@@ -1,0 +1,8 @@
+.python_libs/
+.DS_Store
+apps/desktop/node_modules/
+apps/desktop/dist/
+apps/desktop/src-tauri/target/
+**/__pycache__/
+*.pyc
+.claude/

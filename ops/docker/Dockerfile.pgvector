@@ -1,0 +1,28 @@
+# Khipu Postgres 19 + pgvector (same-base compile).
+# Do NOT use ghcr.io/pglayers/pgx-pgvector:19 on bookworm — that layer needs GLIBC_2.38.
+# Build on any amd64 host with Docker:
+#   docker build -t alzy/postgres:19beta3-pgvector -f ops/docker/Dockerfile.pgvector ops/docker
+
+FROM postgres:19beta3-bookworm AS build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      git \
+      postgresql-server-dev-19 \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /tmp
+RUN git clone --branch v0.8.6 --depth 1 https://github.com/pgvector/pgvector.git \
+ && cd pgvector \
+ && make -j1 OPTFLAGS="" \
+ && make install
+
+FROM postgres:19beta3-bookworm
+# WAL-G talks HTTPS to R2; stock postgres image has no CA bundle → TLS hang.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/lib/postgresql/19/lib/vector.so /usr/lib/postgresql/19/lib/vector.so
+COPY --from=build /usr/lib/postgresql/19/lib/bitcode/vector /usr/lib/postgresql/19/lib/bitcode/vector
+COPY --from=build /usr/lib/postgresql/19/lib/bitcode/vector.index.bc /usr/lib/postgresql/19/lib/bitcode/vector.index.bc
+COPY --from=build /usr/share/postgresql/19/extension/ /usr/share/postgresql/19/extension/

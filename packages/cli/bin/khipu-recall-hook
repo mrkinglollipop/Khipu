@@ -1,0 +1,48 @@
+#!/bin/sh
+# khipu-recall-hook — Claude Code SessionStart hook. Prints the thin Khipu recall
+# rule as hookSpecificOutput.additionalContext (same mechanism as the other
+# SessionStart hooks in this workspace). Never fails a session: any error → {}.
+# Aegis's runner env means Aegis is calling, and Aegis gets no recall rule by
+# ANY route: its SessionStart is an Observe gate that discards stdout, so there
+# is nothing to inject into (see khipu/recall_rule.py). The guard used to make
+# an exception for KHIPU_HARNESS=aegis, copied from khipu-aegis-capture where
+# that exception is correct; with the mark set this script emitted the whole
+# rule (audit 2026-08-18). maintainer, 2026-08-17: "I don't want Khipu running in
+# Aegis through anything Claude."
+if [ -n "${GROK_HOOK_NAME:-}${GROK_HOOK_EVENT:-}" ]; then
+  cat >/dev/null 2>&1
+  echo '{}'
+  exit 0
+fi
+# Resolve the repo from THIS script's own location (following the shim symlink)
+# rather than a hardcoded path: the pack is installed by symlink from wherever the
+# repo lives, and a hook process does not inherit an interactive shell's exports,
+# so a second machine with the repo somewhere else got a dead ROOT and a silent
+# no-op. KHIPU_ROOT still wins when set.
+SELF="$0"
+HOPS=0
+while [ -L "$SELF" ] && [ "$HOPS" -lt 40 ]; do
+  LINK=$(readlink "$SELF")
+  case "$LINK" in /*) SELF="$LINK" ;; *) SELF="$(dirname "$SELF")/$LINK" ;; esac
+  HOPS=$((HOPS + 1))
+done
+SELF_DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
+ROOT="${KHIPU_ROOT:-$(cd "$SELF_DIR/../../.." 2>/dev/null && pwd)}"
+PYTHONPATH="$ROOT/packages/cli:$ROOT/.python_libs${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+# The log dir must exist before any `2>>` redirect below, or sh fails the
+# redirect and the hook silently does nothing (fresh machine, first run).
+mkdir -p "${HOME}/Library/Logs/khipu" 2>/dev/null
+PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
+[ -x "$PY" ] || PY="python3"
+cat >/dev/null 2>&1
+"$PY" - <<'PY' 2>/dev/null || echo '{}'
+import json
+try:
+    from khipu.recall_rule import claude_additional_context
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                             "additionalContext": claude_additional_context()}}))
+except Exception:
+    print("{}")
+PY
+exit 0

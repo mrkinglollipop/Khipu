@@ -1,0 +1,31 @@
+#!/bin/sh
+# khipu-capture-hook — the writer every harness capture hook points at.
+#
+# Contract: capture_v2.py-compatible. Reads the same JSON payload on stdin and
+# exits with the same codes, so any existing hook that pipes to capture_v2 can
+# be repointed here without changing its extraction logic. Under the hood this
+# is `khipu capture`, routed by capture_mode (dual = PG first, then capture_v2
+# for the file wiki with its own mirror suppressed).
+#
+# The Claude Code / Cursor flush hooks already honor MEMORY_CAPTURE and
+# MEMORY_PYTHON, so the pack sets MEMORY_CAPTURE to this script and nothing
+# else about those hooks changes. Aegis's native [[hooks.Stop]] calls it
+# directly.
+# Resolve the repo from THIS script's own location (following the shim symlink)
+# rather than a hardcoded path; KHIPU_ROOT still wins when set. Same reasoning
+# as khipu-stop-hook: hooks do not inherit a shell's exports, and the repo can
+# live anywhere.
+SELF="$0"
+HOPS=0
+while [ -L "$SELF" ] && [ "$HOPS" -lt 40 ]; do
+  LINK=$(readlink "$SELF")
+  case "$LINK" in /*) SELF="$LINK" ;; *) SELF="$(dirname "$SELF")/$LINK" ;; esac
+  HOPS=$((HOPS + 1))
+done
+SELF_DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
+ROOT="${KHIPU_ROOT:-$(cd "$SELF_DIR/../../.." 2>/dev/null && pwd)}"
+PYTHONPATH="$ROOT/packages/cli:$ROOT/.python_libs${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
+[ -x "$PY" ] || PY="python3"
+exec "$PY" -m khipu capture "$@"

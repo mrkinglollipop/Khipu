@@ -1,0 +1,20 @@
+# Khipu CLI runtime dependencies.
+#
+# These are vendored into <KHIPU_ROOT>/.python_libs rather than installed into a
+# virtualenv, because the desktop app, the MCP launcher, the ops scripts, and the
+# launchd jobs all shell out to a bare python3.11 with PYTHONPATH pointing there.
+# .python_libs is gitignored: psycopg-binary ships platform-specific compiled
+# wheels (the current one is cp311 / macosx_11_0_arm64), so the directory is not
+# portable between machines or architectures — rebuild it per machine from this
+# file instead of copying it.
+#
+# Install (or repair) on any Mac:
+#
+#   /opt/homebrew/bin/python3.11 -m pip install \
+#       --target "$KHIPU_ROOT/.python_libs" -r packages/cli/requirements.txt
+#
+# Verify:  PYTHONPATH="$KHIPU_ROOT/packages/cli:$KHIPU_ROOT/.python_libs" \
+#            python3.11 -c "import psycopg; print(psycopg.__version__)"
+
+psycopg[binary]==3.3.4
+typing_extensions==4.16.0

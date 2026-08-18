@@ -1,0 +1,122 @@
+#!/bin/sh
+# khipu-stop-hook — Khipu's capture-side hook, installed ALONGSIDE the legacy
+# capture hooks in Claude Code, Cursor and Codex (Stop / PreCompact /
+# SessionEnd). Never in Aegis: Aegis sandboxes its hooks, and this hook's jobs
+# need paths that sandbox denies (the legacy Memory tree, Postgres through a
+# TLS root cert it cannot read). Aegis gets khipu-aegis-capture instead, which
+# only queues; this hook drains that queue.
+#
+# Four jobs, in order, each fail-open so nothing here can ever block a session:
+#
+#   1. NATIVE CAPTURE (khipu.session_capture). Reads this session's transcript
+#      from the harness's own hook payload, applies the fixed cadence (every 5
+#      user turns / 20 min on Stop; always on PreCompact + SessionEnd) and
+#      queues an extraction job. This is what replaced the legacy MODEL-driven
+#      capture on 2026-08-17: the model was nudged 377 times in one session and
+#      never captured once, so only the compaction safety net ever fired.
+#      Deterministic now; nothing for the model to forget.
+#   2. Drain the shared queue (this session's job and any other harness's,
+#      Aegis included): model extraction, then khipu capture (PG first, file
+#      mirror, embed). Capture lands in the same Stop that decided it was due.
+#   3. Tail-sync the legacy episodes file into PG (identity upsert; cheap) and
+#      replay the outbox — the parts that were here before.
+#   4. Bounded embed catch-up for rows the mirror leg inserted.
+#
+# Every native-capture run leaves a per-harness heartbeat under
+# ~/.grok/khipu/dispatch/; `khipu doctor` and `khipu integrations verify` read
+# it, so a hook that runs but records nothing turns something RED instead of
+# staying quietly green.
+#
+# Aegis's runner env means Aegis is calling, and this hook must never run there
+# — by ANY route. It used to make an exception for KHIPU_HARNESS=aegis, copied
+# from khipu-aegis-capture where that exception is correct; here it contradicted
+# the rule above, and measurably so: with the mark set, this script ran and
+# wrote ~/Library/Logs/khipu/stop-hook.log, one of the paths the sandbox denies
+# (audit 2026-08-18). Aegis capture goes through khipu-aegis-capture, and its
+# queue is drained by another harness's Stop or by `khipu sessions drain`.
+# maintainer, 2026-08-17: "I don't want Khipu running in Aegis through anything Claude."
+if [ -n "${GROK_HOOK_NAME:-}${GROK_HOOK_EVENT:-}" ]; then
+  cat >/dev/null 2>&1
+  exit 0
+fi
+# Resolve the repo from THIS script's own location (following the shim symlink)
+# rather than a hardcoded path: the pack is installed by symlink from wherever the
+# repo lives, and a hook process does not inherit an interactive shell's exports,
+# so a second machine with the repo somewhere else got a dead ROOT and a silent
+# no-op. KHIPU_ROOT still wins when set.
+SELF="$0"
+HOPS=0
+while [ -L "$SELF" ] && [ "$HOPS" -lt 40 ]; do
+  LINK=$(readlink "$SELF")
+  case "$LINK" in /*) SELF="$LINK" ;; *) SELF="$(dirname "$SELF")/$LINK" ;; esac
+  HOPS=$((HOPS + 1))
+done
+SELF_DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
+ROOT="${KHIPU_ROOT:-$(cd "$SELF_DIR/../../.." 2>/dev/null && pwd)}"
+# Legacy memory tree: env, else the Hub config file (khipu config --set
+# memory_root ...). Empty when unconfigured; the Python below treats that as
+# "no file wiki on this machine".
+MEM="${KHIPU_MEMORY_ROOT:-}"
+PYTHONPATH="$ROOT/packages/cli:$ROOT/.python_libs${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+# The log dir must exist before the `2>>` redirect below, or sh fails the
+# redirect and the hook silently does nothing (fresh machine, first run).
+mkdir -p "${HOME}/Library/Logs/khipu" 2>/dev/null
+PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
+[ -x "$PY" ] || PY="python3"
+STDIN_JSON=$(cat 2>/dev/null)
+export KHIPU_HOOK_STDIN="$STDIN_JSON"
+"$PY" - "$MEM" "${KHIPU_HARNESS:-}" <<'PY' 2>>"${HOME}/Library/Logs/khipu/stop-hook.log" || true
+import os
+import sys
+from pathlib import Path
+tag = f" harness={sys.argv[2]}" if len(sys.argv) > 2 and sys.argv[2] else ""
+try:
+    # 1. Native capture for THIS session (harness inferred from the payload
+    #    unless the pack pinned KHIPU_HARNESS). Never raises; always heartbeats.
+    from khipu.session_capture import hook_main
+    r = hook_main(os.environ.get("KHIPU_HOOK_STDIN", ""), sys.argv[2] or None)
+    print(f"[khipu-stop-hook] capture {r.get('harness')} {r.get('event')} due={r.get('due')} "
+          f"{r.get('reason', '')}{' queued=' + r['queued'] if r.get('queued') else ''}"
+          f"{' ERROR ' + r['error'] if r.get('error') else ''}", file=sys.stderr)
+except Exception as e:  # noqa: BLE001 — fail-open, always
+    print(f"[khipu-stop-hook] capture skipped: {type(e).__name__}: {e}", file=sys.stderr)
+try:
+    # 2. Drain the shared queue: this session's job lands now, not "later".
+    from khipu.session_capture import drain, queued_jobs
+    if queued_jobs() and os.environ.get("KHIPU_CAPTURE_NO_DRAIN") != "1":
+        print("[khipu-stop-hook] drain", drain(), file=sys.stderr)
+except Exception as e:  # noqa: BLE001 — fail-open, always
+    print(f"[khipu-stop-hook] drain skipped: {type(e).__name__}: {e}", file=sys.stderr)
+try:
+    # 3. Mirror the legacy file wiki's recent episodes into PG (dual mode).
+    #    Root: the shell arg (env KHIPU_MEMORY_ROOT), else the Hub config file.
+    from khipu.config import path_setting
+    from khipu.mirror import sync_recent_episodes
+    mem = Path(sys.argv[1]) if sys.argv[1] else path_setting("memory_root")
+    if mem is None:
+        print(f"[khipu-stop-hook]{tag} mirror skipped: memory_root not configured", file=sys.stderr)
+    else:
+        print(f"[khipu-stop-hook]{tag}", sync_recent_episodes(mem), file=sys.stderr)
+except Exception as e:  # noqa: BLE001 — fail-open, always
+    print(f"[khipu-stop-hook]{tag} skipped: {type(e).__name__}: {e}", file=sys.stderr)
+try:
+    # Outbox: captures whose PG write failed (any harness) wait here; replay
+    # them the moment PG is reachable again. Cheap when empty (one listdir).
+    from khipu.outbox import drain as outbox_drain, jobs as outbox_jobs
+    if outbox_jobs():
+        print("[khipu-stop-hook] outbox drain", outbox_drain(), file=sys.stderr)
+except Exception as e:  # noqa: BLE001 — fail-open, always
+    print(f"[khipu-stop-hook] outbox drain skipped: {type(e).__name__}: {e}", file=sys.stderr)
+try:
+    # Rows the legacy mirror leg inserted are already-present to the tail sync, so
+    # they would wait for the nightly to be embedded and stay out of semantic
+    # search until then. Bounded catch-up.
+    from khipu.embed import embed_recent_missing
+    r = embed_recent_missing(limit=5)
+    if r["embedded"]:
+        print("[khipu-stop-hook] embed catch-up", r, file=sys.stderr)
+except Exception as e:  # noqa: BLE001 — fail-open, always
+    print(f"[khipu-stop-hook] embed catch-up skipped: {type(e).__name__}: {e}", file=sys.stderr)
+PY
+exit 0

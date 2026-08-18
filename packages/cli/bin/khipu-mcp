@@ -1,0 +1,22 @@
+#!/bin/sh
+# khipu-mcp — stdio MCP launcher (server id: khipu). Read-only shim; see
+# packages/cli/khipu/mcp_server.py for the tool surface and gating.
+# Resolve the repo from THIS script's own location (following the shim symlink)
+# rather than a hardcoded path: the pack is installed by symlink from wherever the
+# repo lives, and a hook process does not inherit an interactive shell's exports,
+# so a second machine with the repo somewhere else got a dead ROOT and a silent
+# no-op. KHIPU_ROOT still wins when set.
+SELF="$0"
+HOPS=0
+while [ -L "$SELF" ] && [ "$HOPS" -lt 40 ]; do
+  LINK=$(readlink "$SELF")
+  case "$LINK" in /*) SELF="$LINK" ;; *) SELF="$(dirname "$SELF")/$LINK" ;; esac
+  HOPS=$((HOPS + 1))
+done
+SELF_DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
+ROOT="${KHIPU_ROOT:-$(cd "$SELF_DIR/../../.." 2>/dev/null && pwd)}"
+PYTHONPATH="$ROOT/packages/cli:$ROOT/.python_libs${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
+[ -x "$PY" ] || PY="python3"
+exec "$PY" -m khipu.mcp_server "$@"

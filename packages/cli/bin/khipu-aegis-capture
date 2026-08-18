@@ -1,0 +1,48 @@
+#!/bin/sh
+# khipu-aegis-capture — Aegis-native session capture (Stop / PreCompact /
+# SessionEnd). Aegis has no legacy capture_v2 hook, so this is the extraction
+# trigger for Aegis sessions.
+#
+# RUNS INSIDE AEGIS'S SANDBOX. Measured 2026-08-17 from a real session: only
+# /tmp, ~/.grok and the session's project dir are writable; ~/Library,
+# ~/.config/khipu, the legacy Memory tree and the Keychain are denied. So this
+# script must not write outside ~/.grok — in particular it must NOT redirect
+# its output into ~/Library/Logs, because a denied redirect aborts the command
+# before any work runs, with exit 0 (silent failure; that is exactly what the
+# first version did). All logging happens inside Python, under ~/.grok/khipu/.
+#
+# The hook only reads the transcript and queues a job; the model call and the
+# database write happen later in `khipu sessions drain` (or any other harness's
+# Stop hook), outside the sandbox. The engine is khipu.session_capture, shared
+# with every harness; this script pins harness=aegis.
+#
+# Aegis is its own harness: Khipu runs there ONLY through the Aegis pack, which
+# marks its handlers with KHIPU_HARNESS=aegis. If Aegis is running this script
+# by way of a vendor-compat import of another harness's config (Aegis's runner
+# sets GROK_HOOK_NAME / GROK_HOOK_EVENT; our pack also sets KHIPU_HARNESS), do
+# nothing. maintainer, 2026-08-17: "I don't want Khipu running in Aegis through
+# anything Claude."
+if [ -n "${GROK_HOOK_NAME:-}${GROK_HOOK_EVENT:-}" ] && [ "${KHIPU_HARNESS:-}" != "aegis" ]; then
+  cat >/dev/null 2>&1
+  exit 0
+fi
+# Resolve the repo from THIS script's own location (following the shim symlink)
+# rather than a hardcoded path: the pack is installed by symlink from wherever the
+# repo lives, and a hook process does not inherit an interactive shell's exports,
+# so a second machine with the repo somewhere else got a dead ROOT and a silent
+# no-op. KHIPU_ROOT still wins when set.
+SELF="$0"
+HOPS=0
+while [ -L "$SELF" ] && [ "$HOPS" -lt 40 ]; do
+  LINK=$(readlink "$SELF")
+  case "$LINK" in /*) SELF="$LINK" ;; *) SELF="$(dirname "$SELF")/$LINK" ;; esac
+  HOPS=$((HOPS + 1))
+done
+SELF_DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
+ROOT="${KHIPU_ROOT:-$(cd "$SELF_DIR/../../.." 2>/dev/null && pwd)}"
+PYTHONPATH="$ROOT/packages/cli:$ROOT/.python_libs${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
+[ -x "$PY" ] || PY="python3"
+"$PY" -m khipu.session_capture --harness aegis "$@" 2>/dev/null || true
+exit 0
