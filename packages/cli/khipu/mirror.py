@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from khipu.topic_graph import parse_frontmatter_links, persist_topic_graph
+
 
 def _log(msg: str) -> None:
     print(f"[khipu-mirror] {msg}", file=sys.stderr)
@@ -55,7 +57,7 @@ def read_topic_text(path: Path) -> str | None:
         return None
 
 
-def parse_topic_file(path: Path) -> dict[str, str] | None:
+def parse_topic_file(path: Path) -> dict[str, Any] | None:
     """Parse a topic markdown file into the one canonical topic shape (F3).
 
     Both the capture-time mirror and the nightly reconcile must go through this
@@ -63,6 +65,9 @@ def parse_topic_file(path: Path) -> dict[str, str] | None:
     shapes (frontmatter stripped vs raw, title parsed vs slug). content_hash is
     over the FULL file text (frontmatter included) so it stays comparable with
     the drift/conflict checks, which hash the file as-is.
+
+    ``links`` is ``list[str]`` (YAML-ish list under ``links:``). ``frontmatter``
+    is a dict, never left conceptually empty when a block exists.
     """
     text = read_topic_text(path)
     if text is None:
@@ -72,14 +77,23 @@ def parse_topic_file(path: Path) -> dict[str, str] | None:
     title = slug
     status = "active"
     body = text
+    links: list[str] = []
+    frontmatter: dict[str, Any] = {}
     if text.startswith("---"):
         parts = text.split("---", 2)
         if len(parts) >= 3:
-            for line in parts[1].splitlines():
+            fm = parts[1]
+            for line in fm.splitlines():
                 if line.startswith("title:"):
                     title = line.split(":", 1)[1].strip().strip("\"'")
                 if line.startswith("status:"):
                     status = line.split(":", 1)[1].strip()
+            links = parse_frontmatter_links(fm)
+            frontmatter = {
+                "title": title,
+                "status": status,
+                "links": links,
+            }
             body = parts[2].lstrip("\n")
     return {
         "slug": slug,
@@ -87,16 +101,19 @@ def parse_topic_file(path: Path) -> dict[str, str] | None:
         "status": status,
         "body": body,
         "digest": digest,
+        "links": links,
+        "frontmatter": frontmatter,
     }
 
 
 def _upsert_topic(
     cur,
-    parsed: dict[str, str],
+    parsed: dict[str, Any],
     source_path: str,
     *,
     source: str,
     note: str,
+    sync_graph: bool = True,
 ) -> bool:
     """Upsert one parsed topic; write a revision row only when content changed.
 
@@ -104,15 +121,25 @@ def _upsert_topic(
     parse) is by definition not deleted — this is the un-tombstone path when a
     previously deleted topic file reappears.
     Returns True when a revision row was written (content changed).
+
+    Always writes ``links`` and ``frontmatter`` on INSERT **and**
+    ``ON CONFLICT (slug) DO UPDATE`` so existing Hub rows are not left ``{}`` /
+    ``[]``. Then mints Khipu-owned ``topic:`` / ``path:`` edges unless
+    ``sync_graph`` is false (dry-run callers that persist graph separately).
     """
+    links = list(parsed.get("links") or [])
+    frontmatter = parsed.get("frontmatter")
+    if not isinstance(frontmatter, dict):
+        frontmatter = {"title": parsed["title"], "status": parsed["status"], "links": links}
     cur.execute("SELECT content_hash FROM topics WHERE slug = %s", (parsed["slug"],))
     prev = cur.fetchone()
     cur.execute(
         """
         INSERT INTO topics
-          (slug, title, body, status, updated_at, frontmatter, source_path, content_hash)
+          (slug, title, body, status, updated_at, frontmatter, links,
+           source_path, content_hash)
         VALUES
-          (%s, %s, %s, %s, now(), '{}'::jsonb, %s, %s)
+          (%s, %s, %s, %s, now(), %s::jsonb, %s::jsonb, %s, %s)
         ON CONFLICT (slug) DO UPDATE SET
           title = EXCLUDED.title,
           body = EXCLUDED.body,
@@ -120,6 +147,8 @@ def _upsert_topic(
           updated_at = now(),
           source_path = EXCLUDED.source_path,
           content_hash = EXCLUDED.content_hash,
+          frontmatter = EXCLUDED.frontmatter,
+          links = EXCLUDED.links,
           deleted_at = NULL
         """,
         (
@@ -127,6 +156,8 @@ def _upsert_topic(
             parsed["title"],
             parsed["body"],
             parsed["status"],
+            json.dumps(frontmatter, ensure_ascii=False),
+            json.dumps(links, ensure_ascii=False),
             source_path,
             parsed["digest"],
         ),
@@ -140,6 +171,8 @@ def _upsert_topic(
             """,
             (parsed["slug"], parsed["body"], source, note, parsed["digest"]),
         )
+    if sync_graph:
+        persist_topic_graph(cur, parsed, dry_run=False)
     return changed
 
 
@@ -459,4 +492,74 @@ def reconcile_memory_root(memory_root: Path) -> dict[str, int]:
                     )
                     stats["tombstoned"] = cur.rowcount
         conn.commit()
+    return stats
+
+
+def backfill_topic_graph(memory_root: Path, *, dry_run: bool = False) -> dict[str, Any]:
+    """Full persist for every non-``_`` topic: ``topics.links`` + frontmatter
+    **and** Khipu-owned ``topic:`` / ``path:`` nodes/edges. Graph-only is
+    forbidden — this is the Hub one-shot after deploy.
+    """
+    _ensure_path()
+    from khipu.db import connect
+
+    topics_dir = memory_root / "topics"
+    stats: dict[str, Any] = {
+        "dry_run": dry_run,
+        "topics": 0,
+        "column_updates": 0,
+        "nodes_minted": 0,
+        "edges_minted": 0,
+        "unreadable": 0,
+    }
+    if not topics_dir.is_dir():
+        stats["error"] = f"topics dir missing: {topics_dir}"
+        return stats
+
+    def _same_json(a: Any, b: Any) -> bool:
+        return json.dumps(a, sort_keys=True, default=str) == json.dumps(
+            b, sort_keys=True, default=str
+        )
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            for path in sorted(topics_dir.glob("*.md")):
+                if path.name.startswith("_"):
+                    continue
+                parsed = parse_topic_file(path)
+                if parsed is None:
+                    stats["unreadable"] += 1
+                    continue
+                stats["topics"] += 1
+                cur.execute(
+                    "SELECT links, frontmatter FROM topics WHERE slug = %s",
+                    (parsed["slug"],),
+                )
+                row = cur.fetchone()
+                want_links = list(parsed.get("links") or [])
+                want_fm = parsed.get("frontmatter") if isinstance(parsed.get("frontmatter"), dict) else {}
+                if row is None:
+                    stats["column_updates"] += 1
+                else:
+                    have_links, have_fm = row
+                    if not _same_json(list(have_links or []), want_links) or not _same_json(
+                        have_fm or {}, want_fm
+                    ):
+                        stats["column_updates"] += 1
+                g = persist_topic_graph(cur, parsed, dry_run=True)
+                stats["nodes_minted"] += g["nodes_minted"]
+                stats["edges_minted"] += g["edges_minted"]
+                if not dry_run:
+                    _upsert_topic(
+                        cur,
+                        parsed,
+                        str(path),
+                        source="topic-graph-backfill",
+                        note="topic-graph backfill persist",
+                        sync_graph=True,
+                    )
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
     return stats

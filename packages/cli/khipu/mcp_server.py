@@ -1,14 +1,19 @@
-"""khipu-mcp — read-only stdio MCP server (server id: ``khipu``).
+"""khipu-mcp — stdio MCP server (server id: ``khipu``).
 
-Shipped under the plan.md P3 amendment 2026-08-10: reads are allowed in every
-``capture_mode`` and nothing here touches writers or the reconcile, so the
-read-only shim may build during the P2 soak. Tools:
+Reads (search, graph, status) are allowed in every ``capture_mode``.
+``khipu_capture`` is a writer: the HTTPS gateway and no-hook hub installs may
+write; the local stdio server declines when ``khipu-stop-hook`` /
+``khipu-aegis-capture`` is the writer (double-capture). ``legacy``/``dual``
+always reject. The ``khipu capture`` CLI is a separate entrypoint and is not
+gated here.
+
+Tools:
 
   - ``khipu_search``  — per-kind-fair ILIKE search over topics/episodes/nodes
   - ``khipu_graph``   — undirected neighborhood walk from a node id
   - ``khipu_status``  — PG counts + mirror lag (optional drift sample)
-  - ``khipu_capture`` — ALWAYS rejected: writes stay P3-gated; in
-    ``legacy``/``dual`` capture belongs to the shell lane (``capture_v2.py``)
+  - ``khipu_capture`` — hub writer on the HTTPS gateway / no-hook installs;
+    local stdio + capture hook declines with an error pointing at the hook.
 
 Zero-dependency by design: the official MCP SDK requires pydantic/anyio which
 are not vendored in ``.python_libs``. The stdio transport is newline-delimited
@@ -56,6 +61,60 @@ def _capture_mode() -> str:
     return capture_mode()
 
 
+_CAPTURE_HOOK_MARKERS = ("khipu-stop-hook", "khipu-aegis-capture")
+
+
+def _local_hook_config_paths() -> tuple[Path, ...]:
+    home = Path.home()
+    return (
+        home / ".cursor" / "hooks.json",
+        home / ".claude" / "settings.json",
+        home / ".codex" / "hooks.json",
+        home / ".grok" / "config.toml",
+    )
+
+
+def _local_capture_hook_is_writer() -> bool:
+    """True when a local harness is configured to run the Khipu capture hook."""
+    for path in _local_hook_config_paths():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            # Missing files skip; an existing but unreadable harness config
+            # must not fail-open into a second writer (Night School 466).
+            print(
+                f"[khipu-mcp] unreadable {path}: {exc}; "
+                "treating as capture-hook writer to avoid dual-write",
+                file=sys.stderr,
+            )
+            return True
+        if any(marker in text for marker in _CAPTURE_HOOK_MARKERS):
+            return True
+    return False
+
+
+def _via_https_gateway() -> bool:
+    """True when this tools/call arrived through ``khipu.gateway`` (HTTPS)."""
+    try:
+        frame = sys._getframe()
+    except (AttributeError, ValueError):
+        return False
+    while frame is not None:
+        if frame.f_globals.get("__name__") == "khipu.gateway":
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _stdio_hook_owns_capture() -> bool:
+    """Local stdio + installed capture hook: MCP must not write."""
+    if _via_https_gateway():
+        return False
+    return _local_capture_hook_is_writer()
+
+
 def _default_memory_root() -> Path | None:
     _ensure_path()
     from khipu.config import path_setting
@@ -70,8 +129,9 @@ TOOLS: list[dict] = [
             "Search Khipu memory. Default: deterministic per-kind-fair ILIKE over "
             "topics/episodes/graph nodes. semantic=true: cosine top-k over the "
             "active embedding profile (episodes + topics), with a score. Returns "
-            "JSON rows of {kind, id, label, snippet[, score]}. Tombstoned topics "
-            "are excluded."
+            "JSON rows of {kind, id, label, snippet[, score]} plus additive "
+            "paths (filesystem tokens) and neighbors (capped 1-hop wiki/path "
+            "edges) on topic hits. Tombstoned topics are excluded."
         ),
         "inputSchema": {
             "type": "object",
@@ -104,7 +164,8 @@ TOOLS: list[dict] = [
         "description": (
             "Neighborhood of a graph node id (undirected). hops=1 returns "
             "direct edges; hops>=2 walks a recursive undirected CTE ordered "
-            "hops-then-node."
+            "hops-then-node. Topic slugs from search expand as "
+            "{slug, topic:slug, memory_topic:slug}."
         ),
         "inputSchema": {
             "type": "object",
@@ -141,12 +202,14 @@ TOOLS: list[dict] = [
     {
         "name": "khipu_capture",
         "description": (
-            "Remember this session in Khipu. CALL THIS when you finish a "
-            "substantive piece of work — a decision, a fix, a finding worth "
-            "recalling later — with a 1-3 sentence summary, short lowercase "
-            "topic slugs, and any decisions/preferences; set session_id to "
-            "'<harness>:<stable id>' (e.g. 'grokbot:<repo>:<task>'). Allowed "
-            "only in capture_mode=hub: where a Khipu capture hook runs (dual) "
+            "Remember this session in Khipu. Cloud / no capture hook: CALL THIS "
+            "when you finish a substantive piece of work — a decision, a fix, a "
+            "finding worth recalling later — with a 1-3 sentence summary, short "
+            "lowercase topic slugs, and any decisions/preferences; set "
+            "session_id to '<harness>:<stable id>' (e.g. "
+            "'grokbot:<repo>:<task>'). Local Mac with khipu-stop-hook or "
+            "khipu-aegis-capture: do NOT call this even in capture_mode=hub — "
+            "the hook is the writer and an MCP write double-captures. Dual: "
             "this tool declines and says so — expected, the hook already has "
             "it. Through the HTTPS gateway it is the ONLY way the session is "
             "remembered, so do not skip it there."
@@ -183,18 +246,27 @@ def _tool_search(args: dict) -> dict:
         kind = args.get("kind") or None
         if kind not in (None, "episode", "topic"):
             raise ValueError("kind must be 'episode' or 'topic'")
-        return {
-            "query": query,
-            "mode": "semantic",
-            "results": semantic_search(query, limit=max(1, limit), kind=kind),
-        }
+        from khipu.db import connect
+        from khipu.topic_graph import enrich_search_results
+
+        results = semantic_search(query, limit=max(1, limit), kind=kind)
+        with connect() as conn:
+            with conn.cursor() as cur:
+                results = enrich_search_results(cur, results)
+        return {"query": query, "mode": "semantic", "results": results}
     from khipu.cli import _search_query
     from khipu.db import connect
+    from khipu.topic_graph import enrich_search_results
 
     with connect() as conn:
         with conn.cursor() as cur:
-            return {"query": query, "mode": "ilike",
-                    "results": _search_query(cur, query, max(1, limit))}
+            return {
+                "query": query,
+                "mode": "ilike",
+                "results": enrich_search_results(
+                    cur, _search_query(cur, query, max(1, limit))
+                ),
+            }
 
 
 def _tool_graph(args: dict) -> dict:
@@ -225,7 +297,9 @@ def _tool_capture(args: dict) -> dict:
     # Locked semantics (agent-integration note, "MCP + CLI write / read
     # semantics"): in legacy/dual the harness's shell hook is the writer, so an
     # MCP write here would double-capture — reject with a clear pointer. In hub
-    # the MCP tool IS a legitimate writer (P3 step 2, 2026-08-17).
+    # the HTTPS gateway (and no-hook installs) may write; local stdio with
+    # khipu-stop-hook / khipu-aegis-capture must still decline. The CLI
+    # ``khipu capture`` does not go through this function.
     mode = _capture_mode()
     if mode != "hub":
         raise ValueError(
@@ -233,6 +307,13 @@ def _tool_capture(args: dict) -> dict:
             "harness capture hook (khipu capture / capture_v2.py) is the writer, "
             "and an MCP write would double-capture. Set capture_mode=hub to "
             "write through MCP."
+        )
+    if _stdio_hook_owns_capture():
+        raise ValueError(
+            "khipu_capture is rejected on the local stdio MCP server: "
+            "khipu-stop-hook / khipu-aegis-capture is the writer and an MCP "
+            "write would double-capture. The hook already has this session. "
+            "Cloud agents write through the HTTPS gateway, which is allowed."
         )
     from khipu.capture import capture, load_payload
 
