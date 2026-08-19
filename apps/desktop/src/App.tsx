@@ -82,6 +82,9 @@ type SearchResult = {
   id?: string | number;
   label?: string;
   snippet?: string;
+  score?: number;
+  paths?: string[];
+  neighbors?: { id: string; type?: string }[];
 };
 
 type GraphEdge = {
@@ -1312,6 +1315,23 @@ export default function App() {
                     </div>
                     {r.snippet ? (
                       <p className="result-snippet">{r.snippet}</p>
+                    ) : null}
+                    {r.paths && r.paths.length > 0 ? (
+                      <ul className="result-paths mono">
+                        {r.paths.map((p) => (
+                          <li key={p}>{p}</li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    {r.neighbors && r.neighbors.length > 0 ? (
+                      <ul className="result-neighbors mono">
+                        {r.neighbors.map((n) => (
+                          <li key={`${n.id}-${n.type ?? ""}`}>
+                            {n.id}
+                            {n.type ? ` (${n.type})` : ""}
+                          </li>
+                        ))}
+                      </ul>
                     ) : null}
                     {r.id != null && String(r.id) !== r.label ? (
                       <span className="result-id mono">{String(r.id)}</span>
