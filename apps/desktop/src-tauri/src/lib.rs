@@ -351,6 +351,11 @@ const ALLOWED_SUBCOMMANDS: &[&str] = &[
     "backup-local", "import-local", "integrations",
 ];
 
+/// Fire-and-forget job runners — long-running consolidate/graphify passes.
+/// Deliberately separate from `ALLOWED_SUBCOMMANDS`: these spawn detached and
+/// return immediately; the UI must not block on `.output()`.
+const SPAWN_ALLOWED_SUBCOMMANDS: &[&str] = &["nightly", "graph-build", "monthly"];
+
 #[tauri::command]
 fn run_khipu(args: Vec<String>) -> Result<String, String> {
     let sub = args.first().map(String::as_str).unwrap_or("");
@@ -359,6 +364,82 @@ fn run_khipu(args: Vec<String>) -> Result<String, String> {
         return Err(format!("subcommand not permitted from the app: {sub:?}"));
     }
     run_khipu_cli(&args)
+}
+
+#[tauri::command]
+fn spawn_khipu(subcommand: String) -> Result<Value, String> {
+    if !SPAWN_ALLOWED_SUBCOMMANDS.contains(&subcommand.as_str()) {
+        eprintln!("[khipu] refused spawn subcommand from the UI: {subcommand:?}");
+        return Err(format!("subcommand not permitted for spawn: {subcommand:?}"));
+    }
+    let root = khipu_root()?;
+    let py = khipu_python()?;
+    let pythonpath = format!(
+        "{}:{}",
+        root.join("packages/cli").display(),
+        root.join(".python_libs").display()
+    );
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let log_path = dirs_fallback_dsn()
+        .parent()
+        .map(|p| p.join(format!("khipu-job-{subcommand}-{stamp}.log")))
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/khipu-job-{subcommand}-{stamp}.log")));
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("open spawn log {}: {e}", log_path.display()))?;
+    let err_file = log_file
+        .try_clone()
+        .map_err(|e| format!("clone spawn log handle: {e}"))?;
+    let mut child = Command::new(&py)
+        .arg("-m")
+        .arg("khipu")
+        .arg(&subcommand)
+        .env("PYTHONPATH", &pythonpath)
+        .env("KHIPU_ROOT", &root)
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(err_file))
+        .spawn()
+        .map_err(|e| format!("spawn khipu {subcommand} failed ({py:?}): {e}"))?;
+    let pid = child.id();
+    // Reap in the background so the Unix zombie does not linger until Tauri
+    // exits. Must not `.wait()` / `.output()` on this thread (C8 fire-and-forget).
+    std::thread::spawn(move || {
+        if let Err(e) = child.wait() {
+            eprintln!("[khipu] wait on spawned job failed: {e}");
+        }
+    });
+    let engine_log_path = engine_job_log_path(&subcommand);
+    Ok(serde_json::json!({
+        "ok": true,
+        "pid": pid,
+        "log_path": log_path.to_string_lossy(),
+        "engine_log_path": engine_log_path.to_string_lossy(),
+        "subcommand": subcommand,
+    }))
+}
+
+/// Engine stdout for spawnable jobs — same stems as `jobs.py` `_JOB_SPECS`
+/// (`khipu-nightly` / `khipu-monthly` / `khipu-graph`) under
+/// `~/Library/Logs/frozen-threshold/`. Distinct from the wrapper spawn log.
+fn engine_job_log_path(subcommand: &str) -> PathBuf {
+    let stem = match subcommand {
+        "nightly" => "khipu-nightly",
+        "monthly" => "khipu-monthly",
+        "graph-build" => "khipu-graph",
+        other => other,
+    };
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home)
+        .join("Library/Logs/frozen-threshold")
+        .join(format!("{stem}.out.log"))
 }
 
 fn dsn_configured_uncached() -> bool {
@@ -554,6 +635,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             run_khipu,
+            spawn_khipu,
             set_khipu_secret,
             secrets_presence,
             khipu_migrate,

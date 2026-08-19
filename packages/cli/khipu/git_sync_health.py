@@ -43,14 +43,23 @@ HEARTBEAT_NAME = "git-sync.json"
 # The nightly consolidate's own log. Its mtime says when the nightly last ran at
 # all, which is what separates "the sync is broken" from "the machine was off":
 # log newer than the heartbeat means the nightly ran and the sync did not record.
-NIGHTLY_LOG = Path(
-    os.environ.get("KHIPU_NIGHTLY_LOG")
-    or Path.home() / "Library" / "Logs" / "frozen-threshold" / "conversation-memory-nightly.out.log"
-)
 # Slack between the nightly starting and git_sync writing its heartbeat at the end.
 NIGHTLY_SLACK_S = int(os.environ.get("KHIPU_GIT_SYNC_SLACK_S", "1800"))
 BLOCKED_MARKER = Path(os.environ.get("KHIPU_GIT_SYNC_BLOCKED_MARKER") or "/tmp/.memory_sync_blocked.json")
-NIGHTLY_PLIST = Path.home() / "Library" / "LaunchAgents" / "com.matt.conversation-memory-nightly.plist"
+
+
+def nightly_plist_path() -> Path:
+    """Prefer Khipu-owned nightly plist; fall back to legacy during soak."""
+    from khipu.jobs import nightly_plist_path as _jobs_nightly_plist
+
+    return _jobs_nightly_plist()
+
+
+def nightly_log_path() -> Path:
+    """Prefer Khipu nightly log when present/newer; env override wins."""
+    from khipu.jobs import nightly_log_path as _jobs_nightly_log
+
+    return _jobs_nightly_log()
 # Short on purpose: this runs inside `khipu doctor`, which the tray calls at
 # startup, and the memory repo lives on a mounted volume. A slow or unmounting
 # volume must degrade the check, never stall the health report (audit 2026-08-17).
@@ -95,7 +104,7 @@ def is_sync_host() -> bool:
         return True
     if env in {"0", "false", "no"}:
         return False
-    return NIGHTLY_PLIST.is_file()
+    return nightly_plist_path().is_file()
 
 
 def _parse_ts(raw: Any) -> float | None:
@@ -154,7 +163,8 @@ def status(*, now: float | None = None) -> dict[str, Any]:
             note = str(hb.get("note") or hb.get("outcome") or "")[:160]
             out["reasons"].append(f"last sync exited {rc}: {note}" if note else f"last sync exited {rc}")
         try:
-            nightly_ran = NIGHTLY_LOG.stat().st_mtime if NIGHTLY_LOG.is_file() else None
+            nightly_log = nightly_log_path()
+            nightly_ran = nightly_log.stat().st_mtime if nightly_log.is_file() else None
         except OSError:
             nightly_ran = None
         out["nightly_log_age_s"] = int(now - nightly_ran) if nightly_ran else None

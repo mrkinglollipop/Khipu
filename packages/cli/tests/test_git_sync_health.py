@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest import mock
 
 from khipu import git_sync_health as gh
+from khipu import jobs
 
 # The live git_sync.py only exists on a machine with the legacy memory tree;
 # tests that need it are skipped elsewhere.
@@ -60,7 +61,7 @@ class GitSyncHealthTest(unittest.TestCase):
         # Module constants are read at import; pin the marker for this test.
         self._marker_patch = mock.patch.object(gh, "BLOCKED_MARKER", self.marker)
         self._marker_patch.start()
-        self._log_patch = mock.patch.object(gh, "NIGHTLY_LOG", self.nightly_log)
+        self._log_patch = mock.patch.object(gh, "nightly_log_path", return_value=self.nightly_log)
         self._log_patch.start()
 
     def _nightly_ran_at(self, iso: str):
@@ -153,6 +154,19 @@ class GitSyncHealthTest(unittest.TestCase):
         self.assertFalse(s["ok"])
         self.assertTrue(any("not main" in r for r in s["reasons"]), s["reasons"])
         self.assertTrue(any("stray sync branch" in r for r in s["reasons"]), s["reasons"])
+
+    def test_prefers_khipu_nightly_plist_when_present(self):
+        with tempfile.TemporaryDirectory() as td:
+            agents = Path(td)
+            khipu = agents / "com.matt.khipu-nightly.plist"
+            legacy = agents / "com.matt.conversation-memory-nightly.plist"
+            khipu.write_text("plist")
+            with mock.patch.object(jobs, "_launchagents_dir", return_value=agents):
+                self.assertEqual(gh.nightly_plist_path(), khipu)
+            legacy.write_text("plist")
+            khipu.unlink()
+            with mock.patch.object(jobs, "_launchagents_dir", return_value=agents):
+                self.assertEqual(gh.nightly_plist_path(), legacy)
 
 
 @unittest.skipUnless(GIT_SYNC.is_file(), "Memory tree not mounted")
