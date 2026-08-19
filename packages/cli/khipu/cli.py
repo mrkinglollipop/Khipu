@@ -303,17 +303,22 @@ def _search_query(cur, term: str, limit: int) -> list[dict]:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
+    from khipu.db import connect
+    from khipu.topic_graph import enrich_search_results
+
     if getattr(args, "semantic", False):
         from khipu.embed import semantic_search
 
         results = semantic_search(args.query, limit=args.limit, kind=getattr(args, "kind", None))
+        with connect() as conn:
+            with conn.cursor() as cur:
+                results = enrich_search_results(cur, results)
         print(json.dumps(results, indent=2))
         return 0
-    from khipu.db import connect
 
     with connect() as conn:
         with conn.cursor() as cur:
-            results = _search_query(cur, args.query, args.limit)
+            results = enrich_search_results(cur, _search_query(cur, args.query, args.limit))
     print(json.dumps(results, indent=2))
     return 0
 
@@ -343,29 +348,32 @@ def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
     superset of hops=1" hold under a LIMIT, not just in an unbounded query.
     """
     hops = max(1, int(hops))
+    from khipu.topic_graph import graph_query_aliases
+
+    aliases = graph_query_aliases(node_id)
     if hops == 1:
         cur.execute(
             """
             SELECT e.src, e.dst, e.type, e.weight
             FROM edges e
-            WHERE e.src = %(id)s OR e.dst = %(id)s
-            ORDER BY (CASE WHEN e.src = %(id)s THEN e.dst ELSE e.src END) ASC, e.type ASC
+            WHERE e.src = ANY(%(ids)s) OR e.dst = ANY(%(ids)s)
+            ORDER BY (CASE WHEN e.src = ANY(%(ids)s) THEN e.dst ELSE e.src END) ASC, e.type ASC
             LIMIT %(lim)s
             """,
-            {"id": node_id, "lim": limit},
+            {"ids": aliases, "lim": limit},
         )
         edges = cur.fetchall()
-        # Also try GRAPH_TABLE depth-1 when possible
+        # Also try GRAPH_TABLE depth-1 when possible (same alias set).
         try:
             cur.execute(
                 """
                 SELECT * FROM GRAPH_TABLE (
                   alzy_graph
-                  MATCH (a IS node WHERE a.id = %(id)s)-[r IS edge]->(b IS node)
+                  MATCH (a IS node WHERE a.id = ANY(%(ids)s))-[r IS edge]->(b IS node)
                   COLUMNS (a.id AS src, b.id AS dst, r.type AS edge_type)
                 ) LIMIT %(lim)s
                 """,
-                {"id": node_id, "lim": limit},
+                {"ids": aliases, "lim": limit},
             )
             gt = cur.fetchall()
         except Exception:  # noqa: BLE001 — beta GRAPH_TABLE may flake
@@ -383,12 +391,12 @@ def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
         """
         WITH RECURSIVE walk AS (
           SELECT
-            CASE WHEN e.src = %(id)s THEN e.dst ELSE e.src END AS node_id,
+            CASE WHEN e.src = ANY(%(ids)s) THEN e.dst ELSE e.src END AS node_id,
             %(id)s AS via,
             e.type,
             1 AS hops
           FROM edges e
-          WHERE e.src = %(id)s OR e.dst = %(id)s
+          WHERE e.src = ANY(%(ids)s) OR e.dst = ANY(%(ids)s)
           UNION
           SELECT
             CASE WHEN e.src = w.node_id THEN e.dst ELSE e.src END AS node_id,
@@ -403,7 +411,7 @@ def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
         ORDER BY hops ASC, node_id ASC
         LIMIT %(lim)s
         """,
-        {"id": node_id, "max_hops": hops, "lim": limit},
+        {"ids": aliases, "id": node_id, "max_hops": hops, "lim": limit},
     )
     rows = cur.fetchall()
     return {
@@ -422,6 +430,17 @@ def cmd_graph(args: argparse.Namespace) -> int:
         with conn.cursor() as cur:
             out = _graph_query(cur, args.id, args.hops, args.limit)
     print(json.dumps(out, indent=2, default=str))
+    return 0
+
+
+def cmd_topic_graph_backfill(args: argparse.Namespace) -> int:
+    from khipu.mirror import backfill_topic_graph
+
+    mem = _require_memory_root(args)
+    if mem is None:
+        return 2
+    stats = backfill_topic_graph(mem, dry_run=bool(getattr(args, "dry_run", False)))
+    print(json.dumps(stats, indent=2, default=str))
     return 0
 
 
@@ -930,6 +949,20 @@ def build_parser() -> argparse.ArgumentParser:
     obd.add_argument("--limit", type=int, default=None)
     ob_sub.add_parser("status", help="Pending count + oldest age")
     ob.set_defaults(func=cmd_outbox)
+
+    tg = sub.add_parser(
+        "topic-graph",
+        help="Persist topic wiki/path graph (topics.links + Khipu-owned nodes/edges)",
+    )
+    tg_sub = tg.add_subparsers(dest="topic_graph_cmd", required=True)
+    tgb = tg_sub.add_parser(
+        "backfill",
+        help="Walk all topic .md files: UPDATE topics.links/frontmatter and mint topic:/path: edges",
+    )
+    tgb.add_argument("--dry-run", action="store_true",
+                     help="Report column updates + graph upserts; roll back writes")
+    tgb.add_argument("--memory-root", default=_memory_root_default())
+    tg.set_defaults(func=cmd_topic_graph_backfill)
 
     gb = sub.add_parser(
         "grok-bot-config",

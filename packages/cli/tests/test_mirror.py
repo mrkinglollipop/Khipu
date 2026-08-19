@@ -56,11 +56,23 @@ class ParseTopicFileTest(unittest.TestCase):
         self.assertEqual(parsed["title"], "My Topic")
         self.assertEqual(parsed["status"], "archived")
         self.assertEqual(parsed["body"], "Body here.\n")
+        self.assertEqual(parsed["links"], [])
+        self.assertEqual(parsed["frontmatter"]["title"], "My Topic")
         # Hash covers the FULL text (frontmatter included) so it stays
         # comparable with drift/conflict checks that hash the file as-is.
         self.assertEqual(
             parsed["digest"], hashlib.sha256(text.encode("utf-8")).hexdigest()
         )
+
+    def test_yaml_ish_links_list_is_not_the_key_line(self) -> None:
+        text = (
+            "---\ntitle: Art\nstatus: in_progress\nlinks:\n"
+            "  - sojourn-unseen-war-project\n---\n\nBody.\n"
+        )
+        parsed = parse_topic_file(self._write(text))
+        assert parsed is not None
+        self.assertEqual(parsed["links"], ["sojourn-unseen-war-project"])
+        self.assertEqual(parsed["frontmatter"]["links"], ["sojourn-unseen-war-project"])
 
     def test_no_frontmatter_defaults(self) -> None:
         path = self._write("Just a body.\n")
