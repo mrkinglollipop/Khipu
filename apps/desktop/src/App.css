@@ -842,6 +842,20 @@ button.id-chip:hover {
   overflow: hidden;
 }
 
+.result-paths,
+.result-neighbors {
+  margin: 6px 0 0;
+  padding-left: 1.1rem;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.result-paths li,
+.result-neighbors li {
+  margin: 2px 0;
+  word-break: break-all;
+}
+
 .result-id {
   display: block;
   margin-top: 6px;
