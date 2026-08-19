@@ -16,6 +16,7 @@ from unittest import mock
 from pathlib import Path
 
 from khipu import graph_sync as gs
+from khipu import jobs
 
 
 def _pg_and_sqlite_available() -> bool:
@@ -86,6 +87,21 @@ class ReadSqliteTest(unittest.TestCase):
             self.assertIn("skipped", d)
         with self.assertRaises(FileNotFoundError):
             gs.sync_from_sqlite(Path("/nonexistent/graph.sqlite"), dry_run=True)
+
+    def test_graph_producer_prefers_khipu_plist(self):
+        with tempfile.TemporaryDirectory() as td:
+            agents = Path(td)
+            khipu = agents / "com.matt.khipu-graph.plist"
+            legacy = agents / "com.matt.graphify-nightly.plist"
+            khipu.write_text("plist")
+            with mock.patch.dict(os.environ, {"KHIPU_GRAPH_PRODUCER": ""}), \
+                 mock.patch.object(jobs, "_launchagents_dir", return_value=agents):
+                self.assertTrue(gs.is_graph_producer())
+            khipu.unlink()
+            legacy.write_text("plist")
+            with mock.patch.dict(os.environ, {"KHIPU_GRAPH_PRODUCER": ""}), \
+                 mock.patch.object(jobs, "_launchagents_dir", return_value=agents):
+                self.assertTrue(gs.is_graph_producer())
 
 
 @unittest.skipUnless(_pg_and_sqlite_available(), "PG or graph.sqlite unreachable")

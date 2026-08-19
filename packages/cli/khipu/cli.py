@@ -188,6 +188,27 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # Keychain is denied. It went stale on 2026-08-04 and nothing noticed until
     # 2026-08-18, because every check ran where the Keychain worked.
     dsn_file_ok = bool((secrets.get("dsn_file") or {}).get("ok", True))
+    try:
+        from khipu.jobs import index_freshness, job_status
+
+        jobs = job_status()
+        index_fresh = index_freshness(memory_root=mem)
+        index_freshness_ok = bool(index_fresh.get("ok"))
+    except Exception as e:  # noqa: BLE001
+        jobs = {"error": f"{type(e).__name__}: {e}"}
+        index_fresh = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        index_freshness_ok = False
+    try:
+        from khipu.embed import coverage
+
+        embed_coverage = coverage()
+        embed_coverage_ok = (
+            embed_coverage.get("episodes", {}).get("missing", 0) == 0
+            and embed_coverage.get("topics", {}).get("missing", 0) == 0
+        )
+    except Exception as e:  # noqa: BLE001
+        embed_coverage = {"error": f"{type(e).__name__}: {e}"}
+        embed_coverage_ok = False
     out = {
         "status": status,
         "drift": drift,
@@ -197,11 +218,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "git_sync": git_sync,
         "backup": backup,
         "secrets": secrets,
+        "jobs": jobs,
+        "index_freshness": index_fresh,
+        "embed_coverage": embed_coverage,
         "not_configured": not_configured,
         "ok": (
             drift_ok and graph.get("ok", False) and outbox_ok and backup["ok"]
             and bool(liveness.get("ok")) and bool(git_sync.get("ok"))
-            and dsn_file_ok
+            and dsn_file_ok and index_freshness_ok and embed_coverage_ok
         ),
         "drift_ok": drift_ok,
         "graph_drift_ok": bool(graph.get("ok")),
@@ -210,6 +234,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "git_sync_ok": bool(git_sync.get("ok")),
         "backup_ok": backup["ok"],
         "dsn_file_ok": dsn_file_ok,
+        "index_freshness_ok": index_freshness_ok,
+        "embed_coverage_ok": embed_coverage_ok,
     }
     print(json.dumps(out, indent=2, default=str))
     return 0 if out["ok"] else 2
@@ -504,6 +530,26 @@ def cmd_activity(args: argparse.Namespace) -> int:
 
 
 def cmd_regen_memory(args: argparse.Namespace) -> int:
+    if getattr(args, "index", False) is True:
+        from khipu.jobs import BUILD_INDEX, run_build_index
+
+        # build_index.py hardcodes ROOT; --memory-root cannot redirect it.
+        engine_root = BUILD_INDEX.resolve().parent.parent
+        mem = getattr(args, "memory_root", None)
+        if mem:
+            passed = Path(mem).resolve()
+            if passed != engine_root:
+                print(
+                    f"error: --memory-root {passed} does not match build_index.py "
+                    f"engine root {engine_root} (the engine hardcodes ROOT; "
+                    "omit --memory-root or pass that path)",
+                    file=sys.stderr,
+                )
+                return 2
+        rc = run_build_index()
+        print(f"build_index exited {rc} (memory root {engine_root})")
+        return rc
+
     from khipu.memory_md import regen_memory_md
 
     out = args.out
@@ -700,6 +746,24 @@ def cmd_backup_local(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_nightly(_args: argparse.Namespace) -> int:
+    from khipu.jobs import run_nightly
+
+    return run_nightly()
+
+
+def cmd_monthly(args: argparse.Namespace) -> int:
+    from khipu.jobs import run_monthly
+
+    return run_monthly(dry_run=bool(args.dry_run))
+
+
+def cmd_graph_build(_args: argparse.Namespace) -> int:
+    from khipu.jobs import run_graph_build
+
+    return run_graph_build()
+
+
 def cmd_import_local(args: argparse.Namespace) -> int:
     from khipu.paths import import_local
 
@@ -814,8 +878,31 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,  # resolved against memory_root at run time
     )
     r.add_argument("--limit", type=int, default=200)
+    r.add_argument(
+        "--index",
+        action="store_true",
+        help="Rebuild live MEMORY.md index via build_index.py (file wiki SSOT); "
+             "default without --index writes MEMORY.from-khipu.md sidecar from PG",
+    )
     r.add_argument("--memory-root", default=_memory_root_default())
     r.set_defaults(func=cmd_regen_memory)
+
+    nt = sub.add_parser("nightly", help="Run consolidate_nightly.py (memory wiki)")
+    nt.set_defaults(func=cmd_nightly)
+
+    mo = sub.add_parser(
+        "monthly",
+        help="Run conversation-memory-monthly.py (wiki classify)",
+    )
+    mo.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only for Cursor-era consolidate_monthly.py; refused on the live Claude driver",
+    )
+    mo.set_defaults(func=cmd_monthly)
+
+    gb = sub.add_parser("graph-build", help="Run graphify_nightly.py once (graph.sqlite)")
+    gb.set_defaults(func=cmd_graph_build)
 
     rc = sub.add_parser("reconcile", help="Full file→PG episodes/topics sync")
     rc.add_argument("--memory-root", default=_memory_root_default())

@@ -223,7 +223,9 @@ def is_graph_producer() -> bool:
     the graph from Postgres and has no business failing on a missing source."""
     if os.environ.get("KHIPU_GRAPH_PRODUCER", "").strip().lower() in {"1", "true", "yes"}:
         return True
-    return (Path.home() / "Library" / "LaunchAgents" / "com.matt.graphify-nightly.plist").is_file()
+    from khipu.jobs import graph_plist_path
+
+    return graph_plist_path().is_file()
 
 
 def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str, Any]:

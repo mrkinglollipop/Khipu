@@ -98,9 +98,39 @@ class UnconfiguredCommandsTest(unittest.TestCase):
         self.assertIn("khipu config --set memory_root", payload["fix"])
 
     def test_regen_memory_without_out_or_root(self):
-        rc, payload = self._run(cli.cmd_regen_memory, out=None, memory_root=None, limit=5)
+        rc, payload = self._run(
+            cli.cmd_regen_memory, out=None, memory_root=None, limit=5, index=False,
+        )
         self.assertEqual(rc, 2)
         self.assertFalse(payload["ok"])
+
+
+class RegenMemoryIndexTest(unittest.TestCase):
+    def test_index_refuses_memory_root_mismatch(self):
+        engine_script = Path("/tmp/khipu-engine-root/conversations/scripts/build_index.py")
+        args = mock.Mock(index=True, memory_root="/somewhere/else")
+        with mock.patch("khipu.jobs.BUILD_INDEX", engine_script), \
+             mock.patch("khipu.jobs.run_build_index") as run_idx, \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            rc = cli.cmd_regen_memory(args)
+        self.assertEqual(rc, 2)
+        run_idx.assert_not_called()
+        self.assertIn("does not match", err.getvalue())
+
+    def test_index_runs_when_memory_root_matches_engine(self):
+        with tempfile.TemporaryDirectory() as td:
+            engine_root = Path(td) / "conversations"
+            engine_script = engine_root / "scripts" / "build_index.py"
+            engine_script.parent.mkdir(parents=True)
+            engine_script.write_text("# stub\n", encoding="utf-8")
+            args = mock.Mock(index=True, memory_root=str(engine_root))
+            with mock.patch("khipu.jobs.BUILD_INDEX", engine_script), \
+                 mock.patch("khipu.jobs.run_build_index", return_value=0) as run_idx, \
+                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                rc = cli.cmd_regen_memory(args)
+            self.assertEqual(rc, 0)
+            run_idx.assert_called_once_with()
+            self.assertIn(str(engine_root.resolve()), out.getvalue())
 
 
 class ConfigCommandTest(unittest.TestCase):

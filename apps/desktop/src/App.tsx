@@ -145,6 +145,32 @@ async function runKhipu(args: string[]): Promise<string> {
   return invoke<string>("run_khipu", { args });
 }
 
+type JobEntry = {
+  plist_label?: string;
+  log_path?: string;
+  last_run_iso?: string | null;
+  last_run_mtime?: number | null;
+  plist_loaded?: boolean;
+  next_schedule?: string;
+  last_exit?: number | null;
+};
+
+type DoctorJobs = {
+  nightly?: JobEntry;
+  monthly?: JobEntry;
+  graph_build?: JobEntry;
+};
+
+async function spawnKhipu(subcommand: string): Promise<{
+  ok?: boolean;
+  pid?: number;
+  log_path?: string;
+  engine_log_path?: string;
+  subcommand?: string;
+}> {
+  return invoke("spawn_khipu", { subcommand });
+}
+
 function prettyJson(raw: string): string {
   try {
     return JSON.stringify(JSON.parse(raw), null, 2);
@@ -331,6 +357,8 @@ export default function App() {
   // JSON. Capture liveness is the one that matters most: a harness whose
   // hook runs but records nothing must be loud here (2026-08-17).
   const [doctorIssues, setDoctorIssues] = useState<string[]>([]);
+  const [doctorJobs, setDoctorJobs] = useState<DoctorJobs | null>(null);
+  const [jobSpawnMsg, setJobSpawnMsg] = useState<string | null>(null);
   const [revisionsText, setRevisionsText] = useState("…");
   const [activityText, setActivityText] = useState("…");
   const [activityList, setActivityList] = useState<
@@ -506,6 +534,13 @@ export default function App() {
       if ((parsed as { graph_drift_ok?: boolean }).graph_drift_ok === false) issues.push("Graph mirror drift");
       if ((parsed as { outbox_ok?: boolean }).outbox_ok === false) issues.push("Outbox has captures PG does not have yet");
       if ((parsed as { backup_ok?: boolean }).backup_ok === false) issues.push("Backup / restore drill");
+      if ((parsed as { index_freshness_ok?: boolean }).index_freshness_ok === false) {
+        issues.push("MEMORY.md index stale vs nightly");
+      }
+      if ((parsed as { embed_coverage_ok?: boolean }).embed_coverage_ok === false) {
+        issues.push("Embedding coverage incomplete");
+      }
+      setDoctorJobs((parsed as { jobs?: DoctorJobs }).jobs ?? null);
       setDoctorIssues(issues);
       fetchedAt.current.doctor = Date.now();
     } catch (e) {
@@ -695,7 +730,10 @@ export default function App() {
   useEffect(() => {
     if (!dsnOk) return;
     // Fire-and-forget: never block tab paint on CLI.
-    if (tab === "status") void loadStatus(false);
+    if (tab === "status") {
+      void loadStatus(false);
+      void loadDoctor(false);
+    }
     if (tab === "doctor") void loadDoctor(false);
     if (tab === "revisions") void loadRevisions(false);
     if (tab === "activity") void loadActivity(false);
@@ -825,6 +863,24 @@ export default function App() {
     }
   }, [backupOut]);
 
+  const runScheduledJob = useCallback(async (subcommand: string) => {
+    setJobSpawnMsg(null);
+    setActionBusy(true);
+    try {
+      const out = await spawnKhipu(subcommand);
+      setJobSpawnMsg(
+        out.ok
+          ? `Started ${subcommand} (pid ${out.pid ?? "?"}). Engine log: ${out.engine_log_path ?? "—"}${out.log_path ? ` (wrapper: ${out.log_path})` : ""}`
+          : `Could not start ${subcommand}`,
+      );
+      void loadDoctor(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionBusy(false);
+    }
+  }, [loadDoctor]);
+
   const doImportLocal = useCallback(async () => {
     if (!importSource.trim()) return;
     setActionBusy(true);
@@ -924,6 +980,31 @@ export default function App() {
     mirrorLag == null ? "neutral" : lagFresh ? "ok" : "warn";
   const lagStatusLabel =
     mirrorLag == null ? "—" : lagFresh ? "fresh" : "stale";
+
+  const renderJobRow = (
+    label: string,
+    entry: JobEntry | undefined,
+    spawnName: string,
+  ) => (
+    <div key={label} className="row-item">
+      <span className="row-main">{label}</span>
+      <span className="row-meta">
+        {entry?.last_run_iso
+          ? `last ${formatTs(entry.last_run_iso)}`
+          : entry?.last_run_mtime
+            ? "ran (mtime only)"
+            : "never"}
+        {entry?.next_schedule ? ` · next ${entry.next_schedule}` : ""}
+        {entry?.plist_loaded === false ? " · agent not loaded" : ""}
+        {entry?.last_exit != null && entry.last_exit !== 0
+          ? ` · exit ${entry.last_exit}`
+          : ""}
+      </span>
+      <button type="button" onClick={() => void runScheduledJob(spawnName)}>
+        Run now
+      </button>
+    </div>
+  );
 
   return (
     <div className="shell">
@@ -1152,6 +1233,16 @@ export default function App() {
                 ) : null}
               </Callout>
             ) : null}
+
+            {doctorJobs ? (
+              <div className="rows">
+                <div className="rows-head">Scheduled jobs</div>
+                {renderJobRow("Nightly consolidate", doctorJobs.nightly, "nightly")}
+                {renderJobRow("Graph build", doctorJobs.graph_build, "graph-build")}
+                {renderJobRow("Monthly consolidate", doctorJobs.monthly, "monthly")}
+              </div>
+            ) : null}
+            {jobSpawnMsg ? <pre className="code">{jobSpawnMsg}</pre> : null}
 
             <RawJson text={statusText} />
           </div>
@@ -1693,6 +1784,16 @@ export default function App() {
                 </p>
               </div>
             </div>
+
+            {doctorJobs ? (
+              <div className="rows">
+                <div className="rows-head">Scheduled jobs</div>
+                {renderJobRow("Nightly consolidate", doctorJobs.nightly, "nightly")}
+                {renderJobRow("Graph build", doctorJobs.graph_build, "graph-build")}
+                {renderJobRow("Monthly consolidate", doctorJobs.monthly, "monthly")}
+              </div>
+            ) : null}
+            {jobSpawnMsg ? <pre className="code">{jobSpawnMsg}</pre> : null}
 
             <RawJson text={doctorText} />
           </div>
