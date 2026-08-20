@@ -8,13 +8,16 @@ keep the rule honest about what it promises, since nothing else checks it.
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from khipu import recall_rule as rr
 
 
 class RuleTextTest(unittest.TestCase):
     def test_it_names_every_tool_the_mcp_server_exposes(self):
-        for tool in ("khipu_search", "khipu_graph", "khipu_status", "khipu_capture"):
+        from khipu.mcp_server import TOOLS
+
+        for tool in (t["name"] for t in TOOLS):
             with self.subTest(tool=tool):
                 self.assertIn(tool, rr.RULE_MD)
 
@@ -29,6 +32,10 @@ class RuleTextTest(unittest.TestCase):
 
     def test_it_explains_the_semantic_flag_both_ways(self):
         self.assertIn("semantic", rr.RULE_MD)
+
+    def test_it_says_digit_ids_are_episodes_not_graph_nodes(self):
+        self.assertIn("Digit ids are episodes", rr.RULE_MD)
+        self.assertIn("query tokens match", rr.RULE_MD)
 
 
 class ClaudeShapeTest(unittest.TestCase):
@@ -65,6 +72,34 @@ class AegisTest(unittest.TestCase):
         absence of a third shape is a verified fact and not an oversight."""
         self.assertIn("Aegis", rr.__doc__)
         self.assertIn("Observe", rr.__doc__)
+
+
+class PushSliceTest(unittest.TestCase):
+    def test_cwd_walks_off_packages_cli(self):
+        self.assertEqual(
+            rr.cwd_search_term("/Volumes/Cloud Storage/Code/Khipu/packages/cli"),
+            "Khipu",
+        )
+
+    def test_empty_cwd(self):
+        self.assertEqual(rr.cwd_search_term(None), "")
+        self.assertEqual(rr.cwd_search_term(""), "")
+
+    def test_session_start_appends_slice(self):
+        with mock.patch.object(
+            rr, "_pushed_memory_slice", return_value="## Pushed slice\n- episode `1`: hi"
+        ):
+            out = rr.session_start_context("/tmp/Khipu")
+        self.assertTrue(out.startswith("# Khipu memory"))
+        self.assertIn("## Pushed slice", out)
+        self.assertNotEqual(out, rr.claude_additional_context())
+
+    def test_session_start_falls_back_when_slice_raises(self):
+        with mock.patch.object(
+            rr, "_pushed_memory_slice", side_effect=RuntimeError("nope")
+        ):
+            out = rr.session_start_context("/tmp")
+        self.assertEqual(out, rr.RULE_MD.strip())
 
 
 if __name__ == "__main__":

@@ -356,13 +356,57 @@ def enrich_search_results(cur, results: Sequence[Mapping[str, Any]]) -> list[dic
     return out
 
 
+def topic_slug_from_label(raw: str) -> str:
+    """Capture topic labels → slug. ``OpenBot`` and ``openbot`` collapse."""
+    s = re.sub(r"[^a-z0-9]+", "-", (raw or "").strip().lower()).strip("-")
+    return s[:80]
+
+
+def persist_capture_graph(cur, payload: Mapping[str, Any]) -> dict[str, int]:
+    """Mint topic:/path: wiki from a capture payload (no topic markdown file).
+
+    Cloud hub captures never see the file wiki, so this is how an episode's
+    ``topics`` array becomes a graph neighborhood.
+    """
+    slugs: list[str] = []
+    for item in payload.get("topics") or []:
+        slug = topic_slug_from_label(str(item))
+        if slug and slug not in slugs:
+            slugs.append(slug)
+        if len(slugs) >= 8:
+            break
+    if not slugs:
+        return {"nodes_minted": 0, "edges_minted": 0}
+    body = str(payload.get("summary") or "")
+    hub = slugs[0]
+    totals = {"nodes_minted": 0, "edges_minted": 0}
+    for slug in slugs:
+        others = [s for s in slugs if s != slug]
+        links = others[:5] if slug == hub else [hub]
+        stats = persist_topic_graph(
+            cur,
+            {"slug": slug, "title": slug, "links": links, "body": body},
+            dry_run=False,
+        )
+        totals["nodes_minted"] += stats["nodes_minted"]
+        totals["edges_minted"] += stats["edges_minted"]
+    return totals
+
+
 def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
 def graph_query_aliases(node_id: str) -> list[str]:
-    """Alias set for ``_graph_query``: topic-shaped ids expand; others stay singleton."""
+    """Alias set for ``_graph_query``: topic-shaped ids expand; others stay singleton.
+
+    All-digit ids are episode primary keys, not topic slugs — ``_graph_query``
+    resolves those separately. Treating ``9320`` as ``topic:9320`` returned an
+    empty neighborhood and looked like a missing graph.
+    """
     s = (node_id or "").strip()
+    if s.isdigit():
+        return []
     if s.startswith(TOPIC_PREFIX) or s.startswith(MEMORY_TOPIC_PREFIX) or (
         s and ":" not in s
     ):

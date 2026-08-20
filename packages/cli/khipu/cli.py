@@ -8,6 +8,8 @@ import os
 import sys
 from pathlib import Path
 
+from khipu.search_text import search_tokens
+
 
 def _env(*names: str, default: str = "") -> str:
     for name in names:
@@ -305,70 +307,119 @@ def _fair_shares(total: int, n: int) -> list[int]:
     return [base + (1 if i < rem else 0) for i in range(n)]
 
 
+def _clip_search_row(r) -> dict:
+    from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
+
+    return {
+        "kind": r[0],
+        "id": r[1],
+        "label": clip_snippet(r[2], LABEL_LIMIT),
+        "snippet": clip_snippet(r[3], SNIPPET_LIMIT),
+    }
+
+
+def _token_match_sql(columns: tuple[str, ...], n: int) -> tuple[str, str]:
+    """WHERE any-token-hits and ORDER BY how-many-tokens-hit.
+
+    ``n`` is the token count already in the bound params ``t0``..``t{n-1}``.
+    """
+    wheres: list[str] = []
+    scores: list[str] = []
+    for i in range(n):
+        ors = " OR ".join(f"{c} ILIKE %(t{i})s ESCAPE '\\'" for c in columns)
+        wheres.append(f"({ors})")
+        scores.append(f"(CASE WHEN {ors} THEN 1 ELSE 0 END)")
+    return " OR ".join(wheres), " + ".join(scores)
+
+
+def _ilike_token_params(tokens: list[str]) -> dict[str, str]:
+    return {f"t{i}": f"%{_escape_like(tok)}%" for i, tok in enumerate(tokens)}
+
+
 def _search_query(cur, term: str, limit: int) -> list[dict]:
     """Deterministically-ordered, per-kind-fair ILIKE search (F7).
 
     Each kind (topic/episode/node) gets its own fair share of `limit` and its
     own ORDER BY, so one kind can no longer starve the others under a shared
     LIMIT, and results are stable across runs instead of arbitrary scan order.
+
+    Multi-token queries rank by token coverage (OR + hit count), not one
+    giant substring. A query that yields no tokens still uses the whole
+    escaped term as before.
     """
     topic_n, episode_n, node_n = _fair_shares(limit, 3)
-    pattern = f"%{_escape_like(term)}%"
+    tokens = search_tokens(term)
+    if not tokens:
+        tokens = [(term or "").strip()] if (term or "").strip() else []
+        if not tokens:
+            return []
+        params: dict = {"q": f"%{_escape_like(tokens[0])}%"}
+        topic_where = (
+            "body ILIKE %(q)s ESCAPE '\\' OR slug ILIKE %(q)s ESCAPE '\\' "
+            "OR COALESCE(title, '') ILIKE %(q)s ESCAPE '\\'"
+        )
+        topic_order = "slug ASC"
+        episode_where = "summary ILIKE %(q)s ESCAPE '\\'"
+        episode_order = "ts DESC NULLS LAST, id DESC"
+        node_where = (
+            "id ILIKE %(q)s ESCAPE '\\' OR COALESCE(name, '') ILIKE %(q)s ESCAPE '\\'"
+        )
+        node_order = "id ASC"
+    else:
+        params = _ilike_token_params(tokens)
+        n = len(tokens)
+        topic_where, topic_score = _token_match_sql(
+            ("body", "slug", "COALESCE(title, '')"), n
+        )
+        topic_order = f"({topic_score}) DESC, slug ASC"
+        episode_where, episode_score = _token_match_sql(("summary",), n)
+        episode_order = f"({episode_score}) DESC, ts DESC NULLS LAST, id DESC"
+        node_where, node_score = _token_match_sql(("id", "COALESCE(name, '')"), n)
+        node_order = f"({node_score}) DESC, id ASC"
     results: list[dict] = []
 
     if topic_n > 0:
         cur.execute(
-            """
+            f"""
             SELECT 'topic' AS kind, slug AS id, COALESCE(title, slug) AS label,
-                   left(body, 160) AS snippet
+                   left(body, 4000) AS snippet
             FROM topics
             WHERE deleted_at IS NULL
-              AND (body ILIKE %(q)s ESCAPE '\\'
-               OR slug ILIKE %(q)s ESCAPE '\\'
-               OR COALESCE(title, '') ILIKE %(q)s ESCAPE '\\')
-            ORDER BY slug ASC
+              AND ({topic_where})
+            ORDER BY {topic_order}
             LIMIT %(lim)s
             """,
-            {"q": pattern, "lim": topic_n},
+            {**params, "lim": topic_n},
         )
-        results.extend(
-            {"kind": r[0], "id": r[1], "label": r[2], "snippet": r[3]}
-            for r in cur.fetchall()
-        )
+        results.extend(_clip_search_row(r) for r in cur.fetchall())
 
     if episode_n > 0:
         cur.execute(
-            """
-            SELECT 'episode' AS kind, id::text AS id, left(summary, 80) AS label,
-                   left(summary, 160) AS snippet
+            f"""
+            SELECT 'episode' AS kind, id::text AS id, summary AS label,
+                   summary AS snippet
             FROM episodes
-            WHERE summary ILIKE %(q)s ESCAPE '\\'
-            ORDER BY ts DESC NULLS LAST, id DESC
+            WHERE {episode_where}
+            ORDER BY {episode_order}
             LIMIT %(lim)s
             """,
-            {"q": pattern, "lim": episode_n},
+            {**params, "lim": episode_n},
         )
-        results.extend(
-            {"kind": r[0], "id": r[1], "label": r[2], "snippet": r[3]}
-            for r in cur.fetchall()
-        )
+        results.extend(_clip_search_row(r) for r in cur.fetchall())
 
     if node_n > 0:
         cur.execute(
-            """
+            f"""
             SELECT 'node' AS kind, id AS id, COALESCE(name, id) AS label,
-                   left(COALESCE(payload::text, ''), 160) AS snippet
+                   left(COALESCE(payload::text, ''), 4000) AS snippet
             FROM nodes
-            WHERE id ILIKE %(q)s ESCAPE '\\' OR COALESCE(name, '') ILIKE %(q)s ESCAPE '\\'
-            ORDER BY id ASC
+            WHERE {node_where}
+            ORDER BY {node_order}
             LIMIT %(lim)s
             """,
-            {"q": pattern, "lim": node_n},
+            {**params, "lim": node_n},
         )
-        results.extend(
-            {"kind": r[0], "id": r[1], "label": r[2], "snippet": r[3]}
-            for r in cur.fetchall()
-        )
+        results.extend(_clip_search_row(r) for r in cur.fetchall())
 
     return results
 
@@ -467,77 +518,146 @@ def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
     superset of hops=1" hold under a LIMIT, not just in an unbounded query.
     """
     hops = max(1, int(hops))
-    from khipu.topic_graph import graph_query_aliases
+    from khipu.topic_graph import (
+        PATH_PREFIX,
+        TOPIC_PREFIX,
+        extract_paths,
+        graph_query_aliases,
+        topic_slug_from_label,
+    )
 
-    aliases = graph_query_aliases(node_id)
-    if hops == 1:
+    episode_meta: dict | None = None
+    raw_id = (node_id or "").strip()
+    synthetic: list[dict] = []
+    if raw_id.isdigit():
         cur.execute(
-            """
-            SELECT e.src, e.dst, e.type, e.weight
-            FROM edges e
-            WHERE e.src = ANY(%(ids)s) OR e.dst = ANY(%(ids)s)
-            ORDER BY (CASE WHEN e.src = ANY(%(ids)s) THEN e.dst ELSE e.src END) ASC, e.type ASC
-            LIMIT %(lim)s
-            """,
-            {"ids": aliases, "lim": limit},
+            "SELECT topics, summary FROM episodes WHERE id = %s",
+            (int(raw_id),),
         )
-        edges = cur.fetchall()
-        # Also try GRAPH_TABLE depth-1 when possible (same alias set).
-        try:
+        row = cur.fetchone()
+        slugs: list[str] = []
+        aliases: list[str] = []
+        if row is None:
+            episode_meta = {"id": int(raw_id), "missing": True, "topics": []}
+        else:
+            topics_raw, summary = row
+            for item in topics_raw or []:
+                slug = topic_slug_from_label(str(item))
+                if slug:
+                    slugs.append(slug)
+            slugs = list(dict.fromkeys(slugs))
+            for slug in slugs:
+                aliases.extend(graph_query_aliases(slug))
+            for rel in extract_paths(summary or ""):
+                aliases.append(PATH_PREFIX + rel.rstrip("/"))
+            aliases = list(dict.fromkeys(a for a in aliases if a))
+            episode_meta = {
+                "id": int(raw_id),
+                "missing": False,
+                "topics": slugs,
+            }
+            synthetic = [
+                {
+                    "src": f"episode:{raw_id}",
+                    "dst": f"{TOPIC_PREFIX}{slug}",
+                    "type": "capture_topic",
+                    "weight": 1.0,
+                }
+                for slug in slugs
+            ]
+    else:
+        aliases = graph_query_aliases(node_id)
+
+    if hops == 1:
+        sql_edges: list[tuple] = []
+        gt: list[tuple] = []
+        if aliases:
             cur.execute(
                 """
-                SELECT * FROM GRAPH_TABLE (
-                  alzy_graph
-                  MATCH (a IS node WHERE a.id = ANY(%(ids)s))-[r IS edge]->(b IS node)
-                  COLUMNS (a.id AS src, b.id AS dst, r.type AS edge_type)
-                ) LIMIT %(lim)s
+                SELECT e.src, e.dst, e.type, e.weight
+                FROM edges e
+                WHERE e.src = ANY(%(ids)s) OR e.dst = ANY(%(ids)s)
+                ORDER BY (CASE WHEN e.src = ANY(%(ids)s) THEN e.dst ELSE e.src END) ASC, e.type ASC
+                LIMIT %(lim)s
                 """,
                 {"ids": aliases, "lim": limit},
             )
-            gt = cur.fetchall()
-        except Exception:  # noqa: BLE001 — beta GRAPH_TABLE may flake
-            gt = []
-        return {
+            sql_edges = cur.fetchall()
+            try:
+                cur.execute(
+                    """
+                    SELECT * FROM GRAPH_TABLE (
+                      alzy_graph
+                      MATCH (a IS node WHERE a.id = ANY(%(ids)s))-[r IS edge]->(b IS node)
+                      COLUMNS (a.id AS src, b.id AS dst, r.type AS edge_type)
+                    ) LIMIT %(lim)s
+                    """,
+                    {"ids": aliases, "lim": limit},
+                )
+                gt = cur.fetchall()
+            except Exception:  # noqa: BLE001 — beta GRAPH_TABLE may flake
+                gt = []
+        merged = synthetic + [
+            {"src": a, "dst": b, "type": t, "weight": w} for a, b, t, w in sql_edges
+        ]
+        out = {
             "id": node_id,
             "hops": 1,
-            "edges": [
-                {"src": a, "dst": b, "type": t, "weight": w} for a, b, t, w in edges
-            ],
+            "edges": merged[:limit],
             "graph_table": [{"src": a, "dst": b, "type": t} for a, b, t in gt],
         }
+        if episode_meta is not None:
+            out["episode"] = episode_meta
+        return out
 
-    cur.execute(
-        """
-        WITH RECURSIVE walk AS (
-          SELECT
-            CASE WHEN e.src = ANY(%(ids)s) THEN e.dst ELSE e.src END AS node_id,
-            %(id)s AS via,
-            e.type,
-            1 AS hops
-          FROM edges e
-          WHERE e.src = ANY(%(ids)s) OR e.dst = ANY(%(ids)s)
-          UNION
-          SELECT
-            CASE WHEN e.src = w.node_id THEN e.dst ELSE e.src END AS node_id,
-            w.node_id AS via,
-            e.type,
-            w.hops + 1
-          FROM walk w
-          JOIN edges e ON e.src = w.node_id OR e.dst = w.node_id
-          WHERE w.hops < %(max_hops)s
+    walk_rows: list[tuple] = []
+    if aliases:
+        cur.execute(
+            """
+            WITH RECURSIVE walk AS (
+              SELECT
+                CASE WHEN e.src = ANY(%(ids)s) THEN e.dst ELSE e.src END AS node_id,
+                %(id)s AS via,
+                e.type,
+                1 AS hops
+              FROM edges e
+              WHERE e.src = ANY(%(ids)s) OR e.dst = ANY(%(ids)s)
+              UNION
+              SELECT
+                CASE WHEN e.src = w.node_id THEN e.dst ELSE e.src END AS node_id,
+                w.node_id AS via,
+                e.type,
+                w.hops + 1
+              FROM walk w
+              JOIN edges e ON e.src = w.node_id OR e.dst = w.node_id
+              WHERE w.hops < %(max_hops)s
+            )
+            SELECT node_id, via, type, hops FROM walk
+            ORDER BY hops ASC, node_id ASC
+            LIMIT %(lim)s
+            """,
+            {"ids": aliases, "id": node_id, "max_hops": hops, "lim": limit},
         )
-        SELECT node_id, via, type, hops FROM walk
-        ORDER BY hops ASC, node_id ASC
-        LIMIT %(lim)s
-        """,
-        {"ids": aliases, "id": node_id, "max_hops": hops, "lim": limit},
-    )
-    rows = cur.fetchall()
-    return {
+        walk_rows = cur.fetchall()
+    synthetic_walk = [
+        {
+            "node_id": e["dst"],
+            "via": e["src"],
+            "type": e["type"],
+            "hops": 1,
+        }
+        for e in synthetic
+    ]
+    out = {
         "id": node_id,
         "hops": hops,
-        "walk": [{"node_id": a, "via": b, "type": t, "hops": h} for a, b, t, h in rows],
+        "walk": (synthetic_walk + [
+            {"node_id": a, "via": b, "type": t, "hops": h} for a, b, t, h in walk_rows
+        ])[:limit],
     }
+    if episode_meta is not None:
+        out["episode"] = episode_meta
+    return out
 
 
 def cmd_graph(args: argparse.Namespace) -> int:

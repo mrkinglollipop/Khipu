@@ -87,6 +87,14 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
         with conn.cursor() as cur:
             inserted = _upsert_episode(cur, payload)
             from khipu.config import path_setting
+            from khipu.topic_graph import persist_capture_graph
+
+            cur.execute("SAVEPOINT capture_graph")
+            try:
+                persist_capture_graph(cur, payload)
+            except Exception as exc:  # noqa: BLE001 — episode row stays; graph is additive
+                cur.execute("ROLLBACK TO SAVEPOINT capture_graph")
+                _log(f"topic graph mint failed ({type(exc).__name__}: {exc})")
 
             memory_root = path_setting("memory_root")
             # In dual mode capture_v2 has not run yet, so topic pages named in the

@@ -11,7 +11,7 @@ Entrypoints:
   backfill_media(...)          — PNG/JPEG under sources with embed_media
   activate(profile)            — flip the one-active pointer (coverage gate; text only)
   embed_on_capture(payload)    — one episode under the *active* profile; fail-open
-  semantic_search(query, k)    — cosine top-k over the *active* profile
+  semantic_search(query, k)    — cosine oversample + token RRF over the *active* profile
   coverage(profile=None)       — per-kind coverage for active or named profile
 
 Providers:
@@ -34,6 +34,9 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Iterable
+
+from khipu.search_text import hybrid_rerank
+from khipu.snippets import FETCH_LIMIT, LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
 
 MODEL_001 = "gemini-embedding-001"
 MODEL_2 = "gemini-embedding-2"
@@ -753,29 +756,43 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
 def semantic_search(
     query: str, *, limit: int = 10, kind: str | None = None
 ) -> list[dict[str, Any]]:
-    """Cosine top-k over the active profile. Returns kind/id/score/snippet + label."""
+    """Cosine oversample over the active profile, then token-overlap RRF.
+
+    Returns kind/id/score/snippet + label. Cosine alone packed relevant and
+    irrelevant episodes into a ~0.02 band; fusing query-term hits lifts the
+    rows that actually name the question without a second embed call.
+    """
     from khipu.db import connect
 
     query = (query or "").strip()
     if not query:
         return []
+    want = max(1, min(int(limit), 50))
+    fetch = min(50, max(want * 5, 25))
     with connect() as conn:
         with conn.cursor() as cur:
             profile = _active_profile(cur)
             api_q = prefix_query(query) if uses_task_prefixes(profile) else query
             qlit = _vec_literal(embed_one(api_q, profile=profile))
+            cur.execute("SELECT to_regclass('public.media_assets') IS NOT NULL")
+            has_media = bool(cur.fetchone()[0])
+            media_label = (
+                "(SELECT COALESCE(a.path, m.chunk_text) FROM media_assets a WHERE a.id = m.ref)"
+                if has_media
+                else "m.chunk_text"
+            )
             cur.execute(
-                """
+                f"""
                 SELECT m.kind, m.ref, m.chunk_idx,
                        1 - (m.embedding <=> %(q)s::vector) AS score,
-                       left(m.chunk_text, 200) AS snippet,
+                       left(m.chunk_text, %(fetch)s) AS snippet,
                        CASE m.kind
                          WHEN 'topic' THEN
                            (SELECT COALESCE(t.title, t.slug) FROM topics t WHERE t.slug = m.ref)
                          WHEN 'media' THEN
-                           (SELECT COALESCE(a.path, m.chunk_text) FROM media_assets a WHERE a.id = m.ref)
+                           {media_label}
                          ELSE
-                           (SELECT left(e.summary, 80) FROM episodes e WHERE e.id::text = m.ref)
+                           (SELECT e.summary FROM episodes e WHERE e.id::text = m.ref)
                        END AS label
                 FROM memory_embeddings m
                 WHERE m.profile = %(p)s
@@ -783,13 +800,20 @@ def semantic_search(
                 ORDER BY m.embedding <=> %(q)s::vector
                 LIMIT %(lim)s
                 """,
-                {"q": qlit, "p": profile, "kind": kind, "lim": max(1, min(int(limit), 50))},
+                {"q": qlit, "p": profile, "kind": kind, "lim": fetch,
+                 "fetch": FETCH_LIMIT},
             )
-            return [
-                {"kind": k, "id": r, "chunk_idx": i, "score": round(float(s), 4),
-                 "label": lbl, "snippet": snip}
-                for k, r, i, s, snip, lbl in cur.fetchall()
-            ]
+            out = []
+            for k, r, i, s, snip, lbl in cur.fetchall():
+                # Episodes: snippet from the stored summary, not chunk_text
+                # (which appends decisions/topics and used to mid-word clip at 200).
+                snippet_src = lbl if k == "episode" and lbl else snip
+                out.append({
+                    "kind": k, "id": r, "chunk_idx": i, "score": round(float(s), 4),
+                    "label": clip_snippet(lbl or snip, LABEL_LIMIT),
+                    "snippet": clip_snippet(snippet_src, SNIPPET_LIMIT),
+                })
+            return hybrid_rerank(out, query, limit=want)
 
 
 def coverage(*, profile: str | None = None) -> dict[str, Any]:
