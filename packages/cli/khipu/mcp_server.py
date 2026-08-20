@@ -128,7 +128,7 @@ TOOLS: list[dict] = [
         "description": (
             "Search Khipu memory. Default: deterministic per-kind-fair ILIKE over "
             "topics/episodes/graph nodes. semantic=true: cosine top-k over the "
-            "active embedding profile (episodes + topics), with a score. Returns "
+            "active embedding profile (episodes + topics + media), with a score. Returns "
             "JSON rows of {kind, id, label, snippet[, score]} plus additive "
             "paths (filesystem tokens) and neighbors (capped 1-hop wiki/path "
             "edges) on topic hits. Tombstoned topics are excluded."
@@ -153,7 +153,9 @@ TOOLS: list[dict] = [
                 },
                 "kind": {
                     "type": "string",
-                    "description": "Semantic only: restrict to 'episode' or 'topic'",
+                    "description": (
+                        "Semantic only: restrict to 'episode', 'topic', or 'media'"
+                    ),
                 },
             },
             "required": ["query"],
@@ -244,8 +246,8 @@ def _tool_search(args: dict) -> dict:
         from khipu.embed import semantic_search
 
         kind = args.get("kind") or None
-        if kind not in (None, "episode", "topic"):
-            raise ValueError("kind must be 'episode' or 'topic'")
+        if kind not in (None, "episode", "topic", "media"):
+            raise ValueError("kind must be 'episode', 'topic', or 'media'")
         from khipu.db import connect
         from khipu.topic_graph import enrich_search_results
 

@@ -349,6 +349,9 @@ def enrich_search_results(cur, results: Sequence[Mapping[str, Any]]) -> list[dic
             item["neighbors"] = neighbors_by_slug.get(slug, [])
         elif kind == "episode":
             item["paths"] = extract_paths(str(item.get("snippet") or ""))
+        elif kind == "media":
+            # Snippet/label is a relative path or filename from media_assets.
+            item["paths"] = extract_paths(str(item.get("snippet") or item.get("label") or ""))
         out.append(item)
     return out
 
