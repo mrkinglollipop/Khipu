@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -136,9 +137,9 @@ class OwnershipTest(unittest.TestCase):
 
     def test_graphify_delete_spares_conversation_memory(self) -> None:
         self.assertIn("conversation-memory", gs.KHIPU_OWNED_NODE_SQL)
-        src = inspect.getsource(gs.sync_from_sqlite)
-        self.assertIn("DELETE FROM edges e", src)
-        self.assertIn("KHIPU_OWNED_NODE_SQL", src)
+        sync_src = inspect.getsource(gs.sync_from_sqlite)
+        self.assertIn("should_delete_graphify_node", sync_src)
+        self.assertIn("KHIPU_OWNED_NODE_SQL", sync_src)
 
     def test_persist_never_mints_memory_topic(self) -> None:
         cur = mock.Mock()
@@ -258,6 +259,37 @@ class DryRunBackfillTest(unittest.TestCase):
         self.assertGreaterEqual(stats["edges_minted"], 1)
         fake_conn.rollback.assert_called()
         fake_conn.commit.assert_not_called()
+
+
+class ConversationMemoryToggleTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self._env = mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(self.dir)})
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def test_persist_no_ops_when_conversation_memory_disabled(self):
+        from khipu import sources
+
+        sources.set_enabled("conversation_memory", False)
+        cur = mock.Mock()
+        cur.fetchall.return_value = []
+        parsed = {
+            "slug": "demo-topic",
+            "title": "Demo",
+            "body": "See `foo/bar/baz/` here.",
+            "links": [],
+        }
+        stats = persist_topic_graph(cur, parsed, dry_run=False)
+        self.assertEqual(stats["nodes_minted"], 0)
+        self.assertEqual(stats["edges_minted"], 0)
+        for call in cur.execute.call_args_list:
+            sql = call.args[0] if call.args else ""
+            self.assertNotIn("INSERT INTO nodes", sql)
 
 
 @unittest.skipUnless(PG_AVAILABLE, "Postgres unreachable; skipping live path/graph probe")

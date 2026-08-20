@@ -36,6 +36,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+from khipu.sources import (
+    disabled_or_unreachable_ids,
+    drift_failing_pg_extra_edges,
+    drift_failing_pg_extras,
+    should_delete_graphify_edge,
+    should_delete_graphify_node,
+)
 
 
 def _default_sqlite() -> Path:
@@ -176,29 +183,79 @@ def sync_from_sqlite(sqlite_path: Path | None = None, *, dry_run: bool = False) 
                 """
             )
             stats["edges_upserted"] = cur.rowcount
+            membership_off = disabled_or_unreachable_ids()
             # 3. delete graphify-owned edges graphify no longer has (an edge is
             #    graphify-owned when neither endpoint is Khipu-owned).
             cur.execute(
                 f"""
-                DELETE FROM edges e
+                SELECT e.src, e.dst, e.type FROM edges e
                 WHERE NOT EXISTS (SELECT 1 FROM _sync_edges s
                                   WHERE s.src = e.src AND s.dst = e.dst AND s.type = e.type)
                   AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = e.src AND {KHIPU_OWNED_NODE_SQL})
                   AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = e.dst AND {KHIPU_OWNED_NODE_SQL})
                 """
             )
-            stats["edges_deleted"] = cur.rowcount
+            edge_delete = 0
+            for src, dst, etype in cur.fetchall():
+                cur.execute(
+                    "SELECT id, type, bucket, source_path FROM nodes WHERE id = %s",
+                    (src,),
+                )
+                src_row = cur.fetchone()
+                cur.execute(
+                    "SELECT id, type, bucket, source_path FROM nodes WHERE id = %s",
+                    (dst,),
+                )
+                dst_row = cur.fetchone()
+                src_node = (
+                    {
+                        "id": src_row[0],
+                        "type": src_row[1],
+                        "bucket": src_row[2],
+                        "source_path": src_row[3],
+                    }
+                    if src_row
+                    else {"id": src, "type": "", "bucket": None, "source_path": None}
+                )
+                dst_node = (
+                    {
+                        "id": dst_row[0],
+                        "type": dst_row[1],
+                        "bucket": dst_row[2],
+                        "source_path": dst_row[3],
+                    }
+                    if dst_row
+                    else {"id": dst, "type": "", "bucket": None, "source_path": None}
+                )
+                if should_delete_graphify_edge(src_node, dst_node, membership_off):
+                    cur.execute(
+                        "DELETE FROM edges WHERE src = %s AND dst = %s AND type = %s",
+                        (src, dst, etype),
+                    )
+                    edge_delete += cur.rowcount
+            stats["edges_deleted"] = edge_delete
             # 4. delete graphify-owned nodes graphify no longer has — unless some
-            #    remaining (Khipu-owned) edge still references them.
+            #    remaining (Khipu-owned) edge still references them, or membership-off.
             cur.execute(
                 f"""
-                DELETE FROM nodes n
+                SELECT n.id, n.type, n.bucket, n.source_path FROM nodes n
                 WHERE NOT {KHIPU_OWNED_NODE_SQL}
                   AND NOT EXISTS (SELECT 1 FROM _sync_nodes s WHERE s.id = n.id)
                   AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.src = n.id OR e.dst = n.id)
                 """
             )
-            stats["nodes_deleted"] = cur.rowcount
+            node_delete = 0
+            for nid, ntype, bucket, source_path in cur.fetchall():
+                node = {
+                    "id": nid,
+                    "type": ntype,
+                    "bucket": bucket,
+                    "source_path": source_path,
+                }
+                if should_delete_graphify_node(node, membership_off):
+                    cur.execute("DELETE FROM nodes WHERE id = %s", (nid,))
+                    node_delete += cur.rowcount
+            stats["nodes_deleted"] = node_delete
             cur.execute(
                 f"""
                 SELECT COUNT(*) FROM nodes n
@@ -250,10 +307,29 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
         s_edges = {(r[0], r[1], r[2]) for r in con.execute("SELECT src, dst, type FROM edges")}
     finally:
         con.close()
+    from khipu.sources import (
+        disabled_or_unreachable_ids,
+        drift_failing_pg_extra_edges,
+        drift_failing_pg_extras,
+    )
+
+    membership_off = disabled_or_unreachable_ids()
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT n.id FROM nodes n WHERE NOT {KHIPU_OWNED_NODE_SQL}")
-            p_nodes = {r[0] for r in cur.fetchall()}
+            cur.execute(
+                f"SELECT n.id, n.type, n.bucket, n.source_path FROM nodes n "
+                f"WHERE NOT {KHIPU_OWNED_NODE_SQL}"
+            )
+            pg_node_rows = [
+                {
+                    "id": r[0],
+                    "type": r[1],
+                    "bucket": r[2],
+                    "source_path": r[3],
+                }
+                for r in cur.fetchall()
+            ]
+            p_nodes = {r["id"] for r in pg_node_rows}
             cur.execute(f"SELECT COUNT(*) FROM nodes n WHERE {KHIPU_OWNED_NODE_SQL}")
             khipu_nodes = cur.fetchone()[0]
             cur.execute(
@@ -265,9 +341,16 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
             )
             p_edges = {(r[0], r[1], r[2]) for r in cur.fetchall()}
     missing_nodes = sorted(s_nodes - p_nodes)
-    extra_nodes = sorted(p_nodes - s_nodes)
+    extra_node_ids = sorted(p_nodes - s_nodes)
+    extra_node_rows = [r for r in pg_node_rows if r["id"] in set(extra_node_ids)]
+    failing_extra_nodes = drift_failing_pg_extras(extra_node_rows, membership_off)
+    extra_nodes = sorted({r["id"] for r in failing_extra_nodes})
     missing_edges = sorted(s_edges - p_edges)
-    extra_edges = sorted(p_edges - s_edges)
+    extra_edge_tuples = sorted(p_edges - s_edges)
+    nodes_by_id = {r["id"]: r for r in pg_node_rows}
+    extra_edges = drift_failing_pg_extra_edges(
+        extra_edge_tuples, nodes_by_id, membership_off
+    )
     out.update({
         "sqlite_nodes": len(s_nodes), "pg_graphify_nodes": len(p_nodes), "pg_khipu_nodes": khipu_nodes,
         "sqlite_edges": len(s_edges), "pg_graphify_edges": len(p_edges),

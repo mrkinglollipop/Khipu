@@ -172,10 +172,11 @@ khipu graph <node-id> --hops 2                       # connections
 names. It queries each kind separately with its own ordering, so a flood of
 matching episodes cannot starve out the one topic page you actually wanted.
 
-**Semantic** search embeds the query with `gemini-embedding-001` (768
-dimensions) and ranks by cosine distance against `memory_embeddings`, using an
-HNSW index. Embeddings are keyed by content hash, so re-embedding only touches
-text that actually changed.
+**Semantic** search embeds the query with the **active** embedding profile
+(`gemini-embedding-2@768`; `gemini-embedding-001` @ 768 retained as inactive
+rollback) and ranks by cosine distance against
+`memory_embeddings`, using an HNSW index. Embeddings are keyed by content hash,
+so re-embedding only touches text that actually changed.
 
 **Graph** traversal expands a node into its neighbours — the path from a
 decision to the thing it constrained.
@@ -285,6 +286,7 @@ they can disagree. Three mechanisms stop that from going unnoticed:
 | Command | What it checks |
 |---|---|
 | `khipu reconcile` | Sweeps files into PostgreSQL. Idempotent — upserts on `(ts, md5(summary))`, so re-running never duplicates |
+| `khipu sources` | List, enable, or disable graph membership roots; writes `graph_sources.resolved.json` for graphify |
 | `khipu doctor` | Drift between files and rows, directionally: every file episode must exist in PostgreSQL |
 | `khipu revisions` | Conflicting topic edits across machines |
 
@@ -293,12 +295,15 @@ requires explicit confirmation.
 
 ### 7. Operations
 
-`khipu doctor` is the single health command. Seven checks, all of which must
-pass:
+`khipu doctor` is the single health command. Checks that AND into `ok` must
+pass; `graph_offsite_ok` is visible but does not keep the Mac red when the
+Matt-owned `r2` rclone remote is missing:
 
 | Check | Red when |
 |---|---|
-| `backup_ok` | The last backup is stale or its restore drill failed |
+| `backup_ok` | Postgres WAL-G / pg_dump stale or restore drill failed |
+| `graph_backup_ok` | Latest local graph snapshot is missing, empty, or older than 36h (producer only) |
+| `graph_offsite_ok` | Weekly R2 copy of the latest snapshot is missing or stale (producer only; blocked until `r2` remote exists) |
 | `drift_ok` | A file episode has no row in PostgreSQL |
 | `graph_drift_ok` | Graph nodes and edges disagree with their source |
 | `outbox_ok` | A write is queued and hasn't replayed |
@@ -333,7 +338,7 @@ person's servers, not the product.
 | **P2** Truthful signals, graph hop symmetry, idempotent reconcile, tombstones | Shipped |
 | **P3** PG 19, dual-write capture, vectors and semantic search, five harness packs, recall rules | Shipped |
 | **Soak** ≥ 7 days with two Macs on the same database | In progress |
-| **P4** Model roles, embedding profiles, corpus picker, selective vision | Planned |
+| **P4** Model roles, embedding profiles, corpus picker (Settings + `khipu sources`), selective vision | Planned (corpus picker shipped) |
 
 ## Setting it up
 

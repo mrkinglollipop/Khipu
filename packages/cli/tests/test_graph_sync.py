@@ -16,6 +16,7 @@ from unittest import mock
 from pathlib import Path
 
 from khipu import graph_sync as gs
+from khipu import sources as sources_mod
 from khipu import jobs
 
 
@@ -102,6 +103,77 @@ class ReadSqliteTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {"KHIPU_GRAPH_PRODUCER": ""}), \
                  mock.patch.object(jobs, "_launchagents_dir", return_value=agents):
                 self.assertTrue(gs.is_graph_producer())
+
+
+class MembershipDeleteTest(unittest.TestCase):
+    def test_disabled_reports_node_is_not_a_delete_candidate(self):
+        node = {
+            "id": "report:foo",
+            "type": "report",
+            "bucket": "shared",
+            "source_path": "Reports/foo.pdf",
+        }
+        self.assertFalse(sources_mod.should_delete_graphify_node(node, {"reports:claude"}))
+
+    def test_enabled_missing_report_is_a_delete_candidate(self):
+        node = {
+            "id": "report:foo",
+            "type": "report",
+            "bucket": "shared",
+            "source_path": "Reports/foo.pdf",
+        }
+        self.assertTrue(sources_mod.should_delete_graphify_node(node, set()))
+
+    def test_conversation_memory_never_deleted(self):
+        node = {
+            "id": "topic:x",
+            "type": "topic",
+            "bucket": "conversation-memory",
+            "source_path": None,
+        }
+        self.assertFalse(sources_mod.should_delete_graphify_node(node, set()))
+
+    def test_leftover_membership_off_pg_row_keeps_graph_drift_ok(self):
+        extra = {
+            "id": "report:foo",
+            "type": "report",
+            "bucket": "shared",
+            "source_path": "Reports/foo.pdf",
+        }
+        membership_off = {"reports:claude"}
+        self.assertFalse(sources_mod.should_delete_graphify_node(extra, membership_off))
+        failing = sources_mod.drift_failing_pg_extras([extra], membership_off)
+        self.assertEqual(failing, [])
+
+    def test_leftover_membership_off_pg_edge_keeps_graph_drift_ok(self):
+        extra_src = {
+            "id": "report:foo",
+            "type": "report",
+            "bucket": "shared",
+            "source_path": "Reports/foo.pdf",
+        }
+        extra_dst = {
+            "id": "report:bar",
+            "type": "report",
+            "bucket": "shared",
+            "source_path": "Reports/bar.pdf",
+        }
+        membership_off = {"reports:claude"}
+        extra = ("report:foo", "report:bar", "related")
+        nodes = {"report:foo": extra_src, "report:bar": extra_dst}
+        self.assertFalse(
+            sources_mod.should_delete_graphify_edge(
+                extra_src, extra_dst, membership_off
+            )
+        )
+        failing = sources_mod.drift_failing_pg_extra_edges(
+            [extra], nodes, membership_off
+        )
+        self.assertEqual(failing, [])
+        self.assertEqual(
+            sources_mod.drift_failing_pg_extra_edges([extra], nodes, set()),
+            [extra],
+        )
 
 
 @unittest.skipUnless(_pg_and_sqlite_available(), "PG or graph.sqlite unreachable")

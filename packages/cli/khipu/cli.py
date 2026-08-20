@@ -1,4 +1,5 @@
 """khipu CLI entry — status / search / graph / doctor / regen-memory / reconcile."""
+
 from __future__ import annotations
 
 import argparse
@@ -39,12 +40,16 @@ def _require_memory_root(args: argparse.Namespace) -> Path | None:
     v = getattr(args, "memory_root", None)
     if v:
         return Path(v)
-    print(json.dumps({
-        "ok": False,
-        "error": "memory_root is not configured",
-        "fix": "khipu config --set memory_root /path/to/memory/conversations "
-               "(or export KHIPU_MEMORY_ROOT)",
-    }))
+    print(
+        json.dumps(
+            {
+                "ok": False,
+                "error": "memory_root is not configured",
+                "fix": "khipu config --set memory_root /path/to/memory/conversations "
+                "(or export KHIPU_MEMORY_ROOT)",
+            }
+        )
+    )
     return None
 
 
@@ -110,15 +115,31 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # instead of reporting red (audit 2026-08-17).
     if mem is None:
         not_configured.append("memory_root")
-        drift = {"skipped": "memory_root not configured", "episodes_missing_in_pg": 0,
-                 "topic_mismatches": [], "topic_files_unreadable": []}
+        drift = {
+            "skipped": "memory_root not configured",
+            "episodes_missing_in_pg": 0,
+            "topic_mismatches": [],
+            "topic_files_unreadable": [],
+        }
     else:
         try:
             drift = sample_drift(mem, sample=args.sample)
         except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
-            drift = {"error": f"{type(e).__name__}: {e}", "episodes_missing_in_pg": -1,
-                     "topic_mismatches": [], "topic_files_unreadable": []}
+            drift = {
+                "error": f"{type(e).__name__}: {e}",
+                "episodes_missing_in_pg": -1,
+                "topic_mismatches": [],
+                "topic_files_unreadable": [],
+            }
     backup = backup_health()
+    try:
+        from khipu import graph_backup
+
+        _graph_backup = graph_backup.local_health()
+        _graph_offsite = graph_backup.offsite_health()
+    except Exception as e:  # noqa: BLE001
+        _graph_backup = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        _graph_offsite = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # P2b gate: directional. Every file episode must exist in PG by identity
     # (ts, md5(summary)); PG holding MORE than the file is healthy (hub writes,
     # archived episodes survive the upsert-only reconcile), so the old
@@ -165,13 +186,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # firing) — never on idleness. maintainer, 2026-08-17: a session that captured
     # only at compaction looked healthy on every other check here.
     try:
-        from khipu.session_capture import drain as capture_drain, liveness_all, queued_jobs
+        from khipu.session_capture import (
+            drain as capture_drain,
+            liveness_all,
+            queued_jobs,
+        )
 
         if queued_jobs():
-            capture_drain()          # like the outbox: clear what can be cleared, then judge
+            capture_drain()  # like the outbox: clear what can be cleared, then judge
         liveness = liveness_all()
     except Exception as e:  # noqa: BLE001
-        liveness = {"ok": False, "error": f"{type(e).__name__}: {e}", "red": [], "harnesses": {}}
+        liveness = {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "red": [],
+            "harnesses": {},
+        }
     # Git sync: is the memory tree's nightly auto-sync landing on GitHub? It is
     # soft-failed inside the nightly by design, so until this it could die and
     # every light stayed green (state-of-play 2026-08-17 item 7). Judged from
@@ -182,7 +212,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
         git_sync = git_sync_status()
     except Exception as e:  # noqa: BLE001
-        git_sync = {"ok": False, "error": f"{type(e).__name__}: {e}", "reasons": ["check failed"]}
+        git_sync = {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "reasons": ["check failed"],
+        }
     secrets = secrets_status()
     # The file DSN is what every sandboxed harness falls back to when the
     # Keychain is denied. It went stale on 2026-08-04 and nothing noticed until
@@ -223,10 +257,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "embed_coverage": embed_coverage,
         "not_configured": not_configured,
         "ok": (
-            drift_ok and graph.get("ok", False) and outbox_ok and backup["ok"]
-            and bool(liveness.get("ok")) and bool(git_sync.get("ok"))
-            and dsn_file_ok and index_freshness_ok and embed_coverage_ok
+            drift_ok
+            and graph.get("ok", False)
+            and outbox_ok
+            and backup["ok"]
+            and bool(liveness.get("ok"))
+            and bool(git_sync.get("ok"))
+            and dsn_file_ok
+            and index_freshness_ok
+            and embed_coverage_ok
+            and bool(_graph_backup.get("ok"))
         ),
+        "graph_backup": _graph_backup,
+        "graph_backup_ok": bool(_graph_backup.get("ok")),
+        "graph_offsite": _graph_offsite,
+        "graph_offsite_ok": bool(_graph_offsite.get("ok")),
         "drift_ok": drift_ok,
         "graph_drift_ok": bool(graph.get("ok")),
         "outbox_ok": outbox_ok,
@@ -335,7 +380,9 @@ def cmd_search(args: argparse.Namespace) -> int:
     if getattr(args, "semantic", False):
         from khipu.embed import semantic_search
 
-        results = semantic_search(args.query, limit=args.limit, kind=getattr(args, "kind", None))
+        results = semantic_search(
+            args.query, limit=args.limit, kind=getattr(args, "kind", None)
+        )
         with connect() as conn:
             with conn.cursor() as cur:
                 results = enrich_search_results(cur, results)
@@ -344,18 +391,33 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     with connect() as conn:
         with conn.cursor() as cur:
-            results = enrich_search_results(cur, _search_query(cur, args.query, args.limit))
+            results = enrich_search_results(
+                cur, _search_query(cur, args.query, args.limit)
+            )
     print(json.dumps(results, indent=2))
     return 0
 
 
 def cmd_embed(args: argparse.Namespace) -> int:
-    from khipu.embed import backfill, coverage
+    from khipu.embed import activate, backfill, coverage
 
     if args.embed_cmd == "status":
-        print(json.dumps(coverage(), indent=2))
+        print(json.dumps(coverage(profile=getattr(args, "profile", None)), indent=2))
         return 0
-    stats = backfill(kind=args.kind, limit=args.limit, dry_run=args.dry_run)
+    if args.embed_cmd == "activate":
+        try:
+            out = activate(args.profile, force=bool(args.force))
+        except (ValueError, RuntimeError) as e:
+            print(json.dumps({"ok": False, "error": str(e)}))
+            return 2
+        print(json.dumps(out, indent=2))
+        return 0
+    stats = backfill(
+        kind=args.kind,
+        limit=args.limit,
+        dry_run=args.dry_run,
+        profile=getattr(args, "profile", None),
+    )
     print(json.dumps(stats, indent=2))
     return 0
 
@@ -443,9 +505,7 @@ def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
     return {
         "id": node_id,
         "hops": hops,
-        "walk": [
-            {"node_id": a, "via": b, "type": t, "hops": h} for a, b, t, h in rows
-        ],
+        "walk": [{"node_id": a, "via": b, "type": t, "hops": h} for a, b, t, h in rows],
     }
 
 
@@ -487,9 +547,7 @@ def cmd_secrets(args: argparse.Namespace) -> int:
     if account:
         if account not in SETTABLE_SECRETS:
             print(
-                json.dumps(
-                    {"ok": False, "error": f"not a settable secret: {account}"}
-                )
+                json.dumps({"ok": False, "error": f"not a settable secret: {account}"})
             )
             return 2
         # The value arrives on stdin, never as an argument: argv is world-readable
@@ -587,7 +645,12 @@ def cmd_capture(args: argparse.Namespace) -> int:
 
 def cmd_config(args: argparse.Namespace) -> int:
     from khipu.config import (
-        capture_mode, config_file, gateway_url, load_config, set_capture_mode, set_gateway_url,
+        capture_mode,
+        config_file,
+        gateway_url,
+        load_config,
+        set_capture_mode,
+        set_gateway_url,
     )
 
     if args.set_capture_mode:
@@ -610,8 +673,11 @@ def cmd_config(args: argparse.Namespace) -> int:
         except KeyError as e:
             print(json.dumps({"ok": False, "error": str(e)}))
             return 2
-        print(json.dumps({"ok": True, key: path_settings_status()[key],
-                          "config_file": str(path)}))
+        print(
+            json.dumps(
+                {"ok": True, key: path_settings_status()[key], "config_file": str(path)}
+            )
+        )
         return 0
     from khipu.config import path_settings_status
 
@@ -619,8 +685,11 @@ def cmd_config(args: argparse.Namespace) -> int:
         "capture_mode": capture_mode(),
         "gateway_url": gateway_url() or None,
         "capture_mode_source": (
-            "env" if os.environ.get("KHIPU_CAPTURE_MODE") else
-            "file" if "capture_mode" in load_config() else "default"
+            "env"
+            if os.environ.get("KHIPU_CAPTURE_MODE")
+            else "file"
+            if "capture_mode" in load_config()
+            else "default"
         ),
         "paths": path_settings_status(),
         "config_file": str(config_file()),
@@ -675,7 +744,14 @@ def cmd_sessions(args: argparse.Namespace) -> int:
 
     if args.aegis_cmd == "status":
         harness = getattr(args, "harness", None)
-        print(json.dumps(sc.status(harness) if harness and harness != "all" else sc.liveness_all(), indent=2))
+        print(
+            json.dumps(
+                sc.status(harness)
+                if harness and harness != "all"
+                else sc.liveness_all(),
+                indent=2,
+            )
+        )
         return 0
     if args.aegis_cmd == "liveness":
         lv = sc.liveness_all()
@@ -764,6 +840,71 @@ def cmd_graph_build(_args: argparse.Namespace) -> int:
     return run_graph_build()
 
 
+def cmd_sources(args: argparse.Namespace) -> int:
+    from khipu import sources
+
+    action = getattr(args, "sources_cmd", None)
+    try:
+        if action == "list":
+            out = {
+                "sources": sources.load_sources().get("sources", []),
+                "resolved": sources.resolve_for_graphify(),
+                "graph_producer": __import__(
+                    "khipu.graph_sync", fromlist=["is_graph_producer"]
+                ).is_graph_producer(),
+            }
+            print(json.dumps(out, indent=2, default=str))
+            return 0
+        if action == "enable":
+            sources.set_enabled(args.source_id, True)
+            print(json.dumps({"ok": True, "id": args.source_id, "enabled": True}))
+            return 0
+        if action == "disable":
+            sources.set_enabled(args.source_id, False)
+            print(json.dumps({"ok": True, "id": args.source_id, "enabled": False}))
+            return 0
+        if action == "add":
+            sources.add_code_root(Path(args.root))
+            print(json.dumps({"ok": True, "root": args.root}))
+            return 0
+        if action == "remove":
+            sources.remove_user_source(args.source_id)
+            print(json.dumps({"ok": True, "id": args.source_id}))
+            return 0
+        if action == "export":
+            out = sources.export_resolved()
+            print(json.dumps({"ok": True, "path": str(sources.resolved_path()), "resolved": out}))
+            return 0
+        print(json.dumps({"ok": False, "error": f"unknown sources action: {action}"}))
+        return 2
+    except ValueError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+
+
+def cmd_graph_backup(args: argparse.Namespace) -> int:
+    from khipu import graph_backup
+
+    action = getattr(args, "graph_backup_cmd", None)
+    if action == "record-local":
+        out = graph_backup.record_local()
+    elif action == "offsite":
+        out = graph_backup.run_offsite()
+    elif action == "drill":
+        out = graph_backup.scratch_drill()
+    elif action == "status":
+        out = graph_backup.status_payload()
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+    else:
+        print(
+            json.dumps({"ok": False, "error": f"unknown graph-backup action: {action}"})
+        )
+        return 2
+    print(json.dumps(out, indent=2, default=str))
+    return 0 if out.get("ok", False) else 2
+
+
 def cmd_import_local(args: argparse.Namespace) -> int:
     from khipu.paths import import_local
 
@@ -796,8 +937,12 @@ def build_parser() -> argparse.ArgumentParser:
     # Default None = check every topic. It used to be 25, and because the walk
     # is alphabetical that meant doctor compared the same first 4% of 622 topics
     # forever (audit 2026-08-17). The full pass measures 0.09 s.
-    d.add_argument("--sample", type=int, default=None,
-                   help="Cap the topic drift pass at N topics (default: all)")
+    d.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="Cap the topic drift pass at N topics (default: all)",
+    )
     d.set_defaults(func=cmd_doctor)
 
     rv = sub.add_parser(
@@ -809,8 +954,12 @@ def build_parser() -> argparse.ArgumentParser:
     # Default None = compare every topic. It was 40, and because the walk is
     # alphabetical this report cleared all 622 topics after checking the first
     # 40 (audit 2026-08-17) — the same defect doctor's --sample carried.
-    rv.add_argument("--sample", type=int, default=None,
-                    help="Cap the file↔pg pass at N topics (0 = PG-only, default: all)")
+    rv.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="Cap the file↔pg pass at N topics (0 = PG-only, default: all)",
+    )
     rv.add_argument("--slug", default=None, help="Filter recent revisions to one slug")
     rv.add_argument(
         "--show",
@@ -847,23 +996,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sec.set_defaults(func=cmd_secrets)
 
-    se = sub.add_parser("search", help="ILIKE search topics/episodes/nodes (or --semantic)")
+    se = sub.add_parser(
+        "search", help="ILIKE search topics/episodes/nodes (or --semantic)"
+    )
     se.add_argument("query")
     se.add_argument("--limit", type=int, default=20)
     se.add_argument(
-        "--semantic", action="store_true",
+        "--semantic",
+        action="store_true",
         help="Cosine search over memory_embeddings (active profile) instead of ILIKE",
     )
-    se.add_argument("--kind", choices=("episode", "topic"), help="Semantic: restrict to one kind")
+    se.add_argument(
+        "--kind", choices=("episode", "topic"), help="Semantic: restrict to one kind"
+    )
     se.set_defaults(func=cmd_search)
 
-    em = sub.add_parser("embed", help="Vectors: backfill / status (active profile)")
+    em = sub.add_parser(
+        "embed", help="Vectors: backfill / status / activate (profiles)"
+    )
     em_sub = em.add_subparsers(dest="embed_cmd", required=True)
-    bf = em_sub.add_parser("backfill", help="Embed missing/changed episode+topic chunks")
+    bf = em_sub.add_parser(
+        "backfill", help="Embed missing/changed episode+topic chunks"
+    )
     bf.add_argument("--kind", choices=("episode", "topic"))
     bf.add_argument("--limit", type=int, help="Cap chunks this run (pilot / smoke)")
     bf.add_argument("--dry-run", action="store_true", help="Count only; no API calls")
-    em_sub.add_parser("status", help="Coverage per kind for the active profile")
+    bf.add_argument(
+        "--profile",
+        help="Target profile id (default: active). e.g. gemini-embedding-2@768",
+    )
+    st = em_sub.add_parser(
+        "status", help="Coverage per kind for active or named profile"
+    )
+    st.add_argument(
+        "--profile",
+        help="Profile id to report (default: active)",
+    )
+    act = em_sub.add_parser(
+        "activate",
+        help="Flip the one-active search pointer (refuses if coverage incomplete)",
+    )
+    act.add_argument(
+        "profile", help="Profile id to activate, e.g. gemini-embedding-2@768"
+    )
+    act.add_argument(
+        "--force",
+        action="store_true",
+        help="Activate even when the profile still has missing vectors",
+    )
     em.set_defaults(func=cmd_embed)
 
     g = sub.add_parser("graph", help="Neighbors (join / GRAPH_TABLE / CTE)")
@@ -882,7 +1062,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--index",
         action="store_true",
         help="Rebuild live MEMORY.md index via build_index.py (file wiki SSOT); "
-             "default without --index writes MEMORY.from-khipu.md sidecar from PG",
+        "default without --index writes MEMORY.from-khipu.md sidecar from PG",
     )
     r.add_argument("--memory-root", default=_memory_root_default())
     r.set_defaults(func=cmd_regen_memory)
@@ -901,8 +1081,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mo.set_defaults(func=cmd_monthly)
 
-    gb = sub.add_parser("graph-build", help="Run graphify_nightly.py once (graph.sqlite)")
+    gb = sub.add_parser(
+        "graph-build", help="Run graphify_nightly.py once (graph.sqlite)"
+    )
     gb.set_defaults(func=cmd_graph_build)
+
+    src = sub.add_parser("sources", help="Graph membership: list / enable / disable / add / export")
+    src_sub = src.add_subparsers(dest="sources_cmd", required=True)
+    src_sub.add_parser("list", help="JSON: sources + resolve_for_graphify").set_defaults(
+        func=cmd_sources
+    )
+    en = src_sub.add_parser("enable", help="Enable a seeded or user source")
+    en.add_argument("source_id")
+    en.set_defaults(func=cmd_sources)
+    dis = src_sub.add_parser("disable", help="Disable a source (does not purge PG)")
+    dis.add_argument("source_id")
+    dis.set_defaults(func=cmd_sources)
+    add = src_sub.add_parser("add", help="Add a code_ast root (absolute path)")
+    add.add_argument("--root", required=True, dest="root", help="Absolute code root")
+    add.set_defaults(func=cmd_sources)
+    rem = src_sub.add_parser("remove", help="Remove a user-added source row")
+    rem.add_argument("source_id")
+    rem.set_defaults(func=cmd_sources)
+    src_sub.add_parser("export", help="Write graph_sources.resolved.json").set_defaults(
+        func=cmd_sources
+    )
+    src.set_defaults(func=cmd_sources)
+
+    gbu = sub.add_parser(
+        "graph-backup",
+        help="Graph.sqlite snapshot record / offsite / drill / status (producer Mac)",
+    )
+    gbu_sub = gbu.add_subparsers(dest="graph_backup_cmd", required=True)
+    gbu_sub.add_parser(
+        "record-local",
+        help="Integrity-check latest snapshot and record graph_snapshot ops_event",
+    ).set_defaults(func=cmd_graph_backup)
+    gbu_sub.add_parser(
+        "offsite",
+        help="rclone copyto latest snapshot to r2:matt-db-backups/khipu-graph",
+    ).set_defaults(func=cmd_graph_backup)
+    gbu_sub.add_parser(
+        "status", help="Local + offsite health and last ops_events"
+    ).set_defaults(func=cmd_graph_backup)
+    gbu_sub.add_parser(
+        "drill",
+        help="Scratch restore drill on latest snapshot (never touches live graph.sqlite)",
+    ).set_defaults(func=cmd_graph_backup)
+    gbu.set_defaults(func=cmd_graph_backup)
 
     rc = sub.add_parser("reconcile", help="Full file→PG episodes/topics sync")
     rc.add_argument("--memory-root", default=_memory_root_default())
@@ -955,15 +1181,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cap.set_defaults(func=cmd_capture)
 
-    mg = sub.add_parser("migrate", help="Apply pending ops/migrations/*.sql to the database")
-    mg.add_argument("--dry-run", action="store_true", help="Show applied/pending; change nothing")
+    mg = sub.add_parser(
+        "migrate", help="Apply pending ops/migrations/*.sql to the database"
+    )
+    mg.add_argument(
+        "--dry-run", action="store_true", help="Show applied/pending; change nothing"
+    )
     mg.set_defaults(func=cmd_migrate)
 
     cfg = sub.add_parser("config", help="Show / set Hub config (capture_mode, paths)")
     cfg.add_argument(
-        "--set", nargs=2, metavar=("KEY", "PATH"),
+        "--set",
+        nargs=2,
+        metavar=("KEY", "PATH"),
         help="Persist a machine-specific path: memory_root, memory_repo, "
-             "capture_v2, graph_sqlite, gemini_key_file",
+        "capture_v2, graph_sqlite, gemini_key_file",
     )
     cfg.add_argument("--unset", metavar="KEY", help="Remove a path setting")
     cfg.add_argument(
@@ -984,14 +1216,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ig_sub = ig.add_subparsers(dest="integ_cmd", required=True)
     for name, help_ in (
-        ("install", "Write MCP + Khipu stop-hook entries (alongside legacy), then verify"),
+        (
+            "install",
+            "Write MCP + Khipu stop-hook entries (alongside legacy), then verify",
+        ),
         ("verify", "Probe MCP handshake + hook exit for installed components"),
         ("uninstall", "Remove Khipu-owned entries only (backups kept)"),
         ("status", "Which components are present per harness"),
     ):
         sp = ig_sub.add_parser(name, help=help_)
         sp.add_argument(
-            "harness", nargs="?", default="all",
+            "harness",
+            nargs="?",
+            default="all",
             choices=("all", "claude_code", "cursor", "aegis", "codex", "grok_bot"),
         )
         if name in ("install", "uninstall"):
@@ -1005,32 +1242,66 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--no-verify", action="store_true")
     ig.set_defaults(func=cmd_integrations)
 
-    for name, help_ in (("sessions", "Native session capture (every harness): drain / status / liveness"),
-                        ("aegis", "Older name for `sessions`; same queue, same drain")):
+    for name, help_ in (
+        (
+            "sessions",
+            "Native session capture (every harness): drain / status / liveness",
+        ),
+        ("aegis", "Older name for `sessions`; same queue, same drain"),
+    ):
         ag = sub.add_parser(name, help=help_)
         ag_sub = ag.add_subparsers(dest="aegis_cmd", required=True)
-        dr = ag_sub.add_parser("drain", help="Turn queued sessions (any harness) into episodes")
-        dr.add_argument("--limit", type=int, default=None, help="Process at most N jobs")
-        dr.add_argument("--dry-run", action="store_true", help="Extract and print; write nothing")
-        stt = ag_sub.add_parser("status", help="Per-harness liveness (default) or one harness's queue + last dispatch")
-        stt.add_argument("--harness", default="aegis" if name == "aegis" else "all",
-                         choices=("all", "claude_code", "cursor", "codex", "aegis"))
-        ag_sub.add_parser("liveness", help="Red/green per harness; exit 2 if any harness is not being recorded")
+        dr = ag_sub.add_parser(
+            "drain", help="Turn queued sessions (any harness) into episodes"
+        )
+        dr.add_argument(
+            "--limit", type=int, default=None, help="Process at most N jobs"
+        )
+        dr.add_argument(
+            "--dry-run", action="store_true", help="Extract and print; write nothing"
+        )
+        stt = ag_sub.add_parser(
+            "status",
+            help="Per-harness liveness (default) or one harness's queue + last dispatch",
+        )
+        stt.add_argument(
+            "--harness",
+            default="aegis" if name == "aegis" else "all",
+            choices=("all", "claude_code", "cursor", "codex", "aegis"),
+        )
+        ag_sub.add_parser(
+            "liveness",
+            help="Red/green per harness; exit 2 if any harness is not being recorded",
+        )
         ag.set_defaults(func=cmd_sessions)
 
-    gsy = sub.add_parser("git-sync", help="Memory-tree git auto-sync liveness (heartbeat + repo evidence); exit 2 if red")
+    gsy = sub.add_parser(
+        "git-sync",
+        help="Memory-tree git auto-sync liveness (heartbeat + repo evidence); exit 2 if red",
+    )
     gsy.set_defaults(func=cmd_git_sync)
 
     gs = sub.add_parser(
         "graph-sync",
         help="Mirror graphify's graph.sqlite into PG (nodes/edges); --check reports drift only",
     )
-    gs.add_argument("--sqlite", help="Path to graph.sqlite (default: KHIPU_GRAPH_SQLITE or the Graph volume)")
-    gs.add_argument("--dry-run", action="store_true", help="Run the sync in a transaction and roll back")
-    gs.add_argument("--check", action="store_true", help="Drift only; exit 2 when not zero")
+    gs.add_argument(
+        "--sqlite",
+        help="Path to graph.sqlite (default: KHIPU_GRAPH_SQLITE or the Graph volume)",
+    )
+    gs.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run the sync in a transaction and roll back",
+    )
+    gs.add_argument(
+        "--check", action="store_true", help="Drift only; exit 2 when not zero"
+    )
     gs.set_defaults(func=cmd_graph_sync)
 
-    ob = sub.add_parser("outbox", help="Offline outbox: drain (replay into PG) / status")
+    ob = sub.add_parser(
+        "outbox", help="Offline outbox: drain (replay into PG) / status"
+    )
     ob_sub = ob.add_subparsers(dest="outbox_cmd", required=True)
     obd = ob_sub.add_parser("drain", help="Replay queued captures into PG")
     obd.add_argument("--limit", type=int, default=None)
@@ -1046,8 +1317,11 @@ def build_parser() -> argparse.ArgumentParser:
         "backfill",
         help="Walk all topic .md files: UPDATE topics.links/frontmatter and mint topic:/path: edges",
     )
-    tgb.add_argument("--dry-run", action="store_true",
-                     help="Report column updates + graph upserts; roll back writes")
+    tgb.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report column updates + graph upserts; roll back writes",
+    )
     tgb.add_argument("--memory-root", default=_memory_root_default())
     tg.set_defaults(func=cmd_topic_graph_backfill)
 
@@ -1055,9 +1329,19 @@ def build_parser() -> argparse.ArgumentParser:
         "grok-bot-config",
         help="Print the account-level Cursor cloud config (covers every repo) + the secret to add",
     )
-    gb.set_defaults(func=lambda a: (
-        print(json.dumps(__import__("khipu.integrations", fromlist=["x"]).grok_bot_account_config(), indent=2)) or 0
-    ))
+    gb.set_defaults(
+        func=lambda a: (
+            print(
+                json.dumps(
+                    __import__(
+                        "khipu.integrations", fromlist=["x"]
+                    ).grok_bot_account_config(),
+                    indent=2,
+                )
+            )
+            or 0
+        )
+    )
 
     return p
 

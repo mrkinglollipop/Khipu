@@ -95,6 +95,11 @@ class EmbedTextTest(unittest.TestCase):
         _, seen = self._call()
         self.assertEqual(seen["body"]["outputDimensionality"], em.DIM)
 
+    def test_model_override_changes_the_url(self):
+        _, seen = self._call(model=em.MODEL_2)
+        self.assertIn(f"/models/{em.MODEL_2}:embedContent", seen["url"])
+        self.assertEqual(seen["body"]["model"], f"models/{em.MODEL_2}")
+
     def test_an_http_error_is_reraised_with_the_server_message_bounded(self):
         def boom(req, **_):
             raise urllib.error.HTTPError(
