@@ -534,6 +534,8 @@ export default function App() {
       if ((parsed as { graph_drift_ok?: boolean }).graph_drift_ok === false) issues.push("Graph mirror drift");
       if ((parsed as { outbox_ok?: boolean }).outbox_ok === false) issues.push("Outbox has captures PG does not have yet");
       if ((parsed as { backup_ok?: boolean }).backup_ok === false) issues.push("Backup / restore drill");
+      if ((parsed as { graph_backup_ok?: boolean }).graph_backup_ok === false) issues.push("Graph snapshot");
+      if ((parsed as { graph_offsite_ok?: boolean }).graph_offsite_ok === false) issues.push("Graph offsite");
       if ((parsed as { index_freshness_ok?: boolean }).index_freshness_ok === false) {
         issues.push("MEMORY.md index stale vs nightly");
       }
@@ -777,6 +779,15 @@ export default function App() {
   const [backupOut, setBackupOut] = useState("~/Downloads");
   const [importSource, setImportSource] = useState("");
   const [pathsMsg, setPathsMsg] = useState<string | null>(null);
+  const [graphSources, setGraphSources] = useState<
+    Array<{ id: string; kind: string; enabled?: boolean; root?: string }>
+  >([]);
+  const [graphSourcesResolved, setGraphSourcesResolved] = useState<{
+    unreachable?: Array<{ id?: string; root?: string }>;
+  } | null>(null);
+  const [graphSourcesProducer, setGraphSourcesProducer] = useState(true);
+  const [graphSourcesMsg, setGraphSourcesMsg] = useState<string | null>(null);
+  const [newCodeRoot, setNewCodeRoot] = useState("");
   const [appVersion, setAppVersion] = useState<string>("…");
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -795,14 +806,102 @@ export default function App() {
     }
   }, []);
 
+  const loadGraphSources = useCallback(async () => {
+    try {
+      const raw = await runKhipu(["sources", "list"]);
+      const parsed = parseJson(raw) as {
+        sources?: Array<{
+          id: string;
+          kind: string;
+          enabled?: boolean;
+          root?: string;
+        }>;
+        resolved?: { unreachable?: Array<{ id?: string; root?: string }> };
+        graph_producer?: boolean;
+      } | null;
+      setGraphSources(parsed?.sources ?? []);
+      setGraphSourcesResolved(parsed?.resolved ?? null);
+      setGraphSourcesProducer(Boolean(parsed?.graph_producer));
+      setGraphSourcesMsg(null);
+    } catch (e) {
+      setGraphSourcesMsg(String(e));
+    }
+  }, []);
+
+  const toggleGraphSource = useCallback(
+    async (id: string, enabled: boolean) => {
+      if (!graphSourcesProducer) return;
+      setGraphSourcesMsg(null);
+      try {
+        const raw = await runKhipu([
+          "sources",
+          enabled ? "enable" : "disable",
+          id,
+        ]);
+        const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
+        if (!parsed?.ok) {
+          setGraphSourcesMsg(parsed?.error ?? "sources command failed");
+          return;
+        }
+        await loadGraphSources();
+      } catch (e) {
+        setGraphSourcesMsg(String(e));
+      }
+    },
+    [graphSourcesProducer, loadGraphSources],
+  );
+
+  const addGraphCodeRoot = useCallback(async () => {
+    if (!graphSourcesProducer || !newCodeRoot.trim()) return;
+    setGraphSourcesMsg(null);
+    try {
+      const raw = await runKhipu([
+        "sources",
+        "add",
+        `--root=${newCodeRoot.trim()}`,
+      ]);
+      const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
+      if (!parsed?.ok) {
+        setGraphSourcesMsg(parsed?.error ?? "add failed");
+        return;
+      }
+      setNewCodeRoot("");
+      await loadGraphSources();
+    } catch (e) {
+      setGraphSourcesMsg(String(e));
+    }
+  }, [graphSourcesProducer, newCodeRoot, loadGraphSources]);
+
+  const removeGraphSource = useCallback(
+    async (id: string) => {
+      if (!graphSourcesProducer) return;
+      setGraphSourcesMsg(null);
+      try {
+        const raw = await runKhipu(["sources", "remove", id]);
+        const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
+        if (!parsed?.ok) {
+          setGraphSourcesMsg(parsed?.error ?? "remove failed");
+          return;
+        }
+        await loadGraphSources();
+      } catch (e) {
+        setGraphSourcesMsg(String(e));
+      }
+    },
+    [graphSourcesProducer, loadGraphSources],
+  );
+
   useEffect(() => {
     // First-run needs this too: it tells the user which file to create, and
     // the data folder is relocatable from Settings. Loading it only for
     // Settings meant the onboarding screen named ~/.config/khipu no matter
     // where the DSN was actually supposed to go. `khipu paths` needs no DSN,
     // so it works on exactly the screen that exists because there isn't one.
-    if (tab === "settings" || tab === "first-run") void loadPaths();
-  }, [tab, loadPaths]);
+    if (tab === "settings" || tab === "first-run") {
+      void loadPaths();
+      void loadGraphSources();
+    }
+  }, [tab, loadPaths, loadGraphSources]);
 
   useEffect(() => {
     void getVersion()
@@ -1776,10 +1875,10 @@ export default function App() {
                 <p className="doctor-sub muted">
                   {doctorOk == null
                     ? "Run Refresh to check the hub."
-                    : doctorOk
-                      ? "Drift, graph mirror, outbox, backup, capture liveness for every harness, and the nightly git sync — all green. Details below."
-                      : doctorIssues.length
-                        ? doctorIssues.join(" · ")
+                    : doctorIssues.length
+                      ? doctorIssues.join(" · ")
+                      : doctorOk
+                        ? "Drift, graph mirror, outbox, backup, capture liveness for every harness, and the nightly git sync — all green. Details below."
                         : "Details in the raw report below."}
                 </p>
               </div>
@@ -1935,6 +2034,83 @@ export default function App() {
                   </button>
                 </div>
                 {pathsMsg ? <pre className="code">{pathsMsg}</pre> : null}
+              </div>
+            </div>
+
+            <div className="section-card">
+              <div className="section-head">Graph sources</div>
+              <div className="section-body">
+                <p className="muted">
+                  Choose which local folders feed the knowledge graph on the next
+                  build. Takes effect on the next graph build (Status → Graph
+                  build, or tonight&apos;s 02:17). Unchecking does not purge
+                  Postgres — it only skips collectors on the next sqlite rebuild.
+                </p>
+                {!graphSourcesProducer ? (
+                  <p className="muted">
+                    Graph sources are configured on the Mac that builds
+                    graph.sqlite.
+                  </p>
+                ) : null}
+                <div className="rows">
+                  {graphSources.map((row) => {
+                    const unreachable = (graphSourcesResolved?.unreachable ?? [])
+                      .some((u) => u.id === row.id);
+                    const status = !row.enabled
+                      ? "membership-off"
+                      : unreachable
+                        ? "path-unreachable"
+                        : "ok";
+                    const userCode =
+                      row.kind === "code_ast" && row.id !== "code:claude";
+                    return (
+                      <div key={row.id} className="row-item">
+                        <label className="row-main">
+                          <input
+                            type="checkbox"
+                            checked={Boolean(row.enabled)}
+                            disabled={!graphSourcesProducer}
+                            onChange={(e) =>
+                              void toggleGraphSource(row.id, e.target.checked)
+                            }
+                          />
+                          <span className="mono">{row.id}</span>
+                          {row.root ? (
+                            <span className="muted mono"> {row.root}</span>
+                          ) : null}
+                        </label>
+                        <span className="row-meta">{status}</span>
+                        {graphSourcesProducer && userCode ? (
+                          <button
+                            type="button"
+                            onClick={() => void removeGraphSource(row.id)}
+                          >
+                            Remove
+                          </button>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+                {graphSourcesProducer ? (
+                  <div className="toolbar">
+                    <input
+                      className="mono"
+                      value={newCodeRoot}
+                      onChange={(e) => setNewCodeRoot(e.target.value)}
+                      placeholder="/absolute/path/to/code"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") void addGraphCodeRoot();
+                      }}
+                    />
+                    <button type="button" onClick={() => void addGraphCodeRoot()}>
+                      Add code root
+                    </button>
+                  </div>
+                ) : null}
+                {graphSourcesMsg ? (
+                  <pre className="code">{graphSourcesMsg}</pre>
+                ) : null}
               </div>
             </div>
 

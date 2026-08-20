@@ -348,7 +348,7 @@ fn set_khipu_secret(account: String, value: String) -> Result<String, String> {
 /// folder" button is `paths --set`.
 const ALLOWED_SUBCOMMANDS: &[&str] = &[
     "status", "doctor", "activity", "search", "graph", "revisions", "paths",
-    "backup-local", "import-local", "integrations",
+    "backup-local", "import-local", "integrations", "sources",
 ];
 
 /// Fire-and-forget job runners — long-running consolidate/graphify passes.
@@ -862,7 +862,7 @@ mod run_khipu_guard_tests {
     #[test]
     fn every_subcommand_the_ui_calls_is_allowed() {
         for s in ["status", "doctor", "activity", "search", "graph", "revisions",
-                  "paths", "backup-local", "import-local", "integrations"] {
+                  "paths", "backup-local", "import-local", "integrations", "sources"] {
             assert!(ALLOWED_SUBCOMMANDS.contains(&s), "UI calls `{s}` but it is not allowed");
         }
     }
@@ -890,7 +890,7 @@ mod run_khipu_guard_tests {
     fn the_allowlist_is_exactly_what_the_front_end_invokes() {
         // Grown by hand, so pin the size: adding an entry without a call site is
         // how the five above got in.
-        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 10);
+        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 11);
     }
 
     #[test]

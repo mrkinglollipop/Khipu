@@ -89,17 +89,50 @@ class MathTest(unittest.TestCase):
         self.assertEqual(lit.count(","), 1)
 
 
+class ProfilePrefixTest(unittest.TestCase):
+    def test_v2_document_and_query_prefixes(self):
+        self.assertEqual(
+            em.prefix_document("hello", title="T"),
+            "title: T | text: hello",
+        )
+        self.assertEqual(
+            em.prefix_query("why pgvector"),
+            "task: search result | query: why pgvector",
+        )
+
+    def test_v2_profile_uses_prefixes_001_does_not(self):
+        self.assertTrue(em.uses_task_prefixes(em.PROFILE_2))
+        self.assertFalse(em.uses_task_prefixes(em.PROFILE_001))
+
+    def test_model_for_profile_maps_known_ids(self):
+        self.assertEqual(em.model_for_profile(em.PROFILE_001), em.MODEL_001)
+        self.assertEqual(em.model_for_profile(em.PROFILE_2), em.MODEL_2)
+        with self.assertRaises(ValueError):
+            em.model_for_profile("nope@0")
+
+    def test_api_texts_prefix_only_for_v2(self):
+        pairs = [("Title", "body chunk")]
+        self.assertEqual(em._api_texts(em.PROFILE_001, pairs), ["body chunk"])
+        self.assertEqual(
+            em._api_texts(em.PROFILE_2, pairs),
+            ["title: Title | text: body chunk"],
+        )
+
+
 @unittest.skipUnless(PG_AVAILABLE, "Postgres unreachable; skipping live embed checks")
 class LiveCorpusTest(unittest.TestCase):
-    def test_active_profile_is_gemini768(self):
+    def test_active_profile_is_known_768(self):
         from khipu.db import connect
 
         with connect() as conn, conn.cursor() as cur:
-            self.assertEqual(em._active_profile(cur), em.PROFILE_ID)
+            active = em._active_profile(cur)
+        self.assertIn(active, {em.PROFILE_001, em.PROFILE_2})
+        self.assertTrue(active.endswith("@768"))
 
     def test_coverage_shape(self):
         c = em.coverage()
-        self.assertEqual(c["active_profile"], em.PROFILE_ID)
+        self.assertIn(c["active_profile"], {em.PROFILE_001, em.PROFILE_2})
+        self.assertEqual(c["profile"], c["active_profile"])
         for kind in ("episodes", "topics"):
             self.assertIn("pct", c[kind])
             self.assertLessEqual(c[kind]["embedded"], c[kind]["total"])
@@ -132,10 +165,12 @@ class LiveEmbedOnCaptureTest(unittest.TestCase):
             with connect() as conn, conn.cursor() as cur:
                 cur.execute("SELECT id FROM episodes WHERE md5(summary)=%s", (md,))
                 eid = str(cur.fetchone()[0])
+                cur.execute("SELECT id FROM embedding_profiles WHERE is_active")
+                active = cur.fetchone()[0]
                 cur.execute(
                     "SELECT COUNT(*) FROM memory_embeddings "
                     "WHERE kind='episode' AND ref=%s AND profile=%s",
-                    (eid, em.PROFILE_ID),
+                    (eid, active),
                 )
                 self.assertEqual(cur.fetchone()[0], 1)
             hits = em.semantic_search(summary, limit=3, kind="episode")

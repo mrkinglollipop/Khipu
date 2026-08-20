@@ -200,8 +200,12 @@ def _path_node_id(rel: str) -> str:
 
 def persist_topic_graph(cur, parsed: Mapping[str, Any], *, dry_run: bool = False) -> dict[str, int]:
     """Mint ``topic:`` / ``path:`` nodes and wiki_link / lives_in edges. Never graphify ids."""
-    slug = str(parsed.get("slug") or "")
+    from khipu.sources import conversation_memory_enabled
+
     stats = {"nodes_minted": 0, "edges_minted": 0}
+    if not conversation_memory_enabled():
+        return stats
+    slug = str(parsed.get("slug") or "")
     if not slug:
         return stats
     topic_id = f"{TOPIC_PREFIX}{slug}"

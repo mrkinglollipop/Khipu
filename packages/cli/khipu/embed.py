@@ -1,22 +1,21 @@
-"""Vectors for real — P3 step 3 (2026-08-17).
+"""Vectors for real — P3 step 3 (2026-08-17) + Gemini Embedding 2 profile (2026-08-19).
 
-Embeds episodes and topics into ``memory_embeddings`` under the ACTIVE profile
-(``embedding_profiles.is_active``), per the plan.md "Embedding profiles" rules:
+Embeds episodes and topics into ``memory_embeddings`` under a named profile
+(``embedding_profiles``), per the plan.md "Embedding profiles" rules:
 profile-tagged rows, never overwritten in place, one active pointer for search.
 
-Three entrypoints:
-  backfill(...)              — every episode/topic whose (profile, kind, ref) chunk is
-                               missing or whose content_hash changed. Batched.
-  embed_on_capture(payload)  — one episode, called from ``khipu capture`` after the PG
-                               write. Fail-open by design: the capture is already
-                               durable; a vector miss is healed by the next backfill.
-  semantic_search(query, k)  — cosine top-k over the active profile.
+Entrypoints:
+  backfill(..., profile=None)  — missing/changed chunks for active or named profile
+  activate(profile)            — flip the one-active pointer (coverage gate)
+  embed_on_capture(payload)    — one episode under the *active* profile; fail-open
+  semantic_search(query, k)    — cosine top-k over the *active* profile
+  coverage(profile=None)       — per-kind coverage for active or named profile
 
-Provider: gemini-embedding-001 @ output_dimensionality=768, L2-normalized before
-store and before query (both directions, plan lock). Uses ``batchEmbedContents``
-so a full-corpus backfill (~4.6k chunks) is a few dozen calls, not thousands.
-Text is chunked at ~6k chars with a small overlap so long topic pages don't get
-truncated to their first screen.
+Providers:
+  gemini-embedding-001 @768 — no task prefixes (task_type era)
+  gemini-embedding-2 @768   — document/query prefixes at API time; store unprefixed
+                              chunk_text. batchEmbedContents with one content per
+                              request (v2 aggregates multi-part inputs).
 """
 from __future__ import annotations
 
@@ -30,9 +29,21 @@ import urllib.error
 import urllib.request
 from typing import Any, Iterable
 
-MODEL = "gemini-embedding-001"
+MODEL_001 = "gemini-embedding-001"
+MODEL_2 = "gemini-embedding-2"
 DIM = 768
-PROFILE_ID = f"{MODEL}@{DIM}"
+PROFILE_001 = f"{MODEL_001}@{DIM}"
+PROFILE_2 = f"{MODEL_2}@{DIM}"
+# Legacy aliases — tests and callers that still import PROFILE_ID / MODEL.
+MODEL = MODEL_001
+PROFILE_ID = PROFILE_001
+
+# Profile id → Gemini model name. Unknown ids refuse rather than guess.
+_PROFILE_MODELS: dict[str, str] = {
+    PROFILE_001: MODEL_001,
+    PROFILE_2: MODEL_2,
+}
+
 CHUNK_CHARS = 6000
 CHUNK_OVERLAP = 300
 BATCH = 64            # Gemini batchEmbedContents cap is 100; stay under
@@ -73,6 +84,29 @@ def chunk_text(text: str) -> list[str]:
     return out
 
 
+def prefix_document(text: str, *, title: str = "") -> str:
+    """Asymmetric retrieval document prefix for gemini-embedding-2."""
+    return f"title: {title or ''} | text: {text}"
+
+
+def prefix_query(query: str) -> str:
+    """Asymmetric retrieval query prefix for gemini-embedding-2."""
+    return f"task: search result | query: {query}"
+
+
+def model_for_profile(profile: str) -> str:
+    model = _PROFILE_MODELS.get(profile)
+    if not model:
+        raise ValueError(
+            f"unknown embedding profile {profile!r}; known: {sorted(_PROFILE_MODELS)}"
+        )
+    return model
+
+
+def uses_task_prefixes(profile: str) -> bool:
+    return profile == PROFILE_2
+
+
 # ---- provider -----------------------------------------------------------------
 
 def _gemini_key() -> str:
@@ -84,21 +118,33 @@ def _gemini_key() -> str:
     return key
 
 
-def embed_batch(texts: list[str], *, retries: int = 4) -> list[list[float]]:
-    """Embed up to BATCH texts in one call; L2-normalized; dim-checked."""
+def embed_batch(
+    texts: list[str],
+    *,
+    profile: str = PROFILE_001,
+    retries: int = 4,
+) -> list[list[float]]:
+    """Embed up to BATCH texts; L2-normalized; dim-checked.
+
+    ``texts`` must already include any v2 task prefixes — callers store the
+    unprefixed chunk_text separately.
+    """
     if not texts:
         return []
+    model = model_for_profile(profile)
     key = _gemini_key()
     # Header auth, not ?key=. The query-string form puts a live API key inside a
     # URL that any future logging, proxy, or exception-formatting change would
     # surface — HTTPError carries .url, and this module logs exceptions on the
     # capture path. The header form is equivalent to Gemini and leaks nothing
     # (audit 2026-08-17).
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:batchEmbedContents"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents"
+    # One content per request — gemini-embedding-2 aggregates multi-part inputs
+    # into a single vector; we need one vector per chunk.
     body = {
         "requests": [
             {
-                "model": f"models/{MODEL}",
+                "model": f"models/{model}",
                 "content": {"parts": [{"text": t[:MAX_TEXT_CHARS]}]},
                 "outputDimensionality": DIM,
             }
@@ -145,8 +191,8 @@ def embed_batch(texts: list[str], *, retries: int = 4) -> list[list[float]]:
     return [_l2(v) for v in vecs]
 
 
-def embed_one(text: str) -> list[float]:
-    return embed_batch([text])[0]
+def embed_one(text: str, *, profile: str = PROFILE_001) -> list[float]:
+    return embed_batch([text], profile=profile)[0]
 
 
 # ---- corpus -------------------------------------------------------------------
@@ -157,6 +203,21 @@ def _active_profile(cur) -> str:
     if not row:
         raise RuntimeError("no active embedding profile (apply 0004_embedding_profiles.sql)")
     return row[0]
+
+
+def _resolve_profile(cur, profile: str | None) -> str:
+    if profile:
+        profile = profile.strip()
+        cur.execute("SELECT id FROM embedding_profiles WHERE id = %s", (profile,))
+        if not cur.fetchone():
+            raise ValueError(
+                f"embedding profile {profile!r} not in embedding_profiles "
+                f"(apply 0005_gemini_embedding_2.sql if targeting {PROFILE_2})"
+            )
+        # Refuse unknown model wiring even if a rogue row exists.
+        model_for_profile(profile)
+        return profile
+    return _active_profile(cur)
 
 
 def episode_text(row: dict[str, Any]) -> str:
@@ -173,8 +234,12 @@ def topic_text(slug: str, title: str | None, body: str | None) -> str:
     return f"{title or slug}\n\n{body or ''}".strip()
 
 
-def _iter_sources(cur, *, kind: str | None = None) -> Iterable[tuple[str, str, str]]:
-    """Yield (kind, ref, text) for every embeddable row."""
+def _iter_sources(cur, *, kind: str | None = None) -> Iterable[tuple[str, str, str, str]]:
+    """Yield (kind, ref, text, title) for every embeddable row.
+
+    ``title`` is used only for gemini-embedding-2 document prefixes; stored
+    ``chunk_text`` stays the unprefixed ``text``.
+    """
     if kind in (None, "episode"):
         cur.execute(
             "SELECT id, summary, decisions, preferences, topics, people FROM episodes ORDER BY id"
@@ -185,13 +250,13 @@ def _iter_sources(cur, *, kind: str | None = None) -> Iterable[tuple[str, str, s
                  "topics": topics, "people": people}
             )
             if text:
-                yield "episode", str(eid), text
+                yield "episode", str(eid), text, ""
     if kind in (None, "topic"):
         cur.execute("SELECT slug, title, body FROM topics WHERE deleted_at IS NULL ORDER BY slug")
         for slug, title, body in cur.fetchall():
             text = topic_text(slug, title, body)
             if text:
-                yield "topic", slug, text
+                yield "topic", slug, text, (title or slug or "")
 
 
 def _existing_hashes(cur, profile: str) -> dict[tuple[str, str, int], str]:
@@ -221,17 +286,33 @@ def _upsert_chunks(
         )
 
 
+def _api_texts(
+    profile: str, chunks: list[tuple[str, str]]
+) -> list[str]:
+    """Map (title, unprefixed_chunk) → API payload texts for this profile."""
+    if uses_task_prefixes(profile):
+        return [prefix_document(chunk, title=title) for title, chunk in chunks]
+    return [chunk for _, chunk in chunks]
+
+
 def backfill(
-    *, kind: str | None = None, limit: int | None = None, dry_run: bool = False
-) -> dict[str, int]:
-    """Embed every missing / changed chunk under the active profile. Idempotent."""
+    *,
+    kind: str | None = None,
+    limit: int | None = None,
+    dry_run: bool = False,
+    profile: str | None = None,
+) -> dict[str, Any]:
+    """Embed every missing / changed chunk under active or named profile. Idempotent."""
     from khipu.db import connect
 
-    stats = {"scanned": 0, "chunks": 0, "embedded": 0, "skipped_unchanged": 0,
-             "batches": 0, "orphans_removed": 0}
+    stats: dict[str, Any] = {
+        "scanned": 0, "chunks": 0, "embedded": 0, "skipped_unchanged": 0,
+        "batches": 0, "orphans_removed": 0, "profile": None,
+    }
     with connect() as conn:
         with conn.cursor() as cur:
-            profile = _active_profile(cur)
+            profile = _resolve_profile(cur, profile)
+            stats["profile"] = profile
             # ref is polymorphic (episodes.id | topics.slug) so it cannot carry an FK;
             # sweep vectors whose source row is gone or tombstoned so coverage never
             # over-reports (plan rule 4: a status that can't lie).
@@ -251,8 +332,9 @@ def backfill(
                 stats["orphans_removed"] = cur.rowcount
                 conn.commit()
             have = _existing_hashes(cur, profile)
-            todo: list[tuple[str, str, int, str, str]] = []
-            for k, ref, text in _iter_sources(cur, kind=kind):
+            # (kind, ref, idx, unprefixed_chunk, hash, title)
+            todo: list[tuple[str, str, int, str, str, str]] = []
+            for k, ref, text, title in _iter_sources(cur, kind=kind):
                 stats["scanned"] += 1
                 for i, chunk in enumerate(chunk_text(text)):
                     stats["chunks"] += 1
@@ -260,7 +342,7 @@ def backfill(
                     if have.get((k, ref, i)) == h:
                         stats["skipped_unchanged"] += 1
                         continue
-                    todo.append((k, ref, i, chunk, h))
+                    todo.append((k, ref, i, chunk, h, title))
                 if limit and len(todo) >= limit:
                     todo = todo[:limit]
                     break
@@ -270,10 +352,13 @@ def backfill(
                 return stats
             for start in range(0, len(todo), BATCH):
                 batch = todo[start : start + BATCH]
-                vecs = embed_batch([t for _, _, _, t, _ in batch])
+                # todo rows: (kind, ref, idx, chunk, hash, title)
+                api = _api_texts(profile, [(title, chunk) for _k, _r, _i, chunk, _h, title in batch])
+                vecs = embed_batch(api, profile=profile)
                 _upsert_chunks(
                     cur, profile,
-                    [(k, r, i, t, h, v) for (k, r, i, t, h), v in zip(batch, vecs)],
+                    [(k, r, i, chunk, h, v)
+                     for (k, r, i, chunk, h, _title), v in zip(batch, vecs)],
                 )
                 conn.commit()
                 stats["embedded"] += len(batch)
@@ -281,6 +366,41 @@ def backfill(
                 if stats["batches"] % 10 == 0:
                     _log(f"  {stats['embedded']}/{len(todo)}")
     return stats
+
+
+def activate(profile: str, *, force: bool = False) -> dict[str, Any]:
+    """Flip the one-active pointer to ``profile`` after coverage is complete.
+
+    Refuses when the target profile has missing episode/topic refs unless
+    ``force=True``. Search uses exactly one active profile.
+    """
+    from khipu.db import connect
+
+    profile = (profile or "").strip()
+    model_for_profile(profile)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM embedding_profiles WHERE id = %s", (profile,))
+            if not cur.fetchone():
+                raise ValueError(f"unknown embedding profile {profile!r}")
+            cov = coverage(profile=profile)
+            missing = (
+                cov["episodes"]["missing"] + cov["topics"]["missing"]
+            )
+            if missing and not force:
+                raise RuntimeError(
+                    f"refusing to activate {profile}: "
+                    f"{cov['episodes']['missing']} episodes and "
+                    f"{cov['topics']['missing']} topics still missing vectors "
+                    f"(pass force=True to override)"
+                )
+            cur.execute("UPDATE embedding_profiles SET is_active = false WHERE is_active")
+            cur.execute(
+                "UPDATE embedding_profiles SET is_active = true WHERE id = %s",
+                (profile,),
+            )
+            conn.commit()
+    return {"ok": True, "active_profile": profile, "coverage": cov, "forced": bool(force)}
 
 
 def embed_on_capture(payload: dict[str, Any]) -> bool:
@@ -307,14 +427,15 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
                     return False
                 eid = str(row[0])
                 chunks = chunk_text(episode_text(payload))
-                vecs = embed_batch(chunks)
+                api = _api_texts(profile, [("", c) for c in chunks])
+                vecs = embed_batch(api, profile=profile)
                 _upsert_chunks(
                     cur, profile,
                     [("episode", eid, i, c, _md5(c), v)
                      for i, (c, v) in enumerate(zip(chunks, vecs))],
                 )
             conn.commit()
-        _log(f"embed-on-capture ok episode={eid} chunks={len(chunks)}")
+        _log(f"embed-on-capture ok episode={eid} chunks={len(chunks)} profile={profile}")
         return True
     except Exception as exc:  # noqa: BLE001 — fail-open: capture is already durable
         _log(f"embed-on-capture skipped: {type(exc).__name__}: {exc}")
@@ -330,10 +451,11 @@ def semantic_search(
     query = (query or "").strip()
     if not query:
         return []
-    qlit = _vec_literal(embed_one(query))
     with connect() as conn:
         with conn.cursor() as cur:
             profile = _active_profile(cur)
+            api_q = prefix_query(query) if uses_task_prefixes(profile) else query
+            qlit = _vec_literal(embed_one(api_q, profile=profile))
             cur.execute(
                 """
                 SELECT m.kind, m.ref, m.chunk_idx,
@@ -360,13 +482,13 @@ def semantic_search(
             ]
 
 
-def coverage() -> dict[str, Any]:
-    """Per-kind coverage for the active profile — the 'status UI that can't lie'."""
+def coverage(*, profile: str | None = None) -> dict[str, Any]:
+    """Per-kind coverage for active or named profile — the 'status UI that can't lie'."""
     from khipu.db import connect
 
     with connect() as conn:
         with conn.cursor() as cur:
-            profile = _active_profile(cur)
+            profile = _resolve_profile(cur, profile)
             cur.execute("SELECT COUNT(*) FROM episodes")
             eps = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM topics WHERE deleted_at IS NULL")
@@ -383,6 +505,9 @@ def coverage() -> dict[str, Any]:
             profiles = [
                 {"id": i, "model": m, "dim": d, "active": a} for i, m, d, a in cur.fetchall()
             ]
+            cur.execute("SELECT id FROM embedding_profiles WHERE is_active LIMIT 1")
+            active_row = cur.fetchone()
+            active = active_row[0] if active_row else None
     e = by.get("episode", {"refs": 0, "chunks": 0})
     t = by.get("topic", {"refs": 0, "chunks": 0})
     def _pct(done: int, total: int) -> float:
@@ -396,7 +521,8 @@ def coverage() -> dict[str, Any]:
         return min(99.9, int(1000 * done / total) / 10)
 
     return {
-        "active_profile": profile,
+        "profile": profile,
+        "active_profile": active,
         "profiles": profiles,
         "episodes": {"total": eps, "embedded": e["refs"], "missing": max(0, eps - e["refs"]),
                      "chunks": e["chunks"], "pct": _pct(e["refs"], eps)},
@@ -437,7 +563,8 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     todo.append(("episode", str(eid), i, chunk, _md5(chunk)))
             for start in range(0, len(todo), BATCH):
                 batch = todo[start : start + BATCH]
-                vecs = embed_batch([t for _, _, _, t, _ in batch])
+                api = _api_texts(profile, [("", t) for _, _, _, t, _ in batch])
+                vecs = embed_batch(api, profile=profile)
                 _upsert_chunks(cur, profile,
                                [(k, r, i, t, h, v) for (k, r, i, t, h), v in zip(batch, vecs)])
                 conn.commit()
