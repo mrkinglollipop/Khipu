@@ -1,6 +1,6 @@
 """khipu-mcp — stdio MCP server (server id: ``khipu``).
 
-Reads (search, graph, status) are allowed in every ``capture_mode``.
+Reads (search, get, graph, status) are allowed in every ``capture_mode``.
 ``khipu_capture`` is a writer: the HTTPS gateway and no-hook hub installs may
 write; the local stdio server declines when ``khipu-stop-hook`` /
 ``khipu-aegis-capture`` is the writer (double-capture). ``legacy``/``dual``
@@ -9,8 +9,9 @@ gated here.
 
 Tools:
 
-  - ``khipu_search``  — per-kind-fair ILIKE search over topics/episodes/nodes
-  - ``khipu_graph``   — undirected neighborhood walk from a node id
+  - ``khipu_search``  — token-coverage ILIKE or hybrid semantic search
+  - ``khipu_get``     — full episode / topic / media row by search-hit id
+  - ``khipu_graph``   — undirected neighborhood; digit ids are episodes
   - ``khipu_status``  — PG counts + mirror lag (optional drift sample)
   - ``khipu_capture`` — hub writer on the HTTPS gateway / no-hook installs;
     local stdio + capture hook declines with an error pointing at the hook.
@@ -126,12 +127,15 @@ TOOLS: list[dict] = [
     {
         "name": "khipu_search",
         "description": (
-            "Search Khipu memory. Default: deterministic per-kind-fair ILIKE over "
-            "topics/episodes/graph nodes. semantic=true: cosine top-k over the "
-            "active embedding profile (episodes + topics + media), with a score. Returns "
+            "Search Khipu memory. Default: per-kind-fair ILIKE ranked by how "
+            "many query tokens match (not the whole phrase as one substring) "
+            "over topics/episodes/graph nodes. semantic=true: cosine oversample "
+            "fused with token overlap (RRF) over the active embedding profile "
+            "(episodes + topics + media), with a score. Returns "
             "JSON rows of {kind, id, label, snippet[, score]} plus additive "
             "paths (filesystem tokens) and neighbors (capped 1-hop wiki/path "
-            "edges) on topic hits. Tombstoned topics are excluded."
+            "edges) on topic hits. Tombstoned topics are excluded. Snippets "
+            "are word-boundary teasers; call khipu_get for the full row."
         ),
         "inputSchema": {
             "type": "object",
@@ -149,7 +153,10 @@ TOOLS: list[dict] = [
                 },
                 "semantic": {
                     "type": "boolean",
-                    "description": "Cosine search over embeddings instead of ILIKE (default false)",
+                    "description": (
+                        "Cosine fused with query-term overlap instead of ILIKE "
+                        "(default false)"
+                    ),
                 },
                 "kind": {
                     "type": "string",
@@ -162,12 +169,42 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "khipu_get",
+        "description": (
+            "Load a search hit by id. Episodes: full summary, decisions, "
+            "preferences, topics (not the capture raw blob). Topics: full "
+            "page body. Media: path/sha256/mime. Search snippets are teasers; "
+            "use this instead of guessing from a clipped line."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": (
+                        "Episode id (digits), topic slug, or media_assets id"
+                    ),
+                },
+                "kind": {
+                    "type": "string",
+                    "description": (
+                        "Optional: 'episode', 'topic', or 'media'. "
+                        "Inferred from id when omitted."
+                    ),
+                },
+            },
+            "required": ["id"],
+        },
+    },
+    {
         "name": "khipu_graph",
         "description": (
             "Neighborhood of a graph node id (undirected). hops=1 returns "
             "direct edges; hops>=2 walks a recursive undirected CTE ordered "
             "hops-then-node. Topic slugs from search expand as "
-            "{slug, topic:slug, memory_topic:slug}."
+            "{slug, topic:slug, memory_topic:slug}. Digit ids are episodes: "
+            "the walk is that episode's capture topics (synthetic "
+            "capture_topic edges), not a node named with the episode number."
         ),
         "inputSchema": {
             "type": "object",
@@ -271,6 +308,47 @@ def _tool_search(args: dict) -> dict:
             }
 
 
+def _tool_get(args: dict) -> dict:
+    ident = (args.get("id") or "").strip()
+    if not ident:
+        raise ValueError("id is required")
+    kind = (args.get("kind") or "").strip().lower() or None
+    if kind not in (None, "episode", "topic", "media"):
+        raise ValueError("kind must be 'episode', 'topic', or 'media'")
+    _ensure_path()
+    from khipu.activity import episode_detail, media_detail, topic_detail
+
+    inferred = kind
+    if inferred is None:
+        inferred = "episode" if ident.isdigit() else "topic"
+
+    if inferred == "episode":
+        if not ident.isdigit():
+            raise ValueError("episode id must be digits")
+        row = episode_detail(int(ident))
+        if row is None:
+            if kind is not None:
+                raise ValueError(f"episode not found: {ident}")
+            inferred = "topic"
+        else:
+            row = dict(row)
+            row.pop("raw", None)
+            return {"kind": "episode", **row}
+    if inferred == "topic":
+        row = topic_detail(ident)
+        if row is None and kind is None:
+            media = media_detail(ident)
+            if media is not None:
+                return {"kind": "media", **media}
+        if row is None:
+            raise ValueError(f"topic not found: {ident}")
+        return {"kind": "topic", **row}
+    row = media_detail(ident)
+    if row is None:
+        raise ValueError(f"media not found: {ident}")
+    return {"kind": "media", **row}
+
+
 def _tool_graph(args: dict) -> dict:
     node_id = (args.get("id") or "").strip()
     if not node_id:
@@ -329,6 +407,7 @@ def _tool_capture(args: dict) -> dict:
 
 TOOL_FUNCS = {
     "khipu_search": _tool_search,
+    "khipu_get": _tool_get,
     "khipu_graph": _tool_graph,
     "khipu_status": _tool_status,
     "khipu_capture": _tool_capture,

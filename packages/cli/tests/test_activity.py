@@ -69,6 +69,38 @@ class EpisodeDetailTest(unittest.TestCase):
         self.assertEqual(out["raw"], {"r": 2})
 
 
+class TopicDetailTest(unittest.TestCase):
+    def test_a_missing_slug_is_none(self):
+        cur = FakeCursor([[]])
+        with mock.patch.object(activity, "connect", return_value=FakeConn(cur)):
+            self.assertIsNone(activity.topic_detail("nope"))
+
+    def test_detail_shape(self):
+        created = dt.datetime(2026, 8, 17, 12, 0)
+        row = ("khipu", "Khipu", "body text", "active", created, created, [], "/x.md")
+        cur = FakeCursor([[row]])
+        with mock.patch.object(activity, "connect", return_value=FakeConn(cur)):
+            out = activity.topic_detail("khipu")
+        self.assertEqual(out["slug"], "khipu")
+        self.assertEqual(out["body"], "body text")
+        self.assertEqual(out["created_at"], "2026-08-17T12:00:00")
+
+
+class RecentClipTest(unittest.TestCase):
+    def test_long_summaries_are_clipped_on_a_word(self):
+        long = (
+            "The session also included a discussion about Khipu retrieval. "
+            * 20
+        )
+        cur = FakeCursor([[_episode_row(summary=long)]])
+        with mock.patch.object(activity, "connect", return_value=FakeConn(cur)):
+            out = activity.recent_episodes(limit=1)
+        s = out[0]["summary"]
+        self.assertTrue(s.endswith("…"))
+        self.assertLess(len(s), len(long))
+        self.assertFalse(s.rstrip("…").endswith("include"))
+
+
 class ActivityPayloadTest(unittest.TestCase):
     """Query order: COUNT, MAX/lag, ops_events regclass, [ops rows], recent."""
 

@@ -168,21 +168,28 @@ khipu search "why did we pick pgvector" --semantic   # meaning
 khipu graph <node-id> --hops 2                       # connections
 ```
 
-**Keyword** search is `ILIKE` across topic bodies, episode summaries, and node
-names. It queries each kind separately with its own ordering, so a flood of
-matching episodes cannot starve out the one topic page you actually wanted.
+**Keyword** search is token-coverage `ILIKE` across topic bodies, episode
+summaries, and node names — a multi-word query ranks by how many tokens hit,
+not whether the whole phrase appears as one substring. It queries each kind
+separately with its own ordering, so a flood of matching episodes cannot
+starve out the one topic page you actually wanted.
 
 **Semantic** search embeds the query with the **active** embedding profile
 (`gemini-embedding-2@768`; `gemini-embedding-001` @ 768 retained as inactive
-rollback) and ranks by cosine distance against
-`memory_embeddings`, using an HNSW index. Embeddings are keyed by content hash,
-so re-embedding only touches text that actually changed.
+rollback), oversamples cosine neighbors, then fuses that order with query-term
+overlap (reciprocal-rank fusion) so a meaning search still prefers hits that
+name the question. Embeddings are keyed by content hash, so re-embedding only
+touches text that actually changed.
 
-**Graph** traversal expands a node into its neighbours — the path from a
-decision to the thing it constrained.
+**Graph** traversal expands wiki/path/graphify nodes. Digit ids from search
+are episodes: the neighborhood is that capture's topic slugs, not a node
+named `9320`.
 
-Agents reach these through the MCP tools `khipu_search`, `khipu_graph`,
-`khipu_status`, and `khipu_capture`.
+Agents reach these through the MCP tools `khipu_search`, `khipu_get`,
+`khipu_graph`, `khipu_status`, and `khipu_capture`. Search returns
+word-boundary teasers; `khipu_get` loads the full episode, topic, or media
+(path/sha256/mime). Claude Code SessionStart injects the recall rule plus a
+small cwd-scoped (else recents) slice so memory is pushed, not only pulled.
 
 ### 4. Where it runs
 

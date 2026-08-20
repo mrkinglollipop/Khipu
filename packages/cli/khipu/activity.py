@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from khipu.db import connect
+from khipu.snippets import SNIPPET_LIMIT, clip_snippet
 
 
 def _recent_rows(cur, limit: int) -> list[dict]:
@@ -10,7 +11,7 @@ def _recent_rows(cur, limit: int) -> list[dict]:
     cur.execute(
         """
         SELECT id, ts, ingested_at, session_id, scope,
-               left(summary, 280) AS summary,
+               summary,
                topics, decisions, preferences,
                now() - ingested_at AS mirror_age
         FROM episodes
@@ -30,7 +31,7 @@ def _recent_rows(cur, limit: int) -> list[dict]:
                 "ingested_at": r[2].isoformat() if r[2] else None,
                 "session_id": r[3],
                 "scope": r[4],
-                "summary": r[5],
+                "summary": clip_snippet(r[5], SNIPPET_LIMIT),
                 "topics": r[6],
                 "decisions": r[7],
                 "preferences": r[8],
@@ -74,6 +75,69 @@ def episode_detail(episode_id: int) -> dict | None:
         "preferences": r[9],
         "edges": r[10],
         "raw": r[11],
+    }
+
+
+def topic_detail(slug: str) -> dict | None:
+    """Full topic page for MCP ``khipu_get``. Tombstones are not found."""
+    slug = (slug or "").strip()
+    if not slug:
+        return None
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT slug, title, body, status, created_at, updated_at,
+                       links, source_path
+                FROM topics
+                WHERE slug = %s AND deleted_at IS NULL
+                """,
+                (slug,),
+            )
+            r = cur.fetchone()
+    if not r:
+        return None
+    return {
+        "slug": r[0],
+        "title": r[1],
+        "body": r[2],
+        "status": r[3],
+        "created_at": r[4].isoformat() if r[4] else None,
+        "updated_at": r[5].isoformat() if r[5] else None,
+        "links": r[6],
+        "source_path": r[7],
+    }
+
+
+def media_detail(asset_id: str) -> dict | None:
+    """media_assets row for MCP ``khipu_get``. Missing table → not found."""
+    asset_id = (asset_id or "").strip()
+    if not asset_id:
+        return None
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.media_assets') IS NOT NULL")
+            if not cur.fetchone()[0]:
+                return None
+            cur.execute(
+                """
+                SELECT id, source_id, path, sha256, mime, bytes, created_at
+                FROM media_assets
+                WHERE id = %s
+                """,
+                (asset_id,),
+            )
+            r = cur.fetchone()
+    if not r:
+        return None
+    return {
+        "id": r[0],
+        "source_id": r[1],
+        "path": r[2],
+        "sha256": r[3],
+        "mime": r[4],
+        "bytes": r[5],
+        "created_at": r[6].isoformat() if r[6] else None,
     }
 
 

@@ -3,8 +3,8 @@ Postgres (Grok Bot / Cursor cloud agents run on xAI's Linux VMs, outside the
 private network).
 
 Decision 2026-08-17 (maintainer decision, option B): Postgres stays private. This process runs
-next to the database, behind a TLS-terminating reverse proxy, and exposes exactly the four MCP
-tools (`khipu_search`, `khipu_graph`, `khipu_status`, `khipu_capture`) that the
+next to the database, behind a TLS-terminating reverse proxy, and exposes exactly the MCP
+tools (`khipu_search`, `khipu_get`, `khipu_graph`, `khipu_status`, `khipu_capture`) that the
 stdio server exposes locally — same `handle_message`, different transport. The
 cloud agent needs nothing installed: no Python libs, no DSN, no Gemini key; a
 URL and a bearer token in its `.cursor/mcp.json`.

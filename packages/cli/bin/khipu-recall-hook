@@ -35,14 +35,5 @@ export PYTHONPATH
 mkdir -p "${HOME}/Library/Logs/khipu" 2>/dev/null
 PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
 [ -x "$PY" ] || PY="python3"
-cat >/dev/null 2>&1
-"$PY" - <<'PY' 2>/dev/null || echo '{}'
-import json
-try:
-    from khipu.recall_rule import claude_additional_context
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
-                                             "additionalContext": claude_additional_context()}}))
-except Exception:
-    print("{}")
-PY
+"$PY" -c "from khipu.recall_rule import session_start_main; session_start_main()" 2>/dev/null || echo '{}'
 exit 0

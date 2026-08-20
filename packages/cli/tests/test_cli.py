@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import unittest
 
-from khipu.cli import _escape_like, _fair_shares, _graph_query, _search_query
+from khipu.cli import _escape_like, _fair_shares, _graph_query, _search_query, _token_match_sql
 
 # The audit's own counterexample node (ops/notes/p2-audit-2026-08-09.md F4):
 # hops=1 returns 91 distinct neighbors, including
@@ -75,6 +75,14 @@ class FairSharesTest(unittest.TestCase):
     def test_shares_sum_to_total_when_evenly_divisible(self) -> None:
         shares = _fair_shares(30, 3)
         self.assertEqual(sum(shares), 30)
+
+
+class TokenMatchSqlTest(unittest.TestCase):
+    def test_two_tokens_or_and_score(self) -> None:
+        where, score = _token_match_sql(("summary",), 2)
+        self.assertIn("summary ILIKE %(t0)s", where)
+        self.assertIn(" OR ", where)
+        self.assertIn("CASE WHEN", score)
 
 
 @unittest.skipUnless(PG_AVAILABLE, "Postgres unreachable; skipping live query-shape tests")
@@ -175,6 +183,43 @@ class SearchQueryTest(unittest.TestCase):
         self.assertGreaterEqual(
             len(kinds), 2, f"expected results from multiple kinds, got only {kinds}"
         )
+
+    def test_multi_token_query_is_not_one_giant_substring(self) -> None:
+        from khipu.db import connect
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                hits = _search_query(cur, "openbot ingest PR 36", 12)
+        snippets = " ".join(
+            (r.get("snippet") or r.get("label") or "").lower() for r in hits
+        )
+        if "openbot" not in snippets:
+            self.skipTest("no OpenBot rows in live hub")
+        self.assertTrue(
+            any(r["kind"] == "episode" for r in hits),
+            hits,
+        )
+
+    def test_digit_id_graph_uses_episode_topics(self) -> None:
+        from khipu.db import connect
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM episodes WHERE topics IS NOT NULL "
+                    "AND jsonb_array_length(topics) > 0 "
+                    "ORDER BY id DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                if row is None:
+                    self.skipTest("no episode with topics")
+                eid = str(row[0])
+                out = _graph_query(cur, eid, 1, 25)
+        self.assertIn("episode", out)
+        self.assertFalse(out["episode"]["missing"])
+        self.assertTrue(out["episode"]["topics"])
+        tagged = [e for e in out["edges"] if e.get("type") == "capture_topic"]
+        self.assertEqual(len(tagged), len(out["episode"]["topics"]))
 
 
 if __name__ == "__main__":

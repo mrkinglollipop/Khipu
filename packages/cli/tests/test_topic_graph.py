@@ -25,6 +25,7 @@ from khipu.topic_graph import (
     parse_frontmatter_links,
     persist_topic_graph,
     topic_aliases,
+    topic_slug_from_label,
 )
 
 UNSEEN_BODY = """## A-cut fill + Klein corpus (2026-07-26)
@@ -100,6 +101,29 @@ class AliasExpandTest(unittest.TestCase):
     def test_code_node_stays_singleton(self) -> None:
         nid = "module:skills__shared_predictive_gates_scripts_signals_py"
         self.assertEqual(graph_query_aliases(nid), [nid])
+
+    def test_digit_id_is_not_a_topic_slug(self) -> None:
+        self.assertEqual(graph_query_aliases("9320"), [])
+
+    def test_topic_slug_from_label_folds_case(self) -> None:
+        self.assertEqual(topic_slug_from_label("OpenBot"), "openbot")
+        self.assertEqual(topic_slug_from_label("CopilotKit OpenBot"), "copilotkit-openbot")
+
+    def test_persist_capture_graph_stars_from_first_topic(self) -> None:
+        from khipu import topic_graph as tg
+
+        with mock.patch.object(
+            tg, "persist_topic_graph", return_value={"nodes_minted": 1, "edges_minted": 1}
+        ) as persist:
+            stats = tg.persist_capture_graph(
+                mock.Mock(),
+                {"topics": ["OpenBot", "khipu"], "summary": "see `AI/Guides/x.md`"},
+            )
+        self.assertEqual(persist.call_count, 2)
+        first = persist.call_args_list[0].args[1]
+        self.assertEqual(first["slug"], "openbot")
+        self.assertEqual(first["links"], ["khipu"])
+        self.assertEqual(stats["nodes_minted"], 2)
 
     def test_never_double_prefix(self) -> None:
         aliases = topic_aliases("topic:unseen-war-intro")
