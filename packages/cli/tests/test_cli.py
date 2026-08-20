@@ -10,7 +10,14 @@ from __future__ import annotations
 
 import unittest
 
-from khipu.cli import _escape_like, _fair_shares, _graph_query, _search_query, _token_match_sql
+from khipu.cli import (
+    _EPISODE_ILIKE_COLUMNS,
+    _escape_like,
+    _fair_shares,
+    _graph_query,
+    _search_query,
+    _token_match_sql,
+)
 
 # The audit's own counterexample node (ops/notes/p2-audit-2026-08-09.md F4):
 # hops=1 returns 91 distinct neighbors, including
@@ -83,6 +90,13 @@ class TokenMatchSqlTest(unittest.TestCase):
         self.assertIn("summary ILIKE %(t0)s", where)
         self.assertIn(" OR ", where)
         self.assertIn("CASE WHEN", score)
+
+    def test_episode_columns_include_extract_json(self) -> None:
+        blob = " ".join(_EPISODE_ILIKE_COLUMNS)
+        for need in ("summary", "topics::text", "decisions::text", "preferences::text"):
+            self.assertIn(need, blob)
+        where, _score = _token_match_sql(_EPISODE_ILIKE_COLUMNS, 1)
+        self.assertIn("topics::text", where)
 
 
 @unittest.skipUnless(PG_AVAILABLE, "Postgres unreachable; skipping live query-shape tests")

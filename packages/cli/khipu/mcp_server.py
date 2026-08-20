@@ -129,8 +129,9 @@ TOOLS: list[dict] = [
         "description": (
             "Search Khipu memory. Default: per-kind-fair ILIKE ranked by how "
             "many query tokens match (not the whole phrase as one substring) "
-            "over topics/episodes/graph nodes. semantic=true: cosine oversample "
-            "fused with token overlap (RRF) over the active embedding profile "
+            "over topics/episodes (summary + extract fields)/graph nodes. "
+            "semantic=true: cosine oversample fused with token overlap (RRF) "
+            "over the embedded text (not the teaser) on the active profile "
             "(episodes + topics + media), with a score. Returns "
             "JSON rows of {kind, id, label, snippet[, score]} plus additive "
             "paths (filesystem tokens) and neighbors (capped 1-hop wiki/path "

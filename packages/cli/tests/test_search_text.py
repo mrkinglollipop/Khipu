@@ -57,6 +57,28 @@ class HybridRerankTest(unittest.TestCase):
         )
         self.assertEqual(out[0]["id"], "9313")
 
+    def test_rank_text_lifts_extract_hit_when_snippet_misses(self) -> None:
+        rows = [
+            {
+                "id": "high-cosine",
+                "score": 0.90,
+                "snippet": "keyboard path fail silently",
+                "rank_text": "keyboard path fail silently",
+            },
+            {
+                "id": "tagged",
+                "score": 0.68,
+                "snippet": "PR 601 Team auto routing",
+                "rank_text": "PR 601 Team auto routing topics: recap-chip; team",
+            },
+        ]
+        out = hybrid_rerank(
+            rows,
+            "why did the recap chip silently produce nothing in a Team session",
+            limit=2,
+        )
+        self.assertEqual(out[0]["id"], "tagged")
+
     def test_empty_tokens_keep_input_order(self) -> None:
         rows = [{"id": "a", "snippet": "x"}, {"id": "b", "snippet": "y"}]
         out = hybrid_rerank(rows, "the a", limit=2)

@@ -32,8 +32,10 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
 - Before answering anything that might have prior context (a project, a
   decision, a preference, "what did we do about X"), call `khipu_search` with a
   short natural-language query. Set `semantic: true` for meaning-based recall
-  (cosine fused with query-term overlap). Default ILIKE ranks by how many
-  query tokens match, not the whole phrase as one substring.
+  (cosine fused with query-term overlap over the embedded text, including
+  capture extract fields). Default ILIKE ranks by how many query tokens match
+  episode summaries *and* topics/decisions/preferences/people, not the whole
+  phrase as one substring.
 - `khipu_get` loads a search hit by id: full episode (summary, decisions,
   preferences, topics), a topic page, or media (path/sha256/mime). Search
   snippets are teasers; fetch the hit instead of guessing from a clipped line.

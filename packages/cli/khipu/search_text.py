@@ -81,9 +81,23 @@ def token_hit_count(text: str, tokens: Sequence[str]) -> int:
 
 
 def _row_text(row: Mapping[str, Any]) -> str:
-    return " ".join(
-        str(row.get(k) or "") for k in ("label", "snippet", "id")
-    )
+    """Text the RRF token-overlap side may see.
+
+    Search teasers stay summary-only. Ranking uses ``rank_text`` when present
+    so extract fields that were already embedded (topics / decisions /
+    preferences / people) can lift a hit whose snippet never names them.
+    """
+    parts: list[str] = []
+    for key in ("label", "snippet", "id", "rank_text"):
+        val = row.get(key)
+        if val:
+            parts.append(str(val))
+    extra = row.get("topics")
+    if isinstance(extra, (list, tuple)):
+        parts.extend(str(item) for item in extra if item)
+    elif extra:
+        parts.append(str(extra))
+    return " ".join(parts)
 
 
 def hybrid_rerank(
@@ -92,8 +106,8 @@ def hybrid_rerank(
     """Reciprocal-rank fusion of current order (cosine) with token-hit order.
 
     Cosine-alone left relevant and irrelevant episodes in a 0.02-wide band.
-    Fusing token overlap lifts hits that actually name the query terms without
-    a second embedding call.
+    Fusing token overlap lifts hits that actually name the query terms
+    (including extract fields in ``rank_text``) without a second embedding call.
     """
     want = max(1, int(limit))
     material = [dict(r) for r in rows]

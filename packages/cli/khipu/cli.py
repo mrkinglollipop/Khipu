@@ -336,6 +336,18 @@ def _ilike_token_params(tokens: list[str]) -> dict[str, str]:
     return {f"t{i}": f"%{_escape_like(tok)}%" for i, tok in enumerate(tokens)}
 
 
+# Episode ILIKE used to search summary only, so a capture tagged
+# ``recap-chip`` was invisible unless the summary also said those words.
+# Extract JSON is the same family episode_text() already embeds.
+_EPISODE_ILIKE_COLUMNS = (
+    "summary",
+    "COALESCE(topics::text, '')",
+    "COALESCE(decisions::text, '')",
+    "COALESCE(preferences::text, '')",
+    "COALESCE(people::text, '')",
+)
+
+
 def _search_query(cur, term: str, limit: int) -> list[dict]:
     """Deterministically-ordered, per-kind-fair ILIKE search (F7).
 
@@ -359,7 +371,9 @@ def _search_query(cur, term: str, limit: int) -> list[dict]:
             "OR COALESCE(title, '') ILIKE %(q)s ESCAPE '\\'"
         )
         topic_order = "slug ASC"
-        episode_where = "summary ILIKE %(q)s ESCAPE '\\'"
+        episode_where = " OR ".join(
+            f"{c} ILIKE %(q)s ESCAPE '\\'" for c in _EPISODE_ILIKE_COLUMNS
+        )
         episode_order = "ts DESC NULLS LAST, id DESC"
         node_where = (
             "id ILIKE %(q)s ESCAPE '\\' OR COALESCE(name, '') ILIKE %(q)s ESCAPE '\\'"
@@ -372,7 +386,7 @@ def _search_query(cur, term: str, limit: int) -> list[dict]:
             ("body", "slug", "COALESCE(title, '')"), n
         )
         topic_order = f"({topic_score}) DESC, slug ASC"
-        episode_where, episode_score = _token_match_sql(("summary",), n)
+        episode_where, episode_score = _token_match_sql(_EPISODE_ILIKE_COLUMNS, n)
         episode_order = f"({episode_score}) DESC, ts DESC NULLS LAST, id DESC"
         node_where, node_score = _token_match_sql(("id", "COALESCE(name, '')"), n)
         node_order = f"({node_score}) DESC, id ASC"
