@@ -183,6 +183,7 @@ type DoctorJobs = {
   nightly?: JobEntry;
   monthly?: JobEntry;
   graph_build?: JobEntry;
+  embed_media_backfill?: JobEntry;
 };
 
 async function spawnKhipu(subcommand: string): Promise<{
@@ -911,7 +912,13 @@ export default function App() {
   const [importSource, setImportSource] = useState("");
   const [pathsMsg, setPathsMsg] = useState<string | null>(null);
   const [graphSources, setGraphSources] = useState<
-    Array<{ id: string; kind: string; enabled?: boolean; root?: string }>
+    Array<{
+      id: string;
+      kind: string;
+      enabled?: boolean;
+      root?: string;
+      embed_media?: boolean;
+    }>
   >([]);
   const [graphSourcesResolved, setGraphSourcesResolved] = useState<{
     unreachable?: Array<{ id?: string; root?: string }>;
@@ -946,6 +953,7 @@ export default function App() {
           kind: string;
           enabled?: boolean;
           root?: string;
+          embed_media?: boolean;
         }>;
         resolved?: { unreachable?: Array<{ id?: string; root?: string }> };
         graph_producer?: boolean;
@@ -1055,6 +1063,30 @@ export default function App() {
         const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
         if (!parsed?.ok) {
           setGraphSourcesMsg(parsed?.error ?? "sources command failed");
+          return;
+        }
+        await loadGraphSources();
+      } catch (e) {
+        setGraphSourcesMsg(String(e));
+      }
+    },
+    [graphSourcesProducer, loadGraphSources],
+  );
+
+  const toggleEmbedMedia = useCallback(
+    async (id: string, embedMedia: boolean) => {
+      if (!graphSourcesProducer) return;
+      setGraphSourcesMsg(null);
+      try {
+        const raw = await runKhipu([
+          "sources",
+          "set-embed-media",
+          id,
+          embedMedia ? "on" : "off",
+        ]);
+        const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
+        if (!parsed?.ok) {
+          setGraphSourcesMsg(parsed?.error ?? "set-embed-media failed");
           return;
         }
         await loadGraphSources();
@@ -1297,6 +1329,24 @@ export default function App() {
     mirrorLag == null ? "neutral" : lagFresh ? "ok" : "warn";
   const lagStatusLabel =
     mirrorLag == null ? "—" : lagFresh ? "fresh" : "stale";
+
+  const renderOnDemandJobRow = (
+    label: string,
+    entry: JobEntry | undefined,
+  ) => (
+    <div key={label} className="row-item">
+      <span className="row-main">{label}</span>
+      <span className="row-meta">
+        on demand
+        {entry?.last_run_iso
+          ? ` · last ${formatTs(entry.last_run_iso)}`
+          : " · never"}
+        {entry?.last_exit != null && entry.last_exit !== 0
+          ? ` · exit ${entry.last_exit}`
+          : ""}
+      </span>
+    </div>
+  );
 
   const renderJobRow = (
     label: string,
@@ -1557,6 +1607,11 @@ export default function App() {
                 {renderJobRow("Nightly consolidate", doctorJobs.nightly, "nightly")}
                 {renderJobRow("Graph build", doctorJobs.graph_build, "graph-build")}
                 {renderJobRow("Monthly consolidate", doctorJobs.monthly, "monthly")}
+                <div className="rows-head">On demand</div>
+                {renderOnDemandJobRow(
+                  "Embed media backfill",
+                  doctorJobs.embed_media_backfill,
+                )}
               </div>
             ) : null}
             {jobSpawnMsg ? <pre className="code">{jobSpawnMsg}</pre> : null}
@@ -2112,6 +2167,11 @@ export default function App() {
                 {renderJobRow("Nightly consolidate", doctorJobs.nightly, "nightly")}
                 {renderJobRow("Graph build", doctorJobs.graph_build, "graph-build")}
                 {renderJobRow("Monthly consolidate", doctorJobs.monthly, "monthly")}
+                <div className="rows-head">On demand</div>
+                {renderOnDemandJobRow(
+                  "Embed media backfill",
+                  doctorJobs.embed_media_backfill,
+                )}
               </div>
             ) : null}
             {jobSpawnMsg ? <pre className="code">{jobSpawnMsg}</pre> : null}
@@ -2267,6 +2327,9 @@ export default function App() {
                   build. Takes effect on the next graph build (Status → Graph
                   build, or tonight&apos;s 02:17). Unchecking does not purge
                   Postgres — it only skips collectors on the next sqlite rebuild.
+                  &quot;Embed images&quot; opts a rooted source into native Gemini
+                  Embedding 2 PNG/JPEG ingest (default off; CLI{" "}
+                  <code>khipu embed-media-backfill</code>).
                 </p>
                 {!graphSourcesProducer ? (
                   <p className="muted">
@@ -2285,6 +2348,7 @@ export default function App() {
                         : "ok";
                     const userCode =
                       row.kind === "code_ast" && row.id !== "code:claude";
+                    const hasRoot = Boolean(row.root);
                     return (
                       <div key={row.id} className="row-item">
                         <label className="row-main">
@@ -2301,6 +2365,21 @@ export default function App() {
                             <span className="muted mono"> {row.root}</span>
                           ) : null}
                         </label>
+                        {hasRoot ? (
+                          <label className="row-meta" title="Native PNG/JPEG into active Gemini Embedding 2 profile">
+                            <input
+                              type="checkbox"
+                              checked={Boolean(row.embed_media)}
+                              disabled={!graphSourcesProducer}
+                              onChange={(e) =>
+                                void toggleEmbedMedia(row.id, e.target.checked)
+                              }
+                            />{" "}
+                            Embed images
+                          </label>
+                        ) : (
+                          <span className="row-meta muted">no root</span>
+                        )}
                         <span className="row-meta">{status}</span>
                         {graphSourcesProducer && userCode ? (
                           <button

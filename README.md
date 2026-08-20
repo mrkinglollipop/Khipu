@@ -338,7 +338,7 @@ person's servers, not the product.
 | **P2** Truthful signals, graph hop symmetry, idempotent reconcile, tombstones | Shipped |
 | **P3** PG 19, dual-write capture, vectors and semantic search, five harness packs, recall rules | Shipped |
 | **Soak** ≥ 7 days with two Macs on the same database | In progress |
-| **P4** Model roles, embedding profiles, corpus picker (Settings + `khipu sources`), selective vision | Partial — Settings Models (synth live / embed persist / vision off) + corpus picker shipped; profiles, Firecrawl, vision ingest still Planned |
+| **P4** Model roles, embedding profiles, corpus picker (Settings + `khipu sources`), selective vision | Partial — Settings Models + corpus picker shipped; **native** PNG/JPEG ingest into `gemini-embedding-2@768` (per-source `embed_media`, `khipu embed-media-backfill`) shipped; embed-profiles UI, Firecrawl, caption/`models.vision` still Planned |
 
 ## Setting it up
 
@@ -457,8 +457,10 @@ database never has to.
 **Can I use a model other than Gemini?**
 For **session capture summaries (synth)**: yes — Settings → Models can point at a
 local OpenAI-compatible endpoint (Ollama, LM Studio, etc.). Embeddings still use
-the active Gemini embed profile until the profiles cut. Vision ingest is not
-shipped yet (picker defaults to off).
+the active Gemini embed profile until the profiles cut. **Native** image vectors
+(PNG/JPEG into the same `gemini-embedding-2@768` profile) are opt-in per source
+via `embed_media` + `khipu embed-media-backfill`. Caption / `models.vision`
+ingest is still not shipped (picker defaults to off).
 
 **What happens when I'm offline, or the database is down?**
 Captures queue in a local outbox and replay when the database is back;

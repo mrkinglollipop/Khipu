@@ -51,6 +51,8 @@ last failure per harness. ``liveness()`` turns that into a red/green answer to
 from __future__ import annotations
 
 import glob
+import base64
+import hashlib
 import json
 import os
 import re
@@ -291,6 +293,264 @@ def _parse_line(d: dict) -> list[tuple[str, str]]:
         out.extend(("tool", t) for t in tools)
         return out
     return []
+
+
+# PNG/JPEG only (same table as embed_batch_images). Drain lands files; the hook
+# does not — Aegis hooks cannot write ~/.config/khipu. Embed stays on
+# ``khipu embed-media-backfill``.
+_LAND_MIME_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+}
+_MAX_LAND_BYTES = 4 * 1024 * 1024
+
+
+def _normalize_land_mime(mime: str | None) -> str | None:
+    raw = (mime or "").strip().lower().split(";")[0].strip()
+    if raw == "image/jpg":
+        raw = "image/jpeg"
+    if raw in ("image/png", "image/jpeg"):
+        return raw
+    return None
+
+
+def _bytes_from_b64(data: str | None, mime: str | None) -> tuple[bytes, str] | None:
+    mime_n = _normalize_land_mime(mime)
+    if not mime_n or not isinstance(data, str) or not data.strip():
+        return None
+    try:
+        raw = base64.b64decode(data, validate=False)
+    except (ValueError, TypeError):
+        return None
+    if not raw or len(raw) > _MAX_LAND_BYTES:
+        return None
+    return raw, mime_n
+
+
+def _bytes_from_data_uri(value: str) -> tuple[bytes, str] | None:
+    if not value.startswith("data:image/"):
+        return None
+    try:
+        header, b64 = value.split(",", 1)
+    except ValueError:
+        return None
+    mime = header[5:].split(";")[0]
+    return _bytes_from_b64(b64, mime)
+
+
+def _land_allow_roots(
+    transcript_path: Path,
+    dest_root: Path,
+    source_roots: list[Path],
+) -> list[Path]:
+    """Resolved trees a JSONL filesystem image path may be copied from."""
+    roots: list[Path] = []
+    for candidate in (transcript_path.parent, dest_root, *source_roots):
+        try:
+            roots.append(candidate.resolve())
+        except OSError:
+            continue
+    return roots
+
+
+def _path_under_roots(resolved: Path, allow_roots: list[Path]) -> bool:
+    for root in allow_roots:
+        try:
+            if resolved.is_relative_to(root):
+                return True
+        except (ValueError, OSError):
+            continue
+    return False
+
+
+def _bytes_from_local_path(
+    value: Any,
+    allow_roots: list[Path] | None = None,
+) -> tuple[bytes, str] | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if value.startswith("data:image/"):
+        return _bytes_from_data_uri(value)
+    if value.startswith("http://") or value.startswith("https://"):
+        return None
+    p = Path(value)
+    if value.startswith("file://"):
+        p = Path(value[7:])
+    if not p.is_absolute():
+        return None
+    try:
+        resolved = p.resolve()
+    except OSError:
+        return None
+    # resolve() first; leftover `..` or a path that escaped the allowlist
+    # (including symlink traversal) must not be copied.
+    if ".." in resolved.parts:
+        return None
+    if not _path_under_roots(resolved, allow_roots or []):
+        return None
+    if not resolved.is_file():
+        return None
+    mime = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+    }.get(resolved.suffix.lower())
+    if not mime:
+        return None
+    try:
+        nbytes = resolved.stat().st_size
+    except OSError:
+        return None
+    if nbytes > _MAX_LAND_BYTES:
+        return None
+    try:
+        raw = resolved.read_bytes()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    return raw, mime
+
+
+def _image_blobs_from_obj(
+    obj: Any,
+    *,
+    allow_roots: list[Path] | None = None,
+    depth: int = 0,
+) -> list[tuple[bytes, str]]:
+    if depth > 12 or obj is None:
+        return []
+    found: list[tuple[bytes, str]] = []
+    if isinstance(obj, str):
+        blob = _bytes_from_data_uri(obj)
+        return [blob] if blob else []
+    if isinstance(obj, list):
+        for item in obj:
+            found.extend(
+                _image_blobs_from_obj(item, allow_roots=allow_roots, depth=depth + 1)
+            )
+        return found
+    if not isinstance(obj, dict):
+        return []
+    inline = obj.get("inline_data") or obj.get("inlineData")
+    if isinstance(inline, dict):
+        blob = _bytes_from_b64(
+            inline.get("data") if isinstance(inline.get("data"), str) else None,
+            inline.get("mime_type") or inline.get("mimeType"),
+        )
+        if blob:
+            found.append(blob)
+    source = obj.get("source")
+    if isinstance(source, dict):
+        blob = _bytes_from_b64(
+            source.get("data") if isinstance(source.get("data"), str) else None,
+            source.get("media_type") or source.get("mediaType") or source.get("mime_type"),
+        )
+        if blob:
+            found.append(blob)
+        for key in ("path", "url", "file_path", "filePath"):
+            blob = _bytes_from_local_path(source.get(key), allow_roots)
+            if blob:
+                found.append(blob)
+    att = obj.get("attachment") if isinstance(obj.get("attachment"), dict) else None
+    if att:
+        blob = _bytes_from_b64(
+            att.get("data") if isinstance(att.get("data"), str) else None,
+            att.get("media_type") or att.get("mediaType") or att.get("mime"),
+        )
+        if blob:
+            found.append(blob)
+        for key in ("path", "url", "file_path", "filePath", "filename"):
+            blob = _bytes_from_local_path(att.get(key), allow_roots)
+            if blob:
+                found.append(blob)
+    if isinstance(obj.get("data"), str) and obj["data"].startswith("data:image/"):
+        blob = _bytes_from_data_uri(obj["data"])
+        if blob:
+            found.append(blob)
+    for v in obj.values():
+        if v is inline or v is source or v is att:
+            continue
+        found.extend(
+            _image_blobs_from_obj(v, allow_roots=allow_roots, depth=depth + 1)
+        )
+    return found
+
+
+def land_transcript_images(
+    path: Path,
+    *,
+    start_offset: int = 0,
+    end_offset: int | None = None,
+) -> dict[str, int]:
+    """Copy PNG/JPEG out of a JSONL window into conversation_memory's media root.
+
+    No Gemini. Drain-only. Skips when ``conversation_memory.embed_media`` is off.
+    """
+    from khipu.sources import (
+        conversation_media_root,
+        embed_media_enabled,
+        sources_with_embed_media,
+    )
+
+    stats = {"landed": 0, "skipped_existing": 0, "skipped": 0}
+    if not embed_media_enabled("conversation_memory"):
+        return stats
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        _log(f"land-images: cannot stat {path}: {e}")
+        return stats
+    start = max(0, int(start_offset))
+    end = size if end_offset is None else max(start, min(int(end_offset), size))
+    if start >= end:
+        return stats
+    try:
+        with path.open("rb") as f:
+            f.seek(start)
+            data = f.read(end - start)
+    except OSError as e:
+        _log(f"land-images: cannot read {path}: {e}")
+        return stats
+    dest_root = conversation_media_root()
+    source_roots: list[Path] = []
+    for src in sources_with_embed_media():
+        raw = src.get("root")
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        source_roots.append(Path(raw).expanduser())
+    allow_roots = _land_allow_roots(path, dest_root, source_roots)
+    seen: set[str] = set()
+    for raw_line in data.decode("utf-8", "replace").splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            d = json.loads(raw_line)
+        except ValueError:
+            continue
+        for raw, mime in _image_blobs_from_obj(d, allow_roots=allow_roots):
+            sha = hashlib.sha256(raw).hexdigest()
+            if sha in seen:
+                stats["skipped_existing"] += 1
+                continue
+            seen.add(sha)
+            ext = _LAND_MIME_EXT[mime]
+            dest = dest_root / f"{sha}{ext}"
+            if dest.is_file():
+                stats["skipped_existing"] += 1
+                continue
+            tmp = dest.with_suffix(dest.suffix + ".tmp")
+            try:
+                tmp.write_bytes(raw)
+                tmp.replace(dest)
+            except OSError as e:
+                stats["skipped"] += 1
+                _log(f"land-images: write failed {dest.name}: {e}")
+                continue
+            stats["landed"] += 1
+    return stats
 
 
 def read_window(path: Path, offset: int) -> tuple[list[tuple[str, str]], int, int]:
@@ -583,9 +843,11 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                              stop_hook_active=bool(_get(env, "stopHookActive", "stop_hook_active", default=False)))
         out.update(due=due, reason=reason, new_turns=turns, new_chars=len(text))
         if due:
+            off_before = int(st.get("offset", 0))
             job = {"harness": harness, "session_id": sid, "cwd": session_cwd(env), "event": event,
                    "ts": _mint_ts(), "turns": turns, "transcript": text,
-                   "transcript_path": str(path), "offset_after": new_off}
+                   "transcript_path": str(path), "offset_before": off_before,
+                   "offset_after": new_off}
             p = enqueue(job)
             # Advance only after the job is on disk: a crash between the two
             # re-queues the same window (dedup at drain) rather than losing it.
@@ -635,6 +897,21 @@ def drain(*, limit: int | None = None, dry_run: bool = False) -> dict:
             _log(f"drain: unreadable job {original.name}: {e}")
             continue
         harness = str(job.get("harness") or "aegis")
+        try:
+            tp = job.get("transcript_path")
+            if tp:
+                land = land_transcript_images(
+                    Path(str(tp)),
+                    start_offset=int(job.get("offset_before") or 0),
+                    end_offset=job.get("offset_after"),
+                )
+                if land.get("landed") or land.get("skipped_existing"):
+                    out.setdefault("images", {"landed": 0, "skipped_existing": 0, "skipped": 0})
+                    for k in ("landed", "skipped_existing", "skipped"):
+                        out["images"][k] = out["images"].get(k, 0) + int(land.get(k) or 0)
+                    _log(f"drain: land-images {original.name} {land}")
+        except Exception as e:  # noqa: BLE001 — never block episode capture
+            _log(f"drain: land-images skipped for {original.name}: {type(e).__name__}: {e}")
         try:
             payload = extract_memory(job.get("transcript", ""), cwd=job.get("cwd", ""))
         except Exception as e:  # noqa: BLE001 — model/transport: keep the job, retry later

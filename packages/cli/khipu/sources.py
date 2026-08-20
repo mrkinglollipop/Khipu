@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SOURCES_NAME = "graph_sources.json"
 
 CLAUDE_ROOT = Path("/Volumes/Cloud Storage/Claude")
@@ -71,64 +71,74 @@ def sources_file() -> Path:
     return data_dir() / SOURCES_NAME
 
 
+def conversation_media_root() -> Path:
+    """Landing folder for conversation JSONL PNG/JPEG (not a graph collector)."""
+    from khipu.paths import ensure_data_dir
+
+    p = ensure_data_dir() / "media" / "conversation_memory"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def default_document() -> dict:
     claude = str(CLAUDE_ROOT)
+
+    def _row(
+        sid: str,
+        kind: str,
+        *,
+        root: str | None = None,
+        enabled: bool = True,
+    ) -> dict:
+        row: dict[str, Any] = {
+            "id": sid,
+            "kind": kind,
+            "enabled": enabled,
+            "embed_media": False,
+        }
+        if root is not None:
+            row["root"] = root
+        return row
+
     return {
         "schema_version": SCHEMA_VERSION,
         "sources": [
-            {"id": "conversation_memory", "kind": "conversation_memory", "enabled": True},
-            {
-                "id": "code:claude",
-                "kind": "code_ast",
-                "root": claude,
-                "enabled": True,
-            },
-            {
-                "id": "wiki:claude",
-                "kind": "wiki",
-                "root": f"{claude}/wiki",
-                "enabled": True,
-            },
-            {
-                "id": "skills:claude",
-                "kind": "skills",
-                "root": f"{claude}/skills",
-                "enabled": True,
-            },
-            {
-                "id": "agents:claude",
-                "kind": "agents",
-                "root": f"{claude}/Agents",
-                "enabled": True,
-            },
-            {
-                "id": "reports:claude",
-                "kind": "reports",
-                "root": f"{claude}/Reports",
-                "enabled": True,
-            },
-            {
-                "id": "memory_topics",
-                "kind": "memory_topics",
-                "root": "/Volumes/Cloud Storage/Memory/conversations/topics",
-                "enabled": True,
-            },
-            {
-                "id": "frozen_tell",
-                "kind": "frozen_tell",
-                "root": f"{claude}/frozen_tell",
-                "enabled": True,
-            },
-            {"id": "hardcoded", "kind": "hardcoded", "enabled": True},
-            {"id": "biblical:system", "kind": "biblical", "enabled": True},
-            {
-                "id": "model_call_log",
-                "kind": "model_call_log",
-                "root": f"{claude}/UNIFICATION/state/model_call_log.jsonl",
-                "enabled": True,
-            },
+            _row(
+                "conversation_memory",
+                "conversation_memory",
+                root=str(conversation_media_root()),
+            ),
+            _row("code:claude", "code_ast", root=claude),
+            _row("wiki:claude", "wiki", root=f"{claude}/wiki"),
+            _row("skills:claude", "skills", root=f"{claude}/skills"),
+            _row("agents:claude", "agents", root=f"{claude}/Agents"),
+            _row("reports:claude", "reports", root=f"{claude}/Reports"),
+            _row(
+                "memory_topics",
+                "memory_topics",
+                root="/Volumes/Cloud Storage/Memory/conversations/topics",
+            ),
+            _row("frozen_tell", "frozen_tell", root=f"{claude}/frozen_tell"),
+            _row("hardcoded", "hardcoded"),
+            _row("biblical:system", "biblical"),
+            _row(
+                "model_call_log",
+                "model_call_log",
+                root=f"{claude}/UNIFICATION/state/model_call_log.jsonl",
+            ),
         ],
     }
+
+
+def _normalize_source_row(row: dict) -> dict:
+    """Ensure per-source keys exist; missing ``embed_media`` means false."""
+    if "embed_media" not in row:
+        row["embed_media"] = False
+    else:
+        row["embed_media"] = bool(row.get("embed_media"))
+    if row.get("id") == "conversation_memory" and not row.get("root"):
+        row["root"] = str(conversation_media_root())
+    return row
 
 
 def load_sources() -> dict:
@@ -142,6 +152,9 @@ def load_sources() -> dict:
         if not isinstance(data.get("sources"), list):
             data["sources"] = default_document()["sources"]
         data.setdefault("schema_version", SCHEMA_VERSION)
+        for s in data["sources"]:
+            if isinstance(s, dict):
+                _normalize_source_row(s)
         return data
     except (OSError, ValueError):
         return default_document()
@@ -176,6 +189,43 @@ def set_enabled(source_id: str, enabled: bool) -> dict:
     return doc
 
 
+def set_embed_media(source_id: str, embed_media: bool) -> dict:
+    """Per-source opt-in for native image embed (default off). Does not purge PG."""
+    doc = load_sources()
+    row = _find_source(doc, source_id)
+    if row is None:
+        raise ValueError(f"unknown source id: {source_id}")
+    row["embed_media"] = bool(embed_media)
+    if source_id == "conversation_memory":
+        row["root"] = str(conversation_media_root())
+    doc["schema_version"] = SCHEMA_VERSION
+    save_sources(doc)
+    return doc
+
+
+def embed_media_enabled(source_id: str) -> bool:
+    doc = load_sources()
+    row = _find_source(doc, source_id)
+    if row is None:
+        return False
+    return bool(row.get("embed_media", False))
+
+
+def sources_with_embed_media() -> list[dict]:
+    """Sources opted into image embed that have a walkable ``root``."""
+    out: list[dict] = []
+    for s in load_sources().get("sources", []):
+        if not isinstance(s, dict):
+            continue
+        if not bool(s.get("embed_media", False)):
+            continue
+        root = s.get("root")
+        if not root:
+            continue
+        out.append(s)
+    return out
+
+
 def _slug_from_path(root: Path) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", root.name.lower()).strip("-")
     return slug or "root"
@@ -199,6 +249,7 @@ def add_code_root(root: Path) -> dict:
             "kind": "code_ast",
             "root": str(root),
             "enabled": True,
+            "embed_media": False,
         }
     )
     save_sources(doc)

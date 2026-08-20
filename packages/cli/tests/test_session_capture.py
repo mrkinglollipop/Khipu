@@ -9,6 +9,7 @@ queue, heartbeat, Postgres or the model.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -354,6 +355,202 @@ class CadenceIdlenessTest(unittest.TestCase):
     def test_an_active_hook_over_the_turn_cap_is_red(self):
         self._beat(dispatch_age_s=60, pend=sc.STUCK_TURNS, pending_age_s=120)
         self.assertTrue(any("cadence not firing" in r for r in self._reasons()))
+
+
+class ConversationImageLandTest(unittest.TestCase):
+    """Land PNG/JPEG from JSONL when conversation_memory.embed_media is on.
+    Hook text parsing still drops attachment-only rows."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self._env = mock.patch.dict(
+            os.environ,
+            {
+                "KHIPU_CAPTURE_HOME": str(self.dir / "kh"),
+                "KHIPU_DATA_DIR": str(self.dir / "data"),
+            },
+        )
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _png_b64(self) -> str:
+        import struct
+        import zlib
+
+        def chunk(tag: bytes, data: bytes) -> bytes:
+            crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+            return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+        raw = b"\x00" + bytes([255, 220, 0])
+        ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b"")
+        )
+        return base64.b64encode(png).decode("ascii")
+
+    def test_text_parser_still_skips_attachment_only_rows(self):
+        tp = _write(
+            self.dir / "s.jsonl",
+            [
+                {"type": "user", "message": {"role": "user", "content": "hi there"}},
+                {"type": "attachment", "attachment": {"foo": 1}},
+            ],
+        )
+        msgs, _, users = sc.read_window(tp, 0)
+        self.assertEqual(users, 1)
+        self.assertEqual(msgs[0][1].strip(), "hi there")
+
+    def test_land_skips_when_embed_media_off(self):
+        from khipu import sources
+
+        b64 = self._png_b64()
+        tp = _write(
+            self.dir / "img.jsonl",
+            [
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": b64,
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        )
+        self.assertFalse(sources.embed_media_enabled("conversation_memory"))
+        stats = sc.land_transcript_images(tp)
+        self.assertEqual(stats["landed"], 0)
+        root = sources.conversation_media_root()
+        self.assertFalse(any(root.glob("*.png")))
+
+    def test_land_claude_image_block_when_opted_in(self):
+        from khipu import sources
+
+        sources.set_embed_media("conversation_memory", True)
+        b64 = self._png_b64()
+        tp = _write(
+            self.dir / "img.jsonl",
+            [
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": b64,
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        )
+        stats = sc.land_transcript_images(tp)
+        self.assertEqual(stats["landed"], 1)
+        pngs = list(sources.conversation_media_root().glob("*.png"))
+        self.assertEqual(len(pngs), 1)
+        again = sc.land_transcript_images(tp)
+        self.assertEqual(again["landed"], 0)
+        self.assertGreaterEqual(again["skipped_existing"], 1)
+
+    def test_land_rejects_absolute_png_outside_allowlist(self):
+        from khipu import sources
+
+        sources.set_embed_media("conversation_memory", True)
+        png = base64.b64decode(self._png_b64())
+        with tempfile.TemporaryDirectory() as outside:
+            outsider = Path(outside) / "secret.png"
+            outsider.write_bytes(png)
+            tp = _write(
+                self.dir / "outside.jsonl",
+                [
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "path": str(outsider.resolve()),
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+            )
+            stats = sc.land_transcript_images(tp)
+            self.assertEqual(stats["landed"], 0)
+            self.assertFalse(any(sources.conversation_media_root().glob("*.png")))
+
+    def test_land_absolute_png_under_jsonl_parent(self):
+        from khipu import sources
+
+        sources.set_embed_media("conversation_memory", True)
+        png = base64.b64decode(self._png_b64())
+        allowed = self.dir / "shot.png"
+        allowed.write_bytes(png)
+        tp = _write(
+            self.dir / "local.jsonl",
+            [
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "path": str(allowed.resolve()),
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        )
+        stats = sc.land_transcript_images(tp)
+        self.assertEqual(stats["landed"], 1)
+        self.assertEqual(len(list(sources.conversation_media_root().glob("*.png"))), 1)
+
+    def test_land_skips_webp(self):
+        from khipu import sources
+
+        sources.set_embed_media("conversation_memory", True)
+        tp = _write(
+            self.dir / "webp.jsonl",
+            [
+                {
+                    "type": "attachment",
+                    "attachment": {
+                        "media_type": "image/webp",
+                        "data": base64.b64encode(b"RIFF....WEBP").decode("ascii"),
+                    },
+                }
+            ],
+        )
+        stats = sc.land_transcript_images(tp)
+        self.assertEqual(stats["landed"], 0)
 
 
 if __name__ == "__main__":

@@ -134,6 +134,28 @@ def _write_job_state(name: str, exit_code: int) -> None:
     tmp.replace(path)
 
 
+def _on_demand_job_entry(name: str) -> dict[str, Any]:
+    """Receipt-only job status (no launchd / _JOB_SPECS).
+
+    Maps receipt ``ts`` → ``last_run_iso`` and ``exit`` → ``last_exit`` so the
+    desktop On-demand row can show last run without clock/agent copy.
+    """
+    state = _read_job_state(name)
+    ts = state.get("ts") if state else None
+    return {
+        "plist_label": None,
+        "log_path": None,
+        "err_log_path": None,
+        "last_run_mtime": None,
+        "last_run_iso": ts,
+        "plist_loaded": None,
+        "next_schedule": None,
+        "last_exit": state.get("exit") if state else None,
+        "last_exit_ts": ts,
+        "on_demand": True,
+    }
+
+
 def _run_script(script: Path, *, args: list[str] | None = None, log_stem: str, state_name: str) -> int:
     if not script.is_file():
         raise FileNotFoundError(f"job script not found: {script}")
@@ -251,6 +273,7 @@ def job_status() -> dict[str, Any]:
         "nightly": _job_entry("nightly"),
         "monthly": _job_entry("monthly"),
         "graph_build": _job_entry("graph_build"),
+        "embed_media_backfill": _on_demand_job_entry("embed_media_backfill"),
     }
 
 

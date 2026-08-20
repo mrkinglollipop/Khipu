@@ -1,24 +1,28 @@
-"""Vectors for real — P3 step 3 (2026-08-17) + Gemini Embedding 2 profile (2026-08-19).
+"""Vectors for real — P3 step 3 (2026-08-17) + Gemini Embedding 2 profile (2026-08-19)
++ native media (PNG/JPEG) under Embedding 2 (2026-08-20).
 
-Embeds episodes and topics into ``memory_embeddings`` under a named profile
-(``embedding_profiles``), per the plan.md "Embedding profiles" rules:
-profile-tagged rows, never overwritten in place, one active pointer for search.
+Embeds episodes, topics, and opted-in media into ``memory_embeddings`` under a
+named profile (``embedding_profiles``), per the plan.md "Embedding profiles"
+rules: profile-tagged rows, never overwritten in place, one active pointer for
+search.
 
 Entrypoints:
-  backfill(..., profile=None)  — missing/changed chunks for active or named profile
-  activate(profile)            — flip the one-active pointer (coverage gate)
+  backfill(..., profile=None)  — missing/changed episode+topic chunks
+  backfill_media(...)          — PNG/JPEG under sources with embed_media
+  activate(profile)            — flip the one-active pointer (coverage gate; text only)
   embed_on_capture(payload)    — one episode under the *active* profile; fail-open
   semantic_search(query, k)    — cosine top-k over the *active* profile
   coverage(profile=None)       — per-kind coverage for active or named profile
 
 Providers:
-  gemini-embedding-001 @768 — no task prefixes (task_type era)
-  gemini-embedding-2 @768   — document/query prefixes at API time; store unprefixed
-                              chunk_text. batchEmbedContents with one content per
-                              request (v2 aggregates multi-part inputs).
+  gemini-embedding-001 @768 — no task prefixes (task_type era); text only
+  gemini-embedding-2 @768   — document/query prefixes for text; native image parts
+                              for media (no text prefixes). Always outputDimensionality
+                              768. One content per request (v2 aggregates multi-part).
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -27,6 +31,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
+from pathlib import Path
 from typing import Any, Iterable
 
 MODEL_001 = "gemini-embedding-001"
@@ -48,10 +54,38 @@ CHUNK_CHARS = 6000
 CHUNK_OVERLAP = 300
 BATCH = 64            # Gemini batchEmbedContents cap is 100; stay under
 MAX_TEXT_CHARS = 8000  # per-item safety, mirrors embed_mirror.embed_text
+# Google Embedding 2 image table (docs 2026-06-22): PNG and JPEG only.
+MEDIA_MIME: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+# Skip oversized inline payloads; File API would be a later cut.
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
+MEDIA_PILOT_WITHOUT_YES = 1000
 
 
 def _log(msg: str) -> None:
     print(f"[khipu-embed] {msg}", file=sys.stderr, flush=True)
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            block = f.read(1024 * 1024)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+
+def mime_for_image_path(path: Path) -> str | None:
+    return MEDIA_MIME.get(path.suffix.lower())
 
 
 def _l2(vec: list[float]) -> list[float]:
@@ -193,6 +227,280 @@ def embed_batch(
 
 def embed_one(text: str, *, profile: str = PROFILE_001) -> list[float]:
     return embed_batch([text], profile=profile)[0]
+
+
+def embed_batch_images(
+    images: list[tuple[bytes, str]],
+    *,
+    profile: str = PROFILE_2,
+    retries: int = 4,
+) -> list[list[float]]:
+    """Embed PNG/JPEG bytes as native Gemini Embedding 2 image parts.
+
+    Each item is ``(raw_bytes, mime_type)``. Always requests ``outputDimensionality``
+    768. Does **not** apply text task prefixes. One image → one request → one vector
+    (v2 aggregates multi-part content).
+    """
+    if not images:
+        return []
+    if profile != PROFILE_2 and not profile.endswith("@768"):
+        # Media is locked to Embedding 2 @768 for this cut.
+        model_for_profile(profile)
+    model = model_for_profile(profile)
+    key = _gemini_key()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents"
+    requests_body = []
+    for raw, mime in images:
+        if mime not in ("image/png", "image/jpeg"):
+            raise ValueError(f"unsupported image mime {mime!r}; PNG/JPEG only")
+        if len(raw) > MAX_IMAGE_BYTES:
+            raise ValueError(f"image exceeds {MAX_IMAGE_BYTES} bytes inline limit")
+        requests_body.append(
+            {
+                "model": f"models/{model}",
+                "content": {
+                    "parts": [
+                        {
+                            "inline_data": {
+                                "mime_type": mime,
+                                "data": base64.b64encode(raw).decode("ascii"),
+                            }
+                        }
+                    ]
+                },
+                "outputDimensionality": DIM,
+            }
+        )
+    data = json.dumps({"requests": requests_body}).encode("utf-8")
+    delay = 2.0
+    payload: dict[str, Any] = {}
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json", "x-goog-api-key": key},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            err = e.read().decode("utf-8", errors="replace")
+            if e.code in (429, 500, 502, 503, 504) and attempt < retries:
+                _log(f"embed-image HTTP {e.code}, retry in {delay:.0f}s")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise RuntimeError(f"embed-image HTTP {e.code}: {err[:400]}") from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if attempt < retries:
+                _log(f"embed-image network error ({type(e).__name__}), retry in {delay:.0f}s")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise RuntimeError(
+                f"embed-image network error after {retries} retries: {type(e).__name__}: {e}"
+            ) from e
+    vecs = [item["values"] for item in payload["embeddings"]]
+    if len(vecs) != len(images):
+        raise RuntimeError(f"embed-image returned {len(vecs)} vectors for {len(images)} images")
+    for v in vecs:
+        if len(v) != DIM:
+            raise RuntimeError(f"expected dim {DIM}, got {len(v)}")
+    return [_l2(v) for v in vecs]
+
+
+def _iter_media_files(root: Path) -> Iterable[Path]:
+    """Yield PNG/JPEG files under ``root`` (skip dirs that are not readable)."""
+    if not root.is_dir():
+        return
+    try:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                p = Path(dirpath) / name
+                if mime_for_image_path(p):
+                    yield p
+    except OSError as e:
+        _log(f"walk skipped {root}: {e}")
+
+
+def _upsert_media_asset(
+    cur,
+    *,
+    source_id: str,
+    path: str,
+    sha256: str,
+    mime: str,
+    nbytes: int,
+) -> str:
+    cur.execute(
+        "SELECT id, sha256 FROM media_assets WHERE source_id = %s AND path = %s",
+        (source_id, path),
+    )
+    row = cur.fetchone()
+    if row:
+        mid, old_hash = row[0], row[1]
+        if old_hash != sha256:
+            cur.execute(
+                "UPDATE media_assets SET sha256 = %s, mime = %s, bytes = %s WHERE id = %s",
+                (sha256, mime, nbytes, mid),
+            )
+        return mid
+    mid = str(uuid.uuid4())
+    cur.execute(
+        """
+        INSERT INTO media_assets (id, source_id, path, sha256, mime, bytes)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (mid, source_id, path, sha256, mime, nbytes),
+    )
+    return mid
+
+
+def backfill_media(
+    *,
+    dry_run: bool = False,
+    yes: bool = False,
+    limit: int | None = None,
+    profile: str | None = None,
+    source_id: str | None = None,
+) -> dict[str, Any]:
+    """Embed PNG/JPEG under sources with ``embed_media`` and a walkable root.
+
+    Requires ``--yes`` when more than MEDIA_PILOT_WITHOUT_YES files would be
+    scanned. Activate / doctor text coverage ignore media missing.
+    """
+    from khipu.db import connect
+    from khipu.sources import sources_with_embed_media
+
+    stats: dict[str, Any] = {
+        "scanned": 0,
+        "embedded": 0,
+        "skipped_unchanged": 0,
+        "skipped_oversized": 0,
+        "skipped_missing": 0,
+        "batches": 0,
+        "profile": None,
+        "would_embed": 0,
+        "sources": [],
+        "needs_yes": False,
+    }
+    sources = sources_with_embed_media()
+    if source_id:
+        sources = [s for s in sources if s.get("id") == source_id]
+    candidates: list[tuple[str, Path, str]] = []  # source_id, path, rel_label
+    for s in sources:
+        sid = str(s["id"])
+        root = Path(str(s["root"]))
+        stats["sources"].append(sid)
+        if not root.is_dir():
+            _log(f"path-unreachable (skip, no purge): {sid} -> {root}")
+            continue
+        for p in _iter_media_files(root):
+            try:
+                rel = str(p.relative_to(root))
+            except ValueError:
+                rel = p.name
+            candidates.append((sid, p, rel))
+            if limit is not None and len(candidates) >= limit:
+                break
+        if limit is not None and len(candidates) >= limit:
+            break
+
+    stats["scanned"] = len(candidates)
+    if len(candidates) > MEDIA_PILOT_WITHOUT_YES and not yes and not dry_run:
+        stats["needs_yes"] = True
+        stats["error"] = (
+            f"{len(candidates)} images exceed pilot of {MEDIA_PILOT_WITHOUT_YES}; "
+            "re-run with --yes"
+        )
+        return stats
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            profile = _resolve_profile(cur, profile or PROFILE_2)
+            if profile != PROFILE_2:
+                # Still allow named @768 Gemini-2 only for this cut.
+                if "gemini-embedding-2" not in profile:
+                    raise ValueError(
+                        f"media backfill requires gemini-embedding-2@768; got {profile!r}"
+                    )
+            stats["profile"] = profile
+            existing = _existing_hashes(cur, profile)
+            todo: list[tuple[str, Path, str, str, str, bytes]] = []
+            # (source_id, path, rel, mime, sha, raw)
+            for sid, path, rel in candidates:
+                mime = mime_for_image_path(path)
+                if not mime:
+                    continue
+                try:
+                    nbytes = path.stat().st_size
+                except OSError:
+                    stats["skipped_missing"] += 1
+                    continue
+                if nbytes > MAX_IMAGE_BYTES:
+                    stats["skipped_oversized"] += 1
+                    continue
+                try:
+                    raw = path.read_bytes()
+                except OSError:
+                    stats["skipped_missing"] += 1
+                    continue
+                sha = _sha256_bytes(raw)
+                mid_probe = None
+                cur.execute(
+                    "SELECT id FROM media_assets WHERE source_id = %s AND path = %s",
+                    (sid, rel),
+                )
+                prow = cur.fetchone()
+                if prow:
+                    mid_probe = prow[0]
+                    if existing.get(("media", mid_probe, 0)) == sha:
+                        stats["skipped_unchanged"] += 1
+                        continue
+                todo.append((sid, path, rel, mime, sha, raw))
+
+            stats["would_embed"] = len(todo)
+            if dry_run:
+                return stats
+
+            batch: list[tuple[str, Path, str, str, str, bytes]] = []
+            for item in todo:
+                batch.append(item)
+                if len(batch) >= min(BATCH, 16):  # images are heavier; keep batches smaller
+                    _flush_media_batch(cur, profile, batch, stats)
+                    conn.commit()
+                    batch = []
+            if batch:
+                _flush_media_batch(cur, profile, batch, stats)
+                conn.commit()
+    return stats
+
+
+def _flush_media_batch(
+    cur,
+    profile: str,
+    batch: list[tuple[str, Path, str, str, str, bytes]],
+    stats: dict[str, Any],
+) -> None:
+    images = [(raw, mime) for _sid, _p, _rel, mime, _sha, raw in batch]
+    vecs = embed_batch_images(images, profile=profile)
+    rows: list[tuple[str, str, int, str, str, list[float]]] = []
+    for (sid, _path, rel, mime, sha, raw), vec in zip(batch, vecs):
+        mid = _upsert_media_asset(
+            cur,
+            source_id=sid,
+            path=rel,
+            sha256=sha,
+            mime=mime,
+            nbytes=len(raw),
+        )
+        label = rel
+        rows.append(("media", mid, 0, label, sha, vec))
+    _upsert_chunks(cur, profile, rows)
+    stats["embedded"] += len(batch)
+    stats["batches"] += 1
 
 
 # ---- corpus -------------------------------------------------------------------
@@ -464,6 +772,8 @@ def semantic_search(
                        CASE m.kind
                          WHEN 'topic' THEN
                            (SELECT COALESCE(t.title, t.slug) FROM topics t WHERE t.slug = m.ref)
+                         WHEN 'media' THEN
+                           (SELECT COALESCE(a.path, m.chunk_text) FROM media_assets a WHERE a.id = m.ref)
                          ELSE
                            (SELECT left(e.summary, 80) FROM episodes e WHERE e.id::text = m.ref)
                        END AS label
@@ -493,6 +803,12 @@ def coverage(*, profile: str | None = None) -> dict[str, Any]:
             eps = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM topics WHERE deleted_at IS NULL")
             tops = cur.fetchone()[0]
+            cur.execute("SELECT to_regclass('public.media_assets') IS NOT NULL")
+            has_media = bool(cur.fetchone()[0])
+            medias = 0
+            if has_media:
+                cur.execute("SELECT COUNT(*) FROM media_assets")
+                medias = cur.fetchone()[0]
             cur.execute(
                 "SELECT kind, COUNT(DISTINCT ref), COUNT(*) FROM memory_embeddings "
                 "WHERE profile = %s GROUP BY kind",
@@ -510,6 +826,7 @@ def coverage(*, profile: str | None = None) -> dict[str, Any]:
             active = active_row[0] if active_row else None
     e = by.get("episode", {"refs": 0, "chunks": 0})
     t = by.get("topic", {"refs": 0, "chunks": 0})
+    m = by.get("media", {"refs": 0, "chunks": 0})
     def _pct(done: int, total: int) -> float:
         """Never round a gap away. 4335/4336 printed as "100.0" during the
         2026-08-17 audit and hid an unembedded episode; only true completeness
@@ -528,6 +845,10 @@ def coverage(*, profile: str | None = None) -> dict[str, Any]:
                      "chunks": e["chunks"], "pct": _pct(e["refs"], eps)},
         "topics": {"total": tops, "embedded": t["refs"], "missing": max(0, tops - t["refs"]),
                    "chunks": t["chunks"], "pct": _pct(t["refs"], tops)},
+        # Denominator = media_assets rows (registered files). Partial media does
+        # not fail activate() or doctor embed_coverage_ok (episode+topic only).
+        "media": {"total": medias, "embedded": m["refs"], "missing": max(0, medias - m["refs"]),
+                  "chunks": m["chunks"], "pct": _pct(m["refs"], medias)},
     }
 
 

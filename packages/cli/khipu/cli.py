@@ -422,6 +422,37 @@ def cmd_embed(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_embed_media_backfill(args: argparse.Namespace) -> int:
+    """Top-level hyphenated job: native PNG/JPEG into gemini-embedding-2@768."""
+    from khipu.embed import backfill_media
+    from khipu.jobs import _write_job_state
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    yes = bool(getattr(args, "yes", False))
+    try:
+        stats = backfill_media(
+            dry_run=dry_run,
+            yes=yes,
+            limit=getattr(args, "limit", None),
+            source_id=getattr(args, "source_id", None),
+            profile=getattr(args, "profile", None),
+        )
+    except Exception as e:  # noqa: BLE001
+        if not dry_run:
+            _write_job_state("embed_media_backfill", 1)
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
+        return 1
+    if stats.get("needs_yes"):
+        if not dry_run:
+            _write_job_state("embed_media_backfill", 2)
+        print(json.dumps({"ok": False, **stats}, indent=2))
+        return 2
+    if not dry_run:
+        _write_job_state("embed_media_backfill", 0)
+    print(json.dumps({"ok": True, **stats}, indent=2))
+    return 0
+
+
 def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
     """Neighborhood lookup for `khipu graph`.
 
@@ -928,6 +959,30 @@ def cmd_sources(args: argparse.Namespace) -> int:
             sources.set_enabled(args.source_id, False)
             print(json.dumps({"ok": True, "id": args.source_id, "enabled": False}))
             return 0
+        if action == "set-embed-media":
+            raw = str(getattr(args, "embed_media_value", "")).strip().lower()
+            if raw not in ("on", "off"):
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": "set-embed-media expects on|off",
+                        }
+                    )
+                )
+                return 2
+            on = raw == "on"
+            sources.set_embed_media(args.source_id, on)
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "id": args.source_id,
+                        "embed_media": on,
+                    }
+                )
+            )
+            return 0
         if action == "add":
             sources.add_code_root(Path(args.root))
             print(json.dumps({"ok": True, "root": args.root}))
@@ -1072,7 +1127,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cosine search over memory_embeddings (active profile) instead of ILIKE",
     )
     se.add_argument(
-        "--kind", choices=("episode", "topic"), help="Semantic: restrict to one kind"
+        "--kind",
+        choices=("episode", "topic", "media"),
+        help="Semantic: restrict to one kind",
     )
     se.set_defaults(func=cmd_search)
 
@@ -1151,6 +1208,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gb.set_defaults(func=cmd_graph_build)
 
+    emb = sub.add_parser(
+        "embed-media-backfill",
+        help="Embed PNG/JPEG under sources with embed_media (active Gemini Embedding 2)",
+    )
+    emb.add_argument("--dry-run", action="store_true", help="Count only; no API calls")
+    emb.add_argument(
+        "--yes",
+        action="store_true",
+        help=f"Required when more than {1000} images would be scanned",
+    )
+    emb.add_argument("--limit", type=int, default=None, help="Cap files this run")
+    emb.add_argument(
+        "--source-id",
+        dest="source_id",
+        default=None,
+        help="Only walk this source id (must have embed_media on + root)",
+    )
+    emb.add_argument(
+        "--profile",
+        default=None,
+        help="Profile id (default gemini-embedding-2@768)",
+    )
+    emb.set_defaults(func=cmd_embed_media_backfill)
+
     md = sub.add_parser(
         "models",
         help="Per-role model Settings (synth / embed / vision): show / set",
@@ -1202,6 +1283,17 @@ def build_parser() -> argparse.ArgumentParser:
     dis = src_sub.add_parser("disable", help="Disable a source (does not purge PG)")
     dis.add_argument("source_id")
     dis.set_defaults(func=cmd_sources)
+    sem = src_sub.add_parser(
+        "set-embed-media",
+        help="Opt a source into native image embed (on|off; default off)",
+    )
+    sem.add_argument("source_id")
+    sem.add_argument(
+        "embed_media_value",
+        choices=("on", "off"),
+        help="on = walk PNG/JPEG under this source's root on embed-media-backfill",
+    )
+    sem.set_defaults(func=cmd_sources)
     add = src_sub.add_parser("add", help="Add a code_ast root (absolute path)")
     add.add_argument("--root", required=True, dest="root", help="Absolute code root")
     add.set_defaults(func=cmd_sources)
