@@ -7,8 +7,11 @@ The model call is always mocked; nothing here reaches Gemini.
 
 from __future__ import annotations
 
+import io
 import json
+import os
 import unittest
+import urllib.error
 from unittest import mock
 
 from khipu import extract
@@ -137,11 +140,209 @@ class ExtractMemoryTest(unittest.TestCase):
             return _Resp()
 
         with mock.patch.object(extract, "_key", return_value="SECRET-KEY-VALUE"), \
+             mock.patch("khipu.models.synth_settings", return_value={
+                 "provider": "cloud", "endpoint": "", "model_id": "gemini-2.5-flash",
+             }), \
+             mock.patch("khipu.models.cloud_model_id", return_value="gemini-2.5-flash"), \
              mock.patch("urllib.request.urlopen", fake_urlopen):
             extract._generate("hi")
         self.assertNotIn("SECRET-KEY-VALUE", seen["url"])
         self.assertNotIn("key=", seen["url"])
         self.assertEqual(seen["headers"].get("x-goog-api-key"), "SECRET-KEY-VALUE")
+
+    def test_local_path_hits_chat_completions_and_never_calls_key(self):
+        seen = {}
+
+        class _Resp:
+            status = 200
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"content": '{"summary":"x"}'}}]
+                }).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, **kw):
+            seen["url"] = req.full_url
+            seen["headers"] = {k.lower(): v for k, v in req.header_items()}
+            seen["body"] = req.data
+            return _Resp()
+
+        with mock.patch.object(extract, "_key", side_effect=AssertionError("_key")) as key_mock, \
+             mock.patch("khipu.models.synth_settings", return_value={
+                 "provider": "local",
+                 "endpoint": "http://127.0.0.1:11434",
+                 "model_id": "llama3",
+             }), \
+             mock.patch("khipu.keychain.get_openai_compat_key", return_value="LOCAL-SECRET"), \
+             mock.patch("urllib.request.urlopen", fake_urlopen):
+            out = extract._generate("hi")
+        self.assertIn("/v1/chat/completions", seen["url"])
+        self.assertNotIn("generativelanguage.googleapis.com", seen["url"])
+        self.assertEqual(seen["headers"].get("authorization"), "Bearer LOCAL-SECRET")
+        self.assertNotIn(b"LOCAL-SECRET", seen["body"] or b"")
+        self.assertNotIn("LOCAL-SECRET", seen["url"])
+        key_mock.assert_not_called()
+        self.assertIn("summary", out)
+
+    def test_empty_local_endpoint_raises_without_gemini_fallback(self):
+        with mock.patch("khipu.models.synth_settings", return_value={
+                 "provider": "local", "endpoint": "", "model_id": "x",
+             }), \
+             mock.patch.object(extract, "_key", side_effect=AssertionError("_key")) as key_mock, \
+             mock.patch.object(extract, "_generate_cloud") as cloud:
+            with self.assertRaises(RuntimeError):
+                extract._generate("hi")
+        key_mock.assert_not_called()
+        cloud.assert_not_called()
+
+    def test_json_object_retries_once_on_400_then_succeeds(self):
+        calls = []
+
+        class _Resp:
+            def __init__(self, status, body):
+                self.status = status
+                self._body = body.encode()
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, **kw):
+            body = json.loads(req.data.decode())
+            calls.append(body)
+            if "response_format" in body:
+                raise urllib.error.HTTPError(
+                    req.full_url, 400, "Bad", hdrs=None, fp=io.BytesIO(b"no json mode")
+                )
+            return _Resp(200, json.dumps({
+                "choices": [{"message": {"content": '{"ok":true}'}}]
+            }))
+
+        with mock.patch("khipu.models.synth_settings", return_value={
+                 "provider": "local",
+                 "endpoint": "http://127.0.0.1:11434",
+                 "model_id": "llama3",
+             }), \
+             mock.patch("khipu.keychain.get_openai_compat_key", return_value=None), \
+             mock.patch("urllib.request.urlopen", fake_urlopen):
+            out = extract._generate("hi")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("response_format", calls[0])
+        self.assertNotIn("response_format", calls[1])
+        self.assertIn("ok", out)
+
+    def test_json_object_retries_once_on_415_then_succeeds(self):
+        calls = []
+
+        class _Resp:
+            def __init__(self, status, body):
+                self.status = status
+                self._body = body.encode()
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, **kw):
+            body = json.loads(req.data.decode())
+            calls.append(body)
+            if "response_format" in body:
+                raise urllib.error.HTTPError(
+                    req.full_url,
+                    415,
+                    "Unsupported Media Type",
+                    hdrs=None,
+                    fp=io.BytesIO(b"unsupported"),
+                )
+            return _Resp(200, json.dumps({
+                "choices": [{"message": {"content": '{"ok":true}'}}]
+            }))
+
+        with mock.patch("khipu.models.synth_settings", return_value={
+                 "provider": "local",
+                 "endpoint": "http://127.0.0.1:11434",
+                 "model_id": "llama3",
+             }), \
+             mock.patch("khipu.keychain.get_openai_compat_key", return_value=None), \
+             mock.patch("urllib.request.urlopen", fake_urlopen):
+            out = extract._generate("hi")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("response_format", calls[0])
+        self.assertNotIn("response_format", calls[1])
+        self.assertIn("ok", out)
+
+    def test_json_object_does_not_retry_on_401(self):
+        calls = []
+
+        def fake_urlopen(req, **kw):
+            body = json.loads(req.data.decode())
+            calls.append(body)
+            raise urllib.error.HTTPError(
+                req.full_url, 401, "Unauthorized", hdrs=None, fp=io.BytesIO(b"nope")
+            )
+
+        with mock.patch("khipu.models.synth_settings", return_value={
+                 "provider": "local",
+                 "endpoint": "http://127.0.0.1:11434",
+                 "model_id": "llama3",
+             }), \
+             mock.patch("khipu.keychain.get_openai_compat_key", return_value=None), \
+             mock.patch("urllib.request.urlopen", fake_urlopen):
+            with self.assertRaises(RuntimeError):
+                extract._generate("hi")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("response_format", calls[0])
+
+    def test_khipu_extract_model_ignored_when_provider_is_local(self):
+        seen = {}
+
+        class _Resp:
+            status = 200
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"content": "{}"}}]
+                }).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, **kw):
+            seen["body"] = json.loads(req.data.decode())
+            return _Resp()
+
+        with mock.patch.dict(os.environ, {"KHIPU_EXTRACT_MODEL": "should-not-appear"}), \
+             mock.patch("khipu.models.synth_settings", return_value={
+                 "provider": "local",
+                 "endpoint": "http://127.0.0.1:11434",
+                 "model_id": "llama3",
+             }), \
+             mock.patch("khipu.keychain.get_openai_compat_key", return_value=None), \
+             mock.patch("urllib.request.urlopen", fake_urlopen):
+            extract._generate("hi")
+        self.assertEqual(seen["body"]["model"], "llama3")
+
+    def test_module_has_no_import_time_model_constant(self):
+        self.assertFalse(hasattr(extract, "MODEL"))
 
 
 if __name__ == "__main__":

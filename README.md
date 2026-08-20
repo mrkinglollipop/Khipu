@@ -338,7 +338,7 @@ person's servers, not the product.
 | **P2** Truthful signals, graph hop symmetry, idempotent reconcile, tombstones | Shipped |
 | **P3** PG 19, dual-write capture, vectors and semantic search, five harness packs, recall rules | Shipped |
 | **Soak** ≥ 7 days with two Macs on the same database | In progress |
-| **P4** Model roles, embedding profiles, corpus picker (Settings + `khipu sources`), selective vision | Planned (corpus picker shipped) |
+| **P4** Model roles, embedding profiles, corpus picker (Settings + `khipu sources`), selective vision | Partial — Settings Models (synth live / embed persist / vision off) + corpus picker shipped; profiles, Firecrawl, vision ingest still Planned |
 
 ## Setting it up
 
@@ -455,9 +455,10 @@ component designed to face the internet, and it exists precisely so the
 database never has to.
 
 **Can I use a model other than Gemini?**
-Not yet. The key store is account-keyed rather than Gemini-specific, so another
-provider is a UI addition rather than a re-architecture, and it is on the plan
-(P4). Contributions welcome.
+For **session capture summaries (synth)**: yes — Settings → Models can point at a
+local OpenAI-compatible endpoint (Ollama, LM Studio, etc.). Embeddings still use
+the active Gemini embed profile until the profiles cut. Vision ingest is not
+shipped yet (picker defaults to off).
 
 **What happens when I'm offline, or the database is down?**
 Captures queue in a local outbox and replay when the database is back;

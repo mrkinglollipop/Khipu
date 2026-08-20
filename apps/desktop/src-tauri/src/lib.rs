@@ -272,7 +272,7 @@ fn khipu_migrate(dry_run: bool) -> Result<String, String> {
 /// arbitrary argv from the webview, and a secret must never travel as an
 /// argument. This command is the only way in, and it pipes the value to the
 /// CLI's stdin.
-const SETTABLE_SECRETS: &[&str] = &["gemini_api_key", "database_url"];
+const SETTABLE_SECRETS: &[&str] = &["gemini_api_key", "database_url", "openai_compat_api_key"];
 
 #[tauri::command]
 fn set_khipu_secret(account: String, value: String) -> Result<String, String> {
@@ -348,7 +348,7 @@ fn set_khipu_secret(account: String, value: String) -> Result<String, String> {
 /// folder" button is `paths --set`.
 const ALLOWED_SUBCOMMANDS: &[&str] = &[
     "status", "doctor", "activity", "search", "graph", "revisions", "paths",
-    "backup-local", "import-local", "integrations", "sources",
+    "backup-local", "import-local", "integrations", "sources", "models",
 ];
 
 /// Fire-and-forget job runners — long-running consolidate/graphify passes.
@@ -819,8 +819,8 @@ mod settable_secrets_tests {
     }
 
     #[test]
-    fn only_the_two_known_accounts_are_writable() {
-        assert_eq!(SETTABLE_SECRETS, &["gemini_api_key", "database_url"]);
+    fn only_the_known_accounts_are_writable() {
+        assert_eq!(SETTABLE_SECRETS, &["gemini_api_key", "database_url", "openai_compat_api_key"]);
     }
 
     #[test]
@@ -862,7 +862,8 @@ mod run_khipu_guard_tests {
     #[test]
     fn every_subcommand_the_ui_calls_is_allowed() {
         for s in ["status", "doctor", "activity", "search", "graph", "revisions",
-                  "paths", "backup-local", "import-local", "integrations", "sources"] {
+                  "paths", "backup-local", "import-local", "integrations", "sources",
+                  "models"] {
             assert!(ALLOWED_SUBCOMMANDS.contains(&s), "UI calls `{s}` but it is not allowed");
         }
     }
@@ -890,7 +891,7 @@ mod run_khipu_guard_tests {
     fn the_allowlist_is_exactly_what_the_front_end_invokes() {
         // Grown by hand, so pin the size: adding an entry without a call site is
         // how the five above got in.
-        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 11);
+        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 12);
     }
 
     #[test]

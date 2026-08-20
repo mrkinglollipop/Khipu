@@ -11,6 +11,7 @@ SERVICE = os.environ.get("KHIPU_KEYCHAIN_SERVICE") or os.environ.get(
 LEGACY_SERVICE = "Alzy"
 DSN_ACCOUNT = "database_url"
 GEMINI_ACCOUNT = "gemini_api_key"
+OPENAI_COMPAT_ACCOUNT = "openai_compat_api_key"
 CONFIG_DIR = Path.home() / ".config" / "khipu"
 LEGACY_CONFIG_DIR = Path.home() / ".config" / "alzy"
 
@@ -138,6 +139,15 @@ def set_gemini_key(key: str) -> None:
     set_password(GEMINI_ACCOUNT, key.strip())
 
 
+def get_openai_compat_key() -> str | None:
+    """Optional bearer for local OpenAI-compatible synth endpoints."""
+    return get_password(OPENAI_COMPAT_ACCOUNT)
+
+
+def set_openai_compat_key(key: str) -> None:
+    set_password(OPENAI_COMPAT_ACCOUNT, key.strip())
+
+
 def resolve_gemini_key(*, key_file: Path | None = None) -> str:
     """Order: GEMINI_API_KEY → Keychain → optional key file (never print)."""
     env = (os.environ.get("GEMINI_API_KEY") or "").strip()
@@ -238,6 +248,7 @@ def secrets_status() -> dict:
         "dsn": dsn_in_keychain or dsn_in_env or dsn_on_disk,
         "dsn_in_keychain": dsn_in_keychain,
         "gemini_in_keychain": bool(get_gemini_key()),
+        "openai_compat_in_keychain": bool(get_openai_compat_key()),
         "gemini_env": bool((os.environ.get("GEMINI_API_KEY") or "").strip()),
         "gemini_file_present": bool(gemini_file and gemini_file.is_file()),
         "config_dir": str(active_dir),

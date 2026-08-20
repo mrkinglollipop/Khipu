@@ -77,6 +77,30 @@ type Counts = {
   topic_revisions?: number;
 };
 
+type ModelRole = {
+  provider: string;
+  endpoint: string;
+  model_id: string;
+};
+
+type ModelsState = {
+  synth: ModelRole;
+  embed: ModelRole;
+  vision: ModelRole;
+  models_error: string | null;
+};
+
+const DEFAULT_MODELS: ModelsState = {
+  synth: {
+    provider: "cloud",
+    endpoint: "",
+    model_id: "gemini-2.5-flash",
+  },
+  embed: { provider: "cloud", endpoint: "", model_id: "" },
+  vision: { provider: "off", endpoint: "", model_id: "" },
+  models_error: null,
+};
+
 type SearchResult = {
   kind?: string;
   id?: string | number;
@@ -185,6 +209,53 @@ function parseJson(raw: string): unknown {
   } catch {
     return null;
   }
+}
+
+type SecretsPresence = {
+  dsn_in_keychain?: boolean;
+  gemini_in_keychain?: boolean;
+  openai_compat_in_keychain?: boolean;
+};
+
+const SECRET_PRESENCE_KEYS = [
+  "dsn_in_keychain",
+  "gemini_in_keychain",
+  "openai_compat_in_keychain",
+] as const satisfies ReadonlyArray<keyof SecretsPresence>;
+
+function isSecretsPresence(value: unknown): value is SecretsPresence {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
+  if ("error" in obj) {
+    return false;
+  }
+  for (const key of SECRET_PRESENCE_KEYS) {
+    const field = obj[key];
+    if (field !== undefined && typeof field !== "boolean") {
+      return false;
+    }
+  }
+  return true;
+}
+
+function pickSecretsPresence(value: SecretsPresence): SecretsPresence {
+  return {
+    dsn_in_keychain: value.dsn_in_keychain,
+    gemini_in_keychain: value.gemini_in_keychain,
+    openai_compat_in_keychain: value.openai_compat_in_keychain,
+  };
+}
+
+function presenceLabel(
+  presence: SecretsPresence | null,
+  key: keyof SecretsPresence,
+): string {
+  if (presence == null) return "—";
+  const value = presence[key];
+  if (typeof value !== "boolean") return "—";
+  return value ? "yes" : "no";
 }
 
 function formatBytes(bytes: number): string {
@@ -372,13 +443,21 @@ export default function App() {
   const [opsEvents, setOpsEvents] = useState<
     Array<{ kind?: string; status?: string; created_at?: string }>
   >([]);
-  const [secretsPresence, setSecretsPresence] = useState<{
-    dsn_in_keychain?: boolean;
-    gemini_in_keychain?: boolean;
-  } | null>(null);
+  const [secretsPresence, setSecretsPresence] = useState<SecretsPresence | null>(
+    null,
+  );
+  const [secretsPresenceMsg, setSecretsPresenceMsg] = useState<string | null>(
+    null,
+  );
   const [geminiKey, setGeminiKey] = useState("");
   const [geminiMsg, setGeminiMsg] = useState<string | null>(null);
   const [geminiSaving, setGeminiSaving] = useState(false);
+  const [models, setModels] = useState<ModelsState>(DEFAULT_MODELS);
+  const [modelsMsg, setModelsMsg] = useState<string | null>(null);
+  const [modelsSaving, setModelsSaving] = useState(false);
+  const [openaiCompatKey, setOpenaiCompatKey] = useState("");
+  const [openaiCompatMsg, setOpenaiCompatMsg] = useState<string | null>(null);
+  const [openaiCompatSaving, setOpenaiCompatSaving] = useState(false);
   const [episodeShowId, setEpisodeShowId] = useState("");
   const [revSlug, setRevSlug] = useState("");
   const [revRecent, setRevRecent] = useState<RecentRevision[]>([]);
@@ -472,6 +551,23 @@ export default function App() {
     }
   }, []);
 
+  const loadSecretsPresence = useCallback(async () => {
+    try {
+      const raw = await invoke<string>("secrets_presence");
+      const parsed = parseJson(raw);
+      if (!isSecretsPresence(parsed)) {
+        setSecretsPresence(null);
+        setSecretsPresenceMsg("Secrets presence unknown.");
+        return;
+      }
+      setSecretsPresence(pickSecretsPresence(parsed));
+      setSecretsPresenceMsg(null);
+    } catch {
+      setSecretsPresence(null);
+      setSecretsPresenceMsg("Could not read secrets presence.");
+    }
+  }, []);
+
   const saveGeminiKey = useCallback(async () => {
     const value = geminiKey.trim();
     if (!value) {
@@ -492,6 +588,8 @@ export default function App() {
       if (parsed?.ok) {
         setGeminiKey("");
         setGeminiMsg("Saved to Keychain.");
+        fetchedAt.current.activity = undefined;
+        await loadSecretsPresence();
         await loadStatus(true);
       } else {
         setGeminiMsg(parsed?.error ?? "Could not save the key.");
@@ -501,7 +599,37 @@ export default function App() {
     } finally {
       setGeminiSaving(false);
     }
-  }, [geminiKey, loadStatus]);
+  }, [geminiKey, loadSecretsPresence, loadStatus]);
+
+  const saveOpenaiCompatKey = useCallback(async () => {
+    const value = openaiCompatKey.trim();
+    if (!value) {
+      setOpenaiCompatMsg("Enter a key first (or leave blank for Ollama).");
+      return;
+    }
+    setOpenaiCompatSaving(true);
+    setOpenaiCompatMsg(null);
+    try {
+      const raw = await invoke<string>("set_khipu_secret", {
+        account: "openai_compat_api_key",
+        value,
+      });
+      const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
+      if (parsed?.ok) {
+        setOpenaiCompatKey("");
+        setOpenaiCompatMsg("Saved to Keychain.");
+        fetchedAt.current.activity = undefined;
+        await loadSecretsPresence();
+        await loadStatus(true);
+      } else {
+        setOpenaiCompatMsg(parsed?.error ?? "Could not save the key.");
+      }
+    } catch (e) {
+      setOpenaiCompatMsg(String(e));
+    } finally {
+      setOpenaiCompatSaving(false);
+    }
+  }, [openaiCompatKey, loadSecretsPresence, loadStatus]);
 
   const loadDoctor = useCallback(async (force = false) => {
     if (!needsFetch("doctor", force)) return;
@@ -571,10 +699,7 @@ export default function App() {
           status?: string;
           created_at?: string;
         }>;
-        secrets?: {
-          dsn_in_keychain?: boolean;
-          gemini_in_keychain?: boolean;
-        };
+        secrets?: unknown;
       } | null;
       if (
         parsed === null ||
@@ -588,7 +713,13 @@ export default function App() {
       setActivityText(prettyJson(raw));
       setActivityList(parsed.recent ?? []);
       setOpsEvents(parsed.ops_events ?? []);
-      setSecretsPresence(parsed.secrets ?? null);
+      if (isSecretsPresence(parsed.secrets)) {
+        setSecretsPresence(pickSecretsPresence(parsed.secrets));
+        setSecretsPresenceMsg(null);
+      } else {
+        setSecretsPresence(null);
+        setSecretsPresenceMsg("Secrets presence unknown.");
+      }
       fetchedAt.current.activity = Date.now();
     } catch (e) {
       // Preserve last-good activity lists/KPIs; toast only.
@@ -828,6 +959,89 @@ export default function App() {
     }
   }, []);
 
+  const loadModels = useCallback(async () => {
+    try {
+      const raw = await runKhipu(["models"]);
+      const parsed = parseJson(raw) as Partial<ModelsState> | null;
+      if (!parsed || typeof parsed !== "object") {
+        setModelsMsg("Unexpected models response");
+        return;
+      }
+      setModels({
+        synth: {
+          ...DEFAULT_MODELS.synth,
+          ...(parsed.synth ?? {}),
+        },
+        embed: {
+          ...DEFAULT_MODELS.embed,
+          ...(parsed.embed ?? {}),
+        },
+        vision: {
+          ...DEFAULT_MODELS.vision,
+          ...(parsed.vision ?? {}),
+        },
+        models_error:
+          typeof parsed.models_error === "string" ? parsed.models_error : null,
+      });
+      setModelsMsg(null);
+    } catch (e) {
+      setModelsMsg(String(e));
+    }
+  }, []);
+
+  const updateModelRole = useCallback(
+    (role: "synth" | "embed" | "vision", patch: Partial<ModelRole>) => {
+      setModels((prev) => ({
+        ...prev,
+        [role]: { ...prev[role], ...patch },
+      }));
+    },
+    [],
+  );
+
+  const saveModels = useCallback(async () => {
+    if (models.models_error) {
+      setModelsMsg(
+        "Save is blocked until the stored models error is cleared.",
+      );
+      return;
+    }
+    setModelsSaving(true);
+    setModelsMsg(null);
+    try {
+      const payload = {
+        synth: models.synth,
+        embed: models.embed,
+        vision: models.vision,
+      };
+      const raw = await runKhipu(["models", "set", JSON.stringify(payload)]);
+      const parsed = parseJson(raw) as {
+        ok?: boolean;
+        error?: string;
+        models?: ModelsState;
+      } | null;
+      if (!parsed?.ok) {
+        setModelsMsg(parsed?.error ?? "models set failed");
+        return;
+      }
+      if (parsed.models) {
+        setModels({
+          synth: { ...DEFAULT_MODELS.synth, ...parsed.models.synth },
+          embed: { ...DEFAULT_MODELS.embed, ...parsed.models.embed },
+          vision: { ...DEFAULT_MODELS.vision, ...parsed.models.vision },
+          models_error: parsed.models.models_error ?? null,
+        });
+      } else {
+        await loadModels();
+      }
+      setModelsMsg("Saved.");
+    } catch (e) {
+      setModelsMsg(String(e));
+    } finally {
+      setModelsSaving(false);
+    }
+  }, [models, loadModels]);
+
   const toggleGraphSource = useCallback(
     async (id: string, enabled: boolean) => {
       if (!graphSourcesProducer) return;
@@ -901,7 +1115,11 @@ export default function App() {
       void loadPaths();
       void loadGraphSources();
     }
-  }, [tab, loadPaths, loadGraphSources]);
+    if (tab === "settings") {
+      void loadModels();
+      void loadSecretsPresence();
+    }
+  }, [tab, loadPaths, loadGraphSources, loadModels, loadSecretsPresence]);
 
   useEffect(() => {
     void getVersion()
@@ -1359,17 +1577,21 @@ export default function App() {
             </button>
           </PanelHeader>
           <div className="panel-body">
-            {secretsPresence ? (
-              <div className="chips">
-                <span className="chip">
-                  DSN keychain:{" "}
-                  {secretsPresence.dsn_in_keychain ? "yes" : "no"}
-                </span>
-                <span className="chip">
-                  Gemini keychain:{" "}
-                  {secretsPresence.gemini_in_keychain ? "yes" : "no"}
-                </span>
-              </div>
+            <div className="chips">
+              <span className="chip">
+                DSN keychain: {presenceLabel(secretsPresence, "dsn_in_keychain")}
+              </span>
+              <span className="chip">
+                Gemini keychain:{" "}
+                {presenceLabel(secretsPresence, "gemini_in_keychain")}
+              </span>
+              <span className="chip">
+                OpenAI-compat keychain:{" "}
+                {presenceLabel(secretsPresence, "openai_compat_in_keychain")}
+              </span>
+            </div>
+            {secretsPresenceMsg ? (
+              <p className="muted">{secretsPresenceMsg}</p>
             ) : null}
 
             {opsEvents.length > 0 ? (
@@ -2115,11 +2337,148 @@ export default function App() {
             </div>
 
             <div className="section-card">
+              <div className="section-head">Models</div>
+              <div className="section-body">
+                <p className="muted">
+                  Capture extract follows this card (Gemini cloud or a local
+                  OpenAI-compatible endpoint). Nightly consolidate is mechanical;
+                  monthly topic classify is DeepSeek v4-pro via{" "}
+                  <code>conversation-memory-monthly.py</code> and is{" "}
+                  <strong>not</strong> switched here.
+                </p>
+                {models.models_error ? (
+                  <p className="muted">
+                    Stored models config had a problem (showing defaults):{" "}
+                    <code>{models.models_error}</code>. Save is blocked until
+                    the stored models key is fixed or cleared.
+                  </p>
+                ) : null}
+
+                {(
+                  [
+                    ["synth", "Synth (capture extract)"],
+                    ["embed", "Embed (persist only)"],
+                    ["vision", "Vision"],
+                  ] as const
+                ).map(([role, label]) => {
+                  const row = models[role];
+                  const visionOff = role === "vision" && row.provider === "off";
+                  const providerOptions =
+                    role === "vision"
+                      ? (["cloud", "local", "off"] as const)
+                      : (["cloud", "local"] as const);
+                  return (
+                    <div key={role} className="rows" style={{ marginBottom: 12 }}>
+                      <div className="rows-head">{label}</div>
+                      <div className="toolbar">
+                        <label className="muted" htmlFor={`models-${role}-provider`}>
+                          Provider
+                        </label>
+                        <select
+                          id={`models-${role}-provider`}
+                          value={row.provider}
+                          onChange={(e) =>
+                            updateModelRole(role, { provider: e.target.value })
+                          }
+                        >
+                          {providerOptions.map((p) => (
+                            <option key={p} value={p}>
+                              {p}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="toolbar">
+                        <input
+                          className="mono"
+                          disabled={visionOff || row.provider === "cloud"}
+                          value={row.endpoint}
+                          onChange={(e) =>
+                            updateModelRole(role, { endpoint: e.target.value })
+                          }
+                          placeholder={
+                            visionOff
+                              ? "n/a when off"
+                              : "http://127.0.0.1:11434"
+                          }
+                        />
+                        <input
+                          className="mono"
+                          disabled={visionOff}
+                          value={row.model_id}
+                          onChange={(e) =>
+                            updateModelRole(role, { model_id: e.target.value })
+                          }
+                          placeholder={
+                            role === "embed"
+                              ? "runtime = active Gemini embed profile"
+                              : visionOff
+                                ? "n/a when off"
+                                : "model id"
+                          }
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+
+                <p className="muted">
+                  Embed: saved; search still uses the{" "}
+                  <strong>active Gemini embed profile</strong> until the profiles
+                  cut. Vision: off — no ingest this version.
+                </p>
+
+                <label className="muted" htmlFor="openai-compat-key">
+                  Optional local OpenAI-compat bearer (Ollama can leave blank).
+                  Presence is shown under Secrets.
+                </label>
+                <div className="toolbar">
+                  <input
+                    id="openai-compat-key"
+                    className="mono"
+                    type="password"
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={openaiCompatKey}
+                    onChange={(e) => setOpenaiCompatKey(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void saveOpenaiCompatKey();
+                    }}
+                    placeholder="sk-… (optional)"
+                  />
+                  <button
+                    type="button"
+                    disabled={openaiCompatSaving || !openaiCompatKey.trim()}
+                    onClick={() => void saveOpenaiCompatKey()}
+                  >
+                    {openaiCompatSaving ? "Saving…" : "Save local key"}
+                  </button>
+                </div>
+                {openaiCompatMsg ? (
+                  <pre className="code">{openaiCompatMsg}</pre>
+                ) : null}
+
+                <div className="toolbar">
+                  <button
+                    type="button"
+                    className="primary"
+                    disabled={modelsSaving || models.models_error != null}
+                    onClick={() => void saveModels()}
+                  >
+                    {modelsSaving ? "Saving…" : "Save models"}
+                  </button>
+                </div>
+                {modelsMsg ? <pre className="code">{modelsMsg}</pre> : null}
+              </div>
+            </div>
+
+            <div className="section-card">
               <div className="section-head">Secrets</div>
               <div className="section-body">
                 <p className="muted">
                   Keychain service <code>Khipu</code> (
-                  <code>database_url</code>, <code>gemini_api_key</code>).{" "}
+                  <code>database_url</code>, <code>gemini_api_key</code>,{" "}
+                  <code>openai_compat_api_key</code>).{" "}
                   <code>khipu secrets</code> shows presence only.
                 </p>
                 <p className="muted">
@@ -2160,13 +2519,23 @@ export default function App() {
                 </div>
                 {geminiMsg ? <pre className="code">{geminiMsg}</pre> : null}
                 <p className="muted">
-                  Currently stored:{" "}
+                  Currently stored: Gemini{" "}
                   <strong>
-                    {secretsPresence?.gemini_in_keychain ? "yes" : "no"}
+                    {presenceLabel(secretsPresence, "gemini_in_keychain")}
+                  </strong>
+                  ; OpenAI-compat{" "}
+                  <strong>
+                    {presenceLabel(
+                      secretsPresence,
+                      "openai_compat_in_keychain",
+                    )}
                   </strong>
                   . An environment variable <code>GEMINI_API_KEY</code> takes
-                  precedence over this, if one is set.
+                  precedence over the Gemini Keychain item, if one is set.
                 </p>
+                {secretsPresenceMsg ? (
+                  <p className="muted">{secretsPresenceMsg}</p>
+                ) : null}
 
                 <div className="toolbar">
                   <button type="button" onClick={() => void refreshDsn(true)}>
@@ -2185,28 +2554,6 @@ export default function App() {
                   <a href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</a>. Include the
                   Doctor output if it is red — it never contains secrets.
                 </p>
-              </div>
-            </div>
-
-            <div className="section-card">
-              <div className="section-head">
-                Local LLM
-                <span className="badge-muted">planned</span>
-              </div>
-              <div className="section-body">
-                <label className="muted" htmlFor="local-llm">
-                  Endpoint (not available yet)
-                </label>
-                <div className="toolbar">
-                  <input
-                    id="local-llm"
-                    className="mono"
-                    disabled
-                    placeholder="http://127.0.0.1:11434/v1 (disabled)"
-                    value=""
-                    readOnly
-                  />
-                </div>
               </div>
             </div>
           </div>
