@@ -759,8 +759,9 @@ def semantic_search(
     """Cosine oversample over the active profile, then token-overlap RRF.
 
     Returns kind/id/score/snippet + label. Cosine alone packed relevant and
-    irrelevant episodes into a ~0.02 band; fusing query-term hits lifts the
-    rows that actually name the question without a second embed call.
+    irrelevant episodes into a ~0.02 band; fusing query-term hits on the
+    embedded chunk (summary + extract), not the teaser, lifts rows that
+    actually name the question without a second embed call.
     """
     from khipu.db import connect
 
@@ -807,13 +808,19 @@ def semantic_search(
             for k, r, i, s, snip, lbl in cur.fetchall():
                 # Episodes: snippet from the stored summary, not chunk_text
                 # (which appends decisions/topics and used to mid-word clip at 200).
+                # RRF ranks on chunk_text (snip) so extract fields that were
+                # already embedded can lift a hit the teaser never names.
                 snippet_src = lbl if k == "episode" and lbl else snip
                 out.append({
                     "kind": k, "id": r, "chunk_idx": i, "score": round(float(s), 4),
                     "label": clip_snippet(lbl or snip, LABEL_LIMIT),
                     "snippet": clip_snippet(snippet_src, SNIPPET_LIMIT),
+                    "rank_text": snip or "",
                 })
-            return hybrid_rerank(out, query, limit=want)
+            ranked = hybrid_rerank(out, query, limit=want)
+            for row in ranked:
+                row.pop("rank_text", None)
+            return ranked
 
 
 def coverage(*, profile: str | None = None) -> dict[str, Any]:

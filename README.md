@@ -169,17 +169,19 @@ khipu graph <node-id> --hops 2                       # connections
 ```
 
 **Keyword** search is token-coverage `ILIKE` across topic bodies, episode
-summaries, and node names — a multi-word query ranks by how many tokens hit,
-not whether the whole phrase appears as one substring. It queries each kind
-separately with its own ordering, so a flood of matching episodes cannot
-starve out the one topic page you actually wanted.
+summaries plus capture extract fields (topics, decisions, preferences, people),
+and node names — a multi-word query ranks by how many tokens hit, not whether
+the whole phrase appears as one substring. It queries each kind separately
+with its own ordering, so a flood of matching episodes cannot starve out the
+one topic page you actually wanted.
 
 **Semantic** search embeds the query with the **active** embedding profile
 (`gemini-embedding-2@768`; `gemini-embedding-001` @ 768 retained as inactive
 rollback), oversamples cosine neighbors, then fuses that order with query-term
-overlap (reciprocal-rank fusion) so a meaning search still prefers hits that
-name the question. Embeddings are keyed by content hash, so re-embedding only
-touches text that actually changed.
+overlap over the same embedded text (summary + extract), not the teaser
+snippet. Reciprocal-rank fusion still prefers hits that name the question.
+Embeddings are keyed by content hash, so re-embedding only touches text that
+actually changed.
 
 **Graph** traversal expands wiki/path/graphify nodes. Digit ids from search
 are episodes: the neighborhood is that capture's topic slugs, not a node
