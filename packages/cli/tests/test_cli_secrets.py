@@ -47,6 +47,32 @@ class SecretsSetTest(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(calls, [], "refused account must not reach the Keychain")
 
+    def test_openai_compat_api_key_is_allowed(self):
+        status = {
+            "gemini_in_keychain": False,
+            "dsn_in_keychain": False,
+            "openai_compat_in_keychain": True,
+        }
+        args = mock.Mock(set="openai_compat_api_key")
+        calls = []
+
+        def fake_set(acct, value):
+            calls.append((acct, value))
+
+        with mock.patch("khipu.keychain.set_password", side_effect=fake_set), \
+             mock.patch("khipu.keychain.secrets_status", return_value=status), \
+             mock.patch("sys.stdin", io.StringIO("sk-local\n")), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = cli.cmd_secrets(args)
+        self.assertEqual(rc, 0)
+        self.assertTrue(json.loads(out.getvalue())["ok"])
+        self.assertEqual(calls, [("openai_compat_api_key", "sk-local")])
+        self.assertIn("openai_compat_api_key", cli.SETTABLE_SECRETS)
+        self.assertEqual(
+            cli.SETTABLE_SECRETS["openai_compat_api_key"],
+            "openai_compat_in_keychain",
+        )
+
     def test_empty_stdin_is_refused(self):
         for blank in ("", "\n", "   \n"):
             with self.subTest(blank=blank):

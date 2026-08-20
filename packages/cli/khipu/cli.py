@@ -537,6 +537,7 @@ def cmd_topic_graph_backfill(args: argparse.Namespace) -> int:
 SETTABLE_SECRETS = {
     "gemini_api_key": "gemini_in_keychain",
     "database_url": "dsn_in_keychain",
+    "openai_compat_api_key": "openai_compat_in_keychain",
 }
 
 
@@ -840,6 +841,70 @@ def cmd_graph_build(_args: argparse.Namespace) -> int:
     return run_graph_build()
 
 
+def cmd_models(args: argparse.Namespace) -> int:
+    from khipu import models as models_mod
+
+    action = getattr(args, "models_cmd", None) or "show"
+    try:
+        if action == "show":
+            print(models_mod.dump_show_json())
+            return 0
+        if action == "set":
+            raw_json = getattr(args, "models_json", None)
+            role = getattr(args, "role", None)
+            if raw_json:
+                if role:
+                    print(
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": "pass either a JSON blob or --role flags, not both",
+                            }
+                        )
+                    )
+                    return 2
+                try:
+                    payload = json.loads(raw_json)
+                except ValueError as e:
+                    print(json.dumps({"ok": False, "error": f"invalid JSON: {e}"}))
+                    return 2
+                if not isinstance(payload, dict):
+                    print(json.dumps({"ok": False, "error": "JSON payload must be an object"}))
+                    return 2
+                out = models_mod.set_models_replace(payload)
+                print(json.dumps({"ok": True, "models": out}, indent=2))
+                return 0
+            if not role:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": "models set requires a JSON blob or --role …",
+                        }
+                    )
+                )
+                return 2
+            provider = getattr(args, "provider", None)
+            if not provider:
+                print(json.dumps({"ok": False, "error": "--provider is required with --role"}))
+                return 2
+            endpoint = getattr(args, "endpoint", None)
+            model_id = getattr(args, "model_id", None)
+            out = models_mod.set_models_merge_role(
+                role,
+                provider=provider,
+                endpoint=endpoint,
+                model_id=model_id,
+            )
+            print(json.dumps({"ok": True, "models": out}, indent=2))
+            return 0
+        print(json.dumps({"ok": False, "error": f"unknown models action: {action}"}))
+        return 2
+    except ValueError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+
+
 def cmd_sources(args: argparse.Namespace) -> int:
     from khipu import sources
 
@@ -1085,6 +1150,46 @@ def build_parser() -> argparse.ArgumentParser:
         "graph-build", help="Run graphify_nightly.py once (graph.sqlite)"
     )
     gb.set_defaults(func=cmd_graph_build)
+
+    md = sub.add_parser(
+        "models",
+        help="Per-role model Settings (synth / embed / vision): show / set",
+    )
+    md_sub = md.add_subparsers(dest="models_cmd", required=False)
+    md_sub.add_parser("show", help="JSON: three roles + models_error").set_defaults(
+        func=cmd_models, models_cmd="show"
+    )
+    md_set = md_sub.add_parser(
+        "set",
+        help="Merge one role (--role …) or replace all three (JSON blob)",
+    )
+    md_set.add_argument(
+        "models_json",
+        nargs="?",
+        default=None,
+        help="Full models object JSON (all three roles); replaces the whole models key",
+    )
+    md_set.add_argument(
+        "--role",
+        choices=("synth", "embed", "vision"),
+        default=None,
+        help="Merge one role (other roles unchanged)",
+    )
+    md_set.add_argument(
+        "--provider",
+        choices=("cloud", "local", "off"),
+        default=None,
+        help="Provider for --role merge",
+    )
+    md_set.add_argument("--endpoint", default=None, help="Local endpoint origin")
+    md_set.add_argument(
+        "--model-id",
+        dest="model_id",
+        default=None,
+        help="Model id for the role",
+    )
+    md_set.set_defaults(func=cmd_models, models_cmd="set")
+    md.set_defaults(func=cmd_models, models_cmd="show")
 
     src = sub.add_parser("sources", help="Graph membership: list / enable / disable / add / export")
     src_sub = src.add_subparsers(dest="sources_cmd", required=True)
