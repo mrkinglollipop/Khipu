@@ -1,0 +1,36 @@
+---
+description: Audit mode — fire on audit, /audit, audit your work, session audit, assess, health check, review the system, coverage audit, sanity check, findings on, /verify-plan, verify the plan, /myauditandfix, /oracle-retro; mandatory Action summary, Verification ledger, Plan completion; audit+fix when Matt asks to fix findings
+alwaysApply: false
+---
+
+# Audit mode
+
+When Matt's request matches **audit intent**, load and follow **`.cursor/skills/audit/SKILL.md`** before substantive work — **except `/oracle-retro`** (oracle-retro skill only) and **`/verify-plan`** (verify-plan skill only; audit §4 report format).
+
+## Trigger (intent, not exact wording)
+
+Fire on: **audit**, **/audit**, **audit your work**, **session audit**, **audit what you just did**, **assess**, **health check**, **review the system**, **coverage audit**, **what's broken in**, **sanity check on**, **findings on** — when the goal is investigation and a report, not bare implementation.
+
+**Audit + fix (fix phase authorized):** **/myauditandfix** (`.cursor/commands/myauditandfix.md`) — dual critics → confirm verifier → report first, then fix verifier loop until green (max **4 rounds** sequential; confirm-only delta when prior confirm had zero HIGH and fix introduces no new HIGH). Also: **audit and fix**, **fix any issues** (with audit context), or **audit your work** when accompanied by fix language in the same message. **Single-pass fix** applies only to informal audit+fix **not** via `/myauditandfix` or `/verify-plan` — those commands always require post-fix re-audit after Phase 2. Informal audit+fix that still loops needs confirm after fix before green.
+
+**Oracle retro (harness encode authorized):** **/oracle-retro**, **oracle retro** — load **`.cursor/skills/oracle-retro/SKILL.md` only** (not this skill's §4 report format). Verify/oracle friction from invoking thread; Phase 2 encodes runbooks/agents/repo rules when action bar passes; ends with **Closure Summary** per oracle-retro skill §9. Trailing **`audit-only`** skips Phase 2.
+
+**Verify plan (plan-doc fix authorized):** **/verify-plan**, **audit and verify your plan**, **verify the plan** — load **`.cursor/skills/verify-plan/SKILL.md` only** (uses audit §4 report format). Plan artifact(s) in invoking thread; **pipeline:** Freshness pass → dual `session-auditor` (`TRACK=plan`) → confirm-only `audit-verifier` → mandatory §4 report → plan-only fix verifier when not green. Loop audit→plan fix until green (max **4 rounds** sequential; confirm-only delta when prior confirm had zero HIGH and fix introduces no new HIGH). Trailing **`audit-only`** skips Phase 2 plan edits.
+
+**Session audit:** default target = **invoking thread only** — paths touched via `Write`/`StrReplace`/`Delete` (orchestrator + subagents), session shell side effects, and load-bearing claims from this thread. **Not** repo-wide `git diff` or pre-session uncommitted WIP. **Pipeline:** Freshness pass (when applicable) + **prepr prepare** (repo-local `prepr_audit.py --worktree --prepare --json` on code sessions; docs-only N/A) → dual critics (`TRACK=session`, ROLE=bug_hunt + ROLE=claim_bust) on full rounds → confirm-only adjudicator (`fix_authorized=false`) → mandatory §4 report → optional fix adjudicator (`fix_authorized=true`, `TRACK=session`) when fix phase authorized. **`DELTA_CHECK` code rounds:** after prepare re-run, one `bug_hunt` critic with bundle (skip `claim_bust`); docs-only delta may skip all critics. Prepr takes one `--path` per session code path (session scope only; no `--post`/`--pr`/`--waive`) and emits a prepare bundle for critics/verifier — never a Green substitute. Exit 2/3 or a missing run blocks Green:Y on code sessions; re-run after Phase 2 before full/delta confirm so the fingerprint is current. **Dispatch/models:** resolve from **`.cursor/dispatch-settings.yaml`** (Cursor critics pin `composer-2.5`; adjudicator pin `cursor-grok-4.6-xhigh` (allow `cursor-grok-4.6-high`); never omit; never Composer; never k3 as adjudicator pin; **Grok/Claude omit always**). Orchestrator does not solo-audit. **`/myauditandfix`** defaults to session audit unless trailing text narrows or adds scope. **`/oracle-retro`** defaults to verify/oracle slice of the same thread. **Bugbot:** default off on session track; opt in via Matt prompt only.
+
+Do **not** load audit skill for: **/oracle-retro** (oracle-retro skill), **`/verify-plan`** (verify-plan skill), an explicit **`/review-bugbot`** request (use `review-bugbot` skill), or security-only review (use `review-security`). Ordinary PR/diff review stays on the Code track with BugBot off unless Matt explicitly opts in.
+
+## Hard constraints
+
+1. **Read-only by default** — no `Write` / `StrReplace` / commits / builds unless fix phase is authorized (`/myauditandfix`, **`/oracle-retro`** harness encode, **`/verify-plan`** plan-doc edits only, `and fix`, `fix any issues`) or Matt says `approved — build`
+2. **Assessment first** — dual critics + confirm-only verifier; surface structured §4 report to Matt before any fix writes; do not "helpfully" patch mid-audit (Fable 5b). Verifier never confirm+write in one Task. **Same-turn continue (HARD):** when `/myauditandfix` or `/verify-plan` is active and the audit is not green and not stop-early, dispatch Phase 2 in the **same turn** after the §4 report — do **not** wait for Matt acknowledgment; two-step is order-only, not a human checkpoint.
+3. **Mandatory report sections** — on **every** audit-intent trigger using **this** skill (not `/oracle-retro`): **Action summary** → **Verification ledger** → **Plan completion** → Findings/detail per `.cursor/skills/audit/SKILL.md` §4. **`/oracle-retro`** uses Closure Summary per oracle-retro skill §9 instead.
+4. **Scope first** — one-line in/out of scope before fan-out
+5. **Delegate multi-area** — ≥2 independent areas → parallel Explore/Task via product Auto, not serial grep loops
+6. **Specialized tracks** — session track → dual `session-auditor` + `audit-verifier` (**bugbot opt-in only**); diff/PR **Code** track → session-auditor / explore as needed (**bugbot opt-in only** — `/review-bugbot` when Matt asks; `security-review` when relevant); **Hybrid** → explore + optional bugbot on diff (**opt-in only**); do not substitute inline self-review on session or code tracks; never auto-dispatch bugbot during audit, commit, PR, or merge flows
+7. **Cursor product scope** — audit of Cursor IDE/CLI/features behavior → `cursor-guide` (orchestration case 1), even under audit intent; repo/code/system audit stays on audit tracks
+
+## Precedence
+
+Audit mode adds process on top of Fable + orchestration. It does **not** override workspace boundary, security floors, build gate, or orchestration case 1 (`cursor-guide`).

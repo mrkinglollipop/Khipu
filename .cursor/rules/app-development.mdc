@@ -1,0 +1,118 @@
+---
+description: >-
+  Native app development — fire on iOS, macOS, Swift, SwiftUI, Xcode, TestFlight,
+  ship, xcodebuild, simctl, Flutter, CocoaPods, fastlane, Electron, electron-oracle,
+  CDP, Tauri webview UI, mockup, design uplift, ui-design-quality, Code Connect,
+  app repo paths (Code/, ~/Projects/), build oracles, ios-oracle, xc-mcp, visual verify;
+  Xcode toolchain, repo paths, ship lanes, build oracles
+alwaysApply: false
+---
+
+# App Development
+
+Matt's iOS/macOS/Flutter apps are built from **`/Volumes/Cloud Storage/Code/`** (canonical app SSOT) and **`~/Projects/`** (FT family). **`/Volumes/Cloud Storage/Code/**` writes are standing-authorized** per `master.mdc`. **`~/Projects/*`** still requires Matt's explicit in-thread authorization.
+
+## Native toolchain (verified on this machine)
+
+- **Xcode 27** — `/Applications/Xcode-beta.app` (`xcode-select -p` → `…/Xcode-beta.app/Contents/Developer`)
+- **xcodegen** — `/opt/homebrew/bin/xcodegen`
+- **fastlane** — `/opt/homebrew/bin/fastlane`
+- **Flutter 3.44** — `/opt/homebrew/bin/flutter`
+- **CocoaPods** — `/opt/homebrew/bin/pod`
+- **ASC key** — `~/.appstoreconnect/private_keys/AuthKey_YS66F4G38M.p8` (stage from `/Volumes/Cloud Storage/Claude/API Keys/` if absent; never commit)
+
+Shell with `required_permissions: ["all"]` for `xcodebuild`, `simctl`, codesign, and TestFlight uploads — sandbox blocks CoreSimulator.
+
+## Repo paths
+
+| Location | Apps |
+|----------|------|
+| `/Volumes/Cloud Storage/Code/` | mrs-lollipop, Manna, circletown, sojourn, codewright, scriptorium-native, scriptorium, relay, … |
+| `~/Projects/` | ft-terminal-ios, ft-command, ft-terminal-mac, scriptorium-web |
+
+## Bare-repo lint nudge (Phase-2)
+
+When first editing a **bare** app repo this session (no lint config for the language in play), **propose once** — do not silent-install, do not fleet-PR `Code/`:
+
+| Stack | Bare means (approx.) | Propose |
+|-------|----------------------|---------|
+| Python | No `[tool.ruff]` / `ruff.toml` / `.ruff.toml` | Root `pyproject.toml` `[tool.ruff]` (line-length 100); CI only if the repo already has Actions |
+| TS/JS | No Biome/ESLint config | Biome (prefer) over inventing ESLint |
+| Swift | No `.swiftlint.yml` | `.swiftlint.yml` only when next shipping that app |
+
+Leave repos that already have a linter alone. Ask before write. Same rule lives in `code-hygiene.mdc`.
+
+## Build oracle (HARD)
+
+1. **XcodeGen repos:** `xcodegen generate` → `xcodebuild` (never `swift build` alone — misses target membership).
+2. **Workspace iOS verify:** `bash "/Volumes/Cloud Storage/Claude/.cursor/ios-build-verify.sh" REPO_ROOT` — or dispatch `ios-oracle` when useful. Per-repo copies under `~/Projects/*/.cursor/` still valid for those repos.
+3. **Flutter (CodeWright):** `flutter build` / `flutter analyze`.
+4. Oracle = direct shell command; max 3 runs per change (`orchestration.mdc`).
+
+## Ship lanes (TestFlight — checkpoint before upload)
+
+| App | Ship command |
+|-----|--------------|
+| Mrs Lollipop | `cd app && ./ship.sh` |
+| Manna | `fastlane ios_beta` |
+| Circletown / Sojourn | `./scripts/ship.sh` |
+| CodeWright | `codewright_flutter/scripts/ship.sh` |
+| Scriptorium native | `scripts/ship.sh` |
+| FT Terminal iOS | `~/Projects/ft-terminal-ios/scripts/ship.sh` |
+| FT Command | `~/Projects/ft-command/scripts/ship.sh` |
+
+Export `LANG=en_US.UTF-8` before fastlane. Full table: `/Volumes/Cloud Storage/Memory/conversations/topics/ios-ship-runbook.md`.
+
+## Memory
+
+Load `ios-ship-runbook.md` before any TestFlight or archive work. Per-app detail in `mrs-lollipop-*`, `ft-terminal-ios.md`, `ft-command-testflight-ship.md`, `scriptorium-build.md`.
+
+## Prepr audit (via `/myauditandfix`)
+
+`.cursor/scripts/prepr_audit.py --worktree --prepare --json --path <session code path> …` — run as a `/myauditandfix` oracle when the session changed code (not during `/commitprmerge` / `gh pr create`). Docs-only sessions: N/A. Green for code sessions requires a completed latest prepare bundle for the current fingerprint; `/commitprmerge` reuses that transcript evidence.
+
+## SwiftUI design + visual verify
+
+Load `/Volumes/Cloud Storage/Memory/conversations/topics/swiftui-design-tooling.md` and `ft-command-swiftui-toolkit.md` for UI work.
+
+| Tool | Role | Cursor status |
+|------|------|---------------|
+| **xc-mcp** | Build, boot sim, screenshot, accessibility tree | `.cursor/mcp.json` — restart session to load |
+| **figma** (Framelink) | Figma frame metadata → SwiftUI implement fidelity | `.cursor/mcp.json` — restart session to load |
+| **Figma (official plugin)** | Generate / write-to-canvas / Code Connect / `search_design_system` | Cursor marketplace Figma plugin — prefer over freehand for mockups |
+| **ui-design-quality** | Mockup / uplift playbook: constrain→generate→review | `.cursor/skills/ui-design-quality/` or `/ui-design-quality` |
+| **extract-design-system** | Public site → tokens for ground step | `.cursor/skills/extract-design-system/` — Node + Playwright |
+| **better-design MCP** | Themes (webview/shadcn only) + `get-review-rules` (cross-lane) | **Matt-blocker:** Bearer in `~/.cursor/mcp.json` + **Cursor restart** required; **offline degrade** until then (template: `.cursor/mcp.json.example`) |
+| **shadcn-ui MCP** | shadcn source/blocks for web/Electron/Tauri webview | `.cursor/mcp.json` — optional PAT; **not** for SwiftUI |
+| **swiftui-pro** | Paul Hudson SwiftUI review skill | `.cursor/skills/swiftui-pro/` |
+| **figma-to-swiftui** | Figma URL → native SwiftUI workflow | `.cursor/skills/figma-to-swiftui/` |
+| **circletown-art** | Circletown painterly art pipeline (canon, placement, inpaint, scale) | `/Volumes/Cloud Storage/Code/circletown/.cursor/skills/circletown-art/` — repo-local; load for art gen/placement, not SwiftUI chrome |
+| **circletown-app** | Circletown iOS app (HomeView, ink, xc-mcp verify, Prefire) | `/Volumes/Cloud Storage/Code/circletown/.cursor/skills/circletown-app/` — repo-local; load for SwiftUI/verify; not art gen |
+| **InjectionIII + Inject** | Hot reload (DEBUG) | `/Applications/InjectionIII.app`; wired in ft-terminal-ios, ft-command, **mrs-lollipop, circletown, scriptorium-native, Manna** |
+| **Prefire** | Snapshot tests from `#Preview` | **Manna** (`MannaTests` + `README-Prefire.md`; enable plugin in Xcode once) |
+| **SF Symbols.app** | Icon/symbol reference | Installed (`/Applications/SF Symbols Beta.app`) |
+| **logos-bible MCP** | Logos library access | `.cursor/mcp.json` |
+| **adobe-creativity MCP** | Adobe cloud design | `.cursor/mcp.json` |
+| **swiftformat / swiftlint** | Format + lint | Homebrew; configs in app repos |
+| **Pow, Shimmer, Introspect** | UI polish SPM libs | In ft-terminal-ios + ft-command `project.yml` |
+
+**Visual verify loop:** xc-mcp screenshot + accessibility tree (preferred) or `simctl io booted screenshot` with `required_permissions: ["all"]`. UI work without a visual oracle stays blind — see swiftui-design-tooling diagnosis.
+
+**Mockup / design uplift lean-in:** When generating or implementing product UI in Figma or code, prefer **Code Connect** + `search_design_system` over freehand. Load **`ui-design-quality`** (skill or `/ui-design-quality`). Ground with **extract-design-system** when a reference brand/site is named. SwiftUI must **not** ground on better-design **themes** (themes are webview/shadcn). If Code Connect mappings are missing, **label freehand degrade** in-thread. Review via better-design `get-review-rules` when MCP live; else skill offline checklist labeled **`offline degrade`**.
+
+**Mrs Lollipop Talk scroll/dock/clipping:** `xcodebuild` alone is insufficient. Before claiming fix or shipping TestFlight for `ThreadView` / floating-dock scroll work → **`ios-oracle` mandatory** with bottom-of-thread sim screenshot per `/Volumes/Cloud Storage/Memory/conversations/topics/mrs-lollipop-talk-scroll.md`. Orchestrator may run inline `idb`/`simctl` repro on Mac when ios-oracle enum unavailable.
+
+## Electron verify
+
+| Tool | Role | Notes |
+|------|------|-------|
+| **electron-oracle** | Phase 1 smoke + optional Phase 2 CDP screenshot / DOM marker | `.cursor-plugin/agents/electron-oracle.md` + `.cursor/skills/electron-oracle/` |
+| **control-ui** | CDP attach, Playwright `connectOverCDP`, screenshot loop | cursor-team-kit skill — load for Phase 2 |
+
+**Visual verify loop:** dispatch `electron-oracle` after Electron UI or shell changes. Phase 1: `npm run smoke` (or documented smoke) with `ELECTRON_RUN_AS_NODE` cleared. Phase 2: launch with `--remote-debugging-port`, find app root marker (e.g. `[data-oracle-root]`), screenshot under `/tmp/electron-oracle-*.png`. **`npm run smoke` alone ≠ visual pass** — yields **VISUAL SKIP**, never VISUAL PASS.
+
+**D-hybrid:** agent `readonly: true`; shell needs `required_permissions: ["all"]` for launch/CDP. If Task blocks shell/CDP → orchestrator runs Phase 1/2 inline (control-ui) and relays evidence — same escape hatch as ios-oracle enum unavailable.
+
+**Tauri webviews** (`pi-harness-test`, `grok-build-harness/gui`, etc.): design quality via **`ui-design-quality`** (webview lane). **Never** dispatch `electron-oracle` for Tauri. Ship verify = labeled manual/build (repo tauri/npm smoke, screenshot) until a separate tauri-oracle exists. Rust/`src-tauri` is out of scope for design-quality work.
+
+**Not ported from Claude Code:** `swift-lsp` and `apple-platform-build-tools` plugins — Cursor uses `code-worker` + local `xcodebuild` oracle instead.

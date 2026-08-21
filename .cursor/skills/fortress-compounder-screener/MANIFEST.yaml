@@ -1,0 +1,52 @@
+skill_id: fortress-compounder-screener
+version: 1.0.0
+bucket: equity
+status: active
+summary: >-
+  Screens the stock universe for the "CINF archetype" — low-volatility dividend
+  compounders that grind upward, mean-revert, and are well suited to selling covered
+  calls against. Scores five quantified pillars (0–100), gates out the unfit, and ranks
+  by similarity to a CINF anchor. Validated out-of-sample on the 2008 GFC.
+
+entrypoints:
+  screen: scripts/fortress_screener.py
+  backtest: scripts/backtest_asof2007.py
+
+inputs:
+  - name: fmp_sqlite
+    type: sqlite
+    required: true
+    path: ${FMP_DIR:-/Volumes/Cloud Storage/Databases/fmp}
+    tables:
+      - price_history.sqlite::daily_prices   # ticker,date,close,volume,...
+      - dividends.sqlite::dividends          # ticker,date,adj_dividend,dividend
+      - fundamentals.sqlite::key_metrics_ttm # fcf_yield,roe,payout,book_value,market_cap
+      - fundamentals.sqlite::ratios_ttm      # fallback for null key_metrics fields
+  - name: options_iv_source
+    type: optional
+    required: false
+    note: Tier-2 VRP/IV pillar only; not needed for the core screen.
+
+outputs:
+  - ranked candidate list (console table + CSV via --out)
+  - per-ticker scorecard (--ticker SYM): metrics, five pillar sub-scores, gates, verdict
+  - similarity-to-anchor (default CINF) Euclidean distance / nearest-neighbor ranking
+
+depends_on:
+  python: ">=3.9"
+  pip_core: []                 # stdlib only
+  pip_optional: [numpy, pandas, yfinance]
+
+runs_on: local        # deterministic; no API/model calls in the core path
+model_calls: none     # pure quantitative screen; no LLM in the pipeline
+
+validation:
+  method: out-of-sample as-of-2007-12-31 -> 2008-2014 GFC outcomes (no look-ahead)
+  result: >-
+    ELITE-2007 names had 0% dividend-cut / 100% recovery vs 65% / 71% for WEAK;
+    passing the gates cut the dividend-cut rate from 62% to 21%.
+  bounds: >-
+    Not a guarantee (GE scored STRONG then fell 89% and cut); deep drawdowns are normal
+    even for winners; survivor-only universe (~28% of 2007 Aristocrats cut within 3y).
+
+cursor_compatible: true   # pure-Python + SQLite; runnable as a Cursor skill

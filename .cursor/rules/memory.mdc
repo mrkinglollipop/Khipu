@@ -1,0 +1,62 @@
+---
+description: Memory system — Khipu MCP recall, hub capture, retrieval fallback
+alwaysApply: true
+---
+
+# Memory System
+
+## Khipu MCP (recall)
+
+Persistent cross-session memory is the `khipu` MCP server (episodes, topic
+pages, graph). Search when it would change the answer, not on every turn.
+
+- Before answering anything that might have prior context (a project, a
+  decision, a preference, "what did we do about X"), call `khipu_search`.
+  Set `semantic: true` for meaning-based recall; leave it false for exact
+  terms and slugs.
+- `khipu_graph` expands a node id from search results. `khipu_status`
+  reports hub reachability and freshness.
+- After substantive work on a **local Mac with `khipu-stop-hook` installed**,
+  do **not** call `khipu_capture` and do **not** pipe `capture_v2.py` — the
+  Stop/PreCompact/SessionEnd hook is the writer (`session_capture` →
+  `khipu capture`, `capture_mode=hub`). An MCP write here double-captures.
+- Cloud agents on the HTTPS gateway have no hook: `khipu_capture` is the
+  only write, so do it (1–3 sentence summary, topic slugs,
+  decisions/preferences; `session_id` like `cursor:<repo>:<task>`).
+- **Cloud caveat:** `khipu_search` needs the khipu MCP server. Cloud Agents
+  without account-level or repo `khipu-cloud` have this rule but no tools.
+
+Do not skip Khipu search just because a hook already captured.
+
+## Capture cadence
+
+Local Mac: the hook decides — every 5 user turns or 20 minutes on Stop,
+always on PreCompact and SessionEnd. Do not pipe `capture_v2.py`; hub
+reverse-mirrors the file wiki from `khipu capture`.
+
+Cloud / no Stop hook: fire `khipu_capture` on every:
+- Decision landing (even minor — "use X library")
+- Preference stated (explicit or implicit — "I like that approach")
+- Topic shift (conversation moves to a different system/project)
+- Diagnosis or finding (root cause identified, bug explained)
+- Architectural principle or workspace-structure decision stated — ALWAYS capture-worthy, fire immediately, don't wait
+- At minimum every 4-5 turns in any working session
+
+Do NOT batch captures to session end. Many small captures >> one big dump.
+
+**Stop-hook detector (log only):** `capture_nudge.py` (in `stop` chain after `finish_guard`) logs when capture is stale (~90 min or 5+ substantive turns) to `/tmp/.cursor_capture_nudge_log.jsonl` — **no** `followup_message` / popup. Cooldown: 6 turns / 15 min. Kill switch: `/tmp/.cursor_capture_nudge_disable`.
+
+## When NOT to capture
+
+- Trivial Q&A (≤1 turn, no substance)
+- Code the user will throw away
+- Anything prefixed `scope: trivial` or `no memory`
+- Biblical Q&A (logs to `/Volumes/Cloud Storage/Memory/bible-expert/episodes.jsonl` — don't double-bookkeep)
+
+## Retrieval fallback (slug-miss)
+
+Before concluding "no memory on X":
+1. `khipu_search` (MCP) — primary. Semantic or ILIKE; then `khipu_graph` on a hit.
+2. `PYTHONPATH=".python_libs" python3 "/Volumes/Cloud Storage/Graph/query_graph.py" search "X"` — free, the graph indexes every `memory_topic` node.
+3. `grep -ril "X" "/Volumes/Cloud Storage/Memory/conversations/topics/"` — substring search across topic pages.
+4. Episodes older than 90 days rotate to `episodes_<YYYY>.jsonl` archives — grep those for older history.

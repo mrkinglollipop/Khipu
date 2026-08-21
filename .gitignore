@@ -10,3 +10,6 @@ apps/desktop/src-tauri/target/
 .grok/
 *.bak-khipu-*
 
+# Iterate / harness local state
+.cursor/state/
+
