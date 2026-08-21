@@ -1,0 +1,20 @@
+# Fortress Compounder Screener — dependencies
+#
+# CORE (Tier-1): NONE. The screener and backtest run on the Python 3.9+ standard
+# library only (sqlite3, statistics, math, datetime, csv, argparse, json).
+# Against the local FMP SQLite databases there is nothing to pip install.
+#
+# OPTIONAL — install only if you want the extras:
+
+# Faster full-universe screens (vectorized math behind the --fast flag).
+numpy>=1.24
+pandas>=2.0
+
+# NOTE: there is currently NO yfinance/online data backend. The screener reads FMP-schema
+# SQLite only (via the FMPStore class). Running it on a machine without those databases
+# requires copying DBs of the same schema, or adding a new data adapter to FMPStore —
+# installing yfinance alone does nothing today.
+
+# Tier-2 (options / variance-risk-premium) — NOT bundled. The IV-rank / IV-minus-HV
+# pillar needs an options data source. Wire ONE of: a Schwab options-chain pull, ORATS,
+# or yfinance option chains. The core screen runs fully without it.

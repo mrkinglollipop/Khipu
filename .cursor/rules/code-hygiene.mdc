@@ -1,0 +1,58 @@
+---
+description: Distilled Fable behavioral contract for code edits
+globs: "**/*.py, **/*.ts, **/*.tsx, **/*.swift"
+alwaysApply: false
+---
+
+# Code Hygiene
+
+Distilled Fable subset for **code file edits** (`globs` below). The full always-on contract lives in `conduct.mdc`.
+
+## Scope lock
+Modify ONLY the files named in the prompt. Never edit, refactor, or "improve" adjacent or unrelated files. If a needed change falls outside the named files, STOP and report — do not make it.
+
+## No scratch files
+No `.ls_out.txt`, stray logs, or duplicate build scripts. Write only to named target files. The tree must contain nothing else after you finish.
+
+## Style
+Honor the repo's ruff/formatter config: import order, blank lines, line length. Match existing style exactly. Leave no lint errors.
+
+**Claude workspace (Phase-1 day-one carve-out):** enforce Ruff only on touched files under `scripts/`, `tests/`, and `.cursor/` until a later expand. Phase-1 done oracle (from repo root, Homebrew `ruff`): `git ls-files` for those dirs, **exclude** `scripts/audit/smoke_out/`, then `ruff check` **and** `ruff format --check` on that list (empty list → fail). Do **not** use bare no-arg `ruff check` / `ruff format` as the Phase-1 oracle. Defer `skills/_shared/` and other trees.
+
+**Bare Code repo (Phase-2 forget-mitigations):** On the **first edit** in a session of a git repo under `/Volumes/Cloud Storage/Code/` or `~/Projects/` that has **no** lint config for the language being edited, **surface once** (per repo per session): propose wiring the stack default — Python → Ruff (`pyproject.toml` `[tool.ruff]`, line-length 100); TS/JS → Biome (prefer) unless the repo already has ESLint/Biome; Swift → `.swiftlint.yml` only when next shipping that app. **Ask before write.** Do **not** silent-install. Do **not** batch-migrate other repos. Do **not** replace an existing linter (leave ComfyUI/flux Ruff, Loom Biome/ESLint, existing SwiftLint alone). Python autofix: F401/re-export shim protocol before `ruff check --fix` (never blind `--fix` on re-export packages). Empty config ⇒ no lint gate for that repo until wired.
+
+## Build / verify discipline
+
+Oracle taxonomy (matches `orchestration.mdc`):
+
+1. **Forbidden — model-oracle:** LLM judges pass/fail without shell/MCP evidence.
+2. **Evidence subagents:** Readonly agents (`ios-oracle`, `code-reviewer`) may run shell/MCP and return exit code + log tail + artifacts.
+3. **Gate:** Orchestrator owns the 3-run cap and pass/fail verdict. Shell always backs the claim.
+
+Common gate commands:
+- `PYTHONPATH=".python_libs" python3 -m pytest tests/ -m "not slow"`
+- `PYTHONPATH=".python_libs" python3 UNIFICATION/scripts/build_graph.py` (writes `/Volumes/Cloud Storage/Graph/graph.sqlite` — Graph SSOT)
+- `npm run build && tsc`
+- `xcodebuild` / `bash "/Volumes/Cloud Storage/Claude/.cursor/ios-build-verify.sh" REPO_ROOT`
+
+**Shell / pipefail (Night School 1689):** Under `pipefail`, do not trust a pipeline’s exit when a later stage (`head`, etc.) can mask upstream failure. **Do not use `PIPESTATUS`.** Capture with `|| var=$?` (or `|| ec=$?`) on the **failing leg only**, then inspect that variable — e.g. `cmd || ec=$?`.
+
+Codegen workers may pre-screen; orchestrator gate still applies.
+
+## Hard cap
+Run the authoritative oracle at most 3 times per change. Not green after 3 → STOP and surface to user with the log. Never auto-re-run.
+
+## Loops have exits
+Same failure twice → change hypothesis, tool, or input. Never re-run unchanged.
+
+## Claims match evidence
+- Say "verified" / "passing" ONLY for a check you ran and saw pass.
+- Done-but-unchecked → "unverified".
+- Failures → lead with them + paste real output.
+- "should work now" is forbidden.
+
+## Never end on a promise
+No "I'll now..." / "Next, I'll...". Do the work or state the precise blocker.
+
+## Comments
+State constraints the code can't show — never narrate the change or address the reviewer.

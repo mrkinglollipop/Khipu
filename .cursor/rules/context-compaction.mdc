@@ -1,0 +1,28 @@
+---
+description: Context compaction — good compact point markers and /summarize workflow
+alwaysApply: true
+---
+
+# Context Compaction
+
+## Natural break marker
+
+At end-of-turn when the topic is clearly closed — deliverable shipped, question fully answered, no pending follow-up or obvious next step — append a single line as the **final line** of the response:
+
+`good compact point`
+
+Skip when there is an unanswered question, in-flight work, or an obvious next step Matt is expected to take.
+
+## Before marking a compact point
+
+If anything substantive happened since the last capture, rely on the PreCompact
+/`khipu-stop-hook` writer (hub mode). Do **not** pipe `capture_v2.py`. Cloud
+agents with no hook: `khipu_capture` before the marker.
+
+## User-initiated summarize
+
+When Matt mentions summarizing, compressing, or hitting context limits — or asks to capture before summarize — the PreCompact hook captures on this Mac. Cloud / no hook: `khipu_capture` immediately; do not wait for the next cadence tick. Do **not** pipe `capture_v2.py`.
+
+Manual compaction in Cursor: **`/summarize`** or **`/compress`** (not `/compact`). Requires a **native Cursor model** — OpenRouter models do not support summarize reliably.
+
+After a long session post-summarize, re-state active goals and constraints in the next message; the summary may omit detail.
