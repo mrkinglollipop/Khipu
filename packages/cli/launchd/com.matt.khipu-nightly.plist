@@ -1,12 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template — render per machine before install (see Task 6 launchd generator). -->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
 	<string>com.matt.khipu-nightly</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/opt/homebrew/bin/python3.11</string>
+		<string>{{KHIPU_PYTHON}}</string>
 		<string>-m</string>
 		<string>khipu</string>
 		<string>nightly</string>
@@ -14,12 +15,12 @@
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>KHIPU_ROOT</key>
-		<string>/Volumes/Cloud Storage/Code/Khipu</string>
+		<string>{{KHIPU_ROOT}}</string>
 		<key>PYTHONPATH</key>
-		<string>/Volumes/Cloud Storage/Code/Khipu/packages/cli:/Volumes/Cloud Storage/Code/Khipu/.python_libs</string>
+		<string>{{PYTHONPATH}}</string>
 	</dict>
 	<key>WorkingDirectory</key>
-	<string>/Volumes/Cloud Storage/Code/Khipu</string>
+	<string>{{WORKING_DIRECTORY}}</string>
 	<key>StartCalendarInterval</key>
 	<dict>
 		<key>Hour</key>
@@ -28,9 +29,9 @@
 		<integer>5</integer>
 	</dict>
 	<key>StandardOutPath</key>
-	<string>/Users/matthewschwartz/Library/Logs/frozen-threshold/khipu-nightly.out.log</string>
+	<string>{{STDOUT_LOG}}</string>
 	<key>StandardErrorPath</key>
-	<string>/Users/matthewschwartz/Library/Logs/frozen-threshold/khipu-nightly.err.log</string>
+	<string>{{STDERR_LOG}}</string>
 	<key>RunAtLoad</key>
 	<false/>
 </dict>

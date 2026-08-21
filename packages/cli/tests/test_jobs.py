@@ -77,8 +77,8 @@ class JobsRunTest(unittest.TestCase):
             rc = jobs.run_monthly(dry_run=True)
         self.assertEqual(rc, 2)
 
-    def test_default_monthly_script_is_claude_driver(self):
-        self.assertEqual(jobs.CONSOLIDATE_MONTHLY.name, "conversation-memory-monthly.py")
+    def test_default_monthly_script_is_none_without_env(self):
+        self.assertIsNone(jobs.CONSOLIDATE_MONTHLY)
 
     def test_run_graph_build_invokes_graphify_script(self):
         captured: list[list[str]] = []
@@ -135,7 +135,10 @@ class JobsMetadataTest(unittest.TestCase):
     def test_job_status_shape(self):
         with mock.patch.object(jobs, "_job_entry", side_effect=lambda name: {"name": name}):
             out = jobs.job_status()
-        self.assertEqual(set(out), {"nightly", "monthly", "graph_build"})
+        self.assertEqual(
+            set(out),
+            {"nightly", "monthly", "graph_build", "embed_media_backfill"},
+        )
 
 
 class IndexFreshnessTest(unittest.TestCase):

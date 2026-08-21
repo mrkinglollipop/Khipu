@@ -89,20 +89,20 @@ class ReadSqliteTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             gs.sync_from_sqlite(Path("/nonexistent/graph.sqlite"), dry_run=True)
 
-    def test_graph_producer_prefers_khipu_plist(self):
+    def test_graph_producer_requires_scheduled_jobs_flag(self):
         with tempfile.TemporaryDirectory() as td:
             agents = Path(td)
             khipu = agents / "com.matt.khipu-graph.plist"
-            legacy = agents / "com.matt.graphify-nightly.plist"
             khipu.write_text("plist")
+            versions = {"scheduled_jobs": {"graph_build": True}}
             with mock.patch.dict(os.environ, {"KHIPU_GRAPH_PRODUCER": ""}), \
-                 mock.patch.object(jobs, "_launchagents_dir", return_value=agents):
+                 mock.patch.object(jobs, "_launchagents_dir", return_value=agents), \
+                 mock.patch("khipu.components_matrix.read_versions", return_value=versions):
                 self.assertTrue(gs.is_graph_producer())
-            khipu.unlink()
-            legacy.write_text("plist")
             with mock.patch.dict(os.environ, {"KHIPU_GRAPH_PRODUCER": ""}), \
-                 mock.patch.object(jobs, "_launchagents_dir", return_value=agents):
-                self.assertTrue(gs.is_graph_producer())
+                 mock.patch.object(jobs, "_launchagents_dir", return_value=agents), \
+                 mock.patch("khipu.components_matrix.read_versions", return_value={}):
+                self.assertFalse(gs.is_graph_producer())
 
 
 class MembershipDeleteTest(unittest.TestCase):

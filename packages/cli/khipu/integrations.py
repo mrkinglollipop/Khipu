@@ -62,6 +62,14 @@ def _shim_dir() -> Path:
     return HOME / ".config" / "khipu" / "bin"
 
 
+def _bin_script(name: str) -> Path:
+    """Bundled .app layout uses ``<root>/bin/``; dev checkouts use ``packages/cli/bin/``."""
+    bundled = _root() / "bin" / name
+    if bundled.is_file():
+        return bundled
+    return _root() / "packages" / "cli" / "bin" / name
+
+
 def _shim(name: str) -> str:
     """Return a SPACE-FREE, Khipu-owned path for a bin script, creating or
     re-pointing the symlink as needed.
@@ -73,7 +81,7 @@ def _shim(name: str) -> str:
     missed it). A symlink under ~/.config/khipu/bin works whether the harness
     uses a shell or a direct exec, so it is what every pack references.
     """
-    target = _root() / "packages" / "cli" / "bin" / name
+    target = _bin_script(name)
     link = _shim_dir() / name
     try:
         if link.is_symlink() and os.readlink(link) == str(target):

@@ -24,3 +24,6 @@ src-tauri/target
 *.sln
 *.sw?
 target/
+
+# Task 2 bundle staging
+khipu-resources/

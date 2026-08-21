@@ -98,13 +98,25 @@ def read_heartbeat() -> dict[str, Any] | None:
 
 
 def is_sync_host() -> bool:
-    """Only the Mac whose launchd runs the nightly consolidate performs the sync."""
+    """Only the Mac whose launchd runs the nightly consolidate performs the sync.
+
+    Default false on portable installs — opt in via ``versions.json`` scheduled
+    jobs or ``KHIPU_GIT_SYNC_HOST``. Plist presence alone must not mark a host.
+    """
     env = os.environ.get("KHIPU_GIT_SYNC_HOST", "").strip().lower()
     if env in {"1", "true", "yes"}:
         return True
     if env in {"0", "false", "no"}:
         return False
-    return nightly_plist_path().is_file()
+    try:
+        from khipu.components_matrix import read_versions
+
+        scheduled = read_versions().get("scheduled_jobs")
+        if isinstance(scheduled, dict) and scheduled.get("nightly"):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 def _parse_ts(raw: Any) -> float | None:

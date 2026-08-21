@@ -22,12 +22,14 @@ export function welcomeCompleted(): boolean {
 
 export const SUPPORT_EMAIL = "support@kinglollipop.com";
 
-type StepId = "welcome" | "database" | "model" | "agents" | "finish";
+type StepId = "welcome" | "database" | "model" | "graph" | "agents" | "finish";
+type DbMode = "local" | "remote";
 
 const STEPS: { id: StepId; label: string }[] = [
   { id: "welcome", label: "Welcome" },
   { id: "database", label: "Database" },
   { id: "model", label: "Model" },
+  { id: "graph", label: "Graph" },
   { id: "agents", label: "Agents" },
   { id: "finish", label: "Finish" },
 ];
@@ -44,6 +46,37 @@ function parse(raw: string): Record<string, unknown> | null {
 type MigratePlan = { applied?: string[]; pending?: string[]; ran?: string[] };
 type Presence = { gemini_in_keychain?: boolean; gemini_env?: boolean };
 type HarnessRow = { harness: string; detected?: boolean; installed?: boolean };
+type DoctorPayload = {
+  ok?: boolean;
+  not_configured?: string[];
+  backup_ok?: boolean;
+  drift_ok?: boolean;
+  graph_drift_ok?: boolean;
+  outbox_ok?: boolean;
+  capture_liveness_ok?: boolean;
+  git_sync_ok?: boolean;
+  dsn_file_ok?: boolean;
+  index_freshness_ok?: boolean;
+  embed_coverage_ok?: boolean;
+};
+
+function soleBackupRedFlag(doctor: DoctorPayload | null): boolean {
+  if (!doctor || doctor.ok) return false;
+  if (doctor.backup_ok !== false) return false;
+  for (const key of [
+    "drift_ok",
+    "graph_drift_ok",
+    "outbox_ok",
+    "capture_liveness_ok",
+    "git_sync_ok",
+    "dsn_file_ok",
+    "index_freshness_ok",
+    "embed_coverage_ok",
+  ] as const) {
+    if (doctor[key] === false) return false;
+  }
+  return true;
+}
 
 function Note({ tone, title, children, action }: {
   tone: "ok" | "warn"; title: string; children?: React.ReactNode; action?: React.ReactNode;
@@ -61,6 +94,12 @@ function Note({ tone, title, children, action }: {
   );
 }
 
+function payloadError(v: Record<string, unknown> | null): string | null {
+  if (!v) return "Invalid response";
+  if (v.ok === false) return String(v.error ?? "Request failed");
+  return null;
+}
+
 export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegrations }: {
   dsnOk: boolean | null;
   refreshDsn: () => Promise<void>;
@@ -72,10 +111,22 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
   const idx = STEPS.findIndex((s) => s.id === step);
   const go = (n: number) => setStep(STEPS[Math.max(0, Math.min(STEPS.length - 1, idx + n))].id);
 
-  // ---- database: connection + schema ----
+  const [dbMode, setDbMode] = useState<DbMode>("local");
+  const [dockerOk, setDockerOk] = useState<boolean | null>(null);
+  const [dockerErr, setDockerErr] = useState<string | null>(null);
+  const [diskWarn, setDiskWarn] = useState<string | null>(null);
+  const [dbBusy, setDbBusy] = useState(false);
+  const [dbMsg, setDbMsg] = useState<string | null>(null);
+  const [localReady, setLocalReady] = useState(false);
+
+  const [remoteDsn, setRemoteDsn] = useState("");
+  const [remoteBusy, setRemoteBusy] = useState(false);
+  const [remoteReady, setRemoteReady] = useState(false);
+
   const [plan, setPlan] = useState<MigratePlan | null>(null);
   const [planErr, setPlanErr] = useState<string | null>(null);
   const [migrating, setMigrating] = useState(false);
+
   const loadPlan = useCallback(async () => {
     setPlanErr(null);
     try {
@@ -85,6 +136,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
       setPlanErr(String(e));
     }
   }, []);
+
   const applyMigrations = useCallback(async () => {
     setMigrating(true);
     setPlanErr(null);
@@ -96,15 +148,146 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
       setMigrating(false);
     }
   }, []);
+
+  const refreshDocker = useCallback(async () => {
+    setDockerErr(null);
+    try {
+      const raw = await invoke<string>("components_status");
+      const v = parse(raw);
+      const docker = v?.docker as { ok?: boolean; error?: string } | undefined;
+      setDockerOk(Boolean(docker?.ok));
+      if (!docker?.ok) setDockerErr(String(docker?.error ?? "Docker is not running"));
+    } catch (e) {
+      setDockerOk(false);
+      setDockerErr(String(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (step === "database" && dbMode === "local") void refreshDocker();
+  }, [step, dbMode, refreshDocker]);
+
   useEffect(() => {
     if (step === "database" && dsnOk) void loadPlan();
   }, [step, dsnOk, loadPlan]);
 
-  // ---- model: Gemini key ----
+  const runLocalSetup = useCallback(async () => {
+    setDbBusy(true);
+    setDbMsg(null);
+    setDiskWarn(null);
+    setLocalReady(false);
+    try {
+      const statusRaw = await invoke<string>("components_status");
+      const status = parse(statusRaw);
+      const docker = status?.docker as { ok?: boolean; error?: string } | undefined;
+      setDockerOk(Boolean(docker?.ok));
+      if (!docker?.ok) {
+        setDockerErr(String(docker?.error ?? "Docker is not running"));
+        setDbMsg(docker?.error ? String(docker.error) : "Install Docker Desktop, start it, then recheck.");
+        return;
+      }
+      let raw = await invoke<string>("select_compat_row", { mode: "local_docker" });
+      let v = parse(raw);
+      let err = payloadError(v);
+      if (err) {
+        setDbMsg(err);
+        return;
+      }
+      raw = await invoke<string>("install_local_postgres");
+      v = parse(raw);
+      err = payloadError(v);
+      if (err) {
+        setDbMsg(err);
+        return;
+      }
+      const disk = v?.disk as { warning?: string; free_gib?: number } | undefined;
+      if (disk?.warning === "low_disk_space") {
+        setDiskWarn(
+          `Free disk is about ${disk.free_gib ?? "?"} GiB — Postgres needs headroom. You can continue after freeing space.`,
+        );
+      }
+      raw = await invoke<string>("bootstrap_local_backup");
+      v = parse(raw);
+      err = payloadError(v);
+      if (err) {
+        setDbMsg(`Backup drill failed: ${err}`);
+        return;
+      }
+      await refreshDsn();
+      await loadPlan();
+      setLocalReady(true);
+      setDbMsg("Local PostgreSQL 19 is running and the backup drill passed.");
+    } catch (e) {
+      setDbMsg(String(e));
+    } finally {
+      setDbBusy(false);
+    }
+  }, [refreshDsn, loadPlan]);
+
+  const saveRemoteDsn = useCallback(async () => {
+    const value = remoteDsn.trim();
+    if (!value) return;
+    setRemoteBusy(true);
+    setDbMsg(null);
+    setRemoteReady(false);
+    try {
+      const out = parse(await invoke<string>("set_khipu_secret", { account: "database_url", value }));
+      if (out?.ok !== true) {
+        setDbMsg(String(out?.error ?? "Could not save the DSN."));
+        return;
+      }
+      await refreshDsn();
+      let raw = await invoke<string>("check_remote_postgres", { full: false });
+      let v = parse(raw);
+      let err = payloadError(v);
+      if (err) {
+        setDbMsg(err);
+        return;
+      }
+      await applyMigrations();
+      raw = await invoke<string>("check_remote_postgres", { full: true });
+      v = parse(raw);
+      err = payloadError(v);
+      if (err) {
+        setDbMsg(err);
+        return;
+      }
+      raw = await invoke<string>("select_compat_row", {
+        mode: "remote",
+        pgvectorExtversion: String(v?.pgvector ?? ""),
+        serverVersion: String(v?.server_version ?? ""),
+        pgvector: String(v?.pgvector ?? ""),
+      });
+      v = parse(raw);
+      err = payloadError(v);
+      if (err) {
+        setDbMsg(err);
+        return;
+      }
+      await loadPlan();
+      setRemoteReady(true);
+      setDbMsg("Remote PostgreSQL 19 connected and compatible.");
+    } catch (e) {
+      setDbMsg(String(e));
+    } finally {
+      setRemoteBusy(false);
+    }
+  }, [remoteDsn, refreshDsn, applyMigrations, loadPlan]);
+
   const [presence, setPresence] = useState<Presence | null>(null);
   const [key, setKey] = useState("");
   const [keyMsg, setKeyMsg] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  type ModelChoice = "cloud" | "local" | "skip";
+  const [synthChoice, setSynthChoice] = useState<ModelChoice>("cloud");
+  const [embedChoice, setEmbedChoice] = useState<ModelChoice>("cloud");
+  const [localSynthEndpoint, setLocalSynthEndpoint] = useState("http://127.0.0.1:11434/v1");
+  const [localSynthModel, setLocalSynthModel] = useState("");
+  const [localEmbedEndpoint, setLocalEmbedEndpoint] = useState("");
+  const [localEmbedModel, setLocalEmbedModel] = useState("");
+  const [openaiKey, setOpenaiKey] = useState("");
+  const [modelMsg, setModelMsg] = useState<string | null>(null);
+  const [modelSaving, setModelSaving] = useState(false);
   const loadPresence = useCallback(async () => {
     try {
       setPresence(parse(await invoke<string>("secrets_presence")) as Presence);
@@ -121,7 +304,6 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
     setSaving(true);
     setKeyMsg(null);
     try {
-      // Same stdin path as Settings → Secrets: the key never appears in argv.
       const out = parse(await invoke<string>("set_khipu_secret", { account: "gemini_api_key", value }));
       if (out?.ok) {
         setKey("");
@@ -137,7 +319,133 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
     }
   }, [key, loadPresence]);
 
-  // ---- agents ----
+  const saveOpenaiKey = useCallback(async () => {
+    const value = openaiKey.trim();
+    if (!value) return;
+    setSaving(true);
+    setKeyMsg(null);
+    try {
+      const out = parse(await invoke<string>("set_khipu_secret", {
+        account: "openai_compat_api_key",
+        value,
+      }));
+      if (out?.ok) {
+        setOpenaiKey("");
+        setKeyMsg("OpenAI-compat key saved to Keychain.");
+        await loadPresence();
+      } else {
+        setKeyMsg(String(out?.error ?? "Could not save the key."));
+      }
+    } catch (e) {
+      setKeyMsg(String(e));
+    } finally {
+      setSaving(false);
+    }
+  }, [openaiKey, loadPresence]);
+
+  const applyModelStep = useCallback(async (): Promise<boolean> => {
+    setModelSaving(true);
+    setModelMsg(null);
+    try {
+      if (synthChoice === "local" && (!localSynthEndpoint.trim() || !localSynthModel.trim())) {
+        setModelMsg("Local synth needs a base URL and model id.");
+        return false;
+      }
+      if (embedChoice === "local" && (!localEmbedEndpoint.trim() || !localEmbedModel.trim())) {
+        setModelMsg("Local embed needs a base URL and model id.");
+        return false;
+      }
+      const synth =
+        synthChoice === "skip"
+          ? { provider: "cloud", endpoint: "", model_id: "" }
+          : synthChoice === "local"
+            ? {
+                provider: "local",
+                endpoint: localSynthEndpoint.trim(),
+                model_id: localSynthModel.trim(),
+              }
+            : { provider: "cloud", endpoint: "", model_id: "gemini-2.5-flash" };
+      const embed =
+        embedChoice === "skip"
+          ? { provider: "cloud", endpoint: "", model_id: "" }
+          : embedChoice === "local"
+            ? {
+                provider: "local",
+                endpoint: localEmbedEndpoint.trim(),
+                model_id: localEmbedModel.trim(),
+              }
+            : { provider: "cloud", endpoint: "", model_id: "gemini-embedding-2" };
+      const payload = {
+        synth,
+        embed,
+        vision: { provider: "off", endpoint: "", model_id: "" },
+      };
+      const raw = await runKhipu(["models", "set", JSON.stringify(payload)]);
+      const out = parse(raw);
+      if (out?.ok !== true) {
+        setModelMsg(String(out?.error ?? out?.models_error ?? "models set failed"));
+        return false;
+      }
+      if (embedChoice === "cloud") {
+        const act = parse(await runKhipu(["embed", "activate", "gemini-embedding-2@768", "--force"]));
+        if (act?.ok !== true && act?.error) {
+          setModelMsg(String(act.error));
+          return false;
+        }
+      }
+      setModelMsg("Model preferences saved.");
+      return true;
+    } catch (e) {
+      setModelMsg(String(e));
+      return false;
+    } finally {
+      setModelSaving(false);
+    }
+  }, [
+    synthChoice,
+    embedChoice,
+    localSynthEndpoint,
+    localSynthModel,
+    localEmbedEndpoint,
+    localEmbedModel,
+    runKhipu,
+  ]);
+
+  const [graphMsg, setGraphMsg] = useState<string | null>(null);
+  const [graphErr, setGraphErr] = useState<string | null>(null);
+  const [graphInstalling, setGraphInstalling] = useState(false);
+  const [graphOk, setGraphOk] = useState<boolean | null>(null);
+  const installGraphify = useCallback(async () => {
+    setGraphInstalling(true);
+    setGraphErr(null);
+    setGraphMsg(null);
+    try {
+      const raw = await invoke<string>("install_graphify");
+      const out = parse(raw);
+      if (out?.ok) {
+        setGraphOk(true);
+        setGraphMsg(
+          typeof out.semver === "string"
+            ? `Graphify ${out.semver} installed.`
+            : "Graph engine installed.",
+        );
+      } else {
+        setGraphOk(false);
+        setGraphErr(String(out?.error ?? raw));
+      }
+    } catch (e) {
+      setGraphOk(false);
+      setGraphErr(String(e));
+    } finally {
+      setGraphInstalling(false);
+    }
+  }, []);
+  useEffect(() => {
+    if (step === "graph" && graphOk == null && !graphInstalling) {
+      void installGraphify();
+    }
+  }, [step, graphOk, graphInstalling, installGraphify]);
+
   const [harnesses, setHarnesses] = useState<HarnessRow[] | null>(null);
   useEffect(() => {
     if (step !== "agents") return;
@@ -156,21 +464,31 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
     })();
   }, [step, runKhipu]);
 
-  // ---- finish: doctor ----
-  const [doctor, setDoctor] = useState<{ ok?: boolean; not_configured?: string[] } | null>(null);
+  const [doctor, setDoctor] = useState<DoctorPayload | null>(null);
   const [doctorErr, setDoctorErr] = useState<string | null>(null);
+  const reloadDoctor = useCallback(async () => {
+    setDoctorErr(null);
+    try {
+      setDoctor(parse(await runKhipu(["doctor"])) as DoctorPayload);
+    } catch (e) {
+      setDoctorErr(String(e));
+    }
+  }, [runKhipu]);
+
   useEffect(() => {
     if (step !== "finish") return;
-    void (async () => {
-      try {
-        setDoctor(parse(await runKhipu(["doctor"])) as { ok?: boolean; not_configured?: string[] });
-      } catch (e) {
-        setDoctorErr(String(e));
-      }
-    })();
-  }, [step, runKhipu]);
+    void reloadDoctor();
+  }, [step, reloadDoctor]);
 
-  const finish = () => {
+  const soleBackupRed = soleBackupRedFlag(doctor);
+
+  const canFinish =
+    doctor?.ok === true ||
+    (dbMode === "remote" && soleBackupRed);
+
+  const finish = (withWarnings = false) => {
+    if (!canFinish) return;
+    if (withWarnings && !soleBackupRed) return;
     try {
       window.localStorage.setItem(WELCOME_DONE_KEY, "1");
     } catch {
@@ -180,6 +498,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
   };
 
   const pending = plan?.pending?.length ?? 0;
+  const databaseReady = dbMode === "local" ? localReady && dsnOk : remoteReady && dsnOk;
 
   return (
     <div className="onboard welcome" data-step={step}>
@@ -199,17 +518,18 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
           <h1>Welcome to Khipu</h1>
           <p className="muted">
             Khipu gives your coding agents a memory that outlives the session. A
-            hook in each agent captures what happened; PostgreSQL stores it as
-            searchable prose plus a knowledge graph; the next session searches it
+            hook in each agent captures what happened; PostgreSQL 19 stores it as
+            searchable prose plus a property graph; the next session searches it
             — from any of your Macs.
           </p>
           <p className="muted">
-            Setup is four short steps. Each one checks itself, so you can close
-            this and come back; nothing here has to be finished in one go.
+            Setup is six steps. Each one checks itself, so you can close this and
+            come back; nothing here has to be finished in one go.
           </p>
           <ul className="welcome-list">
-            <li><strong>Database</strong> — where memory lives (PostgreSQL 19 + pgvector).</li>
-            <li><strong>Model</strong> — the Gemini key that writes summaries and embeddings.</li>
+            <li><strong>Database</strong> — local PostgreSQL 19 or connect an existing server.</li>
+            <li><strong>Model</strong> — cloud Gemini, local OpenAI-compat, or skip (capture queues).</li>
+            <li><strong>Graph</strong> — installs the Graphify engine under Application Support.</li>
             <li><strong>Agents</strong> — one click per harness to wire the hooks in.</li>
             <li><strong>Finish</strong> — a health check, and where to get help.</li>
           </ul>
@@ -220,18 +540,85 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         <>
           <h1>Connect the database</h1>
           <p className="muted">
-            Khipu needs a PostgreSQL 19 server with pgvector that only your
-            machines can reach. Store its connection string in the login Keychain
-            — the password never touches a config file:
+            Khipu needs PostgreSQL 19 with pgvector and SQL/PGQ property graphs.
+            Choose how you want to run it on this Mac.
           </p>
-          <pre className="code">{`printf '%s' 'postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=verify-full' | khipu secrets --set database_url`}</pre>
-          <div className="toolbar">
-            <button type="button" onClick={() => void refreshDsn()}>Recheck connection</button>
+          <div className="toolbar" role="radiogroup" aria-label="Database setup mode">
+            <label className="mono">
+              <input
+                type="radio"
+                name="db-mode"
+                checked={dbMode === "local"}
+                onChange={() => setDbMode("local")}
+              />
+              {" "}Start a local Postgres 19 (Docker Desktop)
+            </label>
+            <label className="mono">
+              <input
+                type="radio"
+                name="db-mode"
+                checked={dbMode === "remote"}
+                onChange={() => setDbMode("remote")}
+              />
+              {" "}I already have PostgreSQL 19
+            </label>
           </div>
-          {dsnOk ? (
+
+          {dbMode === "local" ? (
+            <>
+              <p className="muted">
+                Install{" "}
+                <a href="https://docs.docker.com/desktop/setup/install/mac-install/" target="_blank" rel="noreferrer">
+                  Docker Desktop
+                </a>{" "}
+                (or OrbStack / Colima with the <code>docker</code> CLI), start it, then recheck.
+              </p>
+              <div className="toolbar">
+                <button type="button" onClick={() => void refreshDocker()}>Recheck Docker</button>
+                <button type="button" className="primary" disabled={dbBusy} onClick={() => void runLocalSetup()}>
+                  {dbBusy ? "Setting up…" : "Install local Postgres 19"}
+                </button>
+              </div>
+              {dockerOk === false ? (
+                <Note tone="warn" title="Docker not ready">{dockerErr ?? "Start Docker Desktop, then recheck."}</Note>
+              ) : null}
+              {diskWarn ? <Note tone="warn" title="Low disk space">{diskWarn}</Note> : null}
+            </>
+          ) : (
+            <>
+              <p className="muted">
+                Paste a PostgreSQL 19 connection string. The password is stored in the
+                login Keychain via <code>set_khipu_secret</code>, never in a config file.
+              </p>
+              <div className="toolbar" style={{ width: "100%" }}>
+                <input
+                  className="mono"
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={remoteDsn}
+                  onChange={(e) => setRemoteDsn(e.target.value)}
+                  placeholder="postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=verify-full"
+                  aria-label="Database connection string"
+                />
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={remoteBusy || !remoteDsn.trim()}
+                  onClick={() => void saveRemoteDsn()}
+                >
+                  {remoteBusy ? "Connecting…" : "Save and verify"}
+                </button>
+              </div>
+            </>
+          )}
+
+          {dbMsg ? <pre className="code">{dbMsg}</pre> : null}
+
+          {dsnOk && databaseReady ? (
             <Note
               tone="ok"
-              title="Connected"
+              title="Database ready"
               action={pending > 0 ? (
                 <button type="button" className="primary" disabled={migrating} onClick={() => void applyMigrations()}>
                   {migrating ? "Applying…" : "Apply schema"}
@@ -246,9 +633,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                     ? `Schema is up to date (${plan.applied?.length ?? 0} migrations applied).`
                     : `${pending} migration${pending === 1 ? "" : "s"} to apply: ${plan.pending?.join(", ")}`}
             </Note>
-          ) : (
-            <Note tone="warn" title="Not connected yet">Run the command above, then recheck.</Note>
-          )}
+          ) : null}
         </>
       ) : null}
 
@@ -256,32 +641,189 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         <>
           <h1>Give it a model</h1>
           <p className="muted">
-            Session summaries and semantic search use Gemini. Paste an API key
-            here — it goes straight to the login Keychain, never to a file or the
-            command line. An environment variable <code>GEMINI_API_KEY</code>{" "}
-            takes precedence if you set one.
+            Session summaries (synth) and semantic search (embed) can use cloud
+            Gemini, a local OpenAI-compatible server, or be skipped — capture
+            queues until credentials exist; nothing is lost.
           </p>
-          <div className="toolbar" style={{ width: "100%" }}>
-            <input
-              className="mono"
-              type="password"
-              autoComplete="off"
-              spellCheck={false}
-              value={key}
-              onChange={(e) => setKey(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") void saveKey(); }}
-              placeholder={presence?.gemini_in_keychain ? "A key is stored — paste a new one to replace it" : "AIza…"}
-              aria-label="Gemini API key"
-            />
-            <button type="button" className="primary" disabled={saving || !key.trim()} onClick={() => void saveKey()}>
-              {saving ? "Saving…" : "Save key"}
-            </button>
+          <div className="section-card">
+            <div className="section-head">Summaries (synth)</div>
+            <div className="section-body">
+              <div className="toolbar" role="radiogroup" aria-label="Synth provider">
+                <label className="mono">
+                  <input
+                    type="radio"
+                    name="synth-choice"
+                    checked={synthChoice === "cloud"}
+                    onChange={() => setSynthChoice("cloud")}
+                  />
+                  {" "}Cloud Gemini
+                </label>
+                <label className="mono">
+                  <input
+                    type="radio"
+                    name="synth-choice"
+                    checked={synthChoice === "local"}
+                    onChange={() => setSynthChoice("local")}
+                  />
+                  {" "}Local OpenAI-compat
+                </label>
+                <label className="mono">
+                  <input
+                    type="radio"
+                    name="synth-choice"
+                    checked={synthChoice === "skip"}
+                    onChange={() => setSynthChoice("skip")}
+                  />
+                  {" "}Skip for now
+                </label>
+              </div>
+              {synthChoice === "cloud" ? (
+                <>
+                  <p className="muted">
+                    Paste a Gemini API key (optional now — capture queues without one).
+                  </p>
+                  <div className="toolbar" style={{ width: "100%" }}>
+                    <input
+                      className="mono"
+                      type="password"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={key}
+                      onChange={(e) => setKey(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") void saveKey(); }}
+                      placeholder={presence?.gemini_in_keychain ? "Key stored — paste to replace" : "AIza…"}
+                      aria-label="Gemini API key"
+                    />
+                    <button type="button" className="primary" disabled={saving || !key.trim()} onClick={() => void saveKey()}>
+                      {saving ? "Saving…" : "Save Gemini key"}
+                    </button>
+                  </div>
+                </>
+              ) : null}
+              {synthChoice === "local" ? (
+                <>
+                  <div className="toolbar" style={{ width: "100%" }}>
+                    <input
+                      className="mono"
+                      value={localSynthEndpoint}
+                      onChange={(e) => setLocalSynthEndpoint(e.target.value)}
+                      placeholder="http://127.0.0.1:11434/v1"
+                      aria-label="Local synth base URL"
+                    />
+                    <input
+                      className="mono"
+                      value={localSynthModel}
+                      onChange={(e) => setLocalSynthModel(e.target.value)}
+                      placeholder="model id"
+                      aria-label="Local synth model id"
+                    />
+                  </div>
+                  <div className="toolbar" style={{ width: "100%" }}>
+                    <input
+                      className="mono"
+                      type="password"
+                      autoComplete="off"
+                      value={openaiKey}
+                      onChange={(e) => setOpenaiKey(e.target.value)}
+                      placeholder="Optional API key (Keychain)"
+                      aria-label="OpenAI-compat API key"
+                    />
+                    <button type="button" disabled={saving || !openaiKey.trim()} onClick={() => void saveOpenaiKey()}>
+                      Save compat key
+                    </button>
+                  </div>
+                </>
+              ) : null}
+            </div>
+          </div>
+          <div className="section-card">
+            <div className="section-head">Embeddings (search)</div>
+            <div className="section-body">
+              <div className="toolbar" role="radiogroup" aria-label="Embed provider">
+                <label className="mono">
+                  <input
+                    type="radio"
+                    name="embed-choice"
+                    checked={embedChoice === "cloud"}
+                    onChange={() => setEmbedChoice("cloud")}
+                  />
+                  {" "}Gemini Embedding 2 @768
+                </label>
+                <label className="mono">
+                  <input
+                    type="radio"
+                    name="embed-choice"
+                    checked={embedChoice === "local"}
+                    onChange={() => setEmbedChoice("local")}
+                  />
+                  {" "}Local (configure later)
+                </label>
+                <label className="mono">
+                  <input
+                    type="radio"
+                    name="embed-choice"
+                    checked={embedChoice === "skip"}
+                    onChange={() => setEmbedChoice("skip")}
+                  />
+                  {" "}Skip — search empty until a profile is active
+                </label>
+              </div>
+              {embedChoice === "local" ? (
+                <div className="toolbar" style={{ width: "100%" }}>
+                  <input
+                    className="mono"
+                    value={localEmbedEndpoint}
+                    onChange={(e) => setLocalEmbedEndpoint(e.target.value)}
+                    placeholder="https://…/v1"
+                    aria-label="Local embed base URL"
+                  />
+                  <input
+                    className="mono"
+                    value={localEmbedModel}
+                    onChange={(e) => setLocalEmbedModel(e.target.value)}
+                    placeholder="embed model id"
+                    aria-label="Local embed model id"
+                  />
+                </div>
+              ) : null}
+              {embedChoice === "cloud" && !presence?.gemini_in_keychain && !presence?.gemini_env ? (
+                <Note tone="warn" title="No Gemini key yet">
+                  Semantic search stays empty until a key is set; synth capture can still queue.
+                </Note>
+              ) : null}
+            </div>
           </div>
           {keyMsg ? <pre className="code">{keyMsg}</pre> : null}
-          {presence?.gemini_in_keychain || presence?.gemini_env ? (
-            <Note tone="ok" title={presence.gemini_env ? "Key found in the environment" : "Key stored in the Keychain"} />
+          {modelMsg ? <pre className="code">{modelMsg}</pre> : null}
+        </>
+      ) : null}
+
+      {step === "graph" ? (
+        <>
+          <h1>Install the graph engine</h1>
+          <p className="muted">
+            Graphify builds the knowledge graph from folders you choose later.
+            It installs as a separate, upgradable component under Application
+            Support — not inside the app bundle.
+          </p>
+          {graphOk ? (
+            <Note tone="ok" title="Graph engine ready">
+              {graphMsg ?? "Graphify is installed."}
+            </Note>
+          ) : graphInstalling ? (
+            <p className="muted">Downloading and unpacking Graphify…</p>
           ) : (
-            <Note tone="warn" title="No key yet">Capture will queue until one is set; nothing is lost.</Note>
+            <Note
+              tone="warn"
+              title="Graph install did not finish"
+              action={
+                <button type="button" className="primary" onClick={() => void installGraphify()}>
+                  Retry
+                </button>
+              }
+            >
+              {graphErr ?? "Complete the Database step first so pending Graphify version is set."}
+            </Note>
           )}
         </>
       ) : null}
@@ -326,9 +868,15 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
           ) : (
             <Note tone={doctor.ok ? "ok" : "warn"} title={doctor.ok ? "Doctor is green" : "Doctor found something"}>
               {doctor.not_configured?.length
-                ? <>Skipped (not configured on this Mac): <code>{doctor.not_configured.join(", ")}</code>. Expected unless you are migrating from a file-based memory.</>
-                : "Every check ran."}
+                ? <>Skipped (not configured on this Mac): <code>{doctor.not_configured.join(", ")}</code>. Expected on a fresh install.</>
+                : "Every configured check ran."}
               {!doctor.ok ? " See the Doctor pane for details." : null}
+              {soleBackupRed ? (
+                <div className="callout-body">
+                  Only <code>backup_ok</code> is red — server-operator backups are not recorded yet.
+                  You may continue with warnings on a remote database.
+                </div>
+              ) : null}
             </Note>
           )}
           <p className="muted">
@@ -348,10 +896,35 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
           <ChevronLeft size={14} aria-hidden /> Back
         </button>
         {step === "finish" ? (
-          <button type="button" className="primary" onClick={finish}>Finish</button>
+          <>
+            {soleBackupRed ? (
+              <button type="button" onClick={() => finish(true)}>Continue with warnings</button>
+            ) : null}
+            <button type="button" className="primary" disabled={!canFinish} onClick={() => finish(false)}>
+              Finish
+            </button>
+          </>
         ) : (
-          <button type="button" className="primary" onClick={() => go(1)}>
-            {step === "welcome" ? "Start" : "Next"} <ChevronRight size={14} aria-hidden />
+          <button
+            type="button"
+            className="primary"
+            disabled={
+              modelSaving ||
+              (step === "database" && !databaseReady) ||
+              (step === "graph" && graphOk !== true)
+            }
+            onClick={() => {
+              if (step === "model") {
+                void applyModelStep().then((ok) => {
+                  if (ok) go(1);
+                });
+                return;
+              }
+              go(1);
+            }}
+          >
+            {step === "welcome" ? "Start" : modelSaving && step === "model" ? "Saving…" : "Next"}{" "}
+            <ChevronRight size={14} aria-hidden />
           </button>
         )}
       </div>

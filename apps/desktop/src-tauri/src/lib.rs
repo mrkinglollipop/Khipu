@@ -75,8 +75,39 @@ fn env_first(keys: &[&str]) -> Option<String> {
 }
 
 /// Prefer `KHIPU_ROOT` / `ALZY_ROOT`. Debug builds fall back to the checkout
-/// they were built from; release builds require env (typically Info.plist
-/// `LSEnvironment` injected by `release_macos.sh`).
+/// they were built from; release builds fall back to `Contents/Resources/khipu`
+/// when the CLI was bundled by `bundle_cli.sh`.
+#[cfg(not(debug_assertions))]
+fn bundled_khipu_root() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let resources_khipu = exe.parent()?.join("../Resources/khipu");
+    let root = resources_khipu.canonicalize().ok()?;
+    if root.join("packages/cli").is_dir() {
+        Some(root)
+    } else {
+        None
+    }
+}
+
+fn khipu_pythonpath(root: &PathBuf) -> String {
+    #[cfg(debug_assertions)]
+    {
+        format!(
+            "{}:{}",
+            root.join("packages/cli").display(),
+            root.join(".python_libs").display()
+        )
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        format!(
+            "{}:{}",
+            root.join("packages/cli").display(),
+            root.join("lib").display()
+        )
+    }
+}
+
 fn khipu_root() -> Result<PathBuf, String> {
     if let Some(v) = env_first(&["KHIPU_ROOT", "ALZY_ROOT"]) {
         return Ok(PathBuf::from(v));
@@ -92,9 +123,12 @@ fn khipu_root() -> Result<PathBuf, String> {
     }
     #[cfg(not(debug_assertions))]
     {
+        if let Some(root) = bundled_khipu_root() {
+            return Ok(root);
+        }
         Err(
-            "KHIPU_ROOT is not set. Reinstall with apps/desktop/scripts/release_macos.sh --install \
-(sets Info.plist LSEnvironment), or export KHIPU_ROOT to the Khipu repo root before launching."
+            "KHIPU_ROOT is not set and the bundled CLI is missing from this .app \
+(Contents/Resources/khipu). Re-download the Khipu DMG or set KHIPU_ROOT."
                 .into(),
         )
     }
@@ -136,8 +170,8 @@ fn python_version(path: &PathBuf) -> Option<(u32, u32)> {
     Some((major_s.parse().ok()?, minor_s.parse().ok()?))
 }
 
-/// Prefer `KHIPU_PYTHON` / `ALZY_PYTHON`, then `which python3` on PATH.
-/// Debug builds may fall back to Homebrew python3.11 when present.
+/// Prefer `KHIPU_PYTHON` / `ALZY_PYTHON`, then bundled `Resources/khipu/python`,
+/// then `which python3` on PATH. Debug builds may fall back to Homebrew python3.11.
 ///
 /// `KHIPU_PYTHON` / LSEnvironment is trusted as-is (the working happy path —
 /// do not add a version check there). Only the `which python3` fallback is
@@ -151,8 +185,17 @@ fn khipu_python() -> Result<PathBuf, String> {
             return Ok(p);
         }
         eprintln!(
-            "[khipu] KHIPU_PYTHON is set to {v} but that path is not a file; falling back to PATH"
+            "[khipu] KHIPU_PYTHON is set to {v} but that path is not a file; falling back"
         );
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        if let Some(root) = bundled_khipu_root() {
+            let bundled = root.join("python/bin/python3.11");
+            if bundled.is_file() {
+                return Ok(bundled);
+            }
+        }
     }
     let mut which_rejected: Option<String> = None;
     if let Some(p) = python_from_which() {
@@ -188,8 +231,8 @@ fn khipu_python() -> Result<PathBuf, String> {
         return Err(msg);
     }
     Err(
-        "KHIPU_PYTHON is not set and python3 was not found on PATH. \
-Set KHIPU_PYTHON (or reinstall via release_macos.sh --install so Info.plist LSEnvironment includes it)."
+        "KHIPU_PYTHON is not set, bundled python is missing, and python3 was not found on PATH. \
+Set KHIPU_PYTHON or reinstall from a DMG that includes the bundled CLI."
             .into(),
     )
 }
@@ -212,11 +255,7 @@ fn stdout_looks_like_json(stdout: &str) -> bool {
 fn run_khipu_cli(args: &[String]) -> Result<String, String> {
     let root = khipu_root()?;
     let py = khipu_python()?;
-    let pythonpath = format!(
-        "{}:{}",
-        root.join("packages/cli").display(),
-        root.join(".python_libs").display()
-    );
+    let pythonpath = khipu_pythonpath(&root);
     let output = Command::new(&py)
         .arg("-m")
         .arg("khipu")
@@ -266,6 +305,79 @@ fn khipu_migrate(dry_run: bool) -> Result<String, String> {
     run_khipu_cli(&args)
 }
 
+#[tauri::command]
+fn select_compat_row(
+    mode: String,
+    pgvector_extversion: Option<String>,
+    server_version: Option<String>,
+    pgvector: Option<String>,
+) -> Result<String, String> {
+    let mut args = vec![
+        "components".into(),
+        "select-compat-row".into(),
+        "--mode".into(),
+        mode,
+    ];
+    if let Some(v) = pgvector_extversion {
+        if !v.trim().is_empty() {
+            args.push("--pgvector-extversion".into());
+            args.push(v.trim().to_string());
+        }
+    }
+    if let Some(v) = server_version {
+        if !v.trim().is_empty() {
+            args.push("--server-version".into());
+            args.push(v.trim().to_string());
+        }
+    }
+    if let Some(v) = pgvector {
+        if !v.trim().is_empty() {
+            args.push("--pgvector".into());
+            args.push(v.trim().to_string());
+        }
+    }
+    run_khipu_cli(&args)
+}
+
+#[tauri::command]
+fn install_local_postgres() -> Result<String, String> {
+    run_khipu_cli(&["components".into(), "install-local-postgres".into()])
+}
+
+#[tauri::command]
+fn bootstrap_local_backup() -> Result<String, String> {
+    run_khipu_cli(&["components".into(), "bootstrap-local-backup".into()])
+}
+
+#[tauri::command]
+fn install_graphify() -> Result<String, String> {
+    run_khipu_cli(&["components".into(), "install-graphify".into()])
+}
+
+#[tauri::command]
+fn components_status() -> Result<String, String> {
+    run_khipu_cli(&["components".into(), "status-json".into()])
+}
+
+#[tauri::command]
+fn upgrade_postgres() -> Result<String, String> {
+    run_khipu_cli(&["components".into(), "upgrade-postgres".into()])
+}
+
+#[tauri::command]
+fn upgrade_graphify() -> Result<String, String> {
+    run_khipu_cli(&["components".into(), "upgrade-graphify".into()])
+}
+
+#[tauri::command]
+fn check_remote_postgres(full: bool) -> Result<String, String> {
+    let mut args = vec!["components".into(), "check-remote".into()];
+    if full {
+        args.push("--full".into());
+    }
+    run_khipu_cli(&args)
+}
+
 /// Secrets the UI may write, and the Keychain accounts they map to.
 ///
 /// `secrets` is deliberately NOT in `ALLOWED_SUBCOMMANDS`: that path forwards
@@ -286,11 +398,7 @@ fn set_khipu_secret(account: String, value: String) -> Result<String, String> {
 
     let root = khipu_root()?;
     let py = khipu_python()?;
-    let pythonpath = format!(
-        "{}:{}",
-        root.join("packages/cli").display(),
-        root.join(".python_libs").display()
-    );
+    let pythonpath = khipu_pythonpath(&root);
     let mut child = Command::new(&py)
         .arg("-m")
         .arg("khipu")
@@ -374,11 +482,7 @@ fn spawn_khipu(subcommand: String) -> Result<Value, String> {
     }
     let root = khipu_root()?;
     let py = khipu_python()?;
-    let pythonpath = format!(
-        "{}:{}",
-        root.join("packages/cli").display(),
-        root.join(".python_libs").display()
-    );
+    let pythonpath = khipu_pythonpath(&root);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -639,6 +743,14 @@ pub fn run() {
             set_khipu_secret,
             secrets_presence,
             khipu_migrate,
+            select_compat_row,
+            install_local_postgres,
+            bootstrap_local_backup,
+            install_graphify,
+            components_status,
+            upgrade_postgres,
+            upgrade_graphify,
+            check_remote_postgres,
             dsn_configured,
             health_snapshot
         ])
@@ -816,6 +928,11 @@ mod settable_secrets_tests {
         // It writes the schema. The UI reaches it only via khipu_migrate,
         // whose argv is fixed.
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"migrate"));
+    }
+
+    #[test]
+    fn components_is_not_reachable_through_the_generic_argv_path() {
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"components"));
     }
 
     #[test]

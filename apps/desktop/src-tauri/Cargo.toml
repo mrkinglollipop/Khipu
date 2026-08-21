@@ -1,6 +1,6 @@
 [package]
 name = "khipu"
-version = "0.2.9"
+version = "0.3.0"
 description = "Khipu — conversation memory hub desktop shell"
 authors = ["Matthew Schwartz"]
 edition = "2021"
@@ -8,6 +8,12 @@ edition = "2021"
 [lib]
 name = "khipu_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Binary name must not be `khipu` — Tauri bundles CLI resources to `khipu/`
+# under target/release/, which would collide with a binary of that name.
+[[bin]]
+name = "Khipu"
+path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -665,9 +665,13 @@ def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
     out = {
         "id": node_id,
         "hops": hops,
-        "walk": (synthetic_walk + [
-            {"node_id": a, "via": b, "type": t, "hops": h} for a, b, t, h in walk_rows
-        ])[:limit],
+        "walk": (
+            synthetic_walk
+            + [
+                {"node_id": a, "via": b, "type": t, "hops": h}
+                for a, b, t, h in walk_rows
+            ]
+        )[:limit],
     }
     if episode_meta is not None:
         out["episode"] = episode_meta
@@ -1034,7 +1038,11 @@ def cmd_models(args: argparse.Namespace) -> int:
                     print(json.dumps({"ok": False, "error": f"invalid JSON: {e}"}))
                     return 2
                 if not isinstance(payload, dict):
-                    print(json.dumps({"ok": False, "error": "JSON payload must be an object"}))
+                    print(
+                        json.dumps(
+                            {"ok": False, "error": "JSON payload must be an object"}
+                        )
+                    )
                     return 2
                 out = models_mod.set_models_replace(payload)
                 print(json.dumps({"ok": True, "models": out}, indent=2))
@@ -1051,7 +1059,11 @@ def cmd_models(args: argparse.Namespace) -> int:
                 return 2
             provider = getattr(args, "provider", None)
             if not provider:
-                print(json.dumps({"ok": False, "error": "--provider is required with --role"}))
+                print(
+                    json.dumps(
+                        {"ok": False, "error": "--provider is required with --role"}
+                    )
+                )
                 return 2
             endpoint = getattr(args, "endpoint", None)
             model_id = getattr(args, "model_id", None)
@@ -1127,7 +1139,11 @@ def cmd_sources(args: argparse.Namespace) -> int:
             return 0
         if action == "export":
             out = sources.export_resolved()
-            print(json.dumps({"ok": True, "path": str(sources.resolved_path()), "resolved": out}))
+            print(
+                json.dumps(
+                    {"ok": True, "path": str(sources.resolved_path()), "resolved": out}
+                )
+            )
             return 0
         print(json.dumps({"ok": False, "error": f"unknown sources action: {action}"}))
         return 2
@@ -1165,6 +1181,87 @@ def cmd_import_local(args: argparse.Namespace) -> int:
     out = import_local(source=Path(args.source), merge=not args.replace)
     print(json.dumps(out, indent=2))
     return 0
+
+
+def _print_component_result(payload: dict) -> int:
+    print(json.dumps(payload, indent=2, default=str))
+    return 0 if payload.get("ok") else 1
+
+
+def cmd_components(args: argparse.Namespace) -> int:
+    action = getattr(args, "components_cmd", None)
+    if action == "select-compat-row":
+        from khipu.components_matrix import select_compat_row
+
+        return _print_component_result(
+            select_compat_row(
+                args.mode,
+                pgvector_extversion=getattr(args, "pgvector_extversion", None),
+                server_version=getattr(args, "server_version", None),
+                pgvector=getattr(args, "pgvector", None),
+                refresh=not getattr(args, "no_refresh", False),
+            )
+        )
+    if action == "install-local-postgres":
+        from khipu.components_postgres import install_local_postgres
+
+        return _print_component_result(install_local_postgres())
+    if action == "bootstrap-local-backup":
+        from khipu.components_backup import bootstrap_local_backup
+
+        return _print_component_result(bootstrap_local_backup())
+    if action == "install-graphify":
+        from khipu.components_graphify import install_graphify
+
+        return _print_component_result(install_graphify(first_run=True))
+    if action == "status-json":
+        from khipu.components_postgres import components_status
+
+        return _print_component_result(components_status())
+    if action == "upgrade-postgres":
+        from khipu.components_postgres import upgrade_postgres
+
+        return _print_component_result(upgrade_postgres())
+    if action == "upgrade-graphify":
+        from khipu.components_graphify import upgrade_graphify
+
+        return _print_component_result(upgrade_graphify())
+    if action == "check-remote":
+        from khipu.components_postgres import check_remote_postgres
+
+        return _print_component_result(
+            check_remote_postgres(full=bool(getattr(args, "full", False)))
+        )
+    if action == "install":
+        target = getattr(args, "install_target", None)
+        if target == "postgres":
+            from khipu.components_postgres import install_local_postgres
+
+            return _print_component_result(install_local_postgres())
+        if target == "graphify":
+            from khipu.components_graphify import install_graphify
+
+            return _print_component_result(install_graphify(first_run=False))
+        print(json.dumps({"ok": False, "error": f"unknown install target: {target}"}))
+        return 1
+    if action == "status":
+        from khipu.components_postgres import components_status
+
+        return _print_component_result(components_status())
+    if action == "upgrade":
+        target = getattr(args, "upgrade_target", None)
+        if target == "postgres":
+            from khipu.components_postgres import upgrade_postgres
+
+            return _print_component_result(upgrade_postgres())
+        if target == "graphify":
+            from khipu.components_graphify import upgrade_graphify
+
+            return _print_component_result(upgrade_graphify())
+        print(json.dumps({"ok": False, "error": f"unknown upgrade target: {target}"}))
+        return 1
+    print(json.dumps({"ok": False, "error": "missing components subcommand"}))
+    return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1406,11 +1503,13 @@ def build_parser() -> argparse.ArgumentParser:
     md_set.set_defaults(func=cmd_models, models_cmd="set")
     md.set_defaults(func=cmd_models, models_cmd="show")
 
-    src = sub.add_parser("sources", help="Graph membership: list / enable / disable / add / export")
-    src_sub = src.add_subparsers(dest="sources_cmd", required=True)
-    src_sub.add_parser("list", help="JSON: sources + resolve_for_graphify").set_defaults(
-        func=cmd_sources
+    src = sub.add_parser(
+        "sources", help="Graph membership: list / enable / disable / add / export"
     )
+    src_sub = src.add_subparsers(dest="sources_cmd", required=True)
+    src_sub.add_parser(
+        "list", help="JSON: sources + resolve_for_graphify"
+    ).set_defaults(func=cmd_sources)
     en = src_sub.add_parser("enable", help="Enable a seeded or user source")
     en.add_argument("source_id")
     en.set_defaults(func=cmd_sources)
@@ -1673,6 +1772,85 @@ def build_parser() -> argparse.ArgumentParser:
             or 0
         )
     )
+
+    comp = sub.add_parser(
+        "components",
+        help="Postgres / Graphify component install, status, and upgrades",
+    )
+    comp_sub = comp.add_subparsers(dest="components_cmd", required=True)
+
+    scr = comp_sub.add_parser(
+        "select-compat-row",
+        help="Refresh matrix and persist versions.json pending row",
+    )
+    scr.add_argument(
+        "--mode",
+        required=True,
+        choices=("local_docker", "remote"),
+    )
+    scr.add_argument("--pgvector-extversion", default=None)
+    scr.add_argument("--server-version", default=None)
+    scr.add_argument("--pgvector", default=None)
+    scr.add_argument(
+        "--no-refresh",
+        action="store_true",
+        help="Use bundled ∪ cache only; do not fetch khipu-compat",
+    )
+    scr.set_defaults(func=cmd_components, components_cmd="select-compat-row")
+
+    comp_sub.add_parser(
+        "install-local-postgres",
+        help="Pull/run local PG19 container through migrate (Welcome Radio A)",
+    ).set_defaults(func=cmd_components, components_cmd="install-local-postgres")
+
+    comp_sub.add_parser(
+        "bootstrap-local-backup",
+        help="pg_dump + restore_drill into ops_events (Welcome Radio A)",
+    ).set_defaults(func=cmd_components, components_cmd="bootstrap-local-backup")
+
+    comp_sub.add_parser(
+        "install-graphify",
+        help="Install pending graphify tarball (Task 5)",
+    ).set_defaults(func=cmd_components, components_cmd="install-graphify")
+
+    comp_sub.add_parser(
+        "status-json",
+        help="JSON component versions for the desktop shell",
+    ).set_defaults(func=cmd_components, components_cmd="status-json")
+
+    comp_sub.add_parser(
+        "upgrade-postgres",
+        help="Dump/restore Postgres upgrade runbook",
+    ).set_defaults(func=cmd_components, components_cmd="upgrade-postgres")
+
+    comp_sub.add_parser(
+        "upgrade-graphify",
+        help="Upgrade installed graphify semver",
+    ).set_defaults(func=cmd_components, components_cmd="upgrade-graphify")
+
+    cr = comp_sub.add_parser(
+        "check-remote",
+        help="Probe remote DSN for PG19 (+ optional vector/GRAPH_TABLE)",
+    )
+    cr.add_argument(
+        "--full",
+        action="store_true",
+        help="After migrate: require vector extension and GRAPH_TABLE",
+    )
+    cr.set_defaults(func=cmd_components, components_cmd="check-remote")
+
+    cst = comp_sub.add_parser("status", help="Show installed component versions")
+    cst.set_defaults(func=cmd_components, components_cmd="status")
+
+    cins = comp_sub.add_parser("install", help="Install a named component")
+    cins.add_argument("install_target", choices=("postgres", "graphify"))
+    cins.set_defaults(func=cmd_components, components_cmd="install")
+
+    cup = comp_sub.add_parser("upgrade", help="Upgrade a named component")
+    cup.add_argument("upgrade_target", choices=("postgres", "graphify"))
+    cup.set_defaults(func=cmd_components, components_cmd="upgrade")
+
+    comp.set_defaults(func=cmd_components)
 
     return p
 

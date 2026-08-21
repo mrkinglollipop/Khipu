@@ -12,8 +12,6 @@ from pathlib import Path
 
 from khipu.drift import BACKUP_MAX_AGE_HOURS
 
-DEFAULT_SNAPSHOT_DIR = Path("/Volumes/Cloud Storage/Backups/graph")
-LIVE_GRAPH = Path("/Volumes/Cloud Storage/Graph/graph.sqlite")
 DEST_REMOTE = "r2:matt-db-backups/khipu-graph"
 
 OFFSITE_MAX_AGE_DAYS = 8
@@ -32,8 +30,23 @@ def _resolve_producer(producer: bool | None) -> bool:
     return is_graph_producer()
 
 
+def _live_graph() -> Path | None:
+    from khipu.config import path_setting
+
+    return path_setting("graph_sqlite")
+
+
+def _default_snapshot_dir() -> Path:
+    raw = (os.environ.get("KHIPU_GRAPH_SNAPSHOT_DIR") or "").strip()
+    if raw:
+        return Path(raw)
+    from khipu.paths import ensure_data_dir
+
+    return ensure_data_dir() / "backups" / "graph"
+
+
 def latest_snapshot(snapshot_dir: Path | None = None) -> Path | None:
-    root = Path(snapshot_dir) if snapshot_dir else DEFAULT_SNAPSHOT_DIR
+    root = Path(snapshot_dir) if snapshot_dir else _default_snapshot_dir()
     if not root.is_dir():
         return None
     candidates = sorted(
@@ -58,7 +71,7 @@ def local_health(
         }
 
     now = now or _utcnow()
-    root = Path(snapshot_dir) if snapshot_dir else DEFAULT_SNAPSHOT_DIR
+    root = Path(snapshot_dir) if snapshot_dir else _default_snapshot_dir()
     snap = latest_snapshot(root)
     max_age_seconds = BACKUP_MAX_AGE_HOURS * 3600
 
@@ -283,7 +296,10 @@ def run_offsite(
     if snap is None:
         return {"ok": False, "reason": "no snapshot found"}
 
-    live = LIVE_GRAPH.resolve()
+    live = _live_graph()
+    if live is None:
+        return {"ok": False, "reason": "graph_sqlite is not configured"}
+    live = live.resolve()
     snap_resolved = snap.resolve()
     if snap_resolved == live:
         return {"ok": False, "reason": "refusing to upload live graph.sqlite"}
@@ -374,7 +390,8 @@ def _prune_remote_snapshots(
     deleted: list[str] = []
     for name in names[keep:]:
         target = f"{prefix}{name}"
-        if str(LIVE_GRAPH.resolve()) in target:
+        live = _live_graph()
+        if live is not None and str(live.resolve()) in target:
             continue
         dr = subprocess.run(
             [rclone_bin, "deletefile", target],
@@ -465,7 +482,10 @@ def scratch_drill(
     if snap is None or not snap.is_file():
         return {"ok": False, "reason": "no snapshot found"}
 
-    live = LIVE_GRAPH.resolve()
+    live = _live_graph()
+    if live is None:
+        return {"ok": False, "reason": "graph_sqlite is not configured"}
+    live = live.resolve()
     if snap.resolve() == live:
         return {"ok": False, "reason": "refusing to drill from live graph.sqlite"}
 
@@ -527,12 +547,13 @@ def scratch_drill(
 def status_payload() -> dict:
     local = local_health()
     offsite = offsite_health()
+    live = _live_graph()
     return {
         "local": local,
         "offsite": offsite,
         "latest_snapshot": str(latest_snapshot()) if latest_snapshot() else None,
         "dest_remote": DEST_REMOTE,
-        "live_graph": str(LIVE_GRAPH),
+        "live_graph": str(live) if live is not None else None,
         "has_r2_remote": has_r2_remote(),
         "last_graph_snapshot": _latest_ops_event("graph_snapshot"),
         "last_graph_snapshot_offsite": _latest_ops_event("graph_snapshot_offsite"),
