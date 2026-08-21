@@ -38,6 +38,7 @@ import re
 import shutil
 import subprocess
 import time
+import tomllib
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -530,17 +531,51 @@ def _aegis_uninstall(dry: bool) -> dict:
     return out
 
 
+def _aegis_capture_events(text: str) -> set[str]:
+    """Which Aegis hook events run khipu-aegis-capture.
+
+    Accepts the installer managed block *or* native TOML tables (Aegis rewrites
+    ``env = { … }`` into ``[hooks.Stop.hooks.env]`` and drops the pack comments).
+    """
+    found: set[str] = set()
+    hb = _AEGIS_HOOK_RE.search(text)
+    if hb and _is_our_capture(hb.group(0)):
+        block = hb.group(0)
+        for ev in ("Stop", "PreCompact", "SessionEnd"):
+            if f"[[hooks.{ev}]]" in block:
+                found.add(ev)
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return found
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return found
+    for ev in ("Stop", "PreCompact", "SessionEnd"):
+        groups = hooks.get(ev) or []
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            for h in group.get("hooks") or []:
+                if not isinstance(h, dict):
+                    continue
+                env = h.get("env") if isinstance(h.get("env"), dict) else {}
+                if _is_our_capture(h.get("command")) and env.get("KHIPU_HARNESS") == "aegis":
+                    found.add(ev)
+                    break
+    return found
+
+
 def _aegis_status() -> dict:
     text = AEGIS_TOML.read_text(encoding="utf-8") if AEGIS_TOML.is_file() else ""
     m = _AEGIS_MCP_RE.search(text)
-    hb = _AEGIS_HOOK_RE.search(text)
-    block = hb.group(0) if hb else ""
-    ours = bool(_is_our_capture(block) and "[[hooks.SessionEnd]]" in block)
-    # Aegis's "capture hook" IS the extraction trigger (no tail sync here — see
-    # _aegis_blocks). Both rows report the same installed hook.
+    events = _aegis_capture_events(text)
+    ours = {"Stop", "PreCompact", "SessionEnd"} <= events
     return {"harness": "aegis", "detected": _aegis_detected() and AEGIS_TOML.is_file(),
             "mcp": bool(m and mcp_launcher() in m.group(0)),
-            "hook_stop": ours, "hook_precompact": ours,
+            "hook_stop": "Stop" in events, "hook_precompact": "PreCompact" in events,
             "recall_rule": "n/a",
             "extract": "installed" if ours else "missing"}
 

@@ -139,6 +139,48 @@ class AegisPackTest(_TempHomeCase):
         self.assertNotIn("hooks", t)
         self.assertEqual(t["model"], "grok")
 
+    def test_status_sees_native_toml_tables_without_pack_marker(self):
+        """Aegis persists hooks as [[hooks.Stop.hooks]] + [hooks.Stop.hooks.env],
+        not the installer comment block. Status must not report extract missing."""
+        (self.home / ".grok").mkdir()
+        shim = integ.aegis_capture_hook()
+        mcp = integ.mcp_launcher()
+        (self.home / ".grok" / "config.toml").write_text(
+            "[mcp_servers.khipu]\n"
+            f'command = "{mcp}"\n'
+            "enabled = true\n"
+            "startup_timeout_sec = 30\n"
+            "\n"
+            "[[hooks.Stop]]\n"
+            "[[hooks.Stop.hooks]]\n"
+            'type = "command"\n'
+            f'command = "{shim}"\n'
+            "timeout = 15\n"
+            "[hooks.Stop.hooks.env]\n"
+            'KHIPU_HARNESS = "aegis"\n'
+            "\n"
+            "[[hooks.PreCompact]]\n"
+            "[[hooks.PreCompact.hooks]]\n"
+            'type = "command"\n'
+            f'command = "{shim}"\n'
+            "timeout = 15\n"
+            "[hooks.PreCompact.hooks.env]\n"
+            'KHIPU_HARNESS = "aegis"\n'
+            "\n"
+            "[[hooks.SessionEnd]]\n"
+            "[[hooks.SessionEnd.hooks]]\n"
+            'type = "command"\n'
+            f'command = "{shim}"\n'
+            "timeout = 15\n"
+            "[hooks.SessionEnd.hooks.env]\n"
+            'KHIPU_HARNESS = "aegis"\n'
+        )
+        st = integ.status("aegis")
+        self.assertTrue(st["mcp"])
+        self.assertTrue(st["hook_stop"] and st["hook_precompact"])
+        self.assertEqual(st["extract"], "installed")
+        self.assertNotIn("khipu-pack", (self.home / ".grok" / "config.toml").read_text())
+
 
 class ProbeTest(unittest.TestCase):
     def test_hook_probe_real_binary_exits_zero(self):
