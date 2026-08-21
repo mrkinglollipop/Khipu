@@ -2,6 +2,89 @@
 
 P1d shell over `packages/cli/`.
 
+## Install (recommended)
+
+Download **`Khipu_<version>_aarch64.dmg`** from
+[GitHub Releases](https://github.com/mrkinglollipop/Khipu/releases) under the
+**v0.3.0** tag (upcoming if that tag is not on GitHub yet), open it, and drag
+**Khipu.app** to **Applications**. Launch from Applications — the Welcome flow
+configures Postgres, models, Graphify, and agent integrations. The app bundle
+carries CLI + Python under `Contents/Resources/khipu`; no git clone or
+`KHIPU_ROOT` env var is required.
+
+Until **v0.3.0** is published and is the newest non-prerelease, GitHub
+`/releases/latest` may still be the **0.2.9** updater tarball — download the
+DMG from the **v0.3.0** tag (or a local/CI artifact), not from `/releases/latest`.
+
+**Gatekeeper / notarization**
+
+| Build | What you get |
+|---|---|
+| **Notarized** (0.3.0+ when release credentials are set) | Developer ID signed + Apple notarized + stapled DMG — opens normally |
+| **Developer ID, not notarized** (e.g. 0.2.9) | Signed app, no staple — if blocked, right-click **Khipu.app** → **Open** once |
+| **Ad-hoc / unsigned** | Local dev builds only — not for distribution |
+
+Maintainers: `release_macos.sh` runs `xcrun notarytool` + `xcrun stapler staple`
+when `APPLE_ID` + `APPLE_APP_SPECIFIC_PASSWORD` (+ `APPLE_TEAM_ID`) or
+`APPLE_API_KEY` + `APPLE_API_KEY_ID` + `APPLE_API_ISSUER` are in the environment.
+Without those, the script prints **Blocked on Matt** and **exits nonzero** — it
+does not silently publish. Use a prior stapled DMG or set the credentials.
+
+## Auto-update (tarball — not the DMG)
+
+The **updater** downloads a signed **`Khipu.app.tar.gz`** + minisign signature from
+GitHub Releases — not the DMG. Defaults: **tauri-plugin-updater** +
+`https://github.com/mrkinglollipop/Khipu/releases/latest/download/latest.json`
+
+- Public key: `src-tauri/tauri.conf.json` (`plugins.updater.pubkey`).
+- Private key off-repo: `~/.tauri/khipu.key` (`npx tauri signer generate -w ~/.tauri/khipu.key`).
+- Launch: check-only (fail-soft log / tray note).
+- Install: **Settings → Check for updates** (user-initiated download + install).
+- `latest.json` lists **darwin-aarch64** only.
+
+Compat matrix (Postgres / pgvector / Graphify versions) is fetched from
+[`mrkinglollipop/khipu-compat`](https://github.com/mrkinglollipop/khipu-compat),
+not from the app release feed.
+
+## Maintainer release build
+
+```bash
+cd apps/desktop
+export APPLE_SIGNING_IDENTITY='Developer ID Application: Name (TEAMID)'
+# Notarization env is required for a zero exit (script fail-closes without it).
+export APPLE_API_KEY='/path/to/AuthKey.p8'
+export APPLE_API_KEY_ID='KEYID'
+export APPLE_API_ISSUER='ISSUER-UUID'
+# or: APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID
+./scripts/release_macos.sh
+# → Khipu.app + Khipu_<version>_aarch64.dmg in src-tauri/target/release/bundle/
+# → updater tarball + .sig in .../bundle/macos/
+```
+
+Flags:
+
+```bash
+cd apps/desktop
+./scripts/release_macos.sh --install    # copy build to /Applications/Khipu.app
+./scripts/release_macos.sh --publish    # gh release create (DMG + tarball + sig + latest.json)
+```
+
+`--publish` requires `gh` auth, a **public** `KHIPU_RELEASE_REPO` (defaults to
+origin), a version bump in `src-tauri/tauri.conf.json`, `package.json`, and
+`src-tauri/Cargo.toml`, and a **stapled** DMG (`xcrun stapler validate`). The
+script refuses private repos (updater fetches unauthenticated).
+
+Notarization env (required for `release_macos.sh` to exit 0):
+
+```bash
+export APPLE_ID='you@example.com'
+export APPLE_APP_SPECIFIC_PASSWORD='xxxx-xxxx-xxxx-xxxx'
+export APPLE_TEAM_ID='TEAMID'
+# or: APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER
+```
+
+## Dev
+
 ```bash
 cd apps/desktop
 npm install
@@ -9,46 +92,10 @@ npm install
 npm run tauri dev
 ```
 
-Screens: Status · Search · Graph · Doctor · Settings · First-run.  
+Screens: Status · Search · Graph · Doctor · Settings · First-run · Components.  
 Menu-bar tray uses the same B9 clay squircle as the Dock (`icons/trayIcon@2x.png`, not a template). Tooltip reflects `khipu doctor` / `khipu status` (fail-soft if CLI down).
 
-## Install (`/Applications`)
-
-```bash
-./scripts/release_macos.sh --install
-# → /Applications/Khipu.app (needs APPLE_SIGNING_IDENTITY)
-```
-
-`release_macos.sh` injects Info.plist `LSEnvironment` with `KHIPU_ROOT` (repo root on the build machine, or `$KHIPU_ROOT`) and `KHIPU_PYTHON` (`$KHIPU_PYTHON` or `python3` on PATH), then re-signs. The release binary does **not** silently assume any repo location when unset — set those env vars or reinstall via the script.
-
-External CLI contract (if launching without LSEnvironment): export `KHIPU_ROOT` to the repo root and `KHIPU_PYTHON` to a real `python3` (or ensure `python3` is on PATH).
-
 Dev-only Dock face: `src-tauri/target/...` or `target/Khipu.dev.app`. Prefer **Khipu.app** from `/Applications` once installed.
-
-## Auto-update (Tauri updater — Sparkle-equivalent)
-
-Defaults: **tauri-plugin-updater** + **GitHub Releases** feed  
-`https://github.com/mrkinglollipop/Khipu/releases/latest/download/latest.json`
-
-- Public key lives in `src-tauri/tauri.conf.json` (`plugins.updater.pubkey`).
-- Private key stays **off-repo**: `~/.tauri/khipu.key` (generate with `npx tauri signer generate -w ~/.tauri/khipu.key`).
-- Launch: **check-only** (fail-soft log / tray note; no auto-download or restart).
-- Install: **Settings → Check for updates** (user-initiated download + install).
-- `latest.json` currently lists **darwin-aarch64** only (no fake x86_64 entry).
-
-Publish a desktop release (build artifacts + `latest.json`):
-
-```bash
-./scripts/release_macos.sh --publish
-# optional: ./scripts/release_macos.sh --install --publish
-```
-
-Requires `gh` auth and, in the environment: `APPLE_SIGNING_IDENTITY` (your
-Developer ID Application identity — Tauri's bundler reads the same variable) and,
-for `--publish`, `KHIPU_RELEASE_REPO=owner/name` (defaults to this checkout's
-origin). The script refuses to publish to a private repo, because the updater
-fetches release assets unauthenticated. Bump `version` in
-`src-tauri/tauri.conf.json`, `package.json` and `src-tauri/Cargo.toml` first.
 
 ## Icons
 

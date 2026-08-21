@@ -23,7 +23,7 @@ WIKI_EDGE = "wiki_link"
 LIVES_IN_EDGE = "lives_in"
 NEIGHBOR_CAP = 6
 PATH_CAP = 12
-VOLUME_ROOT = "/Volumes/Cloud Storage"
+VOLUME_ROOT = "/Volumes/Cloud Storage"  # wiki-path peeler, not an install default
 _ELLIPSIS = ("...", "…")
 _VOLUME_PREFIXES = (
     VOLUME_ROOT + "/",

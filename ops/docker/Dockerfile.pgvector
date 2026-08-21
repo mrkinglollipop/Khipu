@@ -1,7 +1,7 @@
 # Khipu Postgres 19 + pgvector (same-base compile).
 # Do NOT use ghcr.io/pglayers/pgx-pgvector:19 on bookworm — that layer needs GLIBC_2.38.
 # Build on any amd64 host with Docker:
-#   docker build -t alzy/postgres:19beta3-pgvector -f ops/docker/Dockerfile.pgvector ops/docker
+#   docker build -t ghcr.io/mrkinglollipop/khipu-postgres:19beta3-pgvector -f ops/docker/Dockerfile.pgvector ops/docker
 
 FROM postgres:19beta3-bookworm AS build
 RUN apt-get update \

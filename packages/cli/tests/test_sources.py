@@ -24,22 +24,27 @@ class SourcesTest(unittest.TestCase):
         self._env.stop()
         self.tmp.cleanup()
 
-    def test_missing_file_is_all_seeded_enabled_and_does_not_create_the_file(self):
+    def _write_sources(self, rows: list[dict]) -> None:
+        doc = {"schema_version": sources.SCHEMA_VERSION, "sources": rows}
+        path = self.dir / "graph_sources.json"
+        path.write_text(json.dumps(doc) + "\n", encoding="utf-8")
+
+    def test_missing_file_is_empty_and_does_not_create_the_file(self):
         doc = sources.load_sources()
         self.assertFalse((self.dir / "graph_sources.json").exists())
+        self.assertEqual(doc["sources"], [])
         self.assertTrue(sources.conversation_memory_enabled())
-        self.assertTrue(all(s["enabled"] for s in doc["sources"]))
-        self.assertTrue(any(s["id"] == "conversation_memory" for s in doc["sources"]))
         self.assertNotIn("conversation_memory", doc)
 
     def test_membership_store_is_sources_list(self):
         doc = sources.default_document()
         self.assertIsInstance(doc["sources"], list)
-        self.assertTrue(any(s["id"] == "code:claude" for s in doc["sources"]))
-        self.assertTrue(any(s["id"] == "conversation_memory" for s in doc["sources"]))
+        self.assertEqual(doc["sources"], [])
+        self.assertEqual(doc["schema_version"], sources.SCHEMA_VERSION)
         self.assertNotIn("conversation_memory", doc)
 
     def test_disable_does_not_drop_the_row(self):
+        self._write_sources([{"id": "reports:claude", "enabled": True}])
         sources.set_enabled("reports:claude", False)
         ids = {s["id"] for s in sources.load_sources()["sources"]}
         self.assertIn("reports:claude", ids)
@@ -130,7 +135,13 @@ class SourcesCliTest(unittest.TestCase):
             env=env,
         )
 
+    def _write_sources(self, rows: list[dict]) -> None:
+        doc = {"schema_version": sources.SCHEMA_VERSION, "sources": rows}
+        path = self.dir / "graph_sources.json"
+        path.write_text(json.dumps(doc) + "\n", encoding="utf-8")
+
     def test_disable_then_list_shows_enabled_false(self):
+        self._write_sources([{"id": "reports:claude", "enabled": True}])
         r = self._run(["sources", "disable", "reports:claude"])
         self.assertEqual(r.returncode, 0, r.stderr)
         listed = json.loads(self._run(["sources", "list"]).stdout)
@@ -138,6 +149,7 @@ class SourcesCliTest(unittest.TestCase):
         self.assertFalse(row["enabled"])
 
     def test_export_writes_collectors_reports_false(self):
+        self._write_sources([{"id": "reports:claude", "enabled": True}])
         self._run(["sources", "disable", "reports:claude"])
         dest = self.dir / "out.resolved.json"
         r = self._run(["sources", "export"])

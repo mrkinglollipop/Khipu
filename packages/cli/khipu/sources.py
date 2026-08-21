@@ -3,6 +3,7 @@
 Stored in ``graph_sources.json`` under the Khipu data dir. Graphify reads the
 generated ``graph_sources.resolved.json`` (see ``export_resolved``).
 """
+
 from __future__ import annotations
 
 import json
@@ -14,9 +15,6 @@ from typing import Any
 
 SCHEMA_VERSION = 2
 SOURCES_NAME = "graph_sources.json"
-
-CLAUDE_ROOT = Path("/Volumes/Cloud Storage/Claude")
-DEFAULT_RESOLVED = CLAUDE_ROOT / "UNIFICATION" / "state" / "graph_sources.resolved.json"
 
 COLLECTOR_KEYS = frozenset(
     {
@@ -81,52 +79,9 @@ def conversation_media_root() -> Path:
 
 
 def default_document() -> dict:
-    claude = str(CLAUDE_ROOT)
-
-    def _row(
-        sid: str,
-        kind: str,
-        *,
-        root: str | None = None,
-        enabled: bool = True,
-    ) -> dict:
-        row: dict[str, Any] = {
-            "id": sid,
-            "kind": kind,
-            "enabled": enabled,
-            "embed_media": False,
-        }
-        if root is not None:
-            row["root"] = root
-        return row
-
     return {
         "schema_version": SCHEMA_VERSION,
-        "sources": [
-            _row(
-                "conversation_memory",
-                "conversation_memory",
-                root=str(conversation_media_root()),
-            ),
-            _row("code:claude", "code_ast", root=claude),
-            _row("wiki:claude", "wiki", root=f"{claude}/wiki"),
-            _row("skills:claude", "skills", root=f"{claude}/skills"),
-            _row("agents:claude", "agents", root=f"{claude}/Agents"),
-            _row("reports:claude", "reports", root=f"{claude}/Reports"),
-            _row(
-                "memory_topics",
-                "memory_topics",
-                root="/Volumes/Cloud Storage/Memory/conversations/topics",
-            ),
-            _row("frozen_tell", "frozen_tell", root=f"{claude}/frozen_tell"),
-            _row("hardcoded", "hardcoded"),
-            _row("biblical:system", "biblical"),
-            _row(
-                "model_call_log",
-                "model_call_log",
-                root=f"{claude}/UNIFICATION/state/model_call_log.jsonl",
-            ),
-        ],
+        "sources": [],
     }
 
 
@@ -329,7 +284,9 @@ def resolved_path(path: Path | None = None) -> Path:
     override = (os.environ.get("KHIPU_GRAPH_SOURCES_RESOLVED") or "").strip()
     if override:
         return Path(override)
-    return DEFAULT_RESOLVED
+    from khipu.paths import ensure_data_dir
+
+    return ensure_data_dir() / "graph_sources.resolved.json"
 
 
 def export_resolved(path: Path | None = None) -> dict:
@@ -338,7 +295,9 @@ def export_resolved(path: Path | None = None) -> dict:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         os.replace(tmp, dest)
     except OSError:
         if tmp.exists():
@@ -376,17 +335,9 @@ def _code_source_for_path(source_path: str | None, doc: dict) -> str:
         except OSError:
             rel = str(root_path)
         root_posix = rel.replace("\\", "/")
-        claude_posix = str(CLAUDE_ROOT).replace("\\", "/")
         if sp.startswith(root_posix) and len(root_posix) > best_len:
             best_id = str(s.get("id") or "code:claude")
             best_len = len(root_posix)
-        elif root_path == CLAUDE_ROOT or root_posix == claude_posix:
-            if not "/" in sp or sp.startswith(tuple(
-                p for p in ("skills/", "Agents/", "wiki/", "Reports/", "UNIFICATION/")
-            )):
-                if len(claude_posix) > best_len:
-                    best_id = "code:claude"
-                    best_len = len(claude_posix)
     return best_id
 
 
@@ -440,7 +391,9 @@ def disabled_or_unreachable_ids(doc: dict | None = None) -> set[str]:
         if s.get("id") and not s.get("enabled", True)
     }
     resolved = resolve_for_graphify()
-    unreachable = {str(u.get("id")) for u in resolved.get("unreachable", []) if u.get("id")}
+    unreachable = {
+        str(u.get("id")) for u in resolved.get("unreachable", []) if u.get("id")
+    }
     return disabled | unreachable
 
 
@@ -472,13 +425,14 @@ def should_delete_graphify_edge(
     Membership-off / unreachable-source leftover edges stay, matching leftover
     nodes: they must not fail graph_drift.
     """
-    return (
-        should_delete_graphify_node(src, membership_off)
-        and should_delete_graphify_node(dst, membership_off)
-    )
+    return should_delete_graphify_node(
+        src, membership_off
+    ) and should_delete_graphify_node(dst, membership_off)
 
 
-def _edge_endpoint_node(node_id: str, nodes_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _edge_endpoint_node(
+    node_id: str, nodes_by_id: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
     found = nodes_by_id.get(node_id)
     if found is not None:
         return found

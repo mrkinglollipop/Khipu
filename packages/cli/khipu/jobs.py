@@ -2,6 +2,7 @@
 
 Khipu owns the launchd labels and CLI entrypoints; the engines stay unchanged.
 """
+
 from __future__ import annotations
 
 import json
@@ -14,33 +15,53 @@ from typing import Any
 
 from khipu.paths import DEFAULT_DIR, ensure_data_dir
 
-CONSOLIDATE_NIGHTLY = Path(
-    os.environ.get(
-        "KHIPU_CONSOLIDATE_NIGHTLY",
-        "/Volumes/Cloud Storage/Memory/conversations/scripts/consolidate_nightly.py",
-    )
-)
-# Live Claude monthly agent runs launchd `_python/conversation-memory-monthly.py`
-# (Memory tree). Do not default to Memory `consolidate_monthly.py` — that is the
-# Cursor-era script keyed to CURSOR_ROOT and skips when that tree is gone.
-CONSOLIDATE_MONTHLY = Path(
-    os.environ.get(
-        "KHIPU_CONSOLIDATE_MONTHLY",
-        "/Volumes/Cloud Storage/Claude/launchd/drivers/_python/conversation-memory-monthly.py",
-    )
-)
-GRAPHIFY_NIGHTLY = Path(
-    os.environ.get(
-        "KHIPU_GRAPHIFY_NIGHTLY",
-        "/Volumes/Cloud Storage/Claude/UNIFICATION/scripts/graphify_nightly.py",
-    )
-)
-BUILD_INDEX = Path(
-    os.environ.get(
-        "KHIPU_BUILD_INDEX",
-        "/Volumes/Cloud Storage/Memory/conversations/scripts/build_index.py",
-    )
-)
+GRAPHIFY_NOT_INSTALLED = {
+    "ok": False,
+    "error": "graphify_not_installed",
+    "fix": "khipu components install graphify",
+}
+
+
+def _env_script_path(env_key: str) -> Path | None:
+    raw = (os.environ.get(env_key) or "").strip()
+    return Path(raw) if raw else None
+
+
+def _application_support_dir() -> Path:
+    return Path.home() / "Library" / "Application Support" / "Khipu"
+
+
+def _versions_file() -> Path:
+    return _application_support_dir() / "versions.json"
+
+
+def graphify_nightly_path() -> Path | None:
+    """Resolve graphify_nightly.py: versions.json, then env, then None."""
+    versions_path = _versions_file()
+    if versions_path.is_file():
+        try:
+            data = json.loads(versions_path.read_text(encoding="utf-8"))
+            graphify = data.get("graphify") if isinstance(data, dict) else None
+            if isinstance(graphify, dict):
+                root = str(graphify.get("path") or "").strip()
+                if root:
+                    script = Path(root) / "graphify_nightly.py"
+                    if script.is_file():
+                        return script
+        except (OSError, ValueError, TypeError):
+            pass
+
+    env_script = _env_script_path("KHIPU_GRAPHIFY_NIGHTLY")
+    if env_script is not None and env_script.is_file():
+        return env_script
+    return None
+
+
+# Patchable module attrs (tests); no maintainer-path install defaults.
+CONSOLIDATE_NIGHTLY = _env_script_path("KHIPU_CONSOLIDATE_NIGHTLY")
+CONSOLIDATE_MONTHLY = _env_script_path("KHIPU_CONSOLIDATE_MONTHLY")
+GRAPHIFY_NIGHTLY: Path | None = None
+BUILD_INDEX = _env_script_path("KHIPU_BUILD_INDEX")
 
 LOG_DIR_FROZEN = Path.home() / "Library" / "Logs" / "frozen-threshold"
 LOG_DIR_CONFIG = DEFAULT_DIR / "logs"
@@ -156,9 +177,16 @@ def _on_demand_job_entry(name: str) -> dict[str, Any]:
     }
 
 
-def _run_script(script: Path, *, args: list[str] | None = None, log_stem: str, state_name: str) -> int:
-    if not script.is_file():
-        raise FileNotFoundError(f"job script not found: {script}")
+def _run_script(
+    script: Path | None,
+    *,
+    args: list[str] | None = None,
+    log_stem: str,
+    state_name: str,
+) -> int:
+    if script is None or not script.is_file():
+        target = script if script is not None else "unset"
+        raise FileNotFoundError(f"job script not found: {target}")
     out_log, err_log = _log_paths(log_stem)
     out_log.parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -178,7 +206,9 @@ def _run_script(script: Path, *, args: list[str] | None = None, log_stem: str, s
 
 
 def run_nightly() -> int:
-    return _run_script(CONSOLIDATE_NIGHTLY, log_stem="khipu-nightly", state_name="nightly")
+    return _run_script(
+        CONSOLIDATE_NIGHTLY, log_stem="khipu-nightly", state_name="nightly"
+    )
 
 
 def run_monthly(*, dry_run: bool = False) -> int:
@@ -186,14 +216,15 @@ def run_monthly(*, dry_run: bool = False) -> int:
     if dry_run:
         # Live Claude monthly (conversation-memory-monthly.py) has no --dry-run.
         # Cursor-era consolidate_monthly.py does — only pass the flag there.
-        if CONSOLIDATE_MONTHLY.name == "conversation-memory-monthly.py":
+        monthly = CONSOLIDATE_MONTHLY
+        if monthly is not None and monthly.name == "conversation-memory-monthly.py":
             print(
-                "error: live monthly driver has no --dry-run "
-                f"(script={CONSOLIDATE_MONTHLY})",
+                f"error: live monthly driver has no --dry-run (script={monthly})",
                 file=sys.stderr,
             )
             return 2
-        args = ["--dry-run"]
+        if monthly is not None:
+            args = ["--dry-run"]
     return _run_script(
         CONSOLIDATE_MONTHLY,
         args=args,
@@ -203,11 +234,17 @@ def run_monthly(*, dry_run: bool = False) -> int:
 
 
 def run_graph_build() -> int:
-    return _run_script(GRAPHIFY_NIGHTLY, log_stem="khipu-graph", state_name="graph_build")
+    script = GRAPHIFY_NIGHTLY or graphify_nightly_path()
+    if script is None:
+        print(json.dumps(GRAPHIFY_NOT_INSTALLED))
+        return 2
+    return _run_script(script, log_stem="khipu-graph", state_name="graph_build")
 
 
 def run_build_index() -> int:
-    return _run_script(BUILD_INDEX, log_stem="khipu-build-index", state_name="build_index")
+    return _run_script(
+        BUILD_INDEX, log_stem="khipu-build-index", state_name="build_index"
+    )
 
 
 def nightly_plist_path() -> Path:

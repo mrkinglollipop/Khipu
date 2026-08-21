@@ -1,0 +1,11 @@
+{
+  "matrix": [
+    {
+      "khipu_app_min": "0.3.0",
+      "graphify_semver": "1.0.0",
+      "graphify_tarball_url": "https://github.com/mrkinglollipop/khipu-graphify/releases/download/v1.0.0/khipu-graphify-1.0.0.tar.gz",
+      "postgres_image": "ghcr.io/mrkinglollipop/khipu-postgres:19beta3-pgvector",
+      "pgvector_min": "0.8.6"
+    }
+  ]
+}

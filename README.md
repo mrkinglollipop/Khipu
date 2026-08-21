@@ -327,7 +327,8 @@ Matt-owned `r2` rclone remote is missing:
 
 Backups run nightly to object storage via WAL-G, with continuous WAL archiving
 and **automated restore drills** — a backup that has never been restored is not
-a backup.
+a backup. Local (Radio A) dump/restore uses `docker exec` inside the Postgres
+container; set `KHIPU_PG_DUMP` / `KHIPU_PG_RESTORE` to use host binaries instead.
 
 ---
 
@@ -356,16 +357,42 @@ person's servers, not the product.
 
 ## Setting it up
 
-Khipu is a personal system: one database, your machines, your agents. Setup is
-five steps, all of them once per machine except the database.
+Khipu is a personal system: one database, your machines, your agents. On a new
+Mac, install the desktop app first — cloning the repo is only for developers.
 
-**Requirements.** macOS (the desktop app and Keychain integration are Mac-only;
-the CLI itself is plain Python), Python 3.11, and a **PostgreSQL 19 server with
-pgvector** — SQL/PGQ property graphs need 19. Run it somewhere only your
-machines can reach (a Tailscale network works well); never on a public port. A
-Dockerfile for PG 19 + pgvector is in [`ops/docker/`](ops/docker/).
+**Requirements.** macOS on Apple silicon (the desktop app and Keychain
+integration are Mac-only), **PostgreSQL 19 with pgvector** (local Docker or
+your own server — SQL/PGQ property graphs need 19), and optionally Gemini or a
+local model for summaries and search. The in-app Welcome flow covers Postgres,
+models, Graphify, and agent wiring.
 
-**1. Get the code and its dependencies.**
+### Install the desktop app (recommended)
+
+1. Download **`Khipu_0.3.0_aarch64.dmg`** from the
+   [Releases page](https://github.com/mrkinglollipop/Khipu/releases)
+   under the **v0.3.0** tag (upcoming if that tag is not on GitHub yet).
+   Do **not** assume GitHub `/releases/latest` already has this DMG — that
+   redirect may still point at an older 0.2.x updater tarball until v0.3.0
+   is published and is the newest non-prerelease.
+2. Open the DMG and drag **Khipu.app** to **Applications**.
+3. Launch **Khipu** from Applications and complete Welcome (database, model,
+   graph engine, integrations).
+
+The app **updates itself** from GitHub Releases using a signed
+**`Khipu.app.tar.gz`** — not the DMG. Postgres / pgvector / Graphify version
+compat is fetched from
+[`mrkinglollipop/khipu-compat`](https://github.com/mrkinglollipop/khipu-compat).
+
+**Gatekeeper:** the **v0.3.0** DMG is **notarized Developer ID** (stapled)
+once that tag is published. Older releases (e.g. 0.2.9) were Developer ID
+without notarization — if macOS blocks those, right-click **Khipu.app** →
+**Open** once. See
+[`apps/desktop/README.md`](apps/desktop/README.md).
+
+### Developer setup
+
+Clone the repo if you are hacking on Khipu itself or running the CLI outside the
+bundled app:
 
 ```bash
 git clone https://github.com/mrkinglollipop/Khipu.git && cd Khipu
@@ -376,27 +403,35 @@ python3.11 -m pip install --target .python_libs -r packages/cli/requirements.txt
 below assumes `PYTHONPATH="packages/cli:.python_libs"` and `python3.11 -m khipu`;
 put a `khipu` alias in your shell if you like.
 
-**2. Point it at your database.** The connection string goes in the login
+**1. Point it at your database.** The connection string goes in the login
 Keychain (the password never touches a config file or `ps` output):
 
 ```bash
 printf '%s' 'postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=verify-full&sslrootcert=/path/root.crt' | khipu secrets --set database_url
 ```
 
-**3. Apply the schema.**
+Run Postgres somewhere only your machines can reach (a Tailscale network works
+well); never on a public port. A Dockerfile for PG 19 + pgvector is in
+[`ops/docker/`](ops/docker/).
+
+**2. Apply the schema.**
 
 ```bash
 khipu migrate            # --dry-run to see what would change
 ```
 
-**4. Give it a model.** Session summaries and embeddings use Gemini. Paste the
-key into the app (Settings → Secrets), or:
+**3. Give it a model.** Session summaries and semantic search can use cloud
+Gemini, a local OpenAI-compatible endpoint, or be deferred — capture queues
+safely until credentials exist. Paste keys in the app (Settings → Secrets or
+Welcome → Model), or:
 
 ```bash
 printf '%s' 'YOUR-GEMINI-KEY' | khipu secrets --set gemini_api_key
 ```
 
-**5. Wire in your agents.** One command per harness writes the hook and MCP
+Gemini is the convenient default, not a requirement.
+
+**4. Wire in your agents.** One command per harness writes the hook and MCP
 config; `verify` proves it works by exercising it, not by checking a file exists.
 
 ```bash
@@ -408,10 +443,8 @@ Then `khipu doctor` should be green. It names anything it could not check under
 `not_configured` — on a fresh install that is the legacy file-wiki checks, which
 only apply if you are migrating from a pile of markdown (see `khipu config`).
 
-**The desktop app** is a signed macOS build on the
-[Releases page](https://github.com/mrkinglollipop/Khipu/releases); it updates
-itself from there. To build it yourself: `cd apps/desktop && npm install &&
-npm run tauri dev` (needs Rust and Xcode command-line tools) — see
+**Build the desktop app locally:** `cd apps/desktop && npm install &&
+npm run tauri dev` (needs Rust and Xcode command-line tools). Release builds:
 [`apps/desktop/README.md`](apps/desktop/README.md).
 
 **Cloud agents (Grok Bot / Cursor cloud) — optional.** These run on ephemeral
@@ -469,9 +502,11 @@ component designed to face the internet, and it exists precisely so the
 database never has to.
 
 **Can I use a model other than Gemini?**
-For **session capture summaries (synth)**: yes — Settings → Models can point at a
-local OpenAI-compatible endpoint (Ollama, LM Studio, etc.). Embeddings still use
-the active Gemini embed profile until the profiles cut. **Native** image vectors
+Yes. **Synth** (session summaries) supports cloud Gemini or a local
+OpenAI-compatible endpoint (Settings → Models or Welcome → Model). **Embed**
+(search vectors) defaults to Gemini Embedding 2 @768 when you choose cloud
+embed at first-run; you can skip embed until a profile is configured. Switching
+embed later creates a new profile and re-embed job. **Native** image vectors
 (PNG/JPEG into the same `gemini-embedding-2@768` profile) are opt-in per source
 via `embed_media` + `khipu embed-media-backfill`. Caption / `models.vision`
 ingest is still not shipped (picker defaults to off).

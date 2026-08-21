@@ -254,3 +254,64 @@ def cloud_model_id(settings: dict[str, str] | None = None) -> str:
 
 def dump_show_json(doc: dict[str, Any] | None = None) -> str:
     return json.dumps(doc if doc is not None else show_models(), indent=2)
+
+
+def apply_welcome_models(
+    *,
+    synth_choice: str,
+    embed_choice: str,
+    synth_endpoint: str = "",
+    synth_model_id: str = "",
+    embed_endpoint: str = "",
+    embed_model_id: str = "",
+) -> dict[str, Any]:
+    """Persist first-run synth/embed roles and activate embed when applicable."""
+    synth_choice = (synth_choice or "skip").strip().lower()
+    embed_choice = (embed_choice or "skip").strip().lower()
+    if synth_choice not in {"cloud", "local", "skip"}:
+        raise ValueError(f"unknown synth_choice: {synth_choice!r}")
+    if embed_choice not in {"cloud", "local", "skip"}:
+        raise ValueError(f"unknown embed_choice: {embed_choice!r}")
+
+    current = show_models()
+    synth = dict(current["synth"])
+    embed = dict(current["embed"])
+
+    if synth_choice == "cloud":
+        synth = {"provider": "cloud", "endpoint": "", "model_id": DEFAULT_SYNTH_MODEL}
+    elif synth_choice == "local":
+        synth = {
+            "provider": "local",
+            "endpoint": synth_endpoint,
+            "model_id": synth_model_id,
+        }
+    else:
+        synth = {"provider": "cloud", "endpoint": "", "model_id": ""}
+
+    if embed_choice == "cloud":
+        embed = {
+            "provider": "cloud",
+            "endpoint": "",
+            "model_id": "gemini-embedding-2",
+        }
+    elif embed_choice == "local":
+        embed = {
+            "provider": "local",
+            "endpoint": embed_endpoint,
+            "model_id": embed_model_id,
+        }
+    else:
+        embed = {"provider": "cloud", "endpoint": "", "model_id": ""}
+
+    roles = {
+        "synth": _normalize_role("synth", synth, for_set=True),
+        "embed": _normalize_role("embed", embed, for_set=True),
+        "vision": dict(current["vision"]),
+    }
+    stored = _store_roles(roles)
+    embed_result: dict[str, Any] = {"skipped": True}
+    if embed_choice == "cloud":
+        from khipu.embed import activate_welcome_embed
+
+        embed_result = activate_welcome_embed(provider="cloud")
+    return {"ok": True, "models": stored, "embed": embed_result}

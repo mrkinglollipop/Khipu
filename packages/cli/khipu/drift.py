@@ -213,9 +213,28 @@ def _latest_ops_event(cur, kind: str) -> dict | None:
     }
 
 
+def _postgres_backup_mode() -> str | None:
+    try:
+        from khipu.components_matrix import read_versions
+
+        postgres = read_versions().get("postgres")
+        if isinstance(postgres, dict):
+            mode = str(postgres.get("mode") or "").strip()
+            return mode or None
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def backup_health() -> dict:
-    """Doctor backup-age + last restore (reads ops_events via DSN)."""
+    """Doctor backup-age + last restore (reads ops_events via DSN).
+
+    Portable local Docker installs record ``pg_dump`` + ``restore_drill`` during
+    Welcome bootstrap — those events satisfy ``backup_ok`` the same as Linode
+    WAL-G + drill; no separate WAL-G requirement on ``local_docker`` hosts.
+    """
     max_age = BACKUP_MAX_AGE_HOURS * 3600
+    mode = _postgres_backup_mode()
     try:
         with connect() as conn:
             with conn.cursor() as cur:
@@ -229,6 +248,7 @@ def backup_health() -> dict:
                         "ok": False,
                         "reason": "ops_events table missing — apply 0002_ops_events.sql",
                         "max_age_hours": BACKUP_MAX_AGE_HOURS,
+                        "postgres_mode": mode,
                     }
                 walg = _latest_ops_event(cur, "walg_basebackup")
                 pg_dump = _latest_ops_event(cur, "pg_dump")
@@ -238,10 +258,13 @@ def backup_health() -> dict:
             "ok": False,
             "reason": f"backup_health query failed: {exc}",
             "max_age_hours": BACKUP_MAX_AGE_HOURS,
+            "postgres_mode": mode,
         }
 
-    # Freshness: either WAL-G or pg_dump within window is enough
+    # Freshness: WAL-G or pg_dump within window. Local bootstrap writes pg_dump.
     candidates = [e for e in (walg, pg_dump) if e and e.get("status") == "ok"]
+    if mode == "local_docker":
+        candidates = [e for e in (pg_dump,) if e and e.get("status") == "ok"] or candidates
     ages = [e["age_seconds"] for e in candidates if e.get("age_seconds") is not None]
     freshest = min(ages) if ages else None
     backup_fresh = freshest is not None and freshest <= max_age
@@ -249,7 +272,13 @@ def backup_health() -> dict:
 
     reasons = []
     if not candidates:
-        reasons.append("no successful walg_basebackup or pg_dump event recorded")
+        if mode == "local_docker":
+            reasons.append(
+                "no successful local pg_dump event recorded "
+                "(run Welcome backup bootstrap or khipu components bootstrap-local-backup)"
+            )
+        else:
+            reasons.append("no successful walg_basebackup or pg_dump event recorded")
     elif not backup_fresh:
         reasons.append(
             f"last successful backup age {freshest:.0f}s exceeds {BACKUP_MAX_AGE_HOURS}h"
@@ -262,6 +291,7 @@ def backup_health() -> dict:
     return {
         "ok": backup_fresh and restore_ok,
         "max_age_hours": BACKUP_MAX_AGE_HOURS,
+        "postgres_mode": mode,
         "freshest_backup_age_seconds": freshest,
         "walg_basebackup": walg,
         "pg_dump": pg_dump,

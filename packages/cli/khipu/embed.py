@@ -714,6 +714,21 @@ def activate(profile: str, *, force: bool = False) -> dict[str, Any]:
     return {"ok": True, "active_profile": profile, "coverage": cov, "forced": bool(force)}
 
 
+def activate_welcome_embed(*, provider: str, profile: str | None = None) -> dict[str, Any]:
+    """First-run embed activation — empty corpus is allowed (force=True)."""
+    choice = (provider or "skip").strip().lower()
+    if choice == "skip":
+        return {"ok": True, "skipped": True}
+    if choice != "cloud":
+        return {
+            "ok": True,
+            "skipped": True,
+            "note": "local embed profile stored; activate after backfill",
+        }
+    target = (profile or PROFILE_2).strip()
+    return activate(target, force=True)
+
+
 def embed_on_capture(payload: dict[str, Any]) -> bool:
     """Embed one just-captured episode by identity. Fail-open; returns True on success."""
     if os.environ.get("KHIPU_EMBED_ON_CAPTURE", "1").strip().lower() in {"0", "false", "off"}:

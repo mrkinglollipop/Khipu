@@ -12,6 +12,7 @@ import {
   GitBranch,
   History,
   Loader2,
+  Package,
   PlugZap,
   RefreshCw,
   Search,
@@ -23,6 +24,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import khipuIcon from "./assets/khipu-icon.png";
+import { ComponentsPanel } from "./ComponentsPanel";
 import { IntegrationsPanel } from "./IntegrationsPanel";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import "./App.css";
@@ -36,6 +38,7 @@ type Tab =
   | "revisions"
   | "doctor"
   | "settings"
+  | "components"
   | "integrations";
 
 type CacheTab = "status" | "activity" | "revisions" | "doctor";
@@ -155,6 +158,7 @@ const NAV_ICONS: Record<Tab, LucideIcon> = {
   revisions: GitBranch,
   doctor: Stethoscope,
   settings: Settings2,
+  components: Package,
   integrations: Blocks,
   "first-run": PlugZap,
 };
@@ -896,6 +900,7 @@ export default function App() {
           label: "Setup",
           items: [
             ["settings", "Settings", "Keys & data folder"],
+            ["components", "Components", "Postgres & Graphify"],
             ["integrations", "Integrations", "Claude · Cursor · Aegis · Codex"],
             ["first-run", "Welcome", "Tutorial & setup"],
           ],
@@ -2178,6 +2183,14 @@ export default function App() {
 
             <RawJson text={doctorText} />
           </div>
+        </section>
+
+        <section className={panelClass("components")}>
+          <PanelHeader
+            title="Components"
+            lede="Postgres 19 and Graphify upgrade independently of the app. Versions come from Application Support and the compatibility matrix."
+          />
+          <ComponentsPanel />
         </section>
 
         <section className={panelClass("integrations")}>

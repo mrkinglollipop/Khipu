@@ -274,15 +274,40 @@ def sync_from_sqlite(sqlite_path: Path | None = None, *, dry_run: bool = False) 
     return stats
 
 
-def is_graph_producer() -> bool:
-    """Does THIS machine build graph.sqlite? Only the Mac running the graphify
-    nightly does. Everything else (a second Mac, the gateway host, a cloud VM) reads
-    the graph from Postgres and has no business failing on a missing source."""
-    if os.environ.get("KHIPU_GRAPH_PRODUCER", "").strip().lower() in {"1", "true", "yes"}:
-        return True
-    from khipu.jobs import graph_plist_path
+def _scheduled_jobs_flag(name: str) -> bool:
+    try:
+        from khipu.components_matrix import read_versions
 
-    return graph_plist_path().is_file()
+        scheduled = read_versions().get("scheduled_jobs")
+        if isinstance(scheduled, dict) and scheduled.get(name):
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def is_graph_producer() -> bool:
+    """Does THIS machine build graph.sqlite?
+
+    Default false on portable installs — only env or ``versions.json`` scheduled
+    jobs opt in. A leftover LaunchAgents plist must not flip producer on a
+    stranger Mac (portable doctor contract).
+    """
+    env = os.environ.get("KHIPU_GRAPH_PRODUCER", "").strip().lower()
+    if env in {"1", "true", "yes"}:
+        return True
+    if env in {"0", "false", "no"}:
+        return False
+    if _scheduled_jobs_flag("graph_build") or _scheduled_jobs_flag("graph"):
+        return True
+    try:
+        from khipu.components_matrix import read_versions
+
+        if read_versions().get("graph_producer") is True:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str, Any]:

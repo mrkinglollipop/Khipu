@@ -9,9 +9,9 @@
 #   - gh auth for --publish; the target repo must be PUBLIC (an unauthenticated
 #     updater client gets 404 for a private repo's release assets)
 #
-# After build, injects Info.plist LSEnvironment (KHIPU_ROOT / KHIPU_PYTHON) from
-# the build machine (or env overrides), then re-signs so /Applications and
-# updater tarballs carry a production-safe CLI contract.
+# After build, the portable bundle carries CLI + Python under Contents/Resources/khipu
+# (bundle_cli.sh). Do not inject Info.plist LSEnvironment — that tied releases to
+# the builder checkout and Homebrew python.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -71,6 +71,53 @@ export TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY")"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
 export APPLE_SIGNING_IDENTITY="$IDENTITY"
 export CI="${CI:-true}"
+# Cursor sandbox CARGO_TARGET_DIR collides with nested resource name `khipu/`
+# and can lock the output binary. Force the crate-local target.
+export CARGO_TARGET_DIR="$DESKTOP/src-tauri/target"
+
+"$DESKTOP/scripts/bundle_cli.sh"
+
+# Nested CPython / pip dylibs ship with vendor or ad-hoc signatures. Notary
+# rejects those (Developer ID + secure timestamp + hardened runtime).
+sign_macho_tree() {
+  local tree="$1"
+  local entitlements="$DESKTOP/scripts/python-hardened.entitlements"
+  python3 - "$tree" "$IDENTITY" "$entitlements" <<'PY'
+import os, subprocess, sys
+from pathlib import Path
+
+tree, identity, entitlements = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+macho_magics = (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xfe\xed\xfa\xcf")
+python_names = {"python", "python3", "python3.11", "libpython3.11.dylib"}
+signed = 0
+for dirpath, _, filenames in os.walk(tree):
+    for name in filenames:
+        path = Path(dirpath) / name
+        try:
+            head = path.read_bytes()[:4]
+        except OSError:
+            continue
+        if head not in macho_magics:
+            continue
+        cmd = [
+            "codesign",
+            "--force",
+            "--options",
+            "runtime",
+            "--timestamp",
+            "--sign",
+            identity,
+        ]
+        if path.name in python_names:
+            cmd.extend(["--entitlements", str(entitlements)])
+        cmd.append(str(path))
+        subprocess.run(cmd, check=True)
+        signed += 1
+print(f"signed {signed} nested Mach-O under {tree}")
+PY
+}
+
+sign_macho_tree "$DESKTOP/khipu-resources"
 
 cd "$DESKTOP"
 npm run tauri -- build
@@ -84,32 +131,6 @@ echo "app:  $BUNDLE"
 echo "dmg:  ${DMG:-none}"
 echo "tgz:  ${TGZ:-none}"
 echo "sig:  ${SIG:-none}"
-
-inject_ls_environment() {
-  local app="$1"
-  local plist="$app/Contents/Info.plist"
-  local root_val="${KHIPU_ROOT:-$ROOT}"
-  local py_val="${KHIPU_PYTHON:-}"
-  if [[ -z "$py_val" ]]; then
-    py_val="$(command -v python3.11 2>/dev/null || command -v python3 2>/dev/null || true)"
-  fi
-  if [[ -z "$py_val" || ! -x "$py_val" ]]; then
-    echo "KHIPU_PYTHON unset and no python3 on PATH; cannot inject LSEnvironment" >&2
-    exit 1
-  fi
-  if [[ ! -f "$plist" ]]; then
-    echo "Info.plist missing: $plist" >&2
-    exit 1
-  fi
-  /usr/libexec/PlistBuddy -c "Delete :LSEnvironment" "$plist" 2>/dev/null || true
-  /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$plist"
-  /usr/libexec/PlistBuddy -c "Add :LSEnvironment:KHIPU_ROOT string $root_val" "$plist"
-  /usr/libexec/PlistBuddy -c "Add :LSEnvironment:KHIPU_PYTHON string $py_val" "$plist"
-  echo "LSEnvironment: KHIPU_ROOT=$root_val KHIPU_PYTHON=$py_val"
-  # Plist edit invalidates the prior signature — re-sign deep + runtime.
-  codesign --force --deep --options runtime --sign "$IDENTITY" "$app"
-  codesign --verify --verbose=2 "$app"
-}
 
 repack_updater_artifacts() {
   local app="$1"
@@ -134,22 +155,85 @@ if [[ ! -d "$BUNDLE" ]]; then
   exit 1
 fi
 
-inject_ls_environment "$BUNDLE"
-# Updater tarball / DMG from tauri build predate LSEnvironment — always
-# rebuild tarball so plain builds don't leave a stale pre-inject .app.tar.gz.
-# Remove stale DMG file(s) (would lack LSEnvironment); do not publish them.
+# Tauri signs the outer .app; nested Resources Mach-O still need Developer ID
+# + timestamp (notary Invalid without this). Re-sign inside-out, then rebuild
+# the DMG so the image matches the sealed .app.
+codesign --force --deep --options runtime --timestamp --sign "$IDENTITY" "$BUNDLE"
+codesign --verify --deep --strict --verbose=2 "$BUNDLE"
+
+recreate_portable_dmg() {
+  local app="$1"
+  local dmg_dir="$DESKTOP/src-tauri/target/release/bundle/dmg"
+  local dmg_path="$dmg_dir/Khipu_${VERSION}_aarch64.dmg"
+  mkdir -p "$dmg_dir"
+  rm -f "$dmg_dir"/Khipu_*.dmg
+  local stage
+  stage="$(mktemp -d)"
+  ditto "$app" "$stage/Khipu.app"
+  hdiutil create -volname Khipu -srcfolder "$stage" -ov -format UDZO -imagekey zlib-level=9 "$dmg_path"
+  rm -rf "$stage"
+  codesign --force --timestamp --sign "$IDENTITY" "$dmg_path"
+  DMG="$dmg_path"
+  echo "recreated portable dmg: $DMG"
+}
+
+recreate_portable_dmg "$BUNDLE"
+
+# Task 2/3: portable bundle — no LSEnvironment inject (Resources/khipu is SSOT).
 repack_updater_artifacts "$BUNDLE"
-DMG_DIR="$DESKTOP/src-tauri/target/release/bundle/dmg"
-if [[ -d "$DMG_DIR" ]]; then
-  shopt -s nullglob
-  stale_dmgs=("$DMG_DIR"/Khipu_*.dmg)
-  shopt -u nullglob
-  if ((${#stale_dmgs[@]} > 0)); then
-    echo "note: removing stale pre-inject DMG(s) (built before LSEnvironment inject); use .app.tar.gz or --install" >&2
-    rm -f "${stale_dmgs[@]}"
+echo "portable dmg: ${DMG:-none}"
+
+dmg_is_stapled() {
+  local dmg="$1"
+  [[ -n "$dmg" && -f "$dmg" ]] && xcrun stapler validate "$dmg" >/dev/null 2>&1
+}
+
+notarize_dmg() {
+  local dmg="$1"
+  if [[ -z "$dmg" || ! -f "$dmg" ]]; then
+    echo "no DMG to notarize" >&2
+    return 1
   fi
-fi
-DMG=""
+
+  if dmg_is_stapled "$dmg"; then
+    echo "already stapled: $dmg"
+    return 0
+  fi
+
+  local have_api_key=0 have_apple_id=0
+  if [[ -n "${APPLE_API_KEY:-}" && -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER:-}" ]]; then
+    have_api_key=1
+  fi
+  if [[ -n "${APPLE_ID:-}" && -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
+    have_apple_id=1
+  fi
+  if [[ "$have_api_key" -eq 0 && "$have_apple_id" -eq 0 ]]; then
+    echo "Blocked on Matt: notarization skipped — set APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD (+ APPLE_TEAM_ID), or APPLE_API_KEY + APPLE_API_KEY_ID + APPLE_API_ISSUER" >&2
+    return 1
+  fi
+
+  local submit_args=()
+  if [[ "$have_api_key" -eq 1 ]]; then
+    submit_args=(--key "$APPLE_API_KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER")
+  else
+    if [[ -z "${APPLE_TEAM_ID:-}" ]]; then
+      echo "Blocked on Matt: APPLE_TEAM_ID required with APPLE_ID notarization" >&2
+      return 1
+    fi
+    submit_args=(--apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID")
+  fi
+
+  echo "notarytool submit: $dmg"
+  xcrun notarytool submit "$dmg" "${submit_args[@]}" --wait
+  xcrun stapler staple "$dmg"
+  if ! dmg_is_stapled "$dmg"; then
+    echo "stapler validate failed after staple: $dmg" >&2
+    return 1
+  fi
+  echo "notarized and stapled: $dmg"
+}
+
+notarize_dmg "$DMG"
 
 if [[ "$INSTALL_APPS" -eq 1 ]]; then
   # /Applications delivery is the documented install path.
@@ -159,8 +243,12 @@ if [[ "$INSTALL_APPS" -eq 1 ]]; then
 fi
 
 if [[ "$PUBLISH" -eq 1 ]]; then
-  if [[ -z "${TGZ:-}" || -z "${SIG:-}" ]]; then
-    echo "missing updater tarball/signature — was createUpdaterArtifacts enabled?" >&2
+  if [[ -z "${TGZ:-}" || -z "${SIG:-}" || -z "${DMG:-}" || ! -f "$DMG" ]]; then
+    echo "missing DMG or updater tarball/signature — was createUpdaterArtifacts enabled?" >&2
+    exit 1
+  fi
+  if ! dmg_is_stapled "$DMG"; then
+    echo "refusing --publish: $DMG is not Apple-stapled (stapler validate failed)" >&2
     exit 1
   fi
   # One release per version: tarball + .sig + latest.json as assets. The
@@ -188,10 +276,19 @@ EOF
     echo "release $TAG already exists on $RELEASE_REPO; bump the version" >&2
     exit 1
   fi
+  RELEASE_NOTES=$(cat <<EOF
+Khipu $VERSION — portable macOS arm64.
+
+**Install:** download \`Khipu_${VERSION}_aarch64.dmg\`, drag Khipu.app to Applications, complete Welcome (local PostgreSQL 19 via Docker Desktop, or a remote PG 19 DSN).
+
+**Update:** an installed Khipu pulls \`Khipu.app.tar.gz\` from this release via Settings (same minisign feed as 0.2.x).
+
+Compatibility matrix lives on \`mrkinglollipop/khipu-compat\`, not this repo \`/releases/latest\`.
+EOF
+)
   gh release create "$TAG" --repo "$RELEASE_REPO" --title "Khipu $VERSION" \
-    --notes "Khipu $VERSION — signed macOS build (darwin-aarch64). \
-Install: download Khipu.app.tar.gz, or let an installed Khipu update itself from Settings." \
-    "$TGZ" "$SIG" "$NOTES_DIR/latest.json"
+    --notes "$RELEASE_NOTES" \
+    "$DMG" "$TGZ" "$SIG" "$NOTES_DIR/latest.json"
   echo "published $VERSION to https://github.com/$RELEASE_REPO/releases/tag/$TAG"
   # Prove the feed the app polls actually serves this version.
   curl -fsSL "https://github.com/$RELEASE_REPO/releases/latest/download/latest.json" \
