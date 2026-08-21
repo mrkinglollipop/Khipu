@@ -760,8 +760,9 @@ def semantic_search(
 
     Returns kind/id/score/snippet + label. Cosine alone packed relevant and
     irrelevant episodes into a ~0.02 band; fusing query-term hits on the
-    embedded chunk (summary + extract), not the teaser, lifts rows that
-    actually name the question without a second embed call.
+    embedded chunk window (``CHUNK_CHARS``, not the ``FETCH_LIMIT`` teaser
+    fetch) lifts rows that actually name the question without a second embed
+    call.
     """
     from khipu.db import connect
 
@@ -782,11 +783,17 @@ def semantic_search(
                 if has_media
                 else "m.chunk_text"
             )
+            # Teasers stay at FETCH_LIMIT. RRF rank_text uses CHUNK_CHARS so
+            # extract fields appended after a long summary are not clipped off
+            # the lexical side (FETCH_LIMIT still clips some extract headers
+            # on long summaries; CHUNK_CHARS covers all single-chunk episode
+            # embeddings today).
             cur.execute(
                 f"""
                 SELECT m.kind, m.ref, m.chunk_idx,
                        1 - (m.embedding <=> %(q)s::vector) AS score,
                        left(m.chunk_text, %(fetch)s) AS snippet,
+                       left(m.chunk_text, %(rank_fetch)s) AS rank_src,
                        CASE m.kind
                          WHEN 'topic' THEN
                            (SELECT COALESCE(t.title, t.slug) FROM topics t WHERE t.slug = m.ref)
@@ -802,20 +809,20 @@ def semantic_search(
                 LIMIT %(lim)s
                 """,
                 {"q": qlit, "p": profile, "kind": kind, "lim": fetch,
-                 "fetch": FETCH_LIMIT},
+                 "fetch": FETCH_LIMIT, "rank_fetch": CHUNK_CHARS},
             )
             out = []
-            for k, r, i, s, snip, lbl in cur.fetchall():
+            for k, r, i, s, snip, rank_src, lbl in cur.fetchall():
                 # Episodes: snippet from the stored summary, not chunk_text
                 # (which appends decisions/topics and used to mid-word clip at 200).
-                # RRF ranks on chunk_text (snip) so extract fields that were
-                # already embedded can lift a hit the teaser never names.
+                # RRF ranks on rank_src (full embed window) so extract fields
+                # that were already embedded can lift a hit the teaser never names.
                 snippet_src = lbl if k == "episode" and lbl else snip
                 out.append({
                     "kind": k, "id": r, "chunk_idx": i, "score": round(float(s), 4),
                     "label": clip_snippet(lbl or snip, LABEL_LIMIT),
                     "snippet": clip_snippet(snippet_src, SNIPPET_LIMIT),
-                    "rank_text": snip or "",
+                    "rank_text": rank_src or snip or "",
                 })
             ranked = hybrid_rerank(out, query, limit=want)
             for row in ranked:

@@ -175,6 +175,8 @@ class LiveEmbedOnCaptureTest(unittest.TestCase):
                 self.assertEqual(cur.fetchone()[0], 1)
             hits = em.semantic_search(summary, limit=3, kind="episode")
             self.assertTrue(any(h["id"] == eid for h in hits), hits)
+            for h in hits:
+                self.assertNotIn("rank_text", h, h)
         finally:
             with connect() as conn, conn.cursor() as cur:
                 if eid:
@@ -183,6 +185,137 @@ class LiveEmbedOnCaptureTest(unittest.TestCase):
                     )
                 cur.execute("DELETE FROM episodes WHERE md5(summary)=%s", (md,))
                 conn.commit()
+
+
+@unittest.skipUnless(PG_AVAILABLE and KEY_AVAILABLE, "PG or Gemini key unavailable")
+class LiveSemanticRankTextContractTest(unittest.TestCase):
+    """P1: RRF must not leak rank_text (needs a live embed query)."""
+
+    def test_semantic_search_strips_rank_text(self):
+        hits = em.semantic_search("khipu memory", limit=5, kind="episode")
+        self.assertTrue(hits)
+        for h in hits:
+            self.assertNotIn("rank_text", h, h)
+
+
+@unittest.skipUnless(PG_AVAILABLE, "Postgres unreachable; skipping live embed checks")
+class LiveRankWindowContractTest(unittest.TestCase):
+    """Rank window covers extract past FETCH_LIMIT; corpus is SQL-only."""
+
+    def test_rank_window_covers_extract_past_fetch_limit(self):
+        """Functional AC: with CHUNK_CHARS rank window, no live episode embedding
+        still has extract headers past the rank window (re-count after fix)."""
+        from khipu.db import connect
+        from khipu.snippets import FETCH_LIMIT
+
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM embedding_profiles WHERE is_active")
+            profile = cur.fetchone()[0]
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM memory_embeddings m
+                WHERE m.profile = %s AND m.kind = 'episode'
+                  AND (
+                    position(E'\\ntopics:' in m.chunk_text) > %s
+                    OR position(E'\\ndecisions:' in m.chunk_text) > %s
+                    OR position(E'\\npreferences:' in m.chunk_text) > %s
+                    OR position(E'\\npeople:' in m.chunk_text) > %s
+                  )
+                """,
+                (profile, FETCH_LIMIT, FETCH_LIMIT, FETCH_LIMIT, FETCH_LIMIT),
+            )
+            past_fetch = cur.fetchone()[0]
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM memory_embeddings m
+                WHERE m.profile = %s AND m.kind = 'episode'
+                  AND (
+                    position(E'\\ntopics:' in m.chunk_text) > %s
+                    OR position(E'\\ndecisions:' in m.chunk_text) > %s
+                    OR position(E'\\npreferences:' in m.chunk_text) > %s
+                    OR position(E'\\npeople:' in m.chunk_text) > %s
+                  )
+                """,
+                (profile, em.CHUNK_CHARS, em.CHUNK_CHARS, em.CHUNK_CHARS, em.CHUNK_CHARS),
+            )
+            past_rank = cur.fetchone()[0]
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM memory_embeddings m
+                WHERE m.profile = %s AND m.kind = 'episode' AND m.chunk_idx > 0
+                """,
+                (profile,),
+            )
+            extra_chunks = cur.fetchone()[0]
+        # Geometry ACs always run; past_fetch==0 only skips the "hole still exists" check.
+        self.assertEqual(past_rank, 0, f"extract still past CHUNK_CHARS rank window: {past_rank}")
+        self.assertEqual(
+            extra_chunks, 0,
+            f"active-profile episode embeddings with chunk_idx > 0: {extra_chunks}",
+        )
+        if past_fetch == 0:
+            self.skipTest("no live episode rows with extract past FETCH_LIMIT")
+
+
+class SemanticSearchRankFetchWiringTest(unittest.TestCase):
+    """Lock semantic_search SQL: rank window uses CHUNK_CHARS, teaser FETCH_LIMIT."""
+
+    def test_rank_fetch_param_is_chunk_chars_not_fetch_limit(self):
+        import sys
+        from types import ModuleType
+        from unittest import mock
+
+        from khipu.snippets import FETCH_LIMIT
+
+        captured_params: list[dict] = []
+        captured_sql: list[str] = []
+
+        class FakeCur:
+            def execute(self, sql, params=None):
+                if isinstance(params, dict) and "rank_fetch" in params:
+                    captured_params.append(dict(params))
+                    captured_sql.append(sql)
+
+            def fetchone(self):
+                return (True,)
+
+            def fetchall(self):
+                return []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        class FakeConn:
+            def cursor(self):
+                return FakeCur()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        # semantic_search does `from khipu.db import connect` inside the body.
+        # Inject a stub module so this AC runs without psycopg/PG (and without
+        # AttributeError when the real khipu.db never imported).
+        fake_db = ModuleType("khipu.db")
+        fake_db.connect = lambda: FakeConn()
+        with mock.patch.dict(sys.modules, {"khipu.db": fake_db}), mock.patch.object(
+            em, "embed_one", return_value=[0.0] * em.DIM
+        ), mock.patch.object(em, "_active_profile", return_value=em.PROFILE_2):
+            out = em.semantic_search("wiring probe", limit=3, kind="episode")
+        self.assertEqual(out, [])
+        self.assertTrue(captured_params, "expected semantic_search SQL with rank_fetch")
+        params = captured_params[-1]
+        sql = " ".join(captured_sql[-1].split())
+        self.assertEqual(params["rank_fetch"], em.CHUNK_CHARS)
+        self.assertEqual(params["fetch"], FETCH_LIMIT)
+        self.assertNotEqual(params["rank_fetch"], params["fetch"])
+        self.assertIn("left(m.chunk_text, %(rank_fetch)s) AS rank_src", sql)
+        self.assertIn("left(m.chunk_text, %(fetch)s) AS snippet", sql)
 
 
 if __name__ == "__main__":
