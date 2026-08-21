@@ -93,10 +93,17 @@ class TokenMatchSqlTest(unittest.TestCase):
 
     def test_episode_columns_include_extract_json(self) -> None:
         blob = " ".join(_EPISODE_ILIKE_COLUMNS)
-        for need in ("summary", "topics::text", "decisions::text", "preferences::text"):
+        for need in (
+            "summary",
+            "topics::text",
+            "decisions::text",
+            "preferences::text",
+            "people::text",
+        ):
             self.assertIn(need, blob)
         where, _score = _token_match_sql(_EPISODE_ILIKE_COLUMNS, 1)
         self.assertIn("topics::text", where)
+        self.assertIn("people::text", where)
 
 
 @unittest.skipUnless(PG_AVAILABLE, "Postgres unreachable; skipping live query-shape tests")
