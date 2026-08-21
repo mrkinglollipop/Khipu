@@ -1,15 +1,13 @@
 #!/bin/sh
-# khipu-recall-hook — Claude Code SessionStart hook. Prints the thin Khipu recall
-# rule as hookSpecificOutput.additionalContext (same mechanism as the other
-# SessionStart hooks in this workspace). Never fails a session: any error → {}.
+# khipu-recall-hook — SessionStart recall push. Default (Claude Code / Codex):
+# prints hookSpecificOutput.additionalContext. With argv --cursor: prints
+# top-level additional_context (Cursor's sessionStart inject field). Never fails
+# a session: any error → {}.
 # Aegis's runner env means Aegis is calling, and Aegis gets no recall rule by
 # ANY route: its SessionStart is an Observe gate that discards stdout, so there
-# is nothing to inject into (see khipu/recall_rule.py). The guard used to make
-# an exception for KHIPU_HARNESS=aegis, copied from khipu-aegis-capture where
-# that exception is correct; with the mark set this script emitted the whole
-# rule (audit 2026-08-18). maintainer, 2026-08-17: "I don't want Khipu running in
-# Aegis through anything Claude."
-if [ -n "${GROK_HOOK_NAME:-}${GROK_HOOK_EVENT:-}" ]; then
+# is nothing to inject into (see khipu/recall_rule.py). Refuse on GROK runner
+# vars AND on the pack's KHIPU_HARNESS=aegis mark (audit 2026-08-18).
+if [ -n "${GROK_HOOK_NAME:-}${GROK_HOOK_EVENT:-}" ] || [ "${KHIPU_HARNESS:-}" = "aegis" ]; then
   cat >/dev/null 2>&1
   echo '{}'
   exit 0
@@ -35,5 +33,9 @@ export PYTHONPATH
 mkdir -p "${HOME}/Library/Logs/khipu" 2>/dev/null
 PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
 [ -x "$PY" ] || PY="python3"
-"$PY" -c "from khipu.recall_rule import session_start_main; session_start_main()" 2>/dev/null || echo '{}'
+SHAPE=claude
+for a in "$@"; do
+  case "$a" in --cursor) SHAPE=cursor ;; esac
+done
+"$PY" -c "from khipu.recall_rule import session_start_main; session_start_main(shape='$SHAPE')" 2>/dev/null || echo '{}'
 exit 0

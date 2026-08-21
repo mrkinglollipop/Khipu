@@ -2,21 +2,23 @@
 
 A THIN cadence rule, not memory content. It tells the model that Khipu exists,
 which MCP tools to reach for, and when — recall itself happens through the
-tools, on demand. Two native shapes, per the one-pack-per-harness rule:
+tools, on demand. Native shapes, per the one-pack-per-harness rule:
 
   Claude Code  a SessionStart hook (bin/khipu-recall-hook) that prints the rule as
-               hookSpecificOutput.additionalContext — the same mechanism the
-               workspace's other SessionStart hooks use. Global: every session.
-  Cursor       a .cursor/rules/khipu.mdc file (alwaysApply) — Cursor's global
-               "User Rules" live in app state, not a writable file, so this is
-               PROJECT-scoped by design; the installer takes --project <dir>.
+               hookSpecificOutput.additionalContext — Claude's nested inject field.
+               Global: every session. Also appends a cwd-scoped (else recents) slice.
+  Cursor       both: (1) project ``.cursor/rules/khipu.mdc`` (alwaysApply) for pull,
+               and (2) ``sessionStart`` hook emitting top-level ``additional_context``
+               (Cursor's inject field — not Claude ``additionalContext``). The installer
+               appends a second sessionStart entry with a PG-capable timeout; it does
+               not replace harness ``session_start.sh``. The Cursor install command
+               passes ``--cursor`` so the hook emits ``additional_context`` (not an
+               inherited env var that could reshape Claude SessionStart).
   Aegis        none. SessionStart/UserPromptSubmit are Observe gates (verified
                2026-08-17): stdout is discarded, so no rule can be injected.
                Recall is MCP + Stop-gate context; that is a fact, not a gap.
 
-The rule text is one place (RULE_MD) so the two shapes never drift. Claude
-Code SessionStart also appends a small cwd-scoped (else recents) slice so
-recall is pushed, not only pulled.
+The rule text is one place (RULE_MD) so the shapes never drift.
 """
 from __future__ import annotations
 
@@ -150,23 +152,47 @@ def _pushed_memory_slice(cwd: str | None) -> str:
     return "\n".join(lines)
 
 
-def session_start_main() -> None:
-    """Claude Code SessionStart entry: read hook JSON on stdin, print additionalContext."""
-    cwd = None
+def _session_start_cwd() -> str | None:
     try:
         raw = sys.stdin.read()
         if raw.strip():
             payload = json.loads(raw)
             if isinstance(payload, dict):
                 cwd = payload.get("cwd") or payload.get("cwd_path")
+                if isinstance(cwd, str) and cwd.strip():
+                    return cwd
+                # Cursor sessionStart: common input uses workspace_roots, not cwd.
+                roots = payload.get("workspace_roots")
+                if isinstance(roots, list) and roots:
+                    first = roots[0]
+                    if isinstance(first, str) and first.strip():
+                        return first
     except Exception:
-        cwd = None
+        return None
+    return None
+
+
+def session_start_main(*, shape: str | None = None) -> None:
+    """SessionStart entry: print the harness-native inject JSON.
+
+    ``shape`` is ``cursor`` (flat ``additional_context``) or ``claude`` (nested
+    ``hookSpecificOutput``). Default is Claude. Cursor installs pass ``--cursor``
+    on the shim argv; a process-wide env var must not reshape Claude SessionStart.
+    """
+    cwd = _session_start_cwd()
+    ctx = session_start_context(cwd)
+    if shape is None:
+        shape = "cursor" if "--cursor" in sys.argv[1:] else "claude"
+    want = shape.strip().lower()
+    if want == "cursor":
+        print(json.dumps({"additional_context": ctx}))
+        return
     print(
         json.dumps(
             {
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": session_start_context(cwd),
+                    "additionalContext": ctx,
                 }
             }
         )
