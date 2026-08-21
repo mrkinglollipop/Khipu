@@ -4,17 +4,13 @@ P1d shell over `packages/cli/`.
 
 ## Install (recommended)
 
-Download **`Khipu_<version>_aarch64.dmg`** from
-[GitHub Releases](https://github.com/mrkinglollipop/Khipu/releases) under the
-**v0.3.0** tag (upcoming if that tag is not on GitHub yet), open it, and drag
+Download **`Khipu_0.3.0_aarch64.dmg`** from the
+[v0.3.0 release](https://github.com/mrkinglollipop/Khipu/releases/tag/v0.3.0)
+(GitHub `/releases/latest` now points here), open it, and drag
 **Khipu.app** to **Applications**. Launch from Applications — the Welcome flow
 configures Postgres, models, Graphify, and agent integrations. The app bundle
 carries CLI + Python under `Contents/Resources/khipu`; no git clone or
 `KHIPU_ROOT` env var is required.
-
-Until **v0.3.0** is published and is the newest non-prerelease, GitHub
-`/releases/latest` may still be the **0.2.9** updater tarball — download the
-DMG from the **v0.3.0** tag (or a local/CI artifact), not from `/releases/latest`.
 
 **Gatekeeper / notarization**
 
