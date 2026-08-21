@@ -11,6 +11,10 @@ Packs:
                ~/.claude/settings.json hooks.Stop / hooks.PreCompact → khipu-stop-hook
   cursor       ~/.cursor/mcp.json mcpServers.khipu
                ~/.cursor/hooks.json hooks.stop / hooks.preCompact → khipu-stop-hook
+               ~/.cursor/hooks.json hooks.sessionStart += khipu-recall-hook
+                 (--cursor → additional_context; timeout 30s for PG;
+                 does not replace existing harness sessionStart entries)
+               optional --project → .cursor/rules/khipu.mdc (pull)
   aegis        ~/.grok/config.toml [mcp_servers.khipu]
                ~/.grok/config.toml [[hooks.Stop]] / [[hooks.PreCompact]] → khipu-stop-hook
                ~/.grok/config.toml [[hooks.Stop]] / [[hooks.PreCompact]] / [[hooks.SessionEnd]]
@@ -92,6 +96,15 @@ def stop_hook() -> str:
 
 def recall_hook() -> str:
     return _shim("khipu-recall-hook")
+
+
+# Cursor sessionStart must outlive a hub PG slice; harness session_start.sh stays at 5s.
+CURSOR_RECALL_TIMEOUT = 30
+
+
+def recall_hook_cursor() -> str:
+    """Cursor sessionStart command: same binary, Cursor inject field via --cursor."""
+    return f"{recall_hook()} --cursor"
 
 
 def aegis_capture_hook() -> str:
@@ -339,6 +352,30 @@ def _cursor_install(dry: bool, project: str | None = None) -> dict:
         elif _repoint(entries, _is_ours, stop_hook()):
             out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} khipu-stop-hook -> {stop_hook()}")
             changed = True
+    # Push recall: append a second sessionStart entry. Do not replace harness
+    # session_start.sh (Cursor runs all matching hooks; inject field is
+    # additional_context — verified vs Claude additionalContext).
+    ss = hooks.setdefault("sessionStart", [])
+    want_recall = recall_hook_cursor()
+    if not any(_is_our_recall(e.get("command")) for e in ss):
+        ss.append({"command": want_recall, "timeout": CURSOR_RECALL_TIMEOUT})
+        out["changes"].append(
+            f"{CURSOR_HOOKS}: hooks.sessionStart += khipu-recall-hook "
+            f"(additional_context, timeout={CURSOR_RECALL_TIMEOUT})"
+        )
+        changed = True
+    else:
+        for e in ss:
+            if not _is_our_recall(e.get("command")):
+                continue
+            if e.get("command") != want_recall or e.get("timeout") != CURSOR_RECALL_TIMEOUT:
+                e["command"] = want_recall
+                e["timeout"] = CURSOR_RECALL_TIMEOUT
+                out["changes"].append(
+                    f"{CURSOR_HOOKS}: hooks.sessionStart khipu-recall-hook -> "
+                    f"cursor shape timeout={CURSOR_RECALL_TIMEOUT}"
+                )
+                changed = True
     if changed and not dry:
         out.setdefault("backups", []).append(_backup(CURSOR_HOOKS))
         h.setdefault("version", 1)
@@ -363,12 +400,17 @@ def _cursor_uninstall(dry: bool, project: str | None = None) -> dict:
             _write_json(CURSOR_MCP, d)
     h = _load_json(CURSOR_HOOKS)
     changed = False
-    for event in ("stop", "preCompact"):
+    for event in ("stop", "preCompact", "sessionStart"):
         entries = h.get("hooks", {}).get(event, [])
-        kept = [e for e in entries if not _is_ours(e.get("command"))]
+        if event == "sessionStart":
+            kept = [e for e in entries if not _is_our_recall(e.get("command"))]
+            label = "khipu-recall-hook"
+        else:
+            kept = [e for e in entries if not _is_ours(e.get("command"))]
+            label = "khipu-stop-hook"
         if len(kept) != len(entries):
             changed = True
-            out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} -= khipu-stop-hook")
+            out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} -= {label}")
             h["hooks"][event] = kept
     if changed and not dry:
         out.setdefault("backups", []).append(_backup(CURSOR_HOOKS))
@@ -381,9 +423,12 @@ def _cursor_status() -> dict:
     h = _load_json(CURSOR_HOOKS)
     def has(ev: str) -> bool:
         return any(_is_ours(e.get("command")) for e in h.get("hooks", {}).get(ev, []))
+    def has_recall(ev: str) -> bool:
+        return any(_is_our_recall(e.get("command")) for e in h.get("hooks", {}).get(ev, []))
     return {"harness": "cursor", "detected": _cursor_detected(),
             "mcp": d.get("mcpServers", {}).get("khipu", {}).get("command") == mcp_launcher(),
             "hook_stop": has("stop"), "hook_precompact": has("preCompact"),
+            "hook_sessionstart": has_recall("sessionStart"),
             "recall_rule": "project_scoped",
             "extract": "installed" if has("stop") and has("preCompact") else "missing"}
 
@@ -827,13 +872,17 @@ def _probe_hook(command: str) -> dict:
 
 
 def _probe_recall(command: str) -> dict:
-    """SessionStart hook must print valid hookSpecificOutput.additionalContext.
+    """SessionStart hook must print Claude or Cursor inject context with khipu_search.
     Shell-run for the same reason as _probe_hook."""
     t0 = time.time()
     try:
         p = subprocess.run(command, shell=True, input="{}", capture_output=True, text=True, timeout=30)
         d = json.loads(p.stdout.strip() or "{}")
-        ctx = d.get("hookSpecificOutput", {}).get("additionalContext", "")
+        ctx = (
+            d.get("hookSpecificOutput", {}).get("additionalContext")
+            or d.get("additional_context")
+            or ""
+        )
         return {"ok": p.returncode == 0 and "khipu_search" in ctx, "chars": len(ctx),
                 "ms": int((time.time() - t0) * 1000)}
     except Exception as e:  # noqa: BLE001
@@ -1028,7 +1077,11 @@ def _probe_aegis_refusal(command: str) -> dict:
                 wrote = any(Path(home).rglob("*"))
                 # The recall hook refuses by printing a bare {}, so silence on
                 # disk is not enough — an emitted rule is also a breach.
-                leaked = "additionalContext" in (p.stdout or "")
+                # Claude nested additionalContext OR Cursor flat additional_context.
+                leaked = (
+                    "additionalContext" in (p.stdout or "")
+                    or "additional_context" in (p.stdout or "")
+                )
                 results[label] = (not wrote) and (not leaked) and p.returncode == 0
         out = {"ok": all(results.values()), **results, "ms": int((time.time() - t0) * 1000)}
         if not out["ok"]:
@@ -1124,6 +1177,13 @@ def verify(harness: str, *, project: str | None = None) -> dict:
             recall = _probe_recall(recall_hook())
             if recall.get("ok"):
                 ref = _probe_aegis_refusal(recall_hook())
+                recall.update({k: v for k, v in ref.items() if k != "ms"},
+                              ok=recall["ok"] and ref["ok"])
+            out["components"]["recall"] = recall
+        elif harness == "cursor" and st.get("hook_sessionstart"):
+            recall = _probe_recall(recall_hook_cursor())
+            if recall.get("ok"):
+                ref = _probe_aegis_refusal(recall_hook_cursor())
                 recall.update({k: v for k, v in ref.items() if k != "ms"},
                               ok=recall["ok"] and ref["ok"])
             out["components"]["recall"] = recall

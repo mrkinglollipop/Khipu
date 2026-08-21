@@ -1,13 +1,17 @@
 """khipu.recall_rule is the prompt-time text that tells a model Khipu exists.
 
-It ships in two shapes from one source (a Claude Code SessionStart hook and a
-Cursor .mdc rule); these tests exist to keep the two from drifting apart and to
-keep the rule honest about what it promises, since nothing else checks it.
+It ships from one source (RULE_MD) into Claude/Codex SessionStart hooks, a Cursor
+sessionStart push (additional_context), and a Cursor .mdc pull rule; these tests
+exist to keep the shapes from drifting and to keep the rule honest about what it
+promises, since nothing else checks it.
 """
 
 from __future__ import annotations
 
+import io
+import json
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 from khipu import recall_rule as rr
@@ -64,6 +68,57 @@ class CursorShapeTest(unittest.TestCase):
         Code without either being edited separately."""
         self.assertIn(rr.RULE_MD.strip(), rr.cursor_mdc())
         self.assertIn(rr.claude_additional_context(), rr.cursor_mdc())
+
+    def test_session_start_cursor_shape_uses_additional_context(self):
+        with mock.patch.object(rr, "session_start_context", return_value="# Khipu memory\nkhipu_search"):
+            with mock.patch.object(rr, "_session_start_cwd", return_value=None):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rr.session_start_main(shape="cursor")
+        d = json.loads(buf.getvalue())
+        self.assertIn("additional_context", d)
+        self.assertNotIn("hookSpecificOutput", d)
+        self.assertIn("khipu_search", d["additional_context"])
+
+    def test_session_start_default_shape_is_claude_nested(self):
+        with mock.patch.object(rr, "session_start_context", return_value="# Khipu memory\nkhipu_search"):
+            with mock.patch.object(rr, "_session_start_cwd", return_value=None):
+                with mock.patch.object(rr.sys, "argv", ["khipu-recall-hook"]):
+                    buf = io.StringIO()
+                    with redirect_stdout(buf):
+                        rr.session_start_main()
+        d = json.loads(buf.getvalue())
+        self.assertIn("hookSpecificOutput", d)
+        self.assertIn("khipu_search", d["hookSpecificOutput"]["additionalContext"])
+
+    def test_session_start_ignores_env_shape_without_argv(self):
+        """A shell-exported KHIPU_RECALL_SHAPE must not reshape Claude SessionStart."""
+        with mock.patch.object(rr, "session_start_context", return_value="# Khipu memory\nkhipu_search"):
+            with mock.patch.object(rr, "_session_start_cwd", return_value=None):
+                with mock.patch.object(rr.sys, "argv", ["khipu-recall-hook"]):
+                    with mock.patch.dict("os.environ", {"KHIPU_RECALL_SHAPE": "cursor"}):
+                        buf = io.StringIO()
+                        with redirect_stdout(buf):
+                            rr.session_start_main()
+        d = json.loads(buf.getvalue())
+        self.assertIn("hookSpecificOutput", d)
+        self.assertNotIn("additional_context", d)
+
+    def test_session_start_cwd_reads_cursor_workspace_roots(self):
+        payload = json.dumps({"workspace_roots": ["/Volumes/Cloud Storage/Code/Khipu/packages/cli"]})
+        with mock.patch.object(rr.sys, "stdin", io.StringIO(payload)):
+            self.assertEqual(
+                rr._session_start_cwd(),
+                "/Volumes/Cloud Storage/Code/Khipu/packages/cli",
+            )
+
+    def test_session_start_cwd_prefers_explicit_cwd_over_roots(self):
+        payload = json.dumps({
+            "cwd": "/tmp/explicit",
+            "workspace_roots": ["/tmp/root"],
+        })
+        with mock.patch.object(rr.sys, "stdin", io.StringIO(payload)):
+            self.assertEqual(rr._session_start_cwd(), "/tmp/explicit")
 
 
 class AegisTest(unittest.TestCase):

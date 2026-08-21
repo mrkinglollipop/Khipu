@@ -202,6 +202,21 @@ class AegisIsolationTest(unittest.TestCase):
                 rc, logged, out = self._run("khipu-recall-hook", extra)
                 self.assertEqual((rc, logged, out.strip()), (0, False, "{}"))
                 self.assertNotIn("additionalContext", out)
+                self.assertNotIn("additional_context", out)
+
+    def test_recall_hook_cursor_shape_refuses_aegis_mark(self):
+        """Installed Cursor command must refuse on KHIPU_HARNESS=aegis alone."""
+        import os
+        import subprocess
+
+        cmd = integ.recall_hook_cursor()
+        env = {k: v for k, v in os.environ.items() if k not in ("GROK_HOOK_EVENT", "GROK_HOOK_NAME")}
+        env["KHIPU_HARNESS"] = "aegis"
+        p = subprocess.run(cmd, shell=True, input="{}", capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(p.stdout.strip(), "{}")
+        self.assertNotIn("additional_context", p.stdout)
+        self.assertNotIn("additionalContext", p.stdout)
 
     def test_the_recall_rule_is_still_emitted_outside_aegis(self):
         """The guard must not have turned every harness into a refusal."""
@@ -283,7 +298,14 @@ class RecallRuleTest(_TempHomeCase):
     def test_cursor_rule_is_project_scoped_and_only_written_with_project(self):
         (self.home / ".cursor").mkdir()
         (self.home / ".cursor" / "mcp.json").write_text("{}")
-        (self.home / ".cursor" / "hooks.json").write_text("{}")
+        (self.home / ".cursor" / "hooks.json").write_text(json.dumps({
+            "version": 1,
+            "hooks": {
+                "sessionStart": [
+                    {"command": "\"/harness/session_start.sh\"", "timeout": 5},
+                ],
+            },
+        }))
         proj = self.home / "someproj"
         proj.mkdir()
         integ.install("cursor")                                          # no --project
@@ -293,15 +315,63 @@ class RecallRuleTest(_TempHomeCase):
         self.assertTrue(mdc.is_file())
         self.assertIn("alwaysApply: true", mdc.read_text())
         self.assertIn("khipu_search", mdc.read_text())
+        h = json.loads((self.home / ".cursor" / "hooks.json").read_text())
+        ss = h["hooks"]["sessionStart"]
+        self.assertEqual(ss[0]["command"], "\"/harness/session_start.sh\"")  # kept
+        self.assertEqual(ss[0]["timeout"], 5)
+        ours = [e for e in ss if "khipu-recall-hook" in e["command"]]
+        self.assertEqual(len(ours), 1)
+        self.assertIn("--cursor", ours[0]["command"])
+        self.assertEqual(ours[0]["timeout"], integ.CURSOR_RECALL_TIMEOUT)
+        self.assertTrue(integ.status("cursor")["hook_sessionstart"])
         self.assertEqual(integ.install("cursor", project=str(proj))["changes"], [])  # idempotent
         integ.uninstall("cursor", project=str(proj))
         self.assertFalse(mdc.exists())
+        h2 = json.loads((self.home / ".cursor" / "hooks.json").read_text())
+        self.assertEqual(
+            [e["command"] for e in h2["hooks"]["sessionStart"]],
+            ["\"/harness/session_start.sh\""],
+        )
         self.assertEqual(integ.status("cursor")["recall_rule"], "project_scoped")
+        self.assertFalse(integ.status("cursor")["hook_sessionstart"])
 
     def test_recall_probe_real_hook(self):
         r = integ._probe_recall(integ.recall_hook())
         self.assertTrue(r["ok"], r)
         self.assertGreater(r["chars"], 200)
+
+    def test_recall_probe_cursor_shape(self):
+        r = integ._probe_recall(integ.recall_hook_cursor())
+        self.assertTrue(r["ok"], r)
+        self.assertGreater(r["chars"], 200)
+
+    def test_cursor_verify_probes_sessionstart_recall_when_installed(self):
+        (self.home / ".cursor").mkdir()
+        (self.home / ".cursor" / "mcp.json").write_text("{}")
+        (self.home / ".cursor" / "hooks.json").write_text("{}")
+        integ.install("cursor")
+        with mock.patch.object(integ, "_probe_mcp", return_value={"ok": True}), mock.patch.object(
+            integ, "_probe_hook", return_value={"ok": True}
+        ), mock.patch.object(
+            integ, "_probe_native_extract", return_value={"ok": True}
+        ), mock.patch.object(
+            integ, "_runtime", return_value={"ok": True}
+        ), mock.patch.object(
+            integ, "_probe_recall", return_value={"ok": True, "chars": 400}
+        ) as probe, mock.patch.object(
+            integ, "_probe_aegis_refusal", return_value={"ok": True, "refused_marked": True}
+        ) as refuse:
+            out = integ.verify("cursor")
+        self.assertIn("recall", out["components"])
+        self.assertTrue(out["components"]["recall"]["ok"])
+        probe.assert_called_once()
+        self.assertIn("--cursor", probe.call_args[0][0])
+        recall_refuse = [
+            c for c in refuse.call_args_list
+            if c.args and "khipu-recall-hook" in str(c.args[0])
+        ]
+        self.assertEqual(len(recall_refuse), 1)
+        self.assertIn("--cursor", recall_refuse[0].args[0])
 
 
 class CodexPackTest(_TempHomeCase):

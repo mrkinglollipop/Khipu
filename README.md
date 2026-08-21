@@ -192,6 +192,11 @@ Agents reach these through the MCP tools `khipu_search`, `khipu_get`,
 word-boundary teasers; `khipu_get` loads the full episode, topic, or media
 (path/sha256/mime). Claude Code SessionStart injects the recall rule plus a
 small cwd-scoped (else recents) slice so memory is pushed, not only pulled.
+Cursor keeps the project `.cursor/rules/khipu.mdc` pull path and, when
+`khipu install cursor` is applied, also appends a `sessionStart` hook that
+emits Cursor's `additional_context` (not Claude's nested `additionalContext`)
+with a longer timeout so a hub PG slice can finish — without replacing the
+harness `session_start.sh` entry.
 
 ### 4. Where it runs
 
