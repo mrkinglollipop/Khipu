@@ -6,3 +6,7 @@ apps/desktop/src-tauri/target/
 **/__pycache__/
 *.pyc
 .claude/
+# Local Aegis/Grok home. ~/.grok/config.toml holds live API keys — never commit.
+.grok/
+*.bak-khipu-*
+
