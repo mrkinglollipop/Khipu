@@ -4,7 +4,7 @@
 >
 > **This document is a plan.** Build authorized in-thread 2026-08-21 (`approved — build` via kickoff implement). Compatibility picks locked below.
 
-**Status:** Tasks 1–9 implementation ACs done in-tree. Task 10 public `gh release create` and GHCR `write:packages` publish **not done**. Notarized DMG **verified** (`stapler validate` + `spctl` Notarized Developer ID 2026-08-21). Graphify tarball + khipu-compat matrix published. GHCR image retag from Linode `alzy/postgres:19beta3-pgvector` **failed** — GitHub tokens lack `write:packages`; installer `docker build` fallback remains.
+**Status:** SHIPPED 2026-08-21 — Tasks 1–10 in-tree; public [`v0.3.0`](https://github.com/mrkinglollipop/Khipu/releases/tag/v0.3.0) GitHub Release (DMG + updater + `latest.json`). Notarized DMG **verified**. Graphify tarball + khipu-compat matrix published. GHCR `ghcr.io/mrkinglollipop/khipu-postgres:19beta3-pgvector` **not** published — GitHub tokens lack `write:packages`; installer `docker build` fallback remains. Clean-VM Welcome+doctor ACs **unverified**.
 
 **Goal:** A generic user (Matt on a new Mac, or a stranger) can download one signed DMG, follow in-app install, and finish with a working Khipu: **PostgreSQL 19 + pgvector + SQL/PGQ**, a **Graphify** graph engine they can upgrade, memory capture/search, optional harness packs — **no** `/Volumes/Cloud Storage/...` paths, **no** required Linode, **no** required git clone of this repo.
 
@@ -564,7 +564,7 @@ Each task has files, interfaces, and a stop-condition. Checkboxes are for the **
 - **Public ship:** `gh release create` for **0.3.0** attaching the **Task 3+9** DMG (Welcome+Components already in the binary) + updater tarball + `latest.json` — only after Tasks 4–8 **and** the post-4–8 DMG rebuild exist, and Welcome+doctor ACs pass on a clean VM. Until then, 0.2.9 remains the live **Khipu** GitHub Release. Matrix JSON lives on **`khipu-compat`**, not as a docs-only Khipu tag.
 
 - [x] Stranger README path never mentions `/Volumes/Cloud Storage`
-- [ ] First **public** 0.3.0 **Khipu** Release includes DMG + updater; **khipu-compat** has the matrix JSON
+- [x] First **public** 0.3.0 **Khipu** Release includes DMG + updater; **khipu-compat** has the matrix JSON
 - [x] Commit: `docs: DMG-first setup for portable install` (docs can land before public 0.3.0; the `gh release create` is the last checkbox)
 
 ---
@@ -643,4 +643,4 @@ A reviewer on a **clean macOS arm64 VM** (no Khipu clone, no Cloud Storage, no T
 | Write durable plan in Khipu repo | done — this file (`docs/plans/2026-08-21-portable-dmg-install.md`) |
 | Pointer from Khipu-ops `plan.md` | **done** — workspace path in Khipu-ops Current position (ops catalog). `.cursor/plans/` is a pointer, not a second SSOT. GitHub public URL **after merge**. |
 | `/verify-plan` dual critics until green | **Green: Y** (2026-08-21, round 4/4 confirm: 0 HIGH, 0 MEDIUM). |
-| Implement portable install | Tasks 1–9 ACs checked in this file. Task 10 public `gh release create` **not done**. GHCR publish blocked on `write:packages` token. |
+| Implement portable install | **SHIPPED** 2026-08-21 — public `v0.3.0` created (DMG + tarball + `latest.json`). GHCR publish still blocked on `write:packages`. Clean-VM ACs unverified. |
