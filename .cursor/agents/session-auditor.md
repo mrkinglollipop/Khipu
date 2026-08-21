@@ -78,7 +78,7 @@ If the artifact pack is incomplete (missing Freshness oracle notes field, file s
 
 ## Output format (Flavor-OFF)
 
-Return **structured findings only**. No Action summary, no Matt-facing prose, no personality.
+Return **structured findings only**. No Action summary, no Matt-facing §4, no personality, **no essay**. Hard cap: findings table **max ~20 rows**; prefer HIGH/MEDIUM when depth is slash-default or `quick`.
 
 ```markdown
 ## Findings (ROLE=<bug_hunt|claim_bust>, TRACK=<session|plan>)
@@ -90,7 +90,9 @@ Return **structured findings only**. No Action summary, no Matt-facing prose, no
 
 - **Severity:** HIGH (blocks production / data loss / security / false done-claim on critical path / load-bearing freshness failure) · MEDIUM (fragile, drift, false confidence) · LOW (cosmetic, docs, nice-to-have)
 - **claim_id:** reference a load-bearing claim from the artifact pack when applicable; otherwise omit or use `-`
-- Empty findings table is valid — state `No findings for ROLE=<role>, TRACK=<track>.`
+- Empty findings: emit the **substituted** sentinel with real ROLE/TRACK values, e.g. `No findings for ROLE=bug_hunt, TRACK=session.` — **not** the angle-bracket template and **not** `No HIGH/MEDIUM findings...`. The placeholder below is documentation only:
+
+  Placeholder (do not emit literally): `No findings for ROLE=<role>, TRACK=<track>.`
 
 Do not duplicate the other critic's job — stay in your ROLE lens. The audit-verifier dedupes both reports.
 

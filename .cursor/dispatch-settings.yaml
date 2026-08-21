@@ -28,9 +28,11 @@ hosts:
       subagent_type: audit-verifier
       escape_type: generalPurpose
       prompt_from: .cursor/agents/audit-verifier.md
-      # Cursor: pin xhigh required; high allowed if Task enum has it; omit denied
+      # Cursor: fix defaults to xhigh; confirm prefers high (both allowed; omit denied)
       model: cursor-grok-4.6-xhigh
       model_optional: cursor-grok-4.6-high
+      confirm_model: cursor-grok-4.6-high
+      fix_model: cursor-grok-4.6-xhigh
       model_policy: pin_required
       allow_models: [cursor-grok-4.6-xhigh, cursor-grok-4.6-high]
       deny_models: [composer-2.5, composer-2.5-fast, k3]
