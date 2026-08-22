@@ -34,15 +34,16 @@ Critics do not self-select models — if the orchestrator violated host policy, 
 - Plan/todo ids in thread (or "none")
 - Prior round finding deltas (rounds 2–4, if any)
 - Oracle log tails already collected this round (if any)
-- **Freshness oracle notes** (orchestrator-collected before critics; required field — use "none" when Freshness pass did not run)
+- **Freshness oracle notes** (orchestrator-collected before critics; required field — session track: use `"none"` when Freshness pass did not run; **`TRACK=plan`: path to identifier notes or inline `NO_IDENTIFIERS` — reject `"none"`**)
 
 **TRACK=session:**
 - Session file set (paths from this thread's Write/StrReplace/Delete + named shell side effects)
 
 **TRACK=plan:**
 - Plan file set (`.cursor/plans/*.md`, topic `*-plan.md`, thread plan text, todo ids)
+- **Identifier freshness notes** path or inline `NO_IDENTIFIERS` from `identifier_freshness.py` (required — not `"none"`)
 
-If the artifact pack is incomplete (missing Freshness oracle notes field, file set for TRACK, or scope block), return **BLOCKED**.
+If the artifact pack is incomplete (missing Freshness oracle notes field, **`TRACK=plan` freshness `"none"`**, file set for TRACK, or scope block), return **BLOCKED**.
 
 **Large blobs by reference:** the prepr prepare bundle (or other big evidence) may arrive as inline metadata (exit code, fingerprint, `scope_paths`, `files`) plus a `/tmp/prepr_bundle_<fingerprint>.json` path — read that file for `audit_input`/`prompt`; a referenced path is not a missing bundle.
 
@@ -67,7 +68,7 @@ If the artifact pack is incomplete (missing Freshness oracle notes field, file s
 
 **TRACK=session:** chat claims that do not match files, logs, or oracles. False "verified" / "done" assertions. Process gaps (build gate, contract, scope lock, oracle cap, delegation spec). Intent misalignment vs first user build request and Deliverable Contract.
 
-**TRACK=plan:** same shared freshness items applied to plan artifact claims; plan-vs-thread intent misalignment; assumptions marked as fact without verification rows.
+**TRACK=plan:** same shared freshness items applied to plan artifact claims; plan-vs-thread intent misalignment; assumptions marked as fact without verification rows; **recant-vs-plan contradictions from identifier freshness notes → HIGH** (e.g. plan asserts live hook; notes show `EMPIRICAL CORRECTION` / `does NOT fire` / `do not hook`).
 
 ## Investigation
 
