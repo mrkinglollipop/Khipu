@@ -30,7 +30,7 @@ The orchestrator **must** include:
 - Plan/todo ids (or "none")
 - Prior round finding deltas (rounds 2–4, if any)
 - Oracle log tails already collected this round (if any)
-- **Freshness oracle notes** (required field — use "none" when Freshness pass did not run)
+- **Freshness oracle notes** (required field — session track: `"none"` when Freshness pass did not run; **`TRACK=plan`: path or inline `NO_IDENTIFIERS` — reject `"none"`**)
 - Optional **`DELTA_CHECK=true`** — post-fix is **always delta** (even when the prior confirm had HIGH). Escalate to full dual only via `ESCALATE_FULL_REAUDIT` (see below).
 
 **Step 1 only** (`fix_authorized=false`): **both critic reports** (bug_hunt + claim_bust findings tables) — **except** when `DELTA_CHECK=true`. A code-session delta requires the current prepared prepr bundle plus one `ROLE=bug_hunt` report; a docs-only/no-code delta requires no critic report. Every delta also requires fix-touched paths + prior confirmed findings + clearance claims.
@@ -41,7 +41,7 @@ The orchestrator **must** include:
 
 **TRACK=plan:** plan file set (`.cursor/plans/*.md`, topic `*-plan.md`, thread plan text, todo ids)
 
-If `fix_authorized`, TRACK, Freshness oracle notes field, scope block, or TRACK file set is missing, return **BLOCKED** with `Orchestrator blockers`. Additionally: step 1 missing either critic report → **BLOCKED** (**unless** `DELTA_CHECK=true`); code-session `DELTA_CHECK=true` missing the current prepared prepr bundle or `ROLE=bug_hunt` report → **BLOCKED**; any delta missing fix-touched paths or prior confirmed findings → **BLOCKED**; step 2 missing confirmed finding list → **BLOCKED**. Step 2 must **not** block solely for absent critic reports.
+If `fix_authorized`, TRACK, Freshness oracle notes field (**`TRACK=plan` `"none"` → BLOCKED**), scope block, or TRACK file set is missing, return **BLOCKED** with `Orchestrator blockers`. Additionally: step 1 missing either critic report → **BLOCKED** (**unless** `DELTA_CHECK=true`); code-session `DELTA_CHECK=true` missing the current prepared prepr bundle or `ROLE=bug_hunt` report → **BLOCKED**; any delta missing fix-touched paths or prior confirmed findings → **BLOCKED**; step 2 missing confirmed finding list → **BLOCKED**. Step 2 must **not** block solely for absent critic reports.
 
 ## Step 1 — Confirm only (`fix_authorized=false`)
 
@@ -59,6 +59,7 @@ Used after **every** Phase 2 (always-delta). Do **not** require prior-confirm ze
 1. Diff the fix-touched paths against prior confirmed findings + clearance claims. For code sessions, cross-check the prepared prepr bundle and delta `bug_hunt` report too.
 2. Confirm clearances, residual HIGH/MEDIUM, adversarial prepr findings, and whether **any new HIGH** appears or a clearance is contested.
 3. If a **new HIGH** appears or clearance is contested → flag **`ESCALATE_FULL_REAUDIT=true`** so the orchestrator runs dual critics in the same round before Phase 2. Otherwise set **`ESCALATE_FULL_REAUDIT=false`**.
+   - **`TRACK=plan` delta:** re-read identifier freshness notes; **`ESCALATE_FULL_REAUDIT=true`** when a previously verified identifier is now `ZERO_HITS` or recant slice contradicts a live-hook plan sentence. Missing notes on plan delta → **BLOCKED**.
 4. Emit §4-ready **deltas only** (Findings / ledger / Plan completion). Title: `Audit verifier — confirm only DELTA (TRACK=…)`. Always include **`ESCALATE_FULL_REAUDIT: true|false`** in the delta payload (and Handoff tail).
 
 ### Full confirm (default)
@@ -68,7 +69,7 @@ Used after **every** Phase 2 (always-delta). Do **not** require prior-confirm ze
 1. Cross-check both critic findings against the file set for TRACK, claims, Freshness oracle notes, and oracle tails.
 2. **Drop** false positives — cite evidence for each rejection.
 3. **Dedupe** overlapping findings from bug_hunt and claim_bust.
-4. Build Verification ledger rows for every load-bearing claim (verified / unverified / inferred). Include **freshness rows** for version/API/path claims using Freshness oracle notes and critic evidence.
+4. Build Verification ledger rows for every load-bearing claim (verified / unverified / inferred). Include **freshness rows** for version/API/path claims using Freshness oracle notes and critic evidence. **`TRACK=plan`:** one ledger row per identifier `claim_id` from identifier freshness notes (plus graph+memory rows). Cannot mark a wire/hook claim **verified** from plan text alone — require identifier notes hit or explicit blocked-on-Matt.
 5. Build Plan completion rows when plan/todos exist.
 6. Emit a **§4-ready payload** for the orchestrator to surface to Matt before any fix writes.
 

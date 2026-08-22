@@ -13,7 +13,7 @@ description: >-
 
 **Not** `/myauditandfix` · **Not** `/oracle-retro`.
 
-**Shared loop:** `.cursor/skills/audit/references/loop.md`. **Report:** `.cursor/skills/audit/SKILL.md` §4.
+**Shared loop:** `.cursor/skills/audit/references/loop.md`. **Identifier grep:** `.cursor/skills/audit/references/identifier_freshness.py`. **Report:** `.cursor/skills/audit/SKILL.md` §4.
 
 ## 0. Scope
 
@@ -27,7 +27,7 @@ If no plan artifact: say so in Action summary; do not invent a plan.
 
 ## 1–2. Pipeline
 
-Follow `loop.md` with `TRACK=plan`: Freshness → dual critics → confirm (or slim confirm when empty) → §4 → same-turn plan-only fix → **always-delta** post-fix.
+Follow `loop.md` with `TRACK=plan`: identifier freshness (`identifier_freshness.py`) → dual critics → confirm (or slim confirm when empty) → §4 → same-turn plan-only fix → **always-delta** post-fix.
 
 **Plan lenses:** contradictions, missing acceptance criteria, wrong paths, unverified assumptions as fact, freshness failures, documented≠enforced.
 
@@ -47,6 +47,8 @@ App/harness SSOT edits → **BLOCKED**. Re-verify via reads + ledger only (no bu
 ## 5. Green / loop
 
 Per `loop.md`. **Green** when latest confirm has zero HIGH/MEDIUM, Plan completion has no partial/not-started for in-scope items (**blocked on Matt** OK if explicit), load-bearing claims verified or blocked on Matt.
+
+**Verification ledger (§5):** one row per identifier `claim_id` from identifier freshness notes (plus graph+memory freshness rows). `ZERO_HITS` on a load-bearing wire/path symbol, or a recant slice vs a plan sentence asserting the symbol is live → **unverified** (blocks green unless explicitly blocked on Matt). Silent unverified still fails green.
 
 Does **not** authorize `approved — build` for implementation. Does **not** unlock `git push`.
 
