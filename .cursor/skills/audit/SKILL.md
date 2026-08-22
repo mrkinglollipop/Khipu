@@ -1,37 +1,39 @@
 ---
 name: audit
 description: >-
-  Read-only system, codebase, or process audit with mandatory Action summary,
-  Verification ledger, and Plan completion sections. Use when Matt says audit,
-  /audit, audit your work, session audit, assess, health-check, review the system,
-  coverage audit, or asks for findings without fixes. Fix phase only when authorized
-  (/myauditandfix, audit and fix, fix any issues). /myauditandfix = session loop per
-  commands/myauditandfix.md + references/loop.md. /verify-plan = verify-plan skill.
+  Session audit with mandatory Action summary, Verification ledger, and Plan
+  completion. /audit and "audit your work" = one Grok 4.6 agent, loop until green
+  (stamps push OK). /myauditandfix = dual-critic session loop. Read-only: assess,
+  health-check, coverage audit, findings without fixes. /verify-plan = verify-plan skill.
 ---
 
 # Audit
 
-**Mode:** read-only by default. Audit ≠ build (`master.mdc` build gate). Deliver the assessment; do not implement fixes unless fix phase is authorized: **`/myauditandfix`**, `and fix`, `fix any issues`, `fix the highs`, or a follow-up with fix intent.
+**Mode:** read-only by default except **`/audit`** and informal **audit your work** (solo Grok loop + fix) and **`/myauditandfix`** (dual-critic loop + fix). Audit ≠ build (`master.mdc` build gate). Other informal audits (`assess`, `health check`, `coverage audit`) stay assessment-only unless fix is authorized: `and fix`, `fix any issues`, `fix the highs`.
 
-**Shared loop:** `.cursor/skills/audit/references/loop.md` (waves, always-delta, empty-skip, host pins, caps). Slash commands authorize fix + load this skill / verify-plan skill.
+**Shared loop:** `.cursor/skills/audit/references/loop.md` — dual waves for `/myauditandfix` / `/verify-plan`; **Solo audit loop** section for `/audit` / `audit your work`.
 
 ## 0. Confirm scope (one pass, then proceed)
 
 State in one short block:
 - **Target** — path, subsystem, diff, or **this thread**
 - **In scope** / **Out of scope**
-- **Depth** — informal `audit` default **thorough**; slash `/myauditandfix` default HIGH/MEDIUM (see `loop.md`)
+- **Depth** — `/audit` and `audit your work` default HIGH/MEDIUM (solo cap 8); `/myauditandfix` HIGH/MEDIUM (dual cap 3); informal read-only default **thorough**
 - **Track** — session audits use **`TRACK=session`**
 
-### Session audit + fix (`/myauditandfix`)
+### Session audit + fix — solo (`/audit`, `audit your work`)
 
-Command: `.cursor/commands/myauditandfix.md`. Session scope + fix authorized. Pipeline = `loop.md` with `TRACK=session`.
+Command: `.cursor/commands/audit.md` (when present). Session scope + fix authorized. **One Grok 4.6 agent** per `loop.md` **Solo audit loop**. Stamps push OK on Green:Y. Derive file set from **this thread's tool history**, not `git diff` alone. **Bugbot:** default **off**.
+
+### Session audit + fix — dual (`/myauditandfix`)
+
+Command: `.cursor/commands/myauditandfix.md`. Session scope + fix authorized. Pipeline = `loop.md` dual critics + verifier with `TRACK=session`.
 
 ### Plan verify (`/verify-plan`)
 
 Load **`.cursor/skills/verify-plan/SKILL.md`** (not this file's fix allowlist).
 
-### Session audit (`audit your work`, `session audit`)
+### Session file set (solo and dual)
 
 **Default target:** deliverables from **the invoking thread only** — not repo-wide uncommitted diff.
 
@@ -41,8 +43,6 @@ Load **`.cursor/skills/verify-plan/SKILL.md`** (not this file's fix allowlist).
 | Session shell side effects | Unrelated workspace areas |
 | Load-bearing chat claims from this thread | Whole-system explore (unless session touched many areas) |
 | Process rules followed in this thread | Drive-by fixes beyond findings |
-
-**Method:** dual-critic → verifier with **`TRACK=session`** per `loop.md`. Derive file set from **this thread's tool history**, not `git diff` alone. **Bugbot:** default **off**. Skip §1 graph orient when target is only this thread's local files.
 
 ### Code / system / hybrid tracks
 
@@ -56,7 +56,7 @@ Load **`.cursor/skills/verify-plan/SKILL.md`** (not this file's fix allowlist).
 
 ## 2. Investigate
 
-Follow `loop.md`: Freshness → prepr (code myaudit) → dual critics → confirm or empty-skip → §4 → same-turn fix → always-delta.
+Follow `loop.md`: **solo** (`/audit` / `audit your work`) → Freshness → prepr (code) → one `ROLE=solo_audit` Task → §4 → re-hire until green. **dual** (`/myauditandfix`) → Freshness → prepr → dual critics → confirm or empty-skip → §4 → same-turn fix → always-delta.
 
 ### Evidence states (Fable rule 2)
 
@@ -66,7 +66,7 @@ Follow `loop.md`: Freshness → prepr (code myaudit) → dual critics → confir
 | **unverified** | Stated but not checked this session |
 | **inferred** | Reasonable from structure; no oracle |
 
-## 3. Prepr (code `/myauditandfix`)
+## 3. Prepr (code `/audit` and `/myauditandfix`)
 
 See `loop.md` + Night School 465. `/commitprmerge` reuses transcript prepr — never re-runs it.
 
@@ -94,7 +94,7 @@ See `loop.md` + Night School 465. `/commitprmerge` reuses transcript prepr — n
 | Intent alignment — build matches user request primary workflow | verified / **FAILED** | … |
 ```
 
-### 4.2b Rule compliance (session / `/myauditandfix`)
+### 4.2b Rule compliance (session / `/audit` / `/myauditandfix`)
 
 One row per always-on rule file (conduct, master, orchestration, memory, personality, context-compaction, workspace-context): Relevant? / State / Evidence. Procedural/hook **violated** → HIGH.
 
@@ -120,21 +120,24 @@ Stop hook captures on this Mac. Cloud / no hook: `khipu_capture`. Do not pipe `c
 
 ## Triggers
 
-**Audit-only:** `audit`, `/audit`, `audit your work`, `session audit`, `assess`, `health check`, `review the system`, `coverage audit`
+**Solo loop (fix + push OK):** `/audit`, `audit your work` (also `audit our work` / `audit this work`)
+
+**Read-only:** `assess`, `health check`, `review the system`, `coverage audit`, `session audit` (no slash), bare `audit` without “your work”
 
 **Plan verify:** `/verify-plan` → verify-plan skill
 
-**Audit + fix:** `/myauditandfix`, `audit and fix`, `fix any issues` (with audit context)
+**Dual-critic loop (fix + push OK):** `/myauditandfix`, `audit and fix` / `fix any issues` (with dual-audit context)
 
 ## Anti-patterns
 
-- Solo-audit instead of dual critics + verifier
-- Confirm+fix in one Task
+- Dual critics on `/audit` / `audit your work`
+- Solo-audit instead of dual critics + verifier **on `/myauditandfix`**
+- Confirm+fix in one Task **on `/myauditandfix`** (allowed on `/audit` only)
 - End turn after Phase 1 when fixable HIGH/MEDIUM remain under slash loop
 - Green after Phase 2 without post-fix re-audit
 - Treat `NEW_HIGH_FROM_FIX: false` as green
-- Repo-wide `git diff` as `/myauditandfix` surface
+- Repo-wide `git diff` as session-audit surface
 - Default bugbot on without Matt opt-in
-- Skip `loop.md` always-delta / empty-skip / multi-green rules
+- Skip `loop.md` always-delta / empty-skip / multi-green rules on the dual path
 
 **Post-fix re-audit mandatory** — see `loop.md` (never end on Phase 2 alone).

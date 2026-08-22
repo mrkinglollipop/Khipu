@@ -2,6 +2,8 @@
 
 Shared by `/myauditandfix` (`TRACK=session`) and `/verify-plan` (`TRACK=plan`). Skills own scope, fix allowlists, and §4 meaning; this file owns waves, green, delta, packs, and host dispatch.
 
+**Solo Grok loop** (`/audit`, informal `audit your work`): see **Solo audit loop** below — one agent, stamps push OK, not dual critics.
+
 ## Host dispatch (HARD)
 
 Resolve critic + adjudicator from **`.cursor/dispatch-settings.yaml`** for the active host (`cursor` | `grok` | `claude`).
@@ -20,7 +22,7 @@ Every critic/verifier Task prompt must include `ROLE=` / `TRACK=` / `fix_authori
 | Slash default (`/myauditandfix`, `/verify-plan`) | HIGH/MEDIUM only (skip LOW enumeration) | **3** |
 | Trailing `full` | thorough (include LOW) | **4** |
 | Trailing `quick` (Matt-invoked only) | HIGH/MEDIUM only; Freshness free oracles only | **2** |
-| Informal read-only `audit your work` (no slash loop) | thorough | N/A (no loop) |
+| Informal `audit your work` / slash `/audit` | HIGH/MEDIUM (see Solo audit loop) | **8** (solo, not dual) |
 
 Never self-select `quick` absent Matt's words.
 
@@ -69,7 +71,7 @@ Pack must include: scope block, TRACK, file/plan set, load-bearing claims, plan/
 ## Anti-patterns (loop)
 
 - Merge `bug_hunt` + `claim_bust` into one critic
-- Confirm+fix in one Task
+- Confirm+fix in one Task (dual path only — solo `/audit` may audit+fix in one Task)
 - Skip confirm when critics agree on MEDIUMs (judge still required)
 - Honor-system `CONFIRM_SKIP` prose as Push OK evidence
 - Satisfy myaudit empty-skip / push gate with `TRACK=plan`
@@ -77,3 +79,66 @@ Pack must include: scope block, TRACK, file/plan set, load-bearing claims, plan/
 - Stamp a later `Green:Y` from stale round-1 empty sentinels
 - End turn on Phase 2 without post-fix re-audit
 - Treat `NEW_HIGH_FROM_FIX: false` as green
+- Dual critics on `/audit` / `audit your work`
+- Composer or k3 pin on the solo Grok Task (Cursor)
+
+## Solo audit loop (`/audit`)
+
+Owned by **`/audit`** and informal **audit your work**. Dual-critic waves above stay for `/myauditandfix` and `/verify-plan`.
+
+This path **stamps push OK** on `Green: Y` when the solo pipeline Task exists (`audit_marker.py`). **Latest session-audit invocation wins:** a later `/audit` (or informal audit your/our/this work) overrides an earlier `/myauditandfix`. Both commands in the **same** user message still count as dual.
+
+### Host dispatch (HARD)
+
+Resolve from **`.cursor/dispatch-settings.yaml`** `audit_solo`.
+
+| Host | Type | Model |
+|------|------|-------|
+| **cursor** | native `audit-solo` when present (escape: `generalPurpose` + loop/agent brief) | pin **`cursor-grok-4.6-xhigh`** (allow `high`); never omit; **never Composer**; **never k3 as an adjudicator** |
+| **grok** / **claude** | **model omit always** | harness default; grok `capability_mode: all` |
+
+Every Task prompt must include `ROLE=solo_audit` / `TRACK=session` / `fix_authorized=` **in the prompt text**.
+
+### Depth and round cap
+
+Loops **until green** (zero HIGH/MEDIUM) or stop-early. Hard cap prevents infinite burn.
+
+| Invocation | Depth | Cap |
+|------------|-------|-----|
+| Slash default / `audit your work` | HIGH/MEDIUM only (skip LOW enumeration) | **8** |
+| Trailing `full` | thorough (include LOW) | **8** |
+| Trailing `quick` (Matt-invoked only) | HIGH/MEDIUM only | **4** |
+| Trailing `audit-only` | same depth as invocation | no Phase 2 writes |
+
+Never self-select `quick` absent Matt's words.
+
+### Wave shape (HARD)
+
+1. **Freshness pass** (orchestrator) when claims need prior context — graph + memory. No identifier-freshness script (`TRACK=plan` only).
+2. **Prepr prepare** (code sessions) — Night School 465: repo-local `prepr_audit.py --worktree --prepare --json --path <each session code path>` before the first solo Task and again after any fix round before the next hire. Docs-only → `prepr: N/A`. Exit 2/3 or missing run blocks Green:Y.
+3. **Hire one solo Task** (`ROLE=solo_audit`, `TRACK=session`). Prefer **one Task that loops internally** (audit → fix in-scope findings → re-audit) until this round is green or the agent hits its inner stop. `fix_authorized=true` unless `audit-only`.
+4. **Mandatory §4 report** to Matt from the agent payload (skill format) after each hire returns.
+5. **Same-turn re-hire** when not green, not stop-early, and under cap — pass prior findings + clearance claims. Do not wait for Matt ack.
+6. **Post-fix re-audit mandatory (HARD):** Green:Y only after the latest payload shows zero HIGH/MEDIUM **after** any fixes in that Task (or a follow-up hire that only re-audits). `NEW_HIGH_FROM_FIX` is **not** green.
+
+Parent does **not** hire `session-auditor` or `audit-verifier` on this path. Confirm+fix in one Task is **allowed here only**.
+
+### Green / stop-early
+
+**Green** when the latest solo payload has zero HIGH/MEDIUM, session completion gates pass per skill, prepr is current (or N/A), and post-fix re-audit ran when fixes ran.
+
+**Stop-early — Blocked on Matt:** if every remaining HIGH/MEDIUM is explicitly Blocked on Matt and zero fixable-in-session findings remain → exit with `Green: N`.
+
+**Same failure twice** (Fable 3) → stop, `Green: N`, do not burn the rest of the cap.
+
+**Loop summary** must use exact `**Green:** Y` / `**Green:** N` (or `Green: Y` / `Green: N`) for the stop hook.
+
+### Push pipeline (mechanical)
+
+Stop/push OK requires a Task tool_use with:
+
+- `ROLE=solo_audit` and `TRACK=session` in the **prompt**
+- top-level `model` `cursor-grok-4.6-xhigh` or `cursor-grok-4.6-high` (Cursor)
+- `subagent_type` `audit-solo` or escape `generalPurpose` / `explore` / omitted
+
+Prose-only "I ran solo audit" never stamps. Dual-critic Tasks do **not** satisfy this path.
