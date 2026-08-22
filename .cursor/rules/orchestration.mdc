@@ -37,6 +37,7 @@ Otherwise → **hire**. When unsure → **hire**.
 - Native / Electron verify → `ios-oracle` / `electron-oracle`
 - Research gather/deep → `research`
 - Repo target fork → `app-repo-scout`
+- Session audit / `/audit` / `audit your work` → one `audit-solo` (escape `generalPurpose`) pin `cursor-grok-4.6-xhigh` (allow `high`; **Grok/Claude omit always**; never Composer; never k3), `ROLE=solo_audit` `TRACK=session`, loop until green per `audit/references/loop.md` Solo audit loop (default cap **8**); stamps push OK
 - Session audit / `/myauditandfix` → dual `session-auditor` (ROLE=bug_hunt + ROLE=claim_bust, `TRACK=session`) + `audit-verifier` confirm (or empty-skip per `audit/references/loop.md`), then fix verifier when authorized in the **same turn**; loop default max **3** rounds (`full` → 4; `quick` → 2); after every Phase 2, **mandatory** always-delta post-fix re-audit in the **same turn** (`ESCALATE_FULL_REAUDIT` forces dual on contested/new HIGH — never skips re-audit / never equals green)
 - Plan verify / `/verify-plan` → dual `session-auditor` (`TRACK=plan`) + `audit-verifier` confirm, then plan-only fix verifier when authorized in the **same turn** (same `loop.md` caps + always-delta; plan-doc write allowlist only)
 - Improve loop / `/iterate` → parent-owned mission: parallel `iterate-finder` per requested lens → merge → serial `iterate-fixer` → recheck; durable run log (`schema_version: 2`); fix existing surface only. **Not** myaudit (claims). Default lens = `working`; `lenses=all` = working→bugs→gaps→polish→product with **per-lens max 2** passes (find + recheck) and mission ceilings (`2 × N` finder dispatches, 2 fixer batches); budget-stop / skipped lenses mean Green:N. See `.cursor/skills/iterate/SKILL.md`.
@@ -81,7 +82,7 @@ When host is **cursor**, orchestrator may pin Task `model` **only** from Matt's 
 **Must pin allowlisted model for browser/tool-schema-heavy Tasks when parent may be Moonshot/Kimi/Auto-unknown** (Grok or Composer; do not omit). Moonshot/Kimi can reject Cursor tool JSON Schema on inherit (`completed_subtitle.$ref` / `#/$defs/`). **Default light browser pin:** `cursor-grok-4.6-medium`. Prefer in-thread browser MCP (`cursor-ide-browser`) over a browser Task when available.
 
 **Audit pipeline carve-out (HARD) — resolve host first:**
-- **cursor:** `session-auditor` **must** pin `composer-2.5` (omit denied). Confirm **must** pin `cursor-grok-4.6-high` (allow `xhigh`; omit denied); fix **must** pin `cursor-grok-4.6-xhigh` (allow `high`). Hook `task_model_allowlist` enforces when present.
+- **cursor:** `session-auditor` **must** pin `composer-2.5` (omit denied). Confirm **must** pin `cursor-grok-4.6-high` (allow `xhigh`; omit denied); fix **must** pin `cursor-grok-4.6-xhigh` (allow `high`). `audit-solo` **must** pin `cursor-grok-4.6-xhigh` (allow `high`; omit denied). Hook `task_model_allowlist` enforces when present.
 - **grok / claude:** **omit model on every audit dispatch** — do not pin Cursor slugs, `grok-composer-*`, or force a model; let the host harness default. Use types/capability_mode from `dispatch-settings.yaml`.
 
 **Agent frontmatter is separate** for non-audit specialists — prefer omit Task `model` when parent is known allowlisted. No new frontmatter pin campaign that overrides host dispatch-settings.

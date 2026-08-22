@@ -38,6 +38,17 @@ hosts:
       deny_models: [composer-2.5, composer-2.5-fast, k3]
       confirm_readonly: true
       # fix: writable Task (no readonly)
+    audit_solo:
+      dispatch_tool: Task
+      subagent_type: audit-solo
+      escape_type: generalPurpose
+      prompt_from: .cursor/agents/audit-solo.md
+      model: cursor-grok-4.6-xhigh
+      model_optional: cursor-grok-4.6-high
+      model_policy: pin_required
+      allow_models: [cursor-grok-4.6-xhigh, cursor-grok-4.6-high]
+      deny_models: [composer-2.5, composer-2.5-fast, k3]
+      readonly: false
     notes: |
       Enforced by task_model_allowlist hook when present.
       Never bare grok-4.5-* / grok-4.6-* or Grok *-fast on Cursor Task.
@@ -89,6 +100,15 @@ hosts:
       allow_models: [omit]
       confirm_capability_mode: read-only
       fix_capability_mode: all
+    audit_solo:
+      dispatch_tool: spawn_subagent
+      subagent_type: general-purpose
+      escape_type: general-purpose
+      prompt_from: .cursor/agents/audit-solo.md
+      model: omit
+      model_policy: omit_always
+      capability_mode: all
+      readonly: false
     notes: |
       Grok runs harness defaults only. Parent model (often grok-4.6 via
       subagents.models / session) applies when model is omitted.
@@ -138,6 +158,13 @@ hosts:
     notes: |
       Stub — refine when Claude host is primary for these commands.
       Default is omit (Claude subscription routing), not Cursor slugs.
+    audit_solo:
+      dispatch_tool: Agent
+      subagent_type: general-purpose
+      prompt_from: .cursor/agents/audit-solo.md
+      model: omit
+      model_policy: omit_always
+      readonly: false
     iterate_finder:
       dispatch_tool: Agent
       subagent_type: general-purpose

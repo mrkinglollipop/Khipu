@@ -7,28 +7,31 @@ alwaysApply: false
 
 When Matt's request matches **audit intent**, load the matching skill before substantive work:
 
+- **`/audit`** or **audit your work** → `.cursor/skills/audit/SKILL.md` + `loop.md` **Solo audit loop** (one Grok; stamps push OK)
 - **`/verify-plan`** → `.cursor/skills/verify-plan/SKILL.md` + `.cursor/skills/audit/references/loop.md`
 - **`/oracle-retro`** → `.cursor/skills/oracle-retro/SKILL.md` only
-- **Everything else audit-intent** → `.cursor/skills/audit/SKILL.md` (+ `loop.md` when looping)
+- **Everything else audit-intent** → `.cursor/skills/audit/SKILL.md` (+ dual `loop.md` when `/myauditandfix`)
 
 ## Trigger (intent, not exact wording)
 
-Fire on: **audit**, **/audit**, **audit your work**, **session audit**, **audit what you just did**, **assess**, **health check**, **review the system**, **coverage audit**, **what's broken in**, **sanity check on**, **findings on** — investigation and a report, not bare implementation.
+Fire on: **audit**, **/audit**, **audit your work**, **audit our work**, **audit this work**, **session audit**, **audit what you just did**, **assess**, **health check**, **review the system**, **coverage audit**, **what's broken in**, **sanity check on**, **findings on** — investigation and a report, not bare implementation.
 
-**Audit + fix:** **/myauditandfix** (`.cursor/commands/myauditandfix.md`) — session track + fix authorized; pipeline in `loop.md` (default cap **3**; trailing `full` → 4; always-delta post-fix; empty-skip when both session critic children emit substituted sentinels). Also: **audit and fix**, **fix any issues** (with audit context).
+**Solo loop (fix + push OK):** **/audit** (`.cursor/commands/audit.md`) and informal **audit your work** — one Grok 4.6 `ROLE=solo_audit` agent per `loop.md` Solo audit loop (default cap **8**; trailing `full` thorough; `quick` cap 4). **Dispatch:** `audit_solo` in `.cursor/dispatch-settings.yaml` (Cursor pin `cursor-grok-4.6-xhigh`, allow `high`; **Grok/Claude omit always**; never Composer; never k3 as adjudicator).
+
+**Dual-critic loop (fix + push OK):** **/myauditandfix** (`.cursor/commands/myauditandfix.md`) — session track + fix authorized; pipeline in `loop.md` (default cap **3**; trailing `full` → 4; always-delta post-fix; empty-skip when both session critic children emit substituted sentinels). Also: **audit and fix**, **fix any issues** (with dual-audit context).
 
 **Oracle retro:** **/oracle-retro** — oracle-retro skill only (Closure Summary §9).
 
 **Verify plan:** **/verify-plan** — verify-plan skill + `loop.md`; plan-doc fixes only; does not unlock `git push`.
 
-**Session audit:** invoking thread only — not repo-wide `git diff`. **`TRACK=session`**. Prepr prepare on code sessions (Night School 465). **Dispatch:** `.cursor/dispatch-settings.yaml` (Cursor critics pin `composer-2.5`; confirm prefer `cursor-grok-4.6-high`; fix `cursor-grok-4.6-xhigh`; **Grok/Claude omit always**; never Composer; never k3 as adjudicator). **Bugbot:** default off.
+**Session audit:** invoking thread only — not repo-wide `git diff`. **`TRACK=session`**. Prepr prepare on code sessions (Night School 465). Dual dispatch: Cursor critics pin `composer-2.5`; confirm prefer `cursor-grok-4.6-high`; fix `cursor-grok-4.6-xhigh`; **Grok/Claude omit always**; never Composer; never k3 as adjudicator. Solo dispatch: `audit_solo` (above). **Bugbot:** default off.
 
 Do **not** load audit skill for: **/oracle-retro**, **`/verify-plan`** (verify-plan skill), explicit **`/review-bugbot`**, or security-only review.
 
 ## Hard constraints
 
-1. **Read-only by default** — fixes only when authorized (`/myauditandfix`, `/verify-plan` plan-docs, `/oracle-retro` encode, `and fix`, or `approved — build`)
-2. **Assessment first** — dual critics + confirm (or empty-skip per `loop.md`); §4 before fix writes; never confirm+write in one Task; same-turn Phase 2 when slash loop not green
+1. **Read-only by default** — fixes only when authorized (`/audit`, `audit your work`, `/myauditandfix`, `/verify-plan` plan-docs, `/oracle-retro` encode, `and fix`, or `approved — build`)
+2. **Assessment first** — **solo:** one Grok Task may audit+fix then re-audit in-loop; **dual:** dual critics + confirm (or empty-skip per `loop.md`); §4 before or with the loop payload; never confirm+write in one Task **on `/myauditandfix`**; same-turn continue when slash loop not green
 3. **Mandatory report sections** — Action summary → Verification ledger → Plan completion → Findings per audit skill §4 (`/oracle-retro` uses Closure Summary)
 4. **Scope first** — one-line in/out before fan-out
 5. **Delegate multi-area** — ≥2 independent areas → parallel Explore/Task
