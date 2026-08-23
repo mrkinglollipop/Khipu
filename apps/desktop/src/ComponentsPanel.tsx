@@ -23,14 +23,17 @@ type StatusPayload = {
   ok?: boolean;
   khipu_app?: string;
   cli?: string;
+  docker?: { ok?: boolean; error?: string };
   postgres?: {
     mode?: string;
+    source?: string;
     image?: string;
     server_version?: string;
     pgvector?: string;
     port?: number;
   };
-  graphify?: { semver?: string; path?: string };
+  postgres_probe?: { ok?: boolean; error?: string } | null;
+  graphify?: { semver?: string; path?: string; source?: string };
   postgres_upgrade?: UpgradeInfo | null;
   graphify_upgrade?: UpgradeInfo | null;
   error?: string;
@@ -82,9 +85,12 @@ export function ComponentsPanel() {
 
   const pg = status?.postgres;
   const gy = status?.graphify;
+  const docker = status?.docker;
+  const postgresProbe = status?.postgres_probe;
   const pgUp = status?.postgres_upgrade;
   const gyUp = status?.graphify_upgrade;
-  const pgRemote = pg?.mode === "remote";
+  const pgRemote = pg?.mode === "remote" || pg?.source === "dsn";
+  const gyExternal = gy?.source === "env";
 
   return (
     <div className="panel-body">
@@ -120,6 +126,14 @@ export function ComponentsPanel() {
               {pg.port ? <> on port <code>{pg.port}</code></> : null}
               {pg.pgvector ? <> · pgvector <code>{pg.pgvector}</code></> : null}
             </p>
+          ) : postgresProbe && postgresProbe.ok === false ? (
+            <p className="muted">
+              Could not reach the configured Postgres DSN: {postgresProbe.error ?? "unknown error"}.
+            </p>
+          ) : docker && docker.ok === false ? (
+            <p className="muted">
+              Docker not found — install Docker Desktop to set up local Postgres, or configure a remote DSN in Settings.
+            </p>
           ) : (
             <p className="muted">No local Postgres component installed yet.</p>
           )}
@@ -149,7 +163,12 @@ export function ComponentsPanel() {
       <div className="section-card">
         <div className="section-head">Graphify</div>
         <div className="section-body">
-          {gy?.semver ? (
+          {gyExternal ? (
+            <p className="muted">
+              External Graphify install — <code>{gy?.path ?? "?"}</code> (managed outside
+              the app; upgrades via the maintainer tree).
+            </p>
+          ) : gy?.semver ? (
             <p className="muted">
               Installed <code>{gy.semver}</code>
               {gy.path ? (
@@ -162,21 +181,23 @@ export function ComponentsPanel() {
           ) : (
             <p className="muted">Graphify not installed — finish Welcome → Graph first.</p>
           )}
-          <div className="toolbar">
-            <button
-              type="button"
-              className="primary"
-              disabled={busy != null || !gyUp?.available || !gy?.semver}
-              onClick={() => void runUpgrade("graphify")}
-            >
-              {busy === "graphify" ? (
-                <Loader2 size={14} className="spin" aria-hidden />
-              ) : null}
-              {gyUp?.available
-                ? `Upgrade to ${gyUp.target ?? "new version"}`
-                : "Graphify up to date"}
-            </button>
-          </div>
+          {gyExternal ? null : (
+            <div className="toolbar">
+              <button
+                type="button"
+                className="primary"
+                disabled={busy != null || !gyUp?.available || !gy?.semver}
+                onClick={() => void runUpgrade("graphify")}
+              >
+                {busy === "graphify" ? (
+                  <Loader2 size={14} className="spin" aria-hidden />
+                ) : null}
+                {gyUp?.available
+                  ? `Upgrade to ${gyUp.target ?? "new version"}`
+                  : "Graphify up to date"}
+              </button>
+            </div>
+          )}
         </div>
       </div>
 

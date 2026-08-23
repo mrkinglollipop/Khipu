@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { open as openDirectoryDialog } from "@tauri-apps/plugin-dialog";
 import {
   Blocks,
   ChevronRight,
@@ -1102,26 +1103,46 @@ export default function App() {
     [graphSourcesProducer, loadGraphSources],
   );
 
-  const addGraphCodeRoot = useCallback(async () => {
-    if (!graphSourcesProducer || !newCodeRoot.trim()) return;
-    setGraphSourcesMsg(null);
-    try {
-      const raw = await runKhipu([
-        "sources",
-        "add",
-        `--root=${newCodeRoot.trim()}`,
-      ]);
-      const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
-      if (!parsed?.ok) {
-        setGraphSourcesMsg(parsed?.error ?? "add failed");
-        return;
+  const addGraphCodeRootPath = useCallback(
+    async (path: string) => {
+      const trimmed = path.trim();
+      if (!graphSourcesProducer || !trimmed) return;
+      setGraphSourcesMsg(null);
+      try {
+        const raw = await runKhipu(["sources", "add", `--root=${trimmed}`]);
+        const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
+        if (!parsed?.ok) {
+          setGraphSourcesMsg(parsed?.error ?? "add failed");
+          return;
+        }
+        setNewCodeRoot("");
+        await loadGraphSources();
+      } catch (e) {
+        setGraphSourcesMsg(String(e));
       }
-      setNewCodeRoot("");
-      await loadGraphSources();
+    },
+    [graphSourcesProducer, loadGraphSources],
+  );
+
+  const addGraphCodeRoot = useCallback(
+    () => addGraphCodeRootPath(newCodeRoot),
+    [addGraphCodeRootPath, newCodeRoot],
+  );
+
+  const pickGraphCodeRoot = useCallback(async () => {
+    if (!graphSourcesProducer) return;
+    try {
+      const selected = await openDirectoryDialog({
+        directory: true,
+        multiple: false,
+      });
+      if (typeof selected === "string" && selected.trim()) {
+        await addGraphCodeRootPath(selected);
+      }
     } catch (e) {
       setGraphSourcesMsg(String(e));
     }
-  }, [graphSourcesProducer, newCodeRoot, loadGraphSources]);
+  }, [graphSourcesProducer, addGraphCodeRootPath]);
 
   const removeGraphSource = useCallback(
     async (id: string) => {
@@ -2346,8 +2367,10 @@ export default function App() {
                 </p>
                 {!graphSourcesProducer ? (
                   <p className="muted">
-                    Graph sources are configured on the Mac that builds
-                    graph.sqlite.
+                    This Mac is not the graph producer, so sources are
+                    read-only here. Make it the producer with{" "}
+                    <code>khipu jobs install graph_build</code> (or set{" "}
+                    <code>KHIPU_GRAPH_PRODUCER=1</code>).
                   </p>
                 ) : null}
                 <div className="rows">
@@ -2419,6 +2442,9 @@ export default function App() {
                     />
                     <button type="button" onClick={() => void addGraphCodeRoot()}>
                       Add code root
+                    </button>
+                    <button type="button" onClick={() => void pickGraphCodeRoot()}>
+                      Choose folder…
                     </button>
                   </div>
                 ) : null}
