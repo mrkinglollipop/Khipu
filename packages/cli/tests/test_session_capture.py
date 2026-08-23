@@ -96,6 +96,46 @@ class CodexReaderTest(unittest.TestCase):
             self.assertEqual(users, 1, msgs)
             self.assertEqual(msgs, [("user", "audit the UI"), ("tool", "shell"), ("assistant", "13 findings")])
 
+    def test_reads_response_item_only_rollouts_and_drops_injected_context(self):
+        # Codex desktop/app-server rollouts (2026-08) carry no event_msg turns at all.
+        with tempfile.TemporaryDirectory() as td:
+            tp = _write(Path(td) / "r.jsonl", [
+                {"type": "session_meta", "payload": {"id": "x"}},
+                {"type": "response_item", "payload": {"type": "message", "role": "developer", "content": [
+                    {"type": "input_text", "text": "<app-context>\n# Codex desktop context"}]}},
+                {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "<recommended_plugins>\n- A"},
+                    {"type": "input_text", "text": "# AGENTS.md instructions for /x\n\n<INSTRUCTIONS>..."},
+                    {"type": "input_text", "text": "<environment_context>\n  <cwd>/x</cwd>\n</environment_context>"}]}},
+                {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "<image name=[Image #1] path=\"/s.png\">"},
+                    {"type": "input_image", "image_url": "data:..."},
+                    {"type": "input_text", "text": "</image>"},
+                    {"type": "input_text", "text": "make the composer wider"}]}},
+                {"type": "response_item", "payload": {"type": "function_call", "name": "shell"}},
+                {"type": "response_item", "payload": {"type": "reasoning", "encrypted_content": "..."}},
+                {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "Shipped in PR #626."}]}},
+            ])
+            msgs, _, users = sc.read_window(tp, 0)
+            self.assertEqual(users, 1, msgs)
+            self.assertEqual(msgs, [("user", "make the composer wider"), ("tool", "shell"),
+                                    ("assistant", "Shipped in PR #626.")])
+
+    def test_rollout_with_both_shapes_counts_each_turn_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            tp = _write(Path(td) / "r.jsonl", [
+                {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "audit the UI"}]}},
+                {"type": "event_msg", "payload": {"type": "user_message", "message": "audit the UI"}},
+                {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "13 findings"}]}},
+                {"type": "event_msg", "payload": {"type": "agent_message", "message": "13 findings"}},
+            ])
+            msgs, _, users = sc.read_window(tp, 0)
+            self.assertEqual(users, 1, msgs)
+            self.assertEqual(msgs, [("user", "audit the UI"), ("assistant", "13 findings")])
+
 
 class HarnessInferenceTest(unittest.TestCase):
     def test_infers_each_harness_from_payload_and_env(self):

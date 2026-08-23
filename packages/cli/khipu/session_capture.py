@@ -225,6 +225,16 @@ def _clean_user_text(text: str) -> str:
     return _CURSOR_WRAP.sub("", text)   # no strip: ACP user text arrives in chunks that must re-join exactly
 
 
+# Parts Codex prepends to a user response_item that the user never typed:
+# AGENTS.md, environment/app context, plugin lists, and the <image> wrappers
+# around attached files (the typed text is its own part).
+_CODEX_INJECTED = re.compile(
+    r"\s*(# AGENTS\.md instructions\b|# Files mentioned by the user:|</?(?:image|recommended_plugins|"
+    r"environment_context|user_instructions|permissions instructions|app-context|collaboration_mode|"
+    r"skills_instructions|apps_instructions|plugins_instructions|multi_agent_mode|turn_aborted)\b)"
+)
+
+
 def _blocks_text(content: Any) -> tuple[str, list[str], bool]:
     """(text, tool markers, is_tool_result_only) for a Claude/Cursor/Codex
     message content — a string or a list of typed blocks."""
@@ -278,6 +288,18 @@ def _parse_line(d: dict) -> list[tuple[str, str]]:
             return [("assistant", p["message"])]
         if pt == "function_call":
             return [("tool", str(p.get("name") or "tool")[:160])]
+        if pt == "message" and d.get("type") == "response_item" and p.get("role") in ("user", "assistant"):
+            # Codex desktop / app-server rollouts (Aug 2026) write ONLY these —
+            # no event_msg user_message/agent_message at all. Emitted as a
+            # provisional role; read_window keeps them only when the window
+            # has no event_msg turns, so a rollout carrying both is not
+            # double counted. Injected context parts are dropped here.
+            parts = [b.get("text") for b in (p.get("content") or []) if isinstance(b, dict)
+                     and b.get("type") in ("input_text", "output_text") and isinstance(b.get("text"), str)]
+            if p["role"] == "user":
+                parts = [t for t in parts if not _CODEX_INJECTED.match(t)]
+            text = "\n".join(parts)
+            return [(f"codex:{p['role']}", text)] if text.strip() else []
         return []
     msg = d.get("message")
     if isinstance(msg, dict):
@@ -572,6 +594,7 @@ def read_window(path: Path, offset: int) -> tuple[list[tuple[str, str]], int, in
     if data and not data.endswith(b"\n"):  # partial trailing line: leave it for next time
         cut = data.rfind(b"\n")
         data, end = (data[:cut + 1], offset + cut + 1) if cut >= 0 else (b"", offset)
+    parsed: list[tuple[dict, str, str]] = []
     for raw in data.decode("utf-8", "replace").splitlines():
         raw = raw.strip()
         if not raw:
@@ -582,23 +605,34 @@ def read_window(path: Path, offset: int) -> tuple[list[tuple[str, str]], int, in
             continue
         if not isinstance(d, dict) or d.get("isMeta"):
             continue
-        for role, text in _parse_line(d):
-            if role == "user":
-                text = _clean_user_text(text)
-                if not text.strip():
-                    continue
-            if role == "tool":
-                msgs.append(("tool", text))
+        parsed.extend((d, role, text) for role, text in _parse_line(d))
+    # Codex rollouts: event_msg turns win; response_item turns are the
+    # fallback for rollouts that carry no event_msg at all.
+    has_event_turns = any(r in ("user", "assistant") and d.get("type") == "event_msg" for d, r, _ in parsed)
+    items: list[tuple[dict, str, str]] = []
+    for d, role, text in parsed:
+        if role.startswith("codex:"):
+            if has_event_turns:
                 continue
-            if msgs and msgs[-1][0] == role:
-                # ACP streams chunks (concatenate); the others emit whole
-                # messages (join on a newline).
-                sep = "" if isinstance(d.get("params"), dict) else "\n"
-                msgs[-1] = (role, msgs[-1][1] + sep + text)
-            else:
-                msgs.append((role, text))
-                if role == "user":
-                    users += 1
+            role = role[6:]
+        items.append((d, role, text))
+    for d, role, text in items:
+        if role == "user":
+            text = _clean_user_text(text)
+            if not text.strip():
+                continue
+        if role == "tool":
+            msgs.append(("tool", text))
+            continue
+        if msgs and msgs[-1][0] == role:
+            # ACP streams chunks (concatenate); the others emit whole
+            # messages (join on a newline).
+            sep = "" if isinstance(d.get("params"), dict) else "\n"
+            msgs[-1] = (role, msgs[-1][1] + sep + text)
+        else:
+            msgs.append((role, text))
+            if role == "user":
+                users += 1
     return msgs, end, users
 
 
