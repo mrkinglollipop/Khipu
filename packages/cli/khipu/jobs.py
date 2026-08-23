@@ -185,6 +185,9 @@ def _run_script(
     state_name: str,
 ) -> int:
     if script is None or not script.is_file():
+        # Record the failure so doctor/status do not keep reporting the last
+        # good exit after the script path stops resolving.
+        _write_job_state(state_name, 2)
         target = script if script is not None else "unset"
         raise FileNotFoundError(f"job script not found: {target}")
     out_log, err_log = _log_paths(log_stem)
@@ -236,6 +239,7 @@ def run_monthly(*, dry_run: bool = False) -> int:
 def run_graph_build() -> int:
     script = GRAPHIFY_NIGHTLY or graphify_nightly_path()
     if script is None:
+        _write_job_state("graph_build", 2)
         print(json.dumps(GRAPHIFY_NOT_INSTALLED))
         return 2
     return _run_script(script, log_stem="khipu-graph", state_name="graph_build")

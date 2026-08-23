@@ -66,10 +66,15 @@ PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
 [ -x "$PY" ] || PY="python3"
 STDIN_JSON=$(cat 2>/dev/null)
 export KHIPU_HOOK_STDIN="$STDIN_JSON"
+# Queue-only mode (KHIPU_CAPTURE_QUEUE_ONLY=1): run step 1 and nothing else.
+# Codex caps SessionEnd hooks at 3 s (default 1 s), which is enough to read the
+# transcript tail and write the job file, not to extract, mirror or embed. The
+# next Stop of any harness drains what this leaves behind.
 "$PY" - "$MEM" "${KHIPU_HARNESS:-}" <<'PY' 2>>"${HOME}/Library/Logs/khipu/stop-hook.log" || true
 import os
 import sys
 from pathlib import Path
+QUEUE_ONLY = os.environ.get("KHIPU_CAPTURE_QUEUE_ONLY") == "1"
 tag = f" harness={sys.argv[2]}" if len(sys.argv) > 2 and sys.argv[2] else ""
 try:
     # 1. Native capture for THIS session (harness inferred from the payload
@@ -81,6 +86,8 @@ try:
           f"{' ERROR ' + r['error'] if r.get('error') else ''}", file=sys.stderr)
 except Exception as e:  # noqa: BLE001 — fail-open, always
     print(f"[khipu-stop-hook] capture skipped: {type(e).__name__}: {e}", file=sys.stderr)
+if QUEUE_ONLY:
+    sys.exit(0)
 try:
     # 2. Drain the shared queue: this session's job lands now, not "later".
     from khipu.session_capture import drain, queued_jobs

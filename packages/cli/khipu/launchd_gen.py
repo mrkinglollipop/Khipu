@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape
 
 from khipu.components_matrix import application_support_dir, read_versions, write_versions
 from khipu.jobs import (
@@ -72,6 +73,28 @@ def render_context() -> dict[str, str]:
     }
 
 
+# Maintainer-style installs point jobs at scripts outside the bundle via env.
+# Whatever is set when the plist is rendered is baked in, otherwise the job
+# resolves only through versions.json and fails closed.
+PASSTHROUGH_ENV = (
+    "KHIPU_CONSOLIDATE_NIGHTLY",
+    "KHIPU_CONSOLIDATE_MONTHLY",
+    "KHIPU_GRAPHIFY_NIGHTLY",
+    "KHIPU_BUILD_INDEX",
+    "KHIPU_GRAPH_SNAPSHOT_DIR",
+)
+
+
+def render_extra_env(environ: dict[str, str] | None = None) -> str:
+    env = os.environ if environ is None else environ
+    lines = []
+    for key in PASSTHROUGH_ENV:
+        value = (env.get(key) or "").strip()
+        if value:
+            lines.append(f"\n\t\t<key>{key}</key>\n\t\t<string>{escape(value)}</string>")
+    return "".join(lines)
+
+
 def render_plist(job: str) -> bytes:
     template_name = _JOB_TEMPLATE.get(job)
     if not template_name:
@@ -86,6 +109,7 @@ def render_plist(job: str) -> bytes:
     spec = _JOB_SPECS.get(job, {})
     stem = str(spec.get("log_stem") or job)
     out_log, err_log = _log_paths(stem)
+    text = text.replace("{{EXTRA_ENV}}", render_extra_env())
     text = text.replace("{{STDOUT_LOG}}", str(out_log))
     text = text.replace("{{STDERR_LOG}}", str(err_log))
     return text.encode("utf-8")

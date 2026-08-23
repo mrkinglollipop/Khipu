@@ -107,6 +107,14 @@ def recall_hook() -> str:
     return _shim("khipu-recall-hook")
 
 
+CODEX_SESSIONEND_TIMEOUT = 3
+
+
+def codex_sessionend_hook() -> str:
+    """Queue-only shim invocation for Codex SessionEnd (3 s hard cap)."""
+    return f"env KHIPU_CAPTURE_QUEUE_ONLY=1 {stop_hook()}"
+
+
 # Cursor sessionStart must outlive a hub PG slice; harness session_start.sh stays at 5s.
 CURSOR_RECALL_TIMEOUT = 30
 
@@ -632,13 +640,24 @@ def _codex_install(dry: bool) -> dict:
     for event in ("Stop", "PreCompact", "SessionEnd"):
         entries = hooks.setdefault(event, [])
         flat = [x for e in entries for x in e.get("hooks", [])]
+        # Codex allows SessionEnd hooks at most 3 s (docs: default 1 s, max 3 s),
+        # so that entry only queues; the next Stop drains it.
+        want_cmd = codex_sessionend_hook() if event == "SessionEnd" else stop_hook()
+        want_timeout = CODEX_SESSIONEND_TIMEOUT if event == "SessionEnd" else 20
         if not any(_is_ours(x.get("command")) for x in flat):
-            entries.append({"hooks": [{"type": "command", "command": stop_hook(), "timeout": 20}]})
+            entries.append({"hooks": [{"type": "command", "command": want_cmd, "timeout": want_timeout}]})
             out["changes"].append(f"{CODEX_HOOKS}: hooks.{event} += khipu-stop-hook")
             changed = True
-        elif _repoint(flat, _is_ours, stop_hook()):
-            out["changes"].append(f"{CODEX_HOOKS}: hooks.{event} khipu-stop-hook -> {stop_hook()}")
-            changed = True
+        else:
+            for x in flat:
+                if not _is_ours(x.get("command")):
+                    continue
+                if x.get("command") != want_cmd or x.get("timeout") != want_timeout:
+                    x["command"] = want_cmd
+                    x["timeout"] = want_timeout
+                    out["changes"].append(
+                        f"{CODEX_HOOKS}: hooks.{event} khipu-stop-hook -> {want_cmd} (timeout={want_timeout})")
+                    changed = True
     ss = hooks.setdefault("SessionStart", [])
     flat = [x for e in ss for x in e.get("hooks", [])]
     if not any(_is_our_recall(x.get("command")) for x in flat):
