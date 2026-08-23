@@ -54,7 +54,26 @@ def graphify_nightly_path() -> Path | None:
     env_script = _env_script_path("KHIPU_GRAPHIFY_NIGHTLY")
     if env_script is not None and env_script.is_file():
         return env_script
+    # The desktop app and an interactive shell do not carry the launchd job's
+    # environment; the installed plist is the one place the maintainer path
+    # is recorded, so read it back from there.
+    plist_script = _plist_env_path(PLIST_GRAPH, "KHIPU_GRAPHIFY_NIGHTLY")
+    if plist_script is not None and plist_script.is_file():
+        return plist_script
     return None
+
+
+def _plist_env_path(label: str, key: str) -> Path | None:
+    import plistlib
+
+    try:
+        with open(_plist_path(label), "rb") as fh:
+            data = plistlib.load(fh)
+    except (OSError, ValueError):
+        return None
+    env = data.get("EnvironmentVariables") if isinstance(data, dict) else None
+    raw = str((env or {}).get(key) or "").strip() if isinstance(env, dict) else ""
+    return Path(raw) if raw else None
 
 
 # Patchable module attrs (tests); no maintainer-path install defaults.

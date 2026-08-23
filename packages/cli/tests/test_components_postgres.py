@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import unittest
 from unittest import mock
 
@@ -12,6 +13,7 @@ from khipu.components_postgres import (
     DOCKER_PULL_TIMEOUT_S,
     _local_dsn,
     _read_dsn_password_port,
+    components_status,
     install_local_postgres,
     upgrade_postgres,
 )
@@ -151,3 +153,83 @@ class LocalDsnPasswordTest(unittest.TestCase):
         ):
             result = upgrade_postgres()
         self.assertEqual(result, {"ok": False, "error": "dsn_password_missing"})
+
+
+class ComponentsStatusFallbackTest(unittest.TestCase):
+    def _base_stack(self, stack, versions):
+        stack.enter_context(
+            mock.patch("khipu.components_postgres.read_versions", return_value=versions)
+        )
+        stack.enter_context(
+            mock.patch(
+                "khipu.components_postgres.docker_available", return_value={"ok": True}
+            )
+        )
+        stack.enter_context(mock.patch("khipu.components_matrix.refresh_matrix_cache"))
+        stack.enter_context(
+            mock.patch("khipu.components_matrix.effective_matrix", return_value=([], {}))
+        )
+        stack.enter_context(
+            mock.patch("khipu.components_matrix.khipu_app_version", return_value="0.3.1")
+        )
+
+    def test_probes_remote_dsn_when_versions_json_has_no_postgres(self):
+        versions = {"graphify": {"semver": "1.0.0", "path": "/opt/graphify"}}
+        with contextlib.ExitStack() as stack:
+            self._base_stack(stack, versions)
+            probe = stack.enter_context(
+                mock.patch(
+                    "khipu.components_postgres.check_remote_postgres",
+                    return_value={"ok": True, "server_version": "19.1"},
+                )
+            )
+            result = components_status()
+        probe.assert_called_once_with(full=True)
+        self.assertEqual(result["postgres"]["mode"], "remote")
+        self.assertEqual(result["postgres"]["source"], "dsn")
+        self.assertEqual(result["postgres"]["server_version"], "19.1")
+        self.assertIsNone(result["postgres_upgrade"])
+        self.assertIsNone(result["postgres_probe"])
+
+    def test_records_probe_failure_without_writing_postgres_block(self):
+        versions = {"graphify": {"semver": "1.0.0", "path": "/opt/graphify"}}
+        with contextlib.ExitStack() as stack:
+            self._base_stack(stack, versions)
+            stack.enter_context(
+                mock.patch(
+                    "khipu.components_postgres.check_remote_postgres",
+                    return_value={"ok": False, "error": "connection_refused"},
+                )
+            )
+            result = components_status()
+        self.assertEqual(result["postgres"], {})
+        self.assertEqual(
+            result["postgres_probe"], {"ok": False, "error": "connection_refused"}
+        )
+
+    def test_falls_back_to_external_graphify_script(self):
+        versions = {"postgres": {"mode": "remote", "source": "dsn"}}
+        script = mock.Mock()
+        script.parent = "/opt/khipu-ops/graphify"
+        with contextlib.ExitStack() as stack:
+            self._base_stack(stack, versions)
+            nightly = stack.enter_context(
+                mock.patch("khipu.jobs.graphify_nightly_path", return_value=script)
+            )
+            result = components_status()
+        nightly.assert_called_once_with()
+        self.assertEqual(result["graphify"]["semver"], "external")
+        self.assertEqual(result["graphify"]["source"], "env")
+        self.assertEqual(result["graphify"]["path"], "/opt/khipu-ops/graphify")
+        self.assertIsNone(result["graphify_upgrade"])
+
+    def test_no_external_graphify_script_leaves_graphify_empty(self):
+        versions = {"postgres": {"mode": "remote", "source": "dsn"}}
+        with contextlib.ExitStack() as stack:
+            self._base_stack(stack, versions)
+            stack.enter_context(
+                mock.patch("khipu.jobs.graphify_nightly_path", return_value=None)
+            )
+            result = components_status()
+        self.assertEqual(result["graphify"], {})
+        self.assertIsNone(result["graphify_upgrade"])

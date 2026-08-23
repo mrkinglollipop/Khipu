@@ -165,7 +165,7 @@ def khipu_app_version() -> str:
     app = str(versions.get("khipu_app") or "").strip()
     if app:
         return app
-    return "0.3.0"
+    return "0.3.2"
 
 
 def is_forbidden_postgres_image(image: str) -> bool:

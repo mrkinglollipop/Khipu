@@ -43,8 +43,11 @@ class GraphifyPathTest(unittest.TestCase):
         self._env.stop()
         self.tmp.cleanup()
 
+    @mock.patch.object(jobs, "_plist_env_path", return_value=None)
     @mock.patch.object(jobs, "_application_support_dir")
-    def test_graphify_nightly_path_none_without_env_or_versions(self, support_dir):
+    def test_graphify_nightly_path_none_without_env_or_versions(self, support_dir, _plist):
+        # The installed launchd plist is the third resolution source; a fresh
+        # machine has none, which is what this test models.
         support_dir.return_value = self.app_support
         self.assertIsNone(jobs.graphify_nightly_path())
 
@@ -97,6 +100,7 @@ class GraphBuildCliTest(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if not k.startswith("KHIPU_")}
         env["PYTHONPATH"] = str(cli_root)
         env["KHIPU_DATA_DIR"] = str(self.dir / "data")
+        env["HOME"] = str(self.dir)  # no installed LaunchAgents plist to fall back to
         return subprocess.run(
             [sys.executable, "-m", "khipu.cli", "graph-build"],
             capture_output=True,

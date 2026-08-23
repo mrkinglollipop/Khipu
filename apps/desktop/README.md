@@ -4,8 +4,8 @@ P1d shell over `packages/cli/`.
 
 ## Install (recommended)
 
-Download **`Khipu_0.3.1_aarch64.dmg`** from the
-[v0.3.1 release](https://github.com/mrkinglollipop/Khipu/releases/tag/v0.3.1)
+Download **`Khipu_0.3.2_aarch64.dmg`** from the
+[v0.3.2 release](https://github.com/mrkinglollipop/Khipu/releases/tag/v0.3.2)
 (GitHub `/releases/latest` now points here), open it, and drag
 **Khipu.app** to **Applications**. Launch from Applications — the Welcome flow
 configures Postgres, models, Graphify, and agent integrations. The app bundle

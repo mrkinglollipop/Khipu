@@ -493,6 +493,31 @@ def components_status() -> dict[str, Any]:
     graphify = (
         versions.get("graphify") if isinstance(versions.get("graphify"), dict) else {}
     )
+
+    postgres_probe: dict[str, Any] | None = None
+    if not postgres:
+        probe = check_remote_postgres(full=True)
+        if probe.get("ok"):
+            postgres = {
+                "mode": "remote",
+                "source": "dsn",
+                "server_version": probe.get("server_version"),
+                "pgvector": probe.get("pgvector"),
+            }
+        else:
+            postgres_probe = {"ok": False, "error": probe.get("error")}
+
+    if not graphify:
+        from khipu.jobs import graphify_nightly_path
+
+        script = graphify_nightly_path()
+        if script is not None:
+            graphify = {
+                "semver": "external",
+                "path": str(script.parent),
+                "source": "env",
+            }
+
     rows, matrix_meta = effective_matrix(refresh=False)
     app = khipu_app_version()
     mode = str(postgres.get("mode") or "local_docker")
@@ -545,7 +570,7 @@ def components_status() -> dict[str, Any]:
 
     graphify_upgrade: dict[str, Any] | None = None
     current_gy = str(graphify.get("semver") or "")
-    if current_gy:
+    if current_gy and graphify.get("source") != "env":
         gy_candidates: list[dict[str, Any]] = []
         for row in rows:
             if not isinstance(row, dict):
@@ -585,6 +610,7 @@ def components_status() -> dict[str, Any]:
         "docker": docker,
         "pending": pending,
         "postgres": postgres,
+        "postgres_probe": postgres_probe,
         "graphify": graphify,
         "postgres_upgrade": postgres_upgrade,
         "graphify_upgrade": graphify_upgrade,
