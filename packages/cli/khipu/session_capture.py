@@ -767,8 +767,13 @@ def _heartbeat(harness: str, out: dict) -> None:
         beat["pending_turns"] = 0
         beat.pop("pending_since", None)
     elif turns:
-        beat["pending_turns"] = int(beat.get("pending_turns", 0)) + turns
-        beat.setdefault("pending_since", out["at"])
+        # new_turns is already the whole uncaptured window of THIS session
+        # (the offset only advances on a due capture), so it is a level, not a
+        # delta: summing it across runs double-counted every not-due Stop
+        # (1+2+3+4 for one four-turn session) and carried abandoned sessions'
+        # turns forever, which read as "cadence not firing" with nothing wrong.
+        beat["pending_turns"] = turns
+        beat["pending_since"] = out.get("pending_since") or out["at"]
     if out.get("error"):
         beat["last_error"] = out["error"]
         beat["last_error_at"] = out["at"]
@@ -842,6 +847,12 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                              elapsed_s=time.time() - float(st.get("last_ts") or 0),
                              stop_hook_active=bool(_get(env, "stopHookActive", "stop_hook_active", default=False)))
         out.update(due=due, reason=reason, new_turns=turns, new_chars=len(text))
+        if not due and turns:
+            # When this session's uncaptured window began (its last capture, or
+            # first sight) — liveness ages pending turns from here.
+            last = float(st.get("last_ts") or 0)
+            out["pending_since"] = datetime.fromtimestamp(last, tz=timezone.utc).isoformat(
+                timespec="seconds").replace("+00:00", "Z") if last else out["at"]
         if due:
             off_before = int(st.get("offset", 0))
             job = {"harness": harness, "session_id": sid, "cwd": session_cwd(env), "event": event,

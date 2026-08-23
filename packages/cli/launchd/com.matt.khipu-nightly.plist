@@ -17,7 +17,7 @@
 		<key>KHIPU_ROOT</key>
 		<string>{{KHIPU_ROOT}}</string>
 		<key>PYTHONPATH</key>
-		<string>{{PYTHONPATH}}</string>
+		<string>{{PYTHONPATH}}</string>{{EXTRA_ENV}}
 	</dict>
 	<key>WorkingDirectory</key>
 	<string>{{WORKING_DIRECTORY}}</string>

@@ -281,6 +281,28 @@ class LivenessTest(unittest.TestCase):
             self.assertTrue(sc.liveness("claude_code")["ok"])
 
 
+class PendingTurnsAccountingTest(unittest.TestCase):
+    """pending_turns is the current session's uncaptured window, not a running
+    sum: summing the cumulative new_turns of every not-due Stop (1+2+3+4) made
+    one ordinary four-turn session look like a stuck cadence (2026-08-22)."""
+
+    def test_not_due_stops_do_not_accumulate_across_runs(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            started = "2026-08-22T10:00:00Z"
+            for n in (1, 2, 3, 4):
+                sc._heartbeat("claude_code", {"at": sc._mint_ts(), "event": "stop", "session_id": "s1",
+                                              "due": False, "new_turns": n, "pending_since": started})
+            beat = sc._read_beat("claude_code")
+            self.assertEqual(beat["pending_turns"], 4)
+            self.assertEqual(beat["pending_since"], started)
+            # A second session replaces the level; it does not inherit s1's turns.
+            sc._heartbeat("claude_code", {"at": sc._mint_ts(), "event": "stop", "session_id": "s2",
+                                          "due": False, "new_turns": 1, "pending_since": "2026-08-22T11:00:00Z"})
+            beat = sc._read_beat("claude_code")
+            self.assertEqual(beat["pending_turns"], 1)
+            self.assertEqual(beat["pending_since"], "2026-08-22T11:00:00Z")
+
+
 class StopHookIntegrationTest(unittest.TestCase):
     """The shipped khipu-stop-hook, run the way a harness runs it (sh, stdin
     JSON), must capture natively: parse a Claude Code transcript, queue on
