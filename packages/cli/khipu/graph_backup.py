@@ -40,6 +40,15 @@ def _default_snapshot_dir() -> Path:
     raw = (os.environ.get("KHIPU_GRAPH_SNAPSHOT_DIR") or "").strip()
     if raw:
         return Path(raw)
+    # The launchd jobs carry KHIPU_GRAPH_SNAPSHOT_DIR in their plist env, but
+    # doctor also runs from shells and from the app, which do not. Read the
+    # installed plist so every context sees the same snapshot dir (same
+    # fallback jobs.py uses for KHIPU_GRAPHIFY_NIGHTLY).
+    from khipu.jobs import PLIST_GRAPH, _plist_env_path
+
+    plist_dir = _plist_env_path(PLIST_GRAPH, "KHIPU_GRAPH_SNAPSHOT_DIR")
+    if plist_dir is not None:
+        return plist_dir
     from khipu.paths import ensure_data_dir
 
     return ensure_data_dir() / "backups" / "graph"

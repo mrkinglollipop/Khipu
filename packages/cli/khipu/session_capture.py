@@ -881,6 +881,11 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                              elapsed_s=time.time() - float(st.get("last_ts") or 0),
                              stop_hook_active=bool(_get(env, "stopHookActive", "stop_hook_active", default=False)))
         out.update(due=due, reason=reason, new_turns=turns, new_chars=len(text))
+        # Where the hook's parse reached, and when — liveness compares the
+        # transcript against THIS, not its mtime: Aegis writes housekeeping
+        # (workflow_updated) into idle sessions' updates.jsonl, so mtime moves
+        # with no turn in it (2026-08-24 false red).
+        st.update(seen_end=new_off, seen_ts=time.time(), transcript_path=str(path))
         if not due and turns:
             # When this session's uncaptured window began (its last capture, or
             # first sight) — liveness ages pending turns from here.
@@ -896,11 +901,10 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
             p = enqueue(job)
             # Advance only after the job is on disk: a crash between the two
             # re-queues the same window (dedup at drain) rather than losing it.
-            st.update(offset=new_off, last_ts=time.time(), queued=int(st.get("queued", 0)) + 1,
-                      transcript_path=str(path))
-            save_state(harness, sid, st)
+            st.update(offset=new_off, last_ts=time.time(), queued=int(st.get("queued", 0)) + 1)
             out["queued"] = p.name
             _log(f"{harness}:{sid}: {event} due ({reason}) -> queued {p.name} ({turns} turns, {len(text)} chars)")
+        save_state(harness, sid, st)
     except Exception as e:  # noqa: BLE001 — a hook must never fail a session
         out["error"] = f"{type(e).__name__}: {e}"
         _log(f"{harness}:{sid or '?'}: hook error {out['error']}")
@@ -1028,39 +1032,48 @@ def status(harness: str = "aegis") -> dict:
             "sessions_tracked": len(list(state_dir().glob(f"{_safe(harness)}--*.json"))) if state_dir().is_dir() else 0}
 
 
-def transcript_activity(harness: str) -> tuple[float | None, str | None]:
-    """Newest mtime across the transcripts this harness is known to have, and
-    which one. Paths come from the per-session state files the hook itself
-    wrote, so nothing here has to guess a harness's storage layout."""
-    newest: float | None = None
-    which: str | None = None
+def _stopped_hook_evidence(harness: str) -> tuple[str | None, int | None]:
+    """(reason, seconds) when a session's transcript gained parseable turns
+    long after the hook last looked at it (its seen_ts/seen_end marker), or
+    (None, age) when the newest change is only unparseable housekeeping.
+    Sessions without a marker (pre-upgrade state files, so nothing records
+    where the hook's parse reached) are skipped rather than guessed at."""
     try:
         files = list(state_dir().glob(f"{_safe(harness)}--*.json"))
     except OSError:
         return None, None
-    # State files accumulate one per session forever, and this runs inside every
-    # `khipu doctor`. Only the newest handful can possibly be the live session,
-    # so bound the work instead of stat-ing months of history.
     if len(files) > ACTIVITY_SCAN_LIMIT:
         try:
             files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
         except OSError:
             pass
         files = files[:ACTIVITY_SCAN_LIMIT]
+    worst: tuple[int, str] | None = None
+    newer_s: int | None = None
     for f in files:
         try:
-            tp = json.loads(f.read_text(encoding="utf-8")).get("transcript_path")
+            st = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not tp:
+        tp, seen_ts = st.get("transcript_path"), st.get("seen_ts")
+        if not tp or not seen_ts:
             continue
         try:
-            m = Path(tp).stat().st_mtime
-        except OSError:
+            age = int(Path(tp).stat().st_mtime - float(seen_ts))
+        except (OSError, ValueError):
             continue
-        if newest is None or m > newest:
-            newest, which = m, tp
-    return newest, which
+        if age <= HOOK_SILENT_S:
+            continue
+        msgs, _, _ = read_window(Path(tp), int(st.get("seen_end", 0)))
+        if not msgs:                     # housekeeping only — not a stopped hook
+            newer_s = max(newer_s or 0, age)
+            continue
+        if worst is None or age > worst[0]:
+            worst = (age, tp)
+    if worst:
+        return (f"transcript changed {worst[0] // 60} min after the hook last ran "
+                f"({worst[1]}) — the hook has stopped firing"), worst[0]
+    return None, newer_s
 
 
 def liveness(harness: str) -> dict:
@@ -1106,15 +1119,15 @@ def liveness(harness: str) -> dict:
         pend >= STUCK_TURNS or (pend >= 1 and since is not None and since >= STUCK_MINUTES * 60)
     ):
         reasons.append(f"{pend} turn(s) over {(since or 0) // 60} min without a capture being due — cadence not firing")
-    # Has the harness been used since the hook last ran? Transcript mtime is the
-    # one signal that does not come from the hook itself, so it is the only thing
-    # that can catch the hook having stopped.
-    last_run = _parse_ts(beat.get("at"))
-    newest, which = transcript_activity(harness)
-    if last_run and newest and newest - last_run > HOOK_SILENT_S:
-        reasons.append(
-            f"transcript changed {int((newest - last_run) // 60)} min after the hook last ran "
-            f"({which}) — the hook has stopped firing")
+    # Has the harness been used since the hook last ran? The transcript is the
+    # one signal that does not come from the hook itself, so it is the only
+    # thing that can catch the hook having stopped. mtime alone is not enough:
+    # Aegis writes housekeeping (workflow_updated) into idle sessions, so the
+    # file moves with no turn in it. Red requires content past the hook's own
+    # seen_end marker that actually parses to messages.
+    stopped, newer_s = _stopped_hook_evidence(harness)
+    if stopped:
+        reasons.append(stopped)
     return {"harness": harness, "ok": not reasons, "seen": True, "reasons": reasons,
             "last_dispatch_at": beat.get("at"), "last_dispatch_age_s": _age(beat.get("at")),
             "last_event": beat.get("event"), "last_reason": beat.get("reason"),
@@ -1122,7 +1135,7 @@ def liveness(harness: str) -> dict:
             "last_captured_age_s": _age(beat.get("last_captured_at")),
             "captures": int(beat.get("captures", 0)), "dispatches": int(beat.get("dispatches", 0)),
             "pending_turns": pend, "queue_depth": q["depth"], "queue_oldest_age_s": q.get("oldest_age_s"),
-            "transcript_newer_than_hook_s": int(newest - last_run) if (last_run and newest) else None}
+            "transcript_newer_than_hook_s": newer_s}
 
 
 def liveness_all() -> dict:

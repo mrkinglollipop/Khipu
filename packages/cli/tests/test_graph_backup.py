@@ -51,6 +51,36 @@ class LocalHealthTest(unittest.TestCase):
             self.assertFalse(out["ok"])
 
 
+class DefaultSnapshotDirTest(unittest.TestCase):
+    """Doctor runs from shells and from the app with no KHIPU_* env; the
+    installed graph plist is the one place the snapshot dir is always recorded
+    (2026-08-24: shell/app doctor red on the ~/.config default while the real
+    dir held a fresh snapshot)."""
+
+    def test_env_wins_then_plist_then_config_default(self):
+        import plistlib
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            la = home / "Library" / "LaunchAgents"
+            la.mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                 mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("KHIPU_GRAPH_SNAPSHOT_DIR", None)
+                from khipu.jobs import PLIST_GRAPH
+                with open(la / f"{PLIST_GRAPH}.plist", "wb") as fh:
+                    plistlib.dump({"Label": PLIST_GRAPH, "EnvironmentVariables":
+                                   {"KHIPU_GRAPH_SNAPSHOT_DIR": "/backups/graph"}}, fh)
+                self.assertEqual(graph_backup._default_snapshot_dir(), Path("/backups/graph"))
+                os.environ["KHIPU_GRAPH_SNAPSHOT_DIR"] = str(home / "env-dir")
+                try:
+                    self.assertEqual(graph_backup._default_snapshot_dir(), home / "env-dir")
+                finally:
+                    os.environ.pop("KHIPU_GRAPH_SNAPSHOT_DIR", None)
+                (la / f"{PLIST_GRAPH}.plist").unlink()
+                out = graph_backup._default_snapshot_dir()
+                self.assertTrue(str(out).endswith("backups/graph"), out)
+
+
 class OffsiteDueTest(unittest.TestCase):
     def test_never_ok_is_due(self):
         now = datetime(2026, 8, 19, tzinfo=timezone.utc)

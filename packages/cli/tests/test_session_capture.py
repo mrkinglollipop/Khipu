@@ -257,9 +257,10 @@ class LivenessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, _home(td):
             tr = Path(td) / "session.jsonl"
             tr.write_text('{"type":"user","message":{"role":"user","content":"hi"}}\n')
-            sc.save_state("claude_code", "s1", {"offset": 0, "last_ts": 0, "transcript_path": str(tr)})
-            # Hook last ran two hours before the transcript was last written to.
+            # Hook last looked two hours before the transcript was last written to.
             hook_at = time.time() - sc.HOOK_SILENT_S - 600
+            sc.save_state("claude_code", "s1", {"offset": 0, "last_ts": 0, "transcript_path": str(tr),
+                                                "seen_end": 0, "seen_ts": hook_at})
             self._beat("claude_code", at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(hook_at)),
                        pending_turns=0, captures=3)
             lv = sc.liveness("claude_code")
@@ -273,14 +274,15 @@ class LivenessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, _home(td):
             tr = Path(td) / "session.jsonl"
             tr.write_text('{"type":"user","message":{"role":"user","content":"hi"}}\n')
-            sc.save_state("cursor", "s1", {"offset": 0, "last_ts": 0, "transcript_path": str(tr)})
             hook_at = time.time() - (sc.HOOK_SILENT_S // 2)
+            sc.save_state("cursor", "s1", {"offset": 0, "last_ts": 0, "transcript_path": str(tr),
+                                           "seen_end": 0, "seen_ts": hook_at})
             self._beat("cursor", at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(hook_at)))
             self.assertTrue(sc.liveness("cursor")["ok"])
 
     def test_a_missing_or_unrecorded_transcript_never_invents_a_reason(self):
         with tempfile.TemporaryDirectory() as td, _home(td):
-            sc.save_state("codex", "s1", {"offset": 0, "last_ts": 0,
+            sc.save_state("codex", "s1", {"offset": 0, "last_ts": 0, "seen_end": 0, "seen_ts": 1.0,
                                           "transcript_path": str(Path(td) / "gone.jsonl")})
             sc.save_state("codex", "s2", {"offset": 0, "last_ts": 0})   # no path recorded
             self._beat("codex", at="2026-01-01T00:00:00Z")
@@ -297,22 +299,55 @@ class LivenessTest(unittest.TestCase):
             sc.hook_main(json.dumps(env), "claude_code")
             st = sc.load_state("claude_code", "sx")
             self.assertEqual(st["transcript_path"], str(tr))
+            self.assertEqual(st["seen_end"], tr.stat().st_size)
+            self.assertGreater(st["seen_ts"], 0)
 
-    def test_activity_scan_is_bounded_and_still_finds_the_live_session(self):
+    def test_housekeeping_after_the_hook_is_not_a_stopped_hook(self):
+        """Aegis appends workflow_updated lines to idle sessions' updates.jsonl;
+        the mtime moves but no turn arrives (2026-08-24 false red)."""
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            tr = Path(td) / "updates.jsonl"
+            turn = '{"timestamp": 1, "method": "session/update", "params": {"update": '                    '{"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "hi"}}}}\n'
+            tr.write_text(turn)
+            hook_at = time.time() - sc.HOOK_SILENT_S - 600
+            sc.save_state("aegis", "s1", {"offset": 0, "last_ts": 0, "transcript_path": str(tr),
+                                          "seen_end": tr.stat().st_size, "seen_ts": hook_at})
+            with tr.open("a") as fh:   # housekeeping only, hours after the hook
+                fh.write('{"timestamp": 2, "method": "session/update", "params": {"update": '
+                         '{"sessionUpdate": "workflow_updated"}}}\n')
+            self._beat("aegis", at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(hook_at)))
+            lv = sc.liveness("aegis")
+            self.assertTrue(lv["ok"], lv["reasons"])
+            self.assertGreater(lv["transcript_newer_than_hook_s"], sc.HOOK_SILENT_S)
+            with tr.open("a") as fh:   # now a real turn with still no hook run: red
+                fh.write(turn)
+            self.assertIn("stopped firing", " ".join(sc.liveness("aegis")["reasons"]))
+
+    def test_pre_upgrade_state_without_a_seen_marker_is_skipped(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            tr = Path(td) / "session.jsonl"
+            tr.write_text('{"type":"user","message":{"role":"user","content":"hi"}}\n')
+            hook_at = time.time() - sc.HOOK_SILENT_S - 600
+            sc.save_state("aegis", "s1", {"offset": 0, "last_ts": 0, "transcript_path": str(tr)})
+            self._beat("aegis", at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(hook_at)))
+            self.assertTrue(sc.liveness("aegis")["ok"])
+
+    def test_evidence_scan_is_bounded_and_still_sees_the_live_session(self):
         """State files are never pruned and this runs inside every doctor."""
         with tempfile.TemporaryDirectory() as td, _home(td):
-            old = Path(td) / "old.jsonl"
-            old.write_text("x\n")
-            os.utime(old, (time.time() - 86400,) * 2)
+            old_tr = Path(td) / "old.jsonl"
+            old_tr.write_text("x\n")
+            os.utime(old_tr, (time.time() - 86400,) * 2)
             for i in range(sc.ACTIVITY_SCAN_LIMIT + 15):
-                sc.save_state("claude_code", f"old{i}", {"offset": 0, "transcript_path": str(old)})
+                sc.save_state("claude_code", f"old{i}", {"offset": 0, "transcript_path": str(old_tr),
+                                                         "seen_end": 0, "seen_ts": time.time()})
                 os.utime(sc._state_file("claude_code", f"old{i}"), (time.time() - 86400 - i,) * 2)
             live = Path(td) / "live.jsonl"
-            live.write_text("y\n")
-            sc.save_state("claude_code", "live", {"offset": 0, "transcript_path": str(live)})
-            newest, which = sc.transcript_activity("claude_code")
-            self.assertEqual(which, str(live))
-            self.assertIsNotNone(newest)
+            live.write_text('{"type":"user","message":{"role":"user","content":"hi"}}\n')
+            sc.save_state("claude_code", "live", {"offset": 0, "transcript_path": str(live),
+                                                  "seen_end": 0, "seen_ts": time.time() - sc.HOOK_SILENT_S - 600})
+            reason, age = sc._stopped_hook_evidence("claude_code")
+            self.assertIn(str(live), reason or "")
 
     def test_hook_error_older_than_a_later_successful_queue_is_not_red(self):
         with tempfile.TemporaryDirectory() as td, _home(td):
