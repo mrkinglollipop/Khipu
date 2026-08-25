@@ -277,6 +277,8 @@ EOF
     exit 1
   fi
   RELEASE_NOTES=$(cat <<EOF
+${KHIPU_RELEASE_NOTES:-}
+
 Khipu $VERSION — portable macOS arm64.
 
 **Install:** download \`Khipu_${VERSION}_aarch64.dmg\`, drag Khipu.app to Applications, complete Welcome (local PostgreSQL 19 via Docker Desktop, or a remote PG 19 DSN).
@@ -293,4 +295,13 @@ EOF
   # Prove the feed the app polls actually serves this version.
   curl -fsSL "https://github.com/$RELEASE_REPO/releases/latest/download/latest.json" \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print('served version:', d['version'], '->', d['platforms']['darwin-aarch64']['url'])"
+  STUDIO="${KING_LOLLIPOP_STUDIO:-/Volumes/Cloud Storage/Code/king-lollipop-studio}"
+  if [[ -d "$STUDIO/tools/x_post" ]]; then
+    echo "==> X draft in studio (not published)"
+    if ! (cd "$STUDIO" && python3 -m tools.x_post draft-from-github --app khipu --tag "$TAG" --commit --push); then
+      echo "warning: X draft failed (GitHub release $TAG is already live)" >&2
+    fi
+  else
+    echo "warning: studio not at $STUDIO; skip X draft (set KING_LOLLIPOP_STUDIO)" >&2
+  fi
 fi
