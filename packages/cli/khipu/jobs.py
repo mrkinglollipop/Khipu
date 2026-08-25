@@ -261,7 +261,34 @@ def run_graph_build() -> int:
         _write_job_state("graph_build", 2)
         print(json.dumps(GRAPHIFY_NOT_INSTALLED))
         return 2
-    return _run_script(script, log_stem="khipu-graph", state_name="graph_build")
+    rc = _run_script(script, log_stem="khipu-graph", state_name="graph_build")
+    if rc == 0:
+        _offsite_if_due()
+    return rc
+
+
+def _offsite_if_due() -> None:
+    """Weekly offsite copy of the newest graph snapshot, piggybacked on the
+    graph job because nothing else schedules it — `khipu graph-backup offsite`
+    had run exactly once, by hand, before this (2026-08-25). Failures are
+    recorded by run_offsite as ops_events (doctor's graph_offsite reads them)
+    and must never fail the build whose snapshot they copy."""
+    from khipu import graph_backup
+
+    try:
+        last_ok = graph_backup._last_ok_time("graph_snapshot_offsite")
+        now = datetime.now(timezone.utc)
+        if not graph_backup.offsite_due(last_ok=last_ok, now=now):
+            return
+        out = graph_backup.run_offsite()
+    except Exception as exc:  # noqa: BLE001
+        out = {"ok": False, "reason": str(exc)}
+    try:
+        out_log, _ = _log_paths("khipu-graph")
+        with open(out_log, "ab") as f:
+            f.write(f"offsite: {json.dumps(out, default=str)[:600]}\n".encode())
+    except OSError:
+        pass
 
 
 def run_build_index() -> int:

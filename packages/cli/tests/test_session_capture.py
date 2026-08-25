@@ -319,9 +319,33 @@ class LivenessTest(unittest.TestCase):
             lv = sc.liveness("aegis")
             self.assertTrue(lv["ok"], lv["reasons"])
             self.assertGreater(lv["transcript_newer_than_hook_s"], sc.HOOK_SILENT_S)
-            with tr.open("a") as fh:   # now a real turn with still no hook run: red
-                fh.write(turn)
+            with tr.open("a") as fh:   # now a user prompt with still no hook run: red
+                fh.write('{"timestamp": 3, "method": "session/update", "params": {"update": '
+                         '{"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "next"}}}}\n')
             self.assertIn("stopped firing", " ".join(sc.liveness("aegis")["reasons"]))
+
+    def test_an_assistant_only_tail_is_the_flush_race_not_a_stopped_hook(self):
+        """Aegis writes the turn's final agent_message_chunk and turn_completed
+        AFTER the stop hook has read the file, so seen_end lands mid-turn. If
+        the session then goes idle and housekeeping later moves the mtime, the
+        only content past the marker is assistant-side (2026-08-25 false red).
+        A genuinely dead hook would be sitting on the user's prompts too."""
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            tr = Path(td) / "updates.jsonl"
+            tr.write_text('{"timestamp": 1, "method": "session/update", "params": {"update": '
+                          '{"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "hi"}}}}\n')
+            hook_at = time.time() - sc.HOOK_SILENT_S - 600
+            sc.save_state("aegis", "s1", {"offset": 0, "last_ts": 0, "transcript_path": str(tr),
+                                          "seen_end": tr.stat().st_size, "seen_ts": hook_at})
+            with tr.open("a") as fh:   # the raced flush: assistant text, then housekeeping
+                fh.write('{"timestamp": 2, "method": "session/update", "params": {"update": '
+                         '{"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "OK"}}}}\n'
+                         '{"timestamp": 3, "method": "session/update", "params": {"update": '
+                         '{"sessionUpdate": "workflow_updated"}}}\n')
+            self._beat("aegis", at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(hook_at)))
+            lv = sc.liveness("aegis")
+            self.assertTrue(lv["ok"], lv["reasons"])
+            self.assertGreater(lv["transcript_newer_than_hook_s"], sc.HOOK_SILENT_S)
 
     def test_pre_upgrade_state_without_a_seen_marker_is_skipped(self):
         with tempfile.TemporaryDirectory() as td, _home(td):
