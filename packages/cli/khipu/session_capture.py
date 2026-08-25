@@ -1033,11 +1033,12 @@ def status(harness: str = "aegis") -> dict:
 
 
 def _stopped_hook_evidence(harness: str) -> tuple[str | None, int | None]:
-    """(reason, seconds) when a session's transcript gained parseable turns
-    long after the hook last looked at it (its seen_ts/seen_end marker), or
-    (None, age) when the newest change is only unparseable housekeeping.
-    Sessions without a marker (pre-upgrade state files, so nothing records
-    where the hook's parse reached) are skipped rather than guessed at."""
+    """(reason, seconds) when a session's transcript gained a USER turn the
+    hook never saw, long after it last looked (its seen_ts/seen_end marker) —
+    a dead hook sits on the user's prompts. (None, age) when the change is
+    housekeeping or assistant-only. Sessions without a marker (pre-upgrade
+    state files, so nothing records where the hook's parse reached) are
+    skipped rather than guessed at."""
     try:
         files = list(state_dir().glob(f"{_safe(harness)}--*.json"))
     except OSError:
@@ -1064,8 +1065,13 @@ def _stopped_hook_evidence(harness: str) -> tuple[str | None, int | None]:
             continue
         if age <= HOOK_SILENT_S:
             continue
-        msgs, _, _ = read_window(Path(tp), int(st.get("seen_end", 0)))
-        if not msgs:                     # housekeeping only — not a stopped hook
+        _, _, users = read_window(Path(tp), int(st.get("seen_end", 0)))
+        if not users:
+            # No user prompt past the marker. An assistant-only tail is the
+            # stop hook racing the writer — Aegis flushes the turn's final
+            # chunk and turn_completed after the hook has read the file
+            # (2026-08-25 false red) — while a dead hook would be sitting
+            # on user prompts too. Housekeeping-only tails land here as well.
             newer_s = max(newer_s or 0, age)
             continue
         if worst is None or age > worst[0]:

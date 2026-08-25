@@ -92,6 +92,52 @@ class JobsRunTest(unittest.TestCase):
         self.assertEqual(captured[0][1], str(self.script))
 
 
+class OffsiteIfDueTest(unittest.TestCase):
+    """The weekly offsite copy rides the graph job; nothing else schedules it."""
+
+    def _graph_build(self, *, rc: int):
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "graphify.py"
+            script.write_text("pass\n", encoding="utf-8")
+            with mock.patch.object(jobs, "GRAPHIFY_NIGHTLY", script), \
+                 mock.patch.object(jobs, "_run_script", return_value=rc), \
+                 mock.patch.object(jobs, "_offsite_if_due") as off:
+                out = jobs.run_graph_build()
+        return out, off
+
+    def test_successful_build_runs_offsite(self):
+        rc, off = self._graph_build(rc=0)
+        self.assertEqual(rc, 0)
+        off.assert_called_once_with()
+
+    def test_failed_build_skips_offsite(self):
+        rc, off = self._graph_build(rc=1)
+        self.assertEqual(rc, 1)
+        off.assert_not_called()
+
+    def test_offsite_runs_only_when_due_and_never_raises(self):
+        from khipu import graph_backup
+        with tempfile.TemporaryDirectory() as td:
+            logs = (Path(td) / "g.out.log", Path(td) / "g.err.log")
+            with mock.patch.object(jobs, "_log_paths", return_value=logs):
+                with mock.patch.object(graph_backup, "_last_ok_time", return_value=None), \
+                     mock.patch.object(graph_backup, "run_offsite",
+                                       return_value={"ok": True, "dest": "r2:x"}) as run:
+                    jobs._offsite_if_due()   # no prior ok -> due
+                    run.assert_called_once()
+                self.assertIn("offsite:", logs[0].read_text())
+                from datetime import datetime, timezone
+                with mock.patch.object(graph_backup, "_last_ok_time",
+                                       return_value=datetime.now(timezone.utc)), \
+                     mock.patch.object(graph_backup, "run_offsite") as run:
+                    jobs._offsite_if_due()   # fresh ok -> not due
+                    run.assert_not_called()
+                with mock.patch.object(graph_backup, "_last_ok_time",
+                                       side_effect=RuntimeError("db down")):
+                    jobs._offsite_if_due()   # errors are logged, never raised
+                self.assertIn("db down", logs[0].read_text())
+
+
 class PlistLoadedTest(unittest.TestCase):
     def test_launchctl_nonzero_is_not_loaded_even_if_plist_exists(self):
         with tempfile.TemporaryDirectory() as td:
