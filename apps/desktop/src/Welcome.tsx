@@ -741,11 +741,28 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
           {dbMode === "join" ? (
             <>
               <p className="muted">
-                On the hub Mac: Settings → Set up another Mac — export a join kit or
-                advertise nearby with a PIN. Import the <code>.khipujoin</code> file
-                (AirDrop works) or enter the PIN to find that Mac on the LAN. Tailscale
-                or VPN is optional when the hub is already reachable.
+                Use this on the <strong>new</strong> Mac. The Mac that already has
+                Khipu working stays on Settings → <strong>Set up another Mac</strong>.
+                Both Macs need the <strong>same passphrase</strong>. Same Wi‑Fi for
+                nearby join (not a guest / client-isolated network).
               </p>
+              <ol className="welcome-list muted">
+                <li>
+                  On the working Mac: Settings → Set up another Mac → enter a passphrase
+                  → click <strong>Advertise nearby (PIN)</strong> and leave that screen open.
+                </li>
+                <li>On this Mac: enter that same passphrase below.</li>
+                <li>
+                  Type the 6-digit PIN shown on the working Mac, then{" "}
+                  <strong>Find nearby Mac</strong>. If macOS asks for Local Network access,
+                  allow it.
+                </li>
+                <li>
+                  Prefer a file? On the working Mac click <strong>Save join kit…</strong>,
+                  AirDrop the <code>.khipujoin</code> file here, then{" "}
+                  <strong>Import join kit file…</strong> (same passphrase).
+                </li>
+              </ol>
               <div className="toolbar" style={{ width: "100%" }}>
                 <input
                   className="mono"
@@ -754,36 +771,38 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                   spellCheck={false}
                   value={joinPassphrase}
                   onChange={(e) => setJoinPassphrase(e.target.value)}
-                  placeholder="Join passphrase (same on both Macs)"
+                  placeholder="Same passphrase as the other Mac"
                   aria-label="Join passphrase"
                 />
               </div>
-              <div className="toolbar">
-                <button
-                  type="button"
-                  className="primary"
-                  disabled={joinBusy || !joinPassphrase.trim()}
-                  onClick={() => void importJoinFromFile()}
-                >
-                  {joinBusy ? "Importing…" : "Import join kit file…"}
-                </button>
-              </div>
-              <p className="muted">Or find a Mac nearby (Bonjour + TLS — best-effort on macOS):</p>
+              <p className="muted" style={{ marginTop: "0.75rem" }}>
+                Nearby wireless (same Wi‑Fi):
+              </p>
               <div className="toolbar" style={{ width: "100%" }}>
                 <input
                   className="mono"
                   value={joinPin}
                   onChange={(e) => setJoinPin(e.target.value.replace(/\D/g, "").slice(0, 6))}
-                  placeholder="6-digit PIN"
+                  placeholder="6-digit PIN from the other Mac"
                   aria-label="Nearby join PIN"
                   maxLength={6}
                 />
                 <button
                   type="button"
+                  className="primary"
                   disabled={joinBusy || !joinPassphrase.trim() || joinPin.length !== 6}
                   onClick={() => void receiveJoinNearby()}
                 >
                   {joinBusy ? "Connecting…" : "Find nearby Mac"}
+                </button>
+              </div>
+              <div className="toolbar">
+                <button
+                  type="button"
+                  disabled={joinBusy || !joinPassphrase.trim()}
+                  onClick={() => void importJoinFromFile()}
+                >
+                  {joinBusy ? "Importing…" : "Import join kit file…"}
                 </button>
               </div>
               {joinExpected ? (

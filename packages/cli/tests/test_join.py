@@ -67,7 +67,7 @@ class SslrootcertRewriteTest(unittest.TestCase):
         out = j.rewrite_dsn_sslrootcert(dsn, "/tmp/khipu/root.crt")
         self.assertIn("sslrootcert=", out)
         qs = parse_qs(urlsplit(out).query)
-        self.assertEqual(unquote(qs["sslrootcert"][0]), "/tmp/khipu/root.crt")
+        self.assertEqual(unquote(qs["sslrootcert"][0]), str(Path("/tmp/khipu/root.crt").resolve()))
         self.assertIn("sslmode=verify-full", out)
 
 
@@ -109,7 +109,33 @@ class VerifyLiveCountsTest(unittest.TestCase):
             out = j.verify_live_counts({"episodes": 42, "topics": 1, "nodes": 9})
         self.assertFalse(out["ok"])
         self.assertIn("hub.example:5432", out["error"])
-        self.assertIn("not a join-kit file problem", out["error"])
+        self.assertIn("unreachable", out["error"])
+
+    def test_cert_missing_error_not_blamed_on_tailscale(self) -> None:
+        err = RuntimeError(
+            'root certificate file "/Users/matthewsc" does not exist'
+        )
+        with (
+            mock.patch.object(j, "_fetch_live_counts", side_effect=err),
+            mock.patch.object(j, "_dsn_host_port", return_value="100.1.2.3:5433"),
+        ):
+            out = j.verify_live_counts({"episodes": 1, "topics": 1, "nodes": 1})
+        self.assertFalse(out["ok"])
+        self.assertIn("TLS/certificate", out["error"])
+        self.assertIn("not a Tailscale routing failure", out["error"])
+        self.assertNotIn("hub must be reachable", out["error"])
+
+    def test_ssl_syscall_timeout_is_network_not_cert(self) -> None:
+        err = RuntimeError("SSL SYSCALL error: Operation timed out")
+        with (
+            mock.patch.object(j, "_fetch_live_counts", side_effect=err),
+            mock.patch.object(j, "_dsn_host_port", return_value="100.1.2.3:5433"),
+        ):
+            out = j.verify_live_counts({"episodes": 1, "topics": 1, "nodes": 1})
+        self.assertFalse(out["ok"])
+        self.assertIn("unreachable", out["error"])
+        self.assertNotIn("TLS/certificate", out["error"])
+        self.assertIn("hub must be reachable", out["error"])
 
 
 class ImportKitApplyTest(unittest.TestCase):
@@ -157,7 +183,7 @@ class ImportKitApplyTest(unittest.TestCase):
             from urllib.parse import parse_qs, unquote, urlsplit
 
             qs = parse_qs(urlsplit(rewritten).query)
-            self.assertEqual(unquote(qs["sslrootcert"][0]), str(cert))
+            self.assertEqual(unquote(qs["sslrootcert"][0]), str(cert.resolve()))
             self.assertNotIn("/old/mac/root.crt", rewritten)
             set_gemini.assert_called_once_with("g-secret")
             set_mode.assert_called_once_with("hub")
@@ -166,6 +192,41 @@ class ImportKitApplyTest(unittest.TestCase):
             self.assertNotIn("gemini_api_key", summary)
             self.assertTrue(summary["has_gemini_api_key"])
             self.assertEqual((data / "dsn").read_text().strip(), rewritten)
+
+    def test_import_refuses_verify_full_without_pem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            data.mkdir()
+            payload = {
+                "format": j.FORMAT_VERSION,
+                "database_url": (
+                    "postgres://u:pw@remote.example/khipu?sslmode=verify-full"
+                    "&sslrootcert=/old/mac/root.crt"
+                ),
+                "capture_mode": "hub",
+                "expected": {"episodes": 1, "topics": 1, "nodes": 1},
+                "created_at": "2026-08-27T00:00:00+00:00",
+            }
+            blob = j.encrypt_payload(payload, "join-pass")
+            with (
+                mock.patch("khipu.paths.data_dir", return_value=data),
+                mock.patch("khipu.paths.ensure_data_dir", return_value=data),
+                mock.patch("khipu.paths.dsn_file", return_value=data / "dsn"),
+                mock.patch(
+                    "khipu.paths.root_cert_file", return_value=data / "root.crt"
+                ),
+            ):
+                with self.assertRaises(ValueError) as ctx:
+                    j.import_kit(blob, "join-pass")
+            self.assertIn("root_crt_pem", str(ctx.exception))
+
+    def test_rewrite_percent_encodes_slashes(self) -> None:
+        dsn = "postgres://u:p@h/db?sslmode=verify-full"
+        out = j.rewrite_dsn_sslrootcert(
+            dsn, "/Users/matthewschwartz/.config/khipu/root.crt"
+        )
+        self.assertIn("sslrootcert=%2FUsers%2F", out)
+        self.assertNotIn("sslrootcert=/Users/", out)
 
 
 if __name__ == "__main__":

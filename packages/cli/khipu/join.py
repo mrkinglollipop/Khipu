@@ -8,6 +8,7 @@ import json
 import os
 import secrets
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 
@@ -24,13 +25,52 @@ def is_localhost_dsn(dsn: str) -> bool:
 
 
 def rewrite_dsn_sslrootcert(dsn: str, cert_path: str) -> str:
+    """Point ``sslrootcert`` at ``cert_path`` (percent-encoded for libpq URIs)."""
     parts = urlsplit(dsn)
     query = parse_qs(parts.query, keep_blank_values=True)
-    query["sslrootcert"] = [str(cert_path)]
+    # Absolute path — relative / foreign-Mac paths blow up on the joining machine.
+    query["sslrootcert"] = [str(Path(cert_path).expanduser().resolve())]
     flat = {key: values[-1] for key, values in query.items()}
+    # quote_via=quote with urlencode's safe='' percent-encodes '/' so libpq
+    # does not truncate the path (seen as sslrootcert=/Users/matthewsc…).
     new_query = urlencode(flat, quote_via=quote)
     return urlunsplit(
         (parts.scheme, parts.netloc, parts.path, new_query, parts.fragment)
+    )
+
+
+def dsn_requires_sslrootcert(dsn: str) -> bool:
+    mode = (parse_qs(urlsplit(dsn).query).get("sslmode") or [""])[0].lower()
+    return mode.startswith("verify")
+
+
+def classify_hub_connect_error(exc: BaseException, loc: str) -> str:
+    """Distinguish TLS/cert misconfig from real network unreachability."""
+    text = str(exc)
+    low = text.lower()
+    # Do not match generic "ssl " — libpq "SSL SYSCALL error: … timed out"
+    # is a network failure, not a missing root.crt.
+    certish = (
+        "root certificate" in low
+        or "sslrootcert" in low
+        or "certificate file" in low
+        or "certificate verify" in low
+        or "unknown ca" in low
+        or "self signed certificate" in low
+        or "certificate has expired" in low
+    )
+    if certish:
+        return (
+            f"TLS/certificate problem talking to {loc}: {text}. "
+            "The hub network path may be fine — this Mac needs a valid local "
+            "root.crt and sslrootcert in the DSN. Re-export the join kit from the "
+            "working Mac (Settings → Set up another Mac) so the certificate is "
+            "included, then import again. This is not a Tailscale routing failure."
+        )
+    return (
+        f"{loc} unreachable ({type(exc).__name__}: {text}) — "
+        "the hub must be reachable (Tailscale, VPN, SSH tunnel, or shared server); "
+        "this is not a join-kit passphrase problem"
     )
 
 
@@ -209,7 +249,24 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
     root_pem = payload.get("root_crt_pem")
     if isinstance(root_pem, str) and root_pem.strip():
         cert_path.write_text(root_pem.strip() + "\n", encoding="utf-8")
+        try:
+            cert_path.chmod(0o600)
+        except OSError:
+            pass
+    elif dsn_requires_sslrootcert(dsn):
+        raise ValueError(
+            "join kit is missing the hub TLS root certificate (root_crt_pem). "
+            "On the working Mac confirm Settings data folder has root.crt "
+            "(usually ~/.config/khipu/root.crt), export the join kit again, "
+            "then re-import on this Mac."
+        )
+    # Always retarget sslrootcert to THIS Mac — never keep the exporter's path.
+    if cert_path.is_file():
         dsn = rewrite_dsn_sslrootcert(dsn, str(cert_path))
+    elif "sslrootcert" in parse_qs(urlsplit(dsn).query):
+        raise ValueError(
+            f"sslrootcert is set but {cert_path} was not written — cannot join"
+        )
 
     set_dsn(dsn)
     _write_dsn_file(dsn)
@@ -255,11 +312,7 @@ def verify_live_counts(expected: dict[str, int]) -> dict[str, Any]:
                 f"{key}: expected {exp[key]}, got 0"
                 for key in ("episodes", "topics", "nodes")
             ],
-            "error": (
-                f"{loc} unreachable ({type(exc).__name__}: {exc}) — "
-                "the hub must be reachable (Tailscale, VPN, SSH tunnel, or shared server); "
-                "this is not a join-kit file problem"
-            ),
+            "error": classify_hub_connect_error(exc, loc),
         }
     mismatches: list[str] = []
     for key in ("episodes", "topics", "nodes"):
