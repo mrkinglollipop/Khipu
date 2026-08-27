@@ -2,14 +2,15 @@
 name: verify-plan
 description: >-
   Audit and verify the plan in the invoking thread; loop plan-document fixes until
-  green (default cap 3; trailing full → 4). Use for /verify-plan, audit and verify
-  your plan, verify the plan. Uses audit/SKILL.md §4 report format. Authorizes
-  plan/todo edits only — not app code or harness encode.
+  green (default cap 3; trailing full → 4). Use for /verify-plan (dual),
+  /verify-plan-v2 (one Grok), audit and verify your plan, verify the plan.
+  Uses audit/SKILL.md §4 report format. Authorizes plan/todo edits only —
+  not app code or harness encode.
 ---
 
 # Verify plan
 
-**Mode:** read-only Phase 1; Phase 2 authorized only by **`/verify-plan`** (trailing `audit-only` skips Phase 2).
+**Mode:** read-only Phase 1; Phase 2 authorized by **`/verify-plan`** or **`/verify-plan-v2`** (trailing `audit-only` skips Phase 2).
 
 **Not** `/myauditandfix` · **Not** `/oracle-retro`.
 
@@ -21,13 +22,13 @@ description: >-
 - **In scope** — plan claims, dependencies, acceptance criteria, contradictions, stale paths, freshness
 - **Out of scope** — implementing plan items, app/harness source edits, repo-wide git diff
 - **Track** — **`TRACK=plan`** on every dispatch
-- **Depth** — per `loop.md` (slash default HIGH/MEDIUM cap 3; `full` / `quick`)
+- **Depth** — per `loop.md` (dual slash default HIGH/MEDIUM cap 3; `/verify-plan-v2` solo cap 8; `full` / `quick`)
 
 If no plan artifact: say so in Action summary; do not invent a plan.
 
 ## 1–2. Pipeline
 
-Follow `loop.md` with `TRACK=plan`: identifier freshness (`identifier_freshness.py`) → dual critics → confirm (or slim confirm when empty) → §4 → same-turn plan-only fix → **always-delta** post-fix.
+Follow `loop.md` with `TRACK=plan`. **`/verify-plan`:** identifier freshness → dual critics → confirm → §4 → same-turn plan-only fix → **always-delta**. **`/verify-plan-v2`:** identifier freshness → one `ROLE=solo_audit` Task → §4 → re-hire until green (Solo plan loop).
 
 **Plan lenses:** contradictions, missing acceptance criteria, wrong paths, unverified assumptions as fact, freshness failures, documented≠enforced.
 
@@ -54,9 +55,10 @@ Does **not** authorize `approved — build` for implementation. Does **not** unl
 
 ## Anti-patterns
 
-- Implementing plan items under `/verify-plan`
+- Implementing plan items under `/verify-plan` or `/verify-plan-v2`
 - Using session file-set scope instead of plan artifacts
-- Solo-audit; confirm+fix in one Task
+- Solo-audit **on `/verify-plan`** (full dual path); confirm+fix in one Task **on `/verify-plan`**
+- Dual critics **on `/verify-plan-v2`**
 - Green without post-fix re-audit when Phase 2 ran
 - Skipping `loop.md` always-delta rule
 

@@ -1,9 +1,9 @@
 ---
-name: audit
-description: Session audit (this thread) with one Grok agent; loop audit→fix until green (default cap 8; trailing full / quick / audit-only)
+name: myauditandfix-v2
+description: Compact one-Grok session audit+fix until green; stamps push OK (cap 8)
 ---
 
-# Session audit (solo)
+# Compact session audit (one Grok)
 
 **Authorizes fix phase** for work in **this thread only**. Load and follow:
 

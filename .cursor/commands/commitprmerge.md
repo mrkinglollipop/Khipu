@@ -48,11 +48,11 @@ Operate in the git repo containing the cwd (`git rev-parse --show-toplevel`). **
 
 ## Push-audit gate (HARD — read before push)
 
-`beforeShellExecution` → `push_audit_gate.py` **allows `git commit`, denies `git push`** until this conversation has a green `/audit` or `/myauditandfix` marker (or bypass).
+`beforeShellExecution` → `push_audit_gate.py` **allows `git commit`, denies `git push`** until this conversation has a green `/myauditandfix-v2` or `/myauditandfix` marker (or bypass).
 
 | Marker | Meaning |
 |--------|---------|
-| `/tmp/.cursor_audit_ok_<conversation_id>` | Stop stamped after `Green: Y` (+ Task pipeline evidence when `/audit` or `/myauditandfix` is pending) |
+| `/tmp/.cursor_audit_ok_<conversation_id>` | Stop stamped after `Green: Y` (+ Task pipeline evidence when `/myauditandfix-v2` or `/myauditandfix` is pending) |
 | `/tmp/.cursor_audit_ok_ws_<workspace>` | Workspace-root fallback OK |
 | Bypass phrases | Matt says `push without audit` / `skip audit` / `bypass push audit` **anywhere in the prompt** (inline is enough). Option-list / INCOMPLETE dual-phrase pastes do not stamp |
 | Kill switch | `touch /tmp/.cursor_push_audit_disable` |
@@ -73,7 +73,7 @@ Do **not** invent bypass markers. Bypass phrases stamp when they appear in Matt'
 
 **Preflight (before `git push`):** check for OK/bypass markers, cloud fail-open, or expect transcript fallback; if the previous push was denied, stop with **INCOMPLETE** — do not retry push in a loop, do not claim "committed and done."
 
-Preferred recovery: end a turn with Loop summary `Green: Y` after `/audit` or `/myauditandfix`, run `stamp_ok` when cloud/no-transcript, then re-run `/commitprmerge` (or Matt says a bypass phrase anywhere in the prompt).
+Preferred recovery: end a turn with Loop summary `Green: Y` after `/myauditandfix-v2` or `/myauditandfix`, run `stamp_ok` when cloud/no-transcript, then re-run `/commitprmerge` (or Matt says a bypass phrase anywhere in the prompt).
 
 ## What to ship (default scope)
 
@@ -126,8 +126,8 @@ When continuing unpushed commits already on a feature branch, **stay on that bra
 2. **Branch** — fresh branch off updated `main` (step above), unless continuing an existing feature branch with unpushed commits.
 3. **Stage + security gate** — stage in-scope files; `git diff --cached --name-only`; abort on secrets or unintended paths. (Skip if continue-from-push.)
 4. **Commit** — `git commit -m "<type>: <summary>"` where `<type>` is `memory` for claude-os-workspace memory-only, else `feat`, `fix`, or `chore` inferred from the diff. Summary from trailing text or diff. (Skip if continue-from-push.)
-5. **Push** — `git push -u origin HEAD`. On `push_audit_gate` deny → **INCOMPLETE** (commits local only); tell Matt to finish `/audit` or `/myauditandfix` green or bypass; **do not** claim shipped.
-6. **Prepr evidence reuse (code ships)** — when shipping code files (py, ts, swift, etc.): **do not** run `prepr_audit.py`. Read the latest `/audit` or `/myauditandfix` prepr prepare evidence from **this conversation's transcript** (completed `--worktree --prepare` run, fingerprint, bundle attached to the solo Task or critics). This step is a **transcript read, not a mechanical marker check** — the mechanical gate is `push_audit_gate` on `Green: Y` at step 5. If the transcript has no current Green:Y with completed prepr prepare evidence for the code being shipped → **INCOMPLETE**; tell Matt to run `/audit` or `/myauditandfix` (prepr is that command's oracle, not commit/PR). Docs-only / no-code ships: prepr **N/A**.
+5. **Push** — `git push -u origin HEAD`. On `push_audit_gate` deny → **INCOMPLETE** (commits local only); tell Matt to finish `/myauditandfix-v2` or `/myauditandfix` green or bypass; **do not** claim shipped.
+6. **Prepr evidence reuse (code ships)** — when shipping code files (py, ts, swift, etc.): **do not** run `prepr_audit.py`. Read the latest `/myauditandfix-v2` or `/myauditandfix` prepr prepare evidence from **this conversation's transcript** (completed `--worktree --prepare` run, fingerprint, bundle attached to the solo Task or critics). This step is a **transcript read, not a mechanical marker check** — the mechanical gate is `push_audit_gate` on `Green: Y` at step 5. If the transcript has no current Green:Y with completed prepr prepare evidence for the code being shipped → **INCOMPLETE**; tell Matt to run `/myauditandfix-v2` or `/myauditandfix` (prepr is that command's oracle, not commit/PR). Docs-only / no-code ships: prepr **N/A**.
 7. **Open PR** — `gh pr create --base main --title "<type>: <summary>" --body "…"`. Cloud Agent fallback: `ManagePullRequest` `action: create_pr` when `gh pr create` fails with integration permissions.
 8. **Merge gate (repo-specific)**
    - **iOS / native green lane (non-BugBot):** for iOS/macOS app ships, require session-scoped changes, a green local build oracle when the session touched native code, `/myauditandfix` prepr evidence from this transcript for code ships, and a human checkpoint before merge when the repo's ship norms require it. Do **not** open Memory BugBot runbooks from this command — BugBot stays opt-in only.

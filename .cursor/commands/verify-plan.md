@@ -16,6 +16,6 @@ description: Audit and verify the plan in this thread; loop plan-document fixes 
 
 **Depth:** slash default = HIGH/MEDIUM, cap **3**; trailing `full` → thorough + cap **4**; trailing `quick` (Matt only) → cap **2** (still runs identifier freshness). Trailing `audit-only` skips Phase 2. No plan in thread → report and stop.
 
-Does **not** clear `/myauditandfix` push PENDING and does **not** unlock `git push`.
+Does **not** clear session-audit push PENDING and does **not** unlock `git push`.
 
 Orchestrator remains hub — identifier freshness → dual critics + verifier per `loop.md`; do not solo-audit.

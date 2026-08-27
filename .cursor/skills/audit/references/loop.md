@@ -2,7 +2,9 @@
 
 Shared by `/myauditandfix` (`TRACK=session`) and `/verify-plan` (`TRACK=plan`). Skills own scope, fix allowlists, and §4 meaning; this file owns waves, green, delta, packs, and host dispatch.
 
-**Solo Grok loop** (`/audit`, informal `audit your work`): see **Solo audit loop** below — one agent, stamps push OK, not dual critics.
+**Solo Grok loop** (`/myauditandfix-v2`, informal `audit your work`, leftover `/audit`): see **Solo audit loop** below — one agent, stamps push OK, not dual critics.
+
+**Solo plan loop** (`/verify-plan-v2`): see **Solo plan loop** below — one agent, `TRACK=plan`, does **not** stamp push.
 
 ## Host dispatch (HARD)
 
@@ -22,7 +24,8 @@ Every critic/verifier Task prompt must include `ROLE=` / `TRACK=` / `fix_authori
 | Slash default (`/myauditandfix`, `/verify-plan`) | HIGH/MEDIUM only (skip LOW enumeration) | **3** |
 | Trailing `full` | thorough (include LOW) | **4** |
 | Trailing `quick` (Matt-invoked only) | HIGH/MEDIUM only; Freshness free oracles only | **2** |
-| Informal `audit your work` / slash `/audit` | HIGH/MEDIUM (see Solo audit loop) | **8** (solo, not dual) |
+| Informal `audit your work` / slash `/myauditandfix-v2` (legacy `/audit`) | HIGH/MEDIUM (see Solo audit loop) | **8** (solo, not dual) |
+| Slash `/verify-plan-v2` | HIGH/MEDIUM (see Solo plan loop) | **8** (solo, not dual) |
 
 Never self-select `quick` absent Matt's words.
 
@@ -37,7 +40,7 @@ Never self-select `quick` absent Matt's words.
    - **Missing script run blocks Green:Y** on `/verify-plan` except when notes contain `NO_IDENTIFIERS`.
    - **Always-delta plan track:** re-run the script if Phase 2 edited the plan; attach new notes even when critics are skipped.
    - **Delta confirm AC (`TRACK=plan`):** re-read `/tmp/plan_freshness_<round>.md`; rebuild Verification ledger from current `claim_id`s; set `ESCALATE_FULL_REAUDIT=true` if a previously **verified** identifier is now `ZERO_HITS` or a recant slice contradicts a plan sentence asserting a live hook. Missing notes file on plan delta **blocks Green:Y**.
-2. **Prepr prepare** (code `/myauditandfix` only) — Night School 465: repo-local `prepr_audit.py --worktree --prepare --json --path <each session code path>` before round-1 critics and again after each Phase 2 before confirm/delta. Docs-only → `prepr: N/A`. Exit 2/3 or missing run blocks Green:Y. Never a Green substitute.
+2. **Prepr prepare** (code session audit: `/myauditandfix` dual **and** `/myauditandfix-v2` solo) — Night School 465: repo-local `prepr_audit.py --worktree --prepare --json --path <each session code path>` before round-1 critics (dual) or the first solo Task, and again after each fix round. Docs-only → `prepr: N/A`. Exit 2/3 or missing run blocks Green:Y. Never a Green substitute.
 3. **Round 1:** parallel dual critics (`ROLE=bug_hunt` + `ROLE=claim_bust`) with the skill's TRACK.
 4. **Empty-confirm skip (session track / push gate):** when **both** matching critic **subagent** transcripts contain the **substituted** sentinel `No findings for ROLE=<role>, TRACK=session.` (values filled — not the `<role>`/`<track>` placeholder), and the transcript-shape spike/hook path is live, orchestrator may synthesize §4 + ledger and stamp green **without** a confirm Task — **first-green / single-green only**. Keep the **multi-green gate**: if ≥2 `Green:Y`, a confirm Task must appear **after** the prior green. Join is **latest-per-ROLE / same-wave only** with live critic validation (`session-auditor` + `composer-2.5` + `TRACK=session` in prompt / escape hatch). **`TRACK=plan` must not satisfy `/myauditandfix` empty-skip or `push_audit_gate`.** Fail closed if child jsonl missing. Orchestrator prose (`CONFIRM_SKIP`) never counts. Fallback when skip unavailable: slim confirm (`cursor-grok-4.6-high`, verdict-only).
 5. **Any finding → confirm** (`fix_authorized=false`) — independent adjudicator; never confirm+fix in one Task.
@@ -71,7 +74,7 @@ Pack must include: scope block, TRACK, file/plan set, load-bearing claims, plan/
 ## Anti-patterns (loop)
 
 - Merge `bug_hunt` + `claim_bust` into one critic
-- Confirm+fix in one Task (dual path only — solo `/audit` may audit+fix in one Task)
+- Confirm+fix in one Task (dual path only — solo `/myauditandfix-v2` / `/verify-plan-v2` may audit+fix in one Task)
 - Skip confirm when critics agree on MEDIUMs (judge still required)
 - Honor-system `CONFIRM_SKIP` prose as Push OK evidence
 - Satisfy myaudit empty-skip / push gate with `TRACK=plan`
@@ -79,14 +82,14 @@ Pack must include: scope block, TRACK, file/plan set, load-bearing claims, plan/
 - Stamp a later `Green:Y` from stale round-1 empty sentinels
 - End turn on Phase 2 without post-fix re-audit
 - Treat `NEW_HIGH_FROM_FIX: false` as green
-- Dual critics on `/audit` / `audit your work`
+- Dual critics on `/myauditandfix-v2` / `audit your work` / `/verify-plan-v2`
 - Composer or k3 pin on the solo Grok Task (Cursor)
 
-## Solo audit loop (`/audit`)
+## Solo audit loop (`/myauditandfix-v2`)
 
-Owned by **`/audit`** and informal **audit your work**. Dual-critic waves above stay for `/myauditandfix` and `/verify-plan`.
+Owned by **`/myauditandfix-v2`** and informal **audit your work** (legacy slash `/audit` still routes here). Dual-critic waves above stay for `/myauditandfix` and `/verify-plan`.
 
-This path **stamps push OK** on `Green: Y` when the solo pipeline Task exists (`audit_marker.py`). **Latest session-audit invocation wins:** a later `/audit` (or informal audit your/our/this work) overrides an earlier `/myauditandfix`. Both commands in the **same** user message still count as dual.
+This path **stamps push OK** on `Green: Y` when the solo pipeline Task exists (`audit_marker.py`). **Latest session-audit invocation wins:** a later `/myauditandfix-v2` (or informal audit your/our/this work) overrides an earlier `/myauditandfix`. Both full and compact session commands in the **same** user message still count as dual. A later **plan-only** `/verify-plan` / `/verify-plan-v2` clears leftover session kind so plan verify cannot piggyback a prior session pipeline (and still does **not** stamp push). Same-message session+plan still counts as session.
 
 ### Host dispatch (HARD)
 
@@ -142,3 +145,34 @@ Stop/push OK requires a Task tool_use with:
 - `subagent_type` `audit-solo` or escape `generalPurpose` / `explore` / omitted
 
 Prose-only "I ran solo audit" never stamps. Dual-critic Tasks do **not** satisfy this path.
+
+## Solo plan loop (`/verify-plan-v2`)
+
+Owned by **`/verify-plan-v2`**. Dual-critic waves above stay for `/verify-plan`. Same `audit_solo` dispatch as the session compact path, but **`TRACK=plan`**.
+
+This path does **not** stamp push OK (`ROLE=solo_audit` + `TRACK=plan` is not the session push pipeline). Same-message `/verify-plan` + `/verify-plan-v2` → run the **dual** plan path (conservative).
+
+### Host dispatch (HARD)
+
+Same table as **Solo audit loop** (`audit_solo`). Every Task prompt must include `ROLE=solo_audit` / `TRACK=plan` / `fix_authorized=` **in the prompt text**.
+
+### Depth and round cap
+
+Same caps as Solo audit loop (default **8**; `quick` → **4**; `audit-only` skips Phase 2).
+
+### Wave shape (HARD)
+
+1. **Identifier freshness** — run `identifier_freshness.py` before the solo Task (same invoke as dual `/verify-plan`, including Matt `quick`). Missing notes without `NO_IDENTIFIERS` blocks Green:Y. Re-run after Phase 2 plan edits.
+2. **Hire one solo Task** (`ROLE=solo_audit`, `TRACK=plan`). Prefer **one Task that loops internally** (audit → plan-doc fixes → re-audit). `fix_authorized=true` unless `audit-only`. Fix allowlist = verify-plan skill (plan docs / todos only).
+3. **Mandatory §4 report** to Matt from the agent payload after each hire returns.
+4. **Same-turn re-hire** when not green, not stop-early, and under cap.
+5. **Post-fix re-audit mandatory (HARD):** Green:Y only after the latest payload shows zero HIGH/MEDIUM **after** any fixes in that Task.
+
+Parent does **not** hire `session-auditor` or `audit-verifier` on this path. Confirm+fix in one Task is **allowed here**.
+
+### Green / stop-early
+
+**Green** when the latest solo payload has zero HIGH/MEDIUM, plan completion gates pass per verify-plan skill, freshness notes are current (or `NO_IDENTIFIERS`), and post-fix re-audit ran when fixes ran.
+
+**Stop-early — Blocked on Matt** and **Loop summary** `Green: Y|N` — same as Solo audit loop.
+
