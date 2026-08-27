@@ -62,13 +62,17 @@ Flags:
 ```bash
 cd apps/desktop
 ./scripts/release_macos.sh --install    # copy build to /Applications/Khipu.app
-./scripts/release_macos.sh --publish    # gh release create (versioned DMG + Khipu_aarch64.dmg + tarball + sig + latest.json)
+./scripts/release_macos.sh --publish    # gh release create + kinglollipop.com verify
 ```
 
 `--publish` requires `gh` auth, a **public** `KHIPU_RELEASE_REPO` (defaults to
 origin), a version bump in `src-tauri/tauri.conf.json`, `package.json`, and
 `src-tauri/Cargo.toml`, and a **stapled** DMG (`xcrun stapler validate`). The
-script refuses private repos (updater fetches unauthenticated).
+script refuses private repos (updater fetches unauthenticated). After
+`gh release create` it bumps kinglollipop.com Khipu copy and the
+`_redirects` DMG pin (studio `scripts/bump_khipu_site.py`), deploys Pages, and
+`scripts/verify_khipu_website.py` must see that version on the page plus a
+working `/khipu/download` 302. `KHIPU_SKIP_SITE=1` skips that gate.
 
 Notarization env (required for `release_macos.sh` to exit 0):
 
