@@ -1202,6 +1202,12 @@ def cmd_components(args: argparse.Namespace) -> int:
                 refresh=not getattr(args, "no_refresh", False),
             )
         )
+    if action == "ensure-docker":
+        from khipu.docker_runtime import ensure_docker
+
+        return _print_component_result(
+            ensure_docker(install=bool(getattr(args, "install", False)))
+        )
     if action == "install-local-postgres":
         from khipu.components_postgres import install_local_postgres
 
@@ -1797,6 +1803,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use bundled ∪ cache only; do not fetch khipu-compat",
     )
     scr.set_defaults(func=cmd_components, components_cmd="select-compat-row")
+
+    ed = comp_sub.add_parser(
+        "ensure-docker",
+        help="Find/start Docker, or download Docker Desktop (--install)",
+    )
+    ed.add_argument(
+        "--install",
+        action="store_true",
+        help="Download Docker Desktop from desktop.docker.com if no runtime is present",
+    )
+    ed.set_defaults(func=cmd_components, components_cmd="ensure-docker")
 
     comp_sub.add_parser(
         "install-local-postgres",

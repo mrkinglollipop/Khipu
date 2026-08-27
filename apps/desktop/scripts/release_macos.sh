@@ -12,6 +12,8 @@
 # After build, the portable bundle carries CLI + Python under Contents/Resources/khipu
 # (bundle_cli.sh). Do not inject Info.plist LSEnvironment — that tied releases to
 # the builder checkout and Homebrew python.
+#
+# --selftest-dmg-layout  dummy .app → UDZO with Applications alias; no signing.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -29,14 +31,154 @@ RELEASE_REPO="${KHIPU_RELEASE_REPO:-$(gh repo view --json nameWithOwner -q .name
 VERSION="$(python3 -c "import json; print(json.load(open('$DESKTOP/src-tauri/tauri.conf.json'))['version'])")"
 PUBLISH=0
 INSTALL_APPS=0
+SELFTEST_DMG=0
 
 for arg in "$@"; do
   case "$arg" in
     --publish) PUBLISH=1 ;;
     --install) INSTALL_APPS=1 ;;
+    --selftest-dmg-layout) SELFTEST_DMG=1 ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
+
+# Drag-to-Applications installer window (Murmur make-dmg.sh pattern). Tauri's
+# first DMG has the Applications alias; we recreate after re-sign, so the
+# alias + Finder icon layout have to live here or the shipped image is a
+# lone .app and strangers never see "drag this into Applications".
+DMG_VOLNAME="Khipu"
+
+stage_dmg_payload() {
+  local app="$1"
+  local stage="$2"
+  ditto "$app" "$stage/Khipu.app"
+  ln -s /Applications "$stage/Applications"
+}
+
+detach_dmg_volume() {
+  local volpath="/Volumes/${DMG_VOLNAME}"
+  if [[ -e "$volpath" ]]; then
+    hdiutil detach "$volpath" -quiet 2>/dev/null || hdiutil detach "$volpath" -force -quiet 2>/dev/null || true
+  fi
+}
+
+# Icon view: Khipu.app left, Applications right. Fail-soft — the alias is
+# load-bearing; positions are nicety. Finder addresses the volume by name
+# (must mount at /Volumes/Khipu, not a custom mountpoint).
+layout_dmg_finder_window() {
+  osascript <<EOF
+tell application "Finder"
+  tell disk "${DMG_VOLNAME}"
+    open
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    set the bounds of container window to {200, 120, 860, 520}
+    set theViewOptions to the icon view options of container window
+    set arrangement of theViewOptions to not arranged
+    set icon size of theViewOptions to 128
+    set position of item "Khipu.app" of container window to {180, 170}
+    set position of item "Applications" of container window to {480, 170}
+    update without registering applications
+    delay 1
+    close
+  end tell
+end tell
+EOF
+}
+
+verify_dmg_drag_install() {
+  local dmg_path="$1"
+  local mnt
+  mnt="$(mktemp -d /tmp/khipu-dmg-verify-XXXXXX)"
+  if ! hdiutil attach "$dmg_path" -nobrowse -readonly -mountpoint "$mnt" >/dev/null; then
+    rmdir "$mnt" 2>/dev/null || true
+    echo "error: could not attach $dmg_path to verify installer layout" >&2
+    return 1
+  fi
+  local ok=1
+  if [[ ! -d "$mnt/Khipu.app" ]]; then
+    echo "error: DMG is missing Khipu.app" >&2
+    ok=0
+  fi
+  if [[ ! -L "$mnt/Applications" ]]; then
+    echo "error: DMG is missing the Applications symlink (drag-install target)" >&2
+    ok=0
+  else
+    local target
+    target="$(readlink "$mnt/Applications")"
+    if [[ "$target" != "/Applications" ]]; then
+      echo "error: Applications symlink points at $target, expected /Applications" >&2
+      ok=0
+    fi
+  fi
+  hdiutil detach "$mnt" -quiet 2>/dev/null || hdiutil detach "$mnt" -force -quiet 2>/dev/null || true
+  rmdir "$mnt" 2>/dev/null || true
+  [[ "$ok" == 1 ]]
+}
+
+# Build a UDZO DMG whose Finder window is the standard drag-to-Applications
+# installer. skip_sign=1 for --selftest-dmg-layout (no Developer ID needed).
+build_portable_dmg() {
+  local app="$1"
+  local dmg_path="$2"
+  local skip_sign="${3:-0}"
+  local stage rw
+  stage="$(mktemp -d /tmp/khipu-dmg-stage-XXXXXX)"
+  rw="$(mktemp /tmp/khipu-dmg-rw-XXXXXX)"
+  rm -f "$rw"
+  rw="${rw}.dmg"
+  mkdir -p "$(dirname "$dmg_path")"
+  rm -f "$dmg_path"
+  stage_dmg_payload "$app" "$stage"
+  hdiutil create -volname "$DMG_VOLNAME" -srcfolder "$stage" -ov -format UDRW "$rw" >/dev/null
+  rm -rf "$stage"
+  detach_dmg_volume
+  if ! hdiutil attach -readwrite -noverify -noautoopen "$rw" >/dev/null; then
+    rm -f "$rw"
+    echo "error: could not attach read-write DMG for Finder layout" >&2
+    return 1
+  fi
+  if ! layout_dmg_finder_window; then
+    echo "warning: Finder did not apply icon positions; Applications alias is still in the image" >&2
+  fi
+  sync
+  detach_dmg_volume
+  hdiutil convert "$rw" -format UDZO -imagekey zlib-level=9 -ov -o "$dmg_path" >/dev/null
+  rm -f "$rw"
+  verify_dmg_drag_install "$dmg_path"
+  if [[ "$skip_sign" != 1 ]]; then
+    codesign --force --timestamp --sign "$IDENTITY" "$dmg_path"
+  fi
+}
+
+selftest_dmg_layout() {
+  local tmp dummy dmg
+  tmp="$(mktemp -d /tmp/khipu-dmg-selftest-XXXXXX)"
+  dummy="$tmp/Khipu.app"
+  mkdir -p "$dummy/Contents/MacOS"
+  cat > "$dummy/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>Khipu</string>
+  <key>CFBundleIdentifier</key><string>com.matt.khipu.selftest</string>
+  <key>CFBundleName</key><string>Khipu</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>
+PLIST
+  printf '#!/bin/sh\nexit 0\n' > "$dummy/Contents/MacOS/Khipu"
+  chmod +x "$dummy/Contents/MacOS/Khipu"
+  dmg="$tmp/Khipu_selftest.dmg"
+  build_portable_dmg "$dummy" "$dmg" 1
+  rm -rf "$tmp"
+  echo "dmg layout selftest ok"
+}
+
+if [[ "$SELFTEST_DMG" == 1 ]]; then
+  selftest_dmg_layout
+  exit 0
+fi
 
 if [[ -z "$IDENTITY" ]]; then
   echo "APPLE_SIGNING_IDENTITY is not set (e.g. 'Developer ID Application: Name (TEAMID)')" >&2
@@ -167,12 +309,7 @@ recreate_portable_dmg() {
   local dmg_path="$dmg_dir/Khipu_${VERSION}_aarch64.dmg"
   mkdir -p "$dmg_dir"
   rm -f "$dmg_dir"/Khipu_*.dmg
-  local stage
-  stage="$(mktemp -d)"
-  ditto "$app" "$stage/Khipu.app"
-  hdiutil create -volname Khipu -srcfolder "$stage" -ov -format UDZO -imagekey zlib-level=9 "$dmg_path"
-  rm -rf "$stage"
-  codesign --force --timestamp --sign "$IDENTITY" "$dmg_path"
+  build_portable_dmg "$app" "$dmg_path" 0
   DMG="$dmg_path"
   echo "recreated portable dmg: $DMG"
 }
