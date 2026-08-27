@@ -943,6 +943,7 @@ export default function App() {
     pin?: string;
     timeout_sec?: number;
     expires_at?: number;
+    ipv4?: string;
   } | null>(null);
   const [hubSnapshotHealth, setHubSnapshotHealth] = useState<{
     refreshed_at?: string;
@@ -1313,6 +1314,7 @@ export default function App() {
         pin?: string;
         timeout_sec?: number;
         expires_at?: number;
+        ipv4?: string;
       } | null;
       if (parsed?.ok !== true) {
         setSetupJoinMsg(String(parsed?.error ?? "Advertise failed."));
@@ -1322,9 +1324,10 @@ export default function App() {
         pin: parsed.pin,
         timeout_sec: parsed.timeout_sec,
         expires_at: parsed.expires_at,
+        ipv4: typeof parsed.ipv4 === "string" ? parsed.ipv4 : undefined,
       });
       setSetupJoinMsg(
-        `Advertising nearby for ${parsed.timeout_sec ?? 600}s — share PIN ${parsed.pin ?? "?"}`,
+        `Advertising nearby — on the new Mac: Join existing Khipu → same passphrase → PIN ${parsed.pin ?? "?"} → Find nearby Mac`,
       );
     } catch (e) {
       setSetupJoinMsg(String(e));
@@ -2358,13 +2361,25 @@ export default function App() {
               <div className="section-head">Set up another Mac</div>
               <div className="section-body">
                 <p className="muted">
-                  Export a passphrase-encrypted join kit for a second Mac. The file
-                  carries hub credentials and expected episode/topic/node counts — not a
-                  database dump. AirDrop the <code>.khipujoin</code> file or advertise
-                  nearby with a short-lived PIN (Bonjour + TLS; macOS best-effort).
+                  Do this on the Mac that <strong>already works</strong>. The new Mac
+                  uses Welcome → <strong>Join existing Khipu</strong> with the same
+                  passphrase. This sends hub connection details and expected counts —
+                  not a database dump.
                 </p>
+                <ol className="welcome-list muted">
+                  <li>Invent a short passphrase and say it to yourself on the other Mac.</li>
+                  <li>
+                    Prefer wireless: click <strong>Advertise nearby (PIN)</strong>, leave
+                    this open, then on the new Mac enter passphrase + PIN → Find nearby Mac
+                    (same Wi‑Fi; allow Local Network if asked).
+                  </li>
+                  <li>
+                    Or click <strong>Save join kit…</strong>, AirDrop the{" "}
+                    <code>.khipujoin</code> file, and import it on the new Mac.
+                  </li>
+                </ol>
                 <ul className="welcome-list muted">
-                  <li>Tailscale / VPN is optional when the hub is already reachable.</li>
+                  <li>The Postgres hub must already be reachable from the new Mac (Tailscale / VPN / shared server).</li>
                   <li>Same repo cloned at two paths on one Mac = duplicate graph nodes in v1.</li>
                 </ul>
                 <div className="toolbar" style={{ width: "100%" }}>
@@ -2375,7 +2390,7 @@ export default function App() {
                     spellCheck={false}
                     value={setupJoinPassphrase}
                     onChange={(e) => setSetupJoinPassphrase(e.target.value)}
-                    placeholder="Join passphrase (share verbally with the other Mac)"
+                    placeholder="Passphrase (same on the new Mac)"
                     aria-label="Join export passphrase"
                   />
                 </div>
@@ -2383,17 +2398,17 @@ export default function App() {
                   <button
                     type="button"
                     className="primary"
+                    disabled={advertiseBusy || !setupJoinPassphrase.trim()}
+                    onClick={() => void startJoinAdvertise()}
+                  >
+                    {advertiseBusy ? "Advertising…" : "Advertise nearby (PIN)"}
+                  </button>
+                  <button
+                    type="button"
                     disabled={!setupJoinPassphrase.trim()}
                     onClick={() => void exportJoinKit()}
                   >
                     Save join kit…
-                  </button>
-                  <button
-                    type="button"
-                    disabled={advertiseBusy || !setupJoinPassphrase.trim()}
-                    onClick={() => void startJoinAdvertise()}
-                  >
-                    {advertiseBusy ? "Starting…" : "Advertise nearby (PIN)"}
                   </button>
                 </div>
                 {setupJoinExpected ? (
@@ -2405,10 +2420,11 @@ export default function App() {
                 ) : null}
                 {advertiseInfo?.pin ? (
                   <p className="muted">
-                    PIN <strong className="mono">{advertiseInfo.pin}</strong>
+                    PIN for the new Mac: <strong className="mono">{advertiseInfo.pin}</strong>
                     {advertiseInfo.timeout_sec
-                      ? ` · expires in ~${advertiseInfo.timeout_sec}s`
+                      ? ` · keep this open (~${Math.round(advertiseInfo.timeout_sec / 60)} min)`
                       : null}
+                    {advertiseInfo.ipv4 ? ` · LAN ${advertiseInfo.ipv4}` : null}
                   </p>
                 ) : null}
                 {hubSnapshotHealth?.refreshed_at ? (
