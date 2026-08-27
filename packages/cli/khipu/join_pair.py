@@ -510,10 +510,9 @@ def receive(
 
     path_written: str | None = None
     if out_path is not None:
-        out_path = Path(out_path).expanduser()
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(blob)
-        path_written = str(out_path)
+        from khipu.join import write_kit_file
+
+        path_written = str(write_kit_file(out_path, blob))
 
     result: dict[str, Any] = {
         "ok": True,
@@ -528,11 +527,13 @@ def receive(
         counts = verify_live_counts(summary.get("expected") or {})
         result["summary"] = summary
         result["counts"] = counts
-        result["ok"] = bool(counts.get("ok"))
+        result["kit_imported"] = True
+        result["hub_ok"] = bool(counts.get("ok"))
+        result["ok"] = True
         if counts.get("error"):
-            result["error"] = counts["error"]
-        elif not result["ok"] and counts.get("mismatches"):
-            result["error"] = "; ".join(counts["mismatches"])
+            result["warning"] = counts["error"]
+        elif not result["hub_ok"] and counts.get("mismatches"):
+            result["warning"] = "; ".join(counts["mismatches"])
     return result
 
 
@@ -553,8 +554,9 @@ def advertise_join_kit(
         "service": SERVICE_TYPE,
         "ipv4": lan_ipv4(),
         "hint": (
-            "On the new Mac: Join existing Khipu → same passphrase → enter this PIN "
-            "→ Find nearby Mac. Same Wi‑Fi required. File/AirDrop works if nearby fails."
+            "On the new Mac: Join existing Khipu → enter this PIN → Find nearby Mac. "
+            "Same Wi‑Fi required. File/AirDrop works if nearby fails. Passphrase only "
+            "if you locked the kit when saving."
         ),
     }
     print(json.dumps(banner), flush=True)

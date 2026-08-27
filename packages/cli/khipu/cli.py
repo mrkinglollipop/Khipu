@@ -949,6 +949,7 @@ def cmd_join(args: argparse.Namespace) -> int:
         import_kit,
         resolve_passphrase,
         verify_live_counts,
+        write_kit_file,
     )
 
     try:
@@ -960,9 +961,7 @@ def cmd_join(args: argparse.Namespace) -> int:
     if args.join_cmd == "export":
         try:
             blob = export_kit(passphrase)
-            out_path = Path(args.out).expanduser()
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_bytes(blob)
+            out_path = write_kit_file(Path(args.out), blob)
             from khipu.join import decrypt_payload
 
             payload = decrypt_payload(blob, passphrase)
@@ -996,20 +995,23 @@ def cmd_join(args: argparse.Namespace) -> int:
             from khipu.migrate import run
 
             migrate_out = run(dry_run=False)
+        hub_ok = bool(counts.get("ok"))
         result = {
-            "ok": counts["ok"],
+            "ok": True,
+            "kit_imported": True,
+            "hub_ok": hub_ok,
             "action": "import",
             "summary": summary,
             "counts": counts,
         }
         if counts.get("error"):
-            result["error"] = counts["error"]
-        elif not counts["ok"] and counts.get("mismatches"):
-            result["error"] = "; ".join(counts["mismatches"])
+            result["warning"] = counts["error"]
+        elif not hub_ok and counts.get("mismatches"):
+            result["warning"] = "; ".join(counts["mismatches"])
         if migrate_out is not None:
             result["migrate"] = migrate_out
         print(json.dumps(result, indent=2))
-        return 0 if counts["ok"] else 2
+        return 0
 
     if args.join_cmd == "advertise":
         try:
@@ -1038,7 +1040,7 @@ def cmd_join(args: argparse.Namespace) -> int:
             print(json.dumps({"ok": False, "error": str(exc)}))
             return 1
         print(json.dumps(result, indent=2))
-        return 0 if result.get("ok") else 2
+        return 0 if result.get("kit_imported") or result.get("ok") else 2
 
     print(
         json.dumps({"ok": False, "error": f"unknown join subcommand: {args.join_cmd}"})
@@ -1804,16 +1806,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     join = sub.add_parser(
         "join",
-        help="Export/import passphrase-encrypted hub join kits (never prints secrets)",
+        help="Export/import hub join kits (optional passphrase; never prints secrets)",
     )
     join_sub = join.add_subparsers(dest="join_cmd", required=True)
     join_export = join_sub.add_parser(
-        "export", help="Write an encrypted join kit from this Mac's Keychain/config"
+        "export", help="Write a join kit from this Mac's Keychain/config"
     )
     join_export.add_argument(
         "--passphrase",
         default=None,
-        help="Encryption passphrase (or set KHIPU_JOIN_PASSPHRASE)",
+        help="Optional encryption passphrase (omit for plaintext; or KHIPU_JOIN_PASSPHRASE)",
     )
     join_export.add_argument(
         "--out",
@@ -1822,12 +1824,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     join_export.set_defaults(func=cmd_join)
     join_import = join_sub.add_parser(
-        "import", help="Decrypt a join kit and apply hub credentials on this Mac"
+        "import", help="Apply a join kit's hub credentials on this Mac"
     )
     join_import.add_argument(
         "--passphrase",
         default=None,
-        help="Decryption passphrase (or set KHIPU_JOIN_PASSPHRASE)",
+        help="Passphrase if the kit was saved encrypted (or KHIPU_JOIN_PASSPHRASE)",
     )
     join_import.add_argument(
         "--file",
@@ -1847,7 +1849,7 @@ def build_parser() -> argparse.ArgumentParser:
     join_advertise.add_argument(
         "--passphrase",
         default=None,
-        help="Encryption passphrase (or set KHIPU_JOIN_PASSPHRASE)",
+        help="Optional encryption passphrase (omit for plaintext; or KHIPU_JOIN_PASSPHRASE)",
     )
     join_advertise.add_argument(
         "--timeout",
@@ -1868,7 +1870,7 @@ def build_parser() -> argparse.ArgumentParser:
     join_receive.add_argument(
         "--passphrase",
         default=None,
-        help="Decryption passphrase (or set KHIPU_JOIN_PASSPHRASE)",
+        help="Passphrase if the kit was saved encrypted (or KHIPU_JOIN_PASSPHRASE)",
     )
     join_receive.add_argument(
         "--pin",

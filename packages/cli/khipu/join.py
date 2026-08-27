@@ -85,8 +85,8 @@ def _derive_key(passphrase: str, salt: bytes) -> bytes:
 
 
 def encrypt_payload(payload: dict[str, Any], passphrase: str) -> bytes:
-    if not passphrase:
-        raise ValueError("passphrase is required")
+    if not passphrase.strip():
+        raise ValueError("passphrase is required to encrypt a join kit")
     salt = secrets.token_bytes(16)
     nonce = secrets.token_bytes(12)
     key = _derive_key(passphrase, salt)
@@ -101,22 +101,32 @@ def encrypt_payload(payload: dict[str, Any], passphrase: str) -> bytes:
     return json.dumps(envelope).encode("utf-8")
 
 
-def decrypt_payload(blob: bytes, passphrase: str) -> dict[str, Any]:
-    if not passphrase:
-        raise ValueError("passphrase is required")
+def decrypt_payload(blob: bytes, passphrase: str = "") -> dict[str, Any]:
     try:
         envelope = json.loads(blob.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("join kit is not valid JSON") from exc
+    if not isinstance(envelope, dict):
+        raise ValueError("join kit must be a JSON object")
+    # AirDrop / file kits may be plaintext (the file is the secret).
+    if envelope.get("format") == FORMAT_VERSION and "database_url" in envelope:
+        return envelope
     if envelope.get("v") != FORMAT_VERSION:
         raise ValueError(f"unsupported join kit version: {envelope.get('v')!r}")
+    if "ciphertext_b64" not in envelope:
+        raise ValueError("join kit envelope is malformed")
+    if not passphrase.strip():
+        raise ValueError(
+            "this join kit is passphrase-protected — enter the phrase you typed "
+            "when saving it, or save a new kit without a passphrase"
+        )
     try:
         salt = base64.b64decode(envelope["salt_b64"])
         nonce = base64.b64decode(envelope["nonce_b64"])
         ciphertext = base64.b64decode(envelope["ciphertext_b64"])
     except (KeyError, ValueError) as exc:
         raise ValueError("join kit envelope is malformed") from exc
-    key = _derive_key(passphrase, salt)
+    key = _derive_key(passphrase.strip(), salt)
     try:
         plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
     except Exception as exc:
@@ -197,7 +207,23 @@ def export_kit(passphrase: str) -> bytes:
         payload["openai_compat_api_key"] = openai_compat
     if root_crt_pem:
         payload["root_crt_pem"] = root_crt_pem
-    return encrypt_payload(payload, passphrase)
+    phrase = (passphrase or "").strip()
+    if phrase:
+        return encrypt_payload(payload, phrase)
+    return json.dumps(payload, sort_keys=True).encode("utf-8")
+
+
+def write_kit_file(path: Path, blob: bytes) -> Path:
+    """Write a join kit and restrict it to owner read/write.
+
+    Plaintext kits hold the DSN and API keys; default umask would leave them
+    world-readable on the Desktop.
+    """
+    dest = Path(path).expanduser()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(blob)
+    dest.chmod(0o600)
+    return dest
 
 
 def _write_dsn_file(dsn: str) -> None:
@@ -333,7 +359,5 @@ def verify_live_counts(expected: dict[str, int]) -> dict[str, Any]:
 
 
 def resolve_passphrase(arg: str | None) -> str:
-    value = (arg or os.environ.get("KHIPU_JOIN_PASSPHRASE") or "").strip()
-    if not value:
-        raise ValueError("passphrase required (--passphrase or KHIPU_JOIN_PASSPHRASE)")
-    return value
+    """Optional. Empty means a plaintext join kit (file/AirDrop is the secret)."""
+    return (arg or os.environ.get("KHIPU_JOIN_PASSPHRASE") or "").strip()

@@ -43,7 +43,7 @@ function joinFailMessage(
   const mismatch = Array.isArray(counts?.mismatches)
     ? (counts.mismatches as string[]).join("; ")
     : "";
-  return String(out?.error || mismatch || fallback);
+  return String(out?.error || out?.warning || mismatch || fallback);
 }
 
 function parse(raw: string): Record<string, unknown> | null {
@@ -298,38 +298,54 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
   }, [remoteDsn, refreshDsn, applyMigrations, loadPlan]);
 
   const completeJoinAfterImport = useCallback(
-    async (summary: Record<string, unknown> | undefined, counts: Record<string, unknown> | undefined) => {
+    async (
+      summary: Record<string, unknown> | undefined,
+      counts: Record<string, unknown> | undefined,
+      warning?: string,
+    ) => {
       setJoinExpected((summary?.expected as Record<string, number>) ?? null);
       if (counts?.live && typeof counts.live === "object") {
         setJoinLive(counts.live as Record<string, number>);
       }
       await refreshDsn();
-      let raw = await invoke<string>("check_remote_postgres", { full: false });
-      let v = parse(raw);
-      let err = payloadError(v);
-      if (err) {
-        setDbMsg(err);
-        return false;
-      }
-      await applyMigrations();
-      raw = await invoke<string>("check_remote_postgres", { full: true });
-      v = parse(raw);
-      err = payloadError(v);
-      if (err) {
-        setDbMsg(err);
-        return false;
-      }
-      await loadPlan();
       setJoinReady(true);
       setJoinedHub(true);
       const mismatches = Array.isArray(counts?.mismatches)
         ? (counts.mismatches as string[])
         : [];
-      setDbMsg(
-        mismatches.length
-          ? `Joined the hub — count delta vs kit: ${mismatches.join("; ")}`
-          : "Joined the hub — live counts match the join kit.",
-      );
+      try {
+        let raw = await invoke<string>("check_remote_postgres", { full: false });
+        let v = parse(raw);
+        let err = payloadError(v);
+        if (err) {
+          setDbMsg(
+            warning
+              ? `${warning}\n\nJoin kit is saved on this Mac — you can continue. Hub is not reachable yet: ${err}`
+              : `Join kit is saved on this Mac — you can continue. Hub is not reachable yet: ${err}`,
+          );
+          return true;
+        }
+        await applyMigrations();
+        raw = await invoke<string>("check_remote_postgres", { full: true });
+        v = parse(raw);
+        err = payloadError(v);
+        if (err) {
+          setDbMsg(
+            `Join kit is saved on this Mac — you can continue. Hub check: ${err}`,
+          );
+          return true;
+        }
+        await loadPlan();
+        setDbMsg(
+          mismatches.length
+            ? `Joined the hub — count delta vs kit: ${mismatches.join("; ")}`
+            : "Joined the hub — live counts match the join kit.",
+        );
+      } catch (e) {
+        setDbMsg(
+          `Join kit is saved on this Mac — you can continue. Hub check failed: ${String(e)}`,
+        );
+      }
       return true;
     },
     [refreshDsn, applyMigrations, loadPlan],
@@ -337,13 +353,8 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
 
   const importJoinFromFile = useCallback(async () => {
     const passphrase = joinPassphrase.trim();
-    if (!passphrase) {
-      setDbMsg("Enter the join passphrase first.");
-      return;
-    }
     setJoinBusy(true);
     setDbMsg(null);
-    setJoinReady(false);
     try {
       const selected = await openFileDialog({
         multiple: false,
@@ -355,13 +366,14 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         filePath: selected.trim(),
       });
       const out = parse(raw);
-      if (out?.ok !== true) {
+      if (out?.ok !== true && out?.kit_imported !== true) {
         setDbMsg(joinFailMessage(out, "Join import failed."));
         return;
       }
       await completeJoinAfterImport(
         out.summary as Record<string, unknown> | undefined,
         out.counts as Record<string, unknown> | undefined,
+        typeof out.warning === "string" ? out.warning : undefined,
       );
     } catch (e) {
       setDbMsg(String(e));
@@ -373,27 +385,23 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
   const receiveJoinNearby = useCallback(async () => {
     const passphrase = joinPassphrase.trim();
     const pin = joinPin.trim();
-    if (!passphrase) {
-      setDbMsg("Enter the join passphrase first.");
-      return;
-    }
     if (!/^\d{6}$/.test(pin)) {
       setDbMsg("Enter the six-digit PIN from the other Mac.");
       return;
     }
     setJoinBusy(true);
     setDbMsg(null);
-    setJoinReady(false);
     try {
       const raw = await invoke<string>("join_receive", { passphrase, pin, outPath: null });
       const out = parse(raw);
-      if (out?.ok !== true) {
+      if (out?.ok !== true && out?.kit_imported !== true) {
         setDbMsg(joinFailMessage(out, "Nearby join failed."));
         return;
       }
       await completeJoinAfterImport(
         out.summary as Record<string, unknown> | undefined,
         out.counts as Record<string, unknown> | undefined,
+        typeof out.warning === "string" ? out.warning : undefined,
       );
     } catch (e) {
       setDbMsg(String(e));
@@ -741,28 +749,32 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
           {dbMode === "join" ? (
             <>
               <p className="muted">
-                Use this on the <strong>new</strong> Mac. The Mac that already has
-                Khipu working stays on Settings → <strong>Set up another Mac</strong>.
-                Both Macs need the <strong>same passphrase</strong>. Same Wi‑Fi for
-                nearby join (not a guest / client-isolated network).
+                Use this on the <strong>new</strong> Mac. The working Mac: Settings →
+                <strong> Set up another Mac</strong> → <strong>Save join kit…</strong>,
+                then AirDrop the <code>.khipujoin</code> file here.
               </p>
               <ol className="welcome-list muted">
                 <li>
-                  On the working Mac: Settings → Set up another Mac → enter a passphrase
-                  → click <strong>Advertise nearby (PIN)</strong> and leave that screen open.
-                </li>
-                <li>On this Mac: enter that same passphrase below.</li>
-                <li>
-                  Type the 6-digit PIN shown on the working Mac, then{" "}
-                  <strong>Find nearby Mac</strong>. If macOS asks for Local Network access,
-                  allow it.
+                  Click <strong>Import join kit file…</strong> and pick that file.
+                  A passphrase is optional — only if you typed one when saving.
                 </li>
                 <li>
-                  Prefer a file? On the working Mac click <strong>Save join kit…</strong>,
-                  AirDrop the <code>.khipujoin</code> file here, then{" "}
-                  <strong>Import join kit file…</strong> (same passphrase).
+                  Nearby PIN is optional (same Wi‑Fi). File import is enough to continue.
                 </li>
               </ol>
+              <div className="toolbar">
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={joinBusy}
+                  onClick={() => void importJoinFromFile()}
+                >
+                  {joinBusy ? "Importing…" : "Import join kit file…"}
+                </button>
+              </div>
+              <p className="muted" style={{ marginTop: "0.75rem" }}>
+                Optional passphrase (only if you set one when saving the file):
+              </p>
               <div className="toolbar" style={{ width: "100%" }}>
                 <input
                   className="mono"
@@ -771,12 +783,12 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                   spellCheck={false}
                   value={joinPassphrase}
                   onChange={(e) => setJoinPassphrase(e.target.value)}
-                  placeholder="Same passphrase as the other Mac"
-                  aria-label="Join passphrase"
+                  placeholder="Leave blank unless the file is locked"
+                  aria-label="Optional join passphrase"
                 />
               </div>
               <p className="muted" style={{ marginTop: "0.75rem" }}>
-                Nearby wireless (same Wi‑Fi):
+                Optional — nearby wireless (same Wi‑Fi):
               </p>
               <div className="toolbar" style={{ width: "100%" }}>
                 <input
@@ -789,20 +801,10 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                 />
                 <button
                   type="button"
-                  className="primary"
-                  disabled={joinBusy || !joinPassphrase.trim() || joinPin.length !== 6}
+                  disabled={joinBusy || joinPin.length !== 6}
                   onClick={() => void receiveJoinNearby()}
                 >
                   {joinBusy ? "Connecting…" : "Find nearby Mac"}
-                </button>
-              </div>
-              <div className="toolbar">
-                <button
-                  type="button"
-                  disabled={joinBusy || !joinPassphrase.trim()}
-                  onClick={() => void importJoinFromFile()}
-                >
-                  {joinBusy ? "Importing…" : "Import join kit file…"}
                 </button>
               </div>
               {joinExpected ? (
