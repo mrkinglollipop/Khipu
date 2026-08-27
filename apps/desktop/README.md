@@ -4,9 +4,9 @@ P1d shell over `packages/cli/`.
 
 ## Install (recommended)
 
-Download **`Khipu_0.3.2_aarch64.dmg`** from the
-[v0.3.2 release](https://github.com/mrkinglollipop/Khipu/releases/tag/v0.3.2)
-(GitHub `/releases/latest` now points here), open it, and drag
+Download the latest Apple Silicon DMG (`Khipu_<version>_aarch64.dmg`) from the
+[latest GitHub Release](https://github.com/mrkinglollipop/Khipu/releases/latest)
+or [kinglollipop.com/khipu](https://kinglollipop.com/khipu/), open it, and drag
 **Khipu.app** to **Applications**. Launch from Applications — the Welcome flow
 configures Postgres, models, Graphify, and agent integrations. The app bundle
 carries CLI + Python under `Contents/Resources/khipu`; no git clone or
@@ -62,7 +62,7 @@ Flags:
 ```bash
 cd apps/desktop
 ./scripts/release_macos.sh --install    # copy build to /Applications/Khipu.app
-./scripts/release_macos.sh --publish    # gh release create (DMG + tarball + sig + latest.json)
+./scripts/release_macos.sh --publish    # gh release create (versioned DMG + Khipu_aarch64.dmg + tarball + sig + latest.json)
 ```
 
 `--publish` requires `gh` auth, a **public** `KHIPU_RELEASE_REPO` (defaults to
