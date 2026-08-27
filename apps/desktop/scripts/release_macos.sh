@@ -251,10 +251,12 @@ if [[ "$PUBLISH" -eq 1 ]]; then
     echo "refusing --publish: $DMG is not Apple-stapled (stapler validate failed)" >&2
     exit 1
   fi
-  # One release per version: tarball + .sig + latest.json as assets. The
-  # `latest` redirect GitHub keeps for the newest non-prerelease release is
-  # what the app polls, so latest.json must be attached to every release.
-  # Authenticity is the minisign signature inside latest.json, not the host.
+  # One release per version: versioned DMG + stable `Khipu_aarch64.dmg` alias
+  # (kinglollipop.com /khipu/download → GitHub `/releases/latest/download/…`)
+  # + tarball + .sig + latest.json. The `latest` redirect GitHub keeps for the
+  # newest non-prerelease release is what the app polls, so latest.json must
+  # be attached to every release. Authenticity is the minisign signature
+  # inside latest.json, not the host.
   TAG="v$VERSION"
   NOTES_DIR="$(mktemp -d)"
   TGZ_NAME="$(basename "$TGZ")"
@@ -288,9 +290,13 @@ Khipu $VERSION — portable macOS arm64.
 Compatibility matrix lives on \`mrkinglollipop/khipu-compat\`, not this repo \`/releases/latest\`.
 EOF
 )
+  # Copy in $NOTES_DIR so a stable name never lands next to Khipu_*.dmg
+  # (the glob at the top of this script would otherwise get ambiguous).
+  STABLE_DMG="$NOTES_DIR/Khipu_aarch64.dmg"
+  cp "$DMG" "$STABLE_DMG"
   gh release create "$TAG" --repo "$RELEASE_REPO" --title "Khipu $VERSION" \
     --notes "$RELEASE_NOTES" \
-    "$DMG" "$TGZ" "$SIG" "$NOTES_DIR/latest.json"
+    "$DMG" "$STABLE_DMG" "$TGZ" "$SIG" "$NOTES_DIR/latest.json"
   echo "published $VERSION to https://github.com/$RELEASE_REPO/releases/tag/$TAG"
   # Prove the feed the app polls actually serves this version.
   curl -fsSL "https://github.com/$RELEASE_REPO/releases/latest/download/latest.json" \
