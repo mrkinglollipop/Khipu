@@ -368,8 +368,8 @@ models, Graphify, and agent wiring.
 
 ### Install the desktop app (recommended)
 
-1. Download **`Khipu_0.3.7_aarch64.dmg`** from the
-   [v0.3.7 release](https://github.com/mrkinglollipop/Khipu/releases/tag/v0.3.7)
+1. Download **`Khipu_0.3.8_aarch64.dmg`** from the
+   [v0.3.8 release](https://github.com/mrkinglollipop/Khipu/releases/tag/v0.3.8)
    (GitHub `/releases/latest` now points here), or use
    [kinglollipop.com/khipu/download](https://kinglollipop.com/khipu/download).
 2. Open the DMG and drag **Khipu.app** to **Applications**.
@@ -478,13 +478,12 @@ not use the gateway at all.
 
 **A second Mac** joins the same hub — it does not create a new empty database.
 
-1. On the Mac that already works: Settings → **Set up another Mac** → invent a
-   passphrase → **Advertise nearby (PIN)** (same Wi‑Fi) *or* **Save join kit…**
-   and AirDrop the `.khipujoin` file.
-2. On the new Mac: Welcome → **Join existing Khipu** → same passphrase → enter
-   the PIN and **Find nearby Mac**, *or* **Import join kit file…**.
-3. Allow **Local Network** if macOS asks. Guest / client-isolated Wi‑Fi will
-   fail nearby join — use AirDrop or a normal LAN.
+1. On the Mac that already works: Settings → **Set up another Mac** →
+   **Save join kit…** and AirDrop the `.khipujoin` file. Passphrase is optional.
+   Nearby PIN is optional (same Wi‑Fi).
+2. On the new Mac: Welcome → **Join existing Khipu** → **Import join kit file…**.
+   Only enter a passphrase if you set one when saving. PIN is not required.
+3. Guest / client-isolated Wi‑Fi will fail nearby join — use the file.
 
 That rewrites the TLS cert path for this machine, stores the DSN in Keychain,
 and verifies live episode counts against the kit. Localhost Postgres cannot be

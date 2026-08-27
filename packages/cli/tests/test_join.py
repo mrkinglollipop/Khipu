@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,6 +40,74 @@ class EncryptRoundtripTest(unittest.TestCase):
         blob = j.encrypt_payload({"database_url": "postgres://x"}, "right")
         with self.assertRaises(ValueError):
             j.decrypt_payload(blob, "wrong")
+
+    def test_plaintext_kit_roundtrip_without_passphrase(self) -> None:
+        payload = {
+            "format": j.FORMAT_VERSION,
+            "database_url": "postgres://u:p@hub.example/db",
+            "expected": {"episodes": 1, "topics": 1, "nodes": 1},
+        }
+        blob = json.dumps(payload).encode("utf-8")
+        out = j.decrypt_payload(blob, "")
+        self.assertEqual(out["database_url"], payload["database_url"])
+
+    def test_encrypted_kit_without_passphrase_explains(self) -> None:
+        blob = j.encrypt_payload({"format": j.FORMAT_VERSION, "database_url": "postgres://x"}, "secret")
+        with self.assertRaises(ValueError) as ctx:
+            j.decrypt_payload(blob, "")
+        self.assertIn("passphrase-protected", str(ctx.exception))
+
+    def test_write_kit_file_is_owner_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "kit.khipujoin"
+            j.write_kit_file(dest, b'{"format":"khipu-join-v1"}')
+            self.assertEqual(stat.S_IMODE(dest.stat().st_mode), 0o600)
+
+    def test_resolve_passphrase_empty_is_ok(self) -> None:
+        with mock.patch.dict(os.environ, {"KHIPU_JOIN_PASSPHRASE": ""}, clear=False):
+            self.assertEqual(j.resolve_passphrase(None), "")
+            self.assertEqual(j.resolve_passphrase("  "), "")
+
+    def test_export_kit_plaintext_when_passphrase_empty(self) -> None:
+        with (
+            mock.patch("khipu.keychain.get_dsn", return_value="postgres://u:p@hub/db"),
+            mock.patch("khipu.config.capture_mode", return_value="hub"),
+            mock.patch("khipu.config.gateway_url", return_value=None),
+            mock.patch("khipu.keychain.get_gemini_key", return_value=None),
+            mock.patch("khipu.keychain.get_openai_compat_key", return_value=None),
+            mock.patch.object(j, "_models_export_blob", return_value={}),
+            mock.patch.object(
+                j, "_fetch_live_counts", return_value={"episodes": 1, "topics": 1, "nodes": 1}
+            ),
+            mock.patch("khipu.paths.root_cert_file", return_value=Path("/no/such/root.crt")),
+        ):
+            blob = j.export_kit("")
+        data = json.loads(blob.decode("utf-8"))
+        self.assertEqual(data["database_url"], "postgres://u:p@hub/db")
+        self.assertNotIn("ciphertext_b64", data)
+        self.assertEqual(j.decrypt_payload(blob, ""), data)
+
+    def test_export_kit_encrypts_when_passphrase_set(self) -> None:
+        with (
+            mock.patch("khipu.keychain.get_dsn", return_value="postgres://u:p@hub/db"),
+            mock.patch("khipu.config.capture_mode", return_value="hub"),
+            mock.patch("khipu.config.gateway_url", return_value=None),
+            mock.patch("khipu.keychain.get_gemini_key", return_value=None),
+            mock.patch("khipu.keychain.get_openai_compat_key", return_value=None),
+            mock.patch.object(j, "_models_export_blob", return_value={}),
+            mock.patch.object(
+                j, "_fetch_live_counts", return_value={"episodes": 1, "topics": 1, "nodes": 1}
+            ),
+            mock.patch("khipu.paths.root_cert_file", return_value=Path("/no/such/root.crt")),
+        ):
+            blob = j.export_kit("secret")
+        envelope = json.loads(blob.decode("utf-8"))
+        self.assertIn("ciphertext_b64", envelope)
+        out = j.decrypt_payload(blob, "secret")
+        self.assertEqual(out["database_url"], "postgres://u:p@hub/db")
+        with self.assertRaises(ValueError) as ctx:
+            j.decrypt_payload(blob, "")
+        self.assertIn("passphrase-protected", str(ctx.exception))
 
 
 class LocalhostRefuseTest(unittest.TestCase):

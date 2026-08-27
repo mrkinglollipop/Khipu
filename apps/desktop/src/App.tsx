@@ -1265,10 +1265,6 @@ export default function App() {
 
   const exportJoinKit = useCallback(async () => {
     const passphrase = setupJoinPassphrase.trim();
-    if (!passphrase) {
-      setSetupJoinMsg("Enter a passphrase first.");
-      return;
-    }
     setSetupJoinMsg(null);
     try {
       const dest = await saveFileDialog({
@@ -1299,10 +1295,6 @@ export default function App() {
 
   const startJoinAdvertise = useCallback(async () => {
     const passphrase = setupJoinPassphrase.trim();
-    if (!passphrase) {
-      setSetupJoinMsg("Enter a passphrase first.");
-      return;
-    }
     setAdvertiseBusy(true);
     setSetupJoinMsg(null);
     setAdvertiseInfo(null);
@@ -1327,7 +1319,7 @@ export default function App() {
         ipv4: typeof parsed.ipv4 === "string" ? parsed.ipv4 : undefined,
       });
       setSetupJoinMsg(
-        `Advertising nearby — on the new Mac: Join existing Khipu → same passphrase → PIN ${parsed.pin ?? "?"} → Find nearby Mac`,
+        `Advertising nearby — on the new Mac: Join existing Khipu → PIN ${parsed.pin ?? "?"} → Find nearby Mac`,
       );
     } catch (e) {
       setSetupJoinMsg(String(e));
@@ -2361,21 +2353,18 @@ export default function App() {
               <div className="section-head">Set up another Mac</div>
               <div className="section-body">
                 <p className="muted">
-                  Do this on the Mac that <strong>already works</strong>. The new Mac
-                  uses Welcome → <strong>Join existing Khipu</strong> with the same
-                  passphrase. This sends hub connection details and expected counts —
-                  not a database dump.
+                  Do this on the Mac that <strong>already works</strong>. Save a join kit
+                  and AirDrop it to the new Mac — that file is enough. Passphrase is
+                  optional (only if you want the file locked).
                 </p>
                 <ol className="welcome-list muted">
-                  <li>Invent a short passphrase and say it to yourself on the other Mac.</li>
                   <li>
-                    Prefer wireless: click <strong>Advertise nearby (PIN)</strong>, leave
-                    this open, then on the new Mac enter passphrase + PIN → Find nearby Mac
-                    (same Wi‑Fi; allow Local Network if asked).
+                    Click <strong>Save join kit…</strong>, then AirDrop the{" "}
+                    <code>.khipujoin</code> file. On the new Mac: Welcome → Join existing
+                    Khipu → Import join kit file.
                   </li>
                   <li>
-                    Or click <strong>Save join kit…</strong>, AirDrop the{" "}
-                    <code>.khipujoin</code> file, and import it on the new Mac.
+                    Optional: <strong>Advertise nearby (PIN)</strong> on the same Wi‑Fi.
                   </li>
                 </ol>
                 <ul className="welcome-list muted">
@@ -2390,25 +2379,24 @@ export default function App() {
                     spellCheck={false}
                     value={setupJoinPassphrase}
                     onChange={(e) => setSetupJoinPassphrase(e.target.value)}
-                    placeholder="Passphrase (same on the new Mac)"
-                    aria-label="Join export passphrase"
+                    placeholder="Optional passphrase (leave blank for an unlocked file)"
+                    aria-label="Optional join export passphrase"
                   />
                 </div>
                 <div className="toolbar">
                   <button
                     type="button"
                     className="primary"
-                    disabled={advertiseBusy || !setupJoinPassphrase.trim()}
-                    onClick={() => void startJoinAdvertise()}
-                  >
-                    {advertiseBusy ? "Advertising…" : "Advertise nearby (PIN)"}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!setupJoinPassphrase.trim()}
                     onClick={() => void exportJoinKit()}
                   >
                     Save join kit…
+                  </button>
+                  <button
+                    type="button"
+                    disabled={advertiseBusy}
+                    onClick={() => void startJoinAdvertise()}
+                  >
+                    {advertiseBusy ? "Advertising…" : "Advertise nearby (PIN)"}
                   </button>
                 </div>
                 {setupJoinExpected ? (

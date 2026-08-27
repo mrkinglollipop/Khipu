@@ -438,13 +438,11 @@ fn set_khipu_secret(account: String, value: String) -> Result<String, String> {
     Ok(stdout)
 }
 
-/// Export a passphrase-encrypted join kit to disk. Passphrase travels via env,
-/// never argv — same exposure model as `set_khipu_secret`'s stdin pipe.
+/// Export a join kit to disk. Optional passphrase travels via env, never argv —
+/// same exposure model as `set_khipu_secret`'s stdin pipe. Empty passphrase
+/// writes a plaintext kit (the file is the secret).
 #[tauri::command]
 fn join_export(passphrase: String, out_path: String) -> Result<String, String> {
-    if passphrase.trim().is_empty() {
-        return Err("passphrase is empty".to_string());
-    }
     if out_path.trim().is_empty() {
         return Err("out_path is empty".to_string());
     }
@@ -479,9 +477,6 @@ fn join_export(passphrase: String, out_path: String) -> Result<String, String> {
 /// Import a join kit from disk. Passphrase travels via env, never argv.
 #[tauri::command]
 fn join_import(passphrase: String, file_path: String) -> Result<String, String> {
-    if passphrase.trim().is_empty() {
-        return Err("passphrase is empty".to_string());
-    }
     if file_path.trim().is_empty() {
         return Err("file_path is empty".to_string());
     }
@@ -517,9 +512,6 @@ fn join_import(passphrase: String, file_path: String) -> Result<String, String> 
 /// the first JSON line (PIN, port, timeout) while the server keeps running.
 #[tauri::command]
 fn join_advertise(passphrase: String, timeout: u32) -> Result<String, String> {
-    if passphrase.trim().is_empty() {
-        return Err("passphrase is empty".to_string());
-    }
     let root = khipu_root()?;
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
@@ -567,9 +559,6 @@ fn parse_json_line(line: &str) -> Result<Value, String> {
 /// Receive join kit from a nearby Mac (Bonjour browse + TLS + import).
 #[tauri::command]
 fn join_receive(passphrase: String, pin: String, out_path: Option<String>) -> Result<String, String> {
-    if passphrase.trim().is_empty() {
-        return Err("passphrase is empty".to_string());
-    }
     let pin_trim = pin.trim();
     if pin_trim.len() != 6 || !pin_trim.chars().all(|c| c.is_ascii_digit()) {
         return Err("pin must be six digits".to_string());
