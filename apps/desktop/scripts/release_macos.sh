@@ -310,4 +310,44 @@ EOF
   else
     echo "warning: studio not at $STUDIO; skip X draft (set KING_LOLLIPOP_STUDIO)" >&2
   fi
+  if [[ "${KHIPU_SKIP_SITE:-}" == 1 ]]; then
+    echo "skipping kinglollipop.com sync (KHIPU_SKIP_SITE=1)"
+  else
+    echo "==> kinglollipop.com Khipu $VERSION"
+    if [[ -f "$STUDIO/scripts/bump_khipu_site.py" ]]; then
+      python3 "$STUDIO/scripts/bump_khipu_site.py" "$VERSION"
+      (
+        cd "$STUDIO"
+        branch="$(git rev-parse --abbrev-ref HEAD)"
+        if [[ "$branch" != "main" ]]; then
+          echo "warning: studio HEAD is $branch, not main; site bump left uncommitted" >&2
+        else
+          head_before="$(git rev-parse HEAD)"
+          git add -- site/khipu/index.html site/news.json site/assets/now.js site/_redirects
+          if git diff --cached --quiet; then
+            echo "studio site copy already at $VERSION"
+          else
+            git commit -m "chore(site): bump Khipu page to $VERSION"
+            if git rev-parse refs/remotes/origin/main >/dev/null 2>&1; then
+              origin_main="$(git rev-parse refs/remotes/origin/main)"
+              if [[ "$head_before" == "$origin_main" ]]; then
+                git push origin HEAD:main || echo "warning: studio site bump push failed (Pages deploy still uses this tree)" >&2
+              else
+                echo "warning: studio main has unpushed commits; not pushing site bump (refusing to push unrelated WIP)" >&2
+              fi
+            fi
+          fi
+        fi
+      )
+      if [[ -x "$STUDIO/scripts/deploy-site.sh" ]]; then
+        "$STUDIO/scripts/deploy-site.sh"
+      else
+        echo "Blocked on Matt: $STUDIO/scripts/deploy-site.sh missing" >&2
+        exit 1
+      fi
+    else
+      echo "warning: $STUDIO/scripts/bump_khipu_site.py missing; verifying live copy only" >&2
+    fi
+    python3 "$DESKTOP/scripts/verify_khipu_website.py" "$VERSION"
+  fi
 fi
