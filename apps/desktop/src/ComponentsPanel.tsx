@@ -23,7 +23,7 @@ type StatusPayload = {
   ok?: boolean;
   khipu_app?: string;
   cli?: string;
-  docker?: { ok?: boolean; error?: string };
+  docker?: { ok?: boolean; error?: string; app_installed?: boolean; code?: string };
   postgres?: {
     mode?: string;
     source?: string;
@@ -132,7 +132,9 @@ export function ComponentsPanel() {
             </p>
           ) : docker && docker.ok === false ? (
             <p className="muted">
-              Docker not found — install Docker Desktop to set up local Postgres, or configure a remote DSN in Settings.
+              {docker.app_installed
+                ? "Docker Desktop is installed but not running — open it from Welcome, or start Docker Desktop yourself."
+                : "Docker Desktop isn’t installed. Welcome can download it, or configure a remote DSN in Settings."}
             </p>
           ) : (
             <p className="muted">No local Postgres component installed yet.</p>

@@ -21,6 +21,7 @@ from khipu.components_matrix import (
     versions_path,
     write_versions,
 )
+from khipu.docker_runtime import docker_available, docker_cli, docker_path_env
 from khipu.keychain import set_dsn
 from khipu.paths import repo_root
 
@@ -41,6 +42,7 @@ def _run(
     timeout: float | None = None,
     check: bool = True,
     input_text: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
@@ -49,20 +51,8 @@ def _run(
         timeout=timeout,
         check=check,
         input=input_text,
+        env=env,
     )
-
-
-def docker_available() -> dict[str, Any]:
-    if shutil.which("docker") is None:
-        return {"ok": False, "error": "docker_not_found"}
-    try:
-        proc = _run(["docker", "info"], timeout=30, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        return {"ok": False, "error": err or "docker info failed"}
-    return {"ok": True}
 
 
 def free_disk_gib(path: Path | None = None) -> float | None:
@@ -201,7 +191,11 @@ def choose_host_port() -> int | None:
 
 
 def _docker(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-    return _run(["docker", *args], **kwargs)
+    cli = docker_cli()
+    if cli is None:
+        raise FileNotFoundError("docker CLI not found")
+    kwargs.setdefault("env", docker_path_env(cli))
+    return _run([str(cli), *args], **kwargs)
 
 
 def pull_postgres_image(image: str) -> dict[str, Any]:
@@ -470,7 +464,15 @@ def install_local_postgres() -> dict[str, Any]:
 
 
 def components_status() -> dict[str, Any]:
-    from packaging.version import Version
+    docker = docker_available()
+    try:
+        from packaging.version import Version
+    except ImportError as exc:
+        return {
+            "ok": False,
+            "docker": docker,
+            "error": f"ImportError: {exc}",
+        }
 
     from khipu.components_matrix import (
         effective_matrix,
@@ -485,7 +487,6 @@ def components_status() -> dict[str, Any]:
         pass
 
     versions = read_versions()
-    docker = docker_available()
     pending = versions.get("pending")
     postgres = (
         versions.get("postgres") if isinstance(versions.get("postgres"), dict) else {}

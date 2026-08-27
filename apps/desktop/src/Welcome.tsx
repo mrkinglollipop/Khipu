@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { resourceDir } from "@tauri-apps/api/path";
 import {
@@ -102,6 +102,48 @@ function launchedFromDiskImage(resourcePath: string): boolean {
   return /\/Volumes\/Khipu(?: \d+)?\//.test(resourcePath);
 }
 
+type DockerStatus = {
+  ok?: boolean;
+  error?: string;
+  code?: string;
+  app_installed?: boolean;
+  action?: string;
+  cli?: string | null;
+};
+
+function dockerNoteTitle(docker: DockerStatus): string {
+  const code = docker.code ?? docker.action;
+  if (code === "docker_not_found" || code === "need_install") {
+    return "Docker Desktop isn’t installed";
+  }
+  if (code === "docker_dmg_opened") {
+    return "Drag Docker into Applications";
+  }
+  if (code === "docker_daemon_stopped" || code === "docker_starting") {
+    return "Starting Docker Desktop";
+  }
+  if (code === "docker_download_failed") {
+    return "Couldn’t download Docker Desktop";
+  }
+  return "Docker isn’t ready";
+}
+
+function dockerNoteBody(docker: DockerStatus): string {
+  const code = docker.code ?? "";
+  if (code === "docker_not_found" || code === "need_install") {
+    return "Khipu can download Docker Desktop and open it. First launch may ask for your password — that’s Docker’s installer, not us.";
+  }
+  if (code === "docker_dmg_opened") {
+    return docker.error ?? "Open the Docker disk image, drag Docker.app into Applications, then recheck.";
+  }
+  if (code === "docker_daemon_stopped" || code === "docker_starting") {
+    return "Docker Desktop is installed. Finish its first-launch prompts if they appear, then recheck.";
+  }
+  const err = docker.error ?? "";
+  if (err && err !== "docker_not_found") return err;
+  return "Start Docker Desktop, then recheck.";
+}
+
 function payloadError(v: Record<string, unknown> | null): string | null {
   if (!v) return "Invalid response";
   if (v.ok === false) return String(v.error ?? "Request failed");
@@ -129,6 +171,9 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
   const [dbMode, setDbMode] = useState<DbMode>("local");
   const [dockerOk, setDockerOk] = useState<boolean | null>(null);
   const [dockerErr, setDockerErr] = useState<string | null>(null);
+  const [dockerStatus, setDockerStatus] = useState<DockerStatus | null>(null);
+  const [dockerBusy, setDockerBusy] = useState(false);
+  const autoStartedDocker = useRef(false);
   const [diskWarn, setDiskWarn] = useState<string | null>(null);
   const [dbBusy, setDbBusy] = useState(false);
   const [dbMsg, setDbMsg] = useState<string | null>(null);
@@ -164,22 +209,72 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
     }
   }, []);
 
-  const refreshDocker = useCallback(async () => {
+  const refreshDocker = useCallback(async (opts?: { startIfInstalled?: boolean }) => {
     setDockerErr(null);
     try {
       const raw = await invoke<string>("components_status");
       const v = parse(raw);
-      const docker = v?.docker as { ok?: boolean; error?: string } | undefined;
+      let docker = (v?.docker ?? null) as DockerStatus | null;
+      if (v && v.ok === false && v.error && !docker) {
+        docker = { ok: false, error: String(v.error), code: "status_failed" };
+      }
+      setDockerStatus(docker);
       setDockerOk(Boolean(docker?.ok));
       if (!docker?.ok) setDockerErr(String(docker?.error ?? "Docker is not running"));
+      if (
+        opts?.startIfInstalled &&
+        docker &&
+        !docker.ok &&
+        docker.app_installed &&
+        !autoStartedDocker.current
+      ) {
+        autoStartedDocker.current = true;
+        setDockerBusy(true);
+        try {
+          const ensuredRaw = await invoke<string>("ensure_docker", { install: false });
+          const ensured = parse(ensuredRaw) as DockerStatus | null;
+          if (ensured) {
+            setDockerStatus(ensured);
+            setDockerOk(Boolean(ensured.ok));
+            if (!ensured.ok) setDockerErr(String(ensured.error ?? "Docker is not running"));
+          }
+        } finally {
+          setDockerBusy(false);
+        }
+      }
     } catch (e) {
       setDockerOk(false);
       setDockerErr(String(e));
+      setDockerStatus({ ok: false, error: String(e), code: "status_failed" });
     }
   }, []);
 
+  const setupDocker = useCallback(async () => {
+    setDockerBusy(true);
+    setDockerErr(null);
+    setDbMsg(null);
+    try {
+      const install = !dockerStatus?.app_installed;
+      const raw = await invoke<string>("ensure_docker", { install });
+      const ensured = parse(raw) as DockerStatus | null;
+      if (ensured) {
+        setDockerStatus(ensured);
+        setDockerOk(Boolean(ensured.ok));
+        if (!ensured.ok) setDockerErr(String(ensured.error ?? "Docker is not running"));
+      }
+    } catch (e) {
+      setDockerOk(false);
+      setDockerErr(String(e));
+      setDockerStatus({ ok: false, error: String(e), code: "status_failed" });
+    } finally {
+      setDockerBusy(false);
+    }
+  }, [dockerStatus?.app_installed]);
+
   useEffect(() => {
-    if (step === "database" && dbMode === "local") void refreshDocker();
+    if (step === "database" && dbMode === "local") {
+      void refreshDocker({ startIfInstalled: true });
+    }
   }, [step, dbMode, refreshDocker]);
 
   useEffect(() => {
@@ -194,12 +289,29 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
     try {
       const statusRaw = await invoke<string>("components_status");
       const status = parse(statusRaw);
-      const docker = status?.docker as { ok?: boolean; error?: string } | undefined;
+      let docker = (status?.docker ?? null) as DockerStatus | null;
+      setDockerStatus(docker);
       setDockerOk(Boolean(docker?.ok));
       if (!docker?.ok) {
-        setDockerErr(String(docker?.error ?? "Docker is not running"));
-        setDbMsg(docker?.error ? String(docker.error) : "Install Docker Desktop, start it, then recheck.");
-        return;
+        setDockerBusy(true);
+        setDbMsg(
+          docker?.app_installed
+            ? "Starting Docker Desktop…"
+            : "Downloading Docker Desktop (~600 MB) and opening it…",
+        );
+        try {
+          const ensuredRaw = await invoke<string>("ensure_docker", { install: true });
+          docker = parse(ensuredRaw) as DockerStatus | null;
+          setDockerStatus(docker);
+          setDockerOk(Boolean(docker?.ok));
+          if (!docker?.ok) {
+            setDockerErr(String(docker?.error ?? "Docker is not running"));
+            setDbMsg(dockerNoteBody(docker ?? { ok: false }));
+            return;
+          }
+        } finally {
+          setDockerBusy(false);
+        }
       }
       let raw = await invoke<string>("select_compat_row", { mode: "local_docker" });
       let v = parse(raw);
@@ -595,20 +707,32 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
           {dbMode === "local" ? (
             <>
               <p className="muted">
-                Install{" "}
-                <a href="https://docs.docker.com/desktop/setup/install/mac-install/" target="_blank" rel="noreferrer">
-                  Docker Desktop
-                </a>{" "}
-                (or OrbStack / Colima with the <code>docker</code> CLI), start it, then recheck.
+                Local Postgres runs in Docker. If Docker Desktop isn’t on this Mac,
+                Khipu downloads it from Docker and opens it — first launch may ask
+                for your password.
               </p>
               <div className="toolbar">
-                <button type="button" onClick={() => void refreshDocker()}>Recheck Docker</button>
-                <button type="button" className="primary" disabled={dbBusy} onClick={() => void runLocalSetup()}>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={dockerBusy || dbBusy || dockerOk === true}
+                  onClick={() => void setupDocker()}
+                >
+                  {dockerBusy
+                    ? "Setting up Docker…"
+                    : dockerStatus?.app_installed
+                      ? "Start Docker Desktop"
+                      : "Install Docker Desktop"}
+                </button>
+                <button type="button" disabled={dockerBusy} onClick={() => void refreshDocker()}>Recheck Docker</button>
+                <button type="button" className="primary" disabled={dbBusy || dockerBusy} onClick={() => void runLocalSetup()}>
                   {dbBusy ? "Setting up…" : "Install local Postgres 19"}
                 </button>
               </div>
-              {dockerOk === false ? (
-                <Note tone="warn" title="Docker not ready">{dockerErr ?? "Start Docker Desktop, then recheck."}</Note>
+              {dockerOk === false && dockerStatus ? (
+                <Note tone="warn" title={dockerNoteTitle(dockerStatus)}>{dockerNoteBody(dockerStatus)}</Note>
+              ) : dockerOk === false && dockerErr ? (
+                <Note tone="warn" title="Docker isn’t ready">{dockerErr}</Note>
               ) : null}
               {diskWarn ? <Note tone="warn" title="Low disk space">{diskWarn}</Note> : null}
             </>

@@ -340,6 +340,15 @@ fn select_compat_row(
 }
 
 #[tauri::command]
+fn ensure_docker(install: bool) -> Result<String, String> {
+    let mut args = vec!["components".into(), "ensure-docker".into()];
+    if install {
+        args.push("--install".into());
+    }
+    run_khipu_cli(&args)
+}
+
+#[tauri::command]
 fn install_local_postgres() -> Result<String, String> {
     run_khipu_cli(&["components".into(), "install-local-postgres".into()])
 }
@@ -745,6 +754,7 @@ pub fn run() {
             secrets_presence,
             khipu_migrate,
             select_compat_row,
+            ensure_docker,
             install_local_postgres,
             bootstrap_local_backup,
             install_graphify,
