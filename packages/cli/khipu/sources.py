@@ -208,6 +208,9 @@ def add_code_root(root: Path) -> dict:
         }
     )
     save_sources(doc)
+    from khipu.components_matrix import set_graph_producer
+
+    set_graph_producer(True)
     return doc
 
 
@@ -320,8 +323,16 @@ def collector_flags_from_resolved(raw: dict) -> dict[str, bool]:
 def _code_source_for_path(source_path: str | None, doc: dict) -> str:
     if not source_path:
         return "code:claude"
+    matched = _code_source_id_for_path(source_path, doc)
+    return matched if matched is not None else "code:claude"
+
+
+def _code_source_id_for_path(source_path: str | None, doc: dict) -> str | None:
+    """Longest registered code_ast root prefix; None when unmatched."""
+    if not source_path:
+        return None
     sp = source_path.replace("\\", "/")
-    best_id = "code:claude"
+    best_id: str | None = None
     best_len = -1
     for s in doc.get("sources", []):
         if s.get("kind") != "code_ast":
@@ -336,9 +347,22 @@ def _code_source_for_path(source_path: str | None, doc: dict) -> str:
             rel = str(root_path)
         root_posix = rel.replace("\\", "/")
         if sp.startswith(root_posix) and len(root_posix) > best_len:
-            best_id = str(s.get("id") or "code:claude")
-            best_len = len(root_posix)
+            sid = str(s.get("id") or "").strip()
+            if sid:
+                best_id = sid
+                best_len = len(root_posix)
     return best_id
+
+
+def owned_source_ids(doc: dict | None = None) -> set[str]:
+    """Enabled and reachable source ids from graph_sources.json on this Mac."""
+    doc = doc or load_sources()
+    off = disabled_or_unreachable_ids(doc)
+    return {
+        str(s.get("id"))
+        for s in doc.get("sources", [])
+        if s.get("id") and str(s.get("id")) not in off
+    }
 
 
 def source_id_for_graphify_node(
@@ -379,7 +403,58 @@ def source_id_for_graphify_node(
     if nid.startswith("data_source:") or nid.startswith("notion_db:"):
         return "hardcoded"
     if ntype in {"module", "function", "class"} or bkt == "code":
-        return _code_source_for_path(sp or None, doc)
+        matched = _code_source_id_for_path(sp or None, doc)
+        if matched:
+            return matched
+        # Mac 1 still labels unmatched code as code:claude when that source is
+        # in this Mac's membership file. A join Mac that never listed it must
+        # not stamp Mac 1's id — scoped delete would then purge those nodes.
+        if _find_source(doc, "code:claude") is not None:
+            return _code_source_for_path(sp or None, doc)
+        return None
+    return None
+
+
+def source_id_for_delete(
+    *,
+    node_id: str,
+    type: str,
+    bucket: str | None,
+    source_path: str | None,
+    doc: dict | None = None,
+) -> str | None:
+    """Resolve source_id for delete eligibility; never defaults code paths to code:claude."""
+    doc = doc or load_sources()
+    nid = (node_id or "").strip()
+    ntype = (type or "").strip()
+    bkt = (bucket or "").strip()
+
+    if bkt == "conversation-memory":
+        return "conversation_memory"
+    sp = (source_path or "").replace("\\", "/")
+    if "/Memory/conversations/graph" in sp:
+        return "conversation_memory"
+
+    if nid.startswith("memory_topic:"):
+        return "memory_topics"
+    if nid.startswith("ticker:"):
+        return "wiki:claude"
+    if nid.startswith("skill:"):
+        return "biblical:system" if bkt == "biblical" else "skills:claude"
+    if nid.startswith("agent:"):
+        return "biblical:system" if bkt == "biblical" else "agents:claude"
+    if nid.startswith("report:") or ntype == "report":
+        return "biblical:system" if bkt == "biblical" else "reports:claude"
+    if nid.startswith("corpus_author:") or bkt == "biblical":
+        return "biblical:system"
+    if nid.startswith("gate:"):
+        return "skills:claude"
+    if ntype == "sentiment_run" or nid.startswith("tell:"):
+        return "frozen_tell"
+    if nid.startswith("data_source:") or nid.startswith("notion_db:"):
+        return "hardcoded"
+    if ntype in {"module", "function", "class"} or bkt == "code":
+        return _code_source_id_for_path(sp or None, doc)
     return None
 
 
@@ -404,13 +479,19 @@ def should_delete_graphify_node(node: dict[str, Any], membership_off: set[str]) 
     sp = node.get("source_path")
     if sp and "/Memory/conversations/graph" in str(sp).replace("\\", "/"):
         return False
-    sid = source_id_for_graphify_node(
-        node_id=str(node.get("id") or ""),
-        type=str(node.get("type") or ""),
-        bucket=node.get("bucket"),
-        source_path=sp,
-    )
-    if sid and sid in membership_off:
+    pg_sid = node.get("source_id")
+    if pg_sid:
+        sid = str(pg_sid).strip() or None
+    else:
+        sid = source_id_for_delete(
+            node_id=str(node.get("id") or ""),
+            type=str(node.get("type") or ""),
+            bucket=node.get("bucket"),
+            source_path=sp,
+        )
+    if not sid:
+        return False
+    if sid in membership_off:
         return False
     return True
 
@@ -436,7 +517,13 @@ def _edge_endpoint_node(
     found = nodes_by_id.get(node_id)
     if found is not None:
         return found
-    return {"id": node_id, "type": "", "bucket": None, "source_path": None}
+    return {
+        "id": node_id,
+        "type": "",
+        "bucket": None,
+        "source_path": None,
+        "source_id": None,
+    }
 
 
 def drift_failing_pg_extras(

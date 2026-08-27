@@ -67,13 +67,28 @@ def _add_paths() -> None:
 
 def cmd_status(args: argparse.Namespace) -> int:
     from khipu.drift import status_payload
+    from khipu.hub_snapshot import (
+        hub_connection_failed,
+        maybe_refresh,
+        snapshot_health,
+        status_payload_snapshot,
+    )
 
     mem = Path(args.memory_root) if args.memory_root else None
-    data = status_payload(
-        mem,
-        conflict_sample=int(args.sample),
-        include_drift=bool(args.drift),
-    )
+    try:
+        data = status_payload(
+            mem,
+            conflict_sample=int(args.sample),
+            include_drift=bool(args.drift),
+        )
+        maybe_refresh()
+        data["hub_snapshot"] = snapshot_health()
+    except Exception as exc:
+        if not hub_connection_failed(exc):
+            raise
+        data = status_payload_snapshot()
+        if mem:
+            data["status_error"] = f"{type(exc).__name__}: {exc}"
     print(json.dumps(data, indent=2, default=str))
     return 0
 
@@ -103,10 +118,27 @@ def cmd_revisions(args: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     from khipu.drift import backup_health, sample_drift, status_payload
+    from khipu.hub_snapshot import (
+        hub_connection_failed,
+        maybe_refresh,
+        snapshot_health,
+        status_payload_snapshot,
+    )
     from khipu.keychain import secrets_status
 
     mem = Path(args.memory_root) if args.memory_root else None
-    status = status_payload(None)
+    hub_ok = True
+    try:
+        status = status_payload(None)
+        maybe_refresh()
+    except Exception as exc:
+        if hub_connection_failed(exc):
+            hub_ok = False
+            status = status_payload_snapshot()
+            status["hub_error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            raise
+    hub_snapshot = snapshot_health()
     # A check whose input is not configured on this machine is SKIPPED and
     # named in `not_configured` — distinct from red (configured but broken)
     # and from green (checked and clean). A fresh install has no legacy file
@@ -247,6 +279,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         embed_coverage_ok = False
     out = {
         "status": status,
+        "hub_ok": hub_ok,
+        "hub_snapshot": hub_snapshot,
         "drift": drift,
         "graph_drift": graph,
         "outbox": outbox,
@@ -259,7 +293,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "embed_coverage": embed_coverage,
         "not_configured": not_configured,
         "ok": (
-            drift_ok
+            hub_ok
+            and drift_ok
             and graph.get("ok", False)
             and outbox_ok
             and backup["ok"]
@@ -439,26 +474,45 @@ def _search_query(cur, term: str, limit: int) -> list[dict]:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    from khipu.db import connect
+    from khipu.hub_snapshot import (
+        hub_connection_failed,
+        search_stale_payload,
+        try_hub_connect,
+    )
     from khipu.topic_graph import enrich_search_results
 
-    if getattr(args, "semantic", False):
-        from khipu.embed import semantic_search
+    semantic = getattr(args, "semantic", False)
+    kind = getattr(args, "kind", None)
+    try:
+        if semantic:
+            from khipu.embed import semantic_search
 
-        results = semantic_search(
-            args.query, limit=args.limit, kind=getattr(args, "kind", None)
-        )
-        with connect() as conn:
-            with conn.cursor() as cur:
-                results = enrich_search_results(cur, results)
-        print(json.dumps(results, indent=2))
+            results = semantic_search(args.query, limit=args.limit, kind=kind)
+            with try_hub_connect() as conn:
+                with conn.cursor() as cur:
+                    results = enrich_search_results(cur, results)
+        else:
+            with try_hub_connect() as conn:
+                with conn.cursor() as cur:
+                    results = enrich_search_results(
+                        cur, _search_query(cur, args.query, args.limit)
+                    )
+    except Exception as exc:
+        if not hub_connection_failed(exc):
+            raise
+        if semantic:
+            try:
+                payload = search_stale_payload(
+                    args.query, args.limit, semantic=True, kind=kind
+                )
+            except ValueError as err:
+                print(json.dumps({"ok": False, "error": str(err)}))
+                return 2
+            print(json.dumps(payload, indent=2))
+            return 0
+        payload = search_stale_payload(args.query, args.limit)
+        print(json.dumps(payload, indent=2))
         return 0
-
-    with connect() as conn:
-        with conn.cursor() as cur:
-            results = enrich_search_results(
-                cur, _search_query(cur, args.query, args.limit)
-            )
     print(json.dumps(results, indent=2))
     return 0
 
@@ -679,11 +733,22 @@ def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
 
 
 def cmd_graph(args: argparse.Namespace) -> int:
-    from khipu.db import connect
+    from khipu.hub_snapshot import (
+        graph_neighbors_snapshot,
+        hub_connection_failed,
+        stale_fields,
+        try_hub_connect,
+    )
 
-    with connect() as conn:
-        with conn.cursor() as cur:
-            out = _graph_query(cur, args.id, args.hops, args.limit)
+    try:
+        with try_hub_connect() as conn:
+            with conn.cursor() as cur:
+                out = _graph_query(cur, args.id, args.hops, args.limit)
+    except Exception as exc:
+        if not hub_connection_failed(exc):
+            raise
+        out = graph_neighbors_snapshot(args.id, args.hops, args.limit)
+        out.update(stale_fields())
     print(json.dumps(out, indent=2, default=str))
     return 0
 
@@ -878,6 +943,109 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     return 0 if args.dry_run or not out["pending"] else 1
 
 
+def cmd_join(args: argparse.Namespace) -> int:
+    from khipu.join import (
+        export_kit,
+        import_kit,
+        resolve_passphrase,
+        verify_live_counts,
+    )
+
+    try:
+        passphrase = resolve_passphrase(getattr(args, "passphrase", None))
+    except ValueError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 2
+
+    if args.join_cmd == "export":
+        try:
+            blob = export_kit(passphrase)
+            out_path = Path(args.out).expanduser()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(blob)
+            from khipu.join import decrypt_payload
+
+            payload = decrypt_payload(blob, passphrase)
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+            return 1
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "action": "export",
+                    "out": str(out_path),
+                    "expected": payload.get("expected"),
+                    "created_at": payload.get("created_at"),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.join_cmd == "import":
+        try:
+            blob = Path(args.file).expanduser().read_bytes()
+            summary = import_kit(blob, passphrase)
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+            return 1
+        migrate_out: dict | None = None
+        counts = verify_live_counts(summary.get("expected") or {})
+        if not getattr(args, "skip_migrate_check", False) and not counts.get("error"):
+            from khipu.migrate import run
+
+            migrate_out = run(dry_run=False)
+        result = {
+            "ok": counts["ok"],
+            "action": "import",
+            "summary": summary,
+            "counts": counts,
+        }
+        if counts.get("error"):
+            result["error"] = counts["error"]
+        elif not counts["ok"] and counts.get("mismatches"):
+            result["error"] = "; ".join(counts["mismatches"])
+        if migrate_out is not None:
+            result["migrate"] = migrate_out
+        print(json.dumps(result, indent=2))
+        return 0 if counts["ok"] else 2
+
+    if args.join_cmd == "advertise":
+        try:
+            from khipu.join_pair import advertise_join_kit
+
+            out = advertise_join_kit(
+                passphrase,
+                timeout=int(getattr(args, "timeout", 600) or 600),
+                pin=getattr(args, "pin", None),
+            )
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+            return 1
+        print(json.dumps(out, indent=2))
+        return 0 if out.get("ok") else 1
+
+    if args.join_cmd == "receive":
+        try:
+            from khipu.join_pair import receive_join_kit
+
+            pin = str(getattr(args, "pin", "") or "").strip()
+            out_arg = getattr(args, "out", None)
+            out_path = Path(out_arg).expanduser() if out_arg else None
+            result = receive_join_kit(passphrase, pin, out_path=out_path)
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") else 2
+
+    print(
+        json.dumps({"ok": False, "error": f"unknown join subcommand: {args.join_cmd}"})
+    )
+    return 2
+
+
 def cmd_outbox(args: argparse.Namespace) -> int:
     """Offline outbox: captures whose PG write failed, replayed when PG is back."""
     from khipu import outbox
@@ -888,7 +1056,22 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     out = outbox.drain(limit=args.limit)
     out["remaining"] = outbox.status()["pending"]
     print(json.dumps(out, indent=2))
-    return 0 if out["failed"] == 0 else 2
+    return 0
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    from khipu.hub_snapshot import refresh, snapshot_health
+
+    if args.snapshot_cmd == "status":
+        print(json.dumps(snapshot_health(), indent=2))
+        return 0
+    try:
+        out = refresh()
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+        return 1
+    print(json.dumps(out, indent=2))
+    return 0 if out.get("ok") else 2
 
 
 def cmd_graph_sync(args: argparse.Namespace) -> int:
@@ -1619,6 +1802,86 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mg.set_defaults(func=cmd_migrate)
 
+    join = sub.add_parser(
+        "join",
+        help="Export/import passphrase-encrypted hub join kits (never prints secrets)",
+    )
+    join_sub = join.add_subparsers(dest="join_cmd", required=True)
+    join_export = join_sub.add_parser(
+        "export", help="Write an encrypted join kit from this Mac's Keychain/config"
+    )
+    join_export.add_argument(
+        "--passphrase",
+        default=None,
+        help="Encryption passphrase (or set KHIPU_JOIN_PASSPHRASE)",
+    )
+    join_export.add_argument(
+        "--out",
+        required=True,
+        help="Destination .khipujoin file path",
+    )
+    join_export.set_defaults(func=cmd_join)
+    join_import = join_sub.add_parser(
+        "import", help="Decrypt a join kit and apply hub credentials on this Mac"
+    )
+    join_import.add_argument(
+        "--passphrase",
+        default=None,
+        help="Decryption passphrase (or set KHIPU_JOIN_PASSPHRASE)",
+    )
+    join_import.add_argument(
+        "--file",
+        required=True,
+        help="Path to a .khipujoin file",
+    )
+    join_import.add_argument(
+        "--skip-migrate-check",
+        action="store_true",
+        help="Skip applying pending migrations after import",
+    )
+    join_import.set_defaults(func=cmd_join)
+    join_advertise = join_sub.add_parser(
+        "advertise",
+        help="Advertise join kit on LAN via Bonjour + TLS (macOS dns-sd)",
+    )
+    join_advertise.add_argument(
+        "--passphrase",
+        default=None,
+        help="Encryption passphrase (or set KHIPU_JOIN_PASSPHRASE)",
+    )
+    join_advertise.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        help="Seconds to advertise (default 600)",
+    )
+    join_advertise.add_argument(
+        "--pin",
+        default=None,
+        help="Optional fixed 6-digit PIN (default: random)",
+    )
+    join_advertise.set_defaults(func=cmd_join)
+    join_receive = join_sub.add_parser(
+        "receive",
+        help="Find nearby Mac, send PIN, import join kit",
+    )
+    join_receive.add_argument(
+        "--passphrase",
+        default=None,
+        help="Decryption passphrase (or set KHIPU_JOIN_PASSPHRASE)",
+    )
+    join_receive.add_argument(
+        "--pin",
+        required=True,
+        help="Six-digit PIN shown on the exporting Mac",
+    )
+    join_receive.add_argument(
+        "--out",
+        default=None,
+        help="Optional path to save the .khipujoin file",
+    )
+    join_receive.set_defaults(func=cmd_join)
+
     cfg = sub.add_parser("config", help="Show / set Hub config (capture_mode, paths)")
     cfg.add_argument(
         "--set",
@@ -1737,6 +2000,17 @@ def build_parser() -> argparse.ArgumentParser:
     obd.add_argument("--limit", type=int, default=None)
     ob_sub.add_parser("status", help="Pending count + oldest age")
     ob.set_defaults(func=cmd_outbox)
+
+    snap = sub.add_parser(
+        "snapshot",
+        help="Hub read replica: refresh hub_snapshot.sqlite / status",
+    )
+    snap_sub = snap.add_subparsers(dest="snapshot_cmd", required=True)
+    snap_sub.add_parser(
+        "refresh", help="Dump hub tables into hub_snapshot.sqlite (hub must be up)"
+    )
+    snap_sub.add_parser("status", help="Snapshot age, size, and row counts from meta")
+    snap.set_defaults(func=cmd_snapshot)
 
     tg = sub.add_parser(
         "topic-graph",

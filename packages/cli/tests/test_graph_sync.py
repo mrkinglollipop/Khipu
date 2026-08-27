@@ -5,6 +5,7 @@ real graph.sqlite is unreachable) run the sync in dry-run mode — one transacti
 rolled back — and assert the drift check is zero, i.e. what the nightly leaves
 behind is what doctor calls ok.
 """
+
 from __future__ import annotations
 
 import json
@@ -22,11 +23,13 @@ from khipu import jobs
 
 def _pg_and_sqlite_available() -> bool:
     from khipu.config import path_setting
+
     sqlite = path_setting("graph_sqlite")
     if sqlite is None or not sqlite.is_file():
         return False
     try:
         from khipu.db import connect
+
         with connect() as c, c.cursor() as cur:
             cur.execute("select 1")
         return True
@@ -54,10 +57,40 @@ class ReadSqliteTest(unittest.TestCase):
             con.close()
             nodes, edges = gs._read_sqlite(p)
             self.assertEqual(len(nodes), 3)
-            a = dict(zip(("id", "type", "bucket", "name", "payload", "source_path", "built_at", "frozen"), nodes[0]))
-            self.assertEqual((a["bucket"], a["payload"], a["frozen"]), ("code", '{"k":1}', False))
-            b = dict(zip(("id", "type", "bucket", "name", "payload", "source_path", "built_at", "frozen"), nodes[1]))
-            self.assertIsNone(b["bucket"])                          # '' -> NULL, as P1 did
+            a = dict(
+                zip(
+                    (
+                        "id",
+                        "type",
+                        "bucket",
+                        "name",
+                        "payload",
+                        "source_path",
+                        "built_at",
+                        "frozen",
+                    ),
+                    nodes[0],
+                )
+            )
+            self.assertEqual(
+                (a["bucket"], a["payload"], a["frozen"]), ("code", '{"k":1}', False)
+            )
+            b = dict(
+                zip(
+                    (
+                        "id",
+                        "type",
+                        "bucket",
+                        "name",
+                        "payload",
+                        "source_path",
+                        "built_at",
+                        "frozen",
+                    ),
+                    nodes[1],
+                )
+            )
+            self.assertIsNone(b["bucket"])  # '' -> NULL, as P1 did
             self.assertEqual(json.loads(b["payload"]), {"_raw": "not json"})
             self.assertTrue(b["frozen"])
             self.assertIsNone(b["built_at"])
@@ -89,19 +122,34 @@ class ReadSqliteTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             gs.sync_from_sqlite(Path("/nonexistent/graph.sqlite"), dry_run=True)
 
+    def test_non_producer_skips_even_when_sqlite_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "graph.sqlite"
+            sqlite3.connect(p).close()
+            with mock.patch.object(gs, "is_graph_producer", return_value=False):
+                d = gs.graph_drift(p)
+            self.assertTrue(d["ok"])
+            self.assertIn("skipped", d)
+
     def test_graph_producer_requires_scheduled_jobs_flag(self):
         with tempfile.TemporaryDirectory() as td:
             agents = Path(td)
             khipu = agents / "com.matt.khipu-graph.plist"
             khipu.write_text("plist")
             versions = {"scheduled_jobs": {"graph_build": True}}
-            with mock.patch.dict(os.environ, {"KHIPU_GRAPH_PRODUCER": ""}), \
-                 mock.patch.object(jobs, "_launchagents_dir", return_value=agents), \
-                 mock.patch("khipu.components_matrix.read_versions", return_value=versions):
+            with (
+                mock.patch.dict(os.environ, {"KHIPU_GRAPH_PRODUCER": ""}),
+                mock.patch.object(jobs, "_launchagents_dir", return_value=agents),
+                mock.patch(
+                    "khipu.components_matrix.read_versions", return_value=versions
+                ),
+            ):
                 self.assertTrue(gs.is_graph_producer())
-            with mock.patch.dict(os.environ, {"KHIPU_GRAPH_PRODUCER": ""}), \
-                 mock.patch.object(jobs, "_launchagents_dir", return_value=agents), \
-                 mock.patch("khipu.components_matrix.read_versions", return_value={}):
+            with (
+                mock.patch.dict(os.environ, {"KHIPU_GRAPH_PRODUCER": ""}),
+                mock.patch.object(jobs, "_launchagents_dir", return_value=agents),
+                mock.patch("khipu.components_matrix.read_versions", return_value={}),
+            ):
                 self.assertFalse(gs.is_graph_producer())
 
 
@@ -113,7 +161,9 @@ class MembershipDeleteTest(unittest.TestCase):
             "bucket": "shared",
             "source_path": "Reports/foo.pdf",
         }
-        self.assertFalse(sources_mod.should_delete_graphify_node(node, {"reports:claude"}))
+        self.assertFalse(
+            sources_mod.should_delete_graphify_node(node, {"reports:claude"})
+        )
 
     def test_enabled_missing_report_is_a_delete_candidate(self):
         node = {
@@ -176,26 +226,59 @@ class MembershipDeleteTest(unittest.TestCase):
         )
 
 
+class ScopedDeleteTest(unittest.TestCase):
+    def test_mac2_does_not_delete_mac1_source_id_nodes(self):
+        mac1_node = {
+            "id": "module:mac1",
+            "type": "module",
+            "bucket": "code",
+            "source_path": "/mac1/Khipu/packages/cli/foo.py",
+            "source_id": "code:mac1",
+        }
+        owned = {"code:mac2"}
+        self.assertTrue(sources_mod.should_delete_graphify_node(mac1_node, set()))
+        self.assertFalse(gs._node_owned(mac1_node, owned))
+
+    def test_owned_mac2_node_is_deletable_when_owned(self):
+        mac2_node = {
+            "id": "module:mac2",
+            "type": "module",
+            "bucket": "code",
+            "source_path": "/mac2/project/bar.py",
+            "source_id": "code:mac2",
+        }
+        owned = {"code:mac2"}
+        self.assertTrue(sources_mod.should_delete_graphify_node(mac2_node, set()))
+        self.assertTrue(gs._node_owned(mac2_node, owned))
+
+
 @unittest.skipUnless(_pg_and_sqlite_available(), "PG or graph.sqlite unreachable")
 class LiveGraphMirrorTest(unittest.TestCase):
     def test_dry_run_is_transactional_and_live_drift_is_zero(self):
         before = gs.graph_drift()
-        out = gs.sync_from_sqlite(dry_run=True)          # rolls back
+        out = gs.sync_from_sqlite(dry_run=True)  # rolls back
         self.assertTrue(out["dry_run"])
         self.assertEqual(out["sqlite_dangling_edges"], 0)
         after = gs.graph_drift()
         for k in ("pg_graphify_nodes", "pg_graphify_edges", "pg_khipu_nodes"):
-            self.assertEqual(before[k], after[k], k)      # dry run changed nothing
+            self.assertEqual(before[k], after[k], k)  # dry run changed nothing
         # The mirror is wired into graphify's nightly; between nightlies the live
         # PG must match graph.sqlite exactly. Not a soft check.
-        self.assertTrue(after["ok"], {k: v for k, v in after.items() if not k.startswith("sample")})
+        self.assertTrue(
+            after["ok"], {k: v for k, v in after.items() if not k.startswith("sample")}
+        )
 
     def test_cli_check_exits_zero_on_zero_drift(self):
         import subprocess
         import sys
-        r = subprocess.run([sys.executable, "-m", "khipu.cli", "graph-sync", "--check"],
-                           capture_output=True, text=True, timeout=300,
-                           env=dict(os.environ, PYTHONPATH=os.environ.get("PYTHONPATH", "")))
+
+        r = subprocess.run(
+            [sys.executable, "-m", "khipu.cli", "graph-sync", "--check"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=dict(os.environ, PYTHONPATH=os.environ.get("PYTHONPATH", "")),
+        )
         self.assertEqual(r.returncode, 0, r.stdout[-400:] + r.stderr[-400:])
 
 

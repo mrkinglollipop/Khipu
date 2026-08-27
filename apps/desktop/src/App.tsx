@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { open as openDirectoryDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDirectoryDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   Blocks,
   ChevronRight,
@@ -935,6 +935,21 @@ export default function App() {
   const [appVersion, setAppVersion] = useState<string>("…");
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
+  const [setupJoinPassphrase, setSetupJoinPassphrase] = useState("");
+  const [setupJoinMsg, setSetupJoinMsg] = useState<string | null>(null);
+  const [setupJoinExpected, setSetupJoinExpected] = useState<Counts | null>(null);
+  const [advertiseBusy, setAdvertiseBusy] = useState(false);
+  const [advertiseInfo, setAdvertiseInfo] = useState<{
+    pin?: string;
+    timeout_sec?: number;
+    expires_at?: number;
+  } | null>(null);
+  const [hubSnapshotHealth, setHubSnapshotHealth] = useState<{
+    refreshed_at?: string;
+    size_bytes?: number;
+    bytes?: number;
+    ok?: boolean;
+  } | null>(null);
 
   const loadPaths = useCallback(async () => {
     try {
@@ -1176,8 +1191,17 @@ export default function App() {
     if (tab === "settings") {
       void loadModels();
       void loadSecretsPresence();
+      void (async () => {
+        try {
+          const raw = await runKhipu(["status"]);
+          const parsed = parseJson(raw) as { hub_snapshot?: typeof hubSnapshotHealth } | null;
+          setHubSnapshotHealth(parsed?.hub_snapshot ?? null);
+        } catch {
+          setHubSnapshotHealth(null);
+        }
+      })();
     }
-  }, [tab, loadPaths, loadGraphSources, loadModels, loadSecretsPresence]);
+  }, [tab, loadPaths, loadGraphSources, loadModels, loadSecretsPresence, runKhipu]);
 
   useEffect(() => {
     void getVersion()
@@ -1237,6 +1261,77 @@ export default function App() {
       setActionBusy(false);
     }
   }, [backupOut]);
+
+  const exportJoinKit = useCallback(async () => {
+    const passphrase = setupJoinPassphrase.trim();
+    if (!passphrase) {
+      setSetupJoinMsg("Enter a passphrase first.");
+      return;
+    }
+    setSetupJoinMsg(null);
+    try {
+      const dest = await saveFileDialog({
+        defaultPath: "Khipu-join.khipujoin",
+        filters: [{ name: "Khipu join kit", extensions: ["khipujoin"] }],
+      });
+      if (typeof dest !== "string" || !dest.trim()) return;
+      const raw = await invoke<string>("join_export", {
+        passphrase,
+        outPath: dest.trim(),
+      });
+      const parsed = parseJson(raw) as {
+        ok?: boolean;
+        error?: string;
+        out?: string;
+        expected?: Counts;
+      } | null;
+      if (parsed?.ok !== true) {
+        setSetupJoinMsg(String(parsed?.error ?? "Export failed."));
+        return;
+      }
+      setSetupJoinExpected(parsed.expected ?? null);
+      setSetupJoinMsg(`Saved join kit to ${parsed.out ?? dest}`);
+    } catch (e) {
+      setSetupJoinMsg(String(e));
+    }
+  }, [setupJoinPassphrase]);
+
+  const startJoinAdvertise = useCallback(async () => {
+    const passphrase = setupJoinPassphrase.trim();
+    if (!passphrase) {
+      setSetupJoinMsg("Enter a passphrase first.");
+      return;
+    }
+    setAdvertiseBusy(true);
+    setSetupJoinMsg(null);
+    setAdvertiseInfo(null);
+    try {
+      const raw = await invoke<string>("join_advertise", { passphrase, timeout: 600 });
+      const parsed = parseJson(raw) as {
+        ok?: boolean;
+        error?: string;
+        pin?: string;
+        timeout_sec?: number;
+        expires_at?: number;
+      } | null;
+      if (parsed?.ok !== true) {
+        setSetupJoinMsg(String(parsed?.error ?? "Advertise failed."));
+        return;
+      }
+      setAdvertiseInfo({
+        pin: parsed.pin,
+        timeout_sec: parsed.timeout_sec,
+        expires_at: parsed.expires_at,
+      });
+      setSetupJoinMsg(
+        `Advertising nearby for ${parsed.timeout_sec ?? 600}s — share PIN ${parsed.pin ?? "?"}`,
+      );
+    } catch (e) {
+      setSetupJoinMsg(String(e));
+    } finally {
+      setAdvertiseBusy(false);
+    }
+  }, [setupJoinPassphrase]);
 
   const runScheduledJob = useCallback(async (subcommand: string) => {
     setJobSpawnMsg(null);
@@ -2256,6 +2351,76 @@ export default function App() {
                   </button>
                 </div>
                 {updateMsg ? <pre className="code">{updateMsg}</pre> : null}
+              </div>
+            </div>
+
+            <div className="section-card">
+              <div className="section-head">Set up another Mac</div>
+              <div className="section-body">
+                <p className="muted">
+                  Export a passphrase-encrypted join kit for a second Mac. The file
+                  carries hub credentials and expected episode/topic/node counts — not a
+                  database dump. AirDrop the <code>.khipujoin</code> file or advertise
+                  nearby with a short-lived PIN (Bonjour + TLS; macOS best-effort).
+                </p>
+                <ul className="welcome-list muted">
+                  <li>Tailscale / VPN is optional when the hub is already reachable.</li>
+                  <li>Same repo cloned at two paths on one Mac = duplicate graph nodes in v1.</li>
+                </ul>
+                <div className="toolbar" style={{ width: "100%" }}>
+                  <input
+                    className="mono"
+                    type="password"
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={setupJoinPassphrase}
+                    onChange={(e) => setSetupJoinPassphrase(e.target.value)}
+                    placeholder="Join passphrase (share verbally with the other Mac)"
+                    aria-label="Join export passphrase"
+                  />
+                </div>
+                <div className="toolbar">
+                  <button
+                    type="button"
+                    className="primary"
+                    disabled={!setupJoinPassphrase.trim()}
+                    onClick={() => void exportJoinKit()}
+                  >
+                    Save join kit…
+                  </button>
+                  <button
+                    type="button"
+                    disabled={advertiseBusy || !setupJoinPassphrase.trim()}
+                    onClick={() => void startJoinAdvertise()}
+                  >
+                    {advertiseBusy ? "Starting…" : "Advertise nearby (PIN)"}
+                  </button>
+                </div>
+                {setupJoinExpected ? (
+                  <p className="muted mono">
+                    Expected hub counts — episodes {setupJoinExpected.episodes ?? "?"},
+                    topics {setupJoinExpected.topics ?? "?"}, nodes{" "}
+                    {setupJoinExpected.nodes ?? "?"}
+                  </p>
+                ) : null}
+                {advertiseInfo?.pin ? (
+                  <p className="muted">
+                    PIN <strong className="mono">{advertiseInfo.pin}</strong>
+                    {advertiseInfo.timeout_sec
+                      ? ` · expires in ~${advertiseInfo.timeout_sec}s`
+                      : null}
+                  </p>
+                ) : null}
+                {hubSnapshotHealth?.refreshed_at ? (
+                  <p className="muted">
+                    Hub snapshot refreshed{" "}
+                    <code>{hubSnapshotHealth.refreshed_at}</code>
+                    {typeof (hubSnapshotHealth.size_bytes ?? hubSnapshotHealth.bytes) === "number"
+                      ? ` (${formatBytes(hubSnapshotHealth.size_bytes ?? hubSnapshotHealth.bytes ?? 0)})`
+                      : null}
+                  </p>
+                ) : null}
+                {setupJoinMsg ? <pre className="code">{setupJoinMsg}</pre> : null}
               </div>
             </div>
 
