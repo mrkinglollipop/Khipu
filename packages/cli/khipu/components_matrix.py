@@ -61,6 +61,16 @@ def write_versions(data: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def set_graph_producer(value: bool = True) -> None:
+    """Mark this Mac as a graph.sqlite feeder (versions.json graph_producer)."""
+    versions = read_versions()
+    if value:
+        versions["graph_producer"] = True
+    else:
+        versions.pop("graph_producer", None)
+    write_versions(versions)
+
+
 def _repo_root() -> Path:
     from khipu.paths import repo_root
 

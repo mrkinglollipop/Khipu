@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   Check,
   ChevronLeft,
@@ -23,7 +24,7 @@ export function welcomeCompleted(): boolean {
 export const SUPPORT_EMAIL = "support@kinglollipop.com";
 
 type StepId = "welcome" | "database" | "model" | "graph" | "agents" | "finish";
-type DbMode = "local" | "remote";
+type DbMode = "join" | "local" | "remote";
 
 const STEPS: { id: StepId; label: string }[] = [
   { id: "welcome", label: "Welcome" },
@@ -33,6 +34,17 @@ const STEPS: { id: StepId; label: string }[] = [
   { id: "agents", label: "Agents" },
   { id: "finish", label: "Finish" },
 ];
+
+function joinFailMessage(
+  out: Record<string, unknown> | null,
+  fallback: string,
+): string {
+  const counts = out?.counts as { mismatches?: unknown } | undefined;
+  const mismatch = Array.isArray(counts?.mismatches)
+    ? (counts.mismatches as string[]).join("; ")
+    : "";
+  return String(out?.error || mismatch || fallback);
+}
 
 function parse(raw: string): Record<string, unknown> | null {
   try {
@@ -111,7 +123,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
   const idx = STEPS.findIndex((s) => s.id === step);
   const go = (n: number) => setStep(STEPS[Math.max(0, Math.min(STEPS.length - 1, idx + n))].id);
 
-  const [dbMode, setDbMode] = useState<DbMode>("local");
+  const [dbMode, setDbMode] = useState<DbMode>("join");
   const [dockerOk, setDockerOk] = useState<boolean | null>(null);
   const [dockerErr, setDockerErr] = useState<string | null>(null);
   const [diskWarn, setDiskWarn] = useState<string | null>(null);
@@ -122,6 +134,17 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
   const [remoteDsn, setRemoteDsn] = useState("");
   const [remoteBusy, setRemoteBusy] = useState(false);
   const [remoteReady, setRemoteReady] = useState(false);
+
+  const [joinPassphrase, setJoinPassphrase] = useState("");
+  const [joinPin, setJoinPin] = useState("");
+  const [joinBusy, setJoinBusy] = useState(false);
+  const [joinReady, setJoinReady] = useState(false);
+  const [joinedHub, setJoinedHub] = useState(false);
+  const [joinExpected, setJoinExpected] = useState<Record<string, number> | null>(null);
+  const [joinLive, setJoinLive] = useState<Record<string, number> | null>(null);
+
+  const [newCodeRoot, setNewCodeRoot] = useState("");
+  const [graphSourcesMsg, setGraphSourcesMsg] = useState<string | null>(null);
 
   const [plan, setPlan] = useState<MigratePlan | null>(null);
   const [planErr, setPlanErr] = useState<string | null>(null);
@@ -273,6 +296,143 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
       setRemoteBusy(false);
     }
   }, [remoteDsn, refreshDsn, applyMigrations, loadPlan]);
+
+  const completeJoinAfterImport = useCallback(
+    async (summary: Record<string, unknown> | undefined, counts: Record<string, unknown> | undefined) => {
+      setJoinExpected((summary?.expected as Record<string, number>) ?? null);
+      if (counts?.live && typeof counts.live === "object") {
+        setJoinLive(counts.live as Record<string, number>);
+      }
+      await refreshDsn();
+      let raw = await invoke<string>("check_remote_postgres", { full: false });
+      let v = parse(raw);
+      let err = payloadError(v);
+      if (err) {
+        setDbMsg(err);
+        return false;
+      }
+      await applyMigrations();
+      raw = await invoke<string>("check_remote_postgres", { full: true });
+      v = parse(raw);
+      err = payloadError(v);
+      if (err) {
+        setDbMsg(err);
+        return false;
+      }
+      await loadPlan();
+      setJoinReady(true);
+      setJoinedHub(true);
+      const mismatches = Array.isArray(counts?.mismatches)
+        ? (counts.mismatches as string[])
+        : [];
+      setDbMsg(
+        mismatches.length
+          ? `Joined the hub — count delta vs kit: ${mismatches.join("; ")}`
+          : "Joined the hub — live counts match the join kit.",
+      );
+      return true;
+    },
+    [refreshDsn, applyMigrations, loadPlan],
+  );
+
+  const importJoinFromFile = useCallback(async () => {
+    const passphrase = joinPassphrase.trim();
+    if (!passphrase) {
+      setDbMsg("Enter the join passphrase first.");
+      return;
+    }
+    setJoinBusy(true);
+    setDbMsg(null);
+    setJoinReady(false);
+    try {
+      const selected = await openFileDialog({
+        multiple: false,
+        filters: [{ name: "Khipu join kit", extensions: ["khipujoin"] }],
+      });
+      if (typeof selected !== "string" || !selected.trim()) return;
+      const raw = await invoke<string>("join_import", {
+        passphrase,
+        filePath: selected.trim(),
+      });
+      const out = parse(raw);
+      if (out?.ok !== true) {
+        setDbMsg(joinFailMessage(out, "Join import failed."));
+        return;
+      }
+      await completeJoinAfterImport(
+        out.summary as Record<string, unknown> | undefined,
+        out.counts as Record<string, unknown> | undefined,
+      );
+    } catch (e) {
+      setDbMsg(String(e));
+    } finally {
+      setJoinBusy(false);
+    }
+  }, [joinPassphrase, completeJoinAfterImport]);
+
+  const receiveJoinNearby = useCallback(async () => {
+    const passphrase = joinPassphrase.trim();
+    const pin = joinPin.trim();
+    if (!passphrase) {
+      setDbMsg("Enter the join passphrase first.");
+      return;
+    }
+    if (!/^\d{6}$/.test(pin)) {
+      setDbMsg("Enter the six-digit PIN from the other Mac.");
+      return;
+    }
+    setJoinBusy(true);
+    setDbMsg(null);
+    setJoinReady(false);
+    try {
+      const raw = await invoke<string>("join_receive", { passphrase, pin, outPath: null });
+      const out = parse(raw);
+      if (out?.ok !== true) {
+        setDbMsg(joinFailMessage(out, "Nearby join failed."));
+        return;
+      }
+      await completeJoinAfterImport(
+        out.summary as Record<string, unknown> | undefined,
+        out.counts as Record<string, unknown> | undefined,
+      );
+    } catch (e) {
+      setDbMsg(String(e));
+    } finally {
+      setJoinBusy(false);
+    }
+  }, [joinPassphrase, joinPin, completeJoinAfterImport]);
+
+  const addGraphCodeRootPath = useCallback(
+    async (path: string) => {
+      const trimmed = path.trim();
+      if (!trimmed) return;
+      setGraphSourcesMsg(null);
+      try {
+        const raw = await runKhipu(["sources", "add", `--root=${trimmed}`]);
+        const out = parse(raw);
+        if (out?.ok !== true) {
+          setGraphSourcesMsg(String(out?.error ?? "Could not add folder."));
+          return;
+        }
+        setNewCodeRoot("");
+        setGraphSourcesMsg(`Added ${trimmed} — runs on the next graph build.`);
+      } catch (e) {
+        setGraphSourcesMsg(String(e));
+      }
+    },
+    [runKhipu],
+  );
+
+  const pickGraphCodeRoot = useCallback(async () => {
+    try {
+      const selected = await openFileDialog({ directory: true, multiple: false });
+      if (typeof selected === "string" && selected.trim()) {
+        await addGraphCodeRootPath(selected);
+      }
+    } catch (e) {
+      setGraphSourcesMsg(String(e));
+    }
+  }, [addGraphCodeRootPath]);
 
   const [presence, setPresence] = useState<Presence | null>(null);
   const [key, setKey] = useState("");
@@ -484,7 +644,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
 
   const canFinish =
     doctor?.ok === true ||
-    (dbMode === "remote" && soleBackupRed);
+    ((dbMode === "remote" || dbMode === "join") && soleBackupRed);
 
   const finish = (withWarnings = false) => {
     if (!canFinish) return;
@@ -498,7 +658,12 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
   };
 
   const pending = plan?.pending?.length ?? 0;
-  const databaseReady = dbMode === "local" ? localReady && dsnOk : remoteReady && dsnOk;
+  const databaseReady =
+    dbMode === "join"
+      ? joinReady && dsnOk
+      : dbMode === "local"
+        ? localReady && dsnOk
+        : remoteReady && dsnOk;
 
   return (
     <div className="onboard welcome" data-step={step}>
@@ -527,7 +692,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
             come back; nothing here has to be finished in one go.
           </p>
           <ul className="welcome-list">
-            <li><strong>Database</strong> — local PostgreSQL 19 or connect an existing server.</li>
+            <li><strong>Database</strong> — join an existing hub, start local Postgres, or connect a server.</li>
             <li><strong>Model</strong> — cloud Gemini, local OpenAI-compat, or skip (capture queues).</li>
             <li><strong>Graph</strong> — installs the Graphify engine under Application Support.</li>
             <li><strong>Agents</strong> — one click per harness to wire the hooks in.</li>
@@ -548,10 +713,19 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
               <input
                 type="radio"
                 name="db-mode"
+                checked={dbMode === "join"}
+                onChange={() => setDbMode("join")}
+              />
+              {" "}Join existing Khipu
+            </label>
+            <label className="mono">
+              <input
+                type="radio"
+                name="db-mode"
                 checked={dbMode === "local"}
                 onChange={() => setDbMode("local")}
               />
-              {" "}Start a local Postgres 19 (Docker Desktop)
+              {" "}Brand-new empty database on this Mac (Docker)
             </label>
             <label className="mono">
               <input
@@ -560,11 +734,69 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                 checked={dbMode === "remote"}
                 onChange={() => setDbMode("remote")}
               />
-              {" "}I already have PostgreSQL 19
+              {" "}I already have PostgreSQL 19 (paste DSN)
             </label>
           </div>
 
-          {dbMode === "local" ? (
+          {dbMode === "join" ? (
+            <>
+              <p className="muted">
+                On the hub Mac: Settings → Set up another Mac — export a join kit or
+                advertise nearby with a PIN. Import the <code>.khipujoin</code> file
+                (AirDrop works) or enter the PIN to find that Mac on the LAN. Tailscale
+                or VPN is optional when the hub is already reachable.
+              </p>
+              <div className="toolbar" style={{ width: "100%" }}>
+                <input
+                  className="mono"
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={joinPassphrase}
+                  onChange={(e) => setJoinPassphrase(e.target.value)}
+                  placeholder="Join passphrase (same on both Macs)"
+                  aria-label="Join passphrase"
+                />
+              </div>
+              <div className="toolbar">
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={joinBusy || !joinPassphrase.trim()}
+                  onClick={() => void importJoinFromFile()}
+                >
+                  {joinBusy ? "Importing…" : "Import join kit file…"}
+                </button>
+              </div>
+              <p className="muted">Or find a Mac nearby (Bonjour + TLS — best-effort on macOS):</p>
+              <div className="toolbar" style={{ width: "100%" }}>
+                <input
+                  className="mono"
+                  value={joinPin}
+                  onChange={(e) => setJoinPin(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                  placeholder="6-digit PIN"
+                  aria-label="Nearby join PIN"
+                  maxLength={6}
+                />
+                <button
+                  type="button"
+                  disabled={joinBusy || !joinPassphrase.trim() || joinPin.length !== 6}
+                  onClick={() => void receiveJoinNearby()}
+                >
+                  {joinBusy ? "Connecting…" : "Find nearby Mac"}
+                </button>
+              </div>
+              {joinExpected ? (
+                <Note tone="ok" title="Expected hub counts">
+                  episodes {joinExpected.episodes ?? "?"} · topics {joinExpected.topics ?? "?"} ·
+                  nodes {joinExpected.nodes ?? "?"}
+                  {joinLive
+                    ? ` — live: episodes ${joinLive.episodes ?? "?"}, topics ${joinLive.topics ?? "?"}, nodes ${joinLive.nodes ?? "?"}`
+                    : null}
+                </Note>
+              ) : null}
+            </>
+          ) : dbMode === "local" ? (
             <>
               <p className="muted">
                 Install{" "}
@@ -825,6 +1057,43 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
               {graphErr ?? "Complete the Database step first so pending Graphify version is set."}
             </Note>
           )}
+          {joinedHub ? (
+            <div className="section-card">
+              <div className="section-head">Add folders on this Mac</div>
+              <div className="section-body">
+                <p className="muted">
+                  Optional — publish extra code folders into the shared graph on the next
+                  build. Skip to stay reader-only on this Mac (search and graph still work
+                  from the hub). Same repo cloned at two paths creates duplicate graph nodes
+                  in v1.
+                </p>
+                <div className="toolbar">
+                  <input
+                    className="mono"
+                    value={newCodeRoot}
+                    onChange={(e) => setNewCodeRoot(e.target.value)}
+                    placeholder="/absolute/path/to/code"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && newCodeRoot.trim()) {
+                        void addGraphCodeRootPath(newCodeRoot);
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    disabled={!newCodeRoot.trim()}
+                    onClick={() => void addGraphCodeRootPath(newCodeRoot)}
+                  >
+                    Add folder
+                  </button>
+                  <button type="button" onClick={() => void pickGraphCodeRoot()}>
+                    Choose folder…
+                  </button>
+                </div>
+                {graphSourcesMsg ? <pre className="code">{graphSourcesMsg}</pre> : null}
+              </div>
+            </div>
+          ) : null}
         </>
       ) : null}
 
@@ -874,7 +1143,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
               {soleBackupRed ? (
                 <div className="callout-body">
                   Only <code>backup_ok</code> is red — server-operator backups are not recorded yet.
-                  You may continue with warnings on a remote database.
+                  You may continue with warnings on a remote or joined hub database.
                 </div>
               ) : null}
             </Note>

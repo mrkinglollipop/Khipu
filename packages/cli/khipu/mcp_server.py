@@ -28,6 +28,7 @@ Manual harness wiring (Install packs remain P3 — do not auto-edit configs):
 
 (``khipu integrations install <harness>`` writes this for you.)
 """
+
 from __future__ import annotations
 
 import json
@@ -257,7 +258,10 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "summary": {"type": "string", "description": "Episode summary (required)"},
+                "summary": {
+                    "type": "string",
+                    "description": "Episode summary (required)",
+                },
                 "topics": {"type": "array", "items": {"type": "string"}},
                 "people": {"type": "array", "items": {"type": "string"}},
                 "decisions": {"type": "array", "items": {"type": "string"}},
@@ -280,33 +284,43 @@ def _tool_search(args: dict) -> dict:
         raise ValueError("query is required")
     limit = min(int(args.get("limit") or SEARCH_LIMIT_DEFAULT), SEARCH_LIMIT_MAX)
     _ensure_path()
-    if args.get("semantic"):
-        from khipu.embed import semantic_search
-
-        kind = args.get("kind") or None
-        if kind not in (None, "episode", "topic", "media"):
-            raise ValueError("kind must be 'episode', 'topic', or 'media'")
-        from khipu.db import connect
-        from khipu.topic_graph import enrich_search_results
-
-        results = semantic_search(query, limit=max(1, limit), kind=kind)
-        with connect() as conn:
-            with conn.cursor() as cur:
-                results = enrich_search_results(cur, results)
-        return {"query": query, "mode": "semantic", "results": results}
-    from khipu.cli import _search_query
-    from khipu.db import connect
+    from khipu.hub_snapshot import (
+        hub_connection_failed,
+        search_stale_payload,
+        try_hub_connect,
+    )
     from khipu.topic_graph import enrich_search_results
 
-    with connect() as conn:
-        with conn.cursor() as cur:
-            return {
-                "query": query,
-                "mode": "ilike",
-                "results": enrich_search_results(
-                    cur, _search_query(cur, query, max(1, limit))
-                ),
-            }
+    semantic = bool(args.get("semantic"))
+    kind = args.get("kind") or None
+    if kind not in (None, "episode", "topic", "media"):
+        raise ValueError("kind must be 'episode', 'topic', or 'media'")
+    try:
+        if semantic:
+            from khipu.embed import semantic_search
+
+            results = semantic_search(query, limit=max(1, limit), kind=kind)
+            with try_hub_connect() as conn:
+                with conn.cursor() as cur:
+                    results = enrich_search_results(cur, results)
+            return {"query": query, "mode": "semantic", "results": results}
+        from khipu.cli import _search_query
+
+        with try_hub_connect() as conn:
+            with conn.cursor() as cur:
+                return {
+                    "query": query,
+                    "mode": "ilike",
+                    "results": enrich_search_results(
+                        cur, _search_query(cur, query, max(1, limit))
+                    ),
+                }
+    except Exception as exc:
+        if not hub_connection_failed(exc):
+            raise
+        if semantic:
+            return search_stale_payload(query, max(1, limit), semantic=True, kind=kind)
+        return search_stale_payload(query, max(1, limit))
 
 
 def _tool_get(args: dict) -> dict:
@@ -317,37 +331,69 @@ def _tool_get(args: dict) -> dict:
     if kind not in (None, "episode", "topic", "media"):
         raise ValueError("kind must be 'episode', 'topic', or 'media'")
     _ensure_path()
-    from khipu.activity import episode_detail, media_detail, topic_detail
+    from khipu.hub_snapshot import (
+        episode_detail_snapshot,
+        hub_connection_failed,
+        stale_fields,
+        topic_detail_snapshot,
+    )
 
     inferred = kind
     if inferred is None:
         inferred = "episode" if ident.isdigit() else "topic"
 
+    hub_failed = False
+    try:
+        from khipu.activity import episode_detail, media_detail, topic_detail
+
+        if inferred == "episode":
+            if not ident.isdigit():
+                raise ValueError("episode id must be digits")
+            row = episode_detail(int(ident))
+            if row is None:
+                if kind is not None:
+                    raise ValueError(f"episode not found: {ident}")
+                inferred = "topic"
+            else:
+                row = dict(row)
+                row.pop("raw", None)
+                return {"kind": "episode", **row}
+        if inferred == "topic":
+            row = topic_detail(ident)
+            if row is None and kind is None:
+                media = media_detail(ident)
+                if media is not None:
+                    return {"kind": "media", **media}
+            if row is None:
+                raise ValueError(f"topic not found: {ident}")
+            return {"kind": "topic", **row}
+        row = media_detail(ident)
+        if row is None:
+            raise ValueError(f"media not found: {ident}")
+        return {"kind": "media", **row}
+    except Exception as exc:
+        if not hub_connection_failed(exc):
+            raise
+        hub_failed = True
+
     if inferred == "episode":
         if not ident.isdigit():
             raise ValueError("episode id must be digits")
-        row = episode_detail(int(ident))
+        row = episode_detail_snapshot(int(ident))
         if row is None:
             if kind is not None:
                 raise ValueError(f"episode not found: {ident}")
             inferred = "topic"
         else:
-            row = dict(row)
-            row.pop("raw", None)
-            return {"kind": "episode", **row}
+            return {"kind": "episode", **row, **stale_fields()}
     if inferred == "topic":
-        row = topic_detail(ident)
-        if row is None and kind is None:
-            media = media_detail(ident)
-            if media is not None:
-                return {"kind": "media", **media}
+        row = topic_detail_snapshot(ident)
         if row is None:
             raise ValueError(f"topic not found: {ident}")
-        return {"kind": "topic", **row}
-    row = media_detail(ident)
-    if row is None:
+        return {"kind": "topic", **row, **stale_fields()}
+    if hub_failed:
         raise ValueError(f"media not found: {ident}")
-    return {"kind": "media", **row}
+    raise ValueError(f"not found: {ident}")
 
 
 def _tool_graph(args: dict) -> dict:
@@ -358,20 +404,51 @@ def _tool_graph(args: dict) -> dict:
     limit = min(max(1, int(args.get("limit") or GRAPH_LIMIT_DEFAULT)), GRAPH_LIMIT_MAX)
     _ensure_path()
     from khipu.cli import _graph_query
-    from khipu.db import connect
+    from khipu.hub_snapshot import (
+        graph_neighbors_snapshot,
+        hub_connection_failed,
+        stale_fields,
+        try_hub_connect,
+    )
 
-    with connect() as conn:
-        with conn.cursor() as cur:
-            return _graph_query(cur, node_id, hops, limit)
+    try:
+        with try_hub_connect() as conn:
+            with conn.cursor() as cur:
+                return _graph_query(cur, node_id, hops, limit)
+    except Exception as exc:
+        if not hub_connection_failed(exc):
+            raise
+        out = graph_neighbors_snapshot(node_id, hops, limit)
+        out.update(stale_fields())
+        return out
 
 
 def _tool_status(args: dict) -> dict:
     _ensure_path()
     from khipu.drift import status_payload
+    from khipu.hub_snapshot import (
+        hub_connection_failed,
+        maybe_refresh,
+        snapshot_health,
+        status_payload_snapshot,
+    )
 
-    if args.get("include_drift"):
-        return status_payload(_default_memory_root(), include_drift=True)
-    return status_payload(None)
+    try:
+        if args.get("include_drift"):
+            payload = status_payload(_default_memory_root(), include_drift=True)
+        else:
+            payload = status_payload(None)
+        maybe_refresh()
+        payload["hub_snapshot"] = snapshot_health()
+        return payload
+    except Exception as exc:
+        if not hub_connection_failed(exc):
+            raise
+        payload = status_payload_snapshot()
+        if args.get("include_drift"):
+            payload["drift_error"] = "hub unreachable; drift omitted"
+        payload["hub_error"] = f"{type(exc).__name__}: {exc}"
+        return payload
 
 
 def _tool_capture(args: dict) -> dict:

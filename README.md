@@ -368,9 +368,10 @@ models, Graphify, and agent wiring.
 
 ### Install the desktop app (recommended)
 
-1. Download **`Khipu_0.3.5_aarch64.dmg`** from the
-   [v0.3.5 release](https://github.com/mrkinglollipop/Khipu/releases/tag/v0.3.5)
-   (GitHub `/releases/latest` now points here).
+1. Download **`Khipu_0.3.6_aarch64.dmg`** from the
+   [v0.3.6 release](https://github.com/mrkinglollipop/Khipu/releases/tag/v0.3.6)
+   (GitHub `/releases/latest` now points here), or use
+   [kinglollipop.com/khipu/download](https://kinglollipop.com/khipu/download).
 2. Open the DMG and drag **Khipu.app** to **Applications**.
 3. Launch **Khipu** from Applications and complete Welcome (database, model,
    graph engine, integrations).
@@ -475,8 +476,16 @@ agent settings; the repo's `.cursor/mcp.json` references it as
 `${env:KHIPU_GATEWAY_TOKEN}` and never contains the value. Local harnesses do
 not use the gateway at all.
 
-**A second Mac** repeats steps 1, 2 and 5 against the same database. That is
-the whole point.
+**A second Mac** joins the same hub — it does not create a new empty database.
+On the Mac that already works: Settings → **Set up another Mac** → export a
+passphrase-encrypted join kit (AirDrop the `.khipujoin` file, or advertise a
+nearby PIN over the LAN). On the new Mac: Welcome → **Join existing Khipu** →
+import the kit (or enter the PIN). That rewrites the TLS cert path for this
+machine, stores the DSN in Keychain, and verifies live episode counts against
+the kit. Localhost Postgres cannot be joined from another computer — the hub
+must be reachable (Tailscale, WireGuard, SSH tunnel, or a shared server). After
+join, optionally add folders on this Mac so Graphify feeds only those sources
+into the shared graph (scoped delete — it will not purge the other Mac’s nodes).
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request.
 
@@ -511,7 +520,14 @@ ingest is still not shipped (picker defaults to off).
 **What happens when I'm offline, or the database is down?**
 Captures queue in a local outbox and replay when the database is back;
 `khipu doctor` stays red until the outbox is empty, so a silent backlog is not
-possible. Reads keep working from a local cache.
+possible. Reads fall back to a full local `hub_snapshot.sqlite` (episodes,
+topics, revisions, nodes, edges, embeddings) refreshed whenever the hub was
+last reachable — results are tagged `stale: true`. Keyword search always works
+offline; semantic search needs a local embed provider configured (cloud Gemini
+is not called while pretending to be online). The snapshot is never a write
+SSOT — writers still use Postgres or the outbox. Capture mode (`legacy` /
+`dual` / `hub`) is a CLI setting (`khipu config --set-capture-mode`); there is
+no desktop toggle for it yet.
 
 **How much does the capture cost in Gemini calls?**
 One summarisation call per capture, and a capture happens after five user turns

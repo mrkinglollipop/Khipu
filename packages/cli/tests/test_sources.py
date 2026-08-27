@@ -1,4 +1,5 @@
 """Tests for khipu.sources — membership store and resolved JSON contract."""
+
 from __future__ import annotations
 
 import json
@@ -54,8 +55,12 @@ class SourcesTest(unittest.TestCase):
     def test_missing_root_is_unreachable_not_deleted_from_doc(self):
         sources.add_code_root(Path("/nope/khipu-missing-root"))
         resolved = sources.resolve_for_graphify()
-        self.assertTrue(any(u["id"].startswith("code:") for u in resolved["unreachable"]))
-        self.assertNotIn(Path("/nope/khipu-missing-root").as_posix(), resolved["code_roots"])
+        self.assertTrue(
+            any(u["id"].startswith("code:") for u in resolved["unreachable"])
+        )
+        self.assertNotIn(
+            Path("/nope/khipu-missing-root").as_posix(), resolved["code_roots"]
+        )
 
     def test_resolved_missing_collector_key_defaults_true(self):
         raw = {"schema_version": 1, "collectors": {"reports": False}}
@@ -67,7 +72,9 @@ class SourcesTest(unittest.TestCase):
         dest = Path(self.dir) / "graph_sources.resolved.json"
         prior = '{"schema_version": 1, "collectors": {"reports": true}}'
         dest.write_text(prior)
-        with mock.patch.object(sources, "resolve_for_graphify", side_effect=OSError("disk")):
+        with mock.patch.object(
+            sources, "resolve_for_graphify", side_effect=OSError("disk")
+        ):
             with self.assertRaises(OSError):
                 sources.export_resolved(path=dest)
         self.assertTrue(dest.is_file())
@@ -76,6 +83,107 @@ class SourcesTest(unittest.TestCase):
     def test_cannot_remove_seeded_id(self):
         with self.assertRaises(ValueError):
             sources.remove_user_source("code:claude")
+
+    def test_owned_source_ids_enabled_reachable_only(self):
+        self._write_sources(
+            [
+                {
+                    "id": "code:mac2",
+                    "kind": "code_ast",
+                    "root": str(self.dir),
+                    "enabled": True,
+                },
+                {"id": "reports:claude", "enabled": False},
+            ]
+        )
+        owned = sources.owned_source_ids()
+        self.assertIn("code:mac2", owned)
+        self.assertNotIn("reports:claude", owned)
+
+    def test_owned_source_ids_excludes_unreachable(self):
+        self._write_sources(
+            [
+                {
+                    "id": "code:missing",
+                    "kind": "code_ast",
+                    "root": "/nope/missing-root",
+                    "enabled": True,
+                },
+            ]
+        )
+        self.assertNotIn("code:missing", sources.owned_source_ids())
+
+    def test_unmatched_code_path_not_delete_candidate(self):
+        node = {
+            "id": "module:orphan",
+            "type": "module",
+            "bucket": "code",
+            "source_path": "/other/mac/project/foo.py",
+        }
+        self.assertIsNone(
+            sources.source_id_for_delete(
+                node_id=node["id"],
+                type=node["type"],
+                bucket=node["bucket"],
+                source_path=node["source_path"],
+            )
+        )
+        self.assertFalse(sources.should_delete_graphify_node(node, set()))
+
+    def test_null_source_id_not_delete_candidate(self):
+        node = {
+            "id": "module:unknown",
+            "type": "module",
+            "bucket": "code",
+            "source_path": None,
+            "source_id": None,
+        }
+        self.assertFalse(sources.should_delete_graphify_node(node, set()))
+
+    def test_add_code_root_sets_graph_producer(self):
+        root = self.dir / "repo"
+        root.mkdir()
+        with mock.patch("khipu.components_matrix.set_graph_producer") as set_prod:
+            sources.add_code_root(root)
+            set_prod.assert_called_once_with(True)
+
+    def test_upsert_unmatched_code_not_stamped_without_code_claude(self):
+        self._write_sources(
+            [
+                {
+                    "id": "code:mac2",
+                    "kind": "code_ast",
+                    "root": str(self.dir),
+                    "enabled": True,
+                },
+            ]
+        )
+        sid = sources.source_id_for_graphify_node(
+            node_id="module:orphan",
+            type="module",
+            bucket="code",
+            source_path="/other/mac/project/foo.py",
+        )
+        self.assertIsNone(sid)
+
+    def test_upsert_unmatched_code_stamped_when_code_claude_listed(self):
+        self._write_sources(
+            [
+                {
+                    "id": "code:claude",
+                    "kind": "code_ast",
+                    "root": str(self.dir),
+                    "enabled": True,
+                },
+            ]
+        )
+        sid = sources.source_id_for_graphify_node(
+            node_id="module:orphan",
+            type="module",
+            bucket="code",
+            source_path="/other/mac/project/foo.py",
+        )
+        self.assertEqual(sid, "code:claude")
 
 
 class ResolveContractTest(unittest.TestCase):

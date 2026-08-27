@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -438,6 +438,177 @@ fn set_khipu_secret(account: String, value: String) -> Result<String, String> {
     Ok(stdout)
 }
 
+/// Export a passphrase-encrypted join kit to disk. Passphrase travels via env,
+/// never argv — same exposure model as `set_khipu_secret`'s stdin pipe.
+#[tauri::command]
+fn join_export(passphrase: String, out_path: String) -> Result<String, String> {
+    if passphrase.trim().is_empty() {
+        return Err("passphrase is empty".to_string());
+    }
+    if out_path.trim().is_empty() {
+        return Err("out_path is empty".to_string());
+    }
+    let root = khipu_root()?;
+    let py = khipu_python()?;
+    let pythonpath = khipu_pythonpath(&root);
+    let output = Command::new(&py)
+        .arg("-m")
+        .arg("khipu")
+        .arg("join")
+        .arg("export")
+        .arg("--out")
+        .arg(out_path.trim())
+        .env("PYTHONPATH", &pythonpath)
+        .env("KHIPU_ROOT", &root)
+        .env("KHIPU_JOIN_PASSPHRASE", passphrase.trim())
+        .output()
+        .map_err(|e| format!("spawn khipu join export failed ({py:?}): {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        if stdout_looks_like_json(&stdout) {
+            return Ok(stdout);
+        }
+        return Err(format!(
+            "khipu join export exited {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(stdout)
+}
+
+/// Import a join kit from disk. Passphrase travels via env, never argv.
+#[tauri::command]
+fn join_import(passphrase: String, file_path: String) -> Result<String, String> {
+    if passphrase.trim().is_empty() {
+        return Err("passphrase is empty".to_string());
+    }
+    if file_path.trim().is_empty() {
+        return Err("file_path is empty".to_string());
+    }
+    let root = khipu_root()?;
+    let py = khipu_python()?;
+    let pythonpath = khipu_pythonpath(&root);
+    let output = Command::new(&py)
+        .arg("-m")
+        .arg("khipu")
+        .arg("join")
+        .arg("import")
+        .arg("--file")
+        .arg(file_path.trim())
+        .env("PYTHONPATH", &pythonpath)
+        .env("KHIPU_ROOT", &root)
+        .env("KHIPU_JOIN_PASSPHRASE", passphrase.trim())
+        .output()
+        .map_err(|e| format!("spawn khipu join import failed ({py:?}): {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        if stdout_looks_like_json(&stdout) {
+            return Ok(stdout);
+        }
+        return Err(format!(
+            "khipu join import exited {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(stdout)
+}
+
+/// Advertise join kit on LAN (Bonjour + TLS). Spawns a background job and returns
+/// the first JSON line (PIN, port, timeout) while the server keeps running.
+#[tauri::command]
+fn join_advertise(passphrase: String, timeout: u32) -> Result<String, String> {
+    if passphrase.trim().is_empty() {
+        return Err("passphrase is empty".to_string());
+    }
+    let root = khipu_root()?;
+    let py = khipu_python()?;
+    let pythonpath = khipu_pythonpath(&root);
+    let tout = timeout.max(60);
+    let mut child = Command::new(&py)
+        .arg("-m")
+        .arg("khipu")
+        .arg("join")
+        .arg("advertise")
+        .arg("--timeout")
+        .arg(tout.to_string())
+        .env("PYTHONPATH", &pythonpath)
+        .env("KHIPU_ROOT", &root)
+        .env("KHIPU_JOIN_PASSPHRASE", passphrase.trim())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn khipu join advertise failed ({py:?}): {e}"))?;
+    let stdout = child.stdout.take().ok_or_else(|| "no stdout on join advertise".to_string())?;
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut first_line = String::new();
+    reader
+        .read_line(&mut first_line)
+        .map_err(|e| format!("read join advertise banner failed: {e}"))?;
+    let pid = child.id();
+    std::thread::spawn(move || {
+        if let Err(e) = child.wait() {
+            eprintln!("[khipu] join advertise wait failed: {e}");
+        }
+    });
+    if first_line.trim().is_empty() {
+        return Err("join advertise produced no status line".to_string());
+    }
+    let mut banner = parse_json_line(&first_line)?;
+    if let Some(obj) = banner.as_object_mut() {
+        obj.insert("pid".into(), Value::from(pid));
+    }
+    Ok(serde_json::to_string(&banner).unwrap_or(first_line))
+}
+
+fn parse_json_line(line: &str) -> Result<Value, String> {
+    serde_json::from_str(line.trim()).map_err(|e| format!("invalid JSON from join advertise: {e}"))
+}
+
+/// Receive join kit from a nearby Mac (Bonjour browse + TLS + import).
+#[tauri::command]
+fn join_receive(passphrase: String, pin: String, out_path: Option<String>) -> Result<String, String> {
+    if passphrase.trim().is_empty() {
+        return Err("passphrase is empty".to_string());
+    }
+    let pin_trim = pin.trim();
+    if pin_trim.len() != 6 || !pin_trim.chars().all(|c| c.is_ascii_digit()) {
+        return Err("pin must be six digits".to_string());
+    }
+    let root = khipu_root()?;
+    let py = khipu_python()?;
+    let pythonpath = khipu_pythonpath(&root);
+    let mut cmd = Command::new(&py);
+    cmd.arg("-m")
+        .arg("khipu")
+        .arg("join")
+        .arg("receive")
+        .arg("--pin")
+        .arg(pin_trim)
+        .env("PYTHONPATH", &pythonpath)
+        .env("KHIPU_ROOT", &root)
+        .env("KHIPU_JOIN_PASSPHRASE", passphrase.trim());
+    if let Some(path) = out_path {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            cmd.arg("--out").arg(trimmed);
+        }
+    }
+    let output = cmd
+        .output()
+        .map_err(|e| format!("spawn khipu join receive failed ({py:?}): {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        if stdout_looks_like_json(&stdout) {
+            return Ok(stdout);
+        }
+        return Err(format!(
+            "khipu join receive exited {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(stdout)
+}
+
 /// Subcommands the UI is allowed to invoke. `run_khipu` is the entire privilege
 /// boundary between the webview and this machine, and it originally accepted any
 /// argv at all — including `capture` (audit 2026-08-17).
@@ -742,6 +913,10 @@ pub fn run() {
             run_khipu,
             spawn_khipu,
             set_khipu_secret,
+            join_export,
+            join_import,
+            join_advertise,
+            join_receive,
             secrets_presence,
             khipu_migrate,
             select_compat_row,
@@ -934,6 +1109,13 @@ mod settable_secrets_tests {
     #[test]
     fn components_is_not_reachable_through_the_generic_argv_path() {
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"components"));
+    }
+
+    #[test]
+    fn join_is_not_reachable_through_the_generic_argv_path() {
+        // DSN lives in the join kit; export/import only via join_export /
+        // join_import so argv cannot carry secrets through run_khipu.
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"join"));
     }
 
     #[test]

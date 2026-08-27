@@ -27,6 +27,7 @@ Khipu mirrors at the source, and drift is measured, not assumed.**
 Voyage vectors in graph.sqlite are NOT mirrored (plan lock: Khipu re-embeds with
 its own profile in P4); the Graph system's own tools keep reading them locally.
 """
+
 from __future__ import annotations
 
 import json
@@ -37,11 +38,16 @@ from pathlib import Path
 from typing import Any
 
 from khipu.sources import (
+    _edge_endpoint_node,
     disabled_or_unreachable_ids,
     drift_failing_pg_extra_edges,
     drift_failing_pg_extras,
+    load_sources,
+    owned_source_ids,
     should_delete_graphify_edge,
     should_delete_graphify_node,
+    source_id_for_delete,
+    source_id_for_graphify_node,
 )
 
 
@@ -86,28 +92,64 @@ def _json_or_wrapped(raw: Any) -> str | None:
         return json.dumps({"_raw": raw})
 
 
+def _effective_source_id(node: dict[str, Any], doc: dict | None = None) -> str | None:
+    pg_sid = node.get("source_id")
+    if pg_sid:
+        return str(pg_sid).strip() or None
+    return source_id_for_delete(
+        node_id=str(node.get("id") or ""),
+        type=str(node.get("type") or ""),
+        bucket=node.get("bucket"),
+        source_path=node.get("source_path"),
+        doc=doc,
+    )
+
+
+def _node_owned(node: dict[str, Any], owned: set[str], doc: dict | None = None) -> bool:
+    sid = _effective_source_id(node, doc)
+    return bool(sid and sid in owned)
+
+
 def _read_sqlite(path: Path) -> tuple[list[tuple], list[tuple]]:
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         con.row_factory = sqlite3.Row
         nodes = [
-            (r["id"], r["type"], r["bucket"] or None, r["name"] or None,
-             _json_or_wrapped(r["payload"]), r["source_path"] or None,
-             r["built_at"] or None, bool(r["frozen"]))
+            (
+                r["id"],
+                r["type"],
+                r["bucket"] or None,
+                r["name"] or None,
+                _json_or_wrapped(r["payload"]),
+                r["source_path"] or None,
+                r["built_at"] or None,
+                bool(r["frozen"]),
+            )
             for r in con.execute(
-                "SELECT id, type, bucket, name, payload, source_path, built_at, frozen FROM nodes")
+                "SELECT id, type, bucket, name, payload, source_path, built_at, frozen FROM nodes"
+            )
         ]
         edges = [
-            (r["src"], r["dst"], r["type"], r["weight"], _json_or_wrapped(r["payload"]),
-             r["built_at"] or None)
-            for r in con.execute("SELECT src, dst, type, weight, payload, built_at FROM edges")
+            (
+                r["src"],
+                r["dst"],
+                r["type"],
+                r["weight"],
+                _json_or_wrapped(r["payload"]),
+                r["built_at"] or None,
+            )
+            for r in con.execute(
+                "SELECT src, dst, type, weight, payload, built_at FROM edges"
+            )
         ]
     finally:
         con.close()
     return nodes, edges
 
 
-def sync_from_sqlite(sqlite_path: Path | None = None, *, dry_run: bool = False) -> dict[str, Any]:
+def sync_from_sqlite(
+    sqlite_path: Path | None = None, *, dry_run: bool = False
+) -> dict[str, Any]:
     """Mirror graphify's graph.sqlite into PG. Idempotent; one transaction.
 
     Returns counts plus the post-sync drift so a caller can assert zero."""
@@ -118,23 +160,45 @@ def sync_from_sqlite(sqlite_path: Path | None = None, *, dry_run: bool = False) 
         raise FileNotFoundError(f"graph.sqlite not found: {path}")
     t0 = time.time()
     nodes, edges = _read_sqlite(path)
-    stats: dict[str, Any] = {"sqlite": str(path), "sqlite_nodes": len(nodes),
-                             "sqlite_edges": len(edges), "dry_run": dry_run}
+    sources_doc = load_sources()
+    nodes_with_source: list[tuple] = []
+    for row in nodes:
+        nid, ntype, bucket, name, payload, source_path, built_at, frozen = row
+        sid = source_id_for_graphify_node(
+            node_id=nid,
+            type=ntype,
+            bucket=bucket,
+            source_path=source_path,
+            doc=sources_doc,
+        )
+        nodes_with_source.append(
+            (nid, ntype, bucket, name, payload, source_path, built_at, frozen, sid)
+        )
+    stats: dict[str, Any] = {
+        "sqlite": str(path),
+        "sqlite_nodes": len(nodes),
+        "sqlite_edges": len(edges),
+        "dry_run": dry_run,
+    }
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "CREATE TEMP TABLE _sync_nodes (id TEXT PRIMARY KEY, type TEXT, bucket TEXT, name TEXT,"
-                " payload TEXT, source_path TEXT, built_at TEXT, frozen BOOLEAN) ON COMMIT DROP"
+                " payload TEXT, source_path TEXT, built_at TEXT, frozen BOOLEAN, source_id TEXT) ON COMMIT DROP"
             )
             cur.execute(
                 "CREATE TEMP TABLE _sync_edges (src TEXT, dst TEXT, type TEXT, weight DOUBLE PRECISION,"
                 " payload TEXT, built_at TEXT) ON COMMIT DROP"
             )
-            with cur.copy("COPY _sync_nodes (id, type, bucket, name, payload, source_path, built_at, frozen)"
-                          " FROM STDIN") as cp:
-                for row in nodes:
+            with cur.copy(
+                "COPY _sync_nodes (id, type, bucket, name, payload, source_path, built_at, frozen, source_id)"
+                " FROM STDIN"
+            ) as cp:
+                for row in nodes_with_source:
                     cp.write_row(row)
-            with cur.copy("COPY _sync_edges (src, dst, type, weight, payload, built_at) FROM STDIN") as cp:
+            with cur.copy(
+                "COPY _sync_edges (src, dst, type, weight, payload, built_at) FROM STDIN"
+            ) as cp:
                 for row in edges:
                     cp.write_row(row)
             # graphify's own file is the authority for edge endpoints; drop nothing
@@ -148,22 +212,24 @@ def sync_from_sqlite(sqlite_path: Path | None = None, *, dry_run: bool = False) 
             # 1. nodes: insert new, update changed (any column, incl. built_at).
             cur.execute(
                 """
-                INSERT INTO nodes (id, type, bucket, name, payload, source_path, built_at, frozen)
+                INSERT INTO nodes (id, type, bucket, name, payload, source_path, built_at, frozen, source_id)
                 SELECT id, type, bucket, name,
                        CASE WHEN payload IS NULL THEN NULL ELSE payload::jsonb END,
                        source_path,
                        CASE WHEN built_at IS NULL THEN NULL ELSE built_at::timestamptz END,
-                       COALESCE(frozen, false)
+                       COALESCE(frozen, false),
+                       source_id
                 FROM _sync_nodes s
                 ON CONFLICT (id) DO UPDATE SET
                     type = EXCLUDED.type, bucket = EXCLUDED.bucket, name = EXCLUDED.name,
                     payload = EXCLUDED.payload, source_path = EXCLUDED.source_path,
-                    built_at = EXCLUDED.built_at, frozen = EXCLUDED.frozen
+                    built_at = EXCLUDED.built_at, frozen = EXCLUDED.frozen,
+                    source_id = EXCLUDED.source_id
                 WHERE (nodes.type, nodes.bucket, nodes.name, nodes.payload, nodes.source_path,
-                       nodes.built_at, nodes.frozen)
+                       nodes.built_at, nodes.frozen, nodes.source_id)
                       IS DISTINCT FROM
                       (EXCLUDED.type, EXCLUDED.bucket, EXCLUDED.name, EXCLUDED.payload,
-                       EXCLUDED.source_path, EXCLUDED.built_at, EXCLUDED.frozen)
+                       EXCLUDED.source_path, EXCLUDED.built_at, EXCLUDED.frozen, EXCLUDED.source_id)
                 """
             )
             stats["nodes_upserted"] = cur.rowcount
@@ -184,6 +250,7 @@ def sync_from_sqlite(sqlite_path: Path | None = None, *, dry_run: bool = False) 
             )
             stats["edges_upserted"] = cur.rowcount
             membership_off = disabled_or_unreachable_ids()
+            owned = owned_source_ids(sources_doc)
             # 3. delete graphify-owned edges graphify no longer has (an edge is
             #    graphify-owned when neither endpoint is Khipu-owned).
             cur.execute(
@@ -198,12 +265,12 @@ def sync_from_sqlite(sqlite_path: Path | None = None, *, dry_run: bool = False) 
             edge_delete = 0
             for src, dst, etype in cur.fetchall():
                 cur.execute(
-                    "SELECT id, type, bucket, source_path FROM nodes WHERE id = %s",
+                    "SELECT id, type, bucket, source_path, source_id FROM nodes WHERE id = %s",
                     (src,),
                 )
                 src_row = cur.fetchone()
                 cur.execute(
-                    "SELECT id, type, bucket, source_path FROM nodes WHERE id = %s",
+                    "SELECT id, type, bucket, source_path, source_id FROM nodes WHERE id = %s",
                     (dst,),
                 )
                 dst_row = cur.fetchone()
@@ -213,9 +280,16 @@ def sync_from_sqlite(sqlite_path: Path | None = None, *, dry_run: bool = False) 
                         "type": src_row[1],
                         "bucket": src_row[2],
                         "source_path": src_row[3],
+                        "source_id": src_row[4],
                     }
                     if src_row
-                    else {"id": src, "type": "", "bucket": None, "source_path": None}
+                    else {
+                        "id": src,
+                        "type": "",
+                        "bucket": None,
+                        "source_path": None,
+                        "source_id": None,
+                    }
                 )
                 dst_node = (
                     {
@@ -223,11 +297,22 @@ def sync_from_sqlite(sqlite_path: Path | None = None, *, dry_run: bool = False) 
                         "type": dst_row[1],
                         "bucket": dst_row[2],
                         "source_path": dst_row[3],
+                        "source_id": dst_row[4],
                     }
                     if dst_row
-                    else {"id": dst, "type": "", "bucket": None, "source_path": None}
+                    else {
+                        "id": dst,
+                        "type": "",
+                        "bucket": None,
+                        "source_path": None,
+                        "source_id": None,
+                    }
                 )
-                if should_delete_graphify_edge(src_node, dst_node, membership_off):
+                if (
+                    should_delete_graphify_edge(src_node, dst_node, membership_off)
+                    and _node_owned(src_node, owned, sources_doc)
+                    and _node_owned(dst_node, owned, sources_doc)
+                ):
                     cur.execute(
                         "DELETE FROM edges WHERE src = %s AND dst = %s AND type = %s",
                         (src, dst, etype),
@@ -238,21 +323,24 @@ def sync_from_sqlite(sqlite_path: Path | None = None, *, dry_run: bool = False) 
             #    remaining (Khipu-owned) edge still references them, or membership-off.
             cur.execute(
                 f"""
-                SELECT n.id, n.type, n.bucket, n.source_path FROM nodes n
+                SELECT n.id, n.type, n.bucket, n.source_path, n.source_id FROM nodes n
                 WHERE NOT {KHIPU_OWNED_NODE_SQL}
                   AND NOT EXISTS (SELECT 1 FROM _sync_nodes s WHERE s.id = n.id)
                   AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.src = n.id OR e.dst = n.id)
                 """
             )
             node_delete = 0
-            for nid, ntype, bucket, source_path in cur.fetchall():
+            for nid, ntype, bucket, source_path, pg_source_id in cur.fetchall():
                 node = {
                     "id": nid,
                     "type": ntype,
                     "bucket": bucket,
                     "source_path": source_path,
+                    "source_id": pg_source_id,
                 }
-                if should_delete_graphify_node(node, membership_off):
+                if should_delete_graphify_node(node, membership_off) and _node_owned(
+                    node, owned, sources_doc
+                ):
                     cur.execute("DELETE FROM nodes WHERE id = %s", (nid,))
                     node_delete += cur.rowcount
             stats["nodes_deleted"] = node_delete
@@ -324,25 +412,33 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
         if is_graph_producer():
             out["error"] = "graph.sqlite not found on the machine that builds it"
             return out
-        out.update(ok=True, skipped="not the graph producer; PG is read-only for the graph here")
+        out.update(
+            ok=True,
+            skipped="not the graph producer; PG is read-only for the graph here",
+        )
+        return out
+    if not is_graph_producer():
+        out.update(
+            ok=True,
+            skipped="not the graph producer; PG is read-only for the graph here",
+        )
         return out
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         s_nodes = {r[0] for r in con.execute("SELECT id FROM nodes")}
-        s_edges = {(r[0], r[1], r[2]) for r in con.execute("SELECT src, dst, type FROM edges")}
+        s_edges = {
+            (r[0], r[1], r[2]) for r in con.execute("SELECT src, dst, type FROM edges")
+        }
     finally:
         con.close()
-    from khipu.sources import (
-        disabled_or_unreachable_ids,
-        drift_failing_pg_extra_edges,
-        drift_failing_pg_extras,
-    )
-
     membership_off = disabled_or_unreachable_ids()
+    sources_doc = load_sources()
+    owned = owned_source_ids(sources_doc)
+    producer = is_graph_producer()
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"SELECT n.id, n.type, n.bucket, n.source_path FROM nodes n "
+                f"SELECT n.id, n.type, n.bucket, n.source_path, n.source_id FROM nodes n "
                 f"WHERE NOT {KHIPU_OWNED_NODE_SQL}"
             )
             pg_node_rows = [
@@ -351,6 +447,7 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
                     "type": r[1],
                     "bucket": r[2],
                     "source_path": r[3],
+                    "source_id": r[4],
                 }
                 for r in cur.fetchall()
             ]
@@ -368,21 +465,42 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
     missing_nodes = sorted(s_nodes - p_nodes)
     extra_node_ids = sorted(p_nodes - s_nodes)
     extra_node_rows = [r for r in pg_node_rows if r["id"] in set(extra_node_ids)]
+    if producer:
+        extra_node_rows = [
+            r for r in extra_node_rows if _node_owned(r, owned, sources_doc)
+        ]
     failing_extra_nodes = drift_failing_pg_extras(extra_node_rows, membership_off)
     extra_nodes = sorted({r["id"] for r in failing_extra_nodes})
     missing_edges = sorted(s_edges - p_edges)
     extra_edge_tuples = sorted(p_edges - s_edges)
     nodes_by_id = {r["id"]: r for r in pg_node_rows}
+    if producer:
+        extra_edge_tuples = [
+            t
+            for t in extra_edge_tuples
+            if _node_owned(_edge_endpoint_node(t[0], nodes_by_id), owned, sources_doc)
+            and _node_owned(_edge_endpoint_node(t[1], nodes_by_id), owned, sources_doc)
+        ]
     extra_edges = drift_failing_pg_extra_edges(
         extra_edge_tuples, nodes_by_id, membership_off
     )
-    out.update({
-        "sqlite_nodes": len(s_nodes), "pg_graphify_nodes": len(p_nodes), "pg_khipu_nodes": khipu_nodes,
-        "sqlite_edges": len(s_edges), "pg_graphify_edges": len(p_edges),
-        "nodes_missing_in_pg": len(missing_nodes), "nodes_extra_in_pg": len(extra_nodes),
-        "edges_missing_in_pg": len(missing_edges), "edges_extra_in_pg": len(extra_edges),
-        "sample_missing_nodes": missing_nodes[:sample], "sample_extra_nodes": extra_nodes[:sample],
-        "sqlite_mtime": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(path.stat().st_mtime)),
-    })
+    out.update(
+        {
+            "sqlite_nodes": len(s_nodes),
+            "pg_graphify_nodes": len(p_nodes),
+            "pg_khipu_nodes": khipu_nodes,
+            "sqlite_edges": len(s_edges),
+            "pg_graphify_edges": len(p_edges),
+            "nodes_missing_in_pg": len(missing_nodes),
+            "nodes_extra_in_pg": len(extra_nodes),
+            "edges_missing_in_pg": len(missing_edges),
+            "edges_extra_in_pg": len(extra_edges),
+            "sample_missing_nodes": missing_nodes[:sample],
+            "sample_extra_nodes": extra_nodes[:sample],
+            "sqlite_mtime": time.strftime(
+                "%Y-%m-%dT%H:%M:%S", time.localtime(path.stat().st_mtime)
+            ),
+        }
+    )
     out["ok"] = not (missing_nodes or extra_nodes or missing_edges or extra_edges)
     return out

@@ -19,3 +19,4 @@
 psycopg[binary]==3.3.4
 typing_extensions==4.16.0
 packaging==25.0
+cryptography==44.0.2
