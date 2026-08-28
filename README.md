@@ -368,8 +368,8 @@ models, Graphify, and agent wiring.
 
 ### Install the desktop app (recommended)
 
-1. Download **`Khipu_0.3.8_aarch64.dmg`** from the
-   [v0.3.8 release](https://github.com/mrkinglollipop/Khipu/releases/tag/v0.3.8)
+1. Download **`Khipu_0.3.9_aarch64.dmg`** from the
+   [v0.3.9 release](https://github.com/mrkinglollipop/Khipu/releases/tag/v0.3.9)
    (GitHub `/releases/latest` now points here), or use
    [kinglollipop.com/khipu/download](https://kinglollipop.com/khipu/download).
 2. Open the DMG and drag **Khipu.app** to **Applications**.

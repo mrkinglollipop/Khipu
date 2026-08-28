@@ -129,9 +129,62 @@ class DsnConfiguredTest(unittest.TestCase):
 class ConnectTest(unittest.TestCase):
     def test_connect_passes_the_resolved_dsn_and_autocommit_through(self):
         with mock.patch.object(db, "resolve_dsn", return_value="postgres://x"), \
+             mock.patch.object(db, "conninfo_with_local_root_cert", side_effect=lambda d: d), \
              mock.patch("psycopg.connect") as pg:
             db.connect(autocommit=True)
         pg.assert_called_once_with("postgres://x", autocommit=True)
+
+
+class ConninfoLocalRootCertTest(unittest.TestCase):
+    def test_overwrites_uri_sslrootcert_with_this_macs_file(self):
+        from psycopg.conninfo import conninfo_to_dict
+
+        with TemporaryDirectory() as tmp:
+            cert = Path(tmp) / "root.crt"
+            cert.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+            dsn = (
+                "postgresql://u:secret@100.114.233.88:5433/alzy"
+                "?sslmode=verify-full"
+                "&sslrootcert=/Users/matthewschwartz/.config/khipu/root.crt"
+            )
+            with mock.patch("khipu.paths.root_cert_file", return_value=cert):
+                out = db.conninfo_with_local_root_cert(dsn)
+        parsed = conninfo_to_dict(out)
+        self.assertEqual(parsed.get("sslrootcert"), str(cert.resolve()))
+        self.assertEqual(parsed.get("host"), "100.114.233.88")
+        self.assertEqual(parsed.get("port"), "5433")
+        self.assertNotIn("://", out)
+        self.assertNotIn("secret", repr(parsed.get("sslrootcert")))
+
+    def test_overwrites_percent_encoded_uri_sslrootcert_too(self):
+        from urllib.parse import quote
+
+        from psycopg.conninfo import conninfo_to_dict
+
+        with TemporaryDirectory() as tmp:
+            cert = Path(tmp) / "root.crt"
+            cert.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+            foreign = "/Users/matthewschwartz/.config/khipu/root.crt"
+            dsn = (
+                "postgresql://u:secret@100.114.233.88:5433/alzy"
+                f"?sslmode=verify-full&sslrootcert={quote(foreign, safe='')}"
+            )
+            with mock.patch("khipu.paths.root_cert_file", return_value=cert):
+                out = db.conninfo_with_local_root_cert(dsn)
+            self.assertEqual(
+                conninfo_to_dict(out).get("sslrootcert"), str(cert.resolve())
+            )
+
+    def test_keyword_conninfo_without_cert_file_omits_sslrootcert(self):
+        from psycopg.conninfo import conninfo_to_dict
+
+        missing = Path("/no/such/khipu-root.crt")
+        dsn = "postgresql://u:p@hub:5433/db?sslmode=verify-full"
+        with mock.patch("khipu.paths.root_cert_file", return_value=missing):
+            out = db.conninfo_with_local_root_cert(dsn)
+        parsed = conninfo_to_dict(out)
+        self.assertEqual(parsed.get("host"), "hub")
+        self.assertIsNone(parsed.get("sslrootcert"))
 
 
 if __name__ == "__main__":
