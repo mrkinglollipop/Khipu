@@ -335,12 +335,25 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
           );
           return true;
         }
+        raw = await invoke<string>("select_compat_row", {
+          mode: "remote",
+          pgvectorExtversion: String(v?.pgvector ?? ""),
+          serverVersion: String(v?.server_version ?? ""),
+          pgvector: String(v?.pgvector ?? ""),
+        });
+        const selErr = payloadError(parse(raw));
         await loadPlan();
-        setDbMsg(
-          mismatches.length
-            ? `Joined the hub — count delta vs kit: ${mismatches.join("; ")}`
-            : "Joined the hub — live counts match the join kit.",
-        );
+        if (selErr) {
+          setDbMsg(
+            `Joined the hub — Graphify version row did not persist (${selErr}). You can retry on the Graph step.`,
+          );
+        } else {
+          setDbMsg(
+            mismatches.length
+              ? `Joined the hub — count delta vs kit: ${mismatches.join("; ")}`
+              : "Joined the hub — live counts match the join kit.",
+          );
+        }
       } catch (e) {
         setDbMsg(
           `Join kit is saved on this Mac — you can continue. Hub check failed: ${String(e)}`,

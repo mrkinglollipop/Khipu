@@ -98,6 +98,60 @@ class GraphifyInstallTest(unittest.TestCase):
         self.assertIn("graphify", saved)
         self.assertNotIn("pending", saved)
 
+    @mock.patch("khipu.components_matrix.select_compat_row")
+    @mock.patch("khipu.components_graphify._download")
+    @mock.patch("khipu.components_graphify.match_row_for_install")
+    @mock.patch("khipu.components_graphify._ensure_empty_sources")
+    @mock.patch("khipu.components_graphify.application_support_dir")
+    @mock.patch("khipu.components_graphify.read_versions")
+    @mock.patch("khipu.components_graphify.write_versions")
+    def test_install_selects_compat_when_pending_missing(
+        self,
+        write_versions,
+        read_versions,
+        support_dir,
+        ensure_sources,
+        match_row,
+        download,
+        select_row,
+    ):
+        del ensure_sources
+        support_dir.return_value = self.app_support
+        pending = {
+            "graphify_semver": "1.0.0",
+            "graphify_tarball_url": "https://example.invalid/khipu-graphify-1.0.0.tar.gz",
+            "pgvector_min": "0.8.6",
+        }
+        read_versions.side_effect = [
+            {"postgres": {"mode": "remote"}},
+            {"pending": pending, "postgres": {"mode": "remote"}},
+        ]
+        select_row.return_value = {"ok": True, "pending": pending}
+        match_row.return_value = dict(pending, khipu_app_min="0.3.0")
+
+        def fake_download(url: str, dest: Path) -> None:
+            dest.write_bytes(self.archive.read_bytes())
+
+        download.side_effect = fake_download
+
+        result = install_graphify(first_run=True)
+        self.assertTrue(result["ok"], msg=result)
+        select_row.assert_called_once()
+        self.assertEqual(select_row.call_args.args[0], "remote")
+
+    @mock.patch("khipu.components_matrix.select_compat_row")
+    @mock.patch("khipu.components_graphify.read_versions")
+    def test_install_still_errors_when_select_cannot_write_pending(
+        self, read_versions, select_row
+    ):
+        read_versions.return_value = {}
+        select_row.return_value = {"ok": False, "error": "matrix_no_matching_row"}
+        result = install_graphify(first_run=True)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "missing_pending_graphify")
+        select_row.assert_called_once()
+        self.assertEqual(select_row.call_args.args[0], "remote")
+
 
 class GraphifyEmptySourcesSmokeTest(unittest.TestCase):
     def test_graphify_nightly_skips_with_empty_sources(self):
