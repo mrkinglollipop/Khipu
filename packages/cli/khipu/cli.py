@@ -1260,9 +1260,48 @@ def cmd_models(args: argparse.Namespace) -> int:
             )
             print(json.dumps({"ok": True, "models": out}, indent=2))
             return 0
+        if action == "welcome":
+            raw_json = getattr(args, "models_json", None)
+            if not raw_json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": "models welcome requires a JSON blob",
+                        }
+                    )
+                )
+                return 2
+            try:
+                payload = json.loads(raw_json)
+            except ValueError as e:
+                print(json.dumps({"ok": False, "error": f"invalid JSON: {e}"}))
+                return 2
+            if not isinstance(payload, dict):
+                print(
+                    json.dumps(
+                        {"ok": False, "error": "JSON payload must be an object"}
+                    )
+                )
+                return 2
+            out = models_mod.apply_welcome_models(
+                synth_choice=str(payload.get("synth_choice") or "skip"),
+                embed_choice=str(payload.get("embed_choice") or "skip"),
+                synth_endpoint=str(payload.get("synth_endpoint") or ""),
+                synth_model_id=str(payload.get("synth_model_id") or ""),
+                embed_endpoint=str(payload.get("embed_endpoint") or ""),
+                embed_model_id=str(payload.get("embed_model_id") or ""),
+            )
+            embed_part = out.get("embed") or {}
+            if embed_part.get("ok") is False:
+                err = embed_part.get("error") or "embed activate failed"
+                print(json.dumps({**out, "ok": False, "error": err}))
+                return 2
+            print(json.dumps(out, indent=2))
+            return 0
         print(json.dumps({"ok": False, "error": f"unknown models action: {action}"}))
         return 2
-    except ValueError as e:
+    except (ValueError, RuntimeError) as e:
         print(json.dumps({"ok": False, "error": str(e)}))
         return 2
 
@@ -1686,6 +1725,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Model id for the role",
     )
     md_set.set_defaults(func=cmd_models, models_cmd="set")
+    md_welcome = md_sub.add_parser(
+        "welcome",
+        help="First-run synth/embed choices; activates cloud embed in-process",
+    )
+    md_welcome.add_argument(
+        "models_json",
+        help="JSON: synth_choice, embed_choice, optional local endpoint/model_id fields",
+    )
+    md_welcome.set_defaults(func=cmd_models, models_cmd="welcome")
     md.set_defaults(func=cmd_models, models_cmd="show")
 
     src = sub.add_parser(

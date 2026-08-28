@@ -106,6 +106,58 @@ class ModelsCliTest(unittest.TestCase):
         stored = json.loads((self.dir / "config.json").read_text())
         self.assertEqual(stored["models"], "not-an-object")
 
+    def test_welcome_cloud_activates_embed(self):
+        payload = json.dumps(
+            {"synth_choice": "cloud", "embed_choice": "cloud"}
+        )
+        with mock.patch(
+            "khipu.embed.activate_welcome_embed",
+            return_value={"ok": True, "active_profile": "gemini-embedding-2@768"},
+        ) as act:
+            rc, raw = _run(["models", "welcome", payload])
+        self.assertEqual(rc, 0)
+        body = json.loads(raw)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["models"]["embed"]["model_id"], "gemini-embedding-2")
+        act.assert_called_once_with(provider="cloud")
+
+    def test_welcome_skip_does_not_activate(self):
+        payload = json.dumps(
+            {"synth_choice": "skip", "embed_choice": "skip"}
+        )
+        with mock.patch("khipu.embed.activate_welcome_embed") as act:
+            rc, raw = _run(["models", "welcome", payload])
+        self.assertEqual(rc, 0)
+        act.assert_not_called()
+
+    def test_welcome_activate_error_is_nonzero(self):
+        payload = json.dumps(
+            {"synth_choice": "cloud", "embed_choice": "cloud"}
+        )
+        with mock.patch(
+            "khipu.embed.activate_welcome_embed",
+            side_effect=RuntimeError("hub profile missing"),
+        ):
+            rc, raw = _run(["models", "welcome", payload])
+        self.assertEqual(rc, 2)
+        body = json.loads(raw)
+        self.assertFalse(body["ok"])
+        self.assertIn("hub profile missing", body["error"])
+
+    def test_welcome_embed_ok_false_does_not_keep_outer_ok(self):
+        payload = json.dumps(
+            {"synth_choice": "cloud", "embed_choice": "cloud"}
+        )
+        with mock.patch(
+            "khipu.embed.activate_welcome_embed",
+            return_value={"ok": False, "error": "vectors missing"},
+        ):
+            rc, raw = _run(["models", "welcome", payload])
+        self.assertEqual(rc, 2)
+        body = json.loads(raw)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["error"], "vectors missing")
+
 
 if __name__ == "__main__":
     unittest.main()

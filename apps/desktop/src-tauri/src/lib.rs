@@ -603,12 +603,15 @@ fn join_receive(passphrase: String, pin: String, out_path: Option<String>) -> Re
 /// argv at all — including `capture` (audit 2026-08-17).
 ///
 /// This list is exactly what the front end invokes, enumerated from every
-/// `runKhipu([...])` call site in `App.tsx` and `IntegrationsPanel.tsx` rather
-/// than assumed. The first pass kept five more — `sessions`, `git-sync`,
-/// `outbox`, `embed`, `graph-sync` — that no pane has ever called, so the
-/// boundary handed a compromised webview paid Gemini calls (`embed backfill`,
-/// which also deletes vectors), model extraction (`sessions drain`), and a
-/// `git-sync` that pushes commits and merges PRs. Removed 2026-08-18.
+/// `runKhipu([...])` call site in `App.tsx`, `Welcome.tsx`, and
+/// `IntegrationsPanel.tsx` rather than assumed. The first pass kept five more
+/// — `sessions`, `git-sync`, `outbox`, `embed`, `graph-sync` — that no pane
+/// should call through `run_khipu`. Welcome first-run activates cloud embed
+/// via `models welcome` (in-process), not the `embed` subcommand. The
+/// boundary must not hand a compromised webview paid Gemini calls
+/// (`embed backfill`, which also deletes vectors), model extraction
+/// (`sessions drain`), or a `git-sync` that pushes commits and merges PRs.
+/// Removed 2026-08-18.
 ///
 /// `integrations` stays and keeps its install/uninstall: the Integrations pane
 /// offers both as deliberate user actions, and uninstall is the documented
@@ -1166,10 +1169,10 @@ mod run_khipu_guard_tests {
 
     #[test]
     fn subcommands_no_pane_calls_are_not_reachable_either() {
-        // Allowlisted until 2026-08-18 despite no `runKhipu([...])` call site in
-        // any .tsx. Each one hands a compromised webview something real: paid
-        // Gemini calls and vector deletes, model extraction, PG writes, and a
-        // git push that opens and merges PRs.
+        // Each one hands a compromised webview something real: paid Gemini
+        // calls and vector deletes, model extraction, PG writes, and a git
+        // push that opens and merges PRs. Welcome first-run uses
+        // `models welcome` (in-process activate), not `embed`.
         for s in ["sessions", "git-sync", "outbox", "embed", "graph-sync"] {
             assert!(!ALLOWED_SUBCOMMANDS.contains(&s),
                     "`{s}` is not called by any pane and must not be reachable");

@@ -166,6 +166,30 @@ class ModelsTest(unittest.TestCase):
             self.assertEqual(models.synth_settings()["provider"], "cloud")
         self.assertEqual(models.synth_settings()["provider"], "local")
 
+    def test_apply_welcome_cloud_activates_embed(self):
+        with mock.patch(
+            "khipu.embed.activate_welcome_embed",
+            return_value={"ok": True, "active_profile": "gemini-embedding-2@768"},
+        ) as act:
+            out = models.apply_welcome_models(
+                synth_choice="cloud", embed_choice="cloud"
+            )
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["models"]["synth"]["model_id"], "gemini-2.5-flash")
+        self.assertEqual(out["models"]["embed"]["model_id"], "gemini-embedding-2")
+        self.assertEqual(out["embed"]["active_profile"], "gemini-embedding-2@768")
+        act.assert_called_once_with(provider="cloud")
+
+    def test_apply_welcome_skip_does_not_activate(self):
+        with mock.patch("khipu.embed.activate_welcome_embed") as act:
+            out = models.apply_welcome_models(
+                synth_choice="skip", embed_choice="skip"
+            )
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["models"]["embed"]["model_id"], "")
+        self.assertTrue(out["embed"].get("skipped"))
+        act.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
