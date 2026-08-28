@@ -106,8 +106,32 @@ def _promote_pending(versions: dict[str, Any]) -> None:
             postgres["image"] = image
 
 
+def _ensure_pending(versions: dict[str, Any]) -> dict[str, Any]:
+    """Join/remote Welcome never called select-compat-row; pick a matrix row."""
+    pending = versions.get("pending")
+    if isinstance(pending, dict) and str(pending.get("graphify_semver") or "").strip():
+        return versions
+    postgres = versions.get("postgres") if isinstance(versions.get("postgres"), dict) else {}
+    mode = str(postgres.get("mode") or "").strip()
+    if mode != "local_docker":
+        mode = "remote"
+    from khipu.components_matrix import select_compat_row
+
+    pgvector = str(postgres.get("pgvector") or "").strip() or None
+    server_version = str(postgres.get("server_version") or "").strip() or None
+    selected = select_compat_row(
+        mode,
+        pgvector_extversion=pgvector,
+        server_version=server_version,
+        refresh=True,
+    )
+    if not selected.get("ok"):
+        return versions
+    return load_versions()
+
+
 def install_graphify(*, first_run: bool = True) -> dict[str, Any]:
-    versions = load_versions()
+    versions = _ensure_pending(load_versions())
     pending = versions.get("pending")
     if not isinstance(pending, dict):
         return {
