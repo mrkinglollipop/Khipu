@@ -523,43 +523,19 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         setModelMsg("Local embed needs a base URL and model id.");
         return false;
       }
-      const synth =
-        synthChoice === "skip"
-          ? { provider: "cloud", endpoint: "", model_id: "" }
-          : synthChoice === "local"
-            ? {
-                provider: "local",
-                endpoint: localSynthEndpoint.trim(),
-                model_id: localSynthModel.trim(),
-              }
-            : { provider: "cloud", endpoint: "", model_id: "gemini-2.5-flash" };
-      const embed =
-        embedChoice === "skip"
-          ? { provider: "cloud", endpoint: "", model_id: "" }
-          : embedChoice === "local"
-            ? {
-                provider: "local",
-                endpoint: localEmbedEndpoint.trim(),
-                model_id: localEmbedModel.trim(),
-              }
-            : { provider: "cloud", endpoint: "", model_id: "gemini-embedding-2" };
       const payload = {
-        synth,
-        embed,
-        vision: { provider: "off", endpoint: "", model_id: "" },
+        synth_choice: synthChoice,
+        embed_choice: embedChoice,
+        synth_endpoint: localSynthEndpoint.trim(),
+        synth_model_id: localSynthModel.trim(),
+        embed_endpoint: localEmbedEndpoint.trim(),
+        embed_model_id: localEmbedModel.trim(),
       };
-      const raw = await runKhipu(["models", "set", JSON.stringify(payload)]);
+      const raw = await runKhipu(["models", "welcome", JSON.stringify(payload)]);
       const out = parse(raw);
       if (out?.ok !== true) {
-        setModelMsg(String(out?.error ?? out?.models_error ?? "models set failed"));
+        setModelMsg(String(out?.error ?? out?.models_error ?? "models welcome failed"));
         return false;
-      }
-      if (embedChoice === "cloud") {
-        const act = parse(await runKhipu(["embed", "activate", "gemini-embedding-2@768", "--force"]));
-        if (act?.ok !== true && act?.error) {
-          setModelMsg(String(act.error));
-          return false;
-        }
       }
       setModelMsg("Model preferences saved.");
       return true;
