@@ -8,6 +8,7 @@ import {
   ShieldCheck,
   TriangleAlert,
 } from "lucide-react";
+import { WorkingBanner } from "./WorkingBanner";
 
 /**
  * Integrations — the pane the agent-integration note locked on 2026-08-17.
@@ -92,7 +93,7 @@ function Dot({ state }: { state: ComponentState }) {
   if (state === "failed")
     return <TriangleAlert size={size} strokeWidth={1.75} aria-hidden className="err" />;
   if (state === "installed")
-    return <ShieldCheck size={size} strokeWidth={1.75} aria-hidden className="warn" />;
+    return <ShieldCheck size={size} strokeWidth={1.75} aria-hidden className="ok" />;
   // "Nothing to do here" and "absent" are different answers to "is it working?"
   // and had shared one grey dashed circle, so a card working exactly as designed
   // read as half-broken (2026-08-17). Solid minus = by design; dashed +
@@ -132,6 +133,7 @@ export function IntegrationsPanel({
 
   const load = useCallback(async () => {
     setLoadError(null);
+    setBusy((prev) => prev ?? "load");
     try {
       const raw = await runKhipu(["integrations", "status"]);
       setRows(JSON.parse(raw) as StatusRow[]);
@@ -139,6 +141,8 @@ export function IntegrationsPanel({
       // A failed status read is NOT "nothing installed" — keep the last rows
       // and surface the failure as its own state.
       setLoadError(String(e));
+    } finally {
+      setBusy((prev) => (prev === "load" ? null : prev));
     }
   }, [runKhipu]);
 
@@ -194,6 +198,21 @@ export function IntegrationsPanel({
 
   return (
     <div className="panel-body">
+      <WorkingBanner
+        label={
+          busy == null
+            ? null
+            : busy === "load"
+              ? "Checking integrations…"
+              : busy.startsWith("install:")
+                ? "Installing harness hooks…"
+                : busy.startsWith("verify:")
+                  ? "Verifying harness hooks…"
+                  : busy.startsWith("uninstall:")
+                    ? "Removing Khipu entries…"
+                    : "Working…"
+        }
+      />
       {loadError ? (
         <div className="doctor-card err" role="alert">
           <TriangleAlert size={24} strokeWidth={1.75} aria-hidden />
@@ -204,7 +223,7 @@ export function IntegrationsPanel({
               Python 3.11 and the Khipu repo path are set in Settings.
             </p>
             <div className="toolbar">
-              <button type="button" onClick={() => void load()}>
+              <button type="button" disabled={busy != null} onClick={() => void load()}>
                 <RefreshCw size={14} strokeWidth={1.75} aria-hidden /> Retry
               </button>
             </div>
@@ -301,9 +320,15 @@ export function IntegrationsPanel({
           <div className="section-card" key={r.harness}>
             <div className="section-head">
               {LABEL[r.harness]}
-              <span className="muted mono" style={{ marginLeft: 8, fontWeight: 400 }}>
+              <span className="muted mono" style={{ fontWeight: 400 }}>
                 {WHERE[r.harness]}
               </span>
+              {r.mcp && (r.harness === "grok_bot" || hookInstalled) ? (
+                <span className="pill ok harness-installed-pill">
+                  <span className="pill-dot" />
+                  Installed
+                </span>
+              ) : null}
             </div>
             <div className="section-body">
               <div className="rows">
@@ -426,7 +451,7 @@ export function IntegrationsPanel({
               <div className="toolbar">
                 <button
                   type="button"
-                  className="primary"
+                  className={r.mcp && hookInstalled ? undefined : "primary"}
                   disabled={busy != null || r.harness === "grok_bot"}
                   onClick={() => void act(r.harness, "install")}
                 >

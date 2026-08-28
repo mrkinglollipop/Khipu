@@ -69,7 +69,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     from khipu.drift import status_payload
     from khipu.hub_snapshot import (
         hub_connection_failed,
-        maybe_refresh,
         snapshot_health,
         status_payload_snapshot,
     )
@@ -81,7 +80,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             conflict_sample=int(args.sample),
             include_drift=bool(args.drift),
         )
-        maybe_refresh()
+        # Do not dump hub_snapshot here. Status is the tab people click; a full
+        # embedding replica over Tailscale froze the desktop. Doctor (throttled)
+        # and `khipu snapshot refresh` own the dump.
         data["hub_snapshot"] = snapshot_health()
     except Exception as exc:
         if not hub_connection_failed(exc):

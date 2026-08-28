@@ -8,6 +8,7 @@ import {
   CircleCheck,
   TriangleAlert,
 } from "lucide-react";
+import { WorkingBanner } from "./WorkingBanner";
 
 /** Persisted so the tutorial opens itself only until it has been finished once;
  *  it stays reachable from Setup → Welcome afterwards. */
@@ -623,25 +624,42 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
 
   const [doctor, setDoctor] = useState<DoctorPayload | null>(null);
   const [doctorErr, setDoctorErr] = useState<string | null>(null);
-  const reloadDoctor = useCallback(async () => {
-    setDoctorErr(null);
-    try {
-      setDoctor(parse(await runKhipu(["doctor"])) as DoctorPayload);
-    } catch (e) {
-      setDoctorErr(String(e));
-    }
-  }, [runKhipu]);
-
+  const [doctorBusy, setDoctorBusy] = useState(false);
   useEffect(() => {
     if (step !== "finish") return;
-    void reloadDoctor();
-  }, [step, reloadDoctor]);
+    let alive = true;
+    // Drop the last payload immediately. Leaving Finish and returning used to
+    // keep doctor.ok / "Doctor is green" / canFinish true while a new
+    // `khipu doctor` ran (first visit is already doctor == null).
+    setDoctor(null);
+    setDoctorErr(null);
+    setDoctorBusy(true);
+    void (async () => {
+      try {
+        const payload = parse(await runKhipu(["doctor"])) as DoctorPayload;
+        if (!alive) return;
+        setDoctor(payload);
+      } catch (e) {
+        if (!alive) return;
+        setDoctorErr(String(e));
+      } finally {
+        if (alive) setDoctorBusy(false);
+      }
+    })();
+    return () => {
+      alive = false;
+      setDoctor(null);
+      setDoctorErr(null);
+      setDoctorBusy(false);
+    };
+  }, [step, runKhipu]);
 
   const soleBackupRed = soleBackupRedFlag(doctor);
 
   const canFinish =
-    doctor?.ok === true ||
-    ((dbMode === "remote" || dbMode === "join") && soleBackupRed);
+    !doctorBusy &&
+    (doctor?.ok === true ||
+      ((dbMode === "remote" || dbMode === "join") && soleBackupRed));
 
   const finish = (withWarnings = false) => {
     if (!canFinish) return;
@@ -662,8 +680,28 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         ? localReady && dsnOk
         : remoteReady && dsnOk;
 
+  const workingLabel =
+    joinBusy
+      ? "Importing join kit — talking to the hub…"
+      : dbBusy
+        ? "Installing local Postgres…"
+        : remoteBusy
+          ? "Connecting to the hub…"
+          : migrating
+            ? "Applying database schema…"
+            : saving
+              ? "Saving key…"
+              : modelSaving
+                ? "Saving models…"
+                : graphInstalling
+                  ? "Installing Graphify…"
+                  : doctorBusy && step === "finish"
+                    ? "Running doctor…"
+                    : null;
+
   return (
     <div className="onboard welcome" data-step={step}>
+      <WorkingBanner label={workingLabel} />
       <ol className="welcome-steps" aria-label="Setup progress">
         {STEPS.map((s, i) => (
           <li key={s.id} className={i < idx ? "done" : i === idx ? "current" : ""} aria-current={i === idx ? "step" : undefined}>
@@ -1119,12 +1157,20 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
           ) : harnesses.length === 0 ? (
             <p className="muted">No supported harness was found on this Mac yet.</p>
           ) : (
-            <ul className="welcome-list">
+            <ul className="welcome-list welcome-harness-list">
               {harnesses.map((h) => (
-                <li key={h.harness}>
+                <li key={h.harness} className="welcome-harness-row">
                   <strong>{h.harness.replace("_", " ")}</strong>
-                  {" — "}
-                  {h.installed ? "installed" : h.detected ? "found, not installed" : "not found on this Mac"}
+                  {h.installed ? (
+                    <span className="pill ok">
+                      <span className="pill-dot" />
+                      Installed
+                    </span>
+                  ) : (
+                    <span className="muted">
+                      {h.detected ? "found, not installed" : "not found on this Mac"}
+                    </span>
+                  )}
                 </li>
               ))}
             </ul>
@@ -1177,7 +1223,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         {step === "finish" ? (
           <>
             {soleBackupRed ? (
-              <button type="button" onClick={() => finish(true)}>Continue with warnings</button>
+              <button type="button" disabled={doctorBusy} onClick={() => finish(true)}>Continue with warnings</button>
             ) : null}
             <button type="button" className="primary" disabled={!canFinish} onClick={() => finish(false)}>
               Finish

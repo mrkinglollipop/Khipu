@@ -2,7 +2,7 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use tauri::{
@@ -284,12 +284,30 @@ fn run_khipu_cli(args: &[String]) -> Result<String, String> {
     Ok(stdout)
 }
 
+/// Sync `#[tauri::command]` fns run on the webview thread. Any `.output()`
+/// there freezes tab paints and the working spinner. Offload CLI waits.
+async fn run_khipu_cli_async(args: Vec<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || run_khipu_cli(&args))
+        .await
+        .map_err(|e| format!("khipu worker join failed: {e}"))?
+}
+
+async fn spawn_blocking_cli<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("khipu worker join failed: {e}"))?
+}
+
 /// Read-only presence report (`khipu secrets`, no arguments). Fixed argv, so
 /// the webview cannot reach `secrets --set` through it; writes go through
 /// `set_khipu_secret` and its stdin transport.
 #[tauri::command]
-fn secrets_presence() -> Result<String, String> {
-    run_khipu_cli(&["secrets".to_string()])
+async fn secrets_presence() -> Result<String, String> {
+    run_khipu_cli_async(vec!["secrets".to_string()]).await
 }
 
 /// Apply (or plan) the schema. `migrate` is a state-changing subcommand and is
@@ -297,16 +315,16 @@ fn secrets_presence() -> Result<String, String> {
 /// exactly `migrate` / `migrate --dry-run` so the UI can offer setup without
 /// forwarding arbitrary arguments.
 #[tauri::command]
-fn khipu_migrate(dry_run: bool) -> Result<String, String> {
+async fn khipu_migrate(dry_run: bool) -> Result<String, String> {
     let mut args = vec!["migrate".to_string()];
     if dry_run {
         args.push("--dry-run".to_string());
     }
-    run_khipu_cli(&args)
+    run_khipu_cli_async(args).await
 }
 
 #[tauri::command]
-fn select_compat_row(
+async fn select_compat_row(
     mode: String,
     pgvector_extversion: Option<String>,
     server_version: Option<String>,
@@ -336,46 +354,46 @@ fn select_compat_row(
             args.push(v.trim().to_string());
         }
     }
-    run_khipu_cli(&args)
+    run_khipu_cli_async(args).await
 }
 
 #[tauri::command]
-fn install_local_postgres() -> Result<String, String> {
-    run_khipu_cli(&["components".into(), "install-local-postgres".into()])
+async fn install_local_postgres() -> Result<String, String> {
+    run_khipu_cli_async(vec!["components".into(), "install-local-postgres".into()]).await
 }
 
 #[tauri::command]
-fn bootstrap_local_backup() -> Result<String, String> {
-    run_khipu_cli(&["components".into(), "bootstrap-local-backup".into()])
+async fn bootstrap_local_backup() -> Result<String, String> {
+    run_khipu_cli_async(vec!["components".into(), "bootstrap-local-backup".into()]).await
 }
 
 #[tauri::command]
-fn install_graphify() -> Result<String, String> {
-    run_khipu_cli(&["components".into(), "install-graphify".into()])
+async fn install_graphify() -> Result<String, String> {
+    run_khipu_cli_async(vec!["components".into(), "install-graphify".into()]).await
 }
 
 #[tauri::command]
-fn components_status() -> Result<String, String> {
-    run_khipu_cli(&["components".into(), "status-json".into()])
+async fn components_status() -> Result<String, String> {
+    run_khipu_cli_async(vec!["components".into(), "status-json".into()]).await
 }
 
 #[tauri::command]
-fn upgrade_postgres() -> Result<String, String> {
-    run_khipu_cli(&["components".into(), "upgrade-postgres".into()])
+async fn upgrade_postgres() -> Result<String, String> {
+    run_khipu_cli_async(vec!["components".into(), "upgrade-postgres".into()]).await
 }
 
 #[tauri::command]
-fn upgrade_graphify() -> Result<String, String> {
-    run_khipu_cli(&["components".into(), "upgrade-graphify".into()])
+async fn upgrade_graphify() -> Result<String, String> {
+    run_khipu_cli_async(vec!["components".into(), "upgrade-graphify".into()]).await
 }
 
 #[tauri::command]
-fn check_remote_postgres(full: bool) -> Result<String, String> {
+async fn check_remote_postgres(full: bool) -> Result<String, String> {
     let mut args = vec!["components".into(), "check-remote".into()];
     if full {
         args.push("--full".into());
     }
-    run_khipu_cli(&args)
+    run_khipu_cli_async(args).await
 }
 
 /// Secrets the UI may write, and the Keychain accounts they map to.
@@ -387,7 +405,11 @@ fn check_remote_postgres(full: bool) -> Result<String, String> {
 const SETTABLE_SECRETS: &[&str] = &["gemini_api_key", "database_url", "openai_compat_api_key"];
 
 #[tauri::command]
-fn set_khipu_secret(account: String, value: String) -> Result<String, String> {
+async fn set_khipu_secret(account: String, value: String) -> Result<String, String> {
+    spawn_blocking_cli(move || set_khipu_secret_sync(account, value)).await
+}
+
+fn set_khipu_secret_sync(account: String, value: String) -> Result<String, String> {
     if !SETTABLE_SECRETS.contains(&account.as_str()) {
         eprintln!("[khipu] refused secret write from the UI: {account:?}");
         return Err(format!("not a settable secret: {account:?}"));
@@ -442,7 +464,11 @@ fn set_khipu_secret(account: String, value: String) -> Result<String, String> {
 /// same exposure model as `set_khipu_secret`'s stdin pipe. Empty passphrase
 /// writes a plaintext kit (the file is the secret).
 #[tauri::command]
-fn join_export(passphrase: String, out_path: String) -> Result<String, String> {
+async fn join_export(passphrase: String, out_path: String) -> Result<String, String> {
+    spawn_blocking_cli(move || join_export_sync(passphrase, out_path)).await
+}
+
+fn join_export_sync(passphrase: String, out_path: String) -> Result<String, String> {
     if out_path.trim().is_empty() {
         return Err("out_path is empty".to_string());
     }
@@ -476,7 +502,11 @@ fn join_export(passphrase: String, out_path: String) -> Result<String, String> {
 
 /// Import a join kit from disk. Passphrase travels via env, never argv.
 #[tauri::command]
-fn join_import(passphrase: String, file_path: String) -> Result<String, String> {
+async fn join_import(passphrase: String, file_path: String) -> Result<String, String> {
+    spawn_blocking_cli(move || join_import_sync(passphrase, file_path)).await
+}
+
+fn join_import_sync(passphrase: String, file_path: String) -> Result<String, String> {
     if file_path.trim().is_empty() {
         return Err("file_path is empty".to_string());
     }
@@ -511,7 +541,11 @@ fn join_import(passphrase: String, file_path: String) -> Result<String, String> 
 /// Advertise join kit on LAN (Bonjour + TLS). Spawns a background job and returns
 /// the first JSON line (PIN, port, timeout) while the server keeps running.
 #[tauri::command]
-fn join_advertise(passphrase: String, timeout: u32) -> Result<String, String> {
+async fn join_advertise(passphrase: String, timeout: u32) -> Result<String, String> {
+    spawn_blocking_cli(move || join_advertise_sync(passphrase, timeout)).await
+}
+
+fn join_advertise_sync(passphrase: String, timeout: u32) -> Result<String, String> {
     let root = khipu_root()?;
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
@@ -558,7 +592,11 @@ fn parse_json_line(line: &str) -> Result<Value, String> {
 
 /// Receive join kit from a nearby Mac (Bonjour browse + TLS + import).
 #[tauri::command]
-fn join_receive(passphrase: String, pin: String, out_path: Option<String>) -> Result<String, String> {
+async fn join_receive(passphrase: String, pin: String, out_path: Option<String>) -> Result<String, String> {
+    spawn_blocking_cli(move || join_receive_sync(passphrase, pin, out_path)).await
+}
+
+fn join_receive_sync(passphrase: String, pin: String, out_path: Option<String>) -> Result<String, String> {
     let pin_trim = pin.trim();
     if pin_trim.len() != 6 || !pin_trim.chars().all(|c| c.is_ascii_digit()) {
         return Err("pin must be six digits".to_string());
@@ -628,13 +666,13 @@ const ALLOWED_SUBCOMMANDS: &[&str] = &[
 const SPAWN_ALLOWED_SUBCOMMANDS: &[&str] = &["nightly", "graph-build", "monthly"];
 
 #[tauri::command]
-fn run_khipu(args: Vec<String>) -> Result<String, String> {
-    let sub = args.first().map(String::as_str).unwrap_or("");
-    if !ALLOWED_SUBCOMMANDS.contains(&sub) {
+async fn run_khipu(args: Vec<String>) -> Result<String, String> {
+    let sub = args.first().cloned().unwrap_or_default();
+    if !ALLOWED_SUBCOMMANDS.contains(&sub.as_str()) {
         eprintln!("[khipu] refused CLI subcommand from the UI: {sub:?}");
         return Err(format!("subcommand not permitted from the app: {sub:?}"));
     }
-    run_khipu_cli(&args)
+    run_khipu_cli_async(args).await
 }
 
 #[tauri::command]
@@ -720,7 +758,17 @@ fn dsn_configured_uncached() -> bool {
 }
 
 #[tauri::command]
-fn dsn_configured(force: bool) -> bool {
+async fn dsn_configured(force: bool) -> bool {
+    match tauri::async_runtime::spawn_blocking(move || dsn_configured_sync(force)).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[khipu] dsn_configured worker join failed: {e}");
+            false
+        }
+    }
+}
+
+fn dsn_configured_sync(force: bool) -> bool {
     if !force {
         if let Ok(guard) = DSN_CACHE.lock() {
             if let Some(c) = guard.as_ref() {
@@ -800,9 +848,164 @@ fn dirs_fallback_dsn() -> PathBuf {
 }
 
 #[tauri::command]
-fn health_snapshot() -> Result<Value, String> {
-    let raw = run_khipu_cli(&["status".into()])?;
+async fn health_snapshot() -> Result<Value, String> {
+    let raw = run_khipu_cli_async(vec!["status".into()]).await?;
     serde_json::from_str(&raw).map_err(|e| format!("status JSON: {e}"))
+}
+
+const FEEDBACK_ATTACH_MAX_BYTES: u64 = 15 * 1024 * 1024;
+const FEEDBACK_MAX_FILES: usize = 10;
+const FEEDBACK_URL: &str = "https://kinglollipop.com/api/feedback";
+
+fn attachment_bytes_cap_ok(total: u64) -> Result<(), String> {
+    if total > FEEDBACK_ATTACH_MAX_BYTES {
+        return Err(format!(
+            "attachments exceed {} MiB total",
+            FEEDBACK_ATTACH_MAX_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
+fn feedback_os_string() -> String {
+    let os = std::env::consts::OS;
+    if os == "macos" {
+        if let Ok(out) = Command::new("sw_vers").arg("-productVersion").output() {
+            if out.status.success() {
+                let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !ver.is_empty() {
+                    return format!("macos {ver}");
+                }
+            }
+        }
+    }
+    os.to_string()
+}
+
+fn feedback_idempotency_key() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    format!("{millis}-{pid}")
+}
+
+fn read_feedback_attachments(paths: &[String]) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+    if paths.len() > FEEDBACK_MAX_FILES {
+        return Err(format!("too many attachments (max {FEEDBACK_MAX_FILES})"));
+    }
+    let mut files = Vec::new();
+    let mut total: u64 = 0;
+    for raw in paths {
+        let path = PathBuf::from(raw.trim());
+        if raw.trim().is_empty() {
+            continue;
+        }
+        if !path.is_file() {
+            return Err(format!("attachment not found: {}", path.display()));
+        }
+        let meta = std::fs::metadata(&path)
+            .map_err(|e| format!("read attachment metadata {}: {e}", path.display()))?;
+        let len = meta.len();
+        total = total.saturating_add(len);
+        attachment_bytes_cap_ok(total)?;
+        let bytes = std::fs::read(&path)
+            .map_err(|e| format!("read attachment {}: {e}", path.display()))?;
+        files.push((path, bytes));
+    }
+    Ok(files)
+}
+
+/// Metadata only — do not fetch file bytes through the webview asset protocol
+/// just to show sizes (that would load the whole attachment into JS).
+fn feedback_file_sizes_sync(paths: Vec<String>) -> Result<Vec<Option<u64>>, String> {
+    Ok(paths
+        .iter()
+        .map(|raw| {
+            let path = PathBuf::from(raw.trim());
+            std::fs::metadata(&path)
+                .ok()
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+        })
+        .collect())
+}
+
+fn send_feedback_sync(
+    reply_to: String,
+    message: String,
+    app_version: String,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    let reply_to = reply_to.trim().to_string();
+    let message = message.trim().to_string();
+    if reply_to.is_empty() || !reply_to.contains('@') {
+        return Err("reply_to must be a valid email".into());
+    }
+    if message.is_empty() {
+        return Err("message is required".into());
+    }
+
+    let attachments = read_feedback_attachments(&paths)?;
+    let os = feedback_os_string();
+    let idempotency_key = feedback_idempotency_key();
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("HTTP client: {e}"))?;
+
+    let mut form = reqwest::blocking::multipart::Form::new()
+        .text("reply_to", reply_to)
+        .text("message", message)
+        .text("app_version", app_version)
+        .text("os", os)
+        .text("idempotency_key", idempotency_key)
+        .text("company", String::new());
+
+    for (path, bytes) in attachments {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let part = reqwest::blocking::multipart::Part::bytes(bytes).file_name(file_name);
+        form = form.part("files", part);
+    }
+
+    let response = client
+        .post(FEEDBACK_URL)
+        .multipart(form)
+        .send()
+        .map_err(|e| format!("feedback request failed: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        let snippet: String = body.chars().take(500).collect();
+        return Err(format!(
+            "feedback server returned {}: {}",
+            status.as_u16(),
+            snippet.trim()
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn send_feedback(
+    reply_to: String,
+    message: String,
+    app_version: String,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    spawn_blocking_cli(move || send_feedback_sync(reply_to, message, app_version, paths)).await
+}
+
+#[tauri::command]
+async fn feedback_file_sizes(paths: Vec<String>) -> Result<Vec<Option<u64>>, String> {
+    spawn_blocking_cli(move || feedback_file_sizes_sync(paths)).await
 }
 
 fn tray_tooltip_from_doctor(raw: &str) -> String {
@@ -920,7 +1123,9 @@ pub fn run() {
             upgrade_graphify,
             check_remote_postgres,
             dsn_configured,
-            health_snapshot
+            health_snapshot,
+            send_feedback,
+            feedback_file_sizes
         ])
         .setup(|app| {
             let show_i = MenuItem::with_id(app, "show", "Show Khipu", true, None::<&str>)?;
@@ -1044,6 +1249,33 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running Khipu");
+}
+
+#[cfg(test)]
+mod feedback_attachment_tests {
+    use super::{attachment_bytes_cap_ok, FEEDBACK_ATTACH_MAX_BYTES};
+
+    #[test]
+    fn cap_allows_exactly_fifteen_mib() {
+        assert!(attachment_bytes_cap_ok(FEEDBACK_ATTACH_MAX_BYTES).is_ok());
+    }
+
+    #[test]
+    fn cap_rejects_one_byte_over() {
+        assert!(attachment_bytes_cap_ok(FEEDBACK_ATTACH_MAX_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn cap_allows_zero() {
+        assert!(attachment_bytes_cap_ok(0).is_ok());
+    }
+
+    #[test]
+    fn rejects_more_than_max_files() {
+        let paths: Vec<String> = (0..11).map(|i| format!("/tmp/f{i}")).collect();
+        let err = super::read_feedback_attachments(&paths).unwrap_err();
+        assert!(err.contains("too many"));
+    }
 }
 
 #[cfg(test)]

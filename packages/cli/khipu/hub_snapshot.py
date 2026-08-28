@@ -10,8 +10,11 @@ Read paths (CLI search/graph/get, MCP search/graph/get/status) try the hub
 first; on connection failure they open a **separate** readonly sqlite handle
 here — ``db.connect()`` stays Postgres-only for writers.
 
-Auto-refresh: ``maybe_refresh()`` is fail-open from ``khipu doctor`` and
-``khipu snapshot refresh`` when the hub answers; it does not block forever.
+Auto-refresh: ``maybe_refresh()`` is fail-open from ``khipu doctor`` when the
+hub answers. It skips when a snapshot already exists and is younger than
+``AUTO_REFRESH_MIN_AGE_S``. ``khipu snapshot refresh`` always dumps (it calls
+``refresh()`` directly). Status / MCP status never dump — they only report
+``snapshot_health()``.
 """
 
 from __future__ import annotations
@@ -35,6 +38,11 @@ SNAPSHOT_NAME = "hub_snapshot.sqlite"
 META_NAME = "hub_snapshot.sqlite.meta.json"
 HUB_CONNECT_TIMEOUT_S = 5
 REFRESH_CONNECT_TIMEOUT_S = 30
+# Status used to call maybe_refresh on every tab click, which dumped every
+# episode + embedding over the wire and froze the desktop. Doctor may refresh,
+# but not more often than this unless the operator runs `khipu snapshot refresh`.
+AUTO_REFRESH_MIN_AGE_S = 15 * 60
+_REFRESH_LOCK_NAME = ".hub_snapshot.refresh.lock"
 
 _TABLES = (
     "episodes",
@@ -488,67 +496,122 @@ def _insert_memory_embeddings(cur, con: sqlite3.Connection) -> int:
 
 
 def refresh() -> dict[str, Any]:
-    """Dump hub tables into a fresh sqlite file and atomically replace the snapshot."""
+    """Dump hub tables into a fresh sqlite file and atomically replace the snapshot.
+
+    Holds a cross-process flock for the whole dump so doctor ``maybe_refresh``
+    and ``khipu snapshot refresh`` serialize. If another dump is live, returns
+    ``{"ok": False, "error": ...}`` instead of dumping anyway.
+    """
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {
+            "ok": False,
+            "error": "hub snapshot refresh already in progress",
+        }
+    try:
+        from khipu.paths import ensure_data_dir
+
+        ensure_data_dir()
+        dest = snapshot_path()
+        tmp_dir = dest.parent
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".hub_snapshot.", suffix=".sqlite", dir=tmp_dir
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        counts: dict[str, int] = {}
+        try:
+            con = sqlite3.connect(str(tmp_path))
+            _create_schema(con)
+            with try_hub_connect(connect_timeout=REFRESH_CONNECT_TIMEOUT_S) as pg:
+                with pg.cursor() as cur:
+                    counts["episodes"] = _insert_episodes(cur, con)
+                    counts["topics"] = _insert_topics(cur, con)
+                    counts["topic_revisions"] = _insert_topic_revisions(cur, con)
+                    counts["nodes"] = _insert_nodes(cur, con)
+                    counts["edges"] = _insert_edges(cur, con)
+                    counts["embedding_profiles"] = _insert_profiles(cur, con)
+                    counts["memory_embeddings"] = _insert_memory_embeddings(
+                        cur, con
+                    )
+            con.commit()
+            con.close()
+            os.replace(tmp_path, dest)
+            refreshed_at = _utcnow_iso()
+            size_bytes = dest.stat().st_size
+            meta_path().write_text(
+                json.dumps(
+                    {
+                        "refreshed_at": refreshed_at,
+                        "size_bytes": size_bytes,
+                        "counts": counts,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "ok": True,
+                "path": str(dest),
+                "refreshed_at": refreshed_at,
+                "size_bytes": size_bytes,
+                "counts": counts,
+            }
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+    finally:
+        _release_refresh_lock(lock)
+
+
+def _acquire_refresh_lock():
+    """Non-blocking exclusive lock across CLI processes. None if another dump is live."""
+    import fcntl
+
     from khipu.paths import ensure_data_dir
 
-    ensure_data_dir()
-    dest = snapshot_path()
-    tmp_dir = dest.parent
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=".hub_snapshot.", suffix=".sqlite", dir=tmp_dir
-    )
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    counts: dict[str, int] = {}
+    path = ensure_data_dir() / _REFRESH_LOCK_NAME
+    fh = path.open("a")
     try:
-        con = sqlite3.connect(str(tmp_path))
-        _create_schema(con)
-        with try_hub_connect(connect_timeout=REFRESH_CONNECT_TIMEOUT_S) as pg:
-            with pg.cursor() as cur:
-                counts["episodes"] = _insert_episodes(cur, con)
-                counts["topics"] = _insert_topics(cur, con)
-                counts["topic_revisions"] = _insert_topic_revisions(cur, con)
-                counts["nodes"] = _insert_nodes(cur, con)
-                counts["edges"] = _insert_edges(cur, con)
-                counts["embedding_profiles"] = _insert_profiles(cur, con)
-                counts["memory_embeddings"] = _insert_memory_embeddings(cur, con)
-        con.commit()
-        con.close()
-        os.replace(tmp_path, dest)
-        refreshed_at = _utcnow_iso()
-        size_bytes = dest.stat().st_size
-        meta_path().write_text(
-            json.dumps(
-                {
-                    "refreshed_at": refreshed_at,
-                    "size_bytes": size_bytes,
-                    "counts": counts,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        return {
-            "ok": True,
-            "path": str(dest),
-            "refreshed_at": refreshed_at,
-            "size_bytes": size_bytes,
-            "counts": counts,
-        }
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+def _release_refresh_lock(lock) -> None:
+    import fcntl
+
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    lock.close()
 
 
 def maybe_refresh(
-    *, connect_timeout: int = REFRESH_CONNECT_TIMEOUT_S
+    *, connect_timeout: int = REFRESH_CONNECT_TIMEOUT_S, force: bool = False
 ) -> dict[str, Any] | None:
-    """Fail-open refresh when the hub is reachable."""
+    """Fail-open refresh when the hub is reachable.
+
+    Skip when a snapshot already exists and is younger than
+    ``AUTO_REFRESH_MIN_AGE_S``, unless ``force`` is true. The age check runs
+    before any hub connect — a 30s connect timeout is not a throttle.
+    """
+    if not force:
+        health = snapshot_health()
+        age = health.get("age_seconds")
+        if health.get("exists") and isinstance(age, int) and 0 <= age < AUTO_REFRESH_MIN_AGE_S:
+            _log(f"refresh skipped: snapshot age {age}s < {AUTO_REFRESH_MIN_AGE_S}s")
+            return None
     try:
         with try_hub_connect(connect_timeout=connect_timeout) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
-        return refresh()
+        # Lock lives in refresh() — do not acquire here (nested LOCK_NB would fail).
+        out = refresh()
+        if not out.get("ok"):
+            _log(f"refresh skipped: {out.get('error', 'refresh failed')}")
+            return None
+        return out
     except Exception as exc:  # noqa: BLE001 — fail-open by design
         _log(f"refresh skipped: {type(exc).__name__}: {exc}")
         return None
@@ -574,8 +637,13 @@ def snapshot_health() -> dict[str, Any]:
         try:
             ref = datetime.fromisoformat(str(refreshed_at).replace("Z", "+00:00"))
             age_s = int((datetime.now(timezone.utc) - ref).total_seconds())
-        except ValueError:
+        except (TypeError, ValueError):
             age_s = None
+    if age_s is None:
+        # Missing/unparseable refreshed_at must not look like "no snapshot" —
+        # a young file with bad meta is still a throttle hit, not a dump.
+        mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+        age_s = int((datetime.now(timezone.utc) - mtime).total_seconds())
     return {
         "ok": True,
         "exists": True,

@@ -13,6 +13,7 @@ import {
   GitBranch,
   History,
   Loader2,
+  MessageSquare,
   Package,
   PlugZap,
   RefreshCw,
@@ -28,6 +29,8 @@ import khipuIcon from "./assets/khipu-icon.png";
 import { ComponentsPanel } from "./ComponentsPanel";
 import { IntegrationsPanel } from "./IntegrationsPanel";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
+import { WorkingBanner } from "./WorkingBanner";
+import { FeedbackForm } from "./FeedbackForm";
 import "./App.css";
 
 type Tab =
@@ -412,6 +415,7 @@ export default function App() {
   );
   const [error, setError] = useState<string | null>(null);
   const fetchedAt = useRef<Partial<Record<CacheTab, number>>>({});
+  const feedbackButtonRef = useRef<HTMLButtonElement>(null);
 
   const [statusText, setStatusText] = useState("…");
   const [counts, setCounts] = useState<Counts | null>(null);
@@ -869,10 +873,7 @@ export default function App() {
   useEffect(() => {
     if (!dsnOk) return;
     // Fire-and-forget: never block tab paint on CLI.
-    if (tab === "status") {
-      void loadStatus(false);
-      void loadDoctor(false);
-    }
+    if (tab === "status") void loadStatus(false);
     if (tab === "doctor") void loadDoctor(false);
     if (tab === "revisions") void loadRevisions(false);
     if (tab === "activity") void loadActivity(false);
@@ -933,6 +934,8 @@ export default function App() {
   const [graphSourcesMsg, setGraphSourcesMsg] = useState<string | null>(null);
   const [newCodeRoot, setNewCodeRoot] = useState("");
   const [appVersion, setAppVersion] = useState<string>("…");
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedbackSending, setFeedbackSending] = useState(false);
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [setupJoinPassphrase, setSetupJoinPassphrase] = useState("");
@@ -945,6 +948,7 @@ export default function App() {
     expires_at?: number;
     ipv4?: string;
   } | null>(null);
+  const [hubSnapBusy, setHubSnapBusy] = useState(false);
   const [hubSnapshotHealth, setHubSnapshotHealth] = useState<{
     refreshed_at?: string;
     size_bytes?: number;
@@ -1185,6 +1189,7 @@ export default function App() {
     // Settings meant the onboarding screen named ~/.config/khipu no matter
     // where the DSN was actually supposed to go. `khipu paths` needs no DSN,
     // so it works on exactly the screen that exists because there isn't one.
+    let alive = true;
     if (tab === "settings" || tab === "first-run") {
       void loadPaths();
       void loadGraphSources();
@@ -1193,15 +1198,24 @@ export default function App() {
       void loadModels();
       void loadSecretsPresence();
       void (async () => {
+        setHubSnapBusy(true);
         try {
           const raw = await runKhipu(["status"]);
+          if (!alive) return;
           const parsed = parseJson(raw) as { hub_snapshot?: typeof hubSnapshotHealth } | null;
           setHubSnapshotHealth(parsed?.hub_snapshot ?? null);
         } catch {
+          if (!alive) return;
           setHubSnapshotHealth(null);
+        } finally {
+          if (alive) setHubSnapBusy(false);
         }
       })();
     }
+    return () => {
+      alive = false;
+      setHubSnapBusy(false);
+    };
   }, [tab, loadPaths, loadGraphSources, loadModels, loadSecretsPresence, runKhipu]);
 
   useEffect(() => {
@@ -1427,6 +1441,28 @@ export default function App() {
   const multiCount =
     revisionsConflicts?.topics_with_multiple_revisions?.length ?? 0;
   const anyLoading = Object.values(loading).some(Boolean) || actionBusy;
+  const workingLabel = (() => {
+    if (feedbackSending) return "Sending feedback…";
+    if (advertiseBusy) return "Advertising a join PIN…";
+    if (updateBusy) return "Checking for updates…";
+    if (actionBusy) return "Working…";
+    const bits: string[] = [];
+    if (loading.status) bits.push("Status");
+    if (loading.doctor) bits.push("Doctor");
+    if (loading.activity) bits.push("Activity");
+    if (loading.revisions) bits.push("Revisions");
+    if (hubSnapBusy && !loading.status && tab === "settings") bits.push("Status");
+    if (bits.length) return `Talking to the hub — ${bits.join(" · ")}`;
+    return null;
+  })();
+  const tabBusy = (id: Tab): boolean => {
+    if (id === "status") return Boolean(loading.status);
+    if (id === "doctor") return Boolean(loading.doctor);
+    if (id === "activity") return Boolean(loading.activity);
+    if (id === "revisions") return Boolean(loading.revisions);
+    if (id === "settings") return hubSnapBusy;
+    return false;
+  };
 
   const lagLabel =
     mirrorLag == null
@@ -1518,6 +1554,9 @@ export default function App() {
                   >
                     <Icon size={16} strokeWidth={1.75} aria-hidden />
                     <span className="nav-label">{label}</span>
+                    {tabBusy(id) ? (
+                      <Loader2 size={12} className="spin nav-spin" aria-hidden />
+                    ) : null}
                   </button>
                 );
               })}
@@ -1525,6 +1564,15 @@ export default function App() {
           ))}
         </div>
         <div className="rail-foot" data-tauri-drag-region>
+          <button
+            ref={feedbackButtonRef}
+            type="button"
+            className="rail-feedback"
+            onClick={() => setFeedbackOpen(true)}
+          >
+            <MessageSquare size={14} aria-hidden />
+            Feedback
+          </button>
           <span className="version-chip">v{appVersion}</span>
           <StatusPill
             tone={dsnOk == null ? "neutral" : dsnOk ? "ok" : "err"}
@@ -1537,7 +1585,8 @@ export default function App() {
         </div>
       </nav>
 
-      <main className="main">
+      <main className="main" aria-busy={workingLabel != null}>
+        <WorkingBanner label={workingLabel} />
         <section className={panelClass("first-run")}>
           <div className="panel-body onboard-wrap" data-tauri-drag-region>
             <Welcome
@@ -2846,6 +2895,14 @@ export default function App() {
           </div>
         </section>
       </main>
+
+      <FeedbackForm
+        open={feedbackOpen}
+        appVersion={appVersion}
+        onClose={() => setFeedbackOpen(false)}
+        onSendingChange={setFeedbackSending}
+        returnFocusRef={feedbackButtonRef}
+      />
 
       {error ? (
         <div className="toast-err" role="alert">

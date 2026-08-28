@@ -244,6 +244,27 @@ button.nav:focus-visible {
   gap: 8px;
   padding: 12px 16px;
   border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+button.rail-feedback {
+  height: auto;
+  min-height: 32px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  button.rail-feedback:hover {
+    background: var(--surface-2);
+    color: var(--text);
+    border-color: var(--border-strong);
+  }
 }
 
 .version-chip {
@@ -257,6 +278,11 @@ button.nav:focus-visible {
   color: var(--muted);
 }
 
+.nav-spin {
+  margin-left: auto;
+  color: var(--muted);
+}
+
 /* --------------------------------------------------------------------------
    Main + panels
 -------------------------------------------------------------------------- */
@@ -264,6 +290,37 @@ button.nav:focus-visible {
 .main {
   overflow-y: auto;
   background: var(--bg);
+}
+
+.working-banner {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 24px;
+  background: var(--accent-soft);
+  border-bottom: 1px solid var(--border);
+  color: var(--accent-text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.working-banner-label {
+  flex: 1 1 auto;
+}
+
+.working-banner-elapsed {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+.working-banner-hint {
+  color: var(--text-2);
+  font-weight: 500;
 }
 
 .panel.is-hidden {
@@ -1154,6 +1211,22 @@ button.toast-close:hover {
 .row-item > svg.muted { color: var(--text-muted, #8a8078); }
 .row-item > svg { flex: 0 0 auto; margin-top: 2px; }
 
+.harness-installed-pill {
+  margin-left: auto;
+}
+
+.welcome-harness-list {
+  list-style: none;
+  padding-left: 0;
+}
+
+.welcome-harness-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 /* Welcome tutorial — step rail + lists, on top of .onboard */
 .welcome { max-width: 640px; }
 .welcome-steps {
@@ -1198,3 +1271,210 @@ button.toast-close:hover {
 .welcome-list li + li { margin-top: 4px; }
 .welcome-nav { width: 100%; justify-content: space-between; margin-top: 8px; }
 .welcome .toolbar input.mono { flex: 1; }
+
+/* --------------------------------------------------------------------------
+   Send feedback dialog
+-------------------------------------------------------------------------- */
+
+.feedback-dialog {
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+  color: var(--text);
+  max-width: min(520px, calc(100vw - 32px));
+  width: 100%;
+}
+
+.feedback-dialog::backdrop {
+  background: rgba(32, 29, 26, 0.45);
+}
+
+@media (prefers-color-scheme: dark) {
+  .feedback-dialog::backdrop {
+    background: rgba(0, 0, 0, 0.55);
+  }
+}
+
+.feedback-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px;
+}
+
+.feedback-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.feedback-head h2 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+button.feedback-close {
+  height: auto;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+
+button.feedback-close:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+.feedback-lede {
+  margin: 0;
+}
+
+.feedback-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.feedback-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+textarea.feedback-message {
+  min-height: 120px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.5;
+  resize: vertical;
+  transition:
+    border-color 140ms ease,
+    box-shadow 140ms ease;
+}
+
+textarea.feedback-message:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--ring);
+}
+
+textarea.feedback-message:disabled {
+  opacity: 0.5;
+}
+
+.feedback-hint {
+  font-size: 11px;
+}
+
+.feedback-field-err {
+  font-size: 12px;
+  color: var(--err);
+}
+
+.feedback-attach-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.feedback-attach-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.feedback-attach-total {
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
+.feedback-attach-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.feedback-attach-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.feedback-attach-list li:last-child {
+  border-bottom: 0;
+}
+
+.feedback-attach-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.feedback-attach-size {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+button.feedback-attach-remove {
+  height: auto;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+
+button.feedback-attach-remove:hover {
+  color: var(--err);
+  background: transparent;
+}
+
+.feedback-form-err {
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  background: var(--err-soft);
+  border: 1px solid var(--err);
+  color: var(--err);
+  font-size: 12px;
+}
+
+.feedback-success-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--ok);
+}
+
+.feedback-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}

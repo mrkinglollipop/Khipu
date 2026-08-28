@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Loader2, RefreshCw } from "lucide-react";
+import { WorkingBanner } from "./WorkingBanner";
 
 function parse(raw: string): Record<string, unknown> | null {
   try {
@@ -46,12 +47,15 @@ export function ComponentsPanel() {
 
   const reload = useCallback(async () => {
     setMsg(null);
+    setBusy((prev) => prev ?? "status");
     try {
       const raw = await invoke<string>("components_status");
       setStatus(parse(raw) as StatusPayload);
     } catch (e) {
       setStatus(null);
       setMsg(String(e));
+    } finally {
+      setBusy((prev) => (prev === "status" ? null : prev));
     }
   }, []);
 
@@ -94,6 +98,17 @@ export function ComponentsPanel() {
 
   return (
     <div className="panel-body">
+      <WorkingBanner
+        label={
+          busy === "status"
+            ? "Checking components…"
+            : busy === "postgres"
+              ? "Upgrading Postgres…"
+              : busy === "graphify"
+                ? "Upgrading Graphify…"
+                : null
+        }
+      />
       <div className="section-card">
         <div className="section-head">App + CLI</div>
         <div className="section-body">
@@ -110,7 +125,7 @@ export function ComponentsPanel() {
         </div>
         <div className="section-body">
           <div className="toolbar">
-            <button type="button" onClick={() => void reload()}>
+            <button type="button" disabled={busy != null} onClick={() => void reload()}>
               <RefreshCw size={14} aria-hidden /> Refresh
             </button>
           </div>
