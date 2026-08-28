@@ -428,7 +428,6 @@ def _tool_status(args: dict) -> dict:
     from khipu.drift import status_payload
     from khipu.hub_snapshot import (
         hub_connection_failed,
-        maybe_refresh,
         snapshot_health,
         status_payload_snapshot,
     )
@@ -438,7 +437,6 @@ def _tool_status(args: dict) -> dict:
             payload = status_payload(_default_memory_root(), include_drift=True)
         else:
             payload = status_payload(None)
-        maybe_refresh()
         payload["hub_snapshot"] = snapshot_health()
         return payload
     except Exception as exc:
