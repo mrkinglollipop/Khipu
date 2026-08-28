@@ -166,9 +166,12 @@ def hub_connection_failed(exc: BaseException) -> bool:
 def try_hub_connect(
     *, connect_timeout: int = HUB_CONNECT_TIMEOUT_S
 ) -> psycopg.Connection:
-    from khipu.db import resolve_dsn
+    from khipu.db import conninfo_with_local_root_cert, resolve_dsn
 
-    return psycopg.connect(resolve_dsn(), connect_timeout=connect_timeout)
+    return psycopg.connect(
+        conninfo_with_local_root_cert(resolve_dsn()),
+        connect_timeout=connect_timeout,
+    )
 
 
 def open_snapshot() -> sqlite3.Connection:

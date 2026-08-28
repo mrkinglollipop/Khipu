@@ -31,8 +31,9 @@ def rewrite_dsn_sslrootcert(dsn: str, cert_path: str) -> str:
     # Absolute path — relative / foreign-Mac paths blow up on the joining machine.
     query["sslrootcert"] = [str(Path(cert_path).expanduser().resolve())]
     flat = {key: values[-1] for key, values in query.items()}
-    # quote_via=quote with urlencode's safe='' percent-encodes '/' so libpq
-    # does not truncate the path (seen as sslrootcert=/Users/matthewsc…).
+    # Percent-encode '/' in the *stored* URI for doctor/file health. Connect
+    # still must not use this string as-is — see db.conninfo_with_local_root_cert
+    # (URI query paths have arrived at TLS as sslrootcert=/Users/matthewsc).
     new_query = urlencode(flat, quote_via=quote)
     return urlunsplit(
         (parts.scheme, parts.netloc, parts.path, new_query, parts.fragment)

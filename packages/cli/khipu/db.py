@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 DEFAULT_DSN_FILE = Path.home() / ".config" / "khipu" / "dsn"
 LEGACY_DSN_FILE = Path.home() / ".config" / "alzy" / "dsn"
@@ -62,8 +63,29 @@ def resolve_dsn() -> str:
     )
 
 
+def conninfo_with_local_root_cert(dsn: str) -> str:
+    """Keyword conninfo for libpq, with this Mac's ``root.crt`` forced in.
+
+    Stored DSNs are ``postgres://`` URIs. Putting ``sslrootcert=/Users/…``
+    in the query string has shown up at TLS time as
+    ``root certificate file "/Users/matthewsc" does not exist`` (the first
+    16 chars of the path) even when ``~/.config/khipu/root.crt`` was on
+    disk. Percent-encoding slashes in the URI does not survive libpq's
+    decode. Keyword/value conninfo plus an overwrite from the local cert
+    file is the connect-time contract; ``resolve_dsn()`` stays the raw
+    Keychain/file URI so password parsers that split on ``://`` still work.
+    """
+    params = {key: val for key, val in conninfo_to_dict(dsn).items() if val is not None}
+    from khipu.paths import root_cert_file
+
+    cert = root_cert_file()
+    if cert.is_file():
+        params["sslrootcert"] = str(cert.resolve())
+    return make_conninfo(**params)
+
+
 def connect(*, autocommit: bool = False):
-    return psycopg.connect(resolve_dsn(), autocommit=autocommit)
+    return psycopg.connect(conninfo_with_local_root_cert(resolve_dsn()), autocommit=autocommit)
 
 
 def dsn_configured() -> bool:

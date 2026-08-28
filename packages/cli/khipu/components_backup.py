@@ -117,13 +117,13 @@ def _pg_restore_result(proc: subprocess.CompletedProcess[str]) -> dict:
 
 
 def _dump_live_db(dest: Path) -> dict:
-    from khipu.db import resolve_dsn
+    from khipu.db import conninfo_with_local_root_cert, resolve_dsn
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     dest_file = dest / f"khipu-local-{stamp}.dump"
     host_dump = _pg_dump_path()
     if host_dump:
-        dsn = resolve_dsn()
+        dsn = conninfo_with_local_root_cert(resolve_dsn())
         proc = _run(
             [
                 host_dump,
