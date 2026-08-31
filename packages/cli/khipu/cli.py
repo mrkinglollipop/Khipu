@@ -305,6 +305,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             and index_freshness_ok
             and embed_coverage_ok
             and bool(_graph_backup.get("ok"))
+            # graph_offsite_ok was reported but never aggregated, so a stale
+            # offsite copy left doctor (and the soak probe reading doctor.ok)
+            # green for days (08-28..08-31).
+            and bool(_graph_offsite.get("ok"))
         ),
         "graph_backup": _graph_backup,
         "graph_backup_ok": bool(_graph_backup.get("ok")),

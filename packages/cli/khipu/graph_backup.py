@@ -176,7 +176,29 @@ def _last_ok_time(kind: str) -> datetime | None:
     return created
 
 
+def resolve_rclone(rclone_bin: str = "rclone") -> str | None:
+    """A launchd job's PATH has no /opt/homebrew/bin, so a bare "rclone"
+    raised OSError there and read as "remote not configured" — every nightly
+    offsite attempt 08-27..08-31 failed that way while the same call worked
+    from a login shell. Resolve to an absolute path before running."""
+    import shutil
+
+    if "/" in rclone_bin:
+        return rclone_bin if Path(rclone_bin).is_file() else None
+    found = shutil.which(rclone_bin)
+    if found:
+        return found
+    for cand in ("/opt/homebrew/bin/rclone", "/usr/local/bin/rclone"):
+        if Path(cand).is_file():
+            return cand
+    return None
+
+
 def has_r2_remote(*, rclone_bin: str = "rclone") -> bool:
+    resolved = resolve_rclone(rclone_bin)
+    if resolved is None:
+        return False
+    rclone_bin = resolved
     try:
         r = subprocess.run(
             [rclone_bin, "listremotes"],
@@ -292,6 +314,16 @@ def run_offsite(
     keep: int = 3,
     rclone_bin: str = "rclone",
 ) -> dict:
+    resolved = resolve_rclone(rclone_bin)
+    if resolved is None:
+        return {
+            "ok": False,
+            "reason": (
+                f"rclone binary not found (looked for {rclone_bin!r}, PATH and "
+                "Homebrew locations) — install rclone or pass rclone_bin"
+            ),
+        }
+    rclone_bin = resolved
     if not has_r2_remote(rclone_bin=rclone_bin):
         return {
             "ok": False,

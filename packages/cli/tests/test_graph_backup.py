@@ -108,9 +108,27 @@ class DrillDueTest(unittest.TestCase):
         self.assertFalse(graph_backup.drill_due(last_ok=last, now=now, period_days=8))
 
 
+class ResolveRcloneTest(unittest.TestCase):
+    def test_bare_name_resolves_or_falls_back_to_homebrew(self):
+        """launchd has no /opt/homebrew/bin on PATH; a bare "rclone" must
+        still resolve there (08-27..08-31: five nightly offsite attempts
+        failed as 'remote not configured' because the binary wasn't found)."""
+        with mock.patch("shutil.which", return_value=None), \
+             mock.patch.object(graph_backup.Path, "is_file",
+                               lambda self: str(self) == "/opt/homebrew/bin/rclone"):
+            self.assertEqual(graph_backup.resolve_rclone("rclone"), "/opt/homebrew/bin/rclone")
+
+    def test_nothing_found_returns_none_and_offsite_names_the_binary(self):
+        with mock.patch.object(graph_backup, "resolve_rclone", return_value=None):
+            out = graph_backup.run_offsite()
+        self.assertFalse(out["ok"])
+        self.assertIn("rclone binary not found", out["reason"])
+
+
 class RunOffsiteTest(unittest.TestCase):
     def test_missing_r2_remote_fails_honest(self):
-        with mock.patch.object(graph_backup, "has_r2_remote", return_value=False):
+        with mock.patch.object(graph_backup, "resolve_rclone", return_value="rclone"), \
+             mock.patch.object(graph_backup, "has_r2_remote", return_value=False):
             out = graph_backup.run_offsite()
         self.assertFalse(out["ok"])
         self.assertIn("r2", out["reason"].lower())
@@ -136,6 +154,7 @@ class RunOffsiteTest(unittest.TestCase):
             with (
                 mock.patch.object(graph_backup, "DEFAULT_SNAPSHOT_DIR", d),
                 mock.patch.object(graph_backup, "LIVE_GRAPH", live),
+                mock.patch.object(graph_backup, "resolve_rclone", return_value="rclone"),
                 mock.patch.object(graph_backup, "has_r2_remote", return_value=True),
                 mock.patch("khipu.graph_backup.subprocess.run", side_effect=fake_run),
                 mock.patch(
@@ -169,6 +188,7 @@ class RunOffsiteTest(unittest.TestCase):
             with (
                 mock.patch.object(graph_backup, "DEFAULT_SNAPSHOT_DIR", d),
                 mock.patch.object(graph_backup, "LIVE_GRAPH", live),
+                mock.patch.object(graph_backup, "resolve_rclone", return_value="rclone"),
                 mock.patch.object(graph_backup, "has_r2_remote", return_value=True),
                 mock.patch("khipu.graph_backup.subprocess.run", side_effect=fake_run),
                 mock.patch(
