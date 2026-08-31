@@ -122,9 +122,11 @@ const STATE_TEXT: Record<ComponentState, string> = {
 export function IntegrationsPanel({
   runKhipu,
   onToast,
+  active,
 }: {
   runKhipu: (args: string[]) => Promise<string>;
   onToast: (msg: string) => void;
+  active: boolean;
 }) {
   const [rows, setRows] = useState<StatusRow[] | null>(null);
   const [verify, setVerify] = useState<Record<string, VerifyRow>>({});
@@ -146,9 +148,14 @@ export function IntegrationsPanel({
     }
   }, [runKhipu]);
 
+  // Panels are CSS-hidden on tab switch, not unmounted, so a mount-only
+  // effect never re-fetches — the pane goes stale as soon as something
+  // changes elsewhere (0.3.12 fixed the same staleness for Status/Doctor by
+  // keying the load on tab activation instead of mount; audit 2026-08-31).
   useEffect(() => {
+    if (!active) return;
     void load();
-  }, [load]);
+  }, [active, load]);
 
   const act = useCallback(
     async (harness: HarnessId | "all", cmd: "install" | "verify" | "uninstall") => {

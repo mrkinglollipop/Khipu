@@ -9,6 +9,7 @@ import {
   Blocks,
   ChevronRight,
   CircleCheck,
+  CircleMinus,
   Gauge,
   GitBranch,
   History,
@@ -193,6 +194,32 @@ type DoctorJobs = {
   graph_build?: JobEntry;
   embed_media_backfill?: JobEntry;
 };
+
+// graph_backup / graph_offsite from khipu.graph_backup.local_health() /
+// offsite_health(): "skipped" means non-producer machine (by design, not a
+// failure); a configured-but-failing check is skipped:false, ok:false.
+type DoctorHealthCheck = {
+  ok?: boolean;
+  skipped?: boolean;
+  reason?: string;
+  age_seconds?: number;
+  max_age_hours?: number;
+  max_age_days?: number;
+  latest?: { age_seconds?: number };
+};
+
+const NOT_CONFIGURED_LABEL: Record<string, string> = {
+  memory_root: "File ↔ PG drift (legacy wiki)",
+  graph_sqlite: "Graph mirror drift",
+};
+
+function formatAge(seconds: number | null | undefined): string {
+  if (seconds == null) return "an unknown time";
+  if (seconds < 90) return `${Math.round(seconds)}s`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)}m`;
+  if (seconds < 172800) return `${Math.round(seconds / 3600)}h`;
+  return `${Math.round(seconds / 86400)}d`;
+}
 
 async function spawnKhipu(subcommand: string): Promise<{
   ok?: boolean;
@@ -407,6 +434,37 @@ function RawJson({
   );
 }
 
+// Positive health row for a check that can be ok / red / skipped-by-design
+// (graph_backup, graph_offsite). Skipped is always neutral gray — folding it
+// into green is exactly the bug this row exists to avoid (audit 2026-08-31).
+function renderHealthRow(
+  label: string,
+  check: DoctorHealthCheck | null,
+  detail: (c: DoctorHealthCheck) => string,
+) {
+  const tone: "ok" | "err" | "muted" = !check
+    ? "muted"
+    : check.skipped
+      ? "muted"
+      : check.ok
+        ? "ok"
+        : "err";
+  const Icon =
+    tone === "ok" ? CircleCheck : tone === "err" ? TriangleAlert : CircleMinus;
+  const text = !check
+    ? "Run Refresh to check."
+    : check.skipped
+      ? `Not checked — ${check.reason ?? "not the graph producer on this Mac"}`
+      : detail(check);
+  return (
+    <div key={label} className="row-item">
+      <Icon size={16} strokeWidth={1.75} aria-hidden className={tone} />
+      <span className="row-main">{label}</span>
+      <span className="row-meta">{text}</span>
+    </div>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>("status");
   const [dsnOk, setDsnOk] = useState<boolean | null>(null);
@@ -439,6 +497,20 @@ export default function App() {
   // hook runs but records nothing must be loud here (2026-08-17).
   const [doctorIssues, setDoctorIssues] = useState<string[]>([]);
   const [doctorJobs, setDoctorJobs] = useState<DoctorJobs | null>(null);
+  // Checks the CLI never ran on this machine (`not_configured`) plus the two
+  // health checks that can be skipped by design (graph_backup/graph_offsite
+  // on a non-producer Mac). Kept separate from doctorIssues so a skip never
+  // gets folded into either "all green" or the red issue list.
+  const [doctorNotConfigured, setDoctorNotConfigured] = useState<string[]>(
+    [],
+  );
+  const [doctorGraphBackup, setDoctorGraphBackup] =
+    useState<DoctorHealthCheck | null>(null);
+  const [doctorGraphOffsite, setDoctorGraphOffsite] =
+    useState<DoctorHealthCheck | null>(null);
+  const [doctorSkipReasons, setDoctorSkipReasons] = useState<
+    Record<string, string | undefined>
+  >({});
   const [jobSpawnMsg, setJobSpawnMsg] = useState<string | null>(null);
   const [revisionsText, setRevisionsText] = useState("…");
   const [activityText, setActivityText] = useState("…");
@@ -474,6 +546,11 @@ export default function App() {
   const [revShowId, setRevShowId] = useState("");
   const [query, setQuery] = useState("");
   const [searchText, setSearchText] = useState("");
+  // A failed search used to clear searchText, which the render reads as
+  // "never searched" — the failure vanished with the toast and the panel
+  // looked like an empty first run. Kept separate so it renders its own
+  // inline, retryable state instead (audit 2026-08-31).
+  const [searchErr, setSearchErr] = useState<string | null>(null);
   // Literal keyword match is the CLI default. The pane offered no alternative,
   // so a natural phrase whose words never appear verbatim ("capture liveness")
   // returned "Nothing matched that query in the hub index" — a false statement,
@@ -681,6 +758,27 @@ export default function App() {
         issues.push("Embedding coverage incomplete");
       }
       setDoctorJobs((parsed as { jobs?: DoctorJobs }).jobs ?? null);
+      const notConfiguredRaw = (parsed as { not_configured?: unknown })
+        .not_configured;
+      setDoctorNotConfigured(
+        Array.isArray(notConfiguredRaw)
+          ? notConfiguredRaw.filter((x): x is string => typeof x === "string")
+          : [],
+      );
+      setDoctorGraphBackup(
+        (parsed as { graph_backup?: DoctorHealthCheck }).graph_backup ??
+          null,
+      );
+      setDoctorGraphOffsite(
+        (parsed as { graph_offsite?: DoctorHealthCheck }).graph_offsite ??
+          null,
+      );
+      setDoctorSkipReasons({
+        memory_root: (parsed as { drift?: { skipped?: string } }).drift
+          ?.skipped,
+        graph_sqlite: (parsed as { graph_drift?: { skipped?: string } })
+          .graph_drift?.skipped,
+      });
       setDoctorIssues(issues);
       fetchedAt.current.doctor = Date.now();
     } catch (e) {
@@ -829,6 +927,7 @@ export default function App() {
     if (!query.trim()) return;
     setActionBusy(true);
     setError(null);
+    setSearchErr(null);
     try {
       const raw = await runKhipu([
         "search",
@@ -840,8 +939,10 @@ export default function App() {
       ]);
       setSearchText(prettyJson(raw));
     } catch (e) {
+      // Keep the query and any prior results — only the new attempt failed —
+      // and surface it inline (below) so it survives the toast timing out.
       setError(String(e));
-      setSearchText("");
+      setSearchErr(String(e));
     } finally {
       setActionBusy(false);
     }
@@ -1474,6 +1575,14 @@ export default function App() {
   const panelClass = (id: Tab) =>
     tab === id ? "panel" : "panel is-hidden";
 
+  // Total checks that never ran on this machine — not_configured entries
+  // plus graph_backup/graph_offsite when this Mac isn't the graph producer.
+  // A skip must never read as a clean pass (audit 2026-08-31).
+  const doctorSkipCount =
+    doctorNotConfigured.length +
+    (doctorGraphBackup?.skipped ? 1 : 0) +
+    (doctorGraphOffsite?.skipped ? 1 : 0);
+
   // SLO (plan.md): mirror lag p95 <= 30s. This is a single latest-sample
   // reading, not a true p95, but the same threshold is the honest bar.
   const lagFresh = mirrorLag != null && mirrorLag <= 30;
@@ -1933,6 +2042,20 @@ export default function App() {
               </button>
             </div>
 
+            {searchErr ? (
+              <Callout
+                tone="warn"
+                title="Search failed"
+                action={
+                  <button type="button" onClick={() => void doSearch()}>
+                    Retry
+                  </button>
+                }
+              >
+                {searchErr}
+              </Callout>
+            ) : null}
+
             {searchResults.length > 0 ? (
               <div className="results">
                 {searchResults.map((r, i) => (
@@ -2311,7 +2434,9 @@ export default function App() {
                   {doctorOk == null
                     ? "—"
                     : doctorOk
-                      ? "All checks passed"
+                      ? doctorSkipCount > 0
+                        ? "All configured checks passed"
+                        : "All checks passed"
                       : "Issues found"}
                 </div>
                 <p className="doctor-sub muted">
@@ -2320,11 +2445,49 @@ export default function App() {
                     : doctorIssues.length
                       ? doctorIssues.join(" · ")
                       : doctorOk
-                        ? "Drift, graph mirror, outbox, backup, capture liveness for every harness, and the nightly git sync — all green. Details below."
+                        ? doctorSkipCount > 0
+                          ? `All configured checks passed · ${doctorSkipCount} not configured. Details below.`
+                          : "Drift, graph mirror, graph snapshot, graph offsite, outbox, backup, capture liveness for every harness, and the nightly git sync — all green. Details below."
                         : "Details in the raw report below."}
                 </p>
               </div>
             </div>
+
+            <div className="rows">
+              <div className="rows-head">Graph backups</div>
+              {renderHealthRow("Graph snapshot", doctorGraphBackup, (c) =>
+                c.ok
+                  ? `Fresh — latest snapshot ${formatAge(c.age_seconds)} old (≤ ${c.max_age_hours}h)`
+                  : (c.reason ?? "stale or missing"),
+              )}
+              {renderHealthRow("Graph offsite", doctorGraphOffsite, (c) =>
+                c.ok
+                  ? `Fresh — last copy ${formatAge(c.latest?.age_seconds)} old (≤ ${c.max_age_days}d)`
+                  : (c.reason ?? "stale or missing"),
+              )}
+            </div>
+
+            {doctorNotConfigured.length ? (
+              <div className="rows">
+                <div className="rows-head">Not checked</div>
+                {doctorNotConfigured.map((name) => (
+                  <div key={name} className="row-item">
+                    <CircleMinus
+                      size={16}
+                      strokeWidth={1.75}
+                      aria-hidden
+                      className="muted"
+                    />
+                    <span className="row-main">
+                      {NOT_CONFIGURED_LABEL[name] ?? name}
+                    </span>
+                    <span className="row-meta">
+                      {doctorSkipReasons[name] ?? `${name} not configured`}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
 
             {doctorJobs ? (
               <div className="rows">
@@ -2350,7 +2513,7 @@ export default function App() {
             title="Components"
             lede="Postgres 19 and Graphify upgrade independently of the app. Versions come from Application Support and the compatibility matrix."
           />
-          <ComponentsPanel />
+          <ComponentsPanel active={tab === "components"} />
         </section>
 
         <section className={panelClass("integrations")}>
@@ -2358,7 +2521,11 @@ export default function App() {
             title="Integrations"
             lede="Install Khipu into each harness on this Mac and verify it actually works. One native pack per harness; nothing shared, nothing forced."
           />
-          <IntegrationsPanel runKhipu={runKhipu} onToast={(m) => setError(m)} />
+          <IntegrationsPanel
+            runKhipu={runKhipu}
+            onToast={(m) => setError(m)}
+            active={tab === "integrations"}
+          />
         </section>
 
         <section className={panelClass("settings")}>

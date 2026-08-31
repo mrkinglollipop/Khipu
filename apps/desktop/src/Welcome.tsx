@@ -573,6 +573,10 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
   const [graphErr, setGraphErr] = useState<string | null>(null);
   const [graphInstalling, setGraphInstalling] = useState(false);
   const [graphOk, setGraphOk] = useState<boolean | null>(null);
+  // A Mac that can't reach the Graphify download (offline, blocked network,
+  // no release for this arch) has no way to get graphOk true — mirrors the
+  // model step's "skip for now" so setup isn't a dead end (audit 2026-08-31).
+  const [graphSkipped, setGraphSkipped] = useState(false);
   const installGraphify = useCallback(async () => {
     setGraphInstalling(true);
     setGraphErr(null);
@@ -1092,17 +1096,42 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
             </Note>
           ) : graphInstalling ? (
             <p className="muted">Downloading and unpacking Graphify…</p>
+          ) : graphSkipped ? (
+            <Note
+              tone="warn"
+              title="Graph engine skipped"
+              action={
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => {
+                    setGraphSkipped(false);
+                    void installGraphify();
+                  }}
+                >
+                  Retry
+                </button>
+              }
+            >
+              Search and capture still work. The knowledge graph stays empty until
+              Graphify is installed later from Components.
+            </Note>
           ) : (
             <Note
               tone="warn"
               title="Graph install did not finish"
               action={
-                <button type="button" className="primary" onClick={() => void installGraphify()}>
-                  Retry
-                </button>
+                <>
+                  <button type="button" className="primary" onClick={() => void installGraphify()}>
+                    Retry
+                  </button>
+                  <button type="button" onClick={() => setGraphSkipped(true)}>
+                    Skip for now
+                  </button>
+                </>
               }
             >
-              {graphErr ?? "Complete the Database step first so pending Graphify version is set."}
+              {graphErr ?? "Graphify isn't installed yet — retry, or skip and install it later from Components."}
             </Note>
           )}
           {joinedHub ? (
@@ -1186,6 +1215,12 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
       {step === "finish" ? (
         <>
           <h1>You're set</h1>
+          {graphSkipped ? (
+            <Note tone="warn" title="Graph engine skipped">
+              Search and capture work now. Install Graphify later from
+              Components to build the knowledge graph.
+            </Note>
+          ) : null}
           {doctorErr ? (
             <p className="muted">Doctor could not run: {doctorErr}</p>
           ) : doctor == null ? (
@@ -1236,7 +1271,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
             disabled={
               modelSaving ||
               (step === "database" && !databaseReady) ||
-              (step === "graph" && graphOk !== true)
+              (step === "graph" && graphOk !== true && !graphSkipped)
             }
             onClick={() => {
               if (step === "model") {
