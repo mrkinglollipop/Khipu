@@ -48,11 +48,17 @@ done
 # lone .app and strangers never see "drag this into Applications".
 DMG_VOLNAME="Khipu"
 
+DMG_BACKGROUND="$DESKTOP/src-tauri/dmg/dmg-background@2x.png"
+
 stage_dmg_payload() {
   local app="$1"
   local stage="$2"
   ditto "$app" "$stage/Khipu.app"
   ln -s /Applications "$stage/Applications"
+  # Branded backdrop (wordmark, quipu cords, drag arrow) — regenerate with
+  # src-tauri/dmg/make_background.py if the palette or layout changes.
+  mkdir "$stage/.background"
+  cp "$DMG_BACKGROUND" "$stage/.background/background.png"
 }
 
 detach_dmg_volume() {
@@ -77,6 +83,7 @@ tell application "Finder"
     set theViewOptions to the icon view options of container window
     set arrangement of theViewOptions to not arranged
     set icon size of theViewOptions to 128
+    set background picture of theViewOptions to file ".background:background.png"
     set position of item "Khipu.app" of container window to {180, 170}
     set position of item "Applications" of container window to {480, 170}
     update without registering applications
@@ -99,6 +106,10 @@ verify_dmg_drag_install() {
   local ok=1
   if [[ ! -d "$mnt/Khipu.app" ]]; then
     echo "error: DMG is missing Khipu.app" >&2
+    ok=0
+  fi
+  if [[ ! -f "$mnt/.background/background.png" ]]; then
+    echo "error: DMG is missing the branded background" >&2
     ok=0
   fi
   if [[ ! -L "$mnt/Applications" ]]; then
