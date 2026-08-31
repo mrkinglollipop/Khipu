@@ -2015,7 +2015,7 @@ dependencies = [
 
 [[package]]
 name = "khipu"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "reqwest",
  "serde",
