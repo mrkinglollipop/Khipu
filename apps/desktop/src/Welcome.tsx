@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import { resourceDir } from "@tauri-apps/api/path";
 import {
   Check,
   ChevronLeft,
@@ -107,6 +108,13 @@ function Note({ tone, title, children, action }: {
   );
 }
 
+/** True when the bundle is on the shipped DMG volume, not /Applications or a
+ *  checkout under `/Volumes/Cloud Storage`. Volume name is `Khipu` (see
+ *  release_macos.sh DMG_VOLNAME). Duplicate mounts show up as `Khipu 1`. */
+function launchedFromDiskImage(resourcePath: string): boolean {
+  return /\/Volumes\/Khipu(?: \d+)?\//.test(resourcePath);
+}
+
 function payloadError(v: Record<string, unknown> | null): string | null {
   if (!v) return "Invalid response";
   if (v.ok === false) return String(v.error ?? "Request failed");
@@ -123,6 +131,13 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
   const [step, setStep] = useState<StepId>("welcome");
   const idx = STEPS.findIndex((s) => s.id === step);
   const go = (n: number) => setStep(STEPS[Math.max(0, Math.min(STEPS.length - 1, idx + n))].id);
+
+  const [fromDiskImage, setFromDiskImage] = useState(false);
+  useEffect(() => {
+    void resourceDir()
+      .then((p) => setFromDiskImage(launchedFromDiskImage(p)))
+      .catch(() => setFromDiskImage(false));
+  }, []);
 
   const [dbMode, setDbMode] = useState<DbMode>("join");
   const [dockerOk, setDockerOk] = useState<boolean | null>(null);
@@ -720,6 +735,19 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
       {step === "welcome" ? (
         <>
           <h1>Welcome to Khipu</h1>
+          {fromDiskImage ? (
+            <Note tone="warn" title="Drag Khipu into Applications">
+              You opened the app from the disk image. Drag <strong>Khipu.app</strong> into
+              the <strong>Applications</strong> folder, eject the disk image, then launch
+              Khipu from Applications — running it from the DMG is not an install.
+            </Note>
+          ) : (
+            <p className="muted">
+              Install: open the disk image and drag <strong>Khipu.app</strong> into the{" "}
+              <strong>Applications</strong> folder, then launch it from Applications
+              (not from the disk image).
+            </p>
+          )}
           <p className="muted">
             Khipu gives your coding agents a memory that outlives the session. A
             hook in each agent captures what happened; PostgreSQL 19 stores it as
