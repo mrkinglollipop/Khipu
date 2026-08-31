@@ -40,7 +40,7 @@ type StatusPayload = {
   error?: string;
 };
 
-export function ComponentsPanel() {
+export function ComponentsPanel({ active }: { active: boolean }) {
   const [status, setStatus] = useState<StatusPayload | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -59,9 +59,14 @@ export function ComponentsPanel() {
     }
   }, []);
 
+  // Panels are CSS-hidden on tab switch, not unmounted, so a mount-only
+  // effect never re-fetches — the pane goes stale as soon as something
+  // changes elsewhere (0.3.12 fixed the same staleness for Status/Doctor by
+  // keying the load on tab activation instead of mount; audit 2026-08-31).
   useEffect(() => {
+    if (!active) return;
     void reload();
-  }, [reload]);
+  }, [active, reload]);
 
   const runUpgrade = useCallback(async (kind: "postgres" | "graphify") => {
     setBusy(kind);
