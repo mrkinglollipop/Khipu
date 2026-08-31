@@ -42,7 +42,9 @@ Otherwise → **hire**. When unsure → **hire**.
 - Plan verify / `/verify-plan-v2` → one `audit-solo` pin `cursor-grok-4.6-xhigh` (allow `high`; **Grok/Claude omit always**; never Composer; never k3), `ROLE=solo_audit` `TRACK=plan`, identifier freshness then Solo plan loop (default cap **8**); does **not** stamp push
 - Plan verify / `/verify-plan` → dual `session-auditor` (`TRACK=plan`) + `audit-verifier` confirm, then plan-only fix verifier when authorized in the **same turn** (same `loop.md` caps + always-delta; plan-doc write allowlist only)
 - Improve loop / `/iterate` → parent-owned mission: parallel `iterate-finder` per requested lens → merge → serial `iterate-fixer` → recheck; durable run log (`schema_version: 2`); fix existing surface only. **Not** myaudit (claims). Default lens = `working`; `lenses=all` = working→bugs→gaps→polish→product with **per-lens max 2** passes (find + recheck) and mission ceilings (`2 × N` finder dispatches, 2 fixer batches); budget-stop / skipped lenses mean Green:N. See `.cursor/skills/iterate/SKILL.md`.
-- Parallel independent legs → **multiple Task calls in one turn**
+- Parallel independent legs → **multiple Task calls in one turn**. When the ask has **≥2 independent legs**, split tracks and fire those Tasks in the **same** turn; orchestrator synthesizes. Caps unchanged (existing explore/code-worker discipline — no unbounded fan-out). Slash `/fanout` forces this decompose→hire path for the trailing ask.
+- **HARD Task `model` field:** omit the field, or pin an allowlisted slug. **Do not** pass the string `inherit` (any case). The local allowlist hook normalizes that string to omit for non-audit agents; prefer omit in policy so models stop sending it.
+- **Task-dead / spawn failure:** if Task fails (Moonshot/K3 schema, Invalid model, hook deny), report the failure class and degrade intentionally — do not silent-solo-grind forever.
 
 **37 — Honor named skill/tool:** When Matt names a specific skill/tool, invoke that skill/tool first this turn (do not wrap in a generic Task that may ignore it). Default: hire still applies when no skill/tool is named.
 
@@ -78,7 +80,7 @@ When host is **cursor**, orchestrator may pin Task `model` **only** from Matt's 
 
 **Effort = slug suffix** (Task has no separate `effort` field). Pick Grok effort by task hardness — light scout → `low`/`medium`; hard multi-step → `high`/`xhigh`. Do not default every pin to `xhigh`. Never bare `grok-4.5-*` / `grok-4.6-*` (product remaps to Fast).
 
-**Omit `model` is OK for non-audit agents when parent is known allowlisted** (`composer-2.5`, `composer-2.5-fast`, or `cursor-grok-4.6-*`; inherit parent otherwise). `composer-2.5-fast` is allowlisted; other `*-fast` (esp. Grok Fast remaps) are denied by `task_model_allowlist.py` (`preToolUse`). Off-list pins (Sonnet, GPT, Fable, bare `grok-4.5-*` / `grok-4.6-*`, …) are denied.
+**Omit `model` is OK for non-audit agents when parent is known allowlisted** (`composer-2.5`, `composer-2.5-fast`, or `cursor-grok-4.6-*`; inherit parent otherwise). **HARD:** omit the Task `model` field — do **not** send the string `inherit` (hook normalizes it to omit locally; prefer omit). `composer-2.5-fast` is allowlisted; other `*-fast` (esp. Grok Fast remaps) are denied by `task_model_allowlist.py` (`preToolUse`). Off-list pins (Sonnet, GPT, Fable, bare `grok-4.5-*` / `grok-4.6-*`, …) are denied.
 
 **Must pin allowlisted model for browser/tool-schema-heavy Tasks when parent may be Moonshot/Kimi/Auto-unknown** (Grok or Composer; do not omit). Moonshot/Kimi can reject Cursor tool JSON Schema on inherit (`completed_subtitle.$ref` / `#/$defs/`). **Default light browser pin:** `cursor-grok-4.6-medium`. Prefer in-thread browser MCP (`cursor-ide-browser`) over a browser Task when available.
 
