@@ -99,6 +99,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         data["recall_quality"] = recall_quality(hub_snapshot=data.get("hub_snapshot"))
     except Exception as exc:  # noqa: BLE001
         data["recall_quality"] = {"error": f"{type(exc).__name__}: {exc}"}
+    # Bundle seal: `na` off a maintainer checkout, red the moment a signed
+    # .app has gained a file it shouldn't have (the 0.3.15 incident). Cheap
+    # (na short-circuits before spawning codesign) so it's fine on the status
+    # tab, not just doctor.
+    try:
+        from khipu import bundle_seal
+
+        data["bundle_seal"] = bundle_seal.check()
+    except Exception as exc:  # noqa: BLE001
+        data["bundle_seal"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     print(json.dumps(data, indent=2, default=str))
     return 0
 
@@ -323,6 +333,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         recall_quality_block = recall_quality(hub_snapshot=hub_snapshot)
     except Exception as e:  # noqa: BLE001
         recall_quality_block = {"error": f"{type(e).__name__}: {e}"}
+    # Bundle seal: red the moment a signed .app has gained a file it shouldn't
+    # have — this is the tripwire the 0.3.15 "Khipu is damaged" incident
+    # needed (see khipu.bundle_seal). `na` (maintainer checkout, no codesign)
+    # counts as ok so it never fails a machine the check does not apply to.
+    try:
+        from khipu import bundle_seal
+
+        bundle_seal_block = bundle_seal.check()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        bundle_seal_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -339,6 +359,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "embed_coverage": embed_coverage,
         "recall_probe": recall_probe,
         "recall_quality": recall_quality_block,
+        "bundle_seal": bundle_seal_block,
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -364,6 +385,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             # signal (W6.1) — red when no probe has run, the last one failed,
             # or it is older than 7 days. This is a hard gate, not a warning.
             and bool(recall_probe.get("ok"))
+            # bundle_seal_ok: red the moment a running .app bundle has gained
+            # a file post-signing (0.3.15's root cause). `ok` is true for both
+            # a clean signature and `na` (not running from inside a bundle).
+            and bool(bundle_seal_block.get("ok"))
         ),
         "graph_backup": _graph_backup,
         "graph_backup_ok": bool(_graph_backup.get("ok")),
@@ -379,6 +404,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "index_freshness_ok": index_freshness_ok,
         "embed_coverage_ok": embed_coverage_ok,
         "recall_probe_ok": bool(recall_probe.get("ok")),
+        "bundle_seal_ok": bool(bundle_seal_block.get("ok")),
     }
     print(json.dumps(out, indent=2, default=str))
     return 0 if out["ok"] else 2

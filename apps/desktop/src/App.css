@@ -1478,3 +1478,55 @@ button.feedback-attach-remove:hover {
   gap: 8px;
   margin-top: 4px;
 }
+
+/* --------------------------------------------------------------------------
+   Post-update notice dialog
+-------------------------------------------------------------------------- */
+
+.post-update-dialog {
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+  color: var(--text);
+  max-width: min(440px, calc(100vw - 32px));
+  width: 100%;
+}
+
+.post-update-dialog::backdrop {
+  background: rgba(32, 29, 26, 0.45);
+}
+
+@media (prefers-color-scheme: dark) {
+  .post-update-dialog::backdrop {
+    background: rgba(0, 0, 0, 0.55);
+  }
+}
+
+.post-update-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 20px;
+}
+
+.post-update-head h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.post-update-text {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.post-update-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}

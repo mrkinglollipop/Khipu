@@ -89,6 +89,54 @@ fn bundled_khipu_root() -> Option<PathBuf> {
     }
 }
 
+/// Startup self-heal: if a launcher ever wrote `__pycache__` inside the
+/// signed bundle before this launch got a chance to redirect it
+/// (`khipu_bytecode_env`), sweep it clean so THIS run's Gatekeeper check is
+/// not tripped by a PAST run's mistake — the actual 0.3.15 failure mode.
+/// This only helps FUTURE launches (the damage already happened by the time
+/// Gatekeeper complains); it does not prevent a write during this session,
+/// just keeps an already-installed bundle clean if anything still manages
+/// one. Errors are ignored throughout — a failed cleanup must never block
+/// startup.
+#[cfg(not(debug_assertions))]
+fn clean_bundled_pycache() {
+    let Some(root) = bundled_khipu_root() else {
+        return;
+    };
+    let mut removed = 0usize;
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            if path.file_name().and_then(|n| n.to_str()) == Some("__pycache__") {
+                if std::fs::remove_dir_all(&path).is_ok() {
+                    removed += 1;
+                }
+            } else {
+                stack.push(path);
+            }
+        }
+    }
+    if removed > 0 {
+        eprintln!(
+            "[khipu] startup self-heal: removed {removed} __pycache__ dir(s) from the bundled CLI"
+        );
+    }
+}
+
+/// Debug builds run from the checkout, never a signed bundle — nothing to heal.
+#[cfg(debug_assertions)]
+fn clean_bundled_pycache() {}
+
 fn khipu_pythonpath(root: &PathBuf) -> String {
     #[cfg(debug_assertions)]
     {
@@ -252,16 +300,37 @@ fn stdout_looks_like_json(stdout: &str) -> bool {
     serde_json::from_str::<Value>(t).is_ok()
 }
 
+/// Bytecode cache location for every khipu CLI invocation, kept OUTSIDE the
+/// signed .app bundle. An in-app update to a previous release wrote
+/// `__pycache__/*.pyc` inside `Contents/Resources/khipu` on first run, which
+/// broke the code signature and made Gatekeeper report the app as "damaged"
+/// (0.3.15, withdrawn — confirmed with `codesign -vvv --deep --strict`).
+/// PYTHONPYCACHEPREFIX redirects CPython's bytecode cache without disabling
+/// it; if the directory can't be created (unwritable HOME, sandboxing) fall
+/// back to PYTHONDONTWRITEBYTECODE=1 instead of silently writing back into
+/// the bundle. Mirrors `khipu.paths.pycache_dir()` on the Python side.
+fn khipu_bytecode_env() -> (&'static str, String) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let cache_dir = PathBuf::from(home).join("Library/Caches/Khipu/pycache");
+    if std::fs::create_dir_all(&cache_dir).is_ok() {
+        ("PYTHONPYCACHEPREFIX", cache_dir.display().to_string())
+    } else {
+        ("PYTHONDONTWRITEBYTECODE", "1".to_string())
+    }
+}
+
 fn run_khipu_cli(args: &[String]) -> Result<String, String> {
     let root = khipu_root()?;
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
+    let (bc_key, bc_val) = khipu_bytecode_env();
     let output = Command::new(&py)
         .arg("-m")
         .arg("khipu")
         .args(args)
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env(bc_key, &bc_val)
         .output()
         .map_err(|e| format!("spawn khipu CLI failed ({py:?}): {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -421,6 +490,7 @@ fn set_khipu_secret_sync(account: String, value: String) -> Result<String, Strin
     let root = khipu_root()?;
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
+    let (bc_key, bc_val) = khipu_bytecode_env();
     let mut child = Command::new(&py)
         .arg("-m")
         .arg("khipu")
@@ -429,6 +499,7 @@ fn set_khipu_secret_sync(account: String, value: String) -> Result<String, Strin
         .arg(&account)
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env(bc_key, &bc_val)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -475,6 +546,7 @@ fn join_export_sync(passphrase: String, out_path: String) -> Result<String, Stri
     let root = khipu_root()?;
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
+    let (bc_key, bc_val) = khipu_bytecode_env();
     let output = Command::new(&py)
         .arg("-m")
         .arg("khipu")
@@ -484,6 +556,7 @@ fn join_export_sync(passphrase: String, out_path: String) -> Result<String, Stri
         .arg(out_path.trim())
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env(bc_key, &bc_val)
         .env("KHIPU_JOIN_PASSPHRASE", passphrase.trim())
         .output()
         .map_err(|e| format!("spawn khipu join export failed ({py:?}): {e}"))?;
@@ -513,6 +586,7 @@ fn join_import_sync(passphrase: String, file_path: String) -> Result<String, Str
     let root = khipu_root()?;
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
+    let (bc_key, bc_val) = khipu_bytecode_env();
     let output = Command::new(&py)
         .arg("-m")
         .arg("khipu")
@@ -522,6 +596,7 @@ fn join_import_sync(passphrase: String, file_path: String) -> Result<String, Str
         .arg(file_path.trim())
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env(bc_key, &bc_val)
         .env("KHIPU_JOIN_PASSPHRASE", passphrase.trim())
         .output()
         .map_err(|e| format!("spawn khipu join import failed ({py:?}): {e}"))?;
@@ -549,6 +624,7 @@ fn join_advertise_sync(passphrase: String, timeout: u32) -> Result<String, Strin
     let root = khipu_root()?;
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
+    let (bc_key, bc_val) = khipu_bytecode_env();
     let tout = timeout.max(60);
     let mut child = Command::new(&py)
         .arg("-m")
@@ -559,6 +635,7 @@ fn join_advertise_sync(passphrase: String, timeout: u32) -> Result<String, Strin
         .arg(tout.to_string())
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env(bc_key, &bc_val)
         .env("KHIPU_JOIN_PASSPHRASE", passphrase.trim())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -604,6 +681,7 @@ fn join_receive_sync(passphrase: String, pin: String, out_path: Option<String>) 
     let root = khipu_root()?;
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
+    let (bc_key, bc_val) = khipu_bytecode_env();
     let mut cmd = Command::new(&py);
     cmd.arg("-m")
         .arg("khipu")
@@ -613,6 +691,7 @@ fn join_receive_sync(passphrase: String, pin: String, out_path: Option<String>) 
         .arg(pin_trim)
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env(bc_key, &bc_val)
         .env("KHIPU_JOIN_PASSPHRASE", passphrase.trim());
     if let Some(path) = out_path {
         let trimmed = path.trim();
@@ -703,12 +782,14 @@ fn spawn_khipu(subcommand: String) -> Result<Value, String> {
     let err_file = log_file
         .try_clone()
         .map_err(|e| format!("clone spawn log handle: {e}"))?;
+    let (bc_key, bc_val) = khipu_bytecode_env();
     let mut child = Command::new(&py)
         .arg("-m")
         .arg("khipu")
         .arg(&subcommand)
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env(bc_key, &bc_val)
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(err_file))
         .spawn()
@@ -1128,6 +1209,10 @@ pub fn run() {
             feedback_file_sizes
         ])
         .setup(|app| {
+            // See clean_bundled_pycache: sweep any __pycache__ a past launch
+            // left inside the signed bundle before it can trip this run's
+            // Gatekeeper check.
+            clean_bundled_pycache();
             let show_i = MenuItem::with_id(app, "show", "Show Khipu", true, None::<&str>)?;
             let doctor_i =
                 MenuItem::with_id(app, "doctor", "Run doctor…", true, None::<&str>)?;

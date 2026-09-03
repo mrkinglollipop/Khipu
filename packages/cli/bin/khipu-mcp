@@ -17,6 +17,14 @@ SELF_DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
 ROOT="${KHIPU_ROOT:-$(cd "$SELF_DIR/../../.." 2>/dev/null && pwd)}"
 PYTHONPATH="$ROOT/packages/cli:$ROOT/.python_libs${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
+# Bytecode cache goes OUTSIDE any signed .app bundle — see khipu.paths.pycache_dir.
+# Running the bundled Python's __pycache__ writes inside Contents/Resources/khipu
+# broke the code signature and made Gatekeeper report "Khipu is damaged" (0.3.15,
+# withdrawn). mkdir failure is fail-open: PYTHONPYCACHEPREFIX to a missing dir
+# just disables caching, never blocks the server.
+PYTHONPYCACHEPREFIX="${HOME}/Library/Caches/Khipu/pycache"
+mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null
+export PYTHONPYCACHEPREFIX
 PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
 [ -x "$PY" ] || PY="python3"
 exec "$PY" -m khipu.mcp_server "$@"

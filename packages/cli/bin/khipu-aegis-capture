@@ -42,6 +42,13 @@ SELF_DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
 ROOT="${KHIPU_ROOT:-$(cd "$SELF_DIR/../../.." 2>/dev/null && pwd)}"
 PYTHONPATH="$ROOT/packages/cli:$ROOT/.python_libs${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
+# No PYTHONPYCACHEPREFIX here: the sandbox DENIES ~/Library (see the header
+# comment above), so a Caches dir under it is not writable either — pointing
+# PYTHONPYCACHEPREFIX there would just mean CPython silently fails to cache.
+# Disable bytecode writing outright instead, matching the "must not write
+# outside ~/.grok" contract this whole script already runs under.
+PYTHONDONTWRITEBYTECODE=1
+export PYTHONDONTWRITEBYTECODE
 PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
 [ -x "$PY" ] || PY="python3"
 "$PY" -m khipu.session_capture --harness aegis "$@" 2>/dev/null || true

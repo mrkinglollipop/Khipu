@@ -32,6 +32,13 @@ import { IntegrationsPanel } from "./IntegrationsPanel";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { WorkingBanner } from "./WorkingBanner";
 import { FeedbackForm } from "./FeedbackForm";
+import { PostUpdateNoticeDialog } from "./PostUpdateNoticeDialog";
+import {
+  noticeForUpgrade,
+  readLastNoticedVersion,
+  writeLastNoticedVersion,
+  type PostUpdateNotice,
+} from "./postUpdateNotices";
 import "./App.css";
 
 type Tab =
@@ -1035,6 +1042,7 @@ export default function App() {
   const [graphSourcesMsg, setGraphSourcesMsg] = useState<string | null>(null);
   const [newCodeRoot, setNewCodeRoot] = useState("");
   const [appVersion, setAppVersion] = useState<string>("…");
+  const [postUpdateNotice, setPostUpdateNotice] = useState<PostUpdateNotice | null>(null);
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [feedbackSending, setFeedbackSending] = useState(false);
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
@@ -1321,7 +1329,15 @@ export default function App() {
 
   useEffect(() => {
     void getVersion()
-      .then(setAppVersion)
+      .then((v) => {
+        setAppVersion(v);
+        // Show the notice for this version, if any, then remember we did —
+        // once per install, never re-shown on a later launch of the same
+        // version (see postUpdateNotices.ts).
+        const notice = noticeForUpgrade(readLastNoticedVersion(), v);
+        if (notice) setPostUpdateNotice(notice);
+        writeLastNoticedVersion(v);
+      })
       .catch(() => setAppVersion("unknown"));
   }, []);
 
@@ -3069,6 +3085,12 @@ export default function App() {
         onClose={() => setFeedbackOpen(false)}
         onSendingChange={setFeedbackSending}
         returnFocusRef={feedbackButtonRef}
+      />
+
+      <PostUpdateNoticeDialog
+        notice={postUpdateNotice}
+        onDismiss={() => setPostUpdateNotice(null)}
+        onOpenIntegrations={() => setTab("integrations")}
       />
 
       {error ? (
