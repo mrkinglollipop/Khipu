@@ -18,7 +18,10 @@ hub from an automated build/test run — tests exercise it with fakes only.
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -160,7 +163,20 @@ def run_probe(
         from khipu.capture import capture
         from khipu.embed import hybrid_search
 
-        rc = capture(payload)
+        # PG-row-only, like the gateway: the legacy file leg would append the
+        # nonce to episodes.jsonl (never forgotten there) and print its own
+        # "OK · episode appended" lines to stdout, which breaks callers that
+        # parse this command's JSON (the desktop Integrations pane).
+        prev_mirror = os.environ.get("KHIPU_HUB_FILE_MIRROR")
+        os.environ["KHIPU_HUB_FILE_MIRROR"] = "0"
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                rc = capture(payload)
+        finally:
+            if prev_mirror is None:
+                os.environ.pop("KHIPU_HUB_FILE_MIRROR", None)
+            else:
+                os.environ["KHIPU_HUB_FILE_MIRROR"] = prev_mirror
         if rc != 0:
             raise RuntimeError(f"capture exited {rc}")
         episode_id = _find_episode_id(session_id)

@@ -1,10 +1,6 @@
 # Khipu memory reliability — scope (2026-09-03)
 
-**Status: APPROVED 2026-09-03 (Matt: "proceed as you recommend"); build in progress on branch
-`claude/khipu-memory-system-53e7a0`.** Migrations 0008–0010 were applied to the live hub on
-2026-09-03 (additive, verified). The two destructive backfills (W1.5 apply, W5.2 apply) remain
-gated on a dry-run report and an explicit go. This is the scope artifact that build briefs point
-at; it is deliberately the only place the design is written down.
+**Status: SHIPPED 2026-09-03.** Merged to `main` in PR #54 (`a8e489c`) plus a follow-up fix PR; migrations 0008–0011 live on the hub; gateway on the Linode rebuilt from `main`; every local harness pack re-pointed to the main checkout and verified (recall probe green on Claude Code, Cursor, Codex, Aegis and the grok-bot gateway). Both destructive backfills were applied after a binary COPY backup of all affected tables (`~/Library/Application Support/Khipu/backups/pre-backfill-20260903T162129/`): identity backfill set project/repo_root on 429 episodes; junk-path purge cut `path:` nodes 4207 → 933 with zero dangling edges. Incident during verification, self-inflicted and reversed: an over-broad cleanup loop forgot ten real episodes returned as nearest neighbours by a hybrid search; all ten were restored with embeddings intact, and the embed backfill/catch-up/orphan/coverage paths now all exclude tombstoned rows. Deferred: W5.5 decisions-as-rows; the desktop 0.3.15 build+publish (needs the maintainer's Apple notarization credentials). This is the scope artifact that build briefs point at; it is deliberately the only place the design is written down.
 
 **Origin.** A live Aegis build session asked "is my follow-up in Khipu?" and
 got the wrong answer from the default search even though capture had worked.

@@ -553,8 +553,13 @@ def _iter_sources(cur, *, kind: str | None = None) -> Iterable[tuple[str, str, s
     ``chunk_text`` stays the unprefixed ``text``.
     """
     if kind in (None, "episode"):
+        # Tombstoned episodes (khipu episode forget) must never be re-embedded;
+        # pre-0010 hubs have no deleted_at column.
+        from khipu.db import has_columns
+
+        live = " WHERE deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
         cur.execute(
-            "SELECT id, summary, decisions, preferences, topics, people FROM episodes ORDER BY id"
+            f"SELECT id, summary, decisions, preferences, topics, people FROM episodes{live} ORDER BY id"
         )
         for eid, summary, decisions, prefs, topics, people in cur.fetchall():
             text = episode_text(
@@ -634,7 +639,8 @@ def backfill(
                     DELETE FROM memory_embeddings m
                     WHERE m.profile = %s AND (
                       (m.kind = 'episode' AND NOT EXISTS
-                         (SELECT 1 FROM episodes e WHERE e.id::text = m.ref))
+                         (SELECT 1 FROM episodes e WHERE e.id::text = m.ref
+                            AND e.deleted_at IS NULL))
                       OR (m.kind = 'topic' AND NOT EXISTS
                          (SELECT 1 FROM topics t WHERE t.slug = m.ref AND t.deleted_at IS NULL))
                     )
@@ -1232,7 +1238,15 @@ def coverage(*, profile: str | None = None) -> dict[str, Any]:
     with connect() as conn:
         with conn.cursor() as cur:
             profile = _resolve_profile(cur, profile)
-            cur.execute("SELECT COUNT(*) FROM episodes")
+            # A forgotten episode (deleted_at set) has its embeddings removed on
+            # purpose; counting it as "missing" turned doctor red after every
+            # recall probe cleanup. Pre-0010 hubs have no deleted_at column.
+            from khipu.db import has_columns
+
+            if has_columns(cur, "episodes", "deleted_at"):
+                cur.execute("SELECT COUNT(*) FROM episodes WHERE deleted_at IS NULL")
+            else:
+                cur.execute("SELECT COUNT(*) FROM episodes")
             eps = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM topics WHERE deleted_at IS NULL")
             tops = cur.fetchone()[0]
@@ -1248,6 +1262,18 @@ def coverage(*, profile: str | None = None) -> dict[str, Any]:
                 (profile,),
             )
             by = {k: {"refs": int(r), "chunks": int(c)} for k, r, c in cur.fetchall()}
+            # Embeddings still attached to a tombstoned episode are orphans, not
+            # coverage: count only refs that point at a live row, or "embedded"
+            # can exceed "total" and the ratio lies.
+            if has_columns(cur, "episodes", "deleted_at") and "episode" in by:
+                cur.execute(
+                    "SELECT COUNT(DISTINCT m.ref), COUNT(*) FROM memory_embeddings m"
+                    " JOIN episodes e ON e.id::text = m.ref AND e.deleted_at IS NULL"
+                    " WHERE m.profile = %s AND m.kind = 'episode'",
+                    (profile,),
+                )
+                r, ch = cur.fetchone()
+                by["episode"] = {"refs": int(r), "chunks": int(ch)}
             cur.execute(
                 "SELECT id, model, dim, is_active FROM embedding_profiles ORDER BY created_at"
             )
@@ -1298,9 +1324,14 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
     with connect() as conn:
         with conn.cursor() as cur:
             profile = _active_profile(cur)
+            from khipu.db import has_columns
+
+            # A forgotten episode has no embedding on purpose; without this
+            # guard the catch-up re-embedded every tombstone on the next hook.
+            live = "e.deleted_at IS NULL AND " if has_columns(cur, "episodes", "deleted_at") else ""
             cur.execute(
                 "SELECT e.id, e.summary, e.decisions, e.preferences, e.topics, e.people"
-                " FROM episodes e WHERE NOT EXISTS ("
+                f" FROM episodes e WHERE {live}NOT EXISTS ("
                 "  SELECT 1 FROM memory_embeddings m"
                 "  WHERE m.profile = %s AND m.kind = 'episode' AND m.ref = e.id::text)"
                 " ORDER BY e.ts DESC LIMIT %s",

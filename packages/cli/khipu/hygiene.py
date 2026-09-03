@@ -127,6 +127,18 @@ def is_real_path(rel: str, *, repo_root: str | None = None) -> bool:
         return True
     if s.startswith(("/", "~", "./")):
         return True
+    # An explicit trailing slash is the author writing a directory
+    # (``sojourn/art-samples/uw-intro-acut-fill-2026-07-26/``). The junk this
+    # rule exists for is two-segment prose pairs (``add/remove``, ``UI/jobs``)
+    # and uppercase ticker/acronym lists (``SPY/QQQ/IWM``, ``IC/PCS/STR``):
+    # three or more lowercase segments with a hyphen or underscore somewhere
+    # is a path, not prose.
+    if s.endswith("/") and "/" in s.rstrip("/"):
+        return True
+    segs = [p for p in s.split("/") if p]
+    if len(segs) >= 3 and not any(p.isupper() or p.isdigit() for p in segs) \
+            and any(("-" in p or "_" in p) for p in segs):
+        return True
     if repo_root:
         try:
             candidate = Path(repo_root).expanduser() / s.lstrip("/")
