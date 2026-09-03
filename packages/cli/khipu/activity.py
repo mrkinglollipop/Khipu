@@ -1,6 +1,9 @@
 """Recent capture / mirror activity (read path for capture_v2 → PG episodes)."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from typing import Any
+
 from khipu.db import connect
 from khipu.snippets import SNIPPET_LIMIT, clip_snippet
 
@@ -196,3 +199,119 @@ def activity_payload(*, limit: int = 40) -> dict:
         "ops_events": ops,
         "recent": recent,
     }
+
+
+def project_slice(
+    *,
+    project: str | None,
+    repo_root: str | None = None,
+    host_session_id: str | None = None,
+    commitment_limit: int = 5,
+    episode_limit: int = 5,
+    topic_limit: int = 3,
+) -> dict[str, Any]:
+    """W4 pushed-slice reads for a resolved repo: open commitments, recent
+    episodes for the project, and the topic pages those episodes actually
+    link to (their already-hygiene-resolved ``topics`` array — real graph
+    edges, not guessed slugs). Order matches the plan's acceptance shape:
+    commitments, then episodes, then topics; ``recall_rule`` renders them and
+    owns the cwd-token fallback and the token budget.
+
+    ``host_session_id`` (this session's own lineage id, ``harness:hostid``)
+    widens the episode match beyond ``project`` alone: a dispatched sibling
+    whose project inheritance (capture.write_pg) missed still surfaces here
+    via its ``parent_session_id``.
+
+    Raises on any PG failure or missing connection — the caller
+    (``recall_rule._pushed_memory_slice``) is responsible for the
+    hub_snapshot degrade and the visible ``stale`` line; this function stays
+    a plain read with no fail-open of its own, same posture as every other
+    function in this module.
+    """
+    from khipu import commitments as _commitments
+    from khipu.embed import _episode_schema_flags
+
+    owed: list[dict[str, Any]] = []
+    episodes: list[dict[str, Any]] = []
+    topics: list[dict[str, Any]] = []
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if project:
+                owed = _commitments.list_owed(
+                    cur, project=project, status="open", limit=commitment_limit
+                )
+
+            flags = _episode_schema_flags(cur)
+            project_expr = "COALESCE(project, scope)" if flags["project"] else "scope"
+            clauses: list[str] = []
+            params: list[Any] = []
+            if project:
+                clauses.append(f"{project_expr} = %s")
+                params.append(project)
+            if host_session_id and flags.get("parent_session_id"):
+                clauses.append("parent_session_id = %s")
+                params.append(host_session_id)
+            if clauses:
+                deleted_clause = "AND deleted_at IS NULL " if flags["deleted_at"] else ""
+                cur.execute(
+                    f"""
+                    SELECT id, ts, summary, topics
+                    FROM episodes
+                    WHERE ({' OR '.join(clauses)}) {deleted_clause}
+                    ORDER BY ts DESC
+                    LIMIT %s
+                    """,
+                    (*params, episode_limit),
+                )
+                cols = ("id", "ts", "summary", "topics")
+                episodes = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+            topic_slugs: list[str] = []
+            for ep in episodes:
+                for t in ep.get("topics") or []:
+                    slug = str(t).strip()
+                    if slug and slug not in topic_slugs:
+                        topic_slugs.append(slug)
+            topic_slugs = topic_slugs[:topic_limit]
+            if topic_slugs:
+                cur.execute(
+                    """
+                    SELECT slug, title, COALESCE(updated_at, created_at)
+                    FROM topics
+                    WHERE slug = ANY(%s) AND deleted_at IS NULL
+                    """,
+                    (topic_slugs,),
+                )
+                now = datetime.now(timezone.utc)
+                for slug, title, when in cur.fetchall():
+                    age_days = (now - when).days if when is not None else None
+                    topics.append({"slug": slug, "title": title, "age_days": age_days})
+
+            # W4.3: harness-native notes (khipu.notes.reconcile) carry no
+            # episode link at all — they never went through a capture — so
+            # they can only be found by the project the reconcile job wrote
+            # into their frontmatter, not by walking an episode's topics.
+            if project and len(topics) < topic_limit:
+                seen_slugs = {t["slug"] for t in topics}
+                remaining = topic_limit - len(topics)
+                now = datetime.now(timezone.utc)
+                cur.execute(
+                    """
+                    SELECT slug, title, COALESCE(updated_at, created_at)
+                    FROM topics
+                    WHERE deleted_at IS NULL AND slug LIKE 'note:%%'
+                      AND frontmatter->>'project' = %s
+                    ORDER BY COALESCE(updated_at, created_at) DESC NULLS LAST
+                    LIMIT %s
+                    """,
+                    (project, remaining + len(seen_slugs)),
+                )
+                for slug, title, when in cur.fetchall():
+                    if slug in seen_slugs:
+                        continue
+                    age_days = (now - when).days if when is not None else None
+                    topics.append({"slug": slug, "title": title, "age_days": age_days})
+                    seen_slugs.add(slug)
+                    if len(topics) >= topic_limit:
+                        break
+    return {"commitments": owed, "episodes": episodes, "topics": topics}

@@ -8,13 +8,17 @@ never a hard failure, never a write.
 """
 from __future__ import annotations
 
+import argparse
 import unittest
+from unittest import mock
 
 from khipu.cli import (
     _EPISODE_ILIKE_COLUMNS,
+    _episode_rank_text,
     _escape_like,
     _fair_shares,
     _graph_query,
+    _id_shaped,
     _search_query,
     _token_match_sql,
 )
@@ -82,6 +86,21 @@ class FairSharesTest(unittest.TestCase):
     def test_shares_sum_to_total_when_evenly_divisible(self) -> None:
         shares = _fair_shares(30, 3)
         self.assertEqual(sum(shares), 30)
+
+
+class IdShapedTest(unittest.TestCase):
+    def test_colon_is_id_shaped(self) -> None:
+        self.assertTrue(_id_shaped("topic:khipu"))
+
+    def test_dunder_is_id_shaped(self) -> None:
+        self.assertTrue(_id_shaped("module__foo_bar"))
+
+    def test_plain_words_are_not(self) -> None:
+        self.assertFalse(_id_shaped("what did we decide"))
+
+    def test_empty_or_none(self) -> None:
+        self.assertFalse(_id_shaped(""))
+        self.assertFalse(_id_shaped(None))
 
 
 class TokenMatchSqlTest(unittest.TestCase):
@@ -221,6 +240,62 @@ class SearchQueryTest(unittest.TestCase):
             hits,
         )
 
+    def test_nodes_excluded_by_default_for_a_non_id_shaped_query(self) -> None:
+        from khipu.db import connect
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                results = _search_query(cur, "e", 30)
+        self.assertNotIn("node", {r["kind"] for r in results})
+
+    def test_kind_node_still_returns_nodes(self) -> None:
+        from khipu.db import connect
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM nodes WHERE id ILIKE %(q)s ESCAPE '\\'",
+                            {"q": "%e%"})
+                nodes_total = cur.fetchone()[0]
+                if nodes_total == 0:
+                    self.skipTest("no matching nodes in live hub")
+                results = _search_query(cur, "e", 10, kind="node")
+        self.assertTrue(results)
+        self.assertTrue(all(r["kind"] == "node" for r in results))
+
+    def test_id_shaped_query_reaches_nodes_without_kind(self) -> None:
+        from khipu.db import connect
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM nodes LIMIT 1")
+                row = cur.fetchone()
+                if row is None:
+                    self.skipTest("no nodes in live hub")
+                node_id = row[0]
+                if not _id_shaped(node_id):
+                    self.skipTest(f"sample node id {node_id!r} is not id-shaped")
+                results = _search_query(cur, node_id, 10)
+        self.assertTrue(any(r["kind"] == "node" for r in results), results)
+
+    def test_kind_filter_restricts_to_one_kind(self) -> None:
+        from khipu.db import connect
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM topics")
+                if cur.fetchone()[0] == 0:
+                    self.skipTest("no topics in live hub")
+                results = _search_query(cur, "e", 10, kind="topic")
+        self.assertTrue(all(r["kind"] == "topic" for r in results))
+
+    def test_invalid_kind_raises(self) -> None:
+        from khipu.db import connect
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                with self.assertRaises(ValueError):
+                    _search_query(cur, "e", 10, kind="bogus")
+
     def test_digit_id_graph_uses_episode_topics(self) -> None:
         from khipu.db import connect
 
@@ -241,6 +316,52 @@ class SearchQueryTest(unittest.TestCase):
         self.assertTrue(out["episode"]["topics"])
         tagged = [e for e in out["edges"] if e.get("type") == "capture_topic"]
         self.assertEqual(len(tagged), len(out["episode"]["topics"]))
+
+
+class SearchStaleFallbackForwardingTest(unittest.TestCase):
+    """fix 7: cmd_search's hub-unreachable fallback must forward project/
+    session_id/harness to search_stale_payload, same as the MCP tool."""
+
+    def test_forwards_project_session_id_harness_to_the_snapshot_fallback(self):
+        from khipu import cli as climod
+
+        captured = {}
+
+        def fake_stale(query, limit, *, semantic, kind, since, until,
+                        project, session_id, harness):
+            captured.update(project=project, session_id=session_id, harness=harness)
+            return {"query": query, "mode": "literal", "results": [], "filters_dropped": []}
+
+        args = argparse.Namespace(
+            query="khipu", limit=10, kind=None, project="acme/widget",
+            since=None, until=None, session_id="claude_code:host-1", harness="claude_code",
+        )
+        with mock.patch("khipu.embed.hybrid_search",
+                         side_effect=RuntimeError("connection refused")), \
+                mock.patch("khipu.hub_snapshot.hub_connection_failed", return_value=True), \
+                mock.patch("khipu.hub_snapshot.search_stale_payload", fake_stale), \
+                mock.patch("khipu.query_log.log_query"):
+            rc = climod.cmd_search(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["project"], "acme/widget")
+        self.assertEqual(captured["session_id"], "claude_code:host-1")
+        self.assertEqual(captured["harness"], "claude_code")
+
+
+class EpisodeRankTextDelegatesToEmbedTest(unittest.TestCase):
+    """cheap dedup: cli._episode_rank_text calls embed.episode_text rather
+    than reimplementing the same assembly."""
+
+    def test_matches_embed_episode_text(self):
+        from khipu.embed import episode_text
+
+        row = {"summary": "did a thing", "topics": ["a", "b"], "decisions": ["d1"],
+               "preferences": ["p1"], "people": ["Matt"]}
+        expected = episode_text(row)
+        actual = _episode_rank_text(
+            row["summary"], row["topics"], row["decisions"], row["preferences"], row["people"]
+        )
+        self.assertEqual(actual, expected)
 
 
 if __name__ == "__main__":

@@ -156,5 +156,150 @@ class ActivityPayloadTest(unittest.TestCase):
         self.assertEqual(cur.params[-1], (3,))
 
 
+class ProjectSliceTest(unittest.TestCase):
+    """W4 pushed-slice reads: commitments -> episodes -> linked topics, in
+    that query order, on the connection commitments.list_owed and
+    embed._episode_schema_flags already share with this module."""
+
+    def _run(self, results, **kw):
+        cur = FakeCursor(results)
+        with mock.patch.object(activity, "connect", return_value=FakeConn(cur)):
+            out = activity.project_slice(**kw)
+        return out, cur
+
+    def test_full_shape_commitments_episodes_and_topics(self):
+        commitment_row = (
+            1, "ship the fix", "acme/widget", None, "followup", 9,
+            dt.datetime(2026, 9, 1), None, "open", None, None, None,
+        )
+        episode_row = (
+            42, dt.datetime(2026, 9, 3, 10, 0), "shipped the fix", ["real-topic"],
+        )
+        topic_row = ("real-topic", "Real Topic", dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc))
+        # _episode_schema_flags is mocked at the function level below (its
+        # own unit tests in test_embed.py cover the information_schema
+        # query), so the fake cursor sees four real queries here: commitments,
+        # episodes, episode-linked topics, then note-topics (still under
+        # topic_limit=3 after one episode-linked hit) — in that order.
+        results = [[commitment_row], [episode_row], [topic_row], []]
+        with mock.patch("khipu.embed._episode_schema_flags", return_value={
+            "project": True, "deleted_at": True,
+        }):
+            out, cur = self._run(results, project="acme/widget")
+        self.assertEqual(out["commitments"][0]["text"], "ship the fix")
+        self.assertEqual(out["episodes"][0]["id"], 42)
+        self.assertEqual(out["episodes"][0]["topics"], ["real-topic"])
+        self.assertEqual(out["topics"][0]["slug"], "real-topic")
+        self.assertIsInstance(out["topics"][0]["age_days"], int)
+        # episodes filtered on project (or COALESCE(project, scope)) — verify
+        # the project value actually reached the WHERE clause params.
+        episodes_call = cur.statements[1]
+        self.assertIn("COALESCE(project, scope) = %s", episodes_call)
+        self.assertEqual(cur.params[1], ("acme/widget", 5))
+        self.assertIn("note:%", cur.statements[3])
+
+    def test_note_topics_fill_remaining_budget_after_episode_linked_ones(self):
+        """W4.3: khipu.notes.reconcile-mirrored `note:` topics carry no
+        episode link at all, so they can only surface via their
+        frontmatter->>'project' — this fills the topic budget with them
+        once the episode-linked slugs run out."""
+        episode_row = (42, dt.datetime(2026, 9, 3, 10, 0), "shipped the fix", [])
+        note_row = ("note:some-note", "Some Note", dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc))
+        results = [[], [episode_row], [note_row]]
+        with mock.patch("khipu.embed._episode_schema_flags", return_value={
+            "project": True, "deleted_at": True,
+        }):
+            out, cur = self._run(results, project="acme/widget")
+        self.assertEqual(out["topics"], [{"slug": "note:some-note", "title": "Some Note", "age_days": 2}])
+        notes_call = cur.statements[-1]
+        self.assertIn("slug LIKE 'note:%%'", notes_call)
+        self.assertIn("frontmatter->>'project' = %s", notes_call)
+        self.assertEqual(cur.params[-1], ("acme/widget", 3))
+
+    def test_no_note_topics_query_when_topic_budget_already_full(self):
+        episode_rows_topics = ["t1", "t2", "t3"]
+        episode_row = (42, dt.datetime(2026, 9, 3, 10, 0), "shipped the fix", episode_rows_topics)
+        topic_rows = [
+            (f"t{i}", f"Topic {i}", dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)) for i in (1, 2, 3)
+        ]
+        results = [[], [episode_row], topic_rows]
+        with mock.patch("khipu.embed._episode_schema_flags", return_value={
+            "project": True, "deleted_at": True,
+        }):
+            out, cur = self._run(results, project="acme/widget")
+        self.assertEqual(len(out["topics"]), 3)
+        self.assertEqual(len(cur.statements), 3, "no fourth (notes) query once the budget is full")
+
+    def test_no_project_no_commitments_query_at_all(self):
+        """project=None: commitments.list_owed must never run (there is
+        nothing to filter it to) — only the episodes query (widened by
+        host_session_id) runs."""
+        with mock.patch("khipu.embed._episode_schema_flags", return_value={
+            "project": True, "deleted_at": True, "parent_session_id": True,
+        }):
+            out, cur = self._run([[], []], project=None, host_session_id="claude_code:host-1")
+        self.assertEqual(out["commitments"], [])
+        self.assertFalse(any("FROM commitments" in s for s in cur.statements))
+
+    def test_host_session_id_widens_the_episode_match_via_or(self):
+        with mock.patch("khipu.embed._episode_schema_flags", return_value={
+            "project": True, "deleted_at": True, "parent_session_id": True,
+        }):
+            out, cur = self._run(
+                [[], []],
+                project=None,
+                host_session_id="claude_code:host-1",
+            )
+        episodes_call = cur.statements[-1]
+        self.assertIn("parent_session_id = %s", episodes_call)
+        self.assertEqual(out["episodes"], [])
+
+    def test_parent_session_id_gated_when_column_missing_pre_0008(self):
+        """fix 10: a pre-migration hub has no episodes.parent_session_id —
+        referencing it unconditionally raises UndefinedColumn; gated behind
+        the schema flag it must degrade to no widening instead."""
+        with mock.patch("khipu.embed._episode_schema_flags", return_value={
+            "project": True, "deleted_at": True, "parent_session_id": False,
+        }):
+            out, cur = self._run(
+                [[], []],
+                project=None,
+                host_session_id="claude_code:host-1",
+            )
+        self.assertEqual(out["episodes"], [])
+        self.assertFalse(cur.statements, "no episodes query at all: no clause could be built")
+
+    def test_falls_back_to_scope_column_when_project_column_is_missing(self):
+        """A DB not yet migrated past 0007: no episodes.project column, so
+        the filter must fall back to `scope` directly (matching embed.
+        hybrid_search's own COALESCE(project, scope) / scope fallback)."""
+        episode_row = (7, dt.datetime(2026, 9, 3), "pre-migration row", [])
+        with mock.patch("khipu.embed._episode_schema_flags", return_value={
+            "project": False, "deleted_at": False,
+        }):
+            # Third result: the note-topics query (project is set, no
+            # episode-linked topic slugs, so the notes lookup still fires).
+            out, cur = self._run([[], [episode_row], []], project="acme/widget")
+        episodes_call = cur.statements[1]
+        self.assertIn("scope = %s", episodes_call)
+        self.assertNotIn("COALESCE", episodes_call)
+        self.assertEqual(out["episodes"][0]["id"], 7)
+
+    def test_note_topics_query_runs_even_with_no_episode_linked_topic_slugs(self):
+        """No episode names a topic slug at all — the episode-linked topics
+        SELECT never runs (nothing to look up) — but note-topics (matched by
+        project alone, not by any episode link) still does."""
+        episode_row = (7, dt.datetime(2026, 9, 3), "no topics here", [])
+        with mock.patch("khipu.embed._episode_schema_flags", return_value={
+            "project": True, "deleted_at": True,
+        }):
+            out, cur = self._run([[], [episode_row], []], project="acme/widget")
+        self.assertEqual(out["topics"], [])
+        # commitments, episodes, note-topics — three queries, none of them
+        # the (skipped) episode-linked-slug lookup.
+        self.assertEqual(len(cur.statements), 3)
+        self.assertIn("note:%", cur.statements[-1])
+
+
 if __name__ == "__main__":
     unittest.main()

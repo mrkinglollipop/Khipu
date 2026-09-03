@@ -1193,6 +1193,15 @@ def verify(harness: str, *, project: str | None = None) -> dict:
                                     else {"ok": False, "error": f"no gateway token ({GROK_BOT_TOKEN_ENV} or Keychain gateway_token)"})
         out["components"]["hook"] = {"ok": True, "na": True,
                                      "note": "cloud agent: capture is the khipu_capture tool over the gateway"}
+        # W6.1: same end-to-end recall probe every other pack's verify runs
+        # (see the non-grok_bot branch below) — grok_bot returns early, so it
+        # needs its own copy rather than falling through.
+        try:
+            from khipu import probe
+
+            out["components"]["recall_probe"] = probe.run_probe(harness)
+        except Exception as e:  # noqa: BLE001
+            out["components"]["recall_probe"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         out["ok"] = all(c.get("ok") for c in out["components"].values())
         return out
     if st["mcp"]:
@@ -1252,6 +1261,18 @@ def verify(harness: str, *, project: str | None = None) -> dict:
         out["runtime"] = _runtime(harness)
     if harness == "aegis":
         out["runtime"] = out["aegis"]
+    # W6.1: prove recall end-to-end for THIS pack, once per verify — every
+    # other component here proves a piece works (the hook fires, the MCP
+    # server answers); this proves a real capture through this harness's
+    # configured write path is actually FINDABLE afterward. Runs for every
+    # detected pack (grok_bot included — write path differs, the question
+    # ("can I find what I just captured") does not).
+    try:
+        from khipu import probe
+
+        out["components"]["recall_probe"] = probe.run_probe(harness)
+    except Exception as e:  # noqa: BLE001 — a probe crash is a failed component, not a crashed verify
+        out["components"]["recall_probe"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # A red liveness verdict fails verify: "the hook works" is not "the harness
     # is being recorded", and the second is the question that matters.
     rt = out.get("runtime") or {}

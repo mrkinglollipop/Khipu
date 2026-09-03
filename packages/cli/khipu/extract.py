@@ -14,7 +14,6 @@ Synth routing (Settings → Models): cloud = Gemini REST; local = OpenAI-compati
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 import urllib.error
@@ -26,9 +25,16 @@ PROMPT = """You are extracting durable memory from an assistant/coding session.
 Output ONLY a single JSON object (no prose, no markdown fences) with these keys:
 - summary: 1-3 sentence what-happened
 - topics: list of short lowercase slug strings
+- people: list of names/handles mentioned as participants or subjects
 - decisions: list of strings
 - preferences: list of strings
 - scope: short string
+- open_loops: list of objects {{text, kind, due_after, owner}} for anything
+  still outstanding — a followup, a blocker, a question, or a promise made.
+  kind is one of "followup", "blocker", "question", "promise". due_after and
+  owner are optional; omit or use null when unknown.
+- closed_loops: list of objects {{text}} for anything explicitly finished,
+  merged, shipped, or no longer needed this turn.
 Capture concrete decisions, user preferences/corrections, project state, file paths in play, and ruled-out dead ends.
 Return a summary of empty string if nothing durable.
 
@@ -215,6 +221,45 @@ def parse_model_json(text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _as_open_loops(v: Any) -> list[dict[str, Any]]:
+    if not isinstance(v, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in v:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                out.append({"text": text, "kind": "followup", "due_after": None, "owner": None})
+            continue
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        kind = str(item.get("kind") or "followup").strip().lower()
+        if kind not in ("followup", "blocker", "question", "promise"):
+            kind = "followup"
+        out.append({
+            "text": text,
+            "kind": kind,
+            "due_after": item.get("due_after") or None,
+            "owner": item.get("owner") or None,
+        })
+    return out
+
+
+def _as_closed_loops(v: Any) -> list[dict[str, Any]]:
+    if not isinstance(v, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in v:
+        text = item.get("text") if isinstance(item, dict) else item
+        text = str(text or "").strip()
+        if text:
+            out.append({"text": text})
+    return out
+
+
 def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
     """Return a capture payload (without ts/session_id) or None when the model
     judged nothing durable. Raises on transport/model failure so the caller can
@@ -244,16 +289,20 @@ def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
         t = slugify(t)
         if t and t not in topics:
             topics.append(t)
-    if cwd:
-        slug = slugify(os.path.basename(cwd.rstrip("/")))
-        if slug and slug not in topics:
-            topics.append(slug)
+    # The cwd basename used to be force-appended here as a topic slug — the
+    # single largest source of dangling/worktree-hash topic nodes (memory
+    # reliability audit 2026-09-03: 'aegis' 423, a worktree slug 406, 'tmp'
+    # 378). The project identity now belongs in the capture payload's own
+    # `project` field (khipu.identity, set by the hook), not in topics.
     return {
         "summary": summary,
         "topics": topics,
+        "people": _as_str_list(parsed.get("people")),
         "decisions": _as_str_list(parsed.get("decisions")),
         "preferences": _as_str_list(parsed.get("preferences")),
         "scope": str(parsed.get("scope", "")).strip(),
+        "open_loops": _as_open_loops(parsed.get("open_loops")),
+        "closed_loops": _as_closed_loops(parsed.get("closed_loops")),
         "edges": [],
         "topic_pages": [],
     }

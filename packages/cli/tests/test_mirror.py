@@ -54,7 +54,10 @@ class ParseTopicFileTest(unittest.TestCase):
         parsed = parse_topic_file(path)
         assert parsed is not None
         self.assertEqual(parsed["title"], "My Topic")
-        self.assertEqual(parsed["status"], "archived")
+        # W5.3: status is normalized to the canonical vocabulary at parse
+        # time; the raw frontmatter value survives under status_raw.
+        self.assertEqual(parsed["status"], "abandoned")
+        self.assertEqual(parsed["frontmatter"]["status_raw"], "archived")
         self.assertEqual(parsed["body"], "Body here.\n")
         self.assertEqual(parsed["links"], [])
         self.assertEqual(parsed["frontmatter"]["title"], "My Topic")
@@ -175,6 +178,143 @@ class DirectionalDriftLiveTest(unittest.TestCase):
                 self.assertEqual(episodes_missing_in_pg(cur, []), [])
 
 
+class NormalizeTopicStatusTest(unittest.TestCase):
+    """W5.3: evidence-based mapping over the 83 distinct topics.status values
+    measured live 2026-09-03 (khipu-memory-system-53e7a0 audit)."""
+
+    def test_seed_bucket(self):
+        for raw in ("seedling", "Draft", "stub", "concept", "conceptual", "germ",
+                    "proposal", "proposed", "plan", "planned", "prototype",
+                    "nascent", "todo", "pending", "scratchpad", "thought", "🌱"):
+            self.assertEqual(mirror.normalize_topic_status(raw), "seed", raw)
+
+    def test_active_bucket_includes_unknown_defaults(self):
+        for raw in ("active", "in-progress", "WIP", "stable", "alive",
+                    "current", "operational", "healthy", "chosen-name", "OPEN"):
+            self.assertEqual(mirror.normalize_topic_status(raw), "active", raw)
+
+    def test_shipped_bucket(self):
+        for raw in ("complete", "Completed", "SHIPPED", "implemented",
+                    "resolved", "Initial Release", "partial-shipped", "wrapped"):
+            self.assertEqual(mirror.normalize_topic_status(raw), "shipped", raw)
+
+    def test_negated_shipped_does_not_become_shipped(self):
+        self.assertNotEqual(mirror.normalize_topic_status("Staged, not shipped."), "shipped")
+
+    def test_superseded_and_evergreen_and_abandoned(self):
+        self.assertEqual(mirror.normalize_topic_status("superseded"), "superseded")
+        self.assertEqual(mirror.normalize_topic_status("evergreen"), "evergreen")
+        self.assertEqual(mirror.normalize_topic_status("permanent"), "evergreen")
+        self.assertEqual(mirror.normalize_topic_status("Abandoned"), "abandoned")
+        self.assertEqual(mirror.normalize_topic_status("retired"), "abandoned")
+
+    def test_quotes_and_case_and_blank(self):
+        self.assertEqual(mirror.normalize_topic_status('"active"'), "active")
+        self.assertEqual(mirror.normalize_topic_status("'seed'"), "seed")
+        self.assertEqual(mirror.normalize_topic_status(""), "active")
+        self.assertEqual(mirror.normalize_topic_status(None), "active")
+
+    def test_result_is_always_canonical(self):
+        samples = ("active", "seedling", "draft", "stub", "superseded", "evergreen",
+                   "complete", "in-progress", "permanent", "🌱", "P0a",
+                   "LIVE - IWM bot deployed", "on_hold")
+        for raw in samples:
+            self.assertIn(mirror.normalize_topic_status(raw), mirror.CANONICAL_TOPIC_STATUSES, raw)
+
+
+class ParseFrontmatterDateTest(unittest.TestCase):
+    def test_date_only(self):
+        out = mirror._parse_frontmatter_date("2026-05-28")
+        self.assertTrue(out.startswith("2026-05-28"))
+
+    def test_full_iso_with_z(self):
+        out = mirror._parse_frontmatter_date("2026-05-28T12:30:00Z")
+        self.assertIn("2026-05-28", out)
+
+    def test_quoted_value(self):
+        out = mirror._parse_frontmatter_date('"2026-05-28"')
+        self.assertTrue(out.startswith("2026-05-28"))
+
+    def test_blank_or_garbage_is_none(self):
+        self.assertIsNone(mirror._parse_frontmatter_date(""))
+        self.assertIsNone(mirror._parse_frontmatter_date(None))
+        self.assertIsNone(mirror._parse_frontmatter_date("not a date"))
+
+
+class ParseTopicFileDatesTest(unittest.TestCase):
+    def _write(self, text: str) -> Path:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", prefix="topic-", delete=False, encoding="utf-8"
+        )
+        tmp.write(text)
+        tmp.close()
+        self.addCleanup(Path(tmp.name).unlink)
+        return Path(tmp.name)
+
+    def test_created_and_last_updated_parsed(self):
+        text = (
+            "---\ntitle: Dated\nstatus: active\ncreated: 2026-01-05\n"
+            "last_updated: 2026-08-30\n---\n\nBody.\n"
+        )
+        parsed = parse_topic_file(self._write(text))
+        assert parsed is not None
+        self.assertTrue(parsed["created_at"].startswith("2026-01-05"))
+        self.assertTrue(parsed["updated_at"].startswith("2026-08-30"))
+
+    def test_missing_dates_are_none(self):
+        text = "---\ntitle: NoDates\nstatus: active\n---\n\nBody.\n"
+        parsed = parse_topic_file(self._write(text))
+        assert parsed is not None
+        self.assertIsNone(parsed["created_at"])
+        self.assertIsNone(parsed["updated_at"])
+
+
+class UpsertEpisodeIdentityColumnsTest(unittest.TestCase):
+    """W1.1/W1.3: _upsert_episode persists the new identity columns and the
+    W5.1 tags column; a legacy capture_v2-shaped payload (none of these
+    fields) must still insert cleanly."""
+
+    def test_identity_and_tags_columns_are_written(self):
+        cur = mock.Mock()
+        cur.rowcount = 1
+        payload = {
+            "ts": "2026-09-03T00:00:00Z",
+            "session_id": "claude_code:abc",
+            "summary": "did a thing",
+            "topics": ["resolved-topic"],
+            "tags": ["dangling-slug"],
+            "harness": "claude_code",
+            "repo_root": "/Users/x/Code/Khipu",
+            "project": "acme/khipu",
+            "parent_session_id": "claude_code:parent",
+            "transcript_range": "0:1234",
+        }
+        inserted = mirror._upsert_episode(cur, payload)
+        self.assertTrue(inserted)
+        sql, params = cur.execute.call_args.args
+        self.assertIn("harness", sql)
+        self.assertIn("repo_root", sql)
+        self.assertIn("project", sql)
+        self.assertIn("parent_session_id", sql)
+        self.assertIn("transcript_range", sql)
+        self.assertIn("tags", sql)
+        self.assertIn("claude_code", params)
+        self.assertIn("/Users/x/Code/Khipu", params)
+        self.assertIn("acme/khipu", params)
+        self.assertIn("claude_code:parent", params)
+        self.assertIn("0:1234", params)
+        self.assertIn(json.dumps(["dangling-slug"]), params)
+
+    def test_legacy_payload_with_no_identity_fields_still_inserts(self):
+        cur = mock.Mock()
+        cur.rowcount = 1
+        payload = {"ts": "2026-09-03T00:00:00Z", "session_id": "legacy", "summary": "x"}
+        self.assertTrue(mirror._upsert_episode(cur, payload))
+        sql, params = cur.execute.call_args.args
+        # harness/repo_root/project/parent_session_id/transcript_range -> None
+        self.assertEqual(params[-6:-1], (None, None, None, None, None))
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -283,3 +423,80 @@ class TombstoneCircuitBreakerTest(unittest.TestCase):
         stats, cur = self._run(live_count=600, env={"KHIPU_ALLOW_MASS_TOMBSTONE": "1"})
         self.assertEqual(len(self._updates(cur)), 1)
 
+
+
+class _MirrorGraphCursor:
+    """Records every executed statement (SAVEPOINT included) for the
+    mirror_episode graph-mint tests (fix 11)."""
+
+    def __init__(self):
+        self.executed: list[tuple] = []
+        self.rowcount = 1
+
+    def execute(self, sql, params=None):
+        self.executed.append((" ".join(sql.split()), params))
+
+    def fetchall(self):
+        return []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _MirrorGraphConn:
+    def __init__(self, cur):
+        self._cur = cur
+        self.commits = 0
+
+    def cursor(self):
+        return self._cur
+
+    def commit(self):
+        self.commits += 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class MirrorEpisodeGraphMintTest(unittest.TestCase):
+    """fix 11: mirror.mirror_episode (the legacy write path) mints the
+    topic:/path: graph from the payload's topics, same as capture.write_pg's
+    hub path — before this fix it minted nothing from a capture payload at
+    all (only mirror_topic_file, driven by an actual topic FILE, did)."""
+
+    def test_mints_the_topic_graph_via_persist_capture_graph(self):
+        cur = _MirrorGraphCursor()
+        payload = {"ts": "2026-09-03T00:00:00Z", "session_id": "s1",
+                   "summary": "did a thing", "topics": ["a-topic"]}
+        with mock.patch("khipu.db.connect", return_value=_MirrorGraphConn(cur)), \
+                mock.patch.object(mirror, "persist_capture_graph") as m_persist:
+            ok = mirror.mirror_episode(payload)
+        self.assertTrue(ok)
+        m_persist.assert_called_once_with(cur, payload)
+
+    def test_graph_mint_failure_rolls_back_but_keeps_the_episode(self):
+        cur = _MirrorGraphCursor()
+        payload = {"ts": "2026-09-03T00:00:00Z", "session_id": "s1",
+                   "summary": "did a thing", "topics": ["a-topic"]}
+        conn = _MirrorGraphConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(mirror, "persist_capture_graph",
+                                   side_effect=RuntimeError("boom")):
+            ok = mirror.mirror_episode(payload)
+        self.assertTrue(ok, "the episode insert must survive a graph-mint failure")
+        self.assertEqual(conn.commits, 1)
+        statements = [s for s, _ in cur.executed]
+        self.assertIn("SAVEPOINT mirror_capture_graph", statements)
+        self.assertIn("ROLLBACK TO SAVEPOINT mirror_capture_graph", statements)
+
+    def test_blank_summary_never_reaches_the_graph_mint(self):
+        with mock.patch.object(mirror, "persist_capture_graph") as m_persist:
+            ok = mirror.mirror_episode({"summary": "   "})
+        self.assertFalse(ok)
+        m_persist.assert_not_called()

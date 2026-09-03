@@ -2,8 +2,15 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timedelta, timezone
 
-from khipu.search_text import hybrid_rerank, search_tokens, token_hit_count
+from khipu.search_text import (
+    fuse_ranked_lists,
+    hybrid_rerank,
+    parse_time_filter,
+    search_tokens,
+    token_hit_count,
+)
 
 
 class SearchTokensTest(unittest.TestCase):
@@ -83,6 +90,81 @@ class HybridRerankTest(unittest.TestCase):
         rows = [{"id": "a", "snippet": "x"}, {"id": "b", "snippet": "y"}]
         out = hybrid_rerank(rows, "the a", limit=2)
         self.assertEqual([r["id"] for r in out], ["a", "b"])
+
+
+class FuseRankedListsTest(unittest.TestCase):
+    def test_row_in_two_lists_outranks_row_in_one(self) -> None:
+        a = [{"kind": "episode", "id": "1"}, {"kind": "episode", "id": "2"}]
+        b = [{"kind": "episode", "id": "1"}, {"kind": "episode", "id": "3"}]
+        out = fuse_ranked_lists([a, b], limit=10)
+        self.assertEqual(out[0]["id"], "1")
+        ids = [r["id"] for r in out]
+        self.assertIn("2", ids)
+        self.assertIn("3", ids)
+
+    def test_two_list_score_matches_hybrid_rerank(self) -> None:
+        """A two-list fuse reproduces hybrid_rerank's score for the same rows."""
+        cosine = [{"kind": "e", "id": "a"}, {"kind": "e", "id": "b"}]
+        lexical = [{"kind": "e", "id": "b"}, {"kind": "e", "id": "a"}]
+        out = fuse_ranked_lists([cosine, lexical], limit=10)
+        by_id = {r["id"]: r["score"] for r in out}
+        # rank(a) = 1st in cosine (i=0), 2nd in lexical (rank=1)
+        expected_a = 1.0 / (20 + 1) + 1.0 / (20 + 2)
+        expected_b = 1.0 / (20 + 2) + 1.0 / (20 + 1)
+        self.assertAlmostEqual(by_id["a"], round(expected_a, 6))
+        self.assertAlmostEqual(by_id["b"], round(expected_b, 6))
+
+    def test_empty_lists_yield_empty_result(self) -> None:
+        self.assertEqual(fuse_ranked_lists([], limit=5), [])
+        self.assertEqual(fuse_ranked_lists([[], []], limit=5), [])
+
+    def test_limit_is_respected(self) -> None:
+        rows = [{"kind": "e", "id": str(i)} for i in range(10)]
+        out = fuse_ranked_lists([rows], limit=3)
+        self.assertEqual(len(out), 3)
+
+    def test_custom_key_function(self) -> None:
+        a = [{"slug": "x"}]
+        b = [{"slug": "x"}, {"slug": "y"}]
+        out = fuse_ranked_lists([a, b], limit=10, key=lambda r: r["slug"])
+        self.assertEqual({r["slug"] for r in out}, {"x", "y"})
+
+    def test_first_list_fields_win_but_score_is_overwritten(self) -> None:
+        a = [{"kind": "e", "id": "1", "label": "from-a", "score": 0.9}]
+        b = [{"kind": "e", "id": "1", "label": "from-b"}]
+        out = fuse_ranked_lists([a, b], limit=10)
+        self.assertEqual(out[0]["label"], "from-a")
+        self.assertNotEqual(out[0]["score"], 0.9)
+
+
+class ParseTimeFilterTest(unittest.TestCase):
+    def test_relative_days(self) -> None:
+        before = datetime.now(timezone.utc) - timedelta(days=7, seconds=5)
+        got = parse_time_filter("7d")
+        after = datetime.now(timezone.utc) - timedelta(days=7, seconds=-5)
+        self.assertTrue(before <= got <= after)
+
+    def test_relative_hours_and_minutes(self) -> None:
+        self.assertIsInstance(parse_time_filter("24h"), datetime)
+        self.assertIsInstance(parse_time_filter("30m"), datetime)
+
+    def test_iso_date_is_utc(self) -> None:
+        got = parse_time_filter("2026-08-01")
+        self.assertEqual(got.tzinfo, timezone.utc)
+        self.assertEqual(got.year, 2026)
+
+    def test_iso_datetime_with_z(self) -> None:
+        got = parse_time_filter("2026-08-01T12:00:00Z")
+        self.assertEqual(got.hour, 12)
+        self.assertIsNotNone(got.tzinfo)
+
+    def test_empty_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_time_filter("")
+
+    def test_garbage_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_time_filter("not-a-date")
 
 
 if __name__ == "__main__":

@@ -67,6 +67,19 @@ _EPISODE_COLS = (
     "edges",
     "raw",
     "ingested_at",
+    # fix 9: identity (0008) + hygiene (0010) columns — carried onto the
+    # sqlite replica so snapshot-mode project/session_id/harness filters
+    # (fix 7) and hygiene tags have something to read. dump/upsert already
+    # skip any column absent on the PG side via _pg_columns/table_columns;
+    # readers here guard with _snapshot_table_columns for an OLD snapshot
+    # dumped before this fix (missing the columns on the sqlite side too).
+    "harness",
+    "repo_root",
+    "project",
+    "parent_session_id",
+    "transcript_range",
+    "tags",
+    "deleted_at",
 )
 _TOPIC_COLS = (
     "slug",
@@ -199,6 +212,16 @@ def _escape_like(term: str) -> str:
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _snapshot_table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    """Column names on THIS sqlite replica (fix 9: old snapshots may predate
+    a migration's new columns — guard every read against that, never assume
+    a column exists just because the current schema has it)."""
+    try:
+        return {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def _json_text(val: Any) -> str | None:
     if val is None:
         return None
@@ -254,7 +277,14 @@ def _create_schema(con: sqlite3.Connection) -> None:
             scope TEXT,
             edges TEXT,
             raw TEXT,
-            ingested_at TEXT
+            ingested_at TEXT,
+            harness TEXT,
+            repo_root TEXT,
+            project TEXT,
+            parent_session_id TEXT,
+            transcript_range TEXT,
+            tags TEXT,
+            deleted_at TEXT
         );
         CREATE TABLE topics (
             slug TEXT PRIMARY KEY,
@@ -324,14 +354,11 @@ def _create_schema(con: sqlite3.Connection) -> None:
 
 
 def _pg_columns(cur, table: str) -> set[str]:
-    cur.execute(
-        """
-        SELECT column_name FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = %s
-        """,
-        (table,),
-    )
-    return {r[0] for r in cur.fetchall()}
+    """Consolidated onto ``db.table_columns`` (shares the process cache and
+    the information_schema round trip with embed/drift)."""
+    from khipu.db import table_columns
+
+    return table_columns(cur, table)
 
 
 def _insert_episodes(cur, con: sqlite3.Connection) -> int:
@@ -343,9 +370,9 @@ def _insert_episodes(cur, con: sqlite3.Connection) -> int:
     for row in rows:
         vals = []
         for col, val in zip(cols, row, strict=True):
-            if col in ("topics", "people", "decisions", "preferences", "edges", "raw"):
+            if col in ("topics", "people", "decisions", "preferences", "edges", "raw", "tags"):
                 vals.append(_json_text(val))
-            elif col in ("ts", "ingested_at"):
+            elif col in ("ts", "ingested_at", "deleted_at"):
                 vals.append(_ts_text(val))
             else:
                 vals.append(val)
@@ -587,6 +614,126 @@ def _release_refresh_lock(lock) -> None:
     lock.close()
 
 
+def upsert_episode(
+    episode_row: Mapping[str, Any], embedding_rows: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Incremental snapshot update: one episode + its embedding chunks (W2.4).
+
+    Called from ``embed.embed_on_capture`` right after a successful embed, so
+    a search that falls back to the sqlite replica (hub unreachable) sees a
+    just-captured episode without waiting for the next full ``refresh()``.
+    Takes the same cross-process lock as ``refresh()`` so an incremental
+    upsert and a full dump never interleave; a dump in progress makes this a
+    no-op ``{"ok": False}`` rather than blocking (the caller is fail-open).
+
+    ``episode_row`` may carry any subset of the episode columns the sqlite
+    schema knows (``_EPISODE_COLS``) — a fresh capture payload typically
+    lacks ``ingested_at``/``edges``/``raw``, which is fine; those stay NULL.
+    """
+    path = snapshot_path()
+    if not path.is_file():
+        return {
+            "ok": False,
+            "error": "hub snapshot missing; run `khipu snapshot refresh` first",
+        }
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
+    try:
+        eid = episode_row.get("id")
+        if eid is None:
+            return {"ok": False, "error": "episode_row missing id"}
+        con = sqlite3.connect(str(path))
+        try:
+            con.execute("DELETE FROM episodes WHERE id = ?", (eid,))
+            cols = [c for c in _EPISODE_COLS if c in episode_row]
+            vals = []
+            for c in cols:
+                v = episode_row.get(c)
+                if c in ("topics", "people", "decisions", "preferences", "edges", "raw", "tags"):
+                    v = _json_text(v)
+                elif c in ("ts", "ingested_at", "deleted_at"):
+                    v = _ts_text(v)
+                vals.append(v)
+            con.execute(
+                f"INSERT INTO episodes ({', '.join(cols)}) "
+                f"VALUES ({', '.join('?' * len(cols))})",
+                vals,
+            )
+            for erow in embedding_rows:
+                ecols = [c for c in _EMBED_COLS if c in erow]
+                evals = []
+                for c in ecols:
+                    v = erow.get(c)
+                    if c == "embedding":
+                        v = _vector_to_blob(v)
+                    elif c == "built_at":
+                        v = _ts_text(v)
+                    evals.append(v)
+                con.execute(
+                    f"INSERT OR REPLACE INTO memory_embeddings ({', '.join(ecols)}) "
+                    f"VALUES ({', '.join('?' * len(ecols))})",
+                    evals,
+                )
+            con.commit()
+        finally:
+            con.close()
+        m = meta()
+        m["last_incremental_upsert_at"] = _utcnow_iso()
+        m["last_incremental_episode_id"] = eid
+        meta_path().write_text(json.dumps(m, indent=2), encoding="utf-8")
+        return {"ok": True, "episode_id": eid, "embeddings": len(embedding_rows)}
+    finally:
+        _release_refresh_lock(lock)
+
+
+def upsert_embeddings(embedding_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Incremental snapshot update: embedding rows only, no episode/topic row
+    (fix 5c) — e.g. commitment embeddings from ``embed.embed_recent_missing``'s
+    bounded catch-up, which has no single episode row to key off like
+    ``upsert_episode`` does. Same locking/fail-open contract as
+    ``upsert_episode``: a no-op ``{"ok": False}`` when the snapshot is
+    missing or a full dump is in progress, never a raise."""
+    path = snapshot_path()
+    if not path.is_file():
+        return {
+            "ok": False,
+            "error": "hub snapshot missing; run `khipu snapshot refresh` first",
+        }
+    if not embedding_rows:
+        return {"ok": True, "embeddings": 0}
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
+    try:
+        con = sqlite3.connect(str(path))
+        try:
+            for erow in embedding_rows:
+                ecols = [c for c in _EMBED_COLS if c in erow]
+                evals = []
+                for c in ecols:
+                    v = erow.get(c)
+                    if c == "embedding":
+                        v = _vector_to_blob(v)
+                    elif c == "built_at":
+                        v = _ts_text(v)
+                    evals.append(v)
+                con.execute(
+                    f"INSERT OR REPLACE INTO memory_embeddings ({', '.join(ecols)}) "
+                    f"VALUES ({', '.join('?' * len(ecols))})",
+                    evals,
+                )
+            con.commit()
+        finally:
+            con.close()
+        m = meta()
+        m["last_incremental_upsert_at"] = _utcnow_iso()
+        meta_path().write_text(json.dumps(m, indent=2), encoding="utf-8")
+        return {"ok": True, "embeddings": len(embedding_rows)}
+    finally:
+        _release_refresh_lock(lock)
+
+
 def maybe_refresh(
     *, connect_timeout: int = REFRESH_CONNECT_TIMEOUT_S, force: bool = False
 ) -> dict[str, Any] | None:
@@ -655,6 +802,43 @@ def snapshot_health() -> dict[str, Any]:
     }
 
 
+SNAPSHOT_BEHIND_INGEST_MAX_S = 30 * 60
+
+
+def snapshot_freshness(
+    latest_ingested_at: str | None, health: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """``snapshot_health()`` plus ``behind_ingest_seconds`` (W2.4).
+
+    Pure function of already-known timestamps — no DB access — so
+    ``cmd_status``/``cmd_doctor``/MCP ``khipu_status`` (which already have PG's
+    ``latest_ingested_at`` from ``status_payload``) can call this instead of
+    plain ``snapshot_health()`` while PG is reachable, without this module
+    reaching into PG itself. ``ok`` flips false with
+    ``reason: "snapshot_behind_ingest"`` once the gap exceeds
+    ``SNAPSHOT_BEHIND_INGEST_MAX_S`` (30 min).
+    """
+    if health is None:
+        health = snapshot_health()
+    out = dict(health)
+    refreshed_at = health.get("refreshed_at")
+    if not latest_ingested_at or not refreshed_at:
+        out["behind_ingest_seconds"] = None
+        return out
+    try:
+        ing = datetime.fromisoformat(str(latest_ingested_at).replace("Z", "+00:00"))
+        ref = datetime.fromisoformat(str(refreshed_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        out["behind_ingest_seconds"] = None
+        return out
+    behind = (ing - ref).total_seconds()
+    out["behind_ingest_seconds"] = behind
+    if behind > SNAPSHOT_BEHIND_INGEST_MAX_S:
+        out["ok"] = False
+        out["reason"] = "snapshot_behind_ingest"
+    return out
+
+
 def stale_fields() -> dict[str, Any]:
     m = meta()
     return {
@@ -691,11 +875,79 @@ def _token_match_sqlite(
     return " OR ".join(wheres), " + ".join(scores), params
 
 
-def search_snapshot(query: str, limit: int) -> list[dict[str, Any]]:
-    from khipu.search_text import search_tokens
+def _id_shaped(term: str) -> bool:
+    """Local copy of ``cli._id_shaped`` (W2.2) — this module must not import
+    ``khipu.cli`` (that module already imports from here, and CLI/MCP fall
+    back to this snapshot search specifically when the hub they'd otherwise
+    reach ``cli`` through is down)."""
+    t = term or ""
+    return ":" in t or "__" in t
+
+
+def _parse_snapshot_ts(val: Any) -> datetime | None:
+    if not val:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def search_snapshot(
+    query: str,
+    limit: int,
+    *,
+    kind: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    project: str | None = None,
+    session_id: str | None = None,
+    harness: str | None = None,
+) -> list[dict[str, Any]]:
+    """ILIKE-equivalent search over the sqlite replica (W2.3: honours at
+    least kind/since/until when the hub is unreachable; fix 7 adds project/
+    session_id/harness so a fallback search doesn't silently drop them).
+
+    project/session_id/harness only exist on episodes — same rule as
+    ``embed._apply_search_filters``: when any is active, topic/node rows
+    are excluded outright rather than guessed at (an explicit non-episode
+    ``kind`` combined with one of these filters yields no results, matching
+    the PG-path behaviour exactly)."""
+    from khipu.search_text import parse_time_filter, search_tokens
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
 
-    topic_n, episode_n, node_n = _fair_shares(limit, 3)
+    if kind is not None and kind not in ("topic", "episode", "node"):
+        raise ValueError("kind must be 'topic', 'episode', or 'node'")
+    want_episode_only = bool(project or session_id or harness)
+    if want_episode_only:
+        active_kinds = ["episode"] if kind in (None, "episode") else []
+    else:
+        want_nodes = kind == "node" or (kind is None and _id_shaped(query))
+        active_kinds = (
+            [kind] if kind else (["topic", "episode", "node"] if want_nodes else ["topic", "episode"])
+        )
+    shares = dict(zip(active_kinds, _fair_shares(limit, len(active_kinds)))) if active_kinds else {}
+    topic_n = shares.get("topic", 0)
+    episode_n = shares.get("episode", 0)
+    node_n = shares.get("node", 0)
+    since_dt = parse_time_filter(since) if since else None
+    until_dt = parse_time_filter(until) if until else None
+
+    def _in_range(ts_text: Any) -> bool:
+        if since_dt is None and until_dt is None:
+            return True
+        ts = _parse_snapshot_ts(ts_text)
+        if ts is None:
+            return False
+        if since_dt is not None and ts < since_dt:
+            return False
+        if until_dt is not None and ts > until_dt:
+            return False
+        return True
+
     tokens = search_tokens(query)
     con = open_snapshot()
     results: list[dict[str, Any]] = []
@@ -736,17 +988,27 @@ def search_snapshot(query: str, limit: int) -> list[dict[str, Any]]:
         )
         node_order = f"({node_score}) DESC, id ASC"
 
+    # since/until filtering happens in Python after fetch (sqlite ISO-text
+    # comparison across mixed offset formats is not reliable), so oversample
+    # the LIMIT when either bound is active.
+    time_filtered = since_dt is not None or until_dt is not None
+
+    def oversample(n: int) -> int:
+        return n * 4 if time_filtered and n > 0 else n
+
     if topic_n > 0:
         sql = f"""
             SELECT 'topic' AS kind, slug AS id, COALESCE(title, slug) AS label,
-                   substr(body, 1, 4000) AS snippet
+                   substr(body, 1, 4000) AS snippet, COALESCE(updated_at, created_at) AS ts
             FROM topics
             WHERE deleted_at IS NULL AND ({topic_where})
             ORDER BY {topic_order}
             LIMIT ?
         """
-        rows = con.execute(sql, (*topic_params, topic_n)).fetchall()
+        rows = con.execute(sql, (*topic_params, oversample(topic_n))).fetchall()
         for r in rows:
+            if not _in_range(r[4]):
+                continue
             results.append(
                 {
                     "kind": r[0],
@@ -757,16 +1019,34 @@ def search_snapshot(query: str, limit: int) -> list[dict[str, Any]]:
             )
 
     if episode_n > 0:
+        ep_cols = _snapshot_table_columns(con, "episodes")
+        project_expr = "COALESCE(project, scope)" if "project" in ep_cols else "scope"
+        harness_expr = "harness" if "harness" in ep_cols else "NULL"
+        # session_id has been a base column since the first snapshot schema;
+        # guard anyway (fix 9) rather than assume an ancient dump has it.
+        session_expr = "session_id" if "session_id" in ep_cols else "NULL"
         sql = f"""
             SELECT 'episode' AS kind, CAST(id AS TEXT) AS id, summary AS label,
-                   summary AS snippet
+                   summary AS snippet, ts, {session_expr} AS sid,
+                   {project_expr} AS proj, {harness_expr} AS harn
             FROM episodes
             WHERE {episode_where}
             ORDER BY {episode_order}
             LIMIT ?
         """
-        rows = con.execute(sql, (*episode_params, episode_n)).fetchall()
+        rows = con.execute(sql, (*episode_params, oversample(episode_n))).fetchall()
         for r in rows:
+            if not _in_range(r[4]):
+                continue
+            row_sid = r[5] or ""
+            if project and project.strip().lower() not in (r[6] or "").lower():
+                continue
+            if session_id and not row_sid.startswith(session_id):
+                continue
+            if harness:
+                row_harness = r[7] or row_sid.split(":", 1)[0]
+                if row_harness != harness:
+                    continue
             results.append(
                 {
                     "kind": r[0],
@@ -779,14 +1059,16 @@ def search_snapshot(query: str, limit: int) -> list[dict[str, Any]]:
     if node_n > 0:
         sql = f"""
             SELECT 'node' AS kind, id AS id, COALESCE(name, id) AS label,
-                   substr(COALESCE(payload, ''), 1, 4000) AS snippet
+                   substr(COALESCE(payload, ''), 1, 4000) AS snippet, built_at
             FROM nodes
             WHERE {node_where}
             ORDER BY {node_order}
             LIMIT ?
         """
-        rows = con.execute(sql, (*node_params, node_n)).fetchall()
+        rows = con.execute(sql, (*node_params, oversample(node_n))).fetchall()
         for r in rows:
+            if not _in_range(r[4]):
+                continue
             results.append(
                 {
                     "kind": r[0],
@@ -1178,15 +1460,27 @@ def semantic_search_snapshot(
     *,
     limit: int = 20,
     kind: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    project: str | None = None,
+    session_id: str | None = None,
+    harness: str | None = None,
 ) -> list[dict[str, Any]]:
+    """fix 7: project/session_id/harness, same episode-only semantics as
+    ``search_snapshot`` — a topic/media hit is dropped outright when any of
+    these is active (they have no such columns to filter on)."""
     if not local_embed_configured():
         raise ValueError(
             "hub unreachable; semantic search requires a configured local embed "
             "provider — use keyword search without --semantic"
         )
     from khipu.models import show_models
+    from khipu.search_text import parse_time_filter
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
 
+    since_dt = parse_time_filter(since) if since else None
+    until_dt = parse_time_filter(until) if until else None
+    want_episode_only = bool(project or session_id or harness)
     cfg = show_models().get("embed") or {}
     vec = _embed_query_local(
         query,
@@ -1213,26 +1507,63 @@ def semantic_search_snapshot(
         """,
         params,
     ).fetchall()
+    time_filtered = since_dt is not None or until_dt is not None
+    if want_episode_only:
+        ep_cols = _snapshot_table_columns(con, "episodes")
+        project_expr = "COALESCE(project, scope)" if "project" in ep_cols else "scope"
+        harness_expr = "harness" if "harness" in ep_cols else "NULL"
     scored: list[tuple[float, dict[str, Any]]] = []
     for knd, ref, chunk_idx, chunk_text, blob in rows:
         if not blob:
             continue
+        if want_episode_only and knd != "episode":
+            continue
         score = _cosine(vec, _blob_to_vector(blob))
         label = chunk_text
+        ts_val = None
         if knd == "topic":
             trow = con.execute(
-                "SELECT COALESCE(title, slug) FROM topics WHERE slug = ?",
+                "SELECT COALESCE(title, slug), COALESCE(updated_at, created_at) "
+                "FROM topics WHERE slug = ?",
                 (ref,),
             ).fetchone()
             if trow:
                 label = trow[0] or ref
+                ts_val = trow[1]
         elif knd == "episode":
-            erow = con.execute(
-                "SELECT summary FROM episodes WHERE CAST(id AS TEXT) = ?",
-                (ref,),
-            ).fetchone()
-            if erow:
-                label = erow[0] or ref
+            if want_episode_only:
+                erow = con.execute(
+                    f"SELECT summary, ts, session_id, {project_expr}, {harness_expr} "
+                    f"FROM episodes WHERE CAST(id AS TEXT) = ?",
+                    (ref,),
+                ).fetchone()
+                if not erow:
+                    continue
+                label, ts_val, row_sid, row_proj, row_harn = erow
+                row_sid = row_sid or ""
+                if project and project.strip().lower() not in (row_proj or "").lower():
+                    continue
+                if session_id and not row_sid.startswith(session_id):
+                    continue
+                if harness and (row_harn or row_sid.split(":", 1)[0]) != harness:
+                    continue
+                label = label or ref
+            else:
+                erow = con.execute(
+                    "SELECT summary, ts FROM episodes WHERE CAST(id AS TEXT) = ?",
+                    (ref,),
+                ).fetchone()
+                if erow:
+                    label = erow[0] or ref
+                    ts_val = erow[1]
+        if time_filtered:
+            ts = _parse_snapshot_ts(ts_val)
+            if ts is None:
+                continue
+            if since_dt is not None and ts < since_dt:
+                continue
+            if until_dt is not None and ts > until_dt:
+                continue
         scored.append(
             (
                 score,
@@ -1250,26 +1581,69 @@ def semantic_search_snapshot(
     return [item for _, item in scored[: max(1, limit)]]
 
 
+def _snapshot_filters_dropped(*, session_id: str | None, harness: str | None) -> list[str]:
+    """fix 7: which requested filters this snapshot genuinely cannot honour
+    at all (never silent) — project always has a `scope` fallback and
+    harness always has a session_id-split fallback, so in practice this is
+    only non-empty against a pathologically old snapshot missing even the
+    base ``session_id`` column."""
+    dropped: list[str] = []
+    try:
+        con = open_snapshot()
+    except FileNotFoundError:
+        return dropped
+    ep_cols = _snapshot_table_columns(con, "episodes")
+    has_session = "session_id" in ep_cols
+    if session_id and not has_session:
+        dropped.append("session_id")
+    if harness and not has_session and "harness" not in ep_cols:
+        dropped.append("harness")
+    return dropped
+
+
 def search_stale_payload(
-    query: str, limit: int, *, semantic: bool = False, kind: str | None = None
+    query: str,
+    limit: int,
+    *,
+    semantic: bool = False,
+    kind: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    project: str | None = None,
+    session_id: str | None = None,
+    harness: str | None = None,
 ) -> dict[str, Any]:
+    """Hub-unreachable search fallback (sqlite replica). Honours kind/since/
+    until/project/session_id/harness on both the semantic and literal paths
+    (W2.3 minimum bar, fix 7 for the metadata filters) — any filter this
+    snapshot genuinely cannot honour is named in ``filters_dropped``, never
+    silently ignored."""
+    filters_dropped = _snapshot_filters_dropped(session_id=session_id, harness=harness)
     if semantic:
-        results = semantic_search_snapshot(query, limit=limit, kind=kind)
+        results = semantic_search_snapshot(
+            query, limit=limit, kind=kind, since=since, until=until,
+            project=project, session_id=session_id, harness=harness,
+        )
         con = open_snapshot()
         results = enrich_search_results_snapshot(con, results)
         return {
             "query": query,
             "mode": "semantic",
             "results": results,
+            "filters_dropped": filters_dropped,
             **stale_fields(),
         }
     con = open_snapshot()
-    results = search_snapshot(query, limit)
+    results = search_snapshot(
+        query, limit, kind=kind, since=since, until=until,
+        project=project, session_id=session_id, harness=harness,
+    )
     results = merge_outbox_episodes(results)
     results = enrich_search_results_snapshot(con, results)
     return {
         "query": query,
-        "mode": "ilike",
+        "mode": "literal",
         "results": results[:limit],
+        "filters_dropped": filters_dropped,
         **stale_fields(),
     }

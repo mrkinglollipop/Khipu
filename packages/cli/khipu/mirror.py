@@ -4,13 +4,70 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from khipu.topic_graph import parse_frontmatter_links, persist_topic_graph
+from khipu.topic_graph import parse_frontmatter_links, persist_capture_graph, persist_topic_graph
+
+# ---- W5.3: status vocabulary + frontmatter date parsing --------------------
+#
+# 83 distinct topics.status values measured live 2026-09-03 (case variants,
+# quoted strings, free-text notes like "v1.0.0 build 12 shipped 2026-05-28.
+# TestFlight ..."). Normalizing at mirror time (not backfill) means every new
+# write lands in the canonical vocabulary; the raw value is kept for audit.
+
+CANONICAL_TOPIC_STATUSES = ("seed", "active", "shipped", "superseded", "abandoned", "evergreen")
+
+_STATUS_NEGATION_RE = re.compile(r"\bnot\s+(shipped|complete|completed|resolved|implemented|released)\b")
+_STATUS_SEED_KEYWORDS = (
+    "seed", "draft", "stub", "concept", "propos", "plan", "prototyp",
+    "nascent", "germ", "todo", "pending", "scratchpad", "thought",
+)
+_STATUS_SHIPPED_KEYWORDS = ("ship", "complet", "resolv", "implement", "release", "wrapped")
+_STATUS_EVERGREEN_KEYWORDS = ("evergreen", "permanent")
+_STATUS_ABANDONED_KEYWORDS = ("abandon", "retire", "cancel", "dead", "archiv")
+
+
+def normalize_topic_status(raw: Any) -> str:
+    """Free-text ``status:`` frontmatter -> one of CANONICAL_TOPIC_STATUSES.
+    Case-insensitive, quotes stripped; unknown values default to 'active'
+    (a topic that exists and has no clearer signal is presumed live)."""
+    s = str(raw or "").strip().strip("\"'").strip()
+    if not s:
+        return "active"
+    if "🌱" in s:
+        return "seed"
+    sl = s.lower()
+    if "supersed" in sl:
+        return "superseded"
+    if any(k in sl for k in _STATUS_ABANDONED_KEYWORDS):
+        return "abandoned"
+    if any(k in sl for k in _STATUS_EVERGREEN_KEYWORDS):
+        return "evergreen"
+    if not _STATUS_NEGATION_RE.search(sl) and any(k in sl for k in _STATUS_SHIPPED_KEYWORDS):
+        return "shipped"
+    if any(k in sl for k in _STATUS_SEED_KEYWORDS):
+        return "seed"
+    return "active"
+
+
+def _parse_frontmatter_date(raw: Any) -> str | None:
+    """A frontmatter ``created:``/``last_updated:`` value as an ISO string,
+    or None when absent/unparseable (never raises)."""
+    s = str(raw or "").strip().strip("\"'").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
 
 
 def _log(msg: str) -> None:
@@ -75,7 +132,9 @@ def parse_topic_file(path: Path) -> dict[str, Any] | None:
     slug = path.stem
     digest = topic_content_hash(text)
     title = slug
-    status = "active"
+    status_raw = "active"
+    created_at: str | None = None
+    updated_at: str | None = None
     body = text
     links: list[str] = []
     frontmatter: dict[str, Any] = {}
@@ -87,14 +146,22 @@ def parse_topic_file(path: Path) -> dict[str, Any] | None:
                 if line.startswith("title:"):
                     title = line.split(":", 1)[1].strip().strip("\"'")
                 if line.startswith("status:"):
-                    status = line.split(":", 1)[1].strip()
+                    status_raw = line.split(":", 1)[1].strip().strip("\"'")
+                if line.startswith("created:"):
+                    created_at = _parse_frontmatter_date(line.split(":", 1)[1])
+                if line.startswith("last_updated:"):
+                    updated_at = _parse_frontmatter_date(line.split(":", 1)[1])
             links = parse_frontmatter_links(fm)
+            status = normalize_topic_status(status_raw)
             frontmatter = {
                 "title": title,
                 "status": status,
+                "status_raw": status_raw,
                 "links": links,
             }
             body = parts[2].lstrip("\n")
+    else:
+        status = normalize_topic_status(status_raw)
     return {
         "slug": slug,
         "title": title,
@@ -103,6 +170,8 @@ def parse_topic_file(path: Path) -> dict[str, Any] | None:
         "digest": digest,
         "links": links,
         "frontmatter": frontmatter,
+        "created_at": created_at,
+        "updated_at": updated_at,
     }
 
 
@@ -133,22 +202,30 @@ def _upsert_topic(
         frontmatter = {"title": parsed["title"], "status": parsed["status"], "links": links}
     cur.execute("SELECT content_hash FROM topics WHERE slug = %s", (parsed["slug"],))
     prev = cur.fetchone()
+    # W5.3: a topic's own frontmatter created/last_updated (when parseable)
+    # is the freshness signal, not "whenever mirror last ran". created_at is
+    # only ever set, never blanked, on conflict (COALESCE keeps the existing
+    # value when this write's frontmatter carries none).
+    updated_at_val = parsed.get("updated_at")
+    created_at_val = parsed.get("created_at")
     cur.execute(
         """
         INSERT INTO topics
           (slug, title, body, status, updated_at, frontmatter, links,
-           source_path, content_hash)
+           source_path, content_hash, created_at)
         VALUES
-          (%s, %s, %s, %s, now(), %s::jsonb, %s::jsonb, %s, %s)
+          (%s, %s, %s, %s, COALESCE(%s::timestamptz, now()),
+           %s::jsonb, %s::jsonb, %s, %s, %s::timestamptz)
         ON CONFLICT (slug) DO UPDATE SET
           title = EXCLUDED.title,
           body = EXCLUDED.body,
           status = EXCLUDED.status,
-          updated_at = now(),
+          updated_at = COALESCE(EXCLUDED.updated_at, now()),
           source_path = EXCLUDED.source_path,
           content_hash = EXCLUDED.content_hash,
           frontmatter = EXCLUDED.frontmatter,
           links = EXCLUDED.links,
+          created_at = COALESCE(topics.created_at, EXCLUDED.created_at),
           deleted_at = NULL
         """,
         (
@@ -156,10 +233,12 @@ def _upsert_topic(
             parsed["title"],
             parsed["body"],
             parsed["status"],
+            updated_at_val,
             json.dumps(frontmatter, ensure_ascii=False),
             json.dumps(links, ensure_ascii=False),
             source_path,
             parsed["digest"],
+            created_at_val,
         ),
     )
     changed = prev is None or prev[0] != parsed["digest"]
@@ -187,10 +266,12 @@ def _upsert_episode(cur, payload: dict[str, Any]) -> bool:
         """
         INSERT INTO episodes
           (ts, session_id, summary, topics, people, decisions,
-           preferences, scope, edges, raw)
+           preferences, scope, edges, raw,
+           harness, repo_root, project, parent_session_id, transcript_range, tags)
         VALUES
           (%s::timestamptz, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb,
-           %s::jsonb, %s, %s::jsonb, %s::jsonb)
+           %s::jsonb, %s, %s::jsonb, %s::jsonb,
+           %s, %s, %s, %s, %s, %s::jsonb)
         ON CONFLICT DO NOTHING
         """,
         (
@@ -204,13 +285,28 @@ def _upsert_episode(cur, payload: dict[str, Any]) -> bool:
             payload.get("scope"),
             json.dumps(payload.get("edges") or []),
             json.dumps(payload, ensure_ascii=False),
+            payload.get("harness"),
+            payload.get("repo_root"),
+            payload.get("project"),
+            payload.get("parent_session_id"),
+            payload.get("transcript_range"),
+            json.dumps(payload.get("tags") or []),
         ),
     )
     return cur.rowcount > 0
 
 
 def mirror_episode(payload: dict[str, Any]) -> bool:
-    """Insert one episode row. Returns True on success (or already mirrored)."""
+    """Insert one episode row. Returns True on success (or already mirrored).
+
+    fix 11: also mints topic:/path: graph nodes from the payload's topics,
+    through the SAME hygiene filter the hub path uses (persist_capture_graph
+    classifies internally now — see its docstring) — this legacy/mirror
+    write path never minted a capture-topic graph neighborhood at all
+    before this fix. It stays additive-only and hub-path features it does
+    NOT get: no W1.4 ingest dedup, and it does not extract commitments
+    (open_loops/closed_loops) — those remain capture.write_pg-only.
+    """
     _ensure_path()
     from khipu.db import connect
 
@@ -220,6 +316,12 @@ def mirror_episode(payload: dict[str, Any]) -> bool:
     with connect() as conn:
         with conn.cursor() as cur:
             _upsert_episode(cur, payload)
+            cur.execute("SAVEPOINT mirror_capture_graph")
+            try:
+                persist_capture_graph(cur, payload)
+            except Exception as exc:  # noqa: BLE001 — episode row stays; graph is additive
+                cur.execute("ROLLBACK TO SAVEPOINT mirror_capture_graph")
+                _log(f"legacy-path topic graph mint failed ({type(exc).__name__}: {exc})")
         conn.commit()
     return True
 

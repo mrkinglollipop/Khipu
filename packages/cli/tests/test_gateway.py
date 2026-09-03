@@ -336,11 +336,14 @@ class GrokBotPackTest(unittest.TestCase):
         integ.install("grok_bot", project=str(self.proj))
         with mock.patch.object(integ, "_gateway_token", return_value="t" * 30), \
                 mock.patch.object(integ, "_probe_gateway", return_value={"ok": True, "episodes": 1, "tools": 4,
-                                                                          "auth_refused_wrong_token": True}) as pg:
+                                                                          "auth_refused_wrong_token": True}) as pg, \
+                mock.patch("khipu.probe.run_probe", return_value={"ok": True, "harness": "grok_bot"}):
             v = integ.verify("grok_bot", project=str(self.proj))
         self.assertTrue(v["ok"], v)
         pg.assert_called_once_with("https://khipu.example.test", "t" * 30)
-        with mock.patch.object(integ, "_gateway_token", return_value=""):
+        self.assertIn("recall_probe", v["components"])
+        with mock.patch.object(integ, "_gateway_token", return_value=""), \
+                mock.patch("khipu.probe.run_probe", return_value={"ok": True, "harness": "grok_bot"}):
             v = integ.verify("grok_bot", project=str(self.proj))
         self.assertFalse(v["ok"])
 

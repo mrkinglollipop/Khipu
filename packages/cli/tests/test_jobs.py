@@ -42,12 +42,29 @@ class JobsRunTest(unittest.TestCase):
             stdout.write(b"ok\n")
             return mock.Mock(returncode=0)
 
-        with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly") as run_mock:
+        # W4.3: run_nightly also piggybacks khipu.notes.reconcile (real
+        # filesystem walk + a real hub write) — never let that run for real
+        # in a unit test; the real reconcile has its own tests (test_notes.py).
+        with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly") as run_mock, \
+                mock.patch("khipu.notes.reconcile", return_value={"ok": True}) as m_reconcile:
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
         run_mock.assert_called_once()
+        m_reconcile.assert_called_once_with(dry_run=False)
         state = json.loads((self.data_dir / "state" / "job-nightly.json").read_text())
         self.assertEqual(state["exit"], 0)
+
+    def test_run_nightly_survives_a_notes_reconcile_failure(self):
+        """The external nightly script's exit code is the one that gates
+        doctor/status — a notes.reconcile exception must not change it."""
+        def _run(cmd, stdout, stderr, env):  # noqa: ARG001
+            stdout.write(b"ok\n")
+            return mock.Mock(returncode=0)
+
+        with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
+                mock.patch("khipu.notes.reconcile", side_effect=RuntimeError("boom")):
+            rc = jobs.run_nightly()
+        self.assertEqual(rc, 0)
 
     def test_run_monthly_passes_dry_run(self):
         captured: list[list[str]] = []

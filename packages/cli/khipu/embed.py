@@ -56,6 +56,7 @@ _PROFILE_MODELS: dict[str, str] = {
 CHUNK_CHARS = 6000
 CHUNK_OVERLAP = 300
 BATCH = 64            # Gemini batchEmbedContents cap is 100; stay under
+COMMITMENT_CATCHUP_LIMIT = 5  # fix 5c: bounded, same spirit as the episode catch-up's limit=5 caller
 MAX_TEXT_CHARS = 8000  # per-item safety, mirrors embed_mirror.embed_text
 # Google Embedding 2 image table (docs 2026-06-22): PNG and JPEG only.
 MEDIA_MIME: dict[str, str] = {
@@ -762,30 +763,82 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
                 )
             conn.commit()
         _log(f"embed-on-capture ok episode={eid} chunks={len(chunks)} profile={profile}")
+        # W2.4: keep the sqlite hub replica current without a full dump, so a
+        # search that falls back to the snapshot (hub unreachable) sees this
+        # episode too. Its own try/except so a snapshot hiccup never turns an
+        # already-successful embed-on-capture into a reported failure.
+        try:
+            from datetime import datetime, timezone
+
+            from khipu.hub_snapshot import upsert_episode
+
+            episode_row = {
+                "id": int(eid),
+                "ts": ts,
+                "session_id": payload.get("session_id"),
+                "summary": summary,
+                "topics": payload.get("topics"),
+                "people": payload.get("people"),
+                "decisions": payload.get("decisions"),
+                "preferences": payload.get("preferences"),
+                "scope": payload.get("scope"),
+                # fix 9: identity columns ride the same incremental upsert so
+                # a just-captured episode is filterable by project/session_id/
+                # harness (fix 7) on the sqlite replica without waiting for
+                # the next full `khipu snapshot refresh`.
+                "harness": payload.get("harness"),
+                "repo_root": payload.get("repo_root"),
+                "project": payload.get("project"),
+                "parent_session_id": payload.get("parent_session_id"),
+                "transcript_range": payload.get("transcript_range"),
+            }
+            built_at = datetime.now(timezone.utc).isoformat()
+            embedding_rows = [
+                {
+                    "profile": profile, "kind": "episode", "ref": eid, "chunk_idx": i,
+                    "chunk_text": c, "content_hash": _md5(c), "embedding": v,
+                    "built_at": built_at,
+                }
+                for i, (c, v) in enumerate(zip(chunks, vecs))
+            ]
+            snap = upsert_episode(episode_row, embedding_rows)
+            if not snap.get("ok"):
+                _log(f"snapshot upsert skipped: {snap.get('error')}")
+        except Exception as exc:  # noqa: BLE001 — fail-open, one log line
+            _log(f"snapshot upsert failed: {type(exc).__name__}: {exc}")
         return True
     except Exception as exc:  # noqa: BLE001 — fail-open: capture is already durable
         _log(f"embed-on-capture skipped: {type(exc).__name__}: {exc}")
         return False
 
 
-def semantic_search(
-    query: str, *, limit: int = 10, kind: str | None = None
+def _cosine_candidates(
+    query: str, *, limit: int, kind: str | None = None
 ) -> list[dict[str, Any]]:
-    """Cosine oversample over the active profile, then token-overlap RRF.
+    """Raw cosine-ordered candidates over the active profile (best first).
 
-    Returns kind/id/score/snippet + label. Cosine alone packed relevant and
-    irrelevant episodes into a ~0.02 band; fusing query-term hits on the
-    embedded chunk window (``CHUNK_CHARS``, not the ``FETCH_LIMIT`` teaser
-    fetch) lifts rows that actually name the question without a second embed
-    call.
+    Extracted from ``semantic_search`` (W2.1) so the hybrid engine
+    (``hybrid_search``) can use this as one ranked list among several,
+    without semantic_search's own token-overlap fusion baked in. Each row
+    keeps ``rank_text`` (the embedded chunk window) so a caller can build a
+    token-overlap-ordered list from the same candidates without a second
+    query. Raises ``RuntimeError`` (from ``_active_profile``) when no
+    embedding profile is active — callers decide whether that means
+    "degrade" or "fail".
+
+    ``kind=None`` means "any of the generic-search-eligible kinds", never
+    "any kind at all" — ``memory_embeddings`` rows with ``kind = 'commitment'``
+    (migration 0009 widened the constraint to allow them) are always
+    excluded here regardless of ``kind``: a commitment's own label lookup
+    below is episode-shaped and would resolve wrong, and commitments have
+    their own dedicated surface (``khipu_owed``), not generic search.
     """
     from khipu.db import connect
 
     query = (query or "").strip()
     if not query:
         return []
-    want = max(1, min(int(limit), 50))
-    fetch = min(50, max(want * 5, 25))
+    fetch = max(1, min(int(limit), 200))
     with connect() as conn:
         with conn.cursor() as cur:
             profile = _active_profile(cur)
@@ -819,6 +872,7 @@ def semantic_search(
                        END AS label
                 FROM memory_embeddings m
                 WHERE m.profile = %(p)s
+                  AND m.kind != 'commitment'
                   AND (%(kind)s::text IS NULL OR m.kind = %(kind)s)
                 ORDER BY m.embedding <=> %(q)s::vector
                 LIMIT %(lim)s
@@ -839,10 +893,336 @@ def semantic_search(
                     "snippet": clip_snippet(snippet_src, SNIPPET_LIMIT),
                     "rank_text": rank_src or snip or "",
                 })
-            ranked = hybrid_rerank(out, query, limit=want)
-            for row in ranked:
-                row.pop("rank_text", None)
-            return ranked
+    return out
+
+
+def semantic_search(
+    query: str, *, limit: int = 10, kind: str | None = None
+) -> list[dict[str, Any]]:
+    """Cosine oversample over the active profile, then token-overlap RRF.
+
+    Returns kind/id/score/snippet + label. Cosine alone packed relevant and
+    irrelevant episodes into a ~0.02 band; fusing query-term hits on the
+    embedded chunk window (``CHUNK_CHARS``, not the ``FETCH_LIMIT`` teaser
+    fetch) lifts rows that actually name the question without a second embed
+    call.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+    want = max(1, min(int(limit), 50))
+    fetch = min(50, max(want * 5, 25))
+    out = _cosine_candidates(query, limit=fetch, kind=kind)
+    ranked = hybrid_rerank(out, query, limit=want)
+    for row in ranked:
+        row.pop("rank_text", None)
+    return ranked
+
+
+# ---- hybrid default retrieval (W2.1-W2.3) --------------------------------------
+
+_SEMANTIC_KINDS = ("episode", "topic", "media")
+_LITERAL_KINDS = ("episode", "topic", "node")
+
+
+def _episode_schema_flags(cur) -> dict[str, bool]:
+    """Which optional episode columns exist on THIS connection (W2.3).
+
+    ``project``/``harness``/``parent_session_id`` (migration 0008) and
+    ``deleted_at`` (migration 0010) may not be applied yet — resolved once
+    per call (cached per process by ``db.table_columns``, not per row) and
+    the caller falls back to ``scope`` / session_id-split / no soft-delete
+    when absent. Consolidated onto ``db.table_columns`` (W-consolidation)
+    so this, ``drift._has_column`` and ``hub_snapshot._pg_columns`` share one
+    information_schema round trip per table.
+    """
+    from khipu.db import table_columns
+
+    cols = table_columns(cur, "episodes")
+    return {
+        "project": "project" in cols,
+        "deleted_at": "deleted_at" in cols,
+        "harness": "harness" in cols,
+        "parent_session_id": "parent_session_id" in cols,
+    }
+
+
+def _aware(ts):
+    from datetime import timezone
+
+    if ts is None:
+        return None
+    if getattr(ts, "tzinfo", None) is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def _neg_ts_sort_key(ts) -> float:
+    """Sort key so a *newer* ts sorts first among equal-score rows (W2.2)."""
+    aware = _aware(ts)
+    if aware is None:
+        return 0.0
+    try:
+        return -aware.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return 0.0
+
+
+def _apply_search_filters(
+    cur,
+    rows: list[dict[str, Any]],
+    *,
+    project: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    session_id: str | None = None,
+    harness: str | None = None,
+) -> list[dict[str, Any]]:
+    """Post-fusion metadata filter + recency tiebreak, in one place for every
+    mode (W2.3). project/session_id/harness only exist on episodes — a topic
+    or node row is dropped when one of those is active rather than guessed at.
+    ``deleted_at`` (once migration 0010 lands) always excludes tombstones.
+    """
+    from khipu.search_text import parse_time_filter
+
+    if not rows:
+        return rows
+    since_dt = parse_time_filter(since) if since else None
+    until_dt = parse_time_filter(until) if until else None
+
+    flags = _episode_schema_flags(cur)
+    episode_ids = [str(r["id"]) for r in rows if r.get("kind") == "episode"]
+    topic_ids = [str(r["id"]) for r in rows if r.get("kind") == "topic"]
+    node_ids = [str(r["id"]) for r in rows if r.get("kind") == "node"]
+
+    meta: dict[tuple[str, str], dict[str, Any]] = {}
+    if episode_ids:
+        project_expr = "COALESCE(project, scope)" if flags["project"] else "scope"
+        select_cols = f"id::text, ts, session_id, {project_expr}"
+        extra_idx = 4
+        deleted_idx = harness_idx = None
+        if flags["deleted_at"]:
+            select_cols += ", deleted_at IS NOT NULL"
+            deleted_idx = extra_idx
+            extra_idx += 1
+        # W2.3/harness fix: filter on episodes.harness (migration 0008) when it
+        # exists — the session_id-prefix split below is a fallback for a
+        # pre-migration hub only, not the primary signal once the column is real.
+        if flags["harness"]:
+            select_cols += ", harness"
+            harness_idx = extra_idx
+            extra_idx += 1
+        cur.execute(
+            f"SELECT {select_cols} FROM episodes WHERE id::text = ANY(%s)",
+            (episode_ids,),
+        )
+        for row in cur.fetchall():
+            eid, ts, sid, proj = row[0], row[1], row[2], row[3]
+            deleted = bool(row[deleted_idx]) if deleted_idx is not None else False
+            harness_col = row[harness_idx] if harness_idx is not None else None
+            meta[("episode", eid)] = {
+                "ts": ts, "session_id": sid, "project": proj or "", "deleted": deleted,
+                "harness": harness_col,
+            }
+    if topic_ids:
+        cur.execute(
+            "SELECT slug, COALESCE(updated_at, created_at) FROM topics WHERE slug = ANY(%s)",
+            (topic_ids,),
+        )
+        for slug, ts in cur.fetchall():
+            meta[("topic", slug)] = {"ts": ts}
+    if node_ids:
+        cur.execute("SELECT id, built_at FROM nodes WHERE id = ANY(%s)", (node_ids,))
+        for nid, ts in cur.fetchall():
+            meta[("node", nid)] = {"ts": ts}
+
+    want_episode_only = bool(project or session_id or harness)
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        k, rid = r.get("kind"), str(r.get("id"))
+        m = meta.get((k, rid), {})
+        if k == "episode" and m.get("deleted"):
+            continue
+        if want_episode_only:
+            if k != "episode":
+                continue
+            if project and project.strip().lower() not in (m.get("project") or "").lower():
+                continue
+            if session_id and not (m.get("session_id") or "").startswith(session_id):
+                continue
+            if harness:
+                row_harness = m.get("harness") or (m.get("session_id") or "").split(":", 1)[0]
+                if row_harness != harness:
+                    continue
+        ts = m.get("ts")
+        if since_dt is not None and (ts is None or _aware(ts) < since_dt):
+            continue
+        if until_dt is not None and (ts is None or _aware(ts) > until_dt):
+            continue
+        r["_sort_ts"] = ts
+        out.append(r)
+    out.sort(key=lambda r: (-(r.get("score") or 0.0), _neg_ts_sort_key(r.get("_sort_ts"))))
+    for r in out:
+        r.pop("_sort_ts", None)
+    return out
+
+
+def _fair_fill(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Rank by score first; per-kind fairness only fills the tail (W2.2).
+
+    Takes the top ``limit`` rows as scored. If any kind present anywhere in
+    ``rows`` has zero rows in that top slice, backfills up to ``limit // 4``
+    of its best-scoring rows from beyond the cut — dropping the worst-scoring
+    rows in the top slice to make room, so the total stays ``<= limit``.
+    """
+    limit = max(1, int(limit))
+    top = rows[:limit]
+    rest = rows[limit:]
+    if not rest:
+        return top
+    present = {r.get("kind") for r in top}
+    all_kinds = {r.get("kind") for r in rows}
+    missing = all_kinds - present
+    backfill_cap = limit // 4
+    if not missing or backfill_cap <= 0:
+        return top
+    added: list[dict[str, Any]] = []
+    for k in missing:
+        added.extend([r for r in rest if r.get("kind") == k][:backfill_cap])
+    if not added:
+        return top
+    keep_n = max(0, len(top) - len(added))
+    result = top[:keep_n] + added
+    result.sort(key=lambda r: -(r.get("score") or 0.0))
+    return result[:limit]
+
+
+def hybrid_search(
+    query: str,
+    *,
+    limit: int = 12,
+    mode: str = "hybrid",
+    kind: str | None = None,
+    project: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    session_id: str | None = None,
+    harness: str | None = None,
+) -> dict[str, Any]:
+    """Default retrieval engine (W2.1-W2.3): fused hybrid, or single-mode.
+
+    mode='hybrid' (default): cosine oversample + token overlap (over the
+    embedded text) + literal ILIKE, fused by ``search_text.fuse_ranked_lists``
+    (generalized RRF), ranked by score with per-kind fairness filling only
+    the tail (``_fair_fill``). If no embedding profile is active, the cosine
+    and token-overlap lists are skipped and the result degrades to literal
+    only, with ``degraded: "no-embedding"`` in the payload.
+    mode='literal': ``cli._literal_candidates`` — a single flat pool ranked
+    globally by (phrase-boost, hit count, ts), not the fair-share-partitioned
+    ``cli._search_query`` (that per-kind split is right for a stand-alone
+    listing but wrong as fusion input — see the bugfix note on
+    ``_literal_candidates``).
+    mode='semantic': the legacy ``semantic_search`` 2-list fuse (cosine +
+    token overlap over the cosine oversample only), no literal list — this is
+    what ``semantic: true`` aliases to. Raises (does not degrade) when no
+    profile is active, same as before.
+
+    Bugfix (live-reported): the token-overlap list is ranked over the UNION
+    of cosine candidates and (hybrid mode only) literal candidates — using
+    each row's full ``rank_text`` — not the cosine oversample alone. A row
+    the embedding ranked low but that names the query verbatim used to be
+    invisible to the lexical list entirely.
+
+    Filters (kind/project/since/until/session_id/harness) are honoured on
+    every mode via a single post-fusion pass (``_apply_search_filters``).
+    Nodes are excluded from hybrid/literal results by default (W2.2) — see
+    ``cli._id_shaped`` / ``cli._literal_candidates``.
+    """
+    from khipu.cli import _literal_candidates
+    from khipu.hub_snapshot import try_hub_connect
+    from khipu.search_text import fuse_ranked_lists, search_tokens, token_hit_count
+    from khipu.topic_graph import enrich_search_results
+
+    query = (query or "").strip()
+    if not query:
+        raise ValueError("query is required")
+    mode = (mode or "hybrid").strip().lower()
+    if mode not in ("hybrid", "literal", "semantic"):
+        raise ValueError("mode must be 'hybrid', 'literal', or 'semantic'")
+    if kind is not None:
+        allowed = _SEMANTIC_KINDS if mode == "semantic" else _LITERAL_KINDS
+        if kind not in allowed:
+            raise ValueError(f"kind must be one of {allowed}")
+
+    limit = max(1, int(limit))
+    # Larger literal pool (bugfix): 50 minimum, not 40 — the fair-share bug's
+    # replacement (a single globally-ranked pool) needs enough headroom that
+    # a strong episode hit is never pushed out by weak-but-numerous topic hits.
+    oversample = max(limit * 4, 50)
+    degraded: str | None = None
+
+    cosine_rows: list[dict[str, Any]] = []
+    # kind="node" (only valid for hybrid/literal, never semantic — checked
+    # above) has nothing to contribute to the cosine list: nodes are never
+    # embedded. Skip cosine entirely rather than let semantic_kind=None fall
+    # through to "no kind filter" and pollute a node-only request with every
+    # other kind.
+    if mode in ("hybrid", "semantic") and not (kind and kind not in _SEMANTIC_KINDS):
+        semantic_kind = kind if kind in _SEMANTIC_KINDS else None
+        try:
+            cosine_rows = _cosine_candidates(query, limit=oversample, kind=semantic_kind)
+        except RuntimeError:
+            if mode == "semantic":
+                raise
+            cosine_rows = []
+            degraded = "no-embedding"
+
+    with try_hub_connect() as conn:
+        with conn.cursor() as cur:
+            literal_rows: list[dict[str, Any]] = []
+            if mode in ("hybrid", "literal"):
+                literal_kind = kind if kind in _LITERAL_KINDS else None
+                literal_rows = _literal_candidates(cur, query, oversample, kind=literal_kind)
+
+            lists: list[list[dict[str, Any]]] = []
+            if cosine_rows:
+                lists.append(list(cosine_rows))
+                tokens = search_tokens(query)
+                if tokens:
+                    union: dict[tuple[str, str], dict[str, Any]] = {
+                        (r["kind"], str(r["id"])): r for r in cosine_rows
+                    }
+                    if mode == "hybrid":
+                        for r in literal_rows:
+                            union.setdefault((r["kind"], str(r["id"])), r)
+                    lex_rows = sorted(
+                        union.values(),
+                        key=lambda r: -token_hit_count(r.get("rank_text") or "", tokens),
+                    )
+                    lists.append(lex_rows)
+            if literal_rows and mode in ("hybrid", "literal"):
+                lists.append(list(literal_rows))
+
+            for row_list in lists:
+                for r in row_list:
+                    r.pop("rank_text", None)
+            if not lists:
+                out: dict[str, Any] = {"query": query, "mode": mode, "results": []}
+                if degraded:
+                    out["degraded"] = degraded
+                return out
+            fused = fuse_ranked_lists(lists, limit=oversample)
+            fused = _apply_search_filters(
+                cur, fused, project=project, since=since, until=until,
+                session_id=session_id, harness=harness,
+            )
+            fused = _fair_fill(fused, limit)
+            fused = enrich_search_results(cur, fused)
+
+    out = {"query": query, "mode": mode, "results": fused}
+    if degraded:
+        out["degraded"] = degraded
+    return out
 
 
 def coverage(*, profile: str | None = None) -> dict[str, Any]:
@@ -943,4 +1323,59 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                                [(k, r, i, t, h, v) for (k, r, i, t, h), v in zip(batch, vecs)])
                 conn.commit()
                 out["chunks"] += len(batch)
+
+            # fix 5c: populate commitment embeddings HERE (the hook's bounded
+            # catch-up step), not inline on the capture decision path —
+            # commitments.auto_close would otherwise pay for an embed API
+            # call on the hot capture path just to find out no embeddings
+            # exist yet. Small and bounded (COMMITMENT_CATCHUP_LIMIT), same
+            # shape as the episode pass above.
+            out["commitments_embedded"] = 0
+            out["commitments_chunks"] = 0
+            try:
+                cur.execute(
+                    "SELECT c.id, c.text FROM commitments c WHERE c.status = 'open' "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM memory_embeddings m"
+                    "  WHERE m.profile = %s AND m.kind = 'commitment' AND m.ref = c.id::text)"
+                    " ORDER BY c.opened_at DESC LIMIT %s",
+                    (profile, COMMITMENT_CATCHUP_LIMIT),
+                )
+                commitment_rows = cur.fetchall()
+            except Exception as exc:  # noqa: BLE001 — pre-0009 hub: table doesn't exist yet
+                _log(f"commitment embed catch-up skipped: {type(exc).__name__}: {exc}")
+                commitment_rows = []
+            snapshot_rows: list[dict[str, Any]] = []
+            for cid, ctext in commitment_rows:
+                text = (ctext or "").strip()
+                if not text:
+                    continue
+                out["commitments_embedded"] += 1
+                chunks = chunk_text(text)
+                api = _api_texts(profile, [("", c) for c in chunks])
+                vecs = embed_batch(api, profile=profile)
+                from datetime import datetime, timezone
+
+                built_at = datetime.now(timezone.utc).isoformat()
+                rows = [("commitment", str(cid), i, c, _md5(c), v)
+                        for i, (c, v) in enumerate(zip(chunks, vecs))]
+                _upsert_chunks(cur, profile, rows)
+                conn.commit()
+                out["commitments_chunks"] += len(rows)
+                snapshot_rows.extend(
+                    {"profile": profile, "kind": "commitment", "ref": str(cid), "chunk_idx": i,
+                     "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": built_at}
+                    for i, (c, v) in enumerate(zip(chunks, vecs))
+                )
+            if snapshot_rows:
+                # Keep the sqlite hub replica current, same as embed_on_capture
+                # does for episodes (W2.4) — best-effort, never fails the pass.
+                try:
+                    from khipu.hub_snapshot import upsert_embeddings
+
+                    snap = upsert_embeddings(snapshot_rows)
+                    if not snap.get("ok"):
+                        _log(f"commitment snapshot upsert skipped: {snap.get('error')}")
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"commitment snapshot upsert failed: {type(exc).__name__}: {exc}")
     return out

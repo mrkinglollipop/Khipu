@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -39,7 +40,14 @@ class RuleTextTest(unittest.TestCase):
 
     def test_it_says_digit_ids_are_episodes_not_graph_nodes(self):
         self.assertIn("Digit ids are episodes", rr.RULE_MD)
-        self.assertIn("query tokens match", rr.RULE_MD)
+        self.assertIn("fused by reciprocal-rank fusion", rr.RULE_MD)
+
+    def test_it_states_the_default_mode_and_filters(self):
+        self.assertIn("mode` is `hybrid`", rr.RULE_MD)
+        self.assertIn("mode: \"literal\"", rr.RULE_MD)
+        for f in ("kind", "project", "since", "session_id", "harness"):
+            with self.subTest(filter=f):
+                self.assertIn(f, rr.RULE_MD)
 
 
 class ClaudeShapeTest(unittest.TestCase):
@@ -155,6 +163,138 @@ class PushSliceTest(unittest.TestCase):
         ):
             out = rr.session_start_context("/tmp")
         self.assertEqual(out, rr.RULE_MD.strip())
+
+
+class RepoScopedSliceTest(unittest.TestCase):
+    """W4: _pushed_memory_slice resolves repo_root/project first and prefers
+    a repo-scoped slice (commitments -> episodes -> topics) over the
+    cwd-token search, which stays the fallback for no-project or empty
+    results, and hub_snapshot.open_snapshot backs a `stale` degrade on a PG
+    failure. identity.resolve_repo_root/activity.project_slice/query_log/
+    hub_snapshot are all mocked — no real DB or filesystem git call."""
+
+    def setUp(self):
+        os.environ.pop("CLAUDE_CODE_HOST_SESSION_ID", None)
+
+    def test_repo_scoped_slice_wins_over_cwd_token_search_when_populated(self):
+        with mock.patch(
+            "khipu.identity.resolve_repo_root",
+            return_value={"repo_root": "/repo/khipu", "project": "acme/khipu"},
+        ), mock.patch(
+            "khipu.activity.project_slice",
+            return_value={
+                "commitments": [{"id": 1, "text": "ship it", "kind": "followup"}],
+                "episodes": [{"id": 5, "summary": "did the thing"}],
+                "topics": [{"slug": "khipu", "title": "Khipu", "age_days": 2}],
+            },
+        ) as m_slice, mock.patch("khipu.cli._search_query") as m_search:
+            out = rr._pushed_memory_slice("/repo/khipu")
+        m_search.assert_not_called()
+        self.assertIn("project: `acme/khipu`", out)
+        self.assertIn("Open commitments", out)
+        self.assertIn("ship it", out)
+        self.assertIn("Recent episodes", out)
+        self.assertIn("Linked topics", out)
+        self.assertIn("2d old", out)
+        self.assertEqual(m_slice.call_args.kwargs["project"], "acme/khipu")
+        self.assertEqual(m_slice.call_args.kwargs["repo_root"], "/repo/khipu")
+
+    def test_empty_project_slice_falls_through_to_cwd_token_search(self):
+        with mock.patch(
+            "khipu.identity.resolve_repo_root",
+            return_value={"repo_root": "/repo/khipu", "project": "acme/khipu"},
+        ), mock.patch(
+            "khipu.activity.project_slice",
+            return_value={"commitments": [], "episodes": [], "topics": []},
+        ), mock.patch("khipu.cli._search_query", return_value=[]), mock.patch(
+            "khipu.activity.recent_episodes",
+            return_value=[{"id": 9, "summary": "fallback episode"}],
+        ), mock.patch("khipu.db.connect"):
+            out = rr._pushed_memory_slice("/repo/khipu")
+        self.assertNotIn("project: `acme/khipu`", out)
+        self.assertIn("fallback episode", out)
+
+    def test_pg_failure_degrades_to_stale_snapshot_and_logs_the_miss(self):
+        class _FakeSnapshotCursor:
+            def fetchall(self_inner):
+                return [(11, "snapshot episode", json.dumps({"project": "acme/khipu"}))]
+
+        class _FakeSnapshotCon:
+            def execute(self_inner, sql, params=None):
+                return _FakeSnapshotCursor()
+
+            def close(self_inner):
+                pass
+
+        with mock.patch(
+            "khipu.identity.resolve_repo_root",
+            return_value={"repo_root": "/repo/khipu", "project": "acme/khipu"},
+        ), mock.patch(
+            "khipu.activity.project_slice", side_effect=RuntimeError("hub unreachable")
+        ), mock.patch(
+            "khipu.hub_snapshot.open_snapshot", return_value=_FakeSnapshotCon()
+        ), mock.patch("khipu.query_log.log_query") as m_log:
+            out = rr._pushed_memory_slice("/repo/khipu")
+        self.assertIn("stale", out)
+        self.assertIn("snapshot episode", out)
+        m_log.assert_called_once()
+        self.assertEqual(m_log.call_args.kwargs["mode"], "slice")
+        self.assertEqual(m_log.call_args.kwargs["result_count"], 0)
+
+    def test_pg_failure_with_no_snapshot_falls_through_to_cwd_token_search(self):
+        with mock.patch(
+            "khipu.identity.resolve_repo_root",
+            return_value={"repo_root": "/repo/khipu", "project": "acme/khipu"},
+        ), mock.patch(
+            "khipu.activity.project_slice", side_effect=RuntimeError("hub unreachable")
+        ), mock.patch(
+            "khipu.hub_snapshot.open_snapshot", side_effect=FileNotFoundError("no snapshot")
+        ), mock.patch("khipu.query_log.log_query"), mock.patch(
+            "khipu.cli._search_query", return_value=[]
+        ), mock.patch(
+            "khipu.activity.recent_episodes",
+            return_value=[{"id": 3, "summary": "last resort episode"}],
+        ), mock.patch("khipu.db.connect"):
+            out = rr._pushed_memory_slice("/repo/khipu")
+        self.assertIn("last resort episode", out)
+
+    def test_host_session_id_used_when_no_project_resolves(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_HOST_SESSION_ID": "host-9"}), mock.patch(
+            "khipu.identity.resolve_repo_root",
+            return_value={"repo_root": None, "project": None},
+        ), mock.patch(
+            "khipu.activity.project_slice",
+            return_value={"commitments": [], "episodes": [{"id": 1, "summary": "sibling work"}], "topics": []},
+        ) as m_slice, mock.patch("khipu.cli._search_query") as m_search:
+            out = rr._pushed_memory_slice("/tmp/scratchpad")
+        m_search.assert_not_called()
+        self.assertEqual(m_slice.call_args.kwargs["host_session_id"], "claude_code:host-9")
+        self.assertIn("sibling work", out)
+
+    def test_no_project_and_no_host_id_goes_straight_to_cwd_token_search(self):
+        with mock.patch(
+            "khipu.identity.resolve_repo_root", return_value={"repo_root": None, "project": None}
+        ), mock.patch("khipu.activity.project_slice") as m_slice, mock.patch(
+            "khipu.cli._search_query", return_value=[]
+        ), mock.patch(
+            "khipu.activity.recent_episodes", return_value=[{"id": 4, "summary": "recents only"}]
+        ), mock.patch("khipu.db.connect"):
+            out = rr._pushed_memory_slice("/tmp")
+        m_slice.assert_not_called()
+        self.assertIn("recents only", out)
+
+
+class SliceBudgetTest(unittest.TestCase):
+    def test_fit_budget_drops_whole_trailing_lines_not_mid_word(self):
+        lines = ["a" * 100 for _ in range(100)]
+        out = rr._fit_budget(lines, budget=550)
+        self.assertLess(len(out), len(lines))
+        self.assertTrue(all(line == "a" * 100 for line in out))
+
+    def test_fit_budget_always_keeps_at_least_the_first_line(self):
+        lines = ["x" * 10000]
+        out = rr._fit_budget(lines, budget=10)
+        self.assertEqual(out, lines)
 
 
 if __name__ == "__main__":

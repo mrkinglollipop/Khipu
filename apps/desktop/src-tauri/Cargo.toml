@@ -1,6 +1,6 @@
 [package]
 name = "khipu"
-version = "0.3.14"
+version = "0.3.15"
 description = "Khipu — conversation memory hub desktop shell"
 authors = ["Matthew Schwartz"]
 edition = "2021"
