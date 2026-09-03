@@ -220,3 +220,25 @@ class BackfillIdentityReportTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealPathDirectoryShapesTest(unittest.TestCase):
+    """Regression: real multi-segment directories were rejected while the rule
+    only accepted an extension or a leading marker (the live fill-dir probe
+    lost its path: node). Junk shapes must still be rejected."""
+
+    def test_trailing_slash_directory_is_a_path(self):
+        from khipu.hygiene import is_real_path
+        self.assertTrue(is_real_path("sojourn/art-samples/uw-intro-acut-fill-2026-07-26/"))
+        self.assertTrue(is_real_path("sojourn_art/nephilim/klein_style_lora/corpus/nphlm_style/"))
+
+    def test_three_lowercase_segments_with_separator_is_a_path(self):
+        from khipu.hygiene import is_real_path
+        self.assertTrue(is_real_path("Code/aegis/.claude/worktrees/w59-1015-perf"))
+
+    def test_junk_shapes_still_rejected(self):
+        from khipu.hygiene import is_real_path
+        for junk in ("UI/jobs", "add/remove", "push-channel/latency", "ideas/mac-hands",
+                     "SPY/QQQ/IWM", "IC/PCS/CCS/COMBO", "60/90/120", "VoiceTyper/LazyType/dictate",
+                     "TheHindSight/biblestudy", "0.118/leg"):
+            self.assertFalse(is_real_path(junk), junk)
