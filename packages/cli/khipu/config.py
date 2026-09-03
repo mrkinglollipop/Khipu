@@ -134,6 +134,48 @@ def set_path_setting(key: str, value: str | None) -> Path:
     return save_config(data)
 
 
+# ---------------------------------------------------------------------------
+# Tunable float knobs (memory reliability W1.4 / W3.3).
+#
+# (env override, default) — same precedence as everything else here: env wins,
+# then config.json, then the default. Never hardcoded at the call site so an
+# operator can tune dedup/close aggressiveness without a code change.
+# ---------------------------------------------------------------------------
+
+FLOAT_SETTINGS: dict[str, tuple[str, float]] = {
+    # W1.4 ingest dedup: cosine (or Jaccard fallback) threshold to merge two
+    # captures in the same project within a 5-minute window.
+    "dedup_similarity": ("KHIPU_DEDUP_SIMILARITY", 0.92),
+    # W3.3 commitments auto-close: cosine threshold for a closed_loop/decision
+    # to close an open commitment in the same project.
+    "commitment_close_similarity": ("KHIPU_COMMITMENT_CLOSE_SIMILARITY", 0.85),
+}
+
+
+def float_setting(key: str) -> float:
+    if key not in FLOAT_SETTINGS:
+        raise KeyError(f"unknown float setting {key!r}; known: {sorted(FLOAT_SETTINGS)}")
+    env_name, default = FLOAT_SETTINGS[key]
+    env = (os.environ.get(env_name) or "").strip()
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    stored = load_config().get(key)
+    if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+        return float(stored)
+    return default
+
+
+def set_float_setting(key: str, value: float) -> Path:
+    if key not in FLOAT_SETTINGS:
+        raise KeyError(f"unknown float setting {key!r}; known: {sorted(FLOAT_SETTINGS)}")
+    data = load_config()
+    data[key] = float(value)
+    return save_config(data)
+
+
 def path_settings_status() -> dict:
     """Every path setting with its resolved value and where it came from."""
     out = {}

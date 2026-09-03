@@ -175,3 +175,298 @@ class TopicHashCoverageTest(unittest.TestCase):
         hashes, _ = file_topic_hashes(self.root)
         self.assertEqual(hashes["topic-007"], parse_topic_file(path)["digest"])
 
+
+# ---------------------------------------------------------------------------
+# W6.2 recall_quality() — no live DB needed, a small prefix-matching fake
+# cursor stands in (same shape as tests/test_cli_memory_reliability.py's).
+# ---------------------------------------------------------------------------
+
+class _FakeCur:
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+        self._last = None
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        self.calls.append((s, params))
+        for i, (prefix, result) in enumerate(self.script):
+            if s.startswith(prefix):
+                self._last = result
+                del self.script[i]
+                return
+        self._last = None
+
+    def fetchone(self):
+        if isinstance(self._last, dict):
+            return self._last.get("row")
+        return self._last
+
+    def fetchall(self):
+        if isinstance(self._last, dict):
+            return self._last.get("rows", [])
+        return self._last or []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeConn:
+    def __init__(self, cur):
+        self._cur = cur
+        self.committed = False
+
+    def cursor(self):
+        return self._cur
+
+    def commit(self):
+        self.committed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class RecallQualityMetricHelpersTest(unittest.TestCase):
+    def test_metric_shape(self):
+        from khipu.drift import _metric
+
+        row = _metric(0.5, 0.8, ok=True, note="n=10")
+        self.assertEqual(row, {"value": 0.5, "threshold": 0.8, "ok": True, "note": "n=10"})
+
+    def test_has_column_true(self):
+        from khipu.drift import _has_column
+
+        cur = _FakeCur([("SELECT column_name FROM information_schema.columns",
+                          {"rows": [("tags",)]})])
+        self.assertTrue(_has_column(cur, "episodes", "tags"))
+
+    def test_has_column_false_when_no_row(self):
+        from khipu.drift import _has_column
+
+        cur = _FakeCur([("SELECT column_name FROM information_schema.columns", {"rows": []})])
+        self.assertFalse(_has_column(cur, "episodes", "tags"))
+
+    def test_table_exists_true(self):
+        from khipu.drift import _table_exists
+
+        cur = _FakeCur([("SELECT to_regclass", {"row": (True,)})])
+        self.assertTrue(_table_exists(cur, "commitments"))
+
+    def test_table_exists_false(self):
+        from khipu.drift import _table_exists
+
+        cur = _FakeCur([("SELECT to_regclass", {"row": (False,)})])
+        self.assertFalse(_table_exists(cur, "commitments"))
+
+    def test_one_episode_session_ratio_computes(self):
+        from khipu.drift import _one_episode_session_ratio
+
+        cur = _FakeCur([("WITH s AS", {"row": (8, 10)})])
+        row = _one_episode_session_ratio(cur)
+        self.assertEqual(row["value"], 0.8)
+        self.assertTrue(row["ok"])  # 0.8 <= 0.85 threshold
+
+    def test_one_episode_session_ratio_no_data_is_ok(self):
+        from khipu.drift import _one_episode_session_ratio
+
+        cur = _FakeCur([("WITH s AS", {"row": (0, 0)})])
+        row = _one_episode_session_ratio(cur)
+        self.assertIsNone(row["value"])
+        self.assertTrue(row["ok"])
+
+    def test_cross_session_pairs_skips_when_columns_missing(self):
+        from khipu.drift import _cross_session_pairs_5min
+
+        cur = _FakeCur([("SELECT column_name FROM information_schema.columns", {"rows": []})])
+        row = _cross_session_pairs_5min(cur)
+        self.assertIsNone(row["value"])
+        self.assertTrue(row["ok"])
+        self.assertIn("pre-0008", row["note"])
+
+    def test_cross_session_pairs_computes_ratio_below_threshold(self):
+        from khipu.drift import _cross_session_pairs_5min
+
+        # _has_column(project) and _has_column(parent_session_id) both read
+        # episodes' columns via db.table_columns — one query, per-process
+        # cached (fix 13 consolidation), not two.
+        cur = _FakeCur([
+            ("SELECT column_name FROM information_schema.columns",
+             {"rows": [("project",), ("parent_session_id",)]}),
+            ("WITH recent AS", {"row": (1,)}),
+            ("SELECT COUNT(*) FROM episodes WHERE ts", {"row": (1000,)}),
+        ])
+        row = _cross_session_pairs_5min(cur)
+        self.assertEqual(row["value"], 1)
+        self.assertTrue(row["ok"])  # 1/1000 = 0.001 <= 0.01 threshold
+
+    def test_cross_session_pairs_over_threshold_warns(self):
+        from khipu.drift import _cross_session_pairs_5min
+
+        cur = _FakeCur([
+            ("SELECT column_name FROM information_schema.columns",
+             {"rows": [("project",), ("parent_session_id",)]}),
+            ("WITH recent AS", {"row": (50,)}),
+            ("SELECT COUNT(*) FROM episodes WHERE ts", {"row": (1000,)}),
+        ])
+        row = _cross_session_pairs_5min(cur)
+        self.assertEqual(row["value"], 50)
+        self.assertFalse(row["ok"])  # 50/1000 = 0.05 > 0.01 threshold
+
+    def test_dangling_topic_ratio_computes(self):
+        from khipu.drift import _dangling_topic_ratio
+
+        cur = _FakeCur([
+            ("SELECT column_name FROM information_schema.columns", {"rows": [("tags",)]}),
+            ("SELECT COALESCE(SUM", {"row": (2, 8)}),
+        ])
+        row = _dangling_topic_ratio(cur)
+        self.assertEqual(row["value"], 0.2)
+        self.assertFalse(row["ok"])  # 0.2 > 0.05 threshold
+
+    def test_dangling_topic_ratio_missing_column_skips(self):
+        from khipu.drift import _dangling_topic_ratio
+
+        cur = _FakeCur([("SELECT column_name FROM information_schema.columns", {"rows": []})])
+        row = _dangling_topic_ratio(cur)
+        self.assertIsNone(row["value"])
+        self.assertTrue(row["ok"])
+
+    def test_junk_path_ratio_reuses_hygiene(self):
+        from khipu.drift import _junk_path_ratio
+
+        cur = _FakeCur([("SELECT id FROM nodes WHERE type", {"rows": [("path:a/b",)]})])
+        row = _junk_path_ratio(cur)
+        self.assertEqual(row["value"], 1.0)
+        self.assertFalse(row["ok"])
+
+    def test_commitments_counts_missing_table(self):
+        from khipu.drift import _commitments_counts
+
+        cur = _FakeCur([("SELECT to_regclass", {"row": (False,)})])
+        open_m, stale_m = _commitments_counts(cur)
+        self.assertIsNone(open_m["value"])
+        self.assertIsNone(stale_m["value"])
+
+    def test_commitments_counts_present(self):
+        from khipu.drift import _commitments_counts
+
+        cur = _FakeCur([
+            ("SELECT to_regclass", {"row": (True,)}),
+            ("SELECT status, COUNT(*) FROM commitments", {"rows": [("open", 5), ("stale", 2)]}),
+        ])
+        open_m, stale_m = _commitments_counts(cur)
+        self.assertEqual(open_m["value"], 5)
+        self.assertEqual(stale_m["value"], 2)
+        self.assertTrue(stale_m["ok"])  # 2 <= max(5,1)
+
+    def test_commitments_counts_more_stale_than_open_warns(self):
+        from khipu.drift import _commitments_counts
+
+        cur = _FakeCur([
+            ("SELECT to_regclass", {"row": (True,)}),
+            ("SELECT status, COUNT(*) FROM commitments", {"rows": [("open", 1), ("stale", 9)]}),
+        ])
+        _open_m, stale_m = _commitments_counts(cur)
+        self.assertFalse(stale_m["ok"])
+
+
+class QueryLogMetricsTest(unittest.TestCase):
+    """`_query_log_window`/`_query_log_metrics` are a read-only pass over the
+    query_log.jsonl format khipu.query_log already documents — write one by
+    hand rather than depend on that module's writer."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = pathlib.Path(self.tmp.name) / "query_log.jsonl"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, rows):
+        with self.path.open("w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(__import__("json").dumps(row) + "\n")
+
+    def test_zero_result_rate_and_slice_errors(self):
+        from khipu import drift
+
+        now = datetime.now(timezone.utc)
+        self._write([
+            {"ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "hybrid", "result_count": 3},
+            {"ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "hybrid", "result_count": 0},
+            {"ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "slice", "result_count": 0},
+        ])
+        with mock.patch("khipu.query_log.log_path", return_value=self.path):
+            zero_row, slice_row = drift._query_log_metrics()
+        self.assertAlmostEqual(zero_row["value"], 2 / 3)
+        self.assertEqual(slice_row["value"], 1)
+        self.assertFalse(slice_row["ok"])
+
+    def test_old_entries_outside_window_are_excluded(self):
+        from khipu import drift
+
+        old = datetime.now(timezone.utc) - timedelta(days=60)
+        self._write([{"ts": old.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "hybrid", "result_count": 0}])
+        with mock.patch("khipu.query_log.log_path", return_value=self.path):
+            zero_row, _slice_row = drift._query_log_metrics()
+        self.assertIsNone(zero_row["value"])  # no entries in-window -> no rate
+
+    def test_missing_log_file_is_empty_not_an_error(self):
+        from khipu import drift
+
+        with mock.patch("khipu.query_log.log_path", return_value=self.path):
+            zero_row, slice_row = drift._query_log_metrics()
+        self.assertIsNone(zero_row["value"])
+        self.assertEqual(slice_row["value"], 0)
+
+
+class RecallQualityIntegrationTest(unittest.TestCase):
+    """recall_quality() opens its own connection (backup_health()'s style);
+    patch khipu.drift.connect so this exercises the real call sequence
+    end-to-end without a live database."""
+
+    def test_returns_full_block_and_never_raises(self):
+        from khipu import drift
+
+        cur = _FakeCur([
+            ("WITH s AS", {"row": (8, 10)}),
+            # cross_session_pairs_5min's _has_column(project)/_has_column(parent)
+            # and dangling_topic_ratio's _has_column(tags) all read episodes'
+            # columns via db.table_columns — one cached query per table (fix 13
+            # consolidation), so every column any check in this run needs must
+            # be in this single "episodes" row set.
+            ("SELECT column_name FROM information_schema.columns",
+             {"rows": [("project",), ("parent_session_id",), ("tags",)]}),
+            ("WITH recent AS", {"row": (0,)}),
+            ("SELECT COUNT(*) FROM episodes WHERE ts", {"row": (10,)}),
+            ("SELECT COALESCE(SUM", {"row": (1, 9)}),
+            ("SELECT id FROM nodes WHERE type", {"rows": []}),
+            ("SELECT to_regclass", {"row": (False,)}),
+        ])
+        conn = _FakeConn(cur)
+        with mock.patch("khipu.drift.connect", return_value=conn):
+            with mock.patch("khipu.query_log.log_path", return_value=pathlib.Path("/nonexistent-khipu-probe")):
+                block = drift.recall_quality(hub_snapshot={"ok": True, "behind_ingest_seconds": 5})
+        for key in (
+            "one_episode_session_ratio", "cross_session_pairs_5min",
+            "dangling_topic_ratio", "junk_path_ratio", "commitments_open",
+            "commitments_stale", "query_zero_result_rate", "slice_error_count",
+            "snapshot_behind_ingest_seconds",
+        ):
+            self.assertIn(key, block)
+        self.assertTrue(block["snapshot_behind_ingest_seconds"]["ok"])
+
+    def test_a_db_failure_reports_error_not_a_crash(self):
+        from khipu import drift
+
+        with mock.patch("khipu.drift.connect", side_effect=RuntimeError("no hub")):
+            block = drift.recall_quality()
+        self.assertIn("error", block)
+        self.assertFalse(block["one_episode_session_ratio"]["ok"])
+

@@ -130,5 +130,44 @@ class AegisCompatShimTest(unittest.TestCase):
             aegis_capture.definitely_not_a_real_name
 
 
+class FloatSettingTest(unittest.TestCase):
+    """W1.4 / W3.3 tunable knobs: env > config.json > default, same
+    precedence as capture_mode and the path settings."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="khipu-cfg-float-")
+        self._env = dict(os.environ)
+        os.environ["KHIPU_DATA_DIR"] = self.tmp
+        os.environ.pop("KHIPU_DEDUP_SIMILARITY", None)
+        os.environ.pop("KHIPU_COMMITMENT_CLOSE_SIMILARITY", None)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+
+    def test_defaults(self):
+        self.assertEqual(config.float_setting("dedup_similarity"), 0.92)
+        self.assertEqual(config.float_setting("commitment_close_similarity"), 0.85)
+
+    def test_set_persists_and_reads_back(self):
+        config.set_float_setting("dedup_similarity", 0.8)
+        self.assertEqual(config.float_setting("dedup_similarity"), 0.8)
+
+    def test_env_overrides_file(self):
+        config.set_float_setting("dedup_similarity", 0.8)
+        os.environ["KHIPU_DEDUP_SIMILARITY"] = "0.5"
+        self.assertEqual(config.float_setting("dedup_similarity"), 0.5)
+
+    def test_garbage_env_falls_back_to_file_or_default(self):
+        os.environ["KHIPU_DEDUP_SIMILARITY"] = "not-a-float"
+        self.assertEqual(config.float_setting("dedup_similarity"), 0.92)
+
+    def test_unknown_key_raises(self):
+        with self.assertRaises(KeyError):
+            config.float_setting("not_a_real_knob")
+        with self.assertRaises(KeyError):
+            config.set_float_setting("not_a_real_knob", 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()

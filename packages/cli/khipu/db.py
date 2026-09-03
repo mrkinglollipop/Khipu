@@ -94,3 +94,34 @@ def dsn_configured() -> bool:
         return True
     except RuntimeError:
         return False
+
+
+# ---- schema introspection (consolidates embed._episode_schema_flags,
+# drift._has_column, and the sqlite-replica module's column-check helper
+# into one helper) -----------------------------------------------------
+#
+# A per-process cache: schema does not change mid-process (a migration lands
+# between runs, not mid-run), and doctor/search/drift each open a fresh
+# connection per check — without this every one of them re-queries
+# information_schema for the same table.
+
+_TABLE_COLUMNS_CACHE: dict[str, set[str]] = {}
+
+
+def table_columns(cur, table: str) -> set[str]:
+    """Column names for ``table`` on THIS connection's database, cached per
+    process. Callers that need to see a just-applied migration mid-process
+    (tests, ``khipu migrate``) should clear ``db._TABLE_COLUMNS_CACHE``."""
+    if table not in _TABLE_COLUMNS_CACHE:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = %s",
+            (table,),
+        )
+        _TABLE_COLUMNS_CACHE[table] = {r[0] for r in cur.fetchall()}
+    return _TABLE_COLUMNS_CACHE[table]
+
+
+def has_columns(cur, table: str, *names: str) -> bool:
+    cols = table_columns(cur, table)
+    return all(name in cols for name in names)

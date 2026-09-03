@@ -170,6 +170,37 @@ def session_cwd(env: dict) -> str:
     return str(cwd or "")
 
 
+def parent_session_id(env: dict, osenv: dict | None = None, *, harness: str = "", sid: str = "") -> str:
+    """Lineage for a dispatched child session (W1.3). ``KHIPU_PARENT_SESSION``
+    is the primary channel and wins over everything else when set.
+
+    Verified empirically 2026-09-03: a dispatched ``claude -p`` child gets its
+    own ``CLAUDE_CODE_SESSION_ID`` but INHERITS the parent's unchanged
+    ``CLAUDE_CODE_HOST_SESSION_ID`` (plus ``CLAUDE_CODE_CHILD_SESSION=1``). So
+    for Claude Code, a present host id that differs from this session's own id
+    IS the parent lineage — no export needed. Format matches how
+    ``session_id`` is stored elsewhere (``f"{harness}:{sid}"`` in ``drain()``).
+
+    Audited the same day for Cursor/Codex/Aegis: none carries an equivalent
+    field today (Cursor: ``conversation_id`` + ``workspace_roots``, no lineage
+    id; Codex: only ``CODEX_HOME``/``CODEX_SANDBOX``, a sandbox marker not
+    lineage; Aegis: ``GROK_HOOK_NAME``/``GROK_HOOK_EVENT`` name the hook, not a
+    parent). ``KHIPU_PARENT_SESSION`` stays their only channel; a short list of
+    plausible payload field names is still checked for forward compat."""
+    osenv = os.environ if osenv is None else osenv
+    explicit = (osenv.get("KHIPU_PARENT_SESSION") or "").strip()
+    if explicit:
+        return explicit
+    host_id = (osenv.get("CLAUDE_CODE_HOST_SESSION_ID") or "").strip()
+    if host_id and host_id != sid:
+        return f"{harness or 'claude_code'}:{host_id}"
+    return str(_get(
+        env, "parentSessionId", "parent_session_id",
+        "agentSessionId", "agent_session_id", "parentId", "parent_id",
+        default="",
+    ) or "")
+
+
 def infer_harness(env: dict, osenv: dict | None = None) -> str:
     """Which harness invoked us. The hook command is identical in every harness
     (the packs re-point drifted entries to one canonical shim path), so the
@@ -894,10 +925,24 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                 timespec="seconds").replace("+00:00", "Z") if last else out["at"]
         if due:
             off_before = int(st.get("offset", 0))
-            job = {"harness": harness, "session_id": sid, "cwd": session_cwd(env), "event": event,
+            cwd = session_cwd(env)
+            # W1.2/W1.3: resolve identity from the cwd, not the model. Never
+            # raises (identity.resolve_repo_root is itself fail-open); this
+            # is the one extra bit of work the hook does before enqueueing,
+            # and it must stay cheap/sandbox-safe (only `git`, 3s timeout).
+            try:
+                from khipu.identity import resolve_repo_root
+
+                ident = resolve_repo_root(cwd)
+            except Exception:  # noqa: BLE001 — identity is best-effort, never fatal
+                ident = {"repo_root": None, "project": None, "is_worktree": False}
+            job = {"harness": harness, "session_id": sid, "cwd": cwd, "event": event,
                    "ts": _mint_ts(), "turns": turns, "transcript": text,
                    "transcript_path": str(path), "offset_before": off_before,
-                   "offset_after": new_off}
+                   "offset_after": new_off,
+                   "repo_root": ident.get("repo_root"), "project": ident.get("project"),
+                   "parent_session_id": parent_session_id(env, harness=harness, sid=sid) or None,
+                   "transcript_range": f"{off_before}:{new_off}"}
             p = enqueue(job)
             # Advance only after the job is on disk: a crash between the two
             # re-queues the same window (dedup at drain) rather than losing it.
@@ -979,6 +1024,19 @@ def drain(*, limit: int | None = None, dry_run: bool = False) -> dict:
         payload["scope"] = payload.get("scope") or f"{harness} {job.get('event')}"
         # The session's own time, not the drain's — a job may sit queued for hours.
         payload["ts"] = job.get("ts") or _mint_ts()
+        # W1.3: identity resolved in-hook rides straight through to capture —
+        # this is a legacy-payload-shaped job too (older queued jobs before
+        # this field existed simply carry None here, same as any harness that
+        # never resolves identity).
+        payload["harness"] = harness
+        payload["repo_root"] = job.get("repo_root")
+        payload["project"] = job.get("project")
+        payload["parent_session_id"] = job.get("parent_session_id")
+        payload["transcript_range"] = job.get("transcript_range") or (
+            f"{job.get('offset_before')}:{job.get('offset_after')}"
+            if job.get("offset_before") is not None and job.get("offset_after") is not None
+            else None
+        )
         if dry_run:
             print(json.dumps(payload, indent=2))
             out["captured"] += 1

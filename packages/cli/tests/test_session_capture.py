@@ -205,6 +205,120 @@ class CadenceTest(unittest.TestCase):
             self.assertEqual(len(sc.queued_jobs()), 1)
 
 
+class IdentityOnJobTest(unittest.TestCase):
+    """W1.2/W1.3: the hook resolves repo_root/project from cwd (via
+    khipu.identity) and carries lineage + the exact transcript window onto
+    the queued job — not left to the model."""
+
+    def test_job_carries_repo_root_project_and_transcript_range(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "remote", "add", "origin",
+                             "git@github.com:acme/widget.git"], cwd=repo, check=True)
+            tp = _write(repo / "t.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": "q " + "x" * 300}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "a " + "y" * 60}}])
+            env = {"hook_event_name": "SessionEnd", "session_id": "s3", "cwd": str(repo),
+                   "transcript_path": str(tp)}
+            out = sc.hook_main(json.dumps(env))
+            self.assertTrue(out["due"], out)
+            job = json.loads(sc.queued_jobs()[0].read_text())
+            self.assertEqual(job["repo_root"], str(repo.resolve()))
+            self.assertEqual(job["project"], "acme/widget")
+            self.assertEqual(job["transcript_range"], f"{job['offset_before']}:{job['offset_after']}")
+
+    def test_job_identity_is_none_for_a_non_git_cwd(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            tp = _write(Path(td) / "notrepo" / "t.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": "q " + "x" * 300}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "a " + "y" * 60}}])
+            env = {"hook_event_name": "SessionEnd", "session_id": "s4",
+                   "cwd": str(Path(td) / "notrepo"), "transcript_path": str(tp)}
+            out = sc.hook_main(json.dumps(env))
+            self.assertTrue(out["due"], out)
+            job = json.loads(sc.queued_jobs()[0].read_text())
+            self.assertIsNone(job["repo_root"])
+            self.assertIsNone(job["project"])
+
+    def test_parent_session_id_from_env_rides_onto_the_job(self):
+        with tempfile.TemporaryDirectory() as td, _home(td), \
+                mock.patch.dict(os.environ, {"KHIPU_PARENT_SESSION": "claude_code:parent-abc"}):
+            tp = _write(Path(td) / "notrepo" / "t.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": "q " + "x" * 300}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "a " + "y" * 60}}])
+            env = {"hook_event_name": "SessionEnd", "session_id": "s5",
+                   "cwd": str(Path(td) / "notrepo"), "transcript_path": str(tp)}
+            sc.hook_main(json.dumps(env))
+            job = json.loads(sc.queued_jobs()[0].read_text())
+            self.assertEqual(job["parent_session_id"], "claude_code:parent-abc")
+
+    def test_no_parent_session_id_means_none_not_empty_string(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            tp = _write(Path(td) / "notrepo" / "t.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": "q " + "x" * 300}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "a " + "y" * 60}}])
+            env = {"hook_event_name": "SessionEnd", "session_id": "s6",
+                   "cwd": str(Path(td) / "notrepo"), "transcript_path": str(tp)}
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("KHIPU_PARENT_SESSION", None)
+                os.environ.pop("CLAUDE_CODE_HOST_SESSION_ID", None)
+                sc.hook_main(json.dumps(env))
+            job = json.loads(sc.queued_jobs()[0].read_text())
+            self.assertIsNone(job["parent_session_id"])
+
+    def test_claude_code_host_session_id_becomes_parent_lineage(self):
+        """A dispatched `claude -p` child (verified 2026-09-03): its own
+        session id differs from CLAUDE_CODE_HOST_SESSION_ID, which it inherits
+        unchanged from the parent — that inherited host id IS the lineage,
+        formatted like session_id itself (`harness:id`) for later comparison."""
+        with tempfile.TemporaryDirectory() as td, _home(td), mock.patch.dict(
+            os.environ,
+            {"CLAUDE_CODE_HOST_SESSION_ID": "host-parent-1", "CLAUDE_CODE_CHILD_SESSION": "1"},
+        ):
+            os.environ.pop("KHIPU_PARENT_SESSION", None)
+            tp = _write(Path(td) / "notrepo" / "t.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": "q " + "x" * 300}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "a " + "y" * 60}}])
+            env = {"hook_event_name": "SessionEnd", "session_id": "child-2",
+                   "cwd": str(Path(td) / "notrepo"), "transcript_path": str(tp)}
+            sc.hook_main(json.dumps(env), harness="claude_code")
+            job = json.loads(sc.queued_jobs()[0].read_text())
+            self.assertEqual(job["parent_session_id"], "claude_code:host-parent-1")
+
+    def test_host_session_id_ignored_when_it_equals_this_sessions_own_id(self):
+        """A non-dispatched session also carries CLAUDE_CODE_HOST_SESSION_ID
+        (it IS the host), equal to its own session id — that must not read as
+        being its own parent."""
+        with tempfile.TemporaryDirectory() as td, _home(td), mock.patch.dict(
+            os.environ, {"CLAUDE_CODE_HOST_SESSION_ID": "s7"}
+        ):
+            os.environ.pop("KHIPU_PARENT_SESSION", None)
+            tp = _write(Path(td) / "notrepo" / "t.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": "q " + "x" * 300}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "a " + "y" * 60}}])
+            env = {"hook_event_name": "SessionEnd", "session_id": "s7",
+                   "cwd": str(Path(td) / "notrepo"), "transcript_path": str(tp)}
+            sc.hook_main(json.dumps(env), harness="claude_code")
+            job = json.loads(sc.queued_jobs()[0].read_text())
+            self.assertIsNone(job["parent_session_id"])
+
+    def test_khipu_parent_session_wins_over_host_session_id(self):
+        with tempfile.TemporaryDirectory() as td, _home(td), mock.patch.dict(
+            os.environ,
+            {"CLAUDE_CODE_HOST_SESSION_ID": "host-x", "KHIPU_PARENT_SESSION": "explicit:override"},
+        ):
+            tp = _write(Path(td) / "notrepo" / "t.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": "q " + "x" * 300}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "a " + "y" * 60}}])
+            env = {"hook_event_name": "SessionEnd", "session_id": "s8",
+                   "cwd": str(Path(td) / "notrepo"), "transcript_path": str(tp)}
+            sc.hook_main(json.dumps(env), harness="claude_code")
+            job = json.loads(sc.queued_jobs()[0].read_text())
+            self.assertEqual(job["parent_session_id"], "explicit:override")
+
+
 class LivenessTest(unittest.TestCase):
     def _beat(self, harness, **kw):
         sc._write_beat(harness, {"harness": harness, "at": sc._mint_ts(), **kw})

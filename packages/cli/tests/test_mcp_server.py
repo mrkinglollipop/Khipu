@@ -91,6 +91,7 @@ class ProtocolTest(unittest.TestCase):
                 "khipu_graph",
                 "khipu_status",
                 "khipu_capture",
+                "khipu_owed",
             },
         )
         for tool in out["result"]["tools"]:
@@ -202,6 +203,44 @@ class CaptureRejectionTest(unittest.TestCase):
         )
         self.assertTrue(out["result"]["isError"])
 
+    def test_bad_mode_is_a_tool_error(self):
+        out = handle_message(
+            _req(
+                11,
+                "tools/call",
+                {"name": "khipu_search", "arguments": {"query": "x", "mode": "bogus"}},
+            )
+        )
+        self.assertTrue(out["result"]["isError"])
+        body = json.loads(out["result"]["content"][0]["text"])
+        self.assertIn("mode", body["error"])
+
+    def test_kind_node_rejected_for_semantic_mode(self):
+        out = handle_message(
+            _req(
+                12,
+                "tools/call",
+                {
+                    "name": "khipu_search",
+                    "arguments": {"query": "x", "mode": "semantic", "kind": "node"},
+                },
+            )
+        )
+        self.assertTrue(out["result"]["isError"])
+
+    def test_kind_media_rejected_for_hybrid_mode(self):
+        out = handle_message(
+            _req(
+                13,
+                "tools/call",
+                {
+                    "name": "khipu_search",
+                    "arguments": {"query": "x", "mode": "hybrid", "kind": "media"},
+                },
+            )
+        )
+        self.assertTrue(out["result"]["isError"])
+
 
 class LocalCaptureHookWriterTest(unittest.TestCase):
     """``_local_capture_hook_is_writer`` itself — not routed through capture()."""
@@ -284,8 +323,60 @@ class LiveToolTest(unittest.TestCase):
         self.assertFalse(out["result"]["isError"])
         body = json.loads(out["result"]["content"][0]["text"])
         self.assertEqual(body["query"], "khipu")
+        self.assertEqual(body["mode"], "hybrid")
         for row in body["results"]:
             self.assertIn(row["kind"], {"topic", "episode", "node"})
+
+    def test_kind_topic_returns_only_topics(self):
+        out = handle_message(
+            _req(
+                22,
+                "tools/call",
+                {"name": "khipu_search", "arguments": {"query": "khipu", "kind": "topic", "limit": 6}},
+            )
+        )
+        self.assertFalse(out["result"]["isError"])
+        body = json.loads(out["result"]["content"][0]["text"])
+        self.assertTrue(all(r["kind"] == "topic" for r in body["results"]))
+
+    def test_since_filter_excludes_old_rows(self):
+        out = handle_message(
+            _req(
+                23,
+                "tools/call",
+                {
+                    "name": "khipu_search",
+                    "arguments": {"query": "khipu", "since": "7d", "kind": "episode", "limit": 8},
+                },
+            )
+        )
+        self.assertFalse(out["result"]["isError"])
+        body = json.loads(out["result"]["content"][0]["text"])
+        # every episode returned must be a live PG row; verify none predate 7d.
+        from khipu.db import connect
+
+        ids = [int(r["id"]) for r in body["results"]]
+        if not ids:
+            self.skipTest("no episode hits for 'khipu' to check dates against")
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM episodes WHERE id = ANY(%s) AND ts < now() - interval '7 days'",
+                    (ids,),
+                )
+                stale = cur.fetchall()
+        self.assertEqual(stale, [])
+
+    def test_search_logs_to_query_log(self):
+        from khipu import query_log
+
+        with mock.patch.object(query_log, "log_query") as logged:
+            out = handle_message(
+                _req(24, "tools/call", {"name": "khipu_search", "arguments": {"query": "khipu"}})
+            )
+        self.assertFalse(out["result"]["isError"])
+        logged.assert_called_once()
+        self.assertEqual(logged.call_args.kwargs.get("mode"), "hybrid")
 
     def test_status_counts(self):
         out = handle_message(
@@ -358,6 +449,35 @@ class StdioEndToEndTest(unittest.TestCase):
         names = {t["name"] for t in responses[1]["result"]["tools"]}
         self.assertIn("khipu_search", names)
         self.assertIn("khipu_get", names)
+
+
+class SearchStaleFallbackForwardingTest(unittest.TestCase):
+    """fix 7: khipu_search's hub-unreachable fallback must forward project/
+    session_id/harness to search_stale_payload — before this fix they were
+    silently dropped the moment the hub went down."""
+
+    def test_forwards_project_session_id_harness_to_the_snapshot_fallback(self):
+        from khipu import mcp_server as srv
+
+        captured = {}
+
+        def fake_stale(query, limit, *, semantic, kind, since, until,
+                        project, session_id, harness):
+            captured.update(project=project, session_id=session_id, harness=harness)
+            return {"query": query, "mode": "literal", "results": [], "filters_dropped": []}
+
+        with mock.patch("khipu.embed.hybrid_search",
+                         side_effect=RuntimeError("connection refused")), \
+                mock.patch("khipu.hub_snapshot.hub_connection_failed", return_value=True), \
+                mock.patch("khipu.hub_snapshot.search_stale_payload", fake_stale):
+            out = srv._tool_search({
+                "query": "khipu", "project": "acme/widget",
+                "session_id": "claude_code:host-1", "harness": "claude_code",
+            })
+        self.assertEqual(captured["project"], "acme/widget")
+        self.assertEqual(captured["session_id"], "claude_code:host-1")
+        self.assertEqual(captured["harness"], "claude_code")
+        self.assertEqual(out["results"], [])
 
 
 if __name__ == "__main__":

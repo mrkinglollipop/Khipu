@@ -128,16 +128,26 @@ TOOLS: list[dict] = [
     {
         "name": "khipu_search",
         "description": (
-            "Search Khipu memory. Default: per-kind-fair ILIKE ranked by how "
-            "many query tokens match (not the whole phrase as one substring) "
-            "over topics/episodes (summary + extract fields)/graph nodes. "
-            "semantic=true: cosine oversample fused with token overlap (RRF) "
-            "over the embedded text (not the teaser) on the active profile "
-            "(episodes + topics + media), with a score. Returns "
-            "JSON rows of {kind, id, label, snippet[, score]} plus additive "
-            "paths (filesystem tokens) and neighbors (capped 1-hop wiki/path "
-            "edges) on topic hits. Tombstoned topics are excluded. Snippets "
-            "are word-boundary teasers; call khipu_get for the full row."
+            "Search Khipu memory. Default mode='hybrid': cosine similarity + "
+            "token overlap (over the embedded text) + literal substring match, "
+            "fused by reciprocal-rank fusion and ranked by score; per-kind "
+            "fairness only backfills the tail if a kind is entirely absent from "
+            "the top results. Graph nodes are excluded from hybrid/literal "
+            "results unless kind='node' or the query looks id-shaped (contains "
+            "':' or '__'). If no embedding profile is active, hybrid degrades to "
+            "literal + token overlap only and the payload carries "
+            "degraded='no-embedding'. mode='literal' is the old ILIKE-only "
+            "behaviour — use it for exact strings, ids, hashes, or error text. "
+            "mode='semantic' (same as the legacy semantic=true) is cosine + "
+            "token-overlap only, no literal list. Filters apply on every mode: "
+            "kind (episode/topic/node, or episode/topic/media for semantic), "
+            "project (matches episode project or scope), since/until (ISO date "
+            "or relative like '7d'/'24h'), session_id (prefix match), harness "
+            "(prefix of session_id before the colon). Returns JSON rows of "
+            "{kind, id, label, snippet, score} plus additive paths (filesystem "
+            "tokens) and neighbors (capped 1-hop wiki/path edges) on topic "
+            "hits. Tombstoned topics are excluded. Snippets are word-boundary "
+            "teasers; call khipu_get for the full row."
         ),
         "inputSchema": {
             "type": "object",
@@ -153,18 +163,44 @@ TOOLS: list[dict] = [
                         f"cap {SEARCH_LIMIT_MAX}"
                     ),
                 },
+                "mode": {
+                    "type": "string",
+                    "description": (
+                        "'hybrid' (default), 'literal', or 'semantic'. Omit to get hybrid."
+                    ),
+                },
                 "semantic": {
                     "type": "boolean",
                     "description": (
-                        "Cosine fused with query-term overlap instead of ILIKE "
-                        "(default false)"
+                        "Deprecated alias for mode='semantic' (default false)"
                     ),
                 },
                 "kind": {
                     "type": "string",
                     "description": (
-                        "Semantic only: restrict to 'episode', 'topic', or 'media'"
+                        "hybrid/literal: 'episode', 'topic', or 'node'. "
+                        "semantic: 'episode', 'topic', or 'media'."
                     ),
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Match episode project (or scope, before migration 0008)",
+                },
+                "since": {
+                    "type": "string",
+                    "description": "ISO date/datetime or relative, e.g. '7d', '24h'",
+                },
+                "until": {
+                    "type": "string",
+                    "description": "ISO date/datetime or relative, e.g. '7d', '24h'",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Episode session_id prefix match",
+                },
+                "harness": {
+                    "type": "string",
+                    "description": "Prefix of session_id before the colon, e.g. 'claude_code'",
                 },
             },
             "required": ["query"],
@@ -271,8 +307,38 @@ TOOLS: list[dict] = [
                     "description": "general | trivial (trivial is skipped per protocol)",
                 },
                 "session_id": {"type": "string"},
+                "project": {
+                    "type": "string",
+                    "description": (
+                        "Stable project identity (e.g. 'owner/repo'). No local hook can "
+                        "resolve this for a gateway/cloud caller, so pass it explicitly "
+                        "when known — it is what W1/W4 key identity, dedup and the pushed "
+                        "slice off of. Omit only when there truly is no repo context."
+                    ),
+                },
             },
             "required": ["summary"],
+        },
+    },
+    {
+        "name": "khipu_owed",
+        "description": (
+            "List open (or closed/stale) commitments — followups, blockers, "
+            "questions, promises captured as open_loops and not yet closed by "
+            "a matching closed_loop/decision. Call this at session start for "
+            "a harness with no pushed slice (Aegis), or whenever 'what do I "
+            "still owe on this project' would change the answer."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Filter to one project"},
+                "status": {
+                    "type": "string",
+                    "description": "open (default) | closed | stale",
+                },
+                "limit": {"type": "integer", "description": "Default 50"},
+            },
         },
     },
 ]
@@ -284,43 +350,46 @@ def _tool_search(args: dict) -> dict:
         raise ValueError("query is required")
     limit = min(int(args.get("limit") or SEARCH_LIMIT_DEFAULT), SEARCH_LIMIT_MAX)
     _ensure_path()
-    from khipu.hub_snapshot import (
-        hub_connection_failed,
-        search_stale_payload,
-        try_hub_connect,
-    )
-    from khipu.topic_graph import enrich_search_results
+    from khipu import query_log
+    from khipu.hub_snapshot import hub_connection_failed, search_stale_payload
 
-    semantic = bool(args.get("semantic"))
+    mode = (args.get("mode") or "").strip().lower() or None
+    if not mode:
+        mode = "semantic" if bool(args.get("semantic")) else "hybrid"
+    if mode not in ("hybrid", "literal", "semantic"):
+        raise ValueError("mode must be 'hybrid', 'literal', or 'semantic'")
     kind = args.get("kind") or None
-    if kind not in (None, "episode", "topic", "media"):
-        raise ValueError("kind must be 'episode', 'topic', or 'media'")
+    allowed_kinds = ("episode", "topic", "media") if mode == "semantic" else ("episode", "topic", "node")
+    if kind not in (None, *allowed_kinds):
+        raise ValueError(f"kind must be one of {allowed_kinds}")
+    project = args.get("project") or None
+    since = args.get("since") or None
+    until = args.get("until") or None
+    session_id = args.get("session_id") or None
+    harness = args.get("harness") or None
+
     try:
-        if semantic:
-            from khipu.embed import semantic_search
+        from khipu.embed import hybrid_search
 
-            results = semantic_search(query, limit=max(1, limit), kind=kind)
-            with try_hub_connect() as conn:
-                with conn.cursor() as cur:
-                    results = enrich_search_results(cur, results)
-            return {"query": query, "mode": "semantic", "results": results}
-        from khipu.cli import _search_query
-
-        with try_hub_connect() as conn:
-            with conn.cursor() as cur:
-                return {
-                    "query": query,
-                    "mode": "ilike",
-                    "results": enrich_search_results(
-                        cur, _search_query(cur, query, max(1, limit))
-                    ),
-                }
+        payload = hybrid_search(
+            query, limit=max(1, limit), mode=mode, kind=kind, project=project,
+            since=since, until=until, session_id=session_id, harness=harness,
+        )
     except Exception as exc:
         if not hub_connection_failed(exc):
             raise
-        if semantic:
-            return search_stale_payload(query, max(1, limit), semantic=True, kind=kind)
-        return search_stale_payload(query, max(1, limit))
+        payload = search_stale_payload(
+            query, max(1, limit), semantic=(mode == "semantic"), kind=kind,
+            since=since, until=until, project=project, session_id=session_id,
+            harness=harness,
+        )
+    query_log.log_query(
+        query, mode=mode,
+        filters={"kind": kind, "project": project, "since": since, "until": until,
+                 "session_id": session_id, "harness": harness},
+        result_count=len(payload.get("results") or []), top=payload.get("results") or [],
+    )
+    return payload
 
 
 def _tool_get(args: dict) -> dict:
@@ -428,7 +497,7 @@ def _tool_status(args: dict) -> dict:
     from khipu.drift import status_payload
     from khipu.hub_snapshot import (
         hub_connection_failed,
-        snapshot_health,
+        snapshot_freshness,
         status_payload_snapshot,
     )
 
@@ -437,7 +506,8 @@ def _tool_status(args: dict) -> dict:
             payload = status_payload(_default_memory_root(), include_drift=True)
         else:
             payload = status_payload(None)
-        payload["hub_snapshot"] = snapshot_health()
+        # W2.4: behind_ingest_seconds only means something while PG answers.
+        payload["hub_snapshot"] = snapshot_freshness(payload.get("latest_ingested_at"))
         return payload
     except Exception as exc:
         if not hub_connection_failed(exc):
@@ -481,12 +551,33 @@ def _tool_capture(args: dict) -> dict:
     return {"ok": True, "mode": mode, "ts": payload["ts"]}
 
 
+def _tool_owed(args: dict) -> dict:
+    """W3.4: list commitments. Read-only; goes straight at the hub (no
+    snapshot fallback yet — commitments are new and small, same posture as
+    khipu_capture rather than the read tools' stale-snapshot degrade)."""
+    status = (args.get("status") or "open").strip().lower()
+    if status not in ("open", "closed", "stale"):
+        raise ValueError("status must be 'open', 'closed', or 'stale'")
+    limit = min(max(1, int(args.get("limit") or 50)), 200)
+    _ensure_path()
+    from khipu import commitments
+    from khipu.db import connect
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            rows = commitments.list_owed(
+                cur, project=args.get("project") or None, status=status, limit=limit
+            )
+    return {"status": status, "project": args.get("project") or None, "results": rows}
+
+
 TOOL_FUNCS = {
     "khipu_search": _tool_search,
     "khipu_get": _tool_get,
     "khipu_graph": _tool_graph,
     "khipu_status": _tool_status,
     "khipu_capture": _tool_capture,
+    "khipu_owed": _tool_owed,
 }
 
 

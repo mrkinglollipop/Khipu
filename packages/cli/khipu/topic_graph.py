@@ -198,8 +198,11 @@ def _path_node_id(rel: str) -> str:
     return PATH_PREFIX + rel.rstrip("/")
 
 
-def persist_topic_graph(cur, parsed: Mapping[str, Any], *, dry_run: bool = False) -> dict[str, int]:
+def persist_topic_graph(
+    cur, parsed: Mapping[str, Any], *, dry_run: bool = False, repo_root: str | None = None
+) -> dict[str, int]:
     """Mint ``topic:`` / ``path:`` nodes and wiki_link / lives_in edges. Never graphify ids."""
+    from khipu.hygiene import filter_real_paths
     from khipu.sources import conversation_memory_enabled
 
     stats = {"nodes_minted": 0, "edges_minted": 0}
@@ -211,7 +214,10 @@ def persist_topic_graph(cur, parsed: Mapping[str, Any], *, dry_run: bool = False
     topic_id = f"{TOPIC_PREFIX}{slug}"
     assert_mintable_id(topic_id)
     links = [str(x) for x in (parsed.get("links") or []) if str(x).strip()]
-    paths = extract_paths(str(parsed.get("body") or ""))
+    # W5.2: a path: node needs a real path shape (extension, leading /~./,
+    # or exists under repo_root) — 73% of existing path: nodes fail this
+    # (measured 2026-09-03: `a/b`-shaped tokens with no extension or marker).
+    paths = filter_real_paths(extract_paths(str(parsed.get("body") or "")), repo_root=repo_root)
     now = datetime.now(timezone.utc).isoformat()
     wanted_nodes: list[tuple[str, str, str]] = [
         (topic_id, "topic", str(parsed.get("title") or slug)),
@@ -366,18 +372,35 @@ def persist_capture_graph(cur, payload: Mapping[str, Any]) -> dict[str, int]:
     """Mint topic:/path: wiki from a capture payload (no topic markdown file).
 
     Cloud hub captures never see the file wiki, so this is how an episode's
-    ``topics`` array becomes a graph neighborhood.
+    ``topics`` array becomes a graph neighborhood. ``hygiene.classify_topics``
+    runs HERE (fix 11 — the mint point, not just the caller) so every writer
+    that reaches this function goes through the same noise filter: the hub
+    path (``capture.write_pg``, which also pre-classifies for its own tags/
+    episode-row columns — re-running here on an already-resolved list is
+    idempotent) AND the legacy mirror path (``mirror.mirror_episode``, which
+    never classified at all before this fix). Degrades to "keep every
+    non-noise slug" on any classification failure — never drops a topic
+    silently.
     """
-    slugs: list[str] = []
+    from khipu import hygiene
+
+    raw_slugs: list[str] = []
     for item in payload.get("topics") or []:
         slug = topic_slug_from_label(str(item))
-        if slug and slug not in slugs:
-            slugs.append(slug)
-        if len(slugs) >= 8:
+        if slug and slug not in raw_slugs:
+            raw_slugs.append(slug)
+        if len(raw_slugs) >= 8:
             break
+    if not raw_slugs:
+        return {"nodes_minted": 0, "edges_minted": 0}
+    try:
+        slugs, _tags, _unresolved = hygiene.classify_topics(cur, raw_slugs)
+    except Exception:  # noqa: BLE001 — degrade to unfiltered rather than mint nothing
+        slugs = raw_slugs
     if not slugs:
         return {"nodes_minted": 0, "edges_minted": 0}
     body = str(payload.get("summary") or "")
+    repo_root = payload.get("repo_root")
     hub = slugs[0]
     totals = {"nodes_minted": 0, "edges_minted": 0}
     for slug in slugs:
@@ -387,6 +410,7 @@ def persist_capture_graph(cur, payload: Mapping[str, Any]) -> dict[str, int]:
             cur,
             {"slug": slug, "title": slug, "links": links, "body": body},
             dry_run=False,
+            repo_root=repo_root,
         )
         totals["nodes_minted"] += stats["nodes_minted"]
         totals["edges_minted"] += stats["edges_minted"]

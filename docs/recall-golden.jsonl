@@ -1,0 +1,8 @@
+{"query": "mobile oracle follow-up W131", "mode": "hybrid", "expect": ["11287", "11286"], "k": 3, "note": "2026-09-03 recall-reliability evidence: the origin follow-up the whole W1-W6 scope was built to fix"}
+{"query": "Recorded mobile followup task", "mode": "hybrid", "expect": ["11286"], "k": 3, "note": "2026-09-03 evidence, second phrasing of the same follow-up"}
+{"query": "merged is not deployed gateway app opt alzy bin", "mode": "hybrid", "expect": ["8658", "8657"], "k": 3, "note": "2026-09-03 evidence: gateway/app/opt-alzy-bin each need their own deploy"}
+{"query": "khipu doctor fully green bare shell app bundle", "mode": "hybrid", "expect": ["9601"], "k": 3, "note": "2026-09-03 evidence; known gap as of W6 build — does not hit top-3 in default hybrid mode yet (recorded so eval measures the real baseline, not a cherry-picked one)"}
+{"query": "independent crypto review PR 860 commit", "mode": "hybrid", "expect": ["11276"], "k": 3, "note": "derived read-only 2026-09-03: distinctive PR + commit phrasing"}
+{"query": "W128 finisher agent parallel bug fix", "mode": "hybrid", "expect": ["11279"], "k": 3, "note": "derived read-only 2026-09-03: distinctive workstream-id phrasing"}
+{"query": "Frontline Plus rashana-1 55.99 9.33 dogs excluded no-EPA sold searches sign-in walled", "mode": "hybrid", "expect": ["11273"], "k": 3, "note": "derived read-only 2026-09-03: distinctive price/listing detail among many similar recurring watch episodes"}
+{"query": "PR 866 PR 867 Expo app reducer scaffold live relay health check blocker", "mode": "hybrid", "expect": ["11297"], "k": 3, "note": "derived read-only 2026-09-03: distinctive PR-number phrasing"}

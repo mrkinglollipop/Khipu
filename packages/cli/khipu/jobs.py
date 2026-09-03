@@ -228,9 +228,31 @@ def _run_script(
 
 
 def run_nightly() -> int:
-    return _run_script(
+    rc = _run_script(
         CONSOLIDATE_NIGHTLY, log_stem="khipu-nightly", state_name="nightly"
     )
+    _reconcile_notes_if_due()
+    return rc
+
+
+def _reconcile_notes_if_due() -> None:
+    """W4.3: piggyback `khipu.notes.reconcile` on the nightly cadence, the
+    same posture as `_offsite_if_due` on the graph job — additive,
+    best-effort, and must never turn a good nightly run into a bad one on
+    doctor/status (the external CONSOLIDATE_NIGHTLY driver's exit code above
+    is the one that actually gates job_status/doctor)."""
+    try:
+        from khipu import notes
+
+        out = notes.reconcile(dry_run=False)
+    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
+        out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+    try:
+        out_log, _ = _log_paths("khipu-nightly")
+        with open(out_log, "ab") as f:
+            f.write(f"notes-reconcile: {json.dumps(out, default=str)[:600]}\n".encode())
+    except OSError:
+        pass
 
 
 def run_monthly(*, dry_run: bool = False) -> int:

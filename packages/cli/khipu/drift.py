@@ -382,6 +382,263 @@ def status_payload(
     return out
 
 
+# ---------------------------------------------------------------------------
+# W6.2 — recall-quality metrics (memory reliability, 2026-09-03). Bounded SQL
+# over the last 30 days, surfaced in `khipu status`/`khipu doctor` as a
+# `recall_quality` block. Every metric carries its own {value, threshold, ok}
+# so a caller can see at a glance which of the six root-cause shapes (A-F in
+# the scope doc) is currently trending wrong — but per the scope, only the
+# probe (W6.1) and snapshot freshness are hard gates on doctor's overall ok;
+# these ratios are surfaced and warned on, never gate the exit code.
+# ---------------------------------------------------------------------------
+
+RECALL_QUALITY_WINDOW_DAYS = 30
+
+
+def _metric(value, threshold, *, ok: bool, note: str = "") -> dict:
+    """One {value, threshold, ok} metric row. `ok` is computed by the caller
+    (direction — lte vs gte — differs per metric) so this is just the shape."""
+    out = {"value": value, "threshold": threshold, "ok": ok}
+    if note:
+        out["note"] = note
+    return out
+
+
+def _has_column(cur, table: str, column: str) -> bool:
+    """Consolidated onto ``db.table_columns`` (shares the process cache and
+    the information_schema round trip with embed/hub_snapshot)."""
+    try:
+        from khipu.db import has_columns
+
+        return has_columns(cur, table, column)
+    except Exception:  # noqa: BLE001 — a failed introspection reads as "not there yet"
+        return False
+
+
+def _table_exists(cur, table: str) -> bool:
+    try:
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"public.{table}",))
+        return bool(cur.fetchone()[0])
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _one_episode_session_ratio(cur) -> dict:
+    cur.execute(
+        """
+        WITH s AS (
+            SELECT session_id, COUNT(*) AS n
+            FROM episodes
+            WHERE ts >= now() - interval '%s days' AND session_id IS NOT NULL
+            GROUP BY session_id
+        )
+        SELECT COUNT(*) FILTER (WHERE n = 1), COUNT(*) FROM s
+        """
+        % RECALL_QUALITY_WINDOW_DAYS
+    )
+    one, total = cur.fetchone()
+    ratio = (one / total) if total else None
+    threshold = 0.85
+    ok = ratio is None or ratio <= threshold
+    return _metric(ratio, threshold, ok=ok,
+                    note=f"sessions_with_one_episode={one} sessions_total={total}")
+
+
+def _cross_session_pairs_5min(cur) -> dict:
+    has_project = _has_column(cur, "episodes", "project")
+    has_parent = _has_column(cur, "episodes", "parent_session_id")
+    if not (has_project and has_parent):
+        return _metric(None, 0.01, ok=True,
+                        note="episodes.project/parent_session_id not present yet (pre-0008)")
+    cur.execute(
+        """
+        WITH recent AS (
+            SELECT id, session_id, ts, project, parent_session_id
+            FROM episodes
+            WHERE ts >= now() - interval '%s days'
+        )
+        SELECT COUNT(*)
+        FROM recent a
+        JOIN recent b
+          ON a.id < b.id
+         AND a.session_id IS DISTINCT FROM b.session_id
+         AND abs(extract(epoch FROM (a.ts - b.ts))) <= 300
+        WHERE NOT (a.project IS NOT NULL AND a.project = b.project)
+          AND NOT (a.parent_session_id IS NOT NULL AND a.parent_session_id = b.session_id)
+          AND NOT (b.parent_session_id IS NOT NULL AND b.parent_session_id = a.session_id)
+          AND NOT (a.parent_session_id IS NOT NULL AND a.parent_session_id = b.parent_session_id)
+        """
+        % RECALL_QUALITY_WINDOW_DAYS
+    )
+    pairs = int(cur.fetchone()[0])
+    cur.execute(
+        "SELECT COUNT(*) FROM episodes WHERE ts >= now() - interval '%s days'"
+        % RECALL_QUALITY_WINDOW_DAYS
+    )
+    episodes_n = int(cur.fetchone()[0])
+    ratio = (pairs / episodes_n) if episodes_n else None
+    threshold = 0.01
+    ok = ratio is None or ratio <= threshold
+    return _metric(pairs, threshold, ok=ok,
+                    note=f"ratio={round(ratio, 4) if ratio is not None else None} episodes={episodes_n}")
+
+
+def _dangling_topic_ratio(cur) -> dict:
+    if not _has_column(cur, "episodes", "tags"):
+        return _metric(None, 0.05, ok=True, note="episodes.tags not present yet (pre-0010)")
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(jsonb_array_length(COALESCE(tags, '[]'::jsonb))), 0),
+               COALESCE(SUM(jsonb_array_length(COALESCE(topics, '[]'::jsonb))), 0)
+        FROM episodes
+        WHERE ts >= now() - interval '%s days'
+        """
+        % RECALL_QUALITY_WINDOW_DAYS
+    )
+    tag_n, topic_n = (int(x) for x in cur.fetchone())
+    denom = tag_n + topic_n
+    ratio = (tag_n / denom) if denom else None
+    threshold = 0.05
+    ok = ratio is None or ratio <= threshold
+    return _metric(ratio, threshold, ok=ok, note=f"tags={tag_n} topics={topic_n}")
+
+
+def _junk_path_ratio(cur) -> dict:
+    from khipu import hygiene
+
+    report = hygiene.report_junk_paths(cur, sample_limit=0)
+    total = report.get("total_path_nodes", 0)
+    failing = report.get("failing", 0)
+    ratio = (failing / total) if total else None
+    threshold = 0.05
+    ok = ratio is None or ratio <= threshold
+    return _metric(ratio, threshold, ok=ok, note=f"failing={failing} total={total}")
+
+
+def _commitments_counts(cur) -> tuple[dict, dict]:
+    if not _table_exists(cur, "commitments"):
+        na = _metric(None, None, ok=True, note="commitments table not present yet (pre-0009)")
+        return na, na
+    cur.execute("SELECT status, COUNT(*) FROM commitments GROUP BY status")
+    counts = {status: int(n) for status, n in cur.fetchall()}
+    open_n = counts.get("open", 0)
+    stale_n = counts.get("stale", 0)
+    # Recommended posture (scope §7 item 4): err toward leaving commitments
+    # open rather than auto-closing wrong — so a nonzero stale count is
+    # expected background noise, not itself unhealthy. It only warns once
+    # stale rows outnumber open ones, which would suggest auto-close (or
+    # someone reviewing `khipu owed --status stale`) has stopped happening.
+    open_metric = _metric(open_n, None, ok=True)
+    stale_ok = stale_n <= max(open_n, 1)
+    stale_metric = _metric(stale_n, "stale <= open (heuristic)", ok=stale_ok)
+    return open_metric, stale_metric
+
+
+def _query_log_window(days: int) -> list[dict]:
+    """Read-only pass over query_log.jsonl (khipu.query_log owns the writer;
+    this only consumes the public log_path()/format it already documents)."""
+    from datetime import datetime, timedelta, timezone
+
+    from khipu.query_log import log_path
+
+    path = log_path()
+    if not path.is_file():
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    out = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            ts_raw = entry.get("ts")
+            try:
+                ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                continue
+            if ts >= cutoff:
+                out.append(entry)
+    except OSError:
+        return out
+    return out
+
+
+def _query_log_metrics(days: int = RECALL_QUALITY_WINDOW_DAYS) -> tuple[dict, dict]:
+    entries = _query_log_window(days)
+    total = len(entries)
+    zero = sum(1 for e in entries if e.get("result_count") == 0)
+    rate = (zero / total) if total else None
+    zero_threshold = 0.2
+    zero_ok = rate is None or rate <= zero_threshold
+    zero_metric = _metric(rate, zero_threshold, ok=zero_ok, note=f"zero={zero} total={total}")
+
+    slice_errors = sum(
+        1 for e in entries if e.get("mode") == "slice" and e.get("result_count") == 0
+    )
+    slice_metric = _metric(slice_errors, 0, ok=slice_errors == 0)
+    return zero_metric, slice_metric
+
+
+def recall_quality(*, hub_snapshot: dict | None = None) -> dict:
+    """The `recall_quality` block for `khipu status`/`khipu doctor` (W6.2).
+
+    Opens its own connection (matching `backup_health()`'s style) so callers
+    can drop this in without threading a cursor through. `hub_snapshot`, when
+    given, is the block cmd_status/cmd_doctor already computed via
+    `hub_snapshot.snapshot_freshness()` — reused here rather than recomputed.
+    """
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                one_episode = _one_episode_session_ratio(cur)
+                cross_session = _cross_session_pairs_5min(cur)
+                dangling_topics = _dangling_topic_ratio(cur)
+                junk_paths = _junk_path_ratio(cur)
+                commitments_open, commitments_stale = _commitments_counts(cur)
+    except Exception as exc:  # noqa: BLE001 — a failed check must not look like a pass
+        err = f"{type(exc).__name__}: {exc}"
+        na = _metric(None, None, ok=False, note=err)
+        return {
+            "error": err,
+            "one_episode_session_ratio": na,
+            "cross_session_pairs_5min": na,
+            "dangling_topic_ratio": na,
+            "junk_path_ratio": na,
+            "commitments_open": na,
+            "commitments_stale": na,
+            "query_zero_result_rate": na,
+            "slice_error_count": na,
+            "snapshot_behind_ingest_seconds": na,
+        }
+    zero_result, slice_errors = _query_log_metrics()
+    behind = None
+    if hub_snapshot is not None:
+        behind = _metric(
+            hub_snapshot.get("behind_ingest_seconds"),
+            None,
+            ok=bool(hub_snapshot.get("ok", True)),
+            note=hub_snapshot.get("reason") or "",
+        )
+    else:
+        behind = _metric(None, None, ok=True, note="hub_snapshot not supplied by caller")
+    return {
+        "window_days": RECALL_QUALITY_WINDOW_DAYS,
+        "one_episode_session_ratio": one_episode,
+        "cross_session_pairs_5min": cross_session,
+        "dangling_topic_ratio": dangling_topics,
+        "junk_path_ratio": junk_paths,
+        "commitments_open": commitments_open,
+        "commitments_stale": commitments_stale,
+        "query_zero_result_rate": zero_result,
+        "slice_error_count": slice_errors,
+        "snapshot_behind_ingest_seconds": behind,
+    }
+
+
 def _dsn_source() -> str:
     if (os.environ.get("KHIPU_DATABASE_URL") or "").strip():
         return "env"

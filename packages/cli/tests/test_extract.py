@@ -85,13 +85,47 @@ class ExtractMemoryTest(unittest.TestCase):
         out = self._run(_reply(topics=["Phase F", "phase f", "Khipu Audit"]))
         self.assertEqual(out["topics"], ["phase-f", "khipu-audit"])
 
-    def test_the_project_dir_is_added_as_a_topic_once(self):
-        out = self._run(_reply(topics=["khipu"]), cwd="/srv/checkouts/Khipu")
-        self.assertEqual(out["topics"].count("khipu"), 1)
+    def test_cwd_basename_is_no_longer_forced_into_topics(self):
+        """memory reliability W1.3: the cwd basename used to be force-appended
+        as a topic (the single largest source of dangling topic nodes);
+        project identity now belongs in the capture payload's `project`
+        field, set by the hook via khipu.identity — not minted as a topic."""
+        out = self._run(_reply(topics=["something-real"]), cwd="/srv/checkouts/Khipu")
+        self.assertEqual(out["topics"], ["something-real"])
+        self.assertNotIn("khipu", out["topics"])
 
-    def test_a_trailing_slash_on_cwd_still_yields_the_dir_name(self):
+    def test_cwd_with_trailing_slash_still_does_not_leak_into_topics(self):
         out = self._run(_reply(), cwd="/a/b/Khipu/")
-        self.assertIn("khipu", out["topics"])
+        self.assertNotIn("khipu", out["topics"])
+
+    def test_people_parsed_from_the_model_reply(self):
+        out = self._run(_reply(people=["Matt", " Alice "]))
+        self.assertEqual(out["people"], ["Matt", "Alice"])
+
+    def test_people_defaults_to_empty_list(self):
+        out = self._run(_reply())
+        self.assertEqual(out["people"], [])
+
+    def test_open_loops_normalized_from_objects(self):
+        out = self._run(_reply(open_loops=[
+            {"text": "follow up with Matt", "kind": "FOLLOWUP", "due_after": "2026-09-10", "owner": "assistant"},
+            {"text": "  "},
+            "bare string loop",
+            {"text": "bad kind", "kind": "nonsense"},
+        ]))
+        self.assertEqual(out["open_loops"], [
+            {"text": "follow up with Matt", "kind": "followup", "due_after": "2026-09-10", "owner": "assistant"},
+            {"text": "bare string loop", "kind": "followup", "due_after": None, "owner": None},
+            {"text": "bad kind", "kind": "followup", "due_after": None, "owner": None},
+        ])
+
+    def test_open_loops_defaults_to_empty_list(self):
+        out = self._run(_reply())
+        self.assertEqual(out["open_loops"], [])
+
+    def test_closed_loops_normalized(self):
+        out = self._run(_reply(closed_loops=[{"text": "shipped the fix"}, "merged PR", {"text": ""}]))
+        self.assertEqual(out["closed_loops"], [{"text": "shipped the fix"}, {"text": "merged PR"}])
 
     def test_non_json_from_the_model_raises_rather_than_losing_the_window(self):
         """The caller must be able to retry; a silent None would mark the

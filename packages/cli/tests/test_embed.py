@@ -318,5 +318,315 @@ class SemanticSearchRankFetchWiringTest(unittest.TestCase):
         self.assertIn("left(m.chunk_text, %(fetch)s) AS snippet", sql)
 
 
+class FairFillTest(unittest.TestCase):
+    """_fair_fill is pure — no DB needed."""
+
+    def test_backfills_a_kind_missing_from_the_top_slice(self):
+        top_episodes = [{"kind": "episode", "id": str(i), "score": 1.0 - i * 0.01} for i in range(8)]
+        one_topic = [{"kind": "topic", "id": "t1", "score": 0.05}]
+        rows = top_episodes + one_topic
+        out = em._fair_fill(rows, 8)
+        self.assertIn("topic", {r["kind"] for r in out})
+        self.assertLessEqual(len(out), 8)
+
+    def test_no_backfill_when_every_kind_already_present(self):
+        rows = [
+            {"kind": "episode", "id": "1", "score": 0.9},
+            {"kind": "topic", "id": "t1", "score": 0.8},
+        ]
+        out = em._fair_fill(rows, 2)
+        self.assertEqual(out, rows)
+
+    def test_backfill_capped_at_limit_over_four(self):
+        episodes = [{"kind": "episode", "id": str(i), "score": 1.0 - i * 0.001} for i in range(20)]
+        topics = [{"kind": "topic", "id": f"t{i}", "score": 0.01} for i in range(20)]
+        out = em._fair_fill(episodes + topics, 20)
+        topic_count = sum(1 for r in out if r["kind"] == "topic")
+        self.assertLessEqual(topic_count, 20 // 4)
+        self.assertLessEqual(len(out), 20)
+
+
+@unittest.skipUnless(PG_AVAILABLE and KEY_AVAILABLE, "PG or Gemini key unavailable")
+class LiveHybridSearchTest(unittest.TestCase):
+    def test_default_mode_is_hybrid_and_scores_present(self):
+        out = em.hybrid_search("khipu", limit=6)
+        self.assertEqual(out["mode"], "hybrid")
+        for r in out["results"]:
+            self.assertIn("score", r)
+
+    def test_kind_node_only_returns_nodes_even_in_hybrid_mode(self):
+        """Regression: cosine sub-list used to ignore kind='node' and pull in
+        every other kind because 'node' is not a semantic-search kind."""
+        out = em.hybrid_search("module", limit=5, kind="node")
+        self.assertTrue(out["results"], "expected at least one node hit")
+        self.assertTrue(all(r["kind"] == "node" for r in out["results"]))
+
+    def test_kind_topic_restricts_hybrid_results(self):
+        out = em.hybrid_search("khipu", limit=6, kind="topic")
+        self.assertTrue(all(r["kind"] == "topic" for r in out["results"]))
+
+    def test_since_filter_excludes_old_episodes(self):
+        from khipu.db import connect
+
+        out = em.hybrid_search("khipu", limit=8, kind="episode", since="7d")
+        ids = [int(r["id"]) for r in out["results"]]
+        if not ids:
+            self.skipTest("no episode hits for 'khipu' to check dates against")
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM episodes WHERE id = ANY(%s) AND ts < now() - interval '7 days'",
+                (ids,),
+            )
+            self.assertEqual(cur.fetchall(), [])
+
+    def test_mode_literal_has_no_semantic_score_field_confusion(self):
+        out = em.hybrid_search("khipu", limit=5, mode="literal")
+        self.assertEqual(out["mode"], "literal")
+        for r in out["results"]:
+            self.assertIn("score", r)
+
+    def test_mode_semantic_matches_legacy_two_list_fuse(self):
+        out = em.hybrid_search("khipu memory", limit=5, mode="semantic")
+        self.assertEqual(out["mode"], "semantic")
+        self.assertTrue(all(r["kind"] in {"episode", "topic", "media"} for r in out["results"]))
+
+    def test_bad_kind_for_mode_raises(self):
+        with self.assertRaises(ValueError):
+            em.hybrid_search("x", kind="node", mode="semantic")
+        with self.assertRaises(ValueError):
+            em.hybrid_search("x", kind="media", mode="hybrid")
+
+    def test_bad_mode_raises(self):
+        with self.assertRaises(ValueError):
+            em.hybrid_search("x", mode="bogus")
+
+
+class CosineCandidatesExcludesCommitmentsTest(unittest.TestCase):
+    """Regression: memory_embeddings.kind widened to include 'commitment'
+    (migration 0009) — a generic search (kind=None) must never surface a
+    commitment row (its label lookup is episode-shaped and resolves wrong,
+    and commitments have their own surface, khipu_owed). Caught live: real
+    commitment embeddings started existing and 'commitment' leaked into
+    hybrid_search/semantic_search results with no kind filter."""
+
+    def test_sql_always_excludes_commitment_kind(self):
+        from unittest import mock
+
+        class FakeCur:
+            def execute(self, sql, params=None):
+                self.sql = " ".join(sql.split())
+                self.params = params
+
+            def fetchone(self):
+                return (False,)
+
+            def fetchall(self):
+                return []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class FakeConn:
+            def __init__(self, cur):
+                self._cur = cur
+
+            def cursor(self):
+                return self._cur
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        cur = FakeCur()
+        with mock.patch("khipu.db.connect", return_value=FakeConn(cur)), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"), \
+                mock.patch.object(em, "embed_one", return_value=[0.0] * em.DIM):
+            em._cosine_candidates("query text", limit=5, kind=None)
+        # Two execute() calls happen (media_assets check, then the main
+        # SELECT) — the fake cursor only remembers the last, which is the
+        # one that matters here.
+        self.assertIn("m.kind != 'commitment'", cur.sql)
+
+
+class ApplySearchFiltersHarnessTest(unittest.TestCase):
+    """fix 6: episodes.harness (migration 0008) is the primary harness
+    signal when it exists; the session_id-prefix split is a fallback for a
+    pre-migration hub only."""
+
+    def test_uses_the_harness_column_when_it_exists(self):
+        from unittest import mock
+
+        class _Cur:
+            def execute(self, sql, params=None):
+                self.sql = " ".join(sql.split())
+
+            def fetchall(self):
+                return [
+                    ("1", None, "claude_code:abc", "acme/widget", "claude_code"),
+                    ("2", None, "cursor:xyz", "acme/widget", "cursor"),
+                ]
+
+        cur = _Cur()
+        rows = [{"kind": "episode", "id": "1", "score": 0.9},
+                {"kind": "episode", "id": "2", "score": 0.8}]
+        with mock.patch.object(em, "_episode_schema_flags", return_value={
+            "project": True, "deleted_at": False, "harness": True, "parent_session_id": True,
+        }):
+            out = em._apply_search_filters(cur, rows, harness="cursor")
+        self.assertEqual({r["id"] for r in out}, {"2"})
+        self.assertIn(", harness", cur.sql)
+
+    def test_falls_back_to_session_id_split_when_harness_column_absent(self):
+        from unittest import mock
+
+        class _Cur:
+            def execute(self, sql, params=None):
+                self.sql = " ".join(sql.split())
+
+            def fetchall(self):
+                return [
+                    ("1", None, "claude_code:abc", "acme/widget"),
+                    ("2", None, "cursor:xyz", "acme/widget"),
+                ]
+
+        cur = _Cur()
+        rows = [{"kind": "episode", "id": "1", "score": 0.9},
+                {"kind": "episode", "id": "2", "score": 0.8}]
+        with mock.patch.object(em, "_episode_schema_flags", return_value={
+            "project": True, "deleted_at": False, "harness": False, "parent_session_id": True,
+        }):
+            out = em._apply_search_filters(cur, rows, harness="claude_code")
+        self.assertEqual({r["id"] for r in out}, {"1"})
+        self.assertNotIn(", harness", cur.sql)
+
+
+class _CatchupCursor:
+    """Enough of a cursor for embed_recent_missing's commitment pass (fix
+    5c): no episodes missing (isolates the commitments leg), N open
+    commitments with no embedding yet, and a recorder for every INSERT."""
+
+    def __init__(self, commitment_rows):
+        self.commitment_rows = commitment_rows
+        self.inserts: list[tuple] = []
+        self._result: list[tuple] = []
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        if "FROM episodes e WHERE NOT EXISTS" in s:
+            self._result = []
+        elif "FROM commitments c WHERE c.status = 'open'" in s:
+            self._result = self.commitment_rows
+        elif s.startswith("INSERT INTO memory_embeddings"):
+            self.inserts.append(params)
+        else:
+            self._result = []
+
+    def fetchall(self):
+        return list(self._result)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _CatchupConn:
+    def __init__(self, cur):
+        self._cur = cur
+        self.commits = 0
+
+    def cursor(self):
+        return self._cur
+
+    def commit(self):
+        self.commits += 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class EmbedRecentMissingCommitmentsTest(unittest.TestCase):
+    """fix 5c: the hook's bounded embed catch-up (embed_recent_missing) also
+    embeds open commitments with no vector yet — not inline on the capture
+    decision path (commitments.auto_close never calls the embed API itself
+    for this)."""
+
+    def _run(self, commitment_rows):
+        from unittest import mock
+
+        cur = _CatchupCursor(commitment_rows)
+        conn = _CatchupConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"), \
+                mock.patch.object(em, "embed_batch",
+                                   side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]):
+            out = em.embed_recent_missing(limit=10)
+        return out, cur
+
+    def test_open_commitments_with_no_vector_get_embedded(self):
+        out, cur = self._run([(1, "ship the fix"), (2, "follow up with Matt")])
+        self.assertEqual(out["commitments_embedded"], 2)
+        self.assertEqual(len(cur.inserts), 2)
+        refs = {p[2] for p in cur.inserts}  # (profile, kind, ref, ...)
+        self.assertEqual(refs, {"1", "2"})
+        self.assertTrue(all(p[1] == "commitment" for p in cur.inserts))
+
+    def test_no_open_commitments_is_a_noop(self):
+        out, cur = self._run([])
+        self.assertEqual(out["commitments_embedded"], 0)
+        self.assertEqual(out["commitments_chunks"], 0)
+        self.assertEqual(cur.inserts, [])
+
+    def test_blank_commitment_text_is_skipped(self):
+        out, _ = self._run([(1, "   ")])
+        self.assertEqual(out["commitments_embedded"], 0)
+
+    def test_missing_commitments_table_degrades_to_zero_not_a_raise(self):
+        """Pre-0009 hub: the commitments table doesn't exist yet — the SELECT
+        raises, and the catch-up must degrade, not blow up the whole call
+        (episode catch-up already succeeded by this point)."""
+        from unittest import mock
+
+        class _RaisingCursor(_CatchupCursor):
+            def execute(self, sql, params=None):
+                s = " ".join(sql.split())
+                if "FROM commitments c WHERE c.status = 'open'" in s:
+                    raise RuntimeError('relation "commitments" does not exist')
+                super().execute(sql, params)
+
+        cur = _RaisingCursor([])
+        conn = _CatchupConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"):
+            out = em.embed_recent_missing(limit=10)
+        self.assertEqual(out["commitments_embedded"], 0)
+
+    def test_snapshot_upsert_is_called_with_commitment_kind_rows(self):
+        from unittest import mock
+
+        cur = _CatchupCursor([(7, "renew the cert")])
+        conn = _CatchupConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"), \
+                mock.patch.object(em, "embed_batch",
+                                   side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]), \
+                mock.patch("khipu.hub_snapshot.upsert_embeddings",
+                           return_value={"ok": True}) as m_snap:
+            em.embed_recent_missing(limit=10)
+        m_snap.assert_called_once()
+        (rows,), _ = m_snap.call_args
+        self.assertTrue(rows)
+        self.assertTrue(all(r["kind"] == "commitment" and r["ref"] == "7" for r in rows))
+
+
 if __name__ == "__main__":
     unittest.main()

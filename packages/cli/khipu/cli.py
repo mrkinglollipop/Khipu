@@ -69,7 +69,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     from khipu.drift import status_payload
     from khipu.hub_snapshot import (
         hub_connection_failed,
-        snapshot_health,
+        snapshot_freshness,
         status_payload_snapshot,
     )
 
@@ -82,14 +82,23 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
         # Do not dump hub_snapshot here. Status is the tab people click; a full
         # embedding replica over Tailscale froze the desktop. Doctor (throttled)
-        # and `khipu snapshot refresh` own the dump.
-        data["hub_snapshot"] = snapshot_health()
+        # and `khipu snapshot refresh` own the dump. snapshot_freshness (W2.4)
+        # is still cheap — it only compares two timestamps already in hand.
+        data["hub_snapshot"] = snapshot_freshness(data.get("latest_ingested_at"))
     except Exception as exc:
         if not hub_connection_failed(exc):
             raise
         data = status_payload_snapshot()
         if mem:
             data["status_error"] = f"{type(exc).__name__}: {exc}"
+    # W6.2: recall-quality ratios, same block `khipu doctor` reports. Wrapped
+    # separately so a metrics-query failure never blanks the rest of status.
+    try:
+        from khipu.drift import recall_quality
+
+        data["recall_quality"] = recall_quality(hub_snapshot=data.get("hub_snapshot"))
+    except Exception as exc:  # noqa: BLE001
+        data["recall_quality"] = {"error": f"{type(exc).__name__}: {exc}"}
     print(json.dumps(data, indent=2, default=str))
     return 0
 
@@ -122,6 +131,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     from khipu.hub_snapshot import (
         hub_connection_failed,
         maybe_refresh,
+        snapshot_freshness,
         snapshot_health,
         status_payload_snapshot,
     )
@@ -139,7 +149,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             status["hub_error"] = f"{type(exc).__name__}: {exc}"
         else:
             raise
-    hub_snapshot = snapshot_health()
+    # W2.4: behind_ingest_seconds / ok=false reason=snapshot_behind_ingest only
+    # means something while PG is reachable — with the hub down, hub_ok is
+    # already red from a different, more specific check.
+    hub_snapshot = (
+        snapshot_freshness(status.get("latest_ingested_at"))
+        if hub_ok
+        else snapshot_health()
+    )
     # A check whose input is not configured on this machine is SKIPPED and
     # named in `not_configured` — distinct from red (configured but broken)
     # and from green (checked and clean). A fresh install has no legacy file
@@ -278,6 +295,34 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001
         embed_coverage = {"error": f"{type(e).__name__}: {e}"}
         embed_coverage_ok = False
+    # W6.1: `khipu doctor --probe` is the ONLY way this command writes anything
+    # — it runs a fresh end-to-end capture-then-search probe (khipu.probe) and
+    # records the result. Plain `khipu doctor` only reads that last recorded
+    # result (probe.status()) and goes red when it is missing, failed, or
+    # older than 7 days — "the host runs it" has to be proven, not assumed.
+    if getattr(args, "probe", False):
+        try:
+            from khipu import probe
+
+            probe_harness = getattr(args, "harness", None) or _env("KHIPU_HARNESS", default="doctor")
+            probe.run_probe(probe_harness)
+        except Exception:  # noqa: BLE001 — a probe crash must not crash doctor;
+            pass          # probe.status() below reports whatever it managed to record
+    try:
+        from khipu import probe
+
+        recall_probe = probe.status()
+    except Exception as e:  # noqa: BLE001
+        recall_probe = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+    # W6.2: recall-quality ratios (fragmentation, dangling topics, junk paths,
+    # commitments, query zero-result rate). Surfaced for visibility; per the
+    # scope these only warn and never gate doctor's overall ok below.
+    try:
+        from khipu.drift import recall_quality
+
+        recall_quality_block = recall_quality(hub_snapshot=hub_snapshot)
+    except Exception as e:  # noqa: BLE001
+        recall_quality_block = {"error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -292,6 +337,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "jobs": jobs,
         "index_freshness": index_fresh,
         "embed_coverage": embed_coverage,
+        "recall_probe": recall_probe,
+        "recall_quality": recall_quality_block,
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -309,6 +356,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             # offsite copy left doctor (and the soak probe reading doctor.ok)
             # green for days (08-28..08-31).
             and bool(_graph_offsite.get("ok"))
+            # hub_snapshot["ok"] was computed and displayed but never folded
+            # into the aggregate — a snapshot stuck behind ingest by hours
+            # still read doctor.ok == true (W6, 2026-09-03).
+            and bool(hub_snapshot.get("ok", True))
+            # recall_probe_ok: the end-to-end "capture then search finds it"
+            # signal (W6.1) — red when no probe has run, the last one failed,
+            # or it is older than 7 days. This is a hard gate, not a warning.
+            and bool(recall_probe.get("ok"))
         ),
         "graph_backup": _graph_backup,
         "graph_backup_ok": bool(_graph_backup.get("ok")),
@@ -323,6 +378,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "dsn_file_ok": dsn_file_ok,
         "index_freshness_ok": index_freshness_ok,
         "embed_coverage_ok": embed_coverage_ok,
+        "recall_probe_ok": bool(recall_probe.get("ok")),
     }
     print(json.dumps(out, indent=2, default=str))
     return 0 if out["ok"] else 2
@@ -388,18 +444,60 @@ _EPISODE_ILIKE_COLUMNS = (
 )
 
 
-def _search_query(cur, term: str, limit: int) -> list[dict]:
+def _id_shaped(term: str) -> bool:
+    """A query that looks like a graph node id (``kind:slug`` or ``a__b``).
+
+    W2.2: nodes are excluded from default (literal and hybrid) results — 73%
+    of path nodes were junk (2026-09-03 evidence) and let a near-zero node
+    starve real hits. An id-shaped query is exactly how a caller reaches a
+    node on purpose, so it still can without ``kind: "node"``.
+    """
+    t = term or ""
+    return ":" in t or "__" in t
+
+
+def _search_query(
+    cur,
+    term: str,
+    limit: int,
+    *,
+    kind: str | None = None,
+    include_nodes: bool | None = None,
+) -> list[dict]:
     """Deterministically-ordered, per-kind-fair ILIKE search (F7).
 
-    Each kind (topic/episode/node) gets its own fair share of `limit` and its
-    own ORDER BY, so one kind can no longer starve the others under a shared
-    LIMIT, and results are stable across runs instead of arbitrary scan order.
+    Each active kind gets its own fair share of `limit` and its own ORDER BY,
+    so one kind can no longer starve the others under a shared LIMIT, and
+    results are stable across runs instead of arbitrary scan order.
 
     Multi-token queries rank by token coverage (OR + hit count), not one
     giant substring. A query that yields no tokens still uses the whole
     escaped term as before.
+
+    ``kind`` restricts to one of 'topic'/'episode'/'node' (None = all
+    eligible kinds). Nodes are excluded from the eligible set by default
+    (W2.2) unless ``kind == "node"``, ``include_nodes`` is explicitly True,
+    or (when ``include_nodes`` is left at its default None) the query looks
+    id-shaped (``_id_shaped``). Pass ``include_nodes=False`` to force nodes
+    out even for an id-shaped query.
     """
-    topic_n, episode_n, node_n = _fair_shares(limit, 3)
+    if kind is not None and kind not in ("topic", "episode", "node"):
+        raise ValueError("kind must be 'topic', 'episode', or 'node'")
+    if kind == "node":
+        want_nodes = True
+    elif include_nodes is None:
+        want_nodes = _id_shaped(term)
+    else:
+        want_nodes = bool(include_nodes)
+    active_kinds = (
+        [kind]
+        if kind
+        else (["topic", "episode", "node"] if want_nodes else ["topic", "episode"])
+    )
+    shares = dict(zip(active_kinds, _fair_shares(limit, len(active_kinds))))
+    topic_n = shares.get("topic", 0)
+    episode_n = shares.get("episode", 0)
+    node_n = shares.get("node", 0)
     tokens = search_tokens(term)
     if not tokens:
         tokens = [(term or "").strip()] if (term or "").strip() else []
@@ -478,47 +576,254 @@ def _search_query(cur, term: str, limit: int) -> list[dict]:
     return results
 
 
-def cmd_search(args: argparse.Namespace) -> int:
-    from khipu.hub_snapshot import (
-        hub_connection_failed,
-        search_stale_payload,
-        try_hub_connect,
-    )
-    from khipu.topic_graph import enrich_search_results
+def _episode_rank_text(summary, topics, decisions, preferences, people) -> str:
+    """Full (unclipped) episode text for ranking — delegates to embed.episode_text
+    (no byte copy) so the two never drift on what "the episode's text" means."""
+    from khipu.embed import episode_text
 
-    semantic = getattr(args, "semantic", False)
-    kind = getattr(args, "kind", None)
+    return episode_text({
+        "summary": summary, "topics": topics, "decisions": decisions,
+        "preferences": preferences, "people": people,
+    })
+
+
+def _neg_ts_sort_key(ts) -> float:
+    if ts is None:
+        return 0.0
     try:
-        if semantic:
-            from khipu.embed import semantic_search
+        return -ts.timestamp()
+    except (AttributeError, OverflowError, OSError, ValueError):
+        return 0.0
 
-            results = semantic_search(args.query, limit=args.limit, kind=kind)
-            with try_hub_connect() as conn:
-                with conn.cursor() as cur:
-                    results = enrich_search_results(cur, results)
-        else:
-            with try_hub_connect() as conn:
-                with conn.cursor() as cur:
-                    results = enrich_search_results(
-                        cur, _search_query(cur, args.query, args.limit)
-                    )
+
+def _literal_candidates(
+    cur, term: str, limit: int, *, kind: str | None = None
+) -> list[dict]:
+    """Globally-ranked literal ILIKE candidates for RRF fusion (bugfix,
+    reported live: "Recorded mobile followup task" — episode 11286 named the
+    query verbatim in its decisions but landed at literal rank 21 because
+    ``_search_query``'s per-kind-fair split concatenates topic rows before
+    episode rows, so *every* topic outranked *every* episode regardless of
+    actual hit strength).
+
+    ``_search_query`` stays fair-share-partitioned (F7) — that is correct for
+    a stand-alone ILIKE listing and is what ``_pushed_memory_slice`` and
+    ``mode=literal``'s per-kind test coverage still exercise. This function
+    is the input to fusion instead: one flat pool (ranked by phrase-boost,
+    then hit count desc, then ts desc, across every eligible kind together),
+    because fairness at the *output* is ``_fair_fill``'s job, and pre-sorting
+    the input into kind blocks defeats RRF's ranking entirely.
+
+    Each row carries ``rank_text`` (unclipped: summary + topics/decisions/
+    preferences/people for episodes, title + body for topics, id + name +
+    payload for nodes) so the caller can also rank token overlap over the
+    same text without a second query.
+    """
+    from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
+
+    if kind is not None and kind not in ("topic", "episode", "node"):
+        raise ValueError("kind must be 'topic', 'episode', or 'node'")
+    want_nodes = kind == "node" or (kind is None and _id_shaped(term))
+    active_kinds = (
+        [kind] if kind else (["topic", "episode", "node"] if want_nodes else ["topic", "episode"])
+    )
+    lim = max(1, int(limit))
+    tokens = search_tokens(term)
+    pool: list[dict] = []
+
+    if not tokens:
+        toks = [(term or "").strip()] if (term or "").strip() else []
+        if not toks:
+            return []
+        params: dict = {"q": f"%{_escape_like(toks[0])}%", "lim": lim}
+        if "topic" in active_kinds:
+            cur.execute(
+                """
+                SELECT slug, COALESCE(title, slug) AS label, body,
+                       COALESCE(updated_at, created_at) AS ts
+                FROM topics
+                WHERE deleted_at IS NULL AND (
+                    body ILIKE %(q)s ESCAPE '\\' OR slug ILIKE %(q)s ESCAPE '\\'
+                    OR COALESCE(title, '') ILIKE %(q)s ESCAPE '\\')
+                ORDER BY slug ASC
+                LIMIT %(lim)s
+                """,
+                params,
+            )
+            for slug, label, body, ts in cur.fetchall():
+                pool.append({
+                    "kind": "topic", "id": slug, "label": label, "snippet": body or "",
+                    "rank_text": f"{label}\n\n{body or ''}", "hits": 1, "ts": ts,
+                })
+        if "episode" in active_kinds:
+            # A backslash can't appear inside an f-string's {...} on Python
+            # 3.11 (PEP 701 lifted this in 3.12 only) — build the ESCAPE '\'
+            # clause as its own string first, same as the literal-mode
+            # episode_where a few lines up, instead of nesting the join()
+            # generator directly inside the outer f"""...""" query below.
+            episode_ilike_where = " OR ".join(
+                f"{c} ILIKE %(q)s ESCAPE '\\'" for c in _EPISODE_ILIKE_COLUMNS
+            )
+            cur.execute(
+                f"""
+                SELECT id::text, summary, topics, decisions, preferences, people, ts
+                FROM episodes
+                WHERE {episode_ilike_where}
+                ORDER BY ts DESC NULLS LAST, id DESC
+                LIMIT %(lim)s
+                """,
+                params,
+            )
+            for eid, summary, topics, decisions, preferences, people, ts in cur.fetchall():
+                pool.append({
+                    "kind": "episode", "id": eid, "label": summary, "snippet": summary,
+                    "rank_text": _episode_rank_text(summary, topics, decisions, preferences, people),
+                    "hits": 1, "ts": ts,
+                })
+        if "node" in active_kinds:
+            cur.execute(
+                """
+                SELECT id, COALESCE(name, id) AS label, payload::text AS payload
+                FROM nodes
+                WHERE id ILIKE %(q)s ESCAPE '\\' OR COALESCE(name, '') ILIKE %(q)s ESCAPE '\\'
+                ORDER BY id ASC
+                LIMIT %(lim)s
+                """,
+                params,
+            )
+            for nid, label, payload in cur.fetchall():
+                pool.append({
+                    "kind": "node", "id": nid, "label": label,
+                    "snippet": (payload or "")[:4000],
+                    "rank_text": f"{label}\n{payload or ''}", "hits": 1, "ts": None,
+                })
+    else:
+        params = _ilike_token_params(tokens)
+        n = len(tokens)
+        if "topic" in active_kinds:
+            topic_where, topic_score = _token_match_sql(("body", "slug", "COALESCE(title, '')"), n)
+            cur.execute(
+                f"""
+                SELECT slug, COALESCE(title, slug) AS label, body,
+                       COALESCE(updated_at, created_at) AS ts, ({topic_score}) AS hits
+                FROM topics
+                WHERE deleted_at IS NULL AND ({topic_where})
+                ORDER BY hits DESC, slug ASC
+                LIMIT %(lim)s
+                """,
+                {**params, "lim": lim},
+            )
+            for slug, label, body, ts, hits in cur.fetchall():
+                pool.append({
+                    "kind": "topic", "id": slug, "label": label, "snippet": body or "",
+                    "rank_text": f"{label}\n\n{body or ''}", "hits": int(hits), "ts": ts,
+                })
+        if "episode" in active_kinds:
+            episode_where, episode_score = _token_match_sql(_EPISODE_ILIKE_COLUMNS, n)
+            cur.execute(
+                f"""
+                SELECT id::text, summary, topics, decisions, preferences, people, ts,
+                       ({episode_score}) AS hits
+                FROM episodes
+                WHERE {episode_where}
+                ORDER BY hits DESC, ts DESC NULLS LAST, id DESC
+                LIMIT %(lim)s
+                """,
+                {**params, "lim": lim},
+            )
+            for eid, summary, topics, decisions, preferences, people, ts, hits in cur.fetchall():
+                pool.append({
+                    "kind": "episode", "id": eid, "label": summary, "snippet": summary,
+                    "rank_text": _episode_rank_text(summary, topics, decisions, preferences, people),
+                    "hits": int(hits), "ts": ts,
+                })
+        if "node" in active_kinds:
+            node_where, node_score = _token_match_sql(("id", "COALESCE(name, '')"), n)
+            cur.execute(
+                f"""
+                SELECT id, COALESCE(name, id) AS label, payload::text AS payload, ({node_score}) AS hits
+                FROM nodes
+                WHERE {node_where}
+                ORDER BY hits DESC, id ASC
+                LIMIT %(lim)s
+                """,
+                {**params, "lim": lim},
+            )
+            for nid, label, payload, hits in cur.fetchall():
+                pool.append({
+                    "kind": "node", "id": nid, "label": label,
+                    "snippet": (payload or "")[:4000],
+                    "rank_text": f"{label}\n{payload or ''}", "hits": int(hits), "ts": None,
+                })
+
+    qlower = (term or "").strip().lower()
+
+    def _phrase_hit(r: dict) -> int:
+        return 1 if qlower and qlower in (r.get("rank_text") or "").lower() else 0
+
+    pool.sort(key=lambda r: (-_phrase_hit(r), -r.get("hits", 0), _neg_ts_sort_key(r.get("ts"))))
+    out = []
+    for r in pool[:lim]:
+        out.append({
+            "kind": r["kind"], "id": r["id"],
+            "label": clip_snippet(r["label"] or "", LABEL_LIMIT),
+            "snippet": clip_snippet(r["snippet"] or "", SNIPPET_LIMIT),
+            "rank_text": r["rank_text"],
+        })
+    return out
+
+
+def _resolve_search_mode(args: argparse.Namespace) -> str:
+    """``--mode`` wins; the legacy ``--semantic`` flag is still an alias for
+    ``mode=semantic`` (W2.1) so existing scripts/muscle-memory keep working."""
+    mode = getattr(args, "mode", None)
+    if mode:
+        return mode
+    if getattr(args, "semantic", False):
+        return "semantic"
+    return "hybrid"
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    from khipu import query_log
+    from khipu.hub_snapshot import hub_connection_failed, search_stale_payload
+
+    mode = _resolve_search_mode(args)
+    kind = getattr(args, "kind", None)
+    project = getattr(args, "project", None)
+    since = getattr(args, "since", None)
+    until = getattr(args, "until", None)
+    session_id = getattr(args, "session_id", None)
+    harness = getattr(args, "harness", None)
+    try:
+        from khipu.embed import hybrid_search
+
+        payload = hybrid_search(
+            args.query, limit=args.limit, mode=mode, kind=kind, project=project,
+            since=since, until=until, session_id=session_id, harness=harness,
+        )
+    except ValueError as err:
+        print(json.dumps({"ok": False, "error": str(err)}))
+        return 2
     except Exception as exc:
         if not hub_connection_failed(exc):
             raise
-        if semantic:
-            try:
-                payload = search_stale_payload(
-                    args.query, args.limit, semantic=True, kind=kind
-                )
-            except ValueError as err:
-                print(json.dumps({"ok": False, "error": str(err)}))
-                return 2
-            print(json.dumps(payload, indent=2))
-            return 0
-        payload = search_stale_payload(args.query, args.limit)
-        print(json.dumps(payload, indent=2))
-        return 0
-    print(json.dumps(results, indent=2))
+        try:
+            payload = search_stale_payload(
+                args.query, args.limit, semantic=(mode == "semantic"), kind=kind,
+                since=since, until=until, project=project, session_id=session_id,
+                harness=harness,
+            )
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+    query_log.log_query(
+        args.query, mode=mode,
+        filters={"kind": kind, "project": project, "since": since, "until": until,
+                 "session_id": session_id, "harness": harness},
+        result_count=len(payload.get("results") or []), top=payload.get("results") or [],
+    )
+    print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -766,6 +1071,170 @@ def cmd_topic_graph_backfill(args: argparse.Namespace) -> int:
         return 2
     stats = backfill_topic_graph(mem, dry_run=bool(getattr(args, "dry_run", False)))
     print(json.dumps(stats, indent=2, default=str))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Memory reliability (2026-09-03): owed / episode forget / topic purge /
+# backfill identity / hygiene paths. New subcommands only — the search/
+# status/doctor internals above are owned by a concurrent change.
+# ---------------------------------------------------------------------------
+
+def cmd_owed(args: argparse.Namespace) -> int:
+    """W3.4: `khipu owed` — list, close, or reopen commitments."""
+    from khipu.db import connect
+    from khipu import commitments
+
+    close_id = getattr(args, "close", None)
+    reopen_id = getattr(args, "reopen", None)
+    if close_id or reopen_id:
+        cid = int(close_id or reopen_id)
+        new_status = "closed" if close_id else "open"
+        with connect() as conn:
+            with conn.cursor() as cur:
+                ok = commitments.set_status(cur, cid, new_status)
+            conn.commit()
+        print(json.dumps({"ok": ok, "id": cid, "status": new_status}))
+        return 0 if ok else 1
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            rows = commitments.list_owed(
+                cur,
+                project=getattr(args, "project", None),
+                status=getattr(args, "status", None) or "open",
+                limit=int(getattr(args, "limit", None) or 50),
+            )
+    print(json.dumps(rows, indent=2, default=str))
+    return 0
+
+
+def cmd_episode(args: argparse.Namespace) -> int:
+    """W5.6: `khipu episode forget ID` — soft-delete + remove its vectors."""
+    if getattr(args, "episode_cmd", None) != "forget":
+        print(json.dumps({"ok": False, "error": "usage: khipu episode forget ID"}))
+        return 2
+    from khipu.db import connect
+
+    eid = int(args.id)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE episodes SET deleted_at = now() WHERE id = %s AND deleted_at IS NULL",
+                (eid,),
+            )
+            soft_deleted = cur.rowcount > 0
+            cur.execute(
+                "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = %s",
+                (str(eid),),
+            )
+            embeddings_removed = cur.rowcount
+        conn.commit()
+    print(json.dumps({
+        "ok": True, "id": eid, "soft_deleted": soft_deleted,
+        "embeddings_removed": embeddings_removed,
+    }))
+    return 0
+
+
+def cmd_topic(args: argparse.Namespace) -> int:
+    """W5.6: `khipu topic purge SLUG --yes` — hard-delete a TOMBSTONED topic
+    (deleted_at already set) and its revisions/embeddings. The command a
+    migration comment (0003_reconcile_upsert.sql) promised but nobody wrote."""
+    if getattr(args, "topic_cmd", None) != "purge":
+        print(json.dumps({"ok": False, "error": "usage: khipu topic purge SLUG --yes"}))
+        return 2
+    if not getattr(args, "yes", False):
+        print(json.dumps({"ok": False, "error": "refusing: pass --yes to confirm a hard delete"}))
+        return 2
+    from khipu.db import connect
+
+    slug = args.slug
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT deleted_at FROM topics WHERE slug = %s", (slug,))
+            row = cur.fetchone()
+            if row is None:
+                print(json.dumps({"ok": False, "error": f"no such topic: {slug}"}))
+                return 1
+            if row[0] is None:
+                print(json.dumps({
+                    "ok": False,
+                    "error": "topic is not tombstoned (deleted_at IS NULL) — purge only "
+                             "removes a topic reconcile already tombstoned; delete its file "
+                             "first and let reconcile tombstone it",
+                }))
+                return 1
+            cur.execute("DELETE FROM memory_embeddings WHERE kind = 'topic' AND ref = %s", (slug,))
+            embeddings_removed = cur.rowcount
+            cur.execute("DELETE FROM topic_revisions WHERE slug = %s", (slug,))
+            revisions_removed = cur.rowcount
+            cur.execute("DELETE FROM topics WHERE slug = %s", (slug,))
+        conn.commit()
+    print(json.dumps({
+        "ok": True, "slug": slug, "revisions_removed": revisions_removed,
+        "embeddings_removed": embeddings_removed,
+    }))
+    return 0
+
+
+def cmd_backfill(args: argparse.Namespace) -> int:
+    """W1.5: `khipu backfill identity [--dry-run|--apply]`."""
+    if getattr(args, "backfill_cmd", None) != "identity":
+        print(json.dumps({"ok": False, "error": "usage: khipu backfill identity [--dry-run|--apply]"}))
+        return 2
+    from khipu.db import connect
+    from khipu import hygiene
+
+    apply = bool(getattr(args, "apply", False))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if apply:
+                report = hygiene.apply_backfill_identity(cur, limit=getattr(args, "limit", None))
+            else:
+                report = hygiene.backfill_identity_report(cur, sample_limit=getattr(args, "limit", None) or 20)
+        if apply:
+            conn.commit()
+    report["dry_run"] = not apply
+    print(json.dumps(report, indent=2, default=str))
+    return 0
+
+
+def cmd_hygiene(args: argparse.Namespace) -> int:
+    """W5.2: `khipu hygiene paths [--dry-run|--apply]`."""
+    if getattr(args, "hygiene_cmd", None) != "paths":
+        print(json.dumps({"ok": False, "error": "usage: khipu hygiene paths [--dry-run|--apply]"}))
+        return 2
+    from khipu.db import connect
+    from khipu import hygiene
+
+    apply = bool(getattr(args, "apply", False))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if apply:
+                report = hygiene.apply_purge_junk_paths(cur)
+            else:
+                report = hygiene.report_junk_paths(cur)
+        if apply:
+            conn.commit()
+    report["dry_run"] = not apply
+    print(json.dumps(report, indent=2, default=str))
+    return 0
+
+
+def cmd_notes(args: argparse.Namespace) -> int:
+    """W4.3: `khipu notes reconcile` — mirror harness-native per-project
+    notes (~/.claude/projects/<slug>/memory/*.md, ~/.codex/memories/*.md)
+    into topics, append-only, so search/graph/the W4 pushed slice can reach
+    them. Never runs against the live hub except through the real
+    khipu.db.connect() this shares with every other write path."""
+    if getattr(args, "notes_cmd", None) != "reconcile":
+        print(json.dumps({"ok": False, "error": "usage: khipu notes reconcile"}))
+        return 2
+    from khipu import notes
+
+    report = notes.reconcile(dry_run=bool(getattr(args, "dry_run", False)))
+    print(json.dumps(report, indent=2, default=str))
     return 0
 
 
@@ -1079,6 +1548,41 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
         return 1
     print(json.dumps(out, indent=2))
     return 0 if out.get("ok") else 2
+
+
+def cmd_recall(args: argparse.Namespace) -> int:
+    """W2.5: the search query log — recent searches, and queries that came
+    back empty (the seed for a zero-result / golden-query review). Also W6.3
+    `khipu recall eval` — score docs/recall-golden.jsonl against default
+    search and print hit@k per line plus overall."""
+    if args.recall_cmd == "log":
+        from khipu import query_log
+
+        print(json.dumps(query_log.tail(args.tail), indent=2, default=str))
+        return 0
+    if args.recall_cmd == "zero-results":
+        from khipu import query_log
+
+        print(json.dumps(query_log.zero_results(args.days), indent=2, default=str))
+        return 0
+    if args.recall_cmd == "eval":
+        from pathlib import Path as _Path
+
+        from khipu import recall_eval
+
+        path = _Path(args.golden) if getattr(args, "golden", None) else None
+        try:
+            report = recall_eval.run_eval(path)
+        except (OSError, ValueError) as exc:
+            print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+            return 2
+        for row in report["rows"]:
+            mark = "hit " if row["hit"] else "MISS"
+            print(f"[{mark}] {row['query']!r} -> got={row['got']} expect={row['expect']}",
+                  file=sys.stderr)
+        print(json.dumps(report, indent=2, default=str))
+        return 0 if report["overall_hit_rate"] >= 0.8 else 1
+    return 2
 
 
 def cmd_graph_sync(args: argparse.Namespace) -> int:
@@ -1523,6 +2027,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Cap the topic drift pass at N topics (default: all)",
     )
+    d.add_argument(
+        "--probe",
+        action="store_true",
+        help="Run a fresh end-to-end recall probe (writes a nonce episode, "
+        "soft-deletes it after) before reporting; the only way `doctor` writes anything",
+    )
+    d.add_argument(
+        "--harness",
+        default=None,
+        help="Harness label for --probe (default: $KHIPU_HARNESS or 'doctor')",
+    )
     d.set_defaults(func=cmd_doctor)
 
     rv = sub.add_parser(
@@ -1577,20 +2092,31 @@ def build_parser() -> argparse.ArgumentParser:
     sec.set_defaults(func=cmd_secrets)
 
     se = sub.add_parser(
-        "search", help="ILIKE search topics/episodes/nodes (or --semantic)"
+        "search",
+        help="Hybrid search (cosine + token overlap + literal), or --mode literal/semantic",
     )
     se.add_argument("query")
     se.add_argument("--limit", type=int, default=20)
     se.add_argument(
+        "--mode",
+        choices=("hybrid", "literal", "semantic"),
+        help="Default hybrid. literal = old ILIKE-only. semantic = cosine + token overlap only.",
+    )
+    se.add_argument(
         "--semantic",
         action="store_true",
-        help="Cosine search over memory_embeddings (active profile) instead of ILIKE",
+        help="Deprecated alias for --mode semantic",
     )
     se.add_argument(
         "--kind",
-        choices=("episode", "topic", "media"),
-        help="Semantic: restrict to one kind",
+        choices=("episode", "topic", "node", "media"),
+        help="Restrict to one kind (media is semantic-only; node is literal/hybrid-only)",
     )
+    se.add_argument("--project", help="Match COALESCE(episodes.project, episodes.scope)")
+    se.add_argument("--since", help="ISO date/datetime or relative, e.g. 7d / 24h")
+    se.add_argument("--until", help="ISO date/datetime or relative, e.g. 7d / 24h")
+    se.add_argument("--session-id", dest="session_id", help="Episode session_id prefix match")
+    se.add_argument("--harness", help="Prefix of session_id before the colon")
     se.set_defaults(func=cmd_search)
 
     em = sub.add_parser(
@@ -1801,6 +2327,62 @@ def build_parser() -> argparse.ArgumentParser:
     rc = sub.add_parser("reconcile", help="Full file→PG episodes/topics sync")
     rc.add_argument("--memory-root", default=_memory_root_default())
     rc.set_defaults(func=cmd_reconcile)
+
+    owed = sub.add_parser("owed", help="List / close / reopen commitments (memory reliability W3)")
+    owed.add_argument("--project", default=None)
+    owed.add_argument("--status", default="open", choices=("open", "closed", "stale"))
+    owed.add_argument("--limit", type=int, default=50)
+    owed.add_argument("--close", metavar="ID", default=None, help="Close commitment ID")
+    owed.add_argument("--reopen", metavar="ID", default=None, help="Reopen commitment ID")
+    owed.set_defaults(func=cmd_owed)
+
+    ep = sub.add_parser("episode", help="Episode maintenance (memory reliability W5.6)")
+    ep_sub = ep.add_subparsers(dest="episode_cmd", required=True)
+    ep_forget = ep_sub.add_parser("forget", help="Soft-delete an episode and remove its vectors")
+    ep_forget.add_argument("id", type=int)
+    ep.set_defaults(func=cmd_episode)
+
+    tp = sub.add_parser("topic", help="Topic maintenance (memory reliability W5.6)")
+    tp_sub = tp.add_subparsers(dest="topic_cmd", required=True)
+    tp_purge = tp_sub.add_parser(
+        "purge", help="Hard-delete a TOMBSTONED topic + its revisions/embeddings"
+    )
+    tp_purge.add_argument("slug")
+    tp_purge.add_argument("--yes", action="store_true", help="Required to confirm the hard delete")
+    tp.set_defaults(func=cmd_topic)
+
+    bf = sub.add_parser("backfill", help="Backfill jobs (memory reliability W1.5)")
+    bf_sub = bf.add_subparsers(dest="backfill_cmd", required=True)
+    bf_identity = bf_sub.add_parser(
+        "identity", help="Derive repo_root/project for episodes with an absolute-path scope"
+    )
+    bf_identity.add_argument("--dry-run", dest="apply", action="store_false", default=False)
+    bf_identity.add_argument(
+        "--apply", dest="apply", action="store_true",
+        help="Actually write the backfill (destructive; needs an explicit go — never run against the live shared hub without it)",
+    )
+    bf_identity.add_argument("--limit", type=int, default=None)
+    bf.set_defaults(func=cmd_backfill)
+
+    hy = sub.add_parser("hygiene", help="Graph hygiene jobs (memory reliability W5.2)")
+    hy_sub = hy.add_subparsers(dest="hygiene_cmd", required=True)
+    hy_paths = hy_sub.add_parser(
+        "paths", help="Report (or purge) path: graph nodes that fail the real-path shape rule"
+    )
+    hy_paths.add_argument("--dry-run", dest="apply", action="store_false", default=False)
+    hy_paths.add_argument(
+        "--apply", dest="apply", action="store_true",
+        help="Actually delete the failing path: nodes (destructive; needs an explicit go)",
+    )
+    hy.set_defaults(func=cmd_hygiene)
+
+    nt = sub.add_parser("notes", help="Index harness-native per-project notes as topics (memory reliability W4)")
+    nt_sub = nt.add_subparsers(dest="notes_cmd", required=True)
+    nt_sub.add_parser(
+        "reconcile",
+        help="Mirror ~/.claude/projects/<slug>/memory/*.md and ~/.codex/memories/*.md into topics",
+    ).add_argument("--dry-run", action="store_true", help="Report without writing")
+    nt.set_defaults(func=cmd_notes)
 
     paths = sub.add_parser(
         "paths",
@@ -2066,6 +2648,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     snap_sub.add_parser("status", help="Snapshot age, size, and row counts from meta")
     snap.set_defaults(func=cmd_snapshot)
+
+    rc = sub.add_parser("recall", help="Search query log: recent / zero-result queries")
+    rc_sub = rc.add_subparsers(dest="recall_cmd", required=True)
+    rlog = rc_sub.add_parser("log", help="Print recent query_log.jsonl entries")
+    rlog.add_argument("--tail", type=int, default=20)
+    rzero = rc_sub.add_parser(
+        "zero-results", help="Queries with result_count 0 in the last N days"
+    )
+    rzero.add_argument("--days", type=int, default=7)
+    reval = rc_sub.add_parser(
+        "eval", help="Score docs/recall-golden.jsonl against default search (W6.3)"
+    )
+    reval.add_argument(
+        "--golden", default=None,
+        help="Path to the golden JSONL file (default: docs/recall-golden.jsonl)",
+    )
+    rc.set_defaults(func=cmd_recall)
 
     tg = sub.add_parser(
         "topic-graph",

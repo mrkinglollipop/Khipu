@@ -265,6 +265,31 @@ class DrainTest(unittest.TestCase):
             # NB: every drain in a test stays inside the mock — one outside it
             # made a real Gemini call and wrote a real episode (audit 2026-08-17).
 
+    def test_drain_forwards_identity_fields_from_job_to_payload(self):
+        """W1.3: repo_root/project/parent_session_id/transcript_range resolved
+        in-hook must survive the drain into the capture payload."""
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {"KHIPU_AEGIS_HOME": str(Path(td) / "kh")}):
+            ac.enqueue({
+                "harness": "aegis", "session_id": "idj", "cwd": "/x", "event": "stop",
+                "ts": ac._mint_ts(), "turns": 1, "transcript": "USER: durable",
+                "offset_before": 10, "offset_after": 20,
+                "repo_root": "/repo/main", "project": "acme/widget",
+                "parent_session_id": "aegis:parent-1",
+            })
+            captured = []
+            with mock.patch("khipu.extract.extract_memory", lambda t, *, cwd="": {
+                    "summary": "s", "topics": [], "decisions": [], "preferences": [],
+                    "scope": "", "edges": [], "topic_pages": []}), \
+                    mock.patch("khipu.capture.capture", lambda p, mode=None: captured.append(p) or 0), \
+                    mock.patch("khipu.config.capture_mode", lambda: "dual"):
+                ac.drain()
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0]["repo_root"], "/repo/main")
+            self.assertEqual(captured[0]["project"], "acme/widget")
+            self.assertEqual(captured[0]["parent_session_id"], "aegis:parent-1")
+            self.assertEqual(captured[0]["transcript_range"], "10:20")
+
     def test_drain_is_a_noop_with_an_empty_queue(self):
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.dict(os.environ, {"KHIPU_AEGIS_HOME": str(Path(td) / "kh")}):

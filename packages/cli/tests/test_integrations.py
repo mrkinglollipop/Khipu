@@ -402,10 +402,14 @@ class RecallRuleTest(_TempHomeCase):
             integ, "_probe_recall", return_value={"ok": True, "chars": 400}
         ) as probe, mock.patch.object(
             integ, "_probe_aegis_refusal", return_value={"ok": True, "refused_marked": True}
-        ) as refuse:
+        ) as refuse, mock.patch(
+            "khipu.probe.run_probe", return_value={"ok": True, "harness": "cursor"}
+        ):
             out = integ.verify("cursor")
         self.assertIn("recall", out["components"])
         self.assertTrue(out["components"]["recall"]["ok"])
+        self.assertIn("recall_probe", out["components"])
+        self.assertTrue(out["components"]["recall_probe"]["ok"])
         probe.assert_called_once()
         self.assertIn("--cursor", probe.call_args[0][0])
         recall_refuse = [
@@ -414,6 +418,56 @@ class RecallRuleTest(_TempHomeCase):
         ]
         self.assertEqual(len(recall_refuse), 1)
         self.assertIn("--cursor", recall_refuse[0].args[0])
+
+    def test_cursor_verify_fails_when_recall_probe_fails(self):
+        """W6.1: a red recall probe must fail verify even when every other
+        component (hook, mcp, extract, recall-rule, runtime) is green — the
+        probe is the only component that proves capture-then-search actually
+        works end-to-end."""
+        (self.home / ".cursor").mkdir()
+        (self.home / ".cursor" / "mcp.json").write_text("{}")
+        (self.home / ".cursor" / "hooks.json").write_text("{}")
+        integ.install("cursor")
+        with mock.patch.object(integ, "_probe_mcp", return_value={"ok": True}), mock.patch.object(
+            integ, "_probe_hook", return_value={"ok": True}
+        ), mock.patch.object(
+            integ, "_probe_native_extract", return_value={"ok": True}
+        ), mock.patch.object(
+            integ, "_runtime", return_value={"ok": True}
+        ), mock.patch.object(
+            integ, "_probe_recall", return_value={"ok": True, "chars": 400}
+        ), mock.patch.object(
+            integ, "_probe_aegis_refusal", return_value={"ok": True, "refused_marked": True}
+        ), mock.patch(
+            "khipu.probe.run_probe",
+            return_value={"ok": False, "harness": "cursor", "error": "nonce never surfaced"},
+        ):
+            out = integ.verify("cursor")
+        self.assertFalse(out["components"]["recall_probe"]["ok"])
+        self.assertFalse(out["ok"])
+
+    def test_cursor_verify_probe_crash_is_a_failed_component_not_a_raise(self):
+        (self.home / ".cursor").mkdir()
+        (self.home / ".cursor" / "mcp.json").write_text("{}")
+        (self.home / ".cursor" / "hooks.json").write_text("{}")
+        integ.install("cursor")
+        with mock.patch.object(integ, "_probe_mcp", return_value={"ok": True}), mock.patch.object(
+            integ, "_probe_hook", return_value={"ok": True}
+        ), mock.patch.object(
+            integ, "_probe_native_extract", return_value={"ok": True}
+        ), mock.patch.object(
+            integ, "_runtime", return_value={"ok": True}
+        ), mock.patch.object(
+            integ, "_probe_recall", return_value={"ok": True, "chars": 400}
+        ), mock.patch.object(
+            integ, "_probe_aegis_refusal", return_value={"ok": True, "refused_marked": True}
+        ), mock.patch(
+            "khipu.probe.run_probe", side_effect=RuntimeError("boom")
+        ):
+            out = integ.verify("cursor")  # must not raise
+        self.assertFalse(out["components"]["recall_probe"]["ok"])
+        self.assertIn("boom", out["components"]["recall_probe"]["error"])
+        self.assertFalse(out["ok"])
 
 
 class CodexPackTest(_TempHomeCase):
