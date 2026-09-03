@@ -65,11 +65,21 @@ def render_context() -> dict[str, str]:
         pythonpath_parts.append(str(legacy))
     support = application_support_dir()
     support.mkdir(parents=True, exist_ok=True)
+    # Bytecode cache goes OUTSIDE any signed .app bundle — see
+    # khipu.paths.pycache_dir. Every other launcher (hook wrappers, the
+    # desktop app's own shell-out) exports the same PYTHONPYCACHEPREFIX; a
+    # launchd job pointed the bundled Python at itself just as directly, so it
+    # gets the same env key here rather than a separate mechanism.
+    from khipu.paths import pycache_dir
+
+    pycache = pycache_dir()
+    pycache.mkdir(parents=True, exist_ok=True)
     return {
         "KHIPU_ROOT": str(root),
         "KHIPU_PYTHON": str(_bundled_python()),
         "PYTHONPATH": ":".join(pythonpath_parts),
         "WORKING_DIRECTORY": str(support),
+        "PYTHONPYCACHEPREFIX": str(pycache),
     }
 
 

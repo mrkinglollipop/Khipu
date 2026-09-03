@@ -21,3 +21,14 @@ def test_rendered_plist_carries_override_env(monkeypatch):
     assert env["KHIPU_CONSOLIDATE_NIGHTLY"] == "/Volumes/A&B/consolidate_nightly.py"
     assert "KHIPU_BUILD_INDEX" not in env
     assert env["KHIPU_ROOT"]
+
+
+def test_rendered_plist_redirects_bytecode_cache_outside_bundle():
+    """Every launchd job exports PYTHONPYCACHEPREFIX so the bundled Python's
+    __pycache__ writes never land inside a signed .app (the 0.3.15 "Khipu is
+    damaged" incident — see khipu.paths.pycache_dir)."""
+    for job in ("nightly", "monthly", "graph_build"):
+        data = plistlib.loads(launchd_gen.render_plist(job))
+        env = data["EnvironmentVariables"]
+        assert env["PYTHONPYCACHEPREFIX"], job
+        assert "Caches/Khipu/pycache" in env["PYTHONPYCACHEPREFIX"], job

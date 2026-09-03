@@ -31,6 +31,14 @@ export PYTHONPATH
 # The log dir must exist before any `2>>` redirect below, or sh fails the
 # redirect and the hook silently does nothing (fresh machine, first run).
 mkdir -p "${HOME}/Library/Logs/khipu" 2>/dev/null
+# Bytecode cache goes OUTSIDE any signed .app bundle — see khipu.paths.pycache_dir.
+# Running the bundled Python's __pycache__ writes inside Contents/Resources/khipu
+# broke the code signature and made Gatekeeper report "Khipu is damaged" (0.3.15,
+# withdrawn). mkdir failure is fail-open: PYTHONPYCACHEPREFIX to a missing dir
+# just disables caching, never blocks the hook.
+PYTHONPYCACHEPREFIX="${HOME}/Library/Caches/Khipu/pycache"
+mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null
+export PYTHONPYCACHEPREFIX
 PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
 [ -x "$PY" ] || PY="python3"
 SHAPE=claude

@@ -1258,6 +1258,25 @@ def verify(harness: str, *, project: str | None = None) -> dict:
                 recall.update({k: v for k, v in ref.items() if k != "ms"},
                               ok=recall["ok"] and ref["ok"])
             out["components"]["recall"] = recall
+        if harness == "cursor":
+            # The recall rule is written per-project (Cursor's User Rules live
+            # in app state, not a writable file) — `khipu integrations install
+            # cursor --project X` is the only thing that refreshes it, so a
+            # version bump that changes cursor_mdc() leaves every already-
+            # installed project's khipu.mdc stale until someone re-runs
+            # install there. With no --project this is unknowable (which
+            # project?), so it is reported null with a note rather than
+            # guessed at.
+            rp = _cursor_rule_path(project)
+            if rp is None:
+                out["rule_stale"] = None
+                out["note"] = "cursor recall rule is per-project; pass --project to check staleness"
+            else:
+                from khipu.recall_rule import cursor_mdc
+
+                want = cursor_mdc()
+                current = rp.read_text(encoding="utf-8") if rp.is_file() else None
+                out["rule_stale"] = current != want
         out["runtime"] = _runtime(harness)
     if harness == "aegis":
         out["runtime"] = out["aegis"]

@@ -470,6 +470,73 @@ class RecallRuleTest(_TempHomeCase):
         self.assertFalse(out["ok"])
 
 
+class CursorVerifyRuleStaleTest(_TempHomeCase):
+    """rule_stale: the Cursor recall rule is per-project (khipu.mdc), so a
+    version bump that changes cursor_mdc() leaves an already-installed
+    project's rule file stale until `integrations install cursor --project`
+    is re-run there. verify() must say so rather than silently reporting a
+    green recall component while the actual file on disk is out of date."""
+
+    def _verify_with_stubs(self, project=None):
+        with mock.patch.object(integ, "_probe_mcp", return_value={"ok": True}), mock.patch.object(
+            integ, "_probe_hook", return_value={"ok": True}
+        ), mock.patch.object(
+            integ, "_probe_native_extract", return_value={"ok": True}
+        ), mock.patch.object(
+            integ, "_runtime", return_value={"ok": True}
+        ), mock.patch.object(
+            integ, "_probe_recall", return_value={"ok": True, "chars": 400}
+        ), mock.patch.object(
+            integ, "_probe_aegis_refusal", return_value={"ok": True, "refused_marked": True}
+        ), mock.patch(
+            "khipu.probe.run_probe", return_value={"ok": True, "harness": "cursor"}
+        ):
+            return integ.verify("cursor", project=project)
+
+    def test_no_project_reports_null_with_note(self):
+        (self.home / ".cursor").mkdir()
+        (self.home / ".cursor" / "mcp.json").write_text("{}")
+        (self.home / ".cursor" / "hooks.json").write_text("{}")
+        integ.install("cursor")
+        out = self._verify_with_stubs(project=None)
+        self.assertIsNone(out["rule_stale"])
+        self.assertIn("per-project", out["note"])
+
+    def test_freshly_installed_project_rule_is_not_stale(self):
+        (self.home / ".cursor").mkdir()
+        (self.home / ".cursor" / "mcp.json").write_text("{}")
+        (self.home / ".cursor" / "hooks.json").write_text("{}")
+        proj = self.home / "someproj"
+        proj.mkdir()
+        integ.install("cursor")
+        integ.install("cursor", project=str(proj))
+        out = self._verify_with_stubs(project=str(proj))
+        self.assertFalse(out["rule_stale"])
+
+    def test_edited_or_outdated_rule_file_is_stale(self):
+        (self.home / ".cursor").mkdir()
+        (self.home / ".cursor" / "mcp.json").write_text("{}")
+        (self.home / ".cursor" / "hooks.json").write_text("{}")
+        proj = self.home / "someproj"
+        proj.mkdir()
+        integ.install("cursor")
+        integ.install("cursor", project=str(proj))
+        mdc = proj / ".cursor" / "rules" / "khipu.mdc"
+        mdc.write_text("stale content from a previous cursor_mdc() version\n")
+        out = self._verify_with_stubs(project=str(proj))
+        self.assertTrue(out["rule_stale"])
+
+    def test_missing_rule_file_for_a_project_is_stale(self):
+        (self.home / ".cursor").mkdir()
+        (self.home / ".cursor" / "mcp.json").write_text("{}")
+        (self.home / ".cursor" / "hooks.json").write_text("{}")
+        proj = self.home / "someproj"
+        proj.mkdir()
+        integ.install("cursor")  # never installed --project
+        out = self._verify_with_stubs(project=str(proj))
+        self.assertTrue(out["rule_stale"])
+
+
 class CodexPackTest(_TempHomeCase):
     def setUp(self):
         super().setUp()

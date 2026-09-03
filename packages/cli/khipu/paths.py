@@ -102,6 +102,29 @@ def root_cert_file() -> Path:
     return ensure_data_dir() / "root.crt"
 
 
+def pycache_dir() -> Path:
+    """Where every Khipu launcher's CPython bytecode cache lands — always
+    OUTSIDE any signed .app bundle. Every launcher (hook wrappers, the desktop
+    app's own shell-out, launchd jobs) exports PYTHONPYCACHEPREFIX to this
+    directory so running the bundled CLI never writes new files into
+    Contents/Resources/khipu after it is signed. Release 0.3.15 skipped this:
+    the bundled Python wrote __pycache__/*.pyc inside the signed bundle, and
+    the next in-app update's Gatekeeper re-validation saw the added files and
+    reported "Khipu is damaged" (confirmed via `codesign -vvv --deep --strict`;
+    release withdrawn).
+
+    Not ``data_dir()`` — that is relocatable and backed up/restored as user
+    data; bytecode cache is neither.
+    """
+    return Path.home() / "Library" / "Caches" / "Khipu" / "pycache"
+
+
+def ensure_pycache_dir() -> Path:
+    d = pycache_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def list_local_files() -> list[dict]:
     d = ensure_data_dir()
     out = []
