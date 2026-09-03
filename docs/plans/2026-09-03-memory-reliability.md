@@ -27,7 +27,7 @@ not done until every column is either "automatic" or explicitly verified.
 | `path:` graph nodes that are not paths (`a/b`, no dot, no `/`, no `~`) | 3048 of 4196 | 73 % of path nodes are noise |
 | Episodes with empty `people` | 6635 of 6809 | the native prompt never asks for people |
 | Episodes with no decisions | 912 | fine; noted |
-| Distinct topic `status` values | 80+ (`active`, `Active`, `"active"`, `LIVE - IWM bot deployed` …) | no vocabulary |
+| Distinct topic `status` values | 80+ (`active`, `Active`, `"active"`, free-text sentences …) | no vocabulary |
 | Topic frontmatter `last_updated` parsed into PG | 0 of 598 | freshness of a topic page is invisible to ranking |
 | `~/.claude/projects/*/memory/*.md` indexed as topics | 0 | durable per-repo notes unreachable from search |
 | Embedding coverage on active profile | 6809 / 6809 episodes | good |
@@ -202,7 +202,7 @@ Aegis: none (documented limit); compensated by the recall rule + `khipu_owed`.
 Gateway: no session start; Grok Bot packs call `khipu_search` with `project`.
 
 Accept: starting a session in this worktree pushes Khipu-project episodes and
-this scope doc's topic, and nothing from FT Command/FT Terminal.
+this scope doc's topic, and nothing from unrelated projects.
 
 ### W5. Extraction and graph hygiene (new)
 
@@ -246,7 +246,7 @@ Accept: dangling-topic ratio on new episodes < 5 %; junk path ratio < 5 %;
    5-min cross-session pair count, dangling-topic ratio, junk-path ratio,
    commitments open/stale, snapshot age vs last ingest, query zero-result
    rate (from the W2 log), pushed-slice error count.
-3. **Golden set.** `docs/recall-golden.jsonl` (query → expected id), grown
+3. **Golden set.** the maintainer-local `recall-golden.jsonl` (query → expected id), grown
    from the query log; `khipu recall eval` prints hit@3 and is part of the
    soak checklist. Not a CI gate (GitHub Actions is not used).
 
@@ -322,6 +322,6 @@ missing/failed/>7d old — a hard gate) and a `recall_quality` block (drift.py:
 `recall_quality`) of warn-only ratios — fragmentation, dangling topics, junk
 paths, commitments, query zero-result rate, snapshot lag. `khipu integrations
 verify` runs the probe once per installed pack, including grok_bot.
-`docs/recall-golden.jsonl` + `khipu recall eval [--golden PATH]` (recall_eval.py)
+the maintainer-local `recall-golden.jsonl` + `khipu recall eval [--golden PATH]` (recall_eval.py)
 score hit@k against default search, exit 1 below 0.8 — not a CI gate, a soak
 check.

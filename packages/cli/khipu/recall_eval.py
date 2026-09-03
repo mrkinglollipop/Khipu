@@ -1,6 +1,6 @@
 """Golden-query recall evaluation (W6.3) — ``khipu recall eval``.
 
-``docs/recall-golden.jsonl`` holds hand- and evidence-derived queries with
+``<config dir>/recall-golden.jsonl`` (maintainer-local; ``KHIPU_RECALL_GOLDEN`` overrides) holds hand- and evidence-derived queries with
 their expected hit ids: ``{query, mode?, expect: [ids], k, note}``. Each line
 runs through ``khipu.embed.hybrid_search`` (or the named ``mode``) and scores
 hit@k — 1 if ANY id in ``expect`` appears among the top ``k`` results, else 0.
@@ -18,13 +18,19 @@ DEFAULT_K = 3
 
 
 def default_golden_path() -> Path:
-    from khipu.paths import repo_root
+    # The golden set quotes real captured content (queries that must find a
+    # specific private episode), so it lives in the maintainer's config dir,
+    # never in the public repo. KHIPU_RECALL_GOLDEN overrides for CI/soak.
+    import os
 
-    return repo_root() / "docs" / "recall-golden.jsonl"
+    from khipu.paths import data_dir
+
+    env = os.environ.get("KHIPU_RECALL_GOLDEN")
+    return Path(env) if env else data_dir() / "recall-golden.jsonl"
 
 
 def load_golden(path: Path) -> list[dict[str, Any]]:
-    """Parse ``docs/recall-golden.jsonl``. Blank lines and ``#``-prefixed
+    """Parse a recall-golden JSONL file. Blank lines and ``#``-prefixed
     comment lines are skipped; a malformed line raises with its 1-based line
     number so a broken golden file fails loudly rather than silently
     dropping a case."""
