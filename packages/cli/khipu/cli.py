@@ -1553,7 +1553,7 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
 def cmd_recall(args: argparse.Namespace) -> int:
     """W2.5: the search query log — recent searches, and queries that came
     back empty (the seed for a zero-result / golden-query review). Also W6.3
-    `khipu recall eval` — score docs/recall-golden.jsonl against default
+    `khipu recall eval` — score the maintainer-local recall-golden.jsonl against default
     search and print hit@k per line plus overall."""
     if args.recall_cmd == "log":
         from khipu import query_log
@@ -2658,11 +2658,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rzero.add_argument("--days", type=int, default=7)
     reval = rc_sub.add_parser(
-        "eval", help="Score docs/recall-golden.jsonl against default search (W6.3)"
+        "eval", help="Score <config dir>/recall-golden.jsonl (or --golden / KHIPU_RECALL_GOLDEN) against default search (W6.3)"
     )
     reval.add_argument(
         "--golden", default=None,
-        help="Path to the golden JSONL file (default: docs/recall-golden.jsonl)",
+        help="Path to the golden JSONL file (default: <config dir>/recall-golden.jsonl, or KHIPU_RECALL_GOLDEN)",
     )
     rc.set_defaults(func=cmd_recall)
 
