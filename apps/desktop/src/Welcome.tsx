@@ -5,7 +5,7 @@ import { resourceDir } from "@tauri-apps/api/path";
 import { Check, ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
 import { WorkingBanner } from "./WorkingBanner";
 import { Callout, Tag } from "./ui";
-import { SetupStages } from "./SetupStages";
+import { SetupStages, plainWords } from "./SetupStages";
 import type { SetupPhase, SetupPipelineResult } from "./SetupStages";
 import { buildAttention, type Attention } from "./doctorAttention";
 import type { RecallProbeStatus } from "./IntegrationsPanel";
@@ -74,7 +74,11 @@ function parse(raw: string): Record<string, unknown> | null {
 }
 
 type MigratePlan = { applied?: string[]; pending?: string[]; ran?: string[] };
-type Presence = { gemini_in_keychain?: boolean; gemini_env?: boolean };
+type Presence = {
+  gemini_in_keychain?: boolean;
+  gemini_env?: boolean;
+  openai_compat_in_keychain?: boolean;
+};
 type HarnessRow = {
   harness: string;
   detected?: boolean;
@@ -738,11 +742,15 @@ export function Welcome({
         );
       } else {
         setGraphOk(false);
-        setGraphErr(String(out?.error ?? raw));
+        const title = typeof out?.title === "string" ? plainWords(out.title) : null;
+        const detail = typeof out?.detail === "string" ? plainWords(out.detail) : null;
+        const fix = typeof out?.fix === "string" ? plainWords(out.fix) : null;
+        const words = [title, detail, fix].filter((s): s is string => Boolean(s)).join(" ");
+        setGraphErr(words || plainWords(String(out?.error ?? raw)));
       }
     } catch (e) {
       setGraphOk(false);
-      setGraphErr(String(e));
+      setGraphErr(plainWords(String(e)));
     } finally {
       setGraphInstalling(false);
     }
@@ -1275,6 +1283,11 @@ export function Welcome({
                     <button type="button" className="primary" disabled={saving || !key.trim()} onClick={() => void saveKey()}>
                       {saving ? "Saving…" : "Save Gemini key"}
                     </button>
+                    {(presence?.gemini_in_keychain || presence?.gemini_env) && !modelVerify ? (
+                      <button type="button" disabled={verifying} onClick={() => void verifyModelKeys()}>
+                        {verifying ? "Checking…" : "Check key now"}
+                      </button>
+                    ) : null}
                   </div>
                   <ModelCheckRow
                     check={modelCheckFor(modelVerify, "gemini_generate")}
@@ -1314,6 +1327,11 @@ export function Welcome({
                     <button type="button" disabled={saving || !openaiKey.trim()} onClick={() => void saveOpenaiKey()}>
                       Save compat key
                     </button>
+                    {presence?.openai_compat_in_keychain && !modelVerify ? (
+                      <button type="button" disabled={verifying} onClick={() => void verifyModelKeys()}>
+                        {verifying ? "Checking…" : "Check key now"}
+                      </button>
+                    ) : null}
                   </div>
                   <ModelCheckRow
                     check={modelCheckFor(modelVerify, "openai_compat_generate")}
@@ -1378,6 +1396,17 @@ export function Welcome({
                 <Callout tone="warn" title="No Gemini key yet">
                   Semantic search stays empty until a key is set; synth capture can still queue.
                 </Callout>
+              ) : null}
+              {embedChoice === "cloud" &&
+              synthChoice !== "cloud" &&
+              (presence?.gemini_in_keychain || presence?.gemini_env) &&
+              !modelVerify ? (
+                <div className="toolbar">
+                  <button type="button" disabled={verifying} onClick={() => void verifyModelKeys()}>
+                    {verifying ? "Checking…" : "Check key now"}
+                  </button>
+                  <span className="muted">A Gemini key is already stored — prove it with one real call.</span>
+                </div>
               ) : null}
               <ModelCheckRow
                 check={modelCheckFor(modelVerify, "gemini_embed")}

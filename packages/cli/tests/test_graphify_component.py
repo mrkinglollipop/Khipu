@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -151,6 +152,41 @@ class GraphifyInstallTest(unittest.TestCase):
         self.assertEqual(result["error"], "missing_pending_graphify")
         select_row.assert_called_once()
         self.assertEqual(select_row.call_args.args[0], "remote")
+
+    @mock.patch("khipu.components_graphify.refresh_matrix_cache")
+    @mock.patch("khipu.components_graphify.match_row_for_install")
+    @mock.patch("khipu.components_graphify.read_versions")
+    def test_no_matrix_row_carries_plain_words_not_a_bare_code(
+        self, read_versions, match_row, refresh_cache
+    ):
+        """A stale matrix or a dev build newer than any khipu_app_min row
+        must never surface `matrix_row_refused` verbatim to the desktop —
+        it must refresh the matrix once and, still refused, hand back
+        title/detail/fix (2026-09-05 pixel-pass finding 1)."""
+        pending = {
+            "graphify_semver": "9.9.9",
+            "graphify_tarball_url": "https://example.invalid/khipu-graphify-9.9.9.tar.gz",
+            "postgres_image": "ghcr.io/mrkinglollipop/khipu-postgres:19beta3-pgvector",
+            "pgvector_min": "0.8.6",
+        }
+        read_versions.return_value = {
+            "pending": pending,
+            "postgres": {"mode": "local_docker", "image": pending["postgres_image"]},
+        }
+        match_row.return_value = None
+
+        result = install_graphify(first_run=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "matrix_row_refused")
+        refresh_cache.assert_called_once()
+        self.assertEqual(match_row.call_count, 2)
+        bare_code_re = re.compile(r"^[a-z_]+$")
+        for key in ("title", "detail", "fix"):
+            self.assertIn(key, result, msg=f"missing {key!r} in {result!r}")
+            value = result[key]
+            self.assertIsInstance(value, str)
+            self.assertNotRegex(value, bare_code_re, msg=f"{key} is a bare code: {value!r}")
 
 
 class GraphifyEmptySourcesSmokeTest(unittest.TestCase):

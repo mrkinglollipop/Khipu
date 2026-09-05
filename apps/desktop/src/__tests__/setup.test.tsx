@@ -9,7 +9,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
 import { Welcome } from "../Welcome";
 import App from "../App";
-import { IntegrationsPanel } from "../IntegrationsPanel";
+import { IntegrationsPanel, verifiedLine } from "../IntegrationsPanel";
 
 const invokeMock = vi.fn();
 
@@ -532,6 +532,32 @@ describe("Welcome › Model step — key verify", () => {
     expect(screen.queryByText("AIzaFAKE")).not.toBeInTheDocument();
   });
 
+  it("offers 'Check key now' for an already-stored key with no verify result yet, and proves it on click", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "secrets_presence") return JSON.stringify({ gemini_in_keychain: true });
+      if (cmd === "khipu_secrets_verify") {
+        return JSON.stringify({
+          ok: true,
+          checks: [
+            { id: "gemini_embed", ok: true, title: "Key works · gemini-embedding-2", detail: "", model: "gemini-embedding-2", seconds: 0.4 },
+            { id: "gemini_generate", ok: true, title: "Key works · gemini-2.5-flash", detail: "", model: "gemini-2.5-flash", seconds: 0.3 },
+          ],
+        });
+      }
+      return "{}";
+    });
+
+    renderModelStep();
+
+    const checkButton = await screen.findByRole("button", { name: "Check key now" });
+    fireEvent.click(checkButton);
+
+    expect(invokeMock).toHaveBeenCalledWith("khipu_secrets_verify");
+    await waitFor(() => expect(screen.getByText("Key works · gemini-embedding-2")).toBeInTheDocument());
+    // Once a result exists, the one-shot button gives way to the ongoing "Check again" row.
+    expect(screen.queryByRole("button", { name: "Check key now" })).not.toBeInTheDocument();
+  });
+
   it("shows the plain-words failure and a Check again button on a 401, and Next stays enabled", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "secrets_presence") return JSON.stringify({ gemini_in_keychain: false });
@@ -567,6 +593,106 @@ describe("Welcome › Model step — key verify", () => {
     expect(screen.getByRole("button", { name: "Check again" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Next/ })).not.toBeDisabled();
     expect(screen.queryByText("AIzaFAKE")).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Graph step — 2026-09-05 pixel-pass finding 1: `matrix_row_refused` must
+// never reach the DOM verbatim, and when the engine sends title/detail/fix
+// they must render alongside the existing Retry + Skip buttons.
+// ---------------------------------------------------------------------------
+
+function renderGraphStep() {
+  return render(
+    <Welcome
+      dsnOk={true}
+      refreshDsn={async () => {}}
+      runKhipu={async () => "{}"}
+      onFinish={() => {}}
+      openIntegrations={() => {}}
+      initialStep="graph"
+      initialStepKey={1}
+    />,
+  );
+}
+
+describe("Welcome › Graph step", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("never shows the bare code matrix_row_refused when the engine sends no plain words", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "install_graphify") {
+        return JSON.stringify({ ok: false, error: "matrix_row_refused" });
+      }
+      return "{}";
+    });
+
+    const { container } = renderGraphStep();
+
+    await waitFor(() =>
+      expect(screen.getByText("The graph builder did not finish installing")).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("matrix_row_refused")).not.toBeInTheDocument();
+    assertNoRawCode(container);
+  });
+
+  it("renders the fix sentence and Retry + Skip when title/detail/fix are present", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "install_graphify") {
+        return JSON.stringify({
+          ok: false,
+          error: "matrix_row_refused",
+          title: "No graph builder is listed for this Khipu yet",
+          detail: "Khipu 0.4.1-dev is not in the compatibility list (graph builder 1.0.0).",
+          fix: "Update Khipu, or skip this step and install the graph builder later from Settings → Components.",
+        });
+      }
+      return "{}";
+    });
+
+    renderGraphStep();
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          /Update Khipu, or skip this step and install the graph builder later from Settings/,
+        ),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Skip for now/ })).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// verifiedLine — 2026-09-05 pixel-pass finding 3: a live capture beat is
+// evidence the hook works even with no timed round-trip probe for this pack
+// yet, so "Not verified on this pack yet" must not sit beside "Recording".
+// ---------------------------------------------------------------------------
+
+describe("verifiedLine — live beat vs. no probe", () => {
+  it("reports Working when there is no probe but the hook has a live beat", () => {
+    const result = verifiedLine("claude_code", undefined, null, {
+      ok: true,
+      seen: true,
+      captures: 3,
+      last_captured_age_s: 42,
+    });
+    expect(result.mark).toBe("ok");
+    expect(result.text).toContain("Working · hook ran");
+    expect(result.text).toContain("Verify to time a round trip");
+  });
+
+  it("keeps 'Not verified on this pack yet' when there is no probe and no beat", () => {
+    const result = verifiedLine("claude_code", undefined, null, {
+      ok: false,
+      seen: false,
+      captures: 0,
+    });
+    expect(result.mark).toBe("off");
+    expect(result.text).toBe("Not verified on this pack yet — Verify runs it");
   });
 });
 

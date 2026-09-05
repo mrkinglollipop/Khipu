@@ -73,7 +73,7 @@ const RAW_CODE_RE = /^[a-z_]+$/;
  *  Applied only to whole payload fields (a stage's `title`/`detail`/`fix`, or
  *  a top-level `error`/`detail`) — never to surrounding prose this component
  *  writes itself, so an ordinary short word never collides with it. */
-function plainWords(text: string | undefined | null): string | null {
+export function plainWords(text: string | undefined | null): string | null {
   if (text == null) return null;
   const trimmed = text.trim();
   if (!trimmed) return null;
