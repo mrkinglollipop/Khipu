@@ -1587,6 +1587,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
 def cmd_config(args: argparse.Namespace) -> int:
     from khipu.config import (
         FLOAT_SETTINGS,
+        LIST_SETTINGS,
         capture_mode,
         config_file,
         gateway_url,
@@ -1623,6 +1624,18 @@ def cmd_config(args: argparse.Namespace) -> int:
         path = set_float_setting(key, value)
         print(json.dumps({"ok": True, key: float_setting(key), "config_file": str(path)}))
         return 0
+    if args.set and args.set[0] in LIST_SETTINGS:
+        # user_aliases is a comma-separated list, not a path (2026-09-05):
+        # `khipu config --set user_aliases "matt,matthew"`.
+        from khipu.commitments import reset_user_patterns
+        from khipu.config import list_setting, set_list_setting
+
+        key, raw = args.set
+        path = set_list_setting(key, raw)
+        if key == "user_aliases":
+            reset_user_patterns()
+        print(json.dumps({"ok": True, key: list(list_setting(key)), "config_file": str(path)}))
+        return 0
     if args.set or args.unset:
         from khipu.config import path_settings_status, set_path_setting
 
@@ -1641,7 +1654,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             )
         )
         return 0
-    from khipu.config import path_settings_status
+    from khipu.config import list_setting, path_settings_status
 
     out = {
         "capture_mode": capture_mode(),
@@ -1654,6 +1667,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             else "default"
         ),
         "paths": path_settings_status(),
+        "user_aliases": list(list_setting("user_aliases")),
         "config_file": str(config_file()),
         "config": load_config(),
     }
@@ -2853,8 +2867,9 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=2,
         metavar=("KEY", "VALUE"),
         help="Persist a machine-specific path (memory_root, memory_repo, "
-        "capture_v2, graph_sqlite, gemini_key_file) or a 0-1 similarity knob "
-        "(dedup_similarity, commitment_close_similarity)",
+        "capture_v2, graph_sqlite, gemini_key_file), a 0-1 similarity knob "
+        "(dedup_similarity, commitment_close_similarity), or the comma-"
+        'separated user_aliases list (e.g. --set user_aliases "matt,matthew")',
     )
     cfg.add_argument("--unset", metavar="KEY", help="Remove a path setting")
     cfg.add_argument(

@@ -7,9 +7,28 @@ merge), the cost guard, and the never-DELETE contract.
 """
 from __future__ import annotations
 
+import os
 import unittest
+from unittest import mock
 
+from khipu import commitments as co
 from khipu import hygiene
+
+# The owner/actor regexes are alias-driven (2026-09-05): "Matt" is only
+# recognised as the user when "matt" is a configured alias. This file's
+# fixtures were written when "matt" was hardcoded, so pin it for the module
+# (mirrors `khipu config --set user_aliases matt`) and reset on the way out.
+_alias_env_patch = mock.patch.dict(os.environ, {"KHIPU_USER_ALIASES": "matt"})
+
+
+def setUpModule():
+    _alias_env_patch.start()
+    co.reset_user_patterns()
+
+
+def tearDownModule():
+    _alias_env_patch.stop()
+    co.reset_user_patterns()
 
 
 class _Cursor:
@@ -107,13 +126,24 @@ class FilterFirstTest(unittest.TestCase):
         cur = _Cursor(_rows(
             "Drive 46 is still running",
             "Send 'screen free' message to Khipu session",
-            "Matt to decide whether 0.3.17 ships with the seal fix",
+            "Complete the audit of the licence wording",
         ))
         judge = _Judge()
         report = hygiene.run_commitments_hygiene(cur, judge=judge)
-        self.assertEqual(judge.calls, [["Matt to decide whether 0.3.17 ships with the seal fix"]])
+        self.assertEqual(judge.calls, [["Complete the audit of the licence wording"]])
         self.assertEqual(report["counts"]["drop"], 2)
         self.assertEqual(report["counts"]["keep"], 1)
+
+    def test_a_user_owed_row_never_reaches_the_model_either(self):
+        """2026-09-05: the deterministic owner rule (not the filter) is the
+        other reason an item never reaches the model — it is kept outright
+        as "user-owed"."""
+        cur = _Cursor(_rows("Matt to decide whether 0.3.17 ships with the seal fix"))
+        judge = _Judge()
+        report = hygiene.run_commitments_hygiene(cur, judge=judge)
+        self.assertEqual(judge.calls, [])
+        self.assertEqual(report["counts"]["keep"], 1)
+        self.assertEqual(report["verdicts"][0]["reason"], "user-owed")
 
     def test_filter_reason_is_reported_verbatim(self):
         cur = _Cursor(_rows("Drive 46 is still running"))
@@ -147,7 +177,7 @@ class ModelVerdictTest(unittest.TestCase):
         self.assertEqual(report["counts"].get("drop", 0), 0)
 
     def test_cost_guard_caps_model_calls_and_reports_unjudged(self):
-        texts = [f"Matt to decide item number {i} before the release" for i in range(90)]
+        texts = [f"Ship item number {i} before the release" for i in range(90)]
         cur = _Cursor(_rows(*texts))
         judge = _Judge()
         report = hygiene.run_commitments_hygiene(cur, judge=judge, max_calls=1)

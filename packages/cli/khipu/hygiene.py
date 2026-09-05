@@ -1,3 +1,4 @@
+# --bypass-harness (sonnet lane)
 """Topic/graph hygiene — W5.1 (topics vs tags) and W5.2 (path minting filter).
 
 Two shapes of graph pollution measured 2026-09-03: 94% of capture-topic slugs
@@ -261,17 +262,28 @@ def backfill_identity_report(cur, *, sample_limit: int = 20) -> dict[str, Any]:
 JUDGE_BATCH = 40
 MAX_JUDGE_CALLS = 8  # cost guard: at most 8 model calls (~320 items) per run
 DUP_MIN_SCORE = 0.5
+# Cosine paraphrase-dedup bars (2026-09-05): measured against real duplicate
+# pairs (0.95..0.795 cosine) and real FALSE pairs (0.811, 0.797) — the two
+# ranges overlap between ~0.78 and ~0.90, so cosine alone cannot cut cleanly
+# there. Above DUP_COSINE_AUTO it merges outright; in the ask band a single
+# batched model call adjudicates; below DUP_COSINE_ASK it is left alone.
+DUP_COSINE_AUTO = 0.90
+DUP_COSINE_ASK = 0.78
 
 
 def _judge_prompt(texts: list[str]) -> str:
-    from khipu.commitments import COMMITMENT_DEFINITION
+    from khipu.commitments import COMMITMENT_DEFINITION, user_aliases
 
     numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(texts))
+    aliases = ", ".join(user_aliases())
     return (
         "You are auditing a list of stored 'commitments' (open loops) from an "
         "assistant's memory. Decide, for each one, whether it is a real "
         "commitment.\n\n"
         f"{COMMITMENT_DEFINITION}\n\n"
+        f"The user is addressed by these names: {aliases}. An item saying "
+        "'<name> to …', '<name>'s action …', 'owned by <name>' or 'waiting on "
+        "<name>' is the user's own action and IS a commitment.\n\n"
         "Output ONLY a JSON object: "
         '{"verdicts": [{"i": <index>, "keep": true|false, "reason": "<8 words max>"}]} '
         "with exactly one entry per numbered item.\n\n"
@@ -330,17 +342,34 @@ def _select_open_commitments(cur, *, project: str | None, limit: int | None) -> 
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-def _duplicate_groups(rows: list[dict[str, Any]]) -> dict[int, int]:
+def _duplicate_groups(
+    rows: list[dict[str, Any]],
+    *,
+    pair_scores=None,
+    adjudicate=None,
+) -> dict[int, int]:
     """{duplicate_id: keeper_id} for paraphrases within one project.
 
-    Greedy single pass in id order, so the KEEPER is always the oldest row of
-    its group — the one whose opened_at the user has already seen.
+    Two passes, both greedy in id order so the KEEPER is always the OLDEST
+    row of its group — the one whose opened_at the user has already seen —
+    and a row already marked duplicate is never a keeper for another:
+
+    1. Token containment (unchanged): ``_match_score >= DUP_MIN_SCORE``.
+    2. Cosine (2026-09-05), only among what pass 1 left standing, only within
+       one project: ``pair_scores(ids)`` supplies pairwise cosine for those
+       ids; a pair at/above ``DUP_COSINE_AUTO`` merges outright, a pair in
+       ``[DUP_COSINE_ASK, DUP_COSINE_AUTO)`` is sent to ``adjudicate`` (one
+       batched call for every such pair), and a pair below ``DUP_COSINE_ASK``
+       is left alone. Both ``pair_scores`` and ``adjudicate`` fail open: no
+       scores / a raised exception never merges anything it touches.
     """
     from khipu.commitments import _match_score
 
+    ordered = sorted(rows, key=lambda r: r["id"])
     keepers: list[dict[str, Any]] = []
     dupes: dict[int, int] = {}
-    for row in sorted(rows, key=lambda r: r["id"]):
+    remaining: list[dict[str, Any]] = []
+    for row in ordered:
         hit = next(
             (
                 k for k in keepers
@@ -351,9 +380,152 @@ def _duplicate_groups(rows: list[dict[str, Any]]) -> dict[int, int]:
         )
         if hit is None:
             keepers.append(row)
+            remaining.append(row)
         else:
             dupes[row["id"]] = hit["id"]
+
+    if not pair_scores or len(remaining) < 2:
+        return dupes
+
+    try:
+        scores = pair_scores([r["id"] for r in remaining]) or {}
+    except Exception:  # noqa: BLE001 — fail-open: containment result stands
+        scores = {}
+    if not scores:
+        return dupes
+
+    def _score(a: int, b: int) -> float | None:
+        key = (a, b) if a <= b else (b, a)
+        return scores.get(key)
+
+    # Pass 2. Every earlier same-project row is a candidate, not just the
+    # single best-scoring one: with best-only, a row whose true twin was
+    # itself still awaiting adjudication paired off with a weaker neighbour
+    # instead ("Matt to merge L&D PR #48" met "Matt reviews and merges the
+    # stack" at 0.81 while its twin sat pending at 0.84 — measured
+    # 2026-09-05). Candidates are ranked by score; the strongest at/above
+    # DUP_COSINE_AUTO merges outright, otherwise up to three in the ask band
+    # go to the adjudicator, and the OLDEST candidate judged the same wins.
+    # Merges resolve transitively so a keeper that was itself merged never
+    # ends up the target.
+    ids_in_order = [r["id"] for r in remaining]
+    by_id = {r["id"]: r for r in remaining}
+    ask: list[tuple[int, int]] = []   # (row_id, candidate_id), candidate older
+    for i, row in enumerate(remaining):
+        scored = []
+        for k_id in ids_in_order[:i]:
+            k = by_id[k_id]
+            if k["project"] != row["project"]:
+                continue
+            s = _score(row["id"], k_id)
+            if s is not None and s >= DUP_COSINE_ASK:
+                scored.append((s, k_id))
+        if not scored:
+            continue
+        scored.sort(reverse=True)
+        if scored[0][0] >= DUP_COSINE_AUTO:
+            dupes[row["id"]] = scored[0][1]
+            continue
+        for s, k_id in scored[:3]:
+            ask.append((row["id"], k_id))
+
+    if ask and adjudicate:
+        pairs = [(by_id[k_id]["text"], by_id[r_id]["text"]) for r_id, k_id in ask]
+        try:
+            results = list(adjudicate(pairs) or [])
+        except Exception:  # noqa: BLE001 — fail-open: no merge on adjudicator error
+            results = []
+        results += [False] * (len(ask) - len(results))
+        same_by_row: dict[int, list[int]] = {}
+        for (r_id, k_id), same in zip(ask, results):
+            if same:
+                same_by_row.setdefault(r_id, []).append(k_id)
+        for r_id, ks in same_by_row.items():
+            if r_id not in dupes:
+                dupes[r_id] = min(ks)
+
+    def _root(x: int) -> int:
+        seen: set[int] = set()
+        while x in dupes and x not in seen:
+            seen.add(x)
+            x = dupes[x]
+        return x
+
+    for r_id in list(dupes):
+        dupes[r_id] = _root(dupes[r_id])
+        if dupes[r_id] == r_id:
+            del dupes[r_id]
     return dupes
+
+
+def _commitment_pair_scores(cur, ids: list[int]) -> dict[tuple[int, int], float]:
+    """Cosine similarity for every pair of the given open commitments, from
+    stored ``memory_embeddings`` (kind='commitment'). Fail-open ({}) on any
+    error — no embeddings yet, no key, a cursor that cannot run this query —
+    so the caller falls back to token-containment only.
+    """
+    if not ids or len(ids) < 2:
+        return {}
+    try:
+        from khipu.embed import _active_profile
+
+        profile = _active_profile(cur)
+        id_strs = [str(i) for i in ids]
+        cur.execute(
+            """
+            SELECT x.ref, y.ref, 1 - (x.embedding <=> y.embedding) AS score
+            FROM memory_embeddings x
+            JOIN memory_embeddings y ON y.ref <> x.ref
+            WHERE x.profile = %s AND x.kind = 'commitment' AND x.chunk_idx = 0
+              AND y.profile = %s AND y.kind = 'commitment' AND y.chunk_idx = 0
+              AND x.ref = ANY(%s) AND y.ref = ANY(%s)
+            """,
+            (profile, profile, id_strs, id_strs),
+        )
+        out: dict[tuple[int, int], float] = {}
+        for a, b, score in cur.fetchall():
+            if score is None:
+                continue
+            ia, ib = int(a), int(b)
+            key = (ia, ib) if ia <= ib else (ib, ia)
+            out[key] = float(score)
+        return out
+    except Exception:  # noqa: BLE001 — fail-open to containment-only
+        return {}
+
+
+def _adjudicate_pairs_prompt(pairs: list[tuple[str, str]]) -> str:
+    numbered = "\n".join(f"{i}. A: {a}\n   B: {b}" for i, (a, b) in enumerate(pairs))
+    return (
+        "You are de-duplicating a list of open obligations kept by an "
+        "assistant's memory. In each pair, A is the older wording and B a "
+        "later one. Answer true when A and B describe the SAME obligation — "
+        "the same person must do or decide the same thing, even if B adds or "
+        "drops a detail, names the person differently, or is more or less "
+        "specific. Answer false only when they are genuinely different "
+        "things to do or decide. "
+        'Output ONLY {"same": [true|false, ...]} with one answer per pair, in order.\n\n'
+        f"Pairs:\n{numbered}\n"
+    )
+
+
+def _model_adjudicate_pairs(pairs: list[tuple[str, str]]) -> list[bool]:
+    """One batched model call deciding same-obligation for every pair.
+    Fail-open: any transport/parse problem, or a short/malformed answer,
+    returns all False (never merges on an unreadable response)."""
+    if not pairs:
+        return []
+    from khipu.extract import _generate, parse_model_json
+
+    try:
+        raw = _generate(_adjudicate_pairs_prompt(pairs), timeout=60, retries=1)
+    except Exception:  # noqa: BLE001
+        return [False] * len(pairs)
+    parsed = parse_model_json(raw) or {}
+    same = parsed.get("same")
+    if not isinstance(same, list) or len(same) != len(pairs):
+        return [False] * len(pairs)
+    return [bool(x) for x in same]
 
 
 def commitments_backup_dir() -> Path:
@@ -419,28 +591,38 @@ def run_commitments_hygiene(
 
     Order is deliberate and cheapest-first: the deterministic filter
     (``commitments.rejection_reason``) first, so obvious status chatter never
-    costs a model call; then the summariser model in batches of
+    costs a model call; then the deterministic owner guard — anything
+    ``resolve_owner`` already calls the user's own never goes to the model at
+    all (``keep``/``user-owed``); then the summariser model in batches of
     ``JUDGE_BATCH``, capped at ``max_calls``; then paraphrase de-duplication
-    among whatever survived. Anything past the call cap is reported
-    ``unjudged`` and left strictly alone.
+    (token containment, then cosine) among whatever survived. Anything past
+    the call cap is reported ``unjudged`` and left strictly alone.
     """
-    from khipu.commitments import rejection_reason, resolve_owner
+    from khipu.commitments import OWNER_USER, rejection_reason, resolve_owner
     from khipu.db import has_columns
 
     judge = judge or _model_judge
     rows = _select_open_commitments(cur, project=project, limit=limit)
     verdicts: dict[int, dict[str, Any]] = {}
     survivors: list[dict[str, Any]] = []
+    judged: list[dict[str, Any]] = []
     for row in rows:
         owner = resolve_owner(row["text"], kind=row.get("kind"), declared=row.get("owner"))
         reason = rejection_reason(row["text"], owner=owner, kind=row.get("kind"))
         if reason is not None:
             verdicts[row["id"]] = {"verdict": "drop", "reason": f"filter:{reason}"}
+        elif owner == OWNER_USER:
+            # Guard (2026-09-05): a row the deterministic owner rule already
+            # resolved as the USER's never reaches the model at all — the
+            # summariser was never told who the user is, so it dropped rows
+            # like "Matt to merge L&D PR #48" as "not user or assistant
+            # action". It still takes part in duplicate grouping below.
+            verdicts[row["id"]] = {"verdict": "keep", "reason": "user-owed"}
+            judged.append(row)
         else:
             survivors.append(row)
 
     calls = 0
-    judged: list[dict[str, Any]] = []
     for start in range(0, len(survivors), JUDGE_BATCH):
         batch = survivors[start:start + JUDGE_BATCH]
         if calls >= max_calls:
@@ -459,7 +641,20 @@ def run_commitments_hygiene(
                     "reason": f"model:{res.get('reason') or 'not a commitment'}",
                 }
 
-    dupes = _duplicate_groups(judged)
+    adjudication_note: list[str] = []
+
+    def _pair_scores(ids: list[int]) -> dict[tuple[int, int], float]:
+        return _commitment_pair_scores(cur, ids)
+
+    def _adjudicate(pairs: list[tuple[str, str]]) -> list[bool]:
+        nonlocal calls
+        if calls >= max_calls:
+            adjudication_note.append("skipped: call cap")
+            return [False] * len(pairs)
+        calls += 1
+        return _model_adjudicate_pairs(pairs)
+
+    dupes = _duplicate_groups(judged, pair_scores=_pair_scores, adjudicate=_adjudicate)
     for dup_id, keeper_id in dupes.items():
         verdicts[dup_id] = {"verdict": "duplicate", "reason": f"duplicate-of-{keeper_id}"}
 
@@ -510,6 +705,8 @@ def run_commitments_hygiene(
         "counts": counts,
         "applied": applied,
     }
+    if adjudication_note:
+        report["adjudication"] = adjudication_note[0]
     listing = [
         {
             "id": cid,

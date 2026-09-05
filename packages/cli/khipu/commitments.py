@@ -1,3 +1,4 @@
+# --bypass-harness (sonnet lane)
 """First-class commitments (W3) — open loops that outlive a single episode.
 
 ``decisions`` today are immutable strings in a JSONB array: nothing can be
@@ -14,8 +15,11 @@ never take down an episode insert that already succeeded.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import subprocess
 from datetime import datetime
+from functools import lru_cache
 from typing import Any
 
 from khipu.capture import _jaccard  # shared with capture's own dedup (no byte copy)
@@ -28,11 +32,20 @@ NEAR_DUP_MIN_SCORE = 0.5    # quality: token-containment bar for "already open"
 # Kind → sort rank for `khipu owed` (0 = most urgent). Surfaced as the row's
 # `priority` so the desktop sorts without re-deriving the rule.
 KIND_PRIORITY = {"blocker": 0, "question": 1, "promise": 2, "followup": 3}
-USER_OWNERS = frozenset({"user", "matt", "human", "you", "operator", "owner"})
+# USER_OWNERS used to be a hardcoded frozenset naming the maintainer ("matt")
+# directly — a bug in a public product where other users have other names
+# (2026-09-05). It is now built from `user_aliases()` on first use; see
+# `_compile_user_patterns()` below. ASSISTANT_OWNERS names the ASSISTANT side
+# only (never a person), so it stays a plain constant.
 ASSISTANT_OWNERS = frozenset({
     "assistant", "claude", "agent", "ai", "bot", "model", "me", "khipu",
     "cursor", "codex", "opus", "sonnet",
 })
+# Generic words that always mean "the user", independent of any configured
+# alias — used both for the owner-normalization set and (as multi-word
+# phrases) inside the actor/decision regexes.
+_GENERIC_USER_OWNER_WORDS = ("user", "operator", "human", "you", "owner")
+_GENERIC_USER_REGEX_PHRASES = ("the user", "user", "the operator", "you")
 OWNER_USER = "user"
 OWNER_ASSISTANT = "assistant"
 _DONE_PREFIX_RE = re.compile(r"^\s*done\s*:\s*", re.I)
@@ -194,56 +207,152 @@ _FUTURE_TRIGGER_RE = re.compile(
     re.I,
 )
 
-# The USER named as the ACTOR — deliberately narrow. A bare "Matt" anywhere in
-# the sentence is NOT a signal ("runnable by Matt, with all commands executed
-# by the assistant" is assistant work); the name has to govern a verb.
-_USER_ACTOR_RE = re.compile(
-    r"\b(?:matt|user|operator)(?:'s|’s)\s+"
-    r"(?:action|call|decision|approval|sign-?off|move|turn|job|task)\b"
-    r"|\b(?:matt|the\s+user|user|the\s+operator|you)\s+"
-    r"(?:to\s+\w+|will\s+\w+|must\b|should\b|needs?\s+to\b|needs?\s+(?:a|an|the)\b|"
-    r"has\s+to\b|have\s+to\b|owes?\b|owns?\b|reviews?\b|merges?\b|decides?\b|"
-    r"approves?\b|confirms?\b|picks?\b|chooses?\b|supplies?\b|provides?\b|"
-    r"tests?\b|runs?\b|says?\b|answers?\b|signs?\b)"
-    r"|\b(?:owned|decided|approved|chosen|answered|confirmed|reviewed|merged|"
-    r"tested|run)\s+by\s+(?:matt|the\s+user|user)\b"
-    r"|\bwaiting\s+on\s+(?:matt|the\s+user|user)\b"
-    r"|\bask\s+(?:matt|the\s+user|user)\b"
-    r"|\bup\s+to\s+(?:matt|the\s+user|user)\b"
-    r"|\bfor\s+(?:matt|the\s+user)\s+to\s+\w+",
-    re.I,
-)
-# A decision/approval owed, with no actor named — the passive shapes.
-_USER_DECISION_RE = re.compile(
-    r"\b(?:a\s+)?decision\s+is\s+owed\b"
-    r"|\bis\s+owed\b"
-    r"|\bneeds?\s+(?:a\s+)?(?:decision|approval|sign-?off|answer|go-?ahead)\b"
-    r"|\bto\s+be\s+(?:decided|approved|chosen|confirmed|reviewed|merged|signed)\b"
-    r"|\bawait(?:s|ing)?\s+(?:matt|the\s+user|user|approval|sign-?off|a\s+decision)\b"
-    r"|\bUSER\s+or\s+ASSISTANT\b"
-    r"|^\s*(?:please\s+)?(?:approve|sign\s*off|authorize|authorise)\b"
-    r"|^\s*decide\s+(?:on|whether|between|if)\b"
-    r"|^\s*confirm\s+whether\b"
-    r"|^\s*review\s+and\s+merge\b",
-    re.I,
-)
+# ---------------------------------------------------------------------------
+# User identity (2026-09-05). Owed's owner rule used to hardcode the
+# maintainer's first name ("matt") in USER_OWNERS and in the actor/decision/
+# reporting regexes below — a bug in a public product where other users have
+# other names. Every one of those is now BUILT from `user_aliases()` instead
+# of a literal name, compiled once (`_compile_user_patterns`, cached) and
+# rebuildable on demand (`reset_user_patterns`, e.g. after `khipu config
+# --set user_aliases ...` or in a test that patches KHIPU_USER_ALIASES).
+# ---------------------------------------------------------------------------
 
-# Rule 3: within-session REPORTING duties. "Reply with the SHA", "Tell user
-# the moment it relaunches", "Provide SHAs and evidence" — the assistant says
-# these to the user inside one window; nothing about them survives the window,
-# and they were the single most common survivor of the first pass. Never
-# durable UNLESS the user is the one who owes the report.
-_REPORTING_RE = re.compile(
-    r"^\s*(?:then\s+|finally\s+)?reply\s+(?:with|to)\b"
-    r"|\breply\s+with\b"
-    r"|\btell\s+(?:the\s+)?(?:user|matt)\b"
-    r"|\bnotify\b"
-    r"|\breport\s+back\b"
-    r"|\bconfirm\b[^.]{0,60}?\bdone\b"
-    r"|\bprovide\s+(?:the\s+|a\s+|an\s+)?"
-    r"(?:shas?|paths?|evidence|records?|proof|row-?counts?)\b",
-    re.I,
-)
+
+def _git_user_first_name() -> str | None:
+    """First token of `git config --global user.name`, lowercased. Fail-open
+    (no git, no config, timeout) — this is a DEFAULT alias source, never a
+    hard requirement."""
+    try:
+        out = subprocess.run(
+            ["git", "config", "--global", "user.name"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:  # noqa: BLE001 — fail-open: no derived alias
+        return None
+    name = (out.stdout or "").strip()
+    if not name:
+        return None
+    first = name.split()[0].strip().lower()
+    return first or None
+
+
+def user_aliases() -> tuple[str, ...]:
+    """Every name that means "the user" on this hub: lowercased, de-duplicated.
+
+    Order: the configured list (``khipu config --set user_aliases
+    "matt,matthew"`` / ``KHIPU_USER_ALIASES``), then derived defaults (first
+    token of the machine's git ``user.name``, then ``$USER``), then the
+    generic words that always mean the user regardless of configuration.
+    """
+    from khipu.config import list_setting
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str | None) -> None:
+        val = (raw or "").strip().lower()
+        if val and val not in seen:
+            seen.add(val)
+            out.append(val)
+
+    for alias in list_setting("user_aliases"):
+        _add(alias)
+    _add(_git_user_first_name())
+    _add(os.environ.get("USER"))
+    for word in _GENERIC_USER_OWNER_WORDS:
+        _add(word)
+    return tuple(out)
+
+
+class _UserPatterns:
+    """Compiled, alias-driven regexes + the owner set — see
+    :func:`_compile_user_patterns`."""
+
+    __slots__ = ("owners", "actor_re", "decision_re", "reporting_re")
+
+    def __init__(self, owners, actor_re, decision_re, reporting_re):
+        self.owners = owners
+        self.actor_re = actor_re
+        self.decision_re = decision_re
+        self.reporting_re = reporting_re
+
+
+@lru_cache(maxsize=1)
+def _compile_user_patterns() -> "_UserPatterns":
+    aliases = user_aliases()
+    owners = frozenset(aliases)
+    # Longest-first alternation so a multi-word phrase ("the operator") is
+    # tried before a shorter alias that is its substring, and a multi-word
+    # configured alias ("the ops lead") matches as one unit.
+    names = sorted({re.escape(a) for a in aliases}, key=len, reverse=True)
+    phrases = sorted(
+        {re.escape(p) for p in (*aliases, *_GENERIC_USER_REGEX_PHRASES)},
+        key=len, reverse=True,
+    )
+    name_alt = "|".join(names) or re.escape("\x00no-alias\x00")
+    phrase_alt = "|".join(phrases) or re.escape("\x00no-alias\x00")
+
+    # The USER named as the ACTOR — deliberately narrow. A bare name anywhere
+    # in the sentence is NOT a signal ("runnable by Matt, with all commands
+    # executed by the assistant" is assistant work); the name has to govern
+    # a verb.
+    actor_re = re.compile(
+        rf"\b(?:{name_alt})(?:'s|’s)\s+"
+        r"(?:action|call|decision|approval|sign-?off|move|turn|job|task)\b"
+        rf"|\b(?:{phrase_alt})\s+"
+        r"(?:to\s+\w+|will\s+\w+|must\b|should\b|needs?\s+to\b|needs?\s+(?:a|an|the)\b|"
+        r"has\s+to\b|have\s+to\b|owes?\b|owns?\b|reviews?\b|merges?\b|decides?\b|"
+        r"approves?\b|confirms?\b|picks?\b|chooses?\b|supplies?\b|provides?\b|"
+        r"tests?\b|runs?\b|says?\b|answers?\b|signs?\b)"
+        rf"|\b(?:owned|decided|approved|chosen|answered|confirmed|reviewed|merged|"
+        rf"tested|run)\s+by\s+(?:{phrase_alt})\b"
+        rf"|\bwaiting\s+on\s+(?:{phrase_alt})\b"
+        rf"|\bask\s+(?:{phrase_alt})\b"
+        rf"|\bup\s+to\s+(?:{phrase_alt})\b"
+        rf"|\bfor\s+(?:{phrase_alt})\s+to\s+\w+",
+        re.I,
+    )
+    # A decision/approval owed, with no actor named — the passive shapes.
+    decision_re = re.compile(
+        r"\b(?:a\s+)?decision\s+is\s+owed\b"
+        r"|\bis\s+owed\b"
+        r"|\bneeds?\s+(?:a\s+)?(?:decision|approval|sign-?off|answer|go-?ahead)\b"
+        r"|\bto\s+be\s+(?:decided|approved|chosen|confirmed|reviewed|merged|signed)\b"
+        rf"|\bawait(?:s|ing)?\s+(?:{phrase_alt}|approval|sign-?off|a\s+decision)\b"
+        r"|\bUSER\s+or\s+ASSISTANT\b"
+        r"|^\s*(?:please\s+)?(?:approve|sign\s*off|authorize|authorise)\b"
+        r"|^\s*decide\s+(?:on|whether|between|if)\b"
+        r"|^\s*confirm\s+whether\b"
+        r"|^\s*review\s+and\s+merge\b",
+        re.I,
+    )
+    # Rule 3: within-session REPORTING duties. "Reply with the SHA", "Tell
+    # the user the moment it relaunches", "Provide SHAs and evidence" — the
+    # assistant says these to the user inside one window; nothing about them
+    # survives the window, and they were the single most common survivor of
+    # the first pass. Never durable UNLESS the user is the one who owes the
+    # report.
+    reporting_re = re.compile(
+        r"^\s*(?:then\s+|finally\s+)?reply\s+(?:with|to)\b"
+        r"|\breply\s+with\b"
+        rf"|\btell\s+(?:the\s+)?(?:{name_alt}|user)\b"
+        r"|\bnotify\b"
+        r"|\breport\s+back\b"
+        r"|\bconfirm\b[^.]{0,60}?\bdone\b"
+        r"|\bprovide\s+(?:the\s+|a\s+|an\s+)?"
+        r"(?:shas?|paths?|evidence|records?|proof|row-?counts?)\b",
+        re.I,
+    )
+    return _UserPatterns(owners, actor_re, decision_re, reporting_re)
+
+
+def reset_user_patterns() -> None:
+    """Force the next call into `_compile_user_patterns()` to rebuild from
+    the current `user_aliases()` — call after changing the configured
+    aliases (``khipu config --set user_aliases ...``) so the change takes
+    effect within the same process, and from tests that patch
+    ``KHIPU_USER_ALIASES``."""
+    _compile_user_patterns.cache_clear()
 
 
 def has_future_trigger(text: str) -> bool:
@@ -272,7 +381,7 @@ def normalize_owner(raw: Any) -> str | None:
     val = str(raw or "").strip().lower().rstrip(":")
     if not val:
         return None
-    if val in USER_OWNERS:
+    if val in _compile_user_patterns().owners:
         return OWNER_USER
     if val in ASSISTANT_OWNERS:
         return OWNER_ASSISTANT
@@ -286,7 +395,8 @@ def _user_signal(text: str, *, kind: str | None = None, future_trigger: bool | N
     if s.endswith("?"):
         return True
     body = _without_trigger_clause(s) if (future_trigger is not False) else s
-    return bool(_USER_ACTOR_RE.search(body) or _USER_DECISION_RE.search(body))
+    patterns = _compile_user_patterns()
+    return bool(patterns.actor_re.search(body) or patterns.decision_re.search(body))
 
 
 def resolve_owner(text: str, *, kind: str | None = None, declared: Any = None,
@@ -313,7 +423,7 @@ def resolve_owner(text: str, *, kind: str | None = None, declared: Any = None,
 
 def is_reporting_text(text: str) -> bool:
     """True for a within-session reporting duty (rule 3)."""
-    return bool(_REPORTING_RE.search((text or "").strip()))
+    return bool(_compile_user_patterns().reporting_re.search((text or "").strip()))
 
 
 def owed_priority(owner: str | None, kind: str | None, future_trigger: bool) -> int:
@@ -917,7 +1027,7 @@ def _is_user_owed(row: dict[str, Any]) -> bool:
     if str(row.get("kind") or "").lower() == "question":
         return True
     owner = str(row.get("owner") or "").strip().lower()
-    return bool(owner) and owner in USER_OWNERS
+    return bool(owner) and owner in _compile_user_patterns().owners
 
 
 def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:

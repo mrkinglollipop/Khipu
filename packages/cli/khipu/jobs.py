@@ -247,6 +247,7 @@ def run_nightly() -> int:
     _embed_backfill()
     _prune_query_cache()
     _mark_stale_commitments()
+    _hygiene_commitments()
     return rc
 
 
@@ -315,6 +316,35 @@ def _mark_stale_commitments() -> None:
             f.write(f"commitments-mark-stale: {json.dumps(out, default=str)[:300]}\n".encode())
     except OSError:
         pass
+
+
+def _hygiene_commitments() -> None:
+    """W3 Owed quality (2026-09-05): run the two hygiene passes every night
+    instead of only on demand via `khipu hygiene commitments`.
+
+    Same posture as `_mark_stale_commitments` — a backup first
+    (``hygiene.backup_commitments``, never DELETEs), then the model-free
+    ownership pass (``run_session_ended_pass``) and the re-judge/dedup pass
+    (``run_commitments_hygiene``), both applied. Fail-open: a failure here is
+    logged and must never turn a good nightly into a bad one (the external
+    CONSOLIDATE_NIGHTLY driver's exit code is what gates job_status/doctor).
+    """
+    try:
+        from khipu import hygiene
+        from khipu.db import connect
+
+        with connect() as conn:
+            backup_dir = hygiene.backup_commitments(conn)
+            with conn.cursor() as cur:
+                session_report = hygiene.run_session_ended_pass(cur, apply=True)
+                rejudge_report = hygiene.run_commitments_hygiene(cur, apply=True)
+            conn.commit()
+        _nightly_log(
+            f"[khipu-hygiene] session-ended {session_report.get('counts')} · "
+            f"rejudge {rejudge_report.get('counts')} · backup {backup_dir}"
+        )
+    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
+        _nightly_log(f"[khipu-hygiene] skipped: {type(exc).__name__}: {exc}")
 
 
 def _reconcile_notes_if_due() -> None:
