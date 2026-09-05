@@ -228,6 +228,38 @@ def uninstall_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
     return {"ok": True, "results": results}
 
 
+def ensure_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
+    """What a first-run or reconnect needs: every job scheduled, without
+    clobbering one that is already there. Missing → installed; installed
+    but stale (app-rendered) → re-rendered with its baked env kept;
+    maintainer-managed (plist_external) → left exactly as it is; current →
+    untouched. install_scheduled_jobs() alone rewrote all three every time,
+    which on a Mac that runs the jobs from a source checkout would have
+    silently repointed the nightly at the app bundle (2026-09-05)."""
+    names = jobs or list(_JOB_TEMPLATE)
+    out: dict[str, Any] = {"installed": [], "refreshed": [], "external": [], "current": [], "results": []}
+    for job in names:
+        label = _LABELS.get(job)
+        if not label:
+            continue
+        if not _plist_path(label).is_file():
+            r = install_job(job)
+            out["results"].append(r)
+            if r.get("ok"):
+                out["installed"].append(job)
+        elif plist_external(job):
+            out["external"].append(job)
+        elif plist_current(job) is False:
+            r = install_job(job, environ=_refresh_environ(job))
+            out["results"].append(r)
+            if r.get("ok"):
+                out["refreshed"].append(job)
+        else:
+            out["current"].append(job)
+    out["ok"] = all(r.get("ok") for r in out["results"])
+    return out
+
+
 def installed_jobs() -> list[str]:
     """Jobs in `_JOB_TEMPLATE` whose plist file actually exists on disk."""
     return [job for job in _JOB_TEMPLATE if _plist_path(_LABELS[job]).is_file()]
