@@ -112,6 +112,81 @@ class OwedCommandTest(unittest.TestCase):
         self.assertFalse(out["ok"])
 
 
+class OwedSnoozeCommandTest(unittest.TestCase):
+    """`khipu owed --snooze ID --until …` (desktop overhaul phase 4)."""
+
+    def test_compact_window_becomes_a_sql_interval(self):
+        cur = _FakeCur([("UPDATE commitments SET due_after", {"rowcount": 1})])
+        rc, out = _run(["owed", "--snooze", "5", "--until", "7d"], cur)
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["ok"])
+        sql, params = cur.calls[-1]
+        self.assertIn("now() + interval '7 days'", sql)
+        # Only the id is bound: the interval is computed in SQL, on the
+        # transaction's clock, never spliced from user text.
+        self.assertEqual(tuple(params), (5,))
+
+    def test_iso_date_is_bound_as_a_parameter(self):
+        cur = _FakeCur([("UPDATE commitments SET due_after", {"rowcount": 1})])
+        rc, out = _run(["owed", "--snooze", "9", "--until", "2026-09-30"], cur)
+        self.assertEqual(rc, 0)
+        sql, params = cur.calls[-1]
+        self.assertIn("%s::timestamptz", sql)
+        self.assertEqual(tuple(params), ("2026-09-30", 9))
+
+    def test_free_text_is_refused_rather_than_clearing_the_due_date(self):
+        cur = _FakeCur([])
+        rc, out = _run(["owed", "--snooze", "5", "--until", "after the release"], cur)
+        self.assertEqual(rc, 2)
+        self.assertFalse(out["ok"])
+        self.assertEqual(cur.calls, [])
+
+    def test_missing_id_reports_not_ok(self):
+        cur = _FakeCur([("UPDATE commitments SET due_after", {"rowcount": 0})])
+        rc, out = _run(["owed", "--snooze", "404", "--until", "2 weeks"], cur)
+        self.assertEqual(rc, 1)
+        self.assertFalse(out["ok"])
+
+
+class EpisodeEditCommandTest(unittest.TestCase):
+    """`khipu episode edit ID --summary TEXT` (desktop overhaul phase 3)."""
+
+    def test_edit_updates_the_summary_and_reembeds(self):
+        cur = _FakeCur([("UPDATE episodes SET summary", {"rowcount": 1})])
+        with mock.patch.object(cli, "_reembed_episode", return_value=True) as m:
+            rc, out = _run(["episode", "edit", "42", "--summary", "corrected"], cur)
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["reembedded"])
+        m.assert_called_once()
+        sql, params = cur.calls[0]
+        self.assertTrue(sql.startswith("UPDATE episodes SET summary"))
+        self.assertEqual(params, ("corrected", 42))
+
+    def test_reembed_failure_still_keeps_the_correction(self):
+        cur = _FakeCur([("UPDATE episodes SET summary", {"rowcount": 1})])
+        with mock.patch.object(cli, "_reembed_episode", side_effect=RuntimeError("no key")):
+            rc, out = _run(["episode", "edit", "42", "--summary", "corrected"], cur)
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["reembedded"])
+
+    def test_unknown_episode_reports_not_ok(self):
+        cur = _FakeCur([("UPDATE episodes SET summary", {"rowcount": 0})])
+        with mock.patch.object(cli, "_reembed_episode", return_value=True) as m:
+            rc, out = _run(["episode", "edit", "404", "--summary", "corrected"], cur)
+        self.assertEqual(rc, 1)
+        self.assertFalse(out["ok"])
+        m.assert_not_called()
+
+    def test_blank_summary_is_refused(self):
+        cur = _FakeCur([])
+        rc, out = _run(["episode", "edit", "42", "--summary", "   "], cur)
+        self.assertEqual(rc, 2)
+        self.assertFalse(out["ok"])
+        self.assertEqual(cur.calls, [])
+
+
 class EpisodeForgetCommandTest(unittest.TestCase):
     def test_forget_soft_deletes_and_removes_embeddings(self):
         cur = _FakeCur([

@@ -5,7 +5,6 @@ import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import {
-  confirm as confirmDialog,
   open as openDirectoryDialog,
   save as saveFileDialog,
 } from "@tauri-apps/plugin-dialog";
@@ -26,6 +25,7 @@ import khipuIcon from "./assets/khipu-icon.png";
 import {
   Callout,
   Chip,
+  Dialog,
   Disclosure,
   EmptyState,
   ListRow,
@@ -314,6 +314,12 @@ type Commitment = {
   opened_at?: string | null;
   due_after?: string | null;
   status?: string | null;
+  /** The close side of the lifecycle — `commitments.list_owed` has always
+   *  returned these; the read-only phase never rendered them. `closed_at` is
+   *  what the "Closed today" callout is built from. */
+  closed_episode?: number | null;
+  closed_at?: string | null;
+  close_reason?: string | null;
 };
 
 type OwedStatus = "open" | "closed" | "stale";
@@ -321,6 +327,18 @@ type OwedStatus = "open" | "closed" | "stale";
 /** How many commitments one screenful asks for. A count that lands exactly on
  *  the cap is shown as "N+", because it is a floor, not a total. */
 const OWED_LIMIT = 500;
+
+/** How many captures one page of Activity shows. `khipu activity` has no
+ *  `--offset`, so "Show 40 more" re-asks for a longer window (`--limit`) and
+ *  renders all of it: the list is newest-first, so a longer limit is always a
+ *  superset of a shorter one. */
+const ACTIVITY_PAGE = 40;
+
+/** The kinds `khipu search --kind` accepts on the modes this screen offers.
+ *  `media` is semantic-only and `node` is literal/hybrid-only, so neither is
+ *  offered as a chip: a filter that silently fails on the selected mode is
+ *  worse than no filter. */
+const SEARCH_KINDS = ["episode", "topic"] as const;
 
 /** A named red check, in plain words, with at most one fix. Home renders one
  *  callout per entry; `action` is omitted where the app has no honest fix to
@@ -380,6 +398,171 @@ function shortProject(project: string): string {
   }
   const parts = project.split("/").filter(Boolean);
   return parts[parts.length - 1] ?? project;
+}
+
+/** `session_id` is `harness:uuid`, so the harness is the half before the
+ *  colon — the same split `khipu search --harness` does server-side. */
+function harnessFromSession(sessionId: string | null | undefined): string | null {
+  if (!sessionId) return null;
+  const at = sessionId.indexOf(":");
+  return at > 0 ? sessionId.slice(0, at) : null;
+}
+
+/** One full episode row from `khipu activity --show ID`. Everything here is a
+ *  column the CLI actually returns; nothing is derived on the way in. */
+type EpisodeDetail = {
+  id: number;
+  ts?: string | null;
+  ingested_at?: string | null;
+  session_id?: string | null;
+  scope?: string | null;
+  summary?: string | null;
+  topics?: unknown;
+  people?: unknown;
+  decisions?: unknown;
+  preferences?: unknown;
+  edges?: unknown;
+  raw?: unknown;
+};
+
+/** jsonb array columns carry whatever the capture wrote. Only the entries that
+ *  are already text become bullets — an object is never stringified into one. */
+function asStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item === "string" && item.trim()) out.push(item.trim());
+    else if (typeof item === "number") out.push(String(item));
+  }
+  return out;
+}
+
+/** `raw.open_loops` — what THIS capture opened, in the capture's own words.
+ *  Entries are strings or `{text, kind, due_after, owner}` objects
+ *  (khipu.commitments._normalize_open_loop). */
+function openLoopTexts(raw: unknown): string[] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  const loops = (raw as { open_loops?: unknown }).open_loops;
+  if (!Array.isArray(loops)) return [];
+  const out: string[] = [];
+  for (const item of loops) {
+    if (typeof item === "string" && item.trim()) out.push(item.trim());
+    else if (item && typeof item === "object") {
+      const text = (item as { text?: unknown }).text;
+      if (typeof text === "string" && text.trim()) out.push(text.trim());
+    }
+  }
+  return out;
+}
+
+function parseTs(iso: string | null | undefined): Date | null {
+  if (!iso) return null;
+  const d = new Date(String(iso).replace(" ", "T"));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** Day heading for the Activity list: Today / Yesterday / "Sep 2". */
+function dayLabel(iso: string | null | undefined): string {
+  const d = parseTs(iso);
+  if (!d) return "Undated";
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return "Today";
+  if (d.toDateString() === yesterday.toDateString()) return "Yesterday";
+  return d.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function timeLabel(iso: string | null | undefined): string {
+  const d = parseTs(iso);
+  return d ? d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+}
+
+function shortDateLabel(iso: string | null | undefined): string {
+  const d = parseTs(iso);
+  return d ? d.toLocaleDateString([], { month: "short", day: "numeric" }) : "—";
+}
+
+function isToday(iso: string | null | undefined): boolean {
+  const d = parseTs(iso);
+  return d != null && d.toDateString() === new Date().toDateString();
+}
+
+/** Graph node ids are `prefix:rest`. The prefix IS the kind — it is minted by
+ *  the graph builder, not guessed here — so a neighbour renders as a kind Tag
+ *  plus the rest of its own id. */
+const NODE_PREFIX_LABEL: Record<string, string> = {
+  topic: "Topic",
+  path: "Path",
+  episode: "Episode",
+  concept: "Concept",
+  symbol: "Symbol",
+  file: "File",
+  note: "Note",
+};
+
+function nodeKindLabel(id: string): string {
+  const at = id.indexOf(":");
+  if (at <= 0) return "Node";
+  const prefix = id.slice(0, at);
+  return NODE_PREFIX_LABEL[prefix] ?? prefix;
+}
+
+function nodeTitle(id: string): string {
+  const at = id.indexOf(":");
+  return at > 0 ? id.slice(at + 1) : id;
+}
+
+/** Neighbourhood rows out of one `khipu graph` payload. Shared by the Graph
+ *  sub-view and the Recall detail pane's "Connected" list so the two can never
+ *  read the same payload differently. */
+function graphNeighborsFrom(parsed: unknown): {
+  rootId: string | null;
+  neighbors: GraphNeighbor[];
+} {
+  if (parsed && typeof parsed === "object") {
+    const obj = parsed as {
+      id?: unknown;
+      edges?: unknown;
+      walk?: unknown;
+      graph_table?: unknown;
+    };
+    const rootId = typeof obj.id === "string" ? obj.id : null;
+
+    if (Array.isArray(obj.walk) && obj.walk.length > 0) {
+      const neighbors: GraphNeighbor[] = [];
+      for (const row of obj.walk as GraphWalkRow[]) {
+        if (typeof row.node_id !== "string" || !row.node_id) continue;
+        neighbors.push({
+          id: row.node_id,
+          via: typeof row.via === "string" ? row.via : undefined,
+          type: typeof row.type === "string" ? row.type : undefined,
+          hops: typeof row.hops === "number" ? row.hops : undefined,
+          mode: "walk",
+        });
+      }
+      return { rootId, neighbors };
+    }
+
+    const edges = Array.isArray(obj.edges) ? (obj.edges as GraphEdge[]) : [];
+    const edgeRows =
+      edges.length > 0
+        ? edges
+        : Array.isArray(obj.graph_table)
+          ? (obj.graph_table as GraphEdge[])
+          : [];
+    return {
+      rootId,
+      neighbors: edgeRows.map((e) => ({
+        id: e.dst === rootId ? (e.src ?? "") : (e.dst ?? e.src ?? ""),
+        src: e.src,
+        dst: e.dst,
+        type: e.type,
+        mode: "edge" as const,
+      })),
+    };
+  }
+  return { rootId: null, neighbors: [] };
 }
 
 // Any user-typed value reaches argparse as its own argv element, so a value
@@ -718,9 +901,31 @@ export default function App() {
       id: number;
       summary?: string;
       ts?: string;
+      ingested_at?: string;
+      session_id?: string;
+      scope?: string;
       mirror_age_seconds?: number;
     }>
   >([]);
+  const [activityCount, setActivityCount] = useState<number | null>(null);
+  // Held in a ref, not state, so Home's own `loadActivity(false)` can never
+  // shrink a list the Activity screen has already paged out.
+  const activityLimitRef = useRef(ACTIVITY_PAGE);
+  const [activityLimit, setActivityLimit] = useState(ACTIVITY_PAGE);
+  const [activityFilter, setActivityFilter] = useState("");
+  const [activityProject, setActivityProject] = useState<string | null>(null);
+  const [activityHarness, setActivityHarness] = useState<string | null>(null);
+  const [activitySince, setActivitySince] = useState<"today" | "7d" | null>(null);
+  const [activitySelected, setActivitySelected] = useState<number | null>(null);
+  const [activityDetail, setActivityDetail] = useState<EpisodeDetail | null>(
+    null,
+  );
+  const [activityDetailLoading, setActivityDetailLoading] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
+  const [editText, setEditText] = useState("");
+  const [editSaving, setEditSaving] = useState(false);
+  // One confirm for both screens' Forget button, through the shared Dialog.
+  const [forgetTarget, setForgetTarget] = useState<number | null>(null);
   const [opsEvents, setOpsEvents] = useState<
     Array<{ kind?: string; status?: string; created_at?: string }>
   >([]);
@@ -739,7 +944,6 @@ export default function App() {
   const [openaiCompatKey, setOpenaiCompatKey] = useState("");
   const [openaiCompatMsg, setOpenaiCompatMsg] = useState<string | null>(null);
   const [openaiCompatSaving, setOpenaiCompatSaving] = useState(false);
-  const [episodeShowId, setEpisodeShowId] = useState("");
   const [revSlug, setRevSlug] = useState("");
   const [revRecent, setRevRecent] = useState<RecentRevision[]>([]);
   const [revShowId, setRevShowId] = useState("");
@@ -760,6 +964,19 @@ export default function App() {
   const [searchMode, setSearchMode] = useState<SearchMode>("hybrid");
   const [searchProject, setSearchProject] = useState("");
   const [searchSince, setSearchSince] = useState("");
+  const [searchKind, setSearchKind] = useState("");
+  const [searchHarness, setSearchHarness] = useState("");
+  // The mock's chips row: a chip is the applied filter, "+ Filter" reveals the
+  // inputs that set them.
+  const [searchFiltersOpen, setSearchFiltersOpen] = useState(false);
+  // The app's own round-trip time. Not a CLI field — it is measured here and
+  // labelled as what it is.
+  const [searchElapsedMs, setSearchElapsedMs] = useState<number | null>(null);
+  const [recallSelected, setRecallSelected] = useState<string | null>(null);
+  const [recallDetail, setRecallDetail] = useState<EpisodeDetail | null>(null);
+  const [recallDetailLoading, setRecallDetailLoading] = useState(false);
+  const [recallNeighbors, setRecallNeighbors] = useState<GraphNeighbor[]>([]);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
   // Separate from the shared `actionBusy`: the results area needs to know
   // that THIS search is in flight so it can show a loading state instead of
   // leaving the "type a query" empty state on screen (audit 2026-09-04).
@@ -767,14 +984,19 @@ export default function App() {
   // Recall holds Search and the graph walk; the walk is a sub-view of a result,
   // not a peer destination (audit IA).
   const [recallView, setRecallView] = useState<"search" | "graph">("search");
-  const [owedRows, setOwedRows] = useState<Commitment[]>([]);
-  // Home previews the open ones; the Owed screen's own list follows its
-  // filter, so the two must not share one array.
-  const [owedOpenRows, setOwedOpenRows] = useState<Commitment[]>([]);
+  // One cached array per status. Home's preview, the rail badge and the Owed
+  // screen's own table all read this, so a write that moves a row between two
+  // statuses cannot leave one of them stale (phase 4: the segmented control
+  // shows all three counts at once, so all three are fetched).
+  const [owedByStatus, setOwedByStatus] = useState<
+    Partial<Record<OwedStatus, Commitment[]>>
+  >({});
   const [owedStatus, setOwedStatus] = useState<OwedStatus>("open");
   const [owedProject, setOwedProject] = useState<string | null>(null);
-  const [owedOpenCount, setOwedOpenCount] = useState<number | null>(null);
+  const [owedKind, setOwedKind] = useState<string | null>(null);
   const [owedLoading, setOwedLoading] = useState(false);
+  const [owedBusyId, setOwedBusyId] = useState<number | null>(null);
+  const [snoozeTarget, setSnoozeTarget] = useState<Commitment | null>(null);
   // Bumped by an attention item with no fix action, and by "Details": opens
   // Home's one disclosure instead of dead-ending.
   const [homeAdvancedKey, setHomeAdvancedKey] = useState(0);
@@ -785,6 +1007,12 @@ export default function App() {
   const [actionBusy, setActionBusy] = useState(false);
   const [activityRawKey, setActivityRawKey] = useState(0);
   const [revisionsRawKey, setRevisionsRawKey] = useState(0);
+
+  // Declared here, not next to the render, because the rail-badge effect below
+  // reads owedOpenCount in its dependency list.
+  const owedOpenRows = owedByStatus.open ?? [];
+  const owedOpenCount = owedByStatus.open ? owedByStatus.open.length : null;
+  const owedRows = owedByStatus[owedStatus] ?? [];
 
   const markLoading = (key: CacheTab, on: boolean) => {
     setLoading((prev) => ({ ...prev, [key]: on }));
@@ -1206,11 +1434,11 @@ export default function App() {
     }
   }, [loadDoctor]);
 
-  /** `khipu owed` — the open commitments a session left behind. Read-only in
-   *  this phase: Done / Snooze / Reopen land in phase 4 with the CLI's
-   *  `--close` / `--reopen` and the `due_after` update Snooze needs. */
+  /** `khipu owed` — the commitments a session left behind, cached per status
+   *  so the rail badge, Home's preview and this screen's table are one fetch
+   *  rather than three racing over one array. */
   const loadOwed = useCallback(
-    async (status: OwedStatus, force = false, forDisplay = true) => {
+    async (status: OwedStatus, force = false) => {
       const at = owedFetchedAt[status];
       if (!force && at != null && Date.now() - at < CACHE_TTL_MS) return;
       setOwedLoading(true);
@@ -1222,14 +1450,7 @@ export default function App() {
         ]);
         const parsed = parseJson(raw);
         const rows = Array.isArray(parsed) ? (parsed as Commitment[]) : [];
-        if (status === "open") {
-          setOwedOpenCount(rows.length);
-          setOwedOpenRows(rows);
-        }
-        // The rail's badge fetch must not replace the rows the Owed screen is
-        // showing for a different filter.
-        if (!forDisplay) return;
-        setOwedRows(rows);
+        setOwedByStatus((prev) => ({ ...prev, [status]: rows }));
         setOwedFetchedAt((prev) => ({ ...prev, [status]: Date.now() }));
       } catch (e) {
         setError(String(e));
@@ -1238,6 +1459,35 @@ export default function App() {
       }
     },
     [owedFetchedAt],
+  );
+
+  /** Done / Reopen / Snooze. Every write refetches all three statuses, because
+   *  each one can move a row between them — a stale count on the segmented
+   *  control is the same lie as a stale row in the table. */
+  const owedWrite = useCallback(
+    async (id: number, args: string[]) => {
+      setOwedBusyId(id);
+      setError(null);
+      try {
+        const raw = await runKhipu(["owed", ...args]);
+        const parsed = parseJson(raw) as
+          | { ok?: boolean; error?: string }
+          | null;
+        if (parsed && parsed.ok === false) {
+          setError(parsed.error ?? `Commitment #${id} was not updated.`);
+        }
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setOwedBusyId(null);
+        await Promise.all([
+          loadOwed("open", true),
+          loadOwed("closed", true),
+          loadOwed("stale", true),
+        ]);
+      }
+    },
+    [loadOwed],
   );
 
   /** Home's one fix action for a harness that stopped recording: the same
@@ -1258,17 +1508,25 @@ export default function App() {
     [loadDoctor],
   );
 
-  const loadActivity = useCallback(async (force = false) => {
+  const loadActivity = useCallback(async (force = false, limit?: number) => {
+    if (limit != null) activityLimitRef.current = limit;
     if (!needsFetch("activity", force)) return;
     markLoading("activity", true);
     setError(null);
     try {
-      const raw = await runKhipu(["activity", "--limit", "40"]);
+      const raw = await runKhipu([
+        "activity",
+        `--limit=${activityLimitRef.current}`,
+      ]);
       const parsed = parseJson(raw) as {
+        episode_count?: number;
         recent?: Array<{
           id: number;
           summary?: string;
           ts?: string;
+          ingested_at?: string;
+          session_id?: string;
+          scope?: string;
           mirror_age_seconds?: number;
         }>;
         ops_events?: Array<{
@@ -1289,6 +1547,9 @@ export default function App() {
       }
       setActivityText(prettyJson(raw));
       setActivityList(parsed.recent ?? []);
+      setActivityCount(
+        typeof parsed.episode_count === "number" ? parsed.episode_count : null,
+      );
       setOpsEvents(parsed.ops_events ?? []);
       if (isSecretsPresence(parsed.secrets)) {
         setSecretsPresence(pickSecretsPresence(parsed.secrets));
@@ -1353,56 +1614,106 @@ export default function App() {
     [revSlug],
   );
 
-  const showEpisode = useCallback(async () => {
-    const id = Number(episodeShowId);
-    if (!Number.isFinite(id) || id <= 0) {
-      setError("Enter a valid id");
-      return;
+  /** One full episode row, for both detail panes. `activity --show` is the
+   *  only CLI read that returns decisions / open loops / where. */
+  const loadEpisodeDetail = useCallback(
+    async (id: number): Promise<EpisodeDetail | null> => {
+      const raw = await runKhipu(["activity", `--show=${id}`]);
+      const parsed = parseJson(raw);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as EpisodeDetail)
+        : null;
+    },
+    [],
+  );
+
+  const selectEpisode = useCallback(
+    async (id: number) => {
+      setActivitySelected(id);
+      setActivityDetail(null);
+      setActivityDetailLoading(true);
+      setError(null);
+      try {
+        const detail = await loadEpisodeDetail(id);
+        setActivityDetail(detail);
+        setActivityText(prettyJson(JSON.stringify(detail ?? {}, null, 2)));
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setActivityDetailLoading(false);
+      }
+    },
+    [loadEpisodeDetail],
+  );
+
+  /** `khipu episode edit ID --summary TEXT` — correcting a summary a model got
+   *  wrong. The CLI re-embeds it in the same transaction; when it could not
+   *  (no key, no profile) it says so, and so do we, rather than implying the
+   *  correction is searchable when it is not. */
+  const saveSummary = useCallback(async () => {
+    const id = activitySelected;
+    const text = editText.trim();
+    if (id == null || !text) return;
+    setEditSaving(true);
+    setError(null);
+    try {
+      const raw = await runKhipu([
+        "episode",
+        "edit",
+        String(id),
+        `--summary=${text}`,
+      ]);
+      const parsed = parseJson(raw) as
+        | { ok?: boolean; reembedded?: boolean; error?: string }
+        | null;
+      if (parsed && parsed.ok === false) {
+        setError(parsed.error ?? `Episode #${id} was not updated.`);
+        return;
+      }
+      setEditOpen(false);
+      setActivityDetail(await loadEpisodeDetail(id));
+      await loadActivity(true);
+      if (parsed && parsed.reembedded === false) {
+        setError(
+          "Summary saved. Search by meaning picks it up at the next nightly.",
+        );
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setEditSaving(false);
     }
+  }, [activitySelected, editText, loadEpisodeDetail, loadActivity]);
+
+  /** `khipu episode forget ID` — soft-deletes the episode and drops its
+   * vectors. The only destructive write either pane makes, so it goes behind
+   * the shared confirm Dialog (audit 2026-09-04). */
+  const confirmForget = useCallback(async () => {
+    const id = forgetTarget;
+    if (id == null) return;
     setActionBusy(true);
     setError(null);
     try {
-      const raw = await runKhipu(["activity", "--show", String(id)]);
+      const raw = await runKhipu(["episode", "forget", String(id)]);
       setActivityText(prettyJson(raw));
       setActivityRawKey((k) => k + 1);
+      setForgetTarget(null);
+      if (activitySelected === id) {
+        setActivitySelected(null);
+        setActivityDetail(null);
+      }
+      if (recallDetail?.id === id) {
+        setRecallSelected(null);
+        setRecallDetail(null);
+        setRecallNeighbors([]);
+      }
+      await loadActivity(true);
     } catch (e) {
       setError(String(e));
     } finally {
       setActionBusy(false);
     }
-  }, [episodeShowId]);
-
-  /** `khipu episode forget ID` — soft-deletes the episode and drops its
-   * vectors. The pane's lede promised deleting was "planned"; this is it, and
-   * it is the only write the Activity pane makes, so it goes behind a native
-   * confirm (audit 2026-09-04). */
-  const forgetEpisode = useCallback(
-    async (rawId: string) => {
-      const id = Number(rawId);
-      if (!Number.isFinite(id) || id <= 0) {
-        setError("Enter a valid id");
-        return;
-      }
-      const yes = await confirmDialog(
-        `Forget episode #${id}? It stops appearing in search and recall, and its vectors are deleted. The row is kept (soft delete), so this is not a shred.`,
-        { title: "Forget episode", kind: "warning" },
-      );
-      if (!yes) return;
-      setActionBusy(true);
-      setError(null);
-      try {
-        const raw = await runKhipu(["episode", "forget", String(id)]);
-        setActivityText(prettyJson(raw));
-        setActivityRawKey((k) => k + 1);
-        await loadActivity(true);
-      } catch (e) {
-        setError(String(e));
-      } finally {
-        setActionBusy(false);
-      }
-    },
-    [loadActivity],
-  );
+  }, [forgetTarget, activitySelected, recallDetail, loadActivity]);
 
   const showRevision = useCallback(async (explicitId?: string) => {
     const id = Number(explicitId ?? revShowId);
@@ -1424,35 +1735,47 @@ export default function App() {
     }
   }, [revShowId]);
 
-  const doSearch = useCallback(async () => {
-    if (!query.trim()) return;
-    setActionBusy(true);
-    setSearchBusy(true);
-    setError(null);
-    setSearchErr(null);
-    try {
-      // Always `--mode`, never the deprecated `--semantic` alias. Filters are
-      // only passed when non-empty: an empty `--project ""` matches nothing.
-      const args = ["search", "--mode", searchMode, "--limit", "20"];
-      if (searchProject.trim()) {
-        args.push("--project", searchProject.trim());
+  /** `override` is how Activity's "Open in Recall" searches for an episode id
+   *  without waiting a render for the query and mode it just set. */
+  const doSearch = useCallback(
+    async (override?: { query?: string; mode?: SearchMode }) => {
+      const q = (override?.query ?? query).trim();
+      const mode = override?.mode ?? searchMode;
+      if (!q) return;
+      setActionBusy(true);
+      setSearchBusy(true);
+      setError(null);
+      setSearchErr(null);
+      setRecallSelected(null);
+      setRecallDetail(null);
+      setRecallNeighbors([]);
+      const startedAt = Date.now();
+      try {
+        // Always `--mode`, never the deprecated `--semantic` alias. Filters are
+        // only passed when non-empty (an empty `--project=` matches nothing)
+        // and always as one `--name=value` token, so a value beginning with a
+        // dash cannot be read as a flag.
+        const args = ["search", "--mode", mode, "--limit", "20"];
+        if (searchProject.trim()) args.push(`--project=${searchProject.trim()}`);
+        if (searchSince.trim()) args.push(`--since=${searchSince.trim()}`);
+        if (searchKind) args.push(`--kind=${searchKind}`);
+        if (searchHarness.trim()) args.push(`--harness=${searchHarness.trim()}`);
+        args.push("--", q);
+        const raw = await runKhipu(args);
+        setSearchText(prettyJson(raw));
+        setSearchElapsedMs(Date.now() - startedAt);
+      } catch (e) {
+        // Keep the query and any prior results — only the new attempt failed —
+        // and surface it inline (below) so it survives the toast timing out.
+        setError(String(e));
+        setSearchErr(String(e));
+      } finally {
+        setActionBusy(false);
+        setSearchBusy(false);
       }
-      if (searchSince.trim()) {
-        args.push("--since", searchSince.trim());
-      }
-      args.push("--", query.trim());
-      const raw = await runKhipu(args);
-      setSearchText(prettyJson(raw));
-    } catch (e) {
-      // Keep the query and any prior results — only the new attempt failed —
-      // and surface it inline (below) so it survives the toast timing out.
-      setError(String(e));
-      setSearchErr(String(e));
-    } finally {
-      setActionBusy(false);
-      setSearchBusy(false);
-    }
-  }, [query, searchMode, searchProject, searchSince]);
+    },
+    [query, searchMode, searchProject, searchSince, searchKind, searchHarness],
+  );
 
   /** `explicitId` is how a Recall result opens its own neighbourhood — the
    *  graph view used to be reachable only by pasting an id you had to already
@@ -1481,6 +1804,75 @@ export default function App() {
     }
   }, [nodeId, hops]);
 
+  /** Fill the detail pane for one hit: the full episode row when it is an
+   *  episode, and its one-hop neighbourhood either way. A topic or node has no
+   *  CLI read beyond what the search payload already carried, so its pane
+   *  shows that and its neighbours — nothing invented to fill the space. */
+  const selectRecallResult = useCallback(
+    async (r: SearchResult) => {
+      const id = String(r.id ?? r.label ?? "");
+      if (!id) return;
+      setRecallSelected(`${r.kind ?? "item"}:${id}`);
+      setRecallDetail(null);
+      setRecallNeighbors([]);
+      setRecallDetailLoading(true);
+      try {
+        if (r.kind === "episode") {
+          setRecallDetail(await loadEpisodeDetail(Number(id)));
+        }
+        const raw = await runKhipu([
+          "graph",
+          "--hops",
+          "1",
+          "--limit",
+          "20",
+          "--",
+          id,
+        ]);
+        setRecallNeighbors(graphNeighborsFrom(parseJson(raw)).neighbors);
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setRecallDetailLoading(false);
+      }
+    },
+    [loadEpisodeDetail],
+  );
+
+  const copyId = useCallback(async (value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedId(value);
+      window.setTimeout(
+        () => setCopiedId((c) => (c === value ? null : c)),
+        1500,
+      );
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  /** Activity → Recall: the episode id, matched as exact words. */
+  const openInRecall = useCallback(
+    (id: number) => {
+      setTab("recall");
+      setRecallView("search");
+      setSearchMode("literal");
+      setQuery(String(id));
+      void doSearch({ query: String(id), mode: "literal" });
+    },
+    [doSearch],
+  );
+
+  /** Owed → Activity: the capture that opened the commitment. */
+  const openInActivity = useCallback(
+    (id: number) => {
+      setTab("activity");
+      void selectEpisode(id);
+    },
+    [selectEpisode],
+  );
+
   useEffect(() => {
     if (!dsnOk) return;
     // Fire-and-forget: never block tab paint on CLI. Home is the merged
@@ -1492,7 +1884,13 @@ export default function App() {
     }
     if (tab === "revisions") void loadRevisions(false);
     if (tab === "activity") void loadActivity(false);
-    if (tab === "owed") void loadOwed(owedStatus, false);
+    if (tab === "owed") {
+      // All three, because the segmented control shows all three counts.
+      void loadOwed(owedStatus, false);
+      void loadOwed("open", false);
+      void loadOwed("closed", false);
+      void loadOwed("stale", false);
+    }
   }, [
     tab,
     dsnOk,
@@ -1508,7 +1906,7 @@ export default function App() {
   // known before anyone opens Owed.
   useEffect(() => {
     if (!dsnOk || owedOpenCount != null) return;
-    void loadOwed("open", false, false);
+    void loadOwed("open", false);
   }, [dsnOk, owedOpenCount, loadOwed]);
 
   /** Six destinations, one per named job (audit IA). Revisions is reachable
@@ -2010,55 +2408,10 @@ export default function App() {
     return [];
   }, [searchText]);
 
-  const graphData = useMemo<{
-    rootId: string | null;
-    neighbors: GraphNeighbor[];
-  }>(() => {
-    const parsed = parseJson(graphText);
-    if (parsed && typeof parsed === "object") {
-      const obj = parsed as {
-        id?: unknown;
-        edges?: unknown;
-        walk?: unknown;
-        graph_table?: unknown;
-      };
-      const rootId = typeof obj.id === "string" ? obj.id : null;
-
-      if (Array.isArray(obj.walk) && obj.walk.length > 0) {
-        const neighbors: GraphNeighbor[] = [];
-        for (const row of obj.walk as GraphWalkRow[]) {
-          if (typeof row.node_id !== "string" || !row.node_id) continue;
-          neighbors.push({
-            id: row.node_id,
-            via: typeof row.via === "string" ? row.via : undefined,
-            type: typeof row.type === "string" ? row.type : undefined,
-            hops: typeof row.hops === "number" ? row.hops : undefined,
-            mode: "walk",
-          });
-        }
-        return { rootId, neighbors };
-      }
-
-      const edges = Array.isArray(obj.edges) ? (obj.edges as GraphEdge[]) : [];
-      const edgeRows =
-        edges.length > 0
-          ? edges
-          : Array.isArray(obj.graph_table)
-            ? (obj.graph_table as GraphEdge[])
-            : [];
-      return {
-        rootId,
-        neighbors: edgeRows.map((e) => ({
-          id: e.dst === rootId ? (e.src ?? "") : (e.dst ?? e.src ?? ""),
-          src: e.src,
-          dst: e.dst,
-          type: e.type,
-          mode: "edge" as const,
-        })),
-      };
-    }
-    return { rootId: null, neighbors: [] };
-  }, [graphText]);
+  const graphData = useMemo(
+    () => graphNeighborsFrom(parseJson(graphText)),
+    [graphText],
+  );
 
   const openDrift = revisionsConflicts?.open_file_vs_pg ?? 0;
   const unreadableTopics = revisionsConflicts?.topic_files_unreadable ?? [];
@@ -2167,14 +2520,104 @@ export default function App() {
 
   const openOwed = owedOpenCount ?? 0;
 
-  // Owed: the project filter offers only projects the loaded rows actually
-  // carry, so a chip can never select an empty list.
+  // Owed: the project and kind filters offer only values the loaded rows
+  // actually carry, so a chip can never select an empty list.
   const owedProjects = Array.from(
     new Set(owedRows.map((c) => c.project).filter((p): p is string => Boolean(p))),
   ).sort();
-  const visibleOwed = owedProject
-    ? owedRows.filter((c) => c.project === owedProject)
-    : owedRows;
+  const owedKinds = Array.from(
+    new Set(owedRows.map((c) => c.kind).filter((k): k is string => Boolean(k))),
+  ).sort();
+  const visibleOwed = owedRows.filter(
+    (c) =>
+      (!owedProject || c.project === owedProject) &&
+      (!owedKind || c.kind === owedKind),
+  );
+  const owedCount = (status: OwedStatus): string => {
+    const rows = owedByStatus[status];
+    if (!rows) return "";
+    return ` · ${rows.length}${rows.length >= OWED_LIMIT ? "+" : ""}`;
+  };
+  // The mock's ok callout: commitments a later capture closed today. Built
+  // only from `closed_at`, which `commitments.list_owed` returns.
+  const closedToday = (owedByStatus.closed ?? []).filter((c) =>
+    isToday(c.closed_at),
+  );
+
+  // Activity: the filter row narrows the fetched page in the browser; the
+  // fetch itself is `--limit` only (the CLI has no --offset and no text
+  // filter), which is why "Show 40 more" re-asks for a longer window.
+  const activityProjects = Array.from(
+    new Set(
+      activityList
+        .map((ep) => projectFromScope(ep.scope))
+        .filter((p): p is string => Boolean(p)),
+    ),
+  ).sort();
+  const activityHarnesses = Array.from(
+    new Set(
+      activityList
+        .map((ep) => harnessFromSession(ep.session_id))
+        .filter((h): h is string => Boolean(h)),
+    ),
+  ).sort();
+  const activityFilterText = activityFilter.trim().toLowerCase();
+  const visibleActivity = activityList.filter((ep) => {
+    if (activityProject && projectFromScope(ep.scope) !== activityProject) {
+      return false;
+    }
+    if (activityHarness && harnessFromSession(ep.session_id) !== activityHarness) {
+      return false;
+    }
+    if (activitySince) {
+      const when = parseTs(ep.ts ?? ep.ingested_at);
+      if (!when) return false;
+      if (activitySince === "today") {
+        if (when.toDateString() !== new Date().toDateString()) return false;
+      } else if (Date.now() - when.getTime() > 7 * 24 * 3600 * 1000) {
+        return false;
+      }
+    }
+    if (
+      activityFilterText &&
+      !(ep.summary ?? "").toLowerCase().includes(activityFilterText) &&
+      !String(ep.id).includes(activityFilterText)
+    ) {
+      return false;
+    }
+    return true;
+  });
+  const sortedActivity = [...visibleActivity].sort((a, b) => {
+    const at = parseTs(a.ts ?? a.ingested_at)?.getTime() ?? 0;
+    const bt = parseTs(b.ts ?? b.ingested_at)?.getTime() ?? 0;
+    return bt - at;
+  });
+  const activityDays: Array<{ label: string; rows: typeof activityList }> = [];
+  for (const ep of sortedActivity) {
+    const label = dayLabel(ep.ts ?? ep.ingested_at);
+    const last = activityDays[activityDays.length - 1];
+    if (last && last.label === label) last.rows.push(ep);
+    else activityDays.push({ label, rows: [ep] });
+  }
+  /** ok / warn from the harness liveness the doctor payload already carries;
+   *  a harness it says nothing about gets the neutral dot, never a green one. */
+  const harnessDotClass = (sessionId: string | undefined): string => {
+    const h = harnessFromSession(sessionId);
+    const known = h ? liveness?.harnesses?.[h] : undefined;
+    if (!known || known.ok == null) return "hdot";
+    return known.ok ? "hdot ok" : "hdot warn";
+  };
+
+  // Recall: the relevance bar is relative to the top hit in THIS response —
+  // the CLI's fused score has no absolute scale.
+  const topScore = searchResults[0]?.score ?? null;
+  const selectedResult =
+    searchResults.find((r) => `${r.kind ?? "item"}:${r.id}` === recallSelected) ??
+    null;
+  const openLoopsFor = (episodeId: number | null | undefined) =>
+    episodeId == null
+      ? []
+      : owedOpenRows.filter((c) => c.opened_episode === episodeId);
 
   const renderOnDemandJobRow = (
     label: string,
@@ -2613,10 +3056,10 @@ export default function App() {
           </div>
         </section>
 
-        <section className={panelClass("activity")}>
+        <section className={`${panelClass("activity")} fill`}>
           <PanelHeader
             title="Activity"
-            lede="Every session Khipu recorded. Open one to read it, or forget one to drop it from search and recall."
+            lede="Every capture, newest first. Open one to read, correct, or forget it."
           >
             {loading.activity ? <Spinner /> : null}
             <button type="button" onClick={() => void loadActivity(true)}>
@@ -2624,100 +3067,286 @@ export default function App() {
               Refresh
             </button>
           </PanelHeader>
-          <div className="panel-body">
-            {opsEvents.length > 0 ? (
-              <div className="rows">
-                <div className="rows-head">System check-ins</div>
-                {opsEvents.slice(0, 8).map((ev, i) => (
-                  <div
-                    key={`${ev.kind}-${ev.created_at}-${i}`}
-                    className="row-item"
+          <div className="panel-body wide">
+            <div className="inline">
+              <input
+                className="activity-filter"
+                value={activityFilter}
+                onChange={(e) => setActivityFilter(e.target.value)}
+                placeholder="Filter captures"
+                aria-label="Filter captures"
+              />
+              <div className="chips">
+                {activityProjects.map((proj) => (
+                  <Chip
+                    key={`ap-${proj}`}
+                    on={activityProject === proj}
+                    onClick={() =>
+                      setActivityProject(activityProject === proj ? null : proj)
+                    }
+                    onRemove={
+                      activityProject === proj
+                        ? () => setActivityProject(null)
+                        : undefined
+                    }
                   >
-                    <span className="row-main mono">{ev.kind}</span>
-                    <Tag dot tone={opsStatusTone(ev.status)}>
-                      {ev.status ?? "?"}
-                    </Tag>
-                    {ev.created_at ? (
-                      <span className="row-meta">{formatTs(ev.created_at)}</span>
-                    ) : null}
-                  </div>
+                    Project · {proj}
+                  </Chip>
+                ))}
+                {activityHarnesses.map((h) => (
+                  <Chip
+                    key={`ah-${h}`}
+                    on={activityHarness === h}
+                    onClick={() =>
+                      setActivityHarness(activityHarness === h ? null : h)
+                    }
+                    onRemove={
+                      activityHarness === h
+                        ? () => setActivityHarness(null)
+                        : undefined
+                    }
+                  >
+                    Harness · {harnessLabel(h)}
+                  </Chip>
+                ))}
+                {(["today", "7d"] as const).map((w) => (
+                  <Chip
+                    key={`as-${w}`}
+                    on={activitySince === w}
+                    onClick={() =>
+                      setActivitySince(activitySince === w ? null : w)
+                    }
+                    onRemove={
+                      activitySince === w
+                        ? () => setActivitySince(null)
+                        : undefined
+                    }
+                  >
+                    Since · {w === "today" ? "Today" : "7 days"}
+                  </Chip>
                 ))}
               </div>
-            ) : null}
-
-            <div className="toolbar">
-              <input
-                className="mono"
-                value={episodeShowId}
-                onChange={(e) => setEpisodeShowId(e.target.value)}
-                placeholder="episode id"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") void showEpisode();
-                }}
-              />
-              <button type="button" onClick={() => void showEpisode()}>
-                Show full
-              </button>
-              <button
-                type="button"
-                className="danger"
-                disabled={actionBusy || !episodeShowId.trim()}
-                title="Soft-delete this episode and remove its vectors."
-                onClick={() => void forgetEpisode(episodeShowId)}
-              >
-                <Trash2 size={14} strokeWidth={1.75} aria-hidden />
-                Forget
-              </button>
+              <span className="meta push">
+                {visibleActivity.length === activityList.length
+                  ? `${activityList.length} loaded`
+                  : `${visibleActivity.length} of ${activityList.length} loaded`}
+                {activityCount != null
+                  ? ` · ${activityCount.toLocaleString()} captures in all`
+                  : ""}
+              </span>
             </div>
 
-            {activityList.length > 0 ? (
-              <div className="rows">
-                {activityList.slice(0, 20).map((ep) => (
-                  <div key={ep.id} className="row-item">
-                    <button
-                      type="button"
-                      className="id-chip"
-                      onClick={() => {
-                        setEpisodeShowId(String(ep.id));
-                        void (async () => {
-                          setActionBusy(true);
-                          try {
-                            const raw = await runKhipu([
-                              "activity",
-                              "--show",
-                              String(ep.id),
-                            ]);
-                            setActivityText(prettyJson(raw));
-                            setActivityRawKey((k) => k + 1);
-                          } catch (e) {
-                            setError(String(e));
-                          } finally {
-                            setActionBusy(false);
-                          }
-                        })();
-                      }}
-                    >
-                      #{ep.id}
-                    </button>
-                    <span className="row-main">
-                      {(ep.summary || "").slice(0, 120)}
-                    </span>
-                    <span className="row-meta">
-                      {ep.ts ? formatTs(ep.ts) : ""}
-                      {ep.mirror_age_seconds != null
-                        ? `${ep.ts ? " · " : ""}lag ${Math.round(ep.mirror_age_seconds)}s`
-                        : ""}
-                    </span>
-                  </div>
-                ))}
+            <div className="split">
+              <div className="card col">
+                <div className="card-scroll">
+                  {loading.activity && activityList.length === 0 ? (
+                    <EmptyState
+                      icon={<Loader2 size={22} className="spin" aria-hidden />}
+                      title="Reading captures…"
+                    />
+                  ) : visibleActivity.length === 0 ? (
+                    <EmptyState
+                      title={
+                        activityList.length === 0
+                          ? "No captures yet"
+                          : "Nothing matches those filters"
+                      }
+                      hint={
+                        activityList.length === 0
+                          ? "Sessions appear here as each harness's capture hook records them."
+                          : "Clear a chip or the text filter to see the rest of this page."
+                      }
+                    />
+                  ) : (
+                    activityDays.map((day) => (
+                      <div key={day.label}>
+                        <div className="day">{day.label}</div>
+                        {day.rows.map((ep) => {
+                          const harness = harnessFromSession(ep.session_id);
+                          const project = projectFromScope(ep.scope);
+                          return (
+                            <button
+                              key={ep.id}
+                              type="button"
+                              className={
+                                activitySelected === ep.id ? "row on" : "row"
+                              }
+                              onClick={() => void selectEpisode(ep.id)}
+                            >
+                              <span className="meta w60">
+                                {timeLabel(ep.ts ?? ep.ingested_at)}
+                              </span>
+                              <span
+                                className={harnessDotClass(ep.session_id)}
+                                aria-hidden
+                              />
+                              <span className="meta w78">
+                                {harness ? harnessLabel(harness) : "—"}
+                              </span>
+                              {project ? (
+                                <Tag title={ep.scope}>{project}</Tag>
+                              ) : null}
+                              <span className="grow ellip t2">
+                                {ep.summary || "(no summary)"}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ))
+                  )}
+                  {activityList.length >= activityLimit &&
+                  (activityCount == null ||
+                    activityList.length < activityCount) ? (
+                    <div className="row" style={{ justifyContent: "center" }}>
+                      <button
+                        type="button"
+                        className="link sm"
+                        disabled={Boolean(loading.activity)}
+                        onClick={() => {
+                          const next = activityLimit + ACTIVITY_PAGE;
+                          setActivityLimit(next);
+                          void loadActivity(true, next);
+                        }}
+                      >
+                        Show {ACTIVITY_PAGE} more
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
               </div>
-            ) : null}
 
-            <RawJson text={activityText} openKey={activityRawKey} />
+              <div className="card col">
+                {activityDetailLoading ? (
+                  <EmptyState
+                    icon={<Loader2 size={22} className="spin" aria-hidden />}
+                    title="Opening…"
+                  />
+                ) : activityDetail ? (
+                  <>
+                    <div className="card-head">
+                      Episode {activityDetail.id}
+                      <span className="spacer" />
+                      <span className="meta">
+                        {timeLabel(activityDetail.ts)}
+                        {harnessFromSession(activityDetail.session_id)
+                          ? ` · ${harnessLabel(
+                              harnessFromSession(activityDetail.session_id) ??
+                                "",
+                            )}`
+                          : ""}
+                      </span>
+                    </div>
+                    <div className="detail">
+                      <div className="section">
+                        <h3>Summary</h3>
+                        <p>
+                          {activityDetail.summary || "No summary was recorded."}
+                        </p>
+                      </div>
+                      {asStrings(activityDetail.decisions).length > 0 ? (
+                        <div className="section">
+                          <h3>Decisions</h3>
+                          <ul>
+                            {asStrings(activityDetail.decisions).map((d) => (
+                              <li key={d}>{d}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                      {openLoopTexts(activityDetail.raw).length > 0 ? (
+                        <div className="section">
+                          <h3>Opened</h3>
+                          <ul>
+                            {openLoopTexts(activityDetail.raw).map((t) => (
+                              <li key={t}>
+                                {t} <Tag kind>Owed</Tag>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                      <div className="section">
+                        <h3>Where</h3>
+                        <p className="t2">
+                          {[
+                            projectFromScope(activityDetail.scope),
+                            activityDetail.scope,
+                            activityDetail.session_id
+                              ? `session ${activityDetail.session_id}`
+                              : null,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ") || "Not recorded"}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="acts">
+                        <button
+                          type="button"
+                          className="sm"
+                          onClick={() => openInRecall(activityDetail.id)}
+                        >
+                          <Search size={14} strokeWidth={1.75} aria-hidden />
+                          Open in Recall
+                        </button>
+                        <button
+                          type="button"
+                          className="sm"
+                          onClick={() => {
+                            setEditText(activityDetail.summary ?? "");
+                            setEditOpen(true);
+                          }}
+                        >
+                          Edit summary
+                        </button>
+                        <button
+                          type="button"
+                          className="sm danger push"
+                          onClick={() => setForgetTarget(activityDetail.id)}
+                        >
+                          <Trash2 size={14} strokeWidth={1.75} aria-hidden />
+                          Forget
+                        </button>
+                    </div>
+                  </>
+                ) : (
+                  <EmptyState
+                    title="Pick a capture"
+                    hint="Its summary, decisions, what it left open and where it ran appear here."
+                  />
+                )}
+              </div>
+            </div>
+
+            <Disclosure label="Advanced" openKey={activityRawKey}>
+              {opsEvents.length > 0 ? (
+                <div className="rows">
+                  <div className="rows-head">System check-ins</div>
+                  {opsEvents.slice(0, 8).map((ev, i) => (
+                    <div
+                      key={`${ev.kind}-${ev.created_at}-${i}`}
+                      className="row-item"
+                    >
+                      <span className="row-main mono">{ev.kind}</span>
+                      <Tag dot tone={opsStatusTone(ev.status)}>
+                        {ev.status ?? "?"}
+                      </Tag>
+                      {ev.created_at ? (
+                        <span className="row-meta">
+                          {formatTs(ev.created_at)}
+                        </span>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              <RawBlock text={activityText} />
+            </Disclosure>
           </div>
         </section>
 
-        <section className={panelClass("recall")}>
+        <section className={`${panelClass("recall")} fill`}>
           <PanelHeader
             title="Recall"
             lede="What does the agent remember about this?"
@@ -2739,14 +3368,16 @@ export default function App() {
           <div className="panel-body wide">
             {recallView === "search" ? (
               <>
-            <div className="toolbar">
+            <div className="inline">
               <input
+                className="grow"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder={
                   SEARCH_MODES.find((m) => m.mode === searchMode)?.placeholder ??
                   "ask in your own words"
                 }
+                aria-label="Search"
                 onKeyDown={(e) => {
                   if (e.key === "Enter") void doSearch();
                 }}
@@ -2775,46 +3406,149 @@ export default function App() {
               </button>
             </div>
 
-            <div className="toolbar">
-              <label className="filter-label">
-                Project
-                <input
-                  className="filter-input"
-                  value={searchProject}
-                  onChange={(e) => setSearchProject(e.target.value)}
-                  placeholder="any"
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void doSearch();
-                  }}
-                />
-              </label>
-              <label
-                className="filter-label"
-                title="ISO date (2026-08-01) or a relative window: 7d, 24h, 30m."
+            <div className="chips">
+              <Chip
+                on={Boolean(searchProject.trim())}
+                title="Match the episode's project or repo path"
+                onClick={() => setSearchFiltersOpen(true)}
+                onRemove={
+                  searchProject.trim()
+                    ? () => {
+                        setSearchProject("");
+                        void doSearch();
+                      }
+                    : undefined
+                }
               >
-                Since
-                <input
-                  className="filter-input"
-                  value={searchSince}
-                  onChange={(e) => setSearchSince(e.target.value)}
-                  placeholder="any · e.g. 7d"
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void doSearch();
-                  }}
-                />
-              </label>
-              {searchProject.trim() || searchSince.trim() ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSearchProject("");
-                    setSearchSince("");
-                  }}
-                >
-                  Clear filters
-                </button>
+                Project · {searchProject.trim() || "Any"}
+              </Chip>
+              <Chip
+                on={Boolean(searchSince.trim())}
+                title="ISO date (2026-08-01) or a relative window: 7d, 24h, 30m"
+                onClick={() => setSearchFiltersOpen(true)}
+                onRemove={
+                  searchSince.trim()
+                    ? () => {
+                        setSearchSince("");
+                        void doSearch();
+                      }
+                    : undefined
+                }
+              >
+                Since · {searchSince.trim() || "Any"}
+              </Chip>
+              <Chip
+                on={Boolean(searchKind)}
+                onClick={() => setSearchFiltersOpen(true)}
+                onRemove={
+                  searchKind
+                    ? () => {
+                        setSearchKind("");
+                        void doSearch();
+                      }
+                    : undefined
+                }
+              >
+                Kind · {searchKind ? `${searchKind[0].toUpperCase()}${searchKind.slice(1)}` : "Any"}
+              </Chip>
+              <Chip
+                on={Boolean(searchHarness.trim())}
+                title="The half of a session id before the colon"
+                onClick={() => setSearchFiltersOpen(true)}
+                onRemove={
+                  searchHarness.trim()
+                    ? () => {
+                        setSearchHarness("");
+                        void doSearch();
+                      }
+                    : undefined
+                }
+              >
+                Harness ·{" "}
+                {searchHarness.trim()
+                  ? harnessLabel(searchHarness.trim())
+                  : "Any"}
+              </Chip>
+              <Chip onClick={() => setSearchFiltersOpen((o) => !o)}>
+                {searchFiltersOpen ? "Hide filters" : "+ Filter"}
+              </Chip>
+              {searchText ? (
+                <span className="meta push">
+                  {searchResults.length} result
+                  {searchResults.length === 1 ? "" : "s"}
+                  {searchElapsedMs != null
+                    ? ` · ${(searchElapsedMs / 1000).toFixed(1)} s`
+                    : ""}
+                </span>
               ) : null}
             </div>
+
+            {searchFiltersOpen ? (
+              <div className="filter-row">
+                <label className="filter-label">
+                  Project
+                  <input
+                    className="filter-input"
+                    value={searchProject}
+                    onChange={(e) => setSearchProject(e.target.value)}
+                    placeholder="any"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void doSearch();
+                    }}
+                  />
+                </label>
+                <label
+                  className="filter-label"
+                  title="ISO date (2026-08-01) or a relative window: 7d, 24h, 30m."
+                >
+                  Since
+                  <input
+                    className="filter-input"
+                    value={searchSince}
+                    onChange={(e) => setSearchSince(e.target.value)}
+                    placeholder="any · e.g. 7d"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void doSearch();
+                    }}
+                  />
+                </label>
+                <label className="filter-label">
+                  Harness
+                  <input
+                    className="filter-input"
+                    value={searchHarness}
+                    onChange={(e) => setSearchHarness(e.target.value)}
+                    placeholder="any · e.g. claude_code"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void doSearch();
+                    }}
+                  />
+                </label>
+                <div className="chips">
+                  <Chip
+                    tiny
+                    on={!searchKind}
+                    onClick={() => setSearchKind("")}
+                  >
+                    Any kind
+                  </Chip>
+                  {SEARCH_KINDS.map((k) => (
+                    <Chip
+                      key={k}
+                      tiny
+                      on={searchKind === k}
+                      onClick={() => setSearchKind(searchKind === k ? "" : k)}
+                    >
+                      {k[0].toUpperCase()}
+                      {k.slice(1)}
+                    </Chip>
+                  ))}
+                </div>
+                <button type="button" onClick={() => void doSearch()}>
+                  Apply
+                </button>
+              </div>
+            ) : null}
 
             {searchErr ? (
               <Callout
@@ -2830,127 +3564,217 @@ export default function App() {
               </Callout>
             ) : null}
 
-            {searchResults.length > 0 ? (
-              <div className="results">
-                {searchResults.map((r, i) => (
-                  <div key={`${r.kind}-${r.id}-${i}`} className="result-card">
-                    <div className="result-top">
-                      <Tag kind tone={r.kind === "episode" ? "accent" : "neutral"}>
-                        {r.kind ?? "item"}
-                      </Tag>
-                      <span className="result-label">
-                        {r.label ?? String(r.id ?? "")}
-                      </span>
-                    </div>
-                    {r.score != null && Number.isFinite(r.score) ? (
-                      <div
-                        className="result-score"
-                        title={`Relevance score ${r.score}. Relative to the other hits in this response.`}
-                      >
-                        <span className="result-score-bar" aria-hidden>
-                          <span
-                            style={{
-                              width: `${Math.max(
-                                4,
-                                Math.min(
-                                  100,
-                                  ((r.score ?? 0) /
-                                    (searchResults[0]?.score || r.score || 1)) *
-                                    100,
-                                ),
-                              )}%`,
-                            }}
-                          />
+            <div className="split">
+              <div className="card col">
+                <div className="card-scroll">
+                  {searchBusy ? (
+                    <EmptyState
+                      icon={<Loader2 size={22} className="spin" aria-hidden />}
+                      title="Searching…"
+                      hint={`Searching for “${query.trim()}”.`}
+                    />
+                  ) : searchResults.length > 0 ? (
+                    searchResults.map((r, i) => {
+                      const key = `${r.kind ?? "item"}:${r.id}`;
+                      const why = whyText(r);
+                      const width =
+                        r.score != null &&
+                        Number.isFinite(r.score) &&
+                        topScore
+                          ? Math.max(
+                              6,
+                              Math.min(100, (r.score / topScore) * 100),
+                            )
+                          : null;
+                      return (
+                        <button
+                          key={`${key}-${i}`}
+                          type="button"
+                          className={
+                            recallSelected === key ? "result on" : "result"
+                          }
+                          onClick={() => void selectRecallResult(r)}
+                        >
+                          <span className="tl">
+                            <Tag
+                              kind
+                              tone={r.kind === "episode" ? "accent" : "neutral"}
+                            >
+                              {r.kind ?? "item"}
+                            </Tag>
+                            <span className="title ellip grow">
+                              {r.label ?? String(r.id ?? "")}
+                            </span>
+                          </span>
+                          {r.snippet ? (
+                            <span className="snip">{r.snippet}</span>
+                          ) : null}
+                          <span className="foot">
+                            {r.id != null ? (
+                              <span className="mono">
+                                {r.kind === "episode"
+                                  ? `#${r.id}`
+                                  : String(r.id)}
+                              </span>
+                            ) : null}
+                            {width != null ? (
+                              <span
+                                className="score"
+                                title={`Relevance ${r.score?.toFixed(4)}, relative to the top hit in this response.`}
+                              >
+                                {why ? <span>{why}</span> : null}
+                                <span className="bar" aria-hidden>
+                                  <i style={{ width: `${width}%` }} />
+                                </span>
+                              </span>
+                            ) : null}
+                          </span>
+                        </button>
+                      );
+                    })
+                  ) : !searchText ? (
+                    <EmptyState
+                      icon={<Search size={22} strokeWidth={1.75} aria-hidden />}
+                      title="Search topics, episodes, and nodes"
+                      hint="Type a question in your own words and press Enter. Best match weighs meaning, word overlap and exact text together."
+                    />
+                  ) : (
+                    <EmptyState
+                      icon={<Search size={22} strokeWidth={1.75} aria-hidden />}
+                      title="No results"
+                      hint={
+                        (searchMode === "literal"
+                          ? "Nothing contains those exact words. Try Best match, which also scores meaning and word overlap."
+                          : searchMode === "semantic"
+                            ? "Nothing in the vector index was close enough. Try Best match, which also matches the words themselves."
+                            : "Nothing recorded matched that query by meaning, word overlap or exact text.") +
+                        (searchProject.trim() ||
+                        searchSince.trim() ||
+                        searchKind ||
+                        searchHarness.trim()
+                          ? " The filter chips are still applied."
+                          : "")
+                      }
+                    />
+                  )}
+                </div>
+              </div>
+
+              <div className="card col">
+                {recallDetailLoading ? (
+                  <EmptyState
+                    icon={<Loader2 size={22} className="spin" aria-hidden />}
+                    title="Opening…"
+                  />
+                ) : selectedResult ? (
+                  <>
+                    <div className="card-head">
+                      {recallDetail
+                        ? `Episode ${recallDetail.id}`
+                        : (selectedResult.kind ?? "item")}
+                      <span className="spacer" />
+                      {recallDetail?.ts ? (
+                        <span className="meta">
+                          {shortDateLabel(recallDetail.ts)} ·{" "}
+                          {timeLabel(recallDetail.ts)}
                         </span>
-                        <span className="result-score-num mono">
-                          {r.score.toFixed(3)}
-                        </span>
-                      </div>
-                    ) : null}
-                    {whyText(r) ? (
-                      <p className="result-why muted">{whyText(r)}</p>
-                    ) : null}
-                    {r.snippet ? (
-                      <p className="result-snippet">{r.snippet}</p>
-                    ) : null}
-                    {r.paths && r.paths.length > 0 ? (
-                      <ul className="result-paths mono">
-                        {r.paths.map((p) => (
-                          <li key={p}>{p}</li>
-                        ))}
-                      </ul>
-                    ) : null}
-                    {r.neighbors && r.neighbors.length > 0 ? (
-                      <ul className="result-neighbors mono">
-                        {r.neighbors.map((n) => (
-                          <li key={`${n.id}-${n.type ?? ""}`}>
-                            {n.id}
-                            {n.type ? ` (${n.type})` : ""}
-                          </li>
-                        ))}
-                      </ul>
-                    ) : null}
-                    <div className="inline">
-                      {r.id != null && String(r.id) !== r.label ? (
-                        <span className="result-id mono">{String(r.id)}</span>
                       ) : null}
-                      {r.kind === "node" || r.kind === "topic" ? (
+                    </div>
+                    <div className="detail">
+                      <div className="section">
+                        <h3>Summary</h3>
+                        <p>
+                          {recallDetail?.summary ||
+                            selectedResult.snippet ||
+                            "Nothing more than the title is recorded here."}
+                        </p>
+                      </div>
+                      {asStrings(recallDetail?.decisions).length > 0 ? (
+                        <div className="section">
+                          <h3>Decisions</h3>
+                          <ul>
+                            {asStrings(recallDetail?.decisions).map((d) => (
+                              <li key={d}>{d}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                      {openLoopsFor(recallDetail?.id).length > 0 ? (
+                        <div className="section">
+                          <h3>Still open</h3>
+                          <ul>
+                            {openLoopsFor(recallDetail?.id).map((c) => (
+                              <li key={c.id}>
+                                {c.text} <Tag kind>Owed</Tag>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                      {recallNeighbors.length > 0 ? (
+                        <div className="section">
+                          <h3>Connected</h3>
+                          {recallNeighbors.slice(0, 8).map((n, i) => (
+                            <div
+                              key={`${n.id}-${i}`}
+                              className="row plain"
+                            >
+                              <Tag kind>{nodeKindLabel(n.id)}</Tag>
+                              <span className="grow ellip t2" title={n.id}>
+                                {nodeTitle(n.id)}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                    <div className="acts">
                         <button
                           type="button"
-                          className="link sm"
-                          title="Open this in the graph view"
+                          className="sm"
                           onClick={() => {
-                            setNodeId(String(r.id ?? r.label ?? ""));
+                            const id = String(
+                              selectedResult.id ?? selectedResult.label ?? "",
+                            );
+                            setNodeId(id);
                             setRecallView("graph");
-                            void doGraph(String(r.id ?? r.label ?? ""));
+                            void doGraph(id);
                           }}
                         >
                           <Waypoints size={14} strokeWidth={1.75} aria-hidden />
                           Walk the graph
                         </button>
-                      ) : null}
+                        <button
+                          type="button"
+                          className="sm"
+                          onClick={() =>
+                            void copyId(String(selectedResult.id ?? ""))
+                          }
+                        >
+                          {copiedId === String(selectedResult.id ?? "")
+                            ? "Copied"
+                            : "Copy id"}
+                        </button>
+                        {recallDetail ? (
+                          <button
+                            type="button"
+                            className="sm danger push"
+                            onClick={() => setForgetTarget(recallDetail.id)}
+                          >
+                            <Trash2 size={14} strokeWidth={1.75} aria-hidden />
+                            Forget
+                          </button>
+                        ) : null}
                     </div>
-                  </div>
-                ))}
+                  </>
+                ) : (
+                  <EmptyState
+                    title="Pick a result"
+                    hint="What it says, what it decided, what it left open and what it connects to appear here."
+                  />
+                )}
               </div>
-            ) : searchBusy ? (
-              // Without this the "type a query" empty state stayed on screen
-              // for the whole round trip, so a slow search looked like a
-              // search that had never been asked for (audit 2026-09-04).
-              <div className="empty">
-                <Loader2 size={22} className="spin" aria-hidden />
-                <div className="empty-title">Searching…</div>
-                <div className="empty-hint">
-                  Searching for “{query.trim()}”.
-                </div>
-              </div>
-            ) : !searchText ? (
-              <div className="empty">
-                <Search size={22} strokeWidth={1.75} aria-hidden />
-                <div className="empty-title">
-                  Search topics, episodes, and nodes
-                </div>
-                <div className="empty-hint">
-                  Type a question in your own words and press Enter. Best match
-                  weighs meaning, word overlap and exact text together.
-                </div>
-              </div>
-            ) : (
-              <div className="empty">
-                <Search size={22} strokeWidth={1.75} aria-hidden />
-                <div className="empty-title">No results</div>
-                <div className="empty-hint">
-                  {searchMode === "literal"
-                    ? "Nothing contains those exact words. Try Best match, which also scores meaning and word overlap."
-                    : searchMode === "semantic"
-                      ? "Nothing in the vector index was close enough. Try Best match, which also matches the words themselves."
-                      : "Nothing recorded matched that query by meaning, word overlap or exact text."}
-                  {searchProject.trim() || searchSince.trim()
-                    ? " The Project and Since filters are still applied."
-                    : ""}
-                </div>
-              </div>
-            )}
+            </div>
 
             <RawJson text={searchText} empty="Results appear here." />
           </>
@@ -3258,15 +4082,9 @@ export default function App() {
                   void loadOwed(next, false);
                 }}
                 options={[
-                  {
-                    value: "open",
-                    label:
-                      owedOpenCount != null
-                        ? `Open · ${owedOpenCount}${owedOpenCount >= OWED_LIMIT ? "+" : ""}`
-                        : "Open",
-                  },
-                  { value: "closed", label: "Closed" },
-                  { value: "stale", label: "Stale" },
+                  { value: "open", label: `Open${owedCount("open")}` },
+                  { value: "closed", label: `Closed${owedCount("closed")}` },
+                  { value: "stale", label: `Stale${owedCount("stale")}` },
                 ]}
               />
               <div className="chips">
@@ -3282,7 +4100,17 @@ export default function App() {
                       owedProject === proj ? () => setOwedProject(null) : undefined
                     }
                   >
-                    {shortProject(proj)}
+                    Project · {shortProject(proj)}
+                  </Chip>
+                ))}
+                {owedKinds.map((k) => (
+                  <Chip
+                    key={`ok-${k}`}
+                    on={owedKind === k}
+                    onClick={() => setOwedKind(owedKind === k ? null : k)}
+                    onRemove={owedKind === k ? () => setOwedKind(null) : undefined}
+                  >
+                    Kind · {OWED_KIND_LABEL[k] ?? k}
                   </Chip>
                 ))}
               </div>
@@ -3295,9 +4123,11 @@ export default function App() {
               <div className="card">
                 <EmptyState
                   title={
-                    owedStatus === "open"
-                      ? "Nothing owed yet"
-                      : `Nothing ${owedStatus} here`
+                    owedProject
+                      ? `Nothing owed on ${shortProject(owedProject)}`
+                      : owedStatus === "open"
+                        ? "Nothing owed yet"
+                        : `Nothing ${owedStatus} here`
                   }
                   hint="Follow-ups, blockers, questions and promises your sessions leave open appear here."
                 />
@@ -3305,23 +4135,25 @@ export default function App() {
             ) : (
               <div className="card">
                 <div className="card-head">
-                  <span className="w76">Kind</span>
+                  <span className="w88">Kind</span>
                   <span className="grow">What you owe</span>
-                  <span className="w104">Project</span>
+                  <span className="w96">Project</span>
                   <span className="w52">Opened</span>
-                  <span className="w52">From</span>
+                  <span className="w44">Due</span>
+                  <span className="w50">From</span>
+                  <span className="w132" />
                 </div>
                 {visibleOwed.map((c) => (
                   <ListRow key={c.id}>
-                    <Tag
-                      kind
-                      tone={c.kind === "blocker" ? "warn" : "neutral"}
-                      className="w76"
-                    >
-                      {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
-                    </Tag>
-                    <span className="grow ellip">{c.text}</span>
-                    <span className="w104">
+                    <span className="w88">
+                      <Tag kind tone={c.kind === "blocker" ? "warn" : "neutral"}>
+                        {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
+                      </Tag>
+                    </span>
+                    <span className="grow ellip" title={c.text}>
+                      {c.text}
+                    </span>
+                    <span className="w96">
                       {c.project ? (
                         <Tag title={c.project}>{shortProject(c.project)}</Tag>
                       ) : (
@@ -3329,22 +4161,109 @@ export default function App() {
                       )}
                     </span>
                     <span className="meta w52">
-                      {c.opened_at
-                        ? new Date(
-                            String(c.opened_at).replace(" ", "T"),
-                          ).toLocaleDateString([], {
-                            month: "short",
-                            day: "numeric",
-                          })
-                        : "—"}
+                      {shortDateLabel(c.opened_at)}
                     </span>
-                    <span className="meta mono w52">
-                      {c.opened_episode != null ? `#${c.opened_episode}` : "—"}
+                    <span className="meta w44">
+                      {shortDateLabel(c.due_after)}
+                    </span>
+                    <span className="w50">
+                      {c.opened_episode != null ? (
+                        <button
+                          type="button"
+                          className="link sm mono"
+                          title="Open the capture that opened this"
+                          onClick={() => openInActivity(c.opened_episode ?? 0)}
+                        >
+                          #{c.opened_episode}
+                        </button>
+                      ) : (
+                        <span className="meta mono">—</span>
+                      )}
+                    </span>
+                    <span className="w132 acts-cell">
+                      {c.status === "closed" ? (
+                        <button
+                          type="button"
+                          className="sm"
+                          disabled={owedBusyId === c.id}
+                          onClick={() =>
+                            void owedWrite(c.id, [`--reopen=${c.id}`])
+                          }
+                        >
+                          Reopen
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            className="sm"
+                            disabled={owedBusyId === c.id}
+                            onClick={() =>
+                              void owedWrite(c.id, [`--close=${c.id}`])
+                            }
+                          >
+                            Done
+                          </button>
+                          <button
+                            type="button"
+                            className="sm"
+                            disabled={owedBusyId === c.id}
+                            onClick={() => setSnoozeTarget(c)}
+                          >
+                            Snooze
+                          </button>
+                        </>
+                      )}
                     </span>
                   </ListRow>
                 ))}
               </div>
             )}
+
+            {closedToday.length > 0 ? (
+              <Callout
+                tone="ok"
+                title={`Closed today · ${closedToday.length}`}
+                action={
+                  owedStatus === "closed" ? undefined : (
+                    <button
+                      type="button"
+                      className="sm"
+                      onClick={() => {
+                        setOwedStatus("closed");
+                        void loadOwed("closed", false);
+                      }}
+                    >
+                      Show them
+                    </button>
+                  )
+                }
+              >
+                A later capture said these were done, so they were closed.
+                Reopen one if that was wrong.
+              </Callout>
+            ) : null}
+            {owedStatus === "closed" && closedToday.length > 0 ? (
+              <div className="card">
+                <div className="card-head">Closed today</div>
+                {closedToday.map((c) => (
+                  <ListRow key={`ct-${c.id}`}>
+                    <span className="grow ellip" title={c.text}>
+                      {c.text}
+                    </span>
+                    <span className="meta">{timeLabel(c.closed_at)}</span>
+                    <button
+                      type="button"
+                      className="sm"
+                      disabled={owedBusyId === c.id}
+                      onClick={() => void owedWrite(c.id, [`--reopen=${c.id}`])}
+                    >
+                      Reopen
+                    </button>
+                  </ListRow>
+                ))}
+              </div>
+            ) : null}
           </div>
         </section>
 
@@ -3926,6 +4845,119 @@ export default function App() {
         onDismiss={() => setPostUpdateNotice(null)}
         onOpenIntegrations={() => setTab("harnesses")}
       />
+
+      {/* Forget — the one destructive write either list makes. */}
+      <Dialog
+        open={forgetTarget != null}
+        className="kit-dialog"
+        ariaLabelledBy="forget-title"
+        onCancel={() => setForgetTarget(null)}
+      >
+        <div className="kit-dialog-body">
+          <h2 id="forget-title">Forget episode #{forgetTarget}?</h2>
+          <p>
+            It stops appearing in search and recall, and its vectors are
+            deleted. The row itself is kept, so this is not a shred.
+          </p>
+          <div className="kit-dialog-actions">
+            <button type="button" onClick={() => setForgetTarget(null)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="danger"
+              disabled={actionBusy}
+              onClick={() => void confirmForget()}
+            >
+              <Trash2 size={14} strokeWidth={1.75} aria-hidden />
+              Forget
+            </button>
+          </div>
+        </div>
+      </Dialog>
+
+      {/* Edit summary — `khipu episode edit`, which re-embeds in the same
+          transaction so the correction is findable, not just visible. */}
+      <Dialog
+        open={editOpen}
+        className="kit-dialog"
+        ariaLabelledBy="edit-title"
+        onCancel={() => setEditOpen(false)}
+      >
+        <div className="kit-dialog-body">
+          <h2 id="edit-title">Edit summary</h2>
+          <p>
+            This is what search reads. Saving re-indexes the capture straight
+            away.
+          </p>
+          <textarea
+            className="edit-summary"
+            value={editText}
+            onChange={(e) => setEditText(e.target.value)}
+            aria-label="Episode summary"
+          />
+          <div className="kit-dialog-actions">
+            <button type="button" onClick={() => setEditOpen(false)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="primary"
+              disabled={editSaving || !editText.trim()}
+              onClick={() => void saveSummary()}
+            >
+              {editSaving ? (
+                <Loader2 size={14} className="spin" aria-hidden />
+              ) : null}
+              Save
+            </button>
+          </div>
+        </div>
+      </Dialog>
+
+      {/* Snooze — `khipu owed --snooze ID --until`. Presets only: the CLI
+          refuses free text rather than silently clearing a due date. */}
+      <Dialog
+        open={snoozeTarget != null}
+        className="kit-dialog"
+        ariaLabelledBy="snooze-title"
+        onCancel={() => setSnoozeTarget(null)}
+      >
+        <div className="kit-dialog-body">
+          <h2 id="snooze-title">Snooze until</h2>
+          <p>{snoozeTarget?.text}</p>
+          <div className="kit-dialog-actions">
+            <button type="button" onClick={() => setSnoozeTarget(null)}>
+              Cancel
+            </button>
+            {(
+              [
+                ["7d", "A week"],
+                ["2w", "Two weeks"],
+                ["1m", "A month"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                disabled={owedBusyId != null}
+                onClick={() => {
+                  const target = snoozeTarget;
+                  setSnoozeTarget(null);
+                  if (target) {
+                    void owedWrite(target.id, [
+                      `--snooze=${target.id}`,
+                      `--until=${value}`,
+                    ]);
+                  }
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </Dialog>
 
       {error ? (
         <div className="toast-err" role="alert">

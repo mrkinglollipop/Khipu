@@ -1026,6 +1026,11 @@ def drain(*, limit: int | None = None, dry_run: bool = False) -> dict:
             continue
         payload["session_id"] = f"{harness}:{job.get('session_id')}"
         payload["scope"] = payload.get("scope") or f"{harness} {job.get('event')}"
+        # The trigger itself, not just its trace in `scope`: commitments'
+        # session-plan closure retires a session's own in-flight/plan items
+        # when that session ENDS, and it needs to know that this capture is
+        # the sessionend one (khipu.commitments.close_session_plan).
+        payload["event"] = job.get("event")
         # The session's own time, not the drain's — a job may sit queued for hours.
         payload["ts"] = job.get("ts") or _mint_ts()
         # W1.3: identity resolved in-hook rides straight through to capture —

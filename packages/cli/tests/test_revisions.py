@@ -16,15 +16,36 @@ from khipu import revisions
 
 
 class FakeCursor:
-    """Records every statement and replays canned rows in order."""
+    """Records every statement and replays canned rows in order.
+
+    ``commitments_columns`` answers the ONE schema-introspection query
+    ``khipu.db.table_columns(cur, "commitments")`` makes (commitments gained
+    last_seen_at/seen_count in migration 0012, and every reader gates on them)
+    out of band: it is not recorded and it does not consume a canned result,
+    so tests that assert on the ORDER of a module's real queries keep working
+    on both a migrated and a pre-migration fake hub. Set it to a column list
+    to simulate the migrated schema.
+    """
+
+    commitments_columns = (
+        "id", "text", "project", "owner", "kind", "opened_episode", "opened_at",
+        "due_after", "status", "closed_episode", "closed_at", "close_reason",
+        "content_hash",
+    )
 
     def __init__(self, results):
         self._results = list(results)
         self.statements: list[str] = []
         self.params: list[tuple] = []
         self._current: list = []
+        from khipu import db as _db
+
+        _db._TABLE_COLUMNS_CACHE.pop("commitments", None)
 
     def execute(self, sql, params=None):
+        if "information_schema.columns" in sql and tuple(params or ()) == ("commitments",):
+            self._current = [(c,) for c in self.commitments_columns]
+            return
         self.statements.append(" ".join(sql.split()))
         self.params.append(params)
         self._current = self._results.pop(0) if self._results else []
