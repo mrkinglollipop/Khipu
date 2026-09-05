@@ -36,6 +36,28 @@
   --r-md: 10px;
   --r-lg: 14px;
 
+  /* Spacing scale — 4/8/12/16/20/24/32. Before this the file picked its own
+     number per rule (7 gap values, 10 padding values). New and touched rules
+     use these; nothing else was rewritten blind. */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 20px;
+  --s6: 24px;
+  --s8: 32px;
+
+  /* Type scale — 11/12/13/15/18/22, replacing 13 literal sizes. */
+  --t-xs: 11px;
+  --t-sm: 12px;
+  --t-md: 13px;
+  --t-lg: 15px;
+  --t-xl: 18px;
+  --t-2xl: 22px;
+
+  /* One modal backdrop, not two independent rgba literals. */
+  --backdrop: rgba(32, 29, 26, 0.45);
+
   color: var(--text);
   background: var(--bg);
   font-family: var(--sans);
@@ -69,6 +91,7 @@
     --ring: rgba(224, 112, 63, 0.4);
     --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
     --shadow-md: 0 6px 24px rgba(0, 0, 0, 0.5);
+    --backdrop: rgba(0, 0, 0, 0.55);
   }
 }
 
@@ -240,11 +263,28 @@ button.nav:focus-visible {
 .rail-foot {
   flex: none;
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 12px 16px;
+  flex-direction: column;
+  gap: var(--s3);
+  padding: var(--s3) var(--s4);
   border-top: 1px solid var(--border);
-  flex-wrap: wrap;
+}
+
+/* Plain-language health line — replaces the permanent "DSN ok" pill. */
+.rail-health {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+.rail-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--s2);
+  font-size: var(--t-xs);
+  color: var(--muted);
 }
 
 button.rail-feedback {
@@ -734,14 +774,40 @@ button.primary .spin {
 }
 
 .chip {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--text-2);
-  background: var(--surface-2);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 999px;
   border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  padding: 4px 8px;
+  background: var(--surface);
+  font: inherit;
+  font-size: var(--t-sm);
+  color: var(--text-2);
   white-space: nowrap;
+}
+
+button.chip {
+  cursor: pointer;
+}
+
+.chip.on {
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+
+.chip.tiny {
+  height: 20px;
+  font-size: var(--t-xs);
+}
+
+.chip .x {
+  color: var(--muted);
+  font-size: var(--t-md);
+  line-height: 1;
+  cursor: pointer;
 }
 
 /* --------------------------------------------------------------------------
@@ -837,64 +903,82 @@ button.id-chip:hover {
 
 .callout {
   display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 12px;
+  gap: var(--s3);
+  padding: var(--s3) var(--s4);
   border-radius: var(--r-md);
-  border-left: 3px solid var(--border-strong);
-  background: var(--surface-2);
+  border: 1px solid var(--border);
+  background: var(--surface);
 }
 
 .callout.ok {
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
   background: var(--ok-soft);
-  border-left-color: var(--ok);
 }
 
 .callout.warn {
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
   background: var(--warn-soft);
-  border-left-color: var(--warn);
 }
 
-.callout-icon {
-  flex: none;
-  margin-top: 1px;
+.callout.err {
+  border-color: color-mix(in srgb, var(--err) 45%, transparent);
+  background: var(--err-soft);
 }
 
-.callout.ok .callout-icon {
-  color: var(--ok);
-}
-
-.callout.warn .callout-icon {
-  color: var(--warn);
-}
-
-/* "neutral" = a true absence (an empty graph walk). Base .callout colours
-   already carry it; the icon just must not read as a pass or a problem. */
-.callout.neutral .callout-icon {
-  color: var(--muted);
-}
-
-.callout-content {
+.callout .txt {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
-.callout-title {
-  font-weight: 600;
+.callout b {
+  display: block;
+  font-size: var(--t-md);
   color: var(--text);
 }
 
-.callout-body {
+.callout span {
+  font-size: var(--t-sm);
   color: var(--text-2);
-  font-size: 12px;
-  margin-top: 2px;
 }
 
-.callout-note {
-  display: block;
-  color: var(--muted);
-  margin-top: 4px;
+.callout .cta {
+  display: flex;
+  gap: var(--s2);
+  align-items: center;
+  flex: none;
 }
+
+/* Severity stripe — the attention items on Home. */
+.stripe {
+  position: relative;
+  padding-left: var(--s5);
+}
+
+.stripe::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: 2px;
+}
+
+.stripe.err::before {
+  background: var(--err);
+}
+
+.stripe.warn::before {
+  background: var(--warn);
+}
+
+.stripe.ok::before {
+  background: var(--ok);
+}
+
 
 .callout-action {
   flex: none;
@@ -1036,26 +1120,29 @@ button.id-chip:hover {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
-  padding: 48px 24px;
+  gap: var(--s1);
+  padding: var(--s8) var(--s6);
   text-align: center;
   color: var(--muted);
 }
 
 .empty svg {
-  margin-bottom: 8px;
+  margin-bottom: var(--s2);
   color: var(--muted);
 }
 
+.empty b,
 .empty-title {
-  font-size: 13px;
+  font-size: var(--t-md);
   font-weight: 600;
-  color: var(--text-2);
+  color: var(--text);
 }
 
+.empty span,
 .empty-hint {
-  font-size: 12px;
+  font-size: var(--t-sm);
   color: var(--muted);
+  max-width: 46ch;
 }
 
 /* --------------------------------------------------------------------------
@@ -1396,15 +1483,6 @@ button.toast-close:hover {
   width: 100%;
 }
 
-.feedback-dialog::backdrop {
-  background: rgba(32, 29, 26, 0.45);
-}
-
-@media (prefers-color-scheme: dark) {
-  .feedback-dialog::backdrop {
-    background: rgba(0, 0, 0, 0.55);
-  }
-}
 
 .feedback-form {
   display: flex;
@@ -1435,7 +1513,6 @@ button.feedback-close {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-}
   border: 0;
   background: transparent;
   color: var(--muted);
@@ -1603,15 +1680,6 @@ button.feedback-attach-remove:hover {
   width: 100%;
 }
 
-.post-update-dialog::backdrop {
-  background: rgba(32, 29, 26, 0.45);
-}
-
-@media (prefers-color-scheme: dark) {
-  .post-update-dialog::backdrop {
-    background: rgba(0, 0, 0, 0.55);
-  }
-}
 
 .post-update-body {
   display: flex;
@@ -1637,4 +1705,388 @@ button.feedback-attach-remove:hover {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 4px;
+}
+
+/* --------------------------------------------------------------------------
+   UI kit (desktop overhaul) — every value from the approved mocks' tokens.css.
+   Markup contracts live in ui.tsx.
+-------------------------------------------------------------------------- */
+
+/* Small buttons and link-styled buttons, so a card row can carry an action
+   without inventing its own size. */
+button.sm {
+  height: 26px;
+  padding: 0 10px;
+  font-size: var(--t-sm);
+}
+
+button.link {
+  border-color: transparent;
+  background: transparent;
+  color: var(--accent-text);
+  padding: 0 var(--s1);
+  height: 26px;
+}
+
+button.link:hover {
+  background: transparent;
+  border-color: transparent;
+  text-decoration: underline;
+}
+
+/* Tag — status (dot) and kind (uppercase) in one component. */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 20px;
+  padding: 0 var(--s2);
+  border-radius: 999px;
+  font-size: var(--t-xs);
+  font-weight: 600;
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  background: var(--surface-2);
+  white-space: nowrap;
+  flex: none;
+}
+
+.tag .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+.tag.ok {
+  color: var(--ok);
+  background: var(--ok-soft);
+  border-color: transparent;
+}
+
+.tag.warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-color: transparent;
+}
+
+.tag.err {
+  color: var(--err);
+  background: var(--err-soft);
+  border-color: transparent;
+}
+
+.tag.accent {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border-color: transparent;
+}
+
+.tag.kind {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+  border-radius: 4px;
+  height: 18px;
+}
+
+/* Health dot — one state system, shared by the rail and every row. */
+.hdot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--border-strong);
+}
+
+.hdot.ok {
+  background: var(--ok);
+}
+
+.hdot.warn {
+  background: var(--warn);
+}
+
+.hdot.err {
+  background: var(--err);
+}
+
+/* Card + rows. */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+.card.col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: 10px var(--s4);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--t-xs);
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.card-head .spacer {
+  flex: 1;
+}
+
+.card .row {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: 9px var(--s4);
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+
+.card .row:last-child {
+  border-bottom: 0;
+}
+
+.card-scroll {
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.ellip {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.meta {
+  font-size: var(--t-xs);
+  color: var(--muted);
+  white-space: nowrap;
+  flex: none;
+}
+
+.t2 {
+  color: var(--text-2);
+}
+
+.push {
+  margin-left: auto;
+}
+
+/* Tiles — the four Home headline numbers. */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--s3);
+}
+
+.tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: var(--s3) var(--s4);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tile .label {
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.tile .value {
+  font-size: var(--t-xl);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+
+.tile .sub {
+  font-size: var(--t-xs);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tile.err {
+  border-color: color-mix(in srgb, var(--err) 50%, transparent);
+}
+
+.tile.warn {
+  border-color: color-mix(in srgb, var(--warn) 50%, transparent);
+}
+
+/* Two equal columns (Home) and a list + detail split (Recall). */
+.cols {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s4);
+  min-height: 0;
+}
+
+.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: var(--s4);
+  min-height: 0;
+}
+
+.inline {
+  display: flex;
+  gap: var(--s2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* Segmented control — replaces the ad-hoc .segmented pill group. */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  height: 30px;
+  flex: none;
+}
+
+.seg button {
+  height: 100%;
+  padding: 0 11px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--surface);
+  font-size: var(--t-sm);
+  font-weight: 500;
+  color: var(--text-2);
+  box-shadow: none;
+}
+
+.seg button:last-child {
+  border-right: 0;
+}
+
+.seg button:hover {
+  background: var(--surface-2);
+}
+
+.seg button.on {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* Disclosure — collapsed by default; every raw JSON dump lives in one. */
+details.disclose {
+  border-top: 1px solid var(--border);
+  padding-top: var(--s1);
+}
+
+details.disclose > summary.disclosure {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  font-size: var(--t-sm);
+  color: var(--muted);
+  padding: var(--s2) 0;
+  cursor: pointer;
+  list-style: none;
+}
+
+details.disclose > summary.disclosure::-webkit-details-marker {
+  display: none;
+}
+
+details.disclose > summary.disclosure:hover {
+  color: var(--text-2);
+}
+
+.disclosure-chevron {
+  transition: transform 140ms ease;
+  flex: none;
+}
+
+details.disclose[open] > summary .disclosure-chevron {
+  transform: rotate(90deg);
+}
+
+.disclose-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  padding-bottom: var(--s3);
+}
+
+/* Screens that need the full window width (Home tiles, Owed table, Recall
+   split). The default .panel-body cap is for prose-width forms. */
+.panel-body.wide {
+  max-width: none;
+}
+
+.panel-body.fill {
+  height: 100%;
+  min-height: 0;
+}
+
+/* Owed table column widths, from the mock. */
+.w44 {
+  width: 44px;
+}
+
+.w52 {
+  width: 52px;
+}
+
+.w60 {
+  width: 60px;
+}
+
+.w76 {
+  width: 76px;
+}
+
+.w104 {
+  width: 104px;
+  flex: none;
+}
+
+/* Rail count badges. */
+.nav-count {
+  margin-left: auto;
+  font-size: var(--t-xs);
+  font-weight: 600;
+  color: var(--on-accent);
+  background: var(--accent);
+  border-radius: 999px;
+  padding: 0 7px;
+  line-height: 17px;
+  flex: none;
+}
+
+.nav-count.quiet {
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+/* One backdrop for every modal. */
+dialog::backdrop {
+  background: var(--backdrop);
 }

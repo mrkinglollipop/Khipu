@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useId, useRef, useState, type RefObject } from "react";
+import { useCallback, useId, useRef, useState, type RefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { Loader2, Paperclip, X } from "lucide-react";
 import { SUPPORT_EMAIL } from "./Welcome";
+import { Dialog } from "./ui";
 
 const ATTACH_MAX_BYTES = 15 * 1024 * 1024;
 const ATTACH_MAX_FILES = 10;
@@ -43,7 +44,6 @@ export function FeedbackForm({
   onSendingChange,
   returnFocusRef,
 }: Props) {
-  const dialogRef = useRef<HTMLDialogElement>(null);
   const emailRef = useRef<HTMLInputElement>(null);
   const messageRef = useRef<HTMLTextAreaElement>(null);
   const headingId = useId();
@@ -76,36 +76,14 @@ export function FeedbackForm({
     successRef.current = false;
   }, []);
 
+  // showModal / close / Escape / backdrop all live in <Dialog> now; this only
+  // decides what closing means for the form.
   const closeDialog = useCallback(() => {
     if (sendingRef.current) return;
-    const dlg = dialogRef.current;
-    if (dlg?.open) dlg.close();
     resetForm();
     onClose();
     requestAnimationFrame(() => returnFocusRef.current?.focus());
   }, [onClose, resetForm, returnFocusRef]);
-
-  useEffect(() => {
-    const dlg = dialogRef.current;
-    if (!dlg) return;
-    if (open && !dlg.open) {
-      dlg.showModal();
-      requestAnimationFrame(() => emailRef.current?.focus());
-    } else if (!open && dlg.open) {
-      dlg.close();
-    }
-  }, [open]);
-
-  useEffect(() => {
-    const dlg = dialogRef.current;
-    if (!dlg) return;
-    const onCancel = (e: Event) => {
-      e.preventDefault();
-      closeDialog();
-    };
-    dlg.addEventListener("cancel", onCancel);
-    return () => dlg.removeEventListener("cancel", onCancel);
-  }, [closeDialog]);
 
   const pickAttachments = async () => {
     setFieldErrors((prev) => ({ ...prev, attachments: undefined }));
@@ -208,10 +186,12 @@ export function FeedbackForm({
   };
 
   return (
-    <dialog
-      ref={dialogRef}
+    <Dialog
+      open={open}
       className="feedback-dialog"
-      aria-labelledby={headingId}
+      ariaLabelledBy={headingId}
+      initialFocusRef={emailRef}
+      onCancel={closeDialog}
       onClose={closeDialog}
     >
       <form
@@ -373,6 +353,6 @@ export function FeedbackForm({
           </>
         )}
       </form>
-    </dialog>
+    </Dialog>
   );
 }

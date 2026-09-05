@@ -1,7 +1,9 @@
 # Desktop overhaul — scope (approved direction A, 2026-09-04)
 
-Status: **scope approved, not started.** The audit and the mocks are the design source of truth;
-this document only fixes the decisions and the phasing so a build session can start from a brief.
+Status: **scope approved 2026-09-04; phases 1–2 in progress the same evening.** The audit and the
+mocks are the design source of truth; this document only fixes the decisions and the phasing so a
+build session can start from a brief. Release decision (Matt, 2026-09-04): **one published release,
+0.4.0**, carrying the audit fixes (PR #61) and the overhaul; no 0.3.17.
 
 - Audit (findings, gap table, harness matrix, per-screen critique, copy glossary):
   maintainer artifact "Khipu Audit, September 2026" (private Claude artifact, 2026-09-04).
@@ -45,7 +47,10 @@ this document only fixes the decisions and the phasing so a build session can st
 - **Phase 4, Owed.** New screen over `khipu owed` (open/closed/stale, project chip, Done /
   Snooze / Reopen; Done and Reopen map to `khipu owed --close ID` / `--reopen ID`, which exist;
   Snooze needs a `due_after` update, add it to the CLI first). Oracle: build + live rows.
-- **Phase 5, Harnesses and Settings.** Card grid with verified-round-trip line; Settings
+- **Phase 5, Harnesses and Settings.** Card grid with verified-round-trip line — the "verified"
+  state must come from the CLI's probe and heartbeat evidence (`integrations status`/`verify`,
+  `recall_probe`), never from app-local install state, which today shows "Installed, not yet
+  verified" forever on packs the CLI has already probed green; Settings
   sub-navigation with the capture cadence, retention and redaction controls (retention and
   redaction need engine work first: see the audit's gap table; ship the controls disabled with a
   "coming" note only if the engine lands in the same release, otherwise omit them).

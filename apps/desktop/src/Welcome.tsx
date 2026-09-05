@@ -2,14 +2,9 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { resourceDir } from "@tauri-apps/api/path";
-import {
-  Check,
-  ChevronLeft,
-  ChevronRight,
-  CircleCheck,
-  TriangleAlert,
-} from "lucide-react";
+import { Check, ChevronLeft, ChevronRight } from "lucide-react";
 import { WorkingBanner } from "./WorkingBanner";
+import { Callout, Tag } from "./ui";
 
 /** Persisted so the tutorial opens itself only until it has been finished once;
  *  it stays reachable from Setup → Welcome afterwards. */
@@ -90,22 +85,6 @@ function soleBackupRedFlag(doctor: DoctorPayload | null): boolean {
     if (doctor[key] === false) return false;
   }
   return true;
-}
-
-function Note({ tone, title, children, action }: {
-  tone: "ok" | "warn"; title: string; children?: React.ReactNode; action?: React.ReactNode;
-}) {
-  const Icon = tone === "ok" ? CircleCheck : TriangleAlert;
-  return (
-    <div className={`callout ${tone}`}>
-      <Icon size={16} strokeWidth={1.75} className="callout-icon" aria-hidden />
-      <div className="callout-content">
-        <div className="callout-title">{title}</div>
-        {children ? <div className="callout-body">{children}</div> : null}
-      </div>
-      {action ? <div className="callout-action">{action}</div> : null}
-    </div>
-  );
 }
 
 /** True when the bundle is on the shipped DMG volume, not /Applications or a
@@ -736,11 +715,11 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         <>
           <h1>Welcome to Khipu</h1>
           {fromDiskImage ? (
-            <Note tone="warn" title="Drag Khipu into Applications">
+            <Callout tone="warn" title="Drag Khipu into Applications">
               You opened the app from the disk image. Drag <strong>Khipu.app</strong> into
               the <strong>Applications</strong> folder, eject the disk image, then launch
               Khipu from Applications — running it from the DMG is not an install.
-            </Note>
+            </Callout>
           ) : (
             <p className="muted">
               Install: open the disk image and drag <strong>Khipu.app</strong> into the{" "}
@@ -867,13 +846,13 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                 </button>
               </div>
               {joinExpected ? (
-                <Note tone="ok" title="Expected hub counts">
+                <Callout tone="ok" title="Expected hub counts">
                   episodes {joinExpected.episodes ?? "?"} · topics {joinExpected.topics ?? "?"} ·
                   nodes {joinExpected.nodes ?? "?"}
                   {joinLive
                     ? ` — live: episodes ${joinLive.episodes ?? "?"}, topics ${joinLive.topics ?? "?"}, nodes ${joinLive.nodes ?? "?"}`
                     : null}
-                </Note>
+                </Callout>
               ) : null}
             </>
           ) : dbMode === "local" ? (
@@ -892,9 +871,9 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                 </button>
               </div>
               {dockerOk === false ? (
-                <Note tone="warn" title="Docker not ready">{dockerErr ?? "Start Docker Desktop, then recheck."}</Note>
+                <Callout tone="warn" title="Docker not ready">{dockerErr ?? "Start Docker Desktop, then recheck."}</Callout>
               ) : null}
-              {diskWarn ? <Note tone="warn" title="Low disk space">{diskWarn}</Note> : null}
+              {diskWarn ? <Callout tone="warn" title="Low disk space">{diskWarn}</Callout> : null}
             </>
           ) : (
             <>
@@ -928,7 +907,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
           {dbMsg ? <pre className="code">{dbMsg}</pre> : null}
 
           {dsnOk && databaseReady ? (
-            <Note
+            <Callout
               tone="ok"
               title="Database ready"
               action={pending > 0 ? (
@@ -944,7 +923,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                   : pending === 0
                     ? `Schema is up to date (${plan.applied?.length ?? 0} migrations applied).`
                     : `${pending} migration${pending === 1 ? "" : "s"} to apply: ${plan.pending?.join(", ")}`}
-            </Note>
+            </Callout>
           ) : null}
         </>
       ) : null}
@@ -1099,9 +1078,9 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                 </div>
               ) : null}
               {embedChoice === "cloud" && !presence?.gemini_in_keychain && !presence?.gemini_env ? (
-                <Note tone="warn" title="No Gemini key yet">
+                <Callout tone="warn" title="No Gemini key yet">
                   Semantic search stays empty until a key is set; synth capture can still queue.
-                </Note>
+                </Callout>
               ) : null}
             </div>
           </div>
@@ -1119,13 +1098,13 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
             Support — not inside the app bundle.
           </p>
           {graphOk ? (
-            <Note tone="ok" title="Graph engine ready">
+            <Callout tone="ok" title="Graph engine ready">
               {graphMsg ?? "Graphify is installed."}
-            </Note>
+            </Callout>
           ) : graphInstalling ? (
             <p className="muted">Downloading and unpacking Graphify…</p>
           ) : graphSkipped ? (
-            <Note
+            <Callout
               tone="warn"
               title="Graph engine skipped"
               action={
@@ -1143,9 +1122,9 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
             >
               Search and capture still work. The knowledge graph stays empty until
               Graphify is installed later from Components.
-            </Note>
+            </Callout>
           ) : (
-            <Note
+            <Callout
               tone="warn"
               title="Graph install did not finish"
               action={
@@ -1160,7 +1139,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
               }
             >
               {graphErr ?? "Graphify isn't installed yet — retry, or skip and install it later from Components."}
-            </Note>
+            </Callout>
           )}
           {joinedHub ? (
             <div className="section-card">
@@ -1219,10 +1198,9 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                 <li key={h.harness} className="welcome-harness-row">
                   <strong>{h.harness.replace("_", " ")}</strong>
                   {h.installed ? (
-                    <span className="pill ok">
-                      <span className="pill-dot" />
+                    <Tag tone="ok" dot>
                       Installed
-                    </span>
+                    </Tag>
                   ) : (
                     <span className="muted">
                       {h.detected ? "found, not installed" : "not found on this Mac"}
@@ -1244,17 +1222,17 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         <>
           <h1>You're set</h1>
           {graphSkipped ? (
-            <Note tone="warn" title="Graph engine skipped">
+            <Callout tone="warn" title="Graph engine skipped">
               Search and capture work now. Install Graphify later from
               Components to build the knowledge graph.
-            </Note>
+            </Callout>
           ) : null}
           {doctorErr ? (
             <p className="muted">Doctor could not run: {doctorErr}</p>
           ) : doctor == null ? (
             <p className="muted">Running a health check…</p>
           ) : (
-            <Note tone={doctor.ok ? "ok" : "warn"} title={doctor.ok ? "Doctor is green" : "Doctor found something"}>
+            <Callout tone={doctor.ok ? "ok" : "warn"} title={doctor.ok ? "Doctor is green" : "Doctor found something"}>
               {doctor.not_configured?.length
                 ? <>Skipped (not configured on this Mac): <code>{doctor.not_configured.join(", ")}</code>. Expected on a fresh install.</>
                 : "Every configured check ran."}
@@ -1265,7 +1243,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                   You may continue with warnings on a remote or joined hub database.
                 </div>
               ) : null}
-            </Note>
+            </Callout>
           )}
           <p className="muted">
             From here: agents capture on their own, and <strong>Search</strong>{" "}

@@ -10,28 +10,29 @@ import {
   save as saveFileDialog,
 } from "@tauri-apps/plugin-dialog";
 import {
-  Blocks,
-  ChevronRight,
   CircleCheck,
   CircleMinus,
-  Gauge,
-  GitBranch,
-  History,
   Loader2,
   MessageSquare,
-  Package,
-  PlugZap,
   RefreshCw,
   Search,
-  Settings2,
   Stethoscope,
   Trash2,
   TriangleAlert,
   Waypoints,
   X,
 } from "lucide-react";
-import type { LucideIcon } from "lucide-react";
 import khipuIcon from "./assets/khipu-icon.png";
+import {
+  Callout,
+  Chip,
+  Disclosure,
+  EmptyState,
+  ListRow,
+  Segmented,
+  Tag,
+  Tile,
+} from "./ui";
 import { ComponentsPanel } from "./ComponentsPanel";
 import { IntegrationsPanel } from "./IntegrationsPanel";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
@@ -46,17 +47,19 @@ import {
 } from "./postUpdateNotices";
 import "./App.css";
 
+/** Six destinations, one per user job, plus the first-run flow and Revisions —
+ *  which is a drill-in from Home's "Conflicting edits" item, not a peer
+ *  (audit 2026-09-04 IA). Status and Doctor are gone as screens; their data
+ *  paths feed Home. */
 type Tab =
   | "first-run"
-  | "status"
+  | "home"
+  | "recall"
+  | "owed"
   | "activity"
-  | "search"
-  | "graph"
-  | "revisions"
-  | "doctor"
+  | "harnesses"
   | "settings"
-  | "components"
-  | "integrations";
+  | "revisions";
 
 type CacheTab = "status" | "activity" | "revisions" | "doctor";
 
@@ -225,18 +228,159 @@ function clampHops(value: number): number {
   return Math.min(4, Math.max(1, Math.trunc(value)));
 }
 
-const NAV_ICONS: Record<Tab, LucideIcon> = {
-  status: Gauge,
-  activity: History,
-  search: Search,
-  graph: Waypoints,
-  revisions: GitBranch,
-  doctor: Stethoscope,
-  settings: Settings2,
-  components: Package,
-  integrations: Blocks,
-  "first-run": PlugZap,
+/** Rail glyphs, traced from the approved mock (`rail.html`) rather than picked
+ *  from an icon set — the six items are the design, not a lucide lookup. */
+function RailIcon({ d }: { d: ReactNode }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      aria-hidden
+      width={16}
+      height={16}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      {d}
+    </svg>
+  );
+}
+
+const NAV_ICONS: Record<Exclude<Tab, "first-run" | "revisions">, ReactNode> = {
+  home: <RailIcon d={<path d="M3 8.5 8 4l5 4.5V13H3z" />} />,
+  recall: (
+    <RailIcon
+      d={
+        <>
+          <circle cx="7" cy="7" r="4" />
+          <path d="m10 10 3.5 3.5" />
+        </>
+      }
+    />
+  ),
+  owed: (
+    <RailIcon
+      d={
+        <>
+          <path d="M3 4h10M3 8h7M3 12h5" />
+          <path d="m11 11 1.5 1.5L15 10" />
+        </>
+      }
+    />
+  ),
+  activity: (
+    <RailIcon
+      d={
+        <>
+          <circle cx="8" cy="8" r="5.5" />
+          <path d="M8 5v3l2 1.5" />
+        </>
+      }
+    />
+  ),
+  harnesses: (
+    <RailIcon
+      d={
+        <>
+          <path d="M5 3v3M11 3v3M3 6h10v3a5 5 0 0 1-10 0z" />
+          <path d="M8 11v3" />
+        </>
+      }
+    />
+  ),
+  settings: (
+    <RailIcon
+      d={
+        <>
+          <path d="M3 5h10M3 11h10" />
+          <circle cx="6" cy="5" r="1.5" />
+          <circle cx="10" cy="11" r="1.5" />
+        </>
+      }
+    />
+  ),
 };
+
+/** One row of `khipu owed --json` (khipu.commitments.list_owed). */
+type Commitment = {
+  id: number;
+  text?: string;
+  project?: string | null;
+  owner?: string | null;
+  kind?: string | null;
+  opened_episode?: number | null;
+  opened_at?: string | null;
+  due_after?: string | null;
+  status?: string | null;
+};
+
+type OwedStatus = "open" | "closed" | "stale";
+
+/** How many commitments one screenful asks for. A count that lands exactly on
+ *  the cap is shown as "N+", because it is a floor, not a total. */
+const OWED_LIMIT = 500;
+
+/** A named red check, in plain words, with at most one fix. Home renders one
+ *  callout per entry; `action` is omitted where the app has no honest fix to
+ *  offer and "Details" opens the Advanced disclosure instead. */
+type Attention = {
+  key: string;
+  tone: "err" | "warn";
+  title: string;
+  cause: string;
+  fix?: { label: string; kind: "reinstall-hook" | "recall-probe" | "revisions" };
+  harness?: string;
+};
+
+const HARNESS_LABEL: Record<string, string> = {
+  claude_code: "Claude Code",
+  cursor: "Cursor",
+  aegis: "Aegis",
+  codex: "Codex",
+  grok_bot: "Grok Bot",
+};
+
+/** `commitments.kind` values, in the mocks' words. Anything the engine adds
+ *  later falls through to its own raw kind rather than being hidden. */
+const OWED_KIND_LABEL: Record<string, string> = {
+  followup: "Follow-up",
+  blocker: "Blocker",
+  question: "Question",
+  promise: "Promise",
+  decision: "Decision",
+};
+
+function harnessLabel(id: string): string {
+  return HARNESS_LABEL[id] ?? id;
+}
+
+/** The project a capture belongs to, from the episode's own `scope`. A scope is
+ *  either a repo path on disk or free text the session named for itself; only
+ *  the path form is a project, so free text carries no tag rather than a
+ *  sentence squeezed into a pill. Never invented. */
+function projectFromScope(scope: string | undefined | null): string | null {
+  if (!scope || !scope.trim()) return null;
+  const s = scope.trim();
+  if (!s.startsWith("/")) return null;
+  const parts = s.split("/").filter(Boolean);
+  const codeAt = parts.lastIndexOf("Code");
+  if (codeAt >= 0 && parts[codeAt + 1]) return parts[codeAt + 1];
+  return parts[parts.length - 1] ?? null;
+}
+
+/** `commitments.project` is an owner/repo slug — or, when the capture could not
+ *  resolve one, the raw `harness:uuid` session id it was opened under. The repo
+ *  half identifies the first; the harness name identifies the second. The full
+ *  value stays as the tooltip either way. */
+function shortProject(project: string): string {
+  if (project.includes(":")) {
+    return `${harnessLabel(project.split(":")[0] ?? "")} session`;
+  }
+  const parts = project.split("/").filter(Boolean);
+  return parts[parts.length - 1] ?? project;
+}
 
 // Any user-typed value reaches argparse as its own argv element, so a value
 // beginning with "-" would be read as a FLAG rather than as the value. Callers
@@ -289,6 +433,14 @@ function formatAge(seconds: number | null | undefined): string {
   if (seconds < 5400) return `${Math.round(seconds / 60)}m`;
   if (seconds < 172800) return `${Math.round(seconds / 3600)}h`;
   return `${Math.round(seconds / 86400)}d`;
+}
+
+/** Coarse age of an ISO timestamp, in the mocks' "2 d" register. */
+function ageSince(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const t = new Date(String(iso).replace(" ", "T")).getTime();
+  if (Number.isNaN(t)) return null;
+  return formatAge((Date.now() - t) / 1000);
 }
 
 async function spawnKhipu(subcommand: string): Promise<{
@@ -408,42 +560,6 @@ function opsStatusTone(status: string | undefined): Tone {
   return "warn";
 }
 
-function StatusPill({ tone, children }: { tone: Tone; children: ReactNode }) {
-  return (
-    <span className={tone === "neutral" ? "pill" : `pill ${tone}`}>
-      <span className="pill-dot" />
-      {children}
-    </span>
-  );
-}
-
-function Callout({
-  tone,
-  title,
-  action,
-  children,
-}: {
-  // "neutral" is for a true absence — an empty result that is neither a pass
-  // nor a problem. It had to borrow "ok", which coloured "No edges" green.
-  tone: "ok" | "warn" | "neutral";
-  title: string;
-  action?: ReactNode;
-  children?: ReactNode;
-}) {
-  const Icon =
-    tone === "warn" ? TriangleAlert : tone === "neutral" ? CircleMinus : CircleCheck;
-  return (
-    <div className={`callout ${tone}`}>
-      <Icon size={16} strokeWidth={1.75} className="callout-icon" aria-hidden />
-      <div className="callout-content">
-        <div className="callout-title">{title}</div>
-        {children ? <div className="callout-body">{children}</div> : null}
-      </div>
-      {action ? <div className="callout-action">{action}</div> : null}
-    </div>
-  );
-}
-
 function PanelHeader({
   title,
   lede,
@@ -470,40 +586,31 @@ function PanelHeader({
   );
 }
 
+/** The JSON body itself. Kept as its own piece so Home can put two of them
+ *  inside one disclosure without nesting two more. */
+function RawBlock({ text, empty }: { text: string; empty?: string }) {
+  const body = text && text !== "\u2026" ? text : empty || "No data yet.";
+  return <pre className="code tall">{body}</pre>;
+}
+
+/** Raw JSON, behind a collapsed "Advanced" disclosure. It used to sit expanded
+ *  on every primary screen — a debug affordance as permanent furniture
+ *  (audit 2026-09-04). */
 function RawJson({
   text,
   empty,
   openKey = 0,
+  label = "Advanced",
 }: {
   text: string;
   empty?: string;
   openKey?: number;
+  label?: string;
 }) {
-  const ref = useRef<HTMLDetailsElement>(null);
-  const [open, setOpen] = useState(false);
-  // Bump openKey → open once; onToggle keeps user collapse/expand free.
-  useEffect(() => {
-    if (openKey > 0) {
-      setOpen(true);
-      requestAnimationFrame(() => {
-        ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-      });
-    }
-  }, [openKey]);
-  const body = text && text !== "…" ? text : empty || "No data yet.";
   return (
-    <details
-      ref={ref}
-      className="raw"
-      open={open}
-      onToggle={(e) => setOpen(e.currentTarget.open)}
-    >
-      <summary>
-        <ChevronRight size={14} className="raw-chevron" aria-hidden />
-        Raw JSON
-      </summary>
-      <pre className="code tall">{body}</pre>
-    </details>
+    <Disclosure label={label} openKey={openKey}>
+      <RawBlock text={text} empty={empty} />
+    </Disclosure>
   );
 }
 
@@ -539,7 +646,7 @@ function renderHealthRow(
 }
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("status");
+  const [tab, setTab] = useState<Tab>("home");
   const [dsnOk, setDsnOk] = useState<boolean | null>(null);
   const [loading, setLoading] = useState<Partial<Record<CacheTab, boolean>>>(
     {},
@@ -550,26 +657,43 @@ export default function App() {
 
   const [statusText, setStatusText] = useState("…");
   const [counts, setCounts] = useState<Counts | null>(null);
-  // True capture -> PG mirror latency (drift.py `mirror_lag_seconds`), distinct
-  // from time-since-last-capture (`time_since_last_capture_seconds`, not shown
-  // as its own KPI today) — see plan.md P2a / audit F2.
-  const [mirrorLag, setMirrorLag] = useState<number | null>(null);
   // Split so Status sample-0 cannot clobber Revisions-derived drift UI.
   const [statusConflicts, setStatusConflicts] =
     useState<ConflictSummary | null>(null);
   const [revisionsConflicts, setRevisionsConflicts] =
     useState<ConflictSummary | null>(null);
   const [recentCaptures, setRecentCaptures] = useState<
-    Array<{ id: number; summary?: string; ts?: string }>
+    Array<{ id: number; summary?: string; ts?: string; scope?: string }>
   >([]);
-  const [dsnSource, setDsnSource] = useState<string | null>(null);
   const [doctorText, setDoctorText] = useState("…");
   const [doctorOk, setDoctorOk] = useState<boolean | null>(null);
   // Named failures, so a red Doctor says WHAT is red without a trip to the raw
   // JSON. Capture liveness is the one that matters most: a harness whose
   // hook runs but records nothing must be loud here (2026-08-17).
   const [doctorIssues, setDoctorIssues] = useState<string[]>([]);
+  // The same failures as `doctorIssues`, but shaped for Home: plain-language
+  // title, the cause in a sentence, and at most one fix action.
+  const [attention, setAttention] = useState<Attention[]>([]);
   const [doctorCheckCount, setDoctorCheckCount] = useState(0);
+  // Home's four tiles read these straight off the doctor payload; nothing here
+  // is derived from a field the report does not carry.
+  const [liveness, setLiveness] = useState<{
+    ok?: boolean;
+    red?: string[];
+    harnesses?: Record<string, { ok?: boolean; reasons?: string[] }>;
+  } | null>(null);
+  const [embedCoverage, setEmbedCoverage] = useState<Record<
+    string,
+    { total?: number; embedded?: number; missing?: number; pct?: number }
+  > | null>(null);
+  const [backupHealth, setBackupHealth] = useState<{
+    ok?: boolean;
+    freshest_backup_age_seconds?: number;
+  } | null>(null);
+  const [snapshotHealth, setSnapshotHealth] = useState<{
+    ok?: boolean;
+    age_seconds?: number;
+  } | null>(null);
   const [probeBusy, setProbeBusy] = useState(false);
   const [doctorJobs, setDoctorJobs] = useState<DoctorJobs | null>(null);
   // Checks the CLI never ran on this machine (`not_configured`) plus the two
@@ -640,6 +764,21 @@ export default function App() {
   // that THIS search is in flight so it can show a loading state instead of
   // leaving the "type a query" empty state on screen (audit 2026-09-04).
   const [searchBusy, setSearchBusy] = useState(false);
+  // Recall holds Search and the graph walk; the walk is a sub-view of a result,
+  // not a peer destination (audit IA).
+  const [recallView, setRecallView] = useState<"search" | "graph">("search");
+  const [owedRows, setOwedRows] = useState<Commitment[]>([]);
+  // Home previews the open ones; the Owed screen's own list follows its
+  // filter, so the two must not share one array.
+  const [owedOpenRows, setOwedOpenRows] = useState<Commitment[]>([]);
+  const [owedStatus, setOwedStatus] = useState<OwedStatus>("open");
+  const [owedProject, setOwedProject] = useState<string | null>(null);
+  const [owedOpenCount, setOwedOpenCount] = useState<number | null>(null);
+  const [owedLoading, setOwedLoading] = useState(false);
+  // Bumped by an attention item with no fix action, and by "Details": opens
+  // Home's one disclosure instead of dead-ending.
+  const [homeAdvancedKey, setHomeAdvancedKey] = useState(0);
+  const [owedFetchedAt, setOwedFetchedAt] = useState<Partial<Record<OwedStatus, number>>>({});
   const [nodeId, setNodeId] = useState("");
   const [hops, setHops] = useState(1);
   const [graphText, setGraphText] = useState("");
@@ -688,10 +827,13 @@ export default function App() {
       const raw = await runKhipu(["status"]);
       const parsed = parseJson(raw) as {
         counts?: Counts;
-        mirror_lag_seconds?: number;
         conflicts?: ConflictSummary;
-        recent_captures?: Array<{ id: number; summary?: string; ts?: string }>;
-        dsn_source?: string;
+        recent_captures?: Array<{
+          id: number;
+          summary?: string;
+          ts?: string;
+          scope?: string;
+        }>;
       } | null;
       if (
         parsed === null ||
@@ -704,14 +846,8 @@ export default function App() {
       }
       setStatusText(prettyJson(raw));
       setCounts(parsed.counts ?? null);
-      setMirrorLag(
-        typeof parsed.mirror_lag_seconds === "number"
-          ? parsed.mirror_lag_seconds
-          : null,
-      );
       setStatusConflicts(parsed.conflicts ?? null);
       setRecentCaptures(parsed.recent_captures ?? []);
-      setDsnSource(parsed.dsn_source ?? null);
       fetchedAt.current.status = Date.now();
     } catch (e) {
       // Preserve last-good KPIs/lists; toast only.
@@ -820,25 +956,141 @@ export default function App() {
       setDoctorText(prettyJson(raw));
       setDoctorOk(typeof parsed.ok === "boolean" ? parsed.ok : null);
       const issues: string[] = [];
-      const lv = (parsed as { capture_liveness?: { ok?: boolean; red?: string[]; harnesses?: Record<string, { reasons?: string[] }> } }).capture_liveness;
+      const items: Attention[] = [];
+      const lv = (parsed as {
+        capture_liveness?: {
+          ok?: boolean;
+          red?: string[];
+          harnesses?: Record<string, { ok?: boolean; reasons?: string[] }>;
+        };
+      }).capture_liveness;
+      setLiveness(lv ?? null);
+      setEmbedCoverage(
+        (parsed as { embed_coverage?: Record<string, { total?: number; embedded?: number; missing?: number; pct?: number }> })
+          .embed_coverage ?? null,
+      );
+      setBackupHealth(
+        (parsed as { backup?: { ok?: boolean; freshest_backup_age_seconds?: number } }).backup ?? null,
+      );
+      setSnapshotHealth(
+        (parsed as { hub_snapshot?: { ok?: boolean; age_seconds?: number } }).hub_snapshot ?? null,
+      );
       if (lv && lv.ok === false) {
         for (const h of lv.red ?? []) {
-          issues.push(`Not recording ${h}: ${(lv.harnesses?.[h]?.reasons ?? []).join("; ") || "see report"}`);
+          const why = (lv.harnesses?.[h]?.reasons ?? []).join("; ");
+          issues.push(`Not recording ${h}: ${why || "see report"}`);
+          items.push({
+            key: `liveness:${h}`,
+            tone: "err",
+            title: `${harnessLabel(h)} has stopped recording sessions`,
+            cause: why
+              ? `${why}. Reinstalling the hook puts it back without losing the session.`
+              : "Its capture hook is no longer reporting. Reinstalling the hook puts it back without losing the session.",
+            fix: { label: "Reinstall hook", kind: "reinstall-hook" },
+            harness: h,
+          });
         }
       }
       const gs = (parsed as { git_sync?: { ok?: boolean; reasons?: string[] } }).git_sync;
-      if (gs && gs.ok === false) issues.push(`Git sync not landing: ${(gs.reasons ?? []).join("; ") || "see report"}`);
-      if ((parsed as { drift_ok?: boolean }).drift_ok === false) issues.push("File ↔ PG drift");
-      if ((parsed as { graph_drift_ok?: boolean }).graph_drift_ok === false) issues.push("Graph mirror drift");
-      if ((parsed as { outbox_ok?: boolean }).outbox_ok === false) issues.push("Outbox has captures PG does not have yet");
-      if ((parsed as { backup_ok?: boolean }).backup_ok === false) issues.push("Backup / restore drill");
-      if ((parsed as { graph_backup_ok?: boolean }).graph_backup_ok === false) issues.push("Graph snapshot");
-      if ((parsed as { graph_offsite_ok?: boolean }).graph_offsite_ok === false) issues.push("Graph offsite");
+      if (gs && gs.ok === false) {
+        const why = (gs.reasons ?? []).join("; ");
+        issues.push(`Git sync not landing: ${why || "see report"}`);
+        items.push({
+          key: "git_sync",
+          tone: "warn",
+          title: "The nightly copy of your notes is not reaching GitHub",
+          cause: why
+            ? `${why}. Everything is still in the database; only the off-site copy of the note files is behind.`
+            : "Everything is still in the database; only the off-site copy of the note files is behind.",
+        });
+      }
+      if ((parsed as { drift_ok?: boolean }).drift_ok === false) {
+        issues.push("Out-of-sync files");
+        items.push({
+          key: "drift",
+          tone: "warn",
+          title: "Some note files no longer match the database",
+          cause:
+            "A file was edited in two places, so one version is not the one search returns. Conflicting edits lists them.",
+          fix: { label: "Conflicting edits", kind: "revisions" },
+        });
+      }
+      if ((parsed as { graph_drift_ok?: boolean }).graph_drift_ok === false) {
+        issues.push("Graph mirror drift");
+        items.push({
+          key: "graph_drift",
+          tone: "warn",
+          title: "The connections index is behind its source",
+          cause:
+            "The graph builder's own copy and the database disagree. The next graph build reconciles them; run it from the health report below.",
+        });
+      }
+      if ((parsed as { outbox_ok?: boolean }).outbox_ok === false) {
+        issues.push("Captures waiting to sync");
+        items.push({
+          key: "outbox",
+          tone: "warn",
+          title: "Some captures are still waiting to reach the database",
+          cause:
+            "They were recorded while the database was unreachable and are queued on this Mac. Refresh retries them; nothing is lost meanwhile.",
+        });
+      }
+      if ((parsed as { backup_ok?: boolean }).backup_ok === false) {
+        issues.push("Backup test");
+        items.push({
+          key: "backup",
+          tone: "err",
+          title: "The newest backup is older than it should be",
+          cause:
+            "Backups run on a schedule off this Mac. Until one lands, a restore would lose recent sessions.",
+        });
+      }
+      if ((parsed as { graph_backup_ok?: boolean }).graph_backup_ok === false) {
+        issues.push("Graph snapshot");
+        items.push({
+          key: "graph_backup",
+          tone: "warn",
+          title: "The connections snapshot is stale",
+          cause: "The last saved copy of the connections index is older than its limit.",
+        });
+      }
+      if ((parsed as { graph_offsite_ok?: boolean }).graph_offsite_ok === false) {
+        issues.push("Graph offsite");
+        items.push({
+          key: "graph_offsite",
+          tone: "warn",
+          title: "The off-site copy of the connections index is stale",
+          cause: "The most recent copy sent off this Mac is older than its limit.",
+        });
+      }
       if ((parsed as { index_freshness_ok?: boolean }).index_freshness_ok === false) {
-        issues.push("MEMORY.md index stale vs nightly");
+        issues.push("Memory index stale vs nightly");
+        items.push({
+          key: "index_freshness",
+          tone: "warn",
+          title: "The memory index has not been rebuilt since the last nightly run",
+          cause: "Recall still works; the summary index an agent reads first is a day behind.",
+        });
       }
       if ((parsed as { embed_coverage_ok?: boolean }).embed_coverage_ok === false) {
-        issues.push("Embedding coverage incomplete");
+        issues.push("Search index catching up");
+        const cov = (parsed as {
+          embed_coverage?: Record<string, { missing?: number }>;
+        }).embed_coverage;
+        const missing = cov
+          ? Object.entries(cov)
+              .filter(([, v]) => v && typeof v === "object" && (v.missing ?? 0) > 0)
+              .map(([k, v]) => `${v.missing} ${k}`)
+              .join(", ")
+          : "";
+        items.push({
+          key: "embed_coverage",
+          tone: "warn",
+          title: "The search index is behind",
+          cause: missing
+            ? `${missing} not indexed yet. They are still findable by their exact words; search by meaning misses them until the nightly catches up.`
+            : "Some rows are not indexed yet. They are still findable by their exact words until the nightly catches up.",
+        });
       }
       // Every red field doctor aggregates into `ok` needs a named issue here,
       // or the card says "Issues found" over an empty list and the person is
@@ -846,17 +1098,39 @@ export default function App() {
       if ((parsed as { recall_probe_ok?: boolean }).recall_probe_ok === false) {
         const rp = (parsed as { recall_probe?: { reason?: string; error?: string } })
           .recall_probe;
+        const why = rp?.reason || rp?.error;
         issues.push(
-          `Recall probe failed or is stale: run a probe${
-            rp?.reason || rp?.error ? ` (${rp.reason ?? rp.error})` : ""
-          }`,
+          `Recall probe failed or is stale: run a probe${why ? ` (${why})` : ""}`,
         );
+        items.push({
+          key: "recall_probe",
+          tone: "err",
+          title: "Nothing has proved that recall works end to end lately",
+          cause: why
+            ? `${why}. The probe records a session, searches for it and removes it again.`
+            : "The check that records a session, searches for it and removes it again has not run in the last seven days.",
+          fix: { label: "Run recall probe", kind: "recall-probe" },
+        });
       }
       if ((parsed as { bundle_seal_ok?: boolean }).bundle_seal_ok === false) {
         issues.push("App bundle signature is broken: reinstall from the DMG");
+        items.push({
+          key: "bundle_seal",
+          tone: "err",
+          title: "This copy of Khipu has been altered since it was signed",
+          cause:
+            "macOS will refuse to open it after the next restart. Reinstall from the downloaded disk image to repair it.",
+        });
       }
       if ((parsed as { dsn_file_ok?: boolean }).dsn_file_ok === false) {
-        issues.push("Database connection file missing or unreadable: set the DSN in Settings");
+        issues.push("Database connection file missing or unreadable");
+        items.push({
+          key: "dsn_file",
+          tone: "err",
+          title: "The saved database connection cannot be read",
+          cause:
+            "Harnesses that cannot reach the Keychain fall back to this file. Set the connection again under Settings.",
+        });
       }
       const snap = (parsed as { hub_snapshot?: { ok?: boolean; reason?: string } })
         .hub_snapshot;
@@ -864,6 +1138,13 @@ export default function App() {
         issues.push(
           `Offline copy is stale${snap.reason ? `: ${snap.reason}` : ""}`,
         );
+        items.push({
+          key: "hub_snapshot",
+          tone: "warn",
+          title: "The offline copy of your memory is behind",
+          cause:
+            "It is what recall falls back to when the database is unreachable. Refreshing it is a Settings action.",
+        });
       }
       setDoctorJobs((parsed as { jobs?: DoctorJobs }).jobs ?? null);
       const notConfiguredRaw = (parsed as { not_configured?: unknown })
@@ -888,6 +1169,7 @@ export default function App() {
           .graph_drift?.skipped,
       });
       setDoctorIssues(issues);
+      setAttention(items);
       // The number of boolean `*_ok` verdicts in this report — what "all
       // checks passed" is actually a claim about.
       setDoctorCheckCount(
@@ -923,6 +1205,58 @@ export default function App() {
       await loadDoctor(true);
     }
   }, [loadDoctor]);
+
+  /** `khipu owed` — the open commitments a session left behind. Read-only in
+   *  this phase: Done / Snooze / Reopen land in phase 4 with the CLI's
+   *  `--close` / `--reopen` and the `due_after` update Snooze needs. */
+  const loadOwed = useCallback(
+    async (status: OwedStatus, force = false, forDisplay = true) => {
+      const at = owedFetchedAt[status];
+      if (!force && at != null && Date.now() - at < CACHE_TTL_MS) return;
+      setOwedLoading(true);
+      try {
+        const raw = await runKhipu([
+          "owed",
+          `--status=${status}`,
+          `--limit=${OWED_LIMIT}`,
+        ]);
+        const parsed = parseJson(raw);
+        const rows = Array.isArray(parsed) ? (parsed as Commitment[]) : [];
+        if (status === "open") {
+          setOwedOpenCount(rows.length);
+          setOwedOpenRows(rows);
+        }
+        // The rail's badge fetch must not replace the rows the Owed screen is
+        // showing for a different filter.
+        if (!forDisplay) return;
+        setOwedRows(rows);
+        setOwedFetchedAt((prev) => ({ ...prev, [status]: Date.now() }));
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setOwedLoading(false);
+      }
+    },
+    [owedFetchedAt],
+  );
+
+  /** Home's one fix action for a harness that stopped recording: the same
+   *  install the Harnesses screen runs, then a fresh health read. */
+  const reinstallHook = useCallback(
+    async (harness: string) => {
+      setActionBusy(true);
+      setError(null);
+      try {
+        await runKhipu(["integrations", "install", harness]);
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setActionBusy(false);
+        await loadDoctor(true);
+      }
+    },
+    [loadDoctor],
+  );
 
   const loadActivity = useCallback(async (force = false) => {
     if (!needsFetch("activity", force)) return;
@@ -1120,8 +1454,12 @@ export default function App() {
     }
   }, [query, searchMode, searchProject, searchSince]);
 
-  const doGraph = useCallback(async () => {
-    if (!nodeId.trim()) return;
+  /** `explicitId` is how a Recall result opens its own neighbourhood — the
+   *  graph view used to be reachable only by pasting an id you had to already
+   *  know (audit 2026-09-04). */
+  const doGraph = useCallback(async (explicitId?: string) => {
+    const target = (explicitId ?? nodeId).trim();
+    if (!target) return;
     setActionBusy(true);
     setError(null);
     try {
@@ -1132,7 +1470,7 @@ export default function App() {
         "--limit",
         "40",
         "--",
-        nodeId.trim(),
+        target,
       ]);
       setGraphText(prettyJson(raw));
     } catch (e) {
@@ -1145,41 +1483,46 @@ export default function App() {
 
   useEffect(() => {
     if (!dsnOk) return;
-    // Fire-and-forget: never block tab paint on CLI.
-    if (tab === "status") void loadStatus(false);
-    if (tab === "doctor") void loadDoctor(false);
+    // Fire-and-forget: never block tab paint on CLI. Home is the merged
+    // Status + Doctor screen, so it pulls all three read paths.
+    if (tab === "home") {
+      void loadStatus(false);
+      void loadDoctor(false);
+      void loadActivity(false);
+    }
     if (tab === "revisions") void loadRevisions(false);
     if (tab === "activity") void loadActivity(false);
-  }, [tab, dsnOk, loadStatus, loadDoctor, loadRevisions, loadActivity]);
+    if (tab === "owed") void loadOwed(owedStatus, false);
+  }, [
+    tab,
+    dsnOk,
+    owedStatus,
+    loadStatus,
+    loadDoctor,
+    loadRevisions,
+    loadActivity,
+    loadOwed,
+  ]);
 
-  const navGroups = useMemo(
+  // The rail's Owed badge is a count of open commitments, so it has to be
+  // known before anyone opens Owed.
+  useEffect(() => {
+    if (!dsnOk || owedOpenCount != null) return;
+    void loadOwed("open", false, false);
+  }, [dsnOk, owedOpenCount, loadOwed]);
+
+  /** Six destinations, one per named job (audit IA). Revisions is reachable
+   *  from Home, not from here; Welcome is a first-run flow with a "Run setup
+   *  again" button in Settings. */
+  const navItems = useMemo(
     () =>
       [
-        {
-          label: "Browse",
-          items: [
-            ["status", "Status", "Health & counts"],
-            ["activity", "Activity", "Recent captures"],
-            ["search", "Search", "Find topics"],
-            ["graph", "Graph", "Neighbors"],
-          ],
-        },
-        {
-          label: "Ops",
-          items: [
-            ["revisions", "Revisions", "Drift & LWW"],
-            ["doctor", "Doctor", "Backup check"],
-          ],
-        },
-        {
-          label: "Setup",
-          items: [
-            ["settings", "Settings", "Keys & data folder"],
-            ["components", "Components", "Postgres & Graphify"],
-            ["integrations", "Integrations", "Claude · Cursor · Aegis · Codex"],
-            ["first-run", "Welcome", "Tutorial & setup"],
-          ],
-        },
+        ["home", "Home", "Is memory working right now?"],
+        ["recall", "Recall", "What does the agent remember about this?"],
+        ["owed", "Owed", "What you still owe on each project"],
+        ["activity", "Activity", "Every session Khipu recorded"],
+        ["harnesses", "Harnesses", "Claude Code · Cursor · Aegis · Codex"],
+        ["settings", "Settings", "Capture, models, data and this Mac"],
       ] as const,
     [],
   );
@@ -1717,7 +2060,6 @@ export default function App() {
     return { rootId: null, neighbors: [] };
   }, [graphText]);
 
-  const statusOpenDrift = statusConflicts?.open_file_vs_pg ?? 0;
   const openDrift = revisionsConflicts?.open_file_vs_pg ?? 0;
   const unreadableTopics = revisionsConflicts?.topic_files_unreadable ?? [];
   const multiCount =
@@ -1729,29 +2071,24 @@ export default function App() {
     if (updateBusy) return "Checking for updates…";
     if (actionBusy) return "Working…";
     const bits: string[] = [];
-    if (loading.status) bits.push("Status");
-    if (loading.doctor) bits.push("Doctor");
-    if (loading.activity) bits.push("Activity");
-    if (loading.revisions) bits.push("Revisions");
-    if (hubSnapBusy && !loading.status && tab === "settings") bits.push("Status");
-    if (bits.length) return `Talking to the hub — ${bits.join(" · ")}`;
+    if (loading.status) bits.push("counts");
+    if (loading.doctor) bits.push("health");
+    if (loading.activity) bits.push("recent sessions");
+    if (loading.revisions) bits.push("conflicting edits");
+    if (hubSnapBusy && !loading.status && tab === "settings") bits.push("counts");
+    if (bits.length) return `Reading the memory server — ${bits.join(" · ")}`;
     return null;
   })();
   const tabBusy = (id: Tab): boolean => {
-    if (id === "status") return Boolean(loading.status);
-    if (id === "doctor") return Boolean(loading.doctor);
+    if (id === "home") {
+      return Boolean(loading.status) || Boolean(loading.doctor);
+    }
     if (id === "activity") return Boolean(loading.activity);
+    if (id === "owed") return owedLoading;
     if (id === "revisions") return Boolean(loading.revisions);
     if (id === "settings") return hubSnapBusy;
     return false;
   };
-
-  const lagLabel =
-    mirrorLag == null
-      ? "—"
-      : mirrorLag < 120
-        ? `${Math.round(mirrorLag)}s`
-        : `${Math.round(mirrorLag / 60)}m`;
 
   const panelClass = (id: Tab) =>
     tab === id ? "panel" : "panel is-hidden";
@@ -1764,13 +2101,80 @@ export default function App() {
     (doctorGraphBackup?.skipped ? 1 : 0) +
     (doctorGraphOffsite?.skipped ? 1 : 0);
 
-  // SLO (plan.md): mirror lag p95 <= 30s. This is a single latest-sample
-  // reading, not a true p95, but the same threshold is the honest bar.
-  const lagFresh = mirrorLag != null && mirrorLag <= 30;
-  const lagTone: Tone =
-    mirrorLag == null ? "neutral" : lagFresh ? "ok" : "warn";
-  const lagStatusLabel =
-    mirrorLag == null ? "—" : lagFresh ? "fresh" : "stale";
+  /* ---- Home tiles. Every value below comes from a field `khipu status` or
+     `khipu doctor` actually returns; where one is absent the element is
+     dropped rather than filled with a placeholder. -------------------------- */
+
+  const harnessIds = liveness?.harnesses ? Object.keys(liveness.harnesses) : [];
+  const harnessRed = liveness?.red ?? [];
+  const recordingValue = harnessIds.length
+    ? `${harnessIds.length - harnessRed.length} of ${harnessIds.length}`
+    : "—";
+  const recordingSub = harnessIds.length
+    ? harnessIds.map(harnessLabel).join(" · ")
+    : undefined;
+
+  // The rail's health line, and the plain-language replacement for "DSN ok".
+  const railHealth: { tone: "ok" | "warn" | "err"; text: string } =
+    dsnOk === false
+      ? { tone: "err", text: "Database not reachable" }
+      : harnessRed.length === 0 && liveness != null
+        ? { tone: "ok", text: "All harnesses recording" }
+        : harnessRed.length > 0
+          ? {
+              tone: "err",
+              text: `${harnessRed.length} harness${harnessRed.length === 1 ? "" : "es"} not recording`,
+            }
+          : { tone: "warn", text: "Checking harnesses…" };
+
+  const coverage = (() => {
+    if (!embedCoverage) return null;
+    let total = 0;
+    let embedded = 0;
+    let missing = 0;
+    for (const v of Object.values(embedCoverage)) {
+      if (!v || typeof v !== "object") continue;
+      if (typeof v.total !== "number") continue;
+      total += v.total;
+      embedded += v.embedded ?? 0;
+      missing += v.missing ?? 0;
+    }
+    if (total === 0) return null;
+    return { pct: (embedded / total) * 100, missing };
+  })();
+
+  const backupAge = backupHealth?.freshest_backup_age_seconds;
+  const offsiteAge = doctorGraphOffsite?.latest?.age_seconds;
+  const backupSub = [
+    backupAge != null ? `Database ${formatAge(backupAge)}` : null,
+    offsiteAge != null ? `off-site copy ${formatAge(offsiteAge)}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const jobEntries: Array<[string, JobEntry | undefined]> = [
+    ["Nightly consolidate", doctorJobs?.nightly],
+    ["Graph build", doctorJobs?.graph_build],
+    ["Monthly consolidate", doctorJobs?.monthly],
+  ];
+  const jobsOk = jobEntries.filter(
+    ([, e]) => e && e.plist_loaded !== false && (e.last_exit ?? 0) === 0,
+  ).length;
+  const nextJob = doctorJobs?.nightly?.next_schedule;
+  const jobsSummary = doctorJobs
+    ? `Scheduled jobs (${jobsOk} ok${nextJob ? `, next ${nextJob}` : ""}) · Full health report`
+    : "Full health report";
+
+  const openOwed = owedOpenCount ?? 0;
+
+  // Owed: the project filter offers only projects the loaded rows actually
+  // carry, so a chip can never select an empty list.
+  const owedProjects = Array.from(
+    new Set(owedRows.map((c) => c.project).filter((p): p is string => Boolean(p))),
+  ).sort();
+  const visibleOwed = owedProject
+    ? owedRows.filter((c) => c.project === owedProject)
+    : owedRows;
 
   const renderOnDemandJobRow = (
     label: string,
@@ -1826,52 +2230,65 @@ export default function App() {
           </span>
         </div>
         <div className="rail-nav" data-tauri-drag-region>
-          {navGroups.map((group) => (
-            <div key={group.label} className="nav-group" data-tauri-drag-region>
-              <div className="nav-group-label" data-tauri-drag-region>
-                {group.label}
-              </div>
-              {group.items.map(([id, label, hint]) => {
-                const Icon = NAV_ICONS[id];
-                return (
-                  <button
-                    key={id}
-                    type="button"
-                    className={tab === id ? "nav active" : "nav"}
-                    title={hint}
-                    aria-current={tab === id ? "page" : undefined}
-                    onClick={() => setTab(id)}
-                  >
-                    <Icon size={16} strokeWidth={1.75} aria-hidden />
-                    <span className="nav-label">{label}</span>
-                    {tabBusy(id) ? (
-                      <Loader2 size={12} className="spin nav-spin" aria-hidden />
-                    ) : null}
-                  </button>
-                );
-              })}
-            </div>
-          ))}
+          <div className="nav-group" data-tauri-drag-region>
+            {navItems.map(([id, label, hint]) => {
+              const badge =
+                id === "owed"
+                  ? openOwed > 0
+                    ? { n: openOwed, quiet: true }
+                    : null
+                  : id === "harnesses"
+                    ? harnessRed.length > 0
+                      ? { n: harnessRed.length, quiet: false }
+                      : null
+                    : null;
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  className={tab === id ? "nav active" : "nav"}
+                  title={hint}
+                  aria-current={tab === id ? "page" : undefined}
+                  onClick={() => setTab(id)}
+                >
+                  {NAV_ICONS[id]}
+                  <span className="nav-label">{label}</span>
+                  {badge ? (
+                    <span
+                      className={badge.quiet ? "nav-count quiet" : "nav-count"}
+                    >
+                      {badge.n}
+                      {id === "owed" && badge.n >= OWED_LIMIT ? "+" : ""}
+                    </span>
+                  ) : null}
+                  {tabBusy(id) ? (
+                    <Loader2 size={12} className="spin nav-spin" aria-hidden />
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
         </div>
         <div className="rail-foot" data-tauri-drag-region>
-          <button
-            ref={feedbackButtonRef}
-            type="button"
-            className="rail-feedback"
-            onClick={() => setFeedbackOpen(true)}
-          >
-            <MessageSquare size={14} aria-hidden />
-            Feedback
-          </button>
-          <span className="version-chip">v{appVersion}</span>
-          <StatusPill
-            tone={dsnOk == null ? "neutral" : dsnOk ? "ok" : "err"}
-          >
-            {dsnOk == null ? "DSN…" : dsnOk ? "DSN ok" : "DSN missing"}
-          </StatusPill>
-          {anyLoading ? (
-            <Loader2 size={12} className="spin rail-spin" aria-hidden />
-          ) : null}
+          <div className="rail-health">
+            <span className={`hdot ${railHealth.tone}`} aria-hidden />
+            <span>{railHealth.text}</span>
+            {anyLoading ? (
+              <Loader2 size={12} className="spin rail-spin" aria-hidden />
+            ) : null}
+          </div>
+          <div className="rail-meta">
+            <button
+              ref={feedbackButtonRef}
+              type="button"
+              className="rail-feedback"
+              onClick={() => setFeedbackOpen(true)}
+            >
+              <MessageSquare size={14} aria-hidden />
+              Feedback
+            </button>
+            <span className="version-chip">v{appVersion}</span>
+          </div>
         </div>
       </nav>
 
@@ -1883,202 +2300,323 @@ export default function App() {
               dsnOk={dsnOk}
               refreshDsn={() => refreshDsn(true)}
               runKhipu={runKhipu}
-              onFinish={() => setTab("status")}
-              openIntegrations={() => setTab("integrations")}
+              onFinish={() => setTab("home")}
+              openIntegrations={() => setTab("harnesses")}
             />
           </div>
         </section>
 
-        <section className={panelClass("status")}>
-          <PanelHeader
-            title="Status"
-            lede="Is the hub alive? Counts, mirror lag, and recent captures from Postgres."
-          >
-            {loading.status ? <Spinner /> : null}
-            <button type="button" onClick={() => void loadStatus(true)}>
+        <section className={panelClass("home")}>
+          <PanelHeader title="Home" lede="Is memory working right now?">
+            {loading.status || loading.doctor ? <Spinner /> : null}
+            <button
+              type="button"
+              onClick={() => {
+                void loadStatus(true);
+                void loadDoctor(true);
+                void loadActivity(true);
+              }}
+            >
               <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
               Refresh
             </button>
           </PanelHeader>
-          <div className="panel-body">
-            <div className="kpis">
-              <div className="kpi">
-                <span className="kpi-label">Postgres</span>
-                <span className="kpi-value">
-                  {dsnOk == null
-                    ? "…"
-                    : dsnOk
-                      ? "Connected"
-                      : "DSN missing"}
-                </span>
-                <StatusPill
-                  tone={dsnOk == null ? "neutral" : dsnOk ? "ok" : "err"}
-                >
-                  {dsnOk == null
-                    ? "checking…"
-                    : dsnOk
-                      ? (dsnSource ?? "dsn")
-                      : "not configured"}
-                </StatusPill>
-              </div>
-              <div className="kpi">
-                <span className="kpi-label">Mirror lag</span>
-                <span className="kpi-value mono">{lagLabel}</span>
-                <StatusPill tone={lagTone}>{lagStatusLabel}</StatusPill>
-              </div>
-              <div className="kpi">
-                <span className="kpi-label">File↔pg drift</span>
-                <span className="kpi-value mono">
-                  {statusConflicts
-                    ? statusOpenDrift === 0
-                      ? "none"
-                      : `${statusOpenDrift} open`
-                    : "—"}
-                </span>
-                <StatusPill
-                  tone={
-                    statusConflicts == null
-                      ? "neutral"
-                      : statusOpenDrift > 0
-                        ? "warn"
-                        : "ok"
-                  }
-                >
-                  {statusConflicts == null
-                    ? "—"
-                    : statusOpenDrift > 0
-                      ? "open drift"
-                      : "clean"}
-                </StatusPill>
-                {statusConflicts && statusOpenDrift === 0 ? (
-                  <span className="kpi-hint">
-                    PG stats only — refresh Revisions to hash files.
-                  </span>
-                ) : null}
-              </div>
-              <div className="kpi">
-                <span className="kpi-label">Episodes</span>
-                <span className="kpi-value mono">
-                  {counts?.episodes ?? "—"}
-                </span>
-                <StatusPill
-                  tone={counts?.episodes == null ? "neutral" : "ok"}
-                >
-                  {counts?.episodes == null ? "—" : "mirrored"}
-                </StatusPill>
-              </div>
-            </div>
-
-            <div className="chips">
-              <span className="chip">topics {counts?.topics ?? "—"}</span>
-              <span className="chip">nodes {counts?.nodes ?? "—"}</span>
-              <span className="chip">edges {counts?.edges ?? "—"}</span>
-              <span className="chip">
-                embeddings {counts?.embeddings ?? "—"}
-              </span>
-            </div>
-
-            {recentCaptures.length > 0 ? (
-              <>
-                <Callout
-                  tone="ok"
-                  title="Recent captures"
-                  action={
-                    <button type="button" onClick={() => setTab("activity")}>
-                      Open Activity
-                    </button>
-                  }
-                >
-                  Latest episodes mirrored into Postgres.
-                </Callout>
-                <div className="rows">
-                  {recentCaptures.slice(0, 5).map((ep) => (
-                    <div key={ep.id} className="row-item">
+          <div className="panel-body wide">
+            {attention.map((a) => (
+              <Callout
+                key={a.key}
+                tone={a.tone}
+                stripe
+                title={a.title}
+                action={
+                  <>
+                    {a.fix ? (
                       <button
                         type="button"
-                        className="id-chip"
+                        className="primary sm"
+                        disabled={actionBusy || probeBusy}
                         onClick={() => {
-                          setEpisodeShowId(String(ep.id));
-                          setTab("activity");
-                          void (async () => {
-                            setActionBusy(true);
-                            try {
-                              const raw = await runKhipu([
-                                "activity",
-                                "--show",
-                                String(ep.id),
-                              ]);
-                              setActivityText(prettyJson(raw));
-                              setActivityRawKey((k) => k + 1);
-                            } catch (e) {
-                              setError(String(e));
-                            } finally {
-                              setActionBusy(false);
-                            }
-                          })();
+                          if (a.fix?.kind === "reinstall-hook" && a.harness) {
+                            void reinstallHook(a.harness);
+                          } else if (a.fix?.kind === "recall-probe") {
+                            void runRecallProbe();
+                          } else if (a.fix?.kind === "revisions") {
+                            setTab("revisions");
+                          }
                         }}
                       >
-                        #{ep.id}
+                        {a.fix.label}
                       </button>
-                      <span className="row-main">
-                        {(ep.summary || "").slice(0, 100)}
-                      </span>
-                      {ep.ts ? (
-                        <span className="row-meta">{formatTs(ep.ts)}</span>
-                      ) : null}
-                    </div>
-                  ))}
-                </div>
-              </>
-            ) : null}
-
-            {statusConflicts ? (
+                    ) : (
+                      <button
+                        type="button"
+                        className="sm"
+                        onClick={() => setHomeAdvancedKey((k) => k + 1)}
+                      >
+                        Details
+                      </button>
+                    )}
+                  </>
+                }
+              >
+                {a.cause}
+              </Callout>
+            ))}
+            {attention.length === 0 && doctorOk ? (
               <Callout
-                tone={statusOpenDrift > 0 ? "warn" : "ok"}
-                title="Conflicts"
+                tone="ok"
+                title="Everything is recording and in sync"
                 action={
-                  <button type="button" onClick={() => setTab("revisions")}>
-                    Open Revisions
+                  <button
+                    type="button"
+                    className="sm"
+                    onClick={() => setHomeAdvancedKey((k) => k + 1)}
+                  >
+                    Details
                   </button>
                 }
               >
-                file↔pg open: <strong>{statusOpenDrift}</strong>
-                {statusOpenDrift === 0 ? " (none in last sample)" : ""} ·
-                multi-revision topics:{" "}
-                <strong>
-                  {statusConflicts.topics_with_multiple_revisions?.length ?? 0}
-                </strong>{" "}
-                · revision rows:{" "}
-                <strong>{statusConflicts.revision_row_count ?? "—"}</strong>
-                {statusConflicts.note ? (
-                  <span className="callout-note">{statusConflicts.note}</span>
-                ) : null}
+                {doctorCheckCount} checks passed
+                {doctorSkipCount > 0
+                  ? `, ${doctorSkipCount} not configured on this Mac`
+                  : ""}
+                .
               </Callout>
             ) : null}
 
-            {doctorJobs ? (
-              <div className="rows">
-                <div className="rows-head">Scheduled jobs</div>
-                {renderJobRow("Nightly consolidate", doctorJobs.nightly, "nightly")}
-                {renderJobRow("Graph build", doctorJobs.graph_build, "graph-build")}
-                {renderJobRow("Monthly consolidate", doctorJobs.monthly, "monthly")}
-                <div className="rows-head">On demand</div>
-                {renderOnDemandJobRow(
-                  "Embed media backfill",
-                  doctorJobs.embed_media_backfill,
+            <div className="tiles">
+              <Tile
+                label="Database"
+                value={
+                  dsnOk == null
+                    ? "…"
+                    : dsnOk
+                      ? "Connected"
+                      : "Not reachable"
+                }
+                sub={
+                  snapshotHealth?.age_seconds != null
+                    ? `Offline copy ${formatAge(snapshotHealth.age_seconds)} old`
+                    : undefined
+                }
+                tone={dsnOk === false ? "err" : "neutral"}
+              />
+              <Tile
+                label="Recording"
+                value={recordingValue}
+                sub={recordingSub}
+                tone={harnessRed.length > 0 ? "err" : "neutral"}
+              />
+              <Tile
+                label="Search index"
+                value={coverage ? `${coverage.pct.toFixed(1)}%` : "—"}
+                sub={
+                  coverage
+                    ? coverage.missing > 0
+                      ? `${coverage.missing} rows not indexed yet · catching up`
+                      : "Everything indexed"
+                    : undefined
+                }
+                tone={coverage && coverage.missing > 0 ? "warn" : "neutral"}
+              />
+              <Tile
+                label="Backups"
+                value={
+                  backupHealth?.ok == null
+                    ? "—"
+                    : backupHealth.ok
+                      ? "Fresh"
+                      : "Stale"
+                }
+                sub={backupSub || undefined}
+                tone={backupHealth?.ok === false ? "err" : "neutral"}
+              />
+            </div>
+
+            <div className="cols">
+              <div className="card col">
+                <div className="card-head">
+                  Recent captures
+                  <span className="spacer" />
+                  <button
+                    type="button"
+                    className="link sm"
+                    onClick={() => setTab("activity")}
+                  >
+                    Open Activity
+                  </button>
+                </div>
+                {recentCaptures.length === 0 ? (
+                  <EmptyState
+                    title="No captures yet"
+                    hint="Sessions your harnesses record show up here within a minute."
+                  />
+                ) : (
+                  recentCaptures.slice(0, 5).map((ep) => {
+                    const project = projectFromScope(ep.scope);
+                    return (
+                      <ListRow key={ep.id}>
+                        <span className="hdot ok" aria-hidden />
+                        {ep.ts ? (
+                          <span className="meta">{formatTs(ep.ts)}</span>
+                        ) : null}
+                        {project ? <Tag>{project}</Tag> : null}
+                        <span className="grow ellip t2">
+                          {ep.summary || `Episode ${ep.id}`}
+                        </span>
+                      </ListRow>
+                    );
+                  })
                 )}
               </div>
-            ) : null}
-            {jobSpawnMsg ? <pre className="code">{jobSpawnMsg}</pre> : null}
 
-            <RawJson text={statusText} />
+              <div className="card col">
+                <div className="card-head">
+                  Owed
+                  <span className="spacer" />
+                  <button
+                    type="button"
+                    className="link sm"
+                    onClick={() => setTab("owed")}
+                  >
+                    Open Owed
+                  </button>
+                </div>
+                {owedOpenRows.length === 0 ? (
+                  <EmptyState
+                    title="Nothing owed yet"
+                    hint="Follow-ups your sessions leave open will appear here."
+                  />
+                ) : (
+                  owedOpenRows.slice(0, 4).map((c) => {
+                    const age = ageSince(c.opened_at);
+                    return (
+                      <ListRow key={c.id}>
+                        <Tag kind tone={c.kind === "blocker" ? "warn" : "neutral"}>
+                          {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
+                        </Tag>
+                        <span className="grow ellip t2">{c.text}</span>
+                        {age ? <span className="meta">{age}</span> : null}
+                      </ListRow>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+
+            <Disclosure label={jobsSummary} openKey={homeAdvancedKey}>
+              {doctorJobs ? (
+                <div className="rows">
+                  <div className="rows-head">Scheduled jobs</div>
+                  {renderJobRow("Nightly consolidate", doctorJobs.nightly, "nightly")}
+                  {renderJobRow("Graph build", doctorJobs.graph_build, "graph-build")}
+                  {renderJobRow("Monthly consolidate", doctorJobs.monthly, "monthly")}
+                  <div className="rows-head">On demand</div>
+                  {renderOnDemandJobRow(
+                    "Embed media backfill",
+                    doctorJobs.embed_media_backfill,
+                  )}
+                </div>
+              ) : null}
+              {jobSpawnMsg ? <pre className="code">{jobSpawnMsg}</pre> : null}
+
+              <div className="rows">
+                <div className="rows-head">Backups of the connections index</div>
+                {renderHealthRow("Snapshot", doctorGraphBackup, (c) =>
+                  c.ok
+                    ? `Fresh — newest copy ${formatAge(c.age_seconds)} old (limit ${c.max_age_hours}h)`
+                    : (c.reason ?? "stale or missing"),
+                )}
+                {renderHealthRow("Off-site copy", doctorGraphOffsite, (c) =>
+                  c.ok
+                    ? `Fresh — last copy ${formatAge(c.latest?.age_seconds)} old (limit ${c.max_age_days}d)`
+                    : (c.reason ?? "stale or missing"),
+                )}
+              </div>
+
+              {doctorNotConfigured.length ? (
+                <div className="rows">
+                  <div className="rows-head">Not checked on this Mac</div>
+                  {doctorNotConfigured.map((name) => (
+                    <div key={name} className="row-item">
+                      <CircleMinus
+                        size={16}
+                        strokeWidth={1.75}
+                        aria-hidden
+                        className="muted"
+                      />
+                      <span className="row-main">
+                        {NOT_CONFIGURED_LABEL[name] ?? name}
+                      </span>
+                      <span className="row-meta">
+                        {doctorSkipReasons[name] ?? `${name} not configured`}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+
+              <div className="chips">
+                <Tag>episodes {counts?.episodes ?? "—"}</Tag>
+                <Tag>topics {counts?.topics ?? "—"}</Tag>
+                <Tag>connections {counts?.edges ?? "—"}</Tag>
+                <Tag>indexed rows {counts?.embeddings ?? "—"}</Tag>
+                <button
+                  type="button"
+                  className="link sm"
+                  onClick={() => setTab("revisions")}
+                  title="Topics edited in two places, and the older versions kept"
+                >
+                  Conflicting edits
+                  {statusConflicts
+                    ? ` (${statusConflicts.open_file_vs_pg ?? 0})`
+                    : ""}
+                </button>
+              </div>
+
+              <div className="inline">
+                <button
+                  type="button"
+                  disabled={probeBusy}
+                  title="Record a throwaway session, search for it, then forget it — proves recall works end to end."
+                  onClick={() => void runRecallProbe()}
+                >
+                  {probeBusy ? (
+                    <Loader2 size={14} className="spin" aria-hidden />
+                  ) : (
+                    <Stethoscope size={14} strokeWidth={1.75} aria-hidden />
+                  )}
+                  Run recall probe
+                </button>
+              </div>
+
+              <div className="rows-head">Full health report</div>
+              {doctorIssues.length ? (
+                <div className="rows">
+                  {doctorIssues.map((issue) => (
+                    <div key={issue} className="row-item">
+                      <TriangleAlert
+                        size={16}
+                        strokeWidth={1.75}
+                        aria-hidden
+                        className="warn"
+                      />
+                      <span className="row-main">{issue}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              <RawBlock text={doctorText} />
+              <div className="rows-head">Database report</div>
+              <RawBlock text={statusText} />
+            </Disclosure>
           </div>
         </section>
 
         <section className={panelClass("activity")}>
           <PanelHeader
             title="Activity"
-            lede="Sessions become episodes in Postgres via Khipu's capture hook, alongside the legacy writer. Inspect an episode, or forget one to drop it from search and recall."
+            lede="Every session Khipu recorded. Open one to read it, or forget one to drop it from search and recall."
           >
             {loading.activity ? <Spinner /> : null}
             <button type="button" onClick={() => void loadActivity(true)}>
@@ -2087,35 +2625,18 @@ export default function App() {
             </button>
           </PanelHeader>
           <div className="panel-body">
-            <div className="chips">
-              <span className="chip">
-                DSN keychain: {presenceLabel(secretsPresence, "dsn_in_keychain")}
-              </span>
-              <span className="chip">
-                Gemini keychain:{" "}
-                {presenceLabel(secretsPresence, "gemini_in_keychain")}
-              </span>
-              <span className="chip">
-                OpenAI-compat keychain:{" "}
-                {presenceLabel(secretsPresence, "openai_compat_in_keychain")}
-              </span>
-            </div>
-            {secretsPresenceMsg ? (
-              <p className="muted">{secretsPresenceMsg}</p>
-            ) : null}
-
             {opsEvents.length > 0 ? (
               <div className="rows">
-                <div className="rows-head">Ops heartbeats</div>
+                <div className="rows-head">System check-ins</div>
                 {opsEvents.slice(0, 8).map((ev, i) => (
                   <div
                     key={`${ev.kind}-${ev.created_at}-${i}`}
                     className="row-item"
                   >
                     <span className="row-main mono">{ev.kind}</span>
-                    <StatusPill tone={opsStatusTone(ev.status)}>
+                    <Tag dot tone={opsStatusTone(ev.status)}>
                       {ev.status ?? "?"}
-                    </StatusPill>
+                    </Tag>
                     {ev.created_at ? (
                       <span className="row-meta">{formatTs(ev.created_at)}</span>
                     ) : null}
@@ -2196,12 +2717,28 @@ export default function App() {
           </div>
         </section>
 
-        <section className={panelClass("search")}>
+        <section className={panelClass("recall")}>
           <PanelHeader
-            title="Search"
-            lede="Find topics, episodes, and nodes across the hub."
-          />
-          <div className="panel-body">
+            title="Recall"
+            lede="What does the agent remember about this?"
+          >
+            <Segmented
+              ariaLabel="Recall view"
+              value={recallView}
+              onChange={setRecallView}
+              options={[
+                { value: "search", label: "Search", hint: "Find episodes, topics and nodes." },
+                {
+                  value: "graph",
+                  label: "Graph",
+                  hint: "Walk what a topic or node is connected to.",
+                },
+              ]}
+            />
+          </PanelHeader>
+          <div className="panel-body wide">
+            {recallView === "search" ? (
+              <>
             <div className="toolbar">
               <input
                 value={query}
@@ -2214,25 +2751,16 @@ export default function App() {
                   if (e.key === "Enter") void doSearch();
                 }}
               />
-              <div
-                className="segmented"
-                role="radiogroup"
-                aria-label="Search mode"
-              >
-                {SEARCH_MODES.map((m) => (
-                  <button
-                    key={m.mode}
-                    type="button"
-                    role="radio"
-                    aria-checked={searchMode === m.mode}
-                    className={searchMode === m.mode ? "selected" : ""}
-                    title={m.hint}
-                    onClick={() => setSearchMode(m.mode)}
-                  >
-                    {m.label}
-                  </button>
-                ))}
-              </div>
+              <Segmented
+                ariaLabel="Search mode"
+                value={searchMode}
+                onChange={setSearchMode}
+                options={SEARCH_MODES.map((m) => ({
+                  value: m.mode,
+                  label: m.label,
+                  hint: m.hint,
+                }))}
+              />
               <button
                 type="button"
                 className="primary"
@@ -2307,9 +2835,9 @@ export default function App() {
                 {searchResults.map((r, i) => (
                   <div key={`${r.kind}-${r.id}-${i}`} className="result-card">
                     <div className="result-top">
-                      <span className={`kind-badge ${r.kind ?? ""}`}>
+                      <Tag kind tone={r.kind === "episode" ? "accent" : "neutral"}>
                         {r.kind ?? "item"}
-                      </span>
+                      </Tag>
                       <span className="result-label">
                         {r.label ?? String(r.id ?? "")}
                       </span>
@@ -2362,9 +2890,26 @@ export default function App() {
                         ))}
                       </ul>
                     ) : null}
-                    {r.id != null && String(r.id) !== r.label ? (
-                      <span className="result-id mono">{String(r.id)}</span>
-                    ) : null}
+                    <div className="inline">
+                      {r.id != null && String(r.id) !== r.label ? (
+                        <span className="result-id mono">{String(r.id)}</span>
+                      ) : null}
+                      {r.kind === "node" || r.kind === "topic" ? (
+                        <button
+                          type="button"
+                          className="link sm"
+                          title="Open this in the graph view"
+                          onClick={() => {
+                            setNodeId(String(r.id ?? r.label ?? ""));
+                            setRecallView("graph");
+                            void doGraph(String(r.id ?? r.label ?? ""));
+                          }}
+                        >
+                          <Waypoints size={14} strokeWidth={1.75} aria-hidden />
+                          Walk the graph
+                        </button>
+                      ) : null}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -2376,7 +2921,7 @@ export default function App() {
                 <Loader2 size={22} className="spin" aria-hidden />
                 <div className="empty-title">Searching…</div>
                 <div className="empty-hint">
-                  Asking the hub index for “{query.trim()}”.
+                  Searching for “{query.trim()}”.
                 </div>
               </div>
             ) : !searchText ? (
@@ -2399,7 +2944,7 @@ export default function App() {
                     ? "Nothing contains those exact words. Try Best match, which also scores meaning and word overlap."
                     : searchMode === "semantic"
                       ? "Nothing in the vector index was close enough. Try Best match, which also matches the words themselves."
-                      : "Nothing in the hub matched that query by meaning, word overlap or exact text."}
+                      : "Nothing recorded matched that query by meaning, word overlap or exact text."}
                   {searchProject.trim() || searchSince.trim()
                     ? " The Project and Since filters are still applied."
                     : ""}
@@ -2408,15 +2953,9 @@ export default function App() {
             )}
 
             <RawJson text={searchText} empty="Results appear here." />
-          </div>
-        </section>
-
-        <section className={panelClass("graph")}>
-          <PanelHeader
-            title="Graph"
-            lede="Walk the neighborhood around a node id."
-          />
-          <div className="panel-body">
+          </>
+            ) : (
+              <>
             <div className="toolbar">
               <input
                 className="mono"
@@ -2480,9 +3019,7 @@ export default function App() {
                           key={`${n.id}-${n.via}-${n.hops}-${i}`}
                           className="row-item"
                         >
-                          <span className="kind-badge">
-                            {n.type ?? "walk"}
-                          </span>
+                          <Tag kind>{n.type ?? "walk"}</Tag>
                           <span className="row-main mono">{n.id}</span>
                           <span className="row-meta">
                             {n.hops != null
@@ -2507,9 +3044,7 @@ export default function App() {
                           key={`${n.src}-${n.dst}-${i}`}
                           className="row-item"
                         >
-                          <span className="kind-badge">
-                            {n.type ?? "edge"}
-                          </span>
+                          <Tag kind>{n.type ?? "edge"}</Tag>
                           <span className="edge-arrow" aria-hidden>
                             {outbound ? "→" : inbound ? "←" : "↔"}
                           </span>
@@ -2537,13 +3072,15 @@ export default function App() {
             ) : null}
 
             <RawJson text={graphText} empty="Neighborhood JSON." />
+          </>
+            )}
           </div>
         </section>
 
         <section className={panelClass("revisions")}>
           <PanelHeader
-            title="Revisions"
-            lede="LWW keeps losers in topic_revisions. Every topic file is hashed and compared against Postgres."
+            title="Conflicting edits"
+            lede="When the same topic is edited in two places, the newest wins and the older version is kept. Every note file is compared against the database."
           >
             {loading.revisions ? <Spinner /> : null}
             <button type="button" onClick={() => void loadRevisions(true)}>
@@ -2555,11 +3092,11 @@ export default function App() {
             {revisionsConflicts ? (
               <Callout
                 tone={openDrift > 0 || unreadableTopics.length > 0 ? "warn" : "ok"}
-                title="Drift summary"
+                title="Out-of-sync files"
               >
-                Open file↔pg: <strong>{openDrift}</strong> · Topics compared:{" "}
+                Out of sync: <strong>{openDrift}</strong> · Topics compared:{" "}
                 <strong>{revisionsConflicts.topics_checked ?? 0}</strong> ·
-                Topics with ≥2 revisions: <strong>{multiCount}</strong>
+                Topics with more than one version: <strong>{multiCount}</strong>
                 {unreadableTopics.length > 0 ? (
                   <>
                     {" "}
@@ -2615,7 +3152,7 @@ export default function App() {
                     >
                       #{r.id}
                     </button>
-                    <span className="pill mono">{r.slug}</span>
+                    <Tag className="mono">{r.slug}</Tag>
                     <span className="row-main">
                       {r.note || r.source || "revision"}
                     </span>
@@ -2626,8 +3163,8 @@ export default function App() {
                 ))}
               </div>
             ) : revSlug.trim() ? (
-              <Callout tone="ok" title="No revisions for that slug">
-                Nothing in topic_revisions matches “{revSlug.trim()}”.
+              <Callout tone="neutral" title="No older versions for that topic">
+                Nothing in the edit history matches “{revSlug.trim()}”.
               </Callout>
             ) : null}
 
@@ -2700,147 +3237,137 @@ export default function App() {
           </div>
         </section>
 
-        <section className={panelClass("doctor")}>
+        <section className={panelClass("owed")}>
           <PanelHeader
-            title="Doctor"
-            lede="Backup freshness and hub reachability checks."
+            title="Owed"
+            lede="What you still owe on each project, kept from your own sessions."
           >
-            {loading.doctor ? <Spinner /> : null}
-            <button
-              type="button"
-              disabled={probeBusy}
-              title="Capture a throwaway episode, search for it, then forget it — proves recall works end to end."
-              onClick={() => void runRecallProbe()}
-            >
-              {probeBusy ? (
-                <Loader2 size={14} className="spin" aria-hidden />
-              ) : (
-                <Stethoscope size={14} strokeWidth={1.75} aria-hidden />
-              )}
-              Run recall probe
-            </button>
-            <button type="button" onClick={() => void loadDoctor(true)}>
+            {owedLoading ? <Spinner /> : null}
+            <button type="button" onClick={() => void loadOwed(owedStatus, true)}>
               <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
               Refresh
             </button>
           </PanelHeader>
-          <div className="panel-body">
-            <div
-              className={`doctor-card ${
-                doctorOk == null ? "" : doctorOk ? "ok" : "err"
-              }`}
-            >
-              {doctorOk == null ? (
-                <Stethoscope size={24} strokeWidth={1.75} aria-hidden />
-              ) : doctorOk ? (
-                <CircleCheck size={24} strokeWidth={1.75} aria-hidden />
-              ) : (
-                <TriangleAlert size={24} strokeWidth={1.75} aria-hidden />
-              )}
-              <div>
-                <div className="doctor-title">
-                  {doctorOk == null
-                    ? "—"
-                    : doctorOk
-                      ? doctorSkipCount > 0
-                        ? "All configured checks passed"
-                        : "All checks passed"
-                      : "Issues found"}
-                </div>
-                <p className="doctor-sub muted">
-                  {doctorOk == null
-                    ? "Run Refresh to check the hub."
-                    : doctorIssues.length
-                      ? doctorIssues.join(" · ")
-                      : doctorOk
-                        ? doctorSkipCount > 0
-                            ? `All checks passed · ${doctorCheckCount} checked, ${doctorSkipCount} not configured. Details below.`
-                          : `All checks passed · ${doctorCheckCount} checked. Details below.`
-                        : "Details in the raw report below."}
-                </p>
-              </div>
-            </div>
-
-            <div className="rows">
-              <div className="rows-head">Graph backups</div>
-              {renderHealthRow("Graph snapshot", doctorGraphBackup, (c) =>
-                c.ok
-                  ? `Fresh — latest snapshot ${formatAge(c.age_seconds)} old (≤ ${c.max_age_hours}h)`
-                  : (c.reason ?? "stale or missing"),
-              )}
-              {renderHealthRow("Graph offsite", doctorGraphOffsite, (c) =>
-                c.ok
-                  ? `Fresh — last copy ${formatAge(c.latest?.age_seconds)} old (≤ ${c.max_age_days}d)`
-                  : (c.reason ?? "stale or missing"),
-              )}
-            </div>
-
-            {doctorNotConfigured.length ? (
-              <div className="rows">
-                <div className="rows-head">Not checked</div>
-                {doctorNotConfigured.map((name) => (
-                  <div key={name} className="row-item">
-                    <CircleMinus
-                      size={16}
-                      strokeWidth={1.75}
-                      aria-hidden
-                      className="muted"
-                    />
-                    <span className="row-main">
-                      {NOT_CONFIGURED_LABEL[name] ?? name}
-                    </span>
-                    <span className="row-meta">
-                      {doctorSkipReasons[name] ?? `${name} not configured`}
-                    </span>
-                  </div>
+          <div className="panel-body wide">
+            <div className="inline">
+              <Segmented
+                ariaLabel="Commitment status"
+                value={owedStatus}
+                onChange={(next) => {
+                  setOwedStatus(next);
+                  void loadOwed(next, false);
+                }}
+                options={[
+                  {
+                    value: "open",
+                    label:
+                      owedOpenCount != null
+                        ? `Open · ${owedOpenCount}${owedOpenCount >= OWED_LIMIT ? "+" : ""}`
+                        : "Open",
+                  },
+                  { value: "closed", label: "Closed" },
+                  { value: "stale", label: "Stale" },
+                ]}
+              />
+              <div className="chips">
+                {owedProjects.map((proj) => (
+                  <Chip
+                    key={proj}
+                    title={proj}
+                    on={owedProject === proj}
+                    onClick={() =>
+                      setOwedProject(owedProject === proj ? null : proj)
+                    }
+                    onRemove={
+                      owedProject === proj ? () => setOwedProject(null) : undefined
+                    }
+                  >
+                    {shortProject(proj)}
+                  </Chip>
                 ))}
               </div>
-            ) : null}
+              <span className="meta push">
+                Closed automatically when a later capture says it was done
+              </span>
+            </div>
 
-            {doctorJobs ? (
-              <div className="rows">
-                <div className="rows-head">Scheduled jobs</div>
-                {renderJobRow("Nightly consolidate", doctorJobs.nightly, "nightly")}
-                {renderJobRow("Graph build", doctorJobs.graph_build, "graph-build")}
-                {renderJobRow("Monthly consolidate", doctorJobs.monthly, "monthly")}
-                <div className="rows-head">On demand</div>
-                {renderOnDemandJobRow(
-                  "Embed media backfill",
-                  doctorJobs.embed_media_backfill,
-                )}
+            {visibleOwed.length === 0 ? (
+              <div className="card">
+                <EmptyState
+                  title={
+                    owedStatus === "open"
+                      ? "Nothing owed yet"
+                      : `Nothing ${owedStatus} here`
+                  }
+                  hint="Follow-ups, blockers, questions and promises your sessions leave open appear here."
+                />
               </div>
-            ) : null}
-            {jobSpawnMsg ? <pre className="code">{jobSpawnMsg}</pre> : null}
-
-            <RawJson text={doctorText} />
+            ) : (
+              <div className="card">
+                <div className="card-head">
+                  <span className="w76">Kind</span>
+                  <span className="grow">What you owe</span>
+                  <span className="w104">Project</span>
+                  <span className="w52">Opened</span>
+                  <span className="w52">From</span>
+                </div>
+                {visibleOwed.map((c) => (
+                  <ListRow key={c.id}>
+                    <Tag
+                      kind
+                      tone={c.kind === "blocker" ? "warn" : "neutral"}
+                      className="w76"
+                    >
+                      {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
+                    </Tag>
+                    <span className="grow ellip">{c.text}</span>
+                    <span className="w104">
+                      {c.project ? (
+                        <Tag title={c.project}>{shortProject(c.project)}</Tag>
+                      ) : (
+                        <span className="meta">—</span>
+                      )}
+                    </span>
+                    <span className="meta w52">
+                      {c.opened_at
+                        ? new Date(
+                            String(c.opened_at).replace(" ", "T"),
+                          ).toLocaleDateString([], {
+                            month: "short",
+                            day: "numeric",
+                          })
+                        : "—"}
+                    </span>
+                    <span className="meta mono w52">
+                      {c.opened_episode != null ? `#${c.opened_episode}` : "—"}
+                    </span>
+                  </ListRow>
+                ))}
+              </div>
+            )}
           </div>
         </section>
 
-        <section className={panelClass("components")}>
+        <section className={panelClass("harnesses")}>
           <PanelHeader
-            title="Components"
-            lede="Postgres 19 and Graphify upgrade independently of the app. Versions come from Application Support and the compatibility matrix."
-          />
-          <ComponentsPanel active={tab === "components"} />
-        </section>
-
-        <section className={panelClass("integrations")}>
-          <PanelHeader
-            title="Integrations"
+            title="Harnesses"
             lede="Install Khipu into each harness on this Mac and verify it actually works. One native pack per harness; nothing shared, nothing forced."
           />
           <IntegrationsPanel
             runKhipu={runKhipu}
             onToast={(m) => setError(m)}
-            active={tab === "integrations"}
+            active={tab === "harnesses"}
           />
         </section>
 
         <section className={panelClass("settings")}>
           <PanelHeader
             title="Settings"
-            lede="Keys, Mac-local files, and backup/import. The database is separate — this folder is only what lives on this Mac."
+            lede="Capture, models, data and this Mac."
           >
+            <button type="button" onClick={() => setTab("first-run")}>
+              Run setup again
+            </button>
             <button type="button" onClick={() => void loadPaths()}>
               <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
               Refresh paths
@@ -3360,11 +3887,26 @@ export default function App() {
               <div className="section-head">Help &amp; support</div>
               <div className="section-body">
                 <p className="muted">
-                  Stuck? Reopen the <strong>Welcome</strong> tutorial from Setup, check{" "}
-                  <strong>Doctor</strong>, or email{" "}
-                  <a href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</a>. Include the
-                  Doctor output if it is red — it never contains secrets.
+                  Stuck? Run setup again from the button at the top of this
+                  screen, open the health report on <strong>Home</strong>, or
+                  email <a href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</a>.
+                  Include the health report if it is red — it never contains
+                  secrets.
                 </p>
+              </div>
+            </div>
+
+            {/* Components used to be its own destination; it is maintenance,
+                and belongs with the rest of what this Mac runs (audit IA). */}
+            <div className="section-card">
+              <div className="section-head">Components</div>
+              <div className="section-body">
+                <p className="muted">
+                  Postgres and the graph builder upgrade independently of the
+                  app. Versions come from Application Support and the
+                  compatibility matrix.
+                </p>
+                <ComponentsPanel active={tab === "settings"} />
               </div>
             </div>
           </div>
@@ -3382,7 +3924,7 @@ export default function App() {
       <PostUpdateNoticeDialog
         notice={postUpdateNotice}
         onDismiss={() => setPostUpdateNotice(null)}
-        onOpenIntegrations={() => setTab("integrations")}
+        onOpenIntegrations={() => setTab("harnesses")}
       />
 
       {error ? (

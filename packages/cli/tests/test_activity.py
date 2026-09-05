@@ -204,7 +204,10 @@ class ProjectSliceTest(unittest.TestCase):
         frontmatter->>'project' — this fills the topic budget with them
         once the episode-linked slugs run out."""
         episode_row = (42, dt.datetime(2026, 9, 3, 10, 0), "shipped the fix", [])
-        note_row = ("note:some-note", "Some Note", dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc))
+        # Relative to now: a fixed date made age_days drift by one every day
+        # the suite ran after it (audit 2026-09-04, environmental failure).
+        note_row = ("note:some-note", "Some Note",
+                    dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2, hours=1))
         results = [[], [episode_row], [note_row]]
         with mock.patch("khipu.embed._episode_schema_flags", return_value={
             "project": True, "deleted_at": True,
