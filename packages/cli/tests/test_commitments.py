@@ -8,10 +8,30 @@ capture.py dedup tests.
 """
 from __future__ import annotations
 
+import os
 import unittest
 from unittest import mock
 
 from khipu import commitments as co
+
+# The owner/actor regexes are alias-driven (2026-09-05): "Matt" is only
+# recognised as the user when "matt" is a configured alias — it is no
+# longer a hardcoded name. Every fixture in this file was written when
+# "matt" WAS hardcoded, so pin it here for the whole module (mirrors how a
+# real deployment would run `khipu config --set user_aliases matt`) and
+# reset the compiled patterns on the way in and out so no other test module
+# inherits this module's alias configuration.
+_alias_env_patch = mock.patch.dict(os.environ, {"KHIPU_USER_ALIASES": "matt"})
+
+
+def setUpModule():
+    _alias_env_patch.start()
+    co.reset_user_patterns()
+
+
+def tearDownModule():
+    _alias_env_patch.stop()
+    co.reset_user_patterns()
 
 
 class _CommitmentsCursor:
@@ -1084,6 +1104,33 @@ class DroppedStatusTest(unittest.TestCase):
         self.assertTrue(co.set_status(cur, cid, "open"))
         with self.assertRaises(ValueError):
             co.set_status(cur, cid, "bogus")
+
+
+class ConfigurableUserAliasesTest(unittest.TestCase):
+    """USER_OWNERS / the actor and decision regexes are built from
+    `commitments.user_aliases()`, never a hardcoded name — this is a public
+    product and other users have other names (2026-09-05)."""
+
+    def tearDown(self):
+        # Every other test in this module runs with KHIPU_USER_ALIASES=matt
+        # (see setUpModule); restore that after each override here.
+        co.reset_user_patterns()
+
+    def test_a_configured_alias_other_than_matt_is_recognised(self):
+        with mock.patch.dict(os.environ, {"KHIPU_USER_ALIASES": "priya"}):
+            co.reset_user_patterns()
+            self.assertEqual(
+                co.resolve_owner("Priya to decide whether the release ships"),
+                co.OWNER_USER,
+            )
+
+    def test_matt_is_not_recognised_when_the_only_configured_alias_is_priya(self):
+        with mock.patch.dict(os.environ, {"KHIPU_USER_ALIASES": "priya"}):
+            co.reset_user_patterns()
+            self.assertEqual(
+                co.resolve_owner("Matt to decide whether the release ships"),
+                co.OWNER_ASSISTANT,
+            )
 
 
 if __name__ == "__main__":

@@ -176,6 +176,53 @@ def set_float_setting(key: str, value: float) -> Path:
     return save_config(data)
 
 
+# ---------------------------------------------------------------------------
+# List knobs (user identity, W3 owner rule — 2026-09-05).
+#
+# Same env → config.json → default precedence as everything else here. The
+# only consumer today is ``khipu.commitments.user_aliases`` (every name that
+# means "the user" on this hub, never a hardcoded name — this is a public
+# product).
+# ---------------------------------------------------------------------------
+
+LIST_SETTINGS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "user_aliases": ("KHIPU_USER_ALIASES", ()),
+}
+
+
+def _split_csv(raw: str) -> tuple[str, ...]:
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
+def list_setting(key: str) -> tuple[str, ...]:
+    if key not in LIST_SETTINGS:
+        raise KeyError(f"unknown list setting {key!r}; known: {sorted(LIST_SETTINGS)}")
+    env_name, default = LIST_SETTINGS[key]
+    env = (os.environ.get(env_name) or "").strip()
+    if env:
+        return _split_csv(env)
+    stored = load_config().get(key)
+    if isinstance(stored, list):
+        return tuple(str(v).strip() for v in stored if str(v).strip())
+    if isinstance(stored, str) and stored.strip():
+        return _split_csv(stored)
+    return tuple(default)
+
+
+def set_list_setting(key: str, values: "str | list[str] | tuple[str, ...]") -> Path:
+    if key not in LIST_SETTINGS:
+        raise KeyError(f"unknown list setting {key!r}; known: {sorted(LIST_SETTINGS)}")
+    if isinstance(values, str):
+        values = _split_csv(values)
+    cleaned = [str(v).strip() for v in values if str(v).strip()]
+    data = load_config()
+    if cleaned:
+        data[key] = cleaned
+    else:
+        data.pop(key, None)
+    return save_config(data)
+
+
 def path_settings_status() -> dict:
     """Every path setting with its resolved value and where it came from."""
     out = {}

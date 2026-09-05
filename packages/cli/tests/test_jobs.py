@@ -51,12 +51,14 @@ class JobsRunTest(unittest.TestCase):
         # in a unit test; the real reconcile has its own tests (test_notes.py).
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly") as run_mock, \
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}) as m_reconcile, \
-                mock.patch.object(jobs, "_mark_stale_commitments") as m_stale:
+                mock.patch.object(jobs, "_mark_stale_commitments") as m_stale, \
+                mock.patch.object(jobs, "_hygiene_commitments") as m_hygiene:
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
         run_mock.assert_called_once()
         m_reconcile.assert_called_once_with(dry_run=False)
         m_stale.assert_called_once_with()
+        m_hygiene.assert_called_once_with()
         state = json.loads((self.data_dir / "state" / "job-nightly.json").read_text())
         self.assertEqual(state["exit"], 0)
 
@@ -78,7 +80,8 @@ class JobsRunTest(unittest.TestCase):
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                 mock.patch("khipu.db.connect", return_value=conn), \
-                mock.patch("khipu.commitments.mark_stale", return_value=4) as m_stale:
+                mock.patch("khipu.commitments.mark_stale", return_value=4) as m_stale, \
+                mock.patch.object(jobs, "_hygiene_commitments"):
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
         m_stale.assert_called_once_with(cur)
@@ -102,7 +105,9 @@ class JobsRunTest(unittest.TestCase):
             return mock.Mock(returncode=0)
 
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
-                mock.patch("khipu.notes.reconcile", side_effect=RuntimeError("boom")):
+                mock.patch("khipu.notes.reconcile", side_effect=RuntimeError("boom")), \
+                mock.patch.object(jobs, "_mark_stale_commitments"), \
+                mock.patch.object(jobs, "_hygiene_commitments"):
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
 
@@ -116,6 +121,7 @@ class JobsRunTest(unittest.TestCase):
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_mark_stale_commitments"), \
+                mock.patch.object(jobs, "_hygiene_commitments"), \
                 mock.patch("khipu.embed.backfill", return_value={"embedded": 7}) as m_bf, \
                 mock.patch("khipu.embed.prune_query_cache", side_effect=RuntimeError("hub down")):
             rc = jobs.run_nightly()
@@ -128,10 +134,66 @@ class JobsRunTest(unittest.TestCase):
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_mark_stale_commitments"), \
+                mock.patch.object(jobs, "_hygiene_commitments"), \
                 mock.patch("khipu.embed.backfill", side_effect=RuntimeError("quota")):
             self.assertEqual(jobs.run_nightly(), 2)
         self.assertIn("backfill skipped: RuntimeError: quota",
                       (self.log_dir / "khipu-nightly.out.log").read_text())
+
+    def test_run_nightly_runs_the_commitments_hygiene_pass(self):
+        """W3 Owed quality (2026-09-05): the two hygiene passes run every
+        night, not only on demand via `khipu hygiene commitments`."""
+        def _run(cmd, stdout, stderr, env):  # noqa: ARG001
+            stdout.write(b"ok\n")
+            return mock.Mock(returncode=0)
+
+        conn = mock.MagicMock()
+        conn.__enter__.return_value = conn
+        conn.__exit__.return_value = False
+        cur = mock.MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn.cursor.return_value = cur
+
+        with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
+                mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
+                mock.patch.object(jobs, "_mark_stale_commitments"), \
+                mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch("khipu.hygiene.backup_commitments", return_value=Path("/tmp/backup")) as m_backup, \
+                mock.patch(
+                    "khipu.hygiene.run_session_ended_pass",
+                    return_value={"counts": {"keep": 1}},
+                ) as m_session, \
+                mock.patch(
+                    "khipu.hygiene.run_commitments_hygiene",
+                    return_value={"counts": {"drop": 2}},
+                ) as m_rejudge:
+            rc = jobs.run_nightly()
+        self.assertEqual(rc, 0)
+        m_backup.assert_called_once_with(conn)
+        m_session.assert_called_once_with(cur, apply=True)
+        m_rejudge.assert_called_once_with(cur, apply=True)
+        conn.commit.assert_called_once()
+        log = (self.log_dir / "khipu-nightly.out.log").read_text()
+        self.assertIn("[khipu-hygiene] session-ended", log)
+        self.assertIn("rejudge", log)
+
+    def test_run_nightly_survives_a_commitments_hygiene_failure(self):
+        """A failure in the hygiene pass must never flip a good nightly to
+        failing — the external driver's exit code is the one that gates
+        job_status/doctor."""
+        def _run(cmd, stdout, stderr, env):  # noqa: ARG001
+            stdout.write(b"ok\n")
+            return mock.Mock(returncode=0)
+
+        with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
+                mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
+                mock.patch.object(jobs, "_mark_stale_commitments"), \
+                mock.patch("khipu.db.connect", side_effect=RuntimeError("hub down")):
+            rc = jobs.run_nightly()
+        self.assertEqual(rc, 0)
+        log = (self.log_dir / "khipu-nightly.out.log").read_text()
+        self.assertIn("[khipu-hygiene] skipped: RuntimeError: hub down", log)
 
     def test_run_monthly_passes_dry_run(self):
         captured: list[list[str]] = []
