@@ -522,7 +522,10 @@ function projectFromScope(scope: string | undefined | null): string | null {
  *  value stays as the tooltip either way. */
 function shortProject(project: string): string {
   if (project.includes(":")) {
-    return `${harnessLabel(project.split(":")[0] ?? "")} session`;
+    // A commitment scoped to a session rather than a repo. The pill is
+    // 96px wide; "Claude Code session" overran it, so the label is the short
+    // word and the harness stays in the pill's title (2026-09-05).
+    return "Session";
   }
   const parts = project.split("/").filter(Boolean);
   return parts[parts.length - 1] ?? project;
@@ -2079,6 +2082,33 @@ export default function App() {
     void loadOwed("open", false);
   }, [dsnOk, owedOpenCount, loadOwed]);
 
+  // Owed changes underneath the app: an agent closes an item, a capture
+  // auto-closes one, the nightly merges duplicates. The screen used to show
+  // whatever it read when the tab opened until someone pressed Refresh
+  // (Matt, 2026-09-05: "does it update near immediately?"). Re-read every
+  // minute while Owed is open, and whenever the window regains focus; the
+  // badge alone is refreshed on the same cadence from any tab.
+  useEffect(() => {
+    if (!dsnOk) return;
+    const refresh = () => {
+      if (tab === "owed") {
+        void loadOwed(owedStatus, false);
+        void loadOwed("open", false);
+        void loadOwed("closed", false);
+        void loadOwed("stale", false);
+      } else {
+        void loadOwed("open", false);
+      }
+    };
+    const every = window.setInterval(refresh, 60_000);
+    const onFocus = () => refresh();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.clearInterval(every);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [dsnOk, tab, owedStatus, loadOwed]);
+
   /** Six destinations, one per named job (audit IA). Revisions is reachable
    *  from Home, not from here; Welcome is a first-run flow with a "Run setup
    *  again" button in Settings. */
@@ -2895,7 +2925,15 @@ export default function App() {
             ) : null}
             <span className="w96">
               {c.project ? (
-                <Tag title={c.project}>{shortProject(c.project)}</Tag>
+                <Tag
+                  title={
+                    c.project.includes(":")
+                      ? `${harnessLabel(c.project.split(":")[0] ?? "")} session · ${c.project}`
+                      : c.project
+                  }
+                >
+                  {shortProject(c.project)}
+                </Tag>
               ) : (
                 <span className="meta">—</span>
               )}
@@ -4661,6 +4699,13 @@ export default function App() {
                           </span>
                         </div>
                         <p className="muted">
+                          Khipu's memory lives in one Postgres database. It can be on
+                          this Mac, on another Mac you already set up, or on a server
+                          you run — a cloud VM, a home box, any Postgres with pgvector.
+                          Every Mac that stores the same connection reads and writes
+                          the same memory, so the server is the single source of truth.
+                        </p>
+                        <p className="muted">
                           Currently stored: database connection{" "}
                           <strong>
                             {presenceLabel(secretsPresence, "dsn_in_keychain")}
@@ -4682,7 +4727,7 @@ export default function App() {
                             Recheck connection
                           </button>
                           <button type="button" onClick={() => setTab("first-run")}>
-                            Change the connection
+                            Connect to a server you run or another Mac…
                           </button>
                         </div>
                       </div>

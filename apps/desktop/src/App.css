@@ -1888,6 +1888,26 @@ button.row.on {
   flex: none;
 }
 
+/* A fixed-width cell never lets its pill spill into the next column: the
+   label truncates and the full name stays in the pill's title. Found on the
+   Owed table's project pill ("Claude Code session" ran over the Opened
+   column, screenshot pass 2026-09-05). */
+.w96,
+.w88 {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.w96 .tag,
+.w88 .tag {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 18px;
+  vertical-align: middle;
+}
+
 /* Confirm / edit dialogs (Forget, Edit summary, Snooze) — the same card the
    feedback dialog uses, without its form-specific rules. */
 /* One dialog card for all three modals — the same box was declared three
