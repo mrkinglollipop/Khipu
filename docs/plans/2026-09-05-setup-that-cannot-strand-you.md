@@ -80,3 +80,23 @@ before the user tries. Import runs the shared pipeline.
 Acceptance: the twelve audit gaps closed one by one, each named in the PR; a stranger's-Mac dry run
 of the remote flow against a fresh empty database (Docker on this Mac standing in for "a server")
 recorded with screenshots.
+
+## The gaps become oracles (Matt, 2026-09-05: "these should be part of the oracles")
+
+A green suite must fail if any of the twelve gaps returns. Three layers, all run by `pytest` in the
+normal suite (the Docker one skips itself when Docker is absent and says so):
+
+1. **Contract tests (`tests/test_setup_contract.py`).** Every failure the connect pipeline can
+   produce carries `title`, `detail` and a one-action `fix`, none of them a bare code; every stage
+   id is reported; `mask_dsn` never leaks a password; the pipeline installs the LaunchAgents and
+   runs the probe on success (asserted with fakes); `khipu db` verbs exit 0/1/2 with JSON.
+2. **First-run end to end (`tests/test_setup_live.py`, Docker).** Start a scratch Postgres from the
+   same image the local install builds (reuse `components_backup`'s drill-cluster helpers), run
+   `connect_database` against the EMPTY database with store off, assert every stage ok and the
+   schema at the newest migration; then `move_database` from the scratch database into a second
+   scratch database (dry run + real), assert identical counts. This is the "stranger's first run"
+   that no reviewer has to remember to do by hand.
+3. **Desktop walkthrough (`apps/desktop` render harness, Phase 2).** The built UI driven by a
+   scripted fake backend through the first-run flow (remote, local, join) asserting at each step
+   that the DOM shows exactly one of the three states and never a raw error code; run as
+   `npm run check:setup` and wired into the same oracle list as `npm run build`.

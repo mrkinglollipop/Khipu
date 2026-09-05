@@ -5,6 +5,8 @@ import react from "@vitejs/plugin-react";
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
+// Vite 8 (Rolldown) + @vitejs/plugin-react 6: no config changes needed here,
+// verified 2026-09-05 — no rollupOptions/css/plugin-API usage in this file.
 export default defineConfig(async () => ({
   plugins: [react()],
 
