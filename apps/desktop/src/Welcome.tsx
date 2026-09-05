@@ -5,6 +5,24 @@ import { resourceDir } from "@tauri-apps/api/path";
 import { Check, ChevronLeft, ChevronRight } from "lucide-react";
 import { WorkingBanner } from "./WorkingBanner";
 import { Callout, Tag } from "./ui";
+import { SetupStages } from "./SetupStages";
+import type { SetupPhase, SetupPipelineResult } from "./SetupStages";
+
+/** `docs/plans/2026-09-05-setup-that-cannot-strand-you.md` stage ids.
+ *  Preflight (`khipu db preflight`) only ever reaches `reach..graph`; a full
+ *  connect (`khipu db connect`) runs all nine. */
+export const PREFLIGHT_STAGE_IDS = ["reach", "version", "privileges", "schema", "graph"] as const;
+export const CONNECT_STAGE_IDS = [
+  "reach",
+  "version",
+  "privileges",
+  "schema",
+  "graph",
+  "store",
+  "upkeep",
+  "prove",
+  "summary",
+] as const;
 
 /** Persisted so the tutorial opens itself only until it has been finished once;
  *  it stays reachable from Setup → Welcome afterwards. */
@@ -139,16 +157,40 @@ function payloadError(v: Record<string, unknown> | null): string | null {
   return null;
 }
 
-export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegrations }: {
+export function Welcome({
+  dsnOk,
+  refreshDsn,
+  runKhipu,
+  onFinish,
+  openIntegrations,
+  initialStep,
+  initialStepKey,
+}: {
   dsnOk: boolean | null;
   refreshDsn: () => Promise<void>;
   runKhipu: (args: string[]) => Promise<string>;
   onFinish: () => void;
   openIntegrations: () => void;
+  /** Jump to this step instead of the usual "welcome" start — Settings ›
+   *  Database's "Connect to a server you run or another Mac…" reopens this
+   *  flow at the Database step rather than restarting from step 1. */
+  initialStep?: StepId;
+  /** Bumped by the caller on every click so revisiting the same
+   *  `initialStep` (the user backed out and clicked the Settings link again)
+   *  still jumps — `initialStep` alone would not change value the second
+   *  time, so nothing would tell this component to re-read it. */
+  initialStepKey?: number;
 }) {
-  const [step, setStep] = useState<StepId>("welcome");
+  const [step, setStep] = useState<StepId>(initialStep ?? "welcome");
   const idx = STEPS.findIndex((s) => s.id === step);
   const go = (n: number) => setStep(STEPS[Math.max(0, Math.min(STEPS.length - 1, idx + n))].id);
+
+  useEffect(() => {
+    if (initialStepKey) setStep(initialStep ?? "welcome");
+    // Only the bump should retrigger this — `initialStep` alone can repeat
+    // ("database" twice in a row) without a fresh navigation to react to.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialStepKey]);
 
   const [fromDiskImage, setFromDiskImage] = useState(false);
   useEffect(() => {
@@ -166,8 +208,35 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
   const [localReady, setLocalReady] = useState(false);
 
   const [remoteDsn, setRemoteDsn] = useState("");
+  const [remoteRootCrt, setRemoteRootCrt] = useState("");
   const [remoteBusy, setRemoteBusy] = useState(false);
   const [remoteReady, setRemoteReady] = useState(false);
+  const [remoteStageIds, setRemoteStageIds] =
+    useState<readonly string[]>(PREFLIGHT_STAGE_IDS);
+  const [remotePhase, setRemotePhase] = useState<SetupPhase>("idle");
+  const [remoteResult, setRemoteResult] = useState<SetupPipelineResult>(null);
+
+  /** After `install_local_postgres`/a join import already stored the DSN,
+   *  `khipu_db_connect_stored` finishes the pipeline (upkeep + prove) that
+   *  neither of those calls ran on its own — audit gap #1. Shared by both
+   *  modes since both just need "run the rest of the pipeline now". */
+  const [finishStageResult, setFinishStageResult] = useState<SetupPipelineResult>(null);
+  const [finishPhase, setFinishPhase] = useState<SetupPhase>("idle");
+  const finishStoredConnect = useCallback(async () => {
+    setFinishPhase("running");
+    setFinishStageResult(null);
+    try {
+      const raw = await invoke<string>("khipu_db_connect_stored");
+      const out = parse(raw) as SetupPipelineResult;
+      setFinishStageResult(out);
+      return out?.ok === true;
+    } catch (e) {
+      setFinishStageResult({ ok: false, error: String(e) });
+      return false;
+    } finally {
+      setFinishPhase("done");
+    }
+  }, []);
 
   const [joinPassphrase, setJoinPassphrase] = useState("");
   const [joinPin, setJoinPin] = useState("");
@@ -274,62 +343,76 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
       await loadPlan();
       setLocalReady(true);
       setDbMsg("The database on this Mac is running, and a test restore of its backup worked.");
+      // install_local_postgres already stored the DSN itself; finish the rest
+      // of the pipeline (nightly upkeep + a real capture-to-search round
+      // trip) the same way a remote connect does — this never ran from the
+      // local-setup path before (audit gap #1).
+      await finishStoredConnect();
     } catch (e) {
       setDbMsg(String(e));
     } finally {
       setDbBusy(false);
     }
-  }, [refreshDsn, loadPlan]);
+  }, [refreshDsn, loadPlan, finishStoredConnect]);
 
-  const saveRemoteDsn = useCallback(async () => {
-    const value = remoteDsn.trim();
-    if (!value) return;
+  /** "Connect to a database I already run" — the one-pipeline flow from
+   *  docs/plans/2026-09-05-setup-that-cannot-strand-you.md: preflight
+   *  (reach..graph, nothing written) first, and only if all five pass does
+   *  the real connect run (store, upkeep, prove, summary). Each call is a
+   *  single round trip, so the five/nine rows go to "running" together and
+   *  fill together — there is no per-stage progress to stream. */
+  const connectRemote = useCallback(async (overrideRootCrt?: string) => {
+    const dsn = remoteDsn.trim();
+    if (!dsn) return;
+    // Accepts an override so a freshly-picked certificate path can be used
+    // immediately, without waiting a render for `remoteRootCrt` state (which
+    // this closure would otherwise still see as stale in the same tick).
+    const rootCrt = (overrideRootCrt ?? remoteRootCrt).trim() || undefined;
     setRemoteBusy(true);
-    setDbMsg(null);
     setRemoteReady(false);
+    setRemoteStageIds(PREFLIGHT_STAGE_IDS);
+    setRemotePhase("running");
+    setRemoteResult(null);
     try {
-      const out = parse(await invoke<string>("set_khipu_secret", { account: "database_url", value }));
-      if (out?.ok !== true) {
-        setDbMsg(String(out?.error ?? "Could not save the connection."));
+      const preRaw = await invoke<string>("khipu_db_preflight", { dsn });
+      const pre = parse(preRaw) as SetupPipelineResult;
+      setRemoteResult(pre);
+      if (!pre || pre.ok !== true) {
+        setRemotePhase("done");
         return;
       }
-      await refreshDsn();
-      let raw = await invoke<string>("check_remote_postgres", { full: false });
-      let v = parse(raw);
-      let err = payloadError(v);
-      if (err) {
-        setDbMsg(err);
-        return;
+
+      setRemoteStageIds(CONNECT_STAGE_IDS);
+      setRemotePhase("running");
+      setRemoteResult(null);
+      const connRaw = await invoke<string>("khipu_db_connect", { dsn, rootCrt });
+      const conn = parse(connRaw) as SetupPipelineResult;
+      setRemoteResult(conn);
+      if (conn?.ok === true) {
+        await refreshDsn();
+        await loadPlan();
+        setRemoteReady(true);
       }
-      await applyMigrations();
-      raw = await invoke<string>("check_remote_postgres", { full: true });
-      v = parse(raw);
-      err = payloadError(v);
-      if (err) {
-        setDbMsg(err);
-        return;
-      }
-      raw = await invoke<string>("select_compat_row", {
-        mode: "remote",
-        pgvectorExtversion: String(v?.pgvector ?? ""),
-        serverVersion: String(v?.server_version ?? ""),
-        pgvector: String(v?.pgvector ?? ""),
-      });
-      v = parse(raw);
-      err = payloadError(v);
-      if (err) {
-        setDbMsg(err);
-        return;
-      }
-      await loadPlan();
-      setRemoteReady(true);
-      setDbMsg("Connected. That server has everything Khipu needs.");
     } catch (e) {
-      setDbMsg(String(e));
+      setRemoteResult({ ok: false, error: String(e) });
     } finally {
+      setRemotePhase("done");
       setRemoteBusy(false);
     }
-  }, [remoteDsn, refreshDsn, applyMigrations, loadPlan]);
+  }, [remoteDsn, remoteRootCrt, refreshDsn, loadPlan]);
+
+  const pickRemoteRootCrt = useCallback(async () => {
+    try {
+      const selected = await openFileDialog({ multiple: false });
+      if (typeof selected === "string" && selected.trim()) {
+        const path = selected.trim();
+        setRemoteRootCrt(path);
+        await connectRemote(path);
+      }
+    } catch (e) {
+      setDbMsg(String(e));
+    }
+  }, [connectRemote]);
 
   const completeJoinAfterImport = useCallback(
     async (
@@ -388,6 +471,11 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
               : "Joined — the counts match the join kit exactly.",
           );
         }
+        // The join import already stored the DSN itself; finish the rest of
+        // the pipeline (nightly upkeep + a real capture-to-search round
+        // trip) the same way a remote connect does — this never ran from the
+        // join path before (audit gap #1).
+        await finishStoredConnect();
       } catch (e) {
         setDbMsg(
           `Join kit is saved on this Mac — you can continue. The database check failed: ${String(e)}`,
@@ -395,7 +483,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
       }
       return true;
     },
-    [refreshDsn, applyMigrations, loadPlan],
+    [refreshDsn, applyMigrations, loadPlan, finishStoredConnect],
   );
 
   const importJoinFromFile = useCallback(async () => {
@@ -917,8 +1005,9 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
           ) : (
             <>
               <p className="muted">
-                Paste the connection string for your server. The password goes
-                straight into the login Keychain — never into a file in the repo.
+                <strong>Connection string</strong> — looks like{" "}
+                <code>postgresql://user:password@host:5432/dbname</code>; your
+                host shows it in the database's connection details.
               </p>
               <div className="toolbar" style={{ width: "100%" }}>
                 <input
@@ -929,23 +1018,45 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                   value={remoteDsn}
                   onChange={(e) => setRemoteDsn(e.target.value)}
                   placeholder="postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=verify-full"
-                  aria-label="Database connection string"
+                  aria-label="Connection string"
                 />
+              </div>
+              <p className="muted" style={{ marginTop: "0.5rem" }}>
+                <strong>Certificate file</strong> — only if your host gave you
+                one (often called <code>root.crt</code> or <code>ca.pem</code>).
+              </p>
+              <div className="toolbar">
+                <button type="button" onClick={() => void pickRemoteRootCrt()}>
+                  {remoteRootCrt ? "Change certificate file…" : "Choose certificate file…"}
+                </button>
+                {remoteRootCrt ? (
+                  <span className="muted mono ellip">{remoteRootCrt}</span>
+                ) : null}
                 <button
                   type="button"
                   className="primary"
                   disabled={remoteBusy || !remoteDsn.trim()}
-                  onClick={() => void saveRemoteDsn()}
+                  onClick={() => void connectRemote()}
                 >
-                  {remoteBusy ? "Connecting…" : "Save and verify"}
+                  {remoteBusy ? "Connecting…" : "Connect"}
                 </button>
               </div>
+              {remotePhase !== "idle" ? (
+                <SetupStages
+                  stageIds={remoteStageIds}
+                  result={remoteResult}
+                  phase={remotePhase}
+                  busy={remoteBusy}
+                  onRetry={() => void connectRemote()}
+                  onPasteCertificate={() => void pickRemoteRootCrt()}
+                />
+              ) : null}
             </>
           )}
 
-          {dbMsg ? <pre className="code">{dbMsg}</pre> : null}
+          {dbMode !== "remote" && dbMsg ? <pre className="code">{dbMsg}</pre> : null}
 
-          {dsnOk && databaseReady ? (
+          {dbMode !== "remote" && dsnOk && databaseReady ? (
             <Callout
               tone="ok"
               title="Database ready"
@@ -963,6 +1074,18 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                     ? `Schema is up to date (${plan.applied?.length ?? 0} migrations applied).`
                     : `${pending} migration${pending === 1 ? "" : "s"} to apply: ${plan.pending?.join(", ")}`}
             </Callout>
+          ) : null}
+
+          {dbMode === "local" || dbMode === "join" ? (
+            finishPhase !== "idle" ? (
+              <SetupStages
+                stageIds={CONNECT_STAGE_IDS.filter((id) => id === "store" || id === "upkeep" || id === "prove" || id === "summary")}
+                result={finishStageResult}
+                phase={finishPhase}
+                busy={finishPhase === "running"}
+                onRetry={() => void finishStoredConnect()}
+              />
+            ) : null
           ) : null}
         </>
       ) : null}

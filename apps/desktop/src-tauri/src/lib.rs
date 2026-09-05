@@ -330,18 +330,33 @@ fn khipu_app_version() -> &'static str {
 }
 
 fn run_khipu_cli(args: &[String]) -> Result<String, String> {
+    run_khipu_cli_with_env(args, &[])
+}
+
+/// Same as `run_khipu_cli`, plus caller-supplied environment variables on the
+/// spawned process only (never argv). This is how a DSN — which can carry a
+/// password — reaches `khipu db preflight|connect|move`: the same "never in
+/// argv, so it never shows in `ps`" rule `set_khipu_secret` follows via a
+/// stdin pipe and `join_export`'s passphrase follows via env, applied here
+/// via env like `join_export` (a one-shot `.output()` call has no long-lived
+/// stdin pipe worth opening).
+fn run_khipu_cli_with_env(args: &[String], extra_env: &[(String, String)]) -> Result<String, String> {
     let root = khipu_root()?;
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
     let (bc_key, bc_val) = khipu_bytecode_env();
-    let output = Command::new(&py)
-        .arg("-m")
+    let mut cmd = Command::new(&py);
+    cmd.arg("-m")
         .arg("khipu")
         .args(args)
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
         .env("KHIPU_APP_VERSION", khipu_app_version())
-        .env(bc_key, &bc_val)
+        .env(bc_key, &bc_val);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd
         .output()
         .map_err(|e| format!("spawn khipu CLI failed ({py:?}): {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -368,6 +383,16 @@ fn run_khipu_cli(args: &[String]) -> Result<String, String> {
 /// there freezes tab paints and the working spinner. Offload CLI waits.
 async fn run_khipu_cli_async(args: Vec<String>) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || run_khipu_cli(&args))
+        .await
+        .map_err(|e| format!("khipu worker join failed: {e}"))?
+}
+
+/// `run_khipu_cli_async` plus per-call env vars — see `run_khipu_cli_with_env`.
+async fn run_khipu_cli_with_env_async(
+    args: Vec<String>,
+    extra_env: Vec<(String, String)>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || run_khipu_cli_with_env(&args, &extra_env))
         .await
         .map_err(|e| format!("khipu worker join failed: {e}"))?
 }
@@ -430,6 +455,107 @@ async fn khipu_migrate(dry_run: bool) -> Result<String, String> {
         args.push("--dry-run".to_string());
     }
     run_khipu_cli_async(args).await
+}
+
+// --- Setup pipeline (docs/plans/2026-09-05-setup-that-cannot-strand-you.md,
+// Phase 2): the Database step (Welcome), the Move dialog (Settings), and the
+// Another Mac gate all call these. `db` is a state-changing subcommand
+// (writes the stored connection, can install LaunchAgents) so it stays OUT
+// of `ALLOWED_SUBCOMMANDS`, the same shape as `migrate`/`embed`/`jobs`: each
+// verb gets exactly one fixed-argv command here, and any DSN travels as a
+// per-call env var, never argv — see `run_khipu_cli_with_env`.
+
+fn db_preflight_argv() -> Vec<String> {
+    vec!["db".to_string(), "preflight".to_string()]
+}
+
+fn db_connect_argv(root_crt: &Option<String>) -> Vec<String> {
+    let mut args = vec!["db".to_string(), "connect".to_string()];
+    if let Some(p) = root_crt {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            args.push("--root-crt".to_string());
+            args.push(trimmed.to_string());
+        }
+    }
+    args
+}
+
+/// `khipu db connect --use-stored`: the CLI verb Phase 2 needed and Phase 1
+/// did not add — finishing setup (upkeep + prove) right after
+/// `install_local_postgres` or a join import, both of which already wrote the
+/// DSN to Keychain themselves. Re-sending that DSN through the webview just
+/// to hand it back would put a password the frontend doesn't otherwise hold
+/// into JS state for no reason, so instead the CLI resolves the
+/// already-configured DSN itself (see `cmd_db` in cli.py). No DSN, so no env
+/// var to set either.
+fn db_connect_stored_argv() -> Vec<String> {
+    vec!["db".to_string(), "connect".to_string(), "--use-stored".to_string()]
+}
+
+fn db_move_argv(dry_run: bool) -> Vec<String> {
+    let mut args = vec!["db".to_string(), "move".to_string()];
+    if dry_run {
+        args.push("--dry-run".to_string());
+    }
+    args
+}
+
+/// `khipu db move --new-local`: the Move dialog's "a new database on this
+/// Mac" target. A second CLI verb Phase 2 needed and Phase 1 did not add —
+/// `install_local_postgres` stores the DSN it creates itself, which would
+/// switch the active connection to the new, empty database before anything
+/// is copied into it, so provisioning has to happen inside the same process
+/// as the move (see `khipu.setup.provision_local_move_target`'s docstring).
+/// No DSN crosses the webview boundary either way.
+fn db_move_new_local_argv(dry_run: bool) -> Vec<String> {
+    let mut args = vec!["db".to_string(), "move".to_string(), "--new-local".to_string()];
+    if dry_run {
+        args.push("--dry-run".to_string());
+    }
+    args
+}
+
+fn db_status_argv() -> Vec<String> {
+    vec!["db".to_string(), "status".to_string()]
+}
+
+#[tauri::command]
+async fn khipu_db_status() -> Result<String, String> {
+    run_khipu_cli_async(db_status_argv()).await
+}
+
+#[tauri::command]
+async fn khipu_db_preflight(dsn: String) -> Result<String, String> {
+    run_khipu_cli_with_env_async(db_preflight_argv(), vec![("KHIPU_DB_DSN".to_string(), dsn)]).await
+}
+
+#[tauri::command]
+async fn khipu_db_connect(dsn: String, root_crt: Option<String>) -> Result<String, String> {
+    run_khipu_cli_with_env_async(
+        db_connect_argv(&root_crt),
+        vec![("KHIPU_DB_DSN".to_string(), dsn)],
+    )
+    .await
+}
+
+#[tauri::command]
+async fn khipu_db_connect_stored() -> Result<String, String> {
+    run_khipu_cli_async(db_connect_stored_argv()).await
+}
+
+#[tauri::command]
+async fn khipu_db_move(target_dsn: String, dry_run: bool) -> Result<String, String> {
+    run_khipu_cli_with_env_async(
+        db_move_argv(dry_run),
+        vec![("KHIPU_DB_TARGET_DSN".to_string(), target_dsn)],
+    )
+    .await
+}
+
+#[tauri::command]
+async fn khipu_db_move_new_local(dry_run: bool) -> Result<String, String> {
+    run_khipu_cli_async(db_move_new_local_argv(dry_run)).await
 }
 
 #[tauri::command]
@@ -1267,6 +1393,12 @@ pub fn run() {
             khipu_migrate,
             khipu_embed_backfill,
             khipu_jobs_refresh,
+            khipu_db_status,
+            khipu_db_preflight,
+            khipu_db_connect,
+            khipu_db_connect_stored,
+            khipu_db_move,
+            khipu_db_move_new_local,
             select_compat_row,
             install_local_postgres,
             bootstrap_local_backup,
@@ -1555,6 +1687,97 @@ mod settable_secrets_tests {
                 "{account} is writable from Rust but absent from cli.py"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod db_command_tests {
+    use super::{
+        db_connect_argv, db_connect_stored_argv, db_move_argv, db_move_new_local_argv,
+        db_preflight_argv, db_status_argv, ALLOWED_SUBCOMMANDS,
+    };
+
+    #[test]
+    fn db_is_not_reachable_through_the_generic_argv_path() {
+        // `db connect`/`db move` write the stored connection and the DSN can
+        // carry a password; each verb gets its own fixed-argv command
+        // instead (khipu_db_status/preflight/connect/move), same shape as
+        // `migrate`/`embed`/`jobs`.
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"db"));
+    }
+
+    #[test]
+    fn preflight_argv_is_fixed_and_carries_no_dsn() {
+        assert_eq!(db_preflight_argv(), vec!["db".to_string(), "preflight".to_string()]);
+    }
+
+    #[test]
+    fn connect_argv_has_no_root_crt_by_default() {
+        assert_eq!(db_connect_argv(&None), vec!["db".to_string(), "connect".to_string()]);
+    }
+
+    #[test]
+    fn connect_argv_adds_root_crt_when_given() {
+        assert_eq!(
+            db_connect_argv(&Some("/tmp/root.crt".to_string())),
+            vec![
+                "db".to_string(),
+                "connect".to_string(),
+                "--root-crt".to_string(),
+                "/tmp/root.crt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn connect_argv_ignores_a_blank_root_crt_path() {
+        assert_eq!(
+            db_connect_argv(&Some("   ".to_string())),
+            vec!["db".to_string(), "connect".to_string()]
+        );
+    }
+
+    #[test]
+    fn connect_stored_argv_uses_the_use_stored_flag_and_no_dsn() {
+        assert_eq!(
+            db_connect_stored_argv(),
+            vec!["db".to_string(), "connect".to_string(), "--use-stored".to_string()]
+        );
+    }
+
+    #[test]
+    fn move_argv_default_is_a_real_move_not_a_dry_run() {
+        assert_eq!(db_move_argv(false), vec!["db".to_string(), "move".to_string()]);
+    }
+
+    #[test]
+    fn move_argv_dry_run_adds_the_flag() {
+        assert_eq!(
+            db_move_argv(true),
+            vec!["db".to_string(), "move".to_string(), "--dry-run".to_string()]
+        );
+    }
+
+    #[test]
+    fn status_argv_is_fixed_and_takes_no_dsn() {
+        assert_eq!(db_status_argv(), vec!["db".to_string(), "status".to_string()]);
+    }
+
+    #[test]
+    fn move_new_local_argv_never_carries_a_dsn() {
+        assert_eq!(
+            db_move_new_local_argv(false),
+            vec!["db".to_string(), "move".to_string(), "--new-local".to_string()]
+        );
+        assert_eq!(
+            db_move_new_local_argv(true),
+            vec![
+                "db".to_string(),
+                "move".to_string(),
+                "--new-local".to_string(),
+                "--dry-run".to_string(),
+            ]
+        );
     }
 }
 
