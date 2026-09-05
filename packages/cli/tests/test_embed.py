@@ -292,6 +292,12 @@ class SemanticSearchRankFetchWiringTest(unittest.TestCase):
             def cursor(self):
                 return FakeCur()
 
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
             def __enter__(self):
                 return self
 
@@ -1063,3 +1069,143 @@ class QueryEmbedBudgetTest(unittest.TestCase):
         self.assertEqual(len(calls), em.QUERY_EMBED_RETRIES + 1)
         self.assertTrue(all(t == em.QUERY_EMBED_TIMEOUT_S for t in calls))
         self.assertLess(em.QUERY_EMBED_TIMEOUT_S, 30)
+
+
+class EmbedDailyBudgetTest(unittest.TestCase):
+    """One Gemini request = one unit against EMBED_DAILY_CALL_BUDGET; the cap
+    exists so a runaway loop cannot spend the key's whole day."""
+
+    def setUp(self):
+        import tempfile
+        from unittest import mock
+
+        self.tmp = tempfile.TemporaryDirectory()
+        from pathlib import Path
+        path = Path(self.tmp.name) / "embed-budget.json"
+        self._p = mock.patch.object(em, "_budget_path", lambda: path)
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_counts_calls_and_resets_by_day(self):
+        from unittest import mock
+
+        self.assertEqual(em.budget_status()["calls"], 0)
+        em._budget_take()
+        em._budget_take()
+        st = em.budget_status()
+        self.assertEqual(st["calls"], 2)
+        self.assertFalse(st["exhausted"])
+        with mock.patch.object(em, "_budget_today", lambda: "1999-01-01"):
+            self.assertEqual(em.budget_status()["calls"], 0)
+
+    def test_exhausted_budget_blocks_the_request_before_the_network(self):
+        from unittest import mock
+
+        def fail_urlopen(*_a, **_k):
+            raise AssertionError("network must not be touched once the budget is spent")
+
+        with mock.patch.object(em, "EMBED_DAILY_CALL_BUDGET", 1), \
+                mock.patch.object(em, "_gemini_key", lambda: "k"), \
+                mock.patch.object(em.urllib.request, "urlopen", fail_urlopen):
+            em._budget_take()
+            with self.assertRaises(RuntimeError) as ctx:
+                em.embed_one("q")
+            self.assertTrue(em.budget_status()["exhausted"])
+        self.assertIn("budget exhausted", str(ctx.exception))
+
+
+class _FakeCur:
+    """Minimal cursor for the query-cache path: answers to_regclass, the
+    cache SELECT, and records every statement."""
+
+    def __init__(self, *, table: bool, cached: str | None = None):
+        self.table = table
+        self.cached = cached
+        self.executed: list[str] = []
+        self._next = None
+
+    def execute(self, sql, params=None):
+        self.executed.append(sql)
+        if "to_regclass" in sql:
+            self._next = (self.table,)
+        elif sql.lstrip().startswith("SELECT embedding::text"):
+            self._next = (self.cached,) if self.cached else None
+        else:
+            self._next = None
+
+    def fetchone(self):
+        return self._next
+
+
+class _FakeConn:
+    def __init__(self):
+        self.commits = 0
+        self.rollbacks = 0
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+class QueryVectorCacheTest(unittest.TestCase):
+    def test_hash_is_profile_scoped_and_whitespace_case_insensitive(self):
+        a = em._query_hash("p1", "  What DID we   decide?")
+        b = em._query_hash("p1", "what did we decide?")
+        c = em._query_hash("p2", "what did we decide?")
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+
+    def test_hit_skips_the_api_and_bumps_usage(self):
+        from unittest import mock
+
+        vec = [1.0] + [0.0] * (em.DIM - 1)
+        cur = _FakeCur(table=True, cached=json.dumps(vec))
+        conn = _FakeConn()
+        with mock.patch.object(em, "embed_one", side_effect=AssertionError("no API on a hit")):
+            out, state = em._query_vec(cur, conn, em.PROFILE_2, "q")
+        self.assertEqual(state, "hit")
+        self.assertEqual(out, vec)
+        self.assertTrue(any(s.lstrip().startswith("UPDATE memory_query_cache") for s in cur.executed))
+        self.assertEqual(conn.commits, 1)
+
+    def test_miss_embeds_once_and_stores(self):
+        from unittest import mock
+
+        vec = [0.5] * em.DIM
+        cur = _FakeCur(table=True, cached=None)
+        conn = _FakeConn()
+        with mock.patch.object(em, "embed_one", return_value=vec) as m:
+            out, state = em._query_vec(cur, conn, em.PROFILE_2, "q")
+        self.assertEqual(state, "miss")
+        self.assertEqual(out, vec)
+        m.assert_called_once()
+        self.assertTrue(any(s.lstrip().startswith("INSERT INTO memory_query_cache") for s in cur.executed))
+
+    def test_unmigrated_hub_embeds_directly(self):
+        from unittest import mock
+
+        cur = _FakeCur(table=False)
+        conn = _FakeConn()
+        with mock.patch.object(em, "embed_one", return_value=[0.1] * em.DIM):
+            _out, state = em._query_vec(cur, conn, em.PROFILE_2, "q")
+        self.assertEqual(state, "off")
+        self.assertFalse(any("memory_query_cache" in s and "to_regclass" not in s for s in cur.executed))
+
+    def test_cache_write_failure_never_fails_the_search(self):
+        from unittest import mock
+
+        class BrokenWriteCur(_FakeCur):
+            def execute(self, sql, params=None):
+                if sql.lstrip().startswith("INSERT"):
+                    raise RuntimeError("permission denied")
+                super().execute(sql, params)
+
+        cur = BrokenWriteCur(table=True)
+        conn = _FakeConn()
+        with mock.patch.object(em, "embed_one", return_value=[0.1] * em.DIM):
+            _out, state = em._query_vec(cur, conn, em.PROFILE_2, "q")
+        self.assertEqual(state, "miss")
+        self.assertEqual(conn.rollbacks, 1)

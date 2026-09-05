@@ -33,7 +33,11 @@ class JobsRunTest(unittest.TestCase):
                  self.log_dir / f"{log_stem}.out.log",
                  self.log_dir / f"{log_stem}.err.log",
              )), \
-             mock.patch.object(jobs.subprocess, "run", side_effect=run_fn) as run_mock:
+             mock.patch.object(jobs.subprocess, "run", side_effect=run_fn) as run_mock, \
+             mock.patch("khipu.embed.backfill", return_value={"embedded": 0}), \
+             mock.patch("khipu.embed.prune_query_cache", return_value=0):
+            # The nightly's own embed sweep and cache prune reach the hub;
+            # they are unit-tested below and never run for real here.
             yield run_mock
 
     def test_run_nightly_invokes_consolidate_script(self):
@@ -101,6 +105,33 @@ class JobsRunTest(unittest.TestCase):
                 mock.patch("khipu.notes.reconcile", side_effect=RuntimeError("boom")):
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
+
+    def test_run_nightly_runs_the_embed_backfill_itself(self):
+        """Vectors no longer depend on the legacy driver's reconcile: the
+        backfill runs from run_nightly regardless of the script's outcome,
+        and a failure in it is logged, never fatal (2026-09-05)."""
+        def _run(cmd, stdout, stderr, env):  # noqa: ARG001
+            return mock.Mock(returncode=2)
+
+        with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
+                mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
+                mock.patch.object(jobs, "_mark_stale_commitments"), \
+                mock.patch("khipu.embed.backfill", return_value={"embedded": 7}) as m_bf, \
+                mock.patch("khipu.embed.prune_query_cache", side_effect=RuntimeError("hub down")):
+            rc = jobs.run_nightly()
+        self.assertEqual(rc, 2)
+        m_bf.assert_called_once_with()
+        log = (self.log_dir / "khipu-nightly.out.log").read_text()
+        self.assertIn("[khipu-embed] backfill ok", log)
+        self.assertIn("query cache prune skipped: RuntimeError", log)
+
+        with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
+                mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
+                mock.patch.object(jobs, "_mark_stale_commitments"), \
+                mock.patch("khipu.embed.backfill", side_effect=RuntimeError("quota")):
+            self.assertEqual(jobs.run_nightly(), 2)
+        self.assertIn("backfill skipped: RuntimeError: quota",
+                      (self.log_dir / "khipu-nightly.out.log").read_text())
 
     def test_run_monthly_passes_dry_run(self):
         captured: list[list[str]] = []

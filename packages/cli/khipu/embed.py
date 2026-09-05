@@ -56,6 +56,9 @@ _PROFILE_MODELS: dict[str, str] = {
 CHUNK_CHARS = 6000
 CHUNK_OVERLAP = 300
 BATCH = 64            # Gemini batchEmbedContents cap is 100; stay under
+BACKFILL_RETRIES = 6  # 429 ladder 5/10/20/40/80/160 s: outlasts a per-minute window
+BACKFILL_DELAY_S = 5.0
+BACKFILL_PAUSE_S = 1.5  # between batches; the sweep is nightly, not interactive
 COMMITMENT_CATCHUP_LIMIT = 5  # fix 5c: bounded, same spirit as the episode catch-up's limit=5 caller
 MAX_TEXT_CHARS = 8000  # per-item safety, mirrors embed_mirror.embed_text
 # Google Embedding 2 image table (docs 2026-06-22): PNG and JPEG only.
@@ -164,6 +167,162 @@ QUERY_EMBED_TIMEOUT_S = 10.0
 QUERY_EMBED_RETRIES = 2
 QUERY_EMBED_DELAY_S = 1.0
 
+# Per-day API budget, counted in REQUESTS (one Gemini call = one unit, so a
+# 64-chunk backfill batch and a single Recall query cost the same). The free
+# tier allows 1,000 embed requests a day; the cap stays under it so a runaway
+# loop can never exhaust the key for the rest of the day. Local to this Mac
+# (~/.config/khipu/state/embed-budget.json), reset at UTC midnight.
+EMBED_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_EMBED_DAILY_CALLS", "800"))
+# Query vectors are cached on the hub (memory_query_cache, migration 0014) so a
+# repeated question costs no API call; rows unused for this long are pruned by
+# the nightly.
+QUERY_CACHE_TTL_DAYS = 30
+
+
+def _budget_path() -> Path:
+    from khipu.paths import ensure_data_dir
+
+    d = ensure_data_dir() / "state"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "embed-budget.json"
+
+
+def _budget_today() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def budget_status() -> dict[str, Any]:
+    """Today's embed API calls against EMBED_DAILY_CALL_BUDGET."""
+    used = 0
+    try:
+        raw = json.loads(_budget_path().read_text(encoding="utf-8"))
+        if raw.get("day") == _budget_today():
+            used = int(raw.get("calls") or 0)
+    except (OSError, ValueError, TypeError):
+        used = 0
+    cap = EMBED_DAILY_CALL_BUDGET
+    return {
+        "day": _budget_today(),
+        "calls": used,
+        "cap": cap,
+        "remaining": max(0, cap - used),
+        "exhausted": used >= cap,
+    }
+
+
+def _budget_take() -> None:
+    """Reserve one API call for today; raise when the day's budget is spent.
+
+    The message carries "budget exhausted" — hybrid_search keys its
+    ``degraded`` reason on it. Read-modify-write without a lock: two
+    concurrent callers may under-count by one, which is fine for a cap whose
+    job is to stop a loop, not to bill."""
+    st = budget_status()
+    if st["exhausted"]:
+        raise RuntimeError(
+            f"embed budget exhausted: {st['calls']} calls today "
+            f"(cap {st['cap']}, KHIPU_EMBED_DAILY_CALLS)"
+        )
+    try:
+        path = _budget_path()
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"day": st["day"], "calls": st["calls"] + 1}), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass  # a budget file we cannot write never blocks an embed
+
+
+def _query_hash(profile: str, api_q: str) -> str:
+    """Cache key: profile + whitespace-collapsed, case-folded query text. Only
+    the hash is stored on the hub, never the query itself."""
+    norm = " ".join(api_q.split()).lower()
+    return _md5(f"{profile}\n{norm}")
+
+
+def _query_cache_available(cur) -> bool:
+    cur.execute("SELECT to_regclass('public.memory_query_cache') IS NOT NULL")
+    row = cur.fetchone()
+    return bool(row and row[0])
+
+
+def _query_vec(cur, conn, profile: str, api_q: str) -> tuple[list[float], str]:
+    """Query vector through memory_query_cache. Returns (vec, state) where
+    state is ``hit`` (no API call), ``miss`` (embedded and stored) or ``off``
+    (hub not migrated; embedded, nothing stored). Cache failures never fail
+    the search — they roll back and fall through to the API."""
+    try:
+        have_cache = _query_cache_available(cur)
+    except Exception:  # noqa: BLE001
+        conn.rollback()
+        have_cache = False
+    qh = _query_hash(profile, api_q)
+    if have_cache:
+        try:
+            cur.execute(
+                "SELECT embedding::text FROM memory_query_cache"
+                " WHERE profile = %s AND query_hash = %s",
+                (profile, qh),
+            )
+            row = cur.fetchone()
+            if row and isinstance(row[0], str) and row[0].startswith("["):
+                cur.execute(
+                    "UPDATE memory_query_cache SET last_used_at = now(), hits = hits + 1"
+                    " WHERE profile = %s AND query_hash = %s",
+                    (profile, qh),
+                )
+                conn.commit()
+                return [float(x) for x in json.loads(row[0])], "hit"
+        except Exception as exc:  # noqa: BLE001
+            conn.rollback()
+            _log(f"query cache read skipped: {type(exc).__name__}")
+            have_cache = False
+    vec = embed_one(
+        api_q, profile=profile,
+        retries=QUERY_EMBED_RETRIES, timeout=QUERY_EMBED_TIMEOUT_S,
+        delay=QUERY_EMBED_DELAY_S,
+    )
+    if not have_cache:
+        return vec, "off"
+    try:
+        cur.execute(
+            "INSERT INTO memory_query_cache (profile, query_hash, embedding)"
+            " VALUES (%s, %s, %s::vector)"
+            " ON CONFLICT (profile, query_hash) DO UPDATE"
+            " SET embedding = EXCLUDED.embedding, last_used_at = now()",
+            (profile, qh, _vec_literal(vec)),
+        )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        conn.rollback()
+        _log(f"query cache write skipped: {type(exc).__name__}")
+    return vec, "miss"
+
+
+def prune_query_cache(*, ttl_days: int = QUERY_CACHE_TTL_DAYS) -> int:
+    """Delete cached query vectors unused for ``ttl_days``. Returns rows removed."""
+    from khipu.db import connect
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if not _query_cache_available(cur):
+                return 0
+            cur.execute(
+                "DELETE FROM memory_query_cache"
+                " WHERE last_used_at < now() - make_interval(days => %s)",
+                (int(ttl_days),),
+            )
+            n = cur.rowcount
+            conn.commit()
+            return int(n or 0)
+
+
+def query_cache_status(cur) -> dict[str, Any]:
+    if not _query_cache_available(cur):
+        return {"available": False, "rows": 0, "hits": 0}
+    cur.execute("SELECT COUNT(*), COALESCE(SUM(hits), 0) FROM memory_query_cache")
+    rows, hits = cur.fetchone()
+    return {"available": True, "rows": int(rows), "hits": int(hits)}
+
 
 def embed_batch(
     texts: list[str],
@@ -203,6 +362,7 @@ def embed_batch(
     data = json.dumps(body).encode("utf-8")
     payload: dict[str, Any] = {}
     for attempt in range(retries + 1):
+        _budget_take()
         req = urllib.request.Request(
             url, data=data, method="POST",
             headers={"Content-Type": "application/json", "x-goog-api-key": key},
@@ -296,6 +456,7 @@ def embed_batch_images(
     delay = 2.0
     payload: dict[str, Any] = {}
     for attempt in range(retries + 1):
+        _budget_take()
         req = urllib.request.Request(
             url,
             data=data,
@@ -705,7 +866,21 @@ def backfill(
                 batch = todo[start : start + BATCH]
                 # todo rows: (kind, ref, idx, chunk, hash, title)
                 api = _api_texts(profile, [(title, chunk) for _k, _r, _i, chunk, _h, title in batch])
-                vecs = embed_batch(api, profile=profile)
+                try:
+                    # Gemini answered 429 to five back-to-back 64-chunk batches
+                    # (2026-09-05) and the 2/4/8/16 s ladder did not outlast
+                    # the window; a longer ladder and a pause between batches
+                    # let one nightly finish instead of leaving a third of the
+                    # topics for tomorrow.
+                    vecs = embed_batch(api, profile=profile, retries=BACKFILL_RETRIES,
+                                       delay=BACKFILL_DELAY_S)
+                except RuntimeError as exc:
+                    if "budget exhausted" not in str(exc):
+                        raise
+                    # Batches already committed stay; tomorrow's sweep finishes.
+                    stats["budget_exhausted"] = True
+                    _log(f"stopping: {exc}")
+                    break
                 _upsert_chunks(
                     cur, profile,
                     [(k, r, i, chunk, h, v)
@@ -716,6 +891,8 @@ def backfill(
                 stats["batches"] += 1
                 if stats["batches"] % 10 == 0:
                     _log(f"  {stats['embedded']}/{len(todo)}")
+                if start + BATCH < len(todo):
+                    time.sleep(BACKFILL_PAUSE_S)
     return stats
 
 
@@ -912,13 +1089,11 @@ def _cosine_candidates(
                     )
             api_q = prefix_query(query) if uses_task_prefixes(profile) else query
             _t0 = time.monotonic()
-            qlit = _vec_literal(embed_one(
-                api_q, profile=profile,
-                retries=QUERY_EMBED_RETRIES, timeout=QUERY_EMBED_TIMEOUT_S,
-                delay=QUERY_EMBED_DELAY_S,
-            ))
+            qvec, cache_state = _query_vec(cur, conn, profile, api_q)
+            qlit = _vec_literal(qvec)
             if timing is not None:
                 timing["embed_ms"] = round((time.monotonic() - _t0) * 1000, 1)
+                timing["embed_cache"] = cache_state
             _t0 = time.monotonic()
             cur.execute("SELECT to_regclass('public.media_assets') IS NOT NULL")
             has_media = bool(cur.fetchone()[0])
@@ -1389,8 +1564,14 @@ def hybrid_search(
             cosine_rows = []
             # "embed-unavailable" = the API did not answer inside the query
             # budget (QUERY_EMBED_TIMEOUT_S); "no-embedding" = no vector at all.
-            degraded = "embed-unavailable" if "network error" in str(exc) else "no-embedding"
-            timing["embed_error"] = str(exc)[:120]
+            msg = str(exc)
+            if "budget exhausted" in msg:
+                degraded = "embed-budget"
+            elif "network error" in msg or "embed HTTP" in msg:
+                degraded = "embed-unavailable"
+            else:
+                degraded = "no-embedding"
+            timing["embed_error"] = msg[:120]
 
     with try_hub_connect() as conn:
         with conn.cursor() as cur:
@@ -1524,6 +1705,7 @@ def coverage(*, profile: str | None = None) -> dict[str, Any]:
             cur.execute("SELECT id FROM embedding_profiles WHERE is_active LIMIT 1")
             active_row = cur.fetchone()
             active = active_row[0] if active_row else None
+            qcache = query_cache_status(cur)
     e = by.get("episode", {"refs": 0, "chunks": 0})
     t = by.get("topic", {"refs": 0, "chunks": 0})
     m = by.get("media", {"refs": 0, "chunks": 0})
@@ -1555,6 +1737,9 @@ def coverage(*, profile: str | None = None) -> dict[str, Any]:
                         "missing": max(0, commitments_total - commitments_refs),
                         "chunks": commitments_chunks,
                         "pct": _pct(commitments_refs, commitments_total)},
+        # Informational: neither gates activate() nor doctor.
+        "query_cache": qcache,
+        "budget": budget_status(),
     }
 
 

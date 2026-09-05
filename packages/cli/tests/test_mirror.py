@@ -564,3 +564,25 @@ class UpsertEpisodeSchemaGateTest(unittest.TestCase):
         sql = self._insert_sql(cur)
         self.assertIn("tags", sql)
         self.assertEqual(len(cur.params[-1]), 16)
+
+
+class UnterminatedFrontmatterTest(unittest.TestCase):
+    """A page that opens a ``---`` block and never closes it must parse (as a
+    body with default metadata), not raise. 45 such pages in the memory tree
+    killed the nightly reconcile from 2026-09-03 to 2026-09-05 and, with it,
+    the embed backfill that ran after it."""
+
+    def test_open_block_without_closer_parses_with_defaults(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", prefix="topic-", delete=False, encoding="utf-8"
+        )
+        text = "---\ntitle: capture-v2\nstatus: active\nlinks:\n  - gateway\n"
+        tmp.write(text)
+        tmp.close()
+        self.addCleanup(Path(tmp.name).unlink)
+        parsed = parse_topic_file(Path(tmp.name))
+        assert parsed is not None
+        self.assertEqual(parsed["status"], "active")
+        self.assertEqual(parsed["title"], Path(tmp.name).stem)
+        self.assertEqual(parsed["body"], text)
+        self.assertEqual(parsed["frontmatter"], {})
