@@ -1209,3 +1209,21 @@ class QueryVectorCacheTest(unittest.TestCase):
             _out, state = em._query_vec(cur, conn, em.PROFILE_2, "q")
         self.assertEqual(state, "miss")
         self.assertEqual(conn.rollbacks, 1)
+
+
+class EmbedBudgetUnlimitedTest(unittest.TestCase):
+    def test_zero_cap_means_no_ceiling(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(em, "_budget_path", lambda: Path(tmp) / "b.json"), \
+                mock.patch.object(em, "EMBED_DAILY_CALL_BUDGET", 0):
+            for _ in range(5):
+                em._budget_take()
+            st = em.budget_status()
+        self.assertTrue(st["unlimited"])
+        self.assertFalse(st["exhausted"])
+        self.assertEqual(st["calls"], 5)
+        self.assertGreaterEqual(em.EMBED_DAILY_CALL_BUDGET, 10000)
