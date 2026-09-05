@@ -896,3 +896,145 @@ class BackfillCommitmentKindTest(unittest.TestCase):
 
         args = build_parser().parse_args(["embed", "backfill", "--kind", "commitment"])
         self.assertEqual(args.kind, "commitment")
+
+
+class SearchRowMetadataTest(unittest.TestCase):
+    """Phase 5 addendum (2026-09-04): Recall's result footer shows "date ·
+    project · harness"; the phase-3 build had to drop all three because
+    `khipu search` returned kind/id/label/snippet/score only. The metadata
+    `_apply_search_filters` already reads for filtering now rides back out on
+    the row — and as a STRING, because `cli.cmd_search` json.dumps the payload
+    with no `default=`."""
+
+    def _cur(self, rows, *, harness_col=True):
+        class FakeCur:
+            def __init__(self):
+                self.sql = ""
+
+            def execute(self, sql, params=None):
+                self.sql = " ".join(sql.split())
+
+            def fetchall(self):
+                return rows
+
+        return FakeCur()
+
+    def test_an_episode_row_carries_ts_project_and_harness(self):
+        import datetime as dt
+        import json
+        from unittest import mock
+
+        ts = dt.datetime(2026, 9, 3, 12, 0, tzinfo=dt.timezone.utc)
+        cur = self._cur([("11", ts, "cursor:abc", "acme/widget", "cursor")])
+        rows = [{"kind": "episode", "id": "11", "score": 0.9}]
+        with mock.patch.object(em, "_episode_schema_flags", return_value={
+            "project": True, "deleted_at": False, "harness": True, "parent_session_id": True,
+        }):
+            out = em._apply_search_filters(cur, rows)
+        self.assertEqual(out[0]["project"], "acme/widget")
+        self.assertEqual(out[0]["harness"], "cursor")
+        self.assertEqual(out[0]["ts"], ts.isoformat())
+        # The whole payload has to survive the CLI's json.dumps.
+        json.dumps(out)
+
+    def test_a_topic_row_carries_ts_but_never_a_project_or_harness(self):
+        import datetime as dt
+        from unittest import mock
+
+        ts = dt.datetime(2026, 9, 1, 8, 30, tzinfo=dt.timezone.utc)
+
+        class FakeCur:
+            def execute(self, sql, params=None):
+                self.sql = " ".join(sql.split())
+
+            def fetchall(self):
+                return [("khipu", ts)]
+
+        cur = FakeCur()
+        rows = [{"kind": "topic", "id": "khipu", "score": 0.5}]
+        with mock.patch.object(em, "_episode_schema_flags", return_value={
+            "project": True, "deleted_at": False, "harness": True, "parent_session_id": True,
+        }):
+            out = em._apply_search_filters(cur, rows)
+        self.assertEqual(out[0]["ts"], ts.isoformat())
+        self.assertNotIn("project", out[0])
+        self.assertNotIn("harness", out[0])
+
+    def test_an_episode_with_no_project_gets_no_empty_label(self):
+        import datetime as dt
+        from unittest import mock
+
+        ts = dt.datetime(2026, 9, 3, 12, 0, tzinfo=dt.timezone.utc)
+        cur = self._cur([("11", ts, "cursor:abc", "", "cursor")])
+        rows = [{"kind": "episode", "id": "11", "score": 0.9}]
+        with mock.patch.object(em, "_episode_schema_flags", return_value={
+            "project": True, "deleted_at": False, "harness": True, "parent_session_id": True,
+        }):
+            out = em._apply_search_filters(cur, rows)
+        self.assertNotIn("project", out[0])
+
+
+class SearchTimingTest(unittest.TestCase):
+    """Phase 5 addendum: a hybrid search took 12.5 s in the dev app and the
+    payload said nothing about which leg cost it. Borrows the pushdown test's
+    fake hub rather than subclassing it (subclassing would re-run its cases)."""
+
+    def setUp(self):
+        self.hub = SearchFilterPushdownTest("test_no_filters_means_no_predicates_and_no_params")
+        self.hub.setUp()
+
+    def test_the_payload_carries_a_timing_block_with_a_total(self):
+        out = self.hub._search(self.hub._cursor())
+        timing = out.get("timing")
+        self.assertIsInstance(timing, dict)
+        self.assertIn("total_ms", timing)
+        self.assertIn("literal_ms", timing)
+        self.assertIn("fusion_ms", timing)
+        for key, value in timing.items():
+            self.assertIsInstance(value, float, key)
+            self.assertGreaterEqual(value, 0.0, key)
+
+    def test_the_embed_leg_is_timed_separately_from_the_vector_scan(self):
+        timing: dict[str, float] = {}
+        seen = {}
+
+        class FakeCur:
+            def execute(self, sql, params=None):
+                seen["sql"] = " ".join(sql.split())
+
+            def fetchall(self):
+                return []
+
+            def fetchone(self):
+                return (False,)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        import contextlib
+        from unittest import mock
+
+        class FakeConn:
+            def cursor(self_inner):
+                return FakeCur()
+
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+
+        @contextlib.contextmanager
+        def _connect():
+            yield FakeConn()
+
+        with mock.patch("khipu.db.connect", _connect), \
+                mock.patch.object(em, "_active_profile", return_value="p@768"), \
+                mock.patch.object(em, "uses_task_prefixes", return_value=False), \
+                mock.patch.object(em, "embed_one", return_value=[0.1, 0.2]):
+            em._cosine_candidates("khipu", limit=10, timing=timing)
+        self.assertIn("embed_ms", timing)
+        self.assertIn("cosine_ms", timing)

@@ -35,6 +35,7 @@ import {
 } from "./ui";
 import { ComponentsPanel } from "./ComponentsPanel";
 import { IntegrationsPanel } from "./IntegrationsPanel";
+import type { LivenessPayload, RecallProbeStatus } from "./IntegrationsPanel";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { WorkingBanner } from "./WorkingBanner";
 import { FeedbackForm } from "./FeedbackForm";
@@ -136,10 +137,39 @@ type SearchResult = {
   score?: number;
   paths?: string[];
   neighbors?: { id: string; type?: string }[];
+  /** Row metadata `khipu search` gained in phase 5 so the footer can read
+   * "date · project · harness" as the mock does. `ts` is an ISO string on
+   * every kind that has one; `project` / `harness` exist on episodes only
+   * (a topic has neither, and inventing one is the bug this replaced). */
+  ts?: string;
+  project?: string;
+  harness?: string;
   /** Optional per-signal explanation, if the CLI ever attaches one. Rendered
    * as plain text when present; absent from today's payload. */
   why?: string;
   signals?: unknown;
+};
+
+/** Per-leg milliseconds from `hybrid_search` (phase 5 addendum). Every field
+ * is optional: an offline/stale payload carries no timing at all. */
+type SearchTiming = {
+  embed_ms?: number;
+  cosine_ms?: number;
+  literal_ms?: number;
+  lexical_ms?: number;
+  fusion_ms?: number;
+  enrich_ms?: number;
+  total_ms?: number;
+};
+
+const TIMING_LABEL: Record<string, string> = {
+  embed_ms: "Embedding the query",
+  cosine_ms: "Vector scan",
+  literal_ms: "Exact-word scan",
+  lexical_ms: "Word-overlap ranking",
+  fusion_ms: "Fusing and filtering",
+  enrich_ms: "Connections lookup",
+  total_ms: "Engine total",
 };
 
 /** The three `khipu search --mode` values, in the order the toolbar offers
@@ -320,7 +350,45 @@ type Commitment = {
   closed_episode?: number | null;
   closed_at?: string | null;
   close_reason?: string | null;
+  /** Commitment-quality fields (migrations 0012/0013, resolved in
+   *  `commitments.list_owed`): who owes it, whether it names a future
+   *  trigger, how it sorts, and how often a later capture has re-stated it.
+   *  All optional — a pre-migration hub answers without them. */
+  future_trigger?: boolean;
+  priority?: number;
+  seen_count?: number;
+  last_seen_at?: string | null;
 };
+
+/** The three Owed groups (phase 4 addendum + phase 5 brief). "Needs you" is
+ *  exactly `owner === "user"`, which the CLI resolves; the app never
+ *  re-derives it. */
+type OwedGroupId = "needs-you" | "promised" | "plan";
+
+const OWED_GROUPS: ReadonlyArray<
+  readonly [OwedGroupId, string, string]
+> = [
+  [
+    "needs-you",
+    "Needs you",
+    "Questions and blockers first, then the follow-ups and promises you own.",
+  ],
+  [
+    "promised",
+    "Promised with a trigger",
+    "The agent said it would do these when something happens.",
+  ],
+  [
+    "plan",
+    "This session's plan",
+    "Steps the agent set itself. They close on their own when a later capture says so.",
+  ],
+] as const;
+
+function owedGroupOf(c: Commitment): OwedGroupId {
+  if ((c.owner ?? "").toLowerCase() === "user") return "needs-you";
+  return c.future_trigger ? "promised" : "plan";
+}
 
 type OwedStatus = "open" | "closed" | "stale";
 
@@ -351,6 +419,44 @@ type Attention = {
   fix?: { label: string; kind: "reinstall-hook" | "recall-probe" | "revisions" };
   harness?: string;
 };
+
+/** Settings sub-navigation (overhaul phase 5, `mocks/main.settings.html`).
+ *  Eight sections, one per thing a person comes here to change. */
+type SettingsSection =
+  | "database"
+  | "capture"
+  | "index"
+  | "data"
+  | "another-mac"
+  | "components"
+  | "updates"
+  | "advanced";
+
+const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
+  ["database", "Database"],
+  ["capture", "Capture & models"],
+  ["index", "Search index"],
+  ["data", "Data & backups"],
+  ["another-mac", "Another Mac"],
+  ["components", "Components"],
+  ["updates", "Updates"],
+  ["advanced", "Advanced"],
+] as const;
+
+/** The capture cadence, read-only: `khipu config` does not expose it, so
+ *  these mirror `session_capture.MIN_TURNS` / `MIN_MINUTES` — the engine's
+ *  own defaults, overridable only by the environment. Shown as text, never as
+ *  an input that would not be saved anywhere. */
+const CAPTURE_MIN_TURNS = 5;
+const CAPTURE_MIN_MINUTES = 20;
+
+/** The coverage rows `khipu doctor` reports, in the order they matter. */
+const EMBED_KINDS: ReadonlyArray<readonly [string, string]> = [
+  ["episodes", "Sessions"],
+  ["topics", "Topic pages"],
+  ["commitments", "Owed items"],
+  ["media", "Images"],
+] as const;
 
 const HARNESS_LABEL: Record<string, string> = {
   claude_code: "Claude Code",
@@ -619,6 +725,13 @@ function formatAge(seconds: number | null | undefined): string {
 }
 
 /** Coarse age of an ISO timestamp, in the mocks' "2 d" register. */
+/** Milliseconds, as a person reads them: sub-second in ms, above that in
+ *  seconds to one decimal. */
+function formatMs(ms: number | null | undefined): string {
+  if (ms == null || !Number.isFinite(ms)) return "—";
+  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
+}
+
 function ageSince(iso: string | null | undefined): string | null {
   if (!iso) return null;
   const t = new Date(String(iso).replace(" ", "T")).getTime();
@@ -860,15 +973,18 @@ export default function App() {
   const [doctorCheckCount, setDoctorCheckCount] = useState(0);
   // Home's four tiles read these straight off the doctor payload; nothing here
   // is derived from a field the report does not carry.
-  const [liveness, setLiveness] = useState<{
-    ok?: boolean;
-    red?: string[];
-    harnesses?: Record<string, { ok?: boolean; reasons?: string[] }>;
-  } | null>(null);
+  const [liveness, setLiveness] = useState<LivenessPayload | null>(null);
+  // The last recorded end-to-end recall probe. Harnesses reads it for its
+  // "Verified …" line; nothing about that line is app-local state.
+  const [recallProbe, setRecallProbe] = useState<RecallProbeStatus | null>(null);
   const [embedCoverage, setEmbedCoverage] = useState<Record<
     string,
     { total?: number; embedded?: number; missing?: number; pct?: number }
   > | null>(null);
+  // `coverage()` reports the active index profile alongside the per-kind
+  // rows; Settings names it rather than saying "the index" and leaving the
+  // person to guess which one.
+  const [embedActiveProfile, setEmbedActiveProfile] = useState<string | null>(null);
   const [backupHealth, setBackupHealth] = useState<{
     ok?: boolean;
     freshest_backup_age_seconds?: number;
@@ -1011,7 +1127,11 @@ export default function App() {
   // Declared here, not next to the render, because the rail-badge effect below
   // reads owedOpenCount in its dependency list.
   const owedOpenRows = owedByStatus.open ?? [];
-  const owedOpenCount = owedByStatus.open ? owedByStatus.open.length : null;
+  // The rail badge and Home's preview count "Needs you" ONLY — the global
+  // open total is ~330 rows of the agent's own plan steps, which is exactly
+  // the number that got the screen ignored (phase 4 addendum).
+  const needsYouRows = owedOpenRows.filter((c) => owedGroupOf(c) === "needs-you");
+  const owedOpenCount = owedByStatus.open ? needsYouRows.length : null;
   const owedRows = owedByStatus[owedStatus] ?? [];
 
   const markLoading = (key: CacheTab, on: boolean) => {
@@ -1185,17 +1305,21 @@ export default function App() {
       setDoctorOk(typeof parsed.ok === "boolean" ? parsed.ok : null);
       const issues: string[] = [];
       const items: Attention[] = [];
-      const lv = (parsed as {
-        capture_liveness?: {
-          ok?: boolean;
-          red?: string[];
-          harnesses?: Record<string, { ok?: boolean; reasons?: string[] }>;
-        };
-      }).capture_liveness;
+      const lv = (parsed as { capture_liveness?: LivenessPayload })
+        .capture_liveness;
       setLiveness(lv ?? null);
-      setEmbedCoverage(
-        (parsed as { embed_coverage?: Record<string, { total?: number; embedded?: number; missing?: number; pct?: number }> })
-          .embed_coverage ?? null,
+      setRecallProbe(
+        (parsed as { recall_probe?: RecallProbeStatus }).recall_probe ?? null,
+      );
+      const cov = (parsed as {
+        embed_coverage?: Record<
+          string,
+          { total?: number; embedded?: number; missing?: number; pct?: number }
+        > & { active_profile?: unknown };
+      }).embed_coverage;
+      setEmbedCoverage(cov ?? null);
+      setEmbedActiveProfile(
+        typeof cov?.active_profile === "string" ? cov.active_profile : null,
       );
       setBackupHealth(
         (parsed as { backup?: { ok?: boolean; freshest_backup_age_seconds?: number } }).backup ?? null,
@@ -1882,6 +2006,9 @@ export default function App() {
       void loadDoctor(false);
       void loadActivity(false);
     }
+    // Harnesses reads capture liveness and the stored recall probe out of the
+    // health report, so it needs the same read Home does.
+    if (tab === "harnesses") void loadDoctor(false);
     if (tab === "revisions") void loadRevisions(false);
     if (tab === "activity") void loadActivity(false);
     if (tab === "owed") {
@@ -1963,6 +2090,13 @@ export default function App() {
     expires_at?: number;
     ipv4?: string;
   } | null>(null);
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("database");
+  // "Index now" and "Restore" both do something a person cannot undo with the
+  // same button, so each goes through a confirm Dialog.
+  const [indexBusy, setIndexBusy] = useState(false);
+  const [indexMsg, setIndexMsg] = useState<string | null>(null);
+  const [indexConfirm, setIndexConfirm] = useState(false);
+  const [importConfirm, setImportConfirm] = useState(false);
   const [hubSnapBusy, setHubSnapBusy] = useState(false);
   const [hubSnapshotHealth, setHubSnapshotHealth] = useState<{
     refreshed_at?: string;
@@ -2398,6 +2532,54 @@ export default function App() {
     }
   }, [importSource, loadPaths]);
 
+  /** "Index now" — `khipu embed backfill`, through its own dedicated Tauri
+   *  command with a FIXED argv. `embed` is deliberately not in the webview's
+   *  subcommand allowlist (it spends money and deletes vectors), so the
+   *  button gets one exact command and no arguments of its own. */
+  const runIndexNow = useCallback(async () => {
+    setIndexBusy(true);
+    setIndexMsg(null);
+    try {
+      const raw = await invoke<string>("khipu_embed_backfill");
+      const parsed = parseJson(raw) as
+        | { embedded?: number; chunks?: number; error?: string }
+        | null;
+      setIndexMsg(
+        parsed && typeof parsed === "object"
+          ? `Indexed ${parsed.embedded ?? 0} item(s), ${parsed.chunks ?? 0} chunk(s).`
+          : prettyJson(raw),
+      );
+      await loadDoctor(true);
+    } catch (e) {
+      setIndexMsg(String(e));
+    } finally {
+      setIndexBusy(false);
+    }
+  }, [loadDoctor]);
+
+  /** What Advanced shows as "raw configuration": only values this app already
+   *  holds, never a fresh read that could disagree with the screen above it. */
+  const settingsRawText = useMemo(
+    () =>
+      JSON.stringify(
+        {
+          app_version: appVersion,
+          data_dir: dataDir,
+          data_files: dataFiles,
+          models,
+          secrets_present: secretsPresence,
+          search_index_profile: embedActiveProfile,
+          capture_cadence: {
+            turns: CAPTURE_MIN_TURNS,
+            minutes: CAPTURE_MIN_MINUTES,
+          },
+        },
+        null,
+        2,
+      ),
+    [appVersion, dataDir, dataFiles, models, secretsPresence, embedActiveProfile],
+  );
+
   const searchResults = useMemo<SearchResult[]>(() => {
     const parsed = parseJson(searchText);
     if (Array.isArray(parsed)) return parsed as SearchResult[];
@@ -2406,6 +2588,16 @@ export default function App() {
       if (Array.isArray(results)) return results as SearchResult[];
     }
     return [];
+  }, [searchText]);
+
+  /** The engine's own per-leg timing, when the payload carries it. The chips
+   *  row still shows the app's round trip; this says which leg spent it. */
+  const searchTiming = useMemo<SearchTiming | null>(() => {
+    const parsed = parseJson(searchText);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const t = (parsed as { timing?: unknown }).timing;
+    if (!t || typeof t !== "object" || Array.isArray(t)) return null;
+    return t as SearchTiming;
   }, [searchText]);
 
   const graphData = useMemo(
@@ -2618,6 +2810,99 @@ export default function App() {
     episodeId == null
       ? []
       : owedOpenRows.filter((c) => c.opened_episode === episodeId);
+
+  /** One Owed table. Same columns for every group and every status; only the
+   *  actions differ (a closed row reopens, an open one closes or snoozes). */
+  const renderOwedTable = (rows: Commitment[]) => (
+    <div className="card">
+      <div className="card-head">
+        <span className="w88">Kind</span>
+        <span className="grow">What you owe</span>
+        <span className="w96">Project</span>
+        <span className="w52">Opened</span>
+        <span className="w44">Due</span>
+        <span className="w50">From</span>
+        <span className="w132" />
+      </div>
+      {rows.map((c) => {
+        // "Seen again" is evidence a later session re-stated the item; it is
+        // shown only when it actually happened (seen_count > 1), and a
+        // pre-migration hub answers 1 for every row.
+        const seen = (c.seen_count ?? 1) > 1 ? ageSince(c.last_seen_at) : null;
+        return (
+          <ListRow key={c.id}>
+            <span className="w88">
+              <Tag kind tone={c.kind === "blocker" ? "warn" : "neutral"}>
+                {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
+              </Tag>
+            </span>
+            <span className="grow ellip" title={c.text}>
+              {c.text}
+            </span>
+            {seen ? (
+              <span className="meta" title={`Restated by ${c.seen_count} captures`}>
+                seen {seen} ago
+              </span>
+            ) : null}
+            <span className="w96">
+              {c.project ? (
+                <Tag title={c.project}>{shortProject(c.project)}</Tag>
+              ) : (
+                <span className="meta">—</span>
+              )}
+            </span>
+            <span className="meta w52">{shortDateLabel(c.opened_at)}</span>
+            <span className="meta w44">{shortDateLabel(c.due_after)}</span>
+            <span className="w50">
+              {c.opened_episode != null ? (
+                <button
+                  type="button"
+                  className="link sm mono"
+                  title="Open the capture that opened this"
+                  onClick={() => openInActivity(c.opened_episode ?? 0)}
+                >
+                  #{c.opened_episode}
+                </button>
+              ) : (
+                <span className="meta mono">—</span>
+              )}
+            </span>
+            <span className="w132 acts-cell">
+              {c.status === "closed" ? (
+                <button
+                  type="button"
+                  className="sm"
+                  disabled={owedBusyId === c.id}
+                  onClick={() => void owedWrite(c.id, [`--reopen=${c.id}`])}
+                >
+                  Reopen
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="sm"
+                    disabled={owedBusyId === c.id}
+                    onClick={() => void owedWrite(c.id, [`--close=${c.id}`])}
+                  >
+                    Done
+                  </button>
+                  <button
+                    type="button"
+                    className="sm"
+                    disabled={owedBusyId === c.id}
+                    onClick={() => setSnoozeTarget(c)}
+                  >
+                    Snooze
+                  </button>
+                </>
+              )}
+            </span>
+          </ListRow>
+        );
+      })}
+    </div>
+  );
 
   const renderOnDemandJobRow = (
     label: string,
@@ -2915,7 +3200,7 @@ export default function App() {
 
               <div className="card col">
                 <div className="card-head">
-                  Owed
+                  Needs you
                   <span className="spacer" />
                   <button
                     type="button"
@@ -2925,13 +3210,13 @@ export default function App() {
                     Open Owed
                   </button>
                 </div>
-                {owedOpenRows.length === 0 ? (
+                {needsYouRows.length === 0 ? (
                   <EmptyState
-                    title="Nothing owed yet"
-                    hint="Follow-ups your sessions leave open will appear here."
+                    title="Nothing needs you"
+                    hint="Questions, blockers and the follow-ups you own appear here."
                   />
                 ) : (
-                  owedOpenRows.slice(0, 4).map((c) => {
+                  needsYouRows.slice(0, 4).map((c) => {
                     const age = ageSince(c.opened_at);
                     return (
                       <ListRow key={c.id}>
@@ -3610,7 +3895,21 @@ export default function App() {
                             <span className="snip">{r.snippet}</span>
                           ) : null}
                           <span className="foot">
-                            {r.id != null ? (
+                            {/* date · project · harness — the mock's footer,
+                                every part straight off the row and simply
+                                absent when the payload has no value for it. */}
+                            {r.ts ? <span>{shortDateLabel(r.ts)}</span> : null}
+                            {r.ts && r.project ? <span>·</span> : null}
+                            {r.project ? (
+                              <span title={r.project}>{shortProject(r.project)}</span>
+                            ) : null}
+                            {(r.ts || r.project) && r.harness ? (
+                              <span>·</span>
+                            ) : null}
+                            {r.harness ? (
+                              <span>{harnessLabel(r.harness)}</span>
+                            ) : null}
+                            {!r.ts && !r.project && !r.harness && r.id != null ? (
                               <span className="mono">
                                 {r.kind === "episode"
                                   ? `#${r.id}`
@@ -3776,7 +4075,30 @@ export default function App() {
               </div>
             </div>
 
-            <RawJson text={searchText} empty="Results appear here." />
+            <Disclosure label="Advanced">
+              {searchTiming ? (
+                <div className="rows">
+                  <div className="rows-head">Where the time went</div>
+                  {Object.entries(TIMING_LABEL)
+                    .filter(([key]) => typeof searchTiming[key as keyof SearchTiming] === "number")
+                    .map(([key, label]) => (
+                      <div key={key} className="row-item">
+                        <span className="row-main">{label}</span>
+                        <span className="row-meta">
+                          {formatMs(searchTiming[key as keyof SearchTiming])}
+                        </span>
+                      </div>
+                    ))}
+                  {searchElapsedMs != null ? (
+                    <div className="row-item">
+                      <span className="row-main">App round trip</span>
+                      <span className="row-meta">{formatMs(searchElapsedMs)}</span>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+              <RawBlock text={searchText} empty="Results appear here." />
+            </Disclosure>
           </>
             ) : (
               <>
@@ -3821,13 +4143,11 @@ export default function App() {
             </div>
 
             {!graphText ? (
-              <div className="empty">
-                <Waypoints size={22} strokeWidth={1.75} aria-hidden />
-                <div className="empty-title">Explore the graph</div>
-                <div className="empty-hint">
-                  Enter a node id and walk its neighbors up to 4 hops out.
-                </div>
-              </div>
+              <EmptyState
+                icon={<Waypoints size={22} strokeWidth={1.75} aria-hidden />}
+                title="Explore the graph"
+                hint="Enter a node id and walk its neighbours up to 4 hops out."
+              />
             ) : null}
 
             {graphData.neighbors.length > 0 ? (
@@ -4129,95 +4449,35 @@ export default function App() {
                         ? "Nothing owed yet"
                         : `Nothing ${owedStatus} here`
                   }
-                  hint="Follow-ups, blockers, questions and promises your sessions leave open appear here."
+                  hint="Questions, blockers, follow-ups and promises your sessions leave open appear here."
                 />
               </div>
+            ) : owedStatus === "open" ? (
+              // Open items are grouped by who owes them: "Needs you" first and
+              // never buried under the agent's own plan steps, which is what
+              // made a 300-row list unusable (phase 4 addendum).
+              OWED_GROUPS.map(([id, title, hint]) => {
+                const rows = visibleOwed.filter((c) => owedGroupOf(c) === id);
+                if (rows.length === 0) return null;
+                return (
+                  <Disclosure
+                    key={id}
+                    className="group"
+                    defaultOpen={id === "needs-you"}
+                    label={
+                      <>
+                        <strong>{title}</strong>
+                        <span className="nav-count quiet">{rows.length}</span>
+                        <span className="meta wrap">{hint}</span>
+                      </>
+                    }
+                  >
+                    {renderOwedTable(rows)}
+                  </Disclosure>
+                );
+              })
             ) : (
-              <div className="card">
-                <div className="card-head">
-                  <span className="w88">Kind</span>
-                  <span className="grow">What you owe</span>
-                  <span className="w96">Project</span>
-                  <span className="w52">Opened</span>
-                  <span className="w44">Due</span>
-                  <span className="w50">From</span>
-                  <span className="w132" />
-                </div>
-                {visibleOwed.map((c) => (
-                  <ListRow key={c.id}>
-                    <span className="w88">
-                      <Tag kind tone={c.kind === "blocker" ? "warn" : "neutral"}>
-                        {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
-                      </Tag>
-                    </span>
-                    <span className="grow ellip" title={c.text}>
-                      {c.text}
-                    </span>
-                    <span className="w96">
-                      {c.project ? (
-                        <Tag title={c.project}>{shortProject(c.project)}</Tag>
-                      ) : (
-                        <span className="meta">—</span>
-                      )}
-                    </span>
-                    <span className="meta w52">
-                      {shortDateLabel(c.opened_at)}
-                    </span>
-                    <span className="meta w44">
-                      {shortDateLabel(c.due_after)}
-                    </span>
-                    <span className="w50">
-                      {c.opened_episode != null ? (
-                        <button
-                          type="button"
-                          className="link sm mono"
-                          title="Open the capture that opened this"
-                          onClick={() => openInActivity(c.opened_episode ?? 0)}
-                        >
-                          #{c.opened_episode}
-                        </button>
-                      ) : (
-                        <span className="meta mono">—</span>
-                      )}
-                    </span>
-                    <span className="w132 acts-cell">
-                      {c.status === "closed" ? (
-                        <button
-                          type="button"
-                          className="sm"
-                          disabled={owedBusyId === c.id}
-                          onClick={() =>
-                            void owedWrite(c.id, [`--reopen=${c.id}`])
-                          }
-                        >
-                          Reopen
-                        </button>
-                      ) : (
-                        <>
-                          <button
-                            type="button"
-                            className="sm"
-                            disabled={owedBusyId === c.id}
-                            onClick={() =>
-                              void owedWrite(c.id, [`--close=${c.id}`])
-                            }
-                          >
-                            Done
-                          </button>
-                          <button
-                            type="button"
-                            className="sm"
-                            disabled={owedBusyId === c.id}
-                            onClick={() => setSnoozeTarget(c)}
-                          >
-                            Snooze
-                          </button>
-                        </>
-                      )}
-                    </span>
-                  </ListRow>
-                ))}
-              </div>
+              renderOwedTable(visibleOwed)
             )}
 
             {closedToday.length > 0 ? (
@@ -4270,12 +4530,19 @@ export default function App() {
         <section className={panelClass("harnesses")}>
           <PanelHeader
             title="Harnesses"
-            lede="Install Khipu into each harness on this Mac and verify it actually works. One native pack per harness; nothing shared, nothing forced."
+            lede="Which agents are wired in, and whether each one is actually recording."
           />
           <IntegrationsPanel
             runKhipu={runKhipu}
             onToast={(m) => setError(m)}
             active={tab === "harnesses"}
+            liveness={liveness}
+            recallProbe={recallProbe}
+            refreshHealth={() => void loadDoctor(true)}
+            onAnotherMac={() => {
+              setSettingsSection("another-mac");
+              setTab("settings");
+            }}
           />
         </section>
 
@@ -4283,549 +4550,697 @@ export default function App() {
           <PanelHeader
             title="Settings"
             lede="Capture, models, data and this Mac."
-          >
-            <button type="button" onClick={() => setTab("first-run")}>
-              Run setup again
-            </button>
-            <button type="button" onClick={() => void loadPaths()}>
-              <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
-              Refresh paths
-            </button>
-          </PanelHeader>
-          <div className="panel-body">
-            <div className="section-card">
-              <div className="section-head">Updates</div>
-              <div className="section-body">
-                <p className="muted">
-                  Installed version <code>v{appVersion}</code>. Launch checks
-                  GitHub Releases (fail-soft, no auto-install); use this
-                  button to download and install. Each build is signed, and the
-                  signature is verified before anything is replaced.
-                </p>
-                <div className="toolbar">
+          />
+          <div className="panel-body wide settings-body">
+            <div className="settings-split">
+              <div className="subnav" role="tablist" aria-label="Settings sections">
+                {SETTINGS_SECTIONS.map(([id, label]) => (
                   <button
+                    key={id}
                     type="button"
-                    className="primary"
-                    disabled={updateBusy}
-                    onClick={() => void checkForUpdates()}
+                    role="tab"
+                    aria-selected={settingsSection === id}
+                    className={settingsSection === id ? "on" : undefined}
+                    onClick={() => setSettingsSection(id)}
                   >
-                    {updateBusy ? (
-                      <Loader2 size={14} className="spin" aria-hidden />
-                    ) : null}
-                    {updateBusy ? "Checking…" : "Check for updates"}
+                    {label}
                   </button>
-                </div>
-                {updateMsg ? <pre className="code">{updateMsg}</pre> : null}
+                ))}
               </div>
-            </div>
 
-            <div className="section-card">
-              <div className="section-head">Set up another Mac</div>
-              <div className="section-body">
-                <p className="muted">
-                  Do this on the Mac that <strong>already works</strong>. Save a join kit
-                  and AirDrop it to the new Mac — that file is enough. Passphrase is
-                  optional (only if you want the file locked).
-                </p>
-                <ol className="welcome-list muted">
-                  <li>
-                    Click <strong>Save join kit…</strong>, then AirDrop the{" "}
-                    <code>.khipujoin</code> file. On the new Mac: Welcome → Join existing
-                    Khipu → Import join kit file.
-                  </li>
-                  <li>
-                    Optional: <strong>Advertise nearby (PIN)</strong> on the same Wi‑Fi.
-                  </li>
-                </ol>
-                <ul className="welcome-list muted">
-                  <li>The Postgres hub must already be reachable from the new Mac (Tailscale / VPN / shared server).</li>
-                  <li>Same repo cloned at two paths on one Mac = duplicate graph nodes in v1.</li>
-                </ul>
-                <div className="toolbar" style={{ width: "100%" }}>
-                  <input
-                    className="mono"
-                    type="password"
-                    autoComplete="off"
-                    spellCheck={false}
-                    value={setupJoinPassphrase}
-                    onChange={(e) => setSetupJoinPassphrase(e.target.value)}
-                    placeholder="Optional passphrase (leave blank for an unlocked file)"
-                    aria-label="Optional join export passphrase"
-                  />
-                </div>
-                <div className="toolbar">
-                  <button
-                    type="button"
-                    className="primary"
-                    onClick={() => void exportJoinKit()}
-                  >
-                    Save join kit…
-                  </button>
-                  <button
-                    type="button"
-                    disabled={advertiseBusy}
-                    onClick={() => void startJoinAdvertise()}
-                  >
-                    {advertiseBusy ? "Advertising…" : "Advertise nearby (PIN)"}
-                  </button>
-                </div>
-                {setupJoinExpected ? (
-                  <p className="muted mono">
-                    Expected hub counts — episodes {setupJoinExpected.episodes ?? "?"},
-                    topics {setupJoinExpected.topics ?? "?"}, nodes{" "}
-                    {setupJoinExpected.nodes ?? "?"}
-                  </p>
-                ) : null}
-                {advertiseInfo?.pin ? (
-                  <p className="muted">
-                    PIN for the new Mac: <strong className="mono">{advertiseInfo.pin}</strong>
-                    {advertiseInfo.timeout_sec
-                      ? ` · keep this open (~${Math.round(advertiseInfo.timeout_sec / 60)} min)`
-                      : null}
-                    {advertiseInfo.ipv4 ? ` · LAN ${advertiseInfo.ipv4}` : null}
-                  </p>
-                ) : null}
-                {hubSnapshotHealth?.refreshed_at ? (
-                  <p className="muted">
-                    Hub snapshot refreshed{" "}
-                    <code>{hubSnapshotHealth.refreshed_at}</code>
-                    {typeof (hubSnapshotHealth.size_bytes ?? hubSnapshotHealth.bytes) === "number"
-                      ? ` (${formatBytes(hubSnapshotHealth.size_bytes ?? hubSnapshotHealth.bytes ?? 0)})`
-                      : null}
-                  </p>
-                ) : null}
-                {setupJoinMsg ? <pre className="code">{setupJoinMsg}</pre> : null}
-              </div>
-            </div>
-
-            <div className="section-card">
-              <div className="section-head">Local data folder</div>
-              <div className="section-body">
-                <div className="toolbar">
-                  <input
-                    className="mono"
-                    value={dataDir}
-                    onChange={(e) => setDataDir(e.target.value)}
-                    placeholder="~/.config/khipu"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void applyDataDir();
-                    }}
-                  />
-                  <button
-                    type="button"
-                    className="primary"
-                    onClick={() => void applyDataDir()}
-                  >
-                    Set folder
-                  </button>
-                </div>
-                {dataFiles.length > 0 ? (
-                  <div className="rows">
-                    {dataFiles.map((f) => (
-                      <div key={f.path} className="row-item">
-                        <span className="row-main mono">{f.path}</span>
-                        <span className="row-meta">
-                          {formatBytes(f.bytes)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="muted">
-                    No local files in the data folder yet.
-                  </p>
-                )}
-              </div>
-            </div>
-
-            <div className="section-card">
-              <div className="section-head">Backup now</div>
-              <div className="section-body">
-                <p className="muted">
-                  Writes a zip of the Mac data folder (DSN file, certs, etc.).
-                  Paste a destination path or a Downloads directory.
-                </p>
-                <div className="toolbar">
-                  <input
-                    className="mono"
-                    value={backupOut}
-                    onChange={(e) => setBackupOut(e.target.value)}
-                    placeholder="~/Downloads"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void doBackupLocal();
-                    }}
-                  />
-                  <button
-                    type="button"
-                    className="primary"
-                    onClick={() => void doBackupLocal()}
-                  >
-                    Backup
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className="section-card">
-              <div className="section-head">Import</div>
-              <div className="section-body">
-                <p className="muted">
-                  Restore from a previous zip or folder into the current data
-                  directory (merge by default).
-                </p>
-                <div className="toolbar">
-                  <input
-                    className="mono"
-                    value={importSource}
-                    onChange={(e) => setImportSource(e.target.value)}
-                    placeholder="~/Downloads/khipu-local-….zip"
-                    // Deliberately no Enter-to-submit, unlike every other input
-                    // here: this one writes over the current data folder, and a
-                    // stray Return while typing a path should not start a
-                    // restore. The button is the only way in.
-                  />
-                  <button type="button" onClick={() => void doImportLocal()}>
-                    Import
-                  </button>
-                </div>
-                {pathsMsg ? <pre className="code">{pathsMsg}</pre> : null}
-              </div>
-            </div>
-
-            <div className="section-card">
-              <div className="section-head">Graph sources</div>
-              <div className="section-body">
-                <p className="muted">
-                  Choose which local folders feed the knowledge graph on the next
-                  build. Takes effect on the next graph build (Status → Graph
-                  build, or tonight&apos;s 02:17). Unchecking does not purge
-                  Postgres — it only skips collectors on the next sqlite rebuild.
-                  &quot;Embed images&quot; opts a rooted source into native Gemini
-                  Embedding 2 PNG/JPEG ingest (default off; CLI{" "}
-                  <code>khipu embed-media-backfill</code>).
-                </p>
-                {!graphSourcesProducer ? (
-                  <p className="muted">
-                    This Mac is not the graph producer, so sources are
-                    read-only here. Make it the producer with{" "}
-                    <code>khipu jobs install graph_build</code> (or set{" "}
-                    <code>KHIPU_GRAPH_PRODUCER=1</code>).
-                  </p>
-                ) : null}
-                <div className="rows">
-                  {graphSources.map((row) => {
-                    const unreachable = (graphSourcesResolved?.unreachable ?? [])
-                      .some((u) => u.id === row.id);
-                    const status = !row.enabled
-                      ? "membership-off"
-                      : unreachable
-                        ? "path-unreachable"
-                        : "ok";
-                    const userCode =
-                      row.kind === "code_ast" && row.id !== "code:claude";
-                    const hasRoot = Boolean(row.root);
-                    return (
-                      <div key={row.id} className="row-item">
-                        <label className="row-main">
-                          <input
-                            type="checkbox"
-                            checked={Boolean(row.enabled)}
-                            disabled={!graphSourcesProducer}
-                            onChange={(e) =>
-                              void toggleGraphSource(row.id, e.target.checked)
-                            }
-                          />
-                          <span className="mono">{row.id}</span>
-                          {row.root ? (
-                            <span className="muted mono"> {row.root}</span>
-                          ) : null}
-                        </label>
-                        {hasRoot ? (
-                          <label className="row-meta" title="Native PNG/JPEG into active Gemini Embedding 2 profile">
-                            <input
-                              type="checkbox"
-                              checked={Boolean(row.embed_media)}
-                              disabled={!graphSourcesProducer}
-                              onChange={(e) =>
-                                void toggleEmbedMedia(row.id, e.target.checked)
-                              }
-                            />{" "}
-                            Embed images
-                          </label>
-                        ) : (
-                          <span className="row-meta muted">no root</span>
-                        )}
-                        <span className="row-meta">{status}</span>
-                        {graphSourcesProducer && userCode ? (
-                          <button
-                            type="button"
-                            onClick={() => void removeGraphSource(row.id)}
-                          >
-                            Remove
-                          </button>
+              <div className="settings-pane">
+                {settingsSection === "database" ? (
+                  <>
+                    <div className="section-card">
+                      <div className="section-head">Connection</div>
+                      <div className="section-body">
+                        <div className="inline">
+                          <Tag tone={dsnOk === false ? "err" : dsnOk ? "ok" : "neutral"} dot>
+                            {dsnOk === false
+                              ? "Not reachable"
+                              : dsnOk
+                                ? "Connected"
+                                : "Checking…"}
+                          </Tag>
+                          <span className="meta">
+                            Stored in the login Keychain (service{" "}
+                            <code>Khipu</code>), never in a file in the repo.
+                          </span>
+                        </div>
+                        <p className="muted">
+                          Currently stored: database connection{" "}
+                          <strong>
+                            {presenceLabel(secretsPresence, "dsn_in_keychain")}
+                          </strong>
+                          . Harnesses that cannot reach the Keychain read the copy
+                          in the data folder instead.
+                        </p>
+                        <p className="muted">
+                          <strong>Encryption:</strong> prefer{" "}
+                          <code>sslmode=verify-full</code> with{" "}
+                          <code>root.crt</code> in the data folder.
+                        </p>
+                        {secretsPresenceMsg ? (
+                          <p className="muted">{secretsPresenceMsg}</p>
                         ) : null}
-                      </div>
-                    );
-                  })}
-                </div>
-                {graphSourcesProducer ? (
-                  <div className="toolbar">
-                    <input
-                      className="mono"
-                      value={newCodeRoot}
-                      onChange={(e) => setNewCodeRoot(e.target.value)}
-                      placeholder="/absolute/path/to/code"
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") void addGraphCodeRoot();
-                      }}
-                    />
-                    <button type="button" onClick={() => void addGraphCodeRoot()}>
-                      Add code root
-                    </button>
-                    <button type="button" onClick={() => void pickGraphCodeRoot()}>
-                      Choose folder…
-                    </button>
-                  </div>
-                ) : null}
-                {graphSourcesMsg ? (
-                  <pre className="code">{graphSourcesMsg}</pre>
-                ) : null}
-              </div>
-            </div>
-
-            <div className="section-card">
-              <div className="section-head">Models</div>
-              <div className="section-body">
-                <p className="muted">
-                  Capture extract follows this card (Gemini cloud or a local
-                  OpenAI-compatible endpoint). Nightly consolidate is mechanical;
-                  monthly topic classify is DeepSeek v4-pro via{" "}
-                  <code>conversation-memory-monthly.py</code> and is{" "}
-                  <strong>not</strong> switched here.
-                </p>
-                {models.models_error ? (
-                  <p className="muted">
-                    Stored models config had a problem (showing defaults):{" "}
-                    <code>{models.models_error}</code>. Save is blocked until
-                    the stored models key is fixed or cleared.
-                  </p>
-                ) : null}
-
-                {(
-                  [
-                    ["synth", "Synth (capture extract)"],
-                    ["embed", "Embed (persist only)"],
-                    ["vision", "Vision"],
-                  ] as const
-                ).map(([role, label]) => {
-                  const row = models[role];
-                  const visionOff = role === "vision" && row.provider === "off";
-                  const providerOptions =
-                    role === "vision"
-                      ? (["cloud", "local", "off"] as const)
-                      : (["cloud", "local"] as const);
-                  return (
-                    <div key={role} className="rows" style={{ marginBottom: 12 }}>
-                      <div className="rows-head">{label}</div>
-                      <div className="toolbar">
-                        <label className="muted" htmlFor={`models-${role}-provider`}>
-                          Provider
-                        </label>
-                        <select
-                          id={`models-${role}-provider`}
-                          value={row.provider}
-                          onChange={(e) =>
-                            updateModelRole(role, { provider: e.target.value })
-                          }
-                        >
-                          {providerOptions.map((p) => (
-                            <option key={p} value={p}>
-                              {p}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="toolbar">
-                        <input
-                          className="mono"
-                          disabled={visionOff || row.provider === "cloud"}
-                          value={row.endpoint}
-                          onChange={(e) =>
-                            updateModelRole(role, { endpoint: e.target.value })
-                          }
-                          placeholder={
-                            visionOff
-                              ? "n/a when off"
-                              : "http://127.0.0.1:11434"
-                          }
-                        />
-                        <input
-                          className="mono"
-                          disabled={visionOff}
-                          value={row.model_id}
-                          onChange={(e) =>
-                            updateModelRole(role, { model_id: e.target.value })
-                          }
-                          placeholder={
-                            role === "embed"
-                              ? "runtime = active Gemini embed profile"
-                              : visionOff
-                                ? "n/a when off"
-                                : "model id"
-                          }
-                        />
+                        <div className="toolbar">
+                          <button type="button" onClick={() => void refreshDsn(true)}>
+                            <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
+                            Recheck connection
+                          </button>
+                          <button type="button" onClick={() => setTab("first-run")}>
+                            Change the connection
+                          </button>
+                        </div>
                       </div>
                     </div>
-                  );
-                })}
-
-                <p className="muted">
-                  Embed: saved; search still uses the{" "}
-                  <strong>active Gemini embed profile</strong> until the profiles
-                  cut. Vision: off — no ingest this version.
-                </p>
-
-                <label className="muted" htmlFor="openai-compat-key">
-                  Optional local OpenAI-compat bearer (Ollama can leave blank).
-                  Presence is shown under Secrets.
-                </label>
-                <div className="toolbar">
-                  <input
-                    id="openai-compat-key"
-                    className="mono"
-                    type="password"
-                    autoComplete="off"
-                    spellCheck={false}
-                    value={openaiCompatKey}
-                    onChange={(e) => setOpenaiCompatKey(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void saveOpenaiCompatKey();
-                    }}
-                    placeholder="sk-… (optional)"
-                  />
-                  <button
-                    type="button"
-                    disabled={openaiCompatSaving || !openaiCompatKey.trim()}
-                    onClick={() => void saveOpenaiCompatKey()}
-                  >
-                    {openaiCompatSaving ? "Saving…" : "Save local key"}
-                  </button>
-                </div>
-                {openaiCompatMsg ? (
-                  <pre className="code">{openaiCompatMsg}</pre>
+                    <Callout title="Changing this is a setup step">
+                      The connection is set during setup, so it is checked and
+                      migrated in one pass rather than saved half-applied.
+                    </Callout>
+                  </>
                 ) : null}
 
-                <div className="toolbar">
-                  <button
-                    type="button"
-                    className="primary"
-                    disabled={modelsSaving || models.models_error != null}
-                    onClick={() => void saveModels()}
-                  >
-                    {modelsSaving ? "Saving…" : "Save models"}
-                  </button>
-                </div>
-                {modelsMsg ? <pre className="code">{modelsMsg}</pre> : null}
-              </div>
-            </div>
+                {settingsSection === "capture" ? (
+                  <>
+                    <div className="section-card">
+                      <div className="section-head">Capture</div>
+                      <div className="section-body">
+                        <div className="rows">
+                          <div className="row-item">
+                            <span className="row-main">Capture a session after</span>
+                            <span className="row-meta">
+                              {CAPTURE_MIN_TURNS} turns, or {CAPTURE_MIN_MINUTES} minutes
+                            </span>
+                          </div>
+                        </div>
+                        <p className="muted">
+                          Always captures before a compaction and when a session
+                          ends. This cadence is the engine's own, the same on every
+                          harness; it is not editable from here.
+                        </p>
+                      </div>
+                    </div>
 
-            <div className="section-card">
-              <div className="section-head">Secrets</div>
-              <div className="section-body">
-                <p className="muted">
-                  Keychain service <code>Khipu</code> (
-                  <code>database_url</code>, <code>gemini_api_key</code>,{" "}
-                  <code>openai_compat_api_key</code>).{" "}
-                  <code>khipu secrets</code> shows presence only.
-                </p>
-                <p className="muted">
-                  <strong>TLS:</strong> prefer <code>sslmode=verify-full</code>{" "}
-                  + <code>root.crt</code> in the data folder.
-                </p>
+                    <div className="section-card">
+                      <div className="section-head">Models</div>
+                      <div className="section-body">
+                        <p className="muted">
+                          Session summaries follow this card (Gemini cloud or a
+                          local OpenAI-compatible endpoint). The monthly topic
+                          pass runs its own model and is not switched here.
+                        </p>
+                        {models.models_error ? (
+                          <Callout tone="err" title="The stored models setting could not be read">
+                            {models.models_error}. Showing defaults; saving is
+                            blocked until it is fixed or cleared.
+                          </Callout>
+                        ) : null}
 
-                <label className="muted" htmlFor="gemini-key">
-                  Gemini API key — used for session summaries and embeddings.
-                  Stored in the login Keychain; never written to the repo or a
-                  config file.
-                </label>
-                <div className="toolbar">
-                  <input
-                    id="gemini-key"
-                    className="mono"
-                    type="password"
-                    autoComplete="off"
-                    spellCheck={false}
-                    value={geminiKey}
-                    onChange={(e) => setGeminiKey(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void saveGeminiKey();
-                    }}
-                    placeholder={
-                      secretsPresence?.gemini_in_keychain
-                        ? "A key is stored — type a new one to replace it"
-                        : "AIza…"
-                    }
-                  />
-                  <button
-                    type="button"
-                    disabled={geminiSaving || !geminiKey.trim()}
-                    onClick={() => void saveGeminiKey()}
-                  >
-                    {geminiSaving ? "Saving…" : "Save key"}
-                  </button>
-                </div>
-                {geminiMsg ? <pre className="code">{geminiMsg}</pre> : null}
-                <p className="muted">
-                  Currently stored: Gemini{" "}
-                  <strong>
-                    {presenceLabel(secretsPresence, "gemini_in_keychain")}
-                  </strong>
-                  ; OpenAI-compat{" "}
-                  <strong>
-                    {presenceLabel(
-                      secretsPresence,
-                      "openai_compat_in_keychain",
-                    )}
-                  </strong>
-                  . An environment variable <code>GEMINI_API_KEY</code> takes
-                  precedence over the Gemini Keychain item, if one is set.
-                </p>
-                {secretsPresenceMsg ? (
-                  <p className="muted">{secretsPresenceMsg}</p>
+                        {(
+                          [
+                            ["synth", "Session summaries"],
+                            ["embed", "Search index"],
+                          ] as const
+                        ).map(([role, label]) => {
+                          const row = models[role];
+                          return (
+                            <div key={role} className="rows" style={{ marginBottom: 12 }}>
+                              <div className="rows-head">{label}</div>
+                              <div className="toolbar">
+                                <label className="muted" htmlFor={`models-${role}-provider`}>
+                                  Provider
+                                </label>
+                                <select
+                                  id={`models-${role}-provider`}
+                                  value={row.provider}
+                                  onChange={(e) =>
+                                    updateModelRole(role, { provider: e.target.value })
+                                  }
+                                >
+                                  {(["cloud", "local"] as const).map((provider) => (
+                                    <option key={provider} value={provider}>
+                                      {provider}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                              <div className="toolbar">
+                                <input
+                                  className="mono"
+                                  disabled={row.provider === "cloud"}
+                                  value={row.endpoint}
+                                  onChange={(e) =>
+                                    updateModelRole(role, { endpoint: e.target.value })
+                                  }
+                                  placeholder="http://127.0.0.1:11434"
+                                />
+                                <input
+                                  className="mono"
+                                  value={row.model_id}
+                                  onChange={(e) =>
+                                    updateModelRole(role, { model_id: e.target.value })
+                                  }
+                                  placeholder={
+                                    role === "embed"
+                                      ? "search uses the active index profile"
+                                      : "model id"
+                                  }
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+
+                        <p className="muted">
+                          The search-index model is saved here, but search still
+                          reads the active index profile — the one named under
+                          Search index — until a profile switch is supported.
+                        </p>
+
+                        <div className="toolbar">
+                          <button
+                            type="button"
+                            className="primary"
+                            disabled={modelsSaving || models.models_error != null}
+                            onClick={() => void saveModels()}
+                          >
+                            {modelsSaving ? "Saving…" : "Save models"}
+                          </button>
+                        </div>
+                        {modelsMsg ? <pre className="code">{modelsMsg}</pre> : null}
+                      </div>
+                    </div>
+
+                    <div className="section-card">
+                      <div className="section-head">Keys</div>
+                      <div className="section-body">
+                        <label className="muted" htmlFor="gemini-key">
+                          Gemini API key — session summaries and the search index.
+                          Stored in the login Keychain; never written to the repo
+                          or a config file.
+                        </label>
+                        <div className="toolbar">
+                          <input
+                            id="gemini-key"
+                            className="mono"
+                            type="password"
+                            autoComplete="off"
+                            spellCheck={false}
+                            value={geminiKey}
+                            onChange={(e) => setGeminiKey(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") void saveGeminiKey();
+                            }}
+                            placeholder={
+                              secretsPresence?.gemini_in_keychain
+                                ? "A key is stored — type a new one to replace it"
+                                : "AIza…"
+                            }
+                          />
+                          <button
+                            type="button"
+                            disabled={geminiSaving || !geminiKey.trim()}
+                            onClick={() => void saveGeminiKey()}
+                          >
+                            {geminiSaving ? "Saving…" : "Save key"}
+                          </button>
+                        </div>
+                        {geminiMsg ? <pre className="code">{geminiMsg}</pre> : null}
+
+                        <label className="muted" htmlFor="openai-compat-key">
+                          Optional key for a local OpenAI-compatible endpoint
+                          (Ollama can leave this blank).
+                        </label>
+                        <div className="toolbar">
+                          <input
+                            id="openai-compat-key"
+                            className="mono"
+                            type="password"
+                            autoComplete="off"
+                            spellCheck={false}
+                            value={openaiCompatKey}
+                            onChange={(e) => setOpenaiCompatKey(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") void saveOpenaiCompatKey();
+                            }}
+                            placeholder="sk-… (optional)"
+                          />
+                          <button
+                            type="button"
+                            disabled={openaiCompatSaving || !openaiCompatKey.trim()}
+                            onClick={() => void saveOpenaiCompatKey()}
+                          >
+                            {openaiCompatSaving ? "Saving…" : "Save local key"}
+                          </button>
+                        </div>
+                        {openaiCompatMsg ? (
+                          <pre className="code">{openaiCompatMsg}</pre>
+                        ) : null}
+                        <p className="muted">
+                          Currently stored: Gemini{" "}
+                          <strong>
+                            {presenceLabel(secretsPresence, "gemini_in_keychain")}
+                          </strong>
+                          ; local endpoint{" "}
+                          <strong>
+                            {presenceLabel(secretsPresence, "openai_compat_in_keychain")}
+                          </strong>
+                          . An environment variable <code>GEMINI_API_KEY</code>{" "}
+                          takes precedence over the stored Gemini key.
+                        </p>
+                      </div>
+                    </div>
+                  </>
                 ) : null}
 
-                <div className="toolbar">
-                  <button type="button" onClick={() => void refreshDsn(true)}>
-                    Recheck DSN
-                  </button>
-                </div>
-              </div>
-            </div>
+                {settingsSection === "index" ? (
+                  <>
+                    <div className="section-card">
+                      <div className="section-head">
+                        Search index
+                        <span className="spacer" />
+                        {embedActiveProfile ? (
+                          <Tag tone="accent">{embedActiveProfile}</Tag>
+                        ) : null}
+                      </div>
+                      <div className="section-body">
+                        <p className="muted">
+                          Search by meaning reads this index. It is rebuilt every
+                          night; anything not indexed yet is still findable by its
+                          exact words.
+                        </p>
+                        {embedCoverage ? (
+                          <div className="rows">
+                            {EMBED_KINDS.map(([key, label]) => {
+                              const row = embedCoverage[key];
+                              if (!row || typeof row.total !== "number") return null;
+                              return (
+                                <div key={key} className="row-item">
+                                  <span className="row-main">{label}</span>
+                                  <span className="row-meta">
+                                    {row.embedded ?? 0} of {row.total} indexed
+                                    {row.missing ? ` · ${row.missing} waiting` : ""}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <p className="muted">
+                            Coverage comes from the health report — open Home once
+                            to fill it in.
+                          </p>
+                        )}
+                        <div className="toolbar">
+                          <button
+                            type="button"
+                            className="primary"
+                            disabled={indexBusy}
+                            onClick={() => setIndexConfirm(true)}
+                          >
+                            {indexBusy ? (
+                              <Loader2 size={14} className="spin" aria-hidden />
+                            ) : null}
+                            Index now
+                          </button>
+                          <span className="meta">
+                            Indexes everything that is missing or changed, using
+                            the Gemini key above.
+                          </span>
+                        </div>
+                        {indexMsg ? <pre className="code">{indexMsg}</pre> : null}
+                      </div>
+                    </div>
+                  </>
+                ) : null}
 
-            <div className="section-card">
-              <div className="section-head">Help &amp; support</div>
-              <div className="section-body">
-                <p className="muted">
-                  Stuck? Run setup again from the button at the top of this
-                  screen, open the health report on <strong>Home</strong>, or
-                  email <a href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</a>.
-                  Include the health report if it is red — it never contains
-                  secrets.
-                </p>
-              </div>
-            </div>
+                {settingsSection === "data" ? (
+                  <>
+                    <div className="section-card">
+                      <div className="section-head">Data folder</div>
+                      <div className="section-body">
+                        <div className="toolbar">
+                          <input
+                            className="mono"
+                            value={dataDir}
+                            onChange={(e) => setDataDir(e.target.value)}
+                            placeholder="~/.config/khipu"
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") void applyDataDir();
+                            }}
+                          />
+                          <button
+                            type="button"
+                            className="primary"
+                            onClick={() => void applyDataDir()}
+                          >
+                            Set folder
+                          </button>
+                          <button type="button" onClick={() => void loadPaths()}>
+                            <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
+                            Refresh
+                          </button>
+                        </div>
+                        {dataFiles.length > 0 ? (
+                          <div className="rows">
+                            {dataFiles.map((f) => (
+                              <div key={f.path} className="row-item">
+                                <span className="row-main mono">{f.path}</span>
+                                <span className="row-meta">{formatBytes(f.bytes)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="muted">No local files in the data folder yet.</p>
+                        )}
+                      </div>
+                    </div>
 
-            {/* Components used to be its own destination; it is maintenance,
-                and belongs with the rest of what this Mac runs (audit IA). */}
-            <div className="section-card">
-              <div className="section-head">Components</div>
-              <div className="section-body">
-                <p className="muted">
-                  Postgres and the graph builder upgrade independently of the
-                  app. Versions come from Application Support and the
-                  compatibility matrix.
-                </p>
-                <ComponentsPanel active={tab === "settings"} />
+                    <div className="section-card">
+                      <div className="section-head">Backup</div>
+                      <div className="section-body">
+                        <p className="muted">
+                          Writes a zip of this Mac's data folder (connection file,
+                          certificates, local state). Paste a destination folder.
+                        </p>
+                        <div className="toolbar">
+                          <input
+                            className="mono"
+                            value={backupOut}
+                            onChange={(e) => setBackupOut(e.target.value)}
+                            placeholder="~/Downloads"
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") void doBackupLocal();
+                            }}
+                          />
+                          <button
+                            type="button"
+                            className="primary"
+                            onClick={() => void doBackupLocal()}
+                          >
+                            Backup
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="section-card">
+                      <div className="section-head">Restore</div>
+                      <div className="section-body">
+                        <p className="muted">
+                          Restores a previous zip or folder into the current data
+                          folder, merging with what is there.
+                        </p>
+                        <div className="toolbar">
+                          <input
+                            className="mono"
+                            value={importSource}
+                            onChange={(e) => setImportSource(e.target.value)}
+                            placeholder="~/Downloads/khipu-local-….zip"
+                            // Deliberately no Enter-to-submit, unlike every other
+                            // input here: this one writes over the current data
+                            // folder, and a stray Return while typing a path
+                            // should not start a restore.
+                          />
+                          <button
+                            type="button"
+                            disabled={!importSource.trim()}
+                            onClick={() => setImportConfirm(true)}
+                          >
+                            Restore…
+                          </button>
+                        </div>
+                        {pathsMsg ? <pre className="code">{pathsMsg}</pre> : null}
+                      </div>
+                    </div>
+                  </>
+                ) : null}
+
+                {settingsSection === "another-mac" ? (
+                  <div className="section-card">
+                    <div className="section-head">Set up another Mac</div>
+                    <div className="section-body">
+                      <p className="muted">
+                        Do this on the Mac that <strong>already works</strong>. Save
+                        a join kit and AirDrop it to the new Mac — that file is
+                        enough. The passphrase is optional (only if you want the
+                        file locked).
+                      </p>
+                      <ol className="welcome-list muted">
+                        <li>
+                          Click <strong>Save join kit…</strong>, then AirDrop the{" "}
+                          <code>.khipujoin</code> file. On the new Mac: Welcome →
+                          Join existing Khipu → Import join kit file.
+                        </li>
+                        <li>
+                          Optional: <strong>Advertise nearby (PIN)</strong> on the
+                          same Wi‑Fi.
+                        </li>
+                      </ol>
+                      <ul className="welcome-list muted">
+                        <li>
+                          The database must already be reachable from the new Mac
+                          (Tailscale, VPN or a shared server).
+                        </li>
+                        <li>
+                          The same repo cloned at two paths on one Mac makes
+                          duplicate entries in the graph.
+                        </li>
+                      </ul>
+                      <div className="toolbar" style={{ width: "100%" }}>
+                        <input
+                          className="mono"
+                          type="password"
+                          autoComplete="off"
+                          spellCheck={false}
+                          value={setupJoinPassphrase}
+                          onChange={(e) => setSetupJoinPassphrase(e.target.value)}
+                          placeholder="Optional passphrase (leave blank for an unlocked file)"
+                          aria-label="Optional join export passphrase"
+                        />
+                      </div>
+                      <div className="toolbar">
+                        <button
+                          type="button"
+                          className="primary"
+                          onClick={() => void exportJoinKit()}
+                        >
+                          Save join kit…
+                        </button>
+                        <button
+                          type="button"
+                          disabled={advertiseBusy}
+                          onClick={() => void startJoinAdvertise()}
+                        >
+                          {advertiseBusy ? "Advertising…" : "Advertise nearby (PIN)"}
+                        </button>
+                      </div>
+                      {setupJoinExpected ? (
+                        <p className="muted mono">
+                          Expected counts — episodes {setupJoinExpected.episodes ?? "?"},
+                          topics {setupJoinExpected.topics ?? "?"}, nodes{" "}
+                          {setupJoinExpected.nodes ?? "?"}
+                        </p>
+                      ) : null}
+                      {advertiseInfo?.pin ? (
+                        <p className="muted">
+                          PIN for the new Mac:{" "}
+                          <strong className="mono">{advertiseInfo.pin}</strong>
+                          {advertiseInfo.timeout_sec
+                            ? ` · keep this open (~${Math.round(advertiseInfo.timeout_sec / 60)} min)`
+                            : null}
+                          {advertiseInfo.ipv4 ? ` · LAN ${advertiseInfo.ipv4}` : null}
+                        </p>
+                      ) : null}
+                      {hubSnapshotHealth?.refreshed_at ? (
+                        <p className="muted">
+                          Offline copy refreshed{" "}
+                          <code>{hubSnapshotHealth.refreshed_at}</code>
+                          {typeof (hubSnapshotHealth.size_bytes ?? hubSnapshotHealth.bytes) === "number"
+                            ? ` (${formatBytes(hubSnapshotHealth.size_bytes ?? hubSnapshotHealth.bytes ?? 0)})`
+                            : null}
+                        </p>
+                      ) : null}
+                      {setupJoinMsg ? <pre className="code">{setupJoinMsg}</pre> : null}
+                    </div>
+                  </div>
+                ) : null}
+
+                {settingsSection === "components" ? (
+                  <>
+                    <div className="section-card">
+                      <div className="section-head">Components</div>
+                      <div className="section-body">
+                        <p className="muted">
+                          The database and the graph builder upgrade
+                          independently of the app. Versions come from
+                          Application Support and the compatibility matrix.
+                        </p>
+                        <ComponentsPanel active={tab === "settings"} />
+                      </div>
+                    </div>
+
+                    <div className="section-card">
+                      <div className="section-head">What feeds the graph</div>
+                      <div className="section-body">
+                        <p className="muted">
+                          Which local folders the graph builder reads on its next
+                          run. Turning one off skips it next time; nothing already
+                          in the database is deleted. &quot;Embed images&quot;
+                          includes PNG and JPEG files from a folder in the search
+                          index.
+                        </p>
+                        {!graphSourcesProducer ? (
+                          <p className="muted">
+                            This Mac does not build the graph, so these are
+                            read-only here.
+                          </p>
+                        ) : null}
+                        <div className="rows">
+                          {graphSources.map((row) => {
+                            const unreachable = (graphSourcesResolved?.unreachable ?? [])
+                              .some((u) => u.id === row.id);
+                            const status = !row.enabled
+                              ? "Turned off"
+                              : unreachable
+                                ? "Folder not found"
+                                : "On";
+                            const userCode =
+                              row.kind === "code_ast" && row.id !== "code:claude";
+                            const hasRoot = Boolean(row.root);
+                            return (
+                              <div key={row.id} className="row-item">
+                                <label className="row-main">
+                                  <input
+                                    type="checkbox"
+                                    checked={Boolean(row.enabled)}
+                                    disabled={!graphSourcesProducer}
+                                    onChange={(e) =>
+                                      void toggleGraphSource(row.id, e.target.checked)
+                                    }
+                                  />
+                                  <span className="mono">{row.id}</span>
+                                  {row.root ? (
+                                    <span className="muted mono"> {row.root}</span>
+                                  ) : null}
+                                </label>
+                                {hasRoot ? (
+                                  <label className="row-meta">
+                                    <input
+                                      type="checkbox"
+                                      checked={Boolean(row.embed_media)}
+                                      disabled={!graphSourcesProducer}
+                                      onChange={(e) =>
+                                        void toggleEmbedMedia(row.id, e.target.checked)
+                                      }
+                                    />{" "}
+                                    Embed images
+                                  </label>
+                                ) : (
+                                  <span className="row-meta muted">no folder</span>
+                                )}
+                                <span className="row-meta">{status}</span>
+                                {graphSourcesProducer && userCode ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => void removeGraphSource(row.id)}
+                                  >
+                                    Remove
+                                  </button>
+                                ) : null}
+                              </div>
+                            );
+                          })}
+                        </div>
+                        {graphSourcesProducer ? (
+                          <div className="toolbar">
+                            <input
+                              className="mono"
+                              value={newCodeRoot}
+                              onChange={(e) => setNewCodeRoot(e.target.value)}
+                              placeholder="/absolute/path/to/code"
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") void addGraphCodeRoot();
+                              }}
+                            />
+                            <button type="button" onClick={() => void addGraphCodeRoot()}>
+                              Add folder
+                            </button>
+                            <button type="button" onClick={() => void pickGraphCodeRoot()}>
+                              Choose folder…
+                            </button>
+                          </div>
+                        ) : null}
+                        {graphSourcesMsg ? (
+                          <pre className="code">{graphSourcesMsg}</pre>
+                        ) : null}
+                      </div>
+                    </div>
+                  </>
+                ) : null}
+
+                {settingsSection === "updates" ? (
+                  <div className="section-card">
+                    <div className="section-head">Updates</div>
+                    <div className="section-body">
+                      <p className="muted">
+                        Installed version <code>v{appVersion}</code>. Launch checks
+                        for a new release (fail-soft, nothing installs itself); use
+                        this button to download and install. Each build is signed,
+                        and the signature is checked before anything is replaced.
+                      </p>
+                      <div className="toolbar">
+                        <button
+                          type="button"
+                          className="primary"
+                          disabled={updateBusy}
+                          onClick={() => void checkForUpdates()}
+                        >
+                          {updateBusy ? (
+                            <Loader2 size={14} className="spin" aria-hidden />
+                          ) : null}
+                          {updateBusy ? "Checking…" : "Check for updates"}
+                        </button>
+                      </div>
+                      {updateMsg ? <pre className="code">{updateMsg}</pre> : null}
+                    </div>
+                  </div>
+                ) : null}
+
+                {settingsSection === "advanced" ? (
+                  <>
+                    <div className="section-card">
+                      <div className="section-head">This Mac</div>
+                      <div className="section-body">
+                        <div className="toolbar">
+                          <button type="button" onClick={() => setTab("first-run")}>
+                            Run setup again
+                          </button>
+                          <button type="button" onClick={() => setTab("revisions")}>
+                            Conflicting edits
+                          </button>
+                          <button type="button" onClick={() => setFeedbackOpen(true)}>
+                            <MessageSquare size={14} aria-hidden />
+                            Send feedback
+                          </button>
+                        </div>
+                        <p className="muted">
+                          Stuck? Open the health report on <strong>Home</strong>, or
+                          email <a href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</a>.
+                          Include the health report if it is red — it never
+                          contains secrets.
+                        </p>
+                      </div>
+                    </div>
+
+                    <RawJson
+                      text={settingsRawText}
+                      label="Raw configuration"
+                      empty="Nothing read yet."
+                    />
+                  </>
+                ) : null}
               </div>
             </div>
           </div>
@@ -4955,6 +5370,71 @@ export default function App() {
                 {label}
               </button>
             ))}
+          </div>
+        </div>
+      </Dialog>
+
+      {/* Index now — paid API calls, so it asks first. */}
+      <Dialog
+        open={indexConfirm}
+        className="kit-dialog"
+        ariaLabelledBy="index-title"
+        onCancel={() => setIndexConfirm(false)}
+      >
+        <div className="kit-dialog-body">
+          <h2 id="index-title">Index everything that is missing?</h2>
+          <p>
+            This sends every unindexed session and topic page to the model
+            behind your Gemini key, which costs money and can take a few
+            minutes. The nightly run does the same thing on its own.
+          </p>
+          <div className="kit-dialog-actions">
+            <button type="button" onClick={() => setIndexConfirm(false)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="primary"
+              disabled={indexBusy}
+              onClick={() => {
+                setIndexConfirm(false);
+                void runIndexNow();
+              }}
+            >
+              Index now
+            </button>
+          </div>
+        </div>
+      </Dialog>
+
+      {/* Restore — writes over the current data folder. */}
+      <Dialog
+        open={importConfirm}
+        className="kit-dialog"
+        ariaLabelledBy="import-title"
+        onCancel={() => setImportConfirm(false)}
+      >
+        <div className="kit-dialog-body">
+          <h2 id="import-title">Restore into the data folder?</h2>
+          <p>
+            Files from <code>{importSource.trim()}</code> are merged into{" "}
+            <code>{dataDir || "the data folder"}</code>. A file with the same
+            name is overwritten, and nothing here undoes that.
+          </p>
+          <div className="kit-dialog-actions">
+            <button type="button" onClick={() => setImportConfirm(false)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="danger"
+              onClick={() => {
+                setImportConfirm(false);
+                void doImportLocal();
+              }}
+            >
+              Restore
+            </button>
           </div>
         </div>
       </Dialog>

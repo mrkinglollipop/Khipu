@@ -390,6 +390,21 @@ async fn secrets_presence() -> Result<String, String> {
     run_khipu_cli_async(vec!["secrets".to_string()]).await
 }
 
+/// Index everything missing or changed (`khipu embed backfill`, no arguments).
+///
+/// `embed` stays OUT of `ALLOWED_SUBCOMMANDS` on purpose: that path forwards
+/// arbitrary argv, and `embed` reaches paid Gemini calls, a `--profile` switch
+/// and vector deletes. Settings → Search index needs exactly one of those
+/// things, so it gets exactly one fixed argv and no arguments of its own —
+/// the same shape as `khipu_migrate` and `secrets_presence`. The button is
+/// behind a confirm dialog in the UI because it spends money.
+const EMBED_BACKFILL_ARGV: &[&str] = &["embed", "backfill"];
+
+#[tauri::command]
+async fn khipu_embed_backfill() -> Result<String, String> {
+    run_khipu_cli_async(EMBED_BACKFILL_ARGV.iter().map(|s| s.to_string()).collect()).await
+}
+
 /// Apply (or plan) the schema. `migrate` is a state-changing subcommand and is
 /// deliberately NOT in `ALLOWED_SUBCOMMANDS`; this command fixes the argv to
 /// exactly `migrate` / `migrate --dry-run` so the UI can offer setup without
@@ -1224,6 +1239,7 @@ pub fn run() {
             join_receive,
             secrets_presence,
             khipu_migrate,
+            khipu_embed_backfill,
             select_compat_row,
             install_local_postgres,
             bootstrap_local_backup,
@@ -1530,6 +1546,16 @@ mod run_khipu_guard_tests {
         // Grown by hand, so pin the size: adding an entry without a call site is
         // how the five above got in.
         assert_eq!(ALLOWED_SUBCOMMANDS.len(), 14);
+    }
+
+    #[test]
+    fn index_now_is_a_fixed_argv_command_not_an_allowlist_entry() {
+        // Settings -> Search index needs `embed backfill` and nothing else.
+        // It gets it as a fixed argv (khipu_embed_backfill) so the webview
+        // cannot reach `--profile`, `--kind` or any other embed verb.
+        use super::EMBED_BACKFILL_ARGV;
+        assert_eq!(EMBED_BACKFILL_ARGV, &["embed", "backfill"]);
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"embed"));
     }
 
     #[test]

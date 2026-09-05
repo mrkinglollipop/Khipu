@@ -835,7 +835,8 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
 
 
 def _cosine_candidates(
-    query: str, *, limit: int, kind: str | None = None, filters: "_SearchFilters | None" = None
+    query: str, *, limit: int, kind: str | None = None,
+    filters: "_SearchFilters | None" = None, timing: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Raw cosine-ordered candidates over the active profile (best first).
 
@@ -854,6 +855,11 @@ def _cosine_candidates(
     excluded here regardless of ``kind``: a commitment's own label lookup
     below is episode-shaped and would resolve wrong, and commitments have
     their own dedicated surface (``khipu_owed``), not generic search.
+
+    ``timing``, when passed, is filled in with ``embed_ms`` (the embedding API
+    call for the query) and ``cosine_ms`` (the vector scan) — the two legs of
+    this function have very different costs and a single total hides which one
+    is slow (a 12.5 s hybrid search in the dev app, 2026-09-04).
     """
     from khipu.db import connect
 
@@ -888,7 +894,11 @@ def _cosine_candidates(
                         f" OR (m.kind NOT IN ('episode', 'topic') AND {other}))\n"
                     )
             api_q = prefix_query(query) if uses_task_prefixes(profile) else query
+            _t0 = time.monotonic()
             qlit = _vec_literal(embed_one(api_q, profile=profile))
+            if timing is not None:
+                timing["embed_ms"] = round((time.monotonic() - _t0) * 1000, 1)
+            _t0 = time.monotonic()
             cur.execute("SELECT to_regclass('public.media_assets') IS NOT NULL")
             has_media = bool(cur.fetchone()[0])
             media_label = (
@@ -938,6 +948,8 @@ def _cosine_candidates(
                     "snippet": clip_snippet(snippet_src, SNIPPET_LIMIT),
                     "rank_text": rank_src or snip or "",
                 })
+    if timing is not None:
+        timing["cosine_ms"] = round((time.monotonic() - _t0) * 1000, 1)
     return out
 
 
@@ -1203,6 +1215,21 @@ def _apply_search_filters(
             continue
         if until_dt is not None and (ts is None or _aware(ts) > until_dt):
             continue
+        # Phase 5 addendum (2026-09-04): the metadata this pass already reads
+        # for filtering rides back out on the row, so a caller can show "date ·
+        # project · harness" without a second query per hit. Serialised here
+        # (never a datetime) because `cli.cmd_search` json.dumps the payload
+        # with no `default=`. Episodes only for project/harness: a topic or
+        # node has neither, and inventing one is the failure this fixes.
+        if ts is not None:
+            r["ts"] = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+        if k == "episode":
+            proj = (m.get("project") or "").strip()
+            if proj:
+                r["project"] = proj
+            row_harness = m.get("harness") or (m.get("session_id") or "").split(":", 1)[0]
+            if row_harness:
+                r["harness"] = row_harness
         r["_sort_ts"] = ts
         out.append(r)
     out.sort(key=lambda r: (-(r.get("score") or 0.0), _neg_ts_sort_key(r.get("_sort_ts"))))
@@ -1283,6 +1310,11 @@ def hybrid_search(
     ``_apply_search_filters`` (which also does the recency tiebreak).
     Nodes are excluded from hybrid/literal results by default (W2.2) — see
     ``cli._id_shaped`` / ``cli._literal_candidates``.
+
+    The payload also carries ``timing`` (phase 5 addendum): ``embed_ms``,
+    ``cosine_ms``, ``literal_ms``, ``lexical_ms``, ``fusion_ms``, ``enrich_ms``
+    and ``total_ms``, all milliseconds. Each row an episode produced carries
+    ``ts`` / ``project`` / ``harness``; a topic or node carries ``ts`` only.
     """
     from khipu.cli import _literal_candidates
     from khipu.hub_snapshot import try_hub_connect
@@ -1301,6 +1333,10 @@ def hybrid_search(
             raise ValueError(f"kind must be one of {allowed}")
 
     limit = max(1, int(limit))
+    # Every leg is timed and reported in the payload's `timing` block (phase 5
+    # addendum): a 12.5 s search told nobody WHICH leg cost the 12.5 s.
+    timing: dict[str, float] = {}
+    _started = time.monotonic()
     # Larger literal pool (bugfix): 50 minimum, not 40 — the fair-share bug's
     # replacement (a single globally-ranked pool) needs enough headroom that
     # a strong episode hit is never pushed out by weak-but-numerous topic hits.
@@ -1323,7 +1359,8 @@ def hybrid_search(
         semantic_kind = kind if kind in _SEMANTIC_KINDS else None
         try:
             cosine_rows = _cosine_candidates(
-                query, limit=oversample, kind=semantic_kind, filters=filters
+                query, limit=oversample, kind=semantic_kind, filters=filters,
+                timing=timing,
             )
         except RuntimeError:
             if mode == "semantic":
@@ -1336,10 +1373,13 @@ def hybrid_search(
             literal_rows: list[dict[str, Any]] = []
             if mode in ("hybrid", "literal"):
                 literal_kind = kind if kind in _LITERAL_KINDS else None
+                _t = time.monotonic()
                 literal_rows = _literal_candidates(
                     cur, query, oversample, kind=literal_kind, filters=filters
                 )
+                timing["literal_ms"] = round((time.monotonic() - _t) * 1000, 1)
 
+            _t = time.monotonic()
             lists: list[list[dict[str, Any]]] = []
             if cosine_rows:
                 lists.append(list(cosine_rows))
@@ -1362,20 +1402,28 @@ def hybrid_search(
             for row_list in lists:
                 for r in row_list:
                     r.pop("rank_text", None)
+            timing["lexical_ms"] = round((time.monotonic() - _t) * 1000, 1)
             if not lists:
-                out: dict[str, Any] = {"query": query, "mode": mode, "results": []}
+                timing["total_ms"] = round((time.monotonic() - _started) * 1000, 1)
+                out: dict[str, Any] = {"query": query, "mode": mode, "results": [],
+                                       "timing": timing}
                 if degraded:
                     out["degraded"] = degraded
                 return out
+            _t = time.monotonic()
             fused = fuse_ranked_lists(lists, limit=oversample)
             fused = _apply_search_filters(
                 cur, fused, project=project, since=since, until=until,
                 session_id=session_id, harness=harness,
             )
             fused = _fair_fill(fused, limit)
+            timing["fusion_ms"] = round((time.monotonic() - _t) * 1000, 1)
+            _t = time.monotonic()
             fused = enrich_search_results(cur, fused)
+            timing["enrich_ms"] = round((time.monotonic() - _t) * 1000, 1)
 
-    out = {"query": query, "mode": mode, "results": fused}
+    timing["total_ms"] = round((time.monotonic() - _started) * 1000, 1)
+    out = {"query": query, "mode": mode, "results": fused, "timing": timing}
     if degraded:
         out["degraded"] = degraded
     return out

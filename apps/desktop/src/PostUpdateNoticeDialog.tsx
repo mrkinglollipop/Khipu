@@ -59,7 +59,7 @@ export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations }
                 close();
               }}
             >
-              Open Integrations
+              Open Harnesses
             </button>
           ) : null}
         </div>
