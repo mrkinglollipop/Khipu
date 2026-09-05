@@ -416,6 +416,14 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     from khipu.db import connect
     from khipu.mirror import _upsert_episode, _upsert_topic, parse_topic_file
 
+    # Every writer lands here (hook, MCP tool, gateway), so this is the one
+    # place a secret in a summary, decision, loop or topic page is masked
+    # before it becomes a row, a page or a vector.
+    from khipu.redact import redact_payload
+
+    redacted = redact_payload(payload)
+    if redacted:
+        _log(f"redacted {redacted} secret(s) from the capture payload")
     topics_written = 0
     episode_id: int | None = None
     with connect() as conn:

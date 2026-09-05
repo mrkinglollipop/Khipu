@@ -4704,6 +4704,15 @@ export default function App() {
                               {CAPTURE_MIN_TURNS} turns, or {CAPTURE_MIN_MINUTES} minutes
                             </span>
                           </div>
+                          <div className="row-item">
+                            <span className="row-main">Secrets</span>
+                            <span className="row-meta">
+                              API keys, tokens, private keys and passwords in
+                              connection strings are masked before a transcript
+                              reaches the summariser and before any capture is
+                              stored
+                            </span>
+                          </div>
                         </div>
                         <p className="muted">
                           Always captures before a compaction and when a session

@@ -912,6 +912,13 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
         st = load_state(harness, sid)
         msgs, new_off, turns = read_window(path, int(st.get("offset", 0)))
         text = render(msgs)
+        # Secrets never reach the summariser: a pasted key or a password in a
+        # DSN is masked here, before the window is queued to disk.
+        from khipu.redact import redact_secrets
+
+        text, redacted = redact_secrets(text)
+        if redacted:
+            _log(f"[{harness}] {sid} redacted {redacted} secret(s) before summarising")
         due, reason = decide(event, user_turns=turns, chars=len(text),
                              elapsed_s=time.time() - float(st.get("last_ts") or 0),
                              stop_hook_active=bool(_get(env, "stopHookActive", "stop_hook_active", default=False)))
