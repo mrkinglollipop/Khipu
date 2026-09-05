@@ -754,11 +754,13 @@ fn join_receive_sync(passphrase: String, pin: String, out_path: Option<String>) 
 /// Activity pane's "Forget" button (`episode forget ID`) is an explicit user
 /// action behind a confirm dialog, and soft-deleting one's own episode is the
 /// documented way to remove something the capture hook recorded. Its argv is
-/// still constrained by the CLI itself — `episode` only accepts the `forget`
-/// subcommand and an integer id.
-/// `owed` is read-only in the app today (`--status`/`--limit` only): the Owed
-/// screen lists open commitments. Closing and reopening (`--close`/`--reopen`)
-/// are writes and stay unreachable until the screen offers them.
+/// still constrained by the CLI itself — `episode` accepts only `forget ID`
+/// and `edit ID --summary TEXT` (the Activity pane's "Edit summary", which
+/// corrects a summary and re-embeds it; it cannot reach any other table).
+/// `owed` now carries the Owed screen's three writes as well as its reads:
+/// `--close` / `--reopen` / `--snooze ID --until …` all act on one commitment
+/// row by id, and `--until` is parsed by the CLI (a value it cannot read as a
+/// date is refused, never bound).
 const ALLOWED_SUBCOMMANDS: &[&str] = &[
     "status", "doctor", "activity", "search", "graph", "revisions", "paths",
     "backup-local", "import-local", "integrations", "sources", "models",

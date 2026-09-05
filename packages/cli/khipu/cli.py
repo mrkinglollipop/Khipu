@@ -1142,10 +1142,59 @@ def cmd_topic_graph_backfill(args: argparse.Namespace) -> int:
 # status/doctor internals above are owned by a concurrent change.
 # ---------------------------------------------------------------------------
 
+def _snooze_until_sql(raw: str) -> tuple[str, object] | None:
+    """`--until` for `khipu owed --snooze`, as an (sql_expr, param) pair.
+
+    Accepts everything the capture path's lenient parser already accepts
+    (ISO 8601 / ``YYYY-MM-DD``, ``N days|weeks|months``, ``in N days``) plus
+    the compact ``7d`` / ``2w`` / ``3m`` the Owed screen's snooze presets
+    send, which is expanded before handing over. Returns ``None`` when the
+    value is not a date at all — ``_parse_due_after`` answers NULL for free
+    text, and silently clearing a due date is not what "snooze" means.
+    """
+    import re as _re
+
+    from khipu import commitments
+
+    text = (raw or "").strip()
+    m = _re.match(r"^(\d+)\s*([dwm])$", text, _re.I)
+    if m:
+        unit = {"d": "days", "w": "weeks", "m": "months"}[m.group(2).lower()]
+        text = f"{m.group(1)} {unit}"
+    expr, param = commitments._parse_due_after(text)
+    return None if expr == "NULL" else (expr, param)
+
+
 def cmd_owed(args: argparse.Namespace) -> int:
-    """W3.4: `khipu owed` — list, close, or reopen commitments."""
+    """W3.4: `khipu owed` — list, close, reopen, or snooze commitments."""
     from khipu.db import connect
     from khipu import commitments
+
+    snooze_id = getattr(args, "snooze", None)
+    if snooze_id:
+        parsed = _snooze_until_sql(getattr(args, "until", None) or "")
+        if parsed is None:
+            print(json.dumps({
+                "ok": False, "id": int(snooze_id),
+                "error": "--until must be a date (2026-09-30) or a window (7d, 2 weeks)",
+            }))
+            return 2
+        expr, param = parsed
+        cid = int(snooze_id)
+        params = ([param] if param is not None else []) + [cid]
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE commitments SET due_after = {expr} WHERE id = %s",
+                    tuple(params),
+                )
+                ok = cur.rowcount > 0
+            conn.commit()
+        print(json.dumps({
+            "ok": ok, "id": cid,
+            "until": (getattr(args, "until", None) or "").strip(),
+        }))
+        return 0 if ok else 1
 
     close_id = getattr(args, "close", None)
     reopen_id = getattr(args, "reopen", None)
@@ -1171,10 +1220,89 @@ def cmd_owed(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reembed_episode(cur, episode_id: int) -> bool:
+    """Replace one episode's vectors from its current row, using the same text
+    builder, profile and upsert `embed.embed_on_capture` uses — so a corrected
+    summary is findable by meaning immediately instead of at the next nightly.
+    The API call happens before the DELETE, so a failed embed leaves the old
+    vectors in place rather than none at all."""
+    from khipu.embed import (
+        _active_profile,
+        _api_texts,
+        _md5,
+        _upsert_chunks,
+        chunk_text,
+        embed_batch,
+        episode_text,
+    )
+
+    cols = ("summary", "decisions", "preferences", "topics", "people")
+    cur.execute(
+        f"SELECT {', '.join(cols)} FROM episodes WHERE id = %s",
+        (episode_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return False
+    chunks = chunk_text(episode_text(dict(zip(cols, row))))
+    if not chunks:
+        return False
+    profile = _active_profile(cur)
+    vecs = embed_batch(_api_texts(profile, [("", c) for c in chunks]), profile=profile)
+    cur.execute(
+        "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = %s",
+        (str(episode_id),),
+    )
+    _upsert_chunks(cur, profile, [
+        ("episode", str(episode_id), i, c, _md5(c), v)
+        for i, (c, v) in enumerate(zip(chunks, vecs))
+    ])
+    return True
+
+
+def _cmd_episode_edit(args: argparse.Namespace) -> int:
+    """`khipu episode edit ID --summary TEXT` — correct a wrong summary.
+
+    Re-embedding is fail-open, the same posture as embed-on-capture: the
+    correction is durable with no embedding profile and no API key, and the
+    payload says whether the vectors moved with it rather than pretending.
+    """
+    from khipu.db import connect
+
+    eid = int(args.id)
+    summary = (getattr(args, "summary", None) or "").strip()
+    if not summary:
+        print(json.dumps({"ok": False, "id": eid, "error": "--summary must not be empty"}))
+        return 2
+    reembedded = False
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE episodes SET summary = %s WHERE id = %s", (summary, eid))
+            updated = cur.rowcount > 0
+            if updated:
+                try:
+                    reembedded = _reembed_episode(cur, eid)
+                except Exception as exc:  # noqa: BLE001 — the edit itself stands
+                    print(
+                        f"warn: re-embed skipped: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+        conn.commit()
+    print(json.dumps({"ok": updated, "id": eid, "reembedded": reembedded}))
+    return 0 if updated else 1
+
+
 def cmd_episode(args: argparse.Namespace) -> int:
-    """W5.6: `khipu episode forget ID` — soft-delete + remove its vectors."""
-    if getattr(args, "episode_cmd", None) != "forget":
-        print(json.dumps({"ok": False, "error": "usage: khipu episode forget ID"}))
+    """W5.6: `khipu episode forget ID` — soft-delete + remove its vectors.
+    Plus `khipu episode edit ID --summary TEXT` (desktop overhaul phase 3)."""
+    episode_cmd = getattr(args, "episode_cmd", None)
+    if episode_cmd == "edit":
+        return _cmd_episode_edit(args)
+    if episode_cmd != "forget":
+        print(json.dumps({
+            "ok": False,
+            "error": "usage: khipu episode forget ID | khipu episode edit ID --summary TEXT",
+        }))
         return 2
     from khipu.db import connect
 
@@ -1262,10 +1390,68 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_hygiene_commitments(args: argparse.Namespace) -> int:
+    """`khipu hygiene commitments [--session-ended] [--dry-run|--apply]
+    [--project X] [--limit N]`.
+
+    Default pass: re-judges every OPEN commitment against the one commitment
+    definition (``khipu.commitments.COMMITMENT_DEFINITION``) — deterministic
+    filter first, then the summariser model in batches — and drops the rejects
+    / merges the paraphrase duplicates.
+
+    ``--session-ended``: the model-free ownership pass (2026-09-04). Infers
+    ``owner``/``future_trigger`` for every open row with the same
+    deterministic rules capture uses, closes the assistant-owned rows with no
+    cross-session trigger whose session has ended, and drops within-session
+    reporting duties.
+
+    Both are dry runs by default and print every verdict, so a human reads the
+    list before anything is written. ``--apply`` takes a binary-COPY backup of
+    the whole table first and never DELETEs a row.
+    """
+    from khipu import hygiene
+    from khipu.db import connect
+
+    apply = bool(getattr(args, "apply", False))
+    project = getattr(args, "project", None)
+    limit = getattr(args, "limit", None)
+    session_ended = bool(getattr(args, "session_ended", False))
+    max_calls = int(getattr(args, "max_calls", None) or hygiene.MAX_JUDGE_CALLS)
+    backup_dir = None
+    with connect() as conn:
+        if apply:
+            backup_dir = hygiene.backup_commitments(conn)
+        with conn.cursor() as cur:
+            if session_ended:
+                report = hygiene.run_session_ended_pass(
+                    cur, apply=apply, project=project,
+                    limit=int(limit) if limit else None,
+                    hours=int(getattr(args, "ended_after_hours", None)
+                              or hygiene.SESSION_ENDED_HOURS),
+                )
+            else:
+                report = hygiene.run_commitments_hygiene(
+                    cur, apply=apply, project=project,
+                    limit=int(limit) if limit else None, max_calls=max_calls,
+                )
+        if apply:
+            conn.commit()
+    if backup_dir is not None:
+        report["backup"] = str(backup_dir)
+    print(json.dumps(report, indent=2, default=str))
+    return 0
+
+
 def cmd_hygiene(args: argparse.Namespace) -> int:
-    """W5.2: `khipu hygiene paths [--dry-run|--apply]`."""
+    """W5.2: `khipu hygiene paths [--dry-run|--apply]`, plus
+    `khipu hygiene commitments` (Owed quality, 2026-09-04)."""
+    if getattr(args, "hygiene_cmd", None) == "commitments":
+        return cmd_hygiene_commitments(args)
     if getattr(args, "hygiene_cmd", None) != "paths":
-        print(json.dumps({"ok": False, "error": "usage: khipu hygiene paths [--dry-run|--apply]"}))
+        print(json.dumps({
+            "ok": False,
+            "error": "usage: khipu hygiene paths|commitments [--dry-run|--apply]",
+        }))
         return 2
     from khipu.db import connect
     from khipu import hygiene
@@ -2425,12 +2611,23 @@ def build_parser() -> argparse.ArgumentParser:
     owed.add_argument("--limit", type=int, default=50)
     owed.add_argument("--close", metavar="ID", default=None, help="Close commitment ID")
     owed.add_argument("--reopen", metavar="ID", default=None, help="Reopen commitment ID")
+    owed.add_argument(
+        "--snooze", metavar="ID", default=None,
+        help="Push commitment ID's due date out (needs --until)",
+    )
+    owed.add_argument(
+        "--until", default=None,
+        help="With --snooze: a date (2026-09-30) or a window (7d, 2w, 3m, 2 weeks)",
+    )
     owed.set_defaults(func=cmd_owed)
 
     ep = sub.add_parser("episode", help="Episode maintenance (memory reliability W5.6)")
     ep_sub = ep.add_subparsers(dest="episode_cmd", required=True)
     ep_forget = ep_sub.add_parser("forget", help="Soft-delete an episode and remove its vectors")
     ep_forget.add_argument("id", type=int)
+    ep_edit = ep_sub.add_parser("edit", help="Correct an episode's summary and re-embed it")
+    ep_edit.add_argument("id", type=int)
+    ep_edit.add_argument("--summary", required=True, help="Replacement summary text")
     ep.set_defaults(func=cmd_episode)
 
     tp = sub.add_parser("topic", help="Topic maintenance (memory reliability W5.6)")
@@ -2464,6 +2661,32 @@ def build_parser() -> argparse.ArgumentParser:
     hy_paths.add_argument(
         "--apply", dest="apply", action="store_true",
         help="Actually delete the failing path: nodes (destructive; needs an explicit go)",
+    )
+    hy_com = hy_sub.add_parser(
+        "commitments",
+        help="Re-judge open commitments: drop non-commitments, merge paraphrase duplicates",
+    )
+    hy_com.add_argument("--dry-run", dest="apply", action="store_false", default=False)
+    hy_com.add_argument(
+        "--apply", dest="apply", action="store_true",
+        help="Actually drop/merge (backs the table up first; never DELETEs)",
+    )
+    hy_com.add_argument("--project", default=None, help="Limit to one project")
+    hy_com.add_argument("--limit", type=int, default=None, help="Max open commitments to judge")
+    hy_com.add_argument(
+        "--max-calls", dest="max_calls", type=int, default=None,
+        help="Cost guard: max summariser calls per run (default 8, ~40 items each)",
+    )
+    hy_com.add_argument(
+        "--session-ended", dest="session_ended", action="store_true",
+        help="Model-free ownership pass: fill owner/future_trigger, close "
+             "assistant commitments with no cross-session trigger whose "
+             "session has ended, drop within-session reporting duties",
+    )
+    hy_com.add_argument(
+        "--ended-after-hours", dest="ended_after_hours", type=int, default=None,
+        help="With --session-ended: silence (hours) after which a session counts "
+             "as ended (default 6)",
     )
     hy.set_defaults(func=cmd_hygiene)
 

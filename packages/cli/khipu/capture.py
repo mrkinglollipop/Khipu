@@ -293,6 +293,7 @@ def _merge_into_episode(
 
         commitments.open_from_episode(cur, payload, target_id)
         commitments.auto_close(cur, payload, target_id)
+        commitments.close_session_plan(cur, payload, target_id)
     except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
         try:
             cur.execute("ROLLBACK TO SAVEPOINT capture_merge_commitments")
@@ -508,6 +509,7 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
 
                         commitments.open_from_episode(cur, payload, episode_id)
                         commitments.auto_close(cur, payload, episode_id)
+                        commitments.close_session_plan(cur, payload, episode_id)
                     except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
                         cur.execute("ROLLBACK TO SAVEPOINT capture_commitments")
                         _log(f"commitments step failed ({type(exc).__name__}: {exc})")

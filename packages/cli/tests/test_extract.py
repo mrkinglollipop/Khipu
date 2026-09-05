@@ -107,16 +107,22 @@ class ExtractMemoryTest(unittest.TestCase):
         self.assertEqual(out["people"], [])
 
     def test_open_loops_normalized_from_objects(self):
+        """owner/future_trigger ride through as the model sent them (or None);
+        khipu.commitments decides the STORED values deterministically."""
         out = self._run(_reply(open_loops=[
-            {"text": "follow up with Matt", "kind": "FOLLOWUP", "due_after": "2026-09-10", "owner": "assistant"},
+            {"text": "follow up with Matt", "kind": "FOLLOWUP", "due_after": "2026-09-10",
+             "owner": "assistant", "future_trigger": True},
             {"text": "  "},
             "bare string loop",
             {"text": "bad kind", "kind": "nonsense"},
         ]))
         self.assertEqual(out["open_loops"], [
-            {"text": "follow up with Matt", "kind": "followup", "due_after": "2026-09-10", "owner": "assistant"},
-            {"text": "bare string loop", "kind": "followup", "due_after": None, "owner": None},
-            {"text": "bad kind", "kind": "followup", "due_after": None, "owner": None},
+            {"text": "follow up with Matt", "kind": "followup", "due_after": "2026-09-10",
+             "owner": "assistant", "future_trigger": True},
+            {"text": "bare string loop", "kind": "followup", "due_after": None,
+             "owner": None, "future_trigger": None},
+            {"text": "bad kind", "kind": "followup", "due_after": None,
+             "owner": None, "future_trigger": None},
         ])
 
     def test_open_loops_defaults_to_empty_list(self):

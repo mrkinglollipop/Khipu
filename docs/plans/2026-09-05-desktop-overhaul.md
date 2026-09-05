@@ -47,6 +47,15 @@ build session can start from a brief. Release decision (Matt, 2026-09-04): **one
 - **Phase 4, Owed.** New screen over `khipu owed` (open/closed/stale, project chip, Done /
   Snooze / Reopen; Done and Reopen map to `khipu owed --close ID` / `--reopen ID`, which exist;
   Snooze needs a `due_after` update, add it to the CLI first). Oracle: build + live rows.
+- **Phase 4 addendum (Matt, 2026-09-04: "Owed needs to be really good or it'll be entirely
+  ignored").** Measured 328 open rows after two days, ~150/day, mostly in-flight status, the
+  assistant's own plan steps and coordination chatter. Engine work (extraction precision, dedup at
+  open, expiry by silence, session-plan closure, a re-judge cleanup job, and a `priority` field on
+  `khipu owed`) lands first. The screen then shows a **"Needs you"** section on top (questions and
+  blockers, then anything due within 7 days), followed by promises and follow-ups, grouped by
+  project and sorted by the CLI's `priority`; the rail badge and the Home preview count ONLY
+  "Needs you" for the project of the most recent capture, never the global total; "All" and
+  "Stale" are one click away, never the default. Rows show when the item was last seen.
 - **Phase 5, Harnesses and Settings.** Card grid with verified-round-trip line — the "verified"
   state must come from the CLI's probe and heartbeat evidence (`integrations status`/`verify`,
   `recall_probe`), never from app-local install state, which today shows "Installed, not yet
@@ -54,6 +63,11 @@ build session can start from a brief. Release decision (Matt, 2026-09-04): **one
   sub-navigation with the capture cadence, retention and redaction controls (retention and
   redaction need engine work first: see the audit's gap table; ship the controls disabled with a
   "coming" note only if the engine lands in the same release, otherwise omit them).
+- **Phase 5 addendum (from the phase 3–4 screenshots, 2026-09-04):** `khipu search` rows must
+  carry `ts`, `project` and `harness` so Recall's result footer can show "date · project ·
+  harness" as the mock does (dropped rather than invented in phase 3); and a hybrid search took
+  12.5 s in the dev app — add timing to the search payload (embed call, each candidate query,
+  fusion) and surface it under Advanced so the slow leg is visible before 0.4.0 ships.
 - **Phase 6, Welcome and cleanup.** Welcome re-flowed onto the new kit and glossary; delete
   dead CSS and the duplicated dialog code; update README screenshots.
 

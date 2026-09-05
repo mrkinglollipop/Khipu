@@ -2090,3 +2090,357 @@ details.disclose[open] > summary .disclosure-chevron {
 dialog::backdrop {
   background: var(--backdrop);
 }
+
+/* ---------------------------------------------------------------------------
+   UI kit, part two — the list + detail split (Recall, Activity) and the Owed
+   table's remaining columns. Values from the approved mocks' tokens.css.
+--------------------------------------------------------------------------- */
+
+/* A screen whose body is a full-height split rather than a scrolling column.
+   `:not(.is-hidden)` so the hidden-panel `display: none` still wins. */
+.panel.fill:not(.is-hidden) {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.panel.fill .panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.panel.fill .split {
+  flex: 1;
+}
+
+/* One search hit. `.on` is the row the detail pane is showing. */
+button.result {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 6px;
+  width: 100%;
+  height: auto;
+  text-align: left;
+  padding: var(--s3) var(--s4);
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  font: inherit;
+}
+
+button.result:last-child {
+  border-bottom: 0;
+}
+
+button.result:hover {
+  background: var(--surface-2);
+  border-color: transparent;
+  border-bottom: 1px solid var(--border);
+}
+
+button.result.on {
+  background: var(--surface-2);
+}
+
+.result .tl {
+  display: flex;
+  gap: var(--s2);
+  align-items: center;
+  min-width: 0;
+}
+
+.result .title {
+  font-weight: 600;
+  font-size: var(--t-md);
+  color: var(--text);
+}
+
+.result .snip {
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: normal;
+}
+
+.result .foot {
+  display: flex;
+  gap: var(--s3);
+  align-items: center;
+  font-size: var(--t-xs);
+  color: var(--muted);
+  min-width: 0;
+}
+
+/* Relevance, as a bar rather than a number pretending to be a percentage. */
+.score {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--t-xs);
+  color: var(--muted);
+  margin-left: auto;
+  flex: none;
+}
+
+.bar {
+  width: 44px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--surface-2);
+  position: relative;
+  overflow: hidden;
+  flex: none;
+}
+
+.bar i {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: var(--accent);
+}
+
+/* The detail pane on the right of a split. */
+.detail {
+  padding: var(--s4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s4);
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.section h3 {
+  margin: 0;
+  font-size: var(--t-xs);
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.section p {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.section ul {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.section li {
+  margin: 2px 0;
+}
+
+.acts {
+  display: flex;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: var(--s2);
+  flex-wrap: wrap;
+}
+
+/* A row with no card chrome — the "Connected" list inside a detail pane. */
+.card .row.plain,
+.row.plain {
+  padding: 6px 0;
+  border: 0;
+}
+
+/* Day heading inside the Activity list. */
+.day {
+  font-size: var(--t-xs);
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: var(--s2) var(--s4) var(--s1);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+/* A whole list row that opens something. */
+button.row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--s3);
+  min-width: 0;
+  padding: 9px var(--s4);
+  width: 100%;
+  height: auto;
+  text-align: left;
+  border-radius: 0;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  box-shadow: none;
+  font: inherit;
+}
+
+button.row:last-child {
+  border-bottom: 0;
+}
+
+button.row:hover {
+  background: var(--surface-2);
+  border-color: transparent;
+  border-bottom: 1px solid var(--border);
+}
+
+button.row.on {
+  background: var(--surface-2);
+}
+
+/* Remaining Owed / Activity column widths, from the mocks. */
+.w50 {
+  width: 50px;
+  flex: none;
+}
+
+.w78 {
+  width: 78px;
+  flex: none;
+}
+
+.w96 {
+  width: 96px;
+  flex: none;
+}
+
+/* Confirm / edit dialogs (Forget, Edit summary, Snooze) — the same card the
+   feedback dialog uses, without its form-specific rules. */
+.kit-dialog {
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+  color: var(--text);
+  max-width: min(480px, calc(100vw - 32px));
+  width: 100%;
+}
+
+.kit-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  padding: var(--s5);
+}
+
+.kit-dialog-body h2 {
+  margin: 0;
+  font-size: var(--t-lg);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.kit-dialog-body p {
+  margin: 0;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+.kit-dialog-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  padding-top: var(--s1);
+}
+
+textarea.edit-summary {
+  min-height: 140px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+textarea.edit-summary:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--ring);
+}
+
+/* The filter row a chip reveals. */
+.filter-row {
+  display: flex;
+  gap: var(--s2);
+  align-items: flex-end;
+  flex-wrap: wrap;
+  padding: var(--s3) var(--s4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+/* Activity's text filter — a fixed lane so the chips beside it do not reflow
+   as the list changes. */
+input.activity-filter {
+  width: 260px;
+  flex: none;
+}
+
+/* Actions sit under the scrolling detail, not inside it, so "Forget" cannot
+   scroll out of reach on a capture with a long decision list. */
+.card.col > .acts {
+  margin-top: 0;
+  padding: var(--s3) var(--s4);
+  border-top: 1px solid var(--border);
+  flex: none;
+}
+
+/* The selected row, unmistakably. `--surface-2` on its own is nearly invisible
+   against `--surface` in the dark theme, so the accent edge carries it. */
+button.result.on,
+button.row.on {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* Owed: the kind cell and the action cell. Done + Snooze must stay on one
+   line — stacked, they doubled every row's height, and the mock's 104px
+   action column is not wide enough for two real buttons. */
+.w88 {
+  width: 88px;
+  flex: none;
+}
+
+.w132 {
+  width: 132px;
+  flex: none;
+}
+
+.acts-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+}

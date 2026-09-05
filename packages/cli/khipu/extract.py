@@ -29,10 +29,39 @@ Output ONLY a single JSON object (no prose, no markdown fences) with these keys:
 - decisions: list of strings
 - preferences: list of strings
 - scope: short string
-- open_loops: list of objects {{text, kind, due_after, owner}} for anything
-  still outstanding — a followup, a blocker, a question, or a promise made.
-  kind is one of "followup", "blocker", "question", "promise". due_after and
-  owner are optional; omit or use null when unknown.
+- open_loops: list of objects {{text, kind, due_after, owner, future_trigger}}. BE STRICT —
+  an empty list is the right answer for most sessions. Include an item ONLY if
+  it is (a) something the USER must decide, provide, approve, or do, or (b)
+  something you explicitly promised to do in a FUTURE session and cannot
+  finish in this one.
+  NEVER include:
+    * in-progress status of any kind — "is running", "still building",
+      "pending", "in flight", "waiting on/for", "awaiting";
+    * anything about agents, subagents, drives, notifications, reports
+      arriving, verdicts, or polling;
+    * inter-session or inter-agent coordination — "send/receive ... message",
+      "screen free/busy", "ping the session";
+    * steps of your OWN plan for this session (you will finish them here);
+    * anything this window already reports as completed;
+    * vague items with no concrete action or actor.
+  GOOD: "Matt to decide whether 0.3.17 ships with the seal fix or waits";
+  "Send Matt the Linode restore-drill numbers next session";
+  "Matt must supply the second Mac's hostname before soak can start";
+  "Approve the AGPL CLA wording".
+  BAD: "Drive 46 is still running"; "Generate the UI mocks" (a step of this
+  session's own plan); "Send 'screen free' message to the Khipu session";
+  "Receive the report from the phase 1-2 agent"; "Visual check agent's
+  verdict is pending".
+  kind is one of "followup", "blocker", "question", "promise".
+  owner is "user" (the USER must decide/provide/approve/do it, or it is a
+  question for them) or "assistant" — always answer it.
+  future_trigger is true ONLY when the text names an explicit cross-session
+  condition ("when Matt says the lane is re-authed, ...", "next session",
+  "after the wave merges", "if attempt six dies"); false otherwise.
+  NEVER record a within-session reporting duty — "reply with the SHAs",
+  "tell the user when it relaunches", "notify Matt", "report back",
+  "provide the evidence paths" — unless the USER is the one who owes it.
+  due_after is optional; omit or use null when unknown.
 - closed_loops: list of objects {{text}} for anything explicitly finished,
   merged, shipped, or no longer needed this turn.
 Capture concrete decisions, user preferences/corrections, project state, file paths in play, and ruled-out dead ends.
@@ -229,7 +258,8 @@ def _as_open_loops(v: Any) -> list[dict[str, Any]]:
         if isinstance(item, str):
             text = item.strip()
             if text:
-                out.append({"text": text, "kind": "followup", "due_after": None, "owner": None})
+                out.append({"text": text, "kind": "followup", "due_after": None,
+                            "owner": None, "future_trigger": None})
             continue
         if not isinstance(item, dict):
             continue
@@ -244,6 +274,9 @@ def _as_open_loops(v: Any) -> list[dict[str, Any]]:
             "kind": kind,
             "due_after": item.get("due_after") or None,
             "owner": item.get("owner") or None,
+            # Carried through for the record; khipu.commitments decides the
+            # stored value deterministically (has_future_trigger wins).
+            "future_trigger": item.get("future_trigger"),
         })
     return out
 
