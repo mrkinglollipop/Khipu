@@ -53,6 +53,21 @@ def test_every_wrapper_covered():
     all_wrappers = {p.name for p in BIN_DIR.iterdir() if p.is_file()}
     known = set(PYCACHE_WRAPPERS) | set(DONTWRITE_WRAPPERS)
     unaccounted = all_wrappers - known
-    # khipu-capture-hook is not in scope for this pass (see report); do not
-    # silently grow this allowlist for anything else.
-    assert unaccounted <= {"khipu-capture-hook"}, unaccounted
+    # No allowlist. khipu-capture-hook was the last entry and had no reference
+    # anywhere in the repo (audit 2026-09-04) — it was deleted rather than
+    # exempted. Do not grow this back: every launcher gets one mechanism.
+    assert not unaccounted, unaccounted
+
+
+def test_the_bundled_cli_wrapper_redirects_the_cache_too():
+    """apps/desktop/scripts/bundle_cli.sh writes its own `khipu` launcher into
+    Contents/Resources; it shipped WITHOUT PYTHONPYCACHEPREFIX, so running the
+    bundled CLI wrote .pyc files inside the signed bundle — the exact 0.3.15
+    seal break these wrappers exist to prevent."""
+    script = Path(__file__).resolve().parents[3] / "apps" / "desktop" / "scripts" / "bundle_cli.sh"
+    text = script.read_text(encoding="utf-8")
+    heredoc = text.split('cat >"$OUT/bin/khipu" <<', 1)[1].split("EOF", 2)[1]
+    assert "PYTHONPYCACHEPREFIX" in heredoc
+    assert "export PYTHONPYCACHEPREFIX" in heredoc
+    assert "Library/Caches/Khipu/pycache" in heredoc
+    assert 'mkdir -p "$PYTHONPYCACHEPREFIX"' in heredoc

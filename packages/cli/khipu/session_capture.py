@@ -128,7 +128,11 @@ def _log(msg: str) -> None:
         p = log_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} [khipu-capture] {msg}\n")
+            # ISO-8601 UTC (audit 2026-09-04): the old stamp was LOCAL time
+            # with no offset, so a line could not be lined up with the hub's
+            # timestamps or with the harness's own logs.
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            f.write(f"{stamp} [khipu-capture] {msg}\n")
     except OSError:
         pass  # never let logging fail a session
 
@@ -1092,11 +1096,19 @@ def status(harness: str = "aegis") -> dict:
 
 def _stopped_hook_evidence(harness: str) -> tuple[str | None, int | None]:
     """(reason, seconds) when a session's transcript gained a USER turn the
-    hook never saw, long after it last looked (its seen_ts/seen_end marker) —
+    hook never saw, long after it last looked (its seen_ts/seen_end marker),
+    AND has then sat quiet long enough that a Stop must have had its chance —
     a dead hook sits on the user's prompts. (None, age) when the change is
-    housekeeping or assistant-only. Sessions without a marker (pre-upgrade
-    state files, so nothing records where the hook's parse reached) are
-    skipped rather than guessed at."""
+    housekeeping, assistant-only, or still in flight. Sessions without a
+    marker (pre-upgrade state files, so nothing records where the hook's
+    parse reached) are skipped rather than guessed at.
+
+    Both halves are required (audit 2026-09-04). ``mtime - seen_ts`` alone
+    measured how STALE the marker was, not whether the hook had failed: a
+    session idle for 19 h and then resumed with one user prompt read as
+    "transcript changed 1176 min after the hook last ran" and went red
+    instantly — before any Stop event could possibly have fired. The second
+    half (``now - mtime``) is what says a Stop was actually due and missing."""
     try:
         files = list(state_dir().glob(f"{_safe(harness)}--*.json"))
     except OSError:
@@ -1107,8 +1119,9 @@ def _stopped_hook_evidence(harness: str) -> tuple[str | None, int | None]:
         except OSError:
             pass
         files = files[:ACTIVITY_SCAN_LIMIT]
-    worst: tuple[int, str] | None = None
+    worst: tuple[int, str, int] | None = None
     newer_s: int | None = None
+    now = time.time()
     for f in files:
         try:
             st = json.loads(f.read_text(encoding="utf-8"))
@@ -1118,8 +1131,9 @@ def _stopped_hook_evidence(harness: str) -> tuple[str | None, int | None]:
         if not tp or not seen_ts:
             continue
         try:
-            age = int(Path(tp).stat().st_mtime - float(seen_ts))
-        except (OSError, ValueError):
+            mtime = Path(tp).stat().st_mtime
+            age = int(mtime - float(seen_ts))
+        except (OSError, TypeError, ValueError):
             continue
         if age <= HOOK_SILENT_S:
             continue
@@ -1132,10 +1146,19 @@ def _stopped_hook_evidence(harness: str) -> tuple[str | None, int | None]:
             # on user prompts too. Housekeeping-only tails land here as well.
             newer_s = max(newer_s or 0, age)
             continue
+        quiet = int(now - mtime)
+        if quiet <= HOOK_SILENT_S:
+            # The turn is RECENT. A session that sat idle for hours and then
+            # got one prompt has a huge `age` and a tiny `quiet`; no Stop has
+            # had its chance yet, so there is nothing to have stopped firing
+            # (audit 2026-09-04 false red).
+            newer_s = max(newer_s or 0, age)
+            continue
         if worst is None or age > worst[0]:
-            worst = (age, tp)
+            worst = (age, tp, quiet)
     if worst:
-        return (f"transcript changed {worst[0] // 60} min after the hook last ran "
+        return (f"transcript gained a user turn {worst[0] // 60} min after the hook "
+                f"last ran and has been quiet {worst[2] // 60} min since "
                 f"({worst[1]}) — the hook has stopped firing"), worst[0]
     return None, newer_s
 

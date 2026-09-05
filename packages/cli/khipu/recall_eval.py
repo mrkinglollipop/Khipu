@@ -66,9 +66,11 @@ def eval_one(entry: dict[str, Any]) -> dict[str, Any]:
     }
     try:
         out = hybrid_search(query, mode=mode, limit=k)
-        got = [
-            str(r.get("id")) for r in out.get("results", [])[:k] if r.get("kind") == "episode"
-        ]
+        # Every kind counts. Scoring episodes only (audit 2026-09-04) meant a
+        # golden line whose expected id was a topic slug or a graph node could
+        # never hit, and the topic rows it did return silently consumed the
+        # top-k slots the episode filter then discarded.
+        got = [str(r.get("id")) for r in out.get("results", [])[:k]]
         row["got"] = got
         row["hit"] = bool(expect & set(got))
     except Exception as exc:  # noqa: BLE001 — a broken line scores a miss, not a crash

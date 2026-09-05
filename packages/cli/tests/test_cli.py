@@ -366,3 +366,149 @@ class EpisodeRankTextDelegatesToEmbedTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForgottenEpisodesStayForgottenTest(unittest.TestCase):
+    """Audit 2026-09-04: the topic branches of every keyword query excluded
+    tombstones (`deleted_at IS NULL`) but the EPISODE branches did not, so an
+    episode dropped by `khipu episode --forget` came straight back on the next
+    search. Gated on the column, like the rest of the pre-0010 handling."""
+
+    class _Cur:
+        def __init__(self, has_deleted_at=True):
+            self.has_deleted_at = has_deleted_at
+            self.statements: list[str] = []
+            self._result: list[tuple] = []
+
+        def execute(self, sql, params=None):
+            s = " ".join(sql.split())
+            self.statements.append(s)
+            if "information_schema.columns" in s:
+                cols = ["id", "ts", "summary", "session_id", "scope", "topics",
+                        "people", "decisions", "preferences", "project", "harness"]
+                if self.has_deleted_at:
+                    cols.append("deleted_at")
+                self._result = [(c,) for c in cols]
+            else:
+                self._result = []
+
+        def fetchall(self):
+            return list(self._result)
+
+        def fetchone(self):
+            return self._result[0] if self._result else None
+
+    def _episode_sql(self, statements):
+        return [s for s in statements if "FROM episodes" in s]
+
+    def test_search_query_excludes_tombstoned_episodes(self):
+        cur = self._Cur()
+        _search_query(cur, "some query", 10, kind="episode")
+        sql = self._episode_sql(cur.statements)
+        self.assertTrue(sql)
+        self.assertIn("WHERE deleted_at IS NULL AND", sql[0])
+
+    def test_literal_candidates_excludes_tombstoned_episodes(self):
+        from khipu.cli import _literal_candidates
+
+        cur = self._Cur()
+        _literal_candidates(cur, "some query", 10, kind="episode")
+        sql = self._episode_sql(cur.statements)
+        self.assertTrue(sql)
+        self.assertIn("WHERE deleted_at IS NULL AND", sql[0])
+
+    def test_literal_candidates_single_token_path_excludes_them_too(self):
+        from khipu.cli import _literal_candidates
+
+        cur = self._Cur()
+        _literal_candidates(cur, "%", 10, kind="episode")   # no tokens -> raw-term path
+        sql = self._episode_sql(cur.statements)
+        self.assertTrue(sql)
+        self.assertIn("WHERE deleted_at IS NULL AND", sql[0])
+
+    def test_a_pre_migration_hub_still_queries_cleanly(self):
+        cur = self._Cur(has_deleted_at=False)
+        _search_query(cur, "some query", 10, kind="episode")
+        sql = self._episode_sql(cur.statements)
+        self.assertTrue(sql)
+        self.assertNotIn("deleted_at", sql[0])
+
+
+class ConfigFloatSettingsTest(unittest.TestCase):
+    """Audit 2026-09-04: `khipu config --set dedup_similarity 0.8` went through
+    set_path_setting, which stored an expanduser()'d STRING; float_setting only
+    accepts int/float, so it silently kept the default and the knob did nothing."""
+
+    def _run(self, key, value):
+        import json
+
+        from khipu.cli import cmd_config
+
+        args = argparse.Namespace(set=[key, value], unset=None, set_gateway_url=None,
+                                  set_capture_mode=None)
+        with mock.patch("khipu.config.set_float_setting") as m_set, \
+                mock.patch("khipu.config.set_path_setting") as m_path, \
+                mock.patch("khipu.config.float_setting", return_value=0.8), \
+                mock.patch("builtins.print") as m_print:
+            rc = cmd_config(args)
+        payload = json.loads(m_print.call_args.args[0]) if m_print.call_args else {}
+        return rc, payload, m_set, m_path
+
+    def test_a_similarity_knob_is_stored_as_a_float(self):
+        rc, payload, m_set, m_path = self._run("dedup_similarity", "0.8")
+        self.assertEqual(rc, 0)
+        m_set.assert_called_once_with("dedup_similarity", 0.8)
+        m_path.assert_not_called()
+        self.assertTrue(payload["ok"])
+
+    def test_the_close_similarity_knob_takes_the_same_route(self):
+        rc, _payload, m_set, _m_path = self._run("commitment_close_similarity", "0.9")
+        self.assertEqual(rc, 0)
+        m_set.assert_called_once_with("commitment_close_similarity", 0.9)
+
+    def test_out_of_range_is_rejected(self):
+        rc, payload, m_set, _ = self._run("dedup_similarity", "1.5")
+        self.assertEqual(rc, 2)
+        m_set.assert_not_called()
+        self.assertIn("between 0 and 1", payload["error"])
+
+    def test_non_numeric_is_rejected(self):
+        rc, payload, m_set, _ = self._run("dedup_similarity", "~/nope")
+        self.assertEqual(rc, 2)
+        m_set.assert_not_called()
+        self.assertIn("must be a number", payload["error"])
+
+    def test_a_path_setting_still_goes_to_set_path_setting(self):
+        _rc, _payload, m_set, m_path = self._run("memory_root", "/tmp/x")
+        m_set.assert_not_called()
+        m_path.assert_called_once_with("memory_root", "/tmp/x")
+
+
+class IntegrationsProjectForwardingTest(unittest.TestCase):
+    """Audit 2026-09-04: --project reached only grok_bot, so
+    `khipu integrations verify cursor --project X` silently skipped the
+    per-project Cursor stale-rule check it exists for."""
+
+    def test_verify_forwards_project_to_every_harness(self):
+        import json
+
+        from khipu.cli import cmd_integrations
+
+        args = argparse.Namespace(harness="cursor", project="acme/widget",
+                                  integ_cmd="verify", dry_run=False, no_verify=True)
+        with mock.patch("khipu.integrations.verify",
+                        return_value={"harness": "cursor", "detected": False}) as m_verify, \
+                mock.patch("builtins.print"):
+            cmd_integrations(args)
+        m_verify.assert_called_once_with("cursor", project="acme/widget")
+
+    def test_status_forwards_project_to_every_harness(self):
+        from khipu.cli import cmd_integrations
+
+        args = argparse.Namespace(harness="codex", project="acme/widget",
+                                  integ_cmd="status", dry_run=False, no_verify=True)
+        with mock.patch("khipu.integrations.status",
+                        return_value={"harness": "codex", "detected": False}) as m_status, \
+                mock.patch("builtins.print"):
+            cmd_integrations(args)
+        m_status.assert_called_once_with("codex", project="acme/widget")

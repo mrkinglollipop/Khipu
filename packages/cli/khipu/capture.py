@@ -226,17 +226,38 @@ def _union_json_list(existing: Any, new_items: Any) -> list[Any]:
 def _merge_into_episode(
     cur, target_id: int, payload: dict[str, Any], *, matched_via: str, score: float
 ) -> bool:
-    cur.execute(
-        "SELECT topics, decisions, preferences, raw FROM episodes WHERE id = %s",
-        (target_id,),
-    )
+    """Fold a near-duplicate capture into the episode it matched.
+
+    Audit 2026-09-04: the merge used to union topics/decisions/preferences
+    only, so ``people`` and ``tags`` named by the second capture were dropped
+    on the floor; it opened no commitments for the merged payload (an
+    ``open_loops`` entry that arrived on the merged side was lost outright,
+    unlike the insert path at ``write_pg``); and it left the target row's
+    vectors pointing at the pre-merge text, so the new decisions were
+    unsearchable semantically until the nightly backfill. All three are fixed
+    here, each fail-open — the row update is the durable part and must never
+    be taken down by an additive step.
+    """
+    from khipu.db import has_columns
+
+    try:
+        has_tags = has_columns(cur, "episodes", "tags")
+    except Exception:  # noqa: BLE001 — schema probe never blocks the merge
+        has_tags = False
+    cols = "topics, decisions, preferences, people, raw, ts, summary"
+    if has_tags:
+        cols += ", tags"
+    cur.execute(f"SELECT {cols} FROM episodes WHERE id = %s", (target_id,))
     row = cur.fetchone()
     if not row:
         return False
-    topics, decisions, preferences, raw = row
+    topics, decisions, preferences, people, raw, target_ts, target_summary = row[:7]
+    tags = row[7] if has_tags else None
     new_topics = _union_json_list(topics, payload.get("topics"))
     new_decisions = _union_json_list(decisions, payload.get("decisions"))
     new_preferences = _union_json_list(preferences, payload.get("preferences"))
+    new_people = _union_json_list(people, payload.get("people"))
+    new_tags = _union_json_list(tags, payload.get("tags")) if has_tags else None
     raw = dict(raw or {})
     merged_from = list(raw.get("merged_from") or [])
     merged_from.append({
@@ -246,21 +267,66 @@ def _merge_into_episode(
         "score": round(score, 4),
     })
     raw["merged_from"] = merged_from
-    cur.execute(
-        """
-        UPDATE episodes
-        SET topics = %s::jsonb, decisions = %s::jsonb, preferences = %s::jsonb, raw = %s::jsonb
-        WHERE id = %s
-        """,
-        (
-            json.dumps(new_topics, ensure_ascii=False),
-            json.dumps(new_decisions, ensure_ascii=False),
-            json.dumps(new_preferences, ensure_ascii=False),
-            json.dumps(raw, ensure_ascii=False),
-            target_id,
-        ),
-    )
+    sets = ["topics = %s::jsonb", "decisions = %s::jsonb", "preferences = %s::jsonb",
+            "people = %s::jsonb", "raw = %s::jsonb"]
+    params: list[Any] = [
+        json.dumps(new_topics, ensure_ascii=False),
+        json.dumps(new_decisions, ensure_ascii=False),
+        json.dumps(new_preferences, ensure_ascii=False),
+        json.dumps(new_people, ensure_ascii=False),
+        json.dumps(raw, ensure_ascii=False),
+    ]
+    if has_tags:
+        sets.append("tags = %s::jsonb")
+        params.append(json.dumps(new_tags, ensure_ascii=False))
+    params.append(target_id)
+    cur.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id = %s", params)
+
+    # The merged capture's own open/closed loops belong to the target episode
+    # — same call the insert path makes in write_pg, same SAVEPOINT fail-open.
+    try:
+        cur.execute("SAVEPOINT capture_merge_commitments")
+    except Exception:  # noqa: BLE001 — no savepoint support (fake cur / autocommit)
+        pass
+    try:
+        from khipu import commitments
+
+        commitments.open_from_episode(cur, payload, target_id)
+        commitments.auto_close(cur, payload, target_id)
+    except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT capture_merge_commitments")
+        except Exception:  # noqa: BLE001
+            pass
+        _log(f"merge commitments step failed ({type(exc).__name__}: {exc})")
+
+    # The target's text changed, so its vectors are stale. embed_on_capture
+    # finds the row by (ts, md5(summary)) — both unchanged by a merge — and
+    # re-embeds the MERGED text we just wrote.
+    _reembed_merged_episode(target_ts, target_summary, {
+        "summary": target_summary,
+        "topics": new_topics,
+        "decisions": new_decisions,
+        "preferences": new_preferences,
+        "people": new_people,
+    })
     return True
+
+
+def _reembed_merged_episode(ts: Any, summary: Any, merged: dict[str, Any]) -> None:
+    """Re-embed a merged target row. Fail-open: the episode is already durable
+    and `khipu embed backfill` heals any miss."""
+    try:
+        from khipu.embed import embed_on_capture
+
+        merged = dict(merged)
+        merged["ts"] = ts.isoformat() if hasattr(ts, "isoformat") else ts
+        merged["summary"] = summary or ""
+        if not merged["ts"] or not merged["summary"]:
+            return
+        embed_on_capture(merged)
+    except Exception as exc:  # noqa: BLE001 — vectors are additive
+        _log(f"merge re-embed failed ({type(exc).__name__}: {exc})")
 
 
 def dedup_before_insert(cur, payload: dict[str, Any]) -> dict[str, Any]:

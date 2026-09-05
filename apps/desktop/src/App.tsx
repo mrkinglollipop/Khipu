@@ -4,7 +4,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { open as openDirectoryDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
+import {
+  confirm as confirmDialog,
+  open as openDirectoryDialog,
+  save as saveFileDialog,
+} from "@tauri-apps/plugin-dialog";
 import {
   Blocks,
   ChevronRight,
@@ -21,6 +25,7 @@ import {
   Search,
   Settings2,
   Stethoscope,
+  Trash2,
   TriangleAlert,
   Waypoints,
   X,
@@ -121,10 +126,68 @@ type SearchResult = {
   id?: string | number;
   label?: string;
   snippet?: string;
+  /** Fused RRF score from `khipu search` — already in the payload, never
+   * rendered before (audit 2026-09-04). Higher is better; the scale is
+   * relative to the other hits in the same response, so it is shown as a
+   * relevance bar rather than a number pretending to be a percentage. */
   score?: number;
   paths?: string[];
   neighbors?: { id: string; type?: string }[];
+  /** Optional per-signal explanation, if the CLI ever attaches one. Rendered
+   * as plain text when present; absent from today's payload. */
+  why?: string;
+  signals?: unknown;
 };
+
+/** The three `khipu search --mode` values, in the order the toolbar offers
+ * them. `hybrid` is the CLI's own default and so is the pane's. */
+type SearchMode = "hybrid" | "semantic" | "literal";
+
+const SEARCH_MODES: {
+  mode: SearchMode;
+  label: string;
+  hint: string;
+  placeholder: string;
+}[] = [
+  {
+    mode: "hybrid",
+    label: "Best match",
+    hint: "Meaning, word overlap and exact text together — the recommended default.",
+    placeholder: "ask in your own words",
+  },
+  {
+    mode: "semantic",
+    label: "By meaning",
+    hint: "Vector similarity only. The words need not appear in the text.",
+    placeholder: "describe what you are looking for",
+  },
+  {
+    mode: "literal",
+    label: "Exact words",
+    hint: "Substring match only — for ids, hashes and error text.",
+    placeholder: "exact words to match",
+  },
+];
+
+/** A search hit's `why`, when the payload carries one. Kept tolerant: any of
+ * a string, a list of strings, or an object of signal → value renders as one
+ * readable line, and anything else renders as nothing at all. */
+function whyText(r: SearchResult): string | null {
+  if (typeof r.why === "string" && r.why.trim()) return r.why.trim();
+  const sig = r.signals;
+  if (typeof sig === "string" && sig.trim()) return sig.trim();
+  if (Array.isArray(sig)) {
+    const parts = sig.filter((x) => typeof x === "string" || typeof x === "number");
+    return parts.length ? parts.join(" · ") : null;
+  }
+  if (sig && typeof sig === "object") {
+    const parts = Object.entries(sig as Record<string, unknown>)
+      .filter(([, v]) => typeof v === "string" || typeof v === "number")
+      .map(([k, v]) => `${k} ${typeof v === "number" ? Number(v).toFixed(3) : String(v)}`);
+    return parts.length ? parts.join(" · ") : null;
+  }
+  return null;
+}
 
 type GraphEdge = {
   src?: string;
@@ -360,12 +423,15 @@ function Callout({
   action,
   children,
 }: {
-  tone: "ok" | "warn";
+  // "neutral" is for a true absence — an empty result that is neither a pass
+  // nor a problem. It had to borrow "ok", which coloured "No edges" green.
+  tone: "ok" | "warn" | "neutral";
   title: string;
   action?: ReactNode;
   children?: ReactNode;
 }) {
-  const Icon = tone === "warn" ? TriangleAlert : CircleCheck;
+  const Icon =
+    tone === "warn" ? TriangleAlert : tone === "neutral" ? CircleMinus : CircleCheck;
   return (
     <div className={`callout ${tone}`}>
       <Icon size={16} strokeWidth={1.75} className="callout-icon" aria-hidden />
@@ -503,6 +569,8 @@ export default function App() {
   // JSON. Capture liveness is the one that matters most: a harness whose
   // hook runs but records nothing must be loud here (2026-08-17).
   const [doctorIssues, setDoctorIssues] = useState<string[]>([]);
+  const [doctorCheckCount, setDoctorCheckCount] = useState(0);
+  const [probeBusy, setProbeBusy] = useState(false);
   const [doctorJobs, setDoctorJobs] = useState<DoctorJobs | null>(null);
   // Checks the CLI never ran on this machine (`not_configured`) plus the two
   // health checks that can be skipped by design (graph_backup/graph_offsite
@@ -558,12 +626,20 @@ export default function App() {
   // looked like an empty first run. Kept separate so it renders its own
   // inline, retryable state instead (audit 2026-08-31).
   const [searchErr, setSearchErr] = useState<string | null>(null);
-  // Literal keyword match is the CLI default. The pane offered no alternative,
-  // so a natural phrase whose words never appear verbatim ("capture liveness")
-  // returned "Nothing matched that query in the hub index" — a false statement,
-  // since the semantic index scores those very episodes at 0.64 (audit
-  // 2026-08-17). Semantic is the better default for a person typing a sentence.
-  const [semantic, setSemantic] = useState(true);
+  // The CLI's search default is `--mode hybrid` (cosine + token overlap +
+  // literal, fused by RRF). The pane offered a "Semantic" checkbox that sent
+  // the DEPRECATED `--semantic` alias when on and, when off, silently fell
+  // back to literal-only — so neither position of the switch could reach the
+  // mode the CLI itself considers best, and the empty state told people
+  // literal keyword matching was the default (audit 2026-08-17, 2026-09-04).
+  // Three named modes, hybrid first, mapped 1:1 onto `--mode`.
+  const [searchMode, setSearchMode] = useState<SearchMode>("hybrid");
+  const [searchProject, setSearchProject] = useState("");
+  const [searchSince, setSearchSince] = useState("");
+  // Separate from the shared `actionBusy`: the results area needs to know
+  // that THIS search is in flight so it can show a loading state instead of
+  // leaving the "type a query" empty state on screen (audit 2026-09-04).
+  const [searchBusy, setSearchBusy] = useState(false);
   const [nodeId, setNodeId] = useState("");
   const [hops, setHops] = useState(1);
   const [graphText, setGraphText] = useState("");
@@ -764,6 +840,31 @@ export default function App() {
       if ((parsed as { embed_coverage_ok?: boolean }).embed_coverage_ok === false) {
         issues.push("Embedding coverage incomplete");
       }
+      // Every red field doctor aggregates into `ok` needs a named issue here,
+      // or the card says "Issues found" over an empty list and the person is
+      // sent to the raw JSON to find out what broke (audit 2026-09-04).
+      if ((parsed as { recall_probe_ok?: boolean }).recall_probe_ok === false) {
+        const rp = (parsed as { recall_probe?: { reason?: string; error?: string } })
+          .recall_probe;
+        issues.push(
+          `Recall probe failed or is stale: run a probe${
+            rp?.reason || rp?.error ? ` (${rp.reason ?? rp.error})` : ""
+          }`,
+        );
+      }
+      if ((parsed as { bundle_seal_ok?: boolean }).bundle_seal_ok === false) {
+        issues.push("App bundle signature is broken: reinstall from the DMG");
+      }
+      if ((parsed as { dsn_file_ok?: boolean }).dsn_file_ok === false) {
+        issues.push("Database connection file missing or unreadable: set the DSN in Settings");
+      }
+      const snap = (parsed as { hub_snapshot?: { ok?: boolean; reason?: string } })
+        .hub_snapshot;
+      if (snap && snap.ok === false) {
+        issues.push(
+          `Offline copy is stale${snap.reason ? `: ${snap.reason}` : ""}`,
+        );
+      }
       setDoctorJobs((parsed as { jobs?: DoctorJobs }).jobs ?? null);
       const notConfiguredRaw = (parsed as { not_configured?: unknown })
         .not_configured;
@@ -787,6 +888,13 @@ export default function App() {
           .graph_drift?.skipped,
       });
       setDoctorIssues(issues);
+      // The number of boolean `*_ok` verdicts in this report — what "all
+      // checks passed" is actually a claim about.
+      setDoctorCheckCount(
+        Object.entries(parsed as Record<string, unknown>).filter(
+          ([k, v]) => k.endsWith("_ok") && typeof v === "boolean",
+        ).length,
+      );
       fetchedAt.current.doctor = Date.now();
     } catch (e) {
       // Preserve last-good doctorOk/text; toast only.
@@ -795,6 +903,26 @@ export default function App() {
       markLoading("doctor", false);
     }
   }, []);
+
+
+  /** `khipu doctor --probe` — the only doctor invocation that WRITES: it runs
+   * a fresh capture-then-search round trip and records the result, which
+   * plain `doctor` only reads. Without a button here the recall_probe check
+   * could only go stale and stay red (audit 2026-09-04). */
+  const runRecallProbe = useCallback(async () => {
+    setProbeBusy(true);
+    setError(null);
+    try {
+      await runKhipu(["doctor", "--probe"]);
+    } catch (e) {
+      // A probe that exits non-zero is a FAILED probe, not a broken button —
+      // the reload below shows the recorded verdict either way.
+      setError(String(e));
+    } finally {
+      setProbeBusy(false);
+      await loadDoctor(true);
+    }
+  }, [loadDoctor]);
 
   const loadActivity = useCallback(async (force = false) => {
     if (!needsFetch("activity", force)) return;
@@ -910,6 +1038,38 @@ export default function App() {
     }
   }, [episodeShowId]);
 
+  /** `khipu episode forget ID` — soft-deletes the episode and drops its
+   * vectors. The pane's lede promised deleting was "planned"; this is it, and
+   * it is the only write the Activity pane makes, so it goes behind a native
+   * confirm (audit 2026-09-04). */
+  const forgetEpisode = useCallback(
+    async (rawId: string) => {
+      const id = Number(rawId);
+      if (!Number.isFinite(id) || id <= 0) {
+        setError("Enter a valid id");
+        return;
+      }
+      const yes = await confirmDialog(
+        `Forget episode #${id}? It stops appearing in search and recall, and its vectors are deleted. The row is kept (soft delete), so this is not a shred.`,
+        { title: "Forget episode", kind: "warning" },
+      );
+      if (!yes) return;
+      setActionBusy(true);
+      setError(null);
+      try {
+        const raw = await runKhipu(["episode", "forget", String(id)]);
+        setActivityText(prettyJson(raw));
+        setActivityRawKey((k) => k + 1);
+        await loadActivity(true);
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setActionBusy(false);
+      }
+    },
+    [loadActivity],
+  );
+
   const showRevision = useCallback(async (explicitId?: string) => {
     const id = Number(explicitId ?? revShowId);
     if (!Number.isFinite(id) || id <= 0) {
@@ -933,17 +1093,21 @@ export default function App() {
   const doSearch = useCallback(async () => {
     if (!query.trim()) return;
     setActionBusy(true);
+    setSearchBusy(true);
     setError(null);
     setSearchErr(null);
     try {
-      const raw = await runKhipu([
-        "search",
-        ...(semantic ? ["--semantic"] : []),
-        "--limit",
-        "20",
-        "--",
-        query.trim(),
-      ]);
+      // Always `--mode`, never the deprecated `--semantic` alias. Filters are
+      // only passed when non-empty: an empty `--project ""` matches nothing.
+      const args = ["search", "--mode", searchMode, "--limit", "20"];
+      if (searchProject.trim()) {
+        args.push("--project", searchProject.trim());
+      }
+      if (searchSince.trim()) {
+        args.push("--since", searchSince.trim());
+      }
+      args.push("--", query.trim());
+      const raw = await runKhipu(args);
       setSearchText(prettyJson(raw));
     } catch (e) {
       // Keep the query and any prior results — only the new attempt failed —
@@ -952,8 +1116,9 @@ export default function App() {
       setSearchErr(String(e));
     } finally {
       setActionBusy(false);
+      setSearchBusy(false);
     }
-  }, [query, semantic]);
+  }, [query, searchMode, searchProject, searchSince]);
 
   const doGraph = useCallback(async () => {
     if (!nodeId.trim()) return;
@@ -1913,7 +2078,7 @@ export default function App() {
         <section className={panelClass("activity")}>
           <PanelHeader
             title="Activity"
-            lede="Sessions become episodes in Postgres via Khipu's capture hook, alongside the legacy writer. Read/inspect only — editing and deleting from here is planned."
+            lede="Sessions become episodes in Postgres via Khipu's capture hook, alongside the legacy writer. Inspect an episode, or forget one to drop it from search and recall."
           >
             {loading.activity ? <Spinner /> : null}
             <button type="button" onClick={() => void loadActivity(true)}>
@@ -1971,6 +2136,16 @@ export default function App() {
               />
               <button type="button" onClick={() => void showEpisode()}>
                 Show full
+              </button>
+              <button
+                type="button"
+                className="danger"
+                disabled={actionBusy || !episodeShowId.trim()}
+                title="Soft-delete this episode and remove its vectors."
+                onClick={() => void forgetEpisode(episodeShowId)}
+              >
+                <Trash2 size={14} strokeWidth={1.75} aria-hidden />
+                Forget
               </button>
             </div>
 
@@ -2031,31 +2206,86 @@ export default function App() {
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder={semantic ? "ask in your own words" : "exact words to match"}
+                placeholder={
+                  SEARCH_MODES.find((m) => m.mode === searchMode)?.placeholder ??
+                  "ask in your own words"
+                }
                 onKeyDown={(e) => {
                   if (e.key === "Enter") void doSearch();
                 }}
               />
-              <label className="toggle" title="Meaning-based search over the vector index. Off = literal keyword match.">
-                <input
-                  type="checkbox"
-                  checked={semantic}
-                  onChange={(e) => setSemantic(e.target.checked)}
-                />
-                Semantic
-              </label>
+              <div
+                className="segmented"
+                role="radiogroup"
+                aria-label="Search mode"
+              >
+                {SEARCH_MODES.map((m) => (
+                  <button
+                    key={m.mode}
+                    type="button"
+                    role="radio"
+                    aria-checked={searchMode === m.mode}
+                    className={searchMode === m.mode ? "selected" : ""}
+                    title={m.hint}
+                    onClick={() => setSearchMode(m.mode)}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
               <button
                 type="button"
                 className="primary"
                 onClick={() => void doSearch()}
               >
-                {actionBusy ? (
+                {searchBusy ? (
                   <Loader2 size={14} className="spin" aria-hidden />
                 ) : (
                   <Search size={14} strokeWidth={1.75} aria-hidden />
                 )}
                 Search
               </button>
+            </div>
+
+            <div className="toolbar">
+              <label className="filter-label">
+                Project
+                <input
+                  className="filter-input"
+                  value={searchProject}
+                  onChange={(e) => setSearchProject(e.target.value)}
+                  placeholder="any"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void doSearch();
+                  }}
+                />
+              </label>
+              <label
+                className="filter-label"
+                title="ISO date (2026-08-01) or a relative window: 7d, 24h, 30m."
+              >
+                Since
+                <input
+                  className="filter-input"
+                  value={searchSince}
+                  onChange={(e) => setSearchSince(e.target.value)}
+                  placeholder="any · e.g. 7d"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void doSearch();
+                  }}
+                />
+              </label>
+              {searchProject.trim() || searchSince.trim() ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchProject("");
+                    setSearchSince("");
+                  }}
+                >
+                  Clear filters
+                </button>
+              ) : null}
             </div>
 
             {searchErr ? (
@@ -2084,6 +2314,34 @@ export default function App() {
                         {r.label ?? String(r.id ?? "")}
                       </span>
                     </div>
+                    {r.score != null && Number.isFinite(r.score) ? (
+                      <div
+                        className="result-score"
+                        title={`Relevance score ${r.score}. Relative to the other hits in this response.`}
+                      >
+                        <span className="result-score-bar" aria-hidden>
+                          <span
+                            style={{
+                              width: `${Math.max(
+                                4,
+                                Math.min(
+                                  100,
+                                  ((r.score ?? 0) /
+                                    (searchResults[0]?.score || r.score || 1)) *
+                                    100,
+                                ),
+                              )}%`,
+                            }}
+                          />
+                        </span>
+                        <span className="result-score-num mono">
+                          {r.score.toFixed(3)}
+                        </span>
+                      </div>
+                    ) : null}
+                    {whyText(r) ? (
+                      <p className="result-why muted">{whyText(r)}</p>
+                    ) : null}
                     {r.snippet ? (
                       <p className="result-snippet">{r.snippet}</p>
                     ) : null}
@@ -2110,6 +2368,17 @@ export default function App() {
                   </div>
                 ))}
               </div>
+            ) : searchBusy ? (
+              // Without this the "type a query" empty state stayed on screen
+              // for the whole round trip, so a slow search looked like a
+              // search that had never been asked for (audit 2026-09-04).
+              <div className="empty">
+                <Loader2 size={22} className="spin" aria-hidden />
+                <div className="empty-title">Searching…</div>
+                <div className="empty-hint">
+                  Asking the hub index for “{query.trim()}”.
+                </div>
+              </div>
             ) : !searchText ? (
               <div className="empty">
                 <Search size={22} strokeWidth={1.75} aria-hidden />
@@ -2117,8 +2386,8 @@ export default function App() {
                   Search topics, episodes, and nodes
                 </div>
                 <div className="empty-hint">
-                  Type a query and press Enter — results come from the hub
-                  index.
+                  Type a question in your own words and press Enter. Best match
+                  weighs meaning, word overlap and exact text together.
                 </div>
               </div>
             ) : (
@@ -2126,9 +2395,14 @@ export default function App() {
                 <Search size={22} strokeWidth={1.75} aria-hidden />
                 <div className="empty-title">No results</div>
                 <div className="empty-hint">
-                  {semantic
-                    ? "Nothing in the hub index was close enough to that query."
-                    : "No exact keyword match. Turn on Semantic to search by meaning — the words need not appear verbatim."}
+                  {searchMode === "literal"
+                    ? "Nothing contains those exact words. Try Best match, which also scores meaning and word overlap."
+                    : searchMode === "semantic"
+                      ? "Nothing in the vector index was close enough. Try Best match, which also matches the words themselves."
+                      : "Nothing in the hub matched that query by meaning, word overlap or exact text."}
+                  {searchProject.trim() || searchSince.trim()
+                    ? " The Project and Since filters are still applied."
+                    : ""}
                 </div>
               </div>
             )}
@@ -2148,7 +2422,7 @@ export default function App() {
                 className="mono"
                 value={nodeId}
                 onChange={(e) => setNodeId(e.target.value)}
-                placeholder="node id"
+                placeholder="node id — e.g. topic:khipu"
                 onKeyDown={(e) => {
                   if (e.key === "Enter") void doGraph();
                 }}
@@ -2254,8 +2528,11 @@ export default function App() {
                 })}
               </div>
             ) : graphText ? (
-              <Callout tone="ok" title="No edges">
-                This node has no neighbors at the requested hop count.
+              // "No edges" is an absence, not a pass — the ok/success callout
+              // read as "the walk found something good" (audit 2026-09-04).
+              <Callout tone="neutral" title="No edges">
+                This node has no neighbors at the requested hop count. Check the
+                id, or try more hops.
               </Callout>
             ) : null}
 
@@ -2371,14 +2648,16 @@ export default function App() {
                             setActionBusy(true);
                             setError(null);
                             try {
+                              // No --sample, for the same reason loadRevisions
+                              // dropped it: sampling 40 of 622 topics renders
+                              // the conflicts summary green for the whole
+                              // corpus off a partial pass (audit 2026-08-17).
                               const raw = await runKhipu([
                                 "revisions",
                                 "--slug",
                                 t.slug,
                                 "--limit",
                                 "20",
-                                "--sample",
-                                "40",
                               ]);
                               const parsed = parseJson(raw) as {
                                 conflicts?: ConflictSummary;
@@ -2427,6 +2706,19 @@ export default function App() {
             lede="Backup freshness and hub reachability checks."
           >
             {loading.doctor ? <Spinner /> : null}
+            <button
+              type="button"
+              disabled={probeBusy}
+              title="Capture a throwaway episode, search for it, then forget it — proves recall works end to end."
+              onClick={() => void runRecallProbe()}
+            >
+              {probeBusy ? (
+                <Loader2 size={14} className="spin" aria-hidden />
+              ) : (
+                <Stethoscope size={14} strokeWidth={1.75} aria-hidden />
+              )}
+              Run recall probe
+            </button>
             <button type="button" onClick={() => void loadDoctor(true)}>
               <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
               Refresh
@@ -2462,8 +2754,8 @@ export default function App() {
                       ? doctorIssues.join(" · ")
                       : doctorOk
                         ? doctorSkipCount > 0
-                          ? `All configured checks passed · ${doctorSkipCount} not configured. Details below.`
-                          : "Drift, graph mirror, graph snapshot, graph offsite, outbox, backup, capture liveness for every harness, and the nightly git sync — all green. Details below."
+                            ? `All checks passed · ${doctorCheckCount} checked, ${doctorSkipCount} not configured. Details below.`
+                          : `All checks passed · ${doctorCheckCount} checked. Details below.`
                         : "Details in the raw report below."}
                 </p>
               </div>

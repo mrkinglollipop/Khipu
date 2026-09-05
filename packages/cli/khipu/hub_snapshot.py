@@ -1025,12 +1025,15 @@ def search_snapshot(
         # session_id has been a base column since the first snapshot schema;
         # guard anyway (fix 9) rather than assume an ancient dump has it.
         session_expr = "session_id" if "session_id" in ep_cols else "NULL"
+        # A forgotten episode is a tombstone on the hub and must stay one on
+        # the offline replica (audit 2026-09-04) — topics already did this.
+        ep_live = "deleted_at IS NULL AND " if "deleted_at" in ep_cols else ""
         sql = f"""
             SELECT 'episode' AS kind, CAST(id AS TEXT) AS id, summary AS label,
                    summary AS snippet, ts, {session_expr} AS sid,
                    {project_expr} AS proj, {harness_expr} AS harn
             FROM episodes
-            WHERE {episode_where}
+            WHERE {ep_live}({episode_where})
             ORDER BY {episode_order}
             LIMIT ?
         """
@@ -1508,8 +1511,11 @@ def semantic_search_snapshot(
         params,
     ).fetchall()
     time_filtered = since_dt is not None or until_dt is not None
+    ep_cols = _snapshot_table_columns(con, "episodes")
+    # Tombstoned episodes never come back through the offline replica either
+    # (audit 2026-09-04); their vectors can outlive the forget on an old dump.
+    deleted_expr = "deleted_at" if "deleted_at" in ep_cols else "NULL"
     if want_episode_only:
-        ep_cols = _snapshot_table_columns(con, "episodes")
         project_expr = "COALESCE(project, scope)" if "project" in ep_cols else "scope"
         harness_expr = "harness" if "harness" in ep_cols else "NULL"
     scored: list[tuple[float, dict[str, Any]]] = []
@@ -1533,13 +1539,15 @@ def semantic_search_snapshot(
         elif knd == "episode":
             if want_episode_only:
                 erow = con.execute(
-                    f"SELECT summary, ts, session_id, {project_expr}, {harness_expr} "
-                    f"FROM episodes WHERE CAST(id AS TEXT) = ?",
+                    f"SELECT summary, ts, session_id, {project_expr}, {harness_expr}, "
+                    f"{deleted_expr} FROM episodes WHERE CAST(id AS TEXT) = ?",
                     (ref,),
                 ).fetchone()
                 if not erow:
                     continue
-                label, ts_val, row_sid, row_proj, row_harn = erow
+                label, ts_val, row_sid, row_proj, row_harn, row_deleted = erow
+                if row_deleted is not None:
+                    continue
                 row_sid = row_sid or ""
                 if project and project.strip().lower() not in (row_proj or "").lower():
                     continue
@@ -1550,10 +1558,13 @@ def semantic_search_snapshot(
                 label = label or ref
             else:
                 erow = con.execute(
-                    "SELECT summary, ts FROM episodes WHERE CAST(id AS TEXT) = ?",
+                    f"SELECT summary, ts, {deleted_expr} FROM episodes "
+                    "WHERE CAST(id AS TEXT) = ?",
                     (ref,),
                 ).fetchone()
                 if erow:
+                    if erow[2] is not None:
+                        continue
                     label = erow[0] or ref
                     ts_val = erow[1]
         if time_filtered:

@@ -500,3 +500,67 @@ class MirrorEpisodeGraphMintTest(unittest.TestCase):
             ok = mirror.mirror_episode({"summary": "   "})
         self.assertFalse(ok)
         m_persist.assert_not_called()
+
+
+class UpsertEpisodeSchemaGateTest(unittest.TestCase):
+    """Audit 2026-09-04: _upsert_episode named harness/repo_root/project/
+    parent_session_id/transcript_range/tags UNCONDITIONALLY. On a hub that had
+    not run migrations 0008/0010 every INSERT raised UndefinedColumn, so
+    capture.write_pg treated a perfectly healthy hub as unreachable and sent
+    every capture to the outbox."""
+
+    class _Cur:
+        def __init__(self, columns):
+            self.columns = columns
+            self.statements: list[str] = []
+            self.params: list[tuple] = []
+            self._result: list[tuple] = []
+            self.rowcount = 1
+
+        def execute(self, sql, params=None):
+            s = " ".join(sql.split())
+            self.statements.append(s)
+            self.params.append(params)
+            if "information_schema.columns" in s:
+                self._result = [(c,) for c in self.columns]
+            else:
+                self._result = []
+
+        def fetchall(self):
+            return list(self._result)
+
+    BASE = ("id", "ts", "session_id", "summary", "topics", "people", "decisions",
+            "preferences", "scope", "edges", "raw")
+
+    def _insert_sql(self, cur):
+        return [s for s in cur.statements if s.startswith("INSERT INTO episodes")][0]
+
+    def test_a_pre_migration_hub_gets_only_the_base_columns(self):
+        cur = self._Cur(self.BASE)
+        self.assertTrue(mirror._upsert_episode(cur, {
+            "ts": "2026-09-03T00:00:00Z", "session_id": "s", "summary": "x",
+            "harness": "claude_code", "tags": ["t"],
+        }))
+        sql = self._insert_sql(cur)
+        for col in ("harness", "repo_root", "project", "parent_session_id",
+                    "transcript_range", "tags"):
+            self.assertNotIn(col, sql, col)
+        # 10 base values, no more.
+        self.assertEqual(len(cur.params[-1]), 10)
+
+    def test_a_hub_with_0008_but_not_0010_omits_only_tags(self):
+        cur = self._Cur(self.BASE + ("harness", "repo_root", "project",
+                                     "parent_session_id", "transcript_range"))
+        mirror._upsert_episode(cur, {"ts": "t", "session_id": "s", "summary": "x"})
+        sql = self._insert_sql(cur)
+        self.assertIn("harness", sql)
+        self.assertNotIn("tags", sql)
+        self.assertEqual(len(cur.params[-1]), 15)
+
+    def test_a_fully_migrated_hub_is_unchanged(self):
+        cur = self._Cur(self.BASE + ("harness", "repo_root", "project",
+                                     "parent_session_id", "transcript_range", "tags"))
+        mirror._upsert_episode(cur, {"ts": "t", "session_id": "s", "summary": "x"})
+        sql = self._insert_sql(cur)
+        self.assertIn("tags", sql)
+        self.assertEqual(len(cur.params[-1]), 16)

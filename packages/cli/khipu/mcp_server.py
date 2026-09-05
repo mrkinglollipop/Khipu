@@ -31,6 +31,7 @@ Manual harness wiring (Install packs remain P3 — do not auto-edit configs):
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -97,17 +98,30 @@ def _local_capture_hook_is_writer() -> bool:
     return False
 
 
+# Set by khipu.gateway at startup (both in-process and, for a container that
+# re-execs, through the env var). The old detector walked the call stack for a
+# frame whose ``__name__`` was "khipu.gateway" — which is never true in the
+# shipped container, because it runs ``python -m khipu.gateway`` and that
+# module's __name__ is "__main__". Every gateway capture therefore looked like
+# a local stdio call and was rejected as a double-write (audit 2026-09-04).
+GATEWAY_ACTIVE_ENV = "KHIPU_GATEWAY_ACTIVE"
+_GATEWAY_ACTIVE = False
+
+
+def mark_gateway_active() -> None:
+    """Called once by ``khipu.gateway.serve`` — this process IS the gateway."""
+    global _GATEWAY_ACTIVE
+    _GATEWAY_ACTIVE = True
+    os.environ[GATEWAY_ACTIVE_ENV] = "1"
+
+
 def _via_https_gateway() -> bool:
     """True when this tools/call arrived through ``khipu.gateway`` (HTTPS)."""
-    try:
-        frame = sys._getframe()
-    except (AttributeError, ValueError):
-        return False
-    while frame is not None:
-        if frame.f_globals.get("__name__") == "khipu.gateway":
-            return True
-        frame = frame.f_back
-    return False
+    if _GATEWAY_ACTIVE:
+        return True
+    return (os.environ.get(GATEWAY_ACTIVE_ENV) or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def _stdio_hook_owns_capture() -> bool:
@@ -543,12 +557,62 @@ def _tool_capture(args: dict) -> dict:
         )
     from khipu.capture import capture, load_payload
 
+    # load_payload raises SystemExit (EX_DATAERR) on a bad payload — inside an
+    # MCP server that is a process kill, not a tool error. Check the one field
+    # it rejects on before handing it over, so the common case is a clean
+    # ValueError; handle_message catches SystemExit for the rest.
+    summary = args.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise ValueError("khipu_capture requires a non-empty string 'summary'")
+
     # load_payload validates + mints ts; capture() routes by mode (hub → PG only).
     payload = load_payload(json.dumps({k: v for k, v in args.items() if v is not None}))
-    rc = capture(payload, mode="hub")
+    # PG-row-only, exactly as khipu.probe does it: the legacy file leg prints
+    # its own "OK · episode appended" lines on stdout, which on the stdio
+    # transport is the JSON-RPC channel itself — one capture would corrupt the
+    # protocol stream for the rest of the session.
+    prev_mirror = os.environ.get("KHIPU_HUB_FILE_MIRROR")
+    os.environ["KHIPU_HUB_FILE_MIRROR"] = "0"
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            rc = capture(payload, mode="hub")
+    finally:
+        if prev_mirror is None:
+            os.environ.pop("KHIPU_HUB_FILE_MIRROR", None)
+        else:
+            os.environ["KHIPU_HUB_FILE_MIRROR"] = prev_mirror
     if rc != 0:
         raise ValueError(f"khipu capture exited {rc}")
-    return {"ok": True, "mode": mode, "ts": payload["ts"]}
+    out = {"ok": True, "mode": mode, "ts": payload["ts"]}
+    episode_id = _captured_episode_id(payload)
+    if episode_id is not None:
+        out["episode_id"] = episode_id
+    return out
+
+
+def _captured_episode_id(payload: dict) -> int | None:
+    """The row this capture landed on, by the (ts, md5(summary)) identity every
+    writer shares. Fail-open — the capture already succeeded, so an id lookup
+    failure must not turn it into a tool error."""
+    try:
+        import hashlib
+
+        from khipu.db import connect
+
+        summary = (payload.get("summary") or "").strip()
+        ts = payload.get("ts")
+        if not summary or not ts:
+            return None
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
+                    (ts, hashlib.md5(summary.encode("utf-8")).hexdigest()),
+                )
+                row = cur.fetchone()
+        return int(row[0]) if row else None
+    except Exception:  # noqa: BLE001 — best-effort enrichment only
+        return None
 
 
 def _tool_owed(args: dict) -> dict:
@@ -636,11 +700,18 @@ def handle_message(msg: dict) -> dict | None:
             payload = func(params.get("arguments") or {})
         except ValueError as exc:  # argument/mode rejections → tool error, not crash
             return _result(req_id, _tool_text({"error": str(exc)}, is_error=True))
-        except Exception as exc:  # noqa: BLE001 — DB down etc.; server must stay up
-            return _result(
-                req_id,
-                _tool_text({"error": f"{type(exc).__name__}: {exc}"}, is_error=True),
-            )
+        except KeyboardInterrupt:
+            raise
+        except BaseException as exc:  # noqa: BLE001 — DB down, or SystemExit from
+            # capture.load_payload (it exits EX_DATAERR on a malformed payload,
+            # which inside a long-lived MCP server killed the whole process and
+            # took every other client's session with it — audit 2026-09-04).
+            # A tool failing is a tool error; only the transport may end us.
+            if isinstance(exc, SystemExit):
+                detail = f"SystemExit: capture rejected the payload (exit {exc.code})"
+            else:
+                detail = f"{type(exc).__name__}: {exc}"
+            return _result(req_id, _tool_text({"error": detail}, is_error=True))
         return _result(req_id, _tool_text(payload))
     if is_notification:
         return None  # notifications/initialized, cancellations, etc.

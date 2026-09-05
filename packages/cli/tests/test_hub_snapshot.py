@@ -559,3 +559,47 @@ class SnapshotFreshnessTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _make_forgotten_snapshot(data: Path) -> Path:
+    """One live episode and one tombstoned (`khipu episode --forget`) episode,
+    both matching the query, plus a vector for the tombstone."""
+    snap = data / "hub_snapshot.sqlite"
+    con = sqlite3.connect(str(snap))
+    hs._create_schema(con)
+    con.execute(
+        "INSERT INTO episodes (id, ts, summary, session_id, scope, topics, people, "
+        "decisions, preferences) VALUES "
+        "(1, '2026-08-30T00:00:00+00:00', 'alpha still remembered', 'claude_code:a', 'x', "
+        "'[]', '[]', '[]', '[]')"
+    )
+    con.execute(
+        "INSERT INTO episodes (id, ts, summary, session_id, scope, topics, people, "
+        "decisions, preferences, deleted_at) VALUES "
+        "(2, '2026-08-30T00:00:00+00:00', 'alpha deliberately forgotten', 'claude_code:b', 'x', "
+        "'[]', '[]', '[]', '[]', '2026-09-01T00:00:00+00:00')"
+    )
+    con.commit()
+    con.close()
+    return snap
+
+
+class SnapshotNeverResurrectsAForgottenEpisodeTest(unittest.TestCase):
+    """Audit 2026-09-04: topics were excluded when tombstoned but episodes were
+    not, so `khipu episode --forget` was undone by the next offline search."""
+
+    def _open(self, data: Path):
+        return (
+            mock.patch.object(hs, "snapshot_path", return_value=_make_forgotten_snapshot(data)),
+            mock.patch.object(hs, "meta_path", return_value=data / "meta.json"),
+        )
+
+    def test_keyword_search_skips_the_tombstone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            p1, p2 = self._open(data)
+            with p1, p2:
+                results = hs.search_snapshot("alpha", 10, kind="episode")
+        ids = {r["id"] for r in results}
+        self.assertIn("1", ids)
+        self.assertNotIn("2", ids, "a forgotten episode came back from the snapshot")

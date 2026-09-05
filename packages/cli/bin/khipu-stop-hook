@@ -79,30 +79,47 @@ export KHIPU_HOOK_STDIN="$STDIN_JSON"
 # transcript tail and write the job file, not to extract, mirror or embed. The
 # next Stop of any harness drains what this leaves behind.
 "$PY" - "$MEM" "${KHIPU_HARNESS:-}" <<'PY' 2>>"${HOME}/Library/Logs/khipu/stop-hook.log" || true
+import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 QUEUE_ONLY = os.environ.get("KHIPU_CAPTURE_QUEUE_ONLY") == "1"
 tag = f" harness={sys.argv[2]}" if len(sys.argv) > 2 and sys.argv[2] else ""
+# Every line this hook writes is stamped (ISO-8601 UTC) and carries the session
+# id. Without both, a quiet session in stop-hook.log could not be attributed to
+# a run at all — you could not tell "the hook never fired for session X" from
+# "it fired and decided not-due" (audit 2026-09-04).
+def _stamp():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+try:
+    SID = str((json.loads(os.environ.get("KHIPU_HOOK_STDIN") or "{}") or {}).get("session_id")
+              or (json.loads(os.environ.get("KHIPU_HOOK_STDIN") or "{}") or {}).get("sessionId")
+              or "")
+except Exception:  # noqa: BLE001 — a malformed payload must not break logging
+    SID = ""
+def _say(msg):
+    print(f"{_stamp()} [khipu-stop-hook] session={SID or '?'}{tag} {msg}", file=sys.stderr)
 try:
     # 1. Native capture for THIS session (harness inferred from the payload
     #    unless the pack pinned KHIPU_HARNESS). Never raises; always heartbeats.
     from khipu.session_capture import hook_main
     r = hook_main(os.environ.get("KHIPU_HOOK_STDIN", ""), sys.argv[2] or None)
-    print(f"[khipu-stop-hook] capture {r.get('harness')} {r.get('event')} due={r.get('due')} "
-          f"{r.get('reason', '')}{' queued=' + r['queued'] if r.get('queued') else ''}"
-          f"{' ERROR ' + r['error'] if r.get('error') else ''}", file=sys.stderr)
+    SID = str(r.get("session_id") or SID or "")
+    _say(f"capture {r.get('harness')} {r.get('event')} due={r.get('due')} "
+         f"{r.get('reason', '')}{' queued=' + r['queued'] if r.get('queued') else ''}"
+         f"{' ERROR ' + r['error'] if r.get('error') else ''}")
 except Exception as e:  # noqa: BLE001 — fail-open, always
-    print(f"[khipu-stop-hook] capture skipped: {type(e).__name__}: {e}", file=sys.stderr)
+    _say(f"capture skipped: {type(e).__name__}: {e}")
 if QUEUE_ONLY:
     sys.exit(0)
 try:
     # 2. Drain the shared queue: this session's job lands now, not "later".
     from khipu.session_capture import drain, queued_jobs
     if queued_jobs() and os.environ.get("KHIPU_CAPTURE_NO_DRAIN") != "1":
-        print("[khipu-stop-hook] drain", drain(), file=sys.stderr)
+        _say(f"drain {drain()}")
 except Exception as e:  # noqa: BLE001 — fail-open, always
-    print(f"[khipu-stop-hook] drain skipped: {type(e).__name__}: {e}", file=sys.stderr)
+    _say(f"drain skipped: {type(e).__name__}: {e}")
 try:
     # 3. Mirror the legacy file wiki's recent episodes into PG (dual mode).
     #    Root: the shell arg (env KHIPU_MEMORY_ROOT), else the Hub config file.
@@ -110,19 +127,19 @@ try:
     from khipu.mirror import sync_recent_episodes
     mem = Path(sys.argv[1]) if sys.argv[1] else path_setting("memory_root")
     if mem is None:
-        print(f"[khipu-stop-hook]{tag} mirror skipped: memory_root not configured", file=sys.stderr)
+        _say("mirror skipped: memory_root not configured")
     else:
-        print(f"[khipu-stop-hook]{tag}", sync_recent_episodes(mem), file=sys.stderr)
+        _say(f"mirror {sync_recent_episodes(mem)}")
 except Exception as e:  # noqa: BLE001 — fail-open, always
-    print(f"[khipu-stop-hook]{tag} skipped: {type(e).__name__}: {e}", file=sys.stderr)
+    _say(f"mirror skipped: {type(e).__name__}: {e}")
 try:
     # Outbox: captures whose PG write failed (any harness) wait here; replay
     # them the moment PG is reachable again. Cheap when empty (one listdir).
     from khipu.outbox import drain as outbox_drain, jobs as outbox_jobs
     if outbox_jobs():
-        print("[khipu-stop-hook] outbox drain", outbox_drain(), file=sys.stderr)
+        _say(f"outbox drain {outbox_drain()}")
 except Exception as e:  # noqa: BLE001 — fail-open, always
-    print(f"[khipu-stop-hook] outbox drain skipped: {type(e).__name__}: {e}", file=sys.stderr)
+    _say(f"outbox drain skipped: {type(e).__name__}: {e}")
 try:
     # Rows the legacy mirror leg inserted are already-present to the tail sync, so
     # they would wait for the nightly to be embedded and stay out of semantic
@@ -130,8 +147,8 @@ try:
     from khipu.embed import embed_recent_missing
     r = embed_recent_missing(limit=5)
     if r["embedded"]:
-        print("[khipu-stop-hook] embed catch-up", r, file=sys.stderr)
+        _say(f"embed catch-up {r}")
 except Exception as e:  # noqa: BLE001 — fail-open, always
-    print(f"[khipu-stop-hook] embed catch-up skipped: {type(e).__name__}: {e}", file=sys.stderr)
+    _say(f"embed catch-up skipped: {type(e).__name__}: {e}")
 PY
 exit 0

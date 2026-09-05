@@ -46,13 +46,49 @@ class JobsRunTest(unittest.TestCase):
         # filesystem walk + a real hub write) — never let that run for real
         # in a unit test; the real reconcile has its own tests (test_notes.py).
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly") as run_mock, \
-                mock.patch("khipu.notes.reconcile", return_value={"ok": True}) as m_reconcile:
+                mock.patch("khipu.notes.reconcile", return_value={"ok": True}) as m_reconcile, \
+                mock.patch.object(jobs, "_mark_stale_commitments") as m_stale:
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
         run_mock.assert_called_once()
         m_reconcile.assert_called_once_with(dry_run=False)
+        m_stale.assert_called_once_with()
         state = json.loads((self.data_dir / "state" / "job-nightly.json").read_text())
         self.assertEqual(state["exit"], 0)
+
+    def test_run_nightly_ages_open_commitments_into_stale(self):
+        """W3: commitments.mark_stale had NO caller at all (audit 2026-09-04),
+        so nothing ever aged and `khipu owed --status stale` stayed empty."""
+        def _run(cmd, stdout, stderr, env):  # noqa: ARG001
+            stdout.write(b"ok\n")
+            return mock.Mock(returncode=0)
+
+        cur = mock.Mock()
+        cur.__enter__ = mock.Mock(return_value=cur)
+        cur.__exit__ = mock.Mock(return_value=False)
+        cur.rowcount = 4
+        conn = mock.Mock()
+        conn.cursor.return_value = cur
+        conn.__enter__ = mock.Mock(return_value=conn)
+        conn.__exit__ = mock.Mock(return_value=False)
+        with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
+                mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
+                mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch("khipu.commitments.mark_stale", return_value=4) as m_stale:
+            rc = jobs.run_nightly()
+        self.assertEqual(rc, 0)
+        m_stale.assert_called_once_with(cur)
+        conn.commit.assert_called_once()
+
+    def test_run_nightly_survives_a_commitment_staling_failure(self):
+        def _run(cmd, stdout, stderr, env):  # noqa: ARG001
+            stdout.write(b"ok\n")
+            return mock.Mock(returncode=0)
+
+        with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
+                mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
+                mock.patch("khipu.db.connect", side_effect=RuntimeError("hub down")):
+            self.assertEqual(jobs.run_nightly(), 0)
 
     def test_run_nightly_survives_a_notes_reconcile_failure(self):
         """The external nightly script's exit code is the one that gates

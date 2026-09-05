@@ -262,36 +262,54 @@ def _upsert_episode(cur, payload: dict[str, Any]) -> bool:
     the only unique constraint reachable is uq_episodes_ts_summary_md5
     (0003_reconcile_upsert.sql). Returns True when a row was inserted.
     """
+    # Identity columns (0008) and tags (0010) are named only when they exist.
+    # Naming them unconditionally made EVERY capture raise UndefinedColumn on a
+    # pre-migration hub, so write_pg treated a healthy hub as unreachable and
+    # sent the whole capture to the outbox (audit 2026-09-04). Same gate
+    # capture.write_pg already uses for the hygiene step.
+    identity_cols = ("harness", "repo_root", "project", "parent_session_id",
+                     "transcript_range")
+    has_identity = has_tags = True
+    try:
+        from khipu.db import has_columns
+
+        has_identity = has_columns(cur, "episodes", *identity_cols)
+        has_tags = has_columns(cur, "episodes", "tags")
+    except Exception:  # noqa: BLE001 — probe failed (no real cursor): keep the
+        pass          # full modern shape, which is what every live hub has.
+    cols = ["ts", "session_id", "summary", "topics", "people", "decisions",
+            "preferences", "scope", "edges", "raw"]
+    vals = ["%s::timestamptz", "%s", "%s", "%s::jsonb", "%s::jsonb", "%s::jsonb",
+            "%s::jsonb", "%s", "%s::jsonb", "%s::jsonb"]
+    params: list[Any] = [
+        payload.get("ts") or datetime.now(timezone.utc).isoformat(),
+        payload.get("session_id"),
+        payload.get("summary") or "",
+        json.dumps(payload.get("topics") or []),
+        json.dumps(payload.get("people") or []),
+        json.dumps(payload.get("decisions") or []),
+        json.dumps(payload.get("preferences") or []),
+        payload.get("scope"),
+        json.dumps(payload.get("edges") or []),
+        json.dumps(payload, ensure_ascii=False),
+    ]
+    if has_identity:
+        cols.extend(identity_cols)
+        vals.extend(["%s"] * len(identity_cols))
+        params.extend(payload.get(c) for c in identity_cols)
+    if has_tags:
+        cols.append("tags")
+        vals.append("%s::jsonb")
+        params.append(json.dumps(payload.get("tags") or []))
     cur.execute(
-        """
+        f"""
         INSERT INTO episodes
-          (ts, session_id, summary, topics, people, decisions,
-           preferences, scope, edges, raw,
-           harness, repo_root, project, parent_session_id, transcript_range, tags)
+          ({', '.join(cols)})
         VALUES
-          (%s::timestamptz, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb,
-           %s::jsonb, %s, %s::jsonb, %s::jsonb,
-           %s, %s, %s, %s, %s, %s::jsonb)
+          ({', '.join(vals)})
         ON CONFLICT DO NOTHING
         """,
-        (
-            payload.get("ts") or datetime.now(timezone.utc).isoformat(),
-            payload.get("session_id"),
-            payload.get("summary") or "",
-            json.dumps(payload.get("topics") or []),
-            json.dumps(payload.get("people") or []),
-            json.dumps(payload.get("decisions") or []),
-            json.dumps(payload.get("preferences") or []),
-            payload.get("scope"),
-            json.dumps(payload.get("edges") or []),
-            json.dumps(payload, ensure_ascii=False),
-            payload.get("harness"),
-            payload.get("repo_root"),
-            payload.get("project"),
-            payload.get("parent_session_id"),
-            payload.get("transcript_range"),
-            json.dumps(payload.get("tags") or []),
-        ),
+        tuple(params),
     )
     return cur.rowcount > 0
 

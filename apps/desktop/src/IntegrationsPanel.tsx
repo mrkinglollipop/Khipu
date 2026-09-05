@@ -38,13 +38,40 @@ type StatusRow = {
   extract?: string;
 };
 
-type Probe = { ok?: boolean; error?: string; ms?: number; episodes?: number; exit?: number; chars?: number };
+type Probe = {
+  ok?: boolean;
+  error?: string;
+  ms?: number;
+  episodes?: number;
+  exit?: number;
+  chars?: number;
+  /** `recall_probe` only (khipu/probe.py run_probe): the end-to-end
+   * capture-then-search round trip, plus "skipped" in legacy capture mode. */
+  status?: string;
+  reason?: string;
+  seconds?: number;
+  episode_id?: number | null;
+};
 
 type VerifyRow = {
   harness: HarnessId;
   detected: boolean;
   ok?: boolean;
-  components?: { mcp?: Probe; hook?: Probe; recall?: Probe; extract?: Probe };
+  components?: {
+    mcp?: Probe;
+    hook?: Probe;
+    recall?: Probe;
+    extract?: Probe;
+    /** W6.1: capture a nonce, search for it, forget it. Verify has returned
+     * this for every detected pack since 0.3.16 and the pane dropped it on
+     * the floor (audit 2026-09-04). */
+    recall_probe?: Probe;
+  };
+  /** Cursor only: true when this project's .cursor/rules/khipu.mdc no longer
+   * matches what this version would write, null when unknowable (no
+   * --project was passed) — `note` says which. */
+  rule_stale?: boolean | null;
+  note?: string;
   /** Evidence from REAL sessions (not probes): the harness ran the hook, captures
    *  landed, nothing is stuck. `ok=false` + reasons is the "runs but records
    *  nothing" case — the silent failure the pane exists to make loud. */
@@ -313,6 +340,21 @@ export function IntegrationsPanel({
             : rt.note
               ? "installed"
               : "verified";
+        // Verify runs a real capture-then-search round trip per pack and the
+        // pane never showed it, so the one component that proves recall works
+        // end to end was invisible (audit 2026-09-04). "skipped" is legacy
+        // capture mode — by design, not a pass and not a failure.
+        const probe = v?.components?.recall_probe;
+        const probeState: ComponentState = !probe
+          ? "missing"
+          : probe.status === "skipped"
+            ? "na"
+            : probe.ok
+              ? "verified"
+              : "failed";
+        // Cursor's recall rule is per-project and only refreshes on install,
+        // so a version bump silently leaves every installed repo stale.
+        const ruleStale = v?.rule_stale;
         const extractState: ComponentState =
           r.extract === "installed"
             ? v?.components?.extract
@@ -445,9 +487,41 @@ export function IntegrationsPanel({
                             (v?.components?.recall?.ok && v.components.recall.ms != null
                               ? ` · SessionStart injects ${v.components.recall.chars} chars in ${v.components.recall.ms} ms`
                               : "")}
+                      {ruleStale === true ? (
+                        <>
+                          {" · "}
+                          <span className="warn">
+                            This project's khipu.mdc is out of date — run Install
+                            again for this repo to refresh it.
+                          </span>
+                        </>
+                      ) : ruleStale === null && v?.note ? (
+                        ` · ${v.note}`
+                      ) : (
+                        ""
+                      )}
                     </div>
                   </div>
                 </div>
+                {v ? (
+                  <div className="row-item">
+                    <Dot state={probeState} />
+                    <div className="row-main">
+                      <div>Recall probe (capture, then find it again)</div>
+                      <div className="row-meta muted">
+                        {!probe
+                          ? "Not run yet — Verify runs it."
+                          : probe.status === "skipped"
+                            ? `Skipped: ${probe.reason ?? "legacy capture mode writes no Postgres row"} — nothing to prove here.`
+                            : probe.ok
+                              ? `Captured and found again${
+                                  probe.seconds != null ? ` in ${probe.seconds}s` : ""
+                                }. The throwaway episode was forgotten afterwards.`
+                              : `FAILED — ${(probe.error ?? probe.reason ?? "the capture never became findable").slice(0, 160)}`}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
               </div>
               {r.harness === "grok_bot" ? (
                 <div className="row-meta muted" style={{ marginTop: 6 }}>

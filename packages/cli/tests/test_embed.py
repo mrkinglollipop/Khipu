@@ -630,3 +630,269 @@ class EmbedRecentMissingCommitmentsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SearchFilterPushdownTest(unittest.TestCase):
+    """Audit 2026-09-04: project/since/until/session_id/harness ran ONLY after
+    fusion, over a ~50-row pool that had been chosen without them — so a
+    filtered search was blind to every matching row outside that pool. The
+    predicates now ride the candidate SQL; ``_apply_search_filters`` stays as
+    the safety net."""
+
+    TS = None  # set in setUp (needs datetime)
+
+    def setUp(self):
+        import datetime as dt
+
+        self.TS = dt.datetime(2026, 9, 3, 12, 0, tzinfo=dt.timezone.utc)
+
+    def _cursor(self):
+        ts = self.TS
+
+        class FakeCur:
+            """Models a hub where the ONLY row matching project 'acme/widget'
+            (episode 999) sorts far below the unfiltered candidate pool."""
+
+            def __init__(self):
+                self.statements: list[str] = []
+                self._result: list[tuple] = []
+
+            def execute(self, sql, params=None):
+                s = " ".join(sql.split())
+                self.statements.append(s)
+                if "information_schema.columns" in s:
+                    self._result = [(c,) for c in (
+                        "id", "ts", "session_id", "summary", "topics", "people",
+                        "decisions", "preferences", "scope", "project", "harness",
+                        "parent_session_id", "deleted_at",
+                    )]
+                elif "FROM topics" in s:
+                    self._result = []
+                elif "FROM episodes" in s and "id::text = ANY" in s:
+                    # _apply_search_filters' metadata read.
+                    self._result = [
+                        (rid, ts, "claude_code:abc",
+                         "acme/widget" if rid == "999" else "other/repo",
+                         False, "claude_code")
+                        for rid in (params[0] if params else [])
+                    ]
+                elif "FROM episodes" in s:
+                    # The literal candidate pool. Pushdown present -> the DB
+                    # itself returns only the matching row, however deep it is.
+                    if "kf_project" in s:
+                        self._result = [
+                            ("999", "khipu memory deep match", [], [], [], [], ts, 2)
+                        ]
+                    else:
+                        self._result = [
+                            (str(i), "khipu memory decoy", [], [], [], [], ts, 2)
+                            for i in range(1, 51)
+                        ]
+                else:
+                    self._result = []
+
+            def fetchall(self):
+                return list(self._result)
+
+            def fetchone(self):
+                return self._result[0] if self._result else None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        return FakeCur()
+
+    def _search(self, cur, **kw):
+        import contextlib
+        from unittest import mock
+
+        class FakeConn:
+            def cursor(self_inner):
+                return cur
+
+        @contextlib.contextmanager
+        def _hub():
+            yield FakeConn()
+
+        with mock.patch("khipu.hub_snapshot.try_hub_connect", _hub), \
+                mock.patch("khipu.topic_graph.enrich_search_results",
+                           side_effect=lambda c, rows: list(rows)):
+            return em.hybrid_search("khipu memory", limit=5, mode="literal", **kw)
+
+    def test_a_filtered_search_reaches_a_row_outside_the_unfiltered_pool(self):
+        plain = self._search(self._cursor())
+        self.assertNotIn("999", [str(r["id"]) for r in plain["results"]],
+                         "999 is deliberately outside the unfiltered top pool")
+
+        cur = self._cursor()
+        filtered = self._search(cur, project="acme/widget")
+        self.assertEqual([str(r["id"]) for r in filtered["results"]], ["999"])
+        pool_sql = [s for s in cur.statements if "FROM episodes" in s and "ANY" not in s]
+        self.assertTrue(pool_sql)
+        self.assertIn("COALESCE(project, scope) ILIKE %(kf_project)s", pool_sql[0])
+
+    def test_episode_only_filters_drop_the_topic_and_node_queries_entirely(self):
+        cur = self._cursor()
+        self._search(cur, session_id="claude_code:abc")
+        self.assertFalse([s for s in cur.statements
+                          if "FROM topics" in s and "SELECT slug" in s],
+                         "session_id is episode-only; topics must not be queried")
+        pool_sql = [s for s in cur.statements if "FROM episodes" in s and "ANY" not in s]
+        self.assertIn("session_id LIKE %(kf_session)s", pool_sql[0])
+
+    def test_time_bounds_reach_every_kind_that_has_a_timestamp(self):
+        f = em._SearchFilters(since="7d", until=None)
+        self.assertTrue(f.active)
+        self.assertFalse(f.episode_only)
+        self.assertIn("COALESCE(t.updated_at, t.created_at) >= %(kf_since)s", f.topic_sql("t"))
+        self.assertIn("n.built_at >= %(kf_since)s", f.node_sql("n"))
+        self.assertFalse(f.media_allowed, "media has no timestamp to bound")
+
+    def test_no_filters_means_no_predicates_and_no_params(self):
+        f = em._SearchFilters()
+        self.assertFalse(f.active)
+        self.assertEqual(f.params, {})
+        self.assertEqual(f.topic_sql(), "TRUE")
+        self.assertEqual(f.node_sql(), "TRUE")
+
+    def test_harness_falls_back_to_the_session_id_prefix_without_the_column(self):
+        class NoHarnessCur:
+            def execute(self, sql, params=None):
+                self._r = [(c,) for c in ("id", "ts", "session_id", "scope")]
+
+            def fetchall(self):
+                return list(self._r)
+
+        f = em._SearchFilters(harness="cursor")
+        sql = f.episode_sql(NoHarnessCur(), "e")
+        self.assertIn("split_part(COALESCE(e.session_id, ''), ':', 1) = %(kf_harness)s", sql)
+        self.assertNotIn("e.harness", sql)
+
+
+class CommitmentCoverageTest(unittest.TestCase):
+    """Audit 2026-09-04: commitments carry vectors (migration 0009) and
+    commitments.auto_close depends on them, but `khipu embed status` reported
+    nothing about them — a hub whose commitment catch-up had fallen behind
+    looked perfectly green."""
+
+    class _Cur:
+        def __init__(self, *, has_commitments=True):
+            self.has_commitments = has_commitments
+            self._result: list[tuple] = []
+
+        def execute(self, sql, params=None):
+            s = " ".join(sql.split())
+            if "to_regclass('public.media_assets')" in s:
+                self._result = [(False,)]
+            elif "to_regclass('public.commitments')" in s:
+                self._result = [(self.has_commitments,)]
+            elif "information_schema.columns" in s:
+                self._result = [(c,) for c in ("id", "ts", "summary", "deleted_at")]
+            elif "COUNT(*) FROM episodes" in s:
+                self._result = [(10,)]
+            elif "COUNT(*) FROM topics" in s:
+                self._result = [(4,)]
+            elif "COUNT(*) FROM commitments" in s:
+                self._result = [(6,)]
+            elif "JOIN commitments" in s:
+                self._result = [(2, 3)]
+            elif "JOIN episodes" in s:
+                self._result = [(10, 12)]
+            elif "GROUP BY kind" in s:
+                self._result = [("episode", 10, 12), ("topic", 4, 5), ("commitment", 2, 3)]
+            elif "FROM embedding_profiles ORDER BY" in s:
+                self._result = [("p1", "m", 768, True)]
+            elif "FROM embedding_profiles WHERE is_active" in s:
+                self._result = [("p1",)]
+            else:
+                self._result = []
+
+        def fetchone(self):
+            return self._result[0] if self._result else None
+
+        def fetchall(self):
+            return list(self._result)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _coverage(self, cur):
+        from unittest import mock
+
+        class FakeConn:
+            def cursor(self_inner):
+                return cur
+
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+
+        with mock.patch("khipu.db.connect", return_value=FakeConn()), \
+                mock.patch.object(em, "_resolve_profile", return_value="p1"):
+            return em.coverage()
+
+    def test_commitments_are_reported(self):
+        cov = self._coverage(self._Cur())
+        self.assertEqual(cov["commitments"],
+                         {"total": 6, "embedded": 2, "missing": 4, "chunks": 3, "pct": 33.3})
+
+    def test_a_pre_0009_hub_reports_zeroes_not_an_error(self):
+        cov = self._coverage(self._Cur(has_commitments=False))
+        self.assertEqual(cov["commitments"]["total"], 0)
+        self.assertEqual(cov["commitments"]["missing"], 0)
+
+
+class BackfillCommitmentKindTest(unittest.TestCase):
+    """`khipu embed backfill --kind commitment` heals commitment vectors the
+    Stop-hook catch-up fell behind on. Opt-in only: never part of the default
+    all-kinds sweep (their vectors serve auto_close, not generic search)."""
+
+    class _Cur:
+        def __init__(self):
+            self.statements: list[str] = []
+            self._result: list[tuple] = []
+
+        def execute(self, sql, params=None):
+            s = " ".join(sql.split())
+            self.statements.append(s)
+            if "information_schema.columns" in s:
+                self._result = [(c,) for c in ("id", "summary", "deleted_at")]
+            elif "FROM commitments" in s:
+                self._result = [(7, "ship the merge fix"), (8, "   ")]
+            elif "FROM episodes" in s:
+                self._result = []
+            elif "FROM topics" in s:
+                self._result = []
+            else:
+                self._result = []
+
+        def fetchall(self):
+            return list(self._result)
+
+        def fetchone(self):
+            return self._result[0] if self._result else None
+
+    def test_kind_commitment_yields_open_commitments(self):
+        cur = self._Cur()
+        rows = list(em._iter_sources(cur, kind="commitment"))
+        self.assertEqual([(k, r) for k, r, _t, _ti in rows], [("commitment", "7")])
+        self.assertTrue(any("status = 'open'" in s for s in cur.statements))
+
+    def test_the_default_sweep_never_touches_commitments(self):
+        cur = self._Cur()
+        list(em._iter_sources(cur, kind=None))
+        self.assertFalse([s for s in cur.statements if "FROM commitments" in s])
+
+    def test_the_cli_accepts_the_new_kind(self):
+        from khipu.cli import build_parser
+
+        args = build_parser().parse_args(["embed", "backfill", "--kind", "commitment"])
+        self.assertEqual(args.kind, "commitment")

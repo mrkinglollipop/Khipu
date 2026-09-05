@@ -175,7 +175,10 @@ def khipu_app_version() -> str:
     app = str(versions.get("khipu_app") or "").strip()
     if app:
         return app
-    return "0.3.14"
+    # Never invent a version. The hardcoded "0.3.14" kept reporting a shipped
+    # release long after 0.3.16 (audit 2026-09-04); the desktop app passes
+    # KHIPU_APP_VERSION, so an unset value here means genuinely unknown.
+    return "unknown"
 
 
 def is_forbidden_postgres_image(image: str) -> bool:

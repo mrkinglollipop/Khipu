@@ -577,7 +577,7 @@ def _search_query(
             SELECT 'episode' AS kind, id::text AS id, summary AS label,
                    summary AS snippet
             FROM episodes
-            WHERE {episode_where}
+            WHERE {_episode_live_clause(cur)}({episode_where})
             ORDER BY {episode_order}
             LIMIT %(lim)s
             """,
@@ -602,6 +602,24 @@ def _search_query(
     return results
 
 
+def _episode_live_clause(cur) -> str:
+    """``deleted_at IS NULL AND `` when the episodes table has the column.
+
+    A forgotten episode (``khipu episode --forget``) is a tombstone: topics
+    have excluded ``deleted_at IS NOT NULL`` rows from every keyword query
+    since 0010, but the episode branches did not, so a forgotten episode came
+    straight back on the next search (audit 2026-09-04). Gated on the column
+    existing, same posture as ``embed.coverage`` / ``activity`` on a
+    pre-migration hub.
+    """
+    from khipu.db import has_columns
+
+    try:
+        return "deleted_at IS NULL AND " if has_columns(cur, "episodes", "deleted_at") else ""
+    except Exception:  # noqa: BLE001 — schema probe must never break a search
+        return ""
+
+
 def _episode_rank_text(summary, topics, decisions, preferences, people) -> str:
     """Full (unclipped) episode text for ranking — delegates to embed.episode_text
     (no byte copy) so the two never drift on what "the episode's text" means."""
@@ -623,7 +641,7 @@ def _neg_ts_sort_key(ts) -> float:
 
 
 def _literal_candidates(
-    cur, term: str, limit: int, *, kind: str | None = None
+    cur, term: str, limit: int, *, kind: str | None = None, filters=None
 ) -> list[dict]:
     """Globally-ranked literal ILIKE candidates for RRF fusion (bugfix,
     reported live: "Recorded mobile followup task" — episode 11286 named the
@@ -656,21 +674,37 @@ def _literal_candidates(
     lim = max(1, int(limit))
     tokens = search_tokens(term)
     pool: list[dict] = []
+    # ``filters`` (embed._SearchFilters) pushes project/since/until/session_id/
+    # harness into THIS pool's SQL instead of trimming it after the fact — a
+    # filtered search used to be blind to anything past literal rank ~50
+    # (audit 2026-09-04). None = unfiltered, exactly as before.
+    ep_filter = tp_filter = nd_filter = "TRUE"
+    filter_params: dict = {}
+    if filters is not None and filters.active:
+        filter_params = filters.params
+        ep_filter = filters.episode_sql(cur)
+        tp_filter = filters.topic_sql()
+        nd_filter = filters.node_sql()
+        if filters.episode_only:
+            active_kinds = [k for k in active_kinds if k == "episode"]
+            if not active_kinds:
+                return []
 
     if not tokens:
         toks = [(term or "").strip()] if (term or "").strip() else []
         if not toks:
             return []
-        params: dict = {"q": f"%{_escape_like(toks[0])}%", "lim": lim}
+        params: dict = {"q": f"%{_escape_like(toks[0])}%", "lim": lim, **filter_params}
         if "topic" in active_kinds:
             cur.execute(
-                """
+                f"""
                 SELECT slug, COALESCE(title, slug) AS label, body,
                        COALESCE(updated_at, created_at) AS ts
                 FROM topics
                 WHERE deleted_at IS NULL AND (
                     body ILIKE %(q)s ESCAPE '\\' OR slug ILIKE %(q)s ESCAPE '\\'
                     OR COALESCE(title, '') ILIKE %(q)s ESCAPE '\\')
+                  AND ({tp_filter})
                 ORDER BY slug ASC
                 LIMIT %(lim)s
                 """,
@@ -694,7 +728,8 @@ def _literal_candidates(
                 f"""
                 SELECT id::text, summary, topics, decisions, preferences, people, ts
                 FROM episodes
-                WHERE {episode_ilike_where}
+                WHERE {_episode_live_clause(cur)}({episode_ilike_where})
+                  AND ({ep_filter})
                 ORDER BY ts DESC NULLS LAST, id DESC
                 LIMIT %(lim)s
                 """,
@@ -708,10 +743,11 @@ def _literal_candidates(
                 })
         if "node" in active_kinds:
             cur.execute(
-                """
+                f"""
                 SELECT id, COALESCE(name, id) AS label, payload::text AS payload
                 FROM nodes
-                WHERE id ILIKE %(q)s ESCAPE '\\' OR COALESCE(name, '') ILIKE %(q)s ESCAPE '\\'
+                WHERE (id ILIKE %(q)s ESCAPE '\\' OR COALESCE(name, '') ILIKE %(q)s ESCAPE '\\')
+                  AND ({nd_filter})
                 ORDER BY id ASC
                 LIMIT %(lim)s
                 """,
@@ -724,7 +760,7 @@ def _literal_candidates(
                     "rank_text": f"{label}\n{payload or ''}", "hits": 1, "ts": None,
                 })
     else:
-        params = _ilike_token_params(tokens)
+        params = {**_ilike_token_params(tokens), **filter_params}
         n = len(tokens)
         if "topic" in active_kinds:
             topic_where, topic_score = _token_match_sql(("body", "slug", "COALESCE(title, '')"), n)
@@ -733,7 +769,7 @@ def _literal_candidates(
                 SELECT slug, COALESCE(title, slug) AS label, body,
                        COALESCE(updated_at, created_at) AS ts, ({topic_score}) AS hits
                 FROM topics
-                WHERE deleted_at IS NULL AND ({topic_where})
+                WHERE deleted_at IS NULL AND ({topic_where}) AND ({tp_filter})
                 ORDER BY hits DESC, slug ASC
                 LIMIT %(lim)s
                 """,
@@ -751,7 +787,7 @@ def _literal_candidates(
                 SELECT id::text, summary, topics, decisions, preferences, people, ts,
                        ({episode_score}) AS hits
                 FROM episodes
-                WHERE {episode_where}
+                WHERE {_episode_live_clause(cur)}({episode_where}) AND ({ep_filter})
                 ORDER BY hits DESC, ts DESC NULLS LAST, id DESC
                 LIMIT %(lim)s
                 """,
@@ -769,7 +805,7 @@ def _literal_candidates(
                 f"""
                 SELECT id, COALESCE(name, id) AS label, payload::text AS payload, ({node_score}) AS hits
                 FROM nodes
-                WHERE {node_where}
+                WHERE ({node_where}) AND ({nd_filter})
                 ORDER BY hits DESC, id ASC
                 LIMIT %(lim)s
                 """,
@@ -1380,6 +1416,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
 
 def cmd_config(args: argparse.Namespace) -> int:
     from khipu.config import (
+        FLOAT_SETTINGS,
         capture_mode,
         config_file,
         gateway_url,
@@ -1395,6 +1432,26 @@ def cmd_config(args: argparse.Namespace) -> int:
     if args.set_gateway_url is not None:
         path = set_gateway_url(args.set_gateway_url)
         print(json.dumps({"gateway_url": gateway_url(), "config_file": str(path)}))
+        return 0
+    if args.set and args.set[0] in FLOAT_SETTINGS:
+        # dedup_similarity / commitment_close_similarity are floats, not paths.
+        # `--set` routed every key through set_path_setting, which stored them
+        # as expanduser()'d STRINGS — float_setting then ignored the stored
+        # value (it accepts int/float only) and silently kept the default, so
+        # tuning either knob from the CLI did nothing (audit 2026-09-04).
+        from khipu.config import float_setting, set_float_setting
+
+        key, raw = args.set
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            print(json.dumps({"ok": False, "error": f"{key} must be a number, got {raw!r}"}))
+            return 2
+        if not (0.0 <= value <= 1.0):
+            print(json.dumps({"ok": False, "error": f"{key} must be between 0 and 1, got {value}"}))
+            return 2
+        path = set_float_setting(key, value)
+        print(json.dumps({"ok": True, key: float_setting(key), "config_file": str(path)}))
         return 0
     if args.set or args.unset:
         from khipu.config import path_settings_status, set_path_setting
@@ -1670,11 +1727,14 @@ def cmd_integrations(args: argparse.Namespace) -> int:
     targets = list(integ.HARNESSES) if args.harness == "all" else [args.harness]
     project = getattr(args, "project", None)
 
+    # ``project`` reaches EVERY harness, not just grok_bot (audit 2026-09-04):
+    # integrations.verify uses it for the Cursor stale-rule check, so
+    # `khipu integrations verify cursor --project X` silently ignored the flag.
     def _status(h):
-        return integ.status(h, project=project) if h == "grok_bot" else integ.status(h)
+        return integ.status(h, project=project)
 
     def _verify(h):
-        return integ.verify(h, project=project) if h == "grok_bot" else integ.verify(h)
+        return integ.verify(h, project=project)
 
     if args.integ_cmd == "status":
         print(json.dumps([_status(h) for h in targets], indent=2))
@@ -2152,7 +2212,12 @@ def build_parser() -> argparse.ArgumentParser:
     bf = em_sub.add_parser(
         "backfill", help="Embed missing/changed episode+topic chunks"
     )
-    bf.add_argument("--kind", choices=("episode", "topic"))
+    bf.add_argument(
+        "--kind",
+        choices=("episode", "topic", "commitment"),
+        help="commitment is opt-in: it heals commitment vectors the Stop-hook "
+        "catch-up fell behind on, and is never part of the default sweep",
+    )
     bf.add_argument("--limit", type=int, help="Cap chunks this run (pilot / smoke)")
     bf.add_argument("--dry-run", action="store_true", help="Count only; no API calls")
     bf.add_argument(
@@ -2549,9 +2614,10 @@ def build_parser() -> argparse.ArgumentParser:
     cfg.add_argument(
         "--set",
         nargs=2,
-        metavar=("KEY", "PATH"),
-        help="Persist a machine-specific path: memory_root, memory_repo, "
-        "capture_v2, graph_sqlite, gemini_key_file",
+        metavar=("KEY", "VALUE"),
+        help="Persist a machine-specific path (memory_root, memory_repo, "
+        "capture_v2, graph_sqlite, gemini_key_file) or a 0-1 similarity knob "
+        "(dedup_similarity, commitment_close_similarity)",
     )
     cfg.add_argument("--unset", metavar="KEY", help="Remove a path setting")
     cfg.add_argument(

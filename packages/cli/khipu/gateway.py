@@ -34,7 +34,12 @@ from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from khipu.mcp_server import SERVER_NAME, SERVER_VERSION, handle_message
+from khipu.mcp_server import (
+    SERVER_NAME,
+    SERVER_VERSION,
+    handle_message,
+    mark_gateway_active,
+)
 
 MAX_BODY = 1024 * 1024
 RATE_PER_MIN = int(os.environ.get("KHIPU_GATEWAY_RATE_PER_MIN", "120"))
@@ -216,9 +221,16 @@ class Handler(BaseHTTPRequestHandler):
                 tool = str((m.get("params") or {}).get("name") or "")
             try:
                 r = handle_message(m)
-            except Exception as exc:  # noqa: BLE001 — never let one message kill the server
+            except KeyboardInterrupt:
+                raise
+            except BaseException as exc:  # noqa: BLE001 — never let one message kill
+                # the server. BaseException, not Exception: capture.load_payload
+                # raises SystemExit on a malformed payload, which used to unwind
+                # straight through the request thread (audit 2026-09-04).
+                detail = (f"SystemExit: capture rejected the payload (exit {exc.code})"
+                          if isinstance(exc, SystemExit) else f"{type(exc).__name__}: {exc}")
                 r = {"jsonrpc": "2.0", "id": m.get("id"),
-                     "error": {"code": -32603, "message": f"{type(exc).__name__}: {exc}"}}
+                     "error": {"code": -32603, "message": detail}}
             if r is not None:
                 responses.append(r)
         if not responses:  # only notifications
@@ -236,6 +248,11 @@ def serve(bind: str = "127.0.0.1:8787", token: str | None = None) -> None:
     token = token if token is not None else os.environ.get("KHIPU_GATEWAY_TOKEN", "")
     if len(token) < 24:
         raise SystemExit("refusing to start: KHIPU_GATEWAY_TOKEN missing or shorter than 24 chars")
+    # Tell mcp_server this process IS the gateway. The old detector walked the
+    # call stack for a "khipu.gateway" frame, which never matches in the
+    # container (`python -m khipu.gateway` → __name__ == "__main__"), so every
+    # gateway capture was rejected as a local double-write (audit 2026-09-04).
+    mark_gateway_active()
     host, _, port = bind.rpartition(":")
     Handler.token = token
     Handler.rate = _Rate(RATE_PER_MIN)

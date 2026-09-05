@@ -272,7 +272,13 @@ def project_slice(
                     slug = str(t).strip()
                     if slug and slug not in topic_slugs:
                         topic_slugs.append(slug)
-            topic_slugs = topic_slugs[:topic_limit]
+            # Over-fetch, THEN trim (audit 2026-09-04). Trimming the candidate
+            # slugs to topic_limit before the existence lookup meant a capture
+            # whose first N topics were tags or deleted pages returned fewer
+            # rows than asked for — sometimes none — while real topic pages sat
+            # just past the cut. Bounded so a chatty episode list can't send an
+            # unbounded ANY() array.
+            topic_slugs = topic_slugs[: max(topic_limit * 8, topic_limit)]
             if topic_slugs:
                 cur.execute(
                     """
@@ -283,9 +289,13 @@ def project_slice(
                     (topic_slugs,),
                 )
                 now = datetime.now(timezone.utc)
+                order = {s: i for i, s in enumerate(topic_slugs)}
+                found = []
                 for slug, title, when in cur.fetchall():
                     age_days = (now - when).days if when is not None else None
-                    topics.append({"slug": slug, "title": title, "age_days": age_days})
+                    found.append({"slug": slug, "title": title, "age_days": age_days})
+                found.sort(key=lambda t: order.get(t["slug"], len(order)))
+                topics.extend(found[:topic_limit])
 
             # W4.3: harness-native notes (khipu.notes.reconcile) carry no
             # episode link at all — they never went through a capture — so
