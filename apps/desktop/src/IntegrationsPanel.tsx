@@ -217,7 +217,12 @@ export function verifiedLine(
   harness: string,
   fresh: Probe | undefined,
   stored: RecallProbeStatus | null,
+  lv?: HarnessLiveness,
 ): { mark: Mark; text: string } {
+  // A live capture beat is real evidence the hook works, even with no timed
+  // round-trip probe for this pack yet — only the timing is missing, not the
+  // "does it work at all" answer (2026-09-05 pixel-pass finding 3).
+  const liveBeat = lv?.ok !== false && lv?.seen && (lv.captures ?? 0) > 0;
   if (fresh) {
     if (fresh.status === "skipped") {
       return {
@@ -261,6 +266,12 @@ export function verifiedLine(
   }
   const last = stored?.last_probe;
   if (!last) {
+    if (liveBeat) {
+      return {
+        mark: "ok",
+        text: `Working · hook ran ${fmtAge(lv?.last_captured_age_s)} ago · Verify to time a round trip`,
+      };
+    }
     return { mark: "off", text: "Not verified on this pack yet — Verify runs it" };
   }
   if (last.harness !== harness) {
@@ -268,6 +279,14 @@ export function verifiedLine(
     // about this Mac and none at all about this pack, so it is reported as
     // what it is rather than borrowed as a green tick here.
     const other = LABEL[last.harness as HarnessId] ?? last.harness ?? "another pack";
+    if (liveBeat) {
+      return {
+        mark: "ok",
+        text:
+          `Working · hook ran ${fmtAge(lv?.last_captured_age_s)} ago · Verify to time a round trip` +
+          ` · last timed probe on this Mac was for ${other}`,
+      };
+    }
     return {
       mark: "off",
       text:
@@ -532,7 +551,7 @@ export function IntegrationsPanel({
           const canVerify = r.harness === "grok_bot" ? r.detected : installed;
           const verified = justAutoVerified
             ? { mark: "ok" as Mark, text: "Verified — a session ran the hook after Install, no click needed" }
-            : verifiedLine(r.harness, v?.components?.recall_probe, recallProbe);
+            : verifiedLine(r.harness, v?.components?.recall_probe, recallProbe, lv);
           const awaitingAutoVerify = installedAt[r.harness] != null && !justAutoVerified;
 
           // 1. Capture hook — the heartbeat, not the config file.

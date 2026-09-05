@@ -319,6 +319,16 @@ button.rail-feedback {
 -------------------------------------------------------------------------- */
 
 .main {
+  /* `.main` is a `.shell` grid item with the default `min-height: auto`,
+     which sizes the item (and so the grid row, and so `.shell` itself) to
+     fit its tallest panel's content instead of the window's actual height —
+     "grid blowout". That leaves nothing for `overflow-y: auto` to scroll
+     *within*: a step taller than the 1100x720 window (Model, Finish) then
+     has its bottom nav pushed off the fixed-size native window with no way
+     to reach it (2026-09-05 pixel-pass finding 4). Bounding both dimensions
+     to the grid track makes `.main` the actual scroll container. */
+  min-height: 0;
+  height: 100%;
   overflow-y: auto;
   background: var(--bg);
 }
@@ -949,7 +959,13 @@ button.toast-close:hover {
   max-width: none;
   min-height: calc(100vh - 56px);
   align-items: center;
-  justify-content: center;
+  /* Plain `center` on an overflowing flex column splits the overflow evenly
+     above and below, so the top (and any nav pinned at the card's bottom)
+     becomes unreachable even once `.main` itself scrolls. `safe center`
+     keeps the centering when the card fits and falls back to start-aligned
+     (scrollable from the top) the moment it does not — 2026-09-05 pixel-pass
+     finding 4. */
+  justify-content: safe center;
   padding-top: 44px;
 }
 

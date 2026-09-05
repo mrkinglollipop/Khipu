@@ -142,21 +142,43 @@ def install_graphify(*, first_run: bool = True) -> dict[str, Any]:
     semver = str(pending.get("graphify_semver") or "").strip()
     url = str(pending.get("graphify_tarball_url") or "").strip()
     if not semver or not url:
-        return {"ok": False, "error": "missing_pending_graphify_fields"}
+        return {
+            "ok": False,
+            "error": "missing_pending_graphify_fields",
+            "title": "The graph builder's install details are missing",
+            "detail": "Khipu did not record which graph-builder version to install.",
+            "fix": "Go back to the Database step and continue again, or skip this step and install the graph builder later from Settings → Components.",
+        }
 
     postgres = versions.get("postgres") if isinstance(versions.get("postgres"), dict) else {}
     mode = str(postgres.get("mode") or "local_docker")
-    row = match_row_for_install(
+    match_mode = "remote" if mode == "remote" else "local_docker"
+    match_kwargs = dict(
         graphify_semver=semver,
         graphify_tarball_url=url,
         postgres_image=str(pending.get("postgres_image") or postgres.get("image") or ""),
         pgvector_min=str(pending.get("pgvector_min") or ""),
-        mode="remote" if mode == "remote" else "local_docker",
+        mode=match_mode,
     )
+    row = match_row_for_install(**match_kwargs)
     if row is None:
+        # The compat matrix may simply be stale (a dev build's version can be
+        # newer than any khipu_app_min row) — refresh once and retry before
+        # refusing for good.
+        try:
+            refresh_matrix_cache()
+        except (OSError, urllib.error.URLError, ValueError):
+            pass
+        row = match_row_for_install(**match_kwargs)
+    if row is None:
+        app = khipu_app_version()
         return {
             "ok": False,
             "error": "matrix_row_refused",
+            "title": "No graph builder is listed for this Khipu yet",
+            "detail": f"Khipu {app} is not in the compatibility list (graph builder {semver}).",
+            "fix": "Update Khipu, or skip this step and install the graph builder later from Settings → Components.",
+            "khipu_app": app,
             "graphify_semver": semver,
             "graphify_tarball_url": url,
         }
@@ -167,16 +189,36 @@ def install_graphify(*, first_run: bool = True) -> dict[str, Any]:
         try:
             _download(url, archive)
         except (OSError, urllib.error.URLError) as exc:
-            return {"ok": False, "error": "download_failed", "detail": str(exc), "url": url}
+            return {
+                "ok": False,
+                "error": "download_failed",
+                "title": "Could not download the graph builder",
+                "detail": f"{type(exc).__name__}: {exc}",
+                "fix": "Check the connection and retry.",
+                "url": url,
+            }
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         try:
             _extract_tarball(archive, dest)
         except (tarfile.TarError, OSError) as exc:
-            return {"ok": False, "error": "extract_failed", "detail": str(exc)}
+            return {
+                "ok": False,
+                "error": "extract_failed",
+                "title": "Could not unpack the graph builder",
+                "detail": f"{type(exc).__name__}: {exc}",
+                "fix": "Retry the install; if it keeps failing, skip this step and install it later from Settings → Components.",
+            }
 
     script = dest / "graphify_nightly.py"
     if not script.is_file():
-        return {"ok": False, "error": "missing_graphify_nightly", "path": str(dest)}
+        return {
+            "ok": False,
+            "error": "missing_graphify_nightly",
+            "title": "The downloaded graph builder is incomplete",
+            "detail": f"No graphify_nightly.py was found under {dest}.",
+            "fix": "Retry the install; if it keeps failing, skip this step and install it later from Settings → Components.",
+            "path": str(dest),
+        }
 
     _ensure_empty_sources()
     versions["graphify"] = {"semver": semver, "path": str(dest)}
