@@ -1,12 +1,15 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { resourceDir } from "@tauri-apps/api/path";
-import { Check, ChevronLeft, ChevronRight } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
 import { WorkingBanner } from "./WorkingBanner";
 import { Callout, Tag } from "./ui";
 import { SetupStages } from "./SetupStages";
 import type { SetupPhase, SetupPipelineResult } from "./SetupStages";
+import { buildAttention, type Attention } from "./doctorAttention";
+import type { RecallProbeStatus } from "./IntegrationsPanel";
+import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVerify";
 
 /** `docs/plans/2026-09-05-setup-that-cannot-strand-you.md` stage ids.
  *  Preflight (`khipu db preflight`) only ever reaches `reach..graph`; a full
@@ -72,7 +75,15 @@ function parse(raw: string): Record<string, unknown> | null {
 
 type MigratePlan = { applied?: string[]; pending?: string[]; ran?: string[] };
 type Presence = { gemini_in_keychain?: boolean; gemini_env?: boolean };
-type HarnessRow = { harness: string; detected?: boolean; installed?: boolean };
+type HarnessRow = {
+  harness: string;
+  detected?: boolean;
+  installed?: boolean;
+  mcp?: boolean;
+  hook_stop?: boolean;
+  hook_precompact?: boolean;
+  last_beat_at?: string | null;
+};
 type DoctorPayload = {
   ok?: boolean;
   not_configured?: string[];
@@ -88,60 +99,22 @@ type DoctorPayload = {
   graph_backup_ok?: boolean;
   graph_offsite_ok?: boolean;
   recall_probe_ok?: boolean;
+  recall_probe?: RecallProbeStatus;
   bundle_seal_ok?: boolean;
   hub_snapshot?: { ok?: boolean };
 };
 
-/** One plain sentence per check that can be red, so the last step of setup
- *  never hands a first-run user a field name (`capture_liveness_ok`) and a
- *  pane that no longer exists. Anything not named here is reported by its own
- *  key rather than silently dropped. */
-const CHECK_IN_WORDS: Record<string, string> = {
-  backup_ok: "No recent backup of the database has been recorded yet.",
-  drift_ok: "Some note files no longer match the database.",
-  graph_drift_ok: "The connections index is behind its source.",
-  outbox_ok: "Some recorded sessions are still waiting to reach the database.",
-  capture_liveness_ok: "A harness has stopped recording sessions.",
-  git_sync_ok: "The nightly off-site copy of your notes is not landing.",
-  dsn_file_ok: "The saved database connection cannot be read.",
-  index_freshness_ok: "The index an agent reads first has not been rebuilt today.",
-  embed_coverage_ok: "Some sessions are not in the search index yet.",
-  graph_backup_ok: "The saved copy of the connections index is stale.",
-  graph_offsite_ok: "The off-site copy of the connections index is stale.",
-  recall_probe_ok:
-    "Nothing has proved end to end that a session can be recorded and found again.",
-  bundle_seal_ok: "This copy of Khipu has been altered since it was signed.",
-};
-
-function redChecks(doctor: DoctorPayload | null): string[] {
-  if (!doctor) return [];
-  const out: string[] = [];
-  for (const [key, value] of Object.entries(doctor)) {
-    if (!key.endsWith("_ok") || value !== false) continue;
-    out.push(CHECK_IN_WORDS[key] ?? key.replace(/_ok$/, "").replace(/_/g, " "));
-  }
-  if (doctor.hub_snapshot?.ok === false) {
-    out.push("The offline copy of your memory is behind.");
-  }
-  return out;
-}
-
-function soleBackupRedFlag(doctor: DoctorPayload | null): boolean {
-  if (!doctor || doctor.ok) return false;
-  if (doctor.backup_ok !== false) return false;
-  for (const key of [
-    "drift_ok",
-    "graph_drift_ok",
-    "outbox_ok",
-    "capture_liveness_ok",
-    "git_sync_ok",
-    "dsn_file_ok",
-    "index_freshness_ok",
-    "embed_coverage_ok",
-  ] as const) {
-    if (doctor[key] === false) return false;
-  }
-  return true;
+/** True once at least one harness's own last probe (`probe-<harness>.json`)
+ *  passed and is not stale — real evidence that recall works end to end,
+ *  even when the single most-recent probe across every harness (what
+ *  `recall_probe_ok` gates on) happens to be a different, older or failed
+ *  run. Finish only runs its own app-labeled probe when this is false: if a
+ *  harness has already proven the round trip, running a second one from
+ *  Finish would just be noise. */
+function anyHarnessVerified(rp: RecallProbeStatus | null | undefined): boolean {
+  const harnesses = rp?.harnesses;
+  if (!harnesses) return false;
+  return Object.values(harnesses).some((v) => v?.ok === true && v?.stale !== true);
 }
 
 /** True when the bundle is on the shipped DMG volume, not /Applications or a
@@ -292,6 +265,32 @@ export function Welcome({
   useEffect(() => {
     if (step === "database" && dbMode === "local") void refreshDocker();
   }, [step, dbMode, refreshDocker]);
+
+  // "the Docker step polls every 5 s after the download link opens and
+  // advances by itself" — once the user clicks the download link, this Mac
+  // does not yet have Docker, so there is nothing to do but wait; polling
+  // means the person never has to remember to come back and click Recheck.
+  // Capped at 15 minutes (an install this Mac cannot finish is a Docker
+  // problem to go solve, not something to poll forever for).
+  const [dockerLinkClicked, setDockerLinkClicked] = useState(false);
+  const dockerPollCount = useRef(0);
+  useEffect(() => {
+    if (!(step === "database" && dbMode === "local" && dockerLinkClicked) || dockerOk === true) {
+      dockerPollCount.current = 0;
+      return;
+    }
+    const DOCKER_POLL_MS = 5_000;
+    const DOCKER_POLL_MAX = 180; // 15 min at 5 s
+    const id = window.setInterval(() => {
+      dockerPollCount.current += 1;
+      if (dockerPollCount.current > DOCKER_POLL_MAX) {
+        window.clearInterval(id);
+        return;
+      }
+      void refreshDocker();
+    }, DOCKER_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [step, dbMode, dockerLinkClicked, dockerOk, refreshDocker]);
 
   useEffect(() => {
     if (step === "database" && dsnOk) void loadPlan();
@@ -601,6 +600,29 @@ export function Welcome({
   useEffect(() => {
     if (step === "model") void loadPresence();
   }, [step, loadPresence]);
+
+  const [modelVerify, setModelVerify] = useState<ModelVerifyResult | null>(null);
+  const [verifying, setVerifying] = useState(false);
+  /** "A model key is proven on save with one real call" — one cheap, real
+   *  API call per configured provider (`khipu.modelcheck.check_model_keys`
+   *  via the `khipu_secrets_verify` fixed-argv command), never the key
+   *  itself. Runs right after a key save, and again on "Check again". */
+  const verifyModelKeys = useCallback(async () => {
+    setVerifying(true);
+    try {
+      const raw = await invoke<string>("khipu_secrets_verify");
+      const out = parse(raw) as unknown as ModelVerifyResult | null;
+      setModelVerify(out);
+    } catch (e) {
+      setModelVerify({
+        ok: false,
+        checks: [{ id: "error", ok: false, title: "Key check failed", detail: String(e), model: null, seconds: 0 }],
+      });
+    } finally {
+      setVerifying(false);
+    }
+  }, []);
+
   const saveKey = useCallback(async () => {
     const value = key.trim();
     if (!value) return;
@@ -612,6 +634,7 @@ export function Welcome({
         setKey("");
         setKeyMsg("Saved to Keychain.");
         await loadPresence();
+        await verifyModelKeys();
       } else {
         setKeyMsg(String(out?.error ?? "Could not save the key."));
       }
@@ -620,7 +643,7 @@ export function Welcome({
     } finally {
       setSaving(false);
     }
-  }, [key, loadPresence]);
+  }, [key, loadPresence, verifyModelKeys]);
 
   const saveOpenaiKey = useCallback(async () => {
     const value = openaiKey.trim();
@@ -636,6 +659,7 @@ export function Welcome({
         setOpenaiKey("");
         setKeyMsg("OpenAI-compat key saved to Keychain.");
         await loadPresence();
+        await verifyModelKeys();
       } else {
         setKeyMsg(String(out?.error ?? "Could not save the key."));
       }
@@ -750,45 +774,103 @@ export function Welcome({
   const [doctor, setDoctor] = useState<DoctorPayload | null>(null);
   const [doctorErr, setDoctorErr] = useState<string | null>(null);
   const [doctorBusy, setDoctorBusy] = useState(false);
-  useEffect(() => {
-    if (step !== "finish") return;
-    let alive = true;
-    // Drop the last payload immediately. Leaving Finish and returning used to
-    // keep doctor.ok / "Doctor is green" / canFinish true while a new
-    // `khipu doctor` ran (first visit is already doctor == null).
-    setDoctor(null);
+  const [probeSeconds, setProbeSeconds] = useState<number | null>(null);
+  const [fixBusy, setFixBusy] = useState<string | null>(null);
+  // Invalidates any in-flight `reloadDoctor()` run when the user leaves
+  // Finish and comes back (or the component unmounts) — a stale response
+  // landing after a fresh run started used to resurrect the previous
+  // payload (doctor.ok / canFinish) as if nothing had changed.
+  const doctorRunId = useRef(0);
+
+  const reloadDoctor = useCallback(async () => {
+    const myRun = ++doctorRunId.current;
     setDoctorErr(null);
     setDoctorBusy(true);
-    void (async () => {
-      try {
-        const payload = parse(await runKhipu(["doctor"])) as DoctorPayload;
-        if (!alive) return;
-        setDoctor(payload);
-      } catch (e) {
-        if (!alive) return;
-        setDoctorErr(String(e));
-      } finally {
-        if (alive) setDoctorBusy(false);
+    try {
+      let payload = parse(await runKhipu(["doctor"])) as DoctorPayload | null;
+      if (doctorRunId.current !== myRun) return;
+      // "Finish runs the app probe itself" (scope doc, "Finish, keys,
+      // harnesses, Docker"): a red recall_probe_ok that no harness has
+      // separately proven is not a wall — Finish earns the gate itself
+      // rather than sending the user hunting for a Verify button first.
+      if (payload && payload.recall_probe_ok === false && !anyHarnessVerified(payload.recall_probe)) {
+        try {
+          const probed = parse(
+            await runKhipu(["doctor", "--probe", "--harness", "app"]),
+          ) as DoctorPayload | null;
+          if (doctorRunId.current !== myRun) return;
+          if (probed) {
+            payload = probed;
+            const seconds = probed.recall_probe?.last_probe?.seconds;
+            if (typeof seconds === "number") setProbeSeconds(seconds);
+          }
+        } catch {
+          // Keep the plain doctor payload; its row still shows the fix.
+        }
       }
-    })();
-    return () => {
-      alive = false;
-      setDoctor(null);
-      setDoctorErr(null);
-      setDoctorBusy(false);
-    };
-  }, [step, runKhipu]);
+      if (doctorRunId.current !== myRun) return;
+      setDoctor(payload);
+    } catch (e) {
+      if (doctorRunId.current === myRun) setDoctorErr(String(e));
+    } finally {
+      if (doctorRunId.current === myRun) setDoctorBusy(false);
+    }
+  }, [runKhipu]);
 
-  const soleBackupRed = soleBackupRedFlag(doctor);
+  useEffect(() => {
+    if (step !== "finish") return;
+    // Invalidate any run from a previous visit and drop its payload
+    // immediately — leaving Finish and returning used to keep doctor.ok /
+    // canFinish true while a new `khipu doctor` ran.
+    doctorRunId.current++;
+    setDoctor(null);
+    setDoctorErr(null);
+    setProbeSeconds(null);
+    void reloadDoctor();
+  }, [step, reloadDoctor]);
 
-  const canFinish =
-    !doctorBusy &&
-    (doctor?.ok === true ||
-      ((dbMode === "remote" || dbMode === "join") && soleBackupRed));
+  const attentionItems: Attention[] = doctor
+    ? buildAttention(doctor as unknown as Record<string, unknown>).items
+    : [];
+
+  /** Finish's list of what "Continue anyway" is continuing past — a title
+   *  per row, plus the health check's own state when it has not produced a
+   *  row list at all yet. Never empty while anything is unproven, so the
+   *  button's own label ("lists what is not yet proven") always has content
+   *  to point at. */
+  const notYetProven: string[] = doctorErr
+    ? [`The health check could not run: ${doctorErr}`]
+    : doctor == null
+      ? ["The health check has not finished running yet."]
+      : attentionItems.map((item) => item.title);
+
+  const runFinishFix = useCallback(
+    async (item: Attention) => {
+      if (!item.fix || item.fix.kind === "revisions") return;
+      setFixBusy(item.key);
+      try {
+        if (item.fix.kind === "reinstall-hook" && item.harness) {
+          await runKhipu(["integrations", "install", item.harness]);
+        } else if (item.fix.kind === "recall-probe") {
+          await runKhipu(["doctor", "--probe"]);
+        }
+      } catch {
+        // reloadDoctor below reports whatever state actually resulted.
+      } finally {
+        setFixBusy(null);
+        await reloadDoctor();
+      }
+    },
+    [runKhipu, reloadDoctor],
+  );
+
+  // "Finish" (the real, all-clear exit) still requires a green doctor.
+  // "Continue anyway" never traps the user, so it is ALWAYS enabled — see
+  // the render below and `notYetProven` for what it is continuing past.
+  const canFinish = doctor?.ok === true;
 
   const finish = (withWarnings = false) => {
-    if (!canFinish) return;
-    if (withWarnings && !soleBackupRed) return;
+    if (!withWarnings && !canFinish) return;
     try {
       window.localStorage.setItem(WELCOME_DONE_KEY, "1");
     } catch {
@@ -798,12 +880,17 @@ export function Welcome({
   };
 
   const pending = plan?.pending?.length ?? 0;
+  // A Mac that is already connected (Settings › Database opens this step
+  // to change or inspect the connection) must never find Next disabled with
+  // nothing to do: keeping the working connection is a complete answer.
+  const alreadyConnected = dsnOk === true && !joinBusy && !dbBusy && !remoteBusy;
   const databaseReady =
-    dbMode === "join"
+    alreadyConnected ||
+    (dbMode === "join"
       ? joinReady && dsnOk
       : dbMode === "local"
         ? localReady && dsnOk
-        : remoteReady && dsnOk;
+        : remoteReady && dsnOk);
 
   const workingLabel =
     joinBusy
@@ -877,6 +964,13 @@ export function Welcome({
       {step === "database" ? (
         <>
           <h1>Connect the database</h1>
+          {alreadyConnected && !joinReady && !localReady && !remoteReady ? (
+            <Callout tone="ok" title="This Mac is already connected">
+              Keep the current connection and press Next, or pick an option below
+              to connect somewhere else. Settings › Database › Move copies your
+              memory to another database without losing anything.
+            </Callout>
+          ) : null}
           <p className="muted">
             Everything Khipu remembers lives in one database. Choose how you
             want to run it.
@@ -986,14 +1080,31 @@ export function Welcome({
             <>
               <p className="muted">
                 Install{" "}
-                <a href="https://docs.docker.com/desktop/setup/install/mac-install/" target="_blank" rel="noreferrer">
+                <a
+                  href="https://docs.docker.com/desktop/setup/install/mac-install/"
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={() => setDockerLinkClicked(true)}
+                >
                   Docker Desktop
                 </a>{" "}
-                (or OrbStack / Colima with the <code>docker</code> CLI), start it, then recheck.
+                (or OrbStack / Colima with the <code>docker</code> CLI), start it — this page
+                notices on its own once it's ready.
               </p>
+              {dockerLinkClicked && dockerOk !== true ? (
+                <p className="muted">
+                  <Loader2 size={14} className="spin" aria-hidden /> Waiting for Docker
+                  Desktop to finish installing…
+                </p>
+              ) : null}
               <div className="toolbar">
-                <button type="button" onClick={() => void refreshDocker()}>Recheck Docker</button>
-                <button type="button" className="primary" disabled={dbBusy} onClick={() => void runLocalSetup()}>
+                <button type="button" onClick={() => void refreshDocker()}>Recheck now</button>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={dbBusy || dockerOk !== true}
+                  onClick={() => void runLocalSetup()}
+                >
                   {dbBusy ? "Setting up…" : "Set up the database on this Mac"}
                 </button>
               </div>
@@ -1054,7 +1165,21 @@ export function Welcome({
             </>
           )}
 
-          {dbMode !== "remote" && dbMsg ? <pre className="code">{dbMsg}</pre> : null}
+          {dbMode !== "remote" && dbMsg ? (
+            /^[a-z]+(_[a-z]+)+$/.test(dbMsg.trim()) ? (
+              <Callout tone="warn" title="Setup could not finish">
+                Something went wrong at this step (details are in the health
+                report). Try again; if it repeats, ask for help with the exact
+                message from Home › Full health report.
+              </Callout>
+            ) : /^\{/.test(dbMsg.trim()) || /error|failed|denied|refused|timeout/i.test(dbMsg) ? (
+              <Callout tone="warn" title="Setup could not finish">
+                {dbMsg.replace(/\s+/g, " ").slice(0, 400)}
+              </Callout>
+            ) : (
+              <Callout tone="neutral" title="Status">{dbMsg.replace(/\s+/g, " ").slice(0, 400)}</Callout>
+            )
+          ) : null}
 
           {dbMode !== "remote" && dsnOk && databaseReady ? (
             <Callout
@@ -1151,6 +1276,11 @@ export function Welcome({
                       {saving ? "Saving…" : "Save Gemini key"}
                     </button>
                   </div>
+                  <ModelCheckRow
+                    check={modelCheckFor(modelVerify, "gemini_generate")}
+                    verifying={verifying}
+                    onRetry={() => void verifyModelKeys()}
+                  />
                 </>
               ) : null}
               {synthChoice === "local" ? (
@@ -1185,6 +1315,11 @@ export function Welcome({
                       Save compat key
                     </button>
                   </div>
+                  <ModelCheckRow
+                    check={modelCheckFor(modelVerify, "openai_compat_generate")}
+                    verifying={verifying}
+                    onRetry={() => void verifyModelKeys()}
+                  />
                 </>
               ) : null}
             </div>
@@ -1244,6 +1379,11 @@ export function Welcome({
                   Semantic search stays empty until a key is set; synth capture can still queue.
                 </Callout>
               ) : null}
+              <ModelCheckRow
+                check={modelCheckFor(modelVerify, "gemini_embed")}
+                verifying={verifying}
+                onRetry={() => void verifyModelKeys()}
+              />
             </div>
           </div>
           {keyMsg ? <pre className="code">{keyMsg}</pre> : null}
@@ -1361,9 +1501,9 @@ export function Welcome({
               {harnesses.map((h) => (
                 <li key={h.harness} className="welcome-harness-row">
                   <strong>{h.harness.replace("_", " ")}</strong>
-                  {h.installed ? (
+                  {h.installed ?? (h.harness === "grok_bot" ? h.mcp : h.mcp && h.hook_stop && h.hook_precompact) ? (
                     <Tag tone="ok" dot>
-                      Installed
+                      {h.last_beat_at ? "Installed · recording" : "Installed"}
                     </Tag>
                   ) : (
                     <span className="muted">
@@ -1394,43 +1534,54 @@ export function Welcome({
           {doctorErr ? (
             <p className="muted">The health check could not run: {doctorErr}</p>
           ) : doctor == null ? (
-            <p className="muted">Running a health check…</p>
-          ) : (
-            <Callout
-              tone={doctor.ok ? "ok" : "warn"}
-              title={
-                doctor.ok
-                  ? "Everything checked out"
-                  : "One thing still needs attention"
-              }
-              action={
-                doctor.ok ? undefined : (
-                  <button type="button" onClick={onFinish}>
-                    Open Home
-                  </button>
-                )
-              }
-            >
-              {doctor.ok ? (
-                doctor.not_configured?.length ? (
-                  <>
-                    Every check that applies to this Mac passed. Not checked here:{" "}
-                    {doctor.not_configured.join(", ")} — normal on a fresh install.
-                  </>
-                ) : (
-                  "Every check passed."
-                )
-              ) : (
+            <p className="muted">{doctorBusy ? "Running a health check…" : "Health check not run yet."}</p>
+          ) : attentionItems.length === 0 ? (
+            <Callout tone="ok" title="Everything checked out">
+              {doctor.not_configured?.length ? (
                 <>
-                  {redChecks(doctor).join(" ")}
-                  {" Home shows each one with the single action that fixes it."}
-                  {soleBackupRed
-                    ? " This is the only red one, and on a database someone else runs it is expected — you can finish anyway."
-                    : null}
+                  Every check that applies to this Mac passed. Not checked here:{" "}
+                  {doctor.not_configured.join(", ")} — normal on a fresh install.
                 </>
+              ) : (
+                "Every check passed."
               )}
             </Callout>
+          ) : (
+            <>
+              <Callout tone="warn" title={`${attentionItems.length} thing${attentionItems.length === 1 ? "" : "s"} still need attention`}>
+                Each row below is one thing that is not proven yet, with the one action that fixes it.
+              </Callout>
+              {attentionItems.map((item) => (
+                <Callout
+                  key={item.key}
+                  tone={item.tone}
+                  title={item.title}
+                  action={
+                    item.fix && item.fix.kind !== "revisions" ? (
+                      <button
+                        type="button"
+                        disabled={fixBusy != null}
+                        onClick={() => void runFinishFix(item)}
+                      >
+                        {fixBusy === item.key ? "Working…" : item.fix.label}
+                      </button>
+                    ) : item.fix ? (
+                      <span className="muted">{item.fix.label} — from Home, after you finish</span>
+                    ) : (
+                      <span className="muted">See Home for more, after you finish</span>
+                    )
+                  }
+                >
+                  {item.cause}
+                </Callout>
+              ))}
+            </>
           )}
+          {probeSeconds != null ? (
+            <Callout tone="ok" title="Memory round trip proved">
+              Memory round trip: {probeSeconds.toFixed(1)} s
+            </Callout>
+          ) : null}
           <p className="muted">
             From here: your agents record on their own, <strong>Recall</strong> is
             where you ask questions, and <strong>Home</strong> is the one place to
@@ -1450,9 +1601,16 @@ export function Welcome({
         </button>
         {step === "finish" ? (
           <>
-            {soleBackupRed ? (
-              <button type="button" disabled={doctorBusy} onClick={() => finish(true)}>Continue with warnings</button>
+            {notYetProven.length ? (
+              <span className="muted push">Not yet proven: {notYetProven.join("; ")}</span>
             ) : null}
+            {/* Finish must never trap the user on this screen: unlike every
+             *  other step's Next, this button carries no `disabled` at all —
+             *  it is reachable from any doctor state (loading, errored, red,
+             *  or green). */}
+            <button type="button" onClick={() => finish(true)}>
+              Continue anyway
+            </button>
             <button type="button" className="primary" disabled={!canFinish} onClick={() => finish(false)}>
               Finish
             </button>

@@ -9,6 +9,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
 import { Welcome } from "../Welcome";
 import App from "../App";
+import { IntegrationsPanel } from "../IntegrationsPanel";
 
 const invokeMock = vi.fn();
 
@@ -373,5 +374,303 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
     const section = within(screen.getByText("Set up another Mac").closest(".section-card") as HTMLElement);
     expect(section.getByRole("button", { name: /Save join kit/ })).not.toBeDisabled();
     expect(screen.queryByText(/This database lives only on this Mac/)).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finish gate — docs/plans/2026-09-05-setup-that-cannot-strand-you.md,
+// "Finish, keys, harnesses, Docker": Finish must never trap the user, so
+// "Continue anyway" is asserted enabled in every scripted doctor state, and
+// every red row names its action in plain words (never a raw `*_ok` key).
+// ---------------------------------------------------------------------------
+
+function renderFinishStep(runKhipu: (args: string[]) => Promise<string>) {
+  return render(
+    <Welcome
+      dsnOk={true}
+      refreshDsn={async () => {}}
+      runKhipu={runKhipu}
+      onFinish={() => {}}
+      openIntegrations={() => {}}
+      initialStep="finish"
+      initialStepKey={1}
+    />,
+  );
+}
+
+describe("Welcome › Finish step", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("Continue anyway is enabled with three red checks, and each row names its action without a raw _ok key", async () => {
+    const { container } = renderFinishStep(async (args) => {
+      if (args[0] === "doctor" && !args.includes("--probe")) {
+        return JSON.stringify({
+          ok: false,
+          backup_ok: false,
+          drift_ok: false,
+          outbox_ok: false,
+          recall_probe_ok: true,
+        });
+      }
+      return "{}";
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText("The newest backup is older than it should be")).toBeInTheDocument(),
+    );
+    expect(screen.getByText("Some note files no longer match the database")).toBeInTheDocument();
+    expect(screen.getByText("Some captures are still waiting to reach the database")).toBeInTheDocument();
+    // The revisions fix reads as a plain instruction here (Finish has no
+    // Conflicting-edits view of its own to send the button to).
+    expect(screen.getByText(/Conflicting edits — from Home, after you finish/)).toBeInTheDocument();
+
+    expect(screen.getByRole("button", { name: "Continue anyway" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Finish" })).toBeDisabled();
+
+    assertNoRawCode(container);
+  });
+
+  it("Continue anyway is enabled while the health check is still running", () => {
+    renderFinishStep(() => new Promise<string>(() => {}));
+    expect(screen.getByRole("button", { name: "Continue anyway" })).not.toBeDisabled();
+  });
+
+  it("Continue anyway is enabled when the health check itself fails to run", async () => {
+    renderFinishStep(async () => {
+      throw new Error("hub unreachable");
+    });
+    await waitFor(() =>
+      // Anchored: "Not yet proven: …" beside the buttons carries the same
+      // sentence unanchored, and an unanchored match would hit both.
+      expect(screen.getByText(/^The health check could not run: .*hub unreachable/)).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: "Continue anyway" })).not.toBeDisabled();
+  });
+
+  it("both buttons are enabled once every check passes", async () => {
+    renderFinishStep(async (args) =>
+      args[0] === "doctor" ? JSON.stringify({ ok: true }) : "{}",
+    );
+    await waitFor(() => expect(screen.getByText("Every check passed.")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Continue anyway" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Finish" })).not.toBeDisabled();
+    // Nothing left unproven — no "Not yet proven" list beside the buttons.
+    expect(screen.queryByText(/Not yet proven/)).not.toBeInTheDocument();
+  });
+
+  it("runs the app probe itself when recall_probe_ok is red and no harness has verified", async () => {
+    let doctorCalls = 0;
+    renderFinishStep(async (args) => {
+      if (args[0] === "doctor" && args.includes("--probe")) {
+        return JSON.stringify({
+          ok: true,
+          recall_probe_ok: true,
+          recall_probe: { ok: true, last_probe: { harness: "app", ok: true, seconds: 1.8 }, harnesses: { app: { ok: true, stale: false } } },
+        });
+      }
+      if (args[0] === "doctor") {
+        doctorCalls += 1;
+        return JSON.stringify({ ok: false, recall_probe_ok: false, recall_probe: { ok: false, harnesses: {} } });
+      }
+      return "{}";
+    });
+
+    await waitFor(() => expect(screen.getByText("Every check passed.")).toBeInTheDocument());
+    expect(doctorCalls).toBe(1);
+    expect(screen.getByText("Memory round trip: 1.8 s")).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Model key verify — "A model key is proven on save with one real call".
+// ---------------------------------------------------------------------------
+
+function renderModelStep() {
+  return render(
+    <Welcome
+      dsnOk={true}
+      refreshDsn={async () => {}}
+      runKhipu={async () => "{}"}
+      onFinish={() => {}}
+      openIntegrations={() => {}}
+      initialStep="model"
+      initialStepKey={1}
+    />,
+  );
+}
+
+describe("Welcome › Model step — key verify", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("shows 'Key works · gemini-embedding-2' after a key save succeeds", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "secrets_presence") return JSON.stringify({ gemini_in_keychain: false });
+      if (cmd === "set_khipu_secret") return JSON.stringify({ ok: true });
+      if (cmd === "khipu_secrets_verify") {
+        return JSON.stringify({
+          ok: true,
+          checks: [
+            { id: "gemini_embed", ok: true, title: "Key works · gemini-embedding-2", detail: "", model: "gemini-embedding-2", seconds: 0.4 },
+            { id: "gemini_generate", ok: true, title: "Key works · gemini-2.5-flash", detail: "", model: "gemini-2.5-flash", seconds: 0.3 },
+          ],
+        });
+      }
+      return "{}";
+    });
+
+    renderModelStep();
+    fireEvent.change(screen.getByLabelText("Gemini API key"), { target: { value: "AIzaFAKE" } });
+    fireEvent.click(screen.getByRole("button", { name: /Save Gemini key/ }));
+
+    await waitFor(() => expect(screen.getByText("Key works · gemini-embedding-2")).toBeInTheDocument());
+    expect(screen.getByText("Key works · gemini-2.5-flash")).toBeInTheDocument();
+    // Never the key itself.
+    expect(screen.queryByText("AIzaFAKE")).not.toBeInTheDocument();
+  });
+
+  it("shows the plain-words failure and a Check again button on a 401, and Next stays enabled", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "secrets_presence") return JSON.stringify({ gemini_in_keychain: false });
+      if (cmd === "set_khipu_secret") return JSON.stringify({ ok: true });
+      if (cmd === "khipu_secrets_verify") {
+        return JSON.stringify({
+          ok: false,
+          checks: [
+            {
+              id: "gemini_generate",
+              ok: false,
+              title: "Key check failed",
+              detail: "The key was not accepted — paste it again from the provider's console",
+              model: "gemini-2.5-flash",
+              seconds: 0.2,
+              fix: "Paste it again from the provider's console",
+            },
+          ],
+        });
+      }
+      return "{}";
+    });
+
+    renderModelStep();
+    fireEvent.change(screen.getByLabelText("Gemini API key"), { target: { value: "AIzaFAKE" } });
+    fireEvent.click(screen.getByRole("button", { name: /Save Gemini key/ }));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("The key was not accepted — paste it again from the provider's console"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: "Check again" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Next/ })).not.toBeDisabled();
+    expect(screen.queryByText("AIzaFAKE")).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Harness auto-verify — a card flips to Verified on its own once a fresh
+// capture-hook beat lands after Install, no Verify click required.
+// ---------------------------------------------------------------------------
+
+describe("IntegrationsPanel — harness auto-verify", () => {
+  it("flips the card to Verified once the beat is newer than the install time, without clicking Verify", async () => {
+    // Real timers throughout — the 15 s interval is exercised via the same
+    // "on window focus" trigger the panel wires up alongside it, so the test
+    // does not need to fake time to see the poll fire.
+    let statusCall = 0;
+    let installedAtIso = "";
+    const runKhipu = vi.fn(async (args: string[]) => {
+      if (args[0] === "integrations" && args[1] === "status") {
+        statusCall += 1;
+        // Calls 1 (mount) and 2 (right after Install) still show no beat;
+        // only the later, focus-triggered poll (3) reports one, so the flip
+        // is attributable to the poll and not to Install's own reload.
+        const lastBeat =
+          statusCall <= 2 || !installedAtIso
+            ? null
+            : new Date(Date.parse(installedAtIso) + 5_000).toISOString();
+        return JSON.stringify([
+          {
+            harness: "claude_code",
+            detected: true,
+            mcp: true,
+            hook_stop: true,
+            hook_precompact: true,
+            recall_rule: "installed",
+            extract: "installed",
+            last_beat_at: lastBeat,
+          },
+        ]);
+      }
+      if (args[0] === "integrations" && args[1] === "install") {
+        installedAtIso = new Date().toISOString();
+        return '{"harness":"claude_code","detected":true,"changes":[]}\n{\n  "verify": []\n}';
+      }
+      return "{}";
+    });
+
+    render(
+      <IntegrationsPanel
+        runKhipu={runKhipu}
+        onToast={() => {}}
+        active={true}
+        liveness={null}
+        recallProbe={null}
+        refreshHealth={() => {}}
+        onAnotherMac={() => {}}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText("Claude Code")).toBeInTheDocument());
+    const card = screen.getByText("Claude Code").closest(".hcard") as HTMLElement;
+
+    fireEvent.click(within(card).getByRole("button", { name: /Reinstall/ }));
+    await waitFor(() =>
+      expect(within(card).getByText(/this card turns green by itself/)).toBeInTheDocument(),
+    );
+    expect(within(card).queryByText("Verified")).not.toBeInTheDocument();
+
+    // Nobody clicks Verify — a later poll (here, the window-focus trigger)
+    // is what notices the fresh beat.
+    window.dispatchEvent(new Event("focus"));
+
+    await waitFor(() => expect(within(card).getByText("Verified")).toBeInTheDocument());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Docker step — polls `components_status` and enables the install button
+// once Docker is actually there.
+// ---------------------------------------------------------------------------
+
+describe("Welcome › Database step (local) — Docker gate", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("enables 'Set up the database on this Mac' once components_status reports Docker ok", async () => {
+    let dockerOk = false;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "components_status") {
+        return JSON.stringify({
+          docker: dockerOk ? { ok: true } : { ok: false, error: "Docker is not running" },
+        });
+      }
+      return "{}";
+    });
+
+    renderDatabaseStep();
+    fireEvent.click(screen.getByLabelText(/Set up a new database on this Mac/i));
+
+    const setupButton = await screen.findByRole("button", { name: /Set up the database on this Mac/ });
+    await waitFor(() => expect(setupButton).toBeDisabled());
+
+    dockerOk = true;
+    fireEvent.click(screen.getByRole("button", { name: /Recheck now/ }));
+
+    await waitFor(() => expect(setupButton).not.toBeDisabled());
   });
 });

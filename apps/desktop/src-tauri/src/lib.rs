@@ -415,6 +415,21 @@ async fn secrets_presence() -> Result<String, String> {
     run_khipu_cli_async(vec!["secrets".to_string()]).await
 }
 
+/// Prove a saved model key actually works (`khipu secrets verify --json`, no
+/// arguments — `khipu.modelcheck.check_model_keys` decides which configured
+/// providers to call). Fixed argv, the same shape as `secrets_presence`: this
+/// makes exactly one real, cheap call per configured provider and never
+/// returns the key itself, but `secrets` still stays OUT of
+/// `ALLOWED_SUBCOMMANDS` on principle — no subcommand under it should ever
+/// forward arbitrary argv from the webview.
+/// (docs/plans/2026-09-05-setup-that-cannot-strand-you.md, "A model key is
+/// proven on save with one real call".)
+#[tauri::command]
+async fn khipu_secrets_verify() -> Result<String, String> {
+    run_khipu_cli_async(vec!["secrets".to_string(), "verify".to_string(), "--json".to_string()])
+        .await
+}
+
 /// Index everything missing or changed (`khipu embed backfill`, no arguments).
 ///
 /// `embed` stays OUT of `ALLOWED_SUBCOMMANDS` on purpose: that path forwards
@@ -1390,6 +1405,7 @@ pub fn run() {
             join_advertise,
             join_receive,
             secrets_presence,
+            khipu_secrets_verify,
             khipu_migrate,
             khipu_embed_backfill,
             khipu_jobs_refresh,
