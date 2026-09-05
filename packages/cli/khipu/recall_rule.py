@@ -57,6 +57,13 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
   pushed at session start where a slice is available; call `khipu_owed` at
   session start for a harness with no pushed slice (Aegis), or whenever "what
   do I still owe on this project" would change the answer.
+- `khipu_owed_update` closes, reopens or snoozes one commitment by id. Items
+  marked "needs the user" are the user's to do or decide, not yours; the
+  moment the user says one is done, close it here instead of waiting for the
+  next capture to notice. Close your own promises when you keep them.
+- `khipu_forget` forgets one episode completely (row, vectors, the
+  commitments it opened, its legacy line) — for a capture that was wrong or a
+  test. Through the gateway only cloud-harness captures can be forgotten.
 - Capture writes: on a local Mac with a Khipu capture hook (`khipu-stop-hook`
   or `khipu-aegis-capture`) do **not** call `khipu_capture` and do **not** pipe
   `capture_v2.py` — the hook is the writer (`capture_mode=hub`). An MCP write
@@ -165,7 +172,15 @@ def _render_project_slice(label: str, slice_data: dict) -> str:
         lines.append("### Open commitments")
         for c in owed[:5]:
             text = clip_snippet(str(c.get("text") or ""), 160)
-            lines.append(f"- [{c.get('kind')}] `{c.get('id')}`: {text}")
+            owner = str(c.get("owner") or "").strip()
+            who = " (needs the user)" if owner == "user" else (" (yours)" if owner == "assistant" else "")
+            lines.append(f"- [{c.get('kind')}]{who} `{c.get('id')}`: {text}")
+        lines.append(
+            "Items marked (needs the user) are the user's to do or decide — do not "
+            "act on them yourself. When the user says one is done, close it right "
+            "away with `khipu_owed_update` (or `khipu owed --close ID`) instead of "
+            "waiting for the next capture to notice."
+        )
     episodes = slice_data.get("episodes") or []
     if episodes:
         lines.append("### Recent episodes")
