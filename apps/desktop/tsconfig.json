@@ -14,6 +14,13 @@
     "noEmit": true,
     "jsx": "react-jsx",
 
+    /* src/__tests__/setup.test.tsx (Layer 3 oracle, `npm run check:setup`)
+       uses jest-dom's matchers (toBeInTheDocument, toBeDisabled, ...); this
+       is the one global type registration that makes `tsc`'s own pass (run
+       by `npm run build`, which also type-checks test files under `src`)
+       recognize them without every test file needing its own reference. */
+    "types": ["@testing-library/jest-dom"],
+
     /* Linting */
     "strict": true,
     "noUnusedLocals": true,

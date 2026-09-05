@@ -1423,6 +1423,34 @@ button.link:hover {
   border-bottom: 0;
 }
 
+/* SetupStages — one row per connect-pipeline stage. Unlike a plain .card
+   .row, each row can grow a Callout underneath it (the fix for a failed
+   stage), so the row itself is top-aligned rather than vertically centered. */
+.setup-stages .setup-stage-row {
+  align-items: flex-start;
+}
+
+.setup-stages .setup-stage-row .tag {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.setup-stage-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.setup-stage-text .muted {
+  font-size: var(--t-xs);
+}
+
+.setup-stage-text .callout {
+  margin-top: 2px;
+}
+
 .card-scroll {
   overflow-y: auto;
   min-height: 0;

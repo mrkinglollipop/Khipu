@@ -1522,6 +1522,24 @@ def cmd_secrets(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_secrets_verify(args: argparse.Namespace) -> int:
+    from khipu.modelcheck import check_model_keys
+
+    if getattr(args, "gemini", False):
+        which = "gemini"
+    elif getattr(args, "openai", False):
+        which = "openai"
+    else:
+        which = "all"
+    try:
+        result = check_model_keys(which=which)
+    except ValueError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 2
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 1
+
+
 def cmd_activity(args: argparse.Namespace) -> int:
     from khipu.activity import activity_payload, episode_detail
 
@@ -1698,14 +1716,36 @@ def cmd_db(args: argparse.Namespace) -> int:
     subcommand prints JSON and never the password."""
     from khipu.setup import connect_database, host_kind, mask_dsn
 
+    def _missing_dsn(flag: str, env_name: str) -> int:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "dsn_required",
+                    "detail": f"Pass {flag} or set {env_name}.",
+                }
+            )
+        )
+        return 2
+
     if args.db_cmd == "preflight":
-        out = connect_database(args.dsn, store=False, install_jobs=False, prove=False)
+        dsn = args.dsn or os.environ.get("KHIPU_DB_DSN")
+        if not dsn:
+            return _missing_dsn("--dsn", "KHIPU_DB_DSN")
+        out = connect_database(dsn, store=False, install_jobs=False, prove=False)
         print(json.dumps(out, indent=2))
         return 0 if out.get("ok") else 1
 
     if args.db_cmd == "connect":
+        dsn = args.dsn or os.environ.get("KHIPU_DB_DSN")
+        if not dsn and getattr(args, "use_stored", False):
+            from khipu.db import resolve_dsn
+
+            dsn = resolve_dsn()
+        if not dsn:
+            return _missing_dsn("--dsn", "KHIPU_DB_DSN")
         out = connect_database(
-            args.dsn,
+            dsn,
             store=True,
             install_jobs=not args.no_jobs,
             prove=not args.no_prove,
@@ -1717,11 +1757,24 @@ def cmd_db(args: argparse.Namespace) -> int:
     if args.db_cmd == "move":
         from khipu.dbmove import move_database
 
+        if getattr(args, "new_local", False):
+            from khipu.setup import provision_local_move_target
+
+            provisioned = provision_local_move_target()
+            if not provisioned.get("ok"):
+                print(json.dumps(provisioned, indent=2))
+                return 1
+            target = provisioned["dsn"]
+        else:
+            target = args.to or os.environ.get("KHIPU_DB_TARGET_DSN")
+            if not target:
+                return _missing_dsn("--to", "KHIPU_DB_TARGET_DSN")
+
         def _progress(table: str, rows: int) -> None:
             print(f"  {table}: {rows} rows", file=sys.stderr, flush=True)
 
         out = move_database(
-            args.to,
+            target,
             dry_run=bool(args.dry_run),
             allow_nonempty=bool(getattr(args, "into_nonempty", False)),
             progress=_progress,
@@ -2459,6 +2512,29 @@ def build_parser() -> argparse.ArgumentParser:
         choices=SETTABLE_SECRETS,
         help="store a secret read from stdin (never pass the value as an argument)",
     )
+    sec_sub = sec.add_subparsers(dest="secrets_cmd", required=False)
+    sv = sec_sub.add_parser(
+        "verify",
+        help="Prove a configured model key works with one real, cheap call",
+    )
+    sv_group = sv.add_mutually_exclusive_group()
+    sv_group.add_argument(
+        "--gemini", action="store_true",
+        help="Check Gemini embeddings + generation only",
+    )
+    sv_group.add_argument(
+        "--openai", action="store_true",
+        help="Check the configured local OpenAI-compatible synth endpoint only",
+    )
+    sv_group.add_argument(
+        "--all", action="store_true",
+        help="Check every configured provider (default)",
+    )
+    sv.add_argument(
+        "--json", action="store_true",
+        help="JSON output (default; accepted for explicitness)",
+    )
+    sv.set_defaults(func=cmd_secrets_verify, secrets_cmd="verify")
     sec.set_defaults(func=cmd_secrets)
 
     se = sub.add_parser(
@@ -2859,12 +2935,30 @@ def build_parser() -> argparse.ArgumentParser:
     db_pre = db_sub.add_parser(
         "preflight", help="Dry-run stages reach..graph against a DSN; writes nothing"
     )
-    db_pre.add_argument("--dsn", required=True, help="Connection string to check")
+    # --dsn is optional here (and on connect/move's --to below) so a caller that
+    # cannot risk the password showing up in `ps` (the desktop app) can set
+    # KHIPU_DB_DSN in the child's environment instead — see cmd_db's resolution
+    # and apps/desktop/src-tauri/src/lib.rs's khipu_db_preflight/connect/move,
+    # which mirror set_khipu_secret's "never in argv" rule via env instead of
+    # stdin (env is enough here: these are one-shot .output() calls, not a
+    # secret-write that needs the write-then-close stdin dance).
+    db_pre.add_argument(
+        "--dsn", default=None, help="Connection string to check (or KHIPU_DB_DSN)"
+    )
     db_pre.set_defaults(func=cmd_db)
     db_conn = db_sub.add_parser(
         "connect", help="Run the full connect pipeline and store the DSN"
     )
-    db_conn.add_argument("--dsn", required=True, help="Connection string to adopt")
+    db_conn.add_argument(
+        "--dsn", default=None, help="Connection string to adopt (or KHIPU_DB_DSN)"
+    )
+    db_conn.add_argument(
+        "--use-stored",
+        action="store_true",
+        help="Use the already-configured DSN (Keychain / data-folder fallback) "
+        "instead of --dsn/KHIPU_DB_DSN — for finishing setup right after "
+        "install-local-postgres or a join import, which already stored it",
+    )
     db_conn.add_argument(
         "--root-crt", default=None, help="Path to a certificate file to trust (verify-full etc.)"
     )
@@ -2878,7 +2972,16 @@ def build_parser() -> argparse.ArgumentParser:
     db_move = db_sub.add_parser(
         "move", help="Copy the database to another host, verify row counts, and switch"
     )
-    db_move.add_argument("--to", required=True, help="Target connection string")
+    db_move.add_argument(
+        "--to", default=None, help="Target connection string (or KHIPU_DB_TARGET_DSN)"
+    )
+    db_move.add_argument(
+        "--new-local",
+        dest="new_local",
+        action="store_true",
+        help="Create a fresh local-Docker Postgres and use it as the target "
+        "(mutually exclusive with --to/KHIPU_DB_TARGET_DSN)",
+    )
     db_move.add_argument(
         "--dry-run", action="store_true", help="Preflight + row counts only; copies nothing"
     )

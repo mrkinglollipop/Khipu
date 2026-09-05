@@ -37,6 +37,7 @@ import { ComponentsPanel } from "./ComponentsPanel";
 import { IntegrationsPanel } from "./IntegrationsPanel";
 import type { LivenessPayload, RecallProbeStatus } from "./IntegrationsPanel";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
+import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
 import { WorkingBanner } from "./WorkingBanner";
 import { FeedbackForm } from "./FeedbackForm";
 import { PostUpdateNoticeDialog } from "./PostUpdateNoticeDialog";
@@ -2164,6 +2165,143 @@ export default function App() {
     ipv4?: string;
   } | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("database");
+  // "Connect to a server you run or another Mac…" reopens the first-run flow
+  // at the Database step rather than restarting it — `welcomeInitialStepKey`
+  // is bumped on every click so a second visit still jumps even when
+  // `welcomeInitialStep` itself does not change value.
+  const [welcomeInitialStep, setWelcomeInitialStep] = useState<"database" | undefined>(undefined);
+  const [welcomeInitialStepKey, setWelcomeInitialStepKey] = useState(0);
+  const openDatabaseStepInFirstRun = useCallback(() => {
+    setWelcomeInitialStep("database");
+    setWelcomeInitialStepKey((k) => k + 1);
+    setTab("first-run");
+  }, []);
+  // `db status`'s `host_kind` — "this-mac" / "local-docker" mean the stored
+  // connection cannot be reached from another Mac (docs/plans/2026-09-05-
+  // setup-that-cannot-strand-you.md, "Second Mac"): gates the Another Mac
+  // join-kit buttons and is read before the Move dialog's target step too.
+  const [dbHostKind, setDbHostKind] = useState<string | null>(null);
+  const loadDbHostKind = useCallback(async () => {
+    try {
+      const out = parseJson(await invoke<string>("khipu_db_status")) as
+        | { ok?: boolean; host_kind?: string }
+        | null;
+      setDbHostKind(out?.ok && typeof out.host_kind === "string" ? out.host_kind : null);
+    } catch {
+      setDbHostKind(null);
+    }
+  }, []);
+  useEffect(() => {
+    if (tab === "settings" && (settingsSection === "database" || settingsSection === "another-mac")) {
+      void loadDbHostKind();
+    }
+  }, [tab, settingsSection, loadDbHostKind]);
+
+  // Settings › Database › "Move this memory to another database…" —
+  // docs/plans/2026-09-05-setup-that-cannot-strand-you.md, "Move the
+  // database": check the target, copy every table, then switch. The source
+  // is never written to at any step.
+  const [moveOpen, setMoveOpen] = useState(false);
+  const [moveTarget, setMoveTarget] = useState<"server" | "local">("server");
+  const [moveDsn, setMoveDsn] = useState("");
+  const [moveRootCrt, setMoveRootCrt] = useState("");
+  const [moveStep, setMoveStep] = useState<"target" | "copy" | "done">("target");
+  const [movePreflight, setMovePreflight] = useState<SetupPipelineResult>(null);
+  const [movePreflightPhase, setMovePreflightPhase] = useState<SetupPhase>("idle");
+  const [moveDryRun, setMoveDryRun] = useState<
+    { name: string; source_rows: number }[] | null
+  >(null);
+  const [moveDryRunBusy, setMoveDryRunBusy] = useState(false);
+  const [moveBusy, setMoveBusy] = useState(false);
+  const [moveResult, setMoveResult] = useState<Record<string, unknown> | null>(null);
+  const [moveError, setMoveError] = useState<string | null>(null);
+
+  const resetMoveDialog = useCallback(() => {
+    setMoveOpen(false);
+    setMoveTarget("server");
+    setMoveDsn("");
+    setMoveRootCrt("");
+    setMoveStep("target");
+    setMovePreflight(null);
+    setMovePreflightPhase("idle");
+    setMoveDryRun(null);
+    setMoveResult(null);
+    setMoveError(null);
+  }, []);
+
+  const checkMoveTarget = useCallback(async () => {
+    const dsn = moveDsn.trim();
+    if (!dsn) return;
+    setMovePreflightPhase("running");
+    setMovePreflight(null);
+    setMoveError(null);
+    try {
+      const out = parseJson(await invoke<string>("khipu_db_preflight", { dsn })) as SetupPipelineResult;
+      setMovePreflight(out);
+      if (out?.ok === true) setMoveStep("copy");
+    } catch (e) {
+      setMoveError(String(e));
+    } finally {
+      setMovePreflightPhase("done");
+    }
+  }, [moveDsn]);
+
+  const runMoveDryRun = useCallback(async () => {
+    const dsn = moveDsn.trim();
+    if (!dsn) return;
+    setMoveDryRunBusy(true);
+    setMoveError(null);
+    try {
+      const out = parseJson(
+        await invoke<string>("khipu_db_move", { targetDsn: dsn, dryRun: true }),
+      ) as { ok?: boolean; error?: string; detail?: string; tables?: { name: string; source_rows: number }[] } | null;
+      if (out?.ok !== true) {
+        setMoveError(String(out?.detail ?? out?.error ?? "Could not read the target's table counts."));
+        return;
+      }
+      setMoveDryRun(out.tables ?? []);
+    } catch (e) {
+      setMoveError(String(e));
+    } finally {
+      setMoveDryRunBusy(false);
+    }
+  }, [moveDsn]);
+
+  useEffect(() => {
+    if (moveOpen && moveStep === "copy" && moveTarget === "server" && !moveDryRun && !moveDryRunBusy) {
+      void runMoveDryRun();
+    }
+  }, [moveOpen, moveStep, moveTarget, moveDryRun, moveDryRunBusy, runMoveDryRun]);
+
+  const confirmMoveCopy = useCallback(async () => {
+    setMoveBusy(true);
+    setMoveError(null);
+    try {
+      const raw =
+        moveTarget === "local"
+          ? await invoke<string>("khipu_db_move_new_local", { dryRun: false })
+          : await invoke<string>("khipu_db_move", { targetDsn: moveDsn.trim(), dryRun: false });
+      const out = parseJson(raw) as Record<string, unknown> | null;
+      if (!out || out.ok !== true) {
+        setMoveError(
+          String((out?.detail as string | undefined) ?? (out?.error as string | undefined) ?? "The move failed."),
+        );
+        return;
+      }
+      setMoveResult(out);
+      setMoveStep("done");
+      await refreshDsn(true);
+      await loadDbHostKind();
+    } catch (e) {
+      setMoveError(String(e));
+    } finally {
+      setMoveBusy(false);
+    }
+  }, [moveTarget, moveDsn, refreshDsn, loadDbHostKind]);
+
+  const moveConnectSummary = (moveResult?.connect as { stages?: { id?: string; detail?: string }[] } | undefined)
+    ?.stages?.find((s) => s.id === "summary")?.detail;
+  const moveRemaining = Array.isArray(moveResult?.remaining) ? (moveResult?.remaining as string[]) : [];
   // "Index now" and "Restore" both do something a person cannot undo with the
   // same button, so each goes through a confirm Dialog.
   const [indexBusy, setIndexBusy] = useState(false);
@@ -3118,6 +3256,8 @@ export default function App() {
               runKhipu={runKhipu}
               onFinish={() => setTab("home")}
               openIntegrations={() => setTab("harnesses")}
+              initialStep={welcomeInitialStep}
+              initialStepKey={welcomeInitialStepKey}
             />
           </div>
         </section>
@@ -4726,8 +4866,11 @@ export default function App() {
                             <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
                             Recheck connection
                           </button>
-                          <button type="button" onClick={() => setTab("first-run")}>
+                          <button type="button" onClick={openDatabaseStepInFirstRun}>
                             Connect to a server you run or another Mac…
+                          </button>
+                          <button type="button" onClick={() => setMoveOpen(true)}>
+                            Move this memory to another database…
                           </button>
                         </div>
                       </div>
@@ -5130,6 +5273,19 @@ export default function App() {
                   <div className="section-card">
                     <div className="section-head">Set up another Mac</div>
                     <div className="section-body">
+                      {dbHostKind === "this-mac" || dbHostKind === "local-docker" ? (
+                        <Callout
+                          tone="warn"
+                          title="This database lives only on this Mac, so another Mac cannot reach it."
+                          action={
+                            <button type="button" className="primary" onClick={() => setMoveOpen(true)}>
+                              Move it to a server first…
+                            </button>
+                          }
+                        >
+                          Move it to a server first.
+                        </Callout>
+                      ) : null}
                       <p className="muted">
                         Do this on the Mac that <strong>already works</strong>. Save
                         a join kit and AirDrop it to the new Mac — that file is
@@ -5167,19 +5323,29 @@ export default function App() {
                           onChange={(e) => setSetupJoinPassphrase(e.target.value)}
                           placeholder="Optional passphrase (leave blank for an unlocked file)"
                           aria-label="Optional join export passphrase"
+                          disabled={dbHostKind === "this-mac" || dbHostKind === "local-docker"}
                         />
                       </div>
                       <div className="toolbar">
                         <button
                           type="button"
                           className="primary"
+                          disabled={dbHostKind === "this-mac" || dbHostKind === "local-docker"}
                           onClick={() => void exportJoinKit()}
                         >
                           Save join kit…
                         </button>
+                      </div>
+                      <p className="muted">
+                        Both Macs must be on the same Wi‑Fi or network; guest and
+                        hotel networks usually block this.
+                      </p>
+                      <div className="toolbar">
                         <button
                           type="button"
-                          disabled={advertiseBusy}
+                          disabled={
+                            advertiseBusy || dbHostKind === "this-mac" || dbHostKind === "local-docker"
+                          }
                           onClick={() => void startJoinAdvertise()}
                         >
                           {advertiseBusy ? "Advertising…" : "Advertise nearby (PIN)"}
@@ -5583,6 +5749,187 @@ export default function App() {
               }}
             >
               Restore
+            </button>
+          </div>
+        </div>
+      </Dialog>
+
+      {/* Settings › Database › "Move this memory to another database…" —
+          docs/plans/2026-09-05-setup-that-cannot-strand-you.md, "Move the
+          database". Three steps: check the target, copy, done. */}
+      <Dialog
+        open={moveOpen}
+        className="kit-dialog"
+        ariaLabelledBy="move-title"
+        onCancel={resetMoveDialog}
+      >
+        <div className="kit-dialog-body">
+          <h2 id="move-title">Move this memory to another database</h2>
+          <p className="muted">
+            The database you use now is never modified — Khipu only reads
+            from it, and only until the copy finishes.
+          </p>
+
+          {moveStep === "target" ? (
+            <>
+              <Segmented
+                ariaLabel="Move target"
+                value={moveTarget}
+                onChange={(v) => setMoveTarget(v)}
+                options={[
+                  { value: "server", label: "A server I run" },
+                  { value: "local", label: "A new database on this Mac" },
+                ]}
+              />
+              {moveTarget === "server" ? (
+                <>
+                  <p className="muted" style={{ marginTop: "0.5rem" }}>
+                    <strong>Connection string</strong> — looks like{" "}
+                    <code>postgresql://user:password@host:5432/dbname</code>;
+                    your host shows it in the database's connection details.
+                  </p>
+                  <div className="toolbar" style={{ width: "100%" }}>
+                    <input
+                      className="mono"
+                      type="password"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={moveDsn}
+                      onChange={(e) => setMoveDsn(e.target.value)}
+                      placeholder="postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=verify-full"
+                      aria-label="Target connection string"
+                    />
+                  </div>
+                  <div className="toolbar">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          const selected = await openDirectoryDialog({ multiple: false, directory: false });
+                          if (typeof selected === "string" && selected.trim()) {
+                            setMoveRootCrt(selected.trim());
+                          }
+                        } catch (e) {
+                          setMoveError(String(e));
+                        }
+                      }}
+                    >
+                      {moveRootCrt ? "Change certificate file…" : "Certificate file (optional)…"}
+                    </button>
+                    {moveRootCrt ? <span className="muted mono ellip">{moveRootCrt}</span> : null}
+                    <button
+                      type="button"
+                      className="primary"
+                      disabled={!moveDsn.trim() || movePreflightPhase === "running"}
+                      onClick={() => void checkMoveTarget()}
+                    >
+                      {movePreflightPhase === "running" ? "Checking…" : "Check the target"}
+                    </button>
+                  </div>
+                  {movePreflightPhase !== "idle" ? (
+                    <SetupStages
+                      stageIds={["reach", "version", "privileges", "schema", "graph"]}
+                      result={movePreflight}
+                      phase={movePreflightPhase}
+                      busy={movePreflightPhase === "running"}
+                      onRetry={() => void checkMoveTarget()}
+                    />
+                  ) : null}
+                </>
+              ) : (
+                <div className="toolbar" style={{ marginTop: "0.5rem" }}>
+                  <button
+                    type="button"
+                    className="primary"
+                    disabled={moveBusy}
+                    onClick={() => void confirmMoveCopy()}
+                  >
+                    {moveBusy ? "Setting up and copying…" : "Set up a new local database and copy everything"}
+                  </button>
+                </div>
+              )}
+              {moveError ? (
+                <Callout tone="err" title="Needs you">
+                  {moveError}
+                </Callout>
+              ) : null}
+            </>
+          ) : null}
+
+          {moveStep === "copy" ? (
+            <>
+              {moveDryRunBusy || !moveDryRun ? (
+                <p className="muted">Reading table counts from the target…</p>
+              ) : (
+                <>
+                  <div className="rows">
+                    {moveDryRun.map((t) => (
+                      <div key={t.name} className="row-item">
+                        <span className="row-main mono">{t.name}</span>
+                        <span className="row-meta">{t.source_rows} rows</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="toolbar">
+                    <button
+                      type="button"
+                      className="primary"
+                      disabled={moveBusy}
+                      onClick={() => void confirmMoveCopy()}
+                    >
+                      {moveBusy
+                        ? "Copying…"
+                        : `Copy ${moveDryRun.length} table${moveDryRun.length === 1 ? "" : "s"}`}
+                    </button>
+                  </div>
+                </>
+              )}
+              {moveError ? (
+                <Callout
+                  tone="err"
+                  title="Needs you"
+                  action={
+                    <button type="button" className="primary" onClick={() => void runMoveDryRun()}>
+                      Try again
+                    </button>
+                  }
+                >
+                  {moveError}
+                </Callout>
+              ) : null}
+            </>
+          ) : null}
+
+          {moveStep === "done" ? (
+            <>
+              <Callout tone="ok" title="Working">
+                {moveConnectSummary ?? "Working."}
+              </Callout>
+              {moveRemaining.length ? (
+                <Callout
+                  tone="warn"
+                  title="Other Macs need a new join kit"
+                  action={
+                    <button
+                      type="button"
+                      onClick={() => {
+                        resetMoveDialog();
+                        setSettingsSection("another-mac");
+                      }}
+                    >
+                      Open Another Mac…
+                    </button>
+                  }
+                >
+                  {moveRemaining[0]}
+                </Callout>
+              ) : null}
+            </>
+          ) : null}
+
+          <div className="kit-dialog-actions">
+            <button type="button" onClick={resetMoveDialog}>
+              {moveStep === "done" ? "Close" : "Cancel"}
             </button>
           </div>
         </div>
