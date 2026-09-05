@@ -92,6 +92,8 @@ class ProtocolTest(unittest.TestCase):
                 "khipu_get",
                 "khipu_graph",
                 "khipu_status",
+                "khipu_owed_update",
+                "khipu_forget",
                 "khipu_capture",
                 "khipu_owed",
             },

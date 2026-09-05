@@ -1609,9 +1609,12 @@ def hybrid_search(
                     r.pop("rank_text", None)
             timing["lexical_ms"] = round((time.monotonic() - _t) * 1000, 1)
             if not lists:
+                from khipu.recency import HALF_LIFE_DAYS
+
                 timing["total_ms"] = round((time.monotonic() - _started) * 1000, 1)
                 out: dict[str, Any] = {"query": query, "mode": mode, "results": [],
-                                       "timing": timing}
+                                       "timing": timing,
+                                       "ranking": {"recency_half_life_days": HALF_LIFE_DAYS}}
                 if degraded:
                     out["degraded"] = degraded
                 return out
@@ -1621,14 +1624,23 @@ def hybrid_search(
                 cur, fused, project=project, since=since, until=until,
                 session_id=session_id, harness=harness,
             )
+            # Recency rides on the fused score after the filter pass has
+            # attached `ts` to each row; the trim to `limit` in `_fair_fill`
+            # below must see the decayed order, not the pre-decay one.
+            from khipu.recency import apply_recency
+
+            fused = apply_recency(fused)
             fused = _fair_fill(fused, limit)
             timing["fusion_ms"] = round((time.monotonic() - _t) * 1000, 1)
             _t = time.monotonic()
             fused = enrich_search_results(cur, fused)
             timing["enrich_ms"] = round((time.monotonic() - _t) * 1000, 1)
 
+    from khipu.recency import HALF_LIFE_DAYS
+
     timing["total_ms"] = round((time.monotonic() - _started) * 1000, 1)
-    out = {"query": query, "mode": mode, "results": fused, "timing": timing}
+    out = {"query": query, "mode": mode, "results": fused, "timing": timing,
+           "ranking": {"recency_half_life_days": HALF_LIFE_DAYS}}
     if degraded:
         out["degraded"] = degraded
     return out

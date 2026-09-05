@@ -85,6 +85,49 @@ def _atomic_write(dst: Path, job: dict[str, Any]) -> None:
     os.replace(tmp, dst)
 
 
+MAX_ATTEMPTS = int(os.environ.get("KHIPU_OUTBOX_MAX_ATTEMPTS", "25"))
+
+
+def dead_dir() -> Path:
+    return outbox_dir() / "dead"
+
+
+def dead_jobs() -> list[Path]:
+    d = dead_dir()
+    if not d.is_dir():
+        return []
+    return sorted(p for p in d.glob("*.json") if p.is_file())
+
+
+def _bury(jp: Path, job: dict[str, Any]) -> None:
+    """A payload that has failed MAX_ATTEMPTS times for a reason that is not
+    the connection will never succeed by itself (audit 2026-09-04: attempts
+    was written and never read, so such a job retried on every hook forever
+    and kept doctor red). Move it aside so the queue drains and doctor names
+    it; ``khipu outbox retry-dead`` puts it back after the cause is fixed."""
+    dead_dir().mkdir(parents=True, exist_ok=True)
+    job["buried_at"] = datetime.now(timezone.utc).isoformat()
+    _atomic_write(dead_dir() / jp.name, job)
+    jp.unlink(missing_ok=True)
+    _log(f"buried {jp.name} after {job.get('attempts')} attempts: {job.get('last_error')}")
+
+
+def retry_dead() -> dict[str, Any]:
+    """Move every dead job back to the queue with attempts reset."""
+    moved = 0
+    for jp in dead_jobs():
+        try:
+            job = json.loads(jp.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        job["attempts"] = 0
+        job.pop("buried_at", None)
+        _atomic_write(outbox_dir() / jp.name, job)
+        jp.unlink(missing_ok=True)
+        moved += 1
+    return {"moved": moved, "pending": len(jobs())}
+
+
 def jobs() -> list[Path]:
     try:
         return sorted(p for p in outbox_dir().glob("*.json"))
@@ -112,7 +155,8 @@ def status() -> dict[str, Any]:
         if age is not None and (oldest_age is None or age > oldest_age):
             oldest_age, oldest_job = age, jp.name
     return {"dir": str(outbox_dir()), "pending": len(js), "oldest_age_s": oldest_age,
-            "oldest_job": oldest_job, "unreadable": unreadable}
+            "oldest_job": oldest_job, "unreadable": unreadable,
+            "dead": len(dead_jobs()), "max_attempts": MAX_ATTEMPTS}
 
 
 def drain(*, limit: int | None = None) -> dict[str, Any]:
@@ -150,6 +194,9 @@ def drain(*, limit: int | None = None) -> dict[str, Any]:
                 _log(f"PG unreachable ({name}); leaving {len(js) - js.index(jp)} job(s) queued")
                 break
             _log(f"replay failed for {jp.name}: {name}: {e}")
+            if int(job.get("attempts", 0)) >= MAX_ATTEMPTS:
+                _bury(jp, job)
+                out["buried"] = out.get("buried", 0) + 1
             continue
         if stats.get("episode_inserted"):
             try:

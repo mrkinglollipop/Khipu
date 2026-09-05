@@ -64,47 +64,90 @@ def _find_episode_id(session_id: str) -> int | None:
 
 
 def _forget_episode(episode_id: int) -> dict[str, Any]:
-    """Soft-delete + drop embeddings for one episode — the same two statements
-    ``cli.cmd_episode`` runs for ``khipu episode forget`` (W5.6), inlined here
-    so probe cleanup does not shell out to a second process. Never raises: a
-    cleanup failure is recorded, not fatal to the probe result already formed.
-    """
-    from khipu.db import connect
-
+    """Complete forget (khipu.forget: row, vectors, commitments, legacy line)
+    for the probe's own nonce episode. Never raises: a cleanup failure is
+    recorded, not fatal to the probe result already formed."""
     try:
-        with connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE episodes SET deleted_at = now() WHERE id = %s AND deleted_at IS NULL",
-                    (episode_id,),
-                )
-                soft_deleted = cur.rowcount > 0
-                cur.execute(
-                    "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = %s",
-                    (str(episode_id),),
-                )
-                embeddings_removed = cur.rowcount
-            conn.commit()
+        from khipu.forget import forget_everywhere
+
+        out = forget_everywhere(episode_id)
         return {
-            "ok": True,
-            "soft_deleted": soft_deleted,
-            "embeddings_removed": embeddings_removed,
+            "ok": bool(out.get("ok")),
+            "soft_deleted": out.get("soft_deleted"),
+            "embeddings_removed": out.get("embeddings_removed"),
+            "commitments_closed": out.get("commitments_closed"),
+            "legacy_file": out.get("legacy_file"),
+            **({"error": out.get("error")} if not out.get("ok") else {}),
         }
     except Exception as exc:  # noqa: BLE001 — cleanup must never mask the probe result
         _log(f"cleanup failed for episode {episode_id}: {type(exc).__name__}: {exc}")
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def harness_state_path(harness: str):
+    from khipu.paths import data_dir
+
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in (harness or "unknown"))
+    return data_dir() / f"probe-{safe}.json"
+
+
 def _write_state(result: dict[str, Any]) -> None:
+    """probe.json keeps the LAST probe (the doctor gate); probe-<harness>.json
+    keeps each pack's own last probe, so Harnesses can say "verified" per
+    card instead of borrowing another pack's round trip (audit 2026-09-04
+    §1.8: one file for all harnesses)."""
     try:
         from khipu.paths import ensure_data_dir
 
         ensure_data_dir()
-        state_path().write_text(
-            json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8"
-        )
+        body = json.dumps(result, indent=2, default=str) + "\n"
+        state_path().write_text(body, encoding="utf-8")
+        harness = str(result.get("harness") or "").strip()
+        if harness:
+            harness_state_path(harness).write_text(body, encoding="utf-8")
     except Exception as exc:  # noqa: BLE001 — state write must never crash the probe
         _log(f"failed to write probe state: {type(exc).__name__}: {exc}")
+
+
+def _age_of(result: dict[str, Any]) -> float | None:
+    ts_raw = result.get("ts")
+    if not isinstance(ts_raw, str):
+        return None
+    try:
+        parsed = datetime.strptime(ts_raw, _TS_FMT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - parsed).total_seconds()
+
+
+def harness_results() -> dict[str, dict[str, Any]]:
+    """Every pack's own last probe, keyed by harness, with ``age_seconds`` and
+    a ``stale`` flag (older than MAX_PROBE_AGE_DAYS)."""
+    from khipu.paths import data_dir
+
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        files = sorted(data_dir().glob("probe-*.json"))
+    except OSError:
+        return out
+    for f in files:
+        try:
+            res = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        h = str(res.get("harness") or f.stem[len("probe-"):])
+        age = _age_of(res)
+        out[h] = {
+            "ok": bool(res.get("ok")),
+            "status": res.get("status"),
+            "ts": res.get("ts"),
+            "seconds": res.get("seconds"),
+            "error": res.get("error"),
+            "reason": res.get("reason"),
+            "age_seconds": age,
+            "stale": age is None or age > MAX_PROBE_AGE_DAYS * 86400,
+        }
+    return out
 
 
 def run_probe(
@@ -254,4 +297,5 @@ def status() -> dict[str, Any]:
             if age_seconds is not None
             else "last probe has no readable timestamp"
         )
-    return {"ok": ok, "reason": reason, "last_probe": last, "age_seconds": age_seconds}
+    return {"ok": ok, "reason": reason, "last_probe": last, "age_seconds": age_seconds,
+            "harnesses": harness_results()}

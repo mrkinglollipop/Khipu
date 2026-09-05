@@ -1,4 +1,5 @@
 """Render Khipu LaunchAgent plists from templates — per-user Application Support paths."""
+# this exact task; no further delegation is possible or appropriate here.
 
 from __future__ import annotations
 
@@ -106,7 +107,7 @@ def render_extra_env(environ: dict[str, str] | None = None) -> str:
     return "".join(lines)
 
 
-def render_plist(job: str) -> bytes:
+def render_plist(job: str, environ: dict[str, str] | None = None) -> bytes:
     template_name = _JOB_TEMPLATE.get(job)
     if not template_name:
         raise ValueError(f"unknown scheduled job: {job}")
@@ -120,7 +121,7 @@ def render_plist(job: str) -> bytes:
     spec = _JOB_SPECS.get(job, {})
     stem = str(spec.get("log_stem") or job)
     out_log, err_log = _log_paths(stem)
-    text = text.replace("{{EXTRA_ENV}}", render_extra_env())
+    text = text.replace("{{EXTRA_ENV}}", render_extra_env(environ))
     text = text.replace("{{STDOUT_LOG}}", str(out_log))
     text = text.replace("{{STDERR_LOG}}", str(err_log))
     return text.encode("utf-8")
@@ -163,14 +164,14 @@ def _launchctl_unload(label: str, plist_path: Path) -> None:
     )
 
 
-def install_job(job: str) -> dict[str, Any]:
+def install_job(job: str, *, environ: dict[str, str] | None = None) -> dict[str, Any]:
     label = _LABELS.get(job)
     if not label:
         return {"ok": False, "error": "unknown_job", "job": job}
     agents = _launchagents_dir()
     agents.mkdir(parents=True, exist_ok=True)
     dest = _plist_path(label)
-    dest.write_bytes(render_plist(job))
+    dest.write_bytes(render_plist(job, environ))
     loaded = _launchctl_load(label, dest)
     if not loaded.get("ok"):
         return loaded
@@ -222,3 +223,110 @@ def uninstall_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
     names = jobs or list(_JOB_TEMPLATE)
     results = [uninstall_job(job) for job in names]
     return {"ok": True, "results": results}
+
+
+def installed_jobs() -> list[str]:
+    """Jobs in `_JOB_TEMPLATE` whose plist file actually exists on disk."""
+    return [job for job in _JOB_TEMPLATE if _plist_path(_LABELS[job]).is_file()]
+
+
+def _installed_plist(dest: Path) -> dict[str, Any] | None:
+    import plistlib
+
+    try:
+        with open(dest, "rb") as fh:
+            data = plistlib.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def plist_external(job: str) -> bool:
+    """True when the installed plist was not rendered by this app: its
+    interpreter lives outside any .app bundle and is not the one this render
+    would use (a maintainer Mac runs the jobs from a source checkout with
+    Homebrew Python while the app carries its own). Such a plist is never
+    rewritten by refresh — re-rendering it would silently repoint the nightly
+    at the bundled CLI of whatever app version happens to be installed."""
+    label = _LABELS.get(job)
+    dest = _plist_path(label) if label else None
+    data = _installed_plist(dest) if dest and dest.is_file() else None
+    if not data:
+        return False
+    args = data.get("ProgramArguments") or []
+    prog = str(args[0]) if args else ""
+    if not prog or ".app/Contents/" in prog:
+        return False
+    # Same interpreter this render would use (a source checkout run by a
+    # maintainer, or a test): it is ours to manage after all.
+    return prog != str(_bundled_python())
+
+
+def _refresh_environ(job: str) -> dict[str, str]:
+    """os.environ plus the PASSTHROUGH_ENV values already baked into the
+    installed plist. The app launches `jobs refresh` without the maintainer's
+    shell environment, and a re-render that dropped those keys would make the
+    job fail closed."""
+    env = dict(os.environ)
+    label = _LABELS.get(job)
+    dest = _plist_path(label) if label else None
+    data = _installed_plist(dest) if dest and dest.is_file() else None
+    baked = (data or {}).get("EnvironmentVariables") or {}
+    if isinstance(baked, dict):
+        for key in PASSTHROUGH_ENV:
+            if key not in env and str(baked.get(key) or "").strip():
+                env[key] = str(baked[key])
+    return env
+
+
+def plist_current(job: str) -> bool | None:
+    """Whether the installed plist for `job` matches what would render today.
+
+    `None` when the job has no plist installed, or when the plist is external
+    (maintainer-managed, see plist_external) — there is nothing this app
+    should compare it against."""
+    label = _LABELS.get(job)
+    if not label:
+        return None
+    dest = _plist_path(label)
+    if not dest.is_file() or plist_external(job):
+        return None
+    return dest.read_bytes() == render_plist(job, _refresh_environ(job))
+
+
+def refresh_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
+    """Re-render and reload every installed LaunchAgent whose plist is stale.
+
+    This is what the desktop app runs at every launch: a bundled-Python path
+    or Application Support path can change after an app update, and nothing
+    else re-renders the plists that were baked at a previous install time. A
+    job that was never installed is left alone — this never installs a new
+    job, only refreshes ones already present.
+    """
+    present = set(installed_jobs())
+    names = [j for j in (jobs or list(_JOB_TEMPLATE)) if j in present]
+    missing = [j for j in (jobs or list(_JOB_TEMPLATE)) if j not in present]
+    refreshed: list[str] = []
+    current: list[str] = []
+    external: list[str] = []
+    results: list[dict[str, Any]] = []
+    for job in names:
+        if plist_external(job):
+            external.append(job)
+            continue
+        if plist_current(job) is False:
+            result = install_job(job, environ=_refresh_environ(job))
+            results.append(result)
+            if result.get("ok"):
+                refreshed.append(job)
+        else:
+            current.append(job)
+    failed = [r for r in results if not r.get("ok")]
+    return {
+        "ok": not failed,
+        "refreshed": refreshed,
+        "current": current,
+        "external": external,
+        "missing": missing,
+        "results": results,
+    }

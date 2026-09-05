@@ -242,7 +242,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         outbox = outbox_status()
     except Exception as e:  # noqa: BLE001
         outbox = {"pending": -1, "error": f"{type(e).__name__}: {e}"}
-    outbox_ok = outbox.get("pending") == 0
+    outbox_ok = outbox.get("pending") == 0 and not outbox.get("dead")
     # Capture liveness: is each harness ACTUALLY being recorded? Red on evidence
     # of a failure (hook error, drain failure, stale queue, cadence never
     # firing) — never on idleness. maintainer, 2026-08-17: a session that captured
@@ -1304,27 +1304,11 @@ def cmd_episode(args: argparse.Namespace) -> int:
             "error": "usage: khipu episode forget ID | khipu episode edit ID --summary TEXT",
         }))
         return 2
-    from khipu.db import connect
+    from khipu.forget import forget_everywhere
 
-    eid = int(args.id)
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE episodes SET deleted_at = now() WHERE id = %s AND deleted_at IS NULL",
-                (eid,),
-            )
-            soft_deleted = cur.rowcount > 0
-            cur.execute(
-                "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = %s",
-                (str(eid),),
-            )
-            embeddings_removed = cur.rowcount
-        conn.commit()
-    print(json.dumps({
-        "ok": True, "id": eid, "soft_deleted": soft_deleted,
-        "embeddings_removed": embeddings_removed,
-    }))
-    return 0
+    out = forget_everywhere(int(args.id))
+    print(json.dumps(out, default=str))
+    return 0 if out.get("ok") else 1
 
 
 def cmd_topic(args: argparse.Namespace) -> int:
@@ -1798,10 +1782,40 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     if args.outbox_cmd == "status":
         print(json.dumps(outbox.status(), indent=2))
         return 0
+    if args.outbox_cmd == "retry-dead":
+        print(json.dumps(outbox.retry_dead(), indent=2))
+        return 0
     out = outbox.drain(limit=args.limit)
     out["remaining"] = outbox.status()["pending"]
     print(json.dumps(out, indent=2))
     return 0
+
+
+def cmd_jobs(args: argparse.Namespace) -> int:
+    """Scheduled LaunchAgents: status, install, refresh (re-render after an
+    app update so a stale bundled-Python path or Application Support path
+    lands in the plist without a reinstall), uninstall."""
+    from khipu import jobs as jobs_mod
+    from khipu import launchd_gen
+
+    if args.jobs_cmd == "status":
+        print(json.dumps(jobs_mod.job_status(), indent=2))
+        return 0
+    names = getattr(args, "names", None) or None
+    bad = [n for n in (names or []) if n not in _JOBS_CHOICES]
+    if bad:
+        print(json.dumps({"ok": False, "error": f"unknown job(s): {bad}; choose from {list(_JOBS_CHOICES)}"}))
+        return 2
+    if args.jobs_cmd == "install":
+        out = launchd_gen.install_scheduled_jobs(names)
+    elif args.jobs_cmd == "refresh":
+        out = launchd_gen.refresh_scheduled_jobs(names)
+    elif args.jobs_cmd == "uninstall":
+        out = launchd_gen.uninstall_scheduled_jobs(names)
+    else:
+        return 2
+    print(json.dumps(out, indent=2))
+    return 0 if out.get("ok") else 1
 
 
 def cmd_snapshot(args: argparse.Namespace) -> int:
@@ -2950,8 +2964,30 @@ def build_parser() -> argparse.ArgumentParser:
     ob_sub = ob.add_subparsers(dest="outbox_cmd", required=True)
     obd = ob_sub.add_parser("drain", help="Replay queued captures into PG")
     obd.add_argument("--limit", type=int, default=None)
-    ob_sub.add_parser("status", help="Pending count + oldest age")
+    ob_sub.add_parser("status", help="Pending count + oldest age + dead-letter count")
+    ob_sub.add_parser(
+        "retry-dead",
+        help="Move captures buried after KHIPU_OUTBOX_MAX_ATTEMPTS failures back into the queue",
+    )
     ob.set_defaults(func=cmd_outbox)
+
+    jb = sub.add_parser(
+        "jobs",
+        help="Scheduled LaunchAgents: status, install, refresh (re-render after an app update), uninstall",
+    )
+    jb_sub = jb.add_subparsers(dest="jobs_cmd", required=True)
+    jb_sub.add_parser("status", help="Print khipu.jobs.job_status() as JSON")
+    _JOBS_CHOICES = ("nightly", "monthly", "graph_build")
+    jbi = jb_sub.add_parser("install", help="Render + load the named jobs (default: all)")
+    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build}")
+    jbr = jb_sub.add_parser(
+        "refresh",
+        help="Re-render + reload installed jobs whose plist is stale (default: all installed)",
+    )
+    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build}")
+    jbu = jb_sub.add_parser("uninstall", help="Unload + remove the named jobs (default: all)")
+    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build}")
+    jb.set_defaults(func=cmd_jobs)
 
     snap = sub.add_parser(
         "snapshot",

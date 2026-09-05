@@ -709,6 +709,7 @@ type JobEntry = {
   last_run_iso?: string | null;
   last_run_mtime?: number | null;
   plist_loaded?: boolean;
+  plist_current?: boolean | null;
   next_schedule?: string;
   last_exit?: number | null;
 };
@@ -2985,6 +2986,7 @@ export default function App() {
             : "never"}
         {entry?.next_schedule ? ` · next ${entry.next_schedule}` : ""}
         {entry?.plist_loaded === false ? " · agent not loaded" : ""}
+        {entry?.plist_current === false ? " · needs re-render, relaunch Khipu" : ""}
         {entry?.last_exit != null && entry.last_exit !== 0
           ? ` · exit ${entry.last_exit}`
           : ""}

@@ -405,6 +405,20 @@ async fn khipu_embed_backfill() -> Result<String, String> {
     run_khipu_cli_async(EMBED_BACKFILL_ARGV.iter().map(|s| s.to_string()).collect()).await
 }
 
+/// Re-render + reload whichever scheduled LaunchAgents are already installed
+/// (`khipu jobs refresh`, no arguments). `jobs` stays OUT of
+/// `ALLOWED_SUBCOMMANDS` on purpose: `jobs install`/`jobs uninstall` change
+/// launchd state (load/unload agents, write versions.json), and the app only
+/// ever needs the read-and-rewrite-if-stale `refresh` verb — never install or
+/// uninstall — so it gets exactly one fixed argv, the same shape as
+/// `khipu_embed_backfill` and `khipu_migrate`.
+const JOBS_REFRESH_ARGV: &[&str] = &["jobs", "refresh"];
+
+#[tauri::command]
+async fn khipu_jobs_refresh() -> Result<String, String> {
+    run_khipu_cli_async(JOBS_REFRESH_ARGV.iter().map(|s| s.to_string()).collect()).await
+}
+
 /// Apply (or plan) the schema. `migrate` is a state-changing subcommand and is
 /// deliberately NOT in `ALLOWED_SUBCOMMANDS`; this command fixes the argv to
 /// exactly `migrate` / `migrate --dry-run` so the UI can offer setup without
@@ -1240,6 +1254,7 @@ pub fn run() {
             secrets_presence,
             khipu_migrate,
             khipu_embed_backfill,
+            khipu_jobs_refresh,
             select_compat_row,
             install_local_postgres,
             bootstrap_local_backup,
@@ -1368,6 +1383,28 @@ pub fn run() {
                     TrayTooltipSource::Health,
                     Some(tooltip),
                 );
+            });
+
+            // After an app update the LaunchAgents may still point at the
+            // previous bundle's Python and paths (they were baked in at
+            // whatever install rendered them, and nothing else re-renders
+            // them). Re-render what is already installed at every launch so
+            // a bundled-Python or Application Support path change lands
+            // without requiring a manual reinstall.
+            tauri::async_runtime::spawn(async move {
+                match run_khipu_cli_async(
+                    JOBS_REFRESH_ARGV.iter().map(|s| s.to_string()).collect(),
+                )
+                .await
+                {
+                    Ok(out) => {
+                        let snippet: String = out.chars().take(200).collect();
+                        eprintln!("[khipu-jobs] refresh: {snippet}");
+                    }
+                    Err(e) => {
+                        eprintln!("[khipu-jobs] refresh failed: {e}");
+                    }
+                }
             });
 
             let handle = app.handle().clone();
@@ -1556,6 +1593,16 @@ mod run_khipu_guard_tests {
         use super::EMBED_BACKFILL_ARGV;
         assert_eq!(EMBED_BACKFILL_ARGV, &["embed", "backfill"]);
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"embed"));
+    }
+
+    #[test]
+    fn jobs_refresh_is_a_fixed_argv_command_not_an_allowlist_entry() {
+        // The app only ever needs `jobs refresh`; `jobs install`/`jobs
+        // uninstall` change launchd state, so `jobs` stays out of the
+        // allowlist and the webview gets exactly this fixed argv.
+        use super::JOBS_REFRESH_ARGV;
+        assert_eq!(JOBS_REFRESH_ARGV, &["jobs", "refresh"]);
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"jobs"));
     }
 
     #[test]

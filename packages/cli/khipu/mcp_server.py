@@ -355,6 +355,41 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "name": "khipu_owed_update",
+        "description": (
+            "Close, reopen or snooze one commitment by id (ids come from "
+            "khipu_owed). Close it when the work is done or the question is "
+            "answered; snooze it with `until` (a date, or 7d / 2w / 1m) when it "
+            "is real but not now. Cloud agents: this is how you close what you "
+            "opened through khipu_capture."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "Commitment id"},
+                "action": {"type": "string", "description": "close | reopen | snooze"},
+                "until": {"type": "string", "description": "snooze only: 2026-09-30, 7d, 2w, 1m"},
+            },
+            "required": ["id", "action"],
+        },
+    },
+    {
+        "name": "khipu_forget",
+        "description": (
+            "Forget one episode completely: the row is tombstoned, its vectors "
+            "and the commitments it opened go with it, and its line leaves the "
+            "legacy file. Use it for a capture that was wrong, a test, or "
+            "something that should not have been remembered. Through the "
+            "HTTPS gateway only episodes captured by a cloud harness can be "
+            "forgotten; local captures are forgotten from the Mac that owns them."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer", "description": "Episode id (khipu_capture returns it)"}},
+            "required": ["id"],
+        },
+    },
 ]
 
 
@@ -637,6 +672,74 @@ def _tool_owed(args: dict) -> dict:
     return {"status": status, "project": args.get("project") or None, "results": rows}
 
 
+def _tool_owed_update(args: dict) -> dict:
+    """Close / reopen / snooze one commitment — the write half of khipu_owed,
+    so a cloud agent can close what it opened (audit 2026-09-04: cloud
+    clients could open commitments they could never close)."""
+    try:
+        cid = int(args.get("id"))
+    except (TypeError, ValueError):
+        raise ValueError("id must be an integer commitment id") from None
+    action = (args.get("action") or "").strip().lower()
+    if action not in ("close", "reopen", "snooze"):
+        raise ValueError("action must be 'close', 'reopen' or 'snooze'")
+    _ensure_path()
+    from khipu import commitments
+    from khipu.db import connect
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if action == "snooze":
+                from khipu.cli import _snooze_until_sql
+
+                parsed = _snooze_until_sql(str(args.get("until") or ""))
+                if parsed is None:
+                    raise ValueError("until must be a date (2026-09-30) or a window (7d, 2w, 1m)")
+                expr, param = parsed
+                params = ([param] if param is not None else []) + [cid]
+                cur.execute(f"UPDATE commitments SET due_after = {expr} WHERE id = %s", tuple(params))
+                ok = cur.rowcount > 0
+            else:
+                ok = commitments.set_status(cur, cid, "closed" if action == "close" else "open")
+        conn.commit()
+    if not ok:
+        raise ValueError(f"no such commitment: {cid}")
+    return {"ok": True, "id": cid, "action": action,
+            **({"until": str(args.get("until") or "")} if action == "snooze" else {})}
+
+
+def _tool_forget(args: dict) -> dict:
+    """Complete forget of one episode (khipu.forget). From the gateway only a
+    cloud harness's own captures may be forgotten: a local episode belongs to
+    the Mac that captured it and is forgotten there."""
+    try:
+        eid = int(args.get("id"))
+    except (TypeError, ValueError):
+        raise ValueError("id must be an integer episode id") from None
+    _ensure_path()
+    from khipu.forget import LOCAL_HARNESSES, forget_everywhere
+    from khipu.db import connect
+
+    if _via_https_gateway():
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT session_id FROM episodes WHERE id = %s", (eid,))
+                row = cur.fetchone()
+        if row is None:
+            raise ValueError(f"no such episode: {eid}")
+        harness = str(row[0] or "").split(":", 1)[0]
+        if harness in LOCAL_HARNESSES:
+            raise ValueError(
+                f"episode {eid} was captured by {harness} on a Mac; forget it there "
+                "(khipu episode forget) — the gateway forgets only cloud captures"
+            )
+    out = forget_everywhere(eid)
+    if not out.get("ok"):
+        raise ValueError(str(out.get("error") or "forget failed"))
+    out.pop("identity", None)
+    return out
+
+
 TOOL_FUNCS = {
     "khipu_search": _tool_search,
     "khipu_get": _tool_get,
@@ -644,6 +747,8 @@ TOOL_FUNCS = {
     "khipu_status": _tool_status,
     "khipu_capture": _tool_capture,
     "khipu_owed": _tool_owed,
+    "khipu_owed_update": _tool_owed_update,
+    "khipu_forget": _tool_forget,
 }
 
 

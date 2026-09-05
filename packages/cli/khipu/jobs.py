@@ -430,6 +430,16 @@ def _job_entry(name: str) -> dict[str, Any]:
         pass
     state = _read_job_state(name)
     last_exit = state.get("exit") if state else None
+    # Lazy import: launchd_gen imports from this module (_JOB_SPECS,
+    # _plist_path, etc.), so importing it at module scope here would be a
+    # circular import. Deferring it into the function body breaks the cycle
+    # at the cost of one extra import per call.
+    try:
+        from khipu.launchd_gen import plist_current as _plist_current
+
+        current = _plist_current(name)
+    except Exception:
+        current = None
     return {
         "plist_label": spec["plist"],
         "log_path": str(out_log),
@@ -441,6 +451,7 @@ def _job_entry(name: str) -> dict[str, Any]:
             else None
         ),
         "plist_loaded": _plist_loaded(spec["plist"]),
+        "plist_current": current,
         "next_schedule": spec["schedule"],
         "last_exit": last_exit,
         "last_exit_ts": state.get("ts") if state else None,
