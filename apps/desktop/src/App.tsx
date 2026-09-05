@@ -522,7 +522,10 @@ function projectFromScope(scope: string | undefined | null): string | null {
  *  value stays as the tooltip either way. */
 function shortProject(project: string): string {
   if (project.includes(":")) {
-    return `${harnessLabel(project.split(":")[0] ?? "")} session`;
+    // A commitment scoped to a session rather than a repo. The pill is
+    // 96px wide; "Claude Code session" overran it, so the label is the short
+    // word and the harness stays in the pill's title (2026-09-05).
+    return "Session";
   }
   const parts = project.split("/").filter(Boolean);
   return parts[parts.length - 1] ?? project;
@@ -2895,7 +2898,15 @@ export default function App() {
             ) : null}
             <span className="w96">
               {c.project ? (
-                <Tag title={c.project}>{shortProject(c.project)}</Tag>
+                <Tag
+                  title={
+                    c.project.includes(":")
+                      ? `${harnessLabel(c.project.split(":")[0] ?? "")} session · ${c.project}`
+                      : c.project
+                  }
+                >
+                  {shortProject(c.project)}
+                </Tag>
               ) : (
                 <span className="meta">—</span>
               )}
