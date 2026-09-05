@@ -294,7 +294,7 @@ class ImportKitApplyTest(unittest.TestCase):
     def test_rewrite_percent_encodes_slashes(self) -> None:
         dsn = "postgres://u:p@h/db?sslmode=verify-full"
         out = j.rewrite_dsn_sslrootcert(
-            dsn, "/Users/matthewschwartz/.config/khipu/root.crt"
+            dsn, "/Users/example/.config/khipu/root.crt"
         )
         self.assertIn("sslrootcert=%2FUsers%2F", out)
         self.assertNotIn("sslrootcert=/Users/", out)

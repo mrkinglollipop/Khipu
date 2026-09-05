@@ -2,7 +2,8 @@
 Bite 3.7: Dropbox-sync-safe graph finalizer
 
 Copies a working SQLite (typically /tmp/working.sqlite) back to the workspace
-graph at /Volumes/.../UNIFICATION/state/graph.sqlite.
+graph (KHIPU_GRAPH_SQLITE / ALZY_GRAPH_SQLITE, default
+~/Library/Application Support/Khipu/graph.sqlite).
 
 Why: Dropbox-mounted filesystems can revert recently-written files during sync
 ("conflicted copy" behavior, sync-state races, etc). A naive byte-copy from
@@ -32,7 +33,8 @@ from pathlib import Path
 
 
 def _find_workspace() -> Path:
-    candidates = [Path("/Volumes/Cloud Storage/Claude")]
+    env_workspace = (os.environ.get("KHIPU_GRAPHIFY_WORKSPACE") or "").strip()
+    candidates = [Path(env_workspace)] if env_workspace else []
     candidates += [Path(p) for p in glob.glob("/sessions/*/mnt/Claude")]
     candidates += [Path(p) for p in glob.glob("/sessions/*/mnt/Dropbox--Claude")]
     for c in candidates:
@@ -41,9 +43,24 @@ def _find_workspace() -> Path:
     raise RuntimeError("cannot locate workspace")
 
 
-WORKSPACE = _find_workspace()
+_workspace_cache: Path | None = None
+
+
+def workspace() -> Path:
+    """Lazy, cached resolution — importing this module must not require a
+    workspace to be present (e.g. under test with KHIPU_GRAPHIFY_WORKSPACE unset)."""
+    global _workspace_cache
+    if _workspace_cache is None:
+        _workspace_cache = _find_workspace()
+    return _workspace_cache
+
+
 DEFAULT_SRC = Path("/tmp/working.sqlite")
-DEFAULT_DST = Path("/Volumes/Cloud Storage/Graph/graph.sqlite")
+DEFAULT_DST = Path(
+    os.environ.get("KHIPU_GRAPH_SQLITE")
+    or os.environ.get("ALZY_GRAPH_SQLITE")
+    or (Path.home() / "Library" / "Application Support" / "Khipu" / "graph.sqlite")
+)
 MAX_RETRIES = 5
 SETTLE_SECONDS = 4
 
@@ -55,7 +72,8 @@ def get_counts(db: Path) -> dict:
         return {}
     read_path = db
     if str(db).startswith(("/Volumes/", "/sessions/")):
-        import tempfile, shutil
+        import shutil
+        import tempfile
         fd, tmp_str = tempfile.mkstemp(prefix="finalize_verify_", suffix=".sqlite")
         os.close(fd)
         try:
@@ -130,7 +148,7 @@ def main() -> int:
             continue
 
         if args.no_verify:
-            print(f"  copied (no verify).")
+            print("  copied (no verify).")
             return 0
 
         time.sleep(args.settle)

@@ -113,11 +113,11 @@ class CursorShapeTest(unittest.TestCase):
         self.assertNotIn("additional_context", d)
 
     def test_session_start_cwd_reads_cursor_workspace_roots(self):
-        payload = json.dumps({"workspace_roots": ["/Volumes/Cloud Storage/Code/Khipu/packages/cli"]})
+        payload = json.dumps({"workspace_roots": ["/Volumes/Example/Code/Khipu/packages/cli"]})
         with mock.patch.object(rr.sys, "stdin", io.StringIO(payload)):
             self.assertEqual(
                 rr._session_start_cwd(),
-                "/Volumes/Cloud Storage/Code/Khipu/packages/cli",
+                "/Volumes/Example/Code/Khipu/packages/cli",
             )
 
     def test_session_start_cwd_prefers_explicit_cwd_over_roots(self):
@@ -140,7 +140,7 @@ class AegisTest(unittest.TestCase):
 class PushSliceTest(unittest.TestCase):
     def test_cwd_walks_off_packages_cli(self):
         self.assertEqual(
-            rr.cwd_search_term("/Volumes/Cloud Storage/Code/Khipu/packages/cli"),
+            rr.cwd_search_term("/Volumes/Example/Code/Khipu/packages/cli"),
             "Khipu",
         )
 

@@ -1,11 +1,23 @@
-"""Compile-check UNIFICATION graphify scripts so an unparseable extractor cannot ship."""
+"""Compile-check the maintainer's graphify scripts so an unparseable extractor cannot ship."""
 from __future__ import annotations
 
+import os
 import py_compile
 import unittest
 from pathlib import Path
 
-SCRIPTS = Path("/Volumes/Cloud Storage/Claude/UNIFICATION/scripts")
+
+def _scripts_dir() -> Path | None:
+    raw = (os.environ.get("KHIPU_GRAPHIFY_SCRIPTS_DIR") or "").strip()
+    if raw:
+        return Path(raw)
+    nightly = (os.environ.get("KHIPU_GRAPHIFY_NIGHTLY") or "").strip()
+    if nightly:
+        return Path(nightly).parent
+    return None
+
+
+SCRIPTS = _scripts_dir()
 NAMES = (
     "graphify_nightly.py",
     "build_graph.py",
@@ -14,6 +26,9 @@ NAMES = (
 )
 
 
+@unittest.skipUnless(
+    SCRIPTS is not None and SCRIPTS.is_dir(), "maintainer graphify scripts not configured"
+)
 class UnificationScriptsCompileTest(unittest.TestCase):
     def test_session_scripts_compile(self):
         compiled = 0
@@ -24,7 +39,7 @@ class UnificationScriptsCompileTest(unittest.TestCase):
             py_compile.compile(str(path), doraise=True)
             compiled += 1
         if compiled == 0:
-            self.skipTest("UNIFICATION scripts not on disk")
+            self.skipTest("graphify scripts not on disk")
 
 
 if __name__ == "__main__":

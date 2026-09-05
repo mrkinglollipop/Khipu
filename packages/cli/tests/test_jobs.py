@@ -258,7 +258,7 @@ class JobsMetadataTest(unittest.TestCase):
             legacy.write_text("old\n")
             os.utime(legacy, (1, 1))
             os.utime(khipu, (100, 100))
-            with mock.patch.object(jobs, "LOG_DIR_FROZEN", td_path):
+            with mock.patch.object(jobs, "LOG_DIR_LEGACY", td_path):
                 chosen = jobs.nightly_log_path()
             self.assertEqual(chosen.name, "khipu-nightly.out.log")
 

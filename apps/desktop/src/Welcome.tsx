@@ -127,7 +127,7 @@ function soleBackupRedFlag(doctor: DoctorPayload | null): boolean {
 }
 
 /** True when the bundle is on the shipped DMG volume, not /Applications or a
- *  checkout under `/Volumes/Cloud Storage`. Volume name is `Khipu` (see
+ *  checkout on an external volume. Volume name is `Khipu` (see
  *  release_macos.sh DMG_VOLNAME). Duplicate mounts show up as `Khipu 1`. */
 function launchedFromDiskImage(resourcePath: string): boolean {
   return /\/Volumes\/Khipu(?: \d+)?\//.test(resourcePath);

@@ -11,5 +11,5 @@ apps/desktop/src-tauri/target/
 *.bak-khipu-*
 
 # Iterate / harness local state
-.cursor/state/
+.cursor/
 

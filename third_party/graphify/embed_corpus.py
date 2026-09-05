@@ -3,7 +3,7 @@ Bite 3.5: corpus embedder
 
 Embeds text-bearing graph nodes (corpus authors, memory topics, biblical
 entries, ticker-wiki bodies) using Voyage voyage-3. Stores
-vectors in the `embeddings` table of UNIFICATION/state/graph.sqlite.
+vectors in the `embeddings` table of the workspace graph.sqlite.
 
 Properties:
 - Idempotent: skips nodes/files already embedded with the same model

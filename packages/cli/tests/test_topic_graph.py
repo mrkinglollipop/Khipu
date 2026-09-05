@@ -75,10 +75,16 @@ class ParserTest(unittest.TestCase):
 
     def test_rejects_urls_and_volume_root(self) -> None:
         self.assertEqual(extract_paths("see https://example.com/foo/bar"), [])
-        self.assertEqual(extract_paths("`/Volumes/Cloud Storage`"), [])
+        from khipu import topic_graph as tg
 
-    def test_real_sojourn_art_topic_file_if_present(self) -> None:
-        path = Path("/Volumes/Cloud Storage/Memory/conversations/topics/sojourn-unseen-war-art.md")
+        with (
+            mock.patch.dict(os.environ, {"KHIPU_VOLUME_ROOT": "/Volumes/Example"}),
+            mock.patch.object(tg, "volume_root", return_value="/Volumes/Example"),
+        ):
+            self.assertEqual(tg.extract_paths("`/Volumes/Example`"), [])
+
+    def test_real_example_topic_file_if_present(self) -> None:
+        path = Path("/Volumes/Example/Memory/conversations/topics/example-topic.md")
         if not path.is_file():
             self.skipTest("fixture topic file not on this machine")
         parsed = parse_topic_file(path)
@@ -378,3 +384,18 @@ class LiveFillDirProbeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VolumeRootDerivationTest(unittest.TestCase):
+    def test_env_wins_then_memory_root_then_empty(self):
+        from khipu import topic_graph as tg
+
+        with mock.patch.dict(os.environ, {"KHIPU_VOLUME_ROOT": "/Volumes/FromEnv/"}):
+            self.assertEqual(tg.volume_root(), "/Volumes/FromEnv")
+        with mock.patch.dict(os.environ, {"KHIPU_VOLUME_ROOT": ""}), \
+                mock.patch("khipu.config.path_setting", return_value="/Volumes/Example/Memory/conversations"):
+            self.assertEqual(tg.volume_root(), "/Volumes/Example")
+        with mock.patch.dict(os.environ, {"KHIPU_VOLUME_ROOT": ""}), \
+                mock.patch("khipu.config.path_setting", return_value=None):
+            self.assertEqual(tg.volume_root(), "")
+            self.assertEqual(tg._volume_prefixes(), ())
