@@ -1,4 +1,3 @@
-# --bypass-harness (sonnet lane)
 """First-class commitments (W3) — open loops that outlive a single episode.
 
 ``decisions`` today are immutable strings in a JSONB array: nothing can be

@@ -99,6 +99,85 @@ class GraphifyInstallTest(unittest.TestCase):
         self.assertIn("graphify", saved)
         self.assertNotIn("pending", saved)
 
+    @mock.patch("khipu.components_graphify._download")
+    @mock.patch("khipu.components_graphify.match_row_for_install")
+    @mock.patch("khipu.components_graphify._ensure_empty_sources")
+    @mock.patch("khipu.components_graphify.application_support_dir")
+    @mock.patch("khipu.components_graphify.read_versions")
+    @mock.patch("khipu.components_graphify.write_versions")
+    def test_install_infers_remote_mode_when_postgres_dict_missing(
+        self,
+        write_versions,
+        read_versions,
+        support_dir,
+        ensure_sources,
+        match_row,
+        download,
+    ):
+        """The real-world 2026-09-05 case: a Mac whose database was connected
+        before the app ever recorded a mode has versions.json with NO
+        `postgres` dict at all. Without an inferred mode this fell into
+        `local_docker` and demanded a postgres_image the pending row never
+        had, refusing a perfectly good remote install."""
+        del ensure_sources
+        support_dir.return_value = self.app_support
+        pending = {
+            "graphify_semver": "1.0.0",
+            "graphify_tarball_url": "https://example.invalid/khipu-graphify-1.0.0.tar.gz",
+            "pgvector_min": "0.8.6",
+        }
+        read_versions.return_value = {"pending": pending}
+        match_row.return_value = dict(pending, khipu_app_min="0.3.0")
+
+        def fake_download(url: str, dest: Path) -> None:
+            dest.write_bytes(self.archive.read_bytes())
+
+        download.side_effect = fake_download
+
+        result = install_graphify(first_run=True)
+        self.assertTrue(result["ok"], msg=result)
+        match_row.assert_called_once()
+        self.assertEqual(match_row.call_args.kwargs["mode"], "remote")
+
+    @mock.patch("khipu.components_graphify._download")
+    @mock.patch("khipu.components_graphify.match_row_for_install")
+    @mock.patch("khipu.components_graphify._ensure_empty_sources")
+    @mock.patch("khipu.components_graphify.application_support_dir")
+    @mock.patch("khipu.components_graphify.read_versions")
+    @mock.patch("khipu.components_graphify.write_versions")
+    def test_install_infers_local_docker_mode_when_pending_has_image(
+        self,
+        write_versions,
+        read_versions,
+        support_dir,
+        ensure_sources,
+        match_row,
+        download,
+    ):
+        """Same missing-`postgres`-dict setup as above, but the pending row
+        carries a postgres_image — that alone should still route to
+        local_docker even with no recorded mode."""
+        del ensure_sources
+        support_dir.return_value = self.app_support
+        pending = {
+            "graphify_semver": "1.0.0",
+            "graphify_tarball_url": "https://example.invalid/khipu-graphify-1.0.0.tar.gz",
+            "postgres_image": "ghcr.io/mrkinglollipop/khipu-postgres:19beta3-pgvector",
+            "pgvector_min": "0.8.6",
+        }
+        read_versions.return_value = {"pending": pending}
+        match_row.return_value = dict(pending, khipu_app_min="0.3.0")
+
+        def fake_download(url: str, dest: Path) -> None:
+            dest.write_bytes(self.archive.read_bytes())
+
+        download.side_effect = fake_download
+
+        result = install_graphify(first_run=True)
+        self.assertTrue(result["ok"], msg=result)
+        match_row.assert_called_once()
+        self.assertEqual(match_row.call_args.kwargs["mode"], "local_docker")
+
     @mock.patch("khipu.components_matrix.select_compat_row")
     @mock.patch("khipu.components_graphify._download")
     @mock.patch("khipu.components_graphify.match_row_for_install")
@@ -153,16 +232,19 @@ class GraphifyInstallTest(unittest.TestCase):
         select_row.assert_called_once()
         self.assertEqual(select_row.call_args.args[0], "remote")
 
+    @mock.patch("khipu.components_matrix.select_compat_row")
     @mock.patch("khipu.components_graphify.refresh_matrix_cache")
     @mock.patch("khipu.components_graphify.match_row_for_install")
     @mock.patch("khipu.components_graphify.read_versions")
     def test_no_matrix_row_carries_plain_words_not_a_bare_code(
-        self, read_versions, match_row, refresh_cache
+        self, read_versions, match_row, refresh_cache, select_row
     ):
         """A stale matrix or a dev build newer than any khipu_app_min row
         must never surface `matrix_row_refused` verbatim to the desktop —
-        it must refresh the matrix once and, still refused, hand back
-        title/detail/fix (2026-09-05 pixel-pass finding 1)."""
+        it must refresh the matrix once, self-heal the pending row once,
+        and — still refused — hand back title/detail/fix plus mode and
+        matrix_rows (2026-09-05 pixel-pass finding 1; 2026-09-05 root-cause
+        fix for the false 'not in the compatibility list' refusal)."""
         pending = {
             "graphify_semver": "9.9.9",
             "graphify_tarball_url": "https://example.invalid/khipu-graphify-9.9.9.tar.gz",
@@ -174,13 +256,18 @@ class GraphifyInstallTest(unittest.TestCase):
             "postgres": {"mode": "local_docker", "image": pending["postgres_image"]},
         }
         match_row.return_value = None
+        select_row.return_value = {"ok": False, "error": "matrix_no_matching_row"}
 
         result = install_graphify(first_run=True)
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "matrix_row_refused")
         refresh_cache.assert_called_once()
+        select_row.assert_called_once()
+        self.assertEqual(select_row.call_args.args[0], "local_docker")
         self.assertEqual(match_row.call_count, 2)
+        self.assertEqual(result["mode"], "local_docker")
+        self.assertIsInstance(result.get("matrix_rows"), int)
         bare_code_re = re.compile(r"^[a-z_]+$")
         for key in ("title", "detail", "fix"):
             self.assertIn(key, result, msg=f"missing {key!r} in {result!r}")

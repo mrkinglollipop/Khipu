@@ -151,7 +151,13 @@ def install_graphify(*, first_run: bool = True) -> dict[str, Any]:
         }
 
     postgres = versions.get("postgres") if isinstance(versions.get("postgres"), dict) else {}
-    mode = str(postgres.get("mode") or "local_docker")
+    recorded_mode = str(postgres.get("mode") or "").strip()
+    if recorded_mode:
+        mode = recorded_mode
+    elif str(pending.get("postgres_image") or "").strip():
+        mode = "local_docker"
+    else:
+        mode = "remote"
     match_mode = "remote" if mode == "remote" else "local_docker"
     match_kwargs = dict(
         graphify_semver=semver,
@@ -171,14 +177,59 @@ def install_graphify(*, first_run: bool = True) -> dict[str, Any]:
             pass
         row = match_row_for_install(**match_kwargs)
     if row is None:
+        # The recorded pending row may simply be stale (picked against an
+        # older matrix). Ask select_compat_row to re-pick pending from the
+        # current matrix and retry once before refusing for good.
+        from khipu.components_matrix import select_compat_row
+
+        healed = select_compat_row(
+            match_mode,
+            pgvector_extversion=str(postgres.get("pgvector") or "").strip() or None,
+            server_version=str(postgres.get("server_version") or "").strip() or None,
+            refresh=False,
+        )
+        if healed.get("ok"):
+            versions = load_versions()
+            healed_pending = versions.get("pending")
+            if isinstance(healed_pending, dict):
+                pending = healed_pending
+                semver = str(pending.get("graphify_semver") or "").strip()
+                url = str(pending.get("graphify_tarball_url") or "").strip()
+                postgres = (
+                    versions.get("postgres")
+                    if isinstance(versions.get("postgres"), dict)
+                    else {}
+                )
+                if semver and url:
+                    match_kwargs = dict(
+                        graphify_semver=semver,
+                        graphify_tarball_url=url,
+                        postgres_image=str(
+                            pending.get("postgres_image") or postgres.get("image") or ""
+                        ),
+                        pgvector_min=str(pending.get("pgvector_min") or ""),
+                        mode=match_mode,
+                    )
+                    row = match_row_for_install(**match_kwargs)
+    if row is None:
         app = khipu_app_version()
+        rows, _meta = effective_matrix(refresh=False)
+        mode_label = "remote" if match_mode == "remote" else "local Docker"
         return {
             "ok": False,
             "error": "matrix_row_refused",
-            "title": "No graph builder is listed for this Khipu yet",
-            "detail": f"Khipu {app} is not in the compatibility list (graph builder {semver}).",
-            "fix": "Update Khipu, or skip this step and install the graph builder later from Settings → Components.",
+            "title": "No graph builder matches this setup yet",
+            "detail": (
+                f"Khipu {app} with a {mode_label} database needs graph builder "
+                f"{semver}; no row in the compatibility list matches those details."
+            ),
+            "fix": (
+                "Skip this step for now and install the graph builder later from "
+                "Settings → Components, after the next Khipu update."
+            ),
             "khipu_app": app,
+            "mode": match_mode,
+            "matrix_rows": len(rows),
             "graphify_semver": semver,
             "graphify_tarball_url": url,
         }

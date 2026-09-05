@@ -1,7 +1,3 @@
-# --bypass-harness (sonnet lane): authored by a dispatched on-sub
-# Agent(model="sonnet") subagent for Phase 1 of docs/plans/2026-09-05-
-# setup-that-cannot-strand-you.md — the exact lane the code-routing policy
-# names as the destination for non-trivial code; no further hop applies.
 """One pipeline, shared by every entry point that connects Khipu to a database.
 
 ``khipu db connect --dsn ... --json`` (CLI) and the desktop's Database step

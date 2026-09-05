@@ -1,4 +1,3 @@
-# --bypass-harness (sonnet lane)
 """Topic/graph hygiene — W5.1 (topics vs tags) and W5.2 (path minting filter).
 
 Two shapes of graph pollution measured 2026-09-03: 94% of capture-topic slugs

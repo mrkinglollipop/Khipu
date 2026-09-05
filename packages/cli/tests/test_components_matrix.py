@@ -81,6 +81,30 @@ class SelectCompatRowTest(unittest.TestCase):
         self.assertNotIn("postgres_image", out["pending"])
         self.assertEqual(out["pending"]["graphify_semver"], "1.1.0")
 
+    @mock.patch.object(cm, "application_support_dir")
+    def test_remote_mode_recorded_even_without_server_version(self, app_support):
+        """2026-09-05 root cause: a Mac whose database was connected before
+        the app recorded a mode had NO `postgres` dict at all, because this
+        only wrote `postgres.mode = "remote"` when `server_version` was
+        known. The mode must be recorded whenever mode is remote, even with
+        server_version and pgvector still unknown."""
+        app_support.return_value = self.app_support
+
+        bundled_path = Path(self.tmp.name) / "info.json"
+        bundled_path.write_text(json.dumps({"matrix": SAMPLE_ROWS}), encoding="utf-8")
+
+        with mock.patch.object(cm, "bundled_matrix_path", return_value=bundled_path), mock.patch.object(
+            cm, "refresh_matrix_cache"
+        ), mock.patch.object(cm, "khipu_app_version", return_value="0.3.0"):
+            out = cm.select_compat_row("remote", refresh=False)
+        self.assertTrue(out["ok"])
+        saved = json.loads(
+            (self.app_support / "versions.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved["postgres"]["mode"], "remote")
+        self.assertNotIn("server_version", saved["postgres"])
+        self.assertNotIn("pgvector", saved["postgres"])
+
     @mock.patch.object(cm, "khipu_app_version", return_value="0.3.0")
     def test_forbidden_image_rejected(self, _app_ver):
         self.assertTrue(

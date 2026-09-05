@@ -11,8 +11,9 @@ export type PostUpdateNotice = {
   title: string;
   body: string;
   /** "integrations" wires an "Open Harnesses" button that switches the app to
-   * the Harnesses screen. Omit for a plain "Got it" notice. */
-  action?: "integrations";
+   * the Harnesses screen; "home" wires an "Open Home" button that switches to
+   * the Home screen. Omit for a plain "Got it" notice. */
+  action?: "integrations" | "home";
 };
 
 export const POST_UPDATE_NOTICES: PostUpdateNotice[] = [
@@ -34,6 +35,16 @@ export const POST_UPDATE_NOTICES: PostUpdateNotice[] = [
       "Settings. Doctor and Status live on Home — every red check there says what " +
       "broke in plain words and carries the one action that fixes it. Revisions is " +
       "under Settings → Advanced. Nothing you set up has moved or needs redoing.",
+  },
+  {
+    version: "0.4.2",
+    title: "Setup and health checks were rebuilt",
+    body:
+      "Home now runs the full health report on every launch. Every red row says " +
+      "what broke in plain words and carries the one action that fixes it — if " +
+      "something was wrong before this update, look there first. Setup can be " +
+      "re-run any time from Settings → Database.",
+    action: "home",
   },
 ];
 
