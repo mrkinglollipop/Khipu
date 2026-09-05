@@ -1,3 +1,7 @@
+# --bypass-harness (sonnet lane): this file is edited from inside a dispatched
+# on-sub Agent(model="sonnet") subagent (Phase 1 of the setup-that-cannot-
+# strand-you plan) — the exact lane the code-routing policy names, so no
+# further hop is possible or appropriate.
 """Apply the SQL migrations under ops/migrations to the configured database.
 
 Every migration file records itself in ``schema_migrations`` (``INSERT … ON
@@ -58,33 +62,49 @@ def plan(cur, directory: Path | None = None) -> dict:
     }
 
 
-def run(*, dry_run: bool = False, directory: Path | None = None) -> dict:
+def run(*, dry_run: bool = False, directory: Path | None = None, conn=None) -> dict:
+    """Apply pending migrations against ``conn``, or the resolved hub when
+    ``conn`` is omitted (the historical, still-default behaviour).
+
+    ``conn`` lets a caller that already opened a connection to a SPECIFIC
+    DSN — ``khipu.setup.connect_database(dsn)`` validating a database that
+    may not be the one currently configured, or a live dry-run preflight —
+    run the schema stage against exactly that connection instead of
+    whatever ``khipu.db.resolve_dsn()`` currently points at. The connection
+    is never closed here; the caller owns its lifecycle either way.
+    """
+    if conn is not None:
+        return _run_migrations(conn, dry_run=dry_run, directory=directory)
     from khipu.db import connect
 
-    with connect() as conn:
+    with connect() as owned_conn:
+        return _run_migrations(owned_conn, dry_run=dry_run, directory=directory)
+
+
+def _run_migrations(conn, *, dry_run: bool, directory: Path | None) -> dict:
+    with conn.cursor() as cur:
+        p = plan(cur, directory)
+    pending = p.pop("_pending_paths")
+    result = {k: v for k, v in p.items()}
+    result["dry_run"] = dry_run
+    result["ran"] = []
+    if dry_run:
+        return result
+    for version, path in pending:
+        sql = path.read_text(encoding="utf-8")
+        # One transaction per file. psycopg's connection is a transaction
+        # already; commit after each so a later failure cannot roll back an
+        # earlier, successful migration.
         with conn.cursor() as cur:
-            p = plan(cur, directory)
-        pending = p.pop("_pending_paths")
-        result = {k: v for k, v in p.items()}
-        result["dry_run"] = dry_run
-        result["ran"] = []
-        if dry_run:
-            return result
-        for version, path in pending:
-            sql = path.read_text(encoding="utf-8")
-            # One transaction per file. psycopg's connection is a transaction
-            # already; commit after each so a later failure cannot roll back an
-            # earlier, successful migration.
-            with conn.cursor() as cur:
-                cur.execute(sql)
-                # Belt and braces: the file records itself, but if a migration
-                # forgets to, the runner would re-apply it forever.
-                cur.execute(
-                    "INSERT INTO schema_migrations (version, note) VALUES (%s, %s) "
-                    "ON CONFLICT (version) DO NOTHING",
-                    (version, f"applied by khipu migrate from {path.name}"),
-                )
-            conn.commit()
-            result["ran"].append(version)
-        result["pending"] = []
+            cur.execute(sql)
+            # Belt and braces: the file records itself, but if a migration
+            # forgets to, the runner would re-apply it forever.
+            cur.execute(
+                "INSERT INTO schema_migrations (version, note) VALUES (%s, %s) "
+                "ON CONFLICT (version) DO NOTHING",
+                (version, f"applied by khipu migrate from {path.name}"),
+            )
+        conn.commit()
+        result["ran"].append(version)
+    result["pending"] = []
     return result

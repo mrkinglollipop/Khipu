@@ -19,6 +19,14 @@ def _env(*names: str, default: str = "") -> str:
     return default
 
 
+# Pre-existing bug fixed in passing (Phase 1, 2026-09-05): this was defined
+# only as a local inside build_parser(), so cmd_jobs()'s own reference to it
+# was an unconditional NameError on every `khipu jobs install/refresh/
+# uninstall <name>` call with explicit names — a different function's scope
+# does not see a parser-builder's locals. Module level so both see it.
+_JOBS_CHOICES = ("nightly", "monthly", "graph_build")
+
+
 def _memory_root_default() -> str | None:
     """argparse default for --memory-root: env → config.json → None.
 
@@ -1684,6 +1692,68 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     return 0 if args.dry_run or not out["pending"] else 1
 
 
+def cmd_db(args: argparse.Namespace) -> int:
+    """khipu db preflight|connect|move|status — the setup pipeline's CLI face
+    (see docs/plans/2026-09-05-setup-that-cannot-strand-you.md). Every
+    subcommand prints JSON and never the password."""
+    from khipu.setup import connect_database, host_kind, mask_dsn
+
+    if args.db_cmd == "preflight":
+        out = connect_database(args.dsn, store=False, install_jobs=False, prove=False)
+        print(json.dumps(out, indent=2))
+        return 0 if out.get("ok") else 1
+
+    if args.db_cmd == "connect":
+        out = connect_database(
+            args.dsn,
+            store=True,
+            install_jobs=not args.no_jobs,
+            prove=not args.no_prove,
+            root_crt=args.root_crt,
+        )
+        print(json.dumps(out, indent=2))
+        return 0 if out.get("ok") else 1
+
+    if args.db_cmd == "move":
+        from khipu.dbmove import move_database
+
+        def _progress(table: str, rows: int) -> None:
+            print(f"  {table}: {rows} rows", file=sys.stderr, flush=True)
+
+        out = move_database(
+            args.to,
+            dry_run=bool(args.dry_run),
+            allow_nonempty=bool(getattr(args, "into_nonempty", False)),
+            progress=_progress,
+        )
+        print(json.dumps(out, indent=2))
+        return 0 if out.get("ok") else 1
+
+    if args.db_cmd == "status":
+        from khipu.db import connect, dsn_configured, resolve_dsn
+
+        if not dsn_configured():
+            print(json.dumps({"ok": False, "error": "no_dsn_configured"}))
+            return 1
+        dsn = resolve_dsn()
+        out = {"ok": True, "dsn": mask_dsn(dsn), "host_kind": host_kind(dsn)}
+        try:
+            with connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM episodes WHERE deleted_at IS NULL")
+                    out["episodes"] = cur.fetchone()[0]
+                    cur.execute("SELECT COUNT(*) FROM topics")
+                    out["topics"] = cur.fetchone()[0]
+        except Exception as exc:  # noqa: BLE001
+            out["ok"] = False
+            out["error"] = f"{type(exc).__name__}: {exc}"
+        print(json.dumps(out, indent=2))
+        return 0 if out.get("ok") else 1
+
+    print(json.dumps({"ok": False, "error": f"unknown db subcommand: {args.db_cmd}"}))
+    return 2
+
+
 def cmd_join(args: argparse.Namespace) -> int:
     from khipu.join import (
         export_kit,
@@ -2781,6 +2851,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mg.set_defaults(func=cmd_migrate)
 
+    db = sub.add_parser(
+        "db",
+        help="Connect / move / preflight the Postgres database (setup pipeline)",
+    )
+    db_sub = db.add_subparsers(dest="db_cmd", required=True)
+    db_pre = db_sub.add_parser(
+        "preflight", help="Dry-run stages reach..graph against a DSN; writes nothing"
+    )
+    db_pre.add_argument("--dsn", required=True, help="Connection string to check")
+    db_pre.set_defaults(func=cmd_db)
+    db_conn = db_sub.add_parser(
+        "connect", help="Run the full connect pipeline and store the DSN"
+    )
+    db_conn.add_argument("--dsn", required=True, help="Connection string to adopt")
+    db_conn.add_argument(
+        "--root-crt", default=None, help="Path to a certificate file to trust (verify-full etc.)"
+    )
+    db_conn.add_argument(
+        "--no-jobs", action="store_true", help="Skip installing the nightly/monthly/graph LaunchAgents"
+    )
+    db_conn.add_argument(
+        "--no-prove", action="store_true", help="Skip the capture-to-search round trip"
+    )
+    db_conn.set_defaults(func=cmd_db)
+    db_move = db_sub.add_parser(
+        "move", help="Copy the database to another host, verify row counts, and switch"
+    )
+    db_move.add_argument("--to", required=True, help="Target connection string")
+    db_move.add_argument(
+        "--dry-run", action="store_true", help="Preflight + row counts only; copies nothing"
+    )
+    db_move.add_argument(
+        "--into-nonempty",
+        dest="into_nonempty",
+        action="store_true",
+        help="Allow a target that already holds Khipu rows",
+    )
+    db_move.set_defaults(func=cmd_db)
+    db_status = db_sub.add_parser(
+        "status", help="Current masked DSN, host kind, and row counts"
+    )
+    db_status.set_defaults(func=cmd_db)
+
     join = sub.add_parser(
         "join",
         help="Export/import hub join kits (optional passphrase; never prints secrets)",
@@ -2992,7 +3105,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     jb_sub = jb.add_subparsers(dest="jobs_cmd", required=True)
     jb_sub.add_parser("status", help="Print khipu.jobs.job_status() as JSON")
-    _JOBS_CHOICES = ("nightly", "monthly", "graph_build")
     jbi = jb_sub.add_parser("install", help="Render + load the named jobs (default: all)")
     jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build}")
     jbr = jb_sub.add_parser(

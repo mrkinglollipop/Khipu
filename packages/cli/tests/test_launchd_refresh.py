@@ -125,3 +125,29 @@ def test_refresh_keeps_passthrough_env_baked_in_the_installed_plist(monkeypatch)
         finally:
             for p in patches:
                 p.stop()
+
+
+def test_ensure_installs_missing_refreshes_stale_and_leaves_external_alone(monkeypatch):
+    monkeypatch.delenv("KHIPU_CONSOLIDATE_NIGHTLY", raising=False)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        patches = _patched(tmpdir)
+        for p in patches:
+            p.start()
+        try:
+            # nightly: maintainer-managed; monthly: stale app-rendered; graph_build: missing.
+            launchd_gen._plist_path(launchd_gen._LABELS["nightly"]).write_bytes(
+                _plist_bytes("/usr/local/bin/python3.11"))
+            launchd_gen._plist_path(launchd_gen._LABELS["monthly"]).write_bytes(
+                _plist_bytes("/Applications/Khipu.app/Contents/Resources/khipu/python/bin/python3.11"))
+            out = launchd_gen.ensure_scheduled_jobs()
+            assert out["ok"] is True
+            assert out["external"] == ["nightly"]
+            assert out["refreshed"] == ["monthly"]
+            assert out["installed"] == ["graph_build"]
+            assert launchd_gen._plist_path(launchd_gen._LABELS["nightly"]).read_bytes() == _plist_bytes("/usr/local/bin/python3.11")
+            again = launchd_gen.ensure_scheduled_jobs()
+            assert again["installed"] == [] and again["refreshed"] == []
+            assert sorted(again["current"]) == ["graph_build", "monthly"]
+        finally:
+            for p in patches:
+                p.stop()
