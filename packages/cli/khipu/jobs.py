@@ -232,8 +232,49 @@ def run_nightly() -> int:
         CONSOLIDATE_NIGHTLY, log_stem="khipu-nightly", state_name="nightly"
     )
     _reconcile_notes_if_due()
+    _embed_backfill()
+    _prune_query_cache()
     _mark_stale_commitments()
     return rc
+
+
+def _nightly_log(line: str) -> None:
+    try:
+        out_log, _ = _log_paths("khipu-nightly")
+        with open(out_log, "ab") as f:
+            f.write((line.rstrip("\n") + "\n").encode())
+    except OSError:
+        pass
+
+
+def _embed_backfill() -> None:
+    """Khipu owns the vector sweep. Until 2026-09-05 the only nightly embed
+    backfill ran inside the legacy consolidate driver, AFTER its
+    memory-root reconcile — so any reconcile failure (an unterminated
+    frontmatter block, 2026-09-03..05) silently took the backfill with it
+    and topic coverage stalled at 55 %. This runs regardless of the driver's
+    outcome and after notes.reconcile has written its pages, so the pages
+    it just created are findable by meaning the same night. Fail-open: a
+    miss is healed tomorrow, and doctor's embed_coverage_ok says so."""
+    try:
+        from khipu import embed
+
+        stats = embed.backfill()
+        _nightly_log(f"[khipu-embed] backfill ok {json.dumps(stats, default=str)[:400]}")
+    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
+        _nightly_log(f"[khipu-embed] backfill skipped: {type(exc).__name__}: {exc}")
+
+
+def _prune_query_cache() -> None:
+    """Drop query vectors nobody has asked for in a month (see
+    khipu.embed.QUERY_CACHE_TTL_DAYS). Fail-open like the backfill."""
+    try:
+        from khipu import embed
+
+        n = embed.prune_query_cache()
+        _nightly_log(f"[khipu-embed] query cache pruned {n}")
+    except Exception as exc:  # noqa: BLE001
+        _nightly_log(f"[khipu-embed] query cache prune skipped: {type(exc).__name__}: {exc}")
 
 
 def _mark_stale_commitments() -> None:

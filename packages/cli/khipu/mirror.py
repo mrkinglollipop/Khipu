@@ -152,16 +152,20 @@ def parse_topic_file(path: Path) -> dict[str, Any] | None:
                 if line.startswith("last_updated:"):
                     updated_at = _parse_frontmatter_date(line.split(":", 1)[1])
             links = parse_frontmatter_links(fm)
-            status = normalize_topic_status(status_raw)
             frontmatter = {
                 "title": title,
-                "status": status,
+                "status": normalize_topic_status(status_raw),
                 "status_raw": status_raw,
                 "links": links,
             }
             body = parts[2].lstrip("\n")
-    else:
-        status = normalize_topic_status(status_raw)
+        # A file that opens a frontmatter block and never closes it (45 such
+        # pages in the memory tree, 2026-09-05) falls through with the whole
+        # text as body and default metadata. It used to raise
+        # UnboundLocalError here, which the nightly reconcile swallowed as
+        # "khipu reconcile skipped" — and the embed backfill that ran after
+        # the reconcile went with it, so topic coverage silently stalled.
+    status = normalize_topic_status(status_raw)
     return {
         "slug": slug,
         "title": title,

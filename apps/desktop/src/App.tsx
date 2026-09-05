@@ -160,6 +160,28 @@ type SearchTiming = {
   fusion_ms?: number;
   enrich_ms?: number;
   total_ms?: number;
+  /** "hit" (no embedding call), "miss" (embedded and cached) or "off". */
+  embed_cache?: string;
+  embed_error?: string;
+};
+
+/** Why search by meaning was skipped for this query, in the engine's words
+ *  (`degraded` on the search payload): "embed-budget" (today's embedding
+ *  budget is spent), "embed-unavailable" (the embedding service did not answer
+ *  inside the query budget) or "no-embedding" (no index profile is active). */
+const DEGRADED_COPY: Record<string, { title: string; hint: string }> = {
+  "embed-budget": {
+    title: "Showing exact-word matches only",
+    hint: "Today's embedding budget is spent, so this search skipped meaning. It resets at midnight UTC; raise KHIPU_EMBED_DAILY_CALLS to change the cap.",
+  },
+  "embed-unavailable": {
+    title: "Showing exact-word matches only",
+    hint: "The embedding service did not answer in time (rate limit or network), so this search skipped meaning. Try again in a moment.",
+  },
+  "no-embedding": {
+    title: "Showing exact-word matches only",
+    hint: "No search index profile is active, so search by meaning is off. Settings › Search index shows the state.",
+  },
 };
 
 const TIMING_LABEL: Record<string, string> = {
@@ -981,6 +1003,14 @@ export default function App() {
     string,
     { total?: number; embedded?: number; missing?: number; pct?: number }
   > | null>(null);
+  // `coverage()` also reports today's embedding API budget (local to this
+  // Mac) and the hub's query-vector cache; both are informational.
+  const [embedBudget, setEmbedBudget] = useState<{
+    calls?: number; cap?: number; remaining?: number; exhausted?: boolean;
+  } | null>(null);
+  const [queryCache, setQueryCache] = useState<{
+    available?: boolean; rows?: number; hits?: number;
+  } | null>(null);
   // `coverage()` reports the active index profile alongside the per-kind
   // rows; Settings names it rather than saying "the index" and leaving the
   // person to guess which one.
@@ -1315,11 +1345,23 @@ export default function App() {
         embed_coverage?: Record<
           string,
           { total?: number; embedded?: number; missing?: number; pct?: number }
-        > & { active_profile?: unknown };
+        > & { active_profile?: unknown; budget?: unknown; query_cache?: unknown };
       }).embed_coverage;
       setEmbedCoverage(cov ?? null);
       setEmbedActiveProfile(
         typeof cov?.active_profile === "string" ? cov.active_profile : null,
+      );
+      const budget = cov?.budget;
+      setEmbedBudget(
+        budget && typeof budget === "object" && !Array.isArray(budget)
+          ? (budget as { calls?: number; cap?: number; remaining?: number; exhausted?: boolean })
+          : null,
+      );
+      const qc = cov?.query_cache;
+      setQueryCache(
+        qc && typeof qc === "object" && !Array.isArray(qc)
+          ? (qc as { available?: boolean; rows?: number; hits?: number })
+          : null,
       );
       setBackupHealth(
         (parsed as { backup?: { ok?: boolean; freshest_backup_age_seconds?: number } }).backup ?? null,
@@ -2599,6 +2641,12 @@ export default function App() {
     if (!t || typeof t !== "object" || Array.isArray(t)) return null;
     return t as SearchTiming;
   }, [searchText]);
+  const searchDegraded = useMemo<string | null>(() => {
+    const parsed = parseJson(searchText);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const d = (parsed as { degraded?: unknown }).degraded;
+    return typeof d === "string" && d ? d : null;
+  }, [searchText]);
 
   const graphData = useMemo(
     () => graphNeighborsFrom(parseJson(graphText)),
@@ -3835,6 +3883,17 @@ export default function App() {
               </div>
             ) : null}
 
+            {searchDegraded && !searchErr ? (
+              <Callout
+                tone="warn"
+                title={
+                  (DEGRADED_COPY[searchDegraded] ?? DEGRADED_COPY["embed-unavailable"]).title
+                }
+              >
+                {(DEGRADED_COPY[searchDegraded] ?? DEGRADED_COPY["embed-unavailable"]).hint}
+              </Callout>
+            ) : null}
+
             {searchErr ? (
               <Callout
                 tone="warn"
@@ -4085,10 +4144,22 @@ export default function App() {
                       <div key={key} className="row-item">
                         <span className="row-main">{label}</span>
                         <span className="row-meta">
-                          {formatMs(searchTiming[key as keyof SearchTiming])}
+                          {formatMs(searchTiming[key as keyof SearchTiming] as number)}
                         </span>
                       </div>
                     ))}
+                  {searchTiming.embed_cache ? (
+                    <div className="row-item">
+                      <span className="row-main">Query embedding</span>
+                      <span className="row-meta">
+                        {searchTiming.embed_cache === "hit"
+                          ? "reused from cache · no API call"
+                          : searchTiming.embed_cache === "miss"
+                            ? "computed and cached for next time"
+                            : "not cached (hub not migrated)"}
+                      </span>
+                    </div>
+                  ) : null}
                   {searchElapsedMs != null ? (
                     <div className="row-item">
                       <span className="row-main">App round trip</span>
@@ -4845,6 +4916,27 @@ export default function App() {
                                 </div>
                               );
                             })}
+                            {embedBudget && typeof embedBudget.cap === "number" ? (
+                              <div className="row-item">
+                                <span className="row-main">Embedding calls today</span>
+                                <span className="row-meta">
+                                  {embedBudget.calls ?? 0} of {embedBudget.cap}
+                                  {embedBudget.exhausted
+                                    ? " · budget spent, meaning search resumes at midnight UTC"
+                                    : " · this Mac, resets at midnight UTC"}
+                                </span>
+                              </div>
+                            ) : null}
+                            {queryCache?.available ? (
+                              <div className="row-item">
+                                <span className="row-main">Cached questions</span>
+                                <span className="row-meta">
+                                  {queryCache.rows ?? 0} stored · reused {queryCache.hits ?? 0}{" "}
+                                  {(queryCache.hits ?? 0) === 1 ? "time" : "times"} · unused ones
+                                  expire after 30 days
+                                </span>
+                              </div>
+                            ) : null}
                           </div>
                         ) : (
                           <p className="muted">
