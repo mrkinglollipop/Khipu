@@ -5419,6 +5419,7 @@ export default function App() {
         notice={postUpdateNotice}
         onDismiss={() => setPostUpdateNotice(null)}
         onOpenIntegrations={() => setTab("harnesses")}
+        onOpenHome={() => setTab("home")}
       />
 
       {/* Forget — the one destructive write either list makes. */}

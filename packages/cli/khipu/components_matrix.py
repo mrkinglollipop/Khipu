@@ -348,12 +348,12 @@ def select_compat_row(
                 }
             )
     if mode == "remote":
-        if server_version:
-            versions.setdefault("postgres", {})
-            if isinstance(versions["postgres"], dict):
-                versions["postgres"]["mode"] = "remote"
+        versions.setdefault("postgres", {})
+        if isinstance(versions["postgres"], dict):
+            versions["postgres"]["mode"] = "remote"
+            if server_version:
                 versions["postgres"]["server_version"] = server_version
-                if extversion:
-                    versions["postgres"]["pgvector"] = extversion
+            if extversion:
+                versions["postgres"]["pgvector"] = extversion
     write_versions(versions)
     return {"ok": True, "pending": pending, "row": chosen, "matrix": meta}

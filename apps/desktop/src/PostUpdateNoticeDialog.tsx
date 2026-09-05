@@ -6,6 +6,7 @@ type Props = {
   notice: PostUpdateNotice | null;
   onDismiss: () => void;
   onOpenIntegrations: () => void;
+  onOpenHome: () => void;
 };
 
 /** One-time notice shown after an in-app update, when `postUpdateNotices.ts`
@@ -13,7 +14,7 @@ type Props = {
  * showModal(), same pattern as FeedbackForm: role, modality, focus trap and
  * background inertness come from the element itself, Escape maps to the
  * `cancel` event, and focus moves to the primary action on open. */
-export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations }: Props) {
+export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations, onOpenHome }: Props) {
   const primaryRef = useRef<HTMLButtonElement>(null);
   const headingId = useId();
 
@@ -29,7 +30,7 @@ export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations }
     );
   }
 
-  const hasAction = notice.action === "integrations";
+  const hasAction = notice.action === "integrations" || notice.action === "home";
 
   return (
     <Dialog
@@ -49,7 +50,7 @@ export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations }
           <button type="button" ref={hasAction ? undefined : primaryRef} onClick={close}>
             Got it
           </button>
-          {hasAction ? (
+          {notice.action === "integrations" ? (
             <button
               ref={primaryRef}
               type="button"
@@ -60,6 +61,19 @@ export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations }
               }}
             >
               Open Harnesses
+            </button>
+          ) : null}
+          {notice.action === "home" ? (
+            <button
+              ref={primaryRef}
+              type="button"
+              className="primary"
+              onClick={() => {
+                onOpenHome();
+                close();
+              }}
+            >
+              Open Home
             </button>
           ) : null}
         </div>
