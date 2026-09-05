@@ -9,6 +9,7 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import { WorkingBanner } from "./WorkingBanner";
+import { Tag } from "./ui";
 
 /**
  * Integrations — the pane the agent-integration note locked on 2026-08-17.
@@ -373,10 +374,9 @@ export function IntegrationsPanel({
                 {WHERE[r.harness]}
               </span>
               {r.mcp && (r.harness === "grok_bot" || hookInstalled) ? (
-                <span className="pill ok harness-installed-pill">
-                  <span className="pill-dot" />
+                <Tag tone="ok" dot className="harness-installed-pill">
                   Installed
-                </span>
+                </Tag>
               ) : null}
             </div>
             <div className="section-body">

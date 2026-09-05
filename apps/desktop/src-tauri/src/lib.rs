@@ -756,10 +756,13 @@ fn join_receive_sync(passphrase: String, pin: String, out_path: Option<String>) 
 /// documented way to remove something the capture hook recorded. Its argv is
 /// still constrained by the CLI itself — `episode` only accepts the `forget`
 /// subcommand and an integer id.
+/// `owed` is read-only in the app today (`--status`/`--limit` only): the Owed
+/// screen lists open commitments. Closing and reopening (`--close`/`--reopen`)
+/// are writes and stay unreachable until the screen offers them.
 const ALLOWED_SUBCOMMANDS: &[&str] = &[
     "status", "doctor", "activity", "search", "graph", "revisions", "paths",
     "backup-local", "import-local", "integrations", "sources", "models",
-    "episode",
+    "episode", "owed",
 ];
 
 /// Fire-and-forget job runners — long-running consolidate/graphify passes.
@@ -1496,7 +1499,7 @@ mod run_khipu_guard_tests {
     fn every_subcommand_the_ui_calls_is_allowed() {
         for s in ["status", "doctor", "activity", "search", "graph", "revisions",
                   "paths", "backup-local", "import-local", "integrations", "sources",
-                  "models", "episode"] {
+                  "models", "episode", "owed"] {
             assert!(ALLOWED_SUBCOMMANDS.contains(&s), "UI calls `{s}` but it is not allowed");
         }
     }
@@ -1524,7 +1527,7 @@ mod run_khipu_guard_tests {
     fn the_allowlist_is_exactly_what_the_front_end_invokes() {
         // Grown by hand, so pin the size: adding an entry without a call site is
         // how the five above got in.
-        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 13);
+        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 14);
     }
 
     #[test]

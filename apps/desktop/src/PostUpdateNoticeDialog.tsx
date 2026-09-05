@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useId, useRef } from "react";
+import { useCallback, useId, useRef } from "react";
 import type { PostUpdateNotice } from "./postUpdateNotices";
+import { Dialog } from "./ui";
 
 type Props = {
   notice: PostUpdateNotice | null;
@@ -13,52 +14,30 @@ type Props = {
  * background inertness come from the element itself, Escape maps to the
  * `cancel` event, and focus moves to the primary action on open. */
 export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations }: Props) {
-  const dialogRef = useRef<HTMLDialogElement>(null);
   const primaryRef = useRef<HTMLButtonElement>(null);
   const headingId = useId();
 
   const close = useCallback(() => {
-    const dlg = dialogRef.current;
-    if (dlg?.open) dlg.close();
     onDismiss();
   }, [onDismiss]);
-
-  useEffect(() => {
-    const dlg = dialogRef.current;
-    if (!dlg) return;
-    if (notice && !dlg.open) {
-      dlg.showModal();
-      requestAnimationFrame(() => primaryRef.current?.focus());
-    } else if (!notice && dlg.open) {
-      dlg.close();
-    }
-  }, [notice]);
-
-  useEffect(() => {
-    const dlg = dialogRef.current;
-    if (!dlg) return;
-    const onCancel = (e: Event) => {
-      e.preventDefault();
-      close();
-    };
-    dlg.addEventListener("cancel", onCancel);
-    return () => dlg.removeEventListener("cancel", onCancel);
-  }, [close]);
 
   if (!notice) {
     // Keep the <dialog> mounted (open/close transitions need the same node);
     // render nothing inside it when there is no notice to show.
-    return <dialog ref={dialogRef} className="post-update-dialog" />;
+    return (
+      <Dialog open={false} className="post-update-dialog" onCancel={close} />
+    );
   }
 
   const hasAction = notice.action === "integrations";
 
   return (
-    <dialog
-      ref={dialogRef}
+    <Dialog
+      open
       className="post-update-dialog"
-      role="dialog"
-      aria-labelledby={headingId}
+      ariaLabelledBy={headingId}
+      initialFocusRef={primaryRef}
+      onCancel={close}
       onClose={onDismiss}
     >
       <div className="post-update-body">
@@ -85,6 +64,6 @@ export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations }
           ) : null}
         </div>
       </div>
-    </dialog>
+    </Dialog>
   );
 }
