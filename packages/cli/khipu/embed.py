@@ -168,11 +168,13 @@ QUERY_EMBED_RETRIES = 2
 QUERY_EMBED_DELAY_S = 1.0
 
 # Per-day API budget, counted in REQUESTS (one Gemini call = one unit, so a
-# 64-chunk backfill batch and a single Recall query cost the same). The free
-# tier allows 1,000 embed requests a day; the cap stays under it so a runaway
-# loop can never exhaust the key for the rest of the day. Local to this Mac
+# 64-chunk backfill batch and a single Recall query cost the same). This is a
+# runaway-loop ceiling, not a quota: the key is on a paid plan (Matt,
+# 2026-09-05: "we won't want to miss embeddings because of a cap"), so the
+# default is far above any real day (the busiest day so far used ~300) and
+# 0 turns the ceiling off. Local to this Mac
 # (~/.config/khipu/state/embed-budget.json), reset at UTC midnight.
-EMBED_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_EMBED_DAILY_CALLS", "800"))
+EMBED_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_EMBED_DAILY_CALLS", "10000"))
 # Query vectors are cached on the hub (memory_query_cache, migration 0014) so a
 # repeated question costs no API call; rows unused for this long are pruned by
 # the nightly.
@@ -201,12 +203,14 @@ def budget_status() -> dict[str, Any]:
     except (OSError, ValueError, TypeError):
         used = 0
     cap = EMBED_DAILY_CALL_BUDGET
+    unlimited = cap <= 0
     return {
         "day": _budget_today(),
         "calls": used,
         "cap": cap,
-        "remaining": max(0, cap - used),
-        "exhausted": used >= cap,
+        "unlimited": unlimited,
+        "remaining": None if unlimited else max(0, cap - used),
+        "exhausted": False if unlimited else used >= cap,
     }
 
 

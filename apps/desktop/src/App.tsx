@@ -172,7 +172,7 @@ type SearchTiming = {
 const DEGRADED_COPY: Record<string, { title: string; hint: string }> = {
   "embed-budget": {
     title: "Showing exact-word matches only",
-    hint: "Today's embedding budget is spent, so this search skipped meaning. It resets at midnight UTC; raise KHIPU_EMBED_DAILY_CALLS to change the cap.",
+    hint: "Today's embedding ceiling was reached, so this search skipped meaning. It resets at midnight UTC; KHIPU_EMBED_DAILY_CALLS raises the ceiling (0 removes it).",
   },
   "embed-unavailable": {
     title: "Showing exact-word matches only",
@@ -4931,9 +4931,10 @@ export default function App() {
                               <div className="row-item">
                                 <span className="row-main">Embedding calls today</span>
                                 <span className="row-meta">
-                                  {embedBudget.calls ?? 0} of {embedBudget.cap}
+                                  {embedBudget.calls ?? 0}
+                                  {embedBudget.cap > 0 ? ` of a ${embedBudget.cap} runaway ceiling` : " · no ceiling"}
                                   {embedBudget.exhausted
-                                    ? " · budget spent, meaning search resumes at midnight UTC"
+                                    ? " · ceiling reached, meaning search resumes at midnight UTC"
                                     : " · this Mac, resets at midnight UTC"}
                                 </span>
                               </div>
