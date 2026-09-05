@@ -374,7 +374,15 @@ models, Graphify, and agent wiring.
    [kinglollipop.com/khipu/download](https://kinglollipop.com/khipu/download).
 2. Open the DMG and drag **Khipu.app** to **Applications**.
 3. Launch **Khipu** from Applications and complete Welcome (database, model,
-   graph engine, integrations).
+   graph builder, agents).
+
+The app has six screens, one per job: **Home** (is memory working right now —
+health and counts in one place), **Recall** (ask what it remembers, and walk
+the connections), **Owed** (what you still owe on each project, "Needs you"
+first), **Activity** (every session it recorded), **Harnesses** (which agents
+are wired in, and whether each is actually recording), and **Settings**
+(database, capture and models, search index, data and backups, another Mac,
+components, updates, advanced).
 
 The app **updates itself** from GitHub Releases using a signed
 **`Khipu.app.tar.gz`** — not the DMG. Postgres / pgvector / Graphify version
@@ -420,8 +428,8 @@ khipu migrate            # --dry-run to see what would change
 
 **3. Give it a model.** Session summaries and semantic search can use cloud
 Gemini, a local OpenAI-compatible endpoint, or be deferred — capture queues
-safely until credentials exist. Paste keys in the app (Settings → Secrets or
-Welcome → Model), or:
+safely until credentials exist. Paste keys in the app (Settings → **Capture &
+models** or Welcome → Model), or:
 
 ```bash
 printf '%s' 'YOUR-GEMINI-KEY' | khipu secrets --set gemini_api_key
@@ -478,7 +486,7 @@ not use the gateway at all.
 
 **A second Mac** joins the same hub — it does not create a new empty database.
 
-1. On the Mac that already works: Settings → **Set up another Mac** →
+1. On the Mac that already works: Settings → **Another Mac** →
    **Save join kit…** and AirDrop the `.khipujoin` file. Passphrase is optional.
    Nearby PIN is optional (same Wi‑Fi).
 2. On the new Mac: Welcome → **Join existing Khipu** → **Import join kit file…**.
@@ -514,7 +522,8 @@ database never has to.
 
 **Can I use a model other than Gemini?**
 Yes. **Synth** (session summaries) supports cloud Gemini or a local
-OpenAI-compatible endpoint (Settings → Models or Welcome → Model). **Embed**
+OpenAI-compatible endpoint (Settings → **Capture & models**, or Welcome →
+Model). **Embed**
 (search vectors) defaults to Gemini Embedding 2 @768 when you choose cloud
 embed at first-run; you can skip embed until a profile is configured. Switching
 embed later creates a new profile and re-embed job. **Native** image vectors

@@ -67,7 +67,46 @@ type DoctorPayload = {
   dsn_file_ok?: boolean;
   index_freshness_ok?: boolean;
   embed_coverage_ok?: boolean;
+  graph_backup_ok?: boolean;
+  graph_offsite_ok?: boolean;
+  recall_probe_ok?: boolean;
+  bundle_seal_ok?: boolean;
+  hub_snapshot?: { ok?: boolean };
 };
+
+/** One plain sentence per check that can be red, so the last step of setup
+ *  never hands a first-run user a field name (`capture_liveness_ok`) and a
+ *  pane that no longer exists. Anything not named here is reported by its own
+ *  key rather than silently dropped. */
+const CHECK_IN_WORDS: Record<string, string> = {
+  backup_ok: "No recent backup of the database has been recorded yet.",
+  drift_ok: "Some note files no longer match the database.",
+  graph_drift_ok: "The connections index is behind its source.",
+  outbox_ok: "Some recorded sessions are still waiting to reach the database.",
+  capture_liveness_ok: "A harness has stopped recording sessions.",
+  git_sync_ok: "The nightly off-site copy of your notes is not landing.",
+  dsn_file_ok: "The saved database connection cannot be read.",
+  index_freshness_ok: "The index an agent reads first has not been rebuilt today.",
+  embed_coverage_ok: "Some sessions are not in the search index yet.",
+  graph_backup_ok: "The saved copy of the connections index is stale.",
+  graph_offsite_ok: "The off-site copy of the connections index is stale.",
+  recall_probe_ok:
+    "Nothing has proved end to end that a session can be recorded and found again.",
+  bundle_seal_ok: "This copy of Khipu has been altered since it was signed.",
+};
+
+function redChecks(doctor: DoctorPayload | null): string[] {
+  if (!doctor) return [];
+  const out: string[] = [];
+  for (const [key, value] of Object.entries(doctor)) {
+    if (!key.endsWith("_ok") || value !== false) continue;
+    out.push(CHECK_IN_WORDS[key] ?? key.replace(/_ok$/, "").replace(/_/g, " "));
+  }
+  if (doctor.hub_snapshot?.ok === false) {
+    out.push("The offline copy of your memory is behind.");
+  }
+  return out;
+}
 
 function soleBackupRedFlag(doctor: DoctorPayload | null): boolean {
   if (!doctor || doctor.ok) return false;
@@ -221,20 +260,20 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
       const disk = v?.disk as { warning?: string; free_gib?: number } | undefined;
       if (disk?.warning === "low_disk_space") {
         setDiskWarn(
-          `Free disk is about ${disk.free_gib ?? "?"} GiB — Postgres needs headroom. You can continue after freeing space.`,
+          `Free disk is about ${disk.free_gib ?? "?"} GiB — the database needs headroom. You can continue after freeing space.`,
         );
       }
       raw = await invoke<string>("bootstrap_local_backup");
       v = parse(raw);
       err = payloadError(v);
       if (err) {
-        setDbMsg(`Backup drill failed: ${err}`);
+        setDbMsg(`The backup test failed: ${err}`);
         return;
       }
       await refreshDsn();
       await loadPlan();
       setLocalReady(true);
-      setDbMsg("Local PostgreSQL 19 is running and the backup drill passed.");
+      setDbMsg("The database on this Mac is running, and a test restore of its backup worked.");
     } catch (e) {
       setDbMsg(String(e));
     } finally {
@@ -251,7 +290,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
     try {
       const out = parse(await invoke<string>("set_khipu_secret", { account: "database_url", value }));
       if (out?.ok !== true) {
-        setDbMsg(String(out?.error ?? "Could not save the DSN."));
+        setDbMsg(String(out?.error ?? "Could not save the connection."));
         return;
       }
       await refreshDsn();
@@ -284,7 +323,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
       }
       await loadPlan();
       setRemoteReady(true);
-      setDbMsg("Remote PostgreSQL 19 connected and compatible.");
+      setDbMsg("Connected. That server has everything Khipu needs.");
     } catch (e) {
       setDbMsg(String(e));
     } finally {
@@ -315,8 +354,8 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         if (err) {
           setDbMsg(
             warning
-              ? `${warning}\n\nJoin kit is saved on this Mac — you can continue. Hub is not reachable yet: ${err}`
-              : `Join kit is saved on this Mac — you can continue. Hub is not reachable yet: ${err}`,
+              ? `${warning}\n\nJoin kit is saved on this Mac — you can continue. The database is not reachable yet: ${err}`
+              : `Join kit is saved on this Mac — you can continue. The database is not reachable yet: ${err}`,
           );
           return true;
         }
@@ -326,7 +365,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         err = payloadError(v);
         if (err) {
           setDbMsg(
-            `Join kit is saved on this Mac — you can continue. Hub check: ${err}`,
+            `Join kit is saved on this Mac — you can continue. Database check: ${err}`,
           );
           return true;
         }
@@ -340,18 +379,18 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         await loadPlan();
         if (selErr) {
           setDbMsg(
-            `Joined the hub — Graphify version row did not persist (${selErr}). You can retry on the Graph step.`,
+            `Joined — the graph builder's version did not save (${selErr}). You can retry on the Graph step.`,
           );
         } else {
           setDbMsg(
             mismatches.length
-              ? `Joined the hub — count delta vs kit: ${mismatches.join("; ")}`
-              : "Joined the hub — live counts match the join kit.",
+              ? `Joined — counts differ from the join kit: ${mismatches.join("; ")}`
+              : "Joined — the counts match the join kit exactly.",
           );
         }
       } catch (e) {
         setDbMsg(
-          `Join kit is saved on this Mac — you can continue. Hub check failed: ${String(e)}`,
+          `Join kit is saved on this Mac — you can continue. The database check failed: ${String(e)}`,
         );
       }
       return true;
@@ -582,8 +621,8 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         setGraphOk(true);
         setGraphMsg(
           typeof out.semver === "string"
-            ? `Graphify ${out.semver} installed.`
-            : "Graph engine installed.",
+            ? `Graph builder ${out.semver} installed.`
+            : "Graph builder installed.",
         );
       } else {
         setGraphOk(false);
@@ -680,11 +719,11 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
 
   const workingLabel =
     joinBusy
-      ? "Importing join kit — talking to the hub…"
+      ? "Importing join kit — reaching the database…"
       : dbBusy
-        ? "Installing local Postgres…"
+        ? "Setting up the database…"
         : remoteBusy
-          ? "Connecting to the hub…"
+          ? "Connecting to the database…"
           : migrating
             ? "Applying database schema…"
             : saving
@@ -692,7 +731,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
               : modelSaving
                 ? "Saving models…"
                 : graphInstalling
-                  ? "Installing Graphify…"
+                  ? "Installing the graph builder…"
                   : doctorBusy && step === "finish"
                     ? "Running doctor…"
                     : null;
@@ -728,20 +767,20 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
             </p>
           )}
           <p className="muted">
-            Khipu gives your coding agents a memory that outlives the session. A
-            hook in each agent captures what happened; PostgreSQL 19 stores it as
-            searchable prose plus a property graph; the next session searches it
-            — from any of your Macs.
+            Khipu gives your coding agents a memory that outlives the session.
+            Each agent records what happened, the database keeps it as searchable
+            text and a map of what connects to what, and the next session reads it
+            back — from any of your Macs.
           </p>
           <p className="muted">
             Setup is six steps. Each one checks itself, so you can close this and
             come back; nothing here has to be finished in one go.
           </p>
           <ul className="welcome-list">
-            <li><strong>Database</strong> — join an existing hub, start local Postgres, or connect a server.</li>
-            <li><strong>Model</strong> — cloud Gemini, local OpenAI-compat, or skip (capture queues).</li>
-            <li><strong>Graph</strong> — installs the Graphify engine under Application Support.</li>
-            <li><strong>Agents</strong> — one click per harness to wire the hooks in.</li>
+            <li><strong>Database</strong> — join a Khipu you already have, set one up on this Mac, or connect to one you run.</li>
+            <li><strong>Model</strong> — cloud Gemini, a local model, or skip for now (recording waits, nothing is lost).</li>
+            <li><strong>Graph</strong> — installs the graph builder next to the app.</li>
+            <li><strong>Agents</strong> — one click per harness to wire in recording.</li>
             <li><strong>Finish</strong> — a health check, and where to get help.</li>
           </ul>
         </>
@@ -751,8 +790,8 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         <>
           <h1>Connect the database</h1>
           <p className="muted">
-            Khipu needs PostgreSQL 19 with pgvector and SQL/PGQ property graphs.
-            Choose how you want to run it on this Mac.
+            Everything Khipu remembers lives in one database. Choose how you
+            want to run it.
           </p>
           <div className="toolbar" role="radiogroup" aria-label="Database setup mode">
             <label className="mono">
@@ -762,7 +801,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                 checked={dbMode === "join"}
                 onChange={() => setDbMode("join")}
               />
-              {" "}Join existing Khipu
+              {" "}Join a Khipu I already have
             </label>
             <label className="mono">
               <input
@@ -771,7 +810,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                 checked={dbMode === "local"}
                 onChange={() => setDbMode("local")}
               />
-              {" "}Brand-new empty database on this Mac (Docker)
+              {" "}Set up a new database on this Mac (needs Docker)
             </label>
             <label className="mono">
               <input
@@ -780,7 +819,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                 checked={dbMode === "remote"}
                 onChange={() => setDbMode("remote")}
               />
-              {" "}I already have PostgreSQL 19 (paste DSN)
+              {" "}Connect to a database I already run
             </label>
           </div>
 
@@ -846,7 +885,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                 </button>
               </div>
               {joinExpected ? (
-                <Callout tone="ok" title="Expected hub counts">
+                <Callout tone="ok" title="What the other Mac has">
                   episodes {joinExpected.episodes ?? "?"} · topics {joinExpected.topics ?? "?"} ·
                   nodes {joinExpected.nodes ?? "?"}
                   {joinLive
@@ -867,7 +906,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
               <div className="toolbar">
                 <button type="button" onClick={() => void refreshDocker()}>Recheck Docker</button>
                 <button type="button" className="primary" disabled={dbBusy} onClick={() => void runLocalSetup()}>
-                  {dbBusy ? "Setting up…" : "Install local Postgres 19"}
+                  {dbBusy ? "Setting up…" : "Set up the database on this Mac"}
                 </button>
               </div>
               {dockerOk === false ? (
@@ -878,8 +917,8 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
           ) : (
             <>
               <p className="muted">
-                Paste a PostgreSQL 19 connection string. The password is stored in the
-                login Keychain via <code>set_khipu_secret</code>, never in a config file.
+                Paste the connection string for your server. The password goes
+                straight into the login Keychain — never into a file in the repo.
               </p>
               <div className="toolbar" style={{ width: "100%" }}>
                 <input
@@ -932,12 +971,12 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         <>
           <h1>Give it a model</h1>
           <p className="muted">
-            Session summaries (synth) and semantic search (embed) can use cloud
-            Gemini, a local OpenAI-compatible server, or be skipped — capture
-            queues until credentials exist; nothing is lost.
+            Session summaries and search by meaning can use cloud Gemini, a
+            local model on this Mac, or nothing for now — recording waits until a
+            key exists, and nothing is lost meanwhile.
           </p>
           <div className="section-card">
-            <div className="section-head">Summaries (synth)</div>
+            <div className="section-head">Session summaries</div>
             <div className="section-body">
               <div className="toolbar" role="radiogroup" aria-label="Synth provider">
                 <label className="mono">
@@ -1028,7 +1067,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
             </div>
           </div>
           <div className="section-card">
-            <div className="section-head">Embeddings (search)</div>
+            <div className="section-head">Search by meaning</div>
             <div className="section-body">
               <div className="toolbar" role="radiogroup" aria-label="Embed provider">
                 <label className="mono">
@@ -1091,22 +1130,22 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
 
       {step === "graph" ? (
         <>
-          <h1>Install the graph engine</h1>
-          <p className="muted">
-            Graphify builds the knowledge graph from folders you choose later.
-            It installs as a separate, upgradable component under Application
-            Support — not inside the app bundle.
+          <h1>Install the graph builder</h1>
+          <p className="muted" title="Graphify">
+            The graph builder works out how what you talked about connects — to
+            files, topics and each other. It installs next to the app, not inside
+            it, so it can be updated on its own.
           </p>
           {graphOk ? (
-            <Callout tone="ok" title="Graph engine ready">
-              {graphMsg ?? "Graphify is installed."}
+            <Callout tone="ok" title="The graph builder is ready">
+              {graphMsg ?? "Installed."}
             </Callout>
           ) : graphInstalling ? (
-            <p className="muted">Downloading and unpacking Graphify…</p>
+            <p className="muted">Downloading and unpacking the graph builder…</p>
           ) : graphSkipped ? (
             <Callout
               tone="warn"
-              title="Graph engine skipped"
+              title="Graph builder skipped"
               action={
                 <button
                   type="button"
@@ -1120,13 +1159,14 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                 </button>
               }
             >
-              Search and capture still work. The knowledge graph stays empty until
-              Graphify is installed later from Components.
+              Recording and search still work. Connections stay empty until the
+              graph builder is installed, which you can do later from Settings →
+              Components.
             </Callout>
           ) : (
             <Callout
               tone="warn"
-              title="Graph install did not finish"
+              title="The graph builder did not finish installing"
               action={
                 <>
                   <button type="button" className="primary" onClick={() => void installGraphify()}>
@@ -1138,7 +1178,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
                 </>
               }
             >
-              {graphErr ?? "Graphify isn't installed yet — retry, or skip and install it later from Components."}
+              {graphErr ?? "It is not installed yet — retry, or skip it and install it later from Settings → Components."}
             </Callout>
           )}
           {joinedHub ? (
@@ -1146,10 +1186,10 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
               <div className="section-head">Add folders on this Mac</div>
               <div className="section-body">
                 <p className="muted">
-                  Optional — publish extra code folders into the shared graph on the next
-                  build. Skip to stay reader-only on this Mac (search and graph still work
-                  from the hub). Same repo cloned at two paths creates duplicate graph nodes
-                  in v1.
+                  Optional — add code folders on this Mac for the next graph build.
+                  Skip it to read only (search and connections still work from the
+                  shared database). The same repo in two places on one Mac makes
+                  duplicate entries.
                 </p>
                 <div className="toolbar">
                   <input
@@ -1185,8 +1225,9 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         <>
           <h1>Connect your agents</h1>
           <p className="muted">
-            Each harness gets a capture hook and the Khipu MCP tools. Install
-            writes the config; verify proves it works by exercising it.
+            Each agent gets recording and the memory tools. Install writes the
+            settings; Verify proves they work by recording a throwaway session and
+            finding it again.
           </p>
           {harnesses == null ? (
             <p className="muted">Looking for harnesses…</p>
@@ -1212,7 +1253,7 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
           )}
           <div className="toolbar">
             <button type="button" className="primary" onClick={openIntegrations}>
-              Open Integrations to install and verify
+              Open Harnesses to install and verify
             </button>
           </div>
         </>
@@ -1222,37 +1263,60 @@ export function Welcome({ dsnOk, refreshDsn, runKhipu, onFinish, openIntegration
         <>
           <h1>You're set</h1>
           {graphSkipped ? (
-            <Callout tone="warn" title="Graph engine skipped">
-              Search and capture work now. Install Graphify later from
-              Components to build the knowledge graph.
+            <Callout tone="warn" title="Graph builder skipped">
+              Recording and search work now. Install the graph builder later from
+              Settings → Components to fill in the connections.
             </Callout>
           ) : null}
           {doctorErr ? (
-            <p className="muted">Doctor could not run: {doctorErr}</p>
+            <p className="muted">The health check could not run: {doctorErr}</p>
           ) : doctor == null ? (
             <p className="muted">Running a health check…</p>
           ) : (
-            <Callout tone={doctor.ok ? "ok" : "warn"} title={doctor.ok ? "Doctor is green" : "Doctor found something"}>
-              {doctor.not_configured?.length
-                ? <>Skipped (not configured on this Mac): <code>{doctor.not_configured.join(", ")}</code>. Expected on a fresh install.</>
-                : "Every configured check ran."}
-              {!doctor.ok ? " See the Doctor pane for details." : null}
-              {soleBackupRed ? (
-                <div className="callout-body">
-                  Only <code>backup_ok</code> is red — server-operator backups are not recorded yet.
-                  You may continue with warnings on a remote or joined hub database.
-                </div>
-              ) : null}
+            <Callout
+              tone={doctor.ok ? "ok" : "warn"}
+              title={
+                doctor.ok
+                  ? "Everything checked out"
+                  : "One thing still needs attention"
+              }
+              action={
+                doctor.ok ? undefined : (
+                  <button type="button" onClick={onFinish}>
+                    Open Home
+                  </button>
+                )
+              }
+            >
+              {doctor.ok ? (
+                doctor.not_configured?.length ? (
+                  <>
+                    Every check that applies to this Mac passed. Not checked here:{" "}
+                    {doctor.not_configured.join(", ")} — normal on a fresh install.
+                  </>
+                ) : (
+                  "Every check passed."
+                )
+              ) : (
+                <>
+                  {redChecks(doctor).join(" ")}
+                  {" Home shows each one with the single action that fixes it."}
+                  {soleBackupRed
+                    ? " This is the only red one, and on a database someone else runs it is expected — you can finish anyway."
+                    : null}
+                </>
+              )}
             </Callout>
           )}
           <p className="muted">
-            From here: agents capture on their own, and <strong>Search</strong>{" "}
-            is where you ask questions. <strong>Doctor</strong> is the one place
-            to look when something feels off.
+            From here: your agents record on their own, <strong>Recall</strong> is
+            where you ask questions, and <strong>Home</strong> is the one place to
+            look when something feels off.
           </p>
           <p className="muted">
             Need help? Email <a href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</a>.
-            You can reopen this tutorial any time from Setup → Welcome.
+            You can reopen this tutorial any time from Settings → Advanced → Run
+            setup again.
           </p>
         </>
       ) : null}

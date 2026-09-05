@@ -233,8 +233,8 @@ export function FeedbackForm({
         ) : (
           <>
             <p className="muted feedback-lede">
-              Emails <strong>{SUPPORT_EMAIL}</strong>. Optional files, 15 megabytes total. Your
-              hub is not included unless you attach a file.
+              Emails <strong>{SUPPORT_EMAIL}</strong>. Optional files, 15 megabytes total.
+              Nothing Khipu has recorded is included unless you attach a file.
             </p>
 
             <label className="feedback-field">

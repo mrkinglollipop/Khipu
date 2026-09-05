@@ -198,15 +198,6 @@ code {
   gap: 2px;
 }
 
-.nav-group-label {
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--muted);
-  padding: 4px 10px 6px;
-}
-
 button.nav {
   position: relative;
   display: flex;
@@ -495,20 +486,6 @@ button.danger:hover {
   border-color: var(--err);
 }
 
-button.linkish {
-  height: auto;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: var(--accent-text);
-  font-weight: 500;
-}
-
-button.linkish:hover {
-  background: transparent;
-  text-decoration: underline;
-}
-
 /* --------------------------------------------------------------------------
    Inputs
 -------------------------------------------------------------------------- */
@@ -565,56 +542,6 @@ input.mono {
   color: var(--text-2);
 }
 
-/* Search mode switch. Matches .hops-label so the toolbar reads as one row. */
-.toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--text-2);
-  white-space: nowrap;
-  cursor: pointer;
-  user-select: none;
-}
-
-/* Three-way search mode switch. Replaces the old Semantic checkbox, which
-   could express only two of the CLI's three --mode values. Sized off the
-   toolbar's own controls so the row still reads as one line. */
-.segmented {
-  display: inline-flex;
-  flex: none;
-  padding: 2px;
-  gap: 2px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--surface-2);
-}
-
-.segmented button {
-  height: 26px;
-  padding: 0 10px;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text-2);
-  border: 1px solid transparent;
-  background: transparent;
-  box-shadow: none;
-  white-space: nowrap;
-}
-
-.segmented button:hover {
-  background: var(--surface);
-  border-color: transparent;
-}
-
-.segmented button.selected {
-  color: var(--text);
-  font-weight: 600;
-  background: var(--surface);
-  border-color: var(--border);
-  box-shadow: var(--shadow-sm);
-}
-
 /* Optional Project / Since filters — a labelled input pair, same shape as
    .hops-label so the second toolbar row matches the first. */
 .filter-label {
@@ -666,104 +593,6 @@ button.primary .spin {
   to {
     transform: rotate(360deg);
   }
-}
-
-/* --------------------------------------------------------------------------
-   Status pills (dot + text)
--------------------------------------------------------------------------- */
-
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 600;
-  background: var(--surface-2);
-  color: var(--text-2);
-  white-space: nowrap;
-}
-
-.pill-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  flex: none;
-  background: var(--muted);
-}
-
-.pill.ok {
-  background: var(--ok-soft);
-  color: var(--ok);
-}
-
-.pill.ok .pill-dot {
-  background: var(--ok);
-}
-
-.pill.warn {
-  background: var(--warn-soft);
-  color: var(--warn);
-}
-
-.pill.warn .pill-dot {
-  background: var(--warn);
-}
-
-.pill.err {
-  background: var(--err-soft);
-  color: var(--err);
-}
-
-.pill.err .pill-dot {
-  background: var(--err);
-}
-
-/* --------------------------------------------------------------------------
-   KPI cards
--------------------------------------------------------------------------- */
-
-.kpis {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 12px;
-}
-
-.kpi {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 12px 16px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  box-shadow: var(--shadow-sm);
-}
-
-.kpi-label {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-
-.kpi-value {
-  font-size: 18px;
-  font-weight: 600;
-  color: var(--text);
-  line-height: 1.2;
-}
-
-.kpi-value.mono {
-  font-family: var(--mono);
-}
-
-.kpi-hint {
-  font-size: 11px;
-  color: var(--muted);
 }
 
 .chips {
@@ -980,138 +809,6 @@ button.id-chip:hover {
 }
 
 
-.callout-action {
-  flex: none;
-  margin-left: 8px;
-}
-
-/* --------------------------------------------------------------------------
-   Search results
--------------------------------------------------------------------------- */
-
-.results {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.result-card {
-  padding: 12px 16px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  box-shadow: var(--shadow-sm);
-}
-
-.result-top {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-
-.kind-badge {
-  flex: none;
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  padding: 2px 6px;
-  border-radius: 4px;
-  background: var(--surface-2);
-  color: var(--text-2);
-}
-
-.kind-badge.topic {
-  background: var(--accent-soft);
-  color: var(--accent-text);
-}
-
-.kind-badge.node {
-  background: var(--ok-soft);
-  color: var(--ok);
-}
-
-.kind-badge.episode {
-  background: var(--warn-soft);
-  color: var(--warn);
-}
-
-.result-label {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* Relevance indicator. The fused RRF score was in every payload and rendered
-   nowhere, so results looked unordered. The bar is relative to the top hit in
-   the same response — the score's scale is only meaningful within one search. */
-.result-score {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-}
-
-.result-score-bar {
-  flex: 0 1 120px;
-  height: 4px;
-  border-radius: 999px;
-  background: var(--surface-2);
-  overflow: hidden;
-}
-
-.result-score-bar > span {
-  display: block;
-  height: 100%;
-  border-radius: 999px;
-  background: var(--accent);
-}
-
-.result-score-num {
-  font-size: 11px;
-  color: var(--muted);
-}
-
-.result-why {
-  margin: 6px 0 0;
-  font-size: 11.5px;
-}
-
-.result-snippet {
-  margin: 6px 0 0;
-  font-size: 12px;
-  color: var(--muted);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.result-paths,
-.result-neighbors {
-  margin: 6px 0 0;
-  padding-left: 1.1rem;
-  font-size: 11px;
-  color: var(--muted);
-}
-
-.result-paths li,
-.result-neighbors li {
-  margin: 2px 0;
-  word-break: break-all;
-}
-
-.result-id {
-  display: block;
-  margin-top: 6px;
-  font-size: 11px;
-  color: var(--muted);
-}
-
 /* --------------------------------------------------------------------------
    Empty states
 -------------------------------------------------------------------------- */
@@ -1131,15 +828,13 @@ button.id-chip:hover {
   color: var(--muted);
 }
 
-.empty b,
-.empty-title {
+.empty b {
   font-size: var(--t-md);
   font-weight: 600;
   color: var(--text);
 }
 
-.empty span,
-.empty-hint {
+.empty span {
   font-size: var(--t-sm);
   color: var(--muted);
   max-width: 46ch;
@@ -1166,58 +861,6 @@ button.id-chip:hover {
 
 .code.tall {
   max-height: 48vh;
-}
-
-details.raw {
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--surface);
-  overflow: hidden;
-}
-
-details.raw > summary {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  cursor: pointer;
-  padding: 8px 12px;
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 560;
-  user-select: none;
-  list-style: none;
-  transition: background 140ms ease;
-}
-
-details.raw > summary::-webkit-details-marker {
-  display: none;
-}
-
-details.raw > summary:hover {
-  background: var(--surface-2);
-}
-
-details.raw > summary:focus-visible {
-  outline: none;
-  box-shadow: inset 0 0 0 3px var(--ring);
-}
-
-.raw-chevron {
-  transition: transform 140ms ease;
-  flex: none;
-}
-
-details.raw[open] .raw-chevron {
-  transform: rotate(90deg);
-}
-
-details.raw[open] > summary {
-  border-bottom: 1px solid var(--border);
-}
-
-details.raw .code {
-  border: 0;
-  border-radius: 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -1261,51 +904,6 @@ button.toast-close:hover {
 }
 
 /* --------------------------------------------------------------------------
-   Doctor
--------------------------------------------------------------------------- */
-
-.doctor-card {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 20px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  box-shadow: var(--shadow-sm);
-}
-
-.doctor-card svg {
-  flex: none;
-  color: var(--muted);
-}
-
-.doctor-card.ok svg {
-  color: var(--ok);
-}
-
-.doctor-card.err svg {
-  color: var(--err);
-}
-
-.doctor-title {
-  font-size: 15px;
-  font-weight: 650;
-}
-
-.doctor-card.ok .doctor-title {
-  color: var(--ok);
-}
-
-.doctor-card.err .doctor-title {
-  color: var(--err);
-}
-
-.doctor-sub {
-  margin: 2px 0 0;
-}
-
-/* --------------------------------------------------------------------------
    Settings section cards
 -------------------------------------------------------------------------- */
 
@@ -1340,18 +938,6 @@ button.toast-close:hover {
 
 .section-body .rows {
   border-radius: var(--r-sm);
-}
-
-.badge-muted {
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  padding: 2px 6px;
-  border-radius: 4px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  color: var(--muted);
 }
 
 /* --------------------------------------------------------------------------
@@ -1405,10 +991,6 @@ button.toast-close:hover {
 .row-item > svg.warn { color: var(--warn); }
 .row-item > svg.muted { color: var(--muted); }
 .row-item > svg { flex: 0 0 auto; margin-top: 2px; }
-
-.harness-installed-pill {
-  margin-left: auto;
-}
 
 .welcome-harness-list {
   list-style: none;
@@ -1472,15 +1054,7 @@ button.toast-close:hover {
 -------------------------------------------------------------------------- */
 
 .feedback-dialog {
-  margin: auto;
-  padding: 0;
-  border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  background: var(--surface);
-  box-shadow: var(--shadow-md);
-  color: var(--text);
   max-width: min(520px, calc(100vw - 32px));
-  width: 100%;
 }
 
 
@@ -1669,15 +1243,7 @@ button.feedback-attach-remove:hover {
 -------------------------------------------------------------------------- */
 
 .post-update-dialog {
-  margin: auto;
-  padding: 0;
-  border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  background: var(--surface);
-  box-shadow: var(--shadow-md);
-  color: var(--text);
   max-width: min(440px, calc(100vw - 32px));
-  width: 100%;
 }
 
 
@@ -2059,15 +1625,6 @@ details.disclose[open] > summary .disclosure-chevron {
   width: 60px;
 }
 
-.w76 {
-  width: 76px;
-}
-
-.w104 {
-  width: 104px;
-  flex: none;
-}
-
 /* Rail count badges. */
 .nav-count {
   margin-left: auto;
@@ -2332,7 +1889,11 @@ button.row.on {
 
 /* Confirm / edit dialogs (Forget, Edit summary, Snooze) — the same card the
    feedback dialog uses, without its form-specific rules. */
-.kit-dialog {
+/* One dialog card for all three modals — the same box was declared three
+   times, once per dialog, and only the max-width ever differed. */
+.kit-dialog,
+.feedback-dialog,
+.post-update-dialog {
   margin: auto;
   padding: 0;
   border: 1px solid var(--border);
@@ -2340,8 +1901,11 @@ button.row.on {
   background: var(--surface);
   box-shadow: var(--shadow-md);
   color: var(--text);
-  max-width: min(480px, calc(100vw - 32px));
   width: 100%;
+}
+
+.kit-dialog {
+  max-width: min(480px, calc(100vw - 32px));
 }
 
 .kit-dialog-body {
@@ -2443,4 +2007,200 @@ button.row.on {
   gap: 6px;
   flex-wrap: nowrap;
   justify-content: flex-end;
+}
+
+/* ---------------------------------------------------------------------------
+   UI kit, part three — harness cards and the Settings sub-navigation
+   (overhaul phase 5). Values from the approved mocks' tokens.css.
+--------------------------------------------------------------------------- */
+
+.hgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: var(--s3);
+}
+
+.hcard {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.hcard .top {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s3) var(--s4) var(--s2);
+}
+
+.hcard .name {
+  font-weight: 650;
+  font-size: var(--t-lg);
+  flex: 1;
+  min-width: 0;
+}
+
+.hcard .checks {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: var(--s1) var(--s4) var(--s3);
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+.hcard .checks div {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s2);
+}
+
+.hcard .checks span {
+  min-width: 0;
+}
+
+.hcard .note {
+  padding: 0 var(--s4) var(--s3);
+  font-size: var(--t-xs);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hcard .hacts {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: var(--s3) var(--s4);
+  border-top: 1px solid var(--border);
+  margin-top: auto;
+}
+
+.hcard.dashed {
+  border-style: dashed;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: var(--s5);
+  text-align: center;
+}
+
+.hcard.dashed b {
+  font-size: var(--t-md);
+}
+
+.meta.wrap {
+  white-space: normal;
+}
+
+/* Check-line marks. `off` is "nothing to do here, by design" and must never
+   read as either a pass or a failure (2026-08-17). */
+.ck {
+  flex: none;
+  margin-top: 1px;
+  stroke-width: 2.25;
+}
+
+.ck.ok {
+  color: var(--ok);
+}
+
+.ck.err {
+  color: var(--err);
+}
+
+.ck.warn {
+  color: var(--warn);
+}
+
+.ck.off {
+  color: var(--border-strong);
+}
+
+/* Settings: a fixed sub-navigation beside one section at a time. */
+.settings-split {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s5);
+  min-width: 0;
+}
+
+.subnav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 180px;
+  flex: none;
+  position: sticky;
+  top: 76px;
+}
+
+.subnav button {
+  justify-content: flex-start;
+  height: 30px;
+  padding: 0 10px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-2);
+  font-weight: 500;
+  font-size: var(--t-md);
+}
+
+.subnav button:hover {
+  background: var(--surface);
+  border-color: transparent;
+}
+
+.subnav button.on {
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.settings-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s4);
+  flex: 1;
+  min-width: 0;
+  max-width: 720px;
+}
+
+/* Owed groups — a section heading that collapses, not a quiet "Advanced"
+   line. "Needs you" is open by default; the other two are one click. */
+details.disclose.group {
+  border-top: 0;
+  padding-top: 0;
+}
+
+details.disclose.group > summary.disclosure {
+  font-size: var(--t-md);
+  color: var(--text);
+  padding: var(--s2) 0 var(--s1);
+}
+
+details.disclose.group > summary.disclosure strong {
+  font-weight: 650;
+}
+
+details.disclose.group .nav-count {
+  margin-left: 0;
+}
+
+details.disclose.group .meta {
+  color: var(--muted);
+}
+
+/* The label is one span inside the summary (ui.tsx), so the group header's
+   title, count and hint need their own row. */
+details.disclose.group > summary.disclosure > span {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-width: 0;
+  flex: 1;
 }

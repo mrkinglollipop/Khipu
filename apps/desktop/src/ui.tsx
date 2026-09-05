@@ -300,11 +300,15 @@ export function Disclosure({
   label,
   openKey = 0,
   defaultOpen = false,
+  className,
   children,
 }: {
   label: ReactNode;
   openKey?: number;
   defaultOpen?: boolean;
+  /** Extra class on the `details` — `group` is the Owed section header, which
+   *  is a heading rather than a quiet "Advanced" line. */
+  className?: string;
   children?: ReactNode;
 }) {
   const ref = useRef<HTMLDetailsElement>(null);
@@ -320,7 +324,7 @@ export function Disclosure({
   return (
     <details
       ref={ref}
-      className="disclose"
+      className={className ? `disclose ${className}` : "disclose"}
       open={open}
       onToggle={(e) => setOpen(e.currentTarget.open)}
     >

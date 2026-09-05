@@ -171,11 +171,11 @@ export function ComponentsPanel({ active }: { active: boolean }) {
             </p>
           ) : postgresProbe && postgresProbe.ok === false ? (
             <p className="muted">
-              Could not reach the configured Postgres DSN: {postgresProbe.error ?? "unknown error"}.
+              Could not reach the database: {postgresProbe.error ?? "unknown error"}.
             </p>
           ) : docker && docker.ok === false ? (
             <p className="muted">
-              Docker not found — install Docker Desktop to set up local Postgres, or configure a remote DSN in Settings.
+              Docker not found — install Docker Desktop to set up a database on this Mac, or point Khipu at a server under Settings → Database.
             </p>
           ) : (
             <p className="muted">No local Postgres component installed yet.</p>
@@ -204,7 +204,7 @@ export function ComponentsPanel({ active }: { active: boolean }) {
       </div>
 
       <div className="section-card">
-        <div className="section-head">Graphify</div>
+        <div className="section-head" title="Graphify">Graph builder</div>
         <div className="section-body">
           {gyExternal ? (
             <p className="muted">
@@ -222,7 +222,7 @@ export function ComponentsPanel({ active }: { active: boolean }) {
               ) : null}
             </p>
           ) : (
-            <p className="muted">Graphify not installed — finish Welcome → Graph first.</p>
+            <p className="muted">The graph builder is not installed — finish Welcome → Graph first.</p>
           )}
           {gyExternal ? null : (
             <div className="toolbar">

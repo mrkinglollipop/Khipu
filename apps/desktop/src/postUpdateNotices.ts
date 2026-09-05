@@ -10,8 +10,8 @@ export type PostUpdateNotice = {
   version: string;
   title: string;
   body: string;
-  /** "integrations" wires an "Open Integrations" button that switches the
-   * app to the Integrations pane. Omit for a plain "Got it" notice. */
+  /** "integrations" wires an "Open Harnesses" button that switches the app to
+   * the Harnesses screen. Omit for a plain "Got it" notice. */
   action?: "integrations";
 };
 
@@ -21,10 +21,19 @@ export const POST_UPDATE_NOTICES: PostUpdateNotice[] = [
     title: "Cursor users: re-install the Khipu pack once",
     body:
       "This version changed the Cursor recall rule (hybrid search default, khipu_owed). " +
-      "Hooks and the MCP server updated automatically with the app, but Cursor's " +
-      "per-project rule file only refreshes when you re-run Install on the Integrations " +
-      "pane for each project.",
+      "Hooks and the memory server updated automatically with the app, but Cursor's " +
+      "per-project rule file only refreshes when you re-run Install on the Harnesses " +
+      "screen for each project.",
     action: "integrations",
+  },
+  {
+    version: "0.4.0",
+    title: "Khipu has a new layout",
+    body:
+      "Six screens now, one per job: Home, Recall, Owed, Activity, Harnesses and " +
+      "Settings. Doctor and Status live on Home — every red check there says what " +
+      "broke in plain words and carries the one action that fixes it. Revisions is " +
+      "under Settings → Advanced. Nothing you set up has moved or needs redoing.",
   },
 ];
 

@@ -1,25 +1,24 @@
 import { useCallback, useEffect, useState } from "react";
-import {
-  CircleCheck,
-  CircleDashed,
-  CircleMinus,
-  Loader2,
-  RefreshCw,
-  ShieldCheck,
-  TriangleAlert,
-} from "lucide-react";
+import { Check, Loader2, Minus, RefreshCw, TriangleAlert, X } from "lucide-react";
 import { WorkingBanner } from "./WorkingBanner";
-import { Tag } from "./ui";
+import { Callout, Tag } from "./ui";
+import type { Tone } from "./ui";
 
 /**
- * Integrations — the pane the agent-integration note locked on 2026-08-17.
+ * Harnesses — one card per harness on this Mac (desktop overhaul phase 5,
+ * `mocks/main.harness.html`).
  *
  * Thin wrapper over `khipu integrations status|install|verify|uninstall`
- * (packages/cli/khipu/integrations.py). One card per DETECTED harness; each
- * card shows its native components (MCP, capture hook, recall rule) with a
- * state that is only ever green after a real probe passed. Undetected
- * harnesses are shown quietly, never as errors. Every write the CLI does is
- * backed up first, so Uninstall is a full rollback.
+ * (packages/cli/khipu/integrations.py), plus two pieces of EVIDENCE the app
+ * already reads for Home: the per-harness capture heartbeat
+ * (`doctor.capture_liveness`) and the last recorded end-to-end recall probe
+ * (`doctor.recall_probe`, written by `khipu doctor --probe` /
+ * `integrations verify`).
+ *
+ * The status tag and the "Verified …" line come from that evidence and
+ * nothing else. The pre-overhaul pane derived them from app-local install
+ * state, so a pack the CLI had already probed green read "Installed, not yet
+ * verified" forever (audit 2026-09-04, phase 5 brief).
  *
  * Nothing here edits a legacy capture hook: Install adds Khipu's entries
  * ALONGSIDE them (dual-write). Removing legacy is a later, soak-gated step
@@ -63,9 +62,7 @@ type VerifyRow = {
     hook?: Probe;
     recall?: Probe;
     extract?: Probe;
-    /** W6.1: capture a nonce, search for it, forget it. Verify has returned
-     * this for every detected pack since 0.3.16 and the pane dropped it on
-     * the floor (audit 2026-09-04). */
+    /** W6.1: capture a nonce, search for it, forget it. */
     recall_probe?: Probe;
   };
   /** Cursor only: true when this project's .cursor/rules/khipu.mdc no longer
@@ -73,27 +70,42 @@ type VerifyRow = {
    * --project was passed) — `note` says which. */
   rule_stale?: boolean | null;
   note?: string;
-  /** Evidence from REAL sessions (not probes): the harness ran the hook, captures
-   *  landed, nothing is stuck. `ok=false` + reasons is the "runs but records
-   *  nothing" case — the silent failure the pane exists to make loud. */
-  runtime?: Runtime;
-  /** Older name for `runtime` on the Aegis card. */
-  aegis?: Runtime;
 };
 
-type Runtime = {
+/** One harness's row in `doctor.capture_liveness.harnesses`. */
+export type HarnessLiveness = {
   ok?: boolean;
+  seen?: boolean;
   reasons?: string[];
-  last_dispatch?: string | null;
   last_dispatch_age_s?: number | null;
   last_captured_age_s?: number | null;
   captures?: number;
-  dispatches?: number;
-  pending_turns?: number;
   queue_depth?: number | null;
-  sessions_tracked?: number | null;
   note?: string | null;
-  error?: string;
+};
+
+export type LivenessPayload = {
+  ok?: boolean;
+  red?: string[];
+  harnesses?: Record<string, HarnessLiveness>;
+};
+
+/** `doctor.recall_probe` — `khipu.probe.status()`: the LAST RECORDED probe,
+ *  read-only. One file, one row: `last_probe.harness` says which pack it was
+ *  run for, so a card only claims it when the harness matches. */
+export type RecallProbeStatus = {
+  ok?: boolean;
+  reason?: string | null;
+  age_seconds?: number | null;
+  last_probe?: {
+    ts?: string;
+    harness?: string;
+    ok?: boolean;
+    status?: string;
+    reason?: string;
+    seconds?: number;
+    error?: string | null;
+  } | null;
 };
 
 const LABEL: Record<HarnessId, string> = {
@@ -101,7 +113,7 @@ const LABEL: Record<HarnessId, string> = {
   cursor: "Cursor",
   aegis: "Aegis",
   codex: "Codex",
-  grok_bot: "Grok Bot (Cursor cloud)",
+  grok_bot: "Grok Bot · cloud",
 };
 
 const WHERE: Record<HarnessId, string> = {
@@ -109,52 +121,137 @@ const WHERE: Record<HarnessId, string> = {
   cursor: "~/.cursor/mcp.json · ~/.cursor/hooks.json",
   aegis: "~/.grok/config.toml",
   codex: "~/.codex/config.toml · ~/.codex/hooks.json",
-  grok_bot: "per repo: .cursor/mcp.json → your Khipu HTTPS gateway",
+  grok_bot: "per repo: .cursor/mcp.json → your Khipu gateway",
 };
 
-type ComponentState = "verified" | "installed" | "failed" | "missing" | "na";
+/** Check-line marks. `ok`/`err`/`warn` are verdicts; `off` is "nothing to do
+ *  here, by design" and must never read as either. */
+type Mark = "ok" | "warn" | "err" | "off";
 
-function Dot({ state }: { state: ComponentState }) {
-  const size = 16;
-  if (state === "verified")
-    return <CircleCheck size={size} strokeWidth={1.75} aria-hidden className="ok" />;
-  if (state === "failed")
-    return <TriangleAlert size={size} strokeWidth={1.75} aria-hidden className="err" />;
-  if (state === "installed")
-    return <ShieldCheck size={size} strokeWidth={1.75} aria-hidden className="ok" />;
-  // "Nothing to do here" and "absent" are different answers to "is it working?"
-  // and had shared one grey dashed circle, so a card working exactly as designed
-  // read as half-broken (2026-08-17). Solid minus = by design; dashed +
-  // warn = genuinely missing.
-  if (state === "na")
-    return <CircleMinus size={size} strokeWidth={1.75} aria-hidden className="muted" />;
-  return <CircleDashed size={size} strokeWidth={1.75} aria-hidden className="warn" />;
+function CheckMark({ mark }: { mark: Mark }) {
+  const cls = `ck ${mark}`;
+  if (mark === "ok") return <Check size={14} className={cls} aria-hidden />;
+  if (mark === "err") return <X size={14} className={cls} aria-hidden />;
+  return <Minus size={14} className={cls} aria-hidden />;
 }
 
 function fmtAge(s: number | null | undefined): string {
   if (s == null) return "an unknown time";
-  if (s < 90) return `${s}s`;
-  if (s < 5400) return `${Math.round(s / 60)}m`;
-  if (s < 172800) return `${Math.round(s / 3600)}h`;
-  return `${Math.round(s / 86400)}d`;
+  if (s < 90) return `${Math.round(s)}s`;
+  if (s < 5400) return `${Math.round(s / 60)} min`;
+  if (s < 172800) return `${Math.round(s / 3600)} h`;
+  return `${Math.round(s / 86400)} days`;
 }
 
-const STATE_TEXT: Record<ComponentState, string> = {
-  verified: "Installed and verified",
-  installed: "Installed, not yet verified",
-  failed: "Installed, verify failed",
-  missing: "Not installed",
-  na: "Nothing to install here — by design",
-};
+function firstReason(lv: HarnessLiveness | undefined): string {
+  const r = (lv?.reasons ?? [])[0];
+  return r ? r.slice(0, 120) : "";
+}
+
+type CardStatus = { tone: Tone; label: string };
+
+/** The card's one-word verdict, from evidence only:
+ *   Not installed — the pack is absent from this harness's config.
+ *   Not recording — the capture heartbeat is red for this harness.
+ *   Recording     — the heartbeat shows a capture landing.
+ *   Reachable     — the gateway answered (Grok Bot, which has no local hook).
+ *  Anything else is "no evidence yet", which is neither a pass nor a failure. */
+export function cardStatus(
+  row: StatusRow,
+  lv: HarnessLiveness | undefined,
+  gatewayProbe: Probe | undefined,
+): CardStatus {
+  if (!row.detected) return { tone: "neutral", label: "Not on this Mac" };
+  if (row.harness === "grok_bot") {
+    // `mcp` here is only the OPTIONAL per-repo pin; the real configuration
+    // lives in the Cursor cloud UI, which this Mac cannot read. "No pin" is
+    // therefore not "not installed" — only the gateway probe can say.
+    if (gatewayProbe?.ok === true) return { tone: "ok", label: "Reachable" };
+    if (gatewayProbe && gatewayProbe.ok === false) {
+      return { tone: "err", label: "Not reachable" };
+    }
+    return { tone: "neutral", label: "Not checked yet" };
+  }
+  const installed = row.mcp && row.hook_stop && row.hook_precompact;
+  if (!installed) return { tone: "neutral", label: "Not installed" };
+  if (lv?.ok === false) return { tone: "err", label: "Not recording" };
+  if (lv?.seen && (lv.captures ?? 0) > 0) return { tone: "ok", label: "Recording" };
+  return { tone: "neutral", label: "No sessions yet" };
+}
+
+/** The "Verified …" line. Prefers this session's own verify result; falls back
+ *  to the stored probe, and only when that probe was run FOR THIS HARNESS —
+ *  one Mac keeps one probe file, and another pack's round trip is not
+ *  evidence about this one. */
+export function verifiedLine(
+  harness: string,
+  fresh: Probe | undefined,
+  stored: RecallProbeStatus | null,
+): { mark: Mark; text: string } {
+  if (fresh) {
+    if (fresh.status === "skipped") {
+      return {
+        mark: "off",
+        text: `Recall probe skipped — ${fresh.reason ?? "legacy capture mode writes no database row"}`,
+      };
+    }
+    if (fresh.ok) {
+      return {
+        mark: "ok",
+        text: `Verified just now${fresh.seconds != null ? ` · ${fresh.seconds}s round trip` : ""}`,
+      };
+    }
+    return {
+      mark: "err",
+      text: `Verify failed — ${(fresh.error ?? fresh.reason ?? "the capture never became findable").slice(0, 120)}`,
+    };
+  }
+  const last = stored?.last_probe;
+  if (!last || last.harness !== harness) {
+    return { mark: "off", text: "Not verified on this pack yet — Verify runs it" };
+  }
+  if (last.status === "skipped") {
+    return {
+      mark: "off",
+      text: `Recall probe skipped — ${last.reason ?? "legacy capture mode writes no database row"}`,
+    };
+  }
+  const age = stored?.age_seconds;
+  if (last.ok) {
+    return {
+      mark: stored?.ok === false ? "warn" : "ok",
+      text:
+        `Verified ${age != null ? `${fmtAge(age)} ago` : "at an unknown time"}` +
+        (last.seconds != null ? ` · ${last.seconds}s round trip` : "") +
+        (stored?.ok === false ? " — older than a week, run Verify" : ""),
+    };
+  }
+  return {
+    mark: "err",
+    text: `Last verify failed — ${(last.error ?? stored?.reason ?? "the capture never became findable").slice(0, 120)}`,
+  };
+}
 
 export function IntegrationsPanel({
   runKhipu,
   onToast,
   active,
+  liveness,
+  recallProbe,
+  refreshHealth,
+  onAnotherMac,
 }: {
   runKhipu: (args: string[]) => Promise<string>;
   onToast: (msg: string) => void;
   active: boolean;
+  /** `doctor.capture_liveness` — the recording evidence. */
+  liveness: LivenessPayload | null;
+  /** `doctor.recall_probe` — the stored round-trip evidence. */
+  recallProbe: RecallProbeStatus | null;
+  /** Re-read doctor after an install/verify, so the evidence on these cards
+   *  is never older than the action the user just took. */
+  refreshHealth: () => void;
+  onAnotherMac: () => void;
 }) {
   const [rows, setRows] = useState<StatusRow[] | null>(null);
   const [verify, setVerify] = useState<Record<string, VerifyRow>>({});
@@ -178,8 +275,7 @@ export function IntegrationsPanel({
 
   // Panels are CSS-hidden on tab switch, not unmounted, so a mount-only
   // effect never re-fetches — the pane goes stale as soon as something
-  // changes elsewhere (0.3.12 fixed the same staleness for Status/Doctor by
-  // keying the load on tab activation instead of mount; audit 2026-08-31).
+  // changes elsewhere (audit 2026-08-31).
   useEffect(() => {
     if (!active) return;
     void load();
@@ -219,54 +315,54 @@ export function IntegrationsPanel({
           onToast("Removed Khipu entries. Backups kept next to each file.");
         }
         await load();
+        // Verify writes a fresh probe result and install changes what the
+        // heartbeat will say next; both live in the doctor payload.
+        refreshHealth();
       } catch (e) {
         onToast(`${cmd} failed: ${String(e).slice(0, 160)}`);
       } finally {
         setBusy(null);
       }
     },
-    [runKhipu, load, onToast],
+    [runKhipu, load, onToast, refreshHealth],
   );
 
   const detected = (rows ?? []).filter((r) => r.detected);
-  const undetected = (rows ?? []).filter((r) => !r.detected);
 
   return (
-    <div className="panel-body">
+    <div className="panel-body wide">
       <WorkingBanner
         label={
           busy == null
             ? null
             : busy === "load"
-              ? "Checking integrations…"
+              ? "Checking harnesses…"
               : busy.startsWith("install:")
-                ? "Installing harness hooks…"
+                ? "Installing harness packs…"
                 : busy.startsWith("verify:")
-                  ? "Verifying harness hooks…"
+                  ? "Verifying — capturing a throwaway session and searching for it…"
                   : busy.startsWith("uninstall:")
                     ? "Removing Khipu entries…"
                     : "Working…"
         }
       />
       {loadError ? (
-        <div className="doctor-card err" role="alert">
-          <TriangleAlert size={24} strokeWidth={1.75} aria-hidden />
-          <div>
-            <div className="doctor-title">Couldn't read integration status</div>
-            <p className="doctor-sub muted">
-              The CLI didn't answer. Showing the last known state. Retry, or check that
-              Python 3.11 and the Khipu repo path are set in Settings.
-            </p>
-            <div className="toolbar">
-              <button type="button" disabled={busy != null} onClick={() => void load()}>
-                <RefreshCw size={14} strokeWidth={1.75} aria-hidden /> Retry
-              </button>
-            </div>
-          </div>
-        </div>
+        <Callout
+          tone="err"
+          stripe
+          title="Couldn't read the harness configs"
+          action={
+            <button type="button" disabled={busy != null} onClick={() => void load()}>
+              <RefreshCw size={14} strokeWidth={1.75} aria-hidden /> Retry
+            </button>
+          }
+        >
+          The CLI didn't answer, so this is the last known state. Check that
+          Python 3.11 and the Khipu folder are set under Settings → Advanced.
+        </Callout>
       ) : null}
 
-      <div className="toolbar">
+      <div className="inline">
         <button
           type="button"
           className="primary"
@@ -287,300 +383,187 @@ export function IntegrationsPanel({
         <button type="button" disabled={busy != null} onClick={() => void load()}>
           <RefreshCw size={14} strokeWidth={1.75} aria-hidden /> Refresh
         </button>
+        <span className="meta push">
+          Verified = a real capture went in and came back out of search on this Mac
+        </span>
       </div>
 
       {rows == null && !loadError ? (
         <p className="muted">Reading harness configs…</p>
       ) : null}
 
-      {detected.map((r) => {
-        const v = verify[r.harness];
-        // A passed probe outranks the config read: verify talks to the server,
-        // status only looks at a file. Grok Bot's server lives in the Cursor
-        // cloud UI, which this Mac cannot read, so "no repo pin" is not "absent".
-        const mcpState: ComponentState = v?.components?.mcp
-          ? v.components.mcp.ok
-            // A passing grok_bot probe proves the GATEWAY answers this Mac, not
-            // that the cloud agent is pointed at it — never award that row the
-            // same green as a harness whose own client we handshook with.
-            ? (r.harness === "grok_bot" ? "installed" : "verified")
-            : "failed"
-          : r.mcp
-            ? "installed"
-            : r.harness === "grok_bot"
-              ? "na"
-              : "missing";
-        const hookInstalled = r.hook_stop && r.hook_precompact;
-        const hookState: ComponentState = r.harness === "grok_bot"
-          ? "na"                       // cloud agent: capture is the khipu_capture tool over the gateway
-          : !hookInstalled
-          ? "missing"
-          : v?.components?.hook
-            ? v.components.hook.ok
-              ? "verified"
-              : "failed"
-            : "installed";
-        const ruleState: ComponentState =
-          r.recall_rule === "n/a"
-            ? "na"
-            : r.recall_rule === "installed"
-              ? v?.components?.recall
-                ? v.components.recall.ok
-                  ? "verified"
-                  : "failed"
-                : "installed"
-              : r.recall_rule === "project_scoped" || r.recall_rule === "mcp_instructions"
-                ? "na"
-                : "missing";
-        const rt: Runtime | undefined = v?.runtime ?? v?.aegis;
-        // Red on evidence of failure only; "unseen" is a note, not a warning.
-        const rtState: ComponentState = !rt
-          ? "installed"
-          : rt.error || rt.ok === false
-            ? "failed"
-            : rt.note
-              ? "installed"
-              : "verified";
-        // Verify runs a real capture-then-search round trip per pack and the
-        // pane never showed it, so the one component that proves recall works
-        // end to end was invisible (audit 2026-09-04). "skipped" is legacy
-        // capture mode — by design, not a pass and not a failure.
-        const probe = v?.components?.recall_probe;
-        const probeState: ComponentState = !probe
-          ? "missing"
-          : probe.status === "skipped"
-            ? "na"
-            : probe.ok
-              ? "verified"
-              : "failed";
-        // Cursor's recall rule is per-project and only refreshes on install,
-        // so a version bump silently leaves every installed repo stale.
-        const ruleStale = v?.rule_stale;
-        const extractState: ComponentState =
-          r.extract === "installed"
-            ? v?.components?.extract
-              ? v.components.extract.ok
-                ? "verified"
-                : "failed"
-              : "installed"
-            : r.extract === "missing"
-              ? "missing"
-              : "na";
-        return (
-          <div className="section-card" key={r.harness}>
-            <div className="section-head">
-              {LABEL[r.harness]}
-              <span className="muted mono" style={{ fontWeight: 400 }}>
-                {WHERE[r.harness]}
-              </span>
-              {r.mcp && (r.harness === "grok_bot" || hookInstalled) ? (
-                <Tag tone="ok" dot className="harness-installed-pill">
-                  Installed
+      <div className="hgrid">
+        {(rows ?? []).map((r) => {
+          const v = verify[r.harness];
+          const lv = liveness?.harnesses?.[r.harness];
+          const status = cardStatus(r, lv, v?.components?.mcp);
+          const installed =
+            r.harness === "grok_bot" ? r.mcp : r.mcp && r.hook_stop && r.hook_precompact;
+          // Grok Bot has nothing local to install, so Verify ("Probe gateway")
+          // is what its card offers instead — gated on detection, not on the
+          // per-repo pin.
+          const canVerify = r.harness === "grok_bot" ? r.detected : installed;
+          const verified = verifiedLine(r.harness, v?.components?.recall_probe, recallProbe);
+
+          // 1. Capture hook — the heartbeat, not the config file.
+          const hook: { mark: Mark; text: string } =
+            r.harness === "grok_bot"
+              ? { mark: "off", text: "Capture hook · cloud writes through the memory tool" }
+              : !installed
+                ? { mark: "err", text: "Capture hook · not installed" }
+                : lv?.ok === false
+                  ? {
+                      mark: "err",
+                      text: `Capture hook · ${firstReason(lv) || "stopped recording"}`,
+                    }
+                  : lv?.seen && (lv.captures ?? 0) > 0
+                    ? {
+                        mark: "ok",
+                        text: `Capture hook · last capture ${fmtAge(lv.last_captured_age_s)} ago`,
+                      }
+                    : lv?.seen
+                      ? { mark: "warn", text: "Capture hook · ran, nothing captured yet" }
+                      : lv
+                        ? { mark: "off", text: "Capture hook · no session has run it yet" }
+                        : { mark: "off", text: "Capture hook · recording not checked yet" };
+
+          // 2. Recall at session start.
+          const ruleStale = v?.rule_stale;
+          const recall: { mark: Mark; text: string } =
+            r.recall_rule === "n/a"
+              ? { mark: "off", text: "Recall at start · not available in this harness" }
+              : r.recall_rule === "mcp_instructions"
+                ? { mark: "ok", text: "Recall at start · served with the memory tools" }
+                : r.recall_rule === "project_scoped"
+                  ? ruleStale === true
+                    ? { mark: "warn", text: "Recall rule out of date in this project" }
+                    : { mark: "ok", text: "Recall rule · one per project" }
+                  : r.recall_rule === "installed"
+                    ? { mark: "ok", text: "Recall at session start" }
+                    : { mark: "err", text: "Recall at session start · not installed" };
+
+          // 3. Memory tools (MCP). A passing grok_bot gateway probe proves the
+          // gateway answers this Mac, not that the cloud agent points at it.
+          const mcpProbe = v?.components?.mcp;
+          const mcp: { mark: Mark; text: string } =
+            r.harness === "grok_bot"
+              ? mcpProbe?.ok
+                ? { mark: "ok", text: "Gateway answered this Mac · token accepted" }
+                : mcpProbe
+                  ? { mark: "err", text: `Gateway · ${(mcpProbe.error ?? "no answer").slice(0, 110)}` }
+                  : { mark: "off", text: "Memory tools (MCP) · set in the Cursor cloud, not readable here" }
+              : mcpProbe?.ok
+                ? {
+                    mark: "ok",
+                    text: `Memory tools (MCP) · ${mcpProbe.ms} ms, ${mcpProbe.episodes} episodes`,
+                  }
+                : mcpProbe
+                  ? { mark: "err", text: `Memory tools (MCP) · ${(mcpProbe.error ?? "failed").slice(0, 110)}` }
+                  : r.mcp
+                    ? { mark: "ok", text: "Memory tools (MCP)" }
+                    : { mark: "err", text: "Memory tools (MCP) · not installed" };
+
+          const checks = [hook, recall, mcp, verified];
+          const notRecording = status.label === "Not recording";
+          return (
+            <div className="hcard" key={r.harness}>
+              <div className="top">
+                <span className="name">{LABEL[r.harness]}</span>
+                <Tag tone={status.tone} dot>
+                  {status.label}
                 </Tag>
-              ) : null}
-            </div>
-            <div className="section-body">
-              <div className="rows">
-                <div className="row-item">
-                  <Dot state={mcpState} />
-                  <div className="row-main">
-                    <div>MCP server <code>khipu</code></div>
-                    <div className="row-meta muted">
-                      {r.harness === "grok_bot"
-                        ? mcpState === "installed"
-                          ? "Gateway answered this Mac with the real token. Whether Grok Bot itself is pointed at it is a Cursor cloud setting, not readable from here"
-                          : "Configured in the Cursor cloud UI (account level, every repo) — not readable from this Mac. Verify probes the gateway itself."
-                        : STATE_TEXT[mcpState]}
-                      {v?.components?.mcp?.ok && v.components.mcp.ms != null
-                        ? ` · handshake ${v.components.mcp.ms} ms · ${v.components.mcp.episodes} episodes`
-                        : ""}
-                      {mcpState === "failed" && v?.components?.mcp?.error
-                        ? ` · ${v.components.mcp.error.slice(0, 120)}`
-                        : ""}
-                    </div>
-                  </div>
-                </div>
-                <div className="row-item">
-                  <Dot state={hookState} />
-                  <div className="row-main">
-                    <div>Capture hook (Stop + PreCompact)</div>
-                    <div className="row-meta muted">
-                      {r.harness === "grok_bot" ? (
-                        "An ephemeral cloud VM has no hooks. The agent captures with the khipu_capture tool (hub mode on the gateway) — the recall rule tells it to."
-                      ) : (
-                        <>
-                          {STATE_TEXT[hookState]}
-                          {v?.components?.hook?.ok && v.components.hook.ms != null
-                            ? ` · fired in ${v.components.hook.ms} ms`
-                            : ""}
-                          {hookState === "failed" && v?.components?.hook
-                            ? ` · exit ${v.components.hook.exit ?? "?"}`
-                            : ""}
-                          {hookInstalled
-                            ? r.harness === "aegis"
-                              ? " · queues the session inside Aegis's sandbox; never writes outside ~/.grok"
-                              : " · captures natively, then runs alongside your existing capture hook — never replaces it"
-                            : ""}
-                        </>
-                      )}
-                    </div>
-                  </div>
-                </div>
-                <div className="row-item">
-                  <Dot state={extractState} />
-                  <div className="row-main">
-                    <div>Session extraction (what becomes an episode)</div>
-                    <div className="row-meta muted">
-                      {r.extract === "mcp_capture"
-                        ? "The agent calls khipu_capture over the HTTPS gateway (hub mode: PG row + vector, no file). Verify probes the public gateway with the real token."
-                        : r.extract === "legacy" || r.extract == null
-                        ? "Done by this harness's existing capture hooks; Khipu syncs and embeds what they write."
-                        : STATE_TEXT[extractState] +
-                          (r.extract === "installed"
-                            ? r.harness === "aegis"
-                              ? " · Khipu-native: Stop (every 5 turns / 20 min), PreCompact and SessionEnd queue the session inside Aegis's sandbox; drained to gemini-2.5-flash → khipu capture outside it"
-                              : " · Khipu-native, hook-driven: Stop (every 5 turns / 20 min), PreCompact and SessionEnd read the transcript and capture in the same Stop. Nothing for the model to remember."
-                            : "") +
-                          (v?.components?.extract?.ok && v.components.extract.ms != null
-                            ? ` · probe in ${v.components.extract.ms} ms`
-                            : "") +
-                          (extractState === "failed" && v?.components?.extract?.error
-                            ? ` · ${v.components.extract.error.slice(0, 120)}`
-                            : "")}
-                    </div>
-                  </div>
-                </div>
-                {rt ? (
-                  <div className="row-item">
-                    <Dot state={rtState} />
-                    <div className="row-main">
-                      <div>Recording (evidence from real sessions, not probes)</div>
-                      <div className="row-meta muted">
-                        {rt.error
-                          ? `Couldn't read liveness: ${rt.error}`
-                          : rt.note
-                            ? `Not yet observed: ${rt.note}. A probe shows the hook works; only a real session shows ${LABEL[r.harness]} runs it.`
-                            : rt.ok
-                              ? `${LABEL[r.harness]} last ran the hook ${fmtAge(rt.last_dispatch_age_s)} ago · ` +
-                                (rt.captures
-                                  ? `${rt.captures} capture(s), last ${fmtAge(rt.last_captured_age_s)} ago`
-                                  : "no capture landed yet") +
-                                (rt.queue_depth ? ` · ${rt.queue_depth} queued` : "") +
-                                (rt.pending_turns ? ` · ${rt.pending_turns} turn(s) toward the next` : "")
-                              : `NOT RECORDING — ${(rt.reasons ?? []).join("; ")}. Hook last ran ${fmtAge(rt.last_dispatch_age_s)} ago.`}
-                      </div>
-                    </div>
-                  </div>
-                ) : null}
-                <div className="row-item">
-                  <Dot state={ruleState} />
-                  <div className="row-main">
-                    <div>Prompt-time recall rule</div>
-                    <div className="row-meta muted">
-                      {r.recall_rule === "n/a"
-                        ? "Not applicable here: this harness discards hook output at prompt time. Recall is via the MCP tools."
-                        : r.recall_rule === "mcp_instructions"
-                        ? "Served by the gateway as the MCP instructions field on initialize — every client gets it in every repo, with nothing committed."
-                        : r.recall_rule === "project_scoped"
-                          ? "Per project: Cursor keeps rules inside each repo. Run khipu integrations install cursor --project <dir> to add .cursor/rules/khipu.mdc there."
-                          : STATE_TEXT[ruleState] +
-                            (v?.components?.recall?.ok && v.components.recall.ms != null
-                              ? ` · SessionStart injects ${v.components.recall.chars} chars in ${v.components.recall.ms} ms`
-                              : "")}
-                      {ruleStale === true ? (
-                        <>
-                          {" · "}
-                          <span className="warn">
-                            This project's khipu.mdc is out of date — run Install
-                            again for this repo to refresh it.
-                          </span>
-                        </>
-                      ) : ruleStale === null && v?.note ? (
-                        ` · ${v.note}`
-                      ) : (
-                        ""
-                      )}
-                    </div>
-                  </div>
-                </div>
-                {v ? (
-                  <div className="row-item">
-                    <Dot state={probeState} />
-                    <div className="row-main">
-                      <div>Recall probe (capture, then find it again)</div>
-                      <div className="row-meta muted">
-                        {!probe
-                          ? "Not run yet — Verify runs it."
-                          : probe.status === "skipped"
-                            ? `Skipped: ${probe.reason ?? "legacy capture mode writes no Postgres row"} — nothing to prove here.`
-                            : probe.ok
-                              ? `Captured and found again${
-                                  probe.seconds != null ? ` in ${probe.seconds}s` : ""
-                                }. The throwaway episode was forgotten afterwards.`
-                              : `FAILED — ${(probe.error ?? probe.reason ?? "the capture never became findable").slice(0, 160)}`}
-                      </div>
-                    </div>
-                  </div>
-                ) : null}
               </div>
-              {r.harness === "grok_bot" ? (
-                <div className="row-meta muted" style={{ marginTop: 6 }}>
-                  Repo-scoped: run <code>khipu integrations install grok_bot --project &lt;repo&gt;</code> for each repo Grok Bot works in.
-                  The bearer token lives in Cursor cloud secrets as <code>KHIPU_GATEWAY_TOKEN</code>, never in the repo.
+              <div className="checks">
+                {checks.map((c, i) => (
+                  <div key={i}>
+                    <CheckMark mark={c.mark} />
+                    <span>{c.text}</span>
+                  </div>
+                ))}
+              </div>
+              {ruleStale === true ? (
+                <div className="note">Re-run Install for this repo to refresh its rule.</div>
+              ) : r.harness === "grok_bot" ? (
+                <div className="note" title={WHERE[r.harness]}>
+                  One install per repo Grok Bot works in; the token lives in Cursor
+                  cloud secrets, never in the repo.
                 </div>
-              ) : null}
-              <div className="toolbar">
-                <button
-                  type="button"
-                  className={r.mcp && hookInstalled ? undefined : "primary"}
-                  disabled={busy != null || r.harness === "grok_bot"}
-                  onClick={() => void act(r.harness, "install")}
-                >
-                  {busy === `install:${r.harness}` ? (
-                    <Loader2 size={14} className="spin" aria-hidden />
-                  ) : null}
-                  {r.mcp && hookInstalled ? "Reinstall" : "Install"}
-                </button>
-                <button
-                  type="button"
-                  disabled={busy != null || !(r.mcp || hookInstalled) || r.harness === "grok_bot"}
-                  onClick={() => void act(r.harness, "verify")}
-                >
-                  {busy === `verify:${r.harness}` ? (
-                    <Loader2 size={14} className="spin" aria-hidden />
-                  ) : null}
-                  Verify
-                </button>
-                <button
-                  type="button"
-                  disabled={busy != null || !(r.mcp || hookInstalled)}
-                  onClick={() => void act(r.harness, "uninstall")}
-                >
-                  Uninstall
-                </button>
+              ) : !r.detected ? (
+                <div className="note">Config folder not found — nothing to install.</div>
+              ) : (
+                <div className="note mono" title={WHERE[r.harness]}>
+                  {WHERE[r.harness]}
+                </div>
+              )}
+              <div className="hacts">
+                {r.detected ? (
+                  <>
+                    <button
+                      type="button"
+                      className={notRecording || !installed ? "primary sm" : "sm"}
+                      disabled={busy != null || r.harness === "grok_bot"}
+                      onClick={() => void act(r.harness, "install")}
+                    >
+                      {busy === `install:${r.harness}` ? (
+                        <Loader2 size={14} className="spin" aria-hidden />
+                      ) : null}
+                      {!installed
+                        ? "Install"
+                        : notRecording
+                          ? "Reinstall hook"
+                          : "Reinstall"}
+                    </button>
+                    <button
+                      type="button"
+                      className="sm"
+                      disabled={busy != null || !canVerify}
+                      onClick={() => void act(r.harness, "verify")}
+                    >
+                      {busy === `verify:${r.harness}` ? (
+                        <Loader2 size={14} className="spin" aria-hidden />
+                      ) : null}
+                      {r.harness === "grok_bot" ? "Probe gateway" : "Verify"}
+                    </button>
+                    <button
+                      type="button"
+                      className="sm link push"
+                      disabled={busy != null || !installed}
+                      onClick={() => void act(r.harness, "uninstall")}
+                    >
+                      Remove
+                    </button>
+                  </>
+                ) : (
+                  <span className="meta">Nothing to install here.</span>
+                )}
               </div>
             </div>
-          </div>
-        );
-      })}
+          );
+        })}
 
-      {undetected.length > 0 ? (
-        <div className="section-card">
-          <div className="section-head muted">Not on this Mac</div>
-          <div className="section-body">
-            <p className="muted">
-              {undetected.map((r) => LABEL[r.harness]).join(", ")}: config folder not found.
-              Nothing to install here.
-            </p>
-          </div>
+        <div className="hcard dashed">
+          <b>Another Mac</b>
+          <span className="meta wrap">
+            Save a join kit here and open it on the new Mac.
+          </span>
+          <button type="button" className="sm" onClick={onAnotherMac}>
+            Save join kit…
+          </button>
         </div>
-      ) : null}
+      </div>
 
-      <p className="muted" style={{ marginTop: 12 }}>
-        Install writes Khipu's own entries next to whatever is already there and backs each
-        file up first. Your existing capture hooks keep running; both write during the
-        migration. Restart a harness after installing so it loads the change.
+      <p className="muted">
+        Install writes Khipu's own entries next to whatever is already there and
+        backs each file up first. Your existing capture hooks keep running.
+        Restart a harness after installing so it loads the change.
       </p>
+      {liveness == null ? (
+        <p className="muted">
+          <TriangleAlert size={14} strokeWidth={1.75} aria-hidden className="warn" />{" "}
+          Recording evidence comes from the health report — open Home once, or
+          Refresh here, to fill in the capture and verified lines.
+        </p>
+      ) : null}
     </div>
   );
 }
