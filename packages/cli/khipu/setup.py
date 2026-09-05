@@ -258,8 +258,21 @@ def _stage_privileges(conn) -> dict[str, Any]:
 
 
 def _stage_schema(conn) -> dict[str, Any]:
-    from khipu.migrate import run as migrate_run
+    from khipu.migrate import available, migrations_dir, run as migrate_run
 
+    # An install with no migration files would otherwise report "schema is
+    # current" against an EMPTY database and let the graph probe fail one
+    # stage later with a raw "relation does not exist" (caught by the Docker
+    # first-run oracle, 2026-09-05).
+    if not available():
+        return {
+            "id": "schema",
+            "ok": False,
+            "title": "Khipu's schema files are missing from this install",
+            "detail": f"No migration files were found under {migrations_dir()}.",
+            "fix": "Reinstall Khipu (or, from a source checkout, make sure "
+            "ops/migrations is present), then try again.",
+        }
     out = migrate_run(dry_run=False, conn=conn)
     if out["pending"]:
         return {
@@ -270,12 +283,17 @@ def _stage_schema(conn) -> dict[str, Any]:
             "fix": "Check the server logs for the failing migration, then ask "
             "for help with the exact error.",
         }
+    applied_total = len(out.get("applied") or []) if isinstance(out.get("applied"), (list, set, tuple)) else None
     return {
         "id": "schema",
         "ok": True,
         "title": "Schema is current",
-        "detail": f"Applied: {', '.join(out['ran']) or 'nothing new'}.",
+        "detail": (
+            f"Applied: {', '.join(out['ran'])}." if out["ran"]
+            else "Already at the newest version; nothing to apply."
+        ),
         "ran": out["ran"],
+        **({"applied_total": applied_total} if applied_total is not None else {}),
     }
 
 
@@ -565,3 +583,57 @@ def connect_database(
     out["summary"] = summary
     conn.close()
     return out
+
+
+def provision_local_move_target() -> dict[str, Any]:
+    """Create a fresh local-Docker Postgres to hand to :func:`khipu.dbmove.
+    move_database` as a target — the "a new database on this Mac" choice in
+    Settings › Database › Move (``khipu db move --new-local``).
+
+    ``components_postgres.install_local_postgres`` stores the DSN it creates
+    into Keychain itself (the same call the Welcome "set up a new database on
+    this Mac" step uses). Called as-is here, that would switch Khipu's active
+    connection to the new, empty database *before* anything has been copied
+    into it — and then ``move_database``'s own ``current_dsn = resolve_dsn()``
+    would read that new database as the source, refuse with
+    ``target_is_current``, and the move would never happen.
+
+    So: read the current DSN first, let ``install_local_postgres`` do its
+    thing, capture the DSN it just stored, then put the original DSN back —
+    all before ``move_database`` ever looks at ``resolve_dsn()``. The
+    generated local password never leaves this process: the caller
+    (``khipu db move --new-local``) uses the returned DSN to call
+    ``move_database`` directly, in the same process, and never prints it.
+    """
+    from khipu.components_postgres import install_local_postgres
+    from khipu.db import resolve_dsn
+    from khipu.keychain import set_dsn
+
+    try:
+        original_dsn: str | None = resolve_dsn()
+    except Exception:  # noqa: BLE001 — no prior DSN configured is fine here
+        original_dsn = None
+
+    out = install_local_postgres()
+    if not out.get("ok"):
+        return out
+
+    try:
+        new_dsn = resolve_dsn()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"could_not_read_new_local_dsn: {exc}"}
+
+    if original_dsn:
+        try:
+            set_dsn(original_dsn)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "error": "could_not_restore_source_dsn",
+                "detail": f"{type(exc).__name__}: {exc}",
+                "fix": "The new local database was created, but Khipu could "
+                "not put the original connection back to run the copy. "
+                "Check Keychain access and try again.",
+            }
+
+    return {"ok": True, "dsn": new_dsn}

@@ -233,3 +233,27 @@ class ComponentsStatusFallbackTest(unittest.TestCase):
             result = components_status()
         self.assertEqual(result["graphify"], {})
         self.assertIsNone(result["graphify_upgrade"])
+
+
+class EnsurePostgresImageLocalFirstTest(unittest.TestCase):
+    def test_present_image_needs_no_registry(self):
+        from unittest import mock
+
+        from khipu import components_postgres as cp
+
+        with mock.patch.object(cp, "image_present_locally", return_value=True), \
+                mock.patch.object(cp, "pull_postgres_image", side_effect=AssertionError("no pull")), \
+                mock.patch.object(cp, "build_postgres_image", side_effect=AssertionError("no build")):
+            out = cp.ensure_postgres_image("ghcr.io/example/khipu-postgres:19-pgvector")
+        self.assertEqual(out, {"ok": True, "image": "ghcr.io/example/khipu-postgres:19-pgvector", "source": "local"})
+
+    def test_absent_image_pulls_then_builds(self):
+        from unittest import mock
+
+        from khipu import components_postgres as cp
+
+        with mock.patch.object(cp, "image_present_locally", return_value=False), \
+                mock.patch.object(cp, "pull_postgres_image", return_value={"ok": False, "error": "denied"}), \
+                mock.patch.object(cp, "build_postgres_image", return_value={"ok": True, "source": "build"}) as b:
+            out = cp.ensure_postgres_image("ghcr.io/example/khipu-postgres:19-pgvector")
+        self.assertTrue(out["ok"]); b.assert_called_once()

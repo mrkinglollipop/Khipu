@@ -386,3 +386,17 @@ def _literal_text(node: ast.expr) -> str | None:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SchemaStageNeedsMigrationFilesTest(unittest.TestCase):
+    def test_no_migration_files_is_a_loud_failure_not_current(self):
+        from unittest import mock
+
+        from khipu import setup as st
+
+        with mock.patch("khipu.migrate.available", return_value=[]), \
+                mock.patch("khipu.migrate.run", side_effect=AssertionError("must not run")):
+            out = st._stage_schema(conn=object())
+        self.assertFalse(out["ok"])
+        self.assertIn("schema files are missing", out["title"])
+        self.assertTrue(out["fix"].startswith("Reinstall"))

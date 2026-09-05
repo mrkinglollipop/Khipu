@@ -102,6 +102,28 @@ def _connect(dsn: str):
     return psycopg.connect(dsn, autocommit=True)
 
 
+def _connect_when_stable(dsn: str, *, timeout_s: float = 60.0):
+    """Connect over TCP once the server stays up: the postgres entrypoint
+    restarts once after initdb, so the first successful connect can land on
+    the temporary server. Two connects a second apart, then keep the second."""
+    import time
+
+    import psycopg
+
+    deadline = time.monotonic() + timeout_s
+    last: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            first = psycopg.connect(dsn, autocommit=True, connect_timeout=5)
+            first.close()
+            time.sleep(1)
+            return psycopg.connect(dsn, autocommit=True, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001 — retry until the deadline
+            last = exc
+            time.sleep(1)
+    raise RuntimeError(f"scratch cluster never became stable: {last}")
+
+
 def _table_names(dsn: str) -> set[str]:
     with _connect(dsn) as conn:
         with conn.cursor() as cur:
@@ -164,7 +186,7 @@ class SetupLiveTest(unittest.TestCase):
         _log(f"scratch cluster ready in {cls.cluster_start_seconds}s on port {SCRATCH_PORT}")
 
         admin_dsn = _local_dsn(SCRATCH_PORT, password)
-        with _connect(admin_dsn) as conn:
+        with _connect_when_stable(admin_dsn) as conn:
             with conn.cursor() as cur:
                 cur.execute(f'CREATE DATABASE "{DB_A}"')
                 cur.execute(f'CREATE DATABASE "{DB_B}"')
