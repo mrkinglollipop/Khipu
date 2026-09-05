@@ -284,20 +284,23 @@ def _start_drill_cluster(image: str, port: int, password: str) -> dict:
 def _wait_drill_ready(port: int, password: str, *, timeout_s: float) -> bool:
     import time
 
+    # The postgres entrypoint first runs a TEMPORARY server on the unix socket
+    # for init scripts, stops it, then starts the real one on TCP. A socket
+    # pg_isready answers 0 during that first phase, so a caller connected
+    # over TCP a second later to a server that "closed the connection
+    # unexpectedly" (seen 2026-09-05). Ask over TCP, and require two green
+    # answers a second apart so the restart between the phases is not
+    # mistaken for readiness.
     deadline = time.monotonic() + timeout_s
+    green = 0
     while time.monotonic() < deadline:
         ready = _docker_exec_pg(
             DRILL_CONTAINER,
-            [
-                "pg_isready",
-                "-U",
-                "khipu",
-                "-d",
-                "khipu",
-            ],
+            ["pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "khipu", "-d", "khipu"],
             password=password,
         )
-        if ready.returncode == 0:
+        green = green + 1 if ready.returncode == 0 else 0
+        if green >= 2:
             return True
         time.sleep(1)
     return False

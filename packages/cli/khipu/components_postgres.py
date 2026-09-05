@@ -237,7 +237,23 @@ def build_postgres_image(image: str) -> dict[str, Any]:
     return {"ok": True, "image": image, "source": "build"}
 
 
+def image_present_locally(image: str) -> bool:
+    try:
+        proc = _docker(["image", "inspect", image], timeout=30, check=False)
+    except Exception:  # noqa: BLE001 — no docker, or a hung daemon: not present
+        return False
+    return proc.returncode == 0
+
+
 def ensure_postgres_image(image: str) -> dict[str, Any]:
+    """Local image first, then pull, then build from the bundled Dockerfile.
+    The published image is a private package (a pull answers "denied"), and
+    a Mac that already built it once should not need the registry or the
+    network at all (2026-09-05, seen on the Linode)."""
+    if is_forbidden_postgres_image(image):
+        return {"ok": False, "error": "forbidden_postgres_image", "image": image}
+    if image_present_locally(image):
+        return {"ok": True, "image": image, "source": "local"}
     pulled = pull_postgres_image(image)
     if pulled.get("ok"):
         return pulled
