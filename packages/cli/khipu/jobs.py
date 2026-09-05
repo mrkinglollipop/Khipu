@@ -82,7 +82,15 @@ CONSOLIDATE_MONTHLY = _env_script_path("KHIPU_CONSOLIDATE_MONTHLY")
 GRAPHIFY_NIGHTLY: Path | None = None
 BUILD_INDEX = _env_script_path("KHIPU_BUILD_INDEX")
 
-LOG_DIR_FROZEN = Path.home() / "Library" / "Logs" / "frozen-threshold"
+LOG_DIR = Path.home() / "Library" / "Logs" / "Khipu"
+# The maintainer's launchd plists set KHIPU_LEGACY_LOG_DIR so logs written by
+# the product's pre-rename name keep being found after upgrading. No default —
+# a fresh install has no legacy directory to look in.
+LOG_DIR_LEGACY: Path | None = (
+    (Path.home() / "Library" / "Logs" / os.environ["KHIPU_LEGACY_LOG_DIR"])
+    if os.environ.get("KHIPU_LEGACY_LOG_DIR")
+    else None
+)
 LOG_DIR_CONFIG = DEFAULT_DIR / "logs"
 
 PLIST_NIGHTLY = "com.matt.khipu-nightly"
@@ -114,11 +122,15 @@ _JOB_SPECS: dict[str, dict[str, str]] = {
 
 
 def _log_paths(stem: str) -> tuple[Path, Path]:
-    for base in (LOG_DIR_FROZEN, LOG_DIR_CONFIG):
-        out = base / f"{stem}.out.log"
-        err = base / f"{stem}.err.log"
-        if out.parent.exists() or base == LOG_DIR_FROZEN:
-            return out, err
+    if LOG_DIR_LEGACY is not None:
+        legacy_out = LOG_DIR_LEGACY / f"{stem}.out.log"
+        if legacy_out.exists():
+            return legacy_out, LOG_DIR_LEGACY / f"{stem}.err.log"
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        return LOG_DIR / f"{stem}.out.log", LOG_DIR / f"{stem}.err.log"
+    except OSError:
+        pass
     LOG_DIR_CONFIG.mkdir(parents=True, exist_ok=True)
     return LOG_DIR_CONFIG / f"{stem}.out.log", LOG_DIR_CONFIG / f"{stem}.err.log"
 
@@ -401,12 +413,16 @@ def nightly_log_path() -> Path:
     explicit = (os.environ.get("KHIPU_NIGHTLY_LOG") or "").strip()
     if explicit:
         return Path(explicit)
-    khipu = LOG_DIR_FROZEN / "khipu-nightly.out.log"
-    legacy = LOG_DIR_FROZEN / "conversation-memory-nightly.out.log"
+    khipu = _log_paths("khipu-nightly")[0]
+    legacy = (
+        LOG_DIR_LEGACY / "conversation-memory-nightly.out.log"
+        if LOG_DIR_LEGACY is not None
+        else None
+    )
     if khipu.is_file():
-        if not legacy.is_file() or khipu.stat().st_mtime >= legacy.stat().st_mtime:
+        if legacy is None or not legacy.is_file() or khipu.stat().st_mtime >= legacy.stat().st_mtime:
             return khipu
-    if legacy.is_file():
+    if legacy is not None and legacy.is_file():
         return legacy
     return khipu
 

@@ -395,10 +395,16 @@ def collect_code_ast(
 
 
 if __name__ == "__main__":
+    import os
+
+    # Workspace-root marker subdir — same knob as build_graph.py's
+    # GRAPHIFY_STATE_SUBDIR (default "state"); set KHIPU_GRAPHIFY_STATE_DIR if
+    # a maintainer's workspace nests graphify state under a different name.
+    marker = (os.environ.get("KHIPU_GRAPHIFY_STATE_DIR") or "state").strip()
     cwd = Path.cwd()
     workspace = cwd
     for p in [cwd] + list(cwd.parents):
-        if (p / "UNIFICATION").is_dir():
+        if (p / marker).is_dir():
             workspace = p
             break
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")

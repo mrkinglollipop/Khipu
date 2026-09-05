@@ -145,7 +145,7 @@ class ConninfoLocalRootCertTest(unittest.TestCase):
             dsn = (
                 "postgresql://u:secret@100.114.233.88:5433/alzy"
                 "?sslmode=verify-full"
-                "&sslrootcert=/Users/matthewschwartz/.config/khipu/root.crt"
+                "&sslrootcert=/Users/example/.config/khipu/root.crt"
             )
             with mock.patch("khipu.paths.root_cert_file", return_value=cert):
                 out = db.conninfo_with_local_root_cert(dsn)
@@ -164,7 +164,7 @@ class ConninfoLocalRootCertTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             cert = Path(tmp) / "root.crt"
             cert.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
-            foreign = "/Users/matthewschwartz/.config/khipu/root.crt"
+            foreign = "/Users/example/.config/khipu/root.crt"
             dsn = (
                 "postgresql://u:secret@100.114.233.88:5433/alzy"
                 f"?sslmode=verify-full&sslrootcert={quote(foreign, safe='')}"

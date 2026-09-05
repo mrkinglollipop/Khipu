@@ -872,7 +872,10 @@ fn spawn_khipu(subcommand: String) -> Result<Value, String> {
 
 /// Engine stdout for spawnable jobs — same stems as `jobs.py` `_JOB_SPECS`
 /// (`khipu-nightly` / `khipu-monthly` / `khipu-graph`) under
-/// `~/Library/Logs/frozen-threshold/`. Distinct from the wrapper spawn log.
+/// `~/Library/Logs/Khipu/`, falling back to `~/Library/Logs/<KHIPU_LEGACY_LOG_DIR>`
+/// when that env var is set and the Khipu dir does not exist yet (an upgrade
+/// whose launchd jobs still write to the product's pre-rename log directory).
+/// Distinct from the wrapper spawn log.
 fn engine_job_log_path(subcommand: &str) -> PathBuf {
     let stem = match subcommand {
         "nightly" => "khipu-nightly",
@@ -881,9 +884,18 @@ fn engine_job_log_path(subcommand: &str) -> PathBuf {
         other => other,
     };
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
-        .join("Library/Logs/frozen-threshold")
-        .join(format!("{stem}.out.log"))
+    let khipu_dir = PathBuf::from(&home).join("Library/Logs/Khipu");
+    let log_dir = if khipu_dir.is_dir() {
+        khipu_dir
+    } else {
+        match std::env::var("KHIPU_LEGACY_LOG_DIR") {
+            Ok(legacy) if !legacy.is_empty() => {
+                PathBuf::from(&home).join("Library/Logs").join(legacy)
+            }
+            _ => khipu_dir,
+        }
+    };
+    log_dir.join(format!("{stem}.out.log"))
 }
 
 fn dsn_configured_uncached() -> bool {

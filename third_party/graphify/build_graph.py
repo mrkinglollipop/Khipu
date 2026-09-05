@@ -1,7 +1,7 @@
 """
 Bite 2: graph builder
 
-Reads workspace state and produces UNIFICATION/state/graph.sqlite — the master
+Reads workspace state and produces graph.sqlite — the master
 graph that the visual map (bite 3) and dashboard (bite 6) consume.
 
 Sources read:
@@ -85,6 +85,10 @@ def _memory_root() -> Path:
 WORKSPACE = _find_workspace()
 DEFAULT_OUT = _default_graph_sqlite()
 MEMORY_ROOT = _memory_root()
+# Subdir under WORKSPACE holding graphify's own state (model call ledger,
+# etc). A maintainer whose workspace layout nests this under a differently
+# named directory sets KHIPU_GRAPHIFY_STATE_DIR; default is portable.
+GRAPHIFY_STATE_SUBDIR = (os.environ.get("KHIPU_GRAPHIFY_STATE_DIR") or "state").strip()
 NOW_ISO = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 RESOLVED_SOURCES = Path(
@@ -415,9 +419,9 @@ def collect_memory_topics() -> list[dict]:
     # under ANY `_*` subdir) must win over EVERY subdir copy — `_backup/`,
     # `_archive/`, `_retired/`, or any future `_*` dir — not just `_backup/`.
     # The original fix special-cased `_backup/` only, so a live file still lost
-    # to `_retired/` (e.g. memory_topic:ft-terminal-ml resolved to
-    # topics/_retired/ft-terminal-ml.md with archived:false even though a live
-    # topics/ft-terminal-ml.md existed). Among subdir-only copies (no live file
+    # to `_retired/` (e.g. memory_topic:example-topic resolved to
+    # topics/_retired/example-topic.md with archived:false even though a live
+    # topics/example-topic.md existed). Among subdir-only copies (no live file
     # exists), prefer the stable `_archive/`/`_retired/` copy over a `_backup/`
     # snapshot via _topic_archive_rank. Dedupe explicitly by slug instead of
     # relying on rglob sort order (previously let subdirs silently clobber the
@@ -976,13 +980,13 @@ CALLER_SCRIPT_TO_SKILL = {
 
 
 def collect_model_call_log() -> list[dict]:
-    """Read UNIFICATION/state/model_call_log.jsonl → list of row dicts.
+    """Read <workspace state>/model_call_log.jsonl → list of row dicts.
 
     Returns one dict per JSONL line, with fields matching the SQLite
     `model_call_log` table schema. Soft-fail: missing or unreadable file →
     empty list. Bad JSON lines silently skipped.
     """
-    ledger_path = WORKSPACE / "UNIFICATION" / "state" / "model_call_log.jsonl"
+    ledger_path = WORKSPACE / GRAPHIFY_STATE_SUBDIR / "model_call_log.jsonl"
     if not ledger_path.exists():
         return []
     rows: list[dict] = []
@@ -1073,7 +1077,7 @@ def collect_task_type_nodes_and_edges(ledger_rows: list[dict]) -> tuple[list[dic
                 "models":            sorted(a["models"]),
                 "callers":           sorted(a["callers"]),
             },
-            source_path="UNIFICATION/state/model_call_log.jsonl",
+            source_path=f"{GRAPHIFY_STATE_SUBDIR}/model_call_log.jsonl",
         ))
 
     # Build skill→task_type edges, aggregated per (skill, task_type) pair

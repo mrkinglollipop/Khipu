@@ -1,4 +1,4 @@
-"""Tests for UNIFICATION code_semantic_extractor.code_roots_from_resolved."""
+"""Tests for the maintainer's graphify code_semantic_extractor.code_roots_from_resolved."""
 from __future__ import annotations
 
 import importlib.util
@@ -10,9 +10,19 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-EXTRACTOR_PATH = Path(
-    "/Volumes/Cloud Storage/Claude/UNIFICATION/scripts/code_semantic_extractor.py"
-)
+
+def _scripts_dir() -> Path | None:
+    raw = (os.environ.get("KHIPU_GRAPHIFY_SCRIPTS_DIR") or "").strip()
+    if raw:
+        return Path(raw)
+    nightly = (os.environ.get("KHIPU_GRAPHIFY_NIGHTLY") or "").strip()
+    if nightly:
+        return Path(nightly).parent
+    return None
+
+
+_SCRIPTS = _scripts_dir()
+EXTRACTOR_PATH = (_SCRIPTS / "code_semantic_extractor.py") if _SCRIPTS is not None else None
 
 
 def _load_extractor():
@@ -26,7 +36,10 @@ def _load_extractor():
     return mod
 
 
-@unittest.skipUnless(EXTRACTOR_PATH.is_file(), "UNIFICATION extractor not on disk")
+@unittest.skipUnless(
+    EXTRACTOR_PATH is not None and EXTRACTOR_PATH.is_file(),
+    "maintainer graphify scripts not configured",
+)
 class CodeRootsFromResolvedTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

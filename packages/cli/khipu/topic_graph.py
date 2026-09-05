@@ -9,6 +9,8 @@ overwrite type/bucket/payload on the next nightly.
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -23,12 +25,36 @@ WIKI_EDGE = "wiki_link"
 LIVES_IN_EDGE = "lives_in"
 NEIGHBOR_CAP = 6
 PATH_CAP = 12
-VOLUME_ROOT = "/Volumes/Cloud Storage"  # wiki-path peeler, not an install default
+# wiki-path peeler, not an install default — unset means no peeling.
+def volume_root() -> str:
+    """The volume prefix peeled off wiki paths ("/Volumes/<name>"), not an
+    install default. KHIPU_VOLUME_ROOT wins; otherwise it is derived from the
+    configured memory root, so the capture hook (which runs without the
+    launchd environment) peels the same prefix as the nightly and node ids
+    stay stable across writers. Empty means no peeling."""
+    env = os.environ.get("KHIPU_VOLUME_ROOT", "").strip().rstrip("/")
+    if env:
+        return env
+    try:
+        from khipu.config import path_setting
+
+        root = path_setting("memory_root")
+    except Exception:  # noqa: BLE001
+        root = None
+    parts = Path(str(root)).parts if root else ()
+    if len(parts) >= 3 and parts[0] == "/" and parts[1] == "Volumes":
+        return "/" + "/".join(parts[1:3])
+    return ""
+
+
 _ELLIPSIS = ("...", "…")
-_VOLUME_PREFIXES = (
-    VOLUME_ROOT + "/",
-    VOLUME_ROOT,
-)
+
+
+def _volume_prefixes() -> tuple[str, ...]:
+    vr = volume_root()
+    return (vr + "/", vr) if vr else ()
+
+
 # Token with at least one slash; used after backtick extraction.
 _PATHISH = re.compile(
     r"(?:`([^`]+)`)|((?:/~|\.{0,2}/|[A-Za-z0-9_.-]+/)[A-Za-z0-9_./~-]+)"
@@ -123,11 +149,12 @@ def _normalize_path(raw: str) -> str | None:
         return None
     if "node_modules" in text.split("/"):
         return None
-    for prefix in _VOLUME_PREFIXES:
-        if text == prefix.rstrip("/") or text == VOLUME_ROOT:
+    vr = volume_root()
+    for prefix in _volume_prefixes():
+        if text == prefix.rstrip("/") or text == vr:
             return None
         if text.startswith(prefix if prefix.endswith("/") else prefix + "/"):
-            text = text[len(VOLUME_ROOT) :].lstrip("/")
+            text = text[len(vr) :].lstrip("/")
             break
     if "/" not in text:
         return None
