@@ -319,6 +319,16 @@ fn khipu_bytecode_env() -> (&'static str, String) {
     }
 }
 
+/// The desktop app's own version, handed to every CLI invocation as
+/// `KHIPU_APP_VERSION`. `khipu.components_matrix.khipu_app_version()` reads
+/// this first and otherwise falls back to a hard-coded release string, so a
+/// bundled CLI launched by a newer app reported a stale version in the
+/// Components pane (audit 2026-09-04). `CARGO_PKG_VERSION` is the same value
+/// `tauri.conf.json` publishes, so the two can never drift.
+fn khipu_app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 fn run_khipu_cli(args: &[String]) -> Result<String, String> {
     let root = khipu_root()?;
     let py = khipu_python()?;
@@ -330,6 +340,7 @@ fn run_khipu_cli(args: &[String]) -> Result<String, String> {
         .args(args)
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env("KHIPU_APP_VERSION", khipu_app_version())
         .env(bc_key, &bc_val)
         .output()
         .map_err(|e| format!("spawn khipu CLI failed ({py:?}): {e}"))?;
@@ -499,6 +510,7 @@ fn set_khipu_secret_sync(account: String, value: String) -> Result<String, Strin
         .arg(&account)
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env("KHIPU_APP_VERSION", khipu_app_version())
         .env(bc_key, &bc_val)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -556,6 +568,7 @@ fn join_export_sync(passphrase: String, out_path: String) -> Result<String, Stri
         .arg(out_path.trim())
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env("KHIPU_APP_VERSION", khipu_app_version())
         .env(bc_key, &bc_val)
         .env("KHIPU_JOIN_PASSPHRASE", passphrase.trim())
         .output()
@@ -596,6 +609,7 @@ fn join_import_sync(passphrase: String, file_path: String) -> Result<String, Str
         .arg(file_path.trim())
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env("KHIPU_APP_VERSION", khipu_app_version())
         .env(bc_key, &bc_val)
         .env("KHIPU_JOIN_PASSPHRASE", passphrase.trim())
         .output()
@@ -635,6 +649,7 @@ fn join_advertise_sync(passphrase: String, timeout: u32) -> Result<String, Strin
         .arg(tout.to_string())
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env("KHIPU_APP_VERSION", khipu_app_version())
         .env(bc_key, &bc_val)
         .env("KHIPU_JOIN_PASSPHRASE", passphrase.trim())
         .stdout(Stdio::piped())
@@ -691,6 +706,7 @@ fn join_receive_sync(passphrase: String, pin: String, out_path: Option<String>) 
         .arg(pin_trim)
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env("KHIPU_APP_VERSION", khipu_app_version())
         .env(bc_key, &bc_val)
         .env("KHIPU_JOIN_PASSPHRASE", passphrase.trim());
     if let Some(path) = out_path {
@@ -734,9 +750,16 @@ fn join_receive_sync(passphrase: String, pin: String, out_path: Option<String>) 
 /// offers both as deliberate user actions, and uninstall is the documented
 /// rollback. `paths` stays for the same reason — the Settings pane's "Set
 /// folder" button is `paths --set`.
+/// `episode` is the one state-changing entry here, added deliberately: the
+/// Activity pane's "Forget" button (`episode forget ID`) is an explicit user
+/// action behind a confirm dialog, and soft-deleting one's own episode is the
+/// documented way to remove something the capture hook recorded. Its argv is
+/// still constrained by the CLI itself — `episode` only accepts the `forget`
+/// subcommand and an integer id.
 const ALLOWED_SUBCOMMANDS: &[&str] = &[
     "status", "doctor", "activity", "search", "graph", "revisions", "paths",
     "backup-local", "import-local", "integrations", "sources", "models",
+    "episode",
 ];
 
 /// Fire-and-forget job runners — long-running consolidate/graphify passes.
@@ -789,6 +812,7 @@ fn spawn_khipu(subcommand: String) -> Result<Value, String> {
         .arg(&subcommand)
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
+        .env("KHIPU_APP_VERSION", khipu_app_version())
         .env(bc_key, &bc_val)
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(err_file))
@@ -1472,7 +1496,7 @@ mod run_khipu_guard_tests {
     fn every_subcommand_the_ui_calls_is_allowed() {
         for s in ["status", "doctor", "activity", "search", "graph", "revisions",
                   "paths", "backup-local", "import-local", "integrations", "sources",
-                  "models"] {
+                  "models", "episode"] {
             assert!(ALLOWED_SUBCOMMANDS.contains(&s), "UI calls `{s}` but it is not allowed");
         }
     }
@@ -1500,7 +1524,7 @@ mod run_khipu_guard_tests {
     fn the_allowlist_is_exactly_what_the_front_end_invokes() {
         // Grown by hand, so pin the size: adding an entry without a call site is
         // how the five above got in.
-        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 12);
+        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 13);
     }
 
     #[test]

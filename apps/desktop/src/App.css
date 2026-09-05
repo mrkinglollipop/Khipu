@@ -443,6 +443,18 @@ button.primary:hover {
   border-color: var(--accent-hover);
 }
 
+/* Destructive action (Activity → Forget). Outlined, not filled: it must read
+   as dangerous without competing with .primary for attention. */
+button.danger {
+  color: var(--err);
+  border-color: var(--err);
+}
+
+button.danger:hover {
+  background: var(--err-soft);
+  border-color: var(--err);
+}
+
 button.linkish {
   height: auto;
   padding: 0;
@@ -523,6 +535,61 @@ input.mono {
   white-space: nowrap;
   cursor: pointer;
   user-select: none;
+}
+
+/* Three-way search mode switch. Replaces the old Semantic checkbox, which
+   could express only two of the CLI's three --mode values. Sized off the
+   toolbar's own controls so the row still reads as one line. */
+.segmented {
+  display: inline-flex;
+  flex: none;
+  padding: 2px;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+
+.segmented button {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-2);
+  border: 1px solid transparent;
+  background: transparent;
+  box-shadow: none;
+  white-space: nowrap;
+}
+
+.segmented button:hover {
+  background: var(--surface);
+  border-color: transparent;
+}
+
+.segmented button.selected {
+  color: var(--text);
+  font-weight: 600;
+  background: var(--surface);
+  border-color: var(--border);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Optional Project / Since filters — a labelled input pair, same shape as
+   .hops-label so the second toolbar row matches the first. */
+.filter-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 150px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.toolbar input.filter-input {
+  flex: 1;
+  min-width: 80px;
 }
 
 .toolbar input[type="checkbox"] {
@@ -801,6 +868,12 @@ button.id-chip:hover {
   color: var(--warn);
 }
 
+/* "neutral" = a true absence (an empty graph walk). Base .callout colours
+   already carry it; the icon just must not read as a pass or a problem. */
+.callout.neutral .callout-icon {
+  color: var(--muted);
+}
+
 .callout-content {
   flex: 1;
   min-width: 0;
@@ -887,6 +960,41 @@ button.id-chip:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Relevance indicator. The fused RRF score was in every payload and rendered
+   nowhere, so results looked unordered. The bar is relative to the top hit in
+   the same response — the score's scale is only meaningful within one search. */
+.result-score {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.result-score-bar {
+  flex: 0 1 120px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.result-score-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.result-score-num {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.result-why {
+  margin: 6px 0 0;
+  font-size: 11.5px;
 }
 
 .result-snippet {
@@ -1208,7 +1316,7 @@ button.toast-close:hover {
 .row-item > svg.ok { color: var(--ok); }
 .row-item > svg.err { color: var(--err); }
 .row-item > svg.warn { color: var(--warn); }
-.row-item > svg.muted { color: var(--text-muted, #8a8078); }
+.row-item > svg.muted { color: var(--muted); }
 .row-item > svg { flex: 0 0 auto; margin-top: 2px; }
 
 .harness-installed-pill {
@@ -1244,7 +1352,7 @@ button.toast-close:hover {
   gap: 8px;
   padding: 6px 10px 6px 6px;
   font-size: 12.5px;
-  color: var(--text-muted, #8a8078);
+  color: var(--muted);
   background: transparent;
   border: 1px solid transparent;
   border-radius: 999px;
@@ -1265,9 +1373,9 @@ button.toast-close:hover {
   font-weight: 650;
   border: 1px solid var(--border);
 }
-.welcome-steps li.current .welcome-step-n { background: var(--accent, #c45c3e); color: #fff; border-color: transparent; }
-.welcome-steps li.done .welcome-step-n { background: var(--ok); color: #fff; border-color: transparent; }
-.welcome-list { margin: 0; padding-left: 18px; color: var(--text-muted, #8a8078); line-height: 1.55; }
+.welcome-steps li.current .welcome-step-n { background: var(--accent); color: var(--on-accent); border-color: transparent; }
+.welcome-steps li.done .welcome-step-n { background: var(--ok); color: var(--on-accent); border-color: transparent; }
+.welcome-list { margin: 0; padding-left: 18px; color: var(--muted); line-height: 1.55; }
 .welcome-list li + li { margin-top: 4px; }
 .welcome-nav { width: 100%; justify-content: space-between; margin-top: 8px; }
 .welcome .toolbar input.mono { flex: 1; }

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { Loader2, RefreshCw } from "lucide-react";
 import { WorkingBanner } from "./WorkingBanner";
 
@@ -44,6 +45,15 @@ export function ComponentsPanel({ active }: { active: boolean }) {
   const [status, setStatus] = useState<StatusPayload | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  // Tauri's own package version — the last-resort answer, and the only one
+  // that is true by construction.
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    void getVersion()
+      .then(setAppVersion)
+      .catch(() => setAppVersion(null));
+  }, []);
 
   const reload = useCallback(async () => {
     setMsg(null);
@@ -92,6 +102,13 @@ export function ComponentsPanel({ active }: { active: boolean }) {
     }
   }, [reload]);
 
+  // The CLI answers "unknown" when it has no version to report (and older
+  // builds answered a hardcoded release string, which is why this line lied);
+  // either way, only a real version wins over Tauri's own getVersion().
+  const cliVersion = [status?.cli, status?.khipu_app].find(
+    (v) => typeof v === "string" && v.trim() && v.trim() !== "unknown",
+  );
+
   const pg = status?.postgres;
   const gy = status?.graphify;
   const docker = status?.docker;
@@ -115,11 +132,17 @@ export function ComponentsPanel({ active }: { active: boolean }) {
         }
       />
       <div className="section-card">
-        <div className="section-head">App + CLI</div>
+        <div className="section-head">App + CLI version</div>
         <div className="section-body">
           <p className="muted">
-            Upgrade the desktop app from Settings → Updates. Bundled CLI version:{" "}
-            <code>{status?.cli ?? status?.khipu_app ?? "…"}</code>
+            {/* The CLI's own answer first: it now reads KHIPU_APP_VERSION,
+                which the Rust side sets from the app's CARGO_PKG_VERSION on
+                every invocation, so the two agree. Before that env var the
+                CLI fell through to a hard-coded "0.3.14" and this line
+                confidently reported a version nobody was running (audit
+                2026-09-04). Tauri's getVersion() is the fallback. */}
+            Upgrade the desktop app from Settings → Updates. Version:{" "}
+            <code>{cliVersion ?? appVersion ?? "…"}</code>
           </p>
         </div>
       </div>

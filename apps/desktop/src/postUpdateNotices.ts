@@ -67,15 +67,21 @@ export function versionGreaterThan(a: string, b: string): boolean {
 }
 
 /** The single notice to show for this launch, or null. `storedVersion` is
- * `readLastNoticedVersion()`'s return (empty string when never set — treated
- * as "older than everything", so an upgrade from a pre-feature release still
- * surfaces any notice up to the current version). When more than one notice
- * falls in (storedVersion, currentVersion], the highest-versioned one wins —
- * only one dialog shows per launch. */
+ * `readLastNoticedVersion()`'s return. When more than one notice falls in
+ * (storedVersion, currentVersion], the highest-versioned one wins — only one
+ * dialog shows per launch.
+ *
+ * An EMPTY `storedVersion` is a fresh install, not an upgrade from version
+ * zero: nothing was ever installed, so there is no behavior change to act on
+ * and every notice is noise ("re-install the Cursor pack once" on a machine
+ * that has never installed it). Return null and let the caller record the
+ * current version, so the next real upgrade is the first one that can fire
+ * (audit 2026-09-04). */
 export function noticeForUpgrade(
   storedVersion: string,
   currentVersion: string,
 ): PostUpdateNotice | null {
+  if (!storedVersion) return null;
   if (!currentVersion || !versionGreaterThan(currentVersion, storedVersion)) {
     return null;
   }

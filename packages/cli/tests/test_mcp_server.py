@@ -8,6 +8,7 @@ over its stdin/stdout.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -16,6 +17,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from khipu import mcp_server as ms
 from khipu.mcp_server import LATEST_PROTOCOL, TOOLS, _tool_get, handle_message
 
 
@@ -482,3 +484,109 @@ class SearchStaleFallbackForwardingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GatewayFlagTest(unittest.TestCase):
+    """Audit 2026-09-04: `_via_https_gateway` walked the call stack for a frame
+    named "khipu.gateway". The shipped container runs `python -m khipu.gateway`,
+    so that module's __name__ is "__main__" and the walk NEVER matched — every
+    gateway capture was rejected as a local stdio double-write."""
+
+    def setUp(self):
+        self._prev = os.environ.pop(ms.GATEWAY_ACTIVE_ENV, None)
+        ms._GATEWAY_ACTIVE = False
+
+    def tearDown(self):
+        ms._GATEWAY_ACTIVE = False
+        os.environ.pop(ms.GATEWAY_ACTIVE_ENV, None)
+        if self._prev is not None:
+            os.environ[ms.GATEWAY_ACTIVE_ENV] = self._prev
+
+    def test_off_by_default(self):
+        self.assertFalse(ms._via_https_gateway())
+
+    def test_mark_gateway_active_sets_module_flag_and_env(self):
+        ms.mark_gateway_active()
+        self.assertTrue(ms._via_https_gateway())
+        self.assertEqual(os.environ[ms.GATEWAY_ACTIVE_ENV], "1")
+
+    def test_env_var_alone_is_enough_for_a_re_execed_child(self):
+        os.environ[ms.GATEWAY_ACTIVE_ENV] = "1"
+        self.assertTrue(ms._via_https_gateway())
+
+    def test_a_gateway_process_never_defers_to_the_local_stdio_hook(self):
+        ms.mark_gateway_active()
+        with mock.patch.object(ms, "_local_capture_hook_is_writer", return_value=True):
+            self.assertFalse(ms._stdio_hook_owns_capture())
+
+    def test_gateway_serve_marks_the_flag(self):
+        from khipu import gateway
+
+        with mock.patch.object(gateway, "ThreadingHTTPServer", side_effect=RuntimeError("stop")):
+            with self.assertRaises(RuntimeError):
+                gateway.serve("127.0.0.1:8787", token="x" * 32)
+        self.assertTrue(ms._via_https_gateway())
+
+
+class ToolDispatchNeverKillsTheServerTest(unittest.TestCase):
+    """capture.load_payload raises SystemExit(EX_DATAERR) on a bad payload. In a
+    long-lived MCP server that ended the process and took every other client's
+    session with it (audit 2026-09-04)."""
+
+    def _call(self, name="khipu_status", args=None):
+        return ms.handle_message({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": name, "arguments": args or {}},
+        })
+
+    def test_systemexit_from_a_tool_becomes_a_json_rpc_tool_error(self):
+        with mock.patch.dict(ms.TOOL_FUNCS,
+                             {"khipu_status": lambda a: (_ for _ in ()).throw(SystemExit(65))}):
+            out = self._call()
+        self.assertEqual(out["id"], 7)
+        self.assertTrue(out["result"]["isError"])
+        self.assertIn("SystemExit", out["result"]["content"][0]["text"])
+        self.assertIn("65", out["result"]["content"][0]["text"])
+
+    def test_keyboard_interrupt_still_propagates(self):
+        with mock.patch.dict(ms.TOOL_FUNCS,
+                             {"khipu_status": lambda a: (_ for _ in ()).throw(KeyboardInterrupt())}):
+            with self.assertRaises(KeyboardInterrupt):
+                self._call()
+
+    def test_capture_rejects_a_non_string_summary_before_load_payload(self):
+        with mock.patch.object(ms, "_capture_mode", return_value="hub"), \
+                mock.patch.object(ms, "_stdio_hook_owns_capture", return_value=False), \
+                mock.patch("khipu.capture.load_payload") as m_load:
+            out = self._call("khipu_capture", {"summary": ["not", "a", "string"]})
+        m_load.assert_not_called()
+        self.assertTrue(out["result"]["isError"])
+        self.assertIn("non-empty string 'summary'", out["result"]["content"][0]["text"])
+
+    def test_capture_silences_stdout_and_reports_the_episode_id(self):
+        import sys as _sys
+
+        def _noisy_capture(payload, mode=None):
+            print("OK · episode appended")   # would corrupt the JSON-RPC stream
+            self.assertEqual(os.environ["KHIPU_HUB_FILE_MIRROR"], "0")
+            return 0
+
+        prev = os.environ.get("KHIPU_HUB_FILE_MIRROR")
+        os.environ.pop("KHIPU_HUB_FILE_MIRROR", None)
+        buf = io.StringIO()
+        try:
+            with mock.patch.object(ms, "_capture_mode", return_value="hub"), \
+                    mock.patch.object(ms, "_stdio_hook_owns_capture", return_value=False), \
+                    mock.patch.object(ms, "_captured_episode_id", return_value=4242), \
+                    mock.patch("khipu.capture.capture", side_effect=_noisy_capture), \
+                    mock.patch.object(_sys, "stdout", buf):
+                out = ms._tool_capture({"summary": "a real capture", "session_id": "x:1"})
+        finally:
+            if prev is not None:
+                os.environ["KHIPU_HUB_FILE_MIRROR"] = prev
+            else:
+                os.environ.pop("KHIPU_HUB_FILE_MIRROR", None)
+        self.assertEqual(out["episode_id"], 4242)
+        self.assertEqual(buf.getvalue(), "", "capture output must never reach stdout")
+        # The env override is restored, not leaked into the rest of the process.
+        self.assertIsNone(os.environ.get("KHIPU_HUB_FILE_MIRROR"))

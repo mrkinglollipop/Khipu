@@ -93,3 +93,23 @@ class SelectCompatRowTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AppVersionFallbackTest(unittest.TestCase):
+    """Audit 2026-09-04: the fallback hardcoded "0.3.14" and kept reporting a
+    shipped release long after 0.3.16. The desktop app passes KHIPU_APP_VERSION;
+    with nothing to read, the honest answer is "unknown", not a stale number."""
+
+    def test_env_wins(self):
+        with mock.patch.dict("os.environ", {"KHIPU_APP_VERSION": "0.4.1"}):
+            self.assertEqual(cm.khipu_app_version(), "0.4.1")
+
+    def test_versions_json_is_next(self):
+        with mock.patch.dict("os.environ", {"KHIPU_APP_VERSION": "", "KHIPU_VERSION": ""}), \
+                mock.patch.object(cm, "read_versions", return_value={"khipu_app": "0.3.16"}):
+            self.assertEqual(cm.khipu_app_version(), "0.3.16")
+
+    def test_unknown_when_nothing_reports_a_version(self):
+        with mock.patch.dict("os.environ", {"KHIPU_APP_VERSION": "", "KHIPU_VERSION": ""}), \
+                mock.patch.object(cm, "read_versions", return_value={}):
+            self.assertEqual(cm.khipu_app_version(), "unknown")

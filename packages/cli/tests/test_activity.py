@@ -303,3 +303,48 @@ class ProjectSliceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TopicSlugOverFetchTest(unittest.TestCase):
+    """Audit 2026-09-04: the candidate slugs were trimmed to topic_limit BEFORE
+    the existence lookup, so an episode whose first N topics were tags or
+    deleted pages returned fewer topics than asked for — sometimes none — while
+    real topic pages sat just past the cut."""
+
+    def _run(self, results, **kw):
+        cur = FakeCursor(results)
+        with mock.patch.object(activity, "connect", return_value=FakeConn(cur)):
+            out = activity.project_slice(**kw)
+        return out, cur
+
+    def test_slugs_past_the_limit_still_reach_the_existence_lookup(self):
+        episode_row = (
+            42, dt.datetime(2026, 9, 3, 10, 0), "shipped the fix",
+            ["tag-a", "tag-b", "tag-c", "real-topic"],
+        )
+        topic_row = ("real-topic", "Real Topic",
+                     dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc))
+        results = [[], [episode_row], [topic_row], []]
+        with mock.patch("khipu.embed._episode_schema_flags", return_value={
+            "project": True, "deleted_at": True,
+        }):
+            out, cur = self._run(results, project="acme/widget", topic_limit=3)
+        looked_up = cur.params[2][0]
+        self.assertIn("real-topic", looked_up,
+                      "the 4th slug was cut before the lookup with topic_limit=3")
+        self.assertEqual([t["slug"] for t in out["topics"]], ["real-topic"])
+
+    def test_the_result_is_still_capped_at_topic_limit(self):
+        episode_row = (
+            42, dt.datetime(2026, 9, 3, 10, 0), "shipped",
+            ["t1", "t2", "t3", "t4", "t5"],
+        )
+        when = dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)
+        rows = [(f"t{i}", f"T{i}", when) for i in range(1, 6)]
+        results = [[], [episode_row], rows]
+        with mock.patch("khipu.embed._episode_schema_flags", return_value={
+            "project": True, "deleted_at": True,
+        }):
+            out, _cur = self._run(results, project="acme/widget", topic_limit=3)
+        # Capped, and in the episode's own topic order (not the DB's row order).
+        self.assertEqual([t["slug"] for t in out["topics"]], ["t1", "t2", "t3"])

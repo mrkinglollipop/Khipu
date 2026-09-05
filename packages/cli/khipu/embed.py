@@ -574,6 +574,19 @@ def _iter_sources(cur, *, kind: str | None = None) -> Iterable[tuple[str, str, s
             text = topic_text(slug, title, body)
             if text:
                 yield "topic", slug, text, (title or slug or "")
+    # Commitments are OPT-IN only (`--kind commitment`), never part of the
+    # default sweep: their vectors exist for commitments.auto_close, not for
+    # generic search (_cosine_candidates excludes kind='commitment'), and the
+    # hook's bounded catch-up normally keeps them current. This is the manual
+    # heal for a hub whose catch-up fell behind (audit 2026-09-04).
+    if kind == "commitment":
+        cur.execute(
+            "SELECT id, text FROM commitments WHERE status = 'open' ORDER BY id"
+        )
+        for cid, ctext in cur.fetchall():
+            text = (ctext or "").strip()
+            if text:
+                yield "commitment", str(cid), text, ""
 
 
 def _existing_hashes(cur, profile: str) -> dict[tuple[str, str, int], str]:
@@ -619,7 +632,10 @@ def backfill(
     dry_run: bool = False,
     profile: str | None = None,
 ) -> dict[str, Any]:
-    """Embed every missing / changed chunk under active or named profile. Idempotent."""
+    """Embed every missing / changed chunk under active or named profile. Idempotent.
+
+    ``kind`` restricts the sweep; ``kind="commitment"`` is opt-in only (it is
+    never part of the default all-kinds pass — see ``_iter_sources``)."""
     from khipu.db import connect
 
     stats: dict[str, Any] = {
@@ -819,7 +835,7 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
 
 
 def _cosine_candidates(
-    query: str, *, limit: int, kind: str | None = None
+    query: str, *, limit: int, kind: str | None = None, filters: "_SearchFilters | None" = None
 ) -> list[dict[str, Any]]:
     """Raw cosine-ordered candidates over the active profile (best first).
 
@@ -848,6 +864,29 @@ def _cosine_candidates(
     with connect() as conn:
         with conn.cursor() as cur:
             profile = _active_profile(cur)
+            # W2.3 fix: metadata filters ride the candidate SQL, so the
+            # oversample is drawn from rows that already satisfy them (they
+            # used to be applied only after fusion had picked ~50 rows).
+            filter_clause = ""
+            filter_params: dict[str, Any] = {}
+            if filters is not None and filters.active:
+                filter_params = filters.params
+                ep = (
+                    "(m.kind = 'episode' AND EXISTS (SELECT 1 FROM episodes e"
+                    f" WHERE e.id::text = m.ref AND ({filters.episode_sql(cur, 'e')})))"
+                )
+                if filters.episode_only:
+                    filter_clause = f"  AND {ep}\n"
+                else:
+                    tp = (
+                        "(m.kind = 'topic' AND EXISTS (SELECT 1 FROM topics t"
+                        f" WHERE t.slug = m.ref AND ({filters.topic_sql('t')})))"
+                    )
+                    other = "TRUE" if filters.media_allowed else "FALSE"
+                    filter_clause = (
+                        f"  AND ({ep} OR {tp}"
+                        f" OR (m.kind NOT IN ('episode', 'topic') AND {other}))\n"
+                    )
             api_q = prefix_query(query) if uses_task_prefixes(profile) else query
             qlit = _vec_literal(embed_one(api_q, profile=profile))
             cur.execute("SELECT to_regclass('public.media_assets') IS NOT NULL")
@@ -880,11 +919,11 @@ def _cosine_candidates(
                 WHERE m.profile = %(p)s
                   AND m.kind != 'commitment'
                   AND (%(kind)s::text IS NULL OR m.kind = %(kind)s)
-                ORDER BY m.embedding <=> %(q)s::vector
+                {filter_clause}    ORDER BY m.embedding <=> %(q)s::vector
                 LIMIT %(lim)s
                 """,
                 {"q": qlit, "p": profile, "kind": kind, "lim": fetch,
-                 "fetch": FETCH_LIMIT, "rank_fetch": CHUNK_CHARS},
+                 "fetch": FETCH_LIMIT, "rank_fetch": CHUNK_CHARS, **filter_params},
             )
             out = []
             for k, r, i, s, snip, rank_src, lbl in cur.fetchall():
@@ -972,6 +1011,105 @@ def _neg_ts_sort_key(ts) -> float:
         return -aware.timestamp()
     except (OverflowError, OSError, ValueError):
         return 0.0
+
+
+class _SearchFilters:
+    """One predicate builder shared by every candidate query hybrid_search
+    issues (W2.3 fix, audit 2026-09-04).
+
+    Filters used to run ONLY post-fusion, over a ~50-row pool that had already
+    been chosen without them: `khipu search "x" --project acme` could not see a
+    matching row that sat at literal rank 51, so a narrow filter routinely
+    returned nothing while the rows it asked for existed. Every candidate query
+    now carries these predicates in SQL, and ``_apply_search_filters`` stays as
+    the safety net (a snapshot/pre-migration path that could not push them
+    down, and the recency tiebreak).
+
+    Semantics are deliberately identical to ``_apply_search_filters``:
+      * project  — SUBSTRING, case-insensitive, over COALESCE(project, scope)
+      * session_id — case-sensitive PREFIX of episodes.session_id
+      * harness  — equality against episodes.harness, falling back to the
+        session_id prefix before ':' when the column is absent or empty
+      * since/until — inclusive bounds on the row's own timestamp; a row with
+        no timestamp is dropped
+      * project/session_id/harness are episode-only: a topic or node row is
+        dropped outright when any of them is active
+    """
+
+    def __init__(self, *, project=None, since=None, until=None,
+                 session_id=None, harness=None):
+        from khipu.search_text import parse_time_filter
+
+        self.project = (project or "").strip() or None
+        self.session_id = (session_id or "").strip() or None
+        self.harness = (harness or "").strip() or None
+        self.since_dt = parse_time_filter(since) if since else None
+        self.until_dt = parse_time_filter(until) if until else None
+        self.time_filtered = self.since_dt is not None or self.until_dt is not None
+        self.episode_only = bool(self.project or self.session_id or self.harness)
+        self.active = self.episode_only or self.time_filtered
+        # Media rows have no timestamp anywhere to compare against, so a time
+        # bound excludes them — exactly what the post-fusion pass does.
+        self.media_allowed = not self.active
+
+    @property
+    def params(self) -> dict[str, Any]:
+        from khipu.cli import _escape_like
+
+        out: dict[str, Any] = {}
+        if self.project:
+            out["kf_project"] = f"%{_escape_like(self.project)}%"
+        if self.session_id:
+            out["kf_session"] = f"{_escape_like(self.session_id)}%"
+        if self.harness:
+            out["kf_harness"] = self.harness
+        if self.since_dt is not None:
+            out["kf_since"] = self.since_dt
+        if self.until_dt is not None:
+            out["kf_until"] = self.until_dt
+        return out
+
+    def episode_sql(self, cur, alias: str = "") -> str:
+        a = f"{alias}." if alias else ""
+        flags = _episode_schema_flags(cur)
+        parts: list[str] = []
+        if self.project:
+            proj = f"COALESCE({a}project, {a}scope)" if flags["project"] else f"{a}scope"
+            parts.append(proj + " ILIKE %(kf_project)s ESCAPE '" + chr(92) + "'")
+        if self.session_id:
+            parts.append(f"{a}session_id LIKE %(kf_session)s ESCAPE '" + chr(92) + "'")
+        if self.harness:
+            split = f"split_part(COALESCE({a}session_id, ''), ':', 1)"
+            expr = (f"COALESCE(NULLIF({a}harness, ''), {split})" if flags["harness"] else split)
+            parts.append(f"{expr} = %(kf_harness)s")
+        if self.since_dt is not None:
+            parts.append(f"{a}ts >= %(kf_since)s")
+        if self.until_dt is not None:
+            parts.append(f"{a}ts <= %(kf_until)s")
+        return " AND ".join(parts) if parts else "TRUE"
+
+    def topic_sql(self, alias: str = "") -> str:
+        a = f"{alias}." if alias else ""
+        if self.episode_only:
+            return "FALSE"
+        parts: list[str] = []
+        ts = f"COALESCE({a}updated_at, {a}created_at)"
+        if self.since_dt is not None:
+            parts.append(f"{ts} >= %(kf_since)s")
+        if self.until_dt is not None:
+            parts.append(f"{ts} <= %(kf_until)s")
+        return " AND ".join(parts) if parts else "TRUE"
+
+    def node_sql(self, alias: str = "") -> str:
+        a = f"{alias}." if alias else ""
+        if self.episode_only:
+            return "FALSE"
+        parts: list[str] = []
+        if self.since_dt is not None:
+            parts.append(f"{a}built_at >= %(kf_since)s")
+        if self.until_dt is not None:
+            parts.append(f"{a}built_at <= %(kf_until)s")
+        return " AND ".join(parts) if parts else "TRUE"
 
 
 def _apply_search_filters(
@@ -1139,8 +1277,10 @@ def hybrid_search(
     the embedding ranked low but that names the query verbatim used to be
     invisible to the lexical list entirely.
 
-    Filters (kind/project/since/until/session_id/harness) are honoured on
-    every mode via a single post-fusion pass (``_apply_search_filters``).
+    Filters (kind/project/since/until/session_id/harness) are pushed into the
+    SQL of every candidate query (``_SearchFilters``) so the oversample pool is
+    drawn from rows that already satisfy them, and re-checked post-fusion by
+    ``_apply_search_filters`` (which also does the recency tiebreak).
     Nodes are excluded from hybrid/literal results by default (W2.2) — see
     ``cli._id_shaped`` / ``cli._literal_candidates``.
     """
@@ -1166,6 +1306,12 @@ def hybrid_search(
     # a strong episode hit is never pushed out by weak-but-numerous topic hits.
     oversample = max(limit * 4, 50)
     degraded: str | None = None
+    # Built once and pushed into EVERY candidate query below; the post-fusion
+    # pass keeps the same semantics as a safety net (audit 2026-09-04).
+    filters = _SearchFilters(
+        project=project, since=since, until=until,
+        session_id=session_id, harness=harness,
+    )
 
     cosine_rows: list[dict[str, Any]] = []
     # kind="node" (only valid for hybrid/literal, never semantic — checked
@@ -1176,7 +1322,9 @@ def hybrid_search(
     if mode in ("hybrid", "semantic") and not (kind and kind not in _SEMANTIC_KINDS):
         semantic_kind = kind if kind in _SEMANTIC_KINDS else None
         try:
-            cosine_rows = _cosine_candidates(query, limit=oversample, kind=semantic_kind)
+            cosine_rows = _cosine_candidates(
+                query, limit=oversample, kind=semantic_kind, filters=filters
+            )
         except RuntimeError:
             if mode == "semantic":
                 raise
@@ -1188,7 +1336,9 @@ def hybrid_search(
             literal_rows: list[dict[str, Any]] = []
             if mode in ("hybrid", "literal"):
                 literal_kind = kind if kind in _LITERAL_KINDS else None
-                literal_rows = _literal_candidates(cur, query, oversample, kind=literal_kind)
+                literal_rows = _literal_candidates(
+                    cur, query, oversample, kind=literal_kind, filters=filters
+                )
 
             lists: list[list[dict[str, Any]]] = []
             if cosine_rows:
@@ -1256,6 +1406,25 @@ def coverage(*, profile: str | None = None) -> dict[str, Any]:
             if has_media:
                 cur.execute("SELECT COUNT(*) FROM media_assets")
                 medias = cur.fetchone()[0]
+            # Commitments carry vectors too (migration 0009 widened the kind
+            # constraint) and auto_close depends on them, but coverage reported
+            # nothing at all — a hub whose commitment catch-up had fallen behind
+            # looked perfectly green (audit 2026-09-04). Pre-0009 hubs have no
+            # table; report zeroes rather than raising.
+            cur.execute("SELECT to_regclass('public.commitments') IS NOT NULL")
+            has_commitments = bool(cur.fetchone()[0])
+            commitments_total = commitments_refs = commitments_chunks = 0
+            if has_commitments:
+                cur.execute("SELECT COUNT(*) FROM commitments WHERE status = 'open'")
+                commitments_total = int(cur.fetchone()[0])
+                cur.execute(
+                    "SELECT COUNT(DISTINCT m.ref), COUNT(*) FROM memory_embeddings m"
+                    " JOIN commitments c ON c.id::text = m.ref AND c.status = 'open'"
+                    " WHERE m.profile = %s AND m.kind = 'commitment'",
+                    (profile,),
+                )
+                r, ch = cur.fetchone()
+                commitments_refs, commitments_chunks = int(r), int(ch)
             cur.execute(
                 "SELECT kind, COUNT(DISTINCT ref), COUNT(*) FROM memory_embeddings "
                 "WHERE profile = %s GROUP BY kind",
@@ -1308,6 +1477,12 @@ def coverage(*, profile: str | None = None) -> dict[str, Any]:
         # not fail activate() or doctor embed_coverage_ok (episode+topic only).
         "media": {"total": medias, "embedded": m["refs"], "missing": max(0, medias - m["refs"]),
                   "chunks": m["chunks"], "pct": _pct(m["refs"], medias)},
+        # Denominator = OPEN commitments (the only ones auto_close scores
+        # against). Informational, like media: it does not gate activate().
+        "commitments": {"total": commitments_total, "embedded": commitments_refs,
+                        "missing": max(0, commitments_total - commitments_refs),
+                        "chunks": commitments_chunks,
+                        "pct": _pct(commitments_refs, commitments_total)},
     }
 
 

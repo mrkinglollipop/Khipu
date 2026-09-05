@@ -54,8 +54,22 @@ class EvalOneTest(unittest.TestCase):
         with mock.patch("khipu.embed.hybrid_search", return_value=results) as m:
             row = recall_eval.eval_one(entry)
         self.assertTrue(row["hit"])
-        self.assertEqual(row["got"], ["1", "42"])
+        # Every kind is scored (audit 2026-09-04): the top-k slice is what the
+        # caller actually sees, so dropping non-episode rows from `got` both
+        # made a topic-slug golden line unhittable and mis-reported the slice.
+        self.assertEqual(row["got"], ["1", "42", "some-topic"])
         m.assert_called_once_with("q", mode="hybrid", limit=3)
+
+    def test_a_topic_slug_can_be_a_golden_expectation(self):
+        entry = {"query": "q", "expect": ["some-topic"], "k": 3}
+        results = {"results": [
+            {"kind": "episode", "id": "1", "score": 0.5},
+            {"kind": "topic", "id": "some-topic", "score": 0.4},
+        ]}
+        with mock.patch("khipu.embed.hybrid_search", return_value=results):
+            row = recall_eval.eval_one(entry)
+        self.assertTrue(row["hit"], row)
+        self.assertEqual(row["got"], ["1", "some-topic"])
 
     def test_miss_when_expected_id_absent(self):
         entry = {"query": "q", "expect": ["999"], "k": 3}

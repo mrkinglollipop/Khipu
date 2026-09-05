@@ -232,7 +232,36 @@ def run_nightly() -> int:
         CONSOLIDATE_NIGHTLY, log_stem="khipu-nightly", state_name="nightly"
     )
     _reconcile_notes_if_due()
+    _mark_stale_commitments()
     return rc
+
+
+def _mark_stale_commitments() -> None:
+    """W3: age open commitments past STALE_AFTER_DAYS into 'stale'.
+
+    ``commitments.mark_stale`` shipped with no caller at all (audit
+    2026-09-04), so nothing ever aged: `khipu owed --status stale` was
+    permanently empty and the open list grew without bound. Same posture as
+    ``_reconcile_notes_if_due`` — additive, fail-open, and it must never turn
+    a good nightly into a bad one (the external driver's exit code is what
+    gates job_status/doctor)."""
+    try:
+        from khipu import commitments
+        from khipu.db import connect
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                n = commitments.mark_stale(cur)
+            conn.commit()
+        out = {"ok": True, "stale": int(n)}
+    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
+        out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+    try:
+        out_log, _ = _log_paths("khipu-nightly")
+        with open(out_log, "ab") as f:
+            f.write(f"commitments-mark-stale: {json.dumps(out, default=str)[:300]}\n".encode())
+    except OSError:
+        pass
 
 
 def _reconcile_notes_if_due() -> None:

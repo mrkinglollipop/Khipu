@@ -330,9 +330,22 @@ class _EpisodesFakeCursor:
             self._result = [hits[0]] if hits else []
             return
         if s.startswith("INSERT INTO episodes"):
-            (ts, session_id, summary, topics_json, people_json, decisions_json,
-             preferences_json, scope, edges_json, raw_json, harness, repo_root,
-             project, parent_session_id, transcript_range, tags_json) = params
+            # Column list is schema-gated now (mirror._upsert_episode names
+            # identity/tags columns only when they exist), so read it off the
+            # SQL instead of unpacking a fixed 16-tuple.
+            names = [c.strip() for c in
+                     s.split("INSERT INTO episodes (", 1)[1].split(")", 1)[0].split(",")]
+            row = dict(zip(names, params))
+            ts, session_id = row["ts"], row["session_id"]
+            summary, scope = row["summary"], row.get("scope")
+            topics_json, people_json = row["topics"], row["people"]
+            decisions_json, preferences_json = row["decisions"], row["preferences"]
+            raw_json = row["raw"]
+            harness, repo_root = row.get("harness"), row.get("repo_root")
+            project = row.get("project")
+            parent_session_id = row.get("parent_session_id")
+            transcript_range = row.get("transcript_range")
+            tags_json = row.get("tags") or "[]"
             key = (ts, hashlib.md5(summary.encode()).hexdigest())
             if key in self._existing_keys:
                 self.rowcount = 0
@@ -357,18 +370,28 @@ class _EpisodesFakeCursor:
                     if e["ts"] == ts and hashlib.md5(e["summary"].encode()).hexdigest() == md]
             self._result = [(hits[0],)] if hits else []
             return
-        if s.startswith("SELECT topics, decisions, preferences, raw FROM episodes WHERE id"):
+        if s.startswith("SELECT topics, decisions, preferences, people, raw, ts, summary"):
             (target_id,) = params
             e = self.episodes.get(target_id)
-            self._result = [(e["topics"], e["decisions"], e["preferences"], e["raw"])] if e else []
+            if not e:
+                self._result = []
+                return
+            row = [e["topics"], e["decisions"], e["preferences"], e.get("people") or [],
+                   e["raw"], e["ts"], e["summary"]]
+            if ", tags" in s:
+                row.append(e.get("tags") or [])
+            self._result = [tuple(row)]
             return
         if s.startswith("UPDATE episodes SET topics"):
-            new_topics, new_decisions, new_preferences, new_raw, target_id = params
+            target_id = params[-1]
             e = self.episodes[target_id]
-            e["topics"] = json.loads(new_topics)
-            e["decisions"] = json.loads(new_decisions)
-            e["preferences"] = json.loads(new_preferences)
-            e["raw"] = json.loads(new_raw)
+            e["topics"] = json.loads(params[0])
+            e["decisions"] = json.loads(params[1])
+            e["preferences"] = json.loads(params[2])
+            e["people"] = json.loads(params[3])
+            e["raw"] = json.loads(params[4])
+            if "tags = %s::jsonb" in s:
+                e["tags"] = json.loads(params[5])
             self.updated_ids.append(target_id)
             return
         raise AssertionError(f"unexpected SQL in fake cursor: {s[:120]}")
@@ -478,6 +501,72 @@ class WritePgOrchestrationTest(unittest.TestCase):
         self.assertIn("Recorded mobile followup task", merged["decisions"])
         self.assertEqual(len(merged["raw"]["merged_from"]), 1)
         self.assertEqual(merged["raw"]["merged_from"][0]["session_id"], "claude_code:c631b166")
+
+    def test_a_merge_unions_people_and_tags_opens_commitments_and_reembeds(self):
+        """Audit 2026-09-04: the merge folded topics/decisions/preferences and
+        dropped everything else. ``people``/``tags`` from the merged capture
+        vanished, its ``open_loops`` never became commitments (the insert path
+        opens them), and the target row kept vectors built from its pre-merge
+        text."""
+        existing = {1: {
+            "ts": "2026-09-03T00:00:00Z", "session_id": "claude_code:fb929043",
+            "summary": "one conversation captured twice",
+            "topics": ["performance"], "decisions": [], "preferences": [],
+            "people": ["matt"], "tags": ["recap-chip"], "raw": {},
+            "harness": "claude_code", "repo_root": "/r", "project": "acme/widget",
+            "parent_session_id": None, "transcript_range": "0:100",
+        }}
+        cur = _EpisodesFakeCursor(existing)
+        payload = {
+            "ts": "2026-09-03T00:02:00Z", "session_id": "claude_code:c631b166",
+            "summary": "one conversation captured twice",
+            "people": ["matt", "ana"], "tags": ["followup-chip"],
+            "open_loops": [{"text": "ship the merge fix", "kind": "followup"}],
+            "harness": "claude_code", "transcript_range": "50:200", "project": "acme/widget",
+        }
+        opened: list[tuple] = []
+        reembedded: list[tuple] = []
+        with self._connect(cur), \
+                mock.patch("khipu.hygiene.classify_topics", return_value=([], [], False)), \
+                mock.patch("khipu.commitments.open_from_episode",
+                           side_effect=lambda c, pl, eid: opened.append((pl, eid)) or 1), \
+                mock.patch("khipu.commitments.auto_close", return_value=0), \
+                mock.patch.object(cap, "_reembed_merged_episode",
+                                  side_effect=lambda ts, sm, m: reembedded.append((ts, sm, m))), \
+                mock.patch.object(cap, "_dedup_text", side_effect=lambda p: p.get("summary") or ""):
+            stats = cap.write_pg(payload)
+        self.assertEqual(stats["dedup"]["action"], "merge")
+        merged = cur.episodes[1]
+        self.assertEqual(merged["people"], ["matt", "ana"])
+        self.assertEqual(merged["tags"], ["recap-chip", "followup-chip"])
+        # Commitments opened for the MERGED payload against the TARGET id.
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(opened[0][1], 1)
+        self.assertEqual(opened[0][0]["open_loops"], payload["open_loops"])
+        # And the target row is re-embedded from its post-merge text.
+        self.assertEqual(len(reembedded), 1)
+        self.assertEqual(reembedded[0][0], "2026-09-03T00:00:00Z")
+        self.assertEqual(reembedded[0][2]["people"], ["matt", "ana"])
+
+    def test_merge_reembed_looks_the_target_row_up_by_its_own_identity(self):
+        """``embed_on_capture`` finds a row by (ts, md5(summary)); a merge
+        changes neither, so the TARGET's ts/summary — not the merged
+        capture's — are what must be handed to it."""
+        seen: list[dict] = []
+        with mock.patch("khipu.embed.embed_on_capture", side_effect=lambda p: seen.append(p)):
+            cap._reembed_merged_episode(
+                "2026-09-03T00:00:00Z", "target summary",
+                {"summary": "ignored", "topics": ["t"], "decisions": ["d"],
+                 "preferences": [], "people": []},
+            )
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["ts"], "2026-09-03T00:00:00Z")
+        self.assertEqual(seen[0]["summary"], "target summary")
+        self.assertEqual(seen[0]["decisions"], ["d"])
+
+    def test_merge_reembed_never_raises_when_embedding_is_unavailable(self):
+        with mock.patch("khipu.embed.embed_on_capture", side_effect=RuntimeError("no profile")):
+            cap._reembed_merged_episode("2026-09-03T00:00:00Z", "s", {"summary": "s"})
 
     def test_decisions_folded_into_the_similarity_text_can_pull_below_threshold(self):
         """Real-world caveat, not a bug: the Jaccard fallback scores summary

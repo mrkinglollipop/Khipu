@@ -70,6 +70,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export KHIPU_ROOT="$ROOT"
 PY="${KHIPU_PYTHON:-$ROOT/python/bin/python3.11}"
 export PYTHONPATH="$ROOT/packages/cli:$ROOT/lib${PYTHONPATH:+:$PYTHONPATH}"
+# Bytecode cache goes OUTSIDE the signed .app bundle — see khipu.paths.pycache_dir.
+# This wrapper ships INSIDE Contents/Resources, so without this every `khipu`
+# invocation wrote __pycache__/*.pyc next to the signed code and broke the seal
+# ("Khipu is damaged", 0.3.15, withdrawn). mkdir failure is fail-open: a missing
+# PYTHONPYCACHEPREFIX dir just disables caching.
+PYTHONPYCACHEPREFIX="${HOME}/Library/Caches/Khipu/pycache"
+mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null
+export PYTHONPYCACHEPREFIX
 exec "$PY" -m khipu "$@"
 EOF
 chmod +x "$OUT/bin/khipu"

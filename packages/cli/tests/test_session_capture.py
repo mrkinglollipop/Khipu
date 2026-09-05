@@ -371,8 +371,11 @@ class LivenessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, _home(td):
             tr = Path(td) / "session.jsonl"
             tr.write_text('{"type":"user","message":{"role":"user","content":"hi"}}\n')
-            # Hook last looked two hours before the transcript was last written to.
-            hook_at = time.time() - sc.HOOK_SILENT_S - 600
+            # The user prompt landed long after the hook last looked AND the
+            # session has been quiet ever since, so a Stop had its chance.
+            quiet_at = time.time() - sc.HOOK_SILENT_S - 60
+            os.utime(tr, (quiet_at, quiet_at))
+            hook_at = quiet_at - sc.HOOK_SILENT_S - 600
             sc.save_state("claude_code", "s1", {"offset": 0, "last_ts": 0, "transcript_path": str(tr),
                                                 "seen_end": 0, "seen_ts": hook_at})
             self._beat("claude_code", at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(hook_at)),
@@ -423,7 +426,7 @@ class LivenessTest(unittest.TestCase):
             tr = Path(td) / "updates.jsonl"
             turn = '{"timestamp": 1, "method": "session/update", "params": {"update": '                    '{"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "hi"}}}}\n'
             tr.write_text(turn)
-            hook_at = time.time() - sc.HOOK_SILENT_S - 600
+            hook_at = time.time() - 2 * sc.HOOK_SILENT_S - 700
             sc.save_state("aegis", "s1", {"offset": 0, "last_ts": 0, "transcript_path": str(tr),
                                           "seen_end": tr.stat().st_size, "seen_ts": hook_at})
             with tr.open("a") as fh:   # housekeeping only, hours after the hook
@@ -436,6 +439,9 @@ class LivenessTest(unittest.TestCase):
             with tr.open("a") as fh:   # now a user prompt with still no hook run: red
                 fh.write('{"timestamp": 3, "method": "session/update", "params": {"update": '
                          '{"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "next"}}}}\n')
+            # ...and it then sat quiet long enough for a Stop to have fired.
+            quiet_at = time.time() - sc.HOOK_SILENT_S - 60
+            os.utime(tr, (quiet_at, quiet_at))
             self.assertIn("stopped firing", " ".join(sc.liveness("aegis")["reasons"]))
 
     def test_an_assistant_only_tail_is_the_flush_race_not_a_stopped_hook(self):
@@ -470,6 +476,45 @@ class LivenessTest(unittest.TestCase):
             self._beat("aegis", at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(hook_at)))
             self.assertTrue(sc.liveness("aegis")["ok"])
 
+    def test_an_idle_session_resumed_with_one_prompt_is_not_a_stopped_hook(self):
+        """Audit 2026-09-04 false red: a session that sat idle 19 h and then
+        got ONE user prompt two minutes ago. `mtime - seen_ts` is 19 h, so the
+        old rule shouted "the hook has stopped firing" before any Stop event
+        could possibly have fired. A Stop needs its chance first."""
+        with tempfile.TemporaryDirectory() as td, _home(td), \
+                mock.patch.object(sc, "HOOK_SILENT_S", 20 * 60):
+            tr = Path(td) / "session.jsonl"
+            tr.write_text('{"type":"user","message":{"role":"user","content":"hi"}}\n')
+            os.utime(tr, (time.time() - 120,) * 2)          # the prompt is 2 min old
+            sc.save_state("claude_code", "s1", {
+                "offset": 0, "last_ts": 0, "transcript_path": str(tr),
+                "seen_end": 0, "seen_ts": time.time() - 19 * 3600,
+            })
+            self._beat("claude_code", at=sc._mint_ts(), pending_turns=0, captures=3)
+            reason, age = sc._stopped_hook_evidence("claude_code")
+            self.assertIsNone(reason, reason)
+            self.assertGreater(age, 20 * 60, "still reported as newer than the hook")
+            self.assertTrue(sc.liveness("claude_code")["ok"])
+
+    def test_the_same_session_goes_red_once_the_turn_has_sat_unread(self):
+        """Same fixture, one difference: the prompt is 30 min old with
+        HOOK_SILENT_S at 20 min, so a Stop was due and never came."""
+        with tempfile.TemporaryDirectory() as td, _home(td), \
+                mock.patch.object(sc, "HOOK_SILENT_S", 20 * 60):
+            tr = Path(td) / "session.jsonl"
+            tr.write_text('{"type":"user","message":{"role":"user","content":"hi"}}\n')
+            os.utime(tr, (time.time() - 30 * 60,) * 2)
+            sc.save_state("claude_code", "s1", {
+                "offset": 0, "last_ts": 0, "transcript_path": str(tr),
+                "seen_end": 0, "seen_ts": time.time() - 19 * 3600,
+            })
+            self._beat("claude_code", at=sc._mint_ts(), pending_turns=0, captures=3)
+            reason, _ = sc._stopped_hook_evidence("claude_code")
+            self.assertIsNotNone(reason)
+            self.assertIn("stopped firing", reason)
+            self.assertIn("quiet", reason, "the reason must name the quiet window")
+            self.assertFalse(sc.liveness("claude_code")["ok"])
+
     def test_evidence_scan_is_bounded_and_still_sees_the_live_session(self):
         """State files are never pruned and this runs inside every doctor."""
         with tempfile.TemporaryDirectory() as td, _home(td):
@@ -482,8 +527,11 @@ class LivenessTest(unittest.TestCase):
                 os.utime(sc._state_file("claude_code", f"old{i}"), (time.time() - 86400 - i,) * 2)
             live = Path(td) / "live.jsonl"
             live.write_text('{"type":"user","message":{"role":"user","content":"hi"}}\n')
+            quiet_at = time.time() - sc.HOOK_SILENT_S - 60
+            os.utime(live, (quiet_at, quiet_at))
             sc.save_state("claude_code", "live", {"offset": 0, "transcript_path": str(live),
-                                                  "seen_end": 0, "seen_ts": time.time() - sc.HOOK_SILENT_S - 600})
+                                                  "seen_end": 0,
+                                                  "seen_ts": quiet_at - sc.HOOK_SILENT_S - 600})
             reason, age = sc._stopped_hook_evidence("claude_code")
             self.assertIn(str(live), reason or "")
 
