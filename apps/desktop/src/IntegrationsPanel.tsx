@@ -143,6 +143,12 @@ function fmtAge(s: number | null | undefined): string {
   return `${Math.round(s / 86400)} days`;
 }
 
+/** Round-trip seconds as the mock writes them — one decimal and a space
+ *  before the unit ("3.1 s"), not the raw float the probe file carries. */
+function fmtSeconds(s: number): string {
+  return `${s.toFixed(1)} s`;
+}
+
 function firstReason(lv: HarnessLiveness | undefined): string {
   const r = (lv?.reasons ?? [])[0];
   return r ? r.slice(0, 120) : "";
@@ -198,7 +204,7 @@ export function verifiedLine(
     if (fresh.ok) {
       return {
         mark: "ok",
-        text: `Verified just now${fresh.seconds != null ? ` · ${fresh.seconds}s round trip` : ""}`,
+        text: `Verified just now${fresh.seconds != null ? ` · ${fmtSeconds(fresh.seconds)} round trip` : ""}`,
       };
     }
     return {
@@ -207,8 +213,20 @@ export function verifiedLine(
     };
   }
   const last = stored?.last_probe;
-  if (!last || last.harness !== harness) {
+  if (!last) {
     return { mark: "off", text: "Not verified on this pack yet — Verify runs it" };
+  }
+  if (last.harness !== harness) {
+    // One Mac keeps one probe file. Another pack's round trip is real evidence
+    // about this Mac and none at all about this pack, so it is reported as
+    // what it is rather than borrowed as a green tick here.
+    const other = LABEL[last.harness as HarnessId] ?? last.harness ?? "another pack";
+    return {
+      mark: "off",
+      text:
+        `Not verified on this pack yet — the last probe on this Mac ran for ${other}` +
+        (stored?.age_seconds != null ? `, ${fmtAge(stored.age_seconds)} ago` : ""),
+    };
   }
   if (last.status === "skipped") {
     return {
@@ -222,7 +240,7 @@ export function verifiedLine(
       mark: stored?.ok === false ? "warn" : "ok",
       text:
         `Verified ${age != null ? `${fmtAge(age)} ago` : "at an unknown time"}` +
-        (last.seconds != null ? ` · ${last.seconds}s round trip` : "") +
+        (last.seconds != null ? ` · ${fmtSeconds(last.seconds)} round trip` : "") +
         (stored?.ok === false ? " — older than a week, run Verify" : ""),
     };
   }

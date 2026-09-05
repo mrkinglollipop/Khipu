@@ -559,7 +559,8 @@ input.mono {
   min-width: 80px;
 }
 
-.toolbar input[type="checkbox"] {
+.toolbar input[type="checkbox"],
+.toolbar input[type="radio"] {
   flex: none;
   min-width: 0;
   width: auto;
