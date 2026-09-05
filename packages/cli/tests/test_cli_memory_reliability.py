@@ -188,23 +188,32 @@ class EpisodeEditCommandTest(unittest.TestCase):
 
 
 class EpisodeForgetCommandTest(unittest.TestCase):
-    def test_forget_soft_deletes_and_removes_embeddings(self):
-        cur = _FakeCur([
-            ("UPDATE episodes SET deleted_at", {"rowcount": 1}),
-            ("DELETE FROM memory_embeddings WHERE kind = 'episode'", {"rowcount": 3}),
+    """`khipu episode forget` goes through khipu.forget (2026-09-05): row,
+    vectors, the commitments it opened, and the legacy file line."""
+
+    def _script(self, *, soft: int, vectors: int):
+        return _FakeCur([
+            ("SELECT ts, summary, session_id FROM episodes",
+             {"row": ("2026-09-05T12:00:00+00:00", "a summary", "claude_code:x")}),
+            ("UPDATE episodes SET deleted_at", {"rowcount": soft}),
+            ("DELETE FROM memory_embeddings WHERE kind = 'episode'", {"rowcount": vectors}),
+            ("DELETE FROM memory_embeddings WHERE kind = 'commitment'", {"rowcount": 0}),
+            ("UPDATE commitments SET status = 'closed'", {"rowcount": 1}),
         ])
-        rc, out = _run(["episode", "forget", "42"], cur)
+
+    def test_forget_soft_deletes_and_removes_embeddings(self):
+        with mock.patch("khipu.config.path_setting", return_value=None):
+            rc, out = _run(["episode", "forget", "42"], self._script(soft=1, vectors=3))
         self.assertEqual(rc, 0)
         self.assertTrue(out["ok"])
         self.assertTrue(out["soft_deleted"])
         self.assertEqual(out["embeddings_removed"], 3)
+        self.assertEqual(out["commitments_closed"], 1)
+        self.assertEqual(out["legacy_file"]["removed"], 0)
 
     def test_already_deleted_episode_reports_false_but_ok(self):
-        cur = _FakeCur([
-            ("UPDATE episodes SET deleted_at", {"rowcount": 0}),
-            ("DELETE FROM memory_embeddings WHERE kind = 'episode'", {"rowcount": 0}),
-        ])
-        rc, out = _run(["episode", "forget", "42"], cur)
+        with mock.patch("khipu.config.path_setting", return_value=None):
+            rc, out = _run(["episode", "forget", "42"], self._script(soft=0, vectors=0))
         self.assertEqual(rc, 0)
         self.assertFalse(out["soft_deleted"])
 

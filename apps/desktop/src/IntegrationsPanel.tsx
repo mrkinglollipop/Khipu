@@ -33,6 +33,7 @@ type StatusRow = {
   mcp: boolean;
   hook_stop: boolean;
   hook_precompact: boolean;
+  hook_sessionend?: boolean;
   recall_rule: string;
   /** "legacy" = the harness's existing hooks extract; "installed"/"missing" = Khipu's own (Aegis). */
   extract?: string;
@@ -106,6 +107,21 @@ export type RecallProbeStatus = {
     seconds?: number;
     error?: string | null;
   } | null;
+  /** Each pack's own last probe (`probe-<harness>.json`), so a card can say
+   *  "verified" from its own evidence even when another pack ran last. */
+  harnesses?: Record<
+    string,
+    {
+      ok?: boolean;
+      status?: string;
+      ts?: string;
+      seconds?: number;
+      error?: string | null;
+      reason?: string | null;
+      age_seconds?: number | null;
+      stale?: boolean;
+    }
+  >;
 };
 
 const LABEL: Record<HarnessId, string> = {
@@ -210,6 +226,29 @@ export function verifiedLine(
     return {
       mark: "err",
       text: `Verify failed — ${(fresh.error ?? fresh.reason ?? "the capture never became findable").slice(0, 120)}`,
+    };
+  }
+  const own = stored?.harnesses?.[harness];
+  if (own && own.ts) {
+    if (own.status === "skipped") {
+      return {
+        mark: "off",
+        text: `Recall probe skipped — ${own.reason ?? "legacy capture mode writes no database row"}`,
+      };
+    }
+    const ownAge = own.age_seconds;
+    if (own.ok) {
+      return {
+        mark: own.stale ? "warn" : "ok",
+        text:
+          `Verified ${ownAge != null ? `${fmtAge(ownAge)} ago` : "at an unknown time"}` +
+          (own.seconds != null ? ` · ${fmtSeconds(own.seconds)} round trip` : "") +
+          (own.stale ? " — older than a week, run Verify" : ""),
+      };
+    }
+    return {
+      mark: "err",
+      text: `Last verify failed${ownAge != null ? ` ${fmtAge(ownAge)} ago` : ""} — ${(own.error ?? own.reason ?? "the capture never became findable").slice(0, 120)}`,
     };
   }
   const last = stored?.last_probe;

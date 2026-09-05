@@ -10,7 +10,10 @@ Packs:
   claude_code  ~/.claude.json mcpServers.khipu
                ~/.claude/settings.json hooks.Stop / hooks.PreCompact → khipu-stop-hook
   cursor       ~/.cursor/mcp.json mcpServers.khipu
-               ~/.cursor/hooks.json hooks.stop / hooks.preCompact → khipu-stop-hook
+               ~/.cursor/hooks.json hooks.stop / hooks.preCompact / hooks.sessionEnd →
+                 khipu-stop-hook (sessionEnd verified 2026-09-05 against Cursor's own
+                 app bundle, which names a sessionEnd hook event — the "quit without
+                 stopping/compacting" net, same rationale as Claude Code's SessionEnd)
                ~/.cursor/hooks.json hooks.sessionStart += khipu-recall-hook
                  (--cursor → additional_context; timeout 30s for PG;
                  does not replace existing harness sessionStart entries)
@@ -360,7 +363,7 @@ def _cursor_install(dry: bool, project: str | None = None) -> dict:
     h = _load_json(CURSOR_HOOKS)
     hooks = h.setdefault("hooks", {})
     changed = False
-    for event in ("stop", "preCompact"):
+    for event in ("stop", "preCompact", "sessionEnd"):
         entries = hooks.setdefault(event, [])
         if not any(_is_ours(e.get("command")) for e in entries):
             entries.append({"command": stop_hook(), "timeout": 20})
@@ -417,7 +420,7 @@ def _cursor_uninstall(dry: bool, project: str | None = None) -> dict:
             _write_json(CURSOR_MCP, d)
     h = _load_json(CURSOR_HOOKS)
     changed = False
-    for event in ("stop", "preCompact", "sessionStart"):
+    for event in ("stop", "preCompact", "sessionEnd", "sessionStart"):
         entries = h.get("hooks", {}).get(event, [])
         if event == "sessionStart":
             kept = [e for e in entries if not _is_our_recall(e.get("command"))]
@@ -445,6 +448,7 @@ def _cursor_status() -> dict:
     return {"harness": "cursor", "detected": _cursor_detected(),
             "mcp": d.get("mcpServers", {}).get("khipu", {}).get("command") == mcp_launcher(),
             "hook_stop": has("stop"), "hook_precompact": has("preCompact"),
+            "hook_sessionend": has("sessionEnd"),
             "hook_sessionstart": has_recall("sessionStart"),
             "recall_rule": "project_scoped",
             "extract": "installed" if has("stop") and has("preCompact") else "missing"}

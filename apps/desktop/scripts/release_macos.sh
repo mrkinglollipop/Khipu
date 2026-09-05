@@ -383,6 +383,13 @@ notarize_dmg() {
 
 notarize_dmg "$DMG"
 
+# The notarization ticket covers the .app inside the DMG; staple it to the
+# bundle too, then rebuild the updater tarball from the STAPLED app so a
+# post-update first launch does not need the network for Gatekeeper.
+xcrun stapler staple "$BUNDLE"
+xcrun stapler validate "$BUNDLE"
+repack_updater_artifacts "$BUNDLE"
+
 if [[ "$INSTALL_APPS" -eq 1 ]]; then
   # /Applications delivery is the documented install path.
   rm -rf /Applications/Khipu.app
@@ -397,6 +404,10 @@ if [[ "$PUBLISH" -eq 1 ]]; then
   fi
   if ! dmg_is_stapled "$DMG"; then
     echo "refusing --publish: $DMG is not Apple-stapled (stapler validate failed)" >&2
+    exit 1
+  fi
+  if ! xcrun stapler validate "$BUNDLE" >/dev/null 2>&1; then
+    echo "refusing --publish: $BUNDLE is not stapled" >&2
     exit 1
   fi
   # One release per version: versioned DMG + stable `Khipu_aarch64.dmg` alias

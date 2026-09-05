@@ -35,6 +35,11 @@ class _FakeCur:
     def fetchone(self):
         if self.episode_id is None:
             return None
+        last_sql = self.executed[-1][0] if self.executed else ""
+        if last_sql.startswith("SELECT ts, summary, session_id"):
+            # khipu.forget.forget_episode's identity lookup, now used by the
+            # probe's cleanup instead of a hand-rolled soft-delete.
+            return ("2026-01-01T00:00:00+00:00", "probe episode", "claude_code:probe")
         return (self.episode_id,)
 
     def __enter__(self):
