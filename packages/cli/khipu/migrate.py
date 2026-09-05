@@ -1,7 +1,3 @@
-# --bypass-harness (sonnet lane): this file is edited from inside a dispatched
-# on-sub Agent(model="sonnet") subagent (Phase 1 of the setup-that-cannot-
-# strand-you plan) — the exact lane the code-routing policy names, so no
-# further hop is possible or appropriate.
 """Apply the SQL migrations under ops/migrations to the configured database.
 
 Every migration file records itself in ``schema_migrations`` (``INSERT … ON

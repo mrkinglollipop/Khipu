@@ -39,6 +39,7 @@ import type { LivenessPayload, RecallProbeStatus } from "./IntegrationsPanel";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
 import { buildAttention, harnessLabel, type Attention } from "./doctorAttention";
+import { HealthReportRows } from "./healthRows";
 import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVerify";
 import { WorkingBanner } from "./WorkingBanner";
 import { FeedbackForm } from "./FeedbackForm";
@@ -967,13 +968,17 @@ export default function App() {
     Array<{ id: number; summary?: string; ts?: string; scope?: string }>
   >([]);
   const [doctorText, setDoctorText] = useState("…");
+  // The same report as `doctorText`, parsed — `HealthReportRows` iterates its
+  // `*_ok` fields directly rather than re-parsing the pretty-printed string.
+  const [doctorParsed, setDoctorParsed] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
   const [doctorOk, setDoctorOk] = useState<boolean | null>(null);
-  // Named failures, so a red Doctor says WHAT is red without a trip to the raw
-  // JSON. Capture liveness is the one that matters most: a harness whose
-  // hook runs but records nothing must be loud here (2026-08-17).
-  const [doctorIssues, setDoctorIssues] = useState<string[]>([]);
-  // The same failures as `doctorIssues`, but shaped for Home: plain-language
-  // title, the cause in a sentence, and at most one fix action.
+  // Plain-language failures derived from the doctor report: title, the cause
+  // in a sentence, and at most one fix action. Home's attention callouts and
+  // the health report's red rows (`healthRows.tsx`) both read this so the
+  // wording never drifts between the two (2026-08-17 / 2026-09-05).
   const [attention, setAttention] = useState<Attention[]>([]);
   const [doctorCheckCount, setDoctorCheckCount] = useState(0);
   // Home's four tiles read these straight off the doctor payload; nothing here
@@ -1339,8 +1344,9 @@ export default function App() {
         return;
       }
       setDoctorText(prettyJson(raw));
+      setDoctorParsed(parsed as Record<string, unknown>);
       setDoctorOk(typeof parsed.ok === "boolean" ? parsed.ok : null);
-      const { issues, items } = buildAttention(parsed as Record<string, unknown>);
+      const { items } = buildAttention(parsed as Record<string, unknown>);
       const lv = (parsed as { capture_liveness?: LivenessPayload })
         .capture_liveness;
       setLiveness(lv ?? null);
@@ -1397,7 +1403,6 @@ export default function App() {
         graph_sqlite: (parsed as { graph_drift?: { skipped?: string } })
           .graph_drift?.skipped,
       });
-      setDoctorIssues(issues);
       setAttention(items);
       // The number of boolean `*_ok` verdicts in this report — what "all
       // checks passed" is actually a claim about.
@@ -3377,24 +3382,26 @@ export default function App() {
               </div>
 
               <div className="rows-head">Full health report</div>
-              {doctorIssues.length ? (
-                <div className="rows">
-                  {doctorIssues.map((issue) => (
-                    <div key={issue} className="row-item">
-                      <TriangleAlert
-                        size={16}
-                        strokeWidth={1.75}
-                        aria-hidden
-                        className="warn"
-                      />
-                      <span className="row-main">{issue}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-              <RawBlock text={doctorText} />
-              <div className="rows-head">Database report</div>
-              <RawBlock text={statusText} />
+              <HealthReportRows
+                parsed={doctorParsed ?? {}}
+                attention={attention}
+                busy={actionBusy || probeBusy}
+                onFixAction={(fix, harness) => {
+                  if (fix.kind === "reinstall-hook" && harness) {
+                    void reinstallHook(harness);
+                  } else if (fix.kind === "recall-probe") {
+                    void runRecallProbe();
+                  } else if (fix.kind === "revisions") {
+                    setTab("revisions");
+                  }
+                }}
+              />
+              <Disclosure label="Raw report">
+                <div className="rows-head">Doctor report</div>
+                <RawBlock text={doctorText} />
+                <div className="rows-head">Database report</div>
+                <RawBlock text={statusText} />
+              </Disclosure>
             </Disclosure>
           </div>
         </section>
