@@ -350,3 +350,71 @@ class GrokBotPackTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GatewayHardeningTest(unittest.TestCase):
+    """Audit 2026-09-04 §3: Origin check, per-token budget, public healthz."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = _free_port()
+        gw.Handler.token = TOKEN
+        gw.Handler.tokens = {"grokbot": "second-unit-test-token-0123456789"}
+        gw.Handler.rate = gw._Rate(1000)
+        gw.Handler.token_rate = gw._Rate(1000)
+        gw.Handler.auth_fail_rate = gw._Rate(1000)
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", cls.port), gw.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.url = f"http://127.0.0.1:{cls.port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        gw.Handler.tokens = {}
+
+    def _ping(self, **kw):
+        return _post(self.url + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "ping"}, **kw)[0]
+
+    def test_a_browser_origin_is_refused_unless_allowlisted(self):
+        self.assertEqual(self._ping(), 200)
+        self.assertEqual(self._ping(headers={"Origin": "https://evil.example"}), 403)
+        with mock.patch.object(gw, "ALLOWED_ORIGINS", {"https://app.example"}):
+            self.assertEqual(self._ping(headers={"Origin": "https://app.example/"}), 200)
+            self.assertEqual(self._ping(headers={"Origin": "https://evil.example"}), 403)
+
+    def test_each_token_has_its_own_budget(self):
+        old = gw.Handler.token_rate
+        gw.Handler.token_rate = gw._Rate(2)
+        try:
+            a = [self._ping() for _ in range(3)]
+            b = [self._ping(token="second-unit-test-token-0123456789") for _ in range(3)]
+        finally:
+            gw.Handler.token_rate = old
+        self.assertEqual(a, [200, 200, 429])
+        self.assertEqual(b, [200, 200, 429])  # the second token was not starved by the first
+        self.assertEqual(self._ping(token="wrong-token-wrong-token-wrong-token"), 401)
+
+    def test_public_healthz_is_bare_and_loopback_or_token_gets_the_build(self):
+        def get(headers=None):
+            req = urllib.request.Request(self.url + "/healthz", headers=headers or {})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return json.loads(r.read())
+
+        # Direct loopback (the deploy script on the host): full answer.
+        self.assertIn("build", get())
+        # Through the proxy from the internet: liveness only.
+        public = get({"X-Forwarded-For": "203.0.113.9"})
+        self.assertEqual(public, {"ok": True})
+        # A token holder through the proxy: full answer.
+        self.assertIn("build", get({"X-Forwarded-For": "203.0.113.9",
+                                    "Authorization": f"Bearer {TOKEN}"}))
+
+    def test_parse_tokens(self):
+        toks = gw.parse_tokens("grokbot:abcdefghijklmnopqrstuvwxyz0123, short:tiny, "
+                               "zyxwvutsrqponmlkjihgfedcba9876543210")
+        self.assertEqual(toks["grokbot"], "abcdefghijklmnopqrstuvwxyz0123")
+        self.assertNotIn("short", toks)
+        self.assertEqual(len(toks), 2)
+        self.assertTrue(any(k.startswith("tok-") for k in toks))

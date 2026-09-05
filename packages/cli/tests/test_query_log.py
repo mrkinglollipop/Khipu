@@ -136,3 +136,24 @@ class RotationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RedactedQueryLogTest(unittest.TestCase):
+    def test_redact_stores_hash_and_length_never_text(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from khipu import query_log as ql
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "query_log.jsonl"
+            with mock.patch.object(ql, "log_path", lambda: path), \
+                    mock.patch("khipu.paths.ensure_data_dir", lambda: Path(tmp)):
+                ql.log_query("what did we decide about the DSN", mode="hybrid",
+                             result_count=2, redact=True)
+            line = json.loads(path.read_text().splitlines()[-1])
+        self.assertIsNone(line["query"])
+        self.assertEqual(line["query_len"], len("what did we decide about the DSN"))
+        self.assertEqual(len(line["query_sha256"]), 16)
+        self.assertNotIn("DSN", path.read_text() if path.exists() else "")

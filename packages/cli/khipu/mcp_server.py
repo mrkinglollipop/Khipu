@@ -402,6 +402,8 @@ def _tool_search(args: dict) -> dict:
         filters={"kind": kind, "project": project, "since": since, "until": until,
                  "session_id": session_id, "harness": harness},
         result_count=len(payload.get("results") or []), top=payload.get("results") or [],
+        # The gateway host is public: it keeps a hash of the query, never the text.
+        redact=_GATEWAY_ACTIVE or os.environ.get(GATEWAY_ACTIVE_ENV) == "1",
     )
     return payload
 
