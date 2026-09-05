@@ -357,106 +357,119 @@ person's servers, not the product.
 
 ## Setting it up
 
-Khipu is a personal system: one database, your machines, your agents. On a new
-Mac, install the desktop app first — cloning the repo is only for developers.
+Khipu is a personal system: one database, your machines, your agents. Install
+the desktop app — it walks you through the rest. Cloning the repo is only for
+developers and self-hosters (see below).
 
-**Requirements.** macOS on Apple silicon (the desktop app and Keychain
-integration are Mac-only), **PostgreSQL 19 with pgvector** (local Docker or
-your own server — SQL/PGQ property graphs need 19), and optionally Gemini or a
-local model for summaries and search. The in-app Welcome flow covers Postgres,
-models, Graphify, and agent wiring.
+**Requirements.** macOS on Apple silicon (the desktop app and its Keychain
+integration are Mac-only). Everything else — where the database lives, which
+model to use — is a choice the app walks you through; nothing needs deciding
+in advance.
 
-### Install the desktop app (recommended)
+### Install the desktop app
 
-1. Download **`Khipu_0.3.14_aarch64.dmg`** from the
-   [v0.3.14 release](https://github.com/mrkinglollipop/Khipu/releases/tag/v0.3.14)
-   (GitHub `/releases/latest` now points here), or use
-   [kinglollipop.com/khipu/download](https://kinglollipop.com/khipu/download).
+1. Download the latest `Khipu_*.dmg` from the
+   [GitHub releases page](https://github.com/mrkinglollipop/Khipu/releases/latest),
+   or [kinglollipop.com/khipu/download](https://kinglollipop.com/khipu/download).
 2. Open the DMG and drag **Khipu.app** to **Applications**.
-3. Launch **Khipu** from Applications and complete Welcome (database, model,
-   graph builder, agents).
+3. Launch **Khipu**. First launch opens **Welcome**, a short walkthrough:
+   Database, Model, Graph, Agents, Finish. Every step ends in one of three
+   states, shown plainly on screen: **working** (a real check passed, not
+   just "saved"), **needs you** (one plain-words action — never a raw error
+   code), or **fixing it…** (the app is doing the work; wait it out).
 
-The app has six screens, one per job: **Home** (is memory working right now —
-health and counts in one place), **Recall** (ask what it remembers, and walk
-the connections), **Owed** (what you still owe on each project, "Needs you"
-first), **Activity** (every session it recorded), **Harnesses** (which agents
-are wired in, and whether each is actually recording), and **Settings**
-(database, capture and models, search index, data and backups, another Mac,
-components, updates, advanced).
+Six screens after that, one per job: **Home** (is memory working right now),
+**Recall** (ask what it remembers), **Owed** (what you still owe on each
+project), **Activity** (every session it recorded), **Harnesses** (which
+agents are wired in and actually recording), and **Settings**.
 
-The app **updates itself** from GitHub Releases using a signed
-**`Khipu.app.tar.gz`** — not the DMG. Postgres / pgvector / Graphify version
-compat is fetched from
-[`mrkinglollipop/khipu-compat`](https://github.com/mrkinglollipop/khipu-compat).
-
-**Gatekeeper:** the **v0.3.0** DMG is **notarized Developer ID** (stapled)
-once that tag is published. Older releases (e.g. 0.2.9) were Developer ID
-without notarization — if macOS blocks those, right-click **Khipu.app** →
-**Open** once. See
+The app updates itself from GitHub Releases. Gatekeeper: if macOS blocks an
+older, non-notarized release, right-click **Khipu.app** → **Open** once. See
 [`apps/desktop/README.md`](apps/desktop/README.md).
 
-### Developer setup
+### The Database step — three choices, one proof each
 
-Clone the repo if you are hacking on Khipu itself or running the CLI outside the
-bundled app:
+Whichever you pick, it ends the same way: the schema is current, the three
+background upkeep jobs are scheduled, and a real memory round trip is proved
+— written, found by search, shown as a timed line ("1.8 s"), not a checkmark.
+
+- **Join another Mac.** Pick this if a Mac in your life already runs Khipu —
+  you want the *same* memory, not a second one. On the working Mac: Settings
+  → Another Mac → **Save join kit…**, then AirDrop the file (or use the
+  six-digit PIN over the same Wi‑Fi). On the new Mac: Welcome → **Join
+  existing Khipu**. Proves: the copied counts match the source exactly.
+- **Set up a new database on this Mac.** Pick this if nobody has Khipu yet.
+  Needs [Docker Desktop](https://docs.docker.com/desktop/setup/install/mac-install/)
+  (or OrbStack/Colima) — the app notices once it's installed and turns the
+  button on by itself. Proves: a backup was taken and test-restored. A
+  database set up this way lives on this Mac's disk only — another Mac can't
+  reach it directly; use **Join another Mac** there instead, or move it later
+  (below).
+- **Connect to a server you run.** Pick this for a Postgres server you
+  already host — your own machine, a cloud VM, a managed provider. Paste its
+  connection string ("looks like `postgresql://user:pass@host:5432/dbname`;
+  your host shows this under connection details"). Needs Postgres 19+ with
+  the `vector` extension, reachable from every Mac that will use Khipu.
+  Proves: the server answers, the account has enough privilege, and the
+  schema is current.
+
+### Model, Graph, Agents, Finish
+
+**Model** (optional — Skip for now is always there): paste a cloud Gemini key
+or point at a local OpenAI-compatible endpoint. The key is proven with one
+real, cheap call the moment you save it — "Key works · gemini-embedding-2",
+not just "saved". **Graph** installs the connections builder next to the app
+(also skippable; add it later from Settings → Components). **Agents** wires
+Claude Code, Cursor, Aegis and Codex — one Install per harness; restart that
+harness, start any session, and its card turns green by itself, no extra
+click needed. **Finish** lists anything still unproven with its one fix, and
+**Continue anyway** always works — nothing on this screen can leave you
+stuck.
+
+### Moving your memory to another database
+
+Settings → **Database** → **Move this memory to another database…**. Point
+it at the target — a new local database, or a server. It checks the target
+first, without touching anything. Confirm, and it copies every table,
+verifies the row counts match, then switches over; the old database is left
+untouched. Afterward, any other Mac needs a fresh join kit from the new one.
+
+### Developer and self-host setup
+
+Clone the repo to hack on Khipu itself, run the CLI outside the bundled app,
+or run the pieces the desktop app doesn't cover (the cloud-agent gateway):
 
 ```bash
 git clone https://github.com/mrkinglollipop/Khipu.git && cd Khipu
 python3.11 -m pip install --target .python_libs -r packages/cli/requirements.txt
 ```
 
-`.python_libs/` is per-machine (compiled wheels) and git-ignored. Everything
-below assumes `PYTHONPATH="packages/cli:.python_libs"` and `python3.11 -m khipu`;
-put a `khipu` alias in your shell if you like.
-
-**1. Point it at your database.** The connection string goes in the login
-Keychain (the password never touches a config file or `ps` output):
-
-```bash
-printf '%s' 'postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=verify-full&sslrootcert=/path/root.crt' | khipu secrets --set database_url
-```
-
-Run Postgres somewhere only your machines can reach (a Tailscale network works
-well); never on a public port. A Dockerfile for PG 19 + pgvector is in
-[`ops/docker/`](ops/docker/).
-
-**2. Apply the schema.**
+`.python_libs/` is per-machine and git-ignored. Everything below assumes
+`PYTHONPATH="packages/cli:.python_libs"` and `python3.11 -m khipu` (alias it
+to `khipu` if you like). A Dockerfile for Postgres 19 + pgvector is in
+[`ops/docker/`](ops/docker/) — the same image the app's own "set up a new
+database" button builds.
 
 ```bash
-khipu migrate            # --dry-run to see what would change
+# Point at your database — the password goes in the Keychain, never a file or ps output.
+printf '%s' 'postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=verify-full&sslrootcert=/path/root.crt' \
+  | khipu secrets --set database_url
+khipu migrate                              # apply the schema; --dry-run to preview
+khipu integrations install claude_code     # or cursor, codex, aegis
+khipu integrations verify  claude_code     # proves it by exercising it, not by checking a file exists
 ```
 
-**3. Give it a model.** Session summaries and semantic search can use cloud
-Gemini, a local OpenAI-compatible endpoint, or be deferred — capture queues
-safely until credentials exist. Paste keys in the app (Settings → **Capture &
-models** or Welcome → Model), or:
+Then `khipu doctor` should be green. Anything it could not check is named
+under `not_configured` — normal on a fresh install.
 
-```bash
-printf '%s' 'YOUR-GEMINI-KEY' | khipu secrets --set gemini_api_key
-```
-
-Gemini is the convenient default, not a requirement.
-
-**4. Wire in your agents.** One command per harness writes the hook and MCP
-config; `verify` proves it works by exercising it, not by checking a file exists.
-
-```bash
-khipu integrations install claude_code    # or cursor, codex, aegis
-khipu integrations verify  claude_code
-```
-
-Then `khipu doctor` should be green. It names anything it could not check under
-`not_configured` — on a fresh install that is the legacy file-wiki checks, which
-only apply if you are migrating from a pile of markdown (see `khipu config`).
-
-**Build the desktop app locally:** `cd apps/desktop && npm install &&
-npm run tauri dev` (needs Rust and Xcode command-line tools). Release builds:
+**Build the desktop app locally:** `cd apps/desktop && npm install && npm run
+tauri dev` (needs Rust and Xcode command-line tools). Release builds:
 [`apps/desktop/README.md`](apps/desktop/README.md).
 
 **Cloud agents (Grok Bot / Cursor cloud) — optional.** These run on ephemeral
-VMs with no filesystem to install hooks into, so they reach Khipu through the
-HTTPS gateway instead. This is the one component built to face the internet, and
-it exists so the database never has to. Set it up once, next to the database:
+VMs with no filesystem to install hooks into, so they reach Khipu through an
+HTTPS gateway instead — the one component meant to face the internet, so the
+database never has to:
 
 ```bash
 docker build -f ops/docker/Dockerfile.gateway -t khipu/gateway .
@@ -467,11 +480,10 @@ docker run -d --name khipu-gateway --network host \
   khipu/gateway
 ```
 
-It listens on `127.0.0.1:8787` only; put a TLS-terminating reverse proxy in
-front (Caddy or nginx with a real certificate) and give it a hostname. The token
-must be at least 24 characters — the gateway refuses to start otherwise — and it
-is the only credential a cloud agent ever holds; Postgres stays private. Then,
-on your Mac:
+It listens on `127.0.0.1:8787` only; put a TLS-terminating reverse proxy
+(Caddy or nginx, a real certificate) in front. The token must be at least 24
+characters and is the only credential a cloud agent ever holds — Postgres
+stays private. Then, on your Mac:
 
 ```bash
 khipu config --set-gateway-url https://khipu.example.com
@@ -480,25 +492,8 @@ khipu integrations verify grok_bot                            # probes the publi
 ```
 
 Add the same token as a secret named `KHIPU_GATEWAY_TOKEN` in Cursor's cloud
-agent settings; the repo's `.cursor/mcp.json` references it as
-`${env:KHIPU_GATEWAY_TOKEN}` and never contains the value. Local harnesses do
-not use the gateway at all.
-
-**A second Mac** joins the same hub — it does not create a new empty database.
-
-1. On the Mac that already works: Settings → **Another Mac** →
-   **Save join kit…** and AirDrop the `.khipujoin` file. Passphrase is optional.
-   Nearby PIN is optional (same Wi‑Fi).
-2. On the new Mac: Welcome → **Join existing Khipu** → **Import join kit file…**.
-   Only enter a passphrase if you set one when saving. PIN is not required.
-3. Guest / client-isolated Wi‑Fi will fail nearby join — use the file.
-
-That rewrites the TLS cert path for this machine, stores the DSN in Keychain,
-and verifies live episode counts against the kit. Localhost Postgres cannot be
-joined from another computer — the hub must be reachable (Tailscale, WireGuard,
-SSH tunnel, or a shared server). After join, optionally add folders on this Mac
-so Graphify feeds only those sources into the shared graph (scoped delete — it
-will not purge the other Mac’s nodes).
+agent settings; `.cursor/mcp.json` references it as `${env:KHIPU_GATEWAY_TOKEN}`
+and never contains the value. Local harnesses never use the gateway.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request.
 

@@ -651,3 +651,44 @@ class UnreadableConfigTest(_TempHomeCase):
             integ.install("aegis")
         self.assertIn(nasty, integ.AEGIS_TOML.read_text())
 
+
+
+class LastBeatAtTest(_TempHomeCase):
+    """`status()` now carries `last_beat_at` for every harness (docs/plans/
+    2026-09-05-setup-that-cannot-strand-you.md, "Harness auto-verify"): the
+    Harnesses pane polls this so a card can flip to Verified on its own once
+    a real hook dispatch lands after Install, without a manual Verify click."""
+
+    def test_status_reports_the_last_real_capture_over_a_bare_dispatch(self):
+        beat = {"last_captured_at": "2026-09-04T00:00:00Z", "at": "2026-09-04T00:05:00Z"}
+        with mock.patch("khipu.session_capture._read_beat", return_value=beat):
+            st = integ.status("claude_code")
+        self.assertEqual(st["last_beat_at"], "2026-09-04T00:00:00Z")
+
+    def test_status_falls_back_to_the_bare_dispatch_when_nothing_was_captured(self):
+        with mock.patch("khipu.session_capture._read_beat", return_value={"at": "2026-09-04T00:05:00Z"}):
+            st = integ.status("claude_code")
+        self.assertEqual(st["last_beat_at"], "2026-09-04T00:05:00Z")
+
+    def test_status_last_beat_at_is_none_when_the_hook_has_never_run(self):
+        with mock.patch("khipu.session_capture._read_beat", return_value={}):
+            st = integ.status("claude_code")
+        self.assertIsNone(st["last_beat_at"])
+
+
+class StatusInstalledFlagTest(unittest.TestCase):
+    def test_installed_is_derived_the_same_way_for_every_surface(self):
+        from unittest import mock
+
+        from khipu import integrations as integ
+
+        cases = (
+            ("claude_code", {"mcp": True, "hook_stop": True, "hook_precompact": True}, True),
+            ("cursor", {"mcp": True, "hook_stop": True, "hook_precompact": False}, False),
+            ("grok_bot", {"mcp": True, "hook_stop": False, "hook_precompact": False}, True),
+        )
+        for harness, raw, want in cases:
+            with mock.patch.object(integ, "_guarded", return_value=dict(raw)), \
+                    mock.patch.object(integ, "_last_beat_at", return_value=None):
+                out = integ.status(harness)
+            self.assertEqual(out.get("installed"), want, (harness, out))

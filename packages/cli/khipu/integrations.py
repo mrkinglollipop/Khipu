@@ -1336,10 +1336,44 @@ def uninstall(harness: str, *, dry_run: bool = False, project: str | None = None
     return _guarded(harness, _UNINSTALL[harness], dry_run)
 
 
+def _last_beat_at(harness: str) -> str | None:
+    """The newest evidence that this harness's capture hook actually ran, for
+    the Harnesses pane's auto-verify (docs/plans/2026-09-05-setup-that-cannot-
+    strand-you.md, "Harness auto-verify"): a card can flip to Verified on its
+    own once this timestamp is newer than the moment Install ran, without
+    waiting for a manual Verify click. Prefers the last real CAPTURE
+    (`last_captured_at` — a session actually landed in the database) over the
+    last bare dispatch (`at` — the hook merely ran), since a dispatch with
+    nothing to capture is weaker evidence than a capture. `grok_bot` has no
+    local hook (session_capture.HARNESSES does not include it), so this is
+    always ``None`` there — the gateway probe is its only evidence."""
+    try:
+        from khipu.session_capture import _read_beat
+
+        beat = _read_beat(harness)
+    except Exception:  # noqa: BLE001 — a beat-read failure must not break status()
+        return None
+    at = beat.get("last_captured_at") or beat.get("at")
+    return at if isinstance(at, str) else None
+
+
 def status(harness: str, *, project: str | None = None) -> dict:
     if harness == "grok_bot":
-        return _guarded(harness, _grok_bot_status, project)
-    return _guarded(harness, _STATUS[harness])
+        out = _guarded(harness, _grok_bot_status, project)
+    else:
+        out = _guarded(harness, _STATUS[harness])
+    if isinstance(out, dict) and "last_beat_at" not in out:
+        out["last_beat_at"] = _last_beat_at(harness)
+    if isinstance(out, dict) and "installed" not in out:
+        # One rule for every surface (the desktop's Harnesses cards used to
+        # derive this themselves while the first-run Agents step read a field
+        # nobody set, and showed "found, not installed" for installed packs —
+        # 2026-09-05). Gateway packs have no hooks: MCP alone is the install.
+        if harness == "grok_bot":
+            out["installed"] = bool(out.get("mcp"))
+        else:
+            out["installed"] = bool(out.get("mcp") and out.get("hook_stop") and out.get("hook_precompact"))
+    return out
 
 
 def status_all() -> list[dict]:

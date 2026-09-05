@@ -37,6 +37,14 @@ type StatusRow = {
   recall_rule: string;
   /** "legacy" = the harness's existing hooks extract; "installed"/"missing" = Khipu's own (Aegis). */
   extract?: string;
+  /** Newest evidence the capture hook actually ran for this harness
+   *  (`khipu.integrations._last_beat_at`, ISO 8601) — the auto-verify signal
+   *  (docs/plans/2026-09-05-setup-that-cannot-strand-you.md, "Harness
+   *  auto-verify"): newer than the moment Install ran means a real session
+   *  fired the hook since, so the card can flip to Verified on its own.
+   *  `null`/absent means the hook has never run (or, for grok_bot, that
+   *  there is no local hook to run). */
+  last_beat_at?: string | null;
 };
 
 type Probe = {
@@ -314,6 +322,12 @@ export function IntegrationsPanel({
   const [verify, setVerify] = useState<Record<string, VerifyRow>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // "Harness auto-verify": the moment each harness was last Installed, and
+  // which harnesses have since flipped to Verified on their own because a
+  // real session's hook dispatch (or capture) landed after that moment —
+  // docs/plans/2026-09-05-setup-that-cannot-strand-you.md.
+  const [installedAt, setInstalledAt] = useState<Record<string, number>>({});
+  const [autoVerified, setAutoVerified] = useState<Record<string, boolean>>({});
 
   const load = useCallback(async () => {
     setLoadError(null);
@@ -338,6 +352,49 @@ export function IntegrationsPanel({
     void load();
   }, [active, load]);
 
+  // Poll while the tab is open, and again on window focus (the harness was
+  // very possibly restarted and used while this Mac's screen was elsewhere)
+  // — the same cadence Owed uses for its own "does it update near
+  // immediately?" refresh. No manual click required for a card to notice a
+  // fresh capture landed.
+  useEffect(() => {
+    if (!active) return;
+    const every = window.setInterval(() => void load(), 15_000);
+    const onFocus = () => void load();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.clearInterval(every);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [active, load]);
+
+  // A card flips to Verified on its own once real evidence lands AFTER
+  // Install ran: either `last_beat_at` (the capture hook actually firing) or
+  // the stored end-to-end probe for this harness, whichever is newer. Once
+  // flipped, stays flipped for the rest of this pane's lifetime — evidence
+  // does not un-happen.
+  useEffect(() => {
+    if (!rows) return;
+    setAutoVerified((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const r of rows) {
+        if (next[r.harness]) continue;
+        const since = installedAt[r.harness];
+        if (since == null) continue;
+        const beatAt = r.last_beat_at ? Date.parse(r.last_beat_at) : NaN;
+        const probeAt = recallProbe?.harnesses?.[r.harness]?.ok
+          ? Date.parse(recallProbe.harnesses[r.harness]?.ts ?? "")
+          : NaN;
+        if ((!Number.isNaN(beatAt) && beatAt > since) || (!Number.isNaN(probeAt) && probeAt > since)) {
+          next[r.harness] = true;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [rows, installedAt, recallProbe]);
+
   const act = useCallback(
     async (harness: HarnessId | "all", cmd: "install" | "verify" | "uninstall") => {
       setBusy(`${cmd}:${harness}`);
@@ -361,7 +418,17 @@ export function IntegrationsPanel({
               return next;
             });
           }
-          onToast("Installed. Restart each harness to load the change.");
+          const installedAtNow = Date.now();
+          setInstalledAt((prev) => {
+            const next = { ...prev };
+            const targets = harness === "all" ? (rows ?? []).map((r) => r.harness) : [harness];
+            for (const h of targets) {
+              next[h] = installedAtNow;
+              setAutoVerified((av) => (av[h] ? { ...av, [h]: false } : av));
+            }
+            return next;
+          });
+          onToast("Installed. Restart each harness, then start any session — its card turns green by itself.");
         } else {
           setVerify((prev) => {
             const next = { ...prev };
@@ -381,7 +448,7 @@ export function IntegrationsPanel({
         setBusy(null);
       }
     },
-    [runKhipu, load, onToast, refreshHealth],
+    [runKhipu, load, onToast, refreshHealth, rows],
   );
 
   const detected = (rows ?? []).filter((r) => r.detected);
@@ -453,14 +520,20 @@ export function IntegrationsPanel({
         {(rows ?? []).map((r) => {
           const v = verify[r.harness];
           const lv = liveness?.harnesses?.[r.harness];
-          const status = cardStatus(r, lv, v?.components?.mcp);
+          const justAutoVerified = autoVerified[r.harness] === true;
+          const status = justAutoVerified
+            ? { tone: "ok" as const, label: "Verified" }
+            : cardStatus(r, lv, v?.components?.mcp);
           const installed =
             r.harness === "grok_bot" ? r.mcp : r.mcp && r.hook_stop && r.hook_precompact;
           // Grok Bot has nothing local to install, so Verify ("Probe gateway")
           // is what its card offers instead — gated on detection, not on the
           // per-repo pin.
           const canVerify = r.harness === "grok_bot" ? r.detected : installed;
-          const verified = verifiedLine(r.harness, v?.components?.recall_probe, recallProbe);
+          const verified = justAutoVerified
+            ? { mark: "ok" as Mark, text: "Verified — a session ran the hook after Install, no click needed" }
+            : verifiedLine(r.harness, v?.components?.recall_probe, recallProbe);
+          const awaitingAutoVerify = installedAt[r.harness] != null && !justAutoVerified;
 
           // 1. Capture hook — the heartbeat, not the config file.
           const hook: { mark: Mark; text: string } =
@@ -540,6 +613,11 @@ export function IntegrationsPanel({
               </div>
               {ruleStale === true ? (
                 <div className="note">Re-run Install for this repo to refresh its rule.</div>
+              ) : awaitingAutoVerify ? (
+                <div className="note">
+                  Installed. Restart {LABEL[r.harness]}, then start any session — this
+                  card turns green by itself.
+                </div>
               ) : r.harness === "grok_bot" ? (
                 <div className="note" title={WHERE[r.harness]}>
                   One install per repo Grok Bot works in; the token lives in Cursor
