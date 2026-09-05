@@ -9,8 +9,8 @@ DESKTOP="$ROOT/apps/desktop"
 OUT="$DESKTOP/khipu-resources"
 COMPAT="$ROOT/docs/compat/khipu-graphify-postgres.json"
 
-CPYTHON_RELEASE="${KHIPU_CPYTHON_RELEASE:-20250323}"
-CPYTHON_FILE="cpython-3.11.15+${CPYTHON_RELEASE}-aarch64-apple-darwin-install_only.tar.gz"
+CPYTHON_RELEASE="${KHIPU_CPYTHON_RELEASE:-20260901}"
+CPYTHON_FILE="cpython-3.11.16+${CPYTHON_RELEASE}-aarch64-apple-darwin-install_only.tar.gz"
 CPYTHON_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${CPYTHON_RELEASE}/${CPYTHON_FILE}"
 
 if [[ ! -f "$COMPAT" ]]; then
