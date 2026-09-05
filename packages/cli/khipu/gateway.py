@@ -4,8 +4,8 @@ private network).
 
 Decision 2026-08-17 (maintainer decision, option B): Postgres stays private. This process runs
 next to the database, behind a TLS-terminating reverse proxy, and exposes exactly the MCP
-tools (`khipu_search`, `khipu_get`, `khipu_graph`, `khipu_status`, `khipu_capture`) that the
-stdio server exposes locally — same `handle_message`, different transport. The
+tools (`khipu_search`, `khipu_get`, `khipu_graph`, `khipu_status`, `khipu_capture`,
+`khipu_owed`) that the stdio server exposes locally — same `handle_message`, different transport. The
 cloud agent needs nothing installed: no Python libs, no DSN, no Gemini key; a
 URL and a bearer token in its `.cursor/mcp.json`.
 
@@ -14,16 +14,26 @@ batch), JSON response; notifications get 202 with no body; `GET /mcp` is 405
 (no server-initiated stream — the spec allows that). Stateless: no session ids.
 
 Security model (this is the only thing on the public internet):
-  * bearer token, compared in constant time; missing/wrong → 401, no detail
-  * body cap 1 MiB → 413; per-IP token bucket → 429; every request logged
-    (ip, method, path, tool name, status, ms) — never arguments or results
+  * bearer token, compared in constant time; missing/wrong → 401, no detail.
+    Several tokens may be issued (`KHIPU_GATEWAY_TOKENS=label:token,...`) so
+    each cloud client has its own budget and its own label in the log.
+  * a browser `Origin` header is refused (403) unless it is in
+    `KHIPU_GATEWAY_ALLOWED_ORIGINS` — MCP clients send none; a browser page on
+    a rebound DNS name does (Streamable HTTP spec, DNS-rebinding guidance)
+  * body cap 1 MiB → 413; per-IP AND per-token buckets → 429; every request
+    logged (ip, token label, method, path, tool name, status, ms) — never
+    arguments or results, and the search query log stores only a hash on
+    this host (mcp_server passes redact=True when the gateway is active)
   * capture is only accepted in `hub` mode (the tool itself enforces it), and
     on the gateway host the file mirror is off (`KHIPU_HUB_FILE_MIRROR=0`): a cloud
     capture is a PG row + vector, nothing else
-  * `GET /healthz` is unauthenticated and touches nothing but the process
+  * `GET /healthz` is unauthenticated but answers only `{"ok": true}` to the
+    public; the build stamp is for loopback callers (the deploy script on the
+    host) and bearer holders
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import os
@@ -43,6 +53,17 @@ from khipu.mcp_server import (
 
 MAX_BODY = 1024 * 1024
 RATE_PER_MIN = int(os.environ.get("KHIPU_GATEWAY_RATE_PER_MIN", "120"))
+# Per-token budget, on top of the per-IP one: several cloud agents behind one
+# egress IP used to throttle each other, and one caller with many source IPs
+# was unthrottled (audit 2026-09-04).
+RATE_PER_TOKEN_PER_MIN = int(os.environ.get("KHIPU_GATEWAY_RATE_PER_TOKEN_PER_MIN", "240"))
+# Browser origins allowed to POST /mcp. Empty (the default) means every
+# request carrying an Origin header is refused: no browser is a client here.
+ALLOWED_ORIGINS = {
+    o.strip().lower().rstrip("/")
+    for o in os.environ.get("KHIPU_GATEWAY_ALLOWED_ORIGINS", "").split(",")
+    if o.strip()
+}
 AUTH_FAIL_PER_MIN = int(os.environ.get("KHIPU_GATEWAY_AUTH_FAIL_PER_MIN", "10"))
 # A JSON-RPC batch is one request but N pieces of work. Unbounded, a single
 # 1 MiB body holds ~9,900 tool calls — each one a Postgres query — for the price
@@ -64,6 +85,35 @@ BUILD = os.environ.get("KHIPU_BUILD", "unknown")
 
 def _log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} [khipu-gateway] {msg}", file=sys.stderr, flush=True)
+
+
+def parse_tokens(raw: str) -> dict[str, str]:
+    """``label:token,label2:token2`` → {label: token}. A bare token gets a
+    label derived from its hash so the log can still tell callers apart."""
+    out: dict[str, str] = {}
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        label, sep, tok = part.partition(":")
+        if not sep:
+            tok, label = part, ""
+        tok = tok.strip()
+        if len(tok) < 24:
+            continue
+        out[(label.strip() or "tok-" + hashlib.sha256(tok.encode()).hexdigest()[:8])] = tok
+    return out
+
+
+def _read_exact(rfile, n: int) -> bytes:
+    """rfile.read(n) may return short on a chunked or slow client; loop."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = rfile.read(n - len(buf))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
 
 
 class _Rate:
@@ -107,7 +157,11 @@ class _Rate:
 class Handler(BaseHTTPRequestHandler):
     server_version = f"{SERVER_NAME}-gateway/{SERVER_VERSION}"
     token: str = ""
+    # Additional labelled tokens (KHIPU_GATEWAY_TOKENS); `token` stays the
+    # primary one under the label "default".
+    tokens: dict[str, str] = {}
     rate: _Rate = _Rate(RATE_PER_MIN)
+    token_rate: _Rate = _Rate(RATE_PER_TOKEN_PER_MIN)
     # Failed auth gets its own, much tighter budget. The rate check runs BEFORE
     # the token check (audit 2026-08-17: it ran after, so unauthenticated
     # attempts — the ones worth throttling — were not limited at all).
@@ -145,17 +199,40 @@ class Handler(BaseHTTPRequestHandler):
         if body:
             self.wfile.write(body)
 
-    def _authorized(self) -> bool:
+    def _authorized(self) -> str | None:
+        """The label of the token presented, or None. Every configured token is
+        compared (constant time each) so timing does not reveal which exists."""
         auth = self.headers.get("Authorization") or ""
         if not auth.startswith("Bearer "):
-            return False
-        return hmac.compare_digest(auth[7:].strip(), self.token)
+            return None
+        presented = auth[7:].strip()
+        found: str | None = None
+        if self.token and hmac.compare_digest(presented, self.token):
+            found = "default"
+        for label, tok in self.tokens.items():
+            if hmac.compare_digest(presented, tok) and found is None:
+                found = label
+        return found
+
+    def _origin_allowed(self) -> bool:
+        origin = (self.headers.get("Origin") or "").strip().lower().rstrip("/")
+        if not origin:
+            return True  # not a browser
+        return origin in ALLOWED_ORIGINS
+
+    def _is_loopback_client(self) -> bool:
+        return self._client() in ("127.0.0.1", "::1")
 
     # ---- routes ---------------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/healthz":
-            self._send(200, json.dumps({"ok": True, "server": SERVER_NAME,
-                                        "version": SERVER_VERSION, "build": BUILD}).encode())
+            body: dict[str, Any] = {"ok": True}
+            # The build stamp answers "is the deployed fix live?" for the deploy
+            # script (loopback on the host) and for token holders; the public
+            # internet gets a bare liveness answer and nothing to fingerprint.
+            if self._is_loopback_client() or self._authorized():
+                body.update({"server": SERVER_NAME, "version": SERVER_VERSION, "build": BUILD})
+            self._send(200, json.dumps(body).encode())
             return
         if self.path.rstrip("/") == "/mcp":
             self._send(405)  # no server-initiated SSE stream; allowed by the spec
@@ -171,11 +248,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") != "/mcp":
             self._send(404)
             return
+        if not self._origin_allowed():
+            self._send(403)
+            _log(f"{ip} POST /mcp 403 (origin not allowed)")
+            return
         if not self.rate.allow(ip):
             self._send(429)
             _log(f"{ip} POST /mcp 429")
             return
-        if not self.token or not self._authorized():
+        label = self._authorized() if (self.token or self.tokens) else None
+        if not label:
             # Throttle the attempts worth throttling: a caller that keeps
             # failing auth is spending our budget and our log, not doing work.
             if not self.auth_fail_rate.allow(ip):
@@ -185,6 +267,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401)
             _log(f"{ip} POST /mcp 401")
             return
+        if not self.token_rate.allow(label):
+            self._send(429)
+            _log(f"{ip} token={label} POST /mcp 429 (token budget)")
+            return
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -192,7 +278,10 @@ class Handler(BaseHTTPRequestHandler):
         if n <= 0 or n > MAX_BODY:
             self._send(413 if n > MAX_BODY else 400)
             return
-        raw = self.rfile.read(n)
+        raw = _read_exact(self.rfile, n)
+        if len(raw) != n:
+            self._send(400)
+            return
         try:
             msg = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
@@ -210,9 +299,10 @@ class Handler(BaseHTTPRequestHandler):
             _log(f"{ip} POST /mcp 413 (batch {len(msgs)} > {MAX_BATCH})")
             return
         # Charge the rest of the batch: the first message was paid for above.
-        if len(msgs) > 1 and not self.rate.allow(ip, cost=len(msgs) - 1):
+        if len(msgs) > 1 and not (self.rate.allow(ip, cost=len(msgs) - 1)
+                                  and self.token_rate.allow(label, cost=len(msgs) - 1)):
             self._send(429)
-            _log(f"{ip} POST /mcp 429 (batch of {len(msgs)} over budget)")
+            _log(f"{ip} token={label} POST /mcp 429 (batch of {len(msgs)} over budget)")
             return
         tool = ""
         responses = []
@@ -240,7 +330,7 @@ class Handler(BaseHTTPRequestHandler):
             body = responses if isinstance(msg, list) else responses[0]
             self._send(200, json.dumps(body, default=str).encode("utf-8"))
             status = 200
-        _log(f"{ip} POST /mcp {status} {int((time.time() - t0) * 1000)}ms"
+        _log(f"{ip} token={label} POST /mcp {status} {int((time.time() - t0) * 1000)}ms"
              f"{' tool=' + tool if tool else ''} n={len(msgs)}")
 
 
@@ -255,11 +345,15 @@ def serve(bind: str = "127.0.0.1:8787", token: str | None = None) -> None:
     mark_gateway_active()
     host, _, port = bind.rpartition(":")
     Handler.token = token
+    Handler.tokens = parse_tokens(os.environ.get("KHIPU_GATEWAY_TOKENS", ""))
     Handler.rate = _Rate(RATE_PER_MIN)
+    Handler.token_rate = _Rate(RATE_PER_TOKEN_PER_MIN)
     Handler.auth_fail_rate = _Rate(AUTH_FAIL_PER_MIN)
     httpd = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Handler)
     httpd.daemon_threads = True
-    _log(f"listening on {host or '127.0.0.1'}:{port} (pid {os.getpid()}, capture_mode={os.environ.get('KHIPU_CAPTURE_MODE', 'default')})")
+    _log(f"listening on {host or '127.0.0.1'}:{port} (pid {os.getpid()}, "
+         f"capture_mode={os.environ.get('KHIPU_CAPTURE_MODE', 'default')}, "
+         f"tokens={1 + len(Handler.tokens)}, allowed_origins={len(ALLOWED_ORIGINS)})")
     try:
         httpd.serve_forever()
     finally:

@@ -6,6 +6,7 @@ search returns. Fail-open by design: a logging bug must never break search.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -44,8 +45,13 @@ def log_query(
     result_count: int,
     top: list[dict[str, Any]] | None = None,
     harness: str | None = None,
+    redact: bool = False,
 ) -> None:
     """Append one search to the log. Never raises.
+
+    ``redact=True`` stores a hash and the length instead of the query text —
+    the gateway host is on the public internet and its disk must never hold
+    what people asked (audit 2026-09-04).
 
     ``filters`` is stored with empty/None values dropped, so a query log line
     reads as "what was actually constrained", not a fixed-shape record full
@@ -60,10 +66,12 @@ def log_query(
         entry = {
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "harness": (harness or "").strip() or _default_harness(),
-            "query": query,
+            "query": None if redact else query,
             "mode": mode,
             "filters": {k: v for k, v in (filters or {}).items() if v},
             "result_count": int(result_count),
+            **({"query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest()[:16],
+                "query_len": len(query)} if redact else {}),
             "top": [
                 {"kind": r.get("kind"), "id": r.get("id"), "score": r.get("score")}
                 for r in (top or [])[:3]
