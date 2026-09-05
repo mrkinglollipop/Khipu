@@ -1038,3 +1038,28 @@ class SearchTimingTest(unittest.TestCase):
             em._cosine_candidates("khipu", limit=10, timing=timing)
         self.assertIn("embed_ms", timing)
         self.assertIn("cosine_ms", timing)
+
+
+class QueryEmbedBudgetTest(unittest.TestCase):
+    """The interactive query path must not inherit the backfill client's
+    120 s / four-retry budget (a 15 s Recall stall, measured 2026-09-05)."""
+
+    def test_embed_one_honours_retries_and_timeout(self):
+        import urllib.error
+        from unittest import mock
+
+        calls: list[float] = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(timeout)
+            raise urllib.error.URLError("simulated stall")
+
+        with mock.patch.object(em.urllib.request, "urlopen", fake_urlopen), \
+                mock.patch.object(em.time, "sleep", lambda s: None), \
+                mock.patch.object(em, "_gemini_key", lambda: "k"):
+            with self.assertRaises(RuntimeError):
+                em.embed_one("q", retries=em.QUERY_EMBED_RETRIES,
+                             timeout=em.QUERY_EMBED_TIMEOUT_S)
+        self.assertEqual(len(calls), em.QUERY_EMBED_RETRIES + 1)
+        self.assertTrue(all(t == em.QUERY_EMBED_TIMEOUT_S for t in calls))
+        self.assertLess(em.QUERY_EMBED_TIMEOUT_S, 30)

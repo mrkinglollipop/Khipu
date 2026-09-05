@@ -156,11 +156,22 @@ def _gemini_key() -> str:
     return key
 
 
+# Interactive query budget: the backfill defaults (120 s per call, four backoff
+# retries) are right for a nightly sweep and wrong for a person waiting on
+# Recall — one slow Gemini response held a search for 15 s (measured 2026-09-05).
+# A query that misses this budget degrades to literal + lexical instead.
+QUERY_EMBED_TIMEOUT_S = 10.0
+QUERY_EMBED_RETRIES = 2
+QUERY_EMBED_DELAY_S = 1.0
+
+
 def embed_batch(
     texts: list[str],
     *,
     profile: str = PROFILE_001,
     retries: int = 4,
+    timeout: float = 120.0,
+    delay: float = 2.0,
 ) -> list[list[float]]:
     """Embed up to BATCH texts; L2-normalized; dim-checked.
 
@@ -190,7 +201,6 @@ def embed_batch(
         ]
     }
     data = json.dumps(body).encode("utf-8")
-    delay = 2.0
     payload: dict[str, Any] = {}
     for attempt in range(retries + 1):
         req = urllib.request.Request(
@@ -198,7 +208,7 @@ def embed_batch(
             headers={"Content-Type": "application/json", "x-goog-api-key": key},
         )
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             break
         except urllib.error.HTTPError as e:
@@ -229,8 +239,15 @@ def embed_batch(
     return [_l2(v) for v in vecs]
 
 
-def embed_one(text: str, *, profile: str = PROFILE_001) -> list[float]:
-    return embed_batch([text], profile=profile)[0]
+def embed_one(
+    text: str,
+    *,
+    profile: str = PROFILE_001,
+    retries: int = 4,
+    timeout: float = 120.0,
+    delay: float = 2.0,
+) -> list[float]:
+    return embed_batch([text], profile=profile, retries=retries, timeout=timeout, delay=delay)[0]
 
 
 def embed_batch_images(
@@ -895,7 +912,11 @@ def _cosine_candidates(
                     )
             api_q = prefix_query(query) if uses_task_prefixes(profile) else query
             _t0 = time.monotonic()
-            qlit = _vec_literal(embed_one(api_q, profile=profile))
+            qlit = _vec_literal(embed_one(
+                api_q, profile=profile,
+                retries=QUERY_EMBED_RETRIES, timeout=QUERY_EMBED_TIMEOUT_S,
+                delay=QUERY_EMBED_DELAY_S,
+            ))
             if timing is not None:
                 timing["embed_ms"] = round((time.monotonic() - _t0) * 1000, 1)
             _t0 = time.monotonic()
@@ -1362,11 +1383,14 @@ def hybrid_search(
                 query, limit=oversample, kind=semantic_kind, filters=filters,
                 timing=timing,
             )
-        except RuntimeError:
+        except RuntimeError as exc:
             if mode == "semantic":
                 raise
             cosine_rows = []
-            degraded = "no-embedding"
+            # "embed-unavailable" = the API did not answer inside the query
+            # budget (QUERY_EMBED_TIMEOUT_S); "no-embedding" = no vector at all.
+            degraded = "embed-unavailable" if "network error" in str(exc) else "no-embedding"
+            timing["embed_error"] = str(exc)[:120]
 
     with try_hub_connect() as conn:
         with conn.cursor() as cur:
