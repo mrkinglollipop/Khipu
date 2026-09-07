@@ -13,3 +13,9 @@ apps/desktop/src-tauri/target/
 # Iterate / harness local state
 .cursor/
 
+# Reel drafts stay local; production media is distributed as release assets.
+/docs/sizzle-reel/*
+!/docs/sizzle-reel/production/
+/docs/sizzle-reel/production/assets/
+/docs/sizzle-reel/production/exports/
+/docs/sizzle-reel/production/build/
