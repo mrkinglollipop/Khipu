@@ -1,0 +1,26 @@
+{
+  "square": {
+    "decode_exit": 0,
+    "duration_seconds": 25,
+    "frames": 600,
+    "resolution": [
+      1080,
+      1080
+    ],
+    "audio_sha256": "SHA256=a39a6f5948f305116b1eaf19a7cc43a1a84560ba97823c2e049ad029a1c47da5",
+    "connection_frames": 72,
+    "unique_connection_frames": 72
+  },
+  "vertical": {
+    "decode_exit": 0,
+    "duration_seconds": 25,
+    "frames": 600,
+    "resolution": [
+      1080,
+      1920
+    ],
+    "audio_sha256": "SHA256=a39a6f5948f305116b1eaf19a7cc43a1a84560ba97823c2e049ad029a1c47da5",
+    "connection_frames": 72,
+    "unique_connection_frames": 72
+  }
+}
