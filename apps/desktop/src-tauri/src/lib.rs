@@ -459,6 +459,35 @@ async fn khipu_jobs_refresh() -> Result<String, String> {
     run_khipu_cli_async(JOBS_REFRESH_ARGV.iter().map(|s| s.to_string()).collect()).await
 }
 
+/// D3: Home's "Right now" card — pending turns per live harness, queue
+/// depth, captured-today — without waiting on the slower full `doctor` pass
+/// (DB round trips, backup checks, etc.) that also carries this same data
+/// under `capture_liveness`. `khipu sessions liveness` always prints JSON
+/// (`session_capture.liveness_all()`, the same call doctor makes); fixed
+/// argv, no arguments, exits non-zero when a harness is red but still
+/// prints JSON (`run_khipu_cli` already treats that as Ok, not an invoke
+/// error).
+const LIVENESS_NOW_ARGV: &[&str] = &["sessions", "liveness"];
+
+#[tauri::command]
+async fn liveness_now() -> Result<String, String> {
+    run_khipu_cli_async(LIVENESS_NOW_ARGV.iter().map(|s| s.to_string()).collect()).await
+}
+
+/// D3: Home's "Capture now" button — `khipu capture now`, no arguments, so
+/// it flags the most recently active local session (K1's
+/// `newest_session_ref()`) for capture at its next Stop/PreCompact/
+/// SessionEnd instead of waiting on the fixed cadence. Fixed argv: `capture`
+/// stays out of `ALLOWED_SUBCOMMANDS` like every other state-changing verb
+/// here, and the button never lets the webview pick a harness/session id of
+/// its own.
+const CAPTURE_NOW_ARGV: &[&str] = &["capture", "now"];
+
+#[tauri::command]
+async fn khipu_capture_now() -> Result<String, String> {
+    run_khipu_cli_async(CAPTURE_NOW_ARGV.iter().map(|s| s.to_string()).collect()).await
+}
+
 /// Apply (or plan) the schema. `migrate` is a state-changing subcommand and is
 /// deliberately NOT in `ALLOWED_SUBCOMMANDS`; this command fixes the argv to
 /// exactly `migrate` / `migrate --dry-run` so the UI can offer setup without
@@ -1409,6 +1438,8 @@ pub fn run() {
             khipu_migrate,
             khipu_embed_backfill,
             khipu_jobs_refresh,
+            liveness_now,
+            khipu_capture_now,
             khipu_db_status,
             khipu_db_preflight,
             khipu_db_connect,
