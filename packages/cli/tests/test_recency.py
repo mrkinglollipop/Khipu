@@ -96,5 +96,61 @@ class ApplyRecencyTest(unittest.TestCase):
         self.assertNotIn("recency", out[0])
 
 
+class ProjectAndStatusTest(unittest.TestCase):
+    """R5/R6: apply_project_and_status is a pure ranking function over a
+    FIXED result set — no DB, no search — the exact shape the phase-1 brief
+    asks for."""
+
+    def test_a_matching_project_is_boosted_not_hard_filtered(self):
+        rows = [
+            {"kind": "episode", "id": "wrong-project", "score": 0.5, "project": "acme/other"},
+            {"kind": "episode", "id": "right-project", "score": 0.45, "project": "acme/widget"},
+        ]
+        out = rec.apply_project_and_status(rows, project="acme/widget")
+        # The boost (x1.25) flips the ranking: 0.45*1.25=0.5625 > 0.5.
+        self.assertEqual(out[0]["id"], "right-project")
+        # Never a hard filter: the other-project row still shows.
+        self.assertEqual({r["id"] for r in out}, {"wrong-project", "right-project"})
+
+    def test_no_project_argument_leaves_scores_untouched_besides_status(self):
+        rows = [{"kind": "episode", "id": "a", "score": 0.5, "project": "acme/widget"}]
+        out = rec.apply_project_and_status(rows, project=None)
+        self.assertEqual(out[0]["score"], 0.5)
+
+    def test_superseded_topic_is_deranked_not_dropped(self):
+        rows = [
+            {"kind": "topic", "id": "old-page", "score": 0.5, "status": "superseded"},
+            {"kind": "topic", "id": "current-page", "score": 0.3, "status": "active"},
+        ]
+        out = rec.apply_project_and_status(rows)
+        # 0.5 * 0.5 = 0.25 < 0.3, so current-page now leads.
+        self.assertEqual([r["id"] for r in out], ["current-page", "old-page"])
+        self.assertIn("old-page", {r["id"] for r in out})
+
+    def test_retired_and_abandoned_are_also_deranked(self):
+        for status in ("retired", "abandoned"):
+            with self.subTest(status=status):
+                rows = [{"kind": "topic", "id": "x", "score": 0.4, "status": status}]
+                out = rec.apply_project_and_status(rows)
+                self.assertAlmostEqual(out[0]["score"], 0.2)
+
+    def test_episode_rows_are_never_deranked_by_status(self):
+        """An episode has no `status` column at all — the derank only ever
+        applies to kind='topic'."""
+        rows = [{"kind": "episode", "id": "x", "score": 0.4, "status": "superseded"}]
+        out = rec.apply_project_and_status(rows)
+        self.assertEqual(out[0]["score"], 0.4)
+
+    def test_project_boost_and_status_derank_compose(self):
+        rows = [{"kind": "topic", "id": "x", "score": 0.4, "status": "retired", "project": "acme/widget"}]
+        out = rec.apply_project_and_status(rows, project="acme/widget")
+        self.assertAlmostEqual(out[0]["score"], 0.4 * rec.PROJECT_BOOST * rec.STATUS_DERANK)
+
+    def test_empty_list_and_bad_rows_never_raise(self):
+        self.assertEqual(rec.apply_project_and_status([]), [])
+        out = rec.apply_project_and_status([{"kind": "topic", "id": "x", "score": "not-a-number"}])
+        self.assertEqual(out[0]["score"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

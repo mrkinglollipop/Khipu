@@ -8,6 +8,14 @@ from khipu.db import connect
 from khipu.snippets import SNIPPET_LIMIT, clip_snippet
 
 
+def _deranked_topic_statuses() -> frozenset[str]:
+    """Lazy import: khipu.recency owns the canonical de-rank set (R6); this
+    module borrows it rather than duplicating the three status strings."""
+    from khipu.recency import DERANKED_STATUSES
+
+    return DERANKED_STATUSES
+
+
 def _recent_rows(cur, limit: int) -> list[dict]:
     """Recent episodes on a cursor the caller already owns, so a payload that
     needs several queries opens one connection instead of one per query."""
@@ -282,7 +290,7 @@ def project_slice(
             if topic_slugs:
                 cur.execute(
                     """
-                    SELECT slug, title, COALESCE(updated_at, created_at)
+                    SELECT slug, title, COALESCE(updated_at, created_at), status
                     FROM topics
                     WHERE slug = ANY(%s) AND deleted_at IS NULL
                     """,
@@ -291,10 +299,16 @@ def project_slice(
                 now = datetime.now(timezone.utc)
                 order = {s: i for i, s in enumerate(topic_slugs)}
                 found = []
-                for slug, title, when in cur.fetchall():
+                for slug, title, when, status in cur.fetchall():
                     age_days = (now - when).days if when is not None else None
-                    found.append({"slug": slug, "title": title, "age_days": age_days})
-                found.sort(key=lambda t: order.get(t["slug"], len(order)))
+                    found.append({"slug": slug, "title": title, "age_days": age_days,
+                                  "status": status or "active"})
+                # R6: a superseded/retired/abandoned page never wins a slot
+                # over a current one in the same small slice, same posture
+                # as the search de-rank — it can still show, just last.
+                found.sort(key=lambda t: (
+                    t["status"] in _deranked_topic_statuses(), order.get(t["slug"], len(order))
+                ))
                 topics.extend(found[:topic_limit])
 
             # W4.3: harness-native notes (khipu.notes.reconcile) carry no
@@ -307,7 +321,7 @@ def project_slice(
                 now = datetime.now(timezone.utc)
                 cur.execute(
                     """
-                    SELECT slug, title, COALESCE(updated_at, created_at)
+                    SELECT slug, title, COALESCE(updated_at, created_at), status
                     FROM topics
                     WHERE deleted_at IS NULL AND slug LIKE 'note:%%'
                       AND frontmatter->>'project' = %s
@@ -316,11 +330,12 @@ def project_slice(
                     """,
                     (project, remaining + len(seen_slugs)),
                 )
-                for slug, title, when in cur.fetchall():
+                for slug, title, when, status in cur.fetchall():
                     if slug in seen_slugs:
                         continue
                     age_days = (now - when).days if when is not None else None
-                    topics.append({"slug": slug, "title": title, "age_days": age_days})
+                    topics.append({"slug": slug, "title": title, "age_days": age_days,
+                                    "status": status or "active"})
                     seen_slugs.add(slug)
                     if len(topics) >= topic_limit:
                         break

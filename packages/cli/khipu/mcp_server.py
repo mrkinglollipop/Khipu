@@ -158,10 +158,20 @@ TOOLS: list[dict] = [
             "project (matches episode project or scope), since/until (ISO date "
             "or relative like '7d'/'24h'), session_id (prefix match), harness "
             "(prefix of session_id before the colon). Returns JSON rows of "
-            "{kind, id, label, snippet, score} plus additive paths (filesystem "
-            "tokens) and neighbors (capped 1-hop wiki/path edges) on topic "
-            "hits. Tombstoned topics are excluded. Snippets are word-boundary "
-            "teasers; call khipu_get for the full row."
+            "{kind, id, label, snippet, score, cosine, lexical_hits} plus "
+            "additive paths (filesystem tokens) and neighbors (capped 1-hop "
+            "wiki/path edges) on topic hits; a topic hit also carries status "
+            "(active/superseded/retired/abandoned — the latter three are "
+            "de-ranked, not excluded) and, when known, project. `score` is a "
+            "fused rank, NOT a similarity — it sits in the same narrow band "
+            "for a real hit and for gibberish. `cosine` (raw cosine "
+            "similarity, hybrid/semantic only) and `lexical_hits` (how many "
+            "query tokens this row names verbatim) are the honest signals; "
+            "the top-level `confidence` ('none'|'weak'|'strong') is derived "
+            "from them across the whole result set — treat 'none' as "
+            "'nothing found', not as a low-ranked hit. Tombstoned topics are "
+            "excluded. Snippets are word-boundary teasers; call khipu_get for "
+            "the full row."
         ),
         "inputSchema": {
             "type": "object",
@@ -287,6 +297,21 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {
                 "include_drift": {"type": "boolean", "description": "Default false"},
+                "prompt": {
+                    "type": "string",
+                    "description": (
+                        "R10: for a harness with no pushed slice and no per-prompt "
+                        "push (Aegis, the gateway) — pass the first user prompt of "
+                        "the session and the response carries a `prior_work` field: "
+                        "the same top-3 'prior work' block a UserPromptSubmit hook "
+                        "would otherwise have pushed. Omit once the session already "
+                        "has that context."
+                    ),
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional, with `prompt`: boosts hits from this repo's project.",
+                },
             },
         },
     },
@@ -559,7 +584,6 @@ def _tool_status(args: dict) -> dict:
             payload = status_payload(None)
         # W2.4: behind_ingest_seconds only means something while PG answers.
         payload["hub_snapshot"] = snapshot_freshness(payload.get("latest_ingested_at"))
-        return payload
     except Exception as exc:
         if not hub_connection_failed(exc):
             raise
@@ -567,7 +591,30 @@ def _tool_status(args: dict) -> dict:
         if args.get("include_drift"):
             payload["drift_error"] = "hub unreachable; drift omitted"
         payload["hub_error"] = f"{type(exc).__name__}: {exc}"
-        return payload
+    _attach_prior_work(payload, args)
+    return payload
+
+
+def _attach_prior_work(payload: dict, args: dict) -> None:
+    """R10: khipu_status's fallback push for a harness with no SessionStart
+    or UserPromptSubmit hook to inject through (Aegis, the gateway) — the
+    caller passes the session's first user prompt and gets the same top-3
+    block a hook would otherwise have pushed, under `prior_work`. Mutates
+    `payload` in place; never raises (prior_work_for_prompt already never
+    does, but this is the one place a caller cannot afford a crash to reach
+    from an optional field).
+    """
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        return
+    try:
+        from khipu.recall_prompt import prior_work_for_prompt
+
+        result = prior_work_for_prompt(prompt, cwd=args.get("cwd"))
+        if result.get("context"):
+            payload["prior_work"] = result["context"]
+    except Exception:  # noqa: BLE001 — an optional field must never break khipu_status
+        pass
 
 
 def _tool_capture(args: dict) -> dict:

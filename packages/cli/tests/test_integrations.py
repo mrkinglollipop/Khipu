@@ -48,7 +48,8 @@ class ClaudeCodePackTest(_TempHomeCase):
         self._seed()
         out = integ.install("claude_code")
         self.assertTrue(out["detected"])
-        self.assertEqual(len(out["changes"]), 5)  # mcp + Stop + PreCompact + SessionEnd + SessionStart recall
+        # mcp + Stop + PreCompact + SessionEnd + SessionStart recall + UserPromptSubmit recall
+        self.assertEqual(len(out["changes"]), 6)
         s = json.loads((self.home / ".claude" / "settings.json").read_text())
         pc = [h["command"] for e in s["hooks"]["PreCompact"] for h in e["hooks"]]
         self.assertIn("python3 /me/precompact_flush.py", pc)         # legacy untouched
@@ -57,8 +58,13 @@ class ClaudeCodePackTest(_TempHomeCase):
         # SessionEnd is the "quit without compacting" net (2026-08-17): the hook
         # is the harness's capture step now, so it must run when the session ends.
         self.assertTrue(any("khipu-stop-hook" in h["command"] for e in s["hooks"]["SessionEnd"] for h in e["hooks"]))
+        # UserPromptSubmit (R1): the per-prompt recall push, alongside the
+        # SessionStart one, both Khipu-owned.
+        self.assertTrue(any("khipu-prompt-recall" in h["command"]
+                             for e in s["hooks"]["UserPromptSubmit"] for h in e["hooks"]))
         st = integ.status("claude_code")
         self.assertEqual((st["extract"], st["hook_sessionend"]), ("installed", True))
+        self.assertEqual(st["prompt_recall"], "installed")
         d = json.loads((self.home / ".claude.json").read_text())
         self.assertIn("other", d["mcpServers"])                       # other servers kept
         self.assertEqual(d["mcpServers"]["khipu"]["command"], integ.mcp_launcher())
@@ -82,8 +88,10 @@ class ClaudeCodePackTest(_TempHomeCase):
         pc = [h["command"] for e in s["hooks"]["PreCompact"] for h in e["hooks"]]
         self.assertEqual(pc, ["python3 /me/precompact_flush.py"])
         self.assertNotIn("khipu", json.loads((self.home / ".claude.json").read_text())["mcpServers"])
+        self.assertEqual(s["hooks"]["UserPromptSubmit"], [])
         st = integ.status("claude_code")
         self.assertFalse(st["mcp"] or st["hook_stop"] or st["hook_precompact"])
+        self.assertEqual(st["prompt_recall"], "missing")
 
     def test_undetected_is_reported_not_errored(self):
         out = integ.install("claude_code")
@@ -199,6 +207,52 @@ class ProbeTest(unittest.TestCase):
         self.assertFalse(integ._probe_hook(raw)["ok"])
         self.assertNotIn(" ", integ.stop_hook())
         self.assertTrue(integ._probe_hook(integ.stop_hook())["ok"])
+
+
+class ProbePromptRecallSnapshotTest(unittest.TestCase):
+    """R1 follow-up: _probe_prompt_recall's topical assertion is conditional
+    on the LOCAL snapshot being fresh (mocked here — no real subprocess, no
+    real snapshot needed)."""
+
+    def _run(self, *, snapshot_fresh, trivial_ctx="", topical_ctx=""):
+        def _trivial_response(**_kw):
+            return mock.Mock(returncode=0, stdout=json.dumps(
+                {"hookSpecificOutput": {"additionalContext": trivial_ctx}} if trivial_ctx else {}
+            ), stderr="")
+
+        def _topical_response(**_kw):
+            return mock.Mock(returncode=0, stdout=json.dumps(
+                {"hookSpecificOutput": {"additionalContext": topical_ctx}} if topical_ctx else {}
+            ), stderr="")
+
+        with mock.patch(
+            "khipu.hub_snapshot.snapshot_is_fresh", return_value=(snapshot_fresh, {})
+        ), mock.patch.object(integ.subprocess, "run", side_effect=[
+            _trivial_response(), _topical_response()
+        ]):
+            return integ._probe_prompt_recall("khipu-prompt-recall")
+
+    def test_fresh_snapshot_requires_a_non_empty_topical_result(self):
+        out = self._run(snapshot_fresh=True, topical_ctx="")
+        self.assertFalse(out["ok"])
+        self.assertIn("fresh", out["error"])
+
+    def test_fresh_snapshot_with_a_real_hit_passes(self):
+        out = self._run(snapshot_fresh=True, topical_ctx="## Prior work on this topic\n- x")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["topical_context_chars"], len("## Prior work on this topic\n- x"))
+
+    def test_missing_snapshot_does_not_require_a_topical_hit(self):
+        """No local replica: the hook falls back to the hub, where a
+        legitimate timeout is the documented safe failure — must not flake
+        verify() over it."""
+        out = self._run(snapshot_fresh=False, topical_ctx="")
+        self.assertTrue(out["ok"])
+
+    def test_a_non_empty_trivial_prompt_always_fails_regardless_of_snapshot(self):
+        out = self._run(snapshot_fresh=False, trivial_ctx="should not be here")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"], "trivial prompt was not empty")
 
 
 class AegisIsolationTest(unittest.TestCase):
@@ -561,7 +615,8 @@ class CodexPackTest(_TempHomeCase):
             {"hooks": {"PreCompact": [{"hooks": [{"type": "command", "command": "python3 '/me/precompact_flush.py'", "timeout": 45}]}]}}))
         out = integ.install("codex")
         self.assertTrue(out["detected"])
-        self.assertEqual(len(out["changes"]), 5)   # mcp + Stop + PreCompact + SessionEnd + SessionStart
+        # mcp + Stop + PreCompact + SessionEnd + SessionStart + UserPromptSubmit
+        self.assertEqual(len(out["changes"]), 6)
         t = tomllib.loads((self.home / ".codex" / "config.toml").read_text())
         self.assertEqual(sorted(t["mcp_servers"]), ["khipu", "node_repl"])
         h = json.loads((self.home / ".codex" / "hooks.json").read_text())
@@ -569,9 +624,12 @@ class CodexPackTest(_TempHomeCase):
         self.assertIn("python3 '/me/precompact_flush.py'", pc)      # legacy kept
         self.assertTrue(any("khipu-stop-hook" in c for c in pc))
         self.assertTrue(any("khipu-recall-hook" in x["command"] for e in h["hooks"]["SessionStart"] for x in e["hooks"]))
+        self.assertTrue(any("khipu-prompt-recall" in x["command"]
+                             for e in h["hooks"]["UserPromptSubmit"] for x in e["hooks"]))
         st = integ.status("codex")
         self.assertTrue(st["mcp"] and st["hook_stop"] and st["hook_precompact"])
         self.assertEqual(st["recall_rule"], "installed")
+        self.assertEqual(st["prompt_recall"], "installed")
         self.assertEqual(integ.install("codex")["changes"], [])   # idempotent
         integ.uninstall("codex")
         t = tomllib.loads((self.home / ".codex" / "config.toml").read_text())
@@ -580,6 +638,8 @@ class CodexPackTest(_TempHomeCase):
         self.assertEqual([x["command"] for e in h["hooks"]["PreCompact"] for x in e["hooks"]],
                          ["python3 '/me/precompact_flush.py'"])
         self.assertEqual(h["hooks"]["Stop"], [])
+        self.assertEqual(h["hooks"]["UserPromptSubmit"], [])
+        self.assertEqual(integ.status("codex")["prompt_recall"], "missing")
 
 
 class UnreadableConfigTest(_TempHomeCase):

@@ -1592,6 +1592,187 @@ def semantic_search_snapshot(
     return [item for _, item in scored[: max(1, limit)]]
 
 
+# R1 follow-up (2026-09-14): the per-prompt recall lane (khipu.recall_prompt)
+# was timing out against the remote hub on this Mac (measured 1.1-1.6s vs a
+# 1.2s budget) even though this local replica answers a keyword search in
+# ~226ms. These two helpers give that lane a full offline hybrid leg —
+# cosine + lexical, RRF-fused — WITHOUT needing local_embed_configured()
+# (semantic_search_snapshot above requires a local embed *server*; this
+# instead takes an already-computed query vector, so the caller can get one
+# from the same Gemini API the hub profile uses, cached, on its own budget).
+SNAPSHOT_MAX_AGE_S = 24 * 60 * 60
+
+
+def snapshot_is_fresh(*, max_age_s: int = SNAPSHOT_MAX_AGE_S) -> tuple[bool, dict[str, Any]]:
+    """(is_fresh, health) — false when the snapshot is missing OR older than
+    ``max_age_s``. Callers that only care about "can I use this" get one
+    check; ``health`` still carries the age/reason for logging either way.
+    """
+    health = snapshot_health()
+    if not health.get("exists"):
+        return False, health
+    age = health.get("age_seconds")
+    if age is None or age > max_age_s:
+        return False, health
+    return True, health
+
+
+def prompt_recall_snapshot_status() -> dict[str, Any]:
+    """R1 follow-up (doctor): is the local replica usable for the per-prompt
+    recall lane right now? Never red on its own — khipu.recall_prompt
+    already degrades safely to the hub when this is false — but that
+    degrade is otherwise invisible: every prompt then pays the slower,
+    sometimes-timing-out hub round trip with no sign anywhere that it is
+    happening. This is the sign.
+    """
+    fresh, health = snapshot_is_fresh()
+    if fresh:
+        return {"ok": True, "fresh": True}
+    return {
+        "ok": True,
+        "fresh": False,
+        "reason": (
+            "prompt-time recall is running against the hub and may time "
+            "out; run `khipu snapshot refresh`"
+        ),
+        "exists": bool(health.get("exists")),
+        "age_seconds": health.get("age_seconds"),
+    }
+
+
+def active_snapshot_profile() -> str | None:
+    try:
+        con = open_snapshot()
+    except FileNotFoundError:
+        return None
+    row = con.execute(
+        "SELECT id FROM embedding_profiles WHERE is_active = 1 LIMIT 1"
+    ).fetchone()
+    return row[0] if row else None
+
+
+def cosine_candidates_snapshot(
+    vec: Sequence[float], profile: str, *, limit: int, kind: str | None = None
+) -> list[dict[str, Any]]:
+    """Raw cosine-ordered candidates over the LOCAL replica's ``memory_embeddings``
+    (best first) — the offline analog of ``embed._cosine_candidates``. Each row
+    carries ``rank_text`` (the embedded chunk) so a caller can rank token
+    overlap over the same candidates without a second pass, same shape as the
+    hub leg. Never raises for "no rows" — an empty/missing snapshot or profile
+    just yields ``[]``; a genuine sqlite error still propagates (the caller
+    decides whether that means "fall back to the hub").
+    """
+    import operator
+    import struct
+
+    from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
+
+    con = open_snapshot()
+    params: list[Any] = [profile]
+    kind_clause = ""
+    if kind:
+        kind_clause = " AND kind = ?"
+        params.append(kind)
+    rows = con.execute(
+        # A commitment has its own dedicated surface (khipu_owed), not
+        # generic search — same exclusion as embed._cosine_candidates.
+        f"SELECT kind, ref, chunk_idx, chunk_text, embedding FROM memory_embeddings "
+        f"WHERE profile = ? AND kind != 'commitment'{kind_clause} AND embedding IS NOT NULL",
+        params,
+    ).fetchall()
+    # Plain dot product, not _cosine()'s sqrt-normalize-divide: every profile
+    # here is stored via embed.embed_batch, which L2-normalizes every vector
+    # before it is ever written (embedding_profiles.normalize = 'l2', the
+    # schema's own guarantee) — so dot(a, b) on two unit vectors already IS
+    # the cosine similarity. Measured live (2026-09-14, 9,639 rows): calling
+    # _cosine() per row (which recomputes the QUERY vector's norm 9,639
+    # times over) cost 680ms; a plain dot product via struct.unpack +
+    # operator.mul cost 175ms — a ~4x cut, the difference between meeting
+    # and missing the per-prompt hook's 1.2s wall clock. The query vector is
+    # still normalized once, up front, defensively (cheap: it happens once,
+    # not per row) in case its source ever changes.
+    qn = math.sqrt(sum(x * x for x in vec)) or 1.0
+    qvec = tuple(x / qn for x in vec)
+    dim = len(qvec)
+    fmt = f"{dim}f"
+    mul = operator.mul
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for knd, ref, chunk_idx, chunk_text, blob in rows:
+        if not blob or len(blob) < dim * 4:
+            continue
+        doc = struct.unpack(fmt, blob[: dim * 4])
+        score = sum(map(mul, qvec, doc))
+        scored.append((
+            score,
+            {
+                "kind": knd, "id": ref, "chunk_idx": chunk_idx,
+                "score": round(float(score), 4),
+                "label": clip_snippet(chunk_text or "", LABEL_LIMIT),
+                "snippet": clip_snippet(chunk_text or "", SNIPPET_LIMIT),
+                "rank_text": chunk_text or "",
+            },
+        ))
+    scored.sort(key=lambda x: -x[0])
+    return [item for _, item in scored[: max(1, int(limit))]]
+
+
+def snapshot_row_metadata(
+    con: sqlite3.Connection, rows: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """Attach ts/project/status onto already-fused local-replica rows,
+    mirroring ``embed._apply_search_filters``'s episode/topic metadata pass
+    (project via COALESCE(project, scope) for episodes, status + the
+    frontmatter->>'project' equivalent for topics). Drops a tombstoned row
+    outright, same as the hub leg. A row this function has no metadata for
+    (e.g. a node) passes through unchanged.
+    """
+    out: list[dict[str, Any]] = []
+    episode_ids = sorted({str(r["id"]) for r in rows if r.get("kind") == "episode"})
+    topic_ids = sorted({str(r["id"]) for r in rows if r.get("kind") == "topic"})
+    meta: dict[tuple[str, str], dict[str, Any]] = {}
+    if episode_ids:
+        placeholders = ",".join("?" for _ in episode_ids)
+        for eid, ts, proj, deleted in con.execute(
+            f"SELECT CAST(id AS TEXT), ts, COALESCE(project, scope), deleted_at "
+            f"FROM episodes WHERE CAST(id AS TEXT) IN ({placeholders})",
+            episode_ids,
+        ).fetchall():
+            meta[("episode", eid)] = {"ts": ts, "project": proj, "deleted": deleted is not None}
+    if topic_ids:
+        placeholders = ",".join("?" for _ in topic_ids)
+        for slug, ts, status, frontmatter, deleted in con.execute(
+            f"SELECT slug, COALESCE(updated_at, created_at), status, frontmatter, deleted_at "
+            f"FROM topics WHERE slug IN ({placeholders})",
+            topic_ids,
+        ).fetchall():
+            proj = None
+            if frontmatter:
+                try:
+                    proj = json.loads(frontmatter).get("project")
+                except (ValueError, AttributeError, TypeError):
+                    proj = None
+            meta[("topic", slug)] = {
+                "ts": ts, "status": status or "active", "project": proj,
+                "deleted": deleted is not None,
+            }
+    for r in rows:
+        m = meta.get((r.get("kind"), str(r.get("id"))))
+        if m is None:
+            out.append(dict(r))
+            continue
+        if m.get("deleted"):
+            continue
+        item = dict(r)
+        if m.get("ts"):
+            item["ts"] = m["ts"]
+        if m.get("project"):
+            item["project"] = m["project"]
+        if "status" in m:
+            item["status"] = m["status"]
+        out.append(item)
+    return out
+
+
 def _snapshot_filters_dropped(*, session_id: str | None, harness: str | None) -> list[str]:
     """fix 7: which requested filters this snapshot genuinely cannot honour
     at all (never silent) — project always has a `scope` fallback and

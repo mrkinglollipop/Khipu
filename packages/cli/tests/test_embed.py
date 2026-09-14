@@ -954,7 +954,7 @@ class SearchRowMetadataTest(unittest.TestCase):
                 self.sql = " ".join(sql.split())
 
             def fetchall(self):
-                return [("khipu", ts)]
+                return [("khipu", ts, "active", None)]
 
         cur = FakeCur()
         rows = [{"kind": "topic", "id": "khipu", "score": 0.5}]
@@ -965,6 +965,8 @@ class SearchRowMetadataTest(unittest.TestCase):
         self.assertEqual(out[0]["ts"], ts.isoformat())
         self.assertNotIn("project", out[0])
         self.assertNotIn("harness", out[0])
+        # R6: status IS read now, unconditionally — that is the fix.
+        self.assertEqual(out[0]["status"], "active")
 
     def test_an_episode_with_no_project_gets_no_empty_label(self):
         import datetime as dt
@@ -1209,6 +1211,127 @@ class QueryVectorCacheTest(unittest.TestCase):
             _out, state = em._query_vec(cur, conn, em.PROFILE_2, "q")
         self.assertEqual(state, "miss")
         self.assertEqual(conn.rollbacks, 1)
+
+
+class SearchConfidenceTest(unittest.TestCase):
+    """R4: confidence is derived from raw cosine + literal token hits, not
+    the fused RRF score — a gibberish query and a real hit used to land in
+    the same 0.13-0.20 band. Pure function, fixture rows, no DB."""
+
+    def test_no_rows_is_none(self):
+        self.assertEqual(em.search_confidence([], token_count=3), "none")
+
+    def test_gibberish_shaped_row_is_none(self):
+        """Live-observed shape (2026-09-14): a gibberish query's best row had
+        no literal token hit and a cosine well under the baseline for a real
+        match on this hub's embedding profile."""
+        rows = [{"kind": "episode", "id": "1", "cosine": 0.69, "lexical_hits": 0}]
+        self.assertEqual(em.search_confidence(rows, token_count=5), "none")
+
+    def test_full_literal_coverage_is_strong_even_with_middling_cosine(self):
+        rows = [{"kind": "topic", "id": "x", "cosine": 0.5, "lexical_hits": 4}]
+        self.assertEqual(em.search_confidence(rows, token_count=4), "strong")
+
+    def test_high_cosine_alone_is_strong(self):
+        rows = [{"kind": "episode", "id": "1", "cosine": 0.85, "lexical_hits": 0}]
+        self.assertEqual(em.search_confidence(rows, token_count=5), "strong")
+
+    def test_a_single_literal_hit_without_full_coverage_is_weak(self):
+        rows = [{"kind": "episode", "id": "1", "cosine": 0.6, "lexical_hits": 1}]
+        self.assertEqual(em.search_confidence(rows, token_count=4), "weak")
+
+    def test_literal_mode_rows_have_no_cosine_but_still_score_on_lexical_hits(self):
+        rows = [{"kind": "episode", "id": "1", "lexical_hits": 2}]
+        self.assertEqual(em.search_confidence(rows, token_count=2), "strong")
+        rows_partial = [{"kind": "episode", "id": "1", "lexical_hits": 1}]
+        self.assertEqual(em.search_confidence(rows_partial, token_count=2), "weak")
+
+    def test_it_looks_at_the_best_row_not_just_the_top_ranked_one(self):
+        rows = [
+            {"kind": "episode", "id": "top-ranked", "cosine": 0.5, "lexical_hits": 0},
+            {"kind": "topic", "id": "buried", "cosine": 0.9, "lexical_hits": 0},
+        ]
+        self.assertEqual(em.search_confidence(rows, token_count=3), "strong")
+
+
+class LiteralTrgmStatusTest(unittest.TestCase):
+    """R8: literal_trgm_status is what khipu doctor reads for the migration
+    0015 stop condition — pg_trgm unavailable must read as a SKIP (ok=True),
+    never red; a genuinely half-applied hub (extension present, an index
+    missing) is the only red case."""
+
+    class _FakeCur:
+        def __init__(self, rows_by_call):
+            self._rows_by_call = list(rows_by_call)
+            self._current = []
+
+        def execute(self, sql, params=None):
+            self._current = self._rows_by_call.pop(0)
+
+        def fetchone(self):
+            return self._current[0] if self._current else None
+
+        def fetchall(self):
+            return self._current
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _FakeConn:
+        def __init__(self, cur):
+            self._cur = cur
+
+        def cursor(self):
+            return self._cur
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _conn(self, rows_by_call):
+        return self._FakeConn(self._FakeCur(rows_by_call))
+
+    def test_missing_extension_is_a_skip_not_red(self):
+        from unittest import mock
+
+        with mock.patch("khipu.db.connect", return_value=self._conn([[]])):
+            out = em.literal_trgm_status()
+        self.assertTrue(out["ok"])
+        self.assertIn("skipped", out)
+
+    def test_extension_present_and_all_indexes_present_is_clean(self):
+        from unittest import mock
+
+        rows = [[(1,)], [(n,) for n in sorted(em._LITERAL_TRGM_INDEXES)]]
+        with mock.patch("khipu.db.connect", return_value=self._conn(rows)):
+            out = em.literal_trgm_status()
+        self.assertEqual(out, {"ok": True})
+
+    def test_extension_present_but_an_index_missing_is_red(self):
+        from unittest import mock
+
+        present = sorted(em._LITERAL_TRGM_INDEXES)[:-1]
+        rows = [[(1,)], [(n,) for n in present]]
+        with mock.patch("khipu.db.connect", return_value=self._conn(rows)):
+            out = em.literal_trgm_status()
+        self.assertFalse(out["ok"])
+        self.assertEqual(len(out["missing"]), 1)
+
+    def test_a_connection_failure_is_red_not_a_silent_pass(self):
+        from unittest import mock
+
+        def _boom():
+            raise RuntimeError("hub down")
+
+        with mock.patch("khipu.db.connect", _boom):
+            out = em.literal_trgm_status()
+        self.assertFalse(out["ok"])
+        self.assertIn("error", out)
 
 
 class EmbedBudgetUnlimitedTest(unittest.TestCase):
