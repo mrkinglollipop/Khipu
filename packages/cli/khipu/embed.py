@@ -1403,9 +1403,13 @@ def _apply_search_filters(
         # forever, and a project a note's frontmatter names was invisible to
         # the caller. Both ride out on the row the same way episode
         # project/harness already do, just below.
+        # R7: event_at (the note/topic's own timestamp) wins over updated_at
+        # (when Khipu last mirrored it) so apply_recency and the "date" a
+        # search hit carries reflect when the content actually changed, not
+        # when it happened to be re-ingested.
         cur.execute(
-            "SELECT slug, COALESCE(updated_at, created_at), status, frontmatter->>'project' "
-            "FROM topics WHERE slug = ANY(%s)",
+            "SELECT slug, COALESCE(event_at, updated_at, created_at), status, "
+            "frontmatter->>'project' FROM topics WHERE slug = ANY(%s)",
             (topic_ids,),
         )
         for slug, ts, status, proj in cur.fetchall():
