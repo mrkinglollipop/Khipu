@@ -213,6 +213,60 @@ export function buildAttention(parsed: Record<string, unknown>): {
     });
   }
 
+  // D1: one nightly-step check per doctor key, each read from its own
+  // nightly_steps[<key>] block (error + fix already worded by the CLI).
+  const nightlySteps = (
+    parsed as {
+      nightly_steps?: Record<
+        string,
+        { ok?: boolean; error?: string | null; fix?: string | null }
+      >;
+    }
+  ).nightly_steps;
+  const NIGHTLY_STEP_TITLE: Record<string, string> = {
+    notes_reconcile_ok: "The nightly's notes reconcile step did not run cleanly",
+    embed_provider_ok: "The nightly's embedding backfill step did not run cleanly",
+    commitments_hygiene_ok: "The nightly's commitments hygiene step did not run cleanly",
+    mark_stale_ok: "The nightly's stale-commitments step did not run cleanly",
+  };
+  for (const [key, title] of Object.entries(NIGHTLY_STEP_TITLE)) {
+    const step = nightlySteps?.[key];
+    if (step && step.ok === false) {
+      const why = step.error || "see the nightly log";
+      issues.push(`${title}: ${why}`);
+      items.push({
+        key: key.replace(/_ok$/, ""),
+        tone: "err",
+        title,
+        cause: step.fix ? `${why}. ${step.fix}.` : why,
+      });
+    }
+  }
+
+  if ((parsed as { topics_embed_lag_ok?: boolean }).topics_embed_lag_ok === false) {
+    const lag = (parsed as { topics_embed_lag?: { lag_minutes?: number } }).topics_embed_lag;
+    const mins = lag?.lag_minutes ?? 0;
+    issues.push(`Topic search index ${mins} min behind`);
+    items.push({
+      key: "topics_embed_lag",
+      tone: "warn",
+      title: "A note has waited over an hour to become findable by meaning",
+      cause: `The oldest unembedded topic has waited ${mins} minutes. It is still findable by its exact words meanwhile.`,
+    });
+  }
+
+  if ((parsed as { degraded_rate_ok?: boolean }).degraded_rate_ok === false) {
+    const dr = (parsed as { degraded_rate?: { rate?: number; degraded?: number; sampled?: number } }).degraded_rate;
+    const pct = dr?.rate != null ? Math.round(dr.rate * 100) : 0;
+    issues.push(`Search degraded ${pct}% of recent queries`);
+    items.push({
+      key: "degraded_rate",
+      tone: "warn",
+      title: "Search has been falling back to keyword-only often",
+      cause: `${pct}% of the last ${dr?.sampled ?? 0} searches (${dr?.degraded ?? 0}) could not use meaning-based search — usually a missing or exhausted embedding budget.`,
+    });
+  }
+
   const snap = (parsed as { hub_snapshot?: { ok?: boolean; reason?: string } }).hub_snapshot;
   if (snap && snap.ok === false) {
     issues.push(`Offline copy is stale${snap.reason ? `: ${snap.reason}` : ""}`);

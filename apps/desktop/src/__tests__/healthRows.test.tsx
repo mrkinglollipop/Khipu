@@ -29,6 +29,13 @@ const ALL_OK_KEYS = [
   "embed_coverage_ok",
   "recall_probe_ok",
   "bundle_seal_ok",
+  // Phase 6 (honesty): D1 nightly-step evidence + D6 lag/degrade checks.
+  "notes_reconcile_ok",
+  "embed_provider_ok",
+  "commitments_hygiene_ok",
+  "mark_stale_ok",
+  "topics_embed_lag_ok",
+  "degraded_rate_ok",
 ];
 
 function fixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -40,7 +47,7 @@ function fixture(overrides: Record<string, unknown> = {}): Record<string, unknow
 describe("healthRows (pure)", () => {
   it("returns one row per _ok key, all green, when everything passes", () => {
     const rows = healthRows(fixture());
-    expect(rows).toHaveLength(14);
+    expect(rows).toHaveLength(20);
     expect(rows.every((r) => r.status === "ok")).toBe(true);
   });
 
@@ -69,15 +76,26 @@ describe("healthRows (pure)", () => {
     expect(rows[1]).toMatchObject({ key: "graph_drift_ok", status: "skipped" });
     expect(rows[rows.length - 1].status).toBe("ok");
   });
+
+  it("Phase 6: every new nightly-step / lag / degrade key has a plain-words label", () => {
+    const rows = healthRows(fixture());
+    const byKey = Object.fromEntries(rows.map((r) => [r.key, r.label]));
+    expect(byKey.notes_reconcile_ok).toBe("Notes reconciled by the nightly");
+    expect(byKey.embed_provider_ok).toBe("Embedding provider reachable");
+    expect(byKey.commitments_hygiene_ok).toBe("Commitments hygiene ran");
+    expect(byKey.mark_stale_ok).toBe("Stale commitments aged out");
+    expect(byKey.topics_embed_lag_ok).toBe("Search index catching up on time");
+    expect(byKey.degraded_rate_ok).toBe("Search rarely falls back to keyword-only");
+  });
 });
 
 describe("HealthReportRows", () => {
-  it("(a) renders 14 rows with a check mark and no raw JSON", () => {
+  it("(a) renders 20 rows with a check mark and no raw JSON", () => {
     const { container } = render(
       <HealthReportRows parsed={fixture()} attention={[]} />,
     );
-    expect(container.querySelectorAll(".row-item")).toHaveLength(14);
-    expect(container.querySelectorAll("svg.ok")).toHaveLength(14);
+    expect(container.querySelectorAll(".row-item")).toHaveLength(20);
+    expect(container.querySelectorAll("svg.ok")).toHaveLength(20);
     expect(container.querySelector("pre")).toBeNull();
   });
 
