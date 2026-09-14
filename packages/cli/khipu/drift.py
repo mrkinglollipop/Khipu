@@ -348,6 +348,17 @@ def status_payload(
                 """
             )
             latest_capture_row = cur.fetchone()
+            # D4: can the model tell notes are stale? Needs a live cursor
+            # (khipu.notes.notes_freshness reads topics.event_at), so it
+            # rides this same connection rather than opening a second one.
+            # Fail-open: an unmigrated hub (no event_at column yet) must not
+            # take the rest of status down with it.
+            try:
+                from khipu.notes import notes_freshness
+
+                notes_freshness_block = notes_freshness(cur)
+            except Exception as exc:  # noqa: BLE001 — status must stay resilient
+                notes_freshness_block = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     latest_capture_ts, latest_capture_ingested_at = (
         latest_capture_row if latest_capture_row is not None else (None, None)
     )
@@ -365,6 +376,7 @@ def status_payload(
         ),
         "dsn_ok": True,
         "dsn_source": _dsn_source(),
+        "notes_freshness": notes_freshness_block,
     }
     try:
         from khipu.activity import recent_episodes
@@ -372,6 +384,12 @@ def status_payload(
         out["recent_captures"] = recent_episodes(limit=5)
     except Exception as exc:  # noqa: BLE001 — status must stay resilient
         out["recent_captures_error"] = str(exc)
+    try:
+        from khipu import query_log
+
+        out["search_degraded_last_24h"] = query_log.degraded_count(hours=24)
+    except Exception as exc:  # noqa: BLE001 — status must stay resilient
+        out["search_degraded_last_24h_error"] = str(exc)
     if memory_root:
         from khipu.revisions import conflict_report
 

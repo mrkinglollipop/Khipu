@@ -883,6 +883,7 @@ def backfill(
             if dry_run:
                 stats["would_embed"] = len(todo)
                 return stats
+            stats["failed_chunks"] = 0
             for start in range(0, len(todo), BATCH):
                 batch = todo[start : start + BATCH]
                 # todo rows: (kind, ref, idx, chunk, hash, title)
@@ -896,12 +897,28 @@ def backfill(
                     vecs = embed_batch(api, profile=profile, retries=BACKFILL_RETRIES,
                                        delay=BACKFILL_DELAY_S)
                 except RuntimeError as exc:
-                    if "budget exhausted" not in str(exc):
-                        raise
-                    # Batches already committed stay; tomorrow's sweep finishes.
-                    stats["budget_exhausted"] = True
-                    _log(f"stopping: {exc}")
-                    break
+                    msg = str(exc)
+                    if "budget exhausted" in msg:
+                        # Batches already committed stay; tomorrow's sweep finishes.
+                        stats["budget_exhausted"] = True
+                        _log(f"stopping: {exc}")
+                        break
+                    # F3: a missing/expired key (or any other per-batch
+                    # failure — a transient network blip, a malformed chunk)
+                    # used to raise out of the whole sweep, aborting every
+                    # batch still queued behind it even though earlier
+                    # batches had already committed. Isolate it to this
+                    # batch, count it, and keep going — a batch whose only
+                    # problem is "the API is unreachable right now" gets no
+                    # second chance until the next sweep, but it no longer
+                    # takes the rest of tonight's coverage down with it.
+                    stats["failed_chunks"] += len(batch)
+                    if "API key not found" in msg and not stats.get("embed_provider"):
+                        stats["embed_provider"] = "missing key"
+                    _log(f"batch failed ({type(exc).__name__}): {exc}; continuing")
+                    if start + BATCH < len(todo):
+                        time.sleep(BACKFILL_PAUSE_S)
+                    continue
                 _upsert_chunks(
                     cur, profile,
                     [(k, r, i, chunk, h, v)

@@ -249,15 +249,60 @@ def _run_script(
     return proc.returncode
 
 
+def _nightly_last_path() -> Path:
+    return ensure_data_dir() / "nightly-last.json"
+
+
+def _step_result(result: Any) -> dict[str, Any]:
+    """Normalize a step function's return value into ``{ok, counts,
+    error}`` for ``_record_nightly_step``. Every step here already returns
+    (or, after this phase, now returns) a plain ``{"ok": ..., ...}`` dict on
+    both its success and except branches; a mocked step in a test returns a
+    bare ``Mock``/``MagicMock`` instead, which is treated as an
+    unremarkable success — its shape is unknown, not its outcome."""
+    if isinstance(result, dict):
+        return {
+            "ok": bool(result.get("ok", True)),
+            "counts": result,
+            "error": result.get("error") or result.get("reason"),
+        }
+    return {"ok": True, "counts": None, "error": None}
+
+
+def _record_nightly_step(
+    steps: list[dict[str, Any]], name: str, *, ok: bool, counts: Any = None, error: str | None = None
+) -> None:
+    """F3/D1: persist this nightly's step-by-step outcome to
+    ``nightly-last.json`` (one entry per step: name/ok/counts/error/ts) —
+    the "green because the evidence never arrived" class (audit
+    2026-08-17): notes reconcile, embed backfill, mark-stale and hygiene
+    outcomes were logged as free text and never read by anything. Phase 6
+    reads this file; written here so it exists starting now. Written after
+    EVERY step (not once at the end) so a step that hangs or crashes the
+    process still leaves every step before it on record."""
+    steps.append({
+        "name": name, "ok": bool(ok), "counts": counts, "error": error,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
+    try:
+        _nightly_last_path().write_text(
+            json.dumps({"steps": steps}, default=str, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
 def run_nightly() -> int:
+    steps: list[dict[str, Any]] = []
     rc = _run_script(
         CONSOLIDATE_NIGHTLY, log_stem="khipu-nightly", state_name="nightly"
     )
-    _reconcile_notes_if_due()
-    _embed_backfill()
-    _prune_query_cache()
-    _mark_stale_commitments()
-    _hygiene_commitments()
+    _record_nightly_step(steps, "consolidate_nightly", ok=(rc == 0), counts={"rc": rc})
+    _record_nightly_step(steps, "notes_reconcile", **_step_result(_reconcile_notes_if_due()))
+    _record_nightly_step(steps, "embed_backfill", **_step_result(_embed_backfill()))
+    _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))
+    _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
+    _record_nightly_step(steps, "commitments_hygiene", **_step_result(_hygiene_commitments()))
     return rc
 
 
@@ -270,7 +315,7 @@ def _nightly_log(line: str) -> None:
         pass
 
 
-def _embed_backfill() -> None:
+def _embed_backfill() -> dict[str, Any]:
     """Khipu owns the vector sweep. Until 2026-09-05 the only nightly embed
     backfill ran inside the legacy consolidate driver, AFTER its
     memory-root reconcile — so any reconcile failure (an unterminated
@@ -284,11 +329,14 @@ def _embed_backfill() -> None:
 
         stats = embed.backfill()
         _nightly_log(f"[khipu-embed] backfill ok {json.dumps(stats, default=str)[:400]}")
+        out = {"ok": True, **stats}
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
         _nightly_log(f"[khipu-embed] backfill skipped: {type(exc).__name__}: {exc}")
+        out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return out
 
 
-def _prune_query_cache() -> None:
+def _prune_query_cache() -> dict[str, Any]:
     """Drop query vectors nobody has asked for in a month (see
     khipu.embed.QUERY_CACHE_TTL_DAYS). Fail-open like the backfill."""
     try:
@@ -296,11 +344,14 @@ def _prune_query_cache() -> None:
 
         n = embed.prune_query_cache()
         _nightly_log(f"[khipu-embed] query cache pruned {n}")
+        out = {"ok": True, "pruned": n}
     except Exception as exc:  # noqa: BLE001
         _nightly_log(f"[khipu-embed] query cache prune skipped: {type(exc).__name__}: {exc}")
+        out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return out
 
 
-def _mark_stale_commitments() -> None:
+def _mark_stale_commitments() -> dict[str, Any]:
     """W3: age open commitments past STALE_AFTER_DAYS into 'stale'.
 
     ``commitments.mark_stale`` shipped with no caller at all (audit
@@ -326,9 +377,10 @@ def _mark_stale_commitments() -> None:
             f.write(f"commitments-mark-stale: {json.dumps(out, default=str)[:300]}\n".encode())
     except OSError:
         pass
+    return out
 
 
-def _hygiene_commitments() -> None:
+def _hygiene_commitments() -> dict[str, Any]:
     """W3 Owed quality (2026-09-05): run the two hygiene passes every night
     instead of only on demand via `khipu hygiene commitments`.
 
@@ -353,11 +405,17 @@ def _hygiene_commitments() -> None:
             f"[khipu-hygiene] session-ended {session_report.get('counts')} · "
             f"rejudge {rejudge_report.get('counts')} · backup {backup_dir}"
         )
+        out = {
+            "ok": True, "session_ended": session_report.get("counts"),
+            "rejudge": rejudge_report.get("counts"), "backup": str(backup_dir),
+        }
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
         _nightly_log(f"[khipu-hygiene] skipped: {type(exc).__name__}: {exc}")
+        out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return out
 
 
-def _reconcile_notes_if_due() -> None:
+def _reconcile_notes_if_due() -> dict[str, Any]:
     """W4.3: piggyback `khipu.notes.reconcile` on the nightly cadence, the
     same posture as `_offsite_if_due` on the graph job — additive,
     best-effort, and must never turn a good nightly run into a bad one on
@@ -375,6 +433,7 @@ def _reconcile_notes_if_due() -> None:
             f.write(f"notes-reconcile: {json.dumps(out, default=str)[:600]}\n".encode())
     except OSError:
         pass
+    return out
 
 
 def run_monthly(*, dry_run: bool = False) -> int:

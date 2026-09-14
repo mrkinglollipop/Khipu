@@ -935,6 +935,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         filters={"kind": kind, "project": project, "since": since, "until": until,
                  "session_id": session_id, "harness": harness},
         result_count=len(payload.get("results") or []), top=payload.get("results") or [],
+        degraded=payload.get("degraded"),
     )
     print(json.dumps(payload, indent=2))
     return 0
