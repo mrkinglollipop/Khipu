@@ -116,6 +116,19 @@ def degraded_count(*, hours: int = 24) -> int:
     return n
 
 
+def degraded_rate(*, n: int = 50) -> dict[str, Any]:
+    """D6/F4: fraction of the last `n` searches that degraded — a rate, not
+    just `degraded_count`'s raw 24h total, so a burst of degraded searches
+    shows even on a day with heavy volume. Red past 20% (D6's threshold); no
+    searches yet reads as ok with a 0 sample, not red-on-idleness."""
+    entries = tail(n)
+    if not entries:
+        return {"ok": True, "rate": 0.0, "sampled": 0, "degraded": 0}
+    degraded = sum(1 for e in entries if e.get("degraded"))
+    rate = degraded / len(entries)
+    return {"ok": rate <= 0.20, "rate": rate, "sampled": len(entries), "degraded": degraded}
+
+
 def _read_lines(path: Path) -> list[str]:
     if not path.is_file():
         return []

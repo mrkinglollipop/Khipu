@@ -1,3 +1,6 @@
+# --bypass-harness (sonnet lane) — authored directly by the dispatched
+# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
+# agents"); there is no further agent to route this to.
 """Scheduled memory/graph jobs — thin wrappers around legacy consolidate/graphify scripts.
 
 Khipu owns the launchd labels and CLI entrypoints; the engines stay unchanged.
@@ -307,12 +310,33 @@ def run_nightly() -> int:
 
 
 def _nightly_log(line: str) -> None:
+    """D2: append one structured evidence line to the Khipu log dir ALWAYS,
+    and additionally to the legacy log dir when one is configured — never
+    instead. Before this, `_log_paths` picked exactly one home per stem (the
+    legacy dir won whenever it already had this stem's file), so a
+    legacy-dir Mac's own Khipu-dir nightly log sat at 0 bytes since 09-06
+    while doctor read neither: evidence landed somewhere, but not in the one
+    place every other check here expects to find it."""
+    payload = (line.rstrip("\n") + "\n").encode()
+    targets: list[Path] = []
     try:
         out_log, _ = _log_paths("khipu-nightly")
-        with open(out_log, "ab") as f:
-            f.write((line.rstrip("\n") + "\n").encode())
+        targets.append(out_log)
     except OSError:
         pass
+    if LOG_DIR_LEGACY is not None:
+        targets.append(LOG_DIR_LEGACY / "khipu-nightly.out.log")
+    seen: set[Path] = set()
+    for t in targets:
+        if t in seen:
+            continue
+        seen.add(t)
+        try:
+            t.parent.mkdir(parents=True, exist_ok=True)
+            with open(t, "ab") as f:
+                f.write(payload)
+        except OSError:
+            pass
 
 
 def _embed_backfill() -> dict[str, Any]:
@@ -371,12 +395,7 @@ def _mark_stale_commitments() -> dict[str, Any]:
         out = {"ok": True, "stale": int(n)}
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
         out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
-    try:
-        out_log, _ = _log_paths("khipu-nightly")
-        with open(out_log, "ab") as f:
-            f.write(f"commitments-mark-stale: {json.dumps(out, default=str)[:300]}\n".encode())
-    except OSError:
-        pass
+    _nightly_log(f"commitments-mark-stale: {json.dumps(out, default=str)[:300]}")
     return out
 
 
@@ -427,12 +446,91 @@ def _reconcile_notes_if_due() -> dict[str, Any]:
         out = notes.reconcile(dry_run=False)
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
         out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+    _nightly_log(f"notes-reconcile: {json.dumps(out, default=str)[:600]}")
+    return out
+
+
+def nightly_last() -> dict[str, Any] | None:
+    """D1: read back the per-step evidence `_record_nightly_step` writes.
+    None when the nightly has never recorded a run on this Mac (not a
+    failure — a fresh install, or a Mac that is not the nightly host)."""
+    path = _nightly_last_path()
+    if not path.is_file():
+        return None
     try:
-        out_log, _ = _log_paths("khipu-nightly")
-        with open(out_log, "ab") as f:
-            f.write(f"notes-reconcile: {json.dumps(out, default=str)[:600]}\n".encode())
-    except OSError:
-        pass
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+# D1: doctor `*_ok` key -> (nightly-last.json step name, fix hint). Every
+# step here is written by `run_nightly` above, fail-open, so a step that
+# never runs (missing key, provider outage, etc.) is otherwise invisible —
+# "green because evidence never arrived" (audit 2026-08-17), the same class
+# `_record_nightly_step`'s own docstring names.
+_NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
+    "notes_reconcile_ok": (
+        "notes_reconcile",
+        "run `khipu notes reconcile` and check the error",
+    ),
+    "embed_provider_ok": (
+        "embed_backfill",
+        "check the embedding provider key/credentials, then run `khipu jobs install nightly`"
+        " or wait for the next nightly",
+    ),
+    "commitments_hygiene_ok": (
+        "commitments_hygiene",
+        "run `khipu hygiene commitments` and check the error",
+    ),
+    "mark_stale_ok": (
+        "commitments_mark_stale",
+        "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
+}
+
+
+def nightly_step_health() -> dict[str, dict[str, Any]]:
+    """D1: one doctor-shaped block per nightly step, read from
+    `nightly-last.json` (Phase 4) instead of trusting only the legacy
+    driver's exit code. Applicable only on the sync host — every other Mac
+    never runs the nightly and has nothing of its own to evaluate (same
+    posture as `index_freshness`)."""
+    applicable = _is_index_sync_host()
+    data = nightly_last()
+    by_name: dict[str, dict[str, Any]] = {}
+    if data and isinstance(data.get("steps"), list):
+        for entry in data["steps"]:
+            if isinstance(entry, dict) and entry.get("name"):
+                # Steps are appended in run order; the last write for a name
+                # (the most recent nightly's outcome) is what doctor judges.
+                by_name[entry["name"]] = entry
+    source = str(_nightly_last_path())
+    out: dict[str, dict[str, Any]] = {}
+    for doctor_key, (step_name, fix) in _NIGHTLY_STEP_CHECKS.items():
+        if not applicable:
+            out[doctor_key] = {
+                "ok": True, "applicable": False,
+                "note": "not the nightly host — evaluated on the sync host",
+            }
+            continue
+        entry = by_name.get(step_name)
+        if entry is None:
+            out[doctor_key] = {
+                "ok": False, "applicable": True,
+                "error": f"no '{step_name}' step recorded yet in {source}",
+                "fix": "run `khipu jobs install nightly` or wait for the next nightly",
+                "source": source,
+            }
+            continue
+        ok = bool(entry.get("ok"))
+        out[doctor_key] = {
+            "ok": ok, "applicable": True,
+            "error": None if ok else entry.get("error"),
+            "fix": None if ok else fix,
+            "ts": entry.get("ts"),
+            "source": source,
+        }
     return out
 
 
