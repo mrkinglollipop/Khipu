@@ -17,7 +17,10 @@ Packs:
                ~/.cursor/hooks.json hooks.sessionStart += khipu-recall-hook
                  (--cursor → additional_context; timeout 30s for PG;
                  does not replace existing harness sessionStart entries)
-               optional --project → .cursor/rules/khipu.mdc (pull)
+               optional --project → .cursor/rules/khipu.mdc (pull; the ONLY
+                 per-prompt mechanism Cursor gets — it has no UserPromptSubmit
+                 hook event to push through, so the rule text itself carries
+                 the "search before answering" instruction)
   aegis        ~/.grok/config.toml [mcp_servers.khipu]
                ~/.grok/config.toml [[hooks.Stop]] / [[hooks.PreCompact]] → khipu-stop-hook
                ~/.grok/config.toml [[hooks.Stop]] / [[hooks.PreCompact]] / [[hooks.SessionEnd]]
@@ -25,8 +28,14 @@ Packs:
                  capture_v2 hook, so this is what makes Aegis sessions produce episodes)
                (no recall rule: SessionStart/UserPromptSubmit are Observe gates — verified)
   codex        ~/.codex/config.toml [mcp_servers.khipu]            (TOML, like Aegis)
-               ~/.codex/hooks.json hooks.Stop / PreCompact / SessionStart (Claude-shaped JSON —
-               verified 2026-08-17: same event names + {type,command,timeout} entries)
+               ~/.codex/hooks.json hooks.Stop / PreCompact / SessionStart / UserPromptSubmit
+               (Claude-shaped JSON — verified 2026-08-17: same event names +
+               {type,command,timeout} entries; UserPromptSubmit exposed the same way)
+
+  Every claude_code/codex pack above also gets hooks.UserPromptSubmit +=
+  khipu-prompt-recall (R1): a bounded per-prompt search, pushed the same way
+  as the SessionStart recall push, so the model does not have to decide to
+  search — see khipu.recall_prompt.
 
 Every write backs the file up first (``*.bak-khipu-<stamp>``); uninstall
 removes only Khipu-owned entries (matched by our command path), so a
@@ -110,6 +119,16 @@ def recall_hook() -> str:
     return _shim("khipu-recall-hook")
 
 
+def prompt_recall_hook() -> str:
+    return _shim("khipu-prompt-recall")
+
+
+# UserPromptSubmit hook budget: the hook's own internal wall-clock cap is 1.2s
+# (khipu.recall_prompt.TIMEOUT_S); this is the harness-side timeout around the
+# whole process (python startup + the internal budget + a margin), so a hung
+# process is killed by the harness rather than the hook's own timer alone.
+PROMPT_RECALL_TIMEOUT = 3
+
 CODEX_SESSIONEND_TIMEOUT = 3
 
 
@@ -148,6 +167,10 @@ def _repoint(hooks_list: list[dict], is_ours, want: str) -> bool:
 
 def _is_our_recall(cmd: Any) -> bool:
     return isinstance(cmd, str) and "khipu-recall-hook" in cmd
+
+
+def _is_our_prompt_recall(cmd: Any) -> bool:
+    return isinstance(cmd, str) and "khipu-prompt-recall" in cmd
 
 
 def _stamp() -> str:
@@ -261,6 +284,20 @@ def _claude_install(dry: bool) -> dict:
     elif _repoint(flat, _is_our_recall, recall_hook()):
         out["changes"].append(f"{CLAUDE_SETTINGS}: hooks.SessionStart khipu-recall-hook -> {recall_hook()}")
         changed = True
+    # Per-prompt recall (R1): the other half of the recall rule — a bounded
+    # search on the PROMPT ITSELF, pushed before the model acts, instead of
+    # relying on the model to decide to search.
+    ps = hooks.setdefault("UserPromptSubmit", [])
+    flat = [h for e in ps for h in e.get("hooks", [])]
+    if not any(_is_our_prompt_recall(h.get("command")) for h in flat):
+        ps.append({"hooks": [{"type": "command", "command": prompt_recall_hook(),
+                               "timeout": PROMPT_RECALL_TIMEOUT}]})
+        out["changes"].append(f"{CLAUDE_SETTINGS}: hooks.UserPromptSubmit += khipu-prompt-recall")
+        changed = True
+    elif _repoint(flat, _is_our_prompt_recall, prompt_recall_hook()):
+        out["changes"].append(
+            f"{CLAUDE_SETTINGS}: hooks.UserPromptSubmit khipu-prompt-recall -> {prompt_recall_hook()}")
+        changed = True
     if changed and not dry:
         out.setdefault("backups", []).append(_backup(CLAUDE_SETTINGS))
         _write_json(CLAUDE_SETTINGS, s)
@@ -278,12 +315,13 @@ def _claude_uninstall(dry: bool) -> dict:
             _write_json(CLAUDE_JSON, d)
     s = _load_json(CLAUDE_SETTINGS)
     changed = False
-    for event in ("Stop", "PreCompact", "SessionEnd", "SessionStart"):
+    for event in ("Stop", "PreCompact", "SessionEnd", "SessionStart", "UserPromptSubmit"):
         entries = s.get("hooks", {}).get(event, [])
         kept = []
         for e in entries:
             e_hooks = [h for h in e.get("hooks", [])
-                       if not (_is_ours(h.get("command")) or _is_our_recall(h.get("command")))]
+                       if not (_is_ours(h.get("command")) or _is_our_recall(h.get("command"))
+                               or _is_our_prompt_recall(h.get("command")))]
             if len(e_hooks) != len(e.get("hooks", [])):
                 changed = True
                 out["changes"].append(f"{CLAUDE_SETTINGS}: hooks.{event} -= khipu hook")
@@ -307,10 +345,13 @@ def _claude_status() -> dict:
         return any(_is_ours(h.get("command")) for e in s.get("hooks", {}).get(ev, []) for h in e.get("hooks", []))
     rule = any(_is_our_recall(h.get("command"))
                for e in s.get("hooks", {}).get("SessionStart", []) for h in e.get("hooks", []))
+    prompt_recall = any(_is_our_prompt_recall(h.get("command"))
+                        for e in s.get("hooks", {}).get("UserPromptSubmit", []) for h in e.get("hooks", []))
     native = has("Stop") and has("PreCompact")
     return {"harness": "claude_code", "detected": _claude_detected(), "mcp": mcp,
             "hook_stop": has("Stop"), "hook_precompact": has("PreCompact"), "hook_sessionend": has("SessionEnd"),
             "recall_rule": "installed" if rule else "missing",
+            "prompt_recall": "installed" if prompt_recall else "missing",
             # Khipu-native extraction rides on this same hook (session_capture);
             # "legacy" was the model-driven capture_v2 nudge, which is now only
             # a parallel writer until the soak-gated legacy removal.
@@ -671,6 +712,19 @@ def _codex_install(dry: bool) -> dict:
     elif _repoint(flat, _is_our_recall, recall_hook()):
         out["changes"].append(f"{CODEX_HOOKS}: hooks.SessionStart khipu-recall-hook -> {recall_hook()}")
         changed = True
+    # Per-prompt recall (R1) — Codex's hooks.json carries UserPromptSubmit in
+    # the same Claude-shaped envelope, verified alongside its SessionStart.
+    ps = hooks.setdefault("UserPromptSubmit", [])
+    flat = [x for e in ps for x in e.get("hooks", [])]
+    if not any(_is_our_prompt_recall(x.get("command")) for x in flat):
+        ps.append({"hooks": [{"type": "command", "command": prompt_recall_hook(),
+                              "timeout": PROMPT_RECALL_TIMEOUT}]})
+        out["changes"].append(f"{CODEX_HOOKS}: hooks.UserPromptSubmit += khipu-prompt-recall")
+        changed = True
+    elif _repoint(flat, _is_our_prompt_recall, prompt_recall_hook()):
+        out["changes"].append(
+            f"{CODEX_HOOKS}: hooks.UserPromptSubmit khipu-prompt-recall -> {prompt_recall_hook()}")
+        changed = True
     if changed and not dry:
         out.setdefault("backups", []).append(_backup(CODEX_HOOKS))
         _write_json(CODEX_HOOKS, h)
@@ -689,12 +743,13 @@ def _codex_uninstall(dry: bool) -> dict:
                 CODEX_TOML.write_text(new.rstrip("\n") + "\n", encoding="utf-8")
     h = _load_json(CODEX_HOOKS)
     changed = False
-    for event in ("Stop", "PreCompact", "SessionEnd", "SessionStart"):
+    for event in ("Stop", "PreCompact", "SessionEnd", "SessionStart", "UserPromptSubmit"):
         entries = h.get("hooks", {}).get(event, [])
         kept = []
         for e in entries:
             e_hooks = [x for x in e.get("hooks", [])
-                       if not (_is_ours(x.get("command")) or _is_our_recall(x.get("command")))]
+                       if not (_is_ours(x.get("command")) or _is_our_recall(x.get("command"))
+                               or _is_our_prompt_recall(x.get("command")))]
             if len(e_hooks) != len(e.get("hooks", [])):
                 changed = True
                 out["changes"].append(f"{CODEX_HOOKS}: hooks.{event} -= khipu hook")
@@ -721,6 +776,7 @@ def _codex_status() -> dict:
             "hook_stop": has("Stop", _is_ours), "hook_precompact": has("PreCompact", _is_ours),
             "hook_sessionend": has("SessionEnd", _is_ours),
             "recall_rule": "installed" if has("SessionStart", _is_our_recall) else "missing",
+            "prompt_recall": "installed" if has("UserPromptSubmit", _is_our_prompt_recall) else "missing",
             "extract": "installed" if has("Stop", _is_ours) and has("PreCompact", _is_ours) else "missing"}
 
 
@@ -953,6 +1009,52 @@ def _probe_recall(command: str) -> dict:
                 "ms": int((time.time() - t0) * 1000)}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _probe_prompt_recall(command: str) -> dict:
+    """UserPromptSubmit hook: a trivial prompt must print exactly {} (R11's
+    gate) and a topical one must run cleanly and return valid JSON, shell-run
+    for the same reason as _probe_hook.
+
+    The topical case is data-dependent (it searches the real hub) AND
+    latency-dependent (khipu.recall_prompt.TIMEOUT_S=1.2s is a hard internal
+    budget; a slow hub can legitimately time out, which the hook reports as
+    an empty — not broken — result per its own documented fail-open). So
+    "found something" is reported for visibility (``topical_context_chars``,
+    ``topical_ms``) but is NOT part of ``ok`` — only the trivial-prompt gate
+    and clean execution are. Asserting non-empty here would make `verify`
+    flake on exactly the safe failure mode the hook is designed to have.
+    """
+    t0 = time.time()
+    try:
+        trivial = subprocess.run(command, shell=True, input='{"prompt":"ok"}',
+                                  capture_output=True, text=True, timeout=10)
+        topical = subprocess.run(
+            command, shell=True,
+            input=json.dumps({"prompt": "khipu prompt recall verify probe", "session_id": "khipu-verify"}),
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    try:
+        d_trivial = json.loads(trivial.stdout.strip() or "{}")
+        d_topical = json.loads(topical.stdout.strip() or "{}")
+    except ValueError as e:
+        return {"ok": False, "error": f"non-JSON output: {e}"}
+    trivial_ctx = (
+        d_trivial.get("hookSpecificOutput", {}).get("additionalContext")
+        or d_trivial.get("additional_context") or ""
+    )
+    topical_ctx = (
+        d_topical.get("hookSpecificOutput", {}).get("additionalContext")
+        or d_topical.get("additional_context") or ""
+    )
+    ok = trivial.returncode == 0 and topical.returncode == 0 and trivial_ctx == ""
+    out = {"ok": ok, "trivial_empty": trivial_ctx == "", "topical_context_chars": len(topical_ctx),
+           "ms": int((time.time() - t0) * 1000)}
+    if not ok:
+        out["error"] = (trivial.stderr or topical.stderr or "trivial prompt was not empty")[-300:]
+    return out
 
 
 def _probe_extract(command: str) -> dict:
@@ -1262,6 +1364,10 @@ def verify(harness: str, *, project: str | None = None) -> dict:
                 recall.update({k: v for k, v in ref.items() if k != "ms"},
                               ok=recall["ok"] and ref["ok"])
             out["components"]["recall"] = recall
+        # Per-prompt recall (R1): Claude Code / Codex only — Cursor has no
+        # UserPromptSubmit event to hook (it keeps the pull rule instead).
+        if harness in ("claude_code", "codex") and st.get("prompt_recall") == "installed":
+            out["components"]["prompt_recall"] = _probe_prompt_recall(prompt_recall_hook())
         if harness == "cursor":
             # The recall rule is written per-project (Cursor's User Rules live
             # in app state, not a writable file) — `khipu integrations install

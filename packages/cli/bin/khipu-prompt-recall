@@ -1,0 +1,41 @@
+#!/bin/sh
+# khipu-prompt-recall — UserPromptSubmit recall push (Phase 1, R1). Reads the
+# harness's prompt-submit payload on stdin (prompt/cwd/session_id) and prints
+# hookSpecificOutput.additionalContext with the top matching prior work, or
+# {} when nothing qualifies. Never fails a turn: any error -> {}.
+# Aegis's runner env means Aegis is calling, and Aegis gets no per-prompt
+# push by ANY route: its UserPromptSubmit is an Observe gate that discards
+# stdout, same as its SessionStart (see khipu/recall_rule.py). Refuse on
+# GROK runner vars AND on the pack's KHIPU_HARNESS=aegis mark, same guard as
+# khipu-recall-hook.
+if [ -n "${GROK_HOOK_NAME:-}${GROK_HOOK_EVENT:-}" ] || [ "${KHIPU_HARNESS:-}" = "aegis" ]; then
+  cat >/dev/null 2>&1
+  echo '{}'
+  exit 0
+fi
+# Resolve the repo from THIS script's own location (following the shim symlink)
+# rather than a hardcoded path — see khipu-recall-hook for why.
+SELF="$0"
+HOPS=0
+while [ -L "$SELF" ] && [ "$HOPS" -lt 40 ]; do
+  LINK=$(readlink "$SELF")
+  case "$LINK" in /*) SELF="$LINK" ;; *) SELF="$(dirname "$SELF")/$LINK" ;; esac
+  HOPS=$((HOPS + 1))
+done
+SELF_DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
+ROOT="${KHIPU_ROOT:-$(cd "$SELF_DIR/../../.." 2>/dev/null && pwd)}"
+PYTHONPATH="$ROOT/packages/cli:$ROOT/.python_libs${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+mkdir -p "${HOME}/Library/Logs/khipu" 2>/dev/null
+# Bytecode cache goes OUTSIDE any signed .app bundle — see khipu.paths.pycache_dir.
+PYTHONPYCACHEPREFIX="${HOME}/Library/Caches/Khipu/pycache"
+mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null
+export PYTHONPYCACHEPREFIX
+PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
+[ -x "$PY" ] || PY="python3"
+SHAPE=claude
+for a in "$@"; do
+  case "$a" in --cursor) SHAPE=cursor ;; esac
+done
+"$PY" -c "from khipu.recall_prompt import prompt_recall_main; prompt_recall_main(shape='$SHAPE')" 2>/dev/null || echo '{}'
+exit 0
