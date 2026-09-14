@@ -458,3 +458,210 @@ class DecisionsBackfillTest(unittest.TestCase):
         cur = _DecisionsCursor(migrated=False)
         report = de.backfill_decisions(cur, apply=False)
         self.assertFalse(report.get("ok", True))
+
+
+# ---- O4: deliverables index -------------------------------------------------
+
+from khipu import extract as _extract
+from khipu import deliverables as dl
+
+
+class ExtractDeliverablesTest(unittest.TestCase):
+    def test_a_written_file_is_captured(self):
+        out = _extract.extract_deliverables(
+            "ASSISTANT: I wrote the migration to ops/migrations/0019_decisions.sql."
+        )
+        self.assertEqual(out, [{"kind": "file", "path": "ops/migrations/0019_decisions.sql",
+                                 "url": None, "title": None}])
+
+    def test_created_and_saved_and_added_all_count(self):
+        for verb in ("created", "saved", "added"):
+            with self.subTest(verb=verb):
+                out = _extract.extract_deliverables(
+                    f"ASSISTANT: I {verb} packages/cli/khipu/decisions.py for the module."
+                )
+                self.assertEqual(out[0]["path"], "packages/cli/khipu/decisions.py")
+
+    def test_a_pr_url_is_captured(self):
+        out = _extract.extract_deliverables(
+            "ASSISTANT: Opened https://github.com/mrkinglollipop/Khipu/pull/82 for review."
+        )
+        self.assertEqual(out, [{"kind": "pr", "path": None,
+                                 "url": "https://github.com/mrkinglollipop/Khipu/pull/82",
+                                 "title": None}])
+
+    def test_an_issue_url_is_captured(self):
+        out = _extract.extract_deliverables(
+            "ASSISTANT: Filed https://github.com/mrkinglollipop/Khipu/issues/45."
+        )
+        self.assertEqual(out[0]["kind"], "issue")
+
+    def test_a_release_tag_is_captured(self):
+        out = _extract.extract_deliverables("ASSISTANT: Tagged v0.4.4 and published it.")
+        self.assertEqual(out, [{"kind": "release", "path": None, "url": None, "title": "v0.4.4"}])
+
+    def test_a_path_with_no_verb_is_not_captured(self):
+        """Only a path on the SAME line as wrote/created/added/saved counts —
+        a path merely mentioned later is not something this window built."""
+        out = _extract.extract_deliverables(
+            "ASSISTANT: The config lives at packages/cli/khipu/config.py."
+        )
+        self.assertEqual(out, [])
+
+    def test_an_unlisted_extension_is_ignored(self):
+        out = _extract.extract_deliverables("ASSISTANT: I wrote notes.txt for later.")
+        self.assertEqual(out, [])
+
+    def test_duplicates_within_one_window_are_deduped(self):
+        out = _extract.extract_deliverables(
+            "ASSISTANT: I wrote khipu/decisions.py.\n\n"
+            "ASSISTANT: As mentioned, I wrote khipu/decisions.py again."
+        )
+        self.assertEqual(len(out), 1)
+
+    def test_empty_text_returns_empty_list(self):
+        self.assertEqual(_extract.extract_deliverables(""), [])
+
+
+class _DeliverablesCursor:
+    """In-memory stand-in for the ``deliverables`` table."""
+
+    def __init__(self, *, migrated: bool = True):
+        self.rows: dict[int, dict] = {}
+        self.migrated = migrated
+        self.next_id = 1
+        self.rowcount = 0
+        self._result: list[tuple] = []
+        from khipu import db as _db
+
+        _db._TABLE_COLUMNS_CACHE.pop("deliverables", None)
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        params = params or ()
+        if s.startswith("SELECT column_name FROM information_schema.columns"):
+            cols = (
+                ["id", "project", "kind", "path", "url", "title", "episode_id", "created_at"]
+                if self.migrated else []
+            )
+            self._result = [(c,) for c in cols]
+            return
+        if s.startswith("SELECT id FROM deliverables WHERE project IS NOT DISTINCT FROM"):
+            project, kind, path, url = params
+            hit = next(
+                (r["id"] for r in self.rows.values()
+                 if r["project"] == project and r["kind"] == kind
+                 and r["path"] == path and r["url"] == url),
+                None,
+            )
+            self._result = [(hit,)] if hit is not None else []
+            return
+        if s.startswith("INSERT INTO deliverables"):
+            project, kind, path, url, title, episode_id = params
+            cid = self.next_id
+            self.next_id += 1
+            self.rows[cid] = {
+                "id": cid, "project": project, "kind": kind, "path": path, "url": url,
+                "title": title, "episode_id": episode_id, "created_at": "2026-09-14",
+            }
+            self.rowcount = 1
+            return
+        if s.startswith("SELECT id, project, kind, path, url, title, episode_id, created_at"):
+            project, limit = params
+            out = [r for r in self.rows.values() if r["project"] == project]
+            cols = ("id", "project", "kind", "path", "url", "title", "episode_id", "created_at")
+            self._result = [tuple(r[c] for c in cols) for r in out[:limit]]
+            return
+        raise AssertionError(f"unexpected SQL: {s[:120]}")
+
+    def fetchall(self):
+        return list(self._result)
+
+    def fetchone(self):
+        return self._result[0] if self._result else None
+
+
+class DeliverablesInsertTest(unittest.TestCase):
+    def test_each_item_becomes_a_row(self):
+        cur = _DeliverablesCursor()
+        payload = {"project": "acme/widget", "deliverables": [
+            {"kind": "file", "path": "khipu/decisions.py", "url": None, "title": None},
+            {"kind": "pr", "path": None, "url": "https://x/pull/1", "title": None},
+        ]}
+        self.assertEqual(dl.insert_deliverables_from_episode(cur, payload, 1), 2)
+        self.assertEqual(len(cur.rows), 2)
+
+    def test_the_same_path_in_the_same_project_dedups(self):
+        cur = _DeliverablesCursor()
+        payload = {"project": "acme/widget", "deliverables": [
+            {"kind": "file", "path": "khipu/decisions.py", "url": None, "title": None},
+        ]}
+        self.assertEqual(dl.insert_deliverables_from_episode(cur, payload, 1), 1)
+        self.assertEqual(dl.insert_deliverables_from_episode(cur, payload, 2), 0)
+        self.assertEqual(len(cur.rows), 1)
+
+    def test_an_unknown_kind_is_skipped(self):
+        cur = _DeliverablesCursor()
+        payload = {"project": "acme/widget", "deliverables": [
+            {"kind": "bogus", "path": "x.py"},
+        ]}
+        self.assertEqual(dl.insert_deliverables_from_episode(cur, payload, 1), 0)
+
+    def test_pre_migration_hub_is_a_noop(self):
+        cur = _DeliverablesCursor(migrated=False)
+        payload = {"project": "acme/widget", "deliverables": [
+            {"kind": "file", "path": "khipu/decisions.py"},
+        ]}
+        self.assertEqual(dl.insert_deliverables_from_episode(cur, payload, 1), 0)
+
+
+class DeliverablesMatcherTest(unittest.TestCase):
+    """The recall-hook matcher — pure logic, no DB."""
+
+    def test_two_or_more_matching_tokens_is_a_match(self):
+        rows = [{"path": "packages/cli/khipu/decisions.py", "title": None,
+                 "created_at": "2026-09-14", "episode_id": 42}]
+        match = dl.best_match_for_tokens(rows, ["decisions", "khipu", "registry"])
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match["episode_id"], 42)
+
+    def test_one_matching_token_is_not_a_match(self):
+        rows = [{"path": "packages/cli/khipu/decisions.py", "title": None,
+                 "created_at": "2026-09-14", "episode_id": 42}]
+        self.assertIsNone(dl.best_match_for_tokens(rows, ["decisions", "unrelated"]))
+
+    def test_the_best_scoring_row_wins(self):
+        rows = [
+            {"path": "khipu/decisions.py", "title": None, "created_at": "2026-09-01",
+             "episode_id": 1},
+            {"path": "khipu/decisions.py", "title": "decisions registry", "created_at": "2026-09-14",
+             "episode_id": 2},
+        ]
+        match = dl.best_match_for_tokens(rows, ["decisions", "registry"])
+        assert match is not None
+        self.assertEqual(match["episode_id"], 2)
+
+    def test_format_produced_line(self):
+        row = {"path": "khipu/decisions.py", "url": None, "title": None,
+               "created_at": "2026-09-14T10:00:00+00:00", "episode_id": 42}
+        line = dl.format_produced_line(row)
+        self.assertEqual(line, "You produced khipu/decisions.py on 2026-09-14 (episode 42)")
+
+    def test_deliverable_line_for_prompt_end_to_end(self):
+        cur = _DeliverablesCursor()
+        payload = {"project": "acme/widget", "deliverables": [
+            {"kind": "file", "path": "khipu/decisions.py", "url": None, "title": None},
+        ]}
+        dl.insert_deliverables_from_episode(cur, payload, 42)
+        line = dl.deliverable_line_for_prompt(
+            cur, ["decisions", "registry", "khipu"], project="acme/widget"
+        )
+        self.assertIsNotNone(line)
+        assert line is not None
+        self.assertTrue(line.startswith("You produced khipu/decisions.py"))
+        self.assertIn("episode 42", line)
+
+    def test_no_project_never_queries(self):
+        cur = _DeliverablesCursor()
+        self.assertIsNone(dl.deliverable_line_for_prompt(cur, ["x", "y"], project=None))
