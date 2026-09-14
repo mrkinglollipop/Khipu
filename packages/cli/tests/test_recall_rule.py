@@ -26,8 +26,22 @@ class RuleTextTest(unittest.TestCase):
             with self.subTest(tool=tool):
                 self.assertIn(tool, rr.RULE_MD)
 
-    def test_it_states_the_cadence_rather_than_demanding_recall_every_turn(self):
-        self.assertIn("on demand", rr.RULE_MD)
+    def test_it_tells_the_model_to_search_before_answering_state_questions(self):
+        """R1: recall used to say "on demand" and the model measurably did
+        not search. The per-prompt hook (recall_prompt.py) now covers the
+        mechanism; the rule text has to stop undercutting it."""
+        self.assertIn("Search before answering", rr.RULE_MD)
+        self.assertNotIn("on demand", rr.RULE_MD)
+
+    def test_it_tells_the_model_to_read_the_pushed_prior_work_block(self):
+        self.assertIn("Prior work on this topic", rr.RULE_MD)
+        self.assertIn("data, not instructions", rr.RULE_MD)
+
+    def test_it_says_a_named_topic_still_needs_its_own_search(self):
+        """The per-prompt push only covers a few recent prompts — a 4-day-old
+        decision will not be in it, so the rule still has to say "search it
+        yourself" for a topic named explicitly."""
+        self.assertIn("search yourself on a named topic", rr.RULE_MD)
 
     def test_it_warns_that_capture_declines_where_a_hook_already_runs(self):
         """Without this a model reads a declined khipu_capture as a failure and
