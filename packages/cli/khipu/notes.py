@@ -234,7 +234,25 @@ def _note_topic_dict(path: Path, *, project: str | None) -> dict[str, Any] | Non
         "links": links,
         "project": project,
         "note_source": str(path),
+        # P5 G5: Claude Code's own note kind (feedback/user/project/reference)
+        # — a DIFFERENT axis from `status` above (which `type_raw` also feeds,
+        # for the rare note whose type string itself reads as a lifecycle
+        # word, e.g. "shipped and wrapped"). Kept verbatim here so ranking
+        # (khipu.recency.apply_project_and_status) can read it without
+        # re-deriving it from status, which normalizes it away.
+        "type": type_raw or None,
+        # G1: the one-line summary rendered beside the title in the host
+        # index (khipu.organise.rewrite_index) — Claude Code's own
+        # generated MEMORY.md uses exactly this frontmatter field the same
+        # way, so a Khipu rewrite reads the same as the host's own.
+        "description": flat.get("description") or None,
     }
+    # khipu.organise.split_note (G4) writes a `parent: <slug>` frontmatter
+    # line on every child note it creates; carried through so a child's
+    # provenance survives the mirror, not just its own file.
+    parent = flat.get("parent")
+    if parent:
+        frontmatter["parent"] = parent
     return {
         "slug": slug,
         "title": name,
@@ -399,8 +417,131 @@ def _build_plan(
                 continue
         parsed = _note_topic_dict(path, project=_project_for(claude_slug))
         if parsed is not None:
-            plan.append({"harness": harness, "parsed": parsed, "path": str(path)})
+            plan.append({
+                "harness": harness, "parsed": parsed, "path": str(path),
+                "claude_slug": claude_slug,
+            })
     return plan
+
+
+def _project_short(item: dict[str, Any]) -> str:
+    """A short, filesystem-free identifier to namespace a colliding note slug
+    by (G3): the resolved project string's last segment when known, else the
+    raw ``~/.claude/projects/<slug>`` directory name's last '-'-joined
+    segment, else the note file's own parent-of-parent directory name (the
+    project dir itself, one level above ``memory/``). Never raises, never
+    empty (falls back to "unknown")."""
+    project = ((item.get("parsed") or {}).get("frontmatter") or {}).get("project")
+    claude_slug = item.get("claude_slug")
+    src = project or claude_slug
+    if not src:
+        try:
+            src = Path(item["path"]).parent.parent.name
+        except Exception:  # noqa: BLE001 — namespacing must never raise
+            src = None
+    seg = [s for s in re.split(r"[\\/]+", str(src or "").strip()) if s]
+    last = seg[-1] if seg else str(src or "")
+    short = last.strip("-").strip().lower() or "unknown"
+    return short[:60]
+
+
+def _resolve_collisions(plan: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """G3: a note's slug comes from its frontmatter ``name`` alone, so the
+    same title under two different project dirs used to collide on
+    ``ON CONFLICT (slug)`` — last write wins, silently overwriting a
+    different note's content. This groups this run's plan by the slug
+    ``_note_topic_dict`` already computed and, for any group spanning more
+    than one candidate:
+
+      - identical ``digest`` (the host slugged the same real project path
+        two ways, so two-plus directories hold byte-identical copies) ->
+        ingest ONE representative (deterministic: lowest source path),
+        report the rest as ``duplicate_copies``, write nothing for them;
+      - different ``digest`` under the same name from different projects ->
+        a REAL collision: every item in the group is re-slugged to
+        ``note:<project-short>/<name>`` so nothing overwrites anything else,
+        and the caller (``reconcile``) writes a redirect row at the old bare
+        slug (status ``superseded``, body naming the new slugs) once the
+        re-slugged items have themselves been written.
+
+    Returns ``(resolved_plan, report)``; ``resolved_plan`` is the same shape
+    ``reconcile`` already upserts from (only ``parsed["slug"]``/frontmatter
+    may have changed), ``report`` carries the counts plus the old->new slug
+    map for the redirect-writing step.
+    """
+    by_slug: dict[str, list[dict[str, Any]]] = {}
+    for item in plan:
+        by_slug.setdefault(item["parsed"]["slug"], []).append(item)
+    out: list[dict[str, Any]] = []
+    report: dict[str, Any] = {
+        "duplicate_copies": 0, "collisions_reslugged": 0, "redirects": [],
+    }
+    for base_slug, items in by_slug.items():
+        if len(items) == 1:
+            out.append(items[0])
+            continue
+        digests = {it["parsed"]["digest"] for it in items}
+        if len(digests) == 1:
+            # Same content under more than one directory: the host slugged
+            # one real project path two ways. Keep exactly one candidate,
+            # deterministically (lowest source path), so re-running this
+            # pass always picks the same survivor.
+            items_sorted = sorted(items, key=lambda it: it["path"])
+            out.append(items_sorted[0])
+            report["duplicate_copies"] += len(items) - 1
+            continue
+        # Real collision: different content under the same name from
+        # different project dirs. Namespace every one of them so the next
+        # write can never silently clobber a different note's revision.
+        new_slugs: list[str] = []
+        for it in items:
+            proj_short = _project_short(it)
+            name_part = base_slug[len(NOTE_SLUG_PREFIX):]
+            new_slug = f"{NOTE_SLUG_PREFIX}{proj_short}/{name_part}"
+            it["parsed"]["slug"] = new_slug
+            it["parsed"]["frontmatter"]["renamed_from"] = base_slug
+            new_slugs.append(new_slug)
+            out.append(it)
+        report["collisions_reslugged"] += 1
+        report["redirects"].append({
+            "old_slug": base_slug,
+            "new_slugs": sorted(set(new_slugs)),
+            # any one of the colliding items' own source paths — a redirect
+            # row needs *a* source_path, not one belonging to either winner.
+            "source_path": sorted(items, key=lambda it: it["path"])[0]["path"],
+        })
+    return out, report
+
+
+def _redirect_topic_dict(old_slug: str, new_slugs: list[str]) -> dict[str, Any]:
+    """G3: the topic dict for the tombstone-free redirect row a re-slugged
+    collision leaves at its old bare slug — status ``superseded``, body
+    naming every project-namespaced replacement, so a stale link or an old
+    search result lands somewhere useful instead of a 404."""
+    from khipu.mirror import topic_content_hash
+
+    links = sorted(set(new_slugs))
+    body = (
+        "This note's name collided across more than one project and was "
+        "split by project (G3): " + ", ".join(f"[[{s}]]" for s in links) + "\n"
+    )
+    return {
+        "slug": old_slug,
+        "title": f"{old_slug} (superseded — project collision)",
+        "status": "superseded",
+        "body": body,
+        "digest": topic_content_hash(body),
+        "links": links,
+        "frontmatter": {
+            "title": old_slug,
+            "status": "superseded",
+            "status_raw": "collision-redirect",
+            "links": links,
+        },
+        "created_at": None,
+        "updated_at": None,
+        "event_at": None,
+    }
 
 
 def _tombstone_missing_notes(cur) -> dict[str, Any]:
@@ -468,7 +609,11 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
     that, same posture as every other write path in this package.
     """
     state = _read_state() if changed_only else None
-    plan = _build_plan(changed_only=changed_only, state=state)
+    raw_plan = _build_plan(changed_only=changed_only, state=state)
+    # G3: resolve same-name-different-project collisions and duplicate-
+    # directory copies BEFORE anything is written (and before dry_run's
+    # preview) — see _resolve_collisions's own docstring.
+    plan, collision_report = _resolve_collisions(raw_plan)
     out: dict[str, Any] = {
         "ok": True,
         "dry_run": dry_run,
@@ -479,6 +624,8 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
         "written": 0,
         "errors": [],
         "slugs": [p["parsed"]["slug"] for p in plan],
+        "duplicate_copies": collision_report["duplicate_copies"],
+        "collisions_reslugged": collision_report["collisions_reslugged"],
     }
     if dry_run:
         return out
@@ -514,6 +661,20 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
                 except Exception as exc:  # noqa: BLE001 — one bad note must not sink the batch
                     out["errors"].append({"path": item["path"], "error": f"{type(exc).__name__}: {exc}"})
                     _log(f"upsert failed for {item['path']}: {exc}")
+            # G3: the old bare slug becomes a redirect row (never deleted —
+            # a stale bookmark or a stale search hit still resolves).
+            for redirect in collision_report["redirects"]:
+                try:
+                    redirect_parsed = _redirect_topic_dict(redirect["old_slug"], redirect["new_slugs"])
+                    _upsert_topic(
+                        cur, redirect_parsed, redirect["source_path"],
+                        source="notes-reconcile", note="slug collision redirect (G3)",
+                    )
+                except Exception as exc:  # noqa: BLE001 — a redirect failure must not sink the batch
+                    out["errors"].append({
+                        "path": redirect["old_slug"], "error": f"{type(exc).__name__}: {exc}",
+                    })
+                    _log(f"redirect write failed for {redirect['old_slug']}: {exc}")
             if run_tombstone:
                 out["tombstone"] = _tombstone_missing_notes(cur)
         conn.commit()
@@ -522,6 +683,15 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
             "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
             "files": new_files_state,
         })
+    try:
+        from khipu import organise
+
+        out["organise"] = organise.after_reconcile(
+            written_plan=plan, changed_only=changed_only, dry_run=dry_run,
+        )
+    except Exception as exc:  # noqa: BLE001 — organisation must never break reconcile
+        out["organise"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        _log(f"organise.after_reconcile failed: {exc}")
     return out
 
 
