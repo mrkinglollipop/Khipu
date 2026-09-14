@@ -44,11 +44,13 @@ class _CommitmentsCursor:
     ``db.has_columns`` and derives the field from the text when reading).
     """
 
-    def __init__(self, *, migrated: bool = False, trigger: bool = False):
+    def __init__(self, *, migrated: bool = False, trigger: bool = False,
+                 trigger_text: bool = False):
         self.rows: dict[int, dict] = {}
         self.episode_sessions: dict[int, str] = {}
         self.migrated = migrated
         self.trigger = trigger
+        self.trigger_text = trigger_text
         self.next_id = 1
         self.rowcount = 0
         self.statements: list[str] = []
@@ -89,6 +91,8 @@ class _CommitmentsCursor:
                 cols += ["last_seen_at", "seen_count"]
             if self.trigger:
                 cols += ["future_trigger"]
+            if self.trigger_text:
+                cols += ["trigger_text"]
             self._result = [(c,) for c in cols]
             return
         if s.startswith("INSERT INTO commitments"):
@@ -97,6 +101,7 @@ class _CommitmentsCursor:
             # + interval '...'" with no placeholder at all — so the param
             # count varies with what the SQL contains.
             rest = list(params)
+            trigger_text = rest.pop() if "trigger_text" in s else None
             future_trigger = bool(rest.pop()) if "future_trigger" in s else False
             if "%s::timestamptz" in s:
                 text, project, owner, kind, opened_episode, due_after, h = rest
@@ -118,7 +123,7 @@ class _CommitmentsCursor:
                 "status": "open", "closed_episode": None, "closed_at": None,
                 "close_reason": None, "content_hash": h,
                 "last_seen_at": None, "seen_count": 1,
-                "future_trigger": future_trigger,
+                "future_trigger": future_trigger, "trigger_text": trigger_text,
             }
             self.rowcount = 1
             return

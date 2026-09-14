@@ -183,24 +183,40 @@ _OBLIGATION_RE = re.compile(
 # conflict — a model that mislabels an item cannot keep noise alive.
 # ---------------------------------------------------------------------------
 
-# "when/once/after <someone/something> <does something>", plus the explicit
-# next-session phrasings. Gaps allow hyphens/quotes so "after the oracle-speed
-# wave merges" matches.
+# "when/once/until/after/before <someone/something> <does something>", plus
+# the explicit next-session phrasings and the plain deferral idioms ("deferred
+# until", "parked until", "not until"). Gaps allow hyphens/quotes so "after
+# the oracle-speed wave merges" matches.
+#
+# O1 (2026-09-14): the closing-verb list used to omit "closes"/"resolves"/
+# "wraps up"/"un-defers" and the completion shapes "is closed"/"is done"/
+# "is ready"/"is available" (the last four ride the bare "is"/"are"/"has"/
+# "have" alternative already present, so they need no separate entry) — a
+# session-plan/scope item deferred with "until the ledger closes" read as NO
+# trigger at all and was closed as 'session-ended' at the very next Stop
+# (the incident's cause #2). "until" now shares the when/once alternation;
+# "before" gets its own (same verb set) so a plain SAME-session sequencing
+# phrase like "before and after the mid-stream kill" — no completion verb
+# right after "before" — still does not match.
 _GAP = r"(?:[\w'’`./-]+\s+){0,4}?"
+_CLOSING_VERBS = (
+    r"says?|said|tells?|confirms?|approves?|answers?|replies|responds?|"
+    r"returns?|merges?|merged|ships?|shipped|lands?|landed|finishes?|"
+    r"finished|completes?|completed|arrives?|comes?|decides?|picks?|"
+    r"chooses?|gives?|gets?|re-?auths?|re-?authed|closes?|closed|resolves?|"
+    r"resolved|wraps?\s+up|wrapped\s+up|un-?defers?|un-?deferred|passes?|"
+    r"passed|is|are|has|have"
+)
 _FUTURE_TRIGGER_RE = re.compile(
     r"\b(?:next|future|later|another|a\s+future|a\s+later)\s+session\b"
     r"|\bnext\s+time\b"
     r"|\bin\s+a\s+(?:future|later|new)\s+session\b"
-    r"|\bwhen\s+" + _GAP + r"(?:says?|said|tells?|confirms?|approves?|answers?|"
-    r"replies|responds?|returns?|merges?|ships?|lands?|finishes?|completes?|"
-    r"arrives?|comes?|decides?|picks?|chooses?|gives?|gets?|re-?auths?|"
-    r"re-?authed|is|are|has|have)\b"
-    r"|\bonce\s+" + _GAP + r"(?:says?|confirms?|approves?|merges?|merged|ships?|"
-    r"shipped|lands?|landed|finishes?|finished|completes?|completed|returns?|"
-    r"passes?|passed|re-?auth\w*|is|are|has|have)\b"
-    r"|\bafter\s+" + _GAP + r"(?:merges?|merged|ships?|shipped|lands?|landed|"
-    r"approves?|approved|confirms?|confirmed|completes?|completed|finishes?|"
-    r"finished|returns?|passes?|passed|re-?auth\w*)\b"
+    r"|\b(?:when|once|until)\s+" + _GAP + r"(?:" + _CLOSING_VERBS + r")\b"
+    r"|\bafter\s+" + _GAP + r"(?:" + _CLOSING_VERBS + r"|re-?auth\w*)\b"
+    r"|\bbefore\s+" + _GAP + r"(?:" + _CLOSING_VERBS + r")\b"
+    r"|\bdeferred\s+(?:until|to)\s+\S"
+    r"|\bparked\s+until\s+\S"
+    r"|\bnot\s+until\s+\S"
     r"|\bif\s+attempt\s+\w+"
     r"|\bif\s+and\s+when\b",
     re.I,
@@ -358,6 +374,21 @@ def has_future_trigger(text: str) -> bool:
     """True when the text carries an explicit CROSS-SESSION condition — the
     one thing that makes an assistant promise outlive its own session."""
     return bool(_FUTURE_TRIGGER_RE.search((text or "").strip()))
+
+
+def trigger_clause(text: str) -> str | None:
+    """The future-trigger clause itself — the substring `_without_trigger_clause`
+    removes — or None when the text carries no trigger. Stored as
+    `commitments.trigger_text` (O1) and shown in `khipu owed` as "until: …" so
+    a deferred item's condition is visible without re-reading its full text."""
+    s = (text or "").strip()
+    m = _FUTURE_TRIGGER_RE.search(s)
+    if not m:
+        return None
+    comma = s.find(",", m.end())
+    end = comma if comma != -1 else len(s)
+    clause = s[m.start():end].strip()
+    return clause or None
 
 
 def _without_trigger_clause(text: str) -> str:
@@ -641,6 +672,21 @@ def _future_trigger_ready(cur) -> bool:
         return False
 
 
+def _trigger_text_ready(cur) -> bool:
+    """True when migration 0018 (commitments.trigger_text) has been applied.
+
+    Fail-closed, same posture as :func:`_future_trigger_ready`: a
+    pre-migration hub keeps working, it just does not persist the clause —
+    every read derives it from the text via :func:`trigger_clause` anyway.
+    """
+    try:
+        from khipu.db import has_columns
+
+        return has_columns(cur, "commitments", "trigger_text")
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
 def _touch_seen(cur, commitment_id: int) -> None:
     """Record that a later capture restated an already-open commitment.
 
@@ -714,6 +760,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     scope = _coalesce_scope(payload)
     seen_ready = _seen_columns_ready(cur)
     trigger_ready = _future_trigger_ready(cur)
+    trigger_text_ready = _trigger_text_ready(cur)
     inserted = 0
     rejected = 0
     for raw in items:
@@ -758,6 +805,10 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             cols += ", future_trigger"
             vals += ", %s"
             params = (*params, trigger)
+        if trigger_text_ready:
+            cols += ", trigger_text"
+            vals += ", %s"
+            params = (*params, trigger_clause(norm["text"]) if trigger else None)
         cur.execute(
             f"""
             INSERT INTO commitments
@@ -1157,6 +1208,14 @@ def list_owed(cur, *, project: str | None = None, parent_session_id: str | None 
         # explicit future trigger, then the rest by kind. Computed here so the
         # desktop/gateway never re-derive (and never disagree with) it.
         row["priority"] = owed_priority(row["owner"], row.get("kind"), trigger)
+        # O1: the deferral clause itself, recomputed from the text (same
+        # "deterministic wins" posture as owner/future_trigger above) so a
+        # row written before migration 0018 shows it too. `until` is the
+        # human-readable line `khipu owed` prints; `trigger_text` is the bare
+        # clause for callers that want to reformat it themselves.
+        clause = trigger_clause(row.get("text") or "") if trigger else None
+        row["trigger_text"] = clause
+        row["until"] = f"until: {clause}" if clause else None
     # Stable: the SQL order (opened_at DESC) survives inside each rank.
     rows.sort(key=lambda r: r["priority"])
     return rows
