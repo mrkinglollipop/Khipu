@@ -97,6 +97,75 @@ class ResolveRepoRootTest(GitFixtureTestCase):
         out = identity.resolve_repo_root("")
         self.assertIsNone(out["repo_root"])
 
+    def test_no_cursor_never_touches_a_db(self):
+        """The default (hook) path: no cursor, no alias lookup at all."""
+        _git(self.repo, "remote", "add", "origin", "git@github.com:acme/widget.git")
+        out = identity.resolve_repo_root(str(self.repo))
+        self.assertEqual(out["project"], "acme/widget")
+
+    def test_a_cursor_can_remap_the_resolved_project_via_alias(self):
+        """K6: project_aliases lets a renamed/second-checkout project resolve
+        to its canonical name, when the caller opts in with a cursor."""
+        _git(self.repo, "remote", "add", "origin", "git@github.com:acme/widget.git")
+
+        class _Cur:
+            def execute(self, sql, params):
+                self.params = params
+
+            def fetchone(self):
+                return ("acme/widget-canonical",)
+
+        out = identity.resolve_repo_root(str(self.repo), cur=_Cur())
+        self.assertEqual(out["project"], "acme/widget-canonical")
+
+    def test_a_failing_alias_lookup_falls_back_to_the_resolved_project(self):
+        _git(self.repo, "remote", "add", "origin", "git@github.com:acme/widget.git")
+
+        class _BrokenCur:
+            def execute(self, sql, params):
+                raise RuntimeError("no such table")
+
+        out = identity.resolve_repo_root(str(self.repo), cur=_BrokenCur())
+        self.assertEqual(out["project"], "acme/widget")
+
+    def test_no_alias_match_falls_back_to_the_resolved_project(self):
+        _git(self.repo, "remote", "add", "origin", "git@github.com:acme/widget.git")
+
+        class _EmptyCur:
+            def execute(self, sql, params):
+                pass
+
+            def fetchone(self):
+                return None
+
+        out = identity.resolve_repo_root(str(self.repo), cur=_EmptyCur())
+        self.assertEqual(out["project"], "acme/widget")
+
+
+class NormalizeScopeTest(unittest.TestCase):
+    """K6: `episodes.scope` is a free-text FALLBACK, not a project — kept
+    only when it still reads like a short label."""
+
+    def test_a_short_label_survives(self):
+        self.assertEqual(identity.normalize_scope("build"), "build")
+        self.assertEqual(identity.normalize_scope("the seal fix"), "the seal fix")
+
+    def test_a_path_is_dropped(self):
+        self.assertIsNone(identity.normalize_scope("/srv/checkouts/acme-widget"))
+        self.assertIsNone(identity.normalize_scope("relative/path/here"))
+        self.assertIsNone(identity.normalize_scope(r"C:\Users\matt\Khipu"))
+
+    def test_more_than_six_words_is_dropped(self):
+        self.assertIsNone(identity.normalize_scope("one two three four five six seven"))
+
+    def test_exactly_six_words_survives(self):
+        self.assertEqual(identity.normalize_scope("one two three four five six"), "one two three four five six")
+
+    def test_empty_and_none_are_none(self):
+        self.assertIsNone(identity.normalize_scope(""))
+        self.assertIsNone(identity.normalize_scope("   "))
+        self.assertIsNone(identity.normalize_scope(None))
+
 
 class SlugFromRemoteUrlTest(unittest.TestCase):
     def test_ssh_form(self):

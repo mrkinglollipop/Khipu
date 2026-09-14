@@ -358,7 +358,7 @@ class _EpisodesFakeCursor:
                 "preferences": json.loads(preferences_json), "raw": json.loads(raw_json),
                 "harness": harness, "repo_root": repo_root, "project": project,
                 "parent_session_id": parent_session_id, "transcript_range": transcript_range,
-                "tags": json.loads(tags_json),
+                "tags": json.loads(tags_json), "scope": _scope,
             }
             self._existing_keys.add(key)
             self.rowcount = 1
@@ -547,6 +547,30 @@ class WritePgOrchestrationTest(unittest.TestCase):
         self.assertEqual(len(reembedded), 1)
         self.assertEqual(reembedded[0][0], "2026-09-03T00:00:00Z")
         self.assertEqual(reembedded[0][2]["people"], ["matt", "ana"])
+
+    def test_a_path_like_scope_is_normalised_to_null_on_insert(self):
+        """K6: a worktree path or a run-on scope never lands in the column
+        every NULL-project reader falls back to."""
+        cur = _EpisodesFakeCursor({})
+        payload = {
+            "ts": "2026-09-14T00:00:00Z", "session_id": "claude_code:abc",
+            "summary": "did a thing", "harness": "claude_code",
+            "scope": "/srv/checkouts/acme-widget/.claude/worktrees/some-branch",
+        }
+        with self._connect(cur), mock.patch("khipu.hygiene.classify_topics", return_value=([], [], False)):
+            cap.write_pg(payload)
+        self.assertEqual(len(cur.episodes), 1)
+        self.assertIsNone(list(cur.episodes.values())[0]["scope"])
+
+    def test_a_short_label_scope_survives_insert(self):
+        cur = _EpisodesFakeCursor({})
+        payload = {
+            "ts": "2026-09-14T00:00:00Z", "session_id": "claude_code:abc",
+            "summary": "did a thing", "harness": "claude_code", "scope": "build",
+        }
+        with self._connect(cur), mock.patch("khipu.hygiene.classify_topics", return_value=([], [], False)):
+            cap.write_pg(payload)
+        self.assertEqual(list(cur.episodes.values())[0]["scope"], "build")
 
     def test_merge_reembed_looks_the_target_row_up_by_its_own_identity(self):
         """``embed_on_capture`` finds a row by (ts, md5(summary)); a merge

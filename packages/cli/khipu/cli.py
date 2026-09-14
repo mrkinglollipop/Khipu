@@ -1475,6 +1475,31 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_project(args: argparse.Namespace) -> int:
+    """K6: `khipu project backfill [--dry-run|--apply] [--limit N]` — resolve
+    a project for episodes that have none, from the session's other episodes
+    or a known repo_root. Never from a session id or free-text scope."""
+    if getattr(args, "project_cmd", None) != "backfill":
+        print(json.dumps({"ok": False, "error": "usage: khipu project backfill [--dry-run|--apply]"}))
+        return 2
+    from khipu.db import connect
+    from khipu import hygiene
+
+    apply = bool(getattr(args, "apply", False))
+    limit = getattr(args, "limit", None)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if apply:
+                report = hygiene.apply_backfill_project(cur, limit=limit)
+            else:
+                report = hygiene.backfill_project_report(cur, sample_limit=limit or 20)
+        if apply:
+            conn.commit()
+    report["dry_run"] = not apply
+    print(json.dumps(report, indent=2, default=str))
+    return 0
+
+
 def cmd_hygiene_commitments(args: argparse.Namespace) -> int:
     """`khipu hygiene commitments [--session-ended] [--dry-run|--apply]
     [--project X] [--limit N]`.
@@ -2995,6 +3020,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bf_identity.add_argument("--limit", type=int, default=None)
     bf.set_defaults(func=cmd_backfill)
+
+    proj = sub.add_parser("project", help="Project identity maintenance (K6)")
+    proj_sub = proj.add_subparsers(dest="project_cmd", required=True)
+    proj_bf = proj_sub.add_parser(
+        "backfill",
+        help="Resolve a project for episodes that have none (session lineage / repo_root only)",
+    )
+    proj_bf.add_argument("--dry-run", dest="apply", action="store_false", default=False)
+    proj_bf.add_argument(
+        "--apply", dest="apply", action="store_true",
+        help="Actually write the backfill (destructive; needs an explicit go — never run against the live shared hub without it)",
+    )
+    proj_bf.add_argument("--limit", type=int, default=None)
+    proj.set_defaults(func=cmd_project)
 
     hy = sub.add_parser("hygiene", help="Graph hygiene jobs (memory reliability W5.2)")
     hy_sub = hy.add_subparsers(dest="hygiene_cmd", required=True)

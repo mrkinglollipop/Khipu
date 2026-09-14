@@ -585,6 +585,13 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
             payload["tags"] = list(dict.fromkeys([*(payload.get("tags") or []), *tags]))
             if topics_unresolved:
                 payload["topics_unresolved"] = True
+            # K6: scope is a free-text FALLBACK, not a project — normalise it
+            # at write so a worktree path or a run-on sentence never lands in
+            # the column every NULL-project reader (search, the pushed
+            # slice) falls back to.
+            from khipu.identity import normalize_scope
+
+            payload["scope"] = normalize_scope(payload.get("scope"))
 
             inserted = _upsert_episode(cur, payload)
             from khipu.config import path_setting

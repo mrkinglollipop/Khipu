@@ -372,40 +372,57 @@ class DueAfterParsingTest(unittest.TestCase):
 
 
 class ScopeCoalescingTest(unittest.TestCase):
-    """fix 3: when project is NULL, open/dedup/auto_close/list scope by
-    COALESCE(project, parent_session_id, session_id)."""
+    """K6 (2026-09-14): the scope key is the episode's resolved ``project``
+    ONLY — a session id is not a project, so open/dedup/auto_close/list never
+    fall back to parent_session_id/session_id any more. A NULL project stays
+    NULL (real behaviour: a capture with no resolved project groups with
+    every other such capture, not with itself alone by session lineage)."""
 
-    def test_opens_under_parent_session_id_when_project_missing(self):
+    def test_a_null_project_stays_null_even_with_a_parent_session_id(self):
         cur = _CommitmentsCursor()
         payload = {"parent_session_id": "claude_code:host-1", "open_loops": ["follow up with Matt on pricing"]}
         co.open_from_episode(cur, payload, 1)
         row = list(cur.rows.values())[0]
-        self.assertEqual(row["project"], "claude_code:host-1")
+        self.assertIsNone(row["project"])
 
-    def test_falls_back_to_session_id_when_neither_project_nor_parent_known(self):
+    def test_a_null_project_stays_null_even_with_only_a_session_id(self):
         cur = _CommitmentsCursor()
         payload = {"session_id": "claude_code:abc123", "open_loops": ["follow up with Matt on pricing"]}
         co.open_from_episode(cur, payload, 1)
         row = list(cur.rows.values())[0]
-        self.assertEqual(row["project"], "claude_code:abc123")
+        self.assertIsNone(row["project"])
 
-    def test_auto_close_matches_using_the_same_coalesced_scope(self):
+    def test_auto_close_matches_using_the_resolved_project_only(self):
         cur = _CommitmentsCursor()
-        cur._seed("ship the fix", project="claude_code:host-1")
-        payload = {"parent_session_id": "claude_code:host-1",
+        cur._seed("ship the fix", project="acme/widget")
+        payload = {"project": "acme/widget",
                    "closed_loops": [{"text": "done: ship the fix"}]}
         with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
             n = co.auto_close(cur, payload, 2)
         self.assertEqual(n, 1)
 
-    def test_a_different_lineage_never_closes_across_scopes(self):
+    def test_a_different_project_never_closes_across_scopes(self):
         cur = _CommitmentsCursor()
-        cur._seed("ship the fix", project="claude_code:host-1")
-        payload = {"parent_session_id": "claude_code:host-2",
+        cur._seed("ship the fix", project="acme/widget")
+        payload = {"project": "acme/other",
                    "closed_loops": [{"text": "done: ship the fix"}]}
         with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
             n = co.auto_close(cur, payload, 2)
         self.assertEqual(n, 0)
+
+    def test_a_parent_session_id_no_longer_scopes_auto_close(self):
+        """The pre-K6 behaviour: two captures sharing only a
+        parent_session_id (no project on either) used to close each other's
+        commitments; now both are NULL-project and auto_close's NULL-scope
+        query still matches them — this is the accepted, documented
+        broadening (K6), not a regression, and this test pins it."""
+        cur = _CommitmentsCursor()
+        cur._seed("ship the fix", project=None)
+        payload = {"parent_session_id": "claude_code:host-1",
+                   "closed_loops": [{"text": "done: ship the fix"}]}
+        with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
+            n = co.auto_close(cur, payload, 2)
+        self.assertEqual(n, 1)
 
     def test_list_owed_accepts_parent_session_id_as_the_scope_key(self):
         cur = _CommitmentsCursor()

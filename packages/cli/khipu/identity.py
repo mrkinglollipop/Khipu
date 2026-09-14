@@ -1,3 +1,6 @@
+# --bypass-harness (sonnet lane) — authored directly by the dispatched
+# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
+# agents"); there is no further agent to route this to.
 """Stable session identity: repo root + project, resolved from a cwd (W1.2).
 
 ``scope`` today is whatever the model wrote in the extraction prompt — a free
@@ -80,17 +83,41 @@ def _remote_slug(repo_root: Path) -> str | None:
     return _slug_from_remote_url(url)
 
 
-def resolve_repo_root(cwd: str) -> dict[str, Any]:
+def _resolve_project_alias(cur, project: str) -> str | None:
+    """K6: a ``project_aliases`` lookup for ``project`` (migration 0021) — two
+    remote URLs or repo-root basenames for the SAME real project (a rename,
+    an org-transfer, a second local checkout) can otherwise read as two
+    different projects everywhere search/commitments/decisions group by
+    project. Best-effort only: never raises, and callers with no live
+    connection (every hook call — see ``resolve_repo_root``'s own contract)
+    simply skip it by not passing ``cur``."""
+    try:
+        cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (project,))
+        row = cur.fetchone()
+        return str(row[0]) if row and row[0] else None
+    except Exception:  # noqa: BLE001 — alias lookup is best-effort only
+        return None
+
+
+def resolve_repo_root(cwd: str, *, cur: Any = None) -> dict[str, Any]:
     """{repo_root, project, is_worktree} for a hook's cwd.
 
     - A path under a Claude/Cursor/Codex worktree tree, or whose git common
       dir lives outside its own toplevel, resolves to the MAIN checkout
       (repo_root is the common dir's parent, not the worktree's own path).
     - project is the git remote's ``owner/repo`` slug when origin is set,
-      else the repo root's basename.
+      else the repo root's basename — then, when ``cur`` is given, resolved
+      through ``project_aliases`` (K6) so a renamed/aliased project reads as
+      one project everywhere instead of splitting silently.
     - A scratchpad / /tmp cwd (dispatched-child pattern) never resolves —
       repo_root and project are both None; the caller decides fallback.
-    Never raises: any git failure or unexpected shape yields the empty result.
+
+    ``cur`` is OPTIONAL and defaults to None: every hook caller (the actual
+    per-turn path, sandboxed in Aegis, no DB) calls this with no cursor and
+    gets EXACTLY today's behaviour — the alias lookup only runs when a
+    caller that already holds a live cursor (a backfill, a CLI command)
+    opts in. Never raises: any git failure or unexpected shape yields the
+    empty result.
     """
     out: dict[str, Any] = {"repo_root": None, "project": None, "is_worktree": False}
     cwd = (cwd or "").strip()
@@ -131,5 +158,28 @@ def resolve_repo_root(cwd: str) -> dict[str, Any]:
     out["repo_root"] = str(main_root)
     out["is_worktree"] = is_worktree
     slug = _remote_slug(main_root)
-    out["project"] = slug or main_root.name
+    project = slug or main_root.name
+    if cur is not None:
+        project = _resolve_project_alias(cur, project) or project
+    out["project"] = project
     return out
+
+
+_SCOPE_PATH_SEP_RE = re.compile(r"[/\\]")
+SCOPE_MAX_WORDS = 6
+
+
+def normalize_scope(raw: str | None) -> str | None:
+    """K6: ``episodes.scope`` is a free-text FALLBACK label, not a project —
+    the audit found 3,851 distinct values, 2,541 of them over 40 chars,
+    including bare worktree paths. Kept only when it still reads like a
+    short label (<= 6 words, no path separator); anything else is dropped to
+    NULL at write time rather than stored as the junk it is. Never raises."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if _SCOPE_PATH_SEP_RE.search(s):
+        return None
+    if len(s.split()) > SCOPE_MAX_WORDS:
+        return None
+    return s

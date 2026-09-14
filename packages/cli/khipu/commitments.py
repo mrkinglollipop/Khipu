@@ -548,17 +548,21 @@ def content_hash(scope: str | None, text: str) -> str:
 
 
 def _coalesce_scope(payload: dict[str, Any]) -> str | None:
-    """W3.3 grouping key (fix 3): ``project``, else ``parent_session_id``,
-    else ``session_id`` — a capture with no resolved project (a scratchpad/
-    `/tmp` cwd, a dispatched child session) still dedups/closes/lists against
-    its OWN prior commitments instead of every such writer competing for one
-    unscoped NULL bucket. Stored as the row's ``project`` column so
+    """W3.3 grouping key — K6 (2026-09-14): the episode's resolved ``project``,
+    ONLY. This used to fall back to ``parent_session_id``/``session_id`` when
+    project was unknown (a scratchpad/`/tmp` cwd, a dispatched child session)
+    so that writer's commitments at least stayed grouped with each other —
+    but a session id is not a project: it filed 16+ open items under an
+    opaque hex string the user never sees anywhere else, and a NULL project
+    was measured on 81% of episodes (finding K6). A capture with no resolved
+    project now groups under NULL like every other reader does — every
+    ``project IS NOT DISTINCT FROM %s`` comparison already used throughout
+    this module treats every NULL-project row as one shared "(no project)"
+    group, so this is a real, if broad, scope rather than an unscoped
+    free-for-all. Stored as the row's ``project`` column so
     ``list_owed``/``auto_close`` use the exact same key back."""
-    for key in ("project", "parent_session_id", "session_id"):
-        val = payload.get(key)
-        if val:
-            return str(val)
-    return None
+    val = payload.get("project")
+    return str(val) if val else None
 
 
 def _parse_due_after(raw: Any) -> tuple[str, Any]:
