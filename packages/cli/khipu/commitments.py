@@ -380,7 +380,13 @@ def trigger_clause(text: str) -> str | None:
     """The future-trigger clause itself — the substring `_without_trigger_clause`
     removes — or None when the text carries no trigger. Stored as
     `commitments.trigger_text` (O1) and shown in `khipu owed` as "until: …" so
-    a deferred item's condition is visible without re-reading its full text."""
+    a deferred item's condition is visible without re-reading its full text.
+
+    Kept starting at the matched keyword (``"until the ledger closes"``, not
+    just ``"the ledger closes"``) — callers that want the bare clause for
+    display use :func:`until_line`, which knows how to avoid repeating that
+    keyword against its own label.
+    """
     s = (text or "").strip()
     m = _FUTURE_TRIGGER_RE.search(s)
     if not m:
@@ -389,6 +395,25 @@ def trigger_clause(text: str) -> str | None:
     end = comma if comma != -1 else len(s)
     clause = s[m.start():end].strip()
     return clause or None
+
+
+def until_line(clause: str | None) -> str | None:
+    """The `khipu owed` "until: …" display line for a trigger clause, or
+    None when there is no clause.
+
+    `trigger_clause` keeps its own leading connective (`"until the ledger
+    closes"`) so `_without_trigger_clause` can still find where the clause
+    starts — but that means a clause already spelled with "until" produced
+    "until: until the ledger closes." here (the doubled-connective bug).
+    Strip a leading "until" before labelling; a clause introduced by a
+    different word (`"before legal signs off"`) is left as-is — "until:
+    before …" reads as a label followed by its condition, no word repeated.
+    """
+    c = (clause or "").strip()
+    if not c:
+        return None
+    c = re.sub(r"(?i)^until\b\s*", "", c).strip()
+    return f"until: {c}" if c else None
 
 
 def _without_trigger_clause(text: str) -> str:
@@ -1228,7 +1253,7 @@ def list_owed(cur, *, project: str | None = None, parent_session_id: str | None 
         # clause for callers that want to reformat it themselves.
         clause = trigger_clause(row.get("text") or "") if trigger else None
         row["trigger_text"] = clause
-        row["until"] = f"until: {clause}" if clause else None
+        row["until"] = until_line(clause)
     # O3: age x kind — within a priority tier (kind), the LONGEST-outstanding
     # item leads (opened_at ascending), not the newest one the SQL fetched
     # first. A row with no opened_at (should not happen; NOT NULL) sorts
