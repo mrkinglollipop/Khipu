@@ -61,6 +61,11 @@ Output ONLY a single JSON object (no prose, no markdown fences) with these keys:
   NEVER record a within-session reporting duty — "reply with the SHAs",
   "tell the user when it relaunches", "notify Matt", "report back",
   "provide the evidence paths" — unless the USER is the one who owes it.
+  A scope, plan, or design that was APPROVED this session but whose BUILD was
+  explicitly deferred is an open loop of kind "followup", future_trigger
+  true, with the deferral condition itself as the text (e.g. "Build the
+  export screen once the migration ships" — not just "Build the export
+  screen", which loses the condition).
   due_after is optional; omit or use null when unknown.
 - closed_loops: list of objects {{text}} for anything explicitly finished,
   merged, shipped, or no longer needed this turn.
