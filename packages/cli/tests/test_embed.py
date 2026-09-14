@@ -139,9 +139,21 @@ class LiveCorpusTest(unittest.TestCase):
 
     def test_backfill_dry_run_is_idempotent_after_full_run(self):
         """After the 2026-08-17 full backfill a dry run must want to embed ~nothing
-        (allow a small tail for rows captured since — never a large one)."""
+        (allow a small tail for rows captured since — never a large one).
+
+        P5 G4 (2026-09-14) is a ONE-TIME exception to that: a topic with 2+
+        top-level '## ' sections now gets hash-bucketed chunk indices instead
+        of a flat 0..N count (khipu.embed.chunk_text_indexed), so its
+        existing chunks genuinely look "new" under the new scheme until the
+        next nightly backfill actually re-embeds them (2024/11058 chunks on
+        the live hub the day this landed) — expected and correct, not a
+        regression; a topic with 0 or 1 '## ' section (the common case) is
+        byte-for-byte unaffected. The bound below is loosened to cover that
+        one-time transition; tighten it back toward 50 once a nightly has run
+        past this landing.
+        """
         stats = em.backfill(dry_run=True)
-        self.assertLessEqual(stats["would_embed"], 50, stats)
+        self.assertLessEqual(stats["would_embed"], max(50, int(stats["chunks"] * 0.25)), stats)
 
 
 @unittest.skipUnless(PG_AVAILABLE and KEY_AVAILABLE, "PG or Gemini key unavailable")
@@ -1164,7 +1176,9 @@ class SearchRowMetadataTest(unittest.TestCase):
                 self.sql = " ".join(sql.split())
 
             def fetchall(self):
-                return [("khipu", ts, "active", None)]
+                # P5 R6/G5: the topic metadata SELECT also reads
+                # frontmatter->>'type' and superseded_by now.
+                return [("khipu", ts, "active", None, None, None)]
 
         cur = FakeCur()
         rows = [{"kind": "topic", "id": "khipu", "score": 0.5}]
@@ -1177,6 +1191,31 @@ class SearchRowMetadataTest(unittest.TestCase):
         self.assertNotIn("harness", out[0])
         # R6: status IS read now, unconditionally — that is the fix.
         self.assertEqual(out[0]["status"], "active")
+        # P5: absent when the topic carries neither — never a stray None/"".
+        self.assertNotIn("type", out[0])
+        self.assertNotIn("superseded_by", out[0])
+
+    def test_a_topic_row_carries_type_and_superseded_by_when_present(self):
+        import datetime as dt
+        from unittest import mock
+
+        ts = dt.datetime(2026, 9, 1, 8, 30, tzinfo=dt.timezone.utc)
+
+        class FakeCur:
+            def execute(self, sql, params=None):
+                self.sql = " ".join(sql.split())
+
+            def fetchall(self):
+                return [("note:old", ts, "superseded", None, "feedback", "note:new")]
+
+        cur = FakeCur()
+        rows = [{"kind": "topic", "id": "note:old", "score": 0.5}]
+        with mock.patch.object(em, "_episode_schema_flags", return_value={
+            "project": True, "deleted_at": False, "harness": True, "parent_session_id": True,
+        }):
+            out = em._apply_search_filters(cur, rows)
+        self.assertEqual(out[0]["type"], "feedback")
+        self.assertEqual(out[0]["superseded_by"], "note:new")
 
     def test_an_episode_with_no_project_gets_no_empty_label(self):
         import datetime as dt
