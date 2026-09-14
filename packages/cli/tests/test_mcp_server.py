@@ -127,13 +127,20 @@ class ProtocolTest(unittest.TestCase):
 
 
 class CaptureRejectionTest(unittest.TestCase):
-    """Capture gating: dual/legacy reject; hub writes on gateway / no-hook;
-    local stdio + khipu-stop-hook declines. Isolated from live Hub config and
+    """Capture gating: no local hook + dual/legacy → reject (nobody would ever
+    drain the flag); hub writes directly on gateway / no-hook; a local hook
+    (any mode) → K1 queues a capture-now flag instead of writing or declining.
+    Isolated from live Hub config and
     live PG (``capture()`` is mocked — this class must not insert episodes)."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self._env = mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": self.tmp.name})
+        self._env = mock.patch.dict(os.environ, {
+            "KHIPU_DATA_DIR": self.tmp.name,
+            # K1: request_capture_now/newest_session_ref touch this dir — must
+            # never be the real ~/.grok/khipu on the machine running tests.
+            "KHIPU_CAPTURE_HOME": str(Path(self.tmp.name) / "kh"),
+        })
         self._env.start()
         os.environ.pop("KHIPU_CAPTURE_MODE", None)
         self._hook = mock.patch(
@@ -176,17 +183,49 @@ class CaptureRejectionTest(unittest.TestCase):
         self.cap_mock.assert_called_once()
         self.assertEqual(self.cap_mock.call_args.kwargs.get("mode"), "hub")
 
-    def test_hub_stdio_with_local_hook_rejected(self):
+    def test_hub_stdio_with_local_hook_queues_capture_now(self):
+        """K1: a local hook still owns capture, but the tool now flags the
+        session for its next Stop instead of refusing outright."""
         os.environ["KHIPU_CAPTURE_MODE"] = "hub"
         with mock.patch(
             "khipu.mcp_server._local_capture_hook_is_writer", return_value=True
         ), mock.patch(
             "khipu.mcp_server._via_https_gateway", return_value=False
         ):
-            body = self._call_capture()
+            out = handle_message(_req(9, "tools/call", {
+                "name": "khipu_capture",
+                "arguments": {"summary": "x", "session_id": "claude_code:s1"},
+            }))
+        self.assertFalse(out["result"].get("isError"), out)
+        body = json.loads(out["result"]["content"][0]["text"])
         self.cap_mock.assert_not_called()
-        self.assertIn("khipu-stop-hook", body["error"])
-        self.assertIn("khipu-aegis-capture", body["error"])
+        self.assertTrue(body["queued"])
+        self.assertEqual(body["captured_by"], "next stop")
+        self.assertEqual(body["harness"], "claude_code")
+        self.assertEqual(body["session_id"], "s1")
+        from khipu.session_capture import _consume_capture_now
+
+        flag = _consume_capture_now("claude_code", "s1")
+        self.assertIsNotNone(flag)
+        self.assertEqual(flag["note"], "x")
+
+    def test_hub_stdio_with_local_hook_and_no_session_id_uses_newest_state_file(self):
+        os.environ["KHIPU_CAPTURE_MODE"] = "hub"
+        from khipu.session_capture import _consume_capture_now, save_state
+
+        save_state("codex", "auto1", {"offset": 0, "last_ts": 0.0, "captures": 0})
+        with mock.patch(
+            "khipu.mcp_server._local_capture_hook_is_writer", return_value=True
+        ), mock.patch(
+            "khipu.mcp_server._via_https_gateway", return_value=False
+        ):
+            out = handle_message(_req(9, "tools/call", {
+                "name": "khipu_capture", "arguments": {"summary": "auto-detected"},
+            }))
+        self.assertFalse(out["result"].get("isError"), out)
+        body = json.loads(out["result"]["content"][0]["text"])
+        self.assertEqual((body["harness"], body["session_id"]), ("codex", "auto1"))
+        self.assertEqual(_consume_capture_now("codex", "auto1")["note"], "auto-detected")
 
     def test_hub_gateway_writes_even_with_local_hook(self):
         os.environ["KHIPU_CAPTURE_MODE"] = "hub"

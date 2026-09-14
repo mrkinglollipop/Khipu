@@ -188,3 +188,28 @@ Acceptance: the incident replayed end to end — approve a scope on day 0, name 
 brings the scope into context before the model acts, in Claude Code and Codex by hook, in Cursor by
 rule, in Aegis and the gateway by first tool call; and the diagnosis turn is captured within a minute
 with its seven points intact.
+
+## Phase 7 — every harness proven, live
+
+Nothing in this program counts as done for a harness until the row below is green from a real
+session of that harness on this Mac (or, for the gateway, a real call through the deployed gateway),
+with the log line or output pasted in the closing note. "Verified by probe" is not enough; the probe
+proves the installer, the session proves the harness.
+
+| Capability | Claude Code | Cursor | Codex | Aegis | Gateway (cloud harness) |
+|---|---|---|---|---|---|
+| Rule + slice at session start | live session | live session | live session | native first-turn recall | `instructions` + `khipu_status` |
+| Prior work on a topical prompt | hook, live | rule (no event) or hook if Cursor allows injection | hook, live | native per-turn recall | `khipu_status(prompt)` |
+| Capture at cadence | stop-hook log | stop-hook log | stop-hook log | aegis-capture queue + drain | `khipu_capture` |
+| Capture on request / high-value turn | flag + log | flag + log | flag + log | native | direct write |
+| Subagent capture with parent id | SubagentStop, log | n/a unless Cursor has the event | SubagentStop, log | native parent id | n/a |
+| Deferred work returns as owed | `khipu owed` after a fixture session | same | same | same | same |
+| Note edited → searchable ≤ 60 s | watch agent, log | same dirs | Codex memories dir | n/a | n/a |
+| Doctor red on each drop path | fixture | fixture | fixture | queue age, unknown harness | gateway liveness row |
+
+Method: one scripted session per harness (`claude -p`, `codex exec`, Cursor's non-interactive runner
+if it fires hooks, an Aegis session, a token-authenticated call on the Linode for the gateway), each
+sending a topical prompt, a "remember this" turn, a deferral sentence and a subagent dispatch; then
+the stop-hook log, `khipu owed`, `khipu search` and `khipu doctor` are read for the evidence. The
+closing note in the maintainer's ops repo carries the table with every cell filled or marked with
+the exact reason it could not be, and the reason is itself a doctor check where the harness allows it.

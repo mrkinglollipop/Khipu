@@ -337,8 +337,8 @@ class _EpisodesFakeCursor:
                      s.split("INSERT INTO episodes (", 1)[1].split(")", 1)[0].split(",")]
             row = dict(zip(names, params))
             ts, session_id = row["ts"], row["session_id"]
-            summary, scope = row["summary"], row.get("scope")
-            topics_json, people_json = row["topics"], row["people"]
+            summary, _scope = row["summary"], row.get("scope")
+            topics_json, _people_json = row["topics"], row["people"]
             decisions_json, preferences_json = row["decisions"], row["preferences"]
             raw_json = row["raw"]
             harness, repo_root = row.get("harness"), row.get("repo_root")
@@ -385,13 +385,13 @@ class _EpisodesFakeCursor:
         if s.startswith("UPDATE episodes SET topics"):
             target_id = params[-1]
             e = self.episodes[target_id]
-            e["topics"] = json.loads(params[0])
-            e["decisions"] = json.loads(params[1])
-            e["preferences"] = json.loads(params[2])
-            e["people"] = json.loads(params[3])
-            e["raw"] = json.loads(params[4])
+            cols = ["topics", "decisions", "preferences", "people", "raw"]
+            if "summary = %s" in s:
+                cols.append("summary")
             if "tags = %s::jsonb" in s:
-                e["tags"] = json.loads(params[5])
+                cols.append("tags")
+            for col, val in zip(cols, params):
+                e[col] = val if col == "summary" else json.loads(val)
             self.updated_ids.append(target_id)
             return
         raise AssertionError(f"unexpected SQL in fake cursor: {s[:120]}")

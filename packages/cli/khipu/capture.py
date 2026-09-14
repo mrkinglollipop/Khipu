@@ -69,11 +69,33 @@ def _jaccard(a: str, b: str) -> float:
 
 
 def _dedup_exact_window(cur, payload: dict[str, Any]) -> int | None:
+    """K3: every sibling PART of one split window shares the same (harness,
+    session_id, transcript_range) — that alone would match the FIRST part
+    inserted and silently skip every part after it as an "exact window"
+    duplicate. window_id (+ part, carried in raw) makes each sibling its own
+    identity. Pre-migration hub (no window_id column): falls back to the
+    pre-K3 match, same as a payload with no window_id."""
     harness = payload.get("harness")
     session_id = payload.get("session_id")
     tr = payload.get("transcript_range")
     if not harness or not session_id or not tr:
         return None
+    window_id = payload.get("window_id")
+    if window_id:
+        try:
+            from khipu.db import has_columns
+
+            has_window_col = has_columns(cur, "episodes", "window_id")
+        except Exception:  # noqa: BLE001 — schema probe never blocks the write
+            has_window_col = False
+        if has_window_col:
+            cur.execute(
+                "SELECT id FROM episodes WHERE harness = %s AND session_id = %s "
+                "AND transcript_range = %s AND window_id = %s AND raw->>'part' = %s LIMIT 1",
+                (harness, session_id, tr, window_id, payload.get("part")),
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row else None
     cur.execute(
         "SELECT id FROM episodes WHERE harness = %s AND session_id = %s "
         "AND transcript_range = %s LIMIT 1",
@@ -131,13 +153,31 @@ def _dedup_candidates(cur, payload: dict[str, Any]) -> list[dict[str, Any]]:
     would filter for "this same conversation": by project when it is known,
     else by parent_session_id (a dispatched child with no resolvable project
     still shares lineage with its siblings). Neither known → no candidates;
-    only the exact-window skip in dedup_before_insert still applies."""
+    only the exact-window skip in dedup_before_insert still applies.
+
+    K3: siblings of one split window are DIFFERENT parts of a conversation,
+    not near-duplicates of it — a row sharing this payload's window_id is
+    excluded, so the merge path can never fold two parts of one window into
+    each other."""
     ts = payload.get("ts")
     project = payload.get("project")
     parent = payload.get("parent_session_id")
     if not ts or (not project and not parent):
         return []
     group_col, group_val = ("project", project) if project else ("parent_session_id", parent)
+    window_id = payload.get("window_id")
+    exclude_sql, params = "", [group_val, ts, ts]
+    if window_id:
+        try:
+            from khipu.db import has_columns
+
+            has_window_col = has_columns(cur, "episodes", "window_id")
+        except Exception:  # noqa: BLE001 — schema probe never blocks the write
+            has_window_col = False
+        if has_window_col:
+            exclude_sql = " AND window_id IS DISTINCT FROM %s"
+            params.append(window_id)
+    params.append(DEDUP_CANDIDATE_LIMIT)
     try:
         cur.execute(
             f"""
@@ -147,10 +187,11 @@ def _dedup_candidates(cur, payload: dict[str, Any]) -> list[dict[str, Any]]:
               AND deleted_at IS NULL
               AND ts BETWEEN %s::timestamptz - interval '5 minutes'
                          AND %s::timestamptz + interval '5 minutes'
+              {exclude_sql}
             ORDER BY ts DESC
             LIMIT %s
             """,
-            (group_val, ts, ts, DEDUP_CANDIDATE_LIMIT),
+            params,
         )
     except Exception:  # noqa: BLE001 — dedup is best-effort, never blocks a write
         return []
@@ -223,6 +264,22 @@ def _union_json_list(existing: Any, new_items: Any) -> list[Any]:
     return out
 
 
+def _append_summary(existing: str, incoming: str) -> str:
+    """K5: a merge used to drop the incoming capture's own summary outright —
+    now it becomes a new paragraph on the target, deduped by exact text (the
+    same near-duplicate conversation restated across captures must not grow
+    the episode every time it is)."""
+    existing = (existing or "").strip()
+    incoming = (incoming or "").strip()
+    if not incoming:
+        return existing
+    paragraphs = [p for p in existing.split("\n\n") if p.strip()] if existing else []
+    if incoming in paragraphs:
+        return existing
+    paragraphs.append(incoming)
+    return "\n\n".join(paragraphs)
+
+
 def _merge_into_episode(
     cur, target_id: int, payload: dict[str, Any], *, matched_via: str, score: float
 ) -> bool:
@@ -234,9 +291,10 @@ def _merge_into_episode(
     ``open_loops`` entry that arrived on the merged side was lost outright,
     unlike the insert path at ``write_pg``); and it left the target row's
     vectors pointing at the pre-merge text, so the new decisions were
-    unsearchable semantically until the nightly backfill. All three are fixed
-    here, each fail-open — the row update is the durable part and must never
-    be taken down by an additive step.
+    unsearchable semantically until the nightly backfill. And (K5) the
+    incoming capture's own SUMMARY — not just its lists — was dropped on the
+    floor too. All are fixed here, each fail-open — the row update is the
+    durable part and must never be taken down by an additive step.
     """
     from khipu.db import has_columns
 
@@ -258,6 +316,7 @@ def _merge_into_episode(
     new_preferences = _union_json_list(preferences, payload.get("preferences"))
     new_people = _union_json_list(people, payload.get("people"))
     new_tags = _union_json_list(tags, payload.get("tags")) if has_tags else None
+    new_summary = _append_summary(target_summary, payload.get("summary"))
     raw = dict(raw or {})
     merged_from = list(raw.get("merged_from") or [])
     merged_from.append({
@@ -268,13 +327,14 @@ def _merge_into_episode(
     })
     raw["merged_from"] = merged_from
     sets = ["topics = %s::jsonb", "decisions = %s::jsonb", "preferences = %s::jsonb",
-            "people = %s::jsonb", "raw = %s::jsonb"]
+            "people = %s::jsonb", "raw = %s::jsonb", "summary = %s"]
     params: list[Any] = [
         json.dumps(new_topics, ensure_ascii=False),
         json.dumps(new_decisions, ensure_ascii=False),
         json.dumps(new_preferences, ensure_ascii=False),
         json.dumps(new_people, ensure_ascii=False),
         json.dumps(raw, ensure_ascii=False),
+        new_summary,
     ]
     if has_tags:
         sets.append("tags = %s::jsonb")
@@ -302,10 +362,11 @@ def _merge_into_episode(
         _log(f"merge commitments step failed ({type(exc).__name__}: {exc})")
 
     # The target's text changed, so its vectors are stale. embed_on_capture
-    # finds the row by (ts, md5(summary)) — both unchanged by a merge — and
-    # re-embeds the MERGED text we just wrote.
-    _reembed_merged_episode(target_ts, target_summary, {
-        "summary": target_summary,
+    # finds the row by (ts, md5(summary)) — the identity is target_ts +
+    # new_summary now that the UPDATE above changed the summary column, so
+    # both must reflect the MERGED text or the lookup finds nothing.
+    _reembed_merged_episode(target_ts, new_summary, {
+        "summary": new_summary,
         "topics": new_topics,
         "decisions": new_decisions,
         "preferences": new_preferences,

@@ -43,11 +43,13 @@ class RuleTextTest(unittest.TestCase):
         yourself" for a topic named explicitly."""
         self.assertIn("search yourself on a named topic", rr.RULE_MD)
 
-    def test_it_warns_that_capture_declines_where_a_hook_already_runs(self):
-        """Without this a model reads a declined khipu_capture as a failure and
-        retries it every turn."""
-        self.assertIn("declines", rr.RULE_MD)
-        self.assertIn("dual", rr.RULE_MD)
+    def test_it_says_capture_queues_instead_of_declining_where_a_hook_runs(self):
+        """K1: a hook-owned install no longer declines khipu_capture — it
+        queues a capture-now flag for the next Stop. Without this a model
+        reads a declined call as a failure and retries it every turn."""
+        self.assertIn("flags the", rr.RULE_MD)
+        self.assertIn("next Stop", rr.RULE_MD)
+        self.assertIn("verbatim.note", rr.RULE_MD)
 
     def test_it_explains_the_semantic_flag_both_ways(self):
         self.assertIn("semantic", rr.RULE_MD)

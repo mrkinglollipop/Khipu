@@ -61,10 +61,14 @@ def recent_episodes(*, limit: int = 40) -> list[dict]:
 def episode_detail(episode_id: int) -> dict | None:
     with connect() as conn:
         with conn.cursor() as cur:
+            from khipu.db import has_columns
+
+            has_verbatim = has_columns(cur, "episodes", "verbatim")
+            verbatim_col = "verbatim" if has_verbatim else "NULL::jsonb AS verbatim"
             cur.execute(
-                """
+                f"""
                 SELECT id, ts, ingested_at, session_id, scope, summary,
-                       topics, people, decisions, preferences, edges, raw
+                       topics, people, decisions, preferences, edges, raw, {verbatim_col}
                 FROM episodes
                 WHERE id = %s
                 """,
@@ -86,6 +90,7 @@ def episode_detail(episode_id: int) -> dict | None:
         "preferences": r[9],
         "edges": r[10],
         "raw": r[11],
+        "verbatim": r[12],
     }
 
 

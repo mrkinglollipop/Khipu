@@ -318,17 +318,20 @@ TOOLS: list[dict] = [
     {
         "name": "khipu_capture",
         "description": (
-            "Remember this session in Khipu. Cloud / no capture hook: CALL THIS "
-            "when you finish a substantive piece of work — a decision, a fix, a "
-            "finding worth recalling later — with a 1-3 sentence summary, short "
-            "lowercase topic slugs, and any decisions/preferences; set "
-            "session_id to '<harness>:<stable id>' (e.g. "
-            "'grokbot:<repo>:<task>'). Local Mac with khipu-stop-hook or "
-            "khipu-aegis-capture: do NOT call this even in capture_mode=hub — "
-            "the hook is the writer and an MCP write double-captures. Dual: "
-            "this tool declines and says so — expected, the hook already has "
-            "it. Through the HTTPS gateway it is the ONLY way the session is "
-            "remembered, so do not skip it there."
+            "Remember this session in Khipu — works everywhere now (K1). Cloud / "
+            "no capture hook: CALL THIS when you finish a substantive piece of "
+            "work — a decision, a fix, a finding worth recalling later — with a "
+            "1-3 sentence summary, short lowercase topic slugs, and any "
+            "decisions/preferences; set session_id to '<harness>:<stable id>' "
+            "(e.g. 'grokbot:<repo>:<task>'). Local Mac with khipu-stop-hook or "
+            "khipu-aegis-capture (capture_mode=hub or dual): this does NOT write "
+            "directly — the hook is the writer and a direct MCP write would "
+            "double-capture — instead it flags the session and returns "
+            "{queued: true, captured_by: 'next stop'}; the summary you pass "
+            "becomes the job's note and lands in the episode's verbatim.note at "
+            "the next Stop/PreCompact/SessionEnd, regardless of cadence. Through "
+            "the HTTPS gateway (no local hook) it is the ONLY way the session is "
+            "remembered and writes immediately, so do not skip it there."
         ),
         "inputSchema": {
             "type": "object",
@@ -619,11 +622,39 @@ def _attach_prior_work(payload: dict, args: dict) -> None:
 
 def _tool_capture(args: dict) -> dict:
     # Locked semantics (agent-integration note, "MCP + CLI write / read
-    # semantics"): in legacy/dual the harness's shell hook is the writer, so an
-    # MCP write here would double-capture — reject with a clear pointer. In hub
-    # the HTTPS gateway (and no-hook installs) may write; local stdio with
-    # khipu-stop-hook / khipu-aegis-capture must still decline. The CLI
-    # ``khipu capture`` does not go through this function.
+    # semantics"), amended for K1: a local capture hook (khipu-stop-hook /
+    # khipu-aegis-capture) is ALWAYS the writer when one is configured — an
+    # MCP write here would double-capture, in any capture_mode. K1 changed
+    # what happens next: instead of refusing outright, it flags the session
+    # for its next Stop/PreCompact/SessionEnd (khipu.session_capture
+    # request_capture_now), regardless of cadence, and the summary becomes
+    # that job's note (verbatim.note on the resulting episode). No local hook
+    # configured and capture_mode != hub: still a hard reject — nothing would
+    # ever act on a flag with no hook to read it. The CLI ``khipu capture``
+    # does not go through this function.
+    summary = args.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise ValueError("khipu_capture requires a non-empty string 'summary'")
+
+    if _stdio_hook_owns_capture():
+        from khipu.session_capture import newest_session_ref, request_capture_now
+
+        sid_arg = str(args.get("session_id") or "")
+        harness, sid = (sid_arg.split(":", 1) if ":" in sid_arg else (None, None))
+        if not harness or not sid:
+            ref = newest_session_ref()
+            if ref is None:
+                raise ValueError(
+                    "khipu_capture found a local capture hook (khipu-stop-hook / "
+                    "khipu-aegis-capture) but no active session to flag — no "
+                    "per-session state file exists yet (the hook has not run once "
+                    "in this session). Pass session_id='<harness>:<id>' explicitly, "
+                    "or wait for the hook's first run and retry."
+                )
+            harness, sid = ref
+        request_capture_now(harness, sid, note=summary.strip())
+        return {"queued": True, "captured_by": "next stop", "harness": harness, "session_id": sid}
+
     mode = _capture_mode()
     if mode != "hub":
         raise ValueError(
@@ -632,22 +663,7 @@ def _tool_capture(args: dict) -> dict:
             "and an MCP write would double-capture. Set capture_mode=hub to "
             "write through MCP."
         )
-    if _stdio_hook_owns_capture():
-        raise ValueError(
-            "khipu_capture is rejected on the local stdio MCP server: "
-            "khipu-stop-hook / khipu-aegis-capture is the writer and an MCP "
-            "write would double-capture. The hook already has this session. "
-            "Cloud agents write through the HTTPS gateway, which is allowed."
-        )
     from khipu.capture import capture, load_payload
-
-    # load_payload raises SystemExit (EX_DATAERR) on a bad payload — inside an
-    # MCP server that is a process kill, not a tool error. Check the one field
-    # it rejects on before handing it over, so the common case is a clean
-    # ValueError; handle_message catches SystemExit for the rest.
-    summary = args.get("summary")
-    if not isinstance(summary, str) or not summary.strip():
-        raise ValueError("khipu_capture requires a non-empty string 'summary'")
 
     # load_payload validates + mints ts; capture() routes by mode (hub → PG only).
     payload = load_payload(json.dumps({k: v for k, v in args.items() if v is not None}))

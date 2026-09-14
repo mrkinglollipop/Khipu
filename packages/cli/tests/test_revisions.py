@@ -32,6 +32,15 @@ class FakeCursor:
         "due_after", "status", "closed_episode", "closed_at", "close_reason",
         "content_hash",
     )
+    # Full modern episodes shape (0016/0017 included) so a has_columns probe
+    # for e.g. "verbatim" answers True without consuming a canned result —
+    # same reasoning as commitments_columns above.
+    episodes_columns = (
+        "id", "ts", "ingested_at", "session_id", "scope", "summary", "topics",
+        "people", "decisions", "preferences", "edges", "raw", "harness",
+        "repo_root", "project", "parent_session_id", "transcript_range", "tags",
+        "deleted_at", "window_id", "truncated_chars", "verbatim",
+    )
 
     def __init__(self, results):
         self._results = list(results)
@@ -41,10 +50,14 @@ class FakeCursor:
         from khipu import db as _db
 
         _db._TABLE_COLUMNS_CACHE.pop("commitments", None)
+        _db._TABLE_COLUMNS_CACHE.pop("episodes", None)
 
     def execute(self, sql, params=None):
         if "information_schema.columns" in sql and tuple(params or ()) == ("commitments",):
             self._current = [(c,) for c in self.commitments_columns]
+            return
+        if "information_schema.columns" in sql and tuple(params or ()) == ("episodes",):
+            self._current = [(c,) for c in self.episodes_columns]
             return
         self.statements.append(" ".join(sql.split()))
         self.params.append(params)

@@ -658,15 +658,27 @@ def _episode_live_clause(cur) -> str:
         return ""
 
 
-def _episode_rank_text(summary, topics, decisions, preferences, people) -> str:
+def _episode_rank_text(summary, topics, decisions, preferences, people, verbatim=None) -> str:
     """Full (unclipped) episode text for ranking — delegates to embed.episode_text
     (no byte copy) so the two never drift on what "the episode's text" means."""
     from khipu.embed import episode_text
 
     return episode_text({
         "summary": summary, "topics": topics, "decisions": decisions,
-        "preferences": preferences, "people": people,
+        "preferences": preferences, "people": people, "verbatim": verbatim,
     })
+
+
+def _episode_verbatim_select(cur) -> str:
+    """``verbatim`` when the column exists (0017), else a NULL of the same
+    shape — keeps every episode SELECT's column count fixed regardless of
+    migration state, same posture as ``_episode_live_clause``."""
+    from khipu.db import has_columns
+
+    try:
+        return "verbatim" if has_columns(cur, "episodes", "verbatim") else "NULL::jsonb"
+    except Exception:  # noqa: BLE001 — schema probe must never break a search
+        return "NULL::jsonb"
 
 
 def _neg_ts_sort_key(ts) -> float:
@@ -764,7 +776,8 @@ def _literal_candidates(
             )
             cur.execute(
                 f"""
-                SELECT id::text, summary, topics, decisions, preferences, people, ts
+                SELECT id::text, summary, topics, decisions, preferences, people, ts,
+                       {_episode_verbatim_select(cur)} AS verbatim
                 FROM episodes
                 WHERE {_episode_live_clause(cur)}({episode_ilike_where})
                   AND ({ep_filter})
@@ -773,10 +786,10 @@ def _literal_candidates(
                 """,
                 params,
             )
-            for eid, summary, topics, decisions, preferences, people, ts in cur.fetchall():
+            for eid, summary, topics, decisions, preferences, people, ts, verbatim in cur.fetchall():
                 pool.append({
                     "kind": "episode", "id": eid, "label": summary, "snippet": summary,
-                    "rank_text": _episode_rank_text(summary, topics, decisions, preferences, people),
+                    "rank_text": _episode_rank_text(summary, topics, decisions, preferences, people, verbatim),
                     "hits": 1, "ts": ts,
                 })
         if "node" in active_kinds:
@@ -823,7 +836,7 @@ def _literal_candidates(
             cur.execute(
                 f"""
                 SELECT id::text, summary, topics, decisions, preferences, people, ts,
-                       ({episode_score}) AS hits
+                       ({episode_score}) AS hits, {_episode_verbatim_select(cur)} AS verbatim
                 FROM episodes
                 WHERE {_episode_live_clause(cur)}({episode_where}) AND ({ep_filter})
                 ORDER BY hits DESC, ts DESC NULLS LAST, id DESC
@@ -831,10 +844,10 @@ def _literal_candidates(
                 """,
                 {**params, "lim": lim},
             )
-            for eid, summary, topics, decisions, preferences, people, ts, hits in cur.fetchall():
+            for eid, summary, topics, decisions, preferences, people, ts, hits, verbatim in cur.fetchall():
                 pool.append({
                     "kind": "episode", "id": eid, "label": summary, "snippet": summary,
-                    "rank_text": _episode_rank_text(summary, topics, decisions, preferences, people),
+                    "rank_text": _episode_rank_text(summary, topics, decisions, preferences, people, verbatim),
                     "hits": int(hits), "ts": ts,
                 })
         if "node" in active_kinds:
@@ -1275,14 +1288,15 @@ def _reembed_episode(cur, episode_id: int) -> bool:
     )
 
     cols = ("summary", "decisions", "preferences", "topics", "people")
+    verbatim_col = _episode_verbatim_select(cur)
     cur.execute(
-        f"SELECT {', '.join(cols)} FROM episodes WHERE id = %s",
+        f"SELECT {', '.join(cols)}, {verbatim_col} AS verbatim FROM episodes WHERE id = %s",
         (episode_id,),
     )
     row = cur.fetchone()
     if not row:
         return False
-    chunks = chunk_text(episode_text(dict(zip(cols, row))))
+    chunks = chunk_text(episode_text(dict(zip((*cols, "verbatim"), row))))
     if not chunks:
         return False
     profile = _active_profile(cur)
@@ -1638,6 +1652,63 @@ def cmd_capture(args: argparse.Namespace) -> int:
         else sys.stdin.read()
     )
     return capture(load_payload(raw), mode=args.mode)
+
+
+def cmd_capture_now(args: argparse.Namespace) -> int:
+    """K1: `khipu capture now [--note TEXT] [--harness H --session-id ID]` —
+    flags a session for capture on its next Stop/PreCompact/SessionEnd,
+    regardless of cadence. With no explicit --harness/--session-id, targets
+    the most recently active local session (newest per-session state file)."""
+    from khipu.session_capture import newest_session_ref, request_capture_now
+
+    harness = getattr(args, "harness", None)
+    sid = getattr(args, "session_id", None)
+    if not harness or not sid:
+        auto = newest_session_ref()
+        if auto is None:
+            print(json.dumps({
+                "ok": False,
+                "error": "no active session found under the capture state dir; "
+                         "pass --harness and --session-id explicitly",
+            }))
+            return 1
+        harness, sid = harness or auto[0], sid or auto[1]
+    path = request_capture_now(harness, sid, note=getattr(args, "note", None))
+    print(json.dumps({
+        "queued": True, "captured_by": "next stop",
+        "harness": harness, "session_id": sid, "flag": str(path),
+    }))
+    return 0
+
+
+def cmd_get(args: argparse.Namespace) -> int:
+    """`khipu get ID [--kind episode|topic]` — episode or topic detail for
+    local inspection, including the verbatim tier (K2). Same data khipu_get
+    (MCP) returns."""
+    from khipu.activity import episode_detail, topic_detail
+
+    ident = str(args.id)
+    kind = (getattr(args, "kind", None) or "").strip().lower() or None
+    if kind is None:
+        kind = "episode" if ident.isdigit() else "topic"
+    if kind == "episode":
+        if not ident.isdigit():
+            print(json.dumps({"ok": False, "error": "episode id must be digits"}))
+            return 2
+        row = episode_detail(int(ident))
+    else:
+        row = topic_detail(ident)
+    if row is None:
+        print(json.dumps({"ok": False, "error": f"{kind} not found: {ident}"}))
+        return 1
+    row = dict(row)
+    verbatim = row.pop("verbatim", None) if kind == "episode" else None
+    row.pop("raw", None)
+    print(json.dumps({"kind": kind, **row}, indent=2, default=str))
+    if verbatim:
+        print("\nverbatim:")
+        print(json.dumps(verbatim, indent=2, default=str))
+    return 0
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -2947,7 +3018,30 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("legacy", "dual", "hub"),
         help="Override capture_mode for this run",
     )
+    cap_sub = cap.add_subparsers(dest="capture_cmd", required=False)
+    cap_now = cap_sub.add_parser(
+        "now",
+        help="Flag a session for capture on its next Stop, regardless of cadence (K1)",
+    )
+    cap_now.add_argument("--note", default=None, help="Attached to the job; lands in verbatim.note")
+    cap_now.add_argument(
+        "--harness", default=None,
+        help="Defaults to the most recently active local session's harness",
+    )
+    cap_now.add_argument(
+        "--session-id", dest="session_id", default=None,
+        help="Defaults to the most recently active local session's id",
+    )
+    cap_now.set_defaults(func=cmd_capture_now)
     cap.set_defaults(func=cmd_capture)
+
+    gt = sub.add_parser(
+        "get",
+        help="Episode or topic detail by id/slug, including the verbatim tier (K2)",
+    )
+    gt.add_argument("id", help="Episode id (digits) or topic slug")
+    gt.add_argument("--kind", choices=("episode", "topic"), default=None)
+    gt.set_defaults(func=cmd_get)
 
     mg = sub.add_parser(
         "migrate", help="Apply pending ops/migrations/*.sql to the database"

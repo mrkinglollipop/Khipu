@@ -715,12 +715,24 @@ def _resolve_profile(cur, profile: str | None) -> str:
 
 
 def episode_text(row: dict[str, Any]) -> str:
-    """What we embed for an episode: summary + decisions/preferences/topics as context."""
+    """What we embed for an episode: summary + decisions/preferences/topics as
+    context, plus its verbatim tier (K2) — errors, commands, paths and literal
+    quotes are exactly the text a later search is most likely to be typed
+    against, and the model summary never carries them."""
     parts = [row.get("summary") or ""]
     for key in ("decisions", "preferences", "topics", "people"):
         vals = row.get(key) or []
         if isinstance(vals, list) and vals:
             parts.append(f"{key}: " + "; ".join(str(v) for v in vals))
+    verbatim = row.get("verbatim")
+    if isinstance(verbatim, dict):
+        for key in ("errors", "commands", "paths", "quotes"):
+            vals = verbatim.get(key) or []
+            if isinstance(vals, list) and vals:
+                parts.append(f"{key}: " + "; ".join(str(v) for v in vals))
+        note = verbatim.get("note")
+        if note:
+            parts.append(f"note: {note}")
     return "\n".join(p for p in parts if p).strip()
 
 
@@ -740,13 +752,18 @@ def _iter_sources(cur, *, kind: str | None = None) -> Iterable[tuple[str, str, s
         from khipu.db import has_columns
 
         live = " WHERE deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
+        has_verbatim = has_columns(cur, "episodes", "verbatim")
+        verbatim_col = ", verbatim" if has_verbatim else ""
         cur.execute(
-            f"SELECT id, summary, decisions, preferences, topics, people FROM episodes{live} ORDER BY id"
+            f"SELECT id, summary, decisions, preferences, topics, people{verbatim_col} "
+            f"FROM episodes{live} ORDER BY id"
         )
-        for eid, summary, decisions, prefs, topics, people in cur.fetchall():
+        for row in cur.fetchall():
+            eid, summary, decisions, prefs, topics, people = row[:6]
+            verbatim = row[6] if has_verbatim else None
             text = episode_text(
                 {"summary": summary, "decisions": decisions, "preferences": prefs,
-                 "topics": topics, "people": people}
+                 "topics": topics, "people": people, "verbatim": verbatim}
             )
             if text:
                 yield "episode", str(eid), text, ""
@@ -1918,8 +1935,10 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             # A forgotten episode has no embedding on purpose; without this
             # guard the catch-up re-embedded every tombstone on the next hook.
             live = "e.deleted_at IS NULL AND " if has_columns(cur, "episodes", "deleted_at") else ""
+            has_verbatim = has_columns(cur, "episodes", "verbatim")
+            verbatim_col = ", e.verbatim" if has_verbatim else ""
             cur.execute(
-                "SELECT e.id, e.summary, e.decisions, e.preferences, e.topics, e.people"
+                f"SELECT e.id, e.summary, e.decisions, e.preferences, e.topics, e.people{verbatim_col}"
                 f" FROM episodes e WHERE {live}NOT EXISTS ("
                 "  SELECT 1 FROM memory_embeddings m"
                 "  WHERE m.profile = %s AND m.kind = 'episode' AND m.ref = e.id::text)"
@@ -1927,9 +1946,12 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 (profile, limit),
             )
             todo: list[tuple[str, str, int, str, str]] = []
-            for eid, summary, decisions, prefs, topics, people in cur.fetchall():
+            for row in cur.fetchall():
+                eid, summary, decisions, prefs, topics, people = row[:6]
+                verbatim = row[6] if has_verbatim else None
                 text = episode_text({"summary": summary, "decisions": decisions,
-                                     "preferences": prefs, "topics": topics, "people": people})
+                                     "preferences": prefs, "topics": topics, "people": people,
+                                     "verbatim": verbatim})
                 if not text:
                     continue
                 out["embedded"] += 1

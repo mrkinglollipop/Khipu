@@ -8,12 +8,17 @@ capture_v2 hooks (dual-write) and never edits them.
 
 Packs:
   claude_code  ~/.claude.json mcpServers.khipu
-               ~/.claude/settings.json hooks.Stop / hooks.PreCompact → khipu-stop-hook
+               ~/.claude/settings.json hooks.Stop / hooks.PreCompact / hooks.SubagentStop
+                 → khipu-stop-hook (SubagentStop, K4: subagent work otherwise got no
+                 slice at all; session_capture.hook_main() recognises the event and
+                 handles the subagent's own transcript)
   cursor       ~/.cursor/mcp.json mcpServers.khipu
-               ~/.cursor/hooks.json hooks.stop / hooks.preCompact / hooks.sessionEnd →
-                 khipu-stop-hook (sessionEnd verified 2026-09-05 against Cursor's own
-                 app bundle, which names a sessionEnd hook event — the "quit without
-                 stopping/compacting" net, same rationale as Claude Code's SessionEnd)
+               ~/.cursor/hooks.json hooks.stop / hooks.preCompact / hooks.sessionEnd /
+                 hooks.subagentStop → khipu-stop-hook (sessionEnd verified 2026-09-05
+                 against Cursor's own app bundle, which names a sessionEnd hook event —
+                 the "quit without stopping/compacting" net, same rationale as Claude
+                 Code's SessionEnd; subagentStop confirmed in Cursor's own docs, K4,
+                 same shape as its stop entry)
                ~/.cursor/hooks.json hooks.sessionStart += khipu-recall-hook
                  (--cursor → additional_context; timeout 30s for PG;
                  does not replace existing harness sessionStart entries)
@@ -26,11 +31,15 @@ Packs:
                ~/.grok/config.toml [[hooks.Stop]] / [[hooks.PreCompact]] / [[hooks.SessionEnd]]
                  → khipu-aegis-capture (Aegis-native EXTRACTION — Aegis has no legacy
                  capture_v2 hook, so this is what makes Aegis sessions produce episodes)
-               (no recall rule: SessionStart/UserPromptSubmit are Observe gates — verified)
+               (no recall rule: SessionStart/UserPromptSubmit are Observe gates — verified;
+                no SubagentStop pack either — Aegis's hooks run sandboxed through
+                khipu-aegis-capture, a different mechanism from khipu-stop-hook)
   codex        ~/.codex/config.toml [mcp_servers.khipu]            (TOML, like Aegis)
-               ~/.codex/hooks.json hooks.Stop / PreCompact / SessionStart / UserPromptSubmit
+               ~/.codex/hooks.json hooks.Stop / PreCompact / SessionStart /
+                 UserPromptSubmit / SubagentStop
                (Claude-shaped JSON — verified 2026-08-17: same event names +
-               {type,command,timeout} entries; UserPromptSubmit exposed the same way)
+               {type,command,timeout} entries; UserPromptSubmit exposed the same way;
+               SubagentStop, K4, carries agent_transcript_path for the child transcript)
 
   Every claude_code/codex pack above also gets hooks.UserPromptSubmit +=
   khipu-prompt-recall (R1): a bounded per-prompt search, pushed the same way
@@ -258,13 +267,15 @@ def _claude_install(dry: bool) -> dict:
             out.setdefault("backups", []).append(_backup(CLAUDE_JSON))
             d.setdefault("mcpServers", {})["khipu"] = want
             _write_json(CLAUDE_JSON, d)
-    # Hooks: append a Khipu-owned entry to Stop + PreCompact + SessionEnd if not
-    # present. SessionEnd is the "quit without compacting" net: since 2026-08-17
-    # this hook is the harness's actual capture step, not just a tail sync.
+    # Hooks: append a Khipu-owned entry to Stop + PreCompact + SessionEnd +
+    # SubagentStop if not present. SessionEnd is the "quit without compacting"
+    # net: since 2026-08-17 this hook is the harness's actual capture step,
+    # not just a tail sync. SubagentStop (K4) is the same hook — hook_main()
+    # recognises the event name and handles a subagent's own transcript.
     s = _load_json(CLAUDE_SETTINGS)
     hooks = s.setdefault("hooks", {})
     changed = False
-    for event in ("Stop", "PreCompact", "SessionEnd"):
+    for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop"):
         entries = hooks.setdefault(event, [])
         flat = [h for e in entries for h in e.get("hooks", [])]
         if not any(_is_ours(h.get("command")) for h in flat):
@@ -315,7 +326,7 @@ def _claude_uninstall(dry: bool) -> dict:
             _write_json(CLAUDE_JSON, d)
     s = _load_json(CLAUDE_SETTINGS)
     changed = False
-    for event in ("Stop", "PreCompact", "SessionEnd", "SessionStart", "UserPromptSubmit"):
+    for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop", "SessionStart", "UserPromptSubmit"):
         entries = s.get("hooks", {}).get(event, [])
         kept = []
         for e in entries:
@@ -350,6 +361,7 @@ def _claude_status() -> dict:
     native = has("Stop") and has("PreCompact")
     return {"harness": "claude_code", "detected": _claude_detected(), "mcp": mcp,
             "hook_stop": has("Stop"), "hook_precompact": has("PreCompact"), "hook_sessionend": has("SessionEnd"),
+            "hook_subagentstop": has("SubagentStop"),
             "recall_rule": "installed" if rule else "missing",
             "prompt_recall": "installed" if prompt_recall else "missing",
             # Khipu-native extraction rides on this same hook (session_capture);
@@ -404,7 +416,9 @@ def _cursor_install(dry: bool, project: str | None = None) -> dict:
     h = _load_json(CURSOR_HOOKS)
     hooks = h.setdefault("hooks", {})
     changed = False
-    for event in ("stop", "preCompact", "sessionEnd"):
+    # subagentStop (K4): Cursor exposes this event (alongside subagentStart);
+    # same shape as its existing stop entry.
+    for event in ("stop", "preCompact", "sessionEnd", "subagentStop"):
         entries = hooks.setdefault(event, [])
         if not any(_is_ours(e.get("command")) for e in entries):
             entries.append({"command": stop_hook(), "timeout": 20})
@@ -461,7 +475,7 @@ def _cursor_uninstall(dry: bool, project: str | None = None) -> dict:
             _write_json(CURSOR_MCP, d)
     h = _load_json(CURSOR_HOOKS)
     changed = False
-    for event in ("stop", "preCompact", "sessionEnd", "sessionStart"):
+    for event in ("stop", "preCompact", "sessionEnd", "subagentStop", "sessionStart"):
         entries = h.get("hooks", {}).get(event, [])
         if event == "sessionStart":
             kept = [e for e in entries if not _is_our_recall(e.get("command"))]
@@ -490,6 +504,7 @@ def _cursor_status() -> dict:
             "mcp": d.get("mcpServers", {}).get("khipu", {}).get("command") == mcp_launcher(),
             "hook_stop": has("stop"), "hook_precompact": has("preCompact"),
             "hook_sessionend": has("sessionEnd"),
+            "hook_subagentstop": has("subagentStop"),
             "hook_sessionstart": has_recall("sessionStart"),
             "recall_rule": "project_scoped",
             "extract": "installed" if has("stop") and has("preCompact") else "missing"}
@@ -682,7 +697,9 @@ def _codex_install(dry: bool) -> dict:
     h = _load_json(CODEX_HOOKS)
     hooks = h.setdefault("hooks", {})
     changed = False
-    for event in ("Stop", "PreCompact", "SessionEnd"):
+    # SubagentStop (K4): Codex's own hooks.json lists this event; hook_main()
+    # reads its agent_transcript_path (child transcript) when present.
+    for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop"):
         entries = hooks.setdefault(event, [])
         flat = [x for e in entries for x in e.get("hooks", [])]
         # Codex allows SessionEnd hooks at most 3 s (docs: default 1 s, max 3 s),
@@ -743,7 +760,7 @@ def _codex_uninstall(dry: bool) -> dict:
                 CODEX_TOML.write_text(new.rstrip("\n") + "\n", encoding="utf-8")
     h = _load_json(CODEX_HOOKS)
     changed = False
-    for event in ("Stop", "PreCompact", "SessionEnd", "SessionStart", "UserPromptSubmit"):
+    for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop", "SessionStart", "UserPromptSubmit"):
         entries = h.get("hooks", {}).get(event, [])
         kept = []
         for e in entries:
@@ -775,6 +792,7 @@ def _codex_status() -> dict:
             "mcp": bool(m and mcp_launcher() in m.group(0)),
             "hook_stop": has("Stop", _is_ours), "hook_precompact": has("PreCompact", _is_ours),
             "hook_sessionend": has("SessionEnd", _is_ours),
+            "hook_subagentstop": has("SubagentStop", _is_ours),
             "recall_rule": "installed" if has("SessionStart", _is_our_recall) else "missing",
             "prompt_recall": "installed" if has("UserPromptSubmit", _is_our_prompt_recall) else "missing",
             "extract": "installed" if has("Stop", _is_ours) and has("PreCompact", _is_ours) else "missing"}

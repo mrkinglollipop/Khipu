@@ -223,6 +223,93 @@ def _generate(prompt: str, *, timeout: int = 45, retries: int = 2) -> str:
     )
 
 
+# ---- verbatim tier (K2) -----------------------------------------------------
+#
+# Regex-extracted from the rendered window BEFORE the model call — the model
+# summary destroys error strings, commands, paths and the user's own words
+# outright, so this tier is never model-summarized and never lost when the
+# model judges a window "nothing durable".
+
+VERBATIM_CLASS_CAP = 2_000       # combined chars kept per class
+VERBATIM_QUOTE_CHARS = 300       # each literal user quote, clipped
+
+# A line naming a real failure — the traceback/exception/CI-red vocabulary.
+_VERBATIM_ERROR_RE = re.compile(r"^.*\b(?:Error|Exception|Traceback|FAILED|failed:)\b.*$", re.M)
+# A shell command typed at a prompt.
+_VERBATIM_CMD_LINE_RE = re.compile(r"^\s*\$\s+(.+)$", re.M)
+# A shell command inside a fenced ```bash/```sh block.
+_VERBATIM_CMD_FENCE_RE = re.compile(r"```(?:bash|sh)\n(.*?)```", re.S)
+# An absolute path, or a relative path/filename ending in an extension.
+_VERBATIM_PATH_RE = re.compile(
+    r"(?:^|[\s(\[\"'`])((?:/[\w.\-]+)+|(?:\.{1,2}/)?[\w.\-]+(?:/[\w.\-]+)+\.[A-Za-z0-9]{1,8}"
+    r"|[\w.\-]+\.[A-Za-z0-9]{1,8})(?=[\s)\]\"'`,:;]|$)"
+)
+
+
+def _verbatim_cap(items: list[str], cap: int) -> list[str]:
+    out: list[str] = []
+    total = 0
+    for it in items:
+        if not it or total >= cap:
+            continue
+        take = it if total + len(it) <= cap else it[: max(0, cap - total)]
+        if take:
+            out.append(take)
+            total += len(take)
+    return out
+
+
+def _verbatim_user_messages(text: str) -> list[str]:
+    """USER-prefixed blocks from session_capture.render()'s output."""
+    return [b[len("USER: "):].strip() for b in text.split("\n\n")
+            if b.startswith("USER: ") and b[len("USER: "):].strip()]
+
+
+def _verbatim_quotes(user_messages: list[str]) -> list[str]:
+    """The first, the longest, and the last user message — up to three,
+    deduped, each clipped to VERBATIM_QUOTE_CHARS."""
+    if not user_messages:
+        return []
+    picked: list[str] = []
+    for q in (user_messages[0], max(user_messages, key=len), user_messages[-1]):
+        if q not in picked:
+            picked.append(q)
+    return [q[:VERBATIM_QUOTE_CHARS] for q in picked]
+
+
+def extract_verbatim(text: str) -> dict[str, list[str]]:
+    """errors / commands / paths / quotes pulled from a rendered capture
+    window. Never raises; an empty/unmatched window returns {}."""
+    if not text:
+        return {}
+    errors = [m.strip() for m in _VERBATIM_ERROR_RE.findall(text)]
+    cmd_lines = [m.strip() for m in _VERBATIM_CMD_LINE_RE.findall(text)]
+    fence_cmds: list[str] = []
+    for block in _VERBATIM_CMD_FENCE_RE.findall(text):
+        for ln in block.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            # A `$ ` line inside the fence is also a `$ ` line in the whole
+            # text, so the line regex above already found it — strip the
+            # marker the same way it does, so dedup below actually dedups.
+            fence_cmds.append(ln[2:].strip() if ln.startswith("$ ") else ln)
+    paths = list(dict.fromkeys(m for m in _VERBATIM_PATH_RE.findall(text)))
+    quotes = _verbatim_quotes(_verbatim_user_messages(text))
+    out: dict[str, list[str]] = {}
+    if errors:
+        out["errors"] = _verbatim_cap(errors, VERBATIM_CLASS_CAP)
+    commands = list(dict.fromkeys(cmd_lines + fence_cmds))
+    commands = _verbatim_cap(commands, VERBATIM_CLASS_CAP)
+    if commands:
+        out["commands"] = commands
+    if paths:
+        out["paths"] = _verbatim_cap(paths, VERBATIM_CLASS_CAP)
+    if quotes:
+        out["quotes"] = _verbatim_cap(quotes, VERBATIM_CLASS_CAP)
+    return out
+
+
 def _as_str_list(v: Any, *, lower: bool = False) -> list[str]:
     if not isinstance(v, list):
         return []
