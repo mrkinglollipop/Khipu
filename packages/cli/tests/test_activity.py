@@ -61,12 +61,14 @@ class EpisodeDetailTest(unittest.TestCase):
             self.assertIsNone(activity.episode_detail(404))
 
     def test_detail_carries_raw_and_edges(self):
-        row = (1, None, None, "s", "repo", "sum", [], [], [], [], [{"a": 1}], {"r": 2})
+        row = (1, None, None, "s", "repo", "sum", [], [], [], [], [{"a": 1}], {"r": 2},
+               {"errors": ["boom"]})
         cur = FakeCursor([[row]])
         with mock.patch.object(activity, "connect", return_value=FakeConn(cur)):
             out = activity.episode_detail(1)
         self.assertEqual(out["edges"], [{"a": 1}])
         self.assertEqual(out["raw"], {"r": 2})
+        self.assertEqual(out["verbatim"], {"errors": ["boom"]})
 
 
 class TopicDetailTest(unittest.TestCase):

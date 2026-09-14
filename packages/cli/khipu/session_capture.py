@@ -683,6 +683,57 @@ def render(msgs: list[tuple[str, str]], *, max_chars: int = MAX_TRANSCRIPT) -> s
     return out
 
 
+# ---- window split (K3, no tail-clip) ---------------------------------------------
+#
+# A window over max_chars used to be tail-clipped by render() — the middle was
+# gone, unrecorded. Now it is split on MESSAGE boundaries into several parts,
+# each queued as its own job (chronological, oldest first); every part is
+# extracted into its own episode. MAX_WINDOW_PARTS bounds how many jobs one
+# Stop can create — beyond it, the oldest overflow is collapsed into a single
+# clipped part and truncated_chars records exactly what was dropped, so loss
+# is recorded instead of silent.
+
+MAX_WINDOW_PARTS = 8
+
+
+def _split_messages(msgs: list[tuple[str, str]], max_chars: int) -> list[list[tuple[str, str]]]:
+    """Group msgs so each group renders to at most max_chars, breaking only
+    between messages (never mid-message)."""
+    parts: list[list[tuple[str, str]]] = []
+    cur: list[tuple[str, str]] = []
+    cur_len = 0
+    for role, text in msgs:
+        piece = f"[tool] {text}" if role == "tool" else f"{role.upper()}: {text.strip()}"
+        add = len(piece) + (2 if cur else 0)  # "\n\n" joiner, same as render()
+        if cur and cur_len + add > max_chars:
+            parts.append(cur)
+            cur, cur_len, add = [], 0, len(piece)
+        cur.append((role, text))
+        cur_len += add
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+def _window_parts(msgs: list[tuple[str, str]], max_chars: int) -> list[dict[str, Any]]:
+    """Chronological parts, each ``{"text": ..., "truncated_chars": ...}``.
+    truncated_chars is 0 for every part unless there are more than
+    MAX_WINDOW_PARTS groups, in which case the oldest overflow is merged into
+    one part and tail-clipped (render()'s old behaviour), with the exact drop
+    recorded rather than silently lost."""
+    groups = _split_messages(msgs, max_chars)
+    if len(groups) <= MAX_WINDOW_PARTS:
+        return [{"text": render(g, max_chars=max_chars), "truncated_chars": 0} for g in groups]
+    keep = MAX_WINDOW_PARTS - 1
+    split_at = len(groups) - keep
+    oldest_msgs = [m for g in groups[:split_at] for m in g]
+    full = render(oldest_msgs, max_chars=10**9)
+    clipped = render(oldest_msgs, max_chars=max_chars)
+    merged = {"text": clipped, "truncated_chars": max(0, len(full) - len(clipped))}
+    rest = [{"text": render(g, max_chars=max_chars), "truncated_chars": 0} for g in groups[split_at:]]
+    return [merged, *rest]
+
+
 # ---- state + cadence ------------------------------------------------------------
 
 def _safe(sid: str) -> str:
@@ -708,11 +759,112 @@ def save_state(harness: str, sid: str, st: dict) -> None:
     os.replace(tmp, p)
 
 
-def decide(event: str, *, user_turns: int, chars: int, elapsed_s: float, stop_hook_active: bool) -> tuple[bool, str]:
+# ---- capture now (K1) ------------------------------------------------------------
+#
+# A flag file per (harness, session_id), consumed the first time decide() sees
+# it. Two writers: `khipu capture now` (CLI) and the MCP `khipu_capture` tool
+# on a hook-owned install, where a direct write would double-capture — this is
+# what it does instead of refusing outright.
+
+def _capture_now_flag_path(harness: str, sid: str) -> Path:
+    return state_dir() / f"{_safe(harness)}--{_safe(sid)}.capture-now.json"
+
+
+def request_capture_now(harness: str, sid: str, note: str | None = None) -> Path:
+    p = _capture_now_flag_path(harness, sid)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"note": note or None, "requested_at": _mint_ts()}), encoding="utf-8")
+    os.replace(tmp, p)
+    return p
+
+
+def _consume_capture_now(harness: str, sid: str) -> dict | None:
+    """Read-and-delete: a request fires exactly once. None when there is none."""
+    p = _capture_now_flag_path(harness, sid)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    try:
+        p.unlink()
+    except OSError:
+        pass
+    return data if isinstance(data, dict) else {}
+
+
+def newest_session_ref() -> tuple[str, str] | None:
+    """(harness, sid) of the most recently touched per-session state file —
+    for a caller with no session id of its own to go on (`khipu capture now`
+    with no explicit --harness/--session-id, the MCP khipu_capture tool on a
+    hook-owned install). Approximate, like the queue-file parsing in
+    _queue_by_harness: state file names are already lossy (_safe()), so this
+    is "the session someone just used," not an identity lookup."""
+    try:
+        files = [p for p in state_dir().glob("*--*.json") if not p.name.endswith(".capture-now.json")]
+    except OSError:
+        return None
+    if not files:
+        return None
+    try:
+        newest = max(files, key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return None
+    stem = newest.name[: -len(".json")]
+    if "--" not in stem:
+        return None
+    harness, sid = stem.split("--", 1)
+    return harness, sid
+
+
+# ---- high-value turn trigger (K1) ------------------------------------------------
+#
+# A single turn worth an immediate capture, overriding the periodic cadence.
+# Scanned from the rendered window (role-prefixed blocks from render()), so no
+# second parse of the transcript is needed.
+
+# The user asked outright — the highest-confidence capture trigger there is.
+_HV_EXPLICIT_ASK = re.compile(r"\b(remember this|save this|note this|capture this|write that down)\b", re.I)
+# The user is telling us we got something wrong; miss this window and the
+# wrong version is what memory keeps.
+_HV_CORRECTION = re.compile(r"\b(that'?s wrong|we already|no,|not what i|you missed)\b", re.I)
+# A decision or standing instruction, from either side of the conversation.
+_HV_DECISION = re.compile(r"\b(decided|approved|go with|the plan is|from now on)\b", re.I)
+HIGH_VALUE_ASSISTANT_CHARS = 6_000
+
+
+def _high_value_reason(window_text: str) -> str | None:
+    if not window_text:
+        return None
+    for block in window_text.split("\n\n"):
+        if block.startswith("USER: "):
+            body = block[len("USER: "):]
+            if _HV_EXPLICIT_ASK.search(body):
+                return "high-value: explicit capture request"
+            if _HV_CORRECTION.search(body):
+                return "high-value: user correction"
+            if _HV_DECISION.search(body):
+                return "high-value: decision phrase"
+        elif block.startswith("ASSISTANT: "):
+            body = block[len("ASSISTANT: "):]
+            if _HV_DECISION.search(body):
+                return "high-value: decision phrase"
+            if len(body) > HIGH_VALUE_ASSISTANT_CHARS:
+                return "high-value: long assistant turn"
+    return None
+
+
+def decide(event: str, *, user_turns: int, chars: int, elapsed_s: float, stop_hook_active: bool,
+           window_text: str = "", capture_requested: bool = False) -> tuple[bool, str]:
     if stop_hook_active:
         return False, "stop_hook_active"
+    if capture_requested:
+        return True, "requested"
     if user_turns < 1 or chars < MIN_CHARS:
         return False, f"nothing new (turns={user_turns}, chars={chars})"
+    hv_reason = _high_value_reason(window_text)
+    if hv_reason:
+        return True, hv_reason
     if event in ("precompact", "sessionend"):
         return True, event
     if event == "stop":
@@ -826,7 +978,8 @@ def _heartbeat(harness: str, out: dict) -> None:
     # inherit the previous run's new_turns/queued and look like it captured.
     for k in ("event", "session_id", "due", "reason", "new_turns", "new_chars", "queued", "error"):
         beat.pop(k, None)
-    beat.update({k: v for k, v in out.items() if k != "transcript"})
+    beat.update({k: v for k, v in out.items()
+                 if k not in ("transcript", "transcript_missing", "subagent_unsupported")})
     beat["harness"] = harness
     beat["dispatches"] = int(beat.get("dispatches", 0)) + 1
     turns = int(out.get("new_turns") or 0)
@@ -846,6 +999,15 @@ def _heartbeat(harness: str, out: dict) -> None:
     if out.get("error"):
         beat["last_error"] = out["error"]
         beat["last_error_at"] = out["at"]
+    # K7: accumulated, never overwritten by the per-run wholesale replace above
+    # — a "transcript missing" run is otherwise indistinguishable from any
+    # other not-due run once the next hook fires.
+    if out.get("transcript_missing"):
+        beat["transcript_missing"] = int(beat.get("transcript_missing", 0)) + 1
+        beat["last_transcript_missing_at"] = out["at"]
+    if out.get("subagent_unsupported"):
+        beat["subagent_unsupported"] = int(beat.get("subagent_unsupported", 0)) + 1
+        beat["last_subagent_unsupported_at"] = out["at"]
     _write_beat(harness, beat)
 
 
@@ -872,6 +1034,24 @@ def _record_drain(harness: str, *, captured: bool, error: str | None = None, emp
 
 # ---- hook entrypoint (SANDBOX-SAFE) ----------------------------------------------
 
+_SUBAGENTSTOP_SHAPE_LOGGED = "_subagentstop_shape_logged"
+
+
+def _log_subagentstop_shape_once(env: dict) -> None:
+    """K4: the SubagentStop payload shape is not fully documented across
+    harnesses — record it the first time one actually arrives, instead of
+    guessing further field names."""
+    marker = state_dir() / _SUBAGENTSTOP_SHAPE_LOGGED
+    if marker.exists():
+        return
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(_mint_ts(), encoding="utf-8")
+    except OSError:
+        pass
+    _log(f"subagentstop: first sighting, payload keys = {sorted(env.keys())}")
+
+
 def hook_main(raw: str, harness: str | None = None) -> dict:
     try:
         env = json.loads(raw or "{}")
@@ -882,22 +1062,47 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
     harness = harness or infer_harness(env)
     sid = session_id(env)
     event = norm_event(_get(env, "hookEventName", "hook_event_name"))
+    # K4: a SubagentStop's own `session_id` names the PARENT session, not the
+    # subagent — reusing it as-is for state/offset tracking would collide with
+    # the parent's own Stop-hook cadence (two different transcript files, one
+    # offset). track_sid distinguishes the subagent's own state file; the job
+    # still carries the parent id separately, as parent_session_id.
+    is_subagent_stop = event == "subagentstop"
+    if is_subagent_stop:
+        _log_subagentstop_shape_once(env)
+        agent_ref = str(_get(env, "agent_id", "agentId", "turn_id", "turnId", default="") or "x")
+        track_sid = f"{sid}:agent:{agent_ref}" if sid else ""
+    else:
+        track_sid = sid
     out: dict[str, Any] = {"harness": harness, "event": event, "session_id": sid, "due": False, "at": _mint_ts()}
     try:
         if not sid:
             out["reason"] = "no session id"
             return out
-        path = transcript_path(env, harness)
+        if is_subagent_stop:
+            # Codex names the child transcript agent_transcript_path; prefer it
+            # when present, else fall back to the generic transcriptPath every
+            # other event uses (Claude Code / Cursor).
+            agent_tp = _get(env, "agent_transcript_path", "agentTranscriptPath")
+            path = Path(str(agent_tp)) if agent_tp else transcript_path(env, harness)
+        else:
+            path = transcript_path(env, harness)
         if path is None:
-            out["reason"] = "no transcript path in payload"
+            if is_subagent_stop:
+                out["reason"] = "subagentstop: no transcript in payload"
+                out["subagent_unsupported"] = True
+            else:
+                out["reason"] = "no transcript path in payload"
             return out
         if not path.is_file():
             # Real and benign: Claude Code fires SessionEnd for sessions that
             # never wrote a line (headless -p runs, the desktop helper). Recorded
             # by name so a wrong path on a real session is diagnosable.
             out["reason"] = f"transcript missing: {path}"
+            if event in ("stop", "sessionend"):
+                out["transcript_missing"] = True
             return out
-        first_sight = not _state_file(harness, sid).exists()
+        first_sight = not _state_file(harness, track_sid).exists()
         if first_sight:
             # Start the elapsed clock now, so a one-question session does not
             # become an episode on its first Stop. PreCompact/SessionEnd still do.
@@ -907,22 +1112,40 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                 start = max(0, path.stat().st_size - FIRST_SIGHT_TAIL)
             except OSError:
                 start = 0
-            save_state(harness, sid, {"offset": start, "last_ts": time.time(), "captures": 0,
-                                       "transcript_path": str(path)})
-        st = load_state(harness, sid)
+            save_state(harness, track_sid, {"offset": start, "last_ts": time.time(), "captures": 0,
+                                             "transcript_path": str(path)})
+        st = load_state(harness, track_sid)
         msgs, new_off, turns = read_window(path, int(st.get("offset", 0)))
-        text = render(msgs)
         # Secrets never reach the summariser: a pasted key or a password in a
-        # DSN is masked here, before the window is queued to disk.
+        # DSN is masked here, per message, before the window is queued to disk.
         from khipu.redact import redact_secrets
 
-        text, redacted = redact_secrets(text)
-        if redacted:
-            _log(f"[{harness}] {sid} redacted {redacted} secret(s) before summarising")
-        due, reason = decide(event, user_turns=turns, chars=len(text),
-                             elapsed_s=time.time() - float(st.get("last_ts") or 0),
-                             stop_hook_active=bool(_get(env, "stopHookActive", "stop_hook_active", default=False)))
-        out.update(due=due, reason=reason, new_turns=turns, new_chars=len(text))
+        total_redacted = 0
+        redacted_msgs: list[tuple[str, str]] = []
+        for role, mtext in msgs:
+            r, n = redact_secrets(mtext)
+            total_redacted += n
+            redacted_msgs.append((role, r))
+        msgs = redacted_msgs
+        if total_redacted:
+            _log(f"[{harness}] {sid} redacted {total_redacted} secret(s) before summarising")
+        # K3: the full window, unclipped — decide() and the high-value scan see
+        # everything; only the job-splitting step below ever bounds it.
+        full_text = render(msgs, max_chars=10**9)
+        capture_now = _consume_capture_now(harness, track_sid)
+        capture_note = ""
+        if capture_now:
+            capture_note, note_redacted = redact_secrets(str(capture_now.get("note") or ""))
+            if note_redacted:
+                _log(f"[{harness}] {sid} redacted {note_redacted} secret(s) from a capture-now note")
+        due, reason = decide(
+            "stop" if is_subagent_stop else event,
+            user_turns=turns, chars=len(full_text),
+            elapsed_s=time.time() - float(st.get("last_ts") or 0),
+            stop_hook_active=bool(_get(env, "stopHookActive", "stop_hook_active", default=False)),
+            window_text=full_text, capture_requested=capture_now is not None,
+        )
+        out.update(due=due, reason=reason, new_turns=turns, new_chars=len(full_text))
         # Where the hook's parse reached, and when — liveness compares the
         # transcript against THIS, not its mtime: Aegis writes housekeeping
         # (workflow_updated) into idle sessions' updates.jsonl, so mtime moves
@@ -947,20 +1170,36 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                 ident = resolve_repo_root(cwd)
             except Exception:  # noqa: BLE001 — identity is best-effort, never fatal
                 ident = {"repo_root": None, "project": None, "is_worktree": False}
-            job = {"harness": harness, "session_id": sid, "cwd": cwd, "event": event,
-                   "ts": _mint_ts(), "turns": turns, "transcript": text,
-                   "transcript_path": str(path), "offset_before": off_before,
-                   "offset_after": new_off,
-                   "repo_root": ident.get("repo_root"), "project": ident.get("project"),
-                   "parent_session_id": parent_session_id(env, harness=harness, sid=sid) or None,
-                   "transcript_range": f"{off_before}:{new_off}"}
-            p = enqueue(job)
-            # Advance only after the job is on disk: a crash between the two
+            job_sid = track_sid if is_subagent_stop else sid
+            job_parent = sid if is_subagent_stop else (parent_session_id(env, harness=harness, sid=sid) or None)
+            # K3: split on message boundaries instead of tail-clipping — every
+            # part is queued and extracted into its own episode.
+            parts = _window_parts(msgs, MAX_TRANSCRIPT)
+            window_id = uuid.uuid4().hex if len(parts) > 1 else None
+            queued_names: list[str] = []
+            for i, part in enumerate(parts, start=1):
+                job = {"harness": harness, "session_id": job_sid, "cwd": cwd, "event": event,
+                       "ts": _mint_ts(), "turns": turns, "transcript": part["text"],
+                       "transcript_path": str(path), "offset_before": off_before,
+                       "offset_after": new_off,
+                       "repo_root": ident.get("repo_root"), "project": ident.get("project"),
+                       "parent_session_id": job_parent,
+                       "transcript_range": f"{off_before}:{new_off}",
+                       "truncated_chars": part["truncated_chars"]}
+                if window_id:
+                    job["window_id"] = window_id
+                    job["part"] = f"{i}/{len(parts)}"
+                if capture_note:
+                    job["capture_note"] = capture_note
+                p = enqueue(job)
+                queued_names.append(p.name)
+            # Advance only after every part is on disk: a crash partway
             # re-queues the same window (dedup at drain) rather than losing it.
-            st.update(offset=new_off, last_ts=time.time(), queued=int(st.get("queued", 0)) + 1)
-            out["queued"] = p.name
-            _log(f"{harness}:{sid}: {event} due ({reason}) -> queued {p.name} ({turns} turns, {len(text)} chars)")
-        save_state(harness, sid, st)
+            st.update(offset=new_off, last_ts=time.time(), queued=int(st.get("queued", 0)) + len(queued_names))
+            out["queued"] = queued_names[0] if len(queued_names) == 1 else queued_names
+            _log(f"{harness}:{sid}: {event} due ({reason}) -> queued {len(queued_names)} part(s) "
+                 f"({turns} turns, {len(full_text)} chars)")
+        save_state(harness, track_sid, st)
     except Exception as e:  # noqa: BLE001 — a hook must never fail a session
         out["error"] = f"{type(e).__name__}: {e}"
         _log(f"{harness}:{sid or '?'}: hook error {out['error']}")
@@ -1017,6 +1256,11 @@ def drain(*, limit: int | None = None, dry_run: bool = False) -> dict:
                     _log(f"drain: land-images {original.name} {land}")
         except Exception as e:  # noqa: BLE001 — never block episode capture
             _log(f"drain: land-images skipped for {original.name}: {type(e).__name__}: {e}")
+        # K2: regex-extracted BEFORE the model call — never model-summarized,
+        # never lost when the model decides "nothing durable".
+        from khipu.extract import extract_verbatim
+
+        verbatim = extract_verbatim(job.get("transcript", ""))
         try:
             payload = extract_memory(job.get("transcript", ""), cwd=job.get("cwd", ""))
         except Exception as e:  # noqa: BLE001 — model/transport: keep the job, retry later
@@ -1053,6 +1297,17 @@ def drain(*, limit: int | None = None, dry_run: bool = False) -> dict:
             if job.get("offset_before") is not None and job.get("offset_after") is not None
             else None
         )
+        # K1: a capture-now caller's text lands in verbatim.note regardless of
+        # what the regex tiers found.
+        note = job.get("capture_note")
+        if note:
+            verbatim["note"] = note
+        if verbatim:
+            payload["verbatim"] = verbatim
+        # K3: 0 unless the part-count ceiling forced a lossy merge.
+        payload["truncated_chars"] = int(job.get("truncated_chars") or 0)
+        if job.get("window_id"):
+            payload["window_id"] = job["window_id"]
         if dry_run:
             print(json.dumps(payload, indent=2))
             out["captured"] += 1
@@ -1227,7 +1482,29 @@ def liveness(harness: str) -> dict:
     stopped, newer_s = _stopped_hook_evidence(harness)
     if stopped:
         reasons.append(stopped)
-    return {"harness": harness, "ok": not reasons, "seen": True, "reasons": reasons,
+    # K7: a SessionEnd/Stop that could not find a readable transcript at all —
+    # a silent zero-capture otherwise. Red only while it's recent (24h); the
+    # accumulated count is a lifetime total, so a one-off months ago must not
+    # keep a harness red forever.
+    missing = int(beat.get("transcript_missing") or 0)
+    missing_age = _age(beat.get("last_transcript_missing_at"))
+    if missing and missing_age is not None and missing_age <= 24 * 3600:
+        reasons.append(
+            f"{missing} session(s) ended without a readable transcript in the last 24 h — "
+            "the harness deleted or never wrote the transcript; check its transcript setting"
+        )
+    warnings: list[str] = []
+    # K4: a warning, not red — SubagentStop firing with no transcript to read
+    # is a harness/payload gap Khipu cannot fix, not evidence the hook itself
+    # is broken.
+    subagent_unsupported = int(beat.get("subagent_unsupported") or 0)
+    if subagent_unsupported:
+        warnings.append(
+            f"{subagent_unsupported} SubagentStop event(s) carried no readable transcript "
+            "(subagent_unsupported) — this harness's SubagentStop payload shape may not be "
+            "understood yet; see the stop-hook log's 'subagentstop: first sighting' line"
+        )
+    return {"harness": harness, "ok": not reasons, "seen": True, "reasons": reasons, "warnings": warnings,
             "last_dispatch_at": beat.get("at"), "last_dispatch_age_s": _age(beat.get("at")),
             "last_event": beat.get("event"), "last_reason": beat.get("reason"),
             "last_captured_at": beat.get("last_captured_at"),

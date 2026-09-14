@@ -73,13 +73,14 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
   commitments it opened, its legacy line) — for a capture that was wrong or a
   test. Through the gateway only cloud-harness captures can be forgotten.
 - Capture writes: on a local Mac with a Khipu capture hook (`khipu-stop-hook`
-  or `khipu-aegis-capture`) do **not** call `khipu_capture` and do **not** pipe
-  `capture_v2.py` — the hook is the writer (`capture_mode=hub`). An MCP write
-  here double-captures. In a harness where a hook runs with `capture_mode`
-  `dual`, the `khipu_capture` tool declines and says so — that is expected;
-  the hook already has it. Cloud / HTTPS gateway (no hook): `khipu_capture`
-  is the only write, so do it with a 1-3 sentence summary, short topic slugs,
-  and any decisions or preferences; set `session_id` to
+  or `khipu-aegis-capture`) the hook is the writer, not you — but `khipu_capture`
+  now works there too: call it (or `khipu capture now` in a shell) when you
+  want this session remembered before its normal cadence, and it flags the
+  session for its next Stop/PreCompact/SessionEnd instead of writing directly
+  or refusing. Your summary lands as that capture's `verbatim.note`. Cloud /
+  HTTPS gateway (no hook): `khipu_capture` is the only write and it happens
+  immediately, so do it with a 1-3 sentence summary, short topic slugs, and
+  any decisions or preferences; set `session_id` to
   `<harness>:<something stable>` (e.g. `grokbot:<repo>:<task>`).
 
 Search before answering anything about what to build, what was decided, or

@@ -274,11 +274,16 @@ def _upsert_episode(cur, payload: dict[str, Any]) -> bool:
     identity_cols = ("harness", "repo_root", "project", "parent_session_id",
                      "transcript_range")
     has_identity = has_tags = True
+    has_windows = has_verbatim = False
     try:
         from khipu.db import has_columns
 
         has_identity = has_columns(cur, "episodes", *identity_cols)
         has_tags = has_columns(cur, "episodes", "tags")
+        # K3/K2 (0016/0017) — named only when present, same reasoning as
+        # identity/tags above: a pre-migration hub must not raise UndefinedColumn.
+        has_windows = has_columns(cur, "episodes", "window_id", "truncated_chars")
+        has_verbatim = has_columns(cur, "episodes", "verbatim")
     except Exception:  # noqa: BLE001 — probe failed (no real cursor): keep the
         pass          # full modern shape, which is what every live hub has.
     cols = ["ts", "session_id", "summary", "topics", "people", "decisions",
@@ -305,6 +310,14 @@ def _upsert_episode(cur, payload: dict[str, Any]) -> bool:
         cols.append("tags")
         vals.append("%s::jsonb")
         params.append(json.dumps(payload.get("tags") or []))
+    if has_windows:
+        cols.extend(["window_id", "truncated_chars"])
+        vals.extend(["%s", "%s"])
+        params.extend([payload.get("window_id"), int(payload.get("truncated_chars") or 0)])
+    if has_verbatim:
+        cols.append("verbatim")
+        vals.append("%s::jsonb")
+        params.append(json.dumps(payload.get("verbatim") or {}, ensure_ascii=False))
     cur.execute(
         f"""
         INSERT INTO episodes

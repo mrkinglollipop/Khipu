@@ -687,11 +687,11 @@ class SearchFilterPushdownTest(unittest.TestCase):
                     # itself returns only the matching row, however deep it is.
                     if "kf_project" in s:
                         self._result = [
-                            ("999", "khipu memory deep match", [], [], [], [], ts, 2)
+                            ("999", "khipu memory deep match", [], [], [], [], ts, 2, None)
                         ]
                     else:
                         self._result = [
-                            (str(i), "khipu memory decoy", [], [], [], [], ts, 2)
+                            (str(i), "khipu memory decoy", [], [], [], [], ts, 2, None)
                             for i in range(1, 51)
                         ]
                 else:

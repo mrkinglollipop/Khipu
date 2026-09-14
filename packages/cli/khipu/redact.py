@@ -122,6 +122,15 @@ def redact_payload(payload: dict[str, Any]) -> int:
         if k in payload:
             payload[k], n = _redact_str_list(payload[k])
             total += n
+    verbatim = payload.get("verbatim")
+    if isinstance(verbatim, dict):
+        for k in ("errors", "commands", "paths", "quotes"):
+            if k in verbatim:
+                verbatim[k], n = _redact_str_list(verbatim[k])
+                total += n
+        if isinstance(verbatim.get("note"), str):
+            verbatim["note"], n = redact_secrets(verbatim["note"])
+            total += n
     pages = payload.get("topic_pages")
     if isinstance(pages, list):
         for page in pages:
