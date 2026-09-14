@@ -340,8 +340,17 @@ def _snapshot_search_hits(prompt: str, *, project: str | None) -> list[dict[str,
             )
             lists.append(lex_rows)
 
+    # Same fix as embed.hybrid_search (found via `khipu recall eval`,
+    # 2026-09-14): a row can appear in more than one list as the SAME dict
+    # object (a literal match that is also in the cosine/literal union) —
+    # scoring it twice pops rank_text on the first pass and recomputes 0
+    # from the empty string on the second, erasing a real literal match.
+    _scored_rows: set[int] = set()
     for row_list in lists:
         for r in row_list:
+            if id(r) in _scored_rows:
+                continue
+            _scored_rows.add(id(r))
             if tokens:
                 r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)
             r.pop("rank_text", None)

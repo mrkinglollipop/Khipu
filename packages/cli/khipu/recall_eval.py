@@ -73,9 +73,15 @@ def eval_one(entry: dict[str, Any]) -> dict[str, Any]:
         got = [str(r.get("id")) for r in out.get("results", [])[:k]]
         row["got"] = got
         row["hit"] = bool(expect & set(got))
+        # R4 (2026-09-14): a golden entry is a KNOWN positive by definition —
+        # if search finds it (hit=True) but still reports confidence="none",
+        # the two thresholds (embed.CONFIDENCE_COSINE_STRONG/WEAK) are
+        # miscalibrated for this corpus/profile, not just a coincidence.
+        row["confidence"] = out.get("confidence")
     except Exception as exc:  # noqa: BLE001 — a broken line scores a miss, not a crash
         row["got"] = []
         row["hit"] = False
+        row["confidence"] = None
         row["error"] = f"{type(exc).__name__}: {exc}"
     return row
 
@@ -88,10 +94,14 @@ def run_eval(path: Path | None = None) -> dict[str, Any]:
     total = len(rows)
     hits = sum(1 for r in rows if r["hit"])
     overall = (hits / total) if total else 0.0
+    # R4: positives (hit=True) whose confidence still reads "none" — the
+    # thing confidence exists to never do to a real match. Zero is the bar.
+    hit_none_confidence = [r["query"] for r in rows if r["hit"] and r.get("confidence") == "none"]
     return {
         "path": str(golden_path),
         "total": total,
         "hits": hits,
         "overall_hit_rate": round(overall, 4),
+        "hit_none_confidence": hit_none_confidence,
         "rows": rows,
     }

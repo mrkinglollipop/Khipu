@@ -134,6 +134,38 @@ class RunEvalTest(unittest.TestCase):
         self.assertEqual(report["total"], 0)
         self.assertEqual(report["overall_hit_rate"], 0.0)
 
+    def test_a_hit_with_none_confidence_is_flagged(self):
+        """R4: a golden entry is a known positive by definition — if it
+        hits but still reads confidence='none', the thresholds are
+        miscalibrated, and this is the one place that gets checked."""
+        self._write([{"query": "flagged", "expect": ["1"], "k": 3}])
+        with mock.patch(
+            "khipu.embed.hybrid_search",
+            return_value={"results": [{"kind": "episode", "id": "1", "score": 1.0}], "confidence": "none"},
+        ):
+            report = recall_eval.run_eval(self.path)
+        self.assertEqual(report["hit_none_confidence"], ["flagged"])
+
+    def test_a_hit_with_real_confidence_is_not_flagged(self):
+        self._write([{"query": "ok", "expect": ["1"], "k": 3}])
+        with mock.patch(
+            "khipu.embed.hybrid_search",
+            return_value={"results": [{"kind": "episode", "id": "1", "score": 1.0}], "confidence": "strong"},
+        ):
+            report = recall_eval.run_eval(self.path)
+        self.assertEqual(report["hit_none_confidence"], [])
+
+    def test_a_miss_with_none_confidence_is_not_flagged(self):
+        """confidence='none' on an actual MISS is the correct, honest
+        answer — only a hit reading none is the miscalibration this flags."""
+        self._write([{"query": "gibberish", "expect": ["999"], "k": 3}])
+        with mock.patch(
+            "khipu.embed.hybrid_search",
+            return_value={"results": [{"kind": "episode", "id": "1", "score": 1.0}], "confidence": "none"},
+        ):
+            report = recall_eval.run_eval(self.path)
+        self.assertEqual(report["hit_none_confidence"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

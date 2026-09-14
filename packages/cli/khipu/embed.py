@@ -1640,8 +1640,22 @@ def hybrid_search(
             if literal_rows and mode in ("hybrid", "literal"):
                 lists.append(list(literal_rows))
 
+            # A row can legitimately appear in more than one list (e.g. a
+            # literal match that is ALSO in lex_rows via the cosine/literal
+            # union) — the SAME dict object, not a copy. Computing
+            # lexical_hits on every occurrence popped rank_text on the first
+            # pass and then recomputed 0 from the now-empty string on the
+            # second, silently erasing a real literal match (found live via
+            # `khipu recall eval`, 2026-09-14: two known-positive golden
+            # queries whose top hit named the query verbatim still read
+            # lexical_hits=0 and confidence='none'). Track by object
+            # identity so each row is scored exactly once.
+            _scored_rows: set[int] = set()
             for row_list in lists:
                 for r in row_list:
+                    if id(r) in _scored_rows:
+                        continue
+                    _scored_rows.add(id(r))
                     # R4: how many query tokens this row ACTUALLY names,
                     # over its full embedded/ILIKE window — not just its rank
                     # among other rows. 0 for a fused-in row that never
