@@ -146,3 +146,53 @@ class RepoMigrationsTest(unittest.TestCase):
         self.assertGreaterEqual(len(files), 5)
         for version, path in files:
             self.assertIn("INSERT INTO schema_migrations", path.read_text(), version)
+
+
+class LiteralTrgmMigrationTest(unittest.TestCase):
+    """R8: 0015_literal_trgm.sql. No live Postgres fixture exists in this
+    suite (every other migrate test above fakes the cursor too), so this
+    checks the SQL text itself for the no-op-on-permission-failure guard —
+    the one thing that must never be wrong, since a hub where the role
+    cannot CREATE EXTENSION must still apply cleanly and record itself."""
+
+    def _sql(self) -> str:
+        for version, path in migrate.available():
+            if version == "0015_literal_trgm":
+                return path.read_text(encoding="utf-8")
+        self.fail("0015_literal_trgm.sql not found under ops/migrations")
+
+    def test_it_self_records(self):
+        sql = self._sql()
+        self.assertIn("INSERT INTO schema_migrations", sql)
+        self.assertIn("0015_literal_trgm", sql)
+
+    def test_extension_creation_is_guarded_against_insufficient_privilege(self):
+        """The exact stop condition from the phase-1 brief: a permission
+        gap must degrade to a no-op, not fail the whole migration run (and
+        not block every migration queued behind it)."""
+        sql = self._sql()
+        self.assertIn("CREATE EXTENSION IF NOT EXISTS pg_trgm", sql)
+        self.assertIn("EXCEPTION WHEN insufficient_privilege", sql)
+
+    def test_index_creation_is_conditional_on_the_extension_actually_existing(self):
+        """CREATE INDEX ... USING gin (col gin_trgm_ops) itself raises if
+        pg_trgm never got created (the opclass would not exist) — the
+        insufficient_privilege catch above is not enough on its own."""
+        sql = self._sql()
+        self.assertIn("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'", sql)
+        self.assertIn("gin_trgm_ops", sql)
+
+    def test_it_targets_the_columns_the_ilike_pass_actually_scans(self):
+        """khipu.cli._search_query / _literal_candidates ILIKE episodes.summary,
+        topics.title (via COALESCE, since it is nullable) and topics.body,
+        and nodes.name (via COALESCE) — see _EPISODE_ILIKE_COLUMNS and the
+        topic/node WHERE clauses."""
+        sql = self._sql()
+        for target in (
+            "episodes USING gin (summary",
+            "topics USING gin ((COALESCE(title, '')",
+            "topics USING gin (body",
+            "nodes USING gin ((COALESCE(name, '')",
+        ):
+            with self.subTest(target=target):
+                self.assertIn(target, sql)

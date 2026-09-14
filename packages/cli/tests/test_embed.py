@@ -1254,6 +1254,86 @@ class SearchConfidenceTest(unittest.TestCase):
         self.assertEqual(em.search_confidence(rows, token_count=3), "strong")
 
 
+class LiteralTrgmStatusTest(unittest.TestCase):
+    """R8: literal_trgm_status is what khipu doctor reads for the migration
+    0015 stop condition — pg_trgm unavailable must read as a SKIP (ok=True),
+    never red; a genuinely half-applied hub (extension present, an index
+    missing) is the only red case."""
+
+    class _FakeCur:
+        def __init__(self, rows_by_call):
+            self._rows_by_call = list(rows_by_call)
+            self._current = []
+
+        def execute(self, sql, params=None):
+            self._current = self._rows_by_call.pop(0)
+
+        def fetchone(self):
+            return self._current[0] if self._current else None
+
+        def fetchall(self):
+            return self._current
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _FakeConn:
+        def __init__(self, cur):
+            self._cur = cur
+
+        def cursor(self):
+            return self._cur
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _conn(self, rows_by_call):
+        return self._FakeConn(self._FakeCur(rows_by_call))
+
+    def test_missing_extension_is_a_skip_not_red(self):
+        from unittest import mock
+
+        with mock.patch("khipu.db.connect", return_value=self._conn([[]])):
+            out = em.literal_trgm_status()
+        self.assertTrue(out["ok"])
+        self.assertIn("skipped", out)
+
+    def test_extension_present_and_all_indexes_present_is_clean(self):
+        from unittest import mock
+
+        rows = [[(1,)], [(n,) for n in sorted(em._LITERAL_TRGM_INDEXES)]]
+        with mock.patch("khipu.db.connect", return_value=self._conn(rows)):
+            out = em.literal_trgm_status()
+        self.assertEqual(out, {"ok": True})
+
+    def test_extension_present_but_an_index_missing_is_red(self):
+        from unittest import mock
+
+        present = sorted(em._LITERAL_TRGM_INDEXES)[:-1]
+        rows = [[(1,)], [(n,) for n in present]]
+        with mock.patch("khipu.db.connect", return_value=self._conn(rows)):
+            out = em.literal_trgm_status()
+        self.assertFalse(out["ok"])
+        self.assertEqual(len(out["missing"]), 1)
+
+    def test_a_connection_failure_is_red_not_a_silent_pass(self):
+        from unittest import mock
+
+        def _boom():
+            raise RuntimeError("hub down")
+
+        with mock.patch("khipu.db.connect", _boom):
+            out = em.literal_trgm_status()
+        self.assertFalse(out["ok"])
+        self.assertIn("error", out)
+
+
 class EmbedBudgetUnlimitedTest(unittest.TestCase):
     def test_zero_cap_means_no_ceiling(self):
         import tempfile

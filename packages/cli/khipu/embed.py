@@ -1729,6 +1729,54 @@ def search_confidence(rows: list[dict[str, Any]], *, token_count: int) -> str:
     return "none"
 
 
+_LITERAL_TRGM_INDEXES = frozenset({
+    "idx_episodes_summary_trgm", "idx_topics_title_trgm",
+    "idx_topics_body_trgm", "idx_nodes_name_trgm",
+})
+
+
+def literal_trgm_status() -> dict[str, Any]:
+    """R8: is the literal-search trigram speedup (migration 0015) actually
+    in place? A hub whose role cannot ``CREATE EXTENSION`` degrades that
+    migration to a documented no-op — this is a SKIP here (never red: it is
+    a speed optimization, not a correctness requirement, and the migration
+    itself already logged why via NOTICE). A hub where pg_trgm IS installed
+    but one or more of the four indexes is missing (migration half-applied,
+    or an index dropped by hand) is what actually turns this red.
+    """
+    from khipu.db import connect
+
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
+                has_ext = cur.fetchone() is not None
+                if not has_ext:
+                    return {
+                        "ok": True,
+                        "skipped": (
+                            "pg_trgm is not installed on this hub (insufficient "
+                            "privilege, or migration 0015_literal_trgm not yet "
+                            "applied) — literal search uses a sequential scan"
+                        ),
+                    }
+                cur.execute(
+                    "SELECT indexname FROM pg_indexes WHERE indexname = ANY(%s)",
+                    (sorted(_LITERAL_TRGM_INDEXES),),
+                )
+                found = {r[0] for r in cur.fetchall()}
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    missing = sorted(_LITERAL_TRGM_INDEXES - found)
+    if missing:
+        return {
+            "ok": False, "missing": missing,
+            "error": "pg_trgm is installed but the literal-search trigram "
+                     "indexes are missing; run `khipu migrate`",
+        }
+    return {"ok": True}
+
+
 def coverage(*, profile: str | None = None) -> dict[str, Any]:
     """Per-kind coverage for active or named profile — the 'status UI that can't lie'."""
     from khipu.db import connect
