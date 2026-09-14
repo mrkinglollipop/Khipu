@@ -965,6 +965,54 @@ def _probe_gateway(url: str, token: str) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
+def gateway_liveness_check() -> dict[str, Any]:
+    """K9: read the gateway's own per-token last_ok_at/last_error_at back
+    over the network (doctor runs on a different machine than the gateway)
+    from its authenticated `/healthz`. Red only on evidence of failure — the
+    last 24h had an error for a token and no success since; info when there
+    is simply no traffic recorded yet. Applicable only when gateway_url is
+    configured; deploying the gateway itself is the maintainer's step."""
+    import urllib.error
+    import urllib.request
+
+    from khipu.config import gateway_url
+
+    url = gateway_url()
+    if not url:
+        return {"ok": True, "applicable": False, "note": "no gateway_url configured"}
+    token = _gateway_token()
+    if not token:
+        return {"ok": False, "applicable": True,
+                "error": f"gateway_url configured but no bearer token ({GROK_BOT_TOKEN_ENV} or Keychain gateway_token)"}
+    try:
+        req = urllib.request.Request(url + "/healthz", headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode())
+    except Exception as e:  # noqa: BLE001 — a network hiccup is red, not a crash
+        return {"ok": False, "applicable": True, "error": f"{type(e).__name__}: {e}",
+                "fix": "check the gateway is running and reachable"}
+    tokens = (body.get("gateway_liveness") or {}).get("tokens") or {}
+    if not tokens:
+        return {"ok": True, "applicable": True, "note": "no traffic recorded yet", "tokens": tokens}
+    now = time.time()
+
+    def _age(iso: str | None) -> float | None:
+        if not iso:
+            return None
+        try:
+            return now - time.mktime(time.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")) + time.timezone
+        except (TypeError, ValueError):
+            return None
+
+    reasons: list[str] = []
+    for label, t in tokens.items():
+        ok_age = _age(t.get("last_ok_at"))
+        err_age = _age(t.get("last_error_at"))
+        if err_age is not None and err_age <= 24 * 3600 and (ok_age is None or ok_age > err_age):
+            reasons.append(f"{label}: last error '{t.get('last_error')}' with no success since")
+    return {"ok": not reasons, "applicable": True, "reasons": reasons, "tokens": tokens}
+
+
 # ---- verify -------------------------------------------------------------------
 
 def _probe_mcp(command: str) -> dict:
@@ -1335,6 +1383,8 @@ def verify(harness: str, *, project: str | None = None) -> dict:
                                     else {"ok": False, "error": f"no gateway token ({GROK_BOT_TOKEN_ENV} or Keychain gateway_token)"})
         out["components"]["hook"] = {"ok": True, "na": True,
                                      "note": "cloud agent: capture is the khipu_capture tool over the gateway"}
+        # K9: per-token 401/429/5xx liveness, read back from the gateway.
+        out["components"]["gateway_liveness"] = gateway_liveness_check()
         # W6.1: same end-to-end recall probe every other pack's verify runs
         # (see the non-grok_bot branch below) — grok_bot returns early, so it
         # needs its own copy rather than falling through.

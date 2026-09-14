@@ -42,6 +42,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 from khipu.mcp_server import (
@@ -85,6 +86,58 @@ BUILD = os.environ.get("KHIPU_BUILD", "unknown")
 
 def _log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} [khipu-gateway] {msg}", file=sys.stderr, flush=True)
+
+
+# K9: 401/429/5xx stayed invisible — nothing recorded whether a token was
+# actually landing OK or silently failing every call. A small JSON file next
+# to the gateway's own log, one entry per token label, read back by
+# `khipu doctor` / `khipu integrations verify` over the network (through
+# `/healthz`) since doctor runs on a different machine than the gateway.
+_LIVENESS_LOCK = threading.Lock()
+
+
+def _liveness_path() -> Path:
+    from khipu.paths import ensure_data_dir
+
+    return ensure_data_dir() / "gateway-liveness.json"
+
+
+def _record_liveness(label: str, *, ok: bool, error: str | None = None) -> None:
+    if not label:
+        return
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    path = _liveness_path()
+    with _LIVENESS_LOCK:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except (OSError, ValueError):
+            data = {}
+        tokens = data.setdefault("tokens", {}) if isinstance(data, dict) else {}
+        entry = tokens.setdefault(label, {})
+        if ok:
+            entry["last_ok_at"] = now
+        else:
+            entry["last_error_at"] = now
+            entry["last_error"] = str(error or "error")[:200]
+        data["tokens"] = tokens
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+
+def gateway_liveness() -> dict[str, Any]:
+    """Read back what `_record_liveness` wrote — empty when no request has
+    landed yet on this process's lifetime (or ever, on a fresh deploy)."""
+    path = _liveness_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, ValueError):
+        data = {}
+    return {"tokens": data.get("tokens", {}) if isinstance(data, dict) else {}}
 
 
 def parse_tokens(raw: str) -> dict[str, str]:
@@ -232,6 +285,10 @@ class Handler(BaseHTTPRequestHandler):
             # internet gets a bare liveness answer and nothing to fingerprint.
             if self._is_loopback_client() or self._authorized():
                 body.update({"server": SERVER_NAME, "version": SERVER_VERSION, "build": BUILD})
+                # K9: per-token last_ok_at/last_error_at, for doctor's gateway
+                # liveness row — only for a caller who could already see the
+                # build stamp (loopback or bearer holder), never the public.
+                body["gateway_liveness"] = gateway_liveness()
             self._send(200, json.dumps(body).encode())
             return
         if self.path.rstrip("/") == "/mcp":
@@ -269,6 +326,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self.token_rate.allow(label):
             self._send(429)
+            _record_liveness(label, ok=False, error="429 token rate limit")
             _log(f"{ip} token={label} POST /mcp 429 (token budget)")
             return
         try:
@@ -330,6 +388,11 @@ class Handler(BaseHTTPRequestHandler):
             body = responses if isinstance(msg, list) else responses[0]
             self._send(200, json.dumps(body, default=str).encode("utf-8"))
             status = 200
+        errors = [r["error"]["message"] for r in responses if isinstance(r, dict) and r.get("error")]
+        if errors:
+            _record_liveness(label, ok=False, error=f"5xx: {errors[0]}"[:200])
+        else:
+            _record_liveness(label, ok=True)
         _log(f"{ip} token={label} POST /mcp {status} {int((time.time() - t0) * 1000)}ms"
              f"{' tool=' + tool if tool else ''} n={len(msgs)}")
 
