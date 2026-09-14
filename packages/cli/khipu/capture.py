@@ -361,6 +361,39 @@ def _merge_into_episode(
             pass
         _log(f"merge commitments step failed ({type(exc).__name__}: {exc})")
 
+    # O2: the merged capture's own decision strings belong to the target
+    # episode too, same SAVEPOINT fail-open posture as commitments above.
+    try:
+        cur.execute("SAVEPOINT capture_merge_decisions")
+    except Exception:  # noqa: BLE001 — no savepoint support (fake cur / autocommit)
+        pass
+    try:
+        from khipu import decisions as _decisions
+
+        _decisions.insert_decisions_from_episode(cur, payload, target_id)
+    except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT capture_merge_decisions")
+        except Exception:  # noqa: BLE001
+            pass
+        _log(f"merge decisions step failed ({type(exc).__name__}: {exc})")
+
+    # O4: same posture for the merged capture's own deliverables.
+    try:
+        cur.execute("SAVEPOINT capture_merge_deliverables")
+    except Exception:  # noqa: BLE001 — no savepoint support (fake cur / autocommit)
+        pass
+    try:
+        from khipu import deliverables as _deliverables
+
+        _deliverables.insert_deliverables_from_episode(cur, payload, target_id)
+    except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT capture_merge_deliverables")
+        except Exception:  # noqa: BLE001
+            pass
+        _log(f"merge deliverables step failed ({type(exc).__name__}: {exc})")
+
     # The target's text changed, so its vectors are stale. embed_on_capture
     # finds the row by (ts, md5(summary)) — the identity is target_ts +
     # new_summary now that the UPDATE above changed the summary column, so
@@ -552,6 +585,13 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
             payload["tags"] = list(dict.fromkeys([*(payload.get("tags") or []), *tags]))
             if topics_unresolved:
                 payload["topics_unresolved"] = True
+            # K6: scope is a free-text FALLBACK, not a project — normalise it
+            # at write so a worktree path or a run-on sentence never lands in
+            # the column every NULL-project reader (search, the pushed
+            # slice) falls back to.
+            from khipu.identity import normalize_scope
+
+            payload["scope"] = normalize_scope(payload.get("scope"))
 
             inserted = _upsert_episode(cur, payload)
             from khipu.config import path_setting
@@ -582,6 +622,26 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
                         cur.execute("ROLLBACK TO SAVEPOINT capture_commitments")
                         _log(f"commitments step failed ({type(exc).__name__}: {exc})")
+
+                    # O2: each string in payload['decisions'] becomes a row.
+                    cur.execute("SAVEPOINT capture_decisions")
+                    try:
+                        from khipu import decisions as _decisions
+
+                        _decisions.insert_decisions_from_episode(cur, payload, episode_id)
+                    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+                        cur.execute("ROLLBACK TO SAVEPOINT capture_decisions")
+                        _log(f"decisions step failed ({type(exc).__name__}: {exc})")
+
+                    # O4: files/PR-issue-URLs/release tags from payload['deliverables'].
+                    cur.execute("SAVEPOINT capture_deliverables")
+                    try:
+                        from khipu import deliverables as _deliverables
+
+                        _deliverables.insert_deliverables_from_episode(cur, payload, episode_id)
+                    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+                        cur.execute("ROLLBACK TO SAVEPOINT capture_deliverables")
+                        _log(f"deliverables step failed ({type(exc).__name__}: {exc})")
 
             memory_root = path_setting("memory_root")
             # In dual mode capture_v2 has not run yet, so topic pages named in the

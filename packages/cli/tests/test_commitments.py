@@ -44,11 +44,13 @@ class _CommitmentsCursor:
     ``db.has_columns`` and derives the field from the text when reading).
     """
 
-    def __init__(self, *, migrated: bool = False, trigger: bool = False):
+    def __init__(self, *, migrated: bool = False, trigger: bool = False,
+                 trigger_text: bool = False):
         self.rows: dict[int, dict] = {}
         self.episode_sessions: dict[int, str] = {}
         self.migrated = migrated
         self.trigger = trigger
+        self.trigger_text = trigger_text
         self.next_id = 1
         self.rowcount = 0
         self.statements: list[str] = []
@@ -60,7 +62,8 @@ class _CommitmentsCursor:
         _db._TABLE_COLUMNS_CACHE.pop("commitments", None)
 
     def _seed(self, text, *, project="acme/widget", kind="followup", owner=None,
-              episode=1, session_id=None, status="open", future_trigger=False):
+              episode=1, session_id=None, status="open", future_trigger=False,
+              due_after=None, opened_at="t0"):
         """Insert a row WITHOUT going through open_from_episode's filter — for
         tests about auto_close / stale / listing, whose fixtures predate the
         precision filter and are not what those tests are about."""
@@ -68,7 +71,7 @@ class _CommitmentsCursor:
         self.next_id += 1
         self.rows[cid] = {
             "id": cid, "text": text, "project": project, "owner": owner, "kind": kind,
-            "opened_episode": episode, "opened_at": "t0", "due_after": None,
+            "opened_episode": episode, "opened_at": opened_at, "due_after": due_after,
             "status": status, "closed_episode": None, "closed_at": None,
             "close_reason": None, "content_hash": co.content_hash(project, text),
             "last_seen_at": None, "seen_count": 1, "future_trigger": future_trigger,
@@ -89,6 +92,8 @@ class _CommitmentsCursor:
                 cols += ["last_seen_at", "seen_count"]
             if self.trigger:
                 cols += ["future_trigger"]
+            if self.trigger_text:
+                cols += ["trigger_text"]
             self._result = [(c,) for c in cols]
             return
         if s.startswith("INSERT INTO commitments"):
@@ -97,6 +102,7 @@ class _CommitmentsCursor:
             # + interval '...'" with no placeholder at all — so the param
             # count varies with what the SQL contains.
             rest = list(params)
+            trigger_text = rest.pop() if "trigger_text" in s else None
             future_trigger = bool(rest.pop()) if "future_trigger" in s else False
             if "%s::timestamptz" in s:
                 text, project, owner, kind, opened_episode, due_after, h = rest
@@ -118,7 +124,7 @@ class _CommitmentsCursor:
                 "status": "open", "closed_episode": None, "closed_at": None,
                 "close_reason": None, "content_hash": h,
                 "last_seen_at": None, "seen_count": 1,
-                "future_trigger": future_trigger,
+                "future_trigger": future_trigger, "trigger_text": trigger_text,
             }
             self.rowcount = 1
             return
@@ -182,6 +188,22 @@ class _CommitmentsCursor:
             out = [r for r in self.rows.values() if r["status"] == status]
             if project:
                 out = [r for r in out if r["project"] == project]
+            if "due_after IS NULL OR due_after <= now()" in s:
+                from datetime import datetime, timezone
+
+                def _not_snoozed(r):
+                    da = r["due_after"]
+                    if not da:
+                        return True
+                    try:
+                        when = datetime.fromisoformat(str(da).replace("Z", "+00:00"))
+                        if when.tzinfo is None:
+                            when = when.replace(tzinfo=timezone.utc)
+                        return when <= datetime.now(timezone.utc)
+                    except Exception:
+                        return True
+
+                out = [r for r in out if _not_snoozed(r)]
             wide = "last_seen_at" in s
             with_trigger = "future_trigger" in s
             self._result = [
@@ -350,40 +372,57 @@ class DueAfterParsingTest(unittest.TestCase):
 
 
 class ScopeCoalescingTest(unittest.TestCase):
-    """fix 3: when project is NULL, open/dedup/auto_close/list scope by
-    COALESCE(project, parent_session_id, session_id)."""
+    """K6 (2026-09-14): the scope key is the episode's resolved ``project``
+    ONLY — a session id is not a project, so open/dedup/auto_close/list never
+    fall back to parent_session_id/session_id any more. A NULL project stays
+    NULL (real behaviour: a capture with no resolved project groups with
+    every other such capture, not with itself alone by session lineage)."""
 
-    def test_opens_under_parent_session_id_when_project_missing(self):
+    def test_a_null_project_stays_null_even_with_a_parent_session_id(self):
         cur = _CommitmentsCursor()
         payload = {"parent_session_id": "claude_code:host-1", "open_loops": ["follow up with Matt on pricing"]}
         co.open_from_episode(cur, payload, 1)
         row = list(cur.rows.values())[0]
-        self.assertEqual(row["project"], "claude_code:host-1")
+        self.assertIsNone(row["project"])
 
-    def test_falls_back_to_session_id_when_neither_project_nor_parent_known(self):
+    def test_a_null_project_stays_null_even_with_only_a_session_id(self):
         cur = _CommitmentsCursor()
         payload = {"session_id": "claude_code:abc123", "open_loops": ["follow up with Matt on pricing"]}
         co.open_from_episode(cur, payload, 1)
         row = list(cur.rows.values())[0]
-        self.assertEqual(row["project"], "claude_code:abc123")
+        self.assertIsNone(row["project"])
 
-    def test_auto_close_matches_using_the_same_coalesced_scope(self):
+    def test_auto_close_matches_using_the_resolved_project_only(self):
         cur = _CommitmentsCursor()
-        cur._seed("ship the fix", project="claude_code:host-1")
-        payload = {"parent_session_id": "claude_code:host-1",
+        cur._seed("ship the fix", project="acme/widget")
+        payload = {"project": "acme/widget",
                    "closed_loops": [{"text": "done: ship the fix"}]}
         with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
             n = co.auto_close(cur, payload, 2)
         self.assertEqual(n, 1)
 
-    def test_a_different_lineage_never_closes_across_scopes(self):
+    def test_a_different_project_never_closes_across_scopes(self):
         cur = _CommitmentsCursor()
-        cur._seed("ship the fix", project="claude_code:host-1")
-        payload = {"parent_session_id": "claude_code:host-2",
+        cur._seed("ship the fix", project="acme/widget")
+        payload = {"project": "acme/other",
                    "closed_loops": [{"text": "done: ship the fix"}]}
         with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
             n = co.auto_close(cur, payload, 2)
         self.assertEqual(n, 0)
+
+    def test_a_parent_session_id_no_longer_scopes_auto_close(self):
+        """The pre-K6 behaviour: two captures sharing only a
+        parent_session_id (no project on either) used to close each other's
+        commitments; now both are NULL-project and auto_close's NULL-scope
+        query still matches them — this is the accepted, documented
+        broadening (K6), not a regression, and this test pins it."""
+        cur = _CommitmentsCursor()
+        cur._seed("ship the fix", project=None)
+        payload = {"parent_session_id": "claude_code:host-1",
+                   "closed_loops": [{"text": "done: ship the fix"}]}
+        with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
+            n = co.auto_close(cur, payload, 2)
+        self.assertEqual(n, 1)
 
     def test_list_owed_accepts_parent_session_id_as_the_scope_key(self):
         cur = _CommitmentsCursor()

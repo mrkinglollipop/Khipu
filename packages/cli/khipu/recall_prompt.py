@@ -501,7 +501,38 @@ def prior_work_for_prompt(
         reason = "ok (no session_id: dedup skipped)"
 
     context = render_block(hits or [])
+    # O4: "You produced <path> on <date> (episode N)" when a deliverable in
+    # this project matches >= 2 of the prompt's own tokens. Best-effort and
+    # additive — a DB hiccup here must not sink the hits already found.
+    produced = _deliverable_context_line(tokens, cwd=cwd)
+    if produced:
+        context = f"{context}\n{produced}" if context else produced
     return {"context": context, "hits": hits or [], "reason": reason, "ms": ms}
+
+
+def _deliverable_context_line(tokens: list[str], *, cwd: str | None) -> str:
+    """The O4 "You produced …" line for this prompt's tokens, or "". Never
+    raises: a resolve/DB failure here degrades to no line, same fail-open
+    posture as every other step in this module."""
+    if not tokens or not cwd:
+        return ""
+    try:
+        from khipu.identity import resolve_repo_root
+
+        project = resolve_repo_root(cwd).get("project")
+        if not project:
+            return ""
+        from khipu.db import connect
+        from khipu import deliverables as _deliverables
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                return _deliverables.deliverable_line_for_prompt(
+                    cur, tokens, project=project
+                ) or ""
+    except Exception as exc:  # noqa: BLE001 — fail open, same as _search_hits callers
+        _log(f"deliverable line skipped ({type(exc).__name__}: {exc})")
+        return ""
 
 
 def _stdin_payload(raw: str) -> dict[str, Any]:

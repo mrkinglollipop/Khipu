@@ -45,6 +45,54 @@ class GateTest(unittest.TestCase):
         self.assertNotEqual(out["context"], "")
 
 
+class DeliverableLineTest(unittest.TestCase):
+    """O4: prior_work_for_prompt appends the "You produced …" line."""
+
+    def test_no_cwd_never_calls_the_matcher(self):
+        with mock.patch("khipu.deliverables.deliverable_line_for_prompt") as m:
+            self.assertEqual(rp._deliverable_context_line(["x", "y"], cwd=None), "")
+        m.assert_not_called()
+
+    def test_no_project_resolved_never_calls_the_matcher(self):
+        with mock.patch(
+            "khipu.identity.resolve_repo_root", return_value={"project": None}
+        ), mock.patch("khipu.deliverables.deliverable_line_for_prompt") as m:
+            self.assertEqual(rp._deliverable_context_line(["x", "y"], cwd="/repo"), "")
+        m.assert_not_called()
+
+    def test_a_matched_deliverable_reaches_the_line(self):
+        with mock.patch(
+            "khipu.identity.resolve_repo_root", return_value={"project": "acme/widget"}
+        ), mock.patch("khipu.db.connect", return_value=mock.MagicMock()), mock.patch(
+            "khipu.deliverables.deliverable_line_for_prompt",
+            return_value="You produced khipu/decisions.py on 2026-09-14 (episode 42)",
+        ):
+            out = rp._deliverable_context_line(["decisions"], cwd="/repo")
+        self.assertEqual(out, "You produced khipu/decisions.py on 2026-09-14 (episode 42)")
+
+    def test_a_db_failure_degrades_to_empty_string(self):
+        with mock.patch(
+            "khipu.identity.resolve_repo_root", return_value={"project": "acme/widget"}
+        ), mock.patch("khipu.db.connect", side_effect=RuntimeError("down")):
+            self.assertEqual(rp._deliverable_context_line(["decisions"], cwd="/repo"), "")
+
+    def test_prior_work_for_prompt_appends_the_line_after_hits(self):
+        with mock.patch.object(rp, "_search_hits", return_value=[_hit()]), mock.patch.object(
+            rp, "_deliverable_context_line",
+            return_value="You produced khipu/decisions.py on 2026-09-14 (episode 42)",
+        ):
+            out = rp.prior_work_for_prompt("what did we build for decisions", cwd="/repo")
+        self.assertIn("You produced khipu/decisions.py", out["context"])
+
+    def test_prior_work_for_prompt_shows_the_line_even_with_no_other_hits(self):
+        with mock.patch.object(rp, "_search_hits", return_value=[]), mock.patch.object(
+            rp, "_deliverable_context_line",
+            return_value="You produced khipu/decisions.py on 2026-09-14 (episode 42)",
+        ):
+            out = rp.prior_work_for_prompt("what did we build for decisions", cwd="/repo")
+        self.assertEqual(out["context"], "You produced khipu/decisions.py on 2026-09-14 (episode 42)")
+
+
 class RenderTest(unittest.TestCase):
     def test_topical_prompt_renders_a_fenced_block_under_the_budget(self):
         hits = [

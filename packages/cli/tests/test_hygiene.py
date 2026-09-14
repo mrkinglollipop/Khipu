@@ -218,6 +218,145 @@ class BackfillIdentityReportTest(unittest.TestCase):
         self.assertEqual(report["sample"][0]["scope"], "/abs/path")
 
 
+class _ProjectBackfillCursor:
+    """In-memory ``episodes`` stand-in for K6's project backfill. ``rows`` is
+    ``{id: {session_id, project, repo_root, raw}}``."""
+
+    def __init__(self, rows: dict[int, dict]):
+        self.rows = rows
+        self._result: list[tuple] = []
+        self.rowcount = 0
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        params = params or ()
+        if s.startswith("SELECT id, session_id, repo_root, raw FROM episodes WHERE project IS NULL"):
+            out = sorted(
+                (r for r in self.rows.values() if r["project"] is None),
+                key=lambda r: -r["id"],
+            )
+            if "LIMIT %s" in s:
+                out = out[: params[-1]]
+            self._result = [(r["id"], r["session_id"], r["repo_root"], r["raw"]) for r in out]
+            return
+        if s.startswith("SELECT project FROM episodes WHERE session_id = %s"):
+            session_id, exclude_id = params
+            hit = next(
+                (r["project"] for r in self.rows.values()
+                 if r["session_id"] == session_id and r["project"] and r["id"] != exclude_id),
+                None,
+            )
+            self._result = [(hit,)] if hit else []
+            return
+        if s.startswith("UPDATE episodes SET project = %s WHERE id = %s AND project IS NULL"):
+            project, eid = params
+            r = self.rows.get(eid)
+            if r and r["project"] is None:
+                r["project"] = project
+                self.rowcount = 1
+            else:
+                self.rowcount = 0
+            return
+        raise AssertionError(f"unexpected SQL: {s[:120]}")
+
+    def fetchall(self):
+        return list(self._result)
+
+    def fetchone(self):
+        return self._result[0] if self._result else None
+
+
+class ProjectBackfillTest(unittest.TestCase):
+    """K6: resolve a project from the session's OTHER episodes, or from a
+    known repo_root — never from a session id or free-text scope."""
+
+    def test_report_resolves_via_a_sibling_episode_in_the_same_session(self):
+        rows = {
+            1: {"id": 1, "session_id": "claude:s1", "project": "acme/widget",
+                "repo_root": None, "raw": None},
+            2: {"id": 2, "session_id": "claude:s1", "project": None,
+                "repo_root": None, "raw": None},
+        }
+        cur = _ProjectBackfillCursor(rows)
+        report = hygiene.backfill_project_report(cur)
+        self.assertEqual(report["total_null_project"], 1)
+        self.assertEqual(report["would_resolve"], 1)
+        self.assertEqual(report["sample"][0]["resolved_project"], "acme/widget")
+
+    def test_report_resolves_via_repo_root_when_no_sibling_has_a_project(self):
+        rows = {
+            1: {"id": 1, "session_id": "claude:s1", "project": None,
+                "repo_root": "/srv/checkouts/acme-widget", "raw": None},
+        }
+        cur = _ProjectBackfillCursor(rows)
+        report = hygiene.backfill_project_report(cur)
+        self.assertEqual(report["would_resolve"], 1)
+        self.assertEqual(report["sample"][0]["resolved_project"], "acme-widget")
+
+    def test_report_resolves_via_raw_repo_root_when_the_column_is_empty(self):
+        rows = {
+            1: {"id": 1, "session_id": "claude:s1", "project": None,
+                "repo_root": None, "raw": {"repo_root": "/repo/acme-widget"}},
+        }
+        cur = _ProjectBackfillCursor(rows)
+        report = hygiene.backfill_project_report(cur)
+        self.assertEqual(report["sample"][0]["resolved_project"], "acme-widget")
+
+    def test_unresolvable_episodes_are_counted_but_not_sampled_as_resolved(self):
+        rows = {
+            1: {"id": 1, "session_id": "claude:lonely", "project": None,
+                "repo_root": None, "raw": None},
+        }
+        cur = _ProjectBackfillCursor(rows)
+        report = hygiene.backfill_project_report(cur)
+        self.assertEqual(report["total_null_project"], 1)
+        self.assertEqual(report["would_resolve"], 0)
+        self.assertEqual(report["sample"], [])
+
+    def test_never_resolves_from_the_session_id_itself(self):
+        """The K6 regression this whole feature exists to avoid: a lonely
+        session with no other project-bearing episode and no repo_root must
+        stay unresolved, never fall back to inventing a project from the
+        session id."""
+        rows = {
+            1: {"id": 1, "session_id": "claude_code:deadbeef1234", "project": None,
+                "repo_root": None, "raw": None},
+        }
+        cur = _ProjectBackfillCursor(rows)
+        report = hygiene.backfill_project_report(cur)
+        self.assertEqual(report["would_resolve"], 0)
+
+    def test_apply_writes_only_resolvable_rows_and_never_touches_an_existing_project(self):
+        rows = {
+            1: {"id": 1, "session_id": "claude:s1", "project": "acme/widget",
+                "repo_root": None, "raw": None},
+            2: {"id": 2, "session_id": "claude:s1", "project": None,
+                "repo_root": None, "raw": None},
+            3: {"id": 3, "session_id": "claude:lonely", "project": None,
+                "repo_root": None, "raw": None},
+        }
+        cur = _ProjectBackfillCursor(rows)
+        report = hygiene.apply_backfill_project(cur)
+        self.assertEqual(report["updated"], 1)
+        self.assertEqual(rows[2]["project"], "acme/widget")
+        self.assertIsNone(rows[3]["project"])
+        self.assertEqual(rows[1]["project"], "acme/widget")  # untouched, still what it was
+
+    def test_apply_is_idempotent(self):
+        rows = {
+            1: {"id": 1, "session_id": "claude:s1", "project": "acme/widget",
+                "repo_root": None, "raw": None},
+            2: {"id": 2, "session_id": "claude:s1", "project": None,
+                "repo_root": None, "raw": None},
+        }
+        cur = _ProjectBackfillCursor(rows)
+        first = hygiene.apply_backfill_project(cur)
+        self.assertEqual(first["updated"], 1)
+        second = hygiene.apply_backfill_project(cur)
+        self.assertEqual(second["updated"], 0)
+        self.assertEqual(second["scanned"], 0)
+
+
 class _OpenCommitmentsCursor:
     """Minimal fake for `run_commitments_hygiene`'s dry-run path (SELECT
     only — this file's new tests never `apply`)."""

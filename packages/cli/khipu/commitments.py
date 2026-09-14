@@ -183,24 +183,40 @@ _OBLIGATION_RE = re.compile(
 # conflict — a model that mislabels an item cannot keep noise alive.
 # ---------------------------------------------------------------------------
 
-# "when/once/after <someone/something> <does something>", plus the explicit
-# next-session phrasings. Gaps allow hyphens/quotes so "after the oracle-speed
-# wave merges" matches.
+# "when/once/until/after/before <someone/something> <does something>", plus
+# the explicit next-session phrasings and the plain deferral idioms ("deferred
+# until", "parked until", "not until"). Gaps allow hyphens/quotes so "after
+# the oracle-speed wave merges" matches.
+#
+# O1 (2026-09-14): the closing-verb list used to omit "closes"/"resolves"/
+# "wraps up"/"un-defers" and the completion shapes "is closed"/"is done"/
+# "is ready"/"is available" (the last four ride the bare "is"/"are"/"has"/
+# "have" alternative already present, so they need no separate entry) — a
+# session-plan/scope item deferred with "until the ledger closes" read as NO
+# trigger at all and was closed as 'session-ended' at the very next Stop
+# (the incident's cause #2). "until" now shares the when/once alternation;
+# "before" gets its own (same verb set) so a plain SAME-session sequencing
+# phrase like "before and after the mid-stream kill" — no completion verb
+# right after "before" — still does not match.
 _GAP = r"(?:[\w'’`./-]+\s+){0,4}?"
+_CLOSING_VERBS = (
+    r"says?|said|tells?|confirms?|approves?|answers?|replies|responds?|"
+    r"returns?|merges?|merged|ships?|shipped|lands?|landed|finishes?|"
+    r"finished|completes?|completed|arrives?|comes?|decides?|picks?|"
+    r"chooses?|gives?|gets?|re-?auths?|re-?authed|closes?|closed|resolves?|"
+    r"resolved|wraps?\s+up|wrapped\s+up|un-?defers?|un-?deferred|passes?|"
+    r"passed|is|are|has|have"
+)
 _FUTURE_TRIGGER_RE = re.compile(
     r"\b(?:next|future|later|another|a\s+future|a\s+later)\s+session\b"
     r"|\bnext\s+time\b"
     r"|\bin\s+a\s+(?:future|later|new)\s+session\b"
-    r"|\bwhen\s+" + _GAP + r"(?:says?|said|tells?|confirms?|approves?|answers?|"
-    r"replies|responds?|returns?|merges?|ships?|lands?|finishes?|completes?|"
-    r"arrives?|comes?|decides?|picks?|chooses?|gives?|gets?|re-?auths?|"
-    r"re-?authed|is|are|has|have)\b"
-    r"|\bonce\s+" + _GAP + r"(?:says?|confirms?|approves?|merges?|merged|ships?|"
-    r"shipped|lands?|landed|finishes?|finished|completes?|completed|returns?|"
-    r"passes?|passed|re-?auth\w*|is|are|has|have)\b"
-    r"|\bafter\s+" + _GAP + r"(?:merges?|merged|ships?|shipped|lands?|landed|"
-    r"approves?|approved|confirms?|confirmed|completes?|completed|finishes?|"
-    r"finished|returns?|passes?|passed|re-?auth\w*)\b"
+    r"|\b(?:when|once|until)\s+" + _GAP + r"(?:" + _CLOSING_VERBS + r")\b"
+    r"|\bafter\s+" + _GAP + r"(?:" + _CLOSING_VERBS + r"|re-?auth\w*)\b"
+    r"|\bbefore\s+" + _GAP + r"(?:" + _CLOSING_VERBS + r")\b"
+    r"|\bdeferred\s+(?:until|to)\s+\S"
+    r"|\bparked\s+until\s+\S"
+    r"|\bnot\s+until\s+\S"
     r"|\bif\s+attempt\s+\w+"
     r"|\bif\s+and\s+when\b",
     re.I,
@@ -360,6 +376,21 @@ def has_future_trigger(text: str) -> bool:
     return bool(_FUTURE_TRIGGER_RE.search((text or "").strip()))
 
 
+def trigger_clause(text: str) -> str | None:
+    """The future-trigger clause itself — the substring `_without_trigger_clause`
+    removes — or None when the text carries no trigger. Stored as
+    `commitments.trigger_text` (O1) and shown in `khipu owed` as "until: …" so
+    a deferred item's condition is visible without re-reading its full text."""
+    s = (text or "").strip()
+    m = _FUTURE_TRIGGER_RE.search(s)
+    if not m:
+        return None
+    comma = s.find(",", m.end())
+    end = comma if comma != -1 else len(s)
+    clause = s[m.start():end].strip()
+    return clause or None
+
+
 def _without_trigger_clause(text: str) -> str:
     """The commitment minus its trigger clause. "When Matt says the xAI lane
     is re-authed, run oracle.sh" is the ASSISTANT's promise — Matt is named in
@@ -517,17 +548,21 @@ def content_hash(scope: str | None, text: str) -> str:
 
 
 def _coalesce_scope(payload: dict[str, Any]) -> str | None:
-    """W3.3 grouping key (fix 3): ``project``, else ``parent_session_id``,
-    else ``session_id`` — a capture with no resolved project (a scratchpad/
-    `/tmp` cwd, a dispatched child session) still dedups/closes/lists against
-    its OWN prior commitments instead of every such writer competing for one
-    unscoped NULL bucket. Stored as the row's ``project`` column so
+    """W3.3 grouping key — K6 (2026-09-14): the episode's resolved ``project``,
+    ONLY. This used to fall back to ``parent_session_id``/``session_id`` when
+    project was unknown (a scratchpad/`/tmp` cwd, a dispatched child session)
+    so that writer's commitments at least stayed grouped with each other —
+    but a session id is not a project: it filed 16+ open items under an
+    opaque hex string the user never sees anywhere else, and a NULL project
+    was measured on 81% of episodes (finding K6). A capture with no resolved
+    project now groups under NULL like every other reader does — every
+    ``project IS NOT DISTINCT FROM %s`` comparison already used throughout
+    this module treats every NULL-project row as one shared "(no project)"
+    group, so this is a real, if broad, scope rather than an unscoped
+    free-for-all. Stored as the row's ``project`` column so
     ``list_owed``/``auto_close`` use the exact same key back."""
-    for key in ("project", "parent_session_id", "session_id"):
-        val = payload.get(key)
-        if val:
-            return str(val)
-    return None
+    val = payload.get("project")
+    return str(val) if val else None
 
 
 def _parse_due_after(raw: Any) -> tuple[str, Any]:
@@ -641,6 +676,21 @@ def _future_trigger_ready(cur) -> bool:
         return False
 
 
+def _trigger_text_ready(cur) -> bool:
+    """True when migration 0018 (commitments.trigger_text) has been applied.
+
+    Fail-closed, same posture as :func:`_future_trigger_ready`: a
+    pre-migration hub keeps working, it just does not persist the clause —
+    every read derives it from the text via :func:`trigger_clause` anyway.
+    """
+    try:
+        from khipu.db import has_columns
+
+        return has_columns(cur, "commitments", "trigger_text")
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
 def _touch_seen(cur, commitment_id: int) -> None:
     """Record that a later capture restated an already-open commitment.
 
@@ -714,6 +764,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     scope = _coalesce_scope(payload)
     seen_ready = _seen_columns_ready(cur)
     trigger_ready = _future_trigger_ready(cur)
+    trigger_text_ready = _trigger_text_ready(cur)
     inserted = 0
     rejected = 0
     for raw in items:
@@ -758,6 +809,10 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             cols += ", future_trigger"
             vals += ", %s"
             params = (*params, trigger)
+        if trigger_text_ready:
+            cols += ", trigger_text"
+            vals += ", %s"
+            params = (*params, trigger_clause(norm["text"]) if trigger else None)
         cur.execute(
             f"""
             INSERT INTO commitments
@@ -1106,17 +1161,26 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
 
 def list_owed(cur, *, project: str | None = None, parent_session_id: str | None = None,
               session_id: str | None = None, status: str = "open",
-              limit: int = 50) -> list[dict[str, Any]]:
+              limit: int = 50, hide_snoozed: bool = False) -> list[dict[str, Any]]:
     """``project`` if given, else ``parent_session_id``/``session_id`` (fix
     3) — the same coalesced key ``open_from_episode``/``auto_close`` store
     commitments under, so a caller with only session context (no resolved
-    project) can still find its own scope's commitments."""
+    project) can still find its own scope's commitments.
+
+    ``hide_snoozed`` (O3): when true, a row whose ``due_after`` is still in
+    the future is excluded — this is what makes ``khipu owed --snooze``
+    actually park an item instead of it reappearing everywhere immediately.
+    Off by default so ``khipu owed``/the desktop still see (and can
+    un-snooze) a parked row; the W4 pushed slice turns it on.
+    """
     scope = project or parent_session_id or session_id
     clauses = ["status = %s"]
     params: list[Any] = [status]
     if scope:
         clauses.append("project = %s")
         params.append(scope)
+    if hide_snoozed:
+        clauses.append("(due_after IS NULL OR due_after <= now())")
     params.append(limit)
     cols = ["id", "text", "project", "owner", "kind", "opened_episode", "opened_at",
             "due_after", "status", "closed_episode", "closed_at", "close_reason"]
@@ -1157,8 +1221,22 @@ def list_owed(cur, *, project: str | None = None, parent_session_id: str | None 
         # explicit future trigger, then the rest by kind. Computed here so the
         # desktop/gateway never re-derive (and never disagree with) it.
         row["priority"] = owed_priority(row["owner"], row.get("kind"), trigger)
-    # Stable: the SQL order (opened_at DESC) survives inside each rank.
-    rows.sort(key=lambda r: r["priority"])
+        # O1: the deferral clause itself, recomputed from the text (same
+        # "deterministic wins" posture as owner/future_trigger above) so a
+        # row written before migration 0018 shows it too. `until` is the
+        # human-readable line `khipu owed` prints; `trigger_text` is the bare
+        # clause for callers that want to reformat it themselves.
+        clause = trigger_clause(row.get("text") or "") if trigger else None
+        row["trigger_text"] = clause
+        row["until"] = f"until: {clause}" if clause else None
+    # O3: age x kind — within a priority tier (kind), the LONGEST-outstanding
+    # item leads (opened_at ascending), not the newest one the SQL fetched
+    # first. A row with no opened_at (should not happen; NOT NULL) sorts
+    # last within its tier rather than raising.
+    from datetime import datetime, timezone
+
+    _max_dt = datetime.max.replace(tzinfo=timezone.utc)
+    rows.sort(key=lambda r: (r["priority"], r.get("opened_at") or _max_dt))
     return rows
 
 

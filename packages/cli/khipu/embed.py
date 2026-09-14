@@ -1710,6 +1710,14 @@ def hybrid_search(
             timing["fusion_ms"] = round((time.monotonic() - _t) * 1000, 1)
             _t = time.monotonic()
             fused = enrich_search_results(cur, fused)
+            # O2: additive decisions_current/decisions_superseded on episode
+            # rows — never lets a decisions-table problem break search itself.
+            try:
+                from khipu.decisions import enrich_search_results as _enrich_decisions
+
+                fused = _enrich_decisions(cur, fused)
+            except Exception:  # noqa: BLE001 — enrichment only, search must still return
+                pass
             timing["enrich_ms"] = round((time.monotonic() - _t) * 1000, 1)
 
     from khipu.recency import HALF_LIFE_DAYS

@@ -1,3 +1,6 @@
+# --bypass-harness (sonnet lane) — authored directly by the dispatched
+# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
+# agents"); there is no further agent to route this to.
 """Topic/graph hygiene — W5.1 (topics vs tags) and W5.2 (path minting filter).
 
 Two shapes of graph pollution measured 2026-09-03: 94% of capture-topic slugs
@@ -244,6 +247,106 @@ def backfill_identity_report(cur, *, sample_limit: int = 20) -> dict[str, Any]:
     )
     total = int(cur.fetchone()[0])
     return {"would_backfill": total, "sample": sample}
+
+
+# ---- K6: project backfill (2026-09-14) --------------------------------------
+#
+# 81% of episodes carry a NULL project (finding K6). Unlike identity backfill
+# above (derives repo_root/project from an absolute-path SCOPE), this walks
+# episodes that have NEITHER: the only data left to resolve from is (a)
+# another episode of the SAME session already carrying a project — the most
+# common real case, a session whose early captures predate identity
+# resolution or whose hook missed once — and (b) a `repo_root` already on the
+# row (or its `raw` payload) with no `project` alongside it, an edge case
+# identity resolution should not normally produce but is cheap to also cover.
+# Deliberately NOT session_id/parent_session_id itself (K6's whole point) and
+# NOT scope (free text — normalize_scope already drops most of the junk that
+# made scope untrustworthy as an identity signal).
+
+def _project_from_raw(repo_root: Any, raw: Any) -> str | None:
+    root = repo_root
+    if not root and isinstance(raw, dict):
+        root = raw.get("repo_root")
+    if not root:
+        return None
+    from pathlib import Path
+
+    return Path(str(root)).name or None
+
+
+def _resolve_project_for_episode(cur, *, episode_id: int, session_id: str | None,
+                                 repo_root: Any, raw: Any) -> str | None:
+    """Best-effort project for one NULL-project episode. Never invents a
+    project from a session id or free-text scope (K6's whole point)."""
+    if session_id:
+        cur.execute(
+            "SELECT project FROM episodes WHERE session_id = %s AND project IS NOT NULL "
+            "AND id != %s LIMIT 1",
+            (session_id, episode_id),
+        )
+        row = cur.fetchone()
+        if row and row[0]:
+            return str(row[0])
+    return _project_from_raw(repo_root, raw)
+
+
+def backfill_project_report(cur, *, sample_limit: int = 20) -> dict[str, Any]:
+    """Dry run only: every NULL-project episode, whether a resolver would
+    find one, and a sample. Never writes. The caller (``khipu project
+    backfill``) decides whether the resolve rate clears the bar for
+    ``--apply`` on the live hub — this function only reports it."""
+    cur.execute(
+        "SELECT id, session_id, repo_root, raw FROM episodes WHERE project IS NULL ORDER BY id DESC"
+    )
+    rows = cur.fetchall()
+    resolved = 0
+    sample: list[dict[str, Any]] = []
+    for eid, session_id, repo_root, raw in rows:
+        project = _resolve_project_for_episode(
+            cur, episode_id=eid, session_id=session_id, repo_root=repo_root, raw=raw,
+        )
+        if project:
+            resolved += 1
+            if len(sample) < sample_limit:
+                sample.append({"id": eid, "resolved_project": project})
+    total = len(rows)
+    return {
+        "total_null_project": total,
+        "would_resolve": resolved,
+        "resolve_rate": round(resolved / total, 4) if total else 0.0,
+        "sample": sample,
+    }
+
+
+def apply_backfill_project(cur, *, limit: int | None = None) -> dict[str, Any]:
+    """Destructive: write the resolved project for every NULL-project episode
+    a resolver can answer for. The UPDATE's own ``WHERE ... AND project IS
+    NULL`` makes "touches no row that already has a project" structural, not
+    just a convention. Idempotent: a second run finds nothing left to do
+    (every row it could resolve now has a project). Must NOT be run against
+    the live shared hub without Matt's explicit go (same posture as
+    ``apply_purge_junk_paths``/``apply_backfill_identity``) — callers are
+    responsible for that gate; this function only executes what it is asked.
+    """
+    sql = "SELECT id, session_id, repo_root, raw FROM episodes WHERE project IS NULL ORDER BY id DESC"
+    if limit:
+        cur.execute(sql + " LIMIT %s", (limit,))
+    else:
+        cur.execute(sql)
+    rows = cur.fetchall()
+    updated = 0
+    for eid, session_id, repo_root, raw in rows:
+        project = _resolve_project_for_episode(
+            cur, episode_id=eid, session_id=session_id, repo_root=repo_root, raw=raw,
+        )
+        if not project:
+            continue
+        cur.execute(
+            "UPDATE episodes SET project = %s WHERE id = %s AND project IS NULL",
+            (project, eid),
+        )
+        updated += cur.rowcount
+    return {"scanned": len(rows), "updated": updated}
 
 
 # ---- commitments quality (2026-09-04) --------------------------------------

@@ -129,6 +129,23 @@ class ExtractMemoryTest(unittest.TestCase):
         out = self._run(_reply())
         self.assertEqual(out["open_loops"], [])
 
+    def test_a_deferred_build_is_a_followup_with_the_condition_as_its_text(self):
+        """O1: a scope/plan/design approved this session but whose build was
+        deferred round-trips as a followup carrying the deferral clause — a
+        fake extractor payload shaped the way the prompt now asks for it, not
+        just "Build the export screen" with the condition thrown away."""
+        from khipu import commitments as co
+
+        out = self._run(_reply(open_loops=[
+            {"text": "Build the export screen once the migration ships",
+             "kind": "followup", "owner": "assistant", "future_trigger": True,
+             "due_after": None},
+        ]))
+        loop = out["open_loops"][0]
+        self.assertEqual(loop["kind"], "followup")
+        self.assertIn("once the migration ships", loop["text"])
+        self.assertTrue(co.has_future_trigger(loop["text"]))
+
     def test_closed_loops_normalized(self):
         out = self._run(_reply(closed_loops=[{"text": "shipped the fix"}, "merged PR", {"text": ""}]))
         self.assertEqual(out["closed_loops"], [{"text": "shipped the fix"}, {"text": "merged PR"}])

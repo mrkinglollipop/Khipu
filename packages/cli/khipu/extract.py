@@ -1,3 +1,6 @@
+# --bypass-harness (sonnet lane) — authored directly by the dispatched
+# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
+# agents"); there is no further agent to route this to.
 """Transcript → durable-memory extraction (the LLM step of capture).
 
 Khipu's role in the harnesses that already have a legacy extractor (Claude Code,
@@ -61,6 +64,11 @@ Output ONLY a single JSON object (no prose, no markdown fences) with these keys:
   NEVER record a within-session reporting duty — "reply with the SHAs",
   "tell the user when it relaunches", "notify Matt", "report back",
   "provide the evidence paths" — unless the USER is the one who owes it.
+  A scope, plan, or design that was APPROVED this session but whose BUILD was
+  explicitly deferred is an open loop of kind "followup", future_trigger
+  true, with the deferral condition itself as the text (e.g. "Build the
+  export screen once the migration ships" — not just "Build the export
+  screen", which loses the condition).
   due_after is optional; omit or use null when unknown.
 - closed_loops: list of objects {{text}} for anything explicitly finished,
   merged, shipped, or no longer needed this turn.
@@ -308,6 +316,53 @@ def extract_verbatim(text: str) -> dict[str, list[str]]:
     if quotes:
         out["quotes"] = _verbatim_cap(quotes, VERBATIM_CLASS_CAP)
     return out
+
+
+# ---- deliverables (O4) ------------------------------------------------------
+
+DELIVERABLE_CAP = 20  # combined items kept per window
+_DELIVERABLE_EXTS = r"(?:md|py|ts|tsx|rs|sh|json|sql)"
+_DELIVERABLE_FILE_RE = re.compile(
+    r"\b(?:wrote|created|added|saved)\b[^\n.]{0,120}?"
+    r"((?:[\w.~-]+/)*[\w.-]+\." + _DELIVERABLE_EXTS + r")\b",
+    re.I,
+)
+_DELIVERABLE_PR_URL_RE = re.compile(r"https?://\S+?/pull/\d+\b", re.I)
+_DELIVERABLE_ISSUE_URL_RE = re.compile(r"https?://\S+?/issues/\d+\b", re.I)
+_DELIVERABLE_RELEASE_RE = re.compile(
+    r"\b(?:tag(?:ged)?|releas(?:ed?|ing)|shipped|published)\b[^\n.]{0,40}?"
+    r"\b(v?\d+\.\d+(?:\.\d+)?)\b",
+    re.I,
+)
+
+
+def extract_deliverables(text: str) -> list[dict[str, Any]]:
+    """Paths written/created, PR/issue URLs, and release tags pulled from a
+    rendered capture window (O4). session_capture.render() only ever keeps a
+    tool_use's NAME, never its file_path input, so the assistant's own prose
+    naming what it wrote/created is the actual signal here. Never raises; an
+    unmatched window returns []."""
+    if not text:
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(kind: str, *, path=None, url=None, title=None) -> None:
+        key = (kind, path or url or title or "")
+        if not key[1] or key in seen:
+            return
+        seen.add(key)
+        out.append({"kind": kind, "path": path, "url": url, "title": title})
+
+    for m in _DELIVERABLE_FILE_RE.finditer(text):
+        _add("file", path=m.group(1))
+    for m in _DELIVERABLE_PR_URL_RE.finditer(text):
+        _add("pr", url=m.group(0))
+    for m in _DELIVERABLE_ISSUE_URL_RE.finditer(text):
+        _add("issue", url=m.group(0))
+    for m in _DELIVERABLE_RELEASE_RE.finditer(text):
+        _add("release", title=m.group(1))
+    return out[:DELIVERABLE_CAP]
 
 
 def _as_str_list(v: Any, *, lower: bool = False) -> list[str]:

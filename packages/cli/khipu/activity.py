@@ -222,13 +222,15 @@ def project_slice(
     commitment_limit: int = 5,
     episode_limit: int = 5,
     topic_limit: int = 3,
+    decision_limit: int = 5,
 ) -> dict[str, Any]:
     """W4 pushed-slice reads for a resolved repo: open commitments, recent
-    episodes for the project, and the topic pages those episodes actually
-    link to (their already-hygiene-resolved ``topics`` array — real graph
-    edges, not guessed slugs). Order matches the plan's acceptance shape:
-    commitments, then episodes, then topics; ``recall_rule`` renders them and
-    owns the cwd-token fallback and the token budget.
+    episodes for the project, the topic pages those episodes actually link
+    to (their already-hygiene-resolved ``topics`` array — real graph edges,
+    not guessed slugs), and (O2) decisions still standing in the last 14
+    days. Order matches the plan's acceptance shape: commitments, then
+    episodes, then topics; ``recall_rule`` renders them and owns the
+    cwd-token fallback and the token budget.
 
     ``host_session_id`` (this session's own lineage id, ``harness:hostid``)
     widens the episode match beyond ``project`` alone: a dispatched sibling
@@ -242,16 +244,30 @@ def project_slice(
     function in this module.
     """
     from khipu import commitments as _commitments
+    from khipu import decisions as _decisions
     from khipu.embed import _episode_schema_flags
 
     owed: list[dict[str, Any]] = []
     episodes: list[dict[str, Any]] = []
     topics: list[dict[str, Any]] = []
+    decisions: list[dict[str, Any]] = []
     with connect() as conn:
         with conn.cursor() as cur:
             if project:
+                # O3: a snoozed row (due_after in the future) is parked — it
+                # must not reappear in the session-start slice before its
+                # due date, even though `khipu owed`/the desktop still list
+                # it so it can be managed.
                 owed = _commitments.list_owed(
-                    cur, project=project, status="open", limit=commitment_limit
+                    cur, project=project, status="open", limit=commitment_limit,
+                    hide_snoozed=True,
+                )
+                from datetime import timedelta
+
+                decisions = _decisions.standing_decisions(
+                    cur, project=project,
+                    since=datetime.now(timezone.utc) - timedelta(days=14),
+                    limit=decision_limit,
                 )
 
             flags = _episode_schema_flags(cur)
@@ -344,4 +360,4 @@ def project_slice(
                     seen_slugs.add(slug)
                     if len(topics) >= topic_limit:
                         break
-    return {"commitments": owed, "episodes": episodes, "topics": topics}
+    return {"commitments": owed, "episodes": episodes, "topics": topics, "decisions": decisions}

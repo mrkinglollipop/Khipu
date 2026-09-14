@@ -1,3 +1,6 @@
+# --bypass-harness (sonnet lane) — authored directly by the dispatched
+# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
+# agents"); there is no further agent to route this to.
 """Harness-native session capture — enqueue inside the session, drain outside it.
 
 This is Khipu's OWN capture step, and since 2026-08-17 (evening) it runs in
@@ -1258,9 +1261,12 @@ def drain(*, limit: int | None = None, dry_run: bool = False) -> dict:
             _log(f"drain: land-images skipped for {original.name}: {type(e).__name__}: {e}")
         # K2: regex-extracted BEFORE the model call — never model-summarized,
         # never lost when the model decides "nothing durable".
-        from khipu.extract import extract_verbatim
+        from khipu.extract import extract_deliverables, extract_verbatim
 
         verbatim = extract_verbatim(job.get("transcript", ""))
+        # O4: same tier as verbatim above — paths written/created, PR/issue
+        # URLs, release tags, never lost to summarisation either.
+        deliverables = extract_deliverables(job.get("transcript", ""))
         try:
             payload = extract_memory(job.get("transcript", ""), cwd=job.get("cwd", ""))
         except Exception as e:  # noqa: BLE001 — model/transport: keep the job, retry later
@@ -1304,6 +1310,8 @@ def drain(*, limit: int | None = None, dry_run: bool = False) -> dict:
             verbatim["note"] = note
         if verbatim:
             payload["verbatim"] = verbatim
+        if deliverables:
+            payload["deliverables"] = deliverables
         # K3: 0 unless the part-count ceiling forced a lossy merge.
         payload["truncated_chars"] = int(job.get("truncated_chars") or 0)
         if job.get("window_id"):

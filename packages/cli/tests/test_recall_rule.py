@@ -215,6 +215,40 @@ class RepoScopedSliceTest(unittest.TestCase):
         self.assertEqual(m_slice.call_args.kwargs["project"], "acme/khipu")
         self.assertEqual(m_slice.call_args.kwargs["repo_root"], "/repo/khipu")
 
+    def test_decisions_still_standing_block_renders(self):
+        """O2: a non-superseded decision from the last 14 days shows in its
+        own labelled block."""
+        with mock.patch(
+            "khipu.identity.resolve_repo_root",
+            return_value={"repo_root": "/repo/khipu", "project": "acme/khipu"},
+        ), mock.patch(
+            "khipu.activity.project_slice",
+            return_value={
+                "commitments": [],
+                "episodes": [{"id": 5, "summary": "did the thing"}],
+                "topics": [],
+                "decisions": [{"id": 7, "text": "Ship 0.4.4 with the seal fix"}],
+            },
+        ), mock.patch("khipu.cli._search_query") as m_search:
+            out = rr._pushed_memory_slice("/repo/khipu")
+        m_search.assert_not_called()
+        self.assertIn("Decisions still standing (last 14 days)", out)
+        self.assertIn("Ship 0.4.4 with the seal fix", out)
+
+    def test_no_decisions_key_renders_no_decisions_block(self):
+        with mock.patch(
+            "khipu.identity.resolve_repo_root",
+            return_value={"repo_root": "/repo/khipu", "project": "acme/khipu"},
+        ), mock.patch(
+            "khipu.activity.project_slice",
+            return_value={
+                "commitments": [{"id": 1, "text": "ship it", "kind": "followup"}],
+                "episodes": [], "topics": [],
+            },
+        ), mock.patch("khipu.cli._search_query"):
+            out = rr._pushed_memory_slice("/repo/khipu")
+        self.assertNotIn("Decisions still standing", out)
+
     def test_empty_project_slice_falls_through_to_cwd_token_search(self):
         with mock.patch(
             "khipu.identity.resolve_repo_root",
