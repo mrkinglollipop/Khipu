@@ -37,6 +37,15 @@ const LABELS: Record<string, string> = {
   embed_coverage_ok: "Search index complete",
   recall_probe_ok: "Memory round trip works",
   bundle_seal_ok: "App bundle intact",
+  // Phase 6 (honesty): per-nightly-step evidence (D1), instead of trusting
+  // only the legacy driver's exit code.
+  notes_reconcile_ok: "Notes reconciled by the nightly",
+  embed_provider_ok: "Embedding provider reachable",
+  commitments_hygiene_ok: "Commitments hygiene ran",
+  mark_stale_ok: "Stale commitments aged out",
+  // D6/F2/F4: topic-embedding lag and the search-degrade rate.
+  topics_embed_lag_ok: "Search index catching up on time",
+  degraded_rate_ok: "Search rarely falls back to keyword-only",
 };
 
 const ORDER = Object.keys(LABELS);

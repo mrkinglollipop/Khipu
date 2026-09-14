@@ -46,6 +46,17 @@ export const POST_UPDATE_NOTICES: PostUpdateNotice[] = [
       "re-run any time from Settings → Database.",
     action: "home",
   },
+  {
+    version: "0.4.4",
+    title: "Memory now surfaces prior work by itself and captures on request",
+    body:
+      "Home has a new Right now card: pending turns per harness, queue depth and " +
+      "captured-today, plus a Capture now button that flags the current session " +
+      "instead of waiting on the usual cadence. Doctor also checks more of the " +
+      "nightly's own steps, the search index's lag and the gateway's per-token " +
+      "health, in plain words.",
+    action: "home",
+  },
 ];
 
 const STORAGE_KEY = "khipu.lastNoticedVersion";

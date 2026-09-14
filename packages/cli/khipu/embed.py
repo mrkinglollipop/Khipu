@@ -1991,6 +1991,41 @@ def literal_trgm_status() -> dict[str, Any]:
     return {"ok": True}
 
 
+def topics_embed_lag_minutes(*, profile: str | None = None) -> dict[str, Any]:
+    """D6/F2: how long has the OLDEST currently-unembedded topic been
+    waiting? The Stop-hook catch-up (F2) and the nightly backfill both
+    embed topics as they change; coverage() only ever reported a missing
+    COUNT, never how stale the oldest gap is — this is the number that
+    actually says whether either catch-up is keeping up. Red past 60
+    minutes (D6's threshold); a hub with nothing unembedded reads 0/ok."""
+    from khipu.db import connect
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            profile = _resolve_profile(cur, profile)
+            cur.execute(
+                "SELECT MIN(COALESCE(t.event_at, t.updated_at)) FROM topics t "
+                "WHERE t.deleted_at IS NULL AND NOT EXISTS ("
+                "  SELECT 1 FROM memory_embeddings m"
+                "  WHERE m.profile = %s AND m.kind = 'topic' AND m.ref = t.slug)",
+                (profile,),
+            )
+            row = cur.fetchone()
+    oldest = row[0] if row else None
+    if oldest is None:
+        return {"ok": True, "lag_minutes": 0, "oldest_unembedded_at": None}
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    oldest_ts = oldest if oldest.tzinfo else oldest.replace(tzinfo=timezone.utc)
+    lag_minutes = max(0, int((now - oldest_ts).total_seconds() // 60))
+    return {
+        "ok": lag_minutes <= 60,
+        "lag_minutes": lag_minutes,
+        "oldest_unembedded_at": oldest_ts.isoformat(),
+    }
+
+
 def coverage(*, profile: str | None = None) -> dict[str, Any]:
     """Per-kind coverage for active or named profile — the 'status UI that can't lie'."""
     from khipu.db import connect

@@ -115,6 +115,22 @@ def _green_doctor_patches():
         mock.patch("khipu.hub_snapshot.prompt_recall_snapshot_status", return_value={"ok": True, "fresh": True}),
         mock.patch("khipu.probe.status", return_value={"ok": True, "reason": None}),
         mock.patch("khipu.drift.recall_quality", return_value={}),
+        # Phase 6 (honesty): nightly-step evidence, embed lag, search-degrade
+        # rate, gateway per-token liveness, unknown-harness heartbeat.
+        mock.patch("khipu.jobs.nightly_step_health", return_value={
+            "notes_reconcile_ok": {"ok": True}, "embed_provider_ok": {"ok": True},
+            "commitments_hygiene_ok": {"ok": True}, "mark_stale_ok": {"ok": True},
+        }),
+        mock.patch("khipu.embed.topics_embed_lag_minutes", return_value={"ok": True, "lag_minutes": 0}),
+        mock.patch(
+            "khipu.query_log.degraded_rate",
+            return_value={"ok": True, "rate": 0.0, "sampled": 0, "degraded": 0},
+        ),
+        mock.patch(
+            "khipu.integrations.gateway_liveness_check",
+            return_value={"ok": True, "applicable": False},
+        ),
+        mock.patch("khipu.session_capture.unknown_harness_heartbeats", return_value={"warnings": []}),
     ]
 
 

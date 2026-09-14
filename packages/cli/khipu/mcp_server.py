@@ -588,6 +588,21 @@ def _tool_status(args: dict) -> dict:
             payload = status_payload(None)
         # W2.4: behind_ingest_seconds only means something while PG answers.
         payload["hub_snapshot"] = snapshot_freshness(payload.get("latest_ingested_at"))
+        # D4/R10: top-level convenience fields so a caller (or the model
+        # reading its own tool result) does not have to know to dig into
+        # hub_snapshot / session_capture for the two numbers that answer
+        # "how stale is the local replica" and "is anything waiting to be
+        # captured right now".
+        payload["snapshot_age_seconds"] = payload["hub_snapshot"].get("age_seconds")
+        try:
+            from khipu import session_capture as _sc
+
+            payload["pending_turns"] = sum(
+                int(v.get("pending_turns") or 0)
+                for v in _sc.liveness_all().get("harnesses", {}).values()
+            )
+        except Exception:  # noqa: BLE001 — an optional field must never break khipu_status
+            pass
     except Exception as exc:
         if not hub_connection_failed(exc):
             raise

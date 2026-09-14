@@ -16,4 +16,12 @@ describe("noticeForUpgrade", () => {
   it("returns null on a fresh install (empty stored version)", () => {
     expect(noticeForUpgrade("", "0.4.2")).toBeNull();
   });
+
+  it("returns the 0.4.4 notice (Right now / Capture now) when upgrading from 0.4.3", () => {
+    const notice = noticeForUpgrade("0.4.3", "0.4.4");
+    expect(notice).not.toBeNull();
+    expect(notice?.version).toBe("0.4.4");
+    expect(notice?.action).toBe("home");
+    expect(notice?.title).toMatch(/prior work/i);
+  });
 });

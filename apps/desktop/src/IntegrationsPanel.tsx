@@ -89,6 +89,9 @@ export type HarnessLiveness = {
   last_dispatch_age_s?: number | null;
   last_captured_age_s?: number | null;
   captures?: number;
+  /** D3: turns seen since the last capture was due — "N turns waiting for
+   *  capture" on Home's Right now card. */
+  pending_turns?: number | null;
   queue_depth?: number | null;
   note?: string | null;
 };
@@ -97,6 +100,10 @@ export type LivenessPayload = {
   ok?: boolean;
   red?: string[];
   harnesses?: Record<string, HarnessLiveness>;
+  /** Summed across harnesses (session_capture.liveness_all()). */
+  queue_depth?: number | null;
+  /** D3: captures landed today, summed across harnesses. */
+  captured_today?: number | null;
 };
 
 /** `doctor.recall_probe` — `khipu.probe.status()`: the LAST RECORDED probe,
@@ -132,7 +139,7 @@ export type RecallProbeStatus = {
   >;
 };
 
-const LABEL: Record<HarnessId, string> = {
+export const LABEL: Record<HarnessId, string> = {
   claude_code: "Claude Code",
   cursor: "Cursor",
   aegis: "Aegis",

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template — render per machine before install (see Task 6 launchd generator). -->
+<!-- K10: the Aegis capture queue had no drainer of its own — it waited on
+     another harness's Stop hook or the nightly. This runs `khipu sessions
+     drain` every 5 minutes so a Mac running only Aegis still drains. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.khipu.queue-drain</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{KHIPU_PYTHON}}</string>
+		<string>-m</string>
+		<string>khipu</string>
+		<string>sessions</string>
+		<string>drain</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>KHIPU_ROOT</key>
+		<string>{{KHIPU_ROOT}}</string>
+		<key>PYTHONPATH</key>
+		<string>{{PYTHONPATH}}</string>
+		<key>PYTHONPYCACHEPREFIX</key>
+		<string>{{PYTHONPYCACHEPREFIX}}</string>{{EXTRA_ENV}}
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>{{WORKING_DIRECTORY}}</string>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>StandardOutPath</key>
+	<string>{{STDOUT_LOG}}</string>
+	<key>StandardErrorPath</key>
+	<string>{{STDERR_LOG}}</string>
+	<key>RunAtLoad</key>
+	<false/>
+</dict>
+</plist>

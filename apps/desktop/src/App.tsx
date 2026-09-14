@@ -36,6 +36,7 @@ import {
 import { ComponentsPanel } from "./ComponentsPanel";
 import { IntegrationsPanel } from "./IntegrationsPanel";
 import type { LivenessPayload, RecallProbeStatus } from "./IntegrationsPanel";
+import { RightNowCard } from "./RightNow";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
 import { buildAttention, harnessLabel, type Attention } from "./doctorAttention";
@@ -66,7 +67,7 @@ type Tab =
   | "settings"
   | "revisions";
 
-type CacheTab = "status" | "activity" | "revisions" | "doctor";
+type CacheTab = "status" | "activity" | "revisions" | "doctor" | "rightNow";
 
 type ConflictSummary = {
   open_file_vs_pg?: number;
@@ -720,6 +721,12 @@ type DoctorHealthCheck = {
 const NOT_CONFIGURED_LABEL: Record<string, string> = {
   memory_root: "File ↔ PG drift (legacy wiki)",
   graph_sqlite: "Graph mirror drift",
+  // A step nightly_step_health() has never recorded yet (fresh install, or
+  // a Mac that just updated) — skipped, not red; see healthRows.tsx LABELS.
+  notes_reconcile: "Notes reconciled by the nightly",
+  embed_provider: "Embedding provider reachable",
+  commitments_hygiene: "Commitments hygiene ran",
+  mark_stale: "Stale commitments aged out",
 };
 
 function formatAge(seconds: number | null | undefined): string {
@@ -984,6 +991,13 @@ export default function App() {
   // Home's four tiles read these straight off the doctor payload; nothing here
   // is derived from a field the report does not carry.
   const [liveness, setLiveness] = useState<LivenessPayload | null>(null);
+  // D3: Home's "Right now" card — its own fetch (`liveness_now`, fixed
+  // argv `khipu sessions liveness`) rather than reusing `liveness` above,
+  // so a Capture now click can refresh just this card without waiting on
+  // the full doctor pass (DB round trips, backup checks, etc.).
+  const [rightNow, setRightNow] = useState<LivenessPayload | null>(null);
+  const [captureNowBusy, setCaptureNowBusy] = useState(false);
+  const [captureNowMsg, setCaptureNowMsg] = useState<string | null>(null);
   // The last recorded end-to-end recall probe. Harnesses reads it for its
   // "Verified …" line; nothing about that line is app-local state.
   const [recallProbe, setRecallProbe] = useState<RecallProbeStatus | null>(null);
@@ -1397,11 +1411,23 @@ export default function App() {
         (parsed as { graph_offsite?: DoctorHealthCheck }).graph_offsite ??
           null,
       );
+      const nightlyStepsForSkip = (
+        parsed as {
+          nightly_steps?: Record<string, { skipped?: boolean; reason?: string }>;
+        }
+      ).nightly_steps;
+      const nightlyStepSkipReasons: Record<string, string | undefined> = {};
+      for (const [key, step] of Object.entries(nightlyStepsForSkip ?? {})) {
+        if (step?.skipped) {
+          nightlyStepSkipReasons[key.replace(/_ok$/, "")] = step.reason;
+        }
+      }
       setDoctorSkipReasons({
         memory_root: (parsed as { drift?: { skipped?: string } }).drift
           ?.skipped,
         graph_sqlite: (parsed as { graph_drift?: { skipped?: string } })
           .graph_drift?.skipped,
+        ...nightlyStepSkipReasons,
       });
       setAttention(items);
       // The number of boolean `*_ok` verdicts in this report — what "all
@@ -1420,6 +1446,46 @@ export default function App() {
     }
   }, []);
 
+  /** D3: Home's "Right now" card — `liveness_now` (fixed argv `khipu
+   *  sessions liveness`), the same session_capture.liveness_all() call
+   *  doctor makes, fetched on its own so a Capture now click can refresh
+   *  just this card without paying for the full doctor pass. */
+  const loadRightNow = useCallback(async (force = false) => {
+    if (!needsFetch("rightNow", force)) return;
+    markLoading("rightNow", true);
+    try {
+      const raw = await invoke<string>("liveness_now");
+      const parsed = parseJson(raw) as LivenessPayload | null;
+      setRightNow(parsed && typeof parsed === "object" ? parsed : null);
+      fetchedAt.current.rightNow = Date.now();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      markLoading("rightNow", false);
+    }
+  }, []);
+
+  /** "Capture now" — `khipu capture now`, no arguments: flags the most
+   *  recently active local session (K1) for capture at its next Stop /
+   *  PreCompact / SessionEnd instead of waiting on the fixed cadence. */
+  const runCaptureNow = useCallback(async () => {
+    setCaptureNowBusy(true);
+    setCaptureNowMsg(null);
+    try {
+      const raw = await invoke<string>("khipu_capture_now");
+      const parsed = parseJson(raw) as { queued?: boolean; error?: string } | null;
+      setCaptureNowMsg(
+        parsed?.queued
+          ? "Queued; lands at the end of the current turn."
+          : (parsed?.error ?? "Nothing to capture — no active session found."),
+      );
+    } catch (e) {
+      setCaptureNowMsg(String(e));
+    } finally {
+      setCaptureNowBusy(false);
+      await loadRightNow(true);
+    }
+  }, [loadRightNow]);
 
   /** `khipu doctor --probe` — the only doctor invocation that WRITES: it runs
    * a fresh capture-then-search round trip and records the result, which
@@ -1887,6 +1953,7 @@ export default function App() {
       void loadStatus(false);
       void loadDoctor(false);
       void loadActivity(false);
+      void loadRightNow(false);
     }
     // Harnesses reads capture liveness and the stored recall probe out of the
     // health report, so it needs the same read Home does.
@@ -1909,6 +1976,7 @@ export default function App() {
     loadRevisions,
     loadActivity,
     loadOwed,
+    loadRightNow,
   ]);
 
   // The rail's Owed badge is a count of open commitments, so it has to be
@@ -3174,6 +3242,16 @@ export default function App() {
                 .
               </Callout>
             ) : null}
+
+            {/* D3: pending turns per live harness, queue depth and
+             *  captured-today, none of which reached Home before this
+             *  (session_capture.liveness_all() already tracked them). */}
+            <RightNowCard
+              liveness={rightNow}
+              busy={captureNowBusy}
+              message={captureNowMsg}
+              onCaptureNow={() => void runCaptureNow()}
+            />
 
             <div className="tiles">
               <Tile

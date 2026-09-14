@@ -24,7 +24,7 @@ def _env(*names: str, default: str = "") -> str:
 # was an unconditional NameError on every `khipu jobs install/refresh/
 # uninstall <name>` call with explicit names — a different function's scope
 # does not see a parser-builder's locals. Module level so both see it.
-_JOBS_CHOICES = ("nightly", "monthly", "graph_build", "notes_watch")
+_JOBS_CHOICES = ("nightly", "monthly", "graph_build", "notes_watch", "queue_drain")
 
 
 def _memory_root_default() -> str | None:
@@ -250,7 +250,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         outbox = outbox_status()
     except Exception as e:  # noqa: BLE001
         outbox = {"pending": -1, "error": f"{type(e).__name__}: {e}"}
-    outbox_ok = outbox.get("pending") == 0 and not outbox.get("dead")
+    # D6: pending==0 alone missed a job that keeps failing to enqueue-then-
+    # drain and sits there forever with pending temporarily 0 between
+    # attempts; oldest_age_s (renamed here to the name the fix message uses)
+    # is the age signal that was missing. Red only past an hour — draining
+    # takes a few minutes normally, an hour is evidence something is stuck.
+    outbox["oldest_pending_seconds"] = outbox.get("oldest_age_s")
+    outbox_oldest_ok = (outbox.get("oldest_pending_seconds") or 0) <= 3600
+    outbox_ok = outbox.get("pending") == 0 and not outbox.get("dead") and outbox_oldest_ok
+    if not outbox_oldest_ok:
+        outbox["fix"] = "run `khipu sessions drain`"
     # Capture liveness: is each harness ACTUALLY being recorded? Red on evidence
     # of a failure (hook error, drain failure, stale queue, cadence never
     # firing) — never on idleness. maintainer, 2026-08-17: a session that captured
@@ -381,6 +390,64 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         notes_organise = organise.last_run()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         notes_organise = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # D1: per-step nightly evidence — notes reconcile, embed backfill,
+    # commitments hygiene and mark-stale each get their own red/green
+    # instead of only the legacy driver's exit code (`jobs.ok` above).
+    try:
+        from khipu.jobs import nightly_step_health
+
+        nightly_steps = nightly_step_health()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        err = f"{type(e).__name__}: {e}"
+        nightly_steps = {
+            k: {"ok": False, "applicable": True, "error": err}
+            for k in ("notes_reconcile_ok", "embed_provider_ok",
+                      "commitments_hygiene_ok", "mark_stale_ok")
+        }
+    # A step that has never been recorded is skipped, not red — a fresh
+    # install or a Mac that just updated has nothing in nightly-last.json
+    # yet, which is not evidence of a failure (maintainer, 2026-09-14:
+    # "especially after they update"). Reuses the same not_configured /
+    # grey-row convention memory_root and graph_sqlite already use.
+    from khipu.jobs import skipped_step_names
+
+    not_configured.extend(skipped_step_names(nightly_steps))
+    # D6/F2/F4: topic-embedding lag and the search-degrade rate — both were
+    # buried keys nothing aggregated before this (audit 2026-08-17 class).
+    try:
+        from khipu.embed import topics_embed_lag_minutes
+
+        topics_lag = topics_embed_lag_minutes()
+    except Exception as e:  # noqa: BLE001
+        topics_lag = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    try:
+        from khipu import query_log
+
+        degraded_rate = query_log.degraded_rate()
+    except Exception as e:  # noqa: BLE001
+        degraded_rate = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # K9: gateway per-token liveness, read over the network from the
+    # deployed gateway's own /healthz (never deployed by doctor itself).
+    # Applicable only when a gateway_url is configured.
+    try:
+        from khipu.integrations import gateway_liveness_check
+
+        gw_liveness = gateway_liveness_check()
+    except Exception as e:  # noqa: BLE001
+        gw_liveness = {"ok": False, "applicable": True, "error": f"{type(e).__name__}: {e}"}
+    liveness.setdefault("harnesses", {})["gateway"] = gw_liveness
+    if not gw_liveness.get("ok", True):
+        liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "gateway"]))
+        liveness["ok"] = False
+    # K8: a heartbeat file under the dispatch dir from a harness Khipu does
+    # not recognise — a warning (never a hard red: the hook that wrote it may
+    # still be working fine, it is just unidentified).
+    try:
+        from khipu.session_capture import unknown_harness_heartbeats
+
+        unknown_harness = unknown_harness_heartbeats()
+    except Exception as e:  # noqa: BLE001
+        unknown_harness = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -401,6 +468,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "recall_quality": recall_quality_block,
         "bundle_seal": bundle_seal_block,
         "notes_organise": notes_organise,
+        "nightly_steps": nightly_steps,
+        "topics_embed_lag": topics_lag,
+        "topics_embed_lag_minutes": topics_lag.get("lag_minutes"),
+        "degraded_rate": degraded_rate,
+        "unknown_harness": unknown_harness,
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -435,6 +507,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             # the extension exists but an index is actually missing.
             and bool(literal_trgm.get("ok"))
             and bool(prompt_recall_snapshot.get("ok"))
+            and all(bool(v.get("ok")) for v in nightly_steps.values())
+            and bool(topics_lag.get("ok"))
+            and bool(degraded_rate.get("ok"))
         ),
         "graph_backup": _graph_backup,
         "graph_backup_ok": bool(_graph_backup.get("ok")),
@@ -453,6 +528,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "bundle_seal_ok": bool(bundle_seal_block.get("ok")),
         "literal_trgm_ok": bool(literal_trgm.get("ok")),
         "prompt_recall_snapshot_ok": bool(prompt_recall_snapshot.get("ok")),
+        "notes_reconcile_ok": bool(nightly_steps.get("notes_reconcile_ok", {}).get("ok")),
+        "embed_provider_ok": bool(nightly_steps.get("embed_provider_ok", {}).get("ok")),
+        "commitments_hygiene_ok": bool(nightly_steps.get("commitments_hygiene_ok", {}).get("ok")),
+        "mark_stale_ok": bool(nightly_steps.get("mark_stale_ok", {}).get("ok")),
+        "topics_embed_lag_ok": bool(topics_lag.get("ok")),
+        "degraded_rate_ok": bool(degraded_rate.get("ok")),
     }
     print(json.dumps(out, indent=2, default=str))
     return 0 if out["ok"] else 2
@@ -3557,14 +3638,14 @@ def build_parser() -> argparse.ArgumentParser:
     jb_sub = jb.add_subparsers(dest="jobs_cmd", required=True)
     jb_sub.add_parser("status", help="Print khipu.jobs.job_status() as JSON")
     jbi = jb_sub.add_parser("install", help="Render + load the named jobs (default: all)")
-    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch}")
+    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain}")
     jbr = jb_sub.add_parser(
         "refresh",
         help="Re-render + reload installed jobs whose plist is stale (default: all installed)",
     )
-    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch}")
+    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain}")
     jbu = jb_sub.add_parser("uninstall", help="Unload + remove the named jobs (default: all)")
-    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch}")
+    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain}")
     jb.set_defaults(func=cmd_jobs)
 
     snap = sub.add_parser(

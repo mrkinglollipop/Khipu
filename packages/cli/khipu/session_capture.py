@@ -1025,6 +1025,14 @@ def _record_drain(harness: str, *, captured: bool, error: str | None = None, emp
     if captured:
         beat["last_captured_at"] = now
         beat["captures"] = int(beat.get("captures", 0)) + 1
+        # D3: a day-bucketed counter for Home's "captured today" — resets
+        # itself on the first capture of a new UTC day rather than needing a
+        # separate cron/rollover job.
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if beat.get("captures_today_date") != today:
+            beat["captures_today_date"] = today
+            beat["captures_today"] = 0
+        beat["captures_today"] = int(beat.get("captures_today", 0)) + 1
         beat.pop("last_drain_error", None)
     elif empty:
         beat["last_empty_at"] = now
@@ -1526,7 +1534,49 @@ def liveness_all() -> dict:
     per = {h: liveness(h) for h in HARNESSES}
     red = [h for h, v in per.items() if not v["ok"]]
     return {"ok": not red, "red": red, "harnesses": per,
-            "queue_depth": sum(v.get("queue_depth", 0) for v in per.values())}
+            "queue_depth": sum(v.get("queue_depth", 0) for v in per.values()),
+            "captured_today": captured_today()}
+
+
+def captured_today() -> int:
+    """D3: how many captures landed today, across every harness — summed
+    from each harness's own day-bucketed counter (see `_record_drain`), so
+    Home's 'captured today' figure needs no DB round trip."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    total = 0
+    for h in HARNESSES:
+        beat = _read_beat(h)
+        if beat.get("captures_today_date") == today:
+            total += int(beat.get("captures_today") or 0)
+    return total
+
+
+def unknown_harness_heartbeats() -> dict:
+    """K8: a heartbeat file under the dispatch dir from a harness Khipu does
+    not recognise (``HARNESSES``) — evidence a hook is firing from
+    somewhere unaccounted for. Warning, not red: the hook itself may be
+    working fine, it's just unidentified, so this must never gate doctor's
+    aggregate `ok` the way a real capture failure does."""
+    warnings: list[dict] = []
+    try:
+        files = sorted(dispatch_dir().glob("*.json"))
+    except OSError:
+        files = []
+    for f in files:
+        name = f.stem
+        if name in HARNESSES:
+            continue
+        try:
+            beat = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            beat = {}
+        warnings.append({
+            "harness": name,
+            "dispatches": int(beat.get("dispatches") or 0),
+            "reason": beat.get("last_error") or beat.get("reason") or beat.get("event") or "unknown",
+            "last_dispatch_at": beat.get("at"),
+        })
+    return {"warnings": warnings}
 
 
 def main(argv: list[str] | None = None) -> int:

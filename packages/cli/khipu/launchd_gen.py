@@ -16,6 +16,7 @@ from khipu.jobs import (
     PLIST_MONTHLY,
     PLIST_NIGHTLY,
     PLIST_NOTES_WATCH,
+    PLIST_QUEUE_DRAIN,
     _JOB_SPECS,
     _launchagents_dir,
     _log_paths,
@@ -29,6 +30,7 @@ _JOB_TEMPLATE: dict[str, str] = {
     "monthly": "com.matt.khipu-monthly.plist",
     "graph_build": "com.matt.khipu-graph.plist",
     "notes_watch": "com.khipu.notes-watch.plist",
+    "queue_drain": "com.khipu.queue-drain.plist",
 }
 
 _LABELS = {
@@ -36,6 +38,7 @@ _LABELS = {
     "monthly": PLIST_MONTHLY,
     "graph_build": PLIST_GRAPH,
     "notes_watch": PLIST_NOTES_WATCH,
+    "queue_drain": PLIST_QUEUE_DRAIN,
 }
 
 

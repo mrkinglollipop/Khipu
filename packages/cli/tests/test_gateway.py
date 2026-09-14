@@ -60,11 +60,20 @@ class GatewayTransportTest(unittest.TestCase):
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
         cls.url = f"http://127.0.0.1:{cls.port}"
+        # K9: do_POST now records per-token liveness to disk; never let a real
+        # server hit this Mac's actual Khipu state dir (test_repo_hygiene's
+        # own rule, applied here for the same reason).
+        cls._liveness_tmp = tempfile.mkdtemp(prefix="khipu-gw-liveness-")
+        cls._liveness_patch = mock.patch.object(
+            gw, "_liveness_path", return_value=Path(cls._liveness_tmp) / "gateway-liveness.json"
+        )
+        cls._liveness_patch.start()
 
     @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.httpd.server_close()
+        cls._liveness_patch.stop()
 
     def test_health_is_open_and_mcp_get_is_405(self):
         with urllib.request.urlopen(self.url + "/healthz", timeout=5) as r:
@@ -185,11 +194,17 @@ class BatchAmplificationTest(unittest.TestCase):
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
         cls.url = f"http://127.0.0.1:{cls.port}/mcp"
+        cls._liveness_tmp = tempfile.mkdtemp(prefix="khipu-gw-liveness-")
+        cls._liveness_patch = mock.patch.object(
+            gw, "_liveness_path", return_value=Path(cls._liveness_tmp) / "gateway-liveness.json"
+        )
+        cls._liveness_patch.start()
 
     @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.httpd.server_close()
+        cls._liveness_patch.stop()
 
     def setUp(self):
         gw.Handler.rate = gw._Rate(1000)
@@ -337,10 +352,14 @@ class GrokBotPackTest(unittest.TestCase):
         with mock.patch.object(integ, "_gateway_token", return_value="t" * 30), \
                 mock.patch.object(integ, "_probe_gateway", return_value={"ok": True, "episodes": 1, "tools": 4,
                                                                           "auth_refused_wrong_token": True}) as pg, \
+                mock.patch.object(integ, "gateway_liveness_check",
+                                   return_value={"ok": True, "applicable": True, "tokens": {}}) as gwl, \
                 mock.patch("khipu.probe.run_probe", return_value={"ok": True, "harness": "grok_bot"}):
             v = integ.verify("grok_bot", project=str(self.proj))
         self.assertTrue(v["ok"], v)
         pg.assert_called_once_with("https://khipu.example.test", "t" * 30)
+        gwl.assert_called_once_with()
+        self.assertIn("gateway_liveness", v["components"])
         self.assertIn("recall_probe", v["components"])
         with mock.patch.object(integ, "_gateway_token", return_value=""), \
                 mock.patch("khipu.probe.run_probe", return_value={"ok": True, "harness": "grok_bot"}):
@@ -367,12 +386,18 @@ class GatewayHardeningTest(unittest.TestCase):
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
         cls.url = f"http://127.0.0.1:{cls.port}"
+        cls._liveness_tmp = tempfile.mkdtemp(prefix="khipu-gw-liveness-")
+        cls._liveness_patch = mock.patch.object(
+            gw, "_liveness_path", return_value=Path(cls._liveness_tmp) / "gateway-liveness.json"
+        )
+        cls._liveness_patch.start()
 
     @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.httpd.server_close()
         gw.Handler.tokens = {}
+        cls._liveness_patch.stop()
 
     def _ping(self, **kw):
         return _post(self.url + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "ping"}, **kw)[0]
