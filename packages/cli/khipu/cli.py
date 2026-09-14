@@ -404,6 +404,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             for k in ("notes_reconcile_ok", "embed_provider_ok",
                       "commitments_hygiene_ok", "mark_stale_ok")
         }
+    # A step that has never been recorded is skipped, not red — a fresh
+    # install or a Mac that just updated has nothing in nightly-last.json
+    # yet, which is not evidence of a failure (maintainer, 2026-09-14:
+    # "especially after they update"). Reuses the same not_configured /
+    # grey-row convention memory_root and graph_sqlite already use.
+    from khipu.jobs import skipped_step_names
+
+    not_configured.extend(skipped_step_names(nightly_steps))
     # D6/F2/F4: topic-embedding lag and the search-degrade rate — both were
     # buried keys nothing aggregated before this (audit 2026-08-17 class).
     try:

@@ -501,12 +501,42 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
 }
 
 
+# A step whose last recorded run is older than this is treated as "the
+# nightly stopped running", not "it hasn't run yet today" — same idea as
+# index_freshness's INDEX_SLACK_S, wider because this compares against a
+# once-a-day job rather than the index that follows it same-night.
+NIGHTLY_STEP_STALE_HOURS = 36
+
+
+def _hours_since(ts: Any) -> float | None:
+    if not ts:
+        return None
+    try:
+        t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - t).total_seconds() / 3600
+
+
 def nightly_step_health() -> dict[str, dict[str, Any]]:
     """D1: one doctor-shaped block per nightly step, read from
     `nightly-last.json` (Phase 4) instead of trusting only the legacy
     driver's exit code. Applicable only on the sync host — every other Mac
     never runs the nightly and has nothing of its own to evaluate (same
-    posture as `index_freshness`)."""
+    posture as `index_freshness`).
+
+    Three states, not two (maintainer, 2026-09-14 — "especially after they
+    update"): a step that has never been recorded is SKIPPED, not red — a
+    fresh install or a Mac that just updated to this phase's code has
+    nothing in `nightly-last.json` yet, and that is not evidence of a
+    failure, only of a nightly that hasn't run since this started being
+    written. A step recorded `ok: false` is red with its own error/fix. A
+    step whose last recording is older than `NIGHTLY_STEP_STALE_HOURS` is
+    red too, REGARDLESS of that recording's own `ok` — a nightly that
+    stopped running altogether is exactly what a same-day `ok: true` from a
+    week ago would otherwise hide."""
     applicable = _is_index_sync_host()
     data = nightly_last()
     by_name: dict[str, dict[str, Any]] = {}
@@ -528,10 +558,19 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
         entry = by_name.get(step_name)
         if entry is None:
             out[doctor_key] = {
-                "ok": False, "applicable": True,
-                "error": f"no '{step_name}' step recorded yet in {source}",
-                "fix": "run `khipu jobs install nightly` or wait for the next nightly",
+                "ok": True, "applicable": True, "skipped": True,
+                "reason": "not checked yet — the nightly runs at 02:05",
                 "source": source,
+            }
+            continue
+        age_h = _hours_since(entry.get("ts"))
+        if age_h is not None and age_h > NIGHTLY_STEP_STALE_HOURS:
+            last_date = str(entry.get("ts"))[:10] or "an unknown date"
+            out[doctor_key] = {
+                "ok": False, "applicable": True,
+                "error": f"the nightly has not run since {last_date}; run `khipu jobs status`",
+                "fix": "run `khipu jobs status`",
+                "ts": entry.get("ts"), "source": source, "stale": True,
             }
             continue
         ok = bool(entry.get("ok"))
@@ -543,6 +582,15 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
             "source": source,
         }
     return out
+
+
+def skipped_step_names(health: dict[str, dict[str, Any]]) -> list[str]:
+    """The base name (``key`` minus its ``_ok`` suffix) of every
+    `nightly_step_health()` entry marked `skipped` — doctor folds these into
+    its `not_configured` list so healthRows.tsx renders them with the same
+    grey "not set up" row `memory_root`/`graph_sqlite` already use, instead
+    of a false red for a step that simply hasn't run yet."""
+    return [key[: -len("_ok")] for key, v in health.items() if v.get("skipped")]
 
 
 def run_monthly(*, dry_run: bool = False) -> int:

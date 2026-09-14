@@ -721,6 +721,12 @@ type DoctorHealthCheck = {
 const NOT_CONFIGURED_LABEL: Record<string, string> = {
   memory_root: "File ↔ PG drift (legacy wiki)",
   graph_sqlite: "Graph mirror drift",
+  // A step nightly_step_health() has never recorded yet (fresh install, or
+  // a Mac that just updated) — skipped, not red; see healthRows.tsx LABELS.
+  notes_reconcile: "Notes reconciled by the nightly",
+  embed_provider: "Embedding provider reachable",
+  commitments_hygiene: "Commitments hygiene ran",
+  mark_stale: "Stale commitments aged out",
 };
 
 function formatAge(seconds: number | null | undefined): string {
@@ -1405,11 +1411,23 @@ export default function App() {
         (parsed as { graph_offsite?: DoctorHealthCheck }).graph_offsite ??
           null,
       );
+      const nightlyStepsForSkip = (
+        parsed as {
+          nightly_steps?: Record<string, { skipped?: boolean; reason?: string }>;
+        }
+      ).nightly_steps;
+      const nightlyStepSkipReasons: Record<string, string | undefined> = {};
+      for (const [key, step] of Object.entries(nightlyStepsForSkip ?? {})) {
+        if (step?.skipped) {
+          nightlyStepSkipReasons[key.replace(/_ok$/, "")] = step.reason;
+        }
+      }
       setDoctorSkipReasons({
         memory_root: (parsed as { drift?: { skipped?: string } }).drift
           ?.skipped,
         graph_sqlite: (parsed as { graph_drift?: { skipped?: string } })
           .graph_drift?.skipped,
+        ...nightlyStepSkipReasons,
       });
       setAttention(items);
       // The number of boolean `*_ok` verdicts in this report — what "all

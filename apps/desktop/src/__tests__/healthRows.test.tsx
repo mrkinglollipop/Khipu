@@ -65,6 +65,18 @@ describe("healthRows (pure)", () => {
     expect(row?.status).toBe("skipped");
   });
 
+  it("a nightly step never recorded yet (Phase 6) is grey skipped, not red — false red on a fresh install/update", () => {
+    const rows = healthRows(
+      fixture({
+        notes_reconcile_ok: true,
+        not_configured: ["notes_reconcile"],
+      }),
+    );
+    const row = rows.find((r) => r.key === "notes_reconcile_ok");
+    expect(row?.status).toBe("skipped");
+    expect(row?.label).toBe("Notes reconciled by the nightly");
+  });
+
   it("sorts red first, then not-set-up, then green", () => {
     const rows = healthRows(
       fixture({

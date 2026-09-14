@@ -30,16 +30,65 @@ class NightlyStepHealthTest(unittest.TestCase):
             self.assertTrue(out[key]["ok"])
             self.assertFalse(out[key]["applicable"])
 
-    def test_missing_evidence_on_the_sync_host_is_red(self):
+    def test_missing_evidence_on_the_sync_host_is_skipped_not_red(self):
+        """A step that has never been recorded is a false red on every fresh
+        install and every Mac the day it updates (maintainer, 2026-09-14:
+        "especially after they update") — skipped, and must not flip `ok`."""
         from khipu import jobs
 
         with tempfile.TemporaryDirectory() as td:
             with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
                     mock.patch.object(jobs, "ensure_data_dir", return_value=Path(td)):
                 out = jobs.nightly_step_health()
+        for key in ("notes_reconcile_ok", "embed_provider_ok", "commitments_hygiene_ok", "mark_stale_ok"):
+            self.assertTrue(out[key]["ok"], key)
+            self.assertTrue(out[key]["skipped"], key)
+            self.assertEqual(out[key]["reason"], "not checked yet — the nightly runs at 02:05")
+        self.assertEqual(
+            jobs.skipped_step_names(out),
+            ["notes_reconcile", "embed_provider", "commitments_hygiene", "mark_stale"],
+        )
+
+    def test_a_stale_recording_over_36h_old_is_red_even_if_it_was_ok(self):
+        """A nightly that stopped running altogether must not hide behind a
+        week-old `ok: true` — this is a different failure mode from a step
+        that ran and failed, so it gets its own message."""
+        from datetime import datetime, timedelta, timezone
+
+        from khipu import jobs
+
+        old_ts = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            self._write_last(tmp, [
+                {"name": "notes_reconcile", "ok": True, "counts": {}, "error": None, "ts": old_ts},
+            ])
+            with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
+                    mock.patch.object(jobs, "ensure_data_dir", return_value=tmp):
+                out = jobs.nightly_step_health()
         self.assertFalse(out["notes_reconcile_ok"]["ok"])
-        self.assertIn("no 'notes_reconcile' step recorded", out["notes_reconcile_ok"]["error"])
-        self.assertTrue(out["notes_reconcile_ok"]["fix"])
+        self.assertNotIn("skipped", out["notes_reconcile_ok"])
+        self.assertIn("the nightly has not run since", out["notes_reconcile_ok"]["error"])
+        self.assertIn("khipu jobs status", out["notes_reconcile_ok"]["fix"])
+        # Stale, not skipped: it must not show up in the skipped/not_configured list.
+        self.assertNotIn("notes_reconcile", jobs.skipped_step_names(out))
+
+    def test_a_recent_recording_under_36h_old_is_judged_on_its_own_ok(self):
+        from datetime import datetime, timedelta, timezone
+
+        from khipu import jobs
+
+        recent_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            self._write_last(tmp, [
+                {"name": "notes_reconcile", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
+            ])
+            with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
+                    mock.patch.object(jobs, "ensure_data_dir", return_value=tmp):
+                out = jobs.nightly_step_health()
+        self.assertTrue(out["notes_reconcile_ok"]["ok"])
+        self.assertNotIn("skipped", out["notes_reconcile_ok"])
 
     def test_a_failed_step_is_red_with_its_own_error_and_fix(self):
         from khipu import jobs
