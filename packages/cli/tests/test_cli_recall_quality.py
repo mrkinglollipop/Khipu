@@ -41,6 +41,7 @@ def _green_doctor_patches():
         mock.patch("khipu.embed.coverage", return_value={
             "episodes": {"missing": 0}, "topics": {"missing": 0},
         }),
+        mock.patch("khipu.embed.literal_trgm_status", return_value={"ok": True}),
     ]
 
 

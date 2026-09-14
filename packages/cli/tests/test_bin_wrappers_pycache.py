@@ -21,7 +21,7 @@ import pytest
 
 BIN_DIR = Path(__file__).resolve().parents[1] / "bin"
 
-PYCACHE_WRAPPERS = ("khipu-stop-hook", "khipu-mcp", "khipu-recall-hook")
+PYCACHE_WRAPPERS = ("khipu-stop-hook", "khipu-mcp", "khipu-recall-hook", "khipu-prompt-recall")
 DONTWRITE_WRAPPERS = ("khipu-aegis-capture",)
 
 
