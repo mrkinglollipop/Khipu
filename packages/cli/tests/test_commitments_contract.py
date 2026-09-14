@@ -112,6 +112,28 @@ class TriggerClauseTest(unittest.TestCase):
         self.assertNotIn("then close this out", clause)
 
 
+class UntilLineTest(unittest.TestCase):
+    """The doubled-connective bug: `khipu owed` printed "until: until the
+    ledger closes." because `trigger_clause` keeps its own leading "until"
+    and the display code prepended another one."""
+
+    def test_does_not_repeat_until(self):
+        clause = co.trigger_clause("Run the oracle again until the ledger closes.")
+        line = co.until_line(clause)
+        self.assertEqual(line, "until: the ledger closes.")
+        self.assertEqual(line.count("until"), 1)
+
+    def test_a_different_connective_is_left_alone(self):
+        clause = co.trigger_clause("Do not ship this, not until legal signs off.")
+        line = co.until_line(clause)
+        assert line is not None
+        self.assertTrue(line.startswith("until: "))
+
+    def test_none_clause_is_none_line(self):
+        self.assertIsNone(co.until_line(None))
+        self.assertIsNone(co.until_line(""))
+
+
 class DeferralNeverClosesAtSessionEndTest(unittest.TestCase):
     """close_session_plan must never close a row whose text carries a future
     trigger — including the O1 shapes that used to slip through

@@ -20,7 +20,14 @@
 #      mirror, embed). Capture lands in the same Stop that decided it was due.
 #   3. Tail-sync the legacy episodes file into PG (identity upsert; cheap) and
 #      replay the outbox — the parts that were here before.
-#   4. Bounded embed catch-up for rows the mirror leg inserted.
+#   3b. F1: mtime-gated khipu.notes.reconcile(changed_only=True) — a note
+#      edited this session becomes a topic in this same Stop rather than
+#      waiting for the nightly. Costs one stat() per known note file and
+#      opens no DB connection at all when nothing changed.
+#   4. Bounded embed catch-up for rows the mirror leg (and 3b's reconcile)
+#      inserted — episodes, open commitments, AND (F2) topics with no
+#      vector yet, so a just-reconciled note is vector-searchable this
+#      same Stop too.
 #
 # Every native-capture run leaves a per-harness heartbeat under
 # ~/.grok/khipu/dispatch/; `khipu doctor` and `khipu integrations verify` read
@@ -82,6 +89,7 @@ export KHIPU_HOOK_STDIN="$STDIN_JSON"
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 QUEUE_ONLY = os.environ.get("KHIPU_CAPTURE_QUEUE_ONLY") == "1"
@@ -140,6 +148,23 @@ try:
         _say(f"outbox drain {outbox_drain()}")
 except Exception as e:  # noqa: BLE001 — fail-open, always
     _say(f"outbox drain skipped: {type(e).__name__}: {e}")
+try:
+    # 3b. F1: mtime-gated notes reconcile — a note edited this session is a
+    # topic THIS Stop, not after tonight's nightly. changed_only=True costs
+    # one stat() per known note file and skips everything unchanged; when
+    # nothing changed it never even opens a DB connection. Timed so the
+    # "under 300ms when nothing changed" budget is visible in the log, not
+    # just asserted in a test.
+    _t0 = time.monotonic()
+    from khipu.notes import reconcile as _notes_reconcile
+    r = _notes_reconcile(dry_run=False, changed_only=True)
+    _ms = round((time.monotonic() - _t0) * 1000, 1)
+    _say(
+        f"notes-reconcile changed_only candidates={r.get('candidates')} "
+        f"written={r.get('written')} errors={len(r.get('errors') or [])} {_ms}ms"
+    )
+except Exception as e:  # noqa: BLE001 — fail-open, always
+    _say(f"notes-reconcile skipped: {type(e).__name__}: {e}")
 try:
     # Rows the legacy mirror leg inserted are already-present to the tail sync, so
     # they would wait for the nightly to be embedded and stay out of semantic

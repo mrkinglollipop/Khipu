@@ -70,6 +70,17 @@ def _parse_frontmatter_date(raw: Any) -> str | None:
     return dt.isoformat()
 
 
+def _file_mtime_iso(path: str) -> str | None:
+    """R7: a file's own mtime as an ISO-8601 UTC string, the fallback
+    freshness signal when a parsed topic carries no date of its own.
+    None (never ``now()``) when the file cannot be stat'd."""
+    try:
+        ts = Path(path).stat().st_mtime
+    except OSError:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
 def _log(msg: str) -> None:
     print(f"[khipu-mirror] {msg}", file=sys.stderr)
 
@@ -206,20 +217,26 @@ def _upsert_topic(
         frontmatter = {"title": parsed["title"], "status": parsed["status"], "links": links}
     cur.execute("SELECT content_hash FROM topics WHERE slug = %s", (parsed["slug"],))
     prev = cur.fetchone()
-    # W5.3: a topic's own frontmatter created/last_updated (when parseable)
-    # is the freshness signal, not "whenever mirror last ran". created_at is
-    # only ever set, never blanked, on conflict (COALESCE keeps the existing
-    # value when this write's frontmatter carries none).
-    updated_at_val = parsed.get("updated_at")
+    # W5.3/R7: a topic's own frontmatter created/last_updated (when
+    # parseable) is the freshness signal, not "whenever mirror last ran" —
+    # and when the source gives NEITHER that nor an explicit `event_at`
+    # (R7's own true-event-time field), the file's own mtime is the
+    # fallback, never now(): a file mirrored today that nobody touched
+    # today must not read as touched today. created_at is only ever set,
+    # never blanked, on conflict (COALESCE keeps the existing value when
+    # this write's frontmatter carries none).
+    file_mtime = _file_mtime_iso(source_path)
+    updated_at_val = parsed.get("updated_at") or file_mtime
+    event_at_val = parsed.get("event_at") or file_mtime
     created_at_val = parsed.get("created_at")
     cur.execute(
         """
         INSERT INTO topics
           (slug, title, body, status, updated_at, frontmatter, links,
-           source_path, content_hash, created_at)
+           source_path, content_hash, created_at, event_at)
         VALUES
           (%s, %s, %s, %s, COALESCE(%s::timestamptz, now()),
-           %s::jsonb, %s::jsonb, %s, %s, %s::timestamptz)
+           %s::jsonb, %s::jsonb, %s, %s, %s::timestamptz, %s::timestamptz)
         ON CONFLICT (slug) DO UPDATE SET
           title = EXCLUDED.title,
           body = EXCLUDED.body,
@@ -230,6 +247,7 @@ def _upsert_topic(
           frontmatter = EXCLUDED.frontmatter,
           links = EXCLUDED.links,
           created_at = COALESCE(topics.created_at, EXCLUDED.created_at),
+          event_at = COALESCE(EXCLUDED.event_at, topics.event_at),
           deleted_at = NULL
         """,
         (
@@ -243,6 +261,7 @@ def _upsert_topic(
             source_path,
             parsed["digest"],
             created_at_val,
+            event_at_val,
         ),
     )
     changed = prev is None or prev[0] != parsed["digest"]

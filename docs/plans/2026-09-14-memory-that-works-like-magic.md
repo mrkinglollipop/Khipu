@@ -164,6 +164,13 @@ desktop released when a phase touches them ("merged is not deployed").
   with the index line kept); section-aware chunking so an edited ledger re-embeds only the changed
   sections; `status` as an enum surfaced and de-ranked in search and the slice; `type` and `[[links]]`
   used by ranking; stale-note archiving report-only, ported from the legacy heuristic.
+  **Everything in this phase runs by itself:** the index rewrite, duplicate detection, size warnings,
+  section-aware re-embedding and the stale report run from the notes watch agent after every
+  reconcile and from the nightly; the CLI verbs exist for the maintainer, never as the only trigger.
+  Doctor shows the last organisation run, its counts, and anything it refused to do (with the reason
+  and the one action). The maintainer's rule (2026-09-14): "Make sure all of the memories are
+  organized properly and that is happening automatically."
+
 - **Phase 6 — honesty (D1–D6, K8, K9, K10, R10).** Doctor checks: `notes_reconcile_ok`,
   `embed_provider_ok`, `topics_embed_lag`, `degraded_rate_ok`, `oldest_pending_seconds`, gateway
   liveness per token, unknown-harness heartbeat, nightly step evidence persisted, nightly overlap lock.
@@ -189,7 +196,7 @@ brings the scope into context before the model acts, in Claude Code and Codex by
 rule, in Aegis and the gateway by first tool call; and the diagnosis turn is captured within a minute
 with its seven points intact.
 
-## Phase 7 — every harness proven, live
+## Phase 7 — every harness and every function proven, live
 
 Nothing in this program counts as done for a harness until the row below is green from a real
 session of that harness on this Mac (or, for the gateway, a real call through the deployed gateway),
@@ -206,6 +213,17 @@ proves the installer, the session proves the harness.
 | Deferred work returns as owed | `khipu owed` after a fixture session | same | same | same | same |
 | Note edited → searchable ≤ 60 s | watch agent, log | same dirs | Codex memories dir | n/a | n/a |
 | Doctor red on each drop path | fixture | fixture | fixture | queue age, unknown harness | gateway liveness row |
+
+**Function matrix.** Beyond the harness rows, every user-facing function is exercised once against
+the live system with its evidence pasted: every `khipu` CLI verb (`--help` enumerates them; each run
+with a real argument, exit code and one line of output recorded), every MCP tool (`khipu_search`,
+`khipu_get`, `khipu_graph`, `khipu_status` with and without `prompt`, `khipu_owed`,
+`khipu_owed_update`, `khipu_capture` local and via the gateway, `khipu_forget`), every hook binary
+with a real payload, every LaunchAgent (`launchctl list` shows it loaded; its last run's log line),
+every doctor check driven red once by a fixture and back to green, and embedding end to end: a
+capture made during the run is found by a semantic-only search within one Stop, with
+`embed_coverage` showing zero missing for episodes and topics afterwards. The maintainer's rule
+(2026-09-14): "Make sure embedding is working too. All functions need to be verified."
 
 Method: one scripted session per harness (`claude -p`, `codex exec`, Cursor's non-interactive runner
 if it fires hooks, an Aegis session, a token-authenticated call on the Linode for the gateway), each

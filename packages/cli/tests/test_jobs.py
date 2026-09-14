@@ -62,6 +62,53 @@ class JobsRunTest(unittest.TestCase):
         state = json.loads((self.data_dir / "state" / "job-nightly.json").read_text())
         self.assertEqual(state["exit"], 0)
 
+    def test_run_nightly_writes_nightly_last_json_with_every_step(self):
+        """F3/D1: nightly-last.json is the persisted evidence Phase 6 will
+        read — one entry per step, not just free text in the log."""
+        def _run(cmd, stdout, stderr, env):  # noqa: ARG001
+            stdout.write(b"ok\n")
+            return mock.Mock(returncode=0)
+
+        with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
+                mock.patch("khipu.notes.reconcile", return_value={"ok": True, "written": 2}), \
+                mock.patch.object(jobs, "_mark_stale_commitments"), \
+                mock.patch.object(jobs, "_hygiene_commitments"):
+            jobs.run_nightly()
+        payload = json.loads((self.data_dir / "nightly-last.json").read_text())
+        names = [s["name"] for s in payload["steps"]]
+        self.assertEqual(
+            names,
+            ["consolidate_nightly", "notes_reconcile", "embed_backfill",
+             "query_cache_prune", "commitments_mark_stale", "commitments_hygiene"],
+        )
+        for step in payload["steps"]:
+            self.assertIn("ok", step)
+            self.assertIn("counts", step)
+            self.assertIn("error", step)
+            self.assertIn("ts", step)
+        notes_step = next(s for s in payload["steps"] if s["name"] == "notes_reconcile")
+        self.assertTrue(notes_step["ok"])
+        self.assertEqual(notes_step["counts"]["written"], 2)
+
+    def test_nightly_last_json_reports_a_missing_embed_key_once(self):
+        """F3: a missing/expired embedding key must not abort the whole
+        backfill — it shows up once as embed_provider in the persisted
+        step, not as a raise that takes the rest of the nightly with it."""
+        def _run(cmd, stdout, stderr, env):  # noqa: ARG001
+            stdout.write(b"ok\n")
+            return mock.Mock(returncode=0)
+
+        with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
+                mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
+                mock.patch.object(jobs, "_mark_stale_commitments"), \
+                mock.patch.object(jobs, "_hygiene_commitments"), \
+                mock.patch("khipu.embed.backfill",
+                            return_value={"embedded": 3, "embed_provider": "missing key"}):
+            jobs.run_nightly()
+        payload = json.loads((self.data_dir / "nightly-last.json").read_text())
+        backfill_step = next(s for s in payload["steps"] if s["name"] == "embed_backfill")
+        self.assertEqual(backfill_step["counts"]["embed_provider"], "missing key")
+
     def test_run_nightly_ages_open_commitments_into_stale(self):
         """W3: commitments.mark_stale had NO caller at all (audit 2026-09-04),
         so nothing ever aged and `khipu owed --status stale` stayed empty."""
@@ -329,7 +376,7 @@ class JobsMetadataTest(unittest.TestCase):
             out = jobs.job_status()
         self.assertEqual(
             set(out),
-            {"nightly", "monthly", "graph_build", "embed_media_backfill"},
+            {"nightly", "monthly", "graph_build", "notes_watch", "embed_media_backfill"},
         )
 
 

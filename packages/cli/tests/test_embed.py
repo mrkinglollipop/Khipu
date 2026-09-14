@@ -512,12 +512,14 @@ class ApplySearchFiltersHarnessTest(unittest.TestCase):
 
 
 class _CatchupCursor:
-    """Enough of a cursor for embed_recent_missing's commitment pass (fix
-    5c): no episodes missing (isolates the commitments leg), N open
-    commitments with no embedding yet, and a recorder for every INSERT."""
+    """Enough of a cursor for embed_recent_missing's commitment (fix 5c) and
+    topics (F2) passes: no episodes missing (isolates the leg under test),
+    N open commitments / topics with no embedding yet, and a recorder for
+    every INSERT."""
 
-    def __init__(self, commitment_rows):
+    def __init__(self, commitment_rows=(), topic_rows=()):
         self.commitment_rows = commitment_rows
+        self.topic_rows = topic_rows
         self.inserts: list[tuple] = []
         self._result: list[tuple] = []
 
@@ -527,6 +529,8 @@ class _CatchupCursor:
             self._result = []
         elif "FROM commitments c WHERE c.status = 'open'" in s:
             self._result = self.commitment_rows
+        elif "FROM topics t WHERE t.deleted_at IS NULL" in s:
+            self._result = self.topic_rows
         elif s.startswith("INSERT INTO memory_embeddings"):
             self.inserts.append(params)
         else:
@@ -632,6 +636,212 @@ class EmbedRecentMissingCommitmentsTest(unittest.TestCase):
         (rows,), _ = m_snap.call_args
         self.assertTrue(rows)
         self.assertTrue(all(r["kind"] == "commitment" and r["ref"] == "7" for r in rows))
+
+
+class _BackfillCursor:
+    """Enough of a cursor to drive backfill(kind="topic") through more than
+    one BATCH-sized pass: profile resolution, the orphan sweep, existing
+    hashes, and a topics-only source list — no episodes, no commitments."""
+
+    def __init__(self, topic_rows):
+        self.topic_rows = topic_rows
+        self.inserts: list[tuple] = []
+        self.rowcount = 0
+        self._result: list[tuple] = []
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        if s.startswith("SELECT id FROM embedding_profiles"):
+            self._result = [("prof-1",)]
+        elif s.startswith("DELETE FROM memory_embeddings"):
+            self.rowcount = 0
+        elif s.startswith("SELECT kind, ref, chunk_idx, content_hash"):
+            self._result = []
+        elif s.startswith("SELECT slug, title, body FROM topics"):
+            self._result = self.topic_rows
+        elif s.startswith("INSERT INTO memory_embeddings"):
+            self.inserts.append(params)
+        else:
+            self._result = []
+
+    def fetchone(self):
+        return self._result[0] if self._result else None
+
+    def fetchall(self):
+        return list(self._result)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _BackfillConn:
+    def __init__(self, cur):
+        self._cur = cur
+        self.commits = 0
+
+    def cursor(self):
+        return self._cur
+
+    def commit(self):
+        self.commits += 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class BackfillPerChunkIsolationTest(unittest.TestCase):
+    """F3: a failing batch (a missing/expired key, a transient network
+    error, anything embed_batch raises other than "budget exhausted") must
+    not abort the batches still queued behind it — only the old behaviour
+    (re-raise, letting the caller's try/except swallow the WHOLE sweep) did
+    that."""
+
+    def _rows(self, n: int) -> list[tuple[str, str, str]]:
+        return [(f"note:n{i}", f"Title {i}", "short body") for i in range(n)]
+
+    def test_one_bad_batch_does_not_stop_the_rest(self):
+        from unittest import mock
+
+        rows = self._rows(em.BATCH + 1)  # two batches: BATCH, then 1
+        cur = _BackfillCursor(rows)
+        conn = _BackfillConn(cur)
+        calls = {"n": 0}
+
+        def _embed(api, profile, retries=None, delay=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("embed HTTP 500: server error")
+            return [[0.0] * em.DIM for _ in api]
+
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "embed_batch", side_effect=_embed), \
+                mock.patch.object(em.time, "sleep", lambda s: None):
+            stats = em.backfill(kind="topic")
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(stats["failed_chunks"], em.BATCH)
+        self.assertEqual(stats["embedded"], 1)
+        self.assertEqual(len(cur.inserts), 1)
+
+    def test_a_missing_key_is_reported_once_as_embed_provider(self):
+        from unittest import mock
+
+        rows = self._rows(3)
+        cur = _BackfillCursor(rows)
+        conn = _BackfillConn(cur)
+
+        def _embed(api, profile, retries=None, delay=None):
+            raise RuntimeError("Gemini API key not found (Keychain / env / file)")
+
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "embed_batch", side_effect=_embed), \
+                mock.patch.object(em.time, "sleep", lambda s: None):
+            stats = em.backfill(kind="topic")
+        self.assertEqual(stats["embed_provider"], "missing key")
+        self.assertEqual(stats["failed_chunks"], 3)
+        self.assertEqual(stats["embedded"], 0)
+
+    def test_budget_exhausted_still_stops_the_sweep(self):
+        """The pre-existing behaviour: budget exhaustion is deliberate and
+        must still break out, not be treated as an isolated failure."""
+        from unittest import mock
+
+        rows = self._rows(em.BATCH + 1)
+        cur = _BackfillCursor(rows)
+        conn = _BackfillConn(cur)
+
+        def _embed(api, profile, retries=None, delay=None):
+            raise RuntimeError("budget exhausted for today")
+
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "embed_batch", side_effect=_embed), \
+                mock.patch.object(em.time, "sleep", lambda s: None):
+            stats = em.backfill(kind="topic")
+        self.assertTrue(stats["budget_exhausted"])
+        self.assertEqual(stats.get("failed_chunks", 0), 0)
+        self.assertEqual(stats["embedded"], 0)
+
+
+class EmbedRecentMissingTopicsTest(unittest.TestCase):
+    """F2: a topic with no vector under the active profile (a note
+    khipu.notes.reconcile just wrote, or any other topic write) is embedded
+    by the bounded Stop-hook catch-up — not left for the nightly."""
+
+    def _run(self, topic_rows):
+        from unittest import mock
+
+        cur = _CatchupCursor(topic_rows=topic_rows)
+        conn = _CatchupConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"), \
+                mock.patch.object(em, "embed_batch",
+                                   side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]):
+            out = em.embed_recent_missing(limit=10)
+        return out, cur
+
+    def test_topics_with_no_vector_get_embedded(self):
+        out, cur = self._run([
+            ("note:one", "One", "body one"),
+            ("note:two", "Two", "body two"),
+        ])
+        self.assertEqual(out["topics_embedded"], 2)
+        refs = {p[2] for p in cur.inserts if p[1] == "topic"}
+        self.assertEqual(refs, {"note:one", "note:two"})
+
+    def test_no_missing_topics_is_a_noop(self):
+        out, cur = self._run([])
+        self.assertEqual(out["topics_embedded"], 0)
+        self.assertEqual(out["topics_chunks"], 0)
+        self.assertEqual([p for p in cur.inserts if p[1] == "topic"], [])
+
+    def test_blank_title_and_body_still_embeds_via_the_slug_fallback(self):
+        # topic_text() falls back to the slug when title/body are empty, so
+        # a topic row (unlike a commitment's bare text) is never itself
+        # "blank" — every topic has a slug.
+        out, _ = self._run([("note:blank", "", "")])
+        self.assertEqual(out["topics_embedded"], 1)
+
+    def test_missing_topics_leg_degrades_to_zero_not_a_raise(self):
+        """A pre-migration or otherwise broken topics query must not sink
+        the rest of the catch-up — same posture as the commitments leg's
+        pre-0009-hub degrade."""
+        from unittest import mock
+
+        class _RaisingCursor(_CatchupCursor):
+            def execute(self, sql, params=None):
+                s = " ".join(sql.split())
+                if "FROM topics t WHERE t.deleted_at IS NULL" in s:
+                    raise RuntimeError("boom")
+                super().execute(sql, params)
+
+        cur = _RaisingCursor()
+        conn = _CatchupConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"):
+            out = em.embed_recent_missing(limit=10)
+        self.assertEqual(out["topics_embedded"], 0)
+
+    def test_snapshot_upsert_is_called_with_topic_kind_rows(self):
+        from unittest import mock
+
+        cur = _CatchupCursor(topic_rows=[("note:three", "Three", "body three")])
+        conn = _CatchupConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"), \
+                mock.patch.object(em, "embed_batch",
+                                   side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]), \
+                mock.patch("khipu.hub_snapshot.upsert_embeddings",
+                           return_value={"ok": True}) as m_snap:
+            em.embed_recent_missing(limit=10)
+        m_snap.assert_called_once()
+        (rows,), _ = m_snap.call_args
+        self.assertTrue(rows)
+        self.assertTrue(all(r["kind"] == "topic" and r["ref"] == "note:three" for r in rows))
 
 
 if __name__ == "__main__":

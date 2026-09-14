@@ -15,6 +15,7 @@ from khipu.jobs import (
     PLIST_GRAPH,
     PLIST_MONTHLY,
     PLIST_NIGHTLY,
+    PLIST_NOTES_WATCH,
     _JOB_SPECS,
     _launchagents_dir,
     _log_paths,
@@ -27,12 +28,14 @@ _JOB_TEMPLATE: dict[str, str] = {
     "nightly": "com.matt.khipu-nightly.plist",
     "monthly": "com.matt.khipu-monthly.plist",
     "graph_build": "com.matt.khipu-graph.plist",
+    "notes_watch": "com.khipu.notes-watch.plist",
 }
 
 _LABELS = {
     "nightly": PLIST_NIGHTLY,
     "monthly": PLIST_MONTHLY,
     "graph_build": PLIST_GRAPH,
+    "notes_watch": PLIST_NOTES_WATCH,
 }
 
 
@@ -110,6 +113,20 @@ def render_extra_env(environ: dict[str, str] | None = None) -> str:
     return "".join(lines)
 
 
+def render_watch_paths_xml() -> str:
+    """F1: every memory dir the notes scanner reads from (``khipu.notes.
+    memory_dirs()``), rendered as indented ``<string>`` entries for the
+    WatchPaths array. Computed at render time (``khipu jobs install`` /
+    ``refresh``), not at launchd-load time — a project added to
+    ``~/.claude/projects`` after install needs another install/refresh to
+    be watched, same as every other baked-at-render-time value in these
+    templates."""
+    from khipu.notes import memory_dirs
+
+    lines = [f"\n\t\t<string>{escape(str(p))}</string>" for p in memory_dirs()]
+    return "".join(lines)
+
+
 def render_plist(job: str, environ: dict[str, str] | None = None) -> bytes:
     template_name = _JOB_TEMPLATE.get(job)
     if not template_name:
@@ -127,6 +144,8 @@ def render_plist(job: str, environ: dict[str, str] | None = None) -> bytes:
     text = text.replace("{{EXTRA_ENV}}", render_extra_env(environ))
     text = text.replace("{{STDOUT_LOG}}", str(out_log))
     text = text.replace("{{STDERR_LOG}}", str(err_log))
+    if job == "notes_watch":
+        text = text.replace("{{WATCH_PATHS}}", render_watch_paths_xml())
     return text.encode("utf-8")
 
 

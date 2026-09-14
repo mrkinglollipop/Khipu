@@ -309,9 +309,12 @@ def project_slice(
             # unbounded ANY() array.
             topic_slugs = topic_slugs[: max(topic_limit * 8, topic_limit)]
             if topic_slugs:
+                # R7: event_at (the topic's own timestamp) before updated_at
+                # (ingest time) — a note mirrored today that nobody touched
+                # today must not show "0d old" in the slice.
                 cur.execute(
                     """
-                    SELECT slug, title, COALESCE(updated_at, created_at), status
+                    SELECT slug, title, COALESCE(event_at, updated_at, created_at), status
                     FROM topics
                     WHERE slug = ANY(%s) AND deleted_at IS NULL
                     """,
@@ -342,11 +345,11 @@ def project_slice(
                 now = datetime.now(timezone.utc)
                 cur.execute(
                     """
-                    SELECT slug, title, COALESCE(updated_at, created_at), status
+                    SELECT slug, title, COALESCE(event_at, updated_at, created_at), status
                     FROM topics
                     WHERE deleted_at IS NULL AND slug LIKE 'note:%%'
                       AND frontmatter->>'project' = %s
-                    ORDER BY COALESCE(updated_at, created_at) DESC NULLS LAST
+                    ORDER BY COALESCE(event_at, updated_at, created_at) DESC NULLS LAST
                     LIMIT %s
                     """,
                     (project, remaining + len(seen_slugs)),

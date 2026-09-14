@@ -21,18 +21,25 @@ itself rather than forcing the wrong parser onto it, then calls
 ``mirror._upsert_topic`` (the one topic-upsert, the same one
 ``mirror.mirror_topic_file`` calls internally) directly.
 
-``reconcile()`` is append-only and additive-only: it walks the files,
-upserts each into ``topics``, and never deletes/tombstones a topic no longer
-present (unlike the wiki reconcile) — a note vanishing from
-``~/.claude/projects`` is not a signal Khipu should act on unattended. Never
+``reconcile()`` upserts every file it finds into ``topics`` and — since
+Phase 4 (F5) — tombstones a ``note:`` topic whose ``source_path`` file no
+longer exists on disk, bounded by the same circuit-breaker style the wiki
+reconcile uses (never more than 20% of note topics in one run; see
+``_tombstone_missing_notes``). ``changed_only=True`` (F1) skips any file
+whose mtime/size match a small on-disk state file from the last run —
+unchanged files cost one ``stat()``, nothing is read or parsed — so the
+Stop hook can call this on every turn without re-walking hundreds of notes.
+The nightly still calls the full (``changed_only=False``) reconcile. Never
 runs against the live hub in a test: every test here injects a temp dir and
 mocks ``khipu.db.connect`` with a fake cursor, same as every other write
 path in this package.
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +49,11 @@ _WIKILINK_RE = re.compile(r"\[\[([a-z0-9][a-z0-9_-]*)\]\]", re.I)
 # component (a directory name with a space in it) while resolving a
 # Claude Code project slug back to a real path — see resolve_claude_project_path.
 _MAX_JOIN_SEGMENTS = 4
+# F5: never tombstone more than this share of live note: topics in one
+# reconcile — a mount blip that makes every memory dir read as empty must
+# not read as "every note was deleted" (same posture as the wiki reconcile's
+# KHIPU_ALLOW_MASS_TOMBSTONE guard in khipu.mirror).
+TOMBSTONE_MAX_FRACTION = 0.2
 
 
 def _log(msg: str) -> None:
@@ -54,6 +66,32 @@ def claude_projects_root() -> Path:
 
 def codex_memories_root() -> Path:
     return Path.home() / ".codex" / "memories"
+
+
+def cursor_memory_roots() -> list[Path]:
+    """Per-project Cursor memory dirs, F6. Checked live on the maintainer's
+    Mac 2026-09-14: no ``~/.cursor/**/memory/*.md`` exists today — Cursor's
+    own per-project state lives under ``~/.cursor/projects/<slug>/`` but
+    that tree has no ``memory`` subdirectory yet. Empty root list for now;
+    the scanner (``_iter_note_file_candidates``) and the WatchPaths agent both consult
+    this function, so a directory that appears later is picked up with no
+    further code change — just re-running ``khipu notes reconcile`` /
+    ``khipu jobs install``."""
+    root = Path.home() / ".cursor" / "projects"
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.glob("*/memory") if p.is_dir())
+
+
+def aegis_memory_roots() -> list[Path]:
+    """Aegis memory dirs, F6. Checked live 2026-09-14: Aegis sandboxes its
+    own state and keeps no ``memory/*.md`` tree Khipu can reach from outside
+    its sandbox today (see the ``screen-lease-protocol-with-aegis-sessions``
+    / ``aegis-native-only`` memory topics — Aegis is deliberately kept off
+    every Khipu-owned write path). Empty for now, same posture as
+    ``cursor_memory_roots`` above: the code path exists so a future Aegis
+    memory export needs no new plumbing, only a real root here."""
+    return []
 
 
 def _walk_segments(base: Path, segments: list[str]) -> Path | None:
@@ -140,6 +178,30 @@ def _extract_note_links(body: str) -> list[str]:
     return seen
 
 
+def _file_mtime_iso(path: Path) -> str | None:
+    """A file's own mtime as an ISO-8601 UTC string, or None when it cannot
+    be stat'd. Never ``now()`` — see R7."""
+    try:
+        ts = path.stat().st_mtime
+    except OSError:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _note_event_at(flat: dict[str, str], path: Path) -> str | None:
+    """R7: a note's own ``event_at`` — the frontmatter's ``modified``
+    (flat), else the nested ``metadata.modified``, else the file's own
+    mtime. Never ``now()``: a note nobody touched today must not read as
+    touched today just because Khipu happened to reconcile it today."""
+    from khipu.mirror import _parse_frontmatter_date
+
+    for key in ("modified", "metadata.modified"):
+        val = _parse_frontmatter_date(flat.get(key))
+        if val:
+            return val
+    return _file_mtime_iso(path)
+
+
 def _note_topic_dict(path: Path, *, project: str | None) -> dict[str, Any] | None:
     """One note ``.md`` file -> the shape ``mirror._upsert_topic`` expects,
     or None when the file is missing/unreadable — mirrors
@@ -163,6 +225,7 @@ def _note_topic_dict(path: Path, *, project: str | None) -> dict[str, Any] | Non
     type_raw = flat.get("metadata.type") or flat.get("type") or ""
     status = normalize_topic_status(type_raw)
     updated_at = _parse_frontmatter_date(flat.get("metadata.modified") or flat.get("modified"))
+    event_at = _note_event_at(flat, path)
     links = _extract_note_links(body)
     frontmatter = {
         "title": name,
@@ -182,6 +245,7 @@ def _note_topic_dict(path: Path, *, project: str | None) -> dict[str, Any] | Non
         "frontmatter": frontmatter,
         "created_at": None,
         "updated_at": updated_at,
+        "event_at": event_at,
     }
 
 
@@ -211,42 +275,204 @@ def _project_for_slug(slug: str) -> str | None:
         return None
 
 
-def _build_plan() -> list[dict[str, Any]]:
-    """Every note file found -> a plain plan (parsed topic dict + source
-    harness), with no DB access at all, so `reconcile(dry_run=True)` and the
-    real write share exactly one discovery pass."""
-    plan: list[dict[str, Any]] = []
-
+def _iter_note_file_candidates() -> list[tuple[Path, str, str | None]]:
+    """Every note file on disk -> ``(path, harness, claude_slug)``, no
+    parsing and — deliberately — no project resolution: ``_project_for_slug``
+    does a real filesystem DFS (``resolve_claude_project_path``) and is not
+    cheap across dozens of projects. The one place that lists every memory
+    dir the notes scanner knows — ``launchd_gen``'s WatchPaths render (F1)
+    and ``notes_freshness`` (D4) both walk this same set so they can never
+    drift from what ``_build_plan`` actually reconciles. ``claude_slug`` is
+    the raw ``~/.claude/projects/<slug>`` directory name (None for
+    codex/cursor/aegis); resolve it to a project lazily, only for a file
+    you are about to actually parse — see ``_build_plan``."""
+    out: list[tuple[Path, str, str | None]] = []
     for proj_dir in _claude_project_dirs(claude_projects_root()):
         files = _iter_note_files(proj_dir / "memory")
-        if not files:
-            continue
-        project = _project_for_slug(proj_dir.name)
-        for f in files:
-            parsed = _note_topic_dict(f, project=project)
-            if parsed is not None:
-                plan.append({"harness": "claude_code", "parsed": parsed, "path": str(f)})
+        out.extend((f, "claude_code", proj_dir.name) for f in files)
+    out.extend((f, "codex", None) for f in _iter_note_files(codex_memories_root()))
+    # F6: empty today on every checked Mac (see cursor_memory_roots /
+    # aegis_memory_roots) — the loop runs regardless so a root that appears
+    # later needs no code change here.
+    for root in cursor_memory_roots():
+        out.extend((f, "cursor", None) for f in _iter_note_files(root))
+    for root in aegis_memory_roots():
+        out.extend((f, "aegis", None) for f in _iter_note_files(root))
+    return out
 
-    for f in _iter_note_files(codex_memories_root()):
-        parsed = _note_topic_dict(f, project=None)
+
+def memory_dirs() -> list[Path]:
+    """Every memory *directory* the notes scanner reads from — for the
+    WatchPaths LaunchAgent (F1), which watches directories, not the
+    individual files inside them. Each Claude Code project's own
+    ``memory/`` dir (not the ``~/.claude/projects`` parent: launchd's
+    WatchPaths fires on changes to a listed path's own contents, not on a
+    write several directories below it), Codex's single root, and any
+    Cursor/Aegis roots that exist (F6, none today)."""
+    dirs: list[Path] = []
+    for proj_dir in _claude_project_dirs(claude_projects_root()):
+        mem = proj_dir / "memory"
+        if mem.is_dir():
+            dirs.append(mem)
+    codex = codex_memories_root()
+    if codex.is_dir():
+        dirs.append(codex)
+    dirs.extend(cursor_memory_roots())
+    dirs.extend(aegis_memory_roots())
+    return dirs
+
+
+def _state_path() -> Path:
+    from khipu.paths import ensure_data_dir
+
+    d = ensure_data_dir() / "state"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "notes-reconcile-state.json"
+
+
+def _read_state() -> dict[str, Any]:
+    """F1: ``{path: {mtime, size}}`` from the last ``changed_only`` run,
+    plus ``last_reconcile_at`` — never raises; a missing/corrupt state file
+    just means every file looks changed on the next call."""
+    try:
+        data = json.loads(_state_path().read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("files"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"last_reconcile_at": None, "files": {}}
+
+
+def _write_state(state: dict[str, Any]) -> None:
+    try:
+        tmp = _state_path().with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        tmp.replace(_state_path())
+    except OSError:
+        pass
+
+
+def _file_sig(path: Path) -> dict[str, float | int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return {"mtime": st.st_mtime, "size": st.st_size}
+
+
+def _build_plan(
+    *, changed_only: bool = False, state: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """Every note file found -> a plain plan (parsed topic dict + source
+    harness), with no DB access at all, so `reconcile(dry_run=True)` and the
+    real write share exactly one discovery pass.
+
+    ``changed_only=True`` (F1) costs one ``stat()`` per file and skips
+    parsing (reading + hashing) any file whose mtime/size match ``state``
+    (from ``_read_state()``) — this is what keeps the Stop hook's call
+    cheap on a project with hundreds of untouched notes.
+    """
+    plan: list[dict[str, Any]] = []
+    files_state = (state or {}).get("files", {}) if changed_only else {}
+    # Memoized within this one call: several notes under the same Claude
+    # Code project would otherwise each pay for _project_for_slug's real
+    # filesystem DFS. Resolved lazily (only for a file that is actually
+    # about to be parsed) so a changed_only run with nothing changed never
+    # calls it at all — measured live: this dropped a nothing-changed Stop
+    # hook run from ~450-500ms to well under 300ms across ~45 projects.
+    project_cache: dict[str, str | None] = {}
+
+    def _project_for(claude_slug: str | None) -> str | None:
+        if claude_slug is None:
+            return None
+        if claude_slug not in project_cache:
+            project_cache[claude_slug] = _project_for_slug(claude_slug)
+        return project_cache[claude_slug]
+
+    for path, harness, claude_slug in _iter_note_file_candidates():
+        if changed_only:
+            sig = _file_sig(path)
+            if sig is None:
+                continue
+            prev = files_state.get(str(path))
+            if prev and prev.get("mtime") == sig["mtime"] and prev.get("size") == sig["size"]:
+                continue
+        parsed = _note_topic_dict(path, project=_project_for(claude_slug))
         if parsed is not None:
-            plan.append({"harness": "codex", "parsed": parsed, "path": str(f)})
-
+            plan.append({"harness": harness, "parsed": parsed, "path": str(path)})
     return plan
 
 
-def reconcile(*, dry_run: bool = False) -> dict[str, Any]:
-    """Mirror every harness-native note into ``topics``. Append-only:
-    upserts only, never tombstones. Fail-open at the per-file level (one bad
-    note is reported in ``errors`` and does not sink the batch) but lets a
-    connection-level failure (no hub reachable at all) propagate — the
-    caller (`cli.cmd_notes` interactively, `jobs` nightly) decides how to
-    surface that, same posture as every other write path in this package.
+def _tombstone_missing_notes(cur) -> dict[str, Any]:
+    """F5: mark a ``note:`` topic ``deleted_at = now()`` when its
+    ``source_path`` file no longer exists. Circuit-broken the same way the
+    wiki reconcile is (``khipu.mirror.reconcile_from_files``'s mass-tombstone
+    guard): never more than ``TOMBSTONE_MAX_FRACTION`` of live note topics in
+    one run — a mount blip that makes every memory dir read as empty must
+    not silently empty the corpus. Only the full (non ``changed_only``)
+    reconcile calls this; it needs every live note topic's row, which a
+    Stop-hook-cheap changed-only pass does not fetch."""
+    cur.execute(
+        "SELECT slug, source_path FROM topics WHERE slug LIKE %s AND deleted_at IS NULL",
+        (NOTE_SLUG_PREFIX + "%",),
+    )
+    rows = cur.fetchall()
+    total = len(rows)
+    missing = [slug for slug, path in rows if not path or not Path(path).is_file()]
+    out: dict[str, Any] = {"checked": total, "missing": len(missing), "tombstoned": 0, "skipped": False}
+    if not missing:
+        return out
+    if len(missing) > 1 and len(missing) > total * TOMBSTONE_MAX_FRACTION:
+        out["skipped"] = True
+        out["reason"] = (
+            f"{len(missing)}/{total} note topics have no source file on disk — "
+            "refusing, looks like a mount blip rather than a real bulk delete"
+        )
+        return out
+    for slug in missing:
+        cur.execute(
+            "UPDATE topics SET deleted_at = now() WHERE slug = %s AND deleted_at IS NULL",
+            (slug,),
+        )
+    out["tombstoned"] = len(missing)
+    return out
+
+
+def _any_memory_root_exists() -> bool:
+    """Whether at least one memory root is reachable at all — gates the
+    tombstone sweep (F5): a host with NO reachable root (unconfigured, or a
+    mount that vanished) must read the same as an empty plan always has —
+    no DB touch, never a mass-tombstone from a blip that looks identical to
+    "nothing here"."""
+    if claude_projects_root().is_dir():
+        return True
+    if codex_memories_root().is_dir():
+        return True
+    return bool(cursor_memory_roots()) or bool(aegis_memory_roots())
+
+
+def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str, Any]:
+    """Mirror every harness-native note into ``topics``.
+
+    ``changed_only=True`` (F1) is the Stop-hook-cheap path: unchanged files
+    (matched against the state file from the last run) cost one ``stat()``
+    and are skipped entirely, and — since that is the whole point — a run
+    that finds nothing changed never even opens a DB connection. The full
+    (``changed_only=False``, what the nightly calls) reconcile also runs the
+    F5 tombstone sweep (``_tombstone_missing_notes``), which needs every
+    live note topic's row and so is not part of the cheap path. Fail-open at
+    the per-file level (one bad note is reported in ``errors`` and does not
+    sink the batch) but lets a connection-level failure (no hub reachable at
+    all) propagate — the caller (`cli.cmd_notes` interactively, `jobs`
+    nightly, the Stop hook, the WatchPaths agent) decides how to surface
+    that, same posture as every other write path in this package.
     """
-    plan = _build_plan()
+    state = _read_state() if changed_only else None
+    plan = _build_plan(changed_only=changed_only, state=state)
     out: dict[str, Any] = {
         "ok": True,
         "dry_run": dry_run,
+        "changed_only": changed_only,
         "claude_projects_scanned": len(_claude_project_dirs(claude_projects_root())),
         "codex_root_found": codex_memories_root().is_dir(),
         "candidates": len(plan),
@@ -254,12 +480,21 @@ def reconcile(*, dry_run: bool = False) -> dict[str, Any]:
         "errors": [],
         "slugs": [p["parsed"]["slug"] for p in plan],
     }
-    if dry_run or not plan:
+    if dry_run:
+        return out
+    run_tombstone = (not changed_only) and _any_memory_root_exists()
+    if not plan and not run_tombstone:
+        if changed_only:
+            _write_state({
+                "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
+                "files": dict((state or {}).get("files", {})),
+            })
         return out
 
     from khipu.db import connect
     from khipu.mirror import _upsert_topic
 
+    new_files_state = dict((state or {}).get("files", {})) if changed_only else {}
     with connect() as conn:
         with conn.cursor() as cur:
             for item in plan:
@@ -272,8 +507,80 @@ def reconcile(*, dry_run: bool = False) -> dict[str, Any]:
                         note=f"harness-native note ({item['harness']})",
                     )
                     out["written"] += 1
+                    if changed_only:
+                        sig = _file_sig(Path(item["path"]))
+                        if sig is not None:
+                            new_files_state[item["path"]] = sig
                 except Exception as exc:  # noqa: BLE001 — one bad note must not sink the batch
                     out["errors"].append({"path": item["path"], "error": f"{type(exc).__name__}: {exc}"})
                     _log(f"upsert failed for {item['path']}: {exc}")
+            if run_tombstone:
+                out["tombstone"] = _tombstone_missing_notes(cur)
+        conn.commit()
+    if changed_only:
+        _write_state({
+            "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
+            "files": new_files_state,
+        })
+    return out
+
+
+def notes_freshness(cur) -> dict[str, Any]:
+    """D4: can `khipu status`/`khipu_status` tell notes are stale? Compares
+    the newest note file's own mtime on disk against the newest
+    ``event_at`` already mirrored into ``note:`` topics, plus when a
+    (full or changed-only) reconcile last ran. ``cur`` is a live hub
+    cursor — the caller (``drift.status_payload``) already holds one."""
+    newest_mtime: float | None = None
+    for path, _harness, _claude_slug in _iter_note_file_candidates():
+        try:
+            m = path.stat().st_mtime
+        except OSError:
+            continue
+        if newest_mtime is None or m > newest_mtime:
+            newest_mtime = m
+    cur.execute(
+        "SELECT MAX(event_at) FROM topics WHERE slug LIKE %s AND deleted_at IS NULL",
+        (NOTE_SLUG_PREFIX + "%",),
+    )
+    row = cur.fetchone()
+    newest_topic_event_at = row[0] if row else None
+    state = _read_state()
+    return {
+        "newest_note_mtime": (
+            datetime.fromtimestamp(newest_mtime, tz=timezone.utc).isoformat()
+            if newest_mtime is not None else None
+        ),
+        "newest_note_topic_event_at": (
+            newest_topic_event_at.isoformat()
+            if hasattr(newest_topic_event_at, "isoformat") else newest_topic_event_at
+        ),
+        "notes_last_reconcile_at": state.get("last_reconcile_at"),
+    }
+
+
+def backfill_event_at() -> dict[str, Any]:
+    """R7, one-time (idempotent): existing ``note:`` topics written before
+    this phase have no ``event_at`` yet. Re-parses every note file on disk
+    and fills in ``event_at`` for its topic row, ONLY where the row's
+    ``event_at`` is still null — safe to re-run any time, and a no-op once
+    every note topic has been reconciled at least once post-migration
+    (ordinary ``reconcile()`` upserts set ``event_at`` going forward)."""
+    from khipu.db import connect
+
+    plan = _build_plan()
+    out: dict[str, Any] = {"ok": True, "candidates": len(plan), "updated": 0}
+    if not plan:
+        return out
+    with connect() as conn:
+        with conn.cursor() as cur:
+            for item in plan:
+                parsed = item["parsed"]
+                cur.execute(
+                    "UPDATE topics SET event_at = %s::timestamptz "
+                    "WHERE slug = %s AND event_at IS NULL",
+                    (parsed.get("event_at"), parsed["slug"]),
+                )
+                out["updated"] += cur.rowcount or 0
         conn.commit()
     return out

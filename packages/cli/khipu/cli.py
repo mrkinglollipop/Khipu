@@ -24,7 +24,7 @@ def _env(*names: str, default: str = "") -> str:
 # was an unconditional NameError on every `khipu jobs install/refresh/
 # uninstall <name>` call with explicit names — a different function's scope
 # does not see a parser-builder's locals. Module level so both see it.
-_JOBS_CHOICES = ("nightly", "monthly", "graph_build")
+_JOBS_CHOICES = ("nightly", "monthly", "graph_build", "notes_watch")
 
 
 def _memory_root_default() -> str | None:
@@ -935,6 +935,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         filters={"kind": kind, "project": project, "since": since, "until": until,
                  "session_id": session_id, "harness": harness},
         result_count=len(payload.get("results") or []), top=payload.get("results") or [],
+        degraded=payload.get("degraded"),
     )
     print(json.dumps(payload, indent=2))
     return 0
@@ -1591,7 +1592,10 @@ def cmd_notes(args: argparse.Namespace) -> int:
         return 2
     from khipu import notes
 
-    report = notes.reconcile(dry_run=bool(getattr(args, "dry_run", False)))
+    report = notes.reconcile(
+        dry_run=bool(getattr(args, "dry_run", False)),
+        changed_only=bool(getattr(args, "changed_only", False)),
+    )
     print(json.dumps(report, indent=2, default=str))
     return 0
 
@@ -3075,10 +3079,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     nt = sub.add_parser("notes", help="Index harness-native per-project notes as topics (memory reliability W4)")
     nt_sub = nt.add_subparsers(dest="notes_cmd", required=True)
-    nt_sub.add_parser(
+    nt_reconcile = nt_sub.add_parser(
         "reconcile",
         help="Mirror ~/.claude/projects/<slug>/memory/*.md and ~/.codex/memories/*.md into topics",
-    ).add_argument("--dry-run", action="store_true", help="Report without writing")
+    )
+    nt_reconcile.add_argument("--dry-run", action="store_true", help="Report without writing")
+    nt_reconcile.add_argument(
+        "--changed-only", action="store_true",
+        help="F1: skip files unchanged since the last changed-only run (Stop hook / WatchPaths agent)",
+    )
     nt.set_defaults(func=cmd_notes)
 
     paths = sub.add_parser(
@@ -3441,14 +3450,14 @@ def build_parser() -> argparse.ArgumentParser:
     jb_sub = jb.add_subparsers(dest="jobs_cmd", required=True)
     jb_sub.add_parser("status", help="Print khipu.jobs.job_status() as JSON")
     jbi = jb_sub.add_parser("install", help="Render + load the named jobs (default: all)")
-    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build}")
+    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch}")
     jbr = jb_sub.add_parser(
         "refresh",
         help="Re-render + reload installed jobs whose plist is stale (default: all installed)",
     )
-    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build}")
+    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch}")
     jbu = jb_sub.add_parser("uninstall", help="Unload + remove the named jobs (default: all)")
-    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build}")
+    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch}")
     jb.set_defaults(func=cmd_jobs)
 
     snap = sub.add_parser(

@@ -467,6 +467,7 @@ def _tool_search(args: dict) -> dict:
         result_count=len(payload.get("results") or []), top=payload.get("results") or [],
         # The gateway host is public: it keeps a hash of the query, never the text.
         redact=_GATEWAY_ACTIVE or os.environ.get(GATEWAY_ACTIVE_ENV) == "1",
+        degraded=payload.get("degraded"),
     )
     return payload
 

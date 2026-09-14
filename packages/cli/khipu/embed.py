@@ -883,6 +883,7 @@ def backfill(
             if dry_run:
                 stats["would_embed"] = len(todo)
                 return stats
+            stats["failed_chunks"] = 0
             for start in range(0, len(todo), BATCH):
                 batch = todo[start : start + BATCH]
                 # todo rows: (kind, ref, idx, chunk, hash, title)
@@ -896,12 +897,28 @@ def backfill(
                     vecs = embed_batch(api, profile=profile, retries=BACKFILL_RETRIES,
                                        delay=BACKFILL_DELAY_S)
                 except RuntimeError as exc:
-                    if "budget exhausted" not in str(exc):
-                        raise
-                    # Batches already committed stay; tomorrow's sweep finishes.
-                    stats["budget_exhausted"] = True
-                    _log(f"stopping: {exc}")
-                    break
+                    msg = str(exc)
+                    if "budget exhausted" in msg:
+                        # Batches already committed stay; tomorrow's sweep finishes.
+                        stats["budget_exhausted"] = True
+                        _log(f"stopping: {exc}")
+                        break
+                    # F3: a missing/expired key (or any other per-batch
+                    # failure — a transient network blip, a malformed chunk)
+                    # used to raise out of the whole sweep, aborting every
+                    # batch still queued behind it even though earlier
+                    # batches had already committed. Isolate it to this
+                    # batch, count it, and keep going — a batch whose only
+                    # problem is "the API is unreachable right now" gets no
+                    # second chance until the next sweep, but it no longer
+                    # takes the rest of tonight's coverage down with it.
+                    stats["failed_chunks"] += len(batch)
+                    if "API key not found" in msg and not stats.get("embed_provider"):
+                        stats["embed_provider"] = "missing key"
+                    _log(f"batch failed ({type(exc).__name__}): {exc}; continuing")
+                    if start + BATCH < len(todo):
+                        time.sleep(BACKFILL_PAUSE_S)
+                    continue
                 _upsert_chunks(
                     cur, profile,
                     [(k, r, i, chunk, h, v)
@@ -1403,9 +1420,13 @@ def _apply_search_filters(
         # forever, and a project a note's frontmatter names was invisible to
         # the caller. Both ride out on the row the same way episode
         # project/harness already do, just below.
+        # R7: event_at (the note/topic's own timestamp) wins over updated_at
+        # (when Khipu last mirrored it) so apply_recency and the "date" a
+        # search hit carries reflect when the content actually changed, not
+        # when it happened to be re-ingested.
         cur.execute(
-            "SELECT slug, COALESCE(updated_at, created_at), status, frontmatter->>'project' "
-            "FROM topics WHERE slug = ANY(%s)",
+            "SELECT slug, COALESCE(event_at, updated_at, created_at), status, "
+            "frontmatter->>'project' FROM topics WHERE slug = ANY(%s)",
             (topic_ids,),
         )
         for slug, ts, status, proj in cur.fetchall():
@@ -2028,4 +2049,57 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                         _log(f"commitment snapshot upsert skipped: {snap.get('error')}")
                 except Exception as exc:  # noqa: BLE001
                     _log(f"commitment snapshot upsert failed: {type(exc).__name__}: {exc}")
+
+            # F2: topics — a note khipu.notes.reconcile just wrote (or any
+            # other topic write) waited for the nightly to become
+            # vector-searchable. Same bound (COMMITMENT_CATCHUP_LIMIT) and
+            # shape as the commitments leg above, called from the Stop hook
+            # right after step 3b's reconcile so a just-reconciled note is
+            # findable by meaning in the same Stop.
+            out["topics_embedded"] = 0
+            out["topics_chunks"] = 0
+            try:
+                cur.execute(
+                    "SELECT t.slug, t.title, t.body FROM topics t WHERE t.deleted_at IS NULL "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM memory_embeddings m"
+                    "  WHERE m.profile = %s AND m.kind = 'topic' AND m.ref = t.slug)"
+                    " ORDER BY t.updated_at DESC NULLS LAST LIMIT %s",
+                    (profile, COMMITMENT_CATCHUP_LIMIT),
+                )
+                topic_rows = cur.fetchall()
+            except Exception as exc:  # noqa: BLE001 — never lets a topics-leg problem break the rest
+                _log(f"topic embed catch-up skipped: {type(exc).__name__}: {exc}")
+                topic_rows = []
+            topic_snapshot_rows: list[dict[str, Any]] = []
+            for slug, title, body in topic_rows:
+                text = topic_text(slug, title, body)
+                if not text:
+                    continue
+                out["topics_embedded"] += 1
+                chunks = chunk_text(text)
+                api = _api_texts(profile, [(title or slug or "", c) for c in chunks])
+                vecs = embed_batch(api, profile=profile)
+                from datetime import datetime, timezone
+
+                built_at = datetime.now(timezone.utc).isoformat()
+                rows = [("topic", slug, i, c, _md5(c), v)
+                        for i, (c, v) in enumerate(zip(chunks, vecs))]
+                _upsert_chunks(cur, profile, rows)
+                conn.commit()
+                out["topics_chunks"] += len(rows)
+                topic_snapshot_rows.extend(
+                    {"profile": profile, "kind": "topic", "ref": slug, "chunk_idx": i,
+                     "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": built_at}
+                    for i, (c, v) in enumerate(zip(chunks, vecs))
+                )
+            if topic_snapshot_rows:
+                try:
+                    from khipu.hub_snapshot import upsert_embeddings
+
+                    snap = upsert_embeddings(topic_snapshot_rows)
+                    if not snap.get("ok"):
+                        _log(f"topic snapshot upsert skipped: {snap.get('error')}")
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"topic snapshot upsert failed: {type(exc).__name__}: {exc}")
     return out

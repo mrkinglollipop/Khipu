@@ -121,6 +121,45 @@ class ZeroResultsTest(unittest.TestCase):
         self.assertEqual(out, [])
 
 
+class DegradedQueryTest(unittest.TestCase):
+    """F4: search degrading to literal used to be a buried `degraded` key
+    on the response — now logged and aggregated."""
+
+    def test_degraded_reason_is_logged(self) -> None:
+        with _TmpDataDir() as data:
+            ql.log_query("q", mode="hybrid", result_count=1, top=[], degraded="no-embedding")
+            entry = json.loads((data / ql.LOG_NAME).read_text(encoding="utf-8").strip())
+        self.assertEqual(entry["degraded"], "no-embedding")
+
+    def test_no_degraded_key_when_search_was_clean(self) -> None:
+        with _TmpDataDir() as data:
+            ql.log_query("q", mode="hybrid", result_count=1, top=[])
+            entry = json.loads((data / ql.LOG_NAME).read_text(encoding="utf-8").strip())
+        self.assertNotIn("degraded", entry)
+
+    def test_degraded_count_only_counts_degraded_recent_entries(self) -> None:
+        with _TmpDataDir():
+            ql.log_query("a", mode="hybrid", result_count=1, top=[], degraded="embed-budget")
+            ql.log_query("b", mode="hybrid", result_count=1, top=[])
+            ql.log_query("c", mode="hybrid", result_count=1, top=[], degraded="no-embedding")
+            self.assertEqual(ql.degraded_count(hours=24), 2)
+
+    def test_degraded_count_excludes_entries_outside_the_window(self) -> None:
+        with _TmpDataDir() as data:
+            path = data / ql.LOG_NAME
+            old = {
+                "ts": "2020-01-01T00:00:00Z", "query": "ancient", "mode": "hybrid",
+                "filters": {}, "result_count": 0, "top": [], "harness": "mcp",
+                "degraded": "no-embedding",
+            }
+            path.write_text(json.dumps(old) + "\n", encoding="utf-8")
+            self.assertEqual(ql.degraded_count(hours=24), 0)
+
+    def test_degraded_count_on_missing_log_is_zero(self) -> None:
+        with _TmpDataDir():
+            self.assertEqual(ql.degraded_count(hours=24), 0)
+
+
 class RotationTest(unittest.TestCase):
     def test_rotates_when_over_max_bytes(self) -> None:
         with _TmpDataDir() as data:
