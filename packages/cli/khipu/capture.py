@@ -361,6 +361,23 @@ def _merge_into_episode(
             pass
         _log(f"merge commitments step failed ({type(exc).__name__}: {exc})")
 
+    # O2: the merged capture's own decision strings belong to the target
+    # episode too, same SAVEPOINT fail-open posture as commitments above.
+    try:
+        cur.execute("SAVEPOINT capture_merge_decisions")
+    except Exception:  # noqa: BLE001 — no savepoint support (fake cur / autocommit)
+        pass
+    try:
+        from khipu import decisions as _decisions
+
+        _decisions.insert_decisions_from_episode(cur, payload, target_id)
+    except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT capture_merge_decisions")
+        except Exception:  # noqa: BLE001
+            pass
+        _log(f"merge decisions step failed ({type(exc).__name__}: {exc})")
+
     # The target's text changed, so its vectors are stale. embed_on_capture
     # finds the row by (ts, md5(summary)) — the identity is target_ts +
     # new_summary now that the UPDATE above changed the summary column, so
@@ -582,6 +599,16 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
                         cur.execute("ROLLBACK TO SAVEPOINT capture_commitments")
                         _log(f"commitments step failed ({type(exc).__name__}: {exc})")
+
+                    # O2: each string in payload['decisions'] becomes a row.
+                    cur.execute("SAVEPOINT capture_decisions")
+                    try:
+                        from khipu import decisions as _decisions
+
+                        _decisions.insert_decisions_from_episode(cur, payload, episode_id)
+                    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+                        cur.execute("ROLLBACK TO SAVEPOINT capture_decisions")
+                        _log(f"decisions step failed ({type(exc).__name__}: {exc})")
 
             memory_root = path_setting("memory_root")
             # In dual mode capture_v2 has not run yet, so topic pages named in the

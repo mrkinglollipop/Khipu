@@ -41,6 +41,12 @@ class FakeCursor:
         "repo_root", "project", "parent_session_id", "transcript_range", "tags",
         "deleted_at", "window_id", "truncated_chars", "verbatim",
     )
+    # Empty by default = "the decisions table (O2, migration 0019) is not
+    # migrated on this fake hub" — khipu.decisions.standing_decisions then
+    # returns [] without issuing its own SELECT, so a test that does not care
+    # about decisions sees the exact same query sequence it always has. A
+    # test that DOES care sets this to a real column tuple.
+    decisions_columns: tuple[str, ...] = ()
 
     def __init__(self, results):
         self._results = list(results)
@@ -51,6 +57,7 @@ class FakeCursor:
 
         _db._TABLE_COLUMNS_CACHE.pop("commitments", None)
         _db._TABLE_COLUMNS_CACHE.pop("episodes", None)
+        _db._TABLE_COLUMNS_CACHE.pop("decisions", None)
 
     def execute(self, sql, params=None):
         if "information_schema.columns" in sql and tuple(params or ()) == ("commitments",):
@@ -58,6 +65,9 @@ class FakeCursor:
             return
         if "information_schema.columns" in sql and tuple(params or ()) == ("episodes",):
             self._current = [(c,) for c in self.episodes_columns]
+            return
+        if "information_schema.columns" in sql and tuple(params or ()) == ("decisions",):
+            self._current = [(c,) for c in self.decisions_columns]
             return
         self.statements.append(" ".join(sql.split()))
         self.params.append(params)

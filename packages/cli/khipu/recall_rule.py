@@ -152,6 +152,10 @@ def session_start_context(cwd: str | None = None) -> str:
 # budget from the plan. Enforced by dropping whole lines from the tail
 # rather than mid-truncating one, so a rendered line is never cut mid-word.
 _SLICE_BUDGET_CHARS = 6000
+# O2: the "Decisions still standing" block gets its own sub-budget so a
+# chatty project's decision list can never crowd out commitments/episodes/
+# topics before the overall _fit_budget even runs.
+_DECISIONS_SUB_BUDGET_CHARS = 700
 
 
 def _current_host_session_id() -> str | None:
@@ -195,6 +199,13 @@ def _render_project_slice(label: str, slice_data: dict) -> str:
             "away with `khipu_owed_update` (or `khipu owed --close ID`) instead of "
             "waiting for the next capture to notice."
         )
+    decisions = slice_data.get("decisions") or []
+    if decisions:
+        d_lines = ["### Decisions still standing (last 14 days)"]
+        for d in decisions[:5]:
+            text = clip_snippet(str(d.get("text") or ""), 160)
+            d_lines.append(f"- decision `{d.get('id')}`: {text}")
+        lines.extend(_fit_budget(d_lines, budget=_DECISIONS_SUB_BUDGET_CHARS))
     episodes = slice_data.get("episodes") or []
     if episodes:
         lines.append("### Recent episodes")

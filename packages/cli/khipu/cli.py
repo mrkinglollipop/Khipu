@@ -1271,6 +1271,55 @@ def cmd_owed(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_decisions(args: argparse.Namespace) -> int:
+    """O2: `khipu decisions list [--project] [--since]`,
+    `khipu decisions supersede OLD NEW`, `khipu decisions backfill [--dry-run|--apply]`."""
+    from khipu.db import connect
+    from khipu import decisions as _decisions
+
+    sub_cmd = getattr(args, "decisions_cmd", None)
+    if sub_cmd == "supersede":
+        old_id, new_id = int(args.old_id), int(args.new_id)
+        with connect() as conn:
+            with conn.cursor() as cur:
+                ok = _decisions.supersede(cur, old_id, new_id)
+            conn.commit()
+        print(json.dumps({"ok": ok, "old_id": old_id, "new_id": new_id}))
+        return 0 if ok else 1
+
+    if sub_cmd == "backfill":
+        apply = bool(getattr(args, "apply", False))
+        with connect() as conn:
+            with conn.cursor() as cur:
+                report = _decisions.backfill_decisions(
+                    cur, apply=apply, limit=getattr(args, "limit", None)
+                )
+            if apply:
+                conn.commit()
+        print(json.dumps(report, indent=2, default=str))
+        return 0 if report.get("ok", True) else 1
+
+    # "list" (default)
+    since_raw = (getattr(args, "since", None) or "").strip()
+    since_dt = None
+    if since_raw:
+        from khipu.search_text import parse_time_filter
+
+        try:
+            since_dt = parse_time_filter(since_raw)
+        except ValueError as exc:
+            print(json.dumps({"ok": False, "error": f"--since: {exc}"}))
+            return 2
+    with connect() as conn:
+        with conn.cursor() as cur:
+            rows = _decisions.list_decisions(
+                cur, project=getattr(args, "project", None), since=since_dt,
+                limit=int(getattr(args, "limit", None) or 50),
+            )
+    print(json.dumps(rows, indent=2, default=str))
+    return 0
+
+
 def _reembed_episode(cur, episode_id: int) -> bool:
     """Replace one episode's vectors from its current row, using the same text
     builder, profile and upsert `embed.embed_on_capture` uses — so a corrected
@@ -2895,6 +2944,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --snooze: a date (2026-09-30) or a window (7d, 2w, 3m, 2 weeks)",
     )
     owed.set_defaults(func=cmd_owed)
+
+    dec = sub.add_parser("decisions", help="Decisions registry: list / supersede / backfill (O2)")
+    dec_sub = dec.add_subparsers(dest="decisions_cmd", required=True)
+    dec_list = dec_sub.add_parser("list", help="List decisions")
+    dec_list.add_argument("--project", default=None)
+    dec_list.add_argument("--since", default=None, help="ISO date or a window (7d, 24h)")
+    dec_list.add_argument("--limit", type=int, default=50)
+    dec_sup = dec_sub.add_parser("supersede", help="Mark OLD decision superseded by NEW")
+    dec_sup.add_argument("old_id", type=int)
+    dec_sup.add_argument("new_id", type=int)
+    dec_bf = dec_sub.add_parser(
+        "backfill", help="Backfill the decisions table from existing episodes.decisions"
+    )
+    dec_bf.add_argument("--dry-run", dest="apply", action="store_false", default=False)
+    dec_bf.add_argument(
+        "--apply", dest="apply", action="store_true",
+        help="Actually write the backfill (idempotent; safe to re-run)",
+    )
+    dec_bf.add_argument("--limit", type=int, default=None)
+    dec.set_defaults(func=cmd_decisions)
 
     ep = sub.add_parser("episode", help="Episode maintenance (memory reliability W5.6)")
     ep_sub = ep.add_subparsers(dest="episode_cmd", required=True)
