@@ -112,6 +112,7 @@ def _green_doctor_patches():
             return_value={"episodes": {"missing": 0}, "topics": {"missing": 0}},
         ),
         mock.patch("khipu.embed.literal_trgm_status", return_value={"ok": True}),
+        mock.patch("khipu.hub_snapshot.prompt_recall_snapshot_status", return_value={"ok": True, "fresh": True}),
         mock.patch("khipu.probe.status", return_value={"ok": True, "reason": None}),
         mock.patch("khipu.drift.recall_quality", return_value={}),
     ]

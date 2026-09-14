@@ -323,6 +323,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         literal_trgm = literal_trgm_status()
     except Exception as e:  # noqa: BLE001
         literal_trgm = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # R1 follow-up: khipu.recall_prompt (the UserPromptSubmit hook) searches
+    # this local replica first and only falls back to the hub when it is
+    # missing or older than 24h — a degrade that is otherwise invisible.
+    # Never red on its own (the fallback IS the documented safe behaviour);
+    # this only surfaces WHY prompt-time recall might be slow right now.
+    try:
+        from khipu.hub_snapshot import prompt_recall_snapshot_status
+
+        prompt_recall_snapshot = prompt_recall_snapshot_status()
+    except Exception as e:  # noqa: BLE001
+        prompt_recall_snapshot = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # W6.1: `khipu doctor --probe` is the ONLY way this command writes anything
     # — it runs a fresh end-to-end capture-then-search probe (khipu.probe) and
     # records the result. Plain `khipu doctor` only reads that last recorded
@@ -376,6 +387,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "index_freshness": index_fresh,
         "embed_coverage": embed_coverage,
         "literal_trgm": literal_trgm,
+        "prompt_recall_snapshot": prompt_recall_snapshot,
         "recall_probe": recall_probe,
         "recall_quality": recall_quality_block,
         "bundle_seal": bundle_seal_block,
@@ -412,6 +424,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             # documented no-op skip (pg_trgm unavailable); false only when
             # the extension exists but an index is actually missing.
             and bool(literal_trgm.get("ok"))
+            and bool(prompt_recall_snapshot.get("ok"))
         ),
         "graph_backup": _graph_backup,
         "graph_backup_ok": bool(_graph_backup.get("ok")),
@@ -429,6 +442,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "recall_probe_ok": bool(recall_probe.get("ok")),
         "bundle_seal_ok": bool(bundle_seal_block.get("ok")),
         "literal_trgm_ok": bool(literal_trgm.get("ok")),
+        "prompt_recall_snapshot_ok": bool(prompt_recall_snapshot.get("ok")),
     }
     print(json.dumps(out, indent=2, default=str))
     return 0 if out["ok"] else 2

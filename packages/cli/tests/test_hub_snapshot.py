@@ -747,3 +747,35 @@ class SnapshotRowMetadataTest(unittest.TestCase):
                 con = hs.open_snapshot()
                 out = hs.snapshot_row_metadata(con, [{"kind": "node", "id": "n1", "score": 0.2}])
         self.assertEqual(out, [{"kind": "node", "id": "n1", "score": 0.2}])
+
+
+class PromptRecallSnapshotStatusTest(unittest.TestCase):
+    """Doctor reason for the phase-1 fixup: a stale/missing local replica
+    silently pushed prompt-time recall onto the slower hub path with no
+    visible sign anywhere. Never red — the fallback is documented, safe
+    behaviour — only the reason has to show up."""
+
+    def test_fresh_snapshot_is_clean(self) -> None:
+        with mock.patch.object(hs, "snapshot_is_fresh", return_value=(True, {"exists": True})):
+            out = hs.prompt_recall_snapshot_status()
+        self.assertEqual(out, {"ok": True, "fresh": True})
+
+    def test_missing_snapshot_carries_the_exact_reason_text(self) -> None:
+        with mock.patch.object(hs, "snapshot_is_fresh", return_value=(False, {"exists": False})):
+            out = hs.prompt_recall_snapshot_status()
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["fresh"])
+        self.assertEqual(
+            out["reason"],
+            "prompt-time recall is running against the hub and may time out; "
+            "run `khipu snapshot refresh`",
+        )
+
+    def test_stale_snapshot_reports_its_age(self) -> None:
+        with mock.patch.object(
+            hs, "snapshot_is_fresh",
+            return_value=(False, {"exists": True, "age_seconds": hs.SNAPSHOT_MAX_AGE_S + 100}),
+        ):
+            out = hs.prompt_recall_snapshot_status()
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["age_seconds"], hs.SNAPSHOT_MAX_AGE_S + 100)

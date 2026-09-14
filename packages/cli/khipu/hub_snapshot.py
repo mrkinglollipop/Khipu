@@ -1617,6 +1617,29 @@ def snapshot_is_fresh(*, max_age_s: int = SNAPSHOT_MAX_AGE_S) -> tuple[bool, dic
     return True, health
 
 
+def prompt_recall_snapshot_status() -> dict[str, Any]:
+    """R1 follow-up (doctor): is the local replica usable for the per-prompt
+    recall lane right now? Never red on its own — khipu.recall_prompt
+    already degrades safely to the hub when this is false — but that
+    degrade is otherwise invisible: every prompt then pays the slower,
+    sometimes-timing-out hub round trip with no sign anywhere that it is
+    happening. This is the sign.
+    """
+    fresh, health = snapshot_is_fresh()
+    if fresh:
+        return {"ok": True, "fresh": True}
+    return {
+        "ok": True,
+        "fresh": False,
+        "reason": (
+            "prompt-time recall is running against the hub and may time "
+            "out; run `khipu snapshot refresh`"
+        ),
+        "exists": bool(health.get("exists")),
+        "age_seconds": health.get("age_seconds"),
+    }
+
+
 def active_snapshot_profile() -> str | None:
     try:
         con = open_snapshot()
