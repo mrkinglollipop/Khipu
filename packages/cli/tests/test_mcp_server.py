@@ -592,3 +592,45 @@ class ToolDispatchNeverKillsTheServerTest(unittest.TestCase):
         self.assertEqual(buf.getvalue(), "", "capture output must never reach stdout")
         # The env override is restored, not leaked into the rest of the process.
         self.assertIsNone(os.environ.get("KHIPU_HUB_FILE_MIRROR"))
+
+
+class StatusPriorWorkTest(unittest.TestCase):
+    """R10: khipu_status's fallback push for a harness with no SessionStart
+    or UserPromptSubmit hook (Aegis, the gateway) — pass `prompt`, get
+    `prior_work` back. No real DB: status_payload and prior_work_for_prompt
+    are both mocked."""
+
+    def _status(self, args):
+        with mock.patch("khipu.drift.status_payload", return_value={"counts": {"episodes": 1}}), \
+                mock.patch("khipu.hub_snapshot.snapshot_freshness", return_value={"ok": True}):
+            return ms._tool_status(args)
+
+    def test_no_prompt_means_no_prior_work_key_at_all(self):
+        out = self._status({})
+        self.assertNotIn("prior_work", out)
+
+    def test_a_topical_prompt_attaches_prior_work(self):
+        with mock.patch(
+            "khipu.recall_prompt.prior_work_for_prompt",
+            return_value={"context": "## Prior work on this topic\n- x", "hits": [], "reason": "ok", "ms": 1.0},
+        ) as m:
+            out = self._status({"prompt": "what did we decide", "cwd": "/repo"})
+        self.assertEqual(out["prior_work"], "## Prior work on this topic\n- x")
+        self.assertEqual(m.call_args.args[0], "what did we decide")
+        self.assertEqual(m.call_args.kwargs["cwd"], "/repo")
+
+    def test_a_gated_prompt_attaches_nothing(self):
+        with mock.patch(
+            "khipu.recall_prompt.prior_work_for_prompt",
+            return_value={"context": "", "hits": [], "reason": "trivial acknowledgment", "ms": 0.0},
+        ):
+            out = self._status({"prompt": "ok"})
+        self.assertNotIn("prior_work", out)
+
+    def test_a_crash_in_the_optional_field_never_breaks_status(self):
+        with mock.patch(
+            "khipu.recall_prompt.prior_work_for_prompt", side_effect=RuntimeError("boom")
+        ):
+            out = self._status({"prompt": "what did we decide"})
+        self.assertEqual(out["counts"]["episodes"], 1)
+        self.assertNotIn("prior_work", out)
