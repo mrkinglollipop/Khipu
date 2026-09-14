@@ -512,12 +512,14 @@ class ApplySearchFiltersHarnessTest(unittest.TestCase):
 
 
 class _CatchupCursor:
-    """Enough of a cursor for embed_recent_missing's commitment pass (fix
-    5c): no episodes missing (isolates the commitments leg), N open
-    commitments with no embedding yet, and a recorder for every INSERT."""
+    """Enough of a cursor for embed_recent_missing's commitment (fix 5c) and
+    topics (F2) passes: no episodes missing (isolates the leg under test),
+    N open commitments / topics with no embedding yet, and a recorder for
+    every INSERT."""
 
-    def __init__(self, commitment_rows):
+    def __init__(self, commitment_rows=(), topic_rows=()):
         self.commitment_rows = commitment_rows
+        self.topic_rows = topic_rows
         self.inserts: list[tuple] = []
         self._result: list[tuple] = []
 
@@ -527,6 +529,8 @@ class _CatchupCursor:
             self._result = []
         elif "FROM commitments c WHERE c.status = 'open'" in s:
             self._result = self.commitment_rows
+        elif "FROM topics t WHERE t.deleted_at IS NULL" in s:
+            self._result = self.topic_rows
         elif s.startswith("INSERT INTO memory_embeddings"):
             self.inserts.append(params)
         else:
@@ -632,6 +636,83 @@ class EmbedRecentMissingCommitmentsTest(unittest.TestCase):
         (rows,), _ = m_snap.call_args
         self.assertTrue(rows)
         self.assertTrue(all(r["kind"] == "commitment" and r["ref"] == "7" for r in rows))
+
+
+class EmbedRecentMissingTopicsTest(unittest.TestCase):
+    """F2: a topic with no vector under the active profile (a note
+    khipu.notes.reconcile just wrote, or any other topic write) is embedded
+    by the bounded Stop-hook catch-up — not left for the nightly."""
+
+    def _run(self, topic_rows):
+        from unittest import mock
+
+        cur = _CatchupCursor(topic_rows=topic_rows)
+        conn = _CatchupConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"), \
+                mock.patch.object(em, "embed_batch",
+                                   side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]):
+            out = em.embed_recent_missing(limit=10)
+        return out, cur
+
+    def test_topics_with_no_vector_get_embedded(self):
+        out, cur = self._run([
+            ("note:one", "One", "body one"),
+            ("note:two", "Two", "body two"),
+        ])
+        self.assertEqual(out["topics_embedded"], 2)
+        refs = {p[2] for p in cur.inserts if p[1] == "topic"}
+        self.assertEqual(refs, {"note:one", "note:two"})
+
+    def test_no_missing_topics_is_a_noop(self):
+        out, cur = self._run([])
+        self.assertEqual(out["topics_embedded"], 0)
+        self.assertEqual(out["topics_chunks"], 0)
+        self.assertEqual([p for p in cur.inserts if p[1] == "topic"], [])
+
+    def test_blank_title_and_body_still_embeds_via_the_slug_fallback(self):
+        # topic_text() falls back to the slug when title/body are empty, so
+        # a topic row (unlike a commitment's bare text) is never itself
+        # "blank" — every topic has a slug.
+        out, _ = self._run([("note:blank", "", "")])
+        self.assertEqual(out["topics_embedded"], 1)
+
+    def test_missing_topics_leg_degrades_to_zero_not_a_raise(self):
+        """A pre-migration or otherwise broken topics query must not sink
+        the rest of the catch-up — same posture as the commitments leg's
+        pre-0009-hub degrade."""
+        from unittest import mock
+
+        class _RaisingCursor(_CatchupCursor):
+            def execute(self, sql, params=None):
+                s = " ".join(sql.split())
+                if "FROM topics t WHERE t.deleted_at IS NULL" in s:
+                    raise RuntimeError("boom")
+                super().execute(sql, params)
+
+        cur = _RaisingCursor()
+        conn = _CatchupConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"):
+            out = em.embed_recent_missing(limit=10)
+        self.assertEqual(out["topics_embedded"], 0)
+
+    def test_snapshot_upsert_is_called_with_topic_kind_rows(self):
+        from unittest import mock
+
+        cur = _CatchupCursor(topic_rows=[("note:three", "Three", "body three")])
+        conn = _CatchupConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"), \
+                mock.patch.object(em, "embed_batch",
+                                   side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]), \
+                mock.patch("khipu.hub_snapshot.upsert_embeddings",
+                           return_value={"ok": True}) as m_snap:
+            em.embed_recent_missing(limit=10)
+        m_snap.assert_called_once()
+        (rows,), _ = m_snap.call_args
+        self.assertTrue(rows)
+        self.assertTrue(all(r["kind"] == "topic" and r["ref"] == "note:three" for r in rows))
 
 
 if __name__ == "__main__":

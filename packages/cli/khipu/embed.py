@@ -2032,4 +2032,57 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                         _log(f"commitment snapshot upsert skipped: {snap.get('error')}")
                 except Exception as exc:  # noqa: BLE001
                     _log(f"commitment snapshot upsert failed: {type(exc).__name__}: {exc}")
+
+            # F2: topics — a note khipu.notes.reconcile just wrote (or any
+            # other topic write) waited for the nightly to become
+            # vector-searchable. Same bound (COMMITMENT_CATCHUP_LIMIT) and
+            # shape as the commitments leg above, called from the Stop hook
+            # right after step 3b's reconcile so a just-reconciled note is
+            # findable by meaning in the same Stop.
+            out["topics_embedded"] = 0
+            out["topics_chunks"] = 0
+            try:
+                cur.execute(
+                    "SELECT t.slug, t.title, t.body FROM topics t WHERE t.deleted_at IS NULL "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM memory_embeddings m"
+                    "  WHERE m.profile = %s AND m.kind = 'topic' AND m.ref = t.slug)"
+                    " ORDER BY t.updated_at DESC NULLS LAST LIMIT %s",
+                    (profile, COMMITMENT_CATCHUP_LIMIT),
+                )
+                topic_rows = cur.fetchall()
+            except Exception as exc:  # noqa: BLE001 — never lets a topics-leg problem break the rest
+                _log(f"topic embed catch-up skipped: {type(exc).__name__}: {exc}")
+                topic_rows = []
+            topic_snapshot_rows: list[dict[str, Any]] = []
+            for slug, title, body in topic_rows:
+                text = topic_text(slug, title, body)
+                if not text:
+                    continue
+                out["topics_embedded"] += 1
+                chunks = chunk_text(text)
+                api = _api_texts(profile, [(title or slug or "", c) for c in chunks])
+                vecs = embed_batch(api, profile=profile)
+                from datetime import datetime, timezone
+
+                built_at = datetime.now(timezone.utc).isoformat()
+                rows = [("topic", slug, i, c, _md5(c), v)
+                        for i, (c, v) in enumerate(zip(chunks, vecs))]
+                _upsert_chunks(cur, profile, rows)
+                conn.commit()
+                out["topics_chunks"] += len(rows)
+                topic_snapshot_rows.extend(
+                    {"profile": profile, "kind": "topic", "ref": slug, "chunk_idx": i,
+                     "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": built_at}
+                    for i, (c, v) in enumerate(zip(chunks, vecs))
+                )
+            if topic_snapshot_rows:
+                try:
+                    from khipu.hub_snapshot import upsert_embeddings
+
+                    snap = upsert_embeddings(topic_snapshot_rows)
+                    if not snap.get("ok"):
+                        _log(f"topic snapshot upsert skipped: {snap.get('error')}")
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"topic snapshot upsert failed: {type(exc).__name__}: {exc}")
     return out
