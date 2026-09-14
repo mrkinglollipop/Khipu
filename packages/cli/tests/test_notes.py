@@ -17,6 +17,26 @@ from unittest import mock
 
 from khipu import notes
 
+# P5: khipu.notes.reconcile calls khipu.organise.after_reconcile at the end
+# of every REAL write, and several classes below (not just ReconcileTest)
+# call reconcile(dry_run=False, ...) directly. Without this, after_reconcile
+# would write this MACHINE's real ~/.config/khipu/state/notes-organise-
+# last.json (and, on a real index change, ~/.config/khipu/index-backups/)
+# full of these tests' temp-dir fixtures on every run — found live,
+# 2026-09-14, while investigating the G1 incident: a class-scoped mock in
+# ReconcileTest alone missed ChangedOnlyReconcileTest and
+# TombstoneMissingNotesTest, which also call reconcile() for real. Module-
+# scoped so nothing added to this file later has to remember it either.
+_organise_patcher = mock.patch("khipu.organise.after_reconcile", return_value={"ok": True, "mocked": True})
+
+
+def setUpModule():
+    _organise_patcher.start()
+
+
+def tearDownModule():
+    _organise_patcher.stop()
+
 
 def _write(path: Path, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -246,20 +266,10 @@ class ReconcileTest(unittest.TestCase):
     """notes.reconcile is append-only and never touches the live hub in a
     test: khipu.db.connect and khipu.topic_graph.persist_topic_graph are
     always mocked here, same posture as WritePgOrchestrationTest in
-    test_capture.py.
-
-    khipu.organise.after_reconcile is also mocked class-wide: reconcile()
-    calls it at the end of every real write (P5), and without this mock it
-    would write this MACHINE's real ~/.config/khipu/state/notes-organise-
-    last.json full of these tests' temp-dir fixtures — polluting the exact
-    evidence file `khipu doctor`'s notes_organise row reads (found live,
-    2026-09-14, while investigating the G1 incident).
+    test_capture.py. khipu.organise.after_reconcile is mocked at MODULE
+    scope (see setUpModule above) — every class in this file that calls
+    reconcile() for real shares that one mock.
     """
-
-    def setUp(self):
-        patcher = mock.patch("khipu.organise.after_reconcile", return_value={"ok": True, "mocked": True})
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def _tree(self, td: str) -> tuple[Path, Path]:
         claude_root = Path(td) / "claude_projects"
