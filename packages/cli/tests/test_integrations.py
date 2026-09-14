@@ -48,8 +48,9 @@ class ClaudeCodePackTest(_TempHomeCase):
         self._seed()
         out = integ.install("claude_code")
         self.assertTrue(out["detected"])
-        # mcp + Stop + PreCompact + SessionEnd + SessionStart recall + UserPromptSubmit recall
-        self.assertEqual(len(out["changes"]), 6)
+        # mcp + Stop + PreCompact + SessionEnd + SubagentStop + SessionStart recall
+        # + UserPromptSubmit recall
+        self.assertEqual(len(out["changes"]), 7)
         s = json.loads((self.home / ".claude" / "settings.json").read_text())
         pc = [h["command"] for e in s["hooks"]["PreCompact"] for h in e["hooks"]]
         self.assertIn("python3 /me/precompact_flush.py", pc)         # legacy untouched
@@ -615,8 +616,8 @@ class CodexPackTest(_TempHomeCase):
             {"hooks": {"PreCompact": [{"hooks": [{"type": "command", "command": "python3 '/me/precompact_flush.py'", "timeout": 45}]}]}}))
         out = integ.install("codex")
         self.assertTrue(out["detected"])
-        # mcp + Stop + PreCompact + SessionEnd + SessionStart + UserPromptSubmit
-        self.assertEqual(len(out["changes"]), 6)
+        # mcp + Stop + PreCompact + SessionEnd + SubagentStop + SessionStart + UserPromptSubmit
+        self.assertEqual(len(out["changes"]), 7)
         t = tomllib.loads((self.home / ".codex" / "config.toml").read_text())
         self.assertEqual(sorted(t["mcp_servers"]), ["khipu", "node_repl"])
         h = json.loads((self.home / ".codex" / "hooks.json").read_text())
