@@ -1381,12 +1381,18 @@ def _apply_search_filters(
                 "harness": harness_col,
             }
     if topic_ids:
+        # R6: status/project were never read by search before this — a
+        # superseded/retired/abandoned page ranked beside its replacement
+        # forever, and a project a note's frontmatter names was invisible to
+        # the caller. Both ride out on the row the same way episode
+        # project/harness already do, just below.
         cur.execute(
-            "SELECT slug, COALESCE(updated_at, created_at) FROM topics WHERE slug = ANY(%s)",
+            "SELECT slug, COALESCE(updated_at, created_at), status, frontmatter->>'project' "
+            "FROM topics WHERE slug = ANY(%s)",
             (topic_ids,),
         )
-        for slug, ts in cur.fetchall():
-            meta[("topic", slug)] = {"ts": ts}
+        for slug, ts, status, proj in cur.fetchall():
+            meta[("topic", slug)] = {"ts": ts, "status": status, "project": proj}
     if node_ids:
         cur.execute("SELECT id, built_at FROM nodes WHERE id = ANY(%s)", (node_ids,))
         for nid, ts in cur.fetchall():
@@ -1430,6 +1436,15 @@ def _apply_search_filters(
             row_harness = m.get("harness") or (m.get("session_id") or "").split(":", 1)[0]
             if row_harness:
                 r["harness"] = row_harness
+        elif k == "topic":
+            # R6: every topic hit carries status (defaults to 'active' at
+            # the schema level, so this is never missing for a real row);
+            # project only when the topic's frontmatter names one (most
+            # topics have none — graphify pages, non-note captures).
+            r["status"] = m.get("status") or "active"
+            proj = (m.get("project") or "").strip()
+            if proj:
+                r["project"] = proj
         r["_sort_ts"] = ts
         out.append(r)
     out.sort(key=lambda r: (-(r.get("score") or 0.0), _neg_ts_sort_key(r.get("_sort_ts"))))
@@ -1479,6 +1494,7 @@ def hybrid_search(
     until: str | None = None,
     session_id: str | None = None,
     harness: str | None = None,
+    project_boost: str | None = None,
 ) -> dict[str, Any]:
     """Default retrieval engine (W2.1-W2.3): fused hybrid, or single-mode.
 
@@ -1508,6 +1524,12 @@ def hybrid_search(
     SQL of every candidate query (``_SearchFilters``) so the oversample pool is
     drawn from rows that already satisfy them, and re-checked post-fusion by
     ``_apply_search_filters`` (which also does the recency tiebreak).
+
+    ``project_boost`` (R5) is a SEPARATE, ranking-only nudge — never a hard
+    filter like ``project=`` above. A hit from a different project still
+    shows; it just loses a tie-break it would otherwise win against an
+    equally-relevant hit whose project matches. Applied together with the
+    topic status de-rank (R6) via ``recency.apply_project_and_status``.
     Nodes are excluded from hybrid/literal results by default (W2.2) — see
     ``cli._id_shaped`` / ``cli._literal_candidates``.
 
@@ -1590,9 +1612,19 @@ def hybrid_search(
 
             _t = time.monotonic()
             lists: list[list[dict[str, Any]]] = []
+            # R4: the query's own token count matters for confidence below
+            # even in modes/branches with no cosine leg at all.
+            tokens = search_tokens(query)
             if cosine_rows:
+                # Raw cosine (R4): fuse_ranked_lists overwrites `score` with
+                # the fused RRF value below, which is rank-derived and not a
+                # usable confidence signal on its own (a gibberish query and
+                # a real hit can land in the same band). Stash the real
+                # similarity now, on the same objects the fused output is
+                # copied from, so it survives fusion/filtering/enrichment.
+                for r in cosine_rows:
+                    r["cosine"] = r.get("score")
                 lists.append(list(cosine_rows))
-                tokens = search_tokens(query)
                 if tokens:
                     union: dict[tuple[str, str], dict[str, Any]] = {
                         (r["kind"], str(r["id"])): r for r in cosine_rows
@@ -1610,6 +1642,12 @@ def hybrid_search(
 
             for row_list in lists:
                 for r in row_list:
+                    # R4: how many query tokens this row ACTUALLY names,
+                    # over its full embedded/ILIKE window — not just its rank
+                    # among other rows. 0 for a fused-in row that never
+                    # matched a token literally (pure cosine neighbor).
+                    if tokens:
+                        r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)
                     r.pop("rank_text", None)
             timing["lexical_ms"] = round((time.monotonic() - _t) * 1000, 1)
             if not lists:
@@ -1617,7 +1655,7 @@ def hybrid_search(
 
                 timing["total_ms"] = round((time.monotonic() - _started) * 1000, 1)
                 out: dict[str, Any] = {"query": query, "mode": mode, "results": [],
-                                       "timing": timing,
+                                       "timing": timing, "confidence": "none",
                                        "ranking": {"recency_half_life_days": HALF_LIFE_DAYS}}
                 if degraded:
                     out["degraded"] = degraded
@@ -1628,11 +1666,14 @@ def hybrid_search(
                 cur, fused, project=project, since=since, until=until,
                 session_id=session_id, harness=harness,
             )
-            # Recency rides on the fused score after the filter pass has
-            # attached `ts` to each row; the trim to `limit` in `_fair_fill`
-            # below must see the decayed order, not the pre-decay one.
-            from khipu.recency import apply_recency
+            # Project boost + status de-rank (R5/R6) ride on the fused score
+            # BEFORE recency, same as recency itself: both are score nudges
+            # that must see the raw fused order, and both re-sort by the
+            # score they leave behind.
+            from khipu.recency import apply_project_and_status, apply_recency
 
+            if project_boost:
+                fused = apply_project_and_status(fused, project=project_boost)
             fused = apply_recency(fused)
             fused = _fair_fill(fused, limit)
             timing["fusion_ms"] = round((time.monotonic() - _t) * 1000, 1)
@@ -1644,10 +1685,48 @@ def hybrid_search(
 
     timing["total_ms"] = round((time.monotonic() - _started) * 1000, 1)
     out = {"query": query, "mode": mode, "results": fused, "timing": timing,
+           "confidence": search_confidence(fused, token_count=len(tokens)),
            "ranking": {"recency_half_life_days": HALF_LIFE_DAYS}}
     if degraded:
         out["degraded"] = degraded
     return out
+
+
+# R4: gibberish and a real hit used to land in the same 0.13-0.20 FUSED-score
+# band (live evidence, docs/plans/2026-09-14-memory-that-works-like-magic.md
+# finding R4) because that score is rank-derived, not a similarity. These
+# thresholds read the RAW cosine leg instead — and raw cosine on this hub's
+# active embedding profile has a surprisingly high baseline (measured live,
+# 2026-09-14: unrelated/gibberish queries still land ~0.65-0.73 raw cosine
+# against the corpus; a real, on-topic match with full literal coverage
+# measured ~0.78-0.81). So COSINE_STRONG/WEAK sit above that baseline and are
+# a SECONDARY signal to full lexical coverage (below), which is exact rather
+# than a tuned float. Re-tune with `khipu recall eval` if the embedding
+# profile ever changes — this baseline is a property of the active model,
+# not a universal constant.
+CONFIDENCE_COSINE_STRONG = 0.80
+CONFIDENCE_COSINE_WEAK = 0.75
+
+
+def search_confidence(rows: list[dict[str, Any]], *, token_count: int) -> str:
+    """"none" | "weak" | "strong" for a search's TOP hit (R4).
+
+    Full literal coverage (every query token found verbatim in the top hit)
+    or a high raw cosine is "strong". Partial coverage, a single literal
+    hit, or a middling cosine is "weak". Nothing (no rows, or a hit with
+    neither a literal token nor a usable cosine) is "none" — the thing a
+    fused RRF score alone could never say.
+    """
+    if not rows:
+        return "none"
+    top_cosine = max((r.get("cosine") for r in rows if r.get("cosine") is not None), default=None)
+    top_lexical = max((int(r.get("lexical_hits") or 0) for r in rows), default=0)
+    full_coverage = token_count > 0 and top_lexical >= token_count
+    if full_coverage or (top_cosine is not None and top_cosine >= CONFIDENCE_COSINE_STRONG):
+        return "strong"
+    if top_lexical >= 1 or (top_cosine is not None and top_cosine >= CONFIDENCE_COSINE_WEAK):
+        return "weak"
+    return "none"
 
 
 def coverage(*, profile: str | None = None) -> dict[str, Any]:

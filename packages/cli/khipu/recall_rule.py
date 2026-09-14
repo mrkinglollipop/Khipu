@@ -194,7 +194,13 @@ def _render_project_slice(label: str, slice_data: dict) -> str:
             age = t.get("age_days")
             age_txt = f"{age}d old" if age is not None else "age unknown"
             title = t.get("title") or t.get("slug") or ""
-            lines.append(f"- topic `{t.get('slug')}` ({age_txt}): {title}")
+            status = str(t.get("status") or "").strip().lower()
+            # R6: a de-ranked status is exactly the thing that made the 09-14
+            # incident possible — a superseded page sitting in the slice with
+            # no visible sign it was superseded. Label it here, not just in
+            # search results.
+            status_txt = f" · status {status}" if status and status != "active" else ""
+            lines.append(f"- topic `{t.get('slug')}` ({age_txt}{status_txt}): {title}")
     lines.append(
         "Loaded for this session without a search. Call `khipu_get` for a "
         "full row; `khipu_search` for more."

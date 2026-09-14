@@ -175,7 +175,7 @@ class ProjectSliceTest(unittest.TestCase):
         episode_row = (
             42, dt.datetime(2026, 9, 3, 10, 0), "shipped the fix", ["real-topic"],
         )
-        topic_row = ("real-topic", "Real Topic", dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc))
+        topic_row = ("real-topic", "Real Topic", dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc), "active")
         # _episode_schema_flags is mocked at the function level below (its
         # own unit tests in test_embed.py cover the information_schema
         # query), so the fake cursor sees four real queries here: commitments,
@@ -207,13 +207,14 @@ class ProjectSliceTest(unittest.TestCase):
         # Relative to now: a fixed date made age_days drift by one every day
         # the suite ran after it (audit 2026-09-04, environmental failure).
         note_row = ("note:some-note", "Some Note",
-                    dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2, hours=1))
+                    dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2, hours=1), "active")
         results = [[], [episode_row], [note_row]]
         with mock.patch("khipu.embed._episode_schema_flags", return_value={
             "project": True, "deleted_at": True,
         }):
             out, cur = self._run(results, project="acme/widget")
-        self.assertEqual(out["topics"], [{"slug": "note:some-note", "title": "Some Note", "age_days": 2}])
+        self.assertEqual(out["topics"], [{"slug": "note:some-note", "title": "Some Note", "age_days": 2,
+                                           "status": "active"}])
         notes_call = cur.statements[-1]
         self.assertIn("slug LIKE 'note:%%'", notes_call)
         self.assertIn("frontmatter->>'project' = %s", notes_call)
@@ -223,7 +224,8 @@ class ProjectSliceTest(unittest.TestCase):
         episode_rows_topics = ["t1", "t2", "t3"]
         episode_row = (42, dt.datetime(2026, 9, 3, 10, 0), "shipped the fix", episode_rows_topics)
         topic_rows = [
-            (f"t{i}", f"Topic {i}", dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)) for i in (1, 2, 3)
+            (f"t{i}", f"Topic {i}", dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc), "active")
+            for i in (1, 2, 3)
         ]
         results = [[], [episode_row], topic_rows]
         with mock.patch("khipu.embed._episode_schema_flags", return_value={
@@ -326,7 +328,7 @@ class TopicSlugOverFetchTest(unittest.TestCase):
             ["tag-a", "tag-b", "tag-c", "real-topic"],
         )
         topic_row = ("real-topic", "Real Topic",
-                     dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc))
+                     dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc), "active")
         results = [[], [episode_row], [topic_row], []]
         with mock.patch("khipu.embed._episode_schema_flags", return_value={
             "project": True, "deleted_at": True,
@@ -343,7 +345,7 @@ class TopicSlugOverFetchTest(unittest.TestCase):
             ["t1", "t2", "t3", "t4", "t5"],
         )
         when = dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)
-        rows = [(f"t{i}", f"T{i}", when) for i in range(1, 6)]
+        rows = [(f"t{i}", f"T{i}", when, "active") for i in range(1, 6)]
         results = [[], [episode_row], rows]
         with mock.patch("khipu.embed._episode_schema_flags", return_value={
             "project": True, "deleted_at": True,

@@ -196,7 +196,6 @@ def _search_hits(prompt: str, *, cwd: str | None, limit: int = TOP_N) -> list[di
     yields no hits rather than falling back to something unrelated.
     """
     from khipu.embed import hybrid_search
-    from khipu.recency import apply_project_and_status
 
     project = None
     if cwd:
@@ -206,11 +205,8 @@ def _search_hits(prompt: str, *, cwd: str | None, limit: int = TOP_N) -> list[di
             project = resolve_repo_root(cwd).get("project")
         except Exception:  # noqa: BLE001 — a git failure must not sink recall
             project = None
-    payload = hybrid_search(prompt, limit=_SEARCH_LIMIT, mode="semantic")
-    rows = payload.get("results") or []
-    if project:
-        rows = apply_project_and_status(rows, project=project)
-    rows = _apply_score_floor(rows)
+    payload = hybrid_search(prompt, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project)
+    rows = _apply_score_floor(payload.get("results") or [])
     return rows[:limit]
 
 
