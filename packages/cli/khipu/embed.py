@@ -27,6 +27,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -108,7 +109,11 @@ def _vec_literal(vec: list[float]) -> str:
     return "[" + ",".join(f"{x:.7f}" for x in vec) + "]"
 
 
-def chunk_text(text: str) -> list[str]:
+def _window(text: str) -> list[str]:
+    """Fixed CHUNK_CHARS windows with CHUNK_OVERLAP, over one already-scoped
+    span of text (a whole document, or — P5 G4 — one section of one). This is
+    exactly the old flat ``chunk_text`` body, extracted so section-aware
+    chunking can reuse it per section instead of duplicating it."""
     text = (text or "").strip()
     if not text:
         return []
@@ -123,6 +128,118 @@ def chunk_text(text: str) -> list[str]:
             break
         start = end - CHUNK_OVERLAP
     return out
+
+
+_SECTION_HEADING_RE = re.compile(r"(?m)^## [^\n]*$")
+# Chunk-idx layout for chunk_text_indexed (P5 G4): idx = bucket * SECTION_LOCAL_SPACE
+# + local_i. INTEGER column (0004_embedding_profiles.sql), max ~2.1B — this
+# layout tops out at SECTION_HASH_SPACE * SECTION_LOCAL_SPACE, comfortably under
+# that ceiling, and a section holding more than SECTION_LOCAL_SPACE 6,000-char
+# windows (a single ~6MB section) would need to before local_i clamps and two
+# chunks in that one section could collide — recoverable (a spurious re-embed
+# of one chunk next sweep), never silent data loss.
+SECTION_HASH_SPACE = 100_000
+SECTION_LOCAL_SPACE = 1_000
+
+
+def _slugify_anchor(heading: str) -> str:
+    from khipu.topic_graph import topic_slug_from_label
+
+    return topic_slug_from_label(heading)
+
+
+def _split_sections(text: str) -> list[tuple[str, str]]:
+    """Split ``text`` on top-level ``## `` markdown headings (P5 G4).
+
+    Each returned ``(anchor, section_text)`` pair spans from one heading
+    (kept in ``section_text``) up to the next — so editing (e.g. prepending
+    to) one section leaves every OTHER section's text byte-for-byte
+    identical, which is what lets ``chunk_text_indexed`` give unrelated
+    sections the same idx/hash run after run. A doc with no ``## `` heading
+    at all returns exactly one section, anchor ``""``, covering the whole
+    (stripped) text — this is what makes ``chunk_text`` behave exactly like
+    the old flat windowing for anything that is not a sectioned note/ledger
+    (episodes, short topics, plain prose).
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return [("", "")]
+    matches = list(_SECTION_HEADING_RE.finditer(stripped))
+    if not matches:
+        return [("", stripped)]
+    sections: list[tuple[str, str]] = []
+    if matches[0].start() > 0:
+        sections.append(("", stripped[: matches[0].start()]))
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(stripped)
+        heading = stripped[m.start() : m.end()][3:].strip()
+        anchor = _slugify_anchor(heading) or f"section-{i}"
+        sections.append((anchor, stripped[start:end]))
+    return sections
+
+
+def chunk_text(text: str) -> list[str]:
+    """Flat windowed chunks, section order preserved (P5 G4): splits on
+    top-level ``## `` headings first, then windows within each section. A
+    document with no ``## `` heading is one section covering the whole text,
+    so this returns byte-identical output to the pre-P5 flat windowing for
+    episodes, commitments, media captions, and any unsectioned topic body —
+    only a sectioned note/ledger's chunk *boundaries* can differ, and even
+    then only at a section edge that used to fall mid-window.
+    """
+    out: list[str] = []
+    for _anchor, section in _split_sections(text):
+        out.extend(_window(section))
+    return out
+
+
+def chunk_text_indexed(text: str) -> list[tuple[int, str]]:
+    """(stable_idx, chunk) pairs for topics/notes (P5 G4): ``idx`` is derived
+    from a hash of the OWNING SECTION's own heading text plus the chunk's
+    position within that section — never a running count across the whole
+    document. Editing one section (prepending a new dated entry to a running
+    ledger, say) changes only that section's chunk rows; every other
+    section's idx — and therefore its content_hash comparison in
+    ``backfill``'s unchanged-skip — is untouched, so a prepend re-embeds that
+    one section's chunks instead of renumbering (and re-embedding) the whole
+    document. ``chunk_text(text) == [c for _, c in chunk_text_indexed(text)]``
+    always holds; only the index differs from a plain ``enumerate``.
+    """
+    sections = _split_sections(text)
+    if len(sections) <= 1:
+        # No '## ' heading anywhere: this is the vast majority of topics
+        # (plain prose, short captures) and it is byte-for-byte the old
+        # flat scheme — plain 0..N — so migrating to section-aware chunking
+        # does not, by itself, mark every existing topic's vectors stale.
+        # Only a document that actually HAS 2+ sections gets hash-bucketed
+        # indices below.
+        body = sections[0][1] if sections else text
+        return list(enumerate(_window(body)))
+    out: list[tuple[int, str]] = []
+    for anchor, section in sections:
+        bucket = _section_bucket(anchor)
+        for local_i, chunk in enumerate(_window(section)):
+            if local_i >= SECTION_LOCAL_SPACE:
+                local_i = SECTION_LOCAL_SPACE - 1
+            out.append((bucket * SECTION_LOCAL_SPACE + local_i, chunk))
+    return out
+
+
+def _section_bucket(anchor: str) -> int:
+    digest = hashlib.sha256(anchor.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % SECTION_HASH_SPACE
+
+
+def _chunks_for(kind: str, text: str) -> list[tuple[int, str]]:
+    """P5 G4: topics (harness-native notes included — they mirror in as
+    ``kind='topic'``) use section-stable indices so editing one section never
+    renumbers (and so never re-embeds) any other section's chunks. Every
+    other kind (episode, commitment, media) keeps the old flat 0..N
+    enumeration — nothing about their chunking changes."""
+    if kind == "topic":
+        return chunk_text_indexed(text)
+    return list(enumerate(chunk_text(text)))
 
 
 def prefix_document(text: str, *, title: str = "") -> str:
@@ -867,9 +984,17 @@ def backfill(
             have = _existing_hashes(cur, profile)
             # (kind, ref, idx, unprefixed_chunk, hash, title)
             todo: list[tuple[str, str, int, str, str, str]] = []
+            # P5 G4: every topic's *current* valid idx set, so a section that
+            # shrank (or a whole section that was deleted) has its now-stale
+            # chunk rows pruned below instead of lingering forever as orphan
+            # vectors under an idx nothing produces any more.
+            topic_valid_idx: dict[str, set[int]] = {}
             for k, ref, text, title in _iter_sources(cur, kind=kind):
                 stats["scanned"] += 1
-                for i, chunk in enumerate(chunk_text(text)):
+                chunks = _chunks_for(k, text)
+                if k == "topic":
+                    topic_valid_idx[ref] = {i for i, _ in chunks}
+                for i, chunk in chunks:
                     stats["chunks"] += 1
                     h = _md5(chunk)
                     if have.get((k, ref, i)) == h:
@@ -880,6 +1005,17 @@ def backfill(
                     todo = todo[:limit]
                     break
             _log(f"profile={profile} to_embed={len(todo)} unchanged={stats['skipped_unchanged']}")
+            if not dry_run and topic_valid_idx:
+                stats["topic_chunks_pruned"] = 0
+                for ref, valid in topic_valid_idx.items():
+                    cur.execute(
+                        "DELETE FROM memory_embeddings WHERE profile = %s AND kind = 'topic' "
+                        "AND ref = %s AND NOT (chunk_idx = ANY(%s))",
+                        (profile, ref, sorted(valid) or [-1]),
+                    )
+                    stats["topic_chunks_pruned"] += cur.rowcount or 0
+                if stats["topic_chunks_pruned"]:
+                    conn.commit()
             if dry_run:
                 stats["would_embed"] = len(todo)
                 return stats
@@ -1424,13 +1560,22 @@ def _apply_search_filters(
         # (when Khipu last mirrored it) so apply_recency and the "date" a
         # search hit carries reflect when the content actually changed, not
         # when it happened to be re-ingested.
+        # P5 R6/G5: `type` (feedback/user/project/reference, set by
+        # khipu.notes for harness-native notes) rides out the same way so
+        # recency.apply_project_and_status can boost feedback/user notes for
+        # the current project; `superseded_by` (0023_organisation.sql) lets a
+        # hit on a superseded page point straight at its replacement.
         cur.execute(
             "SELECT slug, COALESCE(event_at, updated_at, created_at), status, "
-            "frontmatter->>'project' FROM topics WHERE slug = ANY(%s)",
+            "frontmatter->>'project', frontmatter->>'type', superseded_by "
+            "FROM topics WHERE slug = ANY(%s)",
             (topic_ids,),
         )
-        for slug, ts, status, proj in cur.fetchall():
-            meta[("topic", slug)] = {"ts": ts, "status": status, "project": proj}
+        for slug, ts, status, proj, note_type, superseded_by in cur.fetchall():
+            meta[("topic", slug)] = {
+                "ts": ts, "status": status, "project": proj,
+                "type": note_type, "superseded_by": superseded_by,
+            }
     if node_ids:
         cur.execute("SELECT id, built_at FROM nodes WHERE id = ANY(%s)", (node_ids,))
         for nid, ts in cur.fetchall():
@@ -1483,6 +1628,15 @@ def _apply_search_filters(
             proj = (m.get("project") or "").strip()
             if proj:
                 r["project"] = proj
+            # P5 G5: note type (feedback/user/project/reference) for ranking.
+            note_type = (m.get("type") or "").strip()
+            if note_type:
+                r["type"] = note_type
+            # P5 R6: a superseded page names its replacement so a reader (or
+            # the caller rendering the row) never has to guess.
+            superseded_by = (m.get("superseded_by") or "").strip()
+            if superseded_by:
+                r["superseded_by"] = superseded_by
         r["_sort_ts"] = ts
         out.append(r)
     out.sort(key=lambda r: (-(r.get("score") or 0.0), _neg_ts_sort_key(r.get("_sort_ts"))))
@@ -2077,21 +2231,26 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 if not text:
                     continue
                 out["topics_embedded"] += 1
-                chunks = chunk_text(text)
+                # P5 G4: section-stable idx, same scheme backfill() uses for
+                # topics — keeps this leg's rows from looking "unchanged
+                # under a different idx" (and so getting re-embedded again)
+                # the very next nightly sweep.
+                indexed_chunks = chunk_text_indexed(text)
+                chunks = [c for _i, c in indexed_chunks]
                 api = _api_texts(profile, [(title or slug or "", c) for c in chunks])
                 vecs = embed_batch(api, profile=profile)
                 from datetime import datetime, timezone
 
                 built_at = datetime.now(timezone.utc).isoformat()
                 rows = [("topic", slug, i, c, _md5(c), v)
-                        for i, (c, v) in enumerate(zip(chunks, vecs))]
+                        for (i, c), v in zip(indexed_chunks, vecs)]
                 _upsert_chunks(cur, profile, rows)
                 conn.commit()
                 out["topics_chunks"] += len(rows)
                 topic_snapshot_rows.extend(
                     {"profile": profile, "kind": "topic", "ref": slug, "chunk_idx": i,
                      "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": built_at}
-                    for i, (c, v) in enumerate(zip(chunks, vecs))
+                    for (i, c), v in zip(indexed_chunks, vecs)
                 )
             if topic_snapshot_rows:
                 try:
