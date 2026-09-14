@@ -96,6 +96,11 @@ LOG_DIR_CONFIG = DEFAULT_DIR / "logs"
 PLIST_NIGHTLY = "com.matt.khipu-nightly"
 PLIST_MONTHLY = "com.matt.khipu-monthly"
 PLIST_GRAPH = "com.matt.khipu-graph"
+# F1: the fourth LaunchAgent — WatchPaths on the memory dirs the notes
+# scanner knows, debounced (ThrottleInterval) rather than calendar-scheduled,
+# so a note edit is reconciled within the throttle window instead of waiting
+# for the Stop hook of a session that may not exist right now.
+PLIST_NOTES_WATCH = "com.khipu.notes-watch"
 
 LEGACY_PLIST_NIGHTLY = "com.matt.conversation-memory-nightly"
 LEGACY_PLIST_GRAPH = "com.matt.graphify-nightly"
@@ -117,6 +122,11 @@ _JOB_SPECS: dict[str, dict[str, str]] = {
         "plist": PLIST_GRAPH,
         "log_stem": "khipu-graph",
         "schedule": "daily 02:17",
+    },
+    "notes_watch": {
+        "plist": PLIST_NOTES_WATCH,
+        "log_stem": "khipu-notes-watch",
+        "schedule": "WatchPaths, throttle 30s",
     },
 }
 
@@ -509,6 +519,7 @@ def job_status() -> dict[str, Any]:
         "nightly": _job_entry("nightly"),
         "monthly": _job_entry("monthly"),
         "graph_build": _job_entry("graph_build"),
+        "notes_watch": _job_entry("notes_watch"),
         "embed_media_backfill": _on_demand_job_entry("embed_media_backfill"),
     }
 

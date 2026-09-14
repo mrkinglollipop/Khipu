@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template — render per machine before install (see Task 6 launchd generator). -->
+<!-- F1: debounced notes reconcile. WatchPaths fires when any listed memory
+     dir's own contents change (a note added/edited/removed directly inside
+     it); ThrottleInterval coalesces a burst of edits into one run every 30s
+     instead of one launch per write. Runs changed_only=True, same as the
+     Stop hook's step 3b — cheap even when nothing else changed. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.khipu.notes-watch</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{KHIPU_PYTHON}}</string>
+		<string>-m</string>
+		<string>khipu</string>
+		<string>notes</string>
+		<string>reconcile</string>
+		<string>--changed-only</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>KHIPU_ROOT</key>
+		<string>{{KHIPU_ROOT}}</string>
+		<key>PYTHONPATH</key>
+		<string>{{PYTHONPATH}}</string>
+		<key>PYTHONPYCACHEPREFIX</key>
+		<string>{{PYTHONPYCACHEPREFIX}}</string>{{EXTRA_ENV}}
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>{{WORKING_DIRECTORY}}</string>
+	<key>WatchPaths</key>
+	<array>{{WATCH_PATHS}}
+	</array>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>StandardOutPath</key>
+	<string>{{STDOUT_LOG}}</string>
+	<key>StandardErrorPath</key>
+	<string>{{STDERR_LOG}}</string>
+	<key>RunAtLoad</key>
+	<false/>
+</dict>
+</plist>
