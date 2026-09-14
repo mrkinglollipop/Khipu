@@ -35,7 +35,7 @@ def test_refresh_reports_all_missing_when_nothing_installed():
             assert out["ok"] is True
             assert out["refreshed"] == []
             assert sorted(out["missing"]) == sorted(
-                ["nightly", "monthly", "graph_build", "notes_watch"]
+                ["nightly", "monthly", "graph_build", "notes_watch", "queue_drain"]
             )
         finally:
             for p in patches:
@@ -137,7 +137,7 @@ def test_ensure_installs_missing_refreshes_stale_and_leaves_external_alone(monke
             p.start()
         try:
             # nightly: maintainer-managed; monthly: stale app-rendered;
-            # graph_build/notes_watch: missing.
+            # graph_build/notes_watch/queue_drain: missing.
             launchd_gen._plist_path(launchd_gen._LABELS["nightly"]).write_bytes(
                 _plist_bytes("/usr/local/bin/python3.11"))
             launchd_gen._plist_path(launchd_gen._LABELS["monthly"]).write_bytes(
@@ -146,11 +146,11 @@ def test_ensure_installs_missing_refreshes_stale_and_leaves_external_alone(monke
             assert out["ok"] is True
             assert out["external"] == ["nightly"]
             assert out["refreshed"] == ["monthly"]
-            assert sorted(out["installed"]) == ["graph_build", "notes_watch"]
+            assert sorted(out["installed"]) == ["graph_build", "notes_watch", "queue_drain"]
             assert launchd_gen._plist_path(launchd_gen._LABELS["nightly"]).read_bytes() == _plist_bytes("/usr/local/bin/python3.11")
             again = launchd_gen.ensure_scheduled_jobs()
             assert again["installed"] == [] and again["refreshed"] == []
-            assert sorted(again["current"]) == ["graph_build", "monthly", "notes_watch"]
+            assert sorted(again["current"]) == ["graph_build", "monthly", "notes_watch", "queue_drain"]
         finally:
             for p in patches:
                 p.stop()

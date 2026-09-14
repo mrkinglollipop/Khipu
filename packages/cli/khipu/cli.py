@@ -24,7 +24,7 @@ def _env(*names: str, default: str = "") -> str:
 # was an unconditional NameError on every `khipu jobs install/refresh/
 # uninstall <name>` call with explicit names — a different function's scope
 # does not see a parser-builder's locals. Module level so both see it.
-_JOBS_CHOICES = ("nightly", "monthly", "graph_build", "notes_watch")
+_JOBS_CHOICES = ("nightly", "monthly", "graph_build", "notes_watch", "queue_drain")
 
 
 def _memory_root_default() -> str | None:
@@ -3630,14 +3630,14 @@ def build_parser() -> argparse.ArgumentParser:
     jb_sub = jb.add_subparsers(dest="jobs_cmd", required=True)
     jb_sub.add_parser("status", help="Print khipu.jobs.job_status() as JSON")
     jbi = jb_sub.add_parser("install", help="Render + load the named jobs (default: all)")
-    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch}")
+    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain}")
     jbr = jb_sub.add_parser(
         "refresh",
         help="Re-render + reload installed jobs whose plist is stale (default: all installed)",
     )
-    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch}")
+    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain}")
     jbu = jb_sub.add_parser("uninstall", help="Unload + remove the named jobs (default: all)")
-    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch}")
+    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain}")
     jb.set_defaults(func=cmd_jobs)
 
     snap = sub.add_parser(

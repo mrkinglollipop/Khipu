@@ -104,6 +104,12 @@ PLIST_GRAPH = "com.matt.khipu-graph"
 # so a note edit is reconciled within the throttle window instead of waiting
 # for the Stop hook of a session that may not exist right now.
 PLIST_NOTES_WATCH = "com.khipu.notes-watch"
+# K10: the Aegis capture queue had no drainer of its own — it waited on
+# another harness's Stop hook or the nightly to happen to run `sessions
+# drain`. Calendar-interval (every 5 min) rather than WatchPaths: there is
+# no single directory whose mtime reliably means "a job landed" across every
+# harness's queue file naming.
+PLIST_QUEUE_DRAIN = "com.khipu.queue-drain"
 
 LEGACY_PLIST_NIGHTLY = "com.matt.conversation-memory-nightly"
 LEGACY_PLIST_GRAPH = "com.matt.graphify-nightly"
@@ -130,6 +136,11 @@ _JOB_SPECS: dict[str, dict[str, str]] = {
         "plist": PLIST_NOTES_WATCH,
         "log_stem": "khipu-notes-watch",
         "schedule": "WatchPaths, throttle 30s",
+    },
+    "queue_drain": {
+        "plist": PLIST_QUEUE_DRAIN,
+        "log_stem": "khipu-queue-drain",
+        "schedule": "every 5 min",
     },
 }
 
@@ -677,6 +688,7 @@ def job_status() -> dict[str, Any]:
         "monthly": _job_entry("monthly"),
         "graph_build": _job_entry("graph_build"),
         "notes_watch": _job_entry("notes_watch"),
+        "queue_drain": _job_entry("queue_drain"),
         "embed_media_backfill": _on_demand_job_entry("embed_media_backfill"),
     }
 
