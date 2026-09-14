@@ -204,6 +204,19 @@ class TopicHitsTest(unittest.TestCase):
 
 
 class RewriteIndexTest(unittest.TestCase):
+    """khipu.paths.ensure_data_dir is mocked class-wide: a real (non no-op)
+    rewrite here calls organise._backup_index, and without this mock it
+    would write this MACHINE's real ~/.config/khipu/index-backups/ full of
+    these tests' temp-dir fixtures (found live, 2026-09-14, alongside the
+    same evidence-file pollution in test_notes.py's ReconcileTest)."""
+
+    def setUp(self):
+        self._backup_root = tempfile.TemporaryDirectory()
+        self.addCleanup(self._backup_root.cleanup)
+        patcher = mock.patch("khipu.paths.ensure_data_dir", return_value=Path(self._backup_root.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_keeps_preamble_ranks_and_writes(self):
         with tempfile.TemporaryDirectory() as td:
             mem = Path(td)

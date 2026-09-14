@@ -246,7 +246,20 @@ class ReconcileTest(unittest.TestCase):
     """notes.reconcile is append-only and never touches the live hub in a
     test: khipu.db.connect and khipu.topic_graph.persist_topic_graph are
     always mocked here, same posture as WritePgOrchestrationTest in
-    test_capture.py."""
+    test_capture.py.
+
+    khipu.organise.after_reconcile is also mocked class-wide: reconcile()
+    calls it at the end of every real write (P5), and without this mock it
+    would write this MACHINE's real ~/.config/khipu/state/notes-organise-
+    last.json full of these tests' temp-dir fixtures — polluting the exact
+    evidence file `khipu doctor`'s notes_organise row reads (found live,
+    2026-09-14, while investigating the G1 incident).
+    """
+
+    def setUp(self):
+        patcher = mock.patch("khipu.organise.after_reconcile", return_value={"ok": True, "mocked": True})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _tree(self, td: str) -> tuple[Path, Path]:
         claude_root = Path(td) / "claude_projects"
