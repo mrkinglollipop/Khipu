@@ -254,6 +254,93 @@ class RewriteIndexTest(unittest.TestCase):
             self.assertEqual((mem / "MEMORY.md").read_text(encoding="utf-8"), maintainer_text)
 
 
+class RewriteIndexPreservesTextTest(unittest.TestCase):
+    """G1 incident (2026-09-14): the first rewrite_index replaced every
+    existing bullet line's TEXT with a fresh render from frontmatter,
+    destroying hand-edited index lines on 22 real memory dirs with no
+    backup. These pin the fix: existing text survives verbatim, only
+    membership/order may change, and a real change is always backed up
+    first."""
+
+    def test_existing_line_text_survives_even_when_frontmatter_changed(self):
+        with tempfile.TemporaryDirectory() as td:
+            mem = Path(td)
+            _write(mem / "a.md", _note_text("A", "project", "body"))
+            hand_written = "- [A, the short hand-written hook the author wrote](a.md)\n"
+            _write(mem / "MEMORY.md", hand_written)
+            report = organise.rewrite_index(mem, dry_run=False)
+            self.assertTrue(report["ok"])
+            text = (mem / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertEqual(text, hand_written)
+        self.assertNotIn("body", text)
+
+    def test_new_note_gets_a_fresh_unescaped_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            mem = Path(td)
+            note_path = mem / "b.md"
+            _write(note_path, _note_text("B", "project", "body"))
+            # Simulate a frontmatter description carrying a literal YAML
+            # double-quote escape, same shape as the incident.
+            # The escaped quotes sit INSIDE the value, not touching its own
+            # outer quotes — matches the incident's actual shape and avoids
+            # khipu.notes._parse_note_frontmatter's separate (pre-existing,
+            # out of scope here) quirk of over-stripping quote characters
+            # that are adjacent to the value's own boundary.
+            text = note_path.read_text(encoding="utf-8").replace(
+                'description: "B description"',
+                'description: "a note about \\"the host runs it\\" behavior"',
+            )
+            note_path.write_text(text, encoding="utf-8")
+            report = organise.rewrite_index(mem, dry_run=False)
+            self.assertTrue(report["ok"])
+            out = (mem / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertIn('a note about "the host runs it" behavior', out)
+        self.assertNotIn('\\"', out)
+
+    def test_reorder_only_is_a_true_no_op_no_write_no_backup(self):
+        with tempfile.TemporaryDirectory() as td:
+            mem = Path(td)
+            _write(mem / "a.md", _note_text("A", "reference", "x"))
+            _write(mem / "b.md", _note_text("B", "feedback", "y"))
+            # Pre-seed an index already in the NEW rank order (feedback
+            # first) with hand-written text for both lines.
+            existing = "- [B hand text](b.md)\n- [A hand text](a.md)\n"
+            _write(mem / "MEMORY.md", existing)
+            with mock.patch.object(organise, "_backup_index") as m_backup:
+                report = organise.rewrite_index(mem, dry_run=False)
+                m_backup.assert_not_called()
+                self.assertFalse(report["changed"])
+                self.assertIsNone(report["backup_path"])
+                self.assertEqual((mem / "MEMORY.md").read_text(encoding="utf-8"), existing)
+
+    def test_a_real_change_is_backed_up_first_and_pruned_to_20(self):
+        with tempfile.TemporaryDirectory() as td:
+            mem = Path(td)
+            _write(mem / "a.md", _note_text("A", "reference", "x"))
+            original = "- [A original hand text](a.md)\n"
+            _write(mem / "MEMORY.md", original)
+            with mock.patch("khipu.paths.ensure_data_dir", return_value=mem / "_data"):
+                # A brand-new note with no existing line forces a real
+                # (membership) change, so a backup must be taken.
+                _write(mem / "b.md", _note_text("B", "reference", "y"))
+                report = organise.rewrite_index(mem, dry_run=False)
+                self.assertTrue(report["changed"])
+                backup_path = Path(report["backup_path"])
+                self.assertTrue(backup_path.is_file())
+                self.assertEqual(backup_path.read_text(encoding="utf-8"), original)
+                # Under index-backups/<project-slug>/, never a sibling of
+                # the note files themselves.
+                self.assertIn("index-backups", str(backup_path))
+                self.assertNotEqual(backup_path.parent, mem)
+
+                # 25 more real changes -> only the newest 20 backups survive.
+                for i in range(25):
+                    _write(mem / f"n{i}.md", _note_text(f"N{i}", "reference", "z"))
+                    organise.rewrite_index(mem, dry_run=False)
+                backups = sorted((mem / "_data" / "index-backups").glob("*/MEMORY.md.*"))
+        self.assertLessEqual(len(backups), organise.BACKUP_KEEP)
+
+
 # ---------------------------------------------------------------------------
 # G2/G4 — split
 # ---------------------------------------------------------------------------

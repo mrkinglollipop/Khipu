@@ -167,10 +167,101 @@ def _event_epoch(event_at: Any) -> float:
         return 0.0
 
 
+_LINE_TARGET_RE = re.compile(r"^- \[[^\]]*\]\(([^)]+)\)")
+
+
+def _parse_existing_lines(existing_lines: list[str]) -> dict[str, str]:
+    """G1 incident (2026-09-14): filename (the ``(file.md)`` link target) ->
+    the FULL existing bullet line, verbatim. This is what makes a rewrite
+    non-destructive — a note that already has a line keeps that EXACT line
+    (hand-edited text included), no matter what its frontmatter says today;
+    only a note with no line yet gets one freshly rendered. Only ``- [``
+    lines are indexed (anything else should not appear here — the preamble
+    was already split off)."""
+    out: dict[str, str] = {}
+    for ln in existing_lines:
+        m = _LINE_TARGET_RE.match(ln)
+        if m:
+            out[m.group(1)] = ln
+    return out
+
+
+def _unescape_yaml_dquote(s: str) -> str:
+    """G1 incident: a frontmatter value's outer quote is stripped by
+    ``khipu.notes._parse_note_frontmatter`` (one leading/trailing char, not a
+    real YAML unescape) — an internal ``\\"`` from a double-quoted YAML
+    scalar survives as a literal backslash-quote pair. Never let that escape
+    artifact reach a rendered index line."""
+    return (s or "").replace('\\"', '"')
+
+
 def _render_line(c: dict[str, Any]) -> str:
+    """A FRESH line, rendered from frontmatter — used ONLY for a note that
+    has no existing line to preserve (see ``_parse_existing_lines`` /
+    ``_line_for``)."""
     rel = c["path"].name
-    desc = f" — {c['description']}" if c.get("description") else ""
-    return f"- [{c['title']}]({rel}){desc}"
+    title = _unescape_yaml_dquote(c["title"])
+    desc = _unescape_yaml_dquote(c.get("description") or "")
+    desc_part = f" — {desc}" if desc else ""
+    return f"- [{title}]({rel}){desc_part}"
+
+
+def _line_for(c: dict[str, Any], existing_by_target: dict[str, str]) -> str:
+    """The line to emit for one candidate: the existing line verbatim when
+    one already names this file, else a freshly rendered one. This is the
+    ONE place text is chosen, so ranking (which only decides ORDER, via
+    ``_rank_key``) can never accidentally carry a text rewrite with it."""
+    existing = existing_by_target.get(c["path"].name)
+    return existing if existing is not None else _render_line(c)
+
+
+BACKUP_KEEP = 20
+
+
+def _project_slug_for_dir(memory_dir: Path) -> str:
+    """A filesystem-safe folder name for this memory dir's backups — the
+    Claude Code project slug (``memory_dir.parent.name``) for the common
+    ``<project>/memory`` shape, else the dir's own name (codex's single
+    ``~/.codex/memories`` root, or any future non-nested root)."""
+    name = memory_dir.parent.name if memory_dir.name == "memory" else memory_dir.name
+    return name or "unknown"
+
+
+def _backup_index(memory_dir: Path, existing_text: str) -> Path | None:
+    """G1 incident (2026-09-14): a copy of the index BEFORE any rewrite —
+    never inside the memory dir itself (that's the file being protected).
+    Lives at ``<khipu data dir>/index-backups/<project-slug>/
+    MEMORY.md.<UTC timestamp>``; only the last ``BACKUP_KEEP`` are kept per
+    project. Never raises — a failed backup is logged and returns None, and
+    the caller treats that as "do not proceed with the write" (see
+    ``rewrite_index``: a None backup_path when one was expected is visible
+    in the run result / doctor row, not silently swallowed).
+    """
+    from khipu.paths import ensure_data_dir
+
+    try:
+        backup_dir = ensure_data_dir() / "index-backups" / _project_slug_for_dir(memory_dir)
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = backup_dir / f"{INDEX_NAME}.{ts}"
+        # A same-second retry (test loops, a rapid double-fire) must not
+        # silently clobber the previous backup — suffix with an attempt
+        # counter rather than overwrite.
+        n = 1
+        while backup_path.exists():
+            n += 1
+            backup_path = backup_dir / f"{INDEX_NAME}.{ts}.{n}"
+        backup_path.write_text(existing_text, encoding="utf-8")
+        existing_backups = sorted(backup_dir.glob(f"{INDEX_NAME}.*"))
+        for stale in existing_backups[: max(0, len(existing_backups) - BACKUP_KEEP)]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        return backup_path
+    except OSError as exc:  # noqa: BLE001 — a failed backup must be visible, not silently swallowed
+        _log(f"index backup failed for {memory_dir}: {exc}")
+        return None
 
 
 def rewrite_index(
@@ -197,6 +288,12 @@ def rewrite_index(
             existing_text = index_path.read_text(encoding="utf-8")
         except OSError:
             existing_text = ""
+    existing_overflow_text = ""
+    if overflow_path.is_file():
+        try:
+            existing_overflow_text = overflow_path.read_text(encoding="utf-8")
+        except OSError:
+            existing_overflow_text = ""
     existing_had_index = bool(existing_text.strip())
     if existing_had_index and not _is_khipu_recognised_index(existing_text):
         return {
@@ -217,6 +314,15 @@ def rewrite_index(
     try:
         preamble, existing_lines = _split_preamble(existing_text)
         existing_bullet_count = sum(1 for ln in existing_lines if _INDEX_LINE_RE.match(ln))
+        # G1 incident (2026-09-14): every line whose note is still present
+        # keeps its EXACT existing text — ranking below only ever decides
+        # ORDER, never text. _overflow_index.md is Khipu's own generated
+        # file (never host-loaded, never meant for hand-editing) but is
+        # matched the same way for consistency and so an unchanged overflow
+        # also counts as a true no-op below.
+        existing_by_target = _parse_existing_lines(existing_lines)
+        _, existing_overflow_lines = _split_preamble(existing_overflow_text)
+        existing_by_target.update(_parse_existing_lines(existing_overflow_lines))
 
         candidates = _index_candidates(memory_dir, cur=cur)
         candidates.sort(key=_rank_key)
@@ -226,7 +332,7 @@ def rewrite_index(
         overflow: list[dict[str, Any]] = []
         total = len((preamble_block).encode("utf-8"))
         for c in candidates:
-            line_bytes = len(_render_line(c).encode("utf-8")) + 1
+            line_bytes = len(_line_for(c, existing_by_target).encode("utf-8")) + 1
             if kept and total + line_bytes > cap_bytes:
                 overflow.append(c)
                 continue
@@ -251,20 +357,40 @@ def rewrite_index(
                     "would_move_to_overflow": len(overflow),
                 }
 
-        new_body = "\n".join(_render_line(c) for c in kept)
+        new_body = "\n".join(_line_for(c, existing_by_target) for c in kept)
         new_text = preamble_block + new_body + ("\n" if new_body else "")
-        overflow_text = "\n".join(_render_line(c) for c in overflow) + ("\n" if overflow else "")
+        overflow_text = (
+            "\n".join(_line_for(c, existing_by_target) for c in overflow) + ("\n" if overflow else "")
+        )
 
+        # G1 incident: every kept/overflow line's TEXT is now always either
+        # preserved verbatim or freshly rendered for a genuinely new note —
+        # so the only way new_text/overflow_text can differ from what is
+        # already on disk is a real membership or order change. When
+        # neither differs this is a true no-op: no write, no backup, no
+        # mtime bump.
+        changed = new_text != existing_text or overflow_text != existing_overflow_text
         summary = {
-            "ok": True, "skipped": False, "dir": str(memory_dir),
+            "ok": True, "skipped": False, "dir": str(memory_dir), "changed": changed,
             "lines_before": existing_bullet_count, "lines_kept": len(kept),
             "lines_moved_to_overflow": len(overflow),
             "bytes_before": len(existing_text.encode("utf-8")),
             "bytes_after": len(new_text.encode("utf-8")),
-            "cap_bytes": cap_bytes, "dry_run": dry_run,
+            "cap_bytes": cap_bytes, "dry_run": dry_run, "backup_path": None,
         }
-        if dry_run:
+        if dry_run or not changed:
             return summary
+
+        if existing_had_index:
+            backup_path = _backup_index(memory_dir, existing_text)
+            if backup_path is None:
+                # A backup was owed (there is existing text to protect) and
+                # failed — refuse the write rather than proceed unprotected.
+                return {
+                    "ok": True, "skipped": True, "dir": str(memory_dir),
+                    "reason": "refusing to rewrite: backup of the existing index failed",
+                }
+            summary["backup_path"] = str(backup_path)
 
         tmp = index_path.with_suffix(".md.tmp")
         tmp.write_text(new_text, encoding="utf-8")
