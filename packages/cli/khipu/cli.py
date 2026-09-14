@@ -372,6 +372,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         bundle_seal_block = bundle_seal.check()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         bundle_seal_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # P5: the last organisation run (index rewrite, size warnings, stale
+    # report) — info only, never gates `ok` below. None (not red) when
+    # organisation has never run on this Mac yet.
+    try:
+        from khipu import organise
+
+        notes_organise = organise.last_run()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        notes_organise = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -391,6 +400,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "recall_probe": recall_probe,
         "recall_quality": recall_quality_block,
         "bundle_seal": bundle_seal_block,
+        "notes_organise": notes_organise,
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -1582,22 +1592,86 @@ def cmd_hygiene(args: argparse.Namespace) -> int:
 
 
 def cmd_notes(args: argparse.Namespace) -> int:
-    """W4.3: `khipu notes reconcile` — mirror harness-native per-project
-    notes (~/.claude/projects/<slug>/memory/*.md, ~/.codex/memories/*.md)
-    into topics, append-only, so search/graph/the W4 pushed slice can reach
-    them. Never runs against the live hub except through the real
-    khipu.db.connect() this shares with every other write path."""
-    if getattr(args, "notes_cmd", None) != "reconcile":
-        print(json.dumps({"ok": False, "error": "usage: khipu notes reconcile"}))
-        return 2
+    """W4.3 + Phase 5 (organisation without the user): `khipu notes ...`.
+
+    `reconcile` mirrors harness-native per-project notes into topics,
+    append-only. `index`/`split`/`stale`/`supersede` (Phase 5) are the
+    maintainer-facing verbs for the same organisation that ALSO runs by
+    itself from every reconcile (khipu.organise.after_reconcile) — these
+    exist for a manual pass, never as the only trigger. Never runs against
+    the live hub except through the real khipu.db.connect() this shares
+    with every other write path."""
+    cmd = getattr(args, "notes_cmd", None)
     from khipu import notes
 
-    report = notes.reconcile(
-        dry_run=bool(getattr(args, "dry_run", False)),
-        changed_only=bool(getattr(args, "changed_only", False)),
-    )
-    print(json.dumps(report, indent=2, default=str))
-    return 0
+    if cmd == "reconcile":
+        report = notes.reconcile(
+            dry_run=bool(getattr(args, "dry_run", False)),
+            changed_only=bool(getattr(args, "changed_only", False)),
+        )
+        print(json.dumps(report, indent=2, default=str))
+        return 0
+    if cmd == "index":
+        from khipu import organise
+
+        project_dir = Path(args.project).expanduser()
+        if not project_dir.is_dir():
+            print(json.dumps({"ok": False, "error": f"no such directory: {project_dir}"}))
+            return 2
+        cur = None
+        conn = None
+        if not args.dry_run:
+            try:
+                from khipu.db import connect
+
+                conn = connect()
+                cur = conn.cursor()
+            except Exception as exc:  # noqa: BLE001 — ranking degrades without hits_30d, never blocks
+                print(f"[khipu-notes] hits_30d ranking unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+        try:
+            report = organise.rewrite_index(
+                project_dir, cap_bytes=int(args.cap), dry_run=bool(args.dry_run),
+                force=bool(args.force), cur=cur,
+            )
+        finally:
+            if conn is not None:
+                conn.commit()
+                conn.close()
+        print(json.dumps(report, indent=2, default=str))
+        return 0 if report.get("ok") else 2
+    if cmd == "split":
+        from khipu import organise
+
+        path = Path(args.path).expanduser()
+        report = organise.split_note(path, dry_run=bool(args.dry_run))
+        if report.get("ok") and not report.get("skipped") and not args.dry_run:
+            report["reconcile"] = notes.reconcile(dry_run=False)
+        print(json.dumps(report, indent=2, default=str))
+        return 0 if report.get("ok") else 2
+    if cmd == "stale":
+        from khipu import organise
+        from khipu.db import connect
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                report = organise.stale_report(cur, project=getattr(args, "project", None))
+        print(json.dumps(report, indent=2, default=str))
+        return 0
+    if cmd == "supersede":
+        from khipu import organise
+        from khipu.db import connect
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                report = organise.supersede(cur, args.old_slug, args.new_slug)
+            conn.commit()
+        print(json.dumps(report, indent=2, default=str))
+        return 0 if report.get("ok") else 2
+    print(json.dumps({
+        "ok": False,
+        "error": "usage: khipu notes {reconcile,index,split,stale,supersede}",
+    }))
+    return 2
 
 
 # Secrets the UI and CLI may write. Anything outside this set is refused rather
@@ -3088,6 +3162,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--changed-only", action="store_true",
         help="F1: skip files unchanged since the last changed-only run (Stop hook / WatchPaths agent)",
     )
+    nt_index = nt_sub.add_parser(
+        "index",
+        help="P5 G1: rewrite one memory dir's MEMORY.md under the host's load cap, ranked",
+    )
+    nt_index.add_argument("--project", required=True, help="A memory dir, e.g. ~/.claude/projects/<slug>/memory")
+    nt_index.add_argument("--cap", type=int, default=20_000,
+                           help="Byte cap for the kept index (default 20000; see khipu.organise.DEFAULT_INDEX_CAP_BYTES)")
+    nt_index.add_argument("--dry-run", action="store_true", help="Report the summary; never write")
+    nt_index.add_argument(
+        "--force", action="store_true",
+        help="Write even when it would drop more than 30%% of the existing index's lines",
+    )
+    nt_index.set_defaults(func=cmd_notes)
+    nt_split = nt_sub.add_parser(
+        "split",
+        help="P5 G2/G4: split one oversized note by '## ' section into child notes, then re-reconcile",
+    )
+    nt_split.add_argument("path", help="Path to the note .md file to split")
+    nt_split.add_argument("--dry-run", action="store_true", help="Report the split plan; never write")
+    nt_split.set_defaults(func=cmd_notes)
+    nt_stale = nt_sub.add_parser(
+        "stale",
+        help="P5 G2: report-only — note topics with no recent hits and an old event_at",
+    )
+    nt_stale.add_argument("--project", default=None, help="Restrict to one resolved project")
+    nt_stale.set_defaults(func=cmd_notes)
+    nt_supersede = nt_sub.add_parser(
+        "supersede",
+        help="P5 R6/G5: mark OLD superseded and point it at NEW",
+    )
+    nt_supersede.add_argument("old_slug")
+    nt_supersede.add_argument("new_slug")
+    nt_supersede.set_defaults(func=cmd_notes)
     nt.set_defaults(func=cmd_notes)
 
     paths = sub.add_parser(

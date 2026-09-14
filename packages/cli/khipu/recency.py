@@ -61,6 +61,15 @@ PROJECT_BOOST = 1.25
 # the ones capture/mirror/notes actually write for "this is not current".
 DERANKED_STATUSES = frozenset({"superseded", "retired", "abandoned"})
 STATUS_DERANK = 0.5
+# P5 G5: a harness-native note's own `type` (feedback/user/project/reference,
+# set by khipu.notes._note_topic_dict and carried on the row by
+# khipu.embed's topic metadata join) — feedback (a hard-won lesson) and user
+# (an explicit preference/instruction) are the two kinds worth surfacing
+# ahead of a same-scoring project/reference note for THIS project; applied
+# only when the row already won the project boost above (`type` without a
+# matching project is not "for the current project").
+TYPE_BOOSTED = frozenset({"feedback", "user"})
+TYPE_BOOST = 1.15
 
 
 def apply_project_and_status(
@@ -100,6 +109,10 @@ def apply_project_and_status(
                 row_project = str(row.get("project") or "").strip().lower()
                 if row_project and proj_norm in row_project:
                     score *= PROJECT_BOOST
+                    if row.get("kind") == "topic":
+                        note_type = str(row.get("type") or "").strip().lower()
+                        if note_type in TYPE_BOOSTED:
+                            score *= TYPE_BOOST
             if row.get("kind") == "topic":
                 status = str(row.get("status") or "").strip().lower()
                 if status in DERANKED_STATUSES:
