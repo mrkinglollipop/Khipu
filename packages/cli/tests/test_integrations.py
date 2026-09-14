@@ -209,6 +209,52 @@ class ProbeTest(unittest.TestCase):
         self.assertTrue(integ._probe_hook(integ.stop_hook())["ok"])
 
 
+class ProbePromptRecallSnapshotTest(unittest.TestCase):
+    """R1 follow-up: _probe_prompt_recall's topical assertion is conditional
+    on the LOCAL snapshot being fresh (mocked here — no real subprocess, no
+    real snapshot needed)."""
+
+    def _run(self, *, snapshot_fresh, trivial_ctx="", topical_ctx=""):
+        def _trivial_response(**_kw):
+            return mock.Mock(returncode=0, stdout=json.dumps(
+                {"hookSpecificOutput": {"additionalContext": trivial_ctx}} if trivial_ctx else {}
+            ), stderr="")
+
+        def _topical_response(**_kw):
+            return mock.Mock(returncode=0, stdout=json.dumps(
+                {"hookSpecificOutput": {"additionalContext": topical_ctx}} if topical_ctx else {}
+            ), stderr="")
+
+        with mock.patch(
+            "khipu.hub_snapshot.snapshot_is_fresh", return_value=(snapshot_fresh, {})
+        ), mock.patch.object(integ.subprocess, "run", side_effect=[
+            _trivial_response(), _topical_response()
+        ]):
+            return integ._probe_prompt_recall("khipu-prompt-recall")
+
+    def test_fresh_snapshot_requires_a_non_empty_topical_result(self):
+        out = self._run(snapshot_fresh=True, topical_ctx="")
+        self.assertFalse(out["ok"])
+        self.assertIn("fresh", out["error"])
+
+    def test_fresh_snapshot_with_a_real_hit_passes(self):
+        out = self._run(snapshot_fresh=True, topical_ctx="## Prior work on this topic\n- x")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["topical_context_chars"], len("## Prior work on this topic\n- x"))
+
+    def test_missing_snapshot_does_not_require_a_topical_hit(self):
+        """No local replica: the hook falls back to the hub, where a
+        legitimate timeout is the documented safe failure — must not flake
+        verify() over it."""
+        out = self._run(snapshot_fresh=False, topical_ctx="")
+        self.assertTrue(out["ok"])
+
+    def test_a_non_empty_trivial_prompt_always_fails_regardless_of_snapshot(self):
+        out = self._run(snapshot_fresh=False, trivial_ctx="should not be here")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"], "trivial prompt was not empty")
+
+
 class AegisIsolationTest(unittest.TestCase):
     """Aegis is its own harness (maintainer, 2026-08-17). Exactly ONE Khipu script may
     run there — khipu-aegis-capture, via the Aegis pack's KHIPU_HARNESS=aegis

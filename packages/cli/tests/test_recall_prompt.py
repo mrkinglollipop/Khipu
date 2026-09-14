@@ -182,5 +182,93 @@ class HookShapeTest(unittest.TestCase):
         self.assertEqual(json.loads(buf.getvalue()), {})
 
 
+class QueryEmbedCacheTest(unittest.TestCase):
+    """R1 follow-up: the local query-embedding cache — a repeated prompt
+    must cost zero API calls."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="khipu-qembed-"))
+        self._patch = mock.patch.object(rp, "_query_embed_cache_path", return_value=self.tmp / "c.json")
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+
+    def test_a_repeated_prompt_never_calls_embed_again(self):
+        with mock.patch("khipu.embed.embed_one", return_value=[0.1, 0.2, 0.3]) as m:
+            first = rp._cached_query_embed("what is the status", "p1")
+            second = rp._cached_query_embed("What Is The Status", "p1")  # case/whitespace differ
+        self.assertEqual(first, [0.1, 0.2, 0.3])
+        self.assertEqual(second, [0.1, 0.2, 0.3])
+        m.assert_called_once()
+
+    def test_different_profiles_do_not_share_a_cache_entry(self):
+        with mock.patch("khipu.embed.embed_one", side_effect=[[0.1], [0.2]]) as m:
+            a = rp._cached_query_embed("q", "profile-a")
+            b = rp._cached_query_embed("q", "profile-b")
+        self.assertNotEqual(a, b)
+        self.assertEqual(m.call_count, 2)
+
+    def test_cache_survives_a_fresh_load(self):
+        with mock.patch("khipu.embed.embed_one", return_value=[9.0]) as m:
+            rp._cached_query_embed("persisted", "p1")
+        with mock.patch("khipu.embed.embed_one") as m2:
+            out = rp._cached_query_embed("persisted", "p1")
+        self.assertEqual(out, [9.0])
+        m2.assert_not_called()
+
+
+class SnapshotSearchHitsTest(unittest.TestCase):
+    """R1 follow-up: local-snapshot-first, hub-only-on-fallback."""
+
+    def test_stale_or_missing_snapshot_raises_snapshot_unusable(self):
+        with mock.patch("khipu.hub_snapshot.snapshot_is_fresh", return_value=(False, {"exists": False})):
+            with self.assertRaises(rp._SnapshotUnusable):
+                rp._snapshot_search_hits("a topical prompt", project=None)
+
+    def test_fresh_snapshot_fuses_cosine_and_lexical_and_attaches_metadata(self):
+        cosine_row = {"kind": "topic", "id": "t1", "chunk_idx": 0, "score": 0.9,
+                       "label": "T1", "snippet": "topic body", "rank_text": "topic body"}
+        lexical_row = {"kind": "episode", "id": "5", "label": "ep", "snippet": "episode text"}
+        with mock.patch("khipu.hub_snapshot.snapshot_is_fresh", return_value=(True, {"exists": True})), \
+                mock.patch("khipu.hub_snapshot.search_snapshot", return_value=[lexical_row]), \
+                mock.patch("khipu.hub_snapshot.active_snapshot_profile", return_value="p1"), \
+                mock.patch.object(rp, "_cached_query_embed", return_value=[1.0]), \
+                mock.patch("khipu.hub_snapshot.cosine_candidates_snapshot", return_value=[cosine_row]), \
+                mock.patch("khipu.hub_snapshot.open_snapshot", return_value=object()), \
+                mock.patch("khipu.hub_snapshot.snapshot_row_metadata", side_effect=lambda con, rows: rows):
+            out = rp._snapshot_search_hits("a topical prompt", project=None)
+        ids = {(r["kind"], r["id"]) for r in out}
+        self.assertIn(("topic", "t1"), ids)
+        self.assertIn(("episode", "5"), ids)
+
+    def test_a_cosine_leg_failure_degrades_to_lexical_only_not_a_raise(self):
+        lexical_row = {"kind": "episode", "id": "5", "label": "ep", "snippet": "episode text"}
+        with mock.patch("khipu.hub_snapshot.snapshot_is_fresh", return_value=(True, {"exists": True})), \
+                mock.patch("khipu.hub_snapshot.search_snapshot", return_value=[lexical_row]), \
+                mock.patch("khipu.hub_snapshot.active_snapshot_profile", return_value="p1"), \
+                mock.patch.object(rp, "_cached_query_embed", side_effect=RuntimeError("embed down")), \
+                mock.patch("khipu.hub_snapshot.open_snapshot", return_value=object()), \
+                mock.patch("khipu.hub_snapshot.snapshot_row_metadata", side_effect=lambda con, rows: rows):
+            out = rp._snapshot_search_hits("a topical prompt", project=None)
+        self.assertEqual([r["id"] for r in out], ["5"])
+
+    def test_search_hits_falls_back_to_the_hub_when_the_snapshot_is_unusable(self):
+        hub_hit = {"kind": "episode", "id": "1", "score": 0.5, "label": "x", "snippet": "x"}
+        with mock.patch.object(rp, "_snapshot_search_hits", side_effect=rp._SnapshotUnusable("missing")), \
+                mock.patch("khipu.embed.hybrid_search", return_value={"results": [hub_hit]}) as m_hub:
+            out = rp._search_hits("a topical prompt", cwd=None)
+        m_hub.assert_called_once()
+        self.assertEqual(out[0]["id"], "1")
+
+    def test_search_hits_uses_the_snapshot_without_touching_the_hub_when_it_works(self):
+        snap_hit = {"kind": "episode", "id": "9", "score": 0.5, "label": "x", "snippet": "x"}
+        with mock.patch.object(rp, "_snapshot_search_hits", return_value=[snap_hit]), \
+                mock.patch("khipu.embed.hybrid_search") as m_hub:
+            out = rp._search_hits("a topical prompt", cwd=None)
+        m_hub.assert_not_called()
+        self.assertEqual(out[0]["id"], "9")
+
+
 if __name__ == "__main__":
     unittest.main()

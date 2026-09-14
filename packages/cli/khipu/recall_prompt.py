@@ -63,11 +63,15 @@ _HEADING = (
 )
 _FOOTER = "Call khipu_get on an id before acting on it."
 
-# Relative-score floor: keep a hit only if its score is within this much of
-# the top hit's score. Tuned against recall_eval's golden set (R1's brief) —
-# hardcoded default; not re-derived here since the golden set is
-# maintainer-local (see recall_eval.default_golden_path).
-SCORE_FLOOR_MARGIN = 0.03
+# Relative-score floor: keep a hit only if its score is within this
+# proportion of the top hit's score. A fixed absolute margin (the original
+# 0.03) was tuned against a narrow, mocked-fixture score band and cut two of
+# three genuinely relevant hits on a real prompt (2026-09-14 live check: top
+# RRF score 0.1407, #2 and #3 at 0.093/0.087 — both well outside a +/-0.03
+# window even though all three came from the same fused list). RRF's score
+# scale moves with list size/overlap, so a RATIO of the top score adapts
+# where an absolute epsilon does not.
+SCORE_FLOOR_RATIO = 0.5
 
 # R11: "ok"/"yes" return five hits; there is no floor and no gate. The
 # content-token gate (search_text.search_tokens) already catches "ok" (too
@@ -179,24 +183,194 @@ def _run_with_timeout(fn, timeout_s: float, /, *args, **kwargs) -> Any:
 # ---- search + render --------------------------------------------------------
 
 
-def _apply_score_floor(rows: list[dict[str, Any]], *, margin: float = SCORE_FLOOR_MARGIN) -> list[dict[str, Any]]:
+def _apply_score_floor(rows: list[dict[str, Any]], *, ratio: float = SCORE_FLOOR_RATIO) -> list[dict[str, Any]]:
     if not rows:
         return rows
     top = max(float(r.get("score") or 0.0) for r in rows)
-    floor = top - margin
+    if top <= 0:
+        return rows
+    floor = top * ratio
     return [r for r in rows if float(r.get("score") or 0.0) >= floor]
+
+
+# ---- local query-embedding cache --------------------------------------------
+# Measured 2026-09-14: the remote hub round trip (embed + cosine scan over
+# Postgres + fusion + enrich, several statements each paying ~50ms of network
+# RTT) totalled 1.1-1.6s against the 1.2s budget — over it more often than
+# not. The local sqlite replica (hub_snapshot) answers a keyword search in
+# ~226ms; the only genuinely slow leg left is the embedding API call itself
+# (~0.7-1s uncached). Caching the query VECTOR (never the query text) by a
+# hash of the normalized prompt means a repeated question costs nothing —
+# the same principle as embed.memory_query_cache on the hub, just local and
+# file-based since this lane must not need Postgres at all.
+QUERY_EMBED_CACHE_MAX = 500
+QUERY_EMBED_LOCAL_TIMEOUT_S = 0.7
+
+
+def _query_embed_cache_path() -> Path:
+    from khipu.paths import ensure_data_dir
+
+    d = ensure_data_dir() / "state"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "prompt-query-embed-cache.json"
+
+
+def _normalize_for_cache(text: str) -> str:
+    return " ".join((text or "").split()).lower()
+
+
+def _query_embed_cache_key(profile: str, prompt: str) -> str:
+    import hashlib
+
+    norm = _normalize_for_cache(prompt)
+    return hashlib.sha256(f"{profile}\n{norm}".encode("utf-8")).hexdigest()
+
+
+def _load_query_embed_cache() -> dict[str, list[float]]:
+    try:
+        data = json.loads(_query_embed_cache_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_query_embed_cache(cache: dict[str, list[float]]) -> None:
+    try:
+        # Dicts keep insertion order (py3.7+): trimming the front drops the
+        # oldest entries, an LRU-ish bound with no extra bookkeeping.
+        if len(cache) > QUERY_EMBED_CACHE_MAX:
+            cache = dict(list(cache.items())[-QUERY_EMBED_CACHE_MAX:])
+        p = _query_embed_cache_path()
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def _cached_query_embed(prompt: str, profile: str) -> list[float]:
+    """The query vector for ``prompt`` under ``profile`` — cached locally by
+    sha256(profile + normalized prompt); a cache miss costs one embed API
+    call on its OWN short budget (QUERY_EMBED_LOCAL_TIMEOUT_S), separate
+    from the per-prompt hook's overall 1.2s wall clock, so a slow/failed
+    embed call gives up on the COSINE leg specifically rather than eating
+    the whole budget and returning nothing when the lexical leg alone would
+    have had something.
+    """
+    from khipu.embed import embed_one, prefix_query, uses_task_prefixes
+
+    key = _query_embed_cache_key(profile, prompt)
+    cache = _load_query_embed_cache()
+    hit = cache.get(key)
+    if isinstance(hit, list) and hit:
+        return hit
+    api_q = prefix_query(prompt) if uses_task_prefixes(profile) else prompt
+    vec = embed_one(
+        api_q, profile=profile, retries=0, timeout=QUERY_EMBED_LOCAL_TIMEOUT_S, delay=0
+    )
+    cache[key] = vec
+    _save_query_embed_cache(cache)
+    return vec
+
+
+# ---- local snapshot hybrid search --------------------------------------------
+
+
+class _SnapshotUnusable(Exception):
+    """The local replica cannot answer right now — caller falls back to the
+    hub. Carries the reason so it can be logged (never silently)."""
+
+
+def _snapshot_search_hits(prompt: str, *, project: str | None) -> list[dict[str, Any]]:
+    """Lexical + cosine, RRF-fused, entirely against the local sqlite
+    replica — no Postgres, no network round trip beyond one (cacheable)
+    embed API call. Raises ``_SnapshotUnusable`` when the replica is
+    missing or older than ``hub_snapshot.SNAPSHOT_MAX_AGE_S``; any other
+    failure (sqlite error, embed error on an EMPTY cosine leg) degrades to
+    lexical-only rather than raising, so a cosine hiccup never throws away
+    a perfectly good keyword match.
+    """
+    from khipu import hub_snapshot
+    from khipu.recency import apply_project_and_status
+    from khipu.search_text import fuse_ranked_lists, search_tokens, token_hit_count
+
+    fresh, health = hub_snapshot.snapshot_is_fresh()
+    if not fresh:
+        raise _SnapshotUnusable(
+            "missing" if not health.get("exists") else f"stale ({health.get('age_seconds')}s)"
+        )
+
+    tokens = search_tokens(prompt)
+
+    # A threaded cosine leg (embed API call overlapped with the lexical
+    # sqlite query) was tried here and MEASURED SLOWER end to end (2026-09-14:
+    # several runs crossed the outer 1.2s budget that never did sequentially)
+    # — GIL/thread-scheduling overhead ate the theoretical win, since both
+    # legs do real CPU-bound Python work (SQL param building, sorting, the
+    # cosine dot-product loop) alongside their I/O. Reverted to sequential;
+    # see khipu.recall_prompt's commit history for the measurements.
+    lexical_rows = hub_snapshot.search_snapshot(prompt, _SEARCH_LIMIT, kind=None)
+    for r in lexical_rows:
+        r["rank_text"] = f"{r.get('label') or ''} {r.get('snippet') or ''}"
+    if tokens:
+        lexical_rows.sort(key=lambda r: -token_hit_count(r.get("rank_text") or "", tokens))
+
+    lists: list[list[dict[str, Any]]] = [lexical_rows] if lexical_rows else []
+    cosine_rows: list[dict[str, Any]] = []
+    profile = hub_snapshot.active_snapshot_profile()
+    if profile:
+        try:
+            vec = _cached_query_embed(prompt, profile)
+            cosine_rows = hub_snapshot.cosine_candidates_snapshot(vec, profile, limit=_SEARCH_LIMIT)
+        except Exception as exc:  # noqa: BLE001 — cosine is a bonus leg, not a requirement
+            _log(f"snapshot cosine leg skipped: {type(exc).__name__}: {exc}")
+            cosine_rows = []
+    if cosine_rows:
+        for r in cosine_rows:
+            r["cosine"] = r.get("score")
+        lists.insert(0, list(cosine_rows))
+        if tokens:
+            union: dict[tuple[str, str], dict[str, Any]] = {
+                (r["kind"], str(r["id"])): r for r in cosine_rows
+            }
+            for r in lexical_rows:
+                union.setdefault((r["kind"], str(r["id"])), r)
+            lex_rows = sorted(
+                union.values(), key=lambda r: -token_hit_count(r.get("rank_text") or "", tokens)
+            )
+            lists.append(lex_rows)
+
+    for row_list in lists:
+        for r in row_list:
+            if tokens:
+                r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)
+            r.pop("rank_text", None)
+    if not lists:
+        return []
+
+    fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
+    con = hub_snapshot.open_snapshot()
+    fused = hub_snapshot.snapshot_row_metadata(con, fused)
+    fused = apply_project_and_status(fused, project=project)
+    # Deliberately NOT truncated to `limit` here: the caller applies the
+    # score floor over this full oversample first, then truncates — flooring
+    # an already-3-row slice starved the floor of the context it needs (a
+    # real #2/#3 hit can legitimately sit well below a dominant #1's score).
+    return fused
 
 
 def _search_hits(prompt: str, *, cwd: str | None, limit: int = TOP_N) -> list[dict[str, Any]]:
     """The gated search itself (no timeout, no dedup — those wrap this).
 
-    Raises on any failure; callers decide fail-open. Empty when the prompt
-    has no content tokens (R11): a bare "ok"/"yes" gates before this is ever
-    called, but a query that tokenizes to nothing (all stopwords/short) also
-    yields no hits rather than falling back to something unrelated.
+    Local snapshot first (R1 follow-up): fast, no network round trip beyond
+    one cacheable embed call. Falls back to the hub only when the snapshot
+    is missing, stale (> 24h), or fails outright — logged either way, never
+    silent. Raises on a hub-leg failure; callers decide fail-open. Empty
+    when the prompt has no content tokens (R11): a bare "ok"/"yes" gates
+    before this is ever called, but a query that tokenizes to nothing (all
+    stopwords/short) also yields no hits rather than falling back to
+    something unrelated.
     """
-    from khipu.embed import hybrid_search
-
     project = None
     if cwd:
         try:
@@ -205,6 +379,17 @@ def _search_hits(prompt: str, *, cwd: str | None, limit: int = TOP_N) -> list[di
             project = resolve_repo_root(cwd).get("project")
         except Exception:  # noqa: BLE001 — a git failure must not sink recall
             project = None
+
+    try:
+        rows = _snapshot_search_hits(prompt, project=project)
+        return _apply_score_floor(rows)[:limit]
+    except _SnapshotUnusable as exc:
+        _log(f"snapshot unusable ({exc}) — falling back to hub")
+    except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls back
+        _log(f"snapshot search failed ({type(exc).__name__}: {exc}) — falling back to hub")
+
+    from khipu.embed import hybrid_search
+
     payload = hybrid_search(prompt, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project)
     rows = _apply_score_floor(payload.get("results") or [])
     return rows[:limit]

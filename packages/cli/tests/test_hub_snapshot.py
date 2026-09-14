@@ -603,3 +603,147 @@ class SnapshotNeverResurrectsAForgottenEpisodeTest(unittest.TestCase):
         ids = {r["id"] for r in results}
         self.assertIn("1", ids)
         self.assertNotIn("2", ids, "a forgotten episode came back from the snapshot")
+
+
+def _insert_embedding(con, *, profile: str, kind: str, ref: str, chunk_text: str, vec) -> None:
+    import struct
+
+    blob = struct.pack(f"{len(vec)}f", *vec)
+    con.execute(
+        "INSERT INTO embedding_profiles (id, provider, model, dim, is_active) "
+        "VALUES (?, 'gemini', 'x', ?, 1) ON CONFLICT(id) DO NOTHING",
+        (profile, len(vec)),
+    )
+    con.execute(
+        "INSERT INTO memory_embeddings (profile, kind, ref, chunk_idx, chunk_text, embedding) "
+        "VALUES (?, ?, ?, 0, ?, ?)",
+        (profile, kind, ref, chunk_text, blob),
+    )
+
+
+class SnapshotIsFreshTest(unittest.TestCase):
+    def test_missing_snapshot_is_not_fresh(self) -> None:
+        with mock.patch.object(hs, "snapshot_health", return_value={"exists": False}):
+            fresh, health = hs.snapshot_is_fresh()
+        self.assertFalse(fresh)
+        self.assertFalse(health["exists"])
+
+    def test_snapshot_older_than_max_age_is_not_fresh(self) -> None:
+        with mock.patch.object(
+            hs, "snapshot_health",
+            return_value={"exists": True, "age_seconds": hs.SNAPSHOT_MAX_AGE_S + 1},
+        ):
+            fresh, health = hs.snapshot_is_fresh()
+        self.assertFalse(fresh)
+
+    def test_a_young_snapshot_is_fresh(self) -> None:
+        with mock.patch.object(
+            hs, "snapshot_health", return_value={"exists": True, "age_seconds": 60}
+        ):
+            fresh, _health = hs.snapshot_is_fresh()
+        self.assertTrue(fresh)
+
+
+class CosineCandidatesSnapshotTest(unittest.TestCase):
+    """R1 follow-up: the local-replica cosine leg, including the fast
+    dot-product-only scoring path and the commitment exclusion."""
+
+    def _snapshot(self, data: Path) -> Path:
+        snap = data / "hub_snapshot.sqlite"
+        con = sqlite3.connect(str(snap))
+        hs._create_schema(con)
+        # An exact-match vector [1,0,0] should score highest by dot product.
+        _insert_embedding(con, profile="p1", kind="topic", ref="match",
+                           chunk_text="the target chunk", vec=[1.0, 0.0, 0.0])
+        _insert_embedding(con, profile="p1", kind="episode", ref="99",
+                           chunk_text="unrelated", vec=[0.0, 1.0, 0.0])
+        _insert_embedding(con, profile="p1", kind="commitment", ref="7",
+                           chunk_text="a commitment, not generic search", vec=[1.0, 0.0, 0.0])
+        con.commit()
+        con.close()
+        return snap
+
+    def test_commitments_are_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            with mock.patch.object(hs, "snapshot_path", return_value=self._snapshot(data)):
+                out = hs.cosine_candidates_snapshot([1.0, 0.0, 0.0], "p1", limit=10)
+        self.assertNotIn("commitment", {r["kind"] for r in out})
+
+    def test_ranks_the_closer_vector_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            with mock.patch.object(hs, "snapshot_path", return_value=self._snapshot(data)):
+                out = hs.cosine_candidates_snapshot([1.0, 0.0, 0.0], "p1", limit=10)
+        self.assertEqual(out[0]["id"], "match")
+        self.assertAlmostEqual(out[0]["score"], 1.0, places=4)
+
+    def test_score_matches_full_cosine_for_a_normalized_query(self) -> None:
+        """The fast path assumes stored vectors are already unit-normalized
+        (embed.embed_batch's guarantee) and skips re-deriving their norm —
+        confirm it agrees with the textbook cosine formula, not just that it
+        runs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            with mock.patch.object(hs, "snapshot_path", return_value=self._snapshot(data)):
+                out = hs.cosine_candidates_snapshot([2.0, 0.0, 0.0], "p1", limit=10)
+        got = {r["id"]: r["score"] for r in out}
+        self.assertAlmostEqual(got["match"], hs._cosine([2.0, 0.0, 0.0], [1.0, 0.0, 0.0]), places=4)
+        self.assertAlmostEqual(got["99"], hs._cosine([2.0, 0.0, 0.0], [0.0, 1.0, 0.0]), places=4)
+
+
+class SnapshotRowMetadataTest(unittest.TestCase):
+    def _snapshot(self, data: Path) -> Path:
+        snap = data / "hub_snapshot.sqlite"
+        con = sqlite3.connect(str(snap))
+        hs._create_schema(con)
+        con.execute(
+            "INSERT INTO episodes (id, ts, summary, project, scope) "
+            "VALUES (1, '2026-09-01T00:00:00Z', 'x', 'acme/widget', NULL)"
+        )
+        con.execute(
+            "INSERT INTO topics (slug, title, body, status, frontmatter, updated_at) "
+            "VALUES ('t1', 'T1', 'body', 'superseded', '{\"project\": \"acme/widget\"}', "
+            "'2026-09-01T00:00:00Z')"
+        )
+        con.execute(
+            "INSERT INTO episodes (id, ts, summary, deleted_at) "
+            "VALUES (2, '2026-09-01T00:00:00Z', 'gone', '2026-09-02T00:00:00Z')"
+        )
+        con.commit()
+        con.close()
+        return snap
+
+    def test_episode_gets_project_and_topic_gets_status_and_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            snap = self._snapshot(data)
+            with mock.patch.object(hs, "snapshot_path", return_value=snap):
+                con = hs.open_snapshot()
+                out = hs.snapshot_row_metadata(
+                    con,
+                    [{"kind": "episode", "id": "1", "score": 0.5},
+                     {"kind": "topic", "id": "t1", "score": 0.4}],
+                )
+        by_id = {r["id"]: r for r in out}
+        self.assertEqual(by_id["1"]["project"], "acme/widget")
+        self.assertEqual(by_id["t1"]["status"], "superseded")
+        self.assertEqual(by_id["t1"]["project"], "acme/widget")
+
+    def test_a_tombstoned_episode_is_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            snap = self._snapshot(data)
+            with mock.patch.object(hs, "snapshot_path", return_value=snap):
+                con = hs.open_snapshot()
+                out = hs.snapshot_row_metadata(con, [{"kind": "episode", "id": "2", "score": 0.1}])
+        self.assertEqual(out, [])
+
+    def test_a_row_with_no_metadata_passes_through(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            snap = self._snapshot(data)
+            with mock.patch.object(hs, "snapshot_path", return_value=snap):
+                con = hs.open_snapshot()
+                out = hs.snapshot_row_metadata(con, [{"kind": "node", "id": "n1", "score": 0.2}])
+        self.assertEqual(out, [{"kind": "node", "id": "n1", "score": 0.2}])

@@ -1016,16 +1016,26 @@ def _probe_prompt_recall(command: str) -> dict:
     gate) and a topical one must run cleanly and return valid JSON, shell-run
     for the same reason as _probe_hook.
 
-    The topical case is data-dependent (it searches the real hub) AND
-    latency-dependent (khipu.recall_prompt.TIMEOUT_S=1.2s is a hard internal
-    budget; a slow hub can legitimately time out, which the hook reports as
-    an empty — not broken — result per its own documented fail-open). So
-    "found something" is reported for visibility (``topical_context_chars``,
-    ``topical_ms``) but is NOT part of ``ok`` — only the trivial-prompt gate
-    and clean execution are. Asserting non-empty here would make `verify`
-    flake on exactly the safe failure mode the hook is designed to have.
+    2026-09-14 revision: khipu.recall_prompt now searches the LOCAL sqlite
+    replica first (khipu.hub_snapshot) — no network round trip beyond one
+    cacheable embed call — so a topical prompt reliably finds SOMETHING
+    whenever that replica exists and is fresh: cosine search always returns
+    its nearest neighbors, and the score floor keeps the top hit by
+    construction. So the topical assertion is now split on that one fact,
+    checked here directly (not shelled out, so it reflects the actual local
+    snapshot the hook itself will see): snapshot fresh -> require non-empty
+    output, and RED if it is not; snapshot missing/stale -> the hook falls
+    back to the hub, where a slow/unreachable Postgres can legitimately time
+    out and return empty per its own documented fail-open — that case stays
+    informational (topical_context_chars, not part of ok), same as before.
     """
     t0 = time.time()
+    try:
+        from khipu import hub_snapshot
+
+        snapshot_fresh, _health = hub_snapshot.snapshot_is_fresh()
+    except Exception:  # noqa: BLE001 — a broken freshness check must not break the probe
+        snapshot_fresh = False
     try:
         trivial = subprocess.run(command, shell=True, input='{"prompt":"ok"}',
                                   capture_output=True, text=True, timeout=10)
@@ -1050,10 +1060,18 @@ def _probe_prompt_recall(command: str) -> dict:
         or d_topical.get("additional_context") or ""
     )
     ok = trivial.returncode == 0 and topical.returncode == 0 and trivial_ctx == ""
+    if snapshot_fresh:
+        ok = ok and bool(topical_ctx)
     out = {"ok": ok, "trivial_empty": trivial_ctx == "", "topical_context_chars": len(topical_ctx),
-           "ms": int((time.time() - t0) * 1000)}
+           "snapshot_fresh": snapshot_fresh, "ms": int((time.time() - t0) * 1000)}
     if not ok:
-        out["error"] = (trivial.stderr or topical.stderr or "trivial prompt was not empty")[-300:]
+        if trivial_ctx:
+            reason = "trivial prompt was not empty"
+        elif snapshot_fresh and not topical_ctx:
+            reason = "topical prompt returned nothing while the local snapshot is fresh"
+        else:
+            reason = trivial.stderr or topical.stderr or "probe failed"
+        out["error"] = reason[:300]
     return out
 
 
