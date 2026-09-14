@@ -1157,17 +1157,26 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
 
 def list_owed(cur, *, project: str | None = None, parent_session_id: str | None = None,
               session_id: str | None = None, status: str = "open",
-              limit: int = 50) -> list[dict[str, Any]]:
+              limit: int = 50, hide_snoozed: bool = False) -> list[dict[str, Any]]:
     """``project`` if given, else ``parent_session_id``/``session_id`` (fix
     3) — the same coalesced key ``open_from_episode``/``auto_close`` store
     commitments under, so a caller with only session context (no resolved
-    project) can still find its own scope's commitments."""
+    project) can still find its own scope's commitments.
+
+    ``hide_snoozed`` (O3): when true, a row whose ``due_after`` is still in
+    the future is excluded — this is what makes ``khipu owed --snooze``
+    actually park an item instead of it reappearing everywhere immediately.
+    Off by default so ``khipu owed``/the desktop still see (and can
+    un-snooze) a parked row; the W4 pushed slice turns it on.
+    """
     scope = project or parent_session_id or session_id
     clauses = ["status = %s"]
     params: list[Any] = [status]
     if scope:
         clauses.append("project = %s")
         params.append(scope)
+    if hide_snoozed:
+        clauses.append("(due_after IS NULL OR due_after <= now())")
     params.append(limit)
     cols = ["id", "text", "project", "owner", "kind", "opened_episode", "opened_at",
             "due_after", "status", "closed_episode", "closed_at", "close_reason"]
@@ -1216,8 +1225,14 @@ def list_owed(cur, *, project: str | None = None, parent_session_id: str | None 
         clause = trigger_clause(row.get("text") or "") if trigger else None
         row["trigger_text"] = clause
         row["until"] = f"until: {clause}" if clause else None
-    # Stable: the SQL order (opened_at DESC) survives inside each rank.
-    rows.sort(key=lambda r: r["priority"])
+    # O3: age x kind — within a priority tier (kind), the LONGEST-outstanding
+    # item leads (opened_at ascending), not the newest one the SQL fetched
+    # first. A row with no opened_at (should not happen; NOT NULL) sorts
+    # last within its tier rather than raising.
+    from datetime import datetime, timezone
+
+    _max_dt = datetime.max.replace(tzinfo=timezone.utc)
+    rows.sort(key=lambda r: (r["priority"], r.get("opened_at") or _max_dt))
     return rows
 
 

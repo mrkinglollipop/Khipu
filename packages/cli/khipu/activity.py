@@ -254,8 +254,13 @@ def project_slice(
     with connect() as conn:
         with conn.cursor() as cur:
             if project:
+                # O3: a snoozed row (due_after in the future) is parked — it
+                # must not reappear in the session-start slice before its
+                # due date, even though `khipu owed`/the desktop still list
+                # it so it can be managed.
                 owed = _commitments.list_owed(
-                    cur, project=project, status="open", limit=commitment_limit
+                    cur, project=project, status="open", limit=commitment_limit,
+                    hide_snoozed=True,
                 )
                 from datetime import timedelta
 

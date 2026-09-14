@@ -181,6 +181,47 @@ def _fit_budget(lines: list[str], budget: int = _SLICE_BUDGET_CHARS) -> list[str
     return out
 
 
+def _commitment_display_rows(owed: list[dict]) -> tuple[list[dict], int]:
+    """(rows to show, extra_blocker_count) — O3: user-owned blockers are
+    capped at 2 in the slice; a blocker beyond the cap is counted, not
+    rendered, and the caller adds a "+N more" line pointing at `khipu owed`
+    instead of letting blockers alone fill the whole block."""
+    display: list[dict] = []
+    blocker_shown = 0
+    extra_blockers = 0
+    for c in owed:
+        is_user_blocker = (
+            str(c.get("owner") or "").strip().lower() == "user"
+            and str(c.get("kind") or "").strip().lower() == "blocker"
+        )
+        if is_user_blocker:
+            if blocker_shown < 2:
+                display.append(c)
+                blocker_shown += 1
+            else:
+                extra_blockers += 1
+            continue
+        display.append(c)
+    return display[:5], extra_blockers
+
+
+def _commitment_age_days(c: dict) -> int | None:
+    """Age of a commitment's `opened_at` in whole days, or None if unknown/
+    unparseable — used to show "(Nd old)" for anything over 7 days (O3)."""
+    opened = c.get("opened_at")
+    if not opened:
+        return None
+    try:
+        from datetime import datetime, timezone
+
+        when = opened if hasattr(opened, "tzinfo") else datetime.fromisoformat(str(opened))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - when).days
+    except Exception:  # noqa: BLE001 — a display nicety, never worth failing the slice
+        return None
+
+
 def _render_project_slice(label: str, slice_data: dict) -> str:
     from khipu.snippets import clip_snippet
 
@@ -188,11 +229,16 @@ def _render_project_slice(label: str, slice_data: dict) -> str:
     owed = slice_data.get("commitments") or []
     if owed:
         lines.append("### Open commitments")
-        for c in owed[:5]:
+        display, extra_blockers = _commitment_display_rows(owed)
+        for c in display:
             text = clip_snippet(str(c.get("text") or ""), 160)
             owner = str(c.get("owner") or "").strip()
             who = " (needs the user)" if owner == "user" else (" (yours)" if owner == "assistant" else "")
-            lines.append(f"- [{c.get('kind')}]{who} `{c.get('id')}`: {text}")
+            age_days = _commitment_age_days(c)
+            age_txt = f" ({age_days}d old)" if age_days is not None and age_days > 7 else ""
+            lines.append(f"- [{c.get('kind')}]{who}{age_txt} `{c.get('id')}`: {text}")
+        if extra_blockers:
+            lines.append(f"- +{extra_blockers} more blocker(s) in `khipu owed`")
         lines.append(
             "Items marked (needs the user) are the user's to do or decide — do not "
             "act on them yourself. When the user says one is done, close it right "

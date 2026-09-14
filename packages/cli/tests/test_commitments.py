@@ -62,7 +62,8 @@ class _CommitmentsCursor:
         _db._TABLE_COLUMNS_CACHE.pop("commitments", None)
 
     def _seed(self, text, *, project="acme/widget", kind="followup", owner=None,
-              episode=1, session_id=None, status="open", future_trigger=False):
+              episode=1, session_id=None, status="open", future_trigger=False,
+              due_after=None, opened_at="t0"):
         """Insert a row WITHOUT going through open_from_episode's filter — for
         tests about auto_close / stale / listing, whose fixtures predate the
         precision filter and are not what those tests are about."""
@@ -70,7 +71,7 @@ class _CommitmentsCursor:
         self.next_id += 1
         self.rows[cid] = {
             "id": cid, "text": text, "project": project, "owner": owner, "kind": kind,
-            "opened_episode": episode, "opened_at": "t0", "due_after": None,
+            "opened_episode": episode, "opened_at": opened_at, "due_after": due_after,
             "status": status, "closed_episode": None, "closed_at": None,
             "close_reason": None, "content_hash": co.content_hash(project, text),
             "last_seen_at": None, "seen_count": 1, "future_trigger": future_trigger,
@@ -187,6 +188,22 @@ class _CommitmentsCursor:
             out = [r for r in self.rows.values() if r["status"] == status]
             if project:
                 out = [r for r in out if r["project"] == project]
+            if "due_after IS NULL OR due_after <= now()" in s:
+                from datetime import datetime, timezone
+
+                def _not_snoozed(r):
+                    da = r["due_after"]
+                    if not da:
+                        return True
+                    try:
+                        when = datetime.fromisoformat(str(da).replace("Z", "+00:00"))
+                        if when.tzinfo is None:
+                            when = when.replace(tzinfo=timezone.utc)
+                        return when <= datetime.now(timezone.utc)
+                    except Exception:
+                        return True
+
+                out = [r for r in out if _not_snoozed(r)]
             wide = "last_seen_at" in s
             with_trigger = "future_trigger" in s
             self._result = [

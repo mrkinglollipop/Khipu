@@ -665,3 +665,115 @@ class DeliverablesMatcherTest(unittest.TestCase):
     def test_no_project_never_queries(self):
         cur = _DeliverablesCursor()
         self.assertIsNone(dl.deliverable_line_for_prompt(cur, ["x", "y"], project=None))
+
+
+# ---- O3: parking works ------------------------------------------------------
+
+class AgeWithinKindOrderingTest(unittest.TestCase):
+    """owed_priority's tiers are unchanged (existing contract, kept); within
+    one tier list_owed now breaks ties by age — the longest-open item of a
+    kind leads, not the one the SQL happened to fetch first."""
+
+    def test_the_older_blocker_leads_within_the_same_tier(self):
+        cur = _CommitmentsCursor(migrated=True)
+        cur._seed("Newer blocker", owner="matt", kind="blocker", opened_at="2026-09-10")
+        cur._seed("Older blocker", owner="matt", kind="blocker", opened_at="2026-09-01")
+        rows = co.list_owed(cur, project="acme/widget")
+        self.assertEqual([r["text"] for r in rows], ["Older blocker", "Newer blocker"])
+
+    def test_priority_tiers_are_unchanged(self):
+        """Regression guard: age tie-breaking must never move a row across
+        the existing blocker/question/other/trigger/kind tier boundaries."""
+        cur = _CommitmentsCursor(migrated=True)
+        cur._seed("Old followup, not user-owed", kind="followup", opened_at="2026-01-01")
+        cur._seed("New blocker for the user", owner="matt", kind="blocker",
+                   opened_at="2026-09-10")
+        rows = co.list_owed(cur, project="acme/widget")
+        self.assertEqual(rows[0]["text"], "New blocker for the user")
+
+
+class SnoozeHidesFromTheSliceTest(unittest.TestCase):
+    """khipu owed --snooze sets due_after; hide_snoozed=True (the W4 pushed
+    slice's call) must not surface the row again until that date passes."""
+
+    def test_hide_snoozed_excludes_a_future_due_after(self):
+        cur = _CommitmentsCursor(migrated=True)
+        cur._seed("Parked until next quarter", due_after="2099-01-01T00:00:00+00:00")
+        cur._seed("Not snoozed", due_after=None)
+        rows = co.list_owed(cur, project="acme/widget", hide_snoozed=True)
+        self.assertEqual([r["text"] for r in rows], ["Not snoozed"])
+
+    def test_a_past_due_after_is_no_longer_hidden(self):
+        cur = _CommitmentsCursor(migrated=True)
+        cur._seed("Snooze expired", due_after="2020-01-01T00:00:00+00:00")
+        rows = co.list_owed(cur, project="acme/widget", hide_snoozed=True)
+        self.assertEqual([r["text"] for r in rows], ["Snooze expired"])
+
+    def test_hide_snoozed_defaults_to_false_so_khipu_owed_still_shows_it(self):
+        cur = _CommitmentsCursor(migrated=True)
+        cur._seed("Parked until next quarter", due_after="2099-01-01T00:00:00+00:00")
+        rows = co.list_owed(cur, project="acme/widget")
+        self.assertEqual(len(rows), 1)
+
+
+class SliceBlockerCapTest(unittest.TestCase):
+    """The W4 pushed slice caps user-owned blockers at 2 with a '+N more'
+    line; other kinds are unaffected."""
+
+    def test_a_third_user_blocker_is_replaced_by_a_more_line(self):
+        from khipu import recall_rule as rr
+
+        owed = [
+            {"id": 1, "text": "Blocker A", "owner": "user", "kind": "blocker",
+             "opened_at": "2026-09-01"},
+            {"id": 2, "text": "Blocker B", "owner": "user", "kind": "blocker",
+             "opened_at": "2026-09-02"},
+            {"id": 3, "text": "Blocker C", "owner": "user", "kind": "blocker",
+             "opened_at": "2026-09-03"},
+        ]
+        out = rr._render_project_slice("acme/widget", {"commitments": owed})
+        self.assertIn("Blocker A", out)
+        self.assertIn("Blocker B", out)
+        self.assertNotIn("Blocker C", out)
+        self.assertIn("+1 more blocker(s) in `khipu owed`", out)
+
+    def test_non_blocker_kinds_are_never_capped(self):
+        from khipu import recall_rule as rr
+
+        owed = [
+            {"id": 1, "text": "Question A", "owner": "user", "kind": "question",
+             "opened_at": "2026-09-01"},
+            {"id": 2, "text": "Question B", "owner": "user", "kind": "question",
+             "opened_at": "2026-09-02"},
+            {"id": 3, "text": "Question C", "owner": "user", "kind": "question",
+             "opened_at": "2026-09-03"},
+        ]
+        out = rr._render_project_slice("acme/widget", {"commitments": owed})
+        self.assertIn("Question A", out)
+        self.assertIn("Question B", out)
+        self.assertIn("Question C", out)
+        self.assertNotIn("more blocker", out)
+
+
+class SliceAgeDisplayTest(unittest.TestCase):
+    def test_an_item_older_than_7_days_shows_its_age(self):
+        from datetime import datetime, timedelta, timezone
+
+        from khipu import recall_rule as rr
+
+        old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        owed = [{"id": 1, "text": "Ancient followup", "owner": "user", "kind": "followup",
+                 "opened_at": old}]
+        out = rr._render_project_slice("acme/widget", {"commitments": owed})
+        self.assertIn("10d old", out)
+
+    def test_an_item_7_days_or_younger_shows_no_age(self):
+        from datetime import datetime, timedelta, timezone
+
+        from khipu import recall_rule as rr
+
+        recent = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        owed = [{"id": 1, "text": "Fresh followup", "owner": "user", "kind": "followup",
+                 "opened_at": recent}]
+        out = rr._render_project_slice("acme/widget", {"commitments": owed})
+        self.assertNotIn("d old", out)
