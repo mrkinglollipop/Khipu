@@ -545,9 +545,16 @@ or twenty minutes — plus one at every compaction or session end. A window unde
 has not changed is never re-embedded.
 
 **Do I need the gateway?**
-Only for agents that run in the cloud (Grok Bot / Cursor cloud agents). Claude
-Code, Cursor, Codex and Aegis on your Mac talk to the database directly over your
-private network. If you never use a cloud agent, skip the gateway entirely.
+For cloud agents (Grok Bot / Cursor cloud agents), yes — it's the only way in.
+Claude Code, Cursor and Codex on your Mac talk to the database directly over
+your private network and need no gateway. Aegis is the exception, not an
+extra-configuration-free member of that list: its sandbox cannot reach
+Postgres or the Keychain, so it always talks to Khipu over the gateway too,
+with a bearer token it reads from `KHIPU_GATEWAY_TOKEN` or the file named in
+its own `[memory.khipu] token_file`. Once `gateway_url` is configured, run
+`khipu gateway token set` once to stage that token — `khipu integrations
+verify aegis` names the same fix if it is ever missing or refused. If you
+never use Aegis or a cloud agent, skip the gateway entirely.
 
 **Something is red in `khipu doctor`. What now?**
 Each check names what it wants. `not_configured` is not red — it lists checks
