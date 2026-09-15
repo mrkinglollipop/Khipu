@@ -633,6 +633,32 @@ class ToolDispatchNeverKillsTheServerTest(unittest.TestCase):
         self.assertIsNone(os.environ.get("KHIPU_HUB_FILE_MIRROR"))
 
 
+# A hit as recall_prompt hands it to _attach_prior_work — carries a couple
+# of extra internal keys (rank_text-derived fields never land here in
+# practice, but the mapping only reads kind/id/ts/project/status/snippet/
+# label, so an extra key is harmless) alongside what _prior_work_items maps.
+_SAMPLE_HIT = {
+    "kind": "topic", "id": "khipu-state-of-play", "ts": "2026-09-14T10:00:00+00:00",
+    "project": "khipu", "status": "active",
+    "snippet": "Soak is blocked on second-Mac onboarding; see plan.md.",
+}
+# The wire-shape item _prior_work_items derives from _SAMPLE_HIT.
+_SAMPLE_ITEM = {
+    "kind": "topic", "id": "khipu-state-of-play", "date": "2026-09-14",
+    "project": "khipu", "status": "active",
+    "snippet": "Soak is blocked on second-Mac onboarding; see plan.md.",
+}
+_SAMPLE_TEXT = "## Prior work on this topic\n- x"
+
+# A budgeted prior_work_for_prompt result always carries prior_work_meta
+# (budget_ms rides along by default), so every mock below uses a return
+# value shaped like the real thing.
+_PRIOR_WORK_OK = {
+    "context": _SAMPLE_TEXT, "hits": [_SAMPLE_HIT], "reason": "ok", "ms": 1.0,
+    "prior_work_meta": {"legs": ["lexical", "cosine"], "ms": 1.0, "degraded": None, "reason": "ok"},
+}
+
+
 class StatusPriorWorkTest(unittest.TestCase):
     """R10: khipu_status's fallback push for a harness with no SessionStart
     or UserPromptSubmit hook (Aegis, the gateway) — pass `prompt`, get
@@ -642,7 +668,9 @@ class StatusPriorWorkTest(unittest.TestCase):
     These tests all pass ``full: True`` (2026-09-15) so they exercise the
     unchanged complete-schema path — see ``StatusLightPayloadTest`` below
     for the new default (``prompt`` given, ``full`` not set) light-payload
-    behavior."""
+    behavior. Wire shape (2026-09-15): ``prior_work`` is now the item ARRAY
+    (see ``_prior_work_items`` / ``_SAMPLE_ITEM``); the old rendered block
+    lives on ``prior_work_text``."""
 
     def _status(self, args):
         with mock.patch("khipu.drift.status_payload", return_value={"counts": {"episodes": 1}}), \
@@ -652,14 +680,15 @@ class StatusPriorWorkTest(unittest.TestCase):
     def test_no_prompt_means_no_prior_work_key_at_all(self):
         out = self._status({})
         self.assertNotIn("prior_work", out)
+        self.assertNotIn("prior_work_text", out)
 
-    def test_a_topical_prompt_attaches_prior_work(self):
+    def test_a_topical_prompt_attaches_prior_work_as_an_item_array(self):
         with mock.patch(
-            "khipu.recall_prompt.prior_work_for_prompt",
-            return_value={"context": "## Prior work on this topic\n- x", "hits": [], "reason": "ok", "ms": 1.0},
+            "khipu.recall_prompt.prior_work_for_prompt", return_value=_PRIOR_WORK_OK,
         ) as m:
             out = self._status({"prompt": "what did we decide", "cwd": "/repo", "full": True})
-        self.assertEqual(out["prior_work"], "## Prior work on this topic\n- x")
+        self.assertEqual(out["prior_work"], [_SAMPLE_ITEM])
+        self.assertEqual(out["prior_work_text"], _SAMPLE_TEXT)
         self.assertEqual(m.call_args.args[0], "what did we decide")
         self.assertEqual(m.call_args.kwargs["cwd"], "/repo")
         # Budgeted phase: the default budget always rides along now, so a
@@ -667,16 +696,39 @@ class StatusPriorWorkTest(unittest.TestCase):
         # to know the parameter exists to get the budgeted behavior.
         self.assertEqual(m.call_args.kwargs["budget_ms"], 600)
 
-    def test_a_custom_budget_ms_is_forwarded_and_clamped(self):
+    def test_prior_work_is_the_empty_list_when_nothing_clears_the_floor(self):
+        """A prompt that searched but found nothing reads as `[]` — the
+        search RAN, it just came up empty — distinct from `null` (the
+        search never ran at all, see the gated test below)."""
         with mock.patch(
             "khipu.recall_prompt.prior_work_for_prompt",
-            return_value={"context": "x", "hits": [], "reason": "ok", "ms": 1.0},
+            return_value={
+                "context": "", "hits": [], "reason": "ok", "ms": 1.0,
+                "prior_work_meta": {"legs": ["lexical", "cosine"], "ms": 1.0,
+                                     "degraded": None, "reason": "ok"},
+            },
+        ):
+            out = self._status({"prompt": "what did we decide", "full": True})
+        self.assertEqual(out["prior_work"], [])
+        self.assertIsNone(out["prior_work_text"])
+
+    def test_at_most_three_items_even_with_more_hits(self):
+        hits = [dict(_SAMPLE_HIT, id=f"topic-{i}") for i in range(5)]
+        with mock.patch(
+            "khipu.recall_prompt.prior_work_for_prompt",
+            return_value={**_PRIOR_WORK_OK, "hits": hits},
+        ):
+            out = self._status({"prompt": "what did we decide", "full": True})
+        self.assertEqual(len(out["prior_work"]), 3)
+
+    def test_a_custom_budget_ms_is_forwarded_and_clamped(self):
+        with mock.patch(
+            "khipu.recall_prompt.prior_work_for_prompt", return_value=_PRIOR_WORK_OK,
         ) as m:
             self._status({"prompt": "what did we decide", "budget_ms": 250, "full": True})
         self.assertEqual(m.call_args.kwargs["budget_ms"], 250)
         with mock.patch(
-            "khipu.recall_prompt.prior_work_for_prompt",
-            return_value={"context": "x", "hits": [], "reason": "ok", "ms": 1.0},
+            "khipu.recall_prompt.prior_work_for_prompt", return_value=_PRIOR_WORK_OK,
         ) as m:
             self._status({"prompt": "what did we decide", "budget_ms": 99999, "full": True})
         self.assertEqual(m.call_args.kwargs["budget_ms"], 5000)
@@ -697,6 +749,7 @@ class StatusPriorWorkTest(unittest.TestCase):
             out = self._status({"prompt": "ok", "full": True})
         self.assertIn("prior_work", out)
         self.assertIsNone(out["prior_work"])
+        self.assertIsNone(out["prior_work_text"])
         self.assertEqual(out["prior_work_meta"]["reason"], "trivial acknowledgment")
 
     def test_a_crash_in_the_optional_field_never_breaks_status(self):
@@ -706,21 +759,12 @@ class StatusPriorWorkTest(unittest.TestCase):
             out = self._status({"prompt": "what did we decide", "full": True})
         self.assertEqual(out["counts"]["episodes"], 1)
         self.assertNotIn("prior_work", out)
-
-
-# A budgeted prior_work_for_prompt result always carries prior_work_meta
-# (budget_ms rides along by default — see StatusPriorWorkTest above), so the
-# light-payload tests below use a return value shaped like the real thing
-# rather than the meta-less shorthand the full-schema tests above use.
-_PRIOR_WORK_OK = {
-    "context": "x", "hits": [], "reason": "ok", "ms": 1.0,
-    "prior_work_meta": {"legs": ["lexical", "cosine"], "ms": 1.0, "degraded": None, "reason": "ok"},
-}
+        self.assertNotIn("prior_work_text", out)
 
 
 class StatusLightPayloadTest(unittest.TestCase):
     """2026-09-15: `prompt` given, `full` not set (the new default) returns
-    the LIGHT schema — {hub_ok, prior_work, prior_work_meta,
+    the LIGHT schema — {hub_ok, prior_work, prior_work_text, prior_work_meta,
     notes_freshness} only — and never calls the heavy status_payload path.
     No real DB: khipu.db.connect and prior_work_for_prompt are mocked."""
 
@@ -735,7 +779,8 @@ class StatusLightPayloadTest(unittest.TestCase):
             out = ms._tool_status({"prompt": "what did we decide"})
         heavy.assert_not_called()
         self.assertEqual(
-            set(out), {"hub_ok", "prior_work", "prior_work_meta", "notes_freshness"}
+            set(out),
+            {"hub_ok", "prior_work", "prior_work_text", "prior_work_meta", "notes_freshness"},
         )
         self.assertNotIn("counts", out)
 
@@ -749,7 +794,8 @@ class StatusLightPayloadTest(unittest.TestCase):
             out = ms._tool_status({"prompt": "what did we decide"})
         self.assertTrue(out["hub_ok"])
         self.assertEqual(out["notes_freshness"], {"ok": True})
-        self.assertEqual(out["prior_work"], "x")
+        self.assertEqual(out["prior_work"], [_SAMPLE_ITEM])
+        self.assertEqual(out["prior_work_text"], _SAMPLE_TEXT)
 
     def test_light_payload_reports_hub_ok_false_on_an_unreachable_hub(self):
         with mock.patch("khipu.db.connect", side_effect=RuntimeError("no dsn")), \
@@ -762,7 +808,7 @@ class StatusLightPayloadTest(unittest.TestCase):
         self.assertIn("hub_error", out)
         self.assertNotIn("notes_freshness", out)
         # prior_work still lands — the probe and the lane are independent.
-        self.assertEqual(out["prior_work"], "x")
+        self.assertEqual(out["prior_work"], [_SAMPLE_ITEM])
 
     def test_full_true_with_a_prompt_still_gets_the_complete_schema(self):
         with mock.patch("khipu.drift.status_payload", return_value={"counts": {"episodes": 1}}), \
@@ -773,7 +819,7 @@ class StatusLightPayloadTest(unittest.TestCase):
                 ):
             out = ms._tool_status({"prompt": "what did we decide", "full": True})
         self.assertIn("counts", out)
-        self.assertEqual(out["prior_work"], "x")
+        self.assertEqual(out["prior_work"], [_SAMPLE_ITEM])
 
     def test_full_false_is_the_same_as_omitted(self):
         with mock.patch("khipu.drift.status_payload") as heavy, \

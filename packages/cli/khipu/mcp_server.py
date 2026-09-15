@@ -295,8 +295,8 @@ TOOLS: list[dict] = [
             "file-vs-PG drift sample (slower: walks the memory root). "
             "When `prompt` is given and `full` is not set, the schema "
             "narrows to a LIGHT payload — {hub_ok, prior_work, "
-            "prior_work_meta, notes_freshness} only, no counts/drift/"
-            "recent_captures — so this call costs roughly what `prior_work` "
+            "prior_work_text, prior_work_meta, notes_freshness} only, no "
+            "counts/drift/recent_captures — so this call costs roughly what `prior_work` "
             "alone costs (the heavy status queries run concurrently with "
             "the prior_work lane on a background thread, never sequentially "
             "in front of it; measured live: the full payload used to add "
@@ -315,11 +315,16 @@ TOOLS: list[dict] = [
                     "description": (
                         "R10: for a harness with no pushed slice and no per-prompt "
                         "push (Aegis, the gateway) — pass the first user prompt of "
-                        "the session and the response carries a `prior_work` field: "
-                        "the same top-3 'prior work' block a UserPromptSubmit hook "
-                        "would otherwise have pushed. Omit once the session already "
-                        "has that context. Also switches the response to the LIGHT "
-                        "payload (see the tool description) unless `full` is set."
+                        "the session and the response carries the same top-3 'prior "
+                        "work' a UserPromptSubmit hook would otherwise have pushed, "
+                        "as `prior_work`: a list of up to 3 {kind, id, date, project, "
+                        "status, snippet} items ([] when nothing clears the relevance "
+                        "floor, null only when the prompt itself gated). "
+                        "`prior_work_text` carries the same material pre-rendered as a "
+                        "≤600-char Markdown block for a caller that just wants to "
+                        "paste it. Omit `prompt` once the session already has that "
+                        "context. Also switches the response to the LIGHT payload "
+                        "(see the tool description) unless `full` is set."
                     ),
                 },
                 "cwd": {
@@ -343,9 +348,10 @@ TOOLS: list[dict] = [
                     "description": (
                         "With `prompt`: return the complete status schema (counts, "
                         "drift, recent_captures, search_degraded_last_24h, …) instead "
-                        "of the light {hub_ok, prior_work, prior_work_meta, "
-                        "notes_freshness} payload. Default false. Ignored without "
-                        "`prompt` — the complete schema is already the only shape."
+                        "of the light {hub_ok, prior_work, prior_work_text, "
+                        "prior_work_meta, notes_freshness} payload. Default false. "
+                        "Ignored without `prompt` — the complete schema is already "
+                        "the only shape."
                     ),
                 },
             },
@@ -610,7 +616,7 @@ def _tool_graph(args: dict) -> dict:
 
 def _tool_status_light(args: dict) -> dict:
     """The ``prompt``-given, ``full``-not-set schema (2026-09-15): ``{hub_ok,
-    prior_work, prior_work_meta, notes_freshness}`` only.
+    prior_work, prior_work_text, prior_work_meta, notes_freshness}`` only.
 
     ``drift.status_payload`` does several sequential round trips (table
     counts, now()/max(ts), a second query for the most-recent capture row,
@@ -713,24 +719,78 @@ _BUDGET_MS_MIN = 100
 _BUDGET_MS_MAX = 5000
 
 
+_PRIOR_WORK_SNIPPET_LIMIT = 160
+# _gated()'s own reason strings (recall_prompt.prior_work_for_prompt) — the
+# ONLY terminal reasons produced before a search ever runs. Everything else
+# (ok, dedup, a timeout, a search-time error) means the search DID run, so
+# `prior_work` reads as `[]` ("checked, nothing there"), not `null` ("never
+# checked" — reserved for these).
+_PRIOR_WORK_GATED_REASONS = frozenset({"no content tokens", "trivial acknowledgment"})
+
+
+def _prior_work_gated(reason: str) -> bool:
+    return reason in _PRIOR_WORK_GATED_REASONS or reason.startswith("gate error:")
+
+
+def _prior_work_items(hits: list[dict]) -> list[dict]:
+    """The `prior_work` wire shape (2026-09-15): a list of up to 3 items —
+    exactly `kind`/`id`/`date`/`project`/`status`/`snippet` — instead of the
+    rendered Markdown string. Aegis (the client this field exists for) parses
+    `prior_work` as this array; seeing a string instead, it fell back to a
+    second `khipu_search` round trip, which is most of what put a "budgeted
+    to 600ms" lane over a 1s wall in practice. `prior_work_text` (set by the
+    caller) carries the old rendered block for a caller that just wants to
+    paste it.
+
+    `date`/`project`/`status` come from whatever the hit already carries —
+    real for a hit found via `hub_snapshot` (a Mac with a fresh local
+    replica) or one that also matched the budgeted lexical leg (episodes/
+    topics both select `ts` there), `null` for a cosine-only hit or a caller
+    with no snapshot and no lexical match on that row (the gateway's
+    `_cosine_candidates` doesn't select project/status — no query added here
+    to keep it that way).
+    """
+    from khipu.snippets import clip_snippet
+
+    out = []
+    for h in hits[:3]:
+        kind = h.get("kind")
+        ts = h.get("ts")
+        date = str(ts)[:10] if ts else None
+        raw = str(h.get("snippet") or h.get("label") or "")
+        out.append({
+            "kind": kind,
+            "id": h.get("id"),
+            "date": date,
+            "project": h.get("project"),
+            "status": h.get("status") if kind == "topic" else None,
+            "snippet": clip_snippet(" ".join(raw.split()), _PRIOR_WORK_SNIPPET_LIMIT),
+        })
+    return out
+
+
 def _attach_prior_work(payload: dict, args: dict) -> None:
     """R10: khipu_status's fallback push for a harness with no SessionStart
     or UserPromptSubmit hook to inject through (Aegis, the gateway) — the
     caller passes the session's first user prompt and gets the same top-3
-    block a hook would otherwise have pushed, under `prior_work`. Mutates
-    `payload` in place; never raises (prior_work_for_prompt already never
-    does, but this is the one place a caller cannot afford a crash to reach
-    from an optional field).
+    "prior work" a hook would otherwise have pushed. Mutates `payload` in
+    place; never raises (prior_work_for_prompt already never does, but this
+    is the one place a caller cannot afford a crash to reach from an
+    optional field).
 
     Budgeted phase (2026-09-15): always runs through prior_work_for_prompt's
     budget_ms path now (default DEFAULT_HUB_BUDGET_MS = 600ms, clamped to
     [100, 5000] against a bad caller value) — this is precisely the R10 lane
-    (Aegis, the gateway) the 1.0s hard slot-drop measurement targeted. Sets
-    `prior_work` to the block, or explicitly to None when the prompt gated
-    to nothing (never just an absent key, so a caller can tell "checked, no
-    hits" from "prompt not given" — the latter returns before this point).
-    `prior_work_meta` carries legs/ms/degraded/reason when the callee
-    provides it.
+    (Aegis, the gateway) the 1.0s hard slot-drop measurement targeted.
+
+    Wire shape (2026-09-15): `prior_work` is a LIST of up to 3 items (see
+    `_prior_work_items`) — `[]` when the search ran and nothing cleared the
+    relevance floor, `None` only when the prompt itself gated before any
+    search ran (`_prior_work_gated`). `prior_work_text` carries the same
+    material pre-rendered as the old ≤600-char Markdown block, `None` when
+    empty — unchanged in content, just a new key (`prior_work` used to BE
+    this string). `prior_work_meta` carries legs/ms/degraded/reason when the
+    callee provides it, exactly as before.
     """
     prompt = str(args.get("prompt") or "").strip()
     if not prompt:
@@ -748,7 +808,11 @@ def _attach_prior_work(payload: dict, args: dict) -> None:
         budget_ms = max(_BUDGET_MS_MIN, min(budget_ms, _BUDGET_MS_MAX))
 
         result = prior_work_for_prompt(prompt, cwd=args.get("cwd"), budget_ms=budget_ms)
-        payload["prior_work"] = result["context"] or None
+        if _prior_work_gated(str(result.get("reason") or "")):
+            payload["prior_work"] = None
+        else:
+            payload["prior_work"] = _prior_work_items(result.get("hits") or [])
+        payload["prior_work_text"] = result["context"] or None
         meta = result.get("prior_work_meta")
         if meta is not None:
             payload["prior_work_meta"] = meta
