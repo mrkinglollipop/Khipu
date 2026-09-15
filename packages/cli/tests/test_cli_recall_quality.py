@@ -58,6 +58,10 @@ def _green_doctor_patches():
             "khipu.integrations.gateway_liveness_check",
             return_value={"ok": True, "applicable": False},
         ),
+        mock.patch(
+            "khipu.integrations.aegis_gateway_check",
+            return_value={"ok": True, "applicable": False, "note": "no gateway_url configured"},
+        ),
         mock.patch("khipu.session_capture.unknown_harness_heartbeats", return_value={"warnings": []}),
     ]
 

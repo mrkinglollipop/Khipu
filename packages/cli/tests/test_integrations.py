@@ -9,6 +9,7 @@ writing, and uninstall removes only what install added.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,6 +28,13 @@ class _TempHomeCase(unittest.TestCase):
             mock.patch.object(integ, "CURSOR_MCP", self.home / ".cursor" / "mcp.json"),
             mock.patch.object(integ, "CURSOR_HOOKS", self.home / ".cursor" / "hooks.json"),
             mock.patch.object(integ, "AEGIS_TOML", self.home / ".grok" / "config.toml"),
+            # gateway_token_file() reads khipu.paths.data_dir(), which is NOT
+            # governed by the integ.HOME patch above — it reads Path.home()
+            # itself (or KHIPU_DATA_DIR). Left unpatched, a Mac that already
+            # has a real ~/.config/khipu/gateway-token staged (the maintainer's,
+            # per the 2026-09-14 gap) leaks into every aegis install/verify
+            # test here. Isolate it under the same temp home as everything else.
+            mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(self.home / ".config" / "khipu")}),
         ]
         for p in self._patches:
             p.start()
