@@ -255,6 +255,38 @@ class ProbePromptRecallSnapshotTest(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertEqual(out["error"], "trivial prompt was not empty")
 
+    def test_repeat_calls_use_distinct_session_ids_not_a_fixed_literal(self):
+        """Found live 2026-09-14: the probe used to send session_id="khipu-verify"
+        on every call. khipu-prompt-recall's own dedup (recall_prompt.py) suppresses
+        re-showing the same hit batch to the same session_id, so the SECOND (and
+        every later) `integrations verify` on a Mac that had already run one replayed
+        the first run's dedup file and got hits=[] back — read as a broken topical
+        lane when dedup was working as designed. Two consecutive calls (snapshot
+        fresh, subprocess mocked to inspect what was sent) must never reuse a
+        session_id, in either the topical or the trivial call."""
+        seen_session_ids = []
+
+        def _record_and_respond(*_a, input=None, **_kw):  # noqa: A002
+            payload = json.loads(input)
+            seen_session_ids.append(payload.get("session_id"))
+            ctx = "## Prior work on this topic\n- x" if payload.get("prompt") != "ok" else ""
+            return mock.Mock(returncode=0, stdout=json.dumps(
+                {"hookSpecificOutput": {"additionalContext": ctx}} if ctx else {}
+            ), stderr="")
+
+        with mock.patch(
+            "khipu.hub_snapshot.snapshot_is_fresh", return_value=(True, {})
+        ), mock.patch.object(integ.subprocess, "run", side_effect=_record_and_respond):
+            out1 = integ._probe_prompt_recall("khipu-prompt-recall")
+            out2 = integ._probe_prompt_recall("khipu-prompt-recall")
+
+        self.assertTrue(out1["ok"])
+        self.assertTrue(out2["ok"])
+        self.assertEqual(len(seen_session_ids), 4)  # trivial+topical, twice
+        self.assertEqual(len(seen_session_ids), len(set(seen_session_ids)),
+                          f"a session_id repeated across probe calls: {seen_session_ids}")
+        self.assertNotIn("khipu-verify", seen_session_ids)
+
 
 class AegisIsolationTest(unittest.TestCase):
     """Aegis is its own harness (maintainer, 2026-08-17). Exactly ONE Khipu script may

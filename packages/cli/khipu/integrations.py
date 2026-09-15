@@ -60,6 +60,7 @@ import shutil
 import subprocess
 import time
 import tomllib
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1102,12 +1103,23 @@ def _probe_prompt_recall(command: str) -> dict:
         snapshot_fresh, _health = hub_snapshot.snapshot_is_fresh()
     except Exception:  # noqa: BLE001 — a broken freshness check must not break the probe
         snapshot_fresh = False
+    # A unique session_id per call, not the fixed "khipu-verify" literal every other
+    # probe in this module uses: khipu-prompt-recall's own dedup (recall_prompt.py
+    # _load_recent_batches/_save_recent_batches) suppresses re-showing the same hit
+    # batch to the same session_id. A fixed id meant every SECOND (and later) run of
+    # `integrations verify` on a live Mac replayed the first run's dedup file and
+    # legitimately got hits=[] back — read by this probe as a broken topical lane
+    # when it was dedup working as designed (found live 2026-09-14: verify() went
+    # red on a Mac whose `khipu-verify` dedup file already held today's batches).
+    trivial_session_id = f"khipu-verify-trivial-{uuid.uuid4().hex[:8]}"
+    topical_session_id = f"khipu-verify-topical-{uuid.uuid4().hex[:8]}"
     try:
-        trivial = subprocess.run(command, shell=True, input='{"prompt":"ok"}',
+        trivial = subprocess.run(command, shell=True,
+                                  input=json.dumps({"prompt": "ok", "session_id": trivial_session_id}),
                                   capture_output=True, text=True, timeout=10)
         topical = subprocess.run(
             command, shell=True,
-            input=json.dumps({"prompt": "khipu prompt recall verify probe", "session_id": "khipu-verify"}),
+            input=json.dumps({"prompt": "khipu prompt recall verify probe", "session_id": topical_session_id}),
             capture_output=True, text=True, timeout=10,
         )
     except Exception as e:  # noqa: BLE001
