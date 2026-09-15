@@ -1045,9 +1045,23 @@ def _gateway_token() -> str:
         return ""
 
 
+def _aegis_gateway_token() -> str:
+    """Bearer resolution exactly as Aegis's own sandbox resolves it: env, then
+    the on-disk token file. Deliberately never the Keychain — a check that
+    could see the Keychain would go green on a Mac where Aegis itself can
+    never reach it, reproducing the exact gap this was built to close."""
+    tok = (os.environ.get(GROK_BOT_TOKEN_ENV) or "").strip()
+    if tok:
+        return tok
+    return _read_gateway_token_file()
+
+
 def _probe_gateway(url: str, token: str) -> dict:
     """The real thing: HTTPS to the public gateway, initialize + tools/list +
-    khipu_status, plus a negative auth check. TLS verified by the system store."""
+    khipu_status, plus a negative auth check. TLS verified by the system store.
+    ``http_status`` is 200 on success, the HTTPError code on a refused/failed
+    request, or None when no HTTP response was ever received (DNS, timeout,
+    connection refused — i.e. the gateway itself is unreachable)."""
     import urllib.error
     import urllib.request
     t0 = time.time()
@@ -1072,10 +1086,50 @@ def _probe_gateway(url: str, token: str) -> dict:
         except urllib.error.HTTPError as e:
             refused = e.code == 401
         ok = "khipu_capture" in tools and "counts" in st and refused
-        return {"ok": ok, "episodes": st.get("counts", {}).get("episodes"), "tools": len(tools),
-                "auth_refused_wrong_token": refused, "ms": int((time.time() - t0) * 1000)}
+        return {"ok": ok, "http_status": 200, "episodes": st.get("counts", {}).get("episodes"),
+                "tools": len(tools), "auth_refused_wrong_token": refused,
+                "ms": int((time.time() - t0) * 1000)}
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "http_status": e.code, "error": f"HTTP {e.code}: {e.reason}"}
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+        return {"ok": False, "http_status": None, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+def aegis_gateway_check() -> dict:
+    """A real round trip through the gateway using the bearer Aegis itself
+    would resolve (see `_aegis_gateway_token`), reported as `gateway_ok` with
+    the HTTP status — the check the 2026-09-14 gap needed: `verify aegis` and
+    `khipu doctor` used to go green with no bearer ever staged. Not applicable
+    (green, uninvolved) when no gateway_url is configured at all — Aegis then
+    has no gateway to reach in the first place, same convention as
+    `gateway_liveness_check`."""
+    from khipu.config import gateway_url
+
+    url = gateway_url()
+    if not url:
+        return {"ok": True, "applicable": False, "note": "no gateway_url configured"}
+    fix = "run `khipu gateway token set`"
+    token = _aegis_gateway_token()
+    if not token:
+        return {"ok": False, "applicable": True, "gateway_ok": False, "http_status": None,
+                "error": f"no gateway token ({GROK_BOT_TOKEN_ENV} env or {gateway_token_file()})",
+                "fix": fix}
+    result = _probe_gateway(url, token)
+    ok = bool(result.get("ok"))
+    out: dict[str, Any] = {"applicable": True, "ok": ok, "gateway_ok": ok,
+                            "http_status": result.get("http_status"),
+                            "episodes": result.get("episodes"), "tools": result.get("tools"),
+                            "ms": result.get("ms")}
+    if not ok:
+        status = result.get("http_status")
+        if status in (401, 403):
+            out["error"] = result.get("error")
+            out["fix"] = fix
+        elif status is None:
+            out["error"] = "gateway unreachable"
+        else:
+            out["error"] = result.get("error")
+    return out
 
 
 def gateway_liveness_check() -> dict[str, Any]:
@@ -1543,6 +1597,10 @@ def verify(harness: str, *, project: str | None = None) -> dict:
             hook.update({k: v for k, v in iso.items() if k != "ms"}, ok=hook["ok"] and iso["ok"])
         out["components"]["hook"] = hook
         out["components"]["extract"] = dict(hook)
+        # The one round trip that proves Aegis can actually reach the hub over
+        # the gateway with a real bearer — the gap that let this pack (and
+        # `khipu doctor`) go green while every Aegis recall 401'd.
+        out["components"]["gateway"] = aegis_gateway_check()
         out["aegis"] = _aegis_runtime()
     else:
         if st["hook_stop"]:

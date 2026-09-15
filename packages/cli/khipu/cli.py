@@ -439,6 +439,27 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if not gw_liveness.get("ok", True):
         liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "gateway"]))
         liveness["ok"] = False
+    # Aegis-specific gateway round trip, same K9 evidence-must-arrive discipline
+    # but keyed on the bearer AEGIS ITSELF resolves (env or the on-disk token
+    # file, never Keychain — its sandbox cannot reach it). Folded into the
+    # aegis harness row, not just the cross-harness "gateway" row above,
+    # because this is what actually explains a 401'ing Aegis recall while the
+    # hook-liveness row stays green (2026-09-14 gap: this evidence never
+    # arrived, so both this row and `verify aegis` stayed green with no
+    # bearer ever staged).
+    try:
+        from khipu.integrations import aegis_gateway_check
+
+        aegis_gw = aegis_gateway_check()
+    except Exception as e:  # noqa: BLE001
+        aegis_gw = {"ok": False, "applicable": True, "error": f"{type(e).__name__}: {e}"}
+    if aegis_gw.get("applicable"):
+        aegis_row = liveness.setdefault("harnesses", {}).setdefault("aegis", {"harness": "aegis", "ok": True})
+        aegis_row["gateway"] = aegis_gw
+        if not aegis_gw.get("ok", True):
+            aegis_row["ok"] = False
+            liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "aegis"]))
+            liveness["ok"] = False
     # K8: a heartbeat file under the dispatch dir from a harness Khipu does
     # not recognise — a warning (never a hard red: the hook that wrote it may
     # still be working fine, it is just unidentified).
