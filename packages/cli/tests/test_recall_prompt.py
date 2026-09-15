@@ -318,5 +318,171 @@ class SnapshotSearchHitsTest(unittest.TestCase):
         self.assertEqual(out[0]["id"], "9")
 
 
+class _FakeConnCtx:
+    """A minimal stand-in for ``with connect() as conn: with conn.cursor() as
+    cur:`` — the lexical leg's cursor is never actually used once
+    ``cli._literal_candidates`` itself is mocked, so this just has to satisfy
+    the context-manager protocol on both levels."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def cursor(self):
+        return self
+
+
+class BudgetedHubSearchTest(unittest.TestCase):
+    """Item 1-3 of the budgeted-prior_work phase (2026-09-15): the gateway/
+    Aegis lane (no local snapshot) runs the lexical (pg_trgm) leg and the
+    query-embedding+cosine leg concurrently against the hub and answers with
+    whatever finished by ``budget_ms``, never both-or-nothing."""
+
+    def _lexical_row(self, hid: str, rank_text: str = "gateway budget lexical hit") -> dict:
+        return {"kind": "episode", "id": hid, "label": "lex", "snippet": "lex",
+                "rank_text": rank_text}
+
+    def _cosine_row(self, hid: str, score: float = 0.9) -> dict:
+        return {"kind": "episode", "id": hid, "score": score, "label": "cos",
+                "snippet": "cos", "rank_text": "gateway budget cosine hit"}
+
+    def test_both_legs_fast_fuses(self):
+        lex = [self._lexical_row("1"), self._lexical_row("2")]
+        cos = [self._cosine_row("2"), self._cosine_row("3")]
+        with mock.patch("khipu.db.connect", return_value=_FakeConnCtx()), \
+                mock.patch("khipu.cli._literal_candidates", return_value=lex), \
+                mock.patch("khipu.embed._cosine_candidates", return_value=cos):
+            out = rp._hub_hits_budgeted(
+                "gateway budget query", ["gateway", "budget"], project=None,
+                budget_ms=600, limit=rp.TOP_N,
+            )
+        self.assertEqual(set(out["legs"]), {"lexical", "cosine"})
+        self.assertIsNone(out["degraded"])
+        ids = {h["id"] for h in out["hits"]}
+        # id "2" is in both lists and must rank first (RRF sums both legs'
+        # contributions for the same key).
+        self.assertEqual(out["hits"][0]["id"], "2")
+        self.assertTrue(ids)
+
+    def test_slow_embedding_leg_degrades_to_lexical_only_within_budget(self):
+        lex = [self._lexical_row("1")]
+
+        def _slow_cosine(*a, **k):
+            time.sleep(2.0)
+            return [self._cosine_row("9")]
+
+        with mock.patch("khipu.db.connect", return_value=_FakeConnCtx()), \
+                mock.patch("khipu.cli._literal_candidates", return_value=lex), \
+                mock.patch("khipu.embed._cosine_candidates", side_effect=_slow_cosine):
+            t0 = time.monotonic()
+            out = rp._hub_hits_budgeted(
+                "gateway budget query", ["gateway", "budget"], project=None,
+                budget_ms=150, limit=rp.TOP_N,
+            )
+            elapsed = time.monotonic() - t0
+        self.assertEqual(out["legs"], ["lexical"])
+        self.assertEqual(out["degraded"], "embedding late")
+        self.assertEqual([h["id"] for h in out["hits"]], ["1"])
+        # Bounded by budget_ms plus scheduling/fuse slop, not the 2s sleep —
+        # the cosine leg keeps running on its own daemon thread in the
+        # background (it is never joined again), it just isn't waited on.
+        self.assertLess(elapsed, 1.0)
+
+    def test_top_k_output_is_capped_at_three(self):
+        lex = [self._lexical_row(str(i)) for i in range(8)]
+        cos = [self._cosine_row(str(i)) for i in range(8)]
+        with mock.patch("khipu.db.connect", return_value=_FakeConnCtx()), \
+                mock.patch("khipu.cli._literal_candidates", return_value=lex), \
+                mock.patch("khipu.embed._cosine_candidates", return_value=cos):
+            out = rp._hub_hits_budgeted(
+                "gateway budget query", ["gateway", "budget"], project=None,
+                budget_ms=600, limit=rp.TOP_N,
+            )
+        self.assertLessEqual(len(out["hits"]), rp.TOP_N)
+
+    def test_both_legs_erroring_reports_no_legs_completed(self):
+        with mock.patch("khipu.db.connect", side_effect=RuntimeError("hub down")), \
+                mock.patch("khipu.embed._cosine_candidates", side_effect=RuntimeError("hub down")):
+            out = rp._hub_hits_budgeted(
+                "gateway budget query", ["gateway", "budget"], project=None,
+                budget_ms=200, limit=rp.TOP_N,
+            )
+        self.assertEqual(out["hits"], [])
+        self.assertEqual(out["degraded"], "no legs completed")
+
+    def test_search_hits_budgeted_falls_back_to_hub_when_snapshot_unusable(self):
+        with mock.patch.object(rp, "_snapshot_search_hits",
+                                side_effect=rp._SnapshotUnusable("missing")), \
+                mock.patch.object(
+                    rp, "_hub_hits_budgeted",
+                    return_value={"hits": [{"id": "1"}], "legs": ["lexical", "cosine"],
+                                  "degraded": None},
+                ) as m_hub:
+            out = rp._search_hits_budgeted(
+                "gateway budget query", cwd=None, budget_ms=600, limit=rp.TOP_N,
+            )
+        m_hub.assert_called_once()
+        self.assertEqual(out["hits"], [{"id": "1"}])
+
+    def test_search_hits_budgeted_uses_the_snapshot_without_touching_the_hub(self):
+        snap_hit = {"kind": "episode", "id": "9", "score": 0.5, "label": "x", "snippet": "x"}
+        with mock.patch.object(rp, "_snapshot_search_hits", return_value=[snap_hit]), \
+                mock.patch.object(rp, "_hub_hits_budgeted") as m_hub:
+            out = rp._search_hits_budgeted(
+                "gateway budget query", cwd=None, budget_ms=600, limit=rp.TOP_N,
+            )
+        m_hub.assert_not_called()
+        self.assertEqual(out["legs"], ["snapshot"])
+        self.assertEqual(out["hits"][0]["id"], "9")
+
+
+class PriorWorkBudgetedTest(unittest.TestCase):
+    """``prior_work_for_prompt(..., budget_ms=...)`` — the khipu_status/
+    gateway entry point end to end (search leg mocked)."""
+
+    def test_gate_never_touches_the_search_leg_and_sets_meta(self):
+        # "yes" tokenizes to ["yes"], a subset of _ACK_WORDS — the
+        # trivial-acknowledgment gate, not the (structurally earlier)
+        # no-content-tokens gate exercised below.
+        with mock.patch.object(rp, "_search_hits_budgeted") as m_search:
+            out = rp.prior_work_for_prompt("yes", budget_ms=600)
+        m_search.assert_not_called()
+        self.assertEqual(out["context"], "")
+        self.assertEqual(
+            out["prior_work_meta"],
+            {"legs": [], "ms": 0.0, "degraded": None, "reason": "trivial acknowledgment"},
+        )
+
+    def test_no_content_tokens_gate_reason(self):
+        # "ok" is only 2 chars — search_tokens drops it before the
+        # trivial-acknowledgment check ever runs (item 3: "empty ->
+        # prior_work: null, prior_work_meta.reason: 'no content tokens'").
+        with mock.patch.object(rp, "_search_hits_budgeted") as m_search:
+            out = rp.prior_work_for_prompt("ok", budget_ms=600)
+        m_search.assert_not_called()
+        self.assertEqual(out["prior_work_meta"]["reason"], "no content tokens")
+
+    def test_a_topical_prompt_carries_legs_and_degraded_through(self):
+        with mock.patch.object(
+            rp, "_search_hits_budgeted",
+            return_value={"hits": [_hit()], "legs": ["lexical"], "degraded": "embedding late"},
+        ):
+            out = rp.prior_work_for_prompt(
+                "what did we decide about the recall hook", budget_ms=600
+            )
+        self.assertNotEqual(out["context"], "")
+        self.assertEqual(out["prior_work_meta"]["legs"], ["lexical"])
+        self.assertEqual(out["prior_work_meta"]["degraded"], "embedding late")
+
+    def test_omitting_budget_ms_never_adds_the_meta_key(self):
+        """The UserPromptSubmit hook path (budget_ms=None, unchanged) must
+        not grow a new key it never asked for."""
+        with mock.patch.object(rp, "_search_hits", return_value=[_hit()]):
+            out = rp.prior_work_for_prompt("what did we decide about the recall hook")
+        self.assertNotIn("prior_work_meta", out)
+
+
 if __name__ == "__main__":
     unittest.main()

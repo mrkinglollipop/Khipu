@@ -368,6 +368,17 @@ def _snapshot_search_hits(prompt: str, *, project: str | None) -> list[dict[str,
     return fused
 
 
+def _project_for_cwd(cwd: str | None) -> str | None:
+    if not cwd:
+        return None
+    try:
+        from khipu.identity import resolve_repo_root
+
+        return resolve_repo_root(cwd).get("project")
+    except Exception:  # noqa: BLE001 — a git failure must not sink recall
+        return None
+
+
 def _search_hits(prompt: str, *, cwd: str | None, limit: int = TOP_N) -> list[dict[str, Any]]:
     """The gated search itself (no timeout, no dedup — those wrap this).
 
@@ -380,14 +391,7 @@ def _search_hits(prompt: str, *, cwd: str | None, limit: int = TOP_N) -> list[di
     stopwords/short) also yields no hits rather than falling back to
     something unrelated.
     """
-    project = None
-    if cwd:
-        try:
-            from khipu.identity import resolve_repo_root
-
-            project = resolve_repo_root(cwd).get("project")
-        except Exception:  # noqa: BLE001 — a git failure must not sink recall
-            project = None
+    project = _project_for_cwd(cwd)
 
     try:
         rows = _snapshot_search_hits(prompt, project=project)
@@ -402,6 +406,155 @@ def _search_hits(prompt: str, *, cwd: str | None, limit: int = TOP_N) -> list[di
     payload = hybrid_search(prompt, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project)
     rows = _apply_score_floor(payload.get("results") or [])
     return rows[:limit]
+
+
+# ---- budgeted hub search (khipu_status's prior_work, R10 + this phase) ------
+# Problem (measured live 2026-09-14 against the deployed gateway): the
+# gateway/Aegis lane has no local snapshot (hub_snapshot is a Mac-only sqlite
+# replica — the gateway lives beside Postgres on the Linode instead), so
+# _search_hits's hub fallback above — one embed API call, then one cosine SQL
+# scan, run SEQUENTIALLY, no lexical leg at all in mode="semantic" — was the
+# entire cold-path cost, 0.7-1.5s against Aegis's hard 1.0s slot drop (3 of 4
+# live turns timed out). The fix: run the lexical (pg_trgm ILIKE) leg and the
+# query-embedding+cosine leg CONCURRENTLY, and answer with whatever finished
+# by a wall-clock deadline instead of either waiting for both or getting nothing.
+DEFAULT_HUB_BUDGET_MS = 600
+# Outer safety margin over the caller's budget_ms (fuse/filter compute after
+# both legs join, plus thread-wake scheduling slop) — the *design* target is
+# "never later than budget_ms by more than the fuse cost"; this is only the
+# absolute give-up backstop against a genuine hang (e.g. a wedged connection),
+# same posture as TIMEOUT_S above.
+_BUDGET_SAFETY_SLACK_S = 0.3
+
+
+def _hub_hits_budgeted(
+    prompt: str,
+    tokens: list[str],
+    *,
+    project: str | None,
+    budget_ms: int,
+    limit: int,
+) -> dict[str, Any]:
+    """Lexical (pg_trgm ILIKE, ``cli._literal_candidates``) and query-
+    embedding + cosine (``embed._cosine_candidates``) legs run concurrently
+    on daemon threads against the hub.
+
+    At ``budget_ms`` the caller gets whatever legs have landed: RRF-fused
+    (``search_text.fuse_ranked_lists``) when both finished, lexical-only when
+    the embedding leg is still running, cosine-only in the rarer reverse
+    case. The still-running leg's thread is never joined past the deadline —
+    it keeps running in the background (daemon, so it never blocks process
+    exit either) and, on completion, its result lands where it always would:
+    the cosine leg's query vector through ``embed._query_vec`` into
+    ``memory_query_cache``, so an identical next prompt is warm even though
+    this call did not wait for it. Never raises — a leg's own exception just
+    means that leg did not land, logged, not fatal.
+
+    Returns ``{"hits": [...], "legs": [...], "degraded": str | None}``.
+    """
+    deadline = time.monotonic() + max(0, int(budget_ms)) / 1000.0
+    lexical_box: dict[str, Any] = {}
+    cosine_box: dict[str, Any] = {}
+
+    def _lexical_worker() -> None:
+        try:
+            from khipu.db import connect
+            from khipu.cli import _literal_candidates
+            from khipu.search_text import token_hit_count
+
+            with connect() as conn:
+                with conn.cursor() as cur:
+                    rows = _literal_candidates(cur, prompt, _SEARCH_LIMIT, kind=None, filters=None)
+            if tokens:
+                for r in rows:
+                    r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)
+            lexical_box["rows"] = rows
+        except Exception as exc:  # noqa: BLE001 — a leg failure just means it didn't land
+            lexical_box["error"] = exc
+            _log(f"budgeted lexical leg failed: {type(exc).__name__}: {exc}")
+
+    def _cosine_worker() -> None:
+        try:
+            from khipu.embed import _cosine_candidates
+
+            rows = _cosine_candidates(prompt, limit=_SEARCH_LIMIT, kind=None, filters=None)
+            for r in rows:
+                r["cosine"] = r.get("score")
+            cosine_box["rows"] = rows
+        except Exception as exc:  # noqa: BLE001 — same posture as the lexical leg
+            cosine_box["error"] = exc
+            _log(f"budgeted cosine leg failed: {type(exc).__name__}: {exc}")
+
+    t_lex = threading.Thread(target=_lexical_worker, daemon=True)
+    t_cos = threading.Thread(target=_cosine_worker, daemon=True)
+    t_lex.start()
+    t_cos.start()
+    t_lex.join(max(0.0, deadline - time.monotonic()))
+    t_cos.join(max(0.0, deadline - time.monotonic()))
+
+    legs: list[str] = []
+    lists: list[list[dict[str, Any]]] = []
+    if "rows" in lexical_box:
+        legs.append("lexical")
+        if lexical_box["rows"]:
+            lists.append(lexical_box["rows"])
+    if "rows" in cosine_box:
+        legs.append("cosine")
+        if cosine_box["rows"]:
+            lists.append(cosine_box["rows"])
+
+    degraded: str | None
+    if not legs:
+        # Neither leg landed anything (error or still running) — report the
+        # summary, not a single leg's detail, so "hub is entirely down" does
+        # not read as a narrower "only the embedding leg had trouble".
+        degraded = "no legs completed"
+    else:
+        missing = {"lexical", "cosine"} - set(legs)
+        if "cosine" in missing:
+            degraded = "embedding late" if t_cos.is_alive() else "embedding error"
+        elif "lexical" in missing:
+            degraded = "lexical late" if t_lex.is_alive() else "lexical error"
+        else:
+            degraded = None
+
+    if not lists:
+        return {"hits": [], "legs": legs, "degraded": degraded}
+
+    from khipu.search_text import fuse_ranked_lists
+    from khipu.recency import apply_project_and_status
+
+    fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
+    fused = apply_project_and_status(fused, project=project)
+    hits = _apply_score_floor(fused)[:limit]
+    return {"hits": hits, "legs": legs, "degraded": degraded}
+
+
+def _search_hits_budgeted(
+    prompt: str, *, cwd: str | None, budget_ms: int, limit: int = TOP_N
+) -> dict[str, Any]:
+    """``khipu_status``'s ``prior_work`` path (R10 + this phase): local
+    snapshot first when fresh (already sub-300ms measured — see
+    ``_snapshot_search_hits``'s docstring), the concurrent hub budgeted
+    search otherwise (the gateway has no local snapshot to try at all, so
+    this falls through to it immediately). Never raises.
+
+    Returns the same shape as ``_hub_hits_budgeted``:
+    ``{"hits": [...], "legs": [...], "degraded": str | None}``.
+    """
+    project = _project_for_cwd(cwd)
+    try:
+        rows = _snapshot_search_hits(prompt, project=project)
+        return {"hits": _apply_score_floor(rows)[:limit], "legs": ["snapshot"], "degraded": None}
+    except _SnapshotUnusable as exc:
+        _log(f"snapshot unusable ({exc}) — hub budgeted path")
+    except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls through
+        _log(f"snapshot search failed ({type(exc).__name__}: {exc}) — hub budgeted path")
+
+    from khipu.search_text import search_tokens
+
+    tokens = search_tokens(prompt)
+    return _hub_hits_budgeted(prompt, tokens, project=project, budget_ms=budget_ms, limit=limit)
 
 
 def _row_date(row: dict[str, Any]) -> str:
@@ -456,33 +609,74 @@ def render_block(hits: list[dict[str, Any]]) -> str:
 
 
 def prior_work_for_prompt(
-    prompt: str, *, cwd: str | None = None, session_id: str | None = None, limit: int = TOP_N
+    prompt: str,
+    *,
+    cwd: str | None = None,
+    session_id: str | None = None,
+    limit: int = TOP_N,
+    budget_ms: int | None = None,
 ) -> dict[str, Any]:
     """The whole pipeline as a plain function: gate -> bounded search -> score
     floor -> dedup. Returns ``{"context": str, "hits": [...], "reason": str,
     "ms": float}``. Never raises. Used by both the hook (which also renders
     the harness-native envelope) and ``khipu_status``'s ``prior_work`` field
     (R10), so the two never drift.
+
+    ``budget_ms`` (khipu_status / the gateway lane only — omitted by the
+    UserPromptSubmit hook, whose TIMEOUT_S-wrapped local-snapshot-first path
+    above is unchanged): switches the search leg from ``_search_hits`` (fixed
+    TIMEOUT_S, hub fallback runs cosine sequentially, empty on timeout) to
+    ``_search_hits_budgeted`` (concurrent lexical+cosine hub legs, returns
+    whatever finished by the deadline). When set, the result also carries
+    ``prior_work_meta``: ``{"legs": [...], "ms": float, "degraded": str |
+    None, "reason": str}``.
     """
     t0 = time.monotonic()
     prompt = (prompt or "").strip()
+
+    def _meta(*, legs: list[str] = (), degraded: str | None = None, reason: str, ms: float = 0.0):
+        if budget_ms is None:
+            return None
+        return {"legs": list(legs), "ms": ms, "degraded": degraded, "reason": reason}
+
+    def _gated(reason: str) -> dict[str, Any]:
+        out = {"context": "", "hits": [], "reason": reason, "ms": 0.0}
+        meta = _meta(reason=reason)
+        if meta is not None:
+            out["prior_work_meta"] = meta
+        return out
+
     try:
         from khipu.search_text import search_tokens
 
         tokens = search_tokens(prompt)
         if not tokens:
-            return {"context": "", "hits": [], "reason": "no content tokens", "ms": 0.0}
+            return _gated("no content tokens")
         if _is_trivial(tokens):
-            return {"context": "", "hits": [], "reason": "trivial acknowledgment", "ms": 0.0}
+            return _gated("trivial acknowledgment")
     except Exception as exc:  # noqa: BLE001 — fail open
-        return {"context": "", "hits": [], "reason": f"gate error: {exc}", "ms": 0.0}
+        return _gated(f"gate error: {exc}")
 
     hits: list[dict[str, Any]] | None = None
     reason = "ok"
+    legs: list[str] = []
+    degraded: str | None = None
     try:
-        hits = _run_with_timeout(_search_hits, TIMEOUT_S, prompt, cwd=cwd, limit=limit)
+        if budget_ms is not None:
+            outer_timeout = max(0.05, budget_ms / 1000.0) + _BUDGET_SAFETY_SLACK_S
+            result = _run_with_timeout(
+                _search_hits_budgeted, outer_timeout,
+                prompt, cwd=cwd, budget_ms=budget_ms, limit=limit,
+            )
+            hits = result.get("hits") or []
+            legs = result.get("legs") or []
+            degraded = result.get("degraded")
+        else:
+            hits = _run_with_timeout(_search_hits, TIMEOUT_S, prompt, cwd=cwd, limit=limit)
     except _TimedOut:
-        reason = f"timeout>{TIMEOUT_S}s"
+        budget_s = (budget_ms / 1000.0) if budget_ms is not None else TIMEOUT_S
+        reason = f"timeout>{budget_s}s"
+        degraded = degraded or "timeout"
         hits = []
     except Exception as exc:  # noqa: BLE001 — fail open on any search failure
         reason = f"error: {type(exc).__name__}: {exc}"
@@ -493,7 +687,11 @@ def prior_work_for_prompt(
         ids = _hit_ids(hits)
         recent = _load_recent_batches(session_id)
         if ids in recent:
-            return {"context": "", "hits": [], "reason": "dedup", "ms": ms}
+            dedup_out = {"context": "", "hits": [], "reason": "dedup", "ms": ms}
+            dedup_meta = _meta(legs=legs, degraded=degraded, reason="dedup", ms=ms)
+            if dedup_meta is not None:
+                dedup_out["prior_work_meta"] = dedup_meta
+            return dedup_out
         _save_recent_batches(session_id, recent + [ids])
     elif hits and not session_id:
         # No session id to key dedup state on: still inject (fail open), just
@@ -507,7 +705,11 @@ def prior_work_for_prompt(
     produced = _deliverable_context_line(tokens, cwd=cwd)
     if produced:
         context = f"{context}\n{produced}" if context else produced
-    return {"context": context, "hits": hits or [], "reason": reason, "ms": ms}
+    out = {"context": context, "hits": hits or [], "reason": reason, "ms": ms}
+    meta = _meta(legs=legs, degraded=degraded, reason=reason, ms=ms)
+    if meta is not None:
+        out["prior_work_meta"] = meta
+    return out
 
 
 def _deliverable_context_line(tokens: list[str], *, cwd: str | None) -> str:

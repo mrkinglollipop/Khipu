@@ -1409,6 +1409,42 @@ class QueryVectorCacheTest(unittest.TestCase):
         self.assertEqual(a, b)
         self.assertNotEqual(a, c)
 
+    def test_hash_ignores_stopwords_like_search_tokens(self):
+        """Budgeted-prior_work phase: the cache key normalizes with the same
+        lowercase/stopword/short-word filter search_text.search_tokens uses
+        (same reduction the lexical leg ranks on) — "what did we decide" and
+        "what decide" differ only by a stopword ("did") and a too-short word
+        ("we"), so they must hit the SAME cache row and cost one embed call,
+        not two."""
+        a = em._query_hash("p1", "what did we decide")
+        b = em._query_hash("p1", "what decide")
+        self.assertEqual(a, b)
+        # A genuinely different content token still misses.
+        c = em._query_hash("p1", "what happened")
+        self.assertNotEqual(a, c)
+
+    def test_hash_falls_back_to_whitespace_norm_with_no_content_tokens(self):
+        """A query with no content tokens at all (e.g. all stopwords/short
+        words) must still be cacheable rather than silently un-cacheable —
+        falls back to the old whitespace-collapsed/case-folded form."""
+        a = em._query_hash("p1", "  Is It  ")
+        b = em._query_hash("p1", "is it")
+        self.assertEqual(a, b)
+
+    def test_hash_does_not_truncate_at_search_tokens_max_tokens(self):
+        """Regression (caught live, 2026-09-14 budgeted-prior_work phase): a
+        naive ``search_tokens(api_q)`` call caps at MAX_TOKENS=8. A
+        task-prefixed query (``prefix_query``: "task: search result | query:
+        <text>") spends 4 of those 8 slots on the constant prefix alone, so
+        two DIFFERENT long queries sharing only their first few content words
+        collided onto the same cache row — a fresh, never-seen query read
+        back as an immediate cache hit and would have returned an unrelated
+        vector. The hash must consider the whole normalized query, uncapped."""
+        prefix = "task: search result | query: "
+        a = em._query_hash("p1", prefix + "gateway budget prompt about the deploy pipeline alpha")
+        b = em._query_hash("p1", prefix + "gateway budget prompt about the deploy pipeline zulu")
+        self.assertNotEqual(a, b)
+
     def test_hit_skips_the_api_and_bumps_usage(self):
         from unittest import mock
 
