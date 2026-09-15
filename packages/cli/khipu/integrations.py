@@ -972,6 +972,67 @@ def _grok_bot_status(project: str | None = None) -> dict:
             "project": project}
 
 
+# ---- gateway bearer token file (Aegis's own resolution order) ----------------
+#
+# Aegis (a home-built harness) talks to Khipu natively over the HTTPS gateway.
+# Its own bearer resolution is env KHIPU_GATEWAY_TOKEN, else a `token_file`
+# path named in `[memory.khipu]` of its own ~/.grok/config.toml — never the
+# macOS Keychain, which its sandbox cannot reach (2026-08-17 audit). Gap found
+# live 2026-09-14: nothing ever staged that file, so every Aegis recall 401'd
+# while `khipu integrations verify aegis` and `khipu doctor` stayed green —
+# the check existed, but its own evidence never arrived. This file is the
+# fix: one on-disk convention both `khipu gateway token set` and the Aegis
+# pack's install/verify agree on.
+GATEWAY_TOKEN_FILE_NAME = "gateway-token"
+
+
+def gateway_token_file() -> Path:
+    from khipu.paths import data_dir
+
+    return data_dir() / GATEWAY_TOKEN_FILE_NAME
+
+
+def _read_gateway_token_file() -> str:
+    path = gateway_token_file()
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def set_gateway_token(token: str) -> Path:
+    """Write the bearer to `gateway_token_file()`, mode 0600, umask-safe (the
+    explicit chmod after creation matters — O_CREAT's mode argument is itself
+    reduced by the process umask, which alone would not guarantee 0600).
+    Never returns or logs the token itself."""
+    token = (token or "").strip()
+    if not token:
+        raise ValueError("token must not be empty")
+    if "\n" in token or "\r" in token:
+        raise ValueError("token must not contain a newline")
+    path = gateway_token_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, (token + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.chmod(path, 0o600)
+    return path
+
+
+def gateway_token_file_status() -> dict:
+    """Presence-only status — exists / mode / bytes. Never the token itself."""
+    path = gateway_token_file()
+    if not path.is_file():
+        return {"path": str(path), "exists": False}
+    st = path.stat()
+    return {"path": str(path), "exists": True,
+            "mode": oct(st.st_mode & 0o777), "bytes": st.st_size}
+
+
 def _gateway_token() -> str:
     tok = (os.environ.get(GROK_BOT_TOKEN_ENV) or "").strip()
     if tok:

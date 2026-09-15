@@ -2424,6 +2424,38 @@ def cmd_integrations(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gateway(args: argparse.Namespace) -> int:
+    """`khipu gateway token set` / `status` — the on-disk bearer convention
+    Aegis's own config points at (`[memory.khipu] token_file`), and the fix
+    named by `khipu integrations verify aegis` on a 401 or a missing token.
+    Never prints the token itself."""
+    from khipu import integrations as integ
+
+    if args.gateway_cmd != "token":
+        print(json.dumps({"ok": False, "error": f"unknown gateway command {args.gateway_cmd!r}"}))
+        return 2
+    if args.gateway_token_cmd == "status":
+        print(json.dumps(integ.gateway_token_file_status(), indent=2))
+        return 0
+    if args.gateway_token_cmd == "set":
+        if args.from_env is not None:
+            token = os.environ.get(args.from_env, "")
+            if not token.strip():
+                print(json.dumps({"ok": False, "error": f"env {args.from_env} is empty or unset"}))
+                return 2
+        else:
+            token = sys.stdin.read()
+        try:
+            integ.set_gateway_token(token)
+        except ValueError as e:
+            print(json.dumps({"ok": False, "error": str(e)}))
+            return 2
+        print(json.dumps({"ok": True, **integ.gateway_token_file_status()}, indent=2))
+        return 0
+    print(json.dumps({"ok": False, "error": f"unknown gateway token command {args.gateway_token_cmd!r}"}))
+    return 2
+
+
 def cmd_paths(args: argparse.Namespace) -> int:
     from khipu.paths import paths_status, set_data_dir
 
@@ -3710,6 +3742,32 @@ def build_parser() -> argparse.ArgumentParser:
             or 0
         )
     )
+
+    gw = sub.add_parser(
+        "gateway",
+        help="Khipu gateway bearer token: set / status (never prints the token)",
+    )
+    gw_sub = gw.add_subparsers(dest="gateway_cmd", required=True)
+    gwt = gw_sub.add_parser(
+        "token", help="Write / inspect ~/.config/khipu/gateway-token"
+    )
+    gwt_sub = gwt.add_subparsers(dest="gateway_token_cmd", required=True)
+    gwt_set = gwt_sub.add_parser(
+        "set",
+        help="Write the bearer file (mode 0600) from stdin, or --from-env",
+    )
+    gwt_set.add_argument(
+        "--from-env",
+        nargs="?",
+        const="KHIPU_GATEWAY_TOKEN",
+        default=None,
+        metavar="VAR",
+        help="Read the token from this env var instead of stdin (default KHIPU_GATEWAY_TOKEN)",
+    )
+    gwt_sub.add_parser(
+        "status", help="exists / mode / bytes only — never the token"
+    )
+    gw.set_defaults(func=cmd_gateway)
 
     comp = sub.add_parser(
         "components",
