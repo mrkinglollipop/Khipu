@@ -354,9 +354,41 @@ def _budget_take() -> None:
 
 
 def _query_hash(profile: str, api_q: str) -> str:
-    """Cache key: profile + whitespace-collapsed, case-folded query text. Only
-    the hash is stored on the hub, never the query itself."""
-    norm = " ".join(api_q.split()).lower()
+    """Cache key: profile + normalized query text. Only the hash is stored on
+    the hub, never the query itself.
+
+    Normalization is the SAME lowercase/stopword/short-word filter
+    ``search_text.search_tokens`` uses — not that function itself — so
+    "what did we decide" and "what do we decide" (a stopword-only
+    difference) hit the same cache row instead of each paying its own embed
+    API call (2026-09-14 budgeted-prior_work phase: a repeated question
+    phrased slightly differently was a guaranteed miss under the old
+    whitespace/case-only normalization). Deliberately does NOT apply
+    ``search_tokens``'s ``MAX_TOKENS`` cap (8): that cap exists to bound RRF
+    ranking cost and is wrong here — ``api_q`` carries the fixed
+    ``prefix_query`` boilerplate ("task: search result | query: ...") ahead
+    of the real query for profiles that use task prefixes, and capping at 8
+    tokens let that constant prefix alone fill the budget, silently
+    colliding every long query sharing its first few content words onto the
+    same cache row regardless of what came after (caught live: a
+    freshly-random-suffixed query read back as an immediate cache "hit").
+    Falls back to the old whitespace-collapsed/case-folded form when the
+    query has no content tokens at all (e.g. a bare id or a too-short query)
+    so it is still cacheable rather than skipped.
+    """
+    from khipu.search_text import STOPWORDS, TOKEN_RE
+
+    seen: set[str] = set()
+    toks: list[str] = []
+    for raw in TOKEN_RE.findall(api_q or ""):
+        key = raw.lower()
+        if key in seen or key in STOPWORDS:
+            continue
+        if len(key) < 3 and not (key.isdigit() and len(key) >= 2):
+            continue
+        seen.add(key)
+        toks.append(key)
+    norm = " ".join(toks) if toks else " ".join((api_q or "").split()).lower()
     return _md5(f"{profile}\n{norm}")
 
 
