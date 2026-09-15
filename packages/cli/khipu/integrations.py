@@ -521,6 +521,26 @@ _AEGIS_HOOK_MARK = "# khipu-pack: managed block — do not edit by hand\n"
 _AEGIS_HOOK_RE = re.compile(
     r"(?ms)^# khipu-pack: managed block — do not edit by hand\n.*?# khipu-pack: end\n"
 )
+# [memory] is NOT Khipu-owned the way [mcp_servers.khipu] is — it is Aegis's
+# own choice of memory backend, which some other tool may already claim. Only
+# used to detect whether the table exists at all; install never rewrites it
+# once present (see _aegis_install). [memory.khipu] is the namespaced child
+# table that carries the token_file path — safe to own outright since nothing
+# else would write under that name.
+_AEGIS_MEMORY_RE = re.compile(r"(?ms)^\[memory\]\n.*?(?=^\[|\Z)")
+_AEGIS_MEMORY_KHIPU_RE = re.compile(r"(?ms)^\[memory\.khipu\]\n.*?(?=^\[|\Z)")
+
+
+def _aegis_memory_block() -> str:
+    return '[memory]\nbackend = "khipu"\nenabled = true\n'
+
+
+def _aegis_memory_khipu_block(token_path: Path) -> str:
+    # TOML basic string: backslashes and quotes must be escaped, or a path
+    # containing either would corrupt the table (same rationale as the
+    # lambda-replacement rule below for the mcp/hooks blocks).
+    escaped = str(token_path).replace("\\", "\\\\").replace('"', '\\"')
+    return f'[memory.khipu]\ntoken_file = "{escaped}"\n'
 
 
 def _aegis_detected() -> bool:
@@ -585,6 +605,37 @@ def _aegis_install(dry: bool) -> dict:
     else:
         new = new.rstrip("\n") + "\n\n" + hook_block
         out["changes"].append(f"{AEGIS_TOML}: add [[hooks.Stop]] + [[hooks.PreCompact]]")
+    # Gateway bearer: only wired into Aegis's own config once the token file
+    # actually exists — writing token_file at a path with nothing in it would
+    # be the same "green with no evidence" gap this closes, just moved one
+    # layer down.
+    token_path = gateway_token_file()
+    if token_path.is_file():
+        mem_match = _AEGIS_MEMORY_RE.search(new)
+        if mem_match is None:
+            new = new.rstrip("\n") + "\n\n" + _aegis_memory_block()
+            out["changes"].append(f'{AEGIS_TOML}: add [memory] backend = "khipu", enabled = true')
+        else:
+            # An existing [memory] table is an existing backend choice — never
+            # overridden, only reported, however it is configured.
+            try:
+                existing_backend = (tomllib.loads(new).get("memory") or {}).get("backend")
+            except tomllib.TOMLDecodeError:
+                existing_backend = None
+            out["memory_backend"] = existing_backend
+            if existing_backend != "khipu":
+                out["note"] = f"[memory].backend is already {existing_backend!r}; left unchanged"
+        khipu_match = _AEGIS_MEMORY_KHIPU_RE.search(new)
+        want_khipu_block = _aegis_memory_khipu_block(token_path)
+        if khipu_match is None:
+            new = new.rstrip("\n") + "\n\n" + want_khipu_block
+            out["changes"].append(f"{AEGIS_TOML}: add [memory.khipu] token_file")
+        elif khipu_match.group(0).strip() != want_khipu_block.strip():
+            new = _AEGIS_MEMORY_KHIPU_RE.sub(lambda _m: want_khipu_block, new)
+            out["changes"].append(f"{AEGIS_TOML}: update [memory.khipu] token_file")
+    else:
+        out["note"] = ("Aegis can search memory only with the gateway token: "
+                        "run `khipu gateway token set`")
     if new != text and not dry:
         out.setdefault("backups", []).append(_backup(AEGIS_TOML))
         AEGIS_TOML.write_text(new, encoding="utf-8")
