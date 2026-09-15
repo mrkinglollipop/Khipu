@@ -657,14 +657,42 @@ class StatusPriorWorkTest(unittest.TestCase):
         self.assertEqual(out["prior_work"], "## Prior work on this topic\n- x")
         self.assertEqual(m.call_args.args[0], "what did we decide")
         self.assertEqual(m.call_args.kwargs["cwd"], "/repo")
+        # Budgeted phase: the default budget always rides along now, so a
+        # caller with no local snapshot/hook (Aegis, the gateway) never has
+        # to know the parameter exists to get the budgeted behavior.
+        self.assertEqual(m.call_args.kwargs["budget_ms"], 600)
 
-    def test_a_gated_prompt_attaches_nothing(self):
+    def test_a_custom_budget_ms_is_forwarded_and_clamped(self):
         with mock.patch(
             "khipu.recall_prompt.prior_work_for_prompt",
-            return_value={"context": "", "hits": [], "reason": "trivial acknowledgment", "ms": 0.0},
+            return_value={"context": "x", "hits": [], "reason": "ok", "ms": 1.0},
+        ) as m:
+            self._status({"prompt": "what did we decide", "budget_ms": 250})
+        self.assertEqual(m.call_args.kwargs["budget_ms"], 250)
+        with mock.patch(
+            "khipu.recall_prompt.prior_work_for_prompt",
+            return_value={"context": "x", "hits": [], "reason": "ok", "ms": 1.0},
+        ) as m:
+            self._status({"prompt": "what did we decide", "budget_ms": 99999})
+        self.assertEqual(m.call_args.kwargs["budget_ms"], 5000)
+
+    def test_a_gated_prompt_sets_prior_work_to_none_not_absent(self):
+        """Budgeted phase, item 3: a prompt that gates server-side (no
+        content tokens / trivial ack) must read as `prior_work: null` — an
+        explicit "checked, nothing there" — not an absent key indistinguishable
+        from "no prompt given at all" (the case covered by the previous test)."""
+        with mock.patch(
+            "khipu.recall_prompt.prior_work_for_prompt",
+            return_value={
+                "context": "", "hits": [], "reason": "trivial acknowledgment", "ms": 0.0,
+                "prior_work_meta": {"legs": [], "ms": 0.0, "degraded": None,
+                                     "reason": "trivial acknowledgment"},
+            },
         ):
             out = self._status({"prompt": "ok"})
-        self.assertNotIn("prior_work", out)
+        self.assertIn("prior_work", out)
+        self.assertIsNone(out["prior_work"])
+        self.assertEqual(out["prior_work_meta"]["reason"], "trivial acknowledgment")
 
     def test_a_crash_in_the_optional_field_never_breaks_status(self):
         with mock.patch(

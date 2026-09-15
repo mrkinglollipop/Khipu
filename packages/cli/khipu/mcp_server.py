@@ -312,6 +312,18 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Optional, with `prompt`: boosts hits from this repo's project.",
                 },
+                "budget_ms": {
+                    "type": "integer",
+                    "description": (
+                        "Optional, with `prompt`: server-side time budget for `prior_work`, "
+                        "default 600. Runs the lexical and query-embedding+cosine legs "
+                        "concurrently and answers with whatever finished by the deadline "
+                        "(fused when both did, lexical-only with prior_work_meta.degraded "
+                        "= 'embedding late' when the embedding leg is still running) — it "
+                        "keeps running in the background either way, so a repeat of the "
+                        "same prompt is warm next time. Clamped to [100, 5000]."
+                    ),
+                },
             },
         },
     },
@@ -614,6 +626,10 @@ def _tool_status(args: dict) -> dict:
     return payload
 
 
+_BUDGET_MS_MIN = 100
+_BUDGET_MS_MAX = 5000
+
+
 def _attach_prior_work(payload: dict, args: dict) -> None:
     """R10: khipu_status's fallback push for a harness with no SessionStart
     or UserPromptSubmit hook to inject through (Aegis, the gateway) — the
@@ -622,16 +638,37 @@ def _attach_prior_work(payload: dict, args: dict) -> None:
     `payload` in place; never raises (prior_work_for_prompt already never
     does, but this is the one place a caller cannot afford a crash to reach
     from an optional field).
+
+    Budgeted phase (2026-09-15): always runs through prior_work_for_prompt's
+    budget_ms path now (default DEFAULT_HUB_BUDGET_MS = 600ms, clamped to
+    [100, 5000] against a bad caller value) — this is precisely the R10 lane
+    (Aegis, the gateway) the 1.0s hard slot-drop measurement targeted. Sets
+    `prior_work` to the block, or explicitly to None when the prompt gated
+    to nothing (never just an absent key, so a caller can tell "checked, no
+    hits" from "prompt not given" — the latter returns before this point).
+    `prior_work_meta` carries legs/ms/degraded/reason when the callee
+    provides it.
     """
     prompt = str(args.get("prompt") or "").strip()
     if not prompt:
         return
     try:
-        from khipu.recall_prompt import prior_work_for_prompt
+        from khipu.recall_prompt import DEFAULT_HUB_BUDGET_MS, prior_work_for_prompt
 
-        result = prior_work_for_prompt(prompt, cwd=args.get("cwd"))
-        if result.get("context"):
-            payload["prior_work"] = result["context"]
+        budget_ms = args.get("budget_ms")
+        try:
+            budget_ms = int(budget_ms) if budget_ms is not None else None
+        except (TypeError, ValueError):
+            budget_ms = None
+        if not budget_ms or budget_ms <= 0:
+            budget_ms = DEFAULT_HUB_BUDGET_MS
+        budget_ms = max(_BUDGET_MS_MIN, min(budget_ms, _BUDGET_MS_MAX))
+
+        result = prior_work_for_prompt(prompt, cwd=args.get("cwd"), budget_ms=budget_ms)
+        payload["prior_work"] = result["context"] or None
+        meta = result.get("prior_work_meta")
+        if meta is not None:
+            payload["prior_work_meta"] = meta
     except Exception:  # noqa: BLE001 — an optional field must never break khipu_status
         pass
 
