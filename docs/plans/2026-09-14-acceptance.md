@@ -198,3 +198,19 @@ immediately after their exit-code check, never left on disk.
 - Live installer runs (not code changes, no test applicable): `khipu integrations install
   claude_code|cursor|codex` (added the missing `SubagentStop` hook to all three harnesses' configs,
   each backed up first) and `khipu jobs refresh notes_watch` (re-rendered the stale launchd plist).
+
+## Cursor live row — closed 2026-09-15 00:51 UTC
+
+Run after the maintainer signed the Cursor CLI in: one `cursor-agent -p --trust` prompt from this
+repo that asked what memory knew about the 0.4.4 seal checks, said "remember this: <token>", and
+stated a deferral ("build the follow-up once the next Khipu release ships").
+
+| Capability | Cursor | Evidence |
+|---|---|---|
+| Rule + slice at session start | PASS | the reply began "0.4.4 seal (memory): built, signed, notarized, published; pixel pass; live acceptance…" — content only the pushed slice could have supplied |
+| Prior work on a topical prompt | PASS (by rule + slice; no per-prompt hook event exists in Cursor) | same reply |
+| Capture at session end | PASS | `capture cursor sessionend due=True … queued=…-cursor-c7b971a5-…json`, drain `captured: 1` → episode 13172 (harness `cursor`) |
+| Deferred work returns as owed | PASS | owed 1500 "Build the follow-up for the Cursor acceptance row once the next Khipu release ships." with `until: once the next Khipu release ships.` |
+| Searchable (literal and semantic) | PASS | `khipu search "<token>" --mode literal` → episode 13172 first; semantic query → 13172 first |
+
+Scratch cleanup: episode 13172 forgotten, owed 1500 closed after the evidence above was recorded.
