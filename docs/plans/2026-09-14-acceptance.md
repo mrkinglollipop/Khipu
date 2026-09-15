@@ -214,3 +214,11 @@ stated a deferral ("build the follow-up once the next Khipu release ships").
 | Searchable (literal and semantic) | PASS | `khipu search "<token>" --mode literal` → episode 13172 first; semantic query → 13172 first |
 
 Scratch cleanup: episode 13172 forgotten, owed 1500 closed after the evidence above was recorded.
+
+## Aegis per-turn recall — VERIFIED 2026-09-15 (live drive on the harness's scratch app)
+
+Native per-turn recall (the harness's own memory stage, no hook injection) against the gateway at
+`cebd732`, with the gateway bearer staged and the memory log target enabled: the "prior work" slot was
+injected on 3 of 3 eligible turns with 0 timeouts at the harness's 1 s budget. Two things had to change
+to get here, both now in Khipu: the bearer is staged by the installer and verified by a real round trip
+(#94), and `khipu_status(prompt)` answers within a server budget with `prior_work` as items (#95, #96).
