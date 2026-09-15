@@ -58,8 +58,13 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
 - `khipu_status` tells you whether the hub is reachable and how fresh it is.
   In a harness with no pushed slice and no per-prompt push (no SessionStart
   or UserPromptSubmit hook can inject here), pass the FIRST user prompt of
-  the session as `prompt` — it returns the same top-3 "prior work" block
-  under `prior_work` that a hook would otherwise have pushed.
+  the session as `prompt` — it returns the same top-3 "prior work" a hook
+  would otherwise have pushed, as `prior_work`: a list of up to 3 items
+  (`kind`, `id`, `date`, `project`, `status`, `snippet`), `[]` when nothing
+  clears the relevance floor, `null` only when the prompt itself gated
+  (trivial or content-free). `prior_work_text` carries the same material
+  pre-rendered as a ≤600-char Markdown block, for pasting straight into
+  context instead of walking the array.
 - `khipu_owed` lists open (or closed/stale) commitments — followups, blockers,
   questions, promises — for a project. Open commitments for this repo are
   pushed at session start where a slice is available; call `khipu_owed` at
