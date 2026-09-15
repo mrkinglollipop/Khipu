@@ -490,8 +490,6 @@ class IntegrationsProjectForwardingTest(unittest.TestCase):
     per-project Cursor stale-rule check it exists for."""
 
     def test_verify_forwards_project_to_every_harness(self):
-        import json
-
         from khipu.cli import cmd_integrations
 
         args = argparse.Namespace(harness="cursor", project="acme/widget",
@@ -512,3 +510,136 @@ class IntegrationsProjectForwardingTest(unittest.TestCase):
                 mock.patch("builtins.print"):
             cmd_integrations(args)
         m_status.assert_called_once_with("codex", project="acme/widget")
+
+
+class LiteralCandidatesFastModeTest(unittest.TestCase):
+    """2026-09-15: `_literal_candidates(fast=True)` is `recall_prompt`'s
+    budgeted lexical leg (`khipu_status`'s `prior_work`) — index-scan-bounded
+    columns only, never `nodes`, plus a `SET LOCAL random_page_cost` nudge.
+    Measured live against the deployed gateway: the full 5-column episode OR
+    (and topics.body's large/TOAST'd content) forced a sequential scan even
+    with the migration-0015 trgm indexes in place — this locks the query
+    SHAPE the fix relies on, with a fake cursor (no real DB)."""
+
+    class _Cur:
+        def __init__(self, has_deleted_at=True, has_verbatim=True):
+            self.has_deleted_at = has_deleted_at
+            self.has_verbatim = has_verbatim
+            self.statements: list[str] = []
+            self._result: list[tuple] = []
+
+        def execute(self, sql, params=None):
+            s = " ".join(sql.split())
+            self.statements.append(s)
+            if "information_schema.columns" in s:
+                cols = ["id", "ts", "summary", "session_id", "scope", "topics",
+                        "people", "decisions", "preferences", "project", "harness"]
+                if self.has_deleted_at:
+                    cols.append("deleted_at")
+                if self.has_verbatim:
+                    cols.append("verbatim")
+                self._result = [(c,) for c in cols]
+            else:
+                self._result = []
+
+        def fetchall(self):
+            return list(self._result)
+
+        def fetchone(self):
+            return self._result[0] if self._result else None
+
+    def _real_statements(self, cur):
+        """Statements against an actual table — excludes the
+        information_schema schema probes `_episode_live_clause` /
+        `_episode_verbatim_select` run first."""
+        return [s for s in cur.statements if "information_schema" not in s]
+
+    def test_fast_mode_sets_random_page_cost_before_querying(self):
+        from khipu.cli import _literal_candidates
+
+        cur = self._Cur()
+        _literal_candidates(cur, "lexical leg slow gateway host", 8, kind=None, fast=True)
+        self.assertIn("SET LOCAL random_page_cost = 1.1", cur.statements)
+        # It runs before the table queries, not after.
+        set_idx = cur.statements.index("SET LOCAL random_page_cost = 1.1")
+        table_idx = next(
+            i for i, s in enumerate(cur.statements)
+            if "FROM topics" in s or "FROM episodes" in s
+        )
+        self.assertLess(set_idx, table_idx)
+
+    def test_fast_mode_never_queries_nodes_even_when_id_shaped(self):
+        from khipu.cli import _literal_candidates
+
+        cur = self._Cur()
+        # "kind:slug" is id-shaped (_id_shaped) — fast=False would include a
+        # nodes query for this term; fast=True must not, regardless.
+        _literal_candidates(cur, "concept:foo__bar", 8, kind=None, fast=True)
+        real = self._real_statements(cur)
+        self.assertFalse(any("FROM nodes" in s for s in real))
+
+    def test_fast_mode_queries_exactly_one_statement_per_active_table(self):
+        from khipu.cli import _literal_candidates
+
+        cur = self._Cur()
+        _literal_candidates(cur, "lexical leg slow gateway host", 8, kind=None, fast=True)
+        real = self._real_statements(cur)
+        episode_stmts = [s for s in real if "FROM episodes" in s]
+        topic_stmts = [s for s in real if "FROM topics" in s]
+        self.assertEqual(len(episode_stmts), 1)
+        self.assertEqual(len(topic_stmts), 1)
+
+    def test_fast_mode_episode_query_only_touches_the_indexed_summary_column(self):
+        from khipu.cli import _literal_candidates
+
+        cur = self._Cur()
+        _literal_candidates(cur, "lexical leg slow gateway host", 8, kind=None, fast=True)
+        episode_sql = next(s for s in self._real_statements(cur) if "FROM episodes" in s)
+        # The SELECT list still fetches decisions/preferences/people/topics
+        # (needed for the row's rank_text regardless of fast mode) — what
+        # must be narrowed is the WHERE clause, the part Postgres actually
+        # has to detoast/evaluate per candidate row.
+        where_clause = episode_sql.split("WHERE", 1)[1]
+        self.assertIn("summary ILIKE", where_clause)
+        for column in ("decisions", "preferences", "people", "topics"):
+            self.assertNotIn(column, where_clause)
+
+    def test_fast_mode_topic_query_only_touches_the_indexed_title_column(self):
+        from khipu.cli import _literal_candidates
+
+        cur = self._Cur()
+        _literal_candidates(cur, "lexical leg slow gateway host", 8, kind=None, fast=True)
+        topic_sql = next(s for s in self._real_statements(cur) if "FROM topics" in s)
+        self.assertIn("COALESCE(title", topic_sql)
+        self.assertNotIn("body ILIKE", topic_sql)
+        self.assertNotIn("slug ILIKE", topic_sql)
+
+    def test_fast_mode_no_tokens_path_also_skips_body_slug_and_nodes(self):
+        from khipu.cli import _literal_candidates
+
+        cur = self._Cur()
+        # "%" alone is not a real token (search_tokens filters it out), so
+        # this exercises the raw-term / no-tokens branch, same as the
+        # existing ForgottenEpisodesStayForgottenTest coverage above.
+        _literal_candidates(cur, "%", 8, kind=None, fast=True)
+        real = self._real_statements(cur)
+        self.assertFalse(any("FROM nodes" in s for s in real))
+        topic_sql = next((s for s in real if "FROM topics" in s), None)
+        if topic_sql is not None:
+            self.assertNotIn("body ILIKE", topic_sql)
+            self.assertNotIn("slug ILIKE", topic_sql)
+
+    def test_default_fast_false_keeps_the_full_column_set(self):
+        """Regression guard: fast=True is opt-in — the general
+        `khipu search` / hybrid_search callers must keep full-column
+        recall (decisions/preferences/people/topics, topics.slug/body)."""
+        from khipu.cli import _literal_candidates
+
+        cur = self._Cur()
+        _literal_candidates(cur, "lexical leg slow gateway host", 8, kind=None)
+        self.assertNotIn("SET LOCAL random_page_cost = 1.1", cur.statements)
+        episode_sql = next(s for s in self._real_statements(cur) if "FROM episodes" in s)
+        self.assertIn("decisions", episode_sql)
+        topic_sql = next(s for s in self._real_statements(cur) if "FROM topics" in s)
+        self.assertIn("body ILIKE", topic_sql) if "body ILIKE" in topic_sql else \
+            self.assertIn("body ~~*", topic_sql)

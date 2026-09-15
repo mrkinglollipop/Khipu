@@ -619,6 +619,33 @@ _EPISODE_ILIKE_COLUMNS = (
     "COALESCE(people::text, '')",
 )
 
+# fast=True columns for `_literal_candidates` (recall_prompt's budgeted
+# lexical leg, khipu_status's prior_work — 2026-09-15): migration 0015 put a
+# pg_trgm GIN index on exactly episodes.summary / topics.title / topics.body
+# / nodes.name. An OR predicate spanning an indexed column AND an unindexed
+# one (e.g. the full 5-column episode ILIKE, or topics.slug alongside
+# title/body) cannot use a BitmapOr of index scans for every disjunct, so
+# Postgres falls back to a full sequential scan for the whole WHERE —
+# measured live against the deployed gateway: 1.18s on episodes (8.3k rows),
+# 0.36s on topics, EXPLAIN showing "Seq Scan" throughout even though the
+# indexes exist. Restricting the ILIKE columns to exactly what is indexed
+# (plus the random_page_cost nudge below) turns the episodes query into a
+# Bitmap Heap Scan.
+#
+# topics.body stayed slow even once the plan used the index: measured
+# avg(length(body)) ~= 3.9KB, one outlier at 614KB — every candidate row's
+# ILIKE match (and the bitmap scan's heap recheck) pays TOAST detoast cost
+# on that large text, ~300-400ms regardless of scan method (seq or bitmap).
+# topics.title averages 27 bytes; the identical query against title alone
+# measured 0.8ms. So the fast topic leg drops body entirely and searches
+# title only — the trade is a real recall loss (a prompt's words often live
+# in a topic's body, not its title), accepted here because the cosine leg
+# (same body text, embedded) still covers that ground semantically, and
+# `fast` is already a "best effort within budget_ms" surface, not
+# `khipu search`'s full-recall path.
+_EPISODE_ILIKE_COLUMNS_FAST = ("summary",)
+_TOPIC_ILIKE_COLUMNS_FAST = ("COALESCE(title, '')",)
+
 
 def _id_shaped(term: str) -> bool:
     """A query that looks like a graph node id (``kind:slug`` or ``a__b``).
@@ -803,7 +830,7 @@ def _neg_ts_sort_key(ts) -> float:
 
 
 def _literal_candidates(
-    cur, term: str, limit: int, *, kind: str | None = None, filters=None
+    cur, term: str, limit: int, *, kind: str | None = None, filters=None, fast: bool = False
 ) -> list[dict]:
     """Globally-ranked literal ILIKE candidates for RRF fusion (bugfix,
     reported live: "Recorded mobile followup task" — episode 11286 named the
@@ -824,15 +851,44 @@ def _literal_candidates(
     preferences/people for episodes, title + body for topics, id + name +
     payload for nodes) so the caller can also rank token overlap over the
     same text without a second query.
+
+    ``fast`` (default False): restricts the ILIKE columns to exactly the
+    ones migration 0015 put a pg_trgm GIN index on (episodes.summary;
+    topics.title/body) and never queries ``nodes`` regardless of ``kind`` or
+    id-shape — see ``_EPISODE_ILIKE_COLUMNS_FAST`` for why. Used only by
+    ``recall_prompt``'s budgeted lexical leg (``khipu_status``'s
+    ``prior_work``), which needs an index-scan-bounded statement per table,
+    not full-column recall.
+
+    ``fast`` also issues ``SET LOCAL random_page_cost`` on ``cur``'s
+    transaction before the ILIKE queries run. Measured on the deployed
+    gateway (Linode, SSD-backed block storage): even the narrowed
+    single/two-column OR above still planned as a full ``Seq Scan`` — the
+    ``BitmapOr`` over the trgm GIN index *is* available and ~8x faster
+    end to end (28.9ms vs 235.6ms warm-cache; far more under concurrent
+    load), but the planner's default ``random_page_cost = 4`` (tuned for
+    spinning disks) makes it look more expensive than the sequential scan.
+    ``SET LOCAL`` only affects the current transaction on this
+    throwaway connection — no server/global config is touched.
     """
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
 
     if kind is not None and kind not in ("topic", "episode", "node"):
         raise ValueError("kind must be 'topic', 'episode', or 'node'")
-    want_nodes = kind == "node" or (kind is None and _id_shaped(term))
+    want_nodes = (not fast) and (kind == "node" or (kind is None and _id_shaped(term)))
     active_kinds = (
         [kind] if kind else (["topic", "episode", "node"] if want_nodes else ["topic", "episode"])
     )
+    if fast:
+        active_kinds = [k for k in active_kinds if k != "node"]
+        if not active_kinds:
+            return []
+        try:
+            cur.execute("SET LOCAL random_page_cost = 1.1")
+        except Exception:  # noqa: BLE001 — a GUC that can't be set (sqlite test
+            # double, a locked-down role) must not sink the search; the
+            # query still runs, just possibly via the slower seq-scan plan.
+            pass
     lim = max(1, int(limit))
     tokens = search_tokens(term)
     pool: list[dict] = []
@@ -858,14 +914,20 @@ def _literal_candidates(
             return []
         params: dict = {"q": f"%{_escape_like(toks[0])}%", "lim": lim, **filter_params}
         if "topic" in active_kinds:
+            topic_ilike_where = (
+                "COALESCE(title, '') ILIKE %(q)s ESCAPE '\\'"
+                if fast
+                else (
+                    "body ILIKE %(q)s ESCAPE '\\' OR slug ILIKE %(q)s ESCAPE '\\'"
+                    " OR COALESCE(title, '') ILIKE %(q)s ESCAPE '\\'"
+                )
+            )
             cur.execute(
                 f"""
                 SELECT slug, COALESCE(title, slug) AS label, body,
                        COALESCE(updated_at, created_at) AS ts
                 FROM topics
-                WHERE deleted_at IS NULL AND (
-                    body ILIKE %(q)s ESCAPE '\\' OR slug ILIKE %(q)s ESCAPE '\\'
-                    OR COALESCE(title, '') ILIKE %(q)s ESCAPE '\\')
+                WHERE deleted_at IS NULL AND ({topic_ilike_where})
                   AND ({tp_filter})
                 ORDER BY slug ASC
                 LIMIT %(lim)s
@@ -884,7 +946,8 @@ def _literal_candidates(
             # episode_where a few lines up, instead of nesting the join()
             # generator directly inside the outer f"""...""" query below.
             episode_ilike_where = " OR ".join(
-                f"{c} ILIKE %(q)s ESCAPE '\\'" for c in _EPISODE_ILIKE_COLUMNS
+                f"{c} ILIKE %(q)s ESCAPE '\\'"
+                for c in (_EPISODE_ILIKE_COLUMNS_FAST if fast else _EPISODE_ILIKE_COLUMNS)
             )
             cur.execute(
                 f"""
@@ -926,7 +989,8 @@ def _literal_candidates(
         params = {**_ilike_token_params(tokens), **filter_params}
         n = len(tokens)
         if "topic" in active_kinds:
-            topic_where, topic_score = _token_match_sql(("body", "slug", "COALESCE(title, '')"), n)
+            topic_cols = _TOPIC_ILIKE_COLUMNS_FAST if fast else ("body", "slug", "COALESCE(title, '')")
+            topic_where, topic_score = _token_match_sql(topic_cols, n)
             cur.execute(
                 f"""
                 SELECT slug, COALESCE(title, slug) AS label, body,
@@ -944,7 +1008,8 @@ def _literal_candidates(
                     "rank_text": f"{label}\n\n{body or ''}", "hits": int(hits), "ts": ts,
                 })
         if "episode" in active_kinds:
-            episode_where, episode_score = _token_match_sql(_EPISODE_ILIKE_COLUMNS, n)
+            episode_cols = _EPISODE_ILIKE_COLUMNS_FAST if fast else _EPISODE_ILIKE_COLUMNS
+            episode_where, episode_score = _token_match_sql(episode_cols, n)
             cur.execute(
                 f"""
                 SELECT id::text, summary, topics, decisions, preferences, people, ts,

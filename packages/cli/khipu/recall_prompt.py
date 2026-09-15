@@ -464,7 +464,20 @@ def _hub_hits_budgeted(
 
             with connect() as conn:
                 with conn.cursor() as cur:
-                    rows = _literal_candidates(cur, prompt, _SEARCH_LIMIT, kind=None, filters=None)
+                    # fast=True (2026-09-15): index-scan-bounded columns only
+                    # (episodes.summary; topics.title/body) and never queries
+                    # `nodes` — see `_EPISODE_ILIKE_COLUMNS_FAST`'s docstring.
+                    # Measured live: the unrestricted 5-column OR forced a
+                    # sequential scan (1.18s on episodes alone) even with the
+                    # migration-0015 trgm indexes in place, because Postgres
+                    # can't BitmapOr an indexed column against an unindexed
+                    # one in the same OR. This leg must fit inside
+                    # DEFAULT_HUB_BUDGET_MS, so full-column recall loses to
+                    # index-scan speed here (unlike `khipu search`, which
+                    # still gets the full column set).
+                    rows = _literal_candidates(
+                        cur, prompt, _SEARCH_LIMIT, kind=None, filters=None, fast=True
+                    )
             if tokens:
                 for r in rows:
                     r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)

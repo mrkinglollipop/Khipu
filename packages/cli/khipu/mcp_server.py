@@ -35,6 +35,7 @@ import contextlib
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 SERVER_NAME = "khipu"
@@ -291,7 +292,19 @@ TOOLS: list[dict] = [
         "description": (
             "Khipu hub status: PG table counts, latest episode ts, true "
             "mirror lag, recent captures. include_drift=true adds the "
-            "file-vs-PG drift sample (slower: walks the memory root)."
+            "file-vs-PG drift sample (slower: walks the memory root). "
+            "When `prompt` is given and `full` is not set, the schema "
+            "narrows to a LIGHT payload — {hub_ok, prior_work, "
+            "prior_work_meta, notes_freshness} only, no counts/drift/"
+            "recent_captures — so this call costs roughly what `prior_work` "
+            "alone costs (the heavy status queries run concurrently with "
+            "the prior_work lane on a background thread, never sequentially "
+            "in front of it; measured live: the full payload used to add "
+            "100ms+ on top of prior_work_meta.ms even though nothing in it "
+            "depends on `prompt`). Pass `full=true` with `prompt` to get "
+            "the complete schema below anyway (unchanged, still pays the "
+            "full sequential cost). Omitting `prompt` always returns the "
+            "complete schema, exactly as before this note."
         ),
         "inputSchema": {
             "type": "object",
@@ -305,7 +318,8 @@ TOOLS: list[dict] = [
                         "the session and the response carries a `prior_work` field: "
                         "the same top-3 'prior work' block a UserPromptSubmit hook "
                         "would otherwise have pushed. Omit once the session already "
-                        "has that context."
+                        "has that context. Also switches the response to the LIGHT "
+                        "payload (see the tool description) unless `full` is set."
                     ),
                 },
                 "cwd": {
@@ -322,6 +336,16 @@ TOOLS: list[dict] = [
                         "= 'embedding late' when the embedding leg is still running) — it "
                         "keeps running in the background either way, so a repeat of the "
                         "same prompt is warm next time. Clamped to [100, 5000]."
+                    ),
+                },
+                "full": {
+                    "type": "boolean",
+                    "description": (
+                        "With `prompt`: return the complete status schema (counts, "
+                        "drift, recent_captures, search_degraded_last_24h, …) instead "
+                        "of the light {hub_ok, prior_work, prior_work_meta, "
+                        "notes_freshness} payload. Default false. Ignored without "
+                        "`prompt` — the complete schema is already the only shape."
                     ),
                 },
             },
@@ -584,8 +608,67 @@ def _tool_graph(args: dict) -> dict:
         return out
 
 
+def _tool_status_light(args: dict) -> dict:
+    """The ``prompt``-given, ``full``-not-set schema (2026-09-15): ``{hub_ok,
+    prior_work, prior_work_meta, notes_freshness}`` only.
+
+    ``drift.status_payload`` does several sequential round trips (table
+    counts, now()/max(ts), a second query for the most-recent capture row,
+    ``notes_freshness`` on the same cursor, then two MORE connections for
+    ``recent_captures`` and ``search_degraded_last_24h``) — measured live
+    against the deployed gateway at ~100ms even before ``prior_work``'s own
+    budgeted lane starts, none of which a caller passing ``prompt`` asked
+    for. This path skips all of it and answers with just what such a caller
+    needs.
+
+    The one cheap probe this path still owes a caller (hub reachability +
+    notes freshness) runs on a background thread CONCURRENTLY with
+    ``_attach_prior_work``'s own budgeted lane (which runs its lexical/
+    cosine legs on their own threads) — so this function's wall clock is
+    ``max(probe, lane)``, not their sum. The probe is best-effort: any
+    failure degrades ``hub_ok`` to False rather than raising, same posture
+    as every other optional field on this tool.
+    """
+    payload: dict = {}
+    probe: dict = {}
+
+    def _probe() -> None:
+        try:
+            from khipu.db import connect
+            from khipu.notes import notes_freshness
+
+            with connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+                    probe["hub_ok"] = True
+                    probe["notes_freshness"] = notes_freshness(cur)
+        except Exception as exc:  # noqa: BLE001 — best-effort; prior_work
+            # (on its own threads below) must land regardless.
+            probe["hub_ok"] = False
+            probe["hub_error"] = f"{type(exc).__name__}: {exc}"
+
+    t = threading.Thread(target=_probe, daemon=True)
+    t.start()
+    _attach_prior_work(payload, args)
+    # The probe is one SELECT 1 + one indexed-ish MAX(event_at) query
+    # (~20-40ms measured) — by the time the budgeted lane above returns
+    # (>= its own budget_ms, default 600) it has long since finished; this
+    # join is a backstop against a genuinely wedged connection, not the
+    # expected path.
+    t.join(2.0)
+    payload["hub_ok"] = probe.get("hub_ok", False)
+    if "hub_error" in probe:
+        payload["hub_error"] = probe["hub_error"]
+    if "notes_freshness" in probe:
+        payload["notes_freshness"] = probe["notes_freshness"]
+    return payload
+
+
 def _tool_status(args: dict) -> dict:
     _ensure_path()
+    if str(args.get("prompt") or "").strip() and not args.get("full"):
+        return _tool_status_light(args)
     from khipu.drift import status_payload
     from khipu.hub_snapshot import (
         hub_connection_failed,
