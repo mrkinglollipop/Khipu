@@ -1,0 +1,26 @@
+# Khipu core parity verification — 2026-09-27
+
+Reviewed commit `9d7d7e09ef63d760ce2fd526b7ed4c1785b6c209` in the supplied isolated checkout. Read-only source review; no oracle was run.
+
+| Research claim | Verdict | Direct implementation evidence / correction |
+|---|---|---|
+| Hybrid recall is cosine + token/literal RRF; graph neighbors enrich results. | **Narrowed.** | `embed.hybrid_search` collects cosine and literal candidates, makes a token-overlap list, fuses with RRF, then applies project/status and recency ranking (`packages/cli/khipu/embed.py:1804-1865,1902-1916`; `search_text.py:132-152`). It calls `topic_graph.enrich_search_results` only after ranking (`embed.py:1919-1926`). The graph function adds `neighbors` only to returned **topic** rows; it does not inject graph neighbors as candidates or alter scores (`topic_graph.py:336-389`). Plan graph retrieval as an independent candidate leg, not an enrichment tweak. |
+| Khipu has date filters and recency but no event-validity/NL chronology engine. | **Narrowed.** | `since/until` are parsed explicit filters and bound against episode `ts`, topic `updated_at/created_at`, and node `built_at` (`embed.py:1747-1750`; `_SearchFilters` near `embed.py:1430-1526`; verified SQL shape at `tests/test_embed.py:974-980`). Ranking uses a 90-day exponential bonus (`recency.py:12-26,126-160`). There *is* source-time `event_at`: episodes mirror `ts`; topics use frontmatter/mtime (`ops/migrations/0022_event_at.sql:1-29`), and topic candidate selection prefers it (`embed.py:1591-1601`). No natural-language temporal parser, validity interval, or query-time effective-truth filter found. |
+| No neural reranker. | **Confirmed.** | Repository-wide Khipu search found only deterministic token-overlap/RRF reranking (`search_text.py:104-152`) and no cross-encoder/reranker model dependency or invocation. |
+| Decision registry supports manual supersession and readers apply it. | **Narrowed.** | Capture inserts extracted decision strings (`capture.py:626-634`; `decisions.py:68-107`). The production CLI exposes the explicit write path `khipu decisions supersede OLD NEW`, aliases `decisions` as `_decisions`, calls `_decisions.supersede`, and commits (`cli.py:1452-1466`; `decisions.py:140-148`). CLI listing includes superseded entries by default (`cli.py:1480-1498`; `decisions.py:110-137`); the pushed activity slice uses `standing_decisions`, which excludes them (`activity.py:245-270`; `decisions.py:194-206`). Search only exposes per-episode current/superseded **counts**, never filters/re-ranks a stale episode (`embed.py:1919-1926`; `decisions.py:151-191`). `rationale` exists in schema/read output but no Khipu writer/parser/CLI argument populates it (`0019_decisions.sql:12-21`; `decisions.py:96-101`; `cli.py:3250-3264`). |
+| Evidence retains selected verbatim strings, not uniform claim-to-span provenance. | **Confirmed.** | Verbatim data is regex-extracted errors/commands/paths plus up to three clipped user messages (`0017_capture_verbatim.sql:1-13`; `extract.py:241-318`), stored as one episode JSON field. Decisions point to an episode, but lack source spans/speaker/type; topic revisions record writer `source`/`note` only (`0001_core_schema.sql:44-52`; `0019_decisions.sql:12-21`). |
+| Topic revisions/reconciliation/native organization exist; nightly invokes legacy consolidation. | **Confirmed.** | `notes.reconcile` writes topics then calls native `organise.after_reconcile` (`notes.py:595-695`); it rebuilds indexes/hits/stale evidence (`organise.py:592-646`). `run_nightly` first executes environment-configured `CONSOLIDATE_NIGHTLY` via subprocess, then runs native reconcile/backfill (`jobs.py:309-320`; `_run_script` `jobs.py:235-263`). External job is configurable/unverified here, not a bundled Khipu consolidation engine. |
+| Evaluation is local/private golden hit@k + confidence; timing exists elsewhere. | **Confirmed.** | `recall_eval` calls `hybrid_search`, records hit rate and hit-with-none-confidence (`recall_eval.py:1-105`); returned search payload includes per-leg timings (`embed.py:1760-1763,1932-1935`). It does not measure stale-answer correctness, abstention quality, tokens, or p95 itself. |
+
+## Small safe mocked selectors for root (do not run live selector)
+
+All below use `unittest` fixtures/mocks or pure functions: no configured DB, network, or live configuration effects are expected. Inspect the individual test bodies before execution to preserve that guarantee.
+
+Run from `packages/cli`:
+
+1. `python -m unittest tests.test_topic_graph.EnrichTest.test_additive_keys_and_union_neighbors` — mock cursor; proves current enrichment is additive.
+2. `python -m unittest tests.test_recency.ProjectAndStatusTest.test_superseded_topic_is_deranked_not_dropped` — pure ranking.
+3. `python -m unittest tests.test_commitments_contract.DecisionsListAndSupersedeTest tests.test_commitments_contract.DecisionsSearchEnrichmentTest` — in-memory `_DecisionsCursor`; covers explicit supersession and the read-side counts.
+4. `python -m unittest tests.test_recall_eval.RunEvalTest` — temp JSONL + mocked `hybrid_search`.
+
+Avoid `LiveHybridSearchTest` (`tests/test_embed.py:367-419`): it intentionally requires PostgreSQL and embedding credentials.
