@@ -1,3 +1,6 @@
+# --bypass-harness (sonnet lane) — authored directly by the dispatched
+# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
+# agents"); there is no further agent to route this to.
 """khipu CLI entry — status / search / graph / doctor / regen-memory / reconcile."""
 
 from __future__ import annotations
@@ -469,6 +472,23 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         unknown_harness = unknown_harness_heartbeats()
     except Exception as e:  # noqa: BLE001
         unknown_harness = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # The five launcher links, read-only. `consistent`
+    # (mixed roots — a stray worktree still live) is a warning, never a gate;
+    # `launchers_ok` (a pack's own config pointed at a dangling/not_a_link
+    # launcher) is a gate, same as every other check below.
+    try:
+        from khipu import integrations as integ
+
+        launchers = integ.launcher_health()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        launchers = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # The switch registry's states, for visibility only — never gates `ok`.
+    try:
+        from khipu import features
+
+        features_block = features.states()
+    except Exception as e:  # noqa: BLE001
+        features_block = {"error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -494,6 +514,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "topics_embed_lag_minutes": topics_lag.get("lag_minutes"),
         "degraded_rate": degraded_rate,
         "unknown_harness": unknown_harness,
+        "launchers": launchers,
+        "features": features_block,
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -531,6 +553,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             and all(bool(v.get("ok")) for v in nightly_steps.values())
             and bool(topics_lag.get("ok"))
             and bool(degraded_rate.get("ok"))
+            # launchers_ok: red only when some pack's own config points at a
+            # dangling/not_a_link launcher. An inconsistent root set
+            # (`launchers["consistent"]`) is a warning, folded in separately
+            # below, and never reaches this aggregate.
+            and bool(launchers.get("ok"))
         ),
         "graph_backup": _graph_backup,
         "graph_backup_ok": bool(_graph_backup.get("ok")),
@@ -555,6 +582,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "mark_stale_ok": bool(nightly_steps.get("mark_stale_ok", {}).get("ok")),
         "topics_embed_lag_ok": bool(topics_lag.get("ok")),
         "degraded_rate_ok": bool(degraded_rate.get("ok")),
+        "launchers_ok": bool(launchers.get("ok")),
     }
     print(json.dumps(out, indent=2, default=str))
     return 0 if out["ok"] else 2
@@ -2542,6 +2570,26 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     return 2
 
 
+def cmd_features(args: argparse.Namespace) -> int:
+    """`khipu features` — the switch registry's states as JSON; `--set NAME
+    on|off` persists one to config.json first."""
+    from khipu import features
+
+    if args.set:
+        name, value = args.set
+        parsed = features.parse_bool(value)
+        if parsed is None:
+            print(json.dumps({"ok": False, "error": f"value must be on/off (got {value!r})"}))
+            return 2
+        try:
+            features.set_enabled(name, parsed)
+        except KeyError as e:
+            print(json.dumps({"ok": False, "error": str(e)}))
+            return 2
+    print(json.dumps(features.states(), indent=2))
+    return 0
+
+
 def cmd_paths(args: argparse.Namespace) -> int:
     from khipu.paths import paths_status, set_data_dir
 
@@ -3854,6 +3902,10 @@ def build_parser() -> argparse.ArgumentParser:
         "status", help="exists / mode / bytes only — never the token"
     )
     gw.set_defaults(func=cmd_gateway)
+
+    feat = sub.add_parser("features", help="Show or set feature switches")
+    feat.add_argument("--set", nargs=2, metavar=("NAME", "VALUE"), default=None)
+    feat.set_defaults(func=cmd_features)
 
     comp = sub.add_parser(
         "components",

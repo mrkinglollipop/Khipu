@@ -66,8 +66,10 @@ cd apps/desktop
 ```
 
 `--publish` requires `gh` auth, a **public** `KHIPU_RELEASE_REPO` (defaults to
-origin), a version bump in `src-tauri/tauri.conf.json`, `package.json`, and
-`src-tauri/Cargo.toml`, and a **stapled** DMG (`xcrun stapler validate`). The
+origin), a version bump in `src-tauri/tauri.conf.json`, `package.json`,
+`src-tauri/Cargo.toml` and `packages/cli/khipu/__init__.py` (the script refuses
+to build when the CLI and the app disagree), and a **stapled** DMG
+(`xcrun stapler validate`). The
 script refuses private repos (updater fetches unauthenticated). After
 `gh release create` it bumps kinglollipop.com Khipu copy and the
 `_redirects` DMG pin (studio `scripts/bump_khipu_site.py`), deploys Pages, and

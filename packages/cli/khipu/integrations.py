@@ -97,46 +97,65 @@ def _bin_script(name: str) -> Path:
 
 
 _INSTALL_DEPTH = 0
+_INSTALL_WRITE_DEPTH = 0
 
 
 @contextlib.contextmanager
-def _installing():
-    """The only context in which ``_shim()`` may create, delete or re-point a
-    launcher symlink. Entered exclusively by ``install()``, for the four LOCAL
-    harness packs (claude_code, cursor, aegis, codex) — never by status,
-    verify, doctor, uninstall or any probe.
+def _installing(*, dry: bool = False):
+    """The only context in which ``_shim()`` may touch a launcher symlink at
+    all. Entered exclusively by ``install()``, for the four LOCAL harness
+    packs (claude_code, cursor, aegis, codex) — never by status, verify,
+    doctor, uninstall or any probe.
 
-    Finding B1 (docs/research/hindsight-plan-review-2026-09-28.md): before
-    this gate, ``_shim()`` re-pointed the real ~/.config/khipu/bin symlinks
-    on EVERY call, including from read-only paths — so running the test
-    suite, or ``khipu doctor``/``khipu integrations verify`` from a
-    throwaway checkout, silently re-pointed the live hook launchers every
-    real harness session runs through at that checkout. Counted with a
-    depth (not a bare bool) so a nested entry — e.g. a future install path
-    that calls another install helper — cannot early-exit the outer one.
+    The links under ~/.config/khipu/bin decide which code every installed
+    harness runs. A read-only operation that re-pointed them would let any
+    command run from another checkout, or from a test suite, silently change
+    what the live hooks execute; so nothing but an install may write them.
+
+    ``dry`` selects the mode ``_shim()`` runs in while this frame is active:
+    WRITE (``dry=False``, create or re-point) or PLAN (``dry=True``, report
+    the path a real install would write and touch nothing, not even the
+    directory). Both depths are counted, not held as a bool, so a nested
+    entry cannot end the outer one early and a dry frame nested inside a
+    real one never downgrades it to PLAN.
     """
-    global _INSTALL_DEPTH
+    global _INSTALL_DEPTH, _INSTALL_WRITE_DEPTH
     _INSTALL_DEPTH += 1
+    if not dry:
+        _INSTALL_WRITE_DEPTH += 1
     try:
         yield
     finally:
         _INSTALL_DEPTH -= 1
+        if not dry:
+            _INSTALL_WRITE_DEPTH -= 1
 
 
 def _is_installing() -> bool:
     return _INSTALL_DEPTH > 0
 
 
-def _shim(name: str) -> str:
-    """Return a SPACE-FREE, Khipu-owned path for a bin script.
+def _is_write_installing() -> bool:
+    return _INSTALL_WRITE_DEPTH > 0
 
-    Read-only by default: outside ``_installing()`` this NEVER creates,
-    deletes or re-points the ~/.config/khipu/bin symlink. It returns the
-    link's current path whenever a link of that name exists — whatever it
-    currently points at, even if that is stale or elsewhere — and the raw
-    repo script path when no link exists yet. Only a call made while
-    ``_installing()`` is active may create or re-point the link; see its
-    docstring for why (B1/B5).
+
+def _shim(name: str) -> str:
+    """Return a SPACE-FREE, Khipu-owned path for a bin script — one of three
+    modes:
+
+    READ (outside ``_installing()``, the default): never creates, deletes or
+    re-points the ~/.config/khipu/bin symlink. Returns the link's current
+    path whenever a link of that name exists — whatever it currently points
+    at, even if that is stale or elsewhere — and the raw repo script path
+    when no link exists yet.
+
+    PLAN (inside ``_installing(dry=True)``): a dry-run install. Returns the
+    path the link WOULD have — ``_shim_dir() / name`` — so a dry run reports
+    exactly the command a real install would write, without creating the
+    directory or touching the link.
+
+    WRITE (inside ``_installing(dry=False)``): today's create/re-point,
+    unchanged.
 
     The repo may live under a path with spaces; every harness runs a
     hook command through ``sh -c``, so the raw path splits at the space and the
@@ -152,6 +171,8 @@ def _shim(name: str) -> str:
         if link.is_symlink() or link.exists():
             return str(link)
         return str(target)
+    if not _is_write_installing():
+        return str(link)  # PLAN: report it, touch nothing
     try:
         if link.is_symlink() and os.readlink(link) == str(target):
             return str(link)
@@ -162,6 +183,91 @@ def _shim(name: str) -> str:
     except OSError:
         return str(target)  # unwritable HOME: fall back to the raw path
     return str(link)
+
+
+LAUNCHER_NAMES = (
+    "khipu-mcp", "khipu-stop-hook", "khipu-recall-hook",
+    "khipu-prompt-recall", "khipu-aegis-capture",
+)
+
+
+def _one_launcher_state(name: str) -> dict:
+    link = _shim_dir() / name
+    if not link.is_symlink():
+        state = "not_a_link" if link.exists() else "missing"
+        return {"name": name, "link": str(link), "state": state, "target": None}
+    target = os.readlink(link)
+    mine = str(_bin_script(name))
+    state = "dangling" if not link.exists() else ("current" if target == mine else "elsewhere")
+    return {"name": name, "link": str(link), "state": state, "target": target}
+
+
+def _launcher_root(target: str) -> str | None:
+    """Reverse ``_bin_script``'s two layouts (bundled ``<root>/bin/<name>``,
+    dev checkout ``<root>/packages/cli/bin/<name>``) to find the root a
+    resolved launcher target implies. None for anything shaped otherwise."""
+    p = Path(target)
+    if p.parent.name != "bin":
+        return None
+    root = p.parent.parent
+    if root.name == "cli" and root.parent.name == "packages":
+        return str(root.parent.parent)
+    return str(root)
+
+
+def launcher_states() -> list[dict]:
+    """Pure inspection of the five launcher links — never creates,
+    deletes or re-points anything. ``target`` is the link's actual on-disk
+    pointee (None for ``missing``/``not_a_link``)."""
+    out = []
+    for name in LAUNCHER_NAMES:
+        out.append(_one_launcher_state(name))
+    return out
+
+
+_PACK_LAUNCHERS: dict[str, tuple[str, ...]] = {
+    "claude_code": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall"),
+    "cursor": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook"),
+    "aegis": ("khipu-mcp", "khipu-aegis-capture"),
+    "codex": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall"),
+}
+
+
+def _pack_launchers(harness: str, configured: dict[str, str | None]) -> dict:
+    """The states of the launchers this pack uses, plus ``launcher_ok`` —
+    false only when one of them is ``dangling``/``not_a_link`` WHILE this
+    pack's own config currently names that exact link path. A pack whose
+    config names the raw script instead (a pre-shim install, or an
+    unwritable HOME at install time) has no link to be broken, so it keeps
+    today's behavior.
+
+    ``configured`` maps a launcher name this pack cares about to the command
+    string its OWN config currently holds for it (None if not configured).
+    A command may wrap the link (``env VAR=1 <link>``, ``<link> --cursor``),
+    so the link path is looked for inside the command, not compared to it."""
+    states = {s["name"]: s for s in launcher_states()}
+    names = _PACK_LAUNCHERS[harness]
+    broken = any(
+        states[n]["state"] in ("dangling", "not_a_link")
+        for n in names
+        if configured.get(n) is not None and states[n]["link"] in str(configured[n])
+    )
+    out = {"launchers": [states[n] for n in names], "launcher_ok": not broken}
+    if broken:
+        out["fix"] = f"run `khipu integrations install {harness}`"
+    return out
+
+
+def _toml_mcp_command(text: str) -> str | None:
+    """The ``command`` a TOML pack's ``[mcp_servers.khipu]`` table currently
+    holds, or None when absent/unparseable (shared by aegis and codex)."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return ((data.get("mcp_servers") or {}).get("khipu") or {}).get("command")
 
 
 def mcp_launcher() -> str:
@@ -399,15 +505,22 @@ def _claude_uninstall(dry: bool) -> dict:
 def _claude_status() -> dict:
     d = _load_json(CLAUDE_JSON)
     s = _load_json(CLAUDE_SETTINGS)
-    mcp = d.get("mcpServers", {}).get("khipu", {}).get("command") == mcp_launcher()
+    mcp_cmd = d.get("mcpServers", {}).get("khipu", {}).get("command")
+    mcp = mcp_cmd == mcp_launcher()
     def has(ev: str) -> bool:
         return any(_is_ours(h.get("command")) for e in s.get("hooks", {}).get(ev, []) for h in e.get("hooks", []))
+    def _cmd(ev: str, pred) -> str | None:
+        for e in s.get("hooks", {}).get(ev, []):
+            for h in e.get("hooks", []):
+                if pred(h.get("command")):
+                    return h.get("command")
+        return None
     rule = any(_is_our_recall(h.get("command"))
                for e in s.get("hooks", {}).get("SessionStart", []) for h in e.get("hooks", []))
     prompt_recall = any(_is_our_prompt_recall(h.get("command"))
                         for e in s.get("hooks", {}).get("UserPromptSubmit", []) for h in e.get("hooks", []))
     native = has("Stop") and has("PreCompact")
-    return {"harness": "claude_code", "detected": _claude_detected(), "mcp": mcp,
+    out = {"harness": "claude_code", "detected": _claude_detected(), "mcp": mcp,
             "hook_stop": has("Stop"), "hook_precompact": has("PreCompact"), "hook_sessionend": has("SessionEnd"),
             "hook_subagentstop": has("SubagentStop"),
             "recall_rule": "installed" if rule else "missing",
@@ -416,6 +529,13 @@ def _claude_status() -> dict:
             # "legacy" was the model-driven capture_v2 nudge, which is now only
             # a parallel writer until the soak-gated legacy removal.
             "extract": "installed" if native else "missing"}
+    out.update(_pack_launchers("claude_code", {
+        "khipu-mcp": mcp_cmd,
+        "khipu-stop-hook": _cmd("Stop", _is_ours),
+        "khipu-recall-hook": _cmd("SessionStart", _is_our_recall),
+        "khipu-prompt-recall": _cmd("UserPromptSubmit", _is_our_prompt_recall),
+    }))
+    return out
 
 
 # ---- Cursor -------------------------------------------------------------------
@@ -548,14 +668,26 @@ def _cursor_status() -> dict:
         return any(_is_ours(e.get("command")) for e in h.get("hooks", {}).get(ev, []))
     def has_recall(ev: str) -> bool:
         return any(_is_our_recall(e.get("command")) for e in h.get("hooks", {}).get(ev, []))
-    return {"harness": "cursor", "detected": _cursor_detected(),
-            "mcp": d.get("mcpServers", {}).get("khipu", {}).get("command") == mcp_launcher(),
+    def _cmd(ev: str, pred) -> str | None:
+        for e in h.get("hooks", {}).get(ev, []):
+            if pred(e.get("command")):
+                return e.get("command")
+        return None
+    mcp_cmd = d.get("mcpServers", {}).get("khipu", {}).get("command")
+    out = {"harness": "cursor", "detected": _cursor_detected(),
+            "mcp": mcp_cmd == mcp_launcher(),
             "hook_stop": has("stop"), "hook_precompact": has("preCompact"),
             "hook_sessionend": has("sessionEnd"),
             "hook_subagentstop": has("subagentStop"),
             "hook_sessionstart": has_recall("sessionStart"),
             "recall_rule": "project_scoped",
             "extract": "installed" if has("stop") and has("preCompact") else "missing"}
+    out.update(_pack_launchers("cursor", {
+        "khipu-mcp": mcp_cmd,
+        "khipu-stop-hook": _cmd("stop", _is_ours),
+        "khipu-recall-hook": _cmd("sessionStart", _is_our_recall),
+    }))
+    return out
 
 
 # ---- Aegis (TOML, textual edit — no toml writer in stdlib) ---------------------
@@ -743,16 +875,42 @@ def _aegis_capture_events(text: str) -> set[str]:
     return found
 
 
+def _aegis_capture_command(text: str) -> str | None:
+    """The ``command`` aegis's own capture hook block currently holds, or
+    None — mirrors ``_aegis_capture_events``'s parse but returns the command
+    text itself rather than which events use it."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if not isinstance(hooks, dict):
+        return None
+    for ev in ("Stop", "PreCompact", "SessionEnd"):
+        for group in hooks.get(ev) or []:
+            if not isinstance(group, dict):
+                continue
+            for hk in group.get("hooks") or []:
+                if isinstance(hk, dict) and _is_our_capture(hk.get("command")):
+                    return hk.get("command")
+    return None
+
+
 def _aegis_status() -> dict:
     text = AEGIS_TOML.read_text(encoding="utf-8") if AEGIS_TOML.is_file() else ""
     m = _AEGIS_MCP_RE.search(text)
     events = _aegis_capture_events(text)
     ours = {"Stop", "PreCompact", "SessionEnd"} <= events
-    return {"harness": "aegis", "detected": _aegis_detected() and AEGIS_TOML.is_file(),
+    out = {"harness": "aegis", "detected": _aegis_detected() and AEGIS_TOML.is_file(),
             "mcp": bool(m and mcp_launcher() in m.group(0)),
             "hook_stop": "Stop" in events, "hook_precompact": "PreCompact" in events,
             "recall_rule": "n/a",
             "extract": "installed" if ours else "missing"}
+    out.update(_pack_launchers("aegis", {
+        "khipu-mcp": _toml_mcp_command(text),
+        "khipu-aegis-capture": _aegis_capture_command(text),
+    }))
+    return out
 
 
 # ---- Codex (TOML MCP like Aegis + Claude-shaped hooks.json) --------------------
@@ -887,7 +1045,7 @@ def _codex_status() -> dict:
     h = _load_json(CODEX_HOOKS)
     def has(ev: str, pred) -> bool:
         return any(pred(x.get("command")) for e in h.get("hooks", {}).get(ev, []) for x in e.get("hooks", []))
-    return {"harness": "codex", "detected": _codex_detected(),
+    out = {"harness": "codex", "detected": _codex_detected(),
             "mcp": bool(m and mcp_launcher() in m.group(0)),
             "hook_stop": has("Stop", _is_ours), "hook_precompact": has("PreCompact", _is_ours),
             "hook_sessionend": has("SessionEnd", _is_ours),
@@ -895,6 +1053,19 @@ def _codex_status() -> dict:
             "recall_rule": "installed" if has("SessionStart", _is_our_recall) else "missing",
             "prompt_recall": "installed" if has("UserPromptSubmit", _is_our_prompt_recall) else "missing",
             "extract": "installed" if has("Stop", _is_ours) and has("PreCompact", _is_ours) else "missing"}
+    def _cmd(ev: str, pred) -> str | None:
+        for e in h.get("hooks", {}).get(ev, []):
+            for x in e.get("hooks", []):
+                if pred(x.get("command")):
+                    return x.get("command")
+        return None
+    out.update(_pack_launchers("codex", {
+        "khipu-mcp": _toml_mcp_command(text),
+        "khipu-stop-hook": _cmd("Stop", _is_ours),
+        "khipu-recall-hook": _cmd("SessionStart", _is_our_recall),
+        "khipu-prompt-recall": _cmd("UserPromptSubmit", _is_our_prompt_recall),
+    }))
+    return out
 
 
 # ---- Grok Bot / Cursor cloud (repo-scoped, remote MCP over HTTPS) --------------
@@ -1746,9 +1917,10 @@ def install(harness: str, *, dry_run: bool = False, project: str | None = None) 
         # grok_bot has no local shim (gateway/URL-based pack) — never enters
         # _installing(), matching "nothing else" in _installing()'s docstring.
         return _guarded(harness, _grok_bot_install, dry_run, project)
-    # Only the four LOCAL harness installs may create or re-point a launcher
-    # symlink (B1) — this is the one place _installing() is entered.
-    with _installing():
+    # Only the four LOCAL harness installs may touch a launcher symlink at
+    # all — this is the one place _installing() is entered. dry_run
+    # carries through so a dry run runs _shim() in PLAN mode, not WRITE.
+    with _installing(dry=dry_run):
         if harness == "cursor":
             return _guarded(harness, _cursor_install, dry_run, project)
         return _guarded(harness, _INSTALL[harness], dry_run)
@@ -1799,8 +1971,40 @@ def status(harness: str, *, project: str | None = None) -> dict:
             out["installed"] = bool(out.get("mcp"))
         else:
             out["installed"] = bool(out.get("mcp") and out.get("hook_stop") and out.get("hook_precompact"))
+    # Status must not claim what it cannot see — a pack pointed at a
+    # dangling/not_a_link launcher is not actually installed.
+    if isinstance(out, dict) and out.get("launcher_ok") is False:
+        out["installed"] = False
     return out
 
 
 def status_all() -> list[dict]:
     return [status(h) for h in HARNESSES]
+
+
+def _launcher_health_body() -> dict:
+    states = launcher_states()
+    roots = {
+        root
+        for s in states if s["state"] in ("current", "elsewhere")
+        for root in (_launcher_root(s["target"]),) if root is not None
+    }
+    consistent = len(roots) <= 1
+    ok = all(status(h).get("launcher_ok", True) for h in ("claude_code", "cursor", "aegis", "codex"))
+    out = {"states": states, "consistent": consistent, "ok": ok}
+    if not consistent:
+        out["warning"] = (
+            f"installed launchers resolve into more than one root directory {sorted(roots)} "
+            "— hooks may be running from a stale checkout left behind by an earlier "
+            "session; re-point with `khipu integrations install <harness>` from "
+            "the checkout that should be live"
+        )
+    return out
+
+
+def launcher_health() -> dict:
+    """`khipu doctor`'s launchers block: the five states, whether the
+    ones that resolve agree on one root directory, and whether any pack
+    pointed at a link is stuck on a broken one. An inconsistent root set is
+    a warning only — an operational fix, not a code defect."""
+    return _launcher_health_body()

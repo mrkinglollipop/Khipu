@@ -42,6 +42,14 @@ for arg in "$@"; do
   esac
 done
 
+# The bundled CLI reports khipu.__version__ over MCP and in khipu_status, so an
+# app built with the two apart would tell every client the wrong version.
+CLI_VERSION="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' "$ROOT/packages/cli/khipu/__init__.py")"
+if [[ "$CLI_VERSION" != "$VERSION" ]]; then
+  echo "refusing to build: packages/cli/khipu/__init__.py says $CLI_VERSION, tauri.conf.json says $VERSION" >&2
+  exit 2
+fi
+
 # Drag-to-Applications installer window (Murmur make-dmg.sh pattern). Tauri's
 # first DMG has the Applications alias; we recreate after re-sign, so the
 # alias + Finder icon layout have to live here or the shipped image is a
