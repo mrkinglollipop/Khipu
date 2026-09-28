@@ -117,6 +117,37 @@ def state_of(row: dict[str, Any]) -> str:
     return "current"
 
 
+def _mirror_to_snapshot(cur, decision_id: int) -> None:
+    """Best-effort local-replica mirror for a decision write made on THIS
+    machine — "the decisions API calls it after a successful local write so
+    a correction made on this machine reaches the local lane at once"
+    (docs/plans/2026-09-27-memory-reasoning-scope.md, Phase 2 session B). A
+    correction made on a DIFFERENT machine reaches this replica instead via
+    ``hub_snapshot.sync_decision_changes``, called from the capture drain.
+    Never raises: the PG write this backs is already durable (or still
+    inside the caller's own open transaction, same-session-visible either
+    way) by the time this runs, so a mirror failure must never surface as
+    if the decision write itself failed."""
+    try:
+        cols = ["id", "project", "text", "decided_at", "episode_id", "superseded_by"]
+        if _evidence_ready(cur):
+            cols += [
+                "source_kind", "evidence", "superseded_at", "supersede_source",
+                "supersede_reason", "retracted_at", "retract_reason",
+            ]
+        cols.append("created_at")
+        cur.execute(f"SELECT {', '.join(cols)} FROM decisions WHERE id = %s", (decision_id,))
+        row = cur.fetchone()
+        if row is None:
+            return
+        payload = dict(zip(cols, row))
+        from khipu import hub_snapshot
+
+        hub_snapshot.apply_decision_changes([payload])
+    except Exception as exc:  # noqa: BLE001 — the PG write already succeeded; mirror is best-effort
+        _log(f"snapshot mirror for decision {decision_id} failed ({type(exc).__name__}: {exc})")
+
+
 def _fetch_decision_row(cur, decision_id: int) -> dict[str, Any] | None:
     cur.execute(
         "SELECT id, project, superseded_by FROM decisions WHERE id = %s",
@@ -344,6 +375,8 @@ def supersede(cur, old_id: int, new_id: int, *, source: str = "manual",
     ok = cur.rowcount > 0
     if ok and _links_ready(cur):
         _record_applied_link(cur, old_id, new_id, source=source, reason=reason)
+    if ok:
+        _mirror_to_snapshot(cur, old_id)
     return ok
 
 
@@ -376,6 +409,8 @@ def restore(cur, decision_id: int) -> bool:
             "WHERE old_id = %s AND new_id = %s AND kind = 'supersedes' AND state = 'applied'",
             (decision_id, new_id),
         )
+    if ok:
+        _mirror_to_snapshot(cur, decision_id)
     return ok
 
 
@@ -391,7 +426,10 @@ def retract(cur, decision_id: int, reason: str | None = None) -> bool:
         "WHERE id = %s AND retracted_at IS NULL",
         (reason, decision_id),
     )
-    return cur.rowcount > 0
+    ok = cur.rowcount > 0
+    if ok:
+        _mirror_to_snapshot(cur, decision_id)
+    return ok
 
 
 def unretract(cur, decision_id: int) -> bool:
@@ -402,7 +440,10 @@ def unretract(cur, decision_id: int) -> bool:
         "WHERE id = %s AND retracted_at IS NOT NULL",
         (decision_id,),
     )
-    return cur.rowcount > 0
+    ok = cur.rowcount > 0
+    if ok:
+        _mirror_to_snapshot(cur, decision_id)
+    return ok
 
 
 def create_decision(cur, *, project: str | None, text: str, session_id: str | None = None,
@@ -579,9 +620,13 @@ def decision_states_for_episode(episode_id: int) -> dict[str, Any]:
 
 
 def enrich_search_results(cur, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Additive ``decisions_current`` / ``decisions_superseded`` counts on
-    episode-kind search rows. Never raises; a pre-migration hub or a row with
-    no matching decisions simply gets zeros."""
+    """Additive ``decisions_current`` / ``decisions_superseded`` /
+    ``decisions_retracted`` counts on episode-kind search rows (the third
+    added Phase 2, session B so ``khipu.validity.episode_state`` has the same
+    three-way breakdown here that the local-replica lane already computes).
+    Never raises; a pre-migration hub or a row with no matching decisions
+    simply gets zeros. A row is counted into exactly one bucket, matching
+    ``state_of``'s own precedence (retracted wins over superseded)."""
     episode_ids: list[int] = []
     for r in results:
         if r.get("kind") == "episode":
@@ -595,18 +640,23 @@ def enrich_search_results(cur, results: list[dict[str, Any]]) -> list[dict[str, 
     try:
         forgotten_clause = _not_forgotten_clause(cur, "decisions")
         extra = f" AND {forgotten_clause}" if forgotten_clause else ""
+        retracted_expr = "retracted_at IS NOT NULL" if _evidence_ready(cur) else "FALSE"
         cur.execute(
             f"""
             SELECT episode_id,
-                   COUNT(*) FILTER (WHERE superseded_by IS NULL) AS current,
-                   COUNT(*) FILTER (WHERE superseded_by IS NOT NULL) AS superseded
+                   COUNT(*) FILTER (WHERE NOT ({retracted_expr}) AND superseded_by IS NULL) AS current,
+                   COUNT(*) FILTER (WHERE NOT ({retracted_expr}) AND superseded_by IS NOT NULL) AS superseded,
+                   COUNT(*) FILTER (WHERE {retracted_expr}) AS retracted
             FROM decisions
             WHERE episode_id = ANY(%s){extra}
             GROUP BY episode_id
             """,
             (episode_ids,),
         )
-        counts = {int(eid): (int(cur_n), int(sup_n)) for eid, cur_n, sup_n in cur.fetchall()}
+        counts = {
+            int(eid): (int(cur_n), int(sup_n), int(ret_n))
+            for eid, cur_n, sup_n, ret_n in cur.fetchall()
+        }
     except Exception as exc:  # noqa: BLE001 — enrichment is additive, never a search failure
         _log(f"decisions enrichment failed ({type(exc).__name__}: {exc})")
         return out
@@ -617,22 +667,26 @@ def enrich_search_results(cur, results: list[dict[str, Any]]) -> list[dict[str, 
             eid = int(row.get("id"))
         except (TypeError, ValueError):
             continue
-        cur_n, sup_n = counts.get(eid, (0, 0))
+        cur_n, sup_n, ret_n = counts.get(eid, (0, 0, 0))
         row["decisions_current"] = cur_n
         row["decisions_superseded"] = sup_n
+        row["decisions_retracted"] = ret_n
     return out
 
 
 def standing_decisions(cur, *, project: str, since: Any, limit: int = 5) -> list[dict[str, Any]]:
-    """Non-superseded decisions for ``project`` decided since ``since`` — the
-    "Decisions still standing" block in the W4 pushed slice. Never raises;
-    a pre-migration hub returns an empty list."""
+    """Non-superseded, non-retracted decisions for ``project`` decided since
+    ``since`` — the "Decisions still standing" block in the W4 pushed slice.
+    Phase 2, session B: uses ``status="standing"`` (superseded_by IS NULL
+    AND, once migration 0024's columns exist, retracted_at IS NULL) instead
+    of the older ``include_superseded=False`` shortcut, which only ever
+    excluded superseded rows — a retracted-but-not-superseded decision must
+    not keep standing here either. Never raises; a pre-migration hub returns
+    an empty list."""
     if not project or not _decisions_ready(cur):
         return []
     try:
-        return list_decisions(
-            cur, project=project, since=since, limit=limit, include_superseded=False
-        )
+        return list_decisions(cur, project=project, since=since, limit=limit, status="standing")
     except Exception as exc:  # noqa: BLE001 — the slice degrades, never fails
         _log(f"standing_decisions failed ({type(exc).__name__}: {exc})")
         return []

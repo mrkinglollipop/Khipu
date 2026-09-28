@@ -1340,6 +1340,21 @@ def drain(*, limit: int | None = None, dry_run: bool = False) -> dict:
         out["captured"] += 1
         _record_drain(harness, captured=True)
         _log(f"drain: captured {original.name} -> {payload['summary'][:90]!r}")
+    if out["captured"] and not dry_run:
+        # Phase 2, session B: "corrections made elsewhere" — a supersession
+        # made on a DIFFERENT machine reaches THIS machine's local replica
+        # here, piggybacking on a drain that already talked to the hub for
+        # its own captures, rather than a dedicated sync job (no hook may
+        # open a hub connection on its own for this). Best-effort: a sync
+        # failure must never surface as a drain failure.
+        try:
+            from khipu import hub_snapshot
+
+            synced = hub_snapshot.sync_decision_changes()
+            if synced.get("ok") and synced.get("decisions"):
+                out["decisions_synced"] = synced["decisions"]
+        except Exception as exc:  # noqa: BLE001 — best-effort, never blocks capture
+            _log(f"drain: decision sync skipped ({type(exc).__name__}: {exc})")
     return out
 
 

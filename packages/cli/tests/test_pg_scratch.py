@@ -8,8 +8,8 @@ database and no network; this file is the one place that talks to a real
 Postgres, and it is gated hard so it can never accidentally reach anything
 but the throwaway scratch database:
 
-  cd packages/cli && S=$(mktemp -d) && KHIPU_SCRATCH_DSN='postgresql://khipu_scratch@/khipu_scratch?host=/tmp/khipu-scratch-sock-501&port=54329' \\
-      PYTHONPYCACHEPREFIX="$S/pyc" PYTHONPATH="$PWD:/Volumes/Cloud Storage/Code/Khipu/.python_libs" \\
+  cd packages/cli && S=$(mktemp -d) && KHIPU_SCRATCH_DSN='postgresql://khipu_scratch@/khipu_scratch?host=<socket dir>&port=54329' \\
+      PYTHONPYCACHEPREFIX="$S/pyc" PYTHONPATH="$PWD:$PWD/../../.python_libs" \\
       python3.11 -m pytest -q -p no:cacheprovider tests/test_pg_scratch.py
 
 The scratch database holds Khipu's relational schema through migration
@@ -21,7 +21,10 @@ before every test. Every test cleans up the rows it creates.
 from __future__ import annotations
 
 import os
+import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -510,6 +513,137 @@ class ToolPairScratchTest(unittest.TestCase):
         by_id = {r["id"]: r for r in listed["results"]}
         self.assertEqual(by_id[out["superseded_by"]]["text"], "tool pair new-text replacement")
         self.assertEqual(by_id[out["superseded_by"]]["source_kind"], "user")
+
+
+class ValidityScratchTest(unittest.TestCase):
+    """Phase 2, session B: hub-side validity counts (decisions.enrich_
+    search_results' three-way breakdown) and the replica's decision export/
+    sync (hub_snapshot), both against real Postgres."""
+
+    def setUp(self):
+        self.conn = _direct_connect()
+        self.cur = self.conn.cursor()
+        self.created_ids: list[int] = []
+        self.episode_id: int | None = None
+        self.env_patch = mock.patch.dict(os.environ, {"KHIPU_DATABASE_URL": SCRATCH_DSN})
+        self.env_patch.start()
+
+    def tearDown(self):
+        self.env_patch.stop()
+        self.conn.rollback()
+        if self.created_ids:
+            self.cur.execute("DELETE FROM decisions WHERE id = ANY(%s)", (self.created_ids,))
+        if self.episode_id is not None:
+            self.cur.execute("DELETE FROM episodes WHERE id = %s", (self.episode_id,))
+        self.conn.commit()
+        self.cur.close()
+        self.conn.close()
+
+    def _seed(self, text: str, **kw) -> int:
+        from khipu import decisions as de
+
+        did = de.create_decision(self.cur, project=_seed_project(), text=text, **kw)
+        self.created_ids.append(did)
+        self.conn.commit()
+        return did
+
+    def _seed_episode(self) -> int:
+        project = _seed_project()
+        self.cur.execute(
+            "INSERT INTO episodes (ts, session_id, summary, scope, project, topics, "
+            "people, decisions, preferences) VALUES "
+            "(now(), 'claude_code:scratch', 'validity scratch episode', "
+            "%s, %s, '[]', '[]', '[]', '[]') RETURNING id",
+            (project, project),
+        )
+        episode_id = self.cur.fetchone()[0]
+        self.episode_id = episode_id
+        self.conn.commit()
+        return episode_id
+
+    def test_enrich_search_results_three_way_breakdown_is_real_sql(self):
+        from khipu import decisions as de
+
+        episode_id = self._seed_episode()
+        current = self._seed("current decision")
+        superseder = self._seed("superseder decision")
+        old = self._seed("old decision")
+        retracted = self._seed("retracted decision")
+        self.cur.execute(
+            "UPDATE decisions SET episode_id = %s WHERE id = ANY(%s)",
+            (episode_id, [current, superseder, old, retracted]),
+        )
+        self.conn.commit()
+        self.assertTrue(de.supersede(self.cur, old, superseder))
+        self.assertTrue(de.retract(self.cur, retracted, "wrong"))
+        self.conn.commit()
+
+        out = de.enrich_search_results(
+            self.cur, [{"kind": "episode", "id": str(episode_id)}]
+        )
+        row = out[0]
+        self.assertEqual(row["decisions_current"], 2)  # current + superseder
+        self.assertEqual(row["decisions_superseded"], 1)  # old
+        self.assertEqual(row["decisions_retracted"], 1)  # retracted
+
+    def test_supersede_mirrors_to_the_local_replica_at_once(self):
+        """decisions.supersede's best-effort _mirror_to_snapshot: a
+        correction made on THIS machine reaches a real sqlite replica
+        without waiting for sync_decision_changes."""
+        from khipu import decisions as de
+        from khipu import hub_snapshot as hs
+
+        old = self._seed("mirror case old")
+        new = self._seed("mirror case new")
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = Path(tmp) / "hub_snapshot.sqlite"
+            con = sqlite3.connect(str(snap))
+            hs._create_schema(con)
+            con.commit()
+            con.close()
+            meta_file = Path(tmp) / "meta.json"
+            meta_file.write_text("{}", encoding="utf-8")
+            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
+                    mock.patch.object(hs, "meta_path", return_value=meta_file):
+                self.assertTrue(de.supersede(self.cur, old, new, reason="mirrored"))
+                self.conn.commit()
+                con2 = sqlite3.connect(str(snap))
+                row = con2.execute(
+                    "SELECT superseded_by FROM decisions WHERE id = ?", (old,)
+                ).fetchone()
+        self.assertEqual(row[0], new)
+
+    def test_sync_decision_changes_pulls_a_hub_supersession_into_the_replica(self):
+        """"Corrections made elsewhere": a supersession already committed on
+        the hub (no local mirror call involved) reaches a fresh replica via
+        sync_decision_changes alone."""
+        from khipu import decisions as de
+        from khipu import hub_snapshot as hs
+
+        old = self._seed("sync case old")
+        new = self._seed("sync case new")
+        self.assertTrue(de.supersede(self.cur, old, new, reason="synced from elsewhere"))
+        self.conn.commit()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = Path(tmp) / "hub_snapshot.sqlite"
+            con = sqlite3.connect(str(snap))
+            hs._create_schema(con)
+            con.commit()
+            con.close()
+            meta_file = Path(tmp) / "meta.json"
+            meta_file.write_text("{}", encoding="utf-8")
+            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
+                    mock.patch.object(hs, "meta_path", return_value=meta_file), \
+                    mock.patch.object(hs, "try_hub_connect", side_effect=_direct_connect):
+                out = hs.sync_decision_changes()
+                self.assertTrue(out["ok"])
+                self.assertGreaterEqual(out["decisions"], 2)  # at least old + new
+                con2 = sqlite3.connect(str(snap))
+                row = con2.execute(
+                    "SELECT superseded_by FROM decisions WHERE id = ?", (old,)
+                ).fetchone()
+        self.assertEqual(row[0], new)
 
 
 if __name__ == "__main__":

@@ -349,6 +349,14 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Optional, with `prompt`: boosts hits from this repo's project.",
                 },
+                "project": {
+                    "type": "string",
+                    "description": (
+                        "Optional, with `prompt`: the project boost to use when `cwd` is "
+                        "absent or cannot be resolved on this host (the gateway cannot "
+                        "resolve a caller's path at all). A `cwd` that resolves still wins."
+                    ),
+                },
                 "budget_ms": {
                     "type": "integer",
                     "description": (
@@ -865,6 +873,13 @@ def _prior_work_items(hits: list[dict]) -> list[dict]:
     with no snapshot and no lexical match on that row (the gateway's
     `_cosine_candidates` doesn't select project/status — no query added here
     to keep it that way).
+
+    Phase 2, session B: an episode item's `status` now also comes from the
+    row — `khipu.validity.annotate` only ever sets it when the episode's
+    state is not current ("superseded"/"partly superseded"/"retracted"), so
+    this is `None` for every episode this upgrade leaves unchanged, exactly
+    as before. It also gains `validity` (the same dict `render_block`/
+    `_row_tag` read) when the row carries one. Topic items are unchanged.
     """
     from khipu.snippets import clip_snippet
 
@@ -874,14 +889,17 @@ def _prior_work_items(hits: list[dict]) -> list[dict]:
         ts = h.get("ts")
         date = str(ts)[:10] if ts else None
         raw = str(h.get("snippet") or h.get("label") or "")
-        out.append({
+        item = {
             "kind": kind,
             "id": h.get("id"),
             "date": date,
             "project": h.get("project"),
-            "status": h.get("status") if kind == "topic" else None,
+            "status": h.get("status") if kind in ("topic", "episode") else None,
             "snippet": clip_snippet(" ".join(raw.split()), _PRIOR_WORK_SNIPPET_LIMIT),
-        })
+        }
+        if kind == "episode" and h.get("validity") is not None:
+            item["validity"] = h["validity"]
+        out.append(item)
     return out
 
 
@@ -923,7 +941,9 @@ def _attach_prior_work(payload: dict, args: dict) -> None:
             budget_ms = DEFAULT_HUB_BUDGET_MS
         budget_ms = max(_BUDGET_MS_MIN, min(budget_ms, _BUDGET_MS_MAX))
 
-        result = prior_work_for_prompt(prompt, cwd=args.get("cwd"), budget_ms=budget_ms)
+        result = prior_work_for_prompt(
+            prompt, cwd=args.get("cwd"), project=args.get("project"), budget_ms=budget_ms,
+        )
         if _prior_work_gated(str(result.get("reason") or "")):
             payload["prior_work"] = None
         else:

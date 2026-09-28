@@ -117,7 +117,14 @@ class EmbeddingOnTimeTest(unittest.TestCase):
                 mock.patch("khipu.hub_snapshot.snapshot_row_metadata", side_effect=lambda con, rows: rows):
             new_out = rp._snapshot_search_hits("a topical prompt", project=None)
             old_out = _reference_snapshot_search_hits("a topical prompt", project=None)
-        self.assertEqual(new_out["hits"], old_out)
+        # Phase 2, session B: `open_snapshot` here is a plain `object()` (no
+        # real sqlite connection), so validity annotation degrades to
+        # "unknown" and adds a `validity` key to every row — additive, but it
+        # breaks a strict dict comparison against the pre-phase reference,
+        # which never adds it. Strip it before comparing; the deadline
+        # machinery under test is unaffected either way.
+        new_hits = [{k: v for k, v in r.items() if k != "validity"} for r in new_out["hits"]]
+        self.assertEqual(new_hits, old_out)
         self.assertIsNone(new_out["degraded"])
         self.assertEqual(set(new_out["legs"]), {"lexical", "cosine"})
 

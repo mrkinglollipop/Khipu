@@ -61,6 +61,11 @@ _CAPABILITIES = (
     "decisions.evidence",
     "tools.annotations",
     "launchers.read_only",
+    # Phase 2, session B.
+    "validity.markers",
+    "prior_work.outcome",
+    "prior_work.project",
+    "replica.schema_version",
 )
 
 

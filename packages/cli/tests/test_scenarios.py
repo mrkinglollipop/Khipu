@@ -41,9 +41,8 @@ def test_prior_approved_work_is_recalled(tmp_path):
     assert any(h["kind"] == "episode" and h["id"] == "1" for h in result["hits"])
 
 
-# ---- 2. explicit reversal (xfail: validity not yet honoured on recall) ------
+# ---- 2. explicit reversal ----------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="Phase 2B")
 def test_explicit_reversal_marks_the_earlier_decision_superseded(tmp_path):
     with corpus.installed_corpus(tmp_path):
         result = rp.prior_work_for_prompt(
@@ -131,9 +130,8 @@ def test_conflicting_decisions_are_both_surfaced_not_silently_resolved(tmp_path)
     assert {"10", "11"} <= ids
 
 
-# ---- 9. mixed current/superseded episode (xfail: no mixed validity state) --
+# ---- 9. mixed current/superseded episode -------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="Phase 2B")
 def test_a_mixed_episode_is_not_discarded_but_marked_mixed(tmp_path):
     with corpus.installed_corpus(tmp_path):
         result = rp.prior_work_for_prompt(
@@ -161,9 +159,8 @@ def test_a_stale_replica_is_unusable_and_a_refreshed_one_recovers(tmp_path):
         assert any(h["id"] == "1" for h in result["hits"])
 
 
-# ---- 11. changed revision under an existing id (xfail: dedup key unaware) --
+# ---- 11. changed revision under an existing id ------------------------------
 
-@pytest.mark.xfail(strict=True, reason="Phase 2B")
 def test_dedup_key_changes_when_a_rows_validity_revision_changes():
     row_v1 = {"kind": "episode", "id": "13", "validity": {"state": "current", "revision": 1}}
     row_v2 = {"kind": "episode", "id": "13", "validity": {"state": "current", "revision": 2}}

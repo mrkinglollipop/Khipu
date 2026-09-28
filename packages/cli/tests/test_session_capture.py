@@ -836,5 +836,72 @@ class ConversationImageLandTest(unittest.TestCase):
         self.assertEqual(stats["landed"], 0)
 
 
+class DrainDecisionSyncTest(unittest.TestCase):
+    """Phase 2, session B: ``drain()`` pulls decision changes made
+    elsewhere onto this replica once per drain that actually talked to the
+    hub — never on an empty/dry-run drain, never fatal to the drain itself."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp(prefix="khipu-drain-sync-"))
+        self._patches = [
+            mock.patch.object(sc, "_reclaim_stale", return_value=0),
+            mock.patch.object(sc, "land_transcript_images", return_value={}),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self) -> None:
+        for p in self._patches:
+            p.stop()
+
+    def _one_queued_job(self) -> Path:
+        jp = self.dir / "job-claude_code-1.json"
+        jp.write_text(json.dumps({
+            "harness": "claude_code", "session_id": "abc", "event": "Stop",
+            "transcript": "hi", "cwd": "",
+        }), encoding="utf-8")
+        return jp
+
+    def test_a_successful_capture_syncs_decisions(self) -> None:
+        jp = self._one_queued_job()
+        with mock.patch.object(sc, "queued_jobs", return_value=[jp]), \
+                mock.patch.object(sc, "_claim", side_effect=lambda p: p), \
+                mock.patch.object(sc, "_release"), \
+                mock.patch("khipu.extract.extract_verbatim", return_value={}), \
+                mock.patch("khipu.extract.extract_deliverables", return_value=[]), \
+                mock.patch("khipu.extract.extract_memory",
+                            return_value={"summary": "a capture", "decisions": []}), \
+                mock.patch("khipu.capture.capture", return_value=0), \
+                mock.patch("khipu.hub_snapshot.sync_decision_changes",
+                            return_value={"ok": True, "decisions": 3}) as m_sync:
+            out = sc.drain()
+        self.assertEqual(out["captured"], 1)
+        m_sync.assert_called_once()
+        self.assertEqual(out["decisions_synced"], 3)
+
+    def test_an_empty_drain_never_syncs(self) -> None:
+        with mock.patch.object(sc, "queued_jobs", return_value=[]), \
+                mock.patch("khipu.hub_snapshot.sync_decision_changes") as m_sync:
+            out = sc.drain()
+        self.assertEqual(out["captured"], 0)
+        m_sync.assert_not_called()
+
+    def test_a_sync_failure_never_breaks_the_drain(self) -> None:
+        jp = self._one_queued_job()
+        with mock.patch.object(sc, "queued_jobs", return_value=[jp]), \
+                mock.patch.object(sc, "_claim", side_effect=lambda p: p), \
+                mock.patch.object(sc, "_release"), \
+                mock.patch("khipu.extract.extract_verbatim", return_value={}), \
+                mock.patch("khipu.extract.extract_deliverables", return_value=[]), \
+                mock.patch("khipu.extract.extract_memory",
+                            return_value={"summary": "a capture", "decisions": []}), \
+                mock.patch("khipu.capture.capture", return_value=0), \
+                mock.patch("khipu.hub_snapshot.sync_decision_changes",
+                            side_effect=RuntimeError("hub down")):
+            out = sc.drain()
+        self.assertEqual(out["captured"], 1)
+        self.assertNotIn("decisions_synced", out)
+
+
 if __name__ == "__main__":
     unittest.main()

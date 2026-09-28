@@ -220,6 +220,42 @@ def activity_payload(*, limit: int = 40) -> dict:
     }
 
 
+def _annotate_episode_validity(cur, episodes: list[dict]) -> list[dict]:
+    """``khipu.validity.annotate`` for the session-start slice's own recent-
+    episode rows — one bounded query (WHERE episode_id = ANY(...), already
+    small: at most ``episode_limit``), gated on ``khipu.db.has_columns``, the
+    same posture as every other reader in this module. Never raises: a
+    validity-lookup failure degrades to "unknown", never costs the slice its
+    episode rows."""
+    if not episodes:
+        return episodes
+    from khipu.db import has_columns
+    from khipu import validity as _validity
+
+    if not has_columns(cur, "decisions", "id", "project", "text", "decided_at"):
+        return _validity.annotate(episodes, None, None)
+    try:
+        evidence_ready = has_columns(cur, "decisions", "retracted_at")
+        retract_expr = "retracted_at IS NOT NULL" if evidence_ready else "FALSE"
+        ep_ids = [e["id"] for e in episodes]
+        cur.execute(
+            f"""
+            SELECT episode_id,
+                   COUNT(*) FILTER (WHERE NOT ({retract_expr}) AND superseded_by IS NULL),
+                   COUNT(*) FILTER (WHERE NOT ({retract_expr}) AND superseded_by IS NOT NULL),
+                   COUNT(*) FILTER (WHERE {retract_expr})
+            FROM decisions
+            WHERE episode_id = ANY(%s)
+            GROUP BY episode_id
+            """,
+            (ep_ids,),
+        )
+        counts = {str(eid): (int(c), int(s), int(r)) for eid, c, s, r in cur.fetchall()}
+    except Exception:  # noqa: BLE001 — the slice degrades, never fails
+        return _validity.annotate(episodes, None, None)
+    return _validity.annotate(episodes, counts, None)
+
+
 def project_slice(
     *,
     project: str | None,
@@ -300,6 +336,7 @@ def project_slice(
                 )
                 cols = ("id", "ts", "summary", "topics")
                 episodes = [dict(zip(cols, row)) for row in cur.fetchall()]
+                episodes = _annotate_episode_validity(cur, episodes)
 
             topic_slugs: list[str] = []
             for ep in episodes:

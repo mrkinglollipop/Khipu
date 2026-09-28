@@ -239,6 +239,19 @@ _NAMED_TOPIC_SPECS: list[dict[str, Any]] = [
 # topic:<slug> <-> topic:<slug> wiki_link, and one topic:<slug> <-> path:<rel>
 # lives_in — the "indirect graph relationship" scenario needs billing-service
 # wiki-linked to rate-limits with NO lexical overlap between the two bodies.
+# ---- decision supersession wiring (schema version 2 only) ------------------
+# (new_episode_id, new_decision_idx), (old_episode_id, old_decision_idx) — the
+# new decision supersedes the old one, matching what the two summaries above
+# already narrate in English. `new_decision_idx`/`old_decision_idx` index
+# into that episode's OWN `decisions` list (0-based) — episode 12 carries two
+# decisions and supersedes itself: its own reversal, in one capture.
+_DECISION_SUPERSESSIONS: list[tuple[tuple[int, int], tuple[int, int]]] = [
+    ((3, 0), (2, 0)),    # rolling deployment (ep 3) supersedes blue-green (ep 2)
+    ((12, 1), (12, 0)),  # rolling migration supersedes blue-green cutover, same episode
+    ((5, 0), (4, 0)),    # October fee raise supersedes the September fee
+    ((14, 0), (13, 0)),  # pool size 40 supersedes pool size 20
+]
+
 _WIKI_LINKS: list[tuple[str, str]] = [
     ("billing-service", "rate-limits"),
     ("deployment-strategy", "widget-batching"),
@@ -313,6 +326,41 @@ def _episode_rank_text(ep: Episode) -> str:
     return " ".join([ep.summary, *ep.decisions, *ep.topics])
 
 
+def _insert_decisions_table(
+    con: sqlite3.Connection, episodes: list[Episode], *, apply_supersessions: bool = True
+) -> None:
+    """One ``decisions`` row per string in each episode's ``decisions`` list,
+    with ``_DECISION_SUPERSESSIONS`` applied afterward (unless
+    ``apply_supersessions=False`` — the invariant test's "production today
+    holds zero superseded decisions" control: every decision row exists,
+    none is marked superseded). Assigns sequential integer ids in episode
+    order — nothing depends on their exact values, only on ``(episode.id,
+    decision_index)`` resolving to a stable id within one corpus build,
+    which ``_DECISION_SUPERSESSIONS`` relies on."""
+    row_id = 1
+    id_by_ref: dict[tuple[int, int], int] = {}
+    for ep in episodes:
+        for idx, text in enumerate(ep.decisions):
+            con.execute(
+                "INSERT INTO decisions (id, project, text, decided_at, episode_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (row_id, ep.project, text, ep.ts, ep.id, ep.ts),
+            )
+            id_by_ref[(ep.id, idx)] = row_id
+            row_id += 1
+    if not apply_supersessions:
+        return
+    for new_ref, old_ref in _DECISION_SUPERSESSIONS:
+        new_id = id_by_ref.get(new_ref)
+        old_id = id_by_ref.get(old_ref)
+        if new_id is None or old_id is None:
+            continue
+        con.execute(
+            "UPDATE decisions SET superseded_by = ? WHERE id = ?",
+            (new_id, old_id),
+        )
+
+
 def build_corpus(
     tmp_dir: Path,
     *,
@@ -323,12 +371,22 @@ def build_corpus(
     profile_dim: int = PROFILE_DIM,
     active_profile: bool = True,
     refreshed_at: datetime | None = None,
+    schema_version: int = 2,
+    apply_decision_supersessions: bool = True,
 ) -> CorpusHandle:
     """Write a fresh SQLite replica (via the product's own ``_create_schema``)
     plus a matching meta.json under ``tmp_dir``. Parameterised so a test can
     append or override rows (``extra_episodes``/``extra_topics``) without
     forking the whole builder, and can force the replica stale
     (``refreshed_at`` in the past) for the stale/offline scenario.
+
+    ``schema_version`` (Phase 2, session B; default 2, the current shape):
+    pass ``1`` to build the pre-Phase-2B replica instead — no ``decisions``
+    table, no ``topics.superseded_by``/``event_at`` — for a reader's
+    version-1 tolerance test. Decision rows (below) are only written when
+    ``schema_version >= 2``; a version-1 corpus still carries each episode's
+    decision TEXT on its own ``episodes.decisions`` JSON array, exactly as
+    it always has.
     """
     from khipu import hub_snapshot as hs
 
@@ -343,7 +401,7 @@ def build_corpus(
     meta_file = tmp_dir / hs.META_NAME
 
     con = sqlite3.connect(str(snap))
-    hs._create_schema(con)
+    hs._create_schema(con, version=schema_version)
 
     for ep in episodes:
         con.execute(
@@ -358,11 +416,22 @@ def build_corpus(
 
     for t in topics:
         frontmatter = json.dumps({"project": t.project}) if t.project else None
-        con.execute(
-            "INSERT INTO topics (slug, title, body, status, created_at, updated_at, "
-            "frontmatter) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (t.slug, t.title, t.body, t.status, t.created_at, t.updated_at, frontmatter),
-        )
+        if schema_version >= 2:
+            con.execute(
+                "INSERT INTO topics (slug, title, body, status, created_at, updated_at, "
+                "frontmatter, event_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (t.slug, t.title, t.body, t.status, t.created_at, t.updated_at,
+                 frontmatter, t.updated_at),
+            )
+        else:
+            con.execute(
+                "INSERT INTO topics (slug, title, body, status, created_at, updated_at, "
+                "frontmatter) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (t.slug, t.title, t.body, t.status, t.created_at, t.updated_at, frontmatter),
+            )
+
+    if schema_version >= 2:
+        _insert_decisions_table(con, episodes, apply_supersessions=apply_decision_supersessions)
 
     topic_slugs = {t.slug for t in topics}
     for a, b in _WIKI_LINKS:
@@ -431,6 +500,7 @@ def build_corpus(
     }
     meta_file.write_text(
         json.dumps({
+            "schema_version": schema_version,
             "refreshed_at": _iso(refreshed),
             "size_bytes": snap.stat().st_size,
             "counts": counts,

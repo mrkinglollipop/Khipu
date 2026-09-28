@@ -265,7 +265,12 @@ def _render_project_slice(label: str, slice_data: dict) -> str:
         lines.append("### Recent episodes")
         for ep in episodes[:5]:
             text = clip_snippet(str(ep.get("summary") or ""), 200)
-            lines.append(f"- episode `{ep.get('id')}`: {text}")
+            # Phase 2, session B: khipu.validity.annotate only ever sets an
+            # episode's `status` when its state is not current — a no-op
+            # line for every episode this upgrade leaves unchanged.
+            marker = str(ep.get("status") or "").strip().lower()
+            marker_txt = f" ({marker})" if marker else ""
+            lines.append(f"- episode `{ep.get('id')}`: {text}{marker_txt}")
     topics = slice_data.get("topics") or []
     if topics:
         lines.append("### Linked topics")

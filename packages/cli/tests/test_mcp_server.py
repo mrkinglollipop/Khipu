@@ -708,6 +708,15 @@ class StatusPriorWorkTest(unittest.TestCase):
         # to know the parameter exists to get the budgeted behavior.
         self.assertEqual(m.call_args.kwargs["budget_ms"], 600)
 
+    def test_project_argument_is_forwarded(self):
+        """Phase 2, session B: `project` lets a caller with no resolvable
+        `cwd` (the gateway) still get the project boost."""
+        with mock.patch(
+            "khipu.recall_prompt.prior_work_for_prompt", return_value=_PRIOR_WORK_OK,
+        ) as m:
+            self._status({"prompt": "what did we decide", "project": "acme/widget", "full": True})
+        self.assertEqual(m.call_args.kwargs["project"], "acme/widget")
+
     def test_prior_work_is_the_empty_list_when_nothing_clears_the_floor(self):
         """A prompt that searched but found nothing reads as `[]` — the
         search RAN, it just came up empty — distinct from `null` (the

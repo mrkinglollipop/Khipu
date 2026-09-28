@@ -246,6 +246,9 @@ class _Cursor:
             return
 
         if s.startswith("SELECT episode_id, COUNT(*) FILTER"):
+            # Three mutually-exclusive buckets since Phase 2, session B
+            # (decisions_retracted added to enrich_search_results) — retracted
+            # wins over superseded, same precedence as state_of().
             (episode_ids,) = params
             counts: dict[int, list[int]] = {}
             for r in self.rows.values():
@@ -253,12 +256,16 @@ class _Cursor:
                     continue
                 if "episode_id IS NULL OR NOT EXISTS" in s and r["episode_id"] in self.forgotten_episodes:
                     continue
-                bucket = counts.setdefault(r["episode_id"], [0, 0])
-                if r["superseded_by"] is None:
+                bucket = counts.setdefault(r["episode_id"], [0, 0, 0])
+                if r.get("retracted_at"):
+                    bucket[2] += 1
+                elif r["superseded_by"] is None:
                     bucket[0] += 1
                 else:
                     bucket[1] += 1
-            self._result = [(eid, cur_n, sup_n) for eid, (cur_n, sup_n) in counts.items()]
+            self._result = [
+                (eid, cur_n, sup_n, ret_n) for eid, (cur_n, sup_n, ret_n) in counts.items()
+            ]
             return
 
         if s.startswith("SELECT id, text, superseded_by FROM decisions WHERE episode_id"):

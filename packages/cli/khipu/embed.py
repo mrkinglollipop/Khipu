@@ -1917,13 +1917,44 @@ def hybrid_search(
             timing["fusion_ms"] = round((time.monotonic() - _t) * 1000, 1)
             _t = time.monotonic()
             fused = enrich_search_results(cur, fused)
-            # O2: additive decisions_current/decisions_superseded on episode
-            # rows — never lets a decisions-table problem break search itself.
+            # O2: additive decisions_current/decisions_superseded/
+            # decisions_retracted on episode rows — never lets a
+            # decisions-table problem break search itself.
             try:
                 from khipu.decisions import enrich_search_results as _enrich_decisions
 
                 fused = _enrich_decisions(cur, fused)
             except Exception:  # noqa: BLE001 — enrichment only, search must still return
+                pass
+            # Validity annotation (Phase 2, session B): reuses the decisions
+            # enrichment above (no second query) for episode counts, and the
+            # status/superseded_by _apply_search_filters already put on topic
+            # rows — additive `validity` key, and `apply_ranking` only moves
+            # a score when the `validity_ranking` switch is on.
+            try:
+                from khipu import validity as _validity
+
+                episode_rows = [r for r in fused if r.get("kind") == "episode"]
+                if episode_rows and "decisions_current" in episode_rows[0]:
+                    episode_counts = {
+                        str(r["id"]): (
+                            int(r.get("decisions_current") or 0),
+                            int(r.get("decisions_superseded") or 0),
+                            int(r.get("decisions_retracted") or 0),
+                        )
+                        for r in episode_rows
+                    }
+                else:
+                    episode_counts = None if episode_rows else {}
+                topic_meta = {
+                    str(r["id"]): {"status": r.get("status"), "superseded_by": r.get("superseded_by")}
+                    for r in fused if r.get("kind") == "topic"
+                }
+                fused = _validity.annotate(fused, episode_counts, topic_meta)
+                fused = _validity.apply_ranking(
+                    fused, historical=_validity.is_historical(query, since, until)
+                )
+            except Exception:  # noqa: BLE001 — validity is additive, never a search failure
                 pass
             timing["enrich_ms"] = round((time.monotonic() - _t) * 1000, 1)
 
