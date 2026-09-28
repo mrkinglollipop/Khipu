@@ -1,0 +1,20 @@
+{
+  "id": 1,
+  "text": "Ship the widget-batching rollout once the staging soak finishes.",
+  "project": "acme/widget",
+  "owner": "assistant",
+  "kind": "followup",
+  "opened_episode": 501,
+  "opened_at": "t0",
+  "due_after": null,
+  "status": "open",
+  "closed_episode": null,
+  "closed_at": null,
+  "close_reason": null,
+  "last_seen_at": null,
+  "seen_count": 1,
+  "future_trigger": true,
+  "priority": 3,
+  "trigger_text": "once the staging soak finishes.",
+  "until": "until: once the staging soak finishes."
+}
