@@ -1,5 +1,7 @@
 # Fable review: Khipu memory improvements
 
+> Superseded on 28 September 2026. The review is complete: see [the review record](../research/hindsight-plan-review-2026-09-28.md). The user lifted the two conditions stated below: implementation is authorized, and Aegis changes are authorized in a dedicated worktree. This request is kept as the record of what was asked.
+
 Read [the proposed scope](2026-09-27-memory-reasoning-scope.md) first, then [the source verification](../research/hindsight-parity-verification-2026-09-27.md) and [the phased plan](2026-09-27-memory-reasoning-plan.md). Review the proposal; do not implement it. The scope remains unapproved. The user explicitly prohibited changes to the Aegis repository and requires any Aegis dependency to be reported separately.
 
 The [original comparison](../research/hindsight-comparison-2026-09-27.md) supplies research context. The subsequent verification record governs corrected claims. [Archived evidence](../research/evidence/hindsight-parity-2026-09-27/README.md) includes the independent source reviews, exact test selectors, original runner and passing output. No essential review evidence depends on temporary files or this conversation.
