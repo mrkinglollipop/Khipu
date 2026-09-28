@@ -343,6 +343,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         prompt_recall_snapshot = prompt_recall_snapshot_status()
     except Exception as e:  # noqa: BLE001
         prompt_recall_snapshot = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # Phase 0 session C (finding B10): prompt_recall_snapshot above only
+    # tests replica freshness — it says nothing about whether the lane
+    # actually answers within its own budget. This reads the hook's own
+    # outcome log for the real timeout rate, the evidence that was missing
+    # while the lane silently discarded results on 85% of prompts.
+    try:
+        from khipu.recall_prompt import prompt_recall_outcomes
+
+        prompt_recall_outcomes_block = prompt_recall_outcomes()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        prompt_recall_outcomes_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # W6.1: `khipu doctor --probe` is the ONLY way this command writes anything
     # — it runs a fresh end-to-end capture-then-search probe (khipu.probe) and
     # records the result. Plain `khipu doctor` only reads that last recorded
@@ -485,6 +496,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "embed_coverage": embed_coverage,
         "literal_trgm": literal_trgm,
         "prompt_recall_snapshot": prompt_recall_snapshot,
+        "prompt_recall_outcomes": prompt_recall_outcomes_block,
         "recall_probe": recall_probe,
         "recall_quality": recall_quality_block,
         "bundle_seal": bundle_seal_block,
@@ -528,6 +540,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             # the extension exists but an index is actually missing.
             and bool(literal_trgm.get("ok"))
             and bool(prompt_recall_snapshot.get("ok"))
+            and bool(prompt_recall_outcomes_block.get("ok"))
             and all(bool(v.get("ok")) for v in nightly_steps.values())
             and bool(topics_lag.get("ok"))
             and bool(degraded_rate.get("ok"))
@@ -549,6 +562,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "bundle_seal_ok": bool(bundle_seal_block.get("ok")),
         "literal_trgm_ok": bool(literal_trgm.get("ok")),
         "prompt_recall_snapshot_ok": bool(prompt_recall_snapshot.get("ok")),
+        "prompt_recall_outcomes_ok": bool(prompt_recall_outcomes_block.get("ok")),
         "notes_reconcile_ok": bool(nightly_steps.get("notes_reconcile_ok", {}).get("ok")),
         "embed_provider_ok": bool(nightly_steps.get("embed_provider_ok", {}).get("ok")),
         "commitments_hygiene_ok": bool(nightly_steps.get("commitments_hygiene_ok", {}).get("ok")),

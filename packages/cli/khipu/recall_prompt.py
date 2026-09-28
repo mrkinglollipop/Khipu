@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import struct
 import sys
 import threading
 import time
@@ -42,6 +44,15 @@ from typing import Any
 # 3-6s (the pre-index literal pass — see search_text/ops_events R8) to every
 # single prompt is not something a session can afford. Fail open on timeout.
 TIMEOUT_S = 1.2
+
+# Phase 0 session C (finding B10, docs/research/hindsight-plan-review-
+# 2026-09-28.md): how long `_snapshot_search_hits` waits for the query-
+# embedding leg specifically, inside the outer TIMEOUT_S. The gap between
+# the two (0.25s) is what is left for scoring/fusion/floor/render/dedup
+# after the deadline — measured generous against the vector-scan and
+# hub_snapshot changes in this same phase (BLAS scoring ~0.3ms, fetch
+# ~22ms, pack 4-19ms on the production-size replica).
+LOCAL_LANE_DEADLINE_S = 0.95
 
 # "Never inject when the same ids were injected in the last N prompts of this
 # session" (R11 follow-on: trivial-looking but topical prompts repeated back
@@ -90,13 +101,17 @@ def _is_trivial(tokens: list[str]) -> bool:
     return bool(tokens) and set(tokens) <= _ACK_WORDS
 
 
+def _log_path() -> Path:
+    from khipu.session_capture import khipu_home
+
+    return khipu_home() / "logs" / "prompt-recall.log"
+
+
 def _log(msg: str) -> None:
     """Same stamped-line style as session_capture._log, its own file so a
     per-prompt hook's chatter never interleaves with per-turn capture logs."""
     try:
-        from khipu.session_capture import khipu_home
-
-        p = khipu_home() / "logs" / "prompt-recall.log"
+        p = _log_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
             stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -206,13 +221,23 @@ def _apply_score_floor(rows: list[dict[str, Any]], *, ratio: float = SCORE_FLOOR
 QUERY_EMBED_CACHE_MAX = 500
 QUERY_EMBED_LOCAL_TIMEOUT_S = 0.7
 
+# Phase 0 session C (finding B10): the single JSON file this cache used to be
+# was parsed in full on EVERY prompt (measured 46ms at 8.5MB) and rewritten
+# whole on every miss. A keyed sqlite table pays only for the one row a
+# lookup or write actually touches. A short connect timeout bounds how long
+# one hook process can ever wait on another's lock; every failure (locked,
+# corrupt, missing directory) degrades to "not cached" below, never raises.
+# Deliberately a NEW filename, not a migration of the old
+# prompt-query-embed-cache.json — that file is left alone, untouched.
+_QUERY_EMBED_CACHE_CONNECT_TIMEOUT_S = 0.1
+
 
 def _query_embed_cache_path() -> Path:
     from khipu.paths import ensure_data_dir
 
     d = ensure_data_dir() / "state"
     d.mkdir(parents=True, exist_ok=True)
-    return d / "prompt-query-embed-cache.json"
+    return d / "prompt-query-embed-cache.sqlite3"
 
 
 def _normalize_for_cache(text: str) -> str:
@@ -226,25 +251,78 @@ def _query_embed_cache_key(profile: str, prompt: str) -> str:
     return hashlib.sha256(f"{profile}\n{norm}".encode("utf-8")).hexdigest()
 
 
-def _load_query_embed_cache() -> dict[str, list[float]]:
-    try:
-        data = json.loads(_query_embed_cache_path().read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+def _query_embed_cache_connect():
+    import sqlite3
+
+    con = sqlite3.connect(
+        _query_embed_cache_path(),
+        timeout=_QUERY_EMBED_CACHE_CONNECT_TIMEOUT_S,
+        isolation_level=None,  # autocommit: each statement is its own short-held lock
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS query_embed_cache ("
+        "key TEXT PRIMARY KEY, vector BLOB NOT NULL, created REAL NOT NULL)"
+    )
+    return con
 
 
-def _save_query_embed_cache(cache: dict[str, list[float]]) -> None:
+def _pack_vector(vec: list[float]) -> bytes:
+    # float64 (native Python float size): the cached vector round-trips
+    # bit-identical to what the embed API returned, no text/float32 lossy
+    # step anywhere in the path.
+    return struct.pack(f"{len(vec)}d", *(float(x) for x in vec))
+
+
+def _unpack_vector(blob: bytes) -> list[float]:
+    n = len(blob) // 8
+    return list(struct.unpack(f"{n}d", blob[: n * 8]))
+
+
+def _query_embed_cache_get(key: str) -> list[float] | None:
+    """The cached vector for ``key``, or ``None`` on a miss OR any cache
+    failure (locked file, corrupt db, missing directory, mid-write
+    interleave) — a cache problem always degrades to "not cached", never
+    raises and never blocks the caller more than the connect timeout."""
     try:
-        # Dicts keep insertion order (py3.7+): trimming the front drops the
-        # oldest entries, an LRU-ish bound with no extra bookkeeping.
-        if len(cache) > QUERY_EMBED_CACHE_MAX:
-            cache = dict(list(cache.items())[-QUERY_EMBED_CACHE_MAX:])
-        p = _query_embed_cache_path()
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(cache), encoding="utf-8")
-        os.replace(tmp, p)
-    except OSError:
+        con = _query_embed_cache_connect()
+        try:
+            row = con.execute(
+                "SELECT vector FROM query_embed_cache WHERE key = ?", (key,)
+            ).fetchone()
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001 — a locked/corrupt cache is a miss, never a crash
+        return None
+    if not row or not row[0]:
+        return None
+    try:
+        vec = _unpack_vector(row[0])
+    except struct.error:
+        return None
+    return vec or None
+
+
+def _query_embed_cache_put(key: str, vec: list[float]) -> None:
+    """Best-effort write-then-prune to ``QUERY_EMBED_CACHE_MAX`` rows, oldest
+    (by ``created``) dropped first. Never raises."""
+    try:
+        blob = _pack_vector(vec)
+        con = _query_embed_cache_connect()
+        try:
+            con.execute(
+                "INSERT INTO query_embed_cache (key, vector, created) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET vector = excluded.vector, "
+                "created = excluded.created",
+                (key, blob, time.time()),
+            )
+            con.execute(
+                "DELETE FROM query_embed_cache WHERE key NOT IN ("
+                "SELECT key FROM query_embed_cache ORDER BY created DESC LIMIT ?)",
+                (QUERY_EMBED_CACHE_MAX,),
+            )
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001 — a locked/corrupt cache degrades to "not saved this time"
         pass
 
 
@@ -260,16 +338,14 @@ def _cached_query_embed(prompt: str, profile: str) -> list[float]:
     from khipu.embed import embed_one, prefix_query, uses_task_prefixes
 
     key = _query_embed_cache_key(profile, prompt)
-    cache = _load_query_embed_cache()
-    hit = cache.get(key)
-    if isinstance(hit, list) and hit:
+    hit = _query_embed_cache_get(key)
+    if hit:
         return hit
     api_q = prefix_query(prompt) if uses_task_prefixes(profile) else prompt
     vec = embed_one(
         api_q, profile=profile, retries=0, timeout=QUERY_EMBED_LOCAL_TIMEOUT_S, delay=0
     )
-    cache[key] = vec
-    _save_query_embed_cache(cache)
+    _query_embed_cache_put(key, vec)
     return vec
 
 
@@ -281,14 +357,34 @@ class _SnapshotUnusable(Exception):
     hub. Carries the reason so it can be logged (never silently)."""
 
 
-def _snapshot_search_hits(prompt: str, *, project: str | None) -> list[dict[str, Any]]:
+def _snapshot_search_hits(prompt: str, *, project: str | None) -> dict[str, Any]:
     """Lexical + cosine, RRF-fused, entirely against the local sqlite
     replica — no Postgres, no network round trip beyond one (cacheable)
     embed API call. Raises ``_SnapshotUnusable`` when the replica is
-    missing or older than ``hub_snapshot.SNAPSHOT_MAX_AGE_S``; any other
-    failure (sqlite error, embed error on an EMPTY cosine leg) degrades to
-    lexical-only rather than raising, so a cosine hiccup never throws away
-    a perfectly good keyword match.
+    missing or older than ``hub_snapshot.SNAPSHOT_MAX_AGE_S`` — unrelated to
+    the deadline below, checked first. Any other cosine-leg failure
+    degrades to lexical-only rather than raising, so a cosine hiccup never
+    throws away a perfectly good keyword match.
+
+    Deadline-aware (Phase 0 session C, finding B10, docs/research/
+    hindsight-plan-review-2026-09-28.md): the query-embedding request starts
+    on a daemon thread immediately, then the lexical (keyword) search runs
+    on the calling thread while it is in flight — concurrent, not
+    sequential like the version this replaces. A threaded cosine leg was
+    tried once before (2026-09-14) and measured SLOWER end to end, because
+    BOTH legs did real CPU-bound Python work back then (the cosine leg's own
+    per-row unpack-and-sum scoring loop) and fought over the GIL. That
+    scoring is now ``khipu.vector_scan.top_k_by_dot``'s BLAS call, which
+    releases the GIL for the bulk of its own work — overlapping the legs is
+    a clear win now instead of contention. Only the cosine leg waits, and
+    only until ``LOCAL_LANE_DEADLINE_S``: past that, this returns the
+    lexical-only result immediately. The cosine thread keeps running in the
+    background regardless (daemon — never blocks process exit) and still
+    warms the query-embedding cache on completion, the same posture as
+    ``_hub_hits_budgeted``'s legs.
+
+    Returns ``{"hits": [...], "legs": [...], "degraded": str | None}`` — the
+    same shape ``_hub_hits_budgeted`` already uses.
     """
     from khipu import hub_snapshot
     from khipu.recency import apply_project_and_status
@@ -301,30 +397,50 @@ def _snapshot_search_hits(prompt: str, *, project: str | None) -> list[dict[str,
         )
 
     tokens = search_tokens(prompt)
+    deadline = time.monotonic() + LOCAL_LANE_DEADLINE_S
 
-    # A threaded cosine leg (embed API call overlapped with the lexical
-    # sqlite query) was tried here and MEASURED SLOWER end to end (2026-09-14:
-    # several runs crossed the outer 1.2s budget that never did sequentially)
-    # — GIL/thread-scheduling overhead ate the theoretical win, since both
-    # legs do real CPU-bound Python work (SQL param building, sorting, the
-    # cosine dot-product loop) alongside their I/O. Reverted to sequential;
-    # see khipu.recall_prompt's commit history for the measurements.
+    profile = hub_snapshot.active_snapshot_profile()
+    cosine_box: dict[str, Any] = {}
+
+    def _cosine_worker() -> None:
+        try:
+            vec = _cached_query_embed(prompt, profile)
+            cosine_box["rows"] = hub_snapshot.cosine_candidates_snapshot(
+                vec, profile, limit=_SEARCH_LIMIT
+            )
+        except Exception as exc:  # noqa: BLE001 — cosine is a bonus leg, not a requirement
+            cosine_box["error"] = exc
+
+    t_cos: threading.Thread | None = None
+    if profile:
+        t_cos = threading.Thread(target=_cosine_worker, daemon=True)
+        t_cos.start()
+
+    # Keyword leg runs on the calling thread while the embedding request (if
+    # any) is in flight on its own daemon thread above.
     lexical_rows = hub_snapshot.search_snapshot(prompt, _SEARCH_LIMIT, kind=None)
     for r in lexical_rows:
         r["rank_text"] = f"{r.get('label') or ''} {r.get('snippet') or ''}"
     if tokens:
         lexical_rows.sort(key=lambda r: -token_hit_count(r.get("rank_text") or "", tokens))
 
+    legs: list[str] = ["lexical"]
     lists: list[list[dict[str, Any]]] = [lexical_rows] if lexical_rows else []
     cosine_rows: list[dict[str, Any]] = []
-    profile = hub_snapshot.active_snapshot_profile()
-    if profile:
-        try:
-            vec = _cached_query_embed(prompt, profile)
-            cosine_rows = hub_snapshot.cosine_candidates_snapshot(vec, profile, limit=_SEARCH_LIMIT)
-        except Exception as exc:  # noqa: BLE001 — cosine is a bonus leg, not a requirement
+    degraded: str | None = None
+
+    if t_cos is not None:
+        t_cos.join(max(0.0, deadline - time.monotonic()))
+        if "rows" in cosine_box:
+            legs.append("cosine")
+            cosine_rows = cosine_box["rows"]
+        elif "error" in cosine_box:
+            degraded = "embedding error"
+            exc = cosine_box["error"]
             _log(f"snapshot cosine leg skipped: {type(exc).__name__}: {exc}")
-            cosine_rows = []
+        else:
+            degraded = "embedding late"
+
     if cosine_rows:
         for r in cosine_rows:
             r["cosine"] = r.get("score")
@@ -355,7 +471,7 @@ def _snapshot_search_hits(prompt: str, *, project: str | None) -> list[dict[str,
                 r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)
             r.pop("rank_text", None)
     if not lists:
-        return []
+        return {"hits": [], "legs": legs, "degraded": degraded}
 
     fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
     con = hub_snapshot.open_snapshot()
@@ -365,7 +481,7 @@ def _snapshot_search_hits(prompt: str, *, project: str | None) -> list[dict[str,
     # score floor over this full oversample first, then truncates — flooring
     # an already-3-row slice starved the floor of the context it needs (a
     # real #2/#3 hit can legitimately sit well below a dominant #1's score).
-    return fused
+    return {"hits": fused, "legs": legs, "degraded": degraded}
 
 
 def _project_for_cwd(cwd: str | None) -> str | None:
@@ -379,7 +495,7 @@ def _project_for_cwd(cwd: str | None) -> str | None:
         return None
 
 
-def _search_hits(prompt: str, *, cwd: str | None, limit: int = TOP_N) -> list[dict[str, Any]]:
+def _search_hits(prompt: str, *, cwd: str | None, limit: int = TOP_N) -> dict[str, Any]:
     """The gated search itself (no timeout, no dedup — those wrap this).
 
     Local snapshot first (R1 follow-up): fast, no network round trip beyond
@@ -390,12 +506,20 @@ def _search_hits(prompt: str, *, cwd: str | None, limit: int = TOP_N) -> list[di
     before this is ever called, but a query that tokenizes to nothing (all
     stopwords/short) also yields no hits rather than falling back to
     something unrelated.
+
+    Returns ``{"hits": [...], "legs": [...], "degraded": str | None}``
+    (Phase 0 session C) — the same shape ``_hub_hits_budgeted``/
+    ``_search_hits_budgeted`` already use, so a snapshot-path degradation
+    (the embedding leg missing ``LOCAL_LANE_DEADLINE_S``) is visible to the
+    hook's own log line the same way a hub-path degradation already is to
+    ``khipu_status``.
     """
     project = _project_for_cwd(cwd)
 
     try:
-        rows = _snapshot_search_hits(prompt, project=project)
-        return _apply_score_floor(rows)[:limit]
+        result = _snapshot_search_hits(prompt, project=project)
+        hits = _apply_score_floor(result["hits"])[:limit]
+        return {"hits": hits, "legs": result["legs"], "degraded": result["degraded"]}
     except _SnapshotUnusable as exc:
         _log(f"snapshot unusable ({exc}) — falling back to hub")
     except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls back
@@ -405,7 +529,7 @@ def _search_hits(prompt: str, *, cwd: str | None, limit: int = TOP_N) -> list[di
 
     payload = hybrid_search(prompt, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project)
     rows = _apply_score_floor(payload.get("results") or [])
-    return rows[:limit]
+    return {"hits": rows[:limit], "legs": ["hub"], "degraded": None}
 
 
 # ---- budgeted hub search (khipu_status's prior_work, R10 + this phase) ------
@@ -553,12 +677,17 @@ def _search_hits_budgeted(
     this falls through to it immediately). Never raises.
 
     Returns the same shape as ``_hub_hits_budgeted``:
-    ``{"hits": [...], "legs": [...], "degraded": str | None}``.
+    ``{"hits": [...], "legs": [...], "degraded": str | None}`` — when the
+    snapshot answers, ``legs``/``degraded`` are ``_snapshot_search_hits``'s
+    own (Phase 0 session C: real sub-legs, e.g. ``["lexical", "cosine"]`` or
+    ``["lexical"]`` with ``degraded="embedding late"``, not a single opaque
+    ``"snapshot"`` placeholder).
     """
     project = _project_for_cwd(cwd)
     try:
-        rows = _snapshot_search_hits(prompt, project=project)
-        return {"hits": _apply_score_floor(rows)[:limit], "legs": ["snapshot"], "degraded": None}
+        result = _snapshot_search_hits(prompt, project=project)
+        hits = _apply_score_floor(result["hits"])[:limit]
+        return {"hits": hits, "legs": result["legs"], "degraded": result["degraded"]}
     except _SnapshotUnusable as exc:
         _log(f"snapshot unusable ({exc}) — hub budgeted path")
     except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls through
@@ -631,18 +760,28 @@ def prior_work_for_prompt(
 ) -> dict[str, Any]:
     """The whole pipeline as a plain function: gate -> bounded search -> score
     floor -> dedup. Returns ``{"context": str, "hits": [...], "reason": str,
-    "ms": float}``. Never raises. Used by both the hook (which also renders
-    the harness-native envelope) and ``khipu_status``'s ``prior_work`` field
-    (R10), so the two never drift.
+    "ms": float, "legs": [...], "degraded": str | None}``. Never raises.
+    Used by both the hook (which also renders the harness-native envelope)
+    and ``khipu_status``'s ``prior_work`` field (R10), so the two never
+    drift.
+
+    ``legs``/``degraded`` (Phase 0 session C, additive, present on every
+    return path regardless of ``budget_ms``) surface whichever search path
+    ran: the local snapshot's own lexical/cosine sub-legs (see
+    ``_snapshot_search_hits``), or ``["hub"]`` on the TIMEOUT_S path's hub
+    fallback. A gated or timed-out call reports ``[]``/``None`` or
+    ``"timeout"`` respectively — never absent, so callers (the hook's log
+    line among them) can read them unconditionally.
 
     ``budget_ms`` (khipu_status / the gateway lane only — omitted by the
     UserPromptSubmit hook, whose TIMEOUT_S-wrapped local-snapshot-first path
     above is unchanged): switches the search leg from ``_search_hits`` (fixed
     TIMEOUT_S, hub fallback runs cosine sequentially, empty on timeout) to
     ``_search_hits_budgeted`` (concurrent lexical+cosine hub legs, returns
-    whatever finished by the deadline). When set, the result also carries
+    whatever finished by the deadline). When set, the result ALSO carries
     ``prior_work_meta``: ``{"legs": [...], "ms": float, "degraded": str |
-    None, "reason": str}``.
+    None, "reason": str}`` — the same legs/degraded, nested, for callers that
+    only want to look when they opted into a budget.
     """
     t0 = time.monotonic()
     prompt = (prompt or "").strip()
@@ -654,6 +793,8 @@ def prior_work_for_prompt(
 
     def _gated(reason: str) -> dict[str, Any]:
         out = {"context": "", "hits": [], "reason": reason, "ms": 0.0}
+        out["legs"] = []
+        out["degraded"] = None
         meta = _meta(reason=reason)
         if meta is not None:
             out["prior_work_meta"] = meta
@@ -685,7 +826,10 @@ def prior_work_for_prompt(
             legs = result.get("legs") or []
             degraded = result.get("degraded")
         else:
-            hits = _run_with_timeout(_search_hits, TIMEOUT_S, prompt, cwd=cwd, limit=limit)
+            result = _run_with_timeout(_search_hits, TIMEOUT_S, prompt, cwd=cwd, limit=limit)
+            hits = result.get("hits") or []
+            legs = result.get("legs") or []
+            degraded = result.get("degraded")
     except _TimedOut:
         budget_s = (budget_ms / 1000.0) if budget_ms is not None else TIMEOUT_S
         reason = f"timeout>{budget_s}s"
@@ -701,6 +845,8 @@ def prior_work_for_prompt(
         recent = _load_recent_batches(session_id)
         if ids in recent:
             dedup_out = {"context": "", "hits": [], "reason": "dedup", "ms": ms}
+            dedup_out["legs"] = legs
+            dedup_out["degraded"] = degraded
             dedup_meta = _meta(legs=legs, degraded=degraded, reason="dedup", ms=ms)
             if dedup_meta is not None:
                 dedup_out["prior_work_meta"] = dedup_meta
@@ -719,6 +865,8 @@ def prior_work_for_prompt(
     if produced:
         context = f"{context}\n{produced}" if context else produced
     out = {"context": context, "hits": hits or [], "reason": reason, "ms": ms}
+    out["legs"] = legs
+    out["degraded"] = degraded
     meta = _meta(legs=legs, degraded=degraded, reason=reason, ms=ms)
     if meta is not None:
         out["prior_work_meta"] = meta
@@ -773,7 +921,10 @@ def hook_main(raw: str, *, shape: str = "claude") -> dict[str, Any]:
 
     result = prior_work_for_prompt(prompt, cwd=cwd, session_id=session_id)
     hit_ids = [f"{h.get('kind')}:{h.get('id')}" for h in result["hits"]]
-    _log(f"session={session_id or '?'} reason={result['reason']} ms={result['ms']} hits={hit_ids}")
+    _log(
+        f"session={session_id or '?'} reason={result['reason']} ms={result['ms']} "
+        f"hits={hit_ids} legs={result.get('legs') or []} degraded={result.get('degraded')}"
+    )
     ctx = result["context"]
     if shape == "cursor":
         return {"additional_context": ctx} if ctx else {}
@@ -801,3 +952,131 @@ def prompt_recall_main(*, shape: str | None = None) -> None:
         _log(f"hook_main crashed: {type(exc).__name__}: {exc}")
         out = {}
     print(json.dumps(out))
+
+
+# ---- doctor: the lane's real outcome rate (Phase 0 session C, finding B10) --
+# `khipu doctor` reported this lane healthy purely because
+# hub_snapshot.prompt_recall_snapshot_status() only tests replica freshness
+# — it never asked "did the lane actually answer a prompt in time." In
+# production it missed its own TIMEOUT_S deadline on 85% of prompts (2,631
+# calls over 14 days, 2,249 timeouts) with nothing anywhere reporting it.
+# This reads hook_main's own structured summary line (the one _log call
+# above every call ends with) and reports the real rate, so a regression
+# here is visible again without waiting for someone to notice live.
+
+_OUTCOMES_WINDOW_S = 7 * 24 * 60 * 60
+_OUTCOMES_MIN_CALLS = 20
+_OUTCOMES_TIMEOUT_RATE_RED = 0.5
+# Generous enough to comfortably span 7 days of hook-log lines (structured
+# summary lines plus free-form diagnostics from other _log calls in this
+# module) at realistic call volumes, while staying a bounded, cheap read
+# regardless of how large the log has grown — same seek-from-the-end tail
+# pattern as khipu.mirror.sync_recent_episodes.
+_OUTCOMES_TAIL_BYTES = 2 * 1024 * 1024
+
+# Matches the summary line hook_main logs: "<stamp> [khipu-prompt-recall]
+# session=... reason=<...> ms=<...> hits=... legs=... degraded=...". Only
+# this shape counts toward the outcome rate; the module's other, free-form
+# _log calls (e.g. "snapshot unusable (...)") simply do not match and are
+# skipped, same as any genuinely corrupt line.
+_LOG_LINE_RE = re.compile(
+    r"^(?P<stamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) \[khipu-prompt-recall\] "
+    r"session=.*? reason=(?P<reason>.*?) ms=(?P<ms>[0-9.]+) hits="
+)
+
+
+def _classify_call_reason(reason: str) -> str | None:
+    """One of "ok"/"dedup"/"timeout"/"error" — the "searched calls" the
+    doctor check counts — or ``None`` when ``reason`` is a GATE outcome
+    ("no content tokens", "trivial acknowledgment", "gate error: ..."): no
+    search was ever attempted, so it does not count as a searched call at
+    all. Checked as prefixes, not exact matches, so variants like "ok (no
+    session_id: dedup skipped)" and "timeout>1.2s" still classify; "gate
+    error: ..." deliberately does NOT match the "error" prefix (it starts
+    with "gate", not "error") — a gate never reaching a search leg is not
+    the same outcome as a search leg that ran and raised.
+    """
+    if reason == "dedup":
+        return "dedup"
+    if reason.startswith("ok"):
+        return "ok"
+    if reason.startswith("timeout"):
+        return "timeout"
+    if reason.startswith("error"):
+        return "error"
+    return None
+
+
+def _tail_text(path: Path, *, max_bytes: int) -> str:
+    with path.open("rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        block = min(size, max_bytes)
+        f.seek(size - block)
+        return f.read().decode("utf-8", errors="replace")
+
+
+def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
+    """Doctor's real evidence for the per-prompt lane (finding B10): count,
+    timeout rate and median latency of actually-searched calls (reason ok,
+    dedup, timeout or error — a gated call never reached a search leg and
+    does not count) over the last 7 days, read from the hook's own log.
+
+    Not ok when there are at least 20 searched calls and the timeout rate is
+    0.5 or higher. Fewer than 20 calls is ok with ``"insufficient": True`` —
+    a fresh install or a quiet week is not evidence of a failure. Never
+    raises and never does more than one bounded tail read: a missing log, an
+    unreadable one, or a file of nothing but garbage lines all degrade to
+    the same "insufficient" outcome as a fresh install.
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = now.timestamp() - _OUTCOMES_WINDOW_S
+    path = _log_path()
+    try:
+        if not path.is_file():
+            return {"ok": True, "insufficient": True, "count": 0}
+        raw = _tail_text(path, max_bytes=_OUTCOMES_TAIL_BYTES)
+    except OSError:
+        return {"ok": True, "insufficient": True, "count": 0}
+
+    ms_values: list[float] = []
+    timeouts = 0
+    total = 0
+    for line in raw.splitlines():
+        m = _LOG_LINE_RE.match(line)
+        if not m:
+            continue
+        try:
+            stamp = datetime.strptime(m.group("stamp"), "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+        if stamp.timestamp() < cutoff:
+            continue
+        category = _classify_call_reason(m.group("reason"))
+        if category is None:
+            continue
+        ms_values.append(float(m.group("ms")))
+        total += 1
+        if category == "timeout":
+            timeouts += 1
+
+    if total < _OUTCOMES_MIN_CALLS:
+        return {"ok": True, "insufficient": True, "count": total}
+
+    timeout_rate = timeouts / total
+    ms_values.sort()
+    mid = len(ms_values) // 2
+    median_ms = (
+        ms_values[mid]
+        if len(ms_values) % 2
+        else (ms_values[mid - 1] + ms_values[mid]) / 2
+    )
+    return {
+        "ok": timeout_rate < _OUTCOMES_TIMEOUT_RATE_RED,
+        "insufficient": False,
+        "count": total,
+        "timeout_rate": round(timeout_rate, 4),
+        "median_ms": round(median_ms, 1),
+    }
