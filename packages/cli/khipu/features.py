@@ -69,6 +69,9 @@ _CAPABILITIES = (
     # Phase 2, session C.
     "decisions.details",
     "decisions.detection",
+    # Phase 3, session A.
+    "search.time_interpretation",
+    "search.graph_candidates",
 )
 
 

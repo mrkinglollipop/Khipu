@@ -2188,6 +2188,37 @@ def _snapshot_filters_dropped(*, session_id: str | None, harness: str | None) ->
     return dropped
 
 
+def _graph_candidates_snapshot(con, results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Switch-gated graph-candidate leg shared by both ``search_stale_
+    payload`` branches (Phase 3, session A: "the replica [backend] serves
+    the local prompt lane and the stale-replica payload"). ``results`` is
+    used as-is for seeding (it is the caller's own already-ranked list, no
+    fusion has happened yet on this path the way ``embed.hybrid_search``
+    fuses several candidate lists — a single ranked list is still one valid
+    input to ``fuse_ranked_lists``). Returns ``(results, degraded_legs)``;
+    ``degraded_legs`` is ``[]`` unless the switch is on and the leg missed
+    or errored."""
+    from khipu import features as _features
+
+    if not _features.enabled("graph_candidates"):
+        return results, []
+    try:
+        import time as _time
+
+        from khipu import graph_candidates as _gc
+        from khipu.search_text import fuse_ranked_lists
+
+        deadline = _time.monotonic() + _gc.REPLICA_LEG_DEADLINE_S
+        cand_rows, missed = _gc.replica_candidates(con, results, deadline=deadline)
+        if missed:
+            return results, ["graph_candidates"]
+        if cand_rows:
+            results = fuse_ranked_lists([results, cand_rows], limit=max(len(results), 1) + len(cand_rows))
+        return results, []
+    except Exception:  # noqa: BLE001 — a candidate-leg failure must not sink the search
+        return results, ["graph_candidates"]
+
+
 def search_stale_payload(
     query: str,
     limit: int,
@@ -2199,13 +2230,21 @@ def search_stale_payload(
     project: str | None = None,
     session_id: str | None = None,
     harness: str | None = None,
+    tz: str | None = None,
 ) -> dict[str, Any]:
     """Hub-unreachable search fallback (sqlite replica). Honours kind/since/
     until/project/session_id/harness on both the semantic and literal paths
     (W2.3 minimum bar, fix 7 for the metadata filters) — any filter this
     snapshot genuinely cannot honour is named in ``filters_dropped``, never
     silently ignored. Phase 2, session B: episode/topic rows carry
-    ``validity`` too — this is a recall surface like any other."""
+    ``validity`` too — this is a recall surface like any other.
+
+    ``tz`` (Phase 3, session A) is accepted for the same signature as
+    ``embed.hybrid_search``/``khipu_search``; this fallback path does not
+    itself carry a per-row ``ts`` before enrichment, so — unlike the local
+    prompt lane and the explicit hub search — it wires only the graph-
+    candidates leg here, not time interpretation.
+    """
     filters_dropped = _snapshot_filters_dropped(session_id=session_id, harness=harness)
     if semantic:
         results = semantic_search_snapshot(
@@ -2213,30 +2252,38 @@ def search_stale_payload(
             project=project, session_id=session_id, harness=harness,
         )
         con = open_snapshot()
+        results, degraded_legs = _graph_candidates_snapshot(con, results)
         results = enrich_search_results_snapshot(con, results)
         results = _annotate_snapshot_validity(con, results)
-        return {
+        out = {
             "query": query,
             "mode": "semantic",
             "results": results,
             "filters_dropped": filters_dropped,
             **stale_fields(),
         }
+        if degraded_legs:
+            out["degraded_legs"] = degraded_legs
+        return out
     con = open_snapshot()
     results = search_snapshot(
         query, limit, kind=kind, since=since, until=until,
         project=project, session_id=session_id, harness=harness,
     )
     results = merge_outbox_episodes(results)
+    results, degraded_legs = _graph_candidates_snapshot(con, results)
     results = enrich_search_results_snapshot(con, results)
     results = _annotate_snapshot_validity(con, results)
-    return {
+    out = {
         "query": query,
         "mode": "literal",
         "results": results[:limit],
         "filters_dropped": filters_dropped,
         **stale_fields(),
     }
+    if degraded_legs:
+        out["degraded_legs"] = degraded_legs
+    return out
 
 
 def _annotate_snapshot_validity(

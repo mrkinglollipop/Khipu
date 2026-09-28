@@ -821,5 +821,279 @@ class ValidityScratchTest(unittest.TestCase):
         self.assertEqual(row[0], new)
 
 
+class GraphCandidatesScratchTest(unittest.TestCase):
+    """Phase 3, session A: khipu.graph_candidates.hub_candidates against
+    real Postgres — the one place this suite exercises the JSONB-aware
+    ``jsonb_array_elements_text`` join (episodes.topics is JSONB, migration
+    0001, not a native array) and the ``edges`` ANY(%s)/UNION query; a fake
+    cursor could not stand in for either without re-implementing them."""
+
+    def setUp(self):
+        self.conn = _direct_connect()
+        self.cur = self.conn.cursor()
+        self.topic_slugs: list[str] = []
+        self.episode_ids: list[int] = []
+
+    def tearDown(self):
+        self.conn.rollback()
+        if self.topic_slugs:
+            node_ids = [f"topic:{s}" for s in self.topic_slugs]
+            self.cur.execute(
+                "DELETE FROM edges WHERE src = ANY(%s) OR dst = ANY(%s)",
+                (node_ids, node_ids),
+            )
+            self.cur.execute("DELETE FROM nodes WHERE id = ANY(%s)", (node_ids,))
+            self.cur.execute("DELETE FROM topics WHERE slug = ANY(%s)", (self.topic_slugs,))
+        if self.episode_ids:
+            self.cur.execute("DELETE FROM episodes WHERE id = ANY(%s)", (self.episode_ids,))
+        self.conn.commit()
+        self.cur.close()
+        self.conn.close()
+
+    def _seed_topic(self, slug: str, title: str, body: str) -> None:
+        self.cur.execute(
+            "INSERT INTO topics (slug, title, body, created_at) VALUES (%s, %s, %s, now())",
+            (slug, title, body),
+        )
+        self.topic_slugs.append(slug)
+        self.conn.commit()
+
+    def _seed_episode(self, summary: str, topics: list[str], *, days_ago: int = 0) -> int:
+        import json
+
+        project = _seed_project()
+        self.cur.execute(
+            "INSERT INTO episodes (ts, session_id, summary, scope, project, topics, "
+            "people, decisions, preferences) VALUES "
+            "(now() - (%s * interval '1 day'), 'claude_code:scratch', %s, %s, %s, %s::jsonb, "
+            "'[]', '[]', '[]') RETURNING id",
+            (days_ago, summary, project, project, json.dumps(topics)),
+        )
+        eid = self.cur.fetchone()[0]
+        self.episode_ids.append(eid)
+        self.conn.commit()
+        return eid
+
+    def test_topic_seed_finds_its_wiki_linked_neighbor(self):
+        from khipu import graph_candidates as gc
+
+        self._seed_topic("scratch-gc-billing", "Billing", "billing service body")
+        self._seed_topic("scratch-gc-ratelimits", "Rate limits", "rate limit body")
+        self.cur.execute(
+            "INSERT INTO nodes (id, type, name) VALUES (%s, 'topic', %s), (%s, 'topic', %s) "
+            "ON CONFLICT (id) DO NOTHING",
+            ("topic:scratch-gc-billing", "scratch-gc-billing",
+             "topic:scratch-gc-ratelimits", "scratch-gc-ratelimits"),
+        )
+        self.cur.execute(
+            "INSERT INTO edges (src, dst, type, weight) VALUES (%s, %s, 'wiki_link', 1.0)",
+            ("topic:scratch-gc-billing", "topic:scratch-gc-ratelimits"),
+        )
+        self.conn.commit()
+
+        import time
+
+        fused = [{"kind": "topic", "id": "scratch-gc-billing", "score": 1.0}]
+        deadline = time.monotonic() + gc.HUB_LEG_DEADLINE_S
+        candidates, missed = gc.hub_candidates(self.cur, fused, deadline=deadline)
+        self.assertFalse(missed)
+        hit = next(c for c in candidates if c["id"] == "scratch-gc-ratelimits")
+        self.assertEqual(hit["kind"], "topic")
+        self.assertEqual(
+            hit["via"], {"seed": "topic:scratch-gc-billing", "relation": "wiki_link"}
+        )
+
+    def test_episode_seed_finds_the_topics_it_names(self):
+        from khipu import graph_candidates as gc
+
+        self._seed_topic("scratch-gc-syncjob", "Sync job", "sync job body")
+        eid = self._seed_episode("episode naming the sync job", ["Scratch Gc Syncjob"])
+
+        import time
+
+        fused = [{"kind": "episode", "id": str(eid), "score": 1.0}]
+        deadline = time.monotonic() + gc.HUB_LEG_DEADLINE_S
+        candidates, missed = gc.hub_candidates(self.cur, fused, deadline=deadline)
+        self.assertFalse(missed)
+        self.assertTrue(
+            any(c["kind"] == "topic" and c["id"] == "scratch-gc-syncjob" for c in candidates)
+        )
+
+    def test_topic_seed_finds_recent_episodes_naming_it_case_and_punctuation_insensitively(self):
+        """The label an episode carries ("Scratch GC Webhook!!") is not the
+        topic's slug ("scratch-gc-webhook") — this join only succeeds if the
+        hub-side SQL slugification (regexp_replace mirror of
+        topic_graph.topic_slug_from_label) actually folds them to the same
+        string, which only real Postgres can prove."""
+        from khipu import graph_candidates as gc
+
+        self._seed_topic("scratch-gc-webhook", "Webhook", "webhook body")
+        newest = self._seed_episode(
+            "newest webhook mention", ["Scratch GC Webhook!!"], days_ago=1
+        )
+        self._seed_episode("older webhook mention", ["scratch_gc_webhook"], days_ago=5)
+        self._seed_episode("oldest webhook mention", ["Scratch-GC-Webhook"], days_ago=10)
+
+        import time
+
+        fused = [{"kind": "topic", "id": "scratch-gc-webhook", "score": 1.0}]
+        deadline = time.monotonic() + gc.HUB_LEG_DEADLINE_S
+        candidates, missed = gc.hub_candidates(self.cur, fused, deadline=deadline)
+        self.assertFalse(missed)
+        episode_hits = [c for c in candidates if c["kind"] == "episode"]
+        self.assertEqual({h["id"] for h in episode_hits}, {str(e) for e in self.episode_ids})
+        # Most recent first (recency tiebreak).
+        self.assertEqual(episode_hits[0]["id"], str(newest))
+
+    def test_per_seed_cap_keeps_only_three_of_more_than_three_matches(self):
+        from khipu import graph_candidates as gc
+
+        self._seed_topic("scratch-gc-capped", "Capped", "capped body")
+        for i in range(4):
+            self._seed_episode(f"mention {i}", ["Scratch GC Capped"], days_ago=i)
+
+        import time
+
+        fused = [{"kind": "topic", "id": "scratch-gc-capped", "score": 1.0}]
+        deadline = time.monotonic() + gc.HUB_LEG_DEADLINE_S
+        candidates, missed = gc.hub_candidates(self.cur, fused, deadline=deadline)
+        self.assertFalse(missed)
+        self.assertEqual(len(candidates), gc.PER_SEED_CAP)
+
+    def test_a_row_already_in_the_fused_list_is_never_offered_again(self):
+        from khipu import graph_candidates as gc
+
+        self._seed_topic("scratch-gc-billing2", "Billing2", "billing body")
+        self._seed_topic("scratch-gc-ratelimits2", "Rate limits2", "rate limit body")
+        self.cur.execute(
+            "INSERT INTO nodes (id, type, name) VALUES (%s, 'topic', %s), (%s, 'topic', %s) "
+            "ON CONFLICT (id) DO NOTHING",
+            ("topic:scratch-gc-billing2", "scratch-gc-billing2",
+             "topic:scratch-gc-ratelimits2", "scratch-gc-ratelimits2"),
+        )
+        self.cur.execute(
+            "INSERT INTO edges (src, dst, type, weight) VALUES (%s, %s, 'wiki_link', 1.0)",
+            ("topic:scratch-gc-billing2", "topic:scratch-gc-ratelimits2"),
+        )
+        self.conn.commit()
+
+        import time
+
+        fused = [
+            {"kind": "topic", "id": "scratch-gc-billing2", "score": 1.0},
+            {"kind": "topic", "id": "scratch-gc-ratelimits2", "score": 0.9},
+        ]
+        deadline = time.monotonic() + gc.HUB_LEG_DEADLINE_S
+        candidates, missed = gc.hub_candidates(self.cur, fused, deadline=deadline)
+        self.assertFalse(missed)
+        self.assertFalse(any(c["id"] == "scratch-gc-ratelimits2" for c in candidates))
+
+    def test_an_expired_deadline_drops_the_whole_leg(self):
+        from khipu import graph_candidates as gc
+
+        self._seed_topic("scratch-gc-deadline", "Deadline", "deadline body")
+        self._seed_topic("scratch-gc-deadline-nb", "Neighbor", "neighbor body")
+        self.cur.execute(
+            "INSERT INTO nodes (id, type, name) VALUES (%s, 'topic', %s), (%s, 'topic', %s) "
+            "ON CONFLICT (id) DO NOTHING",
+            ("topic:scratch-gc-deadline", "scratch-gc-deadline",
+             "topic:scratch-gc-deadline-nb", "scratch-gc-deadline-nb"),
+        )
+        self.cur.execute(
+            "INSERT INTO edges (src, dst, type, weight) VALUES (%s, %s, 'wiki_link', 1.0)",
+            ("topic:scratch-gc-deadline", "topic:scratch-gc-deadline-nb"),
+        )
+        self.conn.commit()
+
+        import time
+
+        fused = [{"kind": "topic", "id": "scratch-gc-deadline", "score": 1.0}]
+        candidates, missed = gc.hub_candidates(self.cur, fused, deadline=time.monotonic() - 1)
+        self.assertTrue(missed)
+        self.assertEqual(candidates, [])
+
+
+class EmbedHybridSearchGraphCandidatesScratchTest(unittest.TestCase):
+    """khipu.embed.hybrid_search's graph_candidates wiring, end to end
+    against real Postgres — not just khipu.graph_candidates.hub_candidates
+    in isolation. Confirms the switch-off invariant (no neighbor, no new
+    keys) alongside the switch-on behavior in the same real connection."""
+
+    def setUp(self):
+        self.conn = _direct_connect()
+        self.cur = self.conn.cursor()
+        self.topic_slugs: list[str] = []
+        self.hub_patch = mock.patch("khipu.hub_snapshot.try_hub_connect", side_effect=_direct_connect)
+        self.hub_patch.start()
+
+    def tearDown(self):
+        self.hub_patch.stop()
+        self.conn.rollback()
+        if self.topic_slugs:
+            node_ids = [f"topic:{s}" for s in self.topic_slugs]
+            self.cur.execute(
+                "DELETE FROM edges WHERE src = ANY(%s) OR dst = ANY(%s)",
+                (node_ids, node_ids),
+            )
+            self.cur.execute("DELETE FROM nodes WHERE id = ANY(%s)", (node_ids,))
+            self.cur.execute("DELETE FROM topics WHERE slug = ANY(%s)", (self.topic_slugs,))
+        self.conn.commit()
+        self.cur.close()
+        self.conn.close()
+
+    _SEED_SLUG = "scratch-gc-hybrid-seed-9f2e"
+    _NEIGHBOR_SLUG = "scratch-gc-hybrid-nbr-8a1c"
+
+    def _seed_linked_topics(self) -> None:
+        # The seed's marker token ("zzqwidgetalpha") must not appear ANYWHERE
+        # on the neighbor row (slug included — a shared slug substring would
+        # let plain literal ILIKE find it too, defeating the isolation this
+        # test needs between "found via the graph leg" and "found anyway").
+        self.cur.execute(
+            "INSERT INTO topics (slug, title, body, created_at) VALUES "
+            "(%s, 'Seed topic', 'zzqwidgetalpha marker body', now()), "
+            "(%s, 'Unrelated neighbor topic', 'totally unrelated content', now())",
+            (self._SEED_SLUG, self._NEIGHBOR_SLUG),
+        )
+        self.topic_slugs = [self._SEED_SLUG, self._NEIGHBOR_SLUG]
+        self.cur.execute(
+            "INSERT INTO nodes (id, type, name) VALUES (%s, 'topic', %s), (%s, 'topic', %s) "
+            "ON CONFLICT (id) DO NOTHING",
+            (f"topic:{self._SEED_SLUG}", self._SEED_SLUG,
+             f"topic:{self._NEIGHBOR_SLUG}", self._NEIGHBOR_SLUG),
+        )
+        self.cur.execute(
+            "INSERT INTO edges (src, dst, type, weight) VALUES (%s, %s, 'wiki_link', 1.0)",
+            (f"topic:{self._SEED_SLUG}", f"topic:{self._NEIGHBOR_SLUG}"),
+        )
+        self.conn.commit()
+
+    def test_switch_off_never_adds_the_neighbor_or_new_keys(self):
+        from khipu import embed
+
+        self._seed_linked_topics()
+        with mock.patch("khipu.features.enabled", return_value=False):
+            payload = embed.hybrid_search("zzqwidgetalpha marker", mode="literal", kind="topic", limit=5)
+        ids = {r["id"] for r in payload["results"]}
+        self.assertIn(self._SEED_SLUG, ids)
+        self.assertNotIn(self._NEIGHBOR_SLUG, ids)
+        self.assertNotIn("degraded_legs", payload)
+        self.assertNotIn("time_interpretation", payload)
+
+    def test_switch_on_surfaces_the_wiki_linked_neighbor(self):
+        from khipu import embed
+
+        self._seed_linked_topics()
+        with mock.patch("khipu.features.enabled", side_effect=lambda name: name == "graph_candidates"):
+            payload = embed.hybrid_search("zzqwidgetalpha marker", mode="literal", kind="topic", limit=5)
+        ids = {r["id"] for r in payload["results"]}
+        self.assertIn(self._SEED_SLUG, ids)
+        self.assertIn(self._NEIGHBOR_SLUG, ids)
+        hit = next(r for r in payload["results"] if r["id"] == self._NEIGHBOR_SLUG)
+        self.assertEqual(
+            hit["via"], {"seed": f"topic:{self._SEED_SLUG}", "relation": "wiki_link"}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

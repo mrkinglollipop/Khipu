@@ -517,7 +517,7 @@ class SearchStaleFallbackForwardingTest(unittest.TestCase):
         captured = {}
 
         def fake_stale(query, limit, *, semantic, kind, since, until,
-                        project, session_id, harness):
+                        project, session_id, harness, tz=None):
             captured.update(project=project, session_id=session_id, harness=harness)
             return {"query": query, "mode": "literal", "results": [], "filters_dropped": []}
 

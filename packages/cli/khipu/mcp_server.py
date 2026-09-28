@@ -242,6 +242,15 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Prefix of session_id before the colon, e.g. 'claude_code'",
                 },
+                "tz": {
+                    "type": "string",
+                    "description": (
+                        "IANA zone name (e.g. 'America/New_York') for interpreting a natural-"
+                        "language time phrase in `query` (e.g. 'last week'), when the "
+                        "time_interpretation feature is on and no explicit since/until is "
+                        "given. Defaults to UTC; an unrecognized name also falls back to UTC."
+                    ),
+                },
             },
             "required": ["query"],
         },
@@ -589,6 +598,7 @@ def _tool_search(args: dict) -> dict:
     until = args.get("until") or None
     session_id = args.get("session_id") or None
     harness = args.get("harness") or None
+    tz = args.get("tz") or None
 
     try:
         from khipu.embed import hybrid_search
@@ -596,6 +606,7 @@ def _tool_search(args: dict) -> dict:
         payload = hybrid_search(
             query, limit=max(1, limit), mode=mode, kind=kind, project=project,
             since=since, until=until, session_id=session_id, harness=harness,
+            tz=tz,
         )
     except Exception as exc:
         if not hub_connection_failed(exc):
@@ -603,7 +614,7 @@ def _tool_search(args: dict) -> dict:
         payload = search_stale_payload(
             query, max(1, limit), semantic=(mode == "semantic"), kind=kind,
             since=since, until=until, project=project, session_id=session_id,
-            harness=harness,
+            harness=harness, tz=tz,
         )
     query_log.log_query(
         query, mode=mode,

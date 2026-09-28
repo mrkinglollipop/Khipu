@@ -55,12 +55,12 @@ def test_explicit_reversal_marks_the_earlier_decision_superseded(tmp_path):
     assert hit["validity"]["state"] == "superseded"
 
 
-# ---- 3. historical / as-of question (xfail: time_interpretation unwired) ----
+# ---- 3. historical / as-of question ------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="Phase 3A")
 def test_an_as_of_question_returns_the_historical_value(tmp_path):
     as_of_now = datetime(2026, 10, 15, tzinfo=timezone.utc)
-    with corpus.installed_corpus(tmp_path, now=as_of_now):
+    with corpus.installed_corpus(tmp_path, now=as_of_now), \
+         mock.patch("khipu.features.enabled", side_effect=lambda name: name == "time_interpretation"):
         result = rp.prior_work_for_prompt(
             "what was the rocket launch fee as of September 2026", cwd=None
         )
@@ -81,11 +81,11 @@ def test_same_wording_ranks_the_matching_project_first(tmp_path):
     assert hits[0]["kind"] == "episode" and hits[0]["id"] == "6"
 
 
-# ---- 5. indirect graph relationship (xfail: graph_candidates unwired) ------
+# ---- 5. indirect graph relationship -------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="Phase 3A")
 def test_an_indirect_wiki_linked_topic_surfaces_as_a_graph_candidate(tmp_path):
-    with corpus.installed_corpus(tmp_path):
+    with corpus.installed_corpus(tmp_path), \
+         mock.patch("khipu.features.enabled", side_effect=lambda name: name == "graph_candidates"):
         result = rp.prior_work_for_prompt(
             "billing-service module dependencies", cwd=None
         )

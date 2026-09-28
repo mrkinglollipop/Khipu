@@ -1719,6 +1719,7 @@ def hybrid_search(
     session_id: str | None = None,
     harness: str | None = None,
     project_boost: str | None = None,
+    tz: str | None = None,
 ) -> dict[str, Any]:
     """Default retrieval engine (W2.1-W2.3): fused hybrid, or single-mode.
 
@@ -1900,10 +1901,54 @@ def hybrid_search(
                 return out
             _t = time.monotonic()
             fused = fuse_ranked_lists(lists, limit=oversample)
+
+            # Graph candidates (Phase 3, session A): switch-gated, own 400ms
+            # deadline, dropped entirely (never partially) on a miss — named
+            # in `degraded_legs`. Seeds are the top 5 rows of `fused` exactly
+            # as fused above, before any filter/enrichment pass touches it.
+            degraded_legs: list[str] = []
+            from khipu import features as _features
+
+            if _features.enabled("graph_candidates"):
+                try:
+                    from khipu import graph_candidates as _gc
+
+                    gc_deadline = time.monotonic() + _gc.HUB_LEG_DEADLINE_S
+                    cand_rows, missed = _gc.hub_candidates(cur, fused, deadline=gc_deadline)
+                    if missed:
+                        degraded_legs.append("graph_candidates")
+                    elif cand_rows:
+                        fused = fuse_ranked_lists([fused, cand_rows], limit=oversample)
+                except Exception as exc:  # noqa: BLE001 — a candidate-leg failure must not sink the search
+                    degraded_legs.append("graph_candidates")
+                    timing["graph_candidates_error"] = str(exc)[:120]
+
             fused = _apply_search_filters(
                 cur, fused, project=project, since=since, until=until,
                 session_id=session_id, harness=harness,
             )
+
+            # Time interpretation (Phase 3, session A): switch-gated, and
+            # only when the caller passed no explicit since/until — an
+            # explicit filter always wins outright, this is a preference on
+            # top of what the caller already asked for. A boost, never a
+            # filter: nothing found here is ever excluded.
+            interpretation: dict[str, Any] | None = None
+            if not since and not until and _features.enabled("time_interpretation"):
+                try:
+                    from datetime import datetime as _datetime
+                    from datetime import timezone as _timezone
+
+                    from khipu import timeparse as _timeparse
+
+                    interpretation = _timeparse.interpret(
+                        query, _datetime.now(_timezone.utc), tz
+                    )
+                    if interpretation:
+                        fused = _timeparse.apply_time_boost(fused, interpretation)
+                except Exception:  # noqa: BLE001 — additive, never a search failure
+                    interpretation = None
+
             # Project boost + status de-rank (R5/R6) ride on the fused score
             # BEFORE recency, same as recency itself: both are score nudges
             # that must see the raw fused order, and both re-sort by the
@@ -1951,8 +1996,13 @@ def hybrid_search(
                     for r in fused if r.get("kind") == "topic"
                 }
                 fused = _validity.annotate(fused, episode_counts, topic_meta)
+                # An interpreted window counts as a history cue too (scope,
+                # "BUILD — time interpretation" #2) even though it was never
+                # an explicit filter — is_historical only looks at presence.
+                hist_since = since or (interpretation.get("since") if interpretation else None)
+                hist_until = until or (interpretation.get("until") if interpretation else None)
                 fused = _validity.apply_ranking(
-                    fused, historical=_validity.is_historical(query, since, until)
+                    fused, historical=_validity.is_historical(query, hist_since, hist_until)
                 )
             except Exception:  # noqa: BLE001 — validity is additive, never a search failure
                 pass
@@ -1966,6 +2016,10 @@ def hybrid_search(
            "ranking": {"recency_half_life_days": HALF_LIFE_DAYS}}
     if degraded:
         out["degraded"] = degraded
+    if degraded_legs:
+        out["degraded_legs"] = degraded_legs
+    if interpretation:
+        out["time_interpretation"] = interpretation
     return out
 
 
