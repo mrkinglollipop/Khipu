@@ -378,6 +378,24 @@ def _merge_into_episode(
             pass
         _log(f"merge decisions step failed ({type(exc).__name__}: {exc})")
 
+    # Phase 2, session C: conservative reversal detection reads the row
+    # insert_decisions_from_episode just wrote — its own SAVEPOINT so a
+    # detection failure can never take the merged decision row down with it.
+    try:
+        cur.execute("SAVEPOINT capture_merge_decision_detection")
+    except Exception:  # noqa: BLE001 — no savepoint support (fake cur / autocommit)
+        pass
+    try:
+        from khipu import decisions as _decisions
+
+        _decisions.detect_reversals_from_episode(cur, payload, target_id)
+    except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT capture_merge_decision_detection")
+        except Exception:  # noqa: BLE001
+            pass
+        _log(f"merge decision detection step failed ({type(exc).__name__}: {exc})")
+
     # O4: same posture for the merged capture's own deliverables.
     try:
         cur.execute("SAVEPOINT capture_merge_deliverables")
@@ -632,6 +650,20 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
                         cur.execute("ROLLBACK TO SAVEPOINT capture_decisions")
                         _log(f"decisions step failed ({type(exc).__name__}: {exc})")
+
+                    # Phase 2, session C: conservative reversal detection over
+                    # the rows the step above just inserted — its own
+                    # SAVEPOINT, same fail-open posture as every neighbour
+                    # here, so a detection failure can never take the
+                    # episode (or the decisions just written) down with it.
+                    cur.execute("SAVEPOINT capture_decision_detection")
+                    try:
+                        from khipu import decisions as _decisions
+
+                        _decisions.detect_reversals_from_episode(cur, payload, episode_id)
+                    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+                        cur.execute("ROLLBACK TO SAVEPOINT capture_decision_detection")
+                        _log(f"decision detection step failed ({type(exc).__name__}: {exc})")
 
                     # O4: files/PR-issue-URLs/release tags from payload['deliverables'].
                     cur.execute("SAVEPOINT capture_deliverables")

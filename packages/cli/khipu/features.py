@@ -66,6 +66,9 @@ _CAPABILITIES = (
     "prior_work.outcome",
     "prior_work.project",
     "replica.schema_version",
+    # Phase 2, session C.
+    "decisions.details",
+    "decisions.detection",
 )
 
 

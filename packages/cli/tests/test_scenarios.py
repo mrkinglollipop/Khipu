@@ -22,12 +22,14 @@ from unittest import mock
 import pytest
 
 from khipu import commitments as co
+from khipu import decisions as de
 from khipu import extract
 from khipu import hub_snapshot as hs
 from khipu import outbox
 from khipu import recall_prompt as rp
 from tests.fixtures import corpus
 from tests.test_commitments import _CommitmentsCursor
+from tests.test_decisions import _Cursor as _DecisionsCursor
 
 
 # ---- 1. prior approved work --------------------------------------------------
@@ -259,3 +261,49 @@ def test_a_crash_between_enqueue_and_drain_neither_loses_nor_duplicates(tmp_path
     assert out == {"jobs": 1, "replayed": 1, "failed": 0, "stopped_early": False}
     assert calls == ["durable capture across a crash"]
     assert outbox.status()["pending"] == 0
+
+
+# ---- 19. detected reversal (Phase 2, session C: capture-time detection) ----
+#
+# Distinct from scenario 2 above: that one reads validity a fixture already
+# pins. This one exercises the detector itself — a capture whose model
+# output names an earlier decision it reverses, with no confirmation from
+# anyone, must produce a candidate link and nothing more.
+
+def test_a_capture_time_reversal_is_detected_as_a_candidate_link():
+    cur = _DecisionsCursor(evidence=True, links=True)
+    old_id = cur.seed(project="acme/widget", text="Use blue-green deploys for rollout",
+                       decided_at="2026-09-01T00:00:00+00:00")
+    payload = {
+        "project": "acme/widget", "ts": "2026-09-20T10:00:00+00:00",
+        "decisions": ["Use rolling deploys for rollout"],
+        "decision_details": [{"text": "Use rolling deploys for rollout", "by": "user",
+                               "reverses": "Use blue-green deploys for rollout"}],
+    }
+    de.insert_decisions_from_episode(cur, payload, 42)
+    n = de.detect_reversals_from_episode(cur, payload, 42)
+    assert n == 1
+    link = next(iter(cur.links.values()))
+    assert link["old_id"] == old_id
+    assert link["kind"] == "supersedes"
+    assert link["state"] == "candidate"
+    # detection never changes authoritative state on its own (Evidence rule #7)
+    assert cur.rows[old_id]["superseded_by"] is None
+
+
+def test_auto_supersede_confirms_a_high_confidence_user_reversal_automatically():
+    cur = _DecisionsCursor(evidence=True, links=True)
+    old_id = cur.seed(project="acme/widget", text="Use blue-green deploys for rollout",
+                       decided_at="2026-09-01T00:00:00+00:00")
+    payload = {
+        "project": "acme/widget", "ts": "2026-09-20T10:00:00+00:00",
+        "decisions": ["Use rolling deploys for rollout"],
+        "decision_details": [{"text": "Use rolling deploys for rollout", "by": "user",
+                               "reverses": "Use blue-green deploys for rollout"}],
+    }
+    de.insert_decisions_from_episode(cur, payload, 42)
+    with mock.patch("khipu.features.enabled", return_value=True):
+        de.detect_reversals_from_episode(cur, payload, 42)
+    assert cur.rows[old_id]["superseded_by"] is not None
+    link = next(iter(cur.links.values()))
+    assert link["state"] == "applied"

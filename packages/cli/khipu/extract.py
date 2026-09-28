@@ -81,6 +81,27 @@ Transcript:
 {transcript}
 """
 
+# Appended after PROMPT, before the ``.format()`` call, ONLY when the
+# `decision_details` switch is on (khipu.features) — with the switch off the
+# formatted prompt is byte-identical to PROMPT.format(...) alone, the
+# invariant docs/plans/2026-09-27-memory-reasoning-scope.md calls "the heart
+# of capture". `decisions`'s own key/instructions above are unchanged.
+DECISION_DETAILS_SECTION = """
+When `decisions` is non-empty, ALSO include:
+- decision_details: list of objects {{text, by, rationale, reverses}}. One
+  entry per item in `decisions` you are confident enough to detail — an
+  empty list is fine, and skipping an item you are unsure about is fine.
+  text: the SAME decision, copied WORD FOR WORD from `decisions` — never a
+  paraphrase or summary.
+  by: "user" or "assistant" — whoever actually decided it, from the
+  transcript's own turns.
+  rationale: the stated reason, ONLY when the session gives one explicitly;
+  omit or use null rather than inventing one.
+  reverses: the EARLIER decision this one replaces, in the session's own
+  words, or null. A refinement or elaboration of an earlier decision is NOT
+  a reversal — only a decision that undoes or contradicts an earlier one is.
+"""
+
 
 def _key() -> str:
     from khipu.keychain import resolve_gemini_key
@@ -435,13 +456,61 @@ def _as_closed_loops(v: Any) -> list[dict[str, Any]]:
     return out
 
 
+_VALID_SOURCE_KINDS = ("user", "assistant")
+
+
+def _as_decision_details(v: Any, decisions: list[str]) -> list[dict[str, Any]]:
+    """Tolerant per "BUILD" item 1: the key's absence, a wrong type, extra
+    keys, and an item whose ``text`` matches none of the already-parsed
+    ``decisions`` (dropped, not repaired — a detail must repeat a decision
+    word for word) are all accepted rather than raised. Nothing here can
+    make an extraction fail that would have succeeded without it."""
+    if not isinstance(v, list) or not decisions:
+        return []
+    valid_texts = set(decisions)
+    out: list[dict[str, Any]] = []
+    for item in v:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text or text not in valid_texts:
+            continue
+        by = str(item.get("by") or "").strip().lower()
+        if by not in _VALID_SOURCE_KINDS:
+            by = None
+        rationale = item.get("rationale")
+        rationale = rationale.strip() if isinstance(rationale, str) and rationale.strip() else None
+        reverses = item.get("reverses")
+        reverses = reverses.strip() if isinstance(reverses, str) and reverses.strip() else None
+        out.append({"text": text, "by": by, "rationale": rationale, "reverses": reverses})
+    return out
+
+
+def _build_prompt(*, cwd: str, transcript: str) -> str:
+    """PROMPT, plus DECISION_DETAILS_SECTION spliced in right before the
+    trailing "Session project (cwd):" block, ONLY when the `decision_details`
+    switch is on. With the switch off this returns exactly
+    ``PROMPT.format(...)`` — the invariant every extraction test pins."""
+    template = PROMPT
+    try:
+        from khipu import features
+
+        if features.enabled("decision_details"):
+            marker = "\nSession project (cwd):"
+            idx = PROMPT.index(marker)
+            template = PROMPT[:idx] + DECISION_DETAILS_SECTION + PROMPT[idx:]
+    except Exception:  # noqa: BLE001 — the switch registry must never block extraction
+        template = PROMPT
+    return template.format(cwd=cwd or "(unknown)", transcript=transcript)
+
+
 def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
     """Return a capture payload (without ts/session_id) or None when the model
     judged nothing durable. Raises on transport/model failure so the caller can
     decide whether to retry later (it must NOT mark the window consumed)."""
     if not transcript.strip():
         return None
-    raw = _generate(PROMPT.format(cwd=cwd or "(unknown)", transcript=transcript))
+    raw = _generate(_build_prompt(cwd=cwd, transcript=transcript))
     parsed = parse_model_json(raw)
     if parsed is None:
         raise RuntimeError(f"extract: model returned non-JSON: {raw[:200]!r}")
@@ -469,15 +538,17 @@ def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
     # reliability audit 2026-09-03: 'aegis' 423, a worktree slug 406, 'tmp'
     # 378). The project identity now belongs in the capture payload's own
     # `project` field (khipu.identity, set by the hook), not in topics.
+    decisions = _as_str_list(parsed.get("decisions"))
     return {
         "summary": summary,
         "topics": topics,
         "people": _as_str_list(parsed.get("people")),
-        "decisions": _as_str_list(parsed.get("decisions")),
+        "decisions": decisions,
         "preferences": _as_str_list(parsed.get("preferences")),
         "scope": str(parsed.get("scope", "")).strip(),
         "open_loops": _as_open_loops(parsed.get("open_loops")),
         "closed_loops": _as_closed_loops(parsed.get("closed_loops")),
+        "decision_details": _as_decision_details(parsed.get("decision_details"), decisions),
         "edges": [],
         "topic_pages": [],
     }

@@ -10,7 +10,9 @@ every other decisions test in this suite (test_commitments_contract.py).
 """
 from __future__ import annotations
 
+import json
 import unittest
+from unittest import mock
 
 from khipu import decisions as de
 
@@ -382,6 +384,79 @@ class _Cursor:
             ]
             return
 
+        # -- Phase 2, session C: insert_decisions_from_episode / detect_reversals_from_episode --
+
+        if s.startswith(
+            "INSERT INTO decisions (project, text, episode_id, session_id, decided_at, "
+            "source_kind, rationale, evidence)"
+        ):
+            project, text, episode_id, session_id, decided_at, source_kind, rationale, evidence = params
+            did = self.next_id
+            self.next_id += 1
+            self.rows[did] = {
+                "id": did, "project": project, "text": text, "rationale": rationale,
+                "decided_at": decided_at or "now", "episode_id": episode_id, "session_id": session_id,
+                "superseded_by": None, "created_at": decided_at or "now",
+                "source_kind": source_kind, "evidence": evidence, "superseded_at": None,
+                "supersede_source": None, "supersede_reason": None,
+                "retracted_at": None, "retract_reason": None,
+            }
+            self.rowcount = 1
+            return
+
+        if s.startswith("INSERT INTO decisions (project, text, episode_id, session_id, decided_at)"):
+            project, text, episode_id, session_id, decided_at = params
+            did = self.next_id
+            self.next_id += 1
+            self.rows[did] = {
+                "id": did, "project": project, "text": text, "rationale": None,
+                "decided_at": decided_at or "now", "episode_id": episode_id, "session_id": session_id,
+                "superseded_by": None, "created_at": decided_at or "now",
+                "source_kind": None, "evidence": None, "superseded_at": None,
+                "supersede_source": None, "supersede_reason": None,
+                "retracted_at": None, "retract_reason": None,
+            }
+            self.rowcount = 1
+            return
+
+        if s.startswith("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'"):
+            # This fake has no pg_extension catalog at all — every test using
+            # it exercises the Python token-overlap fallback, never the SQL
+            # similarity() path (that path is real-Postgres-only, covered by
+            # tests/test_pg_scratch.py).
+            self._result = []
+            return
+
+        if s.startswith("SELECT id, project, decided_at FROM decisions WHERE episode_id"):
+            episode_id, text = params
+            hit = next(
+                (r for r in self.rows.values()
+                 if r["episode_id"] == episode_id and r["text"] == text),
+                None,
+            )
+            self._result = [(hit["id"], hit["project"], hit["decided_at"])] if hit else []
+            return
+
+        if s.startswith("SELECT COUNT(*) FROM decision_links WHERE state = 'candidate'"):
+            self._result = [(sum(1 for lk in self.links.values() if lk["state"] == "candidate"),)]
+            return
+
+        if s.startswith("SELECT id, text FROM decisions WHERE project IS NOT DISTINCT FROM"):
+            project, exclude_id, before = params
+            out = [
+                r for r in self.rows.values()
+                if r["project"] == project and r["id"] != exclude_id
+                and str(r["decided_at"]) < str(before) and r["superseded_by"] is None
+            ]
+            if "retracted_at IS NULL" in s:
+                out = [r for r in out if r.get("retracted_at") is None]
+            if "episode_id IS NULL OR NOT EXISTS" in s:
+                out = [r for r in out
+                       if r["episode_id"] is None or r["episode_id"] not in self.forgotten_episodes]
+            out.sort(key=lambda r: r["decided_at"], reverse=True)
+            self._result = [(r["id"], r["text"]) for r in out]
+            return
+
         raise AssertionError(f"unexpected SQL: {s[:160]} params={params}")
 
     def fetchall(self):
@@ -710,6 +785,241 @@ class DecisionStatesForEpisodeTest(unittest.TestCase):
                 mock.patch.object(de, "_decisions_ready", return_value=False):
             out = de.decision_states_for_episode(7)
         self.assertEqual(out, {"decision_states": [], "validity": {"current": 0, "superseded": 0, "retracted": 0}})
+
+
+# ---- Phase 2, session C: capture-time decision_details + detection --------
+
+class InsertDecisionsWithDetailsTest(unittest.TestCase):
+    """decision_details column-filling on insert_decisions_from_episode —
+    BUILD item 2."""
+
+    def test_a_matched_detail_fills_the_evidence_columns(self):
+        cur = _Cursor(evidence=True)
+        payload = {
+            "project": "acme/widget", "ts": "2026-09-20T10:00:00+00:00",
+            "decisions": ["Use rolling deploys"],
+            "decision_details": [{"text": "Use rolling deploys", "by": "user",
+                                   "rationale": "blue-green needs two clusters",
+                                   "reverses": "Use blue-green deploys"}],
+        }
+        n = de.insert_decisions_from_episode(cur, payload, 42)
+        self.assertEqual(n, 1)
+        row = next(iter(cur.rows.values()))
+        self.assertEqual(row["source_kind"], "user")
+        self.assertEqual(row["rationale"], "blue-green needs two clusters")
+        # stored as the raw JSON text the %s::jsonb cast receives, same as
+        # every other jsonb param in this fake (real psycopg round-trips it
+        # as a dict; that adapter behaviour is not what this test is about).
+        self.assertEqual(json.loads(row["evidence"]), {
+            "derivation": "extract-details-v1", "episode_id": 42,
+            "reverses": "Use blue-green deploys",
+        })
+
+    def test_a_decision_with_no_matching_detail_leaves_columns_null(self):
+        cur = _Cursor(evidence=True)
+        payload = {
+            "project": "acme/widget", "ts": "2026-09-20T10:00:00+00:00",
+            "decisions": ["Use rolling deploys", "Also ship the docs"],
+            "decision_details": [{"text": "Use rolling deploys", "by": "user"}],
+        }
+        de.insert_decisions_from_episode(cur, payload, 42)
+        undetailed = next(r for r in cur.rows.values() if r["text"] == "Also ship the docs")
+        self.assertIsNone(undetailed["source_kind"])
+        self.assertIsNone(undetailed["rationale"])
+        self.assertIsNone(undetailed["evidence"])
+
+    def test_pre_migration_hub_ignores_decision_details_entirely(self):
+        """Missing columns: today's insert, unchanged."""
+        cur = _Cursor(evidence=False)
+        payload = {
+            "project": "acme/widget", "ts": "2026-09-20T10:00:00+00:00",
+            "decisions": ["Use rolling deploys"],
+            "decision_details": [{"text": "Use rolling deploys", "by": "user",
+                                   "rationale": "x"}],
+        }
+        n = de.insert_decisions_from_episode(cur, payload, 42)
+        self.assertEqual(n, 1)
+        row = next(iter(cur.rows.values()))
+        self.assertIsNone(row["source_kind"])
+        self.assertIsNone(row["rationale"])
+
+
+class DetectReversalsTest(unittest.TestCase):
+    """Conservative capture-time reversal detection — BUILD item 3. Every
+    test here goes through the Python token-overlap fallback (the fake
+    cursor's ``pg_extension`` probe always reports absent); the SQL
+    ``similarity()`` path is real-Postgres-only, covered by
+    tests/test_pg_scratch.py."""
+
+    def _seed_and_insert(self, cur, *, project="acme/widget", reverses_text,
+                          new_text="Use rolling deploys", by="user",
+                          decided_at="2026-09-20T10:00:00+00:00", episode_id=42):
+        payload = {
+            "project": project, "ts": decided_at, "decisions": [new_text],
+            "decision_details": [{"text": new_text, "by": by, "reverses": reverses_text}],
+        }
+        de.insert_decisions_from_episode(cur, payload, episode_id)
+        return payload
+
+    def test_a_close_match_above_the_candidate_threshold_gets_a_link(self):
+        cur = _Cursor(evidence=True, links=True)
+        old = cur.seed(project="acme/widget", text="Use blue-green deploys for rollout",
+                        decided_at="2026-09-01T00:00:00+00:00")
+        payload = self._seed_and_insert(
+            cur, reverses_text="Use blue-green deploys for rollout")
+        n = de.detect_reversals_from_episode(cur, payload, 42)
+        self.assertEqual(n, 1)
+        self.assertEqual(len(cur.links), 1)
+        link = next(iter(cur.links.values()))
+        self.assertEqual(link["old_id"], old)
+        self.assertEqual(link["kind"], "supersedes")
+        self.assertEqual(link["state"], "candidate")
+        self.assertGreaterEqual(link["confidence"], de.REVERSAL_CANDIDATE_THRESHOLD)
+
+    def test_a_weak_match_below_the_threshold_gets_no_link(self):
+        cur = _Cursor(evidence=True, links=True)
+        cur.seed(project="acme/widget", text="completely unrelated topic entirely",
+                  decided_at="2026-09-01T00:00:00+00:00")
+        payload = self._seed_and_insert(
+            cur, reverses_text="Use blue-green deploys for rollout")
+        n = de.detect_reversals_from_episode(cur, payload, 42)
+        self.assertEqual(n, 0)
+        self.assertEqual(len(cur.links), 0)
+
+    def test_a_matching_text_in_a_different_project_is_never_linked(self):
+        cur = _Cursor(evidence=True, links=True)
+        cur.seed(project="acme/other", text="Use blue-green deploys for rollout",
+                  decided_at="2026-09-01T00:00:00+00:00")
+        payload = self._seed_and_insert(
+            cur, project="acme/widget", reverses_text="Use blue-green deploys for rollout")
+        n = de.detect_reversals_from_episode(cur, payload, 42)
+        self.assertEqual(n, 0)
+
+    def test_a_standing_decision_decided_after_the_new_one_is_never_linked(self):
+        cur = _Cursor(evidence=True, links=True)
+        cur.seed(project="acme/widget", text="Use blue-green deploys for rollout",
+                  decided_at="2026-12-01T00:00:00+00:00")  # AFTER the new decision
+        payload = self._seed_and_insert(
+            cur, reverses_text="Use blue-green deploys for rollout",
+            decided_at="2026-09-20T10:00:00+00:00")
+        n = de.detect_reversals_from_episode(cur, payload, 42)
+        self.assertEqual(n, 0)
+
+    def test_never_more_than_one_candidate_per_new_decision(self):
+        cur = _Cursor(evidence=True, links=True)
+        cur.seed(project="acme/widget", text="Use blue-green deploys for rollout",
+                  decided_at="2026-09-01T00:00:00+00:00")
+        cur.seed(project="acme/widget", text="Use blue-green deploys for rollout v2",
+                  decided_at="2026-09-02T00:00:00+00:00")
+        payload = self._seed_and_insert(
+            cur, reverses_text="Use blue-green deploys for rollout")
+        n = de.detect_reversals_from_episode(cur, payload, 42)
+        self.assertEqual(n, 1)
+        self.assertEqual(len(cur.links), 1)
+
+    def test_no_op_when_the_links_table_is_not_migrated(self):
+        cur = _Cursor(evidence=True, links=False)
+        cur.seed(project="acme/widget", text="Use blue-green deploys for rollout",
+                  decided_at="2026-09-01T00:00:00+00:00")
+        payload = self._seed_and_insert(
+            cur, reverses_text="Use blue-green deploys for rollout")
+        n = de.detect_reversals_from_episode(cur, payload, 42)
+        self.assertEqual(n, 0)
+
+    def test_no_op_when_decision_details_carries_no_reverses(self):
+        cur = _Cursor(evidence=True, links=True)
+        payload = {
+            "project": "acme/widget", "ts": "2026-09-20T10:00:00+00:00",
+            "decisions": ["Use rolling deploys"],
+            "decision_details": [{"text": "Use rolling deploys", "by": "user"}],
+        }
+        de.insert_decisions_from_episode(cur, payload, 42)
+        n = de.detect_reversals_from_episode(cur, payload, 42)
+        self.assertEqual(n, 0)
+
+    def test_auto_supersede_off_records_the_candidate_without_applying_it(self):
+        cur = _Cursor(evidence=True, links=True)
+        old = cur.seed(project="acme/widget", text="Use blue-green deploys for rollout",
+                        decided_at="2026-09-01T00:00:00+00:00")
+        payload = self._seed_and_insert(
+            cur, reverses_text="Use blue-green deploys for rollout", by="user")
+        with mock.patch("khipu.features.enabled", return_value=False):
+            de.detect_reversals_from_episode(cur, payload, 42)
+        self.assertIsNone(cur.rows[old]["superseded_by"])
+
+    def test_auto_supersede_on_applies_only_above_the_higher_bar_and_for_a_user_reversal(self):
+        cur = _Cursor(evidence=True, links=True)
+        old = cur.seed(project="acme/widget", text="Use blue-green deploys for rollout",
+                        decided_at="2026-09-01T00:00:00+00:00")
+        payload = self._seed_and_insert(
+            cur, reverses_text="Use blue-green deploys for rollout", by="user")
+        with mock.patch("khipu.features.enabled", return_value=True):
+            de.detect_reversals_from_episode(cur, payload, 42)
+        self.assertIsNotNone(cur.rows[old]["superseded_by"])
+        link = next(iter(cur.links.values()))
+        self.assertEqual(link["state"], "applied")
+
+    def test_auto_supersede_on_never_applies_an_assistant_only_reversal(self):
+        cur = _Cursor(evidence=True, links=True)
+        old = cur.seed(project="acme/widget", text="Use blue-green deploys for rollout",
+                        decided_at="2026-09-01T00:00:00+00:00")
+        payload = self._seed_and_insert(
+            cur, reverses_text="Use blue-green deploys for rollout", by="assistant")
+        with mock.patch("khipu.features.enabled", return_value=True):
+            n = de.detect_reversals_from_episode(cur, payload, 42)
+        self.assertEqual(n, 1)  # the candidate is still recorded
+        self.assertIsNone(cur.rows[old]["superseded_by"])  # but never auto-applied
+
+    def test_a_deduped_text_this_capture_has_nothing_new_to_link(self):
+        """The text was already on file (outside THIS episode) within the
+        dedup window, so insert_decisions_from_episode skipped the row —
+        detection must find nothing tied to episode 42 and do nothing."""
+        cur = _Cursor(evidence=True, links=True)
+        cur.seed(project="acme/widget", text="Use rolling deploys",
+                  decided_at="2026-09-19T00:00:00+00:00")
+        payload = {
+            "project": "acme/widget", "ts": "2026-09-20T10:00:00+00:00",
+            "decisions": ["Use rolling deploys"],
+            "decision_details": [{"text": "Use rolling deploys", "by": "user",
+                                   "reverses": "Use blue-green deploys"}],
+        }
+        de.insert_decisions_from_episode(cur, payload, 42)  # deduped, 0 new rows
+        n = de.detect_reversals_from_episode(cur, payload, 42)
+        self.assertEqual(n, 0)
+
+
+class CandidateLinkCountTest(unittest.TestCase):
+    """``khipu doctor``'s ``decision_links`` block — visibility only."""
+
+    def test_counts_candidates_only(self):
+        cur = _Cursor(evidence=True, links=True)
+        old, new = cur.seed(project="p", text="a"), cur.seed(project="p", text="b")
+        de.add_link(cur, old, new)
+        applied_old, applied_new = cur.seed(project="p", text="c"), cur.seed(project="p", text="d")
+        link_id = de.add_link(cur, applied_old, applied_new)
+        de.resolve_link(cur, link_id, "confirm")
+
+        fake_conn = mock.MagicMock()
+        fake_conn.__enter__.return_value = fake_conn
+        fake_conn.cursor.return_value.__enter__.return_value = cur
+        with mock.patch("khipu.db.connect", return_value=fake_conn):
+            out = de.candidate_link_count()
+        self.assertEqual(out, {"ok": True, "applicable": True, "candidates": 1})
+
+    def test_pre_migration_hub_reports_not_applicable(self):
+        cur = _Cursor(evidence=False, links=False)
+        fake_conn = mock.MagicMock()
+        fake_conn.__enter__.return_value = fake_conn
+        fake_conn.cursor.return_value.__enter__.return_value = cur
+        with mock.patch("khipu.db.connect", return_value=fake_conn):
+            out = de.candidate_link_count()
+        self.assertEqual(out, {"ok": True, "applicable": False, "candidates": 0})
+
+    def test_a_connection_failure_reports_not_ok_never_raises(self):
+        with mock.patch("khipu.db.connect", side_effect=RuntimeError("down")):
+            out = de.candidate_link_count()
+        self.assertFalse(out["ok"])
+        self.assertIn("down", out["error"])
 
 
 if __name__ == "__main__":

@@ -758,6 +758,35 @@ class HygieneSavepointGateTest(unittest.TestCase):
         self.assertNotIn("RELEASE SAVEPOINT capture_hygiene", statements)
 
 
+class DecisionDetectionSavepointGateTest(unittest.TestCase):
+    """Phase 2, session C: detect_reversals_from_episode runs right after
+    insert_decisions_from_episode, in its own SAVEPOINT — a raising
+    detection step must not lose the episode or the decisions step already
+    wrote, same posture as HygieneSavepointGateTest above."""
+
+    def _connect(self, cur):
+        return mock.patch("khipu.db.connect", return_value=_FakeConn(cur))
+
+    def test_a_raising_detection_step_leaves_the_episode_and_its_decisions_written(self):
+        cur = _EpisodesFakeCursor()
+        payload = {
+            "ts": "2026-09-20T00:00:00Z", "session_id": "s1", "summary": "did a thing",
+            "decisions": ["Use rolling deploys"],
+        }
+        with self._connect(cur), \
+                mock.patch("khipu.decisions.insert_decisions_from_episode", return_value=1), \
+                mock.patch("khipu.decisions.detect_reversals_from_episode",
+                            side_effect=RuntimeError("boom")):
+            stats = cap.write_pg(payload)
+        self.assertTrue(stats["episode_inserted"])
+        eid = stats["episode_id"]
+        self.assertIn(eid, cur.episodes)
+        self.assertEqual(cur.episodes[eid]["decisions"], ["Use rolling deploys"])
+        statements = [s for s, _ in cur.calls]
+        self.assertIn("SAVEPOINT capture_decision_detection", statements)
+        self.assertIn("ROLLBACK TO SAVEPOINT capture_decision_detection", statements)
+
+
 class ProjectInheritanceAndDedupGroupingTest(unittest.TestCase):
     """Task 2 of the memory-reliability build: a scratchpad/`/tmp` cwd never
     resolves repo_root/project (identity.resolve_repo_root), so a dispatched

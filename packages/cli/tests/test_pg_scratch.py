@@ -301,6 +301,181 @@ class LinkLifecycleScratchTest(unittest.TestCase):
         self.assertIn(old, {r["id"] for r in standing})
 
 
+class DetectReversalsScratchTest(unittest.TestCase):
+    """Real Postgres, real pg_trgm ``similarity()`` — the SQL half of
+    detect_reversals_from_episode (BUILD item 3) the fake-cursor tests in
+    test_decisions.py cannot exercise: that fake has no ``pg_extension``
+    catalog at all, so it always takes the Python token-overlap fallback.
+    ``decisions.episode_id`` has a real FK to ``episodes(id)``, so every
+    test here needs an actual (invented) episode row, same pattern as
+    ``DecisionsApiScratchTest.test_decision_states_for_episode_via_its_own_connection``.
+    """
+
+    def setUp(self):
+        self.conn = _direct_connect()
+        self.cur = self.conn.cursor()
+        self.created_ids: list[int] = []
+        self.episode_id: int | None = None
+
+    def tearDown(self):
+        self.conn.rollback()
+        if self.created_ids:
+            self.cur.execute("DELETE FROM decisions WHERE id = ANY(%s)", (self.created_ids,))
+        if self.episode_id is not None:
+            self.cur.execute("DELETE FROM episodes WHERE id = %s", (self.episode_id,))
+        self.conn.commit()
+        self.cur.close()
+        self.conn.close()
+
+    def _seed_episode(self, project: str) -> int:
+        self.cur.execute(
+            "INSERT INTO episodes (ts, session_id, summary, scope, project, topics, "
+            "people, decisions, preferences) VALUES "
+            "(now(), 'claude_code:scratch', 'detect_reversals scratch episode', "
+            "%s, %s, '[]', '[]', '[]', '[]') RETURNING id",
+            (project, project),
+        )
+        eid = self.cur.fetchone()[0]
+        self.episode_id = eid
+        return eid
+
+    def test_pg_trgm_is_actually_available_on_the_scratch_server(self):
+        """The premise every other test in this class relies on: without
+        this, they would all be silently exercising the Python fallback
+        instead of the SQL path they claim to cover."""
+        from khipu import decisions as de
+
+        self.assertTrue(de._trgm_available(self.cur))
+
+    def test_a_close_textual_match_becomes_a_candidate_link_not_a_supersession(self):
+        from khipu import decisions as de
+
+        project = _seed_project()
+        episode_id = self._seed_episode(project)
+        old_id = de.create_decision(
+            self.cur, project=project,
+            text="Use blue-green deploys for the scratch widget rollout",
+            decided_at="2026-09-01T00:00:00+00:00",
+        )
+        self.created_ids.append(old_id)
+        self.conn.commit()
+
+        new_text = "Use rolling deploys for the scratch widget rollout"
+        payload = {
+            "project": project, "ts": "2026-09-20T10:00:00+00:00",
+            "decisions": [new_text],
+            "decision_details": [{
+                "text": new_text, "by": "user",
+                "reverses": "Use blue-green deploys for the scratch widget rollout",
+            }],
+        }
+        de.insert_decisions_from_episode(self.cur, payload, episode_id)
+        self.conn.commit()
+        self.cur.execute(
+            "SELECT id FROM decisions WHERE episode_id = %s AND text = %s",
+            (episode_id, new_text),
+        )
+        new_id = self.cur.fetchone()[0]
+        self.created_ids.append(new_id)
+
+        n = de.detect_reversals_from_episode(self.cur, payload, episode_id)
+        self.conn.commit()
+        self.assertEqual(n, 1)
+
+        links = de.list_links(self.cur, state="candidate", project=project)
+        match = next(link for link in links if link["new_id"] == new_id)
+        self.assertEqual(match["old_id"], old_id)
+        self.assertEqual(match["kind"], "supersedes")
+        self.assertGreaterEqual(match["confidence"], de.REVERSAL_CANDIDATE_THRESHOLD)
+        # detection never changes authoritative state on its own (Evidence rule #7)
+        standing = de.list_decisions(self.cur, project=project, status="standing")
+        self.assertIn(old_id, {r["id"] for r in standing})
+
+    def test_auto_supersede_applies_a_high_confidence_user_reversal(self):
+        from khipu import decisions as de
+
+        project = _seed_project()
+        episode_id = self._seed_episode(project)
+        old_id = de.create_decision(
+            self.cur, project=project,
+            text="Ship the scratch widget with Apache 2.0",
+            decided_at="2026-09-01T00:00:00+00:00",
+        )
+        self.created_ids.append(old_id)
+        self.conn.commit()
+
+        new_text = "Ship the scratch widget with AGPL-3.0"
+        payload = {
+            "project": project, "ts": "2026-09-20T10:00:00+00:00",
+            "decisions": [new_text],
+            "decision_details": [{
+                "text": new_text, "by": "user",
+                "reverses": "Ship the scratch widget with Apache 2.0",
+            }],
+        }
+        de.insert_decisions_from_episode(self.cur, payload, episode_id)
+        self.conn.commit()
+        self.cur.execute(
+            "SELECT id FROM decisions WHERE episode_id = %s AND text = %s",
+            (episode_id, new_text),
+        )
+        new_id = self.cur.fetchone()[0]
+        self.created_ids.append(new_id)
+
+        with mock.patch.dict(os.environ, {"KHIPU_FEATURE_AUTO_SUPERSEDE": "true"}):
+            n = de.detect_reversals_from_episode(self.cur, payload, episode_id)
+        self.conn.commit()
+        self.assertEqual(n, 1)
+
+        superseded = de.list_decisions(self.cur, project=project, status="superseded")
+        self.assertIn(old_id, {r["id"] for r in superseded})
+        applied = de.list_links(self.cur, state="applied", project=project)
+        self.assertTrue(
+            any(link["old_id"] == old_id and link["new_id"] == new_id for link in applied)
+        )
+
+    def test_auto_supersede_off_leaves_the_candidate_unconfirmed(self):
+        from khipu import decisions as de
+
+        project = _seed_project()
+        episode_id = self._seed_episode(project)
+        old_id = de.create_decision(
+            self.cur, project=project,
+            text="Deploy scratch widget releases on Fridays",
+            decided_at="2026-09-01T00:00:00+00:00",
+        )
+        self.created_ids.append(old_id)
+        self.conn.commit()
+
+        new_text = "Deploy scratch widget releases Monday through Thursday"
+        payload = {
+            "project": project, "ts": "2026-09-20T10:00:00+00:00",
+            "decisions": [new_text],
+            "decision_details": [{
+                "text": new_text, "by": "user",
+                "reverses": "Deploy scratch widget releases on Fridays",
+            }],
+        }
+        de.insert_decisions_from_episode(self.cur, payload, episode_id)
+        self.conn.commit()
+        self.cur.execute(
+            "SELECT id FROM decisions WHERE episode_id = %s AND text = %s",
+            (episode_id, new_text),
+        )
+        new_id = self.cur.fetchone()[0]
+        self.created_ids.append(new_id)
+
+        with mock.patch.dict(os.environ, {"KHIPU_FEATURE_AUTO_SUPERSEDE": "false"}):
+            de.detect_reversals_from_episode(self.cur, payload, episode_id)
+        self.conn.commit()
+
+        standing = de.list_decisions(self.cur, project=project, status="standing")
+        self.assertIn(old_id, {r["id"] for r in standing})
+        candidates = de.list_links(self.cur, state="candidate", project=project)
+        self.assertTrue(any(link["old_id"] == old_id and link["new_id"] == new_id
+                             for link in candidates))
+
+
 class ForgetCascadeScratchTest(unittest.TestCase):
     """forget.forget_everywhere against real SQL: episode, commitment,
     deliverable and decision rows all cascade. Uses khipu.db.connect()

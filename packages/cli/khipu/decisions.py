@@ -30,6 +30,12 @@ VALID_LINK_KINDS = ("supersedes", "conflicts")
 VALID_LINK_STATES = ("candidate", "applied", "rejected", "restored")
 VALID_SUPERSEDE_SOURCES = ("manual", "agent", "auto")
 
+# Reversal-detection thresholds (Phase 2, session C) — provisional until
+# measured against the private golden set; nothing has scored them yet.
+REVERSAL_CANDIDATE_THRESHOLD = 0.45   # minimum similarity to record a candidate link at all
+REVERSAL_AUTO_APPLY_THRESHOLD = 0.70  # minimum similarity for auto_supersede to apply one
+REVERSAL_CANDIDATE_POOL = 200         # most-recent standing decisions scored by the Python fallback
+
 
 def _log(msg: str) -> None:
     import sys
@@ -220,6 +226,24 @@ def _find_recent_duplicate(cur, project: str | None, norm_text: str, decided_at:
     return int(row[0]) if row else None
 
 
+def _decision_details_by_text(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """``payload['decision_details']`` keyed by its own ``text`` (already the
+    word-for-word match ``extract._as_decision_details`` enforced) — [] or a
+    malformed payload (a hand-built dict from a caller other than extraction)
+    both degrade to an empty map, never an error."""
+    raw = payload.get("decision_details")
+    if not isinstance(raw, list):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if text:
+            out[text] = item
+    return out
+
+
 def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     """One row per string in ``payload['decisions']``. Returns the count
     actually inserted.
@@ -229,6 +253,15 @@ def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int)
     is by normalised text within that project, in a 30-day window ending at
     this capture's own ``ts`` (never "now" — a backfill mints historical
     ``ts`` values and must dedup against ITS OWN neighbourhood, not today).
+
+    Phase 2, session C: when migration 0024's columns exist AND
+    ``payload['decision_details']`` carries an entry whose ``text`` matches
+    this string exactly, the row also records ``source_kind`` (from
+    ``by``), ``rationale``, and ``evidence`` (the derivation tag, this
+    episode, and the ``reverses`` text detection reads next). A string with
+    no matching detail — the common case, and always the case with the
+    `decision_details` switch off — gets exactly today's five-column insert;
+    a pre-migration hub always does, detail or not.
     """
     items = payload.get("decisions") or []
     if not isinstance(items, list) or not items:
@@ -238,6 +271,8 @@ def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int)
     project = payload.get("project")
     session_id = payload.get("session_id")
     decided_at = payload.get("ts")
+    evidence_ready = _evidence_ready(cur)
+    details = _decision_details_by_text(payload) if evidence_ready else {}
     inserted = 0
     for raw in items:
         text = str(raw or "").strip()
@@ -248,18 +283,175 @@ def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int)
             continue
         if _find_recent_duplicate(cur, project, norm, decided_at) is not None:
             continue
-        cur.execute(
-            """
-            INSERT INTO decisions (project, text, episode_id, session_id, decided_at)
-            VALUES (%s, %s, %s, %s, COALESCE(%s::timestamptz, now()))
-            """,
-            (project, text, episode_id, session_id, decided_at),
-        )
+        detail = details.get(text)
+        if detail is None:
+            cur.execute(
+                """
+                INSERT INTO decisions (project, text, episode_id, session_id, decided_at)
+                VALUES (%s, %s, %s, %s, COALESCE(%s::timestamptz, now()))
+                """,
+                (project, text, episode_id, session_id, decided_at),
+            )
+        else:
+            source_kind = detail.get("by") or None
+            rationale = detail.get("rationale") or None
+            evidence = {
+                "derivation": "extract-details-v1",
+                "episode_id": episode_id,
+                "reverses": detail.get("reverses") or None,
+            }
+            cur.execute(
+                """
+                INSERT INTO decisions
+                    (project, text, episode_id, session_id, decided_at,
+                     source_kind, rationale, evidence)
+                VALUES (%s, %s, %s, %s, COALESCE(%s::timestamptz, now()), %s, %s, %s::jsonb)
+                """,
+                (project, text, episode_id, session_id, decided_at,
+                 source_kind, rationale, json.dumps(evidence)),
+            )
         if cur.rowcount > 0:
             inserted += 1
     if inserted:
         _log(f"recorded {inserted} decision(s) for episode {episode_id} (project={project!r})")
     return inserted
+
+
+def _trgm_available(cur) -> bool:
+    """Same probe ``khipu.embed.literal_trgm_status`` uses for migration
+    0015's indexes — pg_trgm installed means ``similarity()`` is callable.
+    False (never raises) on a hub without the extension AND on any fake/
+    SQLite cursor with no ``pg_extension`` catalog, which is the intended
+    degrade into the Python fallback below."""
+    try:
+        cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
+        return cur.fetchone() is not None
+    except Exception:  # noqa: BLE001 — absence of the catalog IS the fallback signal
+        return False
+
+
+def _standing_before_clause(cur, evidence_ready: bool) -> str:
+    """Shared WHERE fragment for both reversal-match finders below: standing
+    (not superseded, not retracted once evidence is ready), not forgotten,
+    same project, decided strictly before the new decision, excluding the
+    new decision itself. Every caller binds its params in this exact order:
+    (project, exclude_id, before)."""
+    clauses = ["project IS NOT DISTINCT FROM %s", "id != %s", "decided_at < %s",
+               "superseded_by IS NULL"]
+    if evidence_ready:
+        clauses.append("retracted_at IS NULL")
+    forgotten = _not_forgotten_clause(cur, "decisions")
+    if forgotten:
+        clauses.append(forgotten)
+    return " AND ".join(clauses)
+
+
+def _best_reversal_match_sql(cur, *, project, exclude_id, before, reverses_text,
+                              evidence_ready) -> tuple[int, float] | None:
+    """pg_trgm path: let the hub's trigram index rank every standing decision
+    in the project against ``reverses_text`` and return the single best
+    match. No 200-row cap here — that bound is the Python fallback's own,
+    named in ``BUILD`` item 3."""
+    where = _standing_before_clause(cur, evidence_ready)
+    cur.execute(
+        f"SELECT id, similarity(text, %s) AS score FROM decisions "
+        f"WHERE {where} ORDER BY score DESC LIMIT 1",
+        (reverses_text, project, exclude_id, before),
+    )
+    row = cur.fetchone()
+    if row is None or row[1] is None:
+        return None
+    return int(row[0]), float(row[1])
+
+
+def _best_reversal_match_python(cur, *, project, exclude_id, before, reverses_text,
+                                 evidence_ready) -> tuple[int, float] | None:
+    """Fallback when pg_trgm is unavailable: the 200 most recent standing
+    decisions of the project, scored in Python with the same token-overlap
+    ratio ``khipu.commitments`` already uses for paraphrase dedup (shared,
+    not copied, so the two never drift apart)."""
+    from khipu.capture import _jaccard
+
+    where = _standing_before_clause(cur, evidence_ready)
+    cur.execute(
+        f"SELECT id, text FROM decisions WHERE {where} "
+        f"ORDER BY decided_at DESC LIMIT {REVERSAL_CANDIDATE_POOL}",
+        (project, exclude_id, before),
+    )
+    best: tuple[int, float] | None = None
+    for did, text in cur.fetchall():
+        score = _jaccard(reverses_text, text or "")
+        if best is None or score > best[1]:
+            best = (int(did), score)
+    return best
+
+
+def detect_reversals_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
+    """Conservative capture-time reversal detection (Evidence rule #7,
+    docs/plans/2026-09-27-memory-reasoning-scope.md): for each decision this
+    capture just inserted whose ``decision_details`` entry names an earlier
+    decision it ``reverses`` (in the model's own words, never invented), find
+    the closest-matching STANDING decision in the SAME project decided
+    BEFORE it and record one ``supersedes`` candidate link. Detection never
+    changes authoritative state on its own — a candidate becomes a
+    supersession only via confirmation, or here, when ``auto_supersede`` is
+    on AND the match clears the higher bar AND the reversal was the USER's
+    decision (never the assistant's own say-so alone).
+
+    Returns the number of candidate links recorded. No-op — 0, never raises
+    — on a pre-migration hub, an episode with no ``decision_details``, or a
+    detail with no ``reverses``. A capture whose ``decisions``/``decision_
+    details`` text was deduped away this call (an existing row, not one
+    ``insert_decisions_from_episode`` just created for THIS episode) is
+    skipped too: nothing new was inserted for it to link from.
+    """
+    details = payload.get("decision_details")
+    if not isinstance(details, list) or not details:
+        return 0
+    if not _links_ready(cur):
+        return 0
+    evidence_ready = _evidence_ready(cur)
+    trgm = _trgm_available(cur)
+    try:
+        from khipu import features
+
+        auto = features.enabled("auto_supersede")
+    except Exception:  # noqa: BLE001 — the switch registry must never block capture
+        auto = False
+    candidates = 0
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+        reverses = str(item.get("reverses") or "").strip()
+        text = str(item.get("text") or "").strip()
+        if not reverses or not text:
+            continue
+        cur.execute(
+            "SELECT id, project, decided_at FROM decisions "
+            "WHERE episode_id = %s AND text = %s ORDER BY id DESC LIMIT 1",
+            (episode_id, text),
+        )
+        row = cur.fetchone()
+        if row is None:
+            continue  # deduped into an earlier row this capture; nothing new to link
+        new_id, project, decided_at = int(row[0]), row[1], row[2]
+        finder = _best_reversal_match_sql if trgm else _best_reversal_match_python
+        match = finder(cur, project=project, exclude_id=new_id, before=decided_at,
+                        reverses_text=reverses, evidence_ready=evidence_ready)
+        if match is None:
+            continue
+        old_id, score = match
+        if score < REVERSAL_CANDIDATE_THRESHOLD:
+            continue
+        link_id = add_link(cur, old_id, new_id, kind="supersedes", confidence=score,
+                            source="auto", reason=reverses)
+        if link_id is None:
+            continue
+        candidates += 1
+        by = str(item.get("by") or "").strip().lower()
+        if auto and by == "user" and score >= REVERSAL_AUTO_APPLY_THRESHOLD:
+            resolve_link(cur, link_id, "confirm", source="auto")
+    return candidates
 
 
 def list_decisions(cur, *, project: str | None = None, since: Any = None,
@@ -544,6 +736,28 @@ def list_links(cur, *, state: str | None = None, project: str | None = None,
     cols = ("id", "old_id", "new_id", "kind", "confidence", "source", "reason",
             "state", "created_at", "resolved_at", "old_text", "new_text")
     return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def candidate_link_count() -> dict[str, Any]:
+    """``khipu doctor``'s ``decision_links`` block: how many candidates
+    (state ``candidate``) are waiting for a person or an agent to confirm or
+    reject them. Opens its own connection, same posture as
+    ``decision_states_for_episode``. Visibility only — the doctor caller
+    never folds this into ``ok``, so a pre-migration hub or a connection
+    failure both just report what they found rather than pretending to be a
+    correctness gate."""
+    from khipu.db import connect
+
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                if not _links_ready(cur):
+                    return {"ok": True, "applicable": False, "candidates": 0}
+                cur.execute("SELECT COUNT(*) FROM decision_links WHERE state = 'candidate'")
+                row = cur.fetchone()
+                return {"ok": True, "applicable": True, "candidates": int(row[0]) if row else 0}
+    except Exception as exc:  # noqa: BLE001 — a failed check must not look like a pass
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def resolve_link(cur, link_id: int, action: str, *, source: str = "manual") -> dict[str, Any]:

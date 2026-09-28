@@ -500,6 +500,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         features_block = features.states()
     except Exception as e:  # noqa: BLE001
         features_block = {"error": f"{type(e).__name__}: {e}"}
+    # Phase 2, session C: candidate supersession links awaiting review —
+    # visibility only, same posture as features_block above; never gates `ok`.
+    try:
+        from khipu import decisions as _decisions
+
+        decision_links_block = _decisions.candidate_link_count()
+    except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
+        decision_links_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -528,6 +536,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "unknown_harness": unknown_harness,
         "launchers": launchers,
         "features": features_block,
+        "decision_links": decision_links_block,
         "not_configured": not_configured,
         "ok": (
             hub_ok
