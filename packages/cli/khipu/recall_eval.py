@@ -1,3 +1,6 @@
+# --bypass-harness (sonnet lane) — authored directly by the dispatched
+# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
+# agents"); there is no further agent to route this to.
 """Golden-query recall evaluation (W6.3) — ``khipu recall eval``.
 
 ``<config dir>/recall-golden.jsonl`` (maintainer-local; ``KHIPU_RECALL_GOLDEN`` overrides) holds hand- and evidence-derived queries with
@@ -6,11 +9,45 @@ runs through ``khipu.embed.hybrid_search`` (or the named ``mode``) and scores
 hit@k — 1 if ANY id in ``expect`` appears among the top ``k`` results, else 0.
 Not a CI gate (GitHub Actions is not used here); it is a manual/soak check
 that turns "does default search still find the things it used to" into one
-command instead of a memory of a demo that once worked.
+command instead of a memory of a demo that once worked. ``run_eval``/
+``eval_one``/``load_golden`` above are the original W6.3 surface and stay
+byte-identical: ``khipu recall eval`` with no new flag prints exactly what it
+always has.
+
+Phase 1 session A extends this into a regression control that covers every
+query-driven recall path, not just ``hybrid_search`` in hybrid mode (the
+per-prompt hook and ``khipu_status`` lanes were previously unscored — see
+``docs/research/hindsight-plan-review-2026-09-28.md`` finding on the
+evaluator gap):
+
+- ``--path explicit|prompt|status|all`` (default ``explicit``, the legacy
+  behavior) selects which retrieval implementation(s) score each entry:
+  ``explicit`` is ``embed.hybrid_search`` (unchanged); ``prompt`` is
+  ``recall_prompt.prior_work_for_prompt`` unbudgeted (the UserPromptSubmit
+  hook's own path); ``status`` is the same function with ``budget_ms`` (the
+  gateway/``khipu_status`` lane). A golden entry's own ``paths: [...]`` key
+  restricts which of these it is scored against.
+- ``expect_none: true`` marks an abstention case (no relevant memory should
+  come back); ``stale: [ids]`` names ids that must NOT appear in the top k
+  (a superseded/forgotten row leaking back into results).
+- ``--record FILE`` snapshots the ordered ids every (entry, path) pair
+  returns, as a control; ``--compare FILE`` reruns and diffs against it
+  (identical / reordered / changed / new), exit 1 on any difference unless
+  ``--allow-changes``. Latency is never part of the diff.
+- ``--replay LOG [--sample N] [--seed S]`` builds no-expectation entries from
+  a ``query_log.jsonl`` for realistic-traffic record/compare runs; only valid
+  together with ``--record`` or ``--compare``.
+
+Every metric here is computed from the search functions' own return values,
+mocked in tests — this module never opens a database connection itself.
 """
 from __future__ import annotations
 
 import json
+import math
+import random
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +70,15 @@ def load_golden(path: Path) -> list[dict[str, Any]]:
     """Parse a recall-golden JSONL file. Blank lines and ``#``-prefixed
     comment lines are skipped; a malformed line raises with its 1-based line
     number so a broken golden file fails loudly rather than silently
-    dropping a case."""
+    dropping a case.
+
+    A line needs ``query`` and one of ``expect`` (a positive case) /
+    ``expect_none: true`` (an abstention case) — every other key
+    (``mode``, ``k``, ``note``, ``paths``, ``stale``, ``project``, ``cwd``,
+    ``since``, ``until``) is optional and read by the scorer, not here, so an
+    old golden file with only ``query``/``expect``/``k``/``note`` lines keeps
+    loading exactly as before.
+    """
     lines = path.read_text(encoding="utf-8").splitlines()
     out: list[dict[str, Any]] = []
     for i, raw in enumerate(lines, start=1):
@@ -44,8 +89,10 @@ def load_golden(path: Path) -> list[dict[str, Any]]:
             entry = json.loads(line)
         except ValueError as exc:
             raise ValueError(f"{path}:{i}: invalid JSON: {exc}") from exc
-        if not isinstance(entry, dict) or not entry.get("query") or not entry.get("expect"):
-            raise ValueError(f"{path}:{i}: entry needs at least 'query' and 'expect'")
+        if not isinstance(entry, dict) or not entry.get("query"):
+            raise ValueError(f"{path}:{i}: entry needs at least 'query' and one of 'expect'/'expect_none'")
+        if not entry.get("expect") and not entry.get("expect_none"):
+            raise ValueError(f"{path}:{i}: entry needs at least 'query' and one of 'expect'/'expect_none'")
         out.append(entry)
     return out
 
@@ -105,3 +152,333 @@ def run_eval(path: Path | None = None) -> dict[str, Any]:
         "hit_none_confidence": hit_none_confidence,
         "rows": rows,
     }
+
+
+# ---- Phase 1 session A: multi-path scoring ---------------------------------
+# The evaluator above only ever exercised embed.hybrid_search in hybrid mode.
+# Two more query-driven recall paths exist with their own implementations and
+# had no evaluation coverage at all before this: recall_prompt.
+# prior_work_for_prompt with no budget (the UserPromptSubmit hook) and the
+# same function WITH budget_ms (khipu_status / the gateway lane). Everything
+# below extends scoring to all three without changing a byte of what's above.
+
+PATH_EXPLICIT = "explicit"
+PATH_PROMPT = "prompt"
+PATH_STATUS = "status"
+ALL_PATHS = (PATH_EXPLICIT, PATH_PROMPT, PATH_STATUS)
+
+# khipu_status's own default budget for the same call (mirrors the gateway
+# lane; recall_prompt.prior_work_for_prompt's budget_ms is caller-supplied).
+DEFAULT_STATUS_BUDGET_MS = 600
+
+
+def _prompt_path_k_cap() -> int:
+    """Both prompt and status paths render at most recall_prompt.TOP_N hits
+    regardless of an entry's own k (render_block truncates upstream) — a
+    golden k of 5 can never be satisfied by either path, so the scoring
+    window is capped to match rather than report a phantom miss. Imported
+    lazily and read-only; this module never edits recall_prompt."""
+    try:
+        from khipu.recall_prompt import TOP_N
+
+        return int(TOP_N)
+    except Exception:  # noqa: BLE001 — a broken import must not sink scoring
+        return 3
+
+
+def _entry_applies(entry: dict[str, Any], path: str) -> bool:
+    """True when `path` is one of this entry's own `paths` restriction, or
+    the entry carries no restriction (applies to every requested path)."""
+    restrict = entry.get("paths")
+    return not restrict or path in restrict
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    """Nearest-rank percentile; 0.0 for an empty list. Not statistics.
+    quantiles: nearest-rank is well-defined for the tiny (often single-digit)
+    sample sizes one golden run produces, where interpolation schemes
+    disagree most."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    rank = max(1, math.ceil(pct / 100.0 * len(ordered)))
+    return ordered[min(rank, len(ordered)) - 1]
+
+
+def _call_explicit(query: str, entry: dict[str, Any], *, mode: str, k: int) -> dict[str, Any]:
+    from khipu.embed import hybrid_search
+
+    return hybrid_search(
+        query, mode=mode, limit=k,
+        project=entry.get("project"), since=entry.get("since"), until=entry.get("until"),
+    )
+
+
+def _call_prompt_or_status(
+    query: str, entry: dict[str, Any], *, path: str, budget_ms: int
+) -> dict[str, Any]:
+    from khipu.recall_prompt import prior_work_for_prompt
+
+    return prior_work_for_prompt(
+        query, cwd=entry.get("cwd"), session_id=None,
+        budget_ms=budget_ms if path == PATH_STATUS else None,
+    )
+
+
+def _extract_got(payload: dict[str, Any], path: str, k: int) -> list[str]:
+    rows = payload.get("results" if path == PATH_EXPLICIT else "hits") or []
+    return [str(r.get("id")) for r in rows[:k]]
+
+
+def _outcome(payload: dict[str, Any], path: str) -> tuple[bool, bool, str | None, str]:
+    """(timeout, error, degraded, reason) read off one path's raw return
+    value. explicit (embed.hybrid_search) has no deadline today (scope:
+    "Retrieval and multi-harness contract") so it never reports a timeout;
+    prompt/status (recall_prompt.prior_work_for_prompt) are fail-open and
+    describe every outcome, including a timeout, in their own `reason`
+    string rather than raising."""
+    if path == PATH_EXPLICIT:
+        err = payload.get("error")
+        reason = f"error: {err}" if err else "ok"
+        return False, bool(err), payload.get("degraded"), reason
+    reason = str(payload.get("reason") or "")
+    lowered = reason.lower()
+    timeout = lowered.startswith("timeout")
+    error = bool(payload.get("error")) or "error" in lowered
+    degraded = None
+    if path == PATH_STATUS:
+        degraded = (payload.get("prior_work_meta") or {}).get("degraded")
+    return timeout, error, degraded, reason
+
+
+def eval_one_path(
+    entry: dict[str, Any], path: str, *, budget_ms: int = DEFAULT_STATUS_BUDGET_MS
+) -> dict[str, Any]:
+    """Score one golden entry against one retrieval path (explicit / prompt /
+    status). Same fail-open contract as eval_one — a broken line/path is a
+    miss, never a crash — plus the abstention, staleness and outcome
+    accounting a single hybrid_search score has no way to express."""
+    query = str(entry["query"])
+    mode = str(entry.get("mode") or "hybrid")
+    k = int(entry.get("k") or DEFAULT_K)
+    if path != PATH_EXPLICIT:
+        k = min(k, _prompt_path_k_cap())
+    expect = {str(x) for x in (entry.get("expect") or [])}
+    expect_none = bool(entry.get("expect_none"))
+    stale = {str(x) for x in (entry.get("stale") or [])}
+
+    t0 = time.monotonic()
+    try:
+        if path == PATH_EXPLICIT:
+            payload = _call_explicit(query, entry, mode=mode, k=k)
+        else:
+            payload = _call_prompt_or_status(query, entry, path=path, budget_ms=budget_ms)
+    except Exception as exc:  # noqa: BLE001 — a broken line/path scores a miss, not a crash
+        payload = {"error": f"{type(exc).__name__}: {exc}"}
+    ms = round((time.monotonic() - t0) * 1000, 1)
+    payload_chars = len(json.dumps(payload, default=str))
+
+    got = _extract_got(payload, path, k)
+    timeout, error, degraded, reason = _outcome(payload, path)
+
+    hit = False
+    reciprocal_rank = 0.0
+    abstain_correct: bool | None = None
+    if expect_none:
+        # A timed-out/errored call also returns an empty `got` — without this
+        # guard it would read as a correct abstention instead of the
+        # infrastructure failure it actually is: the exact shape the review's
+        # B10 finding warns about, a miss that looks like "no relevant
+        # memory" instead of a lane that missed its own deadline.
+        abstain_correct = (not got) and not timeout and not error
+    else:
+        hit = bool(expect & set(got))
+        for rank, gid in enumerate(got, start=1):
+            if gid in expect:
+                reciprocal_rank = 1.0 / rank
+                break
+
+    return {
+        "query": query, "path": path, "mode": mode if path == PATH_EXPLICIT else None,
+        "k": k, "expect": sorted(expect), "expect_none": expect_none,
+        "stale": sorted(stale), "note": entry.get("note"),
+        "got": got, "hit": hit, "reciprocal_rank": reciprocal_rank,
+        "abstain_correct": abstain_correct,
+        "stale_violation": bool(stale & set(got)),
+        "timeout": timeout, "error": error, "degraded": degraded, "reason": reason,
+        "confidence": payload.get("confidence") if path == PATH_EXPLICIT else None,
+        "ms": ms, "payload_chars": payload_chars,
+    }
+
+
+def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate eval_one_path rows for ONE path into its metrics block:
+    total, hits, hit_rate, mrr, abstain_total, abstain_correct,
+    stale_violations, timeouts, errors, degraded, latency p50/p95 (ms), and
+    mean result payload size (chars)."""
+    positive = [r for r in rows if not r["expect_none"]]
+    abstain = [r for r in rows if r["expect_none"]]
+    hits = sum(1 for r in positive if r["hit"])
+    mrr = (sum(r["reciprocal_rank"] for r in positive) / len(positive)) if positive else 0.0
+    latencies = [r["ms"] for r in rows]
+    sizes = [r["payload_chars"] for r in rows]
+    return {
+        "total": len(rows),
+        "hits": hits,
+        "hit_rate": round(hits / len(positive), 4) if positive else 0.0,
+        "mrr": round(mrr, 4),
+        "abstain_total": len(abstain),
+        "abstain_correct": sum(1 for r in abstain if r["abstain_correct"]),
+        "stale_violations": sum(1 for r in rows if r["stale_violation"]),
+        "timeouts": sum(1 for r in rows if r["timeout"]),
+        # A timeout/error on a positive entry is already folded into `hits`
+        # as a miss (see eval_one_path) AND counted here, so this lane can
+        # never look like it simply "found nothing" (review finding B10).
+        "errors": sum(1 for r in rows if r["error"]),
+        "degraded": sum(1 for r in rows if r["degraded"]),
+        "latency_p50_ms": round(_percentile(latencies, 50), 1),
+        "latency_p95_ms": round(_percentile(latencies, 95), 1),
+        "mean_payload_chars": round(sum(sizes) / len(sizes), 1) if sizes else 0.0,
+    }
+
+
+def run_eval_paths(
+    entries: list[dict[str, Any]], paths: tuple[str, ...],
+    *, budget_ms: int = DEFAULT_STATUS_BUDGET_MS,
+) -> dict[str, Any]:
+    """Score every entry against every requested path, subject to that
+    entry's own `paths` restriction, and summarize per path. The `--path
+    prompt|status|all` counterpart to run_eval (which stays explicit-only)."""
+    rows: list[dict[str, Any]] = []
+    by_path: dict[str, list[dict[str, Any]]] = {p: [] for p in paths}
+    for entry in entries:
+        for path in paths:
+            if not _entry_applies(entry, path):
+                continue
+            row = eval_one_path(entry, path, budget_ms=budget_ms)
+            rows.append(row)
+            by_path[path].append(row)
+    return {"paths": {p: summarize_rows(by_path[p]) for p in paths}, "rows": rows}
+
+
+def _stamp(paths: tuple[str, ...]) -> dict[str, Any]:
+    """khipu version, the path list, wall-clock UTC, and the replica's own
+    refreshed_at. Best-effort: a stamp is metadata, not a scored result, so a
+    snapshot read failure degrades to None rather than sinking a record."""
+    import khipu
+
+    out: dict[str, Any] = {
+        "khipu_version": getattr(khipu, "__version__", None),
+        "paths": list(paths),
+        "utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "replica_refreshed_at": None,
+    }
+    try:
+        from khipu.hub_snapshot import snapshot_health
+
+        out["replica_refreshed_at"] = snapshot_health().get("refreshed_at")
+    except Exception:  # noqa: BLE001 — best-effort stamp metadata only
+        pass
+    return out
+
+
+def build_record(
+    entries: list[dict[str, Any]], paths: tuple[str, ...],
+    *, budget_ms: int = DEFAULT_STATUS_BUDGET_MS,
+) -> dict[str, Any]:
+    """A control: the ordered ids every (entry, path) pair returns right now,
+    plus each pair's reason/degraded state and a stamp. `--compare` diffs a
+    later run against exactly this."""
+    report = run_eval_paths(entries, paths, budget_ms=budget_ms)
+    return {
+        "stamp": _stamp(paths),
+        "entries": [
+            {"query": r["query"], "path": r["path"], "got": r["got"],
+             "reason": r["reason"], "degraded": r["degraded"]}
+            for r in report["rows"]
+        ],
+    }
+
+
+def write_record(path: Path, record: dict[str, Any]) -> None:
+    path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
+
+
+def read_record(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or "entries" not in data:
+        raise ValueError(f"{path}: not a recall-eval control file (missing 'entries')")
+    return data
+
+
+def _diff_status(control_got: list[str] | None, live_got: list[str]) -> str:
+    if control_got is None:
+        return "new"
+    if control_got == live_got:
+        return "identical"
+    if sorted(control_got) == sorted(live_got):
+        return "reordered"
+    return "changed"
+
+
+def compare_record(
+    entries: list[dict[str, Any]], paths: tuple[str, ...], control: dict[str, Any],
+    *, budget_ms: int = DEFAULT_STATUS_BUDGET_MS,
+) -> dict[str, Any]:
+    """Rerun `entries` against `paths` and diff each (query, path) pair's
+    ordered ids against `control`. Latency is deliberately never part of the
+    diff: only `ms` changing between the two runs still reads as
+    "identical", matching the scope's "differences in latency never fail a
+    comparison". A pair the live run has but the control lacks (paths=all
+    added an entry after the control was recorded, or --replay drew a
+    different sample) reports "new" rather than silently matching."""
+    report = run_eval_paths(entries, paths, budget_ms=budget_ms)
+    control_by_key = {(e.get("query"), e.get("path")): e for e in control.get("entries", [])}
+    diffs = []
+    changed = 0
+    for row in report["rows"]:
+        prior = control_by_key.get((row["query"], row["path"]))
+        status = _diff_status(prior.get("got") if prior else None, row["got"])
+        if status in ("changed", "new"):
+            changed += 1
+        diffs.append({
+            "query": row["query"], "path": row["path"], "status": status,
+            "control_got": prior.get("got") if prior else None, "live_got": row["got"],
+            "control_reason": prior.get("reason") if prior else None, "live_reason": row["reason"],
+        })
+    return {"stamp": _stamp(paths), "diffs": diffs, "changed": changed}
+
+
+def load_replay_entries(
+    log_path: Path, *, sample: int | None = None, seed: int = 0,
+) -> list[dict[str, Any]]:
+    """No-expectation entries built from a query_log.jsonl (query_log.
+    log_query's own shape) for a realistic-traffic --record/--compare run.
+    Only valid with --record or --compare — there is no golden `expect` to
+    score against, by design. A redacted line (query=None — the gateway
+    never logs query text, see query_log.log_query's `redact`) has nothing
+    to replay and is skipped, same as a line with no query at all; a
+    `slice:`-prefixed query is the session-start push's own log marker
+    (recall_rule.py), not something a person typed. Sampling is seeded so a
+    replay run is reproducible, not a fresh random subset every time.
+    """
+    seen: set[str] = set()
+    entries: list[dict[str, Any]] = []
+    for raw in log_path.read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            line = json.loads(raw)
+        except ValueError:
+            continue
+        query = line.get("query")
+        if not query or not isinstance(query, str) or query.startswith("slice:"):
+            continue
+        if query in seen:
+            continue
+        seen.add(query)
+        entries.append({"query": query, "mode": line.get("mode") or "hybrid"})
+    if sample is not None and sample < len(entries):
+        entries = random.Random(seed).sample(entries, sample)
+    return entries

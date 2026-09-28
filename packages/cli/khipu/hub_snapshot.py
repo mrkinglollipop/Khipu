@@ -1,3 +1,6 @@
+# --bypass-harness (sonnet lane) — authored directly by the dispatched
+# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
+# agents"); there is no further agent to route this to.
 """Full hub read replica for airplane mode (P3).
 
 When PostgreSQL is reachable, ``refresh()`` atomically replaces
@@ -1661,11 +1664,20 @@ def cosine_candidates_snapshot(
     hub leg. Never raises for "no rows" — an empty/missing snapshot or profile
     just yields ``[]``; a genuine sqlite error still propagates (the caller
     decides whether that means "fall back to the hub").
-    """
-    import operator
-    import struct
 
+    Scoring (Phase 0 session C, finding B10 — docs/research/
+    hindsight-plan-review-2026-09-28.md): selects only the rowid and
+    embedding blob needed to rank every candidate, not ``chunk_text`` — that
+    used to be pulled for every row just to score it (measured 226ms over
+    ~18,400 rows on the production-size replica) — and fetches
+    ``chunk_text`` in a second, tiny query for only the rows that actually
+    win. ``khipu.vector_scan.top_k_by_dot`` does the ranking itself (BLAS
+    when a system library loads, exact Python arithmetic for the final
+    scores either way); this function's signature, output rows, keys,
+    4-decimal scores and order are unchanged from before.
+    """
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
+    from khipu.vector_scan import top_k_by_dot
 
     con = open_snapshot()
     params: list[Any] = [profile]
@@ -1676,7 +1688,9 @@ def cosine_candidates_snapshot(
     rows = con.execute(
         # A commitment has its own dedicated surface (khipu_owed), not
         # generic search — same exclusion as embed._cosine_candidates.
-        f"SELECT kind, ref, chunk_idx, chunk_text, embedding FROM memory_embeddings "
+        # chunk_text is deliberately NOT selected here — it is fetched below
+        # for the winning rows only; scoring needs nothing but the blob.
+        f"SELECT rowid, kind, ref, chunk_idx, embedding FROM memory_embeddings "
         f"WHERE profile = ? AND kind != 'commitment'{kind_clause} AND embedding IS NOT NULL",
         params,
     ).fetchall()
@@ -1684,36 +1698,44 @@ def cosine_candidates_snapshot(
     # here is stored via embed.embed_batch, which L2-normalizes every vector
     # before it is ever written (embedding_profiles.normalize = 'l2', the
     # schema's own guarantee) — so dot(a, b) on two unit vectors already IS
-    # the cosine similarity. Measured live (2026-09-14, 9,639 rows): calling
-    # _cosine() per row (which recomputes the QUERY vector's norm 9,639
-    # times over) cost 680ms; a plain dot product via struct.unpack +
-    # operator.mul cost 175ms — a ~4x cut, the difference between meeting
-    # and missing the per-prompt hook's 1.2s wall clock. The query vector is
-    # still normalized once, up front, defensively (cheap: it happens once,
-    # not per row) in case its source ever changes.
+    # the cosine similarity. The query vector is still normalized once, up
+    # front, defensively (cheap: it happens once, not per row) in case its
+    # source ever changes.
     qn = math.sqrt(sum(x * x for x in vec)) or 1.0
     qvec = tuple(x / qn for x in vec)
-    dim = len(qvec)
-    fmt = f"{dim}f"
-    mul = operator.mul
-    scored: list[tuple[float, dict[str, Any]]] = []
-    for knd, ref, chunk_idx, chunk_text, blob in rows:
-        if not blob or len(blob) < dim * 4:
-            continue
-        doc = struct.unpack(fmt, blob[: dim * 4])
-        score = sum(map(mul, qvec, doc))
-        scored.append((
-            score,
-            {
-                "kind": knd, "id": ref, "chunk_idx": chunk_idx,
-                "score": round(float(score), 4),
-                "label": clip_snippet(chunk_text or "", LABEL_LIMIT),
-                "snippet": clip_snippet(chunk_text or "", SNIPPET_LIMIT),
-                "rank_text": chunk_text or "",
-            },
-        ))
-    scored.sort(key=lambda x: -x[0])
-    return [item for _, item in scored[: max(1, int(limit))]]
+
+    by_rowid: dict[int, tuple[str, str, int]] = {
+        rowid: (knd, ref, chunk_idx) for rowid, knd, ref, chunk_idx, _blob in rows
+    }
+    winners = top_k_by_dot(
+        qvec,
+        ((rowid, blob) for rowid, _knd, _ref, _chunk_idx, blob in rows),
+        max(1, int(limit)),
+    )
+    if not winners:
+        return []
+
+    win_rowids = [rowid for rowid, _score in winners]
+    placeholders = ",".join("?" for _ in win_rowids)
+    texts: dict[int, str] = dict(
+        con.execute(
+            f"SELECT rowid, chunk_text FROM memory_embeddings WHERE rowid IN ({placeholders})",
+            win_rowids,
+        ).fetchall()
+    )
+
+    out: list[dict[str, Any]] = []
+    for rowid, score in winners:
+        knd, ref, chunk_idx = by_rowid[rowid]
+        chunk_text = texts.get(rowid) or ""
+        out.append({
+            "kind": knd, "id": ref, "chunk_idx": chunk_idx,
+            "score": round(float(score), 4),
+            "label": clip_snippet(chunk_text, LABEL_LIMIT),
+            "snippet": clip_snippet(chunk_text, SNIPPET_LIMIT),
+            "rank_text": chunk_text,
+        })
+    return out
 
 
 def snapshot_row_metadata(
