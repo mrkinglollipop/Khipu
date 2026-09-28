@@ -1,3 +1,6 @@
+# --bypass-harness (sonnet lane) — authored directly by the dispatched
+# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
+# agents"); there is no further agent to route this to.
 """Tests for khipu.integrations — per-harness native packs (P3 step 4).
 
 Every test runs against a TEMP home directory (HOME is patched and the module's
@@ -199,7 +202,15 @@ class AegisPackTest(_TempHomeCase):
         self.assertNotIn("khipu-pack", (self.home / ".grok" / "config.toml").read_text())
 
 
-class ProbeTest(unittest.TestCase):
+class ProbeTest(_TempHomeCase):
+    def setUp(self):
+        super().setUp()
+        # _shim() is read-only outside install() now (B1): these probes exec
+        # the shim through the shell, so a real space-free link must exist
+        # first, same as any other harness would get from a real install.
+        (self.home / ".claude").mkdir()
+        integ.install("claude_code")
+
     def test_hook_probe_real_binary_exits_zero(self):
         """The shipped khipu-stop-hook must never block a session: exit 0 always,
         even here where PG may or may not be reachable."""
@@ -296,7 +307,7 @@ class ProbePromptRecallSnapshotTest(unittest.TestCase):
         self.assertNotIn("khipu-verify", seen_session_ids)
 
 
-class AegisIsolationTest(unittest.TestCase):
+class AegisIsolationTest(_TempHomeCase):
     """Aegis is its own harness (maintainer, 2026-08-17). Exactly ONE Khipu script may
     run there — khipu-aegis-capture, via the Aegis pack's KHIPU_HARNESS=aegis
     mark. The Stop hook and the recall hook must refuse under Aegis's runner env
@@ -346,6 +357,10 @@ class AegisIsolationTest(unittest.TestCase):
         import os
         import subprocess
 
+        # _shim() is read-only outside install() now (B1): a real link must
+        # exist before recall_hook_cursor() returns something the shell can run.
+        (self.home / ".claude").mkdir()
+        integ.install("claude_code")
         cmd = integ.recall_hook_cursor()
         env = {k: v for k, v in os.environ.items() if k not in ("GROK_HOOK_EVENT", "GROK_HOOK_NAME")}
         env["KHIPU_HARNESS"] = "aegis"
@@ -389,6 +404,11 @@ class AegisIsolationTest(unittest.TestCase):
             self.assertIn("/.grok/", str(ac.khipu_home()))
 
     def test_verify_isolation_probe(self):
+        # _shim() is read-only outside install() now (B1): a real link must
+        # exist before aegis_capture_hook() returns something the shell can run.
+        (self.home / ".grok").mkdir()
+        integ.AEGIS_TOML.write_text('model = "grok"\n')
+        integ.install("aegis")
         # The probe targets the hook Aegis actually runs (the capture hook).
         r = integ._probe_aegis_isolation(integ.aegis_capture_hook())
         self.assertTrue(r["ok"], r)
@@ -409,6 +429,64 @@ class ShimRepointTest(_TempHomeCase):
         self.assertNotIn(" ", cmds[0])
         self.assertTrue((self.home / ".config" / "khipu" / "bin" / "khipu-stop-hook").is_symlink())
         self.assertEqual(integ.install("claude_code")["changes"], [])  # idempotent after
+
+
+class ShimReadOnlyTest(_TempHomeCase):
+    """B1: _shim() must never create, delete or re-point a launcher symlink
+    outside an explicit install() call — status/verify/doctor/every probe are
+    read-only. See _installing()'s docstring in khipu/integrations.py."""
+
+    def test_status_does_not_touch_a_link_pointing_elsewhere(self):
+        (self.home / ".claude").mkdir()
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        shim_dir.mkdir(parents=True)
+        mcp_link = shim_dir / "khipu-mcp"
+        stop_link = shim_dir / "khipu-stop-hook"
+        # Both point somewhere that is NOT this repo's real bin script — e.g. a
+        # worktree removed since install, or a plain stale target (B5-shaped).
+        # The targets must actually EXIST (state "elsewhere", not "dangling")
+        # for `installed` to stay true here — a dangling launcher a pack's
+        # config names IS reported broken; that is ShimDanglingTest's job.
+        elsewhere = self.home / "nowhere"
+        elsewhere.mkdir(parents=True)
+        (elsewhere / "khipu-mcp").write_text("#!/bin/sh\n")
+        (elsewhere / "khipu-stop-hook").write_text("#!/bin/sh\n")
+        mcp_link.symlink_to(elsewhere / "khipu-mcp")
+        stop_link.symlink_to(elsewhere / "khipu-stop-hook")
+        (self.home / ".claude.json").write_text(json.dumps(
+            {"mcpServers": {"khipu": {"command": str(mcp_link)}}}))
+        (self.home / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": str(stop_link), "timeout": 20}]}],
+            "PreCompact": [{"hooks": [{"type": "command", "command": str(stop_link), "timeout": 20}]}],
+        }}))
+        st = integ.status("claude_code")
+        # The config names the link path, so status reports the pack installed —
+        # it must not need the link's TARGET to be correct to see that.
+        self.assertTrue(st["mcp"])
+        self.assertTrue(st["hook_stop"] and st["hook_precompact"])
+        self.assertTrue(st["installed"])
+        # And it must not have touched either link while checking.
+        self.assertEqual(os.readlink(mcp_link), str(self.home / "nowhere" / "khipu-mcp"))
+        self.assertEqual(os.readlink(stop_link), str(self.home / "nowhere" / "khipu-stop-hook"))
+
+    def test_install_repoints_a_link_pointing_elsewhere(self):
+        (self.home / ".claude").mkdir()
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        shim_dir.mkdir(parents=True)
+        link = shim_dir / "khipu-mcp"
+        link.symlink_to(self.home / "nowhere" / "khipu-mcp")
+        (self.home / ".claude.json").write_text("{}")
+        integ.install("claude_code")
+        self.assertEqual(Path(os.readlink(link)), integ._bin_script("khipu-mcp"))
+
+    def test_fresh_machine_status_reports_not_installed_and_creates_nothing(self):
+        (self.home / ".claude").mkdir()
+        (self.home / ".claude.json").write_text("{}")
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        st = integ.status("claude_code")
+        self.assertFalse(st["installed"])
+        self.assertFalse(st["mcp"])
+        self.assertFalse(shim_dir.exists())  # status created no link, no directory
 
 
 if __name__ == "__main__":
@@ -473,11 +551,17 @@ class RecallRuleTest(_TempHomeCase):
         self.assertFalse(integ.status("cursor")["hook_sessionstart"])
 
     def test_recall_probe_real_hook(self):
+        # _shim() is read-only outside install() now (B1): a real link must
+        # exist before recall_hook() returns something the shell can run.
+        (self.home / ".claude").mkdir()
+        integ.install("claude_code")
         r = integ._probe_recall(integ.recall_hook())
         self.assertTrue(r["ok"], r)
         self.assertGreater(r["chars"], 200)
 
     def test_recall_probe_cursor_shape(self):
+        (self.home / ".claude").mkdir()
+        integ.install("claude_code")
         r = integ._probe_recall(integ.recall_hook_cursor())
         self.assertTrue(r["ok"], r)
         self.assertGreater(r["chars"], 200)
@@ -793,3 +877,210 @@ class StatusInstalledFlagTest(unittest.TestCase):
                     mock.patch.object(integ, "_last_beat_at", return_value=None):
                 out = integ.status(harness)
             self.assertEqual(out.get("installed"), want, (harness, out))
+
+
+class ShimDryRunTest(_TempHomeCase):
+    """A dry-run install runs `_shim()` in PLAN mode — it reports the
+    link path a real install would write and touches nothing, not even the
+    directory."""
+
+    def test_dry_run_creates_nothing_and_reports_the_link_path(self):
+        (self.home / ".claude").mkdir()
+        (self.home / ".claude.json").write_text("{}")
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        out = integ.install("claude_code", dry_run=True)
+        self.assertFalse(shim_dir.exists(), "a dry run must not create the shim directory")
+        change = next(c for c in out["changes"] if "mcpServers.khipu ->" in c)
+        self.assertEqual(change.split(" -> ", 1)[1], str(shim_dir / "khipu-mcp"))
+        self.assertEqual(integ.CLAUDE_JSON.read_text(), "{}", "a dry run must not write the config")
+
+    def test_dry_run_does_not_repoint_an_existing_elsewhere_link(self):
+        (self.home / ".claude").mkdir()
+        (self.home / ".claude.json").write_text("{}")
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        shim_dir.mkdir(parents=True)
+        link = shim_dir / "khipu-mcp"
+        link.symlink_to(self.home / "nowhere" / "khipu-mcp")
+        integ.install("claude_code", dry_run=True)
+        self.assertEqual(os.readlink(link), str(self.home / "nowhere" / "khipu-mcp"))
+
+
+class LauncherStatesTest(_TempHomeCase):
+    def test_five_names_reported_as_missing_on_a_fresh_machine(self):
+        states = {s["name"]: s for s in integ.launcher_states()}
+        self.assertEqual(set(states), set(integ.LAUNCHER_NAMES))
+        self.assertTrue(all(s["state"] == "missing" for s in states.values()))
+
+    def test_not_a_link_when_a_regular_file_is_in_the_way(self):
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        shim_dir.mkdir(parents=True)
+        (shim_dir / "khipu-mcp").write_text("not a symlink")
+        s = next(s for s in integ.launcher_states() if s["name"] == "khipu-mcp")
+        self.assertEqual(s["state"], "not_a_link")
+
+    def test_dangling_when_the_target_does_not_exist(self):
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        shim_dir.mkdir(parents=True)
+        (shim_dir / "khipu-mcp").symlink_to(self.home / "nowhere" / "khipu-mcp")
+        s = next(s for s in integ.launcher_states() if s["name"] == "khipu-mcp")
+        self.assertEqual(s["state"], "dangling")
+        self.assertEqual(s["target"], str(self.home / "nowhere" / "khipu-mcp"))
+
+    def test_current_when_it_points_at_this_codes_own_script(self):
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        shim_dir.mkdir(parents=True)
+        (shim_dir / "khipu-mcp").symlink_to(integ._bin_script("khipu-mcp"))
+        s = next(s for s in integ.launcher_states() if s["name"] == "khipu-mcp")
+        self.assertEqual(s["state"], "current")
+
+    def test_elsewhere_when_it_points_at_a_different_existing_file(self):
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        shim_dir.mkdir(parents=True)
+        other = self.home / "nowhere" / "khipu-mcp"
+        other.parent.mkdir(parents=True)
+        other.write_text("#!/bin/sh\n")
+        (shim_dir / "khipu-mcp").symlink_to(other)
+        s = next(s for s in integ.launcher_states() if s["name"] == "khipu-mcp")
+        self.assertEqual(s["state"], "elsewhere")
+
+
+class ShimDanglingTest(_TempHomeCase):
+    """A pack whose config names a dangling launcher reports
+    `installed=False` and a `fix` string, and never repoints it itself —
+    status/verify only inspect; repointing stays install()'s job."""
+
+    def test_dangling_launcher_referenced_by_config_fails_installed(self):
+        (self.home / ".claude").mkdir()
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        shim_dir.mkdir(parents=True)
+        mcp_link = shim_dir / "khipu-mcp"
+        mcp_link.symlink_to(self.home / "nowhere" / "khipu-mcp")  # target never created: dangling
+        stop_link = shim_dir / "khipu-stop-hook"
+        stop_link.symlink_to(integ._bin_script("khipu-stop-hook"))  # this one is healthy
+        (self.home / ".claude.json").write_text(json.dumps(
+            {"mcpServers": {"khipu": {"command": str(mcp_link)}}}))
+        (self.home / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": str(stop_link)}]}]}}))
+        st = integ.status("claude_code")
+        self.assertFalse(st["launcher_ok"])
+        self.assertFalse(st["installed"])
+        self.assertIn("khipu integrations install claude_code", st["fix"])
+        self.assertEqual(os.readlink(mcp_link), str(self.home / "nowhere" / "khipu-mcp"))
+
+
+class LauncherHealthTest(_TempHomeCase):
+    def test_clean_machine_is_ok_and_consistent(self):
+        out = integ.launcher_health()
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["consistent"])
+        self.assertEqual(len(out["states"]), 5)
+
+    def test_a_referenced_dangling_launcher_fails_ok(self):
+        (self.home / ".claude").mkdir()
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        shim_dir.mkdir(parents=True)
+        mcp_link = shim_dir / "khipu-mcp"
+        mcp_link.symlink_to(self.home / "nowhere" / "khipu-mcp")
+        (self.home / ".claude.json").write_text(json.dumps(
+            {"mcpServers": {"khipu": {"command": str(mcp_link)}}}))
+        self.assertFalse(integ.launcher_health()["ok"])
+
+    def test_two_launchers_resolving_into_different_roots_is_inconsistent(self):
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        shim_dir.mkdir(parents=True)
+        root_a, root_b = self.home / "repo-a", self.home / "repo-b"
+        for root in (root_a, root_b):
+            (root / "packages" / "cli" / "bin").mkdir(parents=True)
+        (root_a / "packages" / "cli" / "bin" / "khipu-mcp").write_text("#!/bin/sh\n")
+        (root_b / "packages" / "cli" / "bin" / "khipu-stop-hook").write_text("#!/bin/sh\n")
+        (shim_dir / "khipu-mcp").symlink_to(root_a / "packages" / "cli" / "bin" / "khipu-mcp")
+        (shim_dir / "khipu-stop-hook").symlink_to(root_b / "packages" / "cli" / "bin" / "khipu-stop-hook")
+        out = integ.launcher_health()
+        self.assertFalse(out["consistent"])
+        self.assertTrue(out["ok"])  # inconsistency warns; must not fail `ok`
+
+
+def _green_doctor_patches():
+    """A complete green `cmd_doctor` baseline so a test can layer ONE
+    override (`khipu.integrations.launcher_health`) on top — same recipe as
+    test_cli_recall_quality.py's own copy, kept local for the same reason."""
+    return [
+        mock.patch("khipu.drift.status_payload", return_value={"latest_ingested_at": None}),
+        mock.patch("khipu.hub_snapshot.maybe_refresh", return_value=None),
+        mock.patch("khipu.hub_snapshot.snapshot_freshness", return_value={"ok": True}),
+        mock.patch("khipu.hub_snapshot.snapshot_health", return_value={"ok": True}),
+        mock.patch("khipu.keychain.secrets_status", return_value={"dsn_file": {"ok": True}}),
+        mock.patch("khipu.drift.backup_health", return_value={"ok": True}),
+        mock.patch("khipu.graph_backup.local_health", return_value={"ok": True}),
+        mock.patch("khipu.graph_backup.offsite_health", return_value={"ok": True}),
+        mock.patch("khipu.config.path_setting", return_value=None),
+        mock.patch("khipu.outbox.status", return_value={"pending": 0}),
+        mock.patch("khipu.outbox.drain", return_value={"failed": 0}),
+        mock.patch("khipu.session_capture.queued_jobs", return_value=False),
+        mock.patch("khipu.session_capture.drain", return_value=None),
+        mock.patch("khipu.session_capture.liveness_all",
+                    return_value={"ok": True, "red": [], "harnesses": {}}),
+        mock.patch("khipu.git_sync_health.status", return_value={"ok": True}),
+        mock.patch("khipu.jobs.job_status", return_value={}),
+        mock.patch("khipu.jobs.index_freshness", return_value={"ok": True}),
+        mock.patch("khipu.embed.coverage",
+                    return_value={"episodes": {"missing": 0}, "topics": {"missing": 0}}),
+        mock.patch("khipu.embed.literal_trgm_status", return_value={"ok": True}),
+        mock.patch("khipu.hub_snapshot.prompt_recall_snapshot_status",
+                    return_value={"ok": True}),
+        mock.patch("khipu.probe.status", return_value={"ok": True, "reason": None}),
+        mock.patch("khipu.drift.recall_quality", return_value={}),
+        mock.patch("khipu.embed.topics_embed_lag_minutes", return_value={"ok": True, "lag_minutes": 0}),
+        mock.patch("khipu.query_log.degraded_rate", return_value={"ok": True}),
+        mock.patch("khipu.integrations.gateway_liveness_check", return_value={"ok": True}),
+        mock.patch("khipu.integrations.aegis_gateway_check", return_value={"ok": True, "applicable": False}),
+        mock.patch("khipu.session_capture.unknown_harness_heartbeats", return_value={"warnings": []}),
+        mock.patch("khipu.jobs.nightly_step_health", return_value={
+            "notes_reconcile_ok": {"ok": True}, "embed_provider_ok": {"ok": True},
+            "commitments_hygiene_ok": {"ok": True}, "mark_stale_ok": {"ok": True}}),
+    ]
+
+
+class DoctorFoldsLauncherHealthTest(unittest.TestCase):
+    """Doctor's `launchers_ok` gates the top-level `ok`; `consistent` is
+    a warning only and must not."""
+
+    def setUp(self):
+        for p in _green_doctor_patches():
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _run_doctor(self):
+        import io
+        from contextlib import redirect_stdout
+
+        from khipu import cli
+        parser = cli.build_parser()
+        args = parser.parse_args(["doctor"])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.cmd_doctor(args)
+        return rc, json.loads(buf.getvalue())
+
+    def test_broken_launcher_fails_doctor(self):
+        bad = {"states": [], "consistent": True, "ok": False}
+        with mock.patch("khipu.integrations.launcher_health", return_value=bad):
+            rc, out = self._run_doctor()
+        self.assertEqual(rc, 2)
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["launchers_ok"])
+
+    def test_inconsistent_roots_warns_without_failing_doctor(self):
+        mixed = {"states": [], "consistent": False, "ok": True, "warning": "mixed roots"}
+        with mock.patch("khipu.integrations.launcher_health", return_value=mixed):
+            rc, out = self._run_doctor()
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["launchers"]["consistent"])
+
+    def test_healthy_launchers_keep_doctor_green(self):
+        good = {"states": [], "consistent": True, "ok": True}
+        with mock.patch("khipu.integrations.launcher_health", return_value=good):
+            rc, out = self._run_doctor()
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["launchers_ok"])

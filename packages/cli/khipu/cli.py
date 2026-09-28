@@ -1,3 +1,6 @@
+# --bypass-harness (sonnet lane) — authored directly by the dispatched
+# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
+# agents"); there is no further agent to route this to.
 """khipu CLI entry — status / search / graph / doctor / regen-memory / reconcile."""
 
 from __future__ import annotations
@@ -343,6 +346,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         prompt_recall_snapshot = prompt_recall_snapshot_status()
     except Exception as e:  # noqa: BLE001
         prompt_recall_snapshot = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # Phase 0 session C (finding B10): prompt_recall_snapshot above only
+    # tests replica freshness — it says nothing about whether the lane
+    # actually answers within its own budget. This reads the hook's own
+    # outcome log for the real timeout rate, the evidence that was missing
+    # while the lane silently discarded results on 85% of prompts.
+    try:
+        from khipu.recall_prompt import prompt_recall_outcomes
+
+        prompt_recall_outcomes_block = prompt_recall_outcomes()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        prompt_recall_outcomes_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # W6.1: `khipu doctor --probe` is the ONLY way this command writes anything
     # — it runs a fresh end-to-end capture-then-search probe (khipu.probe) and
     # records the result. Plain `khipu doctor` only reads that last recorded
@@ -469,6 +483,23 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         unknown_harness = unknown_harness_heartbeats()
     except Exception as e:  # noqa: BLE001
         unknown_harness = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # The five launcher links, read-only. `consistent`
+    # (mixed roots — a stray worktree still live) is a warning, never a gate;
+    # `launchers_ok` (a pack's own config pointed at a dangling/not_a_link
+    # launcher) is a gate, same as every other check below.
+    try:
+        from khipu import integrations as integ
+
+        launchers = integ.launcher_health()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        launchers = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # The switch registry's states, for visibility only — never gates `ok`.
+    try:
+        from khipu import features
+
+        features_block = features.states()
+    except Exception as e:  # noqa: BLE001
+        features_block = {"error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -485,6 +516,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "embed_coverage": embed_coverage,
         "literal_trgm": literal_trgm,
         "prompt_recall_snapshot": prompt_recall_snapshot,
+        "prompt_recall_outcomes": prompt_recall_outcomes_block,
         "recall_probe": recall_probe,
         "recall_quality": recall_quality_block,
         "bundle_seal": bundle_seal_block,
@@ -494,6 +526,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "topics_embed_lag_minutes": topics_lag.get("lag_minutes"),
         "degraded_rate": degraded_rate,
         "unknown_harness": unknown_harness,
+        "launchers": launchers,
+        "features": features_block,
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -528,9 +562,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             # the extension exists but an index is actually missing.
             and bool(literal_trgm.get("ok"))
             and bool(prompt_recall_snapshot.get("ok"))
+            and bool(prompt_recall_outcomes_block.get("ok"))
             and all(bool(v.get("ok")) for v in nightly_steps.values())
             and bool(topics_lag.get("ok"))
             and bool(degraded_rate.get("ok"))
+            # launchers_ok: red only when some pack's own config points at a
+            # dangling/not_a_link launcher. An inconsistent root set
+            # (`launchers["consistent"]`) is a warning, folded in separately
+            # below, and never reaches this aggregate.
+            and bool(launchers.get("ok"))
         ),
         "graph_backup": _graph_backup,
         "graph_backup_ok": bool(_graph_backup.get("ok")),
@@ -549,12 +589,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "bundle_seal_ok": bool(bundle_seal_block.get("ok")),
         "literal_trgm_ok": bool(literal_trgm.get("ok")),
         "prompt_recall_snapshot_ok": bool(prompt_recall_snapshot.get("ok")),
+        "prompt_recall_outcomes_ok": bool(prompt_recall_outcomes_block.get("ok")),
         "notes_reconcile_ok": bool(nightly_steps.get("notes_reconcile_ok", {}).get("ok")),
         "embed_provider_ok": bool(nightly_steps.get("embed_provider_ok", {}).get("ok")),
         "commitments_hygiene_ok": bool(nightly_steps.get("commitments_hygiene_ok", {}).get("ok")),
         "mark_stale_ok": bool(nightly_steps.get("mark_stale_ok", {}).get("ok")),
         "topics_embed_lag_ok": bool(topics_lag.get("ok")),
         "degraded_rate_ok": bool(degraded_rate.get("ok")),
+        "launchers_ok": bool(launchers.get("ok")),
     }
     print(json.dumps(out, indent=2, default=str))
     return 0 if out["ok"] else 2
@@ -2410,18 +2452,79 @@ def cmd_recall(args: argparse.Namespace) -> int:
 
         from khipu import recall_eval
 
-        path = _Path(args.golden) if getattr(args, "golden", None) else None
+        golden_path = _Path(args.golden) if getattr(args, "golden", None) else None
+        path_arg = getattr(args, "path", None) or "explicit"
+        record_to = getattr(args, "record", None)
+        compare_to = getattr(args, "compare", None)
+        replay_from = getattr(args, "replay", None)
+        allow_changes = bool(getattr(args, "allow_changes", False))
+        budget_ms = int(getattr(args, "budget_ms", None) or recall_eval.DEFAULT_STATUS_BUDGET_MS)
+
+        # Legacy fast path: zero new flags touched -> byte-identical to the
+        # original W6.3 command. run_eval/eval_one/load_golden are untouched
+        # by Phase 1 session A, so an existing golden file or script must
+        # never observe a single JSON key move here.
+        if path_arg == "explicit" and not record_to and not compare_to and not replay_from:
+            try:
+                report = recall_eval.run_eval(golden_path)
+            except (OSError, ValueError) as exc:
+                print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+                return 2
+            for row in report["rows"]:
+                mark = "hit " if row["hit"] else "MISS"
+                print(f"[{mark}] {row['query']!r} -> got={row['got']} expect={row['expect']}",
+                      file=sys.stderr)
+            print(json.dumps(report, indent=2, default=str))
+            return 0 if report["overall_hit_rate"] >= 0.8 else 1
+
+        paths = recall_eval.ALL_PATHS if path_arg == "all" else (path_arg,)
         try:
-            report = recall_eval.run_eval(path)
+            if replay_from:
+                if not record_to and not compare_to:
+                    raise ValueError("--replay needs --record or --compare")
+                entries = recall_eval.load_replay_entries(
+                    _Path(replay_from), sample=getattr(args, "sample", None),
+                    seed=int(getattr(args, "seed", 0) or 0),
+                )
+            else:
+                entries = recall_eval.load_golden(golden_path or recall_eval.default_golden_path())
         except (OSError, ValueError) as exc:
             print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
             return 2
+
+        if record_to:
+            record = recall_eval.build_record(entries, paths, budget_ms=budget_ms)
+            recall_eval.write_record(_Path(record_to), record)
+            print(json.dumps(record, indent=2, default=str))
+            return 0
+
+        if compare_to:
+            try:
+                control = recall_eval.read_record(_Path(compare_to))
+            except (OSError, ValueError) as exc:
+                print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+                return 2
+            result = recall_eval.compare_record(entries, paths, control, budget_ms=budget_ms)
+            for d in result["diffs"]:
+                print(f"[{d['status']}] path={d['path']} {d['query']!r}", file=sys.stderr)
+            print(json.dumps(result, indent=2, default=str))
+            return 0 if (result["changed"] == 0 or allow_changes) else 1
+
+        # --path prompt|status|all (no --record/--compare): score and print
+        # per-path metrics, same "hit@k >= 0.8" gate as legacy, generalized
+        # to also require abstention accuracy on any expect_none entries —
+        # a path is not passing if it hallucinates memory that isn't there.
+        report = recall_eval.run_eval_paths(entries, paths, budget_ms=budget_ms)
         for row in report["rows"]:
-            mark = "hit " if row["hit"] else "MISS"
-            print(f"[{mark}] {row['query']!r} -> got={row['got']} expect={row['expect']}",
-                  file=sys.stderr)
+            mark = "hit " if row["hit"] else ("abst" if row["expect_none"] else "MISS")
+            print(f"[{mark}] path={row['path']} {row['query']!r} -> got={row['got']}", file=sys.stderr)
         print(json.dumps(report, indent=2, default=str))
-        return 0 if report["overall_hit_rate"] >= 0.8 else 1
+        ok = all(
+            (s["total"] - s["abstain_total"] == 0 or s["hit_rate"] >= 0.8)
+            and (s["abstain_total"] == 0 or s["abstain_correct"] == s["abstain_total"])
+            for s in report["paths"].values()
+        )
+        return 0 if ok else 1
     return 2
 
 
@@ -2540,6 +2643,26 @@ def cmd_gateway(args: argparse.Namespace) -> int:
         return 0
     print(json.dumps({"ok": False, "error": f"unknown gateway token command {args.gateway_token_cmd!r}"}))
     return 2
+
+
+def cmd_features(args: argparse.Namespace) -> int:
+    """`khipu features` — the switch registry's states as JSON; `--set NAME
+    on|off` persists one to config.json first."""
+    from khipu import features
+
+    if args.set:
+        name, value = args.set
+        parsed = features.parse_bool(value)
+        if parsed is None:
+            print(json.dumps({"ok": False, "error": f"value must be on/off (got {value!r})"}))
+            return 2
+        try:
+            features.set_enabled(name, parsed)
+        except KeyError as e:
+            print(json.dumps({"ok": False, "error": str(e)}))
+            return 2
+    print(json.dumps(features.states(), indent=2))
+    return 0
 
 
 def cmd_paths(args: argparse.Namespace) -> int:
@@ -3786,12 +3909,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rzero.add_argument("--days", type=int, default=7)
     reval = rc_sub.add_parser(
-        "eval", help="Score <config dir>/recall-golden.jsonl (or --golden / KHIPU_RECALL_GOLDEN) against default search (W6.3)"
+        "eval",
+        help=(
+            "Score recall-golden.jsonl (or --golden / KHIPU_RECALL_GOLDEN) against one or all "
+            "retrieval paths (W6.3 + Phase 1 session A); --record/--compare/--replay for regression control"
+        ),
     )
     reval.add_argument(
         "--golden", default=None,
         help="Path to the golden JSONL file (default: <config dir>/recall-golden.jsonl, or KHIPU_RECALL_GOLDEN)",
     )
+    reval.add_argument(
+        "--path", choices=["explicit", "prompt", "status", "all"], default="explicit",
+        help=(
+            "Which retrieval path scores each entry: explicit=embed.hybrid_search (default, legacy "
+            "behavior), prompt=recall_prompt.prior_work_for_prompt unbudgeted, status=the same "
+            "budgeted (--budget-ms), all=every path. An entry's own 'paths' key narrows this further."
+        ),
+    )
+    reval.add_argument(
+        "--budget-ms", type=int, default=None,
+        help="budget_ms for the status path (default 600 — recall_eval.DEFAULT_STATUS_BUDGET_MS)",
+    )
+    reval.add_argument(
+        "--record", default=None,
+        help="Write a control (ordered ids per entry/path + reason/degraded + a stamp) to this file instead of scoring",
+    )
+    reval.add_argument(
+        "--compare", default=None,
+        help="Rerun and diff against a control written by --record; exits 1 on any difference unless --allow-changes",
+    )
+    reval.add_argument(
+        "--allow-changes", action="store_true",
+        help="With --compare: still exit 0 when entries differ (latency differences never fail a comparison either way)",
+    )
+    reval.add_argument(
+        "--replay", default=None,
+        help="Build no-expectation entries from a query_log.jsonl instead of the golden file; only valid with --record/--compare",
+    )
+    reval.add_argument("--sample", type=int, default=None, help="With --replay: cap to N entries")
+    reval.add_argument("--seed", type=int, default=0, help="With --replay --sample: deterministic sampling seed")
     rc.set_defaults(func=cmd_recall)
 
     tg = sub.add_parser(
@@ -3854,6 +4011,10 @@ def build_parser() -> argparse.ArgumentParser:
         "status", help="exists / mode / bytes only — never the token"
     )
     gw.set_defaults(func=cmd_gateway)
+
+    feat = sub.add_parser("features", help="Show or set feature switches")
+    feat.add_argument("--set", nargs=2, metavar=("NAME", "VALUE"), default=None)
+    feat.set_defaults(func=cmd_features)
 
     comp = sub.add_parser(
         "components",

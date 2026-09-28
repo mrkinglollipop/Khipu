@@ -6,6 +6,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -254,20 +255,31 @@ class MergeOutboxTest(unittest.TestCase):
 
 
 def _make_snapshot(data: Path) -> Path:
+    # Dates relative to "now" (fix for review finding 16 / Phase 0 task 4):
+    # a fixed calendar date ages out of a `since="7d"` window as real time
+    # passes, which is exactly what made this fixture's "fresh" episode stop
+    # being fresh. "old" is far enough back to stay outside any plausible
+    # `since` window regardless of when the suite runs; "fresh" is always
+    # within the 7-day window the filter test exercises.
+    now = datetime.now(timezone.utc)
+    old_ts = (now - timedelta(days=400)).isoformat()
+    fresh_ts = (now - timedelta(days=1)).isoformat()
     snap = data / "hub_snapshot.sqlite"
     con = sqlite3.connect(str(snap))
     hs._create_schema(con)
     con.execute(
         "INSERT INTO episodes (id, ts, summary, session_id, scope, topics, people, "
         "decisions, preferences) VALUES "
-        "(1, '2020-01-01T00:00:00+00:00', 'old alpha episode', 'claude_code:a', 'x', "
-        "'[]', '[]', '[]', '[]')"
+        "(1, ?, 'old alpha episode', 'claude_code:a', 'x', "
+        "'[]', '[]', '[]', '[]')",
+        (old_ts,),
     )
     con.execute(
         "INSERT INTO episodes (id, ts, summary, session_id, scope, topics, people, "
         "decisions, preferences) VALUES "
-        "(2, '2026-08-30T00:00:00+00:00', 'fresh alpha episode', 'claude_code:b', 'x', "
-        "'[]', '[]', '[]', '[]')"
+        "(2, ?, 'fresh alpha episode', 'claude_code:b', 'x', "
+        "'[]', '[]', '[]', '[]')",
+        (fresh_ts,),
     )
     con.execute(
         "INSERT INTO topics (slug, title, body) VALUES ('alpha-topic', 'Alpha', 'alpha topic body')"

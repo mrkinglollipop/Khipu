@@ -1,16 +1,67 @@
 """Shared pytest fixtures for the khipu test suite.
 
-``khipu.db.table_columns`` (fix 13 consolidation) keeps a per-process cache
-keyed by table name so repeated schema checks (embed/drift/hub_snapshot)
-share one information_schema round trip. That is correct in a real process
-but poisons test isolation: two test methods that fake different schema
-shapes for the same table (e.g. "pre-migration episodes" vs "post-migration
-episodes") would otherwise see whichever one ran first. Clear it before
-every test so each test's fake cursor is the sole source of truth.
+Hermetic by default (Phase 0 session A; B1 in
+docs/research/hindsight-plan-review-2026-09-28.md). On a machine that has
+ever installed a Khipu pack, the real HOME carries live state: a resolvable
+Postgres DSN (env, Keychain or ~/.config/khipu/dsn), a Keychain-stored Gemini
+key, and the ~/.config/khipu/bin launcher symlinks every real harness session
+currently runs its hooks through. `khipu.integrations._shim()` used to
+re-point those symlinks on every call, including from read-only paths
+(status/verify/doctor), and `khipu.db.resolve_dsn()` / `khipu.keychain` walk
+straight to the configured hub and Keychain whenever nothing has cleared the
+environment first. A suite that resolves any of that by accident is not
+testing khipu, it is operating on it: running this suite un-hermetically once
+re-pointed three live hook launchers at the checkout under test and let ~45
+tests reach the production hub and embedding API.
+
+So, before anything in THIS PROCESS imports `khipu` — the block below runs as
+module-level code, which pytest executes while collecting this conftest,
+ahead of any test module's own `from khipu import ...` — HOME is redirected
+at a throwaway temporary directory (removed at process exit) and every
+credential/identity environment variable is stripped. `Path.home()` and the
+several `HOME`-derived module-level constants (`khipu.integrations.HOME`,
+`khipu.paths.DEFAULT_DIR`, `khipu.db.DEFAULT_DSN_FILE`, ...) are only ever
+evaluated at import time, so patching the environment first is what makes
+this take effect for every one of them without patching each module
+individually. `KHIPU_KEYCHAIN=0` additionally forces `khipu.keychain` to
+report the Keychain unavailable rather than shelling out to `security(1)`.
+
+Set `KHIPU_LIVE_TESTS=1` to opt out of all of this and run against your real,
+configured environment exactly as found — the deliberate way to run the
+tests that write and delete their own probe rows on the configured hub and
+call the real embedding API. Individual tests that need to simulate a
+DIFFERENT home (their own temp dirs, per test) still patch things locally on
+top of this default, same as before — nothing here forecloses that.
+
+Unrelated to the above: ``khipu.db.table_columns`` (fix 13 consolidation)
+keeps a per-process cache keyed by table name so repeated schema checks
+(embed/drift/hub_snapshot) share one information_schema round trip. That is
+correct in a real process but poisons test isolation: two test methods that
+fake different schema shapes for the same table (e.g. "pre-migration
+episodes" vs "post-migration episodes") would otherwise see whichever one
+ran first. Clear it before every test so each test's fake cursor is the sole
+source of truth.
 """
 from __future__ import annotations
 
+import atexit
+import os
+import shutil
+import tempfile
+
 import pytest
+
+if os.environ.get("KHIPU_LIVE_TESTS") != "1":
+    _HERMETIC_HOME = tempfile.mkdtemp(prefix="khipu-hermetic-home-")
+    atexit.register(shutil.rmtree, _HERMETIC_HOME, ignore_errors=True)
+    os.environ["HOME"] = _HERMETIC_HOME
+    os.environ["KHIPU_KEYCHAIN"] = "0"
+    _KEEP = {"KHIPU_KEYCHAIN", "KHIPU_LIVE_TESTS"}
+    for _name in [n for n in os.environ if n.startswith(("KHIPU_", "ALZY_")) and n not in _KEEP]:
+        del os.environ[_name]
+    for _name in ("GEMINI_API_KEY", "GROK_HOOK_NAME", "GROK_HOOK_EVENT",
+                  "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_SESSION_ID"):
+        os.environ.pop(_name, None)
 
 
 @pytest.fixture(autouse=True)

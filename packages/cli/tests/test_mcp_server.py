@@ -74,6 +74,16 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(out["result"]["serverInfo"]["name"], "khipu")
         self.assertIn("tools", out["result"]["capabilities"])
 
+    def test_initialize_carries_the_capability_signal(self):
+        """capabilities.experimental.khipu is features.contract();
+        capabilities.tools is untouched (still `{}`, same as before)."""
+        from khipu import features
+
+        out = handle_message(_req(1, "initialize", {"protocolVersion": "2025-06-18"}))
+        caps = out["result"]["capabilities"]
+        self.assertEqual(caps["tools"], {})
+        self.assertEqual(caps["experimental"]["khipu"], features.contract())
+
     def test_initialize_unknown_version_falls_back(self):
         out = handle_message(_req(1, "initialize", {"protocolVersion": "1999-01-01"}))
         self.assertEqual(out["result"]["protocolVersion"], LATEST_PROTOCOL)
@@ -780,7 +790,8 @@ class StatusLightPayloadTest(unittest.TestCase):
         heavy.assert_not_called()
         self.assertEqual(
             set(out),
-            {"hub_ok", "prior_work", "prior_work_text", "prior_work_meta", "notes_freshness"},
+            {"hub_ok", "prior_work", "prior_work_text", "prior_work_meta", "notes_freshness",
+             "contract"},
         )
         self.assertNotIn("counts", out)
 

@@ -177,6 +177,7 @@ class OutboxDurabilityTest(unittest.TestCase):
         self.assertIsNone(st["oldest_age_s"])
 
 
+@unittest.skipUnless(_pg_available(), "Postgres unreachable")
 class LiveOutageTest(unittest.TestCase):
     def test_pg_outage_then_recovery_lands_exactly_one_row(self):
         from khipu import capture as cap

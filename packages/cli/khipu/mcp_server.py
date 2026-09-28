@@ -39,7 +39,21 @@ import threading
 from pathlib import Path
 
 SERVER_NAME = "khipu"
-SERVER_VERSION = "0.1.0"
+
+
+def _server_version() -> str:
+    """``khipu.__version__`` plus ``+<build>`` when KHIPU_BUILD is set to
+    something real (the gateway container's own commit stamp — see
+    ``khipu.gateway.BUILD``), never a bare "unknown" suffix."""
+    from khipu import __version__
+
+    build = (os.environ.get("KHIPU_BUILD") or "").strip()
+    if build and build != "unknown":
+        return f"{__version__}+{build}"
+    return __version__
+
+
+SERVER_VERSION = _server_version()
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 LATEST_PROTOCOL = "2025-06-18"
 
@@ -295,8 +309,8 @@ TOOLS: list[dict] = [
             "file-vs-PG drift sample (slower: walks the memory root). "
             "When `prompt` is given and `full` is not set, the schema "
             "narrows to a LIGHT payload — {hub_ok, prior_work, "
-            "prior_work_text, prior_work_meta, notes_freshness} only, no "
-            "counts/drift/recent_captures — so this call costs roughly what `prior_work` "
+            "prior_work_text, prior_work_meta, notes_freshness, contract} "
+            "only, no counts/drift/recent_captures — so this call costs roughly what `prior_work` "
             "alone costs (the heavy status queries run concurrently with "
             "the prior_work lane on a background thread, never sequentially "
             "in front of it; measured live: the full payload used to add "
@@ -349,7 +363,7 @@ TOOLS: list[dict] = [
                         "With `prompt`: return the complete status schema (counts, "
                         "drift, recent_captures, search_degraded_last_24h, …) instead "
                         "of the light {hub_ok, prior_work, prior_work_text, "
-                        "prior_work_meta, notes_freshness} payload. Default false. "
+                        "prior_work_meta, notes_freshness, contract} payload. Default false. "
                         "Ignored without `prompt` — the complete schema is already "
                         "the only shape."
                     ),
@@ -668,7 +682,19 @@ def _tool_status_light(args: dict) -> dict:
         payload["hub_error"] = probe["hub_error"]
     if "notes_freshness" in probe:
         payload["notes_freshness"] = probe["notes_freshness"]
+    _attach_contract(payload)
     return payload
+
+
+def _attach_contract(payload: dict) -> None:
+    """The capability signal. Optional: a failure here must never cost the
+    caller the status it asked for."""
+    try:
+        from khipu import features
+
+        payload["contract"] = features.contract()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _tool_status(args: dict) -> dict:
@@ -712,6 +738,7 @@ def _tool_status(args: dict) -> dict:
             payload["drift_error"] = "hub unreachable; drift omitted"
         payload["hub_error"] = f"{type(exc).__name__}: {exc}"
     _attach_prior_work(payload, args)
+    _attach_contract(payload)
     return payload
 
 
@@ -1045,13 +1072,18 @@ def handle_message(msg: dict) -> dict | None:
         # EVERY client without a per-repo rule file: it travels with the server,
         # so a cloud agent that connects account-level gets it in any repo.
         # Same text as the file-based rules, so the two can never drift.
+        from khipu import features
         from khipu.recall_rule import RULE_MD
 
         return _result(
             req_id,
             {
                 "protocolVersion": version,
-                "capabilities": {"tools": {}},
+                # The capability signal, under `experimental` (MCP
+                # lifecycle spec, optional/vendor-namespaced) so a client can
+                # test for a feature instead of inferring it. `tools` stays
+                # exactly as it was.
+                "capabilities": {"tools": {}, "experimental": {"khipu": features.contract()}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": RULE_MD.strip(),
             },

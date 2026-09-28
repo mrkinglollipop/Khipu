@@ -21,6 +21,13 @@ def _hit(kind="episode", hid="1", score=0.9, snippet="did the thing", **extra):
     return row
 
 
+def _hits(*rows, legs=("lexical",), degraded=None):
+    """``_search_hits``'s return shape (Phase 0 session C): ``{"hits": [...],
+    "legs": [...], "degraded": str | None}`` — the mock return value for any
+    test that patches ``rp._search_hits`` directly."""
+    return {"hits": list(rows), "legs": list(legs), "degraded": degraded}
+
+
 class GateTest(unittest.TestCase):
     def test_ok_gates_before_any_search(self):
         with mock.patch.object(rp, "_search_hits") as m_search:
@@ -40,7 +47,7 @@ class GateTest(unittest.TestCase):
                 self.assertEqual(out["context"], "")
 
     def test_a_topical_prompt_does_not_gate(self):
-        with mock.patch.object(rp, "_search_hits", return_value=[_hit()]):
+        with mock.patch.object(rp, "_search_hits", return_value=_hits(_hit())):
             out = rp.prior_work_for_prompt("what did we decide about the recall hook")
         self.assertNotEqual(out["context"], "")
 
@@ -77,7 +84,7 @@ class DeliverableLineTest(unittest.TestCase):
             self.assertEqual(rp._deliverable_context_line(["decisions"], cwd="/repo"), "")
 
     def test_prior_work_for_prompt_appends_the_line_after_hits(self):
-        with mock.patch.object(rp, "_search_hits", return_value=[_hit()]), mock.patch.object(
+        with mock.patch.object(rp, "_search_hits", return_value=_hits(_hit())), mock.patch.object(
             rp, "_deliverable_context_line",
             return_value="You produced khipu/decisions.py on 2026-09-14 (episode 42)",
         ):
@@ -85,7 +92,7 @@ class DeliverableLineTest(unittest.TestCase):
         self.assertIn("You produced khipu/decisions.py", out["context"])
 
     def test_prior_work_for_prompt_shows_the_line_even_with_no_other_hits(self):
-        with mock.patch.object(rp, "_search_hits", return_value=[]), mock.patch.object(
+        with mock.patch.object(rp, "_search_hits", return_value=_hits()), mock.patch.object(
             rp, "_deliverable_context_line",
             return_value="You produced khipu/decisions.py on 2026-09-14 (episode 42)",
         ):
@@ -101,7 +108,7 @@ class RenderTest(unittest.TestCase):
             _hit(kind="topic", hid="note:x", score=0.88, snippet="tracking Y",
                  ts="2026-09-10T00:00:00Z", status="active"),
         ]
-        with mock.patch.object(rp, "_search_hits", return_value=hits):
+        with mock.patch.object(rp, "_search_hits", return_value=_hits(*hits)):
             out = rp.prior_work_for_prompt("what is the status of the widget project")
         ctx = out["context"]
         self.assertLessEqual(len(ctx), rp.BLOCK_CHAR_BUDGET)
@@ -155,7 +162,7 @@ class DedupTest(unittest.TestCase):
 
     def test_same_ids_twice_in_a_row_is_suppressed_the_second_time(self):
         hits = [_hit(hid="1"), _hit(hid="2")]
-        with mock.patch.object(rp, "_search_hits", return_value=hits):
+        with mock.patch.object(rp, "_search_hits", return_value=_hits(*hits)):
             first = rp.prior_work_for_prompt(
                 "what did we decide about the recall hook", session_id="sess-1"
             )
@@ -168,7 +175,7 @@ class DedupTest(unittest.TestCase):
 
     def test_different_sessions_do_not_share_dedup_state(self):
         hits = [_hit(hid="1")]
-        with mock.patch.object(rp, "_search_hits", return_value=hits):
+        with mock.patch.object(rp, "_search_hits", return_value=_hits(*hits)):
             rp.prior_work_for_prompt("what did we decide about the recall hook", session_id="sess-a")
             second = rp.prior_work_for_prompt(
                 "what did we decide about the recall hook", session_id="sess-b"
@@ -176,21 +183,23 @@ class DedupTest(unittest.TestCase):
         self.assertNotEqual(second["context"], "")
 
     def test_no_session_id_still_injects_but_cannot_dedup(self):
-        with mock.patch.object(rp, "_search_hits", return_value=[_hit(hid="1")]):
+        with mock.patch.object(rp, "_search_hits", return_value=_hits(_hit(hid="1"))):
             first = rp.prior_work_for_prompt("what did we decide about the recall hook")
             second = rp.prior_work_for_prompt("what did we decide about the recall hook")
         self.assertNotEqual(first["context"], "")
         self.assertNotEqual(second["context"], "")
 
     def test_the_dedup_window_only_remembers_the_last_n_batches(self):
-        with mock.patch.object(rp, "_search_hits", return_value=[_hit(hid="1")]):
+        with mock.patch.object(rp, "_search_hits", return_value=_hits(_hit(hid="1"))):
             rp.prior_work_for_prompt("q1", session_id="sess-1")
         for i in range(rp.DEDUP_WINDOW):
-            with mock.patch.object(rp, "_search_hits", return_value=[_hit(hid=str(i + 2))]):
+            with mock.patch.object(
+                rp, "_search_hits", return_value=_hits(_hit(hid=str(i + 2)))
+            ):
                 rp.prior_work_for_prompt(f"q{i + 2}", session_id="sess-1")
         # The very first batch ({"episode:1"}) has scrolled out of the window,
         # so it is injectable again.
-        with mock.patch.object(rp, "_search_hits", return_value=[_hit(hid="1")]):
+        with mock.patch.object(rp, "_search_hits", return_value=_hits(_hit(hid="1"))):
             out = rp.prior_work_for_prompt("q1 again", session_id="sess-1")
         self.assertNotEqual(out["context"], "")
 
@@ -286,9 +295,11 @@ class SnapshotSearchHitsTest(unittest.TestCase):
                 mock.patch("khipu.hub_snapshot.open_snapshot", return_value=object()), \
                 mock.patch("khipu.hub_snapshot.snapshot_row_metadata", side_effect=lambda con, rows: rows):
             out = rp._snapshot_search_hits("a topical prompt", project=None)
-        ids = {(r["kind"], r["id"]) for r in out}
+        ids = {(r["kind"], r["id"]) for r in out["hits"]}
         self.assertIn(("topic", "t1"), ids)
         self.assertIn(("episode", "5"), ids)
+        self.assertEqual(set(out["legs"]), {"lexical", "cosine"})
+        self.assertIsNone(out["degraded"])
 
     def test_a_cosine_leg_failure_degrades_to_lexical_only_not_a_raise(self):
         lexical_row = {"kind": "episode", "id": "5", "label": "ep", "snippet": "episode text"}
@@ -299,7 +310,9 @@ class SnapshotSearchHitsTest(unittest.TestCase):
                 mock.patch("khipu.hub_snapshot.open_snapshot", return_value=object()), \
                 mock.patch("khipu.hub_snapshot.snapshot_row_metadata", side_effect=lambda con, rows: rows):
             out = rp._snapshot_search_hits("a topical prompt", project=None)
-        self.assertEqual([r["id"] for r in out], ["5"])
+        self.assertEqual([r["id"] for r in out["hits"]], ["5"])
+        self.assertEqual(out["legs"], ["lexical"])
+        self.assertEqual(out["degraded"], "embedding error")
 
     def test_search_hits_falls_back_to_the_hub_when_the_snapshot_is_unusable(self):
         hub_hit = {"kind": "episode", "id": "1", "score": 0.5, "label": "x", "snippet": "x"}
@@ -307,15 +320,19 @@ class SnapshotSearchHitsTest(unittest.TestCase):
                 mock.patch("khipu.embed.hybrid_search", return_value={"results": [hub_hit]}) as m_hub:
             out = rp._search_hits("a topical prompt", cwd=None)
         m_hub.assert_called_once()
-        self.assertEqual(out[0]["id"], "1")
+        self.assertEqual(out["hits"][0]["id"], "1")
+        self.assertEqual(out["legs"], ["hub"])
 
     def test_search_hits_uses_the_snapshot_without_touching_the_hub_when_it_works(self):
         snap_hit = {"kind": "episode", "id": "9", "score": 0.5, "label": "x", "snippet": "x"}
-        with mock.patch.object(rp, "_snapshot_search_hits", return_value=[snap_hit]), \
-                mock.patch("khipu.embed.hybrid_search") as m_hub:
+        with mock.patch.object(
+            rp, "_snapshot_search_hits",
+            return_value={"hits": [snap_hit], "legs": ["lexical", "cosine"], "degraded": None},
+        ), mock.patch("khipu.embed.hybrid_search") as m_hub:
             out = rp._search_hits("a topical prompt", cwd=None)
         m_hub.assert_not_called()
-        self.assertEqual(out[0]["id"], "9")
+        self.assertEqual(out["hits"][0]["id"], "9")
+        self.assertEqual(out["legs"], ["lexical", "cosine"])
 
 
 class _FakeConnCtx:
@@ -428,13 +445,17 @@ class BudgetedHubSearchTest(unittest.TestCase):
 
     def test_search_hits_budgeted_uses_the_snapshot_without_touching_the_hub(self):
         snap_hit = {"kind": "episode", "id": "9", "score": 0.5, "label": "x", "snippet": "x"}
-        with mock.patch.object(rp, "_snapshot_search_hits", return_value=[snap_hit]), \
-                mock.patch.object(rp, "_hub_hits_budgeted") as m_hub:
+        with mock.patch.object(
+            rp, "_snapshot_search_hits",
+            return_value={"hits": [snap_hit], "legs": ["lexical", "cosine"], "degraded": None},
+        ), mock.patch.object(rp, "_hub_hits_budgeted") as m_hub:
             out = rp._search_hits_budgeted(
                 "gateway budget query", cwd=None, budget_ms=600, limit=rp.TOP_N,
             )
         m_hub.assert_not_called()
-        self.assertEqual(out["legs"], ["snapshot"])
+        # Phase 0 session C: the real sub-legs pass through, not a single
+        # opaque "snapshot" placeholder.
+        self.assertEqual(out["legs"], ["lexical", "cosine"])
         self.assertEqual(out["hits"][0]["id"], "9")
 
 
@@ -478,8 +499,10 @@ class PriorWorkBudgetedTest(unittest.TestCase):
 
     def test_omitting_budget_ms_never_adds_the_meta_key(self):
         """The UserPromptSubmit hook path (budget_ms=None, unchanged) must
-        not grow a new key it never asked for."""
-        with mock.patch.object(rp, "_search_hits", return_value=[_hit()]):
+        not grow a new ``prior_work_meta`` key it never asked for — top-level
+        ``legs``/``degraded`` are fine (additive, Phase 0 session C), only
+        the nested budget_ms-gated key is forbidden here."""
+        with mock.patch.object(rp, "_search_hits", return_value=_hits(_hit())):
             out = rp.prior_work_for_prompt("what did we decide about the recall hook")
         self.assertNotIn("prior_work_meta", out)
 
