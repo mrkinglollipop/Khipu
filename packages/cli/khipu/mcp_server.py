@@ -156,6 +156,7 @@ def _default_memory_root() -> Path | None:
 TOOLS: list[dict] = [
     {
         "name": "khipu_search",
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
         "description": (
             "Search Khipu memory. Default mode='hybrid': cosine similarity + "
             "token overlap (over the embedded text) + literal substring match, "
@@ -247,6 +248,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "khipu_get",
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
         "description": (
             "Load a search hit by id. Episodes: full summary, decisions, "
             "preferences, topics (not the capture raw blob). Topics: full "
@@ -275,6 +277,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "khipu_graph",
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
         "description": (
             "Neighborhood of a graph node id (undirected). hops=1 returns "
             "direct edges; hops>=2 walks a recursive undirected CTE ordered "
@@ -303,6 +306,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "khipu_status",
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
         "description": (
             "Khipu hub status: PG table counts, latest episode ts, true "
             "mirror lag, recent captures. include_drift=true adds the "
@@ -373,6 +377,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "khipu_capture",
+        "annotations": {"readOnlyHint": False},
         "description": (
             "Remember this session in Khipu — works everywhere now (K1). Cloud / "
             "no capture hook: CALL THIS when you finish a substantive piece of "
@@ -420,6 +425,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "khipu_owed",
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
         "description": (
             "List open (or closed/stale) commitments — followups, blockers, "
             "questions, promises captured as open_loops and not yet closed by "
@@ -441,6 +447,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "khipu_owed_update",
+        "annotations": {"readOnlyHint": False, "idempotentHint": True},
         "description": (
             "Close, reopen or snooze one commitment by id (ids come from "
             "khipu_owed). Close it when the work is done or the question is "
@@ -460,6 +467,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "khipu_forget",
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
         "description": (
             "Forget one episode completely: the row is tombstoned, its vectors "
             "and the commitments it opened go with it, and its line leaves the "
@@ -472,6 +480,79 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {"id": {"type": "integer", "description": "Episode id (khipu_capture returns it)"}},
             "required": ["id"],
+        },
+    },
+    {
+        "name": "khipu_decisions",
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "description": (
+            "List decisions for a project, with their validity state. Call this "
+            "before answering what was decided or whether a choice is still "
+            "current. status='standing' (default) excludes anything superseded "
+            "or retracted; 'superseded'/'retracted'/'all' widen it; "
+            "'conflicts' instead returns unresolved candidate links (both "
+            "sides' text) that a person or agent has not yet confirmed or "
+            "rejected. Supersede the moment the user reverses or replaces an "
+            "earlier decision (khipu_decisions_update) — never for a mere "
+            "refinement."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Filter to one project"},
+                "status": {
+                    "type": "string",
+                    "description": "standing (default) | superseded | retracted | conflicts | all",
+                },
+                "since": {"type": "string", "description": "ISO date or relative, e.g. '7d', '24h'"},
+                "limit": {"type": "integer", "description": "Default 20, cap 100"},
+            },
+        },
+    },
+    {
+        "name": "khipu_decisions_update",
+        "annotations": {"readOnlyHint": False, "idempotentHint": True},
+        "description": (
+            "Supersede, restore, retract, confirm or reject one decision (ids "
+            "come from khipu_decisions). action='supersede' takes id and "
+            "EITHER by (an existing decision id) OR new_text (the replacement, "
+            "in the user's own words — a new decision row is created for it) "
+            "plus an optional reason; call it the moment the user reverses or "
+            "replaces an earlier decision, never for a mere refinement, and "
+            "give the reason in the user's own words. action='restore' undoes "
+            "a supersession. action='retract' marks a decision wrong outright "
+            "(not merely replaced) — takes id and an optional reason. "
+            "action='confirm'/'reject' resolve a candidate link from "
+            "khipu_decisions(status='conflicts') — take link_id, not id. "
+            "Before migration 0024 this still supersedes (today's column) and "
+            "the result says evidence fields were not recorded."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "supersede | restore | retract | confirm | reject",
+                },
+                "id": {"type": "integer", "description": "Decision id (supersede/restore/retract)"},
+                "link_id": {"type": "integer", "description": "Link id (confirm/reject)"},
+                "by": {"type": "integer", "description": "supersede: an existing decision id"},
+                "new_text": {"type": "string", "description": "supersede: replacement decision text"},
+                "source_kind": {
+                    "type": "string",
+                    "description": "supersede with new_text: user | assistant | tool (default assistant)",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "supersede/retract: the reason, in the user's own words",
+                },
+                "project": {"type": "string", "description": "supersede with new_text: project for the new row"},
+                "session_id": {
+                    "type": "string",
+                    "description": "supersede with new_text: session id for the new row",
+                },
+            },
+            "required": ["action"],
         },
     },
 ]
@@ -562,6 +643,14 @@ def _tool_get(args: dict) -> dict:
             else:
                 row = dict(row)
                 row.pop("raw", None)
+                # Additive (Phase 2A): decision_states (one entry per decision
+                # this episode produced) + validity (current/superseded/
+                # retracted counts). Hub path only — the sqlite replica has no
+                # decisions table, so the stale-fallback payload below stays
+                # exactly as it was.
+                from khipu.decisions import decision_states_for_episode
+
+                row.update(decision_states_for_episode(int(ident)))
                 return {"kind": "episode", **row}
         if inferred == "topic":
             row = topic_detail(ident)
@@ -1030,6 +1119,115 @@ def _tool_forget(args: dict) -> dict:
     return out
 
 
+def _tool_decisions(args: dict) -> dict:
+    """Read half of the decisions tool pair (khipu_decisions). Reachable
+    through stdio and the gateway exactly like khipu_owed — no snapshot
+    fallback (decisions are hub-only, same posture as commitments)."""
+    status = (args.get("status") or "standing").strip().lower()
+    valid_status = ("standing", "superseded", "retracted", "conflicts", "all")
+    if status not in valid_status:
+        raise ValueError(f"status must be one of {valid_status}")
+    limit = min(max(1, int(args.get("limit") or 20)), 100)
+    project = args.get("project") or None
+    since_raw = (args.get("since") or "").strip()
+    since = None
+    if since_raw:
+        from khipu.search_text import parse_time_filter
+
+        since = parse_time_filter(since_raw)
+    _ensure_path()
+    from khipu import decisions as _decisions
+    from khipu.db import connect
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if status == "conflicts":
+                results = _decisions.list_links(cur, state="candidate", project=project, limit=limit)
+            else:
+                results = _decisions.list_decisions(
+                    cur, project=project, since=since, limit=limit, status=status,
+                )
+    return {"status": status, "project": project, "results": results}
+
+
+def _tool_decisions_update(args: dict) -> dict:
+    """Write half of the decisions tool pair. supersede/restore/retract take
+    a decision id; confirm/reject take a link_id (from
+    khipu_decisions(status='conflicts')). Every write here records its
+    source as 'agent'. Every argument is validated before a connection is
+    opened, same posture as ``_tool_owed_update``."""
+    action = (args.get("action") or "").strip().lower()
+    valid_actions = ("supersede", "restore", "retract", "confirm", "reject")
+    if action not in valid_actions:
+        raise ValueError(f"action must be one of {valid_actions}")
+
+    if action in ("confirm", "reject"):
+        try:
+            link_id = int(args.get("link_id"))
+        except (TypeError, ValueError):
+            raise ValueError("link_id must be an integer") from None
+    else:
+        try:
+            decision_id = int(args.get("id"))
+        except (TypeError, ValueError):
+            raise ValueError("id must be an integer decision id") from None
+
+    by = new_id_arg = new_text = None
+    if action == "supersede":
+        by = args.get("by")
+        new_text = args.get("new_text")
+        if (by is None) == (not new_text):
+            raise ValueError("supersede needs exactly one of 'by' or 'new_text'")
+        if by is not None:
+            try:
+                new_id_arg = int(by)
+            except (TypeError, ValueError):
+                raise ValueError("by must be an integer decision id") from None
+
+    _ensure_path()
+    from khipu import decisions as _decisions
+    from khipu.db import connect
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            evidence_ready = _decisions._evidence_ready(cur)
+            degrade_note = (
+                None if evidence_ready
+                else "evidence fields were not recorded (migration 0024 not applied)"
+            )
+            if action in ("confirm", "reject"):
+                out = _decisions.resolve_link(cur, link_id, action, source="agent")
+                conn.commit()
+                return out
+            if action == "restore":
+                ok = _decisions.restore(cur, decision_id)
+                conn.commit()
+                return {"ok": ok, "id": decision_id, "action": "restore"}
+            if action == "retract":
+                ok = _decisions.retract(cur, decision_id, args.get("reason") or None)
+                conn.commit()
+                out = {"ok": ok, "id": decision_id, "action": "retract"}
+                if degrade_note:
+                    out["note"] = degrade_note
+                return out
+            # action == "supersede"
+            reason = args.get("reason") or None
+            if new_id_arg is not None:
+                new_id = new_id_arg
+            else:
+                new_id = _decisions.create_decision(
+                    cur, project=args.get("project") or None, text=str(new_text),
+                    session_id=args.get("session_id") or None,
+                    source_kind=args.get("source_kind") or "assistant",
+                )
+            ok = _decisions.supersede(cur, decision_id, new_id, source="agent", reason=reason)
+            conn.commit()
+            out = {"ok": ok, "id": decision_id, "superseded_by": new_id, "action": "supersede"}
+            if degrade_note:
+                out["note"] = degrade_note
+            return out
+
+
 TOOL_FUNCS = {
     "khipu_search": _tool_search,
     "khipu_get": _tool_get,
@@ -1039,6 +1237,8 @@ TOOL_FUNCS = {
     "khipu_owed": _tool_owed,
     "khipu_owed_update": _tool_owed_update,
     "khipu_forget": _tool_forget,
+    "khipu_decisions": _tool_decisions,
+    "khipu_decisions_update": _tool_decisions_update,
 }
 
 

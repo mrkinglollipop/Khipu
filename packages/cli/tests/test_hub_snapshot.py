@@ -551,6 +551,73 @@ class UpsertEpisodeTest(unittest.TestCase):
         self.assertFalse(out["ok"])
 
 
+class ForgetEpisodeInSnapshotTest(unittest.TestCase):
+    """``forget_episode_in_snapshot`` (Phase 2, session A) — the local-replica
+    half of ``forget.forget_everywhere``: sets ``deleted_at`` and drops the
+    episode's ``memory_embeddings`` rows, under the same refresh lock as
+    ``upsert_episode``/``refresh``."""
+
+    def test_marks_deleted_at_and_removes_the_episode_vectors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            snap = _make_snapshot(data)
+            con = sqlite3.connect(str(snap))
+            _insert_embedding(con, profile="gemini", kind="episode", ref="1",
+                               chunk_text="old alpha episode", vec=[0.1, 0.2])
+            con.commit()
+            con.close()
+            with (
+                mock.patch.object(hs, "snapshot_path", return_value=snap),
+                mock.patch.object(hs, "meta_path", return_value=data / "meta.json"),
+            ):
+                out = hs.forget_episode_in_snapshot(1)
+                self.assertTrue(out["ok"])
+                self.assertTrue(out["updated"])
+                self.assertIsNone(hs.episode_detail_snapshot(1))
+            con = sqlite3.connect(str(snap))
+            row = con.execute("SELECT deleted_at FROM episodes WHERE id = 1").fetchone()
+            self.assertIsNotNone(row[0])
+            emb = con.execute(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE kind = 'episode' AND ref = '1'"
+            ).fetchone()
+            self.assertEqual(emb[0], 0)
+            con.close()
+
+    def test_an_unknown_episode_id_is_a_clean_no_op(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            snap = _make_snapshot(data)
+            with (
+                mock.patch.object(hs, "snapshot_path", return_value=snap),
+                mock.patch.object(hs, "meta_path", return_value=data / "meta.json"),
+            ):
+                out = hs.forget_episode_in_snapshot(999999)
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["updated"])
+
+    def test_missing_snapshot_is_fail_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            with (
+                mock.patch.object(hs, "snapshot_path", return_value=data / "missing.sqlite"),
+                mock.patch.object(hs, "meta_path", return_value=data / "meta.json"),
+            ):
+                out = hs.forget_episode_in_snapshot(1)
+        self.assertFalse(out["ok"])
+
+    def test_refresh_lock_held_elsewhere_is_fail_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            snap = _make_snapshot(data)
+            with (
+                mock.patch.object(hs, "snapshot_path", return_value=snap),
+                mock.patch.object(hs, "meta_path", return_value=data / "meta.json"),
+                mock.patch.object(hs, "_acquire_refresh_lock", return_value=None),
+            ):
+                out = hs.forget_episode_in_snapshot(1)
+        self.assertFalse(out["ok"])
+
+
 class SnapshotFreshnessTest(unittest.TestCase):
     def test_behind_ingest_seconds_computed(self) -> None:
         health = {"ok": True, "refreshed_at": "2026-09-03T12:00:00+00:00"}
@@ -615,6 +682,18 @@ class SnapshotNeverResurrectsAForgottenEpisodeTest(unittest.TestCase):
         ids = {r["id"] for r in results}
         self.assertIn("1", ids)
         self.assertNotIn("2", ids, "a forgotten episode came back from the snapshot")
+
+    def test_episode_detail_snapshot_skips_the_tombstone(self) -> None:
+        """B3 in docs/research/hindsight-plan-review-2026-09-28.md: khipu_get
+        used to return a forgotten episode in full."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            p1, p2 = self._open(data)
+            with p1, p2:
+                live = hs.episode_detail_snapshot(1)
+                gone = hs.episode_detail_snapshot(2)
+        self.assertIsNotNone(live)
+        self.assertIsNone(gone)
 
 
 def _insert_embedding(con, *, profile: str, kind: str, ref: str, chunk_text: str, vec) -> None:

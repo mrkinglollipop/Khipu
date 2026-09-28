@@ -1492,20 +1492,74 @@ def cmd_owed(args: argparse.Namespace) -> int:
 
 
 def cmd_decisions(args: argparse.Namespace) -> int:
-    """O2: `khipu decisions list [--project] [--since]`,
-    `khipu decisions supersede OLD NEW`, `khipu decisions backfill [--dry-run|--apply]`."""
+    """O2 / Phase 2A: `khipu decisions list [--project] [--since] [--standing|
+    --superseded|--retracted|--all]`, `supersede OLD NEW [--reason] [--force]`,
+    `restore ID`, `retract ID --reason`, `links [--state]`, `confirm LINK_ID`,
+    `reject LINK_ID`, `backfill [--dry-run|--apply]`."""
     from khipu.db import connect
     from khipu import decisions as _decisions
 
     sub_cmd = getattr(args, "decisions_cmd", None)
+
     if sub_cmd == "supersede":
         old_id, new_id = int(args.old_id), int(args.new_id)
+        reason = getattr(args, "reason", None)
+        force = bool(getattr(args, "force", False))
         with connect() as conn:
             with conn.cursor() as cur:
-                ok = _decisions.supersede(cur, old_id, new_id)
+                try:
+                    ok = _decisions.supersede(cur, old_id, new_id, reason=reason, force=force)
+                except ValueError as exc:
+                    print(json.dumps({"ok": False, "error": str(exc)}))
+                    return 1
             conn.commit()
         print(json.dumps({"ok": ok, "old_id": old_id, "new_id": new_id}))
         return 0 if ok else 1
+
+    if sub_cmd == "restore":
+        decision_id = int(args.id)
+        with connect() as conn:
+            with conn.cursor() as cur:
+                try:
+                    ok = _decisions.restore(cur, decision_id)
+                except ValueError as exc:
+                    print(json.dumps({"ok": False, "error": str(exc)}))
+                    return 1
+            conn.commit()
+        print(json.dumps({"ok": ok, "id": decision_id}))
+        return 0 if ok else 1
+
+    if sub_cmd == "retract":
+        decision_id = int(args.id)
+        with connect() as conn:
+            with conn.cursor() as cur:
+                ok = _decisions.retract(cur, decision_id, getattr(args, "reason", None))
+            conn.commit()
+        print(json.dumps({"ok": ok, "id": decision_id}))
+        return 0 if ok else 1
+
+    if sub_cmd == "links":
+        with connect() as conn:
+            with conn.cursor() as cur:
+                rows = _decisions.list_links(
+                    cur, state=getattr(args, "state", None) or None,
+                    project=getattr(args, "project", None),
+                )
+        print(json.dumps(rows, indent=2, default=str))
+        return 0
+
+    if sub_cmd in ("confirm", "reject"):
+        link_id = int(args.link_id)
+        with connect() as conn:
+            with conn.cursor() as cur:
+                try:
+                    out = _decisions.resolve_link(cur, link_id, sub_cmd)
+                except ValueError as exc:
+                    print(json.dumps({"ok": False, "error": str(exc)}))
+                    return 1
+            conn.commit()
+        print(json.dumps(out, indent=2, default=str))
+        return 0 if out.get("ok") else 1
 
     if sub_cmd == "backfill":
         apply = bool(getattr(args, "apply", False))
@@ -1530,11 +1584,20 @@ def cmd_decisions(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(json.dumps({"ok": False, "error": f"--since: {exc}"}))
             return 2
+    status = None
+    if getattr(args, "standing", False):
+        status = "standing"
+    elif getattr(args, "superseded", False):
+        status = "superseded"
+    elif getattr(args, "retracted", False):
+        status = "retracted"
+    elif getattr(args, "all", False):
+        status = "all"
     with connect() as conn:
         with conn.cursor() as cur:
             rows = _decisions.list_decisions(
                 cur, project=getattr(args, "project", None), since=since_dt,
-                limit=int(getattr(args, "limit", None) or 50),
+                limit=int(getattr(args, "limit", None) or 50), status=status,
             )
     print(json.dumps(rows, indent=2, default=str))
     return 0
@@ -3370,15 +3433,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     owed.set_defaults(func=cmd_owed)
 
-    dec = sub.add_parser("decisions", help="Decisions registry: list / supersede / backfill (O2)")
+    dec = sub.add_parser(
+        "decisions", help="Decisions registry: list / supersede / restore / retract / links (O2, Phase 2A)"
+    )
     dec_sub = dec.add_subparsers(dest="decisions_cmd", required=True)
     dec_list = dec_sub.add_parser("list", help="List decisions")
     dec_list.add_argument("--project", default=None)
     dec_list.add_argument("--since", default=None, help="ISO date or a window (7d, 24h)")
     dec_list.add_argument("--limit", type=int, default=50)
+    dec_list_status = dec_list.add_mutually_exclusive_group()
+    dec_list_status.add_argument("--standing", action="store_true", help="Exclude superseded and retracted")
+    dec_list_status.add_argument("--superseded", action="store_true", help="Superseded only")
+    dec_list_status.add_argument("--retracted", action="store_true", help="Retracted only")
+    dec_list_status.add_argument("--all", action="store_true", help="Every row (default)")
     dec_sup = dec_sub.add_parser("supersede", help="Mark OLD decision superseded by NEW")
     dec_sup.add_argument("old_id", type=int)
     dec_sup.add_argument("new_id", type=int)
+    dec_sup.add_argument("--reason", default=None, help="Why, in the user's own words")
+    dec_sup.add_argument(
+        "--force", action="store_true",
+        help="Allow superseding across different projects",
+    )
+    dec_restore = dec_sub.add_parser("restore", help="Undo a supersession")
+    dec_restore.add_argument("id", type=int)
+    dec_retract = dec_sub.add_parser("retract", help="Mark a decision wrong outright (not merely replaced)")
+    dec_retract.add_argument("id", type=int)
+    dec_retract.add_argument("--reason", default=None)
+    dec_links = dec_sub.add_parser("links", help="List supersede/conflict candidate links")
+    dec_links.add_argument("--project", default=None)
+    dec_links.add_argument(
+        "--state", default=None,
+        help="candidate | applied | rejected | restored (omit for every state)",
+    )
+    dec_confirm = dec_sub.add_parser("confirm", help="Confirm a candidate link, applying it")
+    dec_confirm.add_argument("link_id", type=int)
+    dec_reject = dec_sub.add_parser("reject", help="Reject a candidate link")
+    dec_reject.add_argument("link_id", type=int)
     dec_bf = dec_sub.add_parser(
         "backfill", help="Backfill the decisions table from existing episodes.decisions"
     )

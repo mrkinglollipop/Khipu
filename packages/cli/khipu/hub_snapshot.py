@@ -737,6 +737,44 @@ def upsert_embeddings(embedding_rows: Sequence[Mapping[str, Any]]) -> dict[str, 
         _release_refresh_lock(lock)
 
 
+def forget_episode_in_snapshot(episode_id: int) -> dict[str, Any]:
+    """Mark one episode forgotten in the local sqlite replica too (Phase 2,
+    session A — ``forget.forget_everywhere``'s replica half): sets
+    ``episodes.deleted_at`` and removes its ``memory_embeddings`` rows, under
+    the same refresh lock as ``refresh()``/``upsert_episode()`` so a full
+    dump and this incremental tombstone can never interleave.
+
+    Fail-open, never a raise: the hub write (``forget.forget_episode``) is
+    already durable by the time this runs, so a missing snapshot or a dump
+    in progress just means the replica catches up at the next refresh."""
+    path = snapshot_path()
+    if not path.is_file():
+        return {"ok": False, "error": "hub snapshot missing"}
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
+    try:
+        con = sqlite3.connect(str(path))
+        try:
+            cur = con.execute(
+                "UPDATE episodes SET deleted_at = ? WHERE id = ?",
+                (_utcnow_iso(), episode_id),
+            )
+            updated = cur.rowcount
+            con.execute(
+                "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ?",
+                (str(episode_id),),
+            )
+            con.commit()
+        finally:
+            con.close()
+        return {"ok": True, "episode_id": episode_id, "updated": bool(updated)}
+    except Exception as exc:  # noqa: BLE001 — the hub write already succeeded
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        _release_refresh_lock(lock)
+
+
 def maybe_refresh(
     *, connect_timeout: int = REFRESH_CONNECT_TIMEOUT_S, force: bool = False
 ) -> dict[str, Any] | None:
@@ -1321,12 +1359,16 @@ def graph_neighbors_snapshot(node_id: str, hops: int, limit: int) -> dict[str, A
 
 
 def episode_detail_snapshot(episode_id: int) -> dict[str, Any] | None:
+    """A forgotten (soft-deleted) episode is not found here (B3 in
+    docs/research/hindsight-plan-review-2026-09-28.md), same as the hub path
+    (``activity.episode_detail``) — the replica's ``episodes`` schema always
+    carries ``deleted_at`` (``_create_schema``), so no gating is needed here."""
     con = open_snapshot()
     row = con.execute(
         """
         SELECT id, ts, ingested_at, session_id, scope, summary,
                topics, people, decisions, preferences, edges, raw
-        FROM episodes WHERE id = ?
+        FROM episodes WHERE id = ? AND deleted_at IS NULL
         """,
         (episode_id,),
     ).fetchone()

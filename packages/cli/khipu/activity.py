@@ -59,18 +59,24 @@ def recent_episodes(*, limit: int = 40) -> list[dict]:
 
 
 def episode_detail(episode_id: int) -> dict | None:
+    """A forgotten (soft-deleted) episode is not found here (B3 in
+    docs/research/hindsight-plan-review-2026-09-28.md: this used to return a
+    forgotten episode in full), gated on ``episodes.deleted_at`` being
+    present so a pre-migration hub keeps its old behavior instead of every
+    lookup failing."""
     with connect() as conn:
         with conn.cursor() as cur:
             from khipu.db import has_columns
 
             has_verbatim = has_columns(cur, "episodes", "verbatim")
             verbatim_col = "verbatim" if has_verbatim else "NULL::jsonb AS verbatim"
+            live_clause = "AND deleted_at IS NULL " if has_columns(cur, "episodes", "deleted_at") else ""
             cur.execute(
                 f"""
                 SELECT id, ts, ingested_at, session_id, scope, summary,
                        topics, people, decisions, preferences, edges, raw, {verbatim_col}
                 FROM episodes
-                WHERE id = %s
+                WHERE id = %s {live_clause}
                 """,
                 (episode_id,),
             )

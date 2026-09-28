@@ -70,6 +70,19 @@ class EpisodeDetailTest(unittest.TestCase):
         self.assertEqual(out["raw"], {"r": 2})
         self.assertEqual(out["verbatim"], {"errors": ["boom"]})
 
+    def test_the_query_excludes_a_forgotten_episode(self):
+        """B3 in docs/research/hindsight-plan-review-2026-09-28.md:
+        episode_detail used to return a forgotten episode in full —
+        FakeCursor's episodes_columns already carries deleted_at, so the
+        gate is live for this test."""
+        row = (1, None, None, "s", "repo", "sum", [], [], [], [], [], {},
+               None)
+        cur = FakeCursor([[row]])
+        with mock.patch.object(activity, "connect", return_value=FakeConn(cur)):
+            activity.episode_detail(1)
+        episode_query = next(s for s in cur.statements if s.startswith("SELECT id, ts, ingested_at"))
+        self.assertIn("deleted_at IS NULL", episode_query)
+
 
 class TopicDetailTest(unittest.TestCase):
     def test_a_missing_slug_is_none(self):

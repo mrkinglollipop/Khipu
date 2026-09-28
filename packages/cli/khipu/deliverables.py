@@ -81,12 +81,34 @@ def insert_deliverables_from_episode(cur, payload: dict[str, Any], episode_id: i
     return inserted
 
 
+def _not_forgotten_clause(cur) -> str | None:
+    """Same posture as ``khipu.decisions._not_forgotten_clause`` (duplicated,
+    not imported — each module owns its own readiness/exclusion checks):
+    None when ``episodes.deleted_at`` does not exist yet, so a pre-migration
+    hub adds no clause at all. A deliverable with no episode_id is never
+    excluded."""
+    try:
+        from khipu.db import has_columns
+
+        if not has_columns(cur, "episodes", "deleted_at"):
+            return None
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return None
+    return (
+        "(deliverables.episode_id IS NULL OR NOT EXISTS ("
+        "SELECT 1 FROM episodes e WHERE e.id = deliverables.episode_id "
+        "AND e.deleted_at IS NOT NULL))"
+    )
+
+
 def recent_deliverables(cur, *, project: str, limit: int = 200) -> list[dict[str, Any]]:
     if not project or not _deliverables_ready(cur):
         return []
+    forgotten_clause = _not_forgotten_clause(cur)
+    extra = f" AND {forgotten_clause}" if forgotten_clause else ""
     cur.execute(
-        "SELECT id, project, kind, path, url, title, episode_id, created_at "
-        "FROM deliverables WHERE project = %s ORDER BY created_at DESC LIMIT %s",
+        f"SELECT id, project, kind, path, url, title, episode_id, created_at "
+        f"FROM deliverables WHERE project = %s{extra} ORDER BY created_at DESC LIMIT %s",
         (project, limit),
     )
     cols = ("id", "project", "kind", "path", "url", "title", "episode_id", "created_at")

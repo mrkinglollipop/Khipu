@@ -56,6 +56,10 @@ _CAPABILITIES = (
     "prior_work.budget",
     "owed",
     "forget",
+    "forget.cascade",
+    "decisions.tools",
+    "decisions.evidence",
+    "tools.annotations",
     "launchers.read_only",
 )
 

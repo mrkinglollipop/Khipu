@@ -8,9 +8,7 @@ dedup falls back to the pure-Python Jaccard path).
 """
 from __future__ import annotations
 
-import os
 import unittest
-from unittest import mock
 
 from khipu import commitments as co
 from khipu import decisions as de
@@ -281,6 +279,16 @@ class _DecisionsCursor:
                     "session_id", "superseded_by", "created_at")
             self._result = [tuple(r[c] for c in cols) for r in out]
             return
+        if s.startswith("SELECT id, project, superseded_by FROM decisions WHERE id"):
+            (decision_id,) = params
+            r = self.rows.get(decision_id)
+            self._result = [(r["id"], r["project"], r["superseded_by"])] if r else []
+            return
+        if s.startswith("SELECT superseded_by FROM decisions WHERE id"):
+            (decision_id,) = params
+            r = self.rows.get(decision_id)
+            self._result = [(r["superseded_by"],)] if r else []
+            return
         if s.startswith("UPDATE decisions SET superseded_by"):
             new_id, old_id = params
             r = self.rows.get(old_id)
@@ -397,7 +405,7 @@ class DecisionsListAndSupersedeTest(unittest.TestCase):
                   "decisions": ["Use Apache 2.0"]}, 1,
         )
         de.insert_decisions_from_episode(
-            cur, {"project": "acme/other", "ts": "2026-09-14T10:00:00+00:00",
+            cur, {"project": "acme/widget", "ts": "2026-09-14T10:00:00+00:00",
                   "decisions": ["Use AGPL-3.0 + CLA"]}, 2,
         )
         old_id = next(r["id"] for r in cur.rows.values() if r["text"] == "Use Apache 2.0")
@@ -406,6 +414,27 @@ class DecisionsListAndSupersedeTest(unittest.TestCase):
         self.assertEqual(cur.rows[old_id]["superseded_by"], new_id)
         # a second call is a no-op (already superseded), not an error
         self.assertFalse(de.supersede(cur, old_id, new_id))
+
+    def test_supersede_across_projects_needs_force(self):
+        """Phase 2A: cross-project supersession is refused by default
+        (Evidence rule #3, "supersession requires matching scope") — `force`
+        opts back into the old, unrestricted behavior."""
+        cur = _DecisionsCursor()
+        de.insert_decisions_from_episode(
+            cur, {"project": "acme/widget", "ts": "2026-09-01T10:00:00+00:00",
+                  "decisions": ["Use Apache 2.0"]}, 1,
+        )
+        de.insert_decisions_from_episode(
+            cur, {"project": "acme/other", "ts": "2026-09-14T10:00:00+00:00",
+                  "decisions": ["Use AGPL-3.0 + CLA"]}, 2,
+        )
+        old_id = next(r["id"] for r in cur.rows.values() if r["text"] == "Use Apache 2.0")
+        new_id = next(r["id"] for r in cur.rows.values() if r["text"] == "Use AGPL-3.0 + CLA")
+        with self.assertRaises(ValueError):
+            de.supersede(cur, old_id, new_id)
+        self.assertIsNone(cur.rows[old_id]["superseded_by"])
+        self.assertTrue(de.supersede(cur, old_id, new_id, force=True))
+        self.assertEqual(cur.rows[old_id]["superseded_by"], new_id)
 
     def test_list_decisions_can_exclude_superseded(self):
         cur = _DecisionsCursor()
@@ -484,8 +513,8 @@ class DecisionsBackfillTest(unittest.TestCase):
 
 # ---- O4: deliverables index -------------------------------------------------
 
-from khipu import extract as _extract
-from khipu import deliverables as dl
+from khipu import extract as _extract  # noqa: E402
+from khipu import deliverables as dl  # noqa: E402
 
 
 class ExtractDeliverablesTest(unittest.TestCase):

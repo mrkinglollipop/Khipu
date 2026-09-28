@@ -209,9 +209,8 @@ def test_a_recapture_from_a_different_harness_dedups_not_duplicates():
     assert row["seen_count"] == 2
 
 
-# ---- 15. source deletion (xfail: forgetting not yet complete) --------------
+# ---- 15. source deletion ----------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="Phase 2A")
 def test_a_forgotten_episode_is_not_returned_by_any_reader(tmp_path):
     with corpus.installed_corpus(tmp_path) as handle:
         deleted = handle.by_id(15)
