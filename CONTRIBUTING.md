@@ -65,7 +65,7 @@ the bar for a change is a bit higher than the code size suggests.
 **Run the checks.** All three must pass:
 
 ```bash
-PYTHONPATH="packages/cli:.python_libs" python3.11 -m unittest discover -s packages/cli/tests -q
+cd packages/cli && PYTHONPATH="$PWD:$PWD/../../.python_libs" python3.11 -m pytest -q
 ```
 
 ```bash
@@ -75,6 +75,16 @@ cd apps/desktop/src-tauri && cargo test
 ```bash
 ruff check packages/cli
 ```
+
+The suite is **hermetic by default**: before anything imports `khipu`,
+`packages/cli/tests/conftest.py` points `HOME` at a throwaway temporary
+directory and clears every Khipu/Alzy credential and identity variable from
+the environment, so a normal run never touches your real hooks, Keychain, or
+configured hub — even the read-only ones (`status`, `verify`, `doctor`) used
+to re-point live hook launchers just by being asked for their path. Set
+`KHIPU_LIVE_TESTS=1` to opt into the tests that write and delete their own
+probe rows on your configured hub and call the real embedding API — do that
+deliberately, not as your default way of running the suite.
 
 **Never commit** credentials, connection strings, certificates, private keys,
 `.env` files, or anything under a personal path. The test suite uses obvious

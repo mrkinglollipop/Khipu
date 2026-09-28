@@ -199,7 +199,15 @@ class AegisPackTest(_TempHomeCase):
         self.assertNotIn("khipu-pack", (self.home / ".grok" / "config.toml").read_text())
 
 
-class ProbeTest(unittest.TestCase):
+class ProbeTest(_TempHomeCase):
+    def setUp(self):
+        super().setUp()
+        # _shim() is read-only outside install() now (B1): these probes exec
+        # the shim through the shell, so a real space-free link must exist
+        # first, same as any other harness would get from a real install.
+        (self.home / ".claude").mkdir()
+        integ.install("claude_code")
+
     def test_hook_probe_real_binary_exits_zero(self):
         """The shipped khipu-stop-hook must never block a session: exit 0 always,
         even here where PG may or may not be reachable."""
@@ -296,7 +304,7 @@ class ProbePromptRecallSnapshotTest(unittest.TestCase):
         self.assertNotIn("khipu-verify", seen_session_ids)
 
 
-class AegisIsolationTest(unittest.TestCase):
+class AegisIsolationTest(_TempHomeCase):
     """Aegis is its own harness (maintainer, 2026-08-17). Exactly ONE Khipu script may
     run there — khipu-aegis-capture, via the Aegis pack's KHIPU_HARNESS=aegis
     mark. The Stop hook and the recall hook must refuse under Aegis's runner env
@@ -346,6 +354,10 @@ class AegisIsolationTest(unittest.TestCase):
         import os
         import subprocess
 
+        # _shim() is read-only outside install() now (B1): a real link must
+        # exist before recall_hook_cursor() returns something the shell can run.
+        (self.home / ".claude").mkdir()
+        integ.install("claude_code")
         cmd = integ.recall_hook_cursor()
         env = {k: v for k, v in os.environ.items() if k not in ("GROK_HOOK_EVENT", "GROK_HOOK_NAME")}
         env["KHIPU_HARNESS"] = "aegis"
@@ -389,6 +401,11 @@ class AegisIsolationTest(unittest.TestCase):
             self.assertIn("/.grok/", str(ac.khipu_home()))
 
     def test_verify_isolation_probe(self):
+        # _shim() is read-only outside install() now (B1): a real link must
+        # exist before aegis_capture_hook() returns something the shell can run.
+        (self.home / ".grok").mkdir()
+        integ.AEGIS_TOML.write_text('model = "grok"\n')
+        integ.install("aegis")
         # The probe targets the hook Aegis actually runs (the capture hook).
         r = integ._probe_aegis_isolation(integ.aegis_capture_hook())
         self.assertTrue(r["ok"], r)
@@ -409,6 +426,57 @@ class ShimRepointTest(_TempHomeCase):
         self.assertNotIn(" ", cmds[0])
         self.assertTrue((self.home / ".config" / "khipu" / "bin" / "khipu-stop-hook").is_symlink())
         self.assertEqual(integ.install("claude_code")["changes"], [])  # idempotent after
+
+
+class ShimReadOnlyTest(_TempHomeCase):
+    """B1: _shim() must never create, delete or re-point a launcher symlink
+    outside an explicit install() call — status/verify/doctor/every probe are
+    read-only. See _installing()'s docstring in khipu/integrations.py."""
+
+    def test_status_does_not_touch_a_link_pointing_elsewhere(self):
+        (self.home / ".claude").mkdir()
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        shim_dir.mkdir(parents=True)
+        mcp_link = shim_dir / "khipu-mcp"
+        stop_link = shim_dir / "khipu-stop-hook"
+        # Both point somewhere that is NOT this repo's real bin script — e.g. a
+        # worktree removed since install, or a plain stale target (B5-shaped).
+        mcp_link.symlink_to(self.home / "nowhere" / "khipu-mcp")
+        stop_link.symlink_to(self.home / "nowhere" / "khipu-stop-hook")
+        (self.home / ".claude.json").write_text(json.dumps(
+            {"mcpServers": {"khipu": {"command": str(mcp_link)}}}))
+        (self.home / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": str(stop_link), "timeout": 20}]}],
+            "PreCompact": [{"hooks": [{"type": "command", "command": str(stop_link), "timeout": 20}]}],
+        }}))
+        st = integ.status("claude_code")
+        # The config names the link path, so status reports the pack installed —
+        # it must not need the link's TARGET to be correct to see that.
+        self.assertTrue(st["mcp"])
+        self.assertTrue(st["hook_stop"] and st["hook_precompact"])
+        self.assertTrue(st["installed"])
+        # And it must not have touched either link while checking.
+        self.assertEqual(os.readlink(mcp_link), str(self.home / "nowhere" / "khipu-mcp"))
+        self.assertEqual(os.readlink(stop_link), str(self.home / "nowhere" / "khipu-stop-hook"))
+
+    def test_install_repoints_a_link_pointing_elsewhere(self):
+        (self.home / ".claude").mkdir()
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        shim_dir.mkdir(parents=True)
+        link = shim_dir / "khipu-mcp"
+        link.symlink_to(self.home / "nowhere" / "khipu-mcp")
+        (self.home / ".claude.json").write_text("{}")
+        integ.install("claude_code")
+        self.assertEqual(Path(os.readlink(link)), integ._bin_script("khipu-mcp"))
+
+    def test_fresh_machine_status_reports_not_installed_and_creates_nothing(self):
+        (self.home / ".claude").mkdir()
+        (self.home / ".claude.json").write_text("{}")
+        shim_dir = self.home / ".config" / "khipu" / "bin"
+        st = integ.status("claude_code")
+        self.assertFalse(st["installed"])
+        self.assertFalse(st["mcp"])
+        self.assertFalse(shim_dir.exists())  # status created no link, no directory
 
 
 if __name__ == "__main__":
@@ -473,11 +541,17 @@ class RecallRuleTest(_TempHomeCase):
         self.assertFalse(integ.status("cursor")["hook_sessionstart"])
 
     def test_recall_probe_real_hook(self):
+        # _shim() is read-only outside install() now (B1): a real link must
+        # exist before recall_hook() returns something the shell can run.
+        (self.home / ".claude").mkdir()
+        integ.install("claude_code")
         r = integ._probe_recall(integ.recall_hook())
         self.assertTrue(r["ok"], r)
         self.assertGreater(r["chars"], 200)
 
     def test_recall_probe_cursor_shape(self):
+        (self.home / ".claude").mkdir()
+        integ.install("claude_code")
         r = integ._probe_recall(integ.recall_hook_cursor())
         self.assertTrue(r["ok"], r)
         self.assertGreater(r["chars"], 200)

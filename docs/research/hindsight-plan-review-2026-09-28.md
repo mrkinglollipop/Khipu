@@ -53,6 +53,8 @@ Status of the [handoff](../plans/2026-09-27-fable-review-handoff.md): its "revie
 16. The 11 baseline failures are stale tests, recorded since 14 September. One of them, the replica's `since` filter test, uses fixed dates that have aged out and sits inside the code that time interpretation will change.
 17. Recapture contamination is controlled in practice: no production episode carries injected recall text in its verbatim tier, and no Aegis transcript contains the injected heading. The remaining path, an assistant restating recalled memory in its own words, stays an acceptance case.
 18. Search results are verbose (paths and neighbours on every topic row). An optional compact form is recommended, not scheduled.
+19. Cursor still cannot receive per-prompt context. Checked on 28 September against Cursor's hooks documentation: `beforeSubmitPrompt` returns only `continue` and `user_message`. A report on Cursor's forum says `sessionStart`'s `additional_context` is not injected in practice; the Cursor session-start row is re-verified in a real session in Phase 5 rather than assumed from the 15 September acceptance.
+20. Status, verify and doctor re-point the live hook launchers. `integrations._shim` re-points a launcher link whenever its target differs from the running code's own copy, and the read-only operations call it. Any command run from another checkout, or from the desktop bundle, silently changes which code the live hooks execute. Launcher resolution becomes read-only outside an install (Phase 0, session A).
 
 **Hindsight capabilities the comparison did not cover.**
 
