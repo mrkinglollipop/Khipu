@@ -1,3 +1,6 @@
+# --bypass-harness (sonnet lane) — authored directly by the dispatched
+# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
+# agents"); there is no further agent to route this to.
 """Per-harness native packs — the engine under the Integrations pane (P3 step 4).
 
 Scope locked 2026-08-17 (agent-integration note § "Integrations pane"): one
@@ -53,6 +56,7 @@ root exists; an undetected harness is reported, not errored.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -92,19 +96,62 @@ def _bin_script(name: str) -> Path:
     return _root() / "packages" / "cli" / "bin" / name
 
 
+_INSTALL_DEPTH = 0
+
+
+@contextlib.contextmanager
+def _installing():
+    """The only context in which ``_shim()`` may create, delete or re-point a
+    launcher symlink. Entered exclusively by ``install()``, for the four LOCAL
+    harness packs (claude_code, cursor, aegis, codex) — never by status,
+    verify, doctor, uninstall or any probe.
+
+    Finding B1 (docs/research/hindsight-plan-review-2026-09-28.md): before
+    this gate, ``_shim()`` re-pointed the real ~/.config/khipu/bin symlinks
+    on EVERY call, including from read-only paths — so running the test
+    suite, or ``khipu doctor``/``khipu integrations verify`` from a
+    throwaway checkout, silently re-pointed the live hook launchers every
+    real harness session runs through at that checkout. Counted with a
+    depth (not a bare bool) so a nested entry — e.g. a future install path
+    that calls another install helper — cannot early-exit the outer one.
+    """
+    global _INSTALL_DEPTH
+    _INSTALL_DEPTH += 1
+    try:
+        yield
+    finally:
+        _INSTALL_DEPTH -= 1
+
+
+def _is_installing() -> bool:
+    return _INSTALL_DEPTH > 0
+
+
 def _shim(name: str) -> str:
-    """Return a SPACE-FREE, Khipu-owned path for a bin script, creating or
-    re-pointing the symlink as needed.
+    """Return a SPACE-FREE, Khipu-owned path for a bin script.
+
+    Read-only by default: outside ``_installing()`` this NEVER creates,
+    deletes or re-points the ~/.config/khipu/bin symlink. It returns the
+    link's current path whenever a link of that name exists — whatever it
+    currently points at, even if that is stale or elsewhere — and the raw
+    repo script path when no link exists yet. Only a call made while
+    ``_installing()`` is active may create or re-point the link; see its
+    docstring for why (B1/B5).
 
     The repo may live under a path with spaces; every harness runs a
     hook command through ``sh -c``, so the raw path splits at the space and the
     hook dies with ``/bin/sh: /Volumes/Cloud: No such file or directory`` (found
     2026-08-17 on a real PreCompact — the probes had exec'd the path directly and
     missed it). A symlink under ~/.config/khipu/bin works whether the harness
-    uses a shell or a direct exec, so it is what every pack references.
+    uses a shell or a direct exec, so it is what every pack references once an
+    install has created it.
     """
     target = _bin_script(name)
     link = _shim_dir() / name
+    if not _is_installing():
+        if link.is_symlink() or link.exists():
+            return str(link)
+        return str(target)
     try:
         if link.is_symlink() and os.readlink(link) == str(target):
             return str(link)
@@ -1695,11 +1742,16 @@ def _guarded(harness: str, fn, *args):
 
 
 def install(harness: str, *, dry_run: bool = False, project: str | None = None) -> dict:
-    if harness == "cursor":
-        return _guarded(harness, _cursor_install, dry_run, project)
     if harness == "grok_bot":
+        # grok_bot has no local shim (gateway/URL-based pack) — never enters
+        # _installing(), matching "nothing else" in _installing()'s docstring.
         return _guarded(harness, _grok_bot_install, dry_run, project)
-    return _guarded(harness, _INSTALL[harness], dry_run)
+    # Only the four LOCAL harness installs may create or re-point a launcher
+    # symlink (B1) — this is the one place _installing() is entered.
+    with _installing():
+        if harness == "cursor":
+            return _guarded(harness, _cursor_install, dry_run, project)
+        return _guarded(harness, _INSTALL[harness], dry_run)
 
 
 def uninstall(harness: str, *, dry_run: bool = False, project: str | None = None) -> dict:
