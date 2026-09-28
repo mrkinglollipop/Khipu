@@ -13,6 +13,7 @@ An optional isolated Hindsight comparison is useful experimental work. Replacing
 **In scope.**
 
 - Make the test suite hermetic before anything else changes: a temporary home directory, Keychain lookups off, connection-string and key variables cleared, live tests only on explicit opt-in. `pytest` is the oracle; the baseline is the 11 named failures and the gate is no new failure.
+- Restore the per-prompt recall lane to its budget before adding anything to it. In production it misses its deadline on 85% of prompts and returns nothing. The fix changes speed and failure behavior only: identical hits whenever both legs finish, keyword-only results marked as degraded when the embedding is late, and a doctor check on the lane's real outcome rate so the failure can never again be silent.
 - Add a capability signal: a real server version and a `capabilities` list on MCP initialize and in the status payload, so a client can test for a feature instead of inferring it.
 - Make forgetting complete: a forgotten episode is not returned by any reader, and forgetting cascades to the decisions and deliverables that episode produced.
 - Give supersession a write path every harness can reach: the existing CLI, an MCP pair (`khipu_decisions` to read, `khipu_decisions_update` to supersede, restore or retract), and conservative detection at capture. Each records its source and reason.
