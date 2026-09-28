@@ -43,7 +43,7 @@ Status of the [handoff](../plans/2026-09-27-fable-review-handoff.md): its "revie
 6. `decisions` has no uniqueness constraint (31 duplicate groups in production). A unique index cannot be added without first resolving them, so it is not added; duplicate handling stays in the application.
 7. The graph has no episode nodes and no persisted episode-to-topic edge, and the one bounded traversal orders alphabetically. A candidate leg needs its own scoring and must use plain joins, not the SQL/PGQ path the code itself describes as unstable.
 8. Hindsight documents a recall collapse (0.97 to 0.40 at 20 results) from boosting one retrieval arm in score space. New legs are fused in rank space with a bounded weight.
-9. Aegis allowlists three Khipu tool names as read-only. A new read tool is prompted for until Aegis adds it.
+9. Aegis's built-in list names three Khipu tools as read-only (`khipu_search`, `khipu_graph`, `khipu_status`). `khipu_get` and `khipu_owed` are read tools it prompts for on every call today, and any new read tool would be too. Aegis treats a server's own MCP annotations as authoritative over that list, and Khipu sends none. Khipu annotates its tools (Phase 2, session A); Aegis's permission code does not change.
 10. Aegis treats an empty `prior_work` as "field unsupported" and runs a second search inside the same two-second budget, which overrides a deliberate abstention. `prior_work_meta` needs a machine-readable outcome.
 11. The desktop app renders no status or validity. New metadata is safe for it and invisible in it. UI work is out of scope.
 12. Gateway tokens are rate-limit labels, not scopes. A new write tool is callable by any valid token, as `khipu_forget` already is.

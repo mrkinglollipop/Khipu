@@ -65,6 +65,8 @@ Both versions ran back to back on the same machine, on a frozen copy of the prod
 
 The in-process benchmark understates the production timeout rate because the hook is a new process per prompt and the machine is often under far heavier load. It measures the change, not the absolute rate.
 
+The new doctor check, run read-only against the live hook log on the afternoon of 28 September while the old code was still the deployed hook: 100 of the last 100 searched prompts had timed out, median 1,209 ms.
+
 ## Production counts used in the review
 
 Read-only queries against the hub on 28 September: 40,409 decision rows, none superseded, none with a rationale; 92 decision rows belonging to forgotten episodes; 31 groups of duplicate decision text; 10,062 live and 68 forgotten episodes; 1,278 topics with 17 distinct status values, 50 of them `superseded` and none with `superseded_by` set; 497 deliverables; 157,539 edges, of which 40,354 are `wiki_link` and 3,934 `lives_in`; migrations applied through `0023`; PostgreSQL 19 beta 3.
