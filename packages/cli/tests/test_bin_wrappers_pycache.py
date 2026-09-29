@@ -23,6 +23,10 @@ BIN_DIR = Path(__file__).resolve().parents[1] / "bin"
 
 PYCACHE_WRAPPERS = ("khipu-stop-hook", "khipu-mcp", "khipu-recall-hook", "khipu-prompt-recall")
 DONTWRITE_WRAPPERS = ("khipu-aegis-capture",)
+# Plain Python scripts run as __main__ with no khipu import (the launcher starts
+# them under `python3 -S -E -B`): nothing of theirs is ever compiled to a .pyc,
+# so there is no bytecode cache to redirect.
+STDLIB_ONLY_SCRIPTS = ("khipu-recall-client.py",)
 
 
 @pytest.mark.parametrize("name", PYCACHE_WRAPPERS)
@@ -47,11 +51,17 @@ def test_sandboxed_wrapper_disables_bytecode_instead(name):
     assert "export PYTHONPYCACHEPREFIX" not in text, name
 
 
+@pytest.mark.parametrize("name", STDLIB_ONLY_SCRIPTS)
+def test_stdlib_only_script_imports_no_khipu(name):
+    text = (BIN_DIR / name).read_text(encoding="utf-8")
+    assert "import khipu" not in text and "from khipu" not in text, name
+
+
 def test_every_wrapper_covered():
     """Guards against a new bin/khipu-* launcher shipping without either
     mechanism — extend PYCACHE_WRAPPERS or DONTWRITE_WRAPPERS above."""
     all_wrappers = {p.name for p in BIN_DIR.iterdir() if p.is_file()}
-    known = set(PYCACHE_WRAPPERS) | set(DONTWRITE_WRAPPERS)
+    known = set(PYCACHE_WRAPPERS) | set(DONTWRITE_WRAPPERS) | set(STDLIB_ONLY_SCRIPTS)
     unaccounted = all_wrappers - known
     # No allowlist. khipu-capture-hook was the last entry and had no reference
     # anywhere in the repo (audit 2026-09-04) — it was deleted rather than

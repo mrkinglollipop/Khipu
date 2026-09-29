@@ -27,7 +27,7 @@ def test_rendered_plist_redirects_bytecode_cache_outside_bundle():
     """Every launchd job exports PYTHONPYCACHEPREFIX so the bundled Python's
     __pycache__ writes never land inside a signed .app (the 0.3.15 "Khipu is
     damaged" incident — see khipu.paths.pycache_dir)."""
-    for job in ("nightly", "monthly", "graph_build", "notes_watch", "queue_drain"):
+    for job in ("nightly", "monthly", "graph_build", "notes_watch", "queue_drain", "recall_daemon"):
         data = plistlib.loads(launchd_gen.render_plist(job))
         env = data["EnvironmentVariables"]
         assert env["PYTHONPYCACHEPREFIX"], job

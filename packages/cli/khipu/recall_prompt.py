@@ -675,23 +675,30 @@ def _fuse_and_annotate(
     return {"hits": fused, "legs": legs, "degraded": degraded, **result_extra}
 
 
-_PROJECT_FOR_CWD: dict[str, str | None] = {}
+_PROJECT_FOR_CWD: dict[str, tuple[str | None, float]] = {}
+# A one-shot hook process never outlives its prompt, so entries only ever span
+# one prompt. The recall service does outlive them, and a directory that gains
+# a remote (or a first commit) must not read as project-less for the life of
+# the service.
+_PROJECT_FOR_CWD_TTL_S = 300.0
 
 
 def _project_for_cwd(cwd: str | None) -> str | None:
-    """The project for a working directory, resolved once per process: the
-    lookup runs git, and one prompt asks for it more than once."""
+    """The project for a working directory, resolved once per process (or per
+    ``_PROJECT_FOR_CWD_TTL_S`` in a long-lived one): the lookup runs git, and
+    one prompt asks for it more than once."""
     if not cwd:
         return None
-    if cwd in _PROJECT_FOR_CWD:
-        return _PROJECT_FOR_CWD[cwd]
+    cached = _PROJECT_FOR_CWD.get(cwd)
+    if cached is not None and time.monotonic() - cached[1] < _PROJECT_FOR_CWD_TTL_S:
+        return cached[0]
     try:
         from khipu.identity import resolve_repo_root
 
         project = resolve_repo_root(cwd).get("project")
     except Exception:  # noqa: BLE001 — a git failure must not sink recall
         return None
-    _PROJECT_FOR_CWD[cwd] = project
+    _PROJECT_FOR_CWD[cwd] = (project, time.monotonic())
     return project
 
 

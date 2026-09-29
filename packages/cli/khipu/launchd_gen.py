@@ -17,6 +17,7 @@ from khipu.jobs import (
     PLIST_NIGHTLY,
     PLIST_NOTES_WATCH,
     PLIST_QUEUE_DRAIN,
+    PLIST_RECALL_DAEMON,
     _JOB_SPECS,
     _launchagents_dir,
     _log_paths,
@@ -31,7 +32,14 @@ _JOB_TEMPLATE: dict[str, str] = {
     "graph_build": "com.matt.khipu-graph.plist",
     "notes_watch": "com.khipu.notes-watch.plist",
     "queue_drain": "com.khipu.queue-drain.plist",
+    "recall_daemon": "com.khipu.recall-daemon.plist",
 }
+
+# What a fresh install schedules. The recall service is opt-in
+# (`khipu jobs install recall_daemon`): the hook works without it, so a first
+# run must not start a resident process nobody asked for. Once its plist is
+# installed it is refreshed and uninstalled with the rest.
+_DEFAULT_JOBS = tuple(job for job in _JOB_TEMPLATE if job != "recall_daemon")
 
 _LABELS = {
     "nightly": PLIST_NIGHTLY,
@@ -39,6 +47,7 @@ _LABELS = {
     "graph_build": PLIST_GRAPH,
     "notes_watch": PLIST_NOTES_WATCH,
     "queue_drain": PLIST_QUEUE_DRAIN,
+    "recall_daemon": PLIST_RECALL_DAEMON,
 }
 
 
@@ -234,7 +243,7 @@ def uninstall_job(job: str) -> dict[str, Any]:
 
 
 def install_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
-    names = jobs or list(_JOB_TEMPLATE)
+    names = jobs or list(_DEFAULT_JOBS)
     results: list[dict[str, Any]] = []
     for job in names:
         results.append(install_job(job))
@@ -258,7 +267,7 @@ def ensure_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
     untouched. install_scheduled_jobs() alone rewrote all three every time,
     which on a Mac that runs the jobs from a source checkout would have
     silently repointed the nightly at the app bundle (2026-09-05)."""
-    names = jobs or list(_JOB_TEMPLATE)
+    names = jobs or list(_DEFAULT_JOBS)
     out: dict[str, Any] = {"installed": [], "refreshed": [], "external": [], "current": [], "results": []}
     for job in names:
         label = _LABELS.get(job)
@@ -362,7 +371,7 @@ def refresh_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
     """
     present = set(installed_jobs())
     names = [j for j in (jobs or list(_JOB_TEMPLATE)) if j in present]
-    missing = [j for j in (jobs or list(_JOB_TEMPLATE)) if j not in present]
+    missing = [j for j in (jobs or list(_DEFAULT_JOBS)) if j not in present]
     refreshed: list[str] = []
     current: list[str] = []
     external: list[str] = []

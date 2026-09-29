@@ -35,4 +35,19 @@ Read [the scope](../plans/2026-09-27-memory-reasoning-scope.md) first. It requir
 
 **Extraction is noisy with or without the block.** On identical input two runs of today's extraction returned 10 and 0 decisions for one transcript and 5 and 15 for another. That is a property of the existing extraction, not of this work, and it bounds how small a difference any of these comparisons can detect.
 
+**A rejected speed-up: an indexed keyword search.** A trigram index in the replica answered the same `LIKE` patterns as the scan and returned identical results on all 149 real prompts. It was 1.5 times faster at the median (about 160 ms against 240 to 340 ms) and no faster at the 95th percentile (about 560 to 610 ms against 580 to 780 ms), because a common word still matches thousands of rows. It would have added 73 MB to a 266 MB replica and a set of triggers to keep right. Timeouts are a tail problem, so it was not merged.
+
+**Where a prompt's time goes.** Measured on the production replica: the embedding request itself about 300 ms, a fresh TLS connection about 100 ms, reading the key about 60 ms, the project lookup 50 to 150 ms, loading 20,000 vectors from disk for the scan 70 to 250 ms, and the keyword scan 160 to 340 ms beside them. One prompt lands between 750 and 1,000 ms against an internal deadline of 950 ms, before any load on the machine.
+
+**The warm recall service.** A long-lived local process answers the per-prompt hook over a Unix socket, so a prompt no longer pays for a new interpreter, the package imports, a new TLS connection, the key lookup or reloading the vectors. The hook falls back to the one-shot path when the service is not running. Measured through the launcher on 25 distinct prompts per arm, alternating:
+
+| Machine | Path | Hook wall time, median | 90th percentile | Worst |
+|---|---|---|---|---|
+| Load 11 | service | 418 ms | 501 ms | 662 ms |
+| Load 11 | one-shot | 701 ms | 874 ms | 1,031 ms |
+| Load 40 rising to 92 | service | 677 ms | 795 ms | 900 ms |
+| Load 40 rising to 92 | one-shot | 926 ms | 1,032 ms | 1,116 ms |
+
+Both paths named the same memories. What remains is the embedding request itself, about 300 ms.
+
 **What is not covered.** The unseen subjects are far from anything in memory; a prompt on a nearby subject that memory does not hold will still get its nearest neighbours. The blind judge is a model, not the user. Latency was measured on a machine under heavy unrelated load.
