@@ -334,6 +334,31 @@ class SearchSnapshotFilterTest(unittest.TestCase):
         self.assertIn("2", ids)
         self.assertNotIn("1", ids)
 
+    def test_every_token_can_match(self) -> None:
+        # Positional params once bound the first half of the tokens to the
+        # WHERE, so a query matching only on its last token found nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            p1, p2 = self._open(data)
+            with p1, p2:
+                first = hs.search_snapshot("alpha qqzza qqzzb qqzzc qqzzd", 10)
+                last = hs.search_snapshot("qqzza qqzzb qqzzc qqzzd alpha", 10)
+        self.assertTrue(last)
+        self.assertEqual(
+            sorted((r["kind"], r["id"]) for r in first),
+            sorted((r["kind"], r["id"]) for r in last),
+        )
+
+    def test_match_is_case_insensitive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            p1, p2 = self._open(data)
+            with p1, p2:
+                lower = hs.search_snapshot("alpha", 10)
+                upper = hs.search_snapshot("ALPHA", 10)
+        self.assertTrue(lower)
+        self.assertEqual(lower, upper)
+
 
 def _make_identity_snapshot(data: Path) -> Path:
     """fix 7/9: episodes carrying project/session_id/harness, for the
