@@ -2528,9 +2528,11 @@ def cmd_recall(args: argparse.Namespace) -> int:
 
         rerank_arg = getattr(args, "rerank", None)
         if rerank_arg:
-            if path_arg != "explicit" or record_to or compare_to or replay_from:
+            if (path_arg != "explicit" or record_to or compare_to or replay_from
+                    or getattr(args, "relevance_floor", None)):
                 print(json.dumps({"ok": False, "error": "--rerank scores the explicit path only; "
-                                  "it cannot combine with --path, --record, --compare or --replay"}))
+                                  "it cannot combine with --path, --record, --compare, --replay "
+                                  "or --relevance-floor"}))
                 return 2
             try:
                 entries = recall_eval.load_golden(golden_path or recall_eval.default_golden_path())
@@ -2543,6 +2545,31 @@ def cmd_recall(args: argparse.Namespace) -> int:
                       file=sys.stderr)
             print(json.dumps(report, indent=2, default=str))
             return 0
+
+        floor_arg = getattr(args, "relevance_floor", None)
+        if floor_arg:
+            if record_to or compare_to or replay_from:
+                print(json.dumps({"ok": False, "error": "--relevance-floor cannot combine with "
+                                  "--record, --compare or --replay"}))
+                return 2
+            try:
+                entries = recall_eval.load_golden(golden_path or recall_eval.default_golden_path())
+            except (OSError, ValueError) as exc:
+                print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+                return 2
+            paths = recall_eval.ALL_PATHS if path_arg == "all" else (path_arg,)
+            report = recall_eval.run_relevance_eval(
+                entries, paths, floor=(floor_arg == "on"), budget_ms=budget_ms
+            )
+            for path, summary in report["paths"].items():
+                for query in summary.get("removed_positives", []):
+                    print(f"[REMOVED] path={path} {query!r}", file=sys.stderr)
+            print(json.dumps(report, indent=2, default=str))
+            ok = all(
+                s["abstain_correct"] == s["abstain_total"] and not s.get("removed_positives")
+                for s in report["paths"].values()
+            )
+            return 0 if ok else 1
 
         # Legacy fast path: zero new flags touched -> byte-identical to the
         # original W6.3 command. run_eval/eval_one/load_golden are untouched
@@ -4077,6 +4104,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Score the explicit path with the optional reranker switched on or off for this process "
             "only; 'on' scores each entry both ways and reports the expected id's rank with and without"
+        ),
+    )
+    reval.add_argument(
+        "--relevance-floor", dest="relevance_floor", choices=["on", "off"], default=None,
+        help=(
+            "Score the chosen --path(s) with the absolute relevance floor switched on or off for this "
+            "process only; 'on' scores each entry both ways and lists every golden positive the floor removed"
         ),
     )
     reval.add_argument("--sample", type=int, default=None, help="With --replay: cap to N entries")

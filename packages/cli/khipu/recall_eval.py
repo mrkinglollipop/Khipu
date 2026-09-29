@@ -37,6 +37,10 @@ evaluator gap):
 - ``--rerank on|off`` scores the explicit path with the optional reranker
   switch set for this process only; ``on`` scores every entry both ways in the
   one run and reports the expected id's rank with and without the stage.
+- ``--relevance-floor on|off`` scores the chosen ``--path``(s) with the absolute
+  relevance floor switch set for this process only; ``on`` scores every entry
+  both ways and reports abstention correctness per path and each golden
+  positive the floor removed, by query.
 - ``--replay LOG [--sample N] [--seed S]`` builds no-expectation entries from
   a ``query_log.jsonl`` for realistic-traffic record/compare runs; only valid
   together with ``--record`` or ``--compare``.
@@ -565,3 +569,90 @@ def run_rerank_eval(entries: list[dict[str, Any]], *, rerank: bool) -> dict[str,
         })
     return {"rerank": "on" if rerank else "off", "window": RERANK_RANK_WINDOW,
             "summary": summary, "rows": rows}
+
+
+_RELEVANCE_ENV = "KHIPU_FEATURE_RELEVANCE_FLOOR"
+
+
+class _floor_switch:
+    """Force the relevance-floor switch on or off through its environment leg
+    (never config.json) for one block, restoring the prior value after."""
+
+    def __init__(self, on: bool):
+        self._on = on
+        self._prior: str | None = None
+
+    def __enter__(self):
+        import os
+
+        self._prior = os.environ.get(_RELEVANCE_ENV)
+        os.environ[_RELEVANCE_ENV] = "1" if self._on else "0"
+        return self
+
+    def __exit__(self, *exc):
+        import os
+
+        if self._prior is None:
+            os.environ.pop(_RELEVANCE_ENV, None)
+        else:
+            os.environ[_RELEVANCE_ENV] = self._prior
+        return False
+
+
+def run_relevance_eval(
+    entries: list[dict[str, Any]], paths: tuple[str, ...], *, floor: bool,
+    budget_ms: int = DEFAULT_STATUS_BUDGET_MS,
+) -> dict[str, Any]:
+    """Score every entry on every requested path with the relevance floor
+    forced off and, when ``floor`` is True, on too: one run, the same entries
+    both ways. Per path: abstention correctness under the requested setting
+    (and without the floor, for contrast) and ``removed_positives`` — each
+    golden positive the baseline found and the floor lost, by query. That list
+    is the regression; it should be empty."""
+    rows: list[dict[str, Any]] = []
+    by_path: dict[str, list[dict[str, Any]]] = {p: [] for p in paths}
+    for entry in entries:
+        for path in paths:
+            if not _entry_applies(entry, path):
+                continue
+            with _floor_switch(False):
+                base = eval_one_path(entry, path, budget_ms=budget_ms)
+            row: dict[str, Any] = {
+                "query": base["query"], "path": path, "expect_none": base["expect_none"],
+                "got_without": base["got"], "hit_without": base["hit"],
+                "abstain_correct_without": base["abstain_correct"],
+                "got_with": None, "hit_with": None, "abstain_correct_with": None,
+            }
+            if floor:
+                with _floor_switch(True):
+                    staged = eval_one_path(entry, path, budget_ms=budget_ms)
+                row.update({
+                    "got_with": staged["got"], "hit_with": staged["hit"],
+                    "abstain_correct_with": staged["abstain_correct"],
+                })
+            rows.append(row)
+            by_path[path].append(row)
+
+    def _summary(items: list[dict[str, Any]]) -> dict[str, Any]:
+        side = "with" if floor else "without"
+        abstain = [r for r in items if r["expect_none"]]
+        positive = [r for r in items if not r["expect_none"]]
+        out: dict[str, Any] = {
+            "entries": len(items),
+            "abstain_total": len(abstain),
+            "abstain_correct": sum(1 for r in abstain if r[f"abstain_correct_{side}"]),
+            "positives": len(positive),
+            "positives_found": sum(1 for r in positive if r[f"hit_{side}"]),
+        }
+        if floor:
+            out["abstain_correct_without"] = sum(1 for r in abstain if r["abstain_correct_without"])
+            out["removed_positives"] = [
+                r["query"] for r in positive if r["hit_without"] and not r["hit_with"]
+            ]
+        return out
+
+    return {
+        "relevance_floor": "on" if floor else "off",
+        "paths": {p: _summary(by_path[p]) for p in paths},
+        "rows": rows,
+    }

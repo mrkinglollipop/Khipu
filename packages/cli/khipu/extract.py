@@ -413,6 +413,64 @@ def parse_model_json(text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+_TOP_LEVEL_KEYS = ("summary", "topics", "people", "decisions", "preferences", "scope",
+                   "open_loops", "closed_loops")
+
+
+def _detail_block_ends(text: str, start: int):
+    """Offsets where the ``decision_details`` value that begins at ``start``
+    could end, best guess first: the first top-level comma or closing brace
+    (string- and nesting-aware), then the comma before each known sibling key,
+    then the object's last brace. Every guess is checked by re-parsing."""
+    depth, in_str, escaped = 0, False, False
+    for j in range(start, len(text)):
+        ch = text[j]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            if depth == 0:
+                yield j
+                break
+            depth -= 1
+        elif ch == "," and depth == 0:
+            yield j
+            break
+    sibling = re.compile(r',\s*"(?:%s)"\s*:' % "|".join(_TOP_LEVEL_KEYS))
+    for m in sibling.finditer(text, start):
+        yield m.start()
+    last = text.rstrip().rfind("}")
+    if last > start:
+        yield last
+
+
+def _parse_without_decision_details(text: str) -> dict[str, Any] | None:
+    """An answer that fails to parse only because its optional
+    ``decision_details`` block is malformed is still a good answer: cut the
+    block out and parse what is left. None when no cut gives a JSON object,
+    so an answer broken anywhere else still fails as before."""
+    for m in re.finditer(r'"decision_details"\s*:\s*', text):
+        for end in _detail_block_ends(text, m.end()):
+            before = text[: m.start()].rstrip()
+            after = text[end:].lstrip()
+            if after.startswith(","):
+                after = after[1:].lstrip()
+            elif before.endswith(","):
+                before = before[:-1].rstrip()
+            parsed = parse_model_json(f"{before} {after}")
+            if parsed is not None:
+                return parsed
+    return None
+
+
 def _as_open_loops(v: Any) -> list[dict[str, Any]]:
     if not isinstance(v, list):
         return []
@@ -512,6 +570,8 @@ def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
         return None
     raw = _generate(_build_prompt(cwd=cwd, transcript=transcript))
     parsed = parse_model_json(raw)
+    if parsed is None:
+        parsed = _parse_without_decision_details(raw)
     if parsed is None:
         raise RuntimeError(f"extract: model returned non-JSON: {raw[:200]!r}")
     # A model that returns a list here used to become the episode summary via
