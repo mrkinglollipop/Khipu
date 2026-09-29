@@ -74,6 +74,7 @@ _CAPABILITIES = (
     "search.graph_candidates",
     # Phase 3, session B.
     "search.rerank",
+    "replica.deliverables",
 )
 
 

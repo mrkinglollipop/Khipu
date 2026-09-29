@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import struct
 import sys
 import threading
@@ -1107,10 +1108,35 @@ def prior_work_for_prompt(
     return out
 
 
+def _replica_deliverable_line(project: str, tokens: list[str]) -> str | None:
+    """The line from the local replica ("" when nothing matches), or None
+    when the replica cannot answer (stale, missing, an older dump with no
+    ``deliverables`` table, unreadable). Imports neither the Postgres driver
+    nor ``khipu.db``."""
+    from khipu import deliverables as _deliverables
+    from khipu import hub_snapshot
+
+    fresh, _health = hub_snapshot.snapshot_is_fresh()
+    if not fresh:
+        return None
+    try:
+        con = hub_snapshot.open_snapshot()
+    except (FileNotFoundError, sqlite3.Error):
+        return None
+    try:
+        rows = hub_snapshot.recent_deliverables_snapshot(con, project=project)
+    finally:
+        con.close()
+    if rows is None:
+        return None
+    return _deliverables.line_from_rows(rows, tokens) or ""
+
+
 def _deliverable_context_line(tokens: list[str], *, cwd: str | None) -> str:
     """The O4 "You produced …" line for this prompt's tokens, or "". Never
     raises: a resolve/DB failure here degrades to no line, same fail-open
-    posture as every other step in this module."""
+    posture as every other step in this module. The local replica answers
+    when it can; the hub is the fallback for an old or unusable replica."""
     if not tokens or not cwd:
         return ""
     try:
@@ -1119,6 +1145,13 @@ def _deliverable_context_line(tokens: list[str], *, cwd: str | None) -> str:
         project = resolve_repo_root(cwd).get("project")
         if not project:
             return ""
+        try:
+            local = _replica_deliverable_line(project, tokens)
+        except Exception as exc:  # noqa: BLE001 — an unusable replica falls back to the hub
+            _log(f"deliverable replica unusable ({type(exc).__name__}: {exc})")
+            local = None
+        if local is not None:
+            return local
         from khipu.db import connect
         from khipu import deliverables as _deliverables
 

@@ -1163,6 +1163,7 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
         ts = payload.get("ts")
         if not summary or not ts:
             return False
+        deliverable_rows = None
         with connect() as conn:
             with conn.cursor() as cur:
                 profile = _active_profile(cur)
@@ -1183,6 +1184,9 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
                     [("episode", eid, i, c, _md5(c), v)
                      for i, (c, v) in enumerate(zip(chunks, vecs))],
                 )
+                from khipu import deliverables as _deliverables
+
+                deliverable_rows = _deliverables.deliverables_for_episode(cur, int(eid))
             conn.commit()
         _log(f"embed-on-capture ok episode={eid} chunks={len(chunks)} profile={profile}")
         # W2.4: keep the sqlite hub replica current without a full dump, so a
@@ -1223,7 +1227,9 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
                 }
                 for i, (c, v) in enumerate(zip(chunks, vecs))
             ]
-            snap = upsert_episode(episode_row, embedding_rows)
+            snap = upsert_episode(
+                episode_row, embedding_rows, deliverable_rows=deliverable_rows
+            )
             if not snap.get("ok"):
                 _log(f"snapshot upsert skipped: {snap.get('error')}")
         except Exception as exc:  # noqa: BLE001 — fail-open, one log line
