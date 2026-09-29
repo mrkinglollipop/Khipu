@@ -33,9 +33,13 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-import psycopg
+# psycopg is imported where the hub is actually reached: the per-prompt hook
+# reads only the sqlite replica, and the driver's import (200-450 ms on a busy
+# machine) used to land inside that hook's wall-clock limit.
+if TYPE_CHECKING:
+    import psycopg
 
 SNAPSHOT_NAME = "hub_snapshot.sqlite"
 META_NAME = "hub_snapshot.sqlite.meta.json"
@@ -213,6 +217,8 @@ def _log(msg: str) -> None:
 def hub_connection_failed(exc: BaseException) -> bool:
     name = type(exc).__name__
     text = str(exc).lower()
+    import psycopg
+
     if isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError)):
         return True
     if "Operational" in name or "Connection" in name:
@@ -227,6 +233,8 @@ def hub_connection_failed(exc: BaseException) -> bool:
 def try_hub_connect(
     *, connect_timeout: int = HUB_CONNECT_TIMEOUT_S
 ) -> psycopg.Connection:
+    import psycopg
+
     from khipu.db import conninfo_with_local_root_cert, resolve_dsn
 
     return psycopg.connect(

@@ -154,6 +154,54 @@ class EmbeddingLateTest(unittest.TestCase):
         self.assertLess(elapsed, rp.TIMEOUT_S)
 
 
+class DeadlineCountsFromTheCallersStartTest(unittest.TestCase):
+    """The embedding wait and TIMEOUT_S must share one clock. When the wait
+    started after the project lookup, a slow lookup plus a late embedding
+    overran TIMEOUT_S and the keyword rows were thrown away with it."""
+
+    def test_a_slow_project_lookup_shortens_the_embedding_wait(self) -> None:
+        def _slow_embed(*_a, **_k):
+            time.sleep(5.0)
+            return [1.0]
+
+        def _slow_project(_cwd):
+            time.sleep(0.3)
+            return None
+
+        with mock.patch("khipu.hub_snapshot.snapshot_is_fresh", return_value=(True, {"exists": True})), \
+                mock.patch("khipu.hub_snapshot.search_snapshot",
+                            return_value=[_fresh_lexical_row()]), \
+                mock.patch("khipu.hub_snapshot.active_snapshot_profile", return_value="p1"), \
+                mock.patch.object(rp, "_project_for_cwd", side_effect=_slow_project), \
+                mock.patch.object(rp, "_cached_query_embed", side_effect=_slow_embed), \
+                mock.patch("khipu.hub_snapshot.open_snapshot", return_value=object()), \
+                mock.patch("khipu.hub_snapshot.snapshot_row_metadata", side_effect=lambda con, rows: rows):
+            t0 = time.monotonic()
+            out = rp._search_hits("a topical prompt", cwd="/repo")
+            elapsed = time.monotonic() - t0
+        self.assertEqual([h["id"] for h in out["hits"]], ["5"])
+        self.assertEqual(out["degraded"], "embedding late")
+        self.assertLess(elapsed, rp.LOCAL_LANE_DEADLINE_S + 0.15)
+
+
+class DeliverableLineIsBoundedTest(unittest.TestCase):
+    def test_a_slow_hub_costs_the_line_not_the_prompt(self) -> None:
+        def _slow_line(*_a, **_k):
+            time.sleep(5.0)
+            return "You produced x.py on 2026-09-14 (episode 42)"
+
+        hits = {"hits": [_fresh_lexical_row()], "legs": ["lexical"], "degraded": None}
+        with mock.patch.object(rp, "_search_hits", return_value=hits), \
+                mock.patch.object(rp, "_deliverable_context_line", side_effect=_slow_line), \
+                mock.patch.object(rp, "_log"):
+            t0 = time.monotonic()
+            out = rp.prior_work_for_prompt("what did we build for decisions", cwd="/repo")
+            elapsed = time.monotonic() - t0
+        self.assertEqual([h["id"] for h in out["hits"]], ["5"])
+        self.assertNotIn("You produced", out["context"])
+        self.assertLess(elapsed, rp.DELIVERABLE_LINE_TIMEOUT_S + 0.2)
+
+
 class EmbeddingErrorTest(unittest.TestCase):
     def test_keyword_only_rows_come_back_degraded_embedding_error(self) -> None:
         with mock.patch("khipu.hub_snapshot.snapshot_is_fresh", return_value=(True, {"exists": True})), \
