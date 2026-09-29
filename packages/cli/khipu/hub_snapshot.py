@@ -1225,19 +1225,30 @@ def _episode_ilike_columns() -> tuple[str, ...]:
 def _token_match_sqlite(
     columns: tuple[str, ...], tokens: list[str]
 ) -> tuple[str, str, list[Any]]:
-    """WHERE any-token-hits plus ORDER BY coverage; returns bound params."""
+    """WHERE any-token-hits plus ORDER BY coverage; returns bound params.
+
+    The params are positional and the WHERE text precedes the ORDER BY text
+    in every caller's SQL, so every WHERE pattern comes before every score
+    pattern. Interleaving them per token bound the first half of the tokens
+    to the WHERE and the second half to the score (2026-08-27 to 2026-09-29).
+
+    Plain ``LIKE`` is already ASCII case-insensitive in SQLite, exactly the
+    folding ``LOWER()`` does without ICU, and tokens arrive lowercased;
+    ``LOWER()`` on the column only copied every row's text per comparison.
+    """
     wheres: list[str] = []
     scores: list[str] = []
-    params: list[Any] = []
+    where_params: list[Any] = []
+    score_params: list[Any] = []
     ncols = len(columns)
     for tok in tokens:
         pat = f"%{_escape_like(tok)}%"
-        ors = " OR ".join(f"LOWER({c}) LIKE LOWER(?) ESCAPE '\\'" for c in columns)
+        ors = " OR ".join(f"{c} LIKE ? ESCAPE '\\'" for c in columns)
         wheres.append(f"({ors})")
         scores.append(f"(CASE WHEN {ors} THEN 1 ELSE 0 END)")
-        params.extend([pat] * ncols)
-        params.extend([pat] * ncols)
-    return " OR ".join(wheres), " + ".join(scores), params
+        where_params.extend([pat] * ncols)
+        score_params.extend([pat] * ncols)
+    return " OR ".join(wheres), " + ".join(scores), where_params + score_params
 
 
 def _id_shaped(term: str) -> bool:
