@@ -1928,6 +1928,25 @@ def hybrid_search(
                 session_id=session_id, harness=harness,
             )
 
+            # Optional reranker: switch-gated, own 2.5s deadline, run only on
+            # rows that already passed the filters (nothing forgotten or out
+            # of scope reaches the provider) and dropped whole on any failure.
+            rerank_info: dict[str, Any] | None = None
+            if _features.enabled("rerank"):
+                try:
+                    from khipu import rerank as _rerank
+
+                    fused, rerank_info, rerank_failed = _rerank.stage(
+                        query, fused, mode=mode, token_count=len(tokens)
+                    )
+                    if rerank_failed:
+                        degraded_legs.append("rerank")
+                except Exception as exc:  # noqa: BLE001 — a rerank failure must not sink the search
+                    degraded_legs.append("rerank")
+                    rerank_info = {"applied": False, "model": None, "ms": 0.0,
+                                   "candidates": 0, "reason": "error"}
+                    timing["rerank_error"] = str(exc)[:120]
+
             # Time interpretation (Phase 3, session A): switch-gated, and
             # only when the caller passed no explicit since/until — an
             # explicit filter always wins outright, this is a preference on
@@ -2020,6 +2039,8 @@ def hybrid_search(
         out["degraded_legs"] = degraded_legs
     if interpretation:
         out["time_interpretation"] = interpretation
+    if rerank_info is not None:
+        out["rerank"] = rerank_info
     return out
 
 

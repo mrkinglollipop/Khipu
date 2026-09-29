@@ -72,6 +72,8 @@ _CAPABILITIES = (
     # Phase 3, session A.
     "search.time_interpretation",
     "search.graph_candidates",
+    # Phase 3, session B.
+    "search.rerank",
 )
 
 

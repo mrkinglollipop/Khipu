@@ -2526,6 +2526,24 @@ def cmd_recall(args: argparse.Namespace) -> int:
         allow_changes = bool(getattr(args, "allow_changes", False))
         budget_ms = int(getattr(args, "budget_ms", None) or recall_eval.DEFAULT_STATUS_BUDGET_MS)
 
+        rerank_arg = getattr(args, "rerank", None)
+        if rerank_arg:
+            if path_arg != "explicit" or record_to or compare_to or replay_from:
+                print(json.dumps({"ok": False, "error": "--rerank scores the explicit path only; "
+                                  "it cannot combine with --path, --record, --compare or --replay"}))
+                return 2
+            try:
+                entries = recall_eval.load_golden(golden_path or recall_eval.default_golden_path())
+            except (OSError, ValueError) as exc:
+                print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+                return 2
+            report = recall_eval.run_rerank_eval(entries, rerank=(rerank_arg == "on"))
+            for row in report["rows"]:
+                print(f"rank without={row['rank_without']} with={row['rank_with']} {row['query']!r}",
+                      file=sys.stderr)
+            print(json.dumps(report, indent=2, default=str))
+            return 0
+
         # Legacy fast path: zero new flags touched -> byte-identical to the
         # original W6.3 command. run_eval/eval_one/load_golden are untouched
         # by Phase 1 session A, so an existing golden file or script must
@@ -4039,6 +4057,13 @@ def build_parser() -> argparse.ArgumentParser:
     reval.add_argument(
         "--replay", default=None,
         help="Build no-expectation entries from a query_log.jsonl instead of the golden file; only valid with --record/--compare",
+    )
+    reval.add_argument(
+        "--rerank", choices=["on", "off"], default=None,
+        help=(
+            "Score the explicit path with the optional reranker switched on or off for this process "
+            "only; 'on' scores each entry both ways and reports the expected id's rank with and without"
+        ),
     )
     reval.add_argument("--sample", type=int, default=None, help="With --replay: cap to N entries")
     reval.add_argument("--seed", type=int, default=0, help="With --replay --sample: deterministic sampling seed")

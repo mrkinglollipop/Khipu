@@ -34,6 +34,9 @@ evaluator gap):
   returns, as a control; ``--compare FILE`` reruns and diffs against it
   (identical / reordered / changed / new), exit 1 on any difference unless
   ``--allow-changes``. Latency is never part of the diff.
+- ``--rerank on|off`` scores the explicit path with the optional reranker
+  switch set for this process only; ``on`` scores every entry both ways in the
+  one run and reports the expected id's rank with and without the stage.
 - ``--replay LOG [--sample N] [--seed S]`` builds no-expectation entries from
   a ``query_log.jsonl`` for realistic-traffic record/compare runs; only valid
   together with ``--record`` or ``--compare``.
@@ -482,3 +485,83 @@ def load_replay_entries(
     if sample is not None and sample < len(entries):
         entries = random.Random(seed).sample(entries, sample)
     return entries
+
+
+# Rank is read over a window wider than any entry's k so an expected id the
+# reranker pulls up from just outside the top k still shows as a rank.
+RERANK_RANK_WINDOW = 12
+_RERANK_ENV = "KHIPU_FEATURE_RERANK"
+
+
+def _rank_of(expect: set[str], payload: dict[str, Any]) -> int | None:
+    for rank, row in enumerate(payload.get("results") or [], start=1):
+        if str(row.get("id")) in expect:
+            return rank
+    return None
+
+
+def _explicit_once(entry: dict[str, Any], *, rerank: bool) -> dict[str, Any]:
+    """One explicit search with the rerank switch forced on or off through its
+    environment leg (never config.json), restored afterwards."""
+    import os
+
+    from khipu.embed import hybrid_search
+
+    prior = os.environ.get(_RERANK_ENV)
+    os.environ[_RERANK_ENV] = "1" if rerank else "0"
+    try:
+        return hybrid_search(
+            str(entry["query"]), mode=str(entry.get("mode") or "hybrid"),
+            limit=RERANK_RANK_WINDOW, project=entry.get("project"),
+            since=entry.get("since"), until=entry.get("until"),
+        )
+    except Exception as exc:  # noqa: BLE001 — a broken line scores no rank, not a crash
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        if prior is None:
+            os.environ.pop(_RERANK_ENV, None)
+        else:
+            os.environ[_RERANK_ENV] = prior
+
+
+def run_rerank_eval(entries: list[dict[str, Any]], *, rerank: bool) -> dict[str, Any]:
+    """Explicit-path rank of each entry's expected id without the reranker and,
+    when ``rerank`` is True, with it too: one run, the same entries both ways.
+    ``rank_*`` is the 1-based position of the first expected id within the top
+    ``RERANK_RANK_WINDOW`` results; None when absent or the search failed
+    (``error_*`` says which)."""
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        expect = {str(x) for x in (entry.get("expect") or [])}
+        without = _explicit_once(entry, rerank=False)
+        row: dict[str, Any] = {
+            "query": str(entry["query"]), "expect": sorted(expect),
+            "rank_without": _rank_of(expect, without),
+            "rank_with": None, "rerank": None,
+        }
+        if without.get("error"):
+            row["error_without"] = without["error"]
+        if rerank:
+            staged = _explicit_once(entry, rerank=True)
+            row["rank_with"] = _rank_of(expect, staged)
+            row["rerank"] = staged.get("rerank")
+            if staged.get("error"):
+                row["error_with"] = staged["error"]
+        rows.append(row)
+    scored = [r for r in rows if r["expect"]]
+    summary: dict[str, Any] = {
+        "entries": len(scored),
+        "found_without": sum(1 for r in scored if r["rank_without"] is not None),
+    }
+    if rerank:
+        def _pos(rank: int | None) -> float:
+            return float("inf") if rank is None else rank
+
+        summary.update({
+            "found_with": sum(1 for r in scored if r["rank_with"] is not None),
+            "improved": sum(1 for r in scored if _pos(r["rank_with"]) < _pos(r["rank_without"])),
+            "worsened": sum(1 for r in scored if _pos(r["rank_with"]) > _pos(r["rank_without"])),
+            "applied": sum(1 for r in scored if (r["rerank"] or {}).get("applied")),
+        })
+    return {"rerank": "on" if rerank else "off", "window": RERANK_RANK_WINDOW,
+            "summary": summary, "rows": rows}
