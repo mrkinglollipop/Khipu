@@ -284,3 +284,39 @@ class LiveGraphMirrorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChangedSinceLastMirrorTest(unittest.TestCase):
+    """A difference that appeared after a nightly mirror that succeeded is
+    the mirror not having run yet. One the mirror should have carried, or one
+    left by a failed or overdue mirror, stays a failure."""
+
+    def _changed(self, *, state, mtime_offset_s):
+        import time as _time
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "graph.sqlite"
+            p.write_bytes(b"")
+            ended = state.pop("_ended_ago_s", None)
+            if ended is not None:
+                state["ts"] = datetime.fromtimestamp(_time.time() - ended, timezone.utc).isoformat()
+                os.utime(p, (_time.time(), _time.time() - ended + mtime_offset_s))
+            with mock.patch("khipu.jobs._read_job_state", return_value=state or None):
+                return gs._changed_since_last_mirror(p)
+
+    def test_changed_after_a_good_mirror_is_pending(self):
+        self.assertTrue(self._changed(state={"exit": 0, "_ended_ago_s": 3600}, mtime_offset_s=600))
+
+    def test_unchanged_since_the_mirror_is_a_failure(self):
+        self.assertFalse(self._changed(state={"exit": 0, "_ended_ago_s": 3600}, mtime_offset_s=-600))
+
+    def test_a_failed_mirror_excuses_nothing(self):
+        self.assertFalse(self._changed(state={"exit": 1, "_ended_ago_s": 3600}, mtime_offset_s=600))
+
+    def test_an_overdue_mirror_excuses_nothing(self):
+        self.assertFalse(self._changed(
+            state={"exit": 0, "_ended_ago_s": gs.MIRROR_MAX_AGE_S + 3600}, mtime_offset_s=600))
+
+    def test_no_record_excuses_nothing(self):
+        self.assertFalse(self._changed(state={}, mtime_offset_s=0))

@@ -34,6 +34,7 @@ import json
 import os
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -503,4 +504,31 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
         }
     )
     out["ok"] = not (missing_nodes or extra_nodes or missing_edges or extra_edges)
+    if not out["ok"] and _changed_since_last_mirror(path):
+        out["ok"] = True
+        out["pending"] = (
+            "graph.sqlite changed after the last nightly mirror, which succeeded; "
+            "the next one carries the difference"
+        )
     return out
+
+
+# The mirror runs once a night; the graph is rebuilt whenever its sources
+# change. A difference that appeared after a mirror that succeeded is the
+# mirror not having run yet, not the mirror having failed. Past this age the
+# nightly itself is overdue and the difference is a failure again.
+MIRROR_MAX_AGE_S = 26 * 60 * 60
+
+
+def _changed_since_last_mirror(path: Path) -> bool:
+    try:
+        from khipu.jobs import _read_job_state
+
+        state = _read_job_state("graph_build") or {}
+        if state.get("exit") != 0:
+            return False
+        stamp = str(state.get("ts") or "")
+        ended = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+        return path.stat().st_mtime > ended and time.time() - ended <= MIRROR_MAX_AGE_S
+    except Exception:  # noqa: BLE001 — no readable record of a mirror means no excuse
+        return False
