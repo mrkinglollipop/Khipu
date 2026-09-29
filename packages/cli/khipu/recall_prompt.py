@@ -54,6 +54,13 @@ TIMEOUT_S = 1.2
 # ~22ms, pack 4-19ms on the production-size replica).
 LOCAL_LANE_DEADLINE_S = 0.95
 
+# The "You produced ..." line needs the hub (keychain read, connection, one
+# query: 300-660 ms measured on a quiet machine, over a second on a busy one)
+# and used to run with no limit after the search, on every prompt. It runs
+# after the search, not beside it: beside it, the driver import and connection
+# took the embedding leg's time (measured 2026-09-29, 3 of 16 legs lost).
+DELIVERABLE_LINE_TIMEOUT_S = 0.8
+
 # "Never inject when the same ids were injected in the last N prompts of this
 # session" (R11 follow-on: trivial-looking but topical prompts repeated back
 # to back must not spam the same three hits every turn).
@@ -372,7 +379,8 @@ class _SnapshotUnusable(Exception):
 
 
 def _snapshot_search_hits(
-    prompt: str, *, project: str | None, tz: str | None = None
+    prompt: str, *, project: str | None, tz: str | None = None,
+    started: float | None = None,
 ) -> dict[str, Any]:
     """Lexical + cosine, RRF-fused, entirely against the local sqlite
     replica — no Postgres, no network round trip beyond one (cacheable)
@@ -413,7 +421,11 @@ def _snapshot_search_hits(
         )
 
     tokens = search_tokens(prompt)
-    deadline = time.monotonic() + LOCAL_LANE_DEADLINE_S
+    # `started` is when the caller's own TIMEOUT_S clock began. Counting from
+    # here instead let the project lookup before this call eat the margin
+    # between the two limits, and a late embedding then cost the keyword
+    # rows too (2026-09-29: 25 of 28 real prompts under heavy machine load).
+    deadline = (started if started is not None else time.monotonic()) + LOCAL_LANE_DEADLINE_S
 
     profile = hub_snapshot.active_snapshot_profile()
     cosine_box: dict[str, Any] = {}
@@ -615,10 +627,11 @@ def _search_hits(
     hook's own log line the same way a hub-path degradation already is to
     ``khipu_status``.
     """
+    started = time.monotonic()
     project = _project_for_cwd(cwd)
 
     try:
-        result = _snapshot_search_hits(prompt, project=project, tz=tz)
+        result = _snapshot_search_hits(prompt, project=project, tz=tz, started=started)
         hits = _apply_score_floor(result["hits"])[:limit]
         out = {"hits": hits, "legs": result["legs"], "degraded": result["degraded"]}
         if "degraded_legs" in result:
@@ -1072,7 +1085,13 @@ def prior_work_for_prompt(
     # O4: "You produced <path> on <date> (episode N)" when a deliverable in
     # this project matches >= 2 of the prompt's own tokens. Best-effort and
     # additive — a DB hiccup here must not sink the hits already found.
-    produced = _deliverable_context_line(tokens, cwd=cwd)
+    try:
+        produced = _run_with_timeout(
+            _deliverable_context_line, DELIVERABLE_LINE_TIMEOUT_S, tokens, cwd=cwd
+        )
+    except _TimedOut:
+        produced = ""
+        _log(f"deliverable line skipped (not ready within {DELIVERABLE_LINE_TIMEOUT_S}s)")
     if produced:
         context = f"{context}\n{produced}" if context else produced
     out = {"context": context, "hits": hits or [], "reason": reason, "ms": ms}
