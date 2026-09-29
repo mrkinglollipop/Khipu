@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import struct
 import sys
 import threading
@@ -227,6 +228,33 @@ def _apply_score_floor(rows: list[dict[str, Any]], *, ratio: float = SCORE_FLOOR
         return rows
     floor = top * ratio
     return [r for r in rows if float(r.get("score") or 0.0) >= floor]
+
+
+def _relevance_gate(rows: list[dict[str, Any]], tokens: list[str]) -> list[dict[str, Any]]:
+    """The absolute relevance gate (``khipu.relevance``) behind its switch:
+    the fused list unchanged when any row is evidence, empty when none is.
+    Runs before ``_apply_score_floor``, which is relative to the top row and
+    so keeps a nearest neighbour of an unrelated prompt. ``tokens`` is the
+    prompt's content tokens; it also fills in a missing keyword count for a
+    row that only the cosine leg produced (the hub lane counts keywords on its
+    lexical rows alone). Fails open: any error here returns the rows
+    untouched."""
+    try:
+        from khipu import relevance
+
+        if not rows or not tokens or not relevance.enabled():
+            return rows
+        from khipu.search_text import token_hit_count
+
+        for r in rows:
+            if r.get("lexical_hits") is None:
+                text = r.get("rank_text") or f"{r.get('label') or ''} {r.get('snippet') or ''}"
+                r["lexical_hits"] = token_hit_count(text, tokens)
+        kept, _info = relevance.gate(rows, len(tokens))
+        return kept
+    except Exception as exc:  # noqa: BLE001 — a policy failure must not cost the caller its hits
+        _log(f"relevance floor skipped: {type(exc).__name__}: {exc}")
+        return rows
 
 
 # ---- local query-embedding cache --------------------------------------------
@@ -536,6 +564,9 @@ def _snapshot_search_hits(
             degraded_legs.append("graph_candidates")
             _log(f"snapshot graph-candidates leg skipped: {type(exc).__name__}: {exc}")
 
+    # Once, after fusion and graph expansion: candidate rows carry no signal,
+    # so they can never make an otherwise empty list pass.
+    fused = _relevance_gate(fused, tokens)
     fused = hub_snapshot.snapshot_row_metadata(con, fused)
     fused = apply_project_and_status(fused, project=project)
 
@@ -595,15 +626,24 @@ def _snapshot_search_hits(
     return {"hits": fused, "legs": legs, "degraded": degraded, **result_extra}
 
 
+_PROJECT_FOR_CWD: dict[str, str | None] = {}
+
+
 def _project_for_cwd(cwd: str | None) -> str | None:
+    """The project for a working directory, resolved once per process: the
+    lookup runs git, and one prompt asks for it more than once."""
     if not cwd:
         return None
+    if cwd in _PROJECT_FOR_CWD:
+        return _PROJECT_FOR_CWD[cwd]
     try:
         from khipu.identity import resolve_repo_root
 
-        return resolve_repo_root(cwd).get("project")
+        project = resolve_repo_root(cwd).get("project")
     except Exception:  # noqa: BLE001 — a git failure must not sink recall
         return None
+    _PROJECT_FOR_CWD[cwd] = project
+    return project
 
 
 def _search_hits(
@@ -785,6 +825,7 @@ def _hub_hits_budgeted(
     from khipu.recency import apply_project_and_status
 
     fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
+    fused = _relevance_gate(fused, tokens)
     fused = apply_project_and_status(fused, project=project)
 
     # Validity annotation (Phase 2, session B): one counts query for the
@@ -1107,18 +1148,48 @@ def prior_work_for_prompt(
     return out
 
 
+def _replica_deliverable_line(project: str, tokens: list[str]) -> str | None:
+    """The line from the local replica ("" when nothing matches), or None
+    when the replica cannot answer (stale, missing, an older dump with no
+    ``deliverables`` table, unreadable). Imports neither the Postgres driver
+    nor ``khipu.db``."""
+    from khipu import deliverables as _deliverables
+    from khipu import hub_snapshot
+
+    fresh, _health = hub_snapshot.snapshot_is_fresh()
+    if not fresh:
+        return None
+    try:
+        con = hub_snapshot.open_snapshot()
+    except (FileNotFoundError, sqlite3.Error):
+        return None
+    try:
+        rows = hub_snapshot.recent_deliverables_snapshot(con, project=project)
+    finally:
+        con.close()
+    if rows is None:
+        return None
+    return _deliverables.line_from_rows(rows, tokens) or ""
+
+
 def _deliverable_context_line(tokens: list[str], *, cwd: str | None) -> str:
     """The O4 "You produced …" line for this prompt's tokens, or "". Never
     raises: a resolve/DB failure here degrades to no line, same fail-open
-    posture as every other step in this module."""
+    posture as every other step in this module. The local replica answers
+    when it can; the hub is the fallback for an old or unusable replica."""
     if not tokens or not cwd:
         return ""
     try:
-        from khipu.identity import resolve_repo_root
-
-        project = resolve_repo_root(cwd).get("project")
+        project = _project_for_cwd(cwd)
         if not project:
             return ""
+        try:
+            local = _replica_deliverable_line(project, tokens)
+        except Exception as exc:  # noqa: BLE001 — an unusable replica falls back to the hub
+            _log(f"deliverable replica unusable ({type(exc).__name__}: {exc})")
+            local = None
+        if local is not None:
+            return local
         from khipu.db import connect
         from khipu import deliverables as _deliverables
 

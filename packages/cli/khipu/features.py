@@ -38,6 +38,7 @@ FEATURES: dict[str, str] = {
     "rerank": "Run an independently switchable reranking stage over candidate results.",
     "briefs": "Generate source-backed incremental topic briefs instead of the legacy topic-page pipeline.",
     "reflect": "Run an optional cited-reflection step over dependable evidence.",
+    "relevance_floor": "Drop rows with no keyword hit and a cosine similarity below an absolute floor, so an unrelated prompt returns nothing.",
 }
 
 _ENV_PREFIX = "KHIPU_FEATURE_"
@@ -72,6 +73,14 @@ _CAPABILITIES = (
     # Phase 3, session A.
     "search.time_interpretation",
     "search.graph_candidates",
+    # Phase 3, session B.
+    "search.rerank",
+    "replica.deliverables",
+    # Phase 4, session A.
+    "briefs.read",
+    # Phase 4, session B.
+    "reflect",
+    "search.relevance_floor",
 )
 
 

@@ -71,3 +71,14 @@ def _reset_table_columns_cache():
     db._TABLE_COLUMNS_CACHE.clear()
     yield
     db._TABLE_COLUMNS_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_project_for_cwd_cache():
+    # Same reason as above: a per-process cache that is right in a one-shot
+    # hook and wrong between tests that fake different projects for one path.
+    from khipu import recall_prompt
+
+    recall_prompt._PROJECT_FOR_CWD.clear()
+    yield
+    recall_prompt._PROJECT_FOR_CWD.clear()

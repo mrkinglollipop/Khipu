@@ -60,6 +60,7 @@ _TABLES = (
     "embedding_profiles",
     "memory_embeddings",
     "decisions",
+    "deliverables",
 )
 
 # Schema version 2 (Phase 2, session B): the replica gains `decisions` and
@@ -70,7 +71,23 @@ _TABLES = (
 # pre-this-phase shape (still has project/deleted_at/harness/status etc. —
 # those predate this phase); a reader given a version-1 replica reports
 # validity as unknown rather than raising.
-SNAPSHOT_SCHEMA_VERSION = 2
+# Version 3 adds `deliverables`, so the per-prompt "You produced ..." line
+# never needs the hub. Writers of different versions can share one file (an
+# older build's refresh replaces it wholesale, a newer build's incremental
+# writes land on an older file), so readers and incremental writers probe for
+# the table and never trust this number.
+SNAPSHOT_SCHEMA_VERSION = 3
+
+_DELIVERABLE_COLS = (
+    "id",
+    "project",
+    "kind",
+    "path",
+    "url",
+    "title",
+    "episode_id",
+    "created_at",
+)
 
 _EPISODE_COLS = (
     "id",
@@ -308,6 +325,37 @@ def decision_counts_snapshot(
         return None
 
 
+def recent_deliverables_snapshot(
+    con: sqlite3.Connection, *, project: str, limit: int = 200
+) -> list[dict[str, Any]] | None:
+    """The same rows, order and forgotten-episode exclusion as
+    ``khipu.deliverables.recent_deliverables``, read from the replica.
+    ``None`` (not ``[]``) when this replica has no usable ``deliverables``
+    table (an older dump, or an unreadable one) so a caller can tell "cannot
+    answer" from "checked, found nothing"."""
+    cols = ("id", "project", "kind", "path", "url", "title", "episode_id", "created_at")
+    if not set(cols) <= _snapshot_table_columns(con, "deliverables"):
+        return None
+    if not project:
+        return []
+    extra = ""
+    if "deleted_at" in _snapshot_table_columns(con, "episodes"):
+        extra = (
+            " AND (deliverables.episode_id IS NULL OR NOT EXISTS ("
+            "SELECT 1 FROM episodes e WHERE e.id = deliverables.episode_id "
+            "AND e.deleted_at IS NOT NULL))"
+        )
+    try:
+        rows = con.execute(
+            f"SELECT {', '.join(cols)} FROM deliverables WHERE project = ?{extra} "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (project, limit),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    return [dict(zip(cols, row)) for row in rows]
+
+
 def topic_validity_meta_snapshot(
     con: sqlite3.Connection, slugs: Sequence[str]
 ) -> dict[str, dict[str, Any]]:
@@ -513,8 +561,9 @@ def _blob_to_vector(blob: bytes) -> list[float]:
 
 
 def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VERSION) -> None:
-    """``version=2`` (default): the current shape, always what ``refresh()``
-    writes for a real dump. ``version=1``: the pre-Phase-2B shape (no
+    """``version=3`` (default): the current shape, always what ``refresh()``
+    writes for a real dump. ``version=2``: the same without ``deliverables``.
+    ``version=1``: the pre-Phase-2B shape (no
     ``decisions`` table, no ``topics.superseded_by``/``event_at``, no
     ``snapshot_meta``) — for tests exercising a reader's tolerance of an
     older replica. Every reader in this module probes the ACTUAL file
@@ -639,7 +688,23 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
         )
         con.execute(
             "INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('schema_version', ?)",
-            (str(SNAPSHOT_SCHEMA_VERSION),),
+            (str(version),),
+        )
+    if version >= 3:
+        con.executescript(
+            """
+            CREATE TABLE deliverables (
+                id INTEGER PRIMARY KEY,
+                project TEXT,
+                kind TEXT,
+                path TEXT,
+                url TEXT,
+                title TEXT,
+                episode_id INTEGER,
+                created_at TEXT
+            );
+            CREATE INDEX idx_snapshot_deliverables_project ON deliverables (project);
+            """
         )
 
 
@@ -841,6 +906,36 @@ def _insert_decisions(cur, con: sqlite3.Connection) -> int:
     return len(rows)
 
 
+def _insert_deliverables(cur, con: sqlite3.Connection) -> int:
+    """Empty (returns 0, no error) on a hub with no ``deliverables`` table.
+    Rows of a forgotten episode are never exported, the same exclusion
+    ``khipu.deliverables.recent_deliverables`` applies at read time."""
+    hub_cols = _pg_columns(cur, "deliverables")
+    if not {"id", "project", "kind"} <= hub_cols:
+        return 0
+    cols = [c for c in _DELIVERABLE_COLS if c in hub_cols]
+    sel = ", ".join(cols)
+    where = ""
+    if "episode_id" in cols and "deleted_at" in _pg_columns(cur, "episodes"):
+        where = (
+            " WHERE (episode_id IS NULL OR NOT EXISTS ("
+            "SELECT 1 FROM episodes e WHERE e.id = deliverables.episode_id "
+            "AND e.deleted_at IS NOT NULL))"
+        )
+    cur.execute(f"SELECT {sel} FROM deliverables{where} ORDER BY id")
+    rows = cur.fetchall()
+    for row in rows:
+        vals = [
+            _ts_text(val) if col == "created_at" else val
+            for col, val in zip(cols, row, strict=True)
+        ]
+        con.execute(
+            f"INSERT INTO deliverables ({sel}) VALUES ({', '.join('?' * len(cols))})",
+            vals,
+        )
+    return len(rows)
+
+
 def refresh() -> dict[str, Any]:
     """Dump hub tables into a fresh sqlite file and atomically replace the snapshot.
 
@@ -881,6 +976,7 @@ def refresh() -> dict[str, Any]:
                         cur, con
                     )
                     counts["decisions"] = _insert_decisions(cur, con)
+                    counts["deliverables"] = _insert_deliverables(cur, con)
             con.commit()
             con.close()
             os.replace(tmp_path, dest)
@@ -936,10 +1032,33 @@ def _release_refresh_lock(lock) -> None:
     lock.close()
 
 
+def _write_deliverable_rows(
+    con: sqlite3.Connection, episode_id: Any, rows: Sequence[Mapping[str, Any]]
+) -> None:
+    """Replace one episode's deliverables on ``con``. A no-op when this
+    replica has no (or a partial) ``deliverables`` table, so an older dump is
+    left exactly as it was. Caller holds the refresh lock and commits."""
+    if not set(_DELIVERABLE_COLS) <= _snapshot_table_columns(con, "deliverables"):
+        return
+    con.execute("DELETE FROM deliverables WHERE episode_id = ?", (episode_id,))
+    sel = ", ".join(_DELIVERABLE_COLS)
+    for row in rows:
+        vals = [
+            _ts_text(row.get(c)) if c == "created_at" else row.get(c)
+            for c in _DELIVERABLE_COLS
+        ]
+        con.execute(
+            f"INSERT OR REPLACE INTO deliverables ({sel}) "
+            f"VALUES ({', '.join('?' * len(_DELIVERABLE_COLS))})",
+            vals,
+        )
+
+
 def upsert_episode(
     episode_row: Mapping[str, Any],
     embedding_rows: Sequence[Mapping[str, Any]],
     decision_rows: Sequence[Mapping[str, Any]] = (),
+    deliverable_rows: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Incremental snapshot update: one episode + its embedding chunks (W2.4),
     plus (Phase 2, session B) any decision rows minted for it in the same
@@ -947,6 +1066,11 @@ def upsert_episode(
     ``episode_row``/``embedding_rows``) is unchanged. Written via
     ``apply_decision_changes`` under the SAME lock this function already
     holds, so a full dump never interleaves with either half.
+
+    ``deliverable_rows`` (the hub's rows for this episode) REPLACE whatever
+    the replica holds for it, so a re-capture cannot duplicate; ``None``
+    leaves the replica's deliverables alone. Skipped on a replica with no
+    ``deliverables`` table.
 
     Called from ``embed.embed_on_capture`` right after a successful embed, so
     a search that falls back to the sqlite replica (hub unreachable) sees a
@@ -1010,6 +1134,8 @@ def upsert_episode(
                 # error, for that case, and the episode/embedding write
                 # above must still commit regardless.
                 _write_decision_rows(con, decision_rows)
+            if deliverable_rows is not None:
+                _write_deliverable_rows(con, eid, deliverable_rows)
             con.commit()
         finally:
             con.close()
@@ -1097,6 +1223,8 @@ def forget_episode_in_snapshot(episode_id: int) -> dict[str, Any]:
                 "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ?",
                 (str(episode_id),),
             )
+            if _snapshot_table_columns(con, "deliverables"):
+                con.execute("DELETE FROM deliverables WHERE episode_id = ?", (episode_id,))
             con.commit()
         finally:
             con.close()

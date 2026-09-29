@@ -1163,6 +1163,7 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
         ts = payload.get("ts")
         if not summary or not ts:
             return False
+        deliverable_rows = None
         with connect() as conn:
             with conn.cursor() as cur:
                 profile = _active_profile(cur)
@@ -1183,6 +1184,9 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
                     [("episode", eid, i, c, _md5(c), v)
                      for i, (c, v) in enumerate(zip(chunks, vecs))],
                 )
+                from khipu import deliverables as _deliverables
+
+                deliverable_rows = _deliverables.deliverables_for_episode(cur, int(eid))
             conn.commit()
         _log(f"embed-on-capture ok episode={eid} chunks={len(chunks)} profile={profile}")
         # W2.4: keep the sqlite hub replica current without a full dump, so a
@@ -1223,7 +1227,9 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
                 }
                 for i, (c, v) in enumerate(zip(chunks, vecs))
             ]
-            snap = upsert_episode(episode_row, embedding_rows)
+            snap = upsert_episode(
+                episode_row, embedding_rows, deliverable_rows=deliverable_rows
+            )
             if not snap.get("ok"):
                 _log(f"snapshot upsert skipped: {snap.get('error')}")
         except Exception as exc:  # noqa: BLE001 — fail-open, one log line
@@ -1902,6 +1908,8 @@ def hybrid_search(
             _t = time.monotonic()
             fused = fuse_ranked_lists(lists, limit=oversample)
 
+            floor_info: dict[str, Any] | None = None
+
             # Graph candidates (Phase 3, session A): switch-gated, own 400ms
             # deadline, dropped entirely (never partially) on a miss — named
             # in `degraded_legs`. Seeds are the top 5 rows of `fused` exactly
@@ -1927,6 +1935,39 @@ def hybrid_search(
                 cur, fused, project=project, since=since, until=until,
                 session_id=session_id, harness=harness,
             )
+
+            # Absolute relevance gate: the list unchanged when any row is
+            # evidence, empty when none is. Once, after fusion, graph expansion
+            # and the filters (a candidate row carries no signal, and nothing
+            # forgotten or out of scope can make the list pass). Never in
+            # literal mode. Fails open.
+            if mode != "literal":
+                try:
+                    from khipu import relevance as _relevance
+
+                    if _relevance.enabled():
+                        fused, floor_info = _relevance.gate(fused, len(tokens))
+                except Exception as exc:  # noqa: BLE001 — a policy failure must not sink the search
+                    timing["relevance_floor_error"] = str(exc)[:120]
+
+            # Optional reranker: switch-gated, own 2.5s deadline, run only on
+            # rows that already passed the filters (nothing forgotten or out
+            # of scope reaches the provider) and dropped whole on any failure.
+            rerank_info: dict[str, Any] | None = None
+            if _features.enabled("rerank"):
+                try:
+                    from khipu import rerank as _rerank
+
+                    fused, rerank_info, rerank_failed = _rerank.stage(
+                        query, fused, mode=mode, token_count=len(tokens)
+                    )
+                    if rerank_failed:
+                        degraded_legs.append("rerank")
+                except Exception as exc:  # noqa: BLE001 — a rerank failure must not sink the search
+                    degraded_legs.append("rerank")
+                    rerank_info = {"applied": False, "model": None, "ms": 0.0,
+                                   "candidates": 0, "reason": "error"}
+                    timing["rerank_error"] = str(exc)[:120]
 
             # Time interpretation (Phase 3, session A): switch-gated, and
             # only when the caller passed no explicit since/until — an
@@ -2020,6 +2061,10 @@ def hybrid_search(
         out["degraded_legs"] = degraded_legs
     if interpretation:
         out["time_interpretation"] = interpretation
+    if rerank_info is not None:
+        out["rerank"] = rerank_info
+    if floor_info is not None:
+        out["relevance_floor"] = floor_info
     return out
 
 

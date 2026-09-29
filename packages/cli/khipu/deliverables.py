@@ -108,11 +108,35 @@ def recent_deliverables(cur, *, project: str, limit: int = 200) -> list[dict[str
     extra = f" AND {forgotten_clause}" if forgotten_clause else ""
     cur.execute(
         f"SELECT id, project, kind, path, url, title, episode_id, created_at "
-        f"FROM deliverables WHERE project = %s{extra} ORDER BY created_at DESC LIMIT %s",
+        f"FROM deliverables WHERE project = %s{extra} ORDER BY created_at DESC, id DESC LIMIT %s",
         (project, limit),
     )
     cols = ("id", "project", "kind", "path", "url", "title", "episode_id", "created_at")
     return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def deliverables_for_episode(cur, episode_id: int) -> list[dict[str, Any]] | None:
+    """The rows the hub holds for one episode, or None when the table is not
+    there (or the read fails). Runs in a SAVEPOINT so a failure cannot abort
+    the caller's transaction. Used to mirror them into the local replica."""
+    if not _deliverables_ready(cur):
+        return None
+    cols = ("id", "project", "kind", "path", "url", "title", "episode_id", "created_at")
+    try:
+        cur.execute("SAVEPOINT episode_deliverables")
+        cur.execute(
+            f"SELECT {', '.join(cols)} FROM deliverables WHERE episode_id = %s ORDER BY id",
+            (episode_id,),
+        )
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+        cur.execute("RELEASE SAVEPOINT episode_deliverables")
+        return rows
+    except Exception:  # noqa: BLE001 — the replica catches up at the next refresh
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT episode_deliverables")
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
 
 # ---- the recall-hook matcher (unit-tested without a DB) ---------------------
@@ -154,6 +178,16 @@ def format_produced_line(row: dict[str, Any]) -> str:
     return f"You produced {target} on {when} (episode {episode})"
 
 
+def line_from_rows(
+    rows: Sequence[dict[str, Any]], prompt_tokens: Sequence[str], *, min_hits: int = 2
+) -> str | None:
+    """The "You produced ..." line for rows already read (newest first), or
+    None. The one place the match rule and the rendering live, so the hub
+    reader and the replica reader cannot drift apart."""
+    match = best_match_for_tokens(rows, prompt_tokens, min_hits=min_hits)
+    return format_produced_line(match) if match else None
+
+
 def deliverable_line_for_prompt(
     cur, prompt_tokens: Sequence[str], *, project: str | None, min_hits: int = 2
 ) -> str | None:
@@ -162,8 +196,7 @@ def deliverable_line_for_prompt(
         return None
     try:
         rows = recent_deliverables(cur, project=project)
-        match = best_match_for_tokens(rows, prompt_tokens, min_hits=min_hits)
+        return line_from_rows(rows, prompt_tokens, min_hits=min_hits)
     except Exception as exc:  # noqa: BLE001 — the recall hook must still return its hits
         _log(f"deliverable_line_for_prompt failed ({type(exc).__name__}: {exc})")
         return None
-    return format_produced_line(match) if match else None

@@ -2092,24 +2092,18 @@ def cmd_capture_now(args: argparse.Namespace) -> int:
     flags a session for capture on its next Stop/PreCompact/SessionEnd,
     regardless of cadence. With no explicit --harness/--session-id, targets
     the most recently active local session (newest per-session state file)."""
-    from khipu.session_capture import newest_session_ref, request_capture_now
+    from khipu.session_capture import request_capture_now, resolve_session_ref
 
-    harness = getattr(args, "harness", None)
-    sid = getattr(args, "session_id", None)
-    if not harness or not sid:
-        auto = newest_session_ref()
-        if auto is None:
-            print(json.dumps({
-                "ok": False,
-                "error": "no active session found under the capture state dir; "
-                         "pass --harness and --session-id explicitly",
-            }))
-            return 1
-        harness, sid = harness or auto[0], sid or auto[1]
+    try:
+        harness, sid, resolved_by = resolve_session_ref(
+            getattr(args, "harness", None) or None, getattr(args, "session_id", None) or None)
+    except ValueError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 1
     path = request_capture_now(harness, sid, note=getattr(args, "note", None))
     print(json.dumps({
         "queued": True, "captured_by": "next stop",
-        "harness": harness, "session_id": sid, "flag": str(path),
+        "harness": harness, "session_id": sid, "flag": str(path), "resolved_by": resolved_by,
     }))
     return 0
 
@@ -2532,6 +2526,51 @@ def cmd_recall(args: argparse.Namespace) -> int:
         allow_changes = bool(getattr(args, "allow_changes", False))
         budget_ms = int(getattr(args, "budget_ms", None) or recall_eval.DEFAULT_STATUS_BUDGET_MS)
 
+        rerank_arg = getattr(args, "rerank", None)
+        if rerank_arg:
+            if (path_arg != "explicit" or record_to or compare_to or replay_from
+                    or getattr(args, "relevance_floor", None)):
+                print(json.dumps({"ok": False, "error": "--rerank scores the explicit path only; "
+                                  "it cannot combine with --path, --record, --compare, --replay "
+                                  "or --relevance-floor"}))
+                return 2
+            try:
+                entries = recall_eval.load_golden(golden_path or recall_eval.default_golden_path())
+            except (OSError, ValueError) as exc:
+                print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+                return 2
+            report = recall_eval.run_rerank_eval(entries, rerank=(rerank_arg == "on"))
+            for row in report["rows"]:
+                print(f"rank without={row['rank_without']} with={row['rank_with']} {row['query']!r}",
+                      file=sys.stderr)
+            print(json.dumps(report, indent=2, default=str))
+            return 0
+
+        floor_arg = getattr(args, "relevance_floor", None)
+        if floor_arg:
+            if record_to or compare_to or replay_from:
+                print(json.dumps({"ok": False, "error": "--relevance-floor cannot combine with "
+                                  "--record, --compare or --replay"}))
+                return 2
+            try:
+                entries = recall_eval.load_golden(golden_path or recall_eval.default_golden_path())
+            except (OSError, ValueError) as exc:
+                print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+                return 2
+            paths = recall_eval.ALL_PATHS if path_arg == "all" else (path_arg,)
+            report = recall_eval.run_relevance_eval(
+                entries, paths, floor=(floor_arg == "on"), budget_ms=budget_ms
+            )
+            for path, summary in report["paths"].items():
+                for query in summary.get("emptied_positives", []):
+                    print(f"[EMPTIED] path={path} {query!r}", file=sys.stderr)
+            print(json.dumps(report, indent=2, default=str))
+            ok = all(
+                s["abstain_correct"] == s["abstain_total"] and not s.get("emptied_positives")
+                for s in report["paths"].values()
+            )
+            return 0 if ok else 1
+
         # Legacy fast path: zero new flags touched -> byte-identical to the
         # original W6.3 command. run_eval/eval_one/load_golden are untouched
         # by Phase 1 session A, so an existing golden file or script must
@@ -2735,6 +2774,20 @@ def cmd_features(args: argparse.Namespace) -> int:
             return 2
     print(json.dumps(features.states(), indent=2))
     return 0
+
+
+def cmd_briefs(args: argparse.Namespace) -> int:
+    """`khipu briefs plan | build [--topic SLUG] [--limit N] | show SLUG`."""
+    from khipu import briefs
+
+    return briefs.cli_main(args)
+
+
+def cmd_reflect(args: argparse.Namespace) -> int:
+    """`khipu reflect "question" [--project P]`."""
+    from khipu import reflect
+
+    return reflect.cli_main(args)
 
 
 def cmd_paths(args: argparse.Namespace) -> int:
@@ -4046,6 +4099,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--replay", default=None,
         help="Build no-expectation entries from a query_log.jsonl instead of the golden file; only valid with --record/--compare",
     )
+    reval.add_argument(
+        "--rerank", choices=["on", "off"], default=None,
+        help=(
+            "Score the explicit path with the optional reranker switched on or off for this process "
+            "only; 'on' scores each entry both ways and reports the expected id's rank with and without"
+        ),
+    )
+    reval.add_argument(
+        "--relevance-floor", dest="relevance_floor", choices=["on", "off"], default=None,
+        help=(
+            "Score the chosen --path(s) with the absolute relevance gate switched on or off for this "
+            "process only; 'on' scores each entry both ways and lists every golden positive whose query the gate emptied"
+        ),
+    )
     reval.add_argument("--sample", type=int, default=None, help="With --replay: cap to N entries")
     reval.add_argument("--seed", type=int, default=0, help="With --replay --sample: deterministic sampling seed")
     rc.set_defaults(func=cmd_recall)
@@ -4114,6 +4181,23 @@ def build_parser() -> argparse.ArgumentParser:
     feat = sub.add_parser("features", help="Show or set feature switches")
     feat.add_argument("--set", nargs=2, metavar=("NAME", "VALUE"), default=None)
     feat.set_defaults(func=cmd_features)
+
+    br = sub.add_parser("briefs", help="Source-backed topic briefs: plan / build / show")
+    br_sub = br.add_subparsers(dest="briefs_cmd", required=True)
+    br_sub.add_parser("plan", help="Topics whose brief is missing or stale")
+    br_build = br_sub.add_parser(
+        "build", help="Build briefs for planned topics (needs the briefs switch on)"
+    )
+    br_build.add_argument("--topic", default=None, help="Build only this planned topic")
+    br_build.add_argument("--limit", type=int, default=5, help="Most topics to build (default 5)")
+    br_show = br_sub.add_parser("show", help="Print a topic's current brief")
+    br_show.add_argument("slug")
+    br.set_defaults(func=cmd_briefs)
+
+    rf = sub.add_parser("reflect", help="Answer a question from memory with cited evidence (needs the reflect switch on)")
+    rf.add_argument("question")
+    rf.add_argument("--project", default=None, help="Prefer sources from this project")
+    rf.set_defaults(func=cmd_reflect)
 
     comp = sub.add_parser(
         "components",

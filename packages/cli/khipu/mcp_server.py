@@ -572,6 +572,50 @@ TOOLS: list[dict] = [
             "required": ["action"],
         },
     },
+    {
+        "name": "khipu_brief",
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "description": (
+            "Read the source-backed brief for one topic: a derived summary in "
+            "which every claim lists the episode ids it came from (fetch one "
+            "with khipu_get before acting on it). state is 'current' or "
+            "'stale' (a source changed, was forgotten or was retracted since "
+            "it was built); age_seconds and source_count say how fresh and "
+            "how well-grounded it is. It is a summary, never evidence itself: "
+            "cite the episodes. Returns {available: false, reason} when "
+            "briefs are switched off or not yet set up, and found: false when "
+            "the topic has none."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"topic": {"type": "string", "description": "Topic slug (from a search hit)"}},
+            "required": ["topic"],
+        },
+    },
+    {
+        "name": "khipu_reflect",
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "description": (
+            "Answer one question from memory and show the evidence. Runs one "
+            "search, then asks the configured model to answer only from what "
+            "it found; every claim lists the episode or topic ids it rests on "
+            "(fetch one with khipu_get before acting on it), and a claim the "
+            "sources do not support is removed. Superseded or retracted "
+            "decisions are treated as history. Abstains (abstained: true, with "
+            "a reason, answer empty) rather than answer without sources. It "
+            "calls a model, so use it when you want a synthesis, not for a "
+            "lookup: khipu_search is the lookup. Writes nothing. Returns "
+            "{available: false, reason} when reflection is switched off."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "The question to answer from memory"},
+                "project": {"type": "string", "description": "Prefer sources from this project (a preference, not a filter)"},
+            },
+            "required": ["question"],
+        },
+    },
 ]
 
 
@@ -984,23 +1028,17 @@ def _tool_capture(args: dict) -> dict:
         raise ValueError("khipu_capture requires a non-empty string 'summary'")
 
     if _stdio_hook_owns_capture():
-        from khipu.session_capture import newest_session_ref, request_capture_now
+        from khipu.session_capture import request_capture_now, resolve_session_ref
 
         sid_arg = str(args.get("session_id") or "")
-        harness, sid = (sid_arg.split(":", 1) if ":" in sid_arg else (None, None))
-        if not harness or not sid:
-            ref = newest_session_ref()
-            if ref is None:
-                raise ValueError(
-                    "khipu_capture found a local capture hook (khipu-stop-hook / "
-                    "khipu-aegis-capture) but no active session to flag — no "
-                    "per-session state file exists yet (the hook has not run once "
-                    "in this session). Pass session_id='<harness>:<id>' explicitly, "
-                    "or wait for the hook's first run and retry."
-                )
-            harness, sid = ref
+        harness, _, sid = sid_arg.partition(":") if ":" in sid_arg else ("", "", sid_arg)
+        # Which session is the caller's is decided from what the hooks recorded
+        # about themselves, never from which state file is newest: two sessions
+        # can be live at once. An unresolvable caller is refused, not guessed.
+        harness, sid, resolved_by = resolve_session_ref(harness or None, sid or None)
         request_capture_now(harness, sid, note=summary.strip())
-        return {"queued": True, "captured_by": "next stop", "harness": harness, "session_id": sid}
+        return {"queued": True, "captured_by": "next stop", "harness": harness, "session_id": sid,
+                "resolved_by": resolved_by}
 
     mode = _capture_mode()
     if mode != "hub":
@@ -1259,6 +1297,39 @@ def _tool_decisions_update(args: dict) -> dict:
             return out
 
 
+def _tool_brief(args: dict) -> dict:
+    """khipu_brief: the current source-backed brief for a topic. Hub-only, no
+    snapshot fallback (same posture as decisions); the switch is checked before
+    any connection is opened."""
+    topic = (args.get("topic") or "").strip()
+    if not topic:
+        raise ValueError("topic is required")
+    _ensure_path()
+    from khipu import briefs, features
+
+    if not features.enabled("briefs"):
+        return {"available": False, "reason": briefs.REASON_SWITCH_OFF}
+    from khipu.db import connect
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            return briefs.read_brief(cur, topic)
+
+
+def _tool_reflect(args: dict) -> dict:
+    """khipu_reflect: an explicit cited answer. The switch is checked before
+    any search or connection; nothing else in the server calls this."""
+    question = (args.get("question") or "").strip()
+    if not question:
+        raise ValueError("question is required")
+    _ensure_path()
+    from khipu import features, reflect
+
+    if not features.enabled("reflect"):
+        return {"available": False, "reason": reflect.REASON_SWITCH_OFF}
+    return reflect.reflect(question, project=args.get("project") or None)
+
+
 TOOL_FUNCS = {
     "khipu_search": _tool_search,
     "khipu_get": _tool_get,
@@ -1270,6 +1341,8 @@ TOOL_FUNCS = {
     "khipu_forget": _tool_forget,
     "khipu_decisions": _tool_decisions,
     "khipu_decisions_update": _tool_decisions_update,
+    "khipu_brief": _tool_brief,
+    "khipu_reflect": _tool_reflect,
 }
 
 

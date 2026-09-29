@@ -154,6 +154,15 @@ def _mirror_to_snapshot(cur, decision_id: int) -> None:
         _log(f"snapshot mirror for decision {decision_id} failed ({type(exc).__name__}: {exc})")
 
 
+def _stale_briefs(cur, decision_id: int) -> None:
+    """A brief's claims were built under the decision states of the moment;
+    any state change makes the briefs citing this decision's episode stale
+    (khipu.briefs). Fail-open."""
+    from khipu import briefs
+
+    briefs.mark_stale_for_decision(cur, decision_id)
+
+
 def _fetch_decision_row(cur, decision_id: int) -> dict[str, Any] | None:
     cur.execute(
         "SELECT id, project, superseded_by FROM decisions WHERE id = %s",
@@ -569,6 +578,7 @@ def supersede(cur, old_id: int, new_id: int, *, source: str = "manual",
         _record_applied_link(cur, old_id, new_id, source=source, reason=reason)
     if ok:
         _mirror_to_snapshot(cur, old_id)
+        _stale_briefs(cur, old_id)
     return ok
 
 
@@ -603,6 +613,7 @@ def restore(cur, decision_id: int) -> bool:
         )
     if ok:
         _mirror_to_snapshot(cur, decision_id)
+        _stale_briefs(cur, decision_id)
     return ok
 
 
@@ -621,6 +632,7 @@ def retract(cur, decision_id: int, reason: str | None = None) -> bool:
     ok = cur.rowcount > 0
     if ok:
         _mirror_to_snapshot(cur, decision_id)
+        _stale_briefs(cur, decision_id)
     return ok
 
 
@@ -635,6 +647,7 @@ def unretract(cur, decision_id: int) -> bool:
     ok = cur.rowcount > 0
     if ok:
         _mirror_to_snapshot(cur, decision_id)
+        _stale_briefs(cur, decision_id)
     return ok
 
 

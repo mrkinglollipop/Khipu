@@ -34,6 +34,13 @@ evaluator gap):
   returns, as a control; ``--compare FILE`` reruns and diffs against it
   (identical / reordered / changed / new), exit 1 on any difference unless
   ``--allow-changes``. Latency is never part of the diff.
+- ``--rerank on|off`` scores the explicit path with the optional reranker
+  switch set for this process only; ``on`` scores every entry both ways in the
+  one run and reports the expected id's rank with and without the stage.
+- ``--relevance-floor on|off`` scores the chosen ``--path``(s) with the absolute
+  relevance floor switch set for this process only; ``on`` scores every entry
+  both ways and reports abstention correctness per path and each golden
+  positive whose query the gate emptied, by query.
 - ``--replay LOG [--sample N] [--seed S]`` builds no-expectation entries from
   a ``query_log.jsonl`` for realistic-traffic record/compare runs; only valid
   together with ``--record`` or ``--compare``.
@@ -482,3 +489,171 @@ def load_replay_entries(
     if sample is not None and sample < len(entries):
         entries = random.Random(seed).sample(entries, sample)
     return entries
+
+
+# Rank is read over a window wider than any entry's k so an expected id the
+# reranker pulls up from just outside the top k still shows as a rank.
+RERANK_RANK_WINDOW = 12
+_RERANK_ENV = "KHIPU_FEATURE_RERANK"
+
+
+def _rank_of(expect: set[str], payload: dict[str, Any]) -> int | None:
+    for rank, row in enumerate(payload.get("results") or [], start=1):
+        if str(row.get("id")) in expect:
+            return rank
+    return None
+
+
+def _explicit_once(entry: dict[str, Any], *, rerank: bool) -> dict[str, Any]:
+    """One explicit search with the rerank switch forced on or off through its
+    environment leg (never config.json), restored afterwards."""
+    import os
+
+    from khipu.embed import hybrid_search
+
+    prior = os.environ.get(_RERANK_ENV)
+    os.environ[_RERANK_ENV] = "1" if rerank else "0"
+    try:
+        return hybrid_search(
+            str(entry["query"]), mode=str(entry.get("mode") or "hybrid"),
+            limit=RERANK_RANK_WINDOW, project=entry.get("project"),
+            since=entry.get("since"), until=entry.get("until"),
+        )
+    except Exception as exc:  # noqa: BLE001 — a broken line scores no rank, not a crash
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        if prior is None:
+            os.environ.pop(_RERANK_ENV, None)
+        else:
+            os.environ[_RERANK_ENV] = prior
+
+
+def run_rerank_eval(entries: list[dict[str, Any]], *, rerank: bool) -> dict[str, Any]:
+    """Explicit-path rank of each entry's expected id without the reranker and,
+    when ``rerank`` is True, with it too: one run, the same entries both ways.
+    ``rank_*`` is the 1-based position of the first expected id within the top
+    ``RERANK_RANK_WINDOW`` results; None when absent or the search failed
+    (``error_*`` says which)."""
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        expect = {str(x) for x in (entry.get("expect") or [])}
+        without = _explicit_once(entry, rerank=False)
+        row: dict[str, Any] = {
+            "query": str(entry["query"]), "expect": sorted(expect),
+            "rank_without": _rank_of(expect, without),
+            "rank_with": None, "rerank": None,
+        }
+        if without.get("error"):
+            row["error_without"] = without["error"]
+        if rerank:
+            staged = _explicit_once(entry, rerank=True)
+            row["rank_with"] = _rank_of(expect, staged)
+            row["rerank"] = staged.get("rerank")
+            if staged.get("error"):
+                row["error_with"] = staged["error"]
+        rows.append(row)
+    scored = [r for r in rows if r["expect"]]
+    summary: dict[str, Any] = {
+        "entries": len(scored),
+        "found_without": sum(1 for r in scored if r["rank_without"] is not None),
+    }
+    if rerank:
+        def _pos(rank: int | None) -> float:
+            return float("inf") if rank is None else rank
+
+        summary.update({
+            "found_with": sum(1 for r in scored if r["rank_with"] is not None),
+            "improved": sum(1 for r in scored if _pos(r["rank_with"]) < _pos(r["rank_without"])),
+            "worsened": sum(1 for r in scored if _pos(r["rank_with"]) > _pos(r["rank_without"])),
+            "applied": sum(1 for r in scored if (r["rerank"] or {}).get("applied")),
+        })
+    return {"rerank": "on" if rerank else "off", "window": RERANK_RANK_WINDOW,
+            "summary": summary, "rows": rows}
+
+
+_RELEVANCE_ENV = "KHIPU_FEATURE_RELEVANCE_FLOOR"
+
+
+class _floor_switch:
+    """Force the relevance-floor switch on or off through its environment leg
+    (never config.json) for one block, restoring the prior value after."""
+
+    def __init__(self, on: bool):
+        self._on = on
+        self._prior: str | None = None
+
+    def __enter__(self):
+        import os
+
+        self._prior = os.environ.get(_RELEVANCE_ENV)
+        os.environ[_RELEVANCE_ENV] = "1" if self._on else "0"
+        return self
+
+    def __exit__(self, *exc):
+        import os
+
+        if self._prior is None:
+            os.environ.pop(_RELEVANCE_ENV, None)
+        else:
+            os.environ[_RELEVANCE_ENV] = self._prior
+        return False
+
+
+def run_relevance_eval(
+    entries: list[dict[str, Any]], paths: tuple[str, ...], *, floor: bool,
+    budget_ms: int = DEFAULT_STATUS_BUDGET_MS,
+) -> dict[str, Any]:
+    """Score every entry on every requested path with the relevance floor
+    forced off and, when ``floor`` is True, on too: one run, the same entries
+    both ways. Per path: abstention correctness under the requested setting
+    (and without the floor, for contrast) and ``emptied_positives`` — each
+    golden positive whose query the gate emptied although the baseline
+    returned rows, by query. That list is the regression; it should be
+    empty."""
+    rows: list[dict[str, Any]] = []
+    by_path: dict[str, list[dict[str, Any]]] = {p: [] for p in paths}
+    for entry in entries:
+        for path in paths:
+            if not _entry_applies(entry, path):
+                continue
+            with _floor_switch(False):
+                base = eval_one_path(entry, path, budget_ms=budget_ms)
+            row: dict[str, Any] = {
+                "query": base["query"], "path": path, "expect_none": base["expect_none"],
+                "got_without": base["got"], "hit_without": base["hit"],
+                "abstain_correct_without": base["abstain_correct"],
+                "got_with": None, "hit_with": None, "abstain_correct_with": None,
+            }
+            if floor:
+                with _floor_switch(True):
+                    staged = eval_one_path(entry, path, budget_ms=budget_ms)
+                row.update({
+                    "got_with": staged["got"], "hit_with": staged["hit"],
+                    "abstain_correct_with": staged["abstain_correct"],
+                })
+            rows.append(row)
+            by_path[path].append(row)
+
+    def _summary(items: list[dict[str, Any]]) -> dict[str, Any]:
+        side = "with" if floor else "without"
+        abstain = [r for r in items if r["expect_none"]]
+        positive = [r for r in items if not r["expect_none"]]
+        out: dict[str, Any] = {
+            "entries": len(items),
+            "abstain_total": len(abstain),
+            "abstain_correct": sum(1 for r in abstain if r[f"abstain_correct_{side}"]),
+            "positives": len(positive),
+            "positives_found": sum(1 for r in positive if r[f"hit_{side}"]),
+        }
+        if floor:
+            out["abstain_correct_without"] = sum(1 for r in abstain if r["abstain_correct_without"])
+            out["emptied_positives"] = [
+                r["query"] for r in positive if r["got_without"] and not r["got_with"]
+            ]
+        return out
+
+    return {
+        "relevance_floor": "on" if floor else "off",
+        "paths": {p: _summary(by_path[p]) for p in paths},
+        "rows": rows,
+    }

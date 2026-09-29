@@ -59,6 +59,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -796,28 +797,159 @@ def _consume_capture_now(harness: str, sid: str) -> dict | None:
     return data if isinstance(data, dict) else {}
 
 
-def newest_session_ref() -> tuple[str, str] | None:
-    """(harness, sid) of the most recently touched per-session state file —
-    for a caller with no session id of its own to go on (`khipu capture now`
-    with no explicit --harness/--session-id, the MCP khipu_capture tool on a
-    hook-owned install). Approximate, like the queue-file parsing in
-    _queue_by_harness: state file names are already lossy (_safe()), so this
-    is "the session someone just used," not an identity lookup."""
+# A capture-now request has to name a session that is actually being captured,
+# and its caller (the MCP server, the CLI) is not the hook, so it has no session
+# id of its own. Each hook run therefore records two facts about itself in the
+# session's state file (its working directory and its process ancestry), and
+# resolve_session_ref matches the caller against them.
+ANCESTOR_LOOKUP_TIMEOUT_S = 1
+ONLY_ACTIVE_WINDOW_S = 30 * 60
+PROCESS_MATCH_MAX_AGE_S = 12 * 60 * 60
+
+
+def ancestor_pids(pid: int | None = None) -> list[int]:
+    """Ancestor process ids of ``pid`` (default: this process), nearest first,
+    pid 1 and the process itself excluded. One ``ps`` call. Fails open to an
+    empty list: it runs inside a hook, which must never raise or wait on it."""
     try:
-        files = [p for p in state_dir().glob("*--*.json") if not p.name.endswith(".capture-now.json")]
-    except OSError:
-        return None
-    if not files:
-        return None
+        start = os.getpid() if pid is None else int(pid)
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="], capture_output=True, text=True,
+            timeout=ANCESTOR_LOOKUP_TIMEOUT_S, check=False,
+        ).stdout
+        parent: dict[int, int] = {}
+        for line in out.splitlines():
+            cols = line.split()
+            if len(cols) == 2:
+                parent[int(cols[0])] = int(cols[1])
+        chain: list[int] = []
+        cur = parent.get(start, 0)
+        while cur > 1 and cur not in chain and len(chain) < 64:
+            chain.append(cur)
+            cur = parent.get(cur, 0)
+        return chain
+    except Exception:  # noqa: BLE001 — an identity hint must never fail a hook
+        return []
+
+
+def _same_dir(a: Any, b: Any) -> bool:
     try:
-        newest = max(files, key=lambda p: p.stat().st_mtime)
+        return bool(a) and bool(b) and Path(str(a)).resolve() == Path(str(b)).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _dir_after(parts: tuple[str, ...], marker: str) -> str | None:
+    """The path component right after the last ``marker`` component."""
+    idx = [i for i, p in enumerate(parts) if p == marker]
+    return parts[idx[-1] + 1] if idx and idx[-1] + 1 < len(parts) else None
+
+
+def _transcript_project_matches(harness: str, tpath: Any, cwd: str) -> bool:
+    """For a state file that predates the recorded ``cwd``: does the project
+    directory encoded in its transcript path name the caller's directory?
+    Only where the encoding can be checked exactly: Claude Code's project
+    directory is the working directory with every non-alphanumeric character
+    replaced by '-', Aegis's session directory is the percent-encoded working
+    directory. The other harnesses give no such handle, so no match."""
+    try:
+        parts = Path(str(tpath)).parts
+        if harness == "claude_code":
+            return _dir_after(parts, "projects") == re.sub(r"[^A-Za-z0-9]", "-", str(Path(cwd).resolve()))
+        if harness == "aegis":
+            enc = _dir_after(parts, "sessions")
+            return enc is not None and _same_dir(urllib.parse.unquote(enc), cwd)
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return False
+
+
+def _capture_candidates() -> list[dict]:
+    """State files of sessions a capture-now request can target: the real
+    capture harnesses only. Anything else in the directory (the per-prompt
+    recall dedup files, a subagent's own tracking file) is not a session."""
+    out: list[dict] = []
+    try:
+        files = list(state_dir().glob("*--*.json"))
     except OSError:
-        return None
-    stem = newest.name[: -len(".json")]
-    if "--" not in stem:
-        return None
-    harness, sid = stem.split("--", 1)
-    return harness, sid
+        return out
+    for p in files:
+        if p.name.endswith(".capture-now.json"):
+            continue
+        harness, _, sid = p.name[: -len(".json")].partition("--")
+        if harness not in HARNESSES or not sid:
+            continue
+        try:
+            mtime = p.stat().st_mtime
+            st = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(st, dict) or st.get("subagent") or "_agent_" in sid:
+            continue
+        out.append({"harness": harness, "sid": sid, "mtime": mtime, "state": st})
+    return out
+
+
+def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
+                        host_pids: list[int] | None = None,
+                        cwd: str | None = None) -> tuple[str, str, str]:
+    """(harness, session id, how) for a capture-now request; ``how`` is
+    "explicit" | "process" | "cwd" | "only_active". Raises ValueError rather
+    than guess between two live sessions.
+
+    An explicit harness and session id are taken as given, the harness having
+    to be a real one. Otherwise the caller is matched to what the hooks
+    recorded: the nearest process ancestor it shares with exactly one session
+    (an ancestor every session shares says nothing), then the working
+    directory (newest wins), then the only session touched in the last half
+    hour. The caller's own ancestry and directory default to this process's."""
+    if harness and harness not in HARNESSES:
+        raise ValueError(f"unknown capture harness {harness!r}; expected one of {', '.join(HARNESSES)}")
+    if harness and sid:
+        return harness, sid, "explicit"
+    cands = [c for c in _capture_candidates() if not harness or c["harness"] == harness]
+    if sid:
+        cands = [c for c in cands if c["sid"] == _safe(sid)]
+        if len({c["harness"] for c in cands}) != 1:
+            raise ValueError(f"cannot tell the harness of session {sid!r}; pass session_id='<harness>:<id>'")
+        return cands[0]["harness"], sid, "explicit"
+    if not cands:
+        raise ValueError(
+            "no capture session found: no per-session state file exists yet (the capture "
+            "hook has not run once in this session). Pass session_id='<harness>:<id>' "
+            "explicitly, or wait for the hook's first run and retry."
+        )
+    # A process id is reused once its owner is gone, so a session that has
+    # been quiet for half a day no longer vouches for the ids it recorded.
+    now = time.time()
+    live = [c for c in cands if now - c["mtime"] <= PROCESS_MATCH_MAX_AGE_S]
+    for pid in (ancestor_pids() if host_pids is None else host_pids):
+        holders = [c for c in live if pid in (c["state"].get("host_pids") or [])]
+        if holders and len(holders) < len(live):
+            if len(holders) == 1:
+                return holders[0]["harness"], holders[0]["sid"], "process"
+            break
+    if cwd is None:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = ""
+    if cwd:
+        same = [c for c in cands
+                if _same_dir(c["state"].get("cwd"), cwd)
+                or (not c["state"].get("cwd")
+                    and _transcript_project_matches(c["harness"], c["state"].get("transcript_path"), cwd))]
+        if same:
+            best = max(same, key=lambda c: c["mtime"])
+            return best["harness"], best["sid"], "cwd"
+    recent = [c for c in cands if now - c["mtime"] <= ONLY_ACTIVE_WINDOW_S]
+    if len(recent) == 1:
+        return recent[0]["harness"], recent[0]["sid"], "only_active"
+    names = ", ".join(f"{c['harness']}:{c['sid'][:8]}" for c in sorted(cands, key=lambda c: -c["mtime"]))
+    raise ValueError(
+        f"cannot tell which session is yours among {names}; "
+        "pass session_id='<harness>:<id>' (the full session id)."
+    )
 
 
 # ---- high-value turn trigger (K1) ------------------------------------------------
@@ -1161,7 +1293,12 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
         # transcript against THIS, not its mtime: Aegis writes housekeeping
         # (workflow_updated) into idle sessions' updates.jsonl, so mtime moves
         # with no turn in it (2026-08-24 false red).
-        st.update(seen_end=new_off, seen_ts=time.time(), transcript_path=str(path))
+        st.update(seen_end=new_off, seen_ts=time.time(), transcript_path=str(path),
+                  host_pids=ancestor_pids())
+        if session_cwd(env):
+            st["cwd"] = session_cwd(env)
+        if is_subagent_stop:
+            st["subagent"] = True
         if not due and turns:
             # When this session's uncaptured window began (its last capture, or
             # first sight) — liveness ages pending turns from here.
