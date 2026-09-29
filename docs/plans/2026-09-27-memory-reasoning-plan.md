@@ -25,3 +25,5 @@ Each row is one bounded session with its own brief, owned files and oracle. The 
 Phase 4A may run independently of Phase 3B after its own prerequisites pass; parallel work requires separate ownership. No phase is dispatched before its dependencies are satisfied.
 
 The first implementation slice is **Phase 0, session A**. Full Hindsight benchmarking, engine replacement, team authorization, UI redesign and release work are not prerequisites or silently added scope. The final handoff names remaining external gates, exact source and deployed revisions, local test evidence, and rollback state.
+
+**Status, 29 September 2026.** Phases 0 through 4 are built and merged, and the Aegis adapter is open as a pull request in that repository. Which switches are on, which were rejected and why is in [the gate record](../research/switch-gates-2026-09-29.md). Phase 5 (live acceptance in each harness) is the remaining work, together with the items that record lists as not enabled.
