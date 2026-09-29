@@ -75,6 +75,8 @@ _CAPABILITIES = (
     # Phase 3, session B.
     "search.rerank",
     "replica.deliverables",
+    # Phase 4, session A.
+    "briefs.read",
 )
 
 

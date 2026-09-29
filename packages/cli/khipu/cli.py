@@ -2749,6 +2749,13 @@ def cmd_features(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_briefs(args: argparse.Namespace) -> int:
+    """`khipu briefs plan | build [--topic SLUG] [--limit N] | show SLUG`."""
+    from khipu import briefs
+
+    return briefs.cli_main(args)
+
+
 def cmd_paths(args: argparse.Namespace) -> int:
     from khipu.paths import paths_status, set_data_dir
 
@@ -4133,6 +4140,18 @@ def build_parser() -> argparse.ArgumentParser:
     feat = sub.add_parser("features", help="Show or set feature switches")
     feat.add_argument("--set", nargs=2, metavar=("NAME", "VALUE"), default=None)
     feat.set_defaults(func=cmd_features)
+
+    br = sub.add_parser("briefs", help="Source-backed topic briefs: plan / build / show")
+    br_sub = br.add_subparsers(dest="briefs_cmd", required=True)
+    br_sub.add_parser("plan", help="Topics whose brief is missing or stale")
+    br_build = br_sub.add_parser(
+        "build", help="Build briefs for planned topics (needs the briefs switch on)"
+    )
+    br_build.add_argument("--topic", default=None, help="Build only this planned topic")
+    br_build.add_argument("--limit", type=int, default=5, help="Most topics to build (default 5)")
+    br_show = br_sub.add_parser("show", help="Print a topic's current brief")
+    br_show.add_argument("slug")
+    br.set_defaults(func=cmd_briefs)
 
     comp = sub.add_parser(
         "components",

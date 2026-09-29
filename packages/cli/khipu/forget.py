@@ -13,6 +13,7 @@ probe's cleanup, the ``khipu_forget`` MCP tool) so all of it happens:
   5. its deliverable rows → deleted
   6. its line in the legacy file, after a backup copy of the file
   7. the local sqlite replica, if one exists (deleted_at + its embeddings)
+  8. every brief citing it → stale (migration 0025)
 
 B3 in docs/research/hindsight-plan-review-2026-09-28.md: forgetting used to
 stop at step 3 — a forgotten episode's decisions and deliverables stayed
@@ -56,6 +57,17 @@ def _decision_evidence_ready(cur) -> bool:
         from khipu.db import has_columns
 
         return has_columns(cur, "decisions", "retracted_at", "retract_reason")
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
+def _briefs_ready(cur) -> bool:
+    """Same check as ``khipu.briefs._ready`` (migration 0025), duplicated —
+    see ``_deliverables_ready`` above."""
+    try:
+        from khipu.db import has_columns
+
+        return has_columns(cur, "briefs", "id", "source_episode_ids", "state", "superseded_at")
     except Exception:  # noqa: BLE001 — introspection is best-effort
         return False
 
@@ -105,6 +117,15 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         )
         decisions_retracted = cur.rowcount
 
+    briefs_staled = 0
+    if _briefs_ready(cur):
+        cur.execute(
+            "UPDATE briefs SET state = 'stale' WHERE state = 'current' AND superseded_at IS NULL "
+            "AND source_episode_ids && %s::bigint[]",
+            ([episode_id],),
+        )
+        briefs_staled = cur.rowcount
+
     ts_iso = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
     return {
         "ok": True,
@@ -116,6 +137,7 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         "commitment_vectors_removed": commitment_vectors_removed,
         "deliverables_removed": deliverables_removed,
         "decisions_retracted": decisions_retracted,
+        "briefs_staled": briefs_staled,
         "graph": "topic nodes are shared across episodes; none removed",
         "identity": {"ts": ts_iso, "summary_md5": hashlib.md5((summary or "").encode("utf-8")).hexdigest()},
     }

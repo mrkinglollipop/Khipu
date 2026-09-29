@@ -596,15 +596,24 @@ def _snapshot_search_hits(
     return {"hits": fused, "legs": legs, "degraded": degraded, **result_extra}
 
 
+_PROJECT_FOR_CWD: dict[str, str | None] = {}
+
+
 def _project_for_cwd(cwd: str | None) -> str | None:
+    """The project for a working directory, resolved once per process: the
+    lookup runs git, and one prompt asks for it more than once."""
     if not cwd:
         return None
+    if cwd in _PROJECT_FOR_CWD:
+        return _PROJECT_FOR_CWD[cwd]
     try:
         from khipu.identity import resolve_repo_root
 
-        return resolve_repo_root(cwd).get("project")
+        project = resolve_repo_root(cwd).get("project")
     except Exception:  # noqa: BLE001 — a git failure must not sink recall
         return None
+    _PROJECT_FOR_CWD[cwd] = project
+    return project
 
 
 def _search_hits(
@@ -1140,9 +1149,7 @@ def _deliverable_context_line(tokens: list[str], *, cwd: str | None) -> str:
     if not tokens or not cwd:
         return ""
     try:
-        from khipu.identity import resolve_repo_root
-
-        project = resolve_repo_root(cwd).get("project")
+        project = _project_for_cwd(cwd)
         if not project:
             return ""
         try:

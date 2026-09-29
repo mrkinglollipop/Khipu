@@ -572,6 +572,26 @@ TOOLS: list[dict] = [
             "required": ["action"],
         },
     },
+    {
+        "name": "khipu_brief",
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "description": (
+            "Read the source-backed brief for one topic: a derived summary in "
+            "which every claim lists the episode ids it came from (fetch one "
+            "with khipu_get before acting on it). state is 'current' or "
+            "'stale' (a source changed, was forgotten or was retracted since "
+            "it was built); age_seconds and source_count say how fresh and "
+            "how well-grounded it is. It is a summary, never evidence itself: "
+            "cite the episodes. Returns {available: false, reason} when "
+            "briefs are switched off or not yet set up, and found: false when "
+            "the topic has none."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"topic": {"type": "string", "description": "Topic slug (from a search hit)"}},
+            "required": ["topic"],
+        },
+    },
 ]
 
 
@@ -1253,6 +1273,25 @@ def _tool_decisions_update(args: dict) -> dict:
             return out
 
 
+def _tool_brief(args: dict) -> dict:
+    """khipu_brief: the current source-backed brief for a topic. Hub-only, no
+    snapshot fallback (same posture as decisions); the switch is checked before
+    any connection is opened."""
+    topic = (args.get("topic") or "").strip()
+    if not topic:
+        raise ValueError("topic is required")
+    _ensure_path()
+    from khipu import briefs, features
+
+    if not features.enabled("briefs"):
+        return {"available": False, "reason": briefs.REASON_SWITCH_OFF}
+    from khipu.db import connect
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            return briefs.read_brief(cur, topic)
+
+
 TOOL_FUNCS = {
     "khipu_search": _tool_search,
     "khipu_get": _tool_get,
@@ -1264,6 +1303,7 @@ TOOL_FUNCS = {
     "khipu_forget": _tool_forget,
     "khipu_decisions": _tool_decisions,
     "khipu_decisions_update": _tool_decisions_update,
+    "khipu_brief": _tool_brief,
 }
 
 
