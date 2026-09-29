@@ -22,9 +22,9 @@ Read [the scope](../plans/2026-09-27-memory-reasoning-scope.md) first. It requir
 | `relevance_floor` | 20 unseen subjects | 17 abstain with the gate on, 0 with it off | |
 | `relevance_floor` | Golden set, explicit path | 8 of 8 positives found, none emptied | On |
 | `reflect` | Three questions against the production hub | Two answered with every claim cited to an offered source; the unseen subject abstained. 8 to 13 s per question. | On. It runs only when asked. |
-| `decision_details` | Eight real session transcripts, three runs each on two of them | Attribution (`by`) present on every detail; `rationale` and `reverses` almost always empty. The count of plain decisions varies run to run with and without the block, and the sampled sessions were still changing, so the comparison is not clean. | **Not enabled.** Needs frozen transcripts. |
-| `auto_supersede` | Depends on `reverses` from `decision_details` | No reversal was produced in the sample | **Not enabled.** |
-| `briefs` | Unit and scratch-database tests only | Not yet run against the production hub or a real model | **Not enabled.** |
+| `decision_details` | Ten finished session transcripts, frozen, two runs per arm on identical input | Decisions per run: 4.6 without the block, 4.3 with it; runs yielding none: 4 of 20 without, 5 of 20 with. With it, every detail is attributed, about 60% carry a rationale and a few name what they reverse. One transcript of ten yielded decisions on both runs without the block and none on both runs with it. | **Not enabled.** The gain is real, and so is the risk of losing a session's decisions. |
+| `auto_supersede` | Depends on `reverses` from `decision_details` | Follows `decision_details` | **Not enabled.** |
+| `briefs` | Two topics built against the production hub with the configured model, then rebuilt | Both built with every kept claim cited; one uncited claim was removed; the rebuild did no work because the sources had not changed. 525 topics are planned, 3.5 million characters in all. | On. The nightly builds at most 40 a night. |
 
 **The relevance floor's number.** On the production embedding profile the best match for the 20 unseen subjects scored a cosine of 0.57 to 0.64, and the best match for the 149 real prompts scored 0.67 to 0.82. The floor is 0.65. A first version that filtered row by row did nothing, because one common word ("rules", "train", "history") was enough to keep a row; the gate that replaced it asks whether any row in the list is evidence and otherwise leaves the list alone.
 
@@ -32,5 +32,7 @@ Read [the scope](../plans/2026-09-27-memory-reasoning-scope.md) first. It requir
 
 - With `decision_details` on, the model often wrote a decision only in the detail block, and a detail that matched no listed decision was dropped. A session that yielded seven decisions without the block yielded none with it. A detail's text now joins the decision list.
 - A malformed detail block made the whole model answer unparseable, and the capture job retried without end. The block is now cut out and the rest parsed.
+
+**Extraction is noisy with or without the block.** On identical input two runs of today's extraction returned 10 and 0 decisions for one transcript and 5 and 15 for another. That is a property of the existing extraction, not of this work, and it bounds how small a difference any of these comparisons can detect.
 
 **What is not covered.** The unseen subjects are far from anything in memory; a prompt on a nearby subject that memory does not hold will still get its nearest neighbours. The blind judge is a model, not the user. Latency was measured on a machine under heavy unrelated load.
