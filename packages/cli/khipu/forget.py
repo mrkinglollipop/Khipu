@@ -1,4 +1,4 @@
-"""Complete forgetting (2026-09-05).
+"""Complete forgetting (2026-09-05; extended Phase 2, session A).
 
 ``khipu episode forget ID`` used to tombstone the row and drop its vectors
 and stop there: the commitments it opened stayed open, and its line in the
@@ -9,7 +9,17 @@ probe's cleanup, the ``khipu_forget`` MCP tool) so all of it happens:
   1. episodes.deleted_at = now()            (search, activity, doctor skip it)
   2. its episode vectors                    (memory_embeddings)
   3. commitments it opened → closed, close_reason 'forgotten', plus their vectors
-  4. its line in the legacy file, after a backup copy of the file
+  4. its decision rows → retracted, retract_reason 'forgotten' (migration 0024)
+  5. its deliverable rows → deleted
+  6. its line in the legacy file, after a backup copy of the file
+  7. the local sqlite replica, if one exists (deleted_at + its embeddings)
+
+B3 in docs/research/hindsight-plan-review-2026-09-28.md: forgetting used to
+stop at step 3 — a forgotten episode's decisions and deliverables stayed
+readable through every other reader. Steps 4-5 close that; every reader
+(khipu.decisions, khipu.deliverables) also independently excludes a
+forgotten episode's rows, so this cascade is belt-and-suspenders cleanup,
+not the only thing standing between a forgotten row and a reader.
 
 Topic nodes and edges in the graph are shared by every episode that mentions
 the topic and carry no episode provenance, so they are left alone and the
@@ -25,6 +35,29 @@ from pathlib import Path
 from typing import Any
 
 LOCAL_HARNESSES = ("claude_code", "cursor", "codex", "aegis")
+
+
+def _deliverables_ready(cur) -> bool:
+    """Same check as ``khipu.deliverables._deliverables_ready``, duplicated
+    (not imported) — this module already stands alone from every writer it
+    cascades into, and a readiness probe is one line."""
+    try:
+        from khipu.db import has_columns
+
+        return has_columns(cur, "deliverables", "id", "project", "kind")
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
+def _decision_evidence_ready(cur) -> bool:
+    """Same check as ``khipu.decisions._evidence_ready`` (migration 0024),
+    duplicated — see ``_deliverables_ready`` above."""
+    try:
+        from khipu.db import has_columns
+
+        return has_columns(cur, "decisions", "retracted_at", "retract_reason")
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
 
 
 def forget_episode(cur, episode_id: int) -> dict[str, Any]:
@@ -57,6 +90,21 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         (episode_id,),
     )
     commitments_closed = cur.rowcount
+
+    deliverables_removed = 0
+    if _deliverables_ready(cur):
+        cur.execute("DELETE FROM deliverables WHERE episode_id = %s", (episode_id,))
+        deliverables_removed = cur.rowcount
+
+    decisions_retracted = 0
+    if _decision_evidence_ready(cur):
+        cur.execute(
+            "UPDATE decisions SET retracted_at = now(), retract_reason = 'forgotten' "
+            "WHERE episode_id = %s AND retracted_at IS NULL",
+            (episode_id,),
+        )
+        decisions_retracted = cur.rowcount
+
     ts_iso = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
     return {
         "ok": True,
@@ -66,6 +114,8 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         "embeddings_removed": embeddings_removed,
         "commitments_closed": commitments_closed,
         "commitment_vectors_removed": commitment_vectors_removed,
+        "deliverables_removed": deliverables_removed,
+        "decisions_retracted": decisions_retracted,
         "graph": "topic nodes are shared across episodes; none removed",
         "identity": {"ts": ts_iso, "summary_md5": hashlib.md5((summary or "").encode("utf-8")).hexdigest()},
     }
@@ -127,6 +177,12 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
         conn.commit()
     if not out.get("ok"):
         return out
+    try:
+        from khipu.hub_snapshot import forget_episode_in_snapshot
+
+        out["snapshot"] = forget_episode_in_snapshot(episode_id)
+    except Exception as exc:  # noqa: BLE001 — the hub write already succeeded
+        out["snapshot"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     if memory_root is None:
         try:
             from khipu.config import path_setting

@@ -196,3 +196,62 @@ class LiteralTrgmMigrationTest(unittest.TestCase):
         ):
             with self.subTest(target=target):
                 self.assertIn(target, sql)
+
+
+class DecisionEvidenceMigrationTest(unittest.TestCase):
+    """0024_decision_evidence.sql (Phase 2, session A). No live Postgres
+    fixture here (same posture as every other migrate test in this file) —
+    parses the SQL text and asserts the additive/idempotent shape every
+    reader/writer in khipu.decisions relies on."""
+
+    def _sql(self) -> str:
+        for version, path in migrate.available():
+            if version == "0024_decision_evidence":
+                return path.read_text(encoding="utf-8")
+        self.fail("0024_decision_evidence.sql not found under ops/migrations")
+
+    def test_it_self_records(self):
+        sql = self._sql()
+        self.assertIn("INSERT INTO schema_migrations", sql)
+        self.assertIn("0024_decision_evidence", sql)
+
+    def test_every_add_column_is_nullable_or_defaulted(self):
+        sql = self._sql()
+        add_column_lines = [
+            line.strip() for line in sql.splitlines()
+            if "ADD COLUMN" in line
+        ]
+        self.assertGreaterEqual(len(add_column_lines), 7)
+        for line in add_column_lines:
+            with self.subTest(line=line):
+                self.assertIn("IF NOT EXISTS", line)
+                self.assertNotIn("NOT NULL", line)  # nullable (no DEFAULT needed either)
+
+    def test_every_statement_is_idempotent(self):
+        sql = self._sql()
+        for line in sql.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("ALTER TABLE") and "ADD COLUMN" in stripped:
+                self.assertIn("IF NOT EXISTS", stripped)
+            elif stripped.startswith("CREATE TABLE"):
+                self.assertIn("IF NOT EXISTS", stripped)
+            elif stripped.startswith("CREATE INDEX"):
+                self.assertIn("IF NOT EXISTS", stripped)
+        self.assertIn("ON CONFLICT (version) DO NOTHING", sql)
+
+    def test_no_unique_index_on_decisions_itself(self):
+        """Production holds duplicate decision text (B2); a unique index on
+        `decisions` would fail to apply there."""
+        sql = self._sql()
+        self.assertNotIn("UNIQUE", sql.split("CREATE TABLE IF NOT EXISTS decision_links")[0])
+
+    def test_decision_links_has_the_documented_shape(self):
+        sql = self._sql()
+        for target in (
+            "old_id", "new_id", "kind", "confidence", "source", "reason",
+            "state", "created_at", "resolved_at",
+            "UNIQUE (old_id, new_id, kind)",
+            "ON DELETE CASCADE",
+        ):
+            with self.subTest(target=target):
+                self.assertIn(target, sql)

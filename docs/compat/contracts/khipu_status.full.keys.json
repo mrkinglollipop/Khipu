@@ -1,0 +1,12 @@
+[
+  "contract",
+  "counts",
+  "dsn_ok",
+  "hub_error",
+  "hub_snapshot",
+  "hub_unreachable",
+  "latest_episode_ts",
+  "latest_ingested_at",
+  "snapshot_refreshed_at",
+  "stale"
+]

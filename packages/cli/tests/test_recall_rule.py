@@ -347,5 +347,17 @@ class SliceBudgetTest(unittest.TestCase):
         self.assertEqual(out, lines)
 
 
+class RuleMdCeilingTest(unittest.TestCase):
+    """Part 4 (mcp_server.py) of the Phase 2A brief: "Keep its total length
+    under 5,200 characters and add a test for that ceiling.\""""
+
+    def test_rule_md_stays_under_the_character_ceiling(self):
+        self.assertLess(len(rr.RULE_MD.strip()), 5200)
+
+    def test_it_names_both_decisions_tools(self):
+        self.assertIn("khipu_decisions", rr.RULE_MD)
+        self.assertIn("khipu_decisions_update", rr.RULE_MD)
+
+
 if __name__ == "__main__":
     unittest.main()

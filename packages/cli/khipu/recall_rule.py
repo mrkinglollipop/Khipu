@@ -77,6 +77,9 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
 - `khipu_forget` forgets one episode completely (row, vectors, the
   commitments it opened, its legacy line) — for a capture that was wrong or a
   test. Through the gateway only cloud-harness captures can be forgotten.
+- `khipu_decisions` lists decisions with their validity (standing/superseded/
+  retracted/conflicts); `khipu_decisions_update` supersedes, restores,
+  retracts, confirms or rejects one — supersede the moment a decision is reversed, never for a mere refinement.
 - Capture writes: on a local Mac with a Khipu capture hook (`khipu-stop-hook`
   or `khipu-aegis-capture`) the hook is the writer, not you — but `khipu_capture`
   now works there too: call it (or `khipu capture now` in a shell) when you
@@ -262,7 +265,12 @@ def _render_project_slice(label: str, slice_data: dict) -> str:
         lines.append("### Recent episodes")
         for ep in episodes[:5]:
             text = clip_snippet(str(ep.get("summary") or ""), 200)
-            lines.append(f"- episode `{ep.get('id')}`: {text}")
+            # Phase 2, session B: khipu.validity.annotate only ever sets an
+            # episode's `status` when its state is not current — a no-op
+            # line for every episode this upgrade leaves unchanged.
+            marker = str(ep.get("status") or "").strip().lower()
+            marker_txt = f" ({marker})" if marker else ""
+            lines.append(f"- episode `{ep.get('id')}`: {text}{marker_txt}")
     topics = slice_data.get("topics") or []
     if topics:
         lines.append("### Linked topics")

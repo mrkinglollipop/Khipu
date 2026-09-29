@@ -7,6 +7,7 @@ The model call is always mocked; nothing here reaches Gemini.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -400,6 +401,104 @@ class ExtractMemoryTest(unittest.TestCase):
 
     def test_module_has_no_import_time_model_constant(self):
         self.assertFalse(hasattr(extract, "MODEL"))
+
+    # --- Phase 2, session C: decision_details ------------------------------
+
+    def test_decision_details_round_trips_through_extract_memory(self):
+        out = self._run(_reply(
+            decisions=["Ship 0.4.4 with the seal fix"],
+            decision_details=[{"text": "Ship 0.4.4 with the seal fix", "by": "user",
+                                "rationale": "soak passed", "reverses": None}],
+        ))
+        self.assertEqual(out["decision_details"], [
+            {"text": "Ship 0.4.4 with the seal fix", "by": "user",
+             "rationale": "soak passed", "reverses": None},
+        ])
+
+    def test_decision_details_defaults_to_empty_list(self):
+        out = self._run(_reply())
+        self.assertEqual(out["decision_details"], [])
+
+
+class DecisionDetailsPromptTest(unittest.TestCase):
+    """Phase 2, session C: the prompt gains ONE appended section, only when
+    the `decision_details` switch is on. With the switch off (the default),
+    the invariant "the extraction prompt is byte-identical to today's"
+    (docs/plans/2026-09-27-memory-reasoning-scope.md) is pinned by hash so a
+    future edit to PROMPT or the splice point can't silently drift it."""
+
+    PINNED_SHA256 = "3daecbf561e21cecadf67313d126810add6a77b01c08845004dc67867afcab5c"
+
+    def test_prompt_is_byte_identical_with_the_switch_off(self):
+        with mock.patch("khipu.features.enabled", return_value=False):
+            prompt = extract._build_prompt(cwd="/x", transcript="t")
+        self.assertEqual(prompt, extract.PROMPT.format(cwd="/x", transcript="t"))
+        self.assertEqual(
+            hashlib.sha256(prompt.encode("utf-8")).hexdigest(), self.PINNED_SHA256
+        )
+
+    def test_the_appended_section_is_present_with_the_switch_on(self):
+        with mock.patch("khipu.features.enabled", return_value=True):
+            prompt = extract._build_prompt(cwd="/x", transcript="t")
+        self.assertIn("decision_details", prompt)
+        self.assertIn("reverses", prompt)
+        # the transcript trailer still follows, untouched by the splice
+        self.assertIn("Session project (cwd): /x", prompt)
+        self.assertIn("Transcript:\nt", prompt)
+        self.assertLess(
+            prompt.index("decision_details"), prompt.index("Session project (cwd):")
+        )
+
+    def test_a_switch_registry_failure_degrades_to_the_switch_off_prompt(self):
+        with mock.patch("khipu.features.enabled", side_effect=RuntimeError("boom")):
+            prompt = extract._build_prompt(cwd="/x", transcript="t")
+        self.assertEqual(prompt, extract.PROMPT.format(cwd="/x", transcript="t"))
+
+
+class DecisionDetailsParserTest(unittest.TestCase):
+    """``extract._as_decision_details`` — tolerant per BUILD item 1: nothing
+    here can make an extraction fail that would have succeeded without it."""
+
+    def test_text_must_match_a_parsed_decision_word_for_word(self):
+        out = extract._as_decision_details(
+            [{"text": "Ship 0.4.4", "by": "user"},
+             {"text": "not a real decision", "by": "user"}],
+            ["Ship 0.4.4"],
+        )
+        self.assertEqual(out, [
+            {"text": "Ship 0.4.4", "by": "user", "rationale": None, "reverses": None},
+        ])
+
+    def test_absence_and_wrong_type_are_tolerated_as_empty(self):
+        self.assertEqual(extract._as_decision_details(None, ["x"]), [])
+        self.assertEqual(extract._as_decision_details("nonsense", ["x"]), [])
+        self.assertEqual(extract._as_decision_details([{"text": "x"}], []), [])
+
+    def test_extra_keys_are_ignored_not_rejected(self):
+        out = extract._as_decision_details(
+            [{"text": "x", "by": "assistant", "extra": "ignored",
+              "rationale": "because", "reverses": "old x"}],
+            ["x"],
+        )
+        self.assertEqual(out, [
+            {"text": "x", "by": "assistant", "rationale": "because", "reverses": "old x"},
+        ])
+
+    def test_an_invalid_by_becomes_none_not_a_drop(self):
+        out = extract._as_decision_details([{"text": "x", "by": "committee"}], ["x"])
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["by"])
+
+    def test_blank_rationale_and_reverses_become_none(self):
+        out = extract._as_decision_details(
+            [{"text": "x", "rationale": "  ", "reverses": ""}], ["x"]
+        )
+        self.assertIsNone(out[0]["rationale"])
+        self.assertIsNone(out[0]["reverses"])
+
+    def test_a_non_dict_item_is_dropped(self):
+        out = extract._as_decision_details(["just a string"], ["x"])
+        self.assertEqual(out, [])
 
 
 if __name__ == "__main__":

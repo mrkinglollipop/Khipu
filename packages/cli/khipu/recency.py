@@ -9,6 +9,12 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+# Phase 2, session B: khipu.validity is the single source of truth for the
+# not-current status set; recency's own DERANKED_STATUSES below is an alias
+# of it (same members) so the de-rank here and the validity policy can never
+# drift apart.
+from khipu.validity import NOT_CURRENT_TOPIC_STATUSES as DERANKED_STATUSES
+
 HALF_LIFE_DAYS = float(os.environ.get("KHIPU_SEARCH_HALF_LIFE_DAYS", "90"))
 
 try:
@@ -59,7 +65,7 @@ def age_days(ts: Any, now: datetime | None = None) -> float | None:
 PROJECT_BOOST = 1.25
 # Topic housekeeping status (R6): free text today, but these three values are
 # the ones capture/mirror/notes actually write for "this is not current".
-DERANKED_STATUSES = frozenset({"superseded", "retired", "abandoned"})
+# DERANKED_STATUSES itself is imported above, aliased from khipu.validity.
 STATUS_DERANK = 0.5
 # P5 G5: a harness-native note's own `type` (feedback/user/project/reference,
 # set by khipu.notes._note_topic_dict and carried on the row by

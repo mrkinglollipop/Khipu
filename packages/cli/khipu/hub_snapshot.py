@@ -55,7 +55,18 @@ _TABLES = (
     "edges",
     "embedding_profiles",
     "memory_embeddings",
+    "decisions",
 )
+
+# Schema version 2 (Phase 2, session B): the replica gains `decisions` and
+# `topics.superseded_by`/`event_at` so validity can be read offline. A reader
+# probes columns/tables on the ACTUAL sqlite file (`_snapshot_table_columns`/
+# `_snapshot_has_table`) rather than trusting this constant — this is only
+# what `refresh()`/`_create_schema()` write for a NEW dump. Version 1 is the
+# pre-this-phase shape (still has project/deleted_at/harness/status etc. —
+# those predate this phase); a reader given a version-1 replica reports
+# validity as unknown rather than raising.
+SNAPSHOT_SCHEMA_VERSION = 2
 
 _EPISODE_COLS = (
     "id",
@@ -96,6 +107,32 @@ _TOPIC_COLS = (
     "source_path",
     "content_hash",
     "deleted_at",
+    # Phase 2, session B: the second existing supersession mechanism
+    # (0023_organisation.sql) and the topic's own event time
+    # (0022_event_at.sql) — both predate this phase on the hub, neither was
+    # exported to the replica before now.
+    "superseded_by",
+    "event_at",
+)
+_DECISION_COLS = (
+    "id",
+    "project",
+    "text",
+    "decided_at",
+    "episode_id",
+    "superseded_by",
+    "created_at",
+    # 0024_decision_evidence.sql columns — present only once that migration
+    # has been applied to the hub; _pg_columns' existing "only columns that
+    # exist" filter (see _insert_decisions) already handles a hub that is
+    # behind.
+    "source_kind",
+    "evidence",
+    "superseded_at",
+    "supersede_source",
+    "supersede_reason",
+    "retracted_at",
+    "retract_reason",
 )
 _TOPIC_REVISION_COLS = (
     "id",
@@ -225,6 +262,208 @@ def _snapshot_table_columns(con: sqlite3.Connection, table: str) -> set[str]:
         return set()
 
 
+def decision_counts_snapshot(
+    con: sqlite3.Connection, episode_ids: Sequence[Any]
+) -> dict[str, tuple[int, int, int]] | None:
+    """current/superseded/retracted decision counts per episode id, from the
+    local replica's ``decisions`` table — ONE indexed query (``idx_snapshot_
+    decisions_episode_id``), bounded to the caller's own already-small hit
+    set. ``None`` (not ``{}``) when the table does not exist on this replica
+    (a version-1 dump, or any other reason ``PRAGMA table_info`` comes back
+    empty) — a caller must tell that apart from "checked, found nothing" (an
+    empty dict), which ``khipu.validity.annotate`` treats as unknown vs.
+    current respectively. Never raises: a bad connection object degrades to
+    the same ``None`` a missing table would."""
+    if not episode_ids:
+        return {}
+    cols = _snapshot_table_columns(con, "decisions")
+    if not cols:
+        return None
+    try:
+        has_retract = "retracted_at" in cols
+        retract_expr = "retracted_at IS NOT NULL" if has_retract else "0"
+        placeholders = ",".join("?" for _ in episode_ids)
+        rows = con.execute(
+            f"""
+            SELECT CAST(episode_id AS TEXT),
+                   SUM(CASE WHEN NOT ({retract_expr}) AND superseded_by IS NULL THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN NOT ({retract_expr}) AND superseded_by IS NOT NULL THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN ({retract_expr}) THEN 1 ELSE 0 END)
+            FROM decisions
+            WHERE CAST(episode_id AS TEXT) IN ({placeholders})
+            GROUP BY episode_id
+            """,
+            [str(e) for e in episode_ids],
+        ).fetchall()
+        return {eid: (int(c or 0), int(s or 0), int(r or 0)) for eid, c, s, r in rows}
+    except Exception:  # noqa: BLE001 — validity is best-effort metadata, never a search failure
+        return None
+
+
+def topic_validity_meta_snapshot(
+    con: sqlite3.Connection, slugs: Sequence[str]
+) -> dict[str, dict[str, Any]]:
+    """``{slug: {"status": ..., "superseded_by": ...}}`` for ``khipu.validity.
+    annotate``'s ``topic_meta`` argument, read straight from the replica's
+    ``topics`` table — used by ``search_stale_payload``, whose rows (unlike
+    the local-lane's, which already carry status from ``snapshot_row_
+    metadata``) have neither field on them yet. ``superseded_by`` is absent
+    on a version-1 replica; probed, never assumed."""
+    if not slugs:
+        return {}
+    has_superseded_by = "superseded_by" in _snapshot_table_columns(con, "topics")
+    superseded_expr = "superseded_by" if has_superseded_by else "NULL"
+    placeholders = ",".join("?" for _ in slugs)
+    try:
+        rows = con.execute(
+            f"SELECT slug, status, {superseded_expr} FROM topics WHERE slug IN ({placeholders})",
+            list(slugs),
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — validity metadata is best-effort
+        return {}
+    return {slug: {"status": status, "superseded_by": superseded_by} for slug, status, superseded_by in rows}
+
+
+def apply_decision_changes(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Upsert decision rows into the local replica's ``decisions`` table —
+    the write half of validity's local-lane visibility (Phase 2, session B):
+    ``khipu.decisions`` calls this right after a successful supersede/
+    restore/retract on THIS machine so the local lane sees the correction at
+    once; ``sync_decision_changes`` below calls it for corrections made
+    elsewhere. Same lock/fail-open contract as ``upsert_episode``: a no-op
+    ``{"ok": False}`` when the snapshot is missing, too old to have a
+    ``decisions`` table, or a full dump is in progress — never a raise.
+    """
+    if not rows:
+        return {"ok": True, "decisions": 0}
+    path = snapshot_path()
+    if not path.is_file():
+        return {"ok": False, "error": "hub snapshot missing"}
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
+    try:
+        con = sqlite3.connect(str(path))
+        try:
+            written = _write_decision_rows(con, rows)
+            if written is None:
+                return {"ok": False, "error": "replica has no decisions table (version 1)"}
+            con.commit()
+        finally:
+            con.close()
+        return {"ok": True, "decisions": written}
+    except Exception as exc:  # noqa: BLE001 — the PG write already succeeded
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        _release_refresh_lock(lock)
+
+
+def _write_decision_rows(con: sqlite3.Connection, rows: Sequence[Mapping[str, Any]]) -> int | None:
+    """Insert-or-replace ``rows`` into ``con``'s ``decisions`` table. Caller
+    owns the transaction (commit/rollback) and any locking — this never
+    commits or acquires a lock itself, so ``upsert_episode`` (already
+    holding the refresh lock) and ``apply_decision_changes`` (which acquires
+    its own) can both use it without a reentrant-lock risk. Returns ``None``
+    (not 0) when the replica has no ``decisions`` table at all, so a caller
+    can tell that apart from "zero rows written"."""
+    cols_present = _snapshot_table_columns(con, "decisions")
+    if not cols_present:
+        return None
+    written = 0
+    ts_cols = {"decided_at", "created_at", "superseded_at", "retracted_at"}
+    for row in rows:
+        rid = row.get("id")
+        if rid is None:
+            continue
+        cols = [c for c in _DECISION_COLS if c in row and c in cols_present]
+        if "id" not in cols:
+            cols = ["id", *cols]
+        vals = []
+        for c in cols:
+            v = row.get(c)
+            if c == "evidence":
+                v = _json_text(v)
+            elif c in ts_cols:
+                v = _ts_text(v)
+            vals.append(v)
+        con.execute("DELETE FROM decisions WHERE id = ?", (rid,))
+        con.execute(
+            f"INSERT INTO decisions ({', '.join(cols)}) "
+            f"VALUES ({', '.join('?' * len(cols))})",
+            vals,
+        )
+        written += 1
+    return written
+
+
+def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
+    """Pull decision rows changed on the hub since this replica's last sync
+    and mirror them locally — "corrections made elsewhere" (Phase 2, session
+    B): the capture drain, which already talks to the hub for every capture,
+    calls this so a supersession made on a DIFFERENT machine reaches this
+    machine's local recall lane without a dedicated sync job. No hook may
+    call this directly (a per-prompt/session-start hook must never open a
+    hub connection on its own).
+
+    Bounded to ``limit`` rows per call, oldest-changed first, ordered so a
+    caller that never quite catches up still makes forward progress instead
+    of re-scanning the same window. Its own watermark
+    (``last_decision_sync_at``) lives in the meta file, separate from
+    ``refreshed_at`` (a full dump does not imply this has run, and vice
+    versa). Fail-open throughout: any failure — hub unreachable, replica
+    missing or too old — returns ``{"ok": False, ...}``, never raises.
+    """
+    path = snapshot_path()
+    if not path.is_file():
+        return {"ok": False, "error": "hub snapshot missing"}
+    con = sqlite3.connect(str(path))
+    try:
+        if not _snapshot_table_columns(con, "decisions"):
+            return {"ok": False, "error": "replica has no decisions table (version 1)"}
+    finally:
+        con.close()
+    m = meta()
+    since = m.get("last_decision_sync_at")
+    try:
+        with try_hub_connect() as pg:
+            with pg.cursor() as cur:
+                cols = [c for c in _DECISION_COLS if c in _pg_columns(cur, "decisions")]
+                if "id" not in cols:
+                    return {"ok": False, "error": "hub decisions table not migrated"}
+                watermark_expr = "created_at"
+                if "superseded_at" in cols:
+                    watermark_expr = f"GREATEST({watermark_expr}, COALESCE(superseded_at, {watermark_expr}))"
+                if "retracted_at" in cols:
+                    watermark_expr = f"GREATEST({watermark_expr}, COALESCE(retracted_at, {watermark_expr}))"
+                sel = ", ".join(cols)
+                params: list[Any] = []
+                where = ""
+                if since:
+                    where = f"WHERE {watermark_expr} > %s"
+                    params.append(since)
+                cur.execute(
+                    f"SELECT {sel}, {watermark_expr} AS _watermark FROM decisions "
+                    f"{where} ORDER BY _watermark ASC LIMIT %s",
+                    (*params, limit),
+                )
+                fetched = cur.fetchall()
+    except Exception as exc:  # noqa: BLE001 — fail-open, same posture as maybe_refresh
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if not fetched:
+        return {"ok": True, "decisions": 0}
+    rows = [dict(zip(cols, r[:-1])) for r in fetched]
+    out = apply_decision_changes(rows)
+    if out.get("ok"):
+        new_watermark = fetched[-1][-1]
+        m["last_decision_sync_at"] = _ts_text(new_watermark) or _utcnow_iso()
+        try:
+            meta_path().write_text(json.dumps(m, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    out.setdefault("decisions", len(rows))
+    return out
+
+
 def _json_text(val: Any) -> str | None:
     if val is None:
         return None
@@ -265,9 +504,18 @@ def _blob_to_vector(blob: bytes) -> list[float]:
     return list(struct.unpack(f"{n}f", blob[: n * 4]))
 
 
-def _create_schema(con: sqlite3.Connection) -> None:
+def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VERSION) -> None:
+    """``version=2`` (default): the current shape, always what ``refresh()``
+    writes for a real dump. ``version=1``: the pre-Phase-2B shape (no
+    ``decisions`` table, no ``topics.superseded_by``/``event_at``, no
+    ``snapshot_meta``) — for tests exercising a reader's tolerance of an
+    older replica. Every reader in this module probes the ACTUAL file
+    (``_snapshot_table_columns``/``_snapshot_has_table``), never this
+    parameter, so a version-1 replica behaves exactly as a real one dumped
+    before this phase would."""
+    topic_extra_cols = ",\n            superseded_by TEXT,\n            event_at TEXT" if version >= 2 else ""
     con.executescript(
-        """
+        f"""
         CREATE TABLE episodes (
             id INTEGER PRIMARY KEY,
             ts TEXT,
@@ -300,7 +548,7 @@ def _create_schema(con: sqlite3.Connection) -> None:
             frontmatter TEXT,
             source_path TEXT,
             content_hash TEXT,
-            deleted_at TEXT
+            deleted_at TEXT{topic_extra_cols}
         );
         CREATE TABLE topic_revisions (
             id INTEGER PRIMARY KEY,
@@ -354,6 +602,37 @@ def _create_schema(con: sqlite3.Connection) -> None:
         );
         """
     )
+    if version >= 2:
+        con.executescript(
+            """
+            CREATE TABLE decisions (
+                id INTEGER PRIMARY KEY,
+                project TEXT,
+                text TEXT,
+                decided_at TEXT,
+                episode_id INTEGER,
+                superseded_by INTEGER,
+                created_at TEXT,
+                source_kind TEXT,
+                evidence TEXT,
+                superseded_at TEXT,
+                supersede_source TEXT,
+                supersede_reason TEXT,
+                retracted_at TEXT,
+                retract_reason TEXT
+            );
+            CREATE INDEX idx_snapshot_decisions_episode_id ON decisions (episode_id);
+
+            CREATE TABLE snapshot_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            """
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('schema_version', ?)",
+            (str(SNAPSHOT_SCHEMA_VERSION),),
+        )
 
 
 def _pg_columns(cur, table: str) -> set[str]:
@@ -525,6 +804,35 @@ def _insert_memory_embeddings(cur, con: sqlite3.Connection) -> int:
     return len(rows)
 
 
+def _insert_decisions(cur, con: sqlite3.Connection) -> int:
+    """Phase 2, session B. Empty (returns 0, no error) on a hub still at
+    migration 0019 — ``_pg_columns`` only selects columns that exist there,
+    so this degrades to the six pre-0024 columns exactly like every other
+    ``khipu.decisions`` reader/writer does."""
+    cols = [c for c in _DECISION_COLS if c in _pg_columns(cur, "decisions")]
+    if not cols:
+        return 0
+    sel = ", ".join(cols)
+    cur.execute(f"SELECT {sel} FROM decisions ORDER BY id")
+    rows = cur.fetchall()
+    ph = ", ".join(cols)
+    ts_cols = {"decided_at", "created_at", "superseded_at", "retracted_at"}
+    for row in rows:
+        vals = []
+        for col, val in zip(cols, row, strict=True):
+            if col == "evidence":
+                vals.append(_json_text(val))
+            elif col in ts_cols:
+                vals.append(_ts_text(val))
+            else:
+                vals.append(val)
+        con.execute(
+            f"INSERT INTO decisions ({ph}) VALUES ({', '.join('?' * len(cols))})",
+            vals,
+        )
+    return len(rows)
+
+
 def refresh() -> dict[str, Any]:
     """Dump hub tables into a fresh sqlite file and atomically replace the snapshot.
 
@@ -564,6 +872,7 @@ def refresh() -> dict[str, Any]:
                     counts["memory_embeddings"] = _insert_memory_embeddings(
                         cur, con
                     )
+                    counts["decisions"] = _insert_decisions(cur, con)
             con.commit()
             con.close()
             os.replace(tmp_path, dest)
@@ -572,6 +881,7 @@ def refresh() -> dict[str, Any]:
             meta_path().write_text(
                 json.dumps(
                     {
+                        "schema_version": SNAPSHOT_SCHEMA_VERSION,
                         "refreshed_at": refreshed_at,
                         "size_bytes": size_bytes,
                         "counts": counts,
@@ -586,6 +896,7 @@ def refresh() -> dict[str, Any]:
                 "refreshed_at": refreshed_at,
                 "size_bytes": size_bytes,
                 "counts": counts,
+                "schema_version": SNAPSHOT_SCHEMA_VERSION,
             }
         except Exception:
             tmp_path.unlink(missing_ok=True)
@@ -618,9 +929,16 @@ def _release_refresh_lock(lock) -> None:
 
 
 def upsert_episode(
-    episode_row: Mapping[str, Any], embedding_rows: Sequence[Mapping[str, Any]]
+    episode_row: Mapping[str, Any],
+    embedding_rows: Sequence[Mapping[str, Any]],
+    decision_rows: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
-    """Incremental snapshot update: one episode + its embedding chunks (W2.4).
+    """Incremental snapshot update: one episode + its embedding chunks (W2.4),
+    plus (Phase 2, session B) any decision rows minted for it in the same
+    capture — additive and optional, so every existing caller (just
+    ``episode_row``/``embedding_rows``) is unchanged. Written via
+    ``apply_decision_changes`` under the SAME lock this function already
+    holds, so a full dump never interleaves with either half.
 
     Called from ``embed.embed_on_capture`` right after a successful embed, so
     a search that falls back to the sqlite replica (hub unreachable) sees a
@@ -678,6 +996,12 @@ def upsert_episode(
                     f"VALUES ({', '.join('?' * len(ecols))})",
                     evals,
                 )
+            if decision_rows:
+                # Best-effort: an old (version-1) replica has no decisions
+                # table at all — _write_decision_rows returns None, not an
+                # error, for that case, and the episode/embedding write
+                # above must still commit regardless.
+                _write_decision_rows(con, decision_rows)
             con.commit()
         finally:
             con.close()
@@ -733,6 +1057,44 @@ def upsert_embeddings(embedding_rows: Sequence[Mapping[str, Any]]) -> dict[str, 
         m["last_incremental_upsert_at"] = _utcnow_iso()
         meta_path().write_text(json.dumps(m, indent=2), encoding="utf-8")
         return {"ok": True, "embeddings": len(embedding_rows)}
+    finally:
+        _release_refresh_lock(lock)
+
+
+def forget_episode_in_snapshot(episode_id: int) -> dict[str, Any]:
+    """Mark one episode forgotten in the local sqlite replica too (Phase 2,
+    session A — ``forget.forget_everywhere``'s replica half): sets
+    ``episodes.deleted_at`` and removes its ``memory_embeddings`` rows, under
+    the same refresh lock as ``refresh()``/``upsert_episode()`` so a full
+    dump and this incremental tombstone can never interleave.
+
+    Fail-open, never a raise: the hub write (``forget.forget_episode``) is
+    already durable by the time this runs, so a missing snapshot or a dump
+    in progress just means the replica catches up at the next refresh."""
+    path = snapshot_path()
+    if not path.is_file():
+        return {"ok": False, "error": "hub snapshot missing"}
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
+    try:
+        con = sqlite3.connect(str(path))
+        try:
+            cur = con.execute(
+                "UPDATE episodes SET deleted_at = ? WHERE id = ?",
+                (_utcnow_iso(), episode_id),
+            )
+            updated = cur.rowcount
+            con.execute(
+                "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ?",
+                (str(episode_id),),
+            )
+            con.commit()
+        finally:
+            con.close()
+        return {"ok": True, "episode_id": episode_id, "updated": bool(updated)}
+    except Exception as exc:  # noqa: BLE001 — the hub write already succeeded
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     finally:
         _release_refresh_lock(lock)
 
@@ -1321,12 +1683,16 @@ def graph_neighbors_snapshot(node_id: str, hops: int, limit: int) -> dict[str, A
 
 
 def episode_detail_snapshot(episode_id: int) -> dict[str, Any] | None:
+    """A forgotten (soft-deleted) episode is not found here (B3 in
+    docs/research/hindsight-plan-review-2026-09-28.md), same as the hub path
+    (``activity.episode_detail``) — the replica's ``episodes`` schema always
+    carries ``deleted_at`` (``_create_schema``), so no gating is needed here."""
     con = open_snapshot()
     row = con.execute(
         """
         SELECT id, ts, ingested_at, session_id, scope, summary,
                topics, people, decisions, preferences, edges, raw
-        FROM episodes WHERE id = ?
+        FROM episodes WHERE id = ? AND deleted_at IS NULL
         """,
         (episode_id,),
     ).fetchone()
@@ -1762,9 +2128,14 @@ def snapshot_row_metadata(
             meta[("episode", eid)] = {"ts": ts, "project": proj, "deleted": deleted is not None}
     if topic_ids:
         placeholders = ",".join("?" for _ in topic_ids)
-        for slug, ts, status, frontmatter, deleted in con.execute(
-            f"SELECT slug, COALESCE(updated_at, created_at), status, frontmatter, deleted_at "
-            f"FROM topics WHERE slug IN ({placeholders})",
+        # superseded_by (Phase 2, session B) is absent on a version-1
+        # replica — probe rather than assume, same posture as every other
+        # column this module reads from an old dump.
+        has_superseded_by = "superseded_by" in _snapshot_table_columns(con, "topics")
+        superseded_expr = "superseded_by" if has_superseded_by else "NULL"
+        for slug, ts, status, frontmatter, deleted, superseded_by in con.execute(
+            f"SELECT slug, COALESCE(updated_at, created_at), status, frontmatter, "
+            f"deleted_at, {superseded_expr} FROM topics WHERE slug IN ({placeholders})",
             topic_ids,
         ).fetchall():
             proj = None
@@ -1775,7 +2146,7 @@ def snapshot_row_metadata(
                     proj = None
             meta[("topic", slug)] = {
                 "ts": ts, "status": status or "active", "project": proj,
-                "deleted": deleted is not None,
+                "deleted": deleted is not None, "superseded_by": superseded_by,
             }
     for r in rows:
         m = meta.get((r.get("kind"), str(r.get("id"))))
@@ -1791,6 +2162,8 @@ def snapshot_row_metadata(
             item["project"] = m["project"]
         if "status" in m:
             item["status"] = m["status"]
+        if m.get("superseded_by"):
+            item["superseded_by"] = m["superseded_by"]
         out.append(item)
     return out
 
@@ -1815,6 +2188,37 @@ def _snapshot_filters_dropped(*, session_id: str | None, harness: str | None) ->
     return dropped
 
 
+def _graph_candidates_snapshot(con, results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Switch-gated graph-candidate leg shared by both ``search_stale_
+    payload`` branches (Phase 3, session A: "the replica [backend] serves
+    the local prompt lane and the stale-replica payload"). ``results`` is
+    used as-is for seeding (it is the caller's own already-ranked list, no
+    fusion has happened yet on this path the way ``embed.hybrid_search``
+    fuses several candidate lists — a single ranked list is still one valid
+    input to ``fuse_ranked_lists``). Returns ``(results, degraded_legs)``;
+    ``degraded_legs`` is ``[]`` unless the switch is on and the leg missed
+    or errored."""
+    from khipu import features as _features
+
+    if not _features.enabled("graph_candidates"):
+        return results, []
+    try:
+        import time as _time
+
+        from khipu import graph_candidates as _gc
+        from khipu.search_text import fuse_ranked_lists
+
+        deadline = _time.monotonic() + _gc.REPLICA_LEG_DEADLINE_S
+        cand_rows, missed = _gc.replica_candidates(con, results, deadline=deadline)
+        if missed:
+            return results, ["graph_candidates"]
+        if cand_rows:
+            results = fuse_ranked_lists([results, cand_rows], limit=max(len(results), 1) + len(cand_rows))
+        return results, []
+    except Exception:  # noqa: BLE001 — a candidate-leg failure must not sink the search
+        return results, ["graph_candidates"]
+
+
 def search_stale_payload(
     query: str,
     limit: int,
@@ -1826,12 +2230,21 @@ def search_stale_payload(
     project: str | None = None,
     session_id: str | None = None,
     harness: str | None = None,
+    tz: str | None = None,
 ) -> dict[str, Any]:
     """Hub-unreachable search fallback (sqlite replica). Honours kind/since/
     until/project/session_id/harness on both the semantic and literal paths
     (W2.3 minimum bar, fix 7 for the metadata filters) — any filter this
     snapshot genuinely cannot honour is named in ``filters_dropped``, never
-    silently ignored."""
+    silently ignored. Phase 2, session B: episode/topic rows carry
+    ``validity`` too — this is a recall surface like any other.
+
+    ``tz`` (Phase 3, session A) is accepted for the same signature as
+    ``embed.hybrid_search``/``khipu_search``; this fallback path does not
+    itself carry a per-row ``ts`` before enrichment, so — unlike the local
+    prompt lane and the explicit hub search — it wires only the graph-
+    candidates leg here, not time interpretation.
+    """
     filters_dropped = _snapshot_filters_dropped(session_id=session_id, harness=harness)
     if semantic:
         results = semantic_search_snapshot(
@@ -1839,25 +2252,53 @@ def search_stale_payload(
             project=project, session_id=session_id, harness=harness,
         )
         con = open_snapshot()
+        results, degraded_legs = _graph_candidates_snapshot(con, results)
         results = enrich_search_results_snapshot(con, results)
-        return {
+        results = _annotate_snapshot_validity(con, results)
+        out = {
             "query": query,
             "mode": "semantic",
             "results": results,
             "filters_dropped": filters_dropped,
             **stale_fields(),
         }
+        if degraded_legs:
+            out["degraded_legs"] = degraded_legs
+        return out
     con = open_snapshot()
     results = search_snapshot(
         query, limit, kind=kind, since=since, until=until,
         project=project, session_id=session_id, harness=harness,
     )
     results = merge_outbox_episodes(results)
+    results, degraded_legs = _graph_candidates_snapshot(con, results)
     results = enrich_search_results_snapshot(con, results)
-    return {
+    results = _annotate_snapshot_validity(con, results)
+    out = {
         "query": query,
         "mode": "literal",
         "results": results[:limit],
         "filters_dropped": filters_dropped,
         **stale_fields(),
     }
+    if degraded_legs:
+        out["degraded_legs"] = degraded_legs
+    return out
+
+
+def _annotate_snapshot_validity(
+    con: sqlite3.Connection, results: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """``khipu.validity.annotate`` for a general (not latency-bounded)
+    replica search — up to two small, guarded queries, never raising: a
+    validity-annotation failure must not cost the caller its search results."""
+    try:
+        from khipu import validity as _validity
+
+        episode_ids = [r["id"] for r in results if r.get("kind") == "episode"]
+        counts = decision_counts_snapshot(con, episode_ids) if episode_ids else {}
+        topic_ids = [str(r["id"]) for r in results if r.get("kind") == "topic"]
+        topic_meta = topic_validity_meta_snapshot(con, topic_ids) if topic_ids else {}
+        return _validity.annotate(results, counts, topic_meta)
+    except Exception:  # noqa: BLE001 — validity is additive; a search must still return
+        return results

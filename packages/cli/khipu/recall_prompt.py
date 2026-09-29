@@ -159,7 +159,21 @@ def _save_recent_batches(session_id: str, batches: list[tuple[str, ...]]) -> Non
 
 
 def _hit_ids(hits: list[dict[str, Any]]) -> tuple[str, ...]:
-    return tuple(sorted(f"{h.get('kind')}:{h.get('id')}" for h in hits))
+    """Dedup-batch keys (R11). Phase 2, session B: a key gains an
+    ``@<token>`` suffix only when ``khipu.validity.revision_token`` is
+    non-empty — so a key for an unchanged (current/unknown) row stays
+    byte-identical across this upgrade, and a row whose validity changed
+    since the last batch is shown again instead of silently suppressed."""
+    from khipu.validity import revision_token
+
+    keys = []
+    for h in hits:
+        key = f"{h.get('kind')}:{h.get('id')}"
+        token = revision_token(h)
+        if token:
+            key = f"{key}@{token}"
+        keys.append(key)
+    return tuple(sorted(keys))
 
 
 class _TimedOut(Exception):
@@ -357,7 +371,9 @@ class _SnapshotUnusable(Exception):
     hub. Carries the reason so it can be logged (never silently)."""
 
 
-def _snapshot_search_hits(prompt: str, *, project: str | None) -> dict[str, Any]:
+def _snapshot_search_hits(
+    prompt: str, *, project: str | None, tz: str | None = None
+) -> dict[str, Any]:
     """Lexical + cosine, RRF-fused, entirely against the local sqlite
     replica — no Postgres, no network round trip beyond one (cacheable)
     embed API call. Raises ``_SnapshotUnusable`` when the replica is
@@ -475,13 +491,96 @@ def _snapshot_search_hits(prompt: str, *, project: str | None) -> dict[str, Any]
 
     fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
     con = hub_snapshot.open_snapshot()
+
+    # Graph candidates (Phase 3, session A): switch-gated, own 150ms
+    # deadline, dropped entirely (never partially) on a miss — named in
+    # `degraded_legs`, not silently absorbed into `degraded` above (that
+    # field is already owned by the lexical/cosine legs' own vocabulary).
+    # Seeds are the top 5 rows of `fused` as fused above, before any of the
+    # metadata/validity passes below touch it.
+    degraded_legs: list[str] = []
+    from khipu import features as _features
+
+    if _features.enabled("graph_candidates"):
+        try:
+            from khipu import graph_candidates as _gc
+
+            gc_deadline = time.monotonic() + _gc.REPLICA_LEG_DEADLINE_S
+            cand_rows, missed = _gc.replica_candidates(con, fused, deadline=gc_deadline)
+            if missed:
+                degraded_legs.append("graph_candidates")
+            elif cand_rows:
+                # This lane's `via` is the bare seed id (e.g.
+                # "topic:billing-service"), not graph_candidates' own
+                # {seed, relation} dict — the compact per-prompt block has
+                # no room for the relation detail the hub leg keeps.
+                for r in cand_rows:
+                    via = r.get("via")
+                    if isinstance(via, dict):
+                        r["via"] = via.get("seed")
+                fused = fuse_ranked_lists([fused, cand_rows], limit=_SEARCH_LIMIT)
+                legs.append("graph_candidates")
+        except Exception as exc:  # noqa: BLE001 — a candidate-leg failure must not sink the search
+            degraded_legs.append("graph_candidates")
+            _log(f"snapshot graph-candidates leg skipped: {type(exc).__name__}: {exc}")
+
     fused = hub_snapshot.snapshot_row_metadata(con, fused)
     fused = apply_project_and_status(fused, project=project)
+
+    # Time interpretation (Phase 3, session A): switch-gated. This lane never
+    # receives an explicit since/until from its caller (the per-prompt hook
+    # has no such input), so the only gate needed here is the switch itself.
+    # A preference (apply_time_boost), never a filter — nothing is excluded.
+    interpretation: dict[str, Any] | None = None
+    if _features.enabled("time_interpretation"):
+        try:
+            from khipu import timeparse as _timeparse
+
+            interpretation = _timeparse.interpret(prompt, datetime.now(timezone.utc), tz)
+            if interpretation:
+                fused = _timeparse.apply_time_boost(fused, interpretation)
+        except Exception as exc:  # noqa: BLE001 — additive, never a search failure
+            _log(f"snapshot time interpretation skipped: {type(exc).__name__}: {exc}")
+            interpretation = None
+
+    # Validity annotation (Phase 2, session B): ONE indexed sqlite query
+    # (decision_counts_snapshot, idx_snapshot_decisions_episode_id), bounded
+    # to this already-small fused set (<= _SEARCH_LIMIT). Topic validity
+    # rides free on the snapshot_row_metadata pass above — no second query.
+    # Best-effort: a failure here (a fake/mocked `con` in a test, a genuinely
+    # broken replica) must never cost the caller its search hits.
+    try:
+        from khipu import validity as _validity
+
+        episode_ids = [r["id"] for r in fused if r.get("kind") == "episode"]
+        counts = hub_snapshot.decision_counts_snapshot(con, episode_ids) if episode_ids else {}
+        topic_meta = {
+            str(r["id"]): {"status": r.get("status"), "superseded_by": r.get("superseded_by")}
+            for r in fused if r.get("kind") == "topic"
+        }
+        fused = _validity.annotate(fused, counts, topic_meta)
+        # An interpreted window counts as a history cue too (scope, "BUILD —
+        # time interpretation" #2), even though it was never an explicit
+        # filter — is_historical only looks at presence, not provenance.
+        hist_since = interpretation.get("since") if interpretation else None
+        hist_until = interpretation.get("until") if interpretation else None
+        fused = _validity.apply_ranking(
+            fused, historical=_validity.is_historical(prompt, hist_since, hist_until)
+        )
+    except Exception as exc:  # noqa: BLE001 — validity is additive, never a search failure
+        _log(f"snapshot validity annotation skipped: {type(exc).__name__}: {exc}")
+
+    result_extra: dict[str, Any] = {}
+    if degraded_legs:
+        result_extra["degraded_legs"] = degraded_legs
+    if interpretation:
+        result_extra["time_interpretation"] = interpretation
+
     # Deliberately NOT truncated to `limit` here: the caller applies the
     # score floor over this full oversample first, then truncates — flooring
     # an already-3-row slice starved the floor of the context it needs (a
     # real #2/#3 hit can legitimately sit well below a dominant #1's score).
-    return {"hits": fused, "legs": legs, "degraded": degraded}
+    return {"hits": fused, "legs": legs, "degraded": degraded, **result_extra}
 
 
 def _project_for_cwd(cwd: str | None) -> str | None:
@@ -495,7 +594,9 @@ def _project_for_cwd(cwd: str | None) -> str | None:
         return None
 
 
-def _search_hits(prompt: str, *, cwd: str | None, limit: int = TOP_N) -> dict[str, Any]:
+def _search_hits(
+    prompt: str, *, cwd: str | None, limit: int = TOP_N, tz: str | None = None
+) -> dict[str, Any]:
     """The gated search itself (no timeout, no dedup — those wrap this).
 
     Local snapshot first (R1 follow-up): fast, no network round trip beyond
@@ -517,9 +618,14 @@ def _search_hits(prompt: str, *, cwd: str | None, limit: int = TOP_N) -> dict[st
     project = _project_for_cwd(cwd)
 
     try:
-        result = _snapshot_search_hits(prompt, project=project)
+        result = _snapshot_search_hits(prompt, project=project, tz=tz)
         hits = _apply_score_floor(result["hits"])[:limit]
-        return {"hits": hits, "legs": result["legs"], "degraded": result["degraded"]}
+        out = {"hits": hits, "legs": result["legs"], "degraded": result["degraded"]}
+        if "degraded_legs" in result:
+            out["degraded_legs"] = result["degraded_legs"]
+        if "time_interpretation" in result:
+            out["time_interpretation"] = result["time_interpretation"]
+        return out
     except _SnapshotUnusable as exc:
         _log(f"snapshot unusable ({exc}) — falling back to hub")
     except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls back
@@ -549,6 +655,10 @@ DEFAULT_HUB_BUDGET_MS = 600
 # absolute give-up backstop against a genuine hang (e.g. a wedged connection),
 # same posture as TIMEOUT_S above.
 _BUDGET_SAFETY_SLACK_S = 0.3
+# Phase 2, session B: minimum headroom left before `deadline` to still
+# attempt the validity counts query in _hub_hits_budgeted — a query started
+# with less than this left would only make an already-tight lane worse.
+_VALIDITY_QUERY_MIN_S = 0.05
 
 
 def _hub_hits_budgeted(
@@ -663,18 +773,67 @@ def _hub_hits_budgeted(
 
     fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
     fused = apply_project_and_status(fused, project=project)
+
+    # Validity annotation (Phase 2, session B): one counts query for the
+    # fused rows, reusing decisions.enrich_search_results (the exact same
+    # helper the explicit hub search already calls) — only attempted while
+    # there is real headroom left before the deadline; a query started this
+    # close to the wire would just make the lane worse, the thing this whole
+    # function exists to prevent. When skipped, every row's validity state is
+    # "unknown" and, unless a leg already set a more specific reason, so is
+    # `degraded`.
+    from khipu import validity as _validity
+
+    episode_ids = [r["id"] for r in fused if r.get("kind") == "episode"]
+    episode_counts: dict[str, tuple[int, int, int]] | None = None
+    if episode_ids and (deadline - time.monotonic()) > _VALIDITY_QUERY_MIN_S:
+        try:
+            from khipu.db import connect
+            from khipu.decisions import enrich_search_results as _enrich_decisions
+
+            with connect() as conn:
+                with conn.cursor() as cur2:
+                    enriched = _enrich_decisions(cur2, fused)
+            enriched_episodes = [r for r in enriched if r.get("kind") == "episode"]
+            if enriched_episodes and "decisions_current" in enriched_episodes[0]:
+                fused = enriched
+                episode_counts = {
+                    str(r["id"]): (
+                        int(r.get("decisions_current") or 0),
+                        int(r.get("decisions_superseded") or 0),
+                        int(r.get("decisions_retracted") or 0),
+                    )
+                    for r in enriched_episodes
+                }
+        except Exception as exc:  # noqa: BLE001 — validity is additive, never a search failure
+            _log(f"budgeted validity counts skipped: {type(exc).__name__}: {exc}")
+    if episode_ids and episode_counts is None:
+        degraded = degraded or "validity unknown"
+    topic_meta = {
+        str(r["id"]): {"status": r.get("status"), "superseded_by": r.get("superseded_by")}
+        for r in fused if r.get("kind") == "topic"
+    }
+    fused = _validity.annotate(fused, episode_counts, topic_meta)
+    fused = _validity.apply_ranking(fused, historical=_validity.is_historical(prompt))
+
     hits = _apply_score_floor(fused)[:limit]
     return {"hits": hits, "legs": legs, "degraded": degraded}
 
 
 def _search_hits_budgeted(
-    prompt: str, *, cwd: str | None, budget_ms: int, limit: int = TOP_N
+    prompt: str, *, cwd: str | None, budget_ms: int, limit: int = TOP_N,
+    project: str | None = None,
 ) -> dict[str, Any]:
     """``khipu_status``'s ``prior_work`` path (R10 + this phase): local
     snapshot first when fresh (already sub-300ms measured — see
     ``_snapshot_search_hits``'s docstring), the concurrent hub budgeted
     search otherwise (the gateway has no local snapshot to try at all, so
     this falls through to it immediately). Never raises.
+
+    ``project`` (Phase 2, session B) is a FALLBACK, used only when ``cwd`` is
+    absent or fails to resolve a project — the gateway cannot resolve a
+    caller's path at all, so ``khipu_status`` lets a caller name the project
+    directly. ``cwd``, when it resolves, still wins.
 
     Returns the same shape as ``_hub_hits_budgeted``:
     ``{"hits": [...], "legs": [...], "degraded": str | None}`` — when the
@@ -683,7 +842,7 @@ def _search_hits_budgeted(
     ``["lexical"]`` with ``degraded="embedding late"``, not a single opaque
     ``"snapshot"`` placeholder).
     """
-    project = _project_for_cwd(cwd)
+    project = _project_for_cwd(cwd) or project
     try:
         result = _snapshot_search_hits(prompt, project=project)
         hits = _apply_score_floor(result["hits"])[:limit]
@@ -705,15 +864,23 @@ def _row_date(row: dict[str, Any]) -> str:
 
 
 def _row_tag(row: dict[str, Any]) -> str:
+    """Phase 2, session B: an episode line now shows its validity marker
+    AFTER the project (``khipu.validity.annotate`` only ever sets an episode
+    row's ``status`` when its state is not current, so this is a no-op for
+    every row this upgrade leaves unchanged — additive only)."""
     bits = [f"{row.get('kind', '?')} {row.get('id', '?')}"]
     date = _row_date(row)
     if date:
         bits.append(date)
     status = str(row.get("status") or "").strip().lower()
-    if row.get("kind") == "topic" and status:
-        bits.append(f"status {status}")
-    elif row.get("project"):
-        bits.append(f"project {row['project']}")
+    if row.get("kind") == "topic":
+        if status:
+            bits.append(f"status {status}")
+    else:
+        if row.get("project"):
+            bits.append(f"project {row['project']}")
+        if status:
+            bits.append(f"status {status}")
     return " · ".join(bits)
 
 
@@ -750,13 +917,40 @@ def render_block(hits: list[dict[str, Any]]) -> str:
 # ---- top-level: gate, timeout, dedup, log -----------------------------------
 
 
+_OUTCOME_VALUES = frozenset({"match", "no_match", "gated", "dedup", "timeout", "error"})
+# Mirrors mcp_server._PRIOR_WORK_GATED_REASONS — duplicated rather than
+# imported so this module (called from a UserPromptSubmit hook on every
+# prompt) never has to import mcp_server.
+_PRIOR_WORK_GATED_REASONS_FOR_OUTCOME = frozenset({"no content tokens", "trivial acknowledgment"})
+
+
+def _outcome_for(reason: str, hits: list[Any]) -> str:
+    """The closed-set ``outcome`` for ``prior_work_meta`` (Retrieval and
+    multi-harness contract, docs/plans/2026-09-27-memory-reasoning-scope.md):
+    a client can honor an abstention (``no_match``) instead of overriding it
+    with a second search, and can tell a real ``no_match`` apart from
+    ``gated``/``timeout``/``error``, none of which mean "checked, found
+    nothing"."""
+    if reason == "dedup":
+        return "dedup"
+    if reason.startswith("timeout>"):
+        return "timeout"
+    if reason.startswith("error:"):
+        return "error"
+    if reason in _PRIOR_WORK_GATED_REASONS_FOR_OUTCOME or reason.startswith("gate error:"):
+        return "gated"
+    return "match" if hits else "no_match"
+
+
 def prior_work_for_prompt(
     prompt: str,
     *,
     cwd: str | None = None,
+    project: str | None = None,
     session_id: str | None = None,
     limit: int = TOP_N,
     budget_ms: int | None = None,
+    tz: str | None = None,
 ) -> dict[str, Any]:
     """The whole pipeline as a plain function: gate -> bounded search -> score
     floor -> dedup. Returns ``{"context": str, "hits": [...], "reason": str,
@@ -780,16 +974,27 @@ def prior_work_for_prompt(
     ``_search_hits_budgeted`` (concurrent lexical+cosine hub legs, returns
     whatever finished by the deadline). When set, the result ALSO carries
     ``prior_work_meta``: ``{"legs": [...], "ms": float, "degraded": str |
-    None, "reason": str}`` — the same legs/degraded, nested, for callers that
-    only want to look when they opted into a budget.
+    None, "reason": str, "outcome": str}`` — the same legs/degraded, nested,
+    for callers that only want to look when they opted into a budget.
+    ``outcome`` (Phase 2, session B) is a closed set — match, no_match,
+    gated, dedup, timeout, error — present whenever ``prior_work_meta`` is,
+    so a client (Aegis among them) can honor a deliberate ``no_match``
+    abstention instead of treating an empty result as "field unsupported"
+    and running a second search of its own.
     """
     t0 = time.monotonic()
     prompt = (prompt or "").strip()
 
-    def _meta(*, legs: list[str] = (), degraded: str | None = None, reason: str, ms: float = 0.0):
+    def _meta(
+        *, legs: list[str] = (), degraded: str | None = None, reason: str,
+        ms: float = 0.0, hits: list[Any] = (),
+    ):
         if budget_ms is None:
             return None
-        return {"legs": list(legs), "ms": ms, "degraded": degraded, "reason": reason}
+        return {
+            "legs": list(legs), "ms": ms, "degraded": degraded, "reason": reason,
+            "outcome": _outcome_for(reason, list(hits)),
+        }
 
     def _gated(reason: str) -> dict[str, Any]:
         out = {"context": "", "hits": [], "reason": reason, "ms": 0.0}
@@ -815,21 +1020,27 @@ def prior_work_for_prompt(
     reason = "ok"
     legs: list[str] = []
     degraded: str | None = None
+    degraded_legs: list[str] = []
+    interpretation: dict[str, Any] | None = None
     try:
         if budget_ms is not None:
             outer_timeout = max(0.05, budget_ms / 1000.0) + _BUDGET_SAFETY_SLACK_S
             result = _run_with_timeout(
                 _search_hits_budgeted, outer_timeout,
-                prompt, cwd=cwd, budget_ms=budget_ms, limit=limit,
+                prompt, cwd=cwd, budget_ms=budget_ms, limit=limit, project=project,
             )
             hits = result.get("hits") or []
             legs = result.get("legs") or []
             degraded = result.get("degraded")
         else:
-            result = _run_with_timeout(_search_hits, TIMEOUT_S, prompt, cwd=cwd, limit=limit)
+            result = _run_with_timeout(
+                _search_hits, TIMEOUT_S, prompt, cwd=cwd, limit=limit, tz=tz
+            )
             hits = result.get("hits") or []
             legs = result.get("legs") or []
             degraded = result.get("degraded")
+            degraded_legs = result.get("degraded_legs") or []
+            interpretation = result.get("time_interpretation")
     except _TimedOut:
         budget_s = (budget_ms / 1000.0) if budget_ms is not None else TIMEOUT_S
         reason = f"timeout>{budget_s}s"
@@ -847,7 +1058,7 @@ def prior_work_for_prompt(
             dedup_out = {"context": "", "hits": [], "reason": "dedup", "ms": ms}
             dedup_out["legs"] = legs
             dedup_out["degraded"] = degraded
-            dedup_meta = _meta(legs=legs, degraded=degraded, reason="dedup", ms=ms)
+            dedup_meta = _meta(legs=legs, degraded=degraded, reason="dedup", ms=ms, hits=hits)
             if dedup_meta is not None:
                 dedup_out["prior_work_meta"] = dedup_meta
             return dedup_out
@@ -867,7 +1078,11 @@ def prior_work_for_prompt(
     out = {"context": context, "hits": hits or [], "reason": reason, "ms": ms}
     out["legs"] = legs
     out["degraded"] = degraded
-    meta = _meta(legs=legs, degraded=degraded, reason=reason, ms=ms)
+    if degraded_legs:
+        out["degraded_legs"] = degraded_legs
+    if interpretation:
+        out["time_interpretation"] = interpretation
+    meta = _meta(legs=legs, degraded=degraded, reason=reason, ms=ms, hits=hits or [])
     if meta is not None:
         out["prior_work_meta"] = meta
     return out

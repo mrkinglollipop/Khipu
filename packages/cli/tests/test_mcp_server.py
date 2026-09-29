@@ -106,6 +106,8 @@ class ProtocolTest(unittest.TestCase):
                 "khipu_forget",
                 "khipu_capture",
                 "khipu_owed",
+                "khipu_decisions",
+                "khipu_decisions_update",
             },
         )
         for tool in out["result"]["tools"]:
@@ -515,7 +517,7 @@ class SearchStaleFallbackForwardingTest(unittest.TestCase):
         captured = {}
 
         def fake_stale(query, limit, *, semantic, kind, since, until,
-                        project, session_id, harness):
+                        project, session_id, harness, tz=None):
             captured.update(project=project, session_id=session_id, harness=harness)
             return {"query": query, "mode": "literal", "results": [], "filters_dropped": []}
 
@@ -705,6 +707,15 @@ class StatusPriorWorkTest(unittest.TestCase):
         # caller with no local snapshot/hook (Aegis, the gateway) never has
         # to know the parameter exists to get the budgeted behavior.
         self.assertEqual(m.call_args.kwargs["budget_ms"], 600)
+
+    def test_project_argument_is_forwarded(self):
+        """Phase 2, session B: `project` lets a caller with no resolvable
+        `cwd` (the gateway) still get the project boost."""
+        with mock.patch(
+            "khipu.recall_prompt.prior_work_for_prompt", return_value=_PRIOR_WORK_OK,
+        ) as m:
+            self._status({"prompt": "what did we decide", "project": "acme/widget", "full": True})
+        self.assertEqual(m.call_args.kwargs["project"], "acme/widget")
 
     def test_prior_work_is_the_empty_list_when_nothing_clears_the_floor(self):
         """A prompt that searched but found nothing reads as `[]` — the

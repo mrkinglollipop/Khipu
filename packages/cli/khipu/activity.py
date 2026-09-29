@@ -59,18 +59,24 @@ def recent_episodes(*, limit: int = 40) -> list[dict]:
 
 
 def episode_detail(episode_id: int) -> dict | None:
+    """A forgotten (soft-deleted) episode is not found here (B3 in
+    docs/research/hindsight-plan-review-2026-09-28.md: this used to return a
+    forgotten episode in full), gated on ``episodes.deleted_at`` being
+    present so a pre-migration hub keeps its old behavior instead of every
+    lookup failing."""
     with connect() as conn:
         with conn.cursor() as cur:
             from khipu.db import has_columns
 
             has_verbatim = has_columns(cur, "episodes", "verbatim")
             verbatim_col = "verbatim" if has_verbatim else "NULL::jsonb AS verbatim"
+            live_clause = "AND deleted_at IS NULL " if has_columns(cur, "episodes", "deleted_at") else ""
             cur.execute(
                 f"""
                 SELECT id, ts, ingested_at, session_id, scope, summary,
                        topics, people, decisions, preferences, edges, raw, {verbatim_col}
                 FROM episodes
-                WHERE id = %s
+                WHERE id = %s {live_clause}
                 """,
                 (episode_id,),
             )
@@ -214,6 +220,42 @@ def activity_payload(*, limit: int = 40) -> dict:
     }
 
 
+def _annotate_episode_validity(cur, episodes: list[dict]) -> list[dict]:
+    """``khipu.validity.annotate`` for the session-start slice's own recent-
+    episode rows — one bounded query (WHERE episode_id = ANY(...), already
+    small: at most ``episode_limit``), gated on ``khipu.db.has_columns``, the
+    same posture as every other reader in this module. Never raises: a
+    validity-lookup failure degrades to "unknown", never costs the slice its
+    episode rows."""
+    if not episodes:
+        return episodes
+    from khipu.db import has_columns
+    from khipu import validity as _validity
+
+    if not has_columns(cur, "decisions", "id", "project", "text", "decided_at"):
+        return _validity.annotate(episodes, None, None)
+    try:
+        evidence_ready = has_columns(cur, "decisions", "retracted_at")
+        retract_expr = "retracted_at IS NOT NULL" if evidence_ready else "FALSE"
+        ep_ids = [e["id"] for e in episodes]
+        cur.execute(
+            f"""
+            SELECT episode_id,
+                   COUNT(*) FILTER (WHERE NOT ({retract_expr}) AND superseded_by IS NULL),
+                   COUNT(*) FILTER (WHERE NOT ({retract_expr}) AND superseded_by IS NOT NULL),
+                   COUNT(*) FILTER (WHERE {retract_expr})
+            FROM decisions
+            WHERE episode_id = ANY(%s)
+            GROUP BY episode_id
+            """,
+            (ep_ids,),
+        )
+        counts = {str(eid): (int(c), int(s), int(r)) for eid, c, s, r in cur.fetchall()}
+    except Exception:  # noqa: BLE001 — the slice degrades, never fails
+        return _validity.annotate(episodes, None, None)
+    return _validity.annotate(episodes, counts, None)
+
+
 def project_slice(
     *,
     project: str | None,
@@ -294,6 +336,7 @@ def project_slice(
                 )
                 cols = ("id", "ts", "summary", "topics")
                 episodes = [dict(zip(cols, row)) for row in cur.fetchall()]
+                episodes = _annotate_episode_validity(cur, episodes)
 
             topic_slugs: list[str] = []
             for ep in episodes:

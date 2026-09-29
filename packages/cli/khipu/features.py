@@ -56,7 +56,22 @@ _CAPABILITIES = (
     "prior_work.budget",
     "owed",
     "forget",
+    "forget.cascade",
+    "decisions.tools",
+    "decisions.evidence",
+    "tools.annotations",
     "launchers.read_only",
+    # Phase 2, session B.
+    "validity.markers",
+    "prior_work.outcome",
+    "prior_work.project",
+    "replica.schema_version",
+    # Phase 2, session C.
+    "decisions.details",
+    "decisions.detection",
+    # Phase 3, session A.
+    "search.time_interpretation",
+    "search.graph_candidates",
 )
 
 

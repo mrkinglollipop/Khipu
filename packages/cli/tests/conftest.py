@@ -56,7 +56,7 @@ if os.environ.get("KHIPU_LIVE_TESTS") != "1":
     atexit.register(shutil.rmtree, _HERMETIC_HOME, ignore_errors=True)
     os.environ["HOME"] = _HERMETIC_HOME
     os.environ["KHIPU_KEYCHAIN"] = "0"
-    _KEEP = {"KHIPU_KEYCHAIN", "KHIPU_LIVE_TESTS"}
+    _KEEP = {"KHIPU_KEYCHAIN", "KHIPU_LIVE_TESTS", "KHIPU_SCRATCH_DSN"}
     for _name in [n for n in os.environ if n.startswith(("KHIPU_", "ALZY_")) and n not in _KEEP]:
         del os.environ[_name]
     for _name in ("GEMINI_API_KEY", "GROK_HOOK_NAME", "GROK_HOOK_EVENT",

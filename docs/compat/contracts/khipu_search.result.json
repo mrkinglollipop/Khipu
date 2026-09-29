@@ -1,0 +1,24 @@
+{
+  "query": "widget-batching endpoint cursor-based pagination",
+  "mode": "literal",
+  "results": [
+    {
+      "kind": "episode",
+      "id": "1",
+      "label": "Approved: ship the widget-batching endpoint using cursor-based pagination.",
+      "snippet": "Approved: ship the widget-batching endpoint using cursor-based pagination.",
+      "paths": []
+    },
+    {
+      "kind": "topic",
+      "id": "widget-batching",
+      "label": "Widget batching",
+      "snippet": "The widget-batching endpoint batches writes for the acme/widget API.",
+      "paths": [],
+      "neighbors": []
+    }
+  ],
+  "filters_dropped": [],
+  "stale": true,
+  "snapshot_refreshed_at": "2026-09-28T00:00:00+00:00"
+}

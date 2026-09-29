@@ -28,6 +28,24 @@ def _hits(*rows, legs=("lexical",), degraded=None):
     return {"hits": list(rows), "legs": list(legs), "degraded": degraded}
 
 
+def _fake_enrich_with_zero_decisions(cur, rows):  # noqa: ARG001
+    """Stand-in for ``khipu.decisions.enrich_search_results`` (Phase 2,
+    session B: ``_hub_hits_budgeted``'s own validity-counts query reuses that
+    helper) — every episode row reports zero decisions, so a fully-mocked
+    ``khipu.db.connect`` test still exercises the "validity checked, found
+    nothing" path instead of "validity unknown" (which would set
+    ``degraded``)."""
+    out = []
+    for r in rows:
+        item = dict(r)
+        if item.get("kind") == "episode":
+            item["decisions_current"] = 0
+            item["decisions_superseded"] = 0
+            item["decisions_retracted"] = 0
+        out.append(item)
+    return out
+
+
 class GateTest(unittest.TestCase):
     def test_ok_gates_before_any_search(self):
         with mock.patch.object(rp, "_search_hits") as m_search:
@@ -370,7 +388,9 @@ class BudgetedHubSearchTest(unittest.TestCase):
         cos = [self._cosine_row("2"), self._cosine_row("3")]
         with mock.patch("khipu.db.connect", return_value=_FakeConnCtx()), \
                 mock.patch("khipu.cli._literal_candidates", return_value=lex), \
-                mock.patch("khipu.embed._cosine_candidates", return_value=cos):
+                mock.patch("khipu.embed._cosine_candidates", return_value=cos), \
+                mock.patch("khipu.decisions.enrich_search_results",
+                            side_effect=_fake_enrich_with_zero_decisions):
             out = rp._hub_hits_budgeted(
                 "gateway budget query", ["gateway", "budget"], project=None,
                 budget_ms=600, limit=rp.TOP_N,
@@ -473,7 +493,8 @@ class PriorWorkBudgetedTest(unittest.TestCase):
         self.assertEqual(out["context"], "")
         self.assertEqual(
             out["prior_work_meta"],
-            {"legs": [], "ms": 0.0, "degraded": None, "reason": "trivial acknowledgment"},
+            {"legs": [], "ms": 0.0, "degraded": None, "reason": "trivial acknowledgment",
+             "outcome": "gated"},
         )
 
     def test_no_content_tokens_gate_reason(self):
@@ -505,6 +526,72 @@ class PriorWorkBudgetedTest(unittest.TestCase):
         with mock.patch.object(rp, "_search_hits", return_value=_hits(_hit())):
             out = rp.prior_work_for_prompt("what did we decide about the recall hook")
         self.assertNotIn("prior_work_meta", out)
+
+    def test_project_argument_reaches_search_hits_budgeted_when_cwd_is_absent(self):
+        with mock.patch.object(
+            rp, "_search_hits_budgeted",
+            return_value={"hits": [], "legs": [], "degraded": None},
+        ) as m_search:
+            rp.prior_work_for_prompt(
+                "what did we decide about the recall hook",
+                budget_ms=600, project="acme/widget",
+            )
+        self.assertEqual(m_search.call_args.kwargs.get("project"), "acme/widget")
+
+
+class PriorWorkMetaOutcomeTest(unittest.TestCase):
+    """``prior_work_meta["outcome"]`` — the closed set a client (Aegis among
+    them) reads instead of overriding a deliberate abstention with a second
+    search (Retrieval and multi-harness contract,
+    docs/plans/2026-09-27-memory-reasoning-scope.md)."""
+
+    def test_gated_no_content_tokens(self):
+        out = rp.prior_work_for_prompt("ok", budget_ms=600)
+        self.assertEqual(out["prior_work_meta"]["outcome"], "gated")
+
+    def test_gated_trivial_acknowledgment(self):
+        out = rp.prior_work_for_prompt("yes", budget_ms=600)
+        self.assertEqual(out["prior_work_meta"]["outcome"], "gated")
+
+    def test_match_when_hits_are_present(self):
+        with mock.patch.object(
+            rp, "_search_hits_budgeted",
+            return_value={"hits": [_hit()], "legs": ["lexical"], "degraded": None},
+        ):
+            out = rp.prior_work_for_prompt("what did we decide", budget_ms=600)
+        self.assertEqual(out["prior_work_meta"]["outcome"], "match")
+
+    def test_no_match_when_the_search_ran_but_found_nothing(self):
+        with mock.patch.object(
+            rp, "_search_hits_budgeted",
+            return_value={"hits": [], "legs": ["lexical", "cosine"], "degraded": None},
+        ):
+            out = rp.prior_work_for_prompt("what did we decide", budget_ms=600)
+        self.assertEqual(out["prior_work_meta"]["outcome"], "no_match")
+
+    def test_dedup(self):
+        with mock.patch.object(
+            rp, "_search_hits_budgeted",
+            return_value={"hits": [_hit()], "legs": ["lexical"], "degraded": None},
+        ):
+            rp.prior_work_for_prompt("repeat me", budget_ms=600, session_id="sess-outcome")
+            out = rp.prior_work_for_prompt("repeat me", budget_ms=600, session_id="sess-outcome")
+        self.assertEqual(out["reason"], "dedup")
+        self.assertEqual(out["prior_work_meta"]["outcome"], "dedup")
+
+    def test_timeout(self):
+        def _hang(*_a, **_k):
+            time.sleep(2.0)
+            return {"hits": [], "legs": [], "degraded": None}
+
+        with mock.patch.object(rp, "_search_hits_budgeted", side_effect=_hang):
+            out = rp.prior_work_for_prompt("what did we decide", budget_ms=50)
+        self.assertEqual(out["prior_work_meta"]["outcome"], "timeout")
+
+    def test_error(self):
+        with mock.patch.object(rp, "_search_hits_budgeted", side_effect=RuntimeError("boom")):
+            out = rp.prior_work_for_prompt("what did we decide", budget_ms=600)
+        self.assertEqual(out["prior_work_meta"]["outcome"], "error")
 
 
 if __name__ == "__main__":

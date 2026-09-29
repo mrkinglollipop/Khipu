@@ -1,0 +1,17 @@
+{
+  "kind": "episode",
+  "id": 1,
+  "ts": "2026-09-01T12:00:00+00:00",
+  "ingested_at": null,
+  "session_id": "claude_code:named-001",
+  "scope": "acme/widget",
+  "summary": "Approved: ship the widget-batching endpoint using cursor-based pagination.",
+  "topics": ["widget-batching"],
+  "people": [],
+  "decisions": ["Use cursor-based pagination for the widget-batching endpoint."],
+  "preferences": [],
+  "edges": [],
+  "raw": null,
+  "stale": true,
+  "snapshot_refreshed_at": "2026-09-28T00:00:00+00:00"
+}
