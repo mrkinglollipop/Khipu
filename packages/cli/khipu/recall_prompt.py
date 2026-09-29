@@ -29,6 +29,7 @@ turn. Nothing here calls a model.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -215,6 +216,14 @@ def _run_with_timeout(fn, timeout_s: float, /, *args, **kwargs) -> Any:
     if "error" in box:
         raise box["error"]
     return box.get("value")
+
+
+def _enter_stage(progress: dict[str, Any] | None, stage: str) -> None:
+    """Record the stage the search is entering, for a caller that gave up on
+    it. A plain assignment: the search thread writes, the caller reads once
+    after its join times out, and no lock is ever held across I/O."""
+    if progress is not None:
+        progress["stage"] = stage
 
 
 # ---- search + render --------------------------------------------------------
@@ -408,7 +417,7 @@ class _SnapshotUnusable(Exception):
 
 def _snapshot_search_hits(
     prompt: str, *, project: str | None, tz: str | None = None,
-    started: float | None = None,
+    started: float | None = None, progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Lexical + cosine, RRF-fused, entirely against the local sqlite
     replica — no Postgres, no network round trip beyond one (cacheable)
@@ -439,8 +448,7 @@ def _snapshot_search_hits(
     same shape ``_hub_hits_budgeted`` already uses.
     """
     from khipu import hub_snapshot
-    from khipu.recency import apply_project_and_status
-    from khipu.search_text import fuse_ranked_lists, search_tokens, token_hit_count
+    from khipu.search_text import search_tokens, token_hit_count
 
     fresh, health = hub_snapshot.snapshot_is_fresh()
     if not fresh:
@@ -481,11 +489,27 @@ def _snapshot_search_hits(
         lexical_rows.sort(key=lambda r: -token_hit_count(r.get("rank_text") or "", tokens))
 
     legs: list[str] = ["lexical"]
-    lists: list[list[dict[str, Any]]] = [lexical_rows] if lexical_rows else []
     cosine_rows: list[dict[str, Any]] = []
     degraded: str | None = None
 
     if t_cos is not None:
+        # The keyword-only result is complete now; publish it before waiting so
+        # a caller whose own limit passes first still has something to use. It
+        # is built from copies: the fusion rewrites the rows it is given.
+        provisional: dict[str, Any] | None = None
+        try:
+            provisional = _fuse_and_annotate(
+                prompt, tokens=tokens, project=project, tz=tz,
+                lexical_rows=copy.deepcopy(lexical_rows), cosine_rows=[],
+                legs=list(legs), degraded="embedding late",
+            )
+            if progress is not None:
+                progress["provisional"] = provisional
+        except Exception as exc:  # noqa: BLE001 — the full pass below still runs and reports it
+            provisional = None
+            _log(f"snapshot keyword-only result skipped: {type(exc).__name__}: {exc}")
+
+        _enter_stage(progress, "embedding-wait")
         t_cos.join(max(0.0, deadline - time.monotonic()))
         if "rows" in cosine_box:
             legs.append("cosine")
@@ -496,6 +520,31 @@ def _snapshot_search_hits(
             _log(f"snapshot cosine leg skipped: {type(exc).__name__}: {exc}")
         else:
             degraded = "embedding late"
+        if "rows" not in cosine_box and provisional is not None:
+            return {**provisional, "degraded": degraded}
+
+    _enter_stage(progress, "finish")
+    return _fuse_and_annotate(
+        prompt, tokens=tokens, project=project, tz=tz,
+        lexical_rows=lexical_rows, cosine_rows=cosine_rows, legs=legs, degraded=degraded,
+    )
+
+
+def _fuse_and_annotate(
+    prompt: str, *, tokens: list[str], project: str | None, tz: str | None,
+    lexical_rows: list[dict[str, Any]], cosine_rows: list[dict[str, Any]],
+    legs: list[str], degraded: str | None,
+) -> dict[str, Any]:
+    """Everything after the legs finish: fusion, graph candidates, the
+    relevance gate, row metadata, project/status ranking, time boost and
+    validity. One function for the keyword-only result and the full one, so
+    the two cannot drift apart. It rewrites the rows it is given and appends
+    to ``legs``; a caller that needs the originals again passes copies."""
+    from khipu import hub_snapshot
+    from khipu.recency import apply_project_and_status
+    from khipu.search_text import fuse_ranked_lists, token_hit_count
+
+    lists: list[list[dict[str, Any]]] = [lexical_rows] if lexical_rows else []
 
     if cosine_rows:
         for r in cosine_rows:
@@ -646,8 +695,24 @@ def _project_for_cwd(cwd: str | None) -> str | None:
     return project
 
 
+def _trim_result(result: dict[str, Any], limit: int) -> dict[str, Any]:
+    """The score floor over the full oversample, then the cut to ``limit``,
+    with the optional fields carried over. Shared by the finished search and
+    by a caller that falls back to the keyword-only result."""
+    out = {
+        "hits": _apply_score_floor(result["hits"])[:limit],
+        "legs": result["legs"], "degraded": result["degraded"],
+    }
+    if "degraded_legs" in result:
+        out["degraded_legs"] = result["degraded_legs"]
+    if "time_interpretation" in result:
+        out["time_interpretation"] = result["time_interpretation"]
+    return out
+
+
 def _search_hits(
-    prompt: str, *, cwd: str | None, limit: int = TOP_N, tz: str | None = None
+    prompt: str, *, cwd: str | None, limit: int = TOP_N, tz: str | None = None,
+    progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The gated search itself (no timeout, no dedup — those wrap this).
 
@@ -668,17 +733,15 @@ def _search_hits(
     ``khipu_status``.
     """
     started = time.monotonic()
+    _enter_stage(progress, "project")
     project = _project_for_cwd(cwd)
 
     try:
-        result = _snapshot_search_hits(prompt, project=project, tz=tz, started=started)
-        hits = _apply_score_floor(result["hits"])[:limit]
-        out = {"hits": hits, "legs": result["legs"], "degraded": result["degraded"]}
-        if "degraded_legs" in result:
-            out["degraded_legs"] = result["degraded_legs"]
-        if "time_interpretation" in result:
-            out["time_interpretation"] = result["time_interpretation"]
-        return out
+        _enter_stage(progress, "keyword")
+        result = _snapshot_search_hits(
+            prompt, project=project, tz=tz, started=started, progress=progress
+        )
+        return _trim_result(result, limit)
     except _SnapshotUnusable as exc:
         _log(f"snapshot unusable ({exc}) — falling back to hub")
     except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls back
@@ -686,6 +749,7 @@ def _search_hits(
 
     from khipu.embed import hybrid_search
 
+    _enter_stage(progress, "hub")
     payload = hybrid_search(prompt, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project)
     rows = _apply_score_floor(payload.get("results") or [])
     return {"hits": rows[:limit], "legs": ["hub"], "degraded": None}
@@ -1019,7 +1083,11 @@ def prior_work_for_prompt(
     ``_snapshot_search_hits``), or ``["hub"]`` on the TIMEOUT_S path's hub
     fallback. A gated or timed-out call reports ``[]``/``None`` or
     ``"timeout"`` respectively — never absent, so callers (the hook's log
-    line among them) can read them unconditionally.
+    line among them) can read them unconditionally. When TIMEOUT_S passes
+    after the keyword leg finished, the keyword-only rows are returned with
+    reason ``ok`` and ``degraded`` ``"embedding late (limit)"``; only when
+    nothing was ready is it a timeout, and that result carries ``stage``, the
+    last stage the search entered.
 
     ``budget_ms`` (khipu_status / the gateway lane only — omitted by the
     UserPromptSubmit hook, whose TIMEOUT_S-wrapped local-snapshot-first path
@@ -1076,6 +1144,8 @@ def prior_work_for_prompt(
     degraded: str | None = None
     degraded_legs: list[str] = []
     interpretation: dict[str, Any] | None = None
+    stage: str | None = None
+    progress: dict[str, Any] = {}
     try:
         if budget_ms is not None:
             outer_timeout = max(0.05, budget_ms / 1000.0) + _BUDGET_SAFETY_SLACK_S
@@ -1088,7 +1158,8 @@ def prior_work_for_prompt(
             degraded = result.get("degraded")
         else:
             result = _run_with_timeout(
-                _search_hits, TIMEOUT_S, prompt, cwd=cwd, limit=limit, tz=tz
+                _search_hits, TIMEOUT_S, prompt, cwd=cwd, limit=limit, tz=tz,
+                progress=progress,
             )
             hits = result.get("hits") or []
             legs = result.get("legs") or []
@@ -1096,10 +1167,21 @@ def prior_work_for_prompt(
             degraded_legs = result.get("degraded_legs") or []
             interpretation = result.get("time_interpretation")
     except _TimedOut:
-        budget_s = (budget_ms / 1000.0) if budget_ms is not None else TIMEOUT_S
-        reason = f"timeout>{budget_s}s"
-        degraded = degraded or "timeout"
-        hits = []
+        # Read once: the search thread may still publish after this point.
+        provisional = progress.get("provisional") if budget_ms is None else None
+        if provisional is not None:
+            result = _trim_result(provisional, limit)
+            hits = result["hits"]
+            legs = result["legs"]
+            degraded = "embedding late (limit)"
+            degraded_legs = result.get("degraded_legs") or []
+            interpretation = result.get("time_interpretation")
+        else:
+            budget_s = (budget_ms / 1000.0) if budget_ms is not None else TIMEOUT_S
+            reason = f"timeout>{budget_s}s"
+            degraded = degraded or "timeout"
+            hits = []
+            stage = progress.get("stage")
     except Exception as exc:  # noqa: BLE001 — fail open on any search failure
         reason = f"error: {type(exc).__name__}: {exc}"
         hits = []
@@ -1138,6 +1220,8 @@ def prior_work_for_prompt(
     out = {"context": context, "hits": hits or [], "reason": reason, "ms": ms}
     out["legs"] = legs
     out["degraded"] = degraded
+    if stage:
+        out["stage"] = stage
     if degraded_legs:
         out["degraded_legs"] = degraded_legs
     if interpretation:
@@ -1226,9 +1310,10 @@ def hook_main(raw: str, *, shape: str = "claude") -> dict[str, Any]:
 
     result = prior_work_for_prompt(prompt, cwd=cwd, session_id=session_id)
     hit_ids = [f"{h.get('kind')}:{h.get('id')}" for h in result["hits"]]
+    stage = f" stage={result['stage']}" if result.get("stage") else ""
     _log(
         f"session={session_id or '?'} reason={result['reason']} ms={result['ms']} "
-        f"hits={hit_ids} legs={result.get('legs') or []} degraded={result.get('degraded')}"
+        f"hits={hit_ids} legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}"
     )
     ctx = result["context"]
     if shape == "cursor":
