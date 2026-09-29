@@ -40,7 +40,7 @@ evaluator gap):
 - ``--relevance-floor on|off`` scores the chosen ``--path``(s) with the absolute
   relevance floor switch set for this process only; ``on`` scores every entry
   both ways and reports abstention correctness per path and each golden
-  positive the floor removed, by query.
+  positive whose query the gate emptied, by query.
 - ``--replay LOG [--sample N] [--seed S]`` builds no-expectation entries from
   a ``query_log.jsonl`` for realistic-traffic record/compare runs; only valid
   together with ``--record`` or ``--compare``.
@@ -606,9 +606,10 @@ def run_relevance_eval(
     """Score every entry on every requested path with the relevance floor
     forced off and, when ``floor`` is True, on too: one run, the same entries
     both ways. Per path: abstention correctness under the requested setting
-    (and without the floor, for contrast) and ``removed_positives`` — each
-    golden positive the baseline found and the floor lost, by query. That list
-    is the regression; it should be empty."""
+    (and without the floor, for contrast) and ``emptied_positives`` — each
+    golden positive whose query the gate emptied although the baseline
+    returned rows, by query. That list is the regression; it should be
+    empty."""
     rows: list[dict[str, Any]] = []
     by_path: dict[str, list[dict[str, Any]]] = {p: [] for p in paths}
     for entry in entries:
@@ -646,8 +647,8 @@ def run_relevance_eval(
         }
         if floor:
             out["abstain_correct_without"] = sum(1 for r in abstain if r["abstain_correct_without"])
-            out["removed_positives"] = [
-                r["query"] for r in positive if r["hit_without"] and not r["hit_with"]
+            out["emptied_positives"] = [
+                r["query"] for r in positive if r["got_without"] and not r["got_with"]
             ]
         return out
 

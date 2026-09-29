@@ -1,17 +1,26 @@
 # --bypass-harness (sonnet lane) — authored directly by the dispatched
 # on-sub Sonnet build agent for this phase (brief: "do not delegate to other
 # agents"); there is no further agent to route this to.
-"""The one absolute relevance policy, behind the ``relevance_floor`` switch.
+"""The one absolute relevance gate, behind the ``relevance_floor`` switch.
 
 ``recall_prompt._apply_score_floor`` is relative to the top row, so a prompt
 about something memory has never seen still keeps its three nearest
 neighbours: nearest-neighbour search always returns something. This module
-judges each row on its own evidence instead. A row is kept when
+decides whether a fused result list has any evidence at all, and abstains
+when it has none.
 
-- it names at least one query token as a whole word (``lexical_hits`` >= 1), or
-- its raw cosine similarity is at or above ``COSINE_FLOOR``, or
-- nothing is known against it: no keyword count and no cosine value at all
-  (a graph-candidate row, a literal-only hub row).
+A row is evidence when
+
+- its raw cosine similarity is a number at or above the floor, or
+- it names at least ``need`` of the query's content tokens as whole words,
+  where ``need = min(n, max(2, ceil(n / 2)))`` for ``n`` content tokens: one
+  common word never counts as coverage of a multi-word query.
+
+A row with no cosine and too few keyword hits, or with neither field (a
+graph candidate), is not evidence. The gate is all or nothing: when at least
+one row is evidence the list comes back unchanged (same rows, same order);
+when none is, it comes back empty. It never removes individual rows. With no
+content tokens it does not run.
 
 One function serves every query-driven reader (the local prompt lane, the
 budgeted hub lane, explicit hybrid/semantic search), the way ``validity``
@@ -20,14 +29,15 @@ calls it. Pure functions over already-fetched rows: no database, no network.
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Sequence
 
-# Provisional. Raw cosine on the active embedding profile has a high baseline
-# (unrelated queries measured ~0.65-0.73 on the production profile, see
-# embed.CONFIDENCE_COSINE_*), so this value is a starting point to be tuned
-# with ``khipu recall eval --relevance-floor on``, not a measured optimum.
-# Overridable by the ``relevance.cosine_floor`` config key.
-COSINE_FLOOR = 0.62
+# Measured on the production embedding profile: the best match for 20 prompts
+# on subjects memory has never seen scored 0.57 to 0.64, and the best match
+# for 149 real prompts scored 0.67 to 0.82. The floor sits between the two
+# ranges. Re-measure if the active profile changes; overridable by the
+# ``relevance.cosine_floor`` config key.
+COSINE_FLOOR = 0.65
 
 
 def enabled() -> bool:
@@ -57,30 +67,39 @@ def cosine_floor() -> float:
     return float(raw) if 0.0 < float(raw) <= 1.0 else COSINE_FLOOR
 
 
+def need(token_count: int) -> int:
+    """Whole-token keyword hits a row needs to be evidence by coverage."""
+    n = int(token_count)
+    return min(n, max(2, math.ceil(n / 2)))
+
+
 def _number(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
 
 
-def keeps(row: dict[str, Any], floor: float) -> bool:
-    """The policy for one row."""
-    hits = _number(row.get("lexical_hits"))
-    if hits is not None and hits >= 1:
-        return True
+def is_evidence(row: dict[str, Any], floor: float, needed: int) -> bool:
+    """The evidence test for one row."""
     cosine = _number(row.get("cosine"))
-    if cosine is not None:
-        return cosine >= floor
-    return True
+    if cosine is not None and cosine >= floor:
+        return True
+    hits = _number(row.get("lexical_hits"))
+    return hits is not None and hits >= needed
 
 
-def apply(rows: Sequence[dict[str, Any]], *, floor: float | None = None) -> tuple[list[dict[str, Any]], int]:
-    """``(kept rows in their original order, number removed)``."""
+def gate(
+    rows: Sequence[dict[str, Any]], token_count: int, *, floor: float | None = None
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """``(rows, info)``: ``rows`` unchanged when any row is evidence, empty
+    when none is. ``info`` is the payload block, or None when the gate did not
+    run (no content tokens)."""
+    if token_count <= 0:
+        return list(rows), None
     limit = cosine_floor() if floor is None else floor
-    kept = [r for r in rows if keeps(r, limit)]
-    return kept, len(rows) - len(kept)
-
-
-def payload_block(removed: int, floor: float) -> dict[str, Any]:
-    """The additive ``relevance_floor`` key of an explicit search payload."""
-    return {"applied": True, "removed": int(removed), "floor": floor}
+    needed = need(token_count)
+    evidence = sum(1 for r in rows if is_evidence(r, limit, needed))
+    abstained = evidence == 0
+    info = {"applied": True, "abstained": abstained, "evidence_rows": evidence,
+            "floor": limit, "need": needed}
+    return ([] if abstained else list(rows)), info

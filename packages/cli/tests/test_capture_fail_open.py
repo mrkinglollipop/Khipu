@@ -13,6 +13,8 @@ fakes: nothing here reaches a provider or a hub.
 from __future__ import annotations
 
 import json
+import os
+import unittest
 from unittest import mock
 
 import pytest
@@ -92,14 +94,17 @@ def test_a_wrongly_typed_or_garbage_detail_block_is_dropped_not_raised(block):
     assert payload["decision_details"] == []
 
 
-def test_a_detail_naming_a_decision_that_is_not_in_the_list_is_dropped():
+def test_a_detail_naming_a_decision_that_is_not_in_the_list_joins_it():
     block = json.dumps([
         {"text": "Adopt a monorepo", "by": "user", "reverses": OLD_DECISION},
         REVERSAL,
     ])
     payload = _extract(_answer(block))
-    _assert_plain_episode(payload)
-    assert [d["text"] for d in payload["decision_details"]] == ["Use rolling deploys"]
+    assert payload["summary"] == SUMMARY and payload["topics"] == TOPICS
+    assert payload["decisions"] == DECISIONS + ["Adopt a monorepo"]
+    assert [d["text"] for d in payload["decision_details"]] == [
+        "Adopt a monorepo", "Use rolling deploys",
+    ]
 
 
 def test_a_good_detail_block_still_arrives_intact():
@@ -279,3 +284,36 @@ def test_the_merge_path_survives_a_raising_detector_too():
     statements = [s for s, _ in cur.calls]
     assert "ROLLBACK TO SAVEPOINT capture_merge_decision_detection" in statements
     assert sorted(r["text"] for r in decisions.rows.values() if r["episode_id"] == 1) == sorted(DECISIONS)
+
+
+class DetailOnlyDecisionTest(unittest.TestCase):
+    """A decision the model wrote only in the detail block is still a
+    decision: it must reach the plain list, with its detail attached."""
+
+    def _extract(self, answer: dict) -> dict:
+        from khipu import extract
+
+        with mock.patch.dict(os.environ, {"KHIPU_FEATURE_DECISION_DETAILS": "1"}), \
+                mock.patch.object(extract, "_generate", return_value=json.dumps(answer)):
+            return extract.extract_memory("USER: use cursor paging\n\nASSISTANT: done", cwd="/repo")
+
+    def test_a_detail_only_decision_joins_the_list(self):
+        out = self._extract({
+            "summary": "Paging was settled.", "topics": ["paging"], "decisions": [],
+            "decision_details": [{"text": "Use cursor paging.", "by": "user",
+                                  "rationale": None, "reverses": None}],
+        })
+        self.assertEqual(out["decisions"], ["Use cursor paging."])
+        self.assertEqual([d["text"] for d in out["decision_details"]], ["Use cursor paging."])
+
+    def test_listed_decisions_keep_their_order_and_are_not_duplicated(self):
+        out = self._extract({
+            "summary": "Two things were settled.", "topics": ["paging"],
+            "decisions": ["Keep the page size at 50.", "Use cursor paging."],
+            "decision_details": [{"text": "Use cursor paging.", "by": "user"},
+                                 {"text": "Drop offset paging.", "by": "assistant"}],
+        })
+        self.assertEqual(
+            out["decisions"],
+            ["Keep the page size at 50.", "Use cursor paging.", "Drop offset paging."],
+        )

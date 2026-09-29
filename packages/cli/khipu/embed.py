@@ -1908,24 +1908,7 @@ def hybrid_search(
             _t = time.monotonic()
             fused = fuse_ranked_lists(lists, limit=oversample)
 
-            # Absolute relevance floor: judged before graph expansion so an
-            # irrelevant nearest neighbour never seeds candidates, and again
-            # after the filters so a candidate row meets the same rule. Never
-            # in literal mode. Fails open.
-            floor_applied = False
-            _floor_removed = 0
-            _floor_value = 0.0
-            if mode != "literal":
-                try:
-                    from khipu import relevance as _relevance
-
-                    if _relevance.enabled():
-                        _floor_value = _relevance.cosine_floor()
-                        fused, _n = _relevance.apply(fused, floor=_floor_value)
-                        _floor_removed += _n
-                        floor_applied = True
-                except Exception as exc:  # noqa: BLE001 — a policy failure must not sink the search
-                    timing["relevance_floor_error"] = str(exc)[:120]
+            floor_info: dict[str, Any] | None = None
 
             # Graph candidates (Phase 3, session A): switch-gated, own 400ms
             # deadline, dropped entirely (never partially) on a miss — named
@@ -1953,11 +1936,18 @@ def hybrid_search(
                 session_id=session_id, harness=harness,
             )
 
-            if floor_applied:
+            # Absolute relevance gate: the list unchanged when any row is
+            # evidence, empty when none is. Once, after fusion, graph expansion
+            # and the filters (a candidate row carries no signal, and nothing
+            # forgotten or out of scope can make the list pass). Never in
+            # literal mode. Fails open.
+            if mode != "literal":
                 try:
-                    fused, _n = _relevance.apply(fused, floor=_floor_value)
-                    _floor_removed += _n
-                except Exception as exc:  # noqa: BLE001 — as above
+                    from khipu import relevance as _relevance
+
+                    if _relevance.enabled():
+                        fused, floor_info = _relevance.gate(fused, len(tokens))
+                except Exception as exc:  # noqa: BLE001 — a policy failure must not sink the search
                     timing["relevance_floor_error"] = str(exc)[:120]
 
             # Optional reranker: switch-gated, own 2.5s deadline, run only on
@@ -2073,8 +2063,8 @@ def hybrid_search(
         out["time_interpretation"] = interpretation
     if rerank_info is not None:
         out["rerank"] = rerank_info
-    if floor_applied:
-        out["relevance_floor"] = _relevance.payload_block(_floor_removed, _floor_value)
+    if floor_info is not None:
+        out["relevance_floor"] = floor_info
     return out
 
 

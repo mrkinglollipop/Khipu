@@ -2562,11 +2562,11 @@ def cmd_recall(args: argparse.Namespace) -> int:
                 entries, paths, floor=(floor_arg == "on"), budget_ms=budget_ms
             )
             for path, summary in report["paths"].items():
-                for query in summary.get("removed_positives", []):
-                    print(f"[REMOVED] path={path} {query!r}", file=sys.stderr)
+                for query in summary.get("emptied_positives", []):
+                    print(f"[EMPTIED] path={path} {query!r}", file=sys.stderr)
             print(json.dumps(report, indent=2, default=str))
             ok = all(
-                s["abstain_correct"] == s["abstain_total"] and not s.get("removed_positives")
+                s["abstain_correct"] == s["abstain_total"] and not s.get("emptied_positives")
                 for s in report["paths"].values()
             )
             return 0 if ok else 1
@@ -4109,8 +4109,8 @@ def build_parser() -> argparse.ArgumentParser:
     reval.add_argument(
         "--relevance-floor", dest="relevance_floor", choices=["on", "off"], default=None,
         help=(
-            "Score the chosen --path(s) with the absolute relevance floor switched on or off for this "
-            "process only; 'on' scores each entry both ways and lists every golden positive the floor removed"
+            "Score the chosen --path(s) with the absolute relevance gate switched on or off for this "
+            "process only; 'on' scores each entry both ways and lists every golden positive whose query the gate emptied"
         ),
     )
     reval.add_argument("--sample", type=int, default=None, help="With --replay: cap to N entries")

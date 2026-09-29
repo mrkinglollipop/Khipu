@@ -599,6 +599,15 @@ def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
     # 378). The project identity now belongs in the capture payload's own
     # `project` field (khipu.identity, set by the hook), not in topics.
     decisions = _as_str_list(parsed.get("decisions"))
+    # Asked for the detail block, the model often writes a decision there and
+    # nowhere else (measured on real sessions: 7 decisions captured without
+    # the block, 0 with it). A detail's text is a decision: it joins the list.
+    raw_details = parsed.get("decision_details")
+    if isinstance(raw_details, list):
+        for item in raw_details:
+            text = str(item.get("text") or "").strip() if isinstance(item, dict) else ""
+            if text and text not in decisions:
+                decisions.append(text)
     return {
         "summary": summary,
         "topics": topics,

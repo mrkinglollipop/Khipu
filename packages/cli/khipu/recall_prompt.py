@@ -230,28 +230,27 @@ def _apply_score_floor(rows: list[dict[str, Any]], *, ratio: float = SCORE_FLOOR
     return [r for r in rows if float(r.get("score") or 0.0) >= floor]
 
 
-def _relevance_floor(
-    rows: list[dict[str, Any]], tokens: list[str] | None = None
-) -> list[dict[str, Any]]:
-    """The absolute relevance policy (``khipu.relevance``) behind its switch.
+def _relevance_gate(rows: list[dict[str, Any]], tokens: list[str]) -> list[dict[str, Any]]:
+    """The absolute relevance gate (``khipu.relevance``) behind its switch:
+    the fused list unchanged when any row is evidence, empty when none is.
     Runs before ``_apply_score_floor``, which is relative to the top row and
-    so keeps a nearest neighbour of an unrelated prompt. ``tokens`` fills in
-    a missing keyword count for a row that only the cosine leg produced (the
-    hub lane counts keywords on its lexical rows alone). Fails open: any
-    error here returns the rows untouched."""
+    so keeps a nearest neighbour of an unrelated prompt. ``tokens`` is the
+    prompt's content tokens; it also fills in a missing keyword count for a
+    row that only the cosine leg produced (the hub lane counts keywords on its
+    lexical rows alone). Fails open: any error here returns the rows
+    untouched."""
     try:
         from khipu import relevance
 
-        if not rows or not relevance.enabled():
+        if not rows or not tokens or not relevance.enabled():
             return rows
-        if tokens:
-            from khipu.search_text import token_hit_count
+        from khipu.search_text import token_hit_count
 
-            for r in rows:
-                if r.get("lexical_hits") is None:
-                    text = r.get("rank_text") or f"{r.get('label') or ''} {r.get('snippet') or ''}"
-                    r["lexical_hits"] = token_hit_count(text, tokens)
-        kept, _removed = relevance.apply(rows)
+        for r in rows:
+            if r.get("lexical_hits") is None:
+                text = r.get("rank_text") or f"{r.get('label') or ''} {r.get('snippet') or ''}"
+                r["lexical_hits"] = token_hit_count(text, tokens)
+        kept, _info = relevance.gate(rows, len(tokens))
         return kept
     except Exception as exc:  # noqa: BLE001 — a policy failure must not cost the caller its hits
         _log(f"relevance floor skipped: {type(exc).__name__}: {exc}")
@@ -531,10 +530,6 @@ def _snapshot_search_hits(
         return {"hits": [], "legs": legs, "degraded": degraded}
 
     fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
-    # Judged before graph expansion so an irrelevant nearest neighbour never
-    # seeds candidates, and again after it so a candidate row meets the same
-    # rule. Idempotent on rows that already passed.
-    fused = _relevance_floor(fused)
     con = hub_snapshot.open_snapshot()
 
     # Graph candidates (Phase 3, session A): switch-gated, own 150ms
@@ -569,7 +564,9 @@ def _snapshot_search_hits(
             degraded_legs.append("graph_candidates")
             _log(f"snapshot graph-candidates leg skipped: {type(exc).__name__}: {exc}")
 
-    fused = _relevance_floor(fused)
+    # Once, after fusion and graph expansion: candidate rows carry no signal,
+    # so they can never make an otherwise empty list pass.
+    fused = _relevance_gate(fused, tokens)
     fused = hub_snapshot.snapshot_row_metadata(con, fused)
     fused = apply_project_and_status(fused, project=project)
 
@@ -828,7 +825,7 @@ def _hub_hits_budgeted(
     from khipu.recency import apply_project_and_status
 
     fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
-    fused = _relevance_floor(fused, tokens)
+    fused = _relevance_gate(fused, tokens)
     fused = apply_project_and_status(fused, project=project)
 
     # Validity annotation (Phase 2, session B): one counts query for the
