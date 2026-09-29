@@ -317,7 +317,54 @@ def run_nightly() -> int:
     _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))
     _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
     _record_nightly_step(steps, "commitments_hygiene", **_step_result(_hygiene_commitments()))
+    briefs_result = _briefs_build_if_on()
+    if briefs_result is not None:
+        _record_nightly_step(steps, "briefs_build", **_step_result(briefs_result))
     return rc
+
+
+# Each brief is one request to the synth provider, so a first run over every
+# topic is spread across nights instead of sent in one burst.
+BRIEFS_NIGHTLY_LIMIT = 40
+
+
+def _briefs_build_if_on() -> dict[str, Any] | None:
+    """Rebuild the stale or missing source-backed briefs, at most
+    BRIEFS_NIGHTLY_LIMIT a night. ``None`` (no step recorded) while the
+    `briefs` switch is off, so an unswitched nightly is unchanged. The
+    advisory lock is the same one `khipu briefs build` takes: a manual build
+    in flight means this one builds nothing rather than racing it. Fail-open
+    like every step here: it never raises."""
+    try:
+        from khipu import briefs, features
+
+        if not features.enabled("briefs"):
+            return None
+        from khipu.db import connect
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                if not briefs.acquire_build_lock(cur):
+                    _nightly_log("[khipu-briefs] another build holds the lock; built 0")
+                    return {"ok": True, "built": 0, "reason": "lock held"}
+                try:
+                    chosen = briefs.select_for_build(cur, None, BRIEFS_NIGHTLY_LIMIT)
+                    if not chosen.get("available"):
+                        _nightly_log(f"[khipu-briefs] unavailable: {chosen.get('reason')}")
+                        return {"ok": True, "built": 0, "reason": chosen.get("reason")}
+                    results = briefs.build_many(conn, chosen["topics"])
+                finally:
+                    briefs.release_build_lock(cur)
+                    conn.commit()
+        out: dict[str, Any] = {"ok": True, "built": 0}
+        for r in results:
+            status = str(r.get("status"))
+            out[status] = out.get(status, 0) + 1
+        _nightly_log(f"[khipu-briefs] built {json.dumps(out, default=str)[:400]}")
+        return out
+    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
+        _nightly_log(f"[khipu-briefs] skipped: {type(exc).__name__}: {exc}")
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _nightly_log(line: str) -> None:
