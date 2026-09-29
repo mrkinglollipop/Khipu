@@ -24,6 +24,26 @@ while [ -L "$SELF" ] && [ "$HOPS" -lt 40 ]; do
 done
 SELF_DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
 ROOT="${KHIPU_ROOT:-$(cd "$SELF_DIR/../../.." 2>/dev/null && pwd)}"
+PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
+[ -x "$PY" ] || PY="python3"
+SHAPE=claude
+for a in "$@"; do
+  case "$a" in --cursor) SHAPE=cursor ;; esac
+done
+# stdin can be read once, and both paths below need the payload.
+PAYLOAD=$(cat)
+# The warm recall service (khipu recall serve) answers in a few milliseconds; the
+# client is stdlib-only and exits 3 when there is no service to ask. Any other
+# non-zero exit means the client itself is broken, and the one-shot path below
+# is the safer answer to that too. KHIPU_RECALL_DAEMON=0 skips it.
+if [ "${KHIPU_RECALL_DAEMON:-1}" != "0" ] && [ -f "$SELF_DIR/khipu-recall-client.py" ]; then
+  OUT=$(printf '%s' "$PAYLOAD" | "$PY" -S -E -B "$SELF_DIR/khipu-recall-client.py" "$SHAPE" 2>/dev/null)
+  if [ $? -eq 0 ]; then
+    [ -n "$OUT" ] || OUT='{}'
+    printf '%s\n' "$OUT"
+    exit 0
+  fi
+fi
 PYTHONPATH="$ROOT/packages/cli:$ROOT/.python_libs${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
 mkdir -p "${HOME}/Library/Logs/khipu" 2>/dev/null
@@ -31,11 +51,5 @@ mkdir -p "${HOME}/Library/Logs/khipu" 2>/dev/null
 PYTHONPYCACHEPREFIX="${HOME}/Library/Caches/Khipu/pycache"
 mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null
 export PYTHONPYCACHEPREFIX
-PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
-[ -x "$PY" ] || PY="python3"
-SHAPE=claude
-for a in "$@"; do
-  case "$a" in --cursor) SHAPE=cursor ;; esac
-done
-"$PY" -c "from khipu.recall_prompt import prompt_recall_main; prompt_recall_main(shape='$SHAPE')" 2>/dev/null || echo '{}'
+printf '%s' "$PAYLOAD" | "$PY" -c "from khipu.recall_prompt import prompt_recall_main; prompt_recall_main(shape='$SHAPE')" 2>/dev/null || echo '{}'
 exit 0

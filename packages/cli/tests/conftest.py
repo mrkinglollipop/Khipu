@@ -82,3 +82,20 @@ def _reset_project_for_cwd_cache():
     recall_prompt._PROJECT_FOR_CWD.clear()
     yield
     recall_prompt._PROJECT_FOR_CWD.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_level_caches():
+    # The recall service keeps the replica's matrix, the API key and the embed
+    # transport for the life of its process. A test process is one long process
+    # running many fake worlds, so none of it may carry across tests.
+    from khipu import embed, hub_snapshot
+
+    def _clear():
+        hub_snapshot._MATRIX_CACHE.clear()
+        embed._KEY_CACHE.clear()
+        embed.set_transport(None)
+
+    _clear()
+    yield
+    _clear()

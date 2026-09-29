@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template — render per machine before install (see the launchd generator). -->
+<!-- The warm process behind the per-prompt recall hook: it keeps the replica's
+     vectors, the embedding API connection and the API key in memory and
+     answers over a Unix socket, so a prompt no longer pays for a fresh
+     interpreter. KeepAlive because it exits on purpose when the package's code
+     changes on disk (a git pull) and must come back on the new code; nothing
+     depends on it, since the hook falls back to the one-shot path. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.khipu.recall-daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{KHIPU_PYTHON}}</string>
+		<string>-m</string>
+		<string>khipu</string>
+		<string>recall</string>
+		<string>serve</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>KHIPU_ROOT</key>
+		<string>{{KHIPU_ROOT}}</string>
+		<key>PYTHONPATH</key>
+		<string>{{PYTHONPATH}}</string>
+		<key>PYTHONPYCACHEPREFIX</key>
+		<string>{{PYTHONPYCACHEPREFIX}}</string>{{EXTRA_ENV}}
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>{{WORKING_DIRECTORY}}</string>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>StandardOutPath</key>
+	<string>{{STDOUT_LOG}}</string>
+	<key>StandardErrorPath</key>
+	<string>{{STDERR_LOG}}</string>
+	<key>RunAtLoad</key>
+	<true/>
+</dict>
+</plist>

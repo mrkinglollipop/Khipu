@@ -29,6 +29,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -267,13 +268,55 @@ def uses_task_prefixes(profile: str) -> bool:
 
 # ---- provider -----------------------------------------------------------------
 
+_KEY_LOCK = threading.Lock()
+_KEY_CACHE: list[str] = []
+
+
 def _gemini_key() -> str:
+    """The Gemini key, resolved once per process: resolving shells out to the
+    Keychain (about 60 ms), which a long-lived process should pay once. A key
+    the API rejects is dropped by ``_note_auth_failure``, so a rotated key is
+    picked up on the next call."""
+    with _KEY_LOCK:
+        if _KEY_CACHE:
+            return _KEY_CACHE[0]
     from khipu.keychain import resolve_gemini_key
 
     key = resolve_gemini_key()
     if not key:
         raise RuntimeError("Gemini API key not found (Keychain / env / file)")
+    with _KEY_LOCK:
+        _KEY_CACHE[:] = [key]
     return key
+
+
+def _note_auth_failure(status: int) -> None:
+    """Forget the cached key after a response that says it may be wrong. Gemini
+    answers an invalid key with 400 (``API key not valid``), an unauthorised
+    one with 401 or 403."""
+    if status in (400, 401, 403):
+        with _KEY_LOCK:
+            _KEY_CACHE.clear()
+
+
+def _urllib_transport(url: str, data: bytes, headers: dict[str, str], timeout: float) -> bytes:
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+# How embed_batch sends one request: ``(url, body, headers, timeout) -> response
+# bytes``. It raises ``urllib.error.HTTPError`` for a non-2xx status and
+# ``URLError``/``OSError`` for a network failure, exactly as ``urlopen`` does,
+# so the retry ladder below cannot tell one transport from another. A long-lived
+# process installs one that keeps its connection open (``set_transport``).
+_transport = _urllib_transport
+
+
+def set_transport(fn=None) -> None:
+    """Install ``fn`` as the process's embed transport; None restores urllib."""
+    global _transport
+    _transport = fn or _urllib_transport
 
 
 # Interactive query budget: the backfill defaults (120 s per call, four backoff
@@ -484,6 +527,7 @@ def embed_batch(
     retries: int = 4,
     timeout: float = 120.0,
     delay: float = 2.0,
+    transport=None,
 ) -> list[list[float]]:
     """Embed up to BATCH texts; L2-normalized; dim-checked.
 
@@ -516,15 +560,16 @@ def embed_batch(
     payload: dict[str, Any] = {}
     for attempt in range(retries + 1):
         _budget_take()
-        req = urllib.request.Request(
-            url, data=data, method="POST",
-            headers={"Content-Type": "application/json", "x-goog-api-key": key},
-        )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
+            raw = (transport or _transport)(
+                url, data,
+                {"Content-Type": "application/json", "x-goog-api-key": key},
+                timeout,
+            )
+            payload = json.loads(raw.decode("utf-8"))
             break
         except urllib.error.HTTPError as e:
+            _note_auth_failure(e.code)
             err = e.read().decode("utf-8", errors="replace")
             if e.code in (429, 500, 502, 503, 504) and attempt < retries:
                 _log(f"embed HTTP {e.code}, retry in {delay:.0f}s")
@@ -621,6 +666,7 @@ def embed_batch_images(
                 payload = json.loads(resp.read().decode("utf-8"))
             break
         except urllib.error.HTTPError as e:
+            _note_auth_failure(e.code)
             err = e.read().decode("utf-8", errors="replace")
             if e.code in (429, 500, 502, 503, 504) and attempt < retries:
                 _log(f"embed-image HTTP {e.code}, retry in {delay:.0f}s")

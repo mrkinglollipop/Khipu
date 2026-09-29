@@ -39,4 +39,15 @@ Read [the scope](../plans/2026-09-27-memory-reasoning-scope.md) first. It requir
 
 **Where a prompt's time goes.** Measured on the production replica: the embedding request itself about 300 ms, a fresh TLS connection about 100 ms, reading the key about 60 ms, the project lookup 50 to 150 ms, loading 20,000 vectors from disk for the scan 70 to 250 ms, and the keyword scan 160 to 340 ms beside them. One prompt lands between 750 and 1,000 ms against an internal deadline of 950 ms, before any load on the machine.
 
+**The warm recall service.** A long-lived local process answers the per-prompt hook over a Unix socket, so a prompt no longer pays for a new interpreter, the package imports, a new TLS connection, the key lookup or reloading the vectors. The hook falls back to the one-shot path when the service is not running. Measured through the launcher on 25 distinct prompts per arm, alternating:
+
+| Machine | Path | Hook wall time, median | 90th percentile | Worst |
+|---|---|---|---|---|
+| Load 11 | service | 418 ms | 501 ms | 662 ms |
+| Load 11 | one-shot | 701 ms | 874 ms | 1,031 ms |
+| Load 40 rising to 92 | service | 677 ms | 795 ms | 900 ms |
+| Load 40 rising to 92 | one-shot | 926 ms | 1,032 ms | 1,116 ms |
+
+Both paths named the same memories. What remains is the embedding request itself, about 300 ms.
+
 **What is not covered.** The unseen subjects are far from anything in memory; a prompt on a nearby subject that memory does not hold will still get its nearest neighbours. The blind judge is a model, not the user. Latency was measured on a machine under heavy unrelated load.

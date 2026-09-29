@@ -29,6 +29,7 @@ import sqlite3
 import struct
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -2167,6 +2168,54 @@ def active_snapshot_profile() -> str | None:
     return row[0] if row else None
 
 
+# The rows cosine_candidates_snapshot scores, kept for the life of the process.
+# A one-shot hook never hits this; a long-lived one (`khipu recall serve`)
+# reads ~20,000 blobs from disk once instead of on every prompt. One entry,
+# keyed by the replica's identity: a refresh replaces the file and an
+# incremental write moves its mtime or size, and either one misses and reloads.
+_MATRIX_LOCK = threading.Lock()
+_MATRIX_CACHE: dict[str, Any] = {}
+
+
+def _matrix_rows(
+    path: Path, profile: str, kind: str | None
+) -> tuple[list[tuple[Any, ...]], dict[int, tuple[str, str, int]]]:
+    """(rows, by_rowid) for one profile on the replica at ``path``, from the
+    process cache while the file is unchanged. The load runs under the lock so
+    concurrent callers wait for one read instead of each doing their own."""
+    try:
+        st = path.stat()
+        key: tuple[Any, ...] | None = (str(path), st.st_mtime_ns, st.st_size, profile, kind)
+    except OSError:
+        key = None
+    with _MATRIX_LOCK:
+        if key is not None and _MATRIX_CACHE.get("key") == key:
+            return _MATRIX_CACHE["rows"], _MATRIX_CACHE["by_rowid"]
+        con = open_snapshot()
+        try:
+            params: list[Any] = [profile]
+            kind_clause = ""
+            if kind:
+                kind_clause = " AND kind = ?"
+                params.append(kind)
+            rows = con.execute(
+                # A commitment has its own dedicated surface (khipu_owed), not
+                # generic search — same exclusion as embed._cosine_candidates.
+                # chunk_text is deliberately NOT selected here — it is fetched
+                # for the winning rows only; scoring needs nothing but the blob.
+                f"SELECT rowid, kind, ref, chunk_idx, embedding FROM memory_embeddings "
+                f"WHERE profile = ? AND kind != 'commitment'{kind_clause} AND embedding IS NOT NULL",
+                params,
+            ).fetchall()
+        finally:
+            con.close()
+        by_rowid = {rowid: (knd, ref, chunk_idx) for rowid, knd, ref, chunk_idx, _blob in rows}
+        _MATRIX_CACHE.clear()
+        if key is not None:
+            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid})
+        return rows, by_rowid
+
+
 def cosine_candidates_snapshot(
     vec: Sequence[float], profile: str, *, limit: int, kind: str | None = None
 ) -> list[dict[str, Any]]:
@@ -2192,21 +2241,7 @@ def cosine_candidates_snapshot(
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
     from khipu.vector_scan import top_k_by_dot
 
-    con = open_snapshot()
-    params: list[Any] = [profile]
-    kind_clause = ""
-    if kind:
-        kind_clause = " AND kind = ?"
-        params.append(kind)
-    rows = con.execute(
-        # A commitment has its own dedicated surface (khipu_owed), not
-        # generic search — same exclusion as embed._cosine_candidates.
-        # chunk_text is deliberately NOT selected here — it is fetched below
-        # for the winning rows only; scoring needs nothing but the blob.
-        f"SELECT rowid, kind, ref, chunk_idx, embedding FROM memory_embeddings "
-        f"WHERE profile = ? AND kind != 'commitment'{kind_clause} AND embedding IS NOT NULL",
-        params,
-    ).fetchall()
+    rows, by_rowid = _matrix_rows(snapshot_path(), profile, kind)
     # Plain dot product, not _cosine()'s sqrt-normalize-divide: every profile
     # here is stored via embed.embed_batch, which L2-normalizes every vector
     # before it is ever written (embedding_profiles.normalize = 'l2', the
@@ -2217,9 +2252,6 @@ def cosine_candidates_snapshot(
     qn = math.sqrt(sum(x * x for x in vec)) or 1.0
     qvec = tuple(x / qn for x in vec)
 
-    by_rowid: dict[int, tuple[str, str, int]] = {
-        rowid: (knd, ref, chunk_idx) for rowid, knd, ref, chunk_idx, _blob in rows
-    }
     winners = top_k_by_dot(
         qvec,
         ((rowid, blob) for rowid, _knd, _ref, _chunk_idx, blob in rows),
@@ -2230,12 +2262,16 @@ def cosine_candidates_snapshot(
 
     win_rowids = [rowid for rowid, _score in winners]
     placeholders = ",".join("?" for _ in win_rowids)
-    texts: dict[int, str] = dict(
-        con.execute(
-            f"SELECT rowid, chunk_text FROM memory_embeddings WHERE rowid IN ({placeholders})",
-            win_rowids,
-        ).fetchall()
-    )
+    con = open_snapshot()
+    try:
+        texts: dict[int, str] = dict(
+            con.execute(
+                f"SELECT rowid, chunk_text FROM memory_embeddings WHERE rowid IN ({placeholders})",
+                win_rowids,
+            ).fetchall()
+        )
+    finally:
+        con.close()
 
     out: list[dict[str, Any]] = []
     for rowid, score in winners:

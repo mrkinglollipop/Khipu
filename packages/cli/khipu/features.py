@@ -81,6 +81,7 @@ _CAPABILITIES = (
     # Phase 4, session B.
     "reflect",
     "search.relevance_floor",
+    "recall.daemon",
 )
 
 

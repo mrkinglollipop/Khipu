@@ -27,7 +27,7 @@ def _env(*names: str, default: str = "") -> str:
 # was an unconditional NameError on every `khipu jobs install/refresh/
 # uninstall <name>` call with explicit names — a different function's scope
 # does not see a parser-builder's locals. Module level so both see it.
-_JOBS_CHOICES = ("nightly", "monthly", "graph_build", "notes_watch", "queue_drain")
+_JOBS_CHOICES = ("nightly", "monthly", "graph_build", "notes_watch", "queue_drain", "recall_daemon")
 
 
 def _memory_root_default() -> str | None:
@@ -357,6 +357,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         prompt_recall_outcomes_block = prompt_recall_outcomes()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         prompt_recall_outcomes_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # The warm recall service behind the per-prompt hook. Not running is fine
+    # (the hook falls back to the one-shot path); running on different code
+    # than the disk for over a minute is not — it should have restarted itself.
+    try:
+        from khipu.recall_daemon import daemon_health
+
+        recall_daemon_block = daemon_health()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        recall_daemon_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # W6.1: `khipu doctor --probe` is the ONLY way this command writes anything
     # — it runs a fresh end-to-end capture-then-search probe (khipu.probe) and
     # records the result. Plain `khipu doctor` only reads that last recorded
@@ -525,6 +534,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "literal_trgm": literal_trgm,
         "prompt_recall_snapshot": prompt_recall_snapshot,
         "prompt_recall_outcomes": prompt_recall_outcomes_block,
+        "recall_daemon": recall_daemon_block,
         "recall_probe": recall_probe,
         "recall_quality": recall_quality_block,
         "bundle_seal": bundle_seal_block,
@@ -572,6 +582,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             and bool(literal_trgm.get("ok"))
             and bool(prompt_recall_snapshot.get("ok"))
             and bool(prompt_recall_outcomes_block.get("ok"))
+            and bool(recall_daemon_block.get("ok"))
             and all(bool(v.get("ok")) for v in nightly_steps.values())
             and bool(topics_lag.get("ok"))
             and bool(degraded_rate.get("ok"))
@@ -599,6 +610,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "literal_trgm_ok": bool(literal_trgm.get("ok")),
         "prompt_recall_snapshot_ok": bool(prompt_recall_snapshot.get("ok")),
         "prompt_recall_outcomes_ok": bool(prompt_recall_outcomes_block.get("ok")),
+        "recall_daemon_ok": bool(recall_daemon_block.get("ok")),
         "notes_reconcile_ok": bool(nightly_steps.get("notes_reconcile_ok", {}).get("ok")),
         "embed_provider_ok": bool(nightly_steps.get("embed_provider_ok", {}).get("ok")),
         "commitments_hygiene_ok": bool(nightly_steps.get("commitments_hygiene_ok", {}).get("ok")),
@@ -2502,7 +2514,18 @@ def cmd_recall(args: argparse.Namespace) -> int:
     """W2.5: the search query log — recent searches, and queries that came
     back empty (the seed for a zero-result / golden-query review). Also W6.3
     `khipu recall eval` — score the maintainer-local recall-golden.jsonl against default
-    search and print hit@k per line plus overall."""
+    search and print hit@k per line plus overall. `serve` / `status` are the warm
+    recall service (khipu.recall_daemon) behind the per-prompt hook."""
+    if args.recall_cmd == "serve":
+        from khipu import recall_daemon
+
+        return recall_daemon.serve()
+    if args.recall_cmd == "status":
+        from khipu import recall_daemon
+
+        answer = recall_daemon.ping()
+        print(json.dumps(answer or {"ok": False, "running": False}, indent=2))
+        return 0 if answer else 1
     if args.recall_cmd == "log":
         from khipu import query_log
 
@@ -4031,14 +4054,14 @@ def build_parser() -> argparse.ArgumentParser:
     jb_sub = jb.add_subparsers(dest="jobs_cmd", required=True)
     jb_sub.add_parser("status", help="Print khipu.jobs.job_status() as JSON")
     jbi = jb_sub.add_parser("install", help="Render + load the named jobs (default: all)")
-    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain}")
+    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon}")
     jbr = jb_sub.add_parser(
         "refresh",
         help="Re-render + reload installed jobs whose plist is stale (default: all installed)",
     )
-    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain}")
+    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon}")
     jbu = jb_sub.add_parser("uninstall", help="Unload + remove the named jobs (default: all)")
-    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain}")
+    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon}")
     jb.set_defaults(func=cmd_jobs)
 
     snap = sub.add_parser(
@@ -4054,6 +4077,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     rc = sub.add_parser("recall", help="Search query log: recent / zero-result queries")
     rc_sub = rc.add_subparsers(dest="recall_cmd", required=True)
+    rc_sub.add_parser(
+        "serve", help="Run the warm recall service the per-prompt hook asks first (foreground)"
+    )
+    rc_sub.add_parser("status", help="Ping the warm recall service")
     rlog = rc_sub.add_parser("log", help="Print recent query_log.jsonl entries")
     rlog.add_argument("--tail", type=int, default=20)
     rzero = rc_sub.add_parser(

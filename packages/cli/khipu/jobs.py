@@ -110,6 +110,10 @@ PLIST_NOTES_WATCH = "com.khipu.notes-watch"
 # no single directory whose mtime reliably means "a job landed" across every
 # harness's queue file naming.
 PLIST_QUEUE_DRAIN = "com.khipu.queue-drain"
+# The warm process behind the per-prompt recall hook (khipu.recall_daemon).
+# Not calendar-scheduled: KeepAlive, because it exits on purpose when the
+# package's code changes on disk and must come back on the new code.
+PLIST_RECALL_DAEMON = "com.khipu.recall-daemon"
 
 LEGACY_PLIST_NIGHTLY = "com.matt.conversation-memory-nightly"
 LEGACY_PLIST_GRAPH = "com.matt.graphify-nightly"
@@ -141,6 +145,11 @@ _JOB_SPECS: dict[str, dict[str, str]] = {
         "plist": PLIST_QUEUE_DRAIN,
         "log_stem": "khipu-queue-drain",
         "schedule": "every 5 min",
+    },
+    "recall_daemon": {
+        "plist": PLIST_RECALL_DAEMON,
+        "log_stem": "khipu-recall-daemon",
+        "schedule": "always running (KeepAlive)",
     },
 }
 
@@ -784,6 +793,7 @@ def job_status() -> dict[str, Any]:
         "graph_build": _job_entry("graph_build"),
         "notes_watch": _job_entry("notes_watch"),
         "queue_drain": _job_entry("queue_drain"),
+        "recall_daemon": _job_entry("recall_daemon"),
         "embed_media_backfill": _on_demand_job_entry("embed_media_backfill"),
     }
 
