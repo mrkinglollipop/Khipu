@@ -592,6 +592,30 @@ TOOLS: list[dict] = [
             "required": ["topic"],
         },
     },
+    {
+        "name": "khipu_reflect",
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "description": (
+            "Answer one question from memory and show the evidence. Runs one "
+            "search, then asks the configured model to answer only from what "
+            "it found; every claim lists the episode or topic ids it rests on "
+            "(fetch one with khipu_get before acting on it), and a claim the "
+            "sources do not support is removed. Superseded or retracted "
+            "decisions are treated as history. Abstains (abstained: true, with "
+            "a reason, answer empty) rather than answer without sources. It "
+            "calls a model, so use it when you want a synthesis, not for a "
+            "lookup: khipu_search is the lookup. Writes nothing. Returns "
+            "{available: false, reason} when reflection is switched off."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "The question to answer from memory"},
+                "project": {"type": "string", "description": "Prefer sources from this project (a preference, not a filter)"},
+            },
+            "required": ["question"],
+        },
+    },
 ]
 
 
@@ -1292,6 +1316,20 @@ def _tool_brief(args: dict) -> dict:
             return briefs.read_brief(cur, topic)
 
 
+def _tool_reflect(args: dict) -> dict:
+    """khipu_reflect: an explicit cited answer. The switch is checked before
+    any search or connection; nothing else in the server calls this."""
+    question = (args.get("question") or "").strip()
+    if not question:
+        raise ValueError("question is required")
+    _ensure_path()
+    from khipu import features, reflect
+
+    if not features.enabled("reflect"):
+        return {"available": False, "reason": reflect.REASON_SWITCH_OFF}
+    return reflect.reflect(question, project=args.get("project") or None)
+
+
 TOOL_FUNCS = {
     "khipu_search": _tool_search,
     "khipu_get": _tool_get,
@@ -1304,6 +1342,7 @@ TOOL_FUNCS = {
     "khipu_decisions": _tool_decisions,
     "khipu_decisions_update": _tool_decisions_update,
     "khipu_brief": _tool_brief,
+    "khipu_reflect": _tool_reflect,
 }
 
 

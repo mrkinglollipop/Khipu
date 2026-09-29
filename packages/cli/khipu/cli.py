@@ -2756,6 +2756,13 @@ def cmd_briefs(args: argparse.Namespace) -> int:
     return briefs.cli_main(args)
 
 
+def cmd_reflect(args: argparse.Namespace) -> int:
+    """`khipu reflect "question" [--project P]`."""
+    from khipu import reflect
+
+    return reflect.cli_main(args)
+
+
 def cmd_paths(args: argparse.Namespace) -> int:
     from khipu.paths import paths_status, set_data_dir
 
@@ -4152,6 +4159,11 @@ def build_parser() -> argparse.ArgumentParser:
     br_show = br_sub.add_parser("show", help="Print a topic's current brief")
     br_show.add_argument("slug")
     br.set_defaults(func=cmd_briefs)
+
+    rf = sub.add_parser("reflect", help="Answer a question from memory with cited evidence (needs the reflect switch on)")
+    rf.add_argument("question")
+    rf.add_argument("--project", default=None, help="Prefer sources from this project")
+    rf.set_defaults(func=cmd_reflect)
 
     comp = sub.add_parser(
         "components",

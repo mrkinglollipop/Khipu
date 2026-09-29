@@ -126,6 +126,9 @@ def _prior_work_pattern() -> re.Pattern[str]:
     except Exception:  # noqa: BLE001 — never block a build on the renderer
         heading = "## Prior work on this topic"
         footer = "Call khipu_get on an id before acting on it."
+    # The heading's parenthetical has been reworded before; the block is
+    # recognised by the part that has not.
+    heading = heading.split(" (", 1)[0]
     return re.compile(re.escape(heading) + r".*?(?:" + re.escape(footer) + r"|\Z)", re.S)
 
 

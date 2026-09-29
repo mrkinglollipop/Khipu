@@ -82,6 +82,8 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
   retracts, confirms or rejects one — supersede the moment a decision is reversed, never for a mere refinement.
 - `khipu_brief` reads a topic's derived summary, each claim naming its source
   episode ids; cite the episodes, not the brief. `available: false` means off.
+- `khipu_reflect` answers one question from memory with each claim cited, or
+  abstains. It calls a model: ask it for a synthesis, not a lookup.
 - Capture writes: on a local Mac with a Khipu capture hook (`khipu-stop-hook`
   or `khipu-aegis-capture`) the hook is the writer, not you — but `khipu_capture`
   now works there too: call it (or `khipu capture now` in a shell) when you

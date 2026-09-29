@@ -77,6 +77,8 @@ _CAPABILITIES = (
     "replica.deliverables",
     # Phase 4, session A.
     "briefs.read",
+    # Phase 4, session B.
+    "reflect",
 )
 
 
