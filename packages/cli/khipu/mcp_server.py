@@ -984,23 +984,17 @@ def _tool_capture(args: dict) -> dict:
         raise ValueError("khipu_capture requires a non-empty string 'summary'")
 
     if _stdio_hook_owns_capture():
-        from khipu.session_capture import newest_session_ref, request_capture_now
+        from khipu.session_capture import request_capture_now, resolve_session_ref
 
         sid_arg = str(args.get("session_id") or "")
-        harness, sid = (sid_arg.split(":", 1) if ":" in sid_arg else (None, None))
-        if not harness or not sid:
-            ref = newest_session_ref()
-            if ref is None:
-                raise ValueError(
-                    "khipu_capture found a local capture hook (khipu-stop-hook / "
-                    "khipu-aegis-capture) but no active session to flag — no "
-                    "per-session state file exists yet (the hook has not run once "
-                    "in this session). Pass session_id='<harness>:<id>' explicitly, "
-                    "or wait for the hook's first run and retry."
-                )
-            harness, sid = ref
+        harness, _, sid = sid_arg.partition(":") if ":" in sid_arg else ("", "", sid_arg)
+        # Which session is the caller's is decided from what the hooks recorded
+        # about themselves, never from which state file is newest: two sessions
+        # can be live at once. An unresolvable caller is refused, not guessed.
+        harness, sid, resolved_by = resolve_session_ref(harness or None, sid or None)
         request_capture_now(harness, sid, note=summary.strip())
-        return {"queued": True, "captured_by": "next stop", "harness": harness, "session_id": sid}
+        return {"queued": True, "captured_by": "next stop", "harness": harness, "session_id": sid,
+                "resolved_by": resolved_by}
 
     mode = _capture_mode()
     if mode != "hub":

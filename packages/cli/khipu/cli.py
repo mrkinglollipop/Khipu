@@ -2092,24 +2092,18 @@ def cmd_capture_now(args: argparse.Namespace) -> int:
     flags a session for capture on its next Stop/PreCompact/SessionEnd,
     regardless of cadence. With no explicit --harness/--session-id, targets
     the most recently active local session (newest per-session state file)."""
-    from khipu.session_capture import newest_session_ref, request_capture_now
+    from khipu.session_capture import request_capture_now, resolve_session_ref
 
-    harness = getattr(args, "harness", None)
-    sid = getattr(args, "session_id", None)
-    if not harness or not sid:
-        auto = newest_session_ref()
-        if auto is None:
-            print(json.dumps({
-                "ok": False,
-                "error": "no active session found under the capture state dir; "
-                         "pass --harness and --session-id explicitly",
-            }))
-            return 1
-        harness, sid = harness or auto[0], sid or auto[1]
+    try:
+        harness, sid, resolved_by = resolve_session_ref(
+            getattr(args, "harness", None) or None, getattr(args, "session_id", None) or None)
+    except ValueError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 1
     path = request_capture_now(harness, sid, note=getattr(args, "note", None))
     print(json.dumps({
         "queued": True, "captured_by": "next stop",
-        "harness": harness, "session_id": sid, "flag": str(path),
+        "harness": harness, "session_id": sid, "flag": str(path), "resolved_by": resolved_by,
     }))
     return 0
 

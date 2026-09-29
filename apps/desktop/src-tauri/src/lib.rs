@@ -476,7 +476,7 @@ async fn liveness_now() -> Result<String, String> {
 
 /// D3: Home's "Capture now" button — `khipu capture now`, no arguments, so
 /// it flags the most recently active local session (K1's
-/// `newest_session_ref()`) for capture at its next Stop/PreCompact/
+/// `resolve_session_ref()`) for capture at its next Stop/PreCompact/
 /// SessionEnd instead of waiting on the fixed cadence. Fixed argv: `capture`
 /// stays out of `ALLOWED_SUBCOMMANDS` like every other state-changing verb
 /// here, and the button never lets the webview pick a harness/session id of

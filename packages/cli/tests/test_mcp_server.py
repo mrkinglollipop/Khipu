@@ -149,7 +149,7 @@ class CaptureRejectionTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self._env = mock.patch.dict(os.environ, {
             "KHIPU_DATA_DIR": self.tmp.name,
-            # K1: request_capture_now/newest_session_ref touch this dir — must
+            # K1: request_capture_now/resolve_session_ref touch this dir — must
             # never be the real ~/.grok/khipu on the machine running tests.
             "KHIPU_CAPTURE_HOME": str(Path(self.tmp.name) / "kh"),
         })
