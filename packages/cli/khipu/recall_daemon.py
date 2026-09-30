@@ -71,11 +71,11 @@ def socket_path() -> Path:
     return khipu_home() / SOCKET_NAME
 
 
-def code_stamp_parts() -> tuple[int, int]:
-    """(newest modification time in ns, file count) over the package's own
-    .py files. The count is there so a deleted file, which leaves the newest
-    time alone, still changes the stamp."""
-    root = Path(__file__).resolve().parent
+def code_stamp_parts(root: Path | None = None) -> tuple[int, int]:
+    """(newest modification time in ns, file count) over a package's .py
+    files, this one's by default. The count is there so a deleted file, which
+    leaves the newest time alone, still changes the stamp."""
+    root = Path(__file__).resolve().parent if root is None else Path(root)
     newest = 0
     count = 0
     for p in root.rglob("*.py"):
@@ -342,6 +342,7 @@ class RecallService:
             return {
                 "ok": True, "version": __version__, "pid": os.getpid(),
                 "started": self.started, "code_stamp": self.stamp, "served": served,
+                "root": str(Path(__file__).resolve().parent),
             }
         if op == "recall":
             return self._recall(req)
@@ -506,9 +507,17 @@ def daemon_health(path: Path | None = None, *, now_ns: int | None = None) -> dic
         "ok": True, "running": True, "pid": answer.get("pid"),
         "version": answer.get("version"), "served": answer.get("served"),
     }
-    newest, _count = code_stamp_parts()
+    # The service may run from another copy of the package than this doctor
+    # (the desktop app's bundle asking about a service run from a checkout):
+    # judge it against the files it runs from, not against this copy.
+    root = answer.get("root")
+    own_root = str(Path(__file__).resolve().parent)
+    elsewhere = isinstance(root, str) and root != own_root and Path(root).is_dir()
+    newest, _count = code_stamp_parts(Path(root) if elsewhere else None)
     disk = f"{newest}:{_count}"
-    differs = answer.get("version") != __version__ or answer.get("code_stamp") != disk
+    differs = answer.get("code_stamp") != disk or (
+        not elsewhere and answer.get("version") != __version__
+    )
     now = time.time_ns() if now_ns is None else now_ns
     if differs and now - newest > 60 * 1_000_000_000:
         out["ok"] = False

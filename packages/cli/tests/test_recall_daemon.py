@@ -707,3 +707,32 @@ class ProjectCacheTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HealthFromAnotherCopyTest(unittest.TestCase):
+    """A doctor run from another copy of the package (the app's bundle) judges
+    the service against the files the service runs from, not its own."""
+
+    def test_a_service_current_with_its_own_root_is_ok(self):
+        with tempfile.TemporaryDirectory() as d:
+            other = Path(d) / "khipu"
+            other.mkdir()
+            (other / "a.py").write_text("x = 1\n")
+            newest, count = recall_daemon.code_stamp_parts(other)
+            answer = {"ok": True, "version": "0.0.0", "pid": 1, "served": 0,
+                      "root": str(other), "code_stamp": f"{newest}:{count}"}
+            with mock.patch.object(recall_daemon, "ping", return_value=answer):
+                out = recall_daemon.daemon_health(now_ns=newest + 3600 * 10**9)
+        self.assertTrue(out["ok"])
+
+    def test_a_service_behind_its_own_root_is_not_ok(self):
+        with tempfile.TemporaryDirectory() as d:
+            other = Path(d) / "khipu"
+            other.mkdir()
+            (other / "a.py").write_text("x = 1\n")
+            newest, count = recall_daemon.code_stamp_parts(other)
+            answer = {"ok": True, "version": "0.0.0", "pid": 1, "served": 0,
+                      "root": str(other), "code_stamp": f"{newest - 10**9}:{count}"}
+            with mock.patch.object(recall_daemon, "ping", return_value=answer):
+                out = recall_daemon.daemon_health(now_ns=newest + 3600 * 10**9)
+        self.assertFalse(out["ok"])
