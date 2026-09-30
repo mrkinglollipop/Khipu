@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Check, Loader2, Minus, RefreshCw, TriangleAlert, X } from "lucide-react";
 import { WorkingBanner } from "./WorkingBanner";
 import { Callout, Tag } from "./ui";
+import { GatewayTokenCard } from "./SettingsControls";
 import type { Tone } from "./ui";
 
 /**
@@ -712,6 +713,8 @@ export function IntegrationsPanel({
           </button>
         </div>
       </div>
+
+      <GatewayTokenCard active={active} />
 
       <p className="muted">
         Install writes Khipu's own entries next to whatever is already there and

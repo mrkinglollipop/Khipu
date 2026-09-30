@@ -488,6 +488,312 @@ async fn khipu_capture_now() -> Result<String, String> {
     run_khipu_cli_async(CAPTURE_NOW_ARGV.iter().map(|s| s.to_string()).collect()).await
 }
 
+// --- Settings parity (docs/plans/2026-09-30-settings-parity.md). Every setting
+// the `khipu` CLI persists gets a fixed-argv command here. The webview never
+// supplies argv: a name or key is checked against a constant list, a value is
+// validated per key, and a value that reaches argv travels either as
+// `--flag=value` or as the second operand of `config --set KEY VALUE`, where
+// validation has already refused anything starting with `-` (argparse would
+// read it as a flag). The gateway token travels on stdin. None of these verbs
+// join `ALLOWED_SUBCOMMANDS`.
+
+/// The nine switches in `khipu.features.FEATURES`.
+const FEATURE_NAMES: &[&str] = &[
+    "validity_ranking",
+    "time_interpretation",
+    "relevance_floor",
+    "rerank",
+    "reflect",
+    "briefs",
+    "graph_candidates",
+    "decision_details",
+    "auto_supersede",
+];
+
+/// The scheduled jobs `khipu jobs install|uninstall` accepts (`_JOBS_CHOICES`).
+const JOB_NAMES: &[&str] = &[
+    "nightly",
+    "monthly",
+    "graph_build",
+    "notes_watch",
+    "queue_drain",
+    "recall_daemon",
+];
+
+const CAPTURE_MODES: &[&str] = &["legacy", "dual", "hub"];
+/// `config --set KEY N` with N in [0, 1] (`FLOAT_SETTINGS`).
+const UNIT_FLOAT_KEYS: &[&str] = &["dedup_similarity", "commitment_close_similarity"];
+/// `config --set KEY PATH` / `config --unset KEY` (`PATH_SETTINGS`).
+const PATH_KEYS: &[&str] = &[
+    "memory_root",
+    "memory_repo",
+    "capture_v2",
+    "graph_sqlite",
+    "gemini_key_file",
+];
+const COSINE_FLOOR_KEY: &str = "relevance.cosine_floor";
+
+const FEATURES_SHOW_ARGV: &[&str] = &["features"];
+const CONFIG_SHOW_ARGV: &[&str] = &["config"];
+const JOBS_STATUS_ARGV: &[&str] = &["jobs", "status"];
+const RECALL_STATUS_ARGV: &[&str] = &["recall", "status"];
+const GATEWAY_TOKEN_STATUS_ARGV: &[&str] = &["gateway", "token", "status"];
+const GATEWAY_TOKEN_SET_ARGV: &[&str] = &["gateway", "token", "set"];
+
+fn fixed_argv(argv: &[&str]) -> Vec<String> {
+    argv.iter().map(|s| s.to_string()).collect()
+}
+
+fn has_control(s: &str) -> bool {
+    s.chars().any(|c| c.is_control())
+}
+
+fn feature_set_argv(name: &str, enabled: bool) -> Result<Vec<String>, String> {
+    if !FEATURE_NAMES.contains(&name) {
+        return Err(format!("not a switch: {name:?}"));
+    }
+    Ok(vec![
+        "features".to_string(),
+        "--set".to_string(),
+        name.to_string(),
+        if enabled { "on" } else { "off" }.to_string(),
+    ])
+}
+
+fn job_argv(verb: &str, name: &str) -> Result<Vec<String>, String> {
+    if verb != "install" && verb != "uninstall" {
+        return Err(format!("not a jobs verb: {verb:?}"));
+    }
+    if !JOB_NAMES.contains(&name) {
+        return Err(format!("not a scheduled job: {name:?}"));
+    }
+    Ok(vec!["jobs".to_string(), verb.to_string(), name.to_string()])
+}
+
+/// A number the CLI would accept, re-printed from the parsed value so nothing
+/// the caller typed (a sign, an exponent, whitespace) reaches argv.
+fn parse_unit_number(key: &str, raw: &str, allow_zero: bool) -> Result<String, String> {
+    let v: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{key} must be a number, got {raw:?}"))?;
+    let ok = if allow_zero { (0.0..=1.0).contains(&v) } else { v > 0.0 && v <= 1.0 };
+    if !ok {
+        let low = if allow_zero { "0" } else { "above 0" };
+        return Err(format!("{key} must be {low} and at most 1, got {raw:?}"));
+    }
+    Ok(format!("{v}"))
+}
+
+fn checked_operand(key: &str, raw: &str, allow_empty: bool) -> Result<String, String> {
+    let v = raw.trim();
+    if v.is_empty() {
+        return if allow_empty {
+            Ok(String::new())
+        } else {
+            Err(format!("{key} must not be empty"))
+        };
+    }
+    if v.starts_with('-') {
+        return Err(format!("{key} must not start with '-'"));
+    }
+    if has_control(v) {
+        return Err(format!("{key} must not contain control characters"));
+    }
+    if v.len() > 4096 {
+        return Err(format!("{key} is too long"));
+    }
+    Ok(v.to_string())
+}
+
+fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
+    let set = |k: &str, v: String| {
+        vec!["config".to_string(), "--set".to_string(), k.to_string(), v]
+    };
+    match key {
+        "capture_mode" => {
+            let v = value.trim();
+            if !CAPTURE_MODES.contains(&v) {
+                return Err(format!("capture_mode must be legacy, dual or hub, got {value:?}"));
+            }
+            Ok(vec!["config".to_string(), format!("--set-capture-mode={v}")])
+        }
+        "gateway_url" => {
+            let v = value.trim();
+            if !v.is_empty() {
+                if !v.starts_with("https://") {
+                    return Err("gateway_url must start with https://".to_string());
+                }
+                if v.len() > 2048 || v.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                    return Err("gateway_url must be one line with no spaces".to_string());
+                }
+            }
+            Ok(vec!["config".to_string(), format!("--set-gateway-url={v}")])
+        }
+        k if UNIT_FLOAT_KEYS.contains(&k) => Ok(set(k, parse_unit_number(k, value, true)?)),
+        COSINE_FLOOR_KEY => Ok(set(COSINE_FLOOR_KEY, parse_unit_number(key, value, false)?)),
+        "user_aliases" => Ok(set("user_aliases", checked_operand(key, value, true)?)),
+        k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
+        _ => Err(format!("not a settable key: {key:?}")),
+    }
+}
+
+fn config_unset_argv(key: &str) -> Result<Vec<String>, String> {
+    if !PATH_KEYS.contains(&key) && key != COSINE_FLOOR_KEY {
+        return Err(format!("not a resettable key: {key:?}"));
+    }
+    Ok(vec!["config".to_string(), format!("--unset={key}")])
+}
+
+/// Embedding profile ids look like `gemini-embedding-2@768`.
+fn checked_profile(profile: &str) -> Result<&str, String> {
+    let p = profile.trim();
+    let ok = !p.is_empty()
+        && p.len() <= 64
+        && !p.starts_with('-')
+        && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'));
+    if ok {
+        Ok(p)
+    } else {
+        Err(format!("not an embedding profile id: {profile:?}"))
+    }
+}
+
+fn embed_status_argv(profile: Option<&str>) -> Result<Vec<String>, String> {
+    let mut args = vec!["embed".to_string(), "status".to_string()];
+    if let Some(p) = profile {
+        args.push(format!("--profile={}", checked_profile(p)?));
+    }
+    Ok(args)
+}
+
+/// Never `--force`: the CLI refuses a profile that is missing vectors.
+fn embed_activate_argv(profile: &str) -> Result<Vec<String>, String> {
+    Ok(vec![
+        "embed".to_string(),
+        "activate".to_string(),
+        checked_profile(profile)?.to_string(),
+    ])
+}
+
+fn gateway_token_input(value: &str) -> Result<String, String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Err("token is empty".to_string());
+    }
+    if v.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("token must be a single line with no spaces".to_string());
+    }
+    Ok(v.to_string())
+}
+
+#[tauri::command]
+async fn khipu_features_show() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(FEATURES_SHOW_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_feature_set(name: String, enabled: bool) -> Result<String, String> {
+    run_khipu_cli_async(feature_set_argv(&name, enabled)?).await
+}
+
+#[tauri::command]
+async fn khipu_config_show() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(CONFIG_SHOW_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_config_set(key: String, value: String) -> Result<String, String> {
+    run_khipu_cli_async(config_set_argv(&key, &value)?).await
+}
+
+#[tauri::command]
+async fn khipu_config_unset(key: String) -> Result<String, String> {
+    run_khipu_cli_async(config_unset_argv(&key)?).await
+}
+
+#[tauri::command]
+async fn khipu_jobs_status() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(JOBS_STATUS_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_job_install(name: String) -> Result<String, String> {
+    run_khipu_cli_async(job_argv("install", &name)?).await
+}
+
+#[tauri::command]
+async fn khipu_job_uninstall(name: String) -> Result<String, String> {
+    run_khipu_cli_async(job_argv("uninstall", &name)?).await
+}
+
+#[tauri::command]
+async fn khipu_recall_status() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(RECALL_STATUS_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_gateway_token_status() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(GATEWAY_TOKEN_STATUS_ARGV)).await
+}
+
+/// The token goes to the CLI's stdin, never argv, and is never logged or
+/// returned (the CLI prints only path, mode and size).
+#[tauri::command]
+async fn khipu_gateway_token_set(value: String) -> Result<String, String> {
+    let token = gateway_token_input(&value)?;
+    spawn_blocking_cli(move || run_khipu_cli_with_stdin(&fixed_argv(GATEWAY_TOKEN_SET_ARGV), &token)).await
+}
+
+#[tauri::command]
+async fn khipu_embed_status(profile: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(embed_status_argv(profile.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_embed_activate(profile: String) -> Result<String, String> {
+    run_khipu_cli_async(embed_activate_argv(&profile)?).await
+}
+
+/// `khipu <args>` with `stdin_text` piped to stdin. The text is never echoed
+/// into an error message.
+fn run_khipu_cli_with_stdin(args: &[String], stdin_text: &str) -> Result<String, String> {
+    let root = khipu_root()?;
+    let py = khipu_python()?;
+    let pythonpath = khipu_pythonpath(&root);
+    let (bc_key, bc_val) = khipu_bytecode_env();
+    let mut child = Command::new(&py)
+        .arg("-m")
+        .arg("khipu")
+        .args(args)
+        .env("PYTHONPATH", &pythonpath)
+        .env("KHIPU_ROOT", &root)
+        .env("KHIPU_APP_VERSION", khipu_app_version())
+        .env(bc_key, &bc_val)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn khipu CLI failed ({py:?}): {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "no stdin on khipu CLI".to_string())?
+        .write_all(stdin_text.as_bytes())
+        .map_err(|e| format!("writing to khipu CLI failed: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("khipu CLI did not exit cleanly: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        if stdout_looks_like_json(&stdout) {
+            return Ok(stdout);
+        }
+        return Err(format!("khipu exited {}", output.status.code().unwrap_or(-1)));
+    }
+    Ok(stdout)
+}
+
 /// Apply (or plan) the schema. `migrate` is a state-changing subcommand and is
 /// deliberately NOT in `ALLOWED_SUBCOMMANDS`; this command fixes the argv to
 /// exactly `migrate` / `migrate --dry-run` so the UI can offer setup without
@@ -1438,6 +1744,19 @@ pub fn run() {
             khipu_migrate,
             khipu_embed_backfill,
             khipu_jobs_refresh,
+            khipu_features_show,
+            khipu_feature_set,
+            khipu_config_show,
+            khipu_config_set,
+            khipu_config_unset,
+            khipu_jobs_status,
+            khipu_job_install,
+            khipu_job_uninstall,
+            khipu_recall_status,
+            khipu_gateway_token_status,
+            khipu_gateway_token_set,
+            khipu_embed_status,
+            khipu_embed_activate,
             liveness_now,
             khipu_capture_now,
             khipu_db_status,
@@ -1891,6 +2210,238 @@ mod run_khipu_guard_tests {
     fn an_empty_or_unknown_subcommand_is_not_allowed() {
         assert!(!ALLOWED_SUBCOMMANDS.contains(&""));
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"--help"));
+    }
+}
+
+#[cfg(test)]
+mod settings_command_tests {
+    use super::*;
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn none_of_these_verbs_join_the_generic_allowlist() {
+        for s in ["features", "config", "jobs", "recall", "gateway", "embed"] {
+            assert!(!ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of the allowlist");
+        }
+        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 14);
+    }
+
+    #[test]
+    fn read_only_commands_are_fixed_argv() {
+        assert_eq!(fixed_argv(FEATURES_SHOW_ARGV), v(&["features"]));
+        assert_eq!(fixed_argv(CONFIG_SHOW_ARGV), v(&["config"]));
+        assert_eq!(fixed_argv(JOBS_STATUS_ARGV), v(&["jobs", "status"]));
+        assert_eq!(fixed_argv(RECALL_STATUS_ARGV), v(&["recall", "status"]));
+        assert_eq!(fixed_argv(GATEWAY_TOKEN_STATUS_ARGV), v(&["gateway", "token", "status"]));
+        assert_eq!(fixed_argv(GATEWAY_TOKEN_SET_ARGV), v(&["gateway", "token", "set"]));
+    }
+
+    #[test]
+    fn every_switch_builds_an_on_and_an_off_argv() {
+        assert_eq!(FEATURE_NAMES.len(), 9);
+        for n in FEATURE_NAMES {
+            assert_eq!(feature_set_argv(n, true).unwrap(), v(&["features", "--set", n, "on"]));
+            assert_eq!(feature_set_argv(n, false).unwrap(), v(&["features", "--set", n, "off"]));
+        }
+    }
+
+    #[test]
+    fn the_switch_list_matches_the_python_registry() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../packages/cli/khipu/features.py");
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let block = src.split("FEATURES: dict[str, str] = {").nth(1).expect("FEATURES literal");
+        let block = block.split("\n}").next().unwrap();
+        for n in FEATURE_NAMES {
+            assert!(block.contains(&format!("\"{n}\":")), "{n} missing from features.py");
+        }
+        assert_eq!(block.matches("\": \"").count(), FEATURE_NAMES.len(), "features.py has a switch the app lacks");
+    }
+
+    #[test]
+    fn a_bad_switch_name_is_refused() {
+        for bad in ["", "rerank ", "RERANK", "rerank on", "--help", "-x", "recall.daemon", "briefs\n"] {
+            assert!(feature_set_argv(bad, true).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn job_argv_is_install_or_uninstall_of_a_known_job() {
+        assert_eq!(job_argv("install", "recall_daemon").unwrap(), v(&["jobs", "install", "recall_daemon"]));
+        assert_eq!(job_argv("uninstall", "nightly").unwrap(), v(&["jobs", "uninstall", "nightly"]));
+        for n in JOB_NAMES {
+            assert!(job_argv("install", n).is_ok());
+        }
+        assert_eq!(JOB_NAMES.len(), 6);
+    }
+
+    #[test]
+    fn job_argv_refuses_unknown_names_and_verbs() {
+        for bad in ["", "embed_media_backfill", "nightly monthly", "--help", "-a", "../nightly", "Nightly"] {
+            assert!(job_argv("install", bad).is_err(), "accepted {bad:?}");
+        }
+        for verb in ["refresh", "status", "", "install --all"] {
+            assert!(job_argv(verb, "nightly").is_err(), "accepted verb {verb:?}");
+        }
+    }
+
+    #[test]
+    fn capture_mode_uses_the_equals_form() {
+        assert_eq!(config_set_argv("capture_mode", "hub").unwrap(), v(&["config", "--set-capture-mode=hub"]));
+        assert_eq!(config_set_argv("capture_mode", " legacy ").unwrap(), v(&["config", "--set-capture-mode=legacy"]));
+        for bad in ["", "HUB", "hub --unset", "both", "-hub"] {
+            assert!(config_set_argv("capture_mode", bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn gateway_url_is_empty_or_https() {
+        assert_eq!(
+            config_set_argv("gateway_url", "https://k.example.org").unwrap(),
+            v(&["config", "--set-gateway-url=https://k.example.org"])
+        );
+        assert_eq!(config_set_argv("gateway_url", "  ").unwrap(), v(&["config", "--set-gateway-url="]));
+        for bad in ["http://k.example.org", "k.example.org", "https://a b", "https://a\nb", "--x", "ftp://x"] {
+            assert!(config_set_argv("gateway_url", bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn similarity_knobs_take_zero_to_one_and_print_the_parsed_number() {
+        for key in UNIT_FLOAT_KEYS {
+            assert_eq!(config_set_argv(key, "0.8").unwrap(), v(&["config", "--set", key, "0.8"]));
+            assert_eq!(config_set_argv(key, "0").unwrap(), v(&["config", "--set", key, "0"]));
+            assert_eq!(config_set_argv(key, "1").unwrap(), v(&["config", "--set", key, "1"]));
+            assert_eq!(config_set_argv(key, " +0.50 ").unwrap(), v(&["config", "--set", key, "0.5"]));
+            assert_eq!(config_set_argv(key, "1e-1").unwrap(), v(&["config", "--set", key, "0.1"]));
+        }
+    }
+
+    #[test]
+    fn cosine_floor_is_above_zero_up_to_one() {
+        assert_eq!(
+            config_set_argv("relevance.cosine_floor", "0.65").unwrap(),
+            v(&["config", "--set", "relevance.cosine_floor", "0.65"])
+        );
+        assert!(config_set_argv("relevance.cosine_floor", "1").is_ok());
+        assert!(config_set_argv("relevance.cosine_floor", "0").is_err());
+    }
+
+    #[test]
+    fn a_number_can_never_reach_argv_as_a_flag_or_junk() {
+        for key in ["dedup_similarity", "commitment_close_similarity", "relevance.cosine_floor"] {
+            for bad in ["-0.1", "-1", "--set", "-", "1.01", "2", "nan", "NaN", "inf", "-inf", "", "abc", "0.5 0.6", "0,5"] {
+                assert!(config_set_argv(key, bad).is_err(), "{key} accepted {bad:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn user_aliases_and_paths_refuse_flags_and_control_characters() {
+        assert_eq!(config_set_argv("user_aliases", "matt, matthew").unwrap(), v(&["config", "--set", "user_aliases", "matt, matthew"]));
+        assert_eq!(config_set_argv("user_aliases", "").unwrap(), v(&["config", "--set", "user_aliases", ""]));
+        for key in ["user_aliases", "memory_root", "memory_repo", "capture_v2", "graph_sqlite", "gemini_key_file"] {
+            for bad in ["-x", "--unset", "--set-gateway-url=https://x", "a\nb", "a\0b", "a\tb"] {
+                assert!(config_set_argv(key, bad).is_err(), "{key} accepted {bad:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn path_keys_are_non_empty_and_passed_after_set() {
+        for key in PATH_KEYS {
+            assert_eq!(config_set_argv(key, "/Volumes/X/mem").unwrap(), v(&["config", "--set", key, "/Volumes/X/mem"]));
+            assert!(config_set_argv(key, "  ").is_err(), "{key} accepted an empty path");
+        }
+        assert_eq!(
+            config_set_argv("memory_root", "~/Memory notes").unwrap(),
+            v(&["config", "--set", "memory_root", "~/Memory notes"])
+        );
+    }
+
+    #[test]
+    fn unknown_config_keys_are_refused() {
+        for bad in ["", "features", "models", "config", "database_url", "capture_modes", "relevance", "--set", "Memory_root"] {
+            assert!(config_set_argv(bad, "1").is_err(), "accepted {bad:?}");
+            assert!(config_unset_argv(bad).is_err(), "unset accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn unset_takes_path_keys_and_the_cosine_floor_only() {
+        for key in PATH_KEYS {
+            assert_eq!(config_unset_argv(key).unwrap(), v(&["config", &format!("--unset={key}")]));
+        }
+        assert_eq!(
+            config_unset_argv("relevance.cosine_floor").unwrap(),
+            v(&["config", "--unset=relevance.cosine_floor"])
+        );
+        for not_resettable in ["capture_mode", "gateway_url", "user_aliases", "dedup_similarity"] {
+            assert!(config_unset_argv(not_resettable).is_err());
+        }
+    }
+
+    #[test]
+    fn the_config_key_lists_match_the_python_settings() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../packages/cli/khipu/config.py");
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let paths = src.split("PATH_SETTINGS: dict").nth(1).unwrap().split("\n}").next().unwrap();
+        for k in PATH_KEYS {
+            assert!(paths.contains(&format!("\"{k}\":")), "{k} missing from PATH_SETTINGS");
+        }
+        let floats = src.split("FLOAT_SETTINGS: dict").nth(1).unwrap().split("\n}").next().unwrap();
+        for k in UNIT_FLOAT_KEYS {
+            assert!(floats.contains(&format!("\"{k}\":")), "{k} missing from FLOAT_SETTINGS");
+        }
+        let cli = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/cli/khipu/cli.py"),
+        ).unwrap();
+        let jobs = cli.split("_JOBS_CHOICES = (").nth(1).unwrap().split(')').next().unwrap();
+        for n in JOB_NAMES {
+            assert!(jobs.contains(&format!("\"{n}\"")), "{n} missing from _JOBS_CHOICES");
+        }
+    }
+
+    #[test]
+    fn embed_status_is_fixed_or_takes_a_checked_profile() {
+        assert_eq!(embed_status_argv(None).unwrap(), v(&["embed", "status"]));
+        assert_eq!(
+            embed_status_argv(Some("gemini-embedding-2@768")).unwrap(),
+            v(&["embed", "status", "--profile=gemini-embedding-2@768"])
+        );
+        assert!(embed_status_argv(Some("--profile=x")).is_err());
+    }
+
+    #[test]
+    fn embed_activate_never_forces_and_checks_the_profile() {
+        assert_eq!(
+            embed_activate_argv("gemini-embedding-001@768").unwrap(),
+            v(&["embed", "activate", "gemini-embedding-001@768"])
+        );
+        for ok in ["a", "x.y_z-1@2"] {
+            assert!(embed_activate_argv(ok).is_ok(), "rejected {ok:?}");
+        }
+        for bad in ["", " ", "-f", "--force", "a b", "a;b", "a\nb", "a/b", "gemini$", &"x".repeat(65)] {
+            assert!(embed_activate_argv(bad).is_err(), "accepted {bad:?}");
+        }
+        assert!(!embed_activate_argv("gemini-embedding-2@768").unwrap().iter().any(|a| a.contains("force")));
+    }
+
+    #[test]
+    fn the_gateway_token_is_stdin_only_and_never_in_argv() {
+        // The token has no argv builder at all: its argv is the fixed
+        // constant, and the value goes through `run_khipu_cli_with_stdin`.
+        assert_eq!(GATEWAY_TOKEN_SET_ARGV, &["gateway", "token", "set"]);
+        assert_eq!(gateway_token_input("  abc123  ").unwrap(), "abc123");
+        for bad in ["", "   ", "two words", "a\nb", "a\0b"] {
+            assert!(gateway_token_input(bad).is_err(), "accepted {bad:?}");
+        }
+        let err = gateway_token_input("has space").unwrap_err();
+        assert!(!err.contains("has space"), "error echoed the token");
     }
 }
 

@@ -67,6 +67,46 @@ def cosine_floor() -> float:
     return float(raw) if 0.0 < float(raw) <= 1.0 else COSINE_FLOOR
 
 
+def cosine_floor_status() -> dict[str, Any]:
+    """The effective floor, where it came from (``file`` when config.json holds
+    a usable number, else ``default``) and the built-in default, for
+    ``khipu config``."""
+    value = cosine_floor()
+    try:
+        from khipu.config import load_config
+
+        section = load_config().get("relevance")
+        raw = section.get("cosine_floor") if isinstance(section, dict) else None
+    except Exception:  # noqa: BLE001
+        raw = None
+    stored = (not isinstance(raw, bool) and isinstance(raw, (int, float))
+              and 0.0 < float(raw) <= 1.0)
+    return {"value": value, "source": "file" if stored else "default",
+            "default": COSINE_FLOOR}
+
+
+def set_cosine_floor(value: "float | None"):
+    """Write ``relevance.cosine_floor`` to config.json where ``cosine_floor()``
+    reads it; ``None`` removes it (and an emptied ``relevance`` object) so the
+    default applies. Raises ``ValueError`` outside (0, 1]."""
+    from khipu.config import load_config, save_config
+
+    data = load_config()
+    section = data.get("relevance")
+    section = dict(section) if isinstance(section, dict) else {}
+    if value is None:
+        section.pop("cosine_floor", None)
+    else:
+        if isinstance(value, bool) or not (0.0 < float(value) <= 1.0):
+            raise ValueError(f"relevance.cosine_floor must be a number above 0 and at most 1, got {value!r}")
+        section["cosine_floor"] = float(value)
+    if section:
+        data["relevance"] = section
+    else:
+        data.pop("relevance", None)
+    return save_config(data)
+
+
 def need(token_count: int) -> int:
     """Whole-token keyword hits a row needs to be evidence by coverage."""
     n = int(token_count)

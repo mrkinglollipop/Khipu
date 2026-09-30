@@ -7,6 +7,7 @@ type Props = {
   onDismiss: () => void;
   onOpenIntegrations: () => void;
   onOpenHome: () => void;
+  onOpenSettings: () => void;
 };
 
 /** One-time notice shown after an in-app update, when `postUpdateNotices.ts`
@@ -14,7 +15,7 @@ type Props = {
  * showModal(), same pattern as FeedbackForm: role, modality, focus trap and
  * background inertness come from the element itself, Escape maps to the
  * `cancel` event, and focus moves to the primary action on open. */
-export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations, onOpenHome }: Props) {
+export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations, onOpenHome, onOpenSettings }: Props) {
   const primaryRef = useRef<HTMLButtonElement>(null);
   const headingId = useId();
 
@@ -30,7 +31,8 @@ export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations, 
     );
   }
 
-  const hasAction = notice.action === "integrations" || notice.action === "home";
+  const hasAction =
+    notice.action === "integrations" || notice.action === "home" || notice.action === "settings";
 
   return (
     <Dialog
@@ -74,6 +76,19 @@ export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations, 
               }}
             >
               Open Home
+            </button>
+          ) : null}
+          {notice.action === "settings" ? (
+            <button
+              ref={primaryRef}
+              type="button"
+              className="primary"
+              onClick={() => {
+                onOpenSettings();
+                close();
+              }}
+            >
+              Open Settings
             </button>
           ) : null}
         </div>
