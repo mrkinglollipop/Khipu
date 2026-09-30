@@ -24,4 +24,12 @@ describe("noticeForUpgrade", () => {
     expect(notice?.action).toBe("home");
     expect(notice?.title).toMatch(/prior work/i);
   });
+
+  it("returns the 0.4.5 notice (decision validity) when upgrading from 0.4.4", () => {
+    const notice = noticeForUpgrade("0.4.4", "0.4.5");
+    expect(notice).not.toBeNull();
+    expect(notice?.version).toBe("0.4.5");
+    expect(notice?.action).toBe("home");
+    expect(notice?.title).toMatch(/reversed/i);
+  });
 });
