@@ -12,8 +12,9 @@ export type PostUpdateNotice = {
   body: string;
   /** "integrations" wires an "Open Harnesses" button that switches the app to
    * the Harnesses screen; "home" wires an "Open Home" button that switches to
-   * the Home screen. Omit for a plain "Got it" notice. */
-  action?: "integrations" | "home";
+   * the Home screen; "settings" wires an "Open Settings" button that opens
+   * Settings on Optional features. Omit for a plain "Got it" notice. */
+  action?: "integrations" | "home" | "settings";
 };
 
 export const POST_UPDATE_NOTICES: PostUpdateNotice[] = [
@@ -67,6 +68,18 @@ export const POST_UPDATE_NOTICES: PostUpdateNotice[] = [
       "longer comes back empty when the machine is busy, and Capture now flags the " +
       "session you are actually in.",
     action: "home",
+  },
+  {
+    version: "0.4.7",
+    title: "Optional features now have switches in Settings",
+    body:
+      "Settings has a new Optional features screen. Each new recall behaviour has a " +
+      "switch with what it does and what it costs, and the three that tested badly " +
+      "sit apart under Measured, not recommended. The local recall service has a " +
+      "switch there too. Capture mode, the similarity settings, your names, the " +
+      "gateway address and token, file locations, background jobs and the active " +
+      "search index profile can be changed in Settings as well.",
+    action: "settings",
   },
 ];
 

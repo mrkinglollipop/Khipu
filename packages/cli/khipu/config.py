@@ -242,3 +242,24 @@ def path_settings_status() -> dict:
             "exists": val.exists() if val else False,
         }
     return out
+
+
+def float_settings_status() -> dict:
+    """Every 0-1 knob with its effective value, source (env / file / default)
+    and default, for ``khipu config``."""
+    out = {}
+    for key, (env_name, default) in FLOAT_SETTINGS.items():
+        env = (os.environ.get(env_name) or "").strip()
+        src = "default"
+        if env:
+            try:
+                float(env)
+                src = "env"
+            except ValueError:
+                pass
+        if src == "default":
+            stored = load_config().get(key)
+            if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+                src = "file"
+        out[key] = {"value": float_setting(key), "source": src, "default": default}
+    return out

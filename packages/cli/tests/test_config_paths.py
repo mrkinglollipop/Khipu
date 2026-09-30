@@ -166,3 +166,98 @@ class ConfigCommandTest(unittest.TestCase):
         rc, p = self._cfg(set=["dsn", "/x"])
         self.assertEqual(rc, 2)
         self.assertFalse(p["ok"])
+
+
+class RelevanceCosineFloorConfigTest(unittest.TestCase):
+    """`khipu config --set relevance.cosine_floor N`: stored as the nested
+    ``relevance.cosine_floor`` object that ``relevance.cosine_floor()`` reads,
+    so the Settings number field changes what search actually uses."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._env = mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": self.tmp.name})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def _cfg(self, **kw):
+        base = dict(set_capture_mode=None, set_gateway_url=None, set=None, unset=None)
+        base.update(kw)
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = cli.cmd_config(mock.Mock(**base))
+        return rc, json.loads(out.getvalue())
+
+    def _stored(self):
+        return json.loads((Path(self.tmp.name) / "config.json").read_text())
+
+    def test_set_writes_the_nested_key_relevance_reads(self):
+        from khipu import relevance
+
+        rc, p = self._cfg(set=["relevance.cosine_floor", "0.7"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(p["ok"])
+        self.assertEqual(self._stored()["relevance"], {"cosine_floor": 0.7})
+        self.assertNotIn("relevance.cosine_floor", self._stored())
+        self.assertEqual(relevance.cosine_floor(), 0.7)
+        self.assertEqual(p["relevance_cosine_floor"]["source"], "file")
+
+    def test_show_reports_default_then_file(self):
+        rc, p = self._cfg()
+        self.assertEqual(p["relevance_cosine_floor"],
+                         {"value": 0.65, "source": "default", "default": 0.65})
+        self._cfg(set=["relevance.cosine_floor", "1"])
+        rc, p = self._cfg()
+        self.assertEqual(p["relevance_cosine_floor"]["value"], 1.0)
+        self.assertEqual(p["relevance_cosine_floor"]["source"], "file")
+
+    def test_unset_restores_the_default_and_drops_the_empty_object(self):
+        self._cfg(set=["relevance.cosine_floor", "0.7"])
+        rc, p = self._cfg(unset="relevance.cosine_floor")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("relevance", self._stored())
+        self.assertEqual(p["relevance_cosine_floor"]["value"], 0.65)
+        self.assertEqual(p["relevance_cosine_floor"]["source"], "default")
+
+    def test_unset_keeps_sibling_relevance_keys(self):
+        cfg = Path(self.tmp.name) / "config.json"
+        cfg.write_text(json.dumps({"relevance": {"cosine_floor": 0.7, "other": 1}}))
+        self._cfg(unset="relevance.cosine_floor")
+        self.assertEqual(self._stored()["relevance"], {"other": 1})
+
+    def test_other_config_is_left_alone(self):
+        config.set_capture_mode("hub")
+        self._cfg(set=["relevance.cosine_floor", "0.5"])
+        self.assertEqual(self._stored()["capture_mode"], "hub")
+
+    def test_out_of_range_or_non_numbers_are_refused_and_nothing_is_written(self):
+        for bad in ("0", "-0.1", "1.01", "2", "abc", "", "nan", "inf"):
+            with self.subTest(value=bad):
+                rc, p = self._cfg(set=["relevance.cosine_floor", bad])
+                self.assertEqual(rc, 2)
+                self.assertFalse(p["ok"])
+        self.assertFalse((Path(self.tmp.name) / "config.json").exists())
+
+    def test_the_status_helper_ignores_an_unusable_stored_value(self):
+        from khipu import relevance
+
+        cfg = Path(self.tmp.name) / "config.json"
+        for raw in ("0.9", True, 5, 0):
+            with self.subTest(raw=raw):
+                cfg.write_text(json.dumps({"relevance": {"cosine_floor": raw}}))
+                self.assertEqual(relevance.cosine_floor_status()["source"], "default")
+                self.assertEqual(relevance.cosine_floor(), 0.65)
+
+
+class ConfigShowFloatSettingsTest(unittest.TestCase):
+    def test_show_names_value_source_and_default_for_each_knob(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": td, "KHIPU_DEDUP_SIMILARITY": ""}):
+            config.set_float_setting("commitment_close_similarity", 0.9)
+            base = dict(set_capture_mode=None, set_gateway_url=None, set=None, unset=None)
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                cli.cmd_config(mock.Mock(**base))
+            shown = json.loads(out.getvalue())["float_settings"]
+        self.assertEqual(shown["dedup_similarity"],
+                         {"value": 0.92, "source": "default", "default": 0.92})
+        self.assertEqual(shown["commitment_close_similarity"]["source"], "file")
+        self.assertEqual(shown["commitment_close_similarity"]["value"], 0.9)

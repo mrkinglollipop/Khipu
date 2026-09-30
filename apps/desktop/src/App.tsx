@@ -45,6 +45,14 @@ import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVer
 import { WorkingBanner } from "./WorkingBanner";
 import { FeedbackForm } from "./FeedbackForm";
 import { PostUpdateNoticeDialog } from "./PostUpdateNoticeDialog";
+import { OptionalFeatures } from "./OptionalFeatures";
+import {
+  CaptureTuningCard,
+  EmbedProfilesCard,
+  GatewayUrlCard,
+  JobsCard,
+  PathOverridesCard,
+} from "./SettingsControls";
 import {
   noticeForUpgrade,
   readLastNoticedVersion,
@@ -436,10 +444,11 @@ const ACTIVITY_PAGE = 40;
 const SEARCH_KINDS = ["episode", "topic"] as const;
 
 /** Settings sub-navigation (overhaul phase 5, `mocks/main.settings.html`).
- *  Eight sections, one per thing a person comes here to change. */
+ *  Nine sections, one per thing a person comes here to change. */
 type SettingsSection =
   | "database"
   | "capture"
+  | "features"
   | "index"
   | "data"
   | "another-mac"
@@ -450,6 +459,7 @@ type SettingsSection =
 const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
   ["database", "Database"],
   ["capture", "Capture & models"],
+  ["features", "Optional features"],
   ["index", "Search index"],
   ["data", "Data & backups"],
   ["another-mac", "Another Mac"],
@@ -4827,6 +4837,8 @@ export default function App() {
                       </div>
                     </div>
 
+                    <CaptureTuningCard active={tab === "settings" && settingsSection === "capture"} />
+
                     <div className="section-card">
                       <div className="section-head">Models</div>
                       <div className="section-body">
@@ -5014,6 +5026,10 @@ export default function App() {
                   </>
                 ) : null}
 
+                {settingsSection === "features" ? (
+                  <OptionalFeatures active={tab === "settings" && settingsSection === "features"} />
+                ) : null}
+
                 {settingsSection === "index" ? (
                   <>
                     <div className="section-card">
@@ -5094,6 +5110,7 @@ export default function App() {
                         {indexMsg ? <pre className="code">{indexMsg}</pre> : null}
                       </div>
                     </div>
+                    <EmbedProfilesCard active={tab === "settings" && settingsSection === "index"} />
                   </>
                 ) : null}
 
@@ -5138,6 +5155,8 @@ export default function App() {
                         )}
                       </div>
                     </div>
+
+                    <PathOverridesCard active={tab === "settings" && settingsSection === "data"} />
 
                     <div className="section-card">
                       <div className="section-head">Backup</div>
@@ -5200,6 +5219,8 @@ export default function App() {
                 ) : null}
 
                 {settingsSection === "another-mac" ? (
+                  <>
+                  <GatewayUrlCard active={tab === "settings" && settingsSection === "another-mac"} />
                   <div className="section-card">
                     <div className="section-head">Set up another Mac</div>
                     <div className="section-body">
@@ -5310,6 +5331,7 @@ export default function App() {
                       {setupJoinMsg ? <pre className="code">{setupJoinMsg}</pre> : null}
                     </div>
                   </div>
+                  </>
                 ) : null}
 
                 {settingsSection === "components" ? (
@@ -5479,6 +5501,8 @@ export default function App() {
                       </div>
                     </div>
 
+                    <JobsCard active={tab === "settings" && settingsSection === "advanced"} />
+
                     <RawJson
                       text={settingsRawText}
                       label="Raw configuration"
@@ -5505,6 +5529,10 @@ export default function App() {
         onDismiss={() => setPostUpdateNotice(null)}
         onOpenIntegrations={() => setTab("harnesses")}
         onOpenHome={() => setTab("home")}
+        onOpenSettings={() => {
+          setSettingsSection("features");
+          setTab("settings");
+        }}
       />
 
       {/* Forget — the one destructive write either list makes. */}

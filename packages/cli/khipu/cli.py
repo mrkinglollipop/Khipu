@@ -2170,6 +2170,29 @@ def cmd_config(args: argparse.Namespace) -> int:
         path = set_gateway_url(args.set_gateway_url)
         print(json.dumps({"gateway_url": gateway_url(), "config_file": str(path)}))
         return 0
+    if args.set and args.set[0] == "relevance.cosine_floor":
+        from khipu import relevance
+
+        _key, raw = args.set
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            print(json.dumps({"ok": False, "error": f"relevance.cosine_floor must be a number, got {raw!r}"}))
+            return 2
+        if not (0.0 < value <= 1.0):  # also refuses nan
+            print(json.dumps({"ok": False, "error": f"relevance.cosine_floor must be above 0 and at most 1, got {value}"}))
+            return 2
+        path = relevance.set_cosine_floor(value)
+        print(json.dumps({"ok": True, "relevance_cosine_floor": relevance.cosine_floor_status(),
+                          "config_file": str(path)}))
+        return 0
+    if args.unset == "relevance.cosine_floor":
+        from khipu import relevance
+
+        path = relevance.set_cosine_floor(None)
+        print(json.dumps({"ok": True, "relevance_cosine_floor": relevance.cosine_floor_status(),
+                          "config_file": str(path)}))
+        return 0
     if args.set and args.set[0] in FLOAT_SETTINGS:
         # dedup_similarity / commitment_close_similarity are floats, not paths.
         # `--set` routed every key through set_path_setting, which stored them
@@ -2220,7 +2243,8 @@ def cmd_config(args: argparse.Namespace) -> int:
             )
         )
         return 0
-    from khipu.config import list_setting, path_settings_status
+    from khipu import relevance
+    from khipu.config import float_settings_status, list_setting, path_settings_status
 
     out = {
         "capture_mode": capture_mode(),
@@ -2234,6 +2258,8 @@ def cmd_config(args: argparse.Namespace) -> int:
         ),
         "paths": path_settings_status(),
         "user_aliases": list(list_setting("user_aliases")),
+        "float_settings": float_settings_status(),
+        "relevance_cosine_floor": relevance.cosine_floor_status(),
         "config_file": str(config_file()),
         "config": load_config(),
     }
@@ -3929,10 +3955,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("KEY", "VALUE"),
         help="Persist a machine-specific path (memory_root, memory_repo, "
         "capture_v2, graph_sqlite, gemini_key_file), a 0-1 similarity knob "
-        "(dedup_similarity, commitment_close_similarity), or the comma-"
+        "(dedup_similarity, commitment_close_similarity), the relevance "
+        "floor (relevance.cosine_floor, above 0 up to 1) or the comma-"
         'separated user_aliases list (e.g. --set user_aliases "matt,matthew")',
     )
-    cfg.add_argument("--unset", metavar="KEY", help="Remove a path setting")
+    cfg.add_argument("--unset", metavar="KEY",
+                     help="Remove a path setting, or relevance.cosine_floor to restore its default")
     cfg.add_argument(
         "--set-gateway-url",
         metavar="URL",
