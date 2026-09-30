@@ -57,6 +57,17 @@ export const POST_UPDATE_NOTICES: PostUpdateNotice[] = [
       "health, in plain words.",
     action: "home",
   },
+  {
+    version: "0.4.5",
+    title: "Recall tells current decisions from reversed ones",
+    body:
+      "Recalled memory now marks a decision that was later reversed or retracted, " +
+      "and agents can record a reversal as it happens. Forgetting a session now " +
+      "removes everything derived from it. Recall on each prompt is faster and no " +
+      "longer comes back empty when the machine is busy, and Capture now flags the " +
+      "session you are actually in.",
+    action: "home",
+  },
 ];
 
 const STORAGE_KEY = "khipu.lastNoticedVersion";
