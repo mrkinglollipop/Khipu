@@ -665,11 +665,12 @@ export function IntegrationsPanel({
       // `home` narrows a Claude Code install/remove to one of its homes
       // (`homes[].path`); without it the CLI acts on every home it found.
       setBusy(home ? `${cmd}:${harness}:${home}` : `${cmd}:${harness}`);
+      let message: string | null = null;
       try {
         if (cmd === "install") {
           const run = await runInstall(runKhipu, harness, home);
           if (run.failed) {
-            onToast(`install failed: ${run.failed}`);
+            message = `install failed: ${run.failed}`;
             return;
           }
           const list = run.verify;
@@ -685,7 +686,7 @@ export function IntegrationsPanel({
             // arm auto-verify: a capture from another home must not mark the
             // card Verified.
             const label = rows?.flatMap((r) => r.homes ?? []).find((h) => h.path === home)?.label ?? "that home";
-            onToast(`Installed in ${label}. Restart its sessions to load it; Verify on the card checks it.`);
+            message = `Installed in ${label}. Restart its sessions to load it; Verify on the card checks it.`;
           } else {
             const installedAtNow = Date.now();
             setInstalledAt((prev) => {
@@ -697,11 +698,9 @@ export function IntegrationsPanel({
               }
               return next;
             });
-            onToast(
-              run.verifyFailed
-                ? `Installed; verify failed: ${run.verifyFailed}`
-                : "Installed. Restart each harness, then start any session — its card turns green by itself.",
-            );
+            message = run.verifyFailed
+              ? `Installed; verify failed: ${run.verifyFailed}`
+              : "Installed. Restart each harness, then start any session — its card turns green by itself.";
           }
           return;
         }
@@ -719,7 +718,7 @@ export function IntegrationsPanel({
         const results = parseActResults(raw);
         const failed = results.find((r) => r.ok === false || r.aborted);
         if (failed) {
-          onToast(`${cmd} failed: ${(failed.error ?? "the pack stopped before finishing").slice(0, 160)}`);
+          message = `${cmd} failed: ${(failed.error ?? "the pack stopped before finishing").slice(0, 160)}`;
         } else {
           // One home out of several leaves the others, and the evidence about
           // the harness, in place.
@@ -732,14 +731,12 @@ export function IntegrationsPanel({
             });
           }
           const kept = results.flatMap((r) => r.homes ?? []).find((h) => h.hooks_kept)?.hooks_kept;
-          onToast(
-            kept
-              ? `Removed the memory tools. The hooks were kept (${kept}) because another home uses them. Backups kept next to each file.`
-              : "Removed Khipu entries. Backups kept next to each file.",
-          );
+          message = kept
+            ? `Removed the memory tools. The hooks were kept (${kept}) because another home uses them. Backups kept next to each file.`
+            : "Removed Khipu entries. Backups kept next to each file.";
         }
       } catch (e) {
-        onToast(`${cmd} failed: ${String(e).slice(0, 160)}`);
+        message = `${cmd} failed: ${String(e).slice(0, 160)}`;
       } finally {
         // Whatever happened, the card shows what is on disk now, not what it
         // showed before the click. Verify writes a fresh probe result and
@@ -747,6 +744,8 @@ export function IntegrationsPanel({
         // doctor payload.
         await load();
         await refreshHealth();
+        // The doctor read clears the toast, so the message goes up after it.
+        if (message) onToast(message);
         setBusy(null);
         // The button that was clicked is gone (Install and Remove swap) or was
         // disabled while the CLI ran; hand focus to the row's action.
