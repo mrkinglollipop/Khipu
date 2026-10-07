@@ -733,8 +733,9 @@ describe("IntegrationsPanel — harness auto-verify", () => {
       }
       if (args[0] === "integrations" && args[1] === "install") {
         installedAtIso = new Date().toISOString();
-        return '{"harness":"claude_code","detected":true,"changes":[]}\n{\n  "verify": []\n}';
+        return '[{"harness":"claude_code","detected":true,"changes":[]}]';
       }
+      if (args[0] === "integrations" && args[1] === "verify") return "[]";
       return "{}";
     });
 

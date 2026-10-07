@@ -34,7 +34,7 @@ import {
   Tile,
 } from "./ui";
 import { ComponentsPanel } from "./ComponentsPanel";
-import { IntegrationsPanel } from "./IntegrationsPanel";
+import { IntegrationsPanel, runInstall } from "./IntegrationsPanel";
 import type { LivenessPayload, RecallProbeStatus } from "./IntegrationsPanel";
 import { claudeHomesGap, harnessesBadge, railHealthLine } from "./railHealth";
 import type { ClaudeHomesReport } from "./railHealth";
@@ -966,6 +966,9 @@ export default function App() {
   );
   const [error, setError] = useState<string | null>(null);
   const fetchedAt = useRef<Partial<Record<CacheTab, number>>>({});
+  // Doctor reads can overlap (a forced read after an install while a TTL read
+  // is still running); only the newest request may write its answer.
+  const doctorSeq = useRef(0);
   const feedbackButtonRef = useRef<HTMLButtonElement>(null);
 
   const [statusText, setStatusText] = useState("…");
@@ -1339,10 +1342,12 @@ export default function App() {
 
   const loadDoctor = useCallback(async (force = false) => {
     if (!needsFetch("doctor", force)) return;
+    const seq = ++doctorSeq.current;
     markLoading("doctor", true);
     setError(null);
     try {
       const raw = await runKhipu(["doctor"]);
+      if (seq !== doctorSeq.current) return;
       const parsed = parseJson(raw) as { ok?: boolean } | null;
       if (
         parsed === null ||
@@ -1424,9 +1429,9 @@ export default function App() {
       fetchedAt.current.doctor = Date.now();
     } catch (e) {
       // Preserve last-good doctorOk/text; toast only.
-      setError(String(e));
+      if (seq === doctorSeq.current) setError(String(e));
     } finally {
-      markLoading("doctor", false);
+      if (seq === doctorSeq.current) markLoading("doctor", false);
     }
   }, []);
 
@@ -1552,13 +1557,18 @@ export default function App() {
     async (harness: string) => {
       setActionBusy(true);
       setError(null);
+      let message: string | null = null;
       try {
-        await runKhipu(["integrations", "install", harness]);
+        const run = await runInstall(runKhipu, harness);
+        if (run.failed) message = `install failed: ${run.failed}`;
+        else if (run.verifyFailed) message = `Installed; verify failed: ${run.verifyFailed}`;
       } catch (e) {
-        setError(String(e));
+        message = String(e);
       } finally {
-        setActionBusy(false);
+        // The doctor read clears the toast, so the message goes up after it.
         await loadDoctor(true);
+        if (message) setError(message);
+        setActionBusy(false);
       }
     },
     [loadDoctor],
@@ -4651,7 +4661,7 @@ export default function App() {
             active={tab === "harnesses"}
             liveness={liveness}
             recallProbe={recallProbe}
-            refreshHealth={() => void loadDoctor(true)}
+            refreshHealth={() => loadDoctor(true)}
             onAnotherMac={() => {
               setSettingsSection("another-mac");
               setTab("settings");

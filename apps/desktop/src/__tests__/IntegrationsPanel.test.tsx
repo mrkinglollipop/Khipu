@@ -261,15 +261,24 @@ describe("home rows", () => {
 function renderPanel(
   rowsFor: () => StatusRow[],
   onInstall: () => void = () => {},
-  opts: { actResult?: string; onToast?: (m: string) => void } = {},
+  opts: {
+    actResult?: string;
+    onToast?: (m: string) => void;
+    verifyResult?: string;
+    verifyThrows?: string;
+    liveness?: { ok: boolean; red?: string[]; harnesses: Record<string, HarnessLiveness> };
+    refreshHealth?: () => Promise<void> | void;
+  } = {},
 ) {
   const runKhipu = vi.fn(async (args: string[]) => {
     if (args[0] === "integrations" && args[1] === "status") return JSON.stringify(rowsFor());
     if (args[0] === "integrations" && args[1] === "install") {
       onInstall();
-      return (
-        opts.actResult ?? '[{"harness":"claude_code","detected":true,"changes":[]}]\n{\n  "verify": []\n}'
-      );
+      return opts.actResult ?? '[{"harness":"claude_code","detected":true,"changes":[]}]';
+    }
+    if (args[0] === "integrations" && args[1] === "verify") {
+      if (opts.verifyThrows) throw new Error(opts.verifyThrows);
+      return opts.verifyResult ?? "[]";
     }
     if (args[0] === "integrations" && args[1] === "uninstall") {
       return opts.actResult ?? '[{"harness":"claude_code","changes":[]}]';
@@ -281,9 +290,9 @@ function renderPanel(
       runKhipu={runKhipu}
       onToast={opts.onToast ?? (() => {})}
       active={true}
-      liveness={{ ok: true, harnesses: { claude_code: RECORDING } }}
+      liveness={opts.liveness ?? { ok: true, harnesses: { claude_code: RECORDING } }}
       recallProbe={null}
-      refreshHealth={() => {}}
+      refreshHealth={opts.refreshHealth ?? (() => {})}
       onAnotherMac={() => {}}
     />,
   );
@@ -377,7 +386,9 @@ describe("IntegrationsPanel — Claude homes", () => {
     const card = await claudeCard();
 
     fireEvent.click(within(card).getByRole("button", { name: "Reinstall" }));
-    await waitFor(() => expect(runKhipu).toHaveBeenCalledWith(["integrations", "install", "claude_code"]));
+    await waitFor(() =>
+      expect(runKhipu).toHaveBeenCalledWith(["integrations", "install", "claude_code", "--no-verify"]),
+    );
   });
 
   it("stays off green after a capture lands while a home is still not installed", async () => {
@@ -654,5 +665,135 @@ describe("IntegrationsPanel — per-home actions", () => {
 
     const remove = await within(card).findByRole("button", { name: "Remove Khipu from T3 · Secondary" });
     await waitFor(() => expect(remove).toHaveFocus());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Install runs without the CLI's own verify and verifies as a second call: a
+// failed verify exits 2 with two JSON documents, which the Tauri runner reports
+// as an error although the files were written.
+// ---------------------------------------------------------------------------
+
+const CURSOR_MISSING: StatusRow = {
+  harness: "cursor",
+  detected: true,
+  mcp: false,
+  hook_stop: false,
+  hook_precompact: false,
+  recall_rule: "missing",
+};
+const VERIFY_OK = '[{"harness":"claude_code","detected":true,"ok":true,"components":{"mcp":{"ok":true}}}]';
+const VERIFY_BAD =
+  '[{"harness":"claude_code","detected":true,"ok":false,"components":{"mcp":{"ok":true},"hook":{"ok":false,"error":"Stop hook not found"}}}]';
+const INSTALL_OK_COPY = "Installed. Restart each harness, then start any session — its card turns green by itself.";
+
+type EntryPoint = {
+  name: string;
+  harness: string;
+  rows: () => StatusRow[];
+  liveness?: { ok: boolean; red?: string[]; harnesses: Record<string, HarnessLiveness> };
+  click: () => Promise<void>;
+};
+
+const ENTRY_POINTS: EntryPoint[] = [
+  {
+    name: "the card's Install",
+    harness: "cursor",
+    rows: () => [CURSOR_MISSING],
+    click: async () => void fireEvent.click(await screen.findByRole("button", { name: "Install" })),
+  },
+  {
+    name: "Install all",
+    harness: "all",
+    rows: () => [claudeRow([home(), t3Home()]), CURSOR_MISSING],
+    click: async () => void fireEvent.click(await screen.findByRole("button", { name: "Install all" })),
+  },
+  {
+    name: "Reinstall hook",
+    harness: "claude_code",
+    rows: () => [claudeRow([home(), t3Home()])],
+    liveness: { ok: false, red: ["claude_code"], harnesses: { claude_code: { ok: false, seen: true, captures: 4 } } },
+    click: async () => void fireEvent.click(await screen.findByRole("button", { name: "Reinstall hook" })),
+  },
+];
+
+describe.each(ENTRY_POINTS)("IntegrationsPanel — $name", (ep) => {
+  const setup = (opts: Parameters<typeof renderPanel>[2]) => {
+    const toasts: string[] = [];
+    const runKhipu = renderPanel(ep.rows, undefined, { ...opts, liveness: ep.liveness, onToast: (m) => toasts.push(m) });
+    return { runKhipu, toasts };
+  };
+  const calls = (runKhipu: ReturnType<typeof renderPanel>) => runKhipu.mock.calls.map((c) => c[0]);
+
+  it("installs without verify, verifies separately, and toasts success when both pass", async () => {
+    const { runKhipu, toasts } = setup({ verifyResult: VERIFY_OK });
+    await ep.click();
+    await waitFor(() => expect(toasts).toHaveLength(1));
+
+    expect(toasts[0]).toBe(INSTALL_OK_COPY);
+    const argv = calls(runKhipu).filter((a) => a[1] === "install" || a[1] === "verify");
+    expect(argv).toEqual([
+      ["integrations", "install", ep.harness, "--no-verify"],
+      ["integrations", "verify", ep.harness],
+    ]);
+  });
+
+  it("warns 'Installed; verify failed' and never 'install failed' when only verify fails", async () => {
+    const { toasts } = setup({ verifyResult: VERIFY_BAD });
+    await ep.click();
+    await waitFor(() => expect(toasts).toHaveLength(1));
+
+    expect(toasts[0]).toBe("Installed; verify failed: claude_code hook: Stop hook not found");
+    expect(toasts[0]).not.toMatch(/install failed/);
+  });
+
+  it("warns the same way when the verify call itself errors", async () => {
+    const { toasts } = setup({ verifyThrows: "khipu exited 2" });
+    await ep.click();
+    await waitFor(() => expect(toasts).toHaveLength(1));
+
+    expect(toasts[0]).toMatch(/^Installed; verify failed: Error: khipu exited 2/);
+  });
+
+  it("shows the CLI's error, and does not verify, when the install did not finish", async () => {
+    const { runKhipu, toasts } = setup({
+      actResult: '[{"harness":"claude_code","ok":false,"aborted":true,"error":"/Users/me/.claude.json is not valid JSON"}]',
+    });
+    await ep.click();
+    await waitFor(() => expect(toasts).toHaveLength(1));
+
+    expect(toasts[0]).toBe("install failed: /Users/me/.claude.json is not valid JSON");
+    expect(calls(runKhipu).some((a) => a[1] === "verify")).toBe(false);
+  });
+});
+
+describe("IntegrationsPanel — after an action", () => {
+  it("feeds the separate verify result into the card's verify state", async () => {
+    const toasts: string[] = [];
+    renderPanel(() => [claudeRow([home(), t3Home()])], undefined, {
+      verifyResult:
+        '[{"harness":"claude_code","detected":true,"ok":false,"components":{"mcp":{"ok":false,"error":"handshake failed"}}}]',
+      onToast: (m) => toasts.push(m),
+    });
+    const card = await claudeCard();
+    fireEvent.click(within(card).getByRole("button", { name: "Reinstall" }));
+    await waitFor(() => expect(toasts).toHaveLength(1));
+
+    expect(within(card).getByText("Memory tools (MCP) · handshake failed")).toBeInTheDocument();
+  });
+
+  it("keeps the buttons busy until the forced doctor refresh has answered", async () => {
+    let release: () => void = () => {};
+    const refresh = vi.fn(() => new Promise<void>((resolve) => (release = resolve)));
+    renderPanel(() => [claudeRow([home(), t3Home()])], undefined, { refreshHealth: refresh });
+    const card = await claudeCard();
+    fireEvent.click(within(card).getByRole("button", { name: "Reinstall" }));
+
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    expect(within(card).getByRole("button", { name: "Verify" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Install all" })).toBeDisabled();
+
+    release();
+    await waitFor(() => expect(within(card).getByRole("button", { name: "Verify" })).not.toBeDisabled());
   });
 });

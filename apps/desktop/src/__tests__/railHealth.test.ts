@@ -7,6 +7,7 @@ import type { LivenessPayload } from "../IntegrationsPanel";
 
 const OK: LivenessPayload = { ok: true, red: [], harnesses: { claude_code: { ok: true } } };
 const NONE = { missing: 0, unreadable: 0 };
+const FAILED = { missing: 0, unreadable: 0, checkFailed: true };
 
 describe("claudeHomesGap", () => {
   it("counts found homes without Khipu, and found homes it could not read", () => {
@@ -23,10 +24,18 @@ describe("claudeHomesGap", () => {
     ).toEqual({ missing: 2, unreadable: 1 });
   });
 
-  it("is no gap when doctor has no block, or the block itself failed", () => {
+  it("is no gap when doctor has no block (older CLI)", () => {
     expect(claudeHomesGap(null)).toEqual(NONE);
     expect(claudeHomesGap(undefined)).toEqual(NONE);
-    expect(claudeHomesGap({ homes: [], error: "ImportError: nope" })).toEqual(NONE);
+    expect(claudeHomesGap({})).toEqual(NONE);
+  });
+
+  it("flags a failed check when the block carries an error", () => {
+    expect(claudeHomesGap({ homes: [], error: "ImportError: nope" })).toEqual({
+      missing: 0,
+      unreadable: 0,
+      checkFailed: true,
+    });
   });
 });
 
@@ -50,6 +59,10 @@ describe("railHealthLine", () => {
     });
   });
 
+  it("warns instead of reading green when the Claude homes check failed", () => {
+    expect(railHealthLine(true, OK, FAILED)).toEqual({ tone: "warn", text: "Couldn't check Claude homes" });
+  });
+
   it("lets a red heartbeat and a dead database win over the warning", () => {
     const gap = { missing: 1, unreadable: 0 };
     expect(railHealthLine(true, { ...OK, red: ["claude_code"] }, gap)).toEqual({
@@ -58,6 +71,7 @@ describe("railHealthLine", () => {
     });
     expect(railHealthLine(true, { ...OK, red: ["a", "b"] }, gap).text).toBe("2 harnesses not recording");
     expect(railHealthLine(false, OK, gap)).toEqual({ tone: "err", text: "Database not reachable" });
+    expect(railHealthLine(true, { ...OK, red: ["claude_code"] }, FAILED).tone).toBe("err");
   });
 
   it("says it is checking until the heartbeat has loaded", () => {
@@ -79,5 +93,10 @@ describe("harnessesBadge", () => {
       quiet: false,
     });
     expect(harnessesBadge(OK, { missing: 1, unreadable: 1 })).toEqual({ n: 2, quiet: false });
+  });
+
+  it("flags attention when the Claude homes check failed", () => {
+    expect(harnessesBadge(OK, FAILED)).toEqual({ n: 1, quiet: false });
+    expect(harnessesBadge({ ...OK, red: ["a", "b"] }, FAILED)).toEqual({ n: 2, quiet: false });
   });
 });

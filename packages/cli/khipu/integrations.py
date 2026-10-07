@@ -662,6 +662,7 @@ _CLAUDE_HOME_FLAGS_OFF = {
     "hook_stop": False, "hook_precompact": False, "hook_sessionend": False, "hook_subagentstop": False,
     "recall_rule": "missing", "prompt_recall": "missing",
     "memory_tools_ok": False, "hooks_ok": False, "installed": False, "launcher_ok": True,
+    "has_khipu": False,
 }
 
 
@@ -710,6 +711,10 @@ def _claude_home_status(h: _homes.ClaudeHome) -> tuple[dict, dict]:
     )
     row["hooks_ok"] = all((stop, precompact, sessionend, subagentstop, rule, prompt_recall))
     row["installed"] = bool(mcp_ok and stop and precompact) and launch["launcher_ok"]
+    # Any Khipu entry of this home's own, however stale. A linked home's hooks
+    # are the owner's, so for it only the memory tools entry counts.
+    own_hooks = any((stop, precompact, sessionend, subagentstop, rule, prompt_recall))
+    row["has_khipu"] = any(c is not None for c in mcp_cmds) or (own_hooks and h.linked_to is None)
     return row, launch
 
 
@@ -2025,9 +2030,10 @@ def _missing_in(st: dict, key: str) -> str:
 def _claude_verify_scope(st: dict, home: str | None) -> tuple[dict, list[str]]:
     """`st` narrowed to the homes a verify is about, and the labels of the found
     homes left out. With ``home`` that is the one home (it must be installed to
-    pass); without, every home Khipu is installed in (or whose config could not
-    be read), so a home with no Khipu yet is information, not a failure. When
-    none is installed the scope is every home found, and verify fails on that."""
+    pass); without, every home with any Khipu entry (or whose config could not
+    be read), so a home with none at all is information, not a failure, while a
+    half-installed one fails. When no home has Khipu the scope is every home
+    found, and verify fails on that."""
     rows = st.get("homes") or []
     live = [r for r in rows if r["exists"]]
     if home is not None:
@@ -2036,10 +2042,23 @@ def _claude_verify_scope(st: dict, home: str | None) -> tuple[dict, list[str]]:
         scope = [r for r in rows if os.path.realpath(r["path"]) == want]
         detected = True
     else:
-        scope = [r for r in live if r["installed"] or r.get("error")] or live
+        scope = [r for r in live if r["has_khipu"] or r.get("error")] or live
         detected = bool(live)
     left_out = [r["label"] for r in live if r not in scope]
     return {**st, **_claude_pack_fields(scope), "detected": detected, "homes": scope}, left_out
+
+
+def _claude_incomplete(rows: list[dict]) -> str:
+    """What each half-installed home in ``rows`` is missing, one clause per home."""
+    out = []
+    for r in rows:
+        if r["installed"] or r.get("error"):
+            continue
+        parts = [name for name, ok in (("memory tools", r["memory_tools_ok"]), ("Stop hook", r["hook_stop"]),
+                                       ("PreCompact hook", r["hook_precompact"]),
+                                       ("a working launcher", r["launcher_ok"])) if not ok]
+        out.append(f"{r['label']} is missing {', '.join(parts)}")
+    return "; ".join(out)
 
 
 def verify(harness: str, *, project: str | None = None, home: str | None = None) -> dict:
@@ -2081,6 +2100,10 @@ def verify(harness: str, *, project: str | None = None, home: str | None = None)
         out["components"]["mcp"] = _probe_mcp(mcp_launcher())
     else:
         out["components"]["mcp"] = {"ok": False, "error": "not installed" + _missing_in(st, "memory_tools_ok")}
+    if harness == "claude_code":
+        incomplete = _claude_incomplete(st["homes"])
+        if incomplete:
+            out["components"]["install"] = {"ok": False, "error": incomplete}
     if harness == "aegis":
         # Aegis runs everything without the Keychain. Re-probe the MCP server
         # that way, or this row keeps reporting a server that only works from

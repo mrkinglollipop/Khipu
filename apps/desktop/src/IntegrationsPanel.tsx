@@ -507,6 +507,57 @@ export function parseActResults(raw: string): ActResult[] {
   }
 }
 
+/** The first failing probe of a verify run, as one line. Mirrors the CLI's
+ *  own exit rule: a detected harness with no `ok` is a failure. */
+export function verifyFailure(list: VerifyRow[]): string | null {
+  const bad = list.find((v) => (v.ok ?? !v.detected) === false);
+  if (!bad) return null;
+  const probe = Object.entries(bad.components ?? {}).find(([, p]) => p?.ok === false);
+  const detail = probe ? `${probe[0]}${probe[1]?.error ? `: ${probe[1].error}` : ""}` : (bad.note ?? "a check failed");
+  return `${bad.harness} ${detail}`.slice(0, 160);
+}
+
+export type InstallRun = {
+  /** The CLI's error when the install itself did not finish. */
+  failed: string | null;
+  /** The separate verify run; null when it was skipped or could not be read. */
+  verify: VerifyRow[] | null;
+  /** Why that verify failed, or could not run; null when it passed or was skipped. */
+  verifyFailed: string | null;
+};
+
+/** `integrations install` without the CLI's own verify, then `integrations
+ *  verify` as its own call. Run together, a failed verify prints two JSON
+ *  documents and exits 2, which the runner reports as an error although the
+ *  files were written. Rejects only when the install call itself errors. A
+ *  per-home install skips the verify: that probe covers the whole pack. */
+export async function runInstall(
+  runKhipu: (args: string[]) => Promise<string>,
+  harness: string,
+  home?: string,
+): Promise<InstallRun> {
+  const raw = await runKhipu([
+    "integrations",
+    "install",
+    harness,
+    ...(home ? ["--home", home] : []),
+    "--no-verify",
+  ]);
+  // A pack that stopped (a config it could not read) says so in the JSON, not
+  // in the exit code.
+  const stopped = parseActResults(raw).find((r) => r.ok === false || r.aborted);
+  if (stopped) {
+    return { failed: (stopped.error ?? "the pack stopped before finishing").slice(0, 160), verify: null, verifyFailed: null };
+  }
+  if (home) return { failed: null, verify: null, verifyFailed: null };
+  try {
+    const verify = JSON.parse(await runKhipu(["integrations", "verify", harness])) as VerifyRow[];
+    return { failed: null, verify, verifyFailed: verifyFailure(verify) };
+  } catch (e) {
+    return { failed: null, verify: null, verifyFailed: String(e).slice(0, 160) };
+  }
+}
+
 export function IntegrationsPanel({
   runKhipu,
   onToast,
@@ -524,8 +575,9 @@ export function IntegrationsPanel({
   /** `doctor.recall_probe` — the stored round-trip evidence. */
   recallProbe: RecallProbeStatus | null;
   /** Re-read doctor after an install/verify, so the evidence on these cards
-   *  is never older than the action the user just took. */
-  refreshHealth: () => void;
+   *  is never older than the action the user just took. The panel waits for it
+   *  before the buttons come back. */
+  refreshHealth: () => Promise<void> | void;
   onAnotherMac: () => void;
 }) {
   const [rows, setRows] = useState<StatusRow[] | null>(null);
@@ -614,38 +666,17 @@ export function IntegrationsPanel({
       // (`homes[].path`); without it the CLI acts on every home it found.
       setBusy(home ? `${cmd}:${harness}:${home}` : `${cmd}:${harness}`);
       try {
-        // A per-home install skips the CLI's own verify: that probe covers
-        // the whole pack, runs for every home, and is the card's Verify button.
-        const raw = await runKhipu([
-          "integrations",
-          cmd,
-          harness,
-          ...(home ? ["--home", home] : []),
-          ...(home && cmd === "install" ? ["--no-verify"] : []),
-        ]);
-        if (cmd === "verify") {
-          const list = JSON.parse(raw) as VerifyRow[];
-          setVerify((prev) => {
-            const next = { ...prev };
-            for (const v of list) next[v.harness] = v;
-            return next;
-          });
-          return;
-        }
-        // Install and uninstall report a pack that stopped (a config it could
-        // not read) in the JSON, not in the exit code.
-        const results = parseActResults(raw);
-        const failed = results.find((r) => r.ok === false || r.aborted);
-        if (failed) {
-          onToast(`${cmd} failed: ${(failed.error ?? "the pack stopped before finishing").slice(0, 160)}`);
-        } else if (cmd === "install") {
-          // install prints two JSON docs: results, then {verify:[...]}
-          const idx = raw.indexOf('{\n  "verify"');
-          const verifyDoc = idx >= 0 ? (JSON.parse(raw.slice(idx)) as { verify: VerifyRow[] }) : null;
-          if (verifyDoc) {
+        if (cmd === "install") {
+          const run = await runInstall(runKhipu, harness, home);
+          if (run.failed) {
+            onToast(`install failed: ${run.failed}`);
+            return;
+          }
+          const list = run.verify;
+          if (list) {
             setVerify((prev) => {
               const next = { ...prev };
-              for (const v of verifyDoc.verify) next[v.harness] = v;
+              for (const v of list) next[v.harness] = v;
               return next;
             });
           }
@@ -666,8 +697,29 @@ export function IntegrationsPanel({
               }
               return next;
             });
-            onToast("Installed. Restart each harness, then start any session — its card turns green by itself.");
+            onToast(
+              run.verifyFailed
+                ? `Installed; verify failed: ${run.verifyFailed}`
+                : "Installed. Restart each harness, then start any session — its card turns green by itself.",
+            );
           }
+          return;
+        }
+        const raw = await runKhipu(["integrations", cmd, harness, ...(home ? ["--home", home] : [])]);
+        if (cmd === "verify") {
+          const list = JSON.parse(raw) as VerifyRow[];
+          setVerify((prev) => {
+            const next = { ...prev };
+            for (const v of list) next[v.harness] = v;
+            return next;
+          });
+          return;
+        }
+        // Uninstall reports a pack that stopped in the JSON, not in the exit code.
+        const results = parseActResults(raw);
+        const failed = results.find((r) => r.ok === false || r.aborted);
+        if (failed) {
+          onToast(`${cmd} failed: ${(failed.error ?? "the pack stopped before finishing").slice(0, 160)}`);
         } else {
           // One home out of several leaves the others, and the evidence about
           // the harness, in place.
@@ -694,7 +746,7 @@ export function IntegrationsPanel({
         // install changes what the heartbeat will say next; both live in the
         // doctor payload.
         await load();
-        refreshHealth();
+        await refreshHealth();
         setBusy(null);
         // The button that was clicked is gone (Install and Remove swap) or was
         // disabled while the CLI ran; hand focus to the row's action.

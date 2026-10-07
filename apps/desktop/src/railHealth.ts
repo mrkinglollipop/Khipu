@@ -8,12 +8,13 @@ export type ClaudeHomesReport = {
   error?: string;
 };
 
+export type ClaudeHomesGap = { missing: number; unreadable: number; checkFailed?: boolean };
+
 /** Found Claude homes with no Khipu in them, and found homes whose config
- *  could not be read. Both are sessions that are not being recorded. */
-export function claudeHomesGap(report: ClaudeHomesReport | null | undefined): {
-  missing: number;
-  unreadable: number;
-} {
+ *  could not be read. Both are sessions that are not being recorded. A block
+ *  that carries `error` means the check itself failed, so nothing is known. */
+export function claudeHomesGap(report: ClaudeHomesReport | null | undefined): ClaudeHomesGap {
+  if (report?.error) return { missing: 0, unreadable: 0, checkFailed: true };
   const live = (report?.homes ?? []).filter((h) => h.exists);
   return {
     missing: live.filter((h) => !h.installed && !h.error).length,
@@ -31,7 +32,7 @@ function homesWord(n: number): string {
 export function railHealthLine(
   dsnOk: boolean | null,
   liveness: LivenessPayload | null,
-  gap: { missing: number; unreadable: number },
+  gap: ClaudeHomesGap,
 ): { tone: "ok" | "warn" | "err"; text: string } {
   const red = liveness?.red ?? [];
   if (dsnOk === false) return { tone: "err", text: "Database not reachable" };
@@ -39,6 +40,7 @@ export function railHealthLine(
     return { tone: "err", text: `${red.length} harness${red.length === 1 ? "" : "es"} not recording` };
   }
   if (liveness == null) return { tone: "warn", text: "Checking harnesses…" };
+  if (gap.checkFailed) return { tone: "warn", text: "Couldn't check Claude homes" };
   if (gap.missing > 0) return { tone: "warn", text: `${homesWord(gap.missing)} not installed` };
   if (gap.unreadable > 0) return { tone: "warn", text: `${homesWord(gap.unreadable)} can't be read` };
   return { tone: "ok", text: "All harnesses recording" };
@@ -48,10 +50,10 @@ export function railHealthLine(
  *  homes that need attention. */
 export function harnessesBadge(
   liveness: LivenessPayload | null,
-  gap: { missing: number; unreadable: number },
+  gap: ClaudeHomesGap,
 ): { n: number; quiet: false } | null {
   const red = liveness?.red ?? [];
   if (red.length > 0) return { n: red.length, quiet: false };
-  const homes = gap.missing + gap.unreadable;
+  const homes = gap.missing + gap.unreadable + (gap.checkFailed ? 1 : 0);
   return homes > 0 ? { n: homes, quiet: false } : null;
 }

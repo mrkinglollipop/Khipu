@@ -1373,7 +1373,7 @@ class ClaudeHomesUninstallTest(_ClaudeHomesCase):
 class ClaudeHomesStatusTest(_ClaudeHomesCase):
     ROW_KEYS = {"path", "label", "source", "is_default", "exists", "settings_path", "mcp_paths", "linked_to",
                 "hook_stop", "hook_precompact", "hook_sessionend", "hook_subagentstop", "recall_rule",
-                "prompt_recall", "memory_tools_ok", "hooks_ok", "launcher_ok", "installed"}
+                "prompt_recall", "memory_tools_ok", "hooks_ok", "launcher_ok", "installed", "has_khipu"}
 
     def test_each_home_is_a_row_with_the_documented_keys(self):
         self._seed(link=True)
@@ -1442,6 +1442,68 @@ class ClaudeHomesStatusTest(_ClaudeHomesCase):
         self.assertTrue(out["ok"], out)
         self.assertEqual(out["not_installed_homes"], ["T3 · Secondary"])
         self.assertTrue(out["components"]["mcp"]["ok"])
+
+    def _drop_mcp(self, path: Path):
+        d = json.loads(path.read_text())
+        d["mcpServers"].pop("khipu")
+        path.write_text(json.dumps(d))
+
+    def test_verify_fails_a_home_with_hooks_but_no_memory_tools_and_names_it(self):
+        self._green_probes()
+        self._seed(link=False)
+        integ.install("claude_code")
+        self._drop_mcp(self.home / ".claude.json")
+        out = integ.verify("claude_code")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["not_installed_homes"], [])
+        self.assertEqual(out["components"]["mcp"]["error"], "not installed in Default")
+        self.assertEqual(out["components"]["install"], {"ok": False, "error": "Default is missing memory tools"})
+
+    def test_verify_fails_a_home_with_memory_tools_but_no_hooks_and_names_it(self):
+        self._green_probes()
+        self._seed(link=False)
+        integ.install("claude_code")
+        (self.second / "settings.json").write_text("{}")
+        out = integ.verify("claude_code")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["not_installed_homes"], [])
+        self.assertEqual(out["components"]["hook"]["error"], "not installed in T3 · Secondary")
+        self.assertEqual(out["components"]["install"]["error"],
+                         "T3 · Secondary is missing Stop hook, PreCompact hook")
+
+    def test_verify_fails_a_home_with_a_stale_khipu_command(self):
+        self._green_probes()
+        self._seed(link=False)
+        integ.install("claude_code", home=str(self.default))
+        (self.second / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"khipu": {"command": "/old/place/khipu-mcp"}}}))
+        out = integ.verify("claude_code")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["not_installed_homes"], [])
+        self.assertEqual(out["components"]["install"]["error"],
+                         "T3 · Secondary is missing memory tools, Stop hook, PreCompact hook")
+
+    def test_a_linked_home_with_only_the_owners_hooks_is_still_left_out(self):
+        self._green_probes()
+        self._seed(link=True)
+        integ.install("claude_code", home=str(self.default))
+        self._drop_mcp(self.home / ".claude.json")
+        integ.install("claude_code", home=str(self.second))
+        out = integ.verify("claude_code")
+        self.assertEqual(out["not_installed_homes"], [])
+        rows = {r["label"]: r for r in integ.status("claude_code")["homes"]}
+        self.assertTrue(rows["Default"]["has_khipu"])
+        self.assertTrue(rows["T3 · Secondary"]["has_khipu"])
+
+    def test_has_khipu_is_false_only_for_a_home_with_no_khipu_entry_at_all(self):
+        self._seed(link=True)
+        rows = {r["label"]: r for r in integ.status("claude_code")["homes"]}
+        self.assertFalse(rows["Default"]["has_khipu"])
+        self.assertFalse(rows["T3 · Secondary"]["has_khipu"])
+        integ.install("claude_code", home=str(self.default))
+        rows = {r["label"]: r for r in integ.status("claude_code")["homes"]}
+        self.assertTrue(rows["Default"]["has_khipu"])
+        self.assertFalse(rows["T3 · Secondary"]["has_khipu"], "its hooks are the owner's")
 
     def test_verify_of_one_home_requires_that_home(self):
         self._green_probes()
