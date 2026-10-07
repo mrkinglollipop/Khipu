@@ -246,6 +246,8 @@ def list_profiles(cur) -> list[dict[str, Any]]:
         " FROM embedding_profiles ORDER BY created_at, id"
     )
     rows = cur.fetchall()
+    cur.execute("SELECT indexname FROM pg_indexes WHERE schemaname = 'public'")
+    present = {r[0] for r in cur.fetchall()}
     counts: dict[str, dict[str, int]] = {}
     for space, table in (("memory", "memory_embeddings"), ("library", "library_embeddings")):
         if not _to_regclass(cur, table):
@@ -260,7 +262,25 @@ def list_profiles(cur) -> list[dict[str, Any]]:
             "id": pid, "provider": provider, "model": model, "dim": int(dim),
             "normalize": norm, "endpoint": endpoint or None, "is_active": bool(active),
             "rows": {"memory": spaces.get("memory", 0), "library": spaces.get("library", 0)},
+            "index": _index_status(pid, int(dim), spaces, present),
         })
+    return out
+
+
+def _index_status(profile: str, dim: int, spaces: dict[str, int], present: set[str]) -> dict[str, str]:
+    """Per space that has rows: ``present``, or what to run when the HNSW index
+    is missing. A space with no rows needs none and is left out."""
+    out: dict[str, str] = {}
+    for space, table in (("memory", "memory_embeddings"), ("library", "library_embeddings")):
+        if not spaces.get(space):
+            continue
+        if profile_index_name(profile, table) in present:
+            out[space] = "present"
+        elif dim > MAX_INDEXED_DIM:
+            out[space] = f"unavailable (dim {dim} is above pgvector's {MAX_INDEXED_DIM} limit)"
+        else:
+            flag = "" if space == "memory" else " --table library"
+            out[space] = f"missing (rebuild with: khipu embed index {profile}{flag})"
     return out
 
 
@@ -374,6 +394,86 @@ def ensure_profile_index(
 
 def ensure_library_index(cur, profile: str, *, dim: int | None = None) -> str | None:
     return ensure_profile_index(cur, profile, "library_embeddings", dim=dim)
+
+
+# ---- bulk loads: drop the index, load, rebuild once ---------------------------
+
+# Inserting into a table whose HNSW index exists maintains the graph row by row;
+# at 1024 dims on a small box that is IO-bound (~700 rows/min seen live). One
+# build over finished rows is far cheaper, so a load above this many rows drops
+# the profile's index first and rebuilds it at the end.
+BULK_DROP_ROWS = 5000
+
+
+def drop_profile_index(cur, profile: str, table: str) -> str | None:
+    """Drop ``profile``'s HNSW index on ``table`` if it exists; return its name
+    when one was dropped, else None. Touches only this profile's index. The
+    caller commits. A failed drop is logged and returns None (the load then
+    just runs against the index)."""
+    if table not in INDEXED_TABLES:
+        raise ValueError(f"no per-profile index for table {table!r}")
+    name = profile_index_name(profile, table)
+    cur.execute(
+        "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = %s", (name,)
+    )
+    if not cur.fetchone():
+        return None
+    return name if _drop_index_quiet(cur, name) else None
+
+
+class BulkLoad:
+    """Context for a job that is about to insert many vectors into ``table``::
+
+        with BulkLoad(conn, cur, "library_embeddings") as bulk:
+            bulk.defer(profile, rows)   # rows=None when unknown up front
+            ... insert, commit ...
+
+    ``defer`` drops the profile's index when it exists and ``rows`` is unknown
+    or above ``BULK_DROP_ROWS``, logs one line, and commits so the drop is
+    durable before the load. On exit (success, cancel or error) every index it
+    dropped is rebuilt with ``ensure_profile_index`` (so ``KHIPU_INDEX_MEMORY``
+    applies). Indexes of profiles never passed to ``defer`` are not touched."""
+
+    def __init__(self, conn, cur, table: str):
+        if table not in INDEXED_TABLES:
+            raise ValueError(f"no per-profile index for table {table!r}")
+        self.conn, self.cur, self.table = conn, cur, table
+        self.dropped: dict[str, str] = {}
+
+    def __enter__(self) -> "BulkLoad":
+        return self
+
+    def defer(self, profile: str, rows: int | None) -> str | None:
+        if profile in self.dropped or (rows is not None and rows <= BULK_DROP_ROWS):
+            return None
+        name = drop_profile_index(self.cur, profile, self.table)
+        if name is None:
+            return None
+        self.conn.commit()
+        self.dropped[profile] = name
+        print(
+            f"[khipu-embed] dropped index {name} on {self.table} before loading "
+            f"{'an unknown number of' if rows is None else rows} rows; it is rebuilt "
+            f"once at the end, and searches under {profile} scan sequentially until then",
+            file=sys.stderr, flush=True,
+        )
+        return name
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if not self.dropped:
+            return False
+        if exc_type is not None:
+            try:
+                self.conn.rollback()
+            except Exception:  # noqa: BLE001 - the original error is the one to raise
+                pass
+        for profile in self.dropped:
+            ensure_profile_index(self.cur, profile, self.table, quiet=True)
+        try:
+            self.conn.commit()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
 
 # ---- prices, keys, deletion (the Embeddings screen) ---------------------------

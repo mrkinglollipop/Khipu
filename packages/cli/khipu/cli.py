@@ -1206,6 +1206,8 @@ def cmd_embed(args: argparse.Namespace) -> int:
         return _cmd_embed_profiles(args)
     if args.embed_cmd in ("estimate", "jobs", "test-key"):
         return _cmd_embed_ops(args)
+    if args.embed_cmd == "index":
+        return _cmd_embed_index(args)
     if args.embed_cmd == "backfill" and (getattr(args, "job", False) or getattr(args, "job_id", None)):
         return cmd_embed_backfill_job(args)
     if args.embed_cmd == "activate":
@@ -1247,16 +1249,38 @@ def _cmd_embed_profiles(args: argparse.Namespace) -> int:
         with connect() as conn:
             with conn.cursor() as cur:
                 out = profiles.add_profile(cur, spec)
-                # Both spaces can serve this profile; index it up front (empty,
-                # so instant). A failure is logged, never fatal: search still
-                # works without the index, just sequentially.
-                for table in profiles.INDEXED_TABLES:
-                    profiles.ensure_profile_index(cur, spec.id, table, dim=spec.dim, quiet=True)
+                # No index here: an empty one would be maintained row by row
+                # through the first bulk load. The first backfill or import
+                # builds it once over finished rows.
+                out["indexes"] = "built on first backfill or import"
             conn.commit()
     except (ValueError, RuntimeError) as e:
         print(json.dumps({"ok": False, "error": str(e)}))
         return 2
     print(json.dumps(out, indent=2))
+    return 0
+
+
+def _cmd_embed_index(args: argparse.Namespace) -> int:
+    """`khipu embed index PROFILE [--table memory|library]`: build the profile's
+    HNSW index (default both tables); a no-op where it exists. Honours
+    KHIPU_INDEX_MEMORY."""
+    from khipu import profiles
+    from khipu.db import connect
+
+    tables = {"memory": ("memory_embeddings",), "library": ("library_embeddings",),
+              None: profiles.INDEXED_TABLES}[getattr(args, "table", None)]
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                spec = profiles.resolve_spec(args.profile, cur)
+                built = {t: profiles.ensure_profile_index(cur, spec.id, t, dim=spec.dim)
+                         for t in tables}
+            conn.commit()
+    except (ValueError, RuntimeError) as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+    print(json.dumps({"ok": True, "profile": spec.id, "indexes": built}, indent=2))
     return 0
 
 
@@ -1416,6 +1440,7 @@ def cmd_library(args: argparse.Namespace) -> int:
                 out = library.import_index(
                     conn, args.name, args.path,
                     strip_prefix=args.strip_prefix or "", profile=args.profile,
+                    batch=getattr(args, "batch", None) or library.IMPORT_BATCH,
                 )
     except library.LibraryError as e:
         print(json.dumps({"ok": False, "error": str(e)}))
@@ -3632,6 +3657,12 @@ def build_parser() -> argparse.ArgumentParser:
     tk.add_argument("--endpoint", help="openai-compatible only: base URL")
     tk.add_argument("--model", help="Model (default gemini-embedding-2 / voyage-3; required for "
                     "openai-compatible)")
+    ix = em_sub.add_parser(
+        "index", help="Build a profile's HNSW index (no-op if present); honours KHIPU_INDEX_MEMORY"
+    )
+    ix.add_argument("profile", help="Profile id, e.g. voyage-3@1024")
+    ix.add_argument("--table", choices=("memory", "library"), default=None,
+                    help="Only this space (default: both)")
     st = em_sub.add_parser(
         "status", help="Coverage per kind for active or named profile"
     )
@@ -3742,6 +3773,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Remove this leading text from each row's source_file")
     li.add_argument("--profile", default=None,
                     help="Profile the vectors belong to (default: model@dims from each row)")
+    li.add_argument("--batch", type=int, default=500,
+                    help="Rows per insert-and-commit batch (default 500)")
     lib.set_defaults(func=cmd_library)
 
     g = sub.add_parser("graph", help="Neighbors (join / GRAPH_TABLE / CTE)")

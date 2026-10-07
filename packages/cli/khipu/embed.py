@@ -1379,67 +1379,69 @@ def backfill(
             stats["failed_chunks"] = 0
             if job is not None:
                 job.update(0, len(todo), 0)
-            for start in range(0, len(todo), BATCH):
-                if job is not None and job.cancelled:
-                    stats["cancelled"] = True
-                    _log("cancelled: stopping before the next batch")
-                    break
-                batch = todo[start : start + BATCH]
-                # todo rows: (kind, ref, idx, chunk, hash, title)
-                api = _api_texts(profile, [(title, chunk) for _k, _r, _i, chunk, _h, title in batch])
-                try:
-                    # Gemini answered 429 to five back-to-back 64-chunk batches
-                    # (2026-09-05) and the 2/4/8/16 s ladder did not outlast
-                    # the window; a longer ladder and a pause between batches
-                    # let one nightly finish instead of leaving a third of the
-                    # topics for tomorrow.
-                    vecs = embed_batch(api, profile=profile, retries=BACKFILL_RETRIES,
-                                       delay=BACKFILL_DELAY_S)
-                except RuntimeError as exc:
-                    msg = str(exc)
-                    if "budget exhausted" in msg:
-                        # Batches already committed stay; tomorrow's sweep finishes.
-                        stats["budget_exhausted"] = True
-                        _log(f"stopping: {exc}")
+            with _profiles.BulkLoad(conn, cur, "memory_embeddings") as bulk:
+                bulk.defer(profile, len(todo))
+                for start in range(0, len(todo), BATCH):
+                    if job is not None and job.cancelled:
+                        stats["cancelled"] = True
+                        _log("cancelled: stopping before the next batch")
                         break
-                    # F3: a missing/expired key (or any other per-batch
-                    # failure — a transient network blip, a malformed chunk)
-                    # used to raise out of the whole sweep, aborting every
-                    # batch still queued behind it even though earlier
-                    # batches had already committed. Isolate it to this
-                    # batch, count it, and keep going — a batch whose only
-                    # problem is "the API is unreachable right now" gets no
-                    # second chance until the next sweep, but it no longer
-                    # takes the rest of tonight's coverage down with it.
-                    stats["failed_chunks"] += len(batch)
-                    if "API key not found" in msg and not stats.get("embed_provider"):
-                        stats["embed_provider"] = "missing key"
-                    _log(f"batch failed ({type(exc).__name__}): {exc}; continuing")
+                    batch = todo[start : start + BATCH]
+                    # todo rows: (kind, ref, idx, chunk, hash, title)
+                    api = _api_texts(profile, [(title, chunk) for _k, _r, _i, chunk, _h, title in batch])
+                    try:
+                        # Gemini answered 429 to five back-to-back 64-chunk batches
+                        # (2026-09-05) and the 2/4/8/16 s ladder did not outlast
+                        # the window; a longer ladder and a pause between batches
+                        # let one nightly finish instead of leaving a third of the
+                        # topics for tomorrow.
+                        vecs = embed_batch(api, profile=profile, retries=BACKFILL_RETRIES,
+                                           delay=BACKFILL_DELAY_S)
+                    except RuntimeError as exc:
+                        msg = str(exc)
+                        if "budget exhausted" in msg:
+                            # Batches already committed stay; tomorrow's sweep finishes.
+                            stats["budget_exhausted"] = True
+                            _log(f"stopping: {exc}")
+                            break
+                        # F3: a missing/expired key (or any other per-batch
+                        # failure — a transient network blip, a malformed chunk)
+                        # used to raise out of the whole sweep, aborting every
+                        # batch still queued behind it even though earlier
+                        # batches had already committed. Isolate it to this
+                        # batch, count it, and keep going — a batch whose only
+                        # problem is "the API is unreachable right now" gets no
+                        # second chance until the next sweep, but it no longer
+                        # takes the rest of tonight's coverage down with it.
+                        stats["failed_chunks"] += len(batch)
+                        if "API key not found" in msg and not stats.get("embed_provider"):
+                            stats["embed_provider"] = "missing key"
+                        _log(f"batch failed ({type(exc).__name__}): {exc}; continuing")
+                        if job is not None:
+                            job.update(stats["embedded"], len(todo), stats["failed_chunks"])
+                        if start + BATCH < len(todo):
+                            time.sleep(BACKFILL_PAUSE_S)
+                        continue
+                    _upsert_chunks(
+                        cur, profile,
+                        [(k, r, i, chunk, h, v)
+                         for (k, r, i, chunk, h, _title), v in zip(batch, vecs)],
+                    )
+                    conn.commit()
+                    stats["embedded"] += len(batch)
+                    stats["batches"] += 1
                     if job is not None:
                         job.update(stats["embedded"], len(todo), stats["failed_chunks"])
+                    if stats["batches"] % 10 == 0:
+                        _log(f"  {stats['embedded']}/{len(todo)}")
                     if start + BATCH < len(todo):
                         time.sleep(BACKFILL_PAUSE_S)
-                    continue
-                _upsert_chunks(
-                    cur, profile,
-                    [(k, r, i, chunk, h, v)
-                     for (k, r, i, chunk, h, _title), v in zip(batch, vecs)],
-                )
-                conn.commit()
-                stats["embedded"] += len(batch)
-                stats["batches"] += 1
-                if job is not None:
-                    job.update(stats["embedded"], len(todo), stats["failed_chunks"])
-                if stats["batches"] % 10 == 0:
-                    _log(f"  {stats['embedded']}/{len(todo)}")
-                if start + BATCH < len(todo):
-                    time.sleep(BACKFILL_PAUSE_S)
-            if stats["embedded"] and not stats.get("cancelled"):
-                # After the bulk insert, not before: building the graph once
-                # over finished rows is far cheaper than maintaining it per
-                # batch. A no-op once the profile's index exists.
-                _profiles.ensure_profile_index(cur, profile, "memory_embeddings", quiet=True)
-                conn.commit()
+                if stats["embedded"] and not stats.get("cancelled"):
+                    # After the bulk insert, not before: building the graph once
+                    # over finished rows is far cheaper than maintaining it per
+                    # batch. A no-op once the profile's index exists.
+                    _profiles.ensure_profile_index(cur, profile, "memory_embeddings", quiet=True)
+                    conn.commit()
     return stats
 
 
