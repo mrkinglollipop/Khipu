@@ -18,7 +18,8 @@ class FakeCur:
     """embedding_profiles + row counts, just enough SQL to answer profiles.py."""
 
     def __init__(self, rows=None, *, endpoint_column=True, tables=("memory_embeddings", "library_embeddings"),
-                 counts=None):
+                 counts=None, indexes=()):
+        self.indexes = list(indexes)
         self.rows = dict(rows or {})  # id -> (provider, model, dim, normalize, endpoint)
         self.endpoint_column = endpoint_column
         self.tables = set(tables)
@@ -34,6 +35,8 @@ class FakeCur:
             self._result = [(c,) for c in cols + (["endpoint"] if self.endpoint_column else [])]
         elif s.startswith("SELECT to_regclass"):
             self._result = [(params[0].split(".")[-1] in self.tables,)]
+        elif s.startswith("SELECT indexname FROM pg_indexes"):
+            self._result = [(n,) for n in self.indexes]
         elif s.startswith("SELECT profile, COUNT(*) FROM"):
             table = s.split(" FROM ")[1].split(" ")[0]
             self._result = [(p, n) for (t, p), n in self.counts.items() if t == table]
@@ -153,11 +156,28 @@ class HubTest(unittest.TestCase):
         )
         out = {p["id"]: p for p in profiles.list_profiles(cur)}
         self.assertEqual(set(out["m@8"]), {"id", "provider", "model", "dim", "normalize",
-                                           "endpoint", "is_active", "rows"})
+                                           "endpoint", "is_active", "rows", "index"})
         self.assertTrue(out["a@1"]["is_active"])
         self.assertEqual(out["a@1"]["rows"], {"memory": 10, "library": 0})
         self.assertEqual(out["m@8"]["rows"], {"memory": 0, "library": 7})
         self.assertEqual(out["m@8"]["endpoint"], "http://localhost:1")
+
+    def test_a_profile_with_rows_but_no_index_says_how_to_rebuild_it(self):
+        cur = FakeCur(
+            rows={"a@1": ("gemini", "a", 1, "l2", None), "m@8": ("openai-compatible", "m", 8, "l2", "http://localhost:1"),
+                  "e@3": ("gemini", "e", 3, "l2", None)},
+            counts={("memory_embeddings", "a@1"): 10, ("library_embeddings", "m@8"): 7},
+            indexes=[profiles.profile_index_name("a@1", "memory_embeddings")],
+        )
+        out = {p["id"]: p for p in profiles.list_profiles(cur)}
+        self.assertEqual(out["a@1"]["index"], {"memory": "present"})
+        self.assertEqual(out["m@8"]["index"],
+                         {"library": "missing (rebuild with: khipu embed index m@8 --table library)"})
+        self.assertEqual(out["e@3"]["index"], {}, "no rows, no index needed")
+        cur = FakeCur(rows={"a@1": ("gemini", "a", 1, "l2", None)},
+                      counts={("memory_embeddings", "a@1"): 4})
+        (only,) = profiles.list_profiles(cur)
+        self.assertEqual(only["index"], {"memory": "missing (rebuild with: khipu embed index a@1)"})
 
     def test_list_survives_a_hub_without_the_library_table_or_endpoint(self):
         cur = FakeCur(rows={"a@1": ("gemini", "a", 1, "l2", None)}, endpoint_column=False,
@@ -296,6 +316,97 @@ class LibraryIndexTest(unittest.TestCase):
         self.assertNotEqual(name, profiles.library_index_name("a" * 91 + "@1024"))
 
 
+class BulkLoadTest(unittest.TestCase):
+    """drop_profile_index and BulkLoad: DDL order recorded by a fake cursor."""
+
+    def setUp(self):
+        profiles.clear_learned()
+        profiles.register_spec(ProfileSpec("v@8", "voyage", "v", 8))
+        self.addCleanup(profiles.clear_learned)
+
+    def _cur(self, existing=()):
+        cur = mock.Mock()
+        cur.ddl = []
+        live = set(existing)
+
+        def execute(sql, params=()):
+            s = " ".join(sql.split())
+            if s.startswith("SELECT 1 FROM pg_indexes"):
+                cur.fetchone.return_value = (1,) if params[0] in live else None
+            elif s.startswith("DROP INDEX"):
+                live.discard(s.split(".")[-1])
+                cur.ddl.append(("drop", s.split(".")[-1]))
+            elif s.startswith("CREATE INDEX"):
+                live.add(s.split()[5])
+                cur.ddl.append(("create", s.split()[5]))
+
+        cur.execute.side_effect = execute
+        cur.live = live
+        return cur
+
+    def test_drop_removes_only_the_named_profiles_index_and_reports_it(self):
+        mine = profiles.profile_index_name("v@8", "library_embeddings")
+        theirs = profiles.profile_index_name("w@8", "library_embeddings")
+        cur = self._cur({mine, theirs})
+        self.assertEqual(profiles.drop_profile_index(cur, "v@8", "library_embeddings"), mine)
+        self.assertEqual(cur.live, {theirs})
+        self.assertIsNone(profiles.drop_profile_index(cur, "v@8", "library_embeddings"))
+        with self.assertRaises(ValueError):
+            profiles.drop_profile_index(cur, "v@8", "episodes")
+
+    def test_a_big_load_drops_first_and_rebuilds_once_after(self):
+        name = profiles.profile_index_name("v@8", "memory_embeddings")
+        cur, conn = self._cur({name}), mock.Mock()
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            with profiles.BulkLoad(conn, cur, "memory_embeddings") as bulk:
+                self.assertEqual(bulk.defer("v@8", profiles.BULK_DROP_ROWS + 1), name)
+                self.assertEqual(cur.ddl, [("drop", name)])
+                self.assertEqual(bulk.defer("v@8", 10**6), None, "a second defer is a no-op")
+        self.assertEqual(cur.ddl, [("drop", name), ("create", name)])
+        self.assertIn(f"dropped index {name} on memory_embeddings before loading 5001 rows", err.getvalue())
+        self.assertIn("scan sequentially", err.getvalue())
+
+    def test_a_load_at_or_below_the_threshold_leaves_the_index(self):
+        name = profiles.profile_index_name("v@8", "memory_embeddings")
+        cur, conn = self._cur({name}), mock.Mock()
+        with profiles.BulkLoad(conn, cur, "memory_embeddings") as bulk:
+            self.assertIsNone(bulk.defer("v@8", profiles.BULK_DROP_ROWS))
+        self.assertEqual(cur.ddl, [])
+        self.assertEqual(cur.live, {name})
+
+    def test_an_unknown_row_count_counts_as_big_and_a_missing_index_is_left_missing(self):
+        name = profiles.profile_index_name("v@8", "library_embeddings")
+        cur, conn = self._cur({name}), mock.Mock()
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            with profiles.BulkLoad(conn, cur, "library_embeddings", ) as bulk:
+                self.assertEqual(bulk.defer("v@8", None), name)
+        self.assertIn("an unknown number of rows", err.getvalue())
+        cur = self._cur()
+        with profiles.BulkLoad(conn, cur, "library_embeddings") as bulk:
+            self.assertIsNone(bulk.defer("v@8", None))
+        self.assertEqual(cur.ddl, [])
+
+    def test_an_error_mid_load_still_rebuilds_and_propagates(self):
+        name = profiles.profile_index_name("v@8", "library_embeddings")
+        cur, conn = self._cur({name}), mock.Mock()
+        with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(KeyError):
+            with profiles.BulkLoad(conn, cur, "library_embeddings") as bulk:
+                bulk.defer("v@8", None)
+                raise KeyError("boom")
+        conn.rollback.assert_called_once()
+        self.assertEqual(cur.ddl, [("drop", name), ("create", name)])
+
+    def test_the_rebuild_respects_index_memory(self):
+        name = profiles.profile_index_name("v@8", "library_embeddings")
+        cur, conn = self._cur({name}), mock.Mock()
+        with mock.patch.dict("os.environ", {"KHIPU_INDEX_MEMORY": "1200MB"}), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            with profiles.BulkLoad(conn, cur, "library_embeddings") as bulk:
+                bulk.defer("v@8", None)
+        sent = [" ".join(c.args[0].split()) for c in cur.execute.call_args_list]
+        self.assertIn("SET LOCAL maintenance_work_mem = '1200MB'", sent)
+
+
 class CliTest(unittest.TestCase):
     def _run(self, **kw):
         base = dict(embed_cmd="profiles", profiles_cmd="add", normalize="l2", endpoint=None)
@@ -327,10 +438,9 @@ class CliTest(unittest.TestCase):
             rc, out = self._run(id="voyage-3@1024", provider="voyage", model="voyage-3", dim=1024)
         self.assertEqual((rc, out["created"]), (0, True))
         conn.commit.assert_called_once()
-        ddl = [sql for sql, _ in cur.executed if sql.startswith("CREATE INDEX")]
-        self.assertEqual(len(ddl), 2)
-        self.assertTrue(any("ON memory_embeddings" in d for d in ddl))
-        self.assertTrue(any("ON library_embeddings" in d for d in ddl))
+        self.assertEqual(out["indexes"], "built on first backfill or import")
+        self.assertEqual([sql for sql, _ in cur.executed
+                          if sql.startswith(("CREATE INDEX", "SAVEPOINT"))], [])
 
     def test_list_prints_the_profiles(self):
         db._TABLE_COLUMNS_CACHE.clear()
@@ -345,10 +455,59 @@ class CliTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out.getvalue())["profiles"][0]["id"], "a@1")
 
+    def _conn(self, cur):
+        conn = mock.MagicMock()
+        conn.__enter__.return_value = conn
+        conn.cursor.return_value.__enter__.return_value = cur
+        return conn
+
+    def test_embed_index_builds_both_tables_and_prints_the_receipt(self):
+        db._TABLE_COLUMNS_CACHE.clear()
+        profiles.clear_learned()
+        cur = FakeCur(rows={"voyage-3@1024": ("voyage", "voyage-3", 1024, "l2", None)})
+        conn = self._conn(cur)
+        args = argparse.Namespace(embed_cmd="index", profile="voyage-3@1024", table=None)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.dict("os.environ", {"KHIPU_INDEX_MEMORY": "900MB"}), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = cli.cmd_embed(args)
+        receipt = json.loads(out.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertEqual(receipt, {"ok": True, "profile": "voyage-3@1024", "indexes": {
+            "memory_embeddings": "idx_memory_hnsw_voyage_3_1024",
+            "library_embeddings": "idx_library_hnsw_voyage_3_1024"}})
+        sql = [s for s, _ in cur.executed]
+        self.assertEqual(sql.count("SET LOCAL maintenance_work_mem = '900MB'"), 2)
+        self.assertEqual(len([s for s in sql if s.startswith("CREATE INDEX")]), 2)
+        conn.commit.assert_called_once()
+        profiles.clear_learned()
+
+    def test_embed_index_table_flag_limits_it_and_an_unknown_profile_is_exit_2(self):
+        db._TABLE_COLUMNS_CACHE.clear()
+        profiles.clear_learned()
+        cur = FakeCur(rows={"voyage-3@1024": ("voyage", "voyage-3", 1024, "l2", None)})
+        with mock.patch("khipu.db.connect", return_value=self._conn(cur)), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = cli.cmd_embed(argparse.Namespace(
+                embed_cmd="index", profile="voyage-3@1024", table="library"))
+        self.assertEqual(list(json.loads(out.getvalue())["indexes"]), ["library_embeddings"])
+        self.assertEqual(rc, 0)
+        with mock.patch("khipu.db.connect", return_value=self._conn(FakeCur())), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = cli.cmd_embed(argparse.Namespace(embed_cmd="index", profile="ghost@4", table=None))
+        self.assertEqual(rc, 2)
+        self.assertFalse(json.loads(out.getvalue())["ok"])
+        profiles.clear_learned()
+
     def test_the_argparse_surface_exists(self):
         ns = cli.build_parser().parse_args(["embed", "profiles", "add", "voyage-3@1024", "--provider", "voyage",
                                 "--model", "voyage-3", "--dim", "1024"])
         self.assertEqual((ns.profiles_cmd, ns.dim, ns.normalize), ("add", 1024, "l2"))
+        ix = cli.build_parser().parse_args(["embed", "index", "voyage-3@1024", "--table", "library"])
+        self.assertEqual((ix.embed_cmd, ix.profile, ix.table), ("index", "voyage-3@1024", "library"))
+        imp = cli.build_parser().parse_args(["library", "import", "bib", "x.jsonl", "--batch", "50"])
+        self.assertEqual(imp.batch, 50)
+        self.assertEqual(cli.build_parser().parse_args(["library", "import", "bib", "x"]).batch, 500)
 
 
 if __name__ == "__main__":

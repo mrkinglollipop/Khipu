@@ -568,69 +568,71 @@ def backfill(conn, name: str, *, limit: int | None = None, stale: bool = False,
             total = min(total, limit)
         if job is not None:
             job.update(0, total, 0)
-        while True:
-            if job is not None and job.cancelled:
-                stats["cancelled"] = True
-                _log(f"{name}: cancelled: stopping before the next batch")
-                break
-            size = embed.BATCH if limit is None else min(embed.BATCH, limit - attempted)
-            if size <= 0:
-                break
-            cur.execute(
-                "SELECT c.document, c.chunk_idx, c.chunk_text, c.content_hash, d.title"
-                + _JOIN_E + cond
-                + " AND (c.document, c.chunk_idx) > (%s, %s)"
-                " ORDER BY c.document, c.chunk_idx LIMIT %s",
-                (src.profile, name, last[0], last[1], size),
-            )
-            batch = cur.fetchall()
-            if not batch:
-                break
-            last = (batch[-1][0], batch[-1][1])
-            attempted += len(batch)
-            api = embed._api_texts(src.profile, [(r[4] or "", r[2]) for r in batch])
-            try:
-                vecs = embed.embed_batch(
-                    api, profile=src.profile, retries=embed.BACKFILL_RETRIES,
-                    delay=embed.BACKFILL_DELAY_S, input_type="document",
-                )
-                for v in vecs:
-                    # The column is untyped, so the database will not reject a
-                    # wrong width; this is the check that does.
-                    if len(v) != spec.dim:
-                        raise RuntimeError(
-                            f"vector of length {len(v)} for profile {spec.id} (dim {spec.dim})"
-                        )
-            except RuntimeError as exc:
-                if "budget exhausted" in str(exc):
-                    stats["budget_exhausted"] = True
-                    _log(f"{name}: stopping: {exc}")
+        with profiles.BulkLoad(conn, cur, "library_embeddings") as bulk:
+            bulk.defer(src.profile, total)
+            while True:
+                if job is not None and job.cancelled:
+                    stats["cancelled"] = True
+                    _log(f"{name}: cancelled: stopping before the next batch")
                     break
-                stats["failed"] += len(batch)
-                if "API key not found" in str(exc) and not stats.get("embed_provider"):
-                    stats["embed_provider"] = "missing key"
-                _log(f"{name}: batch failed ({type(exc).__name__}): {exc}; continuing")
+                size = embed.BATCH if limit is None else min(embed.BATCH, limit - attempted)
+                if size <= 0:
+                    break
+                cur.execute(
+                    "SELECT c.document, c.chunk_idx, c.chunk_text, c.content_hash, d.title"
+                    + _JOIN_E + cond
+                    + " AND (c.document, c.chunk_idx) > (%s, %s)"
+                    " ORDER BY c.document, c.chunk_idx LIMIT %s",
+                    (src.profile, name, last[0], last[1], size),
+                )
+                batch = cur.fetchall()
+                if not batch:
+                    break
+                last = (batch[-1][0], batch[-1][1])
+                attempted += len(batch)
+                api = embed._api_texts(src.profile, [(r[4] or "", r[2]) for r in batch])
+                try:
+                    vecs = embed.embed_batch(
+                        api, profile=src.profile, retries=embed.BACKFILL_RETRIES,
+                        delay=embed.BACKFILL_DELAY_S, input_type="document",
+                    )
+                    for v in vecs:
+                        # The column is untyped, so the database will not reject a
+                        # wrong width; this is the check that does.
+                        if len(v) != spec.dim:
+                            raise RuntimeError(
+                                f"vector of length {len(v)} for profile {spec.id} (dim {spec.dim})"
+                            )
+                except RuntimeError as exc:
+                    if "budget exhausted" in str(exc):
+                        stats["budget_exhausted"] = True
+                        _log(f"{name}: stopping: {exc}")
+                        break
+                    stats["failed"] += len(batch)
+                    if "API key not found" in str(exc) and not stats.get("embed_provider"):
+                        stats["embed_provider"] = "missing key"
+                    _log(f"{name}: batch failed ({type(exc).__name__}): {exc}; continuing")
+                    if job is not None:
+                        job.update(stats["embedded"], total, stats["failed"])
+                    time.sleep(embed.BACKFILL_PAUSE_S)
+                    continue
+                cur.executemany(
+                    _INSERT_EMBEDDING,
+                    [(src.profile, r[0], r[1], embed._vec_literal(v), r[3])
+                     for r, v in zip(batch, vecs)],
+                )
+                conn.commit()
+                stats["embedded"] += len(batch)
+                stats["batches"] += 1
                 if job is not None:
                     job.update(stats["embedded"], total, stats["failed"])
-                time.sleep(embed.BACKFILL_PAUSE_S)
-                continue
-            cur.executemany(
-                _INSERT_EMBEDDING,
-                [(src.profile, r[0], r[1], embed._vec_literal(v), r[3])
-                 for r, v in zip(batch, vecs)],
-            )
-            conn.commit()
-            stats["embedded"] += len(batch)
-            stats["batches"] += 1
-            if job is not None:
-                job.update(stats["embedded"], total, stats["failed"])
-            if len(batch) == size:
-                time.sleep(embed.BACKFILL_PAUSE_S)
-        if stats["embedded"] and not stats.get("cancelled"):
-            # After the inserts, not before: one build over finished rows is far
-            # cheaper than maintaining the graph per batch. A no-op once it exists.
-            profiles.ensure_profile_index(cur, src.profile, "library_embeddings", quiet=True)
-            conn.commit()
+                if len(batch) == size:
+                    time.sleep(embed.BACKFILL_PAUSE_S)
+            if stats["embedded"] and not stats.get("cancelled"):
+                # After the inserts, not before: one build over finished rows is far
+                # cheaper than maintaining the graph per batch. A no-op once it exists.
+                profiles.ensure_profile_index(cur, src.profile, "library_embeddings", quiet=True)
+                conn.commit()
         stats["remaining"] = _remaining(cur, src, stale)
     return stats
 
@@ -820,6 +822,7 @@ def _map_path(source_file: str, prefix: str, roots: tuple[str, ...]) -> str | No
 
 def import_index(
     conn, name: str, path: str, *, strip_prefix: str = "", profile: str | None = None,
+    batch: int = IMPORT_BATCH,
 ) -> dict[str, Any]:
     """Import vectors computed elsewhere into library ``name``.
 
@@ -833,6 +836,9 @@ def import_index(
     different window layout are replaced. Idempotent on (document, chunk_idx,
     profile); streams in batches, never loads the file.
     """
+    if int(batch) < 1:
+        raise LibraryError(f"--batch must be at least 1, got {batch}")
+    batch = int(batch)
     src_path = Path(os.path.expanduser(path))
     if not src_path.is_file():
         raise LibraryError(f"{path!r} is not a file")
@@ -886,72 +892,75 @@ def import_index(
             touched[doc_id] = set()
             return doc_id
 
-        for row in reader:
-            stats["read"] += 1
-            if stats["read"] % 20000 == 0:
-                _log(f"{name}: read {stats['read']} imported {stats['imported']}")
-            if row.get("_bad"):
-                stats["skipped_bad_row"] += 1
-                continue
-            rel = _map_path(str(row.get("source_file") or ""), strip_prefix or "", roots)
-            if rel is None:
-                stats["unmapped"] += 1
-                continue
-            if rel not in eligible:
-                eligible[rel] = eligible_file(root, root_real, rel)
-            if eligible[rel] is None:
-                stats["unmapped"] += 1
-                continue
-            text = row.get("chunk_text")
-            if not isinstance(text, str) or is_corrupt_chunk_text(text):
-                stats["skipped_corrupt"] += 1
-                continue
-            vec = _decode_vector(row.get("embedding"))
-            try:
-                idx = int(row.get("chunk_idx"))
-                dims = int(row["dims"]) if row.get("dims") is not None else None
-            except (TypeError, ValueError):
-                stats["skipped_bad_row"] += 1
-                continue
-            if vec is None:
-                stats["skipped_bad_vector"] += 1
-                continue
-            if fixed is not None:
-                spec = fixed
-            else:
-                key = (row.get("model"), dims or len(vec))
-                spec = by_key.get(key)
-                if spec is None:
-                    spec = by_key[key] = _resolve_import_profile(cur, key[0], key[1])
-            if len(vec) != spec.dim or (dims is not None and dims != len(vec)):
-                stats["skipped_bad_vector"] += 1
-                continue
-            doc_id = document_for(rel, eligible[rel])
-            if doc_id is None:
-                stats["unmapped"] += 1
-                continue
-            used[spec.id] = spec
-            clean = _clean(text)
-            digest = _md5(clean)
-            touched[doc_id].add(idx)
-            chunk_rows.append((doc_id, idx, clean, digest))
-            emb_rows.append((spec.id, doc_id, idx, embed._vec_literal(vec), digest))
-            stats["imported"] += 1
-            if len(chunk_rows) >= IMPORT_BATCH:
-                flush()
-        flush()
-        # The imported chunks define each document they touched.
-        for doc_id, idxs in touched.items():
-            cur.execute(
-                "DELETE FROM library_chunks WHERE document = %s AND NOT (chunk_idx = ANY(%s))",
-                (doc_id, sorted(idxs)),
-            )
-        conn.commit()
-        for spec in used.values():
-            profiles.ensure_profile_index(
-                cur, spec.id, "library_embeddings", dim=spec.dim, quiet=True
-            )
-        conn.commit()
+        with profiles.BulkLoad(conn, cur, "library_embeddings") as bulk:
+            for row in reader:
+                stats["read"] += 1
+                if stats["read"] % 20000 == 0:
+                    _log(f"{name}: read {stats['read']} imported {stats['imported']}")
+                if row.get("_bad"):
+                    stats["skipped_bad_row"] += 1
+                    continue
+                rel = _map_path(str(row.get("source_file") or ""), strip_prefix or "", roots)
+                if rel is None:
+                    stats["unmapped"] += 1
+                    continue
+                if rel not in eligible:
+                    eligible[rel] = eligible_file(root, root_real, rel)
+                if eligible[rel] is None:
+                    stats["unmapped"] += 1
+                    continue
+                text = row.get("chunk_text")
+                if not isinstance(text, str) or is_corrupt_chunk_text(text):
+                    stats["skipped_corrupt"] += 1
+                    continue
+                vec = _decode_vector(row.get("embedding"))
+                try:
+                    idx = int(row.get("chunk_idx"))
+                    dims = int(row["dims"]) if row.get("dims") is not None else None
+                except (TypeError, ValueError):
+                    stats["skipped_bad_row"] += 1
+                    continue
+                if vec is None:
+                    stats["skipped_bad_vector"] += 1
+                    continue
+                if fixed is not None:
+                    spec = fixed
+                else:
+                    key = (row.get("model"), dims or len(vec))
+                    spec = by_key.get(key)
+                    if spec is None:
+                        spec = by_key[key] = _resolve_import_profile(cur, key[0], key[1])
+                if len(vec) != spec.dim or (dims is not None and dims != len(vec)):
+                    stats["skipped_bad_vector"] += 1
+                    continue
+                doc_id = document_for(rel, eligible[rel])
+                if doc_id is None:
+                    stats["unmapped"] += 1
+                    continue
+                if spec.id not in used:
+                    bulk.defer(spec.id, None)  # rows unknown up front
+                used[spec.id] = spec
+                clean = _clean(text)
+                digest = _md5(clean)
+                touched[doc_id].add(idx)
+                chunk_rows.append((doc_id, idx, clean, digest))
+                emb_rows.append((spec.id, doc_id, idx, embed._vec_literal(vec), digest))
+                stats["imported"] += 1
+                if len(chunk_rows) >= batch:
+                    flush()
+            flush()
+            # The imported chunks define each document they touched.
+            for doc_id, idxs in touched.items():
+                cur.execute(
+                    "DELETE FROM library_chunks WHERE document = %s AND NOT (chunk_idx = ANY(%s))",
+                    (doc_id, sorted(idxs)),
+                )
+            conn.commit()
+            for spec in used.values():
+                profiles.ensure_profile_index(
+                    cur, spec.id, "library_embeddings", dim=spec.dim, quiet=True
+                )
+            conn.commit()
     ids = sorted(used)
     out: dict[str, Any] = {
         "ok": True, "source": name, **stats, "documents": len(touched),

@@ -124,8 +124,12 @@ class FakeCursor:
             pass
         elif s.startswith("SELECT 1 FROM pg_indexes"):
             self._r = [(1,)] if p[0] in h.indexes else []
+        elif s.startswith("SELECT indexname FROM pg_indexes"):
+            self._r = [(n,) for n in sorted(h.indexes)]
         elif s.startswith("CREATE INDEX IF NOT EXISTS"):
             h.indexes.add(s.split()[5])
+        elif s.startswith("DROP INDEX IF EXISTS"):
+            h.indexes.discard(s.split()[-1].split(".")[-1])
         elif s.startswith("SELECT to_regclass"):
             self._r = [(h.library_tables,)]
         elif s.startswith("SELECT 1 FROM library_sources"):
@@ -516,6 +520,32 @@ class BackfillTest(_Base):
         self.addCleanup(embed.set_transport, None)
         return library.backfill(self.hub, "lib1", **kw)
 
+    def test_a_small_backfill_leaves_an_existing_index_alone(self):
+        name = profiles.profile_index_name(TINY.id, "library_embeddings")
+        self.hub.indexes.add(name)
+        self.run_backfill(_voyage_transport())
+        self.assertFalse([s for s, _ in self.hub.executed if s.startswith("DROP INDEX")])
+        self.assertIn(name, self.hub.indexes)
+
+    def test_a_big_backfill_drops_the_index_first_and_rebuilds_it_at_the_end(self):
+        name = profiles.profile_index_name(TINY.id, "library_embeddings")
+        self.hub.indexes.add(name)
+        with mock.patch.object(profiles, "BULK_DROP_ROWS", 3), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            out = self.run_backfill(_voyage_transport())
+        self.assertEqual(out["embedded"], 7)
+        kinds = []
+        for stmt, _ in self.hub.executed:
+            if stmt.startswith("DROP INDEX"):
+                kinds.append("drop")
+            elif stmt.startswith("INSERT INTO library_embeddings") and "insert" not in kinds:
+                kinds.append("insert")
+            elif stmt.startswith("CREATE INDEX"):
+                kinds.append("create")
+        self.assertEqual(kinds, ["drop", "insert", "create"])
+        self.assertIn(name, self.hub.indexes)
+        self.assertIn("before loading 7 rows", err.getvalue())
+
     def test_batches_of_the_batch_size_document_input_type_and_receipt(self):
         calls: list = []
         out = self.run_backfill(_voyage_transport(calls))
@@ -652,6 +682,62 @@ class ImportTest(_Base):
                              for s, _ in self.hub.executed), True)
         row = library.list_sources(self.hub)[0]
         self.assertEqual((row["documents"], row["chunks"], row["embedded"], row["missing"]), (2, 3, 3, 0))
+
+    def _ddl_order(self):
+        """Statement kinds in the order they ran: drop, first insert, create."""
+        kinds = []
+        for stmt, _ in self.hub.executed:
+            if stmt.startswith("DROP INDEX"):
+                kinds.append("drop")
+            elif stmt.startswith("INSERT INTO library_embeddings") and "insert" not in kinds:
+                kinds.append("insert")
+            elif stmt.startswith("CREATE INDEX"):
+                kinds.append("create")
+        return kinds
+
+    def test_an_existing_index_is_dropped_before_the_insert_and_rebuilt_after(self):
+        name = profiles.profile_index_name(TINY.id, "library_embeddings")
+        other = profiles.profile_index_name("other@4", "library_embeddings")
+        self.hub.indexes |= {name, other}
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.run_import()
+        self.assertEqual(self._ddl_order(), ["drop", "insert", "create"])
+        self.assertIn(name, self.hub.indexes)  # rebuilt
+        self.assertIn(other, self.hub.indexes)  # a profile the job never wrote to is untouched
+        self.assertIn("scan sequentially", err.getvalue())
+        self.assertIn(f"dropped index {name}", err.getvalue())
+
+    def test_no_index_means_no_drop_and_one_build_at_the_end(self):
+        self.run_import()
+        self.assertEqual(self._ddl_order(), ["insert", "create"])
+
+    def test_the_index_is_rebuilt_even_when_the_load_dies(self):
+        name = profiles.profile_index_name(TINY.id, "library_embeddings")
+        self.hub.indexes.add(name)
+        real = library._decode_vector
+        calls = {"n": 0}
+
+        def boom(raw):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("disk gone")
+            return real(raw)
+
+        with mock.patch.object(library, "_decode_vector", boom), \
+                mock.patch("sys.stderr", new_callable=io.StringIO), \
+                self.assertRaises(RuntimeError):
+            self.run_import()
+        self.assertEqual(self._ddl_order()[0], "drop")
+        self.assertIn(name, self.hub.indexes)
+
+    def test_batch_sets_the_rows_per_commit_and_must_be_positive(self):
+        self.run_import()
+        default_commits = self.hub.commits
+        self.hub.commits = 0
+        self.run_import(batch=1)
+        self.assertGreater(self.hub.commits, default_commits)
+        with self.assertRaises(library.LibraryError):
+            self.run_import(batch=0)
 
     def test_second_run_is_idempotent(self):
         first = self.run_import()
