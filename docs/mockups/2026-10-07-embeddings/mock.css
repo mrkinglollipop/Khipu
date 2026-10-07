@@ -1,0 +1,60 @@
+/* Mock-only layout for the two new screens. Tokens and components come from App.css. */
+.emb-list{display:flex;flex-direction:column}
+.emb-row{display:flex;flex-direction:column;gap:var(--s2);padding:var(--s4);border-bottom:1px solid var(--border)}
+.emb-row:last-child{border-bottom:0}
+.emb-top{display:flex;align-items:center;gap:var(--s3)}
+.emb-id{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap;flex:1;min-width:0}
+.emb-q{font-size:var(--t-sm);color:var(--text-2);text-align:right;white-space:nowrap}
+.emb-q b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
+.emb-cov{display:grid;grid-template-columns:150px 180px 150px 1fr;align-items:center;column-gap:var(--s3);row-gap:var(--s1);font-size:var(--t-sm);color:var(--text-2);margin-top:var(--s1)}
+.emb-cov .num{font-variant-numeric:tabular-nums;text-align:right;color:var(--text)}
+.emb-cov .bar{width:100%;height:6px;border-radius:3px;background:var(--border)}
+.emb-cov .bar.ok i{background:var(--ok)}
+.emb-acts{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap;margin-top:var(--s2)}
+.emb-acts .why{font-size:var(--t-sm);color:var(--text-2);margin-right:var(--s3)}
+.emb-acts .gap{margin-left:var(--s2)}
+.emb-job{border:1px solid var(--border);background:var(--surface-2);border-radius:var(--r-sm);padding:var(--s3);display:flex;flex-direction:column;gap:var(--s2);margin-top:var(--s2)}
+.emb-job .top{display:flex;align-items:center;gap:var(--s3)}
+.emb-job .bar{width:100%;height:8px;border-radius:4px;background:var(--border)}
+.emb-job .bar i{border-radius:4px}
+.sub-sm{font-size:var(--t-sm);color:var(--text-2)}
+.field-grid{display:flex;flex-direction:column;gap:var(--s3)}
+.field-grid .set-field + .set-field{margin-top:0;padding-top:0;border-top:0}
+.field-grid select,.field-grid input{width:100%}
+.two{display:grid;grid-template-columns:1fr 140px;gap:var(--s3)}
+.test-line{display:flex;align-items:center;gap:var(--s2)}
+.lib-row{display:flex;flex-direction:column;gap:var(--s2);padding:var(--s4);border-bottom:1px solid var(--border)}
+.lib-add{display:flex;flex-direction:column;gap:var(--s3);padding:var(--s4)}
+.lib-add .fields{display:grid;grid-template-columns:1fr 150px 210px;gap:var(--s3);align-items:end}
+.lib-add .fields .set-field + .set-field{margin-top:0;padding-top:0;border-top:0}
+.lib-add input,.lib-add select{width:100%}
+.lib-add .folder{display:flex;gap:var(--s2)}
+.lib-stats{display:flex;gap:var(--s5);flex-wrap:wrap;font-size:var(--t-sm);color:var(--text-2)}
+.lib-stats b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
+.path{font-family:var(--mono);font-size:var(--t-sm);color:var(--text-2);overflow-wrap:anywhere}
+.help-pad{padding:var(--s3) var(--s4) 0}
+.rail-nav{overflow:hidden}
+
+/* Round 2 */
+.emb-acts{align-items:flex-start;gap:var(--s4)}
+.act{display:flex;flex-direction:column;gap:var(--s1);align-items:flex-start}
+.act .why{font-size:var(--t-sm);color:var(--text-2);margin:0}
+.emb-acts button:not(:disabled):not(.primary):not(.danger),.lib-add button:not(:disabled):not(.primary){border-color:var(--border-strong)}
+.emb-acts button:disabled,.lib-add button:disabled{border-color:transparent;background:transparent;color:var(--muted);opacity:.7;box-shadow:none}
+.emb-id .tag.accent{background:var(--accent-text);color:var(--on-accent);border-color:transparent}
+.emb-cov{grid-template-columns:150px 180px 190px 1fr}
+.help-line{margin:0;padding:var(--s3) var(--s4);border-top:1px solid var(--border);font-size:var(--t-sm);color:var(--text-2)}
+.lib-add .fields{grid-template-columns:1fr 200px}
+.lib-add .full{grid-column:1/-1}
+#libs{scroll-margin-top:92px}
+dialog::backdrop{background:rgba(32,29,26,.72)}
+@media (prefers-color-scheme: dark){dialog::backdrop{background:rgba(0,0,0,.75)}}
+.dl{margin:0;display:grid;grid-template-columns:auto 1fr;column-gap:var(--s4);row-gap:6px;font-size:var(--t-md)}
+.dl dt{color:var(--text-2);font-size:var(--t-sm)} .dl dd{margin:0;font-weight:600}
+.receipt{border:1px solid var(--border);background:var(--surface-2);border-radius:var(--r-sm);padding:var(--s3);display:flex;flex-direction:column;gap:var(--s2);margin-top:var(--s2)}
+.receipt .line{display:flex;gap:var(--s3);flex-wrap:wrap;font-size:var(--t-sm);color:var(--text-2)}
+.receipt .line b{color:var(--text);font-variant-numeric:tabular-nums}
+.redo-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:var(--s1);font-size:var(--t-sm);color:var(--text-2)}
+.redo-list li{display:flex;gap:var(--s2);align-items:center;justify-content:space-between}
+.err-job{border-color:color-mix(in srgb,var(--err) 45%,transparent);background:var(--err-soft)}
+.act .why{padding-left:13px}

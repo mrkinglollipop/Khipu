@@ -1,3 +1,5 @@
+# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
+# agent (brief: do not delegate); no further agent to route to.
 """Vectors for real — P3 step 3 (2026-08-17) + Gemini Embedding 2 profile (2026-08-19)
 + native media (PNG/JPEG) under Embedding 2 (2026-08-20).
 
@@ -37,6 +39,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
+from khipu import profiles as _profiles
+from khipu.profiles import ProfileSpec, resolve_spec
 from khipu.search_text import hybrid_rerank
 from khipu.snippets import FETCH_LIMIT, LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
 
@@ -49,11 +53,9 @@ PROFILE_2 = f"{MODEL_2}@{DIM}"
 MODEL = MODEL_001
 PROFILE_ID = PROFILE_001
 
-# Profile id → Gemini model name. Unknown ids refuse rather than guess.
-_PROFILE_MODELS: dict[str, str] = {
-    PROFILE_001: MODEL_001,
-    PROFILE_2: MODEL_2,
-}
+# Profile id -> record (provider, model, dim, normalize, endpoint) lives in
+# khipu.profiles: the two Gemini ids are seeded there, every other profile is
+# read from embedding_profiles. Unknown ids refuse rather than guess.
 
 CHUNK_CHARS = 6000
 CHUNK_OVERLAP = 300
@@ -254,12 +256,13 @@ def prefix_query(query: str) -> str:
 
 
 def model_for_profile(profile: str) -> str:
-    model = _PROFILE_MODELS.get(profile)
-    if not model:
+    """Model name for a seeded or already-loaded profile (no database access)."""
+    spec = _profiles.cached_spec(profile)
+    if spec is None:
         raise ValueError(
-            f"unknown embedding profile {profile!r}; known: {sorted(_PROFILE_MODELS)}"
+            f"unknown embedding profile {profile!r}; known: {_profiles.known_ids()}"
         )
-    return model
+    return spec.model
 
 
 def uses_task_prefixes(profile: str) -> bool:
@@ -290,13 +293,48 @@ def _gemini_key() -> str:
     return key
 
 
-def _note_auth_failure(status: int) -> None:
+_VOYAGE_KEY_CACHE: list[str] = []
+_OPENAI_KEY_CACHE: list[str | None] = []  # [None] = resolved, no key stored
+
+
+def _voyage_key() -> str:
+    """The Voyage key, resolved once per process like the Gemini key."""
+    with _KEY_LOCK:
+        if _VOYAGE_KEY_CACHE:
+            return _VOYAGE_KEY_CACHE[0]
+    from khipu.keychain import resolve_voyage_key
+
+    key = resolve_voyage_key()
+    with _KEY_LOCK:
+        _VOYAGE_KEY_CACHE[:] = [key]
+    return key
+
+
+def _openai_compat_key() -> str | None:
+    """The optional bearer for an OpenAI-compatible endpoint. A local server
+    needs none, so absence is a valid, cached answer (a 401/403 drops it)."""
+    with _KEY_LOCK:
+        if _OPENAI_KEY_CACHE:
+            return _OPENAI_KEY_CACHE[0]
+    from khipu.keychain import get_openai_compat_key
+
+    key = get_openai_compat_key()
+    with _KEY_LOCK:
+        _OPENAI_KEY_CACHE[:] = [key]
+    return key
+
+
+def _note_auth_failure(status: int, provider: str = "gemini") -> None:
     """Forget the cached key after a response that says it may be wrong. Gemini
     answers an invalid key with 400 (``API key not valid``), an unauthorised
-    one with 401 or 403."""
-    if status in (400, 401, 403):
+    one with 401 or 403; Voyage and OpenAI-compatible servers use 401/403."""
+    if provider == "gemini":
+        if status in (400, 401, 403):
+            with _KEY_LOCK:
+                _KEY_CACHE.clear()
+    elif status in (401, 403):
         with _KEY_LOCK:
-            _KEY_CACHE.clear()
+            (_VOYAGE_KEY_CACHE if provider == "voyage" else _OPENAI_KEY_CACHE).clear()
 
 
 def _urllib_transport(url: str, data: bytes, headers: dict[str, str], timeout: float) -> bytes:
@@ -475,7 +513,7 @@ def _query_vec(cur, conn, profile: str, api_q: str) -> tuple[list[float], str]:
     vec = embed_one(
         api_q, profile=profile,
         retries=QUERY_EMBED_RETRIES, timeout=QUERY_EMBED_TIMEOUT_S,
-        delay=QUERY_EMBED_DELAY_S,
+        delay=QUERY_EMBED_DELAY_S, input_type="query",
     )
     if not have_cache:
         return vec, "off"
@@ -520,23 +558,24 @@ def query_cache_status(cur) -> dict[str, Any]:
     return {"available": True, "rows": int(rows), "hits": int(hits)}
 
 
-def embed_batch(
-    texts: list[str],
-    *,
-    profile: str = PROFILE_001,
-    retries: int = 4,
-    timeout: float = 120.0,
-    delay: float = 2.0,
-    transport=None,
-) -> list[list[float]]:
-    """Embed up to BATCH texts; L2-normalized; dim-checked.
+# Per-request text cap by provider. Gemini's batchEmbedContents allows 100 and
+# callers already stay at BATCH (64), so it is left alone (None = send as given).
+# Voyage allows 1000 texts but caps tokens per request (120K for the large
+# models): 32 chunks of <= 8000 chars is about 64K tokens worst case.
+_MAX_PER_REQUEST: dict[str, int | None] = {
+    "gemini": None,
+    "voyage": 32,
+    "openai-compatible": 64,
+}
+VOYAGE_URL = "https://api.voyageai.com/v1/embeddings"
+VOYAGE_DEFAULT_DIM = 1024
+# Models whose output_dimension is selectable (docs.voyageai.com); the others
+# are fixed-width and reject the parameter, so it is sent only off the default.
+_VOYAGE_FLEX_PREFIXES = ("voyage-3-large", "voyage-3.5", "voyage-4", "voyage-code-3")
 
-    ``texts`` must already include any v2 task prefixes — callers store the
-    unprefixed chunk_text separately.
-    """
-    if not texts:
-        return []
-    model = model_for_profile(profile)
+
+def _build_gemini(spec: ProfileSpec, texts: list[str], input_type: str | None):
+    model = spec.model
     key = _gemini_key()
     # Header auth, not ?key=. The query-string form puts a live API key inside a
     # URL that any future logging, proxy, or exception-formatting change would
@@ -556,20 +595,64 @@ def embed_batch(
             for t in texts
         ]
     }
+    return url, body, {"Content-Type": "application/json", "x-goog-api-key": key}
+
+
+def _build_voyage(spec: ProfileSpec, texts: list[str], input_type: str | None):
+    body: dict[str, Any] = {
+        "input": [t[:MAX_TEXT_CHARS] for t in texts],
+        "model": spec.model,
+        "input_type": "query" if input_type == "query" else "document",
+    }
+    if spec.dim != VOYAGE_DEFAULT_DIM and spec.model.startswith(_VOYAGE_FLEX_PREFIXES):
+        body["output_dimension"] = spec.dim
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {_voyage_key()}"}
+    return VOYAGE_URL, body, headers
+
+
+def _build_openai_compatible(spec: ProfileSpec, texts: list[str], input_type: str | None):
+    if not spec.endpoint:
+        raise ValueError(f"profile {spec.id!r} has no endpoint")
+    url = f"{spec.endpoint.rstrip('/')}/v1/embeddings"
+    body = {"input": [t[:MAX_TEXT_CHARS] for t in texts], "model": spec.model}
+    headers = {"Content-Type": "application/json"}
+    key = _openai_compat_key()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return url, body, headers
+
+
+_BUILDERS = {
+    "gemini": _build_gemini,
+    "voyage": _build_voyage,
+    "openai-compatible": _build_openai_compatible,
+}
+
+
+def _parse_vectors(provider: str, payload: dict[str, Any]) -> list[list[float]]:
+    if provider == "gemini":
+        return [item["values"] for item in payload["embeddings"]]
+    # Voyage and the OpenAI shape: data[].embedding with an index; order by it.
+    items = sorted(payload["data"], key=lambda d: d.get("index", 0))
+    return [item["embedding"] for item in items]
+
+
+def _post_json(
+    url: str, body: dict[str, Any], headers: dict[str, str], *,
+    provider: str, retries: int, timeout: float, delay: float, transport=None,
+) -> dict[str, Any]:
+    """POST ``body`` with the retry ladder every provider shares: 429/5xx and
+    network errors back off ``delay`` doubling; anything else raises at once."""
     data = json.dumps(body).encode("utf-8")
     payload: dict[str, Any] = {}
     for attempt in range(retries + 1):
         _budget_take()
         try:
-            raw = (transport or _transport)(
-                url, data,
-                {"Content-Type": "application/json", "x-goog-api-key": key},
-                timeout,
-            )
+            raw = (transport or _transport)(url, data, headers, timeout)
             payload = json.loads(raw.decode("utf-8"))
             break
         except urllib.error.HTTPError as e:
-            _note_auth_failure(e.code)
+            _note_auth_failure(e.code, provider)
             err = e.read().decode("utf-8", errors="replace")
             if e.code in (429, 500, 502, 503, 504) and attempt < retries:
                 _log(f"embed HTTP {e.code}, retry in {delay:.0f}s")
@@ -588,13 +671,50 @@ def embed_batch(
                 delay *= 2
                 continue
             raise RuntimeError(f"embed network error after {retries} retries: {type(e).__name__}: {e}") from e
-    vecs = [item["values"] for item in payload["embeddings"]]
-    if len(vecs) != len(texts):
-        raise RuntimeError(f"embed returned {len(vecs)} vectors for {len(texts)} texts")
-    for v in vecs:
-        if len(v) != DIM:
-            raise RuntimeError(f"expected dim {DIM}, got {len(v)}")
-    return [_l2(v) for v in vecs]
+    return payload
+
+
+def embed_batch(
+    texts: list[str],
+    *,
+    profile: str = PROFILE_001,
+    retries: int = 4,
+    timeout: float = 120.0,
+    delay: float = 2.0,
+    transport=None,
+    input_type: str | None = None,
+) -> list[list[float]]:
+    """Embed texts under ``profile``'s provider; dim-checked, L2-normalized when
+    the profile says ``normalize='l2'`` (every shipped profile does).
+
+    ``texts`` must already include any v2 task prefixes — callers store the
+    unprefixed chunk_text separately. ``input_type`` ("query" | "document",
+    default document) is read only by Voyage, whose retrieval models embed the
+    two differently; Gemini uses text prefixes instead.
+    """
+    if not texts:
+        return []
+    spec = resolve_spec(profile)
+    builder = _BUILDERS.get(spec.provider)
+    if builder is None:
+        raise ValueError(f"profile {profile!r} has unsupported provider {spec.provider!r}")
+    step = _MAX_PER_REQUEST.get(spec.provider) or len(texts)
+    out: list[list[float]] = []
+    for i in range(0, len(texts), step):
+        part = texts[i:i + step]
+        url, body, headers = builder(spec, part, input_type)
+        payload = _post_json(
+            url, body, headers, provider=spec.provider,
+            retries=retries, timeout=timeout, delay=delay, transport=transport,
+        )
+        vecs = _parse_vectors(spec.provider, payload)
+        if len(vecs) != len(part):
+            raise RuntimeError(f"embed returned {len(vecs)} vectors for {len(part)} texts")
+        for v in vecs:
+            if len(v) != spec.dim:
+                raise RuntimeError(f"expected dim {spec.dim}, got {len(v)}")
+        out.extend(_l2(v) if spec.normalize == "l2" else [float(x) for x in v] for v in vecs)
+    return out
 
 
 def embed_one(
@@ -604,8 +724,91 @@ def embed_one(
     retries: int = 4,
     timeout: float = 120.0,
     delay: float = 2.0,
+    input_type: str | None = None,
 ) -> list[float]:
-    return embed_batch([text], profile=profile, retries=retries, timeout=timeout, delay=delay)[0]
+    extra = {"input_type": input_type} if input_type else {}
+    if input_type != "query":
+        return embed_batch(
+            [text], profile=profile, retries=retries, timeout=timeout, delay=delay, **extra,
+        )[0]
+    # The interactive path: how long the provider took is what the Embeddings
+    # screen shows beside each model (median over the last day), so a slow
+    # provider is visible before anyone picks it. Batch embedding is not timed.
+    t0 = time.monotonic()
+    try:
+        vec = embed_batch(
+            [text], profile=profile, retries=retries, timeout=timeout, delay=delay, **extra,
+        )[0]
+    except Exception:
+        _log_query_timing(profile, (time.monotonic() - t0) * 1000.0, False)
+        raise
+    _log_query_timing(profile, (time.monotonic() - t0) * 1000.0, True)
+    return vec
+
+
+# ---- query-embedding timing log -----------------------------------------------
+# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+
+TIMING_KEEP = 500          # lines kept after a trim
+TIMING_TRIM_AT = 1000      # trim when the file holds more than this many lines
+# A line is never shorter than ~50 bytes, so a file under this size cannot hold
+# TIMING_TRIM_AT lines: the line count (a read of the whole file) is skipped.
+_TIMING_COUNT_BYTES = 40_000
+
+
+def _timings_path() -> Path:
+    from khipu.paths import data_dir
+
+    return data_dir() / "embed_timings.jsonl"
+
+
+def _log_query_timing(profile: str, ms: float, ok: bool) -> None:
+    """Append ``{ts, profile, ms, ok}`` (``ts`` is epoch seconds) to
+    ``<data_dir>/embed_timings.jsonl``, keeping the last TIMING_KEEP lines once
+    the file passes TIMING_TRIM_AT. Never raises: a log we cannot write must not
+    fail a search."""
+    try:
+        path = _timings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            {"ts": round(time.time(), 3), "profile": profile, "ms": int(round(ms)), "ok": bool(ok)},
+            separators=(",", ":"),
+        )
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        if path.stat().st_size < _TIMING_COUNT_BYTES:
+            return
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) > TIMING_TRIM_AT:
+            tmp = path.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(lines[-TIMING_KEEP:]) + "\n", encoding="utf-8")
+            tmp.replace(path)
+    except Exception:  # noqa: BLE001 - observability only
+        pass
+
+
+def median_query_ms(profile: str | None = None, *, hours: float = 24.0) -> dict[str, int | None]:
+    """Median ms of successful query embeddings in the last ``hours``: for one
+    ``profile`` -> ``{profile: ms | None}``; for ``None`` -> every profile seen."""
+    import statistics
+
+    cutoff = time.time() - hours * 3600.0
+    by: dict[str, list[int]] = {}
+    try:
+        for raw in _timings_path().read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(raw)
+                if not row.get("ok") or float(row["ts"]) < cutoff:
+                    continue
+                by.setdefault(str(row["profile"]), []).append(int(row["ms"]))
+            except (ValueError, KeyError, TypeError):
+                continue
+    except OSError:
+        pass
+    if profile is not None:
+        vals = by.get(profile)
+        return {profile: int(statistics.median(vals)) if vals else None}
+    return {p: int(statistics.median(v)) for p, v in by.items()}
 
 
 def embed_batch_images(
@@ -903,8 +1106,9 @@ def _resolve_profile(cur, profile: str | None) -> str:
                 f"embedding profile {profile!r} not in embedding_profiles "
                 f"(apply 0005_gemini_embedding_2.sql if targeting {PROFILE_2})"
             )
-        # Refuse unknown model wiring even if a rogue row exists.
-        model_for_profile(profile)
+        # Refuse unknown provider wiring even if a rogue row exists; a profile
+        # that is not seeded is read through this cursor and remembered.
+        resolve_spec(profile, cur)
         return profile
     return _active_profile(cur)
 
@@ -994,7 +1198,14 @@ def _existing_hashes(cur, profile: str) -> dict[tuple[str, str, int], str]:
 def _upsert_chunks(
     cur, profile: str, rows: list[tuple[str, str, int, str, str, list[float]]]
 ) -> None:
+    spec = _profiles.cached_spec(profile)
     for kind, ref, idx, text, h, vec in rows:
+        # The column is untyped, so the database no longer rejects a vector of
+        # the wrong width; this is the check that does.
+        if spec is not None and len(vec) != spec.dim:
+            raise RuntimeError(
+                f"vector of length {len(vec)} for profile {profile} (dim {spec.dim})"
+            )
         cur.execute(
             """
             INSERT INTO memory_embeddings
@@ -1019,17 +1230,85 @@ def _api_texts(
     return [chunk for _, chunk in chunks]
 
 
+# ---- the memory space as a set of chunks (coverage, estimate) ---------------------
+# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+
+def memory_chunk_plan(cur) -> dict[tuple[str, str, int], tuple[str, int]]:
+    """Every chunk the default memory sweep embeds (episodes and topics, not
+    commitments or media): ``(kind, ref, chunk_idx) -> (content_hash, chars)``."""
+    plan: dict[tuple[str, str, int], tuple[str, int]] = {}
+    for k, ref, text, _title in _iter_sources(cur):
+        for i, chunk in _chunks_for(k, text):
+            plan[(k, ref, i)] = (_md5(chunk), len(chunk))
+    return plan
+
+
+def memory_gaps(cur, profile: str, plan=None):
+    """``(plan, missing, stale)`` for ``profile``: ``missing`` are plan keys with
+    no vector, ``stale`` are plan keys whose embedded hash differs from the
+    chunk's current hash (what ``backfill`` re-embeds)."""
+    if plan is None:
+        plan = memory_chunk_plan(cur)
+    have = _existing_hashes(cur, profile)
+    missing = [k for k in plan if k not in have]
+    stale = [k for k, (h, _c) in plan.items() if k in have and have[k] != h]
+    return plan, missing, stale
+
+
+def cov_pct(done: int, total: int) -> float:
+    """Never round a gap away: only true completeness reads 100."""
+    if not total:
+        return 0.0
+    if done >= total:
+        return 100.0
+    return min(99.9, int(1000 * done / total) / 10)
+
+
+def _ref_label(key: tuple[str, str, int]) -> str:
+    return f"{key[0]}:{key[1]}"
+
+
+def memory_coverage_fields(plan, missing, stale, *, sample: int = 5) -> dict[str, Any]:
+    """The chunk-level coverage block, with the same names a library's
+    ``status`` uses: chunks (total), embedded, missing, stale, pct,
+    sample_missing, sample_stale (distinct refs, at most ``sample``)."""
+    total = len(plan)
+    embedded = total - len(missing)
+
+    def refs(keys):
+        out: list[str] = []
+        for key in sorted(keys):
+            label = _ref_label(key)
+            if label not in out:
+                out.append(label)
+            if len(out) >= sample:
+                break
+        return out
+
+    return {
+        "chunks": total, "embedded": embedded, "missing": len(missing), "stale": len(stale),
+        "pct": cov_pct(max(0, embedded - len(stale)), total),
+        "sample_missing": refs(missing), "sample_stale": refs(stale),
+    }
+
+
 def backfill(
     *,
     kind: str | None = None,
     limit: int | None = None,
     dry_run: bool = False,
     profile: str | None = None,
+    job=None,
 ) -> dict[str, Any]:
     """Embed every missing / changed chunk under active or named profile. Idempotent.
 
     ``kind`` restricts the sweep; ``kind="commitment"`` is opt-in only (it is
-    never part of the default all-kinds pass — see ``_iter_sources``)."""
+    never part of the default all-kinds pass — see ``_iter_sources``).
+
+    ``job`` (``khipu.embed_jobs.Job``, optional) receives ``update(done, total,
+    failed)`` after every batch and is asked ``cancelled`` before each one: a
+    cancelled run finishes the batch in flight, stops, and returns
+    ``cancelled: True``."""
     from khipu.db import connect
 
     stats: dict[str, Any] = {
@@ -1098,7 +1377,13 @@ def backfill(
                 stats["would_embed"] = len(todo)
                 return stats
             stats["failed_chunks"] = 0
+            if job is not None:
+                job.update(0, len(todo), 0)
             for start in range(0, len(todo), BATCH):
+                if job is not None and job.cancelled:
+                    stats["cancelled"] = True
+                    _log("cancelled: stopping before the next batch")
+                    break
                 batch = todo[start : start + BATCH]
                 # todo rows: (kind, ref, idx, chunk, hash, title)
                 api = _api_texts(profile, [(title, chunk) for _k, _r, _i, chunk, _h, title in batch])
@@ -1130,6 +1415,8 @@ def backfill(
                     if "API key not found" in msg and not stats.get("embed_provider"):
                         stats["embed_provider"] = "missing key"
                     _log(f"batch failed ({type(exc).__name__}): {exc}; continuing")
+                    if job is not None:
+                        job.update(stats["embedded"], len(todo), stats["failed_chunks"])
                     if start + BATCH < len(todo):
                         time.sleep(BACKFILL_PAUSE_S)
                     continue
@@ -1141,10 +1428,18 @@ def backfill(
                 conn.commit()
                 stats["embedded"] += len(batch)
                 stats["batches"] += 1
+                if job is not None:
+                    job.update(stats["embedded"], len(todo), stats["failed_chunks"])
                 if stats["batches"] % 10 == 0:
                     _log(f"  {stats['embedded']}/{len(todo)}")
                 if start + BATCH < len(todo):
                     time.sleep(BACKFILL_PAUSE_S)
+            if stats["embedded"] and not stats.get("cancelled"):
+                # After the bulk insert, not before: building the graph once
+                # over finished rows is far cheaper than maintaining it per
+                # batch. A no-op once the profile's index exists.
+                _profiles.ensure_profile_index(cur, profile, "memory_embeddings", quiet=True)
+                conn.commit()
     return stats
 
 
@@ -1157,7 +1452,7 @@ def activate(profile: str, *, force: bool = False) -> dict[str, Any]:
     from khipu.db import connect
 
     profile = (profile or "").strip()
-    model_for_profile(profile)
+    spec = resolve_spec(profile)  # refuses an unknown id before any connection
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM embedding_profiles WHERE id = %s", (profile,))
@@ -1174,6 +1469,9 @@ def activate(profile: str, *, force: bool = False) -> dict[str, Any]:
                     f"{cov['topics']['missing']} topics still missing vectors "
                     f"(pass force=True to override)"
                 )
+            # The index first, so the pointer never flips onto a sequential scan.
+            _profiles.ensure_profile_index(
+                cur, profile, "memory_embeddings", dim=spec.dim, quiet=True)
             cur.execute("UPDATE embedding_profiles SET is_active = false WHERE is_active")
             cur.execute(
                 "UPDATE embedding_profiles SET is_active = true WHERE id = %s",
@@ -1349,6 +1647,10 @@ def _cosine_candidates(
             _t0 = time.monotonic()
             qvec, cache_state = _query_vec(cur, conn, profile, api_q)
             qlit = _vec_literal(qvec)
+            # memory_embeddings.embedding is an untyped vector (0026); the
+            # per-profile HNSW index is on embedding::vector(<dim>), so the
+            # query repeats that cast (and the profile predicate) to use it.
+            vcast = f"vector({len(qvec)})"
             if timing is not None:
                 timing["embed_ms"] = round((time.monotonic() - _t0) * 1000, 1)
                 timing["embed_cache"] = cache_state
@@ -1368,7 +1670,7 @@ def _cosine_candidates(
             cur.execute(
                 f"""
                 SELECT m.kind, m.ref, m.chunk_idx,
-                       1 - (m.embedding <=> %(q)s::vector) AS score,
+                       1 - (m.embedding::{vcast} <=> %(q)s::{vcast}) AS score,
                        left(m.chunk_text, %(fetch)s) AS snippet,
                        left(m.chunk_text, %(rank_fetch)s) AS rank_src,
                        CASE m.kind
@@ -1383,7 +1685,7 @@ def _cosine_candidates(
                 WHERE m.profile = %(p)s
                   AND m.kind != 'commitment'
                   AND (%(kind)s::text IS NULL OR m.kind = %(kind)s)
-                {filter_clause}    ORDER BY m.embedding <=> %(q)s::vector
+                {filter_clause}    ORDER BY m.embedding::{vcast} <=> %(q)s::{vcast}
                 LIMIT %(lim)s
                 """,
                 {"q": qlit, "p": profile, "kind": kind, "lim": fetch,
@@ -1434,6 +1736,9 @@ def semantic_search(
 
 _SEMANTIC_KINDS = ("episode", "topic", "media")
 _LITERAL_KINDS = ("episode", "topic", "node")
+# Libraries (Session C) are a search space of their own: accepted in every mode
+# but never part of the memory kind tuples above.
+LIBRARY_KIND = "library"
 
 
 def _episode_schema_flags(cur) -> dict[str, bool]:
@@ -1772,6 +2077,8 @@ def hybrid_search(
     harness: str | None = None,
     project_boost: str | None = None,
     tz: str | None = None,
+    source: str | None = None,
+    include_libraries: bool = True,
 ) -> dict[str, Any]:
     """Default retrieval engine (W2.1-W2.3): fused hybrid, or single-mode.
 
@@ -1810,6 +2117,23 @@ def hybrid_search(
     Nodes are excluded from hybrid/literal results by default (W2.2) — see
     ``cli._id_shaped`` / ``cli._literal_candidates``.
 
+    Libraries (Session C, ``khipu.library_search``): ``kind="library"`` searches
+    only the enabled library sources; ``kind=None`` adds them to the memory
+    kinds unless ``include_libraries=False``. ``source`` names one library and
+    implies ``kind="library"`` (any other kind with a source is refused). Each
+    distinct embedding profile among the libraries gets its own cosine list
+    (the query embedded once per profile) and the chunk/title ILIKE leg gets
+    one more; all of them join the same fusion, relevance gate and rerank. In
+    the default search (``kind=None``) a library row must be evidence on its
+    own (``relevance.is_evidence``: raw cosine at/above the floor, or enough
+    query tokens named) before it may enter fusion, so a corpus's nearest
+    neighbours never crowd memory; an explicit ``kind="library"`` keeps every
+    candidate and leaves rejection to the relevance gate. The metadata
+    filters other than ``source`` (project, session_id, harness, since/until)
+    are episode/timestamp-shaped, so any of them switches the library legs
+    off. The per-prompt recall lane passes ``include_libraries=False``: it has
+    a latency budget and must never wait on a second embedding provider.
+
     The payload also carries ``timing`` (phase 5 addendum): ``embed_ms``,
     ``cosine_ms``, ``literal_ms``, ``lexical_ms``, ``fusion_ms``, ``enrich_ms``
     and ``total_ms``, all milliseconds. Each row an episode produced carries
@@ -1826,10 +2150,17 @@ def hybrid_search(
     mode = (mode or "hybrid").strip().lower()
     if mode not in ("hybrid", "literal", "semantic"):
         raise ValueError("mode must be 'hybrid', 'literal', or 'semantic'")
+    source = (source or "").strip() or None
+    if source is not None:
+        if kind not in (None, LIBRARY_KIND):
+            raise ValueError("source applies to kind 'library' only")
+        kind = LIBRARY_KIND
     if kind is not None:
-        allowed = _SEMANTIC_KINDS if mode == "semantic" else _LITERAL_KINDS
+        allowed = (_SEMANTIC_KINDS if mode == "semantic" else _LITERAL_KINDS) + (LIBRARY_KIND,)
         if kind not in allowed:
             raise ValueError(f"kind must be one of {allowed}")
+        if kind == LIBRARY_KIND and not include_libraries:
+            raise ValueError("kind 'library' conflicts with include_libraries=False")
 
     limit = max(1, int(limit))
     # Every leg is timed and reported in the payload's `timing` block (phase 5
@@ -1847,6 +2178,17 @@ def hybrid_search(
         project=project, since=since, until=until,
         session_id=session_id, harness=harness,
     )
+
+    degraded_legs: list[str] = []
+    # Library legs (Session C): only the default and kind="library" searches, only
+    # when the caller allows them, and never under an episode/timestamp-shaped
+    # filter (a library row has neither). ``source`` was folded into ``kind``.
+    want_library = (
+        include_libraries and kind in (None, LIBRARY_KIND) and not filters.active
+    )
+    lib_cos_lists: list[list[dict[str, Any]]] = []
+    lib_literal: list[dict[str, Any]] = []
+    lib_names: list[str] = []
 
     cosine_rows: list[dict[str, Any]] = []
     # kind="node" (only valid for hybrid/literal, never semantic — checked
@@ -1879,7 +2221,7 @@ def hybrid_search(
     with try_hub_connect() as conn:
         with conn.cursor() as cur:
             literal_rows: list[dict[str, Any]] = []
-            if mode in ("hybrid", "literal"):
+            if mode in ("hybrid", "literal") and kind != LIBRARY_KIND:
                 literal_kind = kind if kind in _LITERAL_KINDS else None
                 _t = time.monotonic()
                 literal_rows = _literal_candidates(
@@ -1887,27 +2229,39 @@ def hybrid_search(
                 )
                 timing["literal_ms"] = round((time.monotonic() - _t) * 1000, 1)
 
+            if want_library:
+                from khipu import library_search as _ls
+
+                lib_cos_lists, lib_literal, lib_names = _ls.library_candidates(
+                    conn, cur, query, mode=mode, kind=kind, source=source,
+                    oversample=oversample, timing=timing, degraded_legs=degraded_legs,
+                )
+
             _t = time.monotonic()
             lists: list[list[dict[str, Any]]] = []
             # R4: the query's own token count matters for confidence below
             # even in modes/branches with no cosine leg at all.
             tokens = search_tokens(query)
-            if cosine_rows:
+            # Memory cosine, then one cosine list per library profile: each is
+            # its own ranked list in the fusion.
+            cos_lists = [lst for lst in [cosine_rows, *lib_cos_lists] if lst]
+            if cos_lists:
                 # Raw cosine (R4): fuse_ranked_lists overwrites `score` with
                 # the fused RRF value below, which is rank-derived and not a
                 # usable confidence signal on its own (a gibberish query and
                 # a real hit can land in the same band). Stash the real
                 # similarity now, on the same objects the fused output is
                 # copied from, so it survives fusion/filtering/enrichment.
-                for r in cosine_rows:
-                    r["cosine"] = r.get("score")
-                lists.append(list(cosine_rows))
+                for lst in cos_lists:
+                    for r in lst:
+                        r["cosine"] = r.get("score")
+                    lists.append(list(lst))
                 if tokens:
                     union: dict[tuple[str, str], dict[str, Any]] = {
-                        (r["kind"], str(r["id"])): r for r in cosine_rows
+                        (r["kind"], str(r["id"])): r for lst in cos_lists for r in lst
                     }
                     if mode == "hybrid":
-                        for r in literal_rows:
+                        for r in [*literal_rows, *lib_literal]:
                             union.setdefault((r["kind"], str(r["id"])), r)
                     lex_rows = sorted(
                         union.values(),
@@ -1916,6 +2270,8 @@ def hybrid_search(
                     lists.append(lex_rows)
             if literal_rows and mode in ("hybrid", "literal"):
                 lists.append(list(literal_rows))
+            if lib_literal and mode in ("hybrid", "literal"):
+                lists.append(list(lib_literal))
 
             # A row can legitimately appear in more than one list (e.g. a
             # literal match that is ALSO in lex_rows via the cosine/literal
@@ -1941,6 +2297,24 @@ def hybrid_search(
                         r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)
                     r.pop("rank_text", None)
             timing["lexical_ms"] = round((time.monotonic() - _t) * 1000, 1)
+            if lib_names and kind is None:
+                # Default search only: a library row must be evidence by itself
+                # before it can enter fusion (see the docstring), so a big
+                # corpus's nearest neighbours cannot crowd out memory.
+                try:
+                    from khipu import relevance as _rel
+
+                    _floor, _need = _rel.cosine_floor(), _rel.need(len(tokens))
+                    _by_profile = _rel.cosine_floor_by_profile()
+                    lists = [
+                        [r for r in lst
+                         if r.get("kind") != LIBRARY_KIND
+                         or _rel.is_evidence(r, _floor, _need, _by_profile)]
+                        for lst in lists
+                    ]
+                    lists = [lst for lst in lists if lst]
+                except Exception as exc:  # noqa: BLE001 - a policy failure must not sink the search
+                    timing["library_evidence_error"] = str(exc)[:120]
             if not lists:
                 from khipu.recency import HALF_LIFE_DAYS
 
@@ -1950,6 +2324,10 @@ def hybrid_search(
                                        "ranking": {"recency_half_life_days": HALF_LIFE_DAYS}}
                 if degraded:
                     out["degraded"] = degraded
+                if degraded_legs:
+                    out["degraded_legs"] = degraded_legs
+                if lib_names or kind == LIBRARY_KIND:
+                    out["libraries"] = lib_names
                 return out
             _t = time.monotonic()
             fused = fuse_ranked_lists(lists, limit=oversample)
@@ -1960,7 +2338,6 @@ def hybrid_search(
             # deadline, dropped entirely (never partially) on a miss — named
             # in `degraded_legs`. Seeds are the top 5 rows of `fused` exactly
             # as fused above, before any filter/enrichment pass touches it.
-            degraded_legs: list[str] = []
             from khipu import features as _features
 
             if _features.enabled("graph_candidates"):
@@ -2105,6 +2482,8 @@ def hybrid_search(
         out["degraded"] = degraded
     if degraded_legs:
         out["degraded_legs"] = degraded_legs
+    if lib_names or kind == LIBRARY_KIND:
+        out["libraries"] = lib_names
     if interpretation:
         out["time_interpretation"] = interpretation
     if rerank_info is not None:
@@ -2234,8 +2613,13 @@ def topics_embed_lag_minutes(*, profile: str | None = None) -> dict[str, Any]:
     }
 
 
-def coverage(*, profile: str | None = None) -> dict[str, Any]:
-    """Per-kind coverage for active or named profile — the 'status UI that can't lie'."""
+def coverage(*, profile: str | None = None, detail: bool = False) -> dict[str, Any]:
+    """Per-kind coverage for active or named profile — the 'status UI that can't lie'.
+
+    ``detail=True`` adds the chunk-level block (``chunks``, ``embedded``,
+    ``missing``, ``stale``, ``pct``, ``sample_missing``, ``sample_stale`` — the
+    names a library's ``status`` uses). It chunks every episode and topic, so
+    ``embed status`` asks for it and doctor / activate do not."""
     from khipu.db import connect
 
     with connect() as conn:
@@ -2306,6 +2690,10 @@ def coverage(*, profile: str | None = None) -> dict[str, Any]:
             active_row = cur.fetchone()
             active = active_row[0] if active_row else None
             qcache = query_cache_status(cur)
+            chunk_block: dict[str, Any] = {}
+            if detail:
+                plan, missing, stale = memory_gaps(cur, profile)
+                chunk_block = memory_coverage_fields(plan, missing, stale)
     e = by.get("episode", {"refs": 0, "chunks": 0})
     t = by.get("topic", {"refs": 0, "chunks": 0})
     m = by.get("media", {"refs": 0, "chunks": 0})
@@ -2340,6 +2728,7 @@ def coverage(*, profile: str | None = None) -> dict[str, Any]:
         # Informational: neither gates activate() nor doctor.
         "query_cache": qcache,
         "budget": budget_status(),
+        **chunk_block,
     }
 
 

@@ -424,7 +424,42 @@ def _embed_backfill() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
         _nightly_log(f"[khipu-embed] backfill skipped: {type(exc).__name__}: {exc}")
         out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    # Independent of the memory sweep: a memory-provider failure must not
+    # leave the libraries (a different provider, perhaps) unswept.
+    lib = _library_backfill()
+    if lib is not None:
+        out["library"] = lib
     return out
+
+
+def _library_backfill() -> dict[str, Any] | None:
+    """The same sweep for every enabled library: scan (no model), then embed the
+    missing chunks under each library's own profile, against the same daily
+    embed budget. Rides inside the embed_backfill step so the step set is
+    unchanged; its receipt lands under ``library`` in that step's counts and in
+    its own log line. Fail-open, and never flips the memory sweep's ``ok``.
+    None when no hub is configured (nothing to sweep)."""
+    try:
+        from khipu.db import dsn_configured
+
+        if not dsn_configured():
+            return None
+        from khipu import library
+
+        res = library.nightly()
+        brief = [
+            {k: r[k] for k in ("name", "added", "updated", "removed", "embedded",
+                               "failed", "remaining", "error", "skipped") if k in r}
+            for r in res.get("results", [])
+        ]
+        _nightly_log(
+            f"[khipu-library] backfill {'ok' if res.get('ok') else 'partial'} "
+            f"{json.dumps({'libraries': res.get('libraries'), 'results': brief}, default=str)[:400]}"
+        )
+        return res
+    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
+        _nightly_log(f"[khipu-library] backfill skipped: {type(exc).__name__}: {exc}")
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _prune_query_cache() -> dict[str, Any]:

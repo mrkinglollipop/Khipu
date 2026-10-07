@@ -13,8 +13,9 @@
 #
 # Any PostgreSQL on PATH will do (initdb, pg_ctl, psql). Khipu's hub needs
 # pgvector and property graphs; a stock server has neither, so the statements
-# that need them fail one by one and are counted, and the two tables that carry
-# vectors are replaced by stand-ins whose embedding column is real[]. Everything
+# that need them fail one by one and are counted, and the tables that carry
+# vectors (memory_embeddings, memory_query_cache, library_embeddings) are
+# replaced by stand-ins whose embedding column is real[]. Everything
 # relational is real. Nothing here can rank by similarity: this verifies
 # statements, constraints and migrations, not search quality.
 set -euo pipefail
@@ -67,6 +68,17 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
     PRIMARY KEY (profile, kind, ref, chunk_idx)
 );
 CREATE INDEX IF NOT EXISTS idx_memory_embeddings_kind_ref ON memory_embeddings (kind, ref);
+CREATE TABLE IF NOT EXISTS library_embeddings (
+    profile     TEXT NOT NULL REFERENCES embedding_profiles(id),
+    document    INTEGER NOT NULL,
+    chunk_idx   INTEGER NOT NULL,
+    embedding   real[] NOT NULL,
+    built_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (profile, document, chunk_idx),
+    FOREIGN KEY (document, chunk_idx)
+        REFERENCES library_chunks (document, chunk_idx) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_library_embeddings_doc ON library_embeddings (document, chunk_idx);
 CREATE TABLE IF NOT EXISTS memory_query_cache (
     profile       TEXT NOT NULL REFERENCES embedding_profiles(id),
     query_hash    TEXT NOT NULL,

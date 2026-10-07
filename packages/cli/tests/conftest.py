@@ -59,7 +59,7 @@ if os.environ.get("KHIPU_LIVE_TESTS") != "1":
     _KEEP = {"KHIPU_KEYCHAIN", "KHIPU_LIVE_TESTS", "KHIPU_SCRATCH_DSN"}
     for _name in [n for n in os.environ if n.startswith(("KHIPU_", "ALZY_")) and n not in _KEEP]:
         del os.environ[_name]
-    for _name in ("GEMINI_API_KEY", "GROK_HOOK_NAME", "GROK_HOOK_EVENT",
+    for _name in ("GEMINI_API_KEY", "VOYAGE_API_KEY", "GROK_HOOK_NAME", "GROK_HOOK_EVENT",
                   "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_SESSION_ID"):
         os.environ.pop(_name, None)
 
@@ -89,11 +89,14 @@ def _reset_process_level_caches():
     # The recall service keeps the replica's matrix, the API key and the embed
     # transport for the life of its process. A test process is one long process
     # running many fake worlds, so none of it may carry across tests.
-    from khipu import embed, hub_snapshot
+    from khipu import embed, hub_snapshot, profiles
 
     def _clear():
         hub_snapshot._MATRIX_CACHE.clear()
         embed._KEY_CACHE.clear()
+        embed._VOYAGE_KEY_CACHE.clear()
+        embed._OPENAI_KEY_CACHE.clear()
+        profiles.clear_learned()
         embed.set_transport(None)
 
     _clear()

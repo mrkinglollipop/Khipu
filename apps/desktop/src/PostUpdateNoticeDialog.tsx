@@ -7,7 +7,7 @@ type Props = {
   onDismiss: () => void;
   onOpenIntegrations: () => void;
   onOpenHome: () => void;
-  onOpenSettings: () => void;
+  onOpenSettings: (section?: PostUpdateNotice["settingsSection"]) => void;
 };
 
 /** One-time notice shown after an in-app update, when `postUpdateNotices.ts`
@@ -84,7 +84,7 @@ export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations, 
               type="button"
               className="primary"
               onClick={() => {
-                onOpenSettings();
+                onOpenSettings(notice.settingsSection);
                 close();
               }}
             >

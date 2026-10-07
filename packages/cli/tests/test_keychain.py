@@ -298,3 +298,64 @@ class SecretTransportTest(unittest.TestCase):
             for bad in ("abc\ndef", "abc\rdef"):
                 with self.subTest(bad=bad), self.assertRaises(ValueError):
                     kc.set_password("gemini_api_key", bad)
+
+
+class VoyageKeyTest(unittest.TestCase):
+    """voyage_api_key resolves like the Gemini key: env, then Keychain, then an
+    optional file named by KHIPU_VOYAGE_KEY_FILE. Presence is reported; the
+    value never is."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_env_wins_over_the_keychain(self):
+        with mock.patch.dict(os.environ, {"VOYAGE_API_KEY": " from-env "}), \
+             mock.patch.object(kc, "get_voyage_key", return_value="from-kc") as g:
+            self.assertEqual(kc.resolve_voyage_key(), "from-env")
+        g.assert_not_called()
+
+    def test_keychain_then_file(self):
+        f = self.root / "voyage.txt"
+        f.write_text("from-file\n")
+        with mock.patch.dict(os.environ, {"VOYAGE_API_KEY": ""}):
+            with mock.patch.object(kc, "get_voyage_key", return_value="from-kc"):
+                self.assertEqual(kc.resolve_voyage_key(key_file=f), "from-kc")
+            with mock.patch.object(kc, "get_voyage_key", return_value=None):
+                self.assertEqual(kc.resolve_voyage_key(key_file=f), "from-file")
+
+    def test_the_file_path_comes_from_the_environment(self):
+        f = self.root / "voyage.txt"
+        f.write_text("env-file-key")
+        with mock.patch.dict(os.environ, {"VOYAGE_API_KEY": "", "KHIPU_VOYAGE_KEY_FILE": str(f)}), \
+             mock.patch.object(kc, "get_voyage_key", return_value=None):
+            self.assertEqual(kc.resolve_voyage_key(), "env-file-key")
+
+    def test_no_key_anywhere_names_the_fix_without_a_value(self):
+        with mock.patch.dict(os.environ, {"VOYAGE_API_KEY": "", "KHIPU_VOYAGE_KEY_FILE": ""}), \
+             mock.patch.object(kc, "get_voyage_key", return_value=None):
+            with self.assertRaises(RuntimeError) as ctx:
+                kc.resolve_voyage_key()
+        self.assertIn("voyage_api_key", str(ctx.exception))
+
+    def test_the_account_is_stored_under_the_khipu_service(self):
+        with mock.patch.object(kc, "set_password") as sp:
+            kc.set_voyage_key("  pa-k \n")
+        sp.assert_called_once_with("voyage_api_key", "pa-k")
+
+    def test_secrets_status_reports_presence_only(self):
+        data = self.root / "data"
+        data.mkdir()
+        with mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(data), "VOYAGE_API_KEY": "pa-REAL",
+                                          "KHIPU_GEMINI_KEY_FILE": str(self.root / "none")}), \
+             mock.patch.object(kc, "get_dsn", return_value=None), \
+             mock.patch.object(kc, "get_gemini_key", return_value=None), \
+             mock.patch.object(kc, "get_openai_compat_key", return_value=None), \
+             mock.patch.object(kc, "get_voyage_key", return_value="pa-REAL-KC"), \
+             mock.patch.object(kc, "keychain_available", return_value=True):
+            st = kc.secrets_status()
+        self.assertTrue(st["voyage_in_keychain"])
+        self.assertTrue(st["voyage_env"])
+        self.assertFalse(st["voyage_file_present"])
+        self.assertNotIn("pa-REAL", repr(st))

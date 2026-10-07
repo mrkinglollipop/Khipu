@@ -164,13 +164,19 @@ TOOLS: list[dict] = [
             "fairness only backfills the tail if a kind is entirely absent from "
             "the top results. Graph nodes are excluded from hybrid/literal "
             "results unless kind='node' or the query looks id-shaped (contains "
-            "':' or '__'). If no embedding profile is active, hybrid degrades to "
+            "':' or '__'). Libraries (folders of books and documents indexed as "
+            "their own search space) are searched with kind='library' and "
+            "included in the default search; a hit is "
+            "{kind:'library', id:'library:<name>:<doc>#<chunk>', label:'Author, "
+            "Title', snippet, path, source}, and `source` restricts to one "
+            "library. If no embedding profile is active, hybrid degrades to "
             "literal + token overlap only and the payload carries "
             "degraded='no-embedding'. mode='literal' is the old ILIKE-only "
             "behaviour — use it for exact strings, ids, hashes, or error text. "
             "mode='semantic' (same as the legacy semantic=true) is cosine + "
             "token-overlap only, no literal list. Filters apply on every mode: "
-            "kind (episode/topic/node, or episode/topic/media for semantic), "
+            "kind (episode/topic/node/library, or episode/topic/media/library for "
+            "semantic), "
             "project (matches episode project or scope), since/until (ISO date "
             "or relative like '7d'/'24h'), session_id (prefix match), harness "
             "(prefix of session_id before the colon). Returns JSON rows of "
@@ -187,7 +193,7 @@ TOOLS: list[dict] = [
             "from them across the whole result set — treat 'none' as "
             "'nothing found', not as a low-ranked hit. Tombstoned topics are "
             "excluded. Snippets are word-boundary teasers; call khipu_get for "
-            "the full row."
+            "the full row (for a library hit, the chunk with its neighbours)."
         ),
         "inputSchema": {
             "type": "object",
@@ -218,8 +224,15 @@ TOOLS: list[dict] = [
                 "kind": {
                     "type": "string",
                     "description": (
-                        "hybrid/literal: 'episode', 'topic', or 'node'. "
-                        "semantic: 'episode', 'topic', or 'media'."
+                        "hybrid/literal: 'episode', 'topic', 'node', or 'library'. "
+                        "semantic: 'episode', 'topic', 'media', or 'library'."
+                    ),
+                },
+                "source": {
+                    "type": "string",
+                    "description": (
+                        "Library name (restricts a library search to that "
+                        "library; implies kind='library')"
                     ),
                 },
                 "project": {
@@ -261,7 +274,11 @@ TOOLS: list[dict] = [
         "description": (
             "Load a search hit by id. Episodes: full summary, decisions, "
             "preferences, topics (not the capture raw blob). Topics: full "
-            "page body. Media: path/sha256/mime. Search snippets are teasers; "
+            "page body. Media: path/sha256/mime. Library ids "
+            "(library:<name>:<doc>#<chunk>): the chunk text, its document "
+            "(title, author, tags, rel_path, root) and the previous/next chunk "
+            "text so you can read around a hit; library:<name>:<doc> returns the "
+            "document and its chunk count. Search snippets are teasers; "
             "use this instead of guessing from a clipped line."
         ),
         "inputSchema": {
@@ -270,13 +287,14 @@ TOOLS: list[dict] = [
                 "id": {
                     "type": "string",
                     "description": (
-                        "Episode id (digits), topic slug, or media_assets id"
+                        "Episode id (digits), topic slug, media_assets id, or "
+                        "library id (library:<name>:<doc>[#<chunk>])"
                     ),
                 },
                 "kind": {
                     "type": "string",
                     "description": (
-                        "Optional: 'episode', 'topic', or 'media'. "
+                        "Optional: 'episode', 'topic', 'media', or 'library'. "
                         "Inferred from id when omitted."
                     ),
                 },
@@ -634,9 +652,15 @@ def _tool_search(args: dict) -> dict:
     if mode not in ("hybrid", "literal", "semantic"):
         raise ValueError("mode must be 'hybrid', 'literal', or 'semantic'")
     kind = args.get("kind") or None
-    allowed_kinds = ("episode", "topic", "media") if mode == "semantic" else ("episode", "topic", "node")
+    source = (args.get("source") or "").strip() or None
+    allowed_kinds = (
+        ("episode", "topic", "media", "library") if mode == "semantic"
+        else ("episode", "topic", "node", "library")
+    )
     if kind not in (None, *allowed_kinds):
         raise ValueError(f"kind must be one of {allowed_kinds}")
+    if source and kind not in (None, "library"):
+        raise ValueError("source applies to kind 'library' only")
     project = args.get("project") or None
     since = args.get("since") or None
     until = args.get("until") or None
@@ -650,11 +674,15 @@ def _tool_search(args: dict) -> dict:
         payload = hybrid_search(
             query, limit=max(1, limit), mode=mode, kind=kind, project=project,
             since=since, until=until, session_id=session_id, harness=harness,
-            tz=tz,
+            tz=tz, source=source,
         )
     except Exception as exc:
         if not hub_connection_failed(exc):
             raise
+        if source or kind == "library":
+            raise ValueError(
+                "library search needs the hub; the offline snapshot holds no libraries"
+            ) from exc
         payload = search_stale_payload(
             query, max(1, limit), semantic=(mode == "semantic"), kind=kind,
             since=since, until=until, project=project, session_id=session_id,
@@ -663,7 +691,7 @@ def _tool_search(args: dict) -> dict:
     query_log.log_query(
         query, mode=mode,
         filters={"kind": kind, "project": project, "since": since, "until": until,
-                 "session_id": session_id, "harness": harness},
+                 "session_id": session_id, "harness": harness, "source": source},
         result_count=len(payload.get("results") or []), top=payload.get("results") or [],
         # The gateway host is public: it keeps a hash of the query, never the text.
         redact=_GATEWAY_ACTIVE or os.environ.get(GATEWAY_ACTIVE_ENV) == "1",
@@ -677,9 +705,24 @@ def _tool_get(args: dict) -> dict:
     if not ident:
         raise ValueError("id is required")
     kind = (args.get("kind") or "").strip().lower() or None
-    if kind not in (None, "episode", "topic", "media"):
-        raise ValueError("kind must be 'episode', 'topic', or 'media'")
+    if kind not in (None, "episode", "topic", "media", "library"):
+        raise ValueError("kind must be 'episode', 'topic', 'media', or 'library'")
     _ensure_path()
+    from khipu import library_search
+
+    if kind == "library" or (kind is None and library_search.is_library_id(ident)):
+        try:
+            return library_search.get(ident)
+        except ValueError:
+            raise
+        except Exception as exc:
+            from khipu.hub_snapshot import hub_connection_failed
+
+            if hub_connection_failed(exc):
+                raise ValueError(
+                    "library text needs the hub; the offline snapshot holds no libraries"
+                ) from exc
+            raise
     from khipu.hub_snapshot import (
         episode_detail_snapshot,
         hub_connection_failed,

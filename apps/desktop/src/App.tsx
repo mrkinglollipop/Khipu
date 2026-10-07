@@ -46,9 +46,9 @@ import { WorkingBanner } from "./WorkingBanner";
 import { FeedbackForm } from "./FeedbackForm";
 import { PostUpdateNoticeDialog } from "./PostUpdateNoticeDialog";
 import { OptionalFeatures } from "./OptionalFeatures";
+import { EmbeddingsPanel } from "./EmbeddingsPanel";
 import {
   CaptureTuningCard,
-  EmbedProfilesCard,
   GatewayUrlCard,
   JobsCard,
   PathOverridesCard,
@@ -193,7 +193,7 @@ const DEGRADED_COPY: Record<string, { title: string; hint: string }> = {
   },
   "no-embedding": {
     title: "Showing exact-word matches only",
-    hint: "No search index profile is active, so search by meaning is off. Settings › Search index shows the state.",
+    hint: "No search index profile is active, so search by meaning is off. Settings › Embeddings shows the state.",
   },
 };
 
@@ -460,7 +460,7 @@ const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
   ["database", "Database"],
   ["capture", "Capture & models"],
   ["features", "Optional features"],
-  ["index", "Search index"],
+  ["index", "Embeddings"],
   ["data", "Data & backups"],
   ["another-mac", "Another Mac"],
   ["components", "Components"],
@@ -474,14 +474,6 @@ const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
  *  an input that would not be saved anywhere. */
 const CAPTURE_MIN_TURNS = 5;
 const CAPTURE_MIN_MINUTES = 20;
-
-/** The coverage rows `khipu doctor` reports, in the order they matter. */
-const EMBED_KINDS: ReadonlyArray<readonly [string, string]> = [
-  ["episodes", "Sessions"],
-  ["topics", "Topic pages"],
-  ["commitments", "Owed items"],
-  ["media", "Images"],
-] as const;
 
 /** `commitments.kind` values, in the mocks' words. Anything the engine adds
  *  later falls through to its own raw kind rather than being hidden. */
@@ -1015,14 +1007,6 @@ export default function App() {
     string,
     { total?: number; embedded?: number; missing?: number; pct?: number }
   > | null>(null);
-  // `coverage()` also reports today's embedding API budget (local to this
-  // Mac) and the hub's query-vector cache; both are informational.
-  const [embedBudget, setEmbedBudget] = useState<{
-    calls?: number; cap?: number; remaining?: number; exhausted?: boolean;
-  } | null>(null);
-  const [queryCache, setQueryCache] = useState<{
-    available?: boolean; rows?: number; hits?: number;
-  } | null>(null);
   // `coverage()` reports the active index profile alongside the per-kind
   // rows; Settings names it rather than saying "the index" and leaving the
   // person to guess which one.
@@ -1386,18 +1370,6 @@ export default function App() {
       setEmbedCoverage(cov ?? null);
       setEmbedActiveProfile(
         typeof cov?.active_profile === "string" ? cov.active_profile : null,
-      );
-      const budget = cov?.budget;
-      setEmbedBudget(
-        budget && typeof budget === "object" && !Array.isArray(budget)
-          ? (budget as { calls?: number; cap?: number; remaining?: number; exhausted?: boolean })
-          : null,
-      );
-      const qc = cov?.query_cache;
-      setQueryCache(
-        qc && typeof qc === "object" && !Array.isArray(qc)
-          ? (qc as { available?: boolean; rows?: number; hits?: number })
-          : null,
       );
       setBackupHealth(
         (parsed as { backup?: { ok?: boolean; freshest_backup_age_seconds?: number } }).backup ?? null,
@@ -2217,9 +2189,6 @@ export default function App() {
   const moveRemaining = Array.isArray(moveResult?.remaining) ? (moveResult?.remaining as string[]) : [];
   // "Index now" and "Restore" both do something a person cannot undo with the
   // same button, so each goes through a confirm Dialog.
-  const [indexBusy, setIndexBusy] = useState(false);
-  const [indexMsg, setIndexMsg] = useState<string | null>(null);
-  const [indexConfirm, setIndexConfirm] = useState(false);
   const [importConfirm, setImportConfirm] = useState(false);
   const [hubSnapBusy, setHubSnapBusy] = useState(false);
   const [hubSnapshotHealth, setHubSnapshotHealth] = useState<{
@@ -2655,31 +2624,6 @@ export default function App() {
       setActionBusy(false);
     }
   }, [importSource, loadPaths]);
-
-  /** "Index now" — `khipu embed backfill`, through its own dedicated Tauri
-   *  command with a FIXED argv. `embed` is deliberately not in the webview's
-   *  subcommand allowlist (it spends money and deletes vectors), so the
-   *  button gets one exact command and no arguments of its own. */
-  const runIndexNow = useCallback(async () => {
-    setIndexBusy(true);
-    setIndexMsg(null);
-    try {
-      const raw = await invoke<string>("khipu_embed_backfill");
-      const parsed = parseJson(raw) as
-        | { embedded?: number; chunks?: number; error?: string }
-        | null;
-      setIndexMsg(
-        parsed && typeof parsed === "object"
-          ? `Indexed ${parsed.embedded ?? 0} item(s), ${parsed.chunks ?? 0} chunk(s).`
-          : prettyJson(raw),
-      );
-      await loadDoctor(true);
-    } catch (e) {
-      setIndexMsg(String(e));
-    } finally {
-      setIndexBusy(false);
-    }
-  }, [loadDoctor]);
 
   /** What Advanced shows as "raw configuration": only values this app already
    *  holds, never a fresh read that could disagree with the screen above it. */
@@ -4845,7 +4789,9 @@ export default function App() {
                         <p className="muted">
                           Session summaries follow this card (Gemini cloud or a
                           local OpenAI-compatible endpoint). The monthly topic
-                          pass runs its own model and is not switched here.
+                          pass runs its own model and is not switched here. The
+                          model that searches by meaning is chosen under
+                          Embeddings.
                         </p>
                         {models.models_error ? (
                           <Callout tone="err" title="The stored models setting could not be read">
@@ -4855,10 +4801,7 @@ export default function App() {
                         ) : null}
 
                         {(
-                          [
-                            ["synth", "Session summaries"],
-                            ["embed", "Search index"],
-                          ] as const
+                          [["synth", "Session summaries"]] as const
                         ).map(([role, label]) => {
                           const row = models[role];
                           return (
@@ -4898,22 +4841,12 @@ export default function App() {
                                   onChange={(e) =>
                                     updateModelRole(role, { model_id: e.target.value })
                                   }
-                                  placeholder={
-                                    role === "embed"
-                                      ? "search uses the active index profile"
-                                      : "model id"
-                                  }
+                                  placeholder="model id"
                                 />
                               </div>
                             </div>
                           );
                         })}
-
-                        <p className="muted">
-                          The search-index model is saved here, but search still
-                          reads the active index profile — the one named under
-                          Search index — until a profile switch is supported.
-                        </p>
 
                         <div className="toolbar">
                           <button
@@ -5031,87 +4964,7 @@ export default function App() {
                 ) : null}
 
                 {settingsSection === "index" ? (
-                  <>
-                    <div className="section-card">
-                      <div className="section-head">
-                        Search index
-                        <span className="spacer" />
-                        {embedActiveProfile ? (
-                          <Tag tone="accent">{embedActiveProfile}</Tag>
-                        ) : null}
-                      </div>
-                      <div className="section-body">
-                        <p className="muted">
-                          Search by meaning reads this index. It is rebuilt every
-                          night; anything not indexed yet is still findable by its
-                          exact words.
-                        </p>
-                        {embedCoverage ? (
-                          <div className="rows">
-                            {EMBED_KINDS.map(([key, label]) => {
-                              const row = embedCoverage[key];
-                              if (!row || typeof row.total !== "number") return null;
-                              return (
-                                <div key={key} className="row-item">
-                                  <span className="row-main">{label}</span>
-                                  <span className="row-meta">
-                                    {row.embedded ?? 0} of {row.total} indexed
-                                    {row.missing ? ` · ${row.missing} waiting` : ""}
-                                  </span>
-                                </div>
-                              );
-                            })}
-                            {embedBudget && typeof embedBudget.cap === "number" ? (
-                              <div className="row-item">
-                                <span className="row-main">Embedding calls today</span>
-                                <span className="row-meta">
-                                  {embedBudget.calls ?? 0}
-                                  {embedBudget.cap > 0 ? ` of a ${embedBudget.cap} runaway ceiling` : " · no ceiling"}
-                                  {embedBudget.exhausted
-                                    ? " · ceiling reached, meaning search resumes at midnight UTC"
-                                    : " · this Mac, resets at midnight UTC"}
-                                </span>
-                              </div>
-                            ) : null}
-                            {queryCache?.available ? (
-                              <div className="row-item">
-                                <span className="row-main">Cached questions</span>
-                                <span className="row-meta">
-                                  {queryCache.rows ?? 0} stored · reused {queryCache.hits ?? 0}{" "}
-                                  {(queryCache.hits ?? 0) === 1 ? "time" : "times"} · unused ones
-                                  expire after 30 days
-                                </span>
-                              </div>
-                            ) : null}
-                          </div>
-                        ) : (
-                          <p className="muted">
-                            Coverage comes from the health report — open Home once
-                            to fill it in.
-                          </p>
-                        )}
-                        <div className="toolbar">
-                          <button
-                            type="button"
-                            className="primary"
-                            disabled={indexBusy}
-                            onClick={() => setIndexConfirm(true)}
-                          >
-                            {indexBusy ? (
-                              <Loader2 size={14} className="spin" aria-hidden />
-                            ) : null}
-                            Index now
-                          </button>
-                          <span className="meta">
-                            Indexes everything that is missing or changed, using
-                            the Gemini key above.
-                          </span>
-                        </div>
-                        {indexMsg ? <pre className="code">{indexMsg}</pre> : null}
-                      </div>
-                    </div>
-                    <EmbedProfilesCard active={tab === "settings" && settingsSection === "index"} />
-                  </>
+                  <EmbeddingsPanel active={tab === "settings" && settingsSection === "index"} />
                 ) : null}
 
                 {settingsSection === "data" ? (
@@ -5529,8 +5382,8 @@ export default function App() {
         onDismiss={() => setPostUpdateNotice(null)}
         onOpenIntegrations={() => setTab("harnesses")}
         onOpenHome={() => setTab("home")}
-        onOpenSettings={() => {
-          setSettingsSection("features");
+        onOpenSettings={(section) => {
+          setSettingsSection(section ?? "features");
           setTab("settings");
         }}
       />
@@ -5644,39 +5497,6 @@ export default function App() {
                 {label}
               </button>
             ))}
-          </div>
-        </div>
-      </Dialog>
-
-      {/* Index now — paid API calls, so it asks first. */}
-      <Dialog
-        open={indexConfirm}
-        className="kit-dialog"
-        ariaLabelledBy="index-title"
-        onCancel={() => setIndexConfirm(false)}
-      >
-        <div className="kit-dialog-body">
-          <h2 id="index-title">Index everything that is missing?</h2>
-          <p>
-            This sends every unindexed session and topic page to the model
-            behind your Gemini key, which costs money and can take a few
-            minutes. The nightly run does the same thing on its own.
-          </p>
-          <div className="kit-dialog-actions">
-            <button type="button" onClick={() => setIndexConfirm(false)}>
-              Cancel
-            </button>
-            <button
-              type="button"
-              className="primary"
-              disabled={indexBusy}
-              onClick={() => {
-                setIndexConfirm(false);
-                void runIndexNow();
-              }}
-            >
-              Index now
-            </button>
           </div>
         </div>
       </Dialog>

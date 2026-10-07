@@ -325,6 +325,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001
         embed_coverage = {"error": f"{type(e).__name__}: {e}"}
         embed_coverage_ok = False
+    # Informational: per-library coverage and profile, beside embed coverage.
+    # Never gates status (a library mid-backfill is not a broken hub).
+    try:
+        from khipu.library import doctor_block as _library_block
+
+        libraries = _library_block()
+    except Exception as e:  # noqa: BLE001
+        libraries = {"error": f"{type(e).__name__}: {e}"}
     # R8 (Phase 1 stop condition): the literal-search trigram migration
     # degrades to a no-op when pg_trgm cannot be created — that is a SKIP,
     # never red. Only a genuinely half-applied hub (extension present, an
@@ -531,6 +539,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "jobs": jobs,
         "index_freshness": index_fresh,
         "embed_coverage": embed_coverage,
+        "libraries": libraries,
         "literal_trgm": literal_trgm,
         "prompt_recall_snapshot": prompt_recall_snapshot,
         "prompt_recall_outcomes": prompt_recall_outcomes_block,
@@ -1148,12 +1157,14 @@ def cmd_search(args: argparse.Namespace) -> int:
     until = getattr(args, "until", None)
     session_id = getattr(args, "session_id", None)
     harness = getattr(args, "harness", None)
+    source = getattr(args, "source", None)
     try:
         from khipu.embed import hybrid_search
 
         payload = hybrid_search(
             args.query, limit=args.limit, mode=mode, kind=kind, project=project,
             since=since, until=until, session_id=session_id, harness=harness,
+            source=source,
         )
     except ValueError as err:
         print(json.dumps({"ok": False, "error": str(err)}))
@@ -1161,6 +1172,10 @@ def cmd_search(args: argparse.Namespace) -> int:
     except Exception as exc:
         if not hub_connection_failed(exc):
             raise
+        if kind == "library" or source:
+            print(json.dumps({"ok": False, "error": (
+                "library search needs the hub; the offline snapshot holds no libraries")}))
+            return 2
         try:
             payload = search_stale_payload(
                 args.query, args.limit, semantic=(mode == "semantic"), kind=kind,
@@ -1173,7 +1188,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     query_log.log_query(
         args.query, mode=mode,
         filters={"kind": kind, "project": project, "since": since, "until": until,
-                 "session_id": session_id, "harness": harness},
+                 "session_id": session_id, "harness": harness, "source": source},
         result_count=len(payload.get("results") or []), top=payload.get("results") or [],
         degraded=payload.get("degraded"),
     )
@@ -1185,8 +1200,14 @@ def cmd_embed(args: argparse.Namespace) -> int:
     from khipu.embed import activate, backfill, coverage
 
     if args.embed_cmd == "status":
-        print(json.dumps(coverage(profile=getattr(args, "profile", None)), indent=2))
+        print(json.dumps(coverage(profile=getattr(args, "profile", None), detail=True), indent=2))
         return 0
+    if args.embed_cmd == "profiles":
+        return _cmd_embed_profiles(args)
+    if args.embed_cmd in ("estimate", "jobs", "test-key"):
+        return _cmd_embed_ops(args)
+    if args.embed_cmd == "backfill" and (getattr(args, "job", False) or getattr(args, "job_id", None)):
+        return cmd_embed_backfill_job(args)
     if args.embed_cmd == "activate":
         try:
             out = activate(args.profile, force=bool(args.force))
@@ -1202,6 +1223,204 @@ def cmd_embed(args: argparse.Namespace) -> int:
         profile=getattr(args, "profile", None),
     )
     print(json.dumps(stats, indent=2))
+    return 0
+
+
+def _cmd_embed_profiles(args: argparse.Namespace) -> int:
+    """`khipu embed profiles list|add`: the embedding_profiles table, no model call."""
+    from khipu import profiles
+    from khipu.db import connect
+
+    if args.profiles_cmd == "list":
+        from khipu import embed_ops
+
+        with connect() as conn:
+            print(json.dumps({"profiles": embed_ops.list_detailed(conn)}, indent=2, default=str))
+        return 0
+    if args.profiles_cmd == "delete":
+        return _cmd_embed_profile_delete(args)
+    try:
+        spec = profiles.validate_spec(
+            args.id, provider=args.provider, model=args.model, dim=args.dim,
+            endpoint=args.endpoint, normalize=args.normalize,
+        )
+        with connect() as conn:
+            with conn.cursor() as cur:
+                out = profiles.add_profile(cur, spec)
+                # Both spaces can serve this profile; index it up front (empty,
+                # so instant). A failure is logged, never fatal: search still
+                # works without the index, just sequentially.
+                for table in profiles.INDEXED_TABLES:
+                    profiles.ensure_profile_index(cur, spec.id, table, dim=spec.dim, quiet=True)
+            conn.commit()
+    except (ValueError, RuntimeError) as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+def _cmd_embed_profile_delete(args: argparse.Namespace) -> int:
+    """`khipu embed profiles delete ID --yes`: delete a profile nothing uses and
+    every vector it owns. Refuses (naming the users) when it is the active
+    memory profile or a library is embedded with it."""
+    from khipu import profiles
+    from khipu.db import connect
+
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                if profiles.load_spec(cur, args.id) is None:
+                    raise ValueError(f"unknown embedding profile {args.id!r}")
+                users = profiles.profile_users(cur, args.id)
+                if users:
+                    raise ValueError(
+                        f"profile {args.id!r} is in use by {', '.join(users)}; move those to "
+                        "another profile first, then delete"
+                    )
+                if not args.yes:
+                    rows = next((p["rows"] for p in profiles.list_profiles(cur)
+                                 if p["id"] == args.id), {"memory": 0, "library": 0})
+                    raise ValueError(
+                        f"refusing to delete {args.id!r} without --yes: this deletes "
+                        f"{rows['memory']} memory vectors and {rows['library']} library vectors "
+                        "for it, its cached query vectors and its indexes (the text stays; "
+                        "it can be embedded again)"
+                    )
+                out = profiles.delete_profile(cur, args.id)
+            conn.commit()
+    except (ValueError, RuntimeError) as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def _cmd_embed_ops(args: argparse.Namespace) -> int:
+    """`khipu embed estimate | jobs | test-key`."""
+    from khipu import embed_jobs, embed_ops
+
+    cmd = args.embed_cmd
+    if cmd == "jobs":
+        out = embed_jobs.clear_jobs() if args.clear else {"jobs": embed_jobs.list_jobs()}
+        print(json.dumps(out, indent=2))
+        return 0
+    if cmd == "test-key":
+        out = embed_ops.check_key(args.provider, endpoint=args.endpoint, model=args.model)
+        print(json.dumps(out, indent=2))
+        return 0 if out.get("ok") else 2
+    from khipu import library
+
+    try:
+        out = embed_ops.estimate(args.profile, args.space, stale=bool(args.stale))
+    except (ValueError, RuntimeError, library.LibraryError) as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_embed_backfill_job(args: argparse.Namespace) -> int:
+    """Memory backfill as a detached job with a progress file (`khipu embed
+    backfill --profile P --job`, or the top-level `embed-backfill`). Prints one
+    final JSON line; exit 0 for done and cancelled, 1 for failed."""
+    from khipu import embed_jobs
+    from khipu.embed import backfill
+
+    profile = (getattr(args, "profile", None) or "").strip()
+    if not profile:
+        print(json.dumps({"ok": False, "error": "a job needs --profile (the profile to embed under)"}))
+        return 2
+    try:
+        job_id = embed_jobs.validate_job_id(args.job_id) if getattr(args, "job_id", None) else None
+    except ValueError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+    return embed_jobs.run_job(
+        kind="embed-backfill", profile=profile, space="memory", job_id=job_id,
+        work=lambda job: backfill(profile=profile, limit=getattr(args, "limit", None), job=job),
+    )
+
+
+def cmd_library_backfill_job(args: argparse.Namespace) -> int:
+    """Library backfill as a detached job (`khipu library backfill NAME --job`,
+    or the top-level `library-backfill NAME`)."""
+    from khipu import embed_jobs, library
+    from khipu.db import connect
+
+    try:
+        library.validate_name(args.name)
+        job_id = embed_jobs.validate_job_id(args.job_id) if getattr(args, "job_id", None) else None
+    except (library.LibraryError, ValueError) as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+    override = (getattr(args, "profile", None) or "").strip() or None
+
+    def work(job):
+        with connect() as conn:
+            with conn.cursor() as cur:
+                src = library.get_source(cur, args.name)
+            job.profile = override or src.profile
+            job.write()
+            return library.backfill(
+                conn, args.name, limit=getattr(args, "limit", None),
+                stale=bool(getattr(args, "stale", False)), profile=override, job=job,
+            )
+
+    return embed_jobs.run_job(
+        kind="library-backfill", profile=override or "", space=f"library:{args.name}",
+        job_id=job_id, work=work,
+    )
+
+
+def cmd_library(args: argparse.Namespace) -> int:
+    """`khipu library ...`: library sources (a folder of .txt/.md files as a
+    search space). Refusals print {"ok": false, "error": ...} and exit 2;
+    `scan` makes no model call, `backfill` and a profile-less `import` may."""
+    from khipu import library
+
+    cmd = args.library_cmd
+    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+    if cmd == "backfill" and (getattr(args, "job", False) or getattr(args, "job_id", None)):
+        return cmd_library_backfill_job(args)
+    try:
+        if cmd == "add":
+            library.prepare_add(args.name, args.root)  # refuse before touching the hub
+        elif getattr(args, "name", None):
+            library.validate_name(args.name)
+        from khipu.db import connect
+
+        with connect() as conn:
+            if cmd == "add":
+                out = library.add_source(conn, args.name, args.root, args.profile)
+            elif cmd == "list":
+                out = {"libraries": library.list_sources(conn)}
+            elif cmd == "status":
+                out = library.source_status(conn, args.name)
+            elif cmd == "remove":
+                out = library.remove_source(conn, args.name, yes=bool(args.yes))
+            elif cmd in ("enable", "disable"):
+                out = library.set_enabled(conn, args.name, cmd == "enable")
+            elif cmd == "set-profile":
+                out = library.set_profile(conn, args.name, args.profile)
+            elif cmd == "scan":
+                out = library.scan(conn, args.name)
+            elif cmd == "backfill":
+                # --bypass-harness (sonnet lane): dispatched agent, no delegation.
+                out = library.backfill(
+                    conn, args.name, limit=args.limit, stale=bool(args.stale),
+                    profile=getattr(args, "profile", None),
+                )
+            else:  # import
+                out = library.import_index(
+                    conn, args.name, args.path,
+                    strip_prefix=args.strip_prefix or "", profile=args.profile,
+                )
+    except library.LibraryError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+    print(json.dumps(out, indent=2, default=str))
     return 0
 
 
@@ -1975,6 +2194,7 @@ SETTABLE_SECRETS = {
     "gemini_api_key": "gemini_in_keychain",
     "database_url": "dsn_in_keychain",
     "openai_compat_api_key": "openai_compat_in_keychain",
+    "voyage_api_key": "voyage_in_keychain",
 }
 
 
@@ -2128,6 +2348,19 @@ def cmd_get(args: argparse.Namespace) -> int:
 
     ident = str(args.id)
     kind = (getattr(args, "kind", None) or "").strip().lower() or None
+    from khipu import library_search
+
+    if kind is None and library_search.is_library_id(ident):
+        kind = "library"
+    if kind == "library":
+        # library:<name>:<doc> or library:<name>:<doc>#<chunk>: the chunk (or
+        # document) plus the chunks either side of a hit.
+        try:
+            print(json.dumps(library_search.get(ident), indent=2, default=str))
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 1
+        return 0
     if kind is None:
         kind = "episode" if ident.isdigit() else "topic"
     if kind == "episode":
@@ -2169,6 +2402,37 @@ def cmd_config(args: argparse.Namespace) -> int:
     if args.set_gateway_url is not None:
         path = set_gateway_url(args.set_gateway_url)
         print(json.dumps({"gateway_url": gateway_url(), "config_file": str(path)}))
+        return 0
+    if args.set and args.set[0].startswith("relevance.cosine_floor_by_profile."):
+        from khipu import relevance
+
+        key, raw = args.set
+        profile = key[len(relevance.BY_PROFILE_KEY):]
+        try:
+            value = float(raw)
+            path = relevance.set_cosine_floor_for_profile(profile, value)
+        except (TypeError, ValueError) as err:
+            msg = str(err)
+            if msg.startswith("could not convert"):
+                msg = f"{key} must be a number, got {raw!r}"
+            print(json.dumps({"ok": False, "error": msg}))
+            return 2
+        print(json.dumps({"ok": True,
+                          "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
+                          "config_file": str(path)}))
+        return 0
+    if args.unset and args.unset.startswith("relevance.cosine_floor_by_profile."):
+        from khipu import relevance
+
+        try:
+            path = relevance.set_cosine_floor_for_profile(
+                args.unset[len(relevance.BY_PROFILE_KEY):], None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True,
+                          "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
+                          "config_file": str(path)}))
         return 0
     if args.set and args.set[0] == "relevance.cosine_floor":
         from khipu import relevance
@@ -2260,6 +2524,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "user_aliases": list(list_setting("user_aliases")),
         "float_settings": float_settings_status(),
         "relevance_cosine_floor": relevance.cosine_floor_status(),
+        "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
         "config_file": str(config_file()),
         "config": load_config(),
     }
@@ -3304,8 +3569,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     se.add_argument(
         "--kind",
-        choices=("episode", "topic", "node", "media"),
-        help="Restrict to one kind (media is semantic-only; node is literal/hybrid-only)",
+        choices=("episode", "topic", "node", "media", "library"),
+        help="Restrict to one kind (media is semantic-only; node is literal/hybrid-only; "
+        "library searches the enabled library sources)",
+    )
+    se.add_argument(
+        "--source", metavar="NAME",
+        help="Library name (see `khipu library list`); implies --kind library",
     )
     se.add_argument("--project", help="Match COALESCE(episodes.project, episodes.scope)")
     se.add_argument("--since", help="ISO date/datetime or relative, e.g. 7d / 24h")
@@ -3333,6 +3603,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile",
         help="Target profile id (default: active). e.g. gemini-embedding-2@768",
     )
+    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+    bf.add_argument(
+        "--stale", action="store_true",
+        help="Accepted for symmetry with `library backfill`: memory backfill always "
+        "re-embeds chunks whose text changed since they were embedded",
+    )
+    bf.add_argument(
+        "--job", action="store_true",
+        help="Run as a job: progress file in <data_dir>/jobs, SIGTERM cancels after the "
+        "current batch, one JSON line on stdout. Needs --profile",
+    )
+    bf.add_argument("--job-id", dest="job_id", default=None,
+                    help="Job id for the progress file (implies --job; default generated)")
+    es = em_sub.add_parser(
+        "estimate", help="Chunks, tokens, list price and time a re-embed would take (no model call)"
+    )
+    es.add_argument("--profile", required=True, help="Profile id to embed under")
+    es.add_argument("--space", default="memory", help="memory (default) or library:NAME")
+    es.add_argument("--stale", action="store_true",
+                    help="Library only: also count chunks whose text changed (memory always does)")
+    jb = em_sub.add_parser("jobs", help="List embedding job files (progress receipts)")
+    jb.add_argument("--clear", action="store_true", help="Remove finished jobs' files")
+    tk = em_sub.add_parser(
+        "test-key", help="Embed one short string with the provider's stored key: {ok, ms, dim}"
+    )
+    tk.add_argument("--provider", required=True, help="gemini | voyage | openai-compatible")
+    tk.add_argument("--endpoint", help="openai-compatible only: base URL")
+    tk.add_argument("--model", help="Model (default gemini-embedding-2 / voyage-3; required for "
+                    "openai-compatible)")
     st = em_sub.add_parser(
         "status", help="Coverage per kind for active or named profile"
     )
@@ -3352,7 +3651,98 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Activate even when the profile still has missing vectors",
     )
+    pr = em_sub.add_parser(
+        "profiles", help="List embedding profiles or add one (provider adapter + record)"
+    )
+    pr_sub = pr.add_subparsers(dest="profiles_cmd", required=True)
+    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+    pr_sub.add_parser(
+        "list",
+        help="Every profile: provider, model, dim, endpoint, rows per space, where it is used, "
+        "coverage per space, key presence, median query ms, list price",
+    )
+    pd = pr_sub.add_parser(
+        "delete",
+        help="Delete a profile nothing uses and all its vectors (refuses when in use)",
+    )
+    pd.add_argument("id", help="Profile id, e.g. voyage-3@1024")
+    pd.add_argument("--yes", action="store_true", help="Required: confirms the delete")
+    pa = pr_sub.add_parser(
+        "add",
+        help="Register a profile (inactive); the id must be model@dim, never overwritten",
+    )
+    pa.add_argument("id", help="Profile id, exactly model@dim, e.g. voyage-3@1024")
+    pa.add_argument(
+        "--provider", required=True,
+        help="gemini | voyage | openai-compatible (checked by the command)",
+    )
+    pa.add_argument("--model", required=True, help="Provider model name")
+    pa.add_argument("--dim", required=True, type=int, help="Vector dimension")
+    pa.add_argument(
+        "--endpoint",
+        help="openai-compatible only: base URL, https (http only for localhost). "
+        "The key, if any, is the Keychain item openai_compat_api_key",
+    )
+    pa.add_argument(
+        "--normalize", default="l2", choices=("l2", "none"),
+        help="L2-normalise vectors on the way in (default l2)",
+    )
     em.set_defaults(func=cmd_embed)
+
+    lib = sub.add_parser(
+        "library",
+        help="Library sources: a folder of .txt/.md files indexed as a search space",
+    )
+    lib_sub = lib.add_subparsers(dest="library_cmd", required=True)
+    la = lib_sub.add_parser("add", help="Register a library (root must exist; profile must exist)")
+    la.add_argument("name", help="[a-z0-9_-]{1,40}")
+    la.add_argument("--root", required=True, help="Folder holding the .txt/.md files")
+    la.add_argument("--profile", required=True, help="Embedding profile id (see `embed profiles list`)")
+    lib_sub.add_parser("list", help="Every library with document/chunk/embedded/missing/stale counts")
+    ls_ = lib_sub.add_parser("status", help="One library: counts, last scan/backfill, sample gaps")
+    ls_.add_argument("name")
+    lr = lib_sub.add_parser("remove", help="Delete a library's documents, chunks and vectors (files stay)")
+    lr.add_argument("name")
+    lr.add_argument("--yes", action="store_true", help="Required: confirms the delete")
+    for _verb in ("enable", "disable"):
+        lib_sub.add_parser(_verb, help=f"{_verb.capitalize()} a library (nightly sweep, search)").add_argument("name")
+    lsp = lib_sub.add_parser(
+        "set-profile",
+        help="Move a library's search pointer to another profile (refuses unless that profile "
+        "has a vector for every chunk)",
+    )
+    lsp.add_argument("name")
+    lsp.add_argument("profile", help="Embedding profile id (see `embed profiles list`)")
+    lsc = lib_sub.add_parser("scan", help="Walk the root and record documents + chunks (no model call)")
+    lsc.add_argument("name")
+    lb = lib_sub.add_parser("backfill", help="Embed chunks that have no vector under the library's profile")
+    lb.add_argument("name")
+    lb.add_argument("--limit", type=int, default=None, help="Embed at most N chunks this run")
+    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+    lb.add_argument(
+        "--stale", action="store_true",
+        help="Also re-embed chunks whose text changed since they were embedded",
+    )
+    lb.add_argument("--profile", default=None,
+                    help="Embed under this profile instead of the library's own (a re-embed "
+                    "in preparation; the library's pointer does not move)")
+    lb.add_argument("--job", action="store_true",
+                    help="Run as a job: progress file in <data_dir>/jobs, SIGTERM cancels "
+                    "after the current batch, one JSON line on stdout")
+    lb.add_argument("--job-id", dest="job_id", default=None,
+                    help="Job id for the progress file (implies --job; default generated)")
+    li = lib_sub.add_parser(
+        "import",
+        help="Import vectors computed elsewhere (graphify SQLite `embeddings` table, or .jsonl)",
+    )
+    li.add_argument("name")
+    li.add_argument("path", help="SQLite file or .jsonl with node_id, chunk_idx, source_file, "
+                    "chunk_text, embedding, model, dims")
+    li.add_argument("--strip-prefix", dest="strip_prefix", default="",
+                    help="Remove this leading text from each row's source_file")
+    li.add_argument("--profile", default=None,
+                    help="Profile the vectors belong to (default: model@dims from each row)")
+    lib.set_defaults(func=cmd_library)
 
     g = sub.add_parser("graph", help="Neighbors (join / GRAPH_TABLE / CTE)")
     g.add_argument("id", help="Node id")
@@ -3417,6 +3807,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Profile id (default gemini-embedding-2@768)",
     )
     emb.set_defaults(func=cmd_embed_media_backfill)
+
+    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+    # Detached-spawn wrappers (the desktop app's job pattern: one hyphenated
+    # subcommand, output goes to a log, progress goes to <data_dir>/jobs/<id>.json).
+    ebj = sub.add_parser(
+        "embed-backfill",
+        help="Job: embed memory under --profile with a progress file (= embed backfill --job)",
+    )
+    ebj.add_argument("--profile", required=True, help="Profile id to embed under")
+    ebj.add_argument("--job-id", dest="job_id", default=None, help="Job id (default generated)")
+    ebj.add_argument("--limit", type=int, default=None, help="Cap chunks this run")
+    ebj.set_defaults(func=cmd_embed_backfill_job)
+    lbj = sub.add_parser(
+        "library-backfill",
+        help="Job: embed library NAME with a progress file (= library backfill NAME --job)",
+    )
+    lbj.add_argument("name")
+    lbj.add_argument("--profile", default=None, help="Embed under this profile, not the library's own")
+    lbj.add_argument("--stale", action="store_true", help="Also re-embed changed chunks")
+    lbj.add_argument("--job-id", dest="job_id", default=None, help="Job id (default generated)")
+    lbj.add_argument("--limit", type=int, default=None, help="Cap chunks this run")
+    lbj.set_defaults(func=cmd_library_backfill_job)
 
     md = sub.add_parser(
         "models",
@@ -3786,8 +4198,10 @@ def build_parser() -> argparse.ArgumentParser:
         "get",
         help="Episode or topic detail by id/slug, including the verbatim tier (K2)",
     )
-    gt.add_argument("id", help="Episode id (digits) or topic slug")
-    gt.add_argument("--kind", choices=("episode", "topic"), default=None)
+    gt.add_argument(
+        "id", help="Episode id (digits), topic slug, or library:<name>:<doc>[#<chunk>]"
+    )
+    gt.add_argument("--kind", choices=("episode", "topic", "library"), default=None)
     gt.set_defaults(func=cmd_get)
 
     mg = sub.add_parser(
@@ -3956,11 +4370,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Persist a machine-specific path (memory_root, memory_repo, "
         "capture_v2, graph_sqlite, gemini_key_file), a 0-1 similarity knob "
         "(dedup_similarity, commitment_close_similarity), the relevance "
-        "floor (relevance.cosine_floor, above 0 up to 1) or the comma-"
+        "floor (relevance.cosine_floor, above 0 up to 1; per embedding profile "
+        "relevance.cosine_floor_by_profile.<profile>) or the comma-"
         'separated user_aliases list (e.g. --set user_aliases "matt,matthew")',
     )
     cfg.add_argument("--unset", metavar="KEY",
-                     help="Remove a path setting, or relevance.cosine_floor to restore its default")
+                     help="Remove a path setting, or relevance.cosine_floor / "
+                     "relevance.cosine_floor_by_profile.<profile> to restore its default")
     cfg.add_argument(
         "--set-gateway-url",
         metavar="URL",

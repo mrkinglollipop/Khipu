@@ -1,11 +1,9 @@
 // The other settings the CLI owns: capture mode and thresholds, gateway
-// address, file locations, background jobs, the gateway token (write-only) and
-// the active search-index profile.
+// address, file locations, background jobs, the gateway token (write-only).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import {
   CaptureTuningCard,
-  EmbedProfilesCard,
   GatewayTokenCard,
   GatewayUrlCard,
   JobsCard,
@@ -22,15 +20,11 @@ let config: Record<string, unknown>;
 let jobs: Record<string, unknown>;
 let tokenExists: boolean;
 let refuse: string | null;
-let profileMissing: Record<string, number>;
-let activeProfile: string;
 
 beforeEach(() => {
   calls.length = 0;
   refuse = null;
   tokenExists = false;
-  activeProfile = "gemini-embedding-2@768";
-  profileMissing = { "gemini-embedding-001@768": 0 };
   config = {
     capture_mode: "dual",
     capture_mode_source: "default",
@@ -80,23 +74,6 @@ beforeEach(() => {
         if (refuse) return bad();
         tokenExists = true;
         return JSON.stringify({ ok: true, exists: true, bytes: 48 });
-      case "khipu_embed_status": {
-        const profile = args?.profile as string | undefined;
-        if (profile) {
-          return JSON.stringify({ profile, episodes: { missing: profileMissing[profile] ?? 0 }, topics: { missing: 0 } });
-        }
-        return JSON.stringify({
-          active_profile: activeProfile,
-          profiles: [
-            { id: "gemini-embedding-001@768", model: "gemini-embedding-001", dim: 768, active: activeProfile === "gemini-embedding-001@768" },
-            { id: "gemini-embedding-2@768", model: "gemini-embedding-2", dim: 768, active: activeProfile === "gemini-embedding-2@768" },
-          ],
-        });
-      }
-      case "khipu_embed_activate":
-        if (refuse) return bad();
-        activeProfile = String(args?.profile);
-        return JSON.stringify({ ok: true, active_profile: activeProfile });
       default:
         throw new Error(`unexpected command ${cmd}`);
     }
@@ -250,29 +227,5 @@ describe("GatewayTokenCard", () => {
     fireEvent.submit(field.closest("form")!);
     expect(await screen.findByRole("alert")).toHaveTextContent("token is empty");
     expect(field.value).toBe("abc");
-  });
-});
-
-describe("EmbedProfilesCard", () => {
-  it("marks the active profile and makes another one active when it has every vector", async () => {
-    render(<EmbedProfilesCard active />);
-    const make = await screen.findByRole("button", { name: "Make active" });
-    await waitFor(() => expect(make).not.toBeDisabled());
-    expect(screen.getByText("Active")).toBeInTheDocument();
-    fireEvent.click(make);
-    await waitFor(() =>
-      expect(calls).toContainEqual(["khipu_embed_activate", { profile: "gemini-embedding-001@768" }]),
-    );
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Make active" })).toBeInTheDocument());
-  });
-
-  it("disables Make active while the profile is missing vectors, and never sends force", async () => {
-    profileMissing["gemini-embedding-001@768"] = 12;
-    render(<EmbedProfilesCard active />);
-    const make = await screen.findByRole("button", { name: "Make active" });
-    await waitFor(() => expect(screen.getByText(/12 items still missing vectors/)).toBeInTheDocument());
-    expect(make).toBeDisabled();
-    fireEvent.click(make);
-    expect(calls.some(([c]) => c === "khipu_embed_activate")).toBe(false);
   });
 });
