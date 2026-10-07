@@ -37,7 +37,7 @@ class FakeCur:
 
     def __init__(self, *, libs=None, cosine=None, chunks=None, titles=None,
                  fail_chunks=False, doc=None, chunk_rows=None, chunk_count=3,
-                 ilike=None, fail_fts=False):
+                 ilike=None, fail_fts=False, index_present=True, cosine_error=None):
         self.libs = [("biblical", PROFILE)] if libs is None else libs
         self.cosine = cosine or []
         self.chunks = chunks or []
@@ -45,6 +45,8 @@ class FakeCur:
         self.fail_chunks = fail_chunks      # the ILIKE substring scan times out
         self.fail_fts = fail_fts            # the full-text statement times out
         self.ilike = ilike or []
+        self.index_present = index_present  # the profile's HNSW index exists
+        self.cosine_error = cosine_error    # raised by the cosine statement
         self.doc = doc
         self.chunk_rows = chunk_rows or []
         self.chunk_count = chunk_count
@@ -59,7 +61,11 @@ class FakeCur:
         elif "FROM library_sources" in s:
             src = (params or {}).get("src")
             self._res = [r for r in self.libs if src is None or r[0] == src]
+        elif "FROM pg_indexes" in s:
+            self._res = [(1,)] if self.index_present else []
         elif "FROM library_embeddings" in s:
+            if self.cosine_error:
+                raise self.cosine_error
             self._res = list(self.cosine)
         elif "FROM library_chunks c JOIN library_documents d" in s:
             fts = "plainto_tsquery" in s
@@ -141,6 +147,7 @@ def _hub(cur, *, query_vec=None):
 
     qv = query_vec if query_vec is not None else mock.Mock(return_value=(QVEC, "off"))
     ls._TABLES_SEEN = False
+    ls._INDEX_SEEN.clear()
     with mock.patch("khipu.hub_snapshot.try_hub_connect", _connect), \
             mock.patch.object(em, "_cosine_candidates", return_value=[]), \
             mock.patch.object(em, "_query_vec", qv), \
@@ -345,6 +352,97 @@ class DegradedLegTest(unittest.TestCase):
         self.assertTrue(stmts[i + 1].startswith("SET LOCAL statement_timeout = "))
         self.assertIn("FROM library_chunks c", stmts[i + 2])
         self.assertTrue(stmts[i + 3].startswith("ROLLBACK TO SAVEPOINT khipu_lib_fts"))
+
+
+class UnindexedProfileTest(unittest.TestCase):
+    def test_default_search_skips_cosine_without_the_index_and_names_the_leg(self):
+        cur = FakeCur(cosine=[_cos_row()], chunks=[_chunk_row(7, 3)], titles=[_title_row(9, title="Divine Council Primer", rel="Heiser/Primer.md")],
+                      index_present=False)
+        qv = mock.Mock(return_value=(QVEC, "off"))
+        with _hub(cur, query_vec=qv):
+            out = em.hybrid_search("divine council", limit=5)
+        self.assertIn(f"library_cosine:{PROFILE}:no-index", out["degraded_legs"])
+        self.assertFalse(cur.sql("FROM library_embeddings"))
+        qv.assert_not_called()                                  # no wasted embed either
+        self.assertIn("library:biblical:7#3", _ids(out))         # full-text leg still ran
+        self.assertIn("library:biblical:9", _ids(out))           # so did title/author
+
+    def test_default_search_runs_cosine_when_the_index_exists(self):
+        cur = FakeCur(cosine=[_cos_row()], index_present=True)
+        with _hub(cur):
+            out = em.hybrid_search("divine council", limit=5)
+        self.assertEqual(len(cur.sql("FROM library_embeddings")), 1)
+        self.assertNotIn(f"library_cosine:{PROFILE}:no-index", out.get("degraded_legs", []))
+        self.assertIn("library:biblical:7#3", _ids(out))
+
+    def test_the_index_check_is_looked_up_by_the_profile_index_name(self):
+        from khipu.profiles import profile_index_name
+        cur = FakeCur(cosine=[_cos_row()])
+        with _hub(cur):
+            em.hybrid_search("divine council", limit=5)
+        (_, params), = cur.sql("FROM pg_indexes")
+        self.assertEqual(params, (profile_index_name(PROFILE, "library_embeddings"),))
+
+    def test_the_answer_is_cached_per_process_for_sixty_seconds(self):
+        cur = FakeCur(cosine=[_cos_row()], index_present=False)
+        clock = [1000.0]
+        with _hub(cur), mock.patch.object(ls.time, "monotonic", side_effect=lambda: clock[0]):
+            em.hybrid_search("divine council", limit=5)
+            em.hybrid_search("divine council again", limit=5)
+            self.assertEqual(len(cur.sql("FROM pg_indexes")), 1)
+            cur.index_present = True                  # the index is built meanwhile
+            clock[0] += ls.INDEX_CHECK_TTL_S - 1
+            em.hybrid_search("divine council third", limit=5)
+            self.assertEqual(len(cur.sql("FROM pg_indexes")), 1)   # still the cached "no"
+            self.assertFalse(cur.sql("FROM library_embeddings"))
+            clock[0] += 2                              # past the TTL: re-asked, now present
+            em.hybrid_search("divine council fourth", limit=5)
+        self.assertEqual(len(cur.sql("FROM pg_indexes")), 2)
+        self.assertEqual(len(cur.sql("FROM library_embeddings")), 1)
+
+    def test_a_failed_index_check_fails_open_and_is_not_cached(self):
+        cur = FakeCur(cosine=[_cos_row()])
+        real = cur.execute
+
+        def boom(sql, params=None):
+            if "FROM pg_indexes" in sql:
+                raise RuntimeError("permission denied")
+            return real(sql, params)
+
+        cur.execute = boom
+        with _hub(cur):
+            out = em.hybrid_search("divine council", limit=5)
+        self.assertEqual(len(cur.sql("FROM library_embeddings")), 1)
+        self.assertNotIn(f"library_cosine:{PROFILE}:no-index", out.get("degraded_legs", []))
+        self.assertEqual(ls._INDEX_SEEN, {})
+
+    def test_explicit_kind_library_still_runs_cosine_under_a_savepointed_timeout(self):
+        cur = FakeCur(cosine=[_cos_row()], index_present=False)
+        with _hub(cur):
+            out = em.hybrid_search("divine council", kind="library")
+        self.assertIn("library:biblical:7#3", _ids(out))
+        self.assertNotIn(f"library_cosine:{PROFILE}:no-index", out.get("degraded_legs", []))
+        stmts = [s for s, _ in cur.executed]
+        i = next(n for n, s in enumerate(stmts) if s.startswith("SAVEPOINT khipu_lib_cos"))
+        self.assertEqual(stmts[i + 1], f"SET LOCAL statement_timeout = {ls.UNINDEXED_COSINE_TIMEOUT_MS}")
+        self.assertEqual(ls.UNINDEXED_COSINE_TIMEOUT_MS, 15000)
+        j = next(n for n, s in enumerate(stmts) if "FROM library_embeddings" in s)
+        self.assertGreater(j, i + 1)
+        self.assertTrue(any(s.startswith("ROLLBACK TO SAVEPOINT khipu_lib_cos") for s in stmts[j:]))
+
+    def test_explicit_search_names_a_timed_out_cosine_leg(self):
+        cur = FakeCur(chunks=[_chunk_row(7, 3)], index_present=False,
+                      cosine_error=RuntimeError("canceling statement due to statement timeout"))
+        with _hub(cur):
+            out = em.hybrid_search("divine council", kind="library")
+        self.assertIn(f"library_cosine:{PROFILE}:timeout", out["degraded_legs"])
+        self.assertEqual(_ids(out), ["library:biblical:7#3"])     # literal legs unaffected
+
+    def test_an_indexed_explicit_search_sets_no_cosine_timeout(self):
+        cur = FakeCur(cosine=[_cos_row()], index_present=True)
+        with _hub(cur):
+            em.hybrid_search("divine council", kind="library", mode="semantic")
+        self.assertFalse([s for s, _ in cur.executed if s.startswith("SET LOCAL statement_timeout")])
 
 
 class KeywordLegTest(unittest.TestCase):

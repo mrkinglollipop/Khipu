@@ -66,12 +66,25 @@ LITERAL_TIMEOUT_MS_EXPLICIT = 4000
 # actually returns that many.
 MAX_EF_SEARCH = 1000
 
+# Without the per-profile HNSW index the cosine leg is a sequential scan of
+# library_embeddings (a 329k-row library: ~9 s on top of ~5 s). A default
+# search skips that leg; an explicit kind="library" search runs it under this
+# budget and degrades rather than hang.
+UNINDEXED_COSINE_TIMEOUT_MS = 15000
+# How long "does the index exist" is remembered per process: one pg_indexes
+# query a minute, not one per search.
+INDEX_CHECK_TTL_S = 60.0
+
 _ID_RE = re.compile(r"^library:([a-z0-9_-]{1,40}):([0-9]+)(?:#([0-9]+))?$")
 
 # True once library_sources has been seen on this process; saves a to_regclass
 # round trip on every later search. (A "no" is never cached: the hub can be
 # migrated while the process lives.)
 _TABLES_SEEN = False
+
+
+# index name -> (monotonic time of the check, exists)
+_INDEX_SEEN: dict[str, tuple[float, bool]] = {}
 
 
 def _log(msg: str) -> None:
@@ -172,6 +185,42 @@ def enabled_libraries(cur, conn, source: str | None = None) -> list[tuple[str, s
 # ---- cosine leg -----------------------------------------------------------------
 
 
+def profile_has_index(cur, conn, profile: str) -> bool:
+    """True when the profile's HNSW index on ``library_embeddings`` exists.
+
+    The answer is cached per process for ``INDEX_CHECK_TTL_S``. A failed check
+    fails open (True, not cached): the cosine leg then behaves as it did before
+    this check existed."""
+    from khipu.profiles import profile_index_name
+
+    try:
+        name = profile_index_name(profile, "library_embeddings")
+    except Exception:  # noqa: BLE001
+        return True
+    now = time.monotonic()
+    seen = _INDEX_SEEN.get(name)
+    if seen is not None and now - seen[0] < INDEX_CHECK_TTL_S:
+        return seen[1]
+    try:
+        cur.execute(
+            "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = %s", (name,)
+        )
+        exists = cur.fetchone() is not None
+    except Exception as exc:  # noqa: BLE001
+        _log(f"index check skipped: {type(exc).__name__}")
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+    _INDEX_SEEN[name] = (now, exists)
+    return exists
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    return "statement timeout" in str(exc).lower() or type(exc).__name__ == "QueryCanceled"
+
+
 def _ef_search(limit: int) -> int:
     return max(40, min(int(limit), MAX_EF_SEARCH))
 
@@ -209,9 +258,14 @@ def cosine_sql(dim: int) -> str:
 
 def cosine_lists(
     cur, conn, query: str, libs: list[tuple[str, str]], *, limit: int,
-    timing: dict[str, Any], degraded_legs: list[str],
+    timing: dict[str, Any], degraded_legs: list[str], explicit: bool = False,
 ) -> list[list[dict[str, Any]]]:
-    """One cosine-ordered list (best first) per distinct profile in ``libs``."""
+    """One cosine-ordered list (best first) per distinct profile in ``libs``.
+
+    A profile whose HNSW index is missing is skipped in the default search
+    (``library_cosine:<profile>:no-index`` in ``degraded_legs``); an explicit
+    ``kind="library"`` search still runs it, under ``UNINDEXED_COSINE_TIMEOUT_MS``
+    (``library_cosine:<profile>:timeout`` when that runs out)."""
     from khipu import embed as em
     from khipu.embed import CHUNK_CHARS, FETCH_LIMIT
 
@@ -222,6 +276,10 @@ def cosine_lists(
     out: list[list[dict[str, Any]]] = []
     embed_ms = cosine_ms = 0.0
     for profile, names in by_profile.items():
+        indexed = profile_has_index(cur, conn, profile)
+        if not indexed and not explicit:
+            degraded_legs.append(f"library_cosine:{profile}:no-index")
+            continue
         t0 = time.monotonic()
         try:
             api_q = em.prefix_query(query) if em.uses_task_prefixes(profile) else query
@@ -236,6 +294,8 @@ def cosine_lists(
         t1 = time.monotonic()
         try:
             cur.execute("SAVEPOINT khipu_lib_cos")
+            if not indexed:
+                cur.execute(f"SET LOCAL statement_timeout = {UNINDEXED_COSINE_TIMEOUT_MS}")
             try:
                 cur.execute(f"SET LOCAL hnsw.ef_search = {_ef_search(limit)}")
             except Exception:  # noqa: BLE001 - no pgvector GUC (scratch DB) is not fatal
@@ -255,7 +315,8 @@ def cosine_lists(
                 ))
             out.append(rows)
         except Exception as exc:  # noqa: BLE001
-            degraded_legs.append(f"library_cosine:{profile}")
+            timed_out = not indexed and _is_timeout(exc)
+            degraded_legs.append(f"library_cosine:{profile}" + (":timeout" if timed_out else ""))
             timing["library_cosine_error"] = f"{profile}: {type(exc).__name__}: {exc}"[:160]
         finally:
             try:
@@ -468,7 +529,7 @@ def library_candidates(
     lit: list[dict[str, Any]] = []
     if mode in ("hybrid", "semantic"):
         cos = cosine_lists(cur, conn, query, libs, limit=leg_limit,
-                           timing=timing, degraded_legs=degraded_legs)
+                           timing=timing, degraded_legs=degraded_legs, explicit=explicit)
     if mode in ("hybrid", "literal"):
         lit = literal_rows(
             cur, conn, query, names, limit=leg_limit,
