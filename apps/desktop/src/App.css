@@ -2558,6 +2558,7 @@ input.switch:disabled {
 }
 .idpart { white-space: nowrap; display: inline-block; }
 .emb-row {
+  container-type: inline-size;
   display: flex;
   flex-direction: column;
   gap: var(--s2);
@@ -2572,7 +2573,9 @@ input.switch:disabled {
 .emb-q b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
 .emb-cov {
   display: grid;
-  grid-template-columns: 150px 180px 190px minmax(max-content, 1fr);
+  /* The bar column is the only one allowed to shrink, so the count and the
+     tag keep their full width inside a narrow settings card. */
+  grid-template-columns: minmax(4.5rem, max-content) minmax(4rem, 1fr) max-content max-content;
   align-items: center;
   column-gap: var(--s3);
   row-gap: var(--s1);
@@ -2684,9 +2687,11 @@ input.switch:disabled {
   .emb-id { flex-basis: 100%; }
   .emb-q { text-align: left; white-space: normal; }
 }
-@media (max-width: 760px) {
+@container (max-width: 520px) {
   .emb-cov { grid-template-columns: 1fr auto; }
   .emb-cov .bar { grid-column: 1 / -1; grid-row: auto; }
+}
+@media (max-width: 760px) {
   .lib-add .fields { grid-template-columns: 1fr; }
 }
 .lib-add select { text-overflow: ellipsis; }
