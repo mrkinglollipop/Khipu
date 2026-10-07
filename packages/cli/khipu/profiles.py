@@ -384,6 +384,11 @@ def ensure_profile_index(
     mem = (os.environ.get("KHIPU_INDEX_MEMORY") or "").strip()
     if mem and re.fullmatch(r"\d{1,5}(MB|GB)", mem):
         cur.execute(f"SET LOCAL maintenance_work_mem = '{mem}'")
+        # A parallel build holds that memory in /dev/shm, which a Postgres
+        # container caps at 64 MB by default; the build then fails with
+        # "could not resize shared memory segment". A serial build uses
+        # ordinary process memory instead.
+        cur.execute("SET LOCAL max_parallel_maintenance_workers = 0")
     cur.execute(
         f"CREATE INDEX IF NOT EXISTS {name} ON {table}"
         f" USING hnsw ((embedding::vector({dim})) vector_cosine_ops)"
