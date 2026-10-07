@@ -405,6 +405,7 @@ class BulkLoadTest(unittest.TestCase):
                 bulk.defer("v@8", None)
         sent = [" ".join(c.args[0].split()) for c in cur.execute.call_args_list]
         self.assertIn("SET LOCAL maintenance_work_mem = '1200MB'", sent)
+        self.assertIn("SET LOCAL max_parallel_maintenance_workers = 0", sent)
 
 
 class CliTest(unittest.TestCase):
