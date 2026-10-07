@@ -366,3 +366,126 @@ def ensure_profile_index(
 
 def ensure_library_index(cur, profile: str, *, dim: int | None = None) -> str | None:
     return ensure_profile_index(cur, profile, "library_embeddings", dim=dim)
+
+
+# ---- prices, keys, deletion (the Embeddings screen) ---------------------------
+# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+
+# USD per million input tokens. List prices as of 2026-10, informational: the
+# provider's own pricing page is the authority, and a free allowance or a
+# discount is not modelled. A (provider, model) pair that is not here is
+# "price unknown", never guessed.
+PRICE_TABLE_NOTE = "list prices as of 2026-10, informational"
+PRICE_PER_MILLION_USD: dict[tuple[str, str], float] = {
+    ("gemini", "gemini-embedding-2"): 0.20,
+    ("gemini", "gemini-embedding-001"): 0.20,
+    ("voyage", "voyage-3"): 0.06,
+    ("voyage", "voyage-3-large"): 0.18,
+    ("voyage", "voyage-3-lite"): 0.02,
+    ("openai", "text-embedding-3-small"): 0.02,
+    ("openai", "text-embedding-3-large"): 0.13,
+}
+_OPENAI_HOST = "api.openai.com"
+
+
+def _host(endpoint: str | None) -> str | None:
+    try:
+        return urlsplit(endpoint or "").hostname
+    except ValueError:
+        return None
+
+
+def is_loopback_endpoint(endpoint: str | None) -> bool:
+    return _host(endpoint) in _LOOPBACK
+
+
+def price_info(spec: ProfileSpec) -> tuple[float | None, str]:
+    """``(usd per million tokens | None, note)`` for ``spec``. A loopback
+    OpenAI-compatible server is free; OpenAI's own endpoint uses the OpenAI rows
+    of the table; anything else is unknown."""
+    if spec.provider == "openai-compatible":
+        if is_loopback_endpoint(spec.endpoint):
+            return 0.0, "local server, no charge"
+        if _host(spec.endpoint) == _OPENAI_HOST and ("openai", spec.model) in PRICE_PER_MILLION_USD:
+            return PRICE_PER_MILLION_USD[("openai", spec.model)], PRICE_TABLE_NOTE
+        return None, "price unknown for this provider"
+    price = PRICE_PER_MILLION_USD.get((spec.provider, spec.model))
+    if price is None:
+        return None, "price unknown for this provider"
+    return price, PRICE_TABLE_NOTE
+
+
+def key_present(provider: str) -> bool:
+    """Is a key stored for ``provider`` (Keychain, environment, or key file)?
+    Presence only: the value is never put in the result. An OpenAI-compatible
+    server may need none; this reports whether one is stored."""
+    from khipu import keychain
+
+    try:
+        if provider == "gemini":
+            return bool(keychain.resolve_gemini_key())
+        if provider == "voyage":
+            return bool(keychain.resolve_voyage_key())
+        if provider == "openai-compatible":
+            return bool(keychain.get_openai_compat_key())
+    except Exception:  # noqa: BLE001 - no key / unreadable Keychain both mean "not present"
+        return False
+    return False
+
+
+def profile_users(cur, profile: str) -> list[str]:
+    """Where ``profile`` is in use: ``"memory"`` when it is the active pointer,
+    then the name of every library embedded with it."""
+    users: list[str] = []
+    cur.execute("SELECT is_active FROM embedding_profiles WHERE id = %s", (profile,))
+    row = cur.fetchone()
+    if row and row[0]:
+        users.append("memory")
+    if _to_regclass(cur, "library_sources"):
+        cur.execute("SELECT name FROM library_sources WHERE profile = %s ORDER BY name", (profile,))
+        users.extend(r[0] for r in cur.fetchall())
+    return users
+
+
+def _drop_index_quiet(cur, name: str) -> bool:
+    cur.execute("SAVEPOINT khipu_drop_index")
+    try:
+        cur.execute(f"DROP INDEX IF EXISTS public.{name}")
+    except Exception as exc:  # noqa: BLE001 - a leftover index is harmless, the rows are the point
+        cur.execute("ROLLBACK TO SAVEPOINT khipu_drop_index")
+        print(f"[khipu-embed] could not drop index {name}: {type(exc).__name__}: {exc}",
+              file=sys.stderr, flush=True)
+        return False
+    cur.execute("RELEASE SAVEPOINT khipu_drop_index")
+    return True
+
+
+def delete_profile(cur, profile: str) -> dict[str, Any]:
+    """Delete a profile nothing uses: its vectors in both spaces, its cached
+    query vectors, its per-profile indexes, then the profile row. Refuses (with
+    the users named) when it is active for memory or a library is embedded with
+    it. The caller commits."""
+    spec = load_spec(cur, profile)
+    if spec is None:
+        raise ValueError(f"unknown embedding profile {profile!r}")
+    users = profile_users(cur, profile)
+    if users:
+        raise ValueError(
+            f"profile {profile!r} is in use by {', '.join(users)}; move those to another "
+            "profile first, then delete"
+        )
+    deleted = {"memory": 0, "library": 0, "query_cache": 0}
+    for key, table in (("library", "library_embeddings"), ("memory", "memory_embeddings"),
+                       ("query_cache", "memory_query_cache")):
+        if not _to_regclass(cur, table):
+            continue
+        cur.execute(f"DELETE FROM {table} WHERE profile = %s", (profile,))
+        deleted[key] = int(cur.rowcount or 0)
+    indexes = [profile_index_name(profile, t) for t in INDEXED_TABLES]
+    for name in indexes:
+        _drop_index_quiet(cur, name)
+    cur.execute("DELETE FROM embedding_profiles WHERE id = %s", (profile,))
+    with _LOCK:
+        _LEARNED.pop(profile, None)
+    deleted["total"] = deleted["memory"] + deleted["library"] + deleted["query_cache"]
+    return {"ok": True, "profile": profile, "deleted_rows": deleted, "dropped_indexes": indexes}

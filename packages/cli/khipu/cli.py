@@ -1200,10 +1200,14 @@ def cmd_embed(args: argparse.Namespace) -> int:
     from khipu.embed import activate, backfill, coverage
 
     if args.embed_cmd == "status":
-        print(json.dumps(coverage(profile=getattr(args, "profile", None)), indent=2))
+        print(json.dumps(coverage(profile=getattr(args, "profile", None), detail=True), indent=2))
         return 0
     if args.embed_cmd == "profiles":
         return _cmd_embed_profiles(args)
+    if args.embed_cmd in ("estimate", "jobs", "test-key"):
+        return _cmd_embed_ops(args)
+    if args.embed_cmd == "backfill" and (getattr(args, "job", False) or getattr(args, "job_id", None)):
+        return cmd_embed_backfill_job(args)
     if args.embed_cmd == "activate":
         try:
             out = activate(args.profile, force=bool(args.force))
@@ -1228,10 +1232,13 @@ def _cmd_embed_profiles(args: argparse.Namespace) -> int:
     from khipu.db import connect
 
     if args.profiles_cmd == "list":
+        from khipu import embed_ops
+
         with connect() as conn:
-            with conn.cursor() as cur:
-                print(json.dumps({"profiles": profiles.list_profiles(cur)}, indent=2))
+            print(json.dumps({"profiles": embed_ops.list_detailed(conn)}, indent=2, default=str))
         return 0
+    if args.profiles_cmd == "delete":
+        return _cmd_embed_profile_delete(args)
     try:
         spec = profiles.validate_spec(
             args.id, provider=args.provider, model=args.model, dim=args.dim,
@@ -1253,6 +1260,120 @@ def _cmd_embed_profiles(args: argparse.Namespace) -> int:
     return 0
 
 
+# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+def _cmd_embed_profile_delete(args: argparse.Namespace) -> int:
+    """`khipu embed profiles delete ID --yes`: delete a profile nothing uses and
+    every vector it owns. Refuses (naming the users) when it is the active
+    memory profile or a library is embedded with it."""
+    from khipu import profiles
+    from khipu.db import connect
+
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                if profiles.load_spec(cur, args.id) is None:
+                    raise ValueError(f"unknown embedding profile {args.id!r}")
+                users = profiles.profile_users(cur, args.id)
+                if users:
+                    raise ValueError(
+                        f"profile {args.id!r} is in use by {', '.join(users)}; move those to "
+                        "another profile first, then delete"
+                    )
+                if not args.yes:
+                    rows = next((p["rows"] for p in profiles.list_profiles(cur)
+                                 if p["id"] == args.id), {"memory": 0, "library": 0})
+                    raise ValueError(
+                        f"refusing to delete {args.id!r} without --yes: this deletes "
+                        f"{rows['memory']} memory vectors and {rows['library']} library vectors "
+                        "for it, its cached query vectors and its indexes (the text stays; "
+                        "it can be embedded again)"
+                    )
+                out = profiles.delete_profile(cur, args.id)
+            conn.commit()
+    except (ValueError, RuntimeError) as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def _cmd_embed_ops(args: argparse.Namespace) -> int:
+    """`khipu embed estimate | jobs | test-key`."""
+    from khipu import embed_jobs, embed_ops
+
+    cmd = args.embed_cmd
+    if cmd == "jobs":
+        out = embed_jobs.clear_jobs() if args.clear else {"jobs": embed_jobs.list_jobs()}
+        print(json.dumps(out, indent=2))
+        return 0
+    if cmd == "test-key":
+        out = embed_ops.check_key(args.provider, endpoint=args.endpoint, model=args.model)
+        print(json.dumps(out, indent=2))
+        return 0 if out.get("ok") else 2
+    from khipu import library
+
+    try:
+        out = embed_ops.estimate(args.profile, args.space, stale=bool(args.stale))
+    except (ValueError, RuntimeError, library.LibraryError) as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_embed_backfill_job(args: argparse.Namespace) -> int:
+    """Memory backfill as a detached job with a progress file (`khipu embed
+    backfill --profile P --job`, or the top-level `embed-backfill`). Prints one
+    final JSON line; exit 0 for done and cancelled, 1 for failed."""
+    from khipu import embed_jobs
+    from khipu.embed import backfill
+
+    profile = (getattr(args, "profile", None) or "").strip()
+    if not profile:
+        print(json.dumps({"ok": False, "error": "a job needs --profile (the profile to embed under)"}))
+        return 2
+    try:
+        job_id = embed_jobs.validate_job_id(args.job_id) if getattr(args, "job_id", None) else None
+    except ValueError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+    return embed_jobs.run_job(
+        kind="embed-backfill", profile=profile, space="memory", job_id=job_id,
+        work=lambda job: backfill(profile=profile, limit=getattr(args, "limit", None), job=job),
+    )
+
+
+def cmd_library_backfill_job(args: argparse.Namespace) -> int:
+    """Library backfill as a detached job (`khipu library backfill NAME --job`,
+    or the top-level `library-backfill NAME`)."""
+    from khipu import embed_jobs, library
+    from khipu.db import connect
+
+    try:
+        library.validate_name(args.name)
+        job_id = embed_jobs.validate_job_id(args.job_id) if getattr(args, "job_id", None) else None
+    except (library.LibraryError, ValueError) as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+    override = (getattr(args, "profile", None) or "").strip() or None
+
+    def work(job):
+        with connect() as conn:
+            with conn.cursor() as cur:
+                src = library.get_source(cur, args.name)
+            job.profile = override or src.profile
+            job.write()
+            return library.backfill(
+                conn, args.name, limit=getattr(args, "limit", None),
+                stale=bool(getattr(args, "stale", False)), profile=override, job=job,
+            )
+
+    return embed_jobs.run_job(
+        kind="library-backfill", profile=override or "", space=f"library:{args.name}",
+        job_id=job_id, work=work,
+    )
+
+
 def cmd_library(args: argparse.Namespace) -> int:
     """`khipu library ...`: library sources (a folder of .txt/.md files as a
     search space). Refusals print {"ok": false, "error": ...} and exit 2;
@@ -1260,6 +1381,9 @@ def cmd_library(args: argparse.Namespace) -> int:
     from khipu import library
 
     cmd = args.library_cmd
+    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+    if cmd == "backfill" and (getattr(args, "job", False) or getattr(args, "job_id", None)):
+        return cmd_library_backfill_job(args)
     try:
         if cmd == "add":
             library.prepare_add(args.name, args.root)  # refuse before touching the hub
@@ -1281,8 +1405,10 @@ def cmd_library(args: argparse.Namespace) -> int:
             elif cmd == "scan":
                 out = library.scan(conn, args.name)
             elif cmd == "backfill":
+                # --bypass-harness (sonnet lane): dispatched agent, no delegation.
                 out = library.backfill(
-                    conn, args.name, limit=args.limit, stale=bool(args.stale)
+                    conn, args.name, limit=args.limit, stale=bool(args.stale),
+                    profile=getattr(args, "profile", None),
                 )
             else:  # import
                 out = library.import_index(
@@ -3475,6 +3601,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile",
         help="Target profile id (default: active). e.g. gemini-embedding-2@768",
     )
+    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+    bf.add_argument(
+        "--stale", action="store_true",
+        help="Accepted for symmetry with `library backfill`: memory backfill always "
+        "re-embeds chunks whose text changed since they were embedded",
+    )
+    bf.add_argument(
+        "--job", action="store_true",
+        help="Run as a job: progress file in <data_dir>/jobs, SIGTERM cancels after the "
+        "current batch, one JSON line on stdout. Needs --profile",
+    )
+    bf.add_argument("--job-id", dest="job_id", default=None,
+                    help="Job id for the progress file (implies --job; default generated)")
+    es = em_sub.add_parser(
+        "estimate", help="Chunks, tokens, list price and time a re-embed would take (no model call)"
+    )
+    es.add_argument("--profile", required=True, help="Profile id to embed under")
+    es.add_argument("--space", default="memory", help="memory (default) or library:NAME")
+    es.add_argument("--stale", action="store_true",
+                    help="Library only: also count chunks whose text changed (memory always does)")
+    jb = em_sub.add_parser("jobs", help="List embedding job files (progress receipts)")
+    jb.add_argument("--clear", action="store_true", help="Remove finished jobs' files")
+    tk = em_sub.add_parser(
+        "test-key", help="Embed one short string with the provider's stored key: {ok, ms, dim}"
+    )
+    tk.add_argument("--provider", required=True, help="gemini | voyage | openai-compatible")
+    tk.add_argument("--endpoint", help="openai-compatible only: base URL")
+    tk.add_argument("--model", help="Model (default gemini-embedding-2 / voyage-3; required for "
+                    "openai-compatible)")
     st = em_sub.add_parser(
         "status", help="Coverage per kind for active or named profile"
     )
@@ -3498,7 +3653,18 @@ def build_parser() -> argparse.ArgumentParser:
         "profiles", help="List embedding profiles or add one (provider adapter + record)"
     )
     pr_sub = pr.add_subparsers(dest="profiles_cmd", required=True)
-    pr_sub.add_parser("list", help="Every profile: provider, model, dim, endpoint, rows per space")
+    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+    pr_sub.add_parser(
+        "list",
+        help="Every profile: provider, model, dim, endpoint, rows per space, where it is used, "
+        "coverage per space, key presence, median query ms, list price",
+    )
+    pd = pr_sub.add_parser(
+        "delete",
+        help="Delete a profile nothing uses and all its vectors (refuses when in use)",
+    )
+    pd.add_argument("id", help="Profile id, e.g. voyage-3@1024")
+    pd.add_argument("--yes", action="store_true", help="Required: confirms the delete")
     pa = pr_sub.add_parser(
         "add",
         help="Register a profile (inactive); the id must be model@dim, never overwritten",
@@ -3543,10 +3709,19 @@ def build_parser() -> argparse.ArgumentParser:
     lb = lib_sub.add_parser("backfill", help="Embed chunks that have no vector under the library's profile")
     lb.add_argument("name")
     lb.add_argument("--limit", type=int, default=None, help="Embed at most N chunks this run")
+    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     lb.add_argument(
         "--stale", action="store_true",
         help="Also re-embed chunks whose text changed since they were embedded",
     )
+    lb.add_argument("--profile", default=None,
+                    help="Embed under this profile instead of the library's own (a re-embed "
+                    "in preparation; the library's pointer does not move)")
+    lb.add_argument("--job", action="store_true",
+                    help="Run as a job: progress file in <data_dir>/jobs, SIGTERM cancels "
+                    "after the current batch, one JSON line on stdout")
+    lb.add_argument("--job-id", dest="job_id", default=None,
+                    help="Job id for the progress file (implies --job; default generated)")
     li = lib_sub.add_parser(
         "import",
         help="Import vectors computed elsewhere (graphify SQLite `embeddings` table, or .jsonl)",
@@ -3623,6 +3798,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Profile id (default gemini-embedding-2@768)",
     )
     emb.set_defaults(func=cmd_embed_media_backfill)
+
+    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+    # Detached-spawn wrappers (the desktop app's job pattern: one hyphenated
+    # subcommand, output goes to a log, progress goes to <data_dir>/jobs/<id>.json).
+    ebj = sub.add_parser(
+        "embed-backfill",
+        help="Job: embed memory under --profile with a progress file (= embed backfill --job)",
+    )
+    ebj.add_argument("--profile", required=True, help="Profile id to embed under")
+    ebj.add_argument("--job-id", dest="job_id", default=None, help="Job id (default generated)")
+    ebj.add_argument("--limit", type=int, default=None, help="Cap chunks this run")
+    ebj.set_defaults(func=cmd_embed_backfill_job)
+    lbj = sub.add_parser(
+        "library-backfill",
+        help="Job: embed library NAME with a progress file (= library backfill NAME --job)",
+    )
+    lbj.add_argument("name")
+    lbj.add_argument("--profile", default=None, help="Embed under this profile, not the library's own")
+    lbj.add_argument("--stale", action="store_true", help="Also re-embed changed chunks")
+    lbj.add_argument("--job-id", dest="job_id", default=None, help="Job id (default generated)")
+    lbj.add_argument("--limit", type=int, default=None, help="Cap chunks this run")
+    lbj.set_defaults(func=cmd_library_backfill_job)
 
     md = sub.add_parser(
         "models",

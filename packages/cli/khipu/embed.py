@@ -1,3 +1,5 @@
+# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
+# agent (brief: do not delegate); no further agent to route to.
 """Vectors for real — P3 step 3 (2026-08-17) + Gemini Embedding 2 profile (2026-08-19)
 + native media (PNG/JPEG) under Embedding 2 (2026-08-20).
 
@@ -725,9 +727,88 @@ def embed_one(
     input_type: str | None = None,
 ) -> list[float]:
     extra = {"input_type": input_type} if input_type else {}
-    return embed_batch(
-        [text], profile=profile, retries=retries, timeout=timeout, delay=delay, **extra,
-    )[0]
+    if input_type != "query":
+        return embed_batch(
+            [text], profile=profile, retries=retries, timeout=timeout, delay=delay, **extra,
+        )[0]
+    # The interactive path: how long the provider took is what the Embeddings
+    # screen shows beside each model (median over the last day), so a slow
+    # provider is visible before anyone picks it. Batch embedding is not timed.
+    t0 = time.monotonic()
+    try:
+        vec = embed_batch(
+            [text], profile=profile, retries=retries, timeout=timeout, delay=delay, **extra,
+        )[0]
+    except Exception:
+        _log_query_timing(profile, (time.monotonic() - t0) * 1000.0, False)
+        raise
+    _log_query_timing(profile, (time.monotonic() - t0) * 1000.0, True)
+    return vec
+
+
+# ---- query-embedding timing log -----------------------------------------------
+# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+
+TIMING_KEEP = 500          # lines kept after a trim
+TIMING_TRIM_AT = 1000      # trim when the file holds more than this many lines
+# A line is never shorter than ~50 bytes, so a file under this size cannot hold
+# TIMING_TRIM_AT lines: the line count (a read of the whole file) is skipped.
+_TIMING_COUNT_BYTES = 40_000
+
+
+def _timings_path() -> Path:
+    from khipu.paths import data_dir
+
+    return data_dir() / "embed_timings.jsonl"
+
+
+def _log_query_timing(profile: str, ms: float, ok: bool) -> None:
+    """Append ``{ts, profile, ms, ok}`` (``ts`` is epoch seconds) to
+    ``<data_dir>/embed_timings.jsonl``, keeping the last TIMING_KEEP lines once
+    the file passes TIMING_TRIM_AT. Never raises: a log we cannot write must not
+    fail a search."""
+    try:
+        path = _timings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            {"ts": round(time.time(), 3), "profile": profile, "ms": int(round(ms)), "ok": bool(ok)},
+            separators=(",", ":"),
+        )
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        if path.stat().st_size < _TIMING_COUNT_BYTES:
+            return
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) > TIMING_TRIM_AT:
+            tmp = path.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(lines[-TIMING_KEEP:]) + "\n", encoding="utf-8")
+            tmp.replace(path)
+    except Exception:  # noqa: BLE001 - observability only
+        pass
+
+
+def median_query_ms(profile: str | None = None, *, hours: float = 24.0) -> dict[str, int | None]:
+    """Median ms of successful query embeddings in the last ``hours``: for one
+    ``profile`` -> ``{profile: ms | None}``; for ``None`` -> every profile seen."""
+    import statistics
+
+    cutoff = time.time() - hours * 3600.0
+    by: dict[str, list[int]] = {}
+    try:
+        for raw in _timings_path().read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(raw)
+                if not row.get("ok") or float(row["ts"]) < cutoff:
+                    continue
+                by.setdefault(str(row["profile"]), []).append(int(row["ms"]))
+            except (ValueError, KeyError, TypeError):
+                continue
+    except OSError:
+        pass
+    if profile is not None:
+        vals = by.get(profile)
+        return {profile: int(statistics.median(vals)) if vals else None}
+    return {p: int(statistics.median(v)) for p, v in by.items()}
 
 
 def embed_batch_images(
@@ -1149,17 +1230,85 @@ def _api_texts(
     return [chunk for _, chunk in chunks]
 
 
+# ---- the memory space as a set of chunks (coverage, estimate) ---------------------
+# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
+
+def memory_chunk_plan(cur) -> dict[tuple[str, str, int], tuple[str, int]]:
+    """Every chunk the default memory sweep embeds (episodes and topics, not
+    commitments or media): ``(kind, ref, chunk_idx) -> (content_hash, chars)``."""
+    plan: dict[tuple[str, str, int], tuple[str, int]] = {}
+    for k, ref, text, _title in _iter_sources(cur):
+        for i, chunk in _chunks_for(k, text):
+            plan[(k, ref, i)] = (_md5(chunk), len(chunk))
+    return plan
+
+
+def memory_gaps(cur, profile: str, plan=None):
+    """``(plan, missing, stale)`` for ``profile``: ``missing`` are plan keys with
+    no vector, ``stale`` are plan keys whose embedded hash differs from the
+    chunk's current hash (what ``backfill`` re-embeds)."""
+    if plan is None:
+        plan = memory_chunk_plan(cur)
+    have = _existing_hashes(cur, profile)
+    missing = [k for k in plan if k not in have]
+    stale = [k for k, (h, _c) in plan.items() if k in have and have[k] != h]
+    return plan, missing, stale
+
+
+def cov_pct(done: int, total: int) -> float:
+    """Never round a gap away: only true completeness reads 100."""
+    if not total:
+        return 0.0
+    if done >= total:
+        return 100.0
+    return min(99.9, int(1000 * done / total) / 10)
+
+
+def _ref_label(key: tuple[str, str, int]) -> str:
+    return f"{key[0]}:{key[1]}"
+
+
+def memory_coverage_fields(plan, missing, stale, *, sample: int = 5) -> dict[str, Any]:
+    """The chunk-level coverage block, with the same names a library's
+    ``status`` uses: chunks (total), embedded, missing, stale, pct,
+    sample_missing, sample_stale (distinct refs, at most ``sample``)."""
+    total = len(plan)
+    embedded = total - len(missing)
+
+    def refs(keys):
+        out: list[str] = []
+        for key in sorted(keys):
+            label = _ref_label(key)
+            if label not in out:
+                out.append(label)
+            if len(out) >= sample:
+                break
+        return out
+
+    return {
+        "chunks": total, "embedded": embedded, "missing": len(missing), "stale": len(stale),
+        "pct": cov_pct(max(0, embedded - len(stale)), total),
+        "sample_missing": refs(missing), "sample_stale": refs(stale),
+    }
+
+
 def backfill(
     *,
     kind: str | None = None,
     limit: int | None = None,
     dry_run: bool = False,
     profile: str | None = None,
+    job=None,
 ) -> dict[str, Any]:
     """Embed every missing / changed chunk under active or named profile. Idempotent.
 
     ``kind`` restricts the sweep; ``kind="commitment"`` is opt-in only (it is
-    never part of the default all-kinds pass — see ``_iter_sources``)."""
+    never part of the default all-kinds pass — see ``_iter_sources``).
+
+    ``job`` (``khipu.embed_jobs.Job``, optional) receives ``update(done, total,
+    failed)`` after every batch and is asked ``cancelled`` before each one: a
+    cancelled run finishes the batch in flight, stops, and returns
+    ``cancelled: True``."""
     from khipu.db import connect
 
     stats: dict[str, Any] = {
@@ -1228,7 +1377,13 @@ def backfill(
                 stats["would_embed"] = len(todo)
                 return stats
             stats["failed_chunks"] = 0
+            if job is not None:
+                job.update(0, len(todo), 0)
             for start in range(0, len(todo), BATCH):
+                if job is not None and job.cancelled:
+                    stats["cancelled"] = True
+                    _log("cancelled: stopping before the next batch")
+                    break
                 batch = todo[start : start + BATCH]
                 # todo rows: (kind, ref, idx, chunk, hash, title)
                 api = _api_texts(profile, [(title, chunk) for _k, _r, _i, chunk, _h, title in batch])
@@ -1260,6 +1415,8 @@ def backfill(
                     if "API key not found" in msg and not stats.get("embed_provider"):
                         stats["embed_provider"] = "missing key"
                     _log(f"batch failed ({type(exc).__name__}): {exc}; continuing")
+                    if job is not None:
+                        job.update(stats["embedded"], len(todo), stats["failed_chunks"])
                     if start + BATCH < len(todo):
                         time.sleep(BACKFILL_PAUSE_S)
                     continue
@@ -1271,11 +1428,13 @@ def backfill(
                 conn.commit()
                 stats["embedded"] += len(batch)
                 stats["batches"] += 1
+                if job is not None:
+                    job.update(stats["embedded"], len(todo), stats["failed_chunks"])
                 if stats["batches"] % 10 == 0:
                     _log(f"  {stats['embedded']}/{len(todo)}")
                 if start + BATCH < len(todo):
                     time.sleep(BACKFILL_PAUSE_S)
-            if stats["embedded"]:
+            if stats["embedded"] and not stats.get("cancelled"):
                 # After the bulk insert, not before: building the graph once
                 # over finished rows is far cheaper than maintaining it per
                 # batch. A no-op once the profile's index exists.
@@ -2454,8 +2613,13 @@ def topics_embed_lag_minutes(*, profile: str | None = None) -> dict[str, Any]:
     }
 
 
-def coverage(*, profile: str | None = None) -> dict[str, Any]:
-    """Per-kind coverage for active or named profile — the 'status UI that can't lie'."""
+def coverage(*, profile: str | None = None, detail: bool = False) -> dict[str, Any]:
+    """Per-kind coverage for active or named profile — the 'status UI that can't lie'.
+
+    ``detail=True`` adds the chunk-level block (``chunks``, ``embedded``,
+    ``missing``, ``stale``, ``pct``, ``sample_missing``, ``sample_stale`` — the
+    names a library's ``status`` uses). It chunks every episode and topic, so
+    ``embed status`` asks for it and doctor / activate do not."""
     from khipu.db import connect
 
     with connect() as conn:
@@ -2526,6 +2690,10 @@ def coverage(*, profile: str | None = None) -> dict[str, Any]:
             active_row = cur.fetchone()
             active = active_row[0] if active_row else None
             qcache = query_cache_status(cur)
+            chunk_block: dict[str, Any] = {}
+            if detail:
+                plan, missing, stale = memory_gaps(cur, profile)
+                chunk_block = memory_coverage_fields(plan, missing, stale)
     e = by.get("episode", {"refs": 0, "chunks": 0})
     t = by.get("topic", {"refs": 0, "chunks": 0})
     m = by.get("media", {"refs": 0, "chunks": 0})
@@ -2560,6 +2728,7 @@ def coverage(*, profile: str | None = None) -> dict[str, Any]:
         # Informational: neither gates activate() nor doctor.
         "query_cache": qcache,
         "budget": budget_status(),
+        **chunk_block,
     }
 
 

@@ -32,7 +32,7 @@ import sqlite3
 import struct
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
@@ -508,13 +508,23 @@ def _remaining(cur, src: Source, stale: bool) -> int:
     return int(cur.fetchone()[0])
 
 
-def backfill(conn, name: str, *, limit: int | None = None, stale: bool = False) -> dict[str, Any]:
+def backfill(conn, name: str, *, limit: int | None = None, stale: bool = False,
+             profile: str | None = None, job=None) -> dict[str, Any]:
     """Embed this library's chunks that have no vector under its profile
     (``stale=True`` also those whose text changed since they were embedded).
     Same per-batch isolation and daily budget as the memory backfill: a failed
-    batch is counted and skipped, an exhausted budget stops the run."""
+    batch is counted and skipped, an exhausted budget stops the run.
+
+    ``profile`` embeds under another profile than the library's own (a re-embed
+    in preparation; the library keeps using its pointer). ``job``
+    (``khipu.embed_jobs.Job``) gets ``update(done, total, failed)`` after each
+    batch and is asked ``cancelled`` before the next; a cancelled run finishes
+    the batch in flight, stops, and returns ``cancelled: True``."""
+    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     with conn.cursor() as cur:
         src = get_source(cur, name)
+        if profile and profile != src.profile:
+            src = replace(src, profile=profile)
         spec = profiles.resolve_spec(src.profile, cur)
         stats: dict[str, Any] = {
             "ok": True, "source": name, "profile": src.profile,
@@ -523,7 +533,16 @@ def backfill(conn, name: str, *, limit: int | None = None, stale: bool = False) 
         cond = _TODO_STALE if stale else _TODO_MISSING
         last = (-1, -1)
         attempted = 0
+        total = _remaining(cur, src, stale)
+        if limit is not None:
+            total = min(total, limit)
+        if job is not None:
+            job.update(0, total, 0)
         while True:
+            if job is not None and job.cancelled:
+                stats["cancelled"] = True
+                _log(f"{name}: cancelled: stopping before the next batch")
+                break
             size = embed.BATCH if limit is None else min(embed.BATCH, limit - attempted)
             if size <= 0:
                 break
@@ -561,6 +580,8 @@ def backfill(conn, name: str, *, limit: int | None = None, stale: bool = False) 
                 if "API key not found" in str(exc) and not stats.get("embed_provider"):
                     stats["embed_provider"] = "missing key"
                 _log(f"{name}: batch failed ({type(exc).__name__}): {exc}; continuing")
+                if job is not None:
+                    job.update(stats["embedded"], total, stats["failed"])
                 time.sleep(embed.BACKFILL_PAUSE_S)
                 continue
             cur.executemany(
@@ -571,9 +592,11 @@ def backfill(conn, name: str, *, limit: int | None = None, stale: bool = False) 
             conn.commit()
             stats["embedded"] += len(batch)
             stats["batches"] += 1
+            if job is not None:
+                job.update(stats["embedded"], total, stats["failed"])
             if len(batch) == size:
                 time.sleep(embed.BACKFILL_PAUSE_S)
-        if stats["embedded"]:
+        if stats["embedded"] and not stats.get("cancelled"):
             # After the inserts, not before: one build over finished rows is far
             # cheaper than maintaining the graph per batch. A no-op once it exists.
             profiles.ensure_profile_index(cur, src.profile, "library_embeddings", quiet=True)
