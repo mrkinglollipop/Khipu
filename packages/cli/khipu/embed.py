@@ -2066,6 +2066,75 @@ def _fair_fill(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
     return result[:limit]
 
 
+# Library legs run beside the memory legs on their own connection (2026-10-07):
+# serial, a 329k-row library added ~1-2.5 s to a default search. The join waits
+# only for what is left of this budget (measured from search start); a library
+# that has not answered by then is dropped and named, never waited on.
+LIBRARY_LEG_BUDGET_S = 6.0
+LIBRARY_JOIN_FLOOR_S = 0.5
+
+
+class _LibraryLegs:
+    """The default search's library work on a worker thread.
+
+    Owns its connection, timing dict and degraded-leg list: psycopg connections
+    are not thread-safe and the main thread keeps mutating its own ``timing``,
+    so nothing is shared until ``join`` merges a finished result."""
+
+    def __init__(self, query: str, *, mode: str, oversample: int) -> None:
+        self._query, self._mode, self._oversample = query, mode, oversample
+        self._started = time.monotonic()
+        self._conn = None
+        self._timing: dict[str, Any] = {}
+        self._legs: list[str] = []
+        self._result: tuple[list, list, list] | None = None
+        self._error: str | None = None
+        self._wall_ms: float | None = None
+        self._thread = threading.Thread(target=self._run, name="khipu-library-legs", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            from khipu import library_search as _ls
+            from khipu.hub_snapshot import try_hub_connect
+
+            with try_hub_connect() as conn:
+                self._conn = conn
+                with conn.cursor() as cur:
+                    self._result = _ls.library_candidates(
+                        conn, cur, self._query, mode=self._mode, kind=None, source=None,
+                        oversample=self._oversample, timing=self._timing,
+                        degraded_legs=self._legs,
+                    )
+        except BaseException as exc:  # noqa: BLE001 - a library failure must never sink the memory answer
+            self._error = f"{type(exc).__name__}: {exc}"[:120]
+        finally:
+            self._wall_ms = round((time.monotonic() - self._started) * 1000, 1)
+
+    def join(self, timing: dict[str, Any], degraded_legs: list[str]):
+        """``(cosine_lists, literal_rows, names)``; empty when dropped."""
+        remaining = LIBRARY_LEG_BUDGET_S - (time.monotonic() - self._started)
+        self._thread.join(max(LIBRARY_JOIN_FLOOR_S, remaining))
+        if self._thread.is_alive():
+            degraded_legs.append("library:timeout")
+            timing["library_wall_ms"] = round((time.monotonic() - self._started) * 1000, 1)
+            try:  # best effort: stop the abandoned statement so it frees its connection
+                if self._conn is not None:
+                    self._conn.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            return [], [], []
+        timing.update(self._timing)
+        timing["library_wall_ms"] = self._wall_ms
+        degraded_legs.extend(self._legs)
+        if self._error is not None or self._result is None:
+            degraded_legs.append("library:error")
+            if self._error:
+                timing["library_error"] = self._error
+            return [], [], []
+        return self._result
+
+
 def hybrid_search(
     query: str,
     *,
@@ -2191,6 +2260,12 @@ def hybrid_search(
     lib_cos_lists: list[list[dict[str, Any]]] = []
     lib_literal: list[dict[str, Any]] = []
     lib_names: list[str] = []
+    # Default search only: the library legs start now, beside the memory legs.
+    # An explicit kind="library" has no memory legs to overlap, so it stays serial.
+    lib_legs = (
+        _LibraryLegs(query, mode=mode, oversample=oversample)
+        if want_library and kind is None else None
+    )
 
     cosine_rows: list[dict[str, Any]] = []
     # kind="node" (only valid for hybrid/literal, never semantic — checked
@@ -2231,7 +2306,9 @@ def hybrid_search(
                 )
                 timing["literal_ms"] = round((time.monotonic() - _t) * 1000, 1)
 
-            if want_library:
+            if lib_legs is not None:
+                lib_cos_lists, lib_literal, lib_names = lib_legs.join(timing, degraded_legs)
+            elif want_library:
                 from khipu import library_search as _ls
 
                 lib_cos_lists, lib_literal, lib_names = _ls.library_candidates(
