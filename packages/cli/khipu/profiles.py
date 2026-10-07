@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import os
 import sys
 import threading
 from dataclasses import dataclass
@@ -356,6 +357,13 @@ def ensure_profile_index(
     if cur.fetchone():
         return name
     literal = profile.replace("'", "''")
+    # An HNSW build over a large table needs its graph in memory or it crawls
+    # (pgvector logs "graph no longer fits into maintenance_work_mem"); a hub's
+    # default is 64 MB. KHIPU_INDEX_MEMORY (e.g. 1200MB) raises it for this
+    # transaction only, so an import on a small box can be sized by hand.
+    mem = (os.environ.get("KHIPU_INDEX_MEMORY") or "").strip()
+    if mem and re.fullmatch(r"\d{1,5}(MB|GB)", mem):
+        cur.execute(f"SET LOCAL maintenance_work_mem = '{mem}'")
     cur.execute(
         f"CREATE INDEX IF NOT EXISTS {name} ON {table}"
         f" USING hnsw ((embedding::vector({dim})) vector_cosine_ops)"
