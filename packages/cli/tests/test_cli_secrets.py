@@ -73,6 +73,23 @@ class SecretsSetTest(unittest.TestCase):
             "openai_compat_in_keychain",
         )
 
+    def test_voyage_api_key_is_allowed_and_maps_to_its_presence_field(self):
+        self.assertEqual(cli.SETTABLE_SECRETS["voyage_api_key"], "voyage_in_keychain")
+        status = {"gemini_in_keychain": False, "dsn_in_keychain": False,
+                  "voyage_in_keychain": True}
+        args = mock.Mock(set="voyage_api_key")
+        calls = []
+        with mock.patch("khipu.keychain.set_password", side_effect=lambda a, v: calls.append((a, v))), \
+             mock.patch("khipu.keychain.secrets_status", return_value=status), \
+             mock.patch("sys.stdin", io.StringIO("pa-voyage-key\n")), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = cli.cmd_secrets(args)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [("voyage_api_key", "pa-voyage-key")])
+        self.assertTrue(payload["stored"])
+        self.assertNotIn("pa-voyage-key", json.dumps(payload))
+
     def test_empty_stdin_is_refused(self):
         for blank in ("", "\n", "   \n"):
             with self.subTest(blank=blank):

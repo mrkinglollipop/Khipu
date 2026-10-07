@@ -401,7 +401,8 @@ def _cached_query_embed(prompt: str, profile: str) -> list[float]:
         return hit
     api_q = prefix_query(prompt) if uses_task_prefixes(profile) else prompt
     vec = embed_one(
-        api_q, profile=profile, retries=0, timeout=QUERY_EMBED_LOCAL_TIMEOUT_S, delay=0
+        api_q, profile=profile, retries=0, timeout=QUERY_EMBED_LOCAL_TIMEOUT_S, delay=0,
+        input_type="query",
     )
     _query_embed_cache_put(key, vec)
     return vec

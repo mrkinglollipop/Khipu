@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sys
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -262,42 +263,106 @@ def list_profiles(cur) -> list[dict[str, Any]]:
     return out
 
 
-# ---- library index ------------------------------------------------------------
+# ---- per-profile vector index -------------------------------------------------
 
-def library_index_name(profile: str) -> str:
-    """Postgres identifier for one profile's library HNSW index (63-byte cap)."""
-    safe = re.sub(r"[^a-z0-9]+", "_", profile.lower()).strip("_")
-    name = f"idx_library_hnsw_{safe}"
-    if len(name) > 60:
+# Both vector tables hold an UNTYPED ``vector`` column (profiles of different
+# widths share a table), so each profile gets its own partial expression HNSW
+# index, created by code because a migration cannot know future dimensions.
+INDEXED_TABLES = ("memory_embeddings", "library_embeddings")
+_INDEX_PREFIX = {"memory_embeddings": "idx_memory_hnsw_", "library_embeddings": "idx_library_hnsw_"}
+# 0004/0005 named these two; 0026 recreates them as expression indexes under
+# the same names, so ensure_profile_index must reuse them, not add a twin.
+_LEGACY_INDEX = {
+    ("memory_embeddings", "gemini-embedding-001@768"): "idx_memory_embeddings_hnsw_gemini768",
+    ("memory_embeddings", "gemini-embedding-2@768"): "idx_memory_embeddings_hnsw_gemini2_768",
+}
+
+
+def profile_index_name(profile: str, table: str = "library_embeddings") -> str:
+    """Postgres identifier for one profile's index on ``table`` (63-byte cap)."""
+    if table not in _INDEX_PREFIX:
+        raise ValueError(f"no per-profile index for table {table!r}")
+    legacy = _LEGACY_INDEX.get((table, profile))
+    if legacy:
+        return legacy
+    safe = re.sub(r"[^a-z0-9_]+", "_", profile.lower()).strip("_") or "profile"
+    name = f"{_INDEX_PREFIX[table]}{safe}"
+    # An id that is not the model@dim shape (an old row, a hand-made one) can
+    # sanitise to the same text as another; a hash of the raw id keeps them apart.
+    if len(name) > 60 or not _ID_RE.match(profile):
         name = f"{name[:50]}_{hashlib.sha1(profile.encode()).hexdigest()[:9]}"
     return name
 
 
-def ensure_library_index(cur, profile: str) -> str:
-    """Create (idempotently) the partial expression HNSW index for ``profile``.
+def library_index_name(profile: str) -> str:
+    return profile_index_name(profile, "library_embeddings")
 
-    ``library_embeddings.embedding`` has no declared dimension, so pgvector can
-    only index it through a cast, and a partial index per profile keeps each
-    profile's vectors in their own graph. A query uses the index only when it
-    repeats both the cast and the predicate::
 
-        SELECT ... FROM library_embeddings
+def ensure_profile_index(
+    cur, profile: str, table: str, *, dim: int | None = None, quiet: bool = False,
+) -> str | None:
+    """Create (idempotently) the partial expression HNSW index for ``profile``
+    on ``table`` (``memory_embeddings`` or ``library_embeddings``).
+
+    The dimension is ``dim`` if given, else the profile's record (seed, cache,
+    or its ``embedding_profiles`` row); the id is never parsed, because old
+    rows may carry any id. A query uses the index only when it repeats both
+    the cast and the predicate::
+
+        SELECT ... FROM <table>
          WHERE profile = '<id>'
          ORDER BY embedding::vector(<dim>) <=> %s::vector(<dim>) LIMIT n
 
-    ``profile`` is spliced into DDL, so it is re-validated against the id
-    pattern here, not trusted from the caller. Returns the index name.
+    ``table`` is allow-listed and the id is quote-escaped, since both are
+    spliced into DDL. The existence check is a SELECT, so a nightly backfill
+    that finds the index present runs no DDL.
+
+    ``quiet=True`` is for callers whose real job must not fail over an index
+    (activate, backfill, profiles add): the work runs under a savepoint, any
+    failure (no profile row, no pgvector, dim above 2000, privileges) is
+    logged as one line and swallowed, the table is searched sequentially, and
+    None is returned. Returns the index name on success.
     """
-    _model, dim = parse_profile_id(profile)
+    if table not in INDEXED_TABLES:
+        raise ValueError(f"no per-profile index for table {table!r}")
+    if quiet:
+        cur.execute("SAVEPOINT khipu_profile_index")
+        try:
+            name = ensure_profile_index(cur, profile, table, dim=dim)
+        except Exception as exc:  # noqa: BLE001 - an index is never worth the caller's job
+            cur.execute("ROLLBACK TO SAVEPOINT khipu_profile_index")
+            print(f"[khipu-embed] no index for {profile} on {table}: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            return None
+        cur.execute("RELEASE SAVEPOINT khipu_profile_index")
+        return name
+    if dim is None:
+        spec = cached_spec(profile) or load_spec(cur, profile)
+        if spec is None:
+            raise ValueError(f"no embedding_profiles row for {profile!r}; cannot tell its dimension")
+        dim = spec.dim
+    dim = int(dim)
+    if dim < 1:
+        raise ValueError(f"{profile}: dimension must be positive, got {dim}")
     if dim > MAX_INDEXED_DIM:
         raise ValueError(
             f"{profile}: pgvector indexes at most {MAX_INDEXED_DIM} dimensions "
             f"on vector(n); {dim} would need halfvec"
         )
-    name = library_index_name(profile)
+    name = profile_index_name(profile, table)
     cur.execute(
-        f"CREATE INDEX IF NOT EXISTS {name} ON library_embeddings"
+        "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = %s", (name,)
+    )
+    if cur.fetchone():
+        return name
+    literal = profile.replace("'", "''")
+    cur.execute(
+        f"CREATE INDEX IF NOT EXISTS {name} ON {table}"
         f" USING hnsw ((embedding::vector({dim})) vector_cosine_ops)"
-        f" WHERE profile = '{profile}'"
+        f" WHERE profile = '{literal}'"
     )
     return name
+
+
+def ensure_library_index(cur, profile: str, *, dim: int | None = None) -> str | None:
+    return ensure_profile_index(cur, profile, "library_embeddings", dim=dim)

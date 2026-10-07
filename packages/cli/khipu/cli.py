@@ -1187,6 +1187,8 @@ def cmd_embed(args: argparse.Namespace) -> int:
     if args.embed_cmd == "status":
         print(json.dumps(coverage(profile=getattr(args, "profile", None)), indent=2))
         return 0
+    if args.embed_cmd == "profiles":
+        return _cmd_embed_profiles(args)
     if args.embed_cmd == "activate":
         try:
             out = activate(args.profile, force=bool(args.force))
@@ -1202,6 +1204,37 @@ def cmd_embed(args: argparse.Namespace) -> int:
         profile=getattr(args, "profile", None),
     )
     print(json.dumps(stats, indent=2))
+    return 0
+
+
+def _cmd_embed_profiles(args: argparse.Namespace) -> int:
+    """`khipu embed profiles list|add`: the embedding_profiles table, no model call."""
+    from khipu import profiles
+    from khipu.db import connect
+
+    if args.profiles_cmd == "list":
+        with connect() as conn:
+            with conn.cursor() as cur:
+                print(json.dumps({"profiles": profiles.list_profiles(cur)}, indent=2))
+        return 0
+    try:
+        spec = profiles.validate_spec(
+            args.id, provider=args.provider, model=args.model, dim=args.dim,
+            endpoint=args.endpoint, normalize=args.normalize,
+        )
+        with connect() as conn:
+            with conn.cursor() as cur:
+                out = profiles.add_profile(cur, spec)
+                # Both spaces can serve this profile; index it up front (empty,
+                # so instant). A failure is logged, never fatal: search still
+                # works without the index, just sequentially.
+                for table in profiles.INDEXED_TABLES:
+                    profiles.ensure_profile_index(cur, spec.id, table, dim=spec.dim, quiet=True)
+            conn.commit()
+    except (ValueError, RuntimeError) as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+    print(json.dumps(out, indent=2))
     return 0
 
 
@@ -3352,6 +3385,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Activate even when the profile still has missing vectors",
+    )
+    pr = em_sub.add_parser(
+        "profiles", help="List embedding profiles or add one (provider adapter + record)"
+    )
+    pr_sub = pr.add_subparsers(dest="profiles_cmd", required=True)
+    pr_sub.add_parser("list", help="Every profile: provider, model, dim, endpoint, rows per space")
+    pa = pr_sub.add_parser(
+        "add",
+        help="Register a profile (inactive); the id must be model@dim, never overwritten",
+    )
+    pa.add_argument("id", help="Profile id, exactly model@dim, e.g. voyage-3@1024")
+    pa.add_argument(
+        "--provider", required=True,
+        help="gemini | voyage | openai-compatible (checked by the command)",
+    )
+    pa.add_argument("--model", required=True, help="Provider model name")
+    pa.add_argument("--dim", required=True, type=int, help="Vector dimension")
+    pa.add_argument(
+        "--endpoint",
+        help="openai-compatible only: base URL, https (http only for localhost). "
+        "The key, if any, is the Keychain item openai_compat_api_key",
+    )
+    pa.add_argument(
+        "--normalize", default="l2", choices=("l2", "none"),
+        help="L2-normalise vectors on the way in (default l2)",
     )
     em.set_defaults(func=cmd_embed)
 

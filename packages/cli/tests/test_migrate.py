@@ -198,6 +198,88 @@ class LiteralTrgmMigrationTest(unittest.TestCase):
                 self.assertIn(target, sql)
 
 
+class LibraryMigrationTest(unittest.TestCase):
+    """0026_library.sql (library sources + BYO embeddings, Session A). SQL-text
+    checks like the neighbours; the real-Postgres check is
+    packages/cli/scripts/scratch_pg.sh (pgvector-free: vector columns become
+    real[] there, so only statements and constraints are exercised)."""
+
+    def _sql(self) -> str:
+        for version, path in migrate.available():
+            if version == "0026_library":
+                return path.read_text(encoding="utf-8")
+        self.fail("0026_library.sql not found under ops/migrations")
+
+    def test_it_is_listed_and_self_records(self):
+        self.assertIn("0026_library", [v for v, _ in migrate.available()])
+        sql = self._sql()
+        self.assertIn("INSERT INTO schema_migrations", sql)
+        self.assertIn("'0026_library'", sql)
+
+    def test_every_statement_is_idempotent(self):
+        sql = self._sql()
+        self.assertIn("ADD COLUMN IF NOT EXISTS endpoint TEXT", sql)
+        for line in sql.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("CREATE TABLE"):
+                self.assertIn("IF NOT EXISTS", stripped)
+            if stripped.startswith("CREATE INDEX"):
+                self.assertIn("IF NOT EXISTS", stripped)
+
+    def test_the_four_library_tables_exist(self):
+        sql = self._sql()
+        for table in ("library_sources", "library_documents", "library_chunks", "library_embeddings"):
+            self.assertIn(f"CREATE TABLE IF NOT EXISTS {table} (", sql)
+
+    def _executable(self) -> str:
+        return "\n".join(
+            line for line in self._sql().splitlines() if not line.lstrip().startswith("--")
+        )
+
+    def test_the_embedding_column_is_an_untyped_vector(self):
+        import re
+
+        sql = self._executable()
+        self.assertRegex(sql, r"embedding\s+vector\s+NOT NULL")
+        self.assertIsNone(re.search(r"embedding\s+vector\(", sql))
+
+    def test_memory_vectors_become_untyped_and_the_gemini_indexes_are_recreated(self):
+        sql = self._executable()
+        self.assertIn("ALTER TABLE memory_embeddings ALTER COLUMN embedding TYPE vector;", sql)
+        self.assertIn("ALTER TABLE memory_query_cache ALTER COLUMN embedding TYPE vector;", sql)
+        # dropped before the ALTER, recreated after it, same names as 0004/0005
+        for name, pid in (
+            ("idx_memory_embeddings_hnsw_gemini768", "gemini-embedding-001@768"),
+            ("idx_memory_embeddings_hnsw_gemini2_768", "gemini-embedding-2@768"),
+        ):
+            with self.subTest(index=name):
+                self.assertIn(f"DROP INDEX IF EXISTS {name};", sql)
+                create = sql.index(f"CREATE INDEX IF NOT EXISTS {name}")
+                self.assertGreater(create, sql.index("ALTER TABLE memory_embeddings"))
+                self.assertLess(sql.index(f"DROP INDEX IF EXISTS {name};"),
+                                sql.index("ALTER TABLE memory_embeddings"))
+                tail = " ".join(sql[create:create + 260].split())
+                self.assertIn("USING hnsw ((embedding::vector(768)) vector_cosine_ops)", tail)
+                self.assertIn(f"WHERE profile = '{pid}'", tail)
+
+    def test_the_memory_alter_is_guarded_so_a_rerun_is_a_no_op(self):
+        sql = self._executable()
+        self.assertEqual(sql.count("atttypmod"), 2)
+        self.assertIn("to_regclass('public.memory_embeddings') IS NOT NULL", sql)
+
+    def test_no_library_index_is_built_by_the_migration(self):
+        sql = self._executable().lower()
+        self.assertNotIn("on library_embeddings using hnsw", sql.replace("\n", " "))
+        self.assertEqual(sql.count("create index if not exists idx_library"), 1)  # the doc index
+
+    def test_documents_are_unique_per_source_and_path_and_chunks_cascade(self):
+        sql = self._sql()
+        self.assertIn("UNIQUE (source, rel_path)", sql)
+        self.assertIn("PRIMARY KEY (document, chunk_idx)", sql)
+        self.assertIn("PRIMARY KEY (profile, document, chunk_idx)", sql)
+        self.assertGreaterEqual(sql.count("ON DELETE CASCADE"), 3)
+
+
 class DecisionEvidenceMigrationTest(unittest.TestCase):
     """0024_decision_evidence.sql (Phase 2, session A). No live Postgres
     fixture here (same posture as every other migrate test in this file) —

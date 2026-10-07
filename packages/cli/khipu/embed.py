@@ -37,6 +37,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
+from khipu import profiles as _profiles
+from khipu.profiles import ProfileSpec, resolve_spec
 from khipu.search_text import hybrid_rerank
 from khipu.snippets import FETCH_LIMIT, LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
 
@@ -49,11 +51,9 @@ PROFILE_2 = f"{MODEL_2}@{DIM}"
 MODEL = MODEL_001
 PROFILE_ID = PROFILE_001
 
-# Profile id → Gemini model name. Unknown ids refuse rather than guess.
-_PROFILE_MODELS: dict[str, str] = {
-    PROFILE_001: MODEL_001,
-    PROFILE_2: MODEL_2,
-}
+# Profile id -> record (provider, model, dim, normalize, endpoint) lives in
+# khipu.profiles: the two Gemini ids are seeded there, every other profile is
+# read from embedding_profiles. Unknown ids refuse rather than guess.
 
 CHUNK_CHARS = 6000
 CHUNK_OVERLAP = 300
@@ -254,12 +254,13 @@ def prefix_query(query: str) -> str:
 
 
 def model_for_profile(profile: str) -> str:
-    model = _PROFILE_MODELS.get(profile)
-    if not model:
+    """Model name for a seeded or already-loaded profile (no database access)."""
+    spec = _profiles.cached_spec(profile)
+    if spec is None:
         raise ValueError(
-            f"unknown embedding profile {profile!r}; known: {sorted(_PROFILE_MODELS)}"
+            f"unknown embedding profile {profile!r}; known: {_profiles.known_ids()}"
         )
-    return model
+    return spec.model
 
 
 def uses_task_prefixes(profile: str) -> bool:
@@ -290,13 +291,48 @@ def _gemini_key() -> str:
     return key
 
 
-def _note_auth_failure(status: int) -> None:
+_VOYAGE_KEY_CACHE: list[str] = []
+_OPENAI_KEY_CACHE: list[str | None] = []  # [None] = resolved, no key stored
+
+
+def _voyage_key() -> str:
+    """The Voyage key, resolved once per process like the Gemini key."""
+    with _KEY_LOCK:
+        if _VOYAGE_KEY_CACHE:
+            return _VOYAGE_KEY_CACHE[0]
+    from khipu.keychain import resolve_voyage_key
+
+    key = resolve_voyage_key()
+    with _KEY_LOCK:
+        _VOYAGE_KEY_CACHE[:] = [key]
+    return key
+
+
+def _openai_compat_key() -> str | None:
+    """The optional bearer for an OpenAI-compatible endpoint. A local server
+    needs none, so absence is a valid, cached answer (a 401/403 drops it)."""
+    with _KEY_LOCK:
+        if _OPENAI_KEY_CACHE:
+            return _OPENAI_KEY_CACHE[0]
+    from khipu.keychain import get_openai_compat_key
+
+    key = get_openai_compat_key()
+    with _KEY_LOCK:
+        _OPENAI_KEY_CACHE[:] = [key]
+    return key
+
+
+def _note_auth_failure(status: int, provider: str = "gemini") -> None:
     """Forget the cached key after a response that says it may be wrong. Gemini
     answers an invalid key with 400 (``API key not valid``), an unauthorised
-    one with 401 or 403."""
-    if status in (400, 401, 403):
+    one with 401 or 403; Voyage and OpenAI-compatible servers use 401/403."""
+    if provider == "gemini":
+        if status in (400, 401, 403):
+            with _KEY_LOCK:
+                _KEY_CACHE.clear()
+    elif status in (401, 403):
         with _KEY_LOCK:
-            _KEY_CACHE.clear()
+            (_VOYAGE_KEY_CACHE if provider == "voyage" else _OPENAI_KEY_CACHE).clear()
 
 
 def _urllib_transport(url: str, data: bytes, headers: dict[str, str], timeout: float) -> bytes:
@@ -475,7 +511,7 @@ def _query_vec(cur, conn, profile: str, api_q: str) -> tuple[list[float], str]:
     vec = embed_one(
         api_q, profile=profile,
         retries=QUERY_EMBED_RETRIES, timeout=QUERY_EMBED_TIMEOUT_S,
-        delay=QUERY_EMBED_DELAY_S,
+        delay=QUERY_EMBED_DELAY_S, input_type="query",
     )
     if not have_cache:
         return vec, "off"
@@ -520,23 +556,24 @@ def query_cache_status(cur) -> dict[str, Any]:
     return {"available": True, "rows": int(rows), "hits": int(hits)}
 
 
-def embed_batch(
-    texts: list[str],
-    *,
-    profile: str = PROFILE_001,
-    retries: int = 4,
-    timeout: float = 120.0,
-    delay: float = 2.0,
-    transport=None,
-) -> list[list[float]]:
-    """Embed up to BATCH texts; L2-normalized; dim-checked.
+# Per-request text cap by provider. Gemini's batchEmbedContents allows 100 and
+# callers already stay at BATCH (64), so it is left alone (None = send as given).
+# Voyage allows 1000 texts but caps tokens per request (120K for the large
+# models): 32 chunks of <= 8000 chars is about 64K tokens worst case.
+_MAX_PER_REQUEST: dict[str, int | None] = {
+    "gemini": None,
+    "voyage": 32,
+    "openai-compatible": 64,
+}
+VOYAGE_URL = "https://api.voyageai.com/v1/embeddings"
+VOYAGE_DEFAULT_DIM = 1024
+# Models whose output_dimension is selectable (docs.voyageai.com); the others
+# are fixed-width and reject the parameter, so it is sent only off the default.
+_VOYAGE_FLEX_PREFIXES = ("voyage-3-large", "voyage-3.5", "voyage-4", "voyage-code-3")
 
-    ``texts`` must already include any v2 task prefixes — callers store the
-    unprefixed chunk_text separately.
-    """
-    if not texts:
-        return []
-    model = model_for_profile(profile)
+
+def _build_gemini(spec: ProfileSpec, texts: list[str], input_type: str | None):
+    model = spec.model
     key = _gemini_key()
     # Header auth, not ?key=. The query-string form puts a live API key inside a
     # URL that any future logging, proxy, or exception-formatting change would
@@ -556,20 +593,64 @@ def embed_batch(
             for t in texts
         ]
     }
+    return url, body, {"Content-Type": "application/json", "x-goog-api-key": key}
+
+
+def _build_voyage(spec: ProfileSpec, texts: list[str], input_type: str | None):
+    body: dict[str, Any] = {
+        "input": [t[:MAX_TEXT_CHARS] for t in texts],
+        "model": spec.model,
+        "input_type": "query" if input_type == "query" else "document",
+    }
+    if spec.dim != VOYAGE_DEFAULT_DIM and spec.model.startswith(_VOYAGE_FLEX_PREFIXES):
+        body["output_dimension"] = spec.dim
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {_voyage_key()}"}
+    return VOYAGE_URL, body, headers
+
+
+def _build_openai_compatible(spec: ProfileSpec, texts: list[str], input_type: str | None):
+    if not spec.endpoint:
+        raise ValueError(f"profile {spec.id!r} has no endpoint")
+    url = f"{spec.endpoint.rstrip('/')}/v1/embeddings"
+    body = {"input": [t[:MAX_TEXT_CHARS] for t in texts], "model": spec.model}
+    headers = {"Content-Type": "application/json"}
+    key = _openai_compat_key()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return url, body, headers
+
+
+_BUILDERS = {
+    "gemini": _build_gemini,
+    "voyage": _build_voyage,
+    "openai-compatible": _build_openai_compatible,
+}
+
+
+def _parse_vectors(provider: str, payload: dict[str, Any]) -> list[list[float]]:
+    if provider == "gemini":
+        return [item["values"] for item in payload["embeddings"]]
+    # Voyage and the OpenAI shape: data[].embedding with an index; order by it.
+    items = sorted(payload["data"], key=lambda d: d.get("index", 0))
+    return [item["embedding"] for item in items]
+
+
+def _post_json(
+    url: str, body: dict[str, Any], headers: dict[str, str], *,
+    provider: str, retries: int, timeout: float, delay: float, transport=None,
+) -> dict[str, Any]:
+    """POST ``body`` with the retry ladder every provider shares: 429/5xx and
+    network errors back off ``delay`` doubling; anything else raises at once."""
     data = json.dumps(body).encode("utf-8")
     payload: dict[str, Any] = {}
     for attempt in range(retries + 1):
         _budget_take()
         try:
-            raw = (transport or _transport)(
-                url, data,
-                {"Content-Type": "application/json", "x-goog-api-key": key},
-                timeout,
-            )
+            raw = (transport or _transport)(url, data, headers, timeout)
             payload = json.loads(raw.decode("utf-8"))
             break
         except urllib.error.HTTPError as e:
-            _note_auth_failure(e.code)
+            _note_auth_failure(e.code, provider)
             err = e.read().decode("utf-8", errors="replace")
             if e.code in (429, 500, 502, 503, 504) and attempt < retries:
                 _log(f"embed HTTP {e.code}, retry in {delay:.0f}s")
@@ -588,13 +669,50 @@ def embed_batch(
                 delay *= 2
                 continue
             raise RuntimeError(f"embed network error after {retries} retries: {type(e).__name__}: {e}") from e
-    vecs = [item["values"] for item in payload["embeddings"]]
-    if len(vecs) != len(texts):
-        raise RuntimeError(f"embed returned {len(vecs)} vectors for {len(texts)} texts")
-    for v in vecs:
-        if len(v) != DIM:
-            raise RuntimeError(f"expected dim {DIM}, got {len(v)}")
-    return [_l2(v) for v in vecs]
+    return payload
+
+
+def embed_batch(
+    texts: list[str],
+    *,
+    profile: str = PROFILE_001,
+    retries: int = 4,
+    timeout: float = 120.0,
+    delay: float = 2.0,
+    transport=None,
+    input_type: str | None = None,
+) -> list[list[float]]:
+    """Embed texts under ``profile``'s provider; dim-checked, L2-normalized when
+    the profile says ``normalize='l2'`` (every shipped profile does).
+
+    ``texts`` must already include any v2 task prefixes — callers store the
+    unprefixed chunk_text separately. ``input_type`` ("query" | "document",
+    default document) is read only by Voyage, whose retrieval models embed the
+    two differently; Gemini uses text prefixes instead.
+    """
+    if not texts:
+        return []
+    spec = resolve_spec(profile)
+    builder = _BUILDERS.get(spec.provider)
+    if builder is None:
+        raise ValueError(f"profile {profile!r} has unsupported provider {spec.provider!r}")
+    step = _MAX_PER_REQUEST.get(spec.provider) or len(texts)
+    out: list[list[float]] = []
+    for i in range(0, len(texts), step):
+        part = texts[i:i + step]
+        url, body, headers = builder(spec, part, input_type)
+        payload = _post_json(
+            url, body, headers, provider=spec.provider,
+            retries=retries, timeout=timeout, delay=delay, transport=transport,
+        )
+        vecs = _parse_vectors(spec.provider, payload)
+        if len(vecs) != len(part):
+            raise RuntimeError(f"embed returned {len(vecs)} vectors for {len(part)} texts")
+        for v in vecs:
+            if len(v) != spec.dim:
+                raise RuntimeError(f"expected dim {spec.dim}, got {len(v)}")
+        out.extend(_l2(v) if spec.normalize == "l2" else [float(x) for x in v] for v in vecs)
+    return out
 
 
 def embed_one(
@@ -604,8 +722,12 @@ def embed_one(
     retries: int = 4,
     timeout: float = 120.0,
     delay: float = 2.0,
+    input_type: str | None = None,
 ) -> list[float]:
-    return embed_batch([text], profile=profile, retries=retries, timeout=timeout, delay=delay)[0]
+    extra = {"input_type": input_type} if input_type else {}
+    return embed_batch(
+        [text], profile=profile, retries=retries, timeout=timeout, delay=delay, **extra,
+    )[0]
 
 
 def embed_batch_images(
@@ -903,8 +1025,9 @@ def _resolve_profile(cur, profile: str | None) -> str:
                 f"embedding profile {profile!r} not in embedding_profiles "
                 f"(apply 0005_gemini_embedding_2.sql if targeting {PROFILE_2})"
             )
-        # Refuse unknown model wiring even if a rogue row exists.
-        model_for_profile(profile)
+        # Refuse unknown provider wiring even if a rogue row exists; a profile
+        # that is not seeded is read through this cursor and remembered.
+        resolve_spec(profile, cur)
         return profile
     return _active_profile(cur)
 
@@ -994,7 +1117,14 @@ def _existing_hashes(cur, profile: str) -> dict[tuple[str, str, int], str]:
 def _upsert_chunks(
     cur, profile: str, rows: list[tuple[str, str, int, str, str, list[float]]]
 ) -> None:
+    spec = _profiles.cached_spec(profile)
     for kind, ref, idx, text, h, vec in rows:
+        # The column is untyped, so the database no longer rejects a vector of
+        # the wrong width; this is the check that does.
+        if spec is not None and len(vec) != spec.dim:
+            raise RuntimeError(
+                f"vector of length {len(vec)} for profile {profile} (dim {spec.dim})"
+            )
         cur.execute(
             """
             INSERT INTO memory_embeddings
@@ -1145,6 +1275,12 @@ def backfill(
                     _log(f"  {stats['embedded']}/{len(todo)}")
                 if start + BATCH < len(todo):
                     time.sleep(BACKFILL_PAUSE_S)
+            if stats["embedded"]:
+                # After the bulk insert, not before: building the graph once
+                # over finished rows is far cheaper than maintaining it per
+                # batch. A no-op once the profile's index exists.
+                _profiles.ensure_profile_index(cur, profile, "memory_embeddings", quiet=True)
+                conn.commit()
     return stats
 
 
@@ -1157,7 +1293,7 @@ def activate(profile: str, *, force: bool = False) -> dict[str, Any]:
     from khipu.db import connect
 
     profile = (profile or "").strip()
-    model_for_profile(profile)
+    spec = resolve_spec(profile)  # refuses an unknown id before any connection
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM embedding_profiles WHERE id = %s", (profile,))
@@ -1174,6 +1310,9 @@ def activate(profile: str, *, force: bool = False) -> dict[str, Any]:
                     f"{cov['topics']['missing']} topics still missing vectors "
                     f"(pass force=True to override)"
                 )
+            # The index first, so the pointer never flips onto a sequential scan.
+            _profiles.ensure_profile_index(
+                cur, profile, "memory_embeddings", dim=spec.dim, quiet=True)
             cur.execute("UPDATE embedding_profiles SET is_active = false WHERE is_active")
             cur.execute(
                 "UPDATE embedding_profiles SET is_active = true WHERE id = %s",
@@ -1349,6 +1488,10 @@ def _cosine_candidates(
             _t0 = time.monotonic()
             qvec, cache_state = _query_vec(cur, conn, profile, api_q)
             qlit = _vec_literal(qvec)
+            # memory_embeddings.embedding is an untyped vector (0026); the
+            # per-profile HNSW index is on embedding::vector(<dim>), so the
+            # query repeats that cast (and the profile predicate) to use it.
+            vcast = f"vector({len(qvec)})"
             if timing is not None:
                 timing["embed_ms"] = round((time.monotonic() - _t0) * 1000, 1)
                 timing["embed_cache"] = cache_state
@@ -1368,7 +1511,7 @@ def _cosine_candidates(
             cur.execute(
                 f"""
                 SELECT m.kind, m.ref, m.chunk_idx,
-                       1 - (m.embedding <=> %(q)s::vector) AS score,
+                       1 - (m.embedding::{vcast} <=> %(q)s::{vcast}) AS score,
                        left(m.chunk_text, %(fetch)s) AS snippet,
                        left(m.chunk_text, %(rank_fetch)s) AS rank_src,
                        CASE m.kind
@@ -1383,7 +1526,7 @@ def _cosine_candidates(
                 WHERE m.profile = %(p)s
                   AND m.kind != 'commitment'
                   AND (%(kind)s::text IS NULL OR m.kind = %(kind)s)
-                {filter_clause}    ORDER BY m.embedding <=> %(q)s::vector
+                {filter_clause}    ORDER BY m.embedding::{vcast} <=> %(q)s::{vcast}
                 LIMIT %(lim)s
                 """,
                 {"q": qlit, "p": profile, "kind": kind, "lim": fetch,

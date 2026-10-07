@@ -48,8 +48,8 @@ own profile" (`khipu/graph_sync.py` docstring). Re-embedding is still available;
 
 ## This Mac, after the feature ships
 
-Library `biblical`, root `/Volumes/Cloud Storage/Databases/biblical/corpus` (5,581 txt/md files, 1.72 GB).
-Import from `/Volumes/Cloud Storage/Graph/graph.sqlite`: 329,224 voyage-3 rows (dim 1024) over 5,340 files,
+Library `biblical`, root this Mac's biblical corpus folder (5,581 txt/md files, 1.72 GB).
+Import from the graphify SQLite file: 329,224 voyage-3 rows (dim 1024) over 5,340 files,
 `--strip-prefix "Biblical System/corpus/"`. No corpus file has changed since that index was built
 (2026-07-28), so coverage after import should be complete except files the old index skipped; `backfill`
 then embeds those with voyage-3 at $0.06 per million tokens. Hub growth about 3 GB (text plus vectors); the
