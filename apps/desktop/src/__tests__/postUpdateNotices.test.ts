@@ -41,11 +41,23 @@ describe("noticeForUpgrade", () => {
     expect(notice?.title).toMatch(/switches in Settings/i);
   });
 
+  it("returns the 0.4.8 notice (Embeddings screen) when upgrading from 0.4.7", () => {
+    const notice = noticeForUpgrade("0.4.7", "0.4.8");
+    expect(notice).not.toBeNull();
+    expect(notice?.version).toBe("0.4.8");
+    expect(notice?.action).toBe("settings");
+    expect(notice?.settingsSection).toBe("index");
+    expect(notice?.title).toMatch(/Embeddings/);
+    expect(notice?.body).toMatch(/old search-index picker/i);
+    expect(notice?.body).toMatch(/nothing/i);
+  });
+
   it("shows only the newest notice when several were skipped", () => {
+    expect(noticeForUpgrade("0.4.4", "0.4.8")?.version).toBe("0.4.8");
     expect(noticeForUpgrade("0.4.4", "0.4.7")?.version).toBe("0.4.7");
   });
 
-  it("returns null once 0.4.7 was already noticed", () => {
-    expect(noticeForUpgrade("0.4.7", "0.4.7")).toBeNull();
+  it("returns null once 0.4.8 was already noticed", () => {
+    expect(noticeForUpgrade("0.4.8", "0.4.8")).toBeNull();
   });
 });

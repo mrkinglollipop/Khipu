@@ -532,6 +532,8 @@ const PATH_KEYS: &[&str] = &[
     "gemini_key_file",
 ];
 const COSINE_FLOOR_KEY: &str = "relevance.cosine_floor";
+/// `relevance.cosine_floor_by_profile.<profile id>`: one model's own floor.
+const COSINE_FLOOR_BY_PROFILE_PREFIX: &str = "relevance.cosine_floor_by_profile.";
 
 const FEATURES_SHOW_ARGV: &[&str] = &["features"];
 const CONFIG_SHOW_ARGV: &[&str] = &["config"];
@@ -632,6 +634,10 @@ fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
         }
         k if UNIT_FLOAT_KEYS.contains(&k) => Ok(set(k, parse_unit_number(k, value, true)?)),
         COSINE_FLOOR_KEY => Ok(set(COSINE_FLOOR_KEY, parse_unit_number(key, value, false)?)),
+        k if k.starts_with(COSINE_FLOOR_BY_PROFILE_PREFIX) => {
+            checked_profile(&k[COSINE_FLOOR_BY_PROFILE_PREFIX.len()..])?;
+            Ok(set(k, parse_unit_number(k, value, false)?))
+        }
         "user_aliases" => Ok(set("user_aliases", checked_operand(key, value, true)?)),
         k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
         _ => Err(format!("not a settable key: {key:?}")),
@@ -639,19 +645,24 @@ fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
 }
 
 fn config_unset_argv(key: &str) -> Result<Vec<String>, String> {
-    if !PATH_KEYS.contains(&key) && key != COSINE_FLOOR_KEY {
+    let by_profile = key
+        .strip_prefix(COSINE_FLOOR_BY_PROFILE_PREFIX)
+        .is_some_and(|id| checked_profile(id).is_ok());
+    if !PATH_KEYS.contains(&key) && key != COSINE_FLOOR_KEY && !by_profile {
         return Err(format!("not a resettable key: {key:?}"));
     }
     Ok(vec!["config".to_string(), format!("--unset={key}")])
 }
 
-/// Embedding profile ids look like `gemini-embedding-2@768`.
+/// Embedding profile ids look like `gemini-embedding-2@768`; the CLI also
+/// accepts `:` and `/` (an Ollama tag such as `nomic-embed-text:latest@768`).
+/// The first character is alphanumeric, so an id can never read as a flag.
 fn checked_profile(profile: &str) -> Result<&str, String> {
     let p = profile.trim();
     let ok = !p.is_empty()
         && p.len() <= 64
-        && !p.starts_with('-')
-        && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'));
+        && p.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-' | ':' | '/'));
     if ok {
         Ok(p)
     } else {
@@ -753,6 +764,484 @@ async fn khipu_embed_status(profile: Option<String>) -> Result<String, String> {
 #[tauri::command]
 async fn khipu_embed_activate(profile: String) -> Result<String, String> {
     run_khipu_cli_async(embed_activate_argv(&profile)?).await
+}
+
+// --- Embeddings screen (docs/plans/2026-10-07-library-sources-byoe.md, "The
+// user's view"). Every verb is a fixed argv built here from validated pieces;
+// the webview names a command and passes ids, never argv. `embed` and
+// `library` stay OUT of `ALLOWED_SUBCOMMANDS`, and so do the two job verbs
+// below, which spawn detached and are written to a job file the screen reads.
+
+const EMBED_PROVIDERS: &[&str] = &["gemini", "voyage", "openai-compatible"];
+/// The only two top-level verbs `khipu_job_start` can spawn. Separate from
+/// `SPAWN_ALLOWED_SUBCOMMANDS`, which stays as it was.
+const JOB_SPAWN_VERBS: &[&str] = &["embed-backfill", "library-backfill"];
+const EMBED_PROFILES_LIST_ARGV: &[&str] = &["embed", "profiles", "list"];
+const EMBED_JOBS_ARGV: &[&str] = &["embed", "jobs"];
+const EMBED_JOBS_CLEAR_ARGV: &[&str] = &["embed", "jobs", "--clear"];
+const LIBRARY_LIST_ARGV: &[&str] = &["library", "list"];
+
+/// Library names are `[a-z0-9_-]{1,40}` (`khipu.library.validate_name`).
+fn checked_library(name: &str) -> Result<&str, String> {
+    let n = name.trim();
+    // Never a leading '-': the name is a positional argument and argparse would
+    // read it as a flag (the CLI's own pattern would let it through).
+    let ok = !n.is_empty()
+        && n.len() <= 40
+        && !n.starts_with('-')
+        && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-'));
+    if ok {
+        Ok(n)
+    } else {
+        Err(format!("not a library name (a-z, 0-9, _ and -, up to 40): {name:?}"))
+    }
+}
+
+fn checked_provider(provider: &str) -> Result<&str, String> {
+    let p = provider.trim();
+    if EMBED_PROVIDERS.contains(&p) {
+        Ok(p)
+    } else {
+        Err(format!("not an embedding provider: {provider:?}"))
+    }
+}
+
+fn checked_dim(dim: i64) -> Result<i64, String> {
+    if (1..=8192).contains(&dim) {
+        Ok(dim)
+    } else {
+        Err(format!("dimensions must be between 1 and 8192, got {dim}"))
+    }
+}
+
+/// A model id as providers spell them (`voyage-3`, `nomic-embed-text:latest`).
+fn checked_model(model: &str) -> Result<&str, String> {
+    let m = model.trim();
+    let ok = !m.is_empty()
+        && m.len() <= 100
+        && m.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && m.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/'));
+    if ok {
+        Ok(m)
+    } else {
+        Err(format!("not a model id: {model:?}"))
+    }
+}
+
+/// `https://...`, or plain `http://` only for localhost / 127.0.0.1.
+fn checked_endpoint(endpoint: &str) -> Result<&str, String> {
+    let e = endpoint.trim();
+    if e.len() > 2048 || e.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("endpoint must be one line with no spaces".to_string());
+    }
+    let local = ["http://localhost", "http://127.0.0.1"].iter().any(|pre| {
+        e.strip_prefix(pre)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(':') || rest.starts_with('/'))
+    });
+    if (e.starts_with("https://") && e.len() > "https://".len()) || local {
+        Ok(e)
+    } else {
+        Err("endpoint must start with https:// (http:// is allowed only for localhost or 127.0.0.1)".to_string())
+    }
+}
+
+fn checked_space(space: &str) -> Result<String, String> {
+    let s = space.trim();
+    if s == "memory" {
+        return Ok(s.to_string());
+    }
+    match s.strip_prefix("library:") {
+        Some(name) => Ok(format!("library:{}", checked_library(name)?)),
+        None => Err(format!("space must be memory or library:<name>, got {space:?}")),
+    }
+}
+
+/// A folder or file path: non-empty, no control characters, never a flag.
+fn checked_path(key: &str, raw: &str) -> Result<String, String> {
+    checked_operand(key, raw, false)
+}
+
+fn embed_estimate_argv(profile: &str, space: &str, stale: bool) -> Result<Vec<String>, String> {
+    let mut a = vec![
+        "embed".to_string(),
+        "estimate".to_string(),
+        format!("--profile={}", checked_profile(profile)?),
+        format!("--space={}", checked_space(space)?),
+    ];
+    if stale {
+        a.push("--stale".to_string());
+    }
+    Ok(a)
+}
+
+fn embed_test_key_argv(
+    provider: &str,
+    endpoint: Option<&str>,
+    model: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let provider = checked_provider(provider)?;
+    let mut a = vec![
+        "embed".to_string(),
+        "test-key".to_string(),
+        format!("--provider={provider}"),
+    ];
+    if let Some(e) = endpoint.filter(|e| !e.trim().is_empty()) {
+        if provider != "openai-compatible" {
+            return Err("only an openai-compatible model has an endpoint".to_string());
+        }
+        a.push(format!("--endpoint={}", checked_endpoint(e)?));
+    }
+    if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
+        a.push(format!("--model={}", checked_model(m)?));
+    }
+    Ok(a)
+}
+
+fn embed_profile_add_argv(
+    id: &str,
+    provider: &str,
+    model: &str,
+    dim: i64,
+    endpoint: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let id = checked_profile(id)?;
+    let provider = checked_provider(provider)?;
+    let model = checked_model(model)?;
+    let dim = checked_dim(dim)?;
+    if id != format!("{model}@{dim}") {
+        return Err(format!("profile id must be {model}@{dim}, got {id:?}"));
+    }
+    let mut a = vec![
+        "embed".to_string(),
+        "profiles".to_string(),
+        "add".to_string(),
+        id.to_string(),
+        format!("--provider={provider}"),
+        format!("--model={model}"),
+        format!("--dim={dim}"),
+    ];
+    match endpoint.filter(|e| !e.trim().is_empty()) {
+        Some(e) => {
+            if provider != "openai-compatible" {
+                return Err("only an openai-compatible model has an endpoint".to_string());
+            }
+            a.push(format!("--endpoint={}", checked_endpoint(e)?));
+        }
+        None if provider == "openai-compatible" => {
+            return Err("an openai-compatible model needs an endpoint".to_string());
+        }
+        None => {}
+    }
+    Ok(a)
+}
+
+/// Always `--yes`: the screen asks first, and the CLI refuses a profile that
+/// is in use.
+fn embed_profile_delete_argv(id: &str) -> Result<Vec<String>, String> {
+    Ok(vec![
+        "embed".to_string(),
+        "profiles".to_string(),
+        "delete".to_string(),
+        checked_profile(id)?.to_string(),
+        "--yes".to_string(),
+    ])
+}
+
+fn library_argv(verb: &str, name: &str) -> Result<Vec<String>, String> {
+    if !["status", "scan", "enable", "disable"].contains(&verb) {
+        return Err(format!("not a library verb: {verb:?}"));
+    }
+    Ok(vec!["library".to_string(), verb.to_string(), checked_library(name)?.to_string()])
+}
+
+/// `library set-profile NAME PROFILE`: the CLI refuses unless PROFILE covers
+/// every chunk of the library, so there is no force flag to forward.
+fn library_set_profile_argv(name: &str, profile: &str) -> Result<Vec<String>, String> {
+    Ok(vec![
+        "library".to_string(),
+        "set-profile".to_string(),
+        checked_library(name)?.to_string(),
+        checked_profile(profile)?.to_string(),
+    ])
+}
+
+fn library_add_argv(name: &str, root: &str, profile: &str) -> Result<Vec<String>, String> {
+    Ok(vec![
+        "library".to_string(),
+        "add".to_string(),
+        checked_library(name)?.to_string(),
+        format!("--root={}", checked_path("folder", root)?),
+        format!("--profile={}", checked_profile(profile)?),
+    ])
+}
+
+fn library_remove_argv(name: &str) -> Result<Vec<String>, String> {
+    Ok(vec![
+        "library".to_string(),
+        "remove".to_string(),
+        checked_library(name)?.to_string(),
+        "--yes".to_string(),
+    ])
+}
+
+fn library_import_argv(
+    name: &str,
+    path: &str,
+    strip_prefix: Option<&str>,
+    profile: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut a = vec![
+        "library".to_string(),
+        "import".to_string(),
+        checked_library(name)?.to_string(),
+        checked_path("index file", path)?,
+    ];
+    if let Some(p) = strip_prefix.filter(|p| !p.is_empty()) {
+        // Not trimmed: a trailing slash is part of the prefix.
+        if has_control(p) || p.len() > 4096 {
+            return Err("strip prefix must be one line".to_string());
+        }
+        a.push(format!("--strip-prefix={p}"));
+    }
+    if let Some(p) = profile.filter(|p| !p.trim().is_empty()) {
+        a.push(format!("--profile={}", checked_profile(p)?));
+    }
+    Ok(a)
+}
+
+/// A job id the app makes up for itself: `app-<unix seconds>-<8 hex>`. It
+/// matches the CLI's `[A-Za-z0-9][A-Za-z0-9._-]{0,79}` and is never taken from
+/// the webview.
+fn new_job_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(secs);
+    h.write_u32(std::process::id());
+    format!("app-{}-{:08x}", secs / 1_000_000_000, h.finish() as u32)
+}
+
+fn job_id_ok(id: &str) -> bool {
+    let mut chars = id.chars();
+    id.len() <= 80
+        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// argv for a detached backfill. `kind` is `memory` (needs `profile`) or
+/// `library` (needs `library`; `profile` re-embeds under another model).
+fn job_start_argv(
+    kind: &str,
+    profile: Option<&str>,
+    library: Option<&str>,
+    stale: bool,
+    job_id: &str,
+) -> Result<Vec<String>, String> {
+    if !job_id_ok(job_id) {
+        return Err(format!("not a job id: {job_id:?}"));
+    }
+    let profile = profile.map(str::trim).filter(|p| !p.is_empty());
+    let mut a: Vec<String>;
+    match kind {
+        "memory" => {
+            let p = profile.ok_or_else(|| "a memory job needs a profile".to_string())?;
+            a = vec![JOB_SPAWN_VERBS[0].to_string(), format!("--profile={}", checked_profile(p)?)];
+        }
+        "library" => {
+            let name = library.ok_or_else(|| "a library job needs a library".to_string())?;
+            a = vec![JOB_SPAWN_VERBS[1].to_string(), checked_library(name)?.to_string()];
+            if let Some(p) = profile {
+                a.push(format!("--profile={}", checked_profile(p)?));
+            }
+            if stale {
+                a.push("--stale".to_string());
+            }
+        }
+        other => return Err(format!("not a job kind: {other:?}")),
+    }
+    a.push(format!("--job-id={job_id}"));
+    Ok(a)
+}
+
+/// Where job files live: `<data dir>/jobs`, the same folder
+/// `khipu.embed_jobs.jobs_dir()` writes to.
+fn jobs_dir_path() -> PathBuf {
+    if let Some(d) = data_dir_from_pointer() {
+        return d.join("jobs");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".config/khipu/jobs")
+}
+
+/// The pid to stop for `job_id`, from that job's file: only a file that names
+/// this job id and says `running` yields a pid.
+fn cancel_target(raw_job_file: &str, job_id: &str) -> Result<u32, String> {
+    if !job_id_ok(job_id) {
+        return Err(format!("not a job id: {job_id:?}"));
+    }
+    let v: Value = serde_json::from_str(raw_job_file).map_err(|_| "the job file is unreadable".to_string())?;
+    if v.get("job").and_then(Value::as_str) != Some(job_id) {
+        return Err("the job file names a different job".to_string());
+    }
+    if v.get("state").and_then(Value::as_str) != Some("running") {
+        return Err("that job is not running".to_string());
+    }
+    match v.get("pid").and_then(Value::as_u64) {
+        Some(pid) if pid > 1 && pid <= u32::MAX as u64 => Ok(pid as u32),
+        _ => Err("the job file has no process id".to_string()),
+    }
+}
+
+fn cancel_job_sync(job_id: &str) -> Result<Value, String> {
+    let path = jobs_dir_path().join(format!("{job_id}.json"));
+    if !job_id_ok(job_id) {
+        return Err(format!("not a job id: {job_id:?}"));
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("no job file for {job_id}: {e}"))?;
+    let pid = cancel_target(&raw, job_id)?;
+    // A pid can be reused after a crash: only stop a process that is a khipu run.
+    let cmd = Command::new("/bin/ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .map_err(|e| format!("could not check process {pid}: {e}"))?;
+    let cmdline = String::from_utf8_lossy(&cmd.stdout).to_string();
+    if !cmd.status.success() || !cmdline.contains("khipu") {
+        return Err("that job's process is no longer running".to_string());
+    }
+    let out = Command::new("/bin/kill")
+        .args(["-TERM", &pid.to_string()])
+        .output()
+        .map_err(|e| format!("could not stop process {pid}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("could not stop process {pid}"));
+    }
+    Ok(serde_json::json!({ "ok": true, "job": job_id, "pid": pid }))
+}
+
+#[tauri::command]
+async fn khipu_embed_profiles_list() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(EMBED_PROFILES_LIST_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_embed_profile_add(
+    id: String,
+    provider: String,
+    model: String,
+    dim: i64,
+    endpoint: Option<String>,
+) -> Result<String, String> {
+    run_khipu_cli_async(embed_profile_add_argv(&id, &provider, &model, dim, endpoint.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_embed_profile_delete(id: String) -> Result<String, String> {
+    run_khipu_cli_async(embed_profile_delete_argv(&id)?).await
+}
+
+#[tauri::command]
+async fn khipu_embed_estimate(profile: String, space: String, stale: bool) -> Result<String, String> {
+    run_khipu_cli_async(embed_estimate_argv(&profile, &space, stale)?).await
+}
+
+/// The key is read from the Keychain by the CLI itself (`embed test-key`), so
+/// no secret travels here, in argv or in env.
+#[tauri::command]
+async fn khipu_embed_test_key(
+    provider: String,
+    endpoint: Option<String>,
+    model: Option<String>,
+) -> Result<String, String> {
+    run_khipu_cli_async(embed_test_key_argv(&provider, endpoint.as_deref(), model.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_embed_jobs() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(EMBED_JOBS_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_embed_jobs_clear() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(EMBED_JOBS_CLEAR_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_job_start(
+    kind: String,
+    profile: Option<String>,
+    library: Option<String>,
+    stale: bool,
+) -> Result<Value, String> {
+    let job_id = new_job_id();
+    let args = job_start_argv(&kind, profile.as_deref(), library.as_deref(), stale, &job_id)?;
+    spawn_blocking_cli(move || {
+        let (pid, log_path) = spawn_detached_cli(&args, &args[0])?;
+        Ok(serde_json::json!({
+            "ok": true,
+            "job_id": job_id,
+            "pid": pid,
+            "log_path": log_path.to_string_lossy(),
+        }))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn khipu_job_cancel(job_id: String) -> Result<Value, String> {
+    spawn_blocking_cli(move || cancel_job_sync(&job_id)).await
+}
+
+#[tauri::command]
+async fn khipu_library_list() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(LIBRARY_LIST_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_library_status(name: String) -> Result<String, String> {
+    run_khipu_cli_async(library_argv("status", &name)?).await
+}
+
+#[tauri::command]
+async fn khipu_library_add(name: String, root: String, profile: String) -> Result<String, String> {
+    run_khipu_cli_async(library_add_argv(&name, &root, &profile)?).await
+}
+
+#[tauri::command]
+async fn khipu_library_remove(name: String) -> Result<String, String> {
+    run_khipu_cli_async(library_remove_argv(&name)?).await
+}
+
+#[tauri::command]
+async fn khipu_library_enable(name: String) -> Result<String, String> {
+    run_khipu_cli_async(library_argv("enable", &name)?).await
+}
+
+#[tauri::command]
+async fn khipu_library_disable(name: String) -> Result<String, String> {
+    run_khipu_cli_async(library_argv("disable", &name)?).await
+}
+
+#[tauri::command]
+async fn khipu_library_scan(name: String) -> Result<String, String> {
+    run_khipu_cli_async(library_argv("scan", &name)?).await
+}
+
+#[tauri::command]
+async fn khipu_library_set_profile(name: String, profile: String) -> Result<String, String> {
+    run_khipu_cli_async(library_set_profile_argv(&name, &profile)?).await
+}
+
+#[tauri::command]
+async fn khipu_library_import(
+    name: String,
+    path: String,
+    strip_prefix: Option<String>,
+    profile: Option<String>,
+) -> Result<String, String> {
+    run_khipu_cli_async(library_import_argv(&name, &path, strip_prefix.as_deref(), profile.as_deref())?).await
 }
 
 /// `khipu <args>` with `stdin_text` piped to stdin. The text is never echoed
@@ -1293,6 +1782,22 @@ fn spawn_khipu(subcommand: String) -> Result<Value, String> {
         eprintln!("[khipu] refused spawn subcommand from the UI: {subcommand:?}");
         return Err(format!("subcommand not permitted for spawn: {subcommand:?}"));
     }
+    let (pid, log_path) = spawn_detached_cli(&[subcommand.clone()], &subcommand)?;
+    let engine_log_path = engine_job_log_path(&subcommand);
+    Ok(serde_json::json!({
+        "ok": true,
+        "pid": pid,
+        "log_path": log_path.to_string_lossy(),
+        "engine_log_path": engine_log_path.to_string_lossy(),
+        "subcommand": subcommand,
+    }))
+}
+
+/// Start `khipu <args>` detached: stdout and stderr go to a log file next to
+/// the data folder's `dsn`, the child is reaped in the background, and the
+/// caller gets the pid and the log path back immediately. `args` must already
+/// be validated (fixed argv built in Rust); `label` only names the log file.
+fn spawn_detached_cli(args: &[String], label: &str) -> Result<(u32, PathBuf), String> {
     let root = khipu_root()?;
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
@@ -1302,8 +1807,8 @@ fn spawn_khipu(subcommand: String) -> Result<Value, String> {
         .unwrap_or(0);
     let log_path = dirs_fallback_dsn()
         .parent()
-        .map(|p| p.join(format!("khipu-job-{subcommand}-{stamp}.log")))
-        .unwrap_or_else(|| PathBuf::from(format!("/tmp/khipu-job-{subcommand}-{stamp}.log")));
+        .map(|p| p.join(format!("khipu-job-{label}-{stamp}.log")))
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/khipu-job-{label}-{stamp}.log")));
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -1319,7 +1824,7 @@ fn spawn_khipu(subcommand: String) -> Result<Value, String> {
     let mut child = Command::new(&py)
         .arg("-m")
         .arg("khipu")
-        .arg(&subcommand)
+        .args(args)
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
         .env("KHIPU_APP_VERSION", khipu_app_version())
@@ -1327,7 +1832,7 @@ fn spawn_khipu(subcommand: String) -> Result<Value, String> {
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(err_file))
         .spawn()
-        .map_err(|e| format!("spawn khipu {subcommand} failed ({py:?}): {e}"))?;
+        .map_err(|e| format!("spawn khipu {label} failed ({py:?}): {e}"))?;
     let pid = child.id();
     // Reap in the background so the Unix zombie does not linger until Tauri
     // exits. Must not `.wait()` / `.output()` on this thread (C8 fire-and-forget).
@@ -1336,14 +1841,7 @@ fn spawn_khipu(subcommand: String) -> Result<Value, String> {
             eprintln!("[khipu] wait on spawned job failed: {e}");
         }
     });
-    let engine_log_path = engine_job_log_path(&subcommand);
-    Ok(serde_json::json!({
-        "ok": true,
-        "pid": pid,
-        "log_path": log_path.to_string_lossy(),
-        "engine_log_path": engine_log_path.to_string_lossy(),
-        "subcommand": subcommand,
-    }))
+    Ok((pid, log_path))
 }
 
 /// Engine stdout for spawnable jobs — same stems as `jobs.py` `_JOB_SPECS`
@@ -1757,6 +2255,24 @@ pub fn run() {
             khipu_gateway_token_set,
             khipu_embed_status,
             khipu_embed_activate,
+            khipu_embed_profiles_list,
+            khipu_embed_profile_add,
+            khipu_embed_profile_delete,
+            khipu_embed_estimate,
+            khipu_embed_test_key,
+            khipu_embed_jobs,
+            khipu_embed_jobs_clear,
+            khipu_job_start,
+            khipu_job_cancel,
+            khipu_library_list,
+            khipu_library_status,
+            khipu_library_add,
+            khipu_library_remove,
+            khipu_library_enable,
+            khipu_library_disable,
+            khipu_library_scan,
+            khipu_library_import,
+            khipu_library_set_profile,
             liveness_now,
             khipu_capture_now,
             khipu_db_status,
@@ -2422,10 +2938,10 @@ mod settings_command_tests {
             embed_activate_argv("gemini-embedding-001@768").unwrap(),
             v(&["embed", "activate", "gemini-embedding-001@768"])
         );
-        for ok in ["a", "x.y_z-1@2"] {
+        for ok in ["a", "x.y_z-1@2", "nomic-embed-text:latest@768"] {
             assert!(embed_activate_argv(ok).is_ok(), "rejected {ok:?}");
         }
-        for bad in ["", " ", "-f", "--force", "a b", "a;b", "a\nb", "a/b", "gemini$", &"x".repeat(65)] {
+        for bad in ["", " ", "-f", "--force", "a b", "a;b", "a\nb", "gemini$", "@768", "..", &"x".repeat(65)] {
             assert!(embed_activate_argv(bad).is_err(), "accepted {bad:?}");
         }
         assert!(!embed_activate_argv("gemini-embedding-2@768").unwrap().iter().any(|a| a.contains("force")));
@@ -2442,6 +2958,284 @@ mod settings_command_tests {
         }
         let err = gateway_token_input("has space").unwrap_err();
         assert!(!err.contains("has space"), "error echoed the token");
+    }
+}
+
+#[cfg(test)]
+mod embeddings_command_tests {
+    use super::*;
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn read_only_commands_are_fixed_argv() {
+        assert_eq!(fixed_argv(EMBED_PROFILES_LIST_ARGV), v(&["embed", "profiles", "list"]));
+        assert_eq!(fixed_argv(EMBED_JOBS_ARGV), v(&["embed", "jobs"]));
+        assert_eq!(fixed_argv(EMBED_JOBS_CLEAR_ARGV), v(&["embed", "jobs", "--clear"]));
+        assert_eq!(fixed_argv(LIBRARY_LIST_ARGV), v(&["library", "list"]));
+    }
+
+    #[test]
+    fn neither_embed_nor_library_nor_the_job_verbs_join_an_allowlist() {
+        for s in ["embed", "library", "embed-backfill", "library-backfill"] {
+            assert!(!ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of ALLOWED_SUBCOMMANDS");
+            assert!(!SPAWN_ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of SPAWN_ALLOWED_SUBCOMMANDS");
+        }
+        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 14);
+        assert_eq!(SPAWN_ALLOWED_SUBCOMMANDS, &["nightly", "graph-build", "monthly"]);
+        assert_eq!(JOB_SPAWN_VERBS, &["embed-backfill", "library-backfill"]);
+    }
+
+    #[test]
+    fn estimate_argv_names_profile_and_space() {
+        assert_eq!(
+            embed_estimate_argv("nomic-embed-text@768", "memory", false).unwrap(),
+            v(&["embed", "estimate", "--profile=nomic-embed-text@768", "--space=memory"])
+        );
+        assert_eq!(
+            embed_estimate_argv("voyage-3@1024", "library:biblical", true).unwrap(),
+            v(&["embed", "estimate", "--profile=voyage-3@1024", "--space=library:biblical", "--stale"])
+        );
+    }
+
+    #[test]
+    fn estimate_refuses_bad_profiles_and_spaces() {
+        for bad in ["", "-x", "--force", "a b", "a;b"] {
+            assert!(embed_estimate_argv(bad, "memory", false).is_err(), "profile {bad:?}");
+        }
+        for bad in ["", "libraries", "library:", "library:Bad", "library:a b", "library:../x", "memory --stale", "--space=x", "library:-x"] {
+            assert!(embed_estimate_argv("a@1", bad, false).is_err(), "space {bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_key_takes_a_provider_and_optional_endpoint_and_model() {
+        assert_eq!(
+            embed_test_key_argv("voyage", None, Some("voyage-3")).unwrap(),
+            v(&["embed", "test-key", "--provider=voyage", "--model=voyage-3"])
+        );
+        assert_eq!(
+            embed_test_key_argv("openai-compatible", Some("http://localhost:11434"), Some("nomic-embed-text")).unwrap(),
+            v(&["embed", "test-key", "--provider=openai-compatible", "--endpoint=http://localhost:11434", "--model=nomic-embed-text"])
+        );
+        assert_eq!(embed_test_key_argv("gemini", Some("  "), None).unwrap(), v(&["embed", "test-key", "--provider=gemini"]));
+    }
+
+    #[test]
+    fn test_key_refuses_unknown_providers_and_bad_endpoints() {
+        for bad in ["", "openai", "Gemini", "gemini --model x", "-p"] {
+            assert!(embed_test_key_argv(bad, None, None).is_err(), "provider {bad:?}");
+        }
+        for bad in [
+            "http://example.com", "ftp://x", "localhost:11434", "https://", "http://localhost.evil.com",
+            "http://127.0.0.1.evil.com", "https://a b", "https://a\nb", "-x", "http://localhostevil",
+        ] {
+            assert!(
+                embed_test_key_argv("openai-compatible", Some(bad), Some("m")).is_err(),
+                "endpoint {bad:?}"
+            );
+        }
+        assert!(embed_test_key_argv("voyage", Some("https://api.example.com"), None).is_err());
+        for bad in ["-m", "--model=x", "a b", "a\nb", "a;b"] {
+            assert!(embed_test_key_argv("voyage", None, Some(bad)).is_err(), "model {bad:?}");
+        }
+    }
+
+    #[test]
+    fn endpoint_allows_https_and_loopback_http() {
+        for ok in ["https://api.openai.com", "https://x.example.com/v1", "http://localhost", "http://localhost:1234/v1", "http://127.0.0.1:8080"] {
+            assert!(checked_endpoint(ok).is_ok(), "rejected {ok:?}");
+        }
+    }
+
+    #[test]
+    fn profile_add_argv_checks_every_piece_and_that_the_id_is_model_at_dim() {
+        assert_eq!(
+            embed_profile_add_argv("voyage-3@1024", "voyage", "voyage-3", 1024, None).unwrap(),
+            v(&["embed", "profiles", "add", "voyage-3@1024", "--provider=voyage", "--model=voyage-3", "--dim=1024"])
+        );
+        assert_eq!(
+            embed_profile_add_argv("nomic-embed-text@768", "openai-compatible", "nomic-embed-text", 768, Some("http://localhost:11434")).unwrap(),
+            v(&["embed", "profiles", "add", "nomic-embed-text@768", "--provider=openai-compatible", "--model=nomic-embed-text", "--dim=768", "--endpoint=http://localhost:11434"])
+        );
+        // The id must be exactly model@dim.
+        assert!(embed_profile_add_argv("voyage-3@512", "voyage", "voyage-3", 1024, None).is_err());
+        assert!(embed_profile_add_argv("other@1024", "voyage", "voyage-3", 1024, None).is_err());
+        // Dimensions 1..=8192.
+        for bad in [0, -1, 8193, i64::MAX] {
+            assert!(embed_profile_add_argv(&format!("m@{bad}"), "voyage", "m", bad, None).is_err(), "dim {bad}");
+        }
+        assert!(embed_profile_add_argv("m@8192", "voyage", "m", 8192, None).is_ok());
+        assert!(embed_profile_add_argv("m@1", "voyage", "m", 1, None).is_ok());
+        // OpenAI-compatible needs an endpoint; the others refuse one.
+        assert!(embed_profile_add_argv("m@8", "openai-compatible", "m", 8, None).is_err());
+        assert!(embed_profile_add_argv("m@8", "gemini", "m", 8, Some("https://x.example.com")).is_err());
+        assert!(embed_profile_add_argv("m@8", "nope", "m", 8, None).is_err());
+        assert!(embed_profile_add_argv("-m@8", "voyage", "-m", 8, None).is_err());
+    }
+
+    #[test]
+    fn profile_delete_always_confirms_and_checks_the_id() {
+        assert_eq!(
+            embed_profile_delete_argv("voyage-3@1024").unwrap(),
+            v(&["embed", "profiles", "delete", "voyage-3@1024", "--yes"])
+        );
+        for bad in ["", "-1", "--yes", "a b", "a;b"] {
+            assert!(embed_profile_delete_argv(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn library_verbs_take_a_checked_name() {
+        for verb in ["status", "scan", "enable", "disable"] {
+            assert_eq!(library_argv(verb, "biblical").unwrap(), v(&["library", verb, "biblical"]));
+            for bad in ["", "Biblical", "a b", "-x", "a/b", "a.b", "a\nb", &"x".repeat(41)] {
+                assert!(library_argv(verb, bad).is_err(), "{verb} accepted {bad:?}");
+            }
+        }
+        for verb in ["remove", "add", "backfill", "import", "", "scan --x"] {
+            assert!(library_argv(verb, "x").is_err(), "verb {verb:?}");
+        }
+        assert!(library_argv("scan", &"x".repeat(40)).is_ok());
+        assert!(library_argv("scan", "a_b-9").is_ok());
+    }
+
+    #[test]
+    fn library_set_profile_argv_never_forces_and_checks_both_ids() {
+        assert_eq!(
+            library_set_profile_argv("biblical", "nomic-embed-text@768").unwrap(),
+            v(&["library", "set-profile", "biblical", "nomic-embed-text@768"])
+        );
+        for bad in ["", "-x", "Bad", "a b", "a/b"] {
+            assert!(library_set_profile_argv(bad, "a@1").is_err(), "name {bad:?}");
+        }
+        for bad in ["", "-f", "--force", "a b", "a;b", "a\nb"] {
+            assert!(library_set_profile_argv("biblical", bad).is_err(), "profile {bad:?}");
+        }
+        assert!(!library_set_profile_argv("biblical", "a@1").unwrap().iter().any(|a| a.contains("force")));
+    }
+
+    #[test]
+    fn library_add_and_remove_argv() {
+        assert_eq!(
+            library_add_argv("talks", "/Users/me/Documents/talks", "voyage-3@1024").unwrap(),
+            v(&["library", "add", "talks", "--root=/Users/me/Documents/talks", "--profile=voyage-3@1024"])
+        );
+        assert_eq!(library_remove_argv("talks").unwrap(), v(&["library", "remove", "talks", "--yes"]));
+        for bad in ["", "   ", "-x", "--root=/", "a\nb", "a\0b"] {
+            assert!(library_add_argv("talks", bad, "a@1").is_err(), "root {bad:?}");
+        }
+        assert!(library_add_argv("Talks", "/x", "a@1").is_err());
+        assert!(library_add_argv("talks", "/x", "--bad").is_err());
+        assert!(library_remove_argv("../x").is_err());
+    }
+
+    #[test]
+    fn library_import_argv_keeps_the_prefix_verbatim() {
+        assert_eq!(
+            library_import_argv("biblical", "/Users/me/g.sqlite", Some("Biblical System/corpus/"), Some("voyage-3@1024")).unwrap(),
+            v(&["library", "import", "biblical", "/Users/me/g.sqlite", "--strip-prefix=Biblical System/corpus/", "--profile=voyage-3@1024"])
+        );
+        assert_eq!(
+            library_import_argv("biblical", "/x.jsonl", Some(""), None).unwrap(),
+            v(&["library", "import", "biblical", "/x.jsonl"])
+        );
+        for bad in ["", "-x", "--profile=x", "a\nb"] {
+            assert!(library_import_argv("biblical", bad, None, None).is_err(), "path {bad:?}");
+        }
+        assert!(library_import_argv("biblical", "/x", Some("a\nb"), None).is_err());
+        assert!(library_import_argv("biblical", "/x", None, Some("-p")).is_err());
+        assert!(library_import_argv("Bad", "/x", None, None).is_err());
+    }
+
+    #[test]
+    fn job_start_builds_the_two_detached_verbs() {
+        assert_eq!(
+            job_start_argv("memory", Some("nomic-embed-text@768"), None, false, "app-1-abc").unwrap(),
+            v(&["embed-backfill", "--profile=nomic-embed-text@768", "--job-id=app-1-abc"])
+        );
+        assert_eq!(
+            job_start_argv("library", None, Some("biblical"), false, "app-1-abc").unwrap(),
+            v(&["library-backfill", "biblical", "--job-id=app-1-abc"])
+        );
+        assert_eq!(
+            job_start_argv("library", Some("voyage-3@1024"), Some("biblical"), true, "app-1-abc").unwrap(),
+            v(&["library-backfill", "biblical", "--profile=voyage-3@1024", "--stale", "--job-id=app-1-abc"])
+        );
+    }
+
+    #[test]
+    fn job_start_refuses_bad_kinds_missing_pieces_and_bad_ids() {
+        assert!(job_start_argv("memory", None, None, false, "app-1").is_err());
+        assert!(job_start_argv("memory", Some("  "), None, false, "app-1").is_err());
+        assert!(job_start_argv("library", None, None, false, "app-1").is_err());
+        assert!(job_start_argv("library", None, Some("Bad Name"), false, "app-1").is_err());
+        assert!(job_start_argv("nightly", Some("a@1"), None, false, "app-1").is_err());
+        assert!(job_start_argv("", None, None, false, "app-1").is_err());
+        assert!(job_start_argv("memory", Some("--x"), None, false, "app-1").is_err());
+        for bad in ["", "-x", "a b", "a/b", "../x", &"x".repeat(81)] {
+            assert!(job_start_argv("memory", Some("a@1"), None, false, bad).is_err(), "id {bad:?}");
+        }
+    }
+
+    #[test]
+    fn generated_job_ids_are_valid_and_distinct() {
+        let a = new_job_id();
+        let b = new_job_id();
+        assert!(job_id_ok(&a), "{a}");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cancel_only_targets_a_running_job_that_names_its_own_pid() {
+        let running = r#"{"job":"app-1-abc","state":"running","pid":4242}"#;
+        assert_eq!(cancel_target(running, "app-1-abc").unwrap(), 4242);
+        // A different id, a finished job, no pid, a tiny pid and junk all refuse.
+        assert!(cancel_target(running, "app-2-abc").is_err());
+        for raw in [
+            r#"{"job":"app-1-abc","state":"done","pid":4242}"#,
+            r#"{"job":"app-1-abc","state":"cancelled","pid":4242}"#,
+            r#"{"job":"app-1-abc","state":"running"}"#,
+            r#"{"job":"app-1-abc","state":"running","pid":0}"#,
+            r#"{"job":"app-1-abc","state":"running","pid":1}"#,
+            r#"{"job":"app-1-abc","state":"running","pid":-5}"#,
+            r#"{"job":"app-1-abc","state":"running","pid":"4242"}"#,
+            "not json",
+            "",
+        ] {
+            assert!(cancel_target(raw, "app-1-abc").is_err(), "accepted {raw:?}");
+        }
+        for bad in ["", "-1", "../x", "a b"] {
+            assert!(cancel_target(running, bad).is_err(), "id {bad:?}");
+            assert!(cancel_job_sync(bad).is_err(), "cancel_job_sync {bad:?}");
+        }
+    }
+
+    #[test]
+    fn cosine_floor_by_profile_takes_a_profile_and_a_number_above_zero() {
+        assert_eq!(
+            config_set_argv("relevance.cosine_floor_by_profile.voyage-3@1024", "0.5").unwrap(),
+            v(&["config", "--set", "relevance.cosine_floor_by_profile.voyage-3@1024", "0.5"])
+        );
+        assert_eq!(
+            config_unset_argv("relevance.cosine_floor_by_profile.voyage-3@1024").unwrap(),
+            v(&["config", "--unset=relevance.cosine_floor_by_profile.voyage-3@1024"])
+        );
+        for bad in ["0", "-0.1", "1.1", "nan", "", "--x", "abc"] {
+            assert!(config_set_argv("relevance.cosine_floor_by_profile.a@1", bad).is_err(), "value {bad:?}");
+        }
+        for bad_key in [
+            "relevance.cosine_floor_by_profile.",
+            "relevance.cosine_floor_by_profile.-x",
+            "relevance.cosine_floor_by_profile.a b",
+            "relevance.cosine_floor_by_profile.a;b",
+            "relevance.cosine_floor_by_profile",
+        ] {
+            assert!(config_set_argv(bad_key, "0.5").is_err(), "set key {bad_key:?}");
+            assert!(config_unset_argv(bad_key).is_err(), "unset key {bad_key:?}");
+        }
     }
 }
 

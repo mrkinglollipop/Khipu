@@ -393,6 +393,36 @@ def set_enabled(conn, name: str, enabled: bool) -> dict[str, Any]:
     return {"ok": True, "name": name, "enabled": enabled}
 
 
+def set_profile(conn, name: str, profile: str) -> dict[str, Any]:
+    """Move library ``name``'s search pointer to ``profile`` (the library
+    analogue of ``embed activate``). Refuses unless ``profile`` has a vector
+    for every chunk of the library and none of them is stale, so a library is
+    never served by a half-built profile. The profile's index is created
+    first, so the pointer never flips onto a sequential scan."""
+    profile = (profile or "").strip()
+    with conn.cursor() as cur:
+        src = get_source(cur, name)
+        spec = profiles.load_spec(cur, profile)
+        if spec is None:
+            raise LibraryError(
+                f"unknown embedding profile {profile!r}; see `khipu embed profiles list`"
+            )
+        counts = _counts(cur, replace(src, profile=profile))
+        if counts["missing"] or counts["stale"]:
+            raise LibraryError(
+                f"refusing to move {name!r} to {profile}: {counts['missing']} of "
+                f"{counts['chunks']} chunks still have no vector under it"
+                + (f" and {counts['stale']} are out of date" if counts["stale"] else "")
+                + "; embed them first with `khipu library backfill "
+                f"{name} --profile {profile}`"
+            )
+        profiles.ensure_profile_index(cur, profile, "library_embeddings", dim=spec.dim, quiet=True)
+        cur.execute("UPDATE library_sources SET profile = %s WHERE name = %s", (profile, name))
+    conn.commit()
+    return {"ok": True, "name": name, "profile": profile, "previous_profile": src.profile,
+            "chunks": counts["chunks"], "coverage": counts}
+
+
 # ---- scan -----------------------------------------------------------------------
 
 _UPSERT_DOC = (

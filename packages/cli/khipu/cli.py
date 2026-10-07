@@ -1402,6 +1402,8 @@ def cmd_library(args: argparse.Namespace) -> int:
                 out = library.remove_source(conn, args.name, yes=bool(args.yes))
             elif cmd in ("enable", "disable"):
                 out = library.set_enabled(conn, args.name, cmd == "enable")
+            elif cmd == "set-profile":
+                out = library.set_profile(conn, args.name, args.profile)
             elif cmd == "scan":
                 out = library.scan(conn, args.name)
             elif cmd == "backfill":
@@ -3704,6 +3706,13 @@ def build_parser() -> argparse.ArgumentParser:
     lr.add_argument("--yes", action="store_true", help="Required: confirms the delete")
     for _verb in ("enable", "disable"):
         lib_sub.add_parser(_verb, help=f"{_verb.capitalize()} a library (nightly sweep, search)").add_argument("name")
+    lsp = lib_sub.add_parser(
+        "set-profile",
+        help="Move a library's search pointer to another profile (refuses unless that profile "
+        "has a vector for every chunk)",
+    )
+    lsp.add_argument("name")
+    lsp.add_argument("profile", help="Embedding profile id (see `embed profiles list`)")
     lsc = lib_sub.add_parser("scan", help="Walk the root and record documents + chunks (no model call)")
     lsc.add_argument("name")
     lb = lib_sub.add_parser("backfill", help="Embed chunks that have no vector under the library's profile")

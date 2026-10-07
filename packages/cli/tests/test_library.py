@@ -134,6 +134,8 @@ class FakeCursor:
             h.sources[p[0]] = {"root": p[1], "profile": p[2], "enabled": True}
         elif s.startswith("UPDATE library_sources SET enabled"):
             h.sources[p[1]]["enabled"] = p[0]
+        elif s.startswith("UPDATE library_sources SET profile"):
+            h.sources[p[1]]["profile"] = p[0]
         elif s.startswith("DELETE FROM library_sources"):
             h.sources.pop(p[0], None)
             for doc in h.source_docs(p[0]):
@@ -310,6 +312,45 @@ class RegistryTest(_Base):
         out = library.remove_source(self.hub, "lib1", yes=True)
         self.assertEqual((out["documents"], out["chunks"]), (1, 1))
         self.assertEqual((self.hub.sources, self.hub.docs, self.hub.chunks), ({}, {}, {}))
+
+    def test_set_profile_refuses_until_full_coverage_then_moves_the_pointer(self):
+        other = ProfileSpec("voyage-u@4", "voyage", "voyage-u", 4)
+        self.hub.profile_rows[other.id] = ("voyage", "voyage-u", 4, "l2", None)
+        self.add()
+        self.write("A/x.txt", "some text")
+        self.write("A/y.txt", "other text")
+        library.scan(self.hub, "lib1")
+        with self.assertRaises(library.LibraryError) as ctx:
+            library.set_profile(self.hub, "lib1", other.id)
+        self.assertIn("2 of 2 chunks still have no vector", str(ctx.exception))
+        self.assertEqual(self.hub.sources["lib1"]["profile"], TINY.id)
+        # partly embedded is still refused, with the remaining count
+        doc = sorted(self.hub.source_docs("lib1"))[0]
+        self.hub.embs[(other.id, doc, 0)] = ("[0,0,0,1]", self.hub.chunks[(doc, 0)][1])
+        with self.assertRaises(library.LibraryError) as ctx:
+            library.set_profile(self.hub, "lib1", other.id)
+        self.assertIn("1 of 2 chunks", str(ctx.exception))
+        self.assertEqual(self.hub.sources["lib1"]["profile"], TINY.id)
+        # a stale vector does not count as covered
+        doc2 = sorted(self.hub.source_docs("lib1"))[1]
+        self.hub.embs[(other.id, doc2, 0)] = ("[0,0,0,1]", "old-hash")
+        with self.assertRaises(library.LibraryError) as ctx:
+            library.set_profile(self.hub, "lib1", other.id)
+        self.assertIn("out of date", str(ctx.exception))
+        # complete: the pointer moves and the index is ensured first
+        self.hub.embs[(other.id, doc2, 0)] = ("[0,0,0,1]", self.hub.chunks[(doc2, 0)][1])
+        out = library.set_profile(self.hub, "lib1", other.id)
+        self.assertEqual((out["ok"], out["profile"], out["previous_profile"]), (True, other.id, TINY.id))
+        self.assertEqual(self.hub.sources["lib1"]["profile"], other.id)
+        self.assertTrue(any(i.startswith("idx_library_hnsw_voyage_u") for i in self.hub.indexes))
+
+    def test_set_profile_refuses_unknown_profile_and_library(self):
+        self.add()
+        with self.assertRaises(library.LibraryError) as ctx:
+            library.set_profile(self.hub, "lib1", "ghost@9")
+        self.assertIn("unknown embedding profile", str(ctx.exception))
+        with self.assertRaises(library.LibraryError):
+            library.set_profile(self.hub, "ghost", TINY.id)
 
     def test_unknown_library_is_refused(self):
         for fn in (library.source_status, library.scan, library.backfill):
@@ -752,6 +793,21 @@ class CliTest(_Base):
                 self.assertFalse(out["ok"])
                 self.assertTrue(out["error"])
         self.assertIn("lib1", self.hub.sources)
+
+    def test_set_profile_cli_is_exit_2_with_the_missing_count_then_exit_0(self):
+        other = ProfileSpec("voyage-u@4", "voyage", "voyage-u", 4)
+        self.hub.profile_rows[other.id] = ("voyage", "voyage-u", 4, "l2", None)
+        self.add()
+        self.write("A/x.txt", "some text")
+        library.scan(self.hub, "lib1")
+        rc, out = self.run_cli(library_cmd="set-profile", name="lib1", profile=other.id)
+        self.assertEqual(rc, 2)
+        self.assertFalse(out["ok"])
+        self.assertIn("1 of 1 chunks", out["error"])
+        doc = sorted(self.hub.source_docs("lib1"))[0]
+        self.hub.embs[(other.id, doc, 0)] = ("[0,0,0,1]", self.hub.chunks[(doc, 0)][1])
+        rc, out = self.run_cli(library_cmd="set-profile", name="lib1", profile=other.id)
+        self.assertEqual((rc, out["ok"], out["profile"]), (0, True, other.id))
 
     def test_name_and_root_refusals_never_connect(self):
         with mock.patch("khipu.db.connect", side_effect=AssertionError("must not connect")), \

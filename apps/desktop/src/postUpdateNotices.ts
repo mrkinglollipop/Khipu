@@ -15,6 +15,9 @@ export type PostUpdateNotice = {
    * the Home screen; "settings" wires an "Open Settings" button that opens
    * Settings on Optional features. Omit for a plain "Got it" notice. */
   action?: "integrations" | "home" | "settings";
+  /** With action "settings": the Settings section to open on (default Optional
+   * features). Matches the section keys in App.tsx. */
+  settingsSection?: "features" | "index";
 };
 
 export const POST_UPDATE_NOTICES: PostUpdateNotice[] = [
@@ -80,6 +83,20 @@ export const POST_UPDATE_NOTICES: PostUpdateNotice[] = [
       "gateway address and token, file locations, background jobs and the active " +
       "search index profile can be changed in Settings as well.",
     action: "settings",
+  },
+  {
+    version: "0.4.8",
+    title: "Embeddings has its own screen in Settings",
+    body:
+      "Settings now has an Embeddings screen. It lists each model Khipu can use to " +
+      "search by meaning, shows how much of your memory each one covers, and lets " +
+      "you add a model, switch to one, or redo some of it, with an estimate first. " +
+      "You can also add a folder of text files as a library and bring in an index " +
+      "you already made. The old search-index picker under Capture & models did " +
+      "nothing, so it is gone. If you had chosen something there, nothing changes " +
+      "now; use Embeddings instead.",
+    action: "settings",
+    settingsSection: "index",
   },
 ];
 
