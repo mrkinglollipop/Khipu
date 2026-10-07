@@ -101,7 +101,7 @@ def estimate(profile_id: str, space: str = "memory", *, stale: bool = False) -> 
         "chunks": chunks,
         "chars": chars,
         "approx_tokens": tokens,
-        "price_usd": None if price is None else round(tokens / 1_000_000 * price, 6),
+        "price_usd": None if price is None else round(tokens / 1_000_000 * price, 8),
         "price_note": note,
         "approx_seconds": None if rate is None else int(round(chunks / rate)),
         "rate_source": rate_source,
