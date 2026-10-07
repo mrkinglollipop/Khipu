@@ -1,0 +1,2530 @@
+/* ---------------------------------------------------------------------------
+   Khipu — design tokens
+   Light theme on :root, dark overrides via prefers-color-scheme.
+--------------------------------------------------------------------------- */
+
+:root {
+  --bg: #faf9f7;
+  --surface: #ffffff;
+  --surface-2: #f5f3f0;
+  --rail: #f3f1ed;
+  --border: #e5e1db;
+  --border-strong: #d5d0c8;
+  --text: #201d1a;
+  --text-2: #55504a;
+  --muted: #8a847c;
+  --accent: #a63a1e;
+  --accent-hover: #8f2f16;
+  --accent-text: #8c2d14;
+  --accent-soft: #f6e9e3;
+  --on-accent: #ffffff;
+  --ok: #2e7d43;
+  --ok-soft: #eaf5ec;
+  --warn: #96660a;
+  --warn-soft: #fbf3e0;
+  --err: #b3261e;
+  --err-soft: #fbebea;
+  --ring: rgba(166, 58, 30, 0.35);
+  --shadow-sm: 0 1px 2px rgba(32, 29, 26, 0.06);
+  --shadow-md: 0 4px 16px rgba(32, 29, 26, 0.08);
+
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+    sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", monospace;
+
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+
+  /* Spacing scale — 4/8/12/16/20/24/32. Before this the file picked its own
+     number per rule (7 gap values, 10 padding values). New and touched rules
+     use these; nothing else was rewritten blind. */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 20px;
+  --s6: 24px;
+  --s8: 32px;
+
+  /* Type scale — 11/12/13/15/18/22, replacing 13 literal sizes. */
+  --t-xs: 11px;
+  --t-sm: 12px;
+  --t-md: 13px;
+  --t-lg: 15px;
+  --t-xl: 18px;
+  --t-2xl: 22px;
+
+  /* One modal backdrop, not two independent rgba literals. */
+  --backdrop: rgba(32, 29, 26, 0.45);
+
+  color: var(--text);
+  background: var(--bg);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16130f;
+    --surface: #1f1b17;
+    --surface-2: #262119;
+    --rail: #1a1713;
+    --border: #332d26;
+    --border-strong: #453d33;
+    --text: #ede8e1;
+    --text-2: #b8b0a5;
+    --muted: #857d72;
+    --accent: #e0703f;
+    --accent-hover: #ea8153;
+    --accent-text: #ed9067;
+    --accent-soft: rgba(224, 112, 63, 0.14);
+    --on-accent: #1f0e06;
+    --ok: #63c982;
+    --ok-soft: rgba(99, 201, 130, 0.12);
+    --warn: #e3b241;
+    --warn-soft: rgba(227, 178, 65, 0.12);
+    --err: #f27059;
+    --err-soft: rgba(242, 112, 89, 0.12);
+    --ring: rgba(224, 112, 63, 0.4);
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 6px 24px rgba(0, 0, 0, 0.5);
+    --backdrop: rgba(0, 0, 0, 0.55);
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Base
+-------------------------------------------------------------------------- */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.95em;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 4px 0 8px;
+}
+
+/* --------------------------------------------------------------------------
+   Shell — full-height sidebar + main, overlay title bar
+-------------------------------------------------------------------------- */
+
+.shell {
+  display: grid;
+  grid-template-columns: 216px 1fr;
+  height: 100%;
+}
+
+/* --------------------------------------------------------------------------
+   Sidebar
+-------------------------------------------------------------------------- */
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  background: var(--rail);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+  position: relative;
+  /* Window chrome: draggable surface, not selectable text. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.rail-drag {
+  height: 44px;
+  flex: none;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px 16px;
+}
+
+.brand-icon {
+  display: block;
+  flex: none;
+  /* The PNG bakes its own rounded-rect; clip matches the macOS icon shape. */
+  border-radius: 22.5%;
+  user-select: none;
+}
+
+.brand-name {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+
+.rail-nav {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+button.nav {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    color 140ms ease;
+}
+
+button.nav svg {
+  flex: none;
+}
+
+button.nav:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+button.nav.active {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* Clay cord — the brand motif on the active nav item. */
+button.nav.active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+button.nav:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--ring);
+}
+
+.rail-foot {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  padding: var(--s3) var(--s4);
+  border-top: 1px solid var(--border);
+}
+
+/* Plain-language health line — replaces the permanent "DSN ok" pill. */
+.rail-health {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+.rail-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--s2);
+  font-size: var(--t-xs);
+  color: var(--muted);
+}
+
+button.rail-feedback {
+  height: auto;
+  min-height: 32px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  button.rail-feedback:hover {
+    background: var(--surface-2);
+    color: var(--text);
+    border-color: var(--border-strong);
+  }
+}
+
+.version-chip {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.rail-spin {
+  margin-left: auto;
+  color: var(--muted);
+}
+
+.nav-spin {
+  margin-left: auto;
+  color: var(--muted);
+}
+
+/* --------------------------------------------------------------------------
+   Main + panels
+-------------------------------------------------------------------------- */
+
+.main {
+  /* `.main` is a `.shell` grid item with the default `min-height: auto`,
+     which sizes the item (and so the grid row, and so `.shell` itself) to
+     fit its tallest panel's content instead of the window's actual height —
+     "grid blowout". That leaves nothing for `overflow-y: auto` to scroll
+     *within*: a step taller than the 1100x720 window (Model, Finish) then
+     has its bottom nav pushed off the fixed-size native window with no way
+     to reach it (2026-09-05 pixel-pass finding 4). Bounding both dimensions
+     to the grid track makes `.main` the actual scroll container. */
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+  background: var(--bg);
+}
+
+.working-banner {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 24px;
+  background: var(--accent-soft);
+  border-bottom: 1px solid var(--border);
+  color: var(--accent-text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.working-banner-label {
+  flex: 1 1 auto;
+}
+
+.working-banner-elapsed {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+.working-banner-hint {
+  color: var(--text-2);
+  font-weight: 500;
+}
+
+.panel.is-hidden {
+  display: none;
+}
+
+.panel:not(.is-hidden) {
+  animation: panel-in 160ms ease;
+}
+
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.panel-head {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 24px 12px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  /* Window chrome: draggable surface, not selectable text. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.panel-head h1 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.panel-head .lede {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  max-width: 64ch;
+}
+
+.panel-head-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.panel-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.panel-body {
+  max-width: 920px;
+  padding: 20px 24px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* --------------------------------------------------------------------------
+   Buttons
+-------------------------------------------------------------------------- */
+
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease;
+}
+
+button:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+}
+
+button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--ring);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+
+button.primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+/* Destructive action (Activity → Forget). Outlined, not filled: it must read
+   as dangerous without competing with .primary for attention. */
+button.danger {
+  color: var(--err);
+  border-color: var(--err);
+}
+
+button.danger:hover {
+  background: var(--err-soft);
+  border-color: var(--err);
+}
+
+/* --------------------------------------------------------------------------
+   Inputs
+-------------------------------------------------------------------------- */
+
+input {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  transition:
+    border-color 140ms ease,
+    box-shadow 140ms ease;
+}
+
+input::placeholder {
+  color: var(--muted);
+}
+
+input:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--ring);
+}
+
+input:disabled {
+  opacity: 0.5;
+}
+
+input.mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.toolbar input {
+  flex: 1;
+  min-width: 160px;
+}
+
+.hops-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+/* Optional Project / Since filters — a labelled input pair, same shape as
+   .hops-label so the second toolbar row matches the first. */
+.filter-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 150px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.toolbar input.filter-input {
+  flex: 1;
+  min-width: 80px;
+}
+
+.toolbar input[type="checkbox"],
+.toolbar input[type="radio"] {
+  flex: none;
+  min-width: 0;
+  width: auto;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.toolbar input.hops-input {
+  width: 56px;
+  flex: none;
+  min-width: 0;
+  font-family: var(--mono);
+}
+
+/* --------------------------------------------------------------------------
+   Spinner
+-------------------------------------------------------------------------- */
+
+.spin {
+  animation: spin 800ms linear infinite;
+  color: var(--muted);
+  flex: none;
+}
+
+button.primary .spin {
+  color: var(--on-accent);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.chips {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font: inherit;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+button.chip {
+  cursor: pointer;
+}
+
+.chip.on {
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+
+.chip.tiny {
+  height: 20px;
+  font-size: var(--t-xs);
+}
+
+.chip .x {
+  color: var(--muted);
+  font-size: var(--t-md);
+  line-height: 1;
+  cursor: pointer;
+}
+
+/* --------------------------------------------------------------------------
+   Row lists (captures / activity / revisions / files)
+-------------------------------------------------------------------------- */
+
+.rows {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+
+.rows-head {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.row-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  transition: background 140ms ease;
+}
+
+.row-item:last-child {
+  border-bottom: 0;
+}
+
+.row-item:hover {
+  background: var(--surface-2);
+}
+
+button.id-chip {
+  height: auto;
+  flex: none;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+button.id-chip:hover {
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+
+.row-main {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.row-main.mono {
+  font-size: 12px;
+}
+
+.row-meta {
+  flex: none;
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.edge-arrow {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* --------------------------------------------------------------------------
+   Callouts
+-------------------------------------------------------------------------- */
+
+.callout {
+  display: flex;
+  gap: var(--s3);
+  padding: var(--s3) var(--s4);
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.callout.ok {
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+  background: var(--ok-soft);
+}
+
+.callout.warn {
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+  background: var(--warn-soft);
+}
+
+.callout.err {
+  border-color: color-mix(in srgb, var(--err) 45%, transparent);
+  background: var(--err-soft);
+}
+
+.callout .txt {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.callout b {
+  display: block;
+  font-size: var(--t-md);
+  color: var(--text);
+}
+
+.callout span {
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+.callout .cta {
+  display: flex;
+  gap: var(--s2);
+  align-items: center;
+  flex: none;
+}
+
+/* Severity stripe — the attention items on Home. */
+.stripe {
+  position: relative;
+  padding-left: var(--s5);
+}
+
+.stripe::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: 2px;
+}
+
+.stripe.err::before {
+  background: var(--err);
+}
+
+.stripe.warn::before {
+  background: var(--warn);
+}
+
+.stripe.ok::before {
+  background: var(--ok);
+}
+
+
+/* --------------------------------------------------------------------------
+   Empty states
+-------------------------------------------------------------------------- */
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s1);
+  padding: var(--s8) var(--s6);
+  text-align: center;
+  color: var(--muted);
+}
+
+.empty svg {
+  margin-bottom: var(--s2);
+  color: var(--muted);
+}
+
+.empty b {
+  font-size: var(--t-md);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.empty span {
+  font-size: var(--t-sm);
+  color: var(--muted);
+  max-width: 46ch;
+}
+
+/* --------------------------------------------------------------------------
+   Code blocks + Raw JSON
+-------------------------------------------------------------------------- */
+
+.code {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 12px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.code.tall {
+  max-height: 48vh;
+}
+
+/* --------------------------------------------------------------------------
+   Error toast
+-------------------------------------------------------------------------- */
+
+.toast-err {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 100;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: 420px;
+  padding: 12px;
+  background: var(--err-soft);
+  border: 1px solid var(--err);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-md);
+  color: var(--err);
+}
+
+.toast-msg {
+  font-size: 12px;
+  word-break: break-word;
+}
+
+button.toast-close {
+  height: auto;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: var(--err);
+  flex: none;
+}
+
+button.toast-close:hover {
+  background: transparent;
+  opacity: 0.7;
+}
+
+/* --------------------------------------------------------------------------
+   Settings section cards
+-------------------------------------------------------------------------- */
+
+.section-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.section-body {
+  padding: 12px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.section-body .muted {
+  margin: 0;
+}
+
+.section-body .rows {
+  border-radius: var(--r-sm);
+}
+
+/* --------------------------------------------------------------------------
+   First-run onboarding
+-------------------------------------------------------------------------- */
+
+.onboard-wrap {
+  max-width: none;
+  min-height: calc(100vh - 56px);
+  align-items: center;
+  /* Plain `center` on an overflowing flex column splits the overflow evenly
+     above and below, so the top (and any nav pinned at the card's bottom)
+     becomes unreachable even once `.main` itself scrolls. `safe center`
+     keeps the centering when the card fits and falls back to start-aligned
+     (scrollable from the top) the moment it does not — 2026-09-05 pixel-pass
+     finding 4. */
+  justify-content: safe center;
+  padding-top: 44px;
+}
+
+.onboard {
+  width: 100%;
+  max-width: 560px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 32px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-md);
+}
+
+.onboard h1 {
+  margin: 4px 0 0;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.onboard .muted {
+  margin: 0;
+}
+
+.onboard .code {
+  width: 100%;
+}
+
+.onboard .callout {
+  width: 100%;
+}
+
+/* Integrations pane — component-state dots (icon + text carry meaning; color reinforces) */
+.row-item > svg.ok { color: var(--ok); }
+.row-item > svg.err { color: var(--err); }
+.row-item > svg.warn { color: var(--warn); }
+.row-item > svg.muted { color: var(--muted); }
+.row-item > svg { flex: 0 0 auto; margin-top: 2px; }
+
+.welcome-harness-list {
+  list-style: none;
+  padding-left: 0;
+}
+
+.welcome-harness-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* Welcome tutorial — step rail + lists, on top of .onboard */
+.welcome { max-width: 640px; }
+.welcome-steps {
+  list-style: none;
+  display: flex;
+  gap: 4px;
+  margin: 0 0 4px;
+  padding: 0;
+  width: 100%;
+  flex-wrap: wrap;
+}
+.welcome-steps li button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px 6px 6px;
+  font-size: 12.5px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 999px;
+}
+.welcome-steps li.current button {
+  color: var(--text);
+  border-color: var(--border);
+  background: var(--surface-2, rgba(127,127,127,.08));
+}
+.welcome-steps li.done button { color: var(--text); }
+.welcome-step-n {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 650;
+  border: 1px solid var(--border);
+}
+.welcome-steps li.current .welcome-step-n { background: var(--accent); color: var(--on-accent); border-color: transparent; }
+.welcome-steps li.done .welcome-step-n { background: var(--ok); color: var(--on-accent); border-color: transparent; }
+.welcome-list { margin: 0; padding-left: 18px; color: var(--muted); line-height: 1.55; }
+.welcome-list li + li { margin-top: 4px; }
+.welcome-nav { width: 100%; justify-content: space-between; margin-top: 8px; }
+.welcome .toolbar input.mono { flex: 1; }
+
+/* --------------------------------------------------------------------------
+   Send feedback dialog
+-------------------------------------------------------------------------- */
+
+.feedback-dialog {
+  max-width: min(520px, calc(100vw - 32px));
+}
+
+
+.feedback-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px;
+}
+
+.feedback-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.feedback-head h2 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+button.feedback-close {
+  height: auto;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+
+button.feedback-close:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+.feedback-lede {
+  margin: 0;
+}
+
+.feedback-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.feedback-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+textarea.feedback-message {
+  min-height: 120px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.5;
+  resize: vertical;
+  transition:
+    border-color 140ms ease,
+    box-shadow 140ms ease;
+}
+
+textarea.feedback-message:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--ring);
+}
+
+textarea.feedback-message:disabled {
+  opacity: 0.5;
+}
+
+.feedback-hint {
+  font-size: 11px;
+}
+
+.feedback-field-err {
+  font-size: 12px;
+  color: var(--err);
+}
+
+.feedback-attach-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.feedback-attach-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.feedback-attach-total {
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
+.feedback-attach-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.feedback-attach-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.feedback-attach-list li:last-child {
+  border-bottom: 0;
+}
+
+.feedback-attach-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.feedback-attach-size {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+button.feedback-attach-remove {
+  height: auto;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+
+button.feedback-attach-remove:hover {
+  color: var(--err);
+  background: transparent;
+}
+
+.feedback-form-err {
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  background: var(--err-soft);
+  border: 1px solid var(--err);
+  color: var(--err);
+  font-size: 12px;
+}
+
+.feedback-success-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--ok);
+}
+
+.feedback-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* --------------------------------------------------------------------------
+   Post-update notice dialog
+-------------------------------------------------------------------------- */
+
+.post-update-dialog {
+  max-width: min(440px, calc(100vw - 32px));
+}
+
+
+.post-update-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 20px;
+}
+
+.post-update-head h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.post-update-text {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.post-update-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* --------------------------------------------------------------------------
+   UI kit (desktop overhaul) — every value from the approved mocks' tokens.css.
+   Markup contracts live in ui.tsx.
+-------------------------------------------------------------------------- */
+
+/* Small buttons and link-styled buttons, so a card row can carry an action
+   without inventing its own size. */
+button.sm {
+  height: 26px;
+  padding: 0 10px;
+  font-size: var(--t-sm);
+}
+
+button.link {
+  border-color: transparent;
+  background: transparent;
+  color: var(--accent-text);
+  padding: 0 var(--s1);
+  height: 26px;
+}
+
+button.link:hover {
+  background: transparent;
+  border-color: transparent;
+  text-decoration: underline;
+}
+
+/* Tag — status (dot) and kind (uppercase) in one component. */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 20px;
+  padding: 0 var(--s2);
+  border-radius: 999px;
+  font-size: var(--t-xs);
+  font-weight: 600;
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  background: var(--surface-2);
+  white-space: nowrap;
+  flex: none;
+}
+
+.tag .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+.tag.ok {
+  color: var(--ok);
+  background: var(--ok-soft);
+  border-color: transparent;
+}
+
+.tag.warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-color: transparent;
+}
+
+.tag.err {
+  color: var(--err);
+  background: var(--err-soft);
+  border-color: transparent;
+}
+
+.tag.accent {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border-color: transparent;
+}
+
+.tag.kind {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+  border-radius: 4px;
+  height: 18px;
+}
+
+/* Health dot — one state system, shared by the rail and every row. */
+.hdot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--border-strong);
+}
+
+.hdot.ok {
+  background: var(--ok);
+}
+
+.hdot.warn {
+  background: var(--warn);
+}
+
+.hdot.err {
+  background: var(--err);
+}
+
+/* Card + rows. */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+.card.col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: 10px var(--s4);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--t-xs);
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.card-head .spacer {
+  flex: 1;
+}
+
+.card .row {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: 9px var(--s4);
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+
+.card .row:last-child {
+  border-bottom: 0;
+}
+
+/* SetupStages — one row per connect-pipeline stage. Unlike a plain .card
+   .row, each row can grow a Callout underneath it (the fix for a failed
+   stage), so the row itself is top-aligned rather than vertically centered. */
+.setup-stages .setup-stage-row {
+  align-items: flex-start;
+}
+
+.setup-stages .setup-stage-row .tag {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.setup-stage-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.setup-stage-text .muted {
+  font-size: var(--t-xs);
+}
+
+.setup-stage-text .callout {
+  margin-top: 2px;
+}
+
+.card-scroll {
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.ellip {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.meta {
+  font-size: var(--t-xs);
+  color: var(--muted);
+  white-space: nowrap;
+  flex: none;
+}
+
+.t2 {
+  color: var(--text-2);
+}
+
+.push {
+  margin-left: auto;
+}
+
+/* Tiles — the four Home headline numbers. */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--s3);
+}
+
+.tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: var(--s3) var(--s4);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tile .label {
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.tile .value {
+  font-size: var(--t-xl);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+
+.tile .sub {
+  font-size: var(--t-xs);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tile.err {
+  border-color: color-mix(in srgb, var(--err) 50%, transparent);
+}
+
+.tile.warn {
+  border-color: color-mix(in srgb, var(--warn) 50%, transparent);
+}
+
+/* Two equal columns (Home) and a list + detail split (Recall). */
+.cols {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s4);
+  min-height: 0;
+}
+
+.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: var(--s4);
+  min-height: 0;
+}
+
+.inline {
+  display: flex;
+  gap: var(--s2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* Segmented control — replaces the ad-hoc .segmented pill group. */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  height: 30px;
+  flex: none;
+}
+
+.seg button {
+  height: 100%;
+  padding: 0 11px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--surface);
+  font-size: var(--t-sm);
+  font-weight: 500;
+  color: var(--text-2);
+  box-shadow: none;
+}
+
+.seg button:last-child {
+  border-right: 0;
+}
+
+.seg button:hover {
+  background: var(--surface-2);
+}
+
+.seg button.on {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* Disclosure — collapsed by default; every raw JSON dump lives in one. */
+details.disclose {
+  border-top: 1px solid var(--border);
+  padding-top: var(--s1);
+}
+
+details.disclose > summary.disclosure {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  font-size: var(--t-sm);
+  color: var(--muted);
+  padding: var(--s2) 0;
+  cursor: pointer;
+  list-style: none;
+}
+
+details.disclose > summary.disclosure::-webkit-details-marker {
+  display: none;
+}
+
+details.disclose > summary.disclosure:hover {
+  color: var(--text-2);
+}
+
+.disclosure-chevron {
+  transition: transform 140ms ease;
+  flex: none;
+}
+
+details.disclose[open] > summary .disclosure-chevron {
+  transform: rotate(90deg);
+}
+
+.disclose-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  padding-bottom: var(--s3);
+}
+
+/* Screens that need the full window width (Home tiles, Owed table, Recall
+   split). The default .panel-body cap is for prose-width forms. */
+.panel-body.wide {
+  max-width: none;
+}
+
+.panel-body.fill {
+  height: 100%;
+  min-height: 0;
+}
+
+/* Owed table column widths, from the mock. */
+.w44 {
+  width: 44px;
+}
+
+.w52 {
+  width: 52px;
+}
+
+.w60 {
+  width: 60px;
+}
+
+/* Rail count badges. */
+.nav-count {
+  margin-left: auto;
+  font-size: var(--t-xs);
+  font-weight: 600;
+  color: var(--on-accent);
+  background: var(--accent);
+  border-radius: 999px;
+  padding: 0 7px;
+  line-height: 17px;
+  flex: none;
+}
+
+.nav-count.quiet {
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+/* One backdrop for every modal. */
+dialog::backdrop {
+  background: var(--backdrop);
+}
+
+/* ---------------------------------------------------------------------------
+   UI kit, part two — the list + detail split (Recall, Activity) and the Owed
+   table's remaining columns. Values from the approved mocks' tokens.css.
+--------------------------------------------------------------------------- */
+
+/* A screen whose body is a full-height split rather than a scrolling column.
+   `:not(.is-hidden)` so the hidden-panel `display: none` still wins. */
+.panel.fill:not(.is-hidden) {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.panel.fill .panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.panel.fill .split {
+  flex: 1;
+}
+
+/* One search hit. `.on` is the row the detail pane is showing. */
+button.result {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 6px;
+  width: 100%;
+  height: auto;
+  text-align: left;
+  padding: var(--s3) var(--s4);
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  font: inherit;
+}
+
+button.result:last-child {
+  border-bottom: 0;
+}
+
+button.result:hover {
+  background: var(--surface-2);
+  border-color: transparent;
+  border-bottom: 1px solid var(--border);
+}
+
+button.result.on {
+  background: var(--surface-2);
+}
+
+.result .tl {
+  display: flex;
+  gap: var(--s2);
+  align-items: center;
+  min-width: 0;
+}
+
+.result .title {
+  font-weight: 600;
+  font-size: var(--t-md);
+  color: var(--text);
+}
+
+.result .snip {
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: normal;
+}
+
+.result .foot {
+  display: flex;
+  gap: var(--s3);
+  align-items: center;
+  font-size: var(--t-xs);
+  color: var(--muted);
+  min-width: 0;
+}
+
+/* Relevance, as a bar rather than a number pretending to be a percentage. */
+.score {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--t-xs);
+  color: var(--muted);
+  margin-left: auto;
+  flex: none;
+}
+
+.bar {
+  width: 44px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--surface-2);
+  position: relative;
+  overflow: hidden;
+  flex: none;
+}
+
+.bar i {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: var(--accent);
+}
+
+/* The detail pane on the right of a split. */
+.detail {
+  padding: var(--s4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s4);
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.section h3 {
+  margin: 0;
+  font-size: var(--t-xs);
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.section p {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.section ul {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.section li {
+  margin: 2px 0;
+}
+
+.acts {
+  display: flex;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: var(--s2);
+  flex-wrap: wrap;
+}
+
+/* A row with no card chrome — the "Connected" list inside a detail pane. */
+.card .row.plain,
+.row.plain {
+  padding: 6px 0;
+  border: 0;
+}
+
+/* Day heading inside the Activity list. */
+.day {
+  font-size: var(--t-xs);
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: var(--s2) var(--s4) var(--s1);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+/* A whole list row that opens something. */
+button.row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--s3);
+  min-width: 0;
+  padding: 9px var(--s4);
+  width: 100%;
+  height: auto;
+  text-align: left;
+  border-radius: 0;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  box-shadow: none;
+  font: inherit;
+}
+
+button.row:last-child {
+  border-bottom: 0;
+}
+
+button.row:hover {
+  background: var(--surface-2);
+  border-color: transparent;
+  border-bottom: 1px solid var(--border);
+}
+
+button.row.on {
+  background: var(--surface-2);
+}
+
+/* Remaining Owed / Activity column widths, from the mocks. */
+.w50 {
+  width: 50px;
+  flex: none;
+}
+
+.w78 {
+  width: 78px;
+  flex: none;
+}
+
+.w96 {
+  width: 96px;
+  flex: none;
+}
+
+/* A fixed-width cell never lets its pill spill into the next column: the
+   label truncates and the full name stays in the pill's title. Found on the
+   Owed table's project pill ("Claude Code session" ran over the Opened
+   column, screenshot pass 2026-09-05). */
+.w96,
+.w88 {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.w96 .tag,
+.w88 .tag {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 18px;
+  vertical-align: middle;
+}
+
+/* Confirm / edit dialogs (Forget, Edit summary, Snooze) — the same card the
+   feedback dialog uses, without its form-specific rules. */
+/* One dialog card for all three modals — the same box was declared three
+   times, once per dialog, and only the max-width ever differed. */
+.kit-dialog,
+.feedback-dialog,
+.post-update-dialog {
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+  color: var(--text);
+  width: 100%;
+}
+
+.kit-dialog {
+  max-width: min(480px, calc(100vw - 32px));
+}
+
+.kit-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  padding: var(--s5);
+}
+
+.kit-dialog-body h2 {
+  margin: 0;
+  font-size: var(--t-lg);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.kit-dialog-body p {
+  margin: 0;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+.kit-dialog-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  padding-top: var(--s1);
+}
+
+textarea.edit-summary {
+  min-height: 140px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+textarea.edit-summary:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--ring);
+}
+
+/* The filter row a chip reveals. */
+.filter-row {
+  display: flex;
+  gap: var(--s2);
+  align-items: flex-end;
+  flex-wrap: wrap;
+  padding: var(--s3) var(--s4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+/* Activity's text filter — a fixed lane so the chips beside it do not reflow
+   as the list changes. */
+input.activity-filter {
+  width: 260px;
+  flex: none;
+}
+
+/* Actions sit under the scrolling detail, not inside it, so "Forget" cannot
+   scroll out of reach on a capture with a long decision list. */
+.card.col > .acts {
+  margin-top: 0;
+  padding: var(--s3) var(--s4);
+  border-top: 1px solid var(--border);
+  flex: none;
+}
+
+/* The selected row, unmistakably. `--surface-2` on its own is nearly invisible
+   against `--surface` in the dark theme, so the accent edge carries it. */
+button.result.on,
+button.row.on {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* Owed: the kind cell and the action cell. Done + Snooze must stay on one
+   line — stacked, they doubled every row's height, and the mock's 104px
+   action column is not wide enough for two real buttons. */
+.w88 {
+  width: 88px;
+  flex: none;
+}
+
+.w132 {
+  width: 132px;
+  flex: none;
+}
+
+.acts-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+}
+
+/* ---------------------------------------------------------------------------
+   UI kit, part three — harness cards and the Settings sub-navigation
+   (overhaul phase 5). Values from the approved mocks' tokens.css.
+--------------------------------------------------------------------------- */
+
+.hgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: var(--s3);
+}
+
+.hcard {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.hcard .top {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s3) var(--s4) var(--s2);
+}
+
+.hcard .name {
+  font-weight: 650;
+  font-size: var(--t-lg);
+  flex: 1;
+  min-width: 0;
+}
+
+.hcard .checks {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: var(--s1) var(--s4) var(--s3);
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+.hcard .checks div {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s2);
+}
+
+.hcard .checks span {
+  min-width: 0;
+}
+
+.hcard .note {
+  padding: 0 var(--s4) var(--s3);
+  font-size: var(--t-xs);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hcard .hacts {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: var(--s3) var(--s4);
+  border-top: 1px solid var(--border);
+  margin-top: auto;
+}
+
+.hcard.dashed {
+  border-style: dashed;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: var(--s5);
+  text-align: center;
+}
+
+.hcard.dashed b {
+  font-size: var(--t-md);
+}
+
+.meta.wrap {
+  white-space: normal;
+}
+
+/* Check-line marks. `off` is "nothing to do here, by design" and must never
+   read as either a pass or a failure (2026-08-17). */
+.ck {
+  flex: none;
+  margin-top: 1px;
+  stroke-width: 2.25;
+}
+
+.ck.ok {
+  color: var(--ok);
+}
+
+.ck.err {
+  color: var(--err);
+}
+
+.ck.warn {
+  color: var(--warn);
+}
+
+.ck.off {
+  color: var(--border-strong);
+}
+
+/* Settings: a fixed sub-navigation beside one section at a time. */
+.settings-split {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s5);
+  min-width: 0;
+}
+
+.subnav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 180px;
+  flex: none;
+  position: sticky;
+  top: 76px;
+}
+
+.subnav button {
+  justify-content: flex-start;
+  height: 30px;
+  padding: 0 10px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-2);
+  font-weight: 500;
+  font-size: var(--t-md);
+}
+
+.subnav button:hover {
+  background: var(--surface);
+  border-color: transparent;
+}
+
+.subnav button.on {
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.settings-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s4);
+  flex: 1;
+  min-width: 0;
+  max-width: 720px;
+}
+
+/* Owed groups — a section heading that collapses, not a quiet "Advanced"
+   line. "Needs you" is open by default; the other two are one click. */
+details.disclose.group {
+  border-top: 0;
+  padding-top: 0;
+}
+
+details.disclose.group > summary.disclosure {
+  font-size: var(--t-md);
+  color: var(--text);
+  padding: var(--s2) 0 var(--s1);
+}
+
+details.disclose.group > summary.disclosure strong {
+  font-weight: 650;
+}
+
+details.disclose.group .nav-count {
+  margin-left: 0;
+}
+
+details.disclose.group .meta {
+  color: var(--muted);
+}
+
+/* The label is one span inside the summary (ui.tsx), so the group header's
+   title, count and hint need their own row. */
+details.disclose.group > summary.disclosure > span {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-width: 0;
+  flex: 1;
+}
+
+/* --------------------------------------------------------------------------
+   Settings parity (2026-09-30): switches, labelled fields, job rows.
+   Description text uses --text-2, not --muted: --muted on the card surface is
+   below 4.5:1 and these lines carry the cost and the measurement.
+-------------------------------------------------------------------------- */
+
+select {
+  height: 30px;
+  padding: 0 28px 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background-color: var(--surface);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+select:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--ring);
+}
+
+select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+input.switch {
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  flex: none;
+  width: 36px;
+  height: 20px;
+  min-width: 0;
+  padding: 0;
+  margin: 2px 0 0;
+  border-radius: 999px;
+  border: 1px solid var(--text-2);
+  background: var(--surface-2);
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease;
+}
+
+input.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--text-2);
+  transition: transform 140ms ease;
+}
+
+input.switch:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+input.switch:checked::after {
+  transform: translateX(16px);
+  background: var(--on-accent);
+}
+
+input.switch:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  input.switch,
+  input.switch::after {
+    transition: none;
+  }
+}
+
+.set-intro {
+  margin: 0;
+}
+
+.set-help {
+  margin: 0;
+  color: var(--text-2);
+  font-size: var(--t-sm);
+  line-height: 1.45;
+}
+
+.set-error {
+  margin: 0;
+  color: var(--err);
+  font-size: var(--t-sm);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.set-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+}
+
+.set-field + .set-field {
+  margin-top: var(--s2);
+  padding-top: var(--s3);
+  border-top: 1px solid var(--border);
+}
+
+.set-label {
+  font-size: var(--t-md);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.opt-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.opt-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s3);
+  padding: var(--s3) var(--s4);
+  border-bottom: 1px solid var(--border);
+}
+
+.opt-row:last-child {
+  border-bottom: 0;
+}
+
+.opt-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  flex: 1;
+  min-width: 0;
+}
+
+.opt-title {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  flex-wrap: wrap;
+}
+
+.opt-name {
+  font-size: var(--t-md);
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.opt-what,
+.opt-cost,
+.opt-found {
+  margin: 0;
+  color: var(--text-2);
+  font-size: var(--t-sm);
+  line-height: 1.45;
+}
+
+.opt-cost b,
+.opt-found b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.opt-text .set-field {
+  margin-top: var(--s2);
+}
+
+.section-card.rejected {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+}
+
+.section-card.rejected .section-head {
+  background: var(--warn-soft);
+}
+
+.opt-group-note {
+  margin: 0;
+  padding: var(--s3) var(--s4) 0;
+  color: var(--text-2);
+  font-size: var(--t-sm);
+  line-height: 1.45;
+}
+
+.job-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: var(--s3);
+  border-bottom: 1px solid var(--border);
+}
+
+.job-row:last-child {
+  border-bottom: 0;
+}
+
+.job-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.job-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.job-meta {
+  color: var(--text-2);
+  font-size: var(--t-sm);
+}
+
+.job-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  flex: none;
+}
+
+.section-head .spacer {
+  flex: 1;
+}
+
+.set-field.narrow .toolbar input {
+  flex: none;
+  width: 120px;
+  min-width: 0;
+}
+
+.set-labelrow {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+}
+
+.set-field input:disabled {
+  background: var(--surface-2);
+  color: var(--text-2);
+  opacity: 1;
+  border-style: dashed;
+  cursor: not-allowed;
+}
+
+.job-desc {
+  color: var(--text-2);
+  font-size: var(--t-sm);
+  line-height: 1.4;
+}
