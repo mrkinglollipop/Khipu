@@ -113,6 +113,10 @@ try:
     #    unless the pack pinned KHIPU_HARNESS). Never raises; always heartbeats.
     from khipu.session_capture import hook_main
     r = hook_main(os.environ.get("KHIPU_HOOK_STDIN", ""), sys.argv[2] or None)
+    if r.get("skipped"):
+        # T3's thread-title helper session: nothing captured, nothing logged,
+        # nothing drained (the next real session's Stop does that).
+        sys.exit(0)
     SID = str(r.get("session_id") or SID or "")
     _say(f"capture {r.get('harness')} {r.get('event')} due={r.get('due')} "
          f"{r.get('reason', '')}{' queued=' + r['queued'] if r.get('queued') else ''}"

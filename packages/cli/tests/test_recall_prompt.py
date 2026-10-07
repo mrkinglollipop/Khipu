@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from khipu import recall_prompt as rp
+from tests.fixtures.t3 import handoff_wrapper
 
 
 def _hit(kind="episode", hid="1", score=0.9, snippet="did the thing", **extra):
@@ -592,6 +593,47 @@ class PriorWorkMetaOutcomeTest(unittest.TestCase):
         with mock.patch.object(rp, "_search_hits_budgeted", side_effect=RuntimeError("boom")):
             out = rp.prior_work_for_prompt("what did we decide", budget_ms=600)
         self.assertEqual(out["prior_work_meta"]["outcome"], "error")
+
+
+class T3HandoffRecallTest(unittest.TestCase):
+    """After a provider switch T3 glues a hand-over of earlier turns in front of
+    the user's message; recall must search what the user typed (slice A item 4)
+    and must stay out of T3's thread-title helper sessions (item 5)."""
+
+    TYPED = "what did we decide about the recall hook budget"
+
+    def _run(self, payload: dict):
+        seen: list[str] = []
+
+        def fake_search(prompt, **kw):  # noqa: ARG001
+            seen.append(prompt)
+            return _hits(_hit(hid="7"))
+        with mock.patch.object(rp, "_search_hits", side_effect=fake_search), \
+                mock.patch.object(rp, "_log") as log:
+            out = rp.hook_main(json.dumps(payload))
+        return out, seen, log
+
+    def test_the_search_sees_only_the_typed_message(self):
+        out, seen, _ = self._run({"prompt": handoff_wrapper(self.TYPED), "session_id": "t3-a"})
+        self.assertEqual(seen, [self.TYPED])
+        self.assertIn("additionalContext", out["hookSpecificOutput"])
+
+    def test_a_handoff_with_nothing_typed_is_gated_not_searched(self):
+        for prompt in (handoff_wrapper(""), handoff_wrapper("").rstrip()):
+            out, seen, _ = self._run({"prompt": prompt, "session_id": "t3-b"})
+            self.assertEqual(seen, [])
+            self.assertEqual(out, {})
+
+    def test_the_handoff_is_also_stripped_for_the_status_lane(self):
+        with mock.patch.object(rp, "_search_hits", return_value=_hits(_hit(hid="7"))) as search:
+            rp.prior_work_for_prompt(handoff_wrapper(self.TYPED))
+        self.assertEqual(search.call_args.args[0], self.TYPED)
+
+    def test_a_t3_helper_session_gets_no_recall_and_no_log_line(self):
+        out, seen, log = self._run({"prompt": self.TYPED, "session_id": "t3-c",
+                                    "cwd": "/var/folders/ab/T/t3code-claude-title-q7w8e9"})
+        self.assertEqual((out, seen), ({}, []))
+        log.assert_not_called()
 
 
 if __name__ == "__main__":

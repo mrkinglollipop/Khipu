@@ -68,6 +68,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from khipu.t3 import is_helper_session, strip_handoff
+
 HARNESSES = ("claude_code", "cursor", "codex", "aegis")
 
 
@@ -225,9 +227,22 @@ def infer_harness(env: dict, osenv: dict | None = None) -> str:
         return "cursor"
     if "/.codex/" in tp or osenv.get("CODEX_HOME") or osenv.get("CODEX_SANDBOX"):
         return "codex"
-    if "/.claude/" in tp or osenv.get("CLAUDE_PROJECT_DIR"):
+    if "/.claude/" in tp or osenv.get("CLAUDE_PROJECT_DIR") or _in_claude_home(tp, osenv):
         return "claude_code"
     return "unknown"
+
+
+def _in_claude_home(tp: str, osenv: dict) -> bool:
+    """A transcript under ``<home>/projects/`` of any Claude home Khipu finds
+    (CLAUDE_CONFIG_DIR, T3's accounts): ``/.claude/`` only names the default."""
+    if not tp:
+        return False
+    try:
+        from khipu import claude_homes
+
+        return claude_homes.transcript_home(tp, claude_homes.discover(environ=osenv)) is not None
+    except Exception:  # noqa: BLE001 — inference is best-effort, never fatal
+        return False
 
 
 def transcript_path(env: dict, harness: str = "") -> Path | None:
@@ -259,8 +274,9 @@ _CURSOR_WRAP = re.compile(r"</?(?:user_query|timestamp)>")
 def _clean_user_text(text: str) -> str:
     """Strip harness-injected scaffolding from a user turn: Claude Code's
     <system-reminder> blocks (thousands of chars of hook context, none of it the
-    user) and Cursor's <user_query>/<timestamp> wrappers."""
-    text = _SYSTEM_REMINDER.sub("", text)
+    user), Cursor's <user_query>/<timestamp> wrappers, and the hand-over T3 Code
+    glues in front of the first message after a provider switch."""
+    text = strip_handoff(_SYSTEM_REMINDER.sub("", text))
     return _CURSOR_WRAP.sub("", text)   # no strip: ACP user text arrives in chunks that must re-join exactly
 
 
@@ -1202,6 +1218,10 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
         env = {}
     if not isinstance(env, dict):
         env = {}
+    if is_helper_session(session_cwd(env)):
+        # T3's thread-title helper: nothing to record, and no heartbeat either
+        # (a beat for a session that never wrote a line reads as liveness noise).
+        return {"skipped": "t3 helper session", "due": False}
     harness = harness or infer_harness(env)
     sid = session_id(env)
     event = norm_event(_get(env, "hookEventName", "hook_event_name"))

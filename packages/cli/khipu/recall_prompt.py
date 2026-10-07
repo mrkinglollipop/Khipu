@@ -42,6 +42,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from khipu.t3 import is_helper_session, strip_handoff
+
 # Hard wall-clock budget for the whole gated search (R1): a hook that can add
 # 3-6s (the pre-index literal pass — see search_text/ops_events R8) to every
 # single prompt is not something a session can afford. Fail open on timeout.
@@ -1118,7 +1120,9 @@ def prior_work_for_prompt(
     and running a second search of its own.
     """
     t0 = time.monotonic()
-    prompt = (prompt or "").strip()
+    # T3 Code glues a hand-over of earlier turns in front of the first message
+    # after a provider switch; only what the user typed is worth searching.
+    prompt = strip_handoff(prompt or "").strip()
 
     def _meta(
         *, legs: list[str] = (), degraded: str | None = None, reason: str,
@@ -1320,6 +1324,8 @@ def hook_main(raw: str, *, shape: str = "claude") -> dict[str, Any]:
     prompt = payload.get("prompt") or payload.get("message") or ""
     cwd = payload.get("cwd") or payload.get("cwd_path")
     session_id = payload.get("session_id") or payload.get("sessionId")
+    if is_helper_session(cwd):
+        return {}  # T3's thread-title helper: no recall, and no log line either
 
     result = prior_work_for_prompt(prompt, cwd=cwd, session_id=session_id)
     hit_ids = [f"{h.get('kind')}:{h.get('id')}" for h in result["hits"]]

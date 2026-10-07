@@ -59,8 +59,11 @@ if os.environ.get("KHIPU_LIVE_TESTS") != "1":
     _KEEP = {"KHIPU_KEYCHAIN", "KHIPU_LIVE_TESTS", "KHIPU_SCRATCH_DSN"}
     for _name in [n for n in os.environ if n.startswith(("KHIPU_", "ALZY_")) and n not in _KEEP]:
         del os.environ[_name]
+    # CLAUDE_CONFIG_DIR: Khipu now installs into that home too (khipu.claude_homes),
+    # and a suite launched from a Claude session on a second account inherits the
+    # real one. Left set, any install test would write into a live Claude home.
     for _name in ("GEMINI_API_KEY", "VOYAGE_API_KEY", "GROK_HOOK_NAME", "GROK_HOOK_EVENT",
-                  "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_SESSION_ID"):
+                  "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CONFIG_DIR"):
         os.environ.pop(_name, None)
 
 

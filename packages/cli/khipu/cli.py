@@ -510,6 +510,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         launchers = integ.launcher_health()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         launchers = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # One row per Claude home Khipu found (~/.claude, CLAUDE_CONFIG_DIR, T3's
+    # accounts). Visibility only, like a detected-but-uninstalled Cursor.
+    try:
+        from khipu import integrations as _integ
+
+        claude_homes_block = _integ.claude_homes_report()
+    except Exception as e:  # noqa: BLE001
+        claude_homes_block = {"homes": [], "error": f"{type(e).__name__}: {e}"}
     # The switch registry's states, for visibility only — never gates `ok`.
     try:
         from khipu import features
@@ -554,6 +562,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "degraded_rate": degraded_rate,
         "unknown_harness": unknown_harness,
         "launchers": launchers,
+        "claude_homes": claude_homes_block,
         "features": features_block,
         "decision_links": decision_links_block,
         "not_configured": not_configured,
@@ -3035,6 +3044,18 @@ def cmd_integrations(args: argparse.Namespace) -> int:
 
     targets = list(integ.HARNESSES) if args.harness == "all" else [args.harness]
     project = getattr(args, "project", None)
+    # --home narrows a Claude Code install/uninstall to one of the homes
+    # `integrations status` lists (its `homes[].path`); without it every home
+    # Khipu found is acted on.
+    home = getattr(args, "home", None)
+    if home is not None:
+        try:
+            if args.harness != "claude_code":
+                raise integ.UnknownClaudeHome("--home applies to the claude_code harness only")
+            integ.resolve_claude_home(home)
+        except integ.UnknownClaudeHome as e:
+            print(json.dumps({"harness": args.harness, "ok": False, "error": str(e)}, indent=2))
+            return 2
 
     # ``project`` reaches EVERY harness, not just grok_bot (audit 2026-09-04):
     # integrations.verify uses it for the Cursor stale-rule check, so
@@ -3053,7 +3074,7 @@ def cmd_integrations(args: argparse.Namespace) -> int:
         print(json.dumps(results, indent=2))
         return 0 if all(r.get("ok", not r["detected"]) for r in results) else 2
     fn = integ.install if args.integ_cmd == "install" else integ.uninstall
-    results = [fn(h, dry_run=args.dry_run, project=project) for h in targets]
+    results = [fn(h, dry_run=args.dry_run, project=project, home=home) for h in targets]
     print(json.dumps(results, indent=2))
     if args.integ_cmd == "install" and not args.dry_run and not args.no_verify:
         verified = [_verify(h) for h in targets]
@@ -4444,6 +4465,11 @@ def build_parser() -> argparse.ArgumentParser:
         )
         if name in ("install", "uninstall"):
             sp.add_argument("--dry-run", action="store_true")
+            sp.add_argument(
+                "--home",
+                help="claude_code only: act on this one Claude home (a `homes[].path` from "
+                     "`integrations status`) instead of every home Khipu found",
+            )
         if name in ("install", "uninstall", "status", "verify"):
             sp.add_argument(
                 "--project",
