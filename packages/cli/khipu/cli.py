@@ -325,6 +325,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001
         embed_coverage = {"error": f"{type(e).__name__}: {e}"}
         embed_coverage_ok = False
+    # Informational: per-library coverage and profile, beside embed coverage.
+    # Never gates status (a library mid-backfill is not a broken hub).
+    try:
+        from khipu.library import doctor_block as _library_block
+
+        libraries = _library_block()
+    except Exception as e:  # noqa: BLE001
+        libraries = {"error": f"{type(e).__name__}: {e}"}
     # R8 (Phase 1 stop condition): the literal-search trigram migration
     # degrades to a no-op when pg_trgm cannot be created — that is a SKIP,
     # never red. Only a genuinely half-applied hub (extension present, an
@@ -531,6 +539,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "jobs": jobs,
         "index_freshness": index_fresh,
         "embed_coverage": embed_coverage,
+        "libraries": libraries,
         "literal_trgm": literal_trgm,
         "prompt_recall_snapshot": prompt_recall_snapshot,
         "prompt_recall_outcomes": prompt_recall_outcomes_block,
@@ -1235,6 +1244,49 @@ def _cmd_embed_profiles(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "error": str(e)}))
         return 2
     print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_library(args: argparse.Namespace) -> int:
+    """`khipu library ...`: library sources (a folder of .txt/.md files as a
+    search space). Refusals print {"ok": false, "error": ...} and exit 2;
+    `scan` makes no model call, `backfill` and a profile-less `import` may."""
+    from khipu import library
+
+    cmd = args.library_cmd
+    try:
+        if cmd == "add":
+            library.prepare_add(args.name, args.root)  # refuse before touching the hub
+        elif getattr(args, "name", None):
+            library.validate_name(args.name)
+        from khipu.db import connect
+
+        with connect() as conn:
+            if cmd == "add":
+                out = library.add_source(conn, args.name, args.root, args.profile)
+            elif cmd == "list":
+                out = {"libraries": library.list_sources(conn)}
+            elif cmd == "status":
+                out = library.source_status(conn, args.name)
+            elif cmd == "remove":
+                out = library.remove_source(conn, args.name, yes=bool(args.yes))
+            elif cmd in ("enable", "disable"):
+                out = library.set_enabled(conn, args.name, cmd == "enable")
+            elif cmd == "scan":
+                out = library.scan(conn, args.name)
+            elif cmd == "backfill":
+                out = library.backfill(
+                    conn, args.name, limit=args.limit, stale=bool(args.stale)
+                )
+            else:  # import
+                out = library.import_index(
+                    conn, args.name, args.path,
+                    strip_prefix=args.strip_prefix or "", profile=args.profile,
+                )
+    except library.LibraryError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+    print(json.dumps(out, indent=2, default=str))
     return 0
 
 
@@ -3412,6 +3464,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="L2-normalise vectors on the way in (default l2)",
     )
     em.set_defaults(func=cmd_embed)
+
+    lib = sub.add_parser(
+        "library",
+        help="Library sources: a folder of .txt/.md files indexed as a search space",
+    )
+    lib_sub = lib.add_subparsers(dest="library_cmd", required=True)
+    la = lib_sub.add_parser("add", help="Register a library (root must exist; profile must exist)")
+    la.add_argument("name", help="[a-z0-9_-]{1,40}")
+    la.add_argument("--root", required=True, help="Folder holding the .txt/.md files")
+    la.add_argument("--profile", required=True, help="Embedding profile id (see `embed profiles list`)")
+    lib_sub.add_parser("list", help="Every library with document/chunk/embedded/missing/stale counts")
+    ls_ = lib_sub.add_parser("status", help="One library: counts, last scan/backfill, sample gaps")
+    ls_.add_argument("name")
+    lr = lib_sub.add_parser("remove", help="Delete a library's documents, chunks and vectors (files stay)")
+    lr.add_argument("name")
+    lr.add_argument("--yes", action="store_true", help="Required: confirms the delete")
+    for _verb in ("enable", "disable"):
+        lib_sub.add_parser(_verb, help=f"{_verb.capitalize()} a library (nightly sweep, search)").add_argument("name")
+    lsc = lib_sub.add_parser("scan", help="Walk the root and record documents + chunks (no model call)")
+    lsc.add_argument("name")
+    lb = lib_sub.add_parser("backfill", help="Embed chunks that have no vector under the library's profile")
+    lb.add_argument("name")
+    lb.add_argument("--limit", type=int, default=None, help="Embed at most N chunks this run")
+    lb.add_argument(
+        "--stale", action="store_true",
+        help="Also re-embed chunks whose text changed since they were embedded",
+    )
+    li = lib_sub.add_parser(
+        "import",
+        help="Import vectors computed elsewhere (graphify SQLite `embeddings` table, or .jsonl)",
+    )
+    li.add_argument("name")
+    li.add_argument("path", help="SQLite file or .jsonl with node_id, chunk_idx, source_file, "
+                    "chunk_text, embedding, model, dims")
+    li.add_argument("--strip-prefix", dest="strip_prefix", default="",
+                    help="Remove this leading text from each row's source_file")
+    li.add_argument("--profile", default=None,
+                    help="Profile the vectors belong to (default: model@dims from each row)")
+    lib.set_defaults(func=cmd_library)
 
     g = sub.add_parser("graph", help="Neighbors (join / GRAPH_TABLE / CTE)")
     g.add_argument("id", help="Node id")

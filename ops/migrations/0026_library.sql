@@ -112,11 +112,18 @@ CREATE TABLE IF NOT EXISTS library_embeddings (
     document    INTEGER NOT NULL,
     chunk_idx   INTEGER NOT NULL,
     embedding   vector NOT NULL,
+    content_hash TEXT,
     built_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (profile, document, chunk_idx),
     FOREIGN KEY (document, chunk_idx)
         REFERENCES library_chunks (document, chunk_idx) ON DELETE CASCADE
 );
+
+-- content_hash: the chunk's hash at the time it was embedded (null = unknown,
+-- never counted stale). A chunk whose library_chunks.content_hash differs is
+-- stale; `khipu library backfill --stale` re-embeds it. The ALTER covers a
+-- hub that created the table before this column existed.
+ALTER TABLE library_embeddings ADD COLUMN IF NOT EXISTS content_hash TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_library_embeddings_doc
     ON library_embeddings (document, chunk_idx);
