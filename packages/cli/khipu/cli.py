@@ -1236,8 +1236,7 @@ def _cmd_embed_profiles(args: argparse.Namespace) -> int:
     if args.profiles_cmd == "list":
         from khipu import embed_ops
 
-        with connect() as conn:
-            print(json.dumps({"profiles": embed_ops.list_detailed(conn)}, indent=2, default=str))
+        print(json.dumps({"profiles": embed_ops.list_detailed(parallel=True)}, indent=2, default=str))
         return 0
     if args.profiles_cmd == "delete":
         return _cmd_embed_profile_delete(args)

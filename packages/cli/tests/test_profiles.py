@@ -450,10 +450,23 @@ class CliTest(unittest.TestCase):
         conn.__enter__.return_value = conn
         conn.cursor.return_value.__enter__.return_value = cur
         args = argparse.Namespace(embed_cmd="profiles", profiles_cmd="list")
+        from khipu import embed_ops
+
+        real = embed_ops.list_detailed
+        seen = {}
+
+        def one_connection(*a, parallel=False, **kw):
+            # The CLI asks for the threaded read (a connection per leg); one
+            # shared fake cursor cannot serve threads, so run it on one.
+            seen["parallel"] = parallel
+            return real(*a, parallel=False, **kw)
+
         with mock.patch("khipu.db.connect", return_value=conn), \
+             mock.patch.object(embed_ops, "list_detailed", side_effect=one_connection), \
              mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             rc = cli.cmd_embed(args)
         self.assertEqual(rc, 0)
+        self.assertTrue(seen["parallel"])
         self.assertEqual(json.loads(out.getvalue())["profiles"][0]["id"], "a@1")
 
     def _conn(self, cur):

@@ -259,7 +259,8 @@ class ListDetailedTest(_Env):
         summary = [{"name": "lib1", "profile": "b@2", "enabled": True, "documents": 2, "chunks": 10,
                     "embedded": 8, "missing": 2, "stale": 1, "pct": 70.0}]
         with mock.patch.object(embed, "memory_chunk_plan", return_value=plan), \
-                mock.patch.object(embed, "_existing_hashes", side_effect=lambda c, p: have[p]), \
+                mock.patch.object(embed, "_existing_hashes_many",
+                                  side_effect=lambda c, ps: {p: have[p] for p in ps}), \
                 mock.patch.object(library, "summary", return_value=summary), \
                 mock.patch.object(embed, "median_query_ms", return_value={"a@1": 123}), \
                 mock.patch.object(profiles, "key_present", side_effect=lambda p: p == "gemini"):
@@ -285,13 +286,195 @@ class ListDetailedTest(_Env):
     def test_a_local_profile_lists_a_zero_price(self):
         cur = tp.FakeCur(rows={"nomic@4": ("openai-compatible", "nomic", 4, "l2", "http://localhost:11434")})
         with mock.patch.object(embed, "memory_chunk_plan", return_value={}), \
-                mock.patch.object(embed, "_existing_hashes", return_value={}), \
+                mock.patch.object(embed, "_existing_hashes_many", return_value={}), \
                 mock.patch.object(library, "summary", return_value=[]), \
                 mock.patch.object(embed, "median_query_ms", return_value={}), \
                 mock.patch.object(profiles, "key_present", return_value=False):
             row = embed_ops.list_detailed(fake_conn(cur))[0]
         self.assertEqual(row["price_per_million_usd"], 0.0)
         self.assertEqual(row["coverage"]["memory"]["total"], 0)
+
+
+class ListDetailedStatementsTest(_Env):
+    """The screen's read costs the same number of statements for one profile
+    or many, and its output shape is the one the screen already reads."""
+
+    def run_list(self, n_profiles):
+        db._TABLE_COLUMNS_CACHE.clear()  # the schema probe is once per process, not per profile
+        rows = {f"p{i}@{i + 1}": ("voyage", f"p{i}", i + 1, "l2", None) for i in range(n_profiles)}
+        cur = tp.FakeCur(rows=rows)
+        plan = {("topic", "x", 0): ("h", 10), ("topic", "y", 0): ("h2", 20)}
+        with mock.patch.object(embed, "memory_chunk_plan", return_value=plan), \
+                mock.patch.object(library, "summary", return_value=[]), \
+                mock.patch.object(embed, "median_query_ms", return_value={}), \
+                mock.patch.object(profiles, "key_present", return_value=False):
+            out = embed_ops.list_detailed(fake_conn(cur))
+        return out, [sql for sql, _p in cur.executed]
+
+    def test_statement_count_is_the_same_for_one_profile_and_for_many(self):
+        out1, sql1 = self.run_list(1)
+        out6, sql6 = self.run_list(6)
+        self.assertEqual((len(out1), len(out6)), (1, 6))
+        self.assertEqual(len(sql1), len(sql6))
+        hashes = [s for s in sql6 if "chunk_idx, content_hash FROM memory_embeddings" in s]
+        self.assertEqual(len(hashes), 1)
+
+    def test_memory_hashes_of_every_profile_come_back_from_one_statement(self):
+        cur = mock.MagicMock()
+        cur.fetchall.return_value = [("a@1", "topic", "x", 0, "h"), ("b@2", "episode", "7", 0, "g"),
+                                     ("a@1", "topic", "y", 0, "i")]
+        got = embed._existing_hashes_many(cur, ["a@1", "b@2", "c@3"])
+        self.assertEqual(cur.execute.call_count, 1)
+        self.assertEqual(got, {"a@1": {("topic", "x", 0): "h", ("topic", "y", 0): "i"},
+                               "b@2": {("episode", "7", 0): "g"}, "c@3": {}})
+        self.assertEqual(embed._existing_hashes_many(cur, []), {})
+        self.assertEqual(cur.execute.call_count, 1)  # nothing asked, nothing read
+
+    def test_gaps_for_many_profiles_equal_the_per_profile_answer(self):
+        plan = {("topic", "x", 0): ("h", 10), ("topic", "y", 0): ("h2", 20), ("topic", "z", 0): ("h3", 5)}
+        have = {"a@1": {("topic", "x", 0): "h", ("topic", "y", 0): "old"}, "b@2": {}}
+        many = embed.memory_gaps_many(None, ["a@1", "b@2"], plan, have)
+        for pid in ("a@1", "b@2"):
+            with mock.patch.object(embed, "_existing_hashes", return_value=have[pid]):
+                _p, missing, stale = embed.memory_gaps(None, pid, plan)
+            self.assertEqual(many[pid], (missing, stale))
+
+    def test_the_row_keeps_every_field_the_screen_reads(self):
+        (row,), _sql = self.run_list(1)
+        self.assertEqual(
+            set(row),
+            {"id", "provider", "model", "dim", "normalize", "endpoint", "is_active", "rows", "index",
+             "in_use_by", "coverage", "key_present", "median_query_ms_24h", "price_per_million_usd"})
+        self.assertEqual(set(row["coverage"]["memory"]),
+                         {"total", "embedded", "missing", "stale", "pct"})
+
+
+class CachedMemoryPlanTest(_Env):
+    """``memory_chunk_plan(cached=True)``: same plan, only changed rows re-read."""
+
+    SOURCES = [("episode", "7", "E" * 50, ""), ("episode", "9", "F" * 70, ""),
+               ("topic", "a", "A" * 400, "A"), ("topic", "b", "B" * 10, "B")]
+
+    def setUp(self):
+        super().setUp()
+        self.fp = {(k, r): "v1" for k, r, _t, _ti in self.SOURCES}
+        self.sources = list(self.SOURCES)
+        self.reads: list = []
+        self.cache_path = Path(self.tmp.name) / "plan.json"
+        for patch in (
+            mock.patch.object(embed, "_plan_cache_file", return_value=self.cache_path),
+            mock.patch.object(embed, "_row_fingerprints", side_effect=self._fingerprints),
+            mock.patch.object(embed, "_iter_sources", side_effect=self._iter),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _fingerprints(self, cur):
+        return [(k, r, self.fp[(k, r)]) for k, r, _t, _ti in self.sources]
+
+    def _iter(self, cur, kind=None, refs=None):
+        rows = [x for x in self.sources
+                if x[2] and (kind is None or x[0] == kind) and (refs is None or x[1] in refs)]
+        self.reads.append((kind, None if refs is None else list(refs)))
+        return iter(rows)
+
+    def uncached(self):
+        self.reads.clear()
+        plan = embed.memory_chunk_plan(None)
+        self.reads.clear()
+        return plan
+
+    def test_the_cached_plan_is_the_uncached_plan_in_the_same_order(self):
+        want = self.uncached()
+        got = embed.memory_chunk_plan(None, cached=True)
+        self.assertEqual(got, want)
+        self.assertEqual(list(got), list(want))
+
+    def test_a_second_look_at_unchanged_rows_reads_no_text(self):
+        embed.memory_chunk_plan(None, cached=True)
+        self.reads.clear()
+        again = embed.memory_chunk_plan(None, cached=True)
+        self.assertEqual(self.reads, [])
+        self.assertEqual(again, self.uncached())
+
+    def test_only_a_row_whose_fingerprint_moved_is_read_again(self):
+        embed.memory_chunk_plan(None, cached=True)
+        self.reads.clear()
+        self.sources[2] = ("topic", "a", "A" * 9000, "A")     # grows to two chunks
+        self.fp[("topic", "a")] = "v2"
+        got = embed.memory_chunk_plan(None, cached=True)
+        self.assertEqual(self.reads, [("topic", ["a"])])
+        self.assertEqual(got, self.uncached())
+        self.assertGreater(len([k for k in got if k[1] == "a"]), 1)
+
+    def test_a_row_that_left_the_set_leaves_the_plan(self):
+        embed.memory_chunk_plan(None, cached=True)
+        self.sources = [x for x in self.sources if x[1] != "9"]
+        got = embed.memory_chunk_plan(None, cached=True)
+        self.assertNotIn(("episode", "9", 0), got)
+        self.assertEqual(got, self.uncached())
+        again = embed.memory_chunk_plan(None, cached=True)
+        self.assertEqual(again, got)
+
+    def test_a_row_with_no_text_costs_one_read_and_adds_no_chunks(self):
+        self.sources.append(("topic", "z", "", "Z"))
+        self.fp[("topic", "z")] = "v1"
+        embed.memory_chunk_plan(None, cached=True)
+        self.reads.clear()
+        got = embed.memory_chunk_plan(None, cached=True)
+        self.assertEqual(self.reads, [])
+        self.assertFalse([k for k in got if k[1] == "z"])
+
+    def test_a_changed_chunker_or_a_damaged_file_means_a_full_read_not_a_wrong_plan(self):
+        embed.memory_chunk_plan(None, cached=True)
+        for damage in ('{"stamp": "some-older-chunker", "rows": {}}', "not json", "[]"):
+            with self.subTest(damage=damage):
+                self.cache_path.write_text(damage)
+                self.reads.clear()
+                got = embed.memory_chunk_plan(None, cached=True)
+                self.assertEqual(self.reads, [("episode", ["7", "9"]), ("topic", ["a", "b"])])
+                self.assertEqual(got, self.uncached())
+
+    def test_an_unwritable_cache_only_costs_speed(self):
+        with mock.patch.object(embed, "_plan_cache_file", return_value=Path("/proc/nope/x/plan.json")):
+            self.assertEqual(embed.memory_chunk_plan(None, cached=True), self.uncached())
+
+    def test_the_uncached_call_never_touches_the_file(self):
+        embed.memory_chunk_plan(None)
+        self.assertFalse(self.cache_path.exists())
+
+
+class RowFingerprintTest(_Env):
+    def test_reads_a_version_stamp_not_text_and_keeps_plan_order(self):
+        cur = mock.MagicMock()
+        cur.fetchall.return_value = [("episode", 7, None, "501"), ("topic", None, "a", "77")]
+        with mock.patch("khipu.db.has_columns", return_value=True):
+            got = embed._row_fingerprints(cur)
+        self.assertEqual(got, [("episode", "7", "501"), ("topic", "a", "77")])
+        (sql,), _ = cur.execute.call_args
+        self.assertIn("xmin", sql)
+        self.assertNotIn("summary", sql)
+        self.assertNotIn("body", sql)
+        self.assertIn("ORDER BY kind, id, slug", sql)
+
+    def test_iter_sources_narrows_to_the_refs_asked_for(self):
+        cur = mock.MagicMock()
+        cur.fetchall.return_value = []
+        with mock.patch("khipu.db.has_columns", return_value=True):
+            list(embed._iter_sources(cur, kind="episode", refs=["7", "9"]))
+            list(embed._iter_sources(cur, kind="topic", refs=["a"]))
+        (ep_sql, ep_args), (tp_sql, tp_args) = [c.args for c in cur.execute.call_args_list]
+        self.assertIn("id = ANY(%s)", ep_sql)
+        self.assertEqual(ep_args, ([7, 9],))
+        self.assertIn("slug = ANY(%s)", tp_sql)
+        self.assertEqual(tp_args, (["a"],))
+
+    def test_iter_sources_without_refs_reads_everything_as_before(self):
+        cur = mock.MagicMock()
+        cur.fetchall.return_value = []
+        with mock.patch("khipu.db.has_columns", return_value=True):
+            list(embed._iter_sources(cur, kind="topic"))
+        self.assertNotIn("ANY", cur.execute.call_args.args[0])
 
 
 class KeyPresenceTest(unittest.TestCase):

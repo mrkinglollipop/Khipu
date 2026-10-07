@@ -152,12 +152,22 @@ class FakeCursor:
             elif "WHERE enabled" in s:
                 rows = [(n, v) for n, v in rows if v["enabled"]]
             self._r = [(n, v["root"], v["profile"], v["enabled"]) for n, v in rows]
-        elif s.startswith("SELECT COUNT(DISTINCT d.id)"):
-            profile, source = p
-            st = h.state(source, profile)
-            emb = [x for x in st if x[4] is not None]
-            stale = [x for x in emb if x[4][1] is not None and x[4][1] != x[3]]
-            self._r = [(len(h.source_docs(source)), len(st), len(emb), len(stale))]
+        elif s.startswith(("SET LOCAL", "RESET")):
+            pass  # the planner hints around the coverage join
+        elif s.startswith("SELECT d.source, COUNT(*), COALESCE(SUM(k.n), 0)"):
+            # documents and chunks per source, for every source named in p[0]
+            self._r = [(n, len(h.source_docs(n)), len(h.state(n, "")))
+                       for n in p[0] if h.source_docs(n)]
+        elif s.startswith("SELECT d.source, e.profile, COUNT(*)"):
+            # embedded and stale per (source, profile) that has any vector
+            profiles_, names = p
+            self._r = []
+            for n in names:
+                for prof in profiles_:
+                    emb = [x for x in h.state(n, prof) if x[4] is not None]
+                    stale = [x for x in emb if x[4][1] is not None and x[4][1] != x[3]]
+                    if emb:
+                        self._r.append((n, prof, len(emb), len(stale)))
         elif s.startswith("SELECT id, rel_path, content_hash FROM library_documents"):
             self._r = [(i, d["rel_path"], d["content_hash"]) for i, d in h.docs.items()
                        if d["source"] == p[0]]
@@ -637,6 +647,63 @@ def _make_index(path: Path, rows, *, table=True):
 
 def _blob(*vals):
     return struct.pack(f"<{len(vals)}f", *vals)
+
+
+class CoverageCountsTest(_Base):
+    """Coverage for every library comes from a constant number of statements."""
+
+    def populate(self, names):
+        doc = 0
+        for n, name in enumerate(names):
+            self.hub.sources[name] = {"root": "/x", "profile": TINY.id, "enabled": True}
+            doc += 1
+            self.hub.docs[doc] = {"source": name, "rel_path": "a.txt", "title": "A", "author": None,
+                                  "tags": [], "bytes": 0, "content_hash": "d"}
+            for idx in range(3):
+                self.hub.chunks[(doc, idx)] = (f"text {name} {idx}", f"h{doc}-{idx}")
+            self.hub.embs[(TINY.id, doc, 0)] = ("[0]", f"h{doc}-0")        # current
+            if n % 2:
+                self.hub.embs[(TINY.id, doc, 1)] = ("[0]", "older-hash")   # stale
+            doc += 1                                                       # a document with no chunks
+            self.hub.docs[doc] = {"source": name, "rel_path": "empty.txt", "title": None, "author": None,
+                                  "tags": [], "bytes": 0, "content_hash": "e"}
+
+    def statements(self):
+        before = len(self.hub.executed)
+        out = library.list_sources(self.hub)
+        return out, len(self.hub.executed) - before
+
+    def test_counts_per_library_are_the_ones_the_old_per_library_query_gave(self):
+        self.populate(["a", "b", "c"])
+        out, _n = self.statements()
+        by = {r["name"]: r for r in out}
+        self.assertEqual((by["a"]["documents"], by["a"]["chunks"], by["a"]["embedded"],
+                          by["a"]["missing"], by["a"]["stale"]), (2, 3, 1, 2, 0))
+        self.assertEqual((by["b"]["embedded"], by["b"]["missing"], by["b"]["stale"]), (2, 1, 1))
+        self.assertEqual(by["b"]["pct"], library._pct(1, 3))
+        self.assertEqual(set(by["a"]),
+                         {"name", "root", "profile", "enabled", "documents", "chunks", "embedded",
+                          "missing", "stale", "pct"})
+
+    def test_a_library_with_nothing_in_it_counts_zero(self):
+        self.hub.sources["empty"] = {"root": "/x", "profile": TINY.id, "enabled": True}
+        (row,) = library.list_sources(self.hub)
+        self.assertEqual((row["documents"], row["chunks"], row["embedded"], row["missing"], row["stale"]),
+                         (0, 0, 0, 0, 0))
+
+    def test_the_statement_count_does_not_grow_with_the_number_of_libraries(self):
+        self.populate(["a"])
+        _out, one = self.statements()
+        self.populate(["b", "c", "d", "e"])
+        out, many = self.statements()
+        self.assertEqual(len(out), 5)
+        self.assertEqual(one, many)
+
+    def test_the_planner_hints_never_outlive_the_count(self):
+        self.populate(["a"])
+        library.list_sources(self.hub)
+        kinds = [s.split()[0] for s, _p in self.hub.executed if s.startswith(("SET LOCAL", "RESET"))]
+        self.assertEqual(kinds, ["SET", "RESET"])
 
 
 class ImportTest(_Base):

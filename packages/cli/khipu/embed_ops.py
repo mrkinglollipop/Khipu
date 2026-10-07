@@ -115,20 +115,66 @@ def _cov(total: int, embedded: int, missing: int, stale: int) -> dict[str, Any]:
             "pct": embed.cov_pct(max(0, embedded - stale), total)}
 
 
-def list_detailed(conn) -> list[dict[str, Any]]:
+def _memory_plan_on_own_connection():
+    from khipu.db import connect
+
+    with connect() as conn, conn.cursor() as cur:
+        return embed.memory_chunk_plan(cur, cached=True)
+
+
+def _memory_hashes_on_own_connection():
+    from khipu.db import connect
+
+    with connect() as conn, conn.cursor() as cur:
+        return embed._existing_hashes_many(cur, None)
+
+
+def list_detailed(conn=None, *, parallel: bool = False) -> list[dict[str, Any]]:
     """``profiles.list_profiles`` rows plus ``in_use_by``, ``coverage`` (a key
     per space: ``memory`` and ``library:NAME`` for each library embedded with
     the profile), ``key_present``, ``median_query_ms_24h`` and
     ``price_per_million_usd``. Memory coverage is shown for every profile, so a
-    re-embed in flight has a progress number before the profile is active."""
-    with conn.cursor() as cur:
-        rows = profiles.list_profiles(cur)
-        plan = embed.memory_chunk_plan(cur) if rows else {}
-        mem: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            _p, missing, stale = embed.memory_gaps(cur, row["id"], plan)
-            mem[row["id"]] = _cov(len(plan), len(plan) - len(missing), len(missing), len(stale))
-    libs = library.summary(conn)
+    re-embed in flight has a progress number before the profile is active.
+
+    The number of statements does not grow with the number of profiles: one
+    read for every profile's embedded hashes, grouped reads for the libraries.
+    ``parallel=True`` counts the libraries (the slow part on a large corpus) and
+    builds the memory chunk plan and reads the embedded hashes, each on a connection of their own, while this
+    one reads the profiles. ``conn=None`` opens that one after the others have
+    started, so the four connection set-ups overlap."""
+    pool = None
+    lib_future = plan_future = have_future = None
+    if parallel:
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=3)
+        lib_future = pool.submit(library.doctor_block)
+        plan_future = pool.submit(_memory_plan_on_own_connection)
+        have_future = pool.submit(_memory_hashes_on_own_connection)
+    opened = None
+    try:
+        if conn is None:
+            from khipu.db import connect
+
+            conn = opened = connect()
+        with conn.cursor() as cur:
+            rows = profiles.list_profiles(cur)
+            mem: dict[str, dict[str, Any]] = {}
+            if rows:
+                plan = (plan_future.result() if plan_future is not None
+                        else embed.memory_chunk_plan(cur, cached=True))
+                gaps = embed.memory_gaps_many(
+                    cur, [r["id"] for r in rows], plan,
+                    have_future.result() if have_future is not None else None)
+                for row in rows:
+                    missing, stale = gaps[row["id"]]
+                    mem[row["id"]] = _cov(len(plan), len(plan) - len(missing), len(missing), len(stale))
+        libs = lib_future.result() if lib_future is not None else library.summary(conn)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
+        if opened is not None:
+            opened.close()
     medians = embed.median_query_ms()
     out = []
     for row in rows:

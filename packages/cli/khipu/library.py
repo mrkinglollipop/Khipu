@@ -301,25 +301,60 @@ def add_source(conn, name: str, root: str, profile: str) -> dict[str, Any]:
     return {"ok": True, "name": name, "root": str(p), "profile": profile, "enabled": True}
 
 
-_COUNTS_SQL = (
-    "SELECT COUNT(DISTINCT d.id), COUNT(c.chunk_idx), COUNT(e.chunk_idx),"
+# Coverage per library, for any number of libraries in two statements. The
+# documents/chunks count walks the chunk primary key; the embedded/stale count
+# is one join of two primary-key-ordered streams (library_embeddings for the
+# profile, library_chunks) rather than a nested loop of 330k index probes
+# (1.2 s) or the planner's parallel hash join (0.9-1.3 s) on the hub's 330k-chunk
+# library: the merge runs in 0.4 s, but the planner will not pick it unprompted.
+_MERGE_ON = "SET LOCAL enable_hashjoin = off; SET LOCAL enable_nestloop = off; SET LOCAL max_parallel_workers_per_gather = 0"
+_MERGE_OFF = "RESET enable_hashjoin; RESET enable_nestloop; RESET max_parallel_workers_per_gather"
+_DOC_COUNTS_SQL = (
+    "SELECT d.source, COUNT(*), COALESCE(SUM(k.n), 0) FROM library_documents d"
+    " LEFT JOIN LATERAL (SELECT COUNT(*) AS n FROM library_chunks c WHERE c.document = d.id) k ON true"
+    " WHERE d.source = ANY(%s) GROUP BY d.source"
+)
+_EMBED_COUNTS_SQL = (
+    "SELECT d.source, e.profile, COUNT(*),"
     " COUNT(*) FILTER (WHERE e.content_hash IS NOT NULL AND e.content_hash <> c.content_hash)"
-    " FROM library_documents d"
-    " LEFT JOIN library_chunks c ON c.document = d.id"
-    " LEFT JOIN library_embeddings e ON e.document = c.document"
-    " AND e.chunk_idx = c.chunk_idx AND e.profile = %s"
-    " WHERE d.source = %s"
+    " FROM library_embeddings e"
+    " JOIN library_chunks c ON c.document = e.document AND c.chunk_idx = e.chunk_idx"
+    " JOIN library_documents d ON d.id = e.document"
+    " WHERE e.profile = ANY(%s) AND d.source = ANY(%s) GROUP BY d.source, e.profile"
 )
 
 
+def _counts_many(cur, sources: list[Source]) -> dict[str, dict[str, Any]]:
+    """``{name: counts}`` for every source in ``sources`` (see ``_counts``)."""
+    if not sources:
+        return {}
+    names = [s.name for s in sources]
+    cur.execute(_DOC_COUNTS_SQL, (names,))
+    docs = {name: (int(nd), int(nc)) for name, nd, nc in cur.fetchall()}
+    cur.execute(_MERGE_ON)
+    try:
+        cur.execute(_EMBED_COUNTS_SQL, (sorted({s.profile for s in sources}), names))
+        rows = cur.fetchall()
+    finally:
+        try:
+            cur.execute(_MERGE_OFF)  # the caller's transaction may go on to write
+        except Exception:  # noqa: BLE001 - an aborted transaction already discarded the SET LOCAL
+            pass
+    emb = {(name, profile): (int(n), int(st or 0)) for name, profile, n, st in rows}
+    out = {}
+    for src in sources:
+        n_docs, chunks = docs.get(src.name, (0, 0))
+        embedded, stale = emb.get((src.name, src.profile), (0, 0))
+        out[src.name] = {
+            "documents": n_docs, "chunks": chunks, "embedded": embedded,
+            "missing": max(0, chunks - embedded), "stale": stale,
+            "pct": _pct(max(0, embedded - stale), chunks),
+        }
+    return out
+
+
 def _counts(cur, src: Source) -> dict[str, Any]:
-    cur.execute(_COUNTS_SQL, (src.profile, src.name))
-    docs, chunks, embedded, stale = (int(x or 0) for x in cur.fetchone())
-    return {
-        "documents": docs, "chunks": chunks, "embedded": embedded,
-        "missing": max(0, chunks - embedded), "stale": stale,
-        "pct": _pct(max(0, embedded - stale), chunks),
-    }
+    return _counts_many(cur, [src])[src.name]
 
 
 def _row(src: Source, counts: dict[str, Any]) -> dict[str, Any]:
@@ -331,7 +366,8 @@ def list_sources(conn) -> list[dict[str, Any]]:
     with conn.cursor() as cur:
         cur.execute(f"SELECT {_SRC_COLS} FROM library_sources ORDER BY name")
         sources = [Source(r[0], r[1], r[2], bool(r[3])) for r in cur.fetchall()]
-        return [_row(s, _counts(cur, s)) for s in sources]
+        counts = _counts_many(cur, sources)
+        return [_row(s, counts[s.name]) for s in sources]
 
 
 _JOIN_E = (
