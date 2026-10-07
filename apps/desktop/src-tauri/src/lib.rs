@@ -987,7 +987,7 @@ async fn check_remote_postgres(full: bool) -> Result<String, String> {
 /// arbitrary argv from the webview, and a secret must never travel as an
 /// argument. This command is the only way in, and it pipes the value to the
 /// CLI's stdin.
-const SETTABLE_SECRETS: &[&str] = &["gemini_api_key", "database_url", "openai_compat_api_key"];
+const SETTABLE_SECRETS: &[&str] = &["gemini_api_key", "database_url", "openai_compat_api_key", "voyage_api_key"];
 
 #[tauri::command]
 async fn set_khipu_secret(account: String, value: String) -> Result<String, String> {
@@ -2021,7 +2021,7 @@ mod settable_secrets_tests {
 
     #[test]
     fn only_the_known_accounts_are_writable() {
-        assert_eq!(SETTABLE_SECRETS, &["gemini_api_key", "database_url", "openai_compat_api_key"]);
+        assert_eq!(SETTABLE_SECRETS, &["gemini_api_key", "database_url", "openai_compat_api_key", "voyage_api_key"]);
     }
 
     #[test]

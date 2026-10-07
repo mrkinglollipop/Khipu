@@ -12,6 +12,7 @@ LEGACY_SERVICE = "Alzy"
 DSN_ACCOUNT = "database_url"
 GEMINI_ACCOUNT = "gemini_api_key"
 OPENAI_COMPAT_ACCOUNT = "openai_compat_api_key"
+VOYAGE_ACCOUNT = "voyage_api_key"
 CONFIG_DIR = Path.home() / ".config" / "khipu"
 LEGACY_CONFIG_DIR = Path.home() / ".config" / "alzy"
 
@@ -148,6 +149,41 @@ def set_openai_compat_key(key: str) -> None:
     set_password(OPENAI_COMPAT_ACCOUNT, key.strip())
 
 
+def get_voyage_key() -> str | None:
+    return get_password(VOYAGE_ACCOUNT)
+
+
+def set_voyage_key(key: str) -> None:
+    set_password(VOYAGE_ACCOUNT, key.strip())
+
+
+def _voyage_key_file() -> Path | None:
+    """Optional last-resort key file, env only: KHIPU_VOYAGE_KEY_FILE. Unlike the
+    Gemini file there is no config.json key, because the path settings are a
+    list the desktop app pins; a new one is a cross-surface change."""
+    raw = (os.environ.get("KHIPU_VOYAGE_KEY_FILE") or "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
+def resolve_voyage_key(*, key_file: Path | None = None) -> str:
+    """Order: VOYAGE_API_KEY -> Keychain -> optional key file (never print)."""
+    env = (os.environ.get("VOYAGE_API_KEY") or "").strip()
+    if env:
+        return env
+    kc = get_voyage_key()
+    if kc:
+        return kc
+    path = key_file or _voyage_key_file()
+    if path is not None and path.is_file():
+        key = path.read_text(encoding="utf-8").strip()
+        if key:
+            return key
+    raise RuntimeError(
+        "No Voyage key. Set it in the app (Settings -> Secrets), pipe it to "
+        "`khipu secrets --set voyage_api_key`, or export VOYAGE_API_KEY."
+    )
+
+
 def resolve_gemini_key(*, key_file: Path | None = None) -> str:
     """Order: GEMINI_API_KEY → Keychain → optional key file (never print)."""
     env = (os.environ.get("GEMINI_API_KEY") or "").strip()
@@ -236,6 +272,7 @@ def secrets_status() -> dict:
     from khipu.paths import data_dir
 
     gemini_file = _gemini_key_file()
+    voyage_file = _voyage_key_file()
     active_dir = data_dir()
     dsn_in_keychain = bool(get_dsn())
     dsn_on_disk = (active_dir / "dsn").is_file() or (CONFIG_DIR / "dsn").is_file() \
@@ -249,6 +286,9 @@ def secrets_status() -> dict:
         "dsn_in_keychain": dsn_in_keychain,
         "gemini_in_keychain": bool(get_gemini_key()),
         "openai_compat_in_keychain": bool(get_openai_compat_key()),
+        "voyage_in_keychain": bool(get_voyage_key()),
+        "voyage_env": bool((os.environ.get("VOYAGE_API_KEY") or "").strip()),
+        "voyage_file_present": bool(voyage_file and voyage_file.is_file()),
         "gemini_env": bool((os.environ.get("GEMINI_API_KEY") or "").strip()),
         "gemini_file_present": bool(gemini_file and gemini_file.is_file()),
         "config_dir": str(active_dir),
