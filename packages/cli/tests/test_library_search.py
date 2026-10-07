@@ -13,6 +13,7 @@ import contextlib
 import inspect
 import io
 import json
+import threading
 import unittest
 from unittest import mock
 
@@ -542,6 +543,77 @@ class BoundedLegTest(unittest.TestCase):
         self.assertEqual(sorted(c.args[2] for c in qv.call_args_list),
                          sorted([PROFILE, "gemini-embedding-001@768"]))
         self.assertEqual(len(cur.sql("FROM library_embeddings")), 2)
+
+
+class ConcurrentLibraryLegsTest(unittest.TestCase):
+    """The default search runs the library legs beside the memory legs."""
+
+    MEM = {"kind": "episode", "id": "11", "label": "ep", "snippet": "ep", "score": 0.9,
+           "rank_text": "divine council"}
+
+    def test_the_library_work_runs_on_its_own_connection_and_thread(self):
+        cur = FakeCur(cosine=[_cos_row()])
+        calls: list[str] = []
+        with _hub(cur) as conn:
+            @contextlib.contextmanager
+            def _connect(*a, **k):
+                calls.append(threading.current_thread().name)
+                yield conn
+
+            with mock.patch("khipu.hub_snapshot.try_hub_connect", _connect):
+                out = em.hybrid_search("divine council", limit=5)
+        self.assertEqual(len(calls), 2)                      # memory legs + library thread
+        self.assertIn("khipu-library-legs", calls)
+        self.assertEqual(sum(1 for c in calls if c != "khipu-library-legs"), 1)
+        self.assertIn("library:biblical:7#3", _ids(out))
+        self.assertIn("library_wall_ms", out["timing"])
+        self.assertNotIn("degraded_legs", out)
+
+    def test_a_slow_library_is_dropped_and_named_while_memory_still_answers(self):
+        release = threading.Event()
+
+        def _slow(*a, **k):
+            release.wait(5)
+            return [[_cos_row()]], [], ["biblical"]
+
+        cur = FakeCur(cosine=[_cos_row()])
+        with _hub(cur), \
+                mock.patch.object(ls, "library_candidates", side_effect=_slow), \
+                mock.patch.object(em, "LIBRARY_LEG_BUDGET_S", 0.05), \
+                mock.patch.object(em, "LIBRARY_JOIN_FLOOR_S", 0.05), \
+                mock.patch.object(em, "_cosine_candidates", return_value=[dict(self.MEM)]):
+            try:
+                out = em.hybrid_search("divine council", limit=5)
+            finally:
+                release.set()
+        self.assertIn("library:timeout", out["degraded_legs"])
+        self.assertEqual(_ids(out), ["11"])                  # memory only, no library rows
+        self.assertIn("library_wall_ms", out["timing"])
+
+    def test_an_exception_in_the_library_thread_degrades_instead_of_raising(self):
+        cur = FakeCur()
+        with _hub(cur), \
+                mock.patch.object(ls, "library_candidates", side_effect=RuntimeError("boom")), \
+                mock.patch.object(em, "_cosine_candidates", return_value=[dict(self.MEM)]):
+            out = em.hybrid_search("divine council", limit=5)
+        self.assertIn("library:error", out["degraded_legs"])
+        self.assertEqual(_ids(out), ["11"])
+        self.assertIn("boom", out["timing"]["library_error"])
+
+    def test_include_libraries_false_starts_no_thread(self):
+        cur = FakeCur(cosine=[_cos_row()])
+        with _hub(cur), \
+                mock.patch.object(em, "_LibraryLegs", side_effect=AssertionError("thread started")), \
+                mock.patch("threading.Thread", side_effect=AssertionError("thread started")):
+            out = em.hybrid_search("a topical prompt", include_libraries=False)
+        self.assertNotIn("library_wall_ms", out["timing"])
+
+    def test_the_explicit_library_search_stays_serial(self):
+        cur = FakeCur(cosine=[_cos_row()])
+        with _hub(cur), \
+                mock.patch.object(em, "_LibraryLegs", side_effect=AssertionError("thread started")):
+            out = em.hybrid_search("divine council", kind="library")
+        self.assertIn("library:biblical:7#3", _ids(out))
 
 
 class PromptLaneTest(unittest.TestCase):
