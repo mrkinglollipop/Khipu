@@ -1366,6 +1366,24 @@ button.link:hover {
   border-color: transparent;
 }
 
+/* A tag that opens something (the "N to redo" pill): same one-line pill as the
+   static tag, plus a hover and a focus ring. */
+.tag.as-button {
+  font: inherit;
+  font-size: var(--t-xs);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tag.as-button:hover {
+  text-decoration: underline;
+}
+
+.tag.as-button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--ring);
+}
+
 .tag.kind {
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -2554,7 +2572,7 @@ input.switch:disabled {
 .emb-q b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
 .emb-cov {
   display: grid;
-  grid-template-columns: 150px 180px 190px 1fr;
+  grid-template-columns: 150px 180px 190px minmax(max-content, 1fr);
   align-items: center;
   column-gap: var(--s3);
   row-gap: var(--s1);

@@ -289,7 +289,13 @@ function CoverageBar({
       <span>
         {tag ? (
           onTag ? (
-            <button type="button" className="sm" aria-expanded={tagExpanded} onClick={onTag}>
+            <button
+              type="button"
+              className={`tag ${tag.tone} as-button`}
+              aria-expanded={tagExpanded}
+              onClick={onTag}
+            >
+              <span className="dot" aria-hidden="true" />
               {tag.text}
             </button>
           ) : (

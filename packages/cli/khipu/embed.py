@@ -1139,11 +1139,15 @@ def topic_text(slug: str, title: str | None, body: str | None) -> str:
     return f"{title or slug}\n\n{body or ''}".strip()
 
 
-def _iter_sources(cur, *, kind: str | None = None) -> Iterable[tuple[str, str, str, str]]:
+def _iter_sources(
+    cur, *, kind: str | None = None, refs: list[str] | None = None
+) -> Iterable[tuple[str, str, str, str]]:
     """Yield (kind, ref, text, title) for every embeddable row.
 
     ``title`` is used only for gemini-embedding-2 document prefixes; stored
-    ``chunk_text`` stays the unprefixed ``text``.
+    ``chunk_text`` stays the unprefixed ``text``. ``refs`` (with a ``kind`` of
+    episode or topic) narrows the read to those rows: episode ids as strings,
+    topic slugs.
     """
     if kind in (None, "episode"):
         # Tombstoned episodes (khipu episode forget) must never be re-embedded;
@@ -1153,9 +1157,15 @@ def _iter_sources(cur, *, kind: str | None = None) -> Iterable[tuple[str, str, s
         live = " WHERE deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
         has_verbatim = has_columns(cur, "episodes", "verbatim")
         verbatim_col = ", verbatim" if has_verbatim else ""
+        only = ""
+        args: tuple = ()
+        if refs is not None:
+            only = (" AND" if live else " WHERE") + " id = ANY(%s)"
+            args = ([int(r) for r in refs],)
         cur.execute(
             f"SELECT id, summary, decisions, preferences, topics, people{verbatim_col} "
-            f"FROM episodes{live} ORDER BY id"
+            f"FROM episodes{live}{only} ORDER BY id",
+            args,
         )
         for row in cur.fetchall():
             eid, summary, decisions, prefs, topics, people = row[:6]
@@ -1167,7 +1177,14 @@ def _iter_sources(cur, *, kind: str | None = None) -> Iterable[tuple[str, str, s
             if text:
                 yield "episode", str(eid), text, ""
     if kind in (None, "topic"):
-        cur.execute("SELECT slug, title, body FROM topics WHERE deleted_at IS NULL ORDER BY slug")
+        if refs is None:
+            cur.execute("SELECT slug, title, body FROM topics WHERE deleted_at IS NULL ORDER BY slug")
+        else:
+            cur.execute(
+                "SELECT slug, title, body FROM topics WHERE deleted_at IS NULL"
+                " AND slug = ANY(%s) ORDER BY slug",
+                (list(refs),),
+            )
         for slug, title, body in cur.fetchall():
             text = topic_text(slug, title, body)
             if text:
@@ -1193,6 +1210,22 @@ def _existing_hashes(cur, profile: str) -> dict[tuple[str, str, int], str]:
         (profile,),
     )
     return {(k, r, i): h for k, r, i, h in cur.fetchall()}
+
+
+def _existing_hashes_many(cur, profiles: list[str] | None) -> dict[str, dict[tuple[str, str, int], str]]:
+    """``_existing_hashes`` for several profiles in one statement; ``None`` reads
+    every profile's."""
+    out: dict[str, dict[tuple[str, str, int], str]] = {p: {} for p in profiles or []}
+    if profiles is not None and not profiles:
+        return out
+    sql = "SELECT profile, kind, ref, chunk_idx, content_hash FROM memory_embeddings"
+    if profiles is None:
+        cur.execute(sql)
+    else:
+        cur.execute(sql + " WHERE profile = ANY(%s)", (list(profiles),))
+    for p, k, r, i, h in cur.fetchall():
+        out.setdefault(p, {})[(k, r, i)] = h
+    return out
 
 
 def _upsert_chunks(
@@ -1233,14 +1266,126 @@ def _api_texts(
 # ---- the memory space as a set of chunks (coverage, estimate) ---------------------
 # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
 
-def memory_chunk_plan(cur) -> dict[tuple[str, str, int], tuple[str, int]]:
+def memory_chunk_plan(cur, *, cached: bool = False) -> dict[tuple[str, str, int], tuple[str, int]]:
     """Every chunk the default memory sweep embeds (episodes and topics, not
-    commitments or media): ``(kind, ref, chunk_idx) -> (content_hash, chars)``."""
+    commitments or media): ``(kind, ref, chunk_idx) -> (content_hash, chars)``.
+
+    ``cached=True`` reads only a fingerprint per row from the hub and re-reads
+    and re-chunks just the rows whose fingerprint moved since this Mac last
+    looked (the Embeddings screen asks this on every open; the full text is
+    tens of megabytes). The answer is the same either way."""
+    if cached:
+        return _cached_memory_chunk_plan(cur)
     plan: dict[tuple[str, str, int], tuple[str, int]] = {}
     for k, ref, text, _title in _iter_sources(cur):
         for i, chunk in _chunks_for(k, text):
             plan[(k, ref, i)] = (_md5(chunk), len(chunk))
     return plan
+
+
+PLAN_CACHE_VERSION = 1  # bump when what a plan row means changes beyond the functions hashed below
+
+
+def _plan_code_stamp() -> str:
+    """Changes whenever the code that turns a row into chunks changes, so an
+    edit to the chunker can never be answered from an older plan."""
+    import inspect
+
+    parts = [str(PLAN_CACHE_VERSION), str(CHUNK_CHARS), str(CHUNK_OVERLAP)]
+    for fn in (chunk_text, chunk_text_indexed, _chunks_for, episode_text, topic_text, _md5):
+        try:
+            parts.append(inspect.getsource(fn))
+        except (OSError, TypeError):
+            parts.append(fn.__qualname__)
+    return _md5("\n".join(parts))
+
+
+def _plan_cache_file(cur) -> Path:
+    from khipu import paths
+
+    info = getattr(getattr(cur, "connection", None), "info", None)
+    hub = f"{getattr(info, 'host', '')}:{getattr(info, 'port', '')}/{getattr(info, 'dbname', '')}"
+    return paths.pycache_dir().parent / f"memory-plan-{_md5(hub)[:12]}.json"
+
+
+def _row_fingerprints(cur) -> list[tuple[str, str, str]]:
+    """``(kind, ref, fingerprint)`` for every row the plan covers, in plan order
+    (episodes by id, then topics by slug). The fingerprint is the row version's
+    ``xmin``: every UPDATE writes a new version under a new transaction id, so
+    a row whose text changed cannot keep its fingerprint, and reading it costs
+    the database no text (hashing the 28 MB of episode text server-side took
+    longer than the rest of the screen). A row rewritten with the same text
+    only costs one re-read."""
+    from khipu.db import has_columns
+
+    live = " WHERE deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
+    cur.execute(
+        f"SELECT 'episode' AS kind, id, NULL::text AS slug, xmin::text FROM episodes{live}"
+        " UNION ALL SELECT 'topic', NULL, slug, xmin::text FROM topics WHERE deleted_at IS NULL"
+        " ORDER BY kind, id, slug"
+    )
+    return [(k, str(i) if k == "episode" else slug, fp) for k, i, slug, fp in cur.fetchall()]
+
+
+def _load_plan_cache(path: Path, stamp: str) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("stamp") == stamp and isinstance(data.get("rows"), dict):
+            return data["rows"]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return {}
+
+
+def _save_plan_cache(path: Path, stamp: str, rows: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"stamp": stamp, "rows": rows}), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass  # a cache that cannot be written is only a slower next open
+
+
+def _cached_memory_chunk_plan(cur) -> dict[tuple[str, str, int], tuple[str, int]]:
+    stamp = _plan_code_stamp()
+    path = _plan_cache_file(cur)
+    cache = _load_plan_cache(path, stamp)
+    fps = _row_fingerprints(cur)
+    stale: dict[str, list[str]] = {"episode": [], "topic": []}
+    for k, ref, fp in fps:
+        entry = cache.get(f"{k}:{ref}")
+        if not entry or entry[0] != fp:
+            stale[k].append(ref)
+    fresh: dict[str, Any] = {}
+    for k, refs in stale.items():
+        if not refs:
+            continue
+        seen: dict[str, list[list]] = {ref: [] for ref in refs}
+        for kk, ref, text, _title in _iter_sources(cur, kind=k, refs=refs):
+            seen[ref] = [[i, _md5(chunk), len(chunk)] for i, chunk in _chunks_for(kk, text)]
+        for ref, chunks in seen.items():
+            fresh[f"{k}:{ref}"] = chunks
+    rows: dict[str, Any] = {}
+    plan: dict[tuple[str, str, int], tuple[str, int]] = {}
+    for k, ref, fp in fps:
+        key = f"{k}:{ref}"
+        if key in fresh:
+            chunks = fresh[key]
+        else:
+            chunks = cache[key][1]
+        rows[key] = [fp, chunks]
+        for i, h, n in chunks:
+            plan[(k, ref, i)] = (h, n)
+    if fresh or len(rows) != len(cache):
+        _save_plan_cache(path, stamp, rows)
+    return plan
+
+
+def _gaps(plan, have: dict[tuple[str, str, int], str]):
+    missing = [k for k in plan if k not in have]
+    stale = [k for k, (h, _c) in plan.items() if k in have and have[k] != h]
+    return missing, stale
 
 
 def memory_gaps(cur, profile: str, plan=None):
@@ -1249,10 +1394,19 @@ def memory_gaps(cur, profile: str, plan=None):
     chunk's current hash (what ``backfill`` re-embeds)."""
     if plan is None:
         plan = memory_chunk_plan(cur)
-    have = _existing_hashes(cur, profile)
-    missing = [k for k in plan if k not in have]
-    stale = [k for k, (h, _c) in plan.items() if k in have and have[k] != h]
+    missing, stale = _gaps(plan, _existing_hashes(cur, profile))
     return plan, missing, stale
+
+
+def memory_gaps_many(
+    cur, profile_ids: list[str], plan, have: dict[str, dict] | None = None
+) -> dict[str, tuple[list, list]]:
+    """``{profile: (missing, stale)}`` for every profile against one ``plan``,
+    reading the embedded hashes of all of them in a single statement (or taking
+    ``have``, the result of ``_existing_hashes_many(cur, None)`` read earlier)."""
+    if have is None:
+        have = _existing_hashes_many(cur, profile_ids)
+    return {pid: _gaps(plan, have.get(pid, {})) for pid in profile_ids}
 
 
 def cov_pct(done: int, total: int) -> float:
