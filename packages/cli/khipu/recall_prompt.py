@@ -758,7 +758,12 @@ def _search_hits(
     from khipu.embed import hybrid_search
 
     _enter_stage(progress, "hub")
-    payload = hybrid_search(prompt, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project)
+    # include_libraries=False: this lane has a latency budget and must never
+    # wait on a second embedding provider (library search is explicit-only).
+    payload = hybrid_search(
+        prompt, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project,
+        include_libraries=False,
+    )
     rows = _apply_score_floor(payload.get("results") or [])
     return {"hits": rows[:limit], "legs": ["hub"], "degraded": None}
 

@@ -1157,12 +1157,14 @@ def cmd_search(args: argparse.Namespace) -> int:
     until = getattr(args, "until", None)
     session_id = getattr(args, "session_id", None)
     harness = getattr(args, "harness", None)
+    source = getattr(args, "source", None)
     try:
         from khipu.embed import hybrid_search
 
         payload = hybrid_search(
             args.query, limit=args.limit, mode=mode, kind=kind, project=project,
             since=since, until=until, session_id=session_id, harness=harness,
+            source=source,
         )
     except ValueError as err:
         print(json.dumps({"ok": False, "error": str(err)}))
@@ -1170,6 +1172,10 @@ def cmd_search(args: argparse.Namespace) -> int:
     except Exception as exc:
         if not hub_connection_failed(exc):
             raise
+        if kind == "library" or source:
+            print(json.dumps({"ok": False, "error": (
+                "library search needs the hub; the offline snapshot holds no libraries")}))
+            return 2
         try:
             payload = search_stale_payload(
                 args.query, args.limit, semantic=(mode == "semantic"), kind=kind,
@@ -1182,7 +1188,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     query_log.log_query(
         args.query, mode=mode,
         filters={"kind": kind, "project": project, "since": since, "until": until,
-                 "session_id": session_id, "harness": harness},
+                 "session_id": session_id, "harness": harness, "source": source},
         result_count=len(payload.get("results") or []), top=payload.get("results") or [],
         degraded=payload.get("degraded"),
     )
@@ -2214,6 +2220,19 @@ def cmd_get(args: argparse.Namespace) -> int:
 
     ident = str(args.id)
     kind = (getattr(args, "kind", None) or "").strip().lower() or None
+    from khipu import library_search
+
+    if kind is None and library_search.is_library_id(ident):
+        kind = "library"
+    if kind == "library":
+        # library:<name>:<doc> or library:<name>:<doc>#<chunk>: the chunk (or
+        # document) plus the chunks either side of a hit.
+        try:
+            print(json.dumps(library_search.get(ident), indent=2, default=str))
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 1
+        return 0
     if kind is None:
         kind = "episode" if ident.isdigit() else "topic"
     if kind == "episode":
@@ -2255,6 +2274,37 @@ def cmd_config(args: argparse.Namespace) -> int:
     if args.set_gateway_url is not None:
         path = set_gateway_url(args.set_gateway_url)
         print(json.dumps({"gateway_url": gateway_url(), "config_file": str(path)}))
+        return 0
+    if args.set and args.set[0].startswith("relevance.cosine_floor_by_profile."):
+        from khipu import relevance
+
+        key, raw = args.set
+        profile = key[len(relevance.BY_PROFILE_KEY):]
+        try:
+            value = float(raw)
+            path = relevance.set_cosine_floor_for_profile(profile, value)
+        except (TypeError, ValueError) as err:
+            msg = str(err)
+            if msg.startswith("could not convert"):
+                msg = f"{key} must be a number, got {raw!r}"
+            print(json.dumps({"ok": False, "error": msg}))
+            return 2
+        print(json.dumps({"ok": True,
+                          "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
+                          "config_file": str(path)}))
+        return 0
+    if args.unset and args.unset.startswith("relevance.cosine_floor_by_profile."):
+        from khipu import relevance
+
+        try:
+            path = relevance.set_cosine_floor_for_profile(
+                args.unset[len(relevance.BY_PROFILE_KEY):], None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True,
+                          "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
+                          "config_file": str(path)}))
         return 0
     if args.set and args.set[0] == "relevance.cosine_floor":
         from khipu import relevance
@@ -2346,6 +2396,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "user_aliases": list(list_setting("user_aliases")),
         "float_settings": float_settings_status(),
         "relevance_cosine_floor": relevance.cosine_floor_status(),
+        "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
         "config_file": str(config_file()),
         "config": load_config(),
     }
@@ -3390,8 +3441,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     se.add_argument(
         "--kind",
-        choices=("episode", "topic", "node", "media"),
-        help="Restrict to one kind (media is semantic-only; node is literal/hybrid-only)",
+        choices=("episode", "topic", "node", "media", "library"),
+        help="Restrict to one kind (media is semantic-only; node is literal/hybrid-only; "
+        "library searches the enabled library sources)",
+    )
+    se.add_argument(
+        "--source", metavar="NAME",
+        help="Library name (see `khipu library list`); implies --kind library",
     )
     se.add_argument("--project", help="Match COALESCE(episodes.project, episodes.scope)")
     se.add_argument("--since", help="ISO date/datetime or relative, e.g. 7d / 24h")
@@ -3936,8 +3992,10 @@ def build_parser() -> argparse.ArgumentParser:
         "get",
         help="Episode or topic detail by id/slug, including the verbatim tier (K2)",
     )
-    gt.add_argument("id", help="Episode id (digits) or topic slug")
-    gt.add_argument("--kind", choices=("episode", "topic"), default=None)
+    gt.add_argument(
+        "id", help="Episode id (digits), topic slug, or library:<name>:<doc>[#<chunk>]"
+    )
+    gt.add_argument("--kind", choices=("episode", "topic", "library"), default=None)
     gt.set_defaults(func=cmd_get)
 
     mg = sub.add_parser(
@@ -4106,11 +4164,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Persist a machine-specific path (memory_root, memory_repo, "
         "capture_v2, graph_sqlite, gemini_key_file), a 0-1 similarity knob "
         "(dedup_similarity, commitment_close_similarity), the relevance "
-        "floor (relevance.cosine_floor, above 0 up to 1) or the comma-"
+        "floor (relevance.cosine_floor, above 0 up to 1; per embedding profile "
+        "relevance.cosine_floor_by_profile.<profile>) or the comma-"
         'separated user_aliases list (e.g. --set user_aliases "matt,matthew")',
     )
     cfg.add_argument("--unset", metavar="KEY",
-                     help="Remove a path setting, or relevance.cosine_floor to restore its default")
+                     help="Remove a path setting, or relevance.cosine_floor / "
+                     "relevance.cosine_floor_by_profile.<profile> to restore its default")
     cfg.add_argument(
         "--set-gateway-url",
         metavar="URL",

@@ -128,9 +128,24 @@ ALTER TABLE library_embeddings ADD COLUMN IF NOT EXISTS content_hash TEXT;
 CREATE INDEX IF NOT EXISTS idx_library_embeddings_doc
     ON library_embeddings (document, chunk_idx);
 
+-- Keyword search over chunk text (Session C). A stored generated tsvector plus a
+-- GIN index, so `tsv @@ plainto_tsquery('simple', q)` ranked by ts_rank is an
+-- index lookup rather than an ILIKE scan of every chunk. 'simple' (no stemming,
+-- no stopwords) keeps names and transliterations searchable as written.
+-- tsvector is core Postgres (no extension). On a hub that already holds chunks
+-- the ADD COLUMN rewrites library_chunks and the index build reads every row:
+-- apply it when no scan is running. Rough size: the tsvector column plus its
+-- GIN index come to about 0.5-0.8x the chunk text (about 1 GB on top of the
+-- 1.7 GB corpus text).
+ALTER TABLE library_chunks ADD COLUMN IF NOT EXISTS tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('simple', chunk_text)) STORED;
+
+CREATE INDEX IF NOT EXISTS idx_library_chunks_tsv
+    ON library_chunks USING gin (tsv);
+
 INSERT INTO schema_migrations (version, note)
 VALUES (
     '0026_library',
-    'Library sources: embedding_profiles.endpoint; memory_embeddings/memory_query_cache/library_embeddings take any vector width (Gemini indexes recreated as expression indexes; other profiles indexed by code); library_sources/documents/chunks/embeddings'
+    'Library sources: embedding_profiles.endpoint; memory_embeddings/memory_query_cache/library_embeddings take any vector width (Gemini indexes recreated as expression indexes; other profiles indexed by code); library_sources/documents/chunks/embeddings; library_chunks.tsv (generated tsvector) + GIN index'
 )
 ON CONFLICT (version) DO NOTHING;

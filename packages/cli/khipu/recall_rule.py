@@ -45,13 +45,16 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
   embedding profile is active it degrades to literal + token overlap). Use
   `mode: "literal"` for exact strings, ids, hashes, or error text; `mode:
   "semantic"` (same as the legacy `semantic: true`) for cosine + token-overlap
-  only, no literal list. Filters work on every mode: `kind` (episode/topic/node,
-  or episode/topic/media for semantic), `project`, `since`/`until` (ISO date or
-  relative like `7d`/`24h`), `session_id` (prefix match), `harness` (prefix of
-  session_id before the colon).
+  only, no literal list. Filters work on every mode: `kind` (episode/topic/node/
+  library, or episode/topic/media/library for semantic), `project`, `since`/
+  `until` (ISO date or relative like `7d`/`24h`), `session_id` (prefix match),
+  `harness` (prefix of session_id before the colon). Libraries (books, documents)
+  are in the default search or via `kind: "library"`; `source` names one, and a
+  hit's id is `library:<name>:<doc>#<chunk>`.
 - `khipu_get` loads a search hit by id: full episode (summary, decisions,
-  preferences, topics), a topic page, or media (path/sha256/mime). Search
-  snippets are teasers; fetch the hit instead of guessing from a clipped line.
+  preferences, topics), a topic page, media (path/sha256/mime), or a library
+  chunk with the chunks either side of it. Search snippets are teasers; fetch
+  the hit instead of guessing from a clipped line.
 - `khipu_graph` expands wiki/path/graphify node ids. Topic slugs from search
   work. Digit ids are episodes: the walk is that episode's capture topics,
   not a graph node named with the episode number. Use `khipu_get` for the row.
@@ -79,14 +82,14 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
   test. Through the gateway only cloud-harness captures can be forgotten.
 - `khipu_decisions` lists decisions with their validity (standing/superseded/
   retracted/conflicts); `khipu_decisions_update` supersedes, restores,
-  retracts, confirms or rejects one — supersede the moment a decision is reversed, never for a mere refinement.
+  retracts, confirms or rejects one — supersede when a decision is reversed, never for a refinement.
 - `khipu_brief` reads a topic's derived summary, each claim naming its source
   episode ids; cite the episodes, not the brief. `available: false` means off.
 - `khipu_reflect` answers one question from memory with each claim cited, or
   abstains. It calls a model: ask it for a synthesis, not a lookup.
 - Capture writes: on a local Mac with a Khipu capture hook (`khipu-stop-hook`
   or `khipu-aegis-capture`) the hook is the writer, not you — but `khipu_capture`
-  now works there too: call it (or `khipu capture now` in a shell) when you
+  works there too: call it (or `khipu capture now` in a shell) when you
   want this session remembered before its normal cadence, and it flags the
   session for its next Stop/PreCompact/SessionEnd instead of writing directly
   or refusing. Your summary lands as that capture's `verbatim.note`. Cloud /

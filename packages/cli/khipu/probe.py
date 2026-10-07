@@ -230,7 +230,7 @@ def run_probe(
         deadline = time.monotonic() + timeout_s
         found = False
         while True:
-            out = hybrid_search(phrase, limit=3)
+            out = hybrid_search(phrase, limit=3, include_libraries=False)
             top_ids = {
                 r.get("id") for r in out.get("results", []) if r.get("kind") == "episode"
             }

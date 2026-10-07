@@ -30,6 +30,20 @@ Security model (this is the only thing on the public internet):
   * `GET /healthz` is unauthenticated but answers only `{"ok": true}` to the
     public; the build stamp is for loopback callers (the deploy script on the
     host) and bearer holders
+
+Libraries (Session C, docs/plans/2026-10-07-library-sources-byoe.md): `khipu_search`
+(`kind: "library"`, `source`, and the default search) and `khipu_get`
+(`library:<name>:<doc>[#<chunk>]`) go through the same `handle_message`
+handlers as the stdio server, so the gateway serves libraries with no extra
+code. What it does need, in the gateway's own environment (Khipu-ops), is the
+embedding key of EVERY enabled library's profile, because each library search
+embeds the query with that library's provider: `VOYAGE_API_KEY` for a voyage
+profile, `GEMINI_API_KEY` for a gemini one, and for an openai-compatible one the
+`openai_compat_api_key` secret (plus the endpoint, which lives on the profile
+row and must be reachable from the gateway host). A missing key never fails the
+search: that library's cosine leg is dropped, `degraded_legs` names
+`library_embed:<profile>`, and literal/lexical still answer. The per-prompt
+recall lane never reaches libraries.
 """
 from __future__ import annotations
 

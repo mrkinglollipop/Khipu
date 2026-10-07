@@ -1577,6 +1577,9 @@ def semantic_search(
 
 _SEMANTIC_KINDS = ("episode", "topic", "media")
 _LITERAL_KINDS = ("episode", "topic", "node")
+# Libraries (Session C) are a search space of their own: accepted in every mode
+# but never part of the memory kind tuples above.
+LIBRARY_KIND = "library"
 
 
 def _episode_schema_flags(cur) -> dict[str, bool]:
@@ -1915,6 +1918,8 @@ def hybrid_search(
     harness: str | None = None,
     project_boost: str | None = None,
     tz: str | None = None,
+    source: str | None = None,
+    include_libraries: bool = True,
 ) -> dict[str, Any]:
     """Default retrieval engine (W2.1-W2.3): fused hybrid, or single-mode.
 
@@ -1953,6 +1958,23 @@ def hybrid_search(
     Nodes are excluded from hybrid/literal results by default (W2.2) — see
     ``cli._id_shaped`` / ``cli._literal_candidates``.
 
+    Libraries (Session C, ``khipu.library_search``): ``kind="library"`` searches
+    only the enabled library sources; ``kind=None`` adds them to the memory
+    kinds unless ``include_libraries=False``. ``source`` names one library and
+    implies ``kind="library"`` (any other kind with a source is refused). Each
+    distinct embedding profile among the libraries gets its own cosine list
+    (the query embedded once per profile) and the chunk/title ILIKE leg gets
+    one more; all of them join the same fusion, relevance gate and rerank. In
+    the default search (``kind=None``) a library row must be evidence on its
+    own (``relevance.is_evidence``: raw cosine at/above the floor, or enough
+    query tokens named) before it may enter fusion, so a corpus's nearest
+    neighbours never crowd memory; an explicit ``kind="library"`` keeps every
+    candidate and leaves rejection to the relevance gate. The metadata
+    filters other than ``source`` (project, session_id, harness, since/until)
+    are episode/timestamp-shaped, so any of them switches the library legs
+    off. The per-prompt recall lane passes ``include_libraries=False``: it has
+    a latency budget and must never wait on a second embedding provider.
+
     The payload also carries ``timing`` (phase 5 addendum): ``embed_ms``,
     ``cosine_ms``, ``literal_ms``, ``lexical_ms``, ``fusion_ms``, ``enrich_ms``
     and ``total_ms``, all milliseconds. Each row an episode produced carries
@@ -1969,10 +1991,17 @@ def hybrid_search(
     mode = (mode or "hybrid").strip().lower()
     if mode not in ("hybrid", "literal", "semantic"):
         raise ValueError("mode must be 'hybrid', 'literal', or 'semantic'")
+    source = (source or "").strip() or None
+    if source is not None:
+        if kind not in (None, LIBRARY_KIND):
+            raise ValueError("source applies to kind 'library' only")
+        kind = LIBRARY_KIND
     if kind is not None:
-        allowed = _SEMANTIC_KINDS if mode == "semantic" else _LITERAL_KINDS
+        allowed = (_SEMANTIC_KINDS if mode == "semantic" else _LITERAL_KINDS) + (LIBRARY_KIND,)
         if kind not in allowed:
             raise ValueError(f"kind must be one of {allowed}")
+        if kind == LIBRARY_KIND and not include_libraries:
+            raise ValueError("kind 'library' conflicts with include_libraries=False")
 
     limit = max(1, int(limit))
     # Every leg is timed and reported in the payload's `timing` block (phase 5
@@ -1990,6 +2019,17 @@ def hybrid_search(
         project=project, since=since, until=until,
         session_id=session_id, harness=harness,
     )
+
+    degraded_legs: list[str] = []
+    # Library legs (Session C): only the default and kind="library" searches, only
+    # when the caller allows them, and never under an episode/timestamp-shaped
+    # filter (a library row has neither). ``source`` was folded into ``kind``.
+    want_library = (
+        include_libraries and kind in (None, LIBRARY_KIND) and not filters.active
+    )
+    lib_cos_lists: list[list[dict[str, Any]]] = []
+    lib_literal: list[dict[str, Any]] = []
+    lib_names: list[str] = []
 
     cosine_rows: list[dict[str, Any]] = []
     # kind="node" (only valid for hybrid/literal, never semantic — checked
@@ -2022,7 +2062,7 @@ def hybrid_search(
     with try_hub_connect() as conn:
         with conn.cursor() as cur:
             literal_rows: list[dict[str, Any]] = []
-            if mode in ("hybrid", "literal"):
+            if mode in ("hybrid", "literal") and kind != LIBRARY_KIND:
                 literal_kind = kind if kind in _LITERAL_KINDS else None
                 _t = time.monotonic()
                 literal_rows = _literal_candidates(
@@ -2030,27 +2070,39 @@ def hybrid_search(
                 )
                 timing["literal_ms"] = round((time.monotonic() - _t) * 1000, 1)
 
+            if want_library:
+                from khipu import library_search as _ls
+
+                lib_cos_lists, lib_literal, lib_names = _ls.library_candidates(
+                    conn, cur, query, mode=mode, kind=kind, source=source,
+                    oversample=oversample, timing=timing, degraded_legs=degraded_legs,
+                )
+
             _t = time.monotonic()
             lists: list[list[dict[str, Any]]] = []
             # R4: the query's own token count matters for confidence below
             # even in modes/branches with no cosine leg at all.
             tokens = search_tokens(query)
-            if cosine_rows:
+            # Memory cosine, then one cosine list per library profile: each is
+            # its own ranked list in the fusion.
+            cos_lists = [lst for lst in [cosine_rows, *lib_cos_lists] if lst]
+            if cos_lists:
                 # Raw cosine (R4): fuse_ranked_lists overwrites `score` with
                 # the fused RRF value below, which is rank-derived and not a
                 # usable confidence signal on its own (a gibberish query and
                 # a real hit can land in the same band). Stash the real
                 # similarity now, on the same objects the fused output is
                 # copied from, so it survives fusion/filtering/enrichment.
-                for r in cosine_rows:
-                    r["cosine"] = r.get("score")
-                lists.append(list(cosine_rows))
+                for lst in cos_lists:
+                    for r in lst:
+                        r["cosine"] = r.get("score")
+                    lists.append(list(lst))
                 if tokens:
                     union: dict[tuple[str, str], dict[str, Any]] = {
-                        (r["kind"], str(r["id"])): r for r in cosine_rows
+                        (r["kind"], str(r["id"])): r for lst in cos_lists for r in lst
                     }
                     if mode == "hybrid":
-                        for r in literal_rows:
+                        for r in [*literal_rows, *lib_literal]:
                             union.setdefault((r["kind"], str(r["id"])), r)
                     lex_rows = sorted(
                         union.values(),
@@ -2059,6 +2111,8 @@ def hybrid_search(
                     lists.append(lex_rows)
             if literal_rows and mode in ("hybrid", "literal"):
                 lists.append(list(literal_rows))
+            if lib_literal and mode in ("hybrid", "literal"):
+                lists.append(list(lib_literal))
 
             # A row can legitimately appear in more than one list (e.g. a
             # literal match that is ALSO in lex_rows via the cosine/literal
@@ -2084,6 +2138,24 @@ def hybrid_search(
                         r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)
                     r.pop("rank_text", None)
             timing["lexical_ms"] = round((time.monotonic() - _t) * 1000, 1)
+            if lib_names and kind is None:
+                # Default search only: a library row must be evidence by itself
+                # before it can enter fusion (see the docstring), so a big
+                # corpus's nearest neighbours cannot crowd out memory.
+                try:
+                    from khipu import relevance as _rel
+
+                    _floor, _need = _rel.cosine_floor(), _rel.need(len(tokens))
+                    _by_profile = _rel.cosine_floor_by_profile()
+                    lists = [
+                        [r for r in lst
+                         if r.get("kind") != LIBRARY_KIND
+                         or _rel.is_evidence(r, _floor, _need, _by_profile)]
+                        for lst in lists
+                    ]
+                    lists = [lst for lst in lists if lst]
+                except Exception as exc:  # noqa: BLE001 - a policy failure must not sink the search
+                    timing["library_evidence_error"] = str(exc)[:120]
             if not lists:
                 from khipu.recency import HALF_LIFE_DAYS
 
@@ -2093,6 +2165,10 @@ def hybrid_search(
                                        "ranking": {"recency_half_life_days": HALF_LIFE_DAYS}}
                 if degraded:
                     out["degraded"] = degraded
+                if degraded_legs:
+                    out["degraded_legs"] = degraded_legs
+                if lib_names or kind == LIBRARY_KIND:
+                    out["libraries"] = lib_names
                 return out
             _t = time.monotonic()
             fused = fuse_ranked_lists(lists, limit=oversample)
@@ -2103,7 +2179,6 @@ def hybrid_search(
             # deadline, dropped entirely (never partially) on a miss — named
             # in `degraded_legs`. Seeds are the top 5 rows of `fused` exactly
             # as fused above, before any filter/enrichment pass touches it.
-            degraded_legs: list[str] = []
             from khipu import features as _features
 
             if _features.enabled("graph_candidates"):
@@ -2248,6 +2323,8 @@ def hybrid_search(
         out["degraded"] = degraded
     if degraded_legs:
         out["degraded_legs"] = degraded_legs
+    if lib_names or kind == LIBRARY_KIND:
+        out["libraries"] = lib_names
     if interpretation:
         out["time_interpretation"] = interpretation
     if rerank_info is not None:

@@ -30,6 +30,7 @@ calls it. Pure functions over already-fetched rows: no database, no network.
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Sequence
 
 # Measured on the production embedding profile: the best match for 20 prompts
@@ -107,6 +108,77 @@ def set_cosine_floor(value: "float | None"):
     return save_config(data)
 
 
+# A profile id as it appears in config.json keys: model@dim, so it may carry
+# '@', '-', '.', ':' and '/' (voyage-3.5@1024, org/model:tag@768).
+PROFILE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}$")
+BY_PROFILE_KEY = "relevance.cosine_floor_by_profile."
+
+
+def _valid_floor(raw: Any) -> bool:
+    return (not isinstance(raw, bool) and isinstance(raw, (int, float))
+            and math.isfinite(float(raw)) and 0.0 < float(raw) <= 1.0)
+
+
+def cosine_floor_by_profile() -> dict[str, float]:
+    """``relevance.cosine_floor_by_profile`` from config.json: profile id ->
+    floor, keeping only entries whose key is a plausible id and whose value is
+    a number in (0, 1]. Anything else is ignored, never raised."""
+    try:
+        from khipu.config import load_config
+
+        section = load_config().get("relevance")
+        raw = section.get("cosine_floor_by_profile") if isinstance(section, dict) else None
+    except Exception:  # noqa: BLE001 — config trouble means no overrides
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: float(v) for k, v in raw.items()
+            if isinstance(k, str) and PROFILE_KEY_RE.match(k) and _valid_floor(v)}
+
+
+def cosine_floor_for(profile: str | None, *, by_profile: dict[str, float] | None = None) -> float:
+    """The floor for rows scored by ``profile``'s embedding model: its own
+    entry when set, else the global ``cosine_floor()``. Raw cosine is only
+    comparable within one model, so a profile whose scores sit lower (or
+    higher) than the one the global floor was measured on gets its own."""
+    table = cosine_floor_by_profile() if by_profile is None else by_profile
+    if profile and profile in table:
+        return table[profile]
+    return cosine_floor()
+
+
+def set_cosine_floor_for_profile(profile: str, value: "float | None"):
+    """Write (or, with ``None``, remove) one profile's floor under
+    ``relevance.cosine_floor_by_profile`` in config.json. ``ValueError`` for
+    an id that is not a plausible profile id or a value outside (0, 1]."""
+    from khipu.config import load_config, save_config
+
+    profile = (profile or "").strip()
+    if not PROFILE_KEY_RE.match(profile):
+        raise ValueError(f"not a valid embedding profile id: {profile!r}")
+    if value is not None and not _valid_floor(value):
+        raise ValueError(
+            f"{BY_PROFILE_KEY}{profile} must be a number above 0 and at most 1, got {value!r}")
+    data = load_config()
+    section = data.get("relevance")
+    section = dict(section) if isinstance(section, dict) else {}
+    table = section.get("cosine_floor_by_profile")
+    table = dict(table) if isinstance(table, dict) else {}
+    if value is None:
+        table.pop(profile, None)
+    else:
+        table[profile] = float(value)
+    if table:
+        section["cosine_floor_by_profile"] = table
+    else:
+        section.pop("cosine_floor_by_profile", None)
+    if section:
+        data["relevance"] = section
+    else:
+        data.pop("relevance", None)
+    return save_config(data)
+
+
 def need(token_count: int) -> int:
     """Whole-token keyword hits a row needs to be evidence by coverage."""
     n = int(token_count)
@@ -119,9 +191,16 @@ def _number(value: Any) -> float | None:
     return float(value)
 
 
-def is_evidence(row: dict[str, Any], floor: float, needed: int) -> bool:
-    """The evidence test for one row."""
+def is_evidence(
+    row: dict[str, Any], floor: float, needed: int,
+    by_profile: dict[str, float] | None = None,
+) -> bool:
+    """The evidence test for one row. A row that names the embedding profile
+    its cosine came from (a library row) is held to that profile's floor in
+    ``by_profile`` when it has one, else to ``floor``."""
     cosine = _number(row.get("cosine"))
+    if by_profile:
+        floor = by_profile.get(row.get("profile") or "", floor)
     if cosine is not None and cosine >= floor:
         return True
     hits = _number(row.get("lexical_hits"))
@@ -137,8 +216,9 @@ def gate(
     if token_count <= 0:
         return list(rows), None
     limit = cosine_floor() if floor is None else floor
+    table = cosine_floor_by_profile() if floor is None else None
     needed = need(token_count)
-    evidence = sum(1 for r in rows if is_evidence(r, limit, needed))
+    evidence = sum(1 for r in rows if is_evidence(r, limit, needed, table))
     abstained = evidence == 0
     info = {"applied": True, "abstained": abstained, "evidence_rows": evidence,
             "floor": limit, "need": needed}

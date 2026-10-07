@@ -270,7 +270,9 @@ class LibraryMigrationTest(unittest.TestCase):
     def test_no_library_index_is_built_by_the_migration(self):
         sql = self._executable().lower()
         self.assertNotIn("on library_embeddings using hnsw", sql.replace("\n", " "))
-        self.assertEqual(sql.count("create index if not exists idx_library"), 1)  # the doc index
+        # the doc index and the chunk full-text (GIN tsvector) index; never a vector index
+        self.assertEqual(sql.count("create index if not exists idx_library"), 2)
+        self.assertIn("create index if not exists idx_library_chunks_tsv", sql)
 
     def test_documents_are_unique_per_source_and_path_and_chunks_cascade(self):
         sql = self._sql()

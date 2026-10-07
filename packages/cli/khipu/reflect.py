@@ -273,7 +273,10 @@ def _result(started: float, *, chars_sent: int = 0, model: str | None = None,
 def _search(question: str, project: str | None, limit: int) -> list[dict[str, Any]]:
     from khipu.embed import hybrid_search
 
-    payload = hybrid_search(question, limit=limit, mode="hybrid", project_boost=project or None)
+    payload = hybrid_search(
+        question, limit=limit, mode="hybrid", project_boost=project or None,
+        include_libraries=False,  # reflect cites episodes, not library chunks
+    )
     rows = [r for r in (payload.get("results") or []) if r.get("kind") in ("episode", "topic")]
     return rows[:limit]
 
