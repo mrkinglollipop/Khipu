@@ -1101,6 +1101,18 @@ class _ClaudeHomesCase(_TempHomeCase):
         self.default = self.home / ".claude"
         self.second = self.home / ".claude-t3-second"
 
+    def _green_probes(self):
+        """Verify's live probes (MCP handshake, hooks, a real capture) need a
+        hub; what these tests assert is which homes verify looks at."""
+        for name in ("_probe_mcp", "_probe_hook", "_probe_native_extract", "_probe_recall",
+                     "_probe_prompt_recall", "_probe_aegis_refusal", "_runtime"):
+            p = mock.patch.object(integ, name, return_value={"ok": True})
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch("khipu.probe.run_probe", return_value={"ok": True})
+        p.start()
+        self.addCleanup(p.stop)
+
     def _t3(self, *instances):
         path = self.home / ".t3" / "userdata" / "settings.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1158,6 +1170,26 @@ class WriteJsonTest(_ClaudeHomesCase):
         integ._write_json(fresh, {"k": 1})
         self.assertEqual(fresh.stat().st_mode & 0o777, 0o600)
 
+    def test_two_writes_never_share_a_temp_path_and_leave_none_behind(self):
+        f = self.home / "x.json"
+        seen = []
+        real = os.replace
+        with mock.patch.object(integ.os, "replace", side_effect=lambda a, b: (seen.append(str(a)), real(a, b))):
+            integ._write_json(f, {"k": 1})
+            integ._write_json(f, {"k": 2})
+        self.assertEqual(len(set(seen)), 2)
+        self.assertTrue(all(Path(p).parent == Path(os.path.realpath(f.parent)) for p in seen))
+        self.assertEqual([p.name for p in f.parent.iterdir()], ["x.json"])
+
+    def test_a_failed_write_removes_its_temp_file_and_keeps_the_target(self):
+        f = self.home / "x.json"
+        f.write_text('{"k": 0}')
+        with mock.patch.object(integ.os, "replace", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                integ._write_json(f, {"k": 1})
+        self.assertEqual(json.loads(f.read_text()), {"k": 0})
+        self.assertEqual([p.name for p in f.parent.iterdir()], ["x.json"])
+
     def test_a_plain_file_is_written_as_before(self):
         f = self.home / "sub" / "x.json"
         integ._write_json(f, {"k": 1})
@@ -1212,6 +1244,16 @@ class ClaudeHomesInstallTest(_ClaudeHomesCase):
         self.assertEqual(self._shared_stop_hooks(), 1)
         pc = json.loads((self.default / "settings.json").read_text())["hooks"]["PreCompact"]
         self.assertIn("python3 /me/precompact_flush.py", [h["command"] for e in pc for h in e["hooks"]])
+
+    def test_a_linked_home_whose_owner_does_not_exist_installs_the_hooks_itself(self):
+        self.second.mkdir()
+        (self.second / "settings.json").symlink_to(self.default / "settings.json")  # dangling: no ~/.claude
+        self._t3(("claudeAgent_secondary", {"driver": "claudeAgent", "config": {"homePath": "~/.claude-t3-second"}}))
+        out = integ.install("claude_code")
+        self.assertNotIn("hooks_shared_with", out["homes"][1])
+        self.assertTrue((self.second / "settings.json").is_symlink())
+        self.assertEqual(self._shared_stop_hooks(), 1)
+        self.assertTrue(integ.status("claude_code")["hook_stop"])
 
     def test_a_home_that_does_not_exist_yet_is_reported_not_created(self):
         self.default.mkdir()
@@ -1392,12 +1434,41 @@ class ClaudeHomesStatusTest(_ClaudeHomesCase):
         self.assertTrue(self._row(st, "Default")["installed"])
         self.assertFalse(st["installed"])
 
-    def test_verify_names_the_home_that_is_missing_khipu(self):
+    def test_verify_scopes_to_the_homes_that_have_khipu_and_lists_the_rest(self):
+        self._green_probes()
         self._seed(link=False)
         integ.install("claude_code", home=str(self.default))
         out = integ.verify("claude_code")
-        self.assertEqual(out["components"]["mcp"]["error"], "not installed in T3 · Secondary")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["not_installed_homes"], ["T3 · Secondary"])
+        self.assertTrue(out["components"]["mcp"]["ok"])
+
+    def test_verify_of_one_home_requires_that_home(self):
+        self._green_probes()
+        self._seed(link=False)
+        integ.install("claude_code", home=str(self.default))
+        self.assertTrue(integ.verify("claude_code", home=str(self.default))["ok"])
+        out = integ.verify("claude_code", home=str(self.second))
         self.assertFalse(out["ok"])
+        self.assertEqual(out["components"]["mcp"]["error"], "not installed in T3 · Secondary")
+        with self.assertRaises(integ.UnknownClaudeHome):
+            integ.verify("claude_code", home=str(self.home / "nowhere"))
+        with self.assertRaises(ValueError):
+            integ.verify("cursor", home=str(self.default))
+
+    def test_verify_with_no_home_installed_fails_naming_them(self):
+        self._green_probes()
+        self._seed(link=False)
+        out = integ.verify("claude_code")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["components"]["mcp"]["error"], "not installed in Default, T3 · Secondary")
+
+    def test_verify_fails_for_a_home_whose_config_cannot_be_read(self):
+        self._green_probes()
+        self._seed(link=False)
+        integ.install("claude_code")
+        (self.second / "settings.json").write_text("{broken")
+        self.assertFalse(integ.verify("claude_code")["ok"])
 
     def test_doctor_row_per_home(self):
         self._seed(link=True)
@@ -1409,6 +1480,11 @@ class ClaudeHomesStatusTest(_ClaudeHomesCase):
         self.assertEqual(rep["homes"][1]["linked_to"], {"label": "Default", "path": str(self.default)})
         integ.install("claude_code")
         self.assertTrue(integ.claude_homes_report()["all_installed"])
+
+    def test_doctor_all_installed_is_false_when_no_home_exists(self):
+        rep = integ.claude_homes_report()
+        self.assertEqual(rep["found"], 0)
+        self.assertFalse(rep["all_installed"])
 
 
 class ClaudeHomesCliTest(_ClaudeHomesCase):
@@ -1432,6 +1508,22 @@ class ClaudeHomesCliTest(_ClaudeHomesCase):
         rc, raw = self._run("uninstall", "claude_code", "--home", str(self.second))
         self.assertEqual(rc, 0)
         self.assertNotIn("khipu", self._mcp_servers(self.second / ".claude.json"))
+
+    def test_install_of_the_installed_home_verifies_only_it_and_verify_takes_one_home(self):
+        self._green_probes()
+        self._seed(link=False)
+        rc, raw = self._run("install", "claude_code", "--home", str(self.default))
+        self.assertEqual(rc, 0, raw)
+        rc, raw = self._run("verify", "claude_code")
+        self.assertEqual(rc, 0, raw)
+        self.assertEqual(json.loads(raw)[0]["not_installed_homes"], ["T3 · Secondary"])
+        rc, raw = self._run("verify", "claude_code", "--home", str(self.second))
+        self.assertEqual(rc, 2)
+        rc, raw = self._run("verify", "claude_code", "--home", str(self.home / "nowhere"))
+        self.assertEqual(rc, 2)
+        self.assertFalse(json.loads(raw)["ok"])
+        rc, raw = self._run("verify", "all", "--home", str(self.default))
+        self.assertEqual(rc, 2)
 
     def test_status_lists_the_homes(self):
         self._seed(link=True)

@@ -84,12 +84,26 @@ _CAPTURE_HOOK_MARKERS = ("khipu-stop-hook", "khipu-aegis-capture")
 
 def _local_hook_config_paths() -> tuple[Path, ...]:
     home = Path.home()
-    return (
+    paths = [
         home / ".cursor" / "hooks.json",
         home / ".claude" / "settings.json",
         home / ".codex" / "hooks.json",
         home / ".grok" / "config.toml",
-    )
+    ]
+    try:
+        from khipu import claude_homes
+
+        paths.extend(h.settings_path for h in claude_homes.discover(home=home))
+    except Exception:  # noqa: BLE001 — discovery must never take the writer check down
+        return tuple(paths)
+    seen: set[str] = set()
+    unique = []
+    for p in paths:
+        real = os.path.realpath(p)
+        if real not in seen:
+            seen.add(real)
+            unique.append(p)
+    return tuple(unique)
 
 
 def _local_capture_hook_is_writer() -> bool:

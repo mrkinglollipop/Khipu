@@ -3044,7 +3044,7 @@ def cmd_integrations(args: argparse.Namespace) -> int:
 
     targets = list(integ.HARNESSES) if args.harness == "all" else [args.harness]
     project = getattr(args, "project", None)
-    # --home narrows a Claude Code install/uninstall to one of the homes
+    # --home narrows a Claude Code install/uninstall/verify to one of the homes
     # `integrations status` lists (its `homes[].path`); without it every home
     # Khipu found is acted on.
     home = getattr(args, "home", None)
@@ -3064,6 +3064,8 @@ def cmd_integrations(args: argparse.Namespace) -> int:
         return integ.status(h, project=project)
 
     def _verify(h):
+        if home is not None:
+            return integ.verify(h, project=project, home=home)
         return integ.verify(h, project=project)
 
     if args.integ_cmd == "status":
@@ -4465,6 +4467,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         if name in ("install", "uninstall"):
             sp.add_argument("--dry-run", action="store_true")
+        if name in ("install", "uninstall", "verify"):
             sp.add_argument(
                 "--home",
                 help="claude_code only: act on this one Claude home (a `homes[].path` from "

@@ -1,4 +1,4 @@
-# Harnesses: one row per Claude home (mock, awaiting approval)
+# Harnesses: one row per Claude home (mock, approved 2026-10-07)
 
 Static mock for slice A of `docs/plans/2026-10-07-khipu-t3.md`: the Harnesses screen lists every Claude
 home Khipu finds (`~/.claude`, `CLAUDE_CONFIG_DIR`, each Claude instance in T3's settings). Open either

@@ -314,6 +314,33 @@ class LocalCaptureHookWriterTest(unittest.TestCase):
         hooks.read_text.assert_called_once()
 
 
+class LocalHookConfigPathsTest(unittest.TestCase):
+    def test_every_discovered_claude_homes_settings_is_checked_once(self):
+        import tempfile
+        from pathlib import Path
+
+        from khipu.mcp_server import _local_hook_config_paths
+
+        home = Path(tempfile.mkdtemp(prefix="khipu-mcp-"))
+        other = home / ".claude-t3-second"
+        env = {"CLAUDE_CONFIG_DIR": str(other), "HOME": str(home)}
+        with mock.patch.dict(os.environ, env), mock.patch.object(Path, "home", return_value=home):
+            paths = _local_hook_config_paths()
+        self.assertIn(other / "settings.json", paths)
+        self.assertEqual(paths.count(home / ".claude" / "settings.json"), 1)
+        self.assertEqual(len({os.path.realpath(p) for p in paths}), len(paths))
+
+    def test_a_discovery_failure_falls_back_to_the_fixed_list(self):
+        from pathlib import Path
+
+        from khipu.mcp_server import _local_hook_config_paths
+
+        with mock.patch("khipu.claude_homes.discover", side_effect=RuntimeError("boom")):
+            paths = _local_hook_config_paths()
+        self.assertEqual(paths[1], Path.home() / ".claude" / "settings.json")
+        self.assertEqual(len(paths), 4)
+
+
 class GetKindOmittedFallbackTest(unittest.TestCase):
     """Numeric ids with kind omitted try episode, then topic, then media.
     Explicit kind=episode stays a hard miss. Lookups are mocked; no live PG."""

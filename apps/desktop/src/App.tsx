@@ -36,6 +36,8 @@ import {
 import { ComponentsPanel } from "./ComponentsPanel";
 import { IntegrationsPanel } from "./IntegrationsPanel";
 import type { LivenessPayload, RecallProbeStatus } from "./IntegrationsPanel";
+import { claudeHomesGap, harnessesBadge, railHealthLine } from "./railHealth";
+import type { ClaudeHomesReport } from "./railHealth";
 import { RightNowCard } from "./RightNow";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
@@ -2734,17 +2736,10 @@ export default function App() {
     : undefined;
 
   // The rail's health line, and the plain-language replacement for "DSN ok".
-  const railHealth: { tone: "ok" | "warn" | "err"; text: string } =
-    dsnOk === false
-      ? { tone: "err", text: "Database not reachable" }
-      : harnessRed.length === 0 && liveness != null
-        ? { tone: "ok", text: "All harnesses recording" }
-        : harnessRed.length > 0
-          ? {
-              tone: "err",
-              text: `${harnessRed.length} harness${harnessRed.length === 1 ? "" : "es"} not recording`,
-            }
-          : { tone: "warn", text: "Checking harnesses…" };
+  const claudeHomes = claudeHomesGap(
+    (doctorParsed as { claude_homes?: ClaudeHomesReport } | null)?.claude_homes,
+  );
+  const railHealth = railHealthLine(dsnOk, liveness, claudeHomes);
 
   const coverage = (() => {
     if (!embedCoverage) return null;
@@ -3049,9 +3044,7 @@ export default function App() {
                     ? { n: openOwed, quiet: true }
                     : null
                   : id === "harnesses"
-                    ? harnessRed.length > 0
-                      ? { n: harnessRed.length, quiet: false }
-                      : null
+                    ? harnessesBadge(liveness, claudeHomes)
                     : null;
               return (
                 <button

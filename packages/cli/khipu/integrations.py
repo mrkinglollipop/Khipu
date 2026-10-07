@@ -66,6 +66,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import tomllib
 import uuid
@@ -397,16 +398,29 @@ def _write_json(path: Path, data: dict) -> None:
     itself swaps the link for a plain file and silently un-shares a setup that
     is symlinked on purpose (a second Claude home linking its settings.json to
     ~/.claude's), so the temp file goes next to the RESOLVED target and replaces
-    that. The target's mode is kept: ``.claude.json`` is 0600."""
+    that. The temp name is unique, so two writers never share one. The target's
+    mode is kept: ``.claude.json`` is 0600."""
     target = Path(os.path.realpath(path))
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    if target.exists():
-        shutil.copymode(target, tmp)
-    elif target.name == ".claude.json":
-        os.chmod(tmp, 0o600)
-    os.replace(tmp, target)
+    fd, name = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".", suffix=".tmp")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if target.exists():
+            shutil.copymode(target, tmp)
+        elif target.name == ".claude.json":
+            os.chmod(tmp, 0o600)
+        else:
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp, 0o666 & ~umask)
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _is_ours(cmd: Any) -> bool:
@@ -558,7 +572,8 @@ def _claude_install(dry: bool, home: str | None = None) -> dict:
                 if os.path.realpath(j) not in mcp_done:
                     mcp_done.add(os.path.realpath(j))
                     _claude_mcp_install(j, dry, res)
-            if h.linked_to is not None and str(h.linked_to.real) in target_reals:
+            if (h.linked_to is not None and h.linked_to.exists
+                    and str(h.linked_to.real) in target_reals):
                 res["hooks_shared_with"] = h.linked_to.label  # the owner's pass installs them
             else:
                 _claude_hooks_install(h.settings_path, dry, res)
@@ -707,6 +722,27 @@ def _claude_home_rows() -> tuple[list[dict], list[dict]]:
     return rows, launches
 
 
+def _claude_pack_fields(scope: list[dict]) -> dict:
+    """The pack-level flags: the AND over the home rows in ``scope``."""
+    def every(key: str) -> bool:
+        return bool(scope) and all(r[key] for r in scope)
+
+    def every_installed(key: str) -> bool:
+        return bool(scope) and all(r[key] == "installed" for r in scope)
+
+    return {
+        "mcp": every("memory_tools_ok"),
+        "hook_stop": every("hook_stop"), "hook_precompact": every("hook_precompact"),
+        "hook_sessionend": every("hook_sessionend"), "hook_subagentstop": every("hook_subagentstop"),
+        "recall_rule": "installed" if every_installed("recall_rule") else "missing",
+        "prompt_recall": "installed" if every_installed("prompt_recall") else "missing",
+        # Khipu-native extraction rides on this same hook (session_capture);
+        # "legacy" was the model-driven capture_v2 nudge, which is now only
+        # a parallel writer until the soak-gated legacy removal.
+        "extract": "installed" if every("hook_stop") and every("hook_precompact") else "missing",
+    }
+
+
 def _claude_status() -> dict:
     """Pack-level fields (what the Harnesses card reads) are the AND over the
     homes that exist; `homes` has every home found, one row each:
@@ -718,25 +754,8 @@ def _claude_status() -> dict:
     file could not be read."""
     rows, launches = _claude_home_rows()
     live = [(r, ln) for r, ln in zip(rows, launches) if r["exists"]]
-
-    def every(key: str) -> bool:
-        return bool(live) and all(r[key] for r, _ in live)
-
-    def every_installed(key: str) -> bool:
-        return bool(live) and all(r[key] == "installed" for r, _ in live)
-
-    out: dict[str, Any] = {
-        "harness": "claude_code", "detected": bool(live),
-        "mcp": every("memory_tools_ok"),
-        "hook_stop": every("hook_stop"), "hook_precompact": every("hook_precompact"),
-        "hook_sessionend": every("hook_sessionend"), "hook_subagentstop": every("hook_subagentstop"),
-        "recall_rule": "installed" if every_installed("recall_rule") else "missing",
-        "prompt_recall": "installed" if every_installed("prompt_recall") else "missing",
-        # Khipu-native extraction rides on this same hook (session_capture);
-        # "legacy" was the model-driven capture_v2 nudge, which is now only
-        # a parallel writer until the soak-gated legacy removal.
-        "extract": "installed" if every("hook_stop") and every("hook_precompact") else "missing",
-    }
+    out: dict[str, Any] = {"harness": "claude_code", "detected": bool(live),
+                           **_claude_pack_fields([r for r, _ in live])}
     # The launcher links are shared by every home, so one block stands for all:
     # the first broken one (it carries the fix), else any.
     launch = next((ln for _, ln in live if not ln["launcher_ok"]), None) \
@@ -765,7 +784,8 @@ def claude_homes_report() -> dict:
             row["error"] = r["error"]
         out_rows.append(row)
     live = [r for r in out_rows if r["exists"]]
-    return {"homes": out_rows, "found": len(live), "all_installed": all(r["installed"] for r in live)}
+    return {"homes": out_rows, "found": len(live),
+            "all_installed": bool(live) and all(r["installed"] for r in live)}
 
 
 # ---- Cursor -------------------------------------------------------------------
@@ -2002,9 +2022,38 @@ def _missing_in(st: dict, key: str) -> str:
     return " in " + ", ".join(names) if names else ""
 
 
-def verify(harness: str, *, project: str | None = None) -> dict:
+def _claude_verify_scope(st: dict, home: str | None) -> tuple[dict, list[str]]:
+    """`st` narrowed to the homes a verify is about, and the labels of the found
+    homes left out. With ``home`` that is the one home (it must be installed to
+    pass); without, every home Khipu is installed in (or whose config could not
+    be read), so a home with no Khipu yet is information, not a failure. When
+    none is installed the scope is every home found, and verify fails on that."""
+    rows = st.get("homes") or []
+    live = [r for r in rows if r["exists"]]
+    if home is not None:
+        want = os.path.realpath(Path(home).expanduser())
+        resolve_claude_home(home)
+        scope = [r for r in rows if os.path.realpath(r["path"]) == want]
+        detected = True
+    else:
+        scope = [r for r in live if r["installed"] or r.get("error")] or live
+        detected = bool(live)
+    left_out = [r["label"] for r in live if r not in scope]
+    return {**st, **_claude_pack_fields(scope), "detected": detected, "homes": scope}, left_out
+
+
+def verify(harness: str, *, project: str | None = None, home: str | None = None) -> dict:
+    """``home`` (claude_code only): verify that one Claude home. Without it the
+    pack is verified in every home that has Khipu; homes without it are listed
+    under ``not_installed_homes``."""
+    _claude_only_home(harness, home)
     st = status(harness, project=project) if harness == "grok_bot" else status(harness)
+    left_out: list[str] | None = None
+    if harness == "claude_code":
+        st, left_out = _claude_verify_scope(st, home)
     out: dict[str, Any] = {"harness": harness, "detected": st["detected"], "components": {}}
+    if left_out is not None:
+        out["not_installed_homes"] = left_out
     if not st["detected"]:
         return out
     if harness == "grok_bot":
