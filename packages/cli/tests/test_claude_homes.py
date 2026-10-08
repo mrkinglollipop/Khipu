@@ -248,9 +248,20 @@ class T3FactsTest(unittest.TestCase):
                    f"Provider context handoff. Thread: {THREAD}.\n\nUser message:\nhello")
         self.assertEqual(t3.strip_handoff(wrapped), "hello")
 
-    def test_a_nonheader_prefix_is_preserved(self):
-        prefixed = "\n\n" + handoff_wrapper("hello")
-        self.assertEqual(t3.strip_handoff(prefixed), prefixed)
+    def test_leading_whitespace_and_crlf_still_strip(self):
+        self.assertEqual(t3.strip_handoff("\n\n " + handoff_wrapper("hello")), "hello")
+        self.assertEqual(t3.strip_handoff(handoff_wrapper("hello").replace("\n", "\r\n")), "hello")
+
+    def test_prefer_last_keeps_a_quoting_item_out_of_the_query(self):
+        quoting = f"[Historical assistant; assistant_message; thread={THREAD}]\nformat: \n\nUser message:\nexample"
+        wrapped = (f"Context handoff (full_thread_summary):\n"
+                   f"Provider context handoff. Thread: {THREAD}.\n\n{quoting}\n\nUser message:\nreal ask")
+        self.assertEqual(t3.strip_handoff(wrapped, prefer_last=True), "real ask")
+        # capture keeps every typed word, even at the cost of the quoted tail
+        self.assertTrue(t3.strip_handoff(wrapped).endswith("\n\nUser message:\nreal ask"))
+        typed = "quoting a hand-over: \n\nUser message:\nnot me"
+        self.assertEqual(t3.strip_handoff(handoff_wrapper(typed)), typed)
+        self.assertEqual(t3.strip_handoff(handoff_wrapper(typed), prefer_last=True), "not me")
 
     def test_ordinary_text_and_unmarked_handoffs_come_back_unchanged(self):
         for text in ("fix the bug", "", "Context handoff mentioned mid-sentence",

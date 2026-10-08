@@ -389,6 +389,10 @@ def _claude_json_lock(path: Path):
             try:
                 owned = lock.stat()
             except OSError as e:
+                try:
+                    lock.rmdir()
+                except OSError:
+                    pass
                 raise ConfigUnreadable(f"{path} lock could not be read ({e})") from e
             break
         except FileExistsError:

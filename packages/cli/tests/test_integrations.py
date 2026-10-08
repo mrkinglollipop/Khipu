@@ -1231,6 +1231,22 @@ class ClaudeJsonLockTest(_ClaudeHomesCase):
         self.assertIn("khipu", json.loads(path.read_text())["mcpServers"])
         self.assertFalse(lock.exists())
 
+    def test_a_lock_that_cannot_be_read_back_is_not_left_behind(self):
+        path = self._config()
+        lock = Path(f"{path}.lock")
+        real_stat = Path.stat
+
+        def flaky(self_, *a, **k):
+            if self_ == lock:
+                raise OSError("stat failed")
+            return real_stat(self_, *a, **k)
+
+        with mock.patch.object(Path, "stat", flaky):
+            with self.assertRaises(integ.ConfigUnreadable):
+                with integ._claude_json_lock(path):
+                    pass
+        self.assertFalse(lock.exists())
+
     def test_owned_lock_releases_after_an_exception(self):
         path = self._config()
         with mock.patch.object(integ, "_write_json", side_effect=RuntimeError("disk")):

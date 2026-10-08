@@ -55,25 +55,31 @@ def is_helper_session(cwd: Any) -> bool:
     ) for parent in parents)
 
 
-def strip_handoff(text: str) -> str:
+def strip_handoff(text: str, *, prefer_last: bool = False) -> str:
     """The user's own words from a message that starts with T3's hand-over:
     everything after the first ``\\n\\nUser message:\\n`` following the last
     historical item (or the header when there are none). Anything else, and a
-    hand-over with no such marker, comes back unchanged."""
+    hand-over with no such marker, comes back unchanged.
+
+    The split is ambiguous only when the marker occurs more than once after
+    the last item: either the item's own text or the typed text quotes it.
+    The first marker never drops typed words (capture's choice); the last one
+    never leaks history into a search query (``prefer_last``, recall's)."""
     if not isinstance(text, str):
         return text
-    header, newline, rest = text.partition("\n")
+    norm = text.replace("\r\n", "\n").lstrip()
+    header, newline, rest = norm.partition("\n")
     provider, provider_newline, body = rest.partition("\n")
     if (not newline or not provider_newline
             or not re.fullmatch(r"Context handoff \([^)]+\):", header)
             or not provider.startswith("Provider context handoff. Thread: ")):
         return text
-    historical = [m.start() for m in re.finditer(r"(?m)^\[Historical ", text)]
+    historical = [m.start() for m in re.finditer(r"(?m)^\[Historical ", norm)]
     start = historical[-1] if historical else len(header) + len(newline) + len(provider)
-    marker_at = text.find(HANDOFF_USER_MARKER, start)
+    marker_at = (norm.rfind if prefer_last else norm.find)(HANDOFF_USER_MARKER, start)
     if marker_at >= 0:
-        return text[marker_at + len(HANDOFF_USER_MARKER):]
-    return "" if text.endswith(HANDOFF_USER_MARKER.rstrip("\n")) else text
+        return norm[marker_at + len(HANDOFF_USER_MARKER):]
+    return "" if norm.endswith(HANDOFF_USER_MARKER.rstrip("\n")) else text
 
 
 def claude_instances(settings_file: Path) -> list[dict[str, Any]]:
