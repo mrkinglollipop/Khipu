@@ -65,6 +65,17 @@ if os.environ.get("KHIPU_LIVE_TESTS") != "1":
     for _name in ("GEMINI_API_KEY", "VOYAGE_API_KEY", "GROK_HOOK_NAME", "GROK_HOOK_EVENT",
                   "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CONFIG_DIR"):
         os.environ.pop(_name, None)
+    # launchctl acts on this Mac's live jobs (bootstrap/bootout reload them),
+    # and a test that forgets to stub it reaches them. Shadow it on PATH for
+    # the whole run: it answers like an unknown service. Tests that need a
+    # result patch the call as before.
+    _SHIM_DIR = os.path.join(_HERMETIC_HOME, ".khipu-test-bin")
+    os.makedirs(_SHIM_DIR)
+    _shim = os.path.join(_SHIM_DIR, "launchctl")
+    with open(_shim, "w") as _fh:
+        _fh.write("#!/bin/sh\necho 'Could not find service (khipu test shim)' >&2\nexit 113\n")
+    os.chmod(_shim, 0o755)
+    os.environ["PATH"] = _SHIM_DIR + os.pathsep + os.environ.get("PATH", "")
 
 
 @pytest.fixture(autouse=True)
