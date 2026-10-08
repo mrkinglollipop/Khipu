@@ -18,8 +18,11 @@ a missing file, bad JSON or a changed shape is "nothing found", never an error.
 from __future__ import annotations
 
 import json
+import os
 import re
+import sqlite3
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +40,69 @@ CLAUDE_DRIVER = "claudeAgent"
 
 def settings_path(home: Path | None = None) -> Path:
     return (home if home is not None else Path.home()) / ".t3" / "userdata" / "settings.json"
+
+
+def handoff_thread(text: str) -> str | None:
+    """Read only the validated header, never quoted history."""
+    if not isinstance(text, str):
+        return None
+    lines = text.replace("\r\n", "\n").lstrip().split("\n", 2)
+    if len(lines) < 2 or not re.fullmatch(r"Context handoff \([^)]+\):", lines[0]):
+        return None
+    match = re.match(r"Provider context handoff\. Thread: (\S+?)\.(?:\s|$)", lines[1])
+    return match.group(1) if match else None
+
+
+def thread_for_session(sid: str) -> str | None:
+    """A bounded read of T3's provider projection; failures mean no mapping.
+
+    The connection timeout matches T3's WAL contract, but the busy handler
+    and VM deadline are tighter so a locked or large DB cannot stall a hook.
+    """
+    if not sid:
+        return None
+    path = Path(os.environ.get("KHIPU_T3_DB") or Path.home() / ".t3/userdata/statev2.sqlite")
+    con = None
+    try:
+        # With T3 closed there is no -wal file, and even a mode=ro open of a
+        # WAL database would create -wal/-shm beside it; immutable reads the
+        # file as is and leaves T3's folder untouched.
+        mode = "?mode=ro" if Path(f"{path}-wal").exists() else "?mode=ro&immutable=1"
+        con = sqlite3.connect(path.absolute().as_uri() + mode, uri=True, timeout=0.5)
+        con.execute("PRAGMA busy_timeout = 2")
+        deadline = time.monotonic() + 0.05
+        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        row = con.execute(
+            "SELECT thread_id FROM orchestration_v2_projection_provider_threads "
+            "WHERE CASE WHEN json_valid(payload_json) THEN "
+            "json_extract(payload_json, '$.nativeThreadRef.nativeId') END = ? "
+            "ORDER BY updated_at DESC LIMIT 1", (sid,),
+        ).fetchone()
+        return row[0] if row and isinstance(row[0], str) and row[0] else None
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+    finally:
+        if con is not None:
+            con.close()
+
+
+def cache_thread(st: dict, sid: str) -> str | None:
+    """Keep hits for the session; retry negative reads after five minutes.
+
+    A provider row can land after its first Stop. Negative caching must not
+    label that session as non-T3 forever, or retry sqlite on every Stop.
+    """
+    now = time.time()
+    if st.get("t3_lookup_session") == sid:
+        try:
+            age = now - float(st.get("t3_lookup_at") or 0)
+        except (TypeError, ValueError):
+            age = 300
+        if st.get("t3_thread_id") or age < 300:
+            return st.get("t3_thread_id")
+    thread = thread_for_session(sid)
+    st.update(t3_lookup_session=sid, t3_lookup_at=now, t3_thread_id=thread)
+    return thread
 
 
 def is_helper_session(cwd: Any) -> bool:

@@ -1708,6 +1708,7 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
                 "decisions": payload.get("decisions"),
                 "preferences": payload.get("preferences"),
                 "scope": payload.get("scope"),
+                "raw": payload,
                 # fix 9: identity columns ride the same incremental upsert so
                 # a just-captured episode is filterable by project/session_id/
                 # harness (fix 7) on the sqlite replica without waiting for
@@ -1964,16 +1965,18 @@ class _SearchFilters:
     """
 
     def __init__(self, *, project=None, since=None, until=None,
-                 session_id=None, harness=None):
+                 session_id=None, harness=None, t3_thread=None, via=None):
         from khipu.search_text import parse_time_filter
 
         self.project = (project or "").strip() or None
         self.session_id = (session_id or "").strip() or None
         self.harness = (harness or "").strip() or None
+        self.t3_thread = (t3_thread or "").strip() or None
+        self.via = (via or "").strip() or None
         self.since_dt = parse_time_filter(since) if since else None
         self.until_dt = parse_time_filter(until) if until else None
         self.time_filtered = self.since_dt is not None or self.until_dt is not None
-        self.episode_only = bool(self.project or self.session_id or self.harness)
+        self.episode_only = bool(self.project or self.session_id or self.harness or self.t3_thread or self.via)
         self.active = self.episode_only or self.time_filtered
         # Media rows have no timestamp anywhere to compare against, so a time
         # bound excludes them — exactly what the post-fusion pass does.
@@ -1990,6 +1993,10 @@ class _SearchFilters:
             out["kf_session"] = f"{_escape_like(self.session_id)}%"
         if self.harness:
             out["kf_harness"] = self.harness
+        if self.t3_thread:
+            out["kf_t3_thread"] = self.t3_thread
+        if self.via:
+            out["kf_via"] = self.via
         if self.since_dt is not None:
             out["kf_since"] = self.since_dt
         if self.until_dt is not None:
@@ -2009,6 +2016,10 @@ class _SearchFilters:
             split = f"split_part(COALESCE({a}session_id, ''), ':', 1)"
             expr = (f"COALESCE(NULLIF({a}harness, ''), {split})" if flags["harness"] else split)
             parts.append(f"{expr} = %(kf_harness)s")
+        if self.t3_thread:
+            parts.append(f"{a}raw->>'t3_thread_id' = %(kf_t3_thread)s")
+        if self.via:
+            parts.append(f"{a}raw->>'via' = %(kf_via)s")
         if self.since_dt is not None:
             parts.append(f"{a}ts >= %(kf_since)s")
         if self.until_dt is not None:
@@ -2048,6 +2059,8 @@ def _apply_search_filters(
     until: str | None = None,
     session_id: str | None = None,
     harness: str | None = None,
+    t3_thread: str | None = None,
+    via: str | None = None,
 ) -> list[dict[str, Any]]:
     """Post-fusion metadata filter + recency tiebreak, in one place for every
     mode (W2.3). project/session_id/harness only exist on episodes — a topic
@@ -2083,6 +2096,10 @@ def _apply_search_filters(
             select_cols += ", harness"
             harness_idx = extra_idx
             extra_idx += 1
+        thread_idx = via_idx = None
+        if t3_thread or via:
+            thread_idx, via_idx = extra_idx, extra_idx + 1
+            select_cols += ", raw->>'t3_thread_id', raw->>'via'"
         cur.execute(
             f"SELECT {select_cols} FROM episodes WHERE id::text = ANY(%s)",
             (episode_ids,),
@@ -2094,6 +2111,8 @@ def _apply_search_filters(
             meta[("episode", eid)] = {
                 "ts": ts, "session_id": sid, "project": proj or "", "deleted": deleted,
                 "harness": harness_col,
+                "t3_thread_id": row[thread_idx] if thread_idx is not None else None,
+                "via": row[via_idx] if via_idx is not None else None,
             }
     if topic_ids:
         # R6: status/project were never read by search before this — a
@@ -2126,7 +2145,7 @@ def _apply_search_filters(
         for nid, ts in cur.fetchall():
             meta[("node", nid)] = {"ts": ts}
 
-    want_episode_only = bool(project or session_id or harness)
+    want_episode_only = bool(project or session_id or harness or t3_thread or via)
     out: list[dict[str, Any]] = []
     for r in rows:
         k, rid = r.get("kind"), str(r.get("id"))
@@ -2144,6 +2163,10 @@ def _apply_search_filters(
                 row_harness = m.get("harness") or (m.get("session_id") or "").split(":", 1)[0]
                 if row_harness != harness:
                     continue
+        if t3_thread and m.get("t3_thread_id") != t3_thread:
+            continue
+        if via and m.get("via") != via:
+            continue
         ts = m.get("ts")
         if since_dt is not None and (ts is None or _aware(ts) < since_dt):
             continue
@@ -2300,6 +2323,8 @@ def hybrid_search(
     until: str | None = None,
     session_id: str | None = None,
     harness: str | None = None,
+    t3_thread: str | None = None,
+    via: str | None = None,
     project_boost: str | None = None,
     tz: str | None = None,
     source: str | None = None,
@@ -2401,7 +2426,7 @@ def hybrid_search(
     # pass keeps the same semantics as a safety net (audit 2026-09-04).
     filters = _SearchFilters(
         project=project, since=since, until=until,
-        session_id=session_id, harness=harness,
+        session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
     )
 
     degraded_legs: list[str] = []
@@ -2589,7 +2614,7 @@ def hybrid_search(
 
             fused = _apply_search_filters(
                 cur, fused, project=project, since=since, until=until,
-                session_id=session_id, harness=harness,
+                session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
             )
 
             # Absolute relevance gate: the list unchanged when any row is

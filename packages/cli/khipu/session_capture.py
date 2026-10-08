@@ -69,7 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from khipu.t3 import is_helper_session, strip_handoff
+from khipu.t3 import cache_thread, is_helper_session, strip_handoff
 
 HARNESSES = ("claude_code", "cursor", "codex", "aegis")
 
@@ -1276,6 +1276,7 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     parts = _window_parts(msgs, MAX_TRANSCRIPT)
     window_id = uuid.uuid4().hex if len(parts) > 1 else None
     queued_names: list[str] = []
+    thread = cache_thread(st, sid)
     for i, part in enumerate(parts, start=1):
         job = {"harness": harness, "session_id": sid, "cwd": cwd, "event": event,
                "ts": _mint_ts(), "turns": turns, "transcript": part["text"],
@@ -1288,6 +1289,8 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
         if window_id:
             job["window_id"] = window_id
             job["part"] = f"{i}/{len(parts)}"
+        if thread:
+            job.update(t3_thread_id=thread, via="t3")
         if capture_note:
             job["capture_note"] = capture_note
         p = enqueue(job)
@@ -1718,6 +1721,8 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         payload["repo_root"] = job.get("repo_root")
         payload["project"] = job.get("project")
         payload["parent_session_id"] = job.get("parent_session_id")
+        if job.get("t3_thread_id"):
+            payload.update(t3_thread_id=job["t3_thread_id"], via="t3")
         payload["transcript_range"] = job.get("transcript_range") or (
             f"{job.get('offset_before')}:{job.get('offset_after')}"
             if job.get("offset_before") is not None and job.get("offset_after") is not None

@@ -167,6 +167,14 @@ def _dedup_candidates(cur, payload: dict[str, Any]) -> list[dict[str, Any]]:
     group_col, group_val = ("project", project) if project else ("parent_session_id", parent)
     window_id = payload.get("window_id")
     exclude_sql, params = "", [group_val, ts, ts]
+    # Similar text in another T3 thread is a separate conversation. A merge
+    # across threads would discard the incoming capture's provenance.
+    thread = payload.get("t3_thread_id")
+    if thread:
+        exclude_sql += " AND raw->>'t3_thread_id' = %s"
+        params.append(thread)
+    else:
+        exclude_sql += " AND raw->>'t3_thread_id' IS NULL"
     if window_id:
         try:
             from khipu.db import has_columns
@@ -175,7 +183,7 @@ def _dedup_candidates(cur, payload: dict[str, Any]) -> list[dict[str, Any]]:
         except Exception:  # noqa: BLE001 — schema probe never blocks the write
             has_window_col = False
         if has_window_col:
-            exclude_sql = " AND window_id IS DISTINCT FROM %s"
+            exclude_sql += " AND window_id IS DISTINCT FROM %s"
             params.append(window_id)
     params.append(DEDUP_CANDIDATE_LIMIT)
     try:
@@ -742,6 +750,19 @@ def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
     if payload.get("scope") == "trivial":
         _log("scope=trivial — skipping per protocol")
         return 0
+
+    # Hook jobs already carry the cached mapping. Explicit CLI/MCP captures
+    # enter here without a job, and must retain the same thread provenance.
+    if not payload.get("t3_thread_id"):
+        from khipu.t3 import thread_for_session
+
+        sid = str(payload.get("session_id") or "")
+        prefix, separator, native = sid.partition(":")
+        if separator and prefix in {"claude_code", "codex", "cursor", "aegis"}:
+            sid = native
+        thread = thread_for_session(sid)
+        if thread:
+            payload.update(t3_thread_id=thread, via="t3")
 
     if mode == "legacy":
         _log("mode=legacy → capture_v2 only")

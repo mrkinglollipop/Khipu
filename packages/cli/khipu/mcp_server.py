@@ -193,7 +193,9 @@ TOOLS: list[dict] = [
             "semantic), "
             "project (matches episode project or scope), since/until (ISO date "
             "or relative like '7d'/'24h'), session_id (prefix match), harness "
-            "(prefix of session_id before the colon). Returns JSON rows of "
+            "(prefix of session_id before the colon), t3_thread (exact T3 thread id) "
+            "and via (exact capture origin, e.g. 't3'). T3/origin filters are "
+            "episode-only. Returns JSON rows of "
             "{kind, id, label, snippet, score, cosine, lexical_hits} plus "
             "additive paths (filesystem tokens) and neighbors (capped 1-hop "
             "wiki/path edges) on topic hits; a topic hit also carries status "
@@ -268,6 +270,14 @@ TOOLS: list[dict] = [
                 "harness": {
                     "type": "string",
                     "description": "Prefix of session_id before the colon, e.g. 'claude_code'",
+                },
+                "t3_thread": {
+                    "type": "string",
+                    "description": "Exact T3 thread id across providers and accounts (episodes only)",
+                },
+                "via": {
+                    "type": "string",
+                    "description": "Exact capture origin, e.g. 't3' (episodes only)",
                 },
                 "tz": {
                     "type": "string",
@@ -680,6 +690,8 @@ def _tool_search(args: dict) -> dict:
     until = args.get("until") or None
     session_id = args.get("session_id") or None
     harness = args.get("harness") or None
+    t3_thread = (args.get("t3_thread") or "").strip() or None
+    via = (args.get("via") or "").strip() or None
     tz = args.get("tz") or None
 
     try:
@@ -687,7 +699,7 @@ def _tool_search(args: dict) -> dict:
 
         payload = hybrid_search(
             query, limit=max(1, limit), mode=mode, kind=kind, project=project,
-            since=since, until=until, session_id=session_id, harness=harness,
+            since=since, until=until, session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
             tz=tz, source=source,
         )
     except Exception as exc:
@@ -700,12 +712,13 @@ def _tool_search(args: dict) -> dict:
         payload = search_stale_payload(
             query, max(1, limit), semantic=(mode == "semantic"), kind=kind,
             since=since, until=until, project=project, session_id=session_id,
-            harness=harness, tz=tz,
+            harness=harness, t3_thread=t3_thread, via=via, tz=tz,
         )
     query_log.log_query(
         query, mode=mode,
         filters={"kind": kind, "project": project, "since": since, "until": until,
-                 "session_id": session_id, "harness": harness, "source": source},
+                 "session_id": session_id, "harness": harness, "t3_thread": t3_thread,
+                 "via": via, "source": source},
         result_count=len(payload.get("results") or []), top=payload.get("results") or [],
         # The gateway host is public: it keeps a hash of the query, never the text.
         redact=_GATEWAY_ACTIVE or os.environ.get(GATEWAY_ACTIVE_ENV) == "1",

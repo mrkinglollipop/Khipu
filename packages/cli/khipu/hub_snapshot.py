@@ -1409,6 +1409,37 @@ def _parse_snapshot_ts(val: Any) -> datetime | None:
     return dt
 
 
+def _t3_snapshot_predicate(con, t3_thread: str | None, via: str | None) -> tuple[str, list[Any]]:
+    if not (t3_thread or via):
+        return "TRUE", []
+    if "raw" not in _snapshot_table_columns(con, "episodes"):
+        return "FALSE", []
+    clauses, params = [], []
+    for key, value in (("t3_thread_id", t3_thread), ("via", via)):
+        if value:
+            clauses.append(f"CASE WHEN json_valid(raw) THEN json_extract(raw, '$.{key}') END = ?")
+            params.append(value)
+    return " AND ".join(clauses), params
+
+
+def _filter_t3_snapshot_rows(con, rows, t3_thread, via):
+    """Recheck graph-expanded rows; graph neighbours need not share a thread."""
+    if not (t3_thread or via):
+        return rows
+    predicate, params = _t3_snapshot_predicate(con, t3_thread, via)
+    ids = [str(r["id"]) for r in rows if r.get("kind") == "episode" and not r.get("outbox")]
+    allowed = set()
+    if ids:
+        allowed = {str(r[0]) for r in con.execute(
+            f"SELECT id FROM episodes WHERE ({predicate}) "
+            f"AND CAST(id AS TEXT) IN ({','.join('?' for _ in ids)})", (*params, *ids),
+        )}
+    return [r for r in rows if r.get("kind") == "episode" and (
+        (r.get("outbox") and (not t3_thread or r.get("t3_thread_id") == t3_thread)
+         and (not via or r.get("via") == via))
+        or str(r["id"]) in allowed)]
+
+
 def search_snapshot(
     query: str,
     limit: int,
@@ -1419,6 +1450,8 @@ def search_snapshot(
     project: str | None = None,
     session_id: str | None = None,
     harness: str | None = None,
+    t3_thread: str | None = None,
+    via: str | None = None,
 ) -> list[dict[str, Any]]:
     """ILIKE-equivalent search over the sqlite replica (W2.3: honours at
     least kind/since/until when the hub is unreachable; fix 7 adds project/
@@ -1434,7 +1467,7 @@ def search_snapshot(
 
     if kind is not None and kind not in ("topic", "episode", "node"):
         raise ValueError("kind must be 'topic', 'episode', or 'node'")
-    want_episode_only = bool(project or session_id or harness)
+    want_episode_only = bool(project or session_id or harness or t3_thread or via)
     if want_episode_only:
         active_kinds = ["episode"] if kind in (None, "episode") else []
     else:
@@ -1541,16 +1574,21 @@ def search_snapshot(
         # A forgotten episode is a tombstone on the hub and must stay one on
         # the offline replica (audit 2026-09-04) — topics already did this.
         ep_live = "deleted_at IS NULL AND " if "deleted_at" in ep_cols else ""
+        t3_predicate, t3_params = _t3_snapshot_predicate(con, t3_thread, via)
         sql = f"""
             SELECT 'episode' AS kind, CAST(id AS TEXT) AS id, summary AS label,
                    summary AS snippet, ts, {session_expr} AS sid,
                    {project_expr} AS proj, {harness_expr} AS harn
             FROM episodes
-            WHERE {ep_live}({episode_where})
+            WHERE {ep_live}({episode_where}) AND ({t3_predicate})
             ORDER BY {episode_order}
             LIMIT ?
         """
-        rows = con.execute(sql, (*episode_params, oversample(episode_n))).fetchall()
+        # Token matching binds WHERE and ORDER BY separately; the thread
+        # predicate sits between them in SQL and must sit there in params too.
+        split_at = len(episode_params) // 2 if search_tokens(query) else len(episode_params)
+        rows = con.execute(sql, (*episode_params[:split_at], *t3_params,
+                                 *episode_params[split_at:], oversample(episode_n))).fetchall()
         for r in rows:
             if not _in_range(r[4]):
                 continue
@@ -1596,7 +1634,7 @@ def search_snapshot(
     return results
 
 
-def merge_outbox_episodes(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def merge_outbox_episodes(results: list[dict[str, Any]], *, t3_thread=None, via=None) -> list[dict[str, Any]]:
     from khipu.outbox import jobs
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
 
@@ -1606,6 +1644,10 @@ def merge_outbox_episodes(results: list[dict[str, Any]]) -> list[dict[str, Any]]
         try:
             job = json.loads(jp.read_text(encoding="utf-8"))
             payload = job.get("payload") or {}
+            if t3_thread and payload.get("t3_thread_id") != t3_thread:
+                continue
+            if via and payload.get("via") != via:
+                continue
             summary = (payload.get("summary") or "").strip()
             if not summary:
                 continue
@@ -1620,6 +1662,8 @@ def merge_outbox_episodes(results: list[dict[str, Any]]) -> list[dict[str, Any]]
                     "label": clip_snippet(summary, LABEL_LIMIT),
                     "snippet": clip_snippet(summary, SNIPPET_LIMIT),
                     "outbox": True,
+                    "t3_thread_id": payload.get("t3_thread_id"),
+                    "via": payload.get("via"),
                 }
             )
         except (OSError, ValueError, TypeError):
@@ -1985,6 +2029,8 @@ def semantic_search_snapshot(
     project: str | None = None,
     session_id: str | None = None,
     harness: str | None = None,
+    t3_thread: str | None = None,
+    via: str | None = None,
 ) -> list[dict[str, Any]]:
     """fix 7: project/session_id/harness, same episode-only semantics as
     ``search_snapshot`` — a topic/media hit is dropped outright when any of
@@ -2000,7 +2046,7 @@ def semantic_search_snapshot(
 
     since_dt = parse_time_filter(since) if since else None
     until_dt = parse_time_filter(until) if until else None
-    want_episode_only = bool(project or session_id or harness)
+    want_episode_only = bool(project or session_id or harness or t3_thread or via)
     cfg = show_models().get("embed") or {}
     vec = _embed_query_local(
         query,
@@ -2019,6 +2065,11 @@ def semantic_search_snapshot(
     if kind:
         kind_clause = " AND kind = ?"
         params.append(kind)
+    if t3_thread or via:
+        predicate, t3_params = _t3_snapshot_predicate(con, t3_thread, via)
+        kind_clause += (" AND kind = 'episode' AND ref IN "
+                        f"(SELECT CAST(id AS TEXT) FROM episodes WHERE {predicate})")
+        params.extend(t3_params)
     rows = con.execute(
         f"""
         SELECT kind, ref, chunk_idx, chunk_text, embedding
@@ -2413,6 +2464,8 @@ def search_stale_payload(
     project: str | None = None,
     session_id: str | None = None,
     harness: str | None = None,
+    t3_thread: str | None = None,
+    via: str | None = None,
     tz: str | None = None,
 ) -> dict[str, Any]:
     """Hub-unreachable search fallback (sqlite replica). Honours kind/since/
@@ -2433,9 +2486,11 @@ def search_stale_payload(
         results = semantic_search_snapshot(
             query, limit=limit, kind=kind, since=since, until=until,
             project=project, session_id=session_id, harness=harness,
+            t3_thread=t3_thread, via=via,
         )
         con = open_snapshot()
         results, degraded_legs = _graph_candidates_snapshot(con, results)
+        results = _filter_t3_snapshot_rows(con, results, t3_thread, via)
         results = enrich_search_results_snapshot(con, results)
         results = _annotate_snapshot_validity(con, results)
         out = {
@@ -2452,9 +2507,11 @@ def search_stale_payload(
     results = search_snapshot(
         query, limit, kind=kind, since=since, until=until,
         project=project, session_id=session_id, harness=harness,
+        t3_thread=t3_thread, via=via,
     )
-    results = merge_outbox_episodes(results)
+    results = merge_outbox_episodes(results, t3_thread=t3_thread, via=via)
     results, degraded_legs = _graph_candidates_snapshot(con, results)
+    results = _filter_t3_snapshot_rows(con, results, t3_thread, via)
     results = enrich_search_results_snapshot(con, results)
     results = _annotate_snapshot_validity(con, results)
     out = {
