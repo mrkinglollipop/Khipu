@@ -92,7 +92,7 @@ def test_wrapper_retries_only_pre_entry_startup_eintr(tmp_path, mode, exit_code,
 
 
 @pytest.mark.parametrize("fail_in_init", [False, True])
-def test_real_python_shim_marks_before_any_khipu_code(tmp_path, fail_in_init):
+def test_real_python_shim_marks_after_the_package_import(tmp_path, fail_in_init):
     package = tmp_path / "khipu"
     package.mkdir()
     failure = "raise InterruptedError(4, 'Interrupted system call')\n"
@@ -104,9 +104,15 @@ def test_real_python_shim_marks_before_any_khipu_code(tmp_path, fail_in_init):
     result = subprocess.run(launchd_gen._queue_drain_arguments(sys.executable),
                             env=env, cwd=tmp_path, capture_output=True, text=True, timeout=15)
     assert result.returncode == 1
-    assert result.stderr.count(launchd_gen._DRAIN_ATTEMPT) == 1
-    assert result.stderr.index(launchd_gen._DRAIN_STARTED) < result.stderr.index("Traceback")
     assert "InterruptedError: [Errno 4]" in result.stderr
+    if fail_in_init:
+        # Importing the package is still startup, so no boundary marker: a
+        # real EINTR there (raised inside importlib, so its frames show) is
+        # retried by the shell rules the fake-interpreter tests cover.
+        assert launchd_gen._DRAIN_STARTED not in result.stderr
+    else:
+        assert result.stderr.count(launchd_gen._DRAIN_ATTEMPT) == 1
+        assert result.stderr.index(launchd_gen._DRAIN_STARTED) < result.stderr.index("Traceback")
 
 
 @pytest.mark.parametrize("python,external", [
@@ -164,3 +170,23 @@ def test_refresh_reports_startup_failures_even_for_external_queue_job(tmp_path, 
     assert out["external"] == ["queue_drain"]
     assert out["startup_failures"]["queue_drain"]["count"] == 1
     assert launchd_gen.refresh_scheduled_jobs(["nightly"])["startup_failures"] == {}
+
+
+def test_terminated_run_keeps_its_error_output(tmp_path):
+    python = tmp_path / "python"
+    python.write_text("#!/bin/sh\nprintf 'drain progress line\\n' >&2\nexec sleep 30\n")
+    python.chmod(0o700)
+    env = dict(os.environ, TMPDIR=str(tmp_path))
+    proc = subprocess.Popen(launchd_gen._queue_drain_arguments(str(python)), env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
+    deadline = __import__("time").monotonic() + 10
+    while not list(tmp_path.glob("khipu-drain.*")) or not any(
+            p.stat().st_size for p in tmp_path.glob("khipu-drain.*")):
+        assert __import__("time").monotonic() < deadline
+        __import__("time").sleep(0.05)
+    os.killpg(proc.pid, 15)  # launchd stops the whole job group
+    _, err = proc.communicate(timeout=10)
+    assert proc.returncode == 143
+    assert "drain progress line" in err
+    assert list(tmp_path.glob("khipu-drain.*")) == []

@@ -60,10 +60,12 @@ _STARTUP_LOG_BYTES = 256 * 1024
 
 
 def _queue_drain_arguments(python: str) -> list[str]:
-    # Mark the boundary before importing ANY Khipu code, including __init__.
-    # runpy preserves the -m entry point and argv without a second interpreter.
+    # The EINTR comes from listing the checkout while importing, and the
+    # package import is still startup, so the boundary is after `import khipu`
+    # (its __init__ only sets the version). runpy preserves the -m entry point
+    # and argv without a second interpreter.
     shim = (
-        "import sys, runpy; "
+        "import sys, runpy, khipu; "
         f"sys.stderr.write({_DRAIN_STARTED + chr(10)!r}); sys.stderr.flush(); "
         "runpy.run_module('khipu', run_name='__main__', alter_sys=True)"
     )
@@ -74,9 +76,9 @@ python=$1
 shift
 err=$(mktemp "${{TMPDIR:-/tmp}}/khipu-drain.XXXXXX") || exit 1
 trap 'rm -f "$err"' 0
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'cat "$err" >&2; exit 129' HUP
+trap 'cat "$err" >&2; exit 130' INT
+trap 'cat "$err" >&2; exit 143' TERM
 attempt=1
 while :; do
     printf '%s%s\\n' {shlex.quote(_DRAIN_ATTEMPT)} "$attempt" >&2
