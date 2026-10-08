@@ -332,6 +332,16 @@ class LivenessTest(unittest.TestCase):
             self.assertIn("no real session", lv["note"])
             self.assertTrue(sc.liveness_all()["ok"])
 
+    def test_old_pending_turn_is_not_red_when_a_capture_landed_since(self):
+        # 2026-10-08: one Codex session left a turn pending for 65 min while
+        # other Codex sessions captured; the per-harness beat read it as stuck.
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - (sc.STUCK_MINUTES + 45) * 60))
+            self._beat("codex", pending_turns=1, pending_since=old, last_captured_at=sc._mint_ts())
+            self.assertTrue(sc.liveness("codex")["ok"])
+            self._beat("codex", pending_turns=1, pending_since=old, last_captured_at=old)
+            self.assertIn("cadence not firing", " ".join(sc.liveness("codex")["reasons"]))
+
     def test_hook_error_and_drain_error_and_stale_queue_and_stuck_cadence_are_red(self):
         with tempfile.TemporaryDirectory() as td, _home(td):
             now = sc._mint_ts()

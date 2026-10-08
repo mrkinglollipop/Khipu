@@ -1940,8 +1940,14 @@ def liveness(harness: str) -> dict:
     # The hook's own last run is the gate: no recent dispatch means nobody is
     # failing to decide, there is just nothing to decide about.
     hook_ran_recently = (_age(beat.get("at")) or 0) <= STUCK_MINUTES * 60
+    # The beat is per harness, not per session: one session's leftover turn
+    # keeps pending_since old while other sessions capture. A capture landing
+    # after pending_since is proof the cadence fires.
+    captured_since = since is not None and _age(beat.get("last_captured_at")) is not None \
+        and _age(beat.get("last_captured_at")) < since
     if hook_ran_recently and (
-        pend >= STUCK_TURNS or (pend >= 1 and since is not None and since >= STUCK_MINUTES * 60)
+        pend >= STUCK_TURNS
+        or (pend >= 1 and since is not None and since >= STUCK_MINUTES * 60 and not captured_since)
     ):
         reasons.append(f"{pend} turn(s) over {(since or 0) // 60} min without a capture being due — cadence not firing")
     # Has the harness been used since the hook last ran? The transcript is the
