@@ -199,10 +199,15 @@ def test_t3_health_uses_a_recent_wal_when_the_main_db_is_old(tmp_path, monkeypat
     con.commit()
     try:
         assert Path(f"{db}-wal").is_file()
-        before = {path.name: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()}
+        # -shm is SQLite's reader coordination file: any reader of a live WAL
+        # database, the per-hook thread lookup included, updates read marks
+        # there. The data files must not change.
+        def data_files():
+            return {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file() and not p.name.endswith("-shm")}
+
+        before = data_files()
         assert t3.health(tmp_path)["used_recently"] is True
-        after = {path.name: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()}
-        assert before == after
+        assert before == data_files()
     finally:
         con.close()
 

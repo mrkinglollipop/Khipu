@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import sqlite3
 import tempfile
 import time
@@ -107,54 +106,36 @@ def _lookup_health(path: Path) -> tuple[bool, str | None]:
     """
     if not path.is_file():
         return False, "T3's thread database was not found"
-    source_files = [path, Path(f"{path}-wal")]
+    con = None
     try:
-        before = [(item, item.stat().st_size, item.stat().st_mtime_ns) for item in source_files if item.is_file()]
-        with tempfile.TemporaryDirectory(prefix="khipu-t3-health-") as td:
-            staged = Path(td) / path.name
-            for item, _, _ in before:
-                suffix = "-wal" if item == Path(f"{path}-wal") else ""
-                shutil.copyfile(item, Path(f"{staged}{suffix}"))
-            after = [(item, item.stat().st_size, item.stat().st_mtime_ns) for item in source_files if item.is_file()]
-            if before != after:
-                return False, "T3's thread database changed while it was being checked"
-            con = None
-            try:
-                # SQLite may update shared-memory read marks even in mode=ro.
-                # Open a verified stable copy so health never writes beside
-                # T3's live database or WAL.
-                con = sqlite3.connect(_readonly_uri(staged), uri=True, timeout=0.5)
-                con.execute("PRAGMA busy_timeout = 2")
-                deadline = time.monotonic() + 0.05
-                con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
-                # Prepare the same column/order expression as
-                # ``thread_for_session`` before judging payload shape.
-                con.execute(
-                    "SELECT thread_id, payload_json, updated_at "
-                    "FROM orchestration_v2_projection_provider_threads "
-                    "ORDER BY updated_at DESC LIMIT 1"
-                ).fetchone()
-                count, compatible = con.execute(
-                    "SELECT COUNT(*), COUNT(CASE WHEN json_valid(payload_json) "
-                    "AND typeof(json_extract(payload_json, '$.nativeThreadRef.nativeId')) = 'text' "
-                    "AND json_extract(payload_json, '$.nativeThreadRef.nativeId') <> '' THEN 1 END) "
-                    "FROM orchestration_v2_projection_provider_threads"
-                ).fetchone()
-                if count and not compatible:
-                    return False, "T3's thread records changed shape (no native session ids found)"
-                return True, None
-            finally:
-                if con is not None:
-                    con.close()
+        # The same read-only open thread_for_session uses in every hook, so
+        # this checks the lookup Khipu really runs. No copy: T3's database is
+        # over a gigabyte. A doctor read gets a longer deadline than a hook.
+        con = sqlite3.connect(_readonly_uri(path), uri=True, timeout=0.5)
+        con.execute("PRAGMA busy_timeout = 50")
+        deadline = time.monotonic() + 0.5
+        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        rows = con.execute(
+            "SELECT thread_id, CASE WHEN json_valid(payload_json) THEN "
+            "json_extract(payload_json, '$.nativeThreadRef.nativeId') END "
+            "FROM orchestration_v2_projection_provider_threads "
+            "ORDER BY updated_at DESC LIMIT 20"
+        ).fetchall()
+        if rows and not any(isinstance(native, str) and native for _, native in rows):
+            return False, "T3's thread records changed shape (no native session ids found)"
+        return True, None
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).lower() or "no such column" in str(exc).lower():
             return False, "T3's thread records changed shape (table not found)"
         return False, "T3's thread lookup is unavailable"
     except (OSError, ValueError, sqlite3.Error):
         return False, "T3's thread lookup is unavailable"
+    finally:
+        if con is not None:
+            con.close()
 
 
-def _thread_linked_capture_evidence() -> tuple[str | None, str | None, int]:
+def _thread_linked_capture_evidence() -> tuple[str | None, str | None, int, bool]:
     """Newest stored capture explicitly stamped ``via:t3`` with a thread id.
 
     Doctor has already refreshed the local hub replica when the hub is
@@ -166,10 +147,10 @@ def _thread_linked_capture_evidence() -> tuple[str | None, str | None, int]:
 
         path = snapshot_path()
         if not path.is_file():
-            return None, None, 0
+            return None, None, 0, True
         con = sqlite3.connect(_readonly_uri(path), uri=True, timeout=0.1)
         try:
-            deadline = time.monotonic() + 0.05
+            deadline = time.monotonic() + 0.5
             con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
             cols = {str(row[1]) for row in con.execute("PRAGMA table_info(episodes)")}
             harness = "harness" if "harness" in cols else "NULL"
@@ -192,11 +173,14 @@ def _thread_linked_capture_evidence() -> tuple[str | None, str | None, int]:
                 str(row[0]) if row and row[0] else None,
                 str(row[1]) if row and row[1] else None,
                 int(count[0]) if count else 0,
+                True,
             )
         finally:
             con.close()
     except (ImportError, OSError, ValueError, sqlite3.Error):
-        return None, None, 0
+        # Unknown is not "none": a slow or unreadable replica must not raise
+        # the "used without a linked capture" warning.
+        return None, None, 0, False
 
 
 def _age_seconds(value: str | None) -> float | None:
@@ -229,10 +213,11 @@ def health(home: Path | None = None) -> dict[str, Any] | None:
     except OSError:
         activity_mtime = None
     activity_age = max(0.0, time.time() - activity_mtime) if activity_mtime is not None else None
-    last_capture_at, last_capture_harness, captures_today = _thread_linked_capture_evidence()
+    last_capture_at, last_capture_harness, captures_today, evidence_ok = _thread_linked_capture_evidence()
     last_capture_age = _age_seconds(last_capture_at)
     recent_without_capture = bool(
-        activity_age is not None
+        evidence_ok
+        and activity_age is not None
         and activity_age <= 86400
         and (last_capture_age is None or last_capture_age > 86400)
     )
