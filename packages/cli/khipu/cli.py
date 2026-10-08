@@ -3022,7 +3022,10 @@ def cmd_sessions(args: argparse.Namespace) -> int:
         lv = sc.liveness_all()
         print(json.dumps(lv, indent=2))
         return 0 if lv["ok"] else 2
-    out = sc.drain(limit=args.limit, dry_run=args.dry_run)
+    if args.aegis_cmd == "sweep":
+        print(json.dumps(sc.sweep_idle(limit=args.limit, dry_run=args.dry_run), indent=2))
+        return 0
+    out = sc.drain(limit=args.limit, dry_run=args.dry_run, sweep=True)
     print(json.dumps(out, indent=2))
     return 0 if out["failed"] == 0 else 2
 
@@ -4485,7 +4488,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name, help_ in (
         (
             "sessions",
-            "Native session capture (every harness): drain / status / liveness",
+            "Native session capture (every harness): drain / sweep / status / liveness",
         ),
         ("aegis", "Older name for `sessions`; same queue, same drain"),
     ):
@@ -4500,6 +4503,9 @@ def build_parser() -> argparse.ArgumentParser:
         dr.add_argument(
             "--dry-run", action="store_true", help="Extract and print; write nothing"
         )
+        sw = ag_sub.add_parser("sweep", help="Queue idle unread session windows")
+        sw.add_argument("--limit", type=int, default=25, help="Read at most N transcripts")
+        sw.add_argument("--dry-run", action="store_true", help="Report candidates without queueing or advancing state")
         stt = ag_sub.add_parser(
             "status",
             help="Per-harness liveness (default) or one harness's queue + last dispatch",

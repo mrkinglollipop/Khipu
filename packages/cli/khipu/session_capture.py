@@ -911,6 +911,11 @@ def _capture_candidates() -> list[dict]:
             continue
         if not isinstance(st, dict) or st.get("subagent") or "_agent_" in sid:
             continue
+        # A sweep saves capture progress, but only a hook establishes activity.
+        try:
+            mtime = float(st["seen_ts"]) if st.get("seen_ts") is not None else mtime
+        except (TypeError, ValueError):
+            continue
         out.append({"harness": harness, "sid": sid, "mtime": mtime, "state": st})
     return out
 
@@ -1200,6 +1205,63 @@ def _record_drain(harness: str, *, captured: bool, error: str | None = None, emp
     _write_beat(harness, beat)
 
 
+def _redact_messages(msgs: list[tuple[str, str]], harness: str, sid: str) -> list[tuple[str, str]]:
+    from khipu.redact import redact_secrets
+
+    total_redacted = 0
+    redacted_msgs: list[tuple[str, str]] = []
+    for role, mtext in msgs:
+        r, n = redact_secrets(mtext)
+        total_redacted += n
+        redacted_msgs.append((role, r))
+    if total_redacted:
+        _log(f"[{harness}] {sid} redacted {total_redacted} secret(s) before summarising")
+    return redacted_msgs
+
+
+def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: str,
+                    path: Path, st: dict, msgs: list[tuple[str, str]], new_off: int,
+                    turns: int, job_parent: str | None = None, capture_note: str = "") -> list[str]:
+    """Queue every part before advancing the shared capture offset."""
+    off_before = int(st.get("offset", 0))
+    # W1.2/W1.3: resolve identity from the cwd, not the model. Never
+    # raises (identity.resolve_repo_root is itself fail-open); this
+    # is the one extra bit of work the hook does before enqueueing,
+    # and it must stay cheap/sandbox-safe (only `git`, 3s timeout).
+    try:
+        from khipu.identity import resolve_repo_root
+
+        ident = resolve_repo_root(cwd)
+    except Exception:  # noqa: BLE001 — identity is best-effort, never fatal
+        ident = {"repo_root": None, "project": None, "is_worktree": False}
+    # K3: split on message boundaries instead of tail-clipping — every
+    # part is queued and extracted into its own episode.
+    parts = _window_parts(msgs, MAX_TRANSCRIPT)
+    window_id = uuid.uuid4().hex if len(parts) > 1 else None
+    queued_names: list[str] = []
+    for i, part in enumerate(parts, start=1):
+        job = {"harness": harness, "session_id": sid, "cwd": cwd, "event": event,
+               "ts": _mint_ts(), "turns": turns, "transcript": part["text"],
+               "transcript_path": str(path), "offset_before": off_before,
+               "offset_after": new_off,
+               "repo_root": ident.get("repo_root"), "project": ident.get("project"),
+               "parent_session_id": job_parent,
+               "transcript_range": f"{off_before}:{new_off}",
+               "truncated_chars": part["truncated_chars"]}
+        if window_id:
+            job["window_id"] = window_id
+            job["part"] = f"{i}/{len(parts)}"
+        if capture_note:
+            job["capture_note"] = capture_note
+        p = enqueue(job)
+        queued_names.append(p.name)
+    # Advance only after every part is on disk: a crash partway
+    # re-queues the same window (dedup at drain) rather than losing it.
+    st.update(offset=new_off, last_ts=time.time(), queued=int(st.get("queued", 0)) + len(queued_names))
+    save_state(harness, track_sid, st)
+    return queued_names
+
+
 # ---- hook entrypoint (SANDBOX-SAFE) ----------------------------------------------
 
 _SUBAGENTSTOP_SHAPE_LOGGED = "_subagentstop_shape_logged"
@@ -1292,15 +1354,7 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
         # DSN is masked here, per message, before the window is queued to disk.
         from khipu.redact import redact_secrets
 
-        total_redacted = 0
-        redacted_msgs: list[tuple[str, str]] = []
-        for role, mtext in msgs:
-            r, n = redact_secrets(mtext)
-            total_redacted += n
-            redacted_msgs.append((role, r))
-        msgs = redacted_msgs
-        if total_redacted:
-            _log(f"[{harness}] {sid} redacted {total_redacted} secret(s) before summarising")
+        msgs = _redact_messages(msgs, harness, sid)
         # K3: the full window, unclipped — decide() and the high-value scan see
         # everything; only the job-splitting step below ever bounds it.
         full_text = render(msgs, max_chars=10**9)
@@ -1326,6 +1380,9 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                   host_pids=ancestor_pids())
         if session_cwd(env):
             st["cwd"] = session_cwd(env)
+        st["session_id"] = track_sid if is_subagent_stop else sid
+        st["parent_session_id"] = sid if is_subagent_stop else (
+            parent_session_id(env, harness=harness, sid=sid) or None)
         if is_subagent_stop:
             st["subagent"] = True
         if not due and turns:
@@ -1335,48 +1392,17 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
             out["pending_since"] = datetime.fromtimestamp(last, tz=timezone.utc).isoformat(
                 timespec="seconds").replace("+00:00", "Z") if last else out["at"]
         if due:
-            off_before = int(st.get("offset", 0))
-            cwd = session_cwd(env)
-            # W1.2/W1.3: resolve identity from the cwd, not the model. Never
-            # raises (identity.resolve_repo_root is itself fail-open); this
-            # is the one extra bit of work the hook does before enqueueing,
-            # and it must stay cheap/sandbox-safe (only `git`, 3s timeout).
-            try:
-                from khipu.identity import resolve_repo_root
-
-                ident = resolve_repo_root(cwd)
-            except Exception:  # noqa: BLE001 — identity is best-effort, never fatal
-                ident = {"repo_root": None, "project": None, "is_worktree": False}
-            job_sid = track_sid if is_subagent_stop else sid
-            job_parent = sid if is_subagent_stop else (parent_session_id(env, harness=harness, sid=sid) or None)
-            # K3: split on message boundaries instead of tail-clipping — every
-            # part is queued and extracted into its own episode.
-            parts = _window_parts(msgs, MAX_TRANSCRIPT)
-            window_id = uuid.uuid4().hex if len(parts) > 1 else None
-            queued_names: list[str] = []
-            for i, part in enumerate(parts, start=1):
-                job = {"harness": harness, "session_id": job_sid, "cwd": cwd, "event": event,
-                       "ts": _mint_ts(), "turns": turns, "transcript": part["text"],
-                       "transcript_path": str(path), "offset_before": off_before,
-                       "offset_after": new_off,
-                       "repo_root": ident.get("repo_root"), "project": ident.get("project"),
-                       "parent_session_id": job_parent,
-                       "transcript_range": f"{off_before}:{new_off}",
-                       "truncated_chars": part["truncated_chars"]}
-                if window_id:
-                    job["window_id"] = window_id
-                    job["part"] = f"{i}/{len(parts)}"
-                if capture_note:
-                    job["capture_note"] = capture_note
-                p = enqueue(job)
-                queued_names.append(p.name)
-            # Advance only after every part is on disk: a crash partway
-            # re-queues the same window (dedup at drain) rather than losing it.
-            st.update(offset=new_off, last_ts=time.time(), queued=int(st.get("queued", 0)) + len(queued_names))
+            queued_names = _enqueue_window(
+                harness=harness, sid=track_sid if is_subagent_stop else sid, track_sid=track_sid,
+                cwd=session_cwd(env), event=event, path=path, st=st, msgs=msgs,
+                new_off=new_off, turns=turns, job_parent=st["parent_session_id"],
+                capture_note=capture_note,
+            )
             out["queued"] = queued_names[0] if len(queued_names) == 1 else queued_names
             _log(f"{harness}:{sid}: {event} due ({reason}) -> queued {len(queued_names)} part(s) "
                  f"({turns} turns, {len(full_text)} chars)")
-        save_state(harness, track_sid, st)
+        else:
+            save_state(harness, track_sid, st)
     except Exception as e:  # noqa: BLE001 — a hook must never fail a session
         out["error"] = f"{type(e).__name__}: {e}"
         _log(f"{harness}:{sid or '?'}: hook error {out['error']}")
@@ -1385,17 +1411,134 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
     return out
 
 
+SWEEP_LIMIT = 25
+SWEEP_TIMEOUT_S = 10
+
+
+def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
+               dry_run: bool = False) -> dict:
+    """Queue idle unread windows without impersonating a harness hook.
+
+    The limit bounds transcript reads, including windows too small to queue.
+    The time budget is checked between files and before enqueueing.
+    """
+    out = {"scanned": 0, "read": 0, "swept": 0, "jobs": 0, "skipped": {}, "dry_run": dry_run}
+
+    def skip(reason: str) -> None:
+        out["skipped"][reason] = out["skipped"].get(reason, 0) + 1
+
+    try:
+        now = time.time() if now is None else float(now)
+        limit = max(0, int(limit))
+        deadline = time.monotonic() + SWEEP_TIMEOUT_S
+        for f in state_dir().glob("*--*.json"):
+            if time.monotonic() >= deadline:
+                skip("time_budget")
+                break
+            out["scanned"] += 1
+            harness, _, track_sid = f.stem.partition("--")
+            if harness not in HARNESSES:
+                skip("unknown_harness")
+                continue
+            if f.name.endswith(".capture-now.json") or not track_sid:
+                skip("flag")
+                continue
+            try:
+                original = f.read_text(encoding="utf-8")
+                st = json.loads(original)
+                if not isinstance(st, dict):
+                    raise ValueError("session state is not an object")
+                if st.get("subagent") or "_agent_" in track_sid:
+                    skip("subagent")
+                    continue
+                if not st.get("transcript_path"):
+                    skip("no_transcript")
+                    continue
+                path = Path(st["transcript_path"])
+                try:
+                    info = path.stat()
+                except FileNotFoundError:
+                    skip("missing_transcript")
+                    continue
+                offset = int(st.get("offset", 0))
+                if offset >= info.st_size:
+                    skip("nothing_unread")
+                    continue
+                cwd = str(st.get("cwd") or "")
+                if is_helper_session(cwd):
+                    skip("helper")
+                    continue
+                seen = st.get("seen_ts")
+                if seen is None or now - float(seen) < MIN_MINUTES * 60 \
+                        or now - info.st_mtime < MIN_MINUTES * 60:
+                    skip("not_idle")
+                    continue
+                if float(st.get("last_ts") or 0) >= info.st_mtime:
+                    skip("already_captured")
+                    continue
+                if st.get("sweep_checked_mtime") == info.st_mtime:
+                    skip("unchanged")
+                    continue
+                if out["read"] >= limit:
+                    skip("limit")
+                    break
+                out["read"] += 1
+                msgs, new_off, turns = read_window(path, offset)
+                sid = str(st.get("session_id") or track_sid)
+                msgs = _redact_messages(msgs, harness, sid)
+                chars = len(render(msgs, max_chars=10**9))
+                # A concurrent hook or transcript writer owns its newer state.
+                latest = path.stat()
+                if (latest.st_mtime_ns, latest.st_size) != (info.st_mtime_ns, info.st_size) \
+                        or f.read_text(encoding="utf-8") != original:
+                    skip("changed")
+                    continue
+                if time.monotonic() >= deadline:
+                    skip("time_budget")
+                    break
+                st["sweep_checked_mtime"] = info.st_mtime
+                if turns < 1 or chars < MIN_CHARS:
+                    skip("nothing_new")
+                    if not dry_run:
+                        save_state(harness, track_sid, st)
+                    continue
+                if not dry_run:
+                    names = _enqueue_window(
+                        harness=harness, sid=sid, track_sid=track_sid, cwd=cwd,
+                        event="idle_sweep", path=path, st=st, msgs=msgs,
+                        new_off=new_off, turns=turns, job_parent=st.get("parent_session_id"),
+                    )
+                    out["jobs"] += len(names)
+                    _log(f"sweep {harness}:{sid}: queued {len(names)} part(s) "
+                         f"({turns} turns, {chars} chars)")
+                out["swept"] += 1
+            except Exception as exc:  # noqa: BLE001 — one broken state cannot stop the sweep
+                skip("error")
+                _log(f"sweep: skipped {f.name}: {type(exc).__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001 — the backstop must not block the drainer
+        skip("error")
+        _log(f"sweep: {type(exc).__name__}: {exc}")
+    if out["swept"] or os.environ.get("KHIPU_SWEEP_VERBOSE") == "1":
+        _log(f"sweep summary: {json.dumps(out, sort_keys=True)}")
+    return out
+
+
 # ---- drain (RUNS OUTSIDE ANY SANDBOX) -------------------------------------------
 
-def drain(*, limit: int | None = None, dry_run: bool = False) -> dict:
+def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = False) -> dict:
     """Turn queued jobs into episodes. Safe to call from anywhere unsandboxed —
     the harnesses' Stop hooks, the nightly, the app, the CLI. A job is removed
-    only once its episode is captured; anything else leaves it queued."""
+    only once its episode is captured; anything else leaves it queued.
+    Only scheduled/manual callers opt into the idle sweep; hooks stay cheap.
+    """
+    sweep_out = sweep_idle(dry_run=dry_run) if sweep else None
     reclaimed = _reclaim_stale()
     jobs = queued_jobs()
     if limit is not None:
         jobs = jobs[:limit]
     out = {"jobs": len(jobs), "captured": 0, "empty": 0, "failed": 0, "skipped_claimed": 0}
+    if sweep_out is not None:
+        out["sweep"] = sweep_out
     if reclaimed:
         out["reclaimed_stale"] = reclaimed
     if not jobs:

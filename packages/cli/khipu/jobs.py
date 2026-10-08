@@ -317,6 +317,7 @@ def _record_nightly_step(
 
 def run_nightly() -> int:
     steps: list[dict[str, Any]] = []
+    _record_nightly_step(steps, "sessions_drain", **_step_result(_drain_sessions()))
     rc = _run_script(
         CONSOLIDATE_NIGHTLY, log_stem="khipu-nightly", state_name="nightly"
     )
@@ -330,6 +331,16 @@ def run_nightly() -> int:
     if briefs_result is not None:
         _record_nightly_step(steps, "briefs_build", **_step_result(briefs_result))
     return rc
+
+
+def _drain_sessions() -> dict[str, Any]:
+    try:
+        from khipu.session_capture import drain
+
+        out = drain(sweep=True)
+        return {"ok": out["failed"] == 0, **out}
+    except Exception as exc:  # noqa: BLE001 — capture failure cannot block consolidation
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 # Each brief is one request to the synth provider, so a first run over every

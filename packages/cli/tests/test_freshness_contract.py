@@ -282,6 +282,7 @@ class NightlyLastJsonContractTest(unittest.TestCase):
                     mock.patch.object(jobs, "_log_paths", return_value=(
                         Path(log_td) / "out.log", Path(log_td) / "err.log")), \
                     mock.patch.object(jobs.subprocess, "run", side_effect=_run), \
+                    mock.patch("khipu.session_capture.drain", return_value={"failed": 0}), \
                     mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                     mock.patch("khipu.embed.backfill", return_value={"embedded": 0}), \
                     mock.patch("khipu.embed.prune_query_cache", return_value=0), \
@@ -292,7 +293,7 @@ class NightlyLastJsonContractTest(unittest.TestCase):
         names = {s["name"] for s in payload["steps"]}
         self.assertEqual(
             names,
-            {"consolidate_nightly", "notes_reconcile", "embed_backfill",
+            {"sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
              "query_cache_prune", "commitments_mark_stale", "commitments_hygiene"},
         )
         for step in payload["steps"]:
