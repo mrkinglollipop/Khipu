@@ -64,6 +64,7 @@ import sys
 import time
 import urllib.parse
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -96,8 +97,8 @@ QUEUE_STALE_S = 30 * 60
 # plausible single turn (an agentic turn can run over an hour) — this is a
 # stopped-hook detector, not a latency alarm.
 HOOK_SILENT_S = int(_env_int("KHIPU_CAPTURE_HOOK_SILENT_MIN", "KHIPU_AEGIS_HOOK_SILENT_MIN", "120")) * 60
-# Per-session state files are never pruned, so cap how many the activity scan
-# reads on each `khipu doctor`; the live session is always among the newest.
+# Per-session state files are never pruned, so cap transcript reads on each
+# `khipu doctor` by the hook's own recency stamp.
 ACTIVITY_SCAN_LIMIT = 20              # a job this old means the drain is not landing
 
 
@@ -780,12 +781,47 @@ def load_state(harness: str, sid: str) -> dict:
         return {"offset": 0, "last_ts": 0.0, "captures": 0}
 
 
-def save_state(harness: str, sid: str, st: dict) -> None:
+def save_state(harness: str, sid: str, st: dict, *, preserve_mtime: bool = False) -> None:
     p = _state_file(harness, sid)
     p.parent.mkdir(parents=True, exist_ok=True)
+    previous = p.stat() if preserve_mtime else None
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(st), encoding="utf-8")
     os.replace(tmp, p)
+    if previous is not None:
+        os.utime(p, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+
+
+@contextmanager
+def _state_lock(harness: str, sid: str):
+    """Serialize offset writers without delaying a harness Stop."""
+    lock = _state_file(harness, sid).with_suffix(".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    acquired = None
+    try:
+        for _ in range(2):
+            try:
+                lock.mkdir()
+                acquired = lock.stat()
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - lock.stat().st_mtime <= 60:
+                        break
+                    lock.rmdir()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    break
+        yield acquired is not None
+    finally:
+        if acquired is not None:
+            try:
+                current = lock.stat()
+                if (current.st_dev, current.st_ino) == (acquired.st_dev, acquired.st_ino):
+                    lock.rmdir()
+            except FileNotFoundError:
+                pass
 
 
 # ---- capture now (K1) ------------------------------------------------------------
@@ -1221,7 +1257,8 @@ def _redact_messages(msgs: list[tuple[str, str]], harness: str, sid: str) -> lis
 
 def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: str,
                     path: Path, st: dict, msgs: list[tuple[str, str]], new_off: int,
-                    turns: int, job_parent: str | None = None, capture_note: str = "") -> list[str]:
+                    turns: int, job_parent: str | None = None, capture_note: str = "",
+                    preserve_mtime: bool = False) -> list[str]:
     """Queue every part before advancing the shared capture offset."""
     off_before = int(st.get("offset", 0))
     # W1.2/W1.3: resolve identity from the cwd, not the model. Never
@@ -1258,7 +1295,7 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     # Advance only after every part is on disk: a crash partway
     # re-queues the same window (dedup at drain) rather than losing it.
     st.update(offset=new_off, last_ts=time.time(), queued=int(st.get("queued", 0)) + len(queued_names))
-    save_state(harness, track_sid, st)
+    save_state(harness, track_sid, st, preserve_mtime=preserve_mtime)
     return queued_names
 
 
@@ -1336,73 +1373,77 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
             if event in ("stop", "sessionend"):
                 out["transcript_missing"] = True
             return out
-        first_sight = not _state_file(harness, track_sid).exists()
-        if first_sight:
-            # Start the elapsed clock now, so a one-question session does not
-            # become an episode on its first Stop. PreCompact/SessionEnd still do.
-            # A transcript that is already large (an in-flight session at install
-            # time) is joined near its end: the job carries a bounded tail anyway.
-            try:
-                start = max(0, path.stat().st_size - FIRST_SIGHT_TAIL)
-            except OSError:
-                start = 0
-            save_state(harness, track_sid, {"offset": start, "last_ts": time.time(), "captures": 0,
-                                             "transcript_path": str(path)})
-        st = load_state(harness, track_sid)
-        msgs, new_off, turns = read_window(path, int(st.get("offset", 0)))
-        # Secrets never reach the summariser: a pasted key or a password in a
-        # DSN is masked here, per message, before the window is queued to disk.
-        from khipu.redact import redact_secrets
+        with _state_lock(harness, track_sid) as acquired:
+            if not acquired:
+                out["reason"] = "locked"
+                return out
+            first_sight = not _state_file(harness, track_sid).exists()
+            if first_sight:
+                # Start the elapsed clock now, so a one-question session does not
+                # become an episode on its first Stop. PreCompact/SessionEnd still do.
+                # A transcript that is already large (an in-flight session at install
+                # time) is joined near its end: the job carries a bounded tail anyway.
+                try:
+                    start = max(0, path.stat().st_size - FIRST_SIGHT_TAIL)
+                except OSError:
+                    start = 0
+                save_state(harness, track_sid, {"offset": start, "last_ts": time.time(), "captures": 0,
+                                                 "transcript_path": str(path)})
+            st = load_state(harness, track_sid)
+            msgs, new_off, turns = read_window(path, int(st.get("offset", 0)))
+            # Secrets never reach the summariser: a pasted key or a password in a
+            # DSN is masked here, per message, before the window is queued to disk.
+            from khipu.redact import redact_secrets
 
-        msgs = _redact_messages(msgs, harness, sid)
-        # K3: the full window, unclipped — decide() and the high-value scan see
-        # everything; only the job-splitting step below ever bounds it.
-        full_text = render(msgs, max_chars=10**9)
-        capture_now = _consume_capture_now(harness, track_sid)
-        capture_note = ""
-        if capture_now:
-            capture_note, note_redacted = redact_secrets(str(capture_now.get("note") or ""))
-            if note_redacted:
-                _log(f"[{harness}] {sid} redacted {note_redacted} secret(s) from a capture-now note")
-        due, reason = decide(
-            "stop" if is_subagent_stop else event,
-            user_turns=turns, chars=len(full_text),
-            elapsed_s=time.time() - float(st.get("last_ts") or 0),
-            stop_hook_active=bool(_get(env, "stopHookActive", "stop_hook_active", default=False)),
-            window_text=full_text, capture_requested=capture_now is not None,
-        )
-        out.update(due=due, reason=reason, new_turns=turns, new_chars=len(full_text))
-        # Where the hook's parse reached, and when — liveness compares the
-        # transcript against THIS, not its mtime: Aegis writes housekeeping
-        # (workflow_updated) into idle sessions' updates.jsonl, so mtime moves
-        # with no turn in it (2026-08-24 false red).
-        st.update(seen_end=new_off, seen_ts=time.time(), transcript_path=str(path),
-                  host_pids=ancestor_pids())
-        if session_cwd(env):
-            st["cwd"] = session_cwd(env)
-        st["session_id"] = track_sid if is_subagent_stop else sid
-        st["parent_session_id"] = sid if is_subagent_stop else (
-            parent_session_id(env, harness=harness, sid=sid) or None)
-        if is_subagent_stop:
-            st["subagent"] = True
-        if not due and turns:
-            # When this session's uncaptured window began (its last capture, or
-            # first sight) — liveness ages pending turns from here.
-            last = float(st.get("last_ts") or 0)
-            out["pending_since"] = datetime.fromtimestamp(last, tz=timezone.utc).isoformat(
-                timespec="seconds").replace("+00:00", "Z") if last else out["at"]
-        if due:
-            queued_names = _enqueue_window(
-                harness=harness, sid=track_sid if is_subagent_stop else sid, track_sid=track_sid,
-                cwd=session_cwd(env), event=event, path=path, st=st, msgs=msgs,
-                new_off=new_off, turns=turns, job_parent=st["parent_session_id"],
-                capture_note=capture_note,
+            msgs = _redact_messages(msgs, harness, sid)
+            # K3: the full window, unclipped — decide() and the high-value scan see
+            # everything; only the job-splitting step below ever bounds it.
+            full_text = render(msgs, max_chars=10**9)
+            capture_now = _consume_capture_now(harness, track_sid)
+            capture_note = ""
+            if capture_now:
+                capture_note, note_redacted = redact_secrets(str(capture_now.get("note") or ""))
+                if note_redacted:
+                    _log(f"[{harness}] {sid} redacted {note_redacted} secret(s) from a capture-now note")
+            due, reason = decide(
+                "stop" if is_subagent_stop else event,
+                user_turns=turns, chars=len(full_text),
+                elapsed_s=time.time() - float(st.get("last_ts") or 0),
+                stop_hook_active=bool(_get(env, "stopHookActive", "stop_hook_active", default=False)),
+                window_text=full_text, capture_requested=capture_now is not None,
             )
-            out["queued"] = queued_names[0] if len(queued_names) == 1 else queued_names
-            _log(f"{harness}:{sid}: {event} due ({reason}) -> queued {len(queued_names)} part(s) "
-                 f"({turns} turns, {len(full_text)} chars)")
-        else:
-            save_state(harness, track_sid, st)
+            out.update(due=due, reason=reason, new_turns=turns, new_chars=len(full_text))
+            # Where the hook's parse reached, and when — liveness compares the
+            # transcript against THIS, not its mtime: Aegis writes housekeeping
+            # (workflow_updated) into idle sessions' updates.jsonl, so mtime moves
+            # with no turn in it (2026-08-24 false red).
+            st.update(seen_end=new_off, seen_ts=time.time(), transcript_path=str(path),
+                      host_pids=ancestor_pids())
+            if session_cwd(env):
+                st["cwd"] = session_cwd(env)
+            st["session_id"] = track_sid if is_subagent_stop else sid
+            st["parent_session_id"] = sid if is_subagent_stop else (
+                parent_session_id(env, harness=harness, sid=sid) or None)
+            if is_subagent_stop:
+                st["subagent"] = True
+            if not due and turns:
+                # When this session's uncaptured window began (its last capture, or
+                # first sight) — liveness ages pending turns from here.
+                last = float(st.get("last_ts") or 0)
+                out["pending_since"] = datetime.fromtimestamp(last, tz=timezone.utc).isoformat(
+                    timespec="seconds").replace("+00:00", "Z") if last else out["at"]
+            if due:
+                queued_names = _enqueue_window(
+                    harness=harness, sid=track_sid if is_subagent_stop else sid, track_sid=track_sid,
+                    cwd=session_cwd(env), event=event, path=path, st=st, msgs=msgs,
+                    new_off=new_off, turns=turns, job_parent=st["parent_session_id"],
+                    capture_note=capture_note,
+                )
+                out["queued"] = queued_names[0] if len(queued_names) == 1 else queued_names
+                _log(f"{harness}:{sid}: {event} due ({reason}) -> queued {len(queued_names)} part(s) "
+                     f"({turns} turns, {len(full_text)} chars)")
+            else:
+                save_state(harness, track_sid, st)
     except Exception as e:  # noqa: BLE001 — a hook must never fail a session
         out["error"] = f"{type(e).__name__}: {e}"
         _log(f"{harness}:{sid or '?'}: hook error {out['error']}")
@@ -1423,15 +1464,26 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
     The time budget is checked between files and before enqueueing.
     """
     out = {"scanned": 0, "read": 0, "swept": 0, "jobs": 0, "skipped": {}, "dry_run": dry_run}
+    if dry_run:
+        out["sessions"] = []
 
     def skip(reason: str) -> None:
         out["skipped"][reason] = out["skipped"].get(reason, 0) + 1
+
+    def transcript_mtime(f: Path) -> float:
+        try:
+            st = json.loads(f.read_text(encoding="utf-8"))
+            return Path(st["transcript_path"]).stat().st_mtime
+        except (OSError, ValueError, TypeError, KeyError):
+            return 0.0
 
     try:
         now = time.time() if now is None else float(now)
         limit = max(0, int(limit))
         deadline = time.monotonic() + SWEEP_TIMEOUT_S
-        for f in state_dir().glob("*--*.json"):
+        files = sorted(state_dir().glob("*--*.json"),
+                       key=lambda f: (-transcript_mtime(f), f.name))
+        for f in files:
             if time.monotonic() >= deadline:
                 skip("time_budget")
                 break
@@ -1443,11 +1495,21 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
             if f.name.endswith(".capture-now.json") or not track_sid:
                 skip("flag")
                 continue
+            # A malformed state cannot safely carry its own retry stamp.
+            error_file = f.with_suffix(".sweep-error")
             try:
-                original = f.read_text(encoding="utf-8")
-                st = json.loads(original)
+                if now - float(error_file.read_text()) < 3600:
+                    skip("error_cached")
+                    continue
+            except (OSError, ValueError):
+                pass
+            try:
+                st = json.loads(f.read_text(encoding="utf-8"))
                 if not isinstance(st, dict):
                     raise ValueError("session state is not an object")
+                if st.get("sweep_error") is not None and now - float(st["sweep_error"]) < 3600:
+                    skip("error_cached")
+                    continue
                 if st.get("subagent") or "_agent_" in track_sid:
                     skip("subagent")
                     continue
@@ -1482,38 +1544,73 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                 if out["read"] >= limit:
                     skip("limit")
                     break
-                out["read"] += 1
-                msgs, new_off, turns = read_window(path, offset)
-                sid = str(st.get("session_id") or track_sid)
-                msgs = _redact_messages(msgs, harness, sid)
-                chars = len(render(msgs, max_chars=10**9))
-                # A concurrent hook or transcript writer owns its newer state.
-                latest = path.stat()
-                if (latest.st_mtime_ns, latest.st_size) != (info.st_mtime_ns, info.st_size) \
-                        or f.read_text(encoding="utf-8") != original:
-                    skip("changed")
-                    continue
-                if time.monotonic() >= deadline:
-                    skip("time_budget")
-                    break
-                st["sweep_checked_mtime"] = info.st_mtime
-                if turns < 1 or chars < MIN_CHARS:
-                    skip("nothing_new")
-                    if not dry_run:
-                        save_state(harness, track_sid, st)
-                    continue
-                if not dry_run:
-                    names = _enqueue_window(
-                        harness=harness, sid=sid, track_sid=track_sid, cwd=cwd,
-                        event="idle_sweep", path=path, st=st, msgs=msgs,
-                        new_off=new_off, turns=turns, job_parent=st.get("parent_session_id"),
-                    )
-                    out["jobs"] += len(names)
-                    _log(f"sweep {harness}:{sid}: queued {len(names)} part(s) "
-                         f"({turns} turns, {chars} chars)")
-                out["swept"] += 1
+                with _state_lock(harness, track_sid) as acquired:
+                    if not acquired:
+                        skip("locked")
+                        continue
+                    latest_state = load_state(harness, track_sid)
+                    if latest_state.get("offset") != st.get("offset") \
+                            or latest_state.get("seen_ts") != seen:
+                        skip("changed")
+                        continue
+                    st = latest_state
+                    if st.get("sweep_error") is not None and now - float(st["sweep_error"]) < 3600:
+                        skip("error_cached")
+                        continue
+                    if st.get("sweep_checked_mtime") == info.st_mtime:
+                        skip("unchanged")
+                        continue
+                    try:
+                        out["read"] += 1
+                        msgs, new_off, turns = read_window(path, offset)
+                        sid = str(st.get("session_id") or track_sid)
+                        msgs = _redact_messages(msgs, harness, sid)
+                        chars = len(render(msgs, max_chars=10**9))
+                        latest = path.stat()
+                        if (latest.st_mtime_ns, latest.st_size) != (info.st_mtime_ns, info.st_size) \
+                                or load_state(harness, track_sid) != st:
+                            skip("changed")
+                            continue
+                        if time.monotonic() >= deadline:
+                            skip("time_budget")
+                            break
+                        st.pop("sweep_error", None)
+                        st["sweep_checked_mtime"] = info.st_mtime
+                        if turns < 1 or chars < MIN_CHARS:
+                            skip("nothing_new")
+                            if not dry_run:
+                                save_state(harness, track_sid, st, preserve_mtime=True)
+                            continue
+                        if dry_run:
+                            out["sessions"].append({
+                                "harness": harness, "session_id": sid, "unread_turns": turns,
+                                "unread_chars": chars,
+                                "idle_minutes": (now - max(float(seen), info.st_mtime)) / 60,
+                            })
+                        else:
+                            names = _enqueue_window(
+                                harness=harness, sid=sid, track_sid=track_sid, cwd=cwd,
+                                event="idle_sweep", path=path, st=st, msgs=msgs,
+                                new_off=new_off, turns=turns, job_parent=st.get("parent_session_id"),
+                                preserve_mtime=True,
+                            )
+                            out["jobs"] += len(names)
+                            _log(f"sweep {harness}:{sid}: queued {len(names)} part(s) "
+                                 f"({turns} turns, {chars} chars)")
+                        out["swept"] += 1
+                    except Exception:
+                        if not dry_run:
+                            latest_state = load_state(harness, track_sid)
+                            latest_state["sweep_error"] = now
+                            save_state(harness, track_sid, latest_state, preserve_mtime=True)
+                        raise
             except Exception as exc:  # noqa: BLE001 — one broken state cannot stop the sweep
                 skip("error")
+                if not dry_run:
+                    try:
+                        error_file.write_text(str(now), encoding="utf-8")
+                    except OSError:
+                        pass
                 _log(f"sweep: skipped {f.name}: {type(exc).__name__}: {exc}")
     except Exception as exc:  # noqa: BLE001 — the backstop must not block the drainer
         skip("error")
@@ -1525,12 +1622,15 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
 
 # ---- drain (RUNS OUTSIDE ANY SANDBOX) -------------------------------------------
 
-def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = False) -> dict:
+def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = False,
+          time_budget_s: float | None = None) -> dict:
     """Turn queued jobs into episodes. Safe to call from anywhere unsandboxed —
     the harnesses' Stop hooks, the nightly, the app, the CLI. A job is removed
     only once its episode is captured; anything else leaves it queued.
     Only scheduled/manual callers opt into the idle sweep; hooks stay cheap.
     """
+    # In-flight provider calls finish normally; the budget bounds starting more jobs.
+    deadline = time.monotonic() + max(0, time_budget_s) if time_budget_s is not None else None
     sweep_out = sweep_idle(dry_run=dry_run) if sweep else None
     reclaimed = _reclaim_stale()
     jobs = queued_jobs()
@@ -1549,6 +1649,9 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
 
     mode = capture_mode()
     for original in jobs:
+        if deadline is not None and time.monotonic() >= deadline:
+            out["time_budget_exhausted"] = True
+            break
         jp = _claim(original)
         if jp is None:                       # another drain got it first
             out["skipped_claimed"] += 1
@@ -1649,7 +1752,9 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         out["captured"] += 1
         _record_drain(harness, captured=True)
         _log(f"drain: captured {original.name} -> {payload['summary'][:90]!r}")
-    if out["captured"] and not dry_run:
+    if deadline is not None and time.monotonic() >= deadline:
+        out["time_budget_exhausted"] = True
+    if out["captured"] and not dry_run and not out.get("time_budget_exhausted"):
         # Phase 2, session B: "corrections made elsewhere" — a supersession
         # made on a DIFFERENT machine reaches THIS machine's local replica
         # here, piggybacking on a drain that already talked to the hub for
@@ -1716,24 +1821,22 @@ def _stopped_hook_evidence(harness: str) -> tuple[str | None, int | None]:
     "transcript changed 1176 min after the hook last ran" and went red
     instantly — before any Stop event could possibly have fired. The second
     half (``now - mtime``) is what says a Stop was actually due and missing."""
+    states = []
     try:
-        files = list(state_dir().glob(f"{_safe(harness)}--*.json"))
+        for f in state_dir().glob(f"{_safe(harness)}--*.json"):
+            try:
+                st = json.loads(f.read_text(encoding="utf-8"))
+                seen = float(st.get("seen_ts") or 0)
+                states.append((seen, st))
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
     except OSError:
         return None, None
-    if len(files) > ACTIVITY_SCAN_LIMIT:
-        try:
-            files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-        except OSError:
-            pass
-        files = files[:ACTIVITY_SCAN_LIMIT]
+    states.sort(key=lambda item: item[0], reverse=True)
     worst: tuple[int, str, int] | None = None
     newer_s: int | None = None
     now = time.time()
-    for f in files:
-        try:
-            st = json.loads(f.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
+    for _, st in states[:ACTIVITY_SCAN_LIMIT]:
         tp, seen_ts = st.get("transcript_path"), st.get("seen_ts")
         if not tp or not seen_ts:
             continue

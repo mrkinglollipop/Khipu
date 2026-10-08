@@ -7,6 +7,7 @@ import os
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -225,7 +226,8 @@ class IdleSweepTest(unittest.TestCase):
         self.assertEqual(out["skipped"], {"error": 1})
         self.assertEqual(sc.load_state("codex", "s1")["offset"], 0)
         self.assertNotIn("sweep_checked_mtime", sc.load_state("codex", "s1"))
-        self.assertEqual(sc.sweep_idle(now=self.now)["swept"], 1)
+        self.assertEqual(sc.sweep_idle(now=self.now)["skipped"], {"error_cached": 1})
+        self.assertEqual(sc.sweep_idle(now=self.now + 3601)["swept"], 1)
 
     def test_noop_summary_is_logged_only_when_verbose(self):
         with mock.patch.object(sc, "_log") as log:
@@ -288,9 +290,203 @@ class IdleSweepTest(unittest.TestCase):
         drain.assert_called_once_with(limit=None, dry_run=False, sweep=True)
         with mock.patch.object(sc, "drain", return_value=out) as drain:
             self.assertTrue(jobs._drain_sessions()["ok"])
-        drain.assert_called_once_with(sweep=True)
+        drain.assert_called_once_with(sweep=True, limit=200, time_budget_s=300)
         with mock.patch.object(sc, "drain", side_effect=RuntimeError("offline")):
             self.assertEqual(jobs._drain_sessions(), {"ok": False, "error": "RuntimeError: offline"})
+
+    def test_sweep_preserves_mtime_for_jobs_and_nothing_new(self):
+        self.session("job")
+        self.session("small", rows=[{"type": "event_msg", "payload": {
+            "type": "user_message", "message": "hi"}}])
+        for sid in ("job", "small"):
+            os.utime(sc._state_file("codex", sid), (self.old, self.old))
+        before = {sid: sc._state_file("codex", sid).stat().st_mtime_ns for sid in ("job", "small")}
+        sc.sweep_idle(now=self.now)
+        for sid, stamp in before.items():
+            self.assertEqual(sc._state_file("codex", sid).stat().st_mtime_ns, stamp)
+
+    def test_swept_orphan_does_not_displace_recent_hooks_in_liveness(self):
+        path, _ = self.session("orphan", seen_ts=self.now - 8 * 3600, seen_end=0,
+                               last_ts=self.now - 9 * 3600)
+        os.utime(path, (self.now - 3 * 3600, self.now - 3 * 3600))
+        for i in range(sc.ACTIVITY_SCAN_LIMIT):
+            self.session(f"live-{i}", seen_ts=self.now)
+            os.utime(sc._state_file("codex", f"live-{i}"), (self.old - 1, self.old - 1))
+        sc._heartbeat("codex", {"at": sc._mint_ts(), "event": "stop",
+                                "session_id": "live-0", "due": False, "new_turns": 0})
+        self.assertEqual(sc.sweep_idle(now=self.now)["swept"], 1)
+        self.assertIsNone(sc._stopped_hook_evidence("codex")[0])
+        self.assertTrue(sc.liveness("codex")["ok"])
+        with mock.patch.object(sc, "ACTIVITY_SCAN_LIMIT", sc.ACTIVITY_SCAN_LIMIT + 1):
+            self.assertIsNotNone(sc._stopped_hook_evidence("codex")[0])
+
+    def test_locked_state_is_skipped_by_sweep_and_hook(self):
+        path, st = self.session()
+        before = sc._state_file("codex", "s1").read_bytes()
+        with sc._state_lock("codex", "s1") as acquired:
+            self.assertTrue(acquired)
+            with mock.patch.object(sc, "read_window") as read:
+                self.assertEqual(sc.sweep_idle(now=self.now)["skipped"], {"locked": 1})
+                out = sc.hook_main(json.dumps({"session_id": "s1", "cwd": st["cwd"],
+                    "transcript_path": str(path), "hook_event_name": "SessionEnd"}), "codex")
+            read.assert_not_called()
+            self.assertEqual((out["due"], out["reason"]), (False, "locked"))
+        self.assertEqual(sc._state_file("codex", "s1").read_bytes(), before)
+        self.assertFalse(sc._state_file("codex", "s1").with_suffix(".lock").exists())
+
+    def test_state_changed_before_lock_is_not_read_or_swept(self):
+        for field, value in (("offset", 1), ("seen_ts", self.now)):
+            with self.subTest(field=field):
+                _, st = self.session()
+                real_lock = sc._state_lock
+
+                @contextmanager
+                def changed_lock(harness, sid):
+                    st[field] = value
+                    sc.save_state(harness, sid, st)
+                    with real_lock(harness, sid) as acquired:
+                        yield acquired
+
+                with mock.patch.object(sc, "_state_lock", side_effect=changed_lock), \
+                        mock.patch.object(sc, "read_window") as read:
+                    self.assertEqual(sc.sweep_idle(now=self.now)["skipped"], {"changed": 1})
+                read.assert_not_called()
+                self.assertEqual(sc.load_state("codex", "s1"), st)
+        self.assertEqual(sc.queued_jobs(), [])
+
+    def test_lock_is_released_after_failure_and_stale_lock_is_reclaimed(self):
+        self.session()
+        lock = sc._state_file("codex", "s1").with_suffix(".lock")
+        lock.mkdir()
+        os.utime(lock, (self.now - 61, self.now - 61))
+        with mock.patch.object(sc, "enqueue", side_effect=OSError("disk full")):
+            self.assertEqual(sc.sweep_idle(now=self.now)["skipped"], {"error": 1})
+        self.assertFalse(lock.exists())
+        with mock.patch.object(sc, "read_window", side_effect=RuntimeError("broken")):
+            path = self.home / ".codex" / "sessions" / "rollout-s1.jsonl"
+            out = sc.hook_main(json.dumps({"session_id": "s1", "transcript_path": str(path),
+                "hook_event_name": "SessionEnd"}), "codex")
+        self.assertIn("RuntimeError", out["error"])
+        self.assertFalse(lock.exists())
+
+    def test_hook_cannot_overwrite_sweep_during_identity_lookup(self):
+        path, st = self.session()
+        env = json.dumps({"session_id": "s1", "cwd": st["cwd"],
+                          "transcript_path": str(path), "hook_event_name": "SessionEnd"})
+
+        def resolve(cwd):
+            with path.open("a") as stream:
+                stream.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "user_message", "message": "new turn " + "z" * 300}}) + "\n")
+            self.assertEqual(sc.hook_main(env, "codex")["reason"], "locked")
+            self.assertEqual(sc.sweep_idle(now=self.now)["swept"], 0)
+            return {}
+
+        self.identity.side_effect = resolve
+        out = sc.sweep_idle(now=self.now)
+        self.assertEqual(out["jobs"], 1)
+        self.assertLess(sc.load_state("codex", "s1")["offset"], path.stat().st_size)
+        self.identity.side_effect = None
+        hook = sc.hook_main(env, "codex")
+        self.assertTrue(hook["due"], hook)
+        ranges = [json.loads(p.read_text())["transcript_range"] for p in sc.queued_jobs()]
+        first, second = sorted(tuple(map(int, r.split(":"))) for r in ranges)
+        self.assertEqual(first[1], second[0])
+
+    def test_hook_stores_identity_for_later_sweep(self):
+        path, st = self.session("original_id")
+        with mock.patch.object(sc, "decide", return_value=(False, "waiting")), \
+                mock.patch.dict(os.environ, {"KHIPU_PARENT_SESSION": "codex:parent"}), \
+                mock.patch.object(sc.time, "time", return_value=self.old):
+            out = sc.hook_main(json.dumps({"session_id": "original:id", "cwd": st["cwd"],
+                "transcript_path": str(path), "hook_event_name": "Stop"}), "codex")
+        self.assertFalse(out["due"])
+        saved = sc.load_state("codex", "original:id")
+        self.assertEqual((saved["session_id"], saved["parent_session_id"]),
+                         ("original:id", "codex:parent"))
+        self.assertEqual(sc.sweep_idle(now=self.now)["swept"], 1)
+        job = json.loads(sc.queued_jobs()[0].read_text())
+        self.assertEqual((job["session_id"], job["parent_session_id"]),
+                         ("original:id", "codex:parent"))
+
+    def test_newest_transcript_is_read_first_and_errors_do_not_starve_others(self):
+        self.session("old")
+        new_path, _ = self.session("new")
+        os.utime(new_path, (self.old + 1, self.old + 1))
+        real_read = sc.read_window
+
+        def read(path, offset):
+            if path == new_path:
+                raise OSError("cannot read")
+            return real_read(path, offset)
+
+        with mock.patch.object(sc, "read_window", side_effect=read) as reader:
+            self.assertEqual(sc.sweep_idle(now=self.now, limit=1)["skipped"]["error"], 1)
+            self.assertEqual(reader.call_args.args[0], new_path)
+            stamp = sc._state_file("codex", "new").stat().st_mtime_ns
+            self.assertEqual(sc.sweep_idle(now=self.now + 100, limit=1)["swept"], 1)
+            self.assertEqual(reader.call_count, 2)
+            self.assertEqual(sc.sweep_idle(now=self.now + 3601, limit=1)["skipped"]["error"], 1)
+        self.assertEqual(sc._state_file("codex", "new").stat().st_mtime_ns, stamp)
+
+    def test_malformed_state_error_is_cached_and_dry_run_is_read_only(self):
+        self.session()
+        bad = sc._state_file("codex", "bad")
+        bad.write_text("{broken")
+        sc.sweep_idle(now=self.now, dry_run=True)
+        self.assertFalse(bad.with_suffix(".sweep-error").exists())
+        sc.sweep_idle(now=self.now)
+        self.assertEqual(sc.sweep_idle(now=self.now + 100)["skipped"]["error_cached"], 1)
+        self.assertEqual(sc.sweep_idle(now=self.now + 3601)["skipped"]["error"], 1)
+        self.assertEqual(bad.read_text(), "{broken")
+
+    def test_dry_run_lists_sessions_and_unread_counts(self):
+        _, st = self.session(session_id="original:id")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            cli.main(["sessions", "sweep", "--dry-run", "--limit", "1"])
+        session = json.loads(stdout.getvalue())["sessions"][0]
+        self.assertEqual((session["harness"], session["session_id"], session["unread_turns"]),
+                         ("codex", "original:id", 2))
+        self.assertGreater(session["unread_chars"], sc.MIN_CHARS)
+        self.assertAlmostEqual(session["idle_minutes"], (self.now - st["seen_ts"]) / 60, places=2)
+
+    def test_drain_time_budget_leaves_jobs_unclaimed(self):
+        self.session()
+        sc.sweep_idle(now=self.now)
+        with mock.patch.object(sc, "_claim") as claim:
+            out = sc.drain(time_budget_s=0)
+        claim.assert_not_called()
+        self.assertTrue(out["time_budget_exhausted"])
+        self.assertEqual(len(sc.queued_jobs()), 1)
+
+    def test_nightly_drain_reports_failed_or_exhausted_steps(self):
+        for result in ({"failed": 1}, {"failed": 0, "time_budget_exhausted": True},
+                       {"failed": 0, "sweep": {"skipped": {"error": 1}}}):
+            with mock.patch.object(sc, "drain", return_value=result):
+                self.assertFalse(jobs._drain_sessions()["ok"])
+
+    def test_drain_budget_stops_between_jobs_and_releases_no_extra_claims(self):
+        self.session("one")
+        self.session("two")
+        sc.sweep_idle(now=self.now)
+        clock = [0]
+
+        def extract(*args, **kwargs):
+            clock[0] = 301
+            return {"summary": "captured"}
+
+        with mock.patch.object(sc.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(sc, "land_transcript_images", return_value={}), \
+                mock.patch("khipu.config.capture_mode", return_value="hub"), \
+                mock.patch("khipu.extract.extract_memory", side_effect=extract), \
+                mock.patch("khipu.capture.capture", return_value=0), \
+                mock.patch("khipu.hub_snapshot.sync_decision_changes") as sync:
+            out = sc.drain(time_budget_s=300)
+        self.assertEqual(out["captured"], 1)
+        self.assertTrue(out["time_budget_exhausted"])
+        self.assertEqual(len(sc.queued_jobs()), 1)
+        self.assertEqual(list(sc.queue_dir().glob("*.working*")), [])
+        sync.assert_not_called()
 
     def test_due_hook_job_bytes_match_original_schema_for_split_windows(self):
         rows = [

@@ -524,8 +524,8 @@ class LivenessTest(unittest.TestCase):
             os.utime(old_tr, (time.time() - 86400,) * 2)
             for i in range(sc.ACTIVITY_SCAN_LIMIT + 15):
                 sc.save_state("claude_code", f"old{i}", {"offset": 0, "transcript_path": str(old_tr),
-                                                         "seen_end": 0, "seen_ts": time.time()})
-                os.utime(sc._state_file("claude_code", f"old{i}"), (time.time() - 86400 - i,) * 2)
+                                                         "seen_end": 0, "seen_ts": time.time() - 172800 - i})
+                os.utime(sc._state_file("claude_code", f"old{i}"), (time.time() + i,) * 2)
             live = Path(td) / "live.jsonl"
             live.write_text('{"type":"user","message":{"role":"user","content":"hi"}}\n')
             quiet_at = time.time() - sc.HOOK_SILENT_S - 60
@@ -533,7 +533,9 @@ class LivenessTest(unittest.TestCase):
             sc.save_state("claude_code", "live", {"offset": 0, "transcript_path": str(live),
                                                   "seen_end": 0,
                                                   "seen_ts": quiet_at - sc.HOOK_SILENT_S - 600})
-            reason, age = sc._stopped_hook_evidence("claude_code")
+            with mock.patch.object(sc, "read_window", wraps=sc.read_window) as read:
+                reason, age = sc._stopped_hook_evidence("claude_code")
+            self.assertEqual(read.call_count, sc.ACTIVITY_SCAN_LIMIT)
             self.assertIn(str(live), reason or "")
 
     def test_hook_error_older_than_a_later_successful_queue_is_not_red(self):
