@@ -460,10 +460,12 @@ class IdleSweepTest(unittest.TestCase):
         self.assertEqual(len(sc.queued_jobs()), 1)
 
     def test_nightly_drain_reports_failed_or_exhausted_steps(self):
-        for result in ({"failed": 1}, {"failed": 0, "time_budget_exhausted": True},
-                       {"failed": 0, "sweep": {"skipped": {"error": 1}}}):
+        for result in ({"failed": 1}, {"failed": 0, "time_budget_exhausted": True}):
             with mock.patch.object(sc, "drain", return_value=result):
                 self.assertFalse(jobs._drain_sessions()["ok"])
+        # One unreadable state file is retried by the sweep, not a failed night.
+        with mock.patch.object(sc, "drain", return_value={"failed": 0, "sweep": {"skipped": {"error": 1}}}):
+            self.assertTrue(jobs._drain_sessions()["ok"])
 
     def test_drain_budget_stops_between_jobs_and_releases_no_extra_claims(self):
         self.session("one")

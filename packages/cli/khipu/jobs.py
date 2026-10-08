@@ -339,8 +339,10 @@ def _drain_sessions() -> dict[str, Any]:
         from khipu.session_capture import drain
 
         out = drain(sweep=True, limit=200, time_budget_s=300)
-        return {"ok": out["failed"] == 0 and not out.get("time_budget_exhausted")
-                and not out.get("sweep", {}).get("skipped", {}).get("error"), **out}
+        # A state file the sweep could not read is logged and retried; it is
+        # not a failed night (one bad file on a dead session would otherwise
+        # fail every nightly until someone deletes it).
+        return {"ok": out["failed"] == 0 and not out.get("time_budget_exhausted"), **out}
     except Exception as exc:  # noqa: BLE001 — capture failure cannot block consolidation
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
