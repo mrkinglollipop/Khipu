@@ -20,9 +20,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +86,171 @@ def thread_for_session(sid: str) -> str | None:
     finally:
         if con is not None:
             con.close()
+
+
+def _thread_db_path(home: Path | None = None) -> Path:
+    return Path(os.environ.get("KHIPU_T3_DB") or (home if home is not None else Path.home()) / ".t3/userdata/statev2.sqlite")
+
+
+def _readonly_uri(path: Path) -> str:
+    """Active WALs need ``mode=ro``; a closed WAL needs immutable safety."""
+    mode = "?mode=ro" if Path(f"{path}-wal").exists() else "?mode=ro&immutable=1"
+    return path.absolute().as_uri() + mode
+
+
+def _lookup_health(path: Path) -> tuple[bool, str | None]:
+    """Can this build still read T3's provider-thread projection?
+
+    This intentionally validates the exact three columns ``thread_for_session``
+    reads.  It never guesses from a database mtime or a capture: those only say
+    T3 was used, not that Khipu can link a native session to its T3 thread.
+    """
+    if not path.is_file():
+        return False, "T3's thread database was not found"
+    source_files = [path, Path(f"{path}-wal")]
+    try:
+        before = [(item, item.stat().st_size, item.stat().st_mtime_ns) for item in source_files if item.is_file()]
+        with tempfile.TemporaryDirectory(prefix="khipu-t3-health-") as td:
+            staged = Path(td) / path.name
+            for item, _, _ in before:
+                suffix = "-wal" if item == Path(f"{path}-wal") else ""
+                shutil.copyfile(item, Path(f"{staged}{suffix}"))
+            after = [(item, item.stat().st_size, item.stat().st_mtime_ns) for item in source_files if item.is_file()]
+            if before != after:
+                return False, "T3's thread database changed while it was being checked"
+            con = None
+            try:
+                # SQLite may update shared-memory read marks even in mode=ro.
+                # Open a verified stable copy so health never writes beside
+                # T3's live database or WAL.
+                con = sqlite3.connect(_readonly_uri(staged), uri=True, timeout=0.5)
+                con.execute("PRAGMA busy_timeout = 2")
+                deadline = time.monotonic() + 0.05
+                con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+                # Prepare the same column/order expression as
+                # ``thread_for_session`` before judging payload shape.
+                con.execute(
+                    "SELECT thread_id, payload_json, updated_at "
+                    "FROM orchestration_v2_projection_provider_threads "
+                    "ORDER BY updated_at DESC LIMIT 1"
+                ).fetchone()
+                count, compatible = con.execute(
+                    "SELECT COUNT(*), COUNT(CASE WHEN json_valid(payload_json) "
+                    "AND typeof(json_extract(payload_json, '$.nativeThreadRef.nativeId')) = 'text' "
+                    "AND json_extract(payload_json, '$.nativeThreadRef.nativeId') <> '' THEN 1 END) "
+                    "FROM orchestration_v2_projection_provider_threads"
+                ).fetchone()
+                if count and not compatible:
+                    return False, "T3's thread records changed shape (no native session ids found)"
+                return True, None
+            finally:
+                if con is not None:
+                    con.close()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower() or "no such column" in str(exc).lower():
+            return False, "T3's thread records changed shape (table not found)"
+        return False, "T3's thread lookup is unavailable"
+    except (OSError, ValueError, sqlite3.Error):
+        return False, "T3's thread lookup is unavailable"
+
+
+def _thread_linked_capture_evidence() -> tuple[str | None, str | None, int]:
+    """Newest stored capture explicitly stamped ``via:t3`` with a thread id.
+
+    Doctor has already refreshed the local hub replica when the hub is
+    reachable.  Reading it keeps this check local and fail-open when a
+    portable install has no replica or an older replica lacks ``raw``.
+    """
+    try:
+        from khipu.hub_snapshot import snapshot_path
+
+        path = snapshot_path()
+        if not path.is_file():
+            return None, None, 0
+        con = sqlite3.connect(_readonly_uri(path), uri=True, timeout=0.1)
+        try:
+            deadline = time.monotonic() + 0.05
+            con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+            cols = {str(row[1]) for row in con.execute("PRAGMA table_info(episodes)")}
+            harness = "harness" if "harness" in cols else "NULL"
+            row = con.execute(
+                f"SELECT ts, {harness} FROM episodes "
+                "WHERE json_valid(raw) "
+                "AND json_extract(raw, '$.via') = 't3' "
+                "AND COALESCE(json_extract(raw, '$.t3_thread_id'), '') <> '' "
+                "ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+            today = datetime.fromtimestamp(time.time(), timezone.utc).strftime("%Y-%m-%dT00:00:00+00:00")
+            count = con.execute(
+                "SELECT COUNT(*) FROM episodes "
+                "WHERE ts >= ? AND json_valid(raw) "
+                "AND json_extract(raw, '$.via') = 't3' "
+                "AND COALESCE(json_extract(raw, '$.t3_thread_id'), '') <> ''",
+                (today,),
+            ).fetchone()
+            return (
+                str(row[0]) if row and row[0] else None,
+                str(row[1]) if row and row[1] else None,
+                int(count[0]) if count else 0,
+            )
+        finally:
+            con.close()
+    except (ImportError, OSError, ValueError, sqlite3.Error):
+        return None, None, 0
+
+
+def _age_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, time.time() - parsed.timestamp())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def health(home: Path | None = None) -> dict[str, Any] | None:
+    """Read-only T3 health for ``khipu doctor`` and the desktop card.
+
+    A T3 card exists only when its settings file exists.  Settings contents are
+    deliberately not parsed here: they can hold provider credentials and a
+    malformed or newer settings shape must not hide the installed T3 surface.
+    """
+    if not settings_path(home).is_file():
+        return None
+    path = _thread_db_path(home)
+    lookup_ok, lookup_error = _lookup_health(path)
+    activity_mtime = None
+    try:
+        mtimes = [p.stat().st_mtime for p in (path, Path(f"{path}-wal")) if p.is_file()]
+        activity_mtime = max(mtimes) if mtimes else None
+    except OSError:
+        activity_mtime = None
+    activity_age = max(0.0, time.time() - activity_mtime) if activity_mtime is not None else None
+    last_capture_at, last_capture_harness, captures_today = _thread_linked_capture_evidence()
+    last_capture_age = _age_seconds(last_capture_at)
+    recent_without_capture = bool(
+        activity_age is not None
+        and activity_age <= 86400
+        and (last_capture_age is None or last_capture_age > 86400)
+    )
+    warnings: list[str] = []
+    if not lookup_ok:
+        warnings.append(lookup_error or "T3's thread lookup is unavailable")
+    if recent_without_capture:
+        warnings.append("T3 was used in the last day without a thread-linked capture")
+    return {
+        "detected": True,
+        "lookup": {"ok": lookup_ok, "error": lookup_error},
+        "used_recently": activity_age is not None and activity_age <= 86400,
+        "last_thread_linked_capture_at": last_capture_at,
+        "last_thread_linked_capture_age_s": last_capture_age,
+        "last_thread_linked_capture_harness": last_capture_harness,
+        "thread_linked_captures_today": captures_today,
+        "warnings": warnings,
+    }
 
 
 def cache_thread(st: dict, sid: str) -> str | None:

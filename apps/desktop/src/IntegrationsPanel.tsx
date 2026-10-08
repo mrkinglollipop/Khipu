@@ -148,6 +148,19 @@ export type LivenessPayload = {
   captured_today?: number | null;
 };
 
+/** Read-only `doctor.t3` evidence.  It is absent when this Mac has no T3
+ * settings file, so Harnesses never implies T3 is installed. */
+export type T3Health = {
+  detected?: boolean;
+  lookup?: { ok?: boolean; error?: string | null };
+  used_recently?: boolean;
+  last_thread_linked_capture_at?: string | null;
+  last_thread_linked_capture_age_s?: number | null;
+  last_thread_linked_capture_harness?: string | null;
+  thread_linked_captures_today?: number;
+  warnings?: string[];
+};
+
 /** `doctor.recall_probe` — `khipu.probe.status()`: the LAST RECORDED probe,
  *  read-only. One file, one row: `last_probe.harness` says which pack it was
  *  run for, so a card only claims it when the harness matches. */
@@ -215,6 +228,12 @@ function fmtAge(s: number | null | undefined): string {
   if (s < 5400) return `${Math.round(s / 60)} min`;
   if (s < 172800) return `${Math.round(s / 3600)} h`;
   return `${Math.round(s / 86400)} days`;
+}
+
+export function t3CardStatus(t3: T3Health): CardStatus {
+  if (t3.lookup?.ok === false) return { tone: "warn", label: "Not linking threads" };
+  if ((t3.warnings ?? []).length > 0) return { tone: "warn", label: "Needs a linked capture" };
+  return { tone: "ok", label: "Linking threads" };
 }
 
 /** Round-trip seconds as the mock writes them — one decimal and a space
@@ -567,7 +586,9 @@ export function IntegrationsPanel({
   active,
   liveness,
   recallProbe,
+  t3 = null,
   refreshHealth,
+  onSearchT3Captures = () => {},
   onAnotherMac,
 }: {
   runKhipu: (args: string[]) => Promise<string>;
@@ -577,10 +598,14 @@ export function IntegrationsPanel({
   liveness: LivenessPayload | null;
   /** `doctor.recall_probe` — the stored round-trip evidence. */
   recallProbe: RecallProbeStatus | null;
+  /** Optional T3 Code health from the same doctor read as liveness. */
+  t3?: T3Health | null;
   /** Re-read doctor after an install/verify, so the evidence on these cards
    *  is never older than the action the user just took. The panel waits for it
    *  before the buttons come back. */
   refreshHealth: () => Promise<string | null | void> | void;
+  /** Opens Recall with the exact `via:t3` origin filter applied. */
+  onSearchT3Captures?: () => void;
   onAnotherMac: () => void;
 }) {
   const [rows, setRows] = useState<StatusRow[] | null>(null);
@@ -596,6 +621,13 @@ export function IntegrationsPanel({
   // Which home row's action gets keyboard focus once an Install/Remove ends.
   const [focusHome, setFocusHome] = useState<{ path: string; cmd: "install" | "uninstall" } | null>(null);
   const homeButtons = useRef<Record<string, HTMLButtonElement | null>>({});
+  const harnessCards = useRef<Record<string, HTMLDivElement | null>>({});
+
+  const focusHarnessCard = (harness: HarnessId) => {
+    const card = harnessCards.current[harness];
+    card?.scrollIntoView({ block: "nearest" });
+    card?.focus();
+  };
 
   const load = useCallback(async () => {
     setLoadError(null);
@@ -840,6 +872,95 @@ export function IntegrationsPanel({
       ) : null}
 
       <div className="hgrid">
+        {t3?.detected ? (() => {
+          const status = t3CardStatus(t3);
+          const lookup = t3.lookup?.ok !== false;
+          const recentWithoutCapture = Boolean(
+            t3.used_recently &&
+            (t3.last_thread_linked_capture_age_s == null || t3.last_thread_linked_capture_age_s > 86400),
+          );
+          const latest = t3.last_thread_linked_capture_age_s;
+          const linkedToday = t3.thread_linked_captures_today ?? 0;
+          const claude = rows?.find((r) => r.harness === "claude_code");
+          const codex = rows?.find((r) => r.harness === "codex");
+          const installedClaudeNames = claude
+            ? foundHomes(claude)
+              .filter((home) => home.installed)
+              .map((home) => home.label.replace(/^T3 · /, ""))
+            : [];
+          const claudeInstalled = Boolean(
+            claude && foundHomes(claude).length > 0 && installedClaudeNames.length === foundHomes(claude).length,
+          );
+          const codexInstalled = Boolean(codex && installedAnywhere(codex));
+          const legs = [
+            {
+              harness: "claude_code" as const,
+              mark: claudeInstalled ? "ok" as Mark : "off" as Mark,
+              label: "Claude accounts",
+              text: claudeInstalled ? `${installedClaudeNames.join(" and ")} installed` : "See installed accounts",
+              detail: "details in the Claude Code card",
+            },
+            {
+              harness: "codex" as const,
+              mark: codexInstalled ? "ok" as Mark : "off" as Mark,
+              label: "Codex",
+              text: codexInstalled ? "Hooks installed" : "See hook status",
+              detail: "details in the Codex card",
+            },
+          ];
+          return (
+            <div className="hcard t3-card">
+              <div className="top">
+                <span className="name">T3 Code</span>
+                <Tag tone={status.tone} dot>{status.label}</Tag>
+              </div>
+              <div className="checks">
+                <div>
+                  <CheckMark mark={lookup ? "ok" : "warn"} />
+                  <span>{lookup ? "Thread lookup · reads T3's thread records, read-only" : `Thread lookup failed · ${t3.lookup?.error ?? "unavailable"}`}</span>
+                </div>
+                <div>
+                  <CheckMark mark={latest != null ? (lookup ? "ok" : "off") : (recentWithoutCapture ? "warn" : "off")} />
+                  <span>{latest != null
+                    ? lookup
+                      ? `Last capture linked to a thread ${fmtAge(latest)} ago${t3.last_thread_linked_capture_harness ? ` · ${LABEL[t3.last_thread_linked_capture_harness as HarnessId] ?? t3.last_thread_linked_capture_harness}` : ""}`
+                      : `Last capture linked to a thread ${fmtAge(latest)} ago · captures since then are recorded but not linked`
+                    : recentWithoutCapture
+                      ? "T3 was used in the last day without a thread-linked capture"
+                      : "No thread-linked capture yet"}</span>
+                </div>
+                <div>
+                  <CheckMark mark={lookup ? (linkedToday > 0 ? "ok" : "off") : "warn"} />
+                  <span>{lookup
+                    ? linkedToday > 0
+                      ? `${linkedToday} capture${linkedToday === 1 ? "" : "s"} linked to a T3 thread today`
+                      : "No T3 captures linked today"
+                    : "Search by thread and switch-aware recall paused"}</span>
+                </div>
+              </div>
+              <div className="t3-legs" role="list" aria-label="Providers T3 runs">
+                {legs.map((item) => (
+                  <div className="t3-leg" role="listitem" key={item.label}>
+                    <span className="leg-name">{item.label}</span>
+                    <span className="leg-line"><CheckMark mark={item.mark} />{item.text} · <button type="button" className="sm link t3-detail" onClick={() => focusHarnessCard(item.harness)}>{item.detail}</button></span>
+                  </div>
+                ))}
+              </div>
+              <div className="note wrap">{lookup
+                ? "When you switch account or provider inside a thread, Khipu recalls that thread’s decisions and open commitments first."
+                : "Nothing is lost: captures still land and search still finds them. Until a Khipu update reads T3's new layout, search can't filter by thread and recall after a switch falls back to the usual top 3."}</div>
+              <div className="note wrap">Khipu reads T3's settings and thread records. It never changes them.</div>
+              <div className="hacts">
+                <button type="button" className="sm" disabled={busy != null} onClick={() => void refreshHealth()}>
+                  <RefreshCw size={14} strokeWidth={1.75} aria-hidden /> Recheck
+                </button>
+                <button type="button" className="sm link push" onClick={onSearchT3Captures}>
+                  Search T3 captures
+                </button>
+              </div>
+            </div>
+          );
+        })() : null}
         {(rows ?? []).map((r) => {
           const v = verify[r.harness];
           const lv = liveness?.harnesses?.[r.harness];
@@ -932,7 +1053,7 @@ export function IntegrationsPanel({
           const found = foundHomes(r);
           const homeDir = userHomeDir(r.homes);
           return (
-            <div className={homes.length > 0 ? "hcard homes-card" : "hcard"} key={r.harness}>
+            <div className={homes.length > 0 ? "hcard homes-card" : "hcard"} key={r.harness} id={`harness-${r.harness}`} tabIndex={-1} ref={(el) => { harnessCards.current[r.harness] = el; }}>
               <div className="top">
                 <span className="name">{LABEL[r.harness]}</span>
                 <Tag tone={status.tone} dot>

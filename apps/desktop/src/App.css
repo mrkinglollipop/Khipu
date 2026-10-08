@@ -2211,6 +2211,53 @@ button.row.on {
   grid-column: 1 / -1;
 }
 
+/* T3 is one orchestration surface across its Claude and Codex legs.  Keep its
+   thread evidence together above those individual harness cards. */
+.hcard.t3-card {
+  grid-column: 1 / -1;
+}
+
+.t3-legs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s2);
+  margin: 0 var(--s4) var(--s3);
+}
+
+.t3-leg {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--s3);
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+
+.leg-name {
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.leg-line {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+button.t3-detail {
+  display: inline;
+  height: auto;
+  min-height: 0;
+  padding: 0;
+  font-size: inherit;
+  line-height: inherit;
+  text-align: left;
+}
+
 .homes {
   display: flex;
   flex-direction: column;
@@ -2320,6 +2367,10 @@ button.row.on {
 }
 
 @media (max-width: 900px) {
+  .t3-legs {
+    grid-template-columns: 1fr;
+  }
+
   .home {
     grid-template-columns: minmax(0, 1fr) auto;
     row-gap: var(--s2);

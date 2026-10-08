@@ -103,6 +103,38 @@ describe("App — doctor reads", () => {
     render(<App />);
     await waitFor(() => expect(railText()).toBe("All harnesses recording"));
   });
+
+  it("opens Recall with the exact via:t3 filter from the T3 card", async () => {
+    const calls: string[][] = [];
+    script((args) => {
+      calls.push(args);
+      if (args[0] === "doctor") {
+        return doctorDoc({
+          t3: {
+            detected: true,
+            lookup: { ok: true },
+            thread_linked_captures_today: 1,
+            warnings: [],
+          },
+        });
+      }
+      if (args[0] === "integrations" && args[1] === "status") {
+        return JSON.stringify([{ harness: "claude_code", detected: true, mcp: true, hook_stop: true, hook_precompact: true, recall_rule: "installed" }]);
+      }
+      if (args[0] === "search") return JSON.stringify({ results: [] });
+      return "{}";
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Harnesses" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Search T3 captures" }));
+
+    expect(screen.getByRole("button", { name: "Recall" })).toHaveAttribute("aria-current", "page");
+    const query = await screen.findByRole("textbox", { name: "Search" });
+    expect(query).toHaveFocus();
+    fireEvent.change(query, { target: { value: "open commitments" } });
+    fireEvent.keyDown(query, { key: "Enter" });
+    await waitFor(() => expect(calls).toContainEqual(["search", "--mode", "hybrid", "--limit", "20", "--via=t3", "--", "open commitments"]));
+  });
 });
 
 describe("App — Home's Reinstall hook", () => {

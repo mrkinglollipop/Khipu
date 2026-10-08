@@ -15,7 +15,7 @@ import {
   tildePath,
   userHomeDir,
 } from "../IntegrationsPanel";
-import type { ClaudeHomeRow, HarnessLiveness, StatusRow } from "../IntegrationsPanel";
+import type { ClaudeHomeRow, HarnessLiveness, StatusRow, T3Health } from "../IntegrationsPanel";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async () => "{}"),
@@ -270,6 +270,8 @@ function renderPanel(
     verifyThrows?: string;
     liveness?: { ok: boolean; red?: string[]; harnesses: Record<string, HarnessLiveness> };
     refreshHealth?: () => Promise<void> | void;
+    t3?: import("../IntegrationsPanel").T3Health | null;
+    onSearchT3Captures?: () => void;
   } = {},
 ) {
   const runKhipu = vi.fn(async (args: string[]) => {
@@ -294,7 +296,9 @@ function renderPanel(
       active={true}
       liveness={opts.liveness ?? { ok: true, harnesses: { claude_code: RECORDING } }}
       recallProbe={null}
+      t3={opts.t3}
       refreshHealth={opts.refreshHealth ?? (() => {})}
+      onSearchT3Captures={opts.onSearchT3Captures}
       onAnotherMac={() => {}}
     />,
   );
@@ -305,6 +309,52 @@ async function claudeCard(): Promise<HTMLElement> {
   await waitFor(() => expect(screen.getByText("Claude Code")).toBeInTheDocument());
   return screen.getByText("Claude Code").closest(".hcard") as HTMLElement;
 }
+
+describe("IntegrationsPanel — T3 health card", () => {
+  const LINKING: T3Health = {
+    detected: true,
+    lookup: { ok: true },
+    last_thread_linked_capture_age_s: 720,
+    last_thread_linked_capture_harness: "codex",
+    thread_linked_captures_today: 14,
+    warnings: [],
+  };
+
+  it("renders its full-width linked state and refresh/search actions", async () => {
+    const refresh = vi.fn();
+    const search = vi.fn();
+    renderPanel(() => [claudeRow([home()])], undefined, {
+      t3: LINKING,
+      refreshHealth: refresh,
+      onSearchT3Captures: search,
+    });
+    const card = (await screen.findByText("T3 Code")).closest(".hcard") as HTMLElement;
+
+    expect(card).toHaveClass("t3-card");
+    expect(within(card).getByText("Linking threads")).toBeInTheDocument();
+    expect(within(card).getByText(/Thread lookup · reads T3's thread records, read-only/)).toBeInTheDocument();
+    expect(within(card).getByText(/Last capture linked to a thread 12 min ago · Codex/)).toBeInTheDocument();
+    fireEvent.click(within(card).getByRole("button", { name: "Recheck" }));
+    fireEvent.click(within(card).getByRole("button", { name: "Search T3 captures" }));
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(search).toHaveBeenCalledOnce();
+  });
+
+  it("does not infer linked provenance when the lookup has failed", async () => {
+    renderPanel(() => [claudeRow([home()])], undefined, {
+      t3: {
+        ...LINKING,
+        lookup: { ok: false, error: "T3's thread records changed shape (table not found)" },
+        warnings: ["T3's thread records changed shape (table not found)"],
+      },
+    });
+    const card = (await screen.findByText("T3 Code")).closest(".hcard") as HTMLElement;
+
+    expect(within(card).getByText("Not linking threads")).toBeInTheDocument();
+    expect(within(card).getByText(/Thread lookup failed/)).toBeInTheDocument();
+    expect(within(card).getByText("Search by thread and switch-aware recall paused")).toBeInTheDocument();
+  });
+});
 
 describe("IntegrationsPanel — Claude homes", () => {
   it("lists every home with its path, checks and tag, under the shared evidence", async () => {
