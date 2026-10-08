@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import os
+import plistlib
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -49,6 +51,93 @@ _LABELS = {
     "queue_drain": PLIST_QUEUE_DRAIN,
     "recall_daemon": PLIST_RECALL_DAEMON,
 }
+
+_DRAIN_WRAPPER_NAME = "khipu-queue-drain-retry"
+_DRAIN_STARTED = "[khipu-queue-drain] entered Khipu"
+_DRAIN_ATTEMPT = "[khipu-queue-drain] attempt "
+_STARTUP_EINTR = "InterruptedError: [Errno 4] Interrupted system call"
+_STARTUP_LOG_BYTES = 256 * 1024
+
+
+def _queue_drain_arguments(python: str) -> list[str]:
+    # Mark the boundary before importing ANY Khipu code, including __init__.
+    # runpy preserves the -m entry point and argv without a second interpreter.
+    shim = (
+        "import sys, runpy; "
+        f"sys.stderr.write({_DRAIN_STARTED + chr(10)!r}); sys.stderr.flush(); "
+        "runpy.run_module('khipu', run_name='__main__', alter_sys=True)"
+    )
+    # Inline sh survives a fatal Python initialization failure and needs no
+    # launcher file written into the signed bundle (or during a health check).
+    script = f"""umask 077
+python=$1
+shift
+err=$(mktemp "${{TMPDIR:-/tmp}}/khipu-drain.XXXXXX") || exit 1
+trap 'rm -f "$err"' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+attempt=1
+while :; do
+    printf '%s%s\\n' {shlex.quote(_DRAIN_ATTEMPT)} "$attempt" >&2
+    "$python" -c {shlex.quote(shim)} "$@" 2>"$err"
+    status=$?
+    cat "$err" >&2
+    if [ "$status" -eq 0 ]; then exit 0; fi
+    if [ "$attempt" -ge 3 ] ||
+       grep -Fxq {shlex.quote(_DRAIN_STARTED)} "$err" ||
+       ! grep -Fq {shlex.quote(_STARTUP_EINTR)} "$err" ||
+       ! grep -Eq 'Fatal Python error:|<frozen importlib' "$err"; then
+        exit "$status"
+    fi
+    sleep "$attempt" || exit "$status"
+    attempt=$((attempt + 1))
+done
+"""
+    return ["/bin/sh", "-c", script, _DRAIN_WRAPPER_NAME, python, "sessions", "drain"]
+
+
+def queue_drain_startup_failures() -> dict[str, Any]:
+    """Count startup EINTRs in a bounded log tail, including legacy direct runs."""
+    data = _installed_plist(_plist_path(PLIST_QUEUE_DRAIN)) or {}
+    # An installed plist is authoritative: its log may differ from today's
+    # generator defaults. Do not repeat a stale/default-path health check.
+    log_path = data.get("StandardErrorPath")
+    if not isinstance(log_path, str) or not log_path:
+        _, fallback = _log_paths(_JOB_SPECS["queue_drain"]["log_stem"])
+        log_path = str(fallback)
+    out: dict[str, Any] = {"count": 0, "log_path": log_path, "tail_bytes": _STARTUP_LOG_BYTES}
+    try:
+        with open(log_path, "rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            offset = max(0, size - _STARTUP_LOG_BYTES)
+            fh.seek(offset)
+            tail = fh.read(_STARTUP_LOG_BYTES)
+        out["truncated"] = offset > 0
+        if offset:
+            tail = tail.partition(b"\n")[2]
+    except FileNotFoundError:
+        out["missing"] = True
+        return out
+    except OSError as exc:
+        out["count"] = None
+        out["error"] = str(exc)
+        return out
+    entered = startup = importing = False
+    for line in tail.decode("utf-8", errors="replace").splitlines():
+        if line.startswith(_DRAIN_ATTEMPT):
+            entered = startup = importing = False
+        elif line == _DRAIN_STARTED:
+            entered = True
+        elif "Python path configuration:" in line or "Fatal Python error:" in line:
+            startup = True
+        elif "<frozen importlib" in line:
+            importing = True
+        elif line.startswith(_STARTUP_EINTR):
+            if not entered and (startup or importing):
+                out["count"] += 1
+            startup = importing = False
+    return out
 
 
 def _repo_root() -> Path:
@@ -158,6 +247,10 @@ def render_plist(job: str, environ: dict[str, str] | None = None) -> bytes:
     text = text.replace("{{STDERR_LOG}}", str(err_log))
     if job == "notes_watch":
         text = text.replace("{{WATCH_PATHS}}", render_watch_paths_xml())
+    if job == "queue_drain":
+        data = plistlib.loads(text.encode("utf-8"))
+        data["ProgramArguments"] = _queue_drain_arguments(ctx["KHIPU_PYTHON"])
+        return plistlib.dumps(data)
     return text.encode("utf-8")
 
 
@@ -321,6 +414,11 @@ def plist_external(job: str) -> bool:
         return False
     args = data.get("ProgramArguments") or []
     prog = str(args[0]) if args else ""
+    # The wrapper's shell is not the interpreter used to classify ownership.
+    # Keep older wrapper bodies recognizable when the generator is updated.
+    if (job == "queue_drain" and len(args) >= 5
+            and args[:2] == ["/bin/sh", "-c"] and args[3] == _DRAIN_WRAPPER_NAME):
+        prog = str(args[4])
     if not prog or ".app/Contents/" in prog:
         return False
     # Same interpreter this render would use (a source checkout run by a
@@ -395,4 +493,8 @@ def refresh_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
         "external": external,
         "missing": missing,
         "results": results,
+        "startup_failures": (
+            {"queue_drain": queue_drain_startup_failures()}
+            if jobs is None or "queue_drain" in jobs else {}
+        ),
     }
