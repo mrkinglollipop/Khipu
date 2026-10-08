@@ -64,9 +64,13 @@ def thread_for_session(sid: str) -> str | None:
     path = Path(os.environ.get("KHIPU_T3_DB") or Path.home() / ".t3/userdata/statev2.sqlite")
     con = None
     try:
-        con = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=0.5)
+        # With T3 closed there is no -wal file, and even a mode=ro open of a
+        # WAL database would create -wal/-shm beside it; immutable reads the
+        # file as is and leaves T3's folder untouched.
+        mode = "?mode=ro" if Path(f"{path}-wal").exists() else "?mode=ro&immutable=1"
+        con = sqlite3.connect(path.absolute().as_uri() + mode, uri=True, timeout=0.5)
         con.execute("PRAGMA busy_timeout = 2")
-        deadline = time.monotonic() + 0.005
+        deadline = time.monotonic() + 0.05
         con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
         row = con.execute(
             "SELECT thread_id FROM orchestration_v2_projection_provider_threads "

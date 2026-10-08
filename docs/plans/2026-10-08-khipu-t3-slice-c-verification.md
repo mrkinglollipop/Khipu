@@ -1,7 +1,7 @@
 # Slice C implementation and hermetic verification
 
 Scope: [Khipu in T3 Code, Slice C](2026-10-07-khipu-t3.md). Worktree:
-`/Users/matthewschwartz/.t3/worktrees/Khipu/claude-khipu-t3-slices`, branch
+the slice worktree, branch
 `feat/khipu-t3-slice-c`, parent `7147cca9092a77fa4aec309a0a1ea9147da3ee98`.
 
 ## Implementation
@@ -10,7 +10,7 @@ Scope: [Khipu in T3 Code, Slice C](2026-10-07-khipu-t3.md). Worktree:
   `nativeThreadRef.nativeId`. Multiple providers/accounts and delegated-task
   threads are supported. `KHIPU_T3_DB` overrides the database path.
 - The connection uses URI `mode=ro`, `timeout=0.5`, a 2 ms busy timeout and a
-  5 ms SQLite VM deadline. Missing/locked/changed databases and malformed JSON
+  50 ms SQLite VM deadline (immutable read when T3 is closed, so no -wal/-shm appear). Missing/locked/changed databases and malformed JSON
   yield no mapping. Tests use fixture databases only.
 - Hook/sweep state caches a positive mapping for that session. Negative reads
   are cached for five minutes, allowing provider rows that arrive later to be

@@ -43,6 +43,12 @@ def test_mapping_across_providers_is_read_only(t3_db, sid):
     assert t3_db.read_bytes() == before
 
 
+def test_mapping_with_t3_closed_leaves_no_sidecar_files(t3_db):
+    assert not Path(f'{t3_db}-wal').exists()
+    assert t3.thread_for_session('claude-one') == THREAD
+    assert sorted(p.name for p in t3_db.parent.iterdir()) == ['statev2.sqlite']
+
+
 def test_mapping_child_and_miss(t3_db):
     assert t3.thread_for_session('child') == 'thread:delegated-task:command%3Achild'
     assert t3.thread_for_session('absent') is None
