@@ -2248,6 +2248,12 @@ button.row.on {
   color: var(--text-2);
 }
 
+/* One inline run, so the "·" and the link wrap with the sentence instead of
+   becoming their own flex items (first installed build, 2026-10-08). */
+.leg-text {
+  min-width: 0;
+}
+
 button.t3-detail {
   display: inline;
   height: auto;
