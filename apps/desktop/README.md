@@ -44,6 +44,11 @@ not from the app release feed.
 
 ## Maintainer release build
 
+The checkout must sit on a case-sensitive APFS volume. Tauri stages the bundled CLI at
+`target/release/khipu/` next to the `target/release/Khipu` binary, and on the default
+case-insensitive volume the two collide; `release_macos.sh` refuses early and says so.
+`npm run tauri dev` hits the same collision.
+
 ```bash
 cd apps/desktop
 export APPLE_SIGNING_IDENTITY='Developer ID Application: Name (TEAMID)'

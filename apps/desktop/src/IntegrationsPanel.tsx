@@ -942,7 +942,7 @@ export function IntegrationsPanel({
                 {legs.map((item) => (
                   <div className="t3-leg" role="listitem" key={item.label}>
                     <span className="leg-name">{item.label}</span>
-                    <span className="leg-line"><CheckMark mark={item.mark} />{item.text} · <button type="button" className="sm link t3-detail" onClick={() => focusHarnessCard(item.harness)}>{item.detail}</button></span>
+                    <span className="leg-line"><CheckMark mark={item.mark} /><span className="leg-text">{item.text} · <button type="button" className="sm link t3-detail" onClick={() => focusHarnessCard(item.harness)}>{item.detail}</button></span></span>
                   </div>
                 ))}
               </div>

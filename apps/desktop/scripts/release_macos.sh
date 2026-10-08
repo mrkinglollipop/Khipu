@@ -50,6 +50,19 @@ if [[ "$CLI_VERSION" != "$VERSION" ]]; then
   exit 2
 fi
 
+# Tauri stages the bundle resources at target/release/khipu/ and the binary at
+# target/release/Khipu. On a case-insensitive volume (the macOS default) the
+# two are one name and the build dies late with "failed to remove file
+# .../target/release/Khipu". Say so up front instead.
+probe="$(mktemp -d "$DESKTOP/src-tauri/.caseprobe.XXXXXX")"
+touch "$probe/a"
+if [[ -e "$probe/A" ]]; then
+  rm -rf "$probe"
+  echo "refusing to build: this checkout is on a case-insensitive volume, where target/release/Khipu (the binary) and target/release/khipu/ (the bundled CLI) collide. Build from a checkout on a case-sensitive APFS volume." >&2
+  exit 2
+fi
+rm -rf "$probe"
+
 # Drag-to-Applications installer window (Murmur make-dmg.sh pattern). Tauri's
 # first DMG has the Applications alias; we recreate after re-sign, so the
 # alias + Finder icon layout have to live here or the shipped image is a
