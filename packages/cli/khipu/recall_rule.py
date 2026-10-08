@@ -31,6 +31,8 @@ import os
 import sys
 from pathlib import Path
 
+from khipu.t3 import is_helper_session
+
 RULE_MD = """# Khipu memory (MCP server `khipu`)
 
 You have a persistent, cross-session memory: past conversation episodes, topic
@@ -456,6 +458,9 @@ def session_start_main(*, shape: str | None = None) -> None:
     on the shim argv; a process-wide env var must not reshape Claude SessionStart.
     """
     cwd = _session_start_cwd()
+    if is_helper_session(cwd):
+        print("{}")  # T3's thread-title helper: no recall
+        return
     ctx = session_start_context(cwd)
     if shape is None:
         shape = "cursor" if "--cursor" in sys.argv[1:] else "claude"

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Loader2, Minus, RefreshCw, TriangleAlert, X } from "lucide-react";
 import { WorkingBanner } from "./WorkingBanner";
 import { Callout, Tag } from "./ui";
@@ -28,7 +28,43 @@ import type { Tone } from "./ui";
 
 type HarnessId = "claude_code" | "cursor" | "aegis" | "codex" | "grok_bot";
 
-type StatusRow = {
+/** One Claude home in `khipu integrations status claude_code` → `homes[]`
+ *  (packages/cli/khipu/integrations.py `_claude_home_status`). Hooks live in
+ *  the home's settings.json and the memory tools in its .claude.json, so each
+ *  home is installed or not on its own. */
+export type ClaudeHomeRow = {
+  path: string;
+  label: string;
+  /** "Claude Code, and T3's “Claude” account" — where Khipu found it. */
+  source: string;
+  is_default: boolean;
+  /** False for a configured folder that is not on disk yet. */
+  exists: boolean;
+  /** Set when this home's settings.json resolves to another home's file, so
+   *  the hooks are that home's. Remove on it only takes out its memory tools. */
+  linked_to?: { label: string; path: string } | null;
+  /** The config files this row was read from. */
+  settings_path?: string;
+  mcp_paths?: string[];
+  hook_stop?: boolean;
+  hook_precompact?: boolean;
+  hook_sessionend?: boolean;
+  hook_subagentstop?: boolean;
+  recall_rule?: string;
+  prompt_recall?: string;
+  memory_tools_ok: boolean;
+  /** All six Khipu hooks present. */
+  hooks_ok: boolean;
+  /** False when a launcher link this home's config names is broken; absent
+   *  from an older CLI, which never said. Install repairs it. */
+  launcher_ok?: boolean;
+  /** Memory tools + Stop + PreCompact hooks + working launchers. */
+  installed: boolean;
+  /** A config file in this home could not be read. */
+  error?: string;
+};
+
+export type StatusRow = {
   harness: HarnessId;
   detected: boolean;
   mcp: boolean;
@@ -46,6 +82,9 @@ type StatusRow = {
    *  `null`/absent means the hook has never run (or, for grok_bot, that
    *  there is no local hook to run). */
   last_beat_at?: string | null;
+  /** Claude Code only: one row per Claude home found. The pack-level fields
+   *  above are the AND over the homes that exist. */
+  homes?: ClaudeHomeRow[];
 };
 
 type Probe = {
@@ -164,6 +203,7 @@ function CheckMark({ mark }: { mark: Mark }) {
   const cls = `ck ${mark}`;
   if (mark === "ok") return <Check size={14} className={cls} aria-hidden />;
   if (mark === "err") return <X size={14} className={cls} aria-hidden />;
+  if (mark === "warn") return <TriangleAlert size={14} className={cls} aria-hidden />;
   return <Minus size={14} className={cls} aria-hidden />;
 }
 
@@ -188,9 +228,115 @@ function firstReason(lv: HarnessLiveness | undefined): string {
 
 type CardStatus = { tone: Tone; label: string };
 
+function unreadableLabel(n: number): string {
+  return n === 1 ? "1 home can't be read" : `${n} homes can't be read`;
+}
+
+/** The Claude homes that are on disk — the ones the CLI installs into and
+ *  ANDs the pack-level fields over. Empty for every other harness. */
+export function foundHomes(row: Pick<StatusRow, "homes">): ClaudeHomeRow[] {
+  return (row.homes ?? []).filter((h) => h.exists);
+}
+
+/** Whether Khipu is in the harness at all. Claude Code asks its homes (the
+ *  pack-level fields are the AND, so one missing home would read as nothing
+ *  installed); every other harness asks its own config. */
+export function installedAnywhere(
+  row: Pick<StatusRow, "mcp" | "hook_stop" | "hook_precompact" | "homes">,
+): boolean {
+  const homes = foundHomes(row);
+  if (homes.length > 0) return homes.some((h) => h.installed);
+  return row.mcp && row.hook_stop && row.hook_precompact;
+}
+
+/** How many found homes have no Khipu — what keeps the card from going green.
+ *  A home whose config cannot be read is counted by `homesUnreadable`. */
+export function homesNotInstalled(row: Pick<StatusRow, "homes">): number {
+  return foundHomes(row).filter((h) => !h.installed && !h.error).length;
+}
+
+/** How many found homes have a config file Khipu could not read. */
+export function homesUnreadable(row: Pick<StatusRow, "homes">): number {
+  return foundHomes(row).filter((h) => h.error).length;
+}
+
+/** Whether Khipu has any entry of its own in this home. A linked home's hooks
+ *  are the owner's, so only its memory tools count as its own. */
+export function hasKhipuEntries(h: ClaudeHomeRow): boolean {
+  if (h.memory_tools_ok) return true;
+  if (h.linked_to) return false;
+  return Boolean(h.hook_stop || h.hook_precompact || h.hooks_ok || h.recall_rule === "installed");
+}
+
+/** The current user's home folder, from where the default Claude home lives
+ *  (`<home>/.claude`). Empty when the CLI listed no default home. */
+export function userHomeDir(homes: ClaudeHomeRow[] | undefined): string | undefined {
+  const def = (homes ?? []).find((h) => h.is_default);
+  if (!def) return undefined;
+  const i = def.path.lastIndexOf("/");
+  return i > 0 ? def.path.slice(0, i) : undefined;
+}
+
+/** A path with the user's home folder as `~`, as the mock writes them. The
+ *  webview has no home to ask, so the caller passes the one the CLI showed;
+ *  with none, the path stays as it is rather than guessing at /Users/<x>. */
+export function tildePath(path: string, homeDir?: string): string {
+  if (!homeDir) return path;
+  if (path === homeDir) return "~";
+  return path.startsWith(`${homeDir}/`) ? `~${path.slice(homeDir.length)}` : path;
+}
+
+/** The one line under a home's name: where Khipu found it, then what is true
+ *  of its hooks or its sessions. */
+export function homeSourceLine(h: ClaudeHomeRow, homeDir?: string): string {
+  if (!h.exists) return `${h.source} · folder not found, nothing to install yet`;
+  if (h.error) return `${h.source} · couldn't read its config: ${h.error.slice(0, 120)}`;
+  if (h.linked_to) {
+    return (
+      `${h.source} · settings linked to ${tildePath(h.linked_to.path, homeDir)}, ` +
+      `so its hooks are the ${h.linked_to.label} home's`
+    );
+  }
+  if (!h.installed) {
+    // Partly installed: say what is in, so a row with working hooks never
+    // claims its sessions are unrecorded.
+    if (h.launcher_ok === false) return `${h.source} · a Khipu launcher link is broken, Install repairs it`;
+    if (h.hook_stop && h.hook_precompact) {
+      return `${h.source} · its hooks are in but the memory tools are not, Install adds them`;
+    }
+    if (h.memory_tools_ok) return `${h.source} · its memory tools are in but the hooks are not, Install adds them`;
+    return `${h.source} · its sessions run without memory until you install`;
+  }
+  return h.source;
+}
+
+/** What a check mark says, for the reader who cannot see it. */
+const MARK_WORD: Record<Mark, string> = {
+  ok: "installed",
+  warn: "partly installed",
+  err: "not installed",
+  off: "not checked",
+};
+
+/** A home's two checks. Hooks is `warn` when the capture hooks are in but the
+ *  rest of the six are not (Reinstall fills them in). */
+export function homeChecks(h: ClaudeHomeRow): { hooks: Mark; memoryTools: Mark; launcher?: Mark } {
+  if (!h.exists) return { hooks: "off", memoryTools: "off" };
+  if (h.error) return { hooks: "err", memoryTools: "err" };
+  return {
+    hooks: h.hooks_ok ? "ok" : h.hook_stop && h.hook_precompact ? "warn" : "err",
+    memoryTools: h.memory_tools_ok ? "ok" : "err",
+    // Only shown when it fails: it is the reason an otherwise full row reads
+    // Not installed.
+    ...(h.launcher_ok === false ? { launcher: "err" as const } : {}),
+  };
+}
+
 /** The card's one-word verdict, from evidence only:
  *   Not installed — the pack is absent from this harness's config.
  *   Not recording — the capture heartbeat is red for this harness.
+ *   N homes not installed / can't be read — Claude Code is in some homes it
+ *                   found, not all.
  *   Recording     — the heartbeat shows a capture landing.
  *   Reachable     — the gateway answered (Grok Bot, which has no local hook).
  *  Anything else is "no evidence yet", which is neither a pass nor a failure. */
@@ -210,9 +356,22 @@ export function cardStatus(
     }
     return { tone: "neutral", label: "Not checked yet" };
   }
-  const installed = row.mcp && row.hook_stop && row.hook_precompact;
-  if (!installed) return { tone: "neutral", label: "Not installed" };
+  const missing = homesNotInstalled(row);
+  const unreadable = homesUnreadable(row);
+  if (!installedAnywhere(row)) {
+    if (missing === 0 && unreadable > 0) return { tone: "warn", label: unreadableLabel(unreadable) };
+    return { tone: "neutral", label: "Not installed" };
+  }
   if (lv?.ok === false) return { tone: "err", label: "Not recording" };
+  // Never green while a home Khipu found has no Khipu in it: that home's
+  // sessions are not recorded, whatever the other homes are doing.
+  if (missing > 0 || unreadable > 0) {
+    const parts = [
+      missing > 0 ? (missing === 1 ? "1 home not installed" : `${missing} homes not installed`) : "",
+      unreadable > 0 ? (missing > 0 ? `${unreadable} can't be read` : unreadableLabel(unreadable)) : "",
+    ].filter(Boolean);
+    return { tone: "warn", label: parts.join(", ") };
+  }
   if (lv?.seen && (lv.captures ?? 0) > 0) return { tone: "ok", label: "Recording" };
   return { tone: "neutral", label: "No sessions yet" };
 }
@@ -324,6 +483,81 @@ export function verifiedLine(
   };
 }
 
+/** One harness's entry in `integrations install|uninstall`'s JSON. A pack that
+ *  could not finish says so here (`ok: false`, `aborted`) and still exits 0. */
+type ActResult = {
+  harness?: string;
+  ok?: boolean;
+  aborted?: boolean;
+  error?: string;
+  /** Per Claude home (`install` and `uninstall` on claude_code). */
+  homes?: Array<{ label?: string; hooks_kept?: string }>;
+};
+
+/** The results document of an install/uninstall run: install prints it first
+ *  and the `{verify: [...]}` document after, and a refused `--home` prints a
+ *  single object. Anything unreadable is no results rather than an error. */
+export function parseActResults(raw: string): ActResult[] {
+  const idx = raw.indexOf('{\n  "verify"');
+  try {
+    const doc = JSON.parse(idx >= 0 ? raw.slice(0, idx) : raw) as ActResult | ActResult[];
+    return Array.isArray(doc) ? doc : [doc];
+  } catch {
+    return [];
+  }
+}
+
+/** The first failing probe of a verify run, as one line. Mirrors the CLI's
+ *  own exit rule: a detected harness with no `ok` is a failure. */
+export function verifyFailure(list: VerifyRow[]): string | null {
+  const bad = list.find((v) => (v.ok ?? !v.detected) === false);
+  if (!bad) return null;
+  const probe = Object.entries(bad.components ?? {}).find(([, p]) => p?.ok === false);
+  const detail = probe ? `${probe[0]}${probe[1]?.error ? `: ${probe[1].error}` : ""}` : (bad.note ?? "a check failed");
+  return `${bad.harness} ${detail}`.slice(0, 160);
+}
+
+export type InstallRun = {
+  /** The CLI's error when the install itself did not finish. */
+  failed: string | null;
+  /** The separate verify run; null when it was skipped or could not be read. */
+  verify: VerifyRow[] | null;
+  /** Why that verify failed, or could not run; null when it passed or was skipped. */
+  verifyFailed: string | null;
+};
+
+/** `integrations install` without the CLI's own verify, then `integrations
+ *  verify` as its own call. Run together, a failed verify prints two JSON
+ *  documents and exits 2, which the runner reports as an error although the
+ *  files were written. Rejects only when the install call itself errors. A
+ *  per-home install skips the verify: that probe covers the whole pack. */
+export async function runInstall(
+  runKhipu: (args: string[]) => Promise<string>,
+  harness: string,
+  home?: string,
+): Promise<InstallRun> {
+  const raw = await runKhipu([
+    "integrations",
+    "install",
+    harness,
+    ...(home ? ["--home", home] : []),
+    "--no-verify",
+  ]);
+  // A pack that stopped (a config it could not read) says so in the JSON, not
+  // in the exit code.
+  const stopped = parseActResults(raw).find((r) => r.ok === false || r.aborted);
+  if (stopped) {
+    return { failed: (stopped.error ?? "the pack stopped before finishing").slice(0, 160), verify: null, verifyFailed: null };
+  }
+  if (home) return { failed: null, verify: null, verifyFailed: null };
+  try {
+    const verify = JSON.parse(await runKhipu(["integrations", "verify", harness])) as VerifyRow[];
+    return { failed: null, verify, verifyFailed: verifyFailure(verify) };
+  } catch (e) {
+    return { failed: null, verify: null, verifyFailed: String(e).slice(0, 160) };
+  }
+}
+
 export function IntegrationsPanel({
   runKhipu,
   onToast,
@@ -341,8 +575,9 @@ export function IntegrationsPanel({
   /** `doctor.recall_probe` — the stored round-trip evidence. */
   recallProbe: RecallProbeStatus | null;
   /** Re-read doctor after an install/verify, so the evidence on these cards
-   *  is never older than the action the user just took. */
-  refreshHealth: () => void;
+   *  is never older than the action the user just took. The panel waits for it
+   *  before the buttons come back. */
+  refreshHealth: () => Promise<string | null | void> | void;
   onAnotherMac: () => void;
 }) {
   const [rows, setRows] = useState<StatusRow[] | null>(null);
@@ -355,6 +590,9 @@ export function IntegrationsPanel({
   // docs/plans/2026-09-05-setup-that-cannot-strand-you.md.
   const [installedAt, setInstalledAt] = useState<Record<string, number>>({});
   const [autoVerified, setAutoVerified] = useState<Record<string, boolean>>({});
+  // Which home row's action gets keyboard focus once an Install/Remove ends.
+  const [focusHome, setFocusHome] = useState<{ path: string; cmd: "install" | "uninstall" } | null>(null);
+  const homeButtons = useRef<Record<string, HTMLButtonElement | null>>({});
 
   const load = useCallback(async () => {
     setLoadError(null);
@@ -423,10 +661,50 @@ export function IntegrationsPanel({
   }, [rows, installedAt, recallProbe]);
 
   const act = useCallback(
-    async (harness: HarnessId | "all", cmd: "install" | "verify" | "uninstall") => {
-      setBusy(`${cmd}:${harness}`);
+    async (harness: HarnessId | "all", cmd: "install" | "verify" | "uninstall", home?: string) => {
+      // `home` narrows a Claude Code install/remove to one of its homes
+      // (`homes[].path`); without it the CLI acts on every home it found.
+      setBusy(home ? `${cmd}:${harness}:${home}` : `${cmd}:${harness}`);
+      let message: string | null = null;
       try {
-        const raw = await runKhipu(["integrations", cmd, harness]);
+        if (cmd === "install") {
+          const run = await runInstall(runKhipu, harness, home);
+          if (run.failed) {
+            message = `install failed: ${run.failed}`;
+            return;
+          }
+          const list = run.verify;
+          if (list) {
+            setVerify((prev) => {
+              const next = { ...prev };
+              for (const v of list) next[v.harness] = v;
+              return next;
+            });
+          }
+          if (home) {
+            // One home's install says nothing about the others, so it does not
+            // arm auto-verify: a capture from another home must not mark the
+            // card Verified.
+            const label = rows?.flatMap((r) => r.homes ?? []).find((h) => h.path === home)?.label ?? "that home";
+            message = `Installed in ${label}. Restart its sessions to load it; Verify on the card checks it.`;
+          } else {
+            const installedAtNow = Date.now();
+            setInstalledAt((prev) => {
+              const next = { ...prev };
+              const targets = harness === "all" ? (rows ?? []).map((r) => r.harness) : [harness];
+              for (const h of targets) {
+                next[h] = installedAtNow;
+                setAutoVerified((av) => (av[h] ? { ...av, [h]: false } : av));
+              }
+              return next;
+            });
+            message = run.verifyFailed
+              ? `Installed; verify failed: ${run.verifyFailed}`
+              : "Installed. Restart each harness, then start any session — its card turns green by itself.";
+          }
+          return;
+        }
+        const raw = await runKhipu(["integrations", cmd, harness, ...(home ? ["--home", home] : [])]);
         if (cmd === "verify") {
           const list = JSON.parse(raw) as VerifyRow[];
           setVerify((prev) => {
@@ -434,49 +712,64 @@ export function IntegrationsPanel({
             for (const v of list) next[v.harness] = v;
             return next;
           });
-        } else if (cmd === "install") {
-          // install prints two JSON docs: results, then {verify:[...]}
-          const idx = raw.indexOf('{\n  "verify"');
-          const verifyDoc = idx >= 0 ? (JSON.parse(raw.slice(idx)) as { verify: VerifyRow[] }) : null;
-          if (verifyDoc) {
+          return;
+        }
+        // Uninstall reports a pack that stopped in the JSON, not in the exit code.
+        const results = parseActResults(raw);
+        const failed = results.find((r) => r.ok === false || r.aborted);
+        if (failed) {
+          message = `${cmd} failed: ${(failed.error ?? "the pack stopped before finishing").slice(0, 160)}`;
+        } else {
+          // One home out of several leaves the others, and the evidence about
+          // the harness, in place.
+          if (!home) {
             setVerify((prev) => {
               const next = { ...prev };
-              for (const v of verifyDoc.verify) next[v.harness] = v;
+              if (harness === "all") return {};
+              delete next[harness];
               return next;
             });
           }
-          const installedAtNow = Date.now();
-          setInstalledAt((prev) => {
-            const next = { ...prev };
-            const targets = harness === "all" ? (rows ?? []).map((r) => r.harness) : [harness];
-            for (const h of targets) {
-              next[h] = installedAtNow;
-              setAutoVerified((av) => (av[h] ? { ...av, [h]: false } : av));
-            }
-            return next;
-          });
-          onToast("Installed. Restart each harness, then start any session — its card turns green by itself.");
-        } else {
-          setVerify((prev) => {
-            const next = { ...prev };
-            if (harness === "all") return {};
-            delete next[harness];
-            return next;
-          });
-          onToast("Removed Khipu entries. Backups kept next to each file.");
+          const kept = results.flatMap((r) => r.homes ?? []).find((h) => h.hooks_kept)?.hooks_kept;
+          message = kept
+            ? `Removed the memory tools. The hooks were kept (${kept}) because another home uses them. Backups kept next to each file.`
+            : "Removed Khipu entries. Backups kept next to each file.";
         }
-        await load();
-        // Verify writes a fresh probe result and install changes what the
-        // heartbeat will say next; both live in the doctor payload.
-        refreshHealth();
       } catch (e) {
-        onToast(`${cmd} failed: ${String(e).slice(0, 160)}`);
+        message = `${cmd} failed: ${String(e).slice(0, 160)}`;
       } finally {
+        // Whatever happened, the card shows what is on disk now, not what it
+        // showed before the click. Verify writes a fresh probe result and
+        // install changes what the heartbeat will say next; both live in the
+        // doctor payload.
+        await load();
+        const healthError = await refreshHealth();
+        // The doctor read clears the toast, so the message goes up after it,
+        // carrying the doctor's own failure when there was one.
+        if (message) {
+          onToast(
+            typeof healthError === "string" && healthError
+              ? `${message} The health check then failed: ${healthError.slice(0, 160)}`
+              : message,
+          );
+        }
         setBusy(null);
+        // The button that was clicked is gone (Install and Remove swap) or was
+        // disabled while the CLI ran; hand focus to the row's action.
+        if (home && cmd !== "verify") setFocusHome({ path: home, cmd });
       }
     },
     [runKhipu, load, onToast, refreshHealth, rows],
   );
+
+  // Put keyboard focus back on a home row's action once the rows have reloaded.
+  useEffect(() => {
+    if (!focusHome || busy != null) return;
+    const { path, cmd } = focusHome;
+    const other = cmd === "install" ? "uninstall" : "install";
+    (homeButtons.current[`${cmd}:${path}`] ?? homeButtons.current[`${other}:${path}`])?.focus();
+    setFocusHome(null);
+  }, [focusHome, busy]);
 
   const detected = (rows ?? []).filter((r) => r.detected);
 
@@ -548,11 +841,14 @@ export function IntegrationsPanel({
           const v = verify[r.harness];
           const lv = liveness?.harnesses?.[r.harness];
           const justAutoVerified = autoVerified[r.harness] === true;
-          const status = justAutoVerified
-            ? { tone: "ok" as const, label: "Verified" }
-            : cardStatus(r, lv, v?.components?.mcp);
-          const installed =
-            r.harness === "grok_bot" ? r.mcp : r.mcp && r.hook_stop && r.hook_precompact;
+          // Claude Code lists its homes whenever one is on disk; a home that
+          // is missing keeps the card off green even after a capture lands.
+          const homes = r.harness === "claude_code" && r.detected ? (r.homes ?? []) : [];
+          const status =
+            justAutoVerified && homesNotInstalled(r) === 0 && homesUnreadable(r) === 0
+              ? { tone: "ok" as const, label: "Verified" }
+              : cardStatus(r, lv, v?.components?.mcp);
+          const installed = r.harness === "grok_bot" ? r.mcp : installedAnywhere(r);
           // Grok Bot has nothing local to install, so Verify ("Probe gateway")
           // is what its card offers instead — gated on detection, not on the
           // per-repo pin.
@@ -586,16 +882,22 @@ export function IntegrationsPanel({
 
           // 2. Recall at session start.
           const ruleStale = v?.rule_stale;
+          // With homes, the pack-level rule is the AND, so one missing home
+          // would turn the shared evidence red; each home's own Hooks check
+          // carries that instead.
+          const recallRule = homes.length > 0
+            ? foundHomes(r).some((h) => h.recall_rule === "installed") ? "installed" : "missing"
+            : r.recall_rule;
           const recall: { mark: Mark; text: string } =
-            r.recall_rule === "n/a"
+            recallRule === "n/a"
               ? { mark: "off", text: "Recall at start · not available in this harness" }
-              : r.recall_rule === "mcp_instructions"
+              : recallRule === "mcp_instructions"
                 ? { mark: "ok", text: "Recall at start · served with the memory tools" }
-                : r.recall_rule === "project_scoped"
+                : recallRule === "project_scoped"
                   ? ruleStale === true
                     ? { mark: "warn", text: "Recall rule out of date in this project" }
                     : { mark: "ok", text: "Recall rule · one per project" }
-                  : r.recall_rule === "installed"
+                  : recallRule === "installed"
                     ? { mark: "ok", text: "Recall at session start" }
                     : { mark: "err", text: "Recall at session start · not installed" };
 
@@ -620,10 +922,14 @@ export function IntegrationsPanel({
                     ? { mark: "ok", text: "Memory tools (MCP)" }
                     : { mark: "err", text: "Memory tools (MCP) · not installed" };
 
-          const checks = [hook, recall, mcp, verified];
+          // With homes, memory tools are installed per home and shown there;
+          // the shared line appears only once Verify has probed the handshake.
+          const checks = homes.length > 0 && !mcpProbe ? [hook, recall, verified] : [hook, recall, mcp, verified];
           const notRecording = status.label === "Not recording";
+          const found = foundHomes(r);
+          const homeDir = userHomeDir(r.homes);
           return (
-            <div className="hcard" key={r.harness}>
+            <div className={homes.length > 0 ? "hcard homes-card" : "hcard"} key={r.harness}>
               <div className="top">
                 <span className="name">{LABEL[r.harness]}</span>
                 <Tag tone={status.tone} dot>
@@ -638,6 +944,98 @@ export function IntegrationsPanel({
                   </div>
                 ))}
               </div>
+              {homes.length > 0 ? (
+                <div className="homes">
+                  <div className="homes-head">
+                    Claude homes <span className="meta">{found.length} found</span>
+                  </div>
+                  <div role="list" aria-label="Claude homes">
+                    {homes.map((h) => {
+                      const hc = homeChecks(h);
+                      const tag: { tone: Tone; label: string } = !h.exists
+                        ? { tone: "neutral", label: "Not found" }
+                        : h.error
+                          ? { tone: "err", label: "Can't read" }
+                          : h.installed
+                            ? { tone: "ok", label: "Installed" }
+                            : { tone: "warn", label: "Not installed" };
+                      const canAct = h.exists && !h.error;
+                      // Remove is offered for anything of Khipu's in the row,
+                      // so a half-installed home can be cleared as well as repaired.
+                      const canRemove = canAct && (h.installed || hasKhipuEntries(h));
+                      return (
+                        <div className="home" role="listitem" key={h.path}>
+                          <div className="home-id">
+                            <div className="home-line">
+                              <span className="home-name">{h.label}</span>
+                              <span className="home-path">{tildePath(h.path, homeDir)}</span>
+                            </div>
+                            <span className="home-src">{homeSourceLine(h, homeDir)}</span>
+                          </div>
+                          <div className="home-checks">
+                            <span>
+                              <CheckMark mark={hc.hooks} />
+                              Hooks
+                              <span className="sr-only">: {MARK_WORD[hc.hooks]}</span>
+                            </span>
+                            <span>
+                              <CheckMark mark={hc.memoryTools} />
+                              Memory tools
+                              <span className="sr-only">: {MARK_WORD[hc.memoryTools]}</span>
+                            </span>
+                            {hc.launcher ? (
+                              <span>
+                                <CheckMark mark={hc.launcher} />
+                                Launcher
+                                <span className="sr-only">: broken</span>
+                              </span>
+                            ) : null}
+                          </div>
+                          <div className="home-acts">
+                            <Tag tone={tag.tone} dot>
+                              {tag.label}
+                            </Tag>
+                            {canRemove ? (
+                              <button
+                                type="button"
+                                className="sm link"
+                                aria-label={`Remove Khipu from ${h.label}`}
+                                disabled={busy != null}
+                                ref={(el) => {
+                                  homeButtons.current[`uninstall:${h.path}`] = el;
+                                }}
+                                onClick={() => void act(r.harness, "uninstall", h.path)}
+                              >
+                                {busy === `uninstall:${r.harness}:${h.path}` ? (
+                                  <Loader2 size={14} className="spin" aria-hidden />
+                                ) : null}
+                                Remove
+                              </button>
+                            ) : null}
+                            {canAct && !h.installed ? (
+                              <button
+                                type="button"
+                                className="sm primary"
+                                aria-label={`Install Khipu in ${h.label}`}
+                                disabled={busy != null}
+                                ref={(el) => {
+                                  homeButtons.current[`install:${h.path}`] = el;
+                                }}
+                                onClick={() => void act(r.harness, "install", h.path)}
+                              >
+                                {busy === `install:${r.harness}:${h.path}` ? (
+                                  <Loader2 size={14} className="spin" aria-hidden />
+                                ) : null}
+                                Install
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
               {ruleStale === true ? (
                 <div className="note">Re-run Install for this repo to refresh its rule.</div>
               ) : awaitingAutoVerify ? (
@@ -652,6 +1050,11 @@ export function IntegrationsPanel({
                 </div>
               ) : !r.detected ? (
                 <div className="note">Config folder not found — nothing to install.</div>
+              ) : homes.length > 0 ? (
+                <div className="note wrap">
+                  Khipu finds Claude homes in ~/.claude, CLAUDE_CONFIG_DIR and T3's settings.
+                  It reads T3's settings and never changes them.
+                </div>
               ) : (
                 <div className="note mono" title={WHERE[r.harness]}>
                   {WHERE[r.harness]}
@@ -686,14 +1089,16 @@ export function IntegrationsPanel({
                       ) : null}
                       {r.harness === "grok_bot" ? "Probe gateway" : "Verify"}
                     </button>
-                    <button
-                      type="button"
-                      className="sm link push"
-                      disabled={busy != null || !installed}
-                      onClick={() => void act(r.harness, "uninstall")}
-                    >
-                      Remove
-                    </button>
+                    {homes.length > 0 ? null : (
+                      <button
+                        type="button"
+                        className="sm link push"
+                        disabled={busy != null || !installed}
+                        onClick={() => void act(r.harness, "uninstall")}
+                      >
+                        Remove
+                      </button>
+                    )}
                   </>
                 ) : (
                   <span className="meta">Nothing to install here.</span>

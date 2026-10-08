@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest import mock
 
 from khipu import session_capture as sc
+from tests.fixtures.t3 import handoff_wrapper
 
 REPO = Path(__file__).resolve().parents[3]
 STOP_HOOK = REPO / "packages" / "cli" / "bin" / "khipu-stop-hook"
@@ -901,6 +902,136 @@ class DrainDecisionSyncTest(unittest.TestCase):
             out = sc.drain()
         self.assertEqual(out["captured"], 1)
         self.assertNotIn("decisions_synced", out)
+
+
+def _t3_second_home(home: Path) -> Path:
+    """T3's settings naming a second Claude account at ~/.claude-t3-second."""
+    settings = home / ".t3" / "userdata" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"providerInstances": {"claudeAgent_secondary": {
+        "driver": "claudeAgent", "displayName": "Secondary",
+        "config": {"homePath": "~/.claude-t3-second"}}}}))
+    return home / ".claude-t3-second"
+
+
+class SecondHomeHarnessTest(unittest.TestCase):
+    """docs/plans/2026-10-07-khipu-t3.md slice A item 3: ``/.claude/`` only names
+    the default home, so a second home's sessions used to come out ``unknown``."""
+
+    def test_a_transcript_under_a_t3_homes_projects_folder_is_claude_code(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td).resolve()
+            tp = _t3_second_home(home) / "projects" / "-tmp-x" / "s.jsonl"
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                self.assertEqual(sc.infer_harness({"transcript_path": str(tp)}, {}), "claude_code")
+                # Not under any home's projects/: still unknown.
+                other = home / "elsewhere" / "projects" / "s.jsonl"
+                self.assertEqual(sc.infer_harness({"transcript_path": str(other)}, {}), "unknown")
+
+    def test_a_transcript_under_claude_config_dir_is_claude_code(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td).resolve()
+            cfg = home / "cfg"
+            tp = cfg / "projects" / "-tmp-x" / "s.jsonl"
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                self.assertEqual(sc.infer_harness({"transcript_path": str(tp)}, {"CLAUDE_CONFIG_DIR": str(cfg)}),
+                                 "claude_code")
+                self.assertEqual(sc.infer_harness({"transcript_path": str(tp)}, {}), "unknown")
+
+    def test_the_hook_captures_a_second_home_session_as_claude_code(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td).resolve()
+            tp = _write(_t3_second_home(home) / "projects" / "-tmp-x" / "s2.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": "second account " + "x" * 300}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "ack " * 40}}])
+            with _home(td), mock.patch.dict(os.environ, {"HOME": str(home)}):
+                out = sc.hook_main(json.dumps({"hook_event_name": "PreCompact", "session_id": "s2",
+                                               "cwd": td, "transcript_path": str(tp)}))
+                self.assertEqual((out["harness"], out["due"]), ("claude_code", True), out)
+                self.assertEqual(json.loads(sc.queued_jobs()[0].read_text())["harness"], "claude_code")
+
+
+class T3HandoffCaptureTest(unittest.TestCase):
+    """The hand-over T3 prepends to the first message after a provider switch is
+    not something the user said (slice A item 4)."""
+
+    def test_clean_user_text_keeps_only_what_was_typed(self):
+        typed = "does the recall block show up now?"
+        self.assertEqual(sc._clean_user_text(handoff_wrapper(typed)), typed)
+        reminder = "<system-reminder>\nhook context\n</system-reminder>\n"
+        self.assertEqual(sc._clean_user_text(reminder + handoff_wrapper(typed)), typed)
+        self.assertEqual(sc._clean_user_text(handoff_wrapper(typed) + "\n" + reminder).strip(), typed)
+        self.assertEqual(sc._clean_user_text("plain question"), "plain question")
+
+    def test_the_window_holds_the_typed_turn_not_the_handoff(self):
+        typed = "so what did we decide about the recall hook " + "x" * 220
+        with tempfile.TemporaryDirectory() as td:
+            tp = _write(Path(td) / "s.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": handoff_wrapper(typed)}},
+                {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Checking."}]}},
+                # a hand-over with nothing typed after it is not a turn at all
+                {"type": "user", "message": {"role": "user", "content": handoff_wrapper("")}},
+            ])
+            msgs, _, users = sc.read_window(tp, 0)
+        self.assertEqual(users, 1, msgs)
+        self.assertEqual(msgs[0], ("user", typed))
+        rendered = sc.render(msgs)
+        for leftover in ("Context handoff", "[Historical", "t3_thread_read", "Selected 5 intact items"):
+            self.assertNotIn(leftover, rendered)
+
+    def test_a_queued_job_carries_no_handoff_text(self):
+        typed = "decide the recall hook budget " + "x" * 250
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            tp = _write(Path(td) / ".claude" / "projects" / "p" / "s.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": handoff_wrapper(typed)}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "ack " * 40}}])
+            out = sc.hook_main(json.dumps({"hook_event_name": "PreCompact", "session_id": "h1", "cwd": td,
+                                           "transcript_path": str(tp)}))
+            self.assertTrue(out["due"], out)
+            job = json.loads(sc.queued_jobs()[0].read_text())
+        self.assertIn(typed, job["transcript"])
+        self.assertNotIn("Context handoff", job["transcript"])
+        self.assertNotIn("[Historical", job["transcript"])
+
+
+class T3HelperSessionTest(unittest.TestCase):
+    """T3 runs a Claude helper per thread title in ``t3code-claude-title-*``
+    folders: nothing to capture, and nothing to log (slice A item 5)."""
+
+    HELPER_CWD = "/var/folders/ab/T/t3code-claude-title-q7w8e9"
+
+    def test_hook_main_skips_without_state_queue_or_heartbeat(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            tp = _write(Path(td) / ".claude" / "projects" / "p" / "t.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": "title this " + "x" * 300}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "ack " * 40}}])
+            out = sc.hook_main(json.dumps({"hook_event_name": "SessionEnd", "session_id": "t1",
+                                           "cwd": self.HELPER_CWD, "transcript_path": str(tp)}))
+            self.assertTrue(out["skipped"] and not out["due"], out)
+            self.assertEqual(sc.queued_jobs(), [])
+            self.assertFalse((Path(td) / "kh").exists(), "no state, queue or heartbeat for a helper")
+
+    def test_the_shipped_hook_exits_zero_and_says_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = {k: v for k, v in os.environ.items() if k != "KHIPU_HARNESS"}
+            env.update(HOME=td, KHIPU_CAPTURE_HOME=str(Path(td) / "kh"), KHIPU_CAPTURE_NO_DRAIN="1",
+                       KHIPU_MEMORY_ROOT=str(Path(td) / "mem"))
+            log = Path(td) / "Library" / "Logs" / "khipu" / "stop-hook.log"
+
+            def run(cwd):
+                return subprocess.run(["sh", str(STOP_HOOK)], input=json.dumps(
+                    {"hook_event_name": "SessionEnd", "session_id": "t1", "cwd": cwd,
+                     "transcript_path": str(Path(td) / "gone.jsonl")}),
+                    capture_output=True, text=True, timeout=120, env=env)
+            r = run(self.HELPER_CWD)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(log.read_text() if log.exists() else "", "")
+            self.assertFalse((Path(td) / "kh" / "dispatch").exists())
+            # Control: the same payload from an ordinary folder is logged, so the
+            # silence above is the skip and not a hook that logs nothing anyway.
+            r = run(td)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("transcript missing", log.read_text())
 
 
 if __name__ == "__main__":

@@ -12,6 +12,10 @@ capture_v2 hooks (dual-write) and never edits them.
 Packs:
   claude_code  ~/.claude.json mcpServers.khipu
                ~/.claude/settings.json hooks.Stop / hooks.PreCompact / hooks.SubagentStop
+               (one set per Claude HOME: ~/.claude, CLAUDE_CONFIG_DIR and each Claude
+                account T3 Code runs, whose own folder holds its settings.json and
+                .claude.json — khipu.claude_homes; a home whose settings.json links to
+                another's shares those hooks)
                  → khipu-stop-hook (SubagentStop, K4: subagent work otherwise got no
                  slice at all; session_capture.hook_main() recognises the event and
                  handles the subagent's own transcript)
@@ -62,12 +66,15 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import tomllib
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from khipu import claude_homes as _homes
 
 HARNESSES = ("claude_code", "cursor", "aegis", "codex", "grok_bot")
 HOME = Path.home()
@@ -387,10 +394,33 @@ def _load_json(path: Path) -> dict:
 
 
 def _write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    """Atomic write that keeps a symlink a symlink. ``os.replace`` on the link
+    itself swaps the link for a plain file and silently un-shares a setup that
+    is symlinked on purpose (a second Claude home linking its settings.json to
+    ~/.claude's), so the temp file goes next to the RESOLVED target and replaces
+    that. The temp name is unique, so two writers never share one. The target's
+    mode is kept: ``.claude.json`` is 0600."""
+    target = Path(os.path.realpath(path))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".", suffix=".tmp")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if target.exists():
+            shutil.copymode(target, tmp)
+        elif target.name == ".claude.json":
+            os.chmod(tmp, 0o600)
+        else:
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp, 0o666 & ~umask)
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _is_ours(cmd: Any) -> bool:
@@ -398,56 +428,112 @@ def _is_ours(cmd: Any) -> bool:
 
 
 # ---- Claude Code --------------------------------------------------------------
+#
+# One pack, one or more HOMES (khipu.claude_homes): ~/.claude, CLAUDE_CONFIG_DIR
+# and every Claude instance T3 Code runs. Each home has its own settings.json
+# (hooks) and .claude.json (mcpServers.khipu). install/uninstall act on every
+# home found, or on one (`home=`); status lists each home under `homes` and
+# reports the pack-level fields as the AND over the homes that exist, so a card
+# is never greener than its worst home. Homes whose settings.json resolve to
+# the same file share their hooks: the owner installs them, the others are
+# "linked" and only ever add or remove their own mcpServers entry.
 
 CLAUDE_JSON = HOME / ".claude.json"
 CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
 
+_CLAUDE_HOOK_EVENTS = ("Stop", "PreCompact", "SessionEnd", "SubagentStop")
+
+
+class UnknownClaudeHome(ValueError):
+    """``home=`` names a folder that is not one of the Claude homes Khipu found."""
+
+
+def _claude_homes() -> list[_homes.ClaudeHome]:
+    return _homes.discover(home=HOME, default_dir=CLAUDE_SETTINGS.parent, default_json=CLAUDE_JSON)
+
+
+def _pick_claude_homes(path: str | None, homes: list[_homes.ClaudeHome]) -> list[_homes.ClaudeHome]:
+    """Every home when ``path`` is None, else the one home at that path
+    (matched on the real path, so a ``~`` or a link spelling still finds it)."""
+    if path is None:
+        return homes
+    want = os.path.realpath(Path(path).expanduser())
+    for h in homes:
+        if str(h.real) == want:
+            return [h]
+    raise UnknownClaudeHome(
+        f"{path} is not a Claude home Khipu found ({', '.join(str(h.path) for h in homes)}); "
+        "set CLAUDE_CONFIG_DIR to add one")
+
+
+def resolve_claude_home(path: str) -> _homes.ClaudeHome:
+    """The discovered Claude home at ``path`` (raises UnknownClaudeHome)."""
+    return _pick_claude_homes(path, _claude_homes())[0]
+
 
 def _claude_detected() -> bool:
-    return (HOME / ".claude").is_dir()
+    return any(h.exists for h in _claude_homes())
 
 
-def _claude_install(dry: bool) -> dict:
-    out: dict[str, Any] = {"harness": "claude_code", "detected": _claude_detected(), "changes": []}
-    if not out["detected"]:
-        return out
-    # MCP
-    d = _load_json(CLAUDE_JSON)
+def _claude_mcp_command(d: dict) -> str | None:
+    servers = d.get("mcpServers")
+    entry = servers.get("khipu") if isinstance(servers, dict) else None
+    return entry.get("command") if isinstance(entry, dict) else None
+
+
+def _claude_has_mcp(h: _homes.ClaudeHome) -> bool:
+    """Does any of this home's .claude.json carry a khipu server? An unreadable
+    file counts as yes: the caller uses this to KEEP shared hooks."""
+    for j in h.claude_jsons:
+        try:
+            servers = _load_json(j).get("mcpServers")
+        except ConfigUnreadable:
+            return True
+        if isinstance(servers, dict) and "khipu" in servers:
+            return True
+    return False
+
+
+def _claude_mcp_install(path: Path, dry: bool, res: dict) -> None:
+    d = _load_json(path)
     cur = d.get("mcpServers", {}).get("khipu")
     want = {"command": mcp_launcher()}
     if cur != want:
-        out["changes"].append(f"{CLAUDE_JSON}: mcpServers.khipu -> {want['command']}")
+        res["changes"].append(f"{path}: mcpServers.khipu -> {want['command']}")
         if not dry:
-            out.setdefault("backups", []).append(_backup(CLAUDE_JSON))
+            res.setdefault("backups", []).append(_backup(path))
             d.setdefault("mcpServers", {})["khipu"] = want
-            _write_json(CLAUDE_JSON, d)
+            _write_json(path, d)
+
+
+def _claude_hooks_install(settings: Path, dry: bool, res: dict) -> None:
     # Hooks: append a Khipu-owned entry to Stop + PreCompact + SessionEnd +
     # SubagentStop if not present. SessionEnd is the "quit without compacting"
     # net: since 2026-08-17 this hook is the harness's actual capture step,
     # not just a tail sync. SubagentStop (K4) is the same hook — hook_main()
     # recognises the event name and handles a subagent's own transcript.
-    s = _load_json(CLAUDE_SETTINGS)
+    s = _load_json(settings)
     hooks = s.setdefault("hooks", {})
     changed = False
-    for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop"):
+    for event in _CLAUDE_HOOK_EVENTS:
         entries = hooks.setdefault(event, [])
         flat = [h for e in entries for h in e.get("hooks", [])]
         if not any(_is_ours(h.get("command")) for h in flat):
             entries.append({"hooks": [{"type": "command", "command": stop_hook(), "timeout": 20}]})
-            out["changes"].append(f"{CLAUDE_SETTINGS}: hooks.{event} += khipu-stop-hook")
+            res["changes"].append(f"{settings}: hooks.{event} += khipu-stop-hook")
             changed = True
         elif _repoint(flat, _is_ours, stop_hook()):
-            out["changes"].append(f"{CLAUDE_SETTINGS}: hooks.{event} khipu-stop-hook -> {stop_hook()}")
+            res["changes"].append(f"{settings}: hooks.{event} khipu-stop-hook -> {stop_hook()}")
             changed = True
     # Recall rule: SessionStart additionalContext (thin cadence rule, not memory content).
     ss = hooks.setdefault("SessionStart", [])
     flat = [h for e in ss for h in e.get("hooks", [])]
     if not any(_is_our_recall(h.get("command")) for h in flat):
         ss.append({"hooks": [{"type": "command", "command": recall_hook(), "timeout": 10}]})
-        out["changes"].append(f"{CLAUDE_SETTINGS}: hooks.SessionStart += khipu-recall-hook")
+        res["changes"].append(f"{settings}: hooks.SessionStart += khipu-recall-hook")
         changed = True
     elif _repoint(flat, _is_our_recall, recall_hook()):
-        out["changes"].append(f"{CLAUDE_SETTINGS}: hooks.SessionStart khipu-recall-hook -> {recall_hook()}")
+        res["changes"].append(f"{settings}: hooks.SessionStart khipu-recall-hook -> {recall_hook()}")
         changed = True
     # Per-prompt recall (R1): the other half of the recall rule — a bounded
     # search on the PROMPT ITSELF, pushed before the model acts, instead of
@@ -457,28 +543,63 @@ def _claude_install(dry: bool) -> dict:
     if not any(_is_our_prompt_recall(h.get("command")) for h in flat):
         ps.append({"hooks": [{"type": "command", "command": prompt_recall_hook(),
                                "timeout": PROMPT_RECALL_TIMEOUT}]})
-        out["changes"].append(f"{CLAUDE_SETTINGS}: hooks.UserPromptSubmit += khipu-prompt-recall")
+        res["changes"].append(f"{settings}: hooks.UserPromptSubmit += khipu-prompt-recall")
         changed = True
     elif _repoint(flat, _is_our_prompt_recall, prompt_recall_hook()):
-        out["changes"].append(
-            f"{CLAUDE_SETTINGS}: hooks.UserPromptSubmit khipu-prompt-recall -> {prompt_recall_hook()}")
+        res["changes"].append(
+            f"{settings}: hooks.UserPromptSubmit khipu-prompt-recall -> {prompt_recall_hook()}")
         changed = True
     if changed and not dry:
-        out.setdefault("backups", []).append(_backup(CLAUDE_SETTINGS))
-        _write_json(CLAUDE_SETTINGS, s)
+        res.setdefault("backups", []).append(_backup(settings))
+        _write_json(settings, s)
+
+
+def _claude_install(dry: bool, home: str | None = None) -> dict:
+    all_homes = _claude_homes()
+    targets = _pick_claude_homes(home, all_homes)
+    target_reals = {str(h.real) for h in targets}
+    out: dict[str, Any] = {"harness": "claude_code", "detected": any(h.exists for h in targets),
+                           "changes": [], "homes": []}
+    errors: list[str] = []
+    mcp_done: set[str] = set()
+    for h in targets:
+        res: dict[str, Any] = {"home": str(h.path), "label": h.label, "detected": h.exists, "changes": []}
+        out["homes"].append(res)
+        if not h.exists:
+            continue
+        try:
+            for j in h.claude_jsons:
+                if os.path.realpath(j) not in mcp_done:
+                    mcp_done.add(os.path.realpath(j))
+                    _claude_mcp_install(j, dry, res)
+            if (h.linked_to is not None and h.linked_to.exists
+                    and str(h.linked_to.real) in target_reals):
+                res["hooks_shared_with"] = h.linked_to.label  # the owner's pass installs them
+            else:
+                _claude_hooks_install(h.settings_path, dry, res)
+        except ConfigUnreadable as e:
+            res.update(error=str(e), aborted=True)
+            errors.append(str(e))
+        out["changes"].extend(res["changes"])
+        if res.get("backups"):
+            out.setdefault("backups", []).extend(res["backups"])
+    if errors:
+        out.update(ok=False, aborted=True, error="; ".join(errors))
     return out
 
 
-def _claude_uninstall(dry: bool) -> dict:
-    out: dict[str, Any] = {"harness": "claude_code", "changes": []}
-    d = _load_json(CLAUDE_JSON)
+def _claude_mcp_uninstall(path: Path, dry: bool, res: dict) -> None:
+    d = _load_json(path)
     if "khipu" in d.get("mcpServers", {}):
-        out["changes"].append(f"{CLAUDE_JSON}: remove mcpServers.khipu")
+        res["changes"].append(f"{path}: remove mcpServers.khipu")
         if not dry:
-            out.setdefault("backups", []).append(_backup(CLAUDE_JSON))
+            res.setdefault("backups", []).append(_backup(path))
             d["mcpServers"].pop("khipu")
-            _write_json(CLAUDE_JSON, d)
-    s = _load_json(CLAUDE_SETTINGS)
+            _write_json(path, d)
+
+
+def _claude_hooks_uninstall(settings: Path, dry: bool, res: dict) -> None:
+    s = _load_json(settings)
     changed = False
     for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop", "SessionStart", "UserPromptSubmit"):
         entries = s.get("hooks", {}).get(event, [])
@@ -489,7 +610,7 @@ def _claude_uninstall(dry: bool) -> dict:
                                or _is_our_prompt_recall(h.get("command")))]
             if len(e_hooks) != len(e.get("hooks", [])):
                 changed = True
-                out["changes"].append(f"{CLAUDE_SETTINGS}: hooks.{event} -= khipu hook")
+                res["changes"].append(f"{settings}: hooks.{event} -= khipu hook")
             if e_hooks:
                 e = dict(e)
                 e["hooks"] = e_hooks
@@ -497,45 +618,179 @@ def _claude_uninstall(dry: bool) -> dict:
         if event in s.get("hooks", {}):
             s["hooks"][event] = kept
     if changed and not dry:
-        out.setdefault("backups", []).append(_backup(CLAUDE_SETTINGS))
-        _write_json(CLAUDE_SETTINGS, s)
+        res.setdefault("backups", []).append(_backup(settings))
+        _write_json(settings, s)
+
+
+def _claude_uninstall(dry: bool, home: str | None = None) -> dict:
+    """Remove Khipu's entries from every Claude home, or from one. A linked
+    home removes only its own mcpServers entry. A home that owns shared hooks
+    keeps them while a linked home outside this run still has Khipu installed:
+    those hooks are that home's too."""
+    all_homes = _claude_homes()
+    targets = _pick_claude_homes(home, all_homes)
+    target_reals = {str(h.real) for h in targets}
+    out: dict[str, Any] = {"harness": "claude_code", "changes": [], "homes": []}
+    errors: list[str] = []
+    for h in targets:
+        res: dict[str, Any] = {"home": str(h.path), "label": h.label, "changes": []}
+        out["homes"].append(res)
+        try:
+            for j in h.claude_jsons:
+                _claude_mcp_uninstall(j, dry, res)
+            if h.linked_to is not None:
+                res["hooks_kept"] = f"shared with {h.linked_to.label}"
+            else:
+                users = [x.label for x in all_homes
+                         if x.linked_to is h and str(x.real) not in target_reals and _claude_has_mcp(x)]
+                if users:
+                    res["hooks_kept"] = "still used by " + ", ".join(users)
+                else:
+                    _claude_hooks_uninstall(h.settings_path, dry, res)
+        except ConfigUnreadable as e:
+            res.update(error=str(e), aborted=True)
+            errors.append(str(e))
+        out["changes"].extend(res["changes"])
+        if res.get("backups"):
+            out.setdefault("backups", []).extend(res["backups"])
+    if errors:
+        out.update(ok=False, aborted=True, error="; ".join(errors))
     return out
+
+
+_CLAUDE_HOME_FLAGS_OFF = {
+    "hook_stop": False, "hook_precompact": False, "hook_sessionend": False, "hook_subagentstop": False,
+    "recall_rule": "missing", "prompt_recall": "missing",
+    "memory_tools_ok": False, "hooks_ok": False, "installed": False, "launcher_ok": True,
+    "has_khipu": False,
+}
+
+
+def _claude_home_status(h: _homes.ClaudeHome) -> tuple[dict, dict]:
+    """One home's row (see `_claude_status`) and its launcher block."""
+    row: dict[str, Any] = {
+        "path": str(h.path), "label": h.label, "source": _homes.describe_sources(h.sources),
+        "is_default": h.is_default, "exists": h.exists,
+        "settings_path": str(h.settings_path), "mcp_paths": [str(j) for j in h.claude_jsons],
+        "linked_to": ({"label": h.linked_to.label, "path": str(h.linked_to.path)}
+                      if h.linked_to is not None else None),
+    }
+    row.update(_CLAUDE_HOME_FLAGS_OFF)
+    if not h.exists:
+        return row, _pack_launchers("claude_code", {})
+    try:
+        s = _load_json(h.settings_path)
+        mcp_cmds = [_claude_mcp_command(_load_json(j)) for j in h.claude_jsons]
+    except ConfigUnreadable as e:
+        row.update(error=str(e), aborted=True)
+        return row, _pack_launchers("claude_code", {})
+
+    def _cmd(ev: str, pred) -> str | None:
+        for e in s.get("hooks", {}).get(ev, []):
+            for hk in e.get("hooks", []):
+                if pred(hk.get("command")):
+                    return hk.get("command")
+        return None
+
+    mcp_ok = all(c == mcp_launcher() for c in mcp_cmds)
+    stop, precompact = _cmd("Stop", _is_ours), _cmd("PreCompact", _is_ours)
+    sessionend, subagentstop = _cmd("SessionEnd", _is_ours), _cmd("SubagentStop", _is_ours)
+    rule, prompt_recall = _cmd("SessionStart", _is_our_recall), _cmd("UserPromptSubmit", _is_our_prompt_recall)
+    launch = _pack_launchers("claude_code", {
+        "khipu-mcp": mcp_cmds[0],
+        "khipu-stop-hook": stop,
+        "khipu-recall-hook": rule,
+        "khipu-prompt-recall": prompt_recall,
+    })
+    row.update(
+        hook_stop=stop is not None, hook_precompact=precompact is not None,
+        hook_sessionend=sessionend is not None, hook_subagentstop=subagentstop is not None,
+        recall_rule="installed" if rule else "missing",
+        prompt_recall="installed" if prompt_recall else "missing",
+        memory_tools_ok=mcp_ok, launcher_ok=launch["launcher_ok"],
+    )
+    row["hooks_ok"] = all((stop, precompact, sessionend, subagentstop, rule, prompt_recall))
+    row["installed"] = bool(mcp_ok and stop and precompact) and launch["launcher_ok"]
+    # Any Khipu entry of this home's own, however stale. A linked home's hooks
+    # are the owner's, so for it only the memory tools entry counts.
+    own_hooks = any((stop, precompact, sessionend, subagentstop, rule, prompt_recall))
+    row["has_khipu"] = any(c is not None for c in mcp_cmds) or (own_hooks and h.linked_to is None)
+    return row, launch
+
+
+def _claude_home_rows() -> tuple[list[dict], list[dict]]:
+    rows, launches = [], []
+    for h in _claude_homes():
+        row, launch = _claude_home_status(h)
+        rows.append(row)
+        launches.append(launch)
+    return rows, launches
+
+
+def _claude_pack_fields(scope: list[dict]) -> dict:
+    """The pack-level flags: the AND over the home rows in ``scope``."""
+    def every(key: str) -> bool:
+        return bool(scope) and all(r[key] for r in scope)
+
+    def every_installed(key: str) -> bool:
+        return bool(scope) and all(r[key] == "installed" for r in scope)
+
+    return {
+        "mcp": every("memory_tools_ok"),
+        "hook_stop": every("hook_stop"), "hook_precompact": every("hook_precompact"),
+        "hook_sessionend": every("hook_sessionend"), "hook_subagentstop": every("hook_subagentstop"),
+        "recall_rule": "installed" if every_installed("recall_rule") else "missing",
+        "prompt_recall": "installed" if every_installed("prompt_recall") else "missing",
+        # Khipu-native extraction rides on this same hook (session_capture);
+        # "legacy" was the model-driven capture_v2 nudge, which is now only
+        # a parallel writer until the soak-gated legacy removal.
+        "extract": "installed" if every("hook_stop") and every("hook_precompact") else "missing",
+    }
 
 
 def _claude_status() -> dict:
-    d = _load_json(CLAUDE_JSON)
-    s = _load_json(CLAUDE_SETTINGS)
-    mcp_cmd = d.get("mcpServers", {}).get("khipu", {}).get("command")
-    mcp = mcp_cmd == mcp_launcher()
-    def has(ev: str) -> bool:
-        return any(_is_ours(h.get("command")) for e in s.get("hooks", {}).get(ev, []) for h in e.get("hooks", []))
-    def _cmd(ev: str, pred) -> str | None:
-        for e in s.get("hooks", {}).get(ev, []):
-            for h in e.get("hooks", []):
-                if pred(h.get("command")):
-                    return h.get("command")
-        return None
-    rule = any(_is_our_recall(h.get("command"))
-               for e in s.get("hooks", {}).get("SessionStart", []) for h in e.get("hooks", []))
-    prompt_recall = any(_is_our_prompt_recall(h.get("command"))
-                        for e in s.get("hooks", {}).get("UserPromptSubmit", []) for h in e.get("hooks", []))
-    native = has("Stop") and has("PreCompact")
-    out = {"harness": "claude_code", "detected": _claude_detected(), "mcp": mcp,
-            "hook_stop": has("Stop"), "hook_precompact": has("PreCompact"), "hook_sessionend": has("SessionEnd"),
-            "hook_subagentstop": has("SubagentStop"),
-            "recall_rule": "installed" if rule else "missing",
-            "prompt_recall": "installed" if prompt_recall else "missing",
-            # Khipu-native extraction rides on this same hook (session_capture);
-            # "legacy" was the model-driven capture_v2 nudge, which is now only
-            # a parallel writer until the soak-gated legacy removal.
-            "extract": "installed" if native else "missing"}
-    out.update(_pack_launchers("claude_code", {
-        "khipu-mcp": mcp_cmd,
-        "khipu-stop-hook": _cmd("Stop", _is_ours),
-        "khipu-recall-hook": _cmd("SessionStart", _is_our_recall),
-        "khipu-prompt-recall": _cmd("UserPromptSubmit", _is_our_prompt_recall),
-    }))
+    """Pack-level fields (what the Harnesses card reads) are the AND over the
+    homes that exist; `homes` has every home found, one row each:
+    path, label, source, is_default, exists, settings_path, mcp_paths,
+    linked_to ({label, path} or null), hook_stop / hook_precompact /
+    hook_sessionend / hook_subagentstop, recall_rule, prompt_recall,
+    memory_tools_ok, hooks_ok (all six hooks), launcher_ok, installed
+    (memory tools + Stop + PreCompact + launchers), and error when a config
+    file could not be read."""
+    rows, launches = _claude_home_rows()
+    live = [(r, ln) for r, ln in zip(rows, launches) if r["exists"]]
+    out: dict[str, Any] = {"harness": "claude_code", "detected": bool(live),
+                           **_claude_pack_fields([r for r, _ in live])}
+    # The launcher links are shared by every home, so one block stands for all:
+    # the first broken one (it carries the fix), else any.
+    launch = next((ln for _, ln in live if not ln["launcher_ok"]), None) \
+        or (live[0][1] if live else _pack_launchers("claude_code", {}))
+    out.update(launch)
+    out["homes"] = rows
+    errors = [r["error"] for r, _ in live if r.get("error")]
+    if errors:
+        out.update(ok=False, aborted=True, error="; ".join(errors))
     return out
+
+
+def claude_homes_report() -> dict:
+    """`khipu doctor`'s Claude block: one row per home found, labelled the way
+    the Harnesses card is ("Claude Code", "Claude Code (T3 · Secondary)").
+    Visibility only: a found home with no Khipu in it is a gap to show, like a
+    detected-but-uninstalled Cursor, not a failed check."""
+    rows, _ = _claude_home_rows()
+    out_rows = []
+    for r in rows:
+        row = {"label": "Claude Code" if r["is_default"] else f"Claude Code ({r['label']})",
+               "path": r["path"], "source": r["source"], "exists": r["exists"],
+               "installed": r["installed"], "hooks_ok": r["hooks_ok"],
+               "memory_tools_ok": r["memory_tools_ok"], "linked_to": r["linked_to"]}
+        if r.get("error"):
+            row["error"] = r["error"]
+        out_rows.append(row)
+    live = [r for r in out_rows if r["exists"]]
+    return {"homes": out_rows, "found": len(live),
+            "all_installed": bool(live) and all(r["installed"] for r in live)}
 
 
 # ---- Cursor -------------------------------------------------------------------
@@ -1766,9 +2021,58 @@ def _aegis_runtime() -> dict:
     return _runtime("aegis")
 
 
-def verify(harness: str, *, project: str | None = None) -> dict:
+def _missing_in(st: dict, key: str) -> str:
+    """" in <home>, <home>" for the Claude homes a pack-level flag is false in."""
+    names = [r["label"] for r in st.get("homes") or () if r.get("exists") and not r.get(key)]
+    return " in " + ", ".join(names) if names else ""
+
+
+def _claude_verify_scope(st: dict, home: str | None) -> tuple[dict, list[str]]:
+    """`st` narrowed to the homes a verify is about, and the labels of the found
+    homes left out. With ``home`` that is the one home (it must be installed to
+    pass); without, every home with any Khipu entry (or whose config could not
+    be read), so a home with none at all is information, not a failure, while a
+    half-installed one fails. When no home has Khipu the scope is every home
+    found, and verify fails on that."""
+    rows = st.get("homes") or []
+    live = [r for r in rows if r["exists"]]
+    if home is not None:
+        want = os.path.realpath(Path(home).expanduser())
+        resolve_claude_home(home)
+        scope = [r for r in rows if os.path.realpath(r["path"]) == want]
+        detected = True
+    else:
+        scope = [r for r in live if r["has_khipu"] or r.get("error")] or live
+        detected = bool(live)
+    left_out = [r["label"] for r in live if r not in scope]
+    return {**st, **_claude_pack_fields(scope), "detected": detected, "homes": scope}, left_out
+
+
+def _claude_incomplete(rows: list[dict]) -> str:
+    """What each half-installed home in ``rows`` is missing, one clause per home."""
+    out = []
+    for r in rows:
+        if r["installed"] or r.get("error"):
+            continue
+        parts = [name for name, ok in (("memory tools", r["memory_tools_ok"]), ("Stop hook", r["hook_stop"]),
+                                       ("PreCompact hook", r["hook_precompact"]),
+                                       ("a working launcher", r["launcher_ok"])) if not ok]
+        out.append(f"{r['label']} is missing {', '.join(parts)}")
+    return "; ".join(out)
+
+
+def verify(harness: str, *, project: str | None = None, home: str | None = None) -> dict:
+    """``home`` (claude_code only): verify that one Claude home. Without it the
+    pack is verified in every home that has Khipu; homes without it are listed
+    under ``not_installed_homes``."""
+    _claude_only_home(harness, home)
     st = status(harness, project=project) if harness == "grok_bot" else status(harness)
+    left_out: list[str] | None = None
+    if harness == "claude_code":
+        st, left_out = _claude_verify_scope(st, home)
     out: dict[str, Any] = {"harness": harness, "detected": st["detected"], "components": {}}
+    if left_out is not None:
+        out["not_installed_homes"] = left_out
     if not st["detected"]:
         return out
     if harness == "grok_bot":
@@ -1795,7 +2099,11 @@ def verify(harness: str, *, project: str | None = None) -> dict:
     if st["mcp"]:
         out["components"]["mcp"] = _probe_mcp(mcp_launcher())
     else:
-        out["components"]["mcp"] = {"ok": False, "error": "not installed"}
+        out["components"]["mcp"] = {"ok": False, "error": "not installed" + _missing_in(st, "memory_tools_ok")}
+    if harness == "claude_code":
+        incomplete = _claude_incomplete(st["homes"])
+        if incomplete:
+            out["components"]["install"] = {"ok": False, "error": incomplete}
     if harness == "aegis":
         # Aegis runs everything without the Keychain. Re-probe the MCP server
         # that way, or this row keeps reporting a server that only works from
@@ -1834,8 +2142,9 @@ def verify(harness: str, *, project: str | None = None) -> dict:
             # THIS harness's transcript shape and queues, not just that it exits 0.
             out["components"]["extract"] = _probe_native_extract(stop_hook(), harness)
         else:
-            out["components"]["hook"] = {"ok": False, "error": "not installed"}
-            out["components"]["extract"] = {"ok": False, "error": "not installed"}
+            missing = "not installed" + _missing_in(st, "hook_stop")
+            out["components"]["hook"] = {"ok": False, "error": missing}
+            out["components"]["extract"] = {"ok": False, "error": missing}
         if harness in ("claude_code", "codex") and st.get("recall_rule") == "installed":
             recall = _probe_recall(recall_hook())
             if recall.get("ok"):
@@ -1912,7 +2221,16 @@ def _guarded(harness: str, fn, *args):
                 "error": str(e), "aborted": True}
 
 
-def install(harness: str, *, dry_run: bool = False, project: str | None = None) -> dict:
+def _claude_only_home(harness: str, home: str | None) -> None:
+    if home is not None and harness != "claude_code":
+        raise ValueError("home= applies to the claude_code pack only")
+
+
+def install(harness: str, *, dry_run: bool = False, project: str | None = None,
+            home: str | None = None) -> dict:
+    """``home`` (claude_code only): install into that one Claude home instead of
+    every home found."""
+    _claude_only_home(harness, home)
     if harness == "grok_bot":
         # grok_bot has no local shim (gateway/URL-based pack) — never enters
         # _installing(), matching "nothing else" in _installing()'s docstring.
@@ -1923,10 +2241,17 @@ def install(harness: str, *, dry_run: bool = False, project: str | None = None) 
     with _installing(dry=dry_run):
         if harness == "cursor":
             return _guarded(harness, _cursor_install, dry_run, project)
+        if harness == "claude_code":
+            return _guarded(harness, _claude_install, dry_run, home)
         return _guarded(harness, _INSTALL[harness], dry_run)
 
 
-def uninstall(harness: str, *, dry_run: bool = False, project: str | None = None) -> dict:
+def uninstall(harness: str, *, dry_run: bool = False, project: str | None = None,
+              home: str | None = None) -> dict:
+    """``home`` (claude_code only): remove Khipu from that one Claude home."""
+    _claude_only_home(harness, home)
+    if harness == "claude_code":
+        return _guarded(harness, _claude_uninstall, dry_run, home)
     if harness == "cursor":
         return _guarded(harness, _cursor_uninstall, dry_run, project)
     if harness == "grok_bot":

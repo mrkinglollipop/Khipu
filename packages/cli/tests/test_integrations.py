@@ -1084,3 +1084,546 @@ class DoctorFoldsLauncherHealthTest(unittest.TestCase):
             rc, out = self._run_doctor()
         self.assertEqual(rc, 0)
         self.assertTrue(out["launchers_ok"])
+
+
+class _ClaudeHomesCase(_TempHomeCase):
+    """The Claude Code pack across several homes (docs/plans/2026-10-07-khipu-t3.md,
+    slice A). T3's settings file lives in the temp HOME; the CLAUDE_CONFIG_DIR of
+    the surrounding session (a suite launched from a second-account session
+    inherits it) is cleared so no real home can ever be reached."""
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        self.default = self.home / ".claude"
+        self.second = self.home / ".claude-t3-second"
+
+    def _green_probes(self):
+        """Verify's live probes (MCP handshake, hooks, a real capture) need a
+        hub; what these tests assert is which homes verify looks at."""
+        for name in ("_probe_mcp", "_probe_hook", "_probe_native_extract", "_probe_recall",
+                     "_probe_prompt_recall", "_probe_aegis_refusal", "_runtime"):
+            p = mock.patch.object(integ, name, return_value={"ok": True})
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch("khipu.probe.run_probe", return_value={"ok": True})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _t3(self, *instances):
+        path = self.home / ".t3" / "userdata" / "settings.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"providerInstances": dict(instances)}))
+
+    def _seed(self, *, link: bool, second_json: dict | None = None):
+        """Default home with a legacy hook; a T3 second home whose settings.json
+        either links to the default's or is its own file."""
+        self.default.mkdir()
+        legacy = {"hooks": {"PreCompact": [{"hooks": [{"type": "command",
+                  "command": "python3 /me/precompact_flush.py", "timeout": 45}]}]}}
+        (self.default / "settings.json").write_text(json.dumps(legacy))
+        (self.home / ".claude.json").write_text(json.dumps({"mcpServers": {"other": {"command": "x"}}}))
+        self.second.mkdir()
+        if link:
+            (self.second / "settings.json").symlink_to(self.default / "settings.json")
+        else:
+            (self.second / "settings.json").write_text("{}")
+        (self.second / ".claude.json").write_text(json.dumps(second_json or {"oauthAccount": {"a": 1}}))
+        self._t3(("claudeAgent", {"driver": "claudeAgent", "config": {"homePath": ""}}),
+                 ("claudeAgent_secondary", {"driver": "claudeAgent", "displayName": "Secondary",
+                                            "config": {"homePath": "~/.claude-t3-second"}}))
+
+    def _shared_stop_hooks(self) -> int:
+        s = json.loads((self.default / "settings.json").read_text())
+        return sum("khipu-stop-hook" in h["command"] for e in s["hooks"]["Stop"] for h in e["hooks"])
+
+    def _mcp_servers(self, path: Path) -> dict:
+        return json.loads(path.read_text())["mcpServers"]
+
+    def _row(self, st: dict, label: str) -> dict:
+        return next(r for r in st["homes"] if r["label"] == label)
+
+
+class WriteJsonTest(_ClaudeHomesCase):
+    def test_a_symlinked_file_stays_a_symlink_and_the_target_is_updated(self):
+        real = self.home / "dotfiles" / "settings.json"
+        real.parent.mkdir()
+        real.write_text('{"a": 1}')
+        link = self.home / "settings.json"
+        link.symlink_to(real)
+        integ._write_json(link, {"a": 2})
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(os.path.realpath(link), os.path.realpath(real))
+        self.assertEqual(json.loads(real.read_text()), {"a": 2})
+        self.assertEqual([p.name for p in real.parent.iterdir()], ["settings.json"])  # no temp left
+
+    def test_the_existing_mode_survives_and_a_new_claude_json_is_private(self):
+        f = self.home / ".claude.json"
+        f.write_text("{}")
+        os.chmod(f, 0o600)
+        integ._write_json(f, {"k": 1})
+        self.assertEqual(f.stat().st_mode & 0o777, 0o600)
+        fresh = self.home / "new" / ".claude.json"
+        integ._write_json(fresh, {"k": 1})
+        self.assertEqual(fresh.stat().st_mode & 0o777, 0o600)
+
+    def test_two_writes_never_share_a_temp_path_and_leave_none_behind(self):
+        f = self.home / "x.json"
+        seen = []
+        real = os.replace
+        with mock.patch.object(integ.os, "replace", side_effect=lambda a, b: (seen.append(str(a)), real(a, b))):
+            integ._write_json(f, {"k": 1})
+            integ._write_json(f, {"k": 2})
+        self.assertEqual(len(set(seen)), 2)
+        self.assertTrue(all(Path(p).parent == Path(os.path.realpath(f.parent)) for p in seen))
+        self.assertEqual([p.name for p in f.parent.iterdir()], ["x.json"])
+
+    def test_a_failed_write_removes_its_temp_file_and_keeps_the_target(self):
+        f = self.home / "x.json"
+        f.write_text('{"k": 0}')
+        with mock.patch.object(integ.os, "replace", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                integ._write_json(f, {"k": 1})
+        self.assertEqual(json.loads(f.read_text()), {"k": 0})
+        self.assertEqual([p.name for p in f.parent.iterdir()], ["x.json"])
+
+    def test_a_plain_file_is_written_as_before(self):
+        f = self.home / "sub" / "x.json"
+        integ._write_json(f, {"k": 1})
+        self.assertEqual(json.loads(f.read_text()), {"k": 1})
+        self.assertFalse(f.is_symlink())
+
+
+class ClaudeHomesInstallTest(_ClaudeHomesCase):
+    def test_install_reaches_every_home_found_each_with_its_own_files(self):
+        self._seed(link=False)
+        out = integ.install("claude_code")
+        self.assertEqual([h["label"] for h in out["homes"]], ["Default", "T3 · Secondary"])
+        for settings in (self.default / "settings.json", self.second / "settings.json"):
+            s = json.loads(settings.read_text())
+            self.assertTrue(any("khipu-stop-hook" in h["command"] for e in s["hooks"]["Stop"] for h in e["hooks"]))
+            self.assertTrue(any("khipu-prompt-recall" in h["command"]
+                                for e in s["hooks"]["UserPromptSubmit"] for h in e["hooks"]))
+        self.assertIn("khipu", self._mcp_servers(self.home / ".claude.json"))
+        second_json = json.loads((self.second / ".claude.json").read_text())
+        self.assertEqual(second_json["mcpServers"]["khipu"]["command"], integ.mcp_launcher())
+        self.assertEqual(second_json["oauthAccount"], {"a": 1}, "the account's own keys must survive")
+        self.assertIn("other", self._mcp_servers(self.home / ".claude.json"))
+        self.assertTrue(integ.status("claude_code")["installed"])
+
+    def test_a_linked_home_keeps_its_link_and_the_hooks_are_not_duplicated(self):
+        self._seed(link=True)
+        out = integ.install("claude_code")
+        self.assertTrue((self.second / "settings.json").is_symlink(), "install must not un-share the setup")
+        self.assertEqual(os.path.realpath(self.second / "settings.json"),
+                         os.path.realpath(self.default / "settings.json"))
+        self.assertEqual(self._shared_stop_hooks(), 1)
+        second = out["homes"][1]
+        self.assertEqual(second["hooks_shared_with"], "Default")
+        self.assertEqual(len(second["changes"]), 1)  # its own mcpServers entry, nothing else
+        self.assertIn("mcpServers.khipu", second["changes"][0])
+        self.assertEqual(self._mcp_servers(self.second / ".claude.json")["khipu"]["command"], integ.mcp_launcher())
+        self.assertEqual(integ.install("claude_code")["changes"], [], "second run is a no-op")
+        self.assertEqual(self._shared_stop_hooks(), 1)
+
+    def test_installing_the_linked_home_alone_reuses_the_shared_hooks(self):
+        self._seed(link=True)
+        integ.install("claude_code", home=str(self.default))
+        out = integ.install("claude_code", home=str(self.second))
+        self.assertEqual(len(out["changes"]), 1)
+        self.assertEqual(self._shared_stop_hooks(), 1)
+        self.assertTrue((self.second / "settings.json").is_symlink())
+
+    def test_installing_a_linked_home_first_writes_through_the_link(self):
+        self._seed(link=True)
+        integ.install("claude_code", home=str(self.second))
+        self.assertTrue((self.second / "settings.json").is_symlink())
+        self.assertEqual(self._shared_stop_hooks(), 1)
+        pc = json.loads((self.default / "settings.json").read_text())["hooks"]["PreCompact"]
+        self.assertIn("python3 /me/precompact_flush.py", [h["command"] for e in pc for h in e["hooks"]])
+
+    def test_a_linked_home_whose_owner_does_not_exist_installs_the_hooks_itself(self):
+        self.second.mkdir()
+        (self.second / "settings.json").symlink_to(self.default / "settings.json")  # dangling: no ~/.claude
+        self._t3(("claudeAgent_secondary", {"driver": "claudeAgent", "config": {"homePath": "~/.claude-t3-second"}}))
+        out = integ.install("claude_code")
+        self.assertNotIn("hooks_shared_with", out["homes"][1])
+        self.assertTrue((self.second / "settings.json").is_symlink())
+        self.assertEqual(self._shared_stop_hooks(), 1)
+        self.assertTrue(integ.status("claude_code")["hook_stop"])
+
+    def test_a_home_that_does_not_exist_yet_is_reported_not_created(self):
+        self.default.mkdir()
+        self._t3(("claudeAgent_secondary", {"driver": "claudeAgent", "config": {"homePath": "~/.claude-t3-second"}}))
+        out = integ.install("claude_code")
+        self.assertFalse(self.second.exists())
+        self.assertFalse(out["homes"][1]["detected"])
+        self.assertEqual(out["homes"][1]["changes"], [])
+
+    def test_claude_config_dir_is_a_home_with_its_own_settings_and_claude_json(self):
+        self.default.mkdir()
+        other = self.home / "cfg"
+        other.mkdir()
+        os.environ["CLAUDE_CONFIG_DIR"] = str(other)
+        out = integ.install("claude_code")
+        self.assertEqual([h["label"] for h in out["homes"]], ["Default", "CLAUDE_CONFIG_DIR"])
+        self.assertIn("khipu", self._mcp_servers(other / ".claude.json"))
+        self.assertTrue((other / "settings.json").is_file())
+
+    def test_a_home_named_explicitly_as_the_default_folder_gets_both_claude_json_files(self):
+        # CLAUDE_CONFIG_DIR=~/.claude makes Claude read ~/.claude/.claude.json,
+        # a different file from ~/.claude.json.
+        self.default.mkdir()
+        os.environ["CLAUDE_CONFIG_DIR"] = str(self.default)
+        integ.install("claude_code")
+        self.assertIn("khipu", self._mcp_servers(self.home / ".claude.json"))
+        self.assertIn("khipu", self._mcp_servers(self.default / ".claude.json"))
+        (self.default / ".claude.json").write_text("{}")
+        self.assertFalse(integ.status("claude_code")["mcp"], "both files must carry khipu")
+
+    def test_one_unreadable_config_aborts_that_home_only(self):
+        self._seed(link=False)
+        garbled = '{"oauthAccount": {"a": '
+        (self.second / ".claude.json").write_text(garbled)
+        out = integ.install("claude_code")
+        self.assertTrue(out["aborted"])
+        self.assertIn("refusing to overwrite", out["error"])
+        self.assertEqual((self.second / ".claude.json").read_text(), garbled)
+        self.assertIn("khipu", self._mcp_servers(self.home / ".claude.json"))
+        self.assertTrue(out["homes"][1]["aborted"])
+        self.assertNotIn("aborted", out["homes"][0])
+
+    def test_dry_run_changes_nothing_in_any_home(self):
+        self._seed(link=True)
+        before = {p: p.read_text() for p in (self.default / "settings.json", self.home / ".claude.json",
+                                             self.second / ".claude.json")}
+        out = integ.install("claude_code", dry_run=True)
+        self.assertTrue(out["changes"])
+        self.assertEqual({p: p.read_text() for p in before}, before)
+
+    def test_home_must_be_a_home_khipu_found(self):
+        self._seed(link=False)
+        with self.assertRaises(integ.UnknownClaudeHome):
+            integ.install("claude_code", home=str(self.home / "nowhere"))
+        with self.assertRaises(ValueError):
+            integ.install("cursor", home=str(self.default))
+        self.assertNotIn("mcpServers", json.loads((self.second / ".claude.json").read_text()))
+
+
+class ClaudeHomesUninstallTest(_ClaudeHomesCase):
+    def test_uninstalling_a_linked_home_removes_only_its_own_memory_tools_entry(self):
+        self._seed(link=True)
+        integ.install("claude_code")
+        out = integ.uninstall("claude_code", home=str(self.second))
+        self.assertEqual(len(out["changes"]), 1)
+        self.assertIn("mcpServers.khipu", out["changes"][0])
+        self.assertEqual(out["homes"][0]["hooks_kept"], "shared with Default")
+        self.assertNotIn("khipu", self._mcp_servers(self.second / ".claude.json"))
+        self.assertEqual(self._shared_stop_hooks(), 1, "hooks another home uses must stay")
+        self.assertTrue((self.second / "settings.json").is_symlink())
+        st = integ.status("claude_code")
+        self.assertTrue(self._row(st, "Default")["installed"])
+        self.assertFalse(self._row(st, "T3 · Secondary")["memory_tools_ok"])
+
+    def test_the_owner_keeps_shared_hooks_while_a_linked_home_still_has_khipu(self):
+        self._seed(link=True)
+        integ.install("claude_code")
+        first = integ.uninstall("claude_code", home=str(self.default))
+        self.assertEqual(first["homes"][0]["hooks_kept"], "still used by T3 · Secondary")
+        self.assertEqual(self._shared_stop_hooks(), 1)
+        self.assertNotIn("khipu", self._mcp_servers(self.home / ".claude.json"))
+        integ.uninstall("claude_code", home=str(self.second))
+        last = integ.uninstall("claude_code", home=str(self.default))
+        self.assertNotIn("hooks_kept", last["homes"][0])
+        self.assertEqual(self._shared_stop_hooks(), 0)
+
+    def test_uninstalling_everywhere_leaves_only_what_was_not_ours(self):
+        self._seed(link=True)
+        integ.install("claude_code")
+        integ.uninstall("claude_code")
+        s = json.loads((self.default / "settings.json").read_text())
+        self.assertEqual([h["command"] for e in s["hooks"]["PreCompact"] for h in e["hooks"]],
+                         ["python3 /me/precompact_flush.py"])
+        self.assertEqual(s["hooks"]["Stop"], [])
+        self.assertNotIn("khipu", self._mcp_servers(self.home / ".claude.json"))
+        self.assertNotIn("khipu", self._mcp_servers(self.second / ".claude.json"))
+        self.assertIn("other", self._mcp_servers(self.home / ".claude.json"))
+        self.assertTrue((self.second / "settings.json").is_symlink())
+
+    def test_unlinked_homes_uninstall_independently(self):
+        self._seed(link=False)
+        integ.install("claude_code")
+        integ.uninstall("claude_code", home=str(self.second))
+        self.assertEqual(json.loads((self.second / "settings.json").read_text())["hooks"]["Stop"], [])
+        self.assertEqual(self._shared_stop_hooks(), 1)
+
+    def test_dry_run_uninstall_reports_without_writing(self):
+        self._seed(link=True)
+        integ.install("claude_code")
+        before = (self.default / "settings.json").read_text()
+        out = integ.uninstall("claude_code", dry_run=True)
+        self.assertTrue(out["changes"])
+        self.assertEqual((self.default / "settings.json").read_text(), before)
+        self.assertIn("khipu", self._mcp_servers(self.second / ".claude.json"))
+
+
+class ClaudeHomesStatusTest(_ClaudeHomesCase):
+    ROW_KEYS = {"path", "label", "source", "is_default", "exists", "settings_path", "mcp_paths", "linked_to",
+                "hook_stop", "hook_precompact", "hook_sessionend", "hook_subagentstop", "recall_rule",
+                "prompt_recall", "memory_tools_ok", "hooks_ok", "launcher_ok", "installed", "has_khipu"}
+
+    def test_each_home_is_a_row_with_the_documented_keys(self):
+        self._seed(link=True)
+        integ.install("claude_code")
+        st = integ.status("claude_code")
+        json.dumps(st)  # the CLI prints it
+        self.assertEqual([r["label"] for r in st["homes"]], ["Default", "T3 · Secondary"])
+        for r in st["homes"]:
+            self.assertEqual(set(r) - {"error", "aborted"}, self.ROW_KEYS)
+        default, second = st["homes"]
+        self.assertEqual(default["path"], str(self.default))
+        self.assertEqual(default["source"], "Claude Code, and T3's “Claude” account")
+        self.assertEqual(second["source"], "T3's “Secondary” account")
+        self.assertEqual(second["mcp_paths"], [str(self.second / ".claude.json")])
+        self.assertIsNone(default["linked_to"])
+        self.assertEqual(second["linked_to"], {"label": "Default", "path": str(self.default)})
+        for r in (default, second):
+            self.assertTrue(r["hooks_ok"] and r["memory_tools_ok"] and r["installed"], r)
+
+    def test_the_pack_is_not_installed_while_any_home_is_not(self):
+        self._seed(link=False)
+        integ.install("claude_code", home=str(self.default))
+        st = integ.status("claude_code")
+        self.assertTrue(self._row(st, "Default")["installed"])
+        second = self._row(st, "T3 · Secondary")
+        self.assertFalse(second["installed"])
+        self.assertFalse(second["memory_tools_ok"] or second["hooks_ok"])
+        self.assertTrue(st["detected"])
+        self.assertFalse(st["installed"])
+        self.assertFalse(st["mcp"] or st["hook_stop"])
+        self.assertEqual(st["recall_rule"], "missing")
+
+    def test_a_linked_home_reads_the_hooks_through_the_link(self):
+        self._seed(link=True)
+        integ.install("claude_code", home=str(self.default))
+        second = self._row(integ.status("claude_code"), "T3 · Secondary")
+        self.assertTrue(second["hooks_ok"], "its hooks are the Default home's")
+        self.assertFalse(second["memory_tools_ok"])
+        self.assertFalse(second["installed"])
+
+    def test_a_home_that_does_not_exist_does_not_hold_the_pack_back(self):
+        self.default.mkdir()
+        (self.home / ".claude.json").write_text("{}")
+        self._t3(("claudeAgent_secondary", {"driver": "claudeAgent", "config": {"homePath": "~/.claude-t3-second"}}))
+        integ.install("claude_code")
+        st = integ.status("claude_code")
+        self.assertTrue(st["installed"])
+        self.assertFalse(self._row(st, "T3 · claudeAgent_secondary")["exists"])
+
+    def test_an_unreadable_file_is_that_homes_error_not_a_traceback(self):
+        self._seed(link=False)
+        integ.install("claude_code")
+        (self.second / "settings.json").write_text("{broken")
+        st = integ.status("claude_code")
+        self.assertTrue(st["aborted"])
+        self.assertIn("refusing", st["error"])
+        self.assertIn("refusing", self._row(st, "T3 · Secondary")["error"])
+        self.assertTrue(self._row(st, "Default")["installed"])
+        self.assertFalse(st["installed"])
+
+    def test_verify_scopes_to_the_homes_that_have_khipu_and_lists_the_rest(self):
+        self._green_probes()
+        self._seed(link=False)
+        integ.install("claude_code", home=str(self.default))
+        out = integ.verify("claude_code")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["not_installed_homes"], ["T3 · Secondary"])
+        self.assertTrue(out["components"]["mcp"]["ok"])
+
+    def _drop_mcp(self, path: Path):
+        d = json.loads(path.read_text())
+        d["mcpServers"].pop("khipu")
+        path.write_text(json.dumps(d))
+
+    def test_verify_fails_a_home_with_hooks_but_no_memory_tools_and_names_it(self):
+        self._green_probes()
+        self._seed(link=False)
+        integ.install("claude_code")
+        self._drop_mcp(self.home / ".claude.json")
+        out = integ.verify("claude_code")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["not_installed_homes"], [])
+        self.assertEqual(out["components"]["mcp"]["error"], "not installed in Default")
+        self.assertEqual(out["components"]["install"], {"ok": False, "error": "Default is missing memory tools"})
+
+    def test_verify_fails_a_home_with_memory_tools_but_no_hooks_and_names_it(self):
+        self._green_probes()
+        self._seed(link=False)
+        integ.install("claude_code")
+        (self.second / "settings.json").write_text("{}")
+        out = integ.verify("claude_code")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["not_installed_homes"], [])
+        self.assertEqual(out["components"]["hook"]["error"], "not installed in T3 · Secondary")
+        self.assertEqual(out["components"]["install"]["error"],
+                         "T3 · Secondary is missing Stop hook, PreCompact hook")
+
+    def test_verify_fails_a_home_with_a_stale_khipu_command(self):
+        self._green_probes()
+        self._seed(link=False)
+        integ.install("claude_code", home=str(self.default))
+        (self.second / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"khipu": {"command": "/old/place/khipu-mcp"}}}))
+        out = integ.verify("claude_code")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["not_installed_homes"], [])
+        self.assertEqual(out["components"]["install"]["error"],
+                         "T3 · Secondary is missing memory tools, Stop hook, PreCompact hook")
+
+    def test_a_linked_home_with_only_the_owners_hooks_is_still_left_out(self):
+        self._green_probes()
+        self._seed(link=True)
+        integ.install("claude_code", home=str(self.default))
+        self._drop_mcp(self.home / ".claude.json")
+        integ.install("claude_code", home=str(self.second))
+        out = integ.verify("claude_code")
+        self.assertEqual(out["not_installed_homes"], [])
+        rows = {r["label"]: r for r in integ.status("claude_code")["homes"]}
+        self.assertTrue(rows["Default"]["has_khipu"])
+        self.assertTrue(rows["T3 · Secondary"]["has_khipu"])
+
+    def test_has_khipu_is_false_only_for_a_home_with_no_khipu_entry_at_all(self):
+        self._seed(link=True)
+        rows = {r["label"]: r for r in integ.status("claude_code")["homes"]}
+        self.assertFalse(rows["Default"]["has_khipu"])
+        self.assertFalse(rows["T3 · Secondary"]["has_khipu"])
+        integ.install("claude_code", home=str(self.default))
+        rows = {r["label"]: r for r in integ.status("claude_code")["homes"]}
+        self.assertTrue(rows["Default"]["has_khipu"])
+        self.assertFalse(rows["T3 · Secondary"]["has_khipu"], "its hooks are the owner's")
+
+    def test_verify_of_one_home_requires_that_home(self):
+        self._green_probes()
+        self._seed(link=False)
+        integ.install("claude_code", home=str(self.default))
+        self.assertTrue(integ.verify("claude_code", home=str(self.default))["ok"])
+        out = integ.verify("claude_code", home=str(self.second))
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["components"]["mcp"]["error"], "not installed in T3 · Secondary")
+        with self.assertRaises(integ.UnknownClaudeHome):
+            integ.verify("claude_code", home=str(self.home / "nowhere"))
+        with self.assertRaises(ValueError):
+            integ.verify("cursor", home=str(self.default))
+
+    def test_verify_with_no_home_installed_fails_naming_them(self):
+        self._green_probes()
+        self._seed(link=False)
+        out = integ.verify("claude_code")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["components"]["mcp"]["error"], "not installed in Default, T3 · Secondary")
+
+    def test_verify_fails_for_a_home_whose_config_cannot_be_read(self):
+        self._green_probes()
+        self._seed(link=False)
+        integ.install("claude_code")
+        (self.second / "settings.json").write_text("{broken")
+        self.assertFalse(integ.verify("claude_code")["ok"])
+
+    def test_doctor_row_per_home(self):
+        self._seed(link=True)
+        integ.install("claude_code", home=str(self.default))
+        rep = integ.claude_homes_report()
+        self.assertEqual([r["label"] for r in rep["homes"]], ["Claude Code", "Claude Code (T3 · Secondary)"])
+        self.assertEqual(rep["found"], 2)
+        self.assertFalse(rep["all_installed"])
+        self.assertEqual(rep["homes"][1]["linked_to"], {"label": "Default", "path": str(self.default)})
+        integ.install("claude_code")
+        self.assertTrue(integ.claude_homes_report()["all_installed"])
+
+    def test_doctor_all_installed_is_false_when_no_home_exists(self):
+        rep = integ.claude_homes_report()
+        self.assertEqual(rep["found"], 0)
+        self.assertFalse(rep["all_installed"])
+
+
+class ClaudeHomesCliTest(_ClaudeHomesCase):
+    def _run(self, *argv):
+        import io
+        from contextlib import redirect_stdout
+
+        from khipu import cli
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.cmd_integrations(cli.build_parser().parse_args(["integrations", *argv]))
+        return rc, buf.getvalue()
+
+    def test_install_and_uninstall_take_one_home(self):
+        self._seed(link=True)
+        rc, raw = self._run("install", "claude_code", "--home", str(self.second), "--no-verify")
+        self.assertEqual(rc, 0)
+        out = json.loads(raw)[0]
+        self.assertEqual([h["label"] for h in out["homes"]], ["T3 · Secondary"])
+        self.assertNotIn("khipu", json.loads((self.home / ".claude.json").read_text())["mcpServers"])
+        rc, raw = self._run("uninstall", "claude_code", "--home", str(self.second))
+        self.assertEqual(rc, 0)
+        self.assertNotIn("khipu", self._mcp_servers(self.second / ".claude.json"))
+
+    def test_install_of_the_installed_home_verifies_only_it_and_verify_takes_one_home(self):
+        self._green_probes()
+        self._seed(link=False)
+        rc, raw = self._run("install", "claude_code", "--home", str(self.default))
+        self.assertEqual(rc, 0, raw)
+        rc, raw = self._run("verify", "claude_code")
+        self.assertEqual(rc, 0, raw)
+        self.assertEqual(json.loads(raw)[0]["not_installed_homes"], ["T3 · Secondary"])
+        rc, raw = self._run("verify", "claude_code", "--home", str(self.second))
+        self.assertEqual(rc, 2)
+        rc, raw = self._run("verify", "claude_code", "--home", str(self.home / "nowhere"))
+        self.assertEqual(rc, 2)
+        self.assertFalse(json.loads(raw)["ok"])
+        rc, raw = self._run("verify", "all", "--home", str(self.default))
+        self.assertEqual(rc, 2)
+
+    def test_status_lists_the_homes(self):
+        self._seed(link=True)
+        rc, raw = self._run("status", "claude_code")
+        self.assertEqual(rc, 0)
+        self.assertEqual([r["label"] for r in json.loads(raw)[0]["homes"]], ["Default", "T3 · Secondary"])
+
+    def test_an_unknown_home_or_a_non_claude_harness_is_refused_with_exit_2(self):
+        self._seed(link=True)
+        rc, raw = self._run("install", "claude_code", "--home", str(self.home / "nowhere"))
+        self.assertEqual(rc, 2)
+        self.assertFalse(json.loads(raw)["ok"])
+        rc, raw = self._run("install", "all", "--home", str(self.default))
+        self.assertEqual(rc, 2)
+        self.assertIn("claude_code", json.loads(raw)["error"])
+        self.assertNotIn("mcpServers", json.loads((self.second / ".claude.json").read_text()))
+
+
+class DoctorListsClaudeHomesTest(_ClaudeHomesCase):
+    def setUp(self):
+        super().setUp()
+        for p in _green_doctor_patches():
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_doctor_has_one_row_per_home_and_an_uninstalled_home_does_not_fail_it(self):
+        import io
+        from contextlib import redirect_stdout
+
+        from khipu import cli
+        self._seed(link=True)
+        integ.install("claude_code", home=str(self.default))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.cmd_doctor(cli.build_parser().parse_args(["doctor"]))
+        out = json.loads(buf.getvalue())
+        self.assertEqual([r["label"] for r in out["claude_homes"]["homes"]],
+                         ["Claude Code", "Claude Code (T3 · Secondary)"])
+        self.assertFalse(out["claude_homes"]["all_installed"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["ok"])
