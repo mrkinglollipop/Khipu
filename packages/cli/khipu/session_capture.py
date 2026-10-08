@@ -276,7 +276,16 @@ def _clean_user_text(text: str) -> str:
     <system-reminder> blocks (thousands of chars of hook context, none of it the
     user), Cursor's <user_query>/<timestamp> wrappers, and the hand-over T3 Code
     glues in front of the first message after a provider switch."""
-    text = strip_handoff(_SYSTEM_REMINDER.sub("", text))
+    cleaned = _SYSTEM_REMINDER.sub("", text)
+    # A Claude system-reminder can leave its separator newline before a real
+    # T3 header. The public stripper stays strict; this harness cleanup owns
+    # that injected prefix.
+    if cleaned != text and cleaned.startswith("\n"):
+        candidate = cleaned.lstrip("\n")
+        stripped = strip_handoff(candidate)
+        text = stripped if stripped != candidate else cleaned
+    else:
+        text = strip_handoff(cleaned)
     return _CURSOR_WRAP.sub("", text)   # no strip: ACP user text arrives in chunks that must re-join exactly
 
 

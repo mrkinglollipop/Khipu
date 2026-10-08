@@ -131,11 +131,19 @@ class CursorShapeTest(unittest.TestCase):
     def test_session_start_in_a_t3_helper_session_injects_nothing(self):
         with mock.patch.object(rr, "session_start_context", side_effect=AssertionError("must not run")):
             with mock.patch.object(rr, "_session_start_cwd",
-                                   return_value="/var/folders/ab/T/t3code-claude-title-q7w8e9"):
+                                   return_value="/var/folders/ab/cd/T/t3code-claude-title-q7w8e9"):
                 buf = io.StringIO()
                 with redirect_stdout(buf):
                     rr.session_start_main()
         self.assertEqual(json.loads(buf.getvalue()), {})
+
+    def test_session_start_in_a_project_named_like_a_helper_still_injects(self):
+        with mock.patch.object(rr, "session_start_context", return_value="# Khipu memory"), \
+                mock.patch.object(rr, "_session_start_cwd", return_value="/work/t3code-claude-title-parser/src"):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rr.session_start_main()
+        self.assertIn("additionalContext", json.loads(buf.getvalue())["hookSpecificOutput"])
 
     def test_session_start_cwd_reads_cursor_workspace_roots(self):
         payload = json.dumps({"workspace_roots": ["/Volumes/Example/Code/Khipu/packages/cli"]})

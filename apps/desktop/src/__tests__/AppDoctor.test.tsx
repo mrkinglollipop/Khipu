@@ -145,4 +145,26 @@ describe("App — Home's Reinstall hook", () => {
     fireEvent.click((await screen.findAllByRole("button", { name: "Reinstall hook" }))[0]);
     expect(await screen.findByText("install failed: bad json")).toBeInTheDocument();
   });
+
+  it("keeps a health-check failure beside the reinstall result", async () => {
+    let failDoctor = false;
+    script((args) => {
+      if (args[0] === "doctor") {
+        if (failDoctor) throw new Error("hub unreachable");
+        return doctorDoc({ capture_liveness: RED });
+      }
+      if (args[1] === "install") return '[{"harness":"claude_code","detected":true,"changes":[]}]';
+      if (args[1] === "verify") {
+        return '[{"harness":"claude_code","detected":true,"ok":false,"components":{"hook":{"ok":false,"error":"Stop hook not found"}}}]';
+      }
+      return "{}";
+    });
+    render(<App />);
+    const button = (await screen.findAllByRole("button", { name: "Reinstall hook" }))[0];
+    failDoctor = true;
+    fireEvent.click(button);
+    const toast = await screen.findByText(/The health check then failed:/);
+    expect(toast).toHaveTextContent("Installed; verify failed: claude_code hook: Stop hook not found");
+    expect(toast).toHaveTextContent("hub unreachable");
+  });
 });

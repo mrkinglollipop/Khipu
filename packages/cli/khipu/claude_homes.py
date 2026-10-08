@@ -34,6 +34,15 @@ from khipu import t3
 DEFAULT_LABEL = "Default"
 
 
+def path_identity(path: str | os.PathLike) -> tuple[object, ...]:
+    """The inode for an existing path, else its resolved configured spelling."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return ("path", os.path.realpath(path))
+    return ("inode", stat.st_dev, stat.st_ino)
+
+
 @dataclass
 class ClaudeHome:
     path: Path
@@ -89,19 +98,19 @@ def discover(
     default_dir = default_dir if default_dir is not None else home / ".claude"
     default_json = default_json if default_json is not None else home / ".claude.json"
     homes: list[ClaudeHome] = []
-    by_real: dict[str, ClaudeHome] = {}
+    by_identity: dict[tuple[object, ...], ClaudeHome] = {}
 
     def add(path: Path, label: str, source: str, claude_json: Path) -> ClaudeHome:
-        real = os.path.realpath(path)
-        found = by_real.get(real)
+        identity = path_identity(path)
+        found = by_identity.get(identity)
         if found is None:
             found = ClaudeHome(path=path, label=label, sources=[source], claude_jsons=[claude_json])
             homes.append(found)
-            by_real[real] = found
+            by_identity[identity] = found
             return found
         if source not in found.sources:
             found.sources.append(source)
-        if all(os.path.realpath(j) != os.path.realpath(claude_json) for j in found.claude_jsons):
+        if all(path_identity(j) != path_identity(claude_json) for j in found.claude_jsons):
             found.claude_jsons.append(claude_json)
         return found
 
@@ -133,15 +142,16 @@ def settings_owners(homes: list[ClaudeHome]) -> dict[str, ClaudeHome]:
     lives in its own folder, else the first found); the rest are linked to it.
     Sets ``linked_to`` on the linked homes and returns ``{str(real): owner}``
     for them."""
-    groups: dict[str, list[ClaudeHome]] = {}
+    groups: dict[tuple[object, ...], list[ClaudeHome]] = {}
     for h in homes:
         h.linked_to = None
-        groups.setdefault(os.path.realpath(h.settings_path), []).append(h)
+        groups.setdefault(path_identity(h.settings_path), []).append(h)
     linked: dict[str, ClaudeHome] = {}
     for target, members in groups.items():
         if len(members) < 2:
             continue
-        owner = next((m for m in members if os.path.realpath(m.path / "settings.json") == str(m.real / "settings.json")),
+        owner = next((m for m in members
+                      if path_identity(Path(os.path.realpath(m.settings_path)).parent) == path_identity(m.path)),
                      members[0])
         for m in members:
             if m is not owner:
@@ -154,8 +164,12 @@ def transcript_home(transcript: str | os.PathLike, homes: list[ClaudeHome]) -> C
     """The home whose ``projects/`` folder holds this Claude transcript."""
     if not transcript:
         return None
-    candidates = {str(transcript), os.path.realpath(transcript)}
+    candidate = Path(transcript)
+    candidates = {str(candidate), os.path.realpath(candidate)}
     for h in homes:
+        for parent in (candidate.parent, *candidate.parents):
+            if parent.name == "projects" and path_identity(parent.parent) == path_identity(h.path):
+                return h
         for root in {str(h.path), str(h.real)}:
             prefix = root.rstrip("/") + "/projects/"
             if any(c.startswith(prefix) for c in candidates):

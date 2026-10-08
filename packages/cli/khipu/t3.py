@@ -18,6 +18,8 @@ a missing file, bad JSON or a changed shape is "nothing found", never an error.
 from __future__ import annotations
 
 import json
+import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -40,21 +42,38 @@ def settings_path(home: Path | None = None) -> Path:
 def is_helper_session(cwd: Any) -> bool:
     """A T3 helper session (thread-title generation): Khipu neither recalls
     into it nor captures it."""
-    return isinstance(cwd, str) and HELPER_CWD_MARKER in cwd
+    if not isinstance(cwd, str) or not cwd:
+        return False
+    path = Path(cwd)
+    if not path.name.startswith(HELPER_CWD_MARKER):
+        return False
+    parents = {str(path.parent), str(path.parent.resolve())}
+    temp_root = Path(tempfile.gettempdir())
+    temp_roots = {str(temp_root), str(temp_root.resolve()), "/tmp", "/private/tmp"}
+    return bool(parents & temp_roots) or any(re.fullmatch(
+        r"/(?:private/)?var/folders/[^/]+/[^/]+/T", parent,
+    ) for parent in parents)
 
 
 def strip_handoff(text: str) -> str:
     """The user's own words from a message that starts with T3's hand-over:
-    everything after the last ``\\n\\nUser message:\\n`` (nothing, when the
-    hand-over ends at the marker). Anything else, and a hand-over with no such
-    marker, comes back unchanged (a turn is never dropped on a guess)."""
-    if not isinstance(text, str) or not text.lstrip().startswith(HANDOFF_PREFIX):
+    everything after the first ``\\n\\nUser message:\\n`` following the last
+    historical item (or the header when there are none). Anything else, and a
+    hand-over with no such marker, comes back unchanged."""
+    if not isinstance(text, str):
         return text
-    _, marker, typed = text.rpartition(HANDOFF_USER_MARKER)
-    if marker:
-        return typed
-    # Nothing typed and the trailing newline already trimmed by the caller.
-    return "" if text.rstrip().endswith(HANDOFF_USER_MARKER.rstrip("\n")) else text
+    header, newline, rest = text.partition("\n")
+    provider, provider_newline, body = rest.partition("\n")
+    if (not newline or not provider_newline
+            or not re.fullmatch(r"Context handoff \([^)]+\):", header)
+            or not provider.startswith("Provider context handoff. Thread: ")):
+        return text
+    historical = [m.start() for m in re.finditer(r"(?m)^\[Historical ", text)]
+    start = historical[-1] if historical else len(header) + len(newline) + len(provider)
+    marker_at = text.find(HANDOFF_USER_MARKER, start)
+    if marker_at >= 0:
+        return text[marker_at + len(HANDOFF_USER_MARKER):]
+    return "" if text.endswith(HANDOFF_USER_MARKER.rstrip("\n")) else text
 
 
 def claude_instances(settings_file: Path) -> list[dict[str, Any]]:

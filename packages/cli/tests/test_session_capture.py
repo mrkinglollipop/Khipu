@@ -963,6 +963,9 @@ class T3HandoffCaptureTest(unittest.TestCase):
         self.assertEqual(sc._clean_user_text(handoff_wrapper(typed) + "\n" + reminder).strip(), typed)
         self.assertEqual(sc._clean_user_text("plain question"), "plain question")
 
+    def test_clean_user_text_keeps_a_user_typed_newline_prefix(self):
+        self.assertEqual(sc._clean_user_text("\n\nuser text"), "\n\nuser text")
+
     def test_the_window_holds_the_typed_turn_not_the_handoff(self):
         typed = "so what did we decide about the recall hook " + "x" * 220
         with tempfile.TemporaryDirectory() as td:
@@ -998,7 +1001,7 @@ class T3HelperSessionTest(unittest.TestCase):
     """T3 runs a Claude helper per thread title in ``t3code-claude-title-*``
     folders: nothing to capture, and nothing to log (slice A item 5)."""
 
-    HELPER_CWD = "/var/folders/ab/T/t3code-claude-title-q7w8e9"
+    HELPER_CWD = "/var/folders/ab/cd/T/t3code-claude-title-q7w8e9"
 
     def test_hook_main_skips_without_state_queue_or_heartbeat(self):
         with tempfile.TemporaryDirectory() as td, _home(td):
@@ -1010,6 +1013,16 @@ class T3HelperSessionTest(unittest.TestCase):
             self.assertTrue(out["skipped"] and not out["due"], out)
             self.assertEqual(sc.queued_jobs(), [])
             self.assertFalse((Path(td) / "kh").exists(), "no state, queue or heartbeat for a helper")
+
+    def test_project_named_like_a_helper_is_not_skipped(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            tp = _write(Path(td) / ".claude" / "projects" / "p" / "t.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": "keep this " + "x" * 300}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "ack " * 40}}])
+            out = sc.hook_main(json.dumps({"hook_event_name": "SessionEnd", "session_id": "t-real",
+                                           "cwd": "/work/t3code-claude-title-parser/src",
+                                           "transcript_path": str(tp)}))
+        self.assertNotIn("skipped", out)
 
     def test_the_shipped_hook_exits_zero_and_says_nothing(self):
         with tempfile.TemporaryDirectory() as td:

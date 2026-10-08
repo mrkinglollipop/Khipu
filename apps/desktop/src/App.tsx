@@ -1571,7 +1571,8 @@ export default function App() {
         message = String(e);
       } finally {
         // The doctor read clears the toast, so the message goes up after it.
-        await loadDoctor(true);
+        const doctorError = await loadDoctor(true);
+        if (message && doctorError) message = `${message} The health check then failed: ${doctorError}`;
         if (message) setError(message);
         setActionBusy(false);
       }

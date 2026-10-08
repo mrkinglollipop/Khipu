@@ -110,6 +110,16 @@ class DiscoveryTest(_TempHome):
         self.assertEqual(homes[1].label, "T3 · Real")  # first label found wins
         self.assertEqual(len(homes[1].sources), 3)
 
+    def test_case_aliases_are_one_home_when_the_volume_supports_them(self):
+        real = self.home / "ClaudeHome"
+        real.mkdir()
+        alias = self.home / "claudehome"
+        if not alias.exists():
+            self.skipTest("case-sensitive filesystem")
+        homes = self.discover(default_dir=real, environ={"CLAUDE_CONFIG_DIR": str(alias)})
+        self.assertEqual(len(homes), 1)
+        self.assertIn("CLAUDE_CONFIG_DIR", homes[0].sources)
+
     def test_the_default_folder_named_explicitly_is_still_one_home_with_two_claude_jsons(self):
         # A session with CLAUDE_CONFIG_DIR=~/.claude reads ~/.claude/.claude.json,
         # not ~/.claude.json, so the one home carries both.
@@ -158,6 +168,23 @@ class SettingsOwnersTest(_TempHome):
         self.assertIsNone(default.linked_to)
         self.assertIs(second.linked_to, default)
 
+    def test_owner_beats_a_linked_member_even_when_the_link_is_first(self):
+        default, linked = self._two_homes(link=True)
+        claude_homes.settings_owners([linked, default])
+        self.assertIsNone(default.linked_to)
+        self.assertIs(linked.linked_to, default)
+
+    def test_case_alias_of_shared_settings_has_the_same_owner(self):
+        default, second = self._two_homes(link=False)
+        alias = self.home / ".CLAUDE"
+        if not alias.exists():
+            self.skipTest("case-sensitive filesystem")
+        second.settings_path.unlink()
+        second.settings_path.symlink_to(alias / "settings.json")
+        claude_homes.settings_owners([second, default])
+        self.assertIsNone(default.linked_to)
+        self.assertIs(second.linked_to, default)
+
 
 class TranscriptHomeTest(_TempHome):
     def test_a_transcript_under_a_homes_projects_folder_belongs_to_it(self):
@@ -173,6 +200,25 @@ class TranscriptHomeTest(_TempHome):
         tp = self.home / ".claude-extra" / "projects" / "x" / "s.jsonl"
         self.assertIsNone(claude_homes.transcript_home(tp, homes))
 
+    def test_a_symlinked_home_directory_attributes_its_real_transcript(self):
+        real = self.home / "real-home"
+        (real / "projects" / "p").mkdir(parents=True)
+        alias = self.home / "alias-home"
+        alias.symlink_to(real)
+        homes = self.discover(environ={"CLAUDE_CONFIG_DIR": str(alias)})
+        transcript = real / "projects" / "p" / "session.jsonl"
+        self.assertEqual(claude_homes.transcript_home(transcript, homes).label, "CLAUDE_CONFIG_DIR")
+
+    def test_case_alias_attributes_a_transcript_when_supported(self):
+        root = self.home / ".Claude"
+        (root / "projects" / "p").mkdir(parents=True)
+        alias = self.home / ".claude"
+        if not alias.exists():
+            self.skipTest("case-sensitive filesystem")
+        homes = self.discover(default_dir=alias)
+        self.assertEqual(claude_homes.transcript_home(root / "projects" / "p" / "s.jsonl", homes).label,
+                         "Default")
+
 
 class T3FactsTest(unittest.TestCase):
     def test_handoff_is_stripped_to_what_the_user_typed(self):
@@ -183,22 +229,28 @@ class T3FactsTest(unittest.TestCase):
         self.assertIn("Selected 5 intact items; omitted 57 items.", wrapped)
         self.assertEqual(t3.strip_handoff(wrapped), "so does the recall block show up now?")
 
-    def test_the_last_user_message_marker_wins(self):
+    def test_the_first_marker_after_the_last_historical_item_wins(self):
         typed = "quoting a hand-over: \n\nUser message:\nnot me"
         # A marker inside an earlier historical item must not cut the real text short.
         wrapped = handoff_wrapper("typed once").replace(
             "Linked settings.json", "Linked\n\nUser message:\nsettings.json", 1)
         self.assertEqual(t3.strip_handoff(wrapped), "typed once")
-        self.assertEqual(t3.strip_handoff(handoff_wrapper(typed)), "not me")
+        self.assertEqual(t3.strip_handoff(handoff_wrapper(typed)), typed)
 
     def test_an_empty_typed_message_leaves_nothing(self):
         self.assertEqual(t3.strip_handoff(handoff_wrapper("")), "")
 
-    def test_a_trimmed_trailing_newline_after_the_marker_still_means_nothing_typed(self):
+    def test_a_trimmed_empty_handoff_still_means_no_user_text(self):
         self.assertEqual(t3.strip_handoff(handoff_wrapper("").rstrip()), "")
 
-    def test_leading_whitespace_before_the_prefix_still_counts(self):
-        self.assertEqual(t3.strip_handoff("\n\n" + handoff_wrapper("hello")), "hello")
+    def test_no_items_still_strips_after_the_header(self):
+        wrapped = (f"Context handoff (full_thread_summary):\n"
+                   f"Provider context handoff. Thread: {THREAD}.\n\nUser message:\nhello")
+        self.assertEqual(t3.strip_handoff(wrapped), "hello")
+
+    def test_a_nonheader_prefix_is_preserved(self):
+        prefixed = "\n\n" + handoff_wrapper("hello")
+        self.assertEqual(t3.strip_handoff(prefixed), prefixed)
 
     def test_ordinary_text_and_unmarked_handoffs_come_back_unchanged(self):
         for text in ("fix the bug", "", "Context handoff mentioned mid-sentence",
@@ -210,7 +262,13 @@ class T3FactsTest(unittest.TestCase):
         self.assertEqual(t3.strip_handoff(plain), plain)
 
     def test_helper_session_marker(self):
-        self.assertTrue(t3.is_helper_session("/var/folders/ab/T/t3code-claude-title-x1y2z3"))
+        self.assertTrue(t3.is_helper_session("/var/folders/ab/cd/T/t3code-claude-title-x1y2z3"))
+        self.assertTrue(t3.is_helper_session("/private/var/folders/q1/zk48y_7n6b75mtc9vb8fv2p40000gn/T/t3code-claude-title-6ihnNA"))
+        self.assertTrue(t3.is_helper_session(str(Path(tempfile.gettempdir()).resolve() / "t3code-claude-title-x")))
+        self.assertTrue(t3.is_helper_session("/tmp/t3code-claude-title-x"))
+        self.assertTrue(t3.is_helper_session("/private/tmp/t3code-claude-title-x"))
+        self.assertFalse(t3.is_helper_session("/work/t3code-claude-title-parser/src"))
+        self.assertFalse(t3.is_helper_session("/work/t3code-claude-title-parser"))
         self.assertFalse(t3.is_helper_session("/Users/me/code/project"))
         self.assertFalse(t3.is_helper_session(None))
         self.assertFalse(t3.is_helper_session(""))

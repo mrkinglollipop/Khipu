@@ -359,6 +359,64 @@ class ConfigUnreadable(RuntimeError):
     """An existing harness config could not be parsed, so it must not be rewritten."""
 
 
+_CLAUDE_JSON_LOCK_TIMEOUT = 5.0
+_CLAUDE_JSON_LOCK_STALE_AFTER = 10.0
+
+
+def _same_lock(lock: Path, observed: os.stat_result) -> bool:
+    try:
+        current = lock.stat()
+    except OSError:
+        return False
+    return (current.st_dev, current.st_ino, current.st_mtime_ns) == (
+        observed.st_dev, observed.st_ino, observed.st_mtime_ns,
+    )
+
+
+@contextlib.contextmanager
+def _claude_json_lock(path: Path):
+    """Serialize one Claude JSON update using its unresolved lock directory."""
+    lock = Path(f"{path}.lock")
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise ConfigUnreadable(f"{path} lock directory could not be created ({e})") from e
+    deadline = time.monotonic() + _CLAUDE_JSON_LOCK_TIMEOUT
+    owned: os.stat_result | None = None
+    while owned is None:
+        try:
+            lock.mkdir()
+            try:
+                owned = lock.stat()
+            except OSError as e:
+                raise ConfigUnreadable(f"{path} lock could not be read ({e})") from e
+            break
+        except FileExistsError:
+            try:
+                observed = lock.stat()
+            except FileNotFoundError:
+                continue
+            if time.time() - observed.st_mtime > _CLAUDE_JSON_LOCK_STALE_AFTER:
+                try:
+                    if _same_lock(lock, observed):
+                        lock.rmdir()
+                except OSError:
+                    pass
+            if time.monotonic() >= deadline:
+                raise ConfigUnreadable(f"{path} is locked by Claude; timed out waiting for {lock}")
+            time.sleep(0.05)
+        except OSError as e:
+            raise ConfigUnreadable(f"{path} lock could not be acquired ({e})") from e
+    try:
+        yield
+    finally:
+        if owned is not None and _same_lock(lock, owned):
+            try:
+                lock.rmdir()
+            except OSError:
+                pass
+
+
 def _load_json(path: Path) -> dict:
     """Read a harness config. ABSENT or EMPTY is {}; PRESENT-BUT-UNPARSEABLE
     raises.
@@ -457,9 +515,9 @@ def _pick_claude_homes(path: str | None, homes: list[_homes.ClaudeHome]) -> list
     (matched on the real path, so a ``~`` or a link spelling still finds it)."""
     if path is None:
         return homes
-    want = os.path.realpath(Path(path).expanduser())
+    want = _homes.path_identity(Path(path).expanduser())
     for h in homes:
-        if str(h.real) == want:
+        if _homes.path_identity(h.path) == want:
             return [h]
     raise UnknownClaudeHome(
         f"{path} is not a Claude home Khipu found ({', '.join(str(h.path) for h in homes)}); "
@@ -495,15 +553,16 @@ def _claude_has_mcp(h: _homes.ClaudeHome) -> bool:
 
 
 def _claude_mcp_install(path: Path, dry: bool, res: dict) -> None:
-    d = _load_json(path)
-    cur = d.get("mcpServers", {}).get("khipu")
     want = {"command": mcp_launcher()}
-    if cur != want:
-        res["changes"].append(f"{path}: mcpServers.khipu -> {want['command']}")
-        if not dry:
-            res.setdefault("backups", []).append(_backup(path))
-            d.setdefault("mcpServers", {})["khipu"] = want
-            _write_json(path, d)
+    with contextlib.nullcontext() if dry else _claude_json_lock(path):
+        d = _load_json(path)
+        cur = d.get("mcpServers", {}).get("khipu")
+        if cur != want:
+            res["changes"].append(f"{path}: mcpServers.khipu -> {want['command']}")
+            if not dry:
+                res.setdefault("backups", []).append(_backup(path))
+                d.setdefault("mcpServers", {})["khipu"] = want
+                _write_json(path, d)
 
 
 def _claude_hooks_install(settings: Path, dry: bool, res: dict) -> None:
@@ -589,13 +648,14 @@ def _claude_install(dry: bool, home: str | None = None) -> dict:
 
 
 def _claude_mcp_uninstall(path: Path, dry: bool, res: dict) -> None:
-    d = _load_json(path)
-    if "khipu" in d.get("mcpServers", {}):
-        res["changes"].append(f"{path}: remove mcpServers.khipu")
-        if not dry:
-            res.setdefault("backups", []).append(_backup(path))
-            d["mcpServers"].pop("khipu")
-            _write_json(path, d)
+    with contextlib.nullcontext() if dry else _claude_json_lock(path):
+        d = _load_json(path)
+        if "khipu" in d.get("mcpServers", {}):
+            res["changes"].append(f"{path}: remove mcpServers.khipu")
+            if not dry:
+                res.setdefault("backups", []).append(_backup(path))
+                d["mcpServers"].pop("khipu")
+                _write_json(path, d)
 
 
 def _claude_hooks_uninstall(settings: Path, dry: bool, res: dict) -> None:
@@ -714,7 +774,7 @@ def _claude_home_status(h: _homes.ClaudeHome) -> tuple[dict, dict]:
     # Any Khipu entry of this home's own, however stale. A linked home's hooks
     # are the owner's, so for it only the memory tools entry counts.
     own_hooks = any((stop, precompact, sessionend, subagentstop, rule, prompt_recall))
-    row["has_khipu"] = any(c is not None for c in mcp_cmds) or (own_hooks and h.linked_to is None)
+    row["has_khipu"] = _claude_has_mcp(h) or (own_hooks and h.linked_to is None)
     return row, launch
 
 
