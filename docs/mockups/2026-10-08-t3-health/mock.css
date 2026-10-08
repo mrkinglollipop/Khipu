@@ -1,0 +1,24 @@
+/* Mock-only layout for the Claude homes list. Tokens and components come from App.css. */
+.rail-nav{overflow:hidden}
+.hcard.homes-card{grid-column:1/-1}
+.homes{display:flex;flex-direction:column;margin:0 var(--s4) var(--s3);border:1px solid var(--border);border-radius:var(--r-sm)}
+.homes-head{display:flex;align-items:baseline;gap:var(--s2);padding:var(--s2) var(--s3);border-bottom:1px solid var(--border);font-size:var(--t-sm);font-weight:600;color:var(--text)}
+.homes-head .meta{font-weight:400}
+.home{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;column-gap:var(--s4);padding:var(--s3);border-bottom:1px solid var(--border)}
+.home:last-child{border-bottom:0}
+.home-id{display:flex;flex-direction:column;gap:2px;min-width:0}
+.home-line{display:flex;align-items:baseline;gap:var(--s2);flex-wrap:wrap}
+.home-name{font-weight:600;font-size:var(--t-md);color:var(--text)}
+.home-path{font-family:var(--mono);font-size:var(--t-sm);color:var(--text-2)}
+.home-src{font-size:var(--t-sm);color:var(--text-2)}
+.home-checks{display:flex;gap:var(--s3);font-size:var(--t-sm);color:var(--text-2);white-space:nowrap}
+.home-checks span{display:inline-flex;align-items:center;gap:4px}
+.home-acts{display:flex;align-items:center;gap:var(--s2);justify-content:flex-end;min-width:190px}
+.hcard .note.wrap{white-space:normal}
+.hcard.homes-card .note{font-size:var(--t-sm)}
+/* T3 Code card (2026-10-08) */
+.hcard.t3-card{grid-column:1/-1}
+.t3-legs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--s3);margin:0 var(--s4) var(--s3)}
+.t3-leg{border:1px solid var(--border);border-radius:var(--r-sm);padding:var(--s3);display:flex;flex-direction:column;gap:4px}
+.t3-leg .leg-name{font-weight:600;font-size:var(--t-md);color:var(--text);display:flex;align-items:center;gap:var(--s2)}
+.t3-leg .leg-line{font-size:var(--t-sm);color:var(--text-2);display:flex;align-items:center;gap:4px}
