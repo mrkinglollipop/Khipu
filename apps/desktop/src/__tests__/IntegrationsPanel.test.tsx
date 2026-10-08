@@ -226,6 +226,8 @@ describe("home rows", () => {
     expect(hasKhipuEntries(t3Home(T3_NOT_INSTALLED))).toBe(false);
     expect(hasKhipuEntries(t3Home({ ...T3_NOT_INSTALLED, hook_stop: true }))).toBe(true);
     expect(hasKhipuEntries(t3Home({ ...T3_NOT_INSTALLED, memory_tools_ok: true }))).toBe(true);
+    expect(hasKhipuEntries(t3Home({ ...T3_NOT_INSTALLED, has_khipu: true }))).toBe(true);
+    expect(hasKhipuEntries(t3Home({ memory_tools_ok: true, has_khipu: false }))).toBe(false);
     // A linked home's hooks are the owner's, not its own entries.
     expect(hasKhipuEntries(t3Home({ installed: false, memory_tools_ok: false }))).toBe(false);
   });
@@ -335,6 +337,16 @@ describe("IntegrationsPanel — Claude homes", () => {
     expect(within(card).getAllByRole("button", { name: /^Remove Khipu from / })).toHaveLength(2);
     expect(within(card).getByRole("button", { name: "Reinstall" })).toBeInTheDocument();
     expect(within(card).getByRole("button", { name: "Verify" })).toBeInTheDocument();
+  });
+
+  it("offers Remove for a linked stale Khipu entry reported by the CLI", async () => {
+    renderPanel(() => [claudeRow([home(), t3Home({
+      ...T3_NOT_INSTALLED,
+      has_khipu: true,
+      linked_to: { label: "Default", path: DEFAULT_PATH },
+    })])]);
+    const card = await claudeCard();
+    expect(within(card).getByRole("button", { name: "Remove Khipu from T3 · Secondary" })).toBeInTheDocument();
   });
 
   it("reads '1 home not installed' and offers Install on the missing home", async () => {

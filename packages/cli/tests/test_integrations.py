@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1197,7 +1198,147 @@ class WriteJsonTest(_ClaudeHomesCase):
         self.assertFalse(f.is_symlink())
 
 
+class ClaudeJsonLockTest(_ClaudeHomesCase):
+    def _config(self) -> Path:
+        path = self.home / ".claude.json"
+        path.write_text(json.dumps({"mcpServers": {"other": {"command": "keep"}}}))
+        return path
+
+    def test_held_lock_times_out_without_writing(self):
+        self.default.mkdir()
+        (self.default / "settings.json").write_text("{}")
+        path = self._config()
+        lock = Path(f"{path}.lock")
+        lock.mkdir()
+        before = path.read_text()
+        with mock.patch.object(integ, "_CLAUDE_JSON_LOCK_TIMEOUT", 0.01), \
+                mock.patch.object(integ.time, "monotonic", side_effect=[0, 0, 0.02]), \
+                mock.patch.object(integ.time, "sleep") as sleep:
+            out = integ._claude_install(False)
+        self.assertFalse(out["ok"])
+        self.assertIn("locked by Claude", out["error"])
+        sleep.assert_called_once_with(0.05)
+        self.assertEqual(path.read_text(), before)
+        self.assertTrue(lock.is_dir())
+
+    def test_stale_lock_is_taken_over_and_success_releases_it(self):
+        path = self._config()
+        lock = Path(f"{path}.lock")
+        lock.mkdir()
+        old = time.time() - 20
+        os.utime(lock, (old, old))
+        integ._claude_mcp_install(path, False, {"changes": []})
+        self.assertIn("khipu", json.loads(path.read_text())["mcpServers"])
+        self.assertFalse(lock.exists())
+
+    def test_a_lock_that_cannot_be_read_back_is_not_left_behind(self):
+        path = self._config()
+        lock = Path(f"{path}.lock")
+        real_stat = Path.stat
+
+        def flaky(self_, *a, **k):
+            if self_ == lock:
+                raise OSError("stat failed")
+            return real_stat(self_, *a, **k)
+
+        with mock.patch.object(Path, "stat", flaky):
+            with self.assertRaises(integ.ConfigUnreadable):
+                with integ._claude_json_lock(path):
+                    pass
+        self.assertFalse(lock.exists())
+
+    def test_owned_lock_releases_after_an_exception(self):
+        path = self._config()
+        with mock.patch.object(integ, "_write_json", side_effect=RuntimeError("disk")):
+            with self.assertRaises(RuntimeError):
+                integ._claude_mcp_install(path, False, {"changes": []})
+        self.assertFalse(Path(f"{path}.lock").exists())
+
+    def test_read_after_acquiring_keeps_a_concurrent_change(self):
+        path = self._config()
+        lock = Path(f"{path}.lock")
+        lock.mkdir()
+
+        def release(_: float) -> None:
+            path.write_text(json.dumps({"mcpServers": {"changed": {"command": "keep"}}}))
+            lock.rmdir()
+
+        with mock.patch.object(integ.time, "sleep", side_effect=release):
+            integ._claude_mcp_install(path, False, {"changes": []})
+        servers = json.loads(path.read_text())["mcpServers"]
+        self.assertIn("changed", servers)
+        self.assertIn("khipu", servers)
+
+    def test_uninstall_reads_after_acquiring_and_keeps_a_concurrent_change(self):
+        path = self._config()
+        data = json.loads(path.read_text())
+        data["mcpServers"]["khipu"] = {"command": integ.mcp_launcher()}
+        path.write_text(json.dumps(data))
+        lock = Path(f"{path}.lock")
+        lock.mkdir()
+
+        def release(_: float) -> None:
+            path.write_text(json.dumps({"mcpServers": {"khipu": {"command": integ.mcp_launcher()},
+                                                        "changed": {"command": "keep"}}}))
+            lock.rmdir()
+
+        with mock.patch.object(integ.time, "sleep", side_effect=release):
+            integ._claude_mcp_uninstall(path, False, {"changes": []})
+        self.assertEqual(json.loads(path.read_text())["mcpServers"], {"changed": {"command": "keep"}})
+
+    def test_owned_lock_never_removes_a_replacement_holder(self):
+        path = self._config()
+        lock = Path(f"{path}.lock")
+        with integ._claude_json_lock(path):
+            lock.rmdir()
+            lock.mkdir()
+        self.assertTrue(lock.is_dir())
+
+    def test_symlinked_config_uses_its_home_visible_lock(self):
+        real = self.home / "shared.json"
+        real.write_text('{"mcpServers": {}}')
+        link = self.home / ".claude.json"
+        link.symlink_to(real)
+        with integ._claude_json_lock(link):
+            self.assertTrue(Path(f"{link}.lock").is_dir())
+            self.assertFalse(Path(f"{real}.lock").exists())
+
+    def test_stale_nonempty_lock_times_out(self):
+        path = self._config()
+        lock = Path(f"{path}.lock")
+        lock.mkdir()
+        (lock / "holder").write_text("x")
+        old = time.time() - 20
+        os.utime(lock, (old, old))
+        with mock.patch.object(integ, "_CLAUDE_JSON_LOCK_TIMEOUT", 0), \
+                self.assertRaisesRegex(integ.ConfigUnreadable, "locked by Claude"):
+            integ._claude_mcp_install(path, False, {"changes": []})
+
+
 class ClaudeHomesInstallTest(_ClaudeHomesCase):
+    def test_linked_http_mcp_entry_counts_as_its_own_khipu_presence(self):
+        self._seed(link=True)
+        for entry in ({"type": "http", "url": "http://127.0.0.1:8787"}, None, "stale", []):
+            with self.subTest(entry=entry):
+                (self.second / ".claude.json").write_text(json.dumps({"mcpServers": {"khipu": entry}}))
+                rows = {r["label"]: r for r in integ.status("claude_code")["homes"]}
+                self.assertFalse(rows["Default"]["has_khipu"])
+                self.assertTrue(rows["T3 · Secondary"]["has_khipu"])
+                self.assertFalse(rows["T3 · Secondary"]["memory_tools_ok"])
+
+    def test_case_alias_selects_the_discovered_home_when_supported(self):
+        self._seed(link=False)
+        alias = self.home / ".CLAUDE"
+        if not alias.exists():
+            self.skipTest("case-sensitive filesystem")
+        self.assertTrue(integ._pick_claude_homes(str(alias), integ._claude_homes())[0].is_default)
+
+    def test_home_alias_selects_the_discovered_home(self):
+        self._seed(link=False)
+        alias = self.home / "second-alias"
+        alias.symlink_to(self.second)
+        self.assertEqual(integ._pick_claude_homes(str(alias), integ._claude_homes())[0].label, "T3 · Secondary")
+
     def test_install_reaches_every_home_found_each_with_its_own_files(self):
         self._seed(link=False)
         out = integ.install("claude_code")

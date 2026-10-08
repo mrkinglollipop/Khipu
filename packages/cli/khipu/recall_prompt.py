@@ -1122,7 +1122,7 @@ def prior_work_for_prompt(
     t0 = time.monotonic()
     # T3 Code glues a hand-over of earlier turns in front of the first message
     # after a provider switch; only what the user typed is worth searching.
-    prompt = strip_handoff(prompt or "").strip()
+    prompt = strip_handoff(prompt or "", prefer_last=True).strip()
 
     def _meta(
         *, legs: list[str] = (), degraded: str | None = None, reason: str,

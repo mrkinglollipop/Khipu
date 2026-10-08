@@ -60,6 +60,8 @@ export type ClaudeHomeRow = {
   launcher_ok?: boolean;
   /** Memory tools + Stop + PreCompact hooks + working launchers. */
   installed: boolean;
+  /** Any Khipu entry, including a stale or non-launcher MCP entry. */
+  has_khipu?: boolean;
   /** A config file in this home could not be read. */
   error?: string;
 };
@@ -263,6 +265,7 @@ export function homesUnreadable(row: Pick<StatusRow, "homes">): number {
 /** Whether Khipu has any entry of its own in this home. A linked home's hooks
  *  are the owner's, so only its memory tools count as its own. */
 export function hasKhipuEntries(h: ClaudeHomeRow): boolean {
+  if (typeof h.has_khipu === "boolean") return h.has_khipu;
   if (h.memory_tools_ok) return true;
   if (h.linked_to) return false;
   return Boolean(h.hook_stop || h.hook_precompact || h.hooks_ok || h.recall_rule === "installed");

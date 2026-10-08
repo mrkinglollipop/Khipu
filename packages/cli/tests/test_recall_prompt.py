@@ -631,9 +631,15 @@ class T3HandoffRecallTest(unittest.TestCase):
 
     def test_a_t3_helper_session_gets_no_recall_and_no_log_line(self):
         out, seen, log = self._run({"prompt": self.TYPED, "session_id": "t3-c",
-                                    "cwd": "/var/folders/ab/T/t3code-claude-title-q7w8e9"})
+                                    "cwd": "/var/folders/ab/cd/T/t3code-claude-title-q7w8e9"})
         self.assertEqual((out, seen), ({}, []))
         log.assert_not_called()
+
+    def test_a_project_named_like_a_helper_still_gets_recall(self):
+        out, seen, _ = self._run({"prompt": self.TYPED, "session_id": "t3-real",
+                                  "cwd": "/work/t3code-claude-title-parser/src"})
+        self.assertEqual(seen, [self.TYPED])
+        self.assertIn("additionalContext", out["hookSpecificOutput"])
 
 
 if __name__ == "__main__":
