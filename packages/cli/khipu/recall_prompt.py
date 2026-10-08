@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from khipu.t3 import is_helper_session, strip_handoff
+from khipu.t3 import handoff_thread, is_helper_session, strip_handoff
 
 # Hard wall-clock budget for the whole gated search (R1): a hook that can add
 # 3-6s (the pre-index literal pass — see search_text/ops_events R8) to every
@@ -1002,6 +1002,8 @@ def _row_tag(row: dict[str, Any]) -> str:
     row's ``status`` when its state is not current, so this is a no-op for
     every row this upgrade leaves unchanged — additive only)."""
     bits = [f"{row.get('kind', '?')} {row.get('id', '?')}"]
+    if row.get("episode_id") is not None:
+        bits.append(f"episode {row['episode_id']}")
     date = _row_date(row)
     if date:
         bits.append(date)
@@ -1028,22 +1030,16 @@ def render_block(hits: list[dict[str, Any]]) -> str:
         return ""
     from khipu.snippets import clip_snippet
 
-    lines = [_HEADING]
+    out = [_HEADING]
+    if len(f"{_HEADING}\n{_FOOTER}") > BLOCK_CHAR_BUDGET:
+        return ""
     for h in hits:
         snippet = clip_snippet(str(h.get("snippet") or h.get("label") or ""), 90)
-        lines.append(f"- [{_row_tag(h)}] {snippet}")
-    lines.append(_FOOTER)
-    out: list[str] = []
-    total = 0
-    for line in lines:
-        total += len(line) + 1
-        if total > BLOCK_CHAR_BUDGET and out:
+        line = f"- [{_row_tag(h)}] {snippet}"
+        if len("\n".join([*out, line, _FOOTER])) > BLOCK_CHAR_BUDGET:
             break
         out.append(line)
-    # Always keep the footer if anything else survived, so a truncated block
-    # never reads as the whole answer.
-    if out and out[-1] != _FOOTER:
-        out[-1] = _FOOTER
+    out.append(_FOOTER)
     return "\n".join(out)
 
 
@@ -1073,6 +1069,82 @@ def _outcome_for(reason: str, hits: list[Any]) -> str:
     if reason in _PRIOR_WORK_GATED_REASONS_FOR_OUTCOME or reason.startswith("gate error:"):
         return "gated"
     return "match" if hits else "no_match"
+
+
+def _thread_memory_hits(thread: str, *, progress: dict | None = None) -> list[dict[str, Any]]:
+    """Read authoritative standing decisions and open, unsnoozed commitments.
+
+    The replica has decision state but no commitment table. On a hub failure
+    it can supply decisions; raw open_loops are never treated as still open.
+    The caller bounds this entire leg by the existing search deadline.
+    """
+    from khipu import hub_snapshot
+    from khipu.db import has_columns
+
+    def rows_to_hits(rows):
+        grouped = {"decision": [], "commitment": []}
+        for kind, rid, text, episode, ts in rows:
+            grouped[kind].append({
+                "kind": kind, "id": str(rid), "ts": str(ts) if ts else None,
+                "snippet": text, "episode_id": episode,
+                "status": "standing" if kind == "decision" else "open",
+            })
+        # Give each surface space before more items from either can consume
+        # the block. Whole trailing lines are dropped by render_block.
+        hits = []
+        for i in range(3):
+            for kind in ("decision", "commitment"):
+                if i < len(grouped[kind]):
+                    hits.append(grouped[kind][i])
+        return hits
+
+    local_hits = []
+    try:
+        con = hub_snapshot.open_snapshot()
+        try:
+            con.execute("PRAGMA busy_timeout = 2")
+            cols = hub_snapshot._snapshot_table_columns(con, "decisions")
+            retracted = "AND d.retracted_at IS NULL" if "retracted_at" in cols else ""
+            rows = con.execute(
+                "SELECT 'decision', d.id, d.text, d.episode_id, d.decided_at "
+                "FROM decisions d JOIN episodes e ON e.id = d.episode_id "
+                "WHERE CASE WHEN json_valid(e.raw) THEN "
+                "json_extract(e.raw, '$.t3_thread_id') END = ? "
+                "AND e.deleted_at IS NULL AND d.superseded_by IS NULL "
+                f"{retracted} ORDER BY d.decided_at DESC, d.id DESC LIMIT 3", (thread,),
+            ).fetchall()
+            local_hits = rows_to_hits(rows)
+            for hit in local_hits:
+                hit["status"] = "standing (replica)"
+            if progress is not None:
+                progress["hits"] = local_hits
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001 — old/missing replicas cannot block the hub leg
+        pass
+    try:
+        with hub_snapshot.try_hub_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
+                cur.execute("SET LOCAL statement_timeout = '1000ms'")
+                retracted = "AND d.retracted_at IS NULL" if has_columns(cur, "decisions", "retracted_at") else ""
+                cur.execute(
+                    "SELECT * FROM (SELECT 'decision' AS kind, d.id, d.text, "
+                    "d.episode_id, d.decided_at AS ts FROM decisions d "
+                    "JOIN episodes e ON e.id = d.episode_id "
+                    "WHERE e.raw->>'t3_thread_id' = %s AND e.deleted_at IS NULL "
+                    f"AND d.superseded_by IS NULL {retracted} "
+                    "ORDER BY d.decided_at DESC, d.id DESC LIMIT 3) standing "
+                    "UNION ALL SELECT * FROM (SELECT 'commitment' AS kind, c.id, c.text, "
+                    "c.opened_episode, c.opened_at AS ts FROM commitments c "
+                    "JOIN episodes e ON e.id = c.opened_episode "
+                    "WHERE e.raw->>'t3_thread_id' = %s AND e.deleted_at IS NULL "
+                    "AND c.status = 'open' AND (c.due_after IS NULL OR c.due_after <= now()) "
+                    "ORDER BY c.opened_at, c.id LIMIT 3) owed", (thread, thread),
+                )
+                return rows_to_hits(cur.fetchall())
+    except Exception:  # noqa: BLE001 — recall must fail open on hub/schema errors
+        return local_hits
 
 
 def prior_work_for_prompt(
@@ -1122,6 +1194,7 @@ def prior_work_for_prompt(
     t0 = time.monotonic()
     # T3 Code glues a hand-over of earlier turns in front of the first message
     # after a provider switch; only what the user typed is worth searching.
+    thread = handoff_thread(prompt or "")
     prompt = strip_handoff(prompt or "", prefer_last=True).strip()
 
     def _meta(
@@ -1148,9 +1221,9 @@ def prior_work_for_prompt(
         from khipu.search_text import search_tokens
 
         tokens = search_tokens(prompt)
-        if not tokens:
+        if not tokens and not thread:
             return _gated("no content tokens")
-        if _is_trivial(tokens):
+        if _is_trivial(tokens) and not thread:
             return _gated("trivial acknowledgment")
     except Exception as exc:  # noqa: BLE001 — fail open
         return _gated(f"gate error: {exc}")
@@ -1163,9 +1236,23 @@ def prior_work_for_prompt(
     interpretation: dict[str, Any] | None = None
     stage: str | None = None
     progress: dict[str, Any] = {}
+    deadline = t0 + (max(0.05, budget_ms / 1000.0) + _BUDGET_SAFETY_SLACK_S
+                     if budget_ms is not None else TIMEOUT_S)
+    thread_box: dict[str, Any] = {}
+    thread_worker = None
+    if thread:
+        def read_thread():
+            try:
+                thread_box["hits"] = _thread_memory_hits(thread, progress=thread_box)
+            except Exception:  # noqa: BLE001 — a broken priority leg cannot sink ordinary recall
+                thread_box["hits"] = []
+        thread_worker = threading.Thread(target=read_thread, daemon=True)
+        thread_worker.start()
     try:
-        if budget_ms is not None:
-            outer_timeout = max(0.05, budget_ms / 1000.0) + _BUDGET_SAFETY_SLACK_S
+        if thread and (not tokens or _is_trivial(tokens)):
+            hits = []
+        elif budget_ms is not None:
+            outer_timeout = max(0, deadline - time.monotonic())
             result = _run_with_timeout(
                 _search_hits_budgeted, outer_timeout,
                 prompt, cwd=cwd, budget_ms=budget_ms, limit=limit, project=project,
@@ -1175,7 +1262,7 @@ def prior_work_for_prompt(
             degraded = result.get("degraded")
         else:
             result = _run_with_timeout(
-                _search_hits, TIMEOUT_S, prompt, cwd=cwd, limit=limit, tz=tz,
+                _search_hits, max(0, deadline - time.monotonic()), prompt, cwd=cwd, limit=limit, tz=tz,
                 progress=progress,
             )
             hits = result.get("hits") or []
@@ -1202,9 +1289,18 @@ def prior_work_for_prompt(
     except Exception as exc:  # noqa: BLE001 — fail open on any search failure
         reason = f"error: {type(exc).__name__}: {exc}"
         hits = []
+    if thread_worker is not None:
+        thread_worker.join(max(0, deadline - time.monotonic()))
+        priority = thread_box.get("hits") or []
+        if priority:
+            hits = priority + (hits or [])
+            legs = ["t3_thread", *legs]
+            reason = "ok"
+        if thread_worker.is_alive():
+            degraded_legs.append("t3_thread")
     ms = round((time.monotonic() - t0) * 1000, 1)
 
-    if hits and session_id:
+    if hits and session_id and not thread:
         ids = _hit_ids(hits)
         recent = _load_recent_batches(session_id)
         if ids in recent:
@@ -1233,7 +1329,9 @@ def prior_work_for_prompt(
         produced = ""
         _log(f"deliverable line skipped (not ready within {DELIVERABLE_LINE_TIMEOUT_S}s)")
     if produced:
-        context = f"{context}\n{produced}" if context else produced
+        combined = f"{context}\n{produced}" if context else produced
+        if not thread or len(combined) <= BLOCK_CHAR_BUDGET:
+            context = combined
     out = {"context": context, "hits": hits or [], "reason": reason, "ms": ms}
     out["legs"] = legs
     out["degraded"] = degraded
