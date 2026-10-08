@@ -1,4 +1,4 @@
-# Harnesses: a T3 Code card (mock, awaiting approval 2026-10-08)
+# Harnesses: a T3 Code card (mock, approved 2026-10-08)
 
 Static mock for showing Khipu-in-T3 health in the desktop app. It follows slices A to C of
 `docs/plans/2026-10-07-khipu-t3.md`. Open either `.html` in a browser; it follows the system appearance.
