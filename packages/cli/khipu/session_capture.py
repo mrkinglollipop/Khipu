@@ -1186,7 +1186,8 @@ def _heartbeat(harness: str, out: dict) -> None:
     for k in ("event", "session_id", "due", "reason", "new_turns", "new_chars", "queued", "error"):
         beat.pop(k, None)
     beat.update({k: v for k, v in out.items()
-                 if k not in ("transcript", "transcript_missing", "subagent_unsupported")})
+                 if k not in ("transcript", "transcript_missing", "transcript_never_written",
+                              "subagent_unsupported")})
     beat["harness"] = harness
     beat["dispatches"] = int(beat.get("dispatches", 0)) + 1
     turns = int(out.get("new_turns") or 0)
@@ -1212,6 +1213,13 @@ def _heartbeat(harness: str, out: dict) -> None:
     if out.get("transcript_missing"):
         beat["transcript_missing"] = int(beat.get("transcript_missing", 0)) + 1
         beat["last_transcript_missing_at"] = out["at"]
+        # The lifetime total above cannot say "in the last 24 h"; this can.
+        recent = [t for t in beat.get("transcript_missing_recent") or []
+                  if (_age(t) if _age(t) is not None else 1 << 30) <= 24 * 3600]
+        beat["transcript_missing_recent"] = (recent + [out["at"]])[-200:]
+    if out.get("transcript_never_written"):
+        beat["transcript_never_written"] = int(beat.get("transcript_never_written", 0)) + 1
+        beat["last_transcript_never_written_at"] = out["at"]
     if out.get("subagent_unsupported"):
         beat["subagent_unsupported"] = int(beat.get("subagent_unsupported", 0)) + 1
         beat["last_subagent_unsupported_at"] = out["at"]
@@ -1375,12 +1383,21 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                 out["reason"] = "no transcript path in payload"
             return out
         if not path.is_file():
-            # Real and benign: Claude Code fires SessionEnd for sessions that
-            # never wrote a line (headless -p runs, the desktop helper). Recorded
-            # by name so a wrong path on a real session is diagnosable.
-            out["reason"] = f"transcript missing: {path}"
-            if event in ("stop", "sessionend"):
+            # Benign when the session never wrote a line: Claude Code fires
+            # SessionEnd (and Stop, in -p runs) for sessions with no persisted
+            # transcript, and SubagentStop for agents whose own file is never
+            # written (the parent transcript carries their result). Only a
+            # session Khipu already read turns from (it has a state file) is
+            # losing anything; that one is what liveness turns red for.
+            if is_subagent_stop:
+                out["reason"] = f"subagent transcript not written: {path}"
+            elif event in ("stop", "sessionend") and track_sid and _state_file(harness, track_sid).exists():
+                out["reason"] = f"transcript missing after earlier turns: {path}"
                 out["transcript_missing"] = True
+            else:
+                out["reason"] = f"transcript never written: {path}"
+                if event in ("stop", "sessionend"):
+                    out["transcript_never_written"] = True
             return out
         with _state_lock(harness, track_sid) as acquired:
             if not acquired:
@@ -1936,16 +1953,17 @@ def liveness(harness: str) -> dict:
     stopped, newer_s = _stopped_hook_evidence(harness)
     if stopped:
         reasons.append(stopped)
-    # K7: a SessionEnd/Stop that could not find a readable transcript at all —
-    # a silent zero-capture otherwise. Red only while it's recent (24h); the
-    # accumulated count is a lifetime total, so a one-off months ago must not
-    # keep a harness red forever.
-    missing = int(beat.get("transcript_missing") or 0)
-    missing_age = _age(beat.get("last_transcript_missing_at"))
-    if missing and missing_age is not None and missing_age <= 24 * 3600:
+    # K7: a session Khipu had already read turns from lost its transcript —
+    # those turns past the last capture are gone. Counted over the last 24 h
+    # only; sessions that never wrote a transcript are not counted at all.
+    missing = sum(
+        1 for t in beat.get("transcript_missing_recent") or []
+        if (_age(t) if _age(t) is not None else 1 << 30) <= 24 * 3600
+    )
+    if missing:
         reasons.append(
-            f"{missing} session(s) ended without a readable transcript in the last 24 h — "
-            "the harness deleted or never wrote the transcript; check its transcript setting"
+            f"{missing} session(s) lost their transcript after earlier turns in the last 24 h — "
+            "the harness deleted or moved the transcript; check its transcript setting"
         )
     warnings: list[str] = []
     # K4: a warning, not red — SubagentStop firing with no transcript to read

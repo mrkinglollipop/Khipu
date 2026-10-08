@@ -276,17 +276,47 @@ class TranscriptMissingLivenessTest(unittest.TestCase):
             self.assertEqual(beat["transcript_missing"], 1)
             live = sc.liveness("claude_code")
             self.assertFalse(live["ok"], live)
-            self.assertTrue(any("readable transcript" in r for r in live["reasons"]), live["reasons"])
+            self.assertTrue(any("lost their transcript" in r for r in live["reasons"]), live["reasons"])
 
-    def test_a_transcript_missing_run_via_hook_main_increments_the_heartbeat(self):
+    def test_a_session_that_never_wrote_a_transcript_is_not_red(self):
         with tempfile.TemporaryDirectory() as td, _home(td):
             env = {"hook_event_name": "SessionEnd", "session_id": "tm1", "cwd": td,
                    "transcript_path": str(Path(td) / "nope.jsonl")}
             out = sc.hook_main(json.dumps(env), "claude_code")
             self.assertFalse(out["due"])
-            self.assertIn("transcript missing", out["reason"])
+            self.assertIn("transcript never written", out["reason"])
+            beat = sc._read_beat("claude_code")
+            self.assertEqual(beat.get("transcript_never_written"), 1)
+            self.assertFalse(beat.get("transcript_missing"))
+            live = sc.liveness("claude_code")
+            self.assertFalse(any("transcript" in r for r in live["reasons"]), live["reasons"])
+
+    def test_losing_a_transcript_after_earlier_turns_is_red(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            sc.save_state("claude_code", "tm2", {"offset": 3})
+            env = {"hook_event_name": "SessionEnd", "session_id": "tm2", "cwd": td,
+                   "transcript_path": str(Path(td) / "gone.jsonl")}
+            out = sc.hook_main(json.dumps(env), "claude_code")
+            self.assertIn("transcript missing after earlier turns", out["reason"])
             beat = sc._read_beat("claude_code")
             self.assertEqual(beat.get("transcript_missing"), 1)
+            live = sc.liveness("claude_code")
+            self.assertTrue(any("lost their transcript" in r for r in live["reasons"]), live["reasons"])
+
+    def test_old_losses_age_out_of_the_24h_count(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            sc._write_beat("claude_code", {"transcript_missing": 9,
+                                           "last_transcript_missing_at": sc._mint_ts(),
+                                           "transcript_missing_recent": ["2026-01-01T00:00:00Z"]})
+            live = sc.liveness("claude_code")
+            self.assertFalse(any("transcript" in r for r in live["reasons"]), live["reasons"])
+
+    def test_missing_subagent_file_is_named_as_such(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            env = {"hook_event_name": "SubagentStop", "session_id": "tm3", "cwd": td,
+                   "agent_id": "a1", "agent_transcript_path": str(Path(td) / "agent-a1.jsonl")}
+            out = sc.hook_main(json.dumps(env), "claude_code")
+            self.assertIn("subagent transcript not written", out["reason"])
 
 
 if __name__ == "__main__":

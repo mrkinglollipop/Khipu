@@ -1046,7 +1046,7 @@ class T3HelperSessionTest(unittest.TestCase):
             # silence above is the skip and not a hook that logs nothing anyway.
             r = run(td)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn("transcript missing", log.read_text())
+            self.assertIn("transcript never written", log.read_text())
 
 
 if __name__ == "__main__":
