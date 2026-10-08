@@ -754,6 +754,12 @@ def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
     # Hook jobs already carry the cached mapping. Explicit CLI/MCP captures
     # enter here without a job, and must retain the same thread provenance.
     if not payload.get("t3_thread_id"):
+        from khipu import t3 as _t3
+        if not hasattr(_t3, 'thread_for_session'):
+            # A long-lived MCP server can still hold the t3 from before the
+            # deploy that added this name; t3 is stdlib-only, so reloading is safe.
+            import importlib
+            importlib.reload(_t3)
         from khipu.t3 import thread_for_session
 
         sid = str(payload.get("session_id") or "")

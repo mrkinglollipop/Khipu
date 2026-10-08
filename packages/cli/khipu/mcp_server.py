@@ -1433,6 +1433,59 @@ def _tool_text(payload: dict, *, is_error: bool = False) -> dict:
     }
 
 
+# A stdio server lives as long as its client session, and a deploy (a
+# fast-forward of the checkout) can land mid-session. Tool handlers import
+# khipu lazily, so without this a call after a deploy loads a new module that
+# imports names a module loaded before the deploy does not have (2026-10-08:
+# khipu_capture failed with "cannot import name 'cache_thread'"). When any
+# loaded khipu source has changed, every khipu module but this one is dropped
+# so the next imports load one consistent version. Stdio only: the gateway is
+# multi-threaded and restarts on deploy.
+_RELOAD_ON_CHANGE = False
+_SEEN_MTIMES: dict[str, float] = {}
+
+
+def _khipu_modules() -> dict[str, object]:
+    return {name: mod for name, mod in list(sys.modules.items())
+            if name.startswith("khipu.") and name != __name__}
+
+
+def _source_mtime(mod: object) -> float | None:
+    try:
+        return os.stat(mod.__file__).st_mtime
+    except (AttributeError, TypeError, OSError):
+        return None
+
+
+def _note_loaded_modules() -> None:
+    for name, mod in _khipu_modules().items():
+        if name not in _SEEN_MTIMES:
+            mtime = _source_mtime(mod)
+            if mtime is not None:
+                _SEEN_MTIMES[name] = mtime
+
+
+def _drop_modules_if_code_changed() -> bool:
+    mods = _khipu_modules()
+    if not any(
+        name in _SEEN_MTIMES and _source_mtime(mod) not in (None, _SEEN_MTIMES[name])
+        for name, mod in mods.items()
+    ):
+        return False
+    package = sys.modules.get("khipu")
+    for name in mods:
+        sys.modules.pop(name, None)
+        # `from khipu import x` returns the package attribute when present.
+        child = name.split(".", 1)[1]
+        if package is not None and "." not in child and hasattr(package, child):
+            with contextlib.suppress(AttributeError):
+                delattr(package, child)
+    _SEEN_MTIMES.clear()
+    print("[khipu-mcp] khipu code changed on disk; reloading modules",
+          file=sys.stderr, flush=True)
+    return True
+
+
 def handle_message(msg: dict) -> dict | None:
     """One JSON-RPC message in, one response out (None for notifications)."""
     method = msg.get("method")
@@ -1472,6 +1525,8 @@ def handle_message(msg: dict) -> dict | None:
         func = TOOL_FUNCS.get(name)
         if func is None:
             return _error(req_id, -32602, f"unknown tool: {name}")
+        if _RELOAD_ON_CHANGE:
+            _drop_modules_if_code_changed()
         try:
             payload = func(params.get("arguments") or {})
         except ValueError as exc:  # argument/mode rejections → tool error, not crash
@@ -1488,6 +1543,9 @@ def handle_message(msg: dict) -> dict | None:
             else:
                 detail = f"{type(exc).__name__}: {exc}"
             return _result(req_id, _tool_text({"error": detail}, is_error=True))
+        finally:
+            if _RELOAD_ON_CHANGE:
+                _note_loaded_modules()
         return _result(req_id, _tool_text(payload))
     if is_notification:
         return None  # notifications/initialized, cancellations, etc.
@@ -1495,6 +1553,9 @@ def handle_message(msg: dict) -> dict | None:
 
 
 def main() -> int:
+    global _RELOAD_ON_CHANGE
+    _RELOAD_ON_CHANGE = True
+    _note_loaded_modules()
     print(f"[khipu-mcp] ready (pid {os.getpid()})", file=sys.stderr, flush=True)
     for line in sys.stdin:
         line = line.strip()
