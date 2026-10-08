@@ -577,7 +577,7 @@ export function IntegrationsPanel({
   /** Re-read doctor after an install/verify, so the evidence on these cards
    *  is never older than the action the user just took. The panel waits for it
    *  before the buttons come back. */
-  refreshHealth: () => Promise<void> | void;
+  refreshHealth: () => Promise<string | null | void> | void;
   onAnotherMac: () => void;
 }) {
   const [rows, setRows] = useState<StatusRow[] | null>(null);
@@ -743,9 +743,16 @@ export function IntegrationsPanel({
         // install changes what the heartbeat will say next; both live in the
         // doctor payload.
         await load();
-        await refreshHealth();
-        // The doctor read clears the toast, so the message goes up after it.
-        if (message) onToast(message);
+        const healthError = await refreshHealth();
+        // The doctor read clears the toast, so the message goes up after it,
+        // carrying the doctor's own failure when there was one.
+        if (message) {
+          onToast(
+            typeof healthError === "string" && healthError
+              ? `${message} The health check then failed: ${healthError.slice(0, 160)}`
+              : message,
+          );
+        }
         setBusy(null);
         // The button that was clicked is gone (Install and Remove swap) or was
         // disabled while the CLI ran; hand focus to the row's action.

@@ -82,14 +82,19 @@ const DOCTOR = JSON.stringify({
   claude_homes: { homes: [{ exists: true, installed: true }] },
 });
 
-function script(over: { install?: string; verify?: string; uninstall?: string }) {
+function script(over: { install?: string; verify?: string; uninstall?: string; doctorFailsAfterInstall?: string }) {
+  let installed = false;
   invokeMock.mockImplementation(async (cmd: string, payload?: { args?: string[] }) => {
     if (cmd === "dsn_configured") return true;
     if (cmd !== "run_khipu") return JSON.stringify({ ok: true });
     const args = payload?.args ?? [];
-    if (args[0] === "doctor") return DOCTOR;
+    if (args[0] === "doctor") {
+      if (installed && over.doctorFailsAfterInstall) throw new Error(over.doctorFailsAfterInstall);
+      return DOCTOR;
+    }
     if (args[0] === "integrations" && args[1] === "status") return JSON.stringify(STATUS);
     if (args[0] === "integrations" && args[1] === "install") {
+      installed = true;
       return over.install ?? '[{"harness":"claude_code","detected":true,"changes":[]}]';
     }
     if (args[0] === "integrations" && args[1] === "verify") return over.verify ?? "[]";
@@ -152,5 +157,16 @@ describe("App — Harnesses toasts survive the reload that follows an action", (
     fireEvent.click(within(card).getByRole("button", { name: "Remove Khipu from Default" }));
     await settled(before);
     expect(screen.getByText(/hooks were kept \(still used by T3 · Secondary\)/)).toBeInTheDocument();
+  });
+
+  it("keeps the doctor's own failure next to the action's result", async () => {
+    script({ doctorFailsAfterInstall: "hub unreachable" });
+    const card = await openHarnessesCard();
+    const before = doctorCalls();
+    fireEvent.click(within(card).getByRole("button", { name: "Install Khipu in T3 · Secondary" }));
+    await settled(before);
+    expect(
+      screen.getByText(/^Installed in T3 · Secondary\..*The health check then failed: Error: hub unreachable$/),
+    ).toBeInTheDocument();
   });
 });

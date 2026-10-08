@@ -1340,14 +1340,16 @@ export default function App() {
     }
   }, [openaiCompatKey, loadSecretsPresence, loadStatus, verifyModelKeys]);
 
-  const loadDoctor = useCallback(async (force = false) => {
-    if (!needsFetch("doctor", force)) return;
+  /** Resolves to the error it put in the toast, or null, so a caller that
+   *  posts its own toast afterwards can keep the doctor failure visible. */
+  const loadDoctor = useCallback(async (force = false): Promise<string | null> => {
+    if (!needsFetch("doctor", force)) return null;
     const seq = ++doctorSeq.current;
     markLoading("doctor", true);
     setError(null);
     try {
       const raw = await runKhipu(["doctor"]);
-      if (seq !== doctorSeq.current) return;
+      if (seq !== doctorSeq.current) return null;
       const parsed = parseJson(raw) as { ok?: boolean } | null;
       if (
         parsed === null ||
@@ -1356,7 +1358,7 @@ export default function App() {
       ) {
         // Keep last-good doctorOk; do not stamp fetchedAt so retry is not TTL-blocked.
         setError("Unexpected response from hub");
-        return;
+        return "Unexpected response from hub";
       }
       setDoctorText(prettyJson(raw));
       setDoctorParsed(parsed as Record<string, unknown>);
@@ -1427,9 +1429,12 @@ export default function App() {
         ).length,
       );
       fetchedAt.current.doctor = Date.now();
+      return null;
     } catch (e) {
       // Preserve last-good doctorOk/text; toast only.
-      if (seq === doctorSeq.current) setError(String(e));
+      if (seq !== doctorSeq.current) return null;
+      setError(String(e));
+      return String(e);
     } finally {
       if (seq === doctorSeq.current) markLoading("doctor", false);
     }
