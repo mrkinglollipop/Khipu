@@ -42,6 +42,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from khipu import t3 as _t3
+if not hasattr(_t3, 'handoff_thread'):
+    # A long-lived MCP server can still hold the t3 from before the
+    # deploy that added this name; t3 is stdlib-only, so reloading is safe.
+    import importlib
+    importlib.reload(_t3)
 from khipu.t3 import handoff_thread, is_helper_session, strip_handoff
 
 # Hard wall-clock budget for the whole gated search (R1): a hook that can add
