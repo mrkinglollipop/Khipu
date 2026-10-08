@@ -518,6 +518,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         claude_homes_block = _integ.claude_homes_report()
     except Exception as e:  # noqa: BLE001
         claude_homes_block = {"homes": [], "error": f"{type(e).__name__}: {e}"}
+    # T3's own files are read-only.  It is omitted entirely when no T3
+    # settings file exists, so a normal non-T3 install never gets a phantom
+    # provider card.  A malformed settings file still counts as detected: its
+    # contents can hold credentials, and health needs only its existence.
+    try:
+        from khipu import t3 as _t3
+
+        t3_health = _t3.health()
+    except Exception:  # noqa: BLE001 — doctor must never fail on T3 drift
+        t3_health = None
     # The switch registry's states, for visibility only — never gates `ok`.
     try:
         from khipu import features
@@ -563,6 +573,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "unknown_harness": unknown_harness,
         "launchers": launchers,
         "claude_homes": claude_homes_block,
+        **({"t3": t3_health} if t3_health is not None else {}),
         "features": features_block,
         "decision_links": decision_links_block,
         "not_configured": not_configured,
@@ -1166,14 +1177,16 @@ def cmd_search(args: argparse.Namespace) -> int:
     until = getattr(args, "until", None)
     session_id = getattr(args, "session_id", None)
     harness = getattr(args, "harness", None)
+    via = getattr(args, "via", None)
     source = getattr(args, "source", None)
+    provenance = {"via": via} if via else {}
     try:
         from khipu.embed import hybrid_search
 
         payload = hybrid_search(
             args.query, limit=args.limit, mode=mode, kind=kind, project=project,
             since=since, until=until, session_id=session_id, harness=harness,
-            source=source,
+            source=source, **provenance,
         )
     except ValueError as err:
         print(json.dumps({"ok": False, "error": str(err)}))
@@ -1189,7 +1202,7 @@ def cmd_search(args: argparse.Namespace) -> int:
             payload = search_stale_payload(
                 args.query, args.limit, semantic=(mode == "semantic"), kind=kind,
                 since=since, until=until, project=project, session_id=session_id,
-                harness=harness,
+                harness=harness, **provenance,
             )
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
@@ -1197,7 +1210,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     query_log.log_query(
         args.query, mode=mode,
         filters={"kind": kind, "project": project, "since": since, "until": until,
-                 "session_id": session_id, "harness": harness, "source": source},
+                 "session_id": session_id, "harness": harness, "via": via, "source": source},
         result_count=len(payload.get("results") or []), top=payload.get("results") or [],
         degraded=payload.get("degraded"),
     )
@@ -3632,6 +3645,7 @@ def build_parser() -> argparse.ArgumentParser:
     se.add_argument("--until", help="ISO date/datetime or relative, e.g. 7d / 24h")
     se.add_argument("--session-id", dest="session_id", help="Episode session_id prefix match")
     se.add_argument("--harness", help="Prefix of session_id before the colon")
+    se.add_argument("--via", help="Exact capture origin, e.g. t3")
     se.set_defaults(func=cmd_search)
 
     em = sub.add_parser(

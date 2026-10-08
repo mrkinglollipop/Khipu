@@ -2,7 +2,7 @@
 // with no Khipu in it is a warning, never "All harnesses recording"; a red
 // heartbeat or a dead database still wins.
 import { describe, expect, it } from "vitest";
-import { claudeHomesGap, harnessesBadge, railHealthLine } from "../railHealth";
+import { claudeHomesGap, harnessesBadge, railHealthLine, t3HealthGap } from "../railHealth";
 import type { LivenessPayload } from "../IntegrationsPanel";
 
 const OK: LivenessPayload = { ok: true, red: [], harnesses: { claude_code: { ok: true } } };
@@ -98,5 +98,17 @@ describe("harnessesBadge", () => {
   it("flags attention when the Claude homes check failed", () => {
     expect(harnessesBadge(OK, FAILED)).toEqual({ n: 1, quiet: false });
     expect(harnessesBadge({ ...OK, red: ["a", "b"] }, FAILED)).toEqual({ n: 2, quiet: false });
+  });
+});
+
+describe("T3 health", () => {
+  it("keeps the rail out of green when T3 cannot link its active threads", () => {
+    const gap = t3HealthGap({
+      detected: true,
+      lookup: { ok: false, error: "table not found" },
+      warnings: ["table not found"],
+    });
+    expect(railHealthLine(true, OK, NONE, gap)).toEqual({ tone: "warn", text: "T3 threads not linking" });
+    expect(harnessesBadge(OK, NONE, gap)).toEqual({ n: 1, quiet: false });
   });
 });

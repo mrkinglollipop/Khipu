@@ -15,7 +15,7 @@ export type Attention = {
   tone: "err" | "warn";
   title: string;
   cause: string;
-  fix?: { label: string; kind: "reinstall-hook" | "recall-probe" | "revisions" };
+  fix?: { label: string; kind: "reinstall-hook" | "recall-probe" | "revisions" | "open-harnesses" };
   harness?: string;
 };
 

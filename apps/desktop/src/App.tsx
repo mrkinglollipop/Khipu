@@ -35,8 +35,8 @@ import {
 } from "./ui";
 import { ComponentsPanel } from "./ComponentsPanel";
 import { IntegrationsPanel, runInstall } from "./IntegrationsPanel";
-import type { LivenessPayload, RecallProbeStatus } from "./IntegrationsPanel";
-import { claudeHomesGap, harnessesBadge, railHealthLine } from "./railHealth";
+import type { LivenessPayload, RecallProbeStatus, T3Health } from "./IntegrationsPanel";
+import { claudeHomesGap, harnessesBadge, railHealthLine, t3HealthGap } from "./railHealth";
 import type { ClaudeHomesReport } from "./railHealth";
 import { RightNowCard } from "./RightNow";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
@@ -998,6 +998,7 @@ export default function App() {
   // Home's four tiles read these straight off the doctor payload; nothing here
   // is derived from a field the report does not carry.
   const [liveness, setLiveness] = useState<LivenessPayload | null>(null);
+  const [t3Health, setT3Health] = useState<T3Health | null>(null);
   // D3: Home's "Right now" card — its own fetch (`liveness_now`, fixed
   // argv `khipu sessions liveness`) rather than reusing `liveness` above,
   // so a Capture now click can refresh just this card without waiting on
@@ -1097,6 +1098,7 @@ export default function App() {
   const [revRecent, setRevRecent] = useState<RecentRevision[]>([]);
   const [revShowId, setRevShowId] = useState("");
   const [query, setQuery] = useState("");
+  const recallSearchInput = useRef<HTMLInputElement | null>(null);
   const [searchText, setSearchText] = useState("");
   // A failed search used to clear searchText, which the render reads as
   // "never searched" — the failure vanished with the toast and the panel
@@ -1115,6 +1117,7 @@ export default function App() {
   const [searchSince, setSearchSince] = useState("");
   const [searchKind, setSearchKind] = useState("");
   const [searchHarness, setSearchHarness] = useState("");
+  const [searchVia, setSearchVia] = useState("");
   // The mock's chips row: a chip is the applied filter, "+ Filter" reveals the
   // inputs that set them.
   const [searchFiltersOpen, setSearchFiltersOpen] = useState(false);
@@ -1364,9 +1367,21 @@ export default function App() {
       setDoctorParsed(parsed as Record<string, unknown>);
       setDoctorOk(typeof parsed.ok === "boolean" ? parsed.ok : null);
       const { items } = buildAttention(parsed as Record<string, unknown>);
+      const doctorT3 = (parsed as { t3?: T3Health }).t3 ?? null;
+      const t3Warnings = doctorT3?.warnings ?? [];
+      if (t3Warnings.length > 0) {
+        items.push({
+          key: "t3",
+          tone: "warn",
+          title: doctorT3?.lookup?.ok === false ? "T3 Code is not linking threads" : "Recent T3 work is not linked to a thread",
+          cause: t3Warnings.join(". ") + ". Captures still land and remain searchable; thread filtering is unavailable until this is resolved.",
+          fix: { label: "Open Harnesses", kind: "open-harnesses" },
+        });
+      }
       const lv = (parsed as { capture_liveness?: LivenessPayload })
         .capture_liveness;
       setLiveness(lv ?? null);
+      setT3Health(doctorT3);
       setRecallProbe(
         (parsed as { recall_probe?: RecallProbeStatus }).recall_probe ?? null,
       );
@@ -1810,10 +1825,25 @@ export default function App() {
   /** `override` is how Activity's "Open in Recall" searches for an episode id
    *  without waiting a render for the query and mode it just set. */
   const doSearch = useCallback(
-    async (override?: { query?: string; mode?: SearchMode }) => {
+    async (override?: {
+      query?: string; mode?: SearchMode; via?: string; project?: string; since?: string; kind?: string; harness?: string;
+    }) => {
       const q = (override?.query ?? query).trim();
       const mode = override?.mode ?? searchMode;
-      if (!q) return;
+      const via = (override?.via ?? searchVia).trim();
+      const project = (override?.project ?? searchProject).trim();
+      const since = (override?.since ?? searchSince).trim();
+      const kind = override?.kind ?? searchKind;
+      const harness = (override?.harness ?? searchHarness).trim();
+      if (!q && !via) return;
+      if (!q) {
+        setSearchText("");
+        setSearchErr(null);
+        setRecallSelected(null);
+        setRecallDetail(null);
+        setRecallNeighbors([]);
+        return;
+      }
       setActionBusy(true);
       setSearchBusy(true);
       setError(null);
@@ -1828,10 +1858,11 @@ export default function App() {
         // and always as one `--name=value` token, so a value beginning with a
         // dash cannot be read as a flag.
         const args = ["search", "--mode", mode, "--limit", "20"];
-        if (searchProject.trim()) args.push(`--project=${searchProject.trim()}`);
-        if (searchSince.trim()) args.push(`--since=${searchSince.trim()}`);
-        if (searchKind) args.push(`--kind=${searchKind}`);
-        if (searchHarness.trim()) args.push(`--harness=${searchHarness.trim()}`);
+        if (project) args.push(`--project=${project}`);
+        if (since) args.push(`--since=${since}`);
+        if (kind) args.push(`--kind=${kind}`);
+        if (harness) args.push(`--harness=${harness}`);
+        if (via) args.push(`--via=${via}`);
         args.push("--", q);
         const raw = await runKhipu(args);
         setSearchText(prettyJson(raw));
@@ -1846,7 +1877,7 @@ export default function App() {
         setSearchBusy(false);
       }
     },
-    [query, searchMode, searchProject, searchSince, searchKind, searchHarness],
+    [query, searchMode, searchProject, searchSince, searchKind, searchHarness, searchVia],
   );
 
   /** `explicitId` is how a Recall result opens its own neighbourhood — the
@@ -1935,6 +1966,28 @@ export default function App() {
     },
     [doSearch],
   );
+
+  /** T3's card opens Recall with provenance, never a text guess based on the
+   * provider name.  An existing query is retained; otherwise the user gets a
+   * focused field with the `via:t3` chip already applied. */
+  const openT3Captures = useCallback(() => {
+    const existingQuery = query.trim();
+    setTab("recall");
+    setRecallView("search");
+    setSearchVia("t3");
+    setSearchFiltersOpen(true);
+    setSearchProject("");
+    setSearchSince("");
+    setSearchKind("");
+    setSearchHarness("");
+    setSearchText("");
+    setSearchErr(null);
+    if (existingQuery) {
+      void doSearch({ query: existingQuery, via: "t3", project: "", since: "", kind: "", harness: "" });
+    } else {
+      window.setTimeout(() => recallSearchInput.current?.focus(), 0);
+    }
+  }, [doSearch, query]);
 
   /** Owed → Activity: the capture that opened the commitment. */
   const openInActivity = useCallback(
@@ -2755,7 +2808,8 @@ export default function App() {
   const claudeHomes = claudeHomesGap(
     (doctorParsed as { claude_homes?: ClaudeHomesReport } | null)?.claude_homes,
   );
-  const railHealth = railHealthLine(dsnOk, liveness, claudeHomes);
+  const t3Gap = t3HealthGap(t3Health);
+  const railHealth = railHealthLine(dsnOk, liveness, claudeHomes, t3Gap);
 
   const coverage = (() => {
     if (!embedCoverage) return null;
@@ -3060,7 +3114,7 @@ export default function App() {
                     ? { n: openOwed, quiet: true }
                     : null
                   : id === "harnesses"
-                    ? harnessesBadge(liveness, claudeHomes)
+                    ? harnessesBadge(liveness, claudeHomes, t3Gap)
                     : null;
               return (
                 <button
@@ -3164,6 +3218,8 @@ export default function App() {
                             void runRecallProbe();
                           } else if (a.fix?.kind === "revisions") {
                             setTab("revisions");
+                          } else if (a.fix?.kind === "open-harnesses") {
+                            setTab("harnesses");
                           }
                         }}
                       >
@@ -3762,6 +3818,7 @@ export default function App() {
             <div className="inline">
               <input
                 className="grow"
+                ref={recallSearchInput}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder={
@@ -3860,6 +3917,25 @@ export default function App() {
                   ? harnessLabel(searchHarness.trim())
                   : "Any"}
               </Chip>
+              <Chip
+                on={Boolean(searchVia.trim())}
+                title="Exact capture origin, such as T3 Code"
+                onClick={() => setSearchFiltersOpen(true)}
+                onRemove={
+                  searchVia.trim()
+                    ? () => {
+                        setSearchVia("");
+                        if (query.trim()) void doSearch({ via: "" });
+                        else {
+                          setSearchText("");
+                          setSearchErr(null);
+                        }
+                      }
+                    : undefined
+                }
+              >
+                Source · {searchVia.trim() === "t3" ? "T3 Code" : searchVia.trim() || "Any"}
+              </Chip>
               <Chip onClick={() => setSearchFiltersOpen((o) => !o)}>
                 {searchFiltersOpen ? "Hide filters" : "+ Filter"}
               </Chip>
@@ -3910,6 +3986,18 @@ export default function App() {
                     value={searchHarness}
                     onChange={(e) => setSearchHarness(e.target.value)}
                     placeholder="any · e.g. claude_code"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void doSearch();
+                    }}
+                  />
+                </label>
+                <label className="filter-label">
+                  Source
+                  <input
+                    className="filter-input"
+                    value={searchVia}
+                    onChange={(e) => setSearchVia(e.target.value)}
+                    placeholder="any · e.g. t3"
                     onKeyDown={(e) => {
                       if (e.key === "Enter") void doSearch();
                     }}
@@ -4067,7 +4155,8 @@ export default function App() {
                         (searchProject.trim() ||
                         searchSince.trim() ||
                         searchKind ||
-                        searchHarness.trim()
+                        searchHarness.trim() ||
+                        searchVia.trim()
                           ? " The filter chips are still applied."
                           : "")
                       }
@@ -4667,7 +4756,9 @@ export default function App() {
             active={tab === "harnesses"}
             liveness={liveness}
             recallProbe={recallProbe}
+            t3={t3Health}
             refreshHealth={() => loadDoctor(true)}
+            onSearchT3Captures={openT3Captures}
             onAnotherMac={() => {
               setSettingsSection("another-mac");
               setTab("settings");

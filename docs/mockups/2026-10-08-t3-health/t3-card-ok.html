@@ -1,0 +1,97 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Khipu Harnesses mock: T3 Code</title><link rel="stylesheet" href="App.css"><link rel="stylesheet" href="mock.css"></head>
+<body><div id="root"><div class="shell">
+<nav class="rail" aria-label="Primary"><div class="rail-drag"></div>
+<div class="brand"><img class="brand-icon" src="../../../apps/desktop/src/assets/khipu-icon.png" width="26" height="26" alt=""><span class="brand-name">Khipu</span></div>
+<div class="rail-nav"><div class="nav-group">
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 8 4l5 4.5V13H3z"/></svg><span class="nav-label">Home</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4"/><path d="m10 10 3.5 3.5"/></svg><span class="nav-label">Recall</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h10M3 8h7M3 12h5"/><path d="m11 11 1.5 1.5L15 10"/></svg><span class="nav-label">Owed</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></svg><span class="nav-label">Activity</span></button>
+<button type="button" class="nav active" aria-current="page"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v3M11 3v3M3 6h10v3a5 5 0 0 1-10 0z"/><path d="M8 11v3"/></svg><span class="nav-label">Harnesses</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h10M3 11h10"/><circle cx="6" cy="5" r="1.5"/><circle cx="10" cy="11" r="1.5"/></svg><span class="nav-label">Settings</span></button>
+</div></div>
+<div class="rail-foot"><div class="rail-health"><span class="hdot ok" aria-hidden="true"></span><span>Memory is working</span></div>
+<div class="rail-meta"><button type="button" class="rail-feedback">Feedback</button><span class="version-chip">v0.4.9</span></div></div></nav>
+<main class="main"><section class="panel"><header class="panel-head"><div class="panel-head-text"><h1>Harnesses</h1><p class="lede">Which agents are wired in, and whether each one is actually recording.</p></div></header>
+<div class="panel-body wide">
+
+<div class="inline">
+<button type="button" class="primary">Install all</button>
+<button type="button">Verify all</button>
+<button type="button">Refresh</button>
+<span class="meta push">Verified = a real capture went in and came back out of search on this Mac</span>
+</div>
+
+<div class="hgrid">
+
+<!-- T3 Code: one card across both providers T3 runs. -->
+<div class="hcard t3-card">
+<div class="top"><span class="name">T3 Code</span><span class="tag ok"><span class="dot" aria-hidden="true"></span>Linking threads</span></div>
+<div class="checks"><div><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Thread lookup · reads T3's thread records, read-only</span></div><div><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Last capture linked to a thread 12 min ago · Codex</span></div><div><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>14 captures linked to a T3 thread today</span></div></div>
+<div class="t3-legs" role="list" aria-label="Providers T3 runs">
+<div class="t3-leg" role="listitem"><span class="leg-name">Claude accounts</span><span class="leg-line"><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>Default and Secondary installed · details in the Claude Code card</span></div>
+<div class="t3-leg" role="listitem"><span class="leg-name">Codex</span><span class="leg-line"><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>Hooks installed · details in the Codex card</span></div>
+</div>
+<div class="note wrap">When you switch account or provider inside a thread, Khipu recalls that thread's decisions and open commitments first.</div>
+<div class="note wrap">Khipu reads T3's settings and thread records. It never changes them.</div>
+<div class="hacts"><button type="button" class="sm">Recheck</button><button type="button" class="sm link push">Search T3 captures</button></div>
+</div>
+
+<!-- Claude Code: shared evidence on top, one row per Claude home below. -->
+<div class="hcard homes-card">
+<div class="top"><span class="name">Claude Code</span><span class="tag ok"><span class="dot" aria-hidden="true"></span>Recording</span></div>
+<div class="checks">
+<div><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Capture hook · last capture 4 min ago</span></div>
+<div><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Recall at session start</span></div>
+<div><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Verified 2 h ago · 3.1 s round trip</span></div>
+</div>
+<div class="homes" role="list" aria-label="Claude homes">
+<div class="homes-head">Claude homes <span class="meta">2 found</span></div>
+<div class="home" role="listitem">
+<div class="home-id"><div class="home-line"><span class="home-name">Default</span><span class="home-path">~/.claude</span></div>
+<span class="home-src">Claude Code, and T3's “Claude” account</span></div>
+<div class="home-checks"><span><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>Hooks</span><span><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>Memory tools</span></div>
+<div class="home-acts"><span class="tag ok"><span class="dot" aria-hidden="true"></span>Installed</span><button type="button" class="sm link">Remove</button></div>
+</div>
+<div class="home" role="listitem">
+<div class="home-id"><div class="home-line"><span class="home-name">T3 · Secondary</span><span class="home-path">~/.claude-t3-second</span></div>
+<span class="home-src">T3's “Secondary” account · settings linked to ~/.claude, so its hooks are the Default home's</span></div>
+<div class="home-checks"><span><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>Hooks</span><span><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>Memory tools</span></div>
+<div class="home-acts"><span class="tag ok"><span class="dot" aria-hidden="true"></span>Installed</span><button type="button" class="sm link">Remove</button></div>
+</div>
+</div>
+<div class="note wrap">Khipu finds Claude homes in ~/.claude, CLAUDE_CONFIG_DIR and T3's settings. It reads T3's settings and never changes them.</div>
+<div class="hacts"><button type="button" class="sm">Reinstall</button><button type="button" class="sm">Verify</button></div>
+</div>
+
+<div class="hcard">
+<div class="top"><span class="name">Cursor</span><span class="tag ok"><span class="dot" aria-hidden="true"></span>Recording</span></div>
+<div class="checks">
+<div><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Capture hook · last capture 1 h ago</span></div>
+<div><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Recall rule · one per project</span></div>
+<div><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Memory tools (MCP)</span></div>
+<div><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Verified 3 days ago · 2.8 s round trip</span></div>
+</div>
+<div class="note mono">~/.cursor/mcp.json · ~/.cursor/hooks.json</div>
+<div class="hacts"><button type="button" class="sm">Reinstall</button><button type="button" class="sm">Verify</button><button type="button" class="sm link push">Remove</button></div>
+</div>
+
+<div class="hcard">
+<div class="top"><span class="name">Codex</span><span class="tag ok"><span class="dot" aria-hidden="true"></span>Recording</span></div>
+<div class="checks">
+<div><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Capture hook · last capture 6 h ago</span></div>
+<div><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Recall at session start</span></div>
+<div><svg class="ck ok" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Memory tools (MCP)</span></div>
+<div><svg class="ck off" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/></svg><span>Not verified on this pack yet — Verify runs it</span></div>
+</div>
+<div class="note mono">~/.codex/config.toml · ~/.codex/hooks.json</div>
+<div class="hacts"><button type="button" class="sm">Reinstall</button><button type="button" class="sm">Verify</button><button type="button" class="sm link push">Remove</button></div>
+</div>
+
+<div class="hcard dashed"><b>Another Mac</b><span class="meta wrap">Save a join kit here and open it on the new Mac.</span><button type="button" class="sm">Save join kit…</button></div>
+
+</div>
+
+<p class="muted">Install writes Khipu's own entries next to whatever is already there and backs each file up first. Your existing capture hooks keep running. Restart a harness after installing so it loads the change.</p>
+</div></section></main></div></div></body></html>
