@@ -843,6 +843,14 @@ class SessionPlanClosureTest(unittest.TestCase):
         payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "stop"}
         self.assertEqual(co.close_session_plan(cur, payload, 9), 0)
 
+    def test_idle_sweep_keeps_stop_semantics_even_with_a_sessionend_scope(self):
+        cur = self._cur()
+        payload = {"project": "acme/widget", "session_id": "claude:s1",
+                   "event": "idle_sweep", "scope": "claude sessionend"}
+        self.assertEqual(co.close_session_plan(cur, payload, 9), 0)
+        payload["closed_loops"] = [{"text": "Drive 46 is still running"}]
+        self.assertEqual(co.close_session_plan(cur, payload, 9), 1)
+
     def test_a_mention_in_closed_loops_closes_it_without_sessionend(self):
         cur = self._cur()
         payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "stop",

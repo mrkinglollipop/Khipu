@@ -34,6 +34,7 @@ class JobsRunTest(unittest.TestCase):
                  self.log_dir / f"{log_stem}.err.log",
              )), \
              mock.patch.object(jobs.subprocess, "run", side_effect=run_fn) as run_mock, \
+             mock.patch("khipu.session_capture.drain", return_value={"failed": 0}), \
              mock.patch("khipu.embed.backfill", return_value={"embedded": 0}), \
              mock.patch("khipu.embed.prune_query_cache", return_value=0):
             # The nightly's own embed sweep and cache prune reach the hub;
@@ -62,6 +63,23 @@ class JobsRunTest(unittest.TestCase):
         state = json.loads((self.data_dir / "state" / "job-nightly.json").read_text())
         self.assertEqual(state["exit"], 0)
 
+    def test_failed_drain_sets_return_code_without_blocking_other_steps(self):
+        for consolidate_rc, expected in ((0, 1), (3, 3)):
+            with self.subTest(consolidate_rc=consolidate_rc), \
+                    mock.patch.object(jobs, "_drain_sessions", return_value={"ok": False, "failed": 1}), \
+                    mock.patch.object(jobs, "_run_script", return_value=consolidate_rc) as script, \
+                    mock.patch.object(jobs, "_record_nightly_step") as record, \
+                    mock.patch.object(jobs, "_reconcile_notes_if_due"), \
+                    mock.patch.object(jobs, "_embed_backfill"), \
+                    mock.patch.object(jobs, "_prune_query_cache"), \
+                    mock.patch.object(jobs, "_mark_stale_commitments"), \
+                    mock.patch.object(jobs, "_hygiene_commitments"), \
+                    mock.patch.object(jobs, "_briefs_build_if_on", return_value=None):
+                self.assertEqual(jobs.run_nightly(), expected)
+            script.assert_called_once()
+            self.assertFalse(record.call_args_list[0].kwargs["ok"])
+            self.assertEqual(record.call_count, 7)
+
     def test_run_nightly_writes_nightly_last_json_with_every_step(self):
         """F3/D1: nightly-last.json is the persisted evidence Phase 6 will
         read — one entry per step, not just free text in the log."""
@@ -78,7 +96,7 @@ class JobsRunTest(unittest.TestCase):
         names = [s["name"] for s in payload["steps"]]
         self.assertEqual(
             names,
-            ["consolidate_nightly", "notes_reconcile", "embed_backfill",
+            ["sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
              "query_cache_prune", "commitments_mark_stale", "commitments_hygiene"],
         )
         for step in payload["steps"]:
