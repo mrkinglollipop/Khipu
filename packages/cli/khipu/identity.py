@@ -92,10 +92,17 @@ def _resolve_project_alias(cur, project: str) -> str | None:
     connection (every hook call — see ``resolve_repo_root``'s own contract)
     simply skip it by not passing ``cur``."""
     try:
+        cur.execute("SAVEPOINT project_alias_lookup", ())
         cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (project,))
         row = cur.fetchone()
+        cur.execute("RELEASE SAVEPOINT project_alias_lookup", ())
         return str(row[0]) if row and row[0] else None
     except Exception:  # noqa: BLE001 — alias lookup is best-effort only
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT project_alias_lookup", ())
+            cur.execute("RELEASE SAVEPOINT project_alias_lookup", ())
+        except Exception:  # noqa: BLE001
+            pass
         return None
 
 
