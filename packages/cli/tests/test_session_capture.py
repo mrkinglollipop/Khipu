@@ -1061,3 +1061,37 @@ class T3HelperSessionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReclaimDeadClaimTest(unittest.TestCase):
+    """A claim whose drain process is gone goes back to the queue at once."""
+
+    def _dead_pid(self) -> int:
+        import sys
+
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        return p.pid
+
+    def test_a_claim_from_a_dead_process_is_released_without_waiting(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            q = sc.queue_dir()
+            q.mkdir(parents=True, exist_ok=True)
+            dead = q / f"20261010T000000Z-codex-s-aaaa.claimed.{self._dead_pid()}"
+            live = q / f"20261010T000000Z-codex-s-bbbb.claimed.{os.getppid()}"
+            odd = q / "20261010T000000Z-codex-s-cccc.claimed.notapid"
+            for f in (dead, live, odd):
+                f.write_text("{}")
+            self.assertEqual(sc._reclaim_stale(), 1)
+            self.assertTrue((q / "20261010T000000Z-codex-s-aaaa.json").is_file())
+            self.assertTrue(live.is_file())
+            self.assertTrue(odd.is_file())
+
+    def test_this_process_never_reclaims_its_own_claim(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            q = sc.queue_dir()
+            q.mkdir(parents=True, exist_ok=True)
+            mine = q / f"20261010T000000Z-codex-s-dddd.claimed.{os.getpid()}"
+            mine.write_text("{}")
+            self.assertEqual(sc._reclaim_stale(), 0)
+            self.assertTrue(mine.is_file())

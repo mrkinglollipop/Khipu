@@ -108,6 +108,13 @@ except Exception:  # noqa: BLE001 — a malformed payload must not break logging
     SID = ""
 def _say(msg):
     print(f"{_stamp()} [khipu-stop-hook] session={SID or '?'}{tag} {msg}", file=sys.stderr)
+def _queued(q):
+    # A large window is queued as several jobs, so this is a list as often as a
+    # name. Concatenating the list raised after the jobs were already queued and
+    # logged a capture that had happened as "capture skipped" (2026-09-29 on).
+    if not q:
+        return ""
+    return " queued=" + (",".join(str(x) for x in q) if isinstance(q, (list, tuple)) else str(q))
 try:
     # 1. Native capture for THIS session (harness inferred from the payload
     #    unless the pack pinned KHIPU_HARNESS). Never raises; always heartbeats.
@@ -119,7 +126,7 @@ try:
         sys.exit(0)
     SID = str(r.get("session_id") or SID or "")
     _say(f"capture {r.get('harness')} {r.get('event')} due={r.get('due')} "
-         f"{r.get('reason', '')}{' queued=' + r['queued'] if r.get('queued') else ''}"
+         f"{r.get('reason', '')}{_queued(r.get('queued'))}"
          f"{' ERROR ' + r['error'] if r.get('error') else ''}")
 except Exception as e:  # noqa: BLE001 — fail-open, always
     _say(f"capture skipped: {type(e).__name__}: {e}")

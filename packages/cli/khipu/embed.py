@@ -558,12 +558,15 @@ def query_cache_status(cur) -> dict[str, Any]:
     return {"available": True, "rows": int(rows), "hits": int(hits)}
 
 
-# Per-request text cap by provider. Gemini's batchEmbedContents allows 100 and
-# callers already stay at BATCH (64), so it is left alone (None = send as given).
+# Per-request text cap by provider. Gemini's batchEmbedContents rejects more
+# than 100 requests with a 400. The backfills batch at BATCH (64), but the
+# per-row callers (a topic, a commitment, embed-on-capture) send every chunk of
+# one row at once: a note of more than 100 chunks failed the Stop hook's whole
+# catch-up on every run until the nightly embedded it (2026-10-09, 1,042 runs).
 # Voyage allows 1000 texts but caps tokens per request (120K for the large
 # models): 32 chunks of <= 8000 chars is about 64K tokens worst case.
 _MAX_PER_REQUEST: dict[str, int | None] = {
-    "gemini": None,
+    "gemini": 100,
     "voyage": 32,
     "openai-compatible": 64,
 }

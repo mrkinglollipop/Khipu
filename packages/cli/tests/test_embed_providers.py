@@ -287,8 +287,19 @@ class GeminiStaysPutTest(_Base):
         self.assertEqual(req["requests"][0]["content"], {"parts": [{"text": "hi"}]})
         self.assertEqual(out[0][0], 1.0)
 
-    def test_gemini_is_never_split_by_the_provider_cap(self) -> None:
-        self.assertIsNone(embed._MAX_PER_REQUEST["gemini"])
+    def test_gemini_splits_at_the_batch_cap_of_100(self) -> None:
+        # batchEmbedContents answers 400 past 100 requests; one long note is
+        # more chunks than that.
+        def reply(n: int) -> bytes:
+            return json.dumps({"embeddings": [{"values": _vec(embed.DIM)}] * n}).encode()
+
+        t = FakeTransport(reply(100), reply(100), reply(37))
+        with mock.patch.object(embed, "_gemini_key", return_value="g-key"):
+            out = embed.embed_batch([f"c{i}" for i in range(237)], profile=embed.PROFILE_2,
+                                    retries=0, transport=t)
+        self.assertEqual([len(c[1]["requests"]) for c in t.calls], [100, 100, 37])
+        self.assertEqual(t.calls[2][1]["requests"][0]["content"], {"parts": [{"text": "c200"}]})
+        self.assertEqual(len(out), 237)
 
     def test_an_unknown_profile_still_raises_value_error(self) -> None:
         with self.assertRaises(ValueError):
