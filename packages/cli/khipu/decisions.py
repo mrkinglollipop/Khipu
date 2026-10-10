@@ -47,6 +47,18 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
+def _redacted_value(value: Any) -> Any:
+    from khipu.redact import redact_secrets
+
+    if isinstance(value, str):
+        return redact_secrets(value)[0]
+    if isinstance(value, dict):
+        return {key: _redacted_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redacted_value(item) for item in value]
+    return value
+
+
 def _decisions_ready(cur) -> bool:
     """True when migration 0019 (the ``decisions`` table) has been applied.
 
@@ -163,6 +175,12 @@ def _stale_briefs(cur, decision_id: int) -> None:
     briefs.mark_stale_for_decision(cur, decision_id)
 
 
+def _lock_decision_row(cur, decision_id: int) -> None:
+    cur.execute("SELECT id, project, superseded_by FROM decisions WHERE id = %s FOR UPDATE",
+                (decision_id,))
+    cur.fetchone()
+
+
 def _fetch_decision_row(cur, decision_id: int) -> dict[str, Any] | None:
     cur.execute(
         "SELECT id, project, superseded_by FROM decisions WHERE id = %s",
@@ -219,7 +237,14 @@ def _find_recent_duplicate(cur, project: str | None, norm_text: str, decided_at:
     decided within ``DEDUP_WINDOW_DAYS`` before (or at) ``decided_at`` — or
     None. A reversal restated in the same conversation, or a fact repeated
     across nearby captures, is one decision, not a growing pile of identical
-    rows."""
+    standing rows. Inactive or forgotten choices are separate lifecycle
+    events when chosen again."""
+    clauses = ["superseded_by IS NULL"]
+    if _evidence_ready(cur):
+        clauses.append("retracted_at IS NULL")
+    forgotten = _not_forgotten_clause(cur, "decisions")
+    if forgotten:
+        clauses.append(forgotten)
     cur.execute(
         f"""
         SELECT id FROM decisions
@@ -227,6 +252,8 @@ def _find_recent_duplicate(cur, project: str | None, norm_text: str, decided_at:
           AND lower(regexp_replace(text, '\\s+', ' ', 'g')) = %s
           AND decided_at >= COALESCE(%s::timestamptz, now()) - interval '{DEDUP_WINDOW_DAYS} days'
           AND decided_at <= COALESCE(%s::timestamptz, now())
+          AND {' AND '.join(clauses)}
+        ORDER BY decided_at DESC, id DESC
         LIMIT 1
         """,
         (project, norm_text, decided_at, decided_at),
@@ -247,6 +274,7 @@ def _decision_details_by_text(payload: dict[str, Any]) -> dict[str, dict[str, An
     for item in raw:
         if not isinstance(item, dict):
             continue
+        item = _redacted_value(item)
         text = str(item.get("text") or "").strip()
         if text:
             out[text] = item
@@ -284,7 +312,7 @@ def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int)
     details = _decision_details_by_text(payload) if evidence_ready else {}
     inserted = 0
     for raw in items:
-        text = str(raw or "").strip()
+        text = _redacted_value(str(raw or "").strip())
         if not text:
             continue
         norm = normalize_text(text)
@@ -431,8 +459,8 @@ def detect_reversals_from_episode(cur, payload: dict[str, Any], episode_id: int)
     for item in details:
         if not isinstance(item, dict):
             continue
-        reverses = str(item.get("reverses") or "").strip()
-        text = str(item.get("text") or "").strip()
+        reverses = _redacted_value(str(item.get("reverses") or "").strip())
+        text = _redacted_value(str(item.get("text") or "").strip())
         if not reverses or not text:
             continue
         cur.execute(
@@ -542,6 +570,7 @@ def supersede(cur, old_id: int, new_id: int, *, source: str = "manual",
         raise ValueError(f"source must be one of {VALID_SUPERSEDE_SOURCES}")
     if old_id == new_id:
         raise ValueError("a decision cannot supersede itself")
+    _lock_decision_row(cur, old_id)
     old = _fetch_decision_row(cur, old_id)
     if old is None:
         raise ValueError(f"no such decision: {old_id}")
@@ -561,6 +590,7 @@ def supersede(cur, old_id: int, new_id: int, *, source: str = "manual",
         )
     if _chain_leads_to(cur, new_id, old_id):
         raise ValueError(f"supersede would create a cycle between {old_id} and {new_id}")
+    reason = _redacted_value(reason)
     if _evidence_ready(cur):
         cur.execute(
             "UPDATE decisions SET superseded_by = %s, superseded_at = now(), "
@@ -624,6 +654,7 @@ def retract(cur, decision_id: int, reason: str | None = None) -> bool:
     "evidence fields were not recorded", same posture as ``supersede``."""
     if not _evidence_ready(cur):
         return False
+    reason = _redacted_value(reason)
     cur.execute(
         "UPDATE decisions SET retracted_at = now(), retract_reason = %s "
         "WHERE id = %s AND retracted_at IS NULL",
@@ -659,7 +690,7 @@ def create_decision(cur, *, project: str | None, text: str, session_id: str | No
     whose replacement text restates something already on file within the
     window returns the EXISTING row's id instead of adding a second one.
     Raises ``ValueError`` for empty text."""
-    text = str(text or "").strip()
+    text = _redacted_value(str(text or "").strip())
     if not text:
         raise ValueError("text is required")
     norm = normalize_text(text)
@@ -672,7 +703,7 @@ def create_decision(cur, *, project: str | None, text: str, session_id: str | No
             "VALUES (%s, %s, %s, COALESCE(%s::timestamptz, now()), %s, %s::jsonb) "
             "RETURNING id",
             (project, text, session_id, decided_at, source_kind,
-             json.dumps(evidence) if evidence is not None else None),
+             json.dumps(_redacted_value(evidence)) if evidence is not None else None),
         )
     else:
         cur.execute(
@@ -693,6 +724,7 @@ def add_link(cur, old_id: int, new_id: int, *, kind: str = "supersedes",
         raise ValueError(f"kind must be one of {VALID_LINK_KINDS}")
     if source not in VALID_SUPERSEDE_SOURCES:
         raise ValueError(f"source must be one of {VALID_SUPERSEDE_SOURCES}")
+    reason = _redacted_value(reason)
     if not _links_ready(cur):
         return None
     cur.execute(
@@ -792,6 +824,16 @@ def resolve_link(cur, link_id: int, action: str, *, source: str = "manual") -> d
     if row is None:
         raise ValueError(f"no such link: {link_id}")
     old_id, new_id, kind, state = row
+    # Supersede locks the decision before recording its link; keep that order.
+    _lock_decision_row(cur, int(old_id))
+    cur.execute(
+        "SELECT old_id, new_id, kind, state FROM decision_links WHERE id = %s FOR UPDATE",
+        (link_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise ValueError(f"no such link: {link_id}")
+    old_id, new_id, kind, state = row
     if state != "candidate":
         raise ValueError(f"link {link_id} is not a candidate (state={state!r})")
     if action == "reject":
@@ -803,8 +845,14 @@ def resolve_link(cur, link_id: int, action: str, *, source: str = "manual") -> d
     applied = False
     if kind == "supersedes":
         applied = supersede(cur, int(old_id), int(new_id), source=source, force=True)
+        if not applied:
+            old = _fetch_decision_row(cur, int(old_id))
+            if old is None or old.get("superseded_by") != int(new_id):
+                return {"ok": False, "id": link_id, "action": "confirm", "applied": False,
+                        "error": "candidate supersession conflicts with the current decision"}
     cur.execute(
-        "UPDATE decision_links SET state = 'applied', resolved_at = now() WHERE id = %s",
+        "UPDATE decision_links SET state = 'applied', resolved_at = now() "
+        "WHERE id = %s AND state = 'candidate'",
         (link_id,),
     )
     return {"ok": True, "id": link_id, "action": "confirm", "applied": applied}

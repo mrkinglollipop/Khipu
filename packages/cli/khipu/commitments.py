@@ -573,21 +573,34 @@ def content_hash(scope: str | None, text: str) -> str:
 
 
 def _coalesce_scope(payload: dict[str, Any]) -> str | None:
-    """W3.3 grouping key — K6 (2026-09-14): the episode's resolved ``project``,
-    ONLY. This used to fall back to ``parent_session_id``/``session_id`` when
-    project was unknown (a scratchpad/`/tmp` cwd, a dispatched child session)
-    so that writer's commitments at least stayed grouped with each other —
-    but a session id is not a project: it filed 16+ open items under an
-    opaque hex string the user never sees anywhere else, and a NULL project
-    was measured on 81% of episodes (finding K6). A capture with no resolved
-    project now groups under NULL like every other reader does — every
-    ``project IS NOT DISTINCT FROM %s`` comparison already used throughout
-    this module treats every NULL-project row as one shared "(no project)"
-    group, so this is a real, if broad, scope rather than an unscoped
-    free-for-all. Stored as the row's ``project`` column so
-    ``list_owed``/``auto_close`` use the exact same key back."""
+    """Display project; projectless lifecycle isolation is separate."""
     val = payload.get("project")
     return str(val) if val else None
+
+
+def _not_forgotten_clause(cur) -> str:
+    from khipu.db import has_columns
+
+    if not has_columns(cur, "episodes", "deleted_at"):
+        return "1=1"
+    return ("NOT EXISTS (SELECT 1 FROM episodes forgotten "
+            "WHERE forgotten.id = commitments.opened_episode AND forgotten.deleted_at IS NOT NULL)")
+
+
+def _lineage_clause(cur, payload: dict[str, Any], episode_id: int | None) -> tuple[str, tuple]:
+    """Projectless rows belong to a session lineage, or just their episode."""
+    if _coalesce_scope(payload) is not None:
+        return "1=1", ()
+    from khipu.db import has_columns
+
+    lineage = payload.get("parent_session_id") or payload.get("session_id")
+    if lineage and has_columns(cur, "episodes", "session_id"):
+        column = "e.session_id"
+        if has_columns(cur, "episodes", "parent_session_id"):
+            column = "COALESCE(NULLIF(e.parent_session_id, ''), e.session_id)"
+        return (f"opened_episode IN (SELECT e.id FROM episodes e WHERE {column} = %s)",
+                (lineage,))
+    return "opened_episode IS NOT DISTINCT FROM %s", (episode_id,)
 
 
 def _parse_due_after(raw: Any) -> tuple[str, Any]:
@@ -661,7 +674,8 @@ def _open_id_for_hash(cur, scope: str | None, content_h: str) -> int | None:
     """
     cur.execute(
         "SELECT id FROM commitments WHERE status = 'open' AND content_hash = %s "
-        "AND project IS NOT DISTINCT FROM %s LIMIT 1",
+        "AND project IS NOT DISTINCT FROM %s "
+        f"AND {_not_forgotten_clause(cur)} LIMIT 1",
         (content_h, scope),
     )
     row = cur.fetchone()
@@ -726,14 +740,16 @@ def _touch_seen(cur, commitment_id: int) -> None:
     try:
         cur.execute(
             "UPDATE commitments SET last_seen_at = now(), seen_count = seen_count + 1 "
-            "WHERE id = %s AND status = 'open'",
+            f"WHERE id = %s AND status = 'open' AND {_not_forgotten_clause(cur)}",
             (commitment_id,),
         )
     except Exception as exc:  # noqa: BLE001 — never fail a capture over a touch
         _log(f"seen touch failed for {commitment_id} ({type(exc).__name__}: {exc})")
 
 
-def _near_duplicate_open(cur, scope: str | None, text: str) -> int | None:
+def _near_duplicate_open(cur, scope: str | None, text: str, *,
+                         payload: dict[str, Any] | None = None,
+                         episode_id: int | None = None) -> int | None:
     """id of an already-OPEN commitment in the same scope that says the same
     thing, or None.
 
@@ -744,7 +760,7 @@ def _near_duplicate_open(cur, scope: str | None, text: str) -> int | None:
     signal; cosine against the stored commitment embeddings is the semantic
     one, at the same bar ``auto_close`` uses to close on a paraphrase.
     """
-    rows = _open_commitments(cur, scope)
+    rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id)
     if not rows:
         return None
     best_id, best_score = None, 0.0
@@ -779,9 +795,8 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     touches ``last_seen_at``/``seen_count`` on the row already open, so the
     restatement is recorded without a second row.
 
-    ``scope`` is ``project`` if known else ``parent_session_id``/``session_id``
-    (fix 3) — stored in the row's ``project`` column so every later read uses
-    the same key.
+    Projectless rows keep a NULL display project; dedup and closure use
+    their session lineage, falling back to their own episode.
     """
     items = payload.get("open_loops") or []
     if not isinstance(items, list) or not items:
@@ -810,10 +825,15 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             continue
         # content_hash and dedup key off the UNDECORATED text — the due
         # phrase is presentational, not part of the commitment's identity.
-        h = content_hash(scope, norm["text"])
+        lifecycle_scope = scope
+        if lifecycle_scope is None:
+            lineage = payload.get("parent_session_id") or payload.get("session_id")
+            lifecycle_scope = f"session:{lineage}" if lineage else f"episode:{episode_id}"
+        h = content_hash(lifecycle_scope, norm["text"])
         existing = _open_id_for_hash(cur, scope, h)
         if existing is None:
-            existing = _near_duplicate_open(cur, scope, norm["text"])
+            existing = _near_duplicate_open(cur, scope, norm["text"],
+                                            payload=payload, episode_id=episode_id)
         if existing is not None:
             if seen_ready:
                 _touch_seen(cur, existing)
@@ -857,36 +877,45 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     return inserted
 
 
-def _open_commitments(cur, scope: str | None) -> list[dict[str, Any]]:
+def _open_commitments(cur, scope: str | None, *, payload: dict[str, Any] | None = None,
+                      episode_id: int | None = None) -> list[dict[str, Any]]:
+    lineage, params = _lineage_clause(cur, payload or {"project": scope}, episode_id)
     cur.execute(
-        "SELECT id, text FROM commitments WHERE status = 'open' AND project IS NOT DISTINCT FROM %s",
-        (scope,),
+        "SELECT id, text FROM commitments WHERE status = 'open' AND project IS NOT DISTINCT FROM %s "
+        f"AND {lineage} AND {_not_forgotten_clause(cur)}",
+        (scope, *params),
     )
     return [{"id": r[0], "text": r[1]} for r in cur.fetchall()]
 
 
-def _candidate_close_texts(payload: dict[str, Any]) -> list[tuple[str, str]]:
-    """(text, kind) pairs from closed_loops and decisions, where kind is
+def _candidate_close_texts(payload: dict[str, Any]) -> list[tuple[str, str, int | None]]:
+    """(text, kind, commitment_id) from closed_loops and decisions, where kind is
     ``"done"`` (a ``done:``-prefixed statement — matched by text only, never
     an API call) or ``"loop"`` (a closed_loop the extractor listed as a loop
     that closed — matched by text OR, when commitments are embedded, by
     cosine). Only ``done:``-prefixed decisions are candidates; a plain
     decision never closes a commitment so an unrelated decision cannot close
     one on a text or paraphrase fluke."""
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, int | None]] = []
     for item in payload.get("closed_loops") or []:
         text = item.get("text") if isinstance(item, dict) else item
         text = str(text or "").strip()
         if not text:
             continue
+        reference = item.get("commitment_id") if isinstance(item, dict) else None
+        if reference is not None:
+            try:
+                reference = int(str(reference))
+            except ValueError:
+                reference = 0  # An invalid explicit target must not fall back to another row.
         m = _DONE_PREFIX_RE.match(text)
-        out.append((_DONE_PREFIX_RE.sub("", text), "done" if m else "loop"))
+        out.append((_DONE_PREFIX_RE.sub("", text), "done" if m else "loop", reference))
     for item in payload.get("decisions") or []:
         text = str(item or "").strip()
         if not text:
             continue
         if _DONE_PREFIX_RE.match(text):
-            out.append((_DONE_PREFIX_RE.sub("", text), "done"))
+            out.append((_DONE_PREFIX_RE.sub("", text), "done", None))
     return out
 
 
@@ -958,7 +987,7 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
     candidates = _candidate_close_texts(payload)
     if not candidates:
         return 0
-    open_rows = _open_commitments(cur, scope)
+    open_rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id)
     if not open_rows:
         return 0
     from khipu.config import float_setting
@@ -967,48 +996,64 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
     ids = [r["id"] for r in open_rows]
     already_closed: set[int] = set()
     closed = 0
-    for text, kind in candidates:
+    for text, kind, reference in candidates:
         remaining_ids = [i for i in ids if i not in already_closed]
         # Cosine (semantic paraphrase) is available for a closed_loop when the
         # scope's commitments are embedded; a "done:" close is text-only (fix
         # 5a) and never spends an API call, and with no stored commitment
         # embeddings (fix 5b) there is nothing to score against.
-        if kind != "done" and remaining_ids and _has_commitment_embeddings(cur, remaining_ids):
+        if reference is None and kind != "done" and remaining_ids and _has_commitment_embeddings(cur, remaining_ids):
             cosine = _cosine_scores(cur, text, remaining_ids)
         else:
             cosine: dict[int, float] = {}
         best_id = None
         best_score = 0.0
         best_via = ""
+        tied = False
+        semantic_matches = 0
+        tokens = set(re.findall(r"[\w./-]+", text.lower()))
         for row in open_rows:
             cid = row["id"]
             if cid in already_closed:
                 continue
-            # Two signals, two bars. A containment/lexical text match closes at
-            # the low DONE_MATCH_MIN_SCORE bar — a short closed_loop phrase is a
-            # subset of a longer commitment, so containment (folded into
-            # _match_score), not raw Jaccard, is what matches it. A cosine match
-            # needs the strict commitment_close_similarity bar so a merely
-            # related paraphrase cannot close the wrong item.
-            text_score = _match_score(text, row["text"])
+            if reference is not None:
+                if cid == reference:
+                    best_id, best_score, best_via = cid, 1.0, "commitment id"
+                continue
+            exact = " ".join(text.lower().split()) == " ".join(row["text"].lower().split())
+            if not exact and len(tokens) < 3:
+                continue
+            # Ordinary completion must preserve the full lexical evidence;
+            # substring containment is reserved for an explicit done statement.
+            text_score = _match_score(text, row["text"]) if kind == "done" else _jaccard(text, row["text"])
+            covers = set(re.findall(r"[\w./-]+", row["text"].lower())) <= tokens
             cos = cosine.get(cid)
             score = 0.0
             via = ""
-            if text_score >= DONE_MATCH_MIN_SCORE:
+            text_threshold = DONE_MATCH_MIN_SCORE if kind == "done" else threshold
+            if text_score >= text_threshold and (kind == "done" or covers):
                 score = text_score
                 via = "explicit done (best match)" if kind == "done" else "text"
-            if cos is not None and cos >= threshold and cos > score:
+            # High overlap with missing words can mean a changed qualifier
+            # (staging versus production); cosine must not erase that evidence.
+            if cos is not None and cos >= threshold and cos > score \
+                    and (covers or text_score < NEAR_DUP_MIN_SCORE):
+                semantic_matches += 1
                 score, via = cos, "cosine"
             if via and score > best_score:
                 best_id, best_score, best_via = cid, score, via
-        if best_id is None:
+                tied = False
+            elif via and abs(score - best_score) < 1e-9:
+                tied = True
+        if best_id is None or tied or (best_via == "cosine" and semantic_matches > 1):
             continue
         cur.execute(
-            """
+            f"""
             UPDATE commitments
             SET status = 'closed', closed_episode = %s, closed_at = now(),
                 close_reason = %s
             WHERE id = %s AND status = 'open'
+              AND {_not_forgotten_clause(cur)}
             """,
             (episode_id, f"{best_via} match ({best_score:.2f}): {text[:200]!r}", best_id),
         )
@@ -1034,6 +1079,7 @@ def stale_sql(*, has_last_seen: bool) -> str:
     (each restatement pushes it forward), else from ``opened_at``.
     """
     seen = "COALESCE(last_seen_at, opened_at)" if has_last_seen else "opened_at"
+    seen = f"GREATEST({seen}, due_after)"
     return f"""
         UPDATE commitments
         SET status = 'stale'
@@ -1051,7 +1097,8 @@ def mark_stale(cur) -> int:
     """Flip silent open commitments to 'stale' (see :func:`stale_sql`). Never
     silently dropped — stale stays queryable via `khipu owed --status stale`.
     """
-    cur.execute(stale_sql(has_last_seen=_seen_columns_ready(cur)))
+    cur.execute(stale_sql(has_last_seen=_seen_columns_ready(cur))
+                + f" AND {_not_forgotten_clause(cur)}")
     return cur.rowcount
 
 
@@ -1086,11 +1133,12 @@ def _session_open_commitments(cur, session_id: str) -> list[dict[str, Any]]:
     before this change are covered too.
     """
     cur.execute(
-        """
+        f"""
         SELECT c.id, c.text, c.kind, c.owner
         FROM commitments c
         JOIN episodes e ON e.id = c.opened_episode
         WHERE c.status = 'open' AND e.session_id = %s
+          AND {_not_forgotten_clause(cur).replace('commitments.opened_episode', 'c.opened_episode')}
         """,
         (session_id,),
     )
@@ -1133,7 +1181,7 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
     if not session_id:
         return 0
     is_end = _payload_event(payload) in SESSION_END_EVENTS
-    mentions = [t for t, _ in _candidate_close_texts(payload)]
+    mentions = [t for t, _, _ in _candidate_close_texts(payload)]
     if not is_end and not mentions:
         return 0
     try:
@@ -1169,11 +1217,12 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
         else:
             continue
         cur.execute(
-            """
+            f"""
             UPDATE commitments
             SET status = 'closed', closed_episode = %s, closed_at = now(),
                 close_reason = %s
             WHERE id = %s AND status = 'open'
+              AND {_not_forgotten_clause(cur)}
             """,
             (episode_id, reason, row["id"]),
         )
@@ -1198,15 +1247,22 @@ def list_owed(cur, *, project: str | None = None, parent_session_id: str | None 
     Off by default so ``khipu owed``/the desktop still see (and can
     un-snooze) a parked row; the W4 pushed slice turns it on.
     """
-    scope = project or parent_session_id or session_id
     clauses = ["status = %s"]
     params: list[Any] = [status]
-    if scope:
+    if project:
         clauses.append("project = %s")
-        params.append(scope)
+        params.append(project)
+    elif parent_session_id or session_id:
+        lineage, lineage_params = _lineage_clause(
+            cur, {"parent_session_id": parent_session_id, "session_id": session_id}, None)
+        clauses += ["project IS NULL", lineage]
+        params.extend(lineage_params)
     if hide_snoozed:
         clauses.append("(due_after IS NULL OR due_after <= now())")
-    params.append(limit)
+    clauses.append(_not_forgotten_clause(cur))
+    # Owner and trigger priority are resolved in Python, including legacy rows.
+    # SQL must not truncate the population before that resolution.
+    params.append(None)
     cols = ["id", "text", "project", "owner", "kind", "opened_episode", "opened_at",
             "due_after", "status", "closed_episode", "closed_at", "close_reason"]
     # Additive only (migration 0012). A pre-migration hub still answers, with
@@ -1262,22 +1318,29 @@ def list_owed(cur, *, project: str | None = None, parent_session_id: str | None 
 
     _max_dt = datetime.max.replace(tzinfo=timezone.utc)
     rows.sort(key=lambda r: (r["priority"], r.get("opened_at") or _max_dt))
-    return rows
+    return rows[:limit]
 
 
 def set_status(cur, commitment_id: int, status: str) -> bool:
     if status not in ("open", "closed", "stale", "dropped"):
         raise ValueError(f"status must be open/closed/stale/dropped, got {status!r}")
     if status == "open":
+        refreshed = "last_seen_at = now()" if _seen_columns_ready(cur) else "opened_at = now()"
         cur.execute(
             "UPDATE commitments SET status = 'open', closed_episode = NULL, "
-            "closed_at = NULL, close_reason = NULL WHERE id = %s",
+            f"closed_at = NULL, close_reason = NULL, {refreshed} WHERE id = %s "
+            f"AND {_not_forgotten_clause(cur)} "
+            "AND NOT EXISTS (SELECT 1 FROM commitments other "
+            "WHERE other.id != commitments.id AND other.status = 'open' "
+            "AND other.project IS NOT DISTINCT FROM commitments.project "
+            "AND other.content_hash = commitments.content_hash)",
             (commitment_id,),
         )
     else:
         extra = ", closed_at = now()" if status == "closed" else ""
         cur.execute(
-            f"UPDATE commitments SET status = %s{extra} WHERE id = %s",
+            f"UPDATE commitments SET status = %s{extra} WHERE id = %s "
+            f"AND {_not_forgotten_clause(cur)}",
             (status, commitment_id),
         )
     return cur.rowcount > 0
