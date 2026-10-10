@@ -104,6 +104,27 @@ def local_health(
             "max_age_hours": BACKUP_MAX_AGE_HOURS,
         }
 
+    integrity = _integrity_check(snap)
+    if integrity.lower() != "ok":
+        return {
+            "ok": False,
+            "skipped": False,
+            "reason": f"latest snapshot integrity check failed: {integrity}",
+            "path": str(snap),
+            "bytes": st.st_size,
+            "max_age_hours": BACKUP_MAX_AGE_HOURS,
+        }
+    schema_error = _required_graph_tables(snap)
+    if schema_error:
+        return {
+            "ok": False,
+            "skipped": False,
+            "reason": schema_error,
+            "path": str(snap),
+            "bytes": st.st_size,
+            "max_age_hours": BACKUP_MAX_AGE_HOURS,
+        }
+
     mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
     age_seconds = (now - mtime).total_seconds()
     fresh = age_seconds <= max_age_seconds
@@ -238,6 +259,25 @@ def _integrity_check(path: Path, *, timeout: int = INTEGRITY_TIMEOUT_SECONDS) ->
     return (r.stdout or "").strip() or "unknown"
 
 
+def _required_graph_tables(path: Path) -> str | None:
+    """Return the missing required graph table names, if any, without writing."""
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            found = {
+                row[0]
+                for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('nodes', 'edges')"
+                )
+            }
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        return f"schema probe failed: {exc}"
+    missing = sorted({"nodes", "edges"} - found)
+    return f"missing required graph table(s): {', '.join(missing)}" if missing else None
+
+
 def _embeddings_table(con: sqlite3.Connection) -> str | None:
     row = con.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%embedding%' "
@@ -336,6 +376,21 @@ def run_offsite(
     snap = latest_snapshot()
     if snap is None:
         return {"ok": False, "reason": "no snapshot found"}
+    try:
+        if snap.stat().st_size <= 0:
+            return {"ok": False, "reason": "latest snapshot is empty", "path": str(snap)}
+    except OSError as exc:
+        return {"ok": False, "reason": f"snapshot stat failed: {exc}", "path": str(snap)}
+    integrity = _integrity_check(snap)
+    if integrity.lower() != "ok":
+        return {
+            "ok": False,
+            "reason": f"latest snapshot integrity check failed: {integrity}",
+            "path": str(snap),
+        }
+    schema_error = _required_graph_tables(snap)
+    if schema_error:
+        return {"ok": False, "reason": schema_error, "path": str(snap)}
 
     live = _live_graph()
     if live is None:

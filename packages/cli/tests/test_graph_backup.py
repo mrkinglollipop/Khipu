@@ -29,7 +29,14 @@ class LocalHealthTest(unittest.TestCase):
     def test_fresh_snapshot_is_ok(self):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
-            (d / "graph-20260819T000000Z.sqlite").write_bytes(b"sqlite")
+            snapshot = d / "graph-20260819T000000Z.sqlite"
+            con = sqlite3.connect(snapshot)
+            try:
+                con.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY)")
+                con.execute("CREATE TABLE edges (src TEXT, dst TEXT, type TEXT)")
+                con.commit()
+            finally:
+                con.close()
             out = graph_backup.local_health(
                 producer=True,
                 snapshot_dir=d,

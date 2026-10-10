@@ -185,7 +185,7 @@ def extract_paths(text: str, *, cap: int = PATH_CAP) -> list[str]:
 
 
 def collapse_semantic_topic_hits(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """One topic row per slug: highest score, then lowest chunk_idx. Episodes unchanged."""
+    """One topic per slug by score and chunk; one episode per nonempty durable id."""
     best: dict[str, Mapping[str, Any]] = {}
     for row in rows:
         if row.get("kind") != "topic":
@@ -195,9 +195,16 @@ def collapse_semantic_topic_hits(rows: Sequence[Mapping[str, Any]]) -> list[dict
         if prev is None or _topic_row_better(row, prev):
             best[slug] = row
     emitted: set[str] = set()
+    emitted_episode_ids: set[str] = set()
     out: list[dict[str, Any]] = []
     for row in rows:
         if row.get("kind") != "topic":
+            if row.get("kind") == "episode":
+                episode_id = str(row.get("id") or "")
+                if episode_id:
+                    if episode_id in emitted_episode_ids:
+                        continue
+                    emitted_episode_ids.add(episode_id)
             out.append(dict(row))
             continue
         slug = str(row.get("id") or "")

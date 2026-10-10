@@ -31,6 +31,7 @@ arithmetic (finding 8: a score-space boost collapsed recall in Hindsight).
 """
 from __future__ import annotations
 
+import sqlite3
 import time
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
@@ -53,6 +54,40 @@ class DeadlineMissed(Exception):
 def _check_deadline(deadline: float) -> None:
     if time.monotonic() > deadline:
         raise DeadlineMissed()
+
+
+def _remaining_ms(deadline: float) -> int:
+    _check_deadline(deadline)
+    return max(1, int((deadline - time.monotonic()) * 1000))
+
+
+class _PgDeadlineCursor:
+    """Cursor proxy that reapplies the shared absolute deadline per query."""
+
+    def __init__(self, cur: Any, deadline: float):
+        self._cur, self._deadline = cur, deadline
+
+    def execute(self, sql: str, params: Any = None):
+        timeout = f"{_remaining_ms(self._deadline)}ms"
+        self._cur.execute("SELECT set_config('statement_timeout', %s, true)", (timeout,))
+        return self._cur.execute(sql, params)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cur, name)
+
+
+class _SqliteDeadlineConnection:
+    """Connection proxy that bounds each lock wait by the remaining budget."""
+
+    def __init__(self, con: Any, deadline: float):
+        self._con, self._deadline = con, deadline
+
+    def execute(self, sql: str, params: Any = ()):
+        self._con.execute(f"PRAGMA busy_timeout={_remaining_ms(self._deadline)}")
+        return self._con.execute(sql, params)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._con, name)
 
 
 def _ts_key(value: Any) -> float:
@@ -229,21 +264,52 @@ def hub_candidates(
     seeds = _seeds(fused)
     if not seeds:
         return [], False
+    previous_timeout: str | None = None
+    savepoint = "khipu_graph_candidates_deadline"
+    savepoint_started = False
+    needs_rollback = False
     try:
+        _check_deadline(deadline)
+        cur.execute(f"SAVEPOINT {savepoint}")
+        savepoint_started = True
+        cur.execute("SELECT current_setting('statement_timeout')")
+        row = cur.fetchone()
+        previous_timeout = str(row[0]) if row else "0"
+        bounded_cur = _PgDeadlineCursor(cur, deadline)
         raw: list[dict[str, Any]] = []
         for rank, seed in seeds:
             _check_deadline(deadline)
             skind, sid = seed.get("kind"), str(seed.get("id"))
             seed_key = f"{skind}:{sid}"
             if skind == "topic":
-                raw.extend(_hub_topic_wiki(cur, sid, seed_rank=rank, seed_key=seed_key))
+                raw.extend(_hub_topic_wiki(bounded_cur, sid, seed_rank=rank, seed_key=seed_key))
                 _check_deadline(deadline)
-                raw.extend(_hub_topic_recent_episodes(cur, sid, seed_rank=rank, seed_key=seed_key))
+                raw.extend(_hub_topic_recent_episodes(bounded_cur, sid, seed_rank=rank, seed_key=seed_key))
             else:
-                raw.extend(_hub_episode_topics(cur, sid, seed_rank=rank, seed_key=seed_key))
+                raw.extend(_hub_episode_topics(bounded_cur, sid, seed_rank=rank, seed_key=seed_key))
             _check_deadline(deadline)
     except DeadlineMissed:
+        needs_rollback = True
         return [], True
+    except Exception as exc:
+        timed_out = (
+            time.monotonic() >= deadline
+            or exc.__class__.__name__ in {"QueryCanceled", "QueryCanceledError"}
+            or "statement timeout" in str(exc).lower()
+        )
+        needs_rollback = savepoint_started
+        if timed_out:
+            return [], True
+        raise
+    finally:
+        if savepoint_started and needs_rollback:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        if savepoint_started and previous_timeout is not None:
+            cur.execute(
+                "SELECT set_config('statement_timeout', %s, true)",
+                (previous_timeout,),
+            )
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
     return _select_candidates(raw, exclude=exclude), False
 
 
@@ -385,6 +451,13 @@ def replica_candidates(
     seeds = _seeds(fused)
     if not seeds:
         return [], False
+    previous_busy = int(con.execute("PRAGMA busy_timeout").fetchone()[0])
+    bounded_con = _SqliteDeadlineConnection(con, deadline)
+    con.execute(f"PRAGMA busy_timeout={_remaining_ms(deadline)}")
+    # sqlite3 exposes no getter for an existing progress handler; callers lend
+    # a connection with no handler installed, and this leg always clears its
+    # own handler before returning.
+    con.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 100)
     try:
         raw: list[dict[str, Any]] = []
         for rank, seed in seeds:
@@ -392,12 +465,19 @@ def replica_candidates(
             skind, sid = seed.get("kind"), str(seed.get("id"))
             seed_key = f"{skind}:{sid}"
             if skind == "topic":
-                raw.extend(_replica_topic_wiki(con, sid, seed_rank=rank, seed_key=seed_key))
+                raw.extend(_replica_topic_wiki(bounded_con, sid, seed_rank=rank, seed_key=seed_key))
                 _check_deadline(deadline)
-                raw.extend(_replica_topic_recent_episodes(con, sid, seed_rank=rank, seed_key=seed_key))
+                raw.extend(_replica_topic_recent_episodes(bounded_con, sid, seed_rank=rank, seed_key=seed_key))
             else:
-                raw.extend(_replica_episode_topics(con, sid, seed_rank=rank, seed_key=seed_key))
+                raw.extend(_replica_episode_topics(bounded_con, sid, seed_rank=rank, seed_key=seed_key))
             _check_deadline(deadline)
     except DeadlineMissed:
         return [], True
+    except sqlite3.OperationalError as exc:
+        if any(token in str(exc).lower() for token in ("interrupted", "locked", "busy")):
+            return [], True
+        raise
+    finally:
+        con.set_progress_handler(None, 0)
+        con.execute(f"PRAGMA busy_timeout={previous_busy}")
     return _select_candidates(raw, exclude=exclude), False

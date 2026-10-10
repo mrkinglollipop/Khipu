@@ -34,7 +34,7 @@ import json
 import os
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -400,9 +400,9 @@ def is_graph_producer() -> bool:
 
 
 def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str, Any]:
-    """graphify's rows vs PG's graphify-owned rows, both directions, by identity.
-    Zero on both sides is the only 'ok'."""
+    """Compare graphify rows with PG by identity and normalized content."""
     from khipu.db import connect
+    from khipu import sources as sources_mod
 
     path = Path(sqlite_path) if sqlite_path else _default_sqlite()
     out: dict[str, Any] = {"sqlite": str(path), "ok": False}
@@ -424,14 +424,29 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
             skipped="not the graph producer; PG is read-only for the graph here",
         )
         return out
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    try:
-        s_nodes = {r[0] for r in con.execute("SELECT id FROM nodes")}
-        s_edges = {
-            (r[0], r[1], r[2]) for r in con.execute("SELECT src, dst, type FROM edges")
+
+    registry = sources_mod.sources_file()
+    if registry.exists():
+        try:
+            raw_registry = json.loads(registry.read_text(encoding="utf-8"))
+            if not isinstance(raw_registry, dict) or not isinstance(raw_registry.get("sources"), list):
+                raise ValueError("expected an object with a sources list")
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            out["error"] = f"source registry unreadable or malformed: {exc}"
+            return out
+
+    sqlite_nodes, sqlite_edges = _read_sqlite(path)
+    s_node_rows = {
+        row[0]: {
+            "id": row[0], "type": row[1], "bucket": row[2], "name": row[3],
+            "payload": row[4], "source_path": row[5], "built_at": row[6],
+            "frozen": row[7],
         }
-    finally:
-        con.close()
+        for row in sqlite_nodes
+    }
+    s_edge_rows = {(r[0], r[1], r[2]): r for r in sqlite_edges}
+    s_nodes = set(s_node_rows)
+    s_edges = set(s_edge_rows)
     membership_off = disabled_or_unreachable_ids()
     sources_doc = load_sources()
     owned = owned_source_ids(sources_doc)
@@ -439,7 +454,8 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"SELECT n.id, n.type, n.bucket, n.source_path, n.source_id FROM nodes n "
+                f"SELECT n.id, n.type, n.bucket, n.name, n.payload, n.source_path, "
+                f"n.built_at, n.frozen, n.source_id FROM nodes n "
                 f"WHERE NOT {KHIPU_OWNED_NODE_SQL}"
             )
             pg_node_rows = [
@@ -447,8 +463,12 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
                     "id": r[0],
                     "type": r[1],
                     "bucket": r[2],
-                    "source_path": r[3],
-                    "source_id": r[4],
+                    "name": r[3],
+                    "payload": r[4],
+                    "source_path": r[5],
+                    "built_at": r[6],
+                    "frozen": r[7],
+                    "source_id": r[8],
                 }
                 for r in cur.fetchall()
             ]
@@ -457,12 +477,13 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
             khipu_nodes = cur.fetchone()[0]
             cur.execute(
                 f"""
-                SELECT e.src, e.dst, e.type FROM edges e
+                SELECT e.src, e.dst, e.type, e.weight, e.payload, e.built_at FROM edges e
                 WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = e.src AND {KHIPU_OWNED_NODE_SQL})
                   AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = e.dst AND {KHIPU_OWNED_NODE_SQL})
                 """
             )
-            p_edges = {(r[0], r[1], r[2]) for r in cur.fetchall()}
+            pg_edge_rows = {(r[0], r[1], r[2]): r for r in cur.fetchall()}
+            p_edges = set(pg_edge_rows)
     missing_nodes = sorted(s_nodes - p_nodes)
     extra_node_ids = sorted(p_nodes - s_nodes)
     extra_node_rows = [r for r in pg_node_rows if r["id"] in set(extra_node_ids)]
@@ -485,6 +506,48 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
     extra_edges = drift_failing_pg_extra_edges(
         extra_edge_tuples, nodes_by_id, membership_off
     )
+
+    def _json_value(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except ValueError:
+                return value
+        return value
+
+    def _time_value(value: Any) -> str | None:
+        if value in (None, ""):
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).isoformat()
+        except (ValueError, TypeError):
+            return str(value)
+
+    node_content_drift: list[str] = []
+    pg_nodes_by_id = {r["id"]: r for r in pg_node_rows}
+    for node_id in sorted(s_nodes & p_nodes):
+        srow, prow = s_node_rows[node_id], pg_nodes_by_id[node_id]
+        expected_sid = source_id_for_graphify_node(
+            node_id=node_id, type=srow["type"], bucket=srow["bucket"],
+            source_path=srow["source_path"], doc=sources_doc,
+        )
+        left = (srow["type"], srow["bucket"], srow["name"], _json_value(srow["payload"]),
+                srow["source_path"], _time_value(srow["built_at"]), bool(srow["frozen"]), expected_sid)
+        right = (prow["type"], prow["bucket"], prow["name"], _json_value(prow["payload"]),
+                 prow["source_path"], _time_value(prow["built_at"]), bool(prow["frozen"]), prow["source_id"])
+        if left != right:
+            node_content_drift.append(node_id)
+
+    edge_content_drift: list[str] = []
+    for edge_id in sorted(s_edges & p_edges):
+        srow, prow = s_edge_rows[edge_id], pg_edge_rows[edge_id]
+        left = (None if srow[3] is None else float(srow[3]), _json_value(srow[4]), _time_value(srow[5]))
+        right = (None if prow[3] is None else float(prow[3]), _json_value(prow[4]), _time_value(prow[5]))
+        if left != right:
+            edge_content_drift.append(":".join(edge_id))
     out.update(
         {
             "sqlite_nodes": len(s_nodes),
@@ -496,14 +559,21 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
             "nodes_extra_in_pg": len(extra_nodes),
             "edges_missing_in_pg": len(missing_edges),
             "edges_extra_in_pg": len(extra_edges),
+            "nodes_content_drift": len(node_content_drift),
+            "edges_content_drift": len(edge_content_drift),
             "sample_missing_nodes": missing_nodes[:sample],
             "sample_extra_nodes": extra_nodes[:sample],
+            "sample_content_nodes": node_content_drift[:sample],
+            "sample_content_edges": edge_content_drift[:sample],
             "sqlite_mtime": time.strftime(
                 "%Y-%m-%dT%H:%M:%S", time.localtime(path.stat().st_mtime)
             ),
         }
     )
-    out["ok"] = not (missing_nodes or extra_nodes or missing_edges or extra_edges)
+    out["ok"] = not (
+        missing_nodes or extra_nodes or missing_edges or extra_edges
+        or node_content_drift or edge_content_drift
+    )
     if not out["ok"] and _changed_since_last_mirror(path):
         out["ok"] = True
         out["pending"] = (
