@@ -30,7 +30,9 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import re
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -41,6 +43,8 @@ DEFAULT_INDEX_CAP_BYTES = 20_000
 MAX_DROP_FRACTION = 0.30
 OVERFLOW_NAME = "_overflow_index.md"
 INDEX_NAME = "MEMORY.md"
+INDEX_START = "<!-- khipu:index:start -->"
+INDEX_END = "<!-- khipu:index:end -->"
 # G5: lower rank number = kept first when the index is trimmed to fit the cap.
 _TYPE_RANK = {"feedback": 0, "user": 1, "project": 2, "reference": 3}
 _INDEX_LINE_RE = re.compile(r"^- \[")
@@ -93,7 +97,7 @@ def _is_khipu_recognised_index(text: str) -> bool:
     least one ``- [`` bullet line, the same shape Claude Code's own
     ``MEMORY.md`` writer uses. An empty/missing file is fine to write (it
     becomes one)."""
-    return any(_INDEX_LINE_RE.match(line) for line in text.splitlines())
+    return INDEX_START in text or INDEX_END in text or any(_INDEX_LINE_RE.match(line) for line in text.splitlines())
 
 
 def _split_preamble(text: str) -> tuple[str, list[str]]:
@@ -186,6 +190,35 @@ def _parse_existing_lines(existing_lines: list[str]) -> dict[str, str]:
     return out
 
 
+def _index_region(text: str) -> tuple[str, list[str], str, bool]:
+    """Only a delimited region or an uninterrupted legacy bullet list is writable."""
+    lines = text.splitlines(keepends=True)
+    delimited = INDEX_START in text or INDEX_END in text
+    if delimited:
+        starts = [i for i, ln in enumerate(lines) if ln.rstrip("\r\n") == INDEX_START]
+        ends = [i for i, ln in enumerate(lines) if ln.rstrip("\r\n") == INDEX_END]
+        if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+            raise ValueError("cannot parse generated index region delimiters")
+        start, end = starts[0], ends[0]
+        before, region, after = "".join(lines[:start]), lines[start + 1:end], "".join(lines[end + 1:])
+    else:
+        start = next((i for i, ln in enumerate(lines) if _INDEX_LINE_RE.match(ln)), len(lines))
+        before, region, after = "".join(lines[:start]), lines[start:], ""
+    bullets = [ln.rstrip("\r\n") for ln in region if ln.strip()]
+    targets = [_LINE_TARGET_RE.match(ln) for ln in bullets]
+    if any(m is None for m in targets) or len({m.group(1) for m in targets if m}) != len(targets):
+        raise ValueError("cannot parse generated index region; handwritten content needs explicit region delimiters")
+    return before, bullets, after, delimited
+
+
+def _render_index_region(before: str, body: str, after: str, *, original: str, delimited: bool) -> str:
+    plain = before + body + ("\n" if body else "") + after
+    if not delimited and original and plain == original:
+        return original
+    separator = "\n" if before and not before.endswith("\n") else ""
+    return before + separator + INDEX_START + "\n" + body + ("\n" if body else "") + INDEX_END + "\n" + after
+
+
 def _unescape_yaml_dquote(s: str) -> str:
     """G1 incident: a frontmatter value's outer quote is stripped by
     ``khipu.notes._parse_note_frontmatter`` (one leading/trailing char, not a
@@ -227,7 +260,7 @@ def _project_slug_for_dir(memory_dir: Path) -> str:
     return name or "unknown"
 
 
-def _backup_index(memory_dir: Path, existing_text: str) -> Path | None:
+def _backup_index(memory_dir: Path, existing_text: str, *, name: str = INDEX_NAME) -> Path | None:
     """G1 incident (2026-09-14): a copy of the index BEFORE any rewrite —
     never inside the memory dir itself (that's the file being protected).
     Lives at ``<khipu data dir>/index-backups/<project-slug>/
@@ -243,16 +276,16 @@ def _backup_index(memory_dir: Path, existing_text: str) -> Path | None:
         backup_dir = ensure_data_dir() / "index-backups" / _project_slug_for_dir(memory_dir)
         backup_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        backup_path = backup_dir / f"{INDEX_NAME}.{ts}"
+        backup_path = backup_dir / f"{name}.{ts}"
         # A same-second retry (test loops, a rapid double-fire) must not
         # silently clobber the previous backup — suffix with an attempt
         # counter rather than overwrite.
         n = 1
         while backup_path.exists():
             n += 1
-            backup_path = backup_dir / f"{INDEX_NAME}.{ts}.{n}"
+            backup_path = backup_dir / f"{name}.{ts}.{n}"
         backup_path.write_text(existing_text, encoding="utf-8")
-        existing_backups = sorted(backup_dir.glob(f"{INDEX_NAME}.*"))
+        existing_backups = sorted(backup_dir.glob(f"{name}.*"))
         for stale in existing_backups[: max(0, len(existing_backups) - BACKUP_KEEP)]:
             try:
                 stale.unlink()
@@ -283,23 +316,30 @@ def rewrite_index(
     index_path = memory_dir / INDEX_NAME
     overflow_path = memory_dir / OVERFLOW_NAME
     existing_text = ""
-    if index_path.is_file():
+    if index_path.exists() or index_path.is_symlink():
         try:
             existing_text = index_path.read_text(encoding="utf-8")
-        except OSError:
-            existing_text = ""
+        except (OSError, UnicodeDecodeError) as exc:
+            return {"ok": False, "error": f"cannot read existing index {index_path}: {exc}"}
     existing_overflow_text = ""
-    if overflow_path.is_file():
+    if overflow_path.exists() or overflow_path.is_symlink():
         try:
             existing_overflow_text = overflow_path.read_text(encoding="utf-8")
-        except OSError:
-            existing_overflow_text = ""
+        except (OSError, UnicodeDecodeError) as exc:
+            return {"ok": False, "error": f"cannot read existing overflow {overflow_path}: {exc}"}
     existing_had_index = bool(existing_text.strip())
     if existing_had_index and not _is_khipu_recognised_index(existing_text):
         return {
             "ok": True, "skipped": True, "dir": str(memory_dir),
             "reason": "existing MEMORY.md has no '- [' bullet lines — not a Khipu-recognised index",
         }
+    if existing_overflow_text.strip() and not _is_khipu_recognised_index(existing_overflow_text):
+        return {"ok": True, "skipped": True, "dir": str(memory_dir), "reason": "existing overflow has no recognised index region"}
+    try:
+        preamble, existing_lines, suffix, delimited = _index_region(existing_text)
+        overflow_before, existing_overflow_lines, overflow_after, overflow_delimited = _index_region(existing_overflow_text)
+    except ValueError as exc:
+        return {"ok": True, "skipped": True, "dir": str(memory_dir), "reason": str(exc)}
     lock_path = memory_dir / ".khipu-index.lock"
     try:
         lock_fh = open(lock_path, "a+")
@@ -312,7 +352,6 @@ def rewrite_index(
             lock_fh.close()
             return {"ok": True, "skipped": True, "dir": str(memory_dir), "reason": "another index rewrite is already in flight"}
     try:
-        preamble, existing_lines = _split_preamble(existing_text)
         existing_bullet_count = sum(1 for ln in existing_lines if _INDEX_LINE_RE.match(ln))
         # G1 incident (2026-09-14): every line whose note is still present
         # keeps its EXACT existing text — ranking below only ever decides
@@ -321,16 +360,15 @@ def rewrite_index(
         # matched the same way for consistency and so an unchanged overflow
         # also counts as a true no-op below.
         existing_by_target = _parse_existing_lines(existing_lines)
-        _, existing_overflow_lines = _split_preamble(existing_overflow_text)
         existing_by_target.update(_parse_existing_lines(existing_overflow_lines))
 
         candidates = _index_candidates(memory_dir, cur=cur)
         candidates.sort(key=_rank_key)
 
-        preamble_block = (preamble + "\n\n") if preamble else ""
+        preamble_block = preamble
         kept: list[dict[str, Any]] = []
         overflow: list[dict[str, Any]] = []
-        total = len((preamble_block).encode("utf-8"))
+        total = len((preamble_block + suffix + INDEX_START + "\n" + INDEX_END + "\n").encode("utf-8"))
         for c in candidates:
             line_bytes = len(_line_for(c, existing_by_target).encode("utf-8")) + 1
             if kept and total + line_bytes > cap_bytes:
@@ -358,10 +396,9 @@ def rewrite_index(
                 }
 
         new_body = "\n".join(_line_for(c, existing_by_target) for c in kept)
-        new_text = preamble_block + new_body + ("\n" if new_body else "")
-        overflow_text = (
-            "\n".join(_line_for(c, existing_by_target) for c in overflow) + ("\n" if overflow else "")
-        )
+        new_text = _render_index_region(preamble_block, new_body, suffix, original=existing_text, delimited=delimited)
+        overflow_body = "\n".join(_line_for(c, existing_by_target) for c in overflow)
+        overflow_text = _render_index_region(overflow_before, overflow_body, overflow_after, original=existing_overflow_text, delimited=overflow_delimited) if overflow or overflow_before or overflow_after else ""
 
         # G1 incident: every kept/overflow line's TEXT is now always either
         # preserved verbatim or freshly rendered for a genuinely new note —
@@ -381,7 +418,7 @@ def rewrite_index(
         if dry_run or not changed:
             return summary
 
-        if existing_had_index:
+        if index_path.exists():
             backup_path = _backup_index(memory_dir, existing_text)
             if backup_path is None:
                 # A backup was owed (there is existing text to protect) and
@@ -391,11 +428,16 @@ def rewrite_index(
                     "reason": "refusing to rewrite: backup of the existing index failed",
                 }
             summary["backup_path"] = str(backup_path)
+        if overflow_path.exists() and overflow_text != existing_overflow_text:
+            backup_path = _backup_index(memory_dir, existing_overflow_text, name=OVERFLOW_NAME)
+            if backup_path is None:
+                return {"ok": True, "skipped": True, "dir": str(memory_dir), "reason": "refusing to rewrite: backup of the existing overflow failed"}
+            summary["overflow_backup_path"] = str(backup_path)
 
         tmp = index_path.with_suffix(".md.tmp")
         tmp.write_text(new_text, encoding="utf-8")
         tmp.replace(index_path)
-        if overflow:
+        if overflow_text:
             otmp = overflow_path.with_suffix(".md.tmp")
             otmp.write_text(overflow_text, encoding="utf-8")
             otmp.replace(overflow_path)
@@ -457,8 +499,15 @@ def split_note(path: Path, *, dry_run: bool = False) -> dict[str, Any]:
 
     if not path.is_file():
         return {"ok": False, "error": f"no such file: {path}"}
-    text = path.read_text(encoding="utf-8")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return {"ok": False, "error": f"cannot read note: {exc}"}
     flat, body = _parse_note_frontmatter(text)
+    if text.startswith("---"):
+        frontmatter = re.match(r"\A---\r?\n.*?^---(?:\r?\n|$)", text, re.M | re.S)
+        if frontmatter is None or text[frontmatter.end():].lstrip("\n") != body:
+            return {"ok": False, "error": "cannot parse note frontmatter; refusing to split"}
     matches = list(_SECTION_HEADING_RE.finditer(body))
     if len(matches) < 2:
         return {"ok": True, "skipped": True, "reason": "fewer than two '## ' sections — nothing to split"}
@@ -468,18 +517,31 @@ def split_note(path: Path, *, dry_run: bool = False) -> dict[str, Any]:
     parent_type = flat.get("metadata.type") or flat.get("type") or "project"
     parent_modified = flat.get("metadata.modified") or flat.get("modified") or ""
 
-    sections: list[tuple[str, str, str]] = []  # (heading, slug, text)
+    sections: list[tuple[str, str, str, int]] = []  # (heading, slug, text, occurrence)
+    used: set[str] = set()
     for i, m in enumerate(matches):
         start = m.start()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
         heading = body[m.start() : m.end()][3:].strip()
-        slug = topic_slug_from_label(heading) or f"section-{i}"
-        sections.append((heading, slug, body[start:end].strip() + "\n"))
+        base_slug = topic_slug_from_label(heading) or f"section-{i}"
+        slug, occurrence = base_slug, 1
+        while slug in used:
+            occurrence += 1
+            slug = f"{base_slug}-{occurrence}"
+        used.add(slug)
+        sections.append((heading, slug, body[start:end], occurrence))
 
     children: list[dict[str, str]] = []
-    for heading, slug, section_text in sections:
+    child_slugs: set[str] = set()
+    for heading, slug, section_text, occurrence in sections:
         child_stem = f"{stem}--{slug}"
         child_name = f"{name} — {heading}"
+        if occurrence > 1:
+            child_name += f" ({occurrence})"
+        canonical_slug = topic_slug_from_label(child_name)
+        if not canonical_slug or canonical_slug == (topic_slug_from_label(name) or stem) or canonical_slug in child_slugs:
+            return {"ok": False, "error": "child topic names collide; refusing to split"}
+        child_slugs.add(canonical_slug)
         child_fm = (
             "---\n"
             f"name: {child_name}\n"
@@ -491,17 +553,23 @@ def split_note(path: Path, *, dry_run: bool = False) -> dict[str, Any]:
             f"  parent: {stem}\n"
             "---\n\n"
         )
+        child_flat, child_body = _parse_note_frontmatter(child_fm + section_text)
+        if child_body != section_text or topic_slug_from_label(child_flat.get("name", "")) != canonical_slug:
+            return {"ok": False, "error": "cannot parse generated child note; refusing to split"}
         children.append({
             "path": str(path.parent / f"{child_stem}.md"),
             "text": child_fm + section_text,
-            "slug_hint": child_stem,
+            "slug_hint": canonical_slug,
             "heading": heading,
         })
 
-    parent_body = "\n".join(f"- [[{Path(c['path']).stem}]] — {c['heading']}" for c in children) + "\n"
-    parent_text = text[: text.index(body)] + parent_body if body in text else parent_body
-    # If the note had no frontmatter block at all, text.index(body) == 0 and
-    # the line above degenerates to parent_body alone — correct either way.
+    for child in children:
+        destination = Path(child["path"])
+        if destination.exists() or destination.is_symlink():
+            return {"ok": False, "error": f"child file already exists: {destination}"}
+    overview = body[:matches[0].start()]
+    parent_body = overview + "\n".join(f"- [[{c['slug_hint']}]] — {c['heading']}" for c in children) + "\n"
+    parent_text = text[:len(text) - len(body)] + parent_body
 
     out: dict[str, Any] = {
         "ok": True, "dry_run": dry_run, "parent": str(path),
@@ -510,9 +578,36 @@ def split_note(path: Path, *, dry_run: bool = False) -> dict[str, Any]:
     if dry_run:
         return out
 
-    for c in children:
-        Path(c["path"]).write_text(c["text"], encoding="utf-8")
-    path.write_text(parent_text, encoding="utf-8")
+    backup = _backup_index(path.parent, text, name=path.name)
+    if backup is None:
+        return {"ok": False, "error": "backup of original note failed; refusing to split"}
+    out["backup_path"] = str(backup)
+    staged: list[tuple[Path, Path]] = []
+    created: list[Path] = []
+    try:
+        for destination, content in [(Path(c["path"]), c["text"]) for c in children] + [(path, parent_text)]:
+            fd, temporary = tempfile.mkstemp(prefix=".khipu-split-", dir=path.parent)
+            staged.append((Path(temporary), destination))
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        if path.read_text(encoding="utf-8") != text:
+            raise OSError("parent note changed while staging split")
+        for temporary, destination in staged[:-1]:
+            # Linking staged children publishes them without replacing a file
+            # another writer may have created after the preflight.
+            os.link(temporary, destination)
+            created.append(destination)
+        staged[-1][0].replace(path)
+    except (OSError, UnicodeDecodeError) as exc:
+        for destination in created:
+            destination.unlink()
+        return {"ok": False, "error": f"split failed: {exc}", "backup_path": str(backup)}
+    finally:
+        for temporary, _ in staged:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
     return out
 
 

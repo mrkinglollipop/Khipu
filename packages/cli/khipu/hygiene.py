@@ -180,17 +180,12 @@ def report_junk_paths(cur, *, sample_limit: int = 20) -> dict[str, Any]:
 
 
 def apply_purge_junk_paths(cur) -> dict[str, Any]:
-    """Destructive: delete every ``path:`` node failing :func:`is_real_path`
-    (and its edges). Must NOT be run against the live shared hub without
-    Matt's explicit go (scope §7 item 2) — callers are responsible for that
-    gate; this function only executes what it is asked to.
-    """
+    """Report only: historical path nodes lack the repository provenance
+    needed to distinguish accepted extensionless files from prose."""
     report = report_junk_paths(cur, sample_limit=10_000_000)
     ids = report["sample"]
-    if ids:
-        cur.execute("DELETE FROM edges WHERE src = ANY(%s) OR dst = ANY(%s)", (ids, ids))
-        cur.execute("DELETE FROM nodes WHERE id = ANY(%s)", (ids,))
-    return {"deleted_nodes": len(ids), "sample": ids[:20]}
+    return {"deleted_nodes": 0, "sample": ids[:20], "report_only": True,
+            "reason": "path provenance is unavailable; shape alone cannot authorize deletion"}
 
 
 # ---- W1.5 identity backfill -------------------------------------------------
@@ -216,11 +211,12 @@ def apply_backfill_identity(cur, *, limit: int | None = None) -> dict[str, Any]:
     rows = cur.fetchall()
     updated = 0
     for eid, scope in rows:
-        ident = resolve_repo_root(scope)
+        ident = resolve_repo_root(scope, cur=cur)
         if not ident.get("repo_root"):
             continue
         cur.execute(
-            "UPDATE episodes SET repo_root = %s, project = %s WHERE id = %s",
+            "UPDATE episodes SET repo_root = COALESCE(repo_root, %s), "
+            "project = COALESCE(project, %s) WHERE id = %s",
             (ident["repo_root"], ident["project"], eid),
         )
         updated += cur.rowcount

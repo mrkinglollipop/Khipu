@@ -190,9 +190,10 @@ class ApplyPurgeJunkPathsTest(unittest.TestCase):
 
         cur = _Cur()
         out = hygiene.apply_purge_junk_paths(cur)
-        self.assertEqual(out["deleted_nodes"], 1)
+        self.assertEqual(out["deleted_nodes"], 0)
         self.assertEqual(out["sample"], ["path:a/b"])
-        self.assertEqual(len(cur.deletes), 2)  # edges then nodes
+        self.assertTrue(out["report_only"])
+        self.assertEqual(cur.deletes, [])
 
 
 class BackfillIdentityReportTest(unittest.TestCase):

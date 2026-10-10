@@ -371,8 +371,8 @@ class SplitNoteTest(unittest.TestCase):
                 child_text = Path(child_path).read_text(encoding="utf-8")
                 self.assertIn("parent: big-ledger", child_text)
             parent_text = note_path.read_text(encoding="utf-8")
-        self.assertIn("[[big-ledger--first-entry]]", parent_text)
-        self.assertIn("[[big-ledger--second-entry]]", parent_text)
+        self.assertIn("[[big-ledger-first-entry]]", parent_text)
+        self.assertIn("[[big-ledger-second-entry]]", parent_text)
         self.assertNotIn("content one", parent_text)
 
     def test_dry_run_writes_nothing(self):
