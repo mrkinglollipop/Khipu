@@ -5,8 +5,8 @@
 evidence.
 
 It runs only when a caller asks (the ``khipu_reflect`` tool or ``khipu
-reflect``). No hook, ``khipu_status`` or recall path imports it, and it writes
-nothing: no episode, no decision, no brief.
+reflect``). No hook, ``khipu_status`` or recall path imports it. It writes no
+memory content: no episode, no decision, no brief. Search may update retrieval caches.
 
 The flow is one explicit search, one bounded read of what the hits say, one
 request to the configured synth provider, and a check of the answer against
@@ -17,9 +17,8 @@ what was actually offered:
     never sent; a superseded one is sent labelled as history. A brief is used
     only while it is current and not withheld, otherwise the topic page is
     used, clipped; an injected prior-work block is stripped from both.
-  - A claim whose sources are not all in the offered set is removed. If any
-    claim was removed the answer text is rebuilt from the survivors, never
-    kept as the model wrote it.
+  - A claim whose sources are not all in the offered set is removed. The
+    answer text is always rendered from the surviving claims with citations.
   - No surviving claim, ``insufficient`` from the model, no search hit, or any
     provider failure is an abstention. An answer is never returned without
     sources.
@@ -109,8 +108,11 @@ def _episode_sources(cur, ids: list[int]) -> dict[int, dict[str, Any]]:
         if mine:
             lines = [("(superseded) " if r["state"] == "superseded" else "") + _clean(r["text"])
                      for r in mine if r["state"] != "retracted"]
-        else:
+        elif not ready:
             lines = [_clean(d) for d in (legacy or []) if isinstance(d, str)]
+        else:
+            # Missing per-episode rows cannot establish canonical validity.
+            lines = []
         counts = [sum(1 for r in mine if r["state"] == s) for s in ("current", "superseded", "retracted")]
         state = validity.episode_state(*counts) if ready else "unknown"
         out[eid] = {
@@ -248,13 +250,16 @@ def validate(raw: Any, offered: set[str], *, limit: int) -> tuple[list[dict[str,
 
 
 def _final_answer(answer: Any, claims: list[dict[str, Any]], removed: int) -> str:
-    """The model's answer when every claim it offered survived; otherwise the
-    surviving claims themselves."""
-    from khipu.redact import redact_secrets
-
-    if removed == 0 and isinstance(answer, str) and answer.strip():
-        return redact_secrets(answer.strip())[0][:MAX_ANSWER_CHARS]
-    return "\n".join("- " + c["text"] for c in claims)[:MAX_ANSWER_CHARS]
+    """Render only accepted claims, keeping each citation with its text."""
+    lines: list[str] = []
+    used = 0
+    for claim in claims:
+        line = f"- {claim['text']} [{', '.join(claim['sources'])}]"
+        if used + len(line) + bool(lines) > MAX_ANSWER_CHARS:
+            break
+        used += len(line) + bool(lines)
+        lines.append(line)
+    return "\n".join(lines)
 
 
 # ---- the operation ---------------------------------------------------------------
