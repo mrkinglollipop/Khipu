@@ -91,7 +91,7 @@ def harness_state_path(harness: str):
     return data_dir() / f"probe-{safe}.json"
 
 
-def _write_state(result: dict[str, Any]) -> None:
+def _write_state(result: dict[str, Any]) -> str | None:
     """probe.json keeps the LAST probe (the doctor gate); probe-<harness>.json
     keeps each pack's own last probe, so Harnesses can say "verified" per
     card instead of borrowing another pack's round trip (audit 2026-09-04
@@ -105,8 +105,24 @@ def _write_state(result: dict[str, Any]) -> None:
         harness = str(result.get("harness") or "").strip()
         if harness:
             harness_state_path(harness).write_text(body, encoding="utf-8")
+        return None
     except Exception as exc:  # noqa: BLE001 — state write must never crash the probe
-        _log(f"failed to write probe state: {type(exc).__name__}: {exc}")
+        error = f"{type(exc).__name__}: {exc}"
+        _log(f"failed to write probe state: {error}")
+        return error
+
+
+def _persist_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Return the current result red when its doctor/receipt evidence was lost."""
+    error = _write_state(result)
+    if error:
+        prior = result.get("error")
+        result["ok"] = False
+        result["persistence"] = {"ok": False, "error": error}
+        result["error"] = f"probe result was not persisted: {error}" + (f"; prior: {prior}" if prior else "")
+    else:
+        result["persistence"] = {"ok": True}
+    return result
 
 
 def _age_of(result: dict[str, Any]) -> float | None:
@@ -178,8 +194,7 @@ def run_probe(
             "reason": "legacy-capture-mode", "seconds": round(time.monotonic() - started, 3),
             "episode_id": None, "error": None,
         }
-        _write_state(result)
-        return result
+        return _persist_result(result)
 
     nonce = uuid.uuid4().hex[:12]
     session_id = f"{harness}:probe:{nonce}"
@@ -251,7 +266,7 @@ def run_probe(
         result["seconds"] = round(time.monotonic() - started, 3)
         if episode_id is not None:
             result["cleanup"] = _forget_episode(episode_id)
-        _write_state(result)
+        _persist_result(result)
     return result
 
 
