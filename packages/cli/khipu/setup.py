@@ -199,7 +199,7 @@ def _stage_version(conn) -> dict[str, Any]:
     return {"id": "version", "ok": True, "title": "Version", "detail": f"Postgres {ver_str}."}
 
 
-def _stage_privileges(conn) -> dict[str, Any]:
+def _stage_privileges(conn, *, read_only: bool = False) -> dict[str, Any]:
     with conn.cursor() as cur:
         cur.execute("SELECT current_database()")
         dbname = cur.fetchone()[0]
@@ -229,6 +229,14 @@ def _stage_privileges(conn) -> dict[str, Any]:
                 "fix": "Ask your host to install the pgvector extension package "
                 "on the server.",
             }
+        if read_only:
+            conn.rollback()
+            return {
+                "id": "privileges",
+                "ok": True,
+                "title": "Privileges",
+                "detail": "This role can create tables and pgvector is available.",
+            }
         cur.execute("SAVEPOINT khipu_probe_ext")
         try:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
@@ -253,7 +261,7 @@ def _stage_privileges(conn) -> dict[str, Any]:
     }
 
 
-def _stage_schema(conn) -> dict[str, Any]:
+def _stage_schema(conn, *, read_only: bool = False) -> dict[str, Any]:
     from khipu.migrate import available, migrations_dir, run as migrate_run
 
     # An install with no migration files would otherwise report "schema is
@@ -269,8 +277,16 @@ def _stage_schema(conn) -> dict[str, Any]:
             "fix": "Reinstall Khipu (or, from a source checkout, make sure "
             "ops/migrations is present), then try again.",
         }
-    out = migrate_run(dry_run=False, conn=conn)
+    out = migrate_run(dry_run=read_only, conn=conn)
     if out["pending"]:
+        if read_only:
+            return {
+                "id": "schema",
+                "ok": False,
+                "title": "This database needs preparation",
+                "detail": f"Pending migrations: {', '.join(out['pending'])}.",
+                "fix": "Prepare the target explicitly before running this read-only preflight.",
+            }
         return {
             "id": "schema",
             "ok": False,
@@ -311,17 +327,35 @@ def _stage_graph(conn) -> dict[str, Any]:
 
 
 def _stage_store(dsn: str, root_crt: str | None) -> dict[str, Any]:
-    from khipu.keychain import set_dsn
+    from khipu.join import _file_snapshot, _restore_file, write_private_file
+    from khipu.keychain import keychain_available, set_dsn
+    from khipu.paths import dsn_file, root_cert_file
 
+    dsn_path = dsn_file()
+    cert_dest = root_cert_file()
     try:
-        set_dsn(dsn)
-        if root_crt:
-            from khipu.paths import root_cert_file
-
-            dest = root_cert_file()
-            dest.write_bytes(Path(root_crt).expanduser().read_bytes())
-            dest.chmod(0o600)
+        cert_bytes = Path(root_crt).expanduser().read_bytes() if root_crt else None
     except Exception as exc:  # noqa: BLE001
+        return {
+            "id": "store",
+            "ok": False,
+            "title": "Could not save the connection",
+            "detail": f"{type(exc).__name__}: {exc}",
+            "fix": "Check Keychain access for Khipu and try again.",
+        }
+    snapshots = {dsn_path: _file_snapshot(dsn_path), cert_dest: _file_snapshot(cert_dest)}
+    try:
+        write_private_file(dsn_path, (dsn.strip() + "\n").encode("utf-8"))
+        if cert_bytes is not None:
+            write_private_file(cert_dest, cert_bytes)
+        if keychain_available():
+            set_dsn(dsn)
+    except Exception as exc:  # noqa: BLE001
+        for path, snapshot in snapshots.items():
+            try:
+                _restore_file(path, snapshot)
+            except OSError:
+                pass
         return {
             "id": "store",
             "ok": False,
@@ -491,6 +525,8 @@ def connect_database(
             conn.close()
         return out
 
+    preflight = not store and not install_jobs and not prove
+
     # 1. reach
     t0 = time.monotonic()
     try:
@@ -518,7 +554,7 @@ def connect_database(
     # 3. privileges
     t0 = time.monotonic()
     try:
-        entry = _stage_privileges(conn)
+        entry = _stage_privileges(conn, read_only=preflight)
     except Exception as exc:  # noqa: BLE001
         title, detail, fix = explain_connection_error(exc)
         entry = {"id": "privileges", "ok": False, "title": title, "detail": detail, "fix": fix}
@@ -528,7 +564,7 @@ def connect_database(
     # 4. schema
     t0 = time.monotonic()
     try:
-        entry = _stage_schema(conn)
+        entry = _stage_schema(conn, read_only=preflight)
     except Exception as exc:  # noqa: BLE001
         title, detail, fix = explain_connection_error(exc)
         entry = {"id": "schema", "ok": False, "title": title, "detail": detail, "fix": fix}
@@ -609,6 +645,17 @@ def provision_local_move_target() -> dict[str, Any]:
         original_dsn: str | None = resolve_dsn()
     except Exception:  # noqa: BLE001 — no prior DSN configured is fine here
         original_dsn = None
+
+    if original_dsn:
+        from khipu.join import is_localhost_dsn
+
+        if is_localhost_dsn(original_dsn):
+            return {
+                "ok": False,
+                "error": "existing_local_installation",
+                "detail": "Refusing to replace the fixed local Khipu container while it may be the source database.",
+                "fix": "Choose an independently named target container/volume before moving a local source.",
+            }
 
     out = install_local_postgres()
     if not out.get("ok"):

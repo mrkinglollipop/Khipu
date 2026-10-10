@@ -42,8 +42,11 @@ def test_refresh_reports_all_missing_when_nothing_installed():
                 p.stop()
 
 
-def test_refresh_rewrites_a_stale_plist_then_is_current():
+def test_refresh_rewrites_a_stale_plist_then_is_current(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
+        driver = Path(tmpdir) / "nightly.py"
+        driver.write_text("# driver\n")
+        monkeypatch.setenv("KHIPU_CONSOLIDATE_NIGHTLY", str(driver))
         patches = _patched(tmpdir)
         for p in patches:
             p.start()
@@ -109,6 +112,8 @@ def test_refresh_keeps_passthrough_env_baked_in_the_installed_plist(monkeypatch)
 
     monkeypatch.delenv("KHIPU_CONSOLIDATE_NIGHTLY", raising=False)
     with tempfile.TemporaryDirectory() as tmpdir:
+        driver = Path(tmpdir) / "consolidate_nightly.py"
+        driver.write_text("# driver\n")
         patches = _patched(tmpdir)
         for p in patches:
             p.start()
@@ -116,13 +121,13 @@ def test_refresh_keeps_passthrough_env_baked_in_the_installed_plist(monkeypatch)
             dest = launchd_gen._plist_path(launchd_gen._LABELS["nightly"])
             dest.write_bytes(_plist_bytes(
                 "/Applications/Khipu.app/Contents/Resources/khipu/python/bin/python3.11",
-                {"KHIPU_CONSOLIDATE_NIGHTLY": "/x/consolidate_nightly.py"},
+                {"KHIPU_CONSOLIDATE_NIGHTLY": str(driver)},
             ))
             assert launchd_gen.plist_external("nightly") is False
             out = launchd_gen.refresh_scheduled_jobs(["nightly"])
             assert out["refreshed"] == ["nightly"]
             data = plistlib.loads(dest.read_bytes())
-            assert data["EnvironmentVariables"]["KHIPU_CONSOLIDATE_NIGHTLY"] == "/x/consolidate_nightly.py"
+            assert data["EnvironmentVariables"]["KHIPU_CONSOLIDATE_NIGHTLY"] == str(driver)
             assert launchd_gen.plist_current("nightly") is True
         finally:
             for p in patches:
@@ -132,6 +137,8 @@ def test_refresh_keeps_passthrough_env_baked_in_the_installed_plist(monkeypatch)
 def test_ensure_installs_missing_refreshes_stale_and_leaves_external_alone(monkeypatch):
     monkeypatch.delenv("KHIPU_CONSOLIDATE_NIGHTLY", raising=False)
     with tempfile.TemporaryDirectory() as tmpdir:
+        monthly_driver = Path(tmpdir) / "monthly.py"
+        monthly_driver.write_text("# driver\n")
         patches = _patched(tmpdir)
         for p in patches:
             p.start()
@@ -141,7 +148,10 @@ def test_ensure_installs_missing_refreshes_stale_and_leaves_external_alone(monke
             launchd_gen._plist_path(launchd_gen._LABELS["nightly"]).write_bytes(
                 _plist_bytes("/usr/local/bin/python3.11"))
             launchd_gen._plist_path(launchd_gen._LABELS["monthly"]).write_bytes(
-                _plist_bytes("/Applications/Khipu.app/Contents/Resources/khipu/python/bin/python3.11"))
+                _plist_bytes(
+                    "/Applications/Khipu.app/Contents/Resources/khipu/python/bin/python3.11",
+                    {"KHIPU_CONSOLIDATE_MONTHLY": str(monthly_driver)},
+                ))
             out = launchd_gen.ensure_scheduled_jobs()
             assert out["ok"] is True
             assert out["external"] == ["nightly"]

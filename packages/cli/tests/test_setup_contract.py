@@ -185,6 +185,7 @@ class UpkeepAndProveWiringTest(unittest.TestCase):
 
     def test_success_pipeline_calls_ensure_scheduled_jobs_and_run_probe(self) -> None:
         with _ReachThroughGraphPatches(), \
+             mock.patch("khipu.keychain.keychain_available", return_value=True), \
              mock.patch("khipu.keychain.set_dsn") as set_dsn, \
              mock.patch(
                  "khipu.launchd_gen.ensure_scheduled_jobs",
