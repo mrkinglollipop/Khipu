@@ -147,6 +147,16 @@ def check_remote_postgres(*, full: bool = False) -> dict[str, Any]:
 
     try:
         with connect() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SET LOCAL statement_timeout = '30s'")
+                    cur.execute("SET LOCAL lock_timeout = '10s'")
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "ok": False,
+                    "error": "remote_timeout_configuration_failed",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
             ver_num = server_version_num(conn)
             gate = require_pg19_num(ver_num)
             if not gate.get("ok"):
@@ -383,6 +393,19 @@ def install_local_postgres() -> dict[str, Any]:
         return docker
 
     versions = read_versions()
+    existing = versions.get("postgres")
+    if (
+        isinstance(existing, dict)
+        and existing.get("mode") == "local_docker"
+        and str(existing.get("container") or PG_CONTAINER) == PG_CONTAINER
+        and str(existing.get("volume") or PG_VOLUME) == PG_VOLUME
+    ):
+        return {
+            "ok": False,
+            "error": "existing_local_postgres_refused",
+            "detail": "A configured local Khipu database already owns the fixed container and volume.",
+            "fix": "Use the existing database, upgrade it, or provision a separately named move target.",
+        }
     pending = versions.get("pending")
     if not isinstance(pending, dict):
         return {
@@ -687,6 +710,53 @@ def _docker_volume_rename(old: str, new: str) -> dict[str, Any]:
     return {"ok": True}
 
 
+def _docker_volume_copy(source: str, target: str) -> dict[str, Any]:
+    """Copy a volume without removing either input; prove the copy bytewise."""
+    source_inspect = _docker(["volume", "inspect", source], check=False)
+    if source_inspect.returncode != 0:
+        error = _proc_output(source_inspect).lower()
+        return {"ok": False, "error": "volume_missing" if "no such volume" in error else "volume_inspect_failed", "volume": source}
+    target_inspect = _docker(["volume", "inspect", target], check=False)
+    if target_inspect.returncode == 0:
+        return {"ok": False, "error": "volume_destination_exists", "volume": target}
+    if "no such volume" not in _proc_output(target_inspect).lower():
+        return {"ok": False, "error": "volume_destination_inspect_failed", "volume": target}
+    created = _docker(["volume", "create", target], check=False)
+    if created.returncode != 0:
+        return {"ok": False, "error": _proc_output(created)}
+    copy = _docker(["run", "--rm", "-v", f"{source}:/from:ro", "-v", f"{target}:/to",
+                    "alpine:3", "sh", "-c", "cp -a /from/. /to/"], check=False, timeout=900)
+    if copy.returncode != 0:
+        return {"ok": False, "error": _proc_output(copy)}
+    verified = _docker(["run", "--rm", "-v", f"{source}:/from:ro", "-v", f"{target}:/to:ro",
+                        "alpine:3", "sh", "-c", "diff -r /from /to"], check=False, timeout=900)
+    if verified.returncode != 0:
+        return {"ok": False, "error": "volume_copy_verification_failed", "detail": _proc_output(verified)}
+    return {"ok": True}
+
+
+def _stop_and_remove_container(name: str) -> dict[str, Any]:
+    stopped = _docker(["stop", name], check=False)
+    if stopped.returncode != 0:
+        return {"ok": False, "error": "stop_container_failed", "detail": _proc_output(stopped)}
+    removed = _docker(["rm", "-f", name], check=False)
+    if removed.returncode != 0:
+        return {"ok": False, "error": "remove_container_failed", "detail": _proc_output(removed)}
+    return {"ok": True}
+
+
+def _recovery_failure(
+    failure: Exception,
+    step: str,
+    volumes: list[str],
+    detail: Any | None = None,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {"ok": False, "error": "rollback_recovery_failed", "upgrade_error": str(failure), "recovery_step": step, "uncertain_volumes": volumes}
+    if detail is not None:
+        out["detail"] = detail
+    return out
+
+
 def _read_dsn_password_port(versions: dict[str, Any]) -> dict[str, Any]:
     from khipu.db import resolve_dsn
 
@@ -704,6 +774,86 @@ def _read_dsn_password_port(versions: dict[str, Any]) -> dict[str, Any]:
         # Upgrade must reuse the live DSN secret — never mint a replacement.
         return {"ok": False, "error": "dsn_password_missing"}
     return {"ok": True, "password": password, "port": port}
+
+
+def _recover_previous_upgrade(
+    *,
+    failure: Exception,
+    previous_volume: str,
+    failed_volume: str,
+    previous_image: str,
+    dsn: str,
+    password: str,
+    port: int,
+    expected_counts: dict[str, int],
+    psycopg,
+) -> dict[str, Any]:
+    """Restore and prove the known-good upgrade input before claiming rollback."""
+    stopped = _stop_and_remove_container(PG_CONTAINER)
+    if not stopped.get("ok"):
+        return _recovery_failure(
+            failure, "stop_replacement_container", [PG_VOLUME, previous_volume], stopped
+        )
+    preserved = _docker_volume_copy(PG_VOLUME, failed_volume)
+    if not preserved.get("ok"):
+        return _recovery_failure(
+            failure, "preserve_failed_volume",
+            [PG_VOLUME, previous_volume, failed_volume], preserved,
+        )
+    removed_replacement = _docker(["volume", "rm", "-f", PG_VOLUME], check=False)
+    if removed_replacement.returncode != 0:
+        return _recovery_failure(
+            failure, "remove_replacement_volume",
+            [PG_VOLUME, previous_volume, failed_volume], _proc_output(removed_replacement),
+        )
+    restored = _docker_volume_copy(previous_volume, PG_VOLUME)
+    if not restored.get("ok"):
+        return _recovery_failure(
+            failure, "restore_previous_volume",
+            [PG_VOLUME, previous_volume, failed_volume], restored,
+        )
+    image = ensure_postgres_image(previous_image)
+    if not image.get("ok"):
+        return _recovery_failure(
+            failure, "prepare_previous_image", [PG_VOLUME, previous_volume, failed_volume], image
+        )
+    started = _docker(
+        [
+            "run", "-d", "--name", PG_CONTAINER,
+            "-e", "POSTGRES_USER=khipu", "-e", "POSTGRES_DB=khipu",
+            "-e", f"POSTGRES_PASSWORD={password}",
+            "-e", "POSTGRES_HOST_AUTH_METHOD=scram-sha-256",
+            "-p", f"127.0.0.1:{port}:5432",
+            "-v", f"{PG_VOLUME}:/var/lib/postgresql", previous_image,
+        ],
+        check=False,
+    )
+    if started.returncode != 0:
+        return _recovery_failure(
+            failure, "start_previous_container", [PG_VOLUME, previous_volume, failed_volume], _proc_output(started)
+        )
+    if not _wait_pg_ready(dsn):
+        return _recovery_failure(
+            failure, "wait_for_previous_database", [PG_VOLUME, previous_volume, failed_volume]
+        )
+    try:
+        with psycopg.connect(dsn, connect_timeout=10) as conn:
+            restored_counts = _table_row_counts(conn)
+    except Exception as exc:  # noqa: BLE001
+        return _recovery_failure(
+            failure, "verify_previous_database", [PG_VOLUME, previous_volume, failed_volume],
+            f"{type(exc).__name__}: {exc}",
+        )
+    if restored_counts != expected_counts:
+        return _recovery_failure(
+            failure, "verify_previous_counts", [PG_VOLUME, previous_volume, failed_volume],
+            {"expected": expected_counts, "actual": restored_counts},
+        )
+    return {"ok": True}
+
+
+def _proc_output(proc: subprocess.CompletedProcess[str]) -> str:
+    return (proc.stderr or proc.stdout or "").strip() or "docker command failed"
 
 
 def upgrade_postgres() -> dict[str, Any]:
@@ -787,6 +937,13 @@ def upgrade_postgres() -> dict[str, Any]:
     password = str(creds["password"])
     port = int(creds["port"])
 
+    # Pull/build the replacement while the known-good container and its volume
+    # are still intact. A preparation failure must leave the live database
+    # untouched.
+    pulled = ensure_postgres_image(target_image)
+    if not pulled.get("ok"):
+        return {"ok": False, "error": "image_pull_failed", "detail": pulled}
+
     import psycopg
 
     with psycopg.connect(_local_dsn(port, password), connect_timeout=10) as conn:
@@ -807,9 +964,6 @@ def upgrade_postgres() -> dict[str, Any]:
         return renamed
 
     _ensure_volume(PG_VOLUME)
-    pulled = ensure_postgres_image(target_image)
-    if not pulled.get("ok"):
-        return {"ok": False, "error": "image_pull_failed", "detail": pulled}
 
     run_proc = _docker(
         [
@@ -866,36 +1020,20 @@ def upgrade_postgres() -> dict[str, Any]:
                     f"count_regression:{table}: before={before} after={after}"
                 )
     except Exception as exc:  # noqa: BLE001
-        _stop_container(PG_CONTAINER)
         failed_vol = f"{PG_VOLUME}-failed-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-        _docker(["volume", "rm", "-f", failed_vol], check=False)
-        _docker_volume_rename(PG_VOLUME, failed_vol)
-        _docker(["volume", "rm", "-f", PG_VOLUME], check=False)
-        _docker_volume_rename(prev_volume, PG_VOLUME)
-        ensure_postgres_image(pre_upgrade_image)
-        _ensure_volume(PG_VOLUME)
-        _docker(
-            [
-                "run",
-                "-d",
-                "--name",
-                PG_CONTAINER,
-                "-e",
-                "POSTGRES_USER=khipu",
-                "-e",
-                "POSTGRES_DB=khipu",
-                "-e",
-                f"POSTGRES_PASSWORD={password}",
-                "-e",
-                "POSTGRES_HOST_AUTH_METHOD=scram-sha-256",
-                "-p",
-                f"127.0.0.1:{port}:5432",
-                "-v",
-                f"{PG_VOLUME}:/var/lib/postgresql",
-                pre_upgrade_image,
-            ],
-            check=False,
+        recovery = _recover_previous_upgrade(
+            failure=exc,
+            previous_volume=prev_volume,
+            failed_volume=failed_vol,
+            previous_image=pre_upgrade_image,
+            dsn=dsn,
+            password=password,
+            port=port,
+            expected_counts=pre_counts,
+            psycopg=psycopg,
         )
+        if not recovery.get("ok"):
+            return recovery
         return {"ok": False, "error": str(exc), "rolled_back": True}
 
     try:
