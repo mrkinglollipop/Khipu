@@ -32,10 +32,12 @@ import os
 import re
 import sys
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -137,10 +139,8 @@ _SECTION_HEADING_RE = re.compile(r"(?m)^## [^\n]*$")
 # Chunk-idx layout for chunk_text_indexed (P5 G4): idx = bucket * SECTION_LOCAL_SPACE
 # + local_i. INTEGER column (0004_embedding_profiles.sql), max ~2.1B — this
 # layout tops out at SECTION_HASH_SPACE * SECTION_LOCAL_SPACE, comfortably under
-# that ceiling, and a section holding more than SECTION_LOCAL_SPACE 6,000-char
-# windows (a single ~6MB section) would need to before local_i clamps and two
-# chunks in that one section could collide — recoverable (a spurious re-embed
-# of one chunk next sweep), never silent data loss.
+# that ceiling. Sections longer than one 1,000-index bucket reserve adjacent
+# buckets before any rows are emitted, so long sections cannot overlap peers.
 SECTION_HASH_SPACE = 100_000
 SECTION_LOCAL_SPACE = 1_000
 
@@ -220,11 +220,26 @@ def chunk_text_indexed(text: str) -> list[tuple[int, str]]:
         body = sections[0][1] if sections else text
         return list(enumerate(_window(body)))
     out: list[tuple[int, str]] = []
+    occurrences: dict[str, int] = {}
+    used_buckets: set[int] = set()
     for anchor, section in sections:
-        bucket = _section_bucket(anchor)
-        for local_i, chunk in enumerate(_window(section)):
-            if local_i >= SECTION_LOCAL_SPACE:
-                local_i = SECTION_LOCAL_SPACE - 1
+        windows = _window(section)
+        span = max(1, (len(windows) + SECTION_LOCAL_SPACE - 1) // SECTION_LOCAL_SPACE)
+        if span > SECTION_HASH_SPACE:
+            raise ValueError("section has too many chunks for stable embedding indexes")
+        occurrence = occurrences.get(anchor, 0)
+        occurrences[anchor] = occurrence + 1
+        identity = anchor if occurrence == 0 else f"{anchor}#{occurrence}"
+        bucket = _section_bucket(identity)
+        for _probe in range(SECTION_HASH_SPACE):
+            if bucket + span <= SECTION_HASH_SPACE and all(
+                    b not in used_buckets for b in range(bucket, bucket + span)):
+                break
+            bucket = (bucket + 1) % SECTION_HASH_SPACE
+        else:
+            raise ValueError("too many sections for stable embedding indexes")
+        used_buckets.update(range(bucket, bucket + span))
+        for local_i, chunk in enumerate(windows):
             out.append((bucket * SECTION_LOCAL_SPACE + local_i, chunk))
     return out
 
@@ -391,86 +406,118 @@ def _budget_today() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
+def _read_budget(path: Path, day: str) -> int:
+    if not path.exists():
+        return 0
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("budget record is not an object")
+    raw_day, calls = raw.get("day"), raw.get("calls")
+    if not isinstance(raw_day, str) or isinstance(calls, bool) or not isinstance(calls, int) or calls < 0:
+        raise ValueError("budget record has invalid day or calls")
+    return calls if raw_day == day else 0
+
+
 def budget_status() -> dict[str, Any]:
     """Today's embed API calls against EMBED_DAILY_CALL_BUDGET."""
-    used = 0
+    day = _budget_today()
+    available, error = True, None
     try:
-        raw = json.loads(_budget_path().read_text(encoding="utf-8"))
-        if raw.get("day") == _budget_today():
-            used = int(raw.get("calls") or 0)
-    except (OSError, ValueError, TypeError):
-        used = 0
+        path = _budget_path()
+        used = _read_budget(path, day)
+    except (OSError, ValueError, TypeError) as exc:
+        used = None
+        available, error = False, f"{type(exc).__name__}: {exc}"
     cap = EMBED_DAILY_CALL_BUDGET
     unlimited = cap <= 0
     return {
-        "day": _budget_today(),
+        "day": day,
         "calls": used,
         "cap": cap,
         "unlimited": unlimited,
-        "remaining": None if unlimited else max(0, cap - used),
-        "exhausted": False if unlimited else used >= cap,
+        "remaining": None if unlimited or not available else max(0, cap - used),
+        "exhausted": False if unlimited else (not available or used >= cap),
+        "available": available,
+        **({"error": error} if error else {}),
     }
 
 
-def _budget_take() -> None:
-    """Reserve one API call for today; raise when the day's budget is spent.
+@contextmanager
+def _lock_budget_file(lock):
+    """Hold a one-byte cross-process lock using the host stdlib backend."""
+    try:
+        import fcntl
+    except ImportError:
+        try:
+            import msvcrt
+        except ImportError as exc:
+            raise OSError("no supported file-lock backend") from exc
+        lock.seek(0, os.SEEK_END)
+        if lock.tell() == 0:
+            lock.write("\0")
+            lock.flush()
+        lock.seek(0)
+        msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
-    The message carries "budget exhausted" — hybrid_search keys its
-    ``degraded`` reason on it. Read-modify-write without a lock: two
-    concurrent callers may under-count by one, which is fine for a cap whose
-    job is to stop a loop, not to bill."""
-    st = budget_status()
-    if st["exhausted"]:
-        raise RuntimeError(
-            f"embed budget exhausted: {st['calls']} calls today "
-            f"(cap {st['cap']}, KHIPU_EMBED_DAILY_CALLS)"
-        )
+
+def _budget_take() -> None:
+    """Atomically reserve one API call for today across local processes."""
+    day, cap = _budget_today(), EMBED_DAILY_CALL_BUDGET
     try:
         path = _budget_path()
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"day": st["day"], "calls": st["calls"] + 1}), encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        pass  # a budget file we cannot write never blocks an embed
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as lock:
+            with _lock_budget_file(lock):
+                try:
+                    used = _read_budget(path, day)
+                except (OSError, ValueError, TypeError) as exc:
+                    if cap > 0:
+                        raise RuntimeError(
+                            f"embed budget accounting unavailable: {type(exc).__name__}: {exc}"
+                        ) from exc
+                    used = 0
+                if cap > 0 and used >= cap:
+                    raise RuntimeError(
+                        f"embed budget exhausted: {used} calls today "
+                        f"(cap {cap}, KHIPU_EMBED_DAILY_CALLS)"
+                    )
+                with tempfile.NamedTemporaryFile(
+                        "w", encoding="utf-8", dir=path.parent,
+                        prefix=path.name + ".", suffix=".tmp", delete=False) as tmp:
+                    json.dump({"day": day, "calls": used + 1}, tmp)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                    tmp_path = Path(tmp.name)
+                os.replace(tmp_path, path)
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        raise RuntimeError(f"embed budget accounting unavailable: {type(exc).__name__}: {exc}") from exc
+
+
+QUERY_CACHE_SCHEME = "provider-input-v2"
 
 
 def _query_hash(profile: str, api_q: str) -> str:
-    """Cache key: profile + normalized query text. Only the hash is stored on
-    the hub, never the query itself.
+    """Cache actual provider input; only its hash is stored on the hub.
 
-    Normalization is the SAME lowercase/stopword/short-word filter
-    ``search_text.search_tokens`` uses — not that function itself — so
-    "what did we decide" and "what do we decide" (a stopword-only
-    difference) hit the same cache row instead of each paying its own embed
-    API call (2026-09-14 budgeted-prior_work phase: a repeated question
-    phrased slightly differently was a guaranteed miss under the old
-    whitespace/case-only normalization). Deliberately does NOT apply
-    ``search_tokens``'s ``MAX_TOKENS`` cap (8): that cap exists to bound RRF
-    ranking cost and is wrong here — ``api_q`` carries the fixed
-    ``prefix_query`` boilerplate ("task: search result | query: ...") ahead
-    of the real query for profiles that use task prefixes, and capping at 8
-    tokens let that constant prefix alone fill the budget, silently
-    colliding every long query sharing its first few content words onto the
-    same cache row regardless of what came after (caught live: a
-    freshly-random-suffixed query read back as an immediate cache "hit").
-    Falls back to the old whitespace-collapsed/case-folded form when the
-    query has no content tokens at all (e.g. a bare id or a too-short query)
-    so it is still cacheable rather than skipped.
+    The cache key includes a scheme version, profile, and the query task.
+    Search ranking's stopword reduction is deliberately excluded because it
+    can erase direction or negation before the provider creates its vector.
     """
-    from khipu.search_text import STOPWORDS, TOKEN_RE
-
-    seen: set[str] = set()
-    toks: list[str] = []
-    for raw in TOKEN_RE.findall(api_q or ""):
-        key = raw.lower()
-        if key in seen or key in STOPWORDS:
-            continue
-        if len(key) < 3 and not (key.isdigit() and len(key) >= 2):
-            continue
-        seen.add(key)
-        toks.append(key)
-    norm = " ".join(toks) if toks else " ".join((api_q or "").split()).lower()
-    return _md5(f"{profile}\n{norm}")
+    return _md5(f"{QUERY_CACHE_SCHEME}\n{profile}\nquery\n{api_q or ''}")
 
 
 def _query_cache_available(cur) -> bool:
@@ -484,6 +531,7 @@ def _query_vec(cur, conn, profile: str, api_q: str) -> tuple[list[float], str]:
     state is ``hit`` (no API call), ``miss`` (embedded and stored) or ``off``
     (hub not migrated; embedded, nothing stored). Cache failures never fail
     the search — they roll back and fall through to the API."""
+    api_q = _sanitize_provider_text(api_q)
     try:
         have_cache = _query_cache_available(cur)
     except Exception:  # noqa: BLE001
@@ -499,13 +547,18 @@ def _query_vec(cur, conn, profile: str, api_q: str) -> tuple[list[float], str]:
             )
             row = cur.fetchone()
             if row and isinstance(row[0], str) and row[0].startswith("["):
-                cur.execute(
-                    "UPDATE memory_query_cache SET last_used_at = now(), hits = hits + 1"
-                    " WHERE profile = %s AND query_hash = %s",
-                    (profile, qh),
-                )
-                conn.commit()
-                return [float(x) for x in json.loads(row[0])], "hit"
+                try:
+                    cached = _validated_vector(json.loads(row[0]), resolve_spec(profile, cur).dim)
+                except (RuntimeError, TypeError, ValueError):
+                    _log("query cache row invalid; replacing from provider")
+                else:
+                    cur.execute(
+                        "UPDATE memory_query_cache SET last_used_at = now(), hits = hits + 1"
+                        " WHERE profile = %s AND query_hash = %s",
+                        (profile, qh),
+                    )
+                    conn.commit()
+                    return cached, "hit"
         except Exception as exc:  # noqa: BLE001
             conn.rollback()
             _log(f"query cache read skipped: {type(exc).__name__}")
@@ -593,7 +646,7 @@ def _build_gemini(spec: ProfileSpec, texts: list[str], input_type: str | None):
             {
                 "model": f"models/{model}",
                 "content": {"parts": [{"text": t[:MAX_TEXT_CHARS]}]},
-                "outputDimensionality": DIM,
+                "outputDimensionality": spec.dim,
             }
             for t in texts
         ]
@@ -633,11 +686,60 @@ _BUILDERS = {
 
 
 def _parse_vectors(provider: str, payload: dict[str, Any]) -> list[list[float]]:
-    if provider == "gemini":
-        return [item["values"] for item in payload["embeddings"]]
-    # Voyage and the OpenAI shape: data[].embedding with an index; order by it.
-    items = sorted(payload["data"], key=lambda d: d.get("index", 0))
-    return [item["embedding"] for item in items]
+    try:
+        if provider == "gemini":
+            values = [item["values"] for item in payload["embeddings"]]
+        else:
+            # Voyage and the OpenAI shape: data[].embedding with an index.
+            items = sorted(payload["data"], key=lambda d: d.get("index", 0))
+            values = [item["embedding"] for item in items]
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("embed returned a malformed vector payload") from exc
+    return [_validated_vector(value, None) for value in values]
+
+
+def _validated_vector(values: list[float], dim: int | None) -> list[float]:
+    if not isinstance(values, list) or not all(
+            isinstance(value, (int, float)) and not isinstance(value, bool) for value in values):
+        raise RuntimeError("embed returned a non-numeric vector")
+    try:
+        vec = [float(value) for value in values]
+    except OverflowError as exc:
+        raise RuntimeError("embed returned a numeric vector outside float range") from exc
+    if dim is not None and len(vec) != dim:
+        raise RuntimeError(f"expected dim {dim}, got {len(vec)}")
+    if not all(math.isfinite(value) for value in vec) or not any(value != 0.0 for value in vec):
+        raise RuntimeError("embed returned a vector that is not finite, nonzero")
+    return vec
+
+
+def _sanitize_provider_text(text: str) -> str:
+    """Apply the user-controlled memory redaction policy at the network edge."""
+    from khipu.redact import redact_secrets
+
+    return redact_secrets(text or "")[0]
+
+
+def _redact_provider_diagnostic(text: str, headers: dict[str, str]) -> str:
+    """Keep provider error bodies useful without echoing request credentials."""
+    from khipu.redact import enabled, redact_secrets
+
+    out = str(text)
+    for value in headers.values():
+        if value and len(value) >= 4:
+            out = out.replace(value, "***")
+            if value.lower().startswith("bearer "):
+                out = out.replace(value[7:], "***")
+    if not enabled():
+        return out
+    out, _count = redact_secrets(out)
+    out = re.sub(
+        r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)\S+", r"\1***", out,
+    )
+    return re.sub(
+        r"(?i)((?:x-goog-api-key|api[_ -]?key|key|token|secret)\s*[:=]\s*)[^\s,;\"']+",
+        r"\1***", out,
+    )
 
 
 def _post_json(
@@ -656,7 +758,7 @@ def _post_json(
             break
         except urllib.error.HTTPError as e:
             _note_auth_failure(e.code, provider)
-            err = e.read().decode("utf-8", errors="replace")
+            err = _redact_provider_diagnostic(e.read().decode("utf-8", errors="replace"), headers)
             if e.code in (429, 500, 502, 503, 504) and attempt < retries:
                 _log(f"embed HTTP {e.code}, retry in {delay:.0f}s")
                 time.sleep(delay)
@@ -704,7 +806,7 @@ def embed_batch(
     step = _MAX_PER_REQUEST.get(spec.provider) or len(texts)
     out: list[list[float]] = []
     for i in range(0, len(texts), step):
-        part = texts[i:i + step]
+        part = [_sanitize_provider_text(text) for text in texts[i:i + step]]
         url, body, headers = builder(spec, part, input_type)
         payload = _post_json(
             url, body, headers, provider=spec.provider,
@@ -713,10 +815,8 @@ def embed_batch(
         vecs = _parse_vectors(spec.provider, payload)
         if len(vecs) != len(part):
             raise RuntimeError(f"embed returned {len(vecs)} vectors for {len(part)} texts")
-        for v in vecs:
-            if len(v) != spec.dim:
-                raise RuntimeError(f"expected dim {spec.dim}, got {len(v)}")
-        out.extend(_l2(v) if spec.normalize == "l2" else [float(x) for x in v] for v in vecs)
+        validated = [_validated_vector(v, spec.dim) for v in vecs]
+        out.extend(_l2(v) if spec.normalize == "l2" else v for v in validated)
     return out
 
 
@@ -873,7 +973,10 @@ def embed_batch_images(
             break
         except urllib.error.HTTPError as e:
             _note_auth_failure(e.code)
-            err = e.read().decode("utf-8", errors="replace")
+            err = _redact_provider_diagnostic(
+                e.read().decode("utf-8", errors="replace"),
+                {"x-goog-api-key": key},
+            )
             if e.code in (429, 500, 502, 503, 504) and attempt < retries:
                 _log(f"embed-image HTTP {e.code}, retry in {delay:.0f}s")
                 time.sleep(delay)
@@ -892,10 +995,7 @@ def embed_batch_images(
     vecs = [item["values"] for item in payload["embeddings"]]
     if len(vecs) != len(images):
         raise RuntimeError(f"embed-image returned {len(vecs)} vectors for {len(images)} images")
-    for v in vecs:
-        if len(v) != DIM:
-            raise RuntimeError(f"expected dim {DIM}, got {len(v)}")
-    return [_l2(v) for v in vecs]
+    return [_l2(_validated_vector(v, DIM)) for v in vecs]
 
 
 def _iter_media_files(root: Path) -> Iterable[Path]:
@@ -990,16 +1090,13 @@ def backfill_media(
             except ValueError:
                 rel = p.name
             candidates.append((sid, p, rel))
-            if limit is not None and len(candidates) >= limit:
-                break
-        if limit is not None and len(candidates) >= limit:
-            break
 
     stats["scanned"] = len(candidates)
-    if len(candidates) > MEDIA_PILOT_WITHOUT_YES and not yes and not dry_run:
+    scheduled = len(candidates) if limit is None else min(len(candidates), max(0, limit))
+    if scheduled > MEDIA_PILOT_WITHOUT_YES and not yes and not dry_run:
         stats["needs_yes"] = True
         stats["error"] = (
-            f"{len(candidates)} images exceed pilot of {MEDIA_PILOT_WITHOUT_YES}; "
+            f"{scheduled} scheduled images exceed pilot of {MEDIA_PILOT_WITHOUT_YES}; "
             "re-run with --yes"
         )
         return stats
@@ -1047,6 +1144,8 @@ def backfill_media(
                         stats["skipped_unchanged"] += 1
                         continue
                 todo.append((sid, path, rel, mime, sha, raw))
+                if limit is not None and len(todo) >= limit:
+                    break
 
             stats["would_embed"] = len(todo)
             if dry_run:
@@ -1177,8 +1276,9 @@ def _iter_sources(
                 {"summary": summary, "decisions": decisions, "preferences": prefs,
                  "topics": topics, "people": people, "verbatim": verbatim}
             )
-            if text:
-                yield "episode", str(eid), text, ""
+            # Empty live rows still participate so a successful backfill can
+            # prune vectors left from their former non-empty contents.
+            yield "episode", str(eid), text, ""
     if kind in (None, "topic"):
         if refs is None:
             cur.execute("SELECT slug, title, body FROM topics WHERE deleted_at IS NULL ORDER BY slug")
@@ -1215,6 +1315,19 @@ def _existing_hashes(cur, profile: str) -> dict[tuple[str, str, int], str]:
     return {(k, r, i): h for k, r, i, h in cur.fetchall()}
 
 
+def _existing_hashes_for_refs(
+    cur, profile: str, kind: str, refs: list[str]
+) -> dict[tuple[str, str, int], str]:
+    if not refs:
+        return {}
+    cur.execute(
+        "SELECT kind, ref, chunk_idx, content_hash FROM memory_embeddings "
+        "WHERE profile = %s AND kind = %s AND ref = ANY(%s)",
+        (profile, kind, refs),
+    )
+    return {(k, r, i): h for k, r, i, h in cur.fetchall()}
+
+
 def _existing_hashes_many(cur, profiles: list[str] | None) -> dict[str, dict[tuple[str, str, int], str]]:
     """``_existing_hashes`` for several profiles in one statement; ``None`` reads
     every profile's."""
@@ -1235,6 +1348,9 @@ def _upsert_chunks(
     cur, profile: str, rows: list[tuple[str, str, int, str, str, list[float]]]
 ) -> None:
     spec = _profiles.cached_spec(profile)
+    keys = [(kind, str(ref), idx) for kind, ref, idx, _text, _hash, _vec in rows]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate embedding chunk indexes in one persistence batch")
     for kind, ref, idx, text, h, vec in rows:
         # The column is untyped, so the database no longer rejects a vector of
         # the wrong width; this is the check that does.
@@ -1449,6 +1565,15 @@ def memory_coverage_fields(plan, missing, stale, *, sample: int = 5) -> dict[str
     }
 
 
+def _backfill_outcome(stats: dict[str, Any]) -> dict[str, Any]:
+    """Classify a completed sweep without changing its existing counters."""
+    failed = int(stats.get("failed_chunks") or 0)
+    interrupted = bool(stats.get("budget_exhausted") or stats.get("cancelled"))
+    if failed or interrupted:
+        return {"outcome": "partial" if int(stats.get("embedded") or 0) else "failed", "ok": False}
+    return {"outcome": "complete", "ok": True}
+
+
 def backfill(
     *,
     kind: str | None = None,
@@ -1498,42 +1623,35 @@ def backfill(
             have = _existing_hashes(cur, profile)
             # (kind, ref, idx, unprefixed_chunk, hash, title)
             todo: list[tuple[str, str, int, str, str, str]] = []
-            # P5 G4: every topic's *current* valid idx set, so a section that
-            # shrank (or a whole section that was deleted) has its now-stale
-            # chunk rows pruned below instead of lingering forever as orphan
-            # vectors under an idx nothing produces any more.
-            topic_valid_idx: dict[str, set[int]] = {}
+            valid_idx: dict[tuple[str, str], set[int]] = {}
+            needed_by_ref: dict[tuple[str, str], int] = {}
+            queued_by_ref: dict[tuple[str, str], int] = {}
             for k, ref, text, title in _iter_sources(cur, kind=kind):
                 stats["scanned"] += 1
                 chunks = _chunks_for(k, text)
-                if k == "topic":
-                    topic_valid_idx[ref] = {i for i, _ in chunks}
+                source_key = (k, ref)
+                valid_idx[source_key] = {i for i, _ in chunks}
+                needed_by_ref[source_key] = 0
                 for i, chunk in chunks:
                     stats["chunks"] += 1
                     h = _md5(chunk)
                     if have.get((k, ref, i)) == h:
                         stats["skipped_unchanged"] += 1
                         continue
+                    needed_by_ref[source_key] += 1
+                    if limit and len(todo) >= limit:
+                        continue
                     todo.append((k, ref, i, chunk, h, title))
+                    queued_by_ref[source_key] = queued_by_ref.get(source_key, 0) + 1
                 if limit and len(todo) >= limit:
-                    todo = todo[:limit]
                     break
             _log(f"profile={profile} to_embed={len(todo)} unchanged={stats['skipped_unchanged']}")
-            if not dry_run and topic_valid_idx:
-                stats["topic_chunks_pruned"] = 0
-                for ref, valid in topic_valid_idx.items():
-                    cur.execute(
-                        "DELETE FROM memory_embeddings WHERE profile = %s AND kind = 'topic' "
-                        "AND ref = %s AND NOT (chunk_idx = ANY(%s))",
-                        (profile, ref, sorted(valid) or [-1]),
-                    )
-                    stats["topic_chunks_pruned"] += cur.rowcount or 0
-                if stats["topic_chunks_pruned"]:
-                    conn.commit()
             if dry_run:
                 stats["would_embed"] = len(todo)
+                stats.update({"outcome": "complete", "ok": True})
                 return stats
             stats["failed_chunks"] = 0
+            failed_refs: set[tuple[str, str]] = set()
             if job is not None:
                 job.update(0, len(todo), 0)
             with _profiles.BulkLoad(conn, cur, "memory_embeddings") as bulk:
@@ -1541,6 +1659,7 @@ def backfill(
                 for start in range(0, len(todo), BATCH):
                     if job is not None and job.cancelled:
                         stats["cancelled"] = True
+                        failed_refs.update((k, r) for k, r, *_rest in todo[start:])
                         _log("cancelled: stopping before the next batch")
                         break
                     batch = todo[start : start + BATCH]
@@ -1559,6 +1678,7 @@ def backfill(
                         if "budget exhausted" in msg:
                             # Batches already committed stay; tomorrow's sweep finishes.
                             stats["budget_exhausted"] = True
+                            failed_refs.update((k, r) for k, r, *_rest in todo[start:])
                             _log(f"stopping: {exc}")
                             break
                         # F3: a missing/expired key (or any other per-batch
@@ -1571,6 +1691,7 @@ def backfill(
                         # second chance until the next sweep, but it no longer
                         # takes the rest of tonight's coverage down with it.
                         stats["failed_chunks"] += len(batch)
+                        failed_refs.update((k, r) for k, r, *_rest in batch)
                         if "API key not found" in msg and not stats.get("embed_provider"):
                             stats["embed_provider"] = "missing key"
                         _log(f"batch failed ({type(exc).__name__}): {exc}; continuing")
@@ -1599,6 +1720,25 @@ def backfill(
                     # batch. A no-op once the profile's index exists.
                     _profiles.ensure_profile_index(cur, profile, "memory_embeddings", quiet=True)
                     conn.commit()
+            stats["chunks_pruned"] = 0
+            stats["topic_chunks_pruned"] = 0
+            for (source_kind, ref), valid in valid_idx.items():
+                if (source_kind, ref) in failed_refs:
+                    continue
+                if queued_by_ref.get((source_kind, ref), 0) < needed_by_ref[(source_kind, ref)]:
+                    continue
+                cur.execute(
+                    "DELETE FROM memory_embeddings WHERE profile = %s AND kind = %s "
+                    "AND ref = %s AND NOT (chunk_idx = ANY(%s))",
+                    (profile, source_kind, ref, sorted(valid) or [-1]),
+                )
+                removed = cur.rowcount or 0
+                stats["chunks_pruned"] += removed
+                if source_kind == "topic":
+                    stats["topic_chunks_pruned"] += removed
+            if stats["chunks_pruned"]:
+                conn.commit()
+    stats.update(_backfill_outcome(stats))
     return stats
 
 
@@ -1617,15 +1757,13 @@ def activate(profile: str, *, force: bool = False) -> dict[str, Any]:
             cur.execute("SELECT id FROM embedding_profiles WHERE id = %s", (profile,))
             if not cur.fetchone():
                 raise ValueError(f"unknown embedding profile {profile!r}")
-            cov = coverage(profile=profile)
-            missing = (
-                cov["episodes"]["missing"] + cov["topics"]["missing"]
-            )
-            if missing and not force:
+            cov = coverage(profile=profile, detail=True)
+            missing = int(cov["missing"])
+            stale = int(cov["stale"])
+            if (missing or stale) and not force:
                 raise RuntimeError(
                     f"refusing to activate {profile}: "
-                    f"{cov['episodes']['missing']} episodes and "
-                    f"{cov['topics']['missing']} topics still missing vectors "
+                    f"{missing} chunks missing and {stale} stale "
                     f"(pass force=True to override)"
                 )
             # The index first, so the pointer never flips onto a sequential scan.
@@ -1671,17 +1809,35 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
             with conn.cursor() as cur:
                 profile = _active_profile(cur)
                 cur.execute(
-                    "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
+                    "SELECT row_to_json(e) FROM episodes e "
+                    "WHERE e.ts = %s::timestamptz AND md5(e.summary) = %s "
+                    "AND e.deleted_at IS NULL",
                     (ts, _md5(summary)),
                 )
                 row = cur.fetchone()
-                if not row:
+                source_row = row[0] if row else None
+                if isinstance(source_row, str):
+                    source_row = json.loads(source_row)
+                if not isinstance(source_row, dict):
                     _log("embed-on-capture: episode not found by identity; backfill will catch it")
                     return False
-                eid = str(row[0])
-                chunks = chunk_text(episode_text(payload))
+                eid = str(source_row["id"])
+                source_text = episode_text(source_row)
+                chunks = chunk_text(source_text)
                 api = _api_texts(profile, [("", c) for c in chunks])
                 vecs = embed_batch(api, profile=profile)
+                cur.execute(
+                    "SELECT row_to_json(e) FROM episodes e "
+                    "WHERE e.id = %s AND e.deleted_at IS NULL",
+                    (eid,),
+                )
+                live = cur.fetchone()
+                live_row = live[0] if live else None
+                if isinstance(live_row, str):
+                    live_row = json.loads(live_row)
+                if not isinstance(live_row, dict) or live_row != source_row:
+                    _log("embed-on-capture: episode changed during provider call; backfill will catch it")
+                    return False
                 _upsert_chunks(
                     cur, profile,
                     [("episode", eid, i, c, _md5(c), v)
@@ -1701,27 +1857,10 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
 
             from khipu.hub_snapshot import upsert_episode
 
-            episode_row = {
-                "id": int(eid),
-                "ts": ts,
-                "session_id": payload.get("session_id"),
-                "summary": summary,
-                "topics": payload.get("topics"),
-                "people": payload.get("people"),
-                "decisions": payload.get("decisions"),
-                "preferences": payload.get("preferences"),
-                "scope": payload.get("scope"),
-                "raw": payload,
-                # fix 9: identity columns ride the same incremental upsert so
-                # a just-captured episode is filterable by project/session_id/
-                # harness (fix 7) on the sqlite replica without waiting for
-                # the next full `khipu snapshot refresh`.
-                "harness": payload.get("harness"),
-                "repo_root": payload.get("repo_root"),
-                "project": payload.get("project"),
-                "parent_session_id": payload.get("parent_session_id"),
-                "transcript_range": payload.get("transcript_range"),
-            }
+            # Preserve the full committed source row, including deleted_at.
+            # The snapshot adapter ignores columns it does not store.
+            episode_row = dict(source_row)
+            episode_row["id"] = int(eid)
             built_at = datetime.now(timezone.utc).isoformat()
             embedding_rows = [
                 {
@@ -1785,6 +1924,15 @@ def _cosine_candidates(
             # used to be applied only after fusion had picked ~50 rows).
             filter_clause = ""
             filter_params: dict[str, Any] = {}
+            episode_flags = _episode_schema_flags(cur)
+            episode_live = " AND e.deleted_at IS NULL" if episode_flags["deleted_at"] else ""
+            live_source_clause = (
+                "  AND ((m.kind = 'topic' AND EXISTS (SELECT 1 FROM topics t "
+                "WHERE t.slug = m.ref AND t.deleted_at IS NULL)) "
+                "OR (m.kind = 'episode' AND EXISTS (SELECT 1 FROM episodes e "
+                f"WHERE e.id::text = m.ref{episode_live})) "
+                "OR m.kind NOT IN ('episode', 'topic'))\n"
+            )
             if filters is not None and filters.active:
                 filter_params = filters.params
                 ep = (
@@ -1845,7 +1993,7 @@ def _cosine_candidates(
                 WHERE m.profile = %(p)s
                   AND m.kind != 'commitment'
                   AND (%(kind)s::text IS NULL OR m.kind = %(kind)s)
-                {filter_clause}    ORDER BY m.embedding::{vcast} <=> %(q)s::{vcast}
+                {live_source_clause}{filter_clause}    ORDER BY m.embedding::{vcast} <=> %(q)s::{vcast}
                 LIMIT %(lim)s
                 """,
                 {"q": qlit, "p": profile, "kind": kind, "lim": fetch,
@@ -1912,9 +2060,9 @@ def _episode_schema_flags(cur) -> dict[str, bool]:
     so this, ``drift._has_column`` and ``hub_snapshot._pg_columns`` share one
     information_schema round trip per table.
     """
-    from khipu.db import table_columns
+    from khipu import db
 
-    cols = table_columns(cur, "episodes")
+    cols = db.table_columns(cur, "episodes")
     return {
         "project": "project" in cols,
         "deleted_at": "deleted_at" in cols,
@@ -2135,7 +2283,7 @@ def _apply_search_filters(
         cur.execute(
             "SELECT slug, COALESCE(event_at, updated_at, created_at), status, "
             "frontmatter->>'project', frontmatter->>'type', superseded_by "
-            "FROM topics WHERE slug = ANY(%s)",
+            "FROM topics WHERE deleted_at IS NULL AND slug = ANY(%s)",
             (topic_ids,),
         )
         for slug, ts, status, proj, note_type, superseded_by in cur.fetchall():
@@ -2153,6 +2301,8 @@ def _apply_search_filters(
     for r in rows:
         k, rid = r.get("kind"), str(r.get("id"))
         m = meta.get((k, rid), {})
+        if k in {"episode", "topic", "node"} and not m:
+            continue
         if k == "episode" and m.get("deleted"):
             continue
         if want_episode_only:
@@ -2533,6 +2683,9 @@ def hybrid_search(
                 lists.append(list(literal_rows))
             if lib_literal and mode in ("hybrid", "literal"):
                 lists.append(list(lib_literal))
+            lib_literal_keys = {
+                (r.get("kind"), str(r.get("id"))) for r in lib_literal
+            }
 
             # A row can legitimately appear in more than one list (e.g. a
             # literal match that is ALSO in lex_rows via the cosine/literal
@@ -2570,6 +2723,7 @@ def hybrid_search(
                     lists = [
                         [r for r in lst
                          if r.get("kind") != LIBRARY_KIND
+                         or (not tokens and (r.get("kind"), str(r.get("id"))) in lib_literal_keys)
                          or _rel.is_evidence(r, _floor, _need, _by_profile)]
                         for lst in lists
                     ]
@@ -2680,10 +2834,8 @@ def hybrid_search(
             # score they leave behind.
             from khipu.recency import apply_project_and_status, apply_recency
 
-            if project_boost:
-                fused = apply_project_and_status(fused, project=project_boost)
+            fused = apply_project_and_status(fused, project=project_boost)
             fused = apply_recency(fused)
-            fused = _fair_fill(fused, limit)
             timing["fusion_ms"] = round((time.monotonic() - _t) * 1000, 1)
             _t = time.monotonic()
             fused = enrich_search_results(cur, fused)
@@ -2731,6 +2883,7 @@ def hybrid_search(
                 )
             except Exception:  # noqa: BLE001 — validity is additive, never a search failure
                 pass
+            fused = _fair_fill(fused, limit)
             timing["enrich_ms"] = round((time.monotonic() - _t) * 1000, 1)
 
     from khipu.recency import HALF_LIFE_DAYS
@@ -2851,12 +3004,16 @@ def topics_embed_lag_minutes(*, profile: str | None = None) -> dict[str, Any]:
     with connect() as conn:
         with conn.cursor() as cur:
             profile = _resolve_profile(cur, profile)
+            _plan, missing, stale = memory_gaps(cur, profile)
+            gap_refs = sorted({ref for kind, ref, _idx in [*missing, *stale] if kind == "topic"})
             cur.execute(
                 "SELECT MIN(COALESCE(t.event_at, t.updated_at)) FROM topics t "
-                "WHERE t.deleted_at IS NULL AND NOT EXISTS ("
-                "  SELECT 1 FROM memory_embeddings m"
-                "  WHERE m.profile = %s AND m.kind = 'topic' AND m.ref = t.slug)",
-                (profile,),
+                "WHERE t.deleted_at IS NULL AND ("
+                "t.slug = ANY(%s) OR NOT EXISTS ("
+                "SELECT 1 FROM memory_embeddings m "
+                "WHERE m.profile = %s AND m.kind = 'topic' AND m.ref = t.slug"
+                "))",
+                (gap_refs, profile),
             )
             row = cur.fetchone()
     oldest = row[0] if row else None
@@ -2924,8 +3081,10 @@ def coverage(*, profile: str | None = None, detail: bool = False) -> dict[str, A
                 r, ch = cur.fetchone()
                 commitments_refs, commitments_chunks = int(r), int(ch)
             cur.execute(
-                "SELECT kind, COUNT(DISTINCT ref), COUNT(*) FROM memory_embeddings "
-                "WHERE profile = %s GROUP BY kind",
+                "SELECT m.kind, COUNT(DISTINCT m.ref), COUNT(*) FROM memory_embeddings m "
+                "WHERE m.profile = %s AND (m.kind != 'topic' OR EXISTS ("
+                "SELECT 1 FROM topics t WHERE t.slug = m.ref AND t.deleted_at IS NULL)) "
+                "GROUP BY kind",
                 (profile,),
             )
             by = {k: {"refs": int(r), "chunks": int(c)} for k, r, c in cur.fetchall()}
@@ -3006,6 +3165,7 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
     with connect() as conn:
         with conn.cursor() as cur:
             profile = _active_profile(cur)
+            scan_limit = max(limit * 10, 50)
             from khipu.db import has_columns
 
             # A forgotten episode has no embedding on purpose; without this
@@ -3015,14 +3175,30 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             verbatim_col = ", e.verbatim" if has_verbatim else ""
             cur.execute(
                 f"SELECT e.id, e.summary, e.decisions, e.preferences, e.topics, e.people{verbatim_col}"
+                f" FROM episodes e WHERE {live}TRUE"
+                " ORDER BY e.ts DESC LIMIT %s",
+                (scan_limit,),
+            )
+            episode_rows = list(cur.fetchall())
+            # Preserve the old all-ages missing-row lane so a long run of
+            # healthy recent episodes cannot starve an older wholly-missing row.
+            cur.execute(
+                f"SELECT e.id, e.summary, e.decisions, e.preferences, e.topics, e.people{verbatim_col}"
                 f" FROM episodes e WHERE {live}NOT EXISTS ("
-                "  SELECT 1 FROM memory_embeddings m"
-                "  WHERE m.profile = %s AND m.kind = 'episode' AND m.ref = e.id::text)"
+                "SELECT 1 FROM memory_embeddings m WHERE m.profile = %s "
+                "AND m.kind = 'episode' AND m.ref = e.id::text)"
                 " ORDER BY e.ts DESC LIMIT %s",
                 (profile, limit),
             )
+            seen_episode_ids = {str(row[0]) for row in episode_rows}
+            episode_rows.extend(
+                row for row in cur.fetchall() if str(row[0]) not in seen_episode_ids
+            )
+            episode_existing = _existing_hashes_for_refs(
+                cur, profile, "episode", [str(row[0]) for row in episode_rows]
+            )
             todo: list[tuple[str, str, int, str, str]] = []
-            for row in cur.fetchall():
+            for row in episode_rows:
                 eid, summary, decisions, prefs, topics, people = row[:6]
                 verbatim = row[6] if has_verbatim else None
                 text = episode_text({"summary": summary, "decisions": decisions,
@@ -3030,9 +3206,15 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                                      "verbatim": verbatim})
                 if not text:
                     continue
+                chunks = chunk_text(text)
+                if all(episode_existing.get(("episode", str(eid), i)) == _md5(chunk)
+                       for i, chunk in enumerate(chunks)):
+                    continue
                 out["embedded"] += 1
-                for i, chunk in enumerate(chunk_text(text)):
+                for i, chunk in enumerate(chunks):
                     todo.append(("episode", str(eid), i, chunk, _md5(chunk)))
+                if out["embedded"] >= limit:
+                    break
             for start in range(0, len(todo), BATCH):
                 batch = todo[start : start + BATCH]
                 api = _api_texts(profile, [("", t) for _, _, _, t, _ in batch])
@@ -3108,27 +3290,41 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             try:
                 cur.execute(
                     "SELECT t.slug, t.title, t.body FROM topics t WHERE t.deleted_at IS NULL "
-                    "AND NOT EXISTS ("
-                    "  SELECT 1 FROM memory_embeddings m"
-                    "  WHERE m.profile = %s AND m.kind = 'topic' AND m.ref = t.slug)"
                     " ORDER BY t.updated_at DESC NULLS LAST LIMIT %s",
+                    (max(COMMITMENT_CATCHUP_LIMIT * 10, 50),),
+                )
+                topic_rows = list(cur.fetchall())
+                cur.execute(
+                    "SELECT t.slug, t.title, t.body FROM topics t WHERE t.deleted_at IS NULL "
+                    "AND NOT EXISTS (SELECT 1 FROM memory_embeddings m WHERE m.profile = %s "
+                    "AND m.kind = 'topic' AND m.ref = t.slug) "
+                    "ORDER BY t.updated_at DESC NULLS LAST LIMIT %s",
                     (profile, COMMITMENT_CATCHUP_LIMIT),
                 )
-                topic_rows = cur.fetchall()
+                seen_topic_slugs = {str(row[0]) for row in topic_rows}
+                topic_rows.extend(
+                    row for row in cur.fetchall() if str(row[0]) not in seen_topic_slugs
+                )
             except Exception as exc:  # noqa: BLE001 — never lets a topics-leg problem break the rest
                 _log(f"topic embed catch-up skipped: {type(exc).__name__}: {exc}")
                 topic_rows = []
+            topic_existing = _existing_hashes_for_refs(
+                cur, profile, "topic", [str(row[0]) for row in topic_rows]
+            )
             topic_snapshot_rows: list[dict[str, Any]] = []
             for slug, title, body in topic_rows:
                 text = topic_text(slug, title, body)
                 if not text:
                     continue
-                out["topics_embedded"] += 1
                 # P5 G4: section-stable idx, same scheme backfill() uses for
                 # topics — keeps this leg's rows from looking "unchanged
                 # under a different idx" (and so getting re-embedded again)
                 # the very next nightly sweep.
                 indexed_chunks = chunk_text_indexed(text)
+                if all(topic_existing.get(("topic", str(slug), i)) == _md5(chunk)
+                       for i, chunk in indexed_chunks):
+                    continue
+                out["topics_embedded"] += 1
                 chunks = [c for _i, c in indexed_chunks]
                 api = _api_texts(profile, [(title or slug or "", c) for c in chunks])
                 vecs = embed_batch(api, profile=profile)
@@ -3138,6 +3334,11 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 rows = [("topic", slug, i, c, _md5(c), v)
                         for (i, c), v in zip(indexed_chunks, vecs)]
                 _upsert_chunks(cur, profile, rows)
+                cur.execute(
+                    "DELETE FROM memory_embeddings WHERE profile = %s AND kind = 'topic' "
+                    "AND ref = %s AND NOT (chunk_idx = ANY(%s))",
+                    (profile, slug, [i for i, _chunk in indexed_chunks] or [-1]),
+                )
                 conn.commit()
                 out["topics_chunks"] += len(rows)
                 topic_snapshot_rows.extend(
@@ -3145,6 +3346,8 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                      "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": built_at}
                     for (i, c), v in zip(indexed_chunks, vecs)
                 )
+                if out["topics_embedded"] >= COMMITMENT_CATCHUP_LIMIT:
+                    break
             if topic_snapshot_rows:
                 try:
                     from khipu.hub_snapshot import upsert_embeddings
