@@ -171,6 +171,9 @@ class FakeCursor:
         elif s.startswith("SELECT id, rel_path, content_hash FROM library_documents"):
             self._r = [(i, d["rel_path"], d["content_hash"]) for i, d in h.docs.items()
                        if d["source"] == p[0]]
+        elif s.startswith("SELECT chunk_idx, chunk_text FROM library_chunks WHERE document"):
+            self._r = [(idx, text) for (doc, idx), (text, _) in sorted(h.chunks.items())
+                       if doc == p[0]]
         elif s.startswith("INSERT INTO library_documents"):
             source, rel, title, author, tags, size, _mtime, digest = p
             doc = next((i for i, d in h.docs.items()
@@ -501,12 +504,72 @@ class ScanTest(_Base):
         self.assertEqual(out["skipped"], 2)
         self.assertEqual(set(self.docs_by_rel()), {"A/ok.txt", "A/target.txt", "A/ok-link.txt"})
 
-    def test_undecodable_bytes_are_replaced_and_nul_is_stripped(self):
-        self.write("A/bad.txt", "", raw=b"caf\xe9 and\x00 nul")
+    def test_undecodable_documents_are_reported_without_replacing_prior_text(self):
+        self.write("A/bad.txt", "original café")
         library.scan(self.hub, "lib1")
-        (text, _), = self.hub.chunks.values()
-        self.assertIn("caf�", text)
-        self.assertNotIn("\x00", text)
+        before = (dict(self.hub.docs), dict(self.hub.chunks))
+        for raw in ("café".encode("latin-1"), "日本語".encode("utf-16")):
+            with self.subTest(raw=raw):
+                self.write("A/bad.txt", "", raw=raw)
+                out = library.scan(self.hub, "lib1")
+                self.assertFalse(out["ok"])
+                self.assertEqual(out["skipped_detail"], {"unsupported_encoding": 1})
+                self.assertEqual((self.hub.docs, self.hub.chunks), before)
+
+    def test_repeated_headings_keep_both_sections_in_document_order(self):
+        text = "## Notes\nalpha sentinel\n## Notes\nomega sentinel"
+        self.write("repeat.md", text)
+        library.scan(self.hub, "lib1")
+        self.assertEqual([t for t, _ in self.hub.chunks.values()], embed.chunk_text(text))
+        self.assertEqual([i for _, i in self.hub.chunks], [0, 1])
+
+    def test_more_than_one_thousand_windows_in_a_section_do_not_collide(self):
+        text = "## Long\n" + "0123456789abcdef" * 1100 + "\n## End\nlast sentinel"
+        self.write("long.md", text)
+        with mock.patch.object(embed, "CHUNK_CHARS", 16), \
+                mock.patch.object(embed, "CHUNK_OVERLAP", 0):
+            expected = embed.chunk_text(text)
+            self.assertGreater(len(expected), 1000)
+            out = library.scan(self.hub, "lib1")
+        self.assertEqual(out["chunks"], len(expected))
+        self.assertEqual([i for _, i in self.hub.chunks], list(range(len(expected))))
+        self.assertEqual([t for t, _ in self.hub.chunks.values()], expected)
+
+    def test_incomplete_walk_keeps_documents_chunks_and_vectors(self):
+        self.write("A/ok.txt", "readable")
+        self.write("B/hidden.txt", "temporarily inaccessible")
+        library.scan(self.hub, "lib1")
+        for (doc, idx), (_, digest) in self.hub.chunks.items():
+            self.hub.embs[(TINY.id, doc, idx)] = ("[1,0,0,0]", digest)
+        before = (dict(self.hub.docs), dict(self.hub.chunks), dict(self.hub.embs))
+
+        def incomplete(root, **kw):
+            if kw.get("onerror"):
+                kw["onerror"](PermissionError("B is unreadable"))
+            yield str(root / "A"), [], ["ok.txt"]
+
+        with mock.patch.object(library.os, "walk", side_effect=incomplete):
+            out = library.scan(self.hub, "lib1")
+        self.assertEqual((self.hub.docs, self.hub.chunks, self.hub.embs), before)
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["incomplete"])
+        self.assertEqual(out["removed"], 0)
+
+    def test_stat_failure_keeps_the_uninspected_document(self):
+        self.write("A/ok.txt", "readable")
+        blocked = self.write("B/hidden.txt", "inaccessible")
+        library.scan(self.hub, "lib1")
+        original = Path.stat
+
+        def stat(path, *args, **kw):
+            if path == blocked:
+                raise PermissionError("cannot stat")
+            return original(path, *args, **kw)
+
+        with mock.patch.object(Path, "stat", stat):
+            out = library.scan(self.hub, "lib1")
+        self.assertEqual(len(self.hub.docs), 2)
+        self.assertFalse(out["ok"])
 
     def test_long_file_gets_several_windows(self):
         self.write("A/long.txt", "word " * 3000)
@@ -578,7 +641,14 @@ class BackfillTest(_Base):
     def test_a_failed_batch_is_isolated_and_counted(self):
         out = self.run_backfill(_voyage_transport(fail_on={2}))
         self.assertEqual((out["embedded"], out["failed"], out["remaining"]), (4, 3, 3))
-        self.assertTrue(out["ok"])
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["status"], "partial")
+
+    def test_all_failed_batches_report_failure(self):
+        with mock.patch.object(embed, "embed_batch", side_effect=RuntimeError("API key not found")):
+            out = library.backfill(self.hub, "lib1")
+        self.assertFalse(out["ok"])
+        self.assertEqual((out["status"], out["embedded"], out["failed"]), ("failed", 0, 7))
 
     def test_budget_exhaustion_stops_the_run_but_keeps_committed_batches(self):
         n = {"i": 0}
@@ -591,6 +661,8 @@ class BackfillTest(_Base):
         with mock.patch.object(embed, "_budget_take", side_effect=take):
             out = self.run_backfill(_voyage_transport())
         self.assertTrue(out["budget_exhausted"])
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["status"], "partial")
         self.assertEqual((out["embedded"], out["failed"], out["remaining"]), (3, 0, 4))
 
     def test_wrong_width_vectors_are_never_stored(self):
@@ -833,7 +905,10 @@ class ImportTest(_Base):
 
     def test_explicit_profile_wins_and_must_exist(self):
         self.hub.profile_rows["other@4"] = ("voyage", "other", 4, "l2", None)
-        out = self.run_import(profile="other@4")
+        library.scan(self.hub, "lib1")
+        idx = Path(self.tmp.name) / "matching.sqlite"
+        _make_index(idx, [("n", 0, "Heiser/Unseen.txt", "alpha beta", _blob(1, 0, 0, 0), "voyage-t", 4)])
+        out = library.import_index(self.hub, "lib1", str(idx), profile="other@4")
         self.assertEqual(out["profile"], "other@4")
         self.assertIn("note", out)  # library searches with voyage-t@4, not other@4
         self.assertEqual({k[0] for k in self.hub.embs}, {"other@4"})
@@ -860,14 +935,26 @@ class ImportTest(_Base):
         self.assertEqual((out["read"], out["imported"], out["skipped_bad_vector"],
                           out["skipped_bad_row"]), (4, 1, 1, 2))
 
-    def test_imported_chunks_replace_a_scans_chunks_for_the_same_file(self):
+    def test_new_import_is_unverified_and_rebuilt_from_local_text_on_scan(self):
+        imported = self.run_import()
+        self.assertEqual(imported["unverified_documents"], 2)
+        self.assertTrue(all(d["content_hash"] == "" for d in self.hub.docs.values()))
+        scanned = library.scan(self.hub, "lib1")
+        self.assertEqual(scanned["updated"], 2)
+        self.assertEqual(sorted(t for t, _ in self.hub.chunks.values()), ["alpha beta", "gamma delta"])
+
+    def test_imported_chunks_cannot_replace_a_scans_chunks_for_the_same_file(self):
         library.scan(self.hub, "lib1")
         self.assertEqual(len(self.hub.chunks), 2)  # one scan chunk per file
-        self.run_import()
+        before = dict(self.hub.chunks)
+        imported = self.run_import()
+        self.assertEqual(imported["skipped_conflict"], 3)
+        self.assertEqual(imported["imported"], 0)
+        self.assertFalse(imported["ok"])
         heiser = next(i for i, d in self.hub.docs.items() if d["rel_path"] == "Heiser/Unseen.txt")
-        self.assertEqual(sorted(i for (d, i) in self.hub.chunks if d == heiser), [0, 1])
-        self.assertEqual(self.hub.chunks[(heiser, 0)][0], "first chunk")
-        # a later scan finds the files unchanged and leaves the imported chunks alone
+        self.assertEqual(sorted(i for (d, i) in self.hub.chunks if d == heiser), [0])
+        self.assertEqual(self.hub.chunks, before)
+        self.assertEqual(self.hub.chunks[(heiser, 0)][0], "alpha beta")
         out = library.scan(self.hub, "lib1")
         self.assertEqual((out["updated"], out["unchanged"]), (0, 2))
 
@@ -917,6 +1004,85 @@ class ImportTest(_Base):
         self.assertFalse(library.is_corrupt_chunk_text(None))
         self.assertTrue(library.is_corrupt_chunk_text("\x01" * 5 + "a" * 95 + "\x02"))
         self.assertTrue(library.is_corrupt_chunk_text("�" * 3 + "a" * 50))
+
+
+class AuditImportTest(_Base):
+    def setUp(self):
+        super().setUp()
+        self.add()
+        self.path = self.write("book.txt", "abcdefghABCDEFGH12345678")
+        with mock.patch.object(embed, "CHUNK_CHARS", 8), \
+                mock.patch.object(embed, "CHUNK_OVERLAP", 0):
+            library.scan(self.hub, "lib1")
+        self.doc = next(iter(self.hub.docs))
+
+    def index(self, rows):
+        path = Path(self.tmp.name) / "audit.jsonl"
+        path.write_text("\n".join(json.dumps({
+            "source_file": "book.txt", "chunk_idx": idx, "chunk_text": text,
+            "embedding": [1, 0, 0, 0], "model": "voyage-t", "dims": 4,
+        }) for idx, text in rows))
+        return str(path)
+
+    def test_partially_corrupt_import_preserves_the_complete_scanned_document(self):
+        chunks = dict(self.hub.chunks)
+        path = self.index([(0, "abcdefgh"), (1, "ABCDEFGH"), (2, "\x01\x02garbage")])
+        out = library.import_index(self.hub, "lib1", path)
+        self.assertEqual(out["skipped_corrupt"], 1)
+        self.assertEqual(self.hub.chunks, chunks)
+        self.assertEqual(library.list_sources(self.hub)[0]["missing"], 1)
+
+    def test_old_import_does_not_certify_a_changed_local_file_as_current(self):
+        old_hash = self.hub.docs[self.doc]["content_hash"]
+        self.path.write_text("updated local text")
+        path = self.index([(0, "obsolete index text")])
+        out = library.import_index(self.hub, "lib1", path)
+        self.assertEqual(self.hub.docs[self.doc]["content_hash"], old_hash)
+        self.assertEqual(out["imported"], 0)
+        self.assertEqual(out["skipped_conflict"], 1)
+        scanned = library.scan(self.hub, "lib1")
+        self.assertEqual(scanned["updated"], 1)
+        self.assertEqual(self.hub.chunks[(self.doc, 0)][0], "updated local text")
+
+    def test_other_profile_cannot_replace_the_active_corpus(self):
+        other = "voyage-u@4"
+        self.hub.profile_rows[other] = ("voyage", "voyage-u", 4, "l2", None)
+        for (doc, idx), (_, digest) in self.hub.chunks.items():
+            self.hub.embs[(TINY.id, doc, idx)] = ("[1,0,0,0]", digest)
+        before = (dict(self.hub.docs), dict(self.hub.chunks), dict(self.hub.embs))
+        path = self.index([(0, "different boundaries")])
+        out = library.import_index(self.hub, "lib1", path, profile=other)
+        self.assertEqual((self.hub.docs, self.hub.chunks, self.hub.embs), before)
+        self.assertEqual(out["imported"], 0)
+        self.assertEqual(library.list_sources(self.hub)[0]["pct"], 100.0)
+
+    def test_other_profile_accepts_identical_existing_chunks_without_changing_them(self):
+        other = "voyage-u@4"
+        self.hub.profile_rows[other] = ("voyage", "voyage-u", 4, "l2", None)
+        before = (dict(self.hub.docs), dict(self.hub.chunks))
+        rows = [(idx, text) for (_, idx), (text, _) in self.hub.chunks.items()]
+        out = library.import_index(self.hub, "lib1", self.index(rows), profile=other)
+        self.assertEqual(out["imported"], 3)
+        self.assertEqual((self.hub.docs, self.hub.chunks), before)
+        self.assertEqual(self.hub.sources["lib1"]["profile"], TINY.id)
+
+    def test_negative_chunk_index_is_rejected_before_any_storage_write(self):
+        before = len(self.hub.executed)
+        out = library.import_index(self.hub, "lib1", self.index([(-1, "negative")]))
+        self.assertEqual((out["skipped_bad_row"], out["imported"]), (1, 0))
+        writes = [s for s, _ in self.hub.executed[before:]
+                  if s.startswith(("INSERT INTO library_", "DELETE FROM library_"))]
+        self.assertEqual(writes, [])
+
+    def test_profile_index_failure_leaves_the_pointer_unchanged(self):
+        other = "voyage-u@4"
+        self.hub.profile_rows[other] = ("voyage", "voyage-u", 4, "l2", None)
+        for (doc, idx), (_, digest) in self.hub.chunks.items():
+            self.hub.embs[(other, doc, idx)] = ("[1,0,0,0]", digest)
+        with mock.patch.object(profiles, "ensure_profile_index", return_value=None):
+            with self.assertRaisesRegex(library.LibraryError, "index"):
+                library.set_profile(self.hub, "lib1", other)
+        self.assertEqual(self.hub.sources["lib1"]["profile"], TINY.id)
 
 
 class CliTest(_Base):
@@ -1064,6 +1230,22 @@ class NightlyAndDoctorTest(_Base):
         self.assertTrue(out["results"][0]["budget_exhausted"])
         self.assertEqual(out["results"][1]["skipped"], "embed budget exhausted")
         self.assertEqual(n["i"], 1)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["status"], "partial")
+
+    def test_failed_backfills_propagate_failure_to_the_sweep_and_nightly_log(self):
+        with mock.patch.object(embed, "embed_batch", side_effect=RuntimeError("API key not found")):
+            out = library.backfill_all(self.hub)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["status"], "failed")
+        self.assertEqual(out["results"][0]["status"], "failed")
+        logged = []
+        with mock.patch("khipu.db.dsn_configured", return_value=True), \
+                mock.patch.object(library, "nightly", return_value=out), \
+                mock.patch.object(jobs, "_nightly_log", side_effect=logged.append):
+            jobs._library_backfill()
+        self.assertTrue(any("backfill partial" in line for line in logged))
+        self.assertFalse(any("backfill ok" in line for line in logged))
 
     def test_a_hub_without_library_tables_is_a_skip_not_a_failure(self):
         self.hub.library_tables = False

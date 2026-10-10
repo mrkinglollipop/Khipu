@@ -13,6 +13,8 @@ import contextlib
 import inspect
 import io
 import json
+import re
+import sqlite3
 import threading
 import unittest
 from unittest import mock
@@ -64,6 +66,8 @@ class FakeCur:
             self._res = [r for r in self.libs if src is None or r[0] == src]
         elif "FROM pg_indexes" in s:
             self._res = [(1,)] if self.index_present else []
+        elif s.startswith("SELECT EXISTS"):
+            self._res = [(True,)]
         elif "FROM library_embeddings" in s:
             if self.cosine_error:
                 raise self.cosine_error
@@ -280,7 +284,7 @@ class LibraryLegTest(unittest.TestCase):
 
         conn = FakeConn(Bare())
         ls._TABLES_SEEN = False
-        self.assertEqual(ls.enabled_libraries(Bare(), conn), [])
+        self.assertIsNone(ls.enabled_libraries(Bare(), conn))
         self.assertEqual(conn.rollbacks, 1)
 
 
@@ -319,6 +323,28 @@ class SourceFilterTest(unittest.TestCase):
 
 
 class DegradedLegTest(unittest.TestCase):
+    def test_registry_failure_reports_unavailability_for_default_and_explicit_search(self):
+        class Denied(FakeCur):
+            def execute(self, sql, params=None):
+                if "SELECT name, profile FROM library_sources" in sql:
+                    raise RuntimeError("permission denied for library_sources")
+                super().execute(sql, params)
+
+        for kwargs in ({}, {"kind": "library"}, {"source": "biblical"}):
+            with self.subTest(kwargs=kwargs), _hub(Denied()):
+                out = em.hybrid_search("council", mode="literal", **kwargs)
+            self.assertIn("library:unavailable", out["degraded_legs"])
+            self.assertIn("library_registry_error", out["timing"])
+
+    def test_short_and_non_ascii_fts_matches_survive_default_literal_search(self):
+        for query in ("AI", "日本語"):
+            with self.subTest(query=query):
+                cur = FakeCur(chunks=[_chunk_row(text=f"matching {query}")])
+                with _hub(cur):
+                    out = em.hybrid_search(query, mode="literal")
+                self.assertIn("library:biblical:7#3", _ids(out))
+                self.assertGreater(out["results"][0]["lexical_hits"], 0)
+
     def test_a_failed_query_embedding_degrades_to_literal_and_names_the_leg(self):
         cur = FakeCur(cosine=[_cos_row()], chunks=[_chunk_row(7, 3)])
         qv = mock.Mock(side_effect=RuntimeError("embed HTTP 503: unavailable"))
@@ -439,11 +465,12 @@ class UnindexedProfileTest(unittest.TestCase):
         self.assertIn(f"library_cosine:{PROFILE}:timeout", out["degraded_legs"])
         self.assertEqual(_ids(out), ["library:biblical:7#3"])     # literal legs unaffected
 
-    def test_an_indexed_explicit_search_sets_no_cosine_timeout(self):
+    def test_an_indexed_explicit_filtered_search_sets_a_cosine_timeout(self):
         cur = FakeCur(cosine=[_cos_row()], index_present=True)
         with _hub(cur):
             em.hybrid_search("divine council", kind="library", mode="semantic")
-        self.assertFalse([s for s, _ in cur.executed if s.startswith("SET LOCAL statement_timeout")])
+        self.assertEqual([s for s, _ in cur.executed if s.startswith("SET LOCAL statement_timeout")],
+                         [f"SET LOCAL statement_timeout = {ls.UNINDEXED_COSINE_TIMEOUT_MS}"])
 
 
 class KeywordLegTest(unittest.TestCase):
@@ -510,14 +537,40 @@ class BoundedLegTest(unittest.TestCase):
         self.assertEqual(sql.count("::vector(1024)"), 4)   # score + ORDER BY, both sides
         self.assertIn("WHERE e.profile = %(p)s", sql)
         self.assertIn("ORDER BY e.embedding::vector(1024) <=> %(q)s::vector(1024) LIMIT %(lim)s", sql)
-        # the document join and the source restriction come AFTER the index scan
-        self.assertLess(sql.index("LIMIT %(lim)s"), sql.index("JOIN library_documents"))
+        self.assertLess(sql.index("JOIN library_documents"), sql.index("LIMIT %(lim)s"))
+        self.assertLess(sql.index("d.source = ANY(%(sources)s)"), sql.index("LIMIT %(lim)s"))
+
+    def test_cosine_limit_applies_to_eligible_sources(self):
+        # SQLite executes the relational selection with a scalar distance in
+        # place of pgvector; this checks eligibility, not a PostgreSQL plan.
+        with sqlite3.connect(":memory:") as conn:
+            conn.create_function("distance", 2, lambda a, b: abs(float(a) - float(b)))
+            conn.create_function("clip", 2, lambda text, n: text[:n])
+            conn.executescript("""
+                CREATE TABLE library_documents (id INTEGER, source TEXT, title TEXT, author TEXT, rel_path TEXT);
+                CREATE TABLE library_chunks (document INTEGER, chunk_idx INTEGER, chunk_text TEXT, content_hash TEXT);
+                CREATE TABLE library_embeddings (document INTEGER, chunk_idx INTEGER, profile TEXT, embedding REAL, content_hash TEXT);
+            """)
+            for doc in range(61):
+                source = "a" if doc == 60 else "b"
+                conn.execute("INSERT INTO library_documents VALUES (?, ?, 'T', 'A', 'x.txt')", (doc, source))
+                conn.execute("INSERT INTO library_chunks VALUES (?, 0, 'relevant', 'h')", (doc,))
+                conn.execute("INSERT INTO library_embeddings VALUES (?, 0, ?, ?, 'h')", (doc, PROFILE, doc / 100))
+            sql = re.sub(r"::vector\(\d+\)", "", ls.cosine_sql(1))
+            sql = sql.replace("e.embedding <=> %(q)s", "distance(e.embedding, %(q)s)")
+            sql = sql.replace("d.source = ANY(%(sources)s)", "d.source = %(sources)s")
+            sql = sql.replace("left(", "clip(")
+            sql = re.sub(r"%\((\w+)\)s", r":\1", sql)
+            rows = conn.execute(sql, {"q": 0, "p": PROFILE, "sources": "a",
+                                      "lim": 50, "fetch": 100, "rank_fetch": 100}).fetchall()
+        self.assertEqual([row[0] for row in rows], ["a"])
 
     def test_the_executed_cosine_statement_casts_to_the_query_vectors_width(self):
         cur = FakeCur(cosine=[_cos_row()])
         with _hub(cur):
             em.hybrid_search("divine council", kind="library")
-        (sql, params), = cur.sql("FROM library_embeddings")
+        (sql, params), = [(s, p) for s, p in cur.sql("FROM library_embeddings")
+                          if not s.startswith("SELECT EXISTS")]
         self.assertIn("embedding::vector(3)", sql)       # len(QVEC)
         self.assertEqual(params["p"], PROFILE)
         self.assertTrue(params["q"].startswith("["))
@@ -527,12 +580,33 @@ class BoundedLegTest(unittest.TestCase):
         with _hub(cur):
             em.hybrid_search("divine council", limit=12)
             em.hybrid_search("divine council", limit=12, kind="library")
-        cos = cur.sql("FROM library_embeddings")
+        cos = [(s, p) for s, p in cur.sql("FROM library_embeddings")
+               if not s.startswith("SELECT EXISTS")]
         self.assertEqual(cos[0][1]["lim"], ls.DEFAULT_LEG_LIMIT)
         self.assertEqual(cos[1][1]["lim"], min(50, ls.EXPLICIT_LEG_LIMIT))
         timeouts = [s for s, _ in cur.executed if s.startswith("SET LOCAL statement_timeout")]
-        self.assertEqual(timeouts[0], f"SET LOCAL statement_timeout = {ls.LITERAL_TIMEOUT_MS_DEFAULT}")
-        self.assertEqual(timeouts[1], f"SET LOCAL statement_timeout = {ls.LITERAL_TIMEOUT_MS_EXPLICIT}")
+        self.assertEqual(timeouts, [f"SET LOCAL statement_timeout = {n}" for n in (
+            ls.LITERAL_TIMEOUT_MS_DEFAULT, ls.LITERAL_TIMEOUT_MS_DEFAULT,
+            ls.UNINDEXED_COSINE_TIMEOUT_MS, ls.LITERAL_TIMEOUT_MS_EXPLICIT,
+        )])
+
+    def test_fully_eligible_profile_keeps_the_ann_query(self):
+        class Eligible(FakeCur):
+            def execute(self, sql, params=None):
+                if sql.startswith("SELECT EXISTS"):
+                    self.executed.append((sql, params))
+                    self._res = [(False,)]
+                    return
+                super().execute(sql, params)
+
+        cur = Eligible(cosine=[_cos_row()])
+        with _hub(cur):
+            out = em.hybrid_search("divine council", kind="library", mode="semantic")
+        (sql, _), = cur.sql("FROM library_embeddings")
+        self.assertNotIn("MATERIALIZED", sql)
+        self.assertIn("WHERE e.profile = %(p)s", sql)
+        self.assertEqual(_ids(out), ["library:biblical:7#3"])
+        self.assertFalse([s for s, _ in cur.executed if s.startswith("SET LOCAL statement_timeout")])
 
     def test_the_query_is_embedded_once_per_distinct_profile(self):
         cur = FakeCur(libs=[("a", PROFILE), ("b", PROFILE), ("c", "gemini-embedding-001@768")],
@@ -542,7 +616,8 @@ class BoundedLegTest(unittest.TestCase):
             em.hybrid_search("divine council", kind="library")
         self.assertEqual(sorted(c.args[2] for c in qv.call_args_list),
                          sorted([PROFILE, "gemini-embedding-001@768"]))
-        self.assertEqual(len(cur.sql("FROM library_embeddings")), 2)
+        self.assertEqual(len([s for s, _ in cur.sql("FROM library_embeddings")
+                              if not s.startswith("SELECT EXISTS")]), 2)
 
 
 class ConcurrentLibraryLegsTest(unittest.TestCase):
@@ -701,6 +776,29 @@ class GetTest(unittest.TestCase):
     def test_ids_round_trip(self):
         self.assertEqual(ls.parse_id(ls.format_id("biblical", 7, 3)), ("biblical", 7, 3))
         self.assertEqual(ls.parse_id(ls.format_id("biblical", 7)), ("biblical", 7, None))
+        for idx in (0, 1, 999, 1000, 2147483647):
+            self.assertEqual(ls.parse_id(ls.format_id("biblical", 7, idx)), ("biblical", 7, idx))
+
+    def test_scanned_section_boundary_neighbours_follow_document_order(self):
+        import tempfile
+        from pathlib import Path
+        from khipu import library
+        from tests.test_library import FakeHub, TINY
+
+        with tempfile.TemporaryDirectory() as root:
+            text = "## First\nalpha\n## Second\nomega"
+            Path(root, "book.md").write_text(text)
+            hub = FakeHub()
+            library.add_source(hub, "biblical", root, TINY.id)
+            library.scan(hub, "biblical")
+            doc = next(iter(hub.docs))
+            rows = [(i, t) for (_, i), (t, _) in hub.chunks.items()]
+            doc_row = (doc, "biblical", "book.md", "book", None, [], len(text),
+                       None, hub.docs[doc]["content_hash"], None, root)
+            first, _ = self._get(ls.format_id("biblical", doc, 0), doc=doc_row, chunks=rows)
+            second, _ = self._get(ls.format_id("biblical", doc, 1), doc=doc_row, chunks=rows)
+        self.assertEqual(first["next"]["text"], "## Second\nomega")
+        self.assertEqual(second["previous"]["text"], "## First\nalpha")
 
     def test_the_cli_get_routes_library_ids(self):
         from khipu import cli
