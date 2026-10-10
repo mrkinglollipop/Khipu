@@ -55,14 +55,13 @@ class GetSetTest(unittest.TestCase):
         with mock.patch.object(kc, "_security", return_value=_cp(0, "   \n")):
             self.assertIsNone(kc.get_password("acct"))
 
-    def test_set_password_deletes_then_adds(self):
+    def test_set_password_upserts_without_deleting_first(self):
         with mock.patch.object(kc, "_security", return_value=_cp(0)) as m:
             kc.set_password("acct", "v")
-        self.assertEqual(m.call_args_list[0].args[0], "delete-generic-password")
-        self.assertEqual(m.call_args_list[1].args[0], "add-generic-password")
+        self.assertEqual([call.args[0] for call in m.call_args_list], ["add-generic-password"])
 
     def test_failed_add_raises_with_the_tool_message(self):
-        with mock.patch.object(kc, "_security", side_effect=[_cp(0), _cp(1, "", "boom")]):
+        with mock.patch.object(kc, "_security", side_effect=[_cp(1, "", "boom")]):
             with self.assertRaises(RuntimeError) as e:
                 kc.set_password("acct", "v")
         self.assertIn("boom", str(e.exception))

@@ -129,7 +129,7 @@ class ForgetEverywhereTest(unittest.TestCase):
                          side_effect=RuntimeError("boom")), \
              mock.patch("khipu.config.path_setting", side_effect=Exception("no config")):
             out = forget.forget_everywhere(11617)
-        self.assertTrue(out["ok"])
+        self.assertFalse(out["ok"])
         self.assertFalse(out["snapshot"]["ok"])
 
     def test_unknown_episode_never_reaches_the_snapshot(self):
@@ -157,7 +157,7 @@ class LegacyFileTest(unittest.TestCase):
             out = forget.forget_in_legacy_file(root, "2026-09-05T12:20:17+00:00", md5)
             self.assertEqual(out["removed"], 1)
             self.assertTrue(Path(out["backup"]).is_file())
-            self.assertIn("forget me", Path(out["backup"]).read_text())
+            self.assertNotIn("forget me", Path(out["backup"]).read_text())
             left = (root / "episodes.jsonl").read_text()
             self.assertIn("keep me", left)
             self.assertNotIn("forget me", left)

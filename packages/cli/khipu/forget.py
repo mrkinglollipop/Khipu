@@ -11,7 +11,7 @@ probe's cleanup, the ``khipu_forget`` MCP tool) so all of it happens:
   3. commitments it opened → closed, close_reason 'forgotten', plus their vectors
   4. its decision rows → retracted, retract_reason 'forgotten' (migration 0024)
   5. its deliverable rows → deleted
-  6. its line in the legacy file, after a backup copy of the file
+  6. its lines in the legacy file and retained forget backups
   7. the local sqlite replica, if one exists (deleted_at + its embeddings)
   8. every brief citing it → stale (migration 0025)
 
@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -80,6 +79,30 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
     if row is None:
         return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
     ts, summary, session_id = row
+    legacy_identities = [{
+        "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+        "summary_md5": hashlib.md5((summary or "").encode("utf-8")).hexdigest(),
+    }]
+    # The editable episode summary is not its only available identity: captures
+    # retain the original payload in ``raw``. When an edit changed only the
+    # summary, remove the precise original legacy/outbox identity too. Older
+    # rows and malformed raw values stay on the current identity only.
+    try:
+        cur.execute("SELECT raw FROM episodes WHERE id = %s", (episode_id,))
+        raw_row = cur.fetchone()
+        raw = raw_row[0] if isinstance(raw_row, tuple) and len(raw_row) == 1 else None
+        if isinstance(raw, dict):
+            original_ts = raw.get("ts")
+            original_summary = raw.get("summary")
+            if isinstance(original_ts, str) and isinstance(original_summary, str) and original_summary:
+                original = {
+                    "ts": original_ts,
+                    "summary_md5": hashlib.md5(original_summary.encode("utf-8")).hexdigest(),
+                }
+                if original not in legacy_identities:
+                    legacy_identities.append(original)
+    except Exception:  # noqa: BLE001 — old schema/driver must still forget the hub row
+        pass
     cur.execute(
         "UPDATE episodes SET deleted_at = now() WHERE id = %s AND deleted_at IS NULL",
         (episode_id,),
@@ -126,7 +149,6 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         )
         briefs_staled = cur.rowcount
 
-    ts_iso = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
     return {
         "ok": True,
         "id": episode_id,
@@ -139,7 +161,8 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         "decisions_retracted": decisions_retracted,
         "briefs_staled": briefs_staled,
         "graph": "topic nodes are shared across episodes; none removed",
-        "identity": {"ts": ts_iso, "summary_md5": hashlib.md5((summary or "").encode("utf-8")).hexdigest()},
+        "identity": legacy_identities[0],
+        "legacy_identities": legacy_identities,
     }
 
 
@@ -150,7 +173,8 @@ def _line_matches(line: str, ts_iso: str, summary_md5: str) -> bool:
         return False
     if not isinstance(obj, dict):
         return False
-    if hashlib.md5((obj.get("summary") or "").encode("utf-8")).hexdigest() != summary_md5:
+    summary = obj.get("summary") or ""
+    if not isinstance(summary, str) or hashlib.md5(summary.encode("utf-8")).hexdigest() != summary_md5:
         return False
     raw_ts = str(obj.get("ts") or "")
     # The file stores what the hook minted (2026-09-05T12:20:17Z); PG returns
@@ -161,32 +185,107 @@ def _line_matches(line: str, ts_iso: str, summary_md5: str) -> bool:
     return a == b
 
 
+def _has_unidentified_records(lines: list[str]) -> bool:
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            return True
+        if not isinstance(obj, dict) or not isinstance(obj.get("summary"), str) or not isinstance(obj.get("ts"), str):
+            return True
+    return False
+
+
+def _scrub_retained_backups(memory_root: Path, ts_iso: str, summary_md5: str) -> dict[str, Any]:
+    """Remove a forgotten line from every retained legacy backup.
+
+    A backup made while forgetting one of two identities can contain the
+    other; each identity pass therefore scrubs all old copies as well.
+    """
+    backup_dir = memory_root / ".khipu-forget-backups"
+    if not backup_dir.is_dir():
+        return {"ok": True, "removed": 0, "remaining": []}
+    removed = 0
+    remaining: list[str] = []
+    for backup in backup_dir.glob("episodes.jsonl.*"):
+        if not backup.is_file():
+            continue
+        try:
+            lines = backup.read_text(encoding="utf-8").splitlines(keepends=True)
+            keep = [line for line in lines if not _line_matches(line, ts_iso, summary_md5)]
+            if _has_unidentified_records(keep):
+                remaining.append(f"{backup}: unidentified legacy records")
+            if len(keep) == len(lines):
+                continue
+            from khipu.paths import write_sensitive_bytes
+
+            tmp = backup.with_name(f".{backup.name}.tmp")
+            write_sensitive_bytes(tmp, "".join(keep).encode("utf-8"))
+            tmp.replace(backup)
+            removed += len(lines) - len(keep)
+        except (OSError, UnicodeError) as exc:
+            remaining.append(f"{backup}: {type(exc).__name__}")
+    return {"ok": not remaining, "removed": removed, "remaining": remaining}
+
+
 def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: str) -> dict[str, Any]:
-    """Remove the episode's line from ``memory_root/episodes.jsonl``. The
-    file is copied to ``.khipu-forget-backups/`` first; a rewrite that
-    would remove nothing leaves the file untouched and makes no backup."""
+    """Remove matching lines from the legacy file and retained backups.
+    A rewrite preserves a backup containing only the remaining records."""
+    identity = {"ts": ts_iso, "summary_md5": summary_md5}
     if memory_root is None:
-        return {"file": None, "removed": 0, "reason": "memory_root not configured"}
+        return {"file": None, "removed": 0, "reason": "memory_root not configured", "identity": identity,
+                "backups": {"ok": True, "removed": 0, "remaining": []}}
     path = Path(memory_root) / "episodes.jsonl"
+    backups = _scrub_retained_backups(Path(memory_root), ts_iso, summary_md5)
     if not path.is_file():
-        return {"file": str(path), "removed": 0, "reason": "no legacy file"}
+        return {"file": str(path), "removed": 0, "reason": "no legacy file", "identity": identity,
+                "backups": backups}
     try:
         lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-    except OSError as exc:
-        return {"file": str(path), "removed": 0, "reason": f"unreadable: {exc}"}
+    except (OSError, UnicodeError) as exc:
+        return {"file": str(path), "removed": 0, "reason": f"unreadable: {exc}", "identity": identity,
+                "backups": backups}
     keep = [ln for ln in lines if not _line_matches(ln, ts_iso, summary_md5)]
+    reason = {"reason": "unreadable legacy identities remain"} if _has_unidentified_records(keep) else {}
     removed = len(lines) - len(keep)
     if not removed:
-        return {"file": str(path), "removed": 0}
+        return {"file": str(path), "removed": 0, "identity": identity, "backups": backups, **reason}
     backup_dir = Path(memory_root) / ".khipu-forget-backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"file": str(path), "removed": 0, "reason": f"backup unavailable: {exc}", "identity": identity,
+                "backups": {"ok": False, "removed": 0, "remaining": [str(backup_dir)]}}
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     backup = backup_dir / f"episodes.jsonl.{stamp}"
-    shutil.copy2(path, backup)
-    tmp = path.with_suffix(".jsonl.tmp")
-    tmp.write_text("".join(keep), encoding="utf-8")
-    tmp.replace(path)
-    return {"file": str(path), "removed": removed, "backup": str(backup)}
+    # A retained backup may never retain the line just forgotten. It exists to
+    # protect the remaining file, not to create a new plaintext copy of data
+    # the caller asked to erase.
+    from khipu.paths import write_sensitive_bytes
+
+    try:
+        write_sensitive_bytes(backup, "".join(keep).encode("utf-8"))
+        tmp = path.with_suffix(".jsonl.tmp")
+        write_sensitive_bytes(tmp, "".join(keep).encode("utf-8"))
+        tmp.replace(path)
+        backups = _scrub_retained_backups(Path(memory_root), ts_iso, summary_md5)
+    except (OSError, UnicodeError) as exc:
+        return {"file": str(path), "removed": 0, "reason": f"rewrite failed: {exc}", "identity": identity,
+                "backups": {"ok": False, "removed": 0, "remaining": [str(path)]}}
+    return {"file": str(path), "removed": removed, "backup": str(backup), "identity": identity,
+            "backups": backups, **reason}
+
+
+def forget_from_outbox(ts_iso: str, summary_md5: str) -> dict[str, Any]:
+    """Erase replayable queued/dead copies that could otherwise restore it."""
+    try:
+        from khipu.outbox import forget_identity
+
+        return forget_identity(ts_iso, summary_md5)
+    except Exception as exc:  # noqa: BLE001 — surface an incomplete forget
+        return {"ok": False, "removed": 0, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> dict[str, Any]:
@@ -199,12 +298,19 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
         conn.commit()
     if not out.get("ok"):
         return out
+    partial: list[str] = []
     try:
-        from khipu.hub_snapshot import forget_episode_in_snapshot
+        from khipu.hub_snapshot import forget_episode_in_snapshot, snapshot_path
 
         out["snapshot"] = forget_episode_in_snapshot(episode_id)
+        if (out["snapshot"].get("error") == "hub snapshot missing"
+                and not snapshot_path().exists()):
+            out["snapshot"] = {"ok": True, "skipped": True, "reason": "no snapshot exists"}
     except Exception as exc:  # noqa: BLE001 — the hub write already succeeded
         out["snapshot"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if not out["snapshot"].get("ok"):
+        partial.append("snapshot")
+    root_resolved = True
     if memory_root is None:
         try:
             from khipu.config import path_setting
@@ -212,6 +318,36 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
             memory_root = path_setting("memory_root")
         except Exception:  # noqa: BLE001
             memory_root = None
-    ident = out.get("identity") or {}
-    out["legacy_file"] = forget_in_legacy_file(memory_root, ident.get("ts", ""), ident.get("summary_md5", ""))
+            root_resolved = False
+    identities = out.get("legacy_identities") or [out.get("identity") or {}]
+    out["legacy_files"] = [
+        forget_in_legacy_file(memory_root, ident.get("ts", ""), ident.get("summary_md5", ""))
+        for ident in identities
+    ]
+    out["legacy_file"] = out["legacy_files"][0]
+    if not root_resolved or any(str(item.get("reason") or "").startswith(("unreadable", "backup", "rewrite"))
+                                  for item in out["legacy_files"]):
+        partial.append("legacy_file")
+    if any(not item.get("backups", {}).get("ok", True) for item in out["legacy_files"]):
+        partial.append("legacy_backups")
+    out["outboxes"] = [
+        forget_from_outbox(ident.get("ts", ""), ident.get("summary_md5", ""))
+        for ident in identities
+    ]
+    out["outbox"] = {"ok": all(item.get("ok") for item in out["outboxes"]),
+                     "removed": sum(int(item.get("removed") or 0) for item in out["outboxes"])}
+    if not out["outbox"]["ok"]:
+        partial.append("outbox")
+    out["complete"] = not partial
+    out["partial"] = partial
+    out["partial_errors"] = {
+        "snapshot": out["snapshot"].get("error"),
+        "legacy_file": [item.get("reason") for item in out["legacy_files"] if item.get("reason")],
+        "legacy_backups": [item.get("backups", {}).get("remaining", []) for item in out["legacy_files"]],
+        "outbox": [item.get("remaining", []) for item in out["outboxes"]],
+    }
+    out["partial_errors"] = {key: value for key, value in out["partial_errors"].items() if value}
+    out["ok"] = out["complete"]
+    if partial:
+        out["error"] = "forget incomplete; remaining stores: " + ", ".join(partial)
     return out
