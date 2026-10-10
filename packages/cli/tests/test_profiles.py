@@ -210,17 +210,17 @@ class LibraryIndexTest(unittest.TestCase):
     def test_the_index_is_a_partial_expression_hnsw_for_the_profile(self):
         cur = self._cur()
         name = profiles.ensure_library_index(cur, "voyage-3@1024", dim=1024)
-        self.assertEqual(name, "idx_library_hnsw_voyage_3_1024")
+        self.assertEqual(name, "idx_library_hnsw_voyage_3_1024_d280e893c")
         self.assertEqual(
             self._ddl(cur),
-            ["CREATE INDEX IF NOT EXISTS idx_library_hnsw_voyage_3_1024 ON library_embeddings "
+            ["CREATE INDEX IF NOT EXISTS idx_library_hnsw_voyage_3_1024_d280e893c ON library_embeddings "
              "USING hnsw ((embedding::vector(1024)) vector_cosine_ops) WHERE profile = 'voyage-3@1024'"],
         )
 
     def test_the_memory_table_gets_its_own_index_family(self):
         cur = self._cur()
         name = profiles.ensure_profile_index(cur, "voyage-3@1024", "memory_embeddings", dim=1024)
-        self.assertEqual(name, "idx_memory_hnsw_voyage_3_1024")
+        self.assertEqual(name, "idx_memory_hnsw_voyage_3_1024_d280e893c")
         self.assertIn("ON memory_embeddings USING hnsw ((embedding::vector(1024))", self._ddl(cur)[0])
 
     def test_the_two_gemini_profiles_reuse_the_names_0026_recreates(self):
@@ -232,7 +232,7 @@ class LibraryIndexTest(unittest.TestCase):
             "idx_memory_embeddings_hnsw_gemini2_768")
         self.assertEqual(
             profiles.profile_index_name("gemini-embedding-2@768", "library_embeddings"),
-            "idx_library_hnsw_gemini_embedding_2_768")
+            "idx_library_hnsw_gemini_embedding_2_768_d19571aa5")
 
     def test_an_existing_index_means_no_ddl(self):
         cur = self._cur(exists=True)
@@ -306,7 +306,7 @@ class LibraryIndexTest(unittest.TestCase):
         cur = self._cur()
         self.assertEqual(
             profiles.ensure_profile_index(cur, "voyage-3@1024", "library_embeddings", dim=1024, quiet=True),
-            "idx_library_hnsw_voyage_3_1024")
+            "idx_library_hnsw_voyage_3_1024_d280e893c")
         self.assertEqual(" ".join(cur.execute.call_args_list[-1].args[0].split()),
                          "RELEASE SAVEPOINT khipu_profile_index")
 
@@ -488,8 +488,8 @@ class CliTest(unittest.TestCase):
         receipt = json.loads(out.getvalue())
         self.assertEqual(rc, 0)
         self.assertEqual(receipt, {"ok": True, "profile": "voyage-3@1024", "indexes": {
-            "memory_embeddings": "idx_memory_hnsw_voyage_3_1024",
-            "library_embeddings": "idx_library_hnsw_voyage_3_1024"}})
+            "memory_embeddings": "idx_memory_hnsw_voyage_3_1024_d280e893c",
+            "library_embeddings": "idx_library_hnsw_voyage_3_1024_d280e893c"}})
         sql = [s for s, _ in cur.executed]
         self.assertEqual(sql.count("SET LOCAL maintenance_work_mem = '900MB'"), 2)
         self.assertEqual(len([s for s in sql if s.startswith("CREATE INDEX")]), 2)

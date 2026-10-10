@@ -573,9 +573,9 @@ class DeleteProfileTest(_Env):
                          ["library_embeddings", "memory_embeddings", "memory_query_cache",
                           "embedding_profiles"])
         drops = cur.statements("DROP INDEX")
-        self.assertEqual(drops, ["DROP INDEX IF EXISTS public.idx_memory_hnsw_b_2",
-                                 "DROP INDEX IF EXISTS public.idx_library_hnsw_b_2"])
-        self.assertEqual(out["dropped_indexes"], ["idx_memory_hnsw_b_2", "idx_library_hnsw_b_2"])
+        self.assertEqual(drops, ["DROP INDEX IF EXISTS public.idx_memory_hnsw_b_2_9af3f64f8",
+                                 "DROP INDEX IF EXISTS public.idx_library_hnsw_b_2_9af3f64f8"])
+        self.assertEqual(out["dropped_indexes"], ["idx_memory_hnsw_b_2_9af3f64f8", "idx_library_hnsw_b_2_9af3f64f8"])
         # the row goes last: nothing may still point at it
         order = [s for s, _ in cur.executed if s.startswith(("DELETE", "DROP"))]
         self.assertTrue(order[-1].startswith("DELETE FROM embedding_profiles"))

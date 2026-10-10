@@ -10,15 +10,10 @@ lane's local replica by unpacking every row's embedding blob and summing a
 Python dot product one row at a time — 226ms measured live over ~18,400
 rows, most of a 1.2s budget the lane missed on 85% of prompts in production.
 
-``cblas_sgemv`` (BLAS) scores every row as a single matrix-vector product in
-under a millisecond when a usable library loads — the macOS Accelerate
-framework, or a system libblas/libopenblas. This module tries that first,
-takes a generous shortlist of the highest-scoring rows from the (float32,
-approximate) BLAS pass, and re-scores ONLY that shortlist with the exact
-arithmetic the old pure-Python implementation always used — so the returned
-scores and order are unchanged whether or not BLAS ran, and identical to
-what scoring every row in pure Python would have produced (verified by the
-differential test against a verbatim copy of the old implementation).
+Float32 BLAS shortlist scores cannot safely eliminate a row: a near tie can
+round away the exact winner. This module therefore uses the original exact
+Python arithmetic for every row. The retained BLAS helpers are intentionally
+unused compatibility seams for callers that patch them in older tests.
 
 No new dependency: ctypes (stdlib) loads a SYSTEM library that may or may
 not be present. Every load/call failure — missing library, wrong ABI, a
@@ -35,14 +30,7 @@ import struct
 import sys
 from typing import Any, Iterable, Sequence
 
-# With BLAS: how many of the highest APPROXIMATE (float32) scores get
-# re-scored exactly before the final top-`limit` cut. A floor plus a
-# multiple of `limit` so a small result count (the per-prompt lane asks for
-# 3-8) still gets a shortlist wide enough that the approximate BLAS pass
-# essentially never drops a row that would exactly rank in the true top
-# `limit` — the prototype behind this module measured identical top-8 ids
-# and 4-decimal scores against the exact pure-Python scan on 8 of 8 live
-# prompts using these exact constants.
+# Retained for the private compatibility helper below; not used by ranking.
 _SHORTLIST_FLOOR = 64
 _SHORTLIST_MULTIPLIER = 8
 
@@ -106,11 +94,9 @@ def _blas_shortlist(
     dim: int,
     shortlist_n: int,
 ) -> list[tuple[int, Any, bytes]]:
-    """One ``cblas_sgemv`` call scores every ``valid`` row in float32; return
-    the ``shortlist_n`` highest-scoring rows (ties broken by original
-    position, ``valid[i][0]``). Raises on any shape/library problem — the
-    caller falls back to pure Python on any exception from this function, so
-    it does not need to be defensive beyond not corrupting memory."""
+    """One ``cblas_sgemv`` call scores every ``valid`` row in float32. Its
+    shortlist is advisory only; exact ranking retains all rows. Raises on any
+    shape/library problem so the caller can keep the exact path."""
     n = len(valid)
     packed = bytearray(n * dim * 4)
     for i, (_pos, _key, blob) in enumerate(valid):
@@ -142,15 +128,9 @@ def top_k_by_dot(
     missing or shorter than ``len(query) * 4`` bytes is skipped, same as the
     pure-Python implementation this replaces.
 
-    With a usable BLAS library and more valid rows than the shortlist size
-    (``max(64, 8 * limit)``), scores every row in one ``cblas_sgemv`` call
-    (float32) to build that shortlist, then re-scores ONLY the shortlisted
-    rows with the exact arithmetic (float64 accumulation) the pure-Python
-    path always used, so the final order and scores match it exactly on
-    realistic data. No BLAS, too few rows to bother shortlisting, or ANY
-    exception anywhere in the BLAS path (library load, shape mismatch, the
-    call itself) falls back to exactly scoring every valid row in pure
-    Python — this function itself never raises for a scoring reason.
+    Every valid row is scored with exact arithmetic (float64 accumulation)
+    before the final cut. This function itself never raises for a scoring
+    reason.
     """
     dim = len(query)
     fmt = f"{dim}f"
@@ -162,16 +142,6 @@ def top_k_by_dot(
     if not valid or limit == 0:
         return []
 
-    shortlist_n = max(_SHORTLIST_FLOOR, _SHORTLIST_MULTIPLIER * limit)
-    candidates = valid
-    if use_blas and len(valid) > shortlist_n:
-        try:
-            sgemv = _cblas_sgemv()
-            if sgemv is not None:
-                candidates = _blas_shortlist(sgemv, q, valid, dim, shortlist_n)
-        except Exception:  # noqa: BLE001 — any BLAS failure at all: score everything exactly
-            candidates = valid
-
-    scored = [(pos, key, _exact_score(q, blob, dim, fmt)) for pos, key, blob in candidates]
+    scored = [(pos, key, _exact_score(q, blob, dim, fmt)) for pos, key, blob in valid]
     scored.sort(key=lambda item: (-item[2], item[0]))
     return [(key, score) for _pos, key, score in scored[:limit]]

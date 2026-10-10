@@ -99,12 +99,13 @@ class RunJobTest(_DataDir):
         row = self.read("ok1")
         self.assertEqual((row["state"], row["done"], row["total"], row["failed"]), ("done", 4, 4, 0))
 
-    def test_partial_is_done_with_the_failed_count_not_hidden(self):
-        rc, _ = self.run_job(lambda job: (job.update(3, 10, 0), {"embedded": 3, "failed_chunks": 7})[1],
+    def test_partial_is_failed_with_the_failed_count_not_hidden(self):
+        rc, printed = self.run_job(lambda job: (job.update(3, 10, 0), {"embedded": 3, "failed_chunks": 7})[1],
                              job_id="part")
         row = self.read("part")
-        self.assertEqual(rc, 0)
-        self.assertEqual((row["state"], row["done"], row["total"], row["failed"]), ("done", 3, 10, 7))
+        self.assertEqual(rc, 1)
+        self.assertEqual((row["state"], row["done"], row["total"], row["failed"]), ("failed", 3, 10, 7))
+        self.assertFalse(json.loads(printed)["ok"])
 
     def test_everything_failed_is_failed_with_a_reason(self):
         rc, printed = self.run_job(lambda job: {"embedded": 0, "failed_chunks": 5}, job_id="allbad")
