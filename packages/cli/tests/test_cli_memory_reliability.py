@@ -295,7 +295,9 @@ class HygienePathsCommandTest(unittest.TestCase):
         rc, out = _run(["hygiene", "paths", "--apply"], cur)
         self.assertEqual(rc, 0)
         self.assertFalse(out["dry_run"])
-        self.assertEqual(out["deleted_nodes"], 1)
+        self.assertEqual(out["deleted_nodes"], 0)
+        self.assertTrue(out["report_only"])
+        self.assertFalse(any("DELETE" in s for s, _ in cur.calls))
 
 
 if __name__ == "__main__":

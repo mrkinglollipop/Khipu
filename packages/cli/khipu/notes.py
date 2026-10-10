@@ -25,10 +25,9 @@ itself rather than forcing the wrong parser onto it, then calls
 Phase 4 (F5) — tombstones a ``note:`` topic whose ``source_path`` file no
 longer exists on disk, bounded by the same circuit-breaker style the wiki
 reconcile uses (never more than 20% of note topics in one run; see
-``_tombstone_missing_notes``). ``changed_only=True`` (F1) skips any file
-whose mtime/size match a small on-disk state file from the last run —
-unchanged files cost one ``stat()``, nothing is read or parsed — so the
-Stop hook can call this on every turn without re-walking hundreds of notes.
+``_tombstone_missing_notes``). ``changed_only=True`` (F1) skips writes whose
+file signature and resolved identity match the last run. Identity resolution
+uses the complete note inventory so unchanged collision partners remain visible.
 The nightly still calls the full (``changed_only=False``) reconcile. Never
 runs against the live hub in a test: every test here injects a temp dir and
 mocks ``khipu.db.connect`` with a fake cursor, same as every other write
@@ -36,9 +35,11 @@ path in this package.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -216,8 +217,11 @@ def _note_topic_dict(path: Path, *, project: str | None) -> dict[str, Any] | Non
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
+    from khipu.redact import redact_secrets
+
+    text, _ = redact_secrets(text)
     flat, body = _parse_note_frontmatter(text)
-    name = flat.get("name") or path.stem
+    name, _ = redact_secrets(flat.get("name") or path.stem)
     # `name` is free text ("Aggressive automatic memory capture", em-dashes
     # and all) — slugify it the same way a capture topic label is slugified
     # so `topics.slug` stays a real slug; `title` keeps the readable form.
@@ -269,10 +273,10 @@ def _note_topic_dict(path: Path, *, project: str | None) -> dict[str, Any] | Non
 
 def _iter_note_files(memory_dir: Path) -> list[Path]:
     """Flat (non-recursive) ``*.md`` in ``memory_dir``, excluding
-    ``MEMORY.md`` (the generated index, not a note of its own)."""
+    generated indexes (not notes of their own)."""
     if not memory_dir.is_dir():
         return []
-    return sorted(p for p in memory_dir.glob("*.md") if p.name != "MEMORY.md" and p.is_file())
+    return sorted(p for p in memory_dir.glob("*.md") if p.name not in {"MEMORY.md", "_overflow_index.md"} and p.is_file())
 
 
 def _claude_project_dirs(root: Path) -> list[Path]:
@@ -408,8 +412,8 @@ def _build_plan(
         return project_cache[claude_slug]
 
     for path, harness, claude_slug in _iter_note_file_candidates():
+        sig = _file_sig(path)
         if changed_only:
-            sig = _file_sig(path)
             if sig is None:
                 continue
             prev = files_state.get(str(path))
@@ -419,7 +423,7 @@ def _build_plan(
         if parsed is not None:
             plan.append({
                 "harness": harness, "parsed": parsed, "path": str(path),
-                "claude_slug": claude_slug,
+                "claude_slug": claude_slug, "signature": sig,
             })
     return plan
 
@@ -481,7 +485,7 @@ def _resolve_collisions(plan: list[dict[str, Any]]) -> tuple[list[dict[str, Any]
             out.append(items[0])
             continue
         digests = {it["parsed"]["digest"] for it in items}
-        if len(digests) == 1:
+        if len(digests) == 1 and not any(it.get("resolved_slug") for it in items):
             # Same content under more than one directory: the host slugged
             # one real project path two ways. Keep exactly one candidate,
             # deterministically (lowest source path), so re-running this
@@ -493,9 +497,18 @@ def _resolve_collisions(plan: list[dict[str, Any]]) -> tuple[list[dict[str, Any]
         # Real collision: different content under the same name from
         # different project dirs. Namespace every one of them so the next
         # write can never silently clobber a different note's revision.
+        namespaces = [_project_short(it) for it in items]
+        short_namespaces = list(namespaces)
+        for i, it in enumerate(items):
+            if short_namespaces.count(short_namespaces[i]) > 1:
+                project = it["parsed"]["frontmatter"].get("project") or it.get("claude_slug") or str(Path(it["path"]).parent)
+                namespaces[i] = re.sub(r"[^a-z0-9_-]+", "-", str(project).lower()).strip("-") or "unknown"
+        if len(set(namespaces)) != len(namespaces):
+            namespaces = [f"{ns}-{hashlib.sha256(it['path'].encode()).hexdigest()[:16]}" for ns, it in zip(namespaces, items)]
+        if len(set(namespaces)) != len(namespaces):
+            raise ValueError("colliding note sources do not resolve to unique identities")
         new_slugs: list[str] = []
-        for it in items:
-            proj_short = _project_short(it)
+        for it, proj_short in zip(items, namespaces):
             name_part = base_slug[len(NOTE_SLUG_PREFIX):]
             new_slug = f"{NOTE_SLUG_PREFIX}{proj_short}/{name_part}"
             it["parsed"]["slug"] = new_slug
@@ -595,10 +608,9 @@ def _any_memory_root_exists() -> bool:
 def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str, Any]:
     """Mirror every harness-native note into ``topics``.
 
-    ``changed_only=True`` (F1) is the Stop-hook-cheap path: unchanged files
-    (matched against the state file from the last run) cost one ``stat()``
-    and are skipped entirely, and — since that is the whole point — a run
-    that finds nothing changed never even opens a DB connection. The full
+    ``changed_only=True`` (F1) parses the complete inventory for stable note
+    identities, then skips writes whose signature and slug match the state
+    file. A run that finds nothing changed never opens a DB connection. The full
     (``changed_only=False``, what the nightly calls) reconcile also runs the
     F5 tombstone sweep (``_tombstone_missing_notes``), which needs every
     live note topic's row and so is not part of the cheap path. Fail-open at
@@ -608,12 +620,31 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
     nightly, the Stop hook, the WatchPaths agent) decides how to surface
     that, same posture as every other write path in this package.
     """
-    state = _read_state() if changed_only else None
-    raw_plan = _build_plan(changed_only=changed_only, state=state)
+    state = _read_state()
+    files_state = state.get("files", {})
+    raw_plan = _build_plan()
+    for item in raw_plan:
+        item["base_slug"] = item["parsed"]["slug"]
+        prev = files_state.get(item["path"], {})
+        item["resolved_slug"] = prev.get("slug") if prev.get("base_slug") == item["base_slug"] and prev.get("slug") != item["base_slug"] else None
     # G3: resolve same-name-different-project collisions and duplicate-
     # directory copies BEFORE anything is written (and before dry_run's
     # preview) — see _resolve_collisions's own docstring.
     plan, collision_report = _resolve_collisions(raw_plan)
+    for item in plan:
+        prev = files_state.get(item["path"], {})
+        if prev.get("base_slug") == item["base_slug"] and prev.get("slug") and prev["slug"] != item["base_slug"]:
+            item["parsed"]["slug"] = prev["slug"]
+    if len({item["parsed"]["slug"] for item in plan}) != len(plan):
+        raise ValueError("persisted note identities collide; refusing to reconcile")
+    for redirect in collision_report["redirects"]:
+        redirect["new_slugs"] = sorted(item["parsed"]["slug"] for item in plan if item["base_slug"] == redirect["old_slug"])
+    inventory = plan
+    if changed_only:
+        plan = [item for item in plan if item["signature"] != {k: files_state.get(item["path"], {}).get(k) for k in ("mtime", "size")}
+                or item["parsed"]["slug"] != files_state.get(item["path"], {}).get("slug")]
+        changed_slugs = {item["parsed"]["slug"] for item in plan}
+        collision_report["redirects"] = [r for r in collision_report["redirects"] if changed_slugs.intersection(r["new_slugs"])]
     out: dict[str, Any] = {
         "ok": True,
         "dry_run": dry_run,
@@ -641,36 +672,45 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
     from khipu.db import connect
     from khipu.mirror import _upsert_topic
 
-    new_files_state = dict((state or {}).get("files", {})) if changed_only else {}
+    new_files_state = dict(files_state)
+    written_plan: list[dict[str, Any]] = []
     with connect() as conn:
         with conn.cursor() as cur:
             for item in plan:
                 try:
-                    _upsert_topic(
-                        cur,
-                        item["parsed"],
-                        item["path"],
-                        source="notes-reconcile",
-                        note=f"harness-native note ({item['harness']})",
-                    )
+                    with getattr(conn, "transaction", nullcontext)():
+                        _upsert_topic(
+                            cur,
+                            item["parsed"],
+                            item["path"],
+                            source="notes-reconcile",
+                            note=f"harness-native note ({item['harness']})",
+                        )
                     out["written"] += 1
-                    if changed_only:
-                        sig = _file_sig(Path(item["path"]))
-                        if sig is not None:
-                            new_files_state[item["path"]] = sig
+                    written_plan.append(item)
+                    sig = item["signature"]
+                    if sig is not None:
+                        new_files_state[item["path"]] = {**sig, "slug": item["parsed"]["slug"], "base_slug": item["base_slug"]}
                 except Exception as exc:  # noqa: BLE001 — one bad note must not sink the batch
                     out["errors"].append({"path": item["path"], "error": f"{type(exc).__name__}: {exc}"})
                     _log(f"upsert failed for {item['path']}: {exc}")
             # G3: the old bare slug becomes a redirect row (never deleted —
             # a stale bookmark or a stale search hit still resolves).
+            failed_slugs = {item["parsed"]["slug"] for item in plan if item not in written_plan}
             for redirect in collision_report["redirects"]:
+                if failed_slugs.intersection(redirect["new_slugs"]):
+                    continue
                 try:
                     redirect_parsed = _redirect_topic_dict(redirect["old_slug"], redirect["new_slugs"])
-                    _upsert_topic(
-                        cur, redirect_parsed, redirect["source_path"],
-                        source="notes-reconcile", note="slug collision redirect (G3)",
-                    )
+                    with getattr(conn, "transaction", nullcontext)():
+                        _upsert_topic(
+                            cur, redirect_parsed, redirect["source_path"],
+                            source="notes-reconcile", note="slug collision redirect (G3)",
+                        )
                 except Exception as exc:  # noqa: BLE001 — a redirect failure must not sink the batch
+                    for item in inventory:
+                        if item["parsed"]["slug"] in redirect["new_slugs"]:
+                            new_files_state.pop(item["path"], None)
                     out["errors"].append({
                         "path": redirect["old_slug"], "error": f"{type(exc).__name__}: {exc}",
                     })
@@ -678,16 +718,16 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
             if run_tombstone:
                 out["tombstone"] = _tombstone_missing_notes(cur)
         conn.commit()
-    if changed_only:
-        _write_state({
-            "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
-            "files": new_files_state,
-        })
+    out["ok"] = not out["errors"]
+    _write_state({
+        "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
+        "files": new_files_state,
+    })
     try:
         from khipu import organise
 
         out["organise"] = organise.after_reconcile(
-            written_plan=plan, changed_only=changed_only, dry_run=dry_run,
+            written_plan=written_plan, changed_only=changed_only, dry_run=dry_run,
         )
     except Exception as exc:  # noqa: BLE001 — organisation must never break reconcile
         out["organise"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
