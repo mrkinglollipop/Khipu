@@ -159,8 +159,8 @@ class RunOffsiteTest(unittest.TestCase):
                 return mock.Mock(returncode=0, stdout="", stderr="")
 
             with (
-                mock.patch.object(graph_backup, "DEFAULT_SNAPSHOT_DIR", d),
-                mock.patch.object(graph_backup, "LIVE_GRAPH", live),
+                mock.patch.object(graph_backup, "_default_snapshot_dir", return_value=d),
+                mock.patch.object(graph_backup, "_live_graph", return_value=live),
                 mock.patch.object(graph_backup, "resolve_rclone", return_value="rclone"),
                 mock.patch.object(graph_backup, "has_r2_remote", return_value=True),
                 mock.patch("khipu.graph_backup.subprocess.run", side_effect=fake_run),
@@ -193,8 +193,8 @@ class RunOffsiteTest(unittest.TestCase):
                 return mock.Mock(returncode=0, stdout="", stderr="")
 
             with (
-                mock.patch.object(graph_backup, "DEFAULT_SNAPSHOT_DIR", d),
-                mock.patch.object(graph_backup, "LIVE_GRAPH", live),
+                mock.patch.object(graph_backup, "_default_snapshot_dir", return_value=d),
+                mock.patch.object(graph_backup, "_live_graph", return_value=live),
                 mock.patch.object(graph_backup, "resolve_rclone", return_value="rclone"),
                 mock.patch.object(graph_backup, "has_r2_remote", return_value=True),
                 mock.patch("khipu.graph_backup.subprocess.run", side_effect=fake_run),
@@ -235,7 +235,7 @@ class ScratchDrillTest(unittest.TestCase):
             live.write_bytes(b"x")
 
             with (
-                mock.patch.object(graph_backup, "LIVE_GRAPH", live),
+                mock.patch.object(graph_backup, "_live_graph", return_value=live),
                 mock.patch(
                     "khipu.ops_events.record", return_value={"ok": True, "id": 7}
                 ),

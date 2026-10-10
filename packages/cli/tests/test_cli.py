@@ -1,14 +1,16 @@
 """Unit tests for khipu.cli — P2a / audit F4 (graph hops symmetry) and F7
 (search ordering / per-kind fairness / ILIKE escaping).
 
-Pure-arithmetic / pure-string tests (escaping, fair-share split) need no
-database. The query-shape tests connect read-only to the live Khipu Postgres
-(same DSN resolution as the CLI) and skip cleanly if it's unreachable —
-never a hard failure, never a write.
+Pure helpers and seeded search-SQL tests need no live database. Remaining
+dataset/graph probes require KHIPU_LIVE_TESTS=1 and a reachable Postgres;
+those probes are read-only.
 """
 from __future__ import annotations
 
 import argparse
+import os
+import re
+import sqlite3
 import unittest
 from unittest import mock
 
@@ -37,6 +39,8 @@ VERIFY_LIMIT = 500
 
 
 def _pg_available() -> bool:
+    if os.environ.get("KHIPU_LIVE_TESTS") != "1":
+        return False
     try:
         from khipu.db import connect
 
@@ -182,25 +186,63 @@ class GraphHopsSymmetryTest(unittest.TestCase):
         )
 
 
+class _SqliteSearchCursor:
+    """Execute the search SQL's ASCII matching subset on a disposable SQLite database."""
+
+    def __init__(self, conn):
+        self.cur = conn.cursor()
+
+    def execute(self, sql, params):
+        sql = sql.replace("ILIKE", "LIKE").replace("::text", "")
+        sql = sql.replace("left(body, 4000)", "substr(body, 1, 4000)")
+        sql = sql.replace("left(COALESCE(payload, ''), 4000)", "substr(COALESCE(payload, ''), 1, 4000)")
+        sql = re.sub(r"%\((\w+)\)s", r":\1", sql)
+        self.cur.execute(sql, params)
+
+    def fetchall(self):
+        return self.cur.fetchall()
+
+
+class SearchFixtureTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        self.conn.executescript("""
+            CREATE TABLE topics (slug TEXT, title TEXT, body TEXT, deleted_at TEXT);
+            CREATE TABLE episodes (id INTEGER, ts TEXT, summary TEXT, topics TEXT,
+                decisions TEXT, preferences TEXT, people TEXT, deleted_at TEXT);
+            CREATE TABLE nodes (id TEXT, name TEXT, payload TEXT);
+            INSERT INTO topics VALUES ('literal-percent', 'fixture 50% plan', '', NULL);
+            INSERT INTO topics VALUES ('ordinary', 'fixture ordinary plan', '', NULL);
+            INSERT INTO episodes VALUES (1, '2026-01-01', 'fixture ingest 36 openbot PR',
+                '[]', '[]', '[]', '[]', NULL);
+        """)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0], 2)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0], 1)
+        self.cur = _SqliteSearchCursor(self.conn)
+        patch = mock.patch("khipu.db.has_columns", return_value=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_literal_percent_does_not_match_everything(self):
+        hits = _search_query(self.cur, "%", 999)
+        self.assertEqual([(r["kind"], r["id"]) for r in hits], [("topic", "literal-percent")])
+
+    def test_multi_token_query_is_not_one_giant_substring(self):
+        hits = _search_query(self.cur, "openbot ingest PR 36", 12)
+        self.assertEqual([(r["kind"], str(r["id"])) for r in hits], [("episode", "1")])
+
+    def test_kind_filter_restricts_to_one_kind(self):
+        hits = _search_query(self.cur, "fixture", 10, kind="topic")
+        self.assertEqual([(r["kind"], r["id"]) for r in hits],
+                         [("topic", "literal-percent"), ("topic", "ordinary")])
+
+
 @unittest.skipUnless(PG_AVAILABLE, "Postgres unreachable; skipping live query-shape tests")
 class SearchQueryTest(unittest.TestCase):
     """F7: escaping actually reaches the query, and no kind can starve the
     others under a small shared limit."""
 
-    def test_literal_percent_does_not_match_everything(self) -> None:
-        from khipu.db import connect
-
-        with connect() as conn:
-            with conn.cursor() as cur:
-                # A bare "%" ILIKE'd unescaped matches every non-null row in
-                # each table; escaped, it should behave like a literal char
-                # and (barring real data containing "%") match far fewer.
-                literal_percent_hits = _search_query(cur, "%", 999)
-                cur.execute("SELECT COUNT(*) FROM topics")
-                topic_count = cur.fetchone()[0]
-        if topic_count == 0:
-            self.skipTest("no topics in database to distinguish escaped vs. wildcard")
-        self.assertLess(len(literal_percent_hits), topic_count)
 
     def test_no_kind_starves_the_others_under_small_limit(self) -> None:
         from khipu.db import connect
@@ -224,21 +266,6 @@ class SearchQueryTest(unittest.TestCase):
             len(kinds), 2, f"expected results from multiple kinds, got only {kinds}"
         )
 
-    def test_multi_token_query_is_not_one_giant_substring(self) -> None:
-        from khipu.db import connect
-
-        with connect() as conn:
-            with conn.cursor() as cur:
-                hits = _search_query(cur, "openbot ingest PR 36", 12)
-        snippets = " ".join(
-            (r.get("snippet") or r.get("label") or "").lower() for r in hits
-        )
-        if "openbot" not in snippets:
-            self.skipTest("no OpenBot rows in live hub")
-        self.assertTrue(
-            any(r["kind"] == "episode" for r in hits),
-            hits,
-        )
 
     def test_nodes_excluded_by_default_for_a_non_id_shaped_query(self) -> None:
         from khipu.db import connect
@@ -277,16 +304,6 @@ class SearchQueryTest(unittest.TestCase):
                 results = _search_query(cur, node_id, 10)
         self.assertTrue(any(r["kind"] == "node" for r in results), results)
 
-    def test_kind_filter_restricts_to_one_kind(self) -> None:
-        from khipu.db import connect
-
-        with connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM topics")
-                if cur.fetchone()[0] == 0:
-                    self.skipTest("no topics in live hub")
-                results = _search_query(cur, "e", 10, kind="topic")
-        self.assertTrue(all(r["kind"] == "topic" for r in results))
 
     def test_invalid_kind_raises(self) -> None:
         from khipu.db import connect

@@ -39,6 +39,12 @@ def _unit_vector(rng: random.Random, dim: int = _DIM) -> list[float]:
     return [x / norm for x in v]
 
 
+def _test_sgemv(order, trans, rows, dim, alpha, matrix, stride, query, incx, beta, scores, incy):
+    """An observable float32 scoring callable avoids host BLAS availability gates."""
+    for i in range(rows):
+        scores[i] = sum(matrix[i * stride + j] * query[j] for j in range(dim))
+
+
 class TopKByDotTest(unittest.TestCase):
     """Direct unit coverage of ``top_k_by_dot`` itself, independent of
     ``hub_snapshot`` — the fixture-driven differential test below covers the
@@ -84,10 +90,13 @@ class TopKByDotTest(unittest.TestCase):
     def test_use_blas_false_and_true_agree_on_a_small_case(self) -> None:
         rng = random.Random(7)
         dim = 16
-        rows = [(f"r{i}", _pack_f32(_unit_vector(rng, dim))) for i in range(50)]
+        rows = [(f"r{i}", _pack_f32(_unit_vector(rng, dim))) for i in range(200)]
         query = _unit_vector(rng, dim)
         off = vs.top_k_by_dot(query, rows, 8, use_blas=False)
-        on = vs.top_k_by_dot(query, rows, 8, use_blas=True)
+        sgemv = mock.Mock(side_effect=_test_sgemv)
+        with mock.patch.object(vs, "_cblas_sgemv", return_value=sgemv):
+            on = vs.top_k_by_dot(query, rows, 8, use_blas=True)
+        sgemv.assert_called_once()
         self.assertEqual(off, on)
 
     def test_blas_loader_returning_none_falls_back_silently(self) -> None:
@@ -221,12 +230,15 @@ class CosineCandidatesDifferentialTest(unittest.TestCase):
         cls._tmp.cleanup()
 
     def test_matches_reference_with_blas(self) -> None:
-        with mock.patch.object(hs, "snapshot_path", return_value=self.snap):
+        sgemv = mock.Mock(side_effect=_test_sgemv)
+        with mock.patch.object(hs, "snapshot_path", return_value=self.snap), \
+             mock.patch.object(vs, "_cblas_sgemv", return_value=sgemv):
             for i, q in enumerate(self.queries):
                 with self.subTest(query=i):
                     new_out = hs.cosine_candidates_snapshot(q, "p1", limit=8)
                     old_out = _reference_cosine_candidates_snapshot(q, "p1", limit=8)
                     self.assertEqual(new_out, old_out)
+        self.assertEqual(sgemv.call_count, len(self.queries))
 
     def test_matches_reference_with_blas_forced_off(self) -> None:
         with mock.patch.object(hs, "snapshot_path", return_value=self.snap), \

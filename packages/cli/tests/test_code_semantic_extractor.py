@@ -1,4 +1,4 @@
-"""Tests for the maintainer's graphify code_semantic_extractor.code_roots_from_resolved."""
+"""Behavior tests for the bundled Graphify semantic extractor."""
 from __future__ import annotations
 
 import importlib.util
@@ -11,18 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 
-def _scripts_dir() -> Path | None:
-    raw = (os.environ.get("KHIPU_GRAPHIFY_SCRIPTS_DIR") or "").strip()
-    if raw:
-        return Path(raw)
-    nightly = (os.environ.get("KHIPU_GRAPHIFY_NIGHTLY") or "").strip()
-    if nightly:
-        return Path(nightly).parent
-    return None
-
-
-_SCRIPTS = _scripts_dir()
-EXTRACTOR_PATH = (_SCRIPTS / "code_semantic_extractor.py") if _SCRIPTS is not None else None
+EXTRACTOR_PATH = Path(__file__).resolve().parents[3] / "third_party" / "graphify" / "code_semantic_extractor.py"
 
 
 def _load_extractor():
@@ -32,14 +21,11 @@ def _load_extractor():
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {EXTRACTOR_PATH}")
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    with mock.patch.object(sys, "path", list(sys.path)):
+        spec.loader.exec_module(mod)
     return mod
 
 
-@unittest.skipUnless(
-    EXTRACTOR_PATH is not None and EXTRACTOR_PATH.is_file(),
-    "maintainer graphify scripts not configured",
-)
 class CodeRootsFromResolvedTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -66,12 +52,12 @@ class CodeRootsFromResolvedTest(unittest.TestCase):
         os.environ["KHIPU_GRAPH_SOURCES_RESOLVED"] = str(path)
         return path
 
-    def test_missing_file_falls_back_to_workspace(self):
+    def test_missing_file_returns_no_roots(self):
         os.environ["KHIPU_GRAPH_SOURCES_RESOLVED"] = str(
             self.dir / "does-not-exist.json"
         )
         self.assertEqual(
-            self.mod.code_roots_from_resolved(), [self.mod.WORKSPACE]
+            self.mod.code_roots_from_resolved(), []
         )
 
     def test_code_semantic_false_returns_empty(self):
@@ -104,7 +90,7 @@ class CodeRootsFromResolvedTest(unittest.TestCase):
         )
         self.assertEqual(self.mod.code_roots_from_resolved(), [])
 
-    def test_empty_code_roots_falls_back_to_workspace(self):
+    def test_empty_code_roots_returns_no_roots(self):
         self._write_resolved(
             {
                 "schema_version": 1,
@@ -113,7 +99,7 @@ class CodeRootsFromResolvedTest(unittest.TestCase):
             }
         )
         self.assertEqual(
-            self.mod.code_roots_from_resolved(), [self.mod.WORKSPACE]
+            self.mod.code_roots_from_resolved(), []
         )
 
     def test_main_skips_write_when_no_roots(self):

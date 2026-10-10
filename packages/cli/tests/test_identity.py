@@ -7,16 +7,21 @@ URL set with ``git remote add``, never fetched).
 from __future__ import annotations
 
 import shutil
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from khipu import identity
 
 
 def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    subprocess.run(["git", "-c", "core.hooksPath=" + os.devnull, "-c", "init.templateDir=",
+                    "-C", str(cwd), *args], env=env, check=True, capture_output=True, text=True)
 
 
 class GitFixtureTestCase(unittest.TestCase):
@@ -31,6 +36,43 @@ class GitFixtureTestCase(unittest.TestCase):
         (self.repo / "f.txt").write_text("hi\n")
         _git(self.repo, "add", "f.txt")
         _git(self.repo, "commit", "-qm", "init")
+
+
+class GitEnvironmentIsolationTest(unittest.TestCase):
+    def test_fixture_does_not_follow_inherited_repo_redirection(self):
+        with tempfile.TemporaryDirectory() as td:
+            outside, inside = Path(td) / "outside", Path(td) / "inside"
+            outside.mkdir()
+            inside.mkdir()
+            _git(outside, "init", "-q")
+            _git(outside, "config", "user.name", "outside")
+            with mock.patch.dict(os.environ, {"GIT_DIR": str(outside / ".git"),
+                                            "GIT_WORK_TREE": str(outside)}):
+                _git(inside, "init", "-q")
+                _git(inside, "config", "user.name", "inside")
+            self.assertTrue((inside / ".git").is_dir())
+            self.assertIn("name = outside", (outside / ".git" / "config").read_text())
+
+    def test_fixture_never_runs_inherited_hooks_or_templates(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, template, hooks = root / "repo", root / "template", root / "hooks"
+            for path in (repo, template / "hooks", hooks):
+                path.mkdir(parents=True)
+            sentinel = root / "hook-ran"
+            for directory in (hooks, template / "hooks"):
+                hook = directory / "pre-commit"
+                hook.write_text("#!/bin/sh\ntouch '" + str(sentinel) + "'\n")
+                hook.chmod(0o755)
+            with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": str(hooks),
+                "GIT_TEMPLATE_DIR": str(template)}):
+                _git(repo, "init", "-q")
+                _git(repo, "config", "user.name", "test")
+                _git(repo, "config", "user.email", "test@example.invalid")
+                _git(repo, "commit", "--allow-empty", "-qm", "fixture")
+            self.assertFalse(sentinel.exists())
+            self.assertFalse((repo / ".git" / "hooks" / "pre-commit").exists())
 
 
 class ResolveRepoRootTest(GitFixtureTestCase):

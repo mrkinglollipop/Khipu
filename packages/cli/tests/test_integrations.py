@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import tempfile
 import time
 import unittest
@@ -220,14 +221,14 @@ class ProbeTest(_TempHomeCase):
         self.assertLess(r["ms"], 30_000)
 
     def test_hook_probe_runs_through_the_shell_like_the_harnesses_do(self):
-        """Regression for 2026-08-17: the raw repo path has a space, every harness
-        runs hook commands via `sh -c`, and the old exec-style probe passed while
-        the real hook died. The probe must fail on the raw path and pass on the shim."""
-        raw = str(integ._root() / "packages" / "cli" / "bin" / "khipu-stop-hook")
-        self.assertIn(" ", raw)  # the whole point — if this moves, the test is moot
+        """Harnesses interpret hook commands through a shell, including quoting."""
+        path = self.home / "directory with spaces" / "probe-hook"
+        path.parent.mkdir()
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+        raw = str(path)
         self.assertFalse(integ._probe_hook(raw)["ok"])
-        self.assertNotIn(" ", integ.stop_hook())
-        self.assertTrue(integ._probe_hook(integ.stop_hook())["ok"])
+        self.assertTrue(integ._probe_hook(shlex.quote(raw))["ok"])
 
 
 class ProbePromptRecallSnapshotTest(unittest.TestCase):
