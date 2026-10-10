@@ -604,7 +604,7 @@ class GatewayFlagTest(unittest.TestCase):
     def test_gateway_serve_marks_the_flag(self):
         from khipu import gateway
 
-        with mock.patch.object(gateway, "ThreadingHTTPServer", side_effect=RuntimeError("stop")):
+        with mock.patch.object(gateway, "BoundedHTTPServer", side_effect=RuntimeError("stop")):
             with self.assertRaises(RuntimeError):
                 gateway.serve("127.0.0.1:8787", token="x" * 32)
         self.assertTrue(ms._via_https_gateway())
