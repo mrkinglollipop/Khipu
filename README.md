@@ -40,8 +40,8 @@ Three things make it work:
 
 **Capture is automatic.** A hook in each agent harness watches the session. When
 enough has happened — five user turns, or twenty minutes — it summarises the
-window into an *episode* and writes it. It always captures before a compaction
-or a session end, so nothing is lost to a context window filling up.
+window into an *episode* and writes it. It captures before a compaction or a
+session end.
 
 **Storage is central and shared.** One PostgreSQL instance holds everything.
 Every Mac reads the same database, so memory is not trapped on whichever laptop
@@ -149,10 +149,12 @@ Two shapes of memory, deliberately:
 
 | | What it is | Written by |
 |---|---|---|
-| **Episodes** | Append-only. What happened in one session window, with the decisions and preferences pulled out. | Capture hooks |
+| **Episodes** | What happened in one session window, with the decisions and preferences pulled out. Near-duplicate captures can merge into the matching episode. | Capture hooks |
 | **Topics** | A living page per subject, rewritten as understanding improves. Every version kept in `topic_revisions`. | Capture, plus edits |
 
-Episodes are history and never change. Topics are the current best understanding
+Episodes are historical records, but near-duplicate captures can merge into a
+matching episode; its raw metadata records their sessions, timestamps and matches.
+Topics are the current best understanding
 and change constantly — which is why they carry a `content_hash` and a full
 revision trail.
 
@@ -310,8 +312,7 @@ requires explicit confirmation.
 ### 7. Operations
 
 `khipu doctor` is the single health command. Checks that AND into `ok` must
-pass; `graph_offsite_ok` is visible but does not keep the Mac red when the
-Matt-owned `r2` rclone remote is missing:
+pass; `graph_offsite_ok` keeps a graph producer red when its `r2` remote is missing:
 
 | Check | Red when |
 |---|---|
@@ -389,15 +390,16 @@ older, non-notarized release, right-click **Khipu.app** → **Open** once. See
 
 ### The Database step — three choices, one proof each
 
-Whichever you pick, it ends the same way: the schema is current, the three
-background upkeep jobs are scheduled, and a real memory round trip is proved
-— written, found by search, shown as a timed line ("1.8 s"), not a checkmark.
+Each choice makes the schema current and schedules the three background upkeep
+jobs. A real memory round trip — written, found by search, shown as a timed line
+("1.8 s"), not a checkmark — can be skipped in legacy mode or without a model key.
 
 - **Join another Mac.** Pick this if a Mac in your life already runs Khipu —
   you want the *same* memory, not a second one. On the working Mac: Settings
   → Another Mac → **Save join kit…**, then AirDrop the file (or use the
   six-digit PIN over the same Wi‑Fi). On the new Mac: Welcome → **Join
-  existing Khipu**. Proves: the copied counts match the source exactly.
+  existing Khipu**. Proves: live episode, topic and node counts are non-zero
+  when the join kit expects them to be.
 - **Set up a new database on this Mac.** Pick this if nobody has Khipu yet.
   Needs [Docker Desktop](https://docs.docker.com/desktop/setup/install/mac-install/)
   (or OrbStack/Colima) — the app notices once it's installed and turns the
@@ -500,9 +502,11 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request.
 ## FAQ
 
 **Does Khipu send my code or conversations anywhere?**
-Only to two places you control: your own PostgreSQL server, and Google's Gemini
-API for summarisation and embeddings (the transcript window, capped at 14,000
-characters, is what gets summarised). Nothing goes to the maintainer. There is
+Only to your own PostgreSQL server and the model providers you configure.
+Summarisation sends transcript windows, capped at 14,000 characters, to Google
+Gemini or a configured OpenAI-compatible endpoint. Embeddings send memory chunks
+and search queries to Google Gemini, Voyage, or a configured OpenAI-compatible
+endpoint, which may be local or remote. Nothing goes to the maintainer. There is
 no telemetry.
 
 **Do I have to run PostgreSQL 19? It's a beta.**
