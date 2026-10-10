@@ -25,6 +25,13 @@ done
 SELF_DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
 ROOT="${KHIPU_ROOT:-$(cd "$SELF_DIR/../../.." 2>/dev/null && pwd)}"
 PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
+if [ -x "$SELF_DIR/../python/bin/python3.11" ]; then
+  ROOT="${KHIPU_ROOT:-$(cd "$SELF_DIR/.." 2>/dev/null && pwd)}"
+  PY="${KHIPU_PYTHON:-$ROOT/python/bin/python3.11}"
+fi
+if [ -x "$ROOT/python/bin/python3.11" ]; then
+  PY="${KHIPU_PYTHON:-$ROOT/python/bin/python3.11}"
+fi
 [ -x "$PY" ] || PY="python3"
 SHAPE=claude
 for a in "$@"; do
@@ -33,18 +40,26 @@ done
 # stdin can be read once, and both paths below need the payload.
 PAYLOAD=$(cat)
 # The warm recall service (khipu recall serve) answers in a few milliseconds; the
-# client is stdlib-only and exits 3 when there is no service to ask. Any other
-# non-zero exit means the client itself is broken, and the one-shot path below
-# is the safer answer to that too. KHIPU_RECALL_DAEMON=0 skips it.
+# client is stdlib-only. Exit 3 selects cold fallback; after a connected
+# failure it also supplies the remaining absolute deadline. Exit 4 means
+# the budget is spent. KHIPU_RECALL_DAEMON=0 skips it.
 if [ "${KHIPU_RECALL_DAEMON:-1}" != "0" ] && [ -f "$SELF_DIR/khipu-recall-client.py" ]; then
   OUT=$(printf '%s' "$PAYLOAD" | "$PY" -S -E -B "$SELF_DIR/khipu-recall-client.py" "$SHAPE" 2>/dev/null)
-  if [ $? -eq 0 ]; then
+  STATUS=$?
+  if [ "$STATUS" -eq 0 ] || [ "$STATUS" -eq 4 ]; then
     [ -n "$OUT" ] || OUT='{}'
     printf '%s\n' "$OUT"
     exit 0
   fi
+  if [ "$STATUS" -eq 3 ] && [ -n "$OUT" ]; then
+    KHIPU_RECALL_DEADLINE="$OUT"
+    export KHIPU_RECALL_DEADLINE
+  fi
 fi
 PYTHONPATH="$ROOT/packages/cli:$ROOT/.python_libs${PYTHONPATH:+:$PYTHONPATH}"
+if [ -d "$ROOT/lib" ] && [ -x "$ROOT/python/bin/python3.11" ]; then
+  PYTHONPATH="$ROOT/packages/cli:$ROOT/lib${PYTHONPATH:+:$PYTHONPATH}"
+fi
 export PYTHONPATH
 mkdir -p "${HOME}/Library/Logs/khipu" 2>/dev/null
 # Bytecode cache goes OUTSIDE any signed .app bundle — see khipu.paths.pycache_dir.

@@ -332,13 +332,13 @@ class DoctorOutcomesTest(unittest.TestCase):
         lines = [_log_line(ts, "ok", 500.0) for _ in range(5)]
         self._write(lines)
         out = rp.prompt_recall_outcomes(now=now)
-        self.assertTrue(out["ok"])
+        self.assertFalse(out["ok"])
         self.assertTrue(out["insufficient"])
         self.assertEqual(out["count"], 5)
 
     def test_missing_log_is_insufficient(self) -> None:
         out = rp.prompt_recall_outcomes()
-        self.assertTrue(out["ok"])
+        self.assertFalse(out["ok"])
         self.assertTrue(out["insufficient"])
         self.assertEqual(out["count"], 0)
 
@@ -353,7 +353,7 @@ class DoctorOutcomesTest(unittest.TestCase):
         ]
         self._write(lines)
         out = rp.prompt_recall_outcomes()
-        self.assertTrue(out["ok"])
+        self.assertFalse(out["ok"])
         self.assertTrue(out["insufficient"])
         self.assertEqual(out["count"], 0)
 
@@ -377,7 +377,7 @@ class DoctorOutcomesTest(unittest.TestCase):
         ] * 10
         self._write(lines)
         out = rp.prompt_recall_outcomes(now=now)
-        self.assertEqual(out["count"], 0)
+        self.assertEqual(out["count"], 10)
         self.assertTrue(out["insufficient"])
 
     def test_median_ms_even_and_odd_counts(self) -> None:
@@ -430,7 +430,7 @@ class DoctorOutcomesTest(unittest.TestCase):
         missing = self.tmp / "nope" / "prompt-recall.log"
         with mock.patch.object(rp, "_log_path", return_value=missing):
             out = rp.prompt_recall_outcomes()
-        self.assertTrue(out["ok"])
+        self.assertFalse(out["ok"])
         self.assertTrue(out["insufficient"])
 
 

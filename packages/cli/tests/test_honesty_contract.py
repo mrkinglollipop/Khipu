@@ -217,7 +217,7 @@ class DegradedRateTest(unittest.TestCase):
 
         with mock.patch.object(query_log, "tail", return_value=[]):
             out = query_log.degraded_rate()
-        self.assertTrue(out["ok"])
+        self.assertFalse(out["ok"])
         self.assertEqual(out["sampled"], 0)
 
     def test_over_20_percent_degraded_is_red(self):
