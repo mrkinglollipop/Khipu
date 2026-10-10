@@ -214,7 +214,10 @@ def _iter_files(root: Path, skipped: dict[str, int]) -> Iterator[tuple[str, Path
     def skip(why: str) -> None:
         skipped[why] = skipped.get(why, 0) + 1
 
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    def walk_error(_exc: OSError) -> None:
+        skip("traversal_error")
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=walk_error):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
         for fn in sorted(filenames):
             if fn.startswith(".") or not fn.lower().endswith(EXTENSIONS):
@@ -452,7 +455,11 @@ def set_profile(conn, name: str, profile: str) -> dict[str, Any]:
                 + "; embed them first with `khipu library backfill "
                 f"{name} --profile {profile}`"
             )
-        profiles.ensure_profile_index(cur, profile, "library_embeddings", dim=spec.dim, quiet=True)
+        index = profiles.ensure_profile_index(
+            cur, profile, "library_embeddings", dim=spec.dim, quiet=True
+        )
+        if index is None:
+            raise LibraryError(f"cannot activate {profile!r}: library search index was not created")
         cur.execute("UPDATE library_sources SET profile = %s WHERE name = %s", (profile, name))
     conn.commit()
     return {"ok": True, "name": name, "profile": profile, "previous_profile": src.profile,
@@ -520,14 +527,17 @@ def scan(conn, name: str) -> dict[str, Any]:
             except OSError:
                 skipped["unreadable"] = skipped.get("unreadable", 0) + 1
                 continue
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                skipped["unsupported_encoding"] = skipped.get("unsupported_encoding", 0) + 1
+                continue
             digest = hashlib.sha256(data).hexdigest()
             prior = existing.get(rel)
             if prior and prior[1] == digest:
                 unchanged += 1
                 continue
-            title, author, tags, body = document_metadata(
-                data.decode("utf-8", errors="replace"), rel
-            )
+            title, author, tags, body = document_metadata(text, rel)
             doc_id = _upsert_document(cur, name, rel, title, author, tags, len(data), st, digest)
             if prior:
                 cur.execute("DELETE FROM library_chunks WHERE document = %s", (doc_id,))
@@ -535,7 +545,7 @@ def scan(conn, name: str) -> dict[str, Any]:
             else:
                 added += 1
             rows = []
-            for idx, chunk in embed.chunk_text_indexed(_clean(body)):
+            for idx, chunk in enumerate(embed.chunk_text(_clean(body))):
                 rows.append((doc_id, idx, chunk, _md5(chunk)))
             if rows:
                 cur.executemany(_INSERT_CHUNK, rows)
@@ -543,7 +553,8 @@ def scan(conn, name: str) -> dict[str, Any]:
             if pending >= SCAN_COMMIT_EVERY:
                 conn.commit()
                 pending = 0
-        gone = [existing[rel][0] for rel in existing if rel not in seen]
+        walk_incomplete = bool(skipped.get("traversal_error") or skipped.get("unreadable"))
+        gone = [] if walk_incomplete else [existing[rel][0] for rel in existing if rel not in seen]
         if gone and not seen:
             conn.rollback()
             raise LibraryError(
@@ -556,12 +567,16 @@ def scan(conn, name: str) -> dict[str, Any]:
         cur.execute("UPDATE library_documents SET scanned_at = now() WHERE source = %s", (name,))
         conn.commit()
         counts = _counts(cur, src)
-    return {
-        "ok": True, "source": name, "added": added, "updated": updated,
+    incomplete = walk_incomplete or bool(skipped.get("unsupported_encoding"))
+    out = {
+        "ok": not incomplete, "source": name, "added": added, "updated": updated,
         "removed": len(gone), "unchanged": unchanged,
         "skipped": sum(skipped.values()), "skipped_detail": skipped,
         "documents": counts["documents"], "chunks": counts["chunks"],
     }
+    if incomplete:
+        out["incomplete"] = True
+    return out
 
 
 # ---- backfill -------------------------------------------------------------------
@@ -670,6 +685,10 @@ def backfill(conn, name: str, *, limit: int | None = None, stale: bool = False,
                 profiles.ensure_profile_index(cur, src.profile, "library_embeddings", quiet=True)
                 conn.commit()
         stats["remaining"] = _remaining(cur, src, stale)
+        stats["ok"] = not (stats["remaining"] or stats["failed"]
+                           or stats.get("budget_exhausted") or stats.get("cancelled"))
+        stats["status"] = ("complete" if stats["ok"] else
+                           "failed" if stats["failed"] and not stats["embedded"] else "partial")
     return stats
 
 
@@ -693,6 +712,7 @@ def backfill_all(conn) -> dict[str, Any]:
         out["results"].append(item)
         if budget_out:
             item["skipped"] = "embed budget exhausted"
+            item.update(ok=False, status="partial")
             continue
         try:
             sc = scan(conn, name)
@@ -700,7 +720,13 @@ def backfill_all(conn) -> dict[str, Any]:
             item.update(
                 added=sc["added"], updated=sc["updated"], removed=sc["removed"],
                 embedded=bf["embedded"], failed=bf["failed"], remaining=bf["remaining"],
+                ok=sc["ok"] and bf["ok"],
+                status=bf["status"] if sc["ok"] else "partial",
             )
+            if not sc["ok"]:
+                item["scan"] = sc
+            if not item["ok"]:
+                out["ok"] = False
             budget_out = bool(bf.get("budget_exhausted"))
             if budget_out:
                 item["budget_exhausted"] = True
@@ -710,7 +736,11 @@ def backfill_all(conn) -> dict[str, Any]:
             except Exception:  # noqa: BLE001
                 pass
             item["error"] = f"{type(exc).__name__}: {exc}"
+            item.update(ok=False, status="failed")
             out["ok"] = False
+    out["status"] = ("complete" if out["ok"] else
+                     "partial" if any(r.get("status") != "failed" for r in out["results"])
+                     else "failed")
     return out
 
 
@@ -867,10 +897,11 @@ def import_index(
     path, minus ``strip_prefix``, is not a .txt/.md file under the root),
     ``skipped_corrupt`` (binary-garbage chunk text), ``skipped_bad_vector``
     (wrong length for the profile, or not finite) or ``skipped_bad_row``
-    (malformed), else written. For every document that gets rows, the imported
-    chunks are authoritative: chunks a scan made for the same file under a
-    different window layout are replaced. Idempotent on (document, chunk_idx,
-    profile); streams in batches, never loads the file.
+    (malformed), else written. Existing documents accept only identical chunk
+    identities and text; an import cannot replace their corpus. New documents
+    may be imported under the active profile, but their file hash stays
+    unverified until a scan rebuilds them. Idempotent on (document, chunk_idx,
+    profile); streams in batches, never loads the index file.
     """
     if int(batch) < 1:
         raise LibraryError(f"--batch must be at least 1, got {batch}")
@@ -880,7 +911,7 @@ def import_index(
         raise LibraryError(f"{path!r} is not a file")
     reader = _iter_jsonl(src_path) if src_path.suffix.lower() == ".jsonl" else _iter_sqlite(src_path)
     stats = {"read": 0, "imported": 0, "skipped_corrupt": 0, "skipped_bad_vector": 0,
-             "skipped_bad_row": 0, "unmapped": 0}
+             "skipped_bad_row": 0, "skipped_conflict": 0, "unmapped": 0}
     with conn.cursor() as cur:
         src = get_source(cur, name)
         root = Path(src.root)
@@ -896,14 +927,20 @@ def import_index(
         by_key: dict[tuple[Any, Any], profiles.ProfileSpec] = {}
         used: dict[str, profiles.ProfileSpec] = {}
         eligible: dict[str, Path | None] = {}
+        cur.execute(
+            "SELECT id, rel_path, content_hash FROM library_documents WHERE source = %s", (name,)
+        )
+        existing = {r[1]: (int(r[0]), r[2]) for r in cur.fetchall()}
         doc_ids: dict[str, int] = {}
+        prior_chunks: dict[int, dict[int, str]] = {}
         touched: dict[int, set[int]] = {}
         chunk_rows: list[tuple] = []
         emb_rows: list[tuple] = []
 
         def flush() -> None:
-            if chunk_rows:
-                cur.executemany(_INSERT_CHUNK, chunk_rows)
+            if chunk_rows or emb_rows:
+                if chunk_rows:
+                    cur.executemany(_INSERT_CHUNK, chunk_rows)
                 cur.executemany(_INSERT_EMBEDDING, emb_rows)
                 conn.commit()
                 chunk_rows.clear()
@@ -912,20 +949,26 @@ def import_index(
         def document_for(rel: str, p: Path) -> int | None:
             if rel in doc_ids:
                 return doc_ids[rel]
+            if rel in existing:
+                doc_id = existing[rel][0]
+                cur.execute(
+                    "SELECT chunk_idx, chunk_text FROM library_chunks WHERE document = %s", (doc_id,)
+                )
+                prior_chunks[doc_id] = {int(i): t for i, t in cur.fetchall()}
+                doc_ids[rel] = doc_id
+                return doc_id
             try:
                 data = p.read_bytes()
                 st = p.stat()
-            except OSError:
+                text = data.decode("utf-8")
+            except (OSError, UnicodeDecodeError):
                 return None
-            title, author, tags, _body = document_metadata(
-                data.decode("utf-8", errors="replace"), rel
-            )
+            title, author, tags, _body = document_metadata(text, rel)
             doc_id = _upsert_document(
                 cur, name, rel, title, author, tags, len(data), st,
-                hashlib.sha256(data).hexdigest(),
+                "",  # Imported windows do not prove completeness against the local bytes.
             )
             doc_ids[rel] = doc_id
-            touched[doc_id] = set()
             return doc_id
 
         with profiles.BulkLoad(conn, cur, "library_embeddings") as bulk:
@@ -956,6 +999,9 @@ def import_index(
                 except (TypeError, ValueError):
                     stats["skipped_bad_row"] += 1
                     continue
+                if idx < 0:
+                    stats["skipped_bad_row"] += 1
+                    continue
                 if vec is None:
                     stats["skipped_bad_vector"] += 1
                     continue
@@ -969,28 +1015,29 @@ def import_index(
                 if len(vec) != spec.dim or (dims is not None and dims != len(vec)):
                     stats["skipped_bad_vector"] += 1
                     continue
+                if spec.id != src.profile and rel not in existing:
+                    stats["skipped_conflict"] += 1
+                    continue
                 doc_id = document_for(rel, eligible[rel])
                 if doc_id is None:
                     stats["unmapped"] += 1
                     continue
+                clean = _clean(text)
+                if (doc_id in prior_chunks and prior_chunks[doc_id].get(idx) != clean):
+                    stats["skipped_conflict"] += 1
+                    continue
                 if spec.id not in used:
                     bulk.defer(spec.id, None)  # rows unknown up front
                 used[spec.id] = spec
-                clean = _clean(text)
                 digest = _md5(clean)
-                touched[doc_id].add(idx)
-                chunk_rows.append((doc_id, idx, clean, digest))
+                touched.setdefault(doc_id, set()).add(idx)
+                if doc_id not in prior_chunks:
+                    chunk_rows.append((doc_id, idx, clean, digest))
                 emb_rows.append((spec.id, doc_id, idx, embed._vec_literal(vec), digest))
                 stats["imported"] += 1
-                if len(chunk_rows) >= batch:
+                if len(emb_rows) >= batch:
                     flush()
             flush()
-            # The imported chunks define each document they touched.
-            for doc_id, idxs in touched.items():
-                cur.execute(
-                    "DELETE FROM library_chunks WHERE document = %s AND NOT (chunk_idx = ANY(%s))",
-                    (doc_id, sorted(idxs)),
-                )
             conn.commit()
             for spec in used.values():
                 profiles.ensure_profile_index(
@@ -999,9 +1046,13 @@ def import_index(
             conn.commit()
     ids = sorted(used)
     out: dict[str, Any] = {
-        "ok": True, "source": name, **stats, "documents": len(touched),
+        "ok": not stats["skipped_conflict"], "source": name, **stats, "documents": len(touched),
         "profile": ids[0] if ids else (profile or None), "profiles": ids,
         "source_profile": src.profile,
+        "unverified_documents": sum(
+            1 for rel, doc_id in doc_ids.items() if doc_id in touched
+            and (rel not in existing or not existing[rel][1])
+        ),
     }
     if ids and src.profile not in ids:
         out["note"] = (

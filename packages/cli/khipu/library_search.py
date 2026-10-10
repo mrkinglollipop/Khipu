@@ -15,9 +15,8 @@ relevance gate and rerank untouched:
   through ``embed._query_vec``, so the same ``memory_query_cache`` keyed by
   profile and the same 10 s / 2 retry budget as memory). The SQL repeats the
   profile predicate and the ``embedding::vector(<dim>)`` cast on both sides of
-  ``<=>`` so the per-profile partial HNSW index is used, and takes the
-  nearest ``LIMIT n`` BEFORE joining to documents: a 329k-row library costs an
-  index probe, never a scan.
+  ``<=>``. It uses the per-profile HNSW index when every vector is eligible,
+  otherwise selects exact neighbours from the restricted corpus.
 * **keyword**, three statements. Full-text search over chunk text
   (``tsv @@ plainto_tsquery('simple', q)`` ranked by ``ts_rank``; ``tsv`` is a
   stored generated column with a GIN index, migration 0026) is the main one.
@@ -33,8 +32,8 @@ relevance gate and rerank untouched:
 Every leg fails open. A provider that cannot embed the query (missing key,
 timeout, HTTP error) drops only that profile's cosine list and is named
 ``library_embed:<profile>`` in ``degraded_legs``; literal and lexical still
-run. A hub without the library tables, or a cursor that cannot run these
-statements, simply has no libraries.
+run. A hub without the library tables has no libraries; a failed registry
+lookup reports unavailability.
 
 Row shape (a hit)::
 
@@ -153,9 +152,9 @@ def _row(
 # ---- which libraries ------------------------------------------------------------
 
 
-def enabled_libraries(cur, conn, source: str | None = None) -> list[tuple[str, str]]:
+def enabled_libraries(cur, conn, source: str | None = None) -> list[tuple[str, str]] | None:
     """``[(name, profile)]`` for every enabled library (optionally just
-    ``source``). Empty when the hub has no library tables or the statement
+    ``source``). Empty when the hub has no library tables, None when discovery
     fails; a failure that leaves a Postgres transaction aborted is rolled
     back so the rest of the search keeps working."""
     global _TABLES_SEEN
@@ -179,7 +178,7 @@ def enabled_libraries(cur, conn, source: str | None = None) -> list[tuple[str, s
             conn.rollback()
         except Exception:  # noqa: BLE001
             pass
-        return []
+        return None
 
 
 # ---- cosine leg -----------------------------------------------------------------
@@ -225,17 +224,26 @@ def _ef_search(limit: int) -> int:
     return max(40, min(int(limit), MAX_EF_SEARCH))
 
 
-def cosine_sql(dim: int) -> str:
+def cosine_sql(dim: int, *, filtered: bool = True) -> str:
     """The nearest-neighbour statement for one profile of width ``dim``.
 
-    The inner SELECT is the index-eligible shape: the profile predicate plus
-    ``ORDER BY embedding::vector(<dim>) <=> q::vector(<dim>) LIMIT n``. The
-    join to documents (and the source restriction) happens on those n rows
-    only, so a library sharing its profile with another is filtered after the
-    index scan, never instead of it.
+    Materializing eligible vectors before distance ordering prevents an ANN
+    scan over other sources from exhausting the candidate pool. This is an
+    exact search over the selected corpus.
     """
     v = f"vector({int(dim)})"
+    eligibility = """
+        WITH eligible AS MATERIALIZED (
+            SELECT e.document, e.chunk_idx, e.embedding
+            FROM library_embeddings e
+            JOIN library_documents d ON d.id = e.document
+            WHERE e.profile = %(p)s AND d.source = ANY(%(sources)s)
+        )
+        """ if filtered else ""
+    corpus = "eligible" if filtered else "library_embeddings"
+    predicate = "" if filtered else "WHERE e.profile = %(p)s"
     return f"""
+        {eligibility}
         SELECT d.source, d.id, n.chunk_idx, n.score,
                left(c.chunk_text, %(fetch)s) AS snippet,
                left(c.chunk_text, %(rank_fetch)s) AS rank_src,
@@ -243,14 +251,13 @@ def cosine_sql(dim: int) -> str:
         FROM (
             SELECT e.document, e.chunk_idx,
                    1 - (e.embedding::{v} <=> %(q)s::{v}) AS score
-            FROM library_embeddings e
-            WHERE e.profile = %(p)s
+            FROM {corpus} e
+            {predicate}
             ORDER BY e.embedding::{v} <=> %(q)s::{v}
             LIMIT %(lim)s
         ) n
         JOIN library_documents d ON d.id = n.document
         JOIN library_chunks c ON c.document = n.document AND c.chunk_idx = n.chunk_idx
-        WHERE d.source = ANY(%(sources)s)
         ORDER BY n.score DESC
         LIMIT %(lim)s
         """
@@ -292,6 +299,7 @@ def cosine_lists(
         embed_ms += (time.monotonic() - t0) * 1000
         timing[f"library_embed_cache:{profile}"] = state
         t1 = time.monotonic()
+        filtered = False
         try:
             cur.execute("SAVEPOINT khipu_lib_cos")
             if not indexed:
@@ -301,7 +309,18 @@ def cosine_lists(
             except Exception:  # noqa: BLE001 - no pgvector GUC (scratch DB) is not fatal
                 pass
             cur.execute(
-                cosine_sql(len(qvec)),
+                "SELECT EXISTS (SELECT 1 FROM library_documents d"
+                " JOIN library_embeddings e ON e.document = d.id"
+                " WHERE e.profile = %s AND NOT (d.source = ANY(%s)))",
+                (profile, names),
+            )
+            excluded = cur.fetchone()
+            filtered = not excluded or bool(excluded[0])
+            if filtered and indexed:
+                budget = UNINDEXED_COSINE_TIMEOUT_MS if explicit else LITERAL_TIMEOUT_MS_DEFAULT
+                cur.execute(f"SET LOCAL statement_timeout = {budget}")
+            cur.execute(
+                cosine_sql(len(qvec), filtered=filtered),
                 {"q": em._vec_literal(qvec), "p": profile, "lim": int(limit),
                  "fetch": FETCH_LIMIT, "rank_fetch": CHUNK_CHARS, "sources": names},
             )
@@ -315,7 +334,7 @@ def cosine_lists(
                 ))
             out.append(rows)
         except Exception as exc:  # noqa: BLE001
-            timed_out = not indexed and _is_timeout(exc)
+            timed_out = (not indexed or filtered) and _is_timeout(exc)
             degraded_legs.append(f"library_cosine:{profile}" + (":timeout" if timed_out else ""))
             timing["library_cosine_error"] = f"{profile}: {type(exc).__name__}: {exc}"[:160]
         finally:
@@ -409,7 +428,8 @@ def literal_rows(
 
     t0 = time.monotonic()
     term = (query or "").strip()
-    tokens = search_tokens(term) or ([term] if term else [])
+    lexical_tokens = search_tokens(term)
+    tokens = lexical_tokens or ([term] if term else [])
     if not tokens or not names:
         timing["library_literal_ms"] = 0.0
         return []
@@ -497,6 +517,10 @@ def literal_rows(
         if r["id"] in seen:
             continue
         seen.add(r["id"])
+        if not lexical_tokens:
+            # These rows matched a keyword statement even when the shared
+            # tokenizer cannot represent the query's script or short words.
+            r["lexical_hits"] = 1
         merged.append(r)
     timing["library_literal_ms"] = round((time.monotonic() - t0) * 1000, 1)
     return merged[: int(limit)]
@@ -518,6 +542,10 @@ def library_candidates(
     ``source`` names one library (``ValueError`` when no enabled library has
     that name)."""
     libs = enabled_libraries(cur, conn, source)
+    if libs is None:
+        degraded_legs.append("library:unavailable")
+        timing["library_registry_error"] = "library registry lookup failed"
+        return [], [], []
     if source and not libs:
         raise ValueError(f"no enabled library named {source!r}; see `khipu library list`")
     if not libs:
