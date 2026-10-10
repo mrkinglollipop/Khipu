@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { claudeHomesGap, harnessesBadge, railHealthLine, t3HealthGap } from "../railHealth";
 import type { LivenessPayload } from "../IntegrationsPanel";
 
-const OK: LivenessPayload = { ok: true, red: [], harnesses: { claude_code: { ok: true } } };
+const OK: LivenessPayload = { ok: true, red: [], harnesses: { claude_code: { ok: true, seen: true } } };
 const NONE = { missing: 0, unreadable: 0 };
 const FAILED = { missing: 0, unreadable: 0, checkFailed: true };
 
@@ -44,6 +44,35 @@ describe("railHealthLine", () => {
     expect(railHealthLine(true, OK, NONE)).toEqual({ tone: "ok", text: "All harnesses recording" });
   });
 
+  it("does not call an explicitly failed liveness read healthy when it has no red rows", () => {
+    expect(railHealthLine(true, { ok: false, red: [], harnesses: {} }, NONE)).toEqual({
+      tone: "err",
+      text: "Couldn't check recording",
+    });
+  });
+
+  it("treats an error-bearing liveness payload as failed collection evidence", () => {
+    expect(railHealthLine(true, { ok: true, red: [], harnesses: {}, error: "hub unavailable" } as never, NONE)).toEqual({
+      tone: "err",
+      text: "Couldn't check recording",
+    });
+  });
+
+  it("does not call unseen or absent harness evidence healthy", () => {
+    expect(railHealthLine(true, { ok: true, red: [], harnesses: {} }, NONE)).toEqual({
+      tone: "warn",
+      text: "Recording not checked",
+    });
+    expect(railHealthLine(true, { ok: true, red: [], harnesses: { claude_code: { ok: true, seen: false } } }, NONE).tone).toBe("warn");
+  });
+
+  it("keeps named red evidence ahead of a false aggregate verdict", () => {
+    expect(railHealthLine(true, { ok: false, red: ["claude_code"], harnesses: {} }, NONE)).toEqual({
+      tone: "err",
+      text: "1 harness not recording",
+    });
+  });
+
   it("warns instead of reading green while a found Claude home is not installed", () => {
     expect(railHealthLine(true, OK, { missing: 1, unreadable: 0 })).toEqual({
       tone: "warn",
@@ -56,6 +85,17 @@ describe("railHealthLine", () => {
     expect(railHealthLine(true, OK, { missing: 0, unreadable: 1 })).toEqual({
       tone: "warn",
       text: "1 Claude home can't be read",
+    });
+  });
+
+  it("keeps known Claude-home and T3 warnings ahead of generic unproved harness state", () => {
+    expect(railHealthLine(true, { ok: true, red: [], harnesses: {} }, { missing: 1, unreadable: 0 })).toEqual({
+      tone: "warn",
+      text: "1 Claude home not installed",
+    });
+    expect(railHealthLine(true, { ok: true, red: [], harnesses: {} }, NONE, { warning: true, lookupFailed: false })).toEqual({
+      tone: "warn",
+      text: "T3 needs a linked capture",
     });
   });
 
@@ -98,6 +138,12 @@ describe("harnessesBadge", () => {
   it("flags attention when the Claude homes check failed", () => {
     expect(harnessesBadge(OK, FAILED)).toEqual({ n: 1, quiet: false });
     expect(harnessesBadge({ ...OK, red: ["a", "b"] }, FAILED)).toEqual({ n: 2, quiet: false });
+  });
+
+  it("flags attention when liveness collection carries an error", () => {
+    expect(
+      harnessesBadge({ ...OK, error: "hub unavailable" } as never, NONE),
+    ).toEqual({ n: 1, quiet: false });
   });
 });
 
