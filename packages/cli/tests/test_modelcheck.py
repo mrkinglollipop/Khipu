@@ -140,7 +140,7 @@ class GenerateCheckHttpMappingTest(unittest.TestCase):
     def test_gemini_success(self):
         resp = mock.MagicMock()
         resp.status = 200
-        resp.read.return_value = b'{"candidates": []}'
+        resp.read.return_value = b'{"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}'
         resp.__enter__.return_value = resp
         result = self._run_gemini(urlopen_side_effect=lambda *a, **k: resp)
         self.assertTrue(result["ok"])
@@ -189,7 +189,7 @@ class GenerateCheckHttpMappingTest(unittest.TestCase):
         # of a bearer must not gate whether the check runs.
         resp = mock.MagicMock()
         resp.status = 200
-        resp.read.return_value = b'{"choices": []}'
+        resp.read.return_value = b'{"choices": [{"message": {"content": "ok"}}]}'
         resp.__enter__.return_value = resp
         result = self._run_openai(urlopen_side_effect=lambda *a, **k: resp, bearer=None)
         self.assertTrue(result["ok"])

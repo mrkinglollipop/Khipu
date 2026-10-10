@@ -262,20 +262,24 @@ def list_profiles(cur) -> list[dict[str, Any]]:
             "id": pid, "provider": provider, "model": model, "dim": int(dim),
             "normalize": norm, "endpoint": endpoint or None, "is_active": bool(active),
             "rows": {"memory": spaces.get("memory", 0), "library": spaces.get("library", 0)},
-            "index": _index_status(pid, int(dim), spaces, present),
+            "index": _index_status(cur, pid, int(dim), spaces, present),
         })
     return out
 
 
-def _index_status(profile: str, dim: int, spaces: dict[str, int], present: set[str]) -> dict[str, str]:
+def _index_status(cur, profile: str, dim: int, spaces: dict[str, int], present: set[str]) -> dict[str, str]:
     """Per space that has rows: ``present``, or what to run when the HNSW index
     is missing. A space with no rows needs none and is left out."""
     out: dict[str, str] = {}
     for space, table in (("memory", "memory_embeddings"), ("library", "library_embeddings")):
         if not spaces.get(space):
             continue
-        if profile_index_name(profile, table) in present:
+        name = profile_index_name(profile, table)
+        legacy = _LEGACY_INDEX.get((table, profile))
+        if name in present and (not legacy or _legacy_index_matches(cur, profile, table, dim)):
             out[space] = "present"
+        elif name in present and legacy:
+            out[space] = "missing (legacy index definition is invalid; rebuild it)"
         elif dim > MAX_INDEXED_DIM:
             out[space] = f"unavailable (dim {dim} is above pgvector's {MAX_INDEXED_DIM} limit)"
         else:
@@ -308,11 +312,43 @@ def profile_index_name(profile: str, table: str = "library_embeddings") -> str:
         return legacy
     safe = re.sub(r"[^a-z0-9_]+", "_", profile.lower()).strip("_") or "profile"
     name = f"{_INDEX_PREFIX[table]}{safe}"
-    # An id that is not the model@dim shape (an old row, a hand-made one) can
-    # sanitise to the same text as another; a hash of the raw id keeps them apart.
-    if len(name) > 60 or not _ID_RE.match(profile):
-        name = f"{name[:50]}_{hashlib.sha1(profile.encode()).hexdigest()[:9]}"
-    return name
+    # Every non-legacy name carries the raw-id hash: valid ids such as
+    # ``a-b@768`` and ``a_b@768`` otherwise sanitize to the same identifier.
+    # Existing generic indexes remain untouched and are rebuilt lazily under
+    # their collision-proof name.
+    return f"{name[:53]}_{hashlib.sha1(profile.encode()).hexdigest()[:9]}"
+
+
+def _legacy_indexdef(cur, name: str) -> str | None:
+    cur.execute(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = %s",
+        (name,),
+    )
+    row = cur.fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
+def _legacy_index_matches(cur, profile: str, table: str, dim: int, *, indexdef: str | None = None) -> bool:
+    """Whether one retained seed index has the expected expression and predicate."""
+    name = _LEGACY_INDEX.get((table, profile))
+    if name is None:
+        return True
+    definition = indexdef if indexdef is not None else _legacy_indexdef(cur, name)
+    if not definition:
+        return False
+    normalized = re.sub(r"\s+", " ", definition.replace('"', "").lower())
+    literal = re.escape(profile.lower().replace("'", "''"))
+    return (
+        re.search(rf"\bon\s+(?:public\.)?{re.escape(table)}\b", normalized) is not None
+        and re.search(
+            rf"\busing\s+hnsw\s*\(\s*\(*embedding\)*\s*::\s*vector\(\s*{int(dim)}\s*\)"
+            r"\s*\)*\s+vector_cosine_ops\s*\)", normalized,
+        ) is not None
+        and re.search(
+            rf"\bwhere\s*\(*\s*profile\s*=\s*'{literal}'\s*(?:::\s*text)?\s*\)*\s*;?\s*$",
+            normalized,
+        ) is not None
+    )
 
 
 def library_index_name(profile: str) -> str:
@@ -371,6 +407,13 @@ def ensure_profile_index(
             f"on vector(n); {dim} would need halfvec"
         )
     name = profile_index_name(profile, table)
+    legacy = _LEGACY_INDEX.get((table, profile))
+    if legacy:
+        indexdef = _legacy_indexdef(cur, name)
+        if indexdef is not None:
+            if _legacy_index_matches(cur, profile, table, dim, indexdef=indexdef):
+                return name
+            raise RuntimeError(f"legacy index {name} does not match {profile} on {table}; rebuild it")
     cur.execute(
         "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = %s", (name,)
     )
@@ -418,6 +461,10 @@ def drop_profile_index(cur, profile: str, table: str) -> str | None:
     if table not in INDEXED_TABLES:
         raise ValueError(f"no per-profile index for table {table!r}")
     name = profile_index_name(profile, table)
+    if (table, profile) in _LEGACY_INDEX:
+        indexdef = _legacy_indexdef(cur, name)
+        if indexdef is None or not _legacy_index_matches(cur, profile, table, cached_spec(profile).dim if cached_spec(profile) else 0, indexdef=indexdef):
+            return None
     cur.execute(
         "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = %s", (name,)
     )
@@ -594,8 +641,12 @@ def delete_profile(cur, profile: str) -> dict[str, Any]:
             continue
         cur.execute(f"DELETE FROM {table} WHERE profile = %s", (profile,))
         deleted[key] = int(cur.rowcount or 0)
-    indexes = [profile_index_name(profile, t) for t in INDEXED_TABLES]
-    for name in indexes:
+    indexes = []
+    for table in INDEXED_TABLES:
+        name = profile_index_name(profile, table)
+        if (table, profile) in _LEGACY_INDEX and not _legacy_index_matches(cur, profile, table, spec.dim):
+            continue
+        indexes.append(name)
         _drop_index_quiet(cur, name)
     cur.execute("DELETE FROM embedding_profiles WHERE id = %s", (profile,))
     with _LOCK:
