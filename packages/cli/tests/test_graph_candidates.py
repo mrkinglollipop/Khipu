@@ -144,3 +144,19 @@ def test_no_topic_or_episode_seeds_is_a_no_op():
     )
     assert missed is False
     assert candidates == []
+
+
+def test_slug_prefilter_word_is_always_a_whole_word_of_the_label():
+    from khipu import graph_candidates as gc
+    from khipu.topic_graph import topic_slug_from_label
+
+    for label in ("Khipu in T3 Code", "UI-bug", "x" * 79 + " tail", "a b", "desktop_app/v2", "É clair"):
+        slug = topic_slug_from_label(label)
+        word = gc._slug_prefilter_word(slug)
+        assert word == "" or word in label.lower(), (label, slug, word)
+    # A slug cut at 80 characters may end mid-word: that last word is never used.
+    long_label = "alpha " + "b" * 90
+    slug = topic_slug_from_label(long_label)
+    assert len(slug) == 80 and gc._slug_prefilter_word(slug) == "alpha"
+    # One 80-character word could be a fragment: no prefilter at all.
+    assert gc._slug_prefilter_word("c" * 80) == ""

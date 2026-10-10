@@ -319,6 +319,24 @@ def _replica_episode_topics(con, episode_id: str, *, seed_rank: int, seed_key: s
     return out
 
 
+def _slug_prefilter_word(slug: str) -> str:
+    """The longest word of ``slug`` that is certain to appear in its label.
+
+    A slug is cut at 80 characters, so its last word may be a fragment of the
+    label's; any earlier word is whole. LIKE wildcards cannot occur: a slug
+    holds only a-z, 0-9 and "-"."""
+    from khipu import topic_graph
+
+    words = [w for w in slug.split("-") if w]
+    if len(slug) >= 80 and len(words) > 1:
+        words = words[:-1]
+    elif len(slug) >= 80:
+        return ""
+    if topic_graph.topic_slug_from_label(slug) != slug:
+        return ""
+    return max(words, key=len, default="")
+
+
 def _replica_topic_recent_episodes(con, slug: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
     from khipu.hub_snapshot import _snapshot_table_columns
     from khipu import topic_graph
@@ -330,11 +348,21 @@ def _replica_topic_recent_episodes(con, slug: str, *, seed_rank: int, seed_key: 
     con.create_function("khipu_topic_slug", 1, topic_graph.topic_slug_from_label)
     ep_cols = _snapshot_table_columns(con, "episodes")
     live = "e.deleted_at IS NULL AND " if "deleted_at" in ep_cols else ""
+    # Calling back into Python for every topic of every episode was the single
+    # largest cost of a per-prompt recall (about 64,000 calls, a third of the
+    # search) and pushed it past its budget on a busy Mac. A slug is its label
+    # lowercased with runs of other characters turned into "-", so every whole
+    # word of the slug is in the label as written: let SQLite's own LIKE (which
+    # ignores ASCII case) discard the episodes that cannot match first. (The
+    # two non-ASCII letters that lowercase into ASCII, the Kelvin sign and the
+    # dotted capital I, are the only labels this could miss.)
+    word = _slug_prefilter_word(slug)
+    prefilter, params = ("e.topics LIKE ? AND ", [f"%{word}%"]) if word else ("", [])
     rows = con.execute(
         f"SELECT e.id, e.ts, e.summary FROM episodes e, json_each(e.topics) je "
-        f"WHERE {live}khipu_topic_slug(je.value) = ? "
+        f"WHERE {live}{prefilter}khipu_topic_slug(je.value) = ? "
         f"ORDER BY e.ts DESC LIMIT ?",
-        (slug, PER_SEED_CAP),
+        (*params, slug, PER_SEED_CAP),
     ).fetchall()
     out = []
     for eid, ts, summary in rows:

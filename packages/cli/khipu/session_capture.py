@@ -1131,6 +1131,28 @@ def _release(claimed: Path) -> None:
         pass
 
 
+def _claimant_gone(claimed: Path) -> bool:
+    """True only when the pid in a claim's name certainly no longer exists.
+
+    A harness that kills its Stop hook at the timeout takes the inline drain
+    with it, and the claim then held the job for CLAIM_STALE_S with nobody
+    working on it. Anything short of "no such process" (a pid we may not
+    signal, a name we cannot parse) keeps the claim until it ages out."""
+    try:
+        pid = int(claimed.name.rsplit(".", 1)[-1])
+    except ValueError:
+        return False
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _reclaim_stale() -> int:
     """A drain that died mid-job leaves a .claimed file; give it back."""
     n = 0
@@ -1138,7 +1160,7 @@ def _reclaim_stale() -> int:
     try:
         for c in queue_dir().glob("*.claimed.*"):
             try:
-                if now - c.stat().st_mtime > CLAIM_STALE_S:
+                if now - c.stat().st_mtime > CLAIM_STALE_S or _claimant_gone(c):
                     _release(c)
                     n += 1
             except OSError:
