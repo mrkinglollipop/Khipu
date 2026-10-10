@@ -209,9 +209,10 @@ def replica(tmp_path, monkeypatch):
                                        ({'t3_thread':THREAD,'via':'t3'},{'1'}), ({'t3_thread':'absent'},set())])
 def test_replica_filters_before_candidate_limit(replica, filters, ids):
     assert {r['id'] for r in hs.search_snapshot('recall', 5, **filters)} == ids
-    with mock.patch.object(hs, 'local_embed_configured', return_value=True), \
-         mock.patch('khipu.models.show_models', return_value={'embed':{'endpoint':'fixture','model_id':'fixture'}}), \
-         mock.patch.object(hs, '_embed_query_local', return_value=[1.,0.]):
+    from khipu.profiles import ProfileSpec
+    spec = ProfileSpec('test', 'openai-compatible', 'test', 2, endpoint='http://127.0.0.1:9999')
+    with mock.patch.object(hs, 'active_snapshot_profile_spec', return_value=spec), \
+         mock.patch('khipu.embed.embed_one', return_value=[1.,0.]):
         assert {r['id'] for r in hs.semantic_search_snapshot('recall', limit=5, **filters)} == ids
 
 
@@ -432,9 +433,10 @@ def test_replica_without_raw_fails_closed(replica):
 def test_stale_semantic_graph_respects_thread(replica):
     def graph(con, rows):
         return [*rows, {'kind':'episode','id':'99','snippet':'recall'}], []
-    with mock.patch.object(hs,'local_embed_configured',return_value=True), \
-         mock.patch('khipu.models.show_models',return_value={'embed':{'endpoint':'fixture','model_id':'fixture'}}), \
-         mock.patch.object(hs,'_embed_query_local',return_value=[1.,0.]), \
+    from khipu.profiles import ProfileSpec
+    spec = ProfileSpec('test', 'openai-compatible', 'test', 2, endpoint='http://127.0.0.1:9999')
+    with mock.patch.object(hs,'active_snapshot_profile_spec',return_value=spec), \
+         mock.patch('khipu.embed.embed_one',return_value=[1.,0.]), \
          mock.patch.object(hs,'_graph_candidates_snapshot',side_effect=graph):
         out=hs.search_stale_payload('recall',5,semantic=True,t3_thread=THREAD,via='t3')
     assert [r['id'] for r in out['results']] == ['1']
