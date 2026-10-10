@@ -142,7 +142,7 @@ export function ComponentsPanel({ active }: { active: boolean }) {
                 confidently reported a version nobody was running (audit
                 2026-09-04). Tauri's getVersion() is the fallback. */}
             Upgrade the desktop app from Settings → Updates. Version:{" "}
-            <code>{cliVersion ?? appVersion ?? "…"}</code>
+            <code className="nowrap">{cliVersion ?? appVersion ?? "…"}</code>
           </p>
         </div>
       </div>
@@ -160,14 +160,14 @@ export function ComponentsPanel({ active }: { active: boolean }) {
           {pgRemote ? (
             <p className="muted">
               Remote mode — image tag not tracked locally. Server:{" "}
-              <code>{pg?.server_version ?? "?"}</code>, pgvector{" "}
-              <code>{pg?.pgvector ?? "?"}</code>.
+              <code className="nowrap">{pg?.server_version ?? "?"}</code>, pgvector{" "}
+              <code className="nowrap">{pg?.pgvector ?? "?"}</code>.
             </p>
           ) : pg?.image ? (
             <p className="muted">
               Local Docker image <code>{pg.image}</code>
               {pg.port ? <> on port <code>{pg.port}</code></> : null}
-              {pg.pgvector ? <> · pgvector <code>{pg.pgvector}</code></> : null}
+              {pg.pgvector ? <> · pgvector <code className="nowrap">{pg.pgvector}</code></> : null}
             </p>
           ) : postgresProbe && postgresProbe.ok === false ? (
             <p className="muted">
@@ -183,7 +183,7 @@ export function ComponentsPanel({ active }: { active: boolean }) {
           <div className="toolbar">
             <button
               type="button"
-              className="primary"
+              className={pgUp?.available ? "primary" : undefined}
               disabled={
                 busy != null ||
                 pgRemote ||
@@ -209,11 +209,11 @@ export function ComponentsPanel({ active }: { active: boolean }) {
           {gyExternal ? (
             <p className="muted">
               External Graphify install — <code>{gy?.path ?? "?"}</code> (managed outside
-              the app; upgrades via the maintainer tree).
+              the app; upgrade it where you installed it).
             </p>
           ) : gy?.semver ? (
             <p className="muted">
-              Installed <code>{gy.semver}</code>
+              Installed <code className="nowrap">{gy.semver}</code>
               {gy.path ? (
                 <>
                   {" "}
@@ -228,7 +228,7 @@ export function ComponentsPanel({ active }: { active: boolean }) {
             <div className="toolbar">
               <button
                 type="button"
-                className="primary"
+                className={gyUp?.available ? "primary" : undefined}
                 disabled={busy != null || !gyUp?.available || !gy?.semver}
                 onClick={() => void runUpgrade("graphify")}
               >

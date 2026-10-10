@@ -3,6 +3,7 @@ import { Check, Loader2, Minus, RefreshCw, TriangleAlert, X } from "lucide-react
 import { WorkingBanner } from "./WorkingBanner";
 import { Callout, Tag } from "./ui";
 import { GatewayTokenCard } from "./SettingsControls";
+import { fmtAge } from "./time";
 import type { Tone } from "./ui";
 
 /**
@@ -222,14 +223,6 @@ function CheckMark({ mark }: { mark: Mark }) {
   return <Minus size={14} className={cls} aria-hidden />;
 }
 
-function fmtAge(s: number | null | undefined): string {
-  if (s == null) return "an unknown time";
-  if (s < 90) return `${Math.round(s)}s`;
-  if (s < 5400) return `${Math.round(s / 60)} min`;
-  if (s < 172800) return `${Math.round(s / 3600)} h`;
-  return `${Math.round(s / 86400)} days`;
-}
-
 export function t3CardStatus(t3: T3Health): CardStatus {
   if (t3.lookup?.ok === false) return { tone: "warn", label: "Not linking threads" };
   if ((t3.warnings ?? []).length > 0) return { tone: "warn", label: "Needs a linked capture" };
@@ -360,12 +353,15 @@ export function homeChecks(h: ClaudeHomeRow): { hooks: Mark; memoryTools: Mark; 
  *   N homes not installed / can't be read — Claude Code is in some homes it
  *                   found, not all.
  *   Recording     — the heartbeat shows a capture landing.
- *   Reachable     — the gateway answered (Grok Bot, which has no local hook).
+ *   Reachable     — the gateway answered this session (Grok Bot, which has no
+ *                   local hook). Its stored probe is a local recall check, so
+ *                   it only says the gateway has not been checked yet.
  *  Anything else is "no evidence yet", which is neither a pass nor a failure. */
 export function cardStatus(
   row: StatusRow,
   lv: HarnessLiveness | undefined,
   gatewayProbe: Probe | undefined,
+  stored?: RecallProbeStatus | null,
 ): CardStatus {
   if (!row.detected) return { tone: "neutral", label: "Not on this Mac" };
   if (row.harness === "grok_bot") {
@@ -375,6 +371,12 @@ export function cardStatus(
     if (gatewayProbe?.ok === true) return { tone: "ok", label: "Reachable" };
     if (gatewayProbe && gatewayProbe.ok === false) {
       return { tone: "err", label: "Not reachable" };
+    }
+    // The stored probe is a local recall round trip; it never touches the
+    // gateway, so it cannot say Reachable or Not reachable.
+    const own = stored?.harnesses?.[row.harness];
+    if (own?.ts && own.status !== "skipped") {
+      return { tone: "neutral", label: "Gateway not checked yet" };
     }
     return { tone: "neutral", label: "Not checked yet" };
   }
@@ -971,7 +973,7 @@ export function IntegrationsPanel({
           const status =
             justAutoVerified && homesNotInstalled(r) === 0 && homesUnreadable(r) === 0
               ? { tone: "ok" as const, label: "Verified" }
-              : cardStatus(r, lv, v?.components?.mcp);
+              : cardStatus(r, lv, v?.components?.mcp, recallProbe);
           const installed = r.harness === "grok_bot" ? r.mcp : installedAnywhere(r);
           // Grok Bot has nothing local to install, so Verify ("Probe gateway")
           // is what its card offers instead — gated on detection, not on the
@@ -1168,7 +1170,7 @@ export function IntegrationsPanel({
                   card turns green by itself.
                 </div>
               ) : r.harness === "grok_bot" ? (
-                <div className="note" title={WHERE[r.harness]}>
+                <div className="note wrap" title={WHERE[r.harness]}>
                   One install per repo Grok Bot works in; the token lives in Cursor
                   cloud secrets, never in the repo.
                 </div>
@@ -1218,6 +1220,13 @@ export function IntegrationsPanel({
                         type="button"
                         className="sm link push"
                         disabled={busy != null || !installed}
+                        title={
+                          installed
+                            ? undefined
+                            : r.harness === "grok_bot"
+                              ? "Nothing to remove: Khipu keeps no per-repo pin for Grok Bot on this Mac"
+                              : "Nothing to remove: Khipu is not installed here"
+                        }
                         onClick={() => void act(r.harness, "uninstall")}
                       >
                         Remove

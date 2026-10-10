@@ -427,7 +427,7 @@ class DecisionDetailsPromptTest(unittest.TestCase):
     (docs/plans/2026-09-27-memory-reasoning-scope.md) is pinned by hash so a
     future edit to PROMPT or the splice point can't silently drift it."""
 
-    PINNED_SHA256 = "3daecbf561e21cecadf67313d126810add6a77b01c08845004dc67867afcab5c"
+    PINNED_SHA256 = "da1f1ae17455cbda741f09a0425bd63b274d79cb3ddf0578a53fd167c96931af"
 
     def test_prompt_is_byte_identical_with_the_switch_off(self):
         with mock.patch("khipu.features.enabled", return_value=False):

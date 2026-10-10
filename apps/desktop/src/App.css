@@ -12,7 +12,7 @@
   --border-strong: #d5d0c8;
   --text: #201d1a;
   --text-2: #55504a;
-  --muted: #8a847c;
+  --muted: #6e6860;
   --accent: #a63a1e;
   --accent-hover: #8f2f16;
   --accent-text: #8c2d14;
@@ -109,6 +109,30 @@ body,
   margin: 0;
   height: 100%;
   background: var(--bg);
+}
+
+/* The window is a fixed frame: only panes inside it scroll. Without this the
+   webview rubber-bands the whole document on a sideways trackpad swipe even
+   though nothing overflows (reported 2026-10-10). */
+html,
+body {
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+/* Every pane that scrolls down (`overflow-y: auto`) is a sideways scroller too
+   as far as the webview is concerned, and bounces on a sideways swipe with
+   nothing to scroll to. Not inherited, so it is set on everything. */
+* {
+  overscroll-behavior-x: none;
+}
+
+a {
+  color: var(--accent-text);
+}
+
+code.nowrap {
+  white-space: nowrap;
 }
 
 code {
@@ -326,7 +350,10 @@ button.rail-feedback {
      *within*: a step taller than the 1100x720 window (Model, Finish) then
      has its bottom nav pushed off the fixed-size native window with no way
      to reach it (2026-09-05 pixel-pass finding 4). Bounding both dimensions
-     to the grid track makes `.main` the actual scroll container. */
+     to the grid track makes `.main` the actual scroll container. It is also
+     the containing block for absolutely positioned descendants (`.sr-only`);
+     without one they escape its overflow clip and grow the document. */
+  position: relative;
   min-height: 0;
   height: 100%;
   overflow-y: auto;
@@ -579,6 +606,13 @@ input.mono {
   cursor: pointer;
 }
 
+.radio-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
 .toolbar input.hops-input {
   width: 56px;
   flex: none;
@@ -728,6 +762,13 @@ button.id-chip:hover {
   font-size: 11px;
   color: var(--muted);
   white-space: nowrap;
+}
+
+/* A sentence, not a value: wraps beside its label instead of crushing it. */
+.row-meta.wrap {
+  flex: 0 1 70%;
+  white-space: normal;
+  text-align: right;
 }
 
 .edge-arrow {
@@ -1936,7 +1977,7 @@ button.row.on {
 
 /* Remaining Owed / Activity column widths, from the mocks. */
 .w50 {
-  width: 50px;
+  width: 56px;
   flex: none;
 }
 
@@ -1945,8 +1986,8 @@ button.row.on {
   flex: none;
 }
 
-.w96 {
-  width: 96px;
+.w128 {
+  width: 128px;
   flex: none;
 }
 
@@ -1954,13 +1995,13 @@ button.row.on {
    label truncates and the full name stays in the pill's title. Found on the
    Owed table's project pill ("Claude Code session" ran over the Opened
    column, screenshot pass 2026-09-05). */
-.w96,
+.w128,
 .w88 {
   min-width: 0;
   overflow: hidden;
 }
 
-.w96 .tag,
+.w128 .tag,
 .w88 .tag {
   display: inline-block;
   max-width: 100%;
@@ -2090,6 +2131,67 @@ button.row.on {
   gap: 6px;
   flex-wrap: nowrap;
   justify-content: flex-end;
+}
+
+/* The commitment text is the point of the row: it takes whatever the fixed
+   columns leave and wraps to two lines instead of cutting at one. */
+.owed-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+/* Under ~1040px the six fixed columns leave the text under 150px, so the row
+   stacks: text on its own line, the columns beneath it. */
+@media (max-width: 1040px) {
+  .owed-head {
+    display: none;
+  }
+  .card .owed-row {
+    flex-wrap: wrap;
+    row-gap: var(--s1);
+  }
+  .owed-text {
+    order: -1;
+    flex: 1 1 100%;
+  }
+  .owed-seen {
+    order: 1;
+  }
+  .card .owed-row .acts-cell {
+    order: 2;
+    margin-left: auto;
+  }
+}
+
+/* Activity rows and the two list/detail splits give the summary a line of its
+   own once the list column is under ~450px; the detail pane gives up 60px. */
+@media (max-width: 1180px) {
+  .split {
+    grid-template-columns: minmax(0, 1fr) 300px;
+  }
+  button.row.act-row {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+  .act-row .act-sum {
+    flex: 1 1 100%;
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+}
+
+/* A card header that names a thing ("Episode 17961") is a title, not a
+   column label. */
+.card-head .head-title {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: var(--t-md);
+  color: var(--text);
 }
 
 /* ---------------------------------------------------------------------------
@@ -2432,6 +2534,15 @@ button.t3-detail {
   font-weight: 600;
 }
 
+@media (max-width: 1040px) {
+  .settings-split {
+    gap: var(--s4);
+  }
+  .subnav {
+    width: 148px;
+  }
+}
+
 .settings-pane {
   display: flex;
   flex-direction: column;
@@ -2761,9 +2872,9 @@ input.switch:disabled {
 .emb-q b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
 .emb-cov {
   display: grid;
-  /* The bar column is the only one allowed to shrink, so the count and the
-     tag keep their full width inside a narrow settings card. */
-  grid-template-columns: minmax(4.5rem, max-content) minmax(4rem, 1fr) max-content max-content;
+  /* Fixed side columns so the bars line up from card to card; the bar column
+     is the only one allowed to shrink. */
+  grid-template-columns: 8.5rem minmax(4rem, 1fr) 10.5rem 8.5rem;
   align-items: center;
   column-gap: var(--s3);
   row-gap: var(--s1);
