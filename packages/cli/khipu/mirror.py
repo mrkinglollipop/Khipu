@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -106,7 +107,56 @@ def topic_content_hash(text: str) -> str:
     translated hash the checker refused to match. Decoded text is canonical
     here because Postgres already holds the writer's hashes.
     """
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    # Hash the exact canonical form every persistence reader uses. This also
+    # keeps direct note dictionaries (which hash their full source text before
+    # _upsert_topic) concordant with file drift after secret masking.
+    from khipu.redact import redact_secrets
+
+    canonical = redact_secrets(text)[0]
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _redact_free_text(value: Any) -> tuple[Any, int]:
+    """Return a recursively redacted copy of JSON-like free text."""
+    from khipu.redact import redact_secrets
+
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, list):
+        out, total = [], 0
+        for item in value:
+            clean, count = _redact_free_text(item)
+            out.append(clean)
+            total += count
+        return out, total
+    if isinstance(value, dict):
+        out, total = {}, 0
+        for key, item in value.items():
+            clean, count = _redact_free_text(item)
+            out[key] = clean
+            total += count
+        return out, total
+    return deepcopy(value), 0
+
+
+def _topic_path_allowed(path: Path) -> bool:
+    """Constrain configured-memory reads to canonical topic files."""
+    try:
+        from khipu.config import path_setting
+
+        root = path_setting("memory_root")
+    except Exception:  # noqa: BLE001 - an absent config keeps trusted callers usable
+        root = None
+    if root is None:
+        return True
+    if path.suffix != ".md" or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*\.md", path.name):
+        return False
+    try:
+        topics = (Path(root) / "topics").resolve(strict=True)
+        resolved = path.resolve(strict=True)
+        return resolved.parent == topics and resolved.is_file()
+    except (OSError, RuntimeError):
+        return False
 
 
 def read_topic_text(path: Path) -> str | None:
@@ -117,12 +167,15 @@ def read_topic_text(path: Path) -> str | None:
     list tombstones it, and a tombstone removes the topic from search, from
     MEMORY.md, and (via embed.backfill) deletes its vectors.
     """
-    if not path.is_file():
+    if not _topic_path_allowed(path) or not path.is_file():
         return None
     try:
-        return path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
+    from khipu.redact import redact_secrets
+
+    return redact_secrets(text)[0]
 
 
 def parse_topic_file(path: Path) -> dict[str, Any] | None:
@@ -211,11 +264,21 @@ def _upsert_topic(
     ``[]``. Then mints Khipu-owned ``topic:`` / ``path:`` edges unless
     ``sync_graph`` is false (dry-run callers that persist graph separately).
     """
-    links = list(parsed.get("links") or [])
-    frontmatter = parsed.get("frontmatter")
+    # This is the persistence boundary: callers such as notes can construct a
+    # topic dict directly without going through read_topic_text().
+    safe = deepcopy(parsed)
+    for key in ("title", "body", "frontmatter"):
+        if key in safe:
+            safe[key], _ = _redact_free_text(safe[key])
+    safe_note, _ = _redact_free_text(note)
+    # `digest` is already canonical full-source text: parse_topic_file hashes
+    # read_topic_text and notes._note_topic_dict calls topic_content_hash on
+    # its full file. Rehashing only `body` here would create perpetual drift.
+    links = list(safe.get("links") or [])
+    frontmatter = safe.get("frontmatter")
     if not isinstance(frontmatter, dict):
-        frontmatter = {"title": parsed["title"], "status": parsed["status"], "links": links}
-    cur.execute("SELECT content_hash FROM topics WHERE slug = %s", (parsed["slug"],))
+        frontmatter = {"title": safe["title"], "status": safe["status"], "links": links}
+    cur.execute("SELECT content_hash FROM topics WHERE slug = %s", (safe["slug"],))
     prev = cur.fetchone()
     # W5.3/R7: a topic's own frontmatter created/last_updated (when
     # parseable) is the freshness signal, not "whenever mirror last ran" —
@@ -226,9 +289,9 @@ def _upsert_topic(
     # never blanked, on conflict (COALESCE keeps the existing value when
     # this write's frontmatter carries none).
     file_mtime = _file_mtime_iso(source_path)
-    updated_at_val = parsed.get("updated_at") or file_mtime
-    event_at_val = parsed.get("event_at") or file_mtime
-    created_at_val = parsed.get("created_at")
+    updated_at_val = safe.get("updated_at") or file_mtime
+    event_at_val = safe.get("event_at") or file_mtime
+    created_at_val = safe.get("created_at")
     cur.execute(
         """
         INSERT INTO topics
@@ -251,30 +314,30 @@ def _upsert_topic(
           deleted_at = NULL
         """,
         (
-            parsed["slug"],
-            parsed["title"],
-            parsed["body"],
-            parsed["status"],
+            safe["slug"],
+            safe["title"],
+            safe["body"],
+            safe["status"],
             updated_at_val,
             json.dumps(frontmatter, ensure_ascii=False),
             json.dumps(links, ensure_ascii=False),
             source_path,
-            parsed["digest"],
+            safe["digest"],
             created_at_val,
             event_at_val,
         ),
     )
-    changed = prev is None or prev[0] != parsed["digest"]
+    changed = prev is None or prev[0] != safe["digest"]
     if changed:
         cur.execute(
             """
             INSERT INTO topic_revisions (slug, body, source, note, content_hash)
             VALUES (%s, %s, %s, %s, %s)
             """,
-            (parsed["slug"], parsed["body"], source, note, parsed["digest"]),
+            (safe["slug"], safe["body"], source, safe_note, safe["digest"]),
         )
     if sync_graph:
-        persist_topic_graph(cur, parsed, dry_run=False)
+        persist_topic_graph(cur, safe, dry_run=False)
     return changed
 
 
@@ -292,6 +355,14 @@ def _upsert_episode(cur, payload: dict[str, Any]) -> bool:
     # capture.write_pg already uses for the hygiene step.
     identity_cols = ("harness", "repo_root", "project", "parent_session_id",
                      "transcript_range")
+    identity_keys = {
+        "ts", "session_id", "harness", "repo_root", "project",
+        "parent_session_id", "transcript_range", "window_id",
+    }
+    safe = deepcopy(payload)
+    for key, value in list(safe.items()):
+        if key not in identity_keys:
+            safe[key], _ = _redact_free_text(value)
     has_identity = has_tags = True
     has_windows = has_verbatim = False
     try:
@@ -310,33 +381,33 @@ def _upsert_episode(cur, payload: dict[str, Any]) -> bool:
     vals = ["%s::timestamptz", "%s", "%s", "%s::jsonb", "%s::jsonb", "%s::jsonb",
             "%s::jsonb", "%s", "%s::jsonb", "%s::jsonb"]
     params: list[Any] = [
-        payload.get("ts") or datetime.now(timezone.utc).isoformat(),
-        payload.get("session_id"),
-        payload.get("summary") or "",
-        json.dumps(payload.get("topics") or []),
-        json.dumps(payload.get("people") or []),
-        json.dumps(payload.get("decisions") or []),
-        json.dumps(payload.get("preferences") or []),
-        payload.get("scope"),
-        json.dumps(payload.get("edges") or []),
-        json.dumps(payload, ensure_ascii=False),
+        safe.get("ts") or datetime.now(timezone.utc).isoformat(),
+        safe.get("session_id"),
+        safe.get("summary") or "",
+        json.dumps(safe.get("topics") or []),
+        json.dumps(safe.get("people") or []),
+        json.dumps(safe.get("decisions") or []),
+        json.dumps(safe.get("preferences") or []),
+        safe.get("scope"),
+        json.dumps(safe.get("edges") or []),
+        json.dumps(safe, ensure_ascii=False),
     ]
     if has_identity:
         cols.extend(identity_cols)
         vals.extend(["%s"] * len(identity_cols))
-        params.extend(payload.get(c) for c in identity_cols)
+        params.extend(safe.get(c) for c in identity_cols)
     if has_tags:
         cols.append("tags")
         vals.append("%s::jsonb")
-        params.append(json.dumps(payload.get("tags") or []))
+        params.append(json.dumps(safe.get("tags") or []))
     if has_windows:
         cols.extend(["window_id", "truncated_chars"])
         vals.extend(["%s", "%s"])
-        params.extend([payload.get("window_id"), int(payload.get("truncated_chars") or 0)])
+        params.extend([safe.get("window_id"), int(safe.get("truncated_chars") or 0)])
     if has_verbatim:
         cols.append("verbatim")
         vals.append("%s::jsonb")
-        params.append(json.dumps(payload.get("verbatim") or {}, ensure_ascii=False))
+        params.append(json.dumps(safe.get("verbatim") or {}, ensure_ascii=False))
     cur.execute(
         f"""
         INSERT INTO episodes

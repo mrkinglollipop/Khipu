@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import psycopg
@@ -9,6 +10,9 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 DEFAULT_DSN_FILE = Path.home() / ".config" / "khipu" / "dsn"
 LEGACY_DSN_FILE = Path.home() / ".config" / "alzy" / "dsn"
+CONNECT_TIMEOUT_SECONDS = 5
+STATEMENT_TIMEOUT_MILLISECONDS = 15_000
+_STATEMENT_TIMEOUT = re.compile(r"(?:^|\s)(?:-c\s*|--)statement_timeout=(\S+)")
 
 
 def _env(*names: str) -> str:
@@ -85,7 +89,31 @@ def conninfo_with_local_root_cert(dsn: str) -> str:
 
 
 def connect(*, autocommit: bool = False):
-    return psycopg.connect(conninfo_with_local_root_cert(resolve_dsn()), autocommit=autocommit)
+    """Open a bounded hub connection for ordinary CLI work.
+
+    The client timeout keeps a missing hub from hanging a command indefinitely;
+    the server-side statement timeout also bounds SQL after a connection was
+    made. Callers that deliberately own a longer operation must use their own
+    explicit connection contract rather than silently inheriting an unbounded
+    default.
+    """
+    conninfo = conninfo_with_local_root_cert(resolve_dsn())
+    existing_options = (conninfo_to_dict(conninfo).get("options") or "").strip()
+    # Libpq applies repeated settings in order; the final timeout must be finite.
+    timeouts = _STATEMENT_TIMEOUT.findall(existing_options)
+    final_timeout = timeouts[-1] if timeouts else ""
+    finite = re.fullmatch(r"([1-9]\d*)(us|ms|s|min|h|d)?", final_timeout)
+    if not finite or (finite.group(2) == "us" and int(finite.group(1)) < 1000):
+        existing_options = _STATEMENT_TIMEOUT.sub("", existing_options).strip()
+        existing_options = (
+            f"{existing_options} -c statement_timeout={STATEMENT_TIMEOUT_MILLISECONDS}"
+        ).strip()
+    return psycopg.connect(
+        conninfo,
+        autocommit=autocommit,
+        connect_timeout=CONNECT_TIMEOUT_SECONDS,
+        options=existing_options,
+    )
 
 
 def dsn_configured() -> bool:

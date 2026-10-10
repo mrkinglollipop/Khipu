@@ -132,7 +132,12 @@ class ConnectTest(unittest.TestCase):
              mock.patch.object(db, "conninfo_with_local_root_cert", side_effect=lambda d: d), \
              mock.patch("psycopg.connect") as pg:
             db.connect(autocommit=True)
-        pg.assert_called_once_with("postgres://x", autocommit=True)
+        pg.assert_called_once_with(
+            "postgres://x",
+            autocommit=True,
+            connect_timeout=db.CONNECT_TIMEOUT_SECONDS,
+            options=f"-c statement_timeout={db.STATEMENT_TIMEOUT_MILLISECONDS}",
+        )
 
 
 class ConninfoLocalRootCertTest(unittest.TestCase):
