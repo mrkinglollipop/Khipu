@@ -394,9 +394,10 @@ class MatrixCacheTest(unittest.TestCase):
         opens_after_first = self.opens.call_count
         second = self._query()
         self.assertEqual(first, second)
-        # A miss opens the replica twice (rows, then the winners' text); a hit only once.
-        self.assertEqual(opens_after_first, 2)
-        self.assertEqual(self.opens.call_count - opens_after_first, 1)
+        # The cached generation includes winner text; a miss needs one read
+        # and a cache hit needs none.
+        self.assertEqual(opens_after_first, 1)
+        self.assertEqual(self.opens.call_count - opens_after_first, 0)
 
     def test_a_changed_replica_misses_and_reloads(self) -> None:
         before = self._query()
@@ -414,7 +415,7 @@ class MatrixCacheTest(unittest.TestCase):
         opens_before = self.opens.call_count
         after = self._query()
         self.assertEqual({r["id"] for r in after}, {"near", "far", "added"})
-        self.assertEqual(self.opens.call_count - opens_before, 2)
+        self.assertEqual(self.opens.call_count - opens_before, 1)
 
     def test_the_cache_holds_one_entry_and_is_keyed_by_the_profile(self) -> None:
         self._query()
@@ -431,8 +432,8 @@ class MatrixCacheTest(unittest.TestCase):
             t.join(10)
         self.assertEqual(len(results), 4)
         self.assertTrue(all(r == results[0] for r in results))
-        # One load (1 open) plus one text fetch per caller (4 opens).
-        self.assertEqual(self.opens.call_count, 5)
+        # The shared cached generation carries text as well as vectors.
+        self.assertEqual(self.opens.call_count, 1)
 
 
 # ---- the embedding connection ------------------------------------------------------

@@ -181,29 +181,32 @@ class StaleSearchTest(unittest.TestCase):
             out = hs.maybe_refresh(force=True)
         self.assertIsNone(out)
 
-    def test_maybe_refresh_skips_young_file_with_bad_meta(self) -> None:
-        """Existing young sqlite with missing/unparseable refreshed_at must skip."""
+    def test_maybe_refresh_does_not_trust_young_file_with_bad_meta(self) -> None:
+        """File mtime is not proof that a full snapshot refresh completed."""
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)
             snap = data / "hub_snapshot.sqlite"
             snap.write_bytes(b"sqlite-placeholder")
             meta = data / "hub_snapshot.sqlite.meta.json"
             meta.write_text('{"refreshed_at": "not-a-timestamp"}', encoding="utf-8")
+            cm = mock.MagicMock()
+            cm.__enter__.return_value.cursor.return_value.__enter__.return_value = mock.MagicMock()
+            refreshed = {"ok": True}
             with (
                 mock.patch.object(hs, "snapshot_path", return_value=snap),
                 mock.patch.object(hs, "meta_path", return_value=meta),
-                mock.patch.object(hs, "refresh") as refresh,
-                mock.patch.object(hs, "try_hub_connect") as connect,
+                mock.patch.object(hs, "refresh", return_value=refreshed) as refresh,
+                mock.patch.object(hs, "try_hub_connect", return_value=cm) as connect,
             ):
                 health = hs.snapshot_health()
                 self.assertTrue(health.get("exists"))
-                self.assertIsInstance(health.get("age_seconds"), int)
-                self.assertGreaterEqual(health["age_seconds"], 0)
-                self.assertLess(health["age_seconds"], hs.AUTO_REFRESH_MIN_AGE_S)
+                self.assertFalse(health.get("ok"))
+                self.assertIsNone(health.get("age_seconds"))
+                self.assertEqual(health.get("reason"), "refresh_evidence_unknown")
                 out = hs.maybe_refresh()
-            self.assertIsNone(out)
-            refresh.assert_not_called()
-            connect.assert_not_called()
+            self.assertEqual(out, refreshed)
+            refresh.assert_called_once()
+            connect.assert_called_once()
 
     def test_cmd_status_does_not_dump_snapshot(self) -> None:
         import io
@@ -789,7 +792,14 @@ class CosineCandidatesSnapshotTest(unittest.TestCase):
     def test_ranks_the_closer_vector_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)
-            with mock.patch.object(hs, "snapshot_path", return_value=self._snapshot(data)):
+            snap = self._snapshot(data)
+            con = sqlite3.connect(str(snap))
+            con.execute(
+                "INSERT INTO topics (slug, title, body) VALUES ('match', 'Match', '')"
+            )
+            con.commit()
+            con.close()
+            with mock.patch.object(hs, "snapshot_path", return_value=snap):
                 out = hs.cosine_candidates_snapshot([1.0, 0.0, 0.0], "p1", limit=10)
         self.assertEqual(out[0]["id"], "match")
         self.assertAlmostEqual(out[0]["score"], 1.0, places=4)
@@ -801,7 +811,14 @@ class CosineCandidatesSnapshotTest(unittest.TestCase):
         runs."""
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)
-            with mock.patch.object(hs, "snapshot_path", return_value=self._snapshot(data)):
+            snap = self._snapshot(data)
+            con = sqlite3.connect(str(snap))
+            con.execute(
+                "INSERT INTO topics (slug, title, body) VALUES ('match', 'Match', '')"
+            )
+            con.commit()
+            con.close()
+            with mock.patch.object(hs, "snapshot_path", return_value=snap):
                 out = hs.cosine_candidates_snapshot([2.0, 0.0, 0.0], "p1", limit=10)
         got = {r["id"]: r["score"] for r in out}
         self.assertAlmostEqual(got["match"], hs._cosine([2.0, 0.0, 0.0], [1.0, 0.0, 0.0]), places=4)
