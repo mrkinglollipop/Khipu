@@ -8,6 +8,19 @@ from khipu.db import connect
 from khipu.snippets import SNIPPET_LIMIT, clip_snippet
 
 
+TOPIC_DETAIL_BODY_BYTES = 64 * 1024
+
+
+def _clip_utf8(value: Any, limit: int) -> tuple[Any, bool]:
+    """Keep a valid UTF-8 prefix under a byte budget."""
+    if not isinstance(value, str):
+        return value, False
+    raw = value.encode("utf-8")
+    if len(raw) <= limit:
+        return value, False
+    return raw[:limit].decode("utf-8", "ignore"), True
+
+
 def _deranked_topic_statuses() -> frozenset[str]:
     """Lazy import: khipu.recency owns the canonical de-rank set (R6); this
     module borrows it rather than duplicating the three status strings."""
@@ -109,26 +122,30 @@ def topic_detail(slug: str) -> dict | None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT slug, title, body, status, created_at, updated_at,
+                SELECT slug, title, LEFT(body, %s), status, created_at, updated_at,
                        links, source_path
                 FROM topics
                 WHERE slug = %s AND deleted_at IS NULL
                 """,
-                (slug,),
+                (TOPIC_DETAIL_BODY_BYTES + 1, slug),
             )
             r = cur.fetchone()
     if not r:
         return None
-    return {
+    body, clipped = _clip_utf8(r[2], TOPIC_DETAIL_BODY_BYTES)
+    out = {
         "slug": r[0],
         "title": r[1],
-        "body": r[2],
+        "body": body,
         "status": r[3],
         "created_at": r[4].isoformat() if r[4] else None,
         "updated_at": r[5].isoformat() if r[5] else None,
         "links": r[6],
         "source_path": r[7],
     }
+    if clipped:
+        out["body_truncated"] = True
+    return out
 
 
 def media_detail(asset_id: str) -> dict | None:

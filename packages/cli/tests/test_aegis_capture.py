@@ -196,7 +196,7 @@ class SandboxContractTest(unittest.TestCase):
 
 
 class DrainTest(unittest.TestCase):
-    def test_drain_captures_drops_empty_and_keeps_failures(self):
+    def test_drain_captures_and_keeps_empty_or_failed_extractions(self):
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.dict(os.environ, {"KHIPU_AEGIS_HOME": str(Path(td) / "kh")}):
             for sid in ("good", "empty", "boom"):
@@ -217,8 +217,8 @@ class DrainTest(unittest.TestCase):
                     mock.patch("khipu.capture.capture", lambda p, mode=None: captured.append(p) or 0), \
                     mock.patch("khipu.config.capture_mode", lambda: "dual"):
                 out = ac.drain()
-            self.assertEqual((out["captured"], out["empty"], out["failed"]), (1, 1, 1))
-            self.assertEqual(len(ac.queued_jobs()), 1)             # the failure is retried later
+            self.assertEqual((out["captured"], out["empty"], out["failed"]), (1, 0, 2))
+            self.assertEqual(len(ac.queued_jobs()), 2)             # no extraction result loses source evidence
             self.assertEqual(captured[0]["session_id"], "aegis:good")
             self.assertTrue(captured[0]["ts"].endswith("Z"))
 
