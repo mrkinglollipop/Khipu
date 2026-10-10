@@ -194,23 +194,22 @@ def test_an_existing_artifact_is_fetchable_by_id(tmp_path):
         assert topic is not None and topic["slug"] == "widget-batching"
 
 
-# ---- 14. duplicate / cross-harness recapture ---------------------------------
+# ---- 14. commitment restatement ---------------------------------
 
-def test_a_recapture_from_a_different_harness_dedups_not_duplicates():
+def test_restatement_from_another_episode_deduplicates_commitments():
     cur = _CommitmentsCursor(migrated=True)
     text = "Ship the widget-batching rollout once the staging soak finishes."
     assert co.open_from_episode(cur, {"project": "acme/widget", "open_loops": [text]}, 601) == 1
-    # A second harness (a different episode/session) restates the identical
-    # text — must touch the existing row, never insert a second one.
+    # Another episode restates the identical text: touch the existing row.
     assert co.open_from_episode(cur, {"project": "acme/widget", "open_loops": [text]}, 602) == 0
     assert len(cur.rows) == 1
     row = next(iter(cur.rows.values()))
     assert row["seen_count"] == 2
 
 
-# ---- 15. source deletion ----------------------------------------------------
+# ---- 15. snapshot tombstone visibility ----------------------------------------------------
 
-def test_a_forgotten_episode_is_not_returned_by_any_reader(tmp_path):
+def test_snapshot_detail_excludes_a_pre_tombstoned_episode(tmp_path):
     with corpus.installed_corpus(tmp_path) as handle:
         deleted = handle.by_id(15)
         assert deleted.deleted_at is not None
@@ -238,15 +237,14 @@ def test_malformed_model_output_raises_instead_of_silently_dropping_the_window()
             extract.extract_memory("some transcript")
 
 
-# ---- 18. crash / retry during consolidation -----------------------------------
+# ---- 18. duplicate enqueue before drain -----------------------------------
 
-def test_a_crash_between_enqueue_and_drain_neither_loses_nor_duplicates(tmp_path, monkeypatch):
+def test_reenqueue_before_drain_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setenv("KHIPU_OUTBOX", str(tmp_path / "outbox"))
-    payload = {"ts": "2026-09-01T00:00:00Z", "summary": "durable capture across a crash"}
+    payload = {"ts": "2026-09-01T00:00:00Z", "summary": "idempotent queued capture"}
     outbox.enqueue(payload, reason="pg write failed")
-    # A retry after a crash mid-drain re-queues the same payload before the
-    # first job was ever drained — identity-keyed enqueue must not duplicate it.
-    outbox.enqueue(payload, reason="retry after crash")
+    # Re-enqueue the same payload before draining; identity must stay unique.
+    outbox.enqueue(payload, reason="retry before drain")
     assert outbox.status()["pending"] == 1
 
     calls: list[str] = []
@@ -259,7 +257,7 @@ def test_a_crash_between_enqueue_and_drain_neither_loses_nor_duplicates(tmp_path
          mock.patch("khipu.embed.embed_on_capture", lambda p: True):
         out = outbox.drain()
     assert out == {"jobs": 1, "replayed": 1, "failed": 0, "stopped_early": False}
-    assert calls == ["durable capture across a crash"]
+    assert calls == ["idempotent queued capture"]
     assert outbox.status()["pending"] == 0
 
 

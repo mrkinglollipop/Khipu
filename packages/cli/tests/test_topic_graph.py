@@ -297,6 +297,9 @@ class ConversationMemoryToggleTest(unittest.TestCase):
         self.dir = Path(self.tmp.name)
         self._env = mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(self.dir)})
         self._env.start()
+        from khipu import sources
+
+        sources.save_sources({"sources": [{"id": "conversation_memory"}]})
 
     def tearDown(self):
         self._env.stop()

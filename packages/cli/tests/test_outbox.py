@@ -19,6 +19,8 @@ from khipu import outbox
 
 
 def _pg_available() -> bool:
+    if os.environ.get("KHIPU_LIVE_TESTS") != "1":
+        return False
     try:
         from khipu.db import connect
         with connect() as c, c.cursor() as cur:
@@ -113,7 +115,6 @@ class OutboxUnitTest(unittest.TestCase):
         self.assertEqual(outbox.status()["pending"], 1)
 
 
-@unittest.skipUnless(_pg_available(), "Postgres unreachable")
 class OutboxDurabilityTest(unittest.TestCase):
     """Regressions from the 2026-08-17 audit. The outbox IS the durability leg,
     so a torn write or a misreported age here is worse than elsewhere."""

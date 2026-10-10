@@ -185,14 +185,18 @@ class RedactedQueryLogTest(unittest.TestCase):
 
         from khipu import query_log as ql
 
+        query = "what did we decide about sensitive-token-123"
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "query_log.jsonl"
             with mock.patch.object(ql, "log_path", lambda: path), \
                     mock.patch("khipu.paths.ensure_data_dir", lambda: Path(tmp)):
-                ql.log_query("what did we decide about the DSN", mode="hybrid",
+                ql.log_query(query, mode="hybrid",
                              result_count=2, redact=True)
-            line = json.loads(path.read_text().splitlines()[-1])
+            serialized = path.read_text()
+            line = json.loads(serialized.splitlines()[-1])
         self.assertIsNone(line["query"])
-        self.assertEqual(line["query_len"], len("what did we decide about the DSN"))
+        self.assertEqual(line["query_len"], len(query))
         self.assertEqual(len(line["query_sha256"]), 16)
-        self.assertNotIn("DSN", path.read_text() if path.exists() else "")
+        self.assertNotIn(query, serialized)
+        self.assertEqual(set(line), {"ts", "harness", "query", "mode", "filters",
+                                     "result_count", "query_sha256", "query_len", "top"})

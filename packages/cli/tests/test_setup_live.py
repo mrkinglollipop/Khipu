@@ -13,8 +13,9 @@ not two containers; the drill-cluster helpers in ``components_backup`` only
 know how to run one at a time, and one container is all this needs since a
 "move" only cares about two different *databases*, not two different hosts.
 
-Skips itself, loudly, naming exactly what is missing, when Docker is not
-available or the khipu Postgres image cannot be pulled or built. Every DSN
+Requires KHIPU_LIVE_TESTS=1 before probing Docker and reserves unique test
+container/volume names, refusing existing resources. Skips when Docker is
+unavailable or the image cannot be prepared. Every DSN
 this file touches is asserted to point at 127.0.0.1 on the scratch port
 before any test body runs — this must never be able to reach the
 maintainer's real hub.
@@ -27,6 +28,8 @@ import os
 import sys
 import time
 import unittest
+import uuid
+from contextlib import contextmanager
 from unittest import mock
 from urllib.parse import quote
 
@@ -78,6 +81,8 @@ def _bundled_postgres_image() -> str | None:
 def _skip_reason() -> str | None:
     """None when this suite can run; otherwise exactly what is missing, so
     the skip message never leaves a reader guessing."""
+    if os.environ.get("KHIPU_LIVE_TESTS") != "1":
+        return "requires KHIPU_LIVE_TESTS=1 before contacting Docker"
     docker = docker_available()
     if not docker.get("ok"):
         return f"Docker is not available: {docker.get('error')}"
@@ -88,6 +93,21 @@ def _skip_reason() -> str | None:
 
 
 _SKIP_REASON = _skip_reason()
+
+
+@contextmanager
+def _test_drill_resources():
+    from khipu import components_backup as backup
+
+    if os.environ.get("KHIPU_LIVE_TESTS") != "1":
+        raise unittest.SkipTest("requires KHIPU_LIVE_TESTS=1")
+    nonce = uuid.uuid4().hex
+    container, volume = "khipu-test-drill-" + nonce, "khipu-test-pgdata-" + nonce
+    for args in (["container", "inspect", container], ["volume", "inspect", volume]):
+        if backup._docker(args, check=False).returncode == 0:
+            raise RuntimeError("refusing to reuse existing test drill resources")
+    with mock.patch.multiple(backup, DRILL_CONTAINER=container, DRILL_VOLUME=volume):
+        yield
 
 
 def _dsn_for(port: int, password: str, dbname: str) -> str:
@@ -157,6 +177,10 @@ class SetupLiveTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        resources = _test_drill_resources()
+        resources.__enter__()
+        cls.addClassCleanup(resources.__exit__, None, None, None)
+        cls.addClassCleanup(_cleanup_drill)
         image = _bundled_postgres_image()
         assert image, "guarded by the class-level skipUnless above"
         cls.image = image
@@ -177,9 +201,6 @@ class SetupLiveTest(unittest.TestCase):
         started = _start_drill_cluster(image, SCRATCH_PORT, password)
         if not started.get("ok"):
             raise unittest.SkipTest(f"scratch cluster failed to start: {started}")
-        # Registered the moment the container exists, so any failure between
-        # here and the end of the class still tears it down.
-        cls.addClassCleanup(_cleanup_drill)
         if not _wait_drill_ready(SCRATCH_PORT, password, timeout_s=DRILL_READY_TIMEOUT_S):
             raise unittest.SkipTest("scratch cluster never became ready")
         cls.cluster_start_seconds = round(time.monotonic() - t0, 1)
