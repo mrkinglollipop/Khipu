@@ -408,10 +408,10 @@ class ClaimValidationTest(unittest.TestCase):
         self.assertIn("Grounded fact.", body)
         self.assertNotIn("Made-up fact.", body)
 
-    def test_the_models_body_is_kept_when_every_claim_survives(self):
+    def test_the_body_is_rendered_from_claims_when_every_claim_survives(self):
         hub = _seeded()
         _build(hub, answer=_answer([_claim("Fact.", 1)], body="The model's own summary."))
-        self.assertEqual(hub.current("alpha")["body"], "The model's own summary.")
+        self.assertEqual(hub.current("alpha")["body"], "- Fact. [episode:1]")
 
     def test_all_claims_removed_records_a_failure_and_keeps_the_previous_brief(self):
         hub = _seeded()

@@ -36,8 +36,8 @@ import re
 import sys
 from typing import Any
 
-# Bumping this makes every existing brief stale on the next plan.
-DERIVATION_VERSION = 1
+# Bumping this makes every existing brief stale on its next read or plan.
+DERIVATION_VERSION = 2
 
 DEFAULT_BUILD_LIMIT = 5
 
@@ -276,7 +276,7 @@ def _gather(cur, slug: str) -> dict[str, Any]:
     """The topic's live source episodes: the fingerprint over all of them, and
     the newest cleaned subset (within ``MAX_SOURCE_CHARS``) offered to the
     model."""
-    from khipu import redact
+    from khipu import decisions, redact
 
     project = "e.project" if _has(cur, "episodes", "project") else "NULL"
     cur.execute(
@@ -285,6 +285,7 @@ def _gather(cur, slug: str) -> dict[str, Any]:
         (slug,),
     )
     episodes = cur.fetchall()
+    registry_ready = decisions._decisions_ready(cur)
     decision_rows = _decision_rows(cur, [int(r[0]) for r in episodes], with_text=True)
 
     entries: list[tuple[int, str, str]] = []
@@ -306,8 +307,12 @@ def _gather(cur, slug: str) -> dict[str, Any]:
                 ("(superseded) " if r["state"] == "superseded" else "") + (r["text"] or "")
                 for r in rows if r["state"] != "retracted"
             ]
-        else:
+        elif not registry_ready:
             lines = [d for d in (decisions_json or []) if isinstance(d, str)]
+        else:
+            # A missing row can be a deduplicated decision whose canonical
+            # row was retracted or superseded in another episode.
+            lines = []
         text = strip_derived(summary)[:MAX_EPISODE_CHARS]
         lines = [ln for ln in (strip_derived(ln) for ln in lines) if ln]
         if not text and not lines:
@@ -364,14 +369,17 @@ def validate_claims(raw_claims: Any, offered_ids: set[int]) -> tuple[list[dict[s
 
 
 def _final_body(parsed_body: Any, claims: list[dict[str, Any]], removed: int) -> str:
-    """The model's body when every claim it offered survived; otherwise the
-    surviving claims themselves, so the body never carries what validation
-    removed."""
-    from khipu import redact
-
-    if removed == 0 and isinstance(parsed_body, str) and parsed_body.strip():
-        return redact.redact_secrets(parsed_body.strip())[0][:MAX_BODY_CHARS]
-    return "\n".join("- " + c["text"] for c in claims)[:MAX_BODY_CHARS]
+    """Render only accepted claims, keeping each citation with its text."""
+    lines: list[str] = []
+    used = 0
+    for claim in claims:
+        cited = ", ".join(f"episode:{eid}" for eid in claim["episode_ids"])
+        line = f"- {claim['text']} [{cited}]"
+        if used + len(line) + bool(lines) > MAX_BODY_CHARS:
+            break
+        used += len(line) + bool(lines)
+        lines.append(line)
+    return "\n".join(lines)
 
 
 # ---- build ----------------------------------------------------------------------
@@ -503,6 +511,17 @@ def build_many(conn, topics: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return results
 
 
+def build_outcome(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Count topic outcomes without treating unusable builds as success."""
+    out: dict[str, Any] = {"ok": True, "built": 0}
+    for result in results:
+        status = str(result.get("status"))
+        out[status] = out.get(status, 0) + 1
+        if status in {"failed", "error", "unavailable"}:
+            out["ok"] = False
+    return out
+
+
 # ---- one writer -----------------------------------------------------------------
 
 def acquire_build_lock(cur) -> bool:
@@ -565,7 +584,8 @@ def mark_stale_for_decision(cur, decision_id: int) -> int:
 
 def read_brief(cur, topic_slug: str) -> dict[str, Any]:
     """The current brief for a topic as a reader payload. ``body`` and
-    ``claims`` are withheld when a cited episode has since been forgotten."""
+    ``claims`` are withheld when a cited episode has since been forgotten.
+    State is checked against live sources without writing to the store."""
     if not _ready(cur):
         return _unavailable(REASON_TABLE_MISSING)
     cur.execute(
@@ -588,6 +608,12 @@ def read_brief(cur, topic_slug: str) -> dict[str, Any]:
         "source_count": len(ids), "age_seconds": int(age or 0), "created_at": _iso(created_at),
         "derivation_version": version, "model": model,
     }
+    if state == "current":
+        have = _current_row(cur, topic_slug)
+        if (version != DERIVATION_VERSION or not have or have["id"] != brief_id
+                or have["state"] != "current"
+                or have["hash"] != _gather(cur, topic_slug)["hash"]):
+            payload["state"] = "stale"
     if ids and _has(cur, "episodes", "deleted_at"):
         cur.execute(
             "SELECT id FROM episodes WHERE id = ANY(%s::bigint[]) AND deleted_at IS NOT NULL",
@@ -648,6 +674,6 @@ def cli_main(args) -> int:
             finally:
                 release_build_lock(cur)
                 conn.commit()
-    failed = any(r["status"] == "error" for r in results)
-    _print({"ok": not failed, "cost": cost, "results": results, **({"note": note} if note else {})})
-    return 1 if failed else 0
+    outcome = build_outcome(results)
+    _print({"ok": outcome["ok"], "cost": cost, "results": results, **({"note": note} if note else {})})
+    return 0 if outcome["ok"] else 1
