@@ -172,10 +172,11 @@ class ExtractMemoryTest(unittest.TestCase):
         self.assertEqual(out["summary"], "did a thing")
         self.assertNotIn("[", out["summary"])
 
-    def test_a_nonsense_summary_type_is_treated_as_nothing_durable(self):
+    def test_a_nonsense_summary_type_is_retryable(self):
         for bad in (5, {"a": 1}, None):
             with self.subTest(bad=bad):
-                self.assertIsNone(self._run(_reply(summary=bad)))
+                with self.assertRaises(RuntimeError):
+                    self._run(_reply(summary=bad))
 
     def test_the_api_key_is_sent_as_a_header_not_in_the_url(self):
         seen = {}

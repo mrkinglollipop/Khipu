@@ -313,7 +313,11 @@ def _merge_into_episode(
     cols = "topics, decisions, preferences, people, raw, ts, summary"
     if has_tags:
         cols += ", tags"
-    cur.execute(f"SELECT {cols} FROM episodes WHERE id = %s", (target_id,))
+    has_verbatim = has_columns(cur, "episodes", "verbatim")
+    if has_verbatim:
+        cols += ", verbatim"
+    live = " AND deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
+    cur.execute(f"SELECT {cols} FROM episodes WHERE id = %s{live} FOR UPDATE", (target_id,))
     row = cur.fetchone()
     if not row:
         return False
@@ -326,12 +330,24 @@ def _merge_into_episode(
     new_tags = _union_json_list(tags, payload.get("tags")) if has_tags else None
     new_summary = _append_summary(target_summary, payload.get("summary"))
     raw = dict(raw or {})
+    raw.setdefault("ts", target_ts.isoformat() if hasattr(target_ts, "isoformat") else target_ts)
+    raw.setdefault("summary", target_summary)
+    verbatim = dict((row[8 if has_tags else 7] if has_verbatim else raw.get("verbatim")) or {})
+    for key, value in (payload.get("verbatim") or {}).items():
+        if isinstance(value, list):
+            verbatim[key] = _union_json_list(verbatim.get(key), value)
+        elif key == "note" and isinstance(value, str):
+            verbatim[key] = _append_summary(verbatim.get(key), value)
+        elif key not in verbatim:
+            verbatim[key] = value
+    raw["verbatim"] = verbatim
     merged_from = list(raw.get("merged_from") or [])
     merged_from.append({
         "session_id": payload.get("session_id"),
         "ts": payload.get("ts"),
         "matched_via": matched_via,
         "score": round(score, 4),
+        "payload": payload,
     })
     raw["merged_from"] = merged_from
     sets = ["topics = %s::jsonb", "decisions = %s::jsonb", "preferences = %s::jsonb",
@@ -347,6 +363,9 @@ def _merge_into_episode(
     if has_tags:
         sets.append("tags = %s::jsonb")
         params.append(json.dumps(new_tags, ensure_ascii=False))
+    if has_verbatim:
+        sets.append("verbatim = %s::jsonb")
+        params.append(json.dumps(verbatim, ensure_ascii=False))
     params.append(target_id)
     cur.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id = %s", params)
 
@@ -420,17 +439,6 @@ def _merge_into_episode(
             pass
         _log(f"merge deliverables step failed ({type(exc).__name__}: {exc})")
 
-    # The target's text changed, so its vectors are stale. embed_on_capture
-    # finds the row by (ts, md5(summary)) — the identity is target_ts +
-    # new_summary now that the UPDATE above changed the summary column, so
-    # both must reflect the MERGED text or the lookup finds nothing.
-    _reembed_merged_episode(target_ts, new_summary, {
-        "summary": new_summary,
-        "topics": new_topics,
-        "decisions": new_decisions,
-        "preferences": new_preferences,
-        "people": new_people,
-    })
     return True
 
 
@@ -498,6 +506,52 @@ def _mint_ts() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+class CaptureIdentityConflict(ValueError):
+    """A legacy replay key already belongs to different source evidence."""
+
+
+def _validate_timestamp(payload: dict[str, Any]) -> None:
+    ts = payload.get("ts")
+    if ts is None or ts == "":
+        payload["ts"] = _mint_ts()
+        return
+    if not isinstance(ts, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", ts
+    ):
+        raise ValueError("capture timestamp must be an ISO timestamp with a timezone")
+    datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def _redact_capture_values(value: Any) -> Any:
+    """Apply the shared redactor to every text leaf before any persistence leg."""
+    from khipu.redact import redact_secrets
+
+    if isinstance(value, dict):
+        for key in value:
+            value[key] = _redact_capture_values(value[key])
+    elif isinstance(value, list):
+        value = [_redact_capture_values(item) for item in value]
+    elif isinstance(value, str):
+        value = redact_secrets(value)[0]
+    return value
+
+
+def _refresh_merged_episode(cur, episode_id: int) -> None:
+    """Embedding's separate connection must see the complete committed target."""
+    try:
+        cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s", (episode_id,))
+        row = cur.fetchone()
+        if row:
+            target = row[0]
+            if target.get("deleted_at"):
+                return
+            merged = dict(target.get("raw") or {})
+            merged.update(target)
+            _reembed_merged_episode(target["ts"], target["summary"], merged)
+    except Exception as exc:  # noqa: BLE001 — embedding is additive
+        _log(f"merge refresh failed ({type(exc).__name__}: {exc})")
+
+
 def load_payload(raw: str) -> dict[str, Any]:
     raw = (raw or "").strip()
     if not raw:
@@ -519,8 +573,11 @@ def load_payload(raw: str) -> dict[str, Any]:
         sid = os.environ.get("CLAUDE_SESSION_ID", "").strip()
         if sid:
             payload["session_id"] = sid
-    if not payload.get("ts"):
-        payload["ts"] = _mint_ts()
+    try:
+        _validate_timestamp(payload)
+    except ValueError as exc:
+        _log(str(exc))
+        raise SystemExit(EX_DATAERR) from exc
     return payload
 
 
@@ -539,19 +596,22 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     # Every writer lands here (hook, MCP tool, gateway), so this is the one
     # place a secret in a summary, decision, loop or topic page is masked
     # before it becomes a row, a page or a vector.
-    from khipu.redact import redact_payload
-
-    redacted = redact_payload(payload)
-    if redacted:
-        _log(f"redacted {redacted} secret(s) from the capture payload")
+    _validate_timestamp(payload)
+    _redact_capture_values(payload)
     topics_written = 0
     episode_id: int | None = None
     with connect() as conn:
         with conn.cursor() as cur:
             _inherit_project(cur, payload)
+            if payload.get("project"):
+                from khipu.identity import _resolve_project_alias
+
+                payload["project"] = _resolve_project_alias(cur, payload["project"]) or payload["project"]
             dedup = dedup_before_insert(cur, payload)
             if dedup["action"] in ("skip", "merge"):
                 conn.commit()
+                if dedup["action"] == "merge":
+                    _refresh_merged_episode(cur, dedup["matched_episode"])
                 return {
                     "episode_inserted": False,
                     "topics_written": 0,
@@ -620,6 +680,25 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
             payload["scope"] = normalize_scope(payload.get("scope"))
 
             inserted = _upsert_episode(cur, payload)
+            if not inserted:
+                cur.execute(
+                    "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
+                    (payload["ts"], _md5_hex(payload["summary"])),
+                )
+                existing = cur.fetchone()
+                cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
+                            (existing[0] if existing else None,))
+                row = cur.fetchone()
+                target = row[0] if row else {}
+                source = target.get("raw") or {}
+                # An outbox using this same legacy key cannot safely retain a
+                # conflicting payload either; callers must keep the source job.
+                if not target or any(payload.get(k) != target.get(k, source.get(k)) for k in
+                                     ("session_id", "project", "harness", "transcript_range")) \
+                        or any(payload.get(k) and payload[k] != source.get(k) for k in
+                               ("verbatim", "decisions", "preferences", "open_loops", "closed_loops",
+                                "decision_details", "deliverables", "window_id", "part")):
+                    raise CaptureIdentityConflict("capture replay identity conflicts with existing source evidence")
             from khipu.config import path_setting
             from khipu.topic_graph import persist_capture_graph
 
@@ -691,10 +770,15 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
             # whole capture; there are no topic files to fold in.
             for tp in (payload.get("topic_pages") or []) if memory_root else []:
                 slug = (tp.get("slug") or "").strip() if isinstance(tp, dict) else ""
-                if not slug:
+                if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
                     continue
-                path = memory_root / "topics" / f"{slug}.md"
+                topics_root = (memory_root / "topics").resolve()
+                path = (topics_root / f"{slug}.md").resolve()
+                if not path.is_relative_to(topics_root):
+                    continue
                 parsed = parse_topic_file(path)
+                if parsed:
+                    _redact_capture_values(parsed)
                 if parsed and _upsert_topic(
                     cur, parsed, str(path), source="capture", note="khipu capture"
                 ):
@@ -747,6 +831,12 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
 
 def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
     mode = (mode or capture_mode()).lower()
+    try:
+        _validate_timestamp(payload)
+    except ValueError as exc:
+        _log(str(exc))
+        return EX_DATAERR
+    _redact_capture_values(payload)
     if payload.get("scope") == "trivial":
         _log("scope=trivial — skipping per protocol")
         return 0
@@ -780,6 +870,9 @@ def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
     # is ever double-written (the replay is the same identity upsert).
     try:
         stats = write_pg(payload)
+    except CaptureIdentityConflict as exc:
+        _log(str(exc))
+        return EX_SOFTWARE
     except Exception as exc:  # noqa: BLE001 — surfaced, queued, never swallowed
         from khipu.outbox import enqueue
 
@@ -792,7 +885,13 @@ def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
             queued = False
         # The file leg keeps its own mirror ON here: if PG comes back mid-way it
         # lands the row now, and if not it re-queues the same identity (no dup).
+        if mode == "hub" and os.environ.get("KHIPU_HUB_FILE_MIRROR", "1").strip().lower() in {"0", "false", "off"}:
+            _log(f"hub delivery pending; durable_outbox={queued}")
+            return 0 if queued else EX_SOFTWARE
         rc = run_capture_v2(payload, suppress_mirror=False)
+        if mode == "hub" and queued:
+            _log("hub delivery pending; durable_outbox=True")
+            return 0
         if rc != 0:
             return rc
         return 0 if queued else EX_SOFTWARE
@@ -814,7 +913,8 @@ def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
     # turns the reverse mirror off in hub for a future all-PG world.
     if mode == "hub" and os.environ.get("KHIPU_HUB_FILE_MIRROR", "1").strip().lower() in {"0", "false", "off"}:
         return 0
-    return run_capture_v2(payload, suppress_mirror=True)
+    rc = run_capture_v2(payload, suppress_mirror=True)
+    return 0 if mode == "hub" else rc
 
 
 def main(argv: list[str] | None = None) -> int:

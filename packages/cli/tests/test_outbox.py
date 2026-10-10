@@ -100,9 +100,9 @@ class OutboxUnitTest(unittest.TestCase):
         ran = []
         with mock.patch.object(cap, "write_pg", return_value={"episode_inserted": False, "topics_written": 0}), \
                 mock.patch.object(cap, "run_capture_v2", lambda p, suppress_mirror: ran.append(suppress_mirror) or 0):
-            self.assertEqual(cap.capture({"summary": "x", "ts": "t"}, mode="hub"), 0)
+            self.assertEqual(cap.capture({"summary": "x", "ts": "2026-10-10T00:00:00Z"}, mode="hub"), 0)
             with mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "0"}):
-                self.assertEqual(cap.capture({"summary": "x", "ts": "t"}, mode="hub"), 0)
+                self.assertEqual(cap.capture({"summary": "x", "ts": "2026-10-10T00:00:00Z"}, mode="hub"), 0)
         self.assertEqual(ran, [True])                       # once with mirror suppressed; off when disabled
 
     def test_legacy_mirror_leg_queues_instead_of_losing(self):
