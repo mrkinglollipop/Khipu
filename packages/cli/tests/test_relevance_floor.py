@@ -485,7 +485,7 @@ def test_a_positive_that_was_empty_before_the_gate_is_not_blamed_on_it():
     entries = [{"query": "never found", "expect": ["zzz"]}]
     with mock.patch.object(em, "hybrid_search", side_effect=_fake_search_by_switch):
         report = recall_eval.run_relevance_eval(entries, ("explicit",), floor=True)
-    assert report["paths"]["explicit"]["emptied_positives"] == ["never found"]
+    assert report["paths"]["explicit"]["emptied_positives"] == []
     empty = {"results": []}
     with mock.patch.object(em, "hybrid_search", return_value=empty):
         report = recall_eval.run_relevance_eval(entries, ("explicit",), floor=True)
@@ -511,7 +511,13 @@ def test_eval_restores_a_switch_the_caller_had_set(monkeypatch):
 def test_eval_scores_the_prompt_and_status_paths_with_the_switch_forced_each_way():
     def fake_prompt(query, **kw):
         on = os.environ[ENV] == "1"
-        return {"hits": [] if on else [{"id": "x"}], "reason": "ok"}
+        return {
+            "hits": [] if on else [{"id": "x"}], "reason": "ok",
+            "prior_work_meta": {
+                "outcome": "no_match" if on else "match",
+                "legs": ["lexical"], "degraded": None, "reason": "ok",
+            },
+        }
 
     entries = [{"query": "nothing remembered", "expect_none": True}]
     with mock.patch("khipu.recall_prompt.prior_work_for_prompt", side_effect=fake_prompt):

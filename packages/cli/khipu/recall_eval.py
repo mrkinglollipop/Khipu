@@ -32,7 +32,7 @@ evaluator gap):
   (a superseded/forgotten row leaking back into results).
 - ``--record FILE`` snapshots the ordered ids every (entry, path) pair
   returns, as a control; ``--compare FILE`` reruns and diffs against it
-  (identical / reordered / changed / new), exit 1 on any difference unless
+  (identical / reordered / changed / new / removed), exit 1 on any difference unless
   ``--allow-changes``. Latency is never part of the diff.
 - ``--rerank on|off`` scores the explicit path with the optional reranker
   switch set for this process only; ``on`` scores every entry both ways in the
@@ -40,7 +40,7 @@ evaluator gap):
 - ``--relevance-floor on|off`` scores the chosen ``--path``(s) with the absolute
   relevance floor switch set for this process only; ``on`` scores every entry
   both ways and reports abstention correctness per path and each golden
-  positive whose query the gate emptied, by query.
+  positive whose expected hit the gate removed, by query.
 - ``--replay LOG [--sample N] [--seed S]`` builds no-expectation entries from
   a ``query_log.jsonl`` for realistic-traffic record/compare runs; only valid
   together with ``--record`` or ``--compare``.
@@ -226,10 +226,13 @@ def _call_prompt_or_status(
 ) -> dict[str, Any]:
     from khipu.recall_prompt import prior_work_for_prompt
 
-    return prior_work_for_prompt(
-        query, cwd=entry.get("cwd"), session_id=None,
-        budget_ms=budget_ms if path == PATH_STATUS else None,
-    )
+    kwargs: dict[str, Any] = {
+        "cwd": entry.get("cwd"), "session_id": None,
+        "budget_ms": budget_ms if path == PATH_STATUS else None,
+    }
+    if "project" in entry:
+        kwargs["project"] = entry.get("project")
+    return prior_work_for_prompt(query, **kwargs)
 
 
 def _extract_got(payload: dict[str, Any], path: str, k: int) -> list[str]:
@@ -237,25 +240,47 @@ def _extract_got(payload: dict[str, Any], path: str, k: int) -> list[str]:
     return [str(r.get("id")) for r in rows[:k]]
 
 
-def _outcome(payload: dict[str, Any], path: str) -> tuple[bool, bool, str | None, str]:
-    """(timeout, error, degraded, reason) read off one path's raw return
-    value. explicit (embed.hybrid_search) has no deadline today (scope:
-    "Retrieval and multi-harness contract") so it never reports a timeout;
-    prompt/status (recall_prompt.prior_work_for_prompt) are fail-open and
-    describe every outcome, including a timeout, in their own `reason`
-    string rather than raising."""
+_OUTCOMES = frozenset({"match", "no_match", "gated", "dedup", "timeout", "error"})
+
+
+def _outcome(
+    payload: dict[str, Any], path: str, got: list[str]
+) -> tuple[bool, bool, str | None, str, str, bool]:
+    """Return timeout/error/degradation/reason/outcome/completion evidence."""
     if path == PATH_EXPLICIT:
         err = payload.get("error")
         reason = f"error: {err}" if err else "ok"
-        return False, bool(err), payload.get("degraded"), reason
-    reason = str(payload.get("reason") or "")
+        outcome = "error" if err else ("match" if got else "no_match")
+        return False, bool(err), payload.get("degraded"), reason, outcome, True
+    meta = payload.get("prior_work_meta")
+    meta = meta if isinstance(meta, dict) else {}
+    reason = str(meta.get("reason") or payload.get("reason") or "")
     lowered = reason.lower()
-    timeout = lowered.startswith("timeout")
-    error = bool(payload.get("error")) or "error" in lowered
-    degraded = None
-    if path == PATH_STATUS:
-        degraded = (payload.get("prior_work_meta") or {}).get("degraded")
-    return timeout, error, degraded, reason
+    outcome_present = "outcome" in meta or "outcome" in payload
+    candidate = meta.get("outcome") if "outcome" in meta else payload.get("outcome")
+    structured = candidate if isinstance(candidate, str) and candidate in _OUTCOMES else None
+    invalid_outcome = outcome_present and structured is None
+    timeout = structured == "timeout" or lowered.startswith("timeout")
+    error = (structured == "error" or invalid_outcome
+             or bool(payload.get("error")) or "error" in lowered)
+    degraded = meta.get("degraded") if "degraded" in meta else payload.get("degraded")
+    if structured:
+        outcome = structured
+    elif invalid_outcome:
+        outcome = "error"
+    elif reason == "dedup":
+        outcome = "dedup"
+    elif timeout:
+        outcome = "timeout"
+    elif lowered.startswith("error:"):
+        outcome = "error"
+    elif "gate" in lowered or lowered in {"no content tokens", "trivial acknowledgment"}:
+        outcome = "gated"
+    else:
+        outcome = "match" if got else "no_match"
+    legs = meta.get("legs") if "legs" in meta else payload.get("legs")
+    completed = isinstance(legs, list) and bool(legs)
+    return timeout, error, degraded, reason, outcome, completed
 
 
 def eval_one_path(
@@ -286,7 +311,7 @@ def eval_one_path(
     payload_chars = len(json.dumps(payload, default=str))
 
     got = _extract_got(payload, path, k)
-    timeout, error, degraded, reason = _outcome(payload, path)
+    timeout, error, degraded, reason, outcome, completed = _outcome(payload, path, got)
 
     hit = False
     reciprocal_rank = 0.0
@@ -297,7 +322,10 @@ def eval_one_path(
         # infrastructure failure it actually is: the exact shape the review's
         # B10 finding warns about, a miss that looks like "no relevant
         # memory" instead of a lane that missed its own deadline.
-        abstain_correct = (not got) and not timeout and not error
+        abstain_correct = (
+            not got and outcome == "no_match" and completed
+            and not timeout and not error and not degraded
+        )
     else:
         hit = bool(expect & set(got))
         for rank, gid in enumerate(got, start=1):
@@ -309,10 +337,13 @@ def eval_one_path(
         "query": query, "path": path, "mode": mode if path == PATH_EXPLICIT else None,
         "k": k, "expect": sorted(expect), "expect_none": expect_none,
         "stale": sorted(stale), "note": entry.get("note"),
+        "project": entry.get("project"), "since": entry.get("since"),
+        "until": entry.get("until"), "cwd": entry.get("cwd"),
         "got": got, "hit": hit, "reciprocal_rank": reciprocal_rank,
         "abstain_correct": abstain_correct,
         "stale_violation": bool(stale & set(got)),
         "timeout": timeout, "error": error, "degraded": degraded, "reason": reason,
+        "outcome": outcome,
         "confidence": payload.get("confidence") if path == PATH_EXPLICIT else None,
         "ms": ms, "payload_chars": payload_chars,
     }
@@ -343,6 +374,9 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         # never look like it simply "found nothing" (review finding B10).
         "errors": sum(1 for r in rows if r["error"]),
         "degraded": sum(1 for r in rows if r["degraded"]),
+        "gated": sum(1 for r in rows if r["outcome"] == "gated"),
+        "dedup": sum(1 for r in rows if r["outcome"] == "dedup"),
+        "failed": sum(1 for r in rows if r["outcome"] in {"timeout", "error"}),
         "latency_p50_ms": round(_percentile(latencies, 50), 1),
         "latency_p95_ms": round(_percentile(latencies, 95), 1),
         "mean_payload_chars": round(sum(sizes) / len(sizes), 1) if sizes else 0.0,
@@ -400,8 +434,8 @@ def build_record(
     return {
         "stamp": _stamp(paths),
         "entries": [
-            {"query": r["query"], "path": r["path"], "got": r["got"],
-             "reason": r["reason"], "degraded": r["degraded"]}
+            {"query": r["query"], "path": r["path"], "identity": _entry_identity(r), "got": r["got"],
+             "reason": r["reason"], "degraded": r["degraded"], "outcome": r["outcome"]}
             for r in report["rows"]
         ],
     }
@@ -428,6 +462,26 @@ def _diff_status(control_got: list[str] | None, live_got: list[str]) -> str:
     return "changed"
 
 
+_IDENTITY_FIELDS = ("query", "path", "mode", "k")
+_FILTER_FIELDS = ("project", "since", "until", "cwd")
+
+
+def _entry_identity(row: dict[str, Any]) -> dict[str, Any]:
+    """Stable retrieval contract, excluding only timing/payload size."""
+    identity = {field: row.get(field) for field in _IDENTITY_FIELDS}
+    identity.update({field: row[field] for field in _FILTER_FIELDS if row.get(field) is not None})
+    return identity
+
+
+def _identity_key(identity: dict[str, Any]) -> str:
+    # Scoring expectations do not define a retrieval request; absent filters
+    # are equivalent to null placeholders in older controls.
+    normalized = {field: identity.get(field) for field in _IDENTITY_FIELDS}
+    normalized.update({field: identity[field] for field in _FILTER_FIELDS
+                       if identity.get(field) is not None})
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def compare_record(
     entries: list[dict[str, Any]], paths: tuple[str, ...], control: dict[str, Any],
     *, budget_ms: int = DEFAULT_STATUS_BUDGET_MS,
@@ -440,19 +494,68 @@ def compare_record(
     added an entry after the control was recorded, or --replay drew a
     different sample) reports "new" rather than silently matching."""
     report = run_eval_paths(entries, paths, budget_ms=budget_ms)
-    control_by_key = {(e.get("query"), e.get("path")): e for e in control.get("entries", [])}
+    control_by_key: dict[str, list[dict[str, Any]]] = {}
+    for item in control.get("entries", []):
+        if isinstance(item.get("identity"), dict):
+            control_by_key.setdefault(_identity_key(item["identity"]), []).append(item)
+    # Pre-contract records lacked filter-aware identity. They are readable but
+    # cannot safely distinguish two identical query/path pairs, so retain a
+    # compatibility key only for their old one-pair shape.
+    legacy_by_key: dict[tuple[Any, Any], list[dict[str, Any]]] = {}
+    for item in control.get("entries", []):
+        if "identity" not in item:
+            legacy_by_key.setdefault((item.get("query"), item.get("path")), []).append(item)
+    live_legacy_counts: dict[tuple[Any, Any], int] = {}
+    for row in report["rows"]:
+        pair = (row["query"], row["path"])
+        live_legacy_counts[pair] = live_legacy_counts.get(pair, 0) + 1
+    ambiguous_legacy = {
+        pair for pair, items in legacy_by_key.items()
+        if len(items) != 1 or live_legacy_counts.get(pair, 0) > 1
+    }
     diffs = []
     changed = 0
     for row in report["rows"]:
-        prior = control_by_key.get((row["query"], row["path"]))
+        identity = _entry_identity(row)
+        identity_key = _identity_key(identity)
+        queue = control_by_key.get(identity_key) or []
+        prior = queue.pop(0) if queue else None
+        prior_is_legacy = False
+        if prior is None and (row["query"], row["path"]) not in ambiguous_legacy:
+            legacy = legacy_by_key.pop((row["query"], row["path"]), [])
+            prior = legacy[0] if legacy else None
+            prior_is_legacy = prior is not None
         status = _diff_status(prior.get("got") if prior else None, row["got"])
-        if status in ("changed", "new"):
+        contract_changed = bool(prior and (
+            prior_is_legacy or any(
+                field in prior and prior.get(field) != row.get(field)
+                for field in ("outcome", "degraded", "reason")
+            )
+        ))
+        if status == "identical" and contract_changed:
+            status = "changed"
+        if status != "identical":
             changed += 1
         diffs.append({
             "query": row["query"], "path": row["path"], "status": status,
             "control_got": prior.get("got") if prior else None, "live_got": row["got"],
             "control_reason": prior.get("reason") if prior else None, "live_reason": row["reason"],
+            "control_degraded": prior.get("degraded") if prior else None,
+            "live_degraded": row["degraded"],
+            "control_outcome": prior.get("outcome") if prior else None,
+            "live_outcome": row["outcome"], "contract_changed": contract_changed,
         })
+    removed = [prior for queue in control_by_key.values() for prior in queue]
+    removed.extend(prior for items in legacy_by_key.values() for prior in items)
+    for prior in removed:
+        identity = prior.get("identity") or prior
+        diffs.append({"query": identity.get("query"), "path": identity.get("path"),
+                      "status": "removed", "control_got": prior.get("got"), "live_got": None,
+                      "control_reason": prior.get("reason"), "live_reason": None,
+                      "control_degraded": prior.get("degraded"), "live_degraded": None,
+                      "control_outcome": prior.get("outcome"), "live_outcome": None,
+                      "contract_changed": True})
+        changed += 1
     return {"stamp": _stamp(paths), "diffs": diffs, "changed": changed}
 
 
@@ -607,9 +710,8 @@ def run_relevance_eval(
     forced off and, when ``floor`` is True, on too: one run, the same entries
     both ways. Per path: abstention correctness under the requested setting
     (and without the floor, for contrast) and ``emptied_positives`` — each
-    golden positive whose query the gate emptied although the baseline
-    returned rows, by query. That list is the regression; it should be
-    empty."""
+    golden positive found at baseline whose expected hit the floor removed,
+    even when unrelated results remain. That list should be empty."""
     rows: list[dict[str, Any]] = []
     by_path: dict[str, list[dict[str, Any]]] = {p: [] for p in paths}
     for entry in entries:
@@ -648,7 +750,7 @@ def run_relevance_eval(
         if floor:
             out["abstain_correct_without"] = sum(1 for r in abstain if r["abstain_correct_without"])
             out["emptied_positives"] = [
-                r["query"] for r in positive if r["got_without"] and not r["got_with"]
+                r["query"] for r in positive if r["hit_without"] and not r["hit_with"]
             ]
         return out
 

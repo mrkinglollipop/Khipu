@@ -146,10 +146,11 @@ def fuse_ranked_lists(
     (``1 / (RRF_K + rank + 1)``), so a two-list call reproduces the same score
     ``hybrid_rerank`` would compute.
 
-    The winning row for each key is the first list's dict (deep-ish copied),
-    with ``score`` set to the summed RRF value — this overwrites any prior
-    ``score`` field (e.g. a raw cosine similarity), which is intentional: the
-    fused score is what callers should rank and filter on.
+    The first occurrence supplies the canonical payload. Later occurrences
+    fill missing metadata and preserve the maximum ``cosine`` and
+    ``lexical_hits`` evidence; ``profile`` follows the maximum cosine. Each
+    entity votes once per list and duplicate chunks do not consume ranks.
+    ``score`` is replaced with the summed RRF value.
     """
     if key is None:
 
@@ -161,13 +162,48 @@ def fuse_ranked_lists(
     order: list[Any] = []
     scores: dict[Any, float] = {}
     for rows in lists:
-        for rank, row in enumerate(rows):
+        seen_in_list: set[Any] = set()
+        unique_rank = 0
+        for row in rows:
             k = key(row)
             if k not in merged:
                 merged[k] = dict(row)
                 order.append(k)
                 scores[k] = 0.0
-            scores[k] += 1.0 / (RRF_K + rank + 1)
+            target = merged[k]
+
+            # Preserve evidence across chunks and retrieval legs without
+            # replacing the canonical row based on incomparable raw scores.
+            for field in ("cosine", "lexical_hits"):
+                try:
+                    incoming = float(row[field])
+                except (TypeError, ValueError):
+                    continue
+                except KeyError:
+                    continue
+                try:
+                    current = float(target[field])
+                except (KeyError, TypeError, ValueError):
+                    current = float("-inf")
+                if incoming > current:
+                    target[field] = row[field]
+                    if field == "cosine":
+                        if row.get("profile") not in (None, ""):
+                            target["profile"] = row["profile"]
+                        else:
+                            target.pop("profile", None)
+            for field, value in row.items():
+                if field in {"score", "profile"}:
+                    continue
+                if field not in target or target[field] in (None, ""):
+                    if value not in (None, ""):
+                        target[field] = value
+
+            if k in seen_in_list:
+                continue
+            seen_in_list.add(k)
+            scores[k] += 1.0 / (RRF_K + unique_rank + 1)
+            unique_rank += 1
     ranked = sorted(range(len(order)), key=lambda i: (-scores[order[i]], i))
     out: list[dict[str, Any]] = []
     for i in ranked[:want]:
