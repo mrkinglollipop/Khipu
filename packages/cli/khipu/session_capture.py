@@ -55,12 +55,14 @@ from __future__ import annotations
 
 import glob
 import base64
+import fcntl
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -710,7 +712,7 @@ def read_window(path: Path, offset: int) -> tuple[list[tuple[str, str]], int, in
 def render(msgs: list[tuple[str, str]], *, max_chars: int = MAX_TRANSCRIPT) -> str:
     lines = []
     for role, text in msgs:
-        lines.append(f"[tool] {text}" if role == "tool" else f"{role.upper()}: {text.strip()}")
+        lines.append(f"[tool] {text}" if role == "tool" else f"{role.upper()}: {text}")
     out = "\n\n".join(lines)
     if len(out) > max_chars:  # keep the tail, on a message boundary
         out = out[-max_chars:]
@@ -724,28 +726,28 @@ def render(msgs: list[tuple[str, str]], *, max_chars: int = MAX_TRANSCRIPT) -> s
 # A window over max_chars used to be tail-clipped by render() — the middle was
 # gone, unrecorded. Now it is split on MESSAGE boundaries into several parts,
 # each queued as its own job (chronological, oldest first); every part is
-# extracted into its own episode. MAX_WINDOW_PARTS bounds how many jobs one
-# Stop can create — beyond it, the oldest overflow is collapsed into a single
-# clipped part and truncated_chars records exactly what was dropped, so loss
-# is recorded instead of silent.
-
-MAX_WINDOW_PARTS = 8
+# extracted into its own episode. Oversize single messages are fragmented too;
+# no source window is tail-clipped.
 
 
 def _split_messages(msgs: list[tuple[str, str]], max_chars: int) -> list[list[tuple[str, str]]]:
-    """Group msgs so each group renders to at most max_chars, breaking only
-    between messages (never mid-message)."""
+    """Group messages into bounded, lossless rendered parts."""
     parts: list[list[tuple[str, str]]] = []
     cur: list[tuple[str, str]] = []
     cur_len = 0
     for role, text in msgs:
-        piece = f"[tool] {text}" if role == "tool" else f"{role.upper()}: {text.strip()}"
-        add = len(piece) + (2 if cur else 0)  # "\n\n" joiner, same as render()
-        if cur and cur_len + add > max_chars:
-            parts.append(cur)
-            cur, cur_len, add = [], 0, len(piece)
-        cur.append((role, text))
-        cur_len += add
+        prefix = "[tool] " if role == "tool" else f"{role.upper()}: "
+        body = text
+        room = max(1, max_chars - len(prefix))
+        fragments = [body[i:i + room] for i in range(0, len(body), room)] or [""]
+        for fragment in fragments:
+            piece_len = len(prefix) + len(fragment)
+            add = piece_len + (2 if cur else 0)
+            if cur and cur_len + add > max_chars:
+                parts.append(cur)
+                cur, cur_len, add = [], 0, piece_len
+            cur.append((role, fragment))
+            cur_len += add
     if cur:
         parts.append(cur)
     return parts
@@ -753,21 +755,9 @@ def _split_messages(msgs: list[tuple[str, str]], max_chars: int) -> list[list[tu
 
 def _window_parts(msgs: list[tuple[str, str]], max_chars: int) -> list[dict[str, Any]]:
     """Chronological parts, each ``{"text": ..., "truncated_chars": ...}``.
-    truncated_chars is 0 for every part unless there are more than
-    MAX_WINDOW_PARTS groups, in which case the oldest overflow is merged into
-    one part and tail-clipped (render()'s old behaviour), with the exact drop
-    recorded rather than silently lost."""
+    The split is lossless, including windows beyond the former part cap."""
     groups = _split_messages(msgs, max_chars)
-    if len(groups) <= MAX_WINDOW_PARTS:
-        return [{"text": render(g, max_chars=max_chars), "truncated_chars": 0} for g in groups]
-    keep = MAX_WINDOW_PARTS - 1
-    split_at = len(groups) - keep
-    oldest_msgs = [m for g in groups[:split_at] for m in g]
-    full = render(oldest_msgs, max_chars=10**9)
-    clipped = render(oldest_msgs, max_chars=max_chars)
-    merged = {"text": clipped, "truncated_chars": max(0, len(full) - len(clipped))}
-    rest = [{"text": render(g, max_chars=max_chars), "truncated_chars": 0} for g in groups[split_at:]]
-    return [merged, *rest]
+    return [{"text": render(g, max_chars=max_chars), "truncated_chars": 0} for g in groups]
 
 
 # ---- state + cadence ------------------------------------------------------------
@@ -841,12 +831,37 @@ def _capture_now_flag_path(harness: str, sid: str) -> Path:
     return state_dir() / f"{_safe(harness)}--{_safe(sid)}.capture-now.json"
 
 
+@contextmanager
+def _capture_now_lock(harness: str, sid: str):
+    """Keep request replacement atomic with durable enqueue acknowledgement."""
+    lock = _capture_now_flag_path(harness, sid).with_suffix(".lock")
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        stream = lock.open("a+")
+    except OSError:
+        yield False
+        return
+    with stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def request_capture_now(harness: str, sid: str, note: str | None = None) -> Path:
     p = _capture_now_flag_path(harness, sid)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"note": note or None, "requested_at": _mint_ts()}), encoding="utf-8")
-    os.replace(tmp, p)
+    with _capture_now_lock(harness, sid) as acquired:
+        if not acquired:
+            raise OSError("capture request lock unavailable")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"note": note or None, "requested_at": _mint_ts()}), encoding="utf-8")
+        os.replace(tmp, p)
     return p
 
 
@@ -862,6 +877,26 @@ def _consume_capture_now(harness: str, sid: str) -> dict | None:
     except OSError:
         pass
     return data if isinstance(data, dict) else {}
+
+
+def _pending_capture_now(harness: str, sid: str) -> dict | None:
+    """Read without acknowledging: only a durable queued job consumes it."""
+    try:
+        data = json.loads(_capture_now_flag_path(harness, sid).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else {}
+
+
+def _ack_capture_now(harness: str, sid: str, expected: dict) -> None:
+    try:
+        p = _capture_now_flag_path(harness, sid)
+        current = json.loads(p.read_text(encoding="utf-8"))
+        if current != expected:
+            return
+        p.unlink()
+    except (OSError, ValueError):
+        pass
 
 
 # A capture-now request has to name a session that is actually being captured,
@@ -1067,12 +1102,13 @@ def decide(event: str, *, user_turns: int, chars: int, elapsed_s: float, stop_ho
         return False, "stop_hook_active"
     if capture_requested:
         return True, "requested"
-    if user_turns < 1 or chars < MIN_CHARS:
-        return False, f"nothing new (turns={user_turns}, chars={chars})"
     hv_reason = _high_value_reason(window_text)
     if hv_reason:
         return True, hv_reason
-    if event in ("precompact", "sessionend"):
+    assistant_only = any(block.startswith("ASSISTANT: ") for block in window_text.split("\n\n"))
+    if chars < MIN_CHARS or (user_turns < 1 and not assistant_only):
+        return False, f"nothing new (turns={user_turns}, chars={chars})"
+    if event in ("precompact", "sessionend", "subagentstop"):
         return True, event
     if event == "stop":
         if user_turns >= MIN_TURNS:
@@ -1092,19 +1128,82 @@ def enqueue(job: dict) -> Path:
     stamp = job["ts"].replace(":", "").replace("-", "")
     dst = q / f"{stamp}-{_safe(job.get('harness', 'x'))}-{_safe(job['session_id'])[:40]}-{uuid.uuid4().hex[:8]}.json"
     tmp = dst.with_suffix(".tmp")
-    tmp.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, dst)
+    with _claim_lock() as acquired:
+        if not acquired:
+            raise OSError("queue transition lock unavailable")
+        tmp.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, dst)
     return dst
 
 
 def queued_jobs() -> list[Path]:
     try:
-        return sorted(p for p in queue_dir().glob("*.json") if not p.name.endswith(".tmp"))
+        paths = [p for p in queue_dir().glob("*.json") if not p.name.endswith(".tmp")]
     except OSError:
         return []
+    def key(path: Path) -> tuple[str, str, int, str]:
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            job = {}
+        if not isinstance(job, dict):
+            job = {}
+        return (str(job.get("ts") or ""), str(job.get("window_id") or path.name),
+                _part_index(job) or 0, path.name)
+    return sorted(paths, key=key)
 
 
 CLAIM_STALE_S = 900
+
+
+def _part_index(job: dict) -> int | None:
+    try:
+        return int(str(job.get("part") or "").split("/", 1)[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _has_earlier_sibling(job: dict) -> bool:
+    """A later window part waits until every earlier sibling is delivered."""
+    window_id, index = job.get("window_id"), _part_index(job)
+    if not window_id or index is None or index <= 1:
+        return False
+    try:
+        files = list(queue_dir().glob("*.json")) + list(queue_dir().glob("*.claimed.*"))
+        for path in files:
+            try:
+                sibling = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(sibling, dict):
+                continue
+            if sibling.get("window_id") == window_id and (_part_index(sibling) or index) < index:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+@contextmanager
+def _claim_lock():
+    """Kernel-owned lock for every queue-name transition."""
+    lock = queue_dir() / ".claim.lock"
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        stream = lock.open("a+")
+    except OSError:
+        yield False
+        return
+    with stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def _claim(job: Path) -> Path | None:
@@ -1115,29 +1214,67 @@ def _claim(job: Path) -> Path | None:
     can all drain at once, and each drain runs its OWN model extraction — two
     winners would mean two different summaries, i.e. two episodes for one
     session that no identity upsert can dedup (audit 2026-08-17: reproduced)."""
-    claimed = job.with_suffix(f".claimed.{os.getpid()}")
-    try:
-        os.rename(job, claimed)
-        return claimed
-    except OSError:
-        return None
+    with _claim_lock() as acquired:
+        if not acquired:
+            return None
+        try:
+            contents = json.loads(job.read_text(encoding="utf-8"))
+        except OSError:
+            return None
+        except ValueError:
+            contents = {}
+        if isinstance(contents, dict) and _has_earlier_sibling(contents):
+            return None
+        claimed = job.with_suffix(f".claimed.{os.getpid()}")
+        try:
+            os.rename(job, claimed)
+            return claimed
+        except OSError:
+            return None
 
 
-def _release(claimed: Path) -> None:
-    """Put a job back for a later retry (extraction/capture failed)."""
+def _release_unlocked(claimed: Path) -> None:
     try:
         os.rename(claimed, claimed.with_suffix("").with_suffix(".json"))
     except OSError:
         pass
 
 
+def _release(claimed: Path) -> None:
+    """Put a job back for a later retry (extraction/capture failed)."""
+    with _claim_lock() as acquired:
+        if acquired:
+            _release_unlocked(claimed)
+
+
+def _discard_claim(claimed: Path) -> None:
+    """Remove a delivered claim while sibling inspection is excluded."""
+    with _claim_lock() as acquired:
+        if acquired:
+            claimed.unlink(missing_ok=True)
+
+
+def _save_claimed_job(claimed: Path, job: dict) -> None:
+    """Durably checkpoint model output before attempting delivery."""
+    # Keep partial checkpoints outside ``*.claimed.*`` discovery: a crash after
+    # this write must not create an immortal fake claimant that blocks siblings.
+    tmp = claimed.with_name(f".extract-{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, claimed)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _claimant_gone(claimed: Path) -> bool:
     """True only when the pid in a claim's name certainly no longer exists.
 
-    A harness that kills its Stop hook at the timeout takes the inline drain
-    with it, and the claim then held the job for CLAIM_STALE_S with nobody
-    working on it. Anything short of "no such process" (a pid we may not
-    signal, a name we cannot parse) keeps the claim until it ages out."""
+    A killed drainer can leave a claim with nobody working on it. Anything
+    short of "no such process" (a pid we may not signal, a name we cannot
+    parse) keeps the claim; file age alone never proves abandoned ownership."""
     try:
         pid = int(claimed.name.rsplit(".", 1)[-1])
     except ValueError:
@@ -1156,17 +1293,21 @@ def _claimant_gone(claimed: Path) -> bool:
 def _reclaim_stale() -> int:
     """A drain that died mid-job leaves a .claimed file; give it back."""
     n = 0
-    now = time.time()
-    try:
-        for c in queue_dir().glob("*.claimed.*"):
-            try:
-                if now - c.stat().st_mtime > CLAIM_STALE_S or _claimant_gone(c):
-                    _release(c)
-                    n += 1
-            except OSError:
-                continue
-    except OSError:
-        return 0
+    with _claim_lock() as acquired:
+        if not acquired:
+            return 0
+        try:
+            for c in queue_dir().glob("*.claimed.*"):
+                try:
+                    # File age is not ownership evidence: a slow provider call can
+                    # outlive the lease. Reclaim only after its claimant is gone.
+                    if _claimant_gone(c):
+                        _release_unlocked(c)
+                        n += 1
+                except OSError:
+                    continue
+        except OSError:
+            return 0
     return n
 
 
@@ -1188,17 +1329,49 @@ def _read_beat(harness: str) -> dict:
 
 
 def _write_beat(harness: str, beat: dict) -> None:
+    tmp: Path | None = None
     try:
         p = dispatch_path(harness)
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(beat), encoding="utf-8")
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=p.parent, prefix=f".{p.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            json.dump(beat, stream)
+            tmp = Path(stream.name)
         os.replace(tmp, p)
     except OSError:
         pass
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
-def _heartbeat(harness: str, out: dict) -> None:
+@contextmanager
+def _beat_lock(harness: str):
+    """Kernel-owned per-harness lock for heartbeat read-modify-write."""
+    lock = dispatch_path(harness).with_suffix(".lock")
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        stream = lock.open("a+")
+    except OSError:
+        yield False
+        return
+    with stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _heartbeat_unlocked(harness: str, out: dict) -> None:
     """Record that the harness really invoked us, and keep the running facts
     liveness needs. `verify` reads this instead of assuming dispatch — the
     assumption that hid a silent failure once."""
@@ -1248,12 +1421,18 @@ def _heartbeat(harness: str, out: dict) -> None:
     _write_beat(harness, beat)
 
 
+def _heartbeat(harness: str, out: dict) -> None:
+    with _beat_lock(harness) as acquired:
+        if acquired:
+            _heartbeat_unlocked(harness, out)
+
+
 def last_dispatch(harness: str = "aegis") -> dict | None:
     b = _read_beat(harness)
     return b or None
 
 
-def _record_drain(harness: str, *, captured: bool, error: str | None = None, empty: bool = False) -> None:
+def _record_drain_unlocked(harness: str, *, captured: bool, error: str | None = None, empty: bool = False) -> None:
     beat = _read_beat(harness)
     now = _mint_ts()
     if captured:
@@ -1275,6 +1454,12 @@ def _record_drain(harness: str, *, captured: bool, error: str | None = None, emp
         beat["last_drain_error_at"] = now
     beat.setdefault("harness", harness)
     _write_beat(harness, beat)
+
+
+def _record_drain(harness: str, *, captured: bool, error: str | None = None, empty: bool = False) -> None:
+    with _beat_lock(harness) as acquired:
+        if acquired:
+            _record_drain_unlocked(harness, captured=captured, error=error, empty=empty)
 
 
 def _redact_messages(msgs: list[tuple[str, str]], harness: str, sid: str) -> list[tuple[str, str]]:
@@ -1310,7 +1495,10 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     # K3: split on message boundaries instead of tail-clipping — every
     # part is queued and extracted into its own episode.
     parts = _window_parts(msgs, MAX_TRANSCRIPT)
-    window_id = uuid.uuid4().hex if len(parts) > 1 else None
+    # A retry after a crash must identify the same logical window at delivery.
+    window_id = hashlib.sha256(
+        f"{harness}:{sid}:{off_before}:{new_off}".encode("utf-8")
+    ).hexdigest() if len(parts) > 1 else None
     queued_names: list[str] = []
     thread = cache_thread(st, sid)
     for i, part in enumerate(parts, start=1):
@@ -1333,7 +1521,9 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
         queued_names.append(p.name)
     # Advance only after every part is on disk: a crash partway
     # re-queues the same window (dedup at drain) rather than losing it.
-    st.update(offset=new_off, last_ts=time.time(), queued=int(st.get("queued", 0)) + len(queued_names))
+    now = time.time()
+    st.update(offset=new_off, last_ts=now, window_started_ts=now,
+              queued=int(st.get("queued", 0)) + len(queued_names))
     save_state(harness, track_sid, st, preserve_mtime=preserve_mtime)
     return queued_names
 
@@ -1435,7 +1625,8 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                     start = max(0, path.stat().st_size - FIRST_SIGHT_TAIL)
                 except OSError:
                     start = 0
-                save_state(harness, track_sid, {"offset": start, "last_ts": time.time(), "captures": 0,
+                save_state(harness, track_sid, {"offset": start, "last_ts": 0.0,
+                                                 "window_started_ts": time.time(), "captures": 0,
                                                  "transcript_path": str(path)})
             st = load_state(harness, track_sid)
             msgs, new_off, turns = read_window(path, int(st.get("offset", 0)))
@@ -1447,51 +1638,61 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
             # K3: the full window, unclipped — decide() and the high-value scan see
             # everything; only the job-splitting step below ever bounds it.
             full_text = render(msgs, max_chars=10**9)
-            capture_now = _consume_capture_now(harness, track_sid)
-            capture_note = ""
-            if capture_now:
-                capture_note, note_redacted = redact_secrets(str(capture_now.get("note") or ""))
-                if note_redacted:
-                    _log(f"[{harness}] {sid} redacted {note_redacted} secret(s) from a capture-now note")
-            due, reason = decide(
-                "stop" if is_subagent_stop else event,
-                user_turns=turns, chars=len(full_text),
-                elapsed_s=time.time() - float(st.get("last_ts") or 0),
-                stop_hook_active=bool(_get(env, "stopHookActive", "stop_hook_active", default=False)),
-                window_text=full_text, capture_requested=capture_now is not None,
-            )
-            out.update(due=due, reason=reason, new_turns=turns, new_chars=len(full_text))
-            # Where the hook's parse reached, and when — liveness compares the
-            # transcript against THIS, not its mtime: Aegis writes housekeeping
-            # (workflow_updated) into idle sessions' updates.jsonl, so mtime moves
-            # with no turn in it (2026-08-24 false red).
-            st.update(seen_end=new_off, seen_ts=time.time(), transcript_path=str(path),
-                      host_pids=ancestor_pids())
-            if session_cwd(env):
-                st["cwd"] = session_cwd(env)
-            st["session_id"] = track_sid if is_subagent_stop else sid
-            st["parent_session_id"] = sid if is_subagent_stop else (
-                parent_session_id(env, harness=harness, sid=sid) or None)
-            if is_subagent_stop:
-                st["subagent"] = True
-            if not due and turns:
-                # When this session's uncaptured window began (its last capture, or
-                # first sight) — liveness ages pending turns from here.
-                last = float(st.get("last_ts") or 0)
-                out["pending_since"] = datetime.fromtimestamp(last, tz=timezone.utc).isoformat(
-                    timespec="seconds").replace("+00:00", "Z") if last else out["at"]
-            if due:
-                queued_names = _enqueue_window(
-                    harness=harness, sid=track_sid if is_subagent_stop else sid, track_sid=track_sid,
-                    cwd=session_cwd(env), event=event, path=path, st=st, msgs=msgs,
-                    new_off=new_off, turns=turns, job_parent=st["parent_session_id"],
-                    capture_note=capture_note,
+            with _capture_now_lock(harness, track_sid) as request_locked:
+                capture_now = _pending_capture_now(harness, track_sid) if request_locked else None
+                capture_note = ""
+                if capture_now:
+                    capture_note, note_redacted = redact_secrets(str(capture_now.get("note") or ""))
+                    if note_redacted:
+                        _log(f"[{harness}] {sid} redacted {note_redacted} secret(s) from a capture-now note")
+                    if not msgs:
+                        # A direct capture request is itself durable user intent;
+                        # retain it even when the transcript writer has no unread
+                        # turn yet. `turns` remains zero: this does not fabricate
+                        # cadence history.
+                        msgs = [("user", f"Capture note: {capture_note or 'capture requested'}")]
+                        full_text = render(msgs, max_chars=10**9)
+                due, reason = decide(
+                    "subagentstop" if is_subagent_stop else event,
+                    user_turns=turns, chars=len(full_text),
+                    elapsed_s=time.time() - float(st.get("last_ts") or st.get("window_started_ts") or time.time()),
+                    stop_hook_active=bool(_get(env, "stopHookActive", "stop_hook_active", default=False)),
+                    window_text=full_text, capture_requested=capture_now is not None,
                 )
-                out["queued"] = queued_names[0] if len(queued_names) == 1 else queued_names
-                _log(f"{harness}:{sid}: {event} due ({reason}) -> queued {len(queued_names)} part(s) "
-                     f"({turns} turns, {len(full_text)} chars)")
-            else:
-                save_state(harness, track_sid, st)
+                out.update(due=due, reason=reason, new_turns=turns, new_chars=len(full_text))
+                # Where the hook's parse reached, and when — liveness compares the
+                # transcript against THIS, not its mtime: Aegis writes housekeeping
+                # (workflow_updated) into idle sessions' updates.jsonl, so mtime moves
+                # with no turn in it (2026-08-24 false red).
+                st.update(seen_end=new_off, seen_ts=time.time(), transcript_path=str(path),
+                          host_pids=ancestor_pids())
+                if session_cwd(env):
+                    st["cwd"] = session_cwd(env)
+                st["session_id"] = track_sid if is_subagent_stop else sid
+                st["parent_session_id"] = sid if is_subagent_stop else (
+                    parent_session_id(env, harness=harness, sid=sid) or None)
+                if is_subagent_stop:
+                    st["subagent"] = True
+                if not due and turns:
+                    # When this session's uncaptured window began (its last capture, or
+                    # first sight) — liveness ages pending turns from here.
+                    last = float(st.get("last_ts") or st.get("window_started_ts") or 0)
+                    out["pending_since"] = datetime.fromtimestamp(last, tz=timezone.utc).isoformat(
+                        timespec="seconds").replace("+00:00", "Z") if last else out["at"]
+                if due:
+                    queued_names = _enqueue_window(
+                        harness=harness, sid=track_sid if is_subagent_stop else sid, track_sid=track_sid,
+                        cwd=session_cwd(env), event=event, path=path, st=st, msgs=msgs,
+                        new_off=new_off, turns=turns, job_parent=st["parent_session_id"],
+                        capture_note=capture_note,
+                    )
+                    out["queued"] = queued_names[0] if len(queued_names) == 1 else queued_names
+                    if queued_names and capture_now is not None:
+                        _ack_capture_now(harness, track_sid, capture_now)
+                    _log(f"{harness}:{sid}: {event} due ({reason}) -> queued {len(queued_names)} part(s) "
+                         f"({turns} turns, {len(full_text)} chars)")
+                else:
+                    save_state(harness, track_sid, st)
     except Exception as e:  # noqa: BLE001 — a hook must never fail a session
         out["error"] = f"{type(e).__name__}: {e}"
         _log(f"{harness}:{sid or '?'}: hook error {out['error']}")
@@ -1583,9 +1784,6 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                         or now - info.st_mtime < MIN_MINUTES * 60:
                     skip("not_idle")
                     continue
-                if float(st.get("last_ts") or 0) >= info.st_mtime:
-                    skip("already_captured")
-                    continue
                 if st.get("sweep_checked_mtime") == info.st_mtime:
                     skip("unchanged")
                     continue
@@ -1624,7 +1822,11 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                             break
                         st.pop("sweep_error", None)
                         st["sweep_checked_mtime"] = info.st_mtime
-                        if turns < 1 or chars < MIN_CHARS:
+                        idle_due, _ = decide("idle_sweep", user_turns=turns, chars=chars,
+                                             elapsed_s=0, stop_hook_active=False,
+                                             window_text=render(msgs, max_chars=10**9))
+                        assistant_only = any(role == "assistant" for role, _ in msgs)
+                        if not (idle_due or (chars >= MIN_CHARS and (turns or assistant_only))):
                             skip("nothing_new")
                             if not dry_run:
                                 save_state(harness, track_sid, st, preserve_mtime=True)
@@ -1682,8 +1884,6 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
     sweep_out = sweep_idle(dry_run=dry_run) if sweep else None
     reclaimed = _reclaim_stale()
     jobs = queued_jobs()
-    if limit is not None:
-        jobs = jobs[:limit]
     out = {"jobs": len(jobs), "captured": 0, "empty": 0, "failed": 0, "skipped_claimed": 0}
     if sweep_out is not None:
         out["sweep"] = sweep_out
@@ -1696,7 +1896,10 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
     from khipu.extract import extract_memory
 
     mode = capture_mode()
+    started = 0
     for original in jobs:
+        if limit is not None and started >= limit:
+            break
         if deadline is not None and time.monotonic() >= deadline:
             out["time_budget_exhausted"] = True
             break
@@ -1704,6 +1907,7 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         if jp is None:                       # another drain got it first
             out["skipped_claimed"] += 1
             continue
+        started += 1
         try:
             job = json.loads(jp.read_text(encoding="utf-8"))
         except (OSError, ValueError) as e:
@@ -1735,20 +1939,33 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         # O4: same tier as verbatim above — paths written/created, PR/issue
         # URLs, release tags, never lost to summarisation either.
         deliverables = extract_deliverables(job.get("transcript", ""))
-        try:
-            payload = extract_memory(job.get("transcript", ""), cwd=job.get("cwd", ""))
-        except Exception as e:  # noqa: BLE001 — model/transport: keep the job, retry later
+        cached = job.get("extracted_payload")
+        if isinstance(cached, dict):
+            payload = dict(cached)
+        else:
+            try:
+                payload = extract_memory(job.get("transcript", ""), cwd=job.get("cwd", ""))
+            except Exception as e:  # noqa: BLE001 — model/transport: keep the job, retry later
+                out["failed"] += 1
+                _release(jp)
+                _record_drain(harness, captured=False, error=f"extract: {type(e).__name__}: {e}")
+                _log(f"drain: extraction failed for {original.name}, kept: {e}")
+                continue
+        if payload is None:
             out["failed"] += 1
             _release(jp)
-            _record_drain(harness, captured=False, error=f"extract: {type(e).__name__}: {e}")
-            _log(f"drain: extraction failed for {original.name}, kept: {e}")
+            _record_drain(harness, captured=False, error="extract: no payload")
+            _log(f"drain: extraction returned no payload for {original.name}; kept")
             continue
-        if payload is None:
-            out["empty"] += 1
-            jp.unlink(missing_ok=True)
-            _record_drain(harness, captured=False, empty=True)
-            _log(f"drain: nothing durable in {original.name}; dropped")
-            continue
+        if not isinstance(cached, dict):
+            job["extracted_payload"] = payload
+            try:
+                _save_claimed_job(jp, job)
+            except OSError as e:
+                out["failed"] += 1
+                _release(jp)
+                _record_drain(harness, captured=False, error=f"extract checkpoint: {e}")
+                continue
         payload["session_id"] = f"{harness}:{job.get('session_id')}"
         payload["scope"] = payload.get("scope") or f"{harness} {job.get('event')}"
         # The trigger itself, not just its trace in `scope`: commitments'
@@ -1786,6 +2003,8 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         payload["truncated_chars"] = int(job.get("truncated_chars") or 0)
         if job.get("window_id"):
             payload["window_id"] = job["window_id"]
+        if job.get("part"):
+            payload["part"] = job["part"]
         if dry_run:
             print(json.dumps(payload, indent=2))
             out["captured"] += 1
@@ -1798,7 +2017,7 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
             _record_drain(harness, captured=False, error=f"capture rc={rc}")
             _log(f"drain: capture rc={rc} for {original.name}; kept")
             continue
-        jp.unlink(missing_ok=True)
+        _discard_claim(jp)
         out["captured"] += 1
         _record_drain(harness, captured=True)
         _log(f"drain: captured {original.name} -> {payload['summary'][:90]!r}")
@@ -1832,15 +2051,32 @@ def _age(ts: Any) -> int | None:
 def _queue_by_harness() -> dict[str, dict]:
     out: dict[str, dict] = {}
     now = time.time()
-    for p in queued_jobs():
+    try:
+        paths = [(p, False) for p in queued_jobs()] + [
+            (p, True) for p in queue_dir().glob("*.claimed.*")
+        ]
+    except OSError:
+        paths = []
+    for p, claimed in paths:
+        try:
+            job = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            job = {}
+        if not isinstance(job, dict):
+            job = {}
         parts = p.name.split("-")
-        h = parts[1] if len(parts) > 2 else "aegis"
+        h = str(job.get("harness") or (parts[1] if len(parts) > 2 else "aegis"))
         try:
             age = int(now - p.stat().st_mtime)
         except OSError:
             age = 0
-        d = out.setdefault(h, {"depth": 0, "oldest_age_s": 0, "oldest_job": None})
+        d = out.setdefault(h, {"depth": 0, "claimed_depth": 0, "dead_claims": 0,
+                               "oldest_age_s": 0, "oldest_job": None})
         d["depth"] += 1
+        if claimed:
+            d["claimed_depth"] += 1
+            if _claimant_gone(p):
+                d["dead_claims"] += 1
         if age >= d["oldest_age_s"]:
             d["oldest_age_s"], d["oldest_job"] = age, p.name
     return out
@@ -1848,10 +2084,12 @@ def _queue_by_harness() -> dict[str, dict]:
 
 def status(harness: str = "aegis") -> dict:
     """Single-harness status (queue + last dispatch), as the Aegis pane used it."""
-    q = _queue_by_harness().get(harness, {"depth": 0, "oldest_age_s": None, "oldest_job": None})
+    q = _queue_by_harness().get(harness, {"depth": 0, "claimed_depth": 0, "dead_claims": 0,
+                                                 "oldest_age_s": None, "oldest_job": None})
     ld = last_dispatch(harness)
     return {"home": str(khipu_home()), "harness": harness,
             "queue_depth": q["depth"], "oldest_job": q["oldest_job"],
+            "claimed_depth": q["claimed_depth"], "dead_claims": q["dead_claims"],
             "last_dispatch": ld, "last_dispatch_age_s": _age(ld.get("at")) if ld else None,
             "sessions_tracked": len(list(state_dir().glob(f"{_safe(harness)}--*.json"))) if state_dir().is_dir() else 0}
 
@@ -1937,7 +2175,8 @@ def liveness(harness: str) -> dict:
           STUCK_TURNS turns / STUCK_MINUTES (the cadence is not firing).
     """
     beat = _read_beat(harness)
-    q = _queue_by_harness().get(harness, {"depth": 0, "oldest_age_s": None, "oldest_job": None})
+    q = _queue_by_harness().get(harness, {"depth": 0, "dead_claims": 0,
+                                                 "oldest_age_s": None, "oldest_job": None})
     reasons: list[str] = []
     if not beat:
         return {"harness": harness, "ok": True, "seen": False, "reasons": [],
@@ -1950,6 +2189,8 @@ def liveness(harness: str) -> dict:
         reasons.append(f"last capture attempt failed: {str(beat['last_drain_error'])[:120]}")
     if q["depth"] and (q.get("oldest_age_s") or 0) > QUEUE_STALE_S:
         reasons.append(f"{q['depth']} job(s) waiting {q['oldest_age_s'] // 60} min — nothing is draining them")
+    if q.get("dead_claims"):
+        reasons.append(f"{q['dead_claims']} claimed job(s) owned by a dead process — recovery is required")
     pend = int(beat.get("pending_turns") or 0)
     since = _age(beat.get("pending_since"))
     # "The hook keeps running and never decides due" requires evidence the hook
