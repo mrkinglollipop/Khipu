@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -79,9 +80,9 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
   marked "needs the user" are the user's to do or decide, not yours; the
   moment the user says one is done, close it here instead of waiting for the
   next capture to notice. Close your own promises when you keep them.
-- `khipu_forget` forgets one episode completely (row, vectors, the
-  commitments it opened, its legacy line) — for a capture that was wrong or a
-  test. Through the gateway only cloud-harness captures can be forgotten.
+- `khipu_forget` tombstones the hub row; search-vector and replica/legacy
+  cleanup is best-effort. Current gaps persist: graph-derived data; closed commitments remain;
+  backup copies are retained for recovery. Gateway covers cloud captures only.
 - `khipu_decisions` lists decisions with their validity (standing/superseded/
   retracted/conflicts); `khipu_decisions_update` supersedes, restores,
   retracts, confirms or rejects one — supersede when a decision is reversed, never for a refinement.
@@ -307,8 +308,7 @@ def _stale_project_slice(project: str | None, host: str | None) -> str:
     `raw.parent_session_id` (the snapshot's episodes table carries neither as
     a real column, and has no commitments table at all — a documented
     limitation surfaced by the `stale` line, not silently hidden). Never
-    raises; empty string on any further failure, which lets the caller fall
-    through to the plain cwd-token search."""
+    raises; empty string on any further failure."""
     if not project and not host:
         return ""
     try:
@@ -320,10 +320,22 @@ def _stale_project_slice(project: str | None, host: str | None) -> str:
         return ""
     hits: list[tuple[str, str]] = []
     try:
-        cur = con.execute(
-            "SELECT id, summary, raw FROM episodes "
-            "ORDER BY COALESCE(ingested_at, ts) DESC LIMIT 200"
-        )
+        try:
+            # Filter before limiting so a dense tombstone tail cannot crowd
+            # live context out of the candidate window.
+            cur = con.execute(
+                "SELECT id, summary, raw FROM episodes WHERE deleted_at IS NULL "
+                "ORDER BY COALESCE(ingested_at, ts) DESC LIMIT 200"
+            )
+        except sqlite3.OperationalError as exc:
+            # Only genuinely old replicas may use the unfiltered query. Any
+            # other read failure fails closed rather than exposing tombstones.
+            if "no such column: deleted_at" not in str(exc).lower():
+                raise
+            cur = con.execute(
+                "SELECT id, summary, raw FROM episodes "
+                "ORDER BY COALESCE(ingested_at, ts) DESC LIMIT 200"
+            )
         for eid, summary, raw in cur.fetchall():
             proj = parent = None
             if raw:
@@ -396,7 +408,10 @@ def _pushed_memory_slice(cwd: str | None) -> str:
             stale = _stale_project_slice(project, host)
             if stale:
                 return stale
-            _ = exc  # PG unreachable and no snapshot to degrade to — fall through below
+            # The project-slice hub attempt already failed. Do not immediately
+            # repeat live DB work through the cwd and recents fallbacks.
+            _ = exc
+            return ""
         if slice_data and (slice_data.get("commitments") or slice_data.get("episodes")):
             return _render_project_slice(project or host or "unknown", slice_data)
 
