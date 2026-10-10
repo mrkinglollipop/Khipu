@@ -64,6 +64,118 @@ function script(khipu: (args: string[]) => Promise<string> | string) {
 const railText = () => document.querySelector(".rail-health")?.textContent ?? "";
 
 describe("App — doctor reads", () => {
+  it("routes a failed gateway through its diagnostics instead of reinstalling a hook", async () => {
+    const gateway = {
+      ok: false,
+      red: ["gateway"],
+      harnesses: { gateway: { ok: false, seen: true, reasons: ["token rejected"] } },
+    };
+    script((args) => args[0] === "doctor" ? doctorDoc({ capture_liveness: gateway }) : "{}");
+    render(<App />);
+    expect(await screen.findByText("Gateway is not reachable")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reinstall hook" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open Harnesses" }));
+    expect(screen.getByRole("heading", { name: "Harnesses" })).toBeInTheDocument();
+  });
+
+  it("keeps configured connection presence separate from a failed database probe", async () => {
+    invokeMock.mockImplementation(async (cmd: string, payload?: { args?: string[] }) => {
+      if (cmd === "dsn_configured") return true;
+      if (cmd === "khipu_db_status") return JSON.stringify({ ok: false, error: "connection refused" });
+      if (cmd === "run_khipu" && payload?.args?.[0] === "doctor") return doctorDoc();
+      return JSON.stringify({ ok: true });
+    });
+    render(<App />);
+    expect((await screen.findAllByText("Not reachable")).length).toBeGreaterThan(0);
+    expect(screen.queryByText("Connected")).not.toBeInTheDocument();
+  });
+
+  it("rechecks the database connection when asked", async () => {
+    let statusReads = 0;
+    invokeMock.mockImplementation(async (cmd: string, payload?: { args?: string[] }) => {
+      if (cmd === "dsn_configured") return true;
+      if (cmd === "khipu_db_status") {
+        statusReads += 1;
+        return JSON.stringify({ ok: true });
+      }
+      if (cmd === "liveness_now") return JSON.stringify({ ok: true, red: [], harnesses: {} });
+      if (cmd === "run_khipu" && payload?.args?.[0] === "doctor") return doctorDoc();
+      return JSON.stringify({ ok: true });
+    });
+    render(<App />);
+    await waitFor(() => expect(statusReads).toBeGreaterThan(0));
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    const before = statusReads;
+    fireEvent.click(await screen.findByRole("button", { name: "Recheck connection" }));
+    await waitFor(() => expect(statusReads).toBeGreaterThan(before));
+  });
+
+  it("does not turn a failed live-session response into an empty successful card", async () => {
+    invokeMock.mockImplementation(async (cmd: string, payload?: { args?: string[] }) => {
+      if (cmd === "dsn_configured") return true;
+      if (cmd === "khipu_db_status") return JSON.stringify({ ok: true });
+      if (cmd === "liveness_now") return JSON.stringify({ ok: false, error: "hub unavailable", red: [], harnesses: {} });
+      if (cmd === "run_khipu" && payload?.args?.[0] === "doctor") return doctorDoc();
+      return JSON.stringify({ ok: true });
+    });
+    render(<App />);
+    expect(await screen.findByText("Could not check live sessions")).toBeInTheDocument();
+    expect(screen.queryByText("No live sessions yet")).not.toBeInTheDocument();
+  });
+
+  it("does not count unseen harnesses as recording or call an all-unseen report clear", async () => {
+    script((args) => args[0] === "doctor"
+      ? doctorDoc({ capture_liveness: { ok: true, red: [], harnesses: { claude_code: { ok: true, seen: false } } } })
+      : "{}");
+    render(<App />);
+    expect(await screen.findByText("0 of 1")).toBeInTheDocument();
+    expect(screen.queryByText("Everything is recording and in sync")).not.toBeInTheDocument();
+  });
+
+  it("counts only proven harnesses in a mixed liveness report", async () => {
+    script((args) => args[0] === "doctor"
+      ? doctorDoc({ capture_liveness: { ok: true, red: [], harnesses: {
+        claude_code: { ok: true, seen: true },
+        codex: { ok: true, seen: false },
+        cursor: { ok: true, seen: false },
+      } } })
+      : "{}");
+    render(<App />);
+    expect(await screen.findByText("1 of 3")).toBeInTheDocument();
+    expect(screen.queryByText("Everything is recording and in sync")).not.toBeInTheDocument();
+  });
+
+  it("marks retained doctor data stale when its refresh fails", async () => {
+    let fail = false;
+    script((args) => {
+      if (args[0] !== "doctor") return "{}";
+      if (fail) throw new Error("hub unavailable");
+      return doctorDoc();
+    });
+    render(<App />);
+    await screen.findByText("Everything is recording and in sync");
+    fail = true;
+    fireEvent.click(screen.getAllByRole("button", { name: "Refresh" })[0]);
+    expect(await screen.findByText("Health check failed")).toBeInTheDocument();
+    expect(screen.queryByText("Everything is recording and in sync")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss error" }));
+    expect(screen.getByText("Health check failed")).toBeInTheDocument();
+  });
+
+  it("shows a loading live-session read instead of an empty result", async () => {
+    let resolveLive: ((value: string) => void) | undefined;
+    invokeMock.mockImplementation(async (cmd: string, payload?: { args?: string[] }) => {
+      if (cmd === "dsn_configured") return true;
+      if (cmd === "khipu_db_status") return JSON.stringify({ ok: true });
+      if (cmd === "liveness_now") return new Promise<string>((resolve) => { resolveLive = resolve; });
+      if (cmd === "run_khipu" && payload?.args?.[0] === "doctor") return doctorDoc();
+      return JSON.stringify({ ok: true });
+    });
+    render(<App />);
+    expect(await screen.findByText("Checking live sessions")).toBeInTheDocument();
+    expect(screen.queryByText("No live sessions yet")).not.toBeInTheDocument();
+    resolveLive?.(JSON.stringify({ ok: true, red: [], harnesses: {} }));
+  });
   it("ignores a doctor answer that arrives after a newer one", async () => {
     const doctorReleases: Array<(v: string) => void> = [];
     script((args) => {

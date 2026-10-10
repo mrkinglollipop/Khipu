@@ -64,7 +64,7 @@ describe("RightNowCard", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows the empty state when no harness has run a hook yet", () => {
+  it("does not call an uncollected liveness payload an empty session list", () => {
     render(
       <RightNowCard
         liveness={null}
@@ -73,7 +73,45 @@ describe("RightNowCard", () => {
         onCaptureNow={() => {}}
       />,
     );
+    expect(screen.getByText("Live sessions not checked")).toBeInTheDocument();
+  });
+
+  it("shows the empty state only for an explicit valid empty payload", () => {
+    render(
+      <RightNowCard
+        liveness={{ ok: true, harnesses: {} }}
+        busy={false}
+        message={null}
+        onCaptureNow={() => {}}
+      />,
+    );
     expect(screen.getByText("No live sessions yet")).toBeInTheDocument();
+  });
+
+  it("does not treat a failed or loading read as a valid empty session list", () => {
+    const { rerender } = render(
+      <RightNowCard
+        liveness={null}
+        busy={false}
+        message={null}
+        loading
+        error={null}
+        onCaptureNow={() => {}}
+      />,
+    );
+    expect(screen.getByText("Checking live sessions")).toBeInTheDocument();
+
+    rerender(
+      <RightNowCard
+        liveness={null}
+        busy={false}
+        message={null}
+        loading={false}
+        error="hub unavailable"
+        onCaptureNow={() => {}}
+      />,
+    );
+    expect(screen.getByText("Could not check live sessions")).toBeInTheDocument();
   });
 
   it("Capture now calls the handler and shows a busy label while pending", () => {

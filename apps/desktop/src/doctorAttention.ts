@@ -55,6 +55,18 @@ export function buildAttention(parsed: Record<string, unknown>): {
     for (const h of lv.red ?? []) {
       const why = (lv.harnesses?.[h]?.reasons ?? []).join("; ");
       issues.push(`Not recording ${h}: ${why || "see report"}`);
+      if (h === "gateway") {
+        items.push({
+          key: "liveness:gateway",
+          tone: "err",
+          title: "Gateway is not reachable",
+          cause: why
+            ? `The gateway check failed: ${why}. Open Harnesses to inspect the gateway connection.`
+            : "The gateway check failed. Open Harnesses to inspect the gateway connection.",
+          fix: { label: "Open Harnesses", kind: "open-harnesses" },
+        });
+        continue;
+      }
       items.push({
         key: `liveness:${h}`,
         tone: "err",
