@@ -36,6 +36,11 @@ class DumpDockerExecTest(unittest.TestCase):
                 proc.returncode = 0
                 proc.stderr = ""
                 proc.stdout = ""
+                if args[:2] == ["inspect", LIVE_CONTAINER]:
+                    proc.stdout = ('[{"HostConfig":{"PortBindings":{"5432/tcp":'
+                                   '[{"HostIp":"127.0.0.1","HostPort":"54329"}]}},'
+                                   '"Mounts":[{"Name":"khipu-pgdata",'
+                                   '"Destination":"/var/lib/postgresql"}]}]')
                 if args and args[0] == "cp":
                     Path(args[2]).write_bytes(b"FAKEDUMP")
                 return proc
@@ -43,6 +48,10 @@ class DumpDockerExecTest(unittest.TestCase):
             with (
                 mock.patch.dict(
                     os.environ, {"KHIPU_PG_DUMP": "", "KHIPU_PG_RESTORE": ""}
+                ),
+                mock.patch(
+                    "khipu.components_backup.read_versions",
+                    return_value={"postgres": {"mode": "local_docker", "container": LIVE_CONTAINER, "port": 54329}},
                 ),
                 mock.patch("khipu.components_backup._docker", side_effect=fake_docker),
                 mock.patch(
@@ -335,11 +344,20 @@ class DumpDockerExecTest(unittest.TestCase):
                 proc.returncode = 0
                 proc.stderr = ""
                 proc.stdout = ""
+                if args[:2] == ["inspect", LIVE_CONTAINER]:
+                    proc.stdout = ('[{"HostConfig":{"PortBindings":{"5432/tcp":'
+                                   '[{"HostIp":"127.0.0.1","HostPort":"54329"}]}},'
+                                   '"Mounts":[{"Name":"khipu-pgdata",'
+                                   '"Destination":"/var/lib/postgresql"}]}]')
                 return proc
 
             with (
                 mock.patch.dict(
                     os.environ, {"KHIPU_PG_DUMP": "", "KHIPU_PG_RESTORE": ""}
+                ),
+                mock.patch(
+                    "khipu.components_backup.read_versions",
+                    return_value={"postgres": {"mode": "local_docker", "container": LIVE_CONTAINER, "port": 54329}},
                 ),
                 mock.patch("khipu.components_backup._docker", side_effect=fake_docker),
                 mock.patch(

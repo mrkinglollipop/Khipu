@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from datetime import datetime, timezone
@@ -52,6 +53,48 @@ def _password_from_dsn(dsn: str) -> str:
     if ":" not in userinfo:
         return ""
     return unquote(userinfo.split(":", 1)[1])
+
+
+def _active_local_docker_backup(dsn: str) -> bool:
+    """Whether the fixed Docker container is the active database endpoint."""
+    from psycopg.conninfo import conninfo_to_dict
+
+    postgres = read_versions().get("postgres")
+    if not isinstance(postgres, dict) or postgres.get("mode") != "local_docker":
+        return False
+    if str(postgres.get("container") or PG_CONTAINER) != PG_CONTAINER:
+        return False
+    try:
+        info = conninfo_to_dict(dsn)
+        if info.get("service") or info.get("hostaddr") or not info.get("host"):
+            return False
+        port = int(info.get("port") or 5432)
+        expected_port = int(postgres.get("port"))
+    except (TypeError, ValueError):
+        return False
+    host = str(info.get("host") or "").lower()
+    if not (host in {"127.0.0.1", "::1"} and port == expected_port and (
+        info.get("dbname") or info.get("db")
+    ) == "khipu"):
+        return False
+    try:
+        inspected = _docker(["inspect", PG_CONTAINER], timeout=30, check=False)
+        rows = json.loads(inspected.stdout or "") if inspected.returncode == 0 else []
+        row = rows[0] if isinstance(rows, list) and rows else {}
+        bindings = row.get("HostConfig", {}).get("PortBindings", {}).get("5432/tcp") or []
+        bound = any(
+            str(binding.get("HostPort") or "") == str(expected_port)
+            and str(binding.get("HostIp") or "") == host
+            for binding in bindings if isinstance(binding, dict)
+        )
+        mounted = any(
+            mount.get("Name") == "khipu-pgdata"
+            and mount.get("Destination") == "/var/lib/postgresql"
+            for mount in row.get("Mounts", []) if isinstance(mount, dict)
+        )
+    except (AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bound and mounted
 
 
 def _docker_exec_pg(
@@ -144,6 +187,12 @@ def _dump_live_db(dest: Path) -> dict:
         dsn = resolve_dsn()
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"dsn_unavailable: {exc}"}
+    if not _active_local_docker_backup(dsn):
+        return {
+            "ok": False,
+            "error": "docker_dump_requires_active_local_dsn",
+            "detail": "The fixed local Docker container is not the active Khipu database. Install or configure a host pg_dump for this DSN.",
+        }
     password = _password_from_dsn(dsn)
     try:
         dump_proc = _docker_exec_pg(
