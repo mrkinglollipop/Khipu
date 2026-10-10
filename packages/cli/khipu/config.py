@@ -25,6 +25,10 @@ DEFAULT_CAPTURE_MODE = "dual"
 CONFIG_NAME = "config.json"
 
 
+class InvalidConfigDocument(ValueError):
+    """An existing config document cannot safely be changed."""
+
+
 def config_file() -> Path:
     from khipu.paths import data_dir
 
@@ -40,6 +44,20 @@ def load_config() -> dict:
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _load_config_for_mutation() -> dict:
+    """Load an existing document without overwriting malformed bytes."""
+    path = config_file()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise InvalidConfigDocument(f"cannot read {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise InvalidConfigDocument(f"cannot modify malformed config: {path}")
+    return data
 
 
 def save_config(data: dict) -> Path:
@@ -63,7 +81,7 @@ def set_capture_mode(mode: str) -> Path:
     mode = (mode or "").strip().lower()
     if mode not in CAPTURE_MODES:
         raise ValueError(f"capture_mode must be one of {CAPTURE_MODES}, got {mode!r}")
-    data = load_config()
+    data = _load_config_for_mutation()
     data["capture_mode"] = mode
     return save_config(data)
 
@@ -81,7 +99,7 @@ def set_gateway_url(url: str) -> Path:
     url = (url or "").strip().rstrip("/")
     if url and not url.startswith("https://"):
         raise ValueError("gateway_url must be an https:// URL (it carries a bearer token)")
-    data = load_config()
+    data = _load_config_for_mutation()
     if url:
         data["gateway_url"] = url
     else:
@@ -126,7 +144,7 @@ def path_setting(key: str) -> Path | None:
 def set_path_setting(key: str, value: str | None) -> Path:
     if key not in PATH_SETTINGS:
         raise KeyError(f"unknown path setting {key!r}; known: {sorted(PATH_SETTINGS)}")
-    data = load_config()
+    data = _load_config_for_mutation()
     if value is None or not str(value).strip():
         data.pop(key, None)
     else:
@@ -171,7 +189,7 @@ def float_setting(key: str) -> float:
 def set_float_setting(key: str, value: float) -> Path:
     if key not in FLOAT_SETTINGS:
         raise KeyError(f"unknown float setting {key!r}; known: {sorted(FLOAT_SETTINGS)}")
-    data = load_config()
+    data = _load_config_for_mutation()
     data[key] = float(value)
     return save_config(data)
 
@@ -215,7 +233,7 @@ def set_list_setting(key: str, values: "str | list[str] | tuple[str, ...]") -> P
     if isinstance(values, str):
         values = _split_csv(values)
     cleaned = [str(v).strip() for v in values if str(v).strip()]
-    data = load_config()
+    data = _load_config_for_mutation()
     if cleaned:
         data[key] = cleaned
     else:

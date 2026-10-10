@@ -331,7 +331,10 @@ def run_nightly() -> int:
     briefs_result = _briefs_build_if_on()
     if briefs_result is not None:
         _record_nightly_step(steps, "briefs_build", **_step_result(briefs_result))
-    return rc or (0 if drain_result["ok"] else 1)
+    final_rc = rc or (0 if drain_result["ok"] else 1)
+    if final_rc != rc:
+        _write_job_state("nightly", final_rc)
+    return final_rc
 
 
 def _drain_sessions() -> dict[str, Any]:
@@ -375,15 +378,18 @@ def _briefs_build_if_on() -> dict[str, Any] | None:
                     chosen = briefs.select_for_build(cur, None, BRIEFS_NIGHTLY_LIMIT)
                     if not chosen.get("available"):
                         _nightly_log(f"[khipu-briefs] unavailable: {chosen.get('reason')}")
-                        return {"ok": True, "built": 0, "reason": chosen.get("reason")}
+                        return {"ok": False, "built": 0, "reason": chosen.get("reason") or "unavailable"}
                     results = briefs.build_many(conn, chosen["topics"])
                 finally:
                     briefs.release_build_lock(cur)
                     conn.commit()
         out: dict[str, Any] = {"ok": True, "built": 0}
         for r in results:
-            status = str(r.get("status"))
-            out[status] = out.get(status, 0) + 1
+            status = str(r.get("status") or "unavailable").lower()
+            key = "succeeded" if status == "ok" else status
+            out[key] = int(out.get(key, 0)) + 1
+            if status in {"failed", "error", "unavailable"} or r.get("ok") is False:
+                out["ok"] = False
         _nightly_log(f"[khipu-briefs] built {json.dumps(out, default=str)[:400]}")
         return out
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
@@ -434,8 +440,21 @@ def _embed_backfill() -> dict[str, Any]:
         from khipu import embed
 
         stats = embed.backfill()
-        _nightly_log(f"[khipu-embed] backfill ok {json.dumps(stats, default=str)[:400]}")
-        out = {"ok": True, **stats}
+        failed = int(stats.get("failed_chunks") or stats.get("failed") or 0)
+        budget_exhausted = bool(
+            stats.get("time_budget_exhausted") or stats.get("budget_exhausted")
+        )
+        ok = (
+            bool(stats.get("ok", True))
+            and failed == 0
+            and not budget_exhausted
+            and not bool(stats.get("cancelled"))
+        )
+        _nightly_log(
+            f"[khipu-embed] backfill {'ok' if ok else 'partial'} "
+            f"{json.dumps(stats, default=str)[:400]}"
+        )
+        out = {**stats, "ok": ok}
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
         _nightly_log(f"[khipu-embed] backfill skipped: {type(exc).__name__}: {exc}")
         out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -444,6 +463,8 @@ def _embed_backfill() -> dict[str, Any]:
     lib = _library_backfill()
     if lib is not None:
         out["library"] = lib
+        if not lib.get("ok", False):
+            out["ok"] = False
     return out
 
 
@@ -462,6 +483,27 @@ def _library_backfill() -> dict[str, Any] | None:
         from khipu import library
 
         res = library.nightly()
+        results = res.get("results", []) if isinstance(res, dict) else []
+        nested_unhealthy = any(
+            isinstance(row, dict)
+            and (
+                not bool(row.get("ok", True))
+                or int(row.get("failed") or row.get("failed_chunks") or 0) > 0
+                or int(row.get("remaining") or 0) > 0
+                or bool(row.get("time_budget_exhausted") or row.get("budget_exhausted"))
+                or bool(row.get("error"))
+                or "budget" in str(row.get("skipped") or "").lower()
+            )
+            for row in results
+        )
+        res = {
+            **res,
+            "ok": (
+                bool(res.get("ok", True))
+                and not bool(res.get("budget_exhausted") or res.get("time_budget_exhausted"))
+                and not nested_unhealthy
+            ),
+        }
         brief = [
             {k: r[k] for k in ("name", "added", "updated", "removed", "embedded",
                                "failed", "remaining", "error", "skipped") if k in r}
@@ -633,18 +675,28 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
     never runs the nightly and has nothing of its own to evaluate (same
     posture as `index_freshness`).
 
-    Three states, not two (maintainer, 2026-09-14 — "especially after they
-    update"): a step that has never been recorded is SKIPPED, not red — a
-    fresh install or a Mac that just updated to this phase's code has
-    nothing in `nightly-last.json` yet, and that is not evidence of a
-    failure, only of a nightly that hasn't run since this started being
-    written. A step recorded `ok: false` is red with its own error/fix. A
+    A step that has never been recorded is skipped only during a bounded
+    first-run grace period established by a loaded plist plus recent install
+    or run metadata. Unknown-age or unloaded schedules are red rather than
+    staying green forever. A step recorded `ok: false` is red with its own error/fix. A
     step whose last recording is older than `NIGHTLY_STEP_STALE_HOURS` is
     red too, REGARDLESS of that recording's own `ok` — a nightly that
     stopped running altogether is exactly what a same-day `ok: true` from a
     week ago would otherwise hide."""
     applicable = _is_index_sync_host()
     data = nightly_last()
+    receipt_path = _nightly_last_path()
+    steps_doc = data.get("steps") if isinstance(data, dict) else None
+    receipt_malformed = receipt_path.exists() and (
+        not isinstance(steps_doc, list)
+        or any(
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("name"), str)
+            or not isinstance(entry.get("ok"), bool)
+            for entry in (steps_doc if isinstance(steps_doc, list) else [])
+        )
+    )
+    job = _job_entry("nightly") if applicable else {}
     by_name: dict[str, dict[str, Any]] = {}
     if data and isinstance(data.get("steps"), list):
         for entry in data["steps"]:
@@ -654,6 +706,60 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
                 by_name[entry["name"]] = entry
     source = str(_nightly_last_path())
     out: dict[str, dict[str, Any]] = {}
+    if applicable:
+        exit_code = job.get("last_exit")
+        exit_ts = job.get("last_exit_ts")
+        exit_age = _hours_since(exit_ts)
+        if exit_code not in (None, 0):
+            out["nightly_job_ok"] = {
+                "ok": False, "applicable": True,
+                "error": f"scheduled nightly exited {exit_code}",
+                "ts": exit_ts, "source": source,
+            }
+        elif exit_code == 0 and not exit_ts:
+            out["nightly_job_ok"] = {
+                "ok": False, "applicable": True,
+                "error": "scheduled nightly success has no timestamp",
+                "ts": exit_ts, "source": source,
+            }
+        elif exit_ts and exit_age is None:
+            out["nightly_job_ok"] = {
+                "ok": False, "applicable": True,
+                "error": "scheduled nightly has an unusable success timestamp",
+                "ts": exit_ts, "source": source,
+            }
+        elif exit_age is not None and exit_age > NIGHTLY_STEP_STALE_HOURS:
+            out["nightly_job_ok"] = {
+                "ok": False, "applicable": True,
+                "error": "scheduled nightly receipt is overdue",
+                "ts": exit_ts, "source": source, "stale": True,
+            }
+        elif exit_code == 0:
+            out["nightly_job_ok"] = {
+                "ok": True, "applicable": True, "ts": exit_ts, "source": source,
+            }
+        else:
+            install_age = None
+            if isinstance(job.get("plist_mtime"), (int, float)):
+                install_age = (
+                    datetime.now(timezone.utc).timestamp() - float(job["plist_mtime"])
+                ) / 3600
+            pending = bool(job.get("plist_loaded")) and install_age is not None and (
+                0 <= install_age <= NIGHTLY_STEP_STALE_HOURS
+            )
+            out["nightly_job_ok"] = {
+                "ok": pending, "applicable": True, "source": source,
+                **(
+                    {"pending": True, "reason": "fresh install awaiting its first nightly run"}
+                    if pending
+                    else {"error": "scheduled nightly has no usable recent run or install evidence"}
+                ),
+            }
+    else:
+        out["nightly_job_ok"] = {
+            "ok": True, "applicable": False,
+            "note": "not the nightly host — evaluated on the sync host",
+        }
     for doctor_key, (step_name, fix) in _NIGHTLY_STEP_CHECKS.items():
         if not applicable:
             out[doctor_key] = {
@@ -661,8 +767,33 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
                 "note": "not the nightly host — evaluated on the sync host",
             }
             continue
+        if receipt_malformed:
+            out[doctor_key] = {
+                "ok": False, "applicable": True,
+                "error": "malformed nightly step receipt",
+                "fix": "inspect or remove the invalid nightly-last.json after preserving evidence",
+                "source": source,
+            }
+            continue
         entry = by_name.get(step_name)
         if entry is None:
+            last_run = job.get("last_run_iso") or job.get("last_exit_ts")
+            age_h = _hours_since(last_run)
+            if last_run is None and isinstance(job.get("plist_mtime"), (int, float)):
+                age_h = (
+                    datetime.now(timezone.utc).timestamp() - float(job["plist_mtime"])
+                ) / 3600
+            pending = bool(job.get("plist_loaded")) and age_h is not None and (
+                0 <= age_h <= NIGHTLY_STEP_STALE_HOURS
+            )
+            if not pending:
+                out[doctor_key] = {
+                    "ok": False, "applicable": True,
+                    "error": "scheduled nightly has no usable recent step receipt or first-run evidence",
+                    "fix": "run `khipu jobs status` and inspect the nightly logs",
+                    "source": source,
+                }
+                continue
             out[doctor_key] = {
                 "ok": True, "applicable": True, "skipped": True,
                 "reason": "not checked yet — the nightly runs at 02:05",
@@ -670,6 +801,13 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
             }
             continue
         age_h = _hours_since(entry.get("ts"))
+        if entry.get("ok") and age_h is None:
+            out[doctor_key] = {
+                "ok": False, "applicable": True,
+                "error": "nightly step has an unusable success timestamp",
+                "fix": fix, "ts": entry.get("ts"), "source": source,
+            }
+            continue
         if age_h is not None and age_h > NIGHTLY_STEP_STALE_HOURS:
             last_date = str(entry.get("ts"))[:10] or "an unknown date"
             out[doctor_key] = {
@@ -799,11 +937,18 @@ def graph_plist_path() -> Path:
 
 def _job_entry(name: str) -> dict[str, Any]:
     spec = _JOB_SPECS[name]
+    plist = _plist_path(spec["plist"])
     out_log, err_log = _log_paths(spec["log_stem"])
     last_run_mtime: float | None = None
     try:
         if out_log.is_file():
             last_run_mtime = out_log.stat().st_mtime
+    except OSError:
+        pass
+    plist_mtime: float | None = None
+    try:
+        if plist.is_file():
+            plist_mtime = plist.stat().st_mtime
     except OSError:
         pass
     state = _read_job_state(name)
@@ -820,6 +965,7 @@ def _job_entry(name: str) -> dict[str, Any]:
         current = None
     return {
         "plist_label": spec["plist"],
+        "plist_mtime": plist_mtime,
         "log_path": str(out_log),
         "err_log_path": str(err_log),
         "last_run_mtime": last_run_mtime,
@@ -909,4 +1055,18 @@ def index_freshness(*, memory_root: Path | None = None) -> dict[str, Any]:
         out["reasons"].append(
             f"index is {lag_min} min older than the last nightly log — rebuild may have been skipped"
         )
+    elif nightly_mtime is None:
+        scheduled = _job_entry("nightly")
+        age_h = _hours_since(scheduled.get("last_exit_ts"))
+        plist_mtime = scheduled.get("plist_mtime")
+        if age_h is None and isinstance(plist_mtime, (int, float)):
+            age_h = (datetime.now(timezone.utc).timestamp() - plist_mtime) / 3600
+        pending = bool(scheduled.get("plist_loaded")) and age_h is not None and (
+            0 <= age_h <= NIGHTLY_STEP_STALE_HOURS
+        )
+        if not pending:
+            out["ok"] = False
+            out["reasons"].append(
+                "expected scheduled nightly log is missing without usable recent first-run evidence"
+            )
     return out

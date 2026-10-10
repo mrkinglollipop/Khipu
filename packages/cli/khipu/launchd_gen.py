@@ -52,6 +52,11 @@ _LABELS = {
     "recall_daemon": PLIST_RECALL_DAEMON,
 }
 
+_REQUIRED_DRIVER_ENV = {
+    "nightly": "KHIPU_CONSOLIDATE_NIGHTLY",
+    "monthly": "KHIPU_CONSOLIDATE_MONTHLY",
+}
+
 _DRAIN_WRAPPER_NAME = "khipu-queue-drain-retry"
 _DRAIN_STARTED = "[khipu-queue-drain] entered Khipu"
 _DRAIN_ATTEMPT = "[khipu-queue-drain] attempt "
@@ -240,13 +245,13 @@ def render_plist(job: str, environ: dict[str, str] | None = None) -> bytes:
     text = template_path.read_text(encoding="utf-8")
     ctx = render_context()
     for key, value in ctx.items():
-        text = text.replace(f"{{{{{key}}}}}", value)
+        text = text.replace(f"{{{{{key}}}}}", escape(value))
     spec = _JOB_SPECS.get(job, {})
     stem = str(spec.get("log_stem") or job)
     out_log, err_log = _log_paths(stem)
     text = text.replace("{{EXTRA_ENV}}", render_extra_env(environ))
-    text = text.replace("{{STDOUT_LOG}}", str(out_log))
-    text = text.replace("{{STDERR_LOG}}", str(err_log))
+    text = text.replace("{{STDOUT_LOG}}", escape(str(out_log)))
+    text = text.replace("{{STDERR_LOG}}", escape(str(err_log)))
     if job == "notes_watch":
         text = text.replace("{{WATCH_PATHS}}", render_watch_paths_xml())
     if job == "queue_drain":
@@ -277,26 +282,72 @@ def _launchctl_load(label: str, plist_path: Path) -> dict[str, Any]:
     return {"ok": True, "label": label, "path": str(plist_path)}
 
 
-def _launchctl_unload(label: str, plist_path: Path) -> None:
+def _launchctl_unload(label: str, plist_path: Path) -> dict[str, Any]:
     uid = os.getuid()
-    subprocess.run(
+    label_result = subprocess.run(
         ["launchctl", "bootout", f"gui/{uid}/{label}"],
         capture_output=True,
         text=True,
         check=False,
     )
-    subprocess.run(
-        ["launchctl", "bootout", f"gui/{uid}", str(plist_path)],
+    path_result = None
+    if plist_path.is_file():
+        path_result = subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}", str(plist_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    verify = subprocess.run(
+        ["launchctl", "print", f"gui/{uid}/{label}"],
         capture_output=True,
         text=True,
         check=False,
     )
+    if verify.returncode == 0:
+        error = (label_result.stderr or label_result.stdout or verify.stderr or verify.stdout).strip()
+        return {"ok": False, "error": error or "launchctl agent remains loaded"}
+    verify_text = (verify.stderr or verify.stdout or "").strip().lower()
+    known_absent = any(
+        phrase in verify_text
+        for phrase in ("could not find service", "service not found", "no such process")
+    )
+    if not known_absent:
+        return {
+            "ok": False,
+            "error": verify_text or "launchctl could not verify that the agent is absent",
+        }
+    return {"ok": True, "label_bootout": label_result.returncode, "path_bootout": getattr(path_result, "returncode", None)}
+
+
+def _installed_required_driver(job: str) -> Path | None:
+    env_key = _REQUIRED_DRIVER_ENV.get(job)
+    label = _LABELS.get(job)
+    if not env_key or not label:
+        return None
+    data = _installed_plist(_plist_path(label)) or {}
+    env = data.get("EnvironmentVariables") if isinstance(data, dict) else None
+    raw = str((env or {}).get(env_key) or "").strip() if isinstance(env, dict) else ""
+    path = Path(raw).expanduser() if raw else None
+    return path if path is not None and path.is_file() else None
 
 
 def install_job(job: str, *, environ: dict[str, str] | None = None) -> dict[str, Any]:
     label = _LABELS.get(job)
     if not label:
         return {"ok": False, "error": "unknown_job", "job": job}
+    required_env = _REQUIRED_DRIVER_ENV.get(job)
+    if required_env:
+        env = os.environ if environ is None else environ
+        driver = Path((env.get(required_env) or "").strip()).expanduser()
+        if not str(driver) or not driver.is_file():
+            return {
+                "ok": False,
+                "error": "required_driver_unavailable",
+                "job": job,
+                "driver_env": required_env,
+                "detail": f"{required_env} must name an installed nightly driver before scheduling {job}",
+            }
     agents = _launchagents_dir()
     agents.mkdir(parents=True, exist_ok=True)
     dest = _plist_path(label)
@@ -320,8 +371,10 @@ def uninstall_job(job: str) -> dict[str, Any]:
     if not label:
         return {"ok": False, "error": "unknown_job", "job": job}
     dest = _plist_path(label)
+    unloaded = _launchctl_unload(label, dest)
+    if not unloaded.get("ok"):
+        return {"ok": False, "job": job, "error": unloaded.get("error", "launchctl bootout failed")}
     if dest.is_file():
-        _launchctl_unload(label, dest)
         dest.unlink(missing_ok=True)
     versions = read_versions()
     scheduled = versions.get("scheduled_jobs")
@@ -351,7 +404,7 @@ def install_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
 def uninstall_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
     names = jobs or list(_JOB_TEMPLATE)
     results = [uninstall_job(job) for job in names]
-    return {"ok": True, "results": results}
+    return {"ok": all(result.get("ok") for result in results), "results": results}
 
 
 def ensure_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
@@ -381,7 +434,15 @@ def ensure_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
             if r.get("ok"):
                 out["refreshed"].append(job)
         else:
-            out["current"].append(job)
+            if job in _REQUIRED_DRIVER_ENV and _installed_required_driver(job) is None:
+                out["results"].append({
+                    "ok": False,
+                    "job": job,
+                    "error": "required_driver_unavailable",
+                    "detail": "installed plist has no resolvable scheduled driver",
+                })
+            else:
+                out["current"].append(job)
     out["ok"] = all(r.get("ok") for r in out["results"])
     return out
 

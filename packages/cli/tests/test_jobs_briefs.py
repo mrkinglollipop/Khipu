@@ -79,10 +79,10 @@ class BriefsBuildStepTest(unittest.TestCase):
         select.assert_called_once()
         self.assertEqual(select.call_args.args[1:], (None, jobs.BRIEFS_NIGHTLY_LIMIT))
 
-    def test_unavailable_selection_builds_nothing_and_is_ok(self):
+    def test_unavailable_selection_builds_nothing_and_is_unhealthy(self):
         select = mock.Mock(return_value={"available": False, "reason": "table missing"})
         out, _, _, m_release, _, build = self._run(select=select)
-        self.assertTrue(out["ok"])
+        self.assertFalse(out["ok"])
         self.assertEqual(out["built"], 0)
         build.assert_not_called()
         m_release.assert_called_once()
