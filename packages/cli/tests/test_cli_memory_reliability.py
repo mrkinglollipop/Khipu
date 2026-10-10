@@ -202,20 +202,24 @@ class EpisodeForgetCommandTest(unittest.TestCase):
         ])
 
     def test_forget_soft_deletes_and_removes_embeddings(self):
-        with mock.patch("khipu.config.path_setting", return_value=None):
+        with mock.patch("khipu.config.path_setting", return_value=None), \
+             mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": True}):
             rc, out = _run(["episode", "forget", "42"], self._script(soft=1, vectors=3))
         self.assertEqual(rc, 0)
         self.assertTrue(out["ok"])
+        self.assertTrue(out["snapshot"]["ok"])
         self.assertTrue(out["soft_deleted"])
         self.assertEqual(out["embeddings_removed"], 3)
         self.assertEqual(out["commitments_closed"], 1)
         self.assertEqual(out["legacy_file"]["removed"], 0)
 
     def test_already_deleted_episode_reports_false_but_ok(self):
-        with mock.patch("khipu.config.path_setting", return_value=None):
+        with mock.patch("khipu.config.path_setting", return_value=None), \
+             mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": True}):
             rc, out = _run(["episode", "forget", "42"], self._script(soft=0, vectors=0))
         self.assertEqual(rc, 0)
         self.assertFalse(out["soft_deleted"])
+        self.assertTrue(out["snapshot"]["ok"])
 
 
 class TopicPurgeCommandTest(unittest.TestCase):
