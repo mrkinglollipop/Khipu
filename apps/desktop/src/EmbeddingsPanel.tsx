@@ -393,7 +393,14 @@ export function EmbeddingsPanel({ active }: { active: boolean }) {
   const [busy, setBusy] = useState<string | null>(null);
   /** An error per row key (`profile:<id>` / `library:<name>`) or `screen`. */
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [starting, setStarting] = useState<Array<{ id: string; space: string; profile: string; since: number }>>([]);
+  const [starting, setStarting] = useState<Array<{
+    id: string;
+    space: string;
+    profile: string;
+    rowKey: string;
+    logPath: string;
+    since: number;
+  }>>([]);
   const [redoOpen, setRedoOpen] = useState<Record<string, GapSample | "loading" | "error">>({});
   const [receipts, setReceipts] = useState<Record<string, { title: string; lines: ReactNode[]; tone?: "ok" | "warn" }>>({});
   /** Per library: other models that already hold some of its pieces, and how
@@ -482,13 +489,18 @@ export function EmbeddingsPanel({ active }: { active: boolean }) {
     const stoppedNow = [...lastRunning.current].some((id) => !running.has(id));
     lastRunning.current = running;
     // A job the app started has appeared in the list: it is no longer "starting".
+    const seen = new Set(jobs.map((j) => j.job));
+    for (const item of starting) {
+      if (!seen.has(item.id) && now - item.since >= 60_000) {
+        setError(item.rowKey, `Job start was not confirmed. Check the log: ${item.logPath || "log path unavailable"}`);
+      }
+    }
     setStarting((prev) => {
-      const seen = new Set(jobs.map((j) => j.job));
       const next = prev.filter((s) => !seen.has(s.id) && now - s.since < 60_000);
       return next.length === prev.length ? prev : next;
     });
     if (stoppedNow) void loadAll();
-  }, [jobs, now, loadAll]);
+  }, [jobs, now, loadAll, setError, starting]);
 
   const activeProfile = profiles?.find((p) => p.is_active) ?? null;
 
@@ -519,7 +531,14 @@ export function EmbeddingsPanel({ active }: { active: boolean }) {
     }
     setError(rowKey, null);
     const id = String(res.data.job_id ?? "");
-    setStarting((prev) => [...prev, { id, space: target.space, profile: target.profile, since: Date.now() }]);
+    setStarting((prev) => [...prev, {
+      id,
+      space: target.space,
+      profile: target.profile,
+      rowKey,
+      logPath: String(res.data.log_path ?? ""),
+      since: Date.now(),
+    }]);
     setNow(Date.now());
     setTimeout(() => void loadJobs(), 1500);
   }
@@ -1840,7 +1859,7 @@ function ImportDialog({
   );
 }
 
-type KeyTest = { state: "idle" } | { state: "testing" } | { state: "ok"; ms: number; dim: number } | { state: "error"; message: string };
+type KeyTest = { state: "idle" } | { state: "testing" } | { state: "ok"; ms: number; dim: number; revision: number } | { state: "error"; message: string };
 
 const PROVIDER_DEFAULTS: Record<string, { model: string; dim: string; endpoint: string }> = {
   gemini: { model: "gemini-embedding-2", dim: "768", endpoint: "" },
@@ -1866,6 +1885,13 @@ function AddModelDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const firstRef = useRef<HTMLSelectElement>(null);
+  const formRevision = useRef(0);
+  const latestTest = useRef(0);
+
+  function invalidateTest() {
+    formRevision.current += 1;
+    setTest({ state: "idle" });
+  }
 
   useEffect(() => {
     if (open) {
@@ -1874,6 +1900,8 @@ function AddModelDialog({
       setDim("");
       setEndpoint("http://localhost:11434");
       setKey("");
+      formRevision.current += 1;
+      latestTest.current += 1;
       setTest({ state: "idle" });
       setBusy(false);
       setError(null);
@@ -1886,7 +1914,7 @@ function AddModelDialog({
     setModel(d.model);
     setDim(d.dim);
     setEndpoint(d.endpoint);
-    setTest({ state: "idle" });
+    invalidateTest();
     setError(null);
   }
 
@@ -1907,14 +1935,18 @@ function AddModelDialog({
 
   /** Store a typed key (Keychain, over stdin) then make one tiny embedding call. */
   async function runTest(): Promise<KeyTest> {
+    const revision = formRevision.current;
+    const request = ++latestTest.current;
+    const current = () => latestTest.current === request && formRevision.current === revision;
     setTest({ state: "testing" });
     setError(null);
     if (key.trim()) {
-      try {
-        await invoke("set_khipu_secret", { account: KEY_ACCOUNT[provider], value: key.trim() });
-      } catch (e) {
-        const t: KeyTest = { state: "error", message: `Could not save the key: ${errText(e)}` };
-        setTest(t);
+      const saved = await callCli("set_khipu_secret", { account: KEY_ACCOUNT[provider], value: key.trim() });
+      const affirmed = saved.ok && typeof saved.data === "object" && saved.data != null && (saved.data as { ok?: unknown }).ok === true;
+      if (!affirmed) {
+        const detail = saved.ok ? "Khipu did not confirm the key was saved." : saved.error;
+        const t: KeyTest = { state: "error", message: `Could not save the key: ${detail}` };
+        if (current()) setTest(t);
         return t;
       }
     }
@@ -1924,8 +1956,9 @@ function AddModelDialog({
       model: model.trim(),
     });
     const t: KeyTest = res.ok
-      ? { state: "ok", ms: res.data.ms, dim: res.data.dim }
+      ? { state: "ok", ms: res.data.ms, dim: res.data.dim, revision }
       : { state: "error", message: res.error };
+    if (!current()) return { state: "idle" };
     setTest(t);
     if (t.state === "ok" && !dim.trim()) setDim(String(t.dim));
     return t;
@@ -1935,7 +1968,7 @@ function AddModelDialog({
     setBusy(true);
     setError(null);
     let t: KeyTest = test;
-    if (t.state !== "ok") t = await runTest();
+    if (t.state !== "ok" || t.revision !== formRevision.current) t = await runTest();
     if (t.state !== "ok") {
       setBusy(false);
       return;
@@ -1989,7 +2022,7 @@ function AddModelDialog({
                 spellCheck={false}
                 onChange={(e) => {
                   setModel(e.target.value);
-                  setTest({ state: "idle" });
+                  invalidateTest();
                 }}
               />
             </div>
@@ -2003,7 +2036,10 @@ function AddModelDialog({
                 inputMode="numeric"
                 value={dim}
                 aria-describedby="am-dim-help"
-                onChange={(e) => setDim(e.target.value)}
+                onChange={(e) => {
+                  setDim(e.target.value);
+                  invalidateTest();
+                }}
               />
             </div>
           </div>
@@ -2022,7 +2058,7 @@ function AddModelDialog({
                 spellCheck={false}
                 onChange={(e) => {
                   setEndpoint(e.target.value);
-                  setTest({ state: "idle" });
+                  invalidateTest();
                 }}
               />
             </div>
@@ -2041,7 +2077,7 @@ function AddModelDialog({
                 style={{ flex: 1 }}
                 onChange={(e) => {
                   setKey(e.target.value);
-                  setTest({ state: "idle" });
+                  invalidateTest();
                 }}
               />
               <button type="button" disabled={!modelOk || !endpointOk || test.state === "testing" || busy} onClick={() => void runTest()}>
