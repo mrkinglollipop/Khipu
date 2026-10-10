@@ -64,6 +64,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -285,6 +286,11 @@ def stop_hook() -> str:
     return _shim("khipu-stop-hook")
 
 
+def queue_only_stop_hook() -> str:
+    """Capture-event command that enqueues work without provider-side draining."""
+    return f"env KHIPU_CAPTURE_QUEUE_ONLY=1 {shlex.quote(stop_hook())}"
+
+
 def recall_hook() -> str:
     return _shim("khipu-recall-hook")
 
@@ -304,7 +310,7 @@ CODEX_SESSIONEND_TIMEOUT = 3
 
 def codex_sessionend_hook() -> str:
     """Queue-only shim invocation for Codex SessionEnd (3 s hard cap)."""
-    return f"env KHIPU_CAPTURE_QUEUE_ONLY=1 {stop_hook()}"
+    return queue_only_stop_hook()
 
 
 # Cursor sessionStart must outlive a hub PG slice; harness session_start.sh stays at 5s.
@@ -320,8 +326,36 @@ def aegis_capture_hook() -> str:
     return _shim("khipu-aegis-capture")
 
 
+def _launcher_path_is_legacy(value: str, name: str) -> bool:
+    """Recognize an old checkout launcher by its exact path shape.
+
+    Old installs can point at another Khipu checkout, but a shell snippet that
+    merely mentions a launcher is never ours.  The path shape is deliberately
+    narrow: the current shim/raw paths or a checkout's ``packages/cli/bin``.
+    """
+    if value in (str(_shim_dir() / name), str(_bin_script(name)), name):
+        return True
+    path = Path(value)
+    return (path.name == name and path.parent.name == "bin"
+            and path.parent.parent.name == "cli"
+            and path.parent.parent.parent.name == "packages")
+
+
+def _is_launcher_command(cmd: Any, name: str, *args: str) -> bool:
+    """True only for a supported launcher exec and its exact arguments."""
+    if not isinstance(cmd, str):
+        return False
+    if not args and _launcher_path_is_legacy(cmd, name):
+        return True
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return False
+    return len(argv) == len(args) + 1 and tuple(argv[1:]) == args and _launcher_path_is_legacy(argv[0], name)
+
+
 def _is_our_capture(cmd: Any) -> bool:
-    return isinstance(cmd, str) and "khipu-aegis-capture" in cmd
+    return _is_launcher_command(cmd, "khipu-aegis-capture")
 
 
 def _repoint(hooks_list: list[dict], is_ours, want: str) -> bool:
@@ -336,11 +370,12 @@ def _repoint(hooks_list: list[dict], is_ours, want: str) -> bool:
 
 
 def _is_our_recall(cmd: Any) -> bool:
-    return isinstance(cmd, str) and "khipu-recall-hook" in cmd
+    return (_is_launcher_command(cmd, "khipu-recall-hook")
+            or _is_launcher_command(cmd, "khipu-recall-hook", "--cursor"))
 
 
 def _is_our_prompt_recall(cmd: Any) -> bool:
-    return isinstance(cmd, str) and "khipu-prompt-recall" in cmd
+    return _is_launcher_command(cmd, "khipu-prompt-recall")
 
 
 def _stamp() -> str:
@@ -486,7 +521,16 @@ def _write_json(path: Path, data: dict) -> None:
 
 
 def _is_ours(cmd: Any) -> bool:
-    return isinstance(cmd, str) and "khipu-stop-hook" in cmd
+    if _is_launcher_command(cmd, "khipu-stop-hook"):
+        return True
+    if not isinstance(cmd, str):
+        return False
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return False
+    return (len(argv) == 3 and argv[0] == "env" and argv[1] == "KHIPU_CAPTURE_QUEUE_ONLY=1"
+            and _launcher_path_is_legacy(argv[2], "khipu-stop-hook"))
 
 
 # ---- Claude Code --------------------------------------------------------------
@@ -582,11 +626,12 @@ def _claude_hooks_install(settings: Path, dry: bool, res: dict) -> None:
         entries = hooks.setdefault(event, [])
         flat = [h for e in entries for h in e.get("hooks", [])]
         if not any(_is_ours(h.get("command")) for h in flat):
-            entries.append({"hooks": [{"type": "command", "command": stop_hook(), "timeout": 20}]})
+            entries.append({"hooks": [{"type": "command", "command": queue_only_stop_hook(), "timeout": 20}]})
             res["changes"].append(f"{settings}: hooks.{event} += khipu-stop-hook")
             changed = True
-        elif _repoint(flat, _is_ours, stop_hook()):
-            res["changes"].append(f"{settings}: hooks.{event} khipu-stop-hook -> {stop_hook()}")
+        elif _repoint(flat, _is_ours, queue_only_stop_hook()):
+            res["changes"].append(
+                f"{settings}: hooks.{event} khipu-stop-hook -> {queue_only_stop_hook()}")
             changed = True
     # Recall rule: SessionStart additionalContext (thin cadence rule, not memory content).
     ss = hooks.setdefault("SessionStart", [])
@@ -908,11 +953,12 @@ def _cursor_install(dry: bool, project: str | None = None) -> dict:
     for event in ("stop", "preCompact", "sessionEnd", "subagentStop"):
         entries = hooks.setdefault(event, [])
         if not any(_is_ours(e.get("command")) for e in entries):
-            entries.append({"command": stop_hook(), "timeout": 20})
+            entries.append({"command": queue_only_stop_hook(), "timeout": 20})
             out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} += khipu-stop-hook")
             changed = True
-        elif _repoint(entries, _is_ours, stop_hook()):
-            out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} khipu-stop-hook -> {stop_hook()}")
+        elif _repoint(entries, _is_ours, queue_only_stop_hook()):
+            out["changes"].append(
+                f"{CURSOR_HOOKS}: hooks.{event} khipu-stop-hook -> {queue_only_stop_hook()}")
             changed = True
     # Push recall: append a second sessionStart entry. Do not replace harness
     # session_start.sh (Cursor runs all matching hooks; inject field is
@@ -1014,10 +1060,18 @@ def _cursor_status() -> dict:
 AEGIS_TOML = HOME / ".grok" / "config.toml"
 # Stops at the next table header OR at our managed hooks block, so it never
 # swallows the "# khipu-pack" marker line that sits between them.
-_AEGIS_MCP_RE = re.compile(r"(?ms)^\[mcp_servers\.khipu\]\n.*?(?=^\[|^# khipu-pack:|\Z)")
+_AEGIS_MCP_RE = re.compile(r"(?ms)^\[mcp_servers\.khipu\][ \t]*(?:#.*)?\n.*?(?=^\[|^# khipu-pack:|\Z)")
 _AEGIS_HOOK_MARK = "# khipu-pack: managed block — do not edit by hand\n"
 _AEGIS_HOOK_RE = re.compile(
     r"(?ms)^# khipu-pack: managed block — do not edit by hand\n.*?# khipu-pack: end\n"
+)
+_TOML_HEADER_RE = re.compile(
+    r"(?m)^[ \t]*(?:\[\[[^\]\n]+\]\]|\[[^\]\n]+\])[ \t]*(?:#.*)?$"
+)
+_AEGIS_NATIVE_HOOK_HEADER_RE = re.compile(
+    r"^[ \t]*\[\[[ \t]*hooks[ \t]*\.[ \t]*"
+    r"(?P<event>Stop|PreCompact|SessionEnd)[ \t]*\.[ \t]*hooks[ \t]*\]\]"
+    r"[ \t]*(?:#.*)?$"
 )
 # [memory] is NOT Khipu-owned the way [mcp_servers.khipu] is — it is Aegis's
 # own choice of memory backend, which some other tool may already claim. Only
@@ -1027,6 +1081,135 @@ _AEGIS_HOOK_RE = re.compile(
 # else would write under that name.
 _AEGIS_MEMORY_RE = re.compile(r"(?ms)^\[memory\]\n.*?(?=^\[|\Z)")
 _AEGIS_MEMORY_KHIPU_RE = re.compile(r"(?ms)^\[memory\.khipu\]\n.*?(?=^\[|\Z)")
+
+
+def _validate_toml(path: Path, text: str) -> None:
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigUnreadable(f"{path} is not valid TOML ({exc}); refusing to overwrite it") from exc
+
+
+def _toml_table_block(text: str, table: str) -> tuple[int, int, str] | None:
+    """Return a table span, accepting equivalent quoted/whitespace headers."""
+    keys = table.split(".")
+    key_patterns = [rf"(?:{re.escape(key)}|\"{re.escape(key)}\"|'{re.escape(key)}')"
+                    for key in keys]
+    dotted = r"[ \t]*\.[ \t]*".join(key_patterns)
+    header_re = re.compile(
+        rf"(?m)^[ \t]*\[[ \t]*{dotted}[ \t]*\][ \t]*(?:#.*)?$"
+    )
+    match = next((candidate for candidate in header_re.finditer(text)
+                  if _toml_prefix_is_valid(text, candidate.start())), None)
+    if match is None:
+        return None
+    following = next(
+        (candidate for candidate in _TOML_HEADER_RE.finditer(text, match.end())
+         if _toml_prefix_is_valid(text, candidate.start())), None
+    )
+    managed_re = re.compile(r"(?m)^[ \t]*# khipu-pack: managed block")
+    managed = next(
+        (candidate for candidate in managed_re.finditer(text, match.end())
+         if _toml_prefix_is_valid(text, candidate.start())), None
+    )
+    boundaries = [candidate.start() for candidate in (following, managed)
+                  if candidate is not None]
+    end = min(boundaries) if boundaries else len(text)
+    return match.start(), end, text[match.start():end]
+
+
+def _toml_prefix_is_valid(text: str, end: int) -> bool:
+    """A real table header starts where the preceding TOML is complete."""
+    try:
+        tomllib.loads(text[:end])
+    except tomllib.TOMLDecodeError:
+        return False
+    return True
+
+
+def _replace_toml_table(text: str, table: str, block: str) -> str:
+    found = _toml_table_block(text, table)
+    if found is None:
+        return text.rstrip("\n") + "\n\n" + block
+    start, end, _old = found
+    return text[:start] + block + text[end:]
+
+
+def _remove_toml_table(text: str, table: str) -> str:
+    found = _toml_table_block(text, table)
+    if found is None:
+        return text
+    start, end, _old = found
+    return text[:start] + text[end:]
+
+
+def _write_toml(path: Path, text: str) -> None:
+    """Atomically replace a TOML config after callers validated its full text."""
+    _validate_toml(path, text)
+    target = Path(os.path.realpath(path))
+    fd, name = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".", suffix=".tmp")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+        shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _native_aegis_hook_is_ours(block: str) -> bool:
+    try:
+        data = tomllib.loads(block)
+    except tomllib.TOMLDecodeError:
+        return False
+    for event in ("Stop", "PreCompact", "SessionEnd"):
+        group = (data.get("hooks") or {}).get(event) or {}
+        for hook in group.get("hooks") if isinstance(group, dict) else []:
+            if (isinstance(hook, dict) and _is_our_capture(hook.get("command"))
+                    and isinstance(hook.get("env"), dict)
+                    and hook["env"].get("KHIPU_HARNESS") == "aegis"):
+                return True
+    return False
+
+
+def _remove_native_aegis_hooks(text: str) -> str:
+    """Remove only owned inner hook entries and their adjacent env tables."""
+    headers = list(_TOML_HEADER_RE.finditer(text))
+    managed_spans = [(match.start(), match.end()) for match in _AEGIS_HOOK_RE.finditer(text)]
+    removed: list[tuple[int, int]] = []
+    for index, header in enumerate(headers):
+        if any(start <= header.start() < end for start, end in managed_spans):
+            continue
+        owned_header = _AEGIS_NATIVE_HOOK_HEADER_RE.match(header.group(0))
+        if owned_header is None:
+            continue
+        end_index = index + 1
+        if end_index < len(headers):
+            event = owned_header.group("event")
+            env_header = re.compile(
+                rf"^[ \t]*\[[ \t]*hooks[ \t]*\.[ \t]*{event}[ \t]*\."
+                r"[ \t]*hooks[ \t]*\.[ \t]*env[ \t]*\][ \t]*(?:#.*)?$"
+            )
+            if env_header.match(headers[end_index].group(0)):
+                end_index += 1
+        end = headers[end_index].start() if end_index < len(headers) else len(text)
+        end = min([end] + [start for start, _stop in managed_spans
+                           if header.start() < start < end])
+        if _native_aegis_hook_is_ours(text[header.start():end]):
+            removed.append((header.start(), end))
+    if not removed:
+        return text
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in removed:
+        pieces.append(text[cursor:start])
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
 def _aegis_memory_block() -> str:
@@ -1083,22 +1266,38 @@ def _aegis_install(dry: bool) -> dict:
         out["detected"] = False
         return out
     text = AEGIS_TOML.read_text(encoding="utf-8")
+    _validate_toml(AEGIS_TOML, text)
     mcp_block, hook_block = _aegis_blocks()
     new = text
     # Every .sub() below passes a LAMBDA, not the replacement string: re.sub
     # interprets backslash escapes and \g<n> group references in a literal
     # replacement, so a path containing either would be silently rewritten into
     # a corrupt config. The blocks embed filesystem paths (audit 2026-08-17).
-    if _AEGIS_MCP_RE.search(new):
-        if _AEGIS_MCP_RE.search(new).group(0).strip() != mcp_block.strip():
-            new = _AEGIS_MCP_RE.sub(lambda _m: mcp_block, new)
+    current_mcp = _toml_table_block(new, "mcp_servers.khipu")
+    if current_mcp:
+        if current_mcp[2].strip() != mcp_block.strip():
+            new = _replace_toml_table(new, "mcp_servers.khipu", mcp_block)
             out["changes"].append(f"{AEGIS_TOML}: replace [mcp_servers.khipu]")
     else:
-        new = new.rstrip("\n") + "\n\n" + mcp_block
+        new = _replace_toml_table(new, "mcp_servers.khipu", mcp_block)
         out["changes"].append(f"{AEGIS_TOML}: add [mcp_servers.khipu]")
-    if _AEGIS_HOOK_RE.search(new):
-        if _AEGIS_HOOK_RE.search(new).group(0) != hook_block:
-            new = _AEGIS_HOOK_RE.sub(lambda _m: hook_block, new)
+    without_native = _remove_native_aegis_hooks(new)
+    if without_native != new:
+        new = without_native
+        out["changes"].append(f"{AEGIS_TOML}: remove normalized native khipu hooks")
+    managed_blocks = list(_AEGIS_HOOK_RE.finditer(new))
+    if managed_blocks:
+        if len(managed_blocks) != 1 or managed_blocks[0].group(0) != hook_block:
+            first = True
+
+            def _one_managed_block(_match):
+                nonlocal first
+                if first:
+                    first = False
+                    return hook_block
+                return ""
+
+            new = _AEGIS_HOOK_RE.sub(_one_managed_block, new)
             out["changes"].append(f"{AEGIS_TOML}: replace khipu hooks block")
     else:
         new = new.rstrip("\n") + "\n\n" + hook_block
@@ -1135,8 +1334,9 @@ def _aegis_install(dry: bool) -> dict:
         out["note"] = ("Aegis can search memory only with the gateway token: "
                         "run `khipu gateway token set`")
     if new != text and not dry:
+        _validate_toml(AEGIS_TOML, new)
         out.setdefault("backups", []).append(_backup(AEGIS_TOML))
-        AEGIS_TOML.write_text(new, encoding="utf-8")
+        _write_toml(AEGIS_TOML, new)
     return out
 
 
@@ -1145,15 +1345,18 @@ def _aegis_uninstall(dry: bool) -> dict:
     if not AEGIS_TOML.is_file():
         return out
     text = AEGIS_TOML.read_text(encoding="utf-8")
-    new = _AEGIS_MCP_RE.sub("", text)
+    _validate_toml(AEGIS_TOML, text)
+    new = _remove_toml_table(text, "mcp_servers.khipu")
     if new != text:
         out["changes"].append(f"{AEGIS_TOML}: remove [mcp_servers.khipu]")
-    new2 = _AEGIS_HOOK_RE.sub("", new)
+    new2 = _remove_native_aegis_hooks(_AEGIS_HOOK_RE.sub("", new))
     if new2 != new:
         out["changes"].append(f"{AEGIS_TOML}: remove khipu hooks block")
     if new2 != text and not dry:
+        new2 = new2.rstrip("\n") + "\n"
+        _validate_toml(AEGIS_TOML, new2)
         out.setdefault("backups", []).append(_backup(AEGIS_TOML))
-        AEGIS_TOML.write_text(new2.rstrip("\n") + "\n", encoding="utf-8")
+        _write_toml(AEGIS_TOML, new2)
     return out
 
 
@@ -1217,11 +1420,11 @@ def _aegis_capture_command(text: str) -> str | None:
 
 def _aegis_status() -> dict:
     text = AEGIS_TOML.read_text(encoding="utf-8") if AEGIS_TOML.is_file() else ""
-    m = _AEGIS_MCP_RE.search(text)
+    m = _toml_table_block(text, "mcp_servers.khipu")
     events = _aegis_capture_events(text)
     ours = {"Stop", "PreCompact", "SessionEnd"} <= events
     out = {"harness": "aegis", "detected": _aegis_detected() and AEGIS_TOML.is_file(),
-            "mcp": bool(m and mcp_launcher() in m.group(0)),
+            "mcp": bool(m and mcp_launcher() in m[2]),
             "hook_stop": "Stop" in events, "hook_precompact": "PreCompact" in events,
             "recall_rule": "n/a",
             "extract": "installed" if ours else "missing"}
@@ -1236,7 +1439,7 @@ def _aegis_status() -> dict:
 
 CODEX_TOML = HOME / ".codex" / "config.toml"
 CODEX_HOOKS = HOME / ".codex" / "hooks.json"
-_CODEX_MCP_RE = re.compile(r"(?ms)^\[mcp_servers\.khipu\]\n.*?(?=^\[|\Z)")
+_CODEX_MCP_RE = re.compile(r"(?ms)^\[mcp_servers\.khipu\][ \t]*(?:#.*)?\n.*?(?=^\[|\Z)")
 
 
 def _codex_detected() -> bool:
@@ -1256,19 +1459,21 @@ def _codex_install(dry: bool) -> dict:
     if not out["detected"]:
         return out
     text = CODEX_TOML.read_text(encoding="utf-8")
+    _validate_toml(CODEX_TOML, text)
     block = _codex_mcp_block()
     new = text
-    m = _CODEX_MCP_RE.search(new)
+    m = _toml_table_block(new, "mcp_servers.khipu")
     if m:
-        if m.group(0).strip() != block.strip():
-            new = _CODEX_MCP_RE.sub(lambda _m: block, new)
+        if m[2].strip() != block.strip():
+            new = _replace_toml_table(new, "mcp_servers.khipu", block)
             out["changes"].append(f"{CODEX_TOML}: replace [mcp_servers.khipu]")
     else:
-        new = new.rstrip("\n") + "\n\n" + block
+        new = _replace_toml_table(new, "mcp_servers.khipu", block)
         out["changes"].append(f"{CODEX_TOML}: add [mcp_servers.khipu]")
     if new != text and not dry:
+        _validate_toml(CODEX_TOML, new)
         out.setdefault("backups", []).append(_backup(CODEX_TOML))
-        CODEX_TOML.write_text(new, encoding="utf-8")
+        _write_toml(CODEX_TOML, new)
     # hooks.json — identical shape to Claude Code's settings.json hooks block.
     h = _load_json(CODEX_HOOKS)
     hooks = h.setdefault("hooks", {})
@@ -1280,7 +1485,7 @@ def _codex_install(dry: bool) -> dict:
         flat = [x for e in entries for x in e.get("hooks", [])]
         # Codex allows SessionEnd hooks at most 3 s (docs: default 1 s, max 3 s),
         # so that entry only queues; the next Stop drains it.
-        want_cmd = codex_sessionend_hook() if event == "SessionEnd" else stop_hook()
+        want_cmd = codex_sessionend_hook() if event == "SessionEnd" else queue_only_stop_hook()
         want_timeout = CODEX_SESSIONEND_TIMEOUT if event == "SessionEnd" else 20
         if not any(_is_ours(x.get("command")) for x in flat):
             entries.append({"hooks": [{"type": "command", "command": want_cmd, "timeout": want_timeout}]})
@@ -1328,12 +1533,15 @@ def _codex_uninstall(dry: bool) -> dict:
     out: dict[str, Any] = {"harness": "codex", "changes": []}
     if CODEX_TOML.is_file():
         text = CODEX_TOML.read_text(encoding="utf-8")
-        new = _CODEX_MCP_RE.sub("", text)
+        _validate_toml(CODEX_TOML, text)
+        new = _remove_toml_table(text, "mcp_servers.khipu")
         if new != text:
             out["changes"].append(f"{CODEX_TOML}: remove [mcp_servers.khipu]")
             if not dry:
+                new = new.rstrip("\n") + "\n"
+                _validate_toml(CODEX_TOML, new)
                 out.setdefault("backups", []).append(_backup(CODEX_TOML))
-                CODEX_TOML.write_text(new.rstrip("\n") + "\n", encoding="utf-8")
+                _write_toml(CODEX_TOML, new)
     h = _load_json(CODEX_HOOKS)
     changed = False
     for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop", "SessionStart", "UserPromptSubmit"):
@@ -1360,12 +1568,12 @@ def _codex_uninstall(dry: bool) -> dict:
 
 def _codex_status() -> dict:
     text = CODEX_TOML.read_text(encoding="utf-8") if CODEX_TOML.is_file() else ""
-    m = _CODEX_MCP_RE.search(text)
+    m = _toml_table_block(text, "mcp_servers.khipu")
     h = _load_json(CODEX_HOOKS)
     def has(ev: str, pred) -> bool:
         return any(pred(x.get("command")) for e in h.get("hooks", {}).get(ev, []) for x in e.get("hooks", []))
     out = {"harness": "codex", "detected": _codex_detected(),
-            "mcp": bool(m and mcp_launcher() in m.group(0)),
+            "mcp": bool(m and mcp_launcher() in m[2]),
             "hook_stop": has("Stop", _is_ours), "hook_precompact": has("PreCompact", _is_ours),
             "hook_sessionend": has("SessionEnd", _is_ours),
             "hook_subagentstop": has("SubagentStop", _is_ours),
@@ -1553,6 +1761,7 @@ def set_gateway_token(token: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
+        os.fchmod(fd, 0o600)
         os.write(fd, (token + "\n").encode("utf-8"))
     finally:
         os.close(fd)
@@ -1695,7 +1904,12 @@ def gateway_liveness_check() -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001 — a network hiccup is red, not a crash
         return {"ok": False, "applicable": True, "error": f"{type(e).__name__}: {e}",
                 "fix": "check the gateway is running and reachable"}
-    tokens = (body.get("gateway_liveness") or {}).get("tokens") or {}
+    protected = body.get("gateway_liveness") if isinstance(body, dict) else None
+    if not isinstance(protected, dict):
+        return {"ok": False, "applicable": True,
+                "error": "health response lacks authenticated gateway_liveness fields",
+                "fix": "check the gateway bearer token and protected health endpoint"}
+    tokens = protected.get("tokens") or {}
     if not tokens:
         return {"ok": True, "applicable": True, "note": "no traffic recorded yet", "tokens": tokens}
     now = time.time()
