@@ -189,13 +189,13 @@ const SIMILARITY_FIELDS: ReadonlyArray<{
     key: "dedup_similarity",
     env: "KHIPU_DEDUP_SIMILARITY",
     label: "Merge near-duplicate captures at",
-    help: "Two captures in the same project within five minutes are merged when they are at least this similar, from 0 to 1.",
+    help: "Sets the meaning-based threshold from 0 to 1. An independent word matching rule can also merge close captures.",
   },
   {
     key: "commitment_close_similarity",
     env: "KHIPU_COMMITMENT_CLOSE_SIMILARITY",
     label: "Close an open commitment at",
-    help: "A decision or finished item closes an open commitment in the same project when it is at least this similar, from 0 to 1.",
+    help: "Sets the meaning-based closure threshold from 0 to 1. A separate word and completion rule can also close a commitment.",
   },
 ];
 

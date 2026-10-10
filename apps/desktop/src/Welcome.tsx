@@ -109,6 +109,20 @@ type DoctorPayload = {
   hub_snapshot?: { ok?: boolean };
 };
 
+const UNMAPPED_DOCTOR_FAILURES = [
+  "literal_trgm_ok",
+  "prompt_recall_snapshot_ok",
+  "prompt_recall_outcomes_ok",
+  "recall_daemon_ok",
+  "launchers_ok",
+  "notes_reconcile_ok",
+  "embed_provider_ok",
+  "commitments_hygiene_ok",
+  "mark_stale_ok",
+  "topics_embed_lag_ok",
+  "degraded_rate_ok",
+] as const;
+
 /** True once at least one harness's own last probe (`probe-<harness>.json`)
  *  passed and is not stale — real evidence that recall works end to end,
  *  even when the single most-recent probe across every harness (what
@@ -841,6 +855,9 @@ export function Welcome({
   const attentionItems: Attention[] = doctor
     ? buildAttention(doctor as unknown as Record<string, unknown>).items
     : [];
+  const hasUnmappedDoctorFailure = doctor?.ok !== true && (
+    attentionItems.length === 0 || UNMAPPED_DOCTOR_FAILURES.some((key) => (doctor as Record<string, unknown> | null)?.[key] === false)
+  );
 
   /** Finish's list of what "Continue anyway" is continuing past — a title
    *  per row, plus the health check's own state when it has not produced a
@@ -851,7 +868,10 @@ export function Welcome({
     ? [`The health check could not run: ${doctorErr}`]
     : doctor == null
       ? ["The health check has not finished running yet."]
-      : attentionItems.map((item) => item.title);
+      : [
+          ...attentionItems.map((item) => item.title),
+          ...(hasUnmappedDoctorFailure ? ["The health check found a problem but did not name it."] : []),
+        ];
 
   const runFinishFix = useCallback(
     async (item: Attention) => {
@@ -1372,7 +1392,7 @@ export function Welcome({
                     checked={embedChoice === "skip"}
                     onChange={() => setEmbedChoice("skip")}
                   />
-                  {" "}Skip — search empty until a profile is active
+                  {" "}Skip — meaning-based search waits for a profile; keyword search stays available
                 </label>
               </div>
               {embedChoice === "local" ? (
@@ -1565,7 +1585,7 @@ export function Welcome({
             <p className="muted">The health check could not run: {doctorErr}</p>
           ) : doctor == null ? (
             <p className="muted">{doctorBusy ? "Running a health check…" : "Health check not run yet."}</p>
-          ) : attentionItems.length === 0 ? (
+          ) : doctor.ok === true && attentionItems.length === 0 ? (
             <Callout tone="ok" title="Everything checked out">
               {doctor.not_configured?.length ? (
                 <>
@@ -1575,6 +1595,10 @@ export function Welcome({
               ) : (
                 "Every check passed."
               )}
+            </Callout>
+          ) : hasUnmappedDoctorFailure && attentionItems.length === 0 ? (
+            <Callout tone="warn" title="Health check found a problem">
+              It did not name the check. Run the health check again from Home before you finish.
             </Callout>
           ) : (
             <>
@@ -1605,6 +1629,11 @@ export function Welcome({
                   {item.cause}
                 </Callout>
               ))}
+              {hasUnmappedDoctorFailure ? (
+                <Callout tone="warn" title="Health check found a problem">
+                  It did not name every check. Run the health check again from Home before you finish.
+                </Callout>
+              ) : null}
             </>
           )}
           {probeSeconds != null ? (

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Loader2, Minus, RefreshCw, TriangleAlert, X } from "lucide-react";
 import { WorkingBanner } from "./WorkingBanner";
-import { Callout, Tag } from "./ui";
+import { Callout, Dialog, Tag } from "./ui";
 import { GatewayTokenCard } from "./SettingsControls";
 import { fmtAge } from "./time";
 import type { Tone } from "./ui";
@@ -28,6 +28,7 @@ import type { Tone } from "./ui";
  */
 
 type HarnessId = "claude_code" | "cursor" | "aegis" | "codex" | "grok_bot";
+const ALL_HARNESSES: HarnessId[] = ["claude_code", "cursor", "aegis", "codex", "grok_bot"];
 
 /** One Claude home in `khipu integrations status claude_code` → `homes[]`
  *  (packages/cli/khipu/integrations.py `_claude_home_status`). Hooks live in
@@ -514,6 +515,7 @@ type ActResult = {
   ok?: boolean;
   aborted?: boolean;
   error?: string;
+  changes?: unknown[];
   /** Per Claude home (`install` and `uninstall` on claude_code). */
   homes?: Array<{ label?: string; hooks_kept?: string }>;
 };
@@ -541,6 +543,27 @@ export function verifyFailure(list: VerifyRow[]): string | null {
   return `${bad.harness} ${detail}`.slice(0, 160);
 }
 
+function verifySchemaFailure(list: VerifyRow[], expected: readonly string[]): string | null {
+  if (list.length === 0) return "verify result was empty";
+  for (const harness of expected) {
+    const row = list.find((item) => item.harness === harness);
+    if (!row || typeof row.detected !== "boolean") return "verify result did not cover the requested harness";
+    if (row.detected && typeof row.ok !== "boolean") return "verify result did not say whether the probe passed";
+  }
+  return null;
+}
+
+function actionSchemaFailure(results: ActResult[], expected: readonly string[]): string | null {
+  if (results.length === 0) return "action result was missing or unreadable";
+  for (const harness of expected) {
+    const row = results.find((item) => item.harness === harness);
+    if (!row || (row.ok !== true && !Array.isArray(row.changes))) {
+      return "action result did not cover the requested harness";
+    }
+  }
+  return null;
+}
+
 export type InstallRun = {
   /** The CLI's error when the install itself did not finish. */
   failed: string | null;
@@ -559,6 +582,7 @@ export async function runInstall(
   runKhipu: (args: string[]) => Promise<string>,
   harness: string,
   home?: string,
+  expectedHarnesses?: string[],
 ): Promise<InstallRun> {
   const raw = await runKhipu([
     "integrations",
@@ -569,14 +593,22 @@ export async function runInstall(
   ]);
   // A pack that stopped (a config it could not read) says so in the JSON, not
   // in the exit code.
-  const stopped = parseActResults(raw).find((r) => r.ok === false || r.aborted);
+  const results = parseActResults(raw);
+  const stopped = results.find((r) => r.ok === false || r.aborted);
   if (stopped) {
     return { failed: (stopped.error ?? "the pack stopped before finishing").slice(0, 160), verify: null, verifyFailed: null };
   }
+  const expected = expectedHarnesses ?? (harness === "all" ? ALL_HARNESSES : [harness]);
+  const actionError = actionSchemaFailure(results, expected);
+  if (actionError) {
+    return { failed: actionError, verify: null, verifyFailed: null };
+  }
   if (home) return { failed: null, verify: null, verifyFailed: null };
   try {
-    const verify = JSON.parse(await runKhipu(["integrations", "verify", harness])) as VerifyRow[];
-    return { failed: null, verify, verifyFailed: verifyFailure(verify) };
+    const decoded: unknown = JSON.parse(await runKhipu(["integrations", "verify", harness]));
+    if (!Array.isArray(decoded)) return { failed: null, verify: null, verifyFailed: "verify result was unreadable" };
+    const verify = decoded as VerifyRow[];
+    return { failed: null, verify, verifyFailed: verifySchemaFailure(verify, expected) ?? verifyFailure(verify) };
   } catch (e) {
     return { failed: null, verify: null, verifyFailed: String(e).slice(0, 160) };
   }
@@ -620,6 +652,8 @@ export function IntegrationsPanel({
   // docs/plans/2026-09-05-setup-that-cannot-strand-you.md.
   const [installedAt, setInstalledAt] = useState<Record<string, number>>({});
   const [autoVerified, setAutoVerified] = useState<Record<string, boolean>>({});
+  const [removeConfirm, setRemoveConfirm] = useState<{ harness: HarnessId; home?: string; label: string } | null>(null);
+  const latestLoad = useRef(0);
   // Which home row's action gets keyboard focus once an Install/Remove ends.
   const [focusHome, setFocusHome] = useState<{ path: string; cmd: "install" | "uninstall" } | null>(null);
   const homeButtons = useRef<Record<string, HTMLButtonElement | null>>({});
@@ -632,17 +666,20 @@ export function IntegrationsPanel({
   };
 
   const load = useCallback(async () => {
+    const request = ++latestLoad.current;
+    if (latestLoad.current !== request) return;
     setLoadError(null);
     setBusy((prev) => prev ?? "load");
     try {
       const raw = await runKhipu(["integrations", "status"]);
+      if (latestLoad.current !== request) return;
       setRows(JSON.parse(raw) as StatusRow[]);
     } catch (e) {
       // A failed status read is NOT "nothing installed" — keep the last rows
       // and surface the failure as its own state.
-      setLoadError(String(e));
+      if (latestLoad.current === request) setLoadError(String(e));
     } finally {
-      setBusy((prev) => (prev === "load" ? null : prev));
+      if (latestLoad.current === request) setBusy((prev) => (prev === "load" ? null : prev));
     }
   }, [runKhipu]);
 
@@ -670,9 +707,9 @@ export function IntegrationsPanel({
     };
   }, [active, load]);
 
-  // A card flips to Verified on its own once real evidence lands AFTER
-  // Install ran: either `last_beat_at` (the capture hook actually firing) or
-  // the stored end-to-end probe for this harness, whichever is newer. Once
+  // A card flips to Verified on its own only once a successful end-to-end
+  // probe lands AFTER Install. A capture heartbeat shows the hook ran, but
+  // is not the round trip this label promises. Once
   // flipped, stays flipped for the rest of this pane's lifetime — evidence
   // does not un-happen.
   useEffect(() => {
@@ -684,11 +721,10 @@ export function IntegrationsPanel({
         if (next[r.harness]) continue;
         const since = installedAt[r.harness];
         if (since == null) continue;
-        const beatAt = r.last_beat_at ? Date.parse(r.last_beat_at) : NaN;
         const probeAt = recallProbe?.harnesses?.[r.harness]?.ok
           ? Date.parse(recallProbe.harnesses[r.harness]?.ts ?? "")
           : NaN;
-        if ((!Number.isNaN(beatAt) && beatAt > since) || (!Number.isNaN(probeAt) && probeAt > since)) {
+        if (!Number.isNaN(probeAt) && probeAt > since) {
           next[r.harness] = true;
           changed = true;
         }
@@ -705,7 +741,8 @@ export function IntegrationsPanel({
       let message: string | null = null;
       try {
         if (cmd === "install") {
-          const run = await runInstall(runKhipu, harness, home);
+          const targets = harness === "all" ? ALL_HARNESSES : [harness];
+          const run = await runInstall(runKhipu, harness, home, targets);
           if (run.failed) {
             message = `install failed: ${run.failed}`;
             return;
@@ -737,13 +774,25 @@ export function IntegrationsPanel({
             });
             message = run.verifyFailed
               ? `Installed; verify failed: ${run.verifyFailed}`
-              : "Installed. Restart each harness, then start any session — its card turns green by itself.";
+              : "Installed. Restart each harness, then select Verify to check capture and recall.";
+            const skipped = list?.filter((v) => v.detected === false).map((v) => LABEL[v.harness]) ?? [];
+            if (!run.verifyFailed && skipped.length > 0) {
+              message = list?.every((v) => v.detected === false)
+                ? `Skipped: ${skipped.join(", ")}. No harness was checked.`
+                : `${message} Skipped: ${skipped.join(", ")}.`;
+            }
           }
           return;
         }
         const raw = await runKhipu(["integrations", cmd, harness, ...(home ? ["--home", home] : [])]);
         if (cmd === "verify") {
           const list = JSON.parse(raw) as VerifyRow[];
+          const expected = harness === "all" ? ALL_HARNESSES : [harness];
+          const malformed = verifySchemaFailure(list, expected);
+          if (malformed) {
+            message = `verify failed: ${malformed}`;
+            return;
+          }
           setVerify((prev) => {
             const next = { ...prev };
             for (const v of list) next[v.harness] = v;
@@ -754,8 +803,10 @@ export function IntegrationsPanel({
         // Uninstall reports a pack that stopped in the JSON, not in the exit code.
         const results = parseActResults(raw);
         const failed = results.find((r) => r.ok === false || r.aborted);
-        if (failed) {
-          message = `${cmd} failed: ${(failed.error ?? "the pack stopped before finishing").slice(0, 160)}`;
+        const expected = harness === "all" ? ALL_HARNESSES : [harness];
+        const malformed = actionSchemaFailure(results, expected);
+        if (failed || malformed) {
+          message = `${cmd} failed: ${(failed?.error ?? malformed ?? "the pack stopped before finishing").slice(0, 160)}`;
         } else {
           // One home out of several leaves the others, and the evidence about
           // the harness, in place.
@@ -1130,7 +1181,7 @@ export function IntegrationsPanel({
                                 ref={(el) => {
                                   homeButtons.current[`uninstall:${h.path}`] = el;
                                 }}
-                                onClick={() => void act(r.harness, "uninstall", h.path)}
+                                onClick={() => setRemoveConfirm({ harness: r.harness, home: h.path, label: h.label })}
                               >
                                 {busy === `uninstall:${r.harness}:${h.path}` ? (
                                   <Loader2 size={14} className="spin" aria-hidden />
@@ -1166,8 +1217,7 @@ export function IntegrationsPanel({
                 <div className="note">Re-run Install for this repo to refresh its rule.</div>
               ) : awaitingAutoVerify ? (
                 <div className="note">
-                  Installed. Restart {LABEL[r.harness]}, then start any session — this
-                  card turns green by itself.
+                  Installed. Restart {LABEL[r.harness]}, then select Verify to check capture and recall.
                 </div>
               ) : r.harness === "grok_bot" ? (
                 <div className="note wrap" title={WHERE[r.harness]}>
@@ -1227,7 +1277,7 @@ export function IntegrationsPanel({
                               ? "Nothing to remove: Khipu keeps no per-repo pin for Grok Bot on this Mac"
                               : "Nothing to remove: Khipu is not installed here"
                         }
-                        onClick={() => void act(r.harness, "uninstall")}
+                        onClick={() => setRemoveConfirm({ harness: r.harness, label: LABEL[r.harness] })}
                       >
                         Remove
                       </button>
@@ -1266,6 +1316,27 @@ export function IntegrationsPanel({
           Refresh here, to fill in the capture and verified lines.
         </p>
       ) : null}
+      <Dialog
+        open={removeConfirm != null}
+        className="kit-dialog"
+        ariaLabelledBy="remove-harness-title"
+        onCancel={() => setRemoveConfirm(null)}
+      >
+        <div className="kit-dialog-body">
+          <h2 id="remove-harness-title">Remove Khipu from {removeConfirm?.label ?? "this harness"}?</h2>
+          <p>This stops future capture and recall for this harness until you install it again.</p>
+          <div className="kit-dialog-actions">
+            <button type="button" onClick={() => setRemoveConfirm(null)}>Cancel</button>
+            <button type="button" className="danger" disabled={busy != null} onClick={() => {
+              const target = removeConfirm;
+              setRemoveConfirm(null);
+              if (target) void act(target.harness, "uninstall", target.home);
+            }}>
+              Remove Khipu
+            </button>
+          </div>
+        </div>
+      </Dialog>
     </div>
   );
 }
