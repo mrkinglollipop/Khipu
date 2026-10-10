@@ -1073,7 +1073,8 @@ class DoctorFoldsLauncherHealthTest(unittest.TestCase):
 
     def test_inconsistent_roots_warns_without_failing_doctor(self):
         mixed = {"states": [], "consistent": False, "ok": True, "warning": "mixed roots"}
-        with mock.patch("khipu.integrations.launcher_health", return_value=mixed):
+        with mock.patch("khipu.integrations.launcher_health", return_value=mixed), \
+                mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25}):
             rc, out = self._run_doctor()
         self.assertEqual(rc, 0)
         self.assertTrue(out["ok"])
@@ -1081,7 +1082,8 @@ class DoctorFoldsLauncherHealthTest(unittest.TestCase):
 
     def test_healthy_launchers_keep_doctor_green(self):
         good = {"states": [], "consistent": True, "ok": True}
-        with mock.patch("khipu.integrations.launcher_health", return_value=good):
+        with mock.patch("khipu.integrations.launcher_health", return_value=good), \
+                mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25}):
             rc, out = self._run_doctor()
         self.assertEqual(rc, 0)
         self.assertTrue(out["launchers_ok"])
@@ -1760,7 +1762,8 @@ class DoctorListsClaudeHomesTest(_ClaudeHomesCase):
         self._seed(link=True)
         integ.install("claude_code", home=str(self.default))
         buf = io.StringIO()
-        with redirect_stdout(buf):
+        with redirect_stdout(buf), \
+                mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25}):
             rc = cli.cmd_doctor(cli.build_parser().parse_args(["doctor"]))
         out = json.loads(buf.getvalue())
         self.assertEqual([r["label"] for r in out["claude_homes"]["homes"]],

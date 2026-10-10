@@ -131,14 +131,15 @@ class ProtocolTest(_ServiceCase):
         with mock.patch("khipu.recall_prompt.hook_main", side_effect=[RuntimeError("boom"), good]):
             first = _req(r.path, {"op": "recall", "raw": "{}", "shape": "cursor"})
             second = _req(r.path, {"op": "recall", "raw": "{}", "shape": "cursor"})
-        self.assertEqual(first, {})
+        self.assertEqual(first, {"ok": False, "error": "handler failed: RuntimeError"})
         self.assertEqual(second, good)
         self.assertTrue(r.thread.is_alive())
 
     def test_a_non_object_from_the_handler_answers_an_empty_object(self) -> None:
         r = self.running()
         with mock.patch("khipu.recall_prompt.hook_main", return_value="not a dict"):
-            self.assertEqual(_req(r.path, {"op": "recall", "raw": "{}"}), {})
+            self.assertEqual(_req(r.path, {"op": "recall", "raw": "{}"}),
+                             {"ok": False, "error": "handler failed: TypeError"})
 
     def test_two_requests_are_served_at_the_same_time(self) -> None:
         r = self.running()
@@ -188,7 +189,7 @@ class StalenessTest(_ServiceCase):
         stamp[0] = "b"
         with mock.patch("khipu.recall_prompt.hook_main", return_value={"ok": 1}):
             out = _req(r.path, {"op": "recall", "raw": "{}"})
-        self.assertEqual(out, {"ok": 1})  # the current request is answered, on the code it started with
+        self.assertEqual(out, {"ok": False, "error": "restarting"})
         r.thread.join(5)
         self.assertFalse(r.thread.is_alive())
         self.assertEqual(r.exit, [0])
@@ -205,9 +206,9 @@ class StalenessTest(_ServiceCase):
                 mock.patch("khipu.recall_prompt.hook_main", return_value={"n": 1}) as hook:
             first = svc._answer(b'{"op": "recall", "raw": "{}"}')
             second = svc._answer(b'{"op": "recall", "raw": "{}"}')
-        self.assertEqual(first, {"n": 1})
-        self.assertEqual(second, {"error": "restarting"})
-        self.assertEqual(hook.call_count, 1)
+        self.assertEqual(first, {"ok": False, "error": "restarting"})
+        self.assertEqual(second, {"ok": False, "error": "restarting"})
+        self.assertEqual(hook.call_count, 0)
 
     def test_an_unchanged_stamp_keeps_serving(self) -> None:
         r = self.running(stamp_fn=lambda: "same", recheck_s=0.0)
@@ -720,7 +721,7 @@ class HealthFromAnotherCopyTest(unittest.TestCase):
             (other / "a.py").write_text("x = 1\n")
             newest, count = recall_daemon.code_stamp_parts(other)
             answer = {"ok": True, "version": "0.0.0", "pid": 1, "served": 0,
-                      "root": str(other), "code_stamp": f"{newest}:{count}"}
+                      "root": str(other), "code_stamp": recall_daemon.code_stamp(other)}
             with mock.patch.object(recall_daemon, "ping", return_value=answer):
                 out = recall_daemon.daemon_health(now_ns=newest + 3600 * 10**9)
         self.assertTrue(out["ok"])

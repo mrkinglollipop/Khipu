@@ -103,10 +103,10 @@ class ClientTest(unittest.TestCase):
         done, _ = self._run('{"prompt": "hello"}')
         self.assertEqual(done.returncode, 0)
         self.assertEqual(json.loads(done.stdout), answer)
-        self.assertEqual(
-            json.loads(svc.received[0]),
-            {"op": "recall", "raw": '{"prompt": "hello"}', "shape": "claude"},
-        )
+        request = json.loads(svc.received[0])
+        self.assertEqual(request.pop("protocol"), 1)
+        self.assertIsInstance(request.pop("deadline"), float)
+        self.assertEqual(request, {"op": "recall", "raw": '{"prompt": "hello"}', "shape": "claude"})
 
     def test_the_cursor_shape_is_passed_on(self) -> None:
         svc = self._serve(lambda _line: b"{}\n")
@@ -133,7 +133,7 @@ class ClientTest(unittest.TestCase):
     def test_a_slow_service_gets_an_empty_object_and_no_second_attempt(self) -> None:
         svc = self._serve(lambda _line: b'{"late": true}\n', delay=6.0)
         done, elapsed = self._run()
-        self.assertEqual(done.returncode, 0)
+        self.assertEqual(done.returncode, 4)
         self.assertEqual(json.loads(done.stdout), {})
         self.assertLess(elapsed, 5.5)  # gave up at 1.6 s, not at the service's 6 s
         self.assertEqual(len(svc.received), 1)
@@ -147,8 +147,8 @@ class ClientTest(unittest.TestCase):
                 svc = _FakeService(home, lambda _line, r=reply: r)
                 self.addCleanup(svc.close)
                 done, _ = self._run()
-                self.assertEqual(done.returncode, 0)
-                self.assertEqual(json.loads(done.stdout), {})
+                self.assertEqual(done.returncode, 3)
+                self.assertIsInstance(float(done.stdout), float)
 
 
 class SocketPathTest(unittest.TestCase):

@@ -128,7 +128,8 @@ class DoctorAggregateOkTest(_Patched):
         return rc, json.loads(buf.getvalue())
 
     def test_everything_green_including_probe_and_snapshot_is_ok(self):
-        rc, out = self._run(recall_probe_ok=True, hub_snapshot_ok=True)
+        with mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25}):
+            rc, out = self._run(recall_probe_ok=True, hub_snapshot_ok=True)
         self.assertEqual(rc, 0)
         self.assertTrue(out["ok"])
         self.assertTrue(out["recall_probe_ok"])
@@ -153,6 +154,7 @@ class DoctorAggregateOkTest(_Patched):
         parser = cli.build_parser()
         args = parser.parse_args(["doctor"])
         with mock.patch("khipu.probe.status", return_value={"ok": True, "reason": None}), \
+             mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25}), \
              mock.patch("khipu.drift.recall_quality",
                           return_value={"junk_path_ratio": {"value": 0.9, "threshold": 0.05, "ok": False}}):
             buf = io.StringIO()
