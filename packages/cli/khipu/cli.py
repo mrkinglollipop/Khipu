@@ -151,7 +151,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     from khipu.drift import backup_health, sample_drift, status_payload
     from khipu.hub_snapshot import (
         hub_connection_failed,
-        maybe_refresh,
         snapshot_freshness,
         snapshot_health,
         status_payload_snapshot,
@@ -162,7 +161,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     hub_ok = True
     try:
         status = status_payload(None)
-        maybe_refresh()
     except Exception as exc:
         if hub_connection_failed(exc):
             hub_ok = False
@@ -243,13 +241,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         graph = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # Outbox: a queued capture is something PG does not have yet — red until
-    # drained. Doctor tries a drain first so a transient outage that has
-    # already cleared does not show as a failure.
+    # an explicit `khipu outbox drain` clears it. Doctor may maintain local
+    # diagnostic cache/credential state, but never replays this queue.
     try:
-        from khipu.outbox import drain as outbox_drain, status as outbox_status
+        from khipu.outbox import status as outbox_status
 
-        if outbox_status()["pending"]:
-            outbox_drain()
         outbox = outbox_status()
     except Exception as e:  # noqa: BLE001
         outbox = {"pending": -1, "error": f"{type(e).__name__}: {e}"}
@@ -268,14 +264,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # firing) — never on idleness. maintainer, 2026-08-17: a session that captured
     # only at compaction looked healthy on every other check here.
     try:
-        from khipu.session_capture import (
-            drain as capture_drain,
-            liveness_all,
-            queued_jobs,
-        )
+        from khipu.session_capture import liveness_all
 
-        if queued_jobs():
-            capture_drain()  # like the outbox: clear what can be cleared, then judge
         liveness = liveness_all()
     except Exception as e:  # noqa: BLE001
         liveness = {
@@ -299,7 +289,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "error": f"{type(e).__name__}: {e}",
             "reasons": ["check failed"],
         }
-    secrets = secrets_status()
+    try:
+        secrets = secrets_status()
+    except Exception as e:  # noqa: BLE001 — malformed local diagnostics must not crash doctor
+        secrets = {"error": f"{type(e).__name__}: {e}", "dsn_file": {"ok": False}}
     # The file DSN is what every sandboxed harness falls back to when the
     # Keychain is denied. It went stale on 2026-08-04 and nothing noticed until
     # 2026-08-18, because every check ran where the Keychain worked.
@@ -317,10 +310,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     try:
         from khipu.embed import coverage
 
-        embed_coverage = coverage()
+        embed_coverage = coverage(detail=True)
         embed_coverage_ok = (
             embed_coverage.get("episodes", {}).get("missing", 0) == 0
             and embed_coverage.get("topics", {}).get("missing", 0) == 0
+            and embed_coverage.get("missing", 0) == 0
+            and embed_coverage.get("stale", 0) == 0
         )
     except Exception as e:  # noqa: BLE001
         embed_coverage = {"error": f"{type(e).__name__}: {e}"}
@@ -374,25 +369,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         recall_daemon_block = daemon_health()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         recall_daemon_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    # W6.1: `khipu doctor --probe` is the ONLY way this command writes anything
-    # — it runs a fresh end-to-end capture-then-search probe (khipu.probe) and
-    # records the result. Plain `khipu doctor` only reads that last recorded
-    # result (probe.status()) and goes red when it is missing, failed, or
-    # older than 7 days — "the host runs it" has to be proven, not assumed.
+    # --probe runs a fresh end-to-end capture-then-search probe. Plain doctor
+    # reads its last result; diagnostic helpers may maintain local cache or
+    # credential state but never replay a queue or refresh the hub replica.
+    recall_probe = None
     if getattr(args, "probe", False):
         try:
             from khipu import probe
 
             probe_harness = getattr(args, "harness", None) or _env("KHIPU_HARNESS", default="doctor")
-            probe.run_probe(probe_harness)
-        except Exception:  # noqa: BLE001 — a probe crash must not crash doctor;
-            pass          # probe.status() below reports whatever it managed to record
-    try:
-        from khipu import probe
+            current_probe = probe.run_probe(probe_harness)
+            recall_probe = {
+                "ok": bool(current_probe.get("ok")),
+                "reason": current_probe.get("reason") or current_probe.get("error"),
+                "last_probe": current_probe,
+                "age_seconds": 0,
+                "harnesses": probe.harness_results(),
+            }
+        except Exception as e:  # noqa: BLE001 — a probe crash must become a red result
+            recall_probe = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+    if recall_probe is None:
+        try:
+            from khipu import probe
 
-        recall_probe = probe.status()
-    except Exception as e:  # noqa: BLE001
-        recall_probe = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+            recall_probe = probe.status()
+        except Exception as e:  # noqa: BLE001
+            recall_probe = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
     # W6.2: recall-quality ratios (fragmentation, dangling topics, junk paths,
     # commitments, query zero-result rate). Surfaced for visibility; per the
     # scope these only warn and never gate doctor's overall ok below.
@@ -543,6 +545,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         decision_links_block = _decisions.candidate_link_count()
     except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
         decision_links_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    known_job_failures = [
+        name for name in _JOBS_CHOICES
+        if isinstance(jobs.get(name), dict) and jobs[name].get("last_exit") not in (None, 0)
+    ]
+    jobs_ok = not known_job_failures
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -555,6 +562,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "backup": backup,
         "secrets": secrets,
         "jobs": jobs,
+        "job_failures": known_job_failures,
         "index_freshness": index_fresh,
         "embed_coverage": embed_coverage,
         "libraries": libraries,
@@ -587,6 +595,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             and bool(git_sync.get("ok"))
             and dsn_file_ok
             and index_freshness_ok
+            and jobs_ok
             and embed_coverage_ok
             and bool(_graph_backup.get("ok"))
             # graph_offsite_ok was reported but never aggregated, so a stale
@@ -633,6 +642,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "backup_ok": backup["ok"],
         "dsn_file_ok": dsn_file_ok,
         "index_freshness_ok": index_freshness_ok,
+        "jobs_ok": jobs_ok,
         "embed_coverage_ok": embed_coverage_ok,
         "recall_probe_ok": bool(recall_probe.get("ok")),
         "bundle_seal_ok": bool(bundle_seal_block.get("ok")),
@@ -1247,7 +1257,13 @@ def cmd_embed(args: argparse.Namespace) -> int:
         profile=getattr(args, "profile", None),
     )
     print(json.dumps(stats, indent=2))
-    return 0
+    return _backfill_exit_code(stats)
+
+
+def _backfill_exit_code(stats: dict) -> int:
+    """Failed or budget-stopped backfills are incomplete."""
+    failed = int(stats.get("failed_chunks", stats.get("failed", 0)) or 0)
+    return 1 if stats.get("ok") is False or failed or stats.get("budget_exhausted") else 0
 
 
 def _cmd_embed_profiles(args: argparse.Namespace) -> int:
@@ -1384,7 +1400,10 @@ def cmd_embed_backfill_job(args: argparse.Namespace) -> int:
         return 2
     return embed_jobs.run_job(
         kind="embed-backfill", profile=profile, space="memory", job_id=job_id,
-        work=lambda job: backfill(profile=profile, limit=getattr(args, "limit", None), job=job),
+        work=lambda job: backfill(
+            kind=getattr(args, "kind", None), limit=getattr(args, "limit", None),
+            dry_run=bool(getattr(args, "dry_run", False)), profile=profile, job=job,
+        ),
     )
 
 
@@ -1467,7 +1486,7 @@ def cmd_library(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "error": str(e)}))
         return 2
     print(json.dumps(out, indent=2, default=str))
-    return 0
+    return _backfill_exit_code(out) if cmd == "backfill" else 0
 
 
 def cmd_embed_media_backfill(args: argparse.Namespace) -> int:
@@ -1528,7 +1547,7 @@ def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
     synthetic: list[dict] = []
     if raw_id.isdigit():
         cur.execute(
-            "SELECT topics, summary FROM episodes WHERE id = %s",
+            f"SELECT topics, summary FROM episodes WHERE {_episode_live_clause(cur)}id = %s",
             (int(raw_id),),
         )
         row = cur.fetchone()
@@ -1978,7 +1997,10 @@ def cmd_episode(args: argparse.Namespace) -> int:
 
     out = forget_everywhere(int(args.id))
     print(json.dumps(out, default=str))
-    return 0 if out.get("ok") else 1
+    snapshot_ok = (out.get("snapshot") or {}).get("ok", True)
+    legacy_reason = str((out.get("legacy_file") or {}).get("reason") or "")
+    legacy_ok = not legacy_reason.startswith("unreadable:")
+    return 0 if out.get("ok") and snapshot_ok and legacy_ok else 1
 
 
 def cmd_topic(args: argparse.Namespace) -> int:
@@ -2632,6 +2654,10 @@ def cmd_db(args: argparse.Namespace) -> int:
         return 0 if out.get("ok") else 1
 
     if args.db_cmd == "move":
+        explicit_target = args.to or os.environ.get("KHIPU_DB_TARGET_DSN")
+        if getattr(args, "new_local", False) and explicit_target:
+            print(json.dumps({"ok": False, "error": "--new-local conflicts with --to/KHIPU_DB_TARGET_DSN"}))
+            return 2
         from khipu.dbmove import move_database
 
         if getattr(args, "new_local", False):
@@ -2643,7 +2669,7 @@ def cmd_db(args: argparse.Namespace) -> int:
                 return 1
             target = provisioned["dsn"]
         else:
-            target = args.to or os.environ.get("KHIPU_DB_TARGET_DSN")
+            target = explicit_target
             if not target:
                 return _missing_dsn("--to", "KHIPU_DB_TARGET_DSN")
 
@@ -2802,7 +2828,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     out = outbox.drain(limit=args.limit)
     out["remaining"] = outbox.status()["pending"]
     print(json.dumps(out, indent=2))
-    return 0
+    return 0 if not out.get("failed") else 1
 
 
 def cmd_jobs(args: argparse.Namespace) -> int:
@@ -2925,10 +2951,19 @@ def cmd_recall(args: argparse.Namespace) -> int:
                 for query in summary.get("emptied_positives", []):
                     print(f"[EMPTIED] path={path} {query!r}", file=sys.stderr)
             print(json.dumps(report, indent=2, default=str))
-            ok = all(
-                s["abstain_correct"] == s["abstain_total"] and not s.get("emptied_positives")
-                for s in report["paths"].values()
+            summaries = list(report["paths"].values())
+            floor_regression = floor_arg == "on" and any(
+                not row.get("expect_none")
+                and bool(row.get("hit_without"))
+                and not bool(row.get("hit_with"))
+                for row in report.get("rows", [])
             )
+            ok = bool(summaries) and all(
+                s.get("entries", 0) > 0
+                and s["abstain_correct"] == s["abstain_total"]
+                and not s.get("emptied_positives")
+                for s in summaries
+            ) and not floor_regression
             return 0 if ok else 1
 
         # Legacy fast path: zero new flags touched -> byte-identical to the
@@ -2979,7 +3014,12 @@ def cmd_recall(args: argparse.Namespace) -> int:
             for d in result["diffs"]:
                 print(f"[{d['status']}] path={d['path']} {d['query']!r}", file=sys.stderr)
             print(json.dumps(result, indent=2, default=str))
-            return 0 if (result["changed"] == 0 or allow_changes) else 1
+            material_change = result["changed"] > 0 or any(
+                d.get("status") == "reordered"
+                or d.get("control_reason") != d.get("live_reason")
+                for d in result["diffs"]
+            )
+            return 0 if allow_changes or not material_change else 1
 
         # --path prompt|status|all (no --record/--compare): score and print
         # per-path metrics, same "hit@k >= 0.8" gate as legacy, generalized
@@ -3094,6 +3134,8 @@ def cmd_integrations(args: argparse.Namespace) -> int:
     fn = integ.install if args.integ_cmd == "install" else integ.uninstall
     results = [fn(h, dry_run=args.dry_run, project=project, home=home) for h in targets]
     print(json.dumps(results, indent=2))
+    if not all(r.get("ok", True) and not r.get("aborted", False) for r in results):
+        return 1
     if args.integ_cmd == "install" and not args.dry_run and not args.no_verify:
         verified = [_verify(h) for h in targets]
         print(json.dumps({"verify": verified}, indent=2))
@@ -3411,7 +3453,7 @@ def cmd_graph_backup(args: argparse.Namespace) -> int:
 def cmd_import_local(args: argparse.Namespace) -> int:
     from khipu.paths import import_local
 
-    out = import_local(source=Path(args.source), merge=not args.replace)
+    out = import_local(source=Path(args.source), merge=bool(args.replace))
     print(json.dumps(out, indent=2))
     return 0
 
@@ -3531,7 +3573,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe",
         action="store_true",
         help="Run a fresh end-to-end recall probe (writes a nonce episode, "
-        "soft-deletes it after) before reporting; the only way `doctor` writes anything",
+        "soft-deletes it after) before reporting; plain diagnostics may maintain local cache/credential state",
     )
     d.add_argument(
         "--harness",
@@ -4290,7 +4332,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     db_sub = db.add_subparsers(dest="db_cmd", required=True)
     db_pre = db_sub.add_parser(
-        "preflight", help="Dry-run stages reach..graph against a DSN; writes nothing"
+        "preflight",
+        help="Run setup validation against a DSN; it may modify remote schema/privileges, but does not store the DSN, install jobs, or run a probe",
+        description="Run setup validation against a DSN. It may modify remote schema/privileges, but does not store the DSN, install jobs, or run a probe.",
     )
     # --dsn is optional here (and on connect/move's --to below) so a caller that
     # cannot risk the password showing up in `ps` (the desktop app) can set
@@ -4329,10 +4373,11 @@ def build_parser() -> argparse.ArgumentParser:
     db_move = db_sub.add_parser(
         "move", help="Copy the database to another host, verify row counts, and switch"
     )
-    db_move.add_argument(
+    db_move_target = db_move.add_mutually_exclusive_group()
+    db_move_target.add_argument(
         "--to", default=None, help="Target connection string (or KHIPU_DB_TARGET_DSN)"
     )
-    db_move.add_argument(
+    db_move_target.add_argument(
         "--new-local",
         dest="new_local",
         action="store_true",
