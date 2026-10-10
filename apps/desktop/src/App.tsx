@@ -1194,7 +1194,16 @@ export default function App() {
   const [owedStatus, setOwedStatus] = useState<OwedStatus>("open");
   const [owedProject, setOwedProject] = useState<string | null>(null);
   const [owedKind, setOwedKind] = useState<string | null>(null);
-  const [owedLoading, setOwedLoading] = useState(false);
+  // Reads in flight per status. The three statuses load concurrently, so one
+  // finishing must not end another's loading state.
+  const [owedInFlight, setOwedInFlight] = useState<Record<OwedStatus, number>>({
+    open: 0,
+    closed: 0,
+    stale: 0,
+  });
+  const owedLoading = owedInFlight.open + owedInFlight.closed + owedInFlight.stale > 0;
+  // Latest request per status: an older reply never overwrites a newer one.
+  const owedSeq = useRef<Record<OwedStatus, number>>({ open: 0, closed: 0, stale: 0 });
   const [owedBusyId, setOwedBusyId] = useState<number | null>(null);
   const [snoozeTarget, setSnoozeTarget] = useState<Commitment | null>(null);
   // Bumped by an attention item with no fix action, and by "Details": opens
@@ -1573,7 +1582,9 @@ export default function App() {
     async (status: OwedStatus, force = false) => {
       const at = owedFetchedAt[status];
       if (!force && at != null && Date.now() - at < CACHE_TTL_MS) return;
-      setOwedLoading(true);
+      const seq = ++owedSeq.current[status];
+      const latest = () => owedSeq.current[status] === seq;
+      setOwedInFlight((prev) => ({ ...prev, [status]: prev[status] + 1 }));
       try {
         const raw = await runKhipu([
           "owed",
@@ -1582,14 +1593,16 @@ export default function App() {
         ]);
         const parsed = parseJson(raw);
         const rows = Array.isArray(parsed) ? (parsed as Commitment[]) : [];
+        if (!latest()) return;
         setOwedByStatus((prev) => ({ ...prev, [status]: rows }));
         setOwedFetchedAt((prev) => ({ ...prev, [status]: Date.now() }));
         markLoaded(`owed:${status}`, true);
       } catch (e) {
+        if (!latest()) return;
         setError(String(e));
         markLoaded(`owed:${status}`, false);
       } finally {
-        setOwedLoading(false);
+        setOwedInFlight((prev) => ({ ...prev, [status]: Math.max(0, prev[status] - 1) }));
       }
     },
     [owedFetchedAt, markLoaded],
@@ -3440,7 +3453,7 @@ export default function App() {
                   </button>
                 </div>
                 {loadState["owed:open"] !== "ok" ? (
-                  loadState["owed:open"] === "failed" && !owedLoading ? (
+                  loadState["owed:open"] === "failed" && owedInFlight.open === 0 ? (
                     <ReadFailed
                       what="what you owe"
                       onRetry={() => void loadOwed("open", true)}
@@ -4744,7 +4757,7 @@ export default function App() {
             </div>
 
             {loadState[`owed:${owedStatus}`] !== "ok" ? (
-              loadState[`owed:${owedStatus}`] === "failed" && !owedLoading ? (
+              loadState[`owed:${owedStatus}`] === "failed" && owedInFlight[owedStatus] === 0 ? (
                 <ReadFailed
                   what="commitments"
                   onRetry={() => void loadOwed(owedStatus, true)}

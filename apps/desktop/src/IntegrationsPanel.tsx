@@ -353,9 +353,9 @@ export function homeChecks(h: ClaudeHomeRow): { hooks: Mark; memoryTools: Mark; 
  *   N homes not installed / can't be read — Claude Code is in some homes it
  *                   found, not all.
  *   Recording     — the heartbeat shows a capture landing.
- *   Reachable     — the gateway answered (Grok Bot, which has no local hook),
- *                   now or in its own stored probe (the same one "Verified …"
- *                   reads).
+ *   Reachable     — the gateway answered this session (Grok Bot, which has no
+ *                   local hook). Its stored probe is a local recall check, so
+ *                   it only says the gateway has not been checked yet.
  *  Anything else is "no evidence yet", which is neither a pass nor a failure. */
 export function cardStatus(
   row: StatusRow,
@@ -372,14 +372,11 @@ export function cardStatus(
     if (gatewayProbe && gatewayProbe.ok === false) {
       return { tone: "err", label: "Not reachable" };
     }
+    // The stored probe is a local recall round trip; it never touches the
+    // gateway, so it cannot say Reachable or Not reachable.
     const own = stored?.harnesses?.[row.harness];
     if (own?.ts && own.status !== "skipped") {
-      if (own.ok === false) return { tone: "err", label: "Not reachable" };
-      if (own.ok) {
-        return own.stale
-          ? { tone: "warn", label: "Last verified over a week ago" }
-          : { tone: "ok", label: "Reachable" };
-      }
+      return { tone: "neutral", label: "Gateway not checked yet" };
     }
     return { tone: "neutral", label: "Not checked yet" };
   }
