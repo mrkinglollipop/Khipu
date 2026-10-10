@@ -5,12 +5,41 @@ import json
 import os
 import shutil
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 LEGACY_DIR = Path.home() / ".config" / "alzy"
 DEFAULT_DIR = Path.home() / ".config" / "khipu"
 POINTER_NAME = "data_root.json"
+SENSITIVE_FILENAMES = frozenset({"dsn", "gateway-token"})
+
+
+@contextmanager
+def sensitive_writer(path: Path):
+    """Open a sensitive local file as 0600 before any bytes are written."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            yield handle
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def write_sensitive_bytes(path: Path, data: bytes) -> None:
+    with sensitive_writer(path) as handle:
+        handle.write(data)
+
+
+def copy_sensitive(source, path: Path) -> None:
+    with sensitive_writer(path) as handle:
+        shutil.copyfileobj(source, handle)
 
 
 def repo_root() -> Path:
@@ -153,14 +182,15 @@ def backup_local(*, dest: Path) -> dict:
         dest = dest / f"khipu-local-{stamp}.zip"
     dest.parent.mkdir(parents=True, exist_ok=True)
     count = 0
-    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for p in src.rglob("*"):
-            if not p.is_file():
-                continue
-            if p.name == POINTER_NAME and src == DEFAULT_DIR:
-                continue
-            zf.write(p, arcname=str(p.relative_to(src)))
-            count += 1
+    with sensitive_writer(dest) as archive_file:
+        with zipfile.ZipFile(archive_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for p in src.rglob("*"):
+                if not p.is_file():
+                    continue
+                if p.name == POINTER_NAME and src == DEFAULT_DIR:
+                    continue
+                zf.write(p, arcname=str(p.relative_to(src)))
+                count += 1
     return {"ok": True, "archive": str(dest), "files": count, "source": str(src)}
 
 
@@ -177,9 +207,11 @@ def import_local(*, source: Path, merge: bool = True) -> dict:
             if dst.exists() and not merge:
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(p, dst)
-            if dst.name == "dsn":
-                dst.chmod(0o600)
+            if dst.name in SENSITIVE_FILENAMES:
+                with p.open("rb") as source_file:
+                    copy_sensitive(source_file, dst)
+            else:
+                shutil.copy2(p, dst)
             imported += 1
     elif source.is_file() and source.suffix.lower() == ".zip":
         with zipfile.ZipFile(source, "r") as zf:
@@ -196,10 +228,12 @@ def import_local(*, source: Path, merge: bool = True) -> dict:
                 if dest.exists() and not merge:
                     continue
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(info) as src, open(dest, "wb") as out:
-                    shutil.copyfileobj(src, out)
-                if dest.name == "dsn":
-                    dest.chmod(0o600)
+                with zf.open(info) as source_file:
+                    if dest.name in SENSITIVE_FILENAMES:
+                        copy_sensitive(source_file, dest)
+                    else:
+                        with open(dest, "wb") as out:
+                            shutil.copyfileobj(source_file, out)
                 imported += 1
     else:
         raise RuntimeError("import source must be a .zip or a directory")

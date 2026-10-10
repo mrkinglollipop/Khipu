@@ -59,9 +59,9 @@ _PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     (
         "assignment",
         re.compile(
-            r"(?i)\b([A-Za-z0-9_.-]*?(?:api[_-]?key|secret(?:[_-]?key)?|access[_-]?token|auth[_-]?token|"
+            r"(?i)\b([\"']?[A-Za-z0-9_.-]*?(?:api[_-]?key|secret(?:[_-]?key)?|access[_-]?token|auth[_-]?token|"
             r"refresh[_-]?token|token|password|passwd|pwd|client[_-]?secret|private[_-]?key|"
-            r"access[_-]?key(?:[_-]?id)?|dsn|connection[_-]?string)\s*[:=]\s*[\"']?)"
+            r"access[_-]?key(?:[_-]?id)?|dsn|connection[_-]?string)[\"']?\s*[:=]\s*[\"']?)"
             r"([^\s\"']{8,})"
         ),
         r"\1" + MASK,
@@ -85,25 +85,32 @@ def redact_secrets(text: str) -> tuple[str, int]:
     return out, total
 
 
-def _redact_str_list(items: Any) -> tuple[Any, int]:
-    if not isinstance(items, list):
-        return items, 0
-    total = 0
-    out = []
-    for it in items:
-        if isinstance(it, str):
-            s, n = redact_secrets(it)
+def _redact_free_text(value: Any) -> tuple[Any, int]:
+    """Redact free-text leaves without changing a payload's list/dict shape.
+
+    ``decision_details`` has nested rationale/evidence fields, and callers may
+    add nested details without a schema migration. Values are text; keys remain
+    structural so decision/detail matching still has the same shape after
+    redaction.
+    """
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, list):
+        total = 0
+        out = []
+        for item in value:
+            cleaned, n = _redact_free_text(item)
+            out.append(cleaned)
             total += n
-            out.append(s)
-        elif isinstance(it, dict):
-            d = dict(it)
-            for k in ("text", "summary", "why"):
-                if isinstance(d.get(k), str):
-                    d[k], n = redact_secrets(d[k])
-                    total += n
-            out.append(d)
-        else:
-            out.append(it)
+        return out, total
+    if not isinstance(value, dict):
+        return value, 0
+    total = 0
+    out = {}
+    for key, item in value.items():
+        cleaned, n = _redact_free_text(item)
+        out[key] = cleaned
+        total += n
     return out, total
 
 
@@ -114,19 +121,22 @@ def redact_payload(payload: dict[str, Any]) -> int:
     if not isinstance(payload, dict) or not enabled():
         return 0
     total = 0
-    for k in ("summary", "scope", "raw"):
+    for k in ("summary", "scope"):
         if isinstance(payload.get(k), str):
             payload[k], n = redact_secrets(payload[k])
             total += n
-    for k in ("decisions", "preferences", "open_loops", "closed_loops", "people"):
+    if "raw" in payload:
+        payload["raw"], n = _redact_free_text(payload["raw"])
+        total += n
+    for k in ("decisions", "decision_details", "preferences", "open_loops", "closed_loops", "people"):
         if k in payload:
-            payload[k], n = _redact_str_list(payload[k])
+            payload[k], n = _redact_free_text(payload[k])
             total += n
     verbatim = payload.get("verbatim")
     if isinstance(verbatim, dict):
         for k in ("errors", "commands", "paths", "quotes"):
             if k in verbatim:
-                verbatim[k], n = _redact_str_list(verbatim[k])
+                verbatim[k], n = _redact_free_text(verbatim[k])
                 total += n
         if isinstance(verbatim.get("note"), str):
             verbatim["note"], n = redact_secrets(verbatim["note"])
