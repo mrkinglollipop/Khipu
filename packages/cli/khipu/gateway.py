@@ -64,9 +64,12 @@ from khipu.mcp_server import (
     SERVER_VERSION,
     handle_message,
     mark_gateway_active,
+    take_message_error,
 )
 
 MAX_BODY = 1024 * 1024
+REQUEST_TIMEOUT_S = 15
+MAX_WORKERS = 32
 RATE_PER_MIN = int(os.environ.get("KHIPU_GATEWAY_RATE_PER_MIN", "120"))
 # Per-token budget, on top of the per-IP one: several cloud agents behind one
 # egress IP used to throttle each other, and one caller with many source IPs
@@ -172,15 +175,51 @@ def parse_tokens(raw: str) -> dict[str, str]:
     return out
 
 
-def _read_exact(rfile, n: int) -> bytes:
+def _read_exact(rfile, n: int, *, connection=None) -> bytes:
     """rfile.read(n) may return short on a chunked or slow client; loop."""
     buf = bytearray()
+    deadline = time.monotonic() + REQUEST_TIMEOUT_S
     while len(buf) < n:
-        chunk = rfile.read(n - len(buf))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("body deadline")
+        if connection is not None:
+            connection.settimeout(remaining)
+        chunk = getattr(rfile, "read1", rfile.read)(n - len(buf))
         if not chunk:
             break
         buf.extend(chunk)
     return bytes(buf)
+
+
+class BoundedHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._workers = threading.BoundedSemaphore(MAX_WORKERS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._workers.acquire(blocking=False):
+            try:
+                request.settimeout(1)
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._workers.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._workers.release()
 
 
 class _Rate:
@@ -233,6 +272,10 @@ class Handler(BaseHTTPRequestHandler):
     # the token check (audit 2026-08-17: it ran after, so unauthenticated
     # attempts — the ones worth throttling — were not limited at all).
     auth_fail_rate: _Rate = _Rate(AUTH_FAIL_PER_MIN)
+
+    def setup(self) -> None:
+        self.request.settimeout(REQUEST_TIMEOUT_S)
+        super().setup()
 
     # ---- plumbing --------------------------------------------------------------
     def log_message(self, fmt: str, *args: Any) -> None:  # silence default access log
@@ -293,11 +336,15 @@ class Handler(BaseHTTPRequestHandler):
     # ---- routes ---------------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/healthz":
+            label = self._authorized()
+            if self.headers.get("Authorization") and not label:
+                self._send(401)
+                return
             body: dict[str, Any] = {"ok": True}
             # The build stamp answers "is the deployed fix live?" for the deploy
             # script (loopback on the host) and for token holders; the public
             # internet gets a bare liveness answer and nothing to fingerprint.
-            if self._is_loopback_client() or self._authorized():
+            if self._is_loopback_client() or label:
                 body.update({"server": SERVER_NAME, "version": SERVER_VERSION, "build": BUILD})
                 # K9: per-token last_ok_at/last_error_at, for doctor's gateway
                 # liveness row — only for a caller who could already see the
@@ -350,7 +397,13 @@ class Handler(BaseHTTPRequestHandler):
         if n <= 0 or n > MAX_BODY:
             self._send(413 if n > MAX_BODY else 400)
             return
-        raw = _read_exact(self.rfile, n)
+        try:
+            raw = _read_exact(self.rfile, n, connection=self.connection)
+        except TimeoutError:
+            self.close_connection = True
+            self._send(408)
+            _record_liveness(label, ok=False, error="body timeout")
+            return
         if len(raw) != n:
             self._send(400)
             return
@@ -361,8 +414,9 @@ class Handler(BaseHTTPRequestHandler):
                                         "error": {"code": -32700, "message": "parse error"}}).encode())
             return
         msgs = msg if isinstance(msg, list) else [msg]
-        if not all(isinstance(m, dict) for m in msgs) or not msgs:
-            self._send(400)
+        if not msgs:
+            self._send(400, json.dumps({"jsonrpc": "2.0", "id": None,
+                                        "error": {"code": -32600, "message": "invalid request"}}).encode())
             return
         if len(msgs) > MAX_BATCH:
             self._send(413, json.dumps({"jsonrpc": "2.0", "id": None,
@@ -378,10 +432,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         tool = ""
         responses = []
+        errors = []
         for m in msgs:
-            if m.get("method") == "tools/call":
-                tool = str((m.get("params") or {}).get("name") or "")
             try:
+                if isinstance(m, dict) and m.get("method") == "tools/call":
+                    params = m.get("params")
+                    name = params.get("name") if isinstance(params, dict) else None
+                    tool = name if isinstance(name, str) else ""
                 r = handle_message(m)
             except KeyboardInterrupt:
                 raise
@@ -391,8 +448,17 @@ class Handler(BaseHTTPRequestHandler):
                 # straight through the request thread (audit 2026-09-04).
                 detail = (f"SystemExit: capture rejected the payload (exit {exc.code})"
                           if isinstance(exc, SystemExit) else f"{type(exc).__name__}: {exc}")
-                r = {"jsonrpc": "2.0", "id": m.get("id"),
+                r = {"jsonrpc": "2.0", "id": m.get("id") if isinstance(m, dict) else None,
                      "error": {"code": -32603, "message": detail}}
+                if isinstance(m, dict) and "id" not in m:
+                    r = None
+                errors.append("dispatch error")
+            dispatch_error = take_message_error()
+            if dispatch_error:
+                errors.append(dispatch_error)
+            if isinstance(r, dict) and (r.get("error") or (
+                    isinstance(r.get("result"), dict) and r["result"].get("isError"))):
+                errors.append("protocol error" if r.get("error") else "tool error")
             if r is not None:
                 responses.append(r)
         if not responses:  # only notifications
@@ -402,9 +468,8 @@ class Handler(BaseHTTPRequestHandler):
             body = responses if isinstance(msg, list) else responses[0]
             self._send(200, json.dumps(body, default=str).encode("utf-8"))
             status = 200
-        errors = [r["error"]["message"] for r in responses if isinstance(r, dict) and r.get("error")]
         if errors:
-            _record_liveness(label, ok=False, error=f"5xx: {errors[0]}"[:200])
+            _record_liveness(label, ok=False, error=errors[0])
         else:
             _record_liveness(label, ok=True)
         _log(f"{ip} token={label} POST /mcp {status} {int((time.time() - t0) * 1000)}ms"
@@ -426,7 +491,7 @@ def serve(bind: str = "127.0.0.1:8787", token: str | None = None) -> None:
     Handler.rate = _Rate(RATE_PER_MIN)
     Handler.token_rate = _Rate(RATE_PER_TOKEN_PER_MIN)
     Handler.auth_fail_rate = _Rate(AUTH_FAIL_PER_MIN)
-    httpd = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Handler)
+    httpd = BoundedHTTPServer((host or "127.0.0.1", int(port)), Handler)
     httpd.daemon_threads = True
     _log(f"listening on {host or '127.0.0.1'}:{port} (pid {os.getpid()}, "
          f"capture_mode={os.environ.get('KHIPU_CAPTURE_MODE', 'default')}, "

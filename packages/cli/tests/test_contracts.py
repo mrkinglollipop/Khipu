@@ -143,8 +143,10 @@ def test_prompt_block_keeps_its_heading_line_shape_footer_and_budget():
 
 def test_khipu_get_episode_is_a_superset_of_the_fixture(tmp_path):
     fixture = _load("khipu_get.episode.json")
+    fixture.pop("raw", None)
     with corpus.installed_corpus(tmp_path):
         actual = ms._tool_get({"id": "1"})
+    assert "raw" not in actual
     _assert_superset(actual, fixture, label="khipu_get.episode.json")
 
 
