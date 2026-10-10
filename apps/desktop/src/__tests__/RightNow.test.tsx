@@ -35,7 +35,7 @@ describe("RightNowCard", () => {
     );
     expect(screen.getByText("Claude Code")).toBeInTheDocument();
     expect(
-      screen.getByText(/3 turns waiting for capture · last capture 4m ago/),
+      screen.getByText(/3 turns waiting for capture · last capture 4 min ago/),
     ).toBeInTheDocument();
     expect(
       screen.getByText(/Queue depth 1 · captured today 5/),

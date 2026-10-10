@@ -7,17 +7,7 @@
 import { EmptyState, ListRow } from "./ui";
 import { LABEL as HARNESS_LABEL } from "./IntegrationsPanel";
 import type { LivenessPayload } from "./IntegrationsPanel";
-
-/** `seconds` -> "4m" / "2h" / "3d", the same register `App.tsx`'s own
- *  `formatAge` uses — duplicated rather than imported to keep this file
- *  free of an App.tsx dependency (App.tsx already imports from here). */
-function formatAge(seconds: number | null | undefined): string {
-  if (seconds == null) return "an unknown time";
-  if (seconds < 90) return `${Math.round(seconds)}s`;
-  if (seconds < 5400) return `${Math.round(seconds / 60)}m`;
-  if (seconds < 172800) return `${Math.round(seconds / 3600)}h`;
-  return `${Math.round(seconds / 86400)}d`;
-}
+import { fmtAge } from "./time";
 
 export function RightNowCard({
   liveness,
@@ -66,7 +56,7 @@ export function RightNowCard({
                     : "nothing waiting"}
                   {" · last capture "}
                   {h.last_captured_age_s != null
-                    ? `${formatAge(h.last_captured_age_s)} ago`
+                    ? `${fmtAge(h.last_captured_age_s)} ago`
                     : "never"}
                 </span>
               </ListRow>

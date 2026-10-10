@@ -8,6 +8,7 @@ import { Callout, Tag } from "./ui";
 import { SetupStages, plainWords } from "./SetupStages";
 import type { SetupPhase, SetupPipelineResult } from "./SetupStages";
 import { buildAttention, type Attention } from "./doctorAttention";
+import { LABEL as HARNESS_LABEL } from "./IntegrationsPanel";
 import type { RecallProbeStatus } from "./IntegrationsPanel";
 import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVerify";
 
@@ -984,7 +985,7 @@ export function Welcome({
             want to run it.
           </p>
           <div className="toolbar" role="radiogroup" aria-label="Database setup mode">
-            <label className="mono">
+            <label className="radio-choice">
               <input
                 type="radio"
                 name="db-mode"
@@ -993,7 +994,7 @@ export function Welcome({
               />
               {" "}Join a Khipu I already have
             </label>
-            <label className="mono">
+            <label className="radio-choice">
               <input
                 type="radio"
                 name="db-mode"
@@ -1002,7 +1003,7 @@ export function Welcome({
               />
               {" "}Set up a new database on this Mac (needs Docker)
             </label>
-            <label className="mono">
+            <label className="radio-choice">
               <input
                 type="radio"
                 name="db-mode"
@@ -1235,7 +1236,7 @@ export function Welcome({
             <div className="section-head">Session summaries</div>
             <div className="section-body">
               <div className="toolbar" role="radiogroup" aria-label="Synth provider">
-                <label className="mono">
+                <label className="radio-choice">
                   <input
                     type="radio"
                     name="synth-choice"
@@ -1244,7 +1245,7 @@ export function Welcome({
                   />
                   {" "}Cloud Gemini
                 </label>
-                <label className="mono">
+                <label className="radio-choice">
                   <input
                     type="radio"
                     name="synth-choice"
@@ -1253,7 +1254,7 @@ export function Welcome({
                   />
                   {" "}Local OpenAI-compat
                 </label>
-                <label className="mono">
+                <label className="radio-choice">
                   <input
                     type="radio"
                     name="synth-choice"
@@ -1346,7 +1347,7 @@ export function Welcome({
             <div className="section-head">Search by meaning</div>
             <div className="section-body">
               <div className="toolbar" role="radiogroup" aria-label="Embed provider">
-                <label className="mono">
+                <label className="radio-choice">
                   <input
                     type="radio"
                     name="embed-choice"
@@ -1355,7 +1356,7 @@ export function Welcome({
                   />
                   {" "}Gemini Embedding 2 @768
                 </label>
-                <label className="mono">
+                <label className="radio-choice">
                   <input
                     type="radio"
                     name="embed-choice"
@@ -1364,7 +1365,7 @@ export function Welcome({
                   />
                   {" "}Local (configure later)
                 </label>
-                <label className="mono">
+                <label className="radio-choice">
                   <input
                     type="radio"
                     name="embed-choice"
@@ -1529,7 +1530,7 @@ export function Welcome({
             <ul className="welcome-list welcome-harness-list">
               {harnesses.map((h) => (
                 <li key={h.harness} className="welcome-harness-row">
-                  <strong>{h.harness.replace("_", " ")}</strong>
+                  <strong>{HARNESS_LABEL[h.harness as keyof typeof HARNESS_LABEL] ?? h.harness.replace("_", " ")}</strong>
                   {h.installed ?? (h.harness === "grok_bot" ? h.mcp : h.mcp && h.hook_stop && h.hook_precompact) ? (
                     <Tag tone="ok" dot>
                       {h.last_beat_at ? "Installed · recording" : "Installed"}

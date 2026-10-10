@@ -162,11 +162,16 @@ function isLoopback(endpoint?: string | null): boolean {
   return /^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(endpoint ?? "");
 }
 
+/** Two decimals, more only when the amount is under a cent. */
+function usd(n: number): string {
+  return n >= 0.01 || n === 0 ? `$${n.toFixed(2)}` : `$${Number(n.toPrecision(2))}`;
+}
+
 function pricePhrase(p: ProfileRow): string {
   const price = p.price_per_million_usd;
   if (price === 0) return "local, no charge";
   if (price == null) return "price unknown";
-  return `$${price} per 1M tokens`;
+  return `${usd(price)} per 1M tokens`;
 }
 
 function delayPhrase(p: ProfileRow): string {
@@ -766,11 +771,9 @@ export function EmbeddingsPanel({ active }: { active: boolean }) {
                   why={
                     anyBusy
                       ? "A job is running."
-                      : mem.missing > 0
-                        ? `${num(mem.missing)} missing`
-                        : mem.stale > 0
-                          ? `${num(mem.stale)} out of date`
-                          : "Nothing is embedded yet."
+                      : toRedo > 0
+                        ? `${num(toRedo)} missing${mem.stale > 0 ? " or out of date" : ""}`
+                        : "Nothing is embedded yet."
                   }
                   note="Takes effect on the next search."
                   busy={busy === `activate:${p.id}`}

@@ -49,6 +49,7 @@ import { FeedbackForm } from "./FeedbackForm";
 import { PostUpdateNoticeDialog } from "./PostUpdateNoticeDialog";
 import { OptionalFeatures } from "./OptionalFeatures";
 import { EmbeddingsPanel } from "./EmbeddingsPanel";
+import { fmtAge, fmtAgeSince, fmtClock } from "./time";
 import {
   CaptureTuningCard,
   GatewayUrlCard,
@@ -591,7 +592,7 @@ function dayLabel(iso: string | null | undefined): string {
 
 function timeLabel(iso: string | null | undefined): string {
   const d = parseTs(iso);
-  return d ? d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+  return d ? fmtClock(d) : "";
 }
 
 function shortDateLabel(iso: string | null | undefined): string {
@@ -733,27 +734,11 @@ const NOT_CONFIGURED_LABEL: Record<string, string> = {
   mark_stale: "Stale commitments aged out",
 };
 
-function formatAge(seconds: number | null | undefined): string {
-  if (seconds == null) return "an unknown time";
-  if (seconds < 90) return `${Math.round(seconds)}s`;
-  if (seconds < 5400) return `${Math.round(seconds / 60)}m`;
-  if (seconds < 172800) return `${Math.round(seconds / 3600)}h`;
-  return `${Math.round(seconds / 86400)}d`;
-}
-
-/** Coarse age of an ISO timestamp, in the mocks' "2 d" register. */
 /** Milliseconds, as a person reads them: sub-second in ms, above that in
  *  seconds to one decimal. */
 function formatMs(ms: number | null | undefined): string {
   if (ms == null || !Number.isFinite(ms)) return "—";
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
-}
-
-function ageSince(iso: string | null | undefined): string | null {
-  if (!iso) return null;
-  const t = new Date(String(iso).replace(" ", "T")).getTime();
-  if (Number.isNaN(t)) return null;
-  return formatAge((Date.now() - t) / 1000);
 }
 
 async function spawnKhipu(subcommand: string): Promise<{
@@ -835,10 +820,24 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Newest-first goes by the `mtime` `khipu paths` reports (epoch ms); an older
+ *  CLI without it falls back to the date written into the file name
+ *  (2026-09-28, 20260928), and undated files follow in listed order. */
+function fileStamp(f: { path: string; mtime?: number | string }): number {
+  if (f.mtime != null) {
+    const t = typeof f.mtime === "number" ? f.mtime : Date.parse(f.mtime);
+    if (!Number.isNaN(t)) return t;
+  }
+  const m = f.path.match(/(20\d{2})-?(\d{2})-?(\d{2})/);
+  return m ? Date.UTC(+m[1], +m[2] - 1, +m[3]) : 0;
+}
+
+const DATA_FILES_SHOWN = 10;
+
 function formatTs(raw: string): string {
   const d = new Date(raw);
   if (Number.isNaN(d.getTime())) return raw;
-  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const time = fmtClock(d);
   const sameDay = d.toDateString() === new Date().toDateString();
   if (sameDay) return time;
   return `${d.toLocaleDateString([], { month: "short", day: "numeric" })} ${time}`;
@@ -861,6 +860,43 @@ function BrandMark({ size = 26 }: { size?: number }) {
 
 function Spinner() {
   return <Loader2 size={14} className="spin" aria-hidden />;
+}
+
+/** First load in flight: not the empty state, which would claim the answer. */
+function ReadingLine({ what }: { what: string }) {
+  return (
+    <EmptyState
+      icon={<Loader2 size={22} className="spin" aria-hidden />}
+      title={`Reading ${what}…`}
+    />
+  );
+}
+
+/** A first load that failed and left nothing to show. */
+function ReadFailed({ what, onRetry }: { what: string; onRetry: () => void }) {
+  return (
+    <Callout
+      tone="err"
+      stripe
+      title={`Couldn't read ${what}`}
+      action={
+        <button type="button" onClick={onRetry}>
+          <RefreshCw size={14} strokeWidth={1.75} aria-hidden /> Retry
+        </button>
+      }
+    >
+      The CLI didn't answer, so there is nothing to show yet. Check that Python
+      3.11 and the Khipu folder are set under Settings → Advanced.
+    </Callout>
+  );
+}
+
+/** A Python traceback in a toast is its last non-empty line (the exception);
+ *  the full text stays in the toast's title. */
+function toastLine(text: string): string {
+  if (!text.includes("Traceback (most recent call last)")) return text;
+  const lines = text.split("\n").filter((l) => l.trim() !== "");
+  return (lines[lines.length - 1] ?? text).trim();
 }
 
 type Tone = "ok" | "warn" | "err" | "neutral";
@@ -965,6 +1001,18 @@ export default function App() {
     {},
   );
   const [error, setError] = useState<string | null>(null);
+  // First-load outcome per source ("status", "activity", "owed:open", ...). A
+  // source stays "ok" once it has answered, so a later failed refresh keeps
+  // the last-good rows; only a source that never answered shows as failed.
+  const [loadState, setLoadState] = useState<Record<string, "ok" | "failed">>(
+    {},
+  );
+  const markLoaded = useCallback((key: string, ok: boolean) => {
+    const next = ok ? "ok" : "failed";
+    setLoadState((prev) =>
+      prev[key] === "ok" || prev[key] === next ? prev : { ...prev, [key]: next },
+    );
+  }, []);
   const fetchedAt = useRef<Partial<Record<CacheTab, number>>>({});
   // Doctor reads can overlap (a forced read after an install while a TTL read
   // is still running); only the newest request may write its answer.
@@ -1226,6 +1274,7 @@ export default function App() {
       ) {
         // Keep last-good KPIs; do not stamp fetchedAt so retry is not TTL-blocked.
         setError("Unexpected response from hub");
+        markLoaded("status", false);
         return;
       }
       setStatusText(prettyJson(raw));
@@ -1233,9 +1282,11 @@ export default function App() {
       setStatusConflicts(parsed.conflicts ?? null);
       setRecentCaptures(parsed.recent_captures ?? []);
       fetchedAt.current.status = Date.now();
+      markLoaded("status", true);
     } catch (e) {
       // Preserve last-good KPIs/lists; toast only.
       setError(String(e));
+      markLoaded("status", false);
     } finally {
       markLoading("status", false);
     }
@@ -1533,13 +1584,15 @@ export default function App() {
         const rows = Array.isArray(parsed) ? (parsed as Commitment[]) : [];
         setOwedByStatus((prev) => ({ ...prev, [status]: rows }));
         setOwedFetchedAt((prev) => ({ ...prev, [status]: Date.now() }));
+        markLoaded(`owed:${status}`, true);
       } catch (e) {
         setError(String(e));
+        markLoaded(`owed:${status}`, false);
       } finally {
         setOwedLoading(false);
       }
     },
-    [owedFetchedAt],
+    [owedFetchedAt, markLoaded],
   );
 
   /** Done / Reopen / Snooze. Every write refetches all three statuses, because
@@ -1630,6 +1683,7 @@ export default function App() {
       ) {
         // Keep last-good lists/KPIs; do not stamp fetchedAt so retry is not TTL-blocked.
         setError("Unexpected response from hub");
+        markLoaded("activity", false);
         return;
       }
       setActivityText(prettyJson(raw));
@@ -1646,9 +1700,11 @@ export default function App() {
         setSecretsPresenceMsg("Secrets presence unknown.");
       }
       fetchedAt.current.activity = Date.now();
+      markLoaded("activity", true);
     } catch (e) {
       // Preserve last-good activity lists/KPIs; toast only.
       setError(String(e));
+      markLoaded("activity", false);
     } finally {
       markLoading("activity", false);
     }
@@ -2084,8 +2140,9 @@ export default function App() {
 
   const [dataDir, setDataDir] = useState("");
   const [dataFiles, setDataFiles] = useState<
-    Array<{ path: string; bytes: number }>
+    Array<{ path: string; bytes: number; mtime?: number | string }>
   >([]);
+  const [dataFilesAll, setDataFilesAll] = useState(false);
   const [backupOut, setBackupOut] = useState("~/Downloads");
   const [importSource, setImportSource] = useState("");
   const [pathsMsg, setPathsMsg] = useState<string | null>(null);
@@ -2274,7 +2331,7 @@ export default function App() {
       const raw = await runKhipu(["paths"]);
       const parsed = parseJson(raw) as {
         data_dir?: string;
-        files?: Array<{ path: string; bytes: number }>;
+        files?: Array<{ path: string; bytes: number; mtime?: number | string }>;
       } | null;
       setDataDir(parsed?.data_dir ?? "");
       setDataFiles(parsed?.files ?? []);
@@ -2830,8 +2887,8 @@ export default function App() {
   const backupAge = backupHealth?.freshest_backup_age_seconds;
   const offsiteAge = doctorGraphOffsite?.latest?.age_seconds;
   const backupSub = [
-    backupAge != null ? `Database ${formatAge(backupAge)}` : null,
-    offsiteAge != null ? `off-site copy ${formatAge(offsiteAge)}` : null,
+    backupAge != null ? `Database ${fmtAge(backupAge)} ago` : null,
+    offsiteAge != null ? `off-site copy ${fmtAge(offsiteAge)} ago` : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -2954,10 +3011,10 @@ export default function App() {
    *  actions differ (a closed row reopens, an open one closes or snoozes). */
   const renderOwedTable = (rows: Commitment[]) => (
     <div className="card">
-      <div className="card-head">
+      <div className="card-head owed-head">
         <span className="w88">Kind</span>
         <span className="grow">What you owe</span>
-        <span className="w96">Project</span>
+        <span className="w128">Project</span>
         <span className="w52">Opened</span>
         <span className="w44">Due</span>
         <span className="w50">From</span>
@@ -2967,23 +3024,26 @@ export default function App() {
         // "Seen again" is evidence a later session re-stated the item; it is
         // shown only when it actually happened (seen_count > 1), and a
         // pre-migration hub answers 1 for every row.
-        const seen = (c.seen_count ?? 1) > 1 ? ageSince(c.last_seen_at) : null;
+        const seen = (c.seen_count ?? 1) > 1 ? fmtAgeSince(c.last_seen_at) : null;
         return (
-          <ListRow key={c.id}>
+          <ListRow key={c.id} className="owed-row">
             <span className="w88">
               <Tag kind tone={c.kind === "blocker" ? "warn" : "neutral"}>
                 {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
               </Tag>
             </span>
-            <span className="grow ellip" title={c.text}>
+            <span className="grow owed-text" title={c.text}>
               {c.text}
             </span>
             {seen ? (
-              <span className="meta" title={`Restated by ${c.seen_count} captures`}>
+              <span
+                className="meta owed-seen"
+                title={`Restated by ${c.seen_count} captures`}
+              >
                 seen {seen} ago
               </span>
             ) : null}
-            <span className="w96">
+            <span className="w128">
               {c.project ? (
                 <Tag
                   title={
@@ -3284,7 +3344,7 @@ export default function App() {
                 }
                 sub={
                   snapshotHealth?.age_seconds != null
-                    ? `Offline copy ${formatAge(snapshotHealth.age_seconds)} old`
+                    ? `Offline copy ${fmtAge(snapshotHealth.age_seconds)} ago`
                     : undefined
                 }
                 tone={dsnOk === false ? "err" : "neutral"}
@@ -3334,7 +3394,16 @@ export default function App() {
                     Open Activity
                   </button>
                 </div>
-                {recentCaptures.length === 0 ? (
+                {loadState.status !== "ok" ? (
+                  loadState.status === "failed" && !loading.status ? (
+                    <ReadFailed
+                      what="recent captures"
+                      onRetry={() => void loadStatus(true)}
+                    />
+                  ) : (
+                    <ReadingLine what="captures" />
+                  )
+                ) : recentCaptures.length === 0 ? (
                   <EmptyState
                     title="No captures yet"
                     hint="Sessions your harnesses record show up here within a minute."
@@ -3370,21 +3439,30 @@ export default function App() {
                     Open Owed
                   </button>
                 </div>
-                {needsYouRows.length === 0 ? (
+                {loadState["owed:open"] !== "ok" ? (
+                  loadState["owed:open"] === "failed" && !owedLoading ? (
+                    <ReadFailed
+                      what="what you owe"
+                      onRetry={() => void loadOwed("open", true)}
+                    />
+                  ) : (
+                    <ReadingLine what="commitments" />
+                  )
+                ) : needsYouRows.length === 0 ? (
                   <EmptyState
                     title="Nothing needs you"
                     hint="Questions, blockers and the follow-ups you own appear here."
                   />
                 ) : (
                   needsYouRows.slice(0, 4).map((c) => {
-                    const age = ageSince(c.opened_at);
+                    const age = fmtAgeSince(c.opened_at);
                     return (
                       <ListRow key={c.id}>
                         <Tag kind tone={c.kind === "blocker" ? "warn" : "neutral"}>
                           {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
                         </Tag>
                         <span className="grow ellip t2">{c.text}</span>
-                        {age ? <span className="meta">{age}</span> : null}
+                        {age ? <span className="meta">{age} ago</span> : null}
                       </ListRow>
                     );
                   })
@@ -3412,12 +3490,12 @@ export default function App() {
                 <div className="rows-head">Backups of the connections index</div>
                 {renderHealthRow("Snapshot", doctorGraphBackup, (c) =>
                   c.ok
-                    ? `Fresh — newest copy ${formatAge(c.age_seconds)} old (limit ${c.max_age_hours}h)`
+                    ? `Fresh — newest copy ${fmtAge(c.age_seconds)} ago (limit ${c.max_age_hours}h)`
                     : (c.reason ?? "stale or missing"),
                 )}
                 {renderHealthRow("Off-site copy", doctorGraphOffsite, (c) =>
                   c.ok
-                    ? `Fresh — last copy ${formatAge(c.latest?.age_seconds)} old (limit ${c.max_age_days}d)`
+                    ? `Fresh — last copy ${fmtAge(c.latest?.age_seconds)} ago (limit ${c.max_age_days}d)`
                     : (c.reason ?? "stale or missing"),
                 )}
               </div>
@@ -3586,11 +3664,15 @@ export default function App() {
             <div className="split">
               <div className="card col">
                 <div className="card-scroll">
-                  {loading.activity && activityList.length === 0 ? (
-                    <EmptyState
-                      icon={<Loader2 size={22} className="spin" aria-hidden />}
-                      title="Reading captures…"
-                    />
+                  {loadState.activity !== "ok" ? (
+                    loadState.activity === "failed" && !loading.activity ? (
+                      <ReadFailed
+                        what="captures"
+                        onRetry={() => void loadActivity(true)}
+                      />
+                    ) : (
+                      <ReadingLine what="captures" />
+                    )
                   ) : visibleActivity.length === 0 ? (
                     <EmptyState
                       title={
@@ -3616,7 +3698,9 @@ export default function App() {
                               key={ep.id}
                               type="button"
                               className={
-                                activitySelected === ep.id ? "row on" : "row"
+                                activitySelected === ep.id
+                                  ? "row on act-row"
+                                  : "row act-row"
                               }
                               onClick={() => void selectEpisode(ep.id)}
                             >
@@ -3633,7 +3717,7 @@ export default function App() {
                               {project ? (
                                 <Tag title={ep.scope}>{project}</Tag>
                               ) : null}
-                              <span className="grow ellip t2">
+                              <span className="grow ellip t2 act-sum">
                                 {ep.summary || "(no summary)"}
                               </span>
                             </button>
@@ -3672,7 +3756,9 @@ export default function App() {
                 ) : activityDetail ? (
                   <>
                     <div className="card-head">
-                      Episode {activityDetail.id}
+                      <span className="head-title">
+                        Episode {activityDetail.id}
+                      </span>
                       <span className="spacer" />
                       <span className="meta">
                         {timeLabel(activityDetail.ts)}
@@ -4657,7 +4743,18 @@ export default function App() {
               </span>
             </div>
 
-            {visibleOwed.length === 0 ? (
+            {loadState[`owed:${owedStatus}`] !== "ok" ? (
+              loadState[`owed:${owedStatus}`] === "failed" && !owedLoading ? (
+                <ReadFailed
+                  what="commitments"
+                  onRetry={() => void loadOwed(owedStatus, true)}
+                />
+              ) : (
+                <div className="card">
+                  <ReadingLine what="commitments" />
+                </div>
+              )
+            ) : visibleOwed.length === 0 ? (
               <div className="card">
                 <EmptyState
                   title={
@@ -4865,7 +4962,7 @@ export default function App() {
                           </div>
                           <div className="row-item">
                             <span className="row-main">Secrets</span>
-                            <span className="row-meta">
+                            <span className="row-meta wrap">
                               API keys, tokens, private keys and passwords in
                               connection strings are masked before a transcript
                               reaches the summariser and before any capture is
@@ -5095,14 +5192,33 @@ export default function App() {
                           </button>
                         </div>
                         {dataFiles.length > 0 ? (
-                          <div className="rows">
-                            {dataFiles.map((f) => (
-                              <div key={f.path} className="row-item">
-                                <span className="row-main mono">{f.path}</span>
-                                <span className="row-meta">{formatBytes(f.bytes)}</span>
-                              </div>
-                            ))}
-                          </div>
+                          <>
+                            <div className="rows">
+                              {[...dataFiles]
+                                .sort((a, b) => fileStamp(b) - fileStamp(a))
+                                .slice(
+                                  0,
+                                  dataFilesAll ? undefined : DATA_FILES_SHOWN,
+                                )
+                                .map((f) => (
+                                  <div key={f.path} className="row-item">
+                                    <span className="row-main mono">{f.path}</span>
+                                    <span className="row-meta">{formatBytes(f.bytes)}</span>
+                                  </div>
+                                ))}
+                            </div>
+                            {dataFiles.length > DATA_FILES_SHOWN ? (
+                              <button
+                                type="button"
+                                className="sm link"
+                                onClick={() => setDataFilesAll((v) => !v)}
+                              >
+                                {dataFilesAll
+                                  ? "Show fewer"
+                                  : `Show all (${dataFiles.length})`}
+                              </button>
+                            ) : null}
+                          </>
                         ) : (
                           <p className="muted">No local files in the data folder yet.</p>
                         )}
@@ -5183,12 +5299,10 @@ export default function App() {
                           title="This database lives only on this Mac, so another Mac cannot reach it."
                           action={
                             <button type="button" className="primary" onClick={() => setMoveOpen(true)}>
-                              Move it to a server first…
+                              Move it to a server…
                             </button>
                           }
-                        >
-                          Move it to a server first.
-                        </Callout>
+                        />
                       ) : null}
                       <p className="muted">
                         Do this on the Mac that <strong>already works</strong>. Save
@@ -5816,7 +5930,9 @@ export default function App() {
 
       {error ? (
         <div className="toast-err" role="alert">
-          <span className="toast-msg">{error}</span>
+          <span className="toast-msg" title={error}>
+            {toastLine(error)}
+          </span>
           <button
             type="button"
             className="toast-close"

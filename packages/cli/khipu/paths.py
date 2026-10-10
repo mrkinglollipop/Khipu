@@ -136,7 +136,12 @@ def list_local_files() -> list[dict]:
         if p.name == POINTER_NAME and d == DEFAULT_DIR:
             continue
         rel = str(p.relative_to(d))
-        out.append({"path": rel, "bytes": p.stat().st_size})
+        try:
+            st = p.stat()
+        except OSError:  # removed between the walk and the stat (a lock file)
+            continue
+        # mtime in epoch milliseconds, the unit the desktop's Date math uses.
+        out.append({"path": rel, "bytes": st.st_size, "mtime": int(st.st_mtime * 1000)})
     return out
 
 

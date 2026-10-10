@@ -26,7 +26,9 @@ from typing import Any
 # Same contract as the legacy extractor so episodes look the same downstream.
 PROMPT = """You are extracting durable memory from an assistant/coding session.
 Output ONLY a single JSON object (no prose, no markdown fences) with these keys:
-- summary: 1-3 sentence what-happened
+- summary: 1-3 sentence what-happened. Lead with the outcome or the thing
+  itself ("Fixed the embedding batch cap; ...", "Khipu 0.4.10 shipped ..."),
+  never with "The session", "The user", "The assistant" or "In this session".
 - topics: list of short lowercase slug strings
 - people: list of names/handles mentioned as participants or subjects
 - decisions: list of strings

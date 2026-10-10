@@ -16,8 +16,8 @@
         "title": "Khipu",
         "width": 1100,
         "height": 720,
-        "minWidth": 800,
-        "minHeight": 560,
+        "minWidth": 960,
+        "minHeight": 600,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true
       }

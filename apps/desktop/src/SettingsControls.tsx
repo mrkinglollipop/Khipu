@@ -9,6 +9,7 @@ import type { FormEvent, ReactNode } from "react";
 import { Loader2 } from "lucide-react";
 import { Tag } from "./ui";
 import { callCli, useCliState } from "./settingsCli";
+import { fmtAge } from "./time";
 import type { ConfigShape, JobsShape } from "./settingsCli";
 
 // ---------------------------------------------------------------------------
@@ -456,10 +457,9 @@ function jobWhen(iso: string | null | undefined): string {
   if (!iso) return "not run yet";
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return "not run yet";
-  const hours = Math.round((Date.now() - t) / 3_600_000);
-  if (hours < 1) return "ran within the hour";
-  if (hours < 48) return `ran ${hours} h ago`;
-  return `ran ${Math.round(hours / 24)} d ago`;
+  const seconds = (Date.now() - t) / 1000;
+  if (seconds < 3600) return "ran within the hour";
+  return `ran ${fmtAge(seconds)} ago`;
 }
 
 export function JobsCard({ active }: { active: boolean }) {
