@@ -13,6 +13,7 @@ vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: vi.fn(async () => {}) }
 
 beforeEach(() => {
   invokeMock.mockReset();
+  HTMLElement.prototype.scrollIntoView = vi.fn();
   vi.stubGlobal("localStorage", { getItem: (key: string) => key === WELCOME_DONE_KEY ? "1" : null, setItem: () => {}, removeItem: () => {}, clear: () => {} });
 });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
@@ -142,7 +143,7 @@ describe("App — Recall edges", () => {
       if (args[0] === "activity" && args[1] === "--limit=40") return JSON.stringify({ episode_count: 1, recent: [{ id: 7, summary: "Episode seven" }] });
       if (args[0] === "activity" && args[1] === "--show=7") return JSON.stringify({ id: 7, summary: "Episode seven" });
       if (args[0] === "search") return JSON.stringify({ results: [{ kind: "episode", id: 7, label: "Episode hit" }, { kind: "topic", id: 7, label: "Topic hit" }] });
-      if (args[0] === "episode" && args[1] === "forget") return JSON.stringify({ ok: true, snapshot: { ok: true } });
+      if (args[0] === "episode" && args[1] === "forget") return JSON.stringify({ ok: true, soft_deleted: true, snapshot: { ok: true } });
       return JSON.stringify({ counts: {}, recent: [] });
     });
     render(<App />);

@@ -1019,6 +1019,7 @@ export default function App() {
   // Doctor reads can overlap (a forced read after an install while a TTL read
   // is still running); only the newest request may write its answer.
   const doctorSeq = useRef(0);
+  const rightNowSeq = useRef(0);
   const dsnSeq = useRef(0);
   const activitySeq = useRef(0);
   const activityDetailSeq = useRef(0);
@@ -1075,10 +1076,14 @@ export default function App() {
   // The last recorded end-to-end recall probe. Harnesses reads it for its
   // "Verified …" line; nothing about that line is app-local state.
   const [recallProbe, setRecallProbe] = useState<RecallProbeStatus | null>(null);
-  const [embedCoverage, setEmbedCoverage] = useState<Record<
-    string,
-    { total?: number; embedded?: number; missing?: number; pct?: number }
-  > | null>(null);
+  const [embedCoverage, setEmbedCoverage] = useState<(
+    Record<string, unknown> & {
+      missing?: number;
+      stale?: number;
+      pct?: number;
+      active_profile?: unknown;
+    }
+  ) | null>(null);
   // `coverage()` reports the active index profile alongside the per-kind
   // rows; Settings names it rather than saying "the index" and leaving the
   // person to guess which one.
@@ -1484,10 +1489,14 @@ export default function App() {
         (parsed as { recall_probe?: RecallProbeStatus }).recall_probe ?? null,
       );
       const cov = (parsed as {
-        embed_coverage?: Record<
-          string,
-          { total?: number; embedded?: number; missing?: number; pct?: number }
-        > & { active_profile?: unknown; budget?: unknown; query_cache?: unknown };
+        embed_coverage?: Record<string, unknown> & {
+          missing?: number;
+          stale?: number;
+          pct?: number;
+          active_profile?: unknown;
+          budget?: unknown;
+          query_cache?: unknown;
+        };
       }).embed_coverage;
       setEmbedCoverage(cov ?? null);
       setEmbedActiveProfile(
@@ -1560,22 +1569,26 @@ export default function App() {
    *  just this card without paying for the full doctor pass. */
   const loadRightNow = useCallback(async (force = false) => {
     if (!needsFetch("rightNow", force)) return;
+    const seq = ++rightNowSeq.current;
     markLoading("rightNow", true);
     try {
       const raw = await invoke<string>("liveness_now");
       const parsed = parseJson(raw) as LivenessPayload | null;
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.ok !== true || !parsed.harnesses || typeof parsed.harnesses !== "object" || Array.isArray(parsed.harnesses)) {
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !parsed.harnesses || typeof parsed.harnesses !== "object" || Array.isArray(parsed.harnesses)) {
+        if (seq !== rightNowSeq.current) return;
         setRightNowReadError("Unexpected response from hub");
         return;
       }
+      if (seq !== rightNowSeq.current) return;
       setRightNow(parsed);
       setRightNowReadError(null);
       fetchedAt.current.rightNow = Date.now();
     } catch (e) {
+      if (seq !== rightNowSeq.current) return;
       setError(String(e));
       setRightNowReadError(String(e));
     } finally {
-      markLoading("rightNow", false);
+      if (seq === rightNowSeq.current) markLoading("rightNow", false);
     }
   }, []);
 
@@ -1932,13 +1945,15 @@ export default function App() {
       const raw = await runKhipu(["episode", "forget", String(id)]);
       const parsed = parseJson(raw) as {
         ok?: unknown;
+        soft_deleted?: unknown;
+        partial?: unknown;
         error?: unknown;
         snapshot?: { ok?: unknown; error?: unknown; reason?: unknown } | null;
         legacy_file?: { ok?: unknown; error?: unknown; reason?: unknown } | null;
       } | null;
       setActivityText(prettyJson(raw));
       setActivityRawKey((k) => k + 1);
-      if (!parsed || parsed.ok !== true) {
+      if (!parsed || parsed.soft_deleted !== true) {
         setForgetError(
           typeof parsed?.error === "string"
             ? parsed.error
@@ -1947,6 +1962,9 @@ export default function App() {
         return;
       }
       let localCopyFailure: string | null = null;
+      const remainingStores = Array.isArray(parsed.partial)
+        ? parsed.partial.filter((store): store is string => typeof store === "string")
+        : [];
       if (!parsed.snapshot || parsed.snapshot.ok !== true) {
         localCopyFailure =
           typeof parsed.snapshot?.error === "string"
@@ -1965,6 +1983,9 @@ export default function App() {
             : typeof parsed.legacy_file.reason === "string"
               ? parsed.legacy_file.reason
               : "missing success verdict";
+      }
+      if (remainingStores.length > 0) {
+        localCopyFailure = `remaining stores: ${remainingStores.join(", ")}`;
       }
       setForgetTarget(null);
       ++activitySeq.current;
@@ -2948,7 +2969,7 @@ export default function App() {
     setActionBusy(true);
     setPathsMsg(null);
     try {
-      const raw = await runKhipu(["import-local", `--source=${importSource.trim()}`]);
+      const raw = await runKhipu(["import-local", `--source=${importSource.trim()}`, "--replace"]);
       setPathsMsg(prettyJson(raw));
       await loadPaths();
     } catch (e) {
@@ -3103,18 +3124,27 @@ export default function App() {
 
   const coverage = (() => {
     if (!embedCoverage) return null;
+    if (typeof embedCoverage.pct === "number") {
+      return {
+        pct: embedCoverage.pct,
+        missing: typeof embedCoverage.missing === "number" ? embedCoverage.missing : 0,
+        stale: typeof embedCoverage.stale === "number" ? embedCoverage.stale : 0,
+        unit: "chunks" as const,
+      };
+    }
     let total = 0;
     let embedded = 0;
     let missing = 0;
     for (const v of Object.values(embedCoverage)) {
       if (!v || typeof v !== "object") continue;
-      if (typeof v.total !== "number") continue;
-      total += v.total;
-      embedded += v.embedded ?? 0;
-      missing += v.missing ?? 0;
+      const row = v as { total?: unknown; embedded?: unknown; missing?: unknown };
+      if (typeof row.total !== "number") continue;
+      total += row.total;
+      embedded += typeof row.embedded === "number" ? row.embedded : 0;
+      missing += typeof row.missing === "number" ? row.missing : 0;
     }
     if (total === 0) return null;
-    return { pct: (embedded / total) * 100, missing };
+    return { pct: (embedded / total) * 100, missing, stale: 0, unit: "rows" as const };
   })();
 
   const backupAge = backupHealth?.freshest_backup_age_seconds;
@@ -3492,6 +3522,8 @@ export default function App() {
                 void loadStatus(true);
                 void loadDoctor(true);
                 void loadActivity(true);
+                void refreshDsn(true);
+                void loadRightNow(true);
               }}
             >
               <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
@@ -3610,12 +3642,18 @@ export default function App() {
                 value={coverage ? `${coverage.pct.toFixed(1)}%` : "—"}
                 sub={
                   coverage
-                    ? coverage.missing > 0
-                      ? `${coverage.missing} rows not indexed yet · catching up`
+                    ? coverage.missing > 0 || coverage.stale > 0
+                      ? [
+                          coverage.missing > 0
+                            ? `${coverage.missing} ${coverage.unit === "chunks" ? "chunks missing" : "rows not indexed yet"}`
+                            : null,
+                          coverage.stale > 0 ? `${coverage.stale} stale` : null,
+                          "catching up",
+                        ].filter(Boolean).join(" · ")
                       : "Everything indexed"
                     : undefined
                 }
-                tone={coverage && coverage.missing > 0 ? "warn" : "neutral"}
+                tone={coverage && (coverage.missing > 0 || coverage.stale > 0) ? "warn" : "neutral"}
               />
               <Tile
                 label="Backups"

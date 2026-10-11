@@ -211,7 +211,7 @@ describe("App — Recall audit", () => {
       if (args[0] === "activity" && args[1] === "--show=7") return JSON.stringify(episode(7, "Cached episode"));
       if (args[0] === "search" && args[args.length - 1] === "cached") return JSON.stringify(result(7, "Cached episode"));
       if (args[0] === "search" && args[args.length - 1] === "old") return new Promise<string>((resolve) => { releaseOld = resolve; });
-      if (args[0] === "episode" && args[1] === "forget") return JSON.stringify({ ok: true, snapshot: { ok: true } });
+      if (args[0] === "episode" && args[1] === "forget") return JSON.stringify({ ok: true, soft_deleted: true, snapshot: { ok: true } });
       return "{}";
     });
     render(<App />);

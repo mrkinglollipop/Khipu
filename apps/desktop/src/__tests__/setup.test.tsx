@@ -6,7 +6,7 @@
 // `npm run build`.
 import { useState } from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
 import { Welcome } from "../Welcome";
 import App from "../App";
 import { IntegrationsPanel, verifiedLine } from "../IntegrationsPanel";
@@ -743,6 +743,7 @@ describe("IntegrationsPanel — harness status after install", () => {
     // does not need to fake time to see the poll fire.
     let statusCall = 0;
     let installedAtIso = "";
+    let releaseHeartbeat: ((raw: string) => void) | null = null;
     const runKhipu = vi.fn(async (args: string[]) => {
       if (args[0] === "integrations" && args[1] === "status") {
         statusCall += 1;
@@ -753,7 +754,7 @@ describe("IntegrationsPanel — harness status after install", () => {
           statusCall <= 2 || !installedAtIso
             ? null
             : new Date(Date.parse(installedAtIso) + 5_000).toISOString();
-        return JSON.stringify([
+        const response = JSON.stringify([
           {
             harness: "claude_code",
             detected: true,
@@ -765,6 +766,8 @@ describe("IntegrationsPanel — harness status after install", () => {
             last_beat_at: lastBeat,
           },
         ]);
+        if (statusCall === 3) return new Promise<string>((resolve) => { releaseHeartbeat = resolve; });
+        return response;
       }
       if (args[0] === "integrations" && args[1] === "install") {
         installedAtIso = new Date().toISOString();
@@ -798,7 +801,12 @@ describe("IntegrationsPanel — harness status after install", () => {
     // Nobody clicks Verify — a later poll can see the beat, but that is not
     // proof of the capture-to-search round trip.
     window.dispatchEvent(new Event("focus"));
-
+    await waitFor(() => expect(statusCall).toBeGreaterThanOrEqual(3));
+    await act(async () => releaseHeartbeat?.(JSON.stringify([{
+      harness: "claude_code", detected: true, mcp: true, hook_stop: true,
+      hook_precompact: true, recall_rule: "installed", extract: "installed",
+      last_beat_at: new Date(Date.parse(installedAtIso) + 5_000).toISOString(),
+    }])));
     await waitFor(() => expect(within(card).queryByText("Verified")).not.toBeInTheDocument());
   });
 });
