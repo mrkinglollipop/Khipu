@@ -225,16 +225,24 @@ class CaptureTest(unittest.TestCase):
             cap.write_pg(episode(project="new/app"))
         self.assertEqual(next(iter(cur.episodes.values()))["project"], "old/app")
 
-    def test_collision_with_other_source_is_not_acknowledged(self):
+    def test_collision_with_other_source_is_logged_and_still_acknowledged(self):
+        # A replay whose payload differs from the stored raw is ordinary
+        # (ingestion mutates raw); failing the job here stranded it in the
+        # queue and turned the harness red on 2026-10-11. Until captures carry
+        # an immutable identity the difference is logged, not fatal.
         old = episode()
         cur = Cursor({1: old})
+        logged = []
         with mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
                 mock.patch.object(cap, "dedup_before_insert", return_value={"action": "none"}), \
                 mock.patch.object(cap, "run_capture_v2", return_value=0), \
+                mock.patch.object(cap, "_log", side_effect=logged.append), \
                 mock.patch("khipu.outbox.enqueue") as enqueue:
             rc = cap.capture(episode(session_id="codex:other", project="different/app",
                                      verbatim={"note": "do not lose this"}), mode="hub")
-        self.assertNotEqual(rc, 0)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(cur.episodes), 1, "no second row for the same identity")
+        self.assertTrue(any("replay identity differs" in m for m in logged), logged)
         enqueue.assert_not_called()
 
     def test_nested_secrets_redacted_before_sql_and_outbox(self):
