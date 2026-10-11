@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -174,6 +175,36 @@ class HubAuditRegressionTest(unittest.TestCase):
                  mock.patch.object(hs, "_matrix_rows", side_effect=load_then_swap):
                 out = hs.cosine_candidates_snapshot([1.0, 0.0], "p", limit=1)
         self.assertEqual((out[0]["id"], out[0]["rank_text"]), ("old", "old text"))
+
+    def test_cold_matrix_load_warms_the_cache_even_when_the_prompt_deadline_passes(self) -> None:
+        # A load cut short at the prompt deadline never warmed the cache, so a
+        # daemon whose replica changes between prompts answered every prompt
+        # lexical-only. The load now completes; only the current prompt's
+        # cosine leg is given up.
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = self._snapshot(Path(tmp))
+            con = sqlite3.connect(snap)
+            con.execute("INSERT INTO topics (slug, title, body) VALUES ('t', 't', 't')")
+            con.execute("INSERT INTO memory_embeddings VALUES ('p', 'topic', 't', 0, 't', NULL, ?, NULL)", (hs._vector_to_blob([1.0, 0.0]),))
+            con.commit()
+            con.close()
+            hs._MATRIX_CACHE.clear()
+            real_load = hs._matrix_rows
+            calls = []
+
+            def slow_load(path, profile, kind, **kw):
+                calls.append(kw)
+                time.sleep(0.05)  # the load outlives the prompt deadline
+                return real_load(path, profile, kind)
+
+            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
+                 mock.patch.object(hs, "_matrix_rows", side_effect=slow_load):
+                with self.assertRaises(TimeoutError):
+                    hs.cosine_candidates_snapshot([1.0, 0.0], "p", limit=1, deadline=time.monotonic() + 0.01)
+                self.assertEqual(calls, [{}], "the load must not be bounded by the prompt deadline")
+                self.assertTrue(hs._MATRIX_CACHE.get("rows"), "the cache is warm for the next prompt")
+                out = hs.cosine_candidates_snapshot([1.0, 0.0], "p", limit=1, deadline=time.monotonic() + 5)
+        self.assertEqual([row["id"] for row in out], ["t"])
 
     def test_cosine_candidates_normalize_document_vectors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
