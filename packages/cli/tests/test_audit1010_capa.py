@@ -335,7 +335,12 @@ class CaptureCapaTest(unittest.TestCase):
             self.assertEqual(beat["dispatches"], 1)
             self.assertEqual(beat["last_drain_error"], "provider down")
 
-    def test_fresh_dead_claim_is_immediately_unhealthy(self):
+    def test_dead_claim_is_visible_at_once_and_unhealthy_once_nothing_reclaims_it(self):
+        """CAP-17: claimed work must never vanish from health. A claim whose
+        owner just died is counted at once, but it is the normal hand-over to
+        the next drain (every hook's drain is killed with its hook), so it is
+        red only after DEAD_CLAIM_GRACE_S with no reclaim. Red at once showed
+        "stopped recording" in the app many times a day (2026-10-11)."""
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(Path(td) / "kh")}):
             q = sc.queue_dir()
             q.mkdir(parents=True)
@@ -344,9 +349,14 @@ class CaptureCapaTest(unittest.TestCase):
             sc._heartbeat("codex", {"at": sc._mint_ts(), "event": "stop", "session_id": "s", "due": False})
             sc._record_drain("codex", captured=True)
             with mock.patch.object(sc, "_claimant_gone", return_value=True):
-                health = sc.liveness("codex")
+                fresh = sc.liveness("codex")
+                status = sc.status("codex")
+                with mock.patch.object(sc, "DEAD_CLAIM_GRACE_S", 0):
+                    health = sc.liveness("codex")
+            self.assertTrue(fresh["ok"])
+            self.assertEqual((status["queue_depth"], status["claimed_depth"], status["dead_claims"]), (1, 1, 1))
             self.assertFalse(health["ok"])
-            self.assertTrue(any("dead process" in reason for reason in health["reasons"]))
+            self.assertTrue(any("nothing is reclaiming" in reason for reason in health["reasons"]))
 
     def test_scalar_and_malformed_queue_jobs_remain_visible_and_retryable(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(Path(td) / "kh")}):
