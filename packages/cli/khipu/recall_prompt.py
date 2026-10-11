@@ -30,7 +30,10 @@ turn. Nothing here calls a model.
 from __future__ import annotations
 
 import copy
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import os
 import re
@@ -193,6 +196,8 @@ def _batch_seen(ids: tuple[str, ...], recent: list[tuple[str, ...]]) -> bool:
 
 def _dedup_transaction(session_id: str, hits: list[dict[str, Any]], delivery: dict | None):
     """Hold the session lock until delivery; contention never waits on the hook."""
+    if fcntl is None:
+        raise OSError("dedup locking unavailable")
     p = _dedup_path(session_id).with_suffix(".lock")
     p.parent.mkdir(parents=True, exist_ok=True)
     lock = p.open("a")
@@ -527,7 +532,7 @@ def _snapshot_search_hits(
         try:
             vec = _cached_query_embed(prompt, profile)
             cosine_box["rows"] = hub_snapshot.cosine_candidates_snapshot(
-                vec, profile, limit=_SEARCH_LIMIT
+                vec, profile, limit=_SEARCH_LIMIT, deadline=deadline
             )
         except Exception as exc:  # noqa: BLE001 — cosine is a bonus leg, not a requirement
             cosine_box["error"] = exc
@@ -1393,7 +1398,7 @@ def prior_work_for_prompt(
             seen = _dedup_transaction(session_id, hits, delivery)
         except OSError:
             seen = False
-            reason, hits, context = "error: dedup state unavailable or busy", [], ""
+            reason = "ok (dedup state unavailable or busy)"
         if seen:
             ms = round((time.monotonic() - t0) * 1000, 1)
             dedup_out = {"context": "", "hits": [], "reason": "dedup", "ms": ms}

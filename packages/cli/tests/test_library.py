@@ -577,6 +577,21 @@ class ScanTest(_Base):
         self.assertGreater(out["chunks"], 1)
 
 
+class LayoutMigrationTest(_Base):
+    def test_rv3_unchanged_file_repairs_sparse_or_missing_chunks(self):
+        self.write("a.md", "# Same\n" + "alpha " * 100 + "\n# Same\n" + "beta " * 100)
+        self.add()
+        library.scan(self.hub, "lib1")
+        expected = dict(self.hub.chunks)
+        doc = next(iter(self.hub.docs))
+        for broken in ({(doc, 77): next(iter(expected.values()))}, {(doc, 0): ("truncated", "bad")}):
+            self.hub.chunks = dict(broken)
+            out = library.scan(self.hub, "lib1")
+            self.assertEqual(out["updated"], 1)
+            self.assertEqual(self.hub.chunks, expected)
+        self.assertEqual(library.scan(self.hub, "lib1")["unchanged"], 1)
+
+
 class BackfillTest(_Base):
     def setUp(self):
         super().setUp()
@@ -653,7 +668,7 @@ class BackfillTest(_Base):
     def test_budget_exhaustion_stops_the_run_but_keeps_committed_batches(self):
         n = {"i": 0}
 
-        def take():
+        def take(**_kwargs):
             n["i"] += 1
             if n["i"] == 2:
                 raise RuntimeError("embed budget exhausted: 10000 calls today")
@@ -1219,7 +1234,7 @@ class NightlyAndDoctorTest(_Base):
         library.add_source(self.hub, "zlib", str(self.root), TINY.id)
         n = {"i": 0}
 
-        def take():
+        def take(**_kwargs):
             n["i"] += 1
             raise RuntimeError("embed budget exhausted")
 

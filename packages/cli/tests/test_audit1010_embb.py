@@ -217,7 +217,7 @@ class VectorScanExactnessTest(unittest.TestCase):
 
         with mock.patch.object(vector_scan, "_cblas_sgemv", return_value=float32_tie):
             result = vector_scan.top_k_by_dot(query, rows, 1, use_blas=True)
-        self.assertFalse(calls)
+        self.assertTrue(calls)
         self.assertEqual(result[0][0], "winner")
         self.assertEqual(result, vector_scan.top_k_by_dot(query, rows, 1, use_blas=False))
 
@@ -243,3 +243,22 @@ class PartialJobReceiptTest(unittest.TestCase):
             )
         self.assertEqual(rc, 1)
         self.assertEqual(json.loads(stream.getvalue())["state"], "failed")
+
+
+class LibraryIndexCompatibilityTest(unittest.TestCase):
+    def test_rv3_old_library_index_requires_matching_definition(self):
+        from khipu import library_search
+        profile = "gemini-embedding-001@768"
+        old_name = "idx_library_hnsw_gemini_embedding_001_768"
+        definition = (f"CREATE INDEX {old_name} ON public.library_embeddings USING hnsw "
+                      "((embedding::vector(768)) vector_cosine_ops) "
+                      "WHERE (profile = 'gemini-embedding-001@768'::text)")
+        for sql, expected in [(definition, True), (definition.replace("001@768", "002@768"), False),
+                              (definition.replace("vector(768)", "vector(2)"), False)]:
+            class Cur:
+                def execute(self, statement, params=None):
+                    self.row = (sql,) if "SELECT indexdef" in statement and params == (old_name,) else None
+                def fetchone(self):
+                    return self.row
+            library_search._INDEX_SEEN.clear()
+            self.assertEqual(library_search.profile_has_index(Cur(), mock.Mock(), profile), expected)

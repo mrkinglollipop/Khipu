@@ -50,6 +50,45 @@ class TopKByDotTest(unittest.TestCase):
     ``hub_snapshot`` — the fixture-driven differential test below covers the
     full integration."""
 
+    def test_rv3_expired_scan_stops_before_scoring(self):
+        with mock.patch.object(vs, "_exact_score") as score:
+            with self.assertRaises(TimeoutError):
+                vs.top_k_by_dot([1., 0.], [("a", _pack_f32([1., 0.]))], 1, deadline=0.)
+        score.assert_not_called()
+
+    def test_rv3_scan_stops_when_deadline_expires_during_scoring(self):
+        clock = [0.]
+        def score(*args):
+            clock[0] += 1.
+            return 1.
+        with mock.patch.object(vs.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(vs, "_exact_score", side_effect=score) as scoring:
+            with self.assertRaises(TimeoutError):
+                vs.top_k_by_dot([1., 0.], [(i, _pack_f32([1., 0.])) for i in range(10)],
+                               1, use_blas=False, deadline=2.)
+        self.assertEqual(scoring.call_count, 2)
+
+    def test_rv3_twenty_thousand_vectors_use_blas_and_match_exact_ranking(self):
+        import time
+        native = vs._cblas_sgemv()
+        if native is None:
+            self.skipTest("system BLAS unavailable")
+        rng = random.Random(83)
+        corpus = [_pack_f32(_unit_vector(rng, 768)) for _ in range(128)]
+        rows = [(i, corpus[i % len(corpus)]) for i in range(20000)]
+        query = _unit_vector(rng, 768)
+        start = time.monotonic()
+        expected = vs.top_k_by_dot(query, rows, 8, use_blas=False)
+        exact_ms = (time.monotonic() - start) * 1000
+        with mock.patch.object(vs, "_cblas_sgemv", return_value=native), \
+             mock.patch.object(vs, "_exact_score", wraps=vs._exact_score) as score:
+            start = time.monotonic()
+            actual = vs.top_k_by_dot(query, rows, 8, max_abs_component=1.0)
+            accelerated_ms = (time.monotonic() - start) * 1000
+        self.assertEqual(actual, expected)
+        self.assertLess(score.call_count, len(rows))
+        print(f"20,000 x 768: exact={exact_ms:.1f}ms accelerated={accelerated_ms:.1f}ms rescored={score.call_count}")
+
     def test_empty_rows_yields_empty(self) -> None:
         self.assertEqual(vs.top_k_by_dot([1.0, 0.0], [], 5), [])
 
@@ -96,7 +135,7 @@ class TopKByDotTest(unittest.TestCase):
         sgemv = mock.Mock(side_effect=_test_sgemv)
         with mock.patch.object(vs, "_cblas_sgemv", return_value=sgemv):
             on = vs.top_k_by_dot(query, rows, 8, use_blas=True)
-        sgemv.assert_not_called()
+        sgemv.assert_called()
         self.assertEqual(off, on)
 
     def test_blas_loader_returning_none_falls_back_silently(self) -> None:
@@ -238,7 +277,7 @@ class CosineCandidatesDifferentialTest(unittest.TestCase):
                     new_out = hs.cosine_candidates_snapshot(q, "p1", limit=8)
                     old_out = _reference_cosine_candidates_snapshot(q, "p1", limit=8)
                     self.assertEqual(new_out, old_out)
-        sgemv.assert_not_called()
+        sgemv.assert_called()
 
     def test_matches_reference_with_blas_forced_off(self) -> None:
         with mock.patch.object(hs, "snapshot_path", return_value=self.snap), \

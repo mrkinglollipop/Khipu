@@ -314,9 +314,16 @@ def profile_index_name(profile: str, table: str = "library_embeddings") -> str:
     name = f"{_INDEX_PREFIX[table]}{safe}"
     # Every non-legacy name carries the raw-id hash: valid ids such as
     # ``a-b@768`` and ``a_b@768`` otherwise sanitize to the same identifier.
-    # Existing generic indexes remain untouched and are rebuilt lazily under
-    # their collision-proof name.
+    # Search recognizes validated old names until a replacement is built.
     return f"{name[:53]}_{hashlib.sha1(profile.encode()).hexdigest()[:9]}"
+
+
+def previous_profile_index_name(profile: str, table: str = "library_embeddings") -> str:
+    safe = re.sub(r"[^a-z0-9_]+", "_", profile.lower()).strip("_") or "profile"
+    name = f"{_INDEX_PREFIX[table]}{safe}"
+    if len(name) > 60 or not _ID_RE.match(profile):
+        name = f"{name[:50]}_{hashlib.sha1(profile.encode()).hexdigest()[:9]}"
+    return _LEGACY_INDEX.get((table, profile), name)
 
 
 def _legacy_indexdef(cur, name: str) -> str | None:
@@ -334,6 +341,10 @@ def _legacy_index_matches(cur, profile: str, table: str, dim: int, *, indexdef: 
     if name is None:
         return True
     definition = indexdef if indexdef is not None else _legacy_indexdef(cur, name)
+    return index_definition_matches(profile, table, dim, definition)
+
+
+def index_definition_matches(profile: str, table: str, dim: int, definition: str | None) -> bool:
     if not definition:
         return False
     normalized = re.sub(r"\s+", " ", definition.replace('"', "").lower())

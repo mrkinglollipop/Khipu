@@ -320,22 +320,52 @@ class ProviderInputRedactionTest(unittest.TestCase):
 
     def test_query_cache_hashes_the_same_sanitized_text_sent_to_provider(self) -> None:
         class Cur:
+            def __init__(self):
+                self.calls = []
             def execute(self, sql, params=None):
-                self.sql, self.params = sql, params
+                self.sql = sql
+                self.calls.append((sql, params))
             def fetchone(self):
-                return (False,)
-        class Conn:
-            def rollback(self): pass
-        seen = []
+                return (True,) if "to_regclass" in self.sql else None
+        cur, conn, seen = Cur(), mock.Mock(), []
         raw = "api_key=sk-querysecret"
         with mock.patch.object(embed, "embed_one", side_effect=lambda text, **_: seen.append(text) or [1.0]):
-            embed._query_vec(Cur(), Conn(), embed.PROFILE_2, raw)
+            _vec, state = embed._query_vec(cur, conn, embed.PROFILE_2, raw)
+        self.assertEqual(state, "miss")
         self.assertNotIn("sk-querysecret", seen[0])
-        self.assertEqual(embed._query_hash(embed.PROFILE_2, seen[0]),
-                         embed._query_hash(embed.PROFILE_2, embed._sanitize_provider_text(raw)))
+        import hashlib
+        expected = hashlib.md5(f"{embed.QUERY_CACHE_SCHEME}\n{embed.PROFILE_2}\nquery\n{seen[0]}".encode()).hexdigest()
+        keys = [params[1] for sql, params in cur.calls if sql.startswith(("SELECT embedding", "INSERT INTO memory_query_cache"))]
+        self.assertEqual(keys, [expected, expected])
 
 
 class BudgetReservationTest(unittest.TestCase):
+    def test_rv3_budget_time_is_deducted_from_transport_timeout(self):
+        transport = mock.Mock(return_value=b'{}')
+        with mock.patch.object(embed, "_budget_take") as take, \
+             mock.patch.object(embed.time, "monotonic", side_effect=[10., 10.25]):
+            embed._post_json("unused", {}, {}, provider="local", retries=0,
+                             timeout=1., delay=0, transport=transport)
+        take.assert_called_once_with(deadline=11.)
+        self.assertEqual(transport.call_args.args[-1], 0.75)
+
+    def test_rv3_busy_budget_lock_expires_without_provider_call(self):
+        import fcntl
+        def lock(_fd, flags):
+            if not flags & fcntl.LOCK_NB:
+                raise AssertionError("blocking lock acquisition")
+            raise BlockingIOError("held")
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(embed, "_budget_path", return_value=Path(tmp) / "budget.json"), \
+             mock.patch.object(fcntl, "flock", side_effect=lock), \
+             mock.patch.object(embed.time, "monotonic", side_effect=[0., 0., 0.02, 0.02]), \
+             mock.patch.object(embed.time, "sleep"):
+            transport = mock.Mock()
+            with self.assertRaisesRegex(RuntimeError, "accounting.*deadline"):
+                embed._post_json("unused", {}, {}, provider="local", retries=0,
+                                 timeout=0.01, delay=0, transport=transport)
+            transport.assert_not_called()
+
     def test_windows_lock_backend_imports_and_enforces_budget(self) -> None:
         import os
         import subprocess
@@ -355,7 +385,7 @@ class BudgetReservationTest(unittest.TestCase):
 
             events = []
             msvcrt = types.ModuleType("msvcrt")
-            msvcrt.LK_LOCK = 1
+            msvcrt.LK_NBLCK = 1
             msvcrt.LK_UNLCK = 2
             msvcrt.locking = lambda _fd, mode, count: events.append([mode, count])
             sys.modules["msvcrt"] = msvcrt
@@ -732,7 +762,7 @@ class CatchupStalenessTest(unittest.TestCase):
                     self.result = []
                 elif "FROM topics t" in text:
                     self.topic_sql.append(text)
-                    self.result = [("stale", "Title", "new body")] if "NOT EXISTS" not in text else []
+                    self.result = [("stale", "Title", "new body", {"slug": "stale", "title": "Title", "body": "new body"})] if "NOT EXISTS" not in text else []
                 else:
                     self.result = []
             def fetchall(self): return list(self.result)
@@ -862,3 +892,71 @@ class CaptureEmbeddingConsistencyTest(unittest.TestCase):
             self.assertFalse(embed.embed_on_capture({"ts": cur.row["ts"], "summary": "same summary"}))
         upsert.assert_not_called()
         snapshot.assert_not_called()
+
+
+class ReplicaCatchupTest(unittest.TestCase):
+    def _catchup(self, *, existing=False, empty=False):
+        from khipu import hub_snapshot as hs
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = Path(tmp) / "snapshot.sqlite"
+            con = sqlite3.connect(snap); hs._create_schema(con)
+            if existing:
+                con.execute("INSERT INTO topics (slug, title, body) VALUES ('note', 'Title', 'old')")
+                con.execute("INSERT INTO episodes (id, summary) VALUES (7, 'A')")
+                for kind, ref in [("topic", "note"), ("episode", "7")]:
+                    for i, text in enumerate(["A", "B"]):
+                        con.execute("INSERT INTO memory_embeddings (profile,kind,ref,chunk_idx,chunk_text,embedding) VALUES ('prof',?,?,?,?,?)",
+                                    (kind, ref, i, text, hs._vector_to_blob([1., 0.])))
+                con.execute("INSERT INTO memory_embeddings (profile,kind,ref,chunk_idx,chunk_text,embedding) VALUES ('other','topic','note',0,'other',?)", (hs._vector_to_blob([1., 0.]),))
+            con.commit(); con.close()
+            calls = []
+            class Cur:
+                def execute(self, sql, params=None):
+                    calls.append((sql, params)); self.rows = []
+                    if "FROM topics t" in sql and "NOT EXISTS" not in sql:
+                        row = ("note", "Title", "A")
+                        if "row_to_json(t)" in sql:
+                            row += ({"slug": "note", "title": "Title", "body": "A", "status": "active", "frontmatter": {"project": "p"}},)
+                        self.rows = [row]
+                    if existing and "FROM episodes e" in sql and "NOT EXISTS" not in sql:
+                        self.rows = [(7, "A", [], [], [], [])]
+                def fetchall(self): return self.rows
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+            def hashes(_cur, _profile, kind, refs):
+                return {(kind, refs[0], i): embed._md5(t) for i, t in enumerate(["A", "B"])} if existing and refs else {}
+            with mock.patch("khipu.db.connect", return_value=_Conn(Cur())), \
+                 mock.patch("khipu.db.has_columns", return_value=False), \
+                 mock.patch.object(embed, "_active_profile", return_value="prof"), \
+                 mock.patch.object(embed, "_existing_hashes_for_refs", side_effect=hashes), \
+                 mock.patch.object(embed, "episode_text", return_value="" if empty else "A"), \
+                 mock.patch.object(embed, "topic_text", return_value="" if empty else "A"), \
+                 mock.patch.object(embed, "chunk_text", return_value=[] if empty else ["A"]), \
+                 mock.patch.object(embed, "chunk_text_indexed", return_value=[] if empty else [(0, "A")]), \
+                 mock.patch.object(embed, "embed_batch", side_effect=lambda texts, **kw: [[1., 0.] for t in texts]), \
+                 mock.patch.object(embed, "_upsert_chunks"), \
+                 mock.patch.object(hs, "snapshot_path", return_value=snap), \
+                 mock.patch.object(hs, "meta_path", return_value=Path(tmp) / "meta.json"):
+                embed.embed_recent_missing(limit=1)
+                hs._MATRIX_CACHE.clear()
+                found = hs.cosine_candidates_snapshot([1., 0.], "prof", limit=5)
+            con = sqlite3.connect(snap)
+            vectors = con.execute("SELECT profile,kind,ref,chunk_idx FROM memory_embeddings ORDER BY profile,kind,ref,chunk_idx").fetchall()
+            con.close()
+        return found, vectors, calls
+
+    def test_rv3_new_topic_is_searchable_after_catchup(self):
+        found, _, _ = self._catchup()
+        self.assertEqual([r["id"] for r in found], ["note"])
+
+    def test_rv3_removed_and_empty_chunks_are_pruned_in_both_stores(self):
+        for empty in (False, True):
+            with self.subTest(empty=empty):
+                _, vectors, calls = self._catchup(existing=True, empty=empty)
+                expected = [("other", "topic", "note", 0)]
+                if not empty:
+                    expected += [("prof", "episode", "7", 0), ("prof", "topic", "note", 0)]
+                self.assertEqual(vectors, expected)
+                deletes = [sql for sql, p in calls if sql.startswith("DELETE FROM memory_embeddings")]
+                self.assertTrue(any("kind = 'episode'" in sql for sql in deletes))
+                self.assertTrue(any("kind = 'topic'" in sql for sql in deletes))

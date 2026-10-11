@@ -443,7 +443,7 @@ def budget_status() -> dict[str, Any]:
 
 
 @contextmanager
-def _lock_budget_file(lock):
+def _lock_budget_file(lock, deadline: float):
     """Hold a one-byte cross-process lock using the host stdlib backend."""
     try:
         import fcntl
@@ -457,29 +457,46 @@ def _lock_budget_file(lock):
             lock.write("\0")
             lock.flush()
         lock.seek(0)
-        msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        while True:
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("embed budget accounting deadline expired")
+                time.sleep(min(0.01, remaining))
         try:
             yield
         finally:
             lock.seek(0)
             msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
     else:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("embed budget accounting deadline expired")
+                time.sleep(min(0.01, remaining))
         try:
             yield
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def _budget_take() -> None:
+def _budget_take(*, deadline: float | None = None) -> None:
     """Atomically reserve one API call for today across local processes."""
+    deadline = time.monotonic() + 1.0 if deadline is None else deadline
     day, cap = _budget_today(), EMBED_DAILY_CALL_BUDGET
     try:
         path = _budget_path()
         lock_path = path.with_suffix(path.suffix + ".lock")
         path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+", encoding="utf-8") as lock:
-            with _lock_budget_file(lock):
+            with _lock_budget_file(lock, deadline):
                 try:
                     used = _read_budget(path, day)
                 except (OSError, ValueError, TypeError) as exc:
@@ -498,7 +515,6 @@ def _budget_take() -> None:
                         prefix=path.name + ".", suffix=".tmp", delete=False) as tmp:
                     json.dump({"day": day, "calls": used + 1}, tmp)
                     tmp.flush()
-                    os.fsync(tmp.fileno())
                     tmp_path = Path(tmp.name)
                 os.replace(tmp_path, path)
     except RuntimeError:
@@ -751,9 +767,13 @@ def _post_json(
     data = json.dumps(body).encode("utf-8")
     payload: dict[str, Any] = {}
     for attempt in range(retries + 1):
-        _budget_take()
+        deadline = time.monotonic() + max(0, timeout)
+        _budget_take(deadline=deadline)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("embed budget accounting deadline expired")
         try:
-            raw = (transport or _transport)(url, data, headers, timeout)
+            raw = (transport or _transport)(url, data, headers, remaining)
             payload = json.loads(raw.decode("utf-8"))
             break
         except urllib.error.HTTPError as e:
@@ -3198,18 +3218,20 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 cur, profile, "episode", [str(row[0]) for row in episode_rows]
             )
             todo: list[tuple[str, str, int, str, str]] = []
+            episode_replacements = {}
+            episode_snapshot_rows = []
             for row in episode_rows:
                 eid, summary, decisions, prefs, topics, people = row[:6]
                 verbatim = row[6] if has_verbatim else None
                 text = episode_text({"summary": summary, "decisions": decisions,
                                      "preferences": prefs, "topics": topics, "people": people,
                                      "verbatim": verbatim})
-                if not text:
+                chunks = chunk_text(text) if text else []
+                current = {i: _md5(chunk) for i, chunk in enumerate(chunks)}
+                previous = {i: h for (k, r, i), h in episode_existing.items() if k == "episode" and r == str(eid)}
+                if current == previous:
                     continue
-                chunks = chunk_text(text)
-                if all(episode_existing.get(("episode", str(eid), i)) == _md5(chunk)
-                       for i, chunk in enumerate(chunks)):
-                    continue
+                episode_replacements[str(eid)] = list(current)
                 out["embedded"] += 1
                 for i, chunk in enumerate(chunks):
                     todo.append(("episode", str(eid), i, chunk, _md5(chunk)))
@@ -3223,6 +3245,24 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                                [(k, r, i, t, h, v) for (k, r, i, t, h), v in zip(batch, vecs)])
                 conn.commit()
                 out["chunks"] += len(batch)
+                episode_snapshot_rows.extend(
+                    {"profile": profile, "kind": k, "ref": r, "chunk_idx": i,
+                     "chunk_text": t, "content_hash": h, "embedding": v}
+                    for (k, r, i, t, h), v in zip(batch, vecs)
+                )
+            for ref, indices in episode_replacements.items():
+                cur.execute(
+                    "DELETE FROM memory_embeddings WHERE profile = %s AND kind = 'episode' "
+                    "AND ref = %s AND NOT (chunk_idx = ANY(%s))", (profile, ref, indices),
+                )
+            if episode_replacements:
+                conn.commit()
+                try:
+                    from khipu.hub_snapshot import upsert_embeddings
+                    upsert_embeddings(episode_snapshot_rows, replace_refs=[
+                        (profile, "episode", ref) for ref in episode_replacements])
+                except Exception as exc:  # noqa: BLE001 — replica cannot roll back the hub commit
+                    _log(f"episode snapshot upsert failed: {type(exc).__name__}: {exc}")
 
             # fix 5c: populate commitment embeddings HERE (the hook's bounded
             # catch-up step), not inline on the capture decision path —
@@ -3289,13 +3329,13 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             out["topics_chunks"] = 0
             try:
                 cur.execute(
-                    "SELECT t.slug, t.title, t.body FROM topics t WHERE t.deleted_at IS NULL "
+                    "SELECT t.slug, t.title, t.body, row_to_json(t) FROM topics t WHERE t.deleted_at IS NULL "
                     " ORDER BY t.updated_at DESC NULLS LAST LIMIT %s",
                     (max(COMMITMENT_CATCHUP_LIMIT * 10, 50),),
                 )
                 topic_rows = list(cur.fetchall())
                 cur.execute(
-                    "SELECT t.slug, t.title, t.body FROM topics t WHERE t.deleted_at IS NULL "
+                    "SELECT t.slug, t.title, t.body, row_to_json(t) FROM topics t WHERE t.deleted_at IS NULL "
                     "AND NOT EXISTS (SELECT 1 FROM memory_embeddings m WHERE m.profile = %s "
                     "AND m.kind = 'topic' AND m.ref = t.slug) "
                     "ORDER BY t.updated_at DESC NULLS LAST LIMIT %s",
@@ -3312,22 +3352,23 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 cur, profile, "topic", [str(row[0]) for row in topic_rows]
             )
             topic_snapshot_rows: list[dict[str, Any]] = []
-            for slug, title, body in topic_rows:
+            topic_sources = []
+            topic_replacements = []
+            for slug, title, body, source_row in topic_rows:
                 text = topic_text(slug, title, body)
-                if not text:
-                    continue
                 # P5 G4: section-stable idx, same scheme backfill() uses for
                 # topics — keeps this leg's rows from looking "unchanged
                 # under a different idx" (and so getting re-embedded again)
                 # the very next nightly sweep.
-                indexed_chunks = chunk_text_indexed(text)
-                if all(topic_existing.get(("topic", str(slug), i)) == _md5(chunk)
-                       for i, chunk in indexed_chunks):
+                indexed_chunks = chunk_text_indexed(text) if text else []
+                current = {i: _md5(chunk) for i, chunk in indexed_chunks}
+                previous = {i: h for (k, r, i), h in topic_existing.items() if k == "topic" and r == str(slug)}
+                if current == previous:
                     continue
                 out["topics_embedded"] += 1
                 chunks = [c for _i, c in indexed_chunks]
                 api = _api_texts(profile, [(title or slug or "", c) for c in chunks])
-                vecs = embed_batch(api, profile=profile)
+                vecs = embed_batch(api, profile=profile) if api else []
                 from datetime import datetime, timezone
 
                 built_at = datetime.now(timezone.utc).isoformat()
@@ -3341,6 +3382,8 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 )
                 conn.commit()
                 out["topics_chunks"] += len(rows)
+                topic_sources.append(source_row)
+                topic_replacements.append((profile, "topic", str(slug)))
                 topic_snapshot_rows.extend(
                     {"profile": profile, "kind": "topic", "ref": slug, "chunk_idx": i,
                      "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": built_at}
@@ -3348,11 +3391,12 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 )
                 if out["topics_embedded"] >= COMMITMENT_CATCHUP_LIMIT:
                     break
-            if topic_snapshot_rows:
+            if topic_replacements:
                 try:
                     from khipu.hub_snapshot import upsert_embeddings
 
-                    snap = upsert_embeddings(topic_snapshot_rows)
+                    snap = upsert_embeddings(topic_snapshot_rows, topic_rows=topic_sources,
+                                             replace_refs=topic_replacements)
                     if not snap.get("ok"):
                         _log(f"topic snapshot upsert skipped: {snap.get('error')}")
                 except Exception as exc:  # noqa: BLE001
