@@ -354,6 +354,24 @@ class LivenessTest(unittest.TestCase):
             p = sc.enqueue({"harness": "codex", "session_id": "q", "ts": now, "transcript": "x", "event": "stop"})
             os.utime(p, (time.time() - sc.QUEUE_STALE_S - 5,) * 2)
             self.assertIn("nothing is draining", " ".join(sc.liveness("codex")["reasons"]))
+            # A claim whose owner just died is the normal hand-over to the next
+            # drain; it is red only once nothing has reclaimed it for the grace.
+            self._beat("grok")
+            job = sc.enqueue({"harness": "grok", "session_id": "d", "ts": now, "transcript": "x", "event": "stop"})
+            claim = job.rename(job.with_suffix(".claimed.999999"))
+            with mock.patch.object(sc, "_claimant_gone", return_value=True):
+                self.assertTrue(sc.liveness("grok")["ok"])
+                self.assertEqual(sc.status("grok")["dead_claims"], 1)
+                old = time.time() - sc.DEAD_CLAIM_GRACE_S - 5
+                real_stat = Path.stat
+
+                def aged(self, **kw):
+                    st = real_stat(self, **kw)
+                    return os.stat_result((*st[:7], st.st_atime, old, old)) if self == claim else st
+
+                with mock.patch.object(Path, "stat", aged):
+                    self.assertIn("nothing is reclaiming", " ".join(sc.liveness("grok")["reasons"]))
+            claim.unlink()
             # Stuck cadence: many turns seen, never due.
             self._beat("aegis", pending_turns=sc.STUCK_TURNS, pending_since=now)
             self.assertIn("cadence not firing", " ".join(sc.liveness("aegis")["reasons"]))

@@ -96,6 +96,11 @@ FIRST_SIGHT_TAIL = 1_000_000  # bytes: first sight of a long transcript starts t
 STUCK_TURNS = MIN_TURNS * 3          # turns seen with no capture decided due
 STUCK_MINUTES = MIN_MINUTES * 3      # minutes with pending turns and nothing due
 QUEUE_STALE_S = 30 * 60
+# A hook's drain is killed whenever its harness ends the hook (timeout, session
+# end), leaving a claim nobody owns until the next drain reclaims it. That is
+# the normal hand-over, not a fault; only a claim still abandoned after two
+# runs of the 5-minute queue-drain job means nothing is reclaiming.
+DEAD_CLAIM_GRACE_S = 10 * 60
 # A hook that stops firing is invisible to every other check here: pending_turns
 # resets to 0 on a successful capture, so a hook that dies right after one leaves
 # a heartbeat with no error, no queue and nothing pending — green forever (audit
@@ -2108,16 +2113,24 @@ def _queue_by_harness() -> dict[str, dict]:
         parts = p.name.split("-")
         h = str(job.get("harness") or (parts[1] if len(parts) > 2 else "aegis"))
         try:
-            age = int(now - p.stat().st_mtime)
+            st = p.stat()
+            age = int(now - st.st_mtime)
+            # Claiming is a rename: it moves ctime and leaves mtime at queue
+            # time, so the newer of the two is when this claim was taken.
+            claim_age = int(now - max(st.st_mtime, st.st_ctime))
         except OSError:
-            age = 0
+            # Gone between the listing and here: the claimant finished it.
+            age = claim_age = 0
         d = out.setdefault(h, {"depth": 0, "claimed_depth": 0, "dead_claims": 0,
+                               "dead_claims_stale": 0,
                                "oldest_age_s": 0, "oldest_job": None})
         d["depth"] += 1
         if claimed:
             d["claimed_depth"] += 1
             if _claimant_gone(p):
                 d["dead_claims"] += 1
+                if claim_age >= DEAD_CLAIM_GRACE_S:
+                    d["dead_claims_stale"] += 1
         if age >= d["oldest_age_s"]:
             d["oldest_age_s"], d["oldest_job"] = age, p.name
     return out
@@ -2230,8 +2243,11 @@ def liveness(harness: str) -> dict:
         reasons.append(f"last capture attempt failed: {str(beat['last_drain_error'])[:120]}")
     if q["depth"] and (q.get("oldest_age_s") or 0) > QUEUE_STALE_S:
         reasons.append(f"{q['depth']} job(s) waiting {q['oldest_age_s'] // 60} min — nothing is draining them")
-    if q.get("dead_claims"):
-        reasons.append(f"{q['dead_claims']} claimed job(s) owned by a dead process — recovery is required")
+    if q.get("dead_claims_stale"):
+        reasons.append(
+            f"{q['dead_claims_stale']} claimed job(s) abandoned for over "
+            f"{DEAD_CLAIM_GRACE_S // 60} min — nothing is reclaiming them"
+        )
     pend = int(beat.get("pending_turns") or 0)
     since = _age(beat.get("pending_since"))
     # "The hook keeps running and never decides due" requires evidence the hook
