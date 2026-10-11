@@ -1487,12 +1487,26 @@ def snapshot_health() -> dict[str, Any]:
 SNAPSHOT_BEHIND_INGEST_MAX_S = 30 * 60
 
 
+def _replica_latest_ingested_at() -> datetime | None:
+    """Newest ``ingested_at`` among the episodes the replica holds, or None
+    when the file is missing, unreadable, empty or holds an unparseable value."""
+    try:
+        con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
+        try:
+            row = con.execute("SELECT MAX(ingested_at) FROM episodes").fetchone()
+        finally:
+            con.close()
+        return datetime.fromisoformat(str(row[0]).replace("Z", "+00:00")) if row and row[0] else None
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return None
+
+
 def snapshot_freshness(
     latest_ingested_at: str | None, health: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """``snapshot_health()`` plus ``behind_ingest_seconds`` (W2.4).
 
-    Pure function of already-known timestamps — no DB access — so
+    Reads only the local replica and already-known timestamps, never PG, so
     ``cmd_status``/``cmd_doctor``/MCP ``khipu_status`` (which already have PG's
     ``latest_ingested_at`` from ``status_payload``) can call this instead of
     plain ``snapshot_health()`` while PG is reachable, without this module
@@ -1513,6 +1527,19 @@ def snapshot_freshness(
     except (TypeError, ValueError):
         out["behind_ingest_seconds"] = None
         return out
+    # Since nothing dumps the replica every 15 minutes any more, the last full
+    # dump is hours old on a healthy machine while incremental writes keep the
+    # replica current. "Behind" is the hub's newest ingest against the newest
+    # ingest the replica actually holds; refreshed_at (and the 24 h trust in
+    # snapshot_is_fresh) is untouched, so an incremental write still cannot
+    # pass for a full dump.
+    held = _replica_latest_ingested_at()
+    if held is not None:
+        out["replica_latest_ingested_at"] = held.isoformat()
+        try:
+            ref = max(ref, held)
+        except TypeError:
+            pass
     behind = (ing - ref).total_seconds()
     out["behind_ingest_seconds"] = behind
     if behind > SNAPSHOT_BEHIND_INGEST_MAX_S:
