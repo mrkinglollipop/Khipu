@@ -267,6 +267,110 @@ class RewriteIndexTest(unittest.TestCase):
             self.assertEqual((mem / "MEMORY.md").read_text(encoding="utf-8"), maintainer_text)
 
 
+class _IndexHitsCursor:
+    def __init__(self, rows=(), error=None):
+        self.statements = []
+        self.rows = rows
+        self.error = error
+        self._result = []
+
+    def execute(self, sql, params=None):
+        self.statements.append(sql)
+        if sql.startswith("SELECT slug, hits_30d FROM topic_hits"):
+            if self.error is not None:
+                raise self.error
+            self._result = self.rows
+
+    def fetchall(self):
+        return list(self._result)
+
+
+class IndexCandidatesTransactionTest(unittest.TestCase):
+    def setUp(self):
+        self._data_root = tempfile.TemporaryDirectory()
+        self.addCleanup(self._data_root.cleanup)
+        patcher = mock.patch("khipu.paths.ensure_data_dir", return_value=Path(self._data_root.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_hits_join_runs_inside_a_savepoint_and_releases_on_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            mem = Path(td)
+            _write(mem / "one.md", _note_text("One", "project", "Content"))
+            out = organise._index_candidates(mem)
+            self.assertEqual(len(out), 1)
+            cur = _IndexHitsCursor(rows=[(out[0]["slug"], 7)])
+
+            out = organise._index_candidates(mem, cur=cur)
+
+        self.assertEqual(len(out), 1)
+        self.assertEqual(len(cur.statements), 3)
+        self.assertEqual(cur.statements[0], "SAVEPOINT khipu_index_hits")
+        self.assertTrue(cur.statements[1].startswith("SELECT slug, hits_30d FROM topic_hits"))
+        self.assertEqual(cur.statements[2], "RELEASE SAVEPOINT khipu_index_hits")
+        self.assertEqual(out[0]["hits_30d"], 7)
+
+    def test_failed_hits_join_rolls_back_to_the_savepoint_and_degrades(self):
+        with tempfile.TemporaryDirectory() as td:
+            mem = Path(td)
+            _write(mem / "one.md", _note_text("One", "project", "Content"))
+            cur = _IndexHitsCursor(error=RuntimeError("boom"))
+
+            out = organise._index_candidates(mem, cur=cur)
+
+        self.assertEqual(len(out), 1)
+        self.assertEqual(len(cur.statements), 3)
+        self.assertEqual(cur.statements[0], "SAVEPOINT khipu_index_hits")
+        self.assertTrue(cur.statements[1].startswith("SELECT slug, hits_30d FROM topic_hits"))
+        self.assertEqual(cur.statements[2], "ROLLBACK TO SAVEPOINT khipu_index_hits")
+        self.assertNotIn("RELEASE SAVEPOINT khipu_index_hits", cur.statements)
+        self.assertEqual(out[0]["hits_30d"], 0)
+
+
+class AfterReconcileEvidenceTest(unittest.TestCase):
+    def setUp(self):
+        self._data_root = tempfile.TemporaryDirectory()
+        self.addCleanup(self._data_root.cleanup)
+        patcher = mock.patch("khipu.paths.ensure_data_dir", return_value=Path(self._data_root.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.conn = mock.MagicMock()
+        self.cur = mock.MagicMock()
+        self.conn.cursor.return_value.__enter__.return_value = self.cur
+        connect_patcher = mock.patch("khipu.db.connect")
+        connect = connect_patcher.start()
+        self.addCleanup(connect_patcher.stop)
+        connect.return_value.__enter__.return_value = self.conn
+        organise._write_evidence({
+            "ok": False,
+            "error": "InFailedSqlTransaction: old",
+            "stale": {"ok": True, "count": 3},
+            "size_warnings": [],
+        })
+
+    def test_clean_run_after_a_failed_run_drops_the_stale_error(self):
+        with mock.patch("khipu.topic_hits.apply_incremental", return_value={"ok": True, "new_bytes": 0}):
+            out = organise.after_reconcile(written_plan=[], changed_only=True, dry_run=False)
+
+        self.assertIs(out["ok"], True)
+        self.assertNotIn("error", out)
+        evidence = organise.last_run()
+        self.assertIs(evidence["ok"], True)
+        self.assertNotIn("error", evidence)
+        self.assertEqual(evidence["stale"]["count"], 3)
+
+    def test_failed_run_reports_its_own_error(self):
+        with mock.patch("khipu.topic_hits.apply_incremental", side_effect=RuntimeError("InFailedSqlTransaction: now")):
+            out = organise.after_reconcile(written_plan=[], changed_only=True, dry_run=False)
+
+        self.assertIs(out["ok"], False)
+        self.assertIn("InFailedSqlTransaction: now", out["error"])
+        self.assertEqual(out["error"], "RuntimeError: InFailedSqlTransaction: now")
+        evidence = organise.last_run()
+        self.assertIs(evidence["ok"], False)
+        self.assertEqual(evidence["error"], out["error"])
+
+
 class RewriteIndexPreservesTextTest(unittest.TestCase):
     """G1 incident (2026-09-14): the first rewrite_index replaced every
     existing bullet line's TEXT with a fresh render from frontmatter,
