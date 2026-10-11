@@ -8,7 +8,7 @@ cursor), REC-14 (installed-code freshness, out of scope).
 
 | Phase | What | State |
 |---|---|---|
-| 0 | Scheduled full refresh, so the replica cannot age out while the rest is built | open, urgent |
+| 0 | Scheduled full refresh, so the replica cannot age out while the rest is built | done 2026-10-11 (PR #140): nightly `snapshot_refresh` step, fail-open; `refresh()` keeps the decision-sync cursor (the phase 1 stop-condition test exists); live dump 29 s |
 | 1 | Honest freshness: lag per table, stale/unknown states, no false red | open |
 | 2 | Bounded incremental sync from the hub on a schedule, independent of embeddings | open |
 | 3 | Decision cursor survives refresh and sees restore/unretract (HUB-19 migration) | open |
