@@ -121,7 +121,7 @@ class RunNightlyBriefsStepTest(unittest.TestCase):
         self.assertEqual(steps[-1]["name"], "briefs_build")
         self.assertEqual(steps[-1]["counts"]["built"], 3)
 
-    def test_build_many_raising_still_returns_the_exit_code(self):
+    def test_build_many_raising_fails_the_nightly_exit_code(self):
         patches = mock.patch.multiple(
             "khipu.briefs",
             acquire_build_lock=mock.Mock(return_value=True),
@@ -132,7 +132,7 @@ class RunNightlyBriefsStepTest(unittest.TestCase):
         with mock.patch("khipu.features.enabled", return_value=True), \
                 mock.patch("khipu.db.connect", return_value=_Conn()):
             rc, steps = self._nightly(patches)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(steps[-1]["name"], "briefs_build")
         self.assertFalse(steps[-1]["ok"])
 

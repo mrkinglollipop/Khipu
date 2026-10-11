@@ -405,6 +405,44 @@ class NightlyHealthRegressionTest(unittest.TestCase):
 
 
 class NightlyAggregateRegressionTest(unittest.TestCase):
+    def test_rv4_07_failed_brief_reaches_nightly_state_and_health(self) -> None:
+        from khipu import briefs
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(jobs, "ensure_data_dir", return_value=Path(tmp)), \
+                    mock.patch.object(jobs, "_drain_sessions", return_value={"ok": True}), \
+                    mock.patch.object(jobs, "_run_script", return_value=0), \
+                    mock.patch.object(jobs, "_reconcile_notes_if_due", return_value={"ok": True}), \
+                    mock.patch.object(jobs, "_embed_backfill", return_value={"ok": True}), \
+                    mock.patch.object(jobs, "_prune_query_cache", return_value={"ok": True}), \
+                    mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True}), \
+                    mock.patch.object(jobs, "_hygiene_commitments", return_value={"ok": True}), \
+                    mock.patch("khipu.features.enabled", return_value=True), \
+                    mock.patch("khipu.db.connect", return_value=mock.MagicMock()), \
+                    mock.patch.object(briefs, "acquire_build_lock", return_value=True), \
+                    mock.patch.object(briefs, "release_build_lock"), \
+                    mock.patch.object(briefs, "select_for_build", return_value={"available": True, "topics": ["a"]}), \
+                    mock.patch.object(briefs, "build_many", return_value=[{"status": "failed", "error": "provider"}]), \
+                    mock.patch.object(jobs, "_nightly_log"):
+                rc = jobs.run_nightly()
+                self.assertEqual(rc, 1)
+                self.assertEqual(jobs._read_job_state("nightly")["exit"], 1)
+                with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
+                        mock.patch.object(jobs, "_job_entry", return_value={"last_exit": rc,
+                            "last_exit_ts": datetime.now(timezone.utc).isoformat(), "plist_loaded": True}):
+                    health = jobs.nightly_step_health()
+                self.assertFalse(health["briefs_build_ok"]["ok"])
+                self.assertTrue(health["briefs_build_ok"]["applicable"])
+
+    def test_rv4_07_disabled_briefs_do_not_gate_health(self) -> None:
+        with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
+                mock.patch.object(jobs, "_job_entry", return_value={}), \
+                mock.patch.object(jobs, "nightly_last", return_value={"steps": [
+                    {"name": "briefs_build", "ok": False, "error": "old provider failure"}]}), \
+                mock.patch("khipu.features.enabled", return_value=False):
+            health = jobs.nightly_step_health()
+        self.assertTrue(health["briefs_build_ok"]["ok"])
+        self.assertFalse(health["briefs_build_ok"]["applicable"])
+
     def test_briefs_failed_or_unavailable_result_is_unhealthy(self) -> None:
         from khipu import briefs, features
 
@@ -444,6 +482,53 @@ class NightlyAggregateRegressionTest(unittest.TestCase):
 
 
 class JoinTransactionRegressionTest(unittest.TestCase):
+    def test_rv4_02_rollback_failure_is_reported(self) -> None:
+        from khipu import keychain
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": tmp}), \
+                mock.patch.object(keychain, "keychain_available", return_value=True), \
+                mock.patch.object(keychain, "_security", return_value=mock.Mock(returncode=0, stdout="old dsn")), \
+                mock.patch.object(keychain, "set_dsn"), \
+                mock.patch.object(keychain, "set_password", side_effect=RuntimeError("locked")), \
+                mock.patch("khipu.models.set_models_replace", side_effect=RuntimeError("late failure")):
+            with self.assertRaisesRegex(RuntimeError, "rollback failed for credential database_url") as caught:
+                join.import_kit(self._payload(), "")
+            self.assertEqual(str(caught.exception.__cause__), "late failure")
+
+    def test_rv4_02_late_failure_restores_keychain_and_files(self) -> None:
+        from khipu import keychain
+        for existing in (True, False):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "dsn").write_text("host=old.example dbname=khipu\n")
+                (root / "root.crt").write_text("old cert\n")
+                (root / "config.json").write_text('{"capture_mode":"dual"}\n')
+                original = {keychain.DSN_ACCOUNT: "host=old.example dbname=khipu",
+                            keychain.GEMINI_ACCOUNT: "old-gemini"} if existing else {}
+                stored = dict(original)
+
+                def security(*args, **kwargs):
+                    account = args[args.index("-a") + 1]
+                    if args[0] == "find-generic-password":
+                        return mock.Mock(returncode=0 if account in stored else 44,
+                                         stdout=stored.get(account, ""), stderr="")
+                    if args[0] == "delete-generic-password":
+                        stored.pop(account, None)
+                        return mock.Mock(returncode=0)
+                    stored[account] = kwargs["stdin"].splitlines()[0]
+                    return mock.Mock(returncode=0)
+
+                with mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": tmp}), \
+                        mock.patch.object(keychain, "keychain_available", return_value=True), \
+                        mock.patch.object(keychain, "_security", side_effect=security), \
+                        mock.patch("khipu.models.set_models_replace", side_effect=RuntimeError("late failure")):
+                    with self.assertRaisesRegex(RuntimeError, "late failure"):
+                        join.import_kit(self._payload(root_crt_pem="new cert", gemini_api_key="new-gemini",
+                                                      openai_compat_api_key="new-openai"), "")
+                self.assertEqual(stored, original)
+                self.assertEqual((root / "dsn").read_text(), "host=old.example dbname=khipu\n")
+                self.assertEqual((root / "root.crt").read_text(), "old cert\n")
+
     def _payload(self, **extra: object) -> bytes:
         models = {
             "synth": {"provider": "cloud", "endpoint": "", "model_id": "x"},
@@ -826,6 +911,7 @@ class NightlyUnknownEvidenceRegressionTest(unittest.TestCase):
             missing = Path(tmp) / "nightly-last.json"
             with (
                 mock.patch.object(jobs, "_nightly_last_path", return_value=missing),
+                mock.patch("khipu.features.enabled", return_value=True),
                 mock.patch.object(jobs, "_is_index_sync_host", return_value=True),
                 mock.patch.object(
                     jobs,

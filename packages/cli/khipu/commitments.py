@@ -930,6 +930,16 @@ def _match_score(a: str, b: str) -> float:
     return _jaccard(a, b)
 
 
+def _completion_text(text: str) -> str:
+    text = " ".join(text.lower().split())
+    # Only the leading action changes tense; task qualifiers retain their words.
+    def action(match):
+        token = match.group()
+        stems = (*_stems(token), token[:-3] + "y" if token.endswith("ied") else token)
+        return next((stem for stem in stems if stem in _ACTION_STEMS), token)
+    return re.sub(r"^[a-z]+", action, text, count=1)
+
+
 def _has_commitment_embeddings(cur, commitment_ids: list[int]) -> bool:
     """Cheap existence check (fix 5b): skip the embed API call entirely when
     no candidate commitment has a stored embedding yet — the embed catch-up
@@ -1011,7 +1021,8 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
         best_via = ""
         tied = False
         semantic_matches = 0
-        tokens = set(re.findall(r"[\w./-]+", text.lower()))
+        completion = _completion_text(text)
+        tokens = set(re.findall(r"[\w./-]+", completion))
         for row in open_rows:
             cid = row["id"]
             if cid in already_closed:
@@ -1020,13 +1031,14 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
                 if cid == reference:
                     best_id, best_score, best_via = cid, 1.0, "commitment id"
                 continue
-            exact = " ".join(text.lower().split()) == " ".join(row["text"].lower().split())
+            target = _completion_text(row["text"])
+            exact = completion == target
             if not exact and len(tokens) < 3:
                 continue
             # Ordinary completion must preserve the full lexical evidence;
             # substring containment is reserved for an explicit done statement.
-            text_score = _match_score(text, row["text"]) if kind == "done" else _jaccard(text, row["text"])
-            covers = set(re.findall(r"[\w./-]+", row["text"].lower())) <= tokens
+            text_score = _match_score(text, row["text"]) if kind == "done" else _jaccard(completion, target)
+            covers = set(re.findall(r"[\w./-]+", target)) <= tokens
             cos = cosine.get(cid)
             score = 0.0
             via = ""

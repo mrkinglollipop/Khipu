@@ -37,7 +37,7 @@ import sys
 from typing import Any
 
 # Bumping this makes every existing brief stale on its next read or plan.
-DERIVATION_VERSION = 2
+DERIVATION_VERSION = 3
 
 DEFAULT_BUILD_LIMIT = 5
 
@@ -178,7 +178,47 @@ def _decision_rows(cur, episode_ids: list[int], *, with_text: bool = False) -> d
         row["text" if with_text else "chars"] = body
         row["state"] = decisions.state_of(row)
         out.setdefault(int(episode_id), []).append(row)
+    # Backfill deduplicates repeated strings into an earlier episode's row.
+    body = "d.text" if with_text else "length(d.text)"
+    retracted = "d.retracted_at" if decisions._evidence_ready(cur) else "NULL"
+    live = decisions._not_forgotten_clause(cur, "d")
+    cur.execute(
+        f"SELECT e.id, d.id, {body}, d.superseded_by, {retracted} "
+        "FROM episodes e CROSS JOIN LATERAL jsonb_array_elements_text(e.decisions) legacy(text) "
+        "JOIN LATERAL (SELECT d.* FROM decisions d "
+        "WHERE d.project IS NOT DISTINCT FROM e.project "
+        "AND lower(regexp_replace(trim(d.text), '\\s+', ' ', 'g')) = "
+        "lower(regexp_replace(trim(legacy.text), '\\s+', ' ', 'g')) "
+        "AND d.decided_at <= e.ts "
+        f"AND d.decided_at >= e.ts - interval '{decisions.DEDUP_WINDOW_DAYS} days' "
+        + (f"AND {live} " if live else "") +
+        "ORDER BY d.decided_at DESC, d.id DESC LIMIT 1) d ON true "
+        "WHERE e.id = ANY(%s::bigint[]) "
+        "AND NOT EXISTS (SELECT 1 FROM decisions own WHERE own.episode_id = e.id "
+        "AND lower(regexp_replace(trim(own.text), '\\s+', ' ', 'g')) = "
+        "lower(regexp_replace(trim(legacy.text), '\\s+', ' ', 'g'))) ORDER BY e.id, d.id",
+        (list(episode_ids),),
+    )
+    for episode_id, did, body, superseded_by, retracted_at in cur.fetchall():
+        mine = out.setdefault(int(episode_id), [])
+        if any(r["id"] == did for r in mine):
+            continue
+        row = {"id": did, "superseded_by": superseded_by, "retracted_at": retracted_at}
+        row["text" if with_text else "chars"] = body
+        row["state"] = decisions.state_of(row)
+        mine.append(row)
     return out
+
+
+def _decision_lines(rows, legacy, *, label_unknown=True) -> tuple[list[str], bool]:
+    from khipu.decisions import normalize_text
+
+    known = {normalize_text(r["text"]) for r in rows}
+    lines = [("(superseded) " if r["state"] == "superseded" else "") + (r["text"] or "")
+             for r in rows if r["state"] != "retracted"]
+    unmatched = [d for d in (legacy or []) if isinstance(d, str) and normalize_text(d) not in known]
+    lines.extend(("(validity unknown) " if label_unknown else "") + d for d in unmatched)
+    return lines, bool(unmatched)
 
 
 def _live_clause(cur) -> str:
@@ -302,17 +342,7 @@ def _gather(cur, slug: str) -> dict[str, Any]:
         ))
         if project_name:
             projects[project_name] = projects.get(project_name, 0) + 1
-        if rows:
-            lines = [
-                ("(superseded) " if r["state"] == "superseded" else "") + (r["text"] or "")
-                for r in rows if r["state"] != "retracted"
-            ]
-        elif not registry_ready:
-            lines = [d for d in (decisions_json or []) if isinstance(d, str)]
-        else:
-            # A missing row can be a deduplicated decision whose canonical
-            # row was retracted or superseded in another episode.
-            lines = []
+        lines, _ = _decision_lines(rows, decisions_json, label_unknown=registry_ready)
         text = strip_derived(summary)[:MAX_EPISODE_CHARS]
         lines = [ln for ln in (strip_derived(ln) for ln in lines) if ln]
         if not text and not lines:

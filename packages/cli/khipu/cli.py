@@ -548,6 +548,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     known_job_failures = [
         name for name in _JOBS_CHOICES
         if isinstance(jobs.get(name), dict) and jobs[name].get("last_exit") not in (None, 0)
+        and (jobs[name].get("plist_loaded") or jobs[name].get("plist_mtime") is not None
+             or jobs[name].get("expected"))
     ]
     jobs_ok = not known_job_failures
     out = {

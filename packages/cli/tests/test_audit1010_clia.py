@@ -121,6 +121,46 @@ class DoctorReadOnlyAndProbeTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
+    def test_rv4_06_uninstalled_job_failure_is_informational(self):
+        job = {"last_exit": 7, "plist_loaded": False, "plist_mtime": None, "expected": False}
+        args = cli.build_parser().parse_args(["doctor"])
+        with mock.patch("khipu.jobs.job_status", return_value={"monthly": job}), \
+                mock.patch("khipu.probe.status", return_value={"ok": True}), \
+                mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True}), \
+                mock.patch("khipu.drift.recall_quality", return_value={}), \
+                redirect_stdout(io.StringIO()) as stdout:
+            rc = cli.cmd_doctor(args)
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertTrue(result["jobs_ok"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["jobs"]["monthly"]["last_exit"], 7)
+
+    def test_rv4_06_installed_or_expected_job_failure_remains_red(self):
+        args = cli.build_parser().parse_args(["doctor"])
+        for active in ({"plist_loaded": True}, {"plist_mtime": 1}, {"expected": True}):
+            with self.subTest(active=active), \
+                    mock.patch("khipu.jobs.job_status", return_value={"monthly": {"last_exit": 7, **active}}), \
+                    mock.patch("khipu.probe.status", return_value={"ok": True}), \
+                    mock.patch("khipu.drift.recall_quality", return_value={}), \
+                    redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(cli.cmd_doctor(args), 2)
+            self.assertIn("monthly", json.loads(stdout.getvalue())["job_failures"])
+
+    def test_rv4_06_job_expectation_comes_from_scheduled_configuration(self):
+        from khipu import jobs
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(jobs, "_plist_path", return_value=Path(tmp) / "missing.plist"), \
+                mock.patch.object(jobs, "_plist_loaded", return_value=False), \
+                mock.patch.object(jobs, "_read_job_state", return_value={"exit": 7}), \
+                mock.patch("khipu.launchd_gen.plist_current", return_value=None):
+            for scheduled in ({"monthly": True}, {}):
+                with self.subTest(scheduled=scheduled), mock.patch("khipu.launchd_gen.read_versions", return_value={
+                    "scheduled_jobs": scheduled}):
+                    entry = jobs._job_entry("monthly")
+                self.assertEqual(entry["expected"], bool(scheduled))
+                self.assertEqual(entry["last_exit"], 7)
+
     def test_plain_doctor_does_not_refresh_or_drain(self):
         args = cli.build_parser().parse_args(["doctor"])
         with mock.patch("khipu.hub_snapshot.maybe_refresh") as refresh, \
@@ -178,7 +218,8 @@ class DoctorReadOnlyAndProbeTest(unittest.TestCase):
 
     def test_known_scheduled_job_failure_fails_doctor(self):
         args = cli.build_parser().parse_args(["doctor"])
-        jobs = {name: {"last_exit": 0, "next_schedule": "daily"} for name in cli._JOBS_CHOICES}
+        jobs = {name: {"last_exit": 0, "next_schedule": "daily", "plist_loaded": True}
+                for name in cli._JOBS_CHOICES}
         jobs["nightly"]["last_exit"] = 1
         with mock.patch("khipu.jobs.job_status", return_value=jobs), \
                 mock.patch("khipu.probe.status", return_value={"ok": True}), \

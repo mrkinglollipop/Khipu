@@ -207,6 +207,26 @@ class DecisionLifecycleTest(RegistryTest):
 
 
 class CommitmentClosureTest(RegistryTest):
+    def test_rv4_03_plain_completion_closes_unique_task(self):
+        for semantic in (False, True):
+            with self.subTest(semantic=semantic):
+                self.cur.conn.execute("DELETE FROM commitments")
+                cid = self.cur.commitment("Verify the installed app")
+                with mock.patch.object(co, "_has_commitment_embeddings", return_value=semantic), \
+                        mock.patch.object(co, "_cosine_scores", return_value={cid: 1.0}):
+                    self.assertEqual(co.auto_close(self.cur, {"project": "p", "closed_loops": [
+                        "Verified the installed app"]}, 3), 1)
+                self.assertEqual(self.cur.value("commitments", cid, "status"), "closed")
+
+    def test_rv4_03_tense_does_not_remove_destination_or_ambiguity(self):
+        ids = [self.cur.commitment(text) for text in (
+            "Verify the installed production app", "Verify the installed staging app")]
+        with mock.patch.object(co, "_has_commitment_embeddings", return_value=True), \
+                mock.patch.object(co, "_cosine_scores", return_value=dict.fromkeys(ids, 1.0)):
+            self.assertEqual(co.auto_close(self.cur, {"project": "p", "closed_loops": [
+                "Verified the installed app"]}, 3), 0)
+        self.assertEqual(self.cur.conn.execute("SELECT count(*) FROM commitments WHERE status = 'open'").fetchone()[0], 2)
+
     def test_arch11_ambiguous_publish_abstains_in_both_orders(self):
         for texts in (("Publish legal privacy notice", "Publish release 1.2"),
                       ("Publish release 1.2", "Publish legal privacy notice")):

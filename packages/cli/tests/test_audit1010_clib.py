@@ -212,6 +212,26 @@ class AegisTomlTest(_AegisConfigCase):
 
 
 class ProbePersistenceTest(unittest.TestCase):
+    def test_rv4_08_partial_receipt_failure_keeps_aggregate_red(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": tmp}):
+            harness_path = probe.harness_state_path("codex")
+            write_text = Path.write_text
+            def write(path, *args, **kwargs):
+                if path == harness_path:
+                    raise OSError("harness receipt denied")
+                return write_text(path, *args, **kwargs)
+            result = {"ts": probe._now_iso(), "harness": "codex", "ok": True, "error": None}
+            with mock.patch.object(Path, "write_text", write):
+                current = probe._persist_result(result)
+            stored = json.loads(probe.state_path().read_text())
+            self.assertFalse(current["ok"])
+            self.assertFalse(stored["ok"])
+            self.assertEqual(stored["persistence"], current["persistence"])
+            self.assertIn("harness receipt denied", stored["error"])
+            self.assertFalse(probe.status()["ok"])
+
     def test_current_probe_result_is_red_when_state_receipt_cannot_persist(self):
         search = {"results": [{"kind": "episode", "id": "7"}]}
         with mock.patch("khipu.config.capture_mode", return_value="hub"), \

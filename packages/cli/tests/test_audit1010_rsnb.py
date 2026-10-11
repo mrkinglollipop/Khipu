@@ -135,6 +135,65 @@ class BriefBuildOutcomeTest(unittest.TestCase):
 
 
 class LegacyDecisionValidityTest(unittest.TestCase):
+    def test_rv4_01_existing_registry_preserves_unregistered_history(self):
+        hub = _ReflectHub()
+        hub.episode(1, "Discussed deployment", decisions=["Deploy to staging only"])
+        _, gen = _build(hub, answer=_answer([_claim("Discussed deployment", 1)]))
+        self.assertIn("Deploy to staging only", gen.call_args.args[0])
+        with hub.cursor() as cur:
+            source = reflect._episode_sources(cur, [1])[1]
+        self.assertIn("Deploy to staging only", "\n".join(source["decisions"]))
+        self.assertEqual(source["validity"], "unknown")
+
+    def test_rv4_01_deduplicated_standing_history_is_preserved(self):
+        hub = _ReflectHub()
+        for eid in (1, 2):
+            hub.episode(eid, "Discussed deployment", decisions=["Deploy to staging only"])
+        hub.decision(10, 1, "Deploy to staging only")
+        with hub.cursor() as cur:
+            self.assertIn("Deploy to staging only", reflect._episode_sources(cur, [2])[2]["decisions"])
+
+    def test_rv4_01_partial_registry_and_other_projects_preserve_unknown_history(self):
+        hub = _ReflectHub()
+        hub.episode(1, "Discussed deployment", decisions=["Deploy to staging only", "Keep backups"])
+        hub.decision(10, 1, "Keep backups")
+        hub.episode(2, "Other project", project="other")
+        hub.decision(11, 2, "Deploy to staging only", retracted=True)
+        with hub.cursor() as cur:
+            source = reflect._episode_sources(cur, [1])[1]
+        self.assertEqual(source["decisions"], ["Keep backups", "(validity unknown) Deploy to staging only"])
+        self.assertEqual(source["validity"], "unknown")
+
+    def test_rv4_01_deduplicated_lifecycle_changes_stale_the_brief(self):
+        hub = _ReflectHub()
+        for eid in (1, 2):
+            hub.episode(eid, "Discussed deployment", decisions=["Deploy to staging only"])
+        hub.decision(10, 1, "Deploy to staging only")
+        _build(hub, answer=_answer([_claim("Discussed deployment", 2)]))
+        hub.decisions[10]["retracted_at"] = "2026-10-10"
+        with hub.cursor() as cur:
+            self.assertEqual(briefs.read_brief(cur, "alpha")["state"], "stale")
+
+    def test_rv4_01_own_lifecycle_wins_over_a_later_restatement(self):
+        hub = _ReflectHub()
+        for eid in (1, 2):
+            hub.episode(eid, "Discussed deployment", decisions=["Deploy to staging only"])
+        hub.decision(10, 1, "Deploy to staging only", retracted=True)
+        hub.decision(11, 2, "Deploy to staging only")
+        with hub.cursor() as cur:
+            sources = reflect._episode_sources(cur, [1, 2])
+        self.assertEqual(sources[1]["decisions"], [])
+        self.assertEqual(sources[2]["decisions"], ["Deploy to staging only"])
+
+    def test_rv4_01_old_derivation_is_stale_even_without_registry_rows(self):
+        hub = _ReflectHub()
+        hub.episode(1, "Discussed deployment", decisions=["Deploy to staging only"])
+        with hub.cursor() as cur:
+            fingerprint = briefs._gather(cur, "alpha")["hash"]
+        hub.seed_brief("alpha", source_hash=fingerprint, version=2)
+        with hub.cursor() as cur:
+            self.assertEqual(briefs.read_brief(cur, "alpha")["state"], "stale")
+
     def test_repeated_legacy_decision_cannot_bypass_registry_lifecycle(self):
         for state in ("retracted", "superseded"):
             with self.subTest(state=state):
@@ -150,7 +209,10 @@ class LegacyDecisionValidityTest(unittest.TestCase):
                 ), rows=_rows(2))
                 brief_source = gen.call_args.args[0].split("[episode 2,", 1)[1].split("\n\n", 1)[0]
                 self.assertNotIn("- Use offset pagination", brief_source)
-                self.assertNotIn("Use offset pagination", prompts[0])
+                if state == "retracted":
+                    self.assertNotIn("Use offset pagination", prompts[0])
+                else:
+                    self.assertIn("(superseded) Use offset pagination", prompts[0])
 
     def test_legacy_fallback_is_retained_without_a_registry(self):
         hub = _ReflectHub(decisions_table=False)
@@ -205,6 +267,7 @@ class ReflectionCacheContractTest(unittest.TestCase):
                 with mock.patch("khipu.db.connect", return_value=hub), \
                         mock.patch("khipu.hub_snapshot.try_hub_connect", return_value=hub), \
                         mock.patch("khipu.embed._active_profile", return_value="test"), \
+                        mock.patch("khipu.embed.resolve_spec", return_value=SimpleNamespace(dim=2)), \
                         mock.patch("khipu.embed.uses_task_prefixes", return_value=False), \
                         mock.patch("khipu.embed.embed_one", return_value=[1.0, 0.0]) as transport, \
                         mock.patch("khipu.cli._literal_candidates", return_value=[]), \
