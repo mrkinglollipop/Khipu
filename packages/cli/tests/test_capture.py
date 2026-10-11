@@ -304,6 +304,13 @@ class _EpisodesFakeCursor:
             else:
                 self._result = []
             return
+        if s.startswith("SELECT id FROM episodes WHERE raw @>"):
+            receipt = json.loads(params[0])["merged_from"][0]["source_id"]
+            hits = [eid for eid, e in self.episodes.items()
+                    if any(source.get("source_id") == receipt
+                           for source in (e.get("raw") or {}).get("merged_from", []))]
+            self._result = [(hits[0],)] if hits else []
+            return
         if s.startswith("SELECT id FROM episodes WHERE harness"):
             harness, sid, tr = params
             hits = [eid for eid, e in self.episodes.items()
@@ -517,6 +524,17 @@ class WritePgOrchestrationTest(unittest.TestCase):
             "parent_session_id": None, "transcript_range": "0:100",
         }}
         cur = _EpisodesFakeCursor(existing)
+        conn = _FakeConn(cur)
+        original_execute = cur.execute
+
+        def execute(sql, params=None):
+            if sql.startswith("SELECT to_jsonb(e)"):
+                self.assertGreater(conn.commits, 0, "embedding must read committed target metadata")
+                cur._result = [(dict(cur.episodes[params[0]]),)]
+            else:
+                original_execute(sql, params)
+
+        cur.execute = execute
         payload = {
             "ts": "2026-09-03T00:02:00Z", "session_id": "claude_code:c631b166",
             "summary": "one conversation captured twice",
@@ -526,7 +544,7 @@ class WritePgOrchestrationTest(unittest.TestCase):
         }
         opened: list[tuple] = []
         reembedded: list[tuple] = []
-        with self._connect(cur), \
+        with mock.patch("khipu.db.connect", return_value=conn), \
                 mock.patch("khipu.hygiene.classify_topics", return_value=([], [], False)), \
                 mock.patch("khipu.commitments.open_from_episode",
                            side_effect=lambda c, pl, eid: opened.append((pl, eid)) or 1), \
@@ -547,6 +565,8 @@ class WritePgOrchestrationTest(unittest.TestCase):
         self.assertEqual(len(reembedded), 1)
         self.assertEqual(reembedded[0][0], "2026-09-03T00:00:00Z")
         self.assertEqual(reembedded[0][2]["people"], ["matt", "ana"])
+        self.assertEqual(reembedded[0][2]["session_id"], existing[1]["session_id"])
+        self.assertEqual(reembedded[0][2]["project"], "acme/widget")
 
     def test_a_path_like_scope_is_normalised_to_null_on_insert(self):
         """K6: a worktree path or a run-on scope never lands in the column

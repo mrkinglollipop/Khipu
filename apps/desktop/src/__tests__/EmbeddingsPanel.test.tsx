@@ -3,7 +3,7 @@
 // `library list`, `embed jobs`, `embed estimate`, `embed status` and
 // `library status`) owns all state, so every write is followed by a re-read.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { EmbeddingsPanel } from "../EmbeddingsPanel";
 import type { JobRow, LibraryRow, ProfileRow } from "../EmbeddingsPanel";
 
@@ -107,12 +107,16 @@ let refuse: Record<string, string>;
 let jobsReads: number;
 let estimateChunks: number;
 let estimatePrice: number | null;
+let testKeyResponse: ((args: Args) => Promise<string>) | null;
+let secretWriteFailure: string | null;
 
 beforeEach(() => {
   calls.length = 0;
   jobsReads = 0;
   estimateChunks = 22271;
   estimatePrice = 0;
+  testKeyResponse = null;
+  secretWriteFailure = null;
   refuse = {};
   profiles = [gemini(), voyage(), nomic()];
   libraries = [biblical()];
@@ -169,9 +173,10 @@ beforeEach(() => {
         profiles = profiles.filter((p) => p.id !== args?.id);
         return JSON.stringify({ ok: true });
       case "khipu_embed_test_key":
+        if (testKeyResponse) return testKeyResponse(args);
         return JSON.stringify({ ok: true, provider: args?.provider, model: args?.model, ms: 196, dim: 768 });
       case "set_khipu_secret":
-        return JSON.stringify({ ok: true });
+        return JSON.stringify(secretWriteFailure ? { ok: false, error: secretWriteFailure } : { ok: true });
       case "khipu_embed_profile_add":
         profiles = [...profiles, nomic({ id: String(args?.id), model: String(args?.model) })];
         return JSON.stringify({ ok: true });
@@ -331,6 +336,29 @@ describe("estimate, start, progress and cancel", () => {
       ]),
     );
     expect(await within(n).findByText("Starting…")).toBeInTheDocument();
+  });
+
+  it("shows the startup log when a started job never appears", async () => {
+    render(<EmbeddingsPanel active />);
+    const n = await model("nomic-embed-text@768");
+    fireEvent.click(within(n).getByRole("button", { name: "Re-embed memory with this model" }));
+    const dlg = await screen.findByRole("dialog", { name: "Re-embed memory with nomic-embed-text?" });
+    await within(dlg).findByText("22,271 pieces of text, about 14M tokens");
+
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(within(dlg).getByRole("button", { name: "Start" }));
+      await act(async () => Promise.resolve());
+      expect(within(n).getByText("Starting…")).toBeInTheDocument();
+
+      await act(async () => vi.advanceTimersByTimeAsync(61_000));
+
+      expect(within(n).getByRole("alert")).toHaveTextContent("Job start was not confirmed");
+      expect(within(n).getByRole("alert")).toHaveTextContent("/tmp/x.log");
+      expect(within(n).queryByText("Starting…")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("starts a library job under the library name", async () => {
@@ -668,6 +696,34 @@ describe("Add a model", () => {
     fireEvent.click(within(dlg).getByRole("button", { name: "Add model" }));
     expect(await within(dlg).findByText("HTTP 401: invalid API key")).toBeInTheDocument();
     expect(callsTo("khipu_embed_profile_add")).toHaveLength(0);
+  });
+
+  it("stops before the provider test when saving a typed key returns a failure verdict", async () => {
+    secretWriteFailure = "Keychain is locked";
+    const dlg = await openDialog();
+    fireEvent.change(within(dlg).getByLabelText("Model id"), { target: { value: "mxbai-embed-large" } });
+    fireEvent.change(within(dlg).getByLabelText("Dimensions"), { target: { value: "768" } });
+    fireEvent.change(within(dlg).getByLabelText("Key"), { target: { value: "typed-key" } });
+    fireEvent.click(within(dlg).getByRole("button", { name: "Test key" }));
+    expect(await within(dlg).findByText(/Keychain is locked/)).toBeInTheDocument();
+    expect(callsTo("khipu_embed_test_key")).toHaveLength(0);
+    expect(callsTo("khipu_embed_profile_add")).toHaveLength(0);
+  });
+
+  it("does not use a late endpoint-A result to add endpoint B", async () => {
+    let resolveFirst: (raw: string) => void = () => {};
+    testKeyResponse = () => new Promise<string>((resolve) => { resolveFirst = resolve; });
+    const dlg = await openDialog();
+    fireEvent.change(within(dlg).getByLabelText("Model id"), { target: { value: "mxbai-embed-large" } });
+    fireEvent.change(within(dlg).getByLabelText("Dimensions"), { target: { value: "768" } });
+    fireEvent.click(within(dlg).getByRole("button", { name: "Test key" }));
+    await waitFor(() => expect(callsTo("khipu_embed_test_key")).toHaveLength(1));
+    fireEvent.change(within(dlg).getByLabelText("Endpoint"), { target: { value: "http://localhost:9999" } });
+    await act(async () => resolveFirst(JSON.stringify({ ok: true, ms: 196, dim: 768 })));
+    await waitFor(() => expect(within(dlg).queryByText("ok, 196 ms")).not.toBeInTheDocument());
+    fireEvent.click(within(dlg).getByRole("button", { name: "Add model" }));
+    await waitFor(() => expect(callsTo("khipu_embed_test_key")).toHaveLength(2));
+    expect(callsTo("khipu_embed_test_key")[1]).toMatchObject({ endpoint: "http://localhost:9999" });
   });
 
   it("refuses dimensions that differ from what the model returned", async () => {

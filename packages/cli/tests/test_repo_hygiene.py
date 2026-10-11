@@ -12,7 +12,9 @@ from __future__ import annotations
 import shutil
 import subprocess
 import unittest
+import tempfile
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -59,7 +61,7 @@ GIT_AVAILABLE = _git_available()
 class RepoHygieneTest(unittest.TestCase):
     def test_no_maintainer_specific_strings_in_tracked_files(self) -> None:
         result = subprocess.run(
-            ["git", "ls-files"],
+            ["git", "ls-files", "--", ".", ":(exclude)**/API Keys/**", ":(exclude)**/My Portfolio/**"],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
@@ -75,18 +77,19 @@ class RepoHygieneTest(unittest.TestCase):
                 continue
             path = REPO_ROOT / rel_path
             try:
-                if not path.is_file():
-                    continue
-                if path.stat().st_size > MAX_FILE_BYTES:
-                    continue
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-
-            for line_no, line in enumerate(text.splitlines(), start=1):
-                for needle in FORBIDDEN_STRINGS:
-                    if needle in line:
-                        offenses.append(f"{rel_path}:{line_no}: contains {needle!r}")
+                seen = set()
+                overlap = max(len(s.encode()) for s in FORBIDDEN_STRINGS) - 1
+                tail = b""
+                with path.open("rb") as fh:
+                    while chunk := fh.read(MAX_FILE_BYTES):
+                        data = tail + chunk
+                        for needle in FORBIDDEN_STRINGS:
+                            if needle.encode() in data:
+                                seen.add(needle)
+                        tail = data[-overlap:]
+                offenses.extend(f"{rel_path}: contains {needle!r}" for needle in sorted(seen))
+            except OSError as exc:
+                offenses.append(f"{rel_path}: incomplete scan ({type(exc).__name__})")
 
         self.assertEqual(
             offenses,
@@ -97,3 +100,27 @@ class RepoHygieneTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HygieneCoverageTest(unittest.TestCase):
+    def _scan_fixture(self, root):
+        with mock.patch(__name__ + ".REPO_ROOT", root), mock.patch(
+            "subprocess.run", return_value=mock.Mock(stdout="fixture.bin\n")
+        ):
+            RepoHygieneTest("test_no_maintainer_specific_strings_in_tracked_files").test_no_maintainer_specific_strings_in_tracked_files()
+
+    def test_large_and_binary_files_are_checked(self):
+        for prefix in (b"x" * (MAX_FILE_BYTES - 3), b"\xff\xfe"):
+            with self.subTest(size=len(prefix)), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                (root / "fixture.bin").write_bytes(prefix + FORBIDDEN_STRINGS[0].encode())
+                with self.assertRaisesRegex(AssertionError, "contains"):
+                    self._scan_fixture(root)
+
+    def test_unreadable_files_fail_the_gate_explicitly(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "fixture.bin").write_bytes(b"safe")
+            with mock.patch.object(Path, "open", side_effect=PermissionError("denied")):
+                with self.assertRaisesRegex(AssertionError, "incomplete"):
+                    self._scan_fixture(root)

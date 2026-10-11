@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from khipu import forget
+from khipu import forget, outbox
 
 
 class _Cur:
@@ -101,6 +102,122 @@ class ForgetEpisodeTest(unittest.TestCase):
 
 
 class ForgetEverywhereTest(unittest.TestCase):
+    def test_outbox_read_failure_preserves_error_and_remaining(self):
+        hub_cur = _Cur(("2026-10-10T00:00:00Z", "Forget this", "grokbot:task"))
+        hub_conn = mock.MagicMock()
+        hub_conn.__enter__.return_value = hub_conn
+        hub_conn.cursor.return_value.__enter__.return_value = hub_cur
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch("khipu.db.connect", return_value=hub_conn), \
+                mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": True}), \
+                mock.patch("khipu.outbox.outbox_dir", side_effect=PermissionError("outbox directory denied")):
+            out = forget.forget_everywhere(7, memory_root=Path(td))
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["complete"])
+        self.assertEqual(out["partial_errors"]["outbox"], [{
+            "error": "PermissionError: outbox directory denied",
+            "remaining": ["outbox: not cleaned (capture identity needed)"],
+        }])
+
+    def test_sessionless_episode_with_any_retained_job_reports_incomplete(self):
+        # No session id means no way to tell the forgotten capture from the
+        # queued one, so forget must not claim the outbox is clean.
+        hub_cur = _Cur(("2026-10-10T00:00:00Z", "Edited hub summary", None))
+        hub_conn = mock.MagicMock()
+        hub_conn.__enter__.return_value = hub_conn
+        hub_conn.cursor.return_value.__enter__.return_value = hub_cur
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(Path(td) / "outbox")}), \
+                mock.patch("khipu.db.connect", return_value=hub_conn), \
+                mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": True}):
+            queued = outbox.enqueue({"ts": "2026-10-10T00:01:00Z", "summary": "Original capture",
+                                     "session_id": "other:session"})
+            before = {path: path.read_bytes() for path in queued.parent.iterdir()}
+            result = forget.forget_everywhere(7, memory_root=Path(td))
+            self.assertEqual({path: path.read_bytes() for path in queued.parent.iterdir()}, before)
+        self.assertFalse(result["complete"])
+        self.assertIn("outbox", result["partial"])
+        self.assertEqual(result["remaining"], ["outbox: not cleaned (capture identity needed)"])
+
+    def test_outbox_scan_holds_the_outbox_lock(self):
+        # retry_dead() and the drain move jobs between directories under this
+        # lock; scanning without it could miss a job mid-move.
+        hub_cur = _Cur(("2026-10-10T00:00:00Z", "Edited hub summary", "codex:session"))
+        hub_conn = mock.MagicMock()
+        hub_conn.__enter__.return_value = hub_conn
+        hub_conn.cursor.return_value.__enter__.return_value = hub_cur
+        seen = []
+        real_lock = outbox._locked_outbox
+
+        def recording_lock():
+            seen.append("locked")
+            return real_lock()
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(Path(td) / "outbox")}), \
+                mock.patch("khipu.db.connect", return_value=hub_conn), \
+                mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": True}), \
+                mock.patch("khipu.outbox._locked_outbox", side_effect=recording_lock):
+            forget.forget_everywhere(7, memory_root=Path(td))
+        self.assertEqual(seen, ["locked"])
+
+    def test_pending_outbox_session_reports_incomplete_and_leaves_file_untouched(self):
+        hub_cur = _Cur(("2026-10-10T00:00:00Z", "Edited hub summary", "codex:session"))
+        hub_conn = mock.MagicMock()
+        hub_conn.__enter__.return_value = hub_conn
+        hub_conn.cursor.return_value.__enter__.return_value = hub_cur
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(Path(td) / "outbox")}), \
+                mock.patch("khipu.db.connect", return_value=hub_conn), \
+                mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": True}):
+            queued = outbox.enqueue({"ts": "2026-10-10T00:01:00Z", "summary": "Original capture",
+                                     "session_id": "codex:session"})
+            before = {path: path.read_bytes() for path in queued.parent.iterdir()}
+            result = forget.forget_everywhere(7, memory_root=Path(td))
+            self.assertEqual({path: path.read_bytes() for path in queued.parent.iterdir()}, before)
+        self.assertFalse(result["complete"])
+        self.assertFalse(result["ok"])
+        self.assertIn("outbox", result["partial"])
+        self.assertEqual(result["remaining"], ["outbox: not cleaned (capture identity needed)"])
+        self.assertEqual(result["outbox"]["removed"], 0)
+
+    def test_dead_outbox_session_reports_incomplete_and_leaves_file_untouched(self):
+        hub_cur = _Cur(("2026-10-10T00:00:00Z", "Forget this", "codex:session"))
+        hub_conn = mock.MagicMock()
+        hub_conn.__enter__.return_value = hub_conn
+        hub_conn.cursor.return_value.__enter__.return_value = hub_cur
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(Path(td) / "outbox")}), \
+                mock.patch("khipu.db.connect", return_value=hub_conn), \
+                mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": True}):
+            dead = outbox.dead_dir()
+            dead.mkdir(parents=True)
+            path = dead / "capture.json"
+            path.write_text(json.dumps({"payload": {"session_id": "codex:session"}}))
+            before = path.read_bytes()
+            result = forget.forget_everywhere(7, memory_root=Path(td))
+            self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["remaining"], ["outbox: not cleaned (capture identity needed)"])
+
+    def test_other_outbox_session_does_not_withhold_completion(self):
+        hub_cur = _Cur(("2026-10-10T00:00:00Z", "Same summary", "codex:session"))
+        hub_conn = mock.MagicMock()
+        hub_conn.__enter__.return_value = hub_conn
+        hub_conn.cursor.return_value.__enter__.return_value = hub_cur
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(Path(td) / "outbox")}), \
+                mock.patch("khipu.db.connect", return_value=hub_conn), \
+                mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": True}):
+            path = outbox.enqueue({"ts": "2026-10-10T00:00:00Z", "summary": "Same summary",
+                                  "session_id": "codex:other"})
+            before = path.read_bytes()
+            result = forget.forget_everywhere(7, memory_root=Path(td))
+            self.assertEqual(path.read_bytes(), before)
+        self.assertTrue(result["complete"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["remaining"], [])
+
     def test_touches_the_local_snapshot_too(self):
         ts = datetime(2026, 9, 5, 12, 20, 17, tzinfo=timezone.utc)
         hub_cur = _Cur((ts, "Shipped 0.4.0", "claude_code:abc"))
@@ -129,7 +246,7 @@ class ForgetEverywhereTest(unittest.TestCase):
                          side_effect=RuntimeError("boom")), \
              mock.patch("khipu.config.path_setting", side_effect=Exception("no config")):
             out = forget.forget_everywhere(11617)
-        self.assertTrue(out["ok"])
+        self.assertFalse(out["ok"])
         self.assertFalse(out["snapshot"]["ok"])
 
     def test_unknown_episode_never_reaches_the_snapshot(self):
@@ -157,7 +274,7 @@ class LegacyFileTest(unittest.TestCase):
             out = forget.forget_in_legacy_file(root, "2026-09-05T12:20:17+00:00", md5)
             self.assertEqual(out["removed"], 1)
             self.assertTrue(Path(out["backup"]).is_file())
-            self.assertIn("forget me", Path(out["backup"]).read_text())
+            self.assertNotIn("forget me", Path(out["backup"]).read_text())
             left = (root / "episodes.jsonl").read_text()
             self.assertIn("keep me", left)
             self.assertNotIn("forget me", left)

@@ -244,7 +244,7 @@ class QueryBudgetTest(_Base):
                         timeout=embed.QUERY_EMBED_TIMEOUT_S, input_type="query",
                     )
                 self.assertEqual(len(t.calls), embed.QUERY_EMBED_RETRIES + 1)
-                self.assertTrue(all(c[3] == embed.QUERY_EMBED_TIMEOUT_S for c in t.calls))
+                self.assertTrue(all(0 < c[3] <= embed.QUERY_EMBED_TIMEOUT_S for c in t.calls))
 
     def test_embed_one_forwards_input_type_only_when_given(self) -> None:
         with mock.patch.object(embed, "embed_batch", return_value=[[1.0]]) as m:
@@ -402,14 +402,21 @@ class MemorySpaceAnyDimTest(_Base):
             def commit(self):
                 pass
 
-        cov = {"episodes": {"missing": 0}, "topics": {"missing": 0}}
+        cov = {
+            "missing": 0,
+            "stale": 0,
+            "episodes": {"missing": 0},
+            "topics": {"missing": 0},
+        }
+        coverage = mock.patch.object(embed, "coverage", return_value=cov)
         with mock.patch("khipu.db.connect", return_value=_Conn()), \
-             mock.patch.object(embed, "coverage", return_value=cov), \
+             coverage as coverage_mock, \
              mock.patch.object(
                  embed._profiles, "ensure_profile_index",
                  side_effect=lambda cur, p, t, dim=None, quiet=False: order.append(f"index:{t}:{dim}:{quiet}")):
             out = embed.activate(VOYAGE.id)
         self.assertEqual(order, ["index:memory_embeddings:1024:True", "flip"])
+        coverage_mock.assert_called_once_with(profile=VOYAGE.id, detail=True)
         self.assertTrue(out["ok"])
 
 

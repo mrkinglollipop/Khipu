@@ -1,22 +1,13 @@
 # --bypass-harness (sonnet lane) — authored directly by the dispatched
 # on-sub Sonnet build agent for this phase (brief: "do not delegate to other
 # agents"); there is no further agent to route this to.
-"""Real-SQL integration tests against an isolated, throwaway PostgreSQL 16
-(Phase 2, session A addendum). These run ONLY when ``KHIPU_SCRATCH_DSN`` is
-set — every other test in this suite is a fake-cursor unit test with no
-database and no network; this file is the one place that talks to a real
-Postgres, and it is gated hard so it can never accidentally reach anything
-but the throwaway scratch database:
+"""Real-SQL integration tests against a separately provisioned disposable database.
 
-  cd packages/cli && S=$(mktemp -d) && KHIPU_SCRATCH_DSN='postgresql://khipu_scratch@/khipu_scratch?host=<socket dir>&port=54329' \\
-      PYTHONPYCACHEPREFIX="$S/pyc" PYTHONPATH="$PWD:$PWD/../../.python_libs" \\
-      python3.11 -m pytest -q -p no:cacheprovider tests/test_pg_scratch.py
-
-The scratch database holds Khipu's relational schema through migration
-0023 (no pgvector, no property graph; ``memory_embeddings`` is a stand-in
-with a real[] column) — migration 0024 (this phase's decisions evidence/
-lifecycle columns + ``decision_links``) is applied here, once, idempotently,
-before every test. Every test cleans up the rows it creates.
+Require KHIPU_LIVE_TESTS=1, a 32-character lowercase hexadecimal
+KHIPU_SCRATCH_NONCE, and a loopback/temporary-socket KHIPU_SCRATCH_DSN whose
+database is named khipu_scratch_<nonce>. Provision public.khipu_test_owner
+with one text column, nonce, containing exactly the matching nonce row.
+The shared guard validates that sentinel before any migration or deletion.
 """
 from __future__ import annotations
 
@@ -30,29 +21,18 @@ from unittest import mock
 import pytest
 
 from khipu import forget
+from tests import connect_scratch, validate_scratch_dsn
 
 SCRATCH_DSN = os.environ.get("KHIPU_SCRATCH_DSN")
 
 
-def _scratch_dbname(dsn: str) -> str:
-    from psycopg.conninfo import conninfo_to_dict
 
-    return str((conninfo_to_dict(dsn) or {}).get("dbname") or "")
-
-
-if SCRATCH_DSN:
-    # Fail LOUDLY (a collection error, not a quiet skip) if this ever points
-    # anywhere but a database whose name says "scratch" — this file applies
-    # a migration and writes/deletes real rows.
-    _dbname = _scratch_dbname(SCRATCH_DSN)
-    assert "scratch" in _dbname.lower(), (
-        f"refusing to run tests/test_pg_scratch.py against database {_dbname!r} — "
-        "KHIPU_SCRATCH_DSN must name a database containing 'scratch'"
-    )
+if SCRATCH_DSN and os.environ.get("KHIPU_LIVE_TESTS") == "1":
+    validate_scratch_dsn(SCRATCH_DSN)
 
 pytestmark = pytest.mark.skipif(
-    not SCRATCH_DSN,
-    reason="KHIPU_SCRATCH_DSN not set — this file only runs against the isolated scratch database",
+    not SCRATCH_DSN or os.environ.get("KHIPU_LIVE_TESTS") != "1",
+    reason="requires KHIPU_LIVE_TESTS=1 and a provisioned nonce-scoped KHIPU_SCRATCH_DSN",
 )
 
 
@@ -60,9 +40,7 @@ def _direct_connect():
     """A connection made with EXACTLY the given DSN — never khipu.db's own
     Keychain/config-file resolution, so there is no path by which this
     could silently reach a different database."""
-    import psycopg
-
-    return psycopg.connect(SCRATCH_DSN)
+    return connect_scratch(SCRATCH_DSN)
 
 
 def _migration_0024_sql() -> str:

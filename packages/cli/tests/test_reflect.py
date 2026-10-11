@@ -117,19 +117,19 @@ class GroundingTest(unittest.TestCase):
         ]))
         self.assertFalse(out["abstained"])
         self.assertEqual(out["claims"], [{"text": "Pagination is cursor based.", "sources": ["episode:1"]}])
-        self.assertEqual(out["answer"], "- Pagination is cursor based.")
+        self.assertEqual(out["answer"], "- Pagination is cursor based. [episode:1]")
         self.assertNotIn("MODEL WORDING", out["answer"])
         self.assertEqual([(s["kind"], s["id"]) for s in out["sources"]], [("episode", 1)])
 
-    def test_the_model_answer_is_kept_when_every_claim_survives(self):
+    def test_the_answer_is_rendered_from_claims_when_every_claim_survives(self):
         out, _ = _run(_hub(), _answer([_claim("Cursor based.", "episode:1"),
                                        _claim("Behind a flag.", "episode:2")]))
-        self.assertEqual(out["answer"], "MODEL WORDING")
+        self.assertEqual(out["answer"], "- Cursor based. [episode:1]\n- Behind a flag. [episode:2]")
         self.assertEqual({s["id"] for s in out["sources"]}, {1, 2})
 
     def test_answer_text_and_cited_ids_are_separate_fields(self):
         out, _ = _run(_hub(), _answer([_claim("Cursor based.", "episode:1")]))
-        self.assertNotIn("episode:1", out["answer"])
+        self.assertEqual(out["answer"], "- Cursor based. [episode:1]")
         self.assertEqual(out["claims"][0]["sources"], ["episode:1"])
         self.assertEqual(set(out["sources"][0]), {"kind", "id", "date", "validity"})
         self.assertEqual(out["sources"][0]["date"], "2026-09-01")
@@ -290,8 +290,12 @@ class BriefUseTest(unittest.TestCase):
         return prompts[0]
 
     def test_a_current_brief_is_used(self):
+        from khipu import briefs
+
         hub = self._topic_hub()
-        hub.seed_brief("alpha", body="CURRENT-BRIEF body.", ids=(1,))
+        with hub.cursor() as cur:
+            fingerprint = briefs._gather(cur, "alpha")["hash"]
+        hub.seed_brief("alpha", body="CURRENT-BRIEF body.", ids=(1,), source_hash=fingerprint)
         prompt = self._sent(hub, {"KHIPU_FEATURE_BRIEFS": "1"})
         self.assertIn("CURRENT-BRIEF", prompt)
         self.assertNotIn("PAGE-TEXT", prompt)

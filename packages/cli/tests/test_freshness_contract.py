@@ -108,7 +108,8 @@ class TopicsCatchupContractTest(unittest.TestCase):
                 elif "FROM commitments c WHERE c.status = 'open'" in s:
                     self._result = []
                 elif "FROM topics t WHERE t.deleted_at IS NULL" in s:
-                    self._result = [("note:fresh", "Fresh", "body text")]
+                    self._result = [("note:fresh", "Fresh", "body text",
+                                     {"slug": "note:fresh", "title": "Fresh", "body": "body text"})]
                 elif s.startswith("INSERT INTO memory_embeddings"):
                     self.inserts.append(params)
                 else:

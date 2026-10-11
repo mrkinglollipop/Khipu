@@ -81,19 +81,34 @@ PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
 [ -x "$PY" ] || PY="python3"
 STDIN_JSON=$(cat 2>/dev/null)
 export KHIPU_HOOK_STDIN="$STDIN_JSON"
-# Queue-only mode (KHIPU_CAPTURE_QUEUE_ONLY=1): run step 1 and nothing else.
-# Codex caps SessionEnd hooks at 3 s (default 1 s), which is enough to read the
-# transcript tail and write the job file, not to extract, mirror or embed. The
-# next Stop of any harness drains what this leaves behind.
+# Queue-only mode leaves delivery to the next draining Stop or scheduled job.
 "$PY" - "$MEM" "${KHIPU_HARNESS:-}" <<'PY' 2>>"${HOME}/Library/Logs/khipu/stop-hook.log" || true
 import json
 import os
+import signal
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 QUEUE_ONLY = os.environ.get("KHIPU_CAPTURE_QUEUE_ONLY") == "1"
 tag = f" harness={sys.argv[2]}" if len(sys.argv) > 2 and sys.argv[2] else ""
+_default_budget = 3.0 if len(sys.argv) > 2 and sys.argv[2] == "codex" else 20.0
+try:
+    _enqueue_budget = min(_default_budget, max(0.05, float(
+        os.environ.get("KHIPU_CAPTURE_ENQUEUE_TIMEOUT_S") or _default_budget
+    )))
+except ValueError:
+    _enqueue_budget = _default_budget
+
+
+class _EnqueueDeadline(BaseException):
+    pass
+
+
+def _deadline(_signum, _frame):
+    # BaseException deliberately bypasses hook_main's fail-open Exception
+    # handler, so its heartbeat cleanup cannot extend the whole-phase budget.
+    raise _EnqueueDeadline(f"capture enqueue exceeded {_enqueue_budget:g}s")
 # Every line this hook writes is stamped (ISO-8601 UTC) and carries the session
 # id. Without both, a quiet session in stop-hook.log could not be attributed to
 # a run at all — you could not tell "the hook never fired for session X" from
@@ -118,8 +133,14 @@ def _queued(q):
 try:
     # 1. Native capture for THIS session (harness inferred from the payload
     #    unless the pack pinned KHIPU_HARNESS). Never raises; always heartbeats.
-    from khipu.session_capture import hook_main
-    r = hook_main(os.environ.get("KHIPU_HOOK_STDIN", ""), sys.argv[2] or None)
+    _previous_alarm = signal.signal(signal.SIGALRM, _deadline)
+    signal.setitimer(signal.ITIMER_REAL, _enqueue_budget, 0.01)
+    try:
+        from khipu.session_capture import hook_main
+        r = hook_main(os.environ.get("KHIPU_HOOK_STDIN", ""), sys.argv[2] or None)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, _previous_alarm)
     if r.get("skipped"):
         # T3's thread-title helper session: nothing captured, nothing logged,
         # nothing drained (the next real session's Stop does that).
@@ -128,6 +149,8 @@ try:
     _say(f"capture {r.get('harness')} {r.get('event')} due={r.get('due')} "
          f"{r.get('reason', '')}{_queued(r.get('queued'))}"
          f"{' ERROR ' + r['error'] if r.get('error') else ''}")
+except _EnqueueDeadline as e:
+    _say(f"capture skipped: {type(e).__name__}: {e}")
 except Exception as e:  # noqa: BLE001 — fail-open, always
     _say(f"capture skipped: {type(e).__name__}: {e}")
 if QUEUE_ONLY:

@@ -996,7 +996,9 @@ function renderHealthRow(
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("home");
+  // Configuration presence lets setup proceed; it does not prove the database answers.
   const [dsnOk, setDsnOk] = useState<boolean | null>(null);
+  const [dbReachable, setDbReachable] = useState<boolean | null>(null);
   const [loading, setLoading] = useState<Partial<Record<CacheTab, boolean>>>(
     {},
   );
@@ -1017,6 +1019,20 @@ export default function App() {
   // Doctor reads can overlap (a forced read after an install while a TTL read
   // is still running); only the newest request may write its answer.
   const doctorSeq = useRef(0);
+  const rightNowSeq = useRef(0);
+  const dsnSeq = useRef(0);
+  const activitySeq = useRef(0);
+  const activityDetailSeq = useRef(0);
+  const searchSeq = useRef(0);
+  const graphSeq = useRef(0);
+  const recallDetailSeq = useRef(0);
+  const revisionsSeq = useRef(0);
+  const revisionsCache = useRef<Record<string, {
+    at: number;
+    text: string;
+    conflicts: ConflictSummary | null;
+    recent: RecentRevision[];
+  }>>({});
   const feedbackButtonRef = useRef<HTMLButtonElement>(null);
 
   const [statusText, setStatusText] = useState("…");
@@ -1037,6 +1053,8 @@ export default function App() {
     unknown
   > | null>(null);
   const [doctorOk, setDoctorOk] = useState<boolean | null>(null);
+  const [doctorReadError, setDoctorReadError] = useState<string | null>(null);
+  const [doctorLastOkAt, setDoctorLastOkAt] = useState<number | null>(null);
   // Plain-language failures derived from the doctor report: title, the cause
   // in a sentence, and at most one fix action. Home's attention callouts and
   // the health report's red rows (`healthRows.tsx`) both read this so the
@@ -1052,15 +1070,20 @@ export default function App() {
   // so a Capture now click can refresh just this card without waiting on
   // the full doctor pass (DB round trips, backup checks, etc.).
   const [rightNow, setRightNow] = useState<LivenessPayload | null>(null);
+  const [rightNowReadError, setRightNowReadError] = useState<string | null>(null);
   const [captureNowBusy, setCaptureNowBusy] = useState(false);
   const [captureNowMsg, setCaptureNowMsg] = useState<string | null>(null);
   // The last recorded end-to-end recall probe. Harnesses reads it for its
   // "Verified …" line; nothing about that line is app-local state.
   const [recallProbe, setRecallProbe] = useState<RecallProbeStatus | null>(null);
-  const [embedCoverage, setEmbedCoverage] = useState<Record<
-    string,
-    { total?: number; embedded?: number; missing?: number; pct?: number }
-  > | null>(null);
+  const [embedCoverage, setEmbedCoverage] = useState<(
+    Record<string, unknown> & {
+      missing?: number;
+      stale?: number;
+      pct?: number;
+      active_profile?: unknown;
+    }
+  ) | null>(null);
   // `coverage()` reports the active index profile alongside the per-kind
   // rows; Settings names it rather than saying "the index" and leaving the
   // person to guess which one.
@@ -1118,10 +1141,12 @@ export default function App() {
   );
   const [activityDetailLoading, setActivityDetailLoading] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
+  const [editTarget, setEditTarget] = useState<number | null>(null);
   const [editText, setEditText] = useState("");
   const [editSaving, setEditSaving] = useState(false);
   // One confirm for both screens' Forget button, through the shared Dialog.
   const [forgetTarget, setForgetTarget] = useState<number | null>(null);
+  const [forgetError, setForgetError] = useState<string | null>(null);
   const [opsEvents, setOpsEvents] = useState<
     Array<{ kind?: string; status?: string; created_at?: string }>
   >([]);
@@ -1181,6 +1206,7 @@ export default function App() {
   // that THIS search is in flight so it can show a loading state instead of
   // leaving the "type a query" empty state on screen (audit 2026-09-04).
   const [searchBusy, setSearchBusy] = useState(false);
+  const [graphBusy, setGraphBusy] = useState(false);
   // Recall holds Search and the graph walk; the walk is a sub-view of a result,
   // not a peer destination (audit IA).
   const [recallView, setRecallView] = useState<"search" | "graph">("search");
@@ -1239,12 +1265,26 @@ export default function App() {
   };
 
   const refreshDsn = useCallback(async (force = false) => {
+    const seq = ++dsnSeq.current;
     try {
-      const ok = await invoke<boolean>("dsn_configured", { force });
-      setDsnOk(ok);
-      if (!ok) setTab("first-run");
+      const configured = await invoke<boolean>("dsn_configured", { force });
+      if (seq !== dsnSeq.current) return;
+      setDsnOk(configured);
+      if (!configured) {
+        setDbReachable(false);
+        setTab("first-run");
+        return;
+      }
+      const status = parseJson(await invoke<string>("khipu_db_status")) as
+        | { ok?: unknown }
+        | null;
+      if (seq !== dsnSeq.current) return;
+      setDbReachable(
+        status?.ok === true ? true : status?.ok === false ? false : null,
+      );
     } catch (e) {
-      setDsnOk(false);
+      if (seq !== dsnSeq.current) return;
+      setDbReachable(false);
       setError(String(e));
     }
   }, []);
@@ -1421,11 +1461,14 @@ export default function App() {
       ) {
         // Keep last-good doctorOk; do not stamp fetchedAt so retry is not TTL-blocked.
         setError("Unexpected response from hub");
+        setDoctorReadError("Unexpected response from hub");
         return "Unexpected response from hub";
       }
       setDoctorText(prettyJson(raw));
       setDoctorParsed(parsed as Record<string, unknown>);
       setDoctorOk(typeof parsed.ok === "boolean" ? parsed.ok : null);
+      setDoctorReadError(null);
+      setDoctorLastOkAt(Date.now());
       const { items } = buildAttention(parsed as Record<string, unknown>);
       const doctorT3 = (parsed as { t3?: T3Health }).t3 ?? null;
       const t3Warnings = doctorT3?.warnings ?? [];
@@ -1446,10 +1489,14 @@ export default function App() {
         (parsed as { recall_probe?: RecallProbeStatus }).recall_probe ?? null,
       );
       const cov = (parsed as {
-        embed_coverage?: Record<
-          string,
-          { total?: number; embedded?: number; missing?: number; pct?: number }
-        > & { active_profile?: unknown; budget?: unknown; query_cache?: unknown };
+        embed_coverage?: Record<string, unknown> & {
+          missing?: number;
+          stale?: number;
+          pct?: number;
+          active_profile?: unknown;
+          budget?: unknown;
+          query_cache?: unknown;
+        };
       }).embed_coverage;
       setEmbedCoverage(cov ?? null);
       setEmbedActiveProfile(
@@ -1509,6 +1556,7 @@ export default function App() {
       // Preserve last-good doctorOk/text; toast only.
       if (seq !== doctorSeq.current) return null;
       setError(String(e));
+      setDoctorReadError(String(e));
       return String(e);
     } finally {
       if (seq === doctorSeq.current) markLoading("doctor", false);
@@ -1521,16 +1569,26 @@ export default function App() {
    *  just this card without paying for the full doctor pass. */
   const loadRightNow = useCallback(async (force = false) => {
     if (!needsFetch("rightNow", force)) return;
+    const seq = ++rightNowSeq.current;
     markLoading("rightNow", true);
     try {
       const raw = await invoke<string>("liveness_now");
       const parsed = parseJson(raw) as LivenessPayload | null;
-      setRightNow(parsed && typeof parsed === "object" ? parsed : null);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !parsed.harnesses || typeof parsed.harnesses !== "object" || Array.isArray(parsed.harnesses)) {
+        if (seq !== rightNowSeq.current) return;
+        setRightNowReadError("Unexpected response from hub");
+        return;
+      }
+      if (seq !== rightNowSeq.current) return;
+      setRightNow(parsed);
+      setRightNowReadError(null);
       fetchedAt.current.rightNow = Date.now();
     } catch (e) {
+      if (seq !== rightNowSeq.current) return;
       setError(String(e));
+      setRightNowReadError(String(e));
     } finally {
-      markLoading("rightNow", false);
+      if (seq === rightNowSeq.current) markLoading("rightNow", false);
     }
   }, []);
 
@@ -1663,13 +1721,16 @@ export default function App() {
 
   const loadActivity = useCallback(async (force = false, limit?: number) => {
     if (limit != null) activityLimitRef.current = limit;
+    const requestedLimit = activityLimitRef.current;
     if (!needsFetch("activity", force)) return;
+    const seq = ++activitySeq.current;
+    const latest = () => activitySeq.current === seq;
     markLoading("activity", true);
     setError(null);
     try {
       const raw = await runKhipu([
         "activity",
-        `--limit=${activityLimitRef.current}`,
+        `--limit=${requestedLimit}`,
       ]);
       const parsed = parseJson(raw) as {
         episode_count?: number;
@@ -1689,6 +1750,7 @@ export default function App() {
         }>;
         secrets?: unknown;
       } | null;
+      if (!latest()) return;
       if (
         parsed === null ||
         typeof parsed !== "object" ||
@@ -1716,16 +1778,27 @@ export default function App() {
       markLoaded("activity", true);
     } catch (e) {
       // Preserve last-good activity lists/KPIs; toast only.
+      if (!latest()) return;
       setError(String(e));
       markLoaded("activity", false);
     } finally {
-      markLoading("activity", false);
+      if (latest()) markLoading("activity", false);
     }
   }, []);
 
   const loadRevisions = useCallback(
     async (force = false) => {
-      if (!needsFetch("revisions", force) && !revSlug.trim()) return;
+      const slug = revSlug.trim();
+      const cached = revisionsCache.current[slug];
+      if (!force && cached && Date.now() - cached.at <= CACHE_TTL_MS) {
+        ++revisionsSeq.current;
+        setRevisionsText(cached.text);
+        setRevisionsConflicts(cached.conflicts);
+        setRevRecent(cached.recent);
+        markLoading("revisions", false);
+        return;
+      }
+      const seq = ++revisionsSeq.current;
       markLoading("revisions", true);
       setError(null);
       try {
@@ -1735,8 +1808,8 @@ export default function App() {
         // 1.3 s on this machine, which is the right trade for a pane that only
         // runs when someone opens it.
         const args = ["revisions", "--limit", "40"];
-        if (revSlug.trim()) {
-          args.push("--slug", revSlug.trim());
+        if (slug) {
+          args.push("--slug", slug);
         }
         const raw = await runKhipu(args);
         const parsed = parseJson(raw) as
@@ -1748,23 +1821,27 @@ export default function App() {
           Array.isArray(parsed)
         ) {
           // Keep last-good conflicts; do not stamp fetchedAt so retry is not TTL-blocked.
+          if (seq !== revisionsSeq.current) return;
           setError("Unexpected response from hub");
           return;
         }
-        setRevisionsText(prettyJson(raw));
-        setRevisionsConflicts(parsed.conflicts ?? null);
+        if (seq !== revisionsSeq.current) return;
+        const text = prettyJson(raw);
+        const conflicts = parsed.conflicts ?? null;
         // The slug filter narrows `recent`, and nothing rendered `recent` — so
         // typing a slug and pressing List changed only data the pane never
         // showed, and the control looked broken (audit 2026-08-17).
-        setRevRecent(
-          ((parsed as { recent?: RecentRevision[] }).recent ?? []).slice(0, 40),
-        );
-        fetchedAt.current.revisions = Date.now();
+        const recent = ((parsed as { recent?: RecentRevision[] }).recent ?? []).slice(0, 40);
+        revisionsCache.current[slug] = { at: Date.now(), text, conflicts, recent };
+        setRevisionsText(text);
+        setRevisionsConflicts(conflicts);
+        setRevRecent(recent);
       } catch (e) {
         // Preserve last-good revisions conflicts/text; toast only.
+        if (seq !== revisionsSeq.current) return;
         setError(String(e));
       } finally {
-        markLoading("revisions", false);
+        if (seq === revisionsSeq.current) markLoading("revisions", false);
       }
     },
     [revSlug],
@@ -1785,18 +1862,21 @@ export default function App() {
 
   const selectEpisode = useCallback(
     async (id: number) => {
+      const seq = ++activityDetailSeq.current;
       setActivitySelected(id);
       setActivityDetail(null);
       setActivityDetailLoading(true);
       setError(null);
       try {
         const detail = await loadEpisodeDetail(id);
+        if (seq !== activityDetailSeq.current) return;
         setActivityDetail(detail);
         setActivityText(prettyJson(JSON.stringify(detail ?? {}, null, 2)));
       } catch (e) {
+        if (seq !== activityDetailSeq.current) return;
         setError(String(e));
       } finally {
-        setActivityDetailLoading(false);
+        if (seq === activityDetailSeq.current) setActivityDetailLoading(false);
       }
     },
     [loadEpisodeDetail],
@@ -1807,9 +1887,11 @@ export default function App() {
    *  (no key, no profile) it says so, and so do we, rather than implying the
    *  correction is searchable when it is not. */
   const saveSummary = useCallback(async () => {
-    const id = activitySelected;
+    const id = editTarget;
     const text = editText.trim();
     if (id == null || !text) return;
+    const selectedAtSave = activitySelected;
+    const detailSeqAtSave = activityDetailSeq.current;
     setEditSaving(true);
     setError(null);
     try {
@@ -1827,7 +1909,16 @@ export default function App() {
         return;
       }
       setEditOpen(false);
-      setActivityDetail(await loadEpisodeDetail(id));
+      setEditTarget(null);
+      if (
+        selectedAtSave === id &&
+        detailSeqAtSave === activityDetailSeq.current
+      ) {
+        const detail = await loadEpisodeDetail(id);
+        if (detailSeqAtSave === activityDetailSeq.current) {
+          setActivityDetail(detail);
+        }
+      }
       await loadActivity(true);
       if (parsed && parsed.reembedded === false) {
         setError(
@@ -1839,7 +1930,7 @@ export default function App() {
     } finally {
       setEditSaving(false);
     }
-  }, [activitySelected, editText, loadEpisodeDetail, loadActivity]);
+  }, [activitySelected, editTarget, editText, loadEpisodeDetail, loadActivity]);
 
   /** `khipu episode forget ID` — soft-deletes the episode and drops its
    * vectors. The only destructive write either pane makes, so it goes behind
@@ -1849,27 +1940,96 @@ export default function App() {
     if (id == null) return;
     setActionBusy(true);
     setError(null);
+    setForgetError(null);
     try {
       const raw = await runKhipu(["episode", "forget", String(id)]);
+      const parsed = parseJson(raw) as {
+        ok?: unknown;
+        soft_deleted?: unknown;
+        partial?: unknown;
+        error?: unknown;
+        snapshot?: { ok?: unknown; error?: unknown; reason?: unknown } | null;
+        legacy_file?: { ok?: unknown; error?: unknown; reason?: unknown } | null;
+      } | null;
       setActivityText(prettyJson(raw));
       setActivityRawKey((k) => k + 1);
+      if (!parsed || parsed.soft_deleted !== true) {
+        setForgetError(
+          typeof parsed?.error === "string"
+            ? parsed.error
+            : `Could not verify that episode #${id} was removed.`,
+        );
+        return;
+      }
+      let localCopyFailure: string | null = null;
+      const remainingStores = Array.isArray(parsed.partial)
+        ? parsed.partial.filter((store): store is string => typeof store === "string")
+        : [];
+      if (!parsed.snapshot || parsed.snapshot.ok !== true) {
+        localCopyFailure =
+          typeof parsed.snapshot?.error === "string"
+            ? parsed.snapshot.error
+            : typeof parsed.snapshot?.reason === "string"
+              ? parsed.snapshot.reason
+              : "missing success verdict";
+      } else if (
+        parsed.legacy_file?.ok === false ||
+        (typeof parsed.legacy_file?.reason === "string" &&
+          parsed.legacy_file.reason.startsWith("unreadable:"))
+      ) {
+        localCopyFailure =
+          typeof parsed.legacy_file.error === "string"
+            ? parsed.legacy_file.error
+            : typeof parsed.legacy_file.reason === "string"
+              ? parsed.legacy_file.reason
+              : "missing success verdict";
+      }
+      if (remainingStores.length > 0) {
+        localCopyFailure = `remaining stores: ${remainingStores.join(", ")}`;
+      }
       setForgetTarget(null);
+      ++activitySeq.current;
+      ++activityDetailSeq.current;
+      ++searchSeq.current;
+      ++recallDetailSeq.current;
+      setActivityDetailLoading(false);
+      setSearchBusy(false);
+      setRecallDetailLoading(false);
+      setActivityList((rows) => rows.filter((row) => row.id !== id));
+      setSearchText((previous) => {
+        const cached = parseJson(previous);
+        const keep = (row: unknown) =>
+          !row || typeof row !== "object" || (row as SearchResult).kind !== "episode" || String((row as SearchResult).id) !== String(id);
+        if (Array.isArray(cached)) return prettyJson(JSON.stringify(cached.filter(keep)));
+        if (cached && typeof cached === "object" && Array.isArray((cached as { results?: unknown }).results)) {
+          return prettyJson(JSON.stringify({
+            ...(cached as Record<string, unknown>),
+            results: ((cached as { results: unknown[] }).results).filter(keep),
+          }));
+        }
+        return previous;
+      });
       if (activitySelected === id) {
         setActivitySelected(null);
         setActivityDetail(null);
       }
-      if (recallDetail?.id === id) {
+      if (recallDetail?.id === id || recallSelected === `episode:${id}`) {
         setRecallSelected(null);
         setRecallDetail(null);
         setRecallNeighbors([]);
       }
       await loadActivity(true);
+      if (localCopyFailure) {
+        setError(
+          `Episode #${id} was removed from database; local copy could not be removed: ${localCopyFailure}`,
+        );
+      }
     } catch (e) {
       setError(String(e));
     } finally {
       setActionBusy(false);
     }
-  }, [forgetTarget, activitySelected, recallDetail, loadActivity]);
+  }, [forgetTarget, activitySelected, recallDetail, recallSelected, loadActivity]);
 
   const showRevision = useCallback(async (explicitId?: string) => {
     const id = Number(explicitId ?? revShowId);
@@ -1904,8 +2064,14 @@ export default function App() {
       const since = (override?.since ?? searchSince).trim();
       const kind = override?.kind ?? searchKind;
       const harness = (override?.harness ?? searchHarness).trim();
-      if (!q && !via) return;
+      const seq = ++searchSeq.current;
+      const latest = () => searchSeq.current === seq;
+      if (!q && !via) {
+        setSearchBusy(false);
+        return;
+      }
       if (!q) {
+        setSearchBusy(false);
         setSearchText("");
         setSearchErr(null);
         setRecallSelected(null);
@@ -1913,7 +2079,6 @@ export default function App() {
         setRecallNeighbors([]);
         return;
       }
-      setActionBusy(true);
       setSearchBusy(true);
       setError(null);
       setSearchErr(null);
@@ -1934,16 +2099,29 @@ export default function App() {
         if (via) args.push(`--via=${via}`);
         args.push("--", q);
         const raw = await runKhipu(args);
+        if (!latest()) return;
+        const parsed = parseJson(raw) as { ok?: unknown; error?: unknown; results?: unknown } | null;
+        if (
+          !parsed ||
+          typeof parsed !== "object" ||
+          Array.isArray(parsed) ||
+          parsed.ok === false ||
+          !Array.isArray(parsed.results)
+        ) {
+          throw new Error(
+            typeof parsed?.error === "string" ? parsed.error : "Invalid search response.",
+          );
+        }
         setSearchText(prettyJson(raw));
         setSearchElapsedMs(Date.now() - startedAt);
       } catch (e) {
         // Keep the query and any prior results — only the new attempt failed —
         // and surface it inline (below) so it survives the toast timing out.
+        if (!latest()) return;
         setError(String(e));
         setSearchErr(String(e));
       } finally {
-        setActionBusy(false);
-        setSearchBusy(false);
+        if (latest()) setSearchBusy(false);
       }
     },
     [query, searchMode, searchProject, searchSince, searchKind, searchHarness, searchVia],
@@ -1955,7 +2133,9 @@ export default function App() {
   const doGraph = useCallback(async (explicitId?: string) => {
     const target = (explicitId ?? nodeId).trim();
     if (!target) return;
-    setActionBusy(true);
+    const seq = ++graphSeq.current;
+    const latest = () => graphSeq.current === seq;
+    setGraphBusy(true);
     setError(null);
     try {
       const raw = await runKhipu([
@@ -1967,12 +2147,14 @@ export default function App() {
         "--",
         target,
       ]);
+      if (!latest()) return;
       setGraphText(prettyJson(raw));
     } catch (e) {
+      if (!latest()) return;
       setError(String(e));
       setGraphText("");
     } finally {
-      setActionBusy(false);
+      if (latest()) setGraphBusy(false);
     }
   }, [nodeId, hops]);
 
@@ -1984,13 +2166,17 @@ export default function App() {
     async (r: SearchResult) => {
       const id = String(r.id ?? r.label ?? "");
       if (!id) return;
+      const seq = ++recallDetailSeq.current;
+      const latest = () => recallDetailSeq.current === seq;
       setRecallSelected(`${r.kind ?? "item"}:${id}`);
       setRecallDetail(null);
       setRecallNeighbors([]);
       setRecallDetailLoading(true);
       try {
         if (r.kind === "episode") {
-          setRecallDetail(await loadEpisodeDetail(Number(id)));
+          const detail = await loadEpisodeDetail(Number(id));
+          if (!latest()) return;
+          setRecallDetail(detail);
         }
         const raw = await runKhipu([
           "graph",
@@ -2001,11 +2187,13 @@ export default function App() {
           "--",
           id,
         ]);
+        if (!latest()) return;
         setRecallNeighbors(graphNeighborsFrom(parseJson(raw)).neighbors);
       } catch (e) {
+        if (!latest()) return;
         setError(String(e));
       } finally {
-        setRecallDetailLoading(false);
+        if (latest()) setRecallDetailLoading(false);
       }
     },
     [loadEpisodeDetail],
@@ -2024,16 +2212,40 @@ export default function App() {
     }
   }, []);
 
-  /** Activity → Recall: the episode id, matched as exact words. */
+  /** Activity → Recall: read this exact episode directly. */
   const openInRecall = useCallback(
-    (id: number) => {
+    async (id: number) => {
       setTab("recall");
       setRecallView("search");
-      setSearchMode("literal");
-      setQuery(String(id));
-      void doSearch({ query: String(id), mode: "literal" });
+      setSearchMode("hybrid");
+      setQuery("");
+      setSearchProject("");
+      setSearchSince("");
+      setSearchKind("");
+      setSearchHarness("");
+      setSearchVia("");
+      setSearchText("");
+      setSearchErr(null);
+      setSearchElapsedMs(null);
+      ++searchSeq.current;
+      setSearchBusy(false);
+      const seq = ++recallDetailSeq.current;
+      setRecallSelected(`episode:${id}`);
+      setRecallDetail(null);
+      setRecallNeighbors([]);
+      setRecallDetailLoading(true);
+      try {
+        const detail = await loadEpisodeDetail(id);
+        if (recallDetailSeq.current !== seq) return;
+        setRecallDetail(detail);
+      } catch (e) {
+        if (recallDetailSeq.current !== seq) return;
+        setError(String(e));
+      } finally {
+        if (recallDetailSeq.current === seq) setRecallDetailLoading(false);
+      }
     },
-    [doSearch],
+    [loadEpisodeDetail],
   );
 
   /** T3's card opens Recall with provenance, never a text guess based on the
@@ -2230,7 +2442,6 @@ export default function App() {
   const [moveOpen, setMoveOpen] = useState(false);
   const [moveTarget, setMoveTarget] = useState<"server" | "local">("server");
   const [moveDsn, setMoveDsn] = useState("");
-  const [moveRootCrt, setMoveRootCrt] = useState("");
   const [moveStep, setMoveStep] = useState<"target" | "copy" | "done">("target");
   const [movePreflight, setMovePreflight] = useState<SetupPipelineResult>(null);
   const [movePreflightPhase, setMovePreflightPhase] = useState<SetupPhase>("idle");
@@ -2241,12 +2452,13 @@ export default function App() {
   const [moveBusy, setMoveBusy] = useState(false);
   const [moveResult, setMoveResult] = useState<Record<string, unknown> | null>(null);
   const [moveError, setMoveError] = useState<string | null>(null);
+  const moveAutoDryRunTarget = useRef<"server" | "local" | null>(null);
 
   const resetMoveDialog = useCallback(() => {
     setMoveOpen(false);
     setMoveTarget("server");
     setMoveDsn("");
-    setMoveRootCrt("");
+    moveAutoDryRunTarget.current = null;
     setMoveStep("target");
     setMovePreflight(null);
     setMovePreflightPhase("idle");
@@ -2294,7 +2506,8 @@ export default function App() {
   }, [moveDsn]);
 
   useEffect(() => {
-    if (moveOpen && moveStep === "copy" && moveTarget === "server" && !moveDryRun && !moveDryRunBusy) {
+    if (moveOpen && moveStep === "copy" && moveTarget === "server" && !moveDryRun && !moveDryRunBusy && moveAutoDryRunTarget.current !== moveTarget) {
+      moveAutoDryRunTarget.current = moveTarget;
       void runMoveDryRun();
     }
   }, [moveOpen, moveStep, moveTarget, moveDryRun, moveDryRunBusy, runMoveDryRun]);
@@ -2724,7 +2937,7 @@ export default function App() {
         ipv4: typeof parsed.ipv4 === "string" ? parsed.ipv4 : undefined,
       });
       setSetupJoinMsg(
-        `Advertising nearby — on the new Mac: Join existing Khipu → PIN ${parsed.pin ?? "?"} → Find nearby Mac`,
+        `Nearby setup started — on the new Mac: Join existing Khipu → PIN ${parsed.pin ?? "?"} → Find nearby Mac. Connection has not been checked.`,
       );
     } catch (e) {
       setSetupJoinMsg(String(e));
@@ -2756,7 +2969,7 @@ export default function App() {
     setActionBusy(true);
     setPathsMsg(null);
     try {
-      const raw = await runKhipu(["import-local", `--source=${importSource.trim()}`]);
+      const raw = await runKhipu(["import-local", `--source=${importSource.trim()}`, "--replace"]);
       setPathsMsg(prettyJson(raw));
       await loadPaths();
     } catch (e) {
@@ -2814,6 +3027,24 @@ export default function App() {
     const d = (parsed as { degraded?: unknown }).degraded;
     return typeof d === "string" && d ? d : null;
   }, [searchText]);
+  const searchFallback = useMemo(() => {
+    const parsed = parseJson(searchText);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const data = parsed as {
+      stale?: unknown;
+      snapshot_refreshed_at?: unknown;
+      mode?: unknown;
+      filters_dropped?: unknown;
+    };
+    if (data.stale !== true) return null;
+    return {
+      refreshedAt: typeof data.snapshot_refreshed_at === "string" ? data.snapshot_refreshed_at : null,
+      mode: typeof data.mode === "string" ? data.mode : null,
+      filtersDropped: Array.isArray(data.filters_dropped)
+        ? data.filters_dropped.filter((item): item is string => typeof item === "string")
+        : [],
+    };
+  }, [searchText]);
 
   const graphData = useMemo(
     () => graphNeighborsFrom(parseJson(graphText)),
@@ -2867,11 +3098,21 @@ export default function App() {
 
   const harnessIds = liveness?.harnesses ? Object.keys(liveness.harnesses) : [];
   const harnessRed = liveness?.red ?? [];
+  const provenHarnesses = Object.values(liveness?.harnesses ?? {}).filter(
+    (h) => h.seen === true && h.ok === true,
+  ).length;
+  const livenessCollectionOk =
+    liveness?.ok === true &&
+    typeof (liveness as { error?: unknown } | null)?.error !== "string";
+  const allHarnessesProven =
+    livenessCollectionOk &&
+    harnessIds.length > 0 &&
+    provenHarnesses === harnessIds.length;
   const recordingValue = harnessIds.length
-    ? `${harnessIds.length - harnessRed.length} of ${harnessIds.length}`
+    ? `${provenHarnesses} of ${harnessIds.length}`
     : "—";
   const recordingSub = harnessIds.length
-    ? harnessIds.map(harnessLabel).join(" · ")
+    ? `${harnessIds.map(harnessLabel).join(" · ")}${provenHarnesses < harnessIds.length ? " · some not checked" : ""}`
     : undefined;
 
   // The rail's health line, and the plain-language replacement for "DSN ok".
@@ -2879,22 +3120,31 @@ export default function App() {
     (doctorParsed as { claude_homes?: ClaudeHomesReport } | null)?.claude_homes,
   );
   const t3Gap = t3HealthGap(t3Health);
-  const railHealth = railHealthLine(dsnOk, liveness, claudeHomes, t3Gap);
+  const railHealth = railHealthLine(dbReachable, liveness, claudeHomes, t3Gap);
 
   const coverage = (() => {
     if (!embedCoverage) return null;
+    if (typeof embedCoverage.pct === "number") {
+      return {
+        pct: embedCoverage.pct,
+        missing: typeof embedCoverage.missing === "number" ? embedCoverage.missing : 0,
+        stale: typeof embedCoverage.stale === "number" ? embedCoverage.stale : 0,
+        unit: "chunks" as const,
+      };
+    }
     let total = 0;
     let embedded = 0;
     let missing = 0;
     for (const v of Object.values(embedCoverage)) {
       if (!v || typeof v !== "object") continue;
-      if (typeof v.total !== "number") continue;
-      total += v.total;
-      embedded += v.embedded ?? 0;
-      missing += v.missing ?? 0;
+      const row = v as { total?: unknown; embedded?: unknown; missing?: unknown };
+      if (typeof row.total !== "number") continue;
+      total += row.total;
+      embedded += typeof row.embedded === "number" ? row.embedded : 0;
+      missing += typeof row.missing === "number" ? row.missing : 0;
     }
     if (total === 0) return null;
-    return { pct: (embedded / total) * 100, missing };
+    return { pct: (embedded / total) * 100, missing, stale: 0, unit: "rows" as const };
   })();
 
   const backupAge = backupHealth?.freshest_backup_age_seconds;
@@ -3014,6 +3264,14 @@ export default function App() {
   const topScore = searchResults[0]?.score ?? null;
   const selectedResult =
     searchResults.find((r) => `${r.kind ?? "item"}:${r.id}` === recallSelected) ??
+    (recallDetail && recallSelected === `episode:${recallDetail.id}`
+      ? {
+          kind: "episode",
+          id: recallDetail.id,
+          label: `Episode ${recallDetail.id}`,
+          snippet: recallDetail.summary,
+        }
+      : null) ??
     null;
   const openLoopsFor = (episodeId: number | null | undefined) =>
     episodeId == null
@@ -3264,6 +3522,8 @@ export default function App() {
                 void loadStatus(true);
                 void loadDoctor(true);
                 void loadActivity(true);
+                void refreshDsn(true);
+                void loadRightNow(true);
               }}
             >
               <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
@@ -3313,7 +3573,14 @@ export default function App() {
                 {a.cause}
               </Callout>
             ))}
-            {attention.length === 0 && doctorOk ? (
+            {doctorReadError ? (
+              <Callout tone="warn" title="Health check failed">
+                {doctorReadError}. {doctorLastOkAt
+                  ? `Showing the last report from ${new Date(doctorLastOkAt).toLocaleTimeString()} until the next check succeeds.`
+                  : "The latest check failed; refresh to try again."}
+              </Callout>
+            ) : null}
+            {attention.length === 0 && doctorOk && !doctorReadError && allHarnessesProven ? (
               <Callout
                 tone="ok"
                 title="Everything is recording and in sync"
@@ -3341,6 +3608,8 @@ export default function App() {
             <RightNowCard
               liveness={rightNow}
               busy={captureNowBusy}
+              loading={Boolean(loading.rightNow)}
+              error={rightNowReadError}
               message={captureNowMsg}
               onCaptureNow={() => void runCaptureNow()}
             />
@@ -3349,9 +3618,9 @@ export default function App() {
               <Tile
                 label="Database"
                 value={
-                  dsnOk == null
+                  dbReachable == null
                     ? "…"
-                    : dsnOk
+                    : dbReachable
                       ? "Connected"
                       : "Not reachable"
                 }
@@ -3360,7 +3629,7 @@ export default function App() {
                     ? `Offline copy ${fmtAge(snapshotHealth.age_seconds)} ago`
                     : undefined
                 }
-                tone={dsnOk === false ? "err" : "neutral"}
+                tone={dbReachable === false ? "err" : "neutral"}
               />
               <Tile
                 label="Recording"
@@ -3373,12 +3642,18 @@ export default function App() {
                 value={coverage ? `${coverage.pct.toFixed(1)}%` : "—"}
                 sub={
                   coverage
-                    ? coverage.missing > 0
-                      ? `${coverage.missing} rows not indexed yet · catching up`
+                    ? coverage.missing > 0 || coverage.stale > 0
+                      ? [
+                          coverage.missing > 0
+                            ? `${coverage.missing} ${coverage.unit === "chunks" ? "chunks missing" : "rows not indexed yet"}`
+                            : null,
+                          coverage.stale > 0 ? `${coverage.stale} stale` : null,
+                          "catching up",
+                        ].filter(Boolean).join(" · ")
                       : "Everything indexed"
                     : undefined
                 }
-                tone={coverage && coverage.missing > 0 ? "warn" : "neutral"}
+                tone={coverage && (coverage.missing > 0 || coverage.stale > 0) ? "warn" : "neutral"}
               />
               <Tile
                 label="Backups"
@@ -3841,6 +4116,7 @@ export default function App() {
                           className="sm"
                           onClick={() => {
                             setEditText(activityDetail.summary ?? "");
+                            setEditTarget(activityDetail.id);
                             setEditOpen(true);
                           }}
                         >
@@ -3849,7 +4125,10 @@ export default function App() {
                         <button
                           type="button"
                           className="sm danger push"
-                          onClick={() => setForgetTarget(activityDetail.id)}
+                          onClick={() => {
+                            setForgetError(null);
+                            setForgetTarget(activityDetail.id);
+                          }}
                         >
                           <Trash2 size={14} strokeWidth={1.75} aria-hidden />
                           Forget
@@ -3962,7 +4241,7 @@ export default function App() {
                   searchProject.trim()
                     ? () => {
                         setSearchProject("");
-                        void doSearch();
+                        void doSearch({ project: "" });
                       }
                     : undefined
                 }
@@ -3977,7 +4256,7 @@ export default function App() {
                   searchSince.trim()
                     ? () => {
                         setSearchSince("");
-                        void doSearch();
+                        void doSearch({ since: "" });
                       }
                     : undefined
                 }
@@ -3991,7 +4270,7 @@ export default function App() {
                   searchKind
                     ? () => {
                         setSearchKind("");
-                        void doSearch();
+                        void doSearch({ kind: "" });
                       }
                     : undefined
                 }
@@ -4006,7 +4285,7 @@ export default function App() {
                   searchHarness.trim()
                     ? () => {
                         setSearchHarness("");
-                        void doSearch();
+                        void doSearch({ harness: "" });
                       }
                     : undefined
                 }
@@ -4139,6 +4418,18 @@ export default function App() {
               </Callout>
             ) : null}
 
+            {searchFallback && !searchErr ? (
+              <Callout tone="warn" title="Offline copy">
+                {[
+                  searchFallback.refreshedAt ? `Updated ${searchFallback.refreshedAt}` : null,
+                  searchFallback.mode ? `Search: ${searchFallback.mode}` : null,
+                  searchFallback.filtersDropped.length
+                    ? `Filters not used: ${searchFallback.filtersDropped.join(", ")}`
+                    : null,
+                ].filter(Boolean).join(" · ")}
+              </Callout>
+            ) : null}
+
             {searchErr ? (
               <Callout
                 tone="warn"
@@ -4244,20 +4535,18 @@ export default function App() {
                   ) : (
                     <EmptyState
                       icon={<Search size={22} strokeWidth={1.75} aria-hidden />}
-                      title="No results"
+                      title={searchFallback ? "No matches in offline copy" : "No results"}
                       hint={
-                        (searchMode === "literal"
-                          ? "Nothing contains those exact words. Try Best match, which also scores meaning and word overlap."
-                          : searchMode === "semantic"
-                            ? "Nothing in the vector index was close enough. Try Best match, which also matches the words themselves."
-                            : "Nothing recorded matched that query by meaning, word overlap or exact text.") +
-                        (searchProject.trim() ||
-                        searchSince.trim() ||
-                        searchKind ||
-                        searchHarness.trim() ||
-                        searchVia.trim()
-                          ? " The filter chips are still applied."
-                          : "")
+                        searchFallback
+                          ? "This offline copy has no match. Reconnect to search the current shared memory."
+                          : (searchMode === "literal"
+                              ? "Nothing contains those exact words. Try Best match, which also scores meaning and word overlap."
+                              : searchMode === "semantic"
+                                ? "Nothing in the vector index was close enough. Try Best match, which also matches the words themselves."
+                                : "Nothing recorded matched that query by meaning, word overlap or exact text.") +
+                            (searchProject.trim() || searchSince.trim() || searchKind || searchHarness.trim() || searchVia.trim()
+                              ? " The filter chips are still applied."
+                              : "")
                       }
                     />
                   )}
@@ -4450,7 +4739,7 @@ export default function App() {
                 className="primary"
                 onClick={() => void doGraph()}
               >
-                {actionBusy ? (
+                {graphBusy ? (
                   <Loader2 size={14} className="spin" aria-hidden />
                 ) : (
                   <Waypoints size={14} strokeWidth={1.75} aria-hidden />
@@ -4905,12 +5194,14 @@ export default function App() {
                       <div className="section-head">Connection</div>
                       <div className="section-body">
                         <div className="inline">
-                          <Tag tone={dsnOk === false ? "err" : dsnOk ? "ok" : "neutral"} dot>
+                          <Tag tone={dbReachable === false ? "err" : dbReachable ? "ok" : "neutral"} dot>
                             {dsnOk === false
-                              ? "Not reachable"
-                              : dsnOk
-                                ? "Connected"
-                                : "Checking…"}
+                              ? "Not configured"
+                              : dbReachable === false
+                                ? "Not reachable"
+                                : dbReachable
+                                  ? "Connected"
+                                  : "Not checked"}
                           </Tag>
                           <span className="meta">
                             Stored in the login Keychain (service{" "}
@@ -5620,7 +5911,10 @@ export default function App() {
         open={forgetTarget != null}
         className="kit-dialog"
         ariaLabelledBy="forget-title"
-        onCancel={() => setForgetTarget(null)}
+        onCancel={() => {
+          setForgetError(null);
+          setForgetTarget(null);
+        }}
       >
         <div className="kit-dialog-body">
           <h2 id="forget-title">Forget episode #{forgetTarget}?</h2>
@@ -5628,8 +5922,15 @@ export default function App() {
             It stops appearing in search and recall, and its vectors are
             deleted. The row itself is kept, so this is not a shred.
           </p>
+          {forgetError ? <p role="alert">{forgetError}</p> : null}
           <div className="kit-dialog-actions">
-            <button type="button" onClick={() => setForgetTarget(null)}>
+            <button
+              type="button"
+              onClick={() => {
+                setForgetError(null);
+                setForgetTarget(null);
+              }}
+            >
               Cancel
             </button>
             <button
@@ -5651,7 +5952,10 @@ export default function App() {
         open={editOpen}
         className="kit-dialog"
         ariaLabelledBy="edit-title"
-        onCancel={() => setEditOpen(false)}
+        onCancel={() => {
+          setEditOpen(false);
+          setEditTarget(null);
+        }}
       >
         <div className="kit-dialog-body">
           <h2 id="edit-title">Edit summary</h2>
@@ -5666,7 +5970,13 @@ export default function App() {
             aria-label="Episode summary"
           />
           <div className="kit-dialog-actions">
-            <button type="button" onClick={() => setEditOpen(false)}>
+            <button
+              type="button"
+              onClick={() => {
+                setEditOpen(false);
+                setEditTarget(null);
+              }}
+            >
               Cancel
             </button>
             <button
@@ -5781,7 +6091,10 @@ export default function App() {
               <Segmented
                 ariaLabel="Move target"
                 value={moveTarget}
-                onChange={(v) => setMoveTarget(v)}
+                onChange={(v) => {
+                  setMoveTarget(v);
+                  moveAutoDryRunTarget.current = null;
+                }}
                 options={[
                   { value: "server", label: "A server I run" },
                   { value: "local", label: "A new database on this Mac" },
@@ -5806,23 +6119,10 @@ export default function App() {
                       aria-label="Target connection string"
                     />
                   </div>
+                  <p className="muted">
+                    Custom certificate files are not supported for moves yet.
+                  </p>
                   <div className="toolbar">
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        try {
-                          const selected = await openDirectoryDialog({ multiple: false, directory: false });
-                          if (typeof selected === "string" && selected.trim()) {
-                            setMoveRootCrt(selected.trim());
-                          }
-                        } catch (e) {
-                          setMoveError(String(e));
-                        }
-                      }}
-                    >
-                      {moveRootCrt ? "Change certificate file…" : "Certificate file (optional)…"}
-                    </button>
-                    {moveRootCrt ? <span className="muted mono ellip">{moveRootCrt}</span> : null}
                     <button
                       type="button"
                       className="primary"
@@ -5864,9 +6164,9 @@ export default function App() {
 
           {moveStep === "copy" ? (
             <>
-              {moveDryRunBusy || !moveDryRun ? (
+              {moveDryRunBusy ? (
                 <p className="muted">Reading table counts from the target…</p>
-              ) : (
+              ) : moveDryRun ? (
                 <>
                   <div className="rows">
                     {moveDryRun.map((t) => (
@@ -5889,7 +6189,7 @@ export default function App() {
                     </button>
                   </div>
                 </>
-              )}
+              ) : null}
               {moveError ? (
                 <Callout
                   tone="err"

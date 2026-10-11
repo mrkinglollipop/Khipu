@@ -6,7 +6,7 @@
 // `npm run build`.
 import { useState } from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
 import { Welcome } from "../Welcome";
 import App from "../App";
 import { IntegrationsPanel, verifiedLine } from "../IntegrationsPanel";
@@ -460,6 +460,21 @@ describe("Welcome › Finish step", () => {
     expect(screen.queryByText(/Not yet proven/)).not.toBeInTheDocument();
   });
 
+  it.each(["literal_trgm_ok", "prompt_recall_snapshot_ok", "recall_daemon_ok", "launchers_ok"])("keeps the all-clear closed when doctor fails unmapped %s", async (key) => {
+    renderFinishStep(async (args) =>
+      args[0] === "doctor" ? JSON.stringify({ ok: false, [key]: false }) : "{}",
+    );
+    await waitFor(() => expect(screen.getByText("Health check found a problem")).toBeInTheDocument());
+    expect(screen.queryByText("Everything checked out")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Finish" })).toBeDisabled();
+  });
+
+  it("keeps the all-clear closed when doctor gives only an aggregate failure", async () => {
+    renderFinishStep(async (args) => args[0] === "doctor" ? JSON.stringify({ ok: false }) : "{}");
+    await waitFor(() => expect(screen.getByText("Health check found a problem")).toBeInTheDocument());
+    expect(screen.queryByText("Everything checked out")).not.toBeInTheDocument();
+  });
+
   it("runs the app probe itself when recall_probe_ok is red and no harness has verified", async () => {
     let doctorCalls = 0;
     renderFinishStep(async (args) => {
@@ -480,6 +495,26 @@ describe("Welcome › Finish step", () => {
     await waitFor(() => expect(screen.getByText("Every check passed.")).toBeInTheDocument());
     expect(doctorCalls).toBe(1);
     expect(screen.getByText("Memory round trip: 1.8 s")).toBeInTheDocument();
+  });
+});
+
+describe("Welcome › Embeddings step", () => {
+  it("says skipping meaning search leaves keyword search available", async () => {
+    render(
+      <Welcome
+        dsnOk={true}
+        refreshDsn={async () => {}}
+        runKhipu={async () => "{}"}
+        onFinish={() => {}}
+        openIntegrations={() => {}}
+        initialStep="model"
+        initialStepKey={1}
+      />,
+    );
+    const skip = await screen.findByRole("radio", { name: "Skip — meaning-based search waits for a profile; keyword search stays available" });
+    fireEvent.click(skip);
+    expect(skip).toBeChecked();
+    expect(screen.queryByText("Skip — search empty until a profile is active")).not.toBeInTheDocument();
   });
 });
 
@@ -697,17 +732,18 @@ describe("verifiedLine — live beat vs. no probe", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Harness auto-verify — a card flips to Verified on its own once a fresh
-// capture-hook beat lands after Install, no Verify click required.
+// A capture-hook beat proves only that the hook ran. Verified remains reserved
+// for a successful round trip from the explicit per-harness probe.
 // ---------------------------------------------------------------------------
 
-describe("IntegrationsPanel — harness auto-verify", () => {
-  it("flips the card to Verified once the beat is newer than the install time, without clicking Verify", async () => {
+describe("IntegrationsPanel — harness status after install", () => {
+  it("does not promote a heartbeat to Verified without a successful probe", async () => {
     // Real timers throughout — the 15 s interval is exercised via the same
     // "on window focus" trigger the panel wires up alongside it, so the test
     // does not need to fake time to see the poll fire.
     let statusCall = 0;
     let installedAtIso = "";
+    let releaseHeartbeat: ((raw: string) => void) | null = null;
     const runKhipu = vi.fn(async (args: string[]) => {
       if (args[0] === "integrations" && args[1] === "status") {
         statusCall += 1;
@@ -718,7 +754,7 @@ describe("IntegrationsPanel — harness auto-verify", () => {
           statusCall <= 2 || !installedAtIso
             ? null
             : new Date(Date.parse(installedAtIso) + 5_000).toISOString();
-        return JSON.stringify([
+        const response = JSON.stringify([
           {
             harness: "claude_code",
             detected: true,
@@ -730,6 +766,8 @@ describe("IntegrationsPanel — harness auto-verify", () => {
             last_beat_at: lastBeat,
           },
         ]);
+        if (statusCall === 3) return new Promise<string>((resolve) => { releaseHeartbeat = resolve; });
+        return response;
       }
       if (args[0] === "integrations" && args[1] === "install") {
         installedAtIso = new Date().toISOString();
@@ -756,15 +794,20 @@ describe("IntegrationsPanel — harness auto-verify", () => {
 
     fireEvent.click(within(card).getByRole("button", { name: /Reinstall/ }));
     await waitFor(() =>
-      expect(within(card).getByText(/this card turns green by itself/)).toBeInTheDocument(),
+      expect(within(card).getByText(/select Verify to check capture and recall/)).toBeInTheDocument(),
     );
     expect(within(card).queryByText("Verified")).not.toBeInTheDocument();
 
-    // Nobody clicks Verify — a later poll (here, the window-focus trigger)
-    // is what notices the fresh beat.
+    // Nobody clicks Verify — a later poll can see the beat, but that is not
+    // proof of the capture-to-search round trip.
     window.dispatchEvent(new Event("focus"));
-
-    await waitFor(() => expect(within(card).getByText("Verified")).toBeInTheDocument());
+    await waitFor(() => expect(statusCall).toBeGreaterThanOrEqual(3));
+    await act(async () => releaseHeartbeat?.(JSON.stringify([{
+      harness: "claude_code", detected: true, mcp: true, hook_stop: true,
+      hook_precompact: true, recall_rule: "installed", extract: "installed",
+      last_beat_at: new Date(Date.parse(installedAtIso) + 5_000).toISOString(),
+    }])));
+    await waitFor(() => expect(within(card).queryByText("Verified")).not.toBeInTheDocument());
   });
 });
 

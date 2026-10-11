@@ -83,7 +83,7 @@ def apply_project_and_status(
 ) -> list[dict[str, Any]]:
     """Ranking-only project boost (R5) + topic status de-rank (R6).
 
-    ``project`` is a BOOST, never a hard filter: a hit from a different
+    ``project`` is optional. When supplied it is a BOOST, never a hard filter: a hit from a different
     project still shows, it just loses the tie-break it would otherwise win
     against an equally-relevant hit from ``project`` (R5's reproduced bug —
     a contradicting decision from the wrong project outranking the real one
@@ -121,7 +121,7 @@ def apply_project_and_status(
                             score *= TYPE_BOOST
             if row.get("kind") == "topic":
                 status = str(row.get("status") or "").strip().lower()
-                if status in DERANKED_STATUSES:
+                if status in DERANKED_STATUSES or row.get("superseded_by"):
                     score *= STATUS_DERANK
         except Exception:  # noqa: BLE001 — one bad row must not sink the search
             pass

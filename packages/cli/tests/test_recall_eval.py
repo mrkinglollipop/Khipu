@@ -482,7 +482,7 @@ class RecordCompareTest(unittest.TestCase):
         self.assertEqual(result["changed"], 0)
         self.assertEqual(result["diffs"][0]["status"], "identical")
 
-    def test_compare_reordered_is_flagged_but_not_counted_as_changed(self):
+    def test_compare_reordered_is_flagged_and_counted_as_changed(self):
         entries = [{"query": "q", "expect": ["1", "2"]}]
         first = {"results": [{"kind": "episode", "id": "1"}, {"kind": "episode", "id": "2"}]}
         second = {"results": [{"kind": "episode", "id": "2"}, {"kind": "episode", "id": "1"}]}
@@ -491,7 +491,7 @@ class RecordCompareTest(unittest.TestCase):
         with mock.patch("khipu.embed.hybrid_search", return_value=second):
             result = recall_eval.compare_record(entries, ("explicit",), record)
         self.assertEqual(result["diffs"][0]["status"], "reordered")
-        self.assertEqual(result["changed"], 0)
+        self.assertEqual(result["changed"], 1)
 
     def test_compare_changed_ids_is_flagged_and_counted(self):
         entries = [{"query": "q", "expect": ["1"]}]

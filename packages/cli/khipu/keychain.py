@@ -53,7 +53,6 @@ def set_password(account: str, password: str, *, service: str = SERVICE) -> None
         # The stdin protocol below is newline-delimited, so an embedded newline
         # would silently truncate the stored secret.
         raise ValueError("secret must not contain a newline")
-    _security("delete-generic-password", "-s", service, "-a", account)
     # `-w` with no value makes security(1) read the secret from stdin, prompting
     # twice. Passing it as an argument instead would expose it in `ps` output to
     # every other process on this machine for the lifetime of the call.
@@ -237,7 +236,7 @@ def dsn_file_health(path: Path | None = None) -> dict:
         return out
     try:
         raw = path.read_text(encoding="utf-8").strip()
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         out["ok"] = False
         out["reasons"].append(f"unreadable: {type(exc).__name__}")
         return out

@@ -30,6 +30,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -41,6 +42,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 # machine) used to land inside that hook's wall-clock limit.
 if TYPE_CHECKING:
     import psycopg
+    from khipu.profiles import ProfileSpec
 
 SNAPSHOT_NAME = "hub_snapshot.sqlite"
 META_NAME = "hub_snapshot.sqlite.meta.json"
@@ -213,15 +215,42 @@ def meta_path() -> Path:
 
 def meta() -> dict[str, Any]:
     p = meta_path()
-    if not p.is_file():
-        return {"exists": False}
+    data: dict[str, Any] = {}
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        if p.is_file():
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            data = loaded if isinstance(loaded, dict) else {"readable": False}
     except (OSError, ValueError):
-        return {"exists": True, "readable": False}
-    data.setdefault("exists", True)
+        data = {"readable": False}
+    # The image is authoritative: a copied/removed sidecar must not make an
+    # incremental write look like a fresh full replica.
+    try:
+        con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
+        try:
+            if _snapshot_table_columns(con, "snapshot_meta"):
+                row = con.execute("SELECT value FROM snapshot_meta WHERE key = 'refreshed_at'").fetchone()
+                if row and row[0]:
+                    data["refreshed_at"] = row[0]
+        finally:
+            con.close()
+    except (OSError, sqlite3.Error):
+        pass
+    data.setdefault("exists", snapshot_path().is_file() or p.is_file())
     data.setdefault("path", str(snapshot_path()))
     return data
+
+
+def _write_meta(data: Mapping[str, Any]) -> None:
+    dest = meta_path()
+    fd, name = tempfile.mkstemp(prefix=".hub_snapshot.meta.", dir=dest.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(name, dest)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
 def _utcnow_iso() -> str:
@@ -265,7 +294,73 @@ def open_snapshot() -> sqlite3.Connection:
     path = snapshot_path()
     if not path.is_file():
         raise FileNotFoundError(f"hub snapshot missing: {path}")
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    cols = _snapshot_table_columns(con, "episodes")
+    pending = _pending_erasure_ids(path)
+    if "id" in cols:
+        blocked = ", ".join(str(i) for i in sorted(pending)) or "-1"
+        live = "deleted_at IS NULL AND " if "deleted_at" in cols else ""
+        con.execute(
+            "CREATE TEMP VIEW episodes AS SELECT * FROM main.episodes "
+            f"WHERE {live}id NOT IN ({blocked})"
+        )
+    embedding_cols = _snapshot_table_columns(con, "memory_embeddings")
+    if {"kind", "ref"} <= embedding_cols:
+        blocked_refs = ", ".join(f"'{i}'" for i in sorted(pending)) or "'-1'"
+        tombstone_filter = ""
+        if {"id", "deleted_at"} <= cols:
+            tombstone_filter = (
+                " AND NOT EXISTS (SELECT 1 FROM main.episodes e "
+                "WHERE e.id = m.ref AND e.deleted_at IS NOT NULL)"
+            )
+        con.execute(
+            "CREATE TEMP VIEW memory_embeddings AS "
+            "SELECT m.rowid AS rowid, m.* FROM main.memory_embeddings m "
+            "WHERE m.kind != 'episode' OR "
+            f"(m.ref NOT IN ({blocked_refs}){tombstone_filter})"
+        )
+    return con
+
+
+def _pending_erasure_dir(path: Path | None = None) -> Path:
+    path = path or snapshot_path()
+    return path.parent / ".hub_snapshot.pending-erasure"
+
+
+def _pending_erasure_ids(path: Path | None = None) -> set[int]:
+    try:
+        return {int(p.name) for p in _pending_erasure_dir(path).iterdir() if p.name.isdigit()}
+    except FileNotFoundError:
+        return set()
+
+
+def _queue_erasure(episode_id: int, path: Path | None = None) -> bool:
+    directory = _pending_erasure_dir(path)
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        marker = directory / str(int(episode_id))
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        dfd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        return True
+    except OSError:
+        return False
+
+
+def _apply_pending_erasures(con: sqlite3.Connection, path: Path) -> None:
+    ids = _pending_erasure_ids(path)
+    for episode_id in ids:
+        con.execute("UPDATE episodes SET deleted_at = COALESCE(deleted_at, ?) WHERE id = ?", (_utcnow_iso(), episode_id))
+        con.execute("DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ?", (str(episode_id),))
+        if _snapshot_table_columns(con, "deliverables"):
+            con.execute("DELETE FROM deliverables WHERE episode_id = ?", (episode_id,))
 
 
 def _fair_shares(total: int, n: int) -> list[int]:
@@ -343,9 +438,13 @@ def recent_deliverables_snapshot(
     if "deleted_at" in _snapshot_table_columns(con, "episodes"):
         extra = (
             " AND (deliverables.episode_id IS NULL OR NOT EXISTS ("
-            "SELECT 1 FROM episodes e WHERE e.id = deliverables.episode_id "
+            "SELECT 1 FROM main.episodes e WHERE e.id = deliverables.episode_id "
             "AND e.deleted_at IS NOT NULL))"
         )
+    pending = _pending_erasure_ids(snapshot_path())
+    if pending:
+        blocked = ", ".join(str(int(i)) for i in sorted(pending))
+        extra += f" AND (episode_id IS NULL OR episode_id NOT IN ({blocked}))"
     try:
         rows = con.execute(
             f"SELECT {', '.join(cols)} FROM deliverables WHERE project = ?{extra} "
@@ -482,6 +581,10 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
     m = meta()
     since = m.get("last_decision_sync_at")
     try:
+        since_id = int(m.get("last_decision_sync_id") or 0)
+    except (TypeError, ValueError):
+        since_id = 0
+    try:
         with try_hub_connect() as pg:
             with pg.cursor() as cur:
                 cols = [c for c in _DECISION_COLS if c in _pg_columns(cur, "decisions")]
@@ -496,11 +599,11 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
                 params: list[Any] = []
                 where = ""
                 if since:
-                    where = f"WHERE {watermark_expr} > %s"
-                    params.append(since)
+                    where = f"WHERE ({watermark_expr}, id) > (%s, %s)"
+                    params.extend((since, since_id))
                 cur.execute(
                     f"SELECT {sel}, {watermark_expr} AS _watermark FROM decisions "
-                    f"{where} ORDER BY _watermark ASC LIMIT %s",
+                    f"{where} ORDER BY _watermark ASC, id ASC LIMIT %s",
                     (*params, limit),
                 )
                 fetched = cur.fetchall()
@@ -513,8 +616,9 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
     if out.get("ok"):
         new_watermark = fetched[-1][-1]
         m["last_decision_sync_at"] = _ts_text(new_watermark) or _utcnow_iso()
+        m["last_decision_sync_id"] = rows[-1].get("id", 0)
         try:
-            meta_path().write_text(json.dumps(m, indent=2), encoding="utf-8")
+            _write_meta(m)
         except OSError:
             pass
     out.setdefault("decisions", len(rows))
@@ -829,14 +933,18 @@ def _insert_edges(cur, con: sqlite3.Connection) -> int:
 
 
 def _insert_profiles(cur, con: sqlite3.Connection) -> int:
-    cols = [c for c in _PROFILE_COLS if c in _pg_columns(cur, "embedding_profiles")]
-    sel = ", ".join(cols)
+    hub_cols = _pg_columns(cur, "embedding_profiles")
+    cols = [c for c in _PROFILE_COLS if c in hub_cols]
+    select_cols = [*cols, *(["endpoint"] if "endpoint" in hub_cols else [])]
+    sel = ", ".join(select_cols)
     cur.execute(f"SELECT {sel} FROM embedding_profiles ORDER BY id")
     rows = cur.fetchall()
     ph = ", ".join(cols)
     for row in rows:
+        record = dict(zip(select_cols, row, strict=True))
         vals = []
-        for col, val in zip(cols, row, strict=True):
+        for col in cols:
+            val = record[col]
             if col == "created_at":
                 vals.append(_ts_text(val))
             elif col == "is_active":
@@ -847,6 +955,17 @@ def _insert_profiles(cur, con: sqlite3.Connection) -> int:
             f"INSERT INTO embedding_profiles ({ph}) VALUES ({', '.join('?' * len(cols))})",
             vals,
         )
+        if {"id", "provider", "model", "dim"} <= record.keys():
+            spec = {
+                "id": record["id"], "provider": record["provider"],
+                "model": record["model"], "dim": int(record["dim"]),
+                "normalize": record.get("normalize") or "l2",
+                "endpoint": record.get("endpoint") or None,
+            }
+            con.execute(
+                "INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES (?, ?)",
+                (f"embedding_profile:{record['id']}", json.dumps(spec, sort_keys=True)),
+            )
     return len(rows)
 
 
@@ -978,23 +1097,15 @@ def refresh() -> dict[str, Any]:
                     )
                     counts["decisions"] = _insert_decisions(cur, con)
                     counts["deliverables"] = _insert_deliverables(cur, con)
+            refreshed_at = _utcnow_iso()
+            if _snapshot_table_columns(con, "snapshot_meta"):
+                con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('refreshed_at', ?)", (refreshed_at,))
+            _apply_pending_erasures(con, dest)
             con.commit()
             con.close()
             os.replace(tmp_path, dest)
-            refreshed_at = _utcnow_iso()
             size_bytes = dest.stat().st_size
-            meta_path().write_text(
-                json.dumps(
-                    {
-                        "schema_version": SNAPSHOT_SCHEMA_VERSION,
-                        "refreshed_at": refreshed_at,
-                        "size_bytes": size_bytes,
-                        "counts": counts,
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+            _write_meta({"schema_version": SNAPSHOT_SCHEMA_VERSION, "refreshed_at": refreshed_at, "size_bytes": size_bytes, "counts": counts})
             return {
                 "ok": True,
                 "path": str(dest),
@@ -1097,13 +1208,30 @@ def upsert_episode(
         eid = episode_row.get("id")
         if eid is None:
             return {"ok": False, "error": "episode_row missing id"}
+        pending_erasure = int(eid) in _pending_erasure_ids(path)
         con = sqlite3.connect(str(path))
         try:
+            ep_cols = _snapshot_table_columns(con, "episodes")
+            cursor = con.execute("SELECT * FROM episodes WHERE id = ?", (eid,))
+            existing = cursor.fetchone()
+            names = [d[0] for d in cursor.description]
+            merged = dict(zip(names, existing or (), strict=False))
+            # Capture payloads commonly omit identity fields. Preserve them,
+            # and keep a durable tombstone monotonic across a late embed.
+            identity_cols = {"project", "scope", "session_id", "harness", "repo_root", "parent_session_id"}
+            merged.update({
+                c: v for c, v in episode_row.items()
+                if c in ep_cols and not (c in identity_cols and v is None and existing)
+            })
+            if existing and "deleted_at" in names and existing[names.index("deleted_at")] is not None:
+                merged["deleted_at"] = existing[names.index("deleted_at")]
+            if pending_erasure:
+                merged["deleted_at"] = merged.get("deleted_at") or _utcnow_iso()
             con.execute("DELETE FROM episodes WHERE id = ?", (eid,))
-            cols = [c for c in _EPISODE_COLS if c in episode_row]
+            cols = [c for c in _EPISODE_COLS if c in merged and c in ep_cols]
             vals = []
             for c in cols:
-                v = episode_row.get(c)
+                v = merged.get(c)
                 if c in ("topics", "people", "decisions", "preferences", "edges", "raw", "tags"):
                     v = _json_text(v)
                 elif c in ("ts", "ingested_at", "deleted_at"):
@@ -1114,7 +1242,15 @@ def upsert_episode(
                 f"VALUES ({', '.join('?' * len(cols))})",
                 vals,
             )
-            for erow in embedding_rows:
+            if merged.get("deleted_at") is not None:
+                con.execute("DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ?", (str(eid),))
+            else:
+                for profile in {row["profile"] for row in embedding_rows}:
+                    con.execute(
+                        "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ? AND profile = ?",
+                        (str(eid), profile),
+                    )
+            for erow in (() if merged.get("deleted_at") is not None else embedding_rows):
                 ecols = [c for c in _EMBED_COLS if c in erow]
                 evals = []
                 for c in ecols:
@@ -1135,7 +1271,9 @@ def upsert_episode(
                 # error, for that case, and the episode/embedding write
                 # above must still commit regardless.
                 _write_decision_rows(con, decision_rows)
-            if deliverable_rows is not None:
+            if merged.get("deleted_at") is not None:
+                _write_deliverable_rows(con, eid, ())
+            elif deliverable_rows is not None:
                 _write_deliverable_rows(con, eid, deliverable_rows)
             con.commit()
         finally:
@@ -1143,15 +1281,20 @@ def upsert_episode(
         m = meta()
         m["last_incremental_upsert_at"] = _utcnow_iso()
         m["last_incremental_episode_id"] = eid
-        meta_path().write_text(json.dumps(m, indent=2), encoding="utf-8")
+        _write_meta(m)
         return {"ok": True, "episode_id": eid, "embeddings": len(embedding_rows)}
     finally:
         _release_refresh_lock(lock)
 
 
-def upsert_embeddings(embedding_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Incremental snapshot update: embedding rows only, no episode/topic row
-    (fix 5c) — e.g. commitment embeddings from ``embed.embed_recent_missing``'s
+def upsert_embeddings(
+    embedding_rows: Sequence[Mapping[str, Any]], *,
+    topic_rows: Sequence[Mapping[str, Any]] = (),
+    replace_refs: Sequence[tuple[str, str, str]] = (),
+) -> dict[str, Any]:
+    """Incremental vectors with optional topic sources and complete ref replacement.
+    Replacements affect only the named profiles, including an empty chunk set.
+    Used by ``embed.embed_recent_missing``'s
     bounded catch-up, which has no single episode row to key off like
     ``upsert_episode`` does. Same locking/fail-open contract as
     ``upsert_episode``: a no-op ``{"ok": False}`` when the snapshot is
@@ -1162,7 +1305,7 @@ def upsert_embeddings(embedding_rows: Sequence[Mapping[str, Any]]) -> dict[str, 
             "ok": False,
             "error": "hub snapshot missing; run `khipu snapshot refresh` first",
         }
-    if not embedding_rows:
+    if not embedding_rows and not topic_rows and not replace_refs:
         return {"ok": True, "embeddings": 0}
     lock = _acquire_refresh_lock()
     if lock is None:
@@ -1170,7 +1313,25 @@ def upsert_embeddings(embedding_rows: Sequence[Mapping[str, Any]]) -> dict[str, 
     try:
         con = sqlite3.connect(str(path))
         try:
+            topic_cols = _snapshot_table_columns(con, "topics")
+            for row in topic_rows:
+                old = con.execute("SELECT deleted_at FROM topics WHERE slug = ?", (row["slug"],)).fetchone()
+                if old and old[0] is not None:
+                    continue
+                cols = [c for c in _TOPIC_COLS if c in topic_cols and c in row]
+                vals = [_json_text(row[c]) if c in ("links", "frontmatter") else
+                        _ts_text(row[c]) if c.endswith("_at") else row[c] for c in cols]
+                con.execute(
+                    f"INSERT INTO topics ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)}) "
+                    "ON CONFLICT(slug) DO UPDATE SET " + ", ".join(f"{c}=excluded.{c}" for c in cols if c != "slug"),
+                    vals,
+                )
+            for profile, kind, ref in replace_refs:
+                con.execute("DELETE FROM memory_embeddings WHERE profile = ? AND kind = ? AND ref = ?",
+                            (profile, kind, ref))
             for erow in embedding_rows:
+                if erow.get("kind") == "episode" and str(erow.get("ref")) in {str(i) for i in _pending_erasure_ids(path)}:
+                    continue
                 ecols = [c for c in _EMBED_COLS if c in erow]
                 evals = []
                 for c in ecols:
@@ -1190,7 +1351,7 @@ def upsert_embeddings(embedding_rows: Sequence[Mapping[str, Any]]) -> dict[str, 
             con.close()
         m = meta()
         m["last_incremental_upsert_at"] = _utcnow_iso()
-        meta_path().write_text(json.dumps(m, indent=2), encoding="utf-8")
+        _write_meta(m)
         return {"ok": True, "embeddings": len(embedding_rows)}
     finally:
         _release_refresh_lock(lock)
@@ -1207,11 +1368,13 @@ def forget_episode_in_snapshot(episode_id: int) -> dict[str, Any]:
     already durable by the time this runs, so a missing snapshot or a dump
     in progress just means the replica catches up at the next refresh."""
     path = snapshot_path()
+    if not _queue_erasure(episode_id, path):
+        return {"ok": False, "episode_id": episode_id, "error": "could not queue pending replica erasure"}
     if not path.is_file():
-        return {"ok": False, "error": "hub snapshot missing"}
+        return {"ok": False, "episode_id": episode_id, "pending": True, "error": "hub snapshot missing"}
     lock = _acquire_refresh_lock()
     if lock is None:
-        return {"ok": False, "error": "hub snapshot refresh in progress"}
+        return {"ok": False, "episode_id": episode_id, "pending": True, "error": "hub snapshot refresh in progress"}
     try:
         con = sqlite3.connect(str(path))
         try:
@@ -1288,19 +1451,15 @@ def snapshot_health() -> dict[str, Any]:
             age_s = int((datetime.now(timezone.utc) - ref).total_seconds())
         except (TypeError, ValueError):
             age_s = None
-    if age_s is None:
-        # Missing/unparseable refreshed_at must not look like "no snapshot" —
-        # a young file with bad meta is still a throttle hit, not a dump.
-        mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
-        age_s = int((datetime.now(timezone.utc) - mtime).total_seconds())
     return {
-        "ok": True,
+        "ok": age_s is not None,
         "exists": True,
         "path": str(path),
         "refreshed_at": refreshed_at,
         "size_bytes": st.st_size,
         "age_seconds": age_s,
         "counts": m.get("counts"),
+        **({"reason": "refresh_evidence_unknown"} if age_s is None else {}),
     }
 
 
@@ -1496,6 +1655,17 @@ def search_snapshot(
 
     tokens = search_tokens(query)
     con = open_snapshot()
+    # SQLite's LIKE is wildcard/case behaviour, not the callers' exact
+    # Python filter semantics. Register deterministic predicates before the
+    # LIMIT so a rejected row cannot consume the result budget.
+    con.create_function("khipu_project_match", 2, lambda value, wanted: str(wanted or "").lower() in str(value or "").lower())
+    con.create_function("khipu_prefix", 2, lambda value, prefix: str(value or "").startswith(str(prefix or "")))
+    def _sql_in_range(value, lo, hi):
+        parsed = _parse_snapshot_ts(value)
+        if parsed is None:
+            return False
+        return (not lo or parsed >= datetime.fromisoformat(lo)) and (not hi or parsed <= datetime.fromisoformat(hi))
+    con.create_function("khipu_in_range", 3, _sql_in_range)
     results: list[dict[str, Any]] = []
 
     if not tokens:
@@ -1543,15 +1713,22 @@ def search_snapshot(
         return n * 4 if time_filtered and n > 0 else n
 
     if topic_n > 0:
+        topic_time_clause = ""
+        topic_time_params: list[Any] = []
+        if time_filtered:
+            topic_time_clause = " AND khipu_in_range(COALESCE(updated_at, created_at), ?, ?)"
+            topic_time_params.extend((since_dt.isoformat() if since_dt else None, until_dt.isoformat() if until_dt else None))
         sql = f"""
             SELECT 'topic' AS kind, slug AS id, COALESCE(title, slug) AS label,
                    substr(body, 1, 4000) AS snippet, COALESCE(updated_at, created_at) AS ts
             FROM topics
-            WHERE deleted_at IS NULL AND ({topic_where})
+            WHERE deleted_at IS NULL AND ({topic_where}){topic_time_clause}
             ORDER BY {topic_order}
             LIMIT ?
         """
-        rows = con.execute(sql, (*topic_params, oversample(topic_n))).fetchall()
+        split_at = len(topic_params) // 2 if search_tokens(query) else len(topic_params)
+        rows = con.execute(sql, (*topic_params[:split_at], *topic_time_params,
+                                 *topic_params[split_at:], oversample(topic_n))).fetchall()
         for r in rows:
             if not _in_range(r[4]):
                 continue
@@ -1575,12 +1752,26 @@ def search_snapshot(
         # the offline replica (audit 2026-09-04) — topics already did this.
         ep_live = "deleted_at IS NULL AND " if "deleted_at" in ep_cols else ""
         t3_predicate, t3_params = _t3_snapshot_predicate(con, t3_thread, via)
+        identity_clause = ""
+        identity_params: list[Any] = []
+        if project:
+            identity_clause += f" AND khipu_project_match({project_expr}, ?)"
+            identity_params.append(project.strip())
+        if session_id:
+            identity_clause += f" AND khipu_prefix({session_expr}, ?)"
+            identity_params.append(session_id)
+        if harness:
+            identity_clause += f" AND COALESCE(NULLIF({harness_expr}, ''), substr({session_expr}, 1, instr({session_expr} || ':', ':') - 1)) = ?"
+            identity_params.append(harness)
+        if time_filtered:
+            identity_clause += " AND khipu_in_range(ts, ?, ?)"
+            identity_params.extend((since_dt.isoformat() if since_dt else None, until_dt.isoformat() if until_dt else None))
         sql = f"""
             SELECT 'episode' AS kind, CAST(id AS TEXT) AS id, summary AS label,
                    summary AS snippet, ts, {session_expr} AS sid,
                    {project_expr} AS proj, {harness_expr} AS harn
             FROM episodes
-            WHERE {ep_live}({episode_where}) AND ({t3_predicate})
+            WHERE {ep_live}({episode_where}) AND ({t3_predicate}){identity_clause}
             ORDER BY {episode_order}
             LIMIT ?
         """
@@ -1588,7 +1779,7 @@ def search_snapshot(
         # predicate sits between them in SQL and must sit there in params too.
         split_at = len(episode_params) // 2 if search_tokens(query) else len(episode_params)
         rows = con.execute(sql, (*episode_params[:split_at], *t3_params,
-                                 *episode_params[split_at:], oversample(episode_n))).fetchall()
+                                 *identity_params, *episode_params[split_at:], oversample(episode_n))).fetchall()
         for r in rows:
             if not _in_range(r[4]):
                 continue
@@ -1611,15 +1802,22 @@ def search_snapshot(
             )
 
     if node_n > 0:
+        node_time_clause = ""
+        node_time_params: list[Any] = []
+        if time_filtered:
+            node_time_clause = " AND khipu_in_range(built_at, ?, ?)"
+            node_time_params.extend((since_dt.isoformat() if since_dt else None, until_dt.isoformat() if until_dt else None))
         sql = f"""
             SELECT 'node' AS kind, id AS id, COALESCE(name, id) AS label,
                    substr(COALESCE(payload, ''), 1, 4000) AS snippet, built_at
             FROM nodes
-            WHERE {node_where}
+            WHERE ({node_where}){node_time_clause}
             ORDER BY {node_order}
             LIMIT ?
         """
-        rows = con.execute(sql, (*node_params, oversample(node_n))).fetchall()
+        split_at = len(node_params) // 2 if search_tokens(query) else len(node_params)
+        rows = con.execute(sql, (*node_params[:split_at], *node_time_params,
+                                 *node_params[split_at:], oversample(node_n))).fetchall()
         for r in rows:
             if not _in_range(r[4]):
                 continue
@@ -1634,12 +1832,22 @@ def search_snapshot(
     return results
 
 
-def merge_outbox_episodes(results: list[dict[str, Any]], *, t3_thread=None, via=None) -> list[dict[str, Any]]:
+def merge_outbox_episodes(
+    results: list[dict[str, Any]], *, query: str | None = None, kind: str | None = None,
+    since: str | None = None, until: str | None = None, project: str | None = None,
+    session_id: str | None = None, harness: str | None = None, t3_thread=None, via=None,
+) -> list[dict[str, Any]]:
     from khipu.outbox import jobs
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
 
     merged = list(results)
     seen: set[str] = {f"{r.get('kind')}:{r.get('id')}" for r in merged}
+    from khipu.search_text import parse_time_filter, search_tokens
+    if kind not in (None, "episode"):
+        return merged
+    since_dt = parse_time_filter(since) if since else None
+    until_dt = parse_time_filter(until) if until else None
+    query_tokens = [token.lower() for token in search_tokens(query or "")]
     for jp in jobs():
         try:
             job = json.loads(jp.read_text(encoding="utf-8"))
@@ -1651,6 +1859,31 @@ def merge_outbox_episodes(results: list[dict[str, Any]], *, t3_thread=None, via=
             summary = (payload.get("summary") or "").strip()
             if not summary:
                 continue
+            if query is not None:
+                raw_query = query.strip().lower()
+                searchable = " ".join(
+                    str(payload.get(field) or "")
+                    for field in ("summary", "topics", "decisions", "preferences", "people")
+                ).lower()
+                raw_fallback = json.dumps(payload.get("raw"), default=str).lower()
+                if query_tokens:
+                    if not any(token in searchable or token in raw_fallback for token in query_tokens):
+                        continue
+                elif not raw_query or (raw_query not in raw_fallback and raw_query not in jp.stem.lower()):
+                    continue
+            row_project = str(payload.get("project") or payload.get("scope") or "")
+            row_session = str(payload.get("session_id") or "")
+            row_harness = str(payload.get("harness") or row_session.split(":", 1)[0])
+            if project and project.strip().lower() not in row_project.lower():
+                continue
+            if session_id and not row_session.startswith(session_id):
+                continue
+            if harness and row_harness != harness:
+                continue
+            if since_dt is not None or until_dt is not None:
+                ts = _parse_snapshot_ts(payload.get("ts"))
+                if ts is None or (since_dt is not None and ts < since_dt) or (until_dt is not None and ts > until_dt):
+                    continue
             key = f"episode:outbox:{jp.stem}"
             if key in seen:
                 continue
@@ -1883,7 +2116,7 @@ def episode_detail_snapshot(episode_id: int) -> dict[str, Any] | None:
     row = con.execute(
         """
         SELECT id, ts, ingested_at, session_id, scope, summary,
-               topics, people, decisions, preferences, edges, raw
+               topics, people, decisions, preferences, edges
         FROM episodes WHERE id = ? AND deleted_at IS NULL
         """,
         (episode_id,),
@@ -1903,7 +2136,6 @@ def episode_detail_snapshot(episode_id: int) -> dict[str, Any] | None:
         "decisions": json.loads(row[8] or "[]"),
         "preferences": json.loads(row[9] or "[]"),
         "edges": json.loads(row[10] or "[]"),
-        "raw": json.loads(row[11] or "null") if row[11] else None,
     }
 
 
@@ -2035,31 +2267,39 @@ def semantic_search_snapshot(
     """fix 7: project/session_id/harness, same episode-only semantics as
     ``search_snapshot`` — a topic/media hit is dropped outright when any of
     these is active (they have no such columns to filter on)."""
-    if not local_embed_configured():
-        raise ValueError(
-            "hub unreachable; semantic search requires a configured local embed "
-            "provider — use keyword search without --semantic"
-        )
-    from khipu.models import show_models
-    from khipu.search_text import parse_time_filter
+    from khipu import profiles
+    from khipu.embed import embed_one, prefix_query, uses_task_prefixes
+    from khipu.search_text import parse_time_filter, search_tokens, token_hit_count
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
 
     since_dt = parse_time_filter(since) if since else None
     until_dt = parse_time_filter(until) if until else None
+    tokens = search_tokens(query)
     want_episode_only = bool(project or session_id or harness or t3_thread or via)
-    cfg = show_models().get("embed") or {}
-    vec = _embed_query_local(
-        query,
-        endpoint=cfg["endpoint"],
-        model_id=cfg["model_id"],
-    )
-    con = open_snapshot()
-    profile_row = con.execute(
-        "SELECT id FROM embedding_profiles WHERE is_active = 1 LIMIT 1"
-    ).fetchone()
-    profile = profile_row[0] if profile_row else None
-    if not profile:
+    spec = active_snapshot_profile_spec()
+    if spec is None:
         return []
+    from khipu.models import show_models
+
+    cfg = show_models().get("embed") or {}
+    if (cfg.get("provider") != "local" or spec.provider != "openai-compatible"
+            or not cfg.get("endpoint") or not cfg.get("model_id")
+            or spec.model != cfg["model_id"]
+            or _embeddings_url(spec.endpoint or "") != _embeddings_url(cfg["endpoint"])):
+        raise RuntimeError("offline semantic search unavailable: configured local provider and replica profile are incompatible")
+    profiles.register_spec(spec)
+    api_query = prefix_query(query) if uses_task_prefixes(spec.id) else query
+    vec = embed_one(
+        api_query, profile=spec.id, retries=0, timeout=60.0, delay=0,
+        input_type="query",
+    )
+    if len(vec) != spec.dim:
+        raise ValueError(
+            f"query embedding dimension {len(vec)} does not match snapshot "
+            f"profile {spec.id!r} dimension {spec.dim}"
+        )
+    con = open_snapshot()
+    profile = spec.id
     params: list[Any] = [profile]
     kind_clause = ""
     if kind:
@@ -2098,12 +2338,13 @@ def semantic_search_snapshot(
         if knd == "topic":
             trow = con.execute(
                 "SELECT COALESCE(title, slug), COALESCE(updated_at, created_at) "
-                "FROM topics WHERE slug = ?",
+                "FROM topics WHERE slug = ? AND deleted_at IS NULL",
                 (ref,),
             ).fetchone()
-            if trow:
-                label = trow[0] or ref
-                ts_val = trow[1]
+            if not trow:
+                continue
+            label = trow[0] or ref
+            ts_val = trow[1]
         elif knd == "episode":
             if want_episode_only:
                 erow = con.execute(
@@ -2130,11 +2371,12 @@ def semantic_search_snapshot(
                     "WHERE CAST(id AS TEXT) = ?",
                     (ref,),
                 ).fetchone()
-                if erow:
-                    if erow[2] is not None:
-                        continue
-                    label = erow[0] or ref
-                    ts_val = erow[1]
+                if not erow:
+                    continue
+                if erow[2] is not None:
+                    continue
+                label = erow[0] or ref
+                ts_val = erow[1]
         if time_filtered:
             ts = _parse_snapshot_ts(ts_val)
             if ts is None:
@@ -2152,12 +2394,34 @@ def semantic_search_snapshot(
                     "label": clip_snippet(str(label), LABEL_LIMIT),
                     "snippet": clip_snippet(chunk_text or "", SNIPPET_LIMIT),
                     "score": score,
+                    "cosine": score,
+                    "cosine_sim": score,
+                    "profile": profile,
+                    "lexical_hits": token_hit_count(
+                        f"{label or ''} {chunk_text or ''}", tokens
+                    ),
                     "chunk_idx": chunk_idx,
                 },
             )
         )
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [item for _, item in scored[: max(1, limit)]]
+    # Chunks are evidence, not independent entities: retain the strongest
+    # chunk per logical row before applying the caller's entity budget.
+    unique: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+    for score, item in scored:
+        key = (str(item["kind"]), str(item["id"]))
+        retained = unique.get(key)
+        if retained is None:
+            unique[key] = (score, item)
+            continue
+        strongest = retained[1]
+        strongest["lexical_hits"] = max(
+            int(strongest.get("lexical_hits") or 0),
+            int(item.get("lexical_hits") or 0),
+        )
+        strongest["cosine"] = max(float(strongest.get("cosine") or 0), score)
+        strongest["cosine_sim"] = max(float(strongest.get("cosine_sim") or 0), score)
+    return [item for _, item in list(unique.values())[: max(1, limit)]]
 
 
 # R1 follow-up (2026-09-14): the per-prompt recall lane (khipu.recall_prompt)
@@ -2208,15 +2472,77 @@ def prompt_recall_snapshot_status() -> dict[str, Any]:
     }
 
 
-def active_snapshot_profile() -> str | None:
+def active_snapshot_profile_spec() -> ProfileSpec | None:
+    """Validate the active replica profile without consulting the hub."""
+    from khipu import profiles
+
     try:
         con = open_snapshot()
     except FileNotFoundError:
         return None
-    row = con.execute(
-        "SELECT id FROM embedding_profiles WHERE is_active = 1 LIMIT 1"
-    ).fetchone()
-    return row[0] if row else None
+    try:
+        row = con.execute(
+            "SELECT id, provider, model, dim, COALESCE(normalize, 'l2') "
+            "FROM embedding_profiles WHERE is_active = 1 LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        profile_id, provider, model, dim, normalize = row
+        endpoint = None
+        if _snapshot_table_columns(con, "snapshot_meta"):
+            saved = con.execute(
+                "SELECT value FROM snapshot_meta WHERE key = ?",
+                (f"embedding_profile:{profile_id}",),
+            ).fetchone()
+            if saved:
+                try:
+                    record = json.loads(saved[0])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"snapshot profile {profile_id!r} metadata is unreadable") from exc
+                expected = {
+                    "id": profile_id, "provider": provider, "model": model,
+                    "dim": int(dim), "normalize": normalize,
+                }
+                if not isinstance(record, dict) or any(record.get(k) != v for k, v in expected.items()):
+                    raise ValueError(f"snapshot profile {profile_id!r} metadata conflicts with its row")
+                endpoint = record.get("endpoint") or None
+        spec = profiles.validate_spec(
+            profile_id, provider=provider, model=model, dim=int(dim),
+            normalize=normalize, endpoint=endpoint,
+        )
+        seeded = profiles.SEED_PROFILES.get(profile_id)
+        if seeded is not None and seeded != spec:
+            raise ValueError(f"snapshot profile {profile_id!r} conflicts with the seeded specification")
+        width = con.execute(
+            "SELECT length(embedding) FROM memory_embeddings "
+            "WHERE profile = ? AND embedding IS NOT NULL LIMIT 1",
+            (profile_id,),
+        ).fetchone()
+        if width and int(width[0]) != spec.dim * 4:
+            raise ValueError(
+                f"snapshot profile {profile_id!r} dimension {spec.dim} conflicts "
+                f"with stored vector dimension {int(width[0]) // 4}"
+            )
+        return spec
+    finally:
+        con.close()
+
+
+def active_snapshot_profile() -> str | None:
+    from khipu import profiles
+
+    try:
+        spec = active_snapshot_profile_spec()
+    except (ValueError, TypeError, sqlite3.Error) as exc:
+        _log(
+            "snapshot semantic leg disabled: active embedding profile is "
+            f"unavailable ({type(exc).__name__}: {exc})"
+        )
+        return None
+    if spec is None:
+        return None
+    profiles.register_spec(spec)
+    return spec.id
 
 
 # The rows cosine_candidates_snapshot scores, kept for the life of the process.
@@ -2229,8 +2555,8 @@ _MATRIX_CACHE: dict[str, Any] = {}
 
 
 def _matrix_rows(
-    path: Path, profile: str, kind: str | None
-) -> tuple[list[tuple[Any, ...]], dict[int, tuple[str, str, int]]]:
+    path: Path, profile: str, kind: str | None, *, deadline: float | None = None,
+) -> tuple[list[tuple[Any, ...]], dict[int, tuple[str, str, int, str]]]:
     """(rows, by_rowid) for one profile on the replica at ``path``, from the
     process cache while the file is unchanged. The load runs under the lock so
     concurrent callers wait for one read instead of each doing their own."""
@@ -2239,36 +2565,57 @@ def _matrix_rows(
         key: tuple[Any, ...] | None = (str(path), st.st_mtime_ns, st.st_size, profile, kind)
     except OSError:
         key = None
-    with _MATRIX_LOCK:
+    remaining = -1 if deadline is None else max(0, deadline - time.monotonic())
+    if not _MATRIX_LOCK.acquire(timeout=remaining):
+        raise TimeoutError("replica matrix deadline expired")
+    try:
         if key is not None and _MATRIX_CACHE.get("key") == key:
             return _MATRIX_CACHE["rows"], _MATRIX_CACHE["by_rowid"]
         con = open_snapshot()
+        if deadline is not None:
+            con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         try:
             params: list[Any] = [profile]
             kind_clause = ""
             if kind:
                 kind_clause = " AND kind = ?"
                 params.append(kind)
+            topic_live = ""
+            topic_cols = _snapshot_table_columns(con, "topics")
+            if "slug" in topic_cols and "deleted_at" in topic_cols:
+                topic_live = " AND (kind != 'topic' OR EXISTS (SELECT 1 FROM topics t WHERE t.slug = ref AND t.deleted_at IS NULL))"
             rows = con.execute(
                 # A commitment has its own dedicated surface (khipu_owed), not
                 # generic search — same exclusion as embed._cosine_candidates.
-                # chunk_text is deliberately NOT selected here — it is fetched
-                # for the winning rows only; scoring needs nothing but the blob.
-                f"SELECT rowid, kind, ref, chunk_idx, embedding FROM memory_embeddings "
-                f"WHERE profile = ? AND kind != 'commitment'{kind_clause} AND embedding IS NOT NULL",
+                # Retain the full logical row with the vector generation.
+                # A fresh text lookup after scoring can pair a replacement
+                # rowid with the identity from the prior snapshot generation.
+                f"SELECT rowid, kind, ref, chunk_idx, chunk_text, embedding FROM memory_embeddings "
+                f"WHERE profile = ? AND kind != 'commitment'{kind_clause} AND embedding IS NOT NULL{topic_live}",
                 params,
             ).fetchall()
         finally:
             con.close()
-        by_rowid = {rowid: (knd, ref, chunk_idx) for rowid, knd, ref, chunk_idx, _blob in rows}
+        def normalize_row(row):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("replica matrix deadline expired")
+            rowid, knd, ref, chunk_idx, text, blob = row
+            vec = _blob_to_vector(blob)
+            norm = math.sqrt(sum(x * x for x in vec))
+            return (rowid, knd, ref, chunk_idx, text, _vector_to_blob([x / norm for x in vec]) if norm else blob)
+        rows = [normalize_row(row) for row in rows]
+        by_rowid = {rowid: (knd, ref, chunk_idx, text or "") for rowid, knd, ref, chunk_idx, text, _blob in rows}
         _MATRIX_CACHE.clear()
         if key is not None:
             _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid})
         return rows, by_rowid
+    finally:
+        _MATRIX_LOCK.release()
 
 
 def cosine_candidates_snapshot(
-    vec: Sequence[float], profile: str, *, limit: int, kind: str | None = None
+    vec: Sequence[float], profile: str, *, limit: int, kind: str | None = None,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     """Raw cosine-ordered candidates over the LOCAL replica's ``memory_embeddings``
     (best first) — the offline analog of ``embed._cosine_candidates``. Each row
@@ -2278,56 +2625,39 @@ def cosine_candidates_snapshot(
     just yields ``[]``; a genuine sqlite error still propagates (the caller
     decides whether that means "fall back to the hub").
 
-    Scoring (Phase 0 session C, finding B10 — docs/research/
-    hindsight-plan-review-2026-09-28.md): selects only the rowid and
-    embedding blob needed to rank every candidate, not ``chunk_text`` — that
-    used to be pulled for every row just to score it (measured 226ms over
-    ~18,400 rows on the production-size replica) — and fetches
-    ``chunk_text`` in a second, tiny query for only the rows that actually
-    win. ``khipu.vector_scan.top_k_by_dot`` does the ranking itself (BLAS
-    when a system library loads, exact Python arithmetic for the final
-    scores either way); this function's signature, output rows, keys,
+    Scoring loads each vector and its matching chunk text into the generation
+    cache together, then ``khipu.vector_scan.top_k_by_dot`` ranks the cached
+    vectors (BLAS when a system library loads, exact Python arithmetic for the
+    final scores either way). This function's signature, output rows, keys,
     4-decimal scores and order are unchanged from before.
     """
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
     from khipu.vector_scan import top_k_by_dot
 
-    rows, by_rowid = _matrix_rows(snapshot_path(), profile, kind)
-    # Plain dot product, not _cosine()'s sqrt-normalize-divide: every profile
-    # here is stored via embed.embed_batch, which L2-normalizes every vector
-    # before it is ever written (embedding_profiles.normalize = 'l2', the
-    # schema's own guarantee) — so dot(a, b) on two unit vectors already IS
-    # the cosine similarity. The query vector is still normalized once, up
-    # front, defensively (cheap: it happens once, not per row) in case its
-    # source ever changes.
-    qn = math.sqrt(sum(x * x for x in vec)) or 1.0
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("replica scan deadline expired")
+    rows, by_rowid = _matrix_rows(snapshot_path(), profile, kind, **({"deadline": deadline} if deadline is not None else {}))
+    pending = {str(i) for i in _pending_erasure_ids(snapshot_path())}
+    rows = [r for r in rows if r[1] != "episode" or str(r[2]) not in pending]
+    # Custom profiles may store unnormalised vectors. Normalize both sides
+    # before the dot scan so BLAS and pure-Python paths return true cosine.
+    qn = math.sqrt(sum(x * x for x in vec))
+    if qn == 0:
+        return []
     qvec = tuple(x / qn for x in vec)
 
+    wanted = max(1, int(limit))
     winners = top_k_by_dot(
-        qvec,
-        ((rowid, blob) for rowid, _knd, _ref, _chunk_idx, blob in rows),
-        max(1, int(limit)),
+        qvec, ((rowid, blob) for rowid, _knd, _ref, _idx, _text, blob in rows),
+        wanted, entity_key=lambda rowid: by_rowid[rowid][:2], deadline=deadline,
+        max_abs_component=1.0,
     )
     if not winners:
         return []
 
-    win_rowids = [rowid for rowid, _score in winners]
-    placeholders = ",".join("?" for _ in win_rowids)
-    con = open_snapshot()
-    try:
-        texts: dict[int, str] = dict(
-            con.execute(
-                f"SELECT rowid, chunk_text FROM memory_embeddings WHERE rowid IN ({placeholders})",
-                win_rowids,
-            ).fetchall()
-        )
-    finally:
-        con.close()
-
     out: list[dict[str, Any]] = []
     for rowid, score in winners:
-        knd, ref, chunk_idx = by_rowid[rowid]
-        chunk_text = texts.get(rowid) or ""
+        knd, ref, chunk_idx, chunk_text = by_rowid[rowid]
         out.append({
             "kind": knd, "id": ref, "chunk_idx": chunk_idx,
             "score": round(float(score), 4),
@@ -2344,47 +2674,74 @@ def snapshot_row_metadata(
     """Attach ts/project/status onto already-fused local-replica rows,
     mirroring ``embed._apply_search_filters``'s episode/topic metadata pass
     (project via COALESCE(project, scope) for episodes, status + the
-    frontmatter->>'project' equivalent for topics). Drops a tombstoned row
-    outright, same as the hub leg. A row this function has no metadata for
-    (e.g. a node) passes through unchanged.
+    frontmatter->>'project' equivalent for topics). Drops a tombstoned or
+    missing episode/topic source row outright, same as the hub leg. Other
+    kinds (e.g. nodes) pass through unchanged.
     """
     out: list[dict[str, Any]] = []
     episode_ids = sorted({str(r["id"]) for r in rows if r.get("kind") == "episode"})
     topic_ids = sorted({str(r["id"]) for r in rows if r.get("kind") == "topic"})
     meta: dict[tuple[str, str], dict[str, Any]] = {}
     if episode_ids:
-        placeholders = ",".join("?" for _ in episode_ids)
-        for eid, ts, proj, deleted in con.execute(
-            f"SELECT CAST(id AS TEXT), ts, COALESCE(project, scope), deleted_at "
-            f"FROM episodes WHERE CAST(id AS TEXT) IN ({placeholders})",
-            episode_ids,
-        ).fetchall():
-            meta[("episode", eid)] = {"ts": ts, "project": proj, "deleted": deleted is not None}
+        episode_cols = _snapshot_table_columns(con, "episodes")
+        if "id" in episode_cols:
+            placeholders = ",".join("?" for _ in episode_ids)
+            ts_expr = "ts" if "ts" in episode_cols else "NULL"
+            if {"project", "scope"} <= episode_cols:
+                project_expr = "COALESCE(project, scope)"
+            elif "project" in episode_cols:
+                project_expr = "project"
+            elif "scope" in episode_cols:
+                project_expr = "scope"
+            else:
+                project_expr = "NULL"
+            deleted_expr = "deleted_at" if "deleted_at" in episode_cols else "NULL"
+            for eid, ts, proj, deleted in con.execute(
+                f"SELECT CAST(id AS TEXT), {ts_expr}, {project_expr}, {deleted_expr} "
+                f"FROM episodes WHERE CAST(id AS TEXT) IN ({placeholders})",
+                episode_ids,
+            ).fetchall():
+                meta[("episode", eid)] = {
+                    "ts": ts, "project": proj, "deleted": deleted is not None,
+                }
     if topic_ids:
-        placeholders = ",".join("?" for _ in topic_ids)
-        # superseded_by (Phase 2, session B) is absent on a version-1
-        # replica — probe rather than assume, same posture as every other
-        # column this module reads from an old dump.
-        has_superseded_by = "superseded_by" in _snapshot_table_columns(con, "topics")
-        superseded_expr = "superseded_by" if has_superseded_by else "NULL"
-        for slug, ts, status, frontmatter, deleted, superseded_by in con.execute(
-            f"SELECT slug, COALESCE(updated_at, created_at), status, frontmatter, "
-            f"deleted_at, {superseded_expr} FROM topics WHERE slug IN ({placeholders})",
-            topic_ids,
-        ).fetchall():
-            proj = None
-            if frontmatter:
-                try:
-                    proj = json.loads(frontmatter).get("project")
-                except (ValueError, AttributeError, TypeError):
-                    proj = None
-            meta[("topic", slug)] = {
-                "ts": ts, "status": status or "active", "project": proj,
-                "deleted": deleted is not None, "superseded_by": superseded_by,
-            }
+        topic_cols = _snapshot_table_columns(con, "topics")
+        if "slug" in topic_cols:
+            placeholders = ",".join("?" for _ in topic_ids)
+            if {"updated_at", "created_at"} <= topic_cols:
+                ts_expr = "COALESCE(updated_at, created_at)"
+            elif "updated_at" in topic_cols:
+                ts_expr = "updated_at"
+            elif "created_at" in topic_cols:
+                ts_expr = "created_at"
+            else:
+                ts_expr = "NULL"
+            status_expr = "status" if "status" in topic_cols else "NULL"
+            frontmatter_expr = "frontmatter" if "frontmatter" in topic_cols else "NULL"
+            deleted_expr = "deleted_at" if "deleted_at" in topic_cols else "NULL"
+            superseded_expr = "superseded_by" if "superseded_by" in topic_cols else "NULL"
+            for slug, ts, status, frontmatter, deleted, superseded_by in con.execute(
+                f"SELECT slug, {ts_expr}, {status_expr}, {frontmatter_expr}, "
+                f"{deleted_expr}, {superseded_expr} FROM topics "
+                f"WHERE slug IN ({placeholders})",
+                topic_ids,
+            ).fetchall():
+                proj = None
+                if frontmatter:
+                    try:
+                        proj = json.loads(frontmatter).get("project")
+                    except (ValueError, AttributeError, TypeError):
+                        proj = None
+                meta[("topic", slug)] = {
+                    "ts": ts, "status": status or "active", "project": proj,
+                    "deleted": deleted is not None, "superseded_by": superseded_by,
+                }
     for r in rows:
-        m = meta.get((r.get("kind"), str(r.get("id"))))
+        row_kind = r.get("kind")
+        m = meta.get((row_kind, str(r.get("id"))))
         if m is None:
+            if row_kind in {"episode", "topic"}:
+                continue
             out.append(dict(r))
             continue
         if m.get("deleted"):
@@ -2489,6 +2846,13 @@ def search_stale_payload(
             t3_thread=t3_thread, via=via,
         )
         con = open_snapshot()
+        try:
+            from khipu import relevance as _relevance
+            from khipu.search_text import search_tokens
+            if _relevance.enabled():
+                results, _floor = _relevance.gate(results, len(search_tokens(query)))
+        except Exception:
+            results = []
         results, degraded_legs = _graph_candidates_snapshot(con, results)
         results = _filter_t3_snapshot_rows(con, results, t3_thread, via)
         results = enrich_search_results_snapshot(con, results)
@@ -2509,7 +2873,11 @@ def search_stale_payload(
         project=project, session_id=session_id, harness=harness,
         t3_thread=t3_thread, via=via,
     )
-    results = merge_outbox_episodes(results, t3_thread=t3_thread, via=via)
+    results = merge_outbox_episodes(
+        results, query=query, kind=kind, since=since, until=until,
+        project=project, session_id=session_id, harness=harness,
+        t3_thread=t3_thread, via=via,
+    )
     results, degraded_legs = _graph_candidates_snapshot(con, results)
     results = _filter_t3_snapshot_rows(con, results, t3_thread, via)
     results = enrich_search_results_snapshot(con, results)

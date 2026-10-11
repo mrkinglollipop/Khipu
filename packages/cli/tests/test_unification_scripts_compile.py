@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import os
-import py_compile
+import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 def _scripts_dir() -> Path | None:
@@ -36,7 +38,7 @@ class UnificationScriptsCompileTest(unittest.TestCase):
             path = SCRIPTS / name
             if not path.is_file():
                 continue
-            py_compile.compile(str(path), doraise=True)
+            compile(path.read_bytes(), str(path), "exec")
             compiled += 1
         if compiled == 0:
             self.skipTest("graphify scripts not on disk")
@@ -44,3 +46,14 @@ class UnificationScriptsCompileTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CompileIsolationTest(unittest.TestCase):
+    def test_compile_creates_no_source_adjacent_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for name in NAMES:
+                (root / name).write_text("value = 1\n")
+            with mock.patch(__name__ + ".SCRIPTS", root), mock.patch.object(sys, "pycache_prefix", None):
+                UnificationScriptsCompileTest().test_session_scripts_compile()
+            self.assertEqual({p.name for p in root.iterdir()}, set(NAMES))

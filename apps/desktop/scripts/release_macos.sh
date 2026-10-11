@@ -411,11 +411,46 @@ xcrun stapler staple "$BUNDLE"
 xcrun stapler validate "$BUNDLE"
 repack_updater_artifacts "$BUNDLE"
 
+install_staged_app() {
+  local bundle="$1"
+  local target="${2:-/Applications/Khipu.app}"
+  local parent
+  parent="$(dirname "$target")"
+  local stage_dir
+  stage_dir="$(mktemp -d "$parent/.khipu-install.XXXXXX")" || {
+    echo "failed to create application install staging directory" >&2
+    return 1
+  }
+  local staged="$stage_dir/Khipu.app"
+  local previous="$stage_dir/previous.app"
+  if ! ditto "$bundle" "$staged" || [[ ! -f "$staged/Contents/Info.plist" ]] || [[ ! -x "$staged/Contents/MacOS/Khipu" ]]; then
+    rm -rf "$stage_dir"
+    echo "failed to stage application install; existing app left untouched" >&2
+    return 1
+  fi
+  if [[ -e "$target" ]] && ! mv "$target" "$previous"; then
+    rm -rf "$stage_dir"
+    echo "failed to preserve existing application before install" >&2
+    return 1
+  fi
+  if mv "$staged" "$target"; then
+    rm -rf "$stage_dir"
+    echo "installed $target"
+    return 0
+  fi
+  if [[ -e "$previous" ]]; then
+    if ! mv "$previous" "$target"; then
+      echo "failed to restore previous application; backup retained at $previous" >&2
+      return 1
+    fi
+  fi
+  rm -rf "$stage_dir"
+  echo "failed to install staged application" >&2
+  return 1
+}
+
 if [[ "$INSTALL_APPS" -eq 1 ]]; then
-  # /Applications delivery is the documented install path.
-  rm -rf /Applications/Khipu.app
-  ditto "$BUNDLE" /Applications/Khipu.app
-  echo "installed /Applications/Khipu.app"
+  install_staged_app "$BUNDLE"
 fi
 
 if [[ "$PUBLISH" -eq 1 ]]; then
@@ -478,9 +513,26 @@ EOF
     --notes "$RELEASE_NOTES" \
     "$DMG" "$STABLE_DMG" "$TGZ" "$SIG" "$NOTES_DIR/latest.json"
   echo "published $VERSION to https://github.com/$RELEASE_REPO/releases/tag/$TAG"
-  # Prove the feed the app polls actually serves this version.
-  curl -fsSL "https://github.com/$RELEASE_REPO/releases/latest/download/latest.json" \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); print('served version:', d['version'], '->', d['platforms']['darwin-aarch64']['url'])"
+  # Prove the feed the app polls contains this release's exact version and asset.
+  FETCHED_LATEST="$NOTES_DIR/fetched-latest.json"
+  curl -fsSL "https://github.com/$RELEASE_REPO/releases/latest/download/latest.json" -o "$FETCHED_LATEST"
+  if ! python3 - "$FETCHED_LATEST" "$VERSION" "$ASSET_BASE/$TGZ_NAME" <<'PY'
+import json, sys
+manifest, version, asset_url = sys.argv[1:]
+with open(manifest, encoding="utf-8") as f:
+    data = json.load(f)
+actual_version = data.get("version")
+actual_url = data.get("platforms", {}).get("darwin-aarch64", {}).get("url")
+if actual_version != version:
+    raise SystemExit(f"latest.json version mismatch: {actual_version!r} != {version!r}")
+if actual_url != asset_url:
+    raise SystemExit(f"latest.json asset mismatch: {actual_url!r} != {asset_url!r}")
+print("served version:", actual_version, "->", actual_url)
+PY
+  then
+    echo "release published, but latest.json verification failed" >&2
+    exit 1
+  fi
   STUDIO="${KING_LOLLIPOP_STUDIO:-}"
   if [[ -z "$STUDIO" ]]; then
     echo "note: KING_LOLLIPOP_STUDIO unset; skipping X draft and site bump"

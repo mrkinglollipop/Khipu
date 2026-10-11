@@ -668,6 +668,9 @@ class ConversationImageLandTest(unittest.TestCase):
             },
         )
         self._env.start()
+        from khipu import sources
+
+        sources.save_sources({"sources": [{"id": "conversation_memory"}]})
 
     def tearDown(self):
         self._env.stop()

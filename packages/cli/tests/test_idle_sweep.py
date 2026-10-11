@@ -128,12 +128,12 @@ class IdleSweepTest(unittest.TestCase):
         read.assert_not_called()
         self.assertEqual(out["skipped"], {"missing_transcript": 1, "not_idle": 1})
 
-    def test_capture_newer_than_transcript_is_skipped(self):
+    def test_first_sight_timestamp_does_not_hide_unread_idle_work(self):
         self.session(last_ts=self.old)
-        with mock.patch.object(sc, "read_window") as read:
+        with mock.patch.object(sc, "read_window", wraps=sc.read_window) as read:
             out = sc.sweep_idle(now=self.now)
-        read.assert_not_called()
-        self.assertEqual(out["skipped"], {"already_captured": 1})
+        read.assert_called_once()
+        self.assertEqual(out["swept"], 1)
 
     def test_limit_counts_transcript_reads_and_later_runs_make_progress(self):
         for i in range(3):
@@ -158,15 +158,17 @@ class IdleSweepTest(unittest.TestCase):
         self.assertEqual(out["skipped"]["error"], 1)
         self.assertIn("sweep: skipped codex--bad.json: JSONDecodeError", sc.log_path().read_text())
 
-    def test_unchanged_small_or_assistant_only_windows_are_not_reread(self):
+    def test_unchanged_small_windows_are_not_reread_and_assistant_tail_queues_once(self):
         for sid, role, text in (("small", "user", "hi"), ("assistant", "assistant", "x" * 300)):
             self.session(sid, rows=[{"type": "event_msg", "payload": {
                 "type": "user_message" if role == "user" else "agent_message", "message": text}}])
-        self.assertEqual(sc.sweep_idle(now=self.now)["skipped"], {"nothing_new": 2})
+        first = sc.sweep_idle(now=self.now)
+        self.assertEqual(first["skipped"], {"nothing_new": 1})
+        self.assertEqual(first["swept"], 1)
         with mock.patch.object(sc, "read_window") as read:
             out = sc.sweep_idle(now=self.now)
         read.assert_not_called()
-        self.assertEqual(out["skipped"], {"unchanged": 2})
+        self.assertEqual(out["skipped"], {"nothing_unread": 1, "unchanged": 1})
         path = self.home / ".codex" / "sessions" / "rollout-small.jsonl"
         with path.open("a") as stream:
             stream.write(json.dumps({"type": "event_msg", "payload": {
@@ -491,6 +493,7 @@ class IdleSweepTest(unittest.TestCase):
         sync.assert_not_called()
 
     def test_due_hook_job_bytes_match_original_schema_for_split_windows(self):
+        import hashlib
         rows = [
             {"type": "event_msg", "payload": {"type": "user_message", "message": "é" * 100}},
             {"type": "event_msg", "payload": {"type": "agent_message", "message": "a" * 100}},
@@ -516,7 +519,9 @@ class IdleSweepTest(unittest.TestCase):
                 "offset_before": 0, "offset_after": path.stat().st_size,
                 "repo_root": "/repo", "project": "acme/project", "parent_session_id": "codex:parent",
                 "transcript_range": f"0:{path.stat().st_size}", "truncated_chars": 0,
-                "window_id": f"{1:08x}" * 4, "part": f"{i}/2", "capture_note": "note é",
+                "window_id": hashlib.sha256(
+                    f"codex:s1:0:{path.stat().st_size}".encode("utf-8")
+                ).hexdigest(), "part": f"{i}/2", "capture_note": "note é",
             }, ensure_ascii=False).encode("utf-8"))
         self.assertCountEqual([p.read_bytes() for p in sc.queued_jobs()], expected)
         self.assertEqual(sc.load_state("codex", "s1")["offset"], path.stat().st_size)

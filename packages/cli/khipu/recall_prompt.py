@@ -30,6 +30,10 @@ turn. Nothing here calls a model.
 from __future__ import annotations
 
 import copy
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import os
 import re
@@ -37,6 +41,7 @@ import sqlite3
 import struct
 import sys
 import threading
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -165,14 +170,58 @@ def _save_recent_batches(session_id: str, batches: list[tuple[str, ...]]) -> Non
     try:
         p = _dedup_path(session_id)
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps({"batches": [list(b) for b in batches[-DEDUP_WINDOW:]]}),
-            encoding="utf-8",
-        )
-        os.replace(tmp, p)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=p.parent,
+                                         prefix=p.name, suffix=".tmp", delete=False) as f:
+            tmp = Path(f.name)
+            json.dump({"batches": [list(b) for b in batches[-DEDUP_WINDOW:]]}, f)
+        try:
+            os.replace(tmp, p)
+        finally:
+            tmp.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _batch_seen(ids: tuple[str, ...], recent: list[tuple[str, ...]]) -> bool:
+    if ids not in recent:
+        return False
+    for key in ids:
+        source = key.rsplit("@", 1)[0]
+        latest = next((k for batch in reversed(recent) for k in batch
+                       if k.rsplit("@", 1)[0] == source), key)
+        if latest != key:
+            return False
+    return True
+
+
+def _dedup_transaction(session_id: str, hits: list[dict[str, Any]], delivery: dict | None):
+    """Hold the session lock until delivery; contention never waits on the hook."""
+    if fcntl is None:
+        raise OSError("dedup locking unavailable")
+    p = _dedup_path(session_id).with_suffix(".lock")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lock = p.open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        ids = _hit_ids(hits)
+        recent = _load_recent_batches(session_id)
+        if _batch_seen(ids, recent):
+            lock.close()
+            return True
+        def finish(commit: bool):
+            try:
+                if commit:
+                    _save_recent_batches(session_id, recent + [ids])
+            finally:
+                lock.close()
+        if delivery is None:
+            finish(True)
+        else:
+            delivery["finish"] = finish
+        return False
+    except Exception:
+        lock.close()
+        raise
 
 
 def _hit_ids(hits: list[dict[str, Any]]) -> tuple[str, ...]:
@@ -402,7 +451,9 @@ def _cached_query_embed(prompt: str, profile: str) -> list[float]:
     have had something.
     """
     from khipu.embed import embed_one, prefix_query, uses_task_prefixes
+    from khipu.redact import redact_secrets
 
+    prompt, _ = redact_secrets(prompt)
     key = _query_embed_cache_key(profile, prompt)
     hit = _query_embed_cache_get(key)
     if hit:
@@ -427,6 +478,7 @@ class _SnapshotUnusable(Exception):
 def _snapshot_search_hits(
     prompt: str, *, project: str | None, tz: str | None = None,
     started: float | None = None, progress: dict[str, Any] | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Lexical + cosine, RRF-fused, entirely against the local sqlite
     replica — no Postgres, no network round trip beyond one (cacheable)
@@ -470,7 +522,8 @@ def _snapshot_search_hits(
     # here instead let the project lookup before this call eat the margin
     # between the two limits, and a late embedding then cost the keyword
     # rows too (2026-09-29: 25 of 28 real prompts under heavy machine load).
-    deadline = (started if started is not None else time.monotonic()) + LOCAL_LANE_DEADLINE_S
+    local_deadline = (started if started is not None else time.monotonic()) + LOCAL_LANE_DEADLINE_S
+    deadline = min(deadline, local_deadline) if deadline is not None else local_deadline
 
     profile = hub_snapshot.active_snapshot_profile()
     cosine_box: dict[str, Any] = {}
@@ -479,7 +532,7 @@ def _snapshot_search_hits(
         try:
             vec = _cached_query_embed(prompt, profile)
             cosine_box["rows"] = hub_snapshot.cosine_candidates_snapshot(
-                vec, profile, limit=_SEARCH_LIMIT
+                vec, profile, limit=_SEARCH_LIMIT, deadline=deadline
             )
         except Exception as exc:  # noqa: BLE001 — cosine is a bonus leg, not a requirement
             cosine_box["error"] = exc
@@ -729,6 +782,7 @@ def _trim_result(result: dict[str, Any], limit: int) -> dict[str, Any]:
 def _search_hits(
     prompt: str, *, cwd: str | None, limit: int = TOP_N, tz: str | None = None,
     progress: dict[str, Any] | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """The gated search itself (no timeout, no dedup — those wrap this).
 
@@ -755,7 +809,7 @@ def _search_hits(
     try:
         _enter_stage(progress, "keyword")
         result = _snapshot_search_hits(
-            prompt, project=project, tz=tz, started=started, progress=progress
+            prompt, project=project, tz=tz, started=started, progress=progress, deadline=deadline
         )
         return _trim_result(result, limit)
     except _SnapshotUnusable as exc:
@@ -764,12 +818,14 @@ def _search_hits(
         _log(f"snapshot search failed ({type(exc).__name__}: {exc}) — falling back to hub")
 
     from khipu.embed import hybrid_search
+    from khipu.redact import redact_secrets
 
     _enter_stage(progress, "hub")
     # include_libraries=False: this lane has a latency budget and must never
     # wait on a second embedding provider (library search is explicit-only).
+    sanitized, _ = redact_secrets(prompt)
     payload = hybrid_search(
-        prompt, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project,
+        sanitized, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project,
         include_libraries=False,
     )
     rows = _apply_score_floor(payload.get("results") or [])
@@ -806,6 +862,7 @@ def _hub_hits_budgeted(
     project: str | None,
     budget_ms: int,
     limit: int,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Lexical (pg_trgm ILIKE, ``cli._literal_candidates``) and query-
     embedding + cosine (``embed._cosine_candidates``) legs run concurrently
@@ -824,7 +881,8 @@ def _hub_hits_budgeted(
 
     Returns ``{"hits": [...], "legs": [...], "degraded": str | None}``.
     """
-    deadline = time.monotonic() + max(0, int(budget_ms)) / 1000.0
+    leg_deadline = time.monotonic() + max(0, int(budget_ms)) / 1000.0
+    deadline = min(deadline, leg_deadline) if deadline is not None else leg_deadline
     lexical_box: dict[str, Any] = {}
     cosine_box: dict[str, Any] = {}
 
@@ -861,8 +919,10 @@ def _hub_hits_budgeted(
     def _cosine_worker() -> None:
         try:
             from khipu.embed import _cosine_candidates
+            from khipu.redact import redact_secrets
 
-            rows = _cosine_candidates(prompt, limit=_SEARCH_LIMIT, kind=None, filters=None)
+            sanitized, _ = redact_secrets(prompt)
+            rows = _cosine_candidates(sanitized, limit=_SEARCH_LIMIT, kind=None, filters=None)
             for r in rows:
                 r["cosine"] = r.get("score")
             cosine_box["rows"] = rows
@@ -904,7 +964,11 @@ def _hub_hits_budgeted(
             degraded = None
 
     if not lists:
-        return {"hits": [], "legs": legs, "degraded": degraded}
+        out = {"hits": [], "legs": legs, "degraded": degraded}
+        if not legs:
+            out["reason"] = ("timeout>hub budget" if t_lex.is_alive() or t_cos.is_alive()
+                             else "error: no search legs completed")
+        return out
 
     from khipu.search_text import fuse_ranked_lists
     from khipu.recency import apply_project_and_status
@@ -962,6 +1026,7 @@ def _hub_hits_budgeted(
 def _search_hits_budgeted(
     prompt: str, *, cwd: str | None, budget_ms: int, limit: int = TOP_N,
     project: str | None = None,
+    deadline: float | None = None, progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """``khipu_status``'s ``prior_work`` path (R10 + this phase): local
     snapshot first when fresh (already sub-300ms measured — see
@@ -981,9 +1046,13 @@ def _search_hits_budgeted(
     ``["lexical"]`` with ``degraded="embedding late"``, not a single opaque
     ``"snapshot"`` placeholder).
     """
+    started = time.monotonic()
+    leg_deadline = started + max(0, budget_ms) / 1000.0
+    deadline = min(deadline, leg_deadline) if deadline is not None else leg_deadline
     project = _project_for_cwd(cwd) or project
     try:
-        result = _snapshot_search_hits(prompt, project=project)
+        result = _snapshot_search_hits(prompt, project=project, started=started,
+                                       deadline=deadline, progress=progress)
         hits = _apply_score_floor(result["hits"])[:limit]
         return {"hits": hits, "legs": result["legs"], "degraded": result["degraded"]}
     except _SnapshotUnusable as exc:
@@ -994,7 +1063,8 @@ def _search_hits_budgeted(
     from khipu.search_text import search_tokens
 
     tokens = search_tokens(prompt)
-    return _hub_hits_budgeted(prompt, tokens, project=project, budget_ms=budget_ms, limit=limit)
+    return _hub_hits_budgeted(prompt, tokens, project=project, budget_ms=budget_ms,
+                              limit=limit, deadline=deadline)
 
 
 def _row_date(row: dict[str, Any]) -> str:
@@ -1025,14 +1095,14 @@ def _row_tag(row: dict[str, Any]) -> str:
     return " · ".join(bits)
 
 
-def render_block(hits: list[dict[str, Any]]) -> str:
+def render_block(hits: list[dict[str, Any]], *, produced: str = "") -> str:
     """The untrusted-data-fenced block, hard-capped at BLOCK_CHAR_BUDGET.
 
     Drops whole trailing hit lines rather than mid-truncating one — same
     posture as recall_rule._fit_budget — so a rendered line is never cut
     mid-word.
     """
-    if not hits:
+    if not hits and not produced:
         return ""
     from khipu.snippets import clip_snippet
 
@@ -1045,6 +1115,10 @@ def render_block(hits: list[dict[str, Any]]) -> str:
         if len("\n".join([*out, line, _FOOTER])) > BLOCK_CHAR_BUDGET:
             break
         out.append(line)
+    if produced:
+        remaining = BLOCK_CHAR_BUDGET - len("\n".join([*out, _FOOTER])) - 1
+        if remaining > 1:
+            out.append(produced if len(produced) <= remaining else produced[:remaining - 1] + "…")
     out.append(_FOOTER)
     return "\n".join(out)
 
@@ -1070,9 +1144,9 @@ def _outcome_for(reason: str, hits: list[Any]) -> str:
         return "dedup"
     if reason.startswith("timeout>"):
         return "timeout"
-    if reason.startswith("error:"):
+    if reason.startswith(("error:", "gate error:")):
         return "error"
-    if reason in _PRIOR_WORK_GATED_REASONS_FOR_OUTCOME or reason.startswith("gate error:"):
+    if reason in _PRIOR_WORK_GATED_REASONS_FOR_OUTCOME:
         return "gated"
     return "match" if hits else "no_match"
 
@@ -1162,6 +1236,8 @@ def prior_work_for_prompt(
     limit: int = TOP_N,
     budget_ms: int | None = None,
     tz: str | None = None,
+    deadline: float | None = None,
+    delivery: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The whole pipeline as a plain function: gate -> bounded search -> score
     floor -> dedup. Returns ``{"context": str, "hits": [...], "reason": str,
@@ -1183,8 +1259,7 @@ def prior_work_for_prompt(
     last stage the search entered.
 
     ``budget_ms`` (khipu_status / the gateway lane only — omitted by the
-    UserPromptSubmit hook, whose TIMEOUT_S-wrapped local-snapshot-first path
-    above is unchanged): switches the search leg from ``_search_hits`` (fixed
+    UserPromptSubmit hook): switches the search leg from ``_search_hits`` (fixed
     TIMEOUT_S, hub fallback runs cosine sequentially, empty on timeout) to
     ``_search_hits_budgeted`` (concurrent lexical+cosine hub legs, returns
     whatever finished by the deadline). When set, the result ALSO carries
@@ -1233,6 +1308,8 @@ def prior_work_for_prompt(
             return _gated("trivial acknowledgment")
     except Exception as exc:  # noqa: BLE001 — fail open
         return _gated(f"gate error: {exc}")
+    if deadline is not None and time.monotonic() >= deadline:
+        return _gated("timeout>request deadline")
 
     hits: list[dict[str, Any]] | None = None
     reason = "ok"
@@ -1242,8 +1319,9 @@ def prior_work_for_prompt(
     interpretation: dict[str, Any] | None = None
     stage: str | None = None
     progress: dict[str, Any] = {}
-    deadline = t0 + (max(0.05, budget_ms / 1000.0) + _BUDGET_SAFETY_SLACK_S
-                     if budget_ms is not None else TIMEOUT_S)
+    search_deadline = t0 + (max(0.05, budget_ms / 1000.0) + _BUDGET_SAFETY_SLACK_S
+                            if budget_ms is not None else TIMEOUT_S)
+    deadline = min(deadline, search_deadline) if deadline is not None else search_deadline
     thread_box: dict[str, Any] = {}
     thread_worker = None
     if thread:
@@ -1262,14 +1340,16 @@ def prior_work_for_prompt(
             result = _run_with_timeout(
                 _search_hits_budgeted, outer_timeout,
                 prompt, cwd=cwd, budget_ms=budget_ms, limit=limit, project=project,
+                deadline=deadline, progress=progress,
             )
             hits = result.get("hits") or []
             legs = result.get("legs") or []
             degraded = result.get("degraded")
+            reason = result.get("reason") or reason
         else:
             result = _run_with_timeout(
                 _search_hits, max(0, deadline - time.monotonic()), prompt, cwd=cwd, limit=limit, tz=tz,
-                progress=progress,
+                progress=progress, deadline=deadline,
             )
             hits = result.get("hits") or []
             legs = result.get("legs") or []
@@ -1278,7 +1358,7 @@ def prior_work_for_prompt(
             interpretation = result.get("time_interpretation")
     except _TimedOut:
         # Read once: the search thread may still publish after this point.
-        provisional = progress.get("provisional") if budget_ms is None else None
+        provisional = progress.get("provisional")
         if provisional is not None:
             result = _trim_result(provisional, limit)
             hits = result["hits"]
@@ -1304,12 +1384,23 @@ def prior_work_for_prompt(
             reason = "ok"
         if thread_worker.is_alive():
             degraded_legs.append("t3_thread")
-    ms = round((time.monotonic() - t0) * 1000, 1)
+    produced = ""
+    remaining = min(DELIVERABLE_LINE_TIMEOUT_S, max(0, deadline - time.monotonic()))
+    if remaining > 0:
+        try:
+            produced = _run_with_timeout(_deliverable_context_line, remaining, tokens, cwd=cwd)
+        except Exception:  # noqa: BLE001 — optional evidence cannot discard completed search
+            pass
+    context = render_block(hits or [], produced=produced)
 
-    if hits and session_id and not thread:
-        ids = _hit_ids(hits)
-        recent = _load_recent_batches(session_id)
-        if ids in recent:
+    if hits and session_id and not thread and context:
+        try:
+            seen = _dedup_transaction(session_id, hits, delivery)
+        except OSError:
+            seen = False
+            reason = "ok (dedup state unavailable or busy)"
+        if seen:
+            ms = round((time.monotonic() - t0) * 1000, 1)
             dedup_out = {"context": "", "hits": [], "reason": "dedup", "ms": ms}
             dedup_out["legs"] = legs
             dedup_out["degraded"] = degraded
@@ -1317,27 +1408,12 @@ def prior_work_for_prompt(
             if dedup_meta is not None:
                 dedup_out["prior_work_meta"] = dedup_meta
             return dedup_out
-        _save_recent_batches(session_id, recent + [ids])
     elif hits and not session_id:
         # No session id to key dedup state on: still inject (fail open), just
         # cannot suppress a repeat. Logged so the gap is visible, not silent.
         reason = "ok (no session_id: dedup skipped)"
 
-    context = render_block(hits or [])
-    # O4: "You produced <path> on <date> (episode N)" when a deliverable in
-    # this project matches >= 2 of the prompt's own tokens. Best-effort and
-    # additive — a DB hiccup here must not sink the hits already found.
-    try:
-        produced = _run_with_timeout(
-            _deliverable_context_line, DELIVERABLE_LINE_TIMEOUT_S, tokens, cwd=cwd
-        )
-    except _TimedOut:
-        produced = ""
-        _log(f"deliverable line skipped (not ready within {DELIVERABLE_LINE_TIMEOUT_S}s)")
-    if produced:
-        combined = f"{context}\n{produced}" if context else produced
-        if not thread or len(combined) <= BLOCK_CHAR_BUDGET:
-            context = combined
+    ms = round((time.monotonic() - t0) * 1000, 1)
     out = {"context": context, "hits": hits or [], "reason": reason, "ms": ms}
     out["legs"] = legs
     out["degraded"] = degraded
@@ -1416,7 +1492,31 @@ def _stdin_payload(raw: str) -> dict[str, Any]:
         return {}
 
 
-def hook_main(raw: str, *, shape: str = "claude") -> dict[str, Any]:
+def log_terminal_outcome(raw: str, reason: str, *, ms: float = 0.0) -> None:
+    payload = _stdin_payload(raw)
+    session = payload.get("session_id") or payload.get("sessionId") or "?"
+    _log(f"session={session} reason={reason} ms={ms:.1f} hits=[] legs=[] degraded=None")
+
+
+def finish_delivery(delivery: dict[str, Any], *, delivered: bool, reason: str | None = None) -> None:
+    finish = delivery.pop("finish", None)
+    if finish is not None:
+        finish(delivered)
+    result = delivery.pop("result", None)
+    if result is not None:
+        if reason:
+            result = {**result, "reason": reason, "hits": []}
+        payload = _stdin_payload(delivery.get("raw", ""))
+        session = payload.get("session_id") or payload.get("sessionId") or "?"
+        hit_ids = [f"{h.get('kind')}:{h.get('id')}" for h in result["hits"]]
+        stage = f" stage={result['stage']}" if result.get("stage") else ""
+        ms = round((time.monotonic() - delivery["started"]) * 1000, 1) if "started" in delivery else result["ms"]
+        _log(f"session={session} reason={result['reason']} ms={ms} hits={hit_ids} "
+             f"legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}")
+
+
+def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
+              delivery: dict[str, Any] | None = None) -> dict[str, Any]:
     """Build the harness-native envelope for one UserPromptSubmit call.
 
     ``shape='claude'`` (default, also used for Codex — same JSON shape):
@@ -1425,19 +1525,24 @@ def hook_main(raw: str, *, shape: str = "claude") -> dict[str, Any]:
     per-prompt event exists there); it emits ``additional_context``.
     """
     payload = _stdin_payload(raw)
+    started = time.monotonic()
     prompt = payload.get("prompt") or payload.get("message") or ""
     cwd = payload.get("cwd") or payload.get("cwd_path")
     session_id = payload.get("session_id") or payload.get("sessionId")
     if is_helper_session(cwd):
         return {}  # T3's thread-title helper: no recall, and no log line either
 
-    result = prior_work_for_prompt(prompt, cwd=cwd, session_id=session_id)
+    options = {} if deadline is None and delivery is None else {"deadline": deadline, "delivery": delivery}
+    result = prior_work_for_prompt(prompt, cwd=cwd, session_id=session_id, **options)
     hit_ids = [f"{h.get('kind')}:{h.get('id')}" for h in result["hits"]]
     stage = f" stage={result['stage']}" if result.get("stage") else ""
-    _log(
-        f"session={session_id or '?'} reason={result['reason']} ms={result['ms']} "
-        f"hits={hit_ids} legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}"
-    )
+    if delivery is not None:
+        delivery.update(result=result, raw=raw, started=started)
+    else:
+        _log(
+            f"session={session_id or '?'} reason={result['reason']} ms={result['ms']} "
+            f"hits={hit_ids} legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}"
+        )
     ctx = result["context"]
     if shape == "cursor":
         return {"additional_context": ctx} if ctx else {}
@@ -1459,12 +1564,24 @@ def prompt_recall_main(*, shape: str | None = None) -> None:
     except Exception:  # noqa: BLE001
         raw = ""
     want = (shape or ("cursor" if "--cursor" in sys.argv[1:] else "claude")).strip().lower()
+    delivery: dict[str, Any] = {}
     try:
-        out = hook_main(raw, shape=want)
+        deadline = None
+        try:
+            deadline = float(os.environ["KHIPU_RECALL_DEADLINE"])
+        except (KeyError, ValueError):
+            pass
+        out = hook_main(raw, shape=want, delivery=delivery, deadline=deadline)
     except Exception as exc:  # noqa: BLE001 — the one thing this must never do is raise
-        _log(f"hook_main crashed: {type(exc).__name__}: {exc}")
+        finish_delivery(delivery, delivered=False, reason="error: hook_main crashed")
+        log_terminal_outcome(raw, f"error: hook_main crashed: {type(exc).__name__}: {exc}")
         out = {}
-    print(json.dumps(out))
+    try:
+        print(json.dumps(out), flush=True)
+    except OSError:
+        finish_delivery(delivery, delivered=False, reason="error: stdout delivery failed")
+    else:
+        finish_delivery(delivery, delivered=True)
 
 
 # ---- doctor: the lane's real outcome rate (Phase 0 session C, finding B10) --
@@ -1508,11 +1625,8 @@ def _classify_call_reason(reason: str) -> str | None:
     doctor check counts — or ``None`` when ``reason`` is a GATE outcome
     ("no content tokens", "trivial acknowledgment", "gate error: ..."): no
     search was ever attempted, so it does not count as a searched call at
-    all. Checked as prefixes, not exact matches, so variants like "ok (no
-    session_id: dedup skipped)" and "timeout>1.2s" still classify; "gate
-    error: ..." deliberately does NOT match the "error" prefix (it starts
-    with "gate", not "error") — a gate never reaching a search leg is not
-    the same outcome as a search leg that ran and raised.
+    all. Gate failures count as errors; deliberate gating does not.
+    Prefix matching also counts variants such as "timeout>1.2s".
     """
     if reason == "dedup":
         return "dedup"
@@ -1520,7 +1634,7 @@ def _classify_call_reason(reason: str) -> str | None:
         return "ok"
     if reason.startswith("timeout"):
         return "timeout"
-    if reason.startswith("error"):
+    if reason.startswith(("error", "gate error:")):
         return "error"
     return None
 
@@ -1540,22 +1654,19 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
     dedup, timeout or error — a gated call never reached a search leg and
     does not count) over the last 7 days, read from the hook's own log.
 
-    Not ok when there are at least 20 searched calls and the timeout rate is
-    0.5 or higher. Fewer than 20 calls is ok with ``"insufficient": True`` —
-    a fresh install or a quiet week is not evidence of a failure. Never
-    raises and never does more than one bounded tail read: a missing log, an
-    unreadable one, or a file of nothing but garbage lines all degrade to
-    the same "insufficient" outcome as a fresh install.
+    Not ok when at least half of 20 or more attempts failed or timed out.
+    Fewer observations report insufficient evidence, rather than measured
+    health. Missing or unreadable telemetry reports available=False.
     """
     now = now or datetime.now(timezone.utc)
     cutoff = now.timestamp() - _OUTCOMES_WINDOW_S
     path = _log_path()
     try:
         if not path.is_file():
-            return {"ok": True, "insufficient": True, "count": 0}
+            return {"ok": False, "available": False, "insufficient": True, "count": 0}
         raw = _tail_text(path, max_bytes=_OUTCOMES_TAIL_BYTES)
     except OSError:
-        return {"ok": True, "insufficient": True, "count": 0}
+        return {"ok": False, "available": False, "insufficient": True, "count": 0}
 
     calls: list[tuple[str, float]] = []
     for line in raw.splitlines():
@@ -1579,10 +1690,12 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
     calls = calls[-_OUTCOMES_MAX_CALLS:]
     total = len(calls)
     if total < _OUTCOMES_MIN_CALLS:
-        return {"ok": True, "insufficient": True, "count": total}
+        return {"ok": False, "available": True, "insufficient": True, "count": total}
 
     timeouts = sum(1 for category, _ms in calls if category == "timeout")
+    errors = sum(1 for category, _ms in calls if category == "error")
     timeout_rate = timeouts / total
+    failure_rate = (timeouts + errors) / total
     ms_values = sorted(ms for _category, ms in calls)
     mid = len(ms_values) // 2
     median_ms = (
@@ -1591,16 +1704,19 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
         else (ms_values[mid - 1] + ms_values[mid]) / 2
     )
     out: dict[str, Any] = {
-        "ok": timeout_rate < _OUTCOMES_TIMEOUT_RATE_RED,
+        "ok": failure_rate < _OUTCOMES_TIMEOUT_RATE_RED,
+        "available": True,
         "insufficient": False,
         "count": total,
         "timeout_rate": round(timeout_rate, 4),
+        "error_rate": round(errors / total, 4),
+        "failure_rate": round(failure_rate, 4),
         "median_ms": round(median_ms, 1),
     }
     if not out["ok"]:
         out["reason"] = (
-            f"{timeouts} of the last {total} prompts got no recall: the search "
-            f"missed its {TIMEOUT_S}s deadline"
+            f"{timeouts + errors} of the last {total} recall attempts failed: "
+            f"{errors} errors and {timeouts} missed the deadline"
         )
         out["fix"] = (
             "run `khipu snapshot refresh`; if this stays red the machine cannot "

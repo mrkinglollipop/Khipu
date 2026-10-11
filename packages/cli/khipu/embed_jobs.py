@@ -124,8 +124,8 @@ def run_job(
 
     ``work`` returns the backfill's stats: ``embedded`` and ``failed`` /
     ``failed_chunks`` counts, ``cancelled``, ``budget_exhausted``. It decides
-    the end state: cancelled > budget exhausted (failed, resumable) > nothing
-    embedded and everything failed (failed) > done (partial when ``failed``)."""
+    the end state: cancelled > budget exhausted (failed, resumable) > any
+    failed or remaining work (failed) > done."""
     out = stream if stream is not None else sys.stdout
     job = Job(job_id or new_job_id(space), kind=kind, profile=profile, space=space)
     previous = {}
@@ -151,6 +151,7 @@ def run_job(
             signal.signal(sig, handler)
     failed = int(stats.get("failed_chunks", stats.get("failed", 0)) or 0)
     embedded = int(stats.get("embedded", 0) or 0)
+    remaining = int(stats.get("remaining", 0) or 0)
     job.done, job.failed = embedded, failed
     error = None
     if stats.get("cancelled") or job.cancelled:
@@ -162,6 +163,10 @@ def run_job(
         error = f"every batch failed ({failed} chunks); see the job log"
         if stats.get("embed_provider") == "missing key":
             error = "no API key for this provider"
+    elif failed or remaining or (job.total and embedded < job.total):
+        state = "failed"
+        error = (f"backfill incomplete ({embedded} embedded, {failed} failed; "
+                 f"{remaining} remaining; {job.total} chunks expected)")
     else:
         state = "done"
     job.finish(state, error)

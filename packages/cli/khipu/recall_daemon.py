@@ -13,12 +13,13 @@ first and runs the one-shot path when it is not there.
 Protocol: one JSON object per line each way, on ``<khipu_home>/recall.sock``.
 
   {"op": "recall", "raw": "<the hook's stdin payload>", "shape": "claude"|"cursor"}
-      answers exactly what ``recall_prompt.hook_main(raw, shape=shape)`` returns
+      with protocol=1, answers {"ok": true, "output": <hook output>} or
+      {"ok": false, "error": ...}; a successful client sends {"op": "ack"}
   {"op": "ping"}
       answers {"ok", "version", "pid", "started", "code_stamp", "served"}
   anything else answers {"error": "..."}
 
-The service never dies from a request: a handler that raises answers ``{}``.
+The service never dies from a request: handler failures answer explicit errors.
 It does exit on purpose when the package's code changes on disk (a ``git pull``
 landed), so launchd starts the new code instead of the process serving old
 code indefinitely.
@@ -26,9 +27,11 @@ code indefinitely.
 from __future__ import annotations
 
 import errno
+import hashlib
 import http.client
 import io
 import json
+import math
 import os
 import signal
 import socket
@@ -89,9 +92,17 @@ def code_stamp_parts(root: Path | None = None) -> tuple[int, int]:
     return newest, count
 
 
-def code_stamp() -> str:
-    newest, count = code_stamp_parts()
-    return f"{newest}:{count}"
+def code_stamp(root: Path | None = None) -> str:
+    root = Path(__file__).resolve().parent if root is None else Path(root)
+    newest, count = code_stamp_parts(root)
+    digest = hashlib.sha256()
+    for p in sorted(root.rglob("*.py")):
+        if "__pycache__" not in p.parts:
+            digest.update(str(p.relative_to(root)).encode())
+            digest.update(b"\0")
+            digest.update(p.read_bytes())
+            digest.update(b"\0")
+    return f"{newest}:{count}:{digest.hexdigest()}"
 
 
 # ---- the embedding connection ------------------------------------------------
@@ -201,6 +212,7 @@ class RecallService:
         # pull does not run on old code. A test that needs the request to be
         # the one that notices turns this off.
         self._idle_check = idle_check
+        self._watching = False
         self.stamp = stamp_fn()
         self.started = datetime.now(timezone.utc).isoformat()
         self.served = 0
@@ -283,7 +295,7 @@ class RecallService:
     def _detect_stale(self) -> bool:
         """True once the package's code has changed since this process
         started. Looks at the disk at most once per ``recheck_s``. The caller
-        holds ``_lock``."""
+        uses a single background watcher in a running service."""
         if self._stopping.is_set():
             return False
         now = self._clock()
@@ -300,39 +312,56 @@ class RecallService:
             self._stopping.set()
         return changed
 
-    def _admit(self) -> bool:
-        """Decide whether this request may be served, and whether it is the
-        last one. Raises ``_Refused`` for a request that arrives after the
-        service has seen stale code: it never serves a second one."""
+    def _admit(self, *, refuse_stale: bool = True) -> bool:
+        """Refuse recall as soon as stale code is detected. Package I/O runs
+        on the watcher, outside the admission lock and prompt deadline."""
         with self._lock:
             if self._stopping.is_set():
                 raise _Refused()
-            return self._detect_stale()
+            if not self._watching and self._detect_stale():
+                if refuse_stale:
+                    raise _Refused()
+                return True
+            return False
 
     def stop(self) -> None:
         self._stopping.set()
 
     # -- requests --
 
-    def _recall(self, req: dict[str, Any]) -> dict[str, Any]:
+    def _recall(self, req: dict[str, Any], delivery: dict | None = None) -> dict[str, Any]:
         raw = req.get("raw", "")
         shape = req.get("shape", "claude")
         if not isinstance(raw, str):
-            return {"error": "raw must be a string"}
+            return {"ok": False, "error": "raw must be a string"}
         if shape not in _SHAPES:
-            return {"error": f"shape must be one of {list(_SHAPES)}"}
+            return {"ok": False, "error": f"shape must be one of {list(_SHAPES)}"}
         try:
             from khipu import recall_prompt
 
-            out = recall_prompt.hook_main(raw, shape=shape)
+            options = {}
+            if req.get("protocol") == 1:
+                deadline = req.get("deadline", time.monotonic() + recall_prompt.TIMEOUT_S)
+                if not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
+                    raise ValueError("invalid request deadline")
+                if time.monotonic() >= deadline:
+                    return {"ok": False, "error": "timeout>request deadline"}
+                options = {"deadline": deadline, "delivery": delivery}
+            out = recall_prompt.hook_main(raw, shape=shape, **options)
+            if not isinstance(out, dict):
+                raise TypeError("recall handler returned a non-object")
         except Exception as exc:  # noqa: BLE001 — the one thing a request must never do is kill us
             _log(f"recall handler raised: {type(exc).__name__}: {exc}")
-            return {}
+            return {"ok": False, "error": f"handler failed: {type(exc).__name__}"}
+        if delivery is not None:
+            result = delivery.get("result") or {}
+            if recall_prompt._outcome_for(result.get("reason", "ok"), result.get("hits", [])) in ("error", "timeout"):
+                return {"ok": False, "error": result["reason"]}
         with self._lock:
             self.served += 1
-        return out if isinstance(out, dict) else {}
+        return {"ok": True, "output": out} if req.get("protocol") == 1 else out
 
-    def dispatch(self, req: Any) -> dict[str, Any]:
+    def dispatch(self, req: Any, delivery: dict | None = None) -> dict[str, Any]:
         if not isinstance(req, dict):
             return {"error": "request must be a JSON object"}
         op = req.get("op")
@@ -345,23 +374,36 @@ class RecallService:
                 "root": str(Path(__file__).resolve().parent),
             }
         if op == "recall":
-            return self._recall(req)
+            return self._recall(req, delivery)
         return {"error": f"unknown op: {op!r}"}
 
-    def _answer(self, line: bytes) -> dict[str, Any]:
+    def _answer(self, line: bytes, delivery: dict | None = None) -> dict[str, Any]:
         try:
             req = json.loads(line.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return {"error": "malformed request"}
+        raw = req.get("raw", "") if isinstance(req, dict) else ""
+        raw = raw if isinstance(raw, str) else ""
         try:
-            last = self._admit()
+            last = self._admit(refuse_stale=isinstance(req, dict) and req.get("op") == "recall")
         except _Refused:
-            return {"error": "restarting"}
+            from khipu import recall_prompt
+            recall_prompt.log_terminal_outcome(raw, "error: daemon restarting")
+            return {"ok": False, "error": "restarting"}
         try:
-            return self.dispatch(req)
+            answer = self.dispatch(req, delivery)
+            if answer.get("ok") is False and not (delivery or {}).get("result"):
+                from khipu import recall_prompt
+                reason = answer["error"]
+                if not reason.startswith(("error:", "timeout>")):
+                    reason = f"error: {reason}"
+                recall_prompt.log_terminal_outcome(raw, reason)
+            return answer
         except Exception as exc:  # noqa: BLE001 — dispatch handles its own; this is the backstop
             _log(f"request raised: {type(exc).__name__}: {exc}")
-            return {}
+            from khipu import recall_prompt
+            recall_prompt.log_terminal_outcome(raw, f"error: dispatch crashed: {type(exc).__name__}")
+            return {"ok": False, "error": "dispatch failed"}
         finally:
             if last:
                 self._wake()
@@ -378,6 +420,7 @@ class RecallService:
             pass
 
     def _serve_conn(self, conn: socket.socket) -> None:
+        delivery: dict = {}
         try:
             conn.settimeout(CONN_READ_TIMEOUT_S)
             buf = b""
@@ -395,12 +438,35 @@ class RecallService:
                 line, buf = buf.split(b"\n", 1)
                 if not line.strip():
                     continue
-                conn.sendall(json.dumps(self._answer(line)).encode("utf-8") + b"\n")
+                delivery = {}
+                answer = self._answer(line, delivery)
+                conn.sendall(json.dumps(answer).encode("utf-8") + b"\n")
+                if delivery:
+                    from khipu import recall_prompt
+                    deadline = json.loads(line).get("deadline", time.monotonic() + 0.2)
+                    delivered = False
+                    if answer.get("ok"):
+                        conn.settimeout(max(0.001, deadline - time.monotonic()))
+                        while b"\n" not in buf and len(buf) <= MAX_REQUEST_BYTES:
+                            chunk = conn.recv(65536)
+                            if not chunk:
+                                break
+                            buf += chunk
+                        if b"\n" in buf:
+                            ack, buf = buf.split(b"\n", 1)
+                            delivered = json.loads(ack) == {"op": "ack"} and time.monotonic() <= deadline
+                    recall_prompt.finish_delivery(
+                        delivery, delivered=delivered,
+                        reason=None if delivered else answer.get("error", "timeout>delivery deadline"),
+                    )
         except OSError:
             pass  # the client went away; nothing to answer
         except Exception as exc:  # noqa: BLE001
             _log(f"connection raised: {type(exc).__name__}: {exc}")
         finally:
+            if delivery:
+                from khipu import recall_prompt
+                recall_prompt.finish_delivery(delivery, delivered=False, reason="timeout>delivery deadline")
             conn.close()
 
     def run(self) -> int:
@@ -408,13 +474,16 @@ class RecallService:
         listener = self._listener
         if listener is None:
             raise RuntimeError("bind() first")
+        if self._idle_check:
+            self._watching = True
+            def watch_code():
+                while not self._stopping.wait(_ACCEPT_TICK_S):
+                    self._detect_stale()
+            threading.Thread(target=watch_code, daemon=True).start()
         while not self._stopping.is_set():
             try:
                 conn, _addr = listener.accept()
             except socket.timeout:
-                if self._idle_check:
-                    with self._lock:
-                        self._detect_stale()
                 continue
             except OSError:
                 if self._stopping.is_set():
@@ -479,8 +548,10 @@ def ping(path: Path | None = None, *, timeout: float = 1.0) -> dict[str, Any] | 
     p = Path(path) if path else socket_path()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
+    connected = False
     try:
         sock.connect(str(p))
+        connected = True
         sock.sendall(b'{"op": "ping"}\n')
         buf = b""
         while b"\n" not in buf:
@@ -489,9 +560,9 @@ def ping(path: Path | None = None, *, timeout: float = 1.0) -> dict[str, Any] | 
                 break
             buf += chunk
         out = json.loads(buf.decode("utf-8"))
-        return out if isinstance(out, dict) and out.get("ok") else None
+        return out if isinstance(out, dict) and out.get("ok") is True else {"ok": False, "error": "invalid ping response"}
     except (OSError, ValueError):
-        return None
+        return {"ok": False, "error": "connected daemon did not answer ping"} if connected else None
     finally:
         sock.close()
 
@@ -503,6 +574,8 @@ def daemon_health(path: Path | None = None, *, now_ns: int | None = None) -> dic
     answer = ping(path)
     if answer is None:
         return {"ok": True, "running": False}
+    if not answer.get("ok"):
+        return {"ok": False, "running": True, "reason": answer.get("error", "invalid ping response")}
     out: dict[str, Any] = {
         "ok": True, "running": True, "pid": answer.get("pid"),
         "version": answer.get("version"), "served": answer.get("served"),
@@ -514,7 +587,10 @@ def daemon_health(path: Path | None = None, *, now_ns: int | None = None) -> dic
     own_root = str(Path(__file__).resolve().parent)
     elsewhere = isinstance(root, str) and root != own_root and Path(root).is_dir()
     newest, _count = code_stamp_parts(Path(root) if elsewhere else None)
-    disk = f"{newest}:{_count}"
+    try:
+        disk = code_stamp(Path(root) if elsewhere else None)
+    except OSError:
+        return {**out, "ok": False, "reason": "installed code fingerprint unavailable"}
     differs = answer.get("code_stamp") != disk or (
         not elsewhere and answer.get("version") != __version__
     )

@@ -157,7 +157,7 @@ class DoctorFoldsBundleSealTest(unittest.TestCase):
         with mock.patch(
             "khipu.bundle_seal.check",
             return_value={"ok": True, "app": "/Applications/Khipu.app"},
-        ):
+        ), mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25}):
             rc, out = self._run_doctor()
         self.assertEqual(rc, 0)
         self.assertTrue(out["ok"])
@@ -167,7 +167,7 @@ class DoctorFoldsBundleSealTest(unittest.TestCase):
         with mock.patch(
             "khipu.bundle_seal.check",
             return_value={"ok": True, "na": True, "reason": "not a bundle"},
-        ):
+        ), mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25}):
             rc, out = self._run_doctor()
         self.assertEqual(rc, 0)
         self.assertTrue(out["ok"])

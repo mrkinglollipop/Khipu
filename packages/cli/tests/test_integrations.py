@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import tempfile
 import time
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -220,14 +222,14 @@ class ProbeTest(_TempHomeCase):
         self.assertLess(r["ms"], 30_000)
 
     def test_hook_probe_runs_through_the_shell_like_the_harnesses_do(self):
-        """Regression for 2026-08-17: the raw repo path has a space, every harness
-        runs hook commands via `sh -c`, and the old exec-style probe passed while
-        the real hook died. The probe must fail on the raw path and pass on the shim."""
-        raw = str(integ._root() / "packages" / "cli" / "bin" / "khipu-stop-hook")
-        self.assertIn(" ", raw)  # the whole point — if this moves, the test is moot
+        """Harnesses interpret hook commands through a shell, including quoting."""
+        path = self.home / "directory with spaces" / "probe-hook"
+        path.parent.mkdir()
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+        raw = str(path)
         self.assertFalse(integ._probe_hook(raw)["ok"])
-        self.assertNotIn(" ", integ.stop_hook())
-        self.assertTrue(integ._probe_hook(integ.stop_hook())["ok"])
+        self.assertTrue(integ._probe_hook(shlex.quote(raw))["ok"])
 
 
 class ProbePromptRecallSnapshotTest(unittest.TestCase):
@@ -833,9 +835,14 @@ class UnreadableConfigTest(_TempHomeCase):
         (self.home / ".grok").mkdir(parents=True, exist_ok=True)
         integ.AEGIS_TOML.write_text('[mcp_servers.khipu]\ncommand = "old"\n')
         nasty = '/tmp/kh\\g<0>ipu/bin/khipu-mcp'
-        with mock.patch.object(integ, "mcp_launcher", lambda: nasty):
+        hook = '/tmp/kh\\g<0>i"pu/bin/khipu-aegis-capture'
+        with mock.patch.object(integ, "mcp_launcher", lambda: nasty), \
+             mock.patch.object(integ, "aegis_capture_hook", lambda: hook):
             integ.install("aegis")
-        self.assertIn(nasty, integ.AEGIS_TOML.read_text())
+        config = tomllib.loads(integ.AEGIS_TOML.read_text())
+        self.assertEqual(config["mcp_servers"]["khipu"]["command"], nasty)
+        for event in ("Stop", "PreCompact", "SessionEnd"):
+            self.assertEqual(config["hooks"][event][0]["hooks"][0]["command"], hook)
 
 
 
@@ -1073,7 +1080,8 @@ class DoctorFoldsLauncherHealthTest(unittest.TestCase):
 
     def test_inconsistent_roots_warns_without_failing_doctor(self):
         mixed = {"states": [], "consistent": False, "ok": True, "warning": "mixed roots"}
-        with mock.patch("khipu.integrations.launcher_health", return_value=mixed):
+        with mock.patch("khipu.integrations.launcher_health", return_value=mixed), \
+                mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25}):
             rc, out = self._run_doctor()
         self.assertEqual(rc, 0)
         self.assertTrue(out["ok"])
@@ -1081,7 +1089,8 @@ class DoctorFoldsLauncherHealthTest(unittest.TestCase):
 
     def test_healthy_launchers_keep_doctor_green(self):
         good = {"states": [], "consistent": True, "ok": True}
-        with mock.patch("khipu.integrations.launcher_health", return_value=good):
+        with mock.patch("khipu.integrations.launcher_health", return_value=good), \
+                mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25}):
             rc, out = self._run_doctor()
         self.assertEqual(rc, 0)
         self.assertTrue(out["launchers_ok"])
@@ -1760,7 +1769,8 @@ class DoctorListsClaudeHomesTest(_ClaudeHomesCase):
         self._seed(link=True)
         integ.install("claude_code", home=str(self.default))
         buf = io.StringIO()
-        with redirect_stdout(buf):
+        with redirect_stdout(buf), \
+                mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25}):
             rc = cli.cmd_doctor(cli.build_parser().parse_args(["doctor"]))
         out = json.loads(buf.getvalue())
         self.assertEqual([r["label"] for r in out["claude_homes"]["homes"]],

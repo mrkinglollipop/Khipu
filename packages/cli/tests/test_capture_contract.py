@@ -102,9 +102,7 @@ class HighValueTriggerTest(unittest.TestCase):
     def test_decide_fires_on_a_high_value_turn_below_the_turn_cadence(self):
         text = "USER: capture this — we just decided the rollout plan"
         due, reason = sc.decide(
-            # chars only needs to clear MIN_CHARS to pass the "nothing new"
-            # gate ahead of the high-value scan; window_text is scanned as-is.
-            "stop", user_turns=1, chars=sc.MIN_CHARS, elapsed_s=0.0, stop_hook_active=False,
+            "stop", user_turns=1, chars=len(text), elapsed_s=0.0, stop_hook_active=False,
             window_text=text,
         )
         self.assertTrue(due)
@@ -130,7 +128,6 @@ class WindowSplitTest(unittest.TestCase):
             self.assertTrue(out["due"], out)
             jobs = sc.queued_jobs()
             self.assertGreater(len(jobs), 1, "a 30k window must split, not clip")
-            self.assertLessEqual(len(jobs), sc.MAX_WINDOW_PARTS)
             payloads = [json.loads(j.read_text()) for j in jobs]
             self.assertTrue(all(j["truncated_chars"] == 0 for j in payloads))
             window_ids = {j["window_id"] for j in payloads}
@@ -139,18 +136,14 @@ class WindowSplitTest(unittest.TestCase):
             parts = sorted(j["part"] for j in payloads)
             self.assertEqual(parts, [f"{i}/{len(jobs)}" for i in range(1, len(jobs) + 1)])
 
-    def test_over_the_part_ceiling_merges_the_oldest_and_stamps_truncated_chars(self):
-        # Tiny max_chars forces far more than MAX_WINDOW_PARTS groups from a
-        # handful of messages — exercises the ceiling directly and fast,
-        # rather than needing a 100k+ char fixture through hook_main().
+    def test_over_the_former_part_ceiling_remains_lossless(self):
+        # Tiny max_chars forces many groups without dropping the oldest part.
         msgs = [("user", f"turn {i} " + "z" * 20) for i in range(20)]
         parts = sc._window_parts(msgs, max_chars=30)
         groups = sc._split_messages(msgs, 30)
-        self.assertGreater(len(groups), sc.MAX_WINDOW_PARTS)
-        self.assertEqual(len(parts), sc.MAX_WINDOW_PARTS)
-        # Oldest part absorbed the overflow and is the only one with loss recorded.
-        self.assertGreater(parts[0]["truncated_chars"], 0)
-        self.assertTrue(all(p["truncated_chars"] == 0 for p in parts[1:]))
+        self.assertGreater(len(groups), 8)
+        self.assertEqual(len(parts), len(groups))
+        self.assertTrue(all(p["truncated_chars"] == 0 for p in parts))
 
 
 # ---- K2: verbatim tier -------------------------------------------------------------

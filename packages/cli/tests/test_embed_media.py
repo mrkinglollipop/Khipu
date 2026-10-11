@@ -31,6 +31,10 @@ class EmbedMediaFlagTest(unittest.TestCase):
         self.dir = Path(self.tmp.name)
         self._env = mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(self.dir)})
         self._env.start()
+        sources.save_sources({"sources": [
+            {"id": "code:claude", "root": str(self.dir), "enabled": True},
+            {"id": "conversation_memory", "enabled": True},
+        ]})
 
     def tearDown(self):
         self._env.stop()
@@ -38,9 +42,16 @@ class EmbedMediaFlagTest(unittest.TestCase):
 
     def test_embed_media_defaults_false(self):
         doc = sources.default_document()
-        self.assertTrue(all(s.get("embed_media") is False for s in doc["sources"]))
+        self.assertEqual(doc["sources"], [])
+        rows = sources.load_sources()["sources"]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(s["embed_media"] is False for s in rows))
         self.assertFalse(sources.embed_media_enabled("conversation_memory"))
         self.assertFalse(sources.embed_media_enabled("code:claude"))
+
+    def test_clean_install_has_no_sources(self):
+        sources.sources_file().unlink()
+        self.assertEqual(sources.load_sources()["sources"], [])
 
     def test_set_embed_media_round_trip(self):
         sources.set_embed_media("code:claude", True)
@@ -132,11 +143,38 @@ class ActivateIgnoresMediaTest(unittest.TestCase):
             "episodes": {"missing": 0},
             "topics": {"missing": 0},
             "media": {"missing": 99},
+            "missing": 0, "stale": 0,
         }
-        missing = cov["episodes"]["missing"] + cov["topics"]["missing"]
-        self.assertEqual(missing, 0)
-        # Mirror activate()'s gate: media missing must not block.
-        self.assertTrue(missing == 0)
+        with mock.patch("khipu.db.connect") as connect, \
+             mock.patch.object(embed, "coverage", return_value=cov), \
+             mock.patch.object(embed._profiles, "ensure_profile_index") as index:
+            conn = connect.return_value.__enter__.return_value
+            cur = conn.cursor.return_value.__enter__.return_value
+            cur.fetchone.return_value = (embed.PROFILE_2,)
+            out = embed.activate(embed.PROFILE_2)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["active_profile"], embed.PROFILE_2)
+        index.assert_called_once()
+        self.assertIn(mock.call("UPDATE embedding_profiles SET is_active = false WHERE is_active"), cur.execute.call_args_list)
+        self.assertIn(mock.call("UPDATE embedding_profiles SET is_active = true WHERE id = %s", (embed.PROFILE_2,)), cur.execute.call_args_list)
+        conn.commit.assert_called_once()
+
+    def test_missing_text_vectors_prevent_pointer_updates(self):
+        for kind in ("episodes", "topics"):
+            cov = {"episodes": {"missing": 0}, "topics": {"missing": 0}, "media": {"missing": 99}}
+            cov[kind]["missing"] = 1
+            cov.update(missing=1, stale=0)
+            with self.subTest(kind=kind), mock.patch("khipu.db.connect") as connect, \
+                 mock.patch.object(embed, "coverage", return_value=cov), \
+                 mock.patch.object(embed._profiles, "ensure_profile_index") as index:
+                conn = connect.return_value.__enter__.return_value
+                cur = conn.cursor.return_value.__enter__.return_value
+                cur.fetchone.return_value = (embed.PROFILE_2,)
+                with self.assertRaisesRegex(RuntimeError, "1 chunks missing and 0 stale"):
+                    embed.activate(embed.PROFILE_2)
+                self.assertFalse(any("UPDATE" in c.args[0] for c in cur.execute.call_args_list))
+                index.assert_not_called()
+                conn.commit.assert_not_called()
 
 
 class JobsOnDemandReceiptTest(unittest.TestCase):

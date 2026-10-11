@@ -581,15 +581,20 @@ def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
     # is then embedded and searched. Join a list, accept a string, reject the
     # rest rather than storing a repr (audit 2026-08-17, same class as the
     # capture payload fix).
-    raw_summary = parsed.get("summary", "")
-    if isinstance(raw_summary, list):
-        summary = " ".join(str(x).strip() for x in raw_summary if str(x).strip()).strip()
+    raw_summary = parsed.get("summary")
+    if isinstance(raw_summary, list) and all(isinstance(x, str) for x in raw_summary):
+        summary = " ".join(x.strip() for x in raw_summary if x.strip()).strip()
     elif isinstance(raw_summary, str):
         summary = raw_summary.strip()
     else:
-        summary = ""
+        raise RuntimeError("extract: model summary is missing or has an invalid type")
     if not summary:
-        return None
+        if not (extract_verbatim(transcript) or extract_deliverables(transcript)
+                or any(parsed.get(k) for k in ("decisions", "preferences", "open_loops",
+                                               "closed_loops", "decision_details"))):
+            return None
+        summary = "Session evidence retained without a model summary."
+        parsed["scope"] = ""
     topics: list[str] = []
     for t in _as_str_list(parsed.get("topics"), lower=True):
         t = slugify(t)

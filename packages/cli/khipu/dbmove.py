@@ -25,14 +25,32 @@ TABLE_ORDER: tuple[str, ...] = (
     "topic_revisions",
     "nodes",
     "edges",
-    "memory_embeddings",
     "embeddings",
+    "memory_embeddings",
+    "memory_query_cache",
     "topic_aliases",
     "media_assets",
     "commitments",
-    "memory_query_cache",
     "ops_events",
+    "project_aliases",
+    "decisions",
+    "decision_links",
+    "deliverables",
+    "briefs",
+    "topic_hits",
+    "library_sources",
+    "library_documents",
+    "library_chunks",
+    "library_embeddings",
 )
+
+_TARGET_METADATA_TABLES = frozenset({"schema_migrations"})
+_BOOTSTRAP_EMBEDDING_PROFILES = frozenset({
+    ("gemini-embedding-001@768", "gemini", "gemini-embedding-001", 768, "l2", True,
+     "P1 lock (plan.md Models/LLM); cloud default through P3, local is P4", None),
+    ("gemini-embedding-2@768", "gemini", "gemini-embedding-2", 768, "l2", False,
+     "Gemini Embedding 2 @768; task prefixes at API time; activate after full memory backfill", None),
+})
 
 
 def _existing_tables(cur) -> set[str]:
@@ -43,11 +61,54 @@ def _existing_tables(cur) -> set[str]:
     return {r[0] for r in cur.fetchall()}
 
 
-def _copy_order(source_tables: set[str], target_tables: set[str]) -> list[str]:
+def _copy_order(
+    source_tables: set[str],
+    target_tables: set[str],
+    dependencies: dict[str, set[str]] | None = None,
+) -> list[str]:
+    """Return a stable parent-before-child order.
+
+    ``TABLE_ORDER`` covers the shipped schema.  Constraint metadata keeps a
+    same-version future table from being copied alphabetically before its
+    parent.  A cycle is left in stable explicit/name order; PostgreSQL will
+    reject an immediate cyclic FK during COPY rather than silently omitting it.
+    """
     common = source_tables & target_tables
-    ordered = [t for t in TABLE_ORDER if t in common]
-    extra = sorted(common - set(ordered))
-    return ordered + extra
+    rank = {table: index for index, table in enumerate(TABLE_ORDER)}
+    pending = {table: set((dependencies or {}).get(table, set())) & common for table in common}
+    ordered: list[str] = []
+    while pending:
+        ready = sorted(
+            (table for table, parents in pending.items() if not parents),
+            key=lambda table: (rank.get(table, len(rank)), table),
+        )
+        if not ready:
+            ordered.extend(sorted(pending, key=lambda table: (rank.get(table, len(rank)), table)))
+            break
+        for table in ready:
+            ordered.append(table)
+            pending.pop(table)
+        for parents in pending.values():
+            parents.difference_update(ready)
+    return ordered
+
+
+def _foreign_key_dependencies(cur, tables: set[str]) -> dict[str, set[str]]:
+    cur.execute(
+        "SELECT child.relname, parent.relname "
+        "FROM pg_constraint con "
+        "JOIN pg_class child ON child.oid = con.conrelid "
+        "JOIN pg_namespace child_ns ON child_ns.oid = child.relnamespace "
+        "JOIN pg_class parent ON parent.oid = con.confrelid "
+        "JOIN pg_namespace parent_ns ON parent_ns.oid = parent.relnamespace "
+        "WHERE con.contype = 'f' AND child_ns.nspname = 'public' "
+        "AND parent_ns.nspname = 'public'"
+    )
+    dependencies = {table: set() for table in tables}
+    for child, parent in cur.fetchall():
+        if child in dependencies and parent in tables and child != parent:
+            dependencies[child].add(parent)
+    return dependencies
 
 
 def _row_count(cur, table: str) -> int:
@@ -95,6 +156,46 @@ def _same_target(current_dsn: str, target_dsn: str) -> bool:
     )
 
 
+def _connected_identity(cur) -> tuple[str, str, str, int] | None:
+    """Server/database identity catches DSN aliases before target mutation.
+
+    ``pg_postmaster_start_time`` identifies a Unix-socket server where libpq
+    cannot expose an inet address, while database name distinguishes databases
+    on that server.
+    """
+    cur.execute(
+        "SELECT current_database(), pg_postmaster_start_time()::text, "
+        "COALESCE(inet_server_addr()::text, ''), COALESCE(inet_server_port(), 0)"
+    )
+    row = cur.fetchone()
+    if not row or any(value is None for value in row):
+        return None
+    return (str(row[0]), str(row[1]), str(row[2]), int(row[3]))
+
+
+def _set_move_timeouts(cur) -> None:
+    # A move must fail closed instead of waiting forever on a locked target.
+    cur.execute("SET LOCAL statement_timeout = '30s'")
+    cur.execute("SET LOCAL lock_timeout = '10s'")
+
+
+def _rollback_target(conn) -> None:
+    rollback = getattr(conn, "rollback", None)
+    if callable(rollback):
+        rollback()
+
+
+def _target_has_user_data(cur, table: str, count: int) -> bool:
+    if count <= 0 or table in _TARGET_METADATA_TABLES:
+        return False
+    if table == "embedding_profiles":
+        # created_at varies with provisioning; every seeded value must match.
+        cur.execute("SELECT id, provider, model, dim, normalize, is_active, note, endpoint FROM embedding_profiles")
+        rows = cur.fetchall()
+        return len(rows) != count or any(tuple(row) not in _BOOTSTRAP_EMBEDDING_PROFILES for row in rows)
+    return True
+
+
 _PREFLIGHT_STAGES = ("reach", "version", "privileges", "schema", "graph")
 
 
@@ -137,58 +238,107 @@ def move_database(
             "preflight": preflight,
         }
 
-    source_conn = psycopg.connect(conninfo_with_local_root_cert(current_dsn), autocommit=False)
-    target_conn = psycopg.connect(conninfo_with_local_root_cert(target_dsn), autocommit=False)
+    source_conn = psycopg.connect(
+        conninfo_with_local_root_cert(current_dsn), autocommit=False, connect_timeout=10
+    )
+    target_conn = psycopg.connect(
+        conninfo_with_local_root_cert(target_dsn), autocommit=False, connect_timeout=10
+    )
     try:
+        with source_conn.cursor() as scur, target_conn.cursor() as tcur:
+            _set_move_timeouts(scur)
+            _set_move_timeouts(tcur)
+            source_identity = _connected_identity(scur)
+            target_identity = _connected_identity(tcur)
+            if source_identity is None or target_identity is None:
+                return {
+                    "ok": False,
+                    "error": "target_identity_unavailable",
+                    "detail": "Khipu could not prove the source and target are different databases.",
+                }
+            if source_identity == target_identity:
+                return {
+                    "ok": False,
+                    "error": "target_is_current",
+                    "detail": "The target resolves to the database Khipu is already using.",
+                }
+            source_tables = _existing_tables(scur)
+            target_tables = _existing_tables(tcur)
+            if source_tables != target_tables:
+                return {
+                    "ok": False,
+                    "error": "schema_mismatch",
+                    "source_only": sorted(source_tables - target_tables),
+                    "target_only": sorted(target_tables - source_tables),
+                    "detail": "Source and target public table sets differ; migrate both before moving.",
+                }
+            dependencies = _foreign_key_dependencies(scur, source_tables)
+            order = _copy_order(source_tables, target_tables, dependencies)
+
+        existing_counts: dict[str, int] = {}
         with target_conn.cursor() as cur:
-            existing_episodes = _row_count(cur, "episodes") if "episodes" in _existing_tables(cur) else 0
+            if not dry_run:
+                for table in order:
+                    cur.execute(f'LOCK TABLE "{table}" IN ACCESS EXCLUSIVE MODE')  # noqa: S608
+            for table in order:
+                existing_counts[table] = _row_count(cur, table)
         with target_conn.cursor() as cur:
-            existing_topics = _row_count(cur, "topics") if "topics" in _existing_tables(cur) else 0
-        if (existing_episodes > 0 or existing_topics > 0) and not allow_nonempty:
+            nonempty = {
+                table: count
+                for table, count in existing_counts.items()
+                if _target_has_user_data(cur, table, count)
+            }
+        if nonempty and not allow_nonempty:
             return {
                 "ok": False,
                 "error": "target_not_empty",
-                "detail": f"The target already holds {existing_episodes} episodes and "
-                f"{existing_topics} topics.",
+                "detail": "The target already holds data: " + ", ".join(
+                    f"{table}={count}" for table, count in sorted(nonempty.items())
+                ) + ".",
                 "fix": "Pass --into-nonempty to copy anyway, or choose an empty database.",
             }
 
-        with source_conn.cursor() as scur, target_conn.cursor() as tcur:
-            order = _copy_order(_existing_tables(scur), _existing_tables(tcur))
-
         tables_report: list[dict[str, Any]] = []
         mismatches: list[str] = []
-        for table in order:
-            t0 = time.monotonic()
-            with source_conn.cursor() as scur:
-                source_rows = _row_count(scur, table)
-            if dry_run:
+        try:
+            for table in order:
+                t0 = time.monotonic()
+                with source_conn.cursor() as scur:
+                    source_rows = _row_count(scur, table)
+                if dry_run:
+                    tables_report.append(
+                        {"name": table, "source_rows": source_rows, "target_rows": None, "seconds": round(time.monotonic() - t0, 3)}
+                    )
+                    if progress:
+                        progress(table, source_rows)
+                    continue
+                with target_conn.cursor() as tcur:
+                    tcur.execute(f'TRUNCATE TABLE "{table}" RESTART IDENTITY CASCADE')  # noqa: S608
+                _copy_table(source_conn, target_conn, table)
+                with target_conn.cursor() as tcur:
+                    target_rows = _row_count(tcur, table)
+                if target_rows != source_rows:
+                    mismatches.append(table)
                 tables_report.append(
-                    {"name": table, "source_rows": source_rows, "target_rows": None, "seconds": round(time.monotonic() - t0, 3)}
+                    {"name": table, "source_rows": source_rows, "target_rows": target_rows, "seconds": round(time.monotonic() - t0, 3)}
                 )
                 if progress:
-                    progress(table, source_rows)
-                continue
-            with target_conn.cursor() as tcur:
-                tcur.execute(f'TRUNCATE TABLE "{table}" CASCADE')  # noqa: S608
-            _copy_table(source_conn, target_conn, table)
-            with target_conn.cursor() as tcur:
-                _reset_sequences(tcur, table)
-            target_conn.commit()
-            with target_conn.cursor() as tcur:
-                target_rows = _row_count(tcur, table)
-            if target_rows != source_rows:
-                mismatches.append(table)
-            tables_report.append(
-                {"name": table, "source_rows": source_rows, "target_rows": target_rows, "seconds": round(time.monotonic() - t0, 3)}
-            )
-            if progress:
-                progress(table, target_rows)
+                    progress(table, target_rows)
+        except Exception as exc:  # noqa: BLE001 — preserve target on every replacement failure
+            _rollback_target(target_conn)
+            return {
+                "ok": False,
+                "error": "copy_failed",
+                "detail": f"{type(exc).__name__}: {exc}",
+                "tables": tables_report,
+                "switched": False,
+            }
 
         if dry_run:
             return {"ok": True, "dry_run": True, "tables": tables_report, "switched": False}
 
         if mismatches:
+            _rollback_target(target_conn)
             return {
                 "ok": False,
                 "error": "row_count_mismatch",
@@ -196,6 +346,20 @@ def move_database(
                 "tables": tables_report,
                 "switched": False,
             }
+        try:
+            with target_conn.cursor() as tcur:
+                for table in order:
+                    _reset_sequences(tcur, table)
+        except Exception as exc:  # noqa: BLE001 — preserve target replacement on sequence failure
+            _rollback_target(target_conn)
+            return {
+                "ok": False,
+                "error": "copy_failed",
+                "detail": f"{type(exc).__name__}: {exc}",
+                "tables": tables_report,
+                "switched": False,
+            }
+        target_conn.commit()
     finally:
         source_conn.close()
         target_conn.close()

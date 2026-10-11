@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -12,6 +13,7 @@ use tauri::{
     AppHandle, Manager,
 };
 use tauri_plugin_updater::UpdaterExt;
+use tauri_plugin_dialog::{DialogExt, FilePath};
 
 const DSN_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -21,6 +23,7 @@ struct DsnCache {
 }
 
 static DSN_CACHE: Mutex<Option<DsnCache>> = Mutex::new(None);
+static FEEDBACK_SELECTED_PATHS: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Health and updater both refresh the tray tooltip asynchronously.
 /// Merge under one mutex so they never clobber each other; update-available wins.
@@ -69,6 +72,15 @@ fn env_first(keys: &[&str]) -> Option<String> {
             if !v.trim().is_empty() {
                 return Some(v);
             }
+        }
+    }
+    None
+}
+
+fn env_raw_first(keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() { return Some(value); }
         }
     }
     None
@@ -205,9 +217,11 @@ fn python_from_which() -> Option<PathBuf> {
 /// Runs `<path> -c "..."` to read (major, minor). None if the interpreter
 /// can't be spawned or its version can't be parsed.
 fn python_version(path: &PathBuf) -> Option<(u32, u32)> {
+    let (bc_key, bc_val) = khipu_bytecode_env();
     let output = Command::new(path)
         .arg("-c")
         .arg("import sys; print('%d.%d' % sys.version_info[:2])")
+        .env(bc_key, bc_val)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -1095,6 +1109,15 @@ fn cancel_target(raw_job_file: &str, job_id: &str) -> Result<u32, String> {
     }
 }
 
+fn process_is_current_job(command: &str, job_id: &str) -> bool {
+    let args: Vec<&str> = command.split_whitespace().collect();
+    let expected = format!("--job-id={job_id}");
+    args.iter().any(|arg| *arg == "khipu")
+        && (args.iter().any(|arg| *arg == "embed-backfill" || *arg == "library-backfill")
+            || args.windows(2).any(|pair| pair == ["embed", "backfill"] || pair == ["library", "backfill"]))
+        && (args.iter().any(|arg| *arg == expected.as_str()) || args.windows(2).any(|pair| pair == ["--job-id", job_id]))
+}
+
 fn cancel_job_sync(job_id: &str) -> Result<Value, String> {
     let path = jobs_dir_path().join(format!("{job_id}.json"));
     if !job_id_ok(job_id) {
@@ -1108,7 +1131,7 @@ fn cancel_job_sync(job_id: &str) -> Result<Value, String> {
         .output()
         .map_err(|e| format!("could not check process {pid}: {e}"))?;
     let cmdline = String::from_utf8_lossy(&cmd.stdout).to_string();
-    if !cmd.status.success() || !cmdline.contains("khipu") {
+    if !cmd.status.success() || !process_is_current_job(&cmdline, job_id) {
         return Err("that job's process is no longer running".to_string());
     }
     let out = Command::new("/bin/kill")
@@ -1876,10 +1899,28 @@ fn dsn_configured_uncached() -> bool {
     if env_first(&["KHIPU_DATABASE_URL", "ALZY_DATABASE_URL"]).is_some() {
         return true;
     }
-    if keychain_has_dsn("Khipu") || keychain_has_dsn("Alzy") {
+    if keychain_services_from_env().iter().any(|service| keychain_has_dsn(service)) {
         return true;
     }
     dirs_fallback_dsn().is_file()
+}
+
+fn keychain_services(service: Option<&str>, enabled: bool) -> Vec<String> {
+    if !enabled { return Vec::new(); }
+    let configured = service.unwrap_or("Khipu");
+    let mut services = vec![configured.to_string()];
+    if configured != "Alzy" { services.push("Alzy".to_string()); }
+    services
+}
+
+fn keychain_services_from_env() -> Vec<String> {
+    let enabled = !env_raw_first(&["KHIPU_KEYCHAIN", "ALZY_KEYCHAIN"])
+        .is_some_and(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"));
+    let service = match std::env::var("KHIPU_KEYCHAIN_SERVICE") {
+        Ok(value) if !value.is_empty() => Some(value),
+        _ => std::env::var("ALZY_KEYCHAIN_SERVICE").ok(),
+    };
+    keychain_services(service.as_deref(), enabled)
 }
 
 #[tauri::command]
@@ -1942,12 +1983,21 @@ fn data_dir_from_pointer_json(raw: &str) -> Option<PathBuf> {
         // whole data dir to CWD (audit 2026-08-17).
         return None;
     }
-    Some(PathBuf::from(path))
+    expand_home_path(path)
+}
+
+fn expand_home_path(raw: &str) -> Option<PathBuf> {
+    let path = raw.trim();
+    if path == "~" { return std::env::var("HOME").ok().map(PathBuf::from); }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(rest));
+    }
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 fn data_dir_from_pointer() -> Option<PathBuf> {
     if let Some(p) = env_first(&["KHIPU_DATA_DIR", "ALZY_DATA_DIR"]) {
-        return Some(PathBuf::from(p));
+        return expand_home_path(&p);
     }
     let home = std::env::var("HOME").ok()?;
     let ptr = PathBuf::from(&home).join(".config/khipu/data_root.json");
@@ -1956,7 +2006,7 @@ fn data_dir_from_pointer() -> Option<PathBuf> {
 
 fn dirs_fallback_dsn() -> PathBuf {
     if let Some(p) = env_first(&["KHIPU_DSN_FILE", "ALZY_DSN_FILE"]) {
-        return PathBuf::from(p);
+        return expand_home_path(&p).unwrap_or_else(|| PathBuf::from(p));
     }
     if let Some(dir) = data_dir_from_pointer() {
         let relocated = dir.join("dsn");
@@ -1992,6 +2042,39 @@ fn attachment_bytes_cap_ok(total: u64) -> Result<(), String> {
     Ok(())
 }
 
+fn approve_feedback_attachment_for_session(path: &std::path::Path) -> Result<PathBuf, String> {
+    let canonical = path.canonicalize().map_err(|e| format!("attachment not found: {}: {e}", path.display()))?;
+    if !canonical.is_file() { return Err(format!("attachment not found: {}", canonical.display())); }
+    FEEDBACK_SELECTED_PATHS.lock().map_err(|_| "attachment selection registry unavailable".to_string())?.insert(canonical.clone());
+    Ok(canonical)
+}
+
+fn forget_feedback_attachment_for_session(path: &std::path::Path) {
+    if let Ok(canonical) = path.canonicalize() {
+        if let Ok(mut selected) = FEEDBACK_SELECTED_PATHS.lock() { selected.remove(&canonical); }
+    }
+}
+
+fn approved_feedback_attachment(path: &std::path::Path) -> Result<PathBuf, String> {
+    let canonical = path.canonicalize().map_err(|_| "attachment was not selected in this app session".to_string())?;
+    if FEEDBACK_SELECTED_PATHS.lock().map(|paths| paths.contains(&canonical)).unwrap_or(false) { Ok(canonical) }
+    else { Err("attachment was not selected in this app session".to_string()) }
+}
+
+#[tauri::command]
+async fn select_feedback_attachments(app: AppHandle) -> Result<Vec<String>, String> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    app.dialog().file().pick_files(move |selected| { let _ = tx.send(selected); });
+    let selected = tauri::async_runtime::spawn_blocking(move || rx.recv()).await
+        .map_err(|e| format!("attachment picker task failed: {e}"))?
+        .map_err(|_| "attachment picker closed unexpectedly".to_string())?
+        .unwrap_or_default();
+    selected.into_iter().map(|file: FilePath| {
+        let path = file.into_path().map_err(|_| "attachment picker returned a non-file path".to_string())?;
+        approve_feedback_attachment_for_session(&path).map(|path| path.display().to_string())
+    }).collect()
+}
+
 fn feedback_os_string() -> String {
     let os = std::env::consts::OS;
     if os == "macos" {
@@ -2023,10 +2106,11 @@ fn read_feedback_attachments(paths: &[String]) -> Result<Vec<(PathBuf, Vec<u8>)>
     let mut files = Vec::new();
     let mut total: u64 = 0;
     for raw in paths {
-        let path = PathBuf::from(raw.trim());
+        let submitted = PathBuf::from(raw.trim());
         if raw.trim().is_empty() {
             continue;
         }
+        let path = approved_feedback_attachment(&submitted)?;
         if !path.is_file() {
             return Err(format!("attachment not found: {}", path.display()));
         }
@@ -2137,19 +2221,15 @@ fn tray_tooltip_from_doctor(raw: &str) -> String {
     match serde_json::from_str::<Value>(raw) {
         Ok(v) => {
             let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
-            let backup = v.get("backup_ok").and_then(|x| x.as_bool()).unwrap_or(false);
-            let drift = v.get("drift_ok").and_then(|x| x.as_bool()).unwrap_or(false);
-            // Missing key (older CLI) counts as green; an explicit false is red.
-            let recording = v
-                .get("capture_liveness_ok")
-                .and_then(|x| x.as_bool())
-                .unwrap_or(true);
-            let git_sync = v.get("git_sync_ok").and_then(|x| x.as_bool()).unwrap_or(true);
+            let Some(backup) = v.get("backup_ok").and_then(|x| x.as_bool()) else { return "Khipu · doctor unavailable".into(); };
+            let Some(drift) = v.get("drift_ok").and_then(|x| x.as_bool()) else { return "Khipu · doctor unavailable".into(); };
+            let Some(recording) = v.get("capture_liveness_ok").and_then(|x| x.as_bool()) else { return "Khipu · doctor unavailable".into(); };
+            let Some(git_sync) = v.get("git_sync_ok").and_then(|x| x.as_bool()) else { return "Khipu · doctor unavailable".into(); };
             let eps = v
                 .pointer("/status/counts/episodes")
                 .and_then(|x| x.as_u64())
                 .unwrap_or(0);
-            if ok {
+            if ok && backup && drift && recording && git_sync {
                 format!("Khipu · OK · {eps} ep · recording/sync/backup/drift green")
             } else if !recording {
                 let red: Vec<String> = v
@@ -2181,7 +2261,7 @@ fn tray_tooltip_from_status(raw: &str) -> String {
                 .and_then(|x| x.as_u64())
                 .unwrap_or(0);
             if ok {
-                format!("Khipu · OK · {eps} episodes")
+                format!("Khipu · doctor unavailable · status only · {eps} episodes")
             } else {
                 "Khipu · DSN missing".into()
             }
@@ -2291,6 +2371,7 @@ pub fn run() {
             check_remote_postgres,
             dsn_configured,
             health_snapshot,
+            select_feedback_attachments,
             send_feedback,
             feedback_file_sizes
         ])
@@ -2498,9 +2579,9 @@ mod tray_tooltip_tests {
     }
 
     #[test]
-    fn older_cli_without_key_is_green() {
+    fn missing_required_health_evidence_is_unavailable() {
         let raw = format!("{BASE},\"ok\":true,\"capture_liveness_ok\":true}}");
-        assert!(tray_tooltip_from_doctor(&raw).starts_with("Khipu · OK"));
+        assert_eq!(tray_tooltip_from_doctor(&raw), "Khipu · doctor unavailable");
     }
 }
 
@@ -3267,5 +3348,142 @@ mod data_dir_pointer_tests {
         assert!(data_dir_from_pointer_json("not json at all").is_none());
         assert!(data_dir_from_pointer_json("").is_none());
         assert!(data_dir_from_pointer_json(r#"{"path": 42}"#).is_none());
+    }
+}
+
+#[cfg(test)]
+mod audit_1010_regression_tests {
+    use super::*;
+
+    #[test]
+    fn feedback_refuses_unselected_and_reads_approved_file() {
+        let path = std::env::temp_dir().join(format!("khipu-feedback-{}", std::process::id()));
+        std::fs::write(&path, b"private attachment").unwrap();
+        assert!(read_feedback_attachments(&[path.display().to_string()]).is_err());
+        approve_feedback_attachment_for_session(&path).unwrap();
+        assert_eq!(read_feedback_attachments(&[path.display().to_string()]).unwrap()[0].1, b"private attachment");
+        forget_feedback_attachment_for_session(&path);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pointer_tilde_expands() {
+        let resolved = data_dir_from_pointer_json(r#"{"path":"~/khipu-test"}"#).unwrap();
+        assert_eq!(resolved, PathBuf::from(std::env::var("HOME").unwrap()).join("khipu-test"));
+    }
+
+    #[test]
+    fn data_dir_env_and_pointer_keep_dsn_and_jobs_together() {
+        if std::env::var("KHIPU_RS10_CHILD").as_deref() == Ok("1") {
+            let home = PathBuf::from(std::env::var("HOME").unwrap());
+            let pointer_data = home.join("pointer-data");
+            std::fs::create_dir_all(pointer_data.join("jobs")).unwrap();
+            std::fs::write(pointer_data.join("dsn"), "postgres://pointer").unwrap();
+            std::fs::create_dir_all(home.join(".config/khipu")).unwrap();
+            std::fs::write(home.join(".config/khipu/data_root.json"), r#"{"path":"~/pointer-data"}"#).unwrap();
+            assert_eq!(dirs_fallback_dsn(), pointer_data.join("dsn"));
+            assert_eq!(jobs_dir_path(), pointer_data.join("jobs"));
+            let env_data = home.join("env-data");
+            std::fs::create_dir_all(env_data.join("jobs")).unwrap();
+            std::fs::write(env_data.join("dsn"), "postgres://env").unwrap();
+            std::env::set_var("KHIPU_DATA_DIR", "~/env-data");
+            assert_eq!(dirs_fallback_dsn(), env_data.join("dsn"));
+            assert_eq!(jobs_dir_path(), env_data.join("jobs"));
+            return;
+        }
+        let home = std::env::temp_dir().join(format!("khipu-rs10-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "audit_1010_regression_tests::data_dir_env_and_pointer_keep_dsn_and_jobs_together"])
+            .env("KHIPU_RS10_CHILD", "1").env("HOME", &home)
+            .env_remove("KHIPU_DATA_DIR").env_remove("ALZY_DATA_DIR")
+            .env_remove("KHIPU_DSN_FILE").env_remove("ALZY_DSN_FILE").status().unwrap();
+        let _ = std::fs::remove_dir_all(home);
+        assert!(status.success());
+    }
+
+    #[test]
+    fn doctor_needs_every_green_field_and_status_is_not_full_health() {
+        for field in ["backup_ok", "drift_ok", "capture_liveness_ok", "git_sync_ok"] {
+            let raw = format!(r#"{{"ok":true,"status":{{"counts":{{"episodes":1}}}},"backup_ok":true,"drift_ok":true,"capture_liveness_ok":true,"git_sync_ok":true,"{field}":false}}"#);
+            assert!(!tray_tooltip_from_doctor(&raw).contains(" · OK · "), "{field}");
+        }
+        for field in ["backup_ok", "drift_ok", "capture_liveness_ok", "git_sync_ok"] {
+            let raw = format!(r#"{{"ok":true,"status":{{"counts":{{"episodes":1}}}},"backup_ok":true,"drift_ok":true,"capture_liveness_ok":true,"git_sync_ok":true}}"#).replace(&format!(",\"{field}\":true"), "");
+            assert_eq!(tray_tooltip_from_doctor(&raw), "Khipu · doctor unavailable", "{field}");
+        }
+        assert_eq!(tray_tooltip_from_status(r#"{"dsn_ok":true,"counts":{"episodes":1}}"#), "Khipu · doctor unavailable · status only · 1 episodes");
+    }
+
+    #[test]
+    fn python_version_uses_isolated_safe_cache_env() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var("KHIPU_RS7_CHILD").as_deref() == Ok("1") {
+            assert_eq!(python_version(&PathBuf::from(std::env::var("KHIPU_RS7_FIXTURE").unwrap())), Some((3, 11)));
+            return;
+        }
+        let temp = std::env::temp_dir().join(format!("khipu-python-{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let fixture = temp.join("python");
+        std::fs::write(&fixture, "#!/bin/sh\n[ \"$PYTHONPYCACHEPREFIX\" = \"$HOME/Library/Caches/Khipu/pycache\" ] && [ -z \"$PYTHONDONTWRITEBYTECODE\" ] && echo 3.11 || echo 3.10\n").unwrap();
+        let mut permissions = std::fs::metadata(&fixture).unwrap().permissions(); permissions.set_mode(0o700); std::fs::set_permissions(&fixture, permissions).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "audit_1010_regression_tests::python_version_uses_isolated_safe_cache_env"])
+            .env("KHIPU_RS7_CHILD", "1").env("KHIPU_RS7_FIXTURE", &fixture).env("HOME", &temp)
+            .env_remove("PYTHONPYCACHEPREFIX").env_remove("PYTHONDONTWRITEBYTECODE").status().unwrap();
+        let _ = std::fs::remove_dir_all(temp); assert!(status.success());
+    }
+
+    #[test]
+    fn cancel_requires_exact_backfill_job_not_another_khipu_daemon() {
+        assert!(!process_is_current_job("python -m khipu recall --job-id=app-1", "app-1"));
+        assert!(!process_is_current_job("python -m khipu embed-backfill --job-id=other", "app-1"));
+        assert!(process_is_current_job("python -m khipu embed-backfill --job-id=app-1", "app-1"));
+    }
+
+    #[test]
+    fn keychain_services_match_custom_and_disabled_python_rules() {
+        assert_eq!(keychain_services(Some("Custom"), false), Vec::<String>::new());
+        assert_eq!(keychain_services(Some("Custom"), true), vec!["Custom", "Alzy"]);
+        assert_eq!(keychain_services(Some(""), true), vec!["", "Alzy"]);
+        assert_eq!(keychain_services(Some(" "), true), vec![" ", "Alzy"]);
+    }
+
+    #[test]
+    fn bundle_stages_both_recall_launchers() {
+        let script = include_str!("../../scripts/bundle_cli.sh");
+        for name in ["khipu-prompt-recall", "khipu-recall-client.py"] { assert!(script.contains(name), "{name}"); }
+    }
+
+    #[test]
+    fn manifest_validator_rejects_stale_and_accepts_matching_feed() {
+        let script = include_str!("../../scripts/release_macos.sh");
+        let start = script.find("import json, sys\n").unwrap(); let end = script[start..].find("\nPY\n").unwrap() + start;
+        let temp = std::env::temp_dir().join(format!("khipu-manifest-{}", std::process::id())); std::fs::create_dir_all(&temp).unwrap();
+        let validator = temp.join("validator.py"); let stale = temp.join("stale.json"); let matching = temp.join("matching.json");
+        std::fs::write(&validator, &script[start..end]).unwrap();
+        std::fs::write(&stale, r#"{"version":"old","platforms":{"darwin-aarch64":{"url":"old"}}}"#).unwrap();
+        std::fs::write(&matching, r#"{"version":"1","platforms":{"darwin-aarch64":{"url":"asset"}}}"#).unwrap();
+        assert!(!Command::new("python3").arg(&validator).arg(&stale).arg("1").arg("asset").status().unwrap().success());
+        assert!(!Command::new("python3").arg(&validator).arg(&matching).arg("1").arg("wrong-asset").status().unwrap().success());
+        assert!(Command::new("python3").arg(&validator).arg(&matching).arg("1").arg("asset").status().unwrap().success());
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn install_fragment_handles_copy_final_move_and_rollback_failures() {
+        let script = include_str!("../../scripts/release_macos.sh");
+        let start = script.find("install_staged_app() {").unwrap();
+        let end = script[start..].find("\n}\n\nif [[ \"$INSTALL_APPS\"").unwrap() + start + 2;
+        let temp = std::env::temp_dir().join(format!("khipu-rs12-{}", std::process::id()));
+        let source = temp.join("source/Khipu.app"); let apps = temp.join("Applications");
+        std::fs::create_dir_all(source.join("Contents/MacOS")).unwrap(); std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(source.join("Contents/Info.plist"), "new").unwrap(); std::fs::write(source.join("Contents/MacOS/Khipu"), "new").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(source.join("Contents/MacOS/Khipu")).unwrap().permissions(); perms.set_mode(0o700); std::fs::set_permissions(source.join("Contents/MacOS/Khipu"), perms).unwrap();
+        let body = format!("{}\nrun() {{ mode=$1; target=$2/Khipu.app; rm -rf \"$target\" \"$2\"/.khipu-install.*; mkdir -p \"$target\"; echo old >\"$target/marker\"; n=0; ditto() {{ if [ \"$mode\" = copyfail ]; then mkdir -p \"$2\"; echo partial >\"$2/partial\"; return 1; fi; cp -R \"$1\" \"$2\"; }}; mv() {{ n=$((n+1)); [ \"$mode\" = finalfail ] && [ \"$n\" = 2 ] && return 1; [ \"$mode\" = rollbackfail ] && [ \"$n\" -ge 2 ] && return 1; command mv \"$@\"; }}; install_staged_app '{}' \"$target\"; rc=$?; case \"$mode\" in copyfail|finalfail) [ $rc -ne 0 ] && [ \"$(cat \"$target/marker\")\" = old ];; rollbackfail) [ $rc -ne 0 ] && [ ! -e \"$target\" ] && [ \"$(cat \"$(find \"$2\" -name previous.app)/marker\")\" = old ];; success) [ $rc -eq 0 ] && [ -f \"$target/Contents/Info.plist\" ] && ! find \"$2\" -name previous.app | grep -q .;; esac; }}\nrun copyfail '{}' || exit 1; run finalfail '{}' || exit 1; run rollbackfail '{}' || exit 1; run success '{}' || exit 1\n", &script[start..end], source.display(), apps.display(), apps.display(), apps.display(), apps.display());
+        let out = Command::new("/bin/bash").arg("-c").arg(body).output().unwrap();
+        let _ = std::fs::remove_dir_all(temp);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     }
 }

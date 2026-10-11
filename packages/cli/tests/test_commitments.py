@@ -410,38 +410,43 @@ class ScopeCoalescingTest(unittest.TestCase):
             n = co.auto_close(cur, payload, 2)
         self.assertEqual(n, 0)
 
-    def test_a_parent_session_id_no_longer_scopes_auto_close(self):
-        """The pre-K6 behaviour: two captures sharing only a
-        parent_session_id (no project on either) used to close each other's
-        commitments; now both are NULL-project and auto_close's NULL-scope
-        query still matches them — this is the accepted, documented
-        broadening (K6), not a regression, and this test pins it."""
-        cur = _CommitmentsCursor()
-        cur._seed("ship the fix", project=None)
+    def test_a_parent_session_id_does_not_close_unrelated_projectless_work(self):
+        from tests.test_audit1010_rsna import _RegistryCursor
+
+        cur = _RegistryCursor()
+        self.addCleanup(cur.conn.close)
+        cur.episode(1, "other-session")
+        cid = cur.commitment("ship the fix", project=None)
         payload = {"parent_session_id": "claude_code:host-1",
                    "closed_loops": [{"text": "done: ship the fix"}]}
         with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
             n = co.auto_close(cur, payload, 2)
-        self.assertEqual(n, 1)
+        self.assertEqual(n, 0)
+        self.assertEqual(cur.value("commitments", cid, "status"), "open")
 
     def test_list_owed_accepts_parent_session_id_as_the_scope_key(self):
-        cur = _CommitmentsCursor()
-        cur._seed("a", project="claude_code:host-1")
+        from tests.test_audit1010_rsna import _RegistryCursor
+
+        cur = _RegistryCursor()
+        self.addCleanup(cur.conn.close)
+        cur.episode(1, "child-session", "claude_code:host-1")
+        cur.commitment("a", project=None)
         rows = co.list_owed(cur, parent_session_id="claude_code:host-1")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["text"], "a")
 
     def test_null_scope_dedup_falls_back_to_the_in_code_check(self):
-        """No project, no parent_session_id, no session_id at all: the
-        partial unique index can't dedup two NULL-project rows, so the
-        explicit in-code check (fix 3) must catch it."""
-        cur = _CommitmentsCursor()
+        from tests.test_audit1010_rsna import _RegistryCursor
+
+        cur = _RegistryCursor()
+        self.addCleanup(cur.conn.close)
         payload = {"open_loops": ["truly unscoped follow up"]}
         n1 = co.open_from_episode(cur, payload, 1)
         n2 = co.open_from_episode(cur, payload, 2)
         self.assertEqual(n1, 1)
-        self.assertEqual(n2, 0, "in-code dedup must catch the NULL-scope duplicate")
-        self.assertEqual(len(cur.rows), 1)
+        self.assertEqual(n2, 1, "episodes without lineage must remain independent")
+        self.assertEqual(co.open_from_episode(cur, payload, 2), 0)
+        self.assertEqual(cur.conn.execute("SELECT count(*) FROM commitments").fetchone()[0], 2)
 
 
 class AutoCloseTest(unittest.TestCase):
@@ -478,18 +483,14 @@ class AutoCloseTest(unittest.TestCase):
         self.assertEqual(n, 0)
         self.assertEqual(list(cur.rows.values())[0]["status"], "open")
 
-    def test_short_closed_loop_phrase_closes_longer_commitment(self):
-        # Regression: a closed_loop is a short phrase ("crimson lantern audit")
-        # that is a subset of a longer commitment text. Plain Jaccard scores it
-        # ~0.27, below commitment_close_similarity (0.85), so it must match by
-        # containment as an explicit close signal — not the strict path.
+    def test_short_closed_loop_phrase_keeps_longer_commitment_open(self):
         cur = _CommitmentsCursor()
         self._open(cur, "run the crimson lantern audit after the widget-42 release ships")
         payload = {"project": "acme/widget", "closed_loops": [{"text": "crimson lantern audit"}]}
         with mock.patch.object(co, "_cosine_scores", _no_cosine):
             n = co.auto_close(cur, payload, 12)
-        self.assertEqual(n, 1)
-        self.assertEqual(list(cur.rows.values())[0]["status"], "closed")
+        self.assertEqual(n, 0)
+        self.assertEqual(list(cur.rows.values())[0]["status"], "open")
 
     def test_decision_with_done_prefix_also_closes(self):
         cur = _CommitmentsCursor()
@@ -795,7 +796,7 @@ class StaleRuleTest(unittest.TestCase):
     def test_pre_migration_hub_falls_back_to_opened_at(self):
         sql = co.stale_sql(has_last_seen=False)
         self.assertNotIn("last_seen_at", sql)
-        self.assertIn("opened_at <", " ".join(sql.split()))
+        self.assertIn("GREATEST(opened_at, due_after) <", " ".join(sql.split()))
 
 
 class SessionPlanClosureTest(unittest.TestCase):

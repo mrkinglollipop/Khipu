@@ -64,6 +64,39 @@ def file_episode_keys(memory_root: Path) -> list[tuple[str, str]]:
     return keys
 
 
+def _legacy_drift_errors(memory_root: Path) -> list[str]:
+    """Evidence that makes a legacy-file drift result unchecked, never clean."""
+    errors: list[str] = []
+    if not memory_root.is_dir():
+        return [f"memory root missing: {memory_root}"]
+    logs = episode_files(memory_root)
+    if not logs:
+        errors.append("episode logs missing")
+    topics = memory_root / "topics"
+    if not topics.is_dir():
+        errors.append(f"topics directory missing: {topics}")
+    rejected = 0
+    for path in logs:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            errors.append(f"episode log unreadable: {path.name}: {type(exc).__name__}")
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                rejected += 1
+                continue
+            if not isinstance(obj, dict) or not obj.get("ts"):
+                rejected += 1
+    if rejected:
+        errors.append(f"episode log contains {rejected} rejected row(s)")
+    return errors
+
+
 def episodes_missing_in_pg(cur, keys: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """File-episode keys with no PG row — the directional drift signal.
 
@@ -132,6 +165,14 @@ def file_topic_hashes(memory_root: Path, limit: int | None = None) -> tuple[dict
 def sample_drift(memory_root: Path, sample: int | None = None) -> dict:
     """Full file-vs-PG comparison. `sample` caps the topic pass for a caller
     that wants a cheap partial run; None (the default) checks every topic."""
+    evidence_errors = _legacy_drift_errors(memory_root)
+    if evidence_errors:
+        return {
+            "error": "; ".join(evidence_errors),
+            "episodes_missing_in_pg": -1,
+            "topic_mismatches": [],
+            "topic_files_unreadable": [],
+        }
     file_keys = file_episode_keys(memory_root)
     file_hashes, unreadable_topics = file_topic_hashes(memory_root, limit=sample)
     with connect() as conn:

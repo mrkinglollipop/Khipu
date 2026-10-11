@@ -60,6 +60,7 @@ LATEST_PROTOCOL = "2025-06-18"
 SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX = 12, 50
 GRAPH_LIMIT_DEFAULT, GRAPH_LIMIT_MAX = 25, 200
 GRAPH_HOPS_MAX = 4
+MAX_FRAME_BYTES = 1024 * 1024
 
 
 def _ensure_path() -> None:
@@ -641,12 +642,14 @@ TOOLS: list[dict] = [
             "Answer one question from memory and show the evidence. Runs one "
             "search, then asks the configured model to answer only from what "
             "it found; every claim lists the episode or topic ids it rests on "
-            "(fetch one with khipu_get before acting on it), and a claim the "
-            "sources do not support is removed. Superseded or retracted "
+            "(fetch one with khipu_get before acting on it). Validation checks "
+            "citation identifiers, not whether sources support the claims or "
+            "the model's separate answer. Superseded or retracted "
             "decisions are treated as history. Abstains (abstained: true, with "
             "a reason, answer empty) rather than answer without sources. It "
             "calls a model, so use it when you want a synthesis, not for a "
-            "lookup: khipu_search is the lookup. Writes nothing. Returns "
+            "lookup: khipu_search is the lookup. Writes no memory content; "
+            "retrieval caches and usage counters may be updated. Returns "
             "{available: false, reason} when reflection is switched off."
         ),
         "inputSchema": {
@@ -661,10 +664,30 @@ TOOLS: list[dict] = [
 ]
 
 
+def _positive_id(value, field: str) -> int:
+    if type(value) is int and value > 0:
+        return value
+    if isinstance(value, str) and value and value.isascii() and value.isdecimal():
+        parsed = int(value)
+        if parsed > 0:
+            return parsed
+    raise ValueError(f"{field} must be a positive integer id")
+
+
+def _detail_response(kind: str, row: dict, **metadata) -> dict:
+    row = dict(row)
+    if kind == "episode":
+        row.pop("raw", None)
+    return {"kind": kind, **row, **metadata}
+
+
 def _tool_search(args: dict) -> dict:
     query = (args.get("query") or "").strip()
     if not query:
         raise ValueError("query is required")
+    from khipu.redact import redact_secrets
+
+    query = redact_secrets(query)[0]
     limit = min(int(args.get("limit") or SEARCH_LIMIT_DEFAULT), SEARCH_LIMIT_MAX)
     _ensure_path()
     from khipu import query_log
@@ -775,7 +798,6 @@ def _tool_get(args: dict) -> dict:
                 inferred = "topic"
             else:
                 row = dict(row)
-                row.pop("raw", None)
                 # Additive (Phase 2A): decision_states (one entry per decision
                 # this episode produced) + validity (current/superseded/
                 # retracted counts). Hub path only — the sqlite replica has no
@@ -784,7 +806,7 @@ def _tool_get(args: dict) -> dict:
                 from khipu.decisions import decision_states_for_episode
 
                 row.update(decision_states_for_episode(int(ident)))
-                return {"kind": "episode", **row}
+                return _detail_response("episode", row)
         if inferred == "topic":
             row = topic_detail(ident)
             if row is None and kind is None:
@@ -793,7 +815,7 @@ def _tool_get(args: dict) -> dict:
                     return {"kind": "media", **media}
             if row is None:
                 raise ValueError(f"topic not found: {ident}")
-            return {"kind": "topic", **row}
+            return _detail_response("topic", row)
         row = media_detail(ident)
         if row is None:
             raise ValueError(f"media not found: {ident}")
@@ -812,12 +834,12 @@ def _tool_get(args: dict) -> dict:
                 raise ValueError(f"episode not found: {ident}")
             inferred = "topic"
         else:
-            return {"kind": "episode", **row, **stale_fields()}
+            return _detail_response("episode", row, **stale_fields())
     if inferred == "topic":
         row = topic_detail_snapshot(ident)
         if row is None:
             raise ValueError(f"topic not found: {ident}")
-        return {"kind": "topic", **row, **stale_fields()}
+        return _detail_response("topic", row, **stale_fields())
     if hub_failed:
         raise ValueError(f"media not found: {ident}")
     raise ValueError(f"not found: {ident}")
@@ -1073,9 +1095,16 @@ def _attach_prior_work(payload: dict, args: dict) -> None:
             payload["prior_work"] = None
         else:
             payload["prior_work"] = _prior_work_items(result.get("hits") or [])
-        payload["prior_work_text"] = result["context"] or None
+        context = result["context"] or ""
+        if len(context) > 600:
+            context = context[:600].rsplit("\n", 1)[0]
+        payload["prior_work_text"] = context or None
         meta = result.get("prior_work_meta")
         if meta is not None:
+            if (not result.get("hits") and not meta.get("legs")
+                    and meta.get("degraded") == "no legs completed"
+                    and meta.get("outcome") == "no_match"):
+                meta = {**meta, "outcome": "error", "reason": "error: no recall legs completed"}
             payload["prior_work_meta"] = meta
     except Exception:  # noqa: BLE001 — an optional field must never break khipu_status
         pass
@@ -1194,10 +1223,7 @@ def _tool_owed_update(args: dict) -> dict:
     """Close / reopen / snooze one commitment — the write half of khipu_owed,
     so a cloud agent can close what it opened (audit 2026-09-04: cloud
     clients could open commitments they could never close)."""
-    try:
-        cid = int(args.get("id"))
-    except (TypeError, ValueError):
-        raise ValueError("id must be an integer commitment id") from None
+    cid = _positive_id(args.get("id"), "id")
     action = (args.get("action") or "").strip().lower()
     if action not in ("close", "reopen", "snooze"):
         raise ValueError("action must be 'close', 'reopen' or 'snooze'")
@@ -1226,14 +1252,17 @@ def _tool_owed_update(args: dict) -> dict:
             **({"until": str(args.get("until") or "")} if action == "snooze" else {})}
 
 
+class _ToolFailure(ValueError):
+    def __init__(self, payload: dict):
+        super().__init__(str(payload.get("error") or "tool failed"))
+        self.payload = payload
+
+
 def _tool_forget(args: dict) -> dict:
     """Complete forget of one episode (khipu.forget). From the gateway only a
     cloud harness's own captures may be forgotten: a local episode belongs to
     the Mac that captured it and is forgotten there."""
-    try:
-        eid = int(args.get("id"))
-    except (TypeError, ValueError):
-        raise ValueError("id must be an integer episode id") from None
+    eid = _positive_id(args.get("id"), "id")
     _ensure_path()
     from khipu.forget import LOCAL_HARNESSES, forget_everywhere
     from khipu.db import connect
@@ -1252,9 +1281,9 @@ def _tool_forget(args: dict) -> dict:
                 "(khipu episode forget) — the gateway forgets only cloud captures"
             )
     out = forget_everywhere(eid)
-    if not out.get("ok"):
-        raise ValueError(str(out.get("error") or "forget failed"))
     out.pop("identity", None)
+    if not out.get("ok"):
+        raise _ToolFailure(out)
     return out
 
 
@@ -1301,15 +1330,9 @@ def _tool_decisions_update(args: dict) -> dict:
         raise ValueError(f"action must be one of {valid_actions}")
 
     if action in ("confirm", "reject"):
-        try:
-            link_id = int(args.get("link_id"))
-        except (TypeError, ValueError):
-            raise ValueError("link_id must be an integer") from None
+        link_id = _positive_id(args.get("link_id"), "link_id")
     else:
-        try:
-            decision_id = int(args.get("id"))
-        except (TypeError, ValueError):
-            raise ValueError("id must be an integer decision id") from None
+        decision_id = _positive_id(args.get("id"), "id")
 
     by = new_id_arg = new_text = None
     if action == "supersede":
@@ -1318,14 +1341,14 @@ def _tool_decisions_update(args: dict) -> dict:
         if (by is None) == (not new_text):
             raise ValueError("supersede needs exactly one of 'by' or 'new_text'")
         if by is not None:
-            try:
-                new_id_arg = int(by)
-            except (TypeError, ValueError):
-                raise ValueError("by must be an integer decision id") from None
+            new_id_arg = _positive_id(by, "by")
 
     _ensure_path()
     from khipu import decisions as _decisions
     from khipu.db import connect
+    from khipu.redact import redact_secrets
+
+    reason = redact_secrets(str(args.get("reason") or ""))[0] or None
 
     with connect() as conn:
         with conn.cursor() as cur:
@@ -1343,25 +1366,36 @@ def _tool_decisions_update(args: dict) -> dict:
                 conn.commit()
                 return {"ok": ok, "id": decision_id, "action": "restore"}
             if action == "retract":
-                ok = _decisions.retract(cur, decision_id, args.get("reason") or None)
+                ok = _decisions.retract(cur, decision_id, reason)
                 conn.commit()
                 out = {"ok": ok, "id": decision_id, "action": "retract"}
                 if degrade_note:
                     out["note"] = degrade_note
                 return out
             # action == "supersede"
-            reason = args.get("reason") or None
             if new_id_arg is not None:
                 new_id = new_id_arg
             else:
+                original = _decisions._fetch_decision_row(cur, decision_id)
+                if original is None:
+                    raise ValueError(f"no such decision: {decision_id}")
+                if original.get("superseded_by") is not None:
+                    return {"ok": False, "id": decision_id,
+                            "superseded_by": original["superseded_by"], "action": "supersede"}
                 new_id = _decisions.create_decision(
-                    cur, project=args.get("project") or None, text=str(new_text),
+                    cur, project=args.get("project") or original.get("project"),
+                    text=redact_secrets(str(new_text))[0],
                     session_id=args.get("session_id") or None,
                     source_kind=args.get("source_kind") or "assistant",
                 )
             ok = _decisions.supersede(cur, decision_id, new_id, source="agent", reason=reason)
-            conn.commit()
-            out = {"ok": ok, "id": decision_id, "superseded_by": new_id, "action": "supersede"}
+            if not ok and new_id_arg is None:
+                conn.rollback()
+            else:
+                conn.commit()
+            out = {"ok": ok, "id": decision_id, "action": "supersede"}
+            if ok or new_id_arg is not None:
+                out["superseded_by"] = new_id
             if degrade_note:
                 out["note"] = degrade_note
             return out
@@ -1486,8 +1520,52 @@ def _drop_modules_if_code_changed() -> bool:
     return True
 
 
-def handle_message(msg: dict) -> dict | None:
-    """One JSON-RPC message in, one response out (None for notifications)."""
+_MESSAGE_STATE = threading.local()
+
+
+def take_message_error() -> str | None:
+    error = getattr(_MESSAGE_STATE, "error", None)
+    _MESSAGE_STATE.error = None
+    return error
+
+
+def _response_error(response: dict | None) -> str | None:
+    if response is not None:
+        if response.get("error"):
+            return "protocol error"
+        result = response.get("result")
+        if isinstance(result, dict) and result.get("isError"):
+            return "tool error"
+    return None
+
+
+def handle_message(msg) -> dict | None:
+    """Validate before dispatch; valid notifications never emit responses."""
+    _MESSAGE_STATE.error = None
+    if (not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0"
+            or not isinstance(msg.get("method"), str) or not msg["method"]
+            or ("id" in msg and (isinstance(msg["id"], bool)
+                                or not isinstance(msg["id"], (str, int, float, type(None)))))):
+        _MESSAGE_STATE.error = "protocol error"
+        return _error(None, -32600, "invalid request")
+    req_id = msg.get("id")
+    params = msg.get("params", {})
+    error = None
+    if not isinstance(params, dict):
+        error = "params must be an object"
+    elif msg["method"] == "initialize" and "protocolVersion" in params and not isinstance(params["protocolVersion"], str):
+        error = "protocolVersion must be a string"
+    elif msg["method"] == "tools/call":
+        if not isinstance(params.get("name"), str):
+            error = "tool name must be a string"
+        elif not isinstance(params.get("arguments", {}), dict):
+            error = "arguments must be an object"
+    response = _error(req_id, -32602, error) if error else _dispatch_message(msg)
+    _MESSAGE_STATE.error = _response_error(response)
+    return response if "id" in msg else None
+
+
+def _dispatch_message(msg: dict) -> dict | None:
     method = msg.get("method")
     req_id = msg.get("id")
     is_notification = "id" not in msg
@@ -1529,6 +1607,8 @@ def handle_message(msg: dict) -> dict | None:
             _drop_modules_if_code_changed()
         try:
             payload = func(params.get("arguments") or {})
+        except _ToolFailure as exc:
+            return _result(req_id, _tool_text(exc.payload, is_error=True))
         except ValueError as exc:  # argument/mode rejections → tool error, not crash
             return _result(req_id, _tool_text({"error": str(exc)}, is_error=True))
         except KeyboardInterrupt:
@@ -1557,13 +1637,24 @@ def main() -> int:
     _RELOAD_ON_CHANGE = True
     _note_loaded_modules()
     print(f"[khipu-mcp] ready (pid {os.getpid()})", file=sys.stderr, flush=True)
-    for line in sys.stdin:
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
+    while True:
+        line = stream.readline(MAX_FRAME_BYTES + 1)
+        if not line:
+            break
+        newline = b"\n" if isinstance(line, bytes) else "\n"
+        size = len(line) if isinstance(line, bytes) else len(line.encode("utf-8"))
+        if size > MAX_FRAME_BYTES:
+            while line and not line.endswith(newline):
+                line = stream.readline(MAX_FRAME_BYTES + 1)
+            print(json.dumps(_error(None, -32700, "frame too large")), flush=True)
+            continue
         line = line.strip()
         if not line:
             continue
         try:
             msg = json.loads(line)
-        except ValueError:
+        except (ValueError, UnicodeDecodeError):
             print(json.dumps(_error(None, -32700, "parse error")), flush=True)
             continue
         response = handle_message(msg)

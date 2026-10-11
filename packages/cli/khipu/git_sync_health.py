@@ -85,16 +85,26 @@ def heartbeat_candidates() -> list[Path]:
 
 
 def read_heartbeat() -> dict[str, Any] | None:
+    heartbeat, _errors = _read_heartbeat_with_errors()
+    return heartbeat
+
+
+def _read_heartbeat_with_errors() -> tuple[dict[str, Any] | None, list[str]]:
+    errors: list[str] = []
     for p in heartbeat_candidates():
         if p.is_file():
             try:
                 d = json.loads(p.read_text(encoding="utf-8"))
-                if isinstance(d, dict):
+                if isinstance(d, dict) and _parse_ts(d.get("ts")) is not None and "exit" in d:
+                    if not isinstance(d["exit"], (int, str)) or isinstance(d["exit"], bool):
+                        raise ValueError("exit must be an integer")
+                    int(d["exit"])
                     d["_path"] = str(p)
-                    return d
-            except Exception:  # noqa: BLE001 — a corrupt heartbeat is judged as none
-                continue
-    return None
+                    return d, errors
+                errors.append(f"heartbeat unreadable at {p}: expected ts and exit")
+            except Exception as exc:  # noqa: BLE001 — corruption is health evidence
+                errors.append(f"heartbeat unreadable at {p}: {type(exc).__name__}")
+    return None, errors
 
 
 def is_sync_host() -> bool:
@@ -130,13 +140,24 @@ def _parse_ts(raw: Any) -> float | None:
 
 
 def _git(repo: Path, *args: str) -> str | None:
+    value, _error = _git_probe(repo, *args)
+    return value
+
+
+def _git_probe(repo: Path, *args: str) -> tuple[str | None, str | None]:
     try:
         r = subprocess.run(
             ["git", *args], cwd=repo, capture_output=True, text=True, timeout=GIT_TIMEOUT_S
         )
-    except Exception:  # noqa: BLE001
-        return None
-    return r.stdout.strip() if r.returncode == 0 else None
+    except subprocess.TimeoutExpired:
+        return None, f"git {' '.join(args)} timed out after {GIT_TIMEOUT_S}s"
+    except OSError as exc:
+        return None, f"git {' '.join(args)} failed: {type(exc).__name__}"
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").strip().splitlines()
+        suffix = f": {detail[-1][:160]}" if detail else ""
+        return None, f"git {' '.join(args)} exited {r.returncode}{suffix}"
+    return r.stdout.strip(), None
 
 
 def repo_state(repo: Path | None) -> dict[str, Any]:
@@ -144,10 +165,15 @@ def repo_state(repo: Path | None) -> dict[str, Any]:
     a sync branch was left behind. No network."""
     if repo is None or not (repo / ".git").exists():
         return {"present": False}
-    branch = _git(repo, "branch", "--show-current")
-    listed = _git(repo, "branch", "--list", "memory-autosync-*")
+    branch, branch_error = _git_probe(repo, "branch", "--show-current")
+    listed, listed_error = _git_probe(repo, "branch", "--list", "memory-autosync-*")
     stray = [b.strip().lstrip("* ").strip() for b in (listed or "").splitlines() if b.strip()]
-    return {"present": True, "branch": branch, "stray_branches": stray}
+    return {
+        "present": True,
+        "branch": branch,
+        "stray_branches": stray,
+        "errors": [e for e in (branch_error, listed_error) if e],
+    }
 
 
 def status(*, now: float | None = None) -> dict[str, Any]:
@@ -162,7 +188,18 @@ def status(*, now: float | None = None) -> dict[str, Any]:
         out["note"] = "not the sync host — this Mac does not run the nightly consolidate"
         return out
 
-    hb = read_heartbeat()
+    hb, heartbeat_errors = _read_heartbeat_with_errors()
+    out["reasons"].extend(heartbeat_errors)
+    try:
+        nightly_log = nightly_log_path()
+        nightly_ran = nightly_log.stat().st_mtime if nightly_log.is_file() else None
+    except OSError:
+        nightly_ran = None
+    try:
+        install = nightly_plist_path()
+        install_boundary = install.stat().st_mtime if install.is_file() else None
+    except OSError:
+        install_boundary = None
     repo: Path | None = None
     if hb:
         out["seen"] = True
@@ -174,11 +211,6 @@ def status(*, now: float | None = None) -> dict[str, Any]:
         if rc not in (0, None):
             note = str(hb.get("note") or hb.get("outcome") or "")[:160]
             out["reasons"].append(f"last sync exited {rc}: {note}" if note else f"last sync exited {rc}")
-        try:
-            nightly_log = nightly_log_path()
-            nightly_ran = nightly_log.stat().st_mtime if nightly_log.is_file() else None
-        except OSError:
-            nightly_ran = None
         out["nightly_log_age_s"] = int(now - nightly_ran) if nightly_ran else None
         if ts and nightly_ran and nightly_ran - ts > NIGHTLY_SLACK_S:
             out["reasons"].append(
@@ -189,6 +221,12 @@ def status(*, now: float | None = None) -> dict[str, Any]:
         repo = Path(str(rp)) if rp else None
     else:
         out["note"] = "no sync has run since the heartbeat was added (first run is the next nightly)"
+        out["nightly_log_age_s"] = int(now - nightly_ran) if nightly_ran else None
+        if nightly_ran:
+            if install_boundary is None:
+                out["reasons"].append("installation boundary missing; nightly heartbeat unchecked")
+            elif nightly_ran >= install_boundary:
+                out["reasons"].append("the nightly ran but did not record a heartbeat")
     if repo is None:
         # Before the first heartbeat (or if it omitted the path) still inspect the
         # repo the sync is known to own, so a stranded branch is visible tonight.
@@ -211,6 +249,8 @@ def status(*, now: float | None = None) -> dict[str, Any]:
 
     rs = repo_state(repo)
     out["repo"] = rs
+    for error in rs.get("errors") or []:
+        out["reasons"].append(f"git probe failed: {error}")
     if rs.get("present"):
         if rs.get("branch") not in (None, "main"):
             out["reasons"].append(f"memory repo is on '{rs['branch']}', not main — a sync died mid-flow")

@@ -397,8 +397,9 @@ def test_with_the_switch_off_the_local_lane_is_identical_and_never_consults_the_
     with corpus.installed_corpus(tmp_path):
         default = [_stable(rp.prior_work_for_prompt(q, cwd=None, budget_ms=600)) for q in _QUERIES]
         monkeypatch.setenv(ENV, "0")
-        with mock.patch.object(relevance, "gate", side_effect=AssertionError("gate consulted")):
+        with mock.patch.object(relevance, "gate", side_effect=AssertionError("gate consulted")) as gate:
             explicit_off = [_stable(rp.prior_work_for_prompt(q, cwd=None, budget_ms=600)) for q in _QUERIES]
+        gate.assert_not_called()
     assert default == explicit_off
 
 
@@ -408,8 +409,9 @@ def test_with_the_switch_off_explicit_search_is_identical(monkeypatch):
         default = em.hybrid_search(QUERY, limit=8)
     monkeypatch.setenv(ENV, "0")
     with _hub_of(rows, literal=rows[:6]), \
-            mock.patch.object(relevance, "gate", side_effect=AssertionError("gate consulted")):
+            mock.patch.object(relevance, "gate", side_effect=AssertionError("gate consulted")) as gate:
         explicit_off = em.hybrid_search(QUERY, limit=8)
+    gate.assert_not_called()
 
     def strip(p):
         return {k: v for k, v in p.items() if k != "timing"}
@@ -421,8 +423,9 @@ def test_with_the_switch_off_the_hub_lane_is_identical(monkeypatch):
     lex, cos = [_lex("1", "gateway only")], [_cos("2", 0.3), _cos("3", 0.2)]
     default = _hub(lex, cos)
     monkeypatch.setenv(ENV, "0")
-    with mock.patch.object(relevance, "gate", side_effect=AssertionError("gate consulted")):
+    with mock.patch.object(relevance, "gate", side_effect=AssertionError("gate consulted")) as gate:
         explicit_off = _hub(lex, cos)
+    gate.assert_not_called()
     assert default == explicit_off
 
 
@@ -485,7 +488,7 @@ def test_a_positive_that_was_empty_before_the_gate_is_not_blamed_on_it():
     entries = [{"query": "never found", "expect": ["zzz"]}]
     with mock.patch.object(em, "hybrid_search", side_effect=_fake_search_by_switch):
         report = recall_eval.run_relevance_eval(entries, ("explicit",), floor=True)
-    assert report["paths"]["explicit"]["emptied_positives"] == ["never found"]
+    assert report["paths"]["explicit"]["emptied_positives"] == []
     empty = {"results": []}
     with mock.patch.object(em, "hybrid_search", return_value=empty):
         report = recall_eval.run_relevance_eval(entries, ("explicit",), floor=True)
@@ -511,7 +514,13 @@ def test_eval_restores_a_switch_the_caller_had_set(monkeypatch):
 def test_eval_scores_the_prompt_and_status_paths_with_the_switch_forced_each_way():
     def fake_prompt(query, **kw):
         on = os.environ[ENV] == "1"
-        return {"hits": [] if on else [{"id": "x"}], "reason": "ok"}
+        return {
+            "hits": [] if on else [{"id": "x"}], "reason": "ok",
+            "prior_work_meta": {
+                "outcome": "no_match" if on else "match",
+                "legs": ["lexical"], "degraded": None, "reason": "ok",
+            },
+        }
 
     entries = [{"query": "nothing remembered", "expect_none": True}]
     with mock.patch("khipu.recall_prompt.prior_work_for_prompt", side_effect=fake_prompt):

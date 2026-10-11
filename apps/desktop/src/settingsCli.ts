@@ -5,7 +5,7 @@
    truth, so a screen re-reads its state after each write instead of trusting
    what it just sent. */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 export type CliResult<T> = { ok: true; data: T } | { ok: false; error: string };
@@ -61,10 +61,13 @@ export function useCliState<T>(command: string, active: boolean) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const latestReload = useRef(0);
 
   const reload = useCallback(async (): Promise<T | null> => {
+    const request = ++latestReload.current;
     setLoading(true);
     const res = await callCli<T>(command);
+    if (latestReload.current !== request) return null;
     setLoading(false);
     if (res.ok) {
       setData(res.data);

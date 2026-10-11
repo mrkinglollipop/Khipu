@@ -94,7 +94,9 @@ class _FakeCursor:
         self.calls.append(s)
         self._guard(s)
         up = s.upper()
-        if up.startswith("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES"):
+        if up.startswith("SELECT CURRENT_DATABASE(), PG_POSTMASTER_START_TIME()"):
+            self._rows = [("khipu", "2026-10-10T00:00:00Z", self.role, 5432)]
+        elif up.startswith("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES"):
             self._rows = [(t,) for t in self.db.tables]
         elif up.startswith("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS"):
             self._rows = []

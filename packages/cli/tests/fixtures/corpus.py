@@ -41,7 +41,7 @@ from unittest import mock
 CORPUS_VERSION = 1
 
 PROJECTS = ("acme/widget", "acme/rocket")
-PROFILE_ID = "pseudo-768"
+PROFILE_ID = "pseudo-hash@768"
 PROFILE_DIM = 768
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -466,7 +466,7 @@ def build_corpus(
 
     con.execute(
         "INSERT INTO embedding_profiles (id, provider, model, dim, normalize, "
-        "is_active, created_at) VALUES (?, 'pseudo', 'pseudo-hash', ?, 'l2', ?, ?)",
+        "is_active, created_at) VALUES (?, 'gemini', 'pseudo-hash', ?, 'l2', ?, ?)",
         (PROFILE_ID, profile_dim, 1 if active_profile else 0, _iso(now)),
     )
     for ep in episodes:

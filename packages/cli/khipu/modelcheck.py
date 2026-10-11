@@ -99,6 +99,14 @@ def _pass(check_id: str, *, model: str, start: float) -> dict[str, Any]:
     )
 
 
+def _fail_empty_generation(check_id: str, *, model: str, start: float) -> dict[str, Any]:
+    return _result(
+        check_id, ok=False, title="Key check failed",
+        detail="The provider returned no usable generated text", model=model,
+        seconds=_elapsed(start),
+    )
+
+
 def _fail_http(check_id: str, *, code: int, model: str, start: float) -> dict[str, Any]:
     if code in (401, 403):
         detail, fix = _UNAUTHORIZED_DETAIL, _UNAUTHORIZED_FIX
@@ -164,12 +172,19 @@ def _check_gemini_embed(*, timeout: float) -> dict[str, Any]:
         keychain.resolve_gemini_key()
     except RuntimeError:
         return _skip("gemini_embed", "Gemini embeddings")
-    profile = _active_embed_profile()
-    model = embed_mod.model_for_profile(profile)
+    try:
+        active = embed_mod._profiles.resolve_spec(_active_embed_profile())
+    except Exception:  # noqa: BLE001 - key verification must survive hub lookup failure
+        active = None
+    if active is not None and active.provider == "gemini":
+        profile, model = active.id, active.model
+    else:
+        fallback = embed_mod._profiles.SEED_PROFILES[embed_mod.PROFILE_2]
+        profile, model = fallback.id, fallback.model
     start = time.monotonic()
     try:
         embed_mod.embed_one(EMBED_PROBE_TEXT, profile=profile, retries=0, timeout=timeout)
-    except RuntimeError as exc:
+    except Exception as exc:  # noqa: BLE001 - the check must not abort its siblings
         return _fail_from_embed_exc("gemini_embed", exc, model=model, start=start)
     return _pass("gemini_embed", model=model, start=start)
 
@@ -183,6 +198,47 @@ def _post_once(url: str, body: bytes, headers: dict[str, str], timeout: float) -
             return resp.status, resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace")
+
+
+def _has_generated_text(provider: str, response: str) -> bool:
+    try:
+        payload = json.loads(response)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if provider == "gemini":
+        candidates = payload.get("candidates", [])
+        if not isinstance(candidates, list):
+            return False
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            content = candidate.get("content") or {}
+            if not isinstance(content, dict):
+                continue
+            parts = content.get("parts", [])
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                if isinstance(part.get("text"), str) and part["text"].strip():
+                    return True
+        return False
+    choices = payload.get("choices", [])
+    if not isinstance(choices, list):
+        return False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") or {}
+        if not isinstance(message, dict):
+            continue
+        text = message.get("content", choice.get("text"))
+        if isinstance(text, str) and text.strip():
+            return True
+    return False
 
 
 def _check_gemini_generate(*, timeout: float) -> dict[str, Any]:
@@ -211,11 +267,13 @@ def _check_gemini_generate(*, timeout: float) -> dict[str, Any]:
     headers = {"Content-Type": "application/json", "x-goog-api-key": key}
     start = time.monotonic()
     try:
-        code, _text = _post_once(url, body, headers, timeout)
+        code, text = _post_once(url, body, headers, timeout)
     except (urllib.error.URLError, TimeoutError, OSError):
         return _fail_network("gemini_generate", model=model, start=start)
-    if code == 200:
+    if code == 200 and _has_generated_text("gemini", text):
         return _pass("gemini_generate", model=model, start=start)
+    if code == 200:
+        return _fail_empty_generation("gemini_generate", model=model, start=start)
     return _fail_http("gemini_generate", code=code, model=model, start=start)
 
 
@@ -239,11 +297,13 @@ def _check_openai_compat_generate(*, timeout: float) -> dict[str, Any]:
     }).encode("utf-8")
     start = time.monotonic()
     try:
-        code, _text = _post_once(url, body, headers, timeout)
+        code, text = _post_once(url, body, headers, timeout)
     except (urllib.error.URLError, TimeoutError, OSError):
         return _fail_network("openai_compat_generate", model=model, start=start)
-    if code == 200:
+    if code == 200 and _has_generated_text("openai", text):
         return _pass("openai_compat_generate", model=model, start=start)
+    if code == 200:
+        return _fail_empty_generation("openai_compat_generate", model=model, start=start)
     return _fail_http("openai_compat_generate", code=code, model=model, start=start)
 
 

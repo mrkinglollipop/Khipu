@@ -79,10 +79,10 @@ class BriefsBuildStepTest(unittest.TestCase):
         select.assert_called_once()
         self.assertEqual(select.call_args.args[1:], (None, jobs.BRIEFS_NIGHTLY_LIMIT))
 
-    def test_unavailable_selection_builds_nothing_and_is_ok(self):
+    def test_unavailable_selection_builds_nothing_and_is_unhealthy(self):
         select = mock.Mock(return_value={"available": False, "reason": "table missing"})
         out, _, _, m_release, _, build = self._run(select=select)
-        self.assertTrue(out["ok"])
+        self.assertFalse(out["ok"])
         self.assertEqual(out["built"], 0)
         build.assert_not_called()
         m_release.assert_called_once()
@@ -121,7 +121,7 @@ class RunNightlyBriefsStepTest(unittest.TestCase):
         self.assertEqual(steps[-1]["name"], "briefs_build")
         self.assertEqual(steps[-1]["counts"]["built"], 3)
 
-    def test_build_many_raising_still_returns_the_exit_code(self):
+    def test_build_many_raising_fails_the_nightly_exit_code(self):
         patches = mock.patch.multiple(
             "khipu.briefs",
             acquire_build_lock=mock.Mock(return_value=True),
@@ -132,7 +132,7 @@ class RunNightlyBriefsStepTest(unittest.TestCase):
         with mock.patch("khipu.features.enabled", return_value=True), \
                 mock.patch("khipu.db.connect", return_value=_Conn()):
             rc, steps = self._nightly(patches)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(steps[-1]["name"], "briefs_build")
         self.assertFalse(steps[-1]["ok"])
 

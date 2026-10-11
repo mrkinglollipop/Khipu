@@ -140,6 +140,8 @@ class ToolDecisionsUpdateTest(unittest.TestCase):
         conn = _FakeConn(cur)
         with mock.patch("khipu.db.connect", return_value=conn), \
                 mock.patch("khipu.decisions._evidence_ready", return_value=True), \
+                mock.patch("khipu.decisions._fetch_decision_row",
+                           return_value={"id": 1, "project": "acme/widget", "superseded_by": None}), \
                 mock.patch("khipu.decisions.create_decision", return_value=42) as m_create, \
                 mock.patch("khipu.decisions.supersede", return_value=True) as m_sup:
             out = srv._tool_decisions_update(

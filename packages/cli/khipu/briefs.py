@@ -36,8 +36,8 @@ import re
 import sys
 from typing import Any
 
-# Bumping this makes every existing brief stale on the next plan.
-DERIVATION_VERSION = 1
+# Bumping this makes every existing brief stale on its next read or plan.
+DERIVATION_VERSION = 3
 
 DEFAULT_BUILD_LIMIT = 5
 
@@ -178,7 +178,47 @@ def _decision_rows(cur, episode_ids: list[int], *, with_text: bool = False) -> d
         row["text" if with_text else "chars"] = body
         row["state"] = decisions.state_of(row)
         out.setdefault(int(episode_id), []).append(row)
+    # Backfill deduplicates repeated strings into an earlier episode's row.
+    body = "d.text" if with_text else "length(d.text)"
+    retracted = "d.retracted_at" if decisions._evidence_ready(cur) else "NULL"
+    live = decisions._not_forgotten_clause(cur, "d")
+    cur.execute(
+        f"SELECT e.id, d.id, {body}, d.superseded_by, {retracted} "
+        "FROM episodes e CROSS JOIN LATERAL jsonb_array_elements_text(e.decisions) legacy(text) "
+        "JOIN LATERAL (SELECT d.* FROM decisions d "
+        "WHERE d.project IS NOT DISTINCT FROM e.project "
+        "AND lower(regexp_replace(trim(d.text), '\\s+', ' ', 'g')) = "
+        "lower(regexp_replace(trim(legacy.text), '\\s+', ' ', 'g')) "
+        "AND d.decided_at <= e.ts "
+        f"AND d.decided_at >= e.ts - interval '{decisions.DEDUP_WINDOW_DAYS} days' "
+        + (f"AND {live} " if live else "") +
+        "ORDER BY d.decided_at DESC, d.id DESC LIMIT 1) d ON true "
+        "WHERE e.id = ANY(%s::bigint[]) "
+        "AND NOT EXISTS (SELECT 1 FROM decisions own WHERE own.episode_id = e.id "
+        "AND lower(regexp_replace(trim(own.text), '\\s+', ' ', 'g')) = "
+        "lower(regexp_replace(trim(legacy.text), '\\s+', ' ', 'g'))) ORDER BY e.id, d.id",
+        (list(episode_ids),),
+    )
+    for episode_id, did, body, superseded_by, retracted_at in cur.fetchall():
+        mine = out.setdefault(int(episode_id), [])
+        if any(r["id"] == did for r in mine):
+            continue
+        row = {"id": did, "superseded_by": superseded_by, "retracted_at": retracted_at}
+        row["text" if with_text else "chars"] = body
+        row["state"] = decisions.state_of(row)
+        mine.append(row)
     return out
+
+
+def _decision_lines(rows, legacy, *, label_unknown=True) -> tuple[list[str], bool]:
+    from khipu.decisions import normalize_text
+
+    known = {normalize_text(r["text"]) for r in rows}
+    lines = [("(superseded) " if r["state"] == "superseded" else "") + (r["text"] or "")
+             for r in rows if r["state"] != "retracted"]
+    unmatched = [d for d in (legacy or []) if isinstance(d, str) and normalize_text(d) not in known]
+    lines.extend(("(validity unknown) " if label_unknown else "") + d for d in unmatched)
+    return lines, bool(unmatched)
 
 
 def _live_clause(cur) -> str:
@@ -276,7 +316,7 @@ def _gather(cur, slug: str) -> dict[str, Any]:
     """The topic's live source episodes: the fingerprint over all of them, and
     the newest cleaned subset (within ``MAX_SOURCE_CHARS``) offered to the
     model."""
-    from khipu import redact
+    from khipu import decisions, redact
 
     project = "e.project" if _has(cur, "episodes", "project") else "NULL"
     cur.execute(
@@ -285,6 +325,7 @@ def _gather(cur, slug: str) -> dict[str, Any]:
         (slug,),
     )
     episodes = cur.fetchall()
+    registry_ready = decisions._decisions_ready(cur)
     decision_rows = _decision_rows(cur, [int(r[0]) for r in episodes], with_text=True)
 
     entries: list[tuple[int, str, str]] = []
@@ -301,13 +342,7 @@ def _gather(cur, slug: str) -> dict[str, Any]:
         ))
         if project_name:
             projects[project_name] = projects.get(project_name, 0) + 1
-        if rows:
-            lines = [
-                ("(superseded) " if r["state"] == "superseded" else "") + (r["text"] or "")
-                for r in rows if r["state"] != "retracted"
-            ]
-        else:
-            lines = [d for d in (decisions_json or []) if isinstance(d, str)]
+        lines, _ = _decision_lines(rows, decisions_json, label_unknown=registry_ready)
         text = strip_derived(summary)[:MAX_EPISODE_CHARS]
         lines = [ln for ln in (strip_derived(ln) for ln in lines) if ln]
         if not text and not lines:
@@ -364,14 +399,17 @@ def validate_claims(raw_claims: Any, offered_ids: set[int]) -> tuple[list[dict[s
 
 
 def _final_body(parsed_body: Any, claims: list[dict[str, Any]], removed: int) -> str:
-    """The model's body when every claim it offered survived; otherwise the
-    surviving claims themselves, so the body never carries what validation
-    removed."""
-    from khipu import redact
-
-    if removed == 0 and isinstance(parsed_body, str) and parsed_body.strip():
-        return redact.redact_secrets(parsed_body.strip())[0][:MAX_BODY_CHARS]
-    return "\n".join("- " + c["text"] for c in claims)[:MAX_BODY_CHARS]
+    """Render only accepted claims, keeping each citation with its text."""
+    lines: list[str] = []
+    used = 0
+    for claim in claims:
+        cited = ", ".join(f"episode:{eid}" for eid in claim["episode_ids"])
+        line = f"- {claim['text']} [{cited}]"
+        if used + len(line) + bool(lines) > MAX_BODY_CHARS:
+            break
+        used += len(line) + bool(lines)
+        lines.append(line)
+    return "\n".join(lines)
 
 
 # ---- build ----------------------------------------------------------------------
@@ -503,6 +541,17 @@ def build_many(conn, topics: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return results
 
 
+def build_outcome(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Count topic outcomes without treating unusable builds as success."""
+    out: dict[str, Any] = {"ok": True, "built": 0}
+    for result in results:
+        status = str(result.get("status"))
+        out[status] = out.get(status, 0) + 1
+        if status in {"failed", "error", "unavailable"}:
+            out["ok"] = False
+    return out
+
+
 # ---- one writer -----------------------------------------------------------------
 
 def acquire_build_lock(cur) -> bool:
@@ -565,7 +614,8 @@ def mark_stale_for_decision(cur, decision_id: int) -> int:
 
 def read_brief(cur, topic_slug: str) -> dict[str, Any]:
     """The current brief for a topic as a reader payload. ``body`` and
-    ``claims`` are withheld when a cited episode has since been forgotten."""
+    ``claims`` are withheld when a cited episode has since been forgotten.
+    State is checked against live sources without writing to the store."""
     if not _ready(cur):
         return _unavailable(REASON_TABLE_MISSING)
     cur.execute(
@@ -588,6 +638,12 @@ def read_brief(cur, topic_slug: str) -> dict[str, Any]:
         "source_count": len(ids), "age_seconds": int(age or 0), "created_at": _iso(created_at),
         "derivation_version": version, "model": model,
     }
+    if state == "current":
+        have = _current_row(cur, topic_slug)
+        if (version != DERIVATION_VERSION or not have or have["id"] != brief_id
+                or have["state"] != "current"
+                or have["hash"] != _gather(cur, topic_slug)["hash"]):
+            payload["state"] = "stale"
     if ids and _has(cur, "episodes", "deleted_at"):
         cur.execute(
             "SELECT id FROM episodes WHERE id = ANY(%s::bigint[]) AND deleted_at IS NOT NULL",
@@ -648,6 +704,6 @@ def cli_main(args) -> int:
             finally:
                 release_build_lock(cur)
                 conn.commit()
-    failed = any(r["status"] == "error" for r in results)
-    _print({"ok": not failed, "cost": cost, "results": results, **({"note": note} if note else {})})
-    return 1 if failed else 0
+    outcome = build_outcome(results)
+    _print({"ok": outcome["ok"], "cost": cost, "results": results, **({"note": note} if note else {})})
+    return 0 if outcome["ok"] else 1

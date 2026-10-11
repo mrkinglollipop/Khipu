@@ -542,7 +542,8 @@ class _CatchupCursor:
         elif "FROM commitments c WHERE c.status = 'open'" in s:
             self._result = self.commitment_rows
         elif "FROM topics t WHERE t.deleted_at IS NULL" in s:
-            self._result = self.topic_rows
+            self._result = [(slug, title, body, {"slug": slug, "title": title, "body": body})
+                            for slug, title, body in self.topic_rows]
         elif s.startswith("INSERT INTO memory_embeddings"):
             self.inserts.append(params)
         else:
@@ -1318,7 +1319,7 @@ class QueryEmbedBudgetTest(unittest.TestCase):
                 em.embed_one("q", retries=em.QUERY_EMBED_RETRIES,
                              timeout=em.QUERY_EMBED_TIMEOUT_S)
         self.assertEqual(len(calls), em.QUERY_EMBED_RETRIES + 1)
-        self.assertTrue(all(t == em.QUERY_EMBED_TIMEOUT_S for t in calls))
+        self.assertTrue(all(0 < t <= em.QUERY_EMBED_TIMEOUT_S for t in calls))
         self.assertLess(em.QUERY_EMBED_TIMEOUT_S, 30)
 
 
@@ -1402,34 +1403,30 @@ class _FakeConn:
 
 
 class QueryVectorCacheTest(unittest.TestCase):
-    def test_hash_is_profile_scoped_and_whitespace_case_insensitive(self):
+    def test_hash_is_profile_scoped_and_exact_provider_input(self):
         a = em._query_hash("p1", "  What DID we   decide?")
         b = em._query_hash("p1", "what did we decide?")
         c = em._query_hash("p2", "what did we decide?")
-        self.assertEqual(a, b)
+        self.assertNotEqual(a, b)
         self.assertNotEqual(a, c)
 
-    def test_hash_ignores_stopwords_like_search_tokens(self):
-        """Budgeted-prior_work phase: the cache key normalizes with the same
-        lowercase/stopword/short-word filter search_text.search_tokens uses
-        (same reduction the lexical leg ranks on) — "what did we decide" and
-        "what decide" differ only by a stopword ("did") and a too-short word
-        ("we"), so they must hit the SAME cache row and cost one embed call,
-        not two."""
+    def test_hash_keeps_stopwords_that_change_provider_input(self):
+        """The query-vector cache keys the provider request, not lexical RRF.
+
+        Stopword reduction can collapse semantically distinct provider inputs,
+        so these requests must not share a vector."""
         a = em._query_hash("p1", "what did we decide")
         b = em._query_hash("p1", "what decide")
-        self.assertEqual(a, b)
+        self.assertNotEqual(a, b)
         # A genuinely different content token still misses.
         c = em._query_hash("p1", "what happened")
         self.assertNotEqual(a, c)
 
-    def test_hash_falls_back_to_whitespace_norm_with_no_content_tokens(self):
-        """A query with no content tokens at all (e.g. all stopwords/short
-        words) must still be cacheable rather than silently un-cacheable —
-        falls back to the old whitespace-collapsed/case-folded form."""
+    def test_hash_keeps_short_provider_inputs_exact(self):
+        """Provider input rather than lexical tokenization defines identity."""
         a = em._query_hash("p1", "  Is It  ")
         b = em._query_hash("p1", "is it")
-        self.assertEqual(a, b)
+        self.assertNotEqual(a, b)
 
     def test_hash_does_not_truncate_at_search_tokens_max_tokens(self):
         """Regression (caught live, 2026-09-14 budgeted-prior_work phase): a

@@ -210,17 +210,17 @@ class LibraryIndexTest(unittest.TestCase):
     def test_the_index_is_a_partial_expression_hnsw_for_the_profile(self):
         cur = self._cur()
         name = profiles.ensure_library_index(cur, "voyage-3@1024", dim=1024)
-        self.assertEqual(name, "idx_library_hnsw_voyage_3_1024")
+        self.assertEqual(name, "idx_library_hnsw_voyage_3_1024_d280e893c")
         self.assertEqual(
             self._ddl(cur),
-            ["CREATE INDEX IF NOT EXISTS idx_library_hnsw_voyage_3_1024 ON library_embeddings "
+            ["CREATE INDEX IF NOT EXISTS idx_library_hnsw_voyage_3_1024_d280e893c ON library_embeddings "
              "USING hnsw ((embedding::vector(1024)) vector_cosine_ops) WHERE profile = 'voyage-3@1024'"],
         )
 
     def test_the_memory_table_gets_its_own_index_family(self):
         cur = self._cur()
         name = profiles.ensure_profile_index(cur, "voyage-3@1024", "memory_embeddings", dim=1024)
-        self.assertEqual(name, "idx_memory_hnsw_voyage_3_1024")
+        self.assertEqual(name, "idx_memory_hnsw_voyage_3_1024_d280e893c")
         self.assertIn("ON memory_embeddings USING hnsw ((embedding::vector(1024))", self._ddl(cur)[0])
 
     def test_the_two_gemini_profiles_reuse_the_names_0026_recreates(self):
@@ -232,7 +232,7 @@ class LibraryIndexTest(unittest.TestCase):
             "idx_memory_embeddings_hnsw_gemini2_768")
         self.assertEqual(
             profiles.profile_index_name("gemini-embedding-2@768", "library_embeddings"),
-            "idx_library_hnsw_gemini_embedding_2_768")
+            "idx_library_hnsw_gemini_embedding_2_768_d19571aa5")
 
     def test_an_existing_index_means_no_ddl(self):
         cur = self._cur(exists=True)
@@ -306,7 +306,7 @@ class LibraryIndexTest(unittest.TestCase):
         cur = self._cur()
         self.assertEqual(
             profiles.ensure_profile_index(cur, "voyage-3@1024", "library_embeddings", dim=1024, quiet=True),
-            "idx_library_hnsw_voyage_3_1024")
+            "idx_library_hnsw_voyage_3_1024_d280e893c")
         self.assertEqual(" ".join(cur.execute.call_args_list[-1].args[0].split()),
                          "RELEASE SAVEPOINT khipu_profile_index")
 
@@ -314,6 +314,41 @@ class LibraryIndexTest(unittest.TestCase):
         name = profiles.library_index_name("a" * 90 + "@1024")
         self.assertLessEqual(len(name), 63)
         self.assertNotEqual(name, profiles.library_index_name("a" * 91 + "@1024"))
+
+    def test_a_valid_pre_hash_index_is_reused_instead_of_creating_a_twin(self):
+        profile, table, dim = "custom-model@8", "library_embeddings", 8
+        profiles.register_spec(ProfileSpec(profile, "voyage", "custom-model", dim))
+        self.addCleanup(profiles.clear_learned)
+        old_name = profiles.previous_profile_index_name(profile, table)
+        definition = (
+            f"CREATE INDEX {old_name} ON public.{table} USING hnsw "
+            f"((embedding::vector({dim})) vector_cosine_ops) WHERE profile = '{profile}'"
+        )
+        cur = mock.Mock()
+
+        def execute(sql, params=()):
+            if "SELECT indexdef" in sql:
+                cur.fetchone.return_value = (definition,) if params[0] == old_name else None
+            elif "SELECT 1 FROM pg_indexes" in sql:
+                cur.fetchone.return_value = (1,) if params[0] == old_name else None
+
+        cur.execute.side_effect = execute
+        self.assertEqual(profiles.ensure_profile_index(cur, profile, table, dim=dim), old_name)
+        self.assertFalse(self._ddl(cur))
+        self.assertEqual(profiles.drop_profile_index(cur, profile, table), old_name)
+        listed = FakeCur(
+            rows={profile: ("voyage", "custom-model", dim, "l2", None)},
+            counts={(table, profile): 1}, indexes=[old_name],
+        )
+        with mock.patch.object(profiles, "_legacy_indexdef", return_value=definition):
+            self.assertEqual(profiles.list_profiles(listed)[0]["index"], {"library": "present"})
+        spec = ProfileSpec(profile, "voyage", "custom-model", dim)
+        with mock.patch.object(profiles, "load_spec", return_value=spec), \
+                mock.patch.object(profiles, "profile_users", return_value=[]), \
+                mock.patch.object(profiles, "_to_regclass", return_value=False), \
+                mock.patch.object(profiles, "_drop_index_quiet", return_value=True) as drop:
+            profiles.delete_profile(cur, profile)
+        self.assertIn(old_name, [call.args[1] for call in drop.call_args_list])
 
 
 class BulkLoadTest(unittest.TestCase):
@@ -488,8 +523,8 @@ class CliTest(unittest.TestCase):
         receipt = json.loads(out.getvalue())
         self.assertEqual(rc, 0)
         self.assertEqual(receipt, {"ok": True, "profile": "voyage-3@1024", "indexes": {
-            "memory_embeddings": "idx_memory_hnsw_voyage_3_1024",
-            "library_embeddings": "idx_library_hnsw_voyage_3_1024"}})
+            "memory_embeddings": "idx_memory_hnsw_voyage_3_1024_d280e893c",
+            "library_embeddings": "idx_library_hnsw_voyage_3_1024_d280e893c"}})
         sql = [s for s, _ in cur.executed]
         self.assertEqual(sql.count("SET LOCAL maintenance_work_mem = '900MB'"), 2)
         self.assertEqual(len([s for s in sql if s.startswith("CREATE INDEX")]), 2)

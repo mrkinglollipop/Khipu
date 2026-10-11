@@ -56,7 +56,7 @@ if os.environ.get("KHIPU_LIVE_TESTS") != "1":
     atexit.register(shutil.rmtree, _HERMETIC_HOME, ignore_errors=True)
     os.environ["HOME"] = _HERMETIC_HOME
     os.environ["KHIPU_KEYCHAIN"] = "0"
-    _KEEP = {"KHIPU_KEYCHAIN", "KHIPU_LIVE_TESTS", "KHIPU_SCRATCH_DSN"}
+    _KEEP = {"KHIPU_KEYCHAIN", "KHIPU_LIVE_TESTS"}
     for _name in [n for n in os.environ if n.startswith(("KHIPU_", "ALZY_")) and n not in _KEEP]:
         del os.environ[_name]
     # CLAUDE_CONFIG_DIR: Khipu now installs into that home too (khipu.claude_homes),
@@ -65,6 +65,20 @@ if os.environ.get("KHIPU_LIVE_TESTS") != "1":
     for _name in ("GEMINI_API_KEY", "VOYAGE_API_KEY", "GROK_HOOK_NAME", "GROK_HOOK_EVENT",
                   "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CONFIG_DIR"):
         os.environ.pop(_name, None)
+    for _name in ("CODEX_HOME", "CODEX_SANDBOX", "CLAUDE_PROJECT_DIR"):
+        os.environ.pop(_name, None)
+    for _name in [n for n in os.environ if n.startswith("GIT_")]:
+        os.environ.pop(_name, None)
+    os.environ.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                      GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_COUNT="1",
+                      GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull,
+                      GIT_TEMPLATE_DIR=os.devnull)
+    import psycopg
+
+    def _forbid_pg_connect(*args, **kwargs):
+        raise RuntimeError("real PostgreSQL connections require KHIPU_LIVE_TESTS=1")
+
+    psycopg.connect = _forbid_pg_connect
     # launchctl acts on this Mac's live jobs (bootstrap/bootout reload them),
     # and a test that forgets to stub it reaches them. Shadow it on PATH for
     # the whole run: it answers like an unknown service. Tests that need a

@@ -534,6 +534,36 @@ class TombstoneMissingNotesTest(unittest.TestCase):
         self.assertEqual(cur.topics["note:n0"]["deleted_at"], "tombstoned")
 
 
+class OrdinaryNoteAfterCollisionTest(unittest.TestCase):
+    def test_old_collision_inventory_does_not_overwrite_a_new_ordinary_note(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as data_td:
+            claude_root = Path(td) / "claude_projects"
+            first = _write(claude_root / "-repo-a" / "memory" / "one.md", _sample_note_text())
+            second = _write(
+                claude_root / "-repo-b" / "memory" / "two.md",
+                _sample_note_text().replace("Khipu's", "Other project's"),
+            )
+            cur = _FakeTopicsCursor()
+            with mock.patch.object(notes, "claude_projects_root", return_value=claude_root), \
+                    mock.patch.object(notes, "codex_memories_root", return_value=Path(td) / "no-codex"), \
+                    mock.patch.object(notes, "_project_for_slug", side_effect=lambda s: f"acme/{s[-1]}"), \
+                    mock.patch("khipu.paths.ensure_data_dir", return_value=Path(data_td)), \
+                    mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
+                    mock.patch("khipu.mirror.persist_topic_graph", return_value={
+                        "nodes_minted": 0, "edges_minted": 0}):
+                notes.reconcile()
+                first.write_text(_sample_note_text().replace("khipu-state-of-play", "first-renamed"))
+                second.write_text(_sample_note_text().replace("khipu-state-of-play", "second-renamed"))
+                ordinary = _write(claude_root / "-repo-c" / "memory" / "ordinary.md", _sample_note_text())
+                notes.reconcile(changed_only=True)
+                notes.reconcile(changed_only=True)
+        row = cur.topics["note:khipu-state-of-play"]
+        self.assertEqual(row["source_path"], str(ordinary))
+        self.assertEqual(row["frontmatter"]["project"], "acme/c")
+        self.assertFalse(any(link.endswith("/khipu-state-of-play") for link in row["links"]))
+        self.assertIsNone(row["deleted_at"])
+
+
 class EventAtNeverNowTest(unittest.TestCase):
     """R7: event_at is the note's own signal — frontmatter modified, else
     metadata.modified, else the file's mtime — never now()."""

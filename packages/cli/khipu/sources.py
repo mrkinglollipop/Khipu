@@ -16,6 +16,10 @@ from typing import Any
 SCHEMA_VERSION = 2
 SOURCES_NAME = "graph_sources.json"
 
+
+class InvalidSourcesDocument(ValueError):
+    """An existing source registry cannot safely be changed."""
+
 COLLECTOR_KEYS = frozenset(
     {
         "tickers",
@@ -98,21 +102,49 @@ def _normalize_source_row(row: dict) -> dict:
 
 def load_sources() -> dict:
     path = sources_file()
-    if not path.is_file():
-        return default_document()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return default_document()
-        if not isinstance(data.get("sources"), list):
-            data["sources"] = default_document()["sources"]
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return default_document()
+    except OSError as exc:
+        raise InvalidSourcesDocument(f"cannot read {path}: {exc}") from exc
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not isinstance(data.get("sources"), list):
+            raise InvalidSourcesDocument(f"cannot read malformed source registry: {path}")
         data.setdefault("schema_version", SCHEMA_VERSION)
         for s in data["sources"]:
-            if isinstance(s, dict):
-                _normalize_source_row(s)
+            if not isinstance(s, dict):
+                raise InvalidSourcesDocument(f"cannot read malformed source registry: {path}")
+            _normalize_source_row(s)
         return data
-    except (OSError, ValueError):
+    except InvalidSourcesDocument:
+        raise
+    except (OSError, ValueError) as exc:
+        raise InvalidSourcesDocument(f"cannot read {path}: {exc}") from exc
+
+
+def _load_sources_for_mutation() -> dict:
+    """Load an existing registry without treating corruption as an empty one."""
+    path = sources_file()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return default_document()
+    except OSError as exc:
+        raise InvalidSourcesDocument(f"cannot read {path}: {exc}") from exc
+    try:
+        data = json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise InvalidSourcesDocument(f"cannot read {path}: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("sources"), list):
+        raise InvalidSourcesDocument(f"cannot modify malformed source registry: {path}")
+    for row in data["sources"]:
+        if not isinstance(row, dict):
+            raise InvalidSourcesDocument(f"cannot modify malformed source registry: {path}")
+        _normalize_source_row(row)
+    data.setdefault("schema_version", SCHEMA_VERSION)
+    return data
 
 
 def save_sources(doc: dict) -> Path:
@@ -135,7 +167,7 @@ def _find_source(doc: dict, source_id: str) -> dict | None:
 
 
 def set_enabled(source_id: str, enabled: bool) -> dict:
-    doc = load_sources()
+    doc = _load_sources_for_mutation()
     row = _find_source(doc, source_id)
     if row is None:
         raise ValueError(f"unknown source id: {source_id}")
@@ -146,7 +178,7 @@ def set_enabled(source_id: str, enabled: bool) -> dict:
 
 def set_embed_media(source_id: str, embed_media: bool) -> dict:
     """Per-source opt-in for native image embed (default off). Does not purge PG."""
-    doc = load_sources()
+    doc = _load_sources_for_mutation()
     row = _find_source(doc, source_id)
     if row is None:
         raise ValueError(f"unknown source id: {source_id}")
@@ -190,7 +222,7 @@ def add_code_root(root: Path) -> dict:
     root = root.resolve()
     if not root.is_absolute():
         raise ValueError(f"code root must be absolute: {root}")
-    doc = load_sources()
+    doc = _load_sources_for_mutation()
     for s in doc.get("sources", []):
         existing = s.get("root")
         if existing and Path(str(existing)).resolve() == root:
@@ -217,7 +249,7 @@ def add_code_root(root: Path) -> dict:
 def remove_user_source(source_id: str) -> dict:
     if source_id in SEEDED_IDS:
         raise ValueError(f"cannot remove seeded source: {source_id}")
-    doc = load_sources()
+    doc = _load_sources_for_mutation()
     sources = doc.get("sources", [])
     idx = next((i for i, s in enumerate(sources) if s.get("id") == source_id), None)
     if idx is None:
@@ -328,10 +360,13 @@ def _code_source_for_path(source_path: str | None, doc: dict) -> str:
 
 
 def _code_source_id_for_path(source_path: str | None, doc: dict) -> str | None:
-    """Longest registered code_ast root prefix; None when unmatched."""
+    """Longest registered code_ast root containing the source; None if unmatched."""
     if not source_path:
         return None
-    sp = source_path.replace("\\", "/")
+    try:
+        candidate = Path(source_path.replace("\\", "/")).resolve()
+    except OSError:
+        candidate = Path(source_path)
     best_id: str | None = None
     best_len = -1
     for s in doc.get("sources", []):
@@ -345,12 +380,15 @@ def _code_source_id_for_path(source_path: str | None, doc: dict) -> str | None:
             rel = str(root_path.resolve())
         except OSError:
             rel = str(root_path)
-        root_posix = rel.replace("\\", "/")
-        if sp.startswith(root_posix) and len(root_posix) > best_len:
+        try:
+            candidate.relative_to(Path(rel))
+        except ValueError:
+            continue
+        if len(rel) > best_len:
             sid = str(s.get("id") or "").strip()
             if sid:
                 best_id = sid
-                best_len = len(root_posix)
+                best_len = len(rel)
     return best_id
 
 

@@ -9,6 +9,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 DEFAULT_DSN_FILE = Path.home() / ".config" / "khipu" / "dsn"
 LEGACY_DSN_FILE = Path.home() / ".config" / "alzy" / "dsn"
+CONNECT_TIMEOUT_SECONDS = 5
 
 
 def _env(*names: str) -> str:
@@ -85,7 +86,13 @@ def conninfo_with_local_root_cert(dsn: str) -> str:
 
 
 def connect(*, autocommit: bool = False):
-    return psycopg.connect(conninfo_with_local_root_cert(resolve_dsn()), autocommit=autocommit)
+    """Bound connection setup; SQL timeouts belong to the operation's caller."""
+    conninfo = conninfo_with_local_root_cert(resolve_dsn())
+    return psycopg.connect(
+        conninfo,
+        autocommit=autocommit,
+        connect_timeout=CONNECT_TIMEOUT_SECONDS,
+    )
 
 
 def dsn_configured() -> bool:

@@ -38,7 +38,13 @@ class NightlyStepHealthTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
-                    mock.patch.object(jobs, "ensure_data_dir", return_value=Path(td)):
+                    mock.patch.object(jobs, "ensure_data_dir", return_value=Path(td)), \
+                    mock.patch.object(jobs, "_job_entry", return_value={
+                        "plist_loaded": True,
+                        "plist_mtime": time.time(),
+                        "last_exit": None,
+                        "last_exit_ts": None,
+                    }):
                 out = jobs.nightly_step_health()
         for key in ("notes_reconcile_ok", "embed_provider_ok", "commitments_hygiene_ok", "mark_stale_ok"):
             self.assertTrue(out[key]["ok"], key)
@@ -91,15 +97,17 @@ class NightlyStepHealthTest(unittest.TestCase):
         self.assertNotIn("skipped", out["notes_reconcile_ok"])
 
     def test_a_failed_step_is_red_with_its_own_error_and_fix(self):
+        from datetime import datetime, timezone
         from khipu import jobs
 
+        recent_ts = datetime.now(timezone.utc).isoformat()
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             self._write_last(tmp, [
-                {"name": "notes_reconcile", "ok": True, "counts": {}, "error": None, "ts": "t1"},
-                {"name": "embed_backfill", "ok": False, "counts": {}, "error": "missing key", "ts": "t2"},
-                {"name": "commitments_mark_stale", "ok": True, "counts": {}, "error": None, "ts": "t3"},
-                {"name": "commitments_hygiene", "ok": True, "counts": {}, "error": None, "ts": "t4"},
+                {"name": "notes_reconcile", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
+                {"name": "embed_backfill", "ok": False, "counts": {}, "error": "missing key", "ts": recent_ts},
+                {"name": "commitments_mark_stale", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
+                {"name": "commitments_hygiene", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
             ])
             with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
                     mock.patch.object(jobs, "ensure_data_dir", return_value=tmp):
@@ -114,13 +122,15 @@ class NightlyStepHealthTest(unittest.TestCase):
     def test_a_later_step_entry_for_the_same_name_wins(self):
         """Steps are appended every nightly run; the LAST entry for a step
         name is tonight's outcome, not last week's."""
+        from datetime import datetime, timezone
         from khipu import jobs
 
+        recent_ts = datetime.now(timezone.utc).isoformat()
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             self._write_last(tmp, [
-                {"name": "notes_reconcile", "ok": False, "counts": {}, "error": "old failure", "ts": "t1"},
-                {"name": "notes_reconcile", "ok": True, "counts": {}, "error": None, "ts": "t2"},
+                {"name": "notes_reconcile", "ok": False, "counts": {}, "error": "old failure", "ts": recent_ts},
+                {"name": "notes_reconcile", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
             ])
             with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
                     mock.patch.object(jobs, "ensure_data_dir", return_value=tmp):
@@ -217,7 +227,7 @@ class DegradedRateTest(unittest.TestCase):
 
         with mock.patch.object(query_log, "tail", return_value=[]):
             out = query_log.degraded_rate()
-        self.assertTrue(out["ok"])
+        self.assertFalse(out["ok"])
         self.assertEqual(out["sampled"], 0)
 
     def test_over_20_percent_degraded_is_red(self):

@@ -308,7 +308,7 @@ class RepoScopedSliceTest(unittest.TestCase):
         self.assertEqual(m_log.call_args.kwargs["mode"], "slice")
         self.assertEqual(m_log.call_args.kwargs["result_count"], 0)
 
-    def test_pg_failure_with_no_snapshot_falls_through_to_cwd_token_search(self):
+    def test_pg_failure_with_no_snapshot_does_not_retry_live_fallbacks(self):
         with mock.patch(
             "khipu.identity.resolve_repo_root",
             return_value={"repo_root": "/repo/khipu", "project": "acme/khipu"},
@@ -317,13 +317,15 @@ class RepoScopedSliceTest(unittest.TestCase):
         ), mock.patch(
             "khipu.hub_snapshot.open_snapshot", side_effect=FileNotFoundError("no snapshot")
         ), mock.patch("khipu.query_log.log_query"), mock.patch(
-            "khipu.cli._search_query", return_value=[]
-        ), mock.patch(
-            "khipu.activity.recent_episodes",
-            return_value=[{"id": 3, "summary": "last resort episode"}],
-        ), mock.patch("khipu.db.connect"):
+            "khipu.cli._search_query"
+        ) as search, mock.patch(
+            "khipu.activity.recent_episodes"
+        ) as recents, mock.patch("khipu.db.connect") as connect:
             out = rr._pushed_memory_slice("/repo/khipu")
-        self.assertIn("last resort episode", out)
+        self.assertEqual(out, "")
+        search.assert_not_called()
+        recents.assert_not_called()
+        connect.assert_not_called()
 
     def test_host_session_id_used_when_no_project_resolves(self):
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_HOST_SESSION_ID": "host-9"}), mock.patch(

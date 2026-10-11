@@ -12,11 +12,15 @@ import { fmtAge } from "./time";
 export function RightNowCard({
   liveness,
   busy,
+  loading = false,
+  error = null,
   message,
   onCaptureNow,
 }: {
   liveness: LivenessPayload | null;
   busy: boolean;
+  loading?: boolean;
+  error?: string | null;
   message: string | null;
   onCaptureNow: () => void;
 }) {
@@ -37,7 +41,16 @@ export function RightNowCard({
           {busy ? "Capturing…" : "Capture now"}
         </button>
       </div>
-      {harnesses.length > 0 ? (
+      {loading ? (
+        <EmptyState title="Checking live sessions" hint="Reading the latest capture state." />
+      ) : error ? (
+        <EmptyState title="Could not check live sessions" hint={error} />
+      ) : liveness == null ? (
+        <EmptyState
+          title="Live sessions not checked"
+          hint="Refresh to read the latest capture state."
+        />
+      ) : harnesses.length > 0 ? (
         <>
           {harnesses.map(([id, h]) => {
             const pending = h.pending_turns ?? 0;

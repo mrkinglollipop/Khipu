@@ -4,7 +4,7 @@
 // component with a scripted `khipu integrations` and checks which argv each
 // button sends. No Tauri: the invoke the Gateway token card makes is stubbed.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   IntegrationsPanel,
   cardStatus,
@@ -12,6 +12,7 @@ import {
   homeChecks,
   homeSourceLine,
   parseActResults,
+  runInstall,
   tildePath,
   userHomeDir,
 } from "../IntegrationsPanel";
@@ -278,11 +279,28 @@ function renderPanel(
     if (args[0] === "integrations" && args[1] === "status") return JSON.stringify(rowsFor());
     if (args[0] === "integrations" && args[1] === "install") {
       onInstall();
-      return opts.actResult ?? '[{"harness":"claude_code","detected":true,"changes":[]}]';
+      return opts.actResult ?? JSON.stringify(
+        args[2] === "all"
+          ? ["claude_code", "cursor", "aegis", "codex", "grok_bot"].map((harness) => ({
+              harness,
+              detected: rowsFor().some((row) => row.harness === harness && row.detected),
+              changes: [],
+            }))
+          : [{ harness: args[2], detected: true, changes: [] }],
+      );
     }
     if (args[0] === "integrations" && args[1] === "verify") {
       if (opts.verifyThrows) throw new Error(opts.verifyThrows);
-      return opts.verifyResult ?? "[]";
+      return opts.verifyResult ?? JSON.stringify(
+        args[2] === "all"
+          ? ["claude_code", "cursor", "aegis", "codex", "grok_bot"].map((harness) => ({
+              harness,
+              detected: rowsFor().some((row) => row.harness === harness && row.detected),
+              ok: true,
+              note: rowsFor().some((row) => row.harness === harness && row.detected) ? undefined : "not detected; skipped",
+            }))
+          : [{ harness: args[2], detected: true, ok: true }],
+      );
     }
     if (args[0] === "integrations" && args[1] === "uninstall") {
       return opts.actResult ?? '[{"harness":"claude_code","changes":[]}]';
@@ -419,7 +437,7 @@ describe("IntegrationsPanel — Claude homes", () => {
     expect(within(rows[1]).queryByRole("button", { name: /^Remove/ })).not.toBeInTheDocument();
   });
 
-  it("installs and removes one home by its path", async () => {
+  it("installs by path and confirms before removing one home", async () => {
     const runKhipu = renderPanel(() => [claudeRow([home(), t3Home(T3_NOT_INSTALLED)])]);
     const card = await claudeCard();
     const rows = within(within(card).getByRole("list", { name: "Claude homes" })).getAllByRole("listitem");
@@ -438,9 +456,43 @@ describe("IntegrationsPanel — Claude homes", () => {
     );
 
     fireEvent.click(within(rows[0]).getByRole("button", { name: "Remove Khipu from Default" }));
+    expect(runKhipu).not.toHaveBeenCalledWith(["integrations", "uninstall", "claude_code", "--home", DEFAULT_PATH]);
+    const dialog = await screen.findByRole("dialog", { name: "Remove Khipu from Default?" });
+    expect(within(dialog).getByText(/future capture and recall/)).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Remove Khipu" }));
     await waitFor(() =>
       expect(runKhipu).toHaveBeenCalledWith(["integrations", "uninstall", "claude_code", "--home", DEFAULT_PATH]),
     );
+  });
+
+  it("does not remove a home when its confirmation is cancelled", async () => {
+    const runKhipu = renderPanel(() => [claudeRow([home(), t3Home()])]);
+    const card = await claudeCard();
+    fireEvent.click(within(card).getByRole("button", { name: "Remove Khipu from Default" }));
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Remove Khipu from Default?" })).getByRole("button", { name: "Cancel" }));
+    expect(runKhipu.mock.calls.some((call) => call[0][1] === "uninstall")).toBe(false);
+  });
+
+  it("cancels or confirms a card removal and calls uninstall once", async () => {
+    const runKhipu = renderPanel(() => [{
+      harness: "cursor",
+      detected: true,
+      mcp: true,
+      hook_stop: true,
+      hook_precompact: true,
+      recall_rule: "installed",
+    }]);
+    await screen.findByText("Cursor");
+    const card = screen.getByText("Cursor").closest(".hcard") as HTMLElement;
+
+    fireEvent.click(within(card).getByRole("button", { name: "Remove" }));
+    expect(runKhipu.mock.calls.some((call) => call[0][1] === "uninstall")).toBe(false);
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Remove Khipu from Cursor?" })).getByRole("button", { name: "Cancel" }));
+    expect(runKhipu.mock.calls.some((call) => call[0][1] === "uninstall")).toBe(false);
+
+    fireEvent.click(within(card).getByRole("button", { name: "Remove" }));
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Remove Khipu from Cursor?" })).getByRole("button", { name: "Remove Khipu" }));
+    await waitFor(() => expect(runKhipu.mock.calls.filter((call) => call[0][1] === "uninstall")).toHaveLength(1));
   });
 
   it("sends the card's Reinstall for every home, with no --home", async () => {
@@ -470,7 +522,7 @@ describe("IntegrationsPanel — Claude homes", () => {
     const card = await claudeCard();
 
     fireEvent.click(within(card).getByRole("button", { name: "Reinstall" }));
-    await waitFor(() => expect(within(card).getByText(/this card turns green by itself/)).toBeInTheDocument());
+    await waitFor(() => expect(within(card).getByText(/select Verify to check capture and recall/)).toBeInTheDocument());
     window.dispatchEvent(new Event("focus"));
     await waitFor(() => expect(runKhipu.mock.calls.filter((c) => c[0][1] === "status").length).toBeGreaterThan(2));
 
@@ -679,6 +731,7 @@ describe("IntegrationsPanel — per-home actions", () => {
     });
     const card = await claudeCard();
     fireEvent.click(within(card).getByRole("button", { name: "Remove Khipu from Default" }));
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Remove Khipu from Default?" })).getByRole("button", { name: "Remove Khipu" }));
     await waitFor(() => expect(toasts).toHaveLength(1));
 
     expect(toasts[0]).toMatch(/Removed the memory tools/);
@@ -690,6 +743,7 @@ describe("IntegrationsPanel — per-home actions", () => {
     renderPanel(() => [claudeRow([home(), t3Home()])], undefined, { onToast: (m) => toasts.push(m) });
     const card = await claudeCard();
     fireEvent.click(within(card).getByRole("button", { name: "Remove Khipu from Default" }));
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Remove Khipu from Default?" })).getByRole("button", { name: "Remove Khipu" }));
     await waitFor(() => expect(toasts).toEqual(["Removed Khipu entries. Backups kept next to each file."]));
   });
 
@@ -712,7 +766,7 @@ describe("IntegrationsPanel — per-home actions", () => {
     await waitFor(() => expect(statusCalls(runKhipu)).toBeGreaterThan(2));
 
     expect(within(card).queryByText(/Verified — a session ran the hook after Install/)).not.toBeInTheDocument();
-    expect(within(card).queryByText(/this card turns green by itself/)).not.toBeInTheDocument();
+    expect(within(card).queryByText(/Restart Claude Code, then select Verify/)).not.toBeInTheDocument();
   });
 
   it("keeps keyboard focus on the row's action when Install and Remove swap", async () => {
@@ -744,10 +798,7 @@ const CURSOR_MISSING: StatusRow = {
   hook_precompact: false,
   recall_rule: "missing",
 };
-const VERIFY_OK = '[{"harness":"claude_code","detected":true,"ok":true,"components":{"mcp":{"ok":true}}}]';
-const VERIFY_BAD =
-  '[{"harness":"claude_code","detected":true,"ok":false,"components":{"mcp":{"ok":true},"hook":{"ok":false,"error":"Stop hook not found"}}}]';
-const INSTALL_OK_COPY = "Installed. Restart each harness, then start any session — its card turns green by itself.";
+const INSTALL_OK_COPY = "Installed. Restart each harness, then select Verify to check capture and recall.";
 
 type EntryPoint = {
   name: string;
@@ -779,6 +830,30 @@ const ENTRY_POINTS: EntryPoint[] = [
   },
 ];
 
+function verifyFixture(ep: EntryPoint, ok: boolean): { raw: string; failedHarness: string } {
+  const requested = ep.harness === "all"
+    ? ["claude_code", "cursor", "aegis", "codex", "grok_bot"]
+    : [ep.harness];
+  const visible = ep.rows();
+  const detected = (harness: string) => visible.some((row) => row.harness === harness && row.detected);
+  const failedHarness = requested.find(detected) ?? requested[0];
+  return {
+    failedHarness,
+    raw: JSON.stringify(requested.map((harness) => {
+      if (!detected(harness)) return { harness, detected: false, components: {} };
+      if (ok || harness !== failedHarness) {
+        return { harness, detected: true, ok: true, components: { mcp: { ok: true } } };
+      }
+      return {
+        harness,
+        detected: true,
+        ok: false,
+        components: { mcp: { ok: true }, hook: { ok: false, error: "Stop hook not found" } },
+      };
+    })),
+  };
+}
+
 describe.each(ENTRY_POINTS)("IntegrationsPanel — $name", (ep) => {
   const setup = (opts: Parameters<typeof renderPanel>[2]) => {
     const toasts: string[] = [];
@@ -788,11 +863,13 @@ describe.each(ENTRY_POINTS)("IntegrationsPanel — $name", (ep) => {
   const calls = (runKhipu: ReturnType<typeof renderPanel>) => runKhipu.mock.calls.map((c) => c[0]);
 
   it("installs without verify, verifies separately, and toasts success when both pass", async () => {
-    const { runKhipu, toasts } = setup({ verifyResult: VERIFY_OK });
+    const { runKhipu, toasts } = setup({ verifyResult: verifyFixture(ep, true).raw });
     await ep.click();
     await waitFor(() => expect(toasts).toHaveLength(1));
 
-    expect(toasts[0]).toBe(INSTALL_OK_COPY);
+    expect(toasts[0]).toBe(ep.harness === "all"
+      ? `${INSTALL_OK_COPY} Skipped: Aegis, Codex, Grok Bot · cloud.`
+      : INSTALL_OK_COPY);
     const argv = calls(runKhipu).filter((a) => a[1] === "install" || a[1] === "verify");
     expect(argv).toEqual([
       ["integrations", "install", ep.harness, "--no-verify"],
@@ -801,11 +878,12 @@ describe.each(ENTRY_POINTS)("IntegrationsPanel — $name", (ep) => {
   });
 
   it("warns 'Installed; verify failed' and never 'install failed' when only verify fails", async () => {
-    const { toasts } = setup({ verifyResult: VERIFY_BAD });
+    const fixture = verifyFixture(ep, false);
+    const { toasts } = setup({ verifyResult: fixture.raw });
     await ep.click();
     await waitFor(() => expect(toasts).toHaveLength(1));
 
-    expect(toasts[0]).toBe("Installed; verify failed: claude_code hook: Stop hook not found");
+    expect(toasts[0]).toBe(`Installed; verify failed: ${fixture.failedHarness} hook: Stop hook not found`);
     expect(toasts[0]).not.toMatch(/install failed/);
   });
 
@@ -826,6 +904,48 @@ describe.each(ENTRY_POINTS)("IntegrationsPanel — $name", (ep) => {
 
     expect(toasts[0]).toBe("install failed: /Users/me/.claude.json is not valid JSON");
     expect(calls(runKhipu).some((a) => a[1] === "verify")).toBe(false);
+  });
+});
+
+describe("runInstall result evidence", () => {
+  it.each([
+    ["[]", "action result was missing or unreadable"],
+    ["not json", "action result was missing or unreadable"],
+    ['[{"harness":"claude_code","ok":true}]', "action result did not cover the requested harness"],
+  ])("rejects %s for cursor", async (raw, error) => {
+    const runKhipu = vi.fn(async () => raw);
+    const run = await runInstall(runKhipu, "cursor");
+    expect(run.failed).toBe(error);
+    expect(run.verify).toBeNull();
+    expect(runKhipu.mock.calls).toHaveLength(1);
+  });
+});
+
+describe("IntegrationsPanel — latest status wins", () => {
+  it("does not replace the post-install status with a slower pre-action read", async () => {
+    let releaseOld: (raw: string) => void = () => {};
+    let finishInstall: (raw: string) => void = () => {};
+    let reads = 0;
+    const runKhipu = vi.fn((args: string[]) => {
+      if (args[1] === "install") return new Promise<string>((resolve) => { finishInstall = resolve; });
+      if (args[1] === "verify") return Promise.resolve('[{"harness":"cursor","detected":true,"ok":true}]');
+      if (args[1] !== "status") throw new Error(`unexpected action ${args[1]}`);
+      reads += 1;
+      if (reads === 1) return Promise.resolve(JSON.stringify([CURSOR_MISSING]));
+      if (reads === 2) return new Promise<string>((resolve) => { releaseOld = resolve; });
+      return Promise.resolve(JSON.stringify([{ ...CURSOR_MISSING, mcp: true, hook_stop: true, hook_precompact: true, recall_rule: "installed" }]));
+    });
+    render(
+      <IntegrationsPanel runKhipu={runKhipu} onToast={() => {}} active={true} liveness={null} recallProbe={null} refreshHealth={() => {}} onAnotherMac={() => {}} />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Install" }));
+    await act(async () => { window.dispatchEvent(new Event("focus")); });
+    await waitFor(() => expect(reads).toBe(2));
+    await act(async () => finishInstall('[{"harness":"cursor","detected":true,"changes":[]}]'));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reinstall" })).toBeEnabled());
+    await act(async () => releaseOld(JSON.stringify([CURSOR_MISSING])));
+    expect(screen.getByRole("button", { name: "Reinstall" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Install" })).not.toBeInTheDocument();
   });
 });
 

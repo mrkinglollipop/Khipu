@@ -157,9 +157,17 @@ def recompute(cur, *, days: int = WINDOW_DAYS) -> dict[str, Any]:
     counts: dict[str, tuple[int, datetime | None]] = {}
     for path in (rotated, active):
         try:
-            text = path.read_text(encoding="utf-8") if path.is_file() else ""
-        except OSError:
-            text = ""
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            # Expected race with log rotation/removal after is_file().
+            continue
+        except OSError as exc:
+            # A missing rotated log is expected. An existing unreadable log is
+            # not empty evidence: replacing aggregates in that state would
+            # silently zero valid counts and advance the checkpoint.
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         for slug, ts in _iter_topic_hits_from_text(text):
             if ts is None or ts < cutoff:
                 continue

@@ -19,6 +19,8 @@ from khipu import outbox
 
 
 def _pg_available() -> bool:
+    if os.environ.get("KHIPU_LIVE_TESTS") != "1":
+        return False
     try:
         from khipu.db import connect
         with connect() as c, c.cursor() as cur:
@@ -100,9 +102,9 @@ class OutboxUnitTest(unittest.TestCase):
         ran = []
         with mock.patch.object(cap, "write_pg", return_value={"episode_inserted": False, "topics_written": 0}), \
                 mock.patch.object(cap, "run_capture_v2", lambda p, suppress_mirror: ran.append(suppress_mirror) or 0):
-            self.assertEqual(cap.capture({"summary": "x", "ts": "t"}, mode="hub"), 0)
+            self.assertEqual(cap.capture({"summary": "x", "ts": "2026-10-10T00:00:00Z"}, mode="hub"), 0)
             with mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "0"}):
-                self.assertEqual(cap.capture({"summary": "x", "ts": "t"}, mode="hub"), 0)
+                self.assertEqual(cap.capture({"summary": "x", "ts": "2026-10-10T00:00:00Z"}, mode="hub"), 0)
         self.assertEqual(ran, [True])                       # once with mirror suppressed; off when disabled
 
     def test_legacy_mirror_leg_queues_instead_of_losing(self):
@@ -113,7 +115,6 @@ class OutboxUnitTest(unittest.TestCase):
         self.assertEqual(outbox.status()["pending"], 1)
 
 
-@unittest.skipUnless(_pg_available(), "Postgres unreachable")
 class OutboxDurabilityTest(unittest.TestCase):
     """Regressions from the 2026-08-17 audit. The outbox IS the durability leg,
     so a torn write or a misreported age here is worse than elsewhere."""
@@ -132,22 +133,26 @@ class OutboxDurabilityTest(unittest.TestCase):
         outbox.enqueue({"ts": "2026-08-17T18:00:00Z", "summary": "s"}, reason="test")
         jp = outbox.jobs()[0]
 
-        seen = {}
-        real = pathlib.Path.write_text
+        original = jp.read_bytes()
+        real = os.replace
 
-        def spy(self, data, *a, **kw):
-            seen.setdefault("first_target", self.name)
-            return real(self, data, *a, **kw)
+        def spy(source, destination):
+            source = pathlib.Path(source)
+            self.assertEqual(pathlib.Path(destination), jp)
+            self.assertEqual(source.parent, jp.parent)
+            self.assertTrue(source.name.endswith(".tmp"))
+            self.assertEqual(jp.read_bytes(), original)
+            self.assertEqual(json.loads(source.read_text())["attempts"], 1)
+            return real(source, destination)
 
         class Boom(Exception):
             pass
 
-        with mock.patch.object(pathlib.Path, "write_text", spy), \
+        with mock.patch.object(os, "replace", side_effect=spy) as replace, \
              mock.patch("khipu.capture.write_pg", side_effect=Boom("nope")), \
              mock.patch("khipu.embed.embed_on_capture", return_value=False):
             outbox.drain()
-        self.assertTrue(seen["first_target"].endswith(".tmp"),
-                        f"retry wrote directly to {seen['first_target']}")
+        replace.assert_called_once()
         # And the job survived, readable, with the attempt recorded.
         job = json.loads(jp.read_text())
         self.assertEqual(job["attempts"], 1)

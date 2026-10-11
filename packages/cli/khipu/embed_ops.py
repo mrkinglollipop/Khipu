@@ -13,6 +13,7 @@ any header value out of an error before it leaves.
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Any
 
@@ -244,7 +245,10 @@ def check_key(provider: str, *, endpoint: str | None = None, model: str | None =
             timeout=embed.QUERY_EMBED_TIMEOUT_S, delay=0.0,
         )
         vecs = embed._parse_vectors(provider, payload)
-        if not vecs or not vecs[0]:
+        if (len(vecs) != 1 or not isinstance(vecs[0], (list, tuple)) or not vecs[0]
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) for v in vecs[0])
+                or not math.isfinite(math.hypot(*vecs[0])) or math.hypot(*vecs[0]) == 0):
             return {"ok": False, "error": "the provider answered without a vector"}
     except Exception as exc:  # noqa: BLE001 - the receipt carries the failure
         return {"ok": False, "error": _scrub(f"{type(exc).__name__}: {exc}", headers)[:500]}

@@ -59,6 +59,19 @@ def _req(path: Path, obj: dict, **kw) -> dict:
     return _ask(path, json.dumps(obj).encode("utf-8") + b"\n", **kw)
 
 
+class ValidationWithoutSocketTest(unittest.TestCase):
+    def test_invalid_raw_is_answered_without_crashing_terminal_logging(self):
+        service = RecallService(Path("unused.sock"), stamp_fn=lambda: "fixed")
+        with mock.patch("khipu.recall_prompt._log"), \
+             mock.patch("khipu.recall_prompt.hook_main") as handler:
+            for raw in (5, None, [], {}):
+                with self.subTest(raw=raw):
+                    answer = service._answer(json.dumps({"op": "recall", "raw": raw}).encode())
+                    self.assertFalse(answer["ok"])
+                    self.assertEqual(answer["error"], "raw must be a string")
+        handler.assert_not_called()
+
+
 class _Running:
     """A bound service running its accept loop on a thread."""
 
@@ -131,14 +144,15 @@ class ProtocolTest(_ServiceCase):
         with mock.patch("khipu.recall_prompt.hook_main", side_effect=[RuntimeError("boom"), good]):
             first = _req(r.path, {"op": "recall", "raw": "{}", "shape": "cursor"})
             second = _req(r.path, {"op": "recall", "raw": "{}", "shape": "cursor"})
-        self.assertEqual(first, {})
+        self.assertEqual(first, {"ok": False, "error": "handler failed: RuntimeError"})
         self.assertEqual(second, good)
         self.assertTrue(r.thread.is_alive())
 
     def test_a_non_object_from_the_handler_answers_an_empty_object(self) -> None:
         r = self.running()
         with mock.patch("khipu.recall_prompt.hook_main", return_value="not a dict"):
-            self.assertEqual(_req(r.path, {"op": "recall", "raw": "{}"}), {})
+            self.assertEqual(_req(r.path, {"op": "recall", "raw": "{}"}),
+                             {"ok": False, "error": "handler failed: TypeError"})
 
     def test_two_requests_are_served_at_the_same_time(self) -> None:
         r = self.running()
@@ -188,7 +202,7 @@ class StalenessTest(_ServiceCase):
         stamp[0] = "b"
         with mock.patch("khipu.recall_prompt.hook_main", return_value={"ok": 1}):
             out = _req(r.path, {"op": "recall", "raw": "{}"})
-        self.assertEqual(out, {"ok": 1})  # the current request is answered, on the code it started with
+        self.assertEqual(out, {"ok": False, "error": "restarting"})
         r.thread.join(5)
         self.assertFalse(r.thread.is_alive())
         self.assertEqual(r.exit, [0])
@@ -205,9 +219,9 @@ class StalenessTest(_ServiceCase):
                 mock.patch("khipu.recall_prompt.hook_main", return_value={"n": 1}) as hook:
             first = svc._answer(b'{"op": "recall", "raw": "{}"}')
             second = svc._answer(b'{"op": "recall", "raw": "{}"}')
-        self.assertEqual(first, {"n": 1})
-        self.assertEqual(second, {"error": "restarting"})
-        self.assertEqual(hook.call_count, 1)
+        self.assertEqual(first, {"ok": False, "error": "restarting"})
+        self.assertEqual(second, {"ok": False, "error": "restarting"})
+        self.assertEqual(hook.call_count, 0)
 
     def test_an_unchanged_stamp_keeps_serving(self) -> None:
         r = self.running(stamp_fn=lambda: "same", recheck_s=0.0)
@@ -393,9 +407,10 @@ class MatrixCacheTest(unittest.TestCase):
         opens_after_first = self.opens.call_count
         second = self._query()
         self.assertEqual(first, second)
-        # A miss opens the replica twice (rows, then the winners' text); a hit only once.
-        self.assertEqual(opens_after_first, 2)
-        self.assertEqual(self.opens.call_count - opens_after_first, 1)
+        # The cached generation includes winner text; a miss needs one read
+        # and a cache hit needs none.
+        self.assertEqual(opens_after_first, 1)
+        self.assertEqual(self.opens.call_count - opens_after_first, 0)
 
     def test_a_changed_replica_misses_and_reloads(self) -> None:
         before = self._query()
@@ -413,7 +428,7 @@ class MatrixCacheTest(unittest.TestCase):
         opens_before = self.opens.call_count
         after = self._query()
         self.assertEqual({r["id"] for r in after}, {"near", "far", "added"})
-        self.assertEqual(self.opens.call_count - opens_before, 2)
+        self.assertEqual(self.opens.call_count - opens_before, 1)
 
     def test_the_cache_holds_one_entry_and_is_keyed_by_the_profile(self) -> None:
         self._query()
@@ -430,8 +445,8 @@ class MatrixCacheTest(unittest.TestCase):
             t.join(10)
         self.assertEqual(len(results), 4)
         self.assertTrue(all(r == results[0] for r in results))
-        # One load (1 open) plus one text fetch per caller (4 opens).
-        self.assertEqual(self.opens.call_count, 5)
+        # The shared cached generation carries text as well as vectors.
+        self.assertEqual(self.opens.call_count, 1)
 
 
 # ---- the embedding connection ------------------------------------------------------
@@ -720,7 +735,7 @@ class HealthFromAnotherCopyTest(unittest.TestCase):
             (other / "a.py").write_text("x = 1\n")
             newest, count = recall_daemon.code_stamp_parts(other)
             answer = {"ok": True, "version": "0.0.0", "pid": 1, "served": 0,
-                      "root": str(other), "code_stamp": f"{newest}:{count}"}
+                      "root": str(other), "code_stamp": recall_daemon.code_stamp(other)}
             with mock.patch.object(recall_daemon, "ping", return_value=answer):
                 out = recall_daemon.daemon_health(now_ns=newest + 3600 * 10**9)
         self.assertTrue(out["ok"])

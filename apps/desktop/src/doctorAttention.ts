@@ -55,6 +55,18 @@ export function buildAttention(parsed: Record<string, unknown>): {
     for (const h of lv.red ?? []) {
       const why = (lv.harnesses?.[h]?.reasons ?? []).join("; ");
       issues.push(`Not recording ${h}: ${why || "see report"}`);
+      if (h === "gateway") {
+        items.push({
+          key: "liveness:gateway",
+          tone: "err",
+          title: "Gateway is not reachable",
+          cause: why
+            ? `The gateway check failed: ${why}. Open Harnesses to inspect the gateway connection.`
+            : "The gateway check failed. Open Harnesses to inspect the gateway connection.",
+          fix: { label: "Open Harnesses", kind: "open-harnesses" },
+        });
+        continue;
+      }
       items.push({
         key: `liveness:${h}`,
         tone: "err",
@@ -112,7 +124,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       tone: "warn",
       title: "Some captures are still waiting to reach the database",
       cause:
-        "They were recorded while the database was unreachable and are queued on this Mac. Refresh retries them; nothing is lost meanwhile.",
+        "They were recorded while the database was unreachable and are queued on this Mac. After reconnecting, run `khipu outbox drain` to deliver them; nothing is lost meanwhile.",
     });
   }
 
@@ -158,11 +170,17 @@ export function buildAttention(parsed: Record<string, unknown>): {
 
   if ((parsed as { embed_coverage_ok?: boolean }).embed_coverage_ok === false) {
     issues.push("Search index catching up");
-    const cov = (parsed as { embed_coverage?: Record<string, { missing?: number }> }).embed_coverage;
-    const missing = cov
+    const cov = (parsed as { embed_coverage?: Record<string, { missing?: number; chunks?: number }>; }).embed_coverage;
+    const top = cov as { missing?: unknown; stale?: unknown; pct?: unknown } | undefined;
+    const topMissing = typeof top?.missing === "number" ? top.missing : 0;
+    const topStale = typeof top?.stale === "number" ? top.stale : 0;
+    const topPct = typeof top?.pct === "number" ? top.pct : null;
+    const missing = topMissing > 0 || topStale > 0
+      ? [topMissing > 0 ? `${topMissing} chunks missing` : "", topStale > 0 ? `${topStale} chunks stale` : "", topPct != null ? `${topPct}% covered` : ""].filter(Boolean).join(", ")
+      : cov
       ? Object.entries(cov)
           .filter(([, v]) => v && typeof v === "object" && (v.missing ?? 0) > 0)
-          .map(([k, v]) => `${v.missing} ${k}`)
+          .map(([k, v]) => `${v.missing} ${v.chunks != null ? `${k} chunks` : k}`)
           .join(", ")
       : "";
     items.push({

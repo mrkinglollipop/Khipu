@@ -1,7 +1,7 @@
 // The other settings the CLI owns: capture mode and thresholds, gateway
 // address, file locations, background jobs, the gateway token (write-only).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import {
   CaptureTuningCard,
   GatewayTokenCard,
@@ -101,6 +101,64 @@ describe("CaptureTuningCard", () => {
     expect(close).toBeDisabled();
     expect(screen.getAllByText("Locked").length).toBeGreaterThan(0);
     expect(screen.getByText("KHIPU_COMMITMENT_CLOSE_SIMILARITY")).toBeInTheDocument();
+  });
+
+  it("describes the independent matching rules beside both thresholds", async () => {
+    render(<CaptureTuningCard active />);
+    await screen.findByLabelText("Merge near-duplicate captures at");
+    expect(screen.getByText(/meaning-based threshold.*independent word matching rule/i)).toBeInTheDocument();
+    expect(screen.getByText(/meaning-based closure threshold.*separate word and completion rule/i)).toBeInTheDocument();
+  });
+
+  it("keeps both newest threshold values when reversed reloads finish", async () => {
+    config = {
+      ...config,
+      float_settings: {
+        dedup_similarity: { value: 0.92, source: "default", default: 0.92 },
+        commitment_close_similarity: { value: 0.85, source: "default", default: 0.85 },
+      },
+    };
+    const pending: Array<(raw: string) => void> = [];
+    let showReads = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_config_set") return JSON.stringify({ ok: true });
+      if (cmd !== "khipu_config_show") throw new Error(`unexpected command ${cmd}`);
+      showReads += 1;
+      if (showReads === 1) return JSON.stringify(config);
+      return new Promise<string>((resolve) => pending.push(resolve));
+    });
+
+    render(<CaptureTuningCard active />);
+    const dedup = (await screen.findByLabelText("Merge near-duplicate captures at")) as HTMLInputElement;
+    const close = screen.getByLabelText("Close an open commitment at") as HTMLInputElement;
+    await waitFor(() => expect(close.value).toBe("0.85"));
+
+    fireEvent.change(dedup, { target: { value: "0.8" } });
+    fireEvent.submit(dedup.closest("form")!);
+    fireEvent.change(close, { target: { value: "0.7" } });
+    fireEvent.submit(close.closest("form")!);
+    await waitFor(() => expect(pending).toHaveLength(2));
+
+    const newest = {
+      ...config,
+      float_settings: {
+        dedup_similarity: { value: 0.8, source: "file", default: 0.92 },
+        commitment_close_similarity: { value: 0.7, source: "file", default: 0.85 },
+      },
+    };
+    const stale = {
+      ...config,
+      float_settings: {
+        dedup_similarity: { value: 0.8, source: "file", default: 0.92 },
+        commitment_close_similarity: { value: 0.85, source: "default", default: 0.85 },
+      },
+    };
+    await act(async () => pending[1](JSON.stringify(newest)));
+    await waitFor(() => expect(close.value).toBe("0.7"));
+    await act(async () => pending[0](JSON.stringify(stale)));
+
+    expect(dedup.value).toBe("0.8");
+    expect(close.value).toBe("0.7");
   });
 
   it("saves the dedup threshold and your names, and shows the CLI's refusal", async () => {

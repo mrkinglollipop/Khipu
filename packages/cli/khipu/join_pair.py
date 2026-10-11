@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import errno
 import json
+import os
 import re
 import secrets
 import select
@@ -128,14 +129,51 @@ def _self_signed_cert_dir() -> Path:
     return td
 
 
-def _readline(conn: ssl.SSLSocket, limit: int = 65536) -> bytes:
+def _readline(
+    conn: ssl.SSLSocket,
+    limit: int = 65536,
+    *,
+    deadline: float | None = None,
+) -> bytes:
     buf = b""
     while b"\n" not in buf and len(buf) < limit:
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise socket.timeout("pairing deadline expired while reading request")
+            conn.settimeout(max(0.01, min(1.0, remaining)))
         chunk = conn.recv(4096)
         if not chunk:
             break
         buf += chunk
     return buf
+
+
+def _process_line(stdout: Any, deadline: float, pending: bytes) -> tuple[str | None, bytes]:
+    """Read one subprocess line without letting a partial line beat a deadline."""
+    if b"\n" in pending:
+        raw, pending = pending.split(b"\n", 1)
+        return raw.decode("utf-8", errors="replace") + "\n", pending
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        return None, pending
+    try:
+        fd = stdout.fileno()
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            return None, pending
+        chunk = os.read(fd, 4096)
+    except (AttributeError, OSError, TypeError, ValueError):
+        # Test doubles and in-memory streams are already nonblocking.
+        line = stdout.readline()
+        return (line or None), pending
+    if not chunk:
+        return None, pending
+    pending += chunk
+    if b"\n" not in pending:
+        return None, pending
+    raw, pending = pending.split(b"\n", 1)
+    return raw.decode("utf-8", errors="replace") + "\n", pending
 
 
 def advertise(
@@ -144,6 +182,7 @@ def advertise(
     timeout_s: int = DEFAULT_TIMEOUT_S,
     port: int = DEFAULT_PORT,
     pin: str | None = None,
+    on_ready: Any | None = None,
 ) -> dict[str, Any]:
     """Export kit, advertise Bonjour, serve once over TLS. Blocks until transfer or timeout."""
     from khipu.join import export_kit
@@ -176,23 +215,36 @@ def advertise(
     ]
     if ipv4:
         register_cmd.append(f"ipv4={ipv4}")
-    dns = subprocess.Popen(
-        register_cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    deadline = time.time() + max(30, int(timeout_s))
+    dns = None
+    deadline = time.time() + max(0.0, float(timeout_s))
     transferred = False
     error: str | None = None
     try:
+        dns = subprocess.Popen(
+            register_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if dns.poll() is not None:
+            raise RuntimeError("Bonjour registration exited before becoming ready")
+        time.sleep(0.02)
+        if dns.poll() is not None:
+            raise RuntimeError("Bonjour registration exited before becoming ready")
+        if on_ready is not None:
+            on_ready()
         while time.time() < deadline and not transferred:
             try:
                 client, _addr = sock.accept()
             except socket.timeout:
                 continue
+            tls = None
             try:
+                remaining = deadline - time.time()
+                client.settimeout(max(0.05, min(1.0, max(0.0, remaining))))
+                if remaining <= 0:
+                    continue
                 tls = ctx.wrap_socket(client, server_side=True)
-                line = _readline(tls).decode("utf-8", errors="replace").strip()
+                line = _readline(tls, deadline=deadline).decode("utf-8", errors="replace").strip()
                 req = json.loads(line) if line else {}
                 if req.get("protocol") != _PROTOCOL:
                     tls.sendall(b'{"ok":false,"error":"bad protocol"}\n')
@@ -200,7 +252,9 @@ def advertise(
                     continue
                 if str(req.get("pin") or "") != pin:
                     tls.sendall(b'{"ok":false,"error":"bad pin"}\n')
-                    tls.close()
+                    continue
+                if time.time() >= deadline:
+                    error = "pairing deadline expired before kit transfer"
                     continue
                 header = json.dumps(
                     {"ok": True, "protocol": _PROTOCOL, "bytes": len(kit)}
@@ -208,19 +262,21 @@ def advertise(
                 tls.sendall(header + b"\n")
                 tls.sendall(kit)
                 transferred = True
-                tls.close()
             except Exception as exc:  # noqa: BLE001
                 error = f"{type(exc).__name__}: {exc}"
+            finally:
                 try:
-                    client.close()
+                    (tls or client).close()
                 except OSError:
                     pass
     finally:
-        dns.terminate()
-        try:
-            dns.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            dns.kill()
+        if dns is not None:
+            dns.terminate()
+            try:
+                dns.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                dns.kill()
+                dns.wait(timeout=2)
         sock.close()
         for p in cert_dir.iterdir():
             p.unlink(missing_ok=True)
@@ -249,12 +305,12 @@ def _browse_service(timeout_s: float = 8.0) -> list[dict[str, str]]:
     )
     found: list[dict[str, str]] = []
     deadline = time.time() + timeout_s
+    pending = b""
     try:
         assert proc.stdout is not None
         while time.time() < deadline:
-            line = proc.stdout.readline()
+            line, pending = _process_line(proc.stdout, deadline, pending)
             if not line:
-                time.sleep(0.05)
                 continue
             # Example: TIMESTAMP ... Add  2  4 local.  _khipu-join._tcp.  Khipu Join (mbp)
             if "Add" in line and SERVICE_TYPE.split(".")[0] in line:
@@ -271,6 +327,7 @@ def _browse_service(timeout_s: float = 8.0) -> list[dict[str, str]]:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=2)
     return found
 
 
@@ -300,26 +357,27 @@ def _parse_dns_sd_resolve_line(
     return host, port, ipv4
 
 
-def _read_txt_ipv4_grace(stdout: Any, grace_s: float) -> str | None:
+def _read_txt_ipv4_grace(
+    stdout: Any,
+    grace_s: float,
+    *,
+    pending: bytes = b"",
+    deadline: float | None = None,
+) -> tuple[str | None, bytes]:
     """Read extra dns-sd lines briefly for TXT ipv4 without blocking forever."""
     grace_end = time.time() + max(0.0, grace_s)
+    if deadline is not None:
+        grace_end = min(grace_end, deadline)
     while time.time() < grace_end:
-        wait = grace_end - time.time()
-        try:
-            ready, _, _ = select.select([stdout], [], [], wait)
-        except (ValueError, OSError, TypeError):
-            return None
-        if not ready:
-            return None
-        extra = stdout.readline()
+        extra, pending = _process_line(stdout, grace_end, pending)
         if not extra:
-            return None
+            continue
         match = _IPV4_TXT_RE.search(extra)
         if match:
             parsed = usable_lan_ipv4(match.group(1))
             if parsed:
-                return parsed
-    return None
+                return parsed, pending
+    return None, pending
 
 
 def _resolve_service(
@@ -336,26 +394,32 @@ def _resolve_service(
     host: str | None = None
     port: int | None = None
     ipv4: str | None = None
+    pending = b""
     try:
         assert proc.stdout is not None
         # Wait for SRV (host:port). TXT ipv4 is optional — do not block the
         # full timeout (or hang in readline) when the advertiser omitted it.
         while time.time() < deadline and (host is None or port is None):
-            line = proc.stdout.readline()
+            line, pending = _process_line(proc.stdout, deadline, pending)
             if not line:
-                time.sleep(0.05)
                 continue
             host, port, ipv4 = _parse_dns_sd_resolve_line(line, host, port, ipv4)
             if host is not None and port is not None:
                 break
         if host is not None and port is not None and ipv4 is None:
-            ipv4 = _read_txt_ipv4_grace(proc.stdout, _TXT_IPV4_GRACE_S)
+            ipv4, pending = _read_txt_ipv4_grace(
+                proc.stdout,
+                _TXT_IPV4_GRACE_S,
+                pending=pending,
+                deadline=deadline,
+            )
     finally:
         proc.terminate()
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=2)
     if not host or not port:
         raise RuntimeError(
             f"could not resolve Bonjour instance {instance!r}; "
@@ -486,24 +550,29 @@ def receive(
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE  # ephemeral pairing cert only
-    tls = ctx.wrap_socket(raw, server_hostname=connected_host)
-    req = json.dumps({"protocol": _PROTOCOL, "pin": pin}).encode("utf-8") + b"\n"
-    tls.sendall(req)
-    header_line = _readline(tls).decode("utf-8", errors="replace").strip()
-    header = json.loads(header_line) if header_line else {}
-    if not header.get("ok"):
-        tls.close()
-        raise RuntimeError(header.get("error") or "nearby Mac refused the PIN")
-    nbytes = int(header.get("bytes") or 0)
-    chunks: list[bytes] = []
-    got = 0
-    while got < nbytes:
-        chunk = tls.recv(min(65536, nbytes - got))
-        if not chunk:
-            break
-        chunks.append(chunk)
-        got += len(chunk)
-    tls.close()
+    tls = None
+    try:
+        tls = ctx.wrap_socket(raw, server_hostname=connected_host)
+        req = json.dumps({"protocol": _PROTOCOL, "pin": pin}).encode("utf-8") + b"\n"
+        tls.sendall(req)
+        header_line = _readline(tls).decode("utf-8", errors="replace").strip()
+        header = json.loads(header_line) if header_line else {}
+        if not header.get("ok"):
+            raise RuntimeError(header.get("error") or "nearby Mac refused the PIN")
+        nbytes = int(header.get("bytes") or 0)
+        chunks: list[bytes] = []
+        got = 0
+        while got < nbytes:
+            chunk = tls.recv(min(65536, nbytes - got))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+    finally:
+        try:
+            (tls or raw).close()
+        except OSError:
+            pass
     blob = b"".join(chunks)
     if len(blob) != nbytes:
         raise RuntimeError(f"incomplete kit transfer ({len(blob)}/{nbytes} bytes)")
@@ -559,8 +628,12 @@ def advertise_join_kit(
             "if you locked the kit when saving."
         ),
     }
-    print(json.dumps(banner), flush=True)
-    out = advertise(passphrase, timeout_s=timeout, pin=pin)
+    out = advertise(
+        passphrase,
+        timeout_s=timeout,
+        pin=pin,
+        on_ready=lambda: print(json.dumps(banner), flush=True),
+    )
     out["phase"] = "finished"
     return out
 

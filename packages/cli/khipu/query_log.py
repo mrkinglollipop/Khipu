@@ -99,7 +99,7 @@ def degraded_count(*, hours: int = 24) -> int:
     reads as 0."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max(0, int(hours)))
     n = 0
-    for line in _read_lines(log_path()):
+    for line in _observations()[0]:
         try:
             entry = json.loads(line)
         except ValueError:
@@ -120,13 +120,29 @@ def degraded_rate(*, n: int = 50) -> dict[str, Any]:
     """D6/F4: fraction of the last `n` searches that degraded — a rate, not
     just `degraded_count`'s raw 24h total, so a burst of degraded searches
     shows even on a day with heavy volume. Red past 20% (D6's threshold); no
-    searches yet reads as ok with a 0 sample, not red-on-idleness."""
+    searches yet reports unavailable evidence and a 0 sample."""
     entries = tail(n)
     if not entries:
-        return {"ok": True, "rate": 0.0, "sampled": 0, "degraded": 0}
+        return {"ok": False, "available": False, "rate": None, "sampled": 0, "degraded": 0}
     degraded = sum(1 for e in entries if e.get("degraded"))
     rate = degraded / len(entries)
-    return {"ok": rate <= 0.20, "rate": rate, "sampled": len(entries), "degraded": degraded}
+    return {"ok": rate <= 0.20, "available": True,
+            "rate": rate, "sampled": len(entries), "degraded": degraded}
+
+
+def _observations() -> tuple[list[str], bool]:
+    path = log_path()
+    lines: list[str] = []
+    available = False
+    for p in (path.with_name(path.name + ROTATED_SUFFIX), path):
+        try:
+            lines.extend(p.read_text(encoding="utf-8").splitlines())
+            available = True
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError):
+            return [], False
+    return lines, available
 
 
 def _read_lines(path: Path) -> list[str]:
@@ -140,21 +156,23 @@ def _read_lines(path: Path) -> list[str]:
 
 def tail(n: int = 20) -> list[dict[str, Any]]:
     """The last ``n`` log entries, newest last (matches file order)."""
-    lines = _read_lines(log_path())[-max(1, int(n)) :]
+    lines = _observations()[0]
     out: list[dict[str, Any]] = []
     for line in lines:
         try:
-            out.append(json.loads(line))
+            entry = json.loads(line)
+            if isinstance(entry, dict):
+                out.append(entry)
         except ValueError:
             continue
-    return out
+    return out[-max(1, int(n)) :]
 
 
 def zero_results(days: int = 7) -> list[dict[str, Any]]:
     """Queries logged with ``result_count == 0`` in the last ``days`` days."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=max(0, int(days)))
     out: list[dict[str, Any]] = []
-    for line in _read_lines(log_path()):
+    for line in _observations()[0]:
         try:
             entry = json.loads(line)
         except ValueError:

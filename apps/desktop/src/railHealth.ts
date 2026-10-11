@@ -50,12 +50,17 @@ export function railHealthLine(
   if (red.length > 0) {
     return { tone: "err", text: `${red.length} harness${red.length === 1 ? "" : "es"} not recording` };
   }
+  if (liveness?.ok === false || typeof (liveness as { error?: unknown } | null)?.error === "string") return { tone: "err", text: "Couldn't check recording" };
   if (liveness == null) return { tone: "warn", text: "Checking harnesses…" };
   if (gap.checkFailed) return { tone: "warn", text: "Couldn't check Claude homes" };
   if (gap.missing > 0) return { tone: "warn", text: `${homesWord(gap.missing)} not installed` };
   if (gap.unreadable > 0) return { tone: "warn", text: `${homesWord(gap.unreadable)} can't be read` };
   if (t3.lookupFailed) return { tone: "warn", text: "T3 threads not linking" };
   if (t3.warning) return { tone: "warn", text: "T3 needs a linked capture" };
+  const harnesses = Object.values(liveness.harnesses ?? {});
+  if (harnesses.length === 0 || harnesses.some((h) => h.seen !== true || h.ok !== true)) {
+    return { tone: "warn", text: "Recording not checked" };
+  }
   return { tone: "ok", text: "All harnesses recording" };
 }
 
@@ -68,6 +73,10 @@ export function harnessesBadge(
 ): { n: number; quiet: false } | null {
   const red = liveness?.red ?? [];
   if (red.length > 0) return { n: red.length, quiet: false };
+  if (
+    liveness?.ok === false ||
+    typeof (liveness as { error?: unknown } | null)?.error === "string"
+  ) return { n: 1, quiet: false };
   const homes = gap.missing + gap.unreadable + (gap.checkFailed ? 1 : 0);
   const attention = homes + (t3.warning ? 1 : 0);
   return attention > 0 ? { n: attention, quiet: false } : null;

@@ -41,8 +41,8 @@ def _deliverables_ready(cur) -> bool:
 def insert_deliverables_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     """One row per item in ``payload['deliverables']`` (the shape
     ``khipu.extract.extract_deliverables`` returns). Dedup: the same
-    (project, kind, path, url) already on file is skipped — a file rewritten
-    across several sessions is one deliverable, not a growing pile."""
+    (project, kind, path, url) already on file is skipped; title identifies
+    items without a path or URL, including release versions."""
     items = payload.get("deliverables") or []
     if not isinstance(items, list) or not items:
         return 0
@@ -61,11 +61,13 @@ def insert_deliverables_from_episode(cur, payload: dict[str, Any], episode_id: i
         title = str(raw.get("title") or "").strip() or None
         if not path and not url and not title:
             continue
+        title_clause = "AND title IS NOT DISTINCT FROM %s " if not path and not url else ""
+        params = (project, kind, path, url, title) if title_clause else (project, kind, path, url)
         cur.execute(
             "SELECT id FROM deliverables WHERE project IS NOT DISTINCT FROM %s "
             "AND kind = %s AND path IS NOT DISTINCT FROM %s AND url IS NOT DISTINCT FROM %s "
-            "LIMIT 1",
-            (project, kind, path, url),
+            + title_clause + "LIMIT 1",
+            params,
         )
         if cur.fetchone():
             continue

@@ -84,16 +84,18 @@ class DoctorProbeFlagTest(_Patched):
                 cli.cmd_doctor(args)
         m_run.assert_not_called()
 
-    def test_probe_flag_calls_run_probe_then_reads_status(self):
+    def test_probe_flag_uses_the_current_run_result_without_a_stale_status_read(self):
         parser = cli.build_parser()
         args = parser.parse_args(["doctor", "--probe", "--harness", "claude_code"])
-        with mock.patch("khipu.probe.run_probe") as m_run, \
+        current = {"ok": True, "reason": None, "seconds": 0.25}
+        with mock.patch("khipu.probe.run_probe", return_value=current) as m_run, \
              mock.patch("khipu.probe.status", return_value={"ok": True, "reason": None}) as m_status, \
              mock.patch("khipu.drift.recall_quality", return_value={}):
-            with redirect_stdout(io.StringIO()):
+            with redirect_stdout(io.StringIO()) as out:
                 cli.cmd_doctor(args)
         m_run.assert_called_once_with("claude_code")
-        m_status.assert_called_once()
+        m_status.assert_not_called()
+        self.assertEqual(json.loads(out.getvalue())["recall_probe"]["last_probe"], current)
 
     def test_probe_harness_defaults_to_env_or_doctor(self):
         parser = cli.build_parser()
@@ -128,7 +130,8 @@ class DoctorAggregateOkTest(_Patched):
         return rc, json.loads(buf.getvalue())
 
     def test_everything_green_including_probe_and_snapshot_is_ok(self):
-        rc, out = self._run(recall_probe_ok=True, hub_snapshot_ok=True)
+        with mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25}):
+            rc, out = self._run(recall_probe_ok=True, hub_snapshot_ok=True)
         self.assertEqual(rc, 0)
         self.assertTrue(out["ok"])
         self.assertTrue(out["recall_probe_ok"])
@@ -153,6 +156,7 @@ class DoctorAggregateOkTest(_Patched):
         parser = cli.build_parser()
         args = parser.parse_args(["doctor"])
         with mock.patch("khipu.probe.status", return_value={"ok": True, "reason": None}), \
+             mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25}), \
              mock.patch("khipu.drift.recall_quality",
                           return_value={"junk_path_ratio": {"value": 0.9, "threshold": 0.05, "ok": False}}):
             buf = io.StringIO()
