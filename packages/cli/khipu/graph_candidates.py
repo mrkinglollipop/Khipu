@@ -453,12 +453,12 @@ def replica_candidates(
         return [], False
     previous_busy = int(con.execute("PRAGMA busy_timeout").fetchone()[0])
     bounded_con = _SqliteDeadlineConnection(con, deadline)
-    con.execute(f"PRAGMA busy_timeout={_remaining_ms(deadline)}")
-    # sqlite3 exposes no getter for an existing progress handler; callers lend
-    # a connection with no handler installed, and this leg always clears its
-    # own handler before returning.
-    con.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 100)
     try:
+        con.execute(f"PRAGMA busy_timeout={_remaining_ms(deadline)}")
+        # sqlite3 exposes no getter for an existing progress handler; callers lend
+        # a connection with no handler installed, and this leg always clears its
+        # own handler before returning.
+        con.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 100)
         raw: list[dict[str, Any]] = []
         for rank, seed in seeds:
             _check_deadline(deadline)

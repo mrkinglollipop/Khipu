@@ -406,19 +406,20 @@ class NightlyHealthRegressionTest(unittest.TestCase):
 
 class NightlyAggregateRegressionTest(unittest.TestCase):
     def test_briefs_failed_or_unavailable_result_is_unhealthy(self) -> None:
+        from khipu import briefs, features
+
         chosen = {"available": True, "topics": ["a", "b"]}
-        fake_briefs = mock.Mock()
-        fake_briefs.acquire_build_lock.return_value = True
-        fake_briefs.select_for_build.return_value = chosen
-        fake_briefs.build_many.return_value = [
+        results = [
             {"status": "ok"},
             {"status": "failed", "error": "provider"},
         ]
-        fake_features = mock.Mock()
-        fake_features.enabled.return_value = True
         conn = mock.MagicMock()
         with (
-            mock.patch.dict("sys.modules", {"khipu.briefs": fake_briefs, "khipu.features": fake_features}),
+            mock.patch.object(briefs, "acquire_build_lock", return_value=True),
+            mock.patch.object(briefs, "release_build_lock"),
+            mock.patch.object(briefs, "select_for_build", return_value=chosen),
+            mock.patch.object(briefs, "build_many", return_value=results),
+            mock.patch.object(features, "enabled", return_value=True),
             mock.patch("khipu.db.connect") as connect,
             mock.patch.object(jobs, "_nightly_log"),
         ):

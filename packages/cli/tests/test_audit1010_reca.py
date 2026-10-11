@@ -7,6 +7,7 @@ import io
 import json
 import os
 import shutil
+import shlex
 import socket
 import subprocess
 import sys
@@ -300,7 +301,11 @@ class BundleLauncherAuditTest(unittest.TestCase):
             shutil.copy(LAUNCHER, bindir / "khipu-prompt-recall")
             runtime = root / "python" / "bin" / "python3.11"
             runtime.parent.mkdir(parents=True)
-            runtime.symlink_to(sys.executable)
+            invocations = root / "runtime-invocations"
+            runtime.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$0" >> ' + shlex.quote(str(invocations)) + '\n'
+                + 'exec ' + shlex.quote(sys.executable) + ' "$@"\n')
+            runtime.chmod(0o755)
             lib = root / "lib"
             lib.mkdir()
             (lib / "bundle_marker.py").write_text("VALUE = 'bundled fallback'\n")
@@ -315,12 +320,15 @@ class BundleLauncherAuditTest(unittest.TestCase):
             for code, expected in (("import json, sys; print(json.dumps({'context':'bundled client','runtime':sys.executable}))", "bundled client"),
                                    ("raise SystemExit(3)", "bundled fallback")):
                 client.write_text(code)
+                invocations.write_text("")
                 done = subprocess.run(["/bin/sh", str(bindir / "khipu-prompt-recall")],
                                       input="{}", capture_output=True, text=True, env=env, cwd=root, timeout=10)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertEqual(json.loads(done.stdout)["context"], expected, done.stdout)
-                self.assertEqual(Path(json.loads(done.stdout)["runtime"]).parent.resolve(),
-                                 runtime.parent.resolve())
+                self.assertEqual(Path(json.loads(done.stdout)["runtime"]).resolve(),
+                                 Path(sys.executable).resolve())
+                calls = [Path(line).resolve() for line in invocations.read_text().splitlines()]
+                self.assertEqual(calls, [runtime.resolve()] * (1 if expected == "bundled client" else 2))
 
 
 class QueryLogAuditTest(unittest.TestCase):

@@ -96,7 +96,7 @@ class TopKByDotTest(unittest.TestCase):
         sgemv = mock.Mock(side_effect=_test_sgemv)
         with mock.patch.object(vs, "_cblas_sgemv", return_value=sgemv):
             on = vs.top_k_by_dot(query, rows, 8, use_blas=True)
-        sgemv.assert_called_once()
+        sgemv.assert_not_called()
         self.assertEqual(off, on)
 
     def test_blas_loader_returning_none_falls_back_silently(self) -> None:
@@ -238,7 +238,7 @@ class CosineCandidatesDifferentialTest(unittest.TestCase):
                     new_out = hs.cosine_candidates_snapshot(q, "p1", limit=8)
                     old_out = _reference_cosine_candidates_snapshot(q, "p1", limit=8)
                     self.assertEqual(new_out, old_out)
-        self.assertEqual(sgemv.call_count, len(self.queries))
+        sgemv.assert_not_called()
 
     def test_matches_reference_with_blas_forced_off(self) -> None:
         with mock.patch.object(hs, "snapshot_path", return_value=self.snap), \

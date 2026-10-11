@@ -133,22 +133,26 @@ class OutboxDurabilityTest(unittest.TestCase):
         outbox.enqueue({"ts": "2026-08-17T18:00:00Z", "summary": "s"}, reason="test")
         jp = outbox.jobs()[0]
 
-        seen = {}
-        real = pathlib.Path.write_text
+        original = jp.read_bytes()
+        real = os.replace
 
-        def spy(self, data, *a, **kw):
-            seen.setdefault("first_target", self.name)
-            return real(self, data, *a, **kw)
+        def spy(source, destination):
+            source = pathlib.Path(source)
+            self.assertEqual(pathlib.Path(destination), jp)
+            self.assertEqual(source.parent, jp.parent)
+            self.assertTrue(source.name.endswith(".tmp"))
+            self.assertEqual(jp.read_bytes(), original)
+            self.assertEqual(json.loads(source.read_text())["attempts"], 1)
+            return real(source, destination)
 
         class Boom(Exception):
             pass
 
-        with mock.patch.object(pathlib.Path, "write_text", spy), \
+        with mock.patch.object(os, "replace", side_effect=spy) as replace, \
              mock.patch("khipu.capture.write_pg", side_effect=Boom("nope")), \
              mock.patch("khipu.embed.embed_on_capture", return_value=False):
             outbox.drain()
-        self.assertTrue(seen["first_target"].endswith(".tmp"),
-                        f"retry wrote directly to {seen['first_target']}")
+        replace.assert_called_once()
         # And the job survived, readable, with the attempt recorded.
         job = json.loads(jp.read_text())
         self.assertEqual(job["attempts"], 1)

@@ -1168,7 +1168,7 @@ def _native_aegis_hook_is_ours(block: str) -> bool:
         return False
     for event in ("Stop", "PreCompact", "SessionEnd"):
         group = (data.get("hooks") or {}).get(event) or {}
-        for hook in group.get("hooks") if isinstance(group, dict) else []:
+        for hook in (group.get("hooks") or []) if isinstance(group, dict) else []:
             if (isinstance(hook, dict) and _is_our_capture(hook.get("command"))
                     and isinstance(hook.get("env"), dict)
                     and hook["env"].get("KHIPU_HARNESS") == "aegis"):
@@ -1231,7 +1231,7 @@ def _aegis_detected() -> bool:
 def _aegis_blocks() -> tuple[str, str]:
     mcp = (
         "[mcp_servers.khipu]\n"
-        f'command = "{mcp_launcher()}"\n'
+        f'command = {json.dumps(mcp_launcher(), ensure_ascii=False)}\n'
         "enabled = true\n"
         "startup_timeout_sec = 30\n"
     )
@@ -1252,7 +1252,7 @@ def _aegis_blocks() -> tuple[str, str]:
             f"[[hooks.{ev}]]\n"
             f"  [[hooks.{ev}.hooks]]\n"
             '  type = "command"\n'
-            f'  command = "{aegis_capture_hook()}"\n'
+            f'  command = {json.dumps(aegis_capture_hook(), ensure_ascii=False)}\n'
             "  timeout = 15\n"
             '  env = { KHIPU_HARNESS = "aegis" }\n'
         )

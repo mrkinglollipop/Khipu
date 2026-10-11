@@ -32,6 +32,13 @@ class Cursor(_EpisodesFakeCursor):
         if s.startswith("SELECT to_jsonb("):
             row = self.episodes.get(params[0])
             self._result = [(copy.deepcopy(row),)] if row else []
+        elif s.startswith("SELECT row_to_json(e) FROM episodes e"):
+            if "e.ts =" in s:
+                row = next((r for r in self.episodes.values()
+                            if r["ts"] == params[0] and cap._md5_hex(r["summary"]) == params[1]), None)
+            else:
+                row = self.episodes.get(int(params[0]))
+            self._result = [(copy.deepcopy(row),)] if row and not row.get("deleted_at") else []
         elif s.startswith("SELECT project FROM project_aliases"):
             self._result = [("old/app",)] if params[0] == "new/app" else []
         elif s.startswith("SELECT topics, decisions, preferences, people, raw, ts, summary"):

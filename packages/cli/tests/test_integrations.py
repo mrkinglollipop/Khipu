@@ -16,6 +16,7 @@ import os
 import shlex
 import tempfile
 import time
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -834,9 +835,14 @@ class UnreadableConfigTest(_TempHomeCase):
         (self.home / ".grok").mkdir(parents=True, exist_ok=True)
         integ.AEGIS_TOML.write_text('[mcp_servers.khipu]\ncommand = "old"\n')
         nasty = '/tmp/kh\\g<0>ipu/bin/khipu-mcp'
-        with mock.patch.object(integ, "mcp_launcher", lambda: nasty):
+        hook = '/tmp/kh\\g<0>i"pu/bin/khipu-aegis-capture'
+        with mock.patch.object(integ, "mcp_launcher", lambda: nasty), \
+             mock.patch.object(integ, "aegis_capture_hook", lambda: hook):
             integ.install("aegis")
-        self.assertIn(nasty, integ.AEGIS_TOML.read_text())
+        config = tomllib.loads(integ.AEGIS_TOML.read_text())
+        self.assertEqual(config["mcp_servers"]["khipu"]["command"], nasty)
+        for event in ("Stop", "PreCompact", "SessionEnd"):
+            self.assertEqual(config["hooks"][event][0]["hooks"][0]["command"], hook)
 
 
 

@@ -297,7 +297,8 @@ def _fake_hub(rows: list[dict]):
          mock.patch("khipu.hub_snapshot.try_hub_connect", return_value=_Conn()), \
          mock.patch.object(em, "_apply_search_filters", side_effect=lambda cur, r, **k: r), \
          mock.patch("khipu.topic_graph.enrich_search_results", side_effect=lambda cur, r: list(r)), \
-         mock.patch("khipu.decisions.enrich_search_results", side_effect=lambda cur, r: list(r)):
+         mock.patch("khipu.decisions.enrich_search_results", side_effect=lambda cur, r: list(r)), \
+         mock.patch("khipu.library_search.enabled_libraries", return_value=[]):
         yield
 
 

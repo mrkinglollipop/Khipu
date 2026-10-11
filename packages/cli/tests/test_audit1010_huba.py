@@ -62,6 +62,8 @@ class HubAuditRegressionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             snap = self._snapshot(Path(tmp))
             con = sqlite3.connect(snap)
+            con.executemany("INSERT INTO topics (slug, title, body) VALUES (?, ?, ?)",
+                            [("old", "old", "old text"), ("new", "new", "new text")])
             con.execute("INSERT INTO memory_embeddings VALUES ('p', 'topic', 'old', 0, 'old text', NULL, ?, NULL)", (hs._vector_to_blob([1.0, 0.0]),))
             con.commit(); con.close()
             hs._MATRIX_CACHE.clear()

@@ -132,7 +132,11 @@ def test_an_expired_deadline_drops_the_whole_leg(tmp_path):
     with corpus.installed_corpus(tmp_path):
         con = hs.open_snapshot()
         fused = [{"kind": "topic", "id": "billing-service", "score": 1.0}]
+        con.execute("PRAGMA busy_timeout=1234")
         candidates, missed = gc.replica_candidates(con, fused, deadline=time.monotonic() - 1)
+        assert con.execute("PRAGMA busy_timeout").fetchone()[0] == 1234
+        assert con.execute("SELECT 1").fetchone()[0] == 1
+        con.close()
     assert missed is True
     assert candidates == []
 

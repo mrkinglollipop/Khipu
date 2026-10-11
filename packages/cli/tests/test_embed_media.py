@@ -143,6 +143,7 @@ class ActivateIgnoresMediaTest(unittest.TestCase):
             "episodes": {"missing": 0},
             "topics": {"missing": 0},
             "media": {"missing": 99},
+            "missing": 0, "stale": 0,
         }
         with mock.patch("khipu.db.connect") as connect, \
              mock.patch.object(embed, "coverage", return_value=cov), \
@@ -162,13 +163,14 @@ class ActivateIgnoresMediaTest(unittest.TestCase):
         for kind in ("episodes", "topics"):
             cov = {"episodes": {"missing": 0}, "topics": {"missing": 0}, "media": {"missing": 99}}
             cov[kind]["missing"] = 1
+            cov.update(missing=1, stale=0)
             with self.subTest(kind=kind), mock.patch("khipu.db.connect") as connect, \
                  mock.patch.object(embed, "coverage", return_value=cov), \
                  mock.patch.object(embed._profiles, "ensure_profile_index") as index:
                 conn = connect.return_value.__enter__.return_value
                 cur = conn.cursor.return_value.__enter__.return_value
                 cur.fetchone.return_value = (embed.PROFILE_2,)
-                with self.assertRaisesRegex(RuntimeError, "still missing vectors"):
+                with self.assertRaisesRegex(RuntimeError, "1 chunks missing and 0 stale"):
                     embed.activate(embed.PROFILE_2)
                 self.assertFalse(any("UPDATE" in c.args[0] for c in cur.execute.call_args_list))
                 index.assert_not_called()

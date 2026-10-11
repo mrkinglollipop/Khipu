@@ -68,6 +68,7 @@ class RedactionPrivacyTest(unittest.TestCase):
 
         seen = []
         cur = mock.MagicMock()
+        cur.fetchone.return_value = None
         conn = mock.MagicMock()
         conn.__enter__.return_value = conn
         conn.cursor.return_value.__enter__.return_value = cur
@@ -78,7 +79,7 @@ class RedactionPrivacyTest(unittest.TestCase):
              mock.patch("khipu.db.has_columns", return_value=False), \
              mock.patch("khipu.capture._inherit_project"), \
              mock.patch("khipu.capture.dedup_before_insert", return_value={"action": "new"}), \
-             mock.patch("khipu.mirror._upsert_episode", side_effect=lambda _c, p: seen.append(p) or False), \
+             mock.patch("khipu.mirror._upsert_episode", side_effect=lambda _c, p: seen.append(p) or True), \
              mock.patch("khipu.topic_graph.persist_capture_graph"), \
              mock.patch("khipu.config.path_setting", return_value=None):
             capture.write_pg(payload)
