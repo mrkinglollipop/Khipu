@@ -868,7 +868,7 @@ describe.each(ENTRY_POINTS)("IntegrationsPanel — $name", (ep) => {
     await waitFor(() => expect(toasts).toHaveLength(1));
 
     expect(toasts[0]).toBe(ep.harness === "all"
-      ? `${INSTALL_OK_COPY} Skipped: Aegis, Codex, Grok Bot.`
+      ? `${INSTALL_OK_COPY} Skipped: Aegis, Codex, Grok Bot · cloud.`
       : INSTALL_OK_COPY);
     const argv = calls(runKhipu).filter((a) => a[1] === "install" || a[1] === "verify");
     expect(argv).toEqual([

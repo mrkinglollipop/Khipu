@@ -127,9 +127,9 @@ describe("App — Activity", () => {
     expect(await screen.findByText("Could not verify that episode #1 was removed.")).toBeInTheDocument();
     expect(screen.getByRole("dialog")).toBeInTheDocument();
 
-    verdict = JSON.stringify({ ok: true, snapshot: { ok: false, error: "disk full" } });
+    verdict = JSON.stringify({ ok: false, complete: false, soft_deleted: true, partial: ["snapshot", "outbox"], snapshot: { ok: false, error: "disk full" } });
     fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Forget" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("removed from database; local copy could not be removed: disk full");
+    expect(await screen.findByRole("alert")).toHaveTextContent("removed from database; local copy could not be removed: remaining stores: snapshot, outbox");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 

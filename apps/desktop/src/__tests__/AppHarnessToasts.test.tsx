@@ -155,6 +155,7 @@ describe("App — Harnesses toasts survive the reload that follows an action", (
     const card = await openHarnessesCard();
     const before = doctorCalls();
     fireEvent.click(within(card).getByRole("button", { name: "Remove Khipu from Default" }));
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Remove Khipu from Default?" })).getByRole("button", { name: "Remove Khipu" }));
     await settled(before);
     expect(screen.getByText(/hooks were kept \(still used by T3 · Secondary\)/)).toBeInTheDocument();
   });

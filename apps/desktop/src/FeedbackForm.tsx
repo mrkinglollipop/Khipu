@@ -1,6 +1,5 @@
 import { useCallback, useId, useRef, useState, type RefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { Loader2, Paperclip, X } from "lucide-react";
 import { SUPPORT_EMAIL } from "./Welcome";
 import { Dialog } from "./ui";
@@ -89,9 +88,8 @@ export function FeedbackForm({
     setFieldErrors((prev) => ({ ...prev, attachments: undefined }));
     setFormError(null);
     try {
-      const selected = await openFileDialog({ multiple: true });
-      if (!selected) return;
-      const paths = Array.isArray(selected) ? selected : [selected];
+      const paths = await invoke<string[]>("select_feedback_attachments");
+      if (!Array.isArray(paths) || paths.length === 0) return;
       const existing = new Set(attachments.map((a) => a.path));
       const unique = paths.filter(
         (path): path is string =>

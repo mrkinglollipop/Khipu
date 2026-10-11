@@ -3,7 +3,7 @@
 // overwrite a newer one, a failed Claude homes check must not read green, and
 // Home's "Reinstall hook" installs without the CLI's verify.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
 
@@ -110,17 +110,90 @@ describe("App — doctor reads", () => {
     await waitFor(() => expect(statusReads).toBeGreaterThan(before));
   });
 
-  it("does not turn a failed live-session response into an empty successful card", async () => {
+  it("Home Refresh rechecks the database and live-session reads", async () => {
+    let dsnReads = 0;
+    let liveReads = 0;
     invokeMock.mockImplementation(async (cmd: string, payload?: { args?: string[] }) => {
-      if (cmd === "dsn_configured") return true;
+      if (cmd === "dsn_configured") { dsnReads += 1; return true; }
       if (cmd === "khipu_db_status") return JSON.stringify({ ok: true });
-      if (cmd === "liveness_now") return JSON.stringify({ ok: false, error: "hub unavailable", red: [], harnesses: {} });
+      if (cmd === "liveness_now") { liveReads += 1; return JSON.stringify({ ok: true, red: [], harnesses: {} }); }
       if (cmd === "run_khipu" && payload?.args?.[0] === "doctor") return doctorDoc();
       return JSON.stringify({ ok: true });
     });
     render(<App />);
-    expect(await screen.findByText("Could not check live sessions")).toBeInTheDocument();
-    expect(screen.queryByText("No live sessions yet")).not.toBeInTheDocument();
+    await waitFor(() => expect(liveReads).toBeGreaterThan(0));
+    const dsnBefore = dsnReads;
+    const liveBefore = liveReads;
+    fireEvent.click(screen.getAllByRole("button", { name: "Refresh" })[0]);
+    await waitFor(() => expect(dsnReads).toBeGreaterThan(dsnBefore));
+    await waitFor(() => expect(liveReads).toBeGreaterThan(liveBefore));
+  });
+
+  it("uses top-level chunk coverage for the Search index tile", async () => {
+    script((args) => args[0] === "doctor"
+      ? doctorDoc({
+        embed_coverage: {
+          missing: 3,
+          stale: 2,
+          pct: 87.5,
+          episodes: { total: 10, embedded: 10, missing: 0, pct: 100 },
+          topics: { total: 4, embedded: 4, missing: 0, pct: 100 },
+        },
+      })
+      : "{}");
+    render(<App />);
+    const tile = (await screen.findByText("Search index")).closest(".tile");
+    expect(tile).not.toBeNull();
+    expect(await within(tile as HTMLElement).findByText("87.5%")).toBeInTheDocument();
+    expect(within(tile as HTMLElement).getByText("3 chunks missing · 2 stale · catching up")).toBeInTheDocument();
+    expect(within(tile as HTMLElement).queryByText("Everything indexed")).not.toBeInTheDocument();
+  });
+
+  it("keeps nested row coverage as the Search index tile fallback", async () => {
+    script((args) => args[0] === "doctor"
+      ? doctorDoc({
+        embed_coverage: {
+          episodes: { total: 10, embedded: 8, missing: 2, pct: 80 },
+          topics: { total: 5, embedded: 5, missing: 0, pct: 100 },
+        },
+      })
+      : "{}");
+    render(<App />);
+    const tile = (await screen.findByText("Search index")).closest(".tile");
+    expect(tile).not.toBeNull();
+    expect(await within(tile as HTMLElement).findByText("86.7%")).toBeInTheDocument();
+    expect(within(tile as HTMLElement).getByText("2 rows not indexed yet · catching up")).toBeInTheDocument();
+  });
+
+  it("passes --replace only after Restore is confirmed", async () => {
+    const calls: string[][] = [];
+    script((args) => {
+      calls.push(args);
+      if (args[0] === "doctor") return doctorDoc();
+      if (args[0] === "paths") return JSON.stringify({ data_dir: "/tmp/khipu", files: [] });
+      return JSON.stringify({ ok: true });
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Data & backups" }));
+    fireEvent.change(screen.getByPlaceholderText("~/Downloads/khipu-local-….zip"), { target: { value: "/tmp/backup.zip" } });
+    fireEvent.click(screen.getByRole("button", { name: "Restore…" }));
+    expect(calls.some((args) => args[0] === "import-local")).toBe(false);
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Restore into the data folder?" })).getByRole("button", { name: "Restore" }));
+    await waitFor(() => expect(calls).toContainEqual(["import-local", "--source=/tmp/backup.zip", "--replace"]));
+  });
+
+  it("keeps the structured unhealthy live-session report visible", async () => {
+    invokeMock.mockImplementation(async (cmd: string, payload?: { args?: string[] }) => {
+      if (cmd === "dsn_configured") return true;
+      if (cmd === "khipu_db_status") return JSON.stringify({ ok: true });
+      if (cmd === "liveness_now") return JSON.stringify({ ok: false, error: "hub unavailable", red: ["claude_code"], queue_depth: 2, captured_today: 4, harnesses: { claude_code: { ok: false, seen: true, pending_turns: 1, last_captured_age_s: 60 } } });
+      if (cmd === "run_khipu" && payload?.args?.[0] === "doctor") return doctorDoc();
+      return JSON.stringify({ ok: true });
+    });
+    render(<App />);
+    expect(await screen.findByText(/1 turn waiting for capture/)).toBeInTheDocument();
+    expect(screen.getByText(/Queue depth 2 · captured today 4/)).toBeInTheDocument();
   });
 
   it("does not count unseen harnesses as recording or call an all-unseen report clear", async () => {
