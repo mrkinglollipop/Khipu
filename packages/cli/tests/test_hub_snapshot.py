@@ -663,6 +663,27 @@ class SnapshotFreshnessTest(unittest.TestCase):
         out = hs.snapshot_freshness(None, {"ok": True, "refreshed_at": None})
         self.assertIsNone(out["behind_ingest_seconds"])
 
+    def test_behind_is_measured_against_what_the_replica_holds(self) -> None:
+        """An old full dump with current incremental writes is not behind; a
+        replica whose newest episode is itself old still is."""
+        health = {"ok": True, "refreshed_at": "2026-09-03T00:00:00+00:00"}
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = Path(tmp) / "hub_snapshot.sqlite"
+            con = sqlite3.connect(snap)
+            hs._create_schema(con)
+            con.execute("INSERT INTO episodes (id, summary, raw, ingested_at) VALUES (1, 's', '{}', ?)",
+                        ("2026-09-03T04:59:00+00:00",))
+            con.commit()
+            con.close()
+            with mock.patch.object(hs, "snapshot_path", return_value=snap):
+                current = hs.snapshot_freshness("2026-09-03T05:00:00+00:00", health)
+                stalled = hs.snapshot_freshness("2026-09-03T09:00:00+00:00", health)
+        self.assertTrue(current["ok"])
+        self.assertEqual(current["behind_ingest_seconds"], 60.0)
+        self.assertEqual(current["refreshed_at"], "2026-09-03T00:00:00+00:00")
+        self.assertFalse(stalled["ok"])
+        self.assertEqual(stalled["reason"], "snapshot_behind_ingest")
+
 
 if __name__ == "__main__":
     unittest.main()
