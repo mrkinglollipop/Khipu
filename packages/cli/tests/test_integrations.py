@@ -428,8 +428,8 @@ class ShimRepointTest(_TempHomeCase):
         self.assertTrue(any("khipu-stop-hook ->" in c for c in out["changes"]), out["changes"])
         s = json.loads((self.home / ".claude" / "settings.json").read_text())
         cmds = [h["command"] for e in s["hooks"]["Stop"] for h in e["hooks"]]
-        self.assertEqual(cmds, [integ.queue_only_stop_hook()])  # re-pointed, not duplicated
-        self.assertNotIn(" ", cmds[0].split()[-1])
+        self.assertEqual(cmds, [integ.stop_hook()])           # re-pointed, not duplicated
+        self.assertNotIn(" ", cmds[0])
         self.assertTrue((self.home / ".config" / "khipu" / "bin" / "khipu-stop-hook").is_symlink())
         self.assertEqual(integ.install("claude_code")["changes"], [])  # idempotent after
 

@@ -50,7 +50,7 @@ class CursorSessionEndTest(_TempHomeCase):
         self.assertIn("\"/x/on-quit.sh\"", commands)          # legacy untouched
         ours = [e for e in se if "khipu-stop-hook" in e["command"]]
         self.assertEqual(len(ours), 1)
-        self.assertEqual(ours[0]["command"], integ.queue_only_stop_hook())
+        self.assertEqual(ours[0]["command"], integ.stop_hook())
         self.assertEqual(ours[0]["timeout"], 20)
         # stop / preCompact also got the entry, same as before this change.
         self.assertTrue(any("khipu-stop-hook" in e["command"] for e in h["hooks"]["stop"]))

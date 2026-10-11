@@ -300,7 +300,7 @@ class QueueOnlyIntegrationTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_all_ordinary_capture_events_install_queue_only_commands(self):
+    def test_ordinary_capture_events_install_the_draining_hook_and_only_codex_sessionend_queues(self):
         claude = self.home / ".claude" / "settings.json"
         claude.parent.mkdir()
         claude.write_text("{}")
@@ -321,20 +321,25 @@ class QueueOnlyIntegrationTest(unittest.TestCase):
         claude_hooks = __import__("json").loads(claude.read_text())["hooks"]
         cursor_hooks = __import__("json").loads(integ.CURSOR_HOOKS.read_text())["hooks"]
         codex_hooks = __import__("json").loads(integ.CODEX_HOOKS.read_text())["hooks"]
-        prefix = "env KHIPU_CAPTURE_QUEUE_ONLY=1 "
+        # The installed command is what the harness runs; a queue-only command
+        # here would leave every capture queued until something else drained it.
+        draining = integ.stop_hook()
+        queue_only = integ.queue_only_stop_hook()
+        self.assertNotEqual(draining, queue_only)
         for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop"):
             hook = claude_hooks[event][0]["hooks"][0]
-            self.assertTrue(hook["command"].startswith(prefix), (event, hook))
+            self.assertEqual(hook["command"], draining, (event, hook))
             self.assertTrue(integ._is_ours(hook["command"]), (event, hook))
             self.assertEqual(hook["timeout"], 20)
         for event in ("stop", "preCompact", "sessionEnd", "subagentStop"):
             hook = cursor_hooks[event][0]
-            self.assertTrue(hook["command"].startswith(prefix), (event, hook))
+            self.assertEqual(hook["command"], draining, (event, hook))
             self.assertTrue(integ._is_ours(hook["command"]), (event, hook))
             self.assertEqual(hook["timeout"], 20)
         for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop"):
             hook = codex_hooks[event][0]["hooks"][0]
-            self.assertTrue(hook["command"].startswith(prefix), (event, hook))
+            want = queue_only if event == "SessionEnd" else draining
+            self.assertEqual(hook["command"], want, (event, hook))
             self.assertTrue(integ._is_ours(hook["command"]), (event, hook))
             self.assertEqual(hook["timeout"], 3 if event == "SessionEnd" else 20)
 

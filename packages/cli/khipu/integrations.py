@@ -626,12 +626,12 @@ def _claude_hooks_install(settings: Path, dry: bool, res: dict) -> None:
         entries = hooks.setdefault(event, [])
         flat = [h for e in entries for h in e.get("hooks", [])]
         if not any(_is_ours(h.get("command")) for h in flat):
-            entries.append({"hooks": [{"type": "command", "command": queue_only_stop_hook(), "timeout": 20}]})
+            entries.append({"hooks": [{"type": "command", "command": stop_hook(), "timeout": 20}]})
             res["changes"].append(f"{settings}: hooks.{event} += khipu-stop-hook")
             changed = True
-        elif _repoint(flat, _is_ours, queue_only_stop_hook()):
+        elif _repoint(flat, _is_ours, stop_hook()):
             res["changes"].append(
-                f"{settings}: hooks.{event} khipu-stop-hook -> {queue_only_stop_hook()}")
+                f"{settings}: hooks.{event} khipu-stop-hook -> {stop_hook()}")
             changed = True
     # Recall rule: SessionStart additionalContext (thin cadence rule, not memory content).
     ss = hooks.setdefault("SessionStart", [])
@@ -953,12 +953,12 @@ def _cursor_install(dry: bool, project: str | None = None) -> dict:
     for event in ("stop", "preCompact", "sessionEnd", "subagentStop"):
         entries = hooks.setdefault(event, [])
         if not any(_is_ours(e.get("command")) for e in entries):
-            entries.append({"command": queue_only_stop_hook(), "timeout": 20})
+            entries.append({"command": stop_hook(), "timeout": 20})
             out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} += khipu-stop-hook")
             changed = True
-        elif _repoint(entries, _is_ours, queue_only_stop_hook()):
+        elif _repoint(entries, _is_ours, stop_hook()):
             out["changes"].append(
-                f"{CURSOR_HOOKS}: hooks.{event} khipu-stop-hook -> {queue_only_stop_hook()}")
+                f"{CURSOR_HOOKS}: hooks.{event} khipu-stop-hook -> {stop_hook()}")
             changed = True
     # Push recall: append a second sessionStart entry. Do not replace harness
     # session_start.sh (Cursor runs all matching hooks; inject field is
@@ -1485,7 +1485,7 @@ def _codex_install(dry: bool) -> dict:
         flat = [x for e in entries for x in e.get("hooks", [])]
         # Codex allows SessionEnd hooks at most 3 s (docs: default 1 s, max 3 s),
         # so that entry only queues; the next Stop drains it.
-        want_cmd = codex_sessionend_hook() if event == "SessionEnd" else queue_only_stop_hook()
+        want_cmd = codex_sessionend_hook() if event == "SessionEnd" else stop_hook()
         want_timeout = CODEX_SESSIONEND_TIMEOUT if event == "SessionEnd" else 20
         if not any(_is_ours(x.get("command")) for x in flat):
             entries.append({"hooks": [{"type": "command", "command": want_cmd, "timeout": want_timeout}]})

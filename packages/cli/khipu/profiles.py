@@ -363,16 +363,20 @@ def _legacy_index_matches(cur, profile: str, table: str, dim: int, *, indexdef: 
 def index_definition_matches(profile: str, table: str, dim: int, definition: str | None) -> bool:
     if not definition:
         return False
-    normalized = re.sub(r"\s+", " ", definition.replace('"', "").lower())
-    literal = re.escape(profile.lower().replace("'", "''"))
+    # Keywords are matched case-insensitively, but the table name and the
+    # profile literal must match exactly: 'Model@8' and 'model@8' are distinct
+    # profiles that share a previous-name index, so a lowercased comparison
+    # would let one of them drop the other's index.
+    normalized = re.sub(r"\s+", " ", definition.replace('"', ""))
+    literal = re.escape(profile.replace("'", "''"))
     return (
-        re.search(rf"\bon\s+(?:public\.)?{re.escape(table)}\b", normalized) is not None
+        re.search(rf"(?i:\bon\s+)(?:public\.)?{re.escape(table)}\b", normalized) is not None
         and re.search(
-            rf"\busing\s+hnsw\s*\(\s*\(*embedding\)*\s*::\s*vector\(\s*{int(dim)}\s*\)"
-            r"\s*\)*\s+vector_cosine_ops\s*\)", normalized,
+            rf"(?i:\busing\s+hnsw\s*\(\s*\(*embedding\)*\s*::\s*vector\(\s*{int(dim)}\s*\))"
+            r"(?i:\s*\)*\s+vector_cosine_ops\s*\))", normalized,
         ) is not None
         and re.search(
-            rf"\bwhere\s*\(*\s*profile\s*=\s*'{literal}'\s*(?:::\s*text)?\s*\)*\s*;?\s*$",
+            rf"(?i:\bwhere\s*\(*\s*profile\s*=\s*)'{literal}'(?i:\s*(?:::\s*text)?\s*\)*\s*;?\s*$)",
             normalized,
         ) is not None
     )

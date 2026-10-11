@@ -203,6 +203,27 @@ class LegacyIndexDefinitionTest(unittest.TestCase):
                          [call.args[1] for call in drop.call_args_list])
 
 
+class IndexDefinitionCaseTest(unittest.TestCase):
+    def _definition(self, profile: str, table: str = "library_embeddings") -> str:
+        return (
+            f"CREATE INDEX idx ON public.{table} USING hnsw ((embedding::vector(768)) "
+            f"vector_cosine_ops) WHERE (profile = '{profile}'::text)"
+        )
+
+    def test_profile_literal_must_match_case_exactly(self):
+        definition = self._definition("model@8")
+        self.assertTrue(profiles.index_definition_matches("model@8", "library_embeddings", 768, definition))
+        self.assertFalse(profiles.index_definition_matches("Model@8", "library_embeddings", 768, definition))
+
+    def test_keywords_may_differ_in_case(self):
+        definition = self._definition("model@8").lower().replace("'model@8'", "'model@8'")
+        self.assertTrue(profiles.index_definition_matches("model@8", "library_embeddings", 768, definition))
+
+    def test_table_name_must_match_case_exactly(self):
+        definition = self._definition("model@8", table="Library_Embeddings")
+        self.assertFalse(profiles.index_definition_matches("model@8", "library_embeddings", 768, definition))
+
+
 class VectorScanExactnessTest(unittest.TestCase):
     def test_accelerated_path_does_not_discard_exact_winner(self):
         query = [1.0, 2.0 ** -14]
