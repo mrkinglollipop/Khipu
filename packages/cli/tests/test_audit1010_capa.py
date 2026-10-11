@@ -221,7 +221,8 @@ class CaptureCapaTest(unittest.TestCase):
 
     def test_live_old_claim_is_not_reclaimed_by_mtime(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(Path(td) / "kh")}):
-            q = sc.queue_dir(); q.mkdir(parents=True)
+            q = sc.queue_dir()
+            q.mkdir(parents=True)
             claim = q / f"x.claimed.{os.getpid()}"
             claim.write_text("{}")
             old = time.time() - sc.CLAIM_STALE_S - 1
@@ -244,7 +245,8 @@ class CaptureCapaTest(unittest.TestCase):
 
     def test_extraction_checkpoint_temp_is_not_a_claim_candidate(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(Path(td) / "kh")}):
-            q = sc.queue_dir(); q.mkdir(parents=True)
+            q = sc.queue_dir()
+            q.mkdir(parents=True)
             claimed = q / f"job.claimed.{os.getpid()}"
             claimed.write_text("{}")
             observed = []
@@ -261,7 +263,8 @@ class CaptureCapaTest(unittest.TestCase):
 
     def test_sibling_parts_cannot_overlap_and_drain_in_sequence(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(Path(td) / "kh")}):
-            q = sc.queue_dir(); q.mkdir(parents=True)
+            q = sc.queue_dir()
+            q.mkdir(parents=True)
             base = {"harness": "aegis", "session_id": "s", "cwd": "/x", "event": "stop",
                     "ts": sc._mint_ts(), "turns": 1, "window_id": "window", "offset_before": 0,
                     "offset_after": 10, "truncated_chars": 0}
@@ -288,17 +291,20 @@ class CaptureCapaTest(unittest.TestCase):
                 first.start()
                 self.assertTrue(first_open.wait(2))
                 second = threading.Thread(target=lambda: sc.drain(limit=1))
-                second.start(); second.join(2)
+                second.start()
+                second.join(2)
                 self.assertFalse(second.is_alive())
                 self.assertNotIn("open:2/2", effects)
-                close_first.set(); first.join(2)
+                close_first.set()
+                first.join(2)
                 self.assertFalse(first.is_alive())
                 sc.drain(limit=1)
             self.assertEqual(effects, ["open:1/2", "close:1/2", "open:2/2", "close:2/2"])
 
     def test_claimed_job_counts_as_stale_queue_work(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(Path(td) / "kh")}):
-            q = sc.queue_dir(); q.mkdir(parents=True)
+            q = sc.queue_dir()
+            q.mkdir(parents=True)
             claim = q / f"job.claimed.{os.getpid()}"
             claim.write_text(json.dumps({"harness": "codex", "session_id": "s"}))
             old = time.time() - sc.QUEUE_STALE_S - 1
@@ -312,10 +318,12 @@ class CaptureCapaTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(Path(td) / "kh")}):
             started = threading.Barrier(3)
             def hook():
-                started.wait(); sc._heartbeat("codex", {"at": sc._mint_ts(), "event": "stop",
+                started.wait()
+                sc._heartbeat("codex", {"at": sc._mint_ts(), "event": "stop",
                                                         "session_id": "s", "due": False})
             def drain():
-                started.wait(); sc._record_drain("codex", captured=False, error="provider down")
+                started.wait()
+                sc._record_drain("codex", captured=False, error="provider down")
             with sc._beat_lock("codex") as acquired:
                 self.assertTrue(acquired)
                 threads = [threading.Thread(target=hook), threading.Thread(target=drain)]
@@ -329,7 +337,8 @@ class CaptureCapaTest(unittest.TestCase):
 
     def test_fresh_dead_claim_is_immediately_unhealthy(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(Path(td) / "kh")}):
-            q = sc.queue_dir(); q.mkdir(parents=True)
+            q = sc.queue_dir()
+            q.mkdir(parents=True)
             claim = q / "fresh.claimed.99999999"
             claim.write_text(json.dumps({"harness": "codex", "session_id": "s"}))
             sc._heartbeat("codex", {"at": sc._mint_ts(), "event": "stop", "session_id": "s", "due": False})
@@ -341,17 +350,20 @@ class CaptureCapaTest(unittest.TestCase):
 
     def test_scalar_and_malformed_queue_jobs_remain_visible_and_retryable(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(Path(td) / "kh")}):
-            q = sc.queue_dir(); q.mkdir(parents=True)
-            scalar = q / "scalar.json"; scalar.write_text("[]")
+            q = sc.queue_dir()
+            q.mkdir(parents=True)
+            scalar = q / "scalar.json"
+            scalar.write_text("[]")
             self.assertEqual(sc.status("aegis")["queue_depth"], 1)
             scalar.unlink()
-            malformed = q / "malformed.json"; malformed.write_text("{broken")
+            malformed = q / "malformed.json"
+            malformed.write_text("{broken")
             with mock.patch("khipu.config.capture_mode", return_value="hub"):
                 out = sc.drain()
             self.assertEqual(out["failed"], 1)
             self.assertTrue(malformed.exists())
 
-    def test_stop_hook_baseline_drains_but_fixed_hook_returns_before_provider_work(self):
+    def test_default_hook_drains_and_embeds_unless_queue_only(self):
         repo = Path(__file__).resolve().parents[3]
         with tempfile.TemporaryDirectory() as td:
             transcript = _write(Path(td) / "session.jsonl", [
@@ -360,7 +372,7 @@ class CaptureCapaTest(unittest.TestCase):
             ])
             env = {"HOME": td, "KHIPU_ROOT": str(repo), "KHIPU_PYTHON": sys.executable,
                    "KHIPU_CAPTURE_HOME": str(Path(td) / "real-queue"), "PATH": os.environ["PATH"],
-                   "KHIPU_HARNESS": "codex"}
+                   "KHIPU_HARNESS": "codex", "KHIPU_CAPTURE_QUEUE_ONLY": "1"}
             payload = json.dumps({"hookEventName": "SessionEnd", "session_id": "real", "cwd": td,
                                   "transcript_path": str(transcript)})
             fixed = subprocess.run(["sh", str(repo / "packages/cli/bin/khipu-stop-hook")], input=payload,
@@ -381,16 +393,32 @@ class CaptureCapaTest(unittest.TestCase):
                 "def queued_jobs(): return [object()]\n"
                 "def drain(): open(os.environ['DRAIN_MARKER'], 'w').write('called'); time.sleep(1); return {'captured': 1}\n"
             )
+            (package / "embed.py").write_text(
+                "import os\n"
+                "def embed_recent_missing(limit):\n"
+                " open(os.environ['EMBED_MARKER'], 'w').write(str(limit))\n"
+                " return {'embedded': 1}\n"
+            )
             env = {"HOME": td, "KHIPU_ROOT": str(root), "KHIPU_PYTHON": sys.executable,
                    "KHIPU_CAPTURE_HOME": str(Path(td) / "queue"), "PATH": os.environ["PATH"],
                    "KHIPU_HARNESS": "codex", "ENQUEUE_MARKER": str(Path(td) / "enqueue-marker"),
-                   "DRAIN_MARKER": str(Path(td) / "drain-marker")}
+                   "DRAIN_MARKER": str(Path(td) / "drain-marker"),
+                   "EMBED_MARKER": str(Path(td) / "embed-marker")}
             payload = json.dumps({"hookEventName": "Stop", "session_id": "s"})
             fixed = subprocess.run(["sh", str(repo / "packages/cli/bin/khipu-stop-hook")], input=payload,
                                    text=True, env=env, capture_output=True, timeout=5, cwd=td)
             self.assertEqual(fixed.returncode, 0)
             self.assertTrue(Path(env["ENQUEUE_MARKER"]).exists())
-            self.assertFalse(Path(env["DRAIN_MARKER"]).exists(), "fixed hook invoked provider work")
+            self.assertTrue(Path(env["DRAIN_MARKER"]).exists(), "default hook must deliver without launchd")
+            self.assertEqual(Path(env["EMBED_MARKER"]).read_text(), "5")
+            Path(env["DRAIN_MARKER"]).unlink()
+            Path(env["EMBED_MARKER"]).unlink()
+            env["KHIPU_CAPTURE_QUEUE_ONLY"] = "1"
+            queued = subprocess.run(["sh", str(repo / "packages/cli/bin/khipu-stop-hook")], input=payload,
+                                    text=True, env=env, capture_output=True, timeout=5, cwd=td)
+            self.assertEqual(queued.returncode, 0)
+            self.assertFalse(Path(env["DRAIN_MARKER"]).exists())
+            self.assertFalse(Path(env["EMBED_MARKER"]).exists())
 
             (package / "session_capture.py").write_text(
                 "import os, time\n"
@@ -406,7 +434,9 @@ class CaptureCapaTest(unittest.TestCase):
 
 class _Cursor:
     def __init__(self, row): self.row, self.statements, self.params = row, [], []
-    def execute(self, statement, params=()): self.statements.append(statement); self.params.append(params)
+    def execute(self, statement, params=()):
+        self.statements.append(statement)
+        self.params.append(params)
     def fetchone(self): return self.row
 
 

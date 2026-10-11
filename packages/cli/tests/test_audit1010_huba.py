@@ -44,7 +44,8 @@ class HubAuditRegressionTest(unittest.TestCase):
             con = sqlite3.connect(snap)
             con.executemany("INSERT INTO memory_embeddings VALUES (?, 'episode', '1', ?, 'old', NULL, ?, NULL)",
                             [(p, i, hs._vector_to_blob([1., 0.])) for p, i in [("a", 0), ("b", 0), ("b", 1)]])
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
                  mock.patch.object(hs, "meta_path", return_value=Path(tmp) / "meta.json"):
                 self.assertTrue(hs.upsert_episode({"id": 1, "summary": "alpha"}, [{"profile": "b", "kind": "episode", "ref": "1", "chunk_idx": 0, "embedding": [1., 0.]}])["ok"])
@@ -55,10 +56,12 @@ class HubAuditRegressionTest(unittest.TestCase):
 
     def test_rv3_deliverables_exclude_tombstones_and_pending_erasure(self):
         with tempfile.TemporaryDirectory() as tmp:
-            snap = self._snapshot(Path(tmp)); con = sqlite3.connect(snap)
+            snap = self._snapshot(Path(tmp))
+            con = sqlite3.connect(snap)
             con.executemany("INSERT INTO episodes (id, deleted_at, summary) VALUES (?, ?, 'alpha')", [(1, "deleted"), (2, None)])
             con.executemany("INSERT INTO deliverables (id, project, episode_id, title, kind) VALUES (?, 'p', ?, 'secret', 'file')", [(1, 1), (2, 2)])
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
                  mock.patch.object(hs, "_pending_erasure_ids", return_value={2}):
                 con = hs.open_snapshot()
@@ -69,21 +72,26 @@ class HubAuditRegressionTest(unittest.TestCase):
 
     def test_rv3_late_capture_cannot_write_tombstoned_deliverables(self):
         with tempfile.TemporaryDirectory() as tmp:
-            snap = self._snapshot(Path(tmp)); con = sqlite3.connect(snap)
+            snap = self._snapshot(Path(tmp))
+            con = sqlite3.connect(snap)
             con.execute("INSERT INTO episodes (id, deleted_at, summary) VALUES (1, 'deleted', 'alpha')")
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
                  mock.patch.object(hs, "meta_path", return_value=Path(tmp) / "meta.json"):
                 hs.upsert_episode({"id": 1, "summary": "alpha"}, [], deliverable_rows=[{"id": 1, "episode_id": 1, "project": "p", "title": "secret", "kind": "file", "created_at": "2026-10-10"}])
             con = sqlite3.connect(snap)
-            rows = con.execute("SELECT * FROM deliverables").fetchall(); con.close()
+            rows = con.execute("SELECT * FROM deliverables").fetchall()
+            con.close()
         self.assertEqual(rows, [])
 
     def test_rv3_empty_harness_uses_session_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
-            snap = self._snapshot(Path(tmp)); con = sqlite3.connect(snap)
+            snap = self._snapshot(Path(tmp))
+            con = sqlite3.connect(snap)
             con.execute("INSERT INTO episodes (id, summary, session_id, harness) VALUES (1, 'alpha', 'codex:abc', '')")
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             with mock.patch.object(hs, "snapshot_path", return_value=snap):
                 rows = hs.search_snapshot("alpha", 1, harness="codex")
         self.assertEqual([r["id"] for r in rows], ["1"])
@@ -108,18 +116,21 @@ class HubAuditRegressionTest(unittest.TestCase):
                 [(1, "2026-10-10T10:00:00Z", "alpha", "wrong", "other:1", "other"),
                  (2, "2026-10-09T10:00:00Z", "alpha", "wanted", "claude:2", "claude")],
             )
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             with mock.patch.object(hs, "snapshot_path", return_value=snap):
                 out = hs.search_snapshot("alpha", 1, project="wanted", session_id="claude", harness="claude")
         self.assertEqual([r["id"] for r in out], ["2"])
 
     def test_incremental_upsert_cannot_resurrect_tombstone_or_erase_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp); snap = self._snapshot(data)
+            data = Path(tmp)
+            snap = self._snapshot(data)
             con = sqlite3.connect(snap)
             con.execute("INSERT INTO episodes (id, summary, project, session_id, harness) VALUES (6, 'old live', 'p', 'claude:6', 'claude')")
             con.execute("INSERT INTO episodes (id, summary, project, session_id, harness, deleted_at) VALUES (7, 'old', 'p', 'claude:7', 'claude', '2026-10-01T00:00:00Z')")
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             with (mock.patch.object(hs, "snapshot_path", return_value=snap), mock.patch.object(hs, "meta_path", return_value=data / "meta.json")):
                 self.assertTrue(hs.upsert_episode({"id": 6, "summary": "new live", "project": None, "session_id": None, "harness": None}, [])["ok"])
                 self.assertTrue(hs.upsert_episode({"id": 7, "summary": "new", "project": None, "session_id": None, "harness": None}, [{"profile": "p", "kind": "episode", "ref": "7", "chunk_idx": 0, "chunk_text": "new", "embedding": [1.0, 0.0]}])["ok"])
@@ -132,9 +143,11 @@ class HubAuditRegressionTest(unittest.TestCase):
             vectors = con.execute("SELECT COUNT(*) FROM memory_embeddings WHERE ref IN ('7', '8')").fetchone()[0]
             late_deleted = con.execute("SELECT deleted_at FROM episodes WHERE id = 8").fetchone()[0]
             con.close()
-        self.assertEqual(row[:3], ("p", "claude:7", "claude")); self.assertIsNotNone(row[3])
+        self.assertEqual(row[:3], ("p", "claude:7", "claude"))
+        self.assertIsNotNone(row[3])
         self.assertEqual([item["id"] for item in found], ["6"])
-        self.assertIsNotNone(late_deleted); self.assertEqual(vectors, 0)
+        self.assertIsNotNone(late_deleted)
+        self.assertEqual(vectors, 0)
 
     def test_cached_generation_never_mixes_old_identity_with_new_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,7 +156,8 @@ class HubAuditRegressionTest(unittest.TestCase):
             con.executemany("INSERT INTO topics (slug, title, body) VALUES (?, ?, ?)",
                             [("old", "old", "old text"), ("new", "new", "new text")])
             con.execute("INSERT INTO memory_embeddings VALUES ('p', 'topic', 'old', 0, 'old text', NULL, ?, NULL)", (hs._vector_to_blob([1.0, 0.0]),))
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             hs._MATRIX_CACHE.clear()
             real_load = hs._matrix_rows
 
@@ -152,7 +166,8 @@ class HubAuditRegressionTest(unittest.TestCase):
                 con = sqlite3.connect(snap)
                 con.execute("DELETE FROM memory_embeddings")
                 con.execute("INSERT INTO memory_embeddings VALUES ('p', 'topic', 'new', 0, 'new text', NULL, ?, NULL)", (hs._vector_to_blob([1.0, 0.0]),))
-                con.commit(); con.close()
+                con.commit()
+                con.close()
                 return generation
 
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
@@ -168,7 +183,8 @@ class HubAuditRegressionTest(unittest.TestCase):
             con.execute("INSERT INTO topics (slug, title, body) VALUES ('scaled', 'scaled', 'scaled')")
             con.execute("INSERT INTO memory_embeddings VALUES ('p', 'topic', 'aligned', 0, 'aligned', NULL, ?, NULL)", (hs._vector_to_blob([1.0, 0.0]),))
             con.execute("INSERT INTO memory_embeddings VALUES ('p', 'topic', 'scaled', 0, 'scaled', NULL, ?, NULL)", (hs._vector_to_blob([2.0, 2.0]),))
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             with mock.patch.object(hs, "snapshot_path", return_value=snap):
                 hs._MATRIX_CACHE.clear()
                 out = hs.cosine_candidates_snapshot([1.0, 0.0], "p", limit=2)
@@ -190,7 +206,8 @@ class HubAuditRegressionTest(unittest.TestCase):
             snap = self._snapshot(Path(tmp))
             con = sqlite3.connect(snap)
             con.execute("INSERT INTO episodes (id, summary, raw) VALUES (8, 'safe summary', '{\"secret\": \"SENTINEL\"}')")
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             with mock.patch.object(hs, "snapshot_path", return_value=snap):
                 out = hs.episode_detail_snapshot(8)
         self.assertIsNotNone(out)
@@ -200,12 +217,14 @@ class HubAuditRegressionTest(unittest.TestCase):
 
     def test_pending_erasure_masks_locked_replica_readers_and_cached_cosine(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp); snap = self._snapshot(data)
+            data = Path(tmp)
+            snap = self._snapshot(data)
             con = sqlite3.connect(snap)
             con.execute("INSERT INTO episodes (id, summary, topics) VALUES (9, 'alpha', '[\"topic-a\"]')")
             con.execute("INSERT INTO topics (slug, title, body) VALUES ('topic-a', 'A', 'body')")
             con.execute("INSERT INTO memory_embeddings VALUES ('p', 'episode', '9', 0, 'alpha', NULL, ?, NULL)", (hs._vector_to_blob([1.0, 0.0]),))
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             with (mock.patch.object(hs, "snapshot_path", return_value=snap), mock.patch.object(hs, "_acquire_refresh_lock", return_value=None)):
                 hs.cosine_candidates_snapshot([1.0, 0.0], "p", limit=1)
                 queued = hs.forget_episode_in_snapshot(9)
@@ -217,10 +236,12 @@ class HubAuditRegressionTest(unittest.TestCase):
 
     def test_internal_refresh_evidence_survives_missing_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp); snap = self._snapshot(data)
+            data = Path(tmp)
+            snap = self._snapshot(data)
             con = sqlite3.connect(snap)
             con.execute("INSERT INTO snapshot_meta VALUES ('refreshed_at', '2026-10-10T00:00:00+00:00')")
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             with (mock.patch.object(hs, "snapshot_path", return_value=snap), mock.patch.object(hs, "meta_path", return_value=data / "missing.json")):
                 health = hs.snapshot_health()
         self.assertEqual(health["refreshed_at"], "2026-10-10T00:00:00+00:00")
@@ -244,7 +265,8 @@ class HubAuditRegressionTest(unittest.TestCase):
                 "(profile, kind, ref, chunk_idx, chunk_text, embedding) VALUES (?, 'episode', '1', 0, 'alpha', ?)",
                 ("local-model@2", hs._vector_to_blob([1.0, 0.0])),
             )
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             profiles.clear_learned()
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
                  mock.patch("khipu.db.connect", side_effect=AssertionError("hub used")), \
@@ -289,14 +311,16 @@ class HubAuditRegressionTest(unittest.TestCase):
                 "(profile, kind, ref, chunk_idx, chunk_text, embedding) VALUES (?, 'episode', '1', 0, 'alpha', ?)",
                 ("local-model@3", hs._vector_to_blob([1.0, 0.0])),
             )
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             profiles.clear_learned()
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
                  mock.patch("khipu.embed.embed_one") as embed, \
                  mock.patch.object(hs, "_cosine") as cosine:
                 with self.assertRaisesRegex(ValueError, "dimension"):
                     hs.semantic_search_snapshot("alpha", limit=1)
-        embed.assert_not_called(); cosine.assert_not_called()
+        embed.assert_not_called()
+        cosine.assert_not_called()
 
     def test_snapshot_profile_refuses_conflict_unsupported_and_missing_endpoint(self) -> None:
         cases = (
@@ -306,25 +330,29 @@ class HubAuditRegressionTest(unittest.TestCase):
         )
         for profile_id, provider, model, dim, endpoint, message in cases:
             with self.subTest(profile_id=profile_id), tempfile.TemporaryDirectory() as tmp:
-                snap = self._snapshot(Path(tmp)); con = sqlite3.connect(snap)
+                snap = self._snapshot(Path(tmp))
+                con = sqlite3.connect(snap)
                 con.execute(
                     "INSERT INTO embedding_profiles (id,provider,model,dim,normalize,is_active) VALUES (?,?,?,?, 'l2',1)",
                     (profile_id, provider, model, dim),
                 )
                 record = {"id": profile_id, "provider": provider, "model": model, "dim": dim, "normalize": "l2", "endpoint": endpoint}
                 con.execute("INSERT INTO snapshot_meta VALUES (?, ?)", (f"embedding_profile:{profile_id}", __import__("json").dumps(record)))
-                con.commit(); con.close()
+                con.commit()
+                con.close()
                 with mock.patch.object(hs, "snapshot_path", return_value=snap):
                     with self.assertRaisesRegex(ValueError, message):
                         hs.active_snapshot_profile_spec()
 
     def test_pending_erasure_masks_old_snapshot_without_deleted_column(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp); snap = data / "hub_snapshot.sqlite"
+            data = Path(tmp)
+            snap = data / "hub_snapshot.sqlite"
             con = sqlite3.connect(snap)
             con.execute("CREATE TABLE episodes (id INTEGER PRIMARY KEY, summary TEXT, raw TEXT, ingested_at TEXT, ts TEXT)")
             con.execute("INSERT INTO episodes VALUES (5, 'forgotten', '{\"project\":\"acme/khipu\"}', '2026-01-01', '2026-01-01')")
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             with mock.patch.object(hs, "snapshot_path", return_value=snap):
                 self.assertTrue(hs._queue_erasure(5, snap))
                 opened = hs.open_snapshot()
@@ -344,7 +372,9 @@ class HubAuditRegressionTest(unittest.TestCase):
 
     def test_non_object_sidecar_is_reported_unreadable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp); snap = self._snapshot(data); sidecar = data / "meta.json"
+            data = Path(tmp)
+            snap = self._snapshot(data)
+            sidecar = data / "meta.json"
             sidecar.write_text("[]", encoding="utf-8")
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
                  mock.patch.object(hs, "meta_path", return_value=sidecar):
@@ -364,9 +394,11 @@ class HubAuditRegressionTest(unittest.TestCase):
 
     def test_profile_export_keeps_endpoint_in_snapshot_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            snap = self._snapshot(Path(tmp)); con = sqlite3.connect(snap)
+            snap = self._snapshot(Path(tmp))
+            con = sqlite3.connect(snap)
             row = ("local-model@2", "openai-compatible", "local-model", 2, "l2", True, "2026-01-01", None, "http://127.0.0.1:11434")
-            cur = mock.Mock(); cur.fetchall.return_value = [row]
+            cur = mock.Mock()
+            cur.fetchall.return_value = [row]
             with mock.patch.object(hs, "_pg_columns", return_value={*hs._PROFILE_COLS, "endpoint"}):
                 self.assertEqual(hs._insert_profiles(cur, con), 1)
             saved = con.execute("SELECT value FROM snapshot_meta WHERE key = 'embedding_profile:local-model@2'").fetchone()[0]
@@ -375,7 +407,8 @@ class HubAuditRegressionTest(unittest.TestCase):
 
     def test_time_and_literal_identity_filters_precede_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            snap = self._snapshot(Path(tmp)); con = sqlite3.connect(snap)
+            snap = self._snapshot(Path(tmp))
+            con = sqlite3.connect(snap)
             for i in range(1, 7):
                 con.execute(
                     "INSERT INTO episodes (id, ts, summary, project, session_id, harness) VALUES (?, ?, 'alpha', ?, ?, 'claude')",
@@ -389,7 +422,8 @@ class HubAuditRegressionTest(unittest.TestCase):
                 con.execute("INSERT INTO nodes (id,name,built_at) VALUES (?,?,?)", (f"new:{i}", f"alpha {i}", f"2026-10-10T1{i}:00:00+00:00"))
             con.execute("INSERT INTO topics (slug,title,body,updated_at) VALUES ('old-topic','alpha old','alpha','2026-10-09T12:00:00+00:00')")
             con.execute("INSERT INTO nodes (id,name,built_at) VALUES ('old:node','alpha old','2026-10-09T12:00:00+00:00')")
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             with mock.patch.object(hs, "snapshot_path", return_value=snap):
                 out = hs.search_snapshot(
                     "alpha", 1, kind="episode", project="100%_p",
@@ -404,10 +438,12 @@ class HubAuditRegressionTest(unittest.TestCase):
 
     def test_invalid_snapshot_profile_degrades_recall_to_lexical(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            snap = self._snapshot(Path(tmp)); con = sqlite3.connect(snap)
+            snap = self._snapshot(Path(tmp))
+            con = sqlite3.connect(snap)
             con.execute("INSERT INTO embedding_profiles (id,provider,model,dim,normalize,is_active) VALUES ('local@2','openai-compatible','local',2,'l2',1)")
             con.execute("INSERT INTO episodes (id,summary) VALUES (1,'alpha lexical')")
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             from khipu import recall_prompt
 
             def fused(_prompt, **kwargs):
@@ -422,7 +458,8 @@ class HubAuditRegressionTest(unittest.TestCase):
 
     def test_weak_semantic_results_abstain_and_duplicate_chunks_collapse(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            snap = self._snapshot(Path(tmp)); con = sqlite3.connect(snap)
+            snap = self._snapshot(Path(tmp))
+            con = sqlite3.connect(snap)
             spec = {"id":"local-model@2","provider":"openai-compatible","model":"local-model","dim":2,"normalize":"l2","endpoint":"http://127.0.0.1:11434"}
             con.execute("INSERT INTO embedding_profiles (id,provider,model,dim,normalize,is_active) VALUES ('local-model@2','openai-compatible','local-model',2,'l2',1)")
             con.execute("INSERT INTO snapshot_meta VALUES (?, ?)", ("embedding_profile:local-model@2", __import__("json").dumps(spec)))
@@ -431,7 +468,9 @@ class HubAuditRegressionTest(unittest.TestCase):
             for idx in range(3):
                 con.execute("INSERT INTO memory_embeddings (profile,kind,ref,chunk_idx,chunk_text,embedding) VALUES ('local-model@2','episode','1',?, 'unrelated memory', ?)", (idx, hs._vector_to_blob([0.0, 1.0])))
             con.execute("INSERT INTO memory_embeddings (profile,kind,ref,chunk_idx,chunk_text,embedding) VALUES ('local-model@2','episode','2',0, 'second unrelated memory', ?)", (hs._vector_to_blob([0.0, 1.0]),))
-            con.commit(); con.close(); profiles.clear_learned()
+            con.commit()
+            con.close()
+            profiles.clear_learned()
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
                  mock.patch("khipu.embed.embed_one", return_value=[1.0, 0.0]), \
                  mock.patch("khipu.relevance.enabled", return_value=True):
@@ -445,13 +484,16 @@ class HubAuditRegressionTest(unittest.TestCase):
 
     def test_low_cosine_exact_keyword_is_relevance_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            snap = self._snapshot(Path(tmp)); con = sqlite3.connect(snap)
+            snap = self._snapshot(Path(tmp))
+            con = sqlite3.connect(snap)
             spec = {"id":"local-model@2","provider":"openai-compatible","model":"local-model","dim":2,"normalize":"l2","endpoint":"http://127.0.0.1:11434"}
             con.execute("INSERT INTO embedding_profiles (id,provider,model,dim,normalize,is_active) VALUES ('local-model@2','openai-compatible','local-model',2,'l2',1)")
             con.execute("INSERT INTO snapshot_meta VALUES (?, ?)", ("embedding_profile:local-model@2", json.dumps(spec)))
             con.execute("INSERT INTO episodes (id,summary) VALUES (1,'needle exact match')")
             con.execute("INSERT INTO memory_embeddings (profile,kind,ref,chunk_idx,chunk_text,embedding) VALUES ('local-model@2','episode','1',0,'needle exact match',?)", (hs._vector_to_blob([0.0, 1.0]),))
-            con.commit(); con.close(); profiles.clear_learned()
+            con.commit()
+            con.close()
+            profiles.clear_learned()
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
                  mock.patch("khipu.embed.embed_one", return_value=[1.0, 0.0]), \
                  mock.patch("khipu.relevance.enabled", return_value=True):
@@ -460,22 +502,29 @@ class HubAuditRegressionTest(unittest.TestCase):
 
     def test_missing_and_tombstoned_topic_vectors_are_excluded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            snap = self._snapshot(Path(tmp)); con = sqlite3.connect(snap)
+            snap = self._snapshot(Path(tmp))
+            con = sqlite3.connect(snap)
             spec = {"id":"local-model@2","provider":"openai-compatible","model":"local-model","dim":2,"normalize":"l2","endpoint":"http://127.0.0.1:11434"}
             con.execute("INSERT INTO embedding_profiles (id,provider,model,dim,normalize,is_active) VALUES ('local-model@2','openai-compatible','local-model',2,'l2',1)")
             con.execute("INSERT INTO snapshot_meta VALUES (?, ?)", ("embedding_profile:local-model@2", __import__("json").dumps(spec)))
             con.execute("INSERT INTO topics (slug,title,body,deleted_at) VALUES ('gone','gone','gone','2026-01-01')")
             for ref in ("gone", "missing"):
                 con.execute("INSERT INTO memory_embeddings (profile,kind,ref,chunk_idx,chunk_text,embedding) VALUES ('local-model@2','topic',?,0,?,?)", (ref, ref, hs._vector_to_blob([1.0, 0.0])))
-            con.commit(); con.close(); profiles.clear_learned(); hs._MATRIX_CACHE.clear()
+            con.commit()
+            con.close()
+            profiles.clear_learned()
+            hs._MATRIX_CACHE.clear()
             with mock.patch.object(hs, "snapshot_path", return_value=snap), mock.patch("khipu.embed.embed_one", return_value=[1.0, 0.0]):
                 semantic = hs.semantic_search_snapshot("gone", limit=5)
                 cosine = hs.cosine_candidates_snapshot([1.0, 0.0], "local-model@2", limit=5)
-        self.assertEqual(semantic, []); self.assertEqual(cosine, [])
+        self.assertEqual(semantic, [])
+        self.assertEqual(cosine, [])
 
     def test_full_snapshot_tombstoned_episode_vectors_are_excluded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp); snap = self._snapshot(data); con = sqlite3.connect(snap)
+            data = Path(tmp)
+            snap = self._snapshot(data)
+            con = sqlite3.connect(snap)
             spec = {"id":"local-model@2","provider":"openai-compatible","model":"local-model","dim":2,"normalize":"l2","endpoint":"http://127.0.0.1:11434"}
             con.execute("INSERT INTO embedding_profiles (id,provider,model,dim,normalize,is_active) VALUES ('local-model@2','openai-compatible','local-model',2,'l2',1)")
             con.execute("INSERT INTO snapshot_meta VALUES (?, ?)", ("embedding_profile:local-model@2", json.dumps(spec)))
@@ -483,7 +532,10 @@ class HubAuditRegressionTest(unittest.TestCase):
             con.execute("INSERT INTO episodes (id,summary,deleted_at) VALUES (2,'private text','2026-01-01T00:00:00+00:00')")
             con.execute("INSERT INTO memory_embeddings (profile,kind,ref,chunk_idx,chunk_text,embedding) VALUES ('local-model@2','episode','1',0,'public text',?)", (hs._vector_to_blob([1.0, 0.0]),))
             con.execute("INSERT INTO memory_embeddings (profile,kind,ref,chunk_idx,chunk_text,embedding) VALUES ('local-model@2','episode','2',0,'private text',?)", (hs._vector_to_blob([1.0, 0.0]),))
-            con.commit(); con.close(); profiles.clear_learned(); hs._MATRIX_CACHE.clear()
+            con.commit()
+            con.close()
+            profiles.clear_learned()
+            hs._MATRIX_CACHE.clear()
             self.assertFalse((data / ".hub_snapshot.pending-erasure").exists())
             with mock.patch.object(hs, "snapshot_path", return_value=snap), mock.patch("khipu.embed.embed_one", return_value=[1.0, 0.0]):
                 semantic = hs.semantic_search_snapshot("text", limit=5)
@@ -494,7 +546,9 @@ class HubAuditRegressionTest(unittest.TestCase):
 
     def test_decision_sync_pages_through_equal_timestamps_with_tuple_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp); snap = self._snapshot(data); sidecar = data / "meta.json"
+            data = Path(tmp)
+            snap = self._snapshot(data)
+            sidecar = data / "meta.json"
             columns = list(hs._DECISION_COLS)
             stamp = "2026-10-10T12:00:00+00:00"
             executed: list[tuple[str, tuple]] = []
@@ -539,11 +593,15 @@ class HubAuditRegressionTest(unittest.TestCase):
 
     def test_incremental_write_cannot_create_refresh_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp); snap = self._snapshot(data); sidecar = data / "meta.json"
+            data = Path(tmp)
+            snap = self._snapshot(data)
+            sidecar = data / "meta.json"
             old = "2020-01-01T00:00:00+00:00"
             con = sqlite3.connect(snap)
             con.execute("INSERT INTO snapshot_meta VALUES ('refreshed_at', ?)", (old,))
-            con.commit(); con.close(); sidecar.write_text("{bad", encoding="utf-8")
+            con.commit()
+            con.close()
+            sidecar.write_text("{bad", encoding="utf-8")
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
                  mock.patch.object(hs, "meta_path", return_value=sidecar), \
                  mock.patch.object(hs, "_acquire_refresh_lock", return_value=object()), \
@@ -555,8 +613,13 @@ class HubAuditRegressionTest(unittest.TestCase):
         self.assertEqual(health["refreshed_at"], old)
         self.assertGreater(health["age_seconds"], hs.SNAPSHOT_MAX_AGE_S)
         with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp); snap = data / "hub_snapshot.sqlite"; sidecar = data / "meta.json"
-            con = sqlite3.connect(snap); hs._create_schema(con, version=1); con.commit(); con.close()
+            data = Path(tmp)
+            snap = data / "hub_snapshot.sqlite"
+            sidecar = data / "meta.json"
+            con = sqlite3.connect(snap)
+            hs._create_schema(con, version=1)
+            con.commit()
+            con.close()
             sidecar.write_text("{bad", encoding="utf-8")
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
                  mock.patch.object(hs, "meta_path", return_value=sidecar), \
@@ -564,11 +627,14 @@ class HubAuditRegressionTest(unittest.TestCase):
                  mock.patch.object(hs, "_release_refresh_lock"):
                 hs.upsert_episode({"id": 2, "summary": "incremental only"}, [])
                 unknown = hs.snapshot_health()
-        self.assertFalse(unknown["ok"]); self.assertIsNone(unknown["refreshed_at"])
+        self.assertFalse(unknown["ok"])
+        self.assertIsNone(unknown["refreshed_at"])
 
     def test_refresh_forget_race_publishes_tombstone_and_masks_every_reader(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp); snap = self._snapshot(data); sidecar = data / "meta.json"
+            data = Path(tmp)
+            snap = self._snapshot(data)
+            sidecar = data / "meta.json"
 
             class Pg:
                 def __enter__(self): return self
@@ -609,18 +675,22 @@ class HubAuditRegressionTest(unittest.TestCase):
             con = sqlite3.connect(snap)
             deleted, vectors_left = con.execute("SELECT deleted_at, (SELECT COUNT(*) FROM memory_embeddings WHERE ref='41') FROM episodes WHERE id=41").fetchone()
             con.close()
-        self.assertIsNotNone(deleted); self.assertEqual(vectors_left, 0)
+        self.assertIsNotNone(deleted)
+        self.assertEqual(vectors_left, 0)
 
     def test_stale_project_slice_uses_pending_filtered_snapshot_view(self) -> None:
         from khipu import recall_rule
         with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp); snap = self._snapshot(data)
+            data = Path(tmp)
+            snap = self._snapshot(data)
             con = sqlite3.connect(snap)
             raw = '{"project":"acme/khipu"}'
             con.execute("INSERT INTO episodes (id,summary,raw,ingested_at) VALUES (1,'live',?,'2026-01-01')", (raw,))
             con.execute("INSERT INTO episodes (id,summary,raw,ingested_at) VALUES (2,'forgotten',?,'2026-01-02')", (raw,))
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             with mock.patch.object(hs, "snapshot_path", return_value=snap):
                 hs._queue_erasure(2, snap)
                 out = recall_rule._stale_project_slice("acme/khipu", None)
-        self.assertIn("live", out); self.assertNotIn("forgotten", out)
+        self.assertIn("live", out)
+        self.assertNotIn("forgotten", out)

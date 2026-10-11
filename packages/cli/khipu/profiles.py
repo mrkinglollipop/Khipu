@@ -278,6 +278,8 @@ def _index_status(cur, profile: str, dim: int, spaces: dict[str, int], present: 
         legacy = _LEGACY_INDEX.get((table, profile))
         if name in present and (not legacy or _legacy_index_matches(cur, profile, table, dim)):
             out[space] = "present"
+        elif _previous_profile_index_is_valid(cur, profile, table, dim, present=present):
+            out[space] = "present"
         elif name in present and legacy:
             out[space] = "missing (legacy index definition is invalid; rebuild it)"
         elif dim > MAX_INDEXED_DIM:
@@ -324,6 +326,20 @@ def previous_profile_index_name(profile: str, table: str = "library_embeddings")
     if len(name) > 60 or not _ID_RE.match(profile):
         name = f"{name[:50]}_{hashlib.sha1(profile.encode()).hexdigest()[:9]}"
     return _LEGACY_INDEX.get((table, profile), name)
+
+
+def _previous_profile_index_is_valid(
+    cur, profile: str, table: str, dim: int, *, present: set[str] | None = None,
+) -> bool:
+    """A pre-hash index is reusable only when it still has this exact shape."""
+    old_name = previous_profile_index_name(profile, table)
+    if old_name == profile_index_name(profile, table):
+        return False
+    if present is not None and old_name not in present:
+        return False
+    return index_definition_matches(
+        profile, table, dim, _legacy_indexdef(cur, old_name),
+    )
 
 
 def _legacy_indexdef(cur, name: str) -> str | None:
@@ -430,6 +446,8 @@ def ensure_profile_index(
     )
     if cur.fetchone():
         return name
+    if _previous_profile_index_is_valid(cur, profile, table, dim):
+        return previous_profile_index_name(profile, table)
     literal = profile.replace("'", "''")
     # An HNSW build over a large table needs its graph in memory or it crawls
     # (pgvector logs "graph no longer fits into maintenance_work_mem"); a hub's
@@ -479,8 +497,17 @@ def drop_profile_index(cur, profile: str, table: str) -> str | None:
     cur.execute(
         "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = %s", (name,)
     )
-    if not cur.fetchone():
-        return None
+    current_exists = bool(cur.fetchone())
+    spec = cached_spec(profile) or load_spec(cur, profile)
+    dim = spec.dim if spec is not None else 0
+    old_exists = _previous_profile_index_is_valid(cur, profile, table, dim)
+    if current_exists:
+        if old_exists:
+            _drop_index_quiet(cur, previous_profile_index_name(profile, table))
+    else:
+        if not old_exists:
+            return None
+        name = previous_profile_index_name(profile, table)
     return name if _drop_index_quiet(cur, name) else None
 
 
@@ -657,8 +684,13 @@ def delete_profile(cur, profile: str) -> dict[str, Any]:
         name = profile_index_name(profile, table)
         if (table, profile) in _LEGACY_INDEX and not _legacy_index_matches(cur, profile, table, spec.dim):
             continue
-        indexes.append(name)
-        _drop_index_quiet(cur, name)
+        names = [name]
+        old_name = previous_profile_index_name(profile, table)
+        if old_name != name and _previous_profile_index_is_valid(cur, profile, table, spec.dim):
+            names.append(old_name)
+        for index_name in names:
+            indexes.append(index_name)
+            _drop_index_quiet(cur, index_name)
     cur.execute("DELETE FROM embedding_profiles WHERE id = %s", (profile,))
     with _LOCK:
         _LEARNED.pop(profile, None)

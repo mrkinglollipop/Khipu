@@ -98,9 +98,26 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
                 original = {
                     "ts": original_ts,
                     "summary_md5": hashlib.md5(original_summary.encode("utf-8")).hexdigest(),
+                    "source": raw,
                 }
-                if original not in legacy_identities:
+                legacy_identities[0]["source"] = {**raw, "ts": legacy_identities[0]["ts"],
+                                                  "summary": summary}
+                if any(original[key] != legacy_identities[0][key] for key in ("ts", "summary_md5")):
                     legacy_identities.append(original)
+            sources = list(raw.get("merged_from") or [])
+            while sources:
+                merged = sources.pop()
+                source = merged.get("payload") if isinstance(merged, dict) else None
+                if not isinstance(source, dict):
+                    continue
+                sources.extend(source.get("merged_from") or [])
+                source_ts, source_summary = source.get("ts"), source.get("summary")
+                if isinstance(source_ts, str) and isinstance(source_summary, str) and source_summary:
+                    identity = {"ts": source_ts,
+                                "summary_md5": hashlib.md5(source_summary.encode("utf-8")).hexdigest(),
+                                "source": source}
+                    if identity not in legacy_identities:
+                        legacy_identities.append(identity)
     except Exception:  # noqa: BLE001 — old schema/driver must still forget the hub row
         pass
     cur.execute(
@@ -166,7 +183,7 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
     }
 
 
-def _line_matches(line: str, ts_iso: str, summary_md5: str) -> bool:
+def _line_matches(line: str, ts_iso: str, summary_md5: str, source: dict[str, Any] | None = None) -> bool:
     try:
         obj = json.loads(line)
     except ValueError:
@@ -182,7 +199,22 @@ def _line_matches(line: str, ts_iso: str, summary_md5: str) -> bool:
     # after normalising the zone suffix.
     a = raw_ts.replace("Z", "+00:00")[:19]
     b = ts_iso.replace("Z", "+00:00")[:19]
-    return a == b
+    if a != b:
+        return False
+    if source is not None:
+        from khipu.outbox import _source_matches
+
+        return _source_matches(obj, source) is True
+    return True
+
+
+def _ambiguous_lines(lines: list[str], ts_iso: str, summary_md5: str, source: dict[str, Any] | None) -> bool:
+    if source is None:
+        return False
+    from khipu.outbox import _source_matches
+
+    return any(_line_matches(line, ts_iso, summary_md5)
+               and _source_matches(json.loads(line), source) is None for line in lines)
 
 
 def _has_unidentified_records(lines: list[str]) -> bool:
@@ -198,7 +230,8 @@ def _has_unidentified_records(lines: list[str]) -> bool:
     return False
 
 
-def _scrub_retained_backups(memory_root: Path, ts_iso: str, summary_md5: str) -> dict[str, Any]:
+def _scrub_retained_backups(memory_root: Path, ts_iso: str, summary_md5: str,
+                          source: dict[str, Any] | None = None) -> dict[str, Any]:
     """Remove a forgotten line from every retained legacy backup.
 
     A backup made while forgetting one of two identities can contain the
@@ -214,8 +247,8 @@ def _scrub_retained_backups(memory_root: Path, ts_iso: str, summary_md5: str) ->
             continue
         try:
             lines = backup.read_text(encoding="utf-8").splitlines(keepends=True)
-            keep = [line for line in lines if not _line_matches(line, ts_iso, summary_md5)]
-            if _has_unidentified_records(keep):
+            keep = [line for line in lines if not _line_matches(line, ts_iso, summary_md5, source)]
+            if _has_unidentified_records(keep) or _ambiguous_lines(keep, ts_iso, summary_md5, source):
                 remaining.append(f"{backup}: unidentified legacy records")
             if len(keep) == len(lines):
                 continue
@@ -230,7 +263,8 @@ def _scrub_retained_backups(memory_root: Path, ts_iso: str, summary_md5: str) ->
     return {"ok": not remaining, "removed": removed, "remaining": remaining}
 
 
-def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: str) -> dict[str, Any]:
+def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: str,
+                         *, source: dict[str, Any] | None = None) -> dict[str, Any]:
     """Remove matching lines from the legacy file and retained backups.
     A rewrite preserves a backup containing only the remaining records."""
     identity = {"ts": ts_iso, "summary_md5": summary_md5}
@@ -238,7 +272,7 @@ def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: st
         return {"file": None, "removed": 0, "reason": "memory_root not configured", "identity": identity,
                 "backups": {"ok": True, "removed": 0, "remaining": []}}
     path = Path(memory_root) / "episodes.jsonl"
-    backups = _scrub_retained_backups(Path(memory_root), ts_iso, summary_md5)
+    backups = _scrub_retained_backups(Path(memory_root), ts_iso, summary_md5, source)
     if not path.is_file():
         return {"file": str(path), "removed": 0, "reason": "no legacy file", "identity": identity,
                 "backups": backups}
@@ -247,8 +281,9 @@ def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: st
     except (OSError, UnicodeError) as exc:
         return {"file": str(path), "removed": 0, "reason": f"unreadable: {exc}", "identity": identity,
                 "backups": backups}
-    keep = [ln for ln in lines if not _line_matches(ln, ts_iso, summary_md5)]
-    reason = {"reason": "unreadable legacy identities remain"} if _has_unidentified_records(keep) else {}
+    keep = [ln for ln in lines if not _line_matches(ln, ts_iso, summary_md5, source)]
+    unidentified = _has_unidentified_records(keep) or _ambiguous_lines(keep, ts_iso, summary_md5, source)
+    reason = {"reason": "unreadable legacy identities remain"} if unidentified else {}
     removed = len(lines) - len(keep)
     if not removed:
         return {"file": str(path), "removed": 0, "identity": identity, "backups": backups, **reason}
@@ -270,7 +305,7 @@ def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: st
         tmp = path.with_suffix(".jsonl.tmp")
         write_sensitive_bytes(tmp, "".join(keep).encode("utf-8"))
         tmp.replace(path)
-        backups = _scrub_retained_backups(Path(memory_root), ts_iso, summary_md5)
+        backups = _scrub_retained_backups(Path(memory_root), ts_iso, summary_md5, source)
     except (OSError, UnicodeError) as exc:
         return {"file": str(path), "removed": 0, "reason": f"rewrite failed: {exc}", "identity": identity,
                 "backups": {"ok": False, "removed": 0, "remaining": [str(path)]}}
@@ -278,12 +313,12 @@ def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: st
             "backups": backups, **reason}
 
 
-def forget_from_outbox(ts_iso: str, summary_md5: str) -> dict[str, Any]:
+def forget_from_outbox(ts_iso: str, summary_md5: str, *, source: dict[str, Any] | None = None) -> dict[str, Any]:
     """Erase replayable queued/dead copies that could otherwise restore it."""
     try:
         from khipu.outbox import forget_identity
 
-        return forget_identity(ts_iso, summary_md5)
+        return forget_identity(ts_iso, summary_md5, source=source)
     except Exception as exc:  # noqa: BLE001 — surface an incomplete forget
         return {"ok": False, "removed": 0, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -321,7 +356,8 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
             root_resolved = False
     identities = out.get("legacy_identities") or [out.get("identity") or {}]
     out["legacy_files"] = [
-        forget_in_legacy_file(memory_root, ident.get("ts", ""), ident.get("summary_md5", ""))
+        forget_in_legacy_file(memory_root, ident.get("ts", ""), ident.get("summary_md5", ""),
+                              source=ident.get("source"))
         for ident in identities
     ]
     out["legacy_file"] = out["legacy_files"][0]
@@ -331,7 +367,7 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
     if any(not item.get("backups", {}).get("ok", True) for item in out["legacy_files"]):
         partial.append("legacy_backups")
     out["outboxes"] = [
-        forget_from_outbox(ident.get("ts", ""), ident.get("summary_md5", ""))
+        forget_from_outbox(ident.get("ts", ""), ident.get("summary_md5", ""), source=ident.get("source"))
         for ident in identities
     ]
     out["outbox"] = {"ok": all(item.get("ok") for item in out["outboxes"]),
@@ -348,6 +384,8 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
                    for item in out["outboxes"] if item.get("error") or item.get("remaining")],
     }
     out["partial_errors"] = {key: value for key, value in out["partial_errors"].items() if value}
+    for ident in identities:
+        ident.pop("source", None)
     out["ok"] = out["complete"]
     if partial:
         out["error"] = "forget incomplete; remaining stores: " + ", ".join(partial)

@@ -382,12 +382,13 @@ class RecallService:
             req = json.loads(line.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return {"error": "malformed request"}
+        raw = req.get("raw", "") if isinstance(req, dict) else ""
+        raw = raw if isinstance(raw, str) else ""
         try:
             last = self._admit(refuse_stale=isinstance(req, dict) and req.get("op") == "recall")
         except _Refused:
             from khipu import recall_prompt
-            recall_prompt.log_terminal_outcome(req.get("raw", "") if isinstance(req, dict) else "",
-                                               "error: daemon restarting")
+            recall_prompt.log_terminal_outcome(raw, "error: daemon restarting")
             return {"ok": False, "error": "restarting"}
         try:
             answer = self.dispatch(req, delivery)
@@ -396,12 +397,12 @@ class RecallService:
                 reason = answer["error"]
                 if not reason.startswith(("error:", "timeout>")):
                     reason = f"error: {reason}"
-                recall_prompt.log_terminal_outcome(req.get("raw", ""), reason)
+                recall_prompt.log_terminal_outcome(raw, reason)
             return answer
         except Exception as exc:  # noqa: BLE001 — dispatch handles its own; this is the backstop
             _log(f"request raised: {type(exc).__name__}: {exc}")
             from khipu import recall_prompt
-            recall_prompt.log_terminal_outcome(req.get("raw", ""), f"error: dispatch crashed: {type(exc).__name__}")
+            recall_prompt.log_terminal_outcome(raw, f"error: dispatch crashed: {type(exc).__name__}")
             return {"ok": False, "error": "dispatch failed"}
         finally:
             if last:

@@ -926,7 +926,7 @@ def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
     if mode == "hub" and os.environ.get("KHIPU_HUB_FILE_MIRROR", "1").strip().lower() in {"0", "false", "off"}:
         return 0
     rc = run_capture_v2(payload, suppress_mirror=True)
-    return 0 if mode == "hub" else rc
+    return rc
 
 
 def main(argv: list[str] | None = None) -> int:

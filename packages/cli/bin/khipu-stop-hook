@@ -81,8 +81,7 @@ PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
 [ -x "$PY" ] || PY="python3"
 STDIN_JSON=$(cat 2>/dev/null)
 export KHIPU_HOOK_STDIN="$STDIN_JSON"
-# Hooks always run step 1 only. Codex gets a 3 s enqueue deadline; other
-# harnesses get 20 s. launchd drains the durable queue outside hook budgets.
+# Queue-only mode leaves delivery to the next draining Stop or scheduled job.
 "$PY" - "$MEM" "${KHIPU_HARNESS:-}" <<'PY' 2>>"${HOME}/Library/Logs/khipu/stop-hook.log" || true
 import json
 import os
@@ -91,9 +90,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-# Ordinary harness hooks are enqueue-only. launchd drains the shared queue;
-# provider, database, mirror and embedding work never runs in a hook budget.
-QUEUE_ONLY = True
+QUEUE_ONLY = os.environ.get("KHIPU_CAPTURE_QUEUE_ONLY") == "1"
 tag = f" harness={sys.argv[2]}" if len(sys.argv) > 2 and sys.argv[2] else ""
 _default_budget = 3.0 if len(sys.argv) > 2 and sys.argv[2] == "codex" else 20.0
 try:

@@ -59,6 +59,19 @@ def _req(path: Path, obj: dict, **kw) -> dict:
     return _ask(path, json.dumps(obj).encode("utf-8") + b"\n", **kw)
 
 
+class ValidationWithoutSocketTest(unittest.TestCase):
+    def test_invalid_raw_is_answered_without_crashing_terminal_logging(self):
+        service = RecallService(Path("unused.sock"), stamp_fn=lambda: "fixed")
+        with mock.patch("khipu.recall_prompt._log"), \
+             mock.patch("khipu.recall_prompt.hook_main") as handler:
+            for raw in (5, None, [], {}):
+                with self.subTest(raw=raw):
+                    answer = service._answer(json.dumps({"op": "recall", "raw": raw}).encode())
+                    self.assertFalse(answer["ok"])
+                    self.assertEqual(answer["error"], "raw must be a string")
+        handler.assert_not_called()
+
+
 class _Running:
     """A bound service running its accept loop on a thread."""
 

@@ -315,6 +315,41 @@ class LibraryIndexTest(unittest.TestCase):
         self.assertLessEqual(len(name), 63)
         self.assertNotEqual(name, profiles.library_index_name("a" * 91 + "@1024"))
 
+    def test_a_valid_pre_hash_index_is_reused_instead_of_creating_a_twin(self):
+        profile, table, dim = "custom-model@8", "library_embeddings", 8
+        profiles.register_spec(ProfileSpec(profile, "voyage", "custom-model", dim))
+        self.addCleanup(profiles.clear_learned)
+        old_name = profiles.previous_profile_index_name(profile, table)
+        definition = (
+            f"CREATE INDEX {old_name} ON public.{table} USING hnsw "
+            f"((embedding::vector({dim})) vector_cosine_ops) WHERE profile = '{profile}'"
+        )
+        cur = mock.Mock()
+
+        def execute(sql, params=()):
+            if "SELECT indexdef" in sql:
+                cur.fetchone.return_value = (definition,) if params[0] == old_name else None
+            elif "SELECT 1 FROM pg_indexes" in sql:
+                cur.fetchone.return_value = (1,) if params[0] == old_name else None
+
+        cur.execute.side_effect = execute
+        self.assertEqual(profiles.ensure_profile_index(cur, profile, table, dim=dim), old_name)
+        self.assertFalse(self._ddl(cur))
+        self.assertEqual(profiles.drop_profile_index(cur, profile, table), old_name)
+        listed = FakeCur(
+            rows={profile: ("voyage", "custom-model", dim, "l2", None)},
+            counts={(table, profile): 1}, indexes=[old_name],
+        )
+        with mock.patch.object(profiles, "_legacy_indexdef", return_value=definition):
+            self.assertEqual(profiles.list_profiles(listed)[0]["index"], {"library": "present"})
+        spec = ProfileSpec(profile, "voyage", "custom-model", dim)
+        with mock.patch.object(profiles, "load_spec", return_value=spec), \
+                mock.patch.object(profiles, "profile_users", return_value=[]), \
+                mock.patch.object(profiles, "_to_regclass", return_value=False), \
+                mock.patch.object(profiles, "_drop_index_quiet", return_value=True) as drop:
+            profiles.delete_profile(cur, profile)
+        self.assertIn(old_name, [call.args[1] for call in drop.call_args_list])
+
 
 class BulkLoadTest(unittest.TestCase):
     """drop_profile_index and BulkLoad: DDL order recorded by a fake cursor."""

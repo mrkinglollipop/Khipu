@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -54,7 +53,7 @@ class _Cursor:
         elif upper.startswith("SELECT COUNT(*)"):
             table = statement.split('"')[1]
             self.rows = [(self.db.counts.get(table, 0),)]
-        elif upper.startswith("SELECT ID, PROVIDER, MODEL, DIM, NORMALIZE, IS_ACTIVE, NOTE FROM EMBEDDING_PROFILES"):
+        elif upper.startswith("SELECT ID, PROVIDER, MODEL, DIM, NORMALIZE, IS_ACTIVE, NOTE, ENDPOINT FROM EMBEDDING_PROFILES"):
             self.rows = self.db.profiles
         elif "INFORMATION_SCHEMA.COLUMNS" in upper:
             self.rows = []
@@ -106,12 +105,21 @@ _PREFLIGHT = {"ok": True, "stages": [{"id": key, "ok": True} for key in ("reach"
 
 
 class DbMoveSafetyTest(unittest.TestCase):
+    def test_custom_bootstrap_endpoint_requires_nonempty_override(self):
+        profile = next(iter(dbmove._BOOTSTRAP_EMBEDDING_PROFILES))[:7]
+        cur = mock.Mock()
+        cur.fetchall.side_effect = lambda: [
+            (*profile, "http://custom.invalid/embeddings")
+            if "endpoint" in cur.execute.call_args.args[0] else profile
+        ]
+        self.assertTrue(dbmove._target_has_user_data(cur, "embedding_profiles", 1))
+
     def test_rv4_04_fresh_migration_profiles_allow_move(self):
         profiles = [
             ("gemini-embedding-001@768", "gemini", "gemini-embedding-001", 768, "l2", True,
-             "P1 lock (plan.md Models/LLM); cloud default through P3, local is P4"),
+             "P1 lock (plan.md Models/LLM); cloud default through P3, local is P4", None),
             ("gemini-embedding-2@768", "gemini", "gemini-embedding-2", 768, "l2", False,
-             "Gemini Embedding 2 @768; task prefixes at API time; activate after full memory backfill"),
+             "Gemini Embedding 2 @768; task prefixes at API time; activate after full memory backfill", None),
         ]
         source = _DB(["embedding_profiles", "episodes"], {"embedding_profiles": 2, "episodes": 1})
         target = _DB(source.tables, {"embedding_profiles": 2, "episodes": 0})
@@ -119,7 +127,7 @@ class DbMoveSafetyTest(unittest.TestCase):
         result, _, _ = self._move(source, target, dry_run=True)
         self.assertTrue(result["ok"], result)
         self.assertEqual(target.counts["embedding_profiles"], 2)
-        for column in range(7):
+        for column in range(8):
             with self.subTest(column=column):
                 modified = list(profiles[0])
                 modified[column] = "custom"

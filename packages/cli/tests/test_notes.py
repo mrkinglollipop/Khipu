@@ -534,6 +534,34 @@ class TombstoneMissingNotesTest(unittest.TestCase):
         self.assertEqual(cur.topics["note:n0"]["deleted_at"], "tombstoned")
 
 
+class CollisionRedirectInventoryTest(unittest.TestCase):
+    def test_removed_collision_source_is_not_left_in_the_bare_redirect(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as data_td:
+            claude_root = Path(td) / "claude_projects"
+            gone = _write(claude_root / "-repo-a" / "memory" / "one.md", _sample_note_text())
+            live = _write(
+                claude_root / "-repo-b" / "memory" / "two.md",
+                _sample_note_text().replace("Khipu's", "Other project's"),
+            )
+            cur = _FakeTopicsCursor()
+            with mock.patch.object(notes, "claude_projects_root", return_value=claude_root), \
+                    mock.patch.object(notes, "codex_memories_root", return_value=Path(td) / "no-codex"), \
+                    mock.patch.object(notes, "_project_for_slug", side_effect=lambda s: f"acme/{s[-1]}"), \
+                    mock.patch("khipu.paths.ensure_data_dir", return_value=Path(data_td)), \
+                    mock.patch("khipu.db.connect", return_value=_FakeConn(cur)) as connect, \
+                    mock.patch("khipu.mirror.persist_topic_graph", return_value={
+                        "nodes_minted": 0, "edges_minted": 0}):
+                notes.reconcile()
+                gone.unlink()
+                notes.reconcile(changed_only=True)
+                notes.reconcile(changed_only=True)
+        redirect = cur.topics["note:khipu-state-of-play"]
+        self.assertEqual(redirect["links"], ["note:b/khipu-state-of-play"])
+        self.assertEqual(redirect["source_path"], str(live))
+        self.assertIsNone(redirect["deleted_at"])
+        self.assertEqual(connect.call_count, 2)
+
+
 class EventAtNeverNowTest(unittest.TestCase):
     """R7: event_at is the note's own signal — frontmatter modified, else
     metadata.modified, else the file's mtime — never now()."""

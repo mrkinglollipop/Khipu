@@ -19,8 +19,8 @@ Contract:
   * ``status()`` is what ``khipu doctor`` reports; **pending > 0 makes doctor
     red** — a queued job is, by definition, something PG does not yet have.
 
-Drain points: scheduled/manual session drains (including empty session queues),
-nightly session drains, and ``khipu outbox drain``. Hooks only enqueue.
+Drain points: Stop hooks unless queue-only, scheduled/manual session drains
+(including empty session queues), nightly drains, and ``khipu outbox drain``.
 Aegis's own hook cannot reach this directory (its sandbox denies ~/.config);
 Aegis captures go through ``khipu aegis drain`` → ``capture()``, which is where
 the outbox catches a PG failure for them.
@@ -341,8 +341,21 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
         os.close(fd)
 
 
-def forget_identity(ts: str, summary_md5: str) -> dict[str, Any]:
-    """Remove queued/dead copies of a forgotten capture by the same identity."""
+def _source_matches(payload: dict[str, Any], source: dict[str, Any] | None) -> bool | None:
+    if source is None:
+        return None
+    evidence = {key: value for key, value in payload.items() if key != "ts"}
+    expected = {key: value for key, value in source.items() if key not in {"ts", "merged_from"}}
+    if evidence == expected:
+        return True
+    if any(key in expected and key in evidence and evidence[key] != expected[key]
+           for key in ("session_id", "harness", "project", "transcript_range", "window_id", "part")):
+        return False
+    return None
+
+
+def forget_identity(ts: str, summary_md5: str, *, source: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Remove copies only when the episode's source evidence identifies them."""
     target = _identity({"ts": ts, "summary": ""})
     target = f"{target.rsplit('-', 1)[0]}-{summary_md5[:10]}"
     removed = 0
@@ -363,6 +376,11 @@ def forget_identity(ts: str, summary_md5: str) -> dict[str, Any]:
                     remaining.append(f"{jp}: {type(exc).__name__}")
                     continue
                 if _identity(payload) == target:
+                    match = _source_matches(payload, source)
+                    if match is not True:
+                        if match is None:
+                            remaining.append(f"{jp}: ambiguous source evidence")
+                        continue
                     jp.unlink(missing_ok=True)
                     removed += 1
     return {"ok": not remaining, "removed": removed, "remaining": remaining}

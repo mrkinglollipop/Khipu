@@ -214,10 +214,10 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual(result["action"], "skip")
         self.assertEqual(result["matched_episode"], 1)
 
-    def test_hub_optional_mirror_failure_does_not_negate_commit(self):
+    def test_hub_enabled_mirror_failure_requires_retry(self):
         with mock.patch.object(cap, "write_pg", return_value={"episode_inserted": False, "topics_written": 0}), \
                 mock.patch.object(cap, "run_capture_v2", return_value=70):
-            self.assertEqual(cap.capture(episode(), mode="hub"), 0)
+            self.assertEqual(cap.capture(episode(), mode="hub"), 70)
 
     def test_alias_is_canonicalized_before_episode_insert(self):
         cur = Cursor({})

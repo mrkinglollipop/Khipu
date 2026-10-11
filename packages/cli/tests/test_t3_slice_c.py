@@ -212,6 +212,8 @@ def test_replica_filters_before_candidate_limit(replica, filters, ids):
     from khipu.profiles import ProfileSpec
     spec = ProfileSpec('test', 'openai-compatible', 'test', 2, endpoint='http://127.0.0.1:9999')
     with mock.patch.object(hs, 'active_snapshot_profile_spec', return_value=spec), \
+         mock.patch('khipu.models.show_models', return_value={'embed': {
+             'provider': 'local', 'model_id': 'test', 'endpoint': spec.endpoint}}), \
          mock.patch('khipu.embed.embed_one', return_value=[1.,0.]):
         assert {r['id'] for r in hs.semantic_search_snapshot('recall', limit=5, **filters)} == ids
 
@@ -436,6 +438,8 @@ def test_stale_semantic_graph_respects_thread(replica):
     from khipu.profiles import ProfileSpec
     spec = ProfileSpec('test', 'openai-compatible', 'test', 2, endpoint='http://127.0.0.1:9999')
     with mock.patch.object(hs,'active_snapshot_profile_spec',return_value=spec), \
+         mock.patch('khipu.models.show_models', return_value={'embed': {
+             'provider': 'local', 'model_id': 'test', 'endpoint': spec.endpoint}}), \
          mock.patch('khipu.embed.embed_one',return_value=[1.,0.]), \
          mock.patch.object(hs,'_graph_candidates_snapshot',side_effect=graph):
         out=hs.search_stale_payload('recall',5,semantic=True,t3_thread=THREAD,via='t3')

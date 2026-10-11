@@ -217,8 +217,14 @@ class DrainTest(unittest.TestCase):
                     mock.patch("khipu.capture.capture", lambda p, mode=None: captured.append(p) or 0), \
                     mock.patch("khipu.config.capture_mode", lambda: "dual"):
                 out = ac.drain()
-            self.assertEqual((out["captured"], out["empty"], out["failed"]), (1, 0, 2))
-            self.assertEqual(len(ac.queued_jobs()), 2)             # no extraction result loses source evidence
+            self.assertEqual((out["captured"], out["empty"], out["failed"]), (1, 1, 1))
+            self.assertEqual(len(ac.queued_jobs()), 1)
+            self.assertEqual(json.loads(ac.queued_jobs()[0].read_text())["session_id"], "boom")
+            archived = list((ac.khipu_home() / "empty").glob("*.json"))
+            self.assertEqual(len(archived), 1)
+            empty = json.loads(archived[0].read_text())
+            self.assertEqual((empty["session_id"], empty["disposition"], empty["transcript"]),
+                             ("empty", "empty", "USER: empty"))
             self.assertEqual(captured[0]["session_id"], "aegis:good")
             self.assertTrue(captured[0]["ts"].endswith("Z"))
 

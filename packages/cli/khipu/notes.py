@@ -557,6 +557,35 @@ def _redirect_topic_dict(old_slug: str, new_slugs: list[str]) -> dict[str, Any]:
     }
 
 
+def _redirects_from_inventory(
+    plan: list[dict[str, Any]], files_state: dict[str, Any], report: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Keep bare collision redirects aligned with persisted, live note identities."""
+    redirects: dict[str, dict[str, Any]] = {}
+    for redirect in report["redirects"]:
+        redirects[redirect["old_slug"]] = {"new_slugs": set(), "source_paths": [], "stale_paths": []}
+    for path, record in files_state.items():
+        base_slug, slug = record.get("base_slug"), record.get("slug")
+        if base_slug and slug and slug != base_slug:
+            data = redirects.setdefault(base_slug, {"new_slugs": set(), "source_paths": [], "stale_paths": []})
+            if Path(path).is_file():
+                data["new_slugs"].add(slug)
+                data["source_paths"].append(path)
+            else:
+                data["stale_paths"].append(path)
+    for item in plan:
+        base_slug, slug = item["base_slug"], item["parsed"]["slug"]
+        if slug != base_slug:
+            data = redirects.setdefault(base_slug, {"new_slugs": set(), "source_paths": [], "stale_paths": []})
+            data["new_slugs"].add(slug)
+            data["source_paths"].append(item["path"])
+    return [
+        {"old_slug": old_slug, "new_slugs": sorted(data["new_slugs"]),
+         "source_path": sorted(data["source_paths"])[0], "stale_paths": data["stale_paths"]}
+        for old_slug, data in redirects.items() if data["new_slugs"] and data["source_paths"]
+    ]
+
+
 def _tombstone_missing_notes(cur) -> dict[str, Any]:
     """F5: mark a ``note:`` topic ``deleted_at = now()`` when its
     ``source_path`` file no longer exists. Circuit-broken the same way the
@@ -637,14 +666,18 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
             item["parsed"]["slug"] = prev["slug"]
     if len({item["parsed"]["slug"] for item in plan}) != len(plan):
         raise ValueError("persisted note identities collide; refusing to reconcile")
-    for redirect in collision_report["redirects"]:
-        redirect["new_slugs"] = sorted(item["parsed"]["slug"] for item in plan if item["base_slug"] == redirect["old_slug"])
+    collision_report["redirects"] = _redirects_from_inventory(
+        plan, files_state, collision_report,
+    )
     inventory = plan
     if changed_only:
         plan = [item for item in plan if item["signature"] != {k: files_state.get(item["path"], {}).get(k) for k in ("mtime", "size")}
                 or item["parsed"]["slug"] != files_state.get(item["path"], {}).get("slug")]
         changed_slugs = {item["parsed"]["slug"] for item in plan}
-        collision_report["redirects"] = [r for r in collision_report["redirects"] if changed_slugs.intersection(r["new_slugs"])]
+        collision_report["redirects"] = [
+            r for r in collision_report["redirects"]
+            if changed_slugs.intersection(r["new_slugs"]) or r["stale_paths"]
+        ]
     out: dict[str, Any] = {
         "ok": True,
         "dry_run": dry_run,
@@ -661,7 +694,7 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
     if dry_run:
         return out
     run_tombstone = (not changed_only) and _any_memory_root_exists()
-    if not plan and not run_tombstone:
+    if not plan and not run_tombstone and not collision_report["redirects"]:
         if changed_only:
             _write_state({
                 "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
@@ -707,6 +740,8 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
                             cur, redirect_parsed, redirect["source_path"],
                             source="notes-reconcile", note="slug collision redirect (G3)",
                         )
+                    for path in redirect["stale_paths"]:
+                        new_files_state.pop(path, None)
                 except Exception as exc:  # noqa: BLE001 — a redirect failure must not sink the batch
                     for item in inventory:
                         if item["parsed"]["slug"] in redirect["new_slugs"]:

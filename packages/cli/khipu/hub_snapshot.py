@@ -246,7 +246,8 @@ def _write_meta(data: Mapping[str, Any]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2)
-            fh.flush(); os.fsync(fh.fileno())
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(name, dest)
     finally:
         Path(name).unlink(missing_ok=True)

@@ -121,8 +121,10 @@ class QueryIdentityTest(unittest.TestCase):
             def __init__(self, cached): self.cached, self.query = cached, ""
             def execute(self, sql, params=None): self.query = " ".join(sql.split())
             def fetchone(self):
-                if "to_regclass" in self.query: return (True,)
-                if "SELECT embedding::text" in self.query: return (self.cached,)
+                if "to_regclass" in self.query:
+                    return (True,)
+                if "SELECT embedding::text" in self.query:
+                    return (self.cached,)
                 return None
         class Conn:
             def commit(self): pass
@@ -554,7 +556,8 @@ class MediaLimitTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = [root / "a.png", root / "b.png"]
-            for i, path in enumerate(paths): path.write_bytes(f"png-{i}".encode())
+            for i, path in enumerate(paths):
+                path.write_bytes(f"png-{i}".encode())
             state, flushed = {}, []
             cur = mock.MagicMock()
             cur.__enter__.return_value = cur
@@ -568,7 +571,9 @@ class MediaLimitTest(unittest.TestCase):
                 return {("media", rel, 0): sha for rel, sha in state.items() if rel != "last"}
             def flush(_cur, _profile, batch, stats):
                 for _sid, _path, rel, _mime, sha, _raw in batch:
-                    state[rel] = sha; flushed.append(rel); stats["embedded"] += 1
+                    state[rel] = sha
+                    flushed.append(rel)
+                    stats["embedded"] += 1
             conn = _Conn(cur)
             patches = (
                 mock.patch("khipu.db.connect", return_value=conn),
@@ -600,7 +605,9 @@ class SearchValidityTest(unittest.TestCase):
 
     def test_cosine_shortlist_requires_live_episode_and_topic_sources(self) -> None:
         class Cur:
-            def __init__(self): self.sql = ""; self.result = []
+            def __init__(self):
+                self.sql = ""
+                self.result = []
             def execute(self, sql, params=None):
                 self.sql = " ".join(sql.split())
                 self.result = [(False,)] if "to_regclass" in self.sql else []
@@ -664,11 +671,14 @@ class HybridOrderingTest(unittest.TestCase):
         @contextmanager
         def hub(): yield Conn()
         status_calls = []
-        def status(rows, project=None): status_calls.append(project); return rows
+        def status(rows, project=None):
+            status_calls.append(project)
+            return rows
         def enrich(_cur, rows):
             return [{**r, "enriched": True} for r in rows]
         def fair(rows, limit):
-            self.assertTrue(all(r.get("enriched") for r in rows)); return rows[:limit]
+            self.assertTrue(all(r.get("enriched") for r in rows))
+            return rows[:limit]
         with mock.patch("khipu.hub_snapshot.try_hub_connect", hub), \
                 mock.patch("khipu.cli._literal_candidates", return_value=[row]), \
                 mock.patch("khipu.topic_graph.enrich_search_results", side_effect=enrich), \
@@ -753,7 +763,9 @@ class CatchupStalenessTest(unittest.TestCase):
 
     def test_recent_catchup_selects_stale_topic_even_when_a_vector_exists(self) -> None:
         class Cur:
-            def __init__(self): self.result = []; self.topic_sql = []
+            def __init__(self):
+                self.result = []
+                self.topic_sql = []
             def execute(self, sql, params=None):
                 text = " ".join(sql.split())
                 if text.startswith("SELECT kind, ref, chunk_idx"):
@@ -899,7 +911,8 @@ class ReplicaCatchupTest(unittest.TestCase):
         from khipu import hub_snapshot as hs
         with tempfile.TemporaryDirectory() as tmp:
             snap = Path(tmp) / "snapshot.sqlite"
-            con = sqlite3.connect(snap); hs._create_schema(con)
+            con = sqlite3.connect(snap)
+            hs._create_schema(con)
             if existing:
                 con.execute("INSERT INTO topics (slug, title, body) VALUES ('note', 'Title', 'old')")
                 con.execute("INSERT INTO episodes (id, summary) VALUES (7, 'A')")
@@ -908,11 +921,13 @@ class ReplicaCatchupTest(unittest.TestCase):
                         con.execute("INSERT INTO memory_embeddings (profile,kind,ref,chunk_idx,chunk_text,embedding) VALUES ('prof',?,?,?,?,?)",
                                     (kind, ref, i, text, hs._vector_to_blob([1., 0.])))
                 con.execute("INSERT INTO memory_embeddings (profile,kind,ref,chunk_idx,chunk_text,embedding) VALUES ('other','topic','note',0,'other',?)", (hs._vector_to_blob([1., 0.]),))
-            con.commit(); con.close()
+            con.commit()
+            con.close()
             calls = []
             class Cur:
                 def execute(self, sql, params=None):
-                    calls.append((sql, params)); self.rows = []
+                    calls.append((sql, params))
+                    self.rows = []
                     if "FROM topics t" in sql and "NOT EXISTS" not in sql:
                         row = ("note", "Title", "A")
                         if "row_to_json(t)" in sql:

@@ -1,14 +1,12 @@
 """Hermetic regressions for the recall audit; no hub or provider calls."""
 from __future__ import annotations
 
-import contextlib
 import importlib.util
 import io
 import json
 import os
 import shutil
 import shlex
-import socket
 import subprocess
 import sys
 import tempfile

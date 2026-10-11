@@ -230,9 +230,12 @@ class LegacyDriftEvidenceTest(unittest.TestCase):
             def __init__(self): self.rows = []
             def execute(self, sql, params=None):
                 flat = " ".join(sql.split())
-                if "FILTER" in flat: self.rows = [(0, 0)]
-                elif "MAX(ts)" in flat: self.rows = [(None, None)]
-                else: self.rows = [(0,)]
+                if "FILTER" in flat:
+                    self.rows = [(0, 0)]
+                elif "MAX(ts)" in flat:
+                    self.rows = [(None, None)]
+                else:
+                    self.rows = [(0,)]
             def fetchone(self): return self.rows[0]
             def fetchall(self): return list(self.rows)
             def __enter__(self): return self
@@ -243,7 +246,8 @@ class LegacyDriftEvidenceTest(unittest.TestCase):
             def __exit__(self, *args): return False
 
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td); (root / "topics").mkdir()
+            root = Path(td)
+            (root / "topics").mkdir()
             (root / "episodes.jsonl").write_text("\n", encoding="utf-8")
             with mock.patch.object(drift, "connect", return_value=Conn()):
                 out = drift.sample_drift(root)
@@ -393,7 +397,9 @@ class GraphDriftContentTest(unittest.TestCase):
         INSERT INTO nodes VALUES('n1','concept','code','Name','{"a":1}','x.py','2026-01-01T00:00:00+00:00',0);
         INSERT INTO edges VALUES('n1','n1','uses',1.0,'{"z":1}','2026-01-01T00:00:00Z');
         """)
-        con.commit(); con.close(); return p
+        con.commit()
+        con.close()
+        return p
 
     def test_equal_ids_with_changed_content_are_red_and_normalized_values_are_clean(self):
         from khipu import graph_sync
@@ -412,11 +418,14 @@ class GraphDriftContentTest(unittest.TestCase):
     def test_corrupt_source_registry_is_explicitly_red(self):
         from khipu import graph_sync, sources
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td); p = self._sqlite(root); registry = root / "sources.json"
+            root = Path(td)
+            p = self._sqlite(root)
+            registry = root / "sources.json"
             registry.write_text("{broken", encoding="utf-8")
             with mock.patch.object(graph_sync, "is_graph_producer", return_value=True), mock.patch.object(sources, "sources_file", return_value=registry):
                 out = graph_sync.graph_drift(p)
-        self.assertFalse(out["ok"]); self.assertIn("source registry", out["error"])
+        self.assertFalse(out["ok"])
+        self.assertIn("source registry", out["error"])
 
 
 class CandidateDeadlineTest(unittest.TestCase):
@@ -427,7 +436,8 @@ class CandidateDeadlineTest(unittest.TestCase):
         seed = [{"kind": "topic", "id": "x"}]
         with mock.patch.object(gc, "_replica_topic_wiki", side_effect=lambda c,*a,**k: c.execute("WITH RECURSIVE x(v) AS (VALUES(0) UNION ALL SELECT v+1 FROM x WHERE v<100000000) SELECT max(v) FROM x").fetchall()):
             rows, missed = gc.replica_candidates(con, seed, deadline=time.monotonic() + 0.002)
-        self.assertTrue(missed); self.assertEqual(rows, [])
+        self.assertTrue(missed)
+        self.assertEqual(rows, [])
         self.assertEqual(con.execute("SELECT 1").fetchone()[0], 1)
 
     def test_hub_applies_remaining_statement_timeout_and_restores_it(self):
@@ -436,7 +446,8 @@ class CandidateDeadlineTest(unittest.TestCase):
         cur.fetchone.side_effect = [("9s",), ("9s",)]
         cur.fetchall.return_value = []
         rows, missed = gc.hub_candidates(cur, [{"kind":"topic", "id":"x"}], deadline=time.monotonic() + 1)
-        self.assertFalse(missed); self.assertEqual(rows, [])
+        self.assertFalse(missed)
+        self.assertEqual(rows, [])
         calls = [(" ".join(c.args[0].split()), c.args[1] if len(c.args)>1 else None) for c in cur.execute.call_args_list]
         settings = [p for sql,p in calls if "set_config('statement_timeout'" in sql]
         self.assertTrue(settings)
@@ -445,21 +456,29 @@ class CandidateDeadlineTest(unittest.TestCase):
     def test_hub_query_timeout_rolls_back_savepoint_and_restores_policy(self):
         from khipu import graph_candidates as gc
 
-        class QueryCanceled(Exception): pass
+        class QueryCanceled(Exception):
+            pass
         class Cur:
-            def __init__(self): self.calls = []; self.rows = []
+            def __init__(self):
+                self.calls = []
+                self.rows = []
             def execute(self, sql, params=None):
-                flat = " ".join(sql.split()); self.calls.append((flat, params))
-                if "current_setting" in flat: self.rows = [("9s",)]
-                elif flat.startswith("SELECT dst FROM edges"): raise QueryCanceled("statement timeout")
-                else: self.rows = []
+                flat = " ".join(sql.split())
+                self.calls.append((flat, params))
+                if "current_setting" in flat:
+                    self.rows = [("9s",)]
+                elif flat.startswith("SELECT dst FROM edges"):
+                    raise QueryCanceled("statement timeout")
+                else:
+                    self.rows = []
             def fetchone(self): return self.rows[0] if self.rows else None
             def fetchall(self): return list(self.rows)
         cur = Cur()
         rows, missed = gc.hub_candidates(
             cur, [{"kind":"topic", "id":"x"}], deadline=time.monotonic() + 1
         )
-        self.assertTrue(missed); self.assertEqual(rows, [])
+        self.assertTrue(missed)
+        self.assertEqual(rows, [])
         sql = [c[0] for c in cur.calls]
         self.assertIn("ROLLBACK TO SAVEPOINT khipu_graph_candidates_deadline", sql)
         self.assertIn("RELEASE SAVEPOINT khipu_graph_candidates_deadline", sql)
