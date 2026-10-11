@@ -2636,7 +2636,14 @@ def cosine_candidates_snapshot(
 
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError("replica scan deadline expired")
-    rows, by_rowid = _matrix_rows(snapshot_path(), profile, kind, **({"deadline": deadline} if deadline is not None else {}))
+    # The load runs to completion regardless of the deadline: every incremental
+    # write to the replica changes the cache key, and a load cut short at the
+    # prompt deadline never warms the cache, so a busy daemon answered every
+    # prompt lexical-only (2026-10-11). A cold load may cost one prompt its
+    # cosine leg; the deadline still bounds the scoring below.
+    rows, by_rowid = _matrix_rows(snapshot_path(), profile, kind)
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("replica scan deadline expired")
     pending = {str(i) for i in _pending_erasure_ids(snapshot_path())}
     rows = [r for r in rows if r[1] != "episode" or str(r[2]) not in pending]
     # Custom profiles may store unnormalised vectors. Normalize both sides
