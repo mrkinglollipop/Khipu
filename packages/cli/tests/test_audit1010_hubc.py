@@ -147,7 +147,30 @@ class GitSyncHealthEvidenceTest(unittest.TestCase):
 
 
 class ConnectBoundsTest(unittest.TestCase):
-    def test_connect_sets_finite_connect_and_statement_timeouts(self):
+    def test_rv4_05_migration_does_not_inherit_interactive_statement_timeout(self):
+        from khipu import db, migrate
+
+        def connection(*args, **kwargs):
+            options = kwargs.get("options", "")
+            conn = mock.MagicMock()
+            cur = conn.cursor.return_value.__enter__.return_value
+            def execute(sql, *unused):
+                if "CREATE INDEX" in sql and "statement_timeout=15000" in options:
+                    raise RuntimeError("canceling statement due to statement timeout")
+            cur.execute.side_effect = execute
+            conn.__enter__.return_value = conn
+            return conn
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "0026_library.sql"
+            path.write_text("CREATE INDEX library_hnsw ON library_embeddings USING hnsw (embedding vector_cosine_ops)")
+            with mock.patch.object(db, "resolve_dsn", return_value="postgres://x"), \
+                    mock.patch.object(db, "conninfo_with_local_root_cert", side_effect=lambda d: d), \
+                    mock.patch("psycopg.connect", side_effect=connection), \
+                    mock.patch.object(migrate, "plan", return_value={"_pending_paths": [("0026_library", path)]}):
+                self.assertEqual(migrate.run()["ran"], ["0026_library"])
+
+    def test_connect_sets_finite_connect_timeout_without_sql_policy(self):
         from khipu import db
 
         with (
@@ -157,7 +180,7 @@ class ConnectBoundsTest(unittest.TestCase):
         ):
             db.connect()
         self.assertEqual(pg.call_args.kwargs["connect_timeout"], db.CONNECT_TIMEOUT_SECONDS)
-        self.assertIn("statement_timeout", pg.call_args.kwargs["options"])
+        self.assertNotIn("options", pg.call_args.kwargs)
 
     def test_connect_preserves_existing_dsn_options(self):
         from khipu import db
@@ -169,38 +192,9 @@ class ConnectBoundsTest(unittest.TestCase):
             mock.patch("psycopg.connect") as pg,
         ):
             db.connect()
-        options = pg.call_args.kwargs["options"]
+        options = db.conninfo_to_dict(pg.call_args.args[0])["options"]
         self.assertIn("search_path=private", options)
-        self.assertIn("statement_timeout", options)
-
-    def test_connect_replaces_zero_or_lookalike_timeout_with_a_finite_bound(self):
-        from khipu import db
-
-        for options in ("-c statement_timeout=0", "-c application_name=statement_timeout"):
-            conninfo = db.make_conninfo(host="hub", options=options)
-            with (
-                mock.patch.object(db, "resolve_dsn", return_value="postgres://x"),
-                mock.patch.object(db, "conninfo_with_local_root_cert", return_value=conninfo),
-                mock.patch("psycopg.connect") as pg,
-            ):
-                db.connect()
-            self.assertIn(f"statement_timeout={db.STATEMENT_TIMEOUT_MILLISECONDS}", pg.call_args.kwargs["options"])
-
-    def test_connect_replaces_a_later_duplicate_zero_timeout(self):
-        from khipu import db
-
-        conninfo = db.make_conninfo(
-            host="hub", options="-c statement_timeout=100 -c statement_timeout=0"
-        )
-        with (
-            mock.patch.object(db, "resolve_dsn", return_value="postgres://x"),
-            mock.patch.object(db, "conninfo_with_local_root_cert", return_value=conninfo),
-            mock.patch("psycopg.connect") as pg,
-        ):
-            db.connect()
-        options = pg.call_args.kwargs["options"]
-        self.assertNotIn("statement_timeout=0", options)
-        self.assertIn(f"statement_timeout={db.STATEMENT_TIMEOUT_MILLISECONDS}", options)
+        self.assertNotIn("statement_timeout", options)
 
 
 class LegacyDriftEvidenceTest(unittest.TestCase):

@@ -105,16 +105,10 @@ def _episode_sources(cur, ids: list[int]) -> dict[int, dict[str, Any]]:
     out: dict[int, dict[str, Any]] = {}
     for eid, (_, ts, summary, legacy) in episodes.items():
         mine = rows.get(eid, [])
-        if mine:
-            lines = [("(superseded) " if r["state"] == "superseded" else "") + _clean(r["text"])
-                     for r in mine if r["state"] != "retracted"]
-        elif not ready:
-            lines = [_clean(d) for d in (legacy or []) if isinstance(d, str)]
-        else:
-            # Missing per-episode rows cannot establish canonical validity.
-            lines = []
+        lines, unknown = briefs._decision_lines(mine, legacy, label_unknown=ready)
+        lines = [_clean(line) for line in lines]
         counts = [sum(1 for r in mine if r["state"] == s) for s in ("current", "superseded", "retracted")]
-        state = validity.episode_state(*counts) if ready else "unknown"
+        state = validity.episode_state(*counts) if ready and not unknown else "unknown"
         out[eid] = {
             "kind": "episode", "id": eid, "date": _iso(ts)[:10], "validity": state,
             "summary": _clean(summary), "decisions": [ln for ln in lines if ln],

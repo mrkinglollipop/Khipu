@@ -331,7 +331,8 @@ def run_nightly() -> int:
     briefs_result = _briefs_build_if_on()
     if briefs_result is not None:
         _record_nightly_step(steps, "briefs_build", **_step_result(briefs_result))
-    final_rc = rc or (0 if drain_result["ok"] else 1)
+    briefs_ok = briefs_result is None or _step_result(briefs_result)["ok"]
+    final_rc = rc or (0 if drain_result["ok"] and briefs_ok else 1)
     if final_rc != rc:
         _write_job_state("nightly", final_rc)
     return final_rc
@@ -629,6 +630,10 @@ def nightly_last() -> dict[str, Any] | None:
 # "green because evidence never arrived" (audit 2026-08-17), the same class
 # `_record_nightly_step`'s own docstring names.
 _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
+    "briefs_build_ok": (
+        "briefs_build",
+        "check the synthesis provider, then run `khipu briefs build`",
+    ),
     "notes_reconcile_ok": (
         "notes_reconcile",
         "run `khipu notes reconcile` and check the error",
@@ -683,6 +688,8 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
     red too, REGARDLESS of that recording's own `ok` — a nightly that
     stopped running altogether is exactly what a same-day `ok: true` from a
     week ago would otherwise hide."""
+    from khipu import features
+
     applicable = _is_index_sync_host()
     data = nightly_last()
     receipt_path = _nightly_last_path()
@@ -761,6 +768,9 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
             "note": "not the nightly host — evaluated on the sync host",
         }
     for doctor_key, (step_name, fix) in _NIGHTLY_STEP_CHECKS.items():
+        if step_name == "briefs_build" and not features.enabled("briefs"):
+            out[doctor_key] = {"ok": True, "applicable": False, "note": "briefs disabled"}
+            continue
         if not applicable:
             out[doctor_key] = {
                 "ok": True, "applicable": False,
@@ -963,6 +973,15 @@ def _job_entry(name: str) -> dict[str, Any]:
         current = _plist_current(name)
     except Exception:
         current = None
+    try:
+        from khipu.launchd_gen import read_versions
+
+        scheduled = read_versions().get("scheduled_jobs", {})
+        expected = isinstance(scheduled, dict) and bool(
+            scheduled.get(name) or (name == "graph_build" and scheduled.get("graph"))
+        )
+    except Exception:
+        expected = False
     return {
         "plist_label": spec["plist"],
         "plist_mtime": plist_mtime,
@@ -976,6 +995,7 @@ def _job_entry(name: str) -> dict[str, Any]:
         ),
         "plist_loaded": _plist_loaded(spec["plist"]),
         "plist_current": current,
+        "expected": expected,
         "next_schedule": spec["schedule"],
         "last_exit": last_exit,
         "last_exit_ts": state.get("ts") if state else None,

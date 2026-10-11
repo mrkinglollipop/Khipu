@@ -178,6 +178,25 @@ class _Cur:
                 for d in sorted(h.decisions.values(), key=lambda d: d["id"])
                 if d["episode_id"] in ids
             ]
+        elif s.startswith("SELECT e.id, d.id,"):
+            from khipu.decisions import DEDUP_WINDOW_DAYS, normalize_text
+            with_text = "length(d.text)" not in s
+            for eid in params[0]:
+                e = h.episodes[eid]
+                for text in e["decisions"]:
+                    if any(d["episode_id"] == eid and normalize_text(d["text"]) == normalize_text(text)
+                           for d in h.decisions.values()):
+                        continue
+                    candidates = [d for d in h.decisions.values()
+                                  if normalize_text(d["text"]) == normalize_text(text)
+                                  and not h.episodes[d["episode_id"]]["deleted"]
+                                  and h.episodes[d["episode_id"]]["project"] == e["project"]
+                                  and e["ts"] - timedelta(days=DEDUP_WINDOW_DAYS)
+                                  <= h.episodes[d["episode_id"]]["ts"] <= e["ts"]]
+                    if candidates:
+                        d = max(candidates, key=lambda d: (h.episodes[d["episode_id"]]["ts"], d["id"]))
+                        self._rows.append((eid, d["id"], d["text"] if with_text else len(d["text"]),
+                                           d["superseded_by"], d["retracted_at"] if h.evidence else None))
         elif s.startswith("SELECT topic_slug, source_hash, state, derivation_version FROM briefs"):
             self._rows = [
                 (b["topic_slug"], b["source_hash"], b["state"], b["derivation_version"])

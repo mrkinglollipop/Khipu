@@ -136,7 +136,6 @@ class ConnectTest(unittest.TestCase):
             "postgres://x",
             autocommit=True,
             connect_timeout=db.CONNECT_TIMEOUT_SECONDS,
-            options=f"-c statement_timeout={db.STATEMENT_TIMEOUT_MILLISECONDS}",
         )
 
 

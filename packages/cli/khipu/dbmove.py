@@ -45,6 +45,12 @@ TABLE_ORDER: tuple[str, ...] = (
 )
 
 _TARGET_METADATA_TABLES = frozenset({"schema_migrations"})
+_BOOTSTRAP_EMBEDDING_PROFILES = frozenset({
+    ("gemini-embedding-001@768", "gemini", "gemini-embedding-001", 768, "l2", True,
+     "P1 lock (plan.md Models/LLM); cloud default through P3, local is P4"),
+    ("gemini-embedding-2@768", "gemini", "gemini-embedding-2", 768, "l2", False,
+     "Gemini Embedding 2 @768; task prefixes at API time; activate after full memory backfill"),
+})
 
 
 def _existing_tables(cur) -> set[str]:
@@ -180,7 +186,14 @@ def _rollback_target(conn) -> None:
 
 
 def _target_has_user_data(cur, table: str, count: int) -> bool:
-    return count > 0 and table not in _TARGET_METADATA_TABLES
+    if count <= 0 or table in _TARGET_METADATA_TABLES:
+        return False
+    if table == "embedding_profiles":
+        # created_at varies with provisioning; every seeded value must match.
+        cur.execute("SELECT id, provider, model, dim, normalize, is_active, note FROM embedding_profiles")
+        rows = cur.fetchall()
+        return len(rows) != count or any(tuple(row) not in _BOOTSTRAP_EMBEDDING_PROFILES for row in rows)
+    return True
 
 
 _PREFLIGHT_STAGES = ("reach", "version", "privileges", "schema", "graph")

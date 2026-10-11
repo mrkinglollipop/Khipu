@@ -114,14 +114,21 @@ def _write_state(result: dict[str, Any]) -> str | None:
 
 def _persist_result(result: dict[str, Any]) -> dict[str, Any]:
     """Return the current result red when its doctor/receipt evidence was lost."""
+    result["persistence"] = {"ok": True}
     error = _write_state(result)
     if error:
         prior = result.get("error")
         result["ok"] = False
         result["persistence"] = {"ok": False, "error": error}
         result["error"] = f"probe result was not persisted: {error}" + (f"; prior: {prior}" if prior else "")
-    else:
-        result["persistence"] = {"ok": True}
+        # The aggregate may already contain success when only the pack write failed.
+        try:
+            result["persistence"]["aggregate_ok"] = True
+            state_path().write_text(json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001 — preserve both persistence failures
+            result["persistence"]["aggregate_ok"] = False
+            result["persistence"]["aggregate_error"] = f"{type(exc).__name__}: {exc}"
+            _log(f"failed to persist aggregate probe failure: {type(exc).__name__}: {exc}")
     return result
 
 

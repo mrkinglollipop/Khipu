@@ -309,6 +309,7 @@ def _sanitize_summary(payload: dict[str, Any]) -> dict[str, Any]:
 
 def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
     from khipu import config as config_mod
+    from khipu import keychain
     from khipu.config import CAPTURE_MODES, set_capture_mode, set_gateway_url
     from khipu.keychain import set_dsn, set_gemini_key, set_openai_compat_key
     from khipu.models import set_models_replace, validate_models_object
@@ -376,6 +377,23 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
         cert_path: _file_snapshot(cert_path),
         config_path: _file_snapshot(config_path),
     }
+    credential_updates = [(keychain.DSN_ACCOUNT, set_dsn, None)]
+    for field, account, setter in (
+        ("gemini_api_key", keychain.GEMINI_ACCOUNT, set_gemini_key),
+        ("openai_compat_api_key", keychain.OPENAI_COMPAT_ACCOUNT, set_openai_compat_key),
+    ):
+        value = payload.get(field)
+        if isinstance(value, str) and value.strip():
+            credential_updates.append((account, setter, value.strip()))
+    credentials = {}
+    if keychain.keychain_available():
+        for account, _, _ in credential_updates:
+            receipt = keychain._security("find-generic-password", "-s", keychain.SERVICE,
+                                         "-a", account, "-w")
+            if receipt.returncode not in (0, 44):
+                raise RuntimeError(f"cannot snapshot join credential {account}")
+            credentials[account] = receipt.stdout.strip() if receipt.returncode == 0 else None
+    modified_credentials = []
     try:
         if isinstance(root_pem, str) and root_pem.strip():
             write_private_file(cert_path, (root_pem.strip() + "\n").encode("utf-8"))
@@ -385,27 +403,38 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
         elif conninfo_to_dict(dsn).get("sslrootcert"):
             raise ValueError(f"sslrootcert is set but {cert_path} was not written — cannot join")
 
-        set_dsn(dsn)
+        for account, setter, value in credential_updates:
+            if account in credentials:
+                modified_credentials.append(account)
+            setter(dsn if account == keychain.DSN_ACCOUNT else value)
         _write_dsn_file(dsn)
-
-        gemini = payload.get("gemini_api_key")
-        if isinstance(gemini, str) and gemini.strip():
-            set_gemini_key(gemini.strip())
-        openai_compat = payload.get("openai_compat_api_key")
-        if isinstance(openai_compat, str) and openai_compat.strip():
-            set_openai_compat_key(openai_compat.strip())
         if mode:
             set_capture_mode(mode)
         if isinstance(models, dict) and models:
             set_models_replace(models)
         if gateway_text:
             set_gateway_url(gateway_text)
-    except Exception:
+    except Exception as exc:
+        rollback_errors = []
+        for account in reversed(modified_credentials):
+            try:
+                old = credentials[account]
+                if old is not None:
+                    keychain.set_password(account, old)
+                else:
+                    receipt = keychain._security("delete-generic-password", "-s", keychain.SERVICE,
+                                                 "-a", account)
+                    if receipt.returncode not in (0, 44):
+                        raise RuntimeError("credential deletion failed")
+            except Exception:
+                rollback_errors.append(f"credential {account}")
         for path, snapshot in snapshots.items():
             try:
                 _restore_file(path, snapshot)
             except OSError:
-                pass
+                rollback_errors.append(f"file {path.name}")
+        if rollback_errors:
+            raise RuntimeError("join import failed; rollback failed for " + ", ".join(rollback_errors)) from exc
         raise
 
     return _sanitize_summary(payload)

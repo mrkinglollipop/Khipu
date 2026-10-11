@@ -54,6 +54,8 @@ class _Cursor:
         elif upper.startswith("SELECT COUNT(*)"):
             table = statement.split('"')[1]
             self.rows = [(self.db.counts.get(table, 0),)]
+        elif upper.startswith("SELECT ID, PROVIDER, MODEL, DIM, NORMALIZE, IS_ACTIVE, NOTE FROM EMBEDDING_PROFILES"):
+            self.rows = self.db.profiles
         elif "INFORMATION_SCHEMA.COLUMNS" in upper:
             self.rows = []
         elif upper.startswith("TRUNCATE"):
@@ -104,6 +106,27 @@ _PREFLIGHT = {"ok": True, "stages": [{"id": key, "ok": True} for key in ("reach"
 
 
 class DbMoveSafetyTest(unittest.TestCase):
+    def test_rv4_04_fresh_migration_profiles_allow_move(self):
+        profiles = [
+            ("gemini-embedding-001@768", "gemini", "gemini-embedding-001", 768, "l2", True,
+             "P1 lock (plan.md Models/LLM); cloud default through P3, local is P4"),
+            ("gemini-embedding-2@768", "gemini", "gemini-embedding-2", 768, "l2", False,
+             "Gemini Embedding 2 @768; task prefixes at API time; activate after full memory backfill"),
+        ]
+        source = _DB(["embedding_profiles", "episodes"], {"embedding_profiles": 2, "episodes": 1})
+        target = _DB(source.tables, {"embedding_profiles": 2, "episodes": 0})
+        target.profiles = profiles
+        result, _, _ = self._move(source, target, dry_run=True)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(target.counts["embedding_profiles"], 2)
+        for column in range(7):
+            with self.subTest(column=column):
+                modified = list(profiles[0])
+                modified[column] = "custom"
+                target.profiles = [tuple(modified), profiles[1]]
+                result, _, _ = self._move(source, target, dry_run=True)
+                self.assertEqual(result["error"], "target_not_empty")
+
     def _move(self, source, target, **kwargs):
         source.name, target.name = "source", "target"
         source_conn, target_conn = _Conn(source), _Conn(target)
