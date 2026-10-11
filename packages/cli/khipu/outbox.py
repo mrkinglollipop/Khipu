@@ -341,51 +341,6 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
         os.close(fd)
 
 
-def _source_matches(payload: dict[str, Any], source: dict[str, Any] | None) -> bool | None:
-    if source is None:
-        return None
-    evidence = {key: value for key, value in payload.items() if key != "ts"}
-    expected = {key: value for key, value in source.items() if key not in {"ts", "merged_from"}}
-    if evidence == expected:
-        return True
-    if any(key in expected and key in evidence and evidence[key] != expected[key]
-           for key in ("session_id", "harness", "project", "transcript_range", "window_id", "part")):
-        return False
-    return None
-
-
-def forget_identity(ts: str, summary_md5: str, *, source: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Remove copies only when the episode's source evidence identifies them."""
-    target = _identity({"ts": ts, "summary": ""})
-    target = f"{target.rsplit('-', 1)[0]}-{summary_md5[:10]}"
-    removed = 0
-    remaining: list[str] = []
-    with _locked_outbox():
-        for directory in (outbox_dir(), dead_dir(), quarantine_dir()):
-            if not directory.is_dir():
-                continue
-            for jp in directory.glob("*.json"):
-                try:
-                    envelope = json.loads(jp.read_bytes())
-                    payload = envelope.get("payload") if isinstance(envelope, dict) else None
-                    if not isinstance(payload, dict):
-                        raise ValueError("payload cannot establish identity")
-                except (OSError, ValueError, TypeError) as exc:
-                    # Do not delete an unknown file, but never claim it was
-                    # cleared: it could be the forgotten episode's bytes.
-                    remaining.append(f"{jp}: {type(exc).__name__}")
-                    continue
-                if _identity(payload) == target:
-                    match = _source_matches(payload, source)
-                    if match is not True:
-                        if match is None:
-                            remaining.append(f"{jp}: ambiguous source evidence")
-                        continue
-                    jp.unlink(missing_ok=True)
-                    removed += 1
-    return {"ok": not remaining, "removed": removed, "remaining": remaining}
-
-
 if __name__ == "__main__":  # `python -m khipu.outbox [drain|status]`
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     print(json.dumps(drain() if cmd == "drain" else status(), indent=2))

@@ -444,7 +444,7 @@ class PathsPrivacyTest(unittest.TestCase):
 
 
 class ForgetPrivacyTest(unittest.TestCase):
-    def test_forget_removes_every_merged_source(self):
+    def test_merged_episode_reports_incomplete_without_deleting_any_file(self):
         first = {"ts": "2026-10-10T00:00:00Z", "summary": "first", "session_id": "codex:first"}
         second = {"ts": "2026-10-10T00:01:00Z", "summary": "second", "session_id": "codex:second"}
         raw = {**first, "merged_from": [{"payload": second}]}
@@ -472,24 +472,15 @@ class ForgetPrivacyTest(unittest.TestCase):
             backups = root / ".khipu-forget-backups"
             backups.mkdir()
             (backups / "episodes.jsonl.old").write_text(json.dumps(second) + "\n")
-            outbox.enqueue(first)
-            second_path = outbox.enqueue(second)
+            before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
             result = forget.forget_everywhere(7, memory_root=root)
-            self.assertFalse(second_path.exists(), "merged source must be erased")
-            self.assertTrue(result["complete"])
-            self.assertEqual((root / "episodes.jsonl").read_text(), "")
-            self.assertTrue(all(not path.read_text() for path in backups.glob("episodes.jsonl.*")))
-
-    def test_forget_without_source_evidence_reports_partial(self):
-        gone = {"ts": "2026-10-10T00:00:00Z", "summary": "same", "session_id": "codex:unknown"}
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.dict(os.environ, {"KHIPU_OUTBOX": td}):
-            path = outbox.enqueue(gone)
-            result = outbox.forget_identity(gone["ts"], hashlib.md5(b"same").hexdigest())
+            self.assertEqual({path: path.read_bytes() for path in root.rglob("*") if path.is_file()}, before)
+            self.assertFalse(result["complete"])
             self.assertFalse(result["ok"])
-            self.assertTrue(path.exists())
+            self.assertEqual(result["remaining"], ["outbox: not cleaned (capture identity needed)"])
+            self.assertEqual(result["legacy_identities"], [result["identity"]])
 
-    def test_merged_source_cleanup_preserves_legacy_collision(self):
+    def test_merged_sources_and_legacy_collisions_are_retained(self):
         first = {"ts": "2026-10-10T00:00:00Z", "summary": "first", "session_id": "codex:first"}
         second = {"ts": "2026-10-10T00:01:00Z", "summary": "second", "session_id": "codex:second"}
         other = {**second, "session_id": "codex:unrelated"}
@@ -519,9 +510,10 @@ class ForgetPrivacyTest(unittest.TestCase):
             retained = backups / "episodes.jsonl.old"
             retained.write_text(path.read_text())
             result = forget.forget_everywhere(7, memory_root=root)
-            self.assertEqual([json.loads(line) for line in path.read_text().splitlines()], [other])
-            self.assertEqual([json.loads(line) for line in retained.read_text().splitlines()], [other])
-            self.assertTrue(result["complete"])
+            self.assertEqual([json.loads(line) for line in path.read_text().splitlines()], [second, other])
+            self.assertEqual([json.loads(line) for line in retained.read_text().splitlines()], [second, other])
+            self.assertFalse(result["complete"])
+            self.assertIn("outbox", result["partial"])
 
     def test_forget_preserves_unrelated_outbox_collision(self):
         gone = {"ts": "2026-10-10T00:00:00Z", "summary": "same summary",
@@ -550,8 +542,9 @@ class ForgetPrivacyTest(unittest.TestCase):
             other_path = outbox.enqueue(other)
             result = forget.forget_everywhere(7, memory_root=Path(td))
             self.assertTrue(other_path.exists(), "unrelated source must remain durable")
-            self.assertFalse(gone_path.exists())
-            self.assertTrue(result["complete"])
+            self.assertTrue(gone_path.exists(), "forget leaves all outbox captures durable")
+            self.assertFalse(result["complete"])
+            self.assertIn("outbox", result["partial"])
 
     def test_absent_unconfigured_stores_are_complete_but_existing_failed_replica_is_partial(self):
         ts = datetime(2026, 10, 10, tzinfo=timezone.utc)
@@ -569,7 +562,7 @@ class ForgetPrivacyTest(unittest.TestCase):
                  }), \
                  mock.patch("khipu.hub_snapshot.snapshot_path", return_value=replica), \
                  mock.patch("khipu.config.path_setting", return_value=None), \
-                 mock.patch("khipu.forget.forget_from_outbox", return_value={"ok": True, "removed": 0}):
+                 mock.patch("khipu.forget._outbox_remainder", return_value={"ok": True, "removed": 0}):
                 absent = forget.forget_everywhere(1)
                 replica.write_bytes(b"private replica content")
                 existing = forget.forget_everywhere(1)
@@ -592,29 +585,29 @@ class ForgetPrivacyTest(unittest.TestCase):
             (root / "episodes.jsonl").write_text('{"summary":"unidentified private text"')
             with mock.patch("khipu.db.connect", return_value=conn), \
                  mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": True}), \
-                 mock.patch("khipu.forget.forget_from_outbox", return_value={"ok": True, "removed": 0}):
+                 mock.patch("khipu.forget._outbox_remainder", return_value={"ok": True, "removed": 0}):
                 result = forget.forget_everywhere(1, memory_root=root)
         self.assertFalse(result["complete"])
         self.assertFalse(result["ok"])
         self.assertIn("legacy_file", result["partial"])
 
-    def test_backup_is_sanitized_and_outbox_copies_are_removed(self):
+    def test_backup_is_sanitized_and_outbox_copies_are_untouched(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             gone = {"ts": "2026-10-10T00:00:00Z", "summary": "forget me"}
             keep = {"ts": "2026-10-10T00:01:00Z", "summary": "keep me"}
             (root / "episodes.jsonl").write_text(json.dumps(gone) + "\n" + json.dumps(keep) + "\n")
             with mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(root / "outbox")}):
-                outbox.enqueue(gone)
+                queued = outbox.enqueue(gone)
+                before = queued.read_bytes()
                 result = forget.forget_in_legacy_file(
                     root, gone["ts"], hashlib.md5(gone["summary"].encode()).hexdigest()
                 )
-                erased = forget.forget_from_outbox(gone["ts"], result["identity"]["summary_md5"], source=gone)
+                self.assertEqual(queued.read_bytes(), before)
+                self.assertEqual(outbox.status()["pending"], 1)
             self.assertNotIn("forget me", Path(result["backup"]).read_text())
-            self.assertEqual(erased["removed"], 1)
-            self.assertEqual(outbox.status()["pending"], 0)
 
-    def test_old_backups_and_all_outbox_stores_are_scrubbed_or_reported_partial(self):
+    def test_old_backups_are_scrubbed_and_all_outbox_stores_are_untouched(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             gone = {"ts": "2026-10-10T00:00:00Z", "summary": "forget me"}
@@ -629,12 +622,13 @@ class ForgetPrivacyTest(unittest.TestCase):
                 (outbox.dead_dir() / "dead.json").write_text(json.dumps({"payload": gone, "attempts": 0}))
                 outbox.quarantine_dir().mkdir(parents=True)
                 (outbox.quarantine_dir() / "quarantine.json").write_text(json.dumps({"payload": gone}))
+                before = {path: path.read_bytes() for path in outbox.outbox_dir().rglob("*") if path.is_file()}
                 # There is no active legacy log: old retained copies still
                 # need erasure when the hub identity is forgotten.
                 forget.forget_in_legacy_file(root, gone["ts"], digest)
-                erased = forget.forget_from_outbox(gone["ts"], digest, source=gone)
+                self.assertEqual({path: path.read_bytes() for path in outbox.outbox_dir().rglob("*")
+                                  if path.is_file()}, before)
             self.assertNotIn("forget me", old.read_text())
-            self.assertEqual(erased["removed"], 3)
 
     def test_raw_original_identity_is_retained_for_edited_summary_cleanup(self):
         ts = datetime(2026, 10, 10, tzinfo=timezone.utc)
@@ -659,7 +653,7 @@ class ForgetPrivacyTest(unittest.TestCase):
             hashlib.md5(b"edited").hexdigest(), hashlib.md5(b"original").hexdigest(),
         })
 
-    def test_forget_everywhere_erases_edited_and_original_legacy_and_outbox_copies(self):
+    def test_forget_erases_edited_and_original_legacy_copies_but_retains_outbox(self):
         ts = datetime(2026, 10, 10, tzinfo=timezone.utc)
 
         class Cur:
@@ -673,8 +667,8 @@ class ForgetPrivacyTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            original = {"ts": "2026-10-10T00:00:00Z", "summary": "original"}
-            edited = {"ts": "2026-10-10T00:00:00+00:00", "summary": "edited"}
+            original = {"ts": "2026-10-10T00:00:00Z", "summary": "original", "session_id": "codex:session"}
+            edited = {"ts": "2026-10-10T00:00:00+00:00", "summary": "edited", "session_id": "codex:session"}
             (root / "episodes.jsonl").write_text(json.dumps(original) + "\n" + json.dumps(edited) + "\n")
             conn = mock.MagicMock()
             conn.__enter__.return_value = conn
@@ -682,12 +676,15 @@ class ForgetPrivacyTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(root / "outbox")}):
                 outbox.enqueue(original)
                 outbox.enqueue(edited)
+                before = {path: path.read_bytes() for path in outbox.jobs()}
                 with mock.patch("khipu.db.connect", return_value=conn), \
                      mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": True}), \
                      mock.patch("khipu.forget.time.strftime", side_effect=["first", "second"]):
                     result = forget.forget_everywhere(1, memory_root=root)
-            self.assertTrue(result["complete"])
-            self.assertEqual(outbox.status()["pending"], 0)
+                self.assertEqual(outbox.status()["pending"], 2)
+                self.assertEqual({path: path.read_bytes() for path in outbox.jobs()}, before)
+            self.assertFalse(result["complete"])
+            self.assertIn("outbox", result["partial"])
             self.assertEqual((root / "episodes.jsonl").read_text(), "")
             retained = "".join(p.read_text() for p in (root / ".khipu-forget-backups").iterdir())
             self.assertNotIn("original", retained)
@@ -704,7 +701,7 @@ class ForgetPrivacyTest(unittest.TestCase):
         with mock.patch("khipu.db.connect", return_value=conn), \
              mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": False, "error": "locked"}), \
              mock.patch("khipu.config.path_setting", side_effect=RuntimeError("no root")), \
-             mock.patch("khipu.forget.forget_from_outbox", return_value={"ok": True, "removed": 0}):
+             mock.patch("khipu.forget._outbox_remainder", return_value={"ok": True, "removed": 0}):
             result = forget.forget_everywhere(1)
         self.assertFalse(result["ok"])
         self.assertFalse(result["complete"])
