@@ -530,14 +530,15 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
     pg_nodes_by_id = {r["id"]: r for r in pg_node_rows}
     for node_id in sorted(s_nodes & p_nodes):
         srow, prow = s_node_rows[node_id], pg_nodes_by_id[node_id]
-        expected_sid = source_id_for_graphify_node(
-            node_id=node_id, type=srow["type"], bucket=srow["bucket"],
-            source_path=srow["source_path"], doc=sources_doc,
-        )
+        # Only fields both sides store are compared. The sqlite side has no
+        # source_id; deriving one from the path heuristic and comparing it
+        # with the stored attribution flagged 31,549 of 50,992 nodes as drift
+        # on 2026-10-11 (the heuristic says code:khipu, the store says
+        # code:claude) and is a question about attribution, not content.
         left = (srow["type"], srow["bucket"], srow["name"], _json_value(srow["payload"]),
-                srow["source_path"], _time_value(srow["built_at"]), bool(srow["frozen"]), expected_sid)
+                srow["source_path"], _time_value(srow["built_at"]), bool(srow["frozen"]))
         right = (prow["type"], prow["bucket"], prow["name"], _json_value(prow["payload"]),
-                 prow["source_path"], _time_value(prow["built_at"]), bool(prow["frozen"]), prow["source_id"])
+                 prow["source_path"], _time_value(prow["built_at"]), bool(prow["frozen"]))
         if left != right:
             node_content_drift.append(node_id)
 
