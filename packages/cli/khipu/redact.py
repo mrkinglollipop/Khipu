@@ -53,15 +53,26 @@ _PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     ),
     # scheme://user:password@host — keep the user, drop the password.
     ("url-credential", re.compile(r"(://[^/\s:@]+:)([^@\s/]{1,})@"), r"\1" + MASK + "@"),
-    # name = value / name: value / name="value" where the name says secret.
-    # The value must be at least 8 characters without spaces so prose such as
-    # "token budget" or "the password is wrong" is left alone.
+    # Quoted keys in source code only identify secrets when the value is a
+    # literal. A variable or lookup expression is evidence, not a credential.
+    (
+        "quoted-assignment",
+        re.compile(
+            r"(?i)((?P<key_quote>[\"'])[A-Za-z0-9_.-]*?(?:api[_-]?key|secret(?:[_-]?key)?|"
+            r"access[_-]?token|auth[_-]?token|refresh[_-]?token|token|password|passwd|pwd|"
+            r"client[_-]?secret|private[_-]?key|access[_-]?key(?:[_-]?id)?|dsn|connection[_-]?string)"
+            r"(?P=key_quote)\s*[:=]\s*(?P<value_quote>[\"']))"
+            r"(?:(?!(?P=value_quote))[^\\\r\n]|\\.){8,}(?P=value_quote)"
+        ),
+        r"\1" + MASK + r"\g<value_quote>",
+    ),
+    # Unquoted shell/YAML assignments retain their existing value rules.
     (
         "assignment",
         re.compile(
-            r"(?i)\b([\"']?[A-Za-z0-9_.-]*?(?:api[_-]?key|secret(?:[_-]?key)?|access[_-]?token|auth[_-]?token|"
+            r"(?i)\b([A-Za-z0-9_.-]*?(?:api[_-]?key|secret(?:[_-]?key)?|access[_-]?token|auth[_-]?token|"
             r"refresh[_-]?token|token|password|passwd|pwd|client[_-]?secret|private[_-]?key|"
-            r"access[_-]?key(?:[_-]?id)?|dsn|connection[_-]?string)[\"']?\s*[:=]\s*[\"']?)"
+            r"access[_-]?key(?:[_-]?id)?|dsn|connection[_-]?string)\s*[:=]\s*[\"']?)"
             r"([^\s\"']{8,})"
         ),
         r"\1" + MASK,

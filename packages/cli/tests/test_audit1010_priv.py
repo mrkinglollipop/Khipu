@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import stat
+import threading
 import tempfile
 import unittest
 import zipfile
@@ -42,6 +43,17 @@ def _concurrent_drain(outbox_path, mode, started, attempted, acknowledged, resul
 
 
 class RedactionPrivacyTest(unittest.TestCase):
+    def test_quoted_source_expressions_survive_redaction(self):
+        for text in ('{"password": os.environ["DB_PASSWORD"]}',
+                     '{"token": identifier}', "{'api_key': settings.get_key()}"):
+            with self.subTest(text=text):
+                self.assertEqual(redact.redact_secrets(text), (text, 0))
+
+    def test_quoted_literal_redaction_preserves_value_boundaries(self):
+        text = '{"password": "literalSecret987", "token": identifier}'
+        self.assertEqual(redact.redact_secrets(text)[0],
+                         '{"password": "[REDACTED]", "token": identifier}')
+
     def test_quoted_json_and_yaml_secret_names_are_redacted(self):
         for text in ('"password": "QuotedSecret987654"', "'api_key': 'YamlSecret987654'"):
             with self.subTest(text=text):
@@ -163,6 +175,55 @@ class RedactionPrivacyTest(unittest.TestCase):
 
 
 class OutboxPrivacyTest(unittest.TestCase):
+    def test_outbox_collision_preserves_both_payloads_and_identical_replay(self):
+        first = {"ts": "2026-10-10T00:00:00Z", "summary": "same", "part": "1/2",
+                 "verbatim": {"quotes": ["first evidence"]}}
+        second = {**first, "part": "2/2", "verbatim": {"quotes": ["second evidence"]}}
+        a, b = outbox.enqueue(first), outbox.enqueue(second)
+        self.assertNotEqual(a, b)
+        self.assertEqual(json.loads(a.read_text())["payload"], first)
+        self.assertEqual(json.loads(b.read_text())["payload"], second)
+        self.assertEqual(outbox.enqueue(first), a)
+        self.assertEqual(outbox.enqueue(second), b)
+
+    def test_enqueue_does_not_wait_for_replay_io(self):
+        outbox.enqueue({"ts": "2026-10-10T00:00:00Z", "summary": "old"})
+        entered, release, queued = threading.Event(), threading.Event(), threading.Event()
+        def replay(_payload):
+            entered.set()
+            release.wait(10)
+            return {"episode_inserted": False}
+        def enqueue():
+            outbox.enqueue({"ts": "2026-10-10T00:00:01Z", "summary": "new"})
+            queued.set()
+        with mock.patch("khipu.capture.write_pg", side_effect=replay):
+            worker = threading.Thread(target=outbox.drain)
+            writer = threading.Thread(target=enqueue)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                writer.start()
+                self.assertTrue(queued.wait(5), "enqueue blocked behind external replay I/O")
+            finally:
+                release.set()
+                worker.join(10)
+                if writer.ident:
+                    writer.join(10)
+        self.assertEqual([json.loads(p.read_text())["payload"]["summary"] for p in outbox.jobs()], ["new"])
+
+    def test_missing_attempts_records_failure_and_continues(self):
+        root = Path(self.tmp.name)
+        (root / "a.json").write_text(json.dumps({"payload": {"summary": "bad"}}))
+        (root / "b.json").write_text(json.dumps({"payload": {"summary": "good"}}))
+        def replay(payload):
+            if payload["summary"] == "bad":
+                raise ValueError("invalid evidence")
+            return {"episode_inserted": False}
+        with mock.patch("khipu.capture.write_pg", side_effect=replay):
+            result = outbox.drain()
+        self.assertEqual((result["failed"], result["replayed"]), (1, 1))
+        self.assertEqual(json.loads((root / "a.json").read_text())["attempts"], 1)
+
     def test_quarantined_jobs_keep_the_existing_dead_work_health_signal_red(self):
         (Path(self.tmp.name) / "broken.json").write_bytes(b"null")
         with mock.patch("khipu.capture.write_pg"), mock.patch("khipu.embed.embed_on_capture"):

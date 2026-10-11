@@ -162,14 +162,57 @@ class CaptureTest(unittest.TestCase):
     def test_equal_summary_embedding_preserves_replica_identity(self):
         self._merge_and_embed(True)
 
-    def test_hub_outbox_handoff_does_not_require_disabled_mirror(self):
+    def test_hub_outbox_alone_does_not_acknowledge_source(self):
         with mock.patch.object(cap, "write_pg", side_effect=RuntimeError("offline")), \
                 mock.patch("khipu.outbox.enqueue") as enqueue, \
                 mock.patch.object(cap, "run_capture_v2", return_value=70) as mirror, \
                 mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "0"}):
-            self.assertEqual(cap.capture(episode(), mode="hub"), 0)
+            self.assertEqual(cap.capture(episode(), mode="hub"), cap.EX_SOFTWARE)
         enqueue.assert_called_once()
         mirror.assert_not_called()
+
+    def test_hub_outage_keeps_source_jobs_and_both_outbox_payloads(self):
+        from khipu import outbox
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": td + "/capture",
+                                             "KHIPU_OUTBOX": td + "/outbox", "KHIPU_HUB_FILE_MIRROR": "0"}), \
+                mock.patch("khipu.config.capture_mode", return_value="hub"), \
+                mock.patch.object(cap, "write_pg", side_effect=RuntimeError("offline")):
+            for sid in ("first", "second"):
+                session_capture.enqueue({"harness": "codex", "session_id": sid,
+                    "ts": "2026-10-10T00:00:00Z", "transcript": "ASSISTANT: " + sid,
+                    "extracted_payload": {"summary": "same summary", "decisions": [sid]}})
+            result = session_capture.drain()
+            self.assertEqual(result["failed"], 2)
+            self.assertEqual(len(session_capture.queued_jobs()), 2)
+            self.assertEqual({json.loads(p.read_text())["payload"]["decisions"][0]
+                              for p in outbox.jobs()}, {"first", "second"})
+
+    def test_hub_failed_mirror_keeps_source_when_only_outbox_succeeds(self):
+        with mock.patch.object(cap, "write_pg", side_effect=RuntimeError("offline")), \
+                mock.patch("khipu.outbox.enqueue"), \
+                mock.patch.object(cap, "run_capture_v2", return_value=70), \
+                mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "1"}):
+            self.assertEqual(cap.capture(episode(), mode="hub"), 70)
+
+    def test_merge_replay_appends_source_evidence_only_once(self):
+        cur = Cursor({1: episode()})
+        incoming = episode(session_id="codex:two", transcript_range="100:200",
+                           verbatim={"quotes": ["retain me"]})
+        with mock.patch.object(cap, "_reembed_merged_episode"):
+            for _ in range(2):
+                cap._merge_into_episode(cur, 1, incoming, matched_via="jaccard", score=.9)
+        self.assertEqual(len(cur.episodes[1]["raw"]["merged_from"]), 1)
+
+    def test_merged_receipt_skips_replay_without_similarity(self):
+        cur = Cursor({1: episode()})
+        incoming = episode(session_id="codex:two", transcript_range="100:200")
+        with mock.patch.object(cap, "_reembed_merged_episode"):
+            cap._merge_into_episode(cur, 1, incoming, matched_via="jaccard", score=.9)
+        with mock.patch.object(cap, "_dedup_candidates", return_value=[]):
+            result = cap.dedup_before_insert(cur, incoming)
+        self.assertEqual(result["action"], "skip")
+        self.assertEqual(result["matched_episode"], 1)
 
     def test_hub_optional_mirror_failure_does_not_negate_commit(self):
         with mock.patch.object(cap, "write_pg", return_value={"episode_inserted": False, "topics_written": 0}), \
@@ -247,11 +290,12 @@ class CaptureTest(unittest.TestCase):
 
 
 class ExtractionTest(unittest.TestCase):
-    def test_durable_hub_handoff_is_not_extracted_again(self):
+    def test_pending_hub_handoff_reuses_extraction_until_pg_recovers(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             job = root / "job.json"
             job.write_text(json.dumps(dict(harness="codex", session_id="test", event="Stop",
+                                           ts="2026-10-10T00:00:00Z",
                                            transcript="USER: retain the rollback instruction")))
             with mock.patch.object(session_capture, "queued_jobs", side_effect=lambda: [job] if job.exists() else []), \
                     mock.patch.object(session_capture, "_claim", side_effect=lambda p: p), \
@@ -259,16 +303,21 @@ class ExtractionTest(unittest.TestCase):
                     mock.patch.object(session_capture, "_record_drain"), \
                     mock.patch.object(hub_snapshot, "sync_decision_changes", return_value={}), \
                     mock.patch.object(extract, "_generate", return_value='{"summary":"Retain rollback"}') as generate, \
-                    mock.patch.object(cap, "write_pg", side_effect=RuntimeError("offline")), \
+                    mock.patch.object(cap, "write_pg", side_effect=RuntimeError("offline")) as write, \
                     mock.patch.object(cap, "run_capture_v2", return_value=70) as mirror, \
                     mock.patch("khipu.t3.thread_for_session", return_value=None), \
                     mock.patch.dict(os.environ, {"KHIPU_CAPTURE_MODE": "hub", "KHIPU_HUB_FILE_MIRROR": "0",
                                                  "KHIPU_OUTBOX": str(root / "outbox")}):
-                self.assertEqual(session_capture.drain()["captured"], 1)
-                self.assertEqual(session_capture.drain()["jobs"], 0)
+                self.assertEqual(session_capture.drain()["failed"], 1)
+                self.assertEqual(session_capture.drain()["failed"], 1)
+                self.assertTrue(job.exists())
                 from khipu.outbox import status
 
                 self.assertEqual(status()["pending"], 1)
+                write.side_effect = None
+                write.return_value = {"episode_inserted": False, "topics_written": 0}
+                self.assertEqual(session_capture.drain()["captured"], 1)
+                self.assertFalse(job.exists())
             generate.assert_called_once()
             mirror.assert_not_called()
 

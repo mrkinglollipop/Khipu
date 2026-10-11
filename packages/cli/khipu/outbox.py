@@ -8,8 +8,9 @@ plan's condition for making ``hub`` the default was exactly this outbox.
 Contract:
   * ``enqueue(payload)`` writes the capture payload to a durable JSON file
     under ``<data_dir>/outbox/`` (temp + rename). The filename is the episode's
-    identity — ``ts`` + ``md5(summary)`` — so re-queuing the same failed capture
-    from two legs (``khipu capture`` and capture_v2's mirror) yields ONE job.
+    legacy identity — ``ts`` + ``md5(summary)`` — unless different evidence
+    already occupies it. Conflicting payloads use a full-content hash; only
+    equal payloads share a queued job.
   * ``drain()`` replays each job through the same upsert every other write path
     uses (``write_pg``: identity ``(ts, md5(summary))``, ON CONFLICT DO NOTHING),
     then embeds; a job is deleted only after PG accepted it. Replaying twice is
@@ -18,8 +19,8 @@ Contract:
   * ``status()`` is what ``khipu doctor`` reports; **pending > 0 makes doctor
     red** — a queued job is, by definition, something PG does not yet have.
 
-Drain points: every harness Stop hook (unsandboxed ones), the nightly
-consolidate, ``khipu outbox drain``, and the desktop app's doctor refresh.
+Drain points: scheduled/manual session drains (including empty session queues),
+nightly session drains, and ``khipu outbox drain``. Hooks only enqueue.
 Aegis's own hook cannot reach this directory (its sandbox denies ~/.config);
 Aegis captures go through ``khipu aegis drain`` → ``capture()``, which is where
 the outbox catches a PG failure for them.
@@ -32,6 +33,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,8 +69,7 @@ def _identity(payload: dict[str, Any]) -> str:
 
 @contextmanager
 def _locked_outbox():
-    """Serialize enqueue/drain/retry so one process cannot resurrect a job
-    another has already acknowledged during the same concurrent operation."""
+    """Serialize short filesystem transitions, never database/provider I/O."""
     d = outbox_dir()
     d.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(d / ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
@@ -82,20 +83,27 @@ def _locked_outbox():
 
 
 def enqueue(payload: dict[str, Any], *, reason: str = "") -> Path:
-    """Durably queue a capture payload for a later PG replay. Idempotent by
-    episode identity. Never raises for a bad payload — the caller already has
-    a durable copy elsewhere or is about to write one."""
+    """Durably queue a capture; acknowledge an existing file only for equal content."""
     with _locked_outbox() as d:
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                                          separators=(",", ":")).encode("utf-8")).hexdigest()
+        collision = d / f"{digest}.json"
+        if collision.exists():
+            if _read_job(collision)["payload"] != payload:
+                raise ValueError("outbox identity conflicts with existing evidence")
+            return collision
         dst = d / f"{_identity(payload)}.json"
         job = {"payload": payload, "reason": reason, "queued_at": datetime.now(timezone.utc).isoformat(),
                "attempts": 0}
-        if dst.is_file():  # keep the first queued_at; bump nothing
+        if dst.exists():
             try:
-                prev = _read_job(dst)
-                job["queued_at"] = prev.get("queued_at", job["queued_at"])
-                job["attempts"] = prev.get("attempts", 0)
+                if _read_job(dst)["payload"] == payload:
+                    return dst
             except (OSError, ValueError, TypeError):
                 pass
+            # Keep legacy names for uncontested jobs; conflicting evidence gets
+            # a stable full-content hash rather than replacing either source.
+            dst = collision
         _atomic_write(dst, job)
     _log(f"queued {dst.name} ({reason or 'pg write failed'})")
     return dst
@@ -163,6 +171,7 @@ def _read_job(jp: Path) -> dict[str, Any]:
     attempts = job.get("attempts", 0)
     if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
         raise ValueError("job attempts is not a non-negative integer")
+    job["attempts"] = attempts
     return job
 
 
@@ -250,56 +259,86 @@ def status() -> dict[str, Any]:
             "max_attempts": MAX_ATTEMPTS}
 
 
-def drain(*, limit: int | None = None) -> dict[str, Any]:
-    """Replay queued captures into PG. Deletes a job only after PG accepted it."""
-    with _locked_outbox():
+def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> dict[str, Any]:
+    """Elect one replayer without blocking enqueue during external I/O.
+
+    The budget bounds starting jobs; in-flight provider calls finish normally.
+    Files stay queued until PG accepts them, including after a process crash.
+    """
+    deadline = time.monotonic() + max(0, time_budget_s) if time_budget_s is not None else None
+    d = outbox_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(d / ".drain.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    out: dict[str, Any] = {"jobs": 0, "replayed": 0, "failed": 0, "stopped_early": False}
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {**out, "busy": True}
         js = jobs()
         if limit is not None:
             js = js[:limit]
-        out: dict[str, Any] = {"jobs": len(js), "replayed": 0, "failed": 0,
-                               "stopped_early": False}
-        if not js:
-            return out
+        out["jobs"] = len(js)
         from khipu.capture import write_pg
         from khipu.embed import embed_on_capture
 
         for jp in js:
-            try:
-                job = _read_job(jp)
-                payload = job["payload"]
-            except (OSError, ValueError, TypeError) as e:
-                _quarantine(jp, e)
-                out["quarantined"] = out.get("quarantined", 0) + 1
-                continue
+            if deadline is not None and time.monotonic() >= deadline:
+                out["time_budget_exhausted"] = True
+                break
+            with _locked_outbox():
+                if not jp.exists():
+                    continue
+                try:
+                    snapshot = jp.read_bytes()
+                    job = _read_job(jp)
+                    payload = json.loads(json.dumps(job["payload"]))
+                except (OSError, ValueError, TypeError) as e:
+                    _quarantine(jp, e)
+                    out["quarantined"] = out.get("quarantined", 0) + 1
+                    continue
             try:
                 stats = write_pg(payload)
             except Exception as e:  # noqa: BLE001 — keep the job; note the attempt
                 out["failed"] += 1
-                try:
-                    job["attempts"] += 1
-                    job["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
-                    _atomic_write(jp, job)
-                except OSError:
-                    pass
+                job["attempts"] += 1
+                job["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
                 name = type(e).__name__
-                if "Operational" in name or "Connection" in name or "connect" in str(e).lower():
+                unreachable = "Operational" in name or "Connection" in name or "connect" in str(e).lower()
+                with _locked_outbox():
+                    try:
+                        # A concurrent forget/retry owns its change. Never
+                        # resurrect a removed job or overwrite a replacement.
+                        if jp.read_bytes() == snapshot:
+                            if not unreachable and job["attempts"] >= MAX_ATTEMPTS:
+                                _bury(jp, job)
+                                out["buried"] = out.get("buried", 0) + 1
+                            else:
+                                _atomic_write(jp, job)
+                    except OSError:
+                        pass
+                if unreachable:
                     out["stopped_early"] = True
-                    _log(f"PG unreachable ({name}); leaving {len(js) - js.index(jp)} job(s) queued")
+                    _log(f"PG unreachable ({name}); leaving remaining jobs queued")
                     break
                 _log(f"replay failed for {jp.name}: {name}: {e}")
-                if job.get("attempts", 0) >= MAX_ATTEMPTS:
-                    _bury(jp, job)
-                    out["buried"] = out.get("buried", 0) + 1
                 continue
             if stats.get("episode_inserted"):
                 try:
                     embed_on_capture(payload)
                 except Exception as e:  # noqa: BLE001 — row is durable; backfill heals vectors
                     _log(f"embed skipped for {jp.name}: {e}")
-            jp.unlink(missing_ok=True)
+            with _locked_outbox():
+                try:
+                    if jp.read_bytes() == snapshot:
+                        jp.unlink()
+                except FileNotFoundError:
+                    pass
             out["replayed"] += 1
             _log(f"replayed {jp.name} (inserted={stats.get('episode_inserted')})")
         return out
+    finally:
+        os.close(fd)
 
 
 def forget_identity(ts: str, summary_md5: str) -> dict[str, Any]:
