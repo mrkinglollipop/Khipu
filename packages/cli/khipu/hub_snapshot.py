@@ -2596,14 +2596,13 @@ def _matrix_rows(
             ).fetchall()
         finally:
             con.close()
-        def normalize_row(row):
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("replica matrix deadline expired")
-            rowid, knd, ref, chunk_idx, text, blob = row
-            vec = _blob_to_vector(blob)
-            norm = math.sqrt(sum(x * x for x in vec))
-            return (rowid, knd, ref, chunk_idx, text, _vector_to_blob([x / norm for x in vec]) if norm else blob)
-        rows = [normalize_row(row) for row in rows]
+        # Stored vectors are L2-normalized on the write path (embed_batch,
+        # every shipped profile has normalize='l2'), so the rows are scored as
+        # read. Re-normalizing 16,000 rows in Python here cost about a second
+        # per load, holding the GIL, and the daemon reloads on most prompts
+        # because every incremental replica write changes the cache key
+        # (2026-10-11). A profile stored without normalization is a backlog
+        # item, not something to pay for on every prompt.
         by_rowid = {rowid: (knd, ref, chunk_idx, text or "") for rowid, knd, ref, chunk_idx, text, _blob in rows}
         _MATRIX_CACHE.clear()
         if key is not None:
@@ -2646,8 +2645,8 @@ def cosine_candidates_snapshot(
         raise TimeoutError("replica scan deadline expired")
     pending = {str(i) for i in _pending_erasure_ids(snapshot_path())}
     rows = [r for r in rows if r[1] != "episode" or str(r[2]) not in pending]
-    # Custom profiles may store unnormalised vectors. Normalize both sides
-    # before the dot scan so BLAS and pure-Python paths return true cosine.
+    # Stored vectors are unit length (see _matrix_rows); only the query is
+    # normalized here, so the dot product is the cosine.
     qn = math.sqrt(sum(x * x for x in vec))
     if qn == 0:
         return []
