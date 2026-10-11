@@ -240,6 +240,18 @@ def meta() -> dict[str, Any]:
     return data
 
 
+_SYNC_CURSOR_KEYS = ("last_decision_sync_at", "last_decision_sync_id")
+
+
+def _read_sidecar() -> dict[str, Any]:
+    """The sidecar as written, without the image's own refreshed_at."""
+    try:
+        loaded = json.loads(meta_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 def _write_meta(data: Mapping[str, Any]) -> None:
     dest = meta_path()
     fd, name = tempfile.mkstemp(prefix=".hub_snapshot.meta.", dir=dest.parent)
@@ -1074,6 +1086,7 @@ def refresh() -> dict[str, Any]:
 
         ensure_data_dir()
         dest = snapshot_path()
+        previous_meta = _read_sidecar()
         tmp_dir = dest.parent
         fd, tmp_name = tempfile.mkstemp(
             prefix=".hub_snapshot.", suffix=".sqlite", dir=tmp_dir
@@ -1105,7 +1118,15 @@ def refresh() -> dict[str, Any]:
             con.close()
             os.replace(tmp_path, dest)
             size_bytes = dest.stat().st_size
-            _write_meta({"schema_version": SNAPSHOT_SCHEMA_VERSION, "refreshed_at": refreshed_at, "size_bytes": size_bytes, "counts": counts})
+            new_meta: dict[str, Any] = {"schema_version": SNAPSHOT_SCHEMA_VERSION, "refreshed_at": refreshed_at, "size_bytes": size_bytes, "counts": counts}
+            # The decision-sync cursor is not evidence about this dump, so a
+            # dump must not reset it: with the keys gone the next sync starts
+            # from the oldest decision and replays months of history 500 rows
+            # per drain (seen live 2026-10-11, cursor a month behind).
+            for key in _SYNC_CURSOR_KEYS:
+                if key in previous_meta:
+                    new_meta[key] = previous_meta[key]
+            _write_meta(new_meta)
             return {
                 "ok": True,
                 "path": str(dest),

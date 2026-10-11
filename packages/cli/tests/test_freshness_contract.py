@@ -295,7 +295,8 @@ class NightlyLastJsonContractTest(unittest.TestCase):
         self.assertEqual(
             names,
             {"sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
-             "query_cache_prune", "commitments_mark_stale", "commitments_hygiene"},
+             "query_cache_prune", "commitments_mark_stale", "commitments_hygiene",
+             "snapshot_refresh"},
         )
         for step in payload["steps"]:
             self.assertIn("ok", step)

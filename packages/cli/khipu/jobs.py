@@ -328,6 +328,7 @@ def run_nightly() -> int:
     _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))
     _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
     _record_nightly_step(steps, "commitments_hygiene", **_step_result(_hygiene_commitments()))
+    _record_nightly_step(steps, "snapshot_refresh", **_step_result(_refresh_snapshot()))
     briefs_result = _briefs_build_if_on()
     if briefs_result is not None:
         _record_nightly_step(steps, "briefs_build", **_step_result(briefs_result))
@@ -336,6 +337,23 @@ def run_nightly() -> int:
     if final_rc != rc:
         _write_job_state("nightly", final_rc)
     return final_rc
+
+
+def _refresh_snapshot() -> dict[str, Any]:
+    """Full dump of the hub into the local replica, after the steps whose
+    output the replica carries (reconciled notes, backfilled vectors,
+    commitment state); briefs are not a replica table. Since the
+    doctor stopped refreshing as a side-effect (CLI-6, 2026-10-10) nothing
+    else does, and the per-prompt recall hook stops trusting the replica
+    24 h after the last dump. Fail-open: a miss is reported in the step record
+    and doctor's hub_snapshot row, and tried again tomorrow."""
+    try:
+        from khipu.hub_snapshot import refresh
+
+        out = refresh()
+        return {"ok": bool(out.get("ok")), **{k: v for k, v in out.items() if k != "path"}}
+    except Exception as exc:  # noqa: BLE001 — a replica miss cannot fail the night
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _drain_sessions() -> dict[str, Any]:
