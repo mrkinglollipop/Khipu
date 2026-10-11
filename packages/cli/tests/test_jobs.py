@@ -74,11 +74,12 @@ class JobsRunTest(unittest.TestCase):
                     mock.patch.object(jobs, "_prune_query_cache"), \
                     mock.patch.object(jobs, "_mark_stale_commitments"), \
                     mock.patch.object(jobs, "_hygiene_commitments"), \
+                    mock.patch.object(jobs, "_refresh_snapshot"), \
                     mock.patch.object(jobs, "_briefs_build_if_on", return_value=None):
                 self.assertEqual(jobs.run_nightly(), expected)
             script.assert_called_once()
             self.assertFalse(record.call_args_list[0].kwargs["ok"])
-            self.assertEqual(record.call_count, 7)
+            self.assertEqual(record.call_count, 8)
 
     def test_run_nightly_writes_nightly_last_json_with_every_step(self):
         """F3/D1: nightly-last.json is the persisted evidence Phase 6 will
@@ -97,7 +98,8 @@ class JobsRunTest(unittest.TestCase):
         self.assertEqual(
             names,
             ["sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
-             "query_cache_prune", "commitments_mark_stale", "commitments_hygiene"],
+             "query_cache_prune", "commitments_mark_stale", "commitments_hygiene",
+             "snapshot_refresh"],
         )
         for step in payload["steps"]:
             self.assertIn("ok", step)
@@ -107,6 +109,39 @@ class JobsRunTest(unittest.TestCase):
         notes_step = next(s for s in payload["steps"] if s["name"] == "notes_reconcile")
         self.assertTrue(notes_step["ok"])
         self.assertEqual(notes_step["counts"]["written"], 2)
+
+    def test_run_nightly_refreshes_the_replica_last_and_a_miss_cannot_fail_the_night(self):
+        """Phase 0 of docs/plans/2026-10-11-replica-freshness.md: the nightly
+        is the only scheduled full replica dump. It runs after the steps whose
+        output the replica carries, its outcome is on record, and a failed
+        dump (hub down) leaves the exit code alone."""
+        def _run(cmd, stdout, stderr, env):  # noqa: ARG001
+            stdout.write(b"ok\n")
+            return mock.Mock(returncode=0)
+
+        with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
+                mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
+                mock.patch.object(jobs, "_mark_stale_commitments"), \
+                mock.patch.object(jobs, "_hygiene_commitments"), \
+                mock.patch("khipu.hub_snapshot.refresh",
+                            return_value={"ok": True, "path": "/x", "counts": {"episodes": 3}}) as dump:
+            self.assertEqual(jobs.run_nightly(), 0)
+        dump.assert_called_once_with()
+        payload = json.loads((self.data_dir / "nightly-last.json").read_text())
+        self.assertEqual(payload["steps"][-1]["name"], "snapshot_refresh")
+        self.assertTrue(payload["steps"][-1]["ok"])
+        self.assertEqual(payload["steps"][-1]["counts"]["counts"], {"episodes": 3})
+
+        with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
+                mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
+                mock.patch.object(jobs, "_mark_stale_commitments"), \
+                mock.patch.object(jobs, "_hygiene_commitments"), \
+                mock.patch("khipu.hub_snapshot.refresh", side_effect=OSError("hub unreachable")):
+            self.assertEqual(jobs.run_nightly(), 0)
+        payload = json.loads((self.data_dir / "nightly-last.json").read_text())
+        step = payload["steps"][-1]
+        self.assertEqual((step["name"], step["ok"]), ("snapshot_refresh", False))
+        self.assertIn("hub unreachable", step["error"])
 
     def test_nightly_last_json_reports_a_missing_embed_key_once(self):
         """F3: a missing/expired embedding key must not abort the whole

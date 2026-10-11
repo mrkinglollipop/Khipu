@@ -691,6 +691,45 @@ class HubAuditRegressionTest(unittest.TestCase):
         self.assertIsNotNone(deleted)
         self.assertEqual(vectors_left, 0)
 
+    def test_full_refresh_keeps_the_decision_sync_cursor(self) -> None:
+        """A dump rewrote the sidecar without the decision cursor, so the
+        next sync restarted from the oldest decision (live 2026-10-11: cursor
+        at 2026-09-14 against a dump from the same morning). The cursor is
+        about sync progress, not about the dump, and must ride through."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            snap = self._snapshot(data)
+            sidecar = data / "meta.json"
+            sidecar.write_text(json.dumps({
+                "schema_version": 3, "refreshed_at": "2020-01-01T00:00:00+00:00",
+                "last_decision_sync_at": "2026-10-11T10:00:00+00:00",
+                "last_decision_sync_id": 50700,
+                "last_incremental_episode_id": 18924,
+            }), encoding="utf-8")
+
+            class Pg:
+                def __enter__(self): return self
+                def __exit__(self, *args): return False
+                def cursor(self): return self
+
+            inserts = ["_insert_episodes", "_insert_topics", "_insert_topic_revisions", "_insert_nodes",
+                       "_insert_edges", "_insert_profiles", "_insert_memory_embeddings",
+                       "_insert_decisions", "_insert_deliverables"]
+            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
+                 mock.patch.object(hs, "meta_path", return_value=sidecar), \
+                 mock.patch("khipu.paths.ensure_data_dir", return_value=data), \
+                 mock.patch.object(hs, "_acquire_refresh_lock", return_value=object()), \
+                 mock.patch.object(hs, "_release_refresh_lock"), \
+                 mock.patch.object(hs, "try_hub_connect", return_value=Pg()), \
+                 mock.patch.multiple(hs, **{name: mock.Mock(return_value=0) for name in inserts}):
+                out = hs.refresh()
+            written = json.loads(sidecar.read_text(encoding="utf-8"))
+        self.assertTrue(out["ok"])
+        self.assertEqual(written["refreshed_at"], out["refreshed_at"])
+        self.assertEqual(written["last_decision_sync_at"], "2026-10-11T10:00:00+00:00")
+        self.assertEqual(written["last_decision_sync_id"], 50700)
+        self.assertNotIn("last_incremental_episode_id", written)
+
     def test_stale_project_slice_uses_pending_filtered_snapshot_view(self) -> None:
         from khipu import recall_rule
         with tempfile.TemporaryDirectory() as tmp:
