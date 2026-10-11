@@ -143,14 +143,25 @@ def _index_candidates(memory_dir: Path, cur=None) -> list[dict[str, Any]]:
         })
     if cur is not None and out:
         slugs = [c["slug"] for c in out]
+        # The cursor is shared with the rest of after_reconcile's transaction.
+        # A failed statement here would abort that transaction, so the hit
+        # aggregation and the stale report after it would fail with
+        # InFailedSqlTransaction (seen in the organise evidence 2026-10-11);
+        # the savepoint keeps a skipped join a skipped join.
         try:
-            cur.execute(
-                "SELECT slug, hits_30d FROM topic_hits WHERE slug = ANY(%s)", (slugs,)
-            )
-            hits = {slug: int(h or 0) for slug, h in cur.fetchall()}
-            for c in out:
-                c["hits_30d"] = hits.get(c["slug"], 0)
-        except Exception as exc:  # noqa: BLE001 — ranking degrades, never breaks
+            cur.execute("SAVEPOINT khipu_index_hits")
+            try:
+                cur.execute(
+                    "SELECT slug, hits_30d FROM topic_hits WHERE slug = ANY(%s)", (slugs,)
+                )
+                hits = {slug: int(h or 0) for slug, h in cur.fetchall()}
+                for c in out:
+                    c["hits_30d"] = hits.get(c["slug"], 0)
+                cur.execute("RELEASE SAVEPOINT khipu_index_hits")
+            except Exception as exc:  # noqa: BLE001 — ranking degrades, never breaks
+                _log(f"hits_30d join skipped: {type(exc).__name__}: {exc}")
+                cur.execute("ROLLBACK TO SAVEPOINT khipu_index_hits")
+        except Exception as exc:  # noqa: BLE001 — no savepoint support: same degradation
             _log(f"hits_30d join skipped: {type(exc).__name__}: {exc}")
     return out
 
@@ -728,12 +739,17 @@ def after_reconcile(*, written_plan: list[dict[str, Any]], changed_only: bool, d
     except Exception as exc:  # noqa: BLE001 — organisation must never break reconcile
         out["ok"] = False
         out["error"] = f"{type(exc).__name__}: {exc}"
+        _log(f"organisation failed: {out['error']}")
     # Merge onto the previous evidence so a changed_only run (which skips the
     # heavier stale/size passes) doesn't blank out the last full run's
     # numbers — doctor should keep showing the last real stale count, not
     # None, between nightlies.
     prev = last_run() or {}
     merged = dict(prev)
+    # The error belongs to the run that raised it; a later clean run must
+    # not keep reporting it under ok=True (doctor showed a stale
+    # InFailedSqlTransaction beside ok=True on 2026-10-11).
+    merged.pop("error", None)
     merged.update({k: v for k, v in out.items() if v is not None})
     for k in ("size_warnings", "stale"):
         if out.get(k) is None and prev.get(k) is not None:
