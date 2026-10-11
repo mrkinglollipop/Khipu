@@ -60,25 +60,29 @@ class EpisodeProjectionTest(unittest.TestCase):
 
 
 class IngressTest(unittest.TestCase):
-    def test_capture_rejects_undeclared_fields_before_side_effects(self):
-        for field in ("topic_pages", "ts", "raw", "decision_details"):
-            with self.subTest(field=field), \
-                    mock.patch.object(srv, "_stdio_hook_owns_capture", return_value=False), \
-                    mock.patch.object(srv, "_capture_mode", return_value="hub"), \
-                    mock.patch("khipu.capture.capture", return_value=0) as capture:
-                out = srv.handle_message(request("khipu_capture", {"summary": "s", field: "../escape"}))
-                self.assertTrue(out["result"]["isError"])
-                capture.assert_not_called()
-
-    def test_capture_schema_is_the_argument_authority(self):
-        schema = next(t["inputSchema"] for t in srv.TOOLS if t["name"] == "khipu_capture")
-        with mock.patch.dict(schema["properties"], {"future_field": {"type": "string"}}), \
-                mock.patch.object(srv, "_stdio_hook_owns_capture", return_value=False), \
+    def test_capture_preserves_preexisting_structured_arguments(self):
+        args = {
+            "summary": "Recorded decisions and remaining work", "topics": ["khipu"],
+            "people": ["Matt"], "decisions": ["Keep local verification"],
+            "preferences": ["Concise reports"], "scope": "general",
+            "session_id": "cursor_cloud:repo:task", "project": "owner/repo",
+            "open_loops": ["Verify the next release", {"text": "Review the report", "owner": "user"}],
+            "closed_loops": [{"text": "Completed the audit", "commitment_id": 42}],
+            "deliverables": [{"kind": "file", "path": "report.md", "title": "Audit"}],
+            "verbatim": {"note": "Preserve this note"},
+            "decision_details": [{"text": "Keep local verification", "source_kind": "user"}],
+        }
+        with mock.patch.object(srv, "_stdio_hook_owns_capture", return_value=False), \
                 mock.patch.object(srv, "_capture_mode", return_value="hub"), \
-                mock.patch("khipu.capture.capture", return_value=0), \
+                mock.patch("khipu.capture.capture", return_value=0) as capture, \
                 mock.patch.object(srv, "_captured_episode_id", return_value=None):
-            out = srv.handle_message(request("khipu_capture", {"summary": "s", "future_field": "safe"}))
-        self.assertFalse(out["result"]["isError"])
+            out = srv.handle_message(request("khipu_capture", args))
+        self.assertFalse(out["result"]["isError"], out)
+        payload = capture.call_args.args[0]
+        for key, value in args.items():
+            self.assertEqual(payload[key], value)
+        schema = next(t["inputSchema"] for t in srv.TOOLS if t["name"] == "khipu_capture")
+        self.assertTrue(schema.get("additionalProperties", True))
 
     def test_malformed_mutation_ids_never_open_database(self):
         cases = [
@@ -237,8 +241,29 @@ class _Connection:
 
 
 class MutationTest(unittest.TestCase):
-    def test_forget_rejects_unknown_gateway_provenance(self):
-        for sid in (None, "", "legacy-id", "unknown:id", "grokbot:", "codex:local"):
+    def test_gateway_can_forget_accepted_cloud_captures(self):
+        for sid in (None, "cursor_cloud:repo:task", "grokbot:repo:task"):
+            args = {"summary": "Cloud capture"}
+            if sid is not None:
+                args["session_id"] = sid
+            with self.subTest(sid=sid), \
+                    mock.patch.object(srv, "_via_https_gateway", return_value=True), \
+                    mock.patch.object(srv, "_stdio_hook_owns_capture", return_value=False), \
+                    mock.patch.object(srv, "_capture_mode", return_value="hub"), \
+                    mock.patch("khipu.capture.capture", return_value=0) as capture, \
+                    mock.patch.object(srv, "_captured_episode_id", return_value=7), \
+                    mock.patch("khipu.db.connect", return_value=_Connection((sid,))), \
+                    mock.patch("khipu.forget.forget_everywhere", return_value={"ok": True, "id": 7}) as forget:
+                captured = srv._tool_capture(args)
+                self.assertEqual(capture.call_args.args[0].get("session_id"), sid)
+                out = srv.handle_message(request("khipu_forget", {"id": captured["episode_id"]}))
+                self.assertFalse(out["result"]["isError"], out)
+                forget.assert_called_once_with(7)
+
+    def test_forget_rejects_local_gateway_provenance(self):
+        from khipu.forget import LOCAL_HARNESSES
+
+        for sid in (h + ":local" for h in LOCAL_HARNESSES):
             with self.subTest(sid=sid), \
                     mock.patch.object(srv, "_via_https_gateway", return_value=True), \
                     mock.patch("khipu.db.connect", return_value=_Connection((sid,))), \
@@ -246,6 +271,18 @@ class MutationTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     srv._tool_forget({"id": 7})
                 forget.assert_not_called()
+
+    def test_partial_forget_exposes_diagnostics_as_tool_error(self):
+        failed = {"ok": False, "id": 7, "complete": False, "partial": ["outbox"],
+                  "error": "forget incomplete; remaining stores: outbox",
+                  "partial_errors": {"outbox": [{"error": "PermissionError: denied", "remaining": ["queued.json"]}]}}
+        with mock.patch.object(srv, "_via_https_gateway", return_value=False), \
+                mock.patch("khipu.forget.forget_everywhere", return_value=failed):
+            out = srv.handle_message(request("khipu_forget", {"id": 7}))
+        self.assertTrue(out["result"]["isError"])
+        body = json.loads(out["result"]["content"][0]["text"])
+        self.assertEqual(body.get("partial_errors"), failed["partial_errors"])
+        self.assertEqual(body.get("id"), 7)
 
     def test_replacement_inherits_project_and_no_orphan_on_retry(self):
         conn = _Connection((1, "acme/repo", None))
@@ -333,12 +370,18 @@ class BoundsTest(unittest.TestCase):
         self.assertIn("frame too large", out[0]["error"]["message"])
         self.assertEqual(out[1]["id"], 9)
 
-    def test_large_topic_and_tool_response_report_truncation(self):
-        with mock.patch("khipu.activity.topic_detail", return_value={"slug": "big", "body": "x" * 400000}):
-            out = srv.handle_message(request("khipu_get", {"id": "big", "kind": "topic"}))
-        text = out["result"]["content"][0]["text"]
-        self.assertLessEqual(len(text.encode()), 256 * 1024)
-        self.assertTrue(json.loads(text)["truncated"])
+    def test_large_records_retain_full_content_and_identity(self):
+        for content in ("x" * 400000 + "THE_END", "漢" * 45000 + "末尾"):
+            for kind, field in (("topic", "body"), ("episode", "summary")):
+                row = {"id": 7, "slug": "big", field: content}
+                with self.subTest(kind=kind, content_length=len(content)), \
+                        mock.patch("khipu.activity." + kind + "_detail", return_value=row), \
+                        mock.patch("khipu.decisions.decision_states_for_episode", return_value={}):
+                    out = srv.handle_message(request("khipu_get", {"id": "7", "kind": kind}))
+                    self.assertFalse(out["result"]["isError"])
+                    body = json.loads(out["result"]["content"][0]["text"])
+                    self.assertEqual(body.get(field), content)
+                    self.assertEqual(body.get("id"), 7)
 
     def test_incomplete_body_timeout_releases_handler(self):
         h = handler()

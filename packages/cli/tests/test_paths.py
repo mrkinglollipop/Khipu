@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 import zipfile
@@ -118,6 +119,31 @@ class ImportLocalTest(unittest.TestCase):
         (src / "dsn").write_text("replacement")
         paths.import_local(source=src, merge=False)
         self.assertEqual((self.target / "dsn").read_text(), "original")
+
+    def test_same_inode_import_preserves_both_credentials(self):
+        for alias in ("same", "symlink", "hardlink"):
+            with self.subTest(alias=alias):
+                originals = {"dsn": b"postgres://original", "gateway-token": b"original-token"}
+                for name, data in originals.items():
+                    (self.target / name).write_bytes(data)
+                source = self.target
+                if alias != "same":
+                    source = self.root / alias
+                    source.mkdir()
+                    for name in originals:
+                        if alias == "symlink":
+                            (source / name).symlink_to(self.target / name)
+                        else:
+                            os.link(self.target / name, source / name)
+                try:
+                    paths.import_local(source=source, merge=True)
+                except shutil.SameFileError:
+                    refused = True
+                else:
+                    refused = False
+                for name, data in originals.items():
+                    self.assertEqual((self.target / name).read_bytes(), data)
+                self.assertTrue(refused)
 
     def test_bad_source_raises(self):
         with self.assertRaises(RuntimeError):
