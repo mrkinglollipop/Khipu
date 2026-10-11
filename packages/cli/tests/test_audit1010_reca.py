@@ -35,6 +35,40 @@ class RecallAuditTest(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
+    def test_rv3_dedup_failure_preserves_completed_context(self):
+        with mock.patch.object(rp, "_search_hits", return_value=RESULT), \
+             mock.patch.object(rp, "_deliverable_context_line", return_value=""), \
+             mock.patch.object(rp, "_dedup_transaction", side_effect=OSError("busy")):
+            out = rp.prior_work_for_prompt(PROMPT, session_id="busy")
+        self.assertTrue(out["context"])
+        self.assertEqual(out["hits"], [HIT])
+
+    def test_rv3_distinct_batch_survives_unacknowledged_delivery(self):
+        pending = {}
+        other = {**HIT, "id": "6"}
+        try:
+            rp._dedup_transaction("busy", [HIT], pending)
+            with mock.patch.object(rp, "_search_hits", return_value={**RESULT, "hits": [other]}), \
+                 mock.patch.object(rp, "_deliverable_context_line", return_value=""):
+                out = rp.prior_work_for_prompt(PROMPT, session_id="busy")
+            self.assertEqual(out["hits"], [other])
+        finally:
+            pending["finish"](False)
+
+    def test_rv3_recall_import_without_fcntl(self):
+        import builtins
+        original = builtins.__import__
+        def guarded(name, *args, **kwargs):
+            if name == "fcntl":
+                raise ImportError("unavailable")
+            return original(name, *args, **kwargs)
+        spec = importlib.util.spec_from_file_location("recall_without_fcntl", rp.__file__)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.object(builtins, "__import__", side_effect=guarded):
+            spec.loader.exec_module(module)
+        with self.assertRaises(OSError):
+            module._dedup_transaction("no-lock-backend", [HIT], None)
+
     def test_handler_failure_is_not_successful_empty_recall(self):
         svc = rd.RecallService(self.home / "recall.sock", stamp_fn=lambda: "same")
         with mock.patch.object(rp, "hook_main", side_effect=RuntimeError("broken handler")):
@@ -211,7 +245,7 @@ class RecallAuditTest(unittest.TestCase):
             after = rd.code_stamp()
         self.assertNotEqual(before, after)
 
-    def test_concurrent_identical_batches_emit_once(self):
+    def test_concurrent_identical_batches_preserve_successful_recall(self):
         barrier = threading.Barrier(2)
         def search(*_a, **_k):
             barrier.wait(2)
@@ -230,7 +264,7 @@ class RecallAuditTest(unittest.TestCase):
                 t.start()
             for t in threads:
                 t.join(3)
-        self.assertEqual(sum(bool(a["context"]) for a in answers), 1)
+        self.assertEqual(sum(bool(a["context"]) for a in answers), 2)
 
     def test_validity_restore_is_recalled_again(self):
         outputs = []
@@ -269,8 +303,8 @@ class RecallAuditTest(unittest.TestCase):
                 mock.patch.object(rp, "_deliverable_context_line", return_value=""):
             rp.prior_work_for_prompt(PROMPT, session_id="distinct", delivery=delivery)
             held = rp.prior_work_for_prompt(PROMPT, session_id="distinct")
-            self.assertEqual(held["context"], "")
-            self.assertTrue(held["reason"].startswith("error:"))
+            self.assertTrue(held["context"])
+            self.assertIn("dedup state unavailable or busy", held["reason"])
             rp.finish_delivery(delivery, delivered=True)
         other = {**HIT, "id": "6"}
         with mock.patch.object(rp, "_search_hits", return_value={**RESULT, "hits": [other]}), \

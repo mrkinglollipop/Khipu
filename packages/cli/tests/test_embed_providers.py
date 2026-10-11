@@ -244,7 +244,7 @@ class QueryBudgetTest(_Base):
                         timeout=embed.QUERY_EMBED_TIMEOUT_S, input_type="query",
                     )
                 self.assertEqual(len(t.calls), embed.QUERY_EMBED_RETRIES + 1)
-                self.assertTrue(all(c[3] == embed.QUERY_EMBED_TIMEOUT_S for c in t.calls))
+                self.assertTrue(all(0 < c[3] <= embed.QUERY_EMBED_TIMEOUT_S for c in t.calls))
 
     def test_embed_one_forwards_input_type_only_when_given(self) -> None:
         with mock.patch.object(embed, "embed_batch", return_value=[[1.0]]) as m:

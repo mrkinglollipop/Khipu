@@ -30,6 +30,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -436,9 +437,13 @@ def recent_deliverables_snapshot(
     if "deleted_at" in _snapshot_table_columns(con, "episodes"):
         extra = (
             " AND (deliverables.episode_id IS NULL OR NOT EXISTS ("
-            "SELECT 1 FROM episodes e WHERE e.id = deliverables.episode_id "
+            "SELECT 1 FROM main.episodes e WHERE e.id = deliverables.episode_id "
             "AND e.deleted_at IS NOT NULL))"
         )
+    pending = _pending_erasure_ids(snapshot_path())
+    if pending:
+        blocked = ", ".join(str(int(i)) for i in sorted(pending))
+        extra += f" AND (episode_id IS NULL OR episode_id NOT IN ({blocked}))"
     try:
         rows = con.execute(
             f"SELECT {', '.join(cols)} FROM deliverables WHERE project = ?{extra} "
@@ -1236,7 +1241,14 @@ def upsert_episode(
                 f"VALUES ({', '.join('?' * len(cols))})",
                 vals,
             )
-            con.execute("DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ?", (str(eid),))
+            if merged.get("deleted_at") is not None:
+                con.execute("DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ?", (str(eid),))
+            else:
+                for profile in {row["profile"] for row in embedding_rows}:
+                    con.execute(
+                        "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ? AND profile = ?",
+                        (str(eid), profile),
+                    )
             for erow in (() if merged.get("deleted_at") is not None else embedding_rows):
                 ecols = [c for c in _EMBED_COLS if c in erow]
                 evals = []
@@ -1258,7 +1270,9 @@ def upsert_episode(
                 # error, for that case, and the episode/embedding write
                 # above must still commit regardless.
                 _write_decision_rows(con, decision_rows)
-            if deliverable_rows is not None:
+            if merged.get("deleted_at") is not None:
+                _write_deliverable_rows(con, eid, ())
+            elif deliverable_rows is not None:
                 _write_deliverable_rows(con, eid, deliverable_rows)
             con.commit()
         finally:
@@ -1272,9 +1286,14 @@ def upsert_episode(
         _release_refresh_lock(lock)
 
 
-def upsert_embeddings(embedding_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Incremental snapshot update: embedding rows only, no episode/topic row
-    (fix 5c) — e.g. commitment embeddings from ``embed.embed_recent_missing``'s
+def upsert_embeddings(
+    embedding_rows: Sequence[Mapping[str, Any]], *,
+    topic_rows: Sequence[Mapping[str, Any]] = (),
+    replace_refs: Sequence[tuple[str, str, str]] = (),
+) -> dict[str, Any]:
+    """Incremental vectors with optional topic sources and complete ref replacement.
+    Replacements affect only the named profiles, including an empty chunk set.
+    Used by ``embed.embed_recent_missing``'s
     bounded catch-up, which has no single episode row to key off like
     ``upsert_episode`` does. Same locking/fail-open contract as
     ``upsert_episode``: a no-op ``{"ok": False}`` when the snapshot is
@@ -1285,7 +1304,7 @@ def upsert_embeddings(embedding_rows: Sequence[Mapping[str, Any]]) -> dict[str, 
             "ok": False,
             "error": "hub snapshot missing; run `khipu snapshot refresh` first",
         }
-    if not embedding_rows:
+    if not embedding_rows and not topic_rows and not replace_refs:
         return {"ok": True, "embeddings": 0}
     lock = _acquire_refresh_lock()
     if lock is None:
@@ -1293,6 +1312,22 @@ def upsert_embeddings(embedding_rows: Sequence[Mapping[str, Any]]) -> dict[str, 
     try:
         con = sqlite3.connect(str(path))
         try:
+            topic_cols = _snapshot_table_columns(con, "topics")
+            for row in topic_rows:
+                old = con.execute("SELECT deleted_at FROM topics WHERE slug = ?", (row["slug"],)).fetchone()
+                if old and old[0] is not None:
+                    continue
+                cols = [c for c in _TOPIC_COLS if c in topic_cols and c in row]
+                vals = [_json_text(row[c]) if c in ("links", "frontmatter") else
+                        _ts_text(row[c]) if c.endswith("_at") else row[c] for c in cols]
+                con.execute(
+                    f"INSERT INTO topics ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)}) "
+                    "ON CONFLICT(slug) DO UPDATE SET " + ", ".join(f"{c}=excluded.{c}" for c in cols if c != "slug"),
+                    vals,
+                )
+            for profile, kind, ref in replace_refs:
+                con.execute("DELETE FROM memory_embeddings WHERE profile = ? AND kind = ? AND ref = ?",
+                            (profile, kind, ref))
             for erow in embedding_rows:
                 if erow.get("kind") == "episode" and str(erow.get("ref")) in {str(i) for i in _pending_erasure_ids(path)}:
                     continue
@@ -1725,7 +1760,7 @@ def search_snapshot(
             identity_clause += f" AND khipu_prefix({session_expr}, ?)"
             identity_params.append(session_id)
         if harness:
-            identity_clause += f" AND COALESCE({harness_expr}, substr({session_expr}, 1, instr({session_expr} || ':', ':') - 1)) = ?"
+            identity_clause += f" AND COALESCE(NULLIF({harness_expr}, ''), substr({session_expr}, 1, instr({session_expr} || ':', ':') - 1)) = ?"
             identity_params.append(harness)
         if time_filtered:
             identity_clause += " AND khipu_in_range(ts, ?, ?)"
@@ -2243,6 +2278,14 @@ def semantic_search_snapshot(
     spec = active_snapshot_profile_spec()
     if spec is None:
         return []
+    from khipu.models import show_models
+
+    cfg = show_models().get("embed") or {}
+    if (cfg.get("provider") != "local" or spec.provider != "openai-compatible"
+            or not cfg.get("endpoint") or not cfg.get("model_id")
+            or spec.model != cfg["model_id"]
+            or _embeddings_url(spec.endpoint or "") != _embeddings_url(cfg["endpoint"])):
+        raise RuntimeError("offline semantic search unavailable: configured local provider and replica profile are incompatible")
     profiles.register_spec(spec)
     api_query = prefix_query(query) if uses_task_prefixes(spec.id) else query
     vec = embed_one(
@@ -2511,7 +2554,7 @@ _MATRIX_CACHE: dict[str, Any] = {}
 
 
 def _matrix_rows(
-    path: Path, profile: str, kind: str | None
+    path: Path, profile: str, kind: str | None, *, deadline: float | None = None,
 ) -> tuple[list[tuple[Any, ...]], dict[int, tuple[str, str, int, str]]]:
     """(rows, by_rowid) for one profile on the replica at ``path``, from the
     process cache while the file is unchanged. The load runs under the lock so
@@ -2521,10 +2564,15 @@ def _matrix_rows(
         key: tuple[Any, ...] | None = (str(path), st.st_mtime_ns, st.st_size, profile, kind)
     except OSError:
         key = None
-    with _MATRIX_LOCK:
+    remaining = -1 if deadline is None else max(0, deadline - time.monotonic())
+    if not _MATRIX_LOCK.acquire(timeout=remaining):
+        raise TimeoutError("replica matrix deadline expired")
+    try:
         if key is not None and _MATRIX_CACHE.get("key") == key:
             return _MATRIX_CACHE["rows"], _MATRIX_CACHE["by_rowid"]
         con = open_snapshot()
+        if deadline is not None:
+            con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         try:
             params: list[Any] = [profile]
             kind_clause = ""
@@ -2548,6 +2596,8 @@ def _matrix_rows(
         finally:
             con.close()
         def normalize_row(row):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("replica matrix deadline expired")
             rowid, knd, ref, chunk_idx, text, blob = row
             vec = _blob_to_vector(blob)
             norm = math.sqrt(sum(x * x for x in vec))
@@ -2558,10 +2608,13 @@ def _matrix_rows(
         if key is not None:
             _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid})
         return rows, by_rowid
+    finally:
+        _MATRIX_LOCK.release()
 
 
 def cosine_candidates_snapshot(
-    vec: Sequence[float], profile: str, *, limit: int, kind: str | None = None
+    vec: Sequence[float], profile: str, *, limit: int, kind: str | None = None,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     """Raw cosine-ordered candidates over the LOCAL replica's ``memory_embeddings``
     (best first) — the offline analog of ``embed._cosine_candidates``. Each row
@@ -2580,7 +2633,9 @@ def cosine_candidates_snapshot(
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
     from khipu.vector_scan import top_k_by_dot
 
-    rows, by_rowid = _matrix_rows(snapshot_path(), profile, kind)
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("replica scan deadline expired")
+    rows, by_rowid = _matrix_rows(snapshot_path(), profile, kind, **({"deadline": deadline} if deadline is not None else {}))
     pending = {str(i) for i in _pending_erasure_ids(snapshot_path())}
     rows = [r for r in rows if r[1] != "episode" or str(r[2]) not in pending]
     # Custom profiles may store unnormalised vectors. Normalize both sides
@@ -2591,28 +2646,11 @@ def cosine_candidates_snapshot(
     qvec = tuple(x / qn for x in vec)
 
     wanted = max(1, int(limit))
-    scan_n = min(len(rows), max(wanted, wanted * 4))
-    winners: list[tuple[int, float]] = []
-    while scan_n:
-        ranked = top_k_by_dot(
-            qvec,
-            ((rowid, blob) for rowid, _knd, _ref, _chunk_idx, _text, blob in rows),
-            scan_n,
-        )
-        seen_entities: set[tuple[str, str]] = set()
-        winners = []
-        for rowid, score in ranked:
-            knd, ref, _chunk_idx, _chunk_text = by_rowid[rowid]
-            entity = (knd, ref)
-            if entity in seen_entities:
-                continue
-            seen_entities.add(entity)
-            winners.append((rowid, score))
-            if len(winners) >= wanted:
-                break
-        if len(winners) >= wanted or scan_n >= len(rows):
-            break
-        scan_n = min(len(rows), scan_n * 2)
+    winners = top_k_by_dot(
+        qvec, ((rowid, blob) for rowid, _knd, _ref, _idx, _text, blob in rows),
+        wanted, entity_key=lambda rowid: by_rowid[rowid][:2], deadline=deadline,
+        max_abs_component=1.0,
+    )
     if not winners:
         return []
 

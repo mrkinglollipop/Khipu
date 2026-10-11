@@ -416,15 +416,15 @@ class UnindexedProfileTest(unittest.TestCase):
         with _hub(cur), mock.patch.object(ls.time, "monotonic", side_effect=lambda: clock[0]):
             em.hybrid_search("divine council", limit=5)
             em.hybrid_search("divine council again", limit=5)
-            self.assertEqual(len(cur.sql("FROM pg_indexes")), 1)
+            self.assertEqual(len(cur.sql("FROM pg_indexes")), 2)
             cur.index_present = True                  # the index is built meanwhile
             clock[0] += ls.INDEX_CHECK_TTL_S - 1
             em.hybrid_search("divine council third", limit=5)
-            self.assertEqual(len(cur.sql("FROM pg_indexes")), 1)   # still the cached "no"
+            self.assertEqual(len(cur.sql("FROM pg_indexes")), 2)   # still the cached "no"
             self.assertFalse(cur.sql("FROM library_embeddings"))
             clock[0] += 2                              # past the TTL: re-asked, now present
             em.hybrid_search("divine council fourth", limit=5)
-        self.assertEqual(len(cur.sql("FROM pg_indexes")), 2)
+        self.assertEqual(len(cur.sql("FROM pg_indexes")), 3)
         self.assertEqual(len(cur.sql("FROM library_embeddings")), 1)
 
     def test_a_failed_index_check_fails_open_and_is_not_cached(self):

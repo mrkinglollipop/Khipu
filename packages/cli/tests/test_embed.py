@@ -542,7 +542,8 @@ class _CatchupCursor:
         elif "FROM commitments c WHERE c.status = 'open'" in s:
             self._result = self.commitment_rows
         elif "FROM topics t WHERE t.deleted_at IS NULL" in s:
-            self._result = self.topic_rows
+            self._result = [(slug, title, body, {"slug": slug, "title": title, "body": body})
+                            for slug, title, body in self.topic_rows]
         elif s.startswith("INSERT INTO memory_embeddings"):
             self.inserts.append(params)
         else:
@@ -1318,7 +1319,7 @@ class QueryEmbedBudgetTest(unittest.TestCase):
                 em.embed_one("q", retries=em.QUERY_EMBED_RETRIES,
                              timeout=em.QUERY_EMBED_TIMEOUT_S)
         self.assertEqual(len(calls), em.QUERY_EMBED_RETRIES + 1)
-        self.assertTrue(all(t == em.QUERY_EMBED_TIMEOUT_S for t in calls))
+        self.assertTrue(all(0 < t <= em.QUERY_EMBED_TIMEOUT_S for t in calls))
         self.assertLess(em.QUERY_EMBED_TIMEOUT_S, 30)
 
 

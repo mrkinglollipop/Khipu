@@ -10,10 +10,9 @@ lane's local replica by unpacking every row's embedding blob and summing a
 Python dot product one row at a time — 226ms measured live over ~18,400
 rows, most of a 1.2s budget the lane missed on 85% of prompts in production.
 
-Float32 BLAS shortlist scores cannot safely eliminate a row: a near tie can
-round away the exact winner. This module therefore uses the original exact
-Python arithmetic for every row. The retained BLAS helpers are intentionally
-unused compatibility seams for callers that patch them in older tests.
+Float32 scores shortlist candidates only outside a conservative roundoff
+bound. Near ties are retained and rescored with the original Python arithmetic.
+Deadline checks bound both the accelerated and fallback scans.
 
 No new dependency: ctypes (stdlib) loads a SYSTEM library that may or may
 not be present. Every load/call failure — missing library, wrong ABI, a
@@ -26,11 +25,13 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import operator
+import math
+import time
 import struct
 import sys
 from typing import Any, Iterable, Sequence
 
-# Retained for the private compatibility helper below; not used by ranking.
+# Avoid native setup overhead for small candidate sets.
 _SHORTLIST_FLOOR = 64
 _SHORTLIST_MULTIPLIER = 8
 
@@ -93,13 +94,19 @@ def _blas_shortlist(
     valid: list[tuple[int, Any, bytes]],
     dim: int,
     shortlist_n: int,
+    *, entity_key=None, deadline: float | None = None, max_abs_component: float | None = None,
 ) -> list[tuple[int, Any, bytes]]:
     """One ``cblas_sgemv`` call scores every ``valid`` row in float32. Its
-    shortlist is advisory only; exact ranking retains all rows. Raises on any
-    shape/library problem so the caller can keep the exact path."""
+    shortlist retains every candidate whose error interval overlaps the cut.
+    Raises on shape/library problems so the caller can use exact scoring."""
     n = len(valid)
     packed = bytearray(n * dim * 4)
+    max_doc = max_abs_component or 0.0
     for i, (_pos, _key, blob) in enumerate(valid):
+        _check_deadline(deadline)
+        if max_abs_component is None:
+            doc = struct.unpack(f"{dim}f", blob[:dim * 4])
+            max_doc = max(max_doc, abs(min(doc)), abs(max(doc)))
         packed[i * dim * 4 : (i + 1) * dim * 4] = blob[: dim * 4]
     a_buf = (ctypes.c_float * (n * dim)).from_buffer(packed)
     x_buf = (ctypes.c_float * dim)(*[float(v) for v in query])
@@ -108,9 +115,31 @@ def _blas_shortlist(
         _CBLAS_ROW_MAJOR, _CBLAS_NO_TRANS, n, dim,
         1.0, a_buf, dim, x_buf, 1, 0.0, y_buf, 1,
     )
+    _check_deadline(deadline)
     approx = list(y_buf)
-    order = sorted(range(n), key=lambda i: (-approx[i], valid[i][0]))[:shortlist_n]
-    return [valid[i] for i in order]
+    # Covers float32 query conversion, multiply/add rounding, float64
+    # reference accumulation, and implementations that flush subnormals.
+    nu = (2 * dim + 2) * 2.0 ** -24
+    if nu >= 0.5 or not all(math.isfinite(v) for v in approx):
+        return valid
+    error = (2 * nu / (1 - nu) * max_doc * sum(abs(v) for v in query)
+             + 4 * dim * 2.0 ** -126 * (max_doc + 1))
+    order = sorted(range(n), key=lambda i: (-approx[i], valid[i][0]))
+    seen = set()
+    cutoff = -math.inf
+    for i in order:
+        _check_deadline(deadline)
+        identity = entity_key(valid[i][1]) if entity_key else valid[i][0]
+        seen.add(identity)
+        if len(seen) >= shortlist_n:
+            cutoff = approx[i] - 2 * error
+            break
+    return [row for i, row in enumerate(valid) if approx[i] >= cutoff]
+
+
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("vector scan deadline expired")
 
 
 def top_k_by_dot(
@@ -119,6 +148,9 @@ def top_k_by_dot(
     limit: int,
     *,
     use_blas: bool = True,
+    entity_key=None,
+    deadline: float | None = None,
+    max_abs_component: float | None = None,
 ) -> list[tuple[Any, float]]:
     """Top ``limit`` ``(row_key, score)`` pairs from ``rows`` — an iterable
     of ``(row_key, blob)``, ``blob`` a packed float32 buffer — ranked by dot
@@ -128,20 +160,46 @@ def top_k_by_dot(
     missing or shorter than ``len(query) * 4`` bytes is skipped, same as the
     pure-Python implementation this replaces.
 
-    Every valid row is scored with exact arithmetic (float64 accumulation)
-    before the final cut. This function itself never raises for a scoring
-    reason.
+    Retained candidates receive exact float64 scores. Optional entity keys
+    collapse chunks in the same pass. Deadline expiry raises TimeoutError.
+    ``max_abs_component`` must bound every document component; normalized
+    callers can supply 1.0 to avoid inspecting the same floats again.
     """
     dim = len(query)
     fmt = f"{dim}f"
     q = tuple(query)
     limit = max(0, int(limit))
-    valid: list[tuple[int, Any, bytes]] = [
-        (pos, key, blob) for pos, (key, blob) in enumerate(rows) if blob and len(blob) >= dim * 4
-    ]
-    if not valid or limit == 0:
+    valid = []
+    for pos, (key, blob) in enumerate(rows):
+        _check_deadline(deadline)
+        if blob and len(blob) >= dim * 4:
+            valid.append((pos, key, blob))
+    if not valid or limit == 0 or dim == 0:
         return []
-
-    scored = [(pos, key, _exact_score(q, blob, dim, fmt)) for pos, key, blob in valid]
+    candidates = valid
+    if use_blas and len(valid) > max(_SHORTLIST_FLOOR, _SHORTLIST_MULTIPLIER * limit):
+        try:
+            sgemv = _cblas_sgemv()
+            if sgemv is not None:
+                candidates = _blas_shortlist(sgemv, q, valid, dim, limit,
+                                            entity_key=entity_key, deadline=deadline,
+                                            max_abs_component=max_abs_component)
+        except TimeoutError:
+            raise
+        except Exception:  # noqa: BLE001 — native failures use the exact fallback
+            candidates = valid
+    scored = []
+    for pos, key, blob in candidates:
+        _check_deadline(deadline)
+        scored.append((pos, key, _exact_score(q, blob, dim, fmt)))
     scored.sort(key=lambda item: (-item[2], item[0]))
-    return [(key, score) for _pos, key, score in scored[:limit]]
+    out, seen = [], set()
+    for pos, key, score in scored:
+        _check_deadline(deadline)
+        identity = entity_key(key) if entity_key else pos
+        if identity not in seen:
+            seen.add(identity)
+            out.append((key, score))
+            if len(out) >= limit:
+                break
+    return out

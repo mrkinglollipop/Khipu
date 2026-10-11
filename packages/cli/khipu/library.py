@@ -534,10 +534,16 @@ def scan(conn, name: str) -> dict[str, Any]:
                 continue
             digest = hashlib.sha256(data).hexdigest()
             prior = existing.get(rel)
-            if prior and prior[1] == digest:
-                unchanged += 1
-                continue
             title, author, tags, body = document_metadata(text, rel)
+            chunks = list(enumerate(embed.chunk_text(_clean(body))))
+            if prior and prior[1] == digest:
+                cur.execute(
+                    "SELECT chunk_idx, chunk_text FROM library_chunks WHERE document = %s ORDER BY chunk_idx",
+                    (prior[0],),
+                )
+                if list(cur.fetchall()) == chunks:
+                    unchanged += 1
+                    continue
             doc_id = _upsert_document(cur, name, rel, title, author, tags, len(data), st, digest)
             if prior:
                 cur.execute("DELETE FROM library_chunks WHERE document = %s", (doc_id,))
@@ -545,7 +551,7 @@ def scan(conn, name: str) -> dict[str, Any]:
             else:
                 added += 1
             rows = []
-            for idx, chunk in enumerate(embed.chunk_text(_clean(body))):
+            for idx, chunk in chunks:
                 rows.append((doc_id, idx, chunk, _md5(chunk)))
             if rows:
                 cur.executemany(_INSERT_CHUNK, rows)

@@ -190,7 +190,9 @@ def profile_has_index(cur, conn, profile: str) -> bool:
     The answer is cached per process for ``INDEX_CHECK_TTL_S``. A failed check
     fails open (True, not cached): the cosine leg then behaves as it did before
     this check existed."""
-    from khipu.profiles import profile_index_name
+    from khipu.profiles import (
+        profile_index_name, previous_profile_index_name, index_definition_matches, resolve_spec,
+    )
 
     try:
         name = profile_index_name(profile, "library_embeddings")
@@ -205,6 +207,16 @@ def profile_has_index(cur, conn, profile: str) -> bool:
             "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = %s", (name,)
         )
         exists = cur.fetchone() is not None
+        if not exists:
+            old_name = previous_profile_index_name(profile, "library_embeddings")
+            cur.execute(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = %s",
+                (old_name,),
+            )
+            row = cur.fetchone()
+            exists = bool(row and index_definition_matches(
+                profile, "library_embeddings", resolve_spec(profile, cur).dim, row[0],
+            ))
     except Exception as exc:  # noqa: BLE001
         _log(f"index check skipped: {type(exc).__name__}")
         try:

@@ -13,6 +13,12 @@ from khipu import profiles
 
 
 class HubAuditRegressionTest(unittest.TestCase):
+    def setUp(self):
+        patch = mock.patch("khipu.models.show_models", return_value={"embed": {
+            "provider": "local", "endpoint": "http://127.0.0.1:11434", "model_id": "local-model"}})
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def _snapshot(self, data: Path) -> Path:
         path = data / "hub_snapshot.sqlite"
         con = sqlite3.connect(path)
@@ -20,6 +26,78 @@ class HubAuditRegressionTest(unittest.TestCase):
         con.commit()
         con.close()
         return path
+
+    def test_rv3_local_policy_rejects_cloud_replica_profile(self):
+        spec = profiles.SEED_PROFILES["gemini-embedding-001@768"]
+        with mock.patch.object(hs, "active_snapshot_profile_spec", return_value=spec), \
+             mock.patch("khipu.models.show_models", return_value={"embed": {
+                 "provider": "local", "endpoint": "http://localhost:11434", "model_id": "local"}}), \
+             mock.patch("khipu.embed.embed_one", return_value=[1.0] * 768) as provider, \
+             mock.patch.object(hs, "open_snapshot", side_effect=AssertionError("must reject before reading")):
+            with self.assertRaisesRegex(RuntimeError, "local.*profile"):
+                hs.semantic_search_snapshot("private query")
+        provider.assert_not_called()
+
+    def test_rv3_episode_update_preserves_other_profiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = self._snapshot(Path(tmp))
+            con = sqlite3.connect(snap)
+            con.executemany("INSERT INTO memory_embeddings VALUES (?, 'episode', '1', ?, 'old', NULL, ?, NULL)",
+                            [(p, i, hs._vector_to_blob([1., 0.])) for p, i in [("a", 0), ("b", 0), ("b", 1)]])
+            con.commit(); con.close()
+            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
+                 mock.patch.object(hs, "meta_path", return_value=Path(tmp) / "meta.json"):
+                self.assertTrue(hs.upsert_episode({"id": 1, "summary": "alpha"}, [{"profile": "b", "kind": "episode", "ref": "1", "chunk_idx": 0, "embedding": [1., 0.]}])["ok"])
+            con = sqlite3.connect(snap)
+            rows = con.execute("SELECT profile, chunk_idx FROM memory_embeddings ORDER BY profile, chunk_idx").fetchall()
+            con.close()
+        self.assertEqual(rows, [("a", 0), ("b", 0)])
+
+    def test_rv3_deliverables_exclude_tombstones_and_pending_erasure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = self._snapshot(Path(tmp)); con = sqlite3.connect(snap)
+            con.executemany("INSERT INTO episodes (id, deleted_at, summary) VALUES (?, ?, 'alpha')", [(1, "deleted"), (2, None)])
+            con.executemany("INSERT INTO deliverables (id, project, episode_id, title, kind) VALUES (?, 'p', ?, 'secret', 'file')", [(1, 1), (2, 2)])
+            con.commit(); con.close()
+            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
+                 mock.patch.object(hs, "_pending_erasure_ids", return_value={2}):
+                con = hs.open_snapshot()
+                try:
+                    self.assertEqual(hs.recent_deliverables_snapshot(con, project="p"), [])
+                finally:
+                    con.close()
+
+    def test_rv3_late_capture_cannot_write_tombstoned_deliverables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = self._snapshot(Path(tmp)); con = sqlite3.connect(snap)
+            con.execute("INSERT INTO episodes (id, deleted_at, summary) VALUES (1, 'deleted', 'alpha')")
+            con.commit(); con.close()
+            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
+                 mock.patch.object(hs, "meta_path", return_value=Path(tmp) / "meta.json"):
+                hs.upsert_episode({"id": 1, "summary": "alpha"}, [], deliverable_rows=[{"id": 1, "episode_id": 1, "project": "p", "title": "secret", "kind": "file", "created_at": "2026-10-10"}])
+            con = sqlite3.connect(snap)
+            rows = con.execute("SELECT * FROM deliverables").fetchall(); con.close()
+        self.assertEqual(rows, [])
+
+    def test_rv3_empty_harness_uses_session_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = self._snapshot(Path(tmp)); con = sqlite3.connect(snap)
+            con.execute("INSERT INTO episodes (id, summary, session_id, harness) VALUES (1, 'alpha', 'codex:abc', '')")
+            con.commit(); con.close()
+            with mock.patch.object(hs, "snapshot_path", return_value=snap):
+                rows = hs.search_snapshot("alpha", 1, harness="codex")
+        self.assertEqual([r["id"] for r in rows], ["1"])
+
+    def test_rv3_dominant_entity_does_not_repeat_vector_scan(self):
+        from khipu import vector_scan
+        rows = [(i, "topic", "dominant" if i < 50 else "other", i, "text", hs._vector_to_blob([1., 0.])) for i in range(51)]
+        identities = {r[0]: r[1:5] for r in rows}
+        with mock.patch.object(hs, "_matrix_rows", return_value=(rows, identities)), \
+             mock.patch.object(hs, "_pending_erasure_ids", return_value=set()), \
+             mock.patch.object(vector_scan, "top_k_by_dot", wraps=vector_scan.top_k_by_dot) as scan:
+            found = hs.cosine_candidates_snapshot([1., 0.], "prof", limit=2)
+        self.assertEqual([r["id"] for r in found], ["dominant", "other"])
+        self.assertEqual(scan.call_count, 1)
 
     def test_episode_identity_filter_precedes_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -183,7 +261,9 @@ class HubAuditRegressionTest(unittest.TestCase):
                     )
                 spec = profiles.resolve_spec("local-model@2")
                 embed.reset_mock()
-                out = hs.semantic_search_snapshot("alpha", limit=1)
+                with mock.patch("khipu.models.show_models", return_value={"embed": {
+                        "provider": "local", "model_id": "local-model", "endpoint": spec.endpoint}}):
+                    out = hs.semantic_search_snapshot("alpha", limit=1)
         self.assertEqual(spec.endpoint, "http://127.0.0.1:11434")
         self.assertEqual(out[0]["id"], "1")
         embed.assert_called_once_with(
