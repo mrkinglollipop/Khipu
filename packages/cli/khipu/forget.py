@@ -289,27 +289,33 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
     if has_merged_sources:
         return {"ok": False, "removed": 0, "remaining": [reason]}
     try:
-        from khipu.outbox import outbox_dir, dead_dir, quarantine_dir
+        from khipu.outbox import _locked_outbox, outbox_dir, dead_dir, quarantine_dir
 
-        for directory in (outbox_dir(), dead_dir(), quarantine_dir()):
-            try:
-                paths = list(directory.iterdir())
-            except FileNotFoundError:
-                continue
-            for path in paths:
-                if path.suffix != ".json" or not path.is_file():
-                    continue
+        # One lock across all three directories: retry_dead() and the drain move
+        # jobs between them under the same lock, so a job cannot slip past the
+        # scan mid-move.
+        with _locked_outbox():
+            for directory in (outbox_dir(), dead_dir(), quarantine_dir()):
                 try:
-                    envelope = json.loads(path.read_bytes())
-                    payload = envelope.get("payload") if isinstance(envelope, dict) else None
-                    if not isinstance(payload, dict):
-                        raise ValueError("job payload is not an object")
-                except (OSError, ValueError, TypeError) as exc:
-                    remaining.append(f"{reason}; {path}: {type(exc).__name__}")
+                    paths = list(directory.iterdir())
+                except FileNotFoundError:
                     continue
-                if session_id and payload.get("session_id") == session_id:
-                    remaining.append(reason)
-                    return {"ok": False, "removed": 0, "remaining": remaining}
+                for path in paths:
+                    if path.suffix != ".json" or not path.is_file():
+                        continue
+                    try:
+                        envelope = json.loads(path.read_bytes())
+                        payload = envelope.get("payload") if isinstance(envelope, dict) else None
+                        if not isinstance(payload, dict):
+                            raise ValueError("job payload is not an object")
+                    except (OSError, ValueError, TypeError) as exc:
+                        remaining.append(f"{reason}; {path}: {type(exc).__name__}")
+                        continue
+                    # Without a session id there is no way to tell this job from
+                    # the forgotten episode's capture, so any retained job counts.
+                    if not session_id or payload.get("session_id") == session_id:
+                        remaining.append(reason)
+                        return {"ok": False, "removed": 0, "remaining": remaining}
     except Exception as exc:  # noqa: BLE001 — surface an incomplete forget
         return {"ok": False, "removed": 0, "remaining": [*remaining, reason],
                 "error": f"{type(exc).__name__}: {exc}"}
