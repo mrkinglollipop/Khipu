@@ -23,6 +23,52 @@ def _write(path: Path, rows: list[dict]) -> Path:
 
 
 class CaptureCapaTest(unittest.TestCase):
+    def test_scheduled_empty_queue_replays_outbox_with_bounds(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": td}), \
+                mock.patch.object(sc, "sweep_idle", return_value={}), \
+                mock.patch("khipu.outbox.drain", return_value={"replayed": 1, "failed": 0}) as replay:
+            out = sc.drain(sweep=True, limit=200, time_budget_s=300)
+        replay.assert_called_once()
+        self.assertLessEqual(replay.call_args.kwargs["limit"], 20)
+        self.assertLessEqual(replay.call_args.kwargs["time_budget_s"], 60)
+        self.assertEqual(out["outbox"]["replayed"], 1)
+
+    def test_successful_empty_extraction_is_archived_and_unblocks_sibling(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": td}), \
+                mock.patch("khipu.extract._generate", return_value='{"summary":""}') as generate, \
+                mock.patch("khipu.capture.capture") as capture, \
+                mock.patch("khipu.config.capture_mode", return_value="hub"):
+            for part in ("1/2", "2/2"):
+                sc.enqueue({"harness": "codex", "session_id": "s", "ts": sc._mint_ts(),
+                            "window_id": "empty-window", "part": part,
+                            "transcript": "ASSISTANT: All right then."})
+            out = sc.drain()
+            again = sc.drain()
+            archived = list((sc.khipu_home() / "empty").glob("*.json"))
+            self.assertEqual(out["empty"], 2)
+            self.assertEqual(out["failed"], 0)
+            self.assertEqual(again["jobs"], 0)
+            self.assertEqual(generate.call_count, 2)
+            self.assertEqual(len(archived), 2)
+            self.assertTrue(all(json.loads(p.read_text())["disposition"] == "empty" for p in archived))
+            capture.assert_not_called()
+
+    def test_empty_archive_failure_keeps_source_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": td}), \
+                mock.patch("khipu.extract._generate", return_value='{"summary":""}') as generate, \
+                mock.patch("khipu.config.capture_mode", return_value="hub"):
+            sc.enqueue({"harness": "codex", "session_id": "s", "ts": sc._mint_ts(),
+                        "transcript": "ASSISTANT: All right then."})
+            (sc.khipu_home() / "empty").write_text("blocked")
+            out = sc.drain()
+            self.assertEqual(out["failed"], 1)
+            pending = sc.queued_jobs()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(json.loads(pending[0].read_text()).get("disposition"), "empty")
+            (sc.khipu_home() / "empty").unlink()
+            self.assertEqual(sc.drain()["empty"], 1)
+            self.assertEqual(generate.call_count, 1)
+
     def test_oversize_coalesced_message_is_lossless_bounded_fragments(self):
         text = "begin-" + "m" * 70 + "-end"
         parts = sc._window_parts([("assistant", text)], 30)

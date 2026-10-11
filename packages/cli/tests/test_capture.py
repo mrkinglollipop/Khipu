@@ -304,6 +304,13 @@ class _EpisodesFakeCursor:
             else:
                 self._result = []
             return
+        if s.startswith("SELECT id FROM episodes WHERE raw @>"):
+            receipt = json.loads(params[0])["merged_from"][0]["source_id"]
+            hits = [eid for eid, e in self.episodes.items()
+                    if any(source.get("source_id") == receipt
+                           for source in (e.get("raw") or {}).get("merged_from", []))]
+            self._result = [(hits[0],)] if hits else []
+            return
         if s.startswith("SELECT id FROM episodes WHERE harness"):
             harness, sid, tr = params
             hits = [eid for eid, e in self.episodes.items()

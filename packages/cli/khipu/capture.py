@@ -68,6 +68,11 @@ def _jaccard(a: str, b: str) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
+def _source_receipt(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 def _dedup_exact_window(cur, payload: dict[str, Any]) -> int | None:
     """K3: every sibling PART of one split window shares the same (harness,
     session_id, transcript_range) — that alone would match the FIRST part
@@ -75,6 +80,11 @@ def _dedup_exact_window(cur, payload: dict[str, Any]) -> int | None:
     duplicate. window_id (+ part, carried in raw) makes each sibling its own
     identity. Pre-migration hub (no window_id column): falls back to the
     pre-K3 match, same as a payload with no window_id."""
+    cur.execute("SELECT id FROM episodes WHERE raw @> %s::jsonb LIMIT 1",
+                (json.dumps({"merged_from": [{"source_id": _source_receipt(payload)}]}),))
+    receipt = cur.fetchone()
+    if receipt:
+        return int(receipt[0])
     harness = payload.get("harness")
     session_id = payload.get("session_id")
     tr = payload.get("transcript_range")
@@ -323,6 +333,10 @@ def _merge_into_episode(
         return False
     topics, decisions, preferences, people, raw, target_ts, target_summary = row[:7]
     tags = row[7] if has_tags else None
+    source_id = _source_receipt(payload)
+    for source in (raw or {}).get("merged_from") or []:
+        if source.get("source_id") == source_id or source.get("payload") == payload:
+            return True
     new_topics = _union_json_list(topics, payload.get("topics"))
     new_decisions = _union_json_list(decisions, payload.get("decisions"))
     new_preferences = _union_json_list(preferences, payload.get("preferences"))
@@ -343,6 +357,7 @@ def _merge_into_episode(
     raw["verbatim"] = verbatim
     merged_from = list(raw.get("merged_from") or [])
     merged_from.append({
+        "source_id": source_id,
         "session_id": payload.get("session_id"),
         "ts": payload.get("ts"),
         "matched_via": matched_via,
@@ -887,11 +902,8 @@ def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
         # lands the row now, and if not it re-queues the same identity (no dup).
         if mode == "hub" and os.environ.get("KHIPU_HUB_FILE_MIRROR", "1").strip().lower() in {"0", "false", "off"}:
             _log(f"hub delivery pending; durable_outbox={queued}")
-            return 0 if queued else EX_SOFTWARE
+            return EX_SOFTWARE
         rc = run_capture_v2(payload, suppress_mirror=False)
-        if mode == "hub" and queued:
-            _log("hub delivery pending; durable_outbox=True")
-            return 0
         if rc != 0:
             return rc
         return 0 if queued else EX_SOFTWARE

@@ -1269,6 +1269,26 @@ def _save_claimed_job(claimed: Path, job: dict) -> None:
             pass
 
 
+def _archive_empty(claimed: Path, job: dict) -> None:
+    job["disposition"] = "empty"
+    _save_claimed_job(claimed, job)
+    with _claim_lock() as acquired:
+        if not acquired:
+            raise OSError("queue transition lock unavailable")
+        archive = khipu_home() / "empty"
+        archive.mkdir(parents=True, exist_ok=True)
+        destination = archive / claimed.with_suffix("").with_suffix(".json").name
+        with claimed.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(claimed, destination)
+        for directory in (archive, queue_dir()):
+            fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+
 def _claimant_gone(claimed: Path) -> bool:
     """True only when the pid in a claim's name certainly no longer exists.
 
@@ -1875,8 +1895,8 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
 def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = False,
           time_budget_s: float | None = None) -> dict:
     """Turn queued jobs into episodes. Safe to call from anywhere unsandboxed —
-    the harnesses' Stop hooks, the nightly, the app, the CLI. A job is removed
-    only once its episode is captured; anything else leaves it queued.
+    the nightly, the app, the CLI. A job leaves the queue only once its episode
+    is captured or its successful empty disposition and source are archived.
     Only scheduled/manual callers opt into the idle sweep; hooks stay cheap.
     """
     # In-flight provider calls finish normally; the budget bounds starting more jobs.
@@ -1889,6 +1909,17 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         out["sweep"] = sweep_out
     if reclaimed:
         out["reclaimed_stale"] = reclaimed
+    if sweep and not dry_run:
+        from khipu.outbox import drain as drain_outbox
+
+        remaining = max(0, deadline - time.monotonic()) if deadline is not None else 60
+        try:
+            out["outbox"] = drain_outbox(limit=min(20, limit) if limit is not None else 20,
+                                         time_budget_s=min(60, remaining))
+            out["failed"] += out["outbox"].get("failed", 0)
+        except Exception as exc:  # noqa: BLE001 — session jobs must still get a turn
+            out["outbox"] = {"error": f"{type(exc).__name__}: {exc}"}
+            out["failed"] += 1
     if not jobs:
         return out
     from khipu.capture import capture
@@ -1940,7 +1971,9 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         # URLs, release tags, never lost to summarisation either.
         deliverables = extract_deliverables(job.get("transcript", ""))
         cached = job.get("extracted_payload")
-        if isinstance(cached, dict):
+        if job.get("disposition") == "empty":
+            payload = None
+        elif isinstance(cached, dict):
             payload = dict(cached)
         else:
             try:
@@ -1952,10 +1985,18 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                 _log(f"drain: extraction failed for {original.name}, kept: {e}")
                 continue
         if payload is None:
-            out["failed"] += 1
-            _release(jp)
-            _record_drain(harness, captured=False, error="extract: no payload")
-            _log(f"drain: extraction returned no payload for {original.name}; kept")
+            if dry_run:
+                _release(jp)
+            else:
+                try:
+                    _archive_empty(jp, job)
+                except OSError as e:
+                    out["failed"] += 1
+                    _release(jp)
+                    _record_drain(harness, captured=False, error=f"empty checkpoint: {e}")
+                    continue
+                _record_drain(harness, captured=False, empty=True)
+            out["empty"] += 1
             continue
         if not isinstance(cached, dict):
             job["extracted_payload"] = payload
