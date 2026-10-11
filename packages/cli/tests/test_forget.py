@@ -101,6 +101,29 @@ class ForgetEpisodeTest(unittest.TestCase):
 
 
 class ForgetEverywhereTest(unittest.TestCase):
+    def test_outbox_partial_diagnostics_preserve_error_and_remaining(self):
+        hub_cur = _Cur(("2026-10-10T00:00:00Z", "Forget this", "grokbot:task"))
+        hub_conn = mock.MagicMock()
+        hub_conn.__enter__.return_value = hub_conn
+        hub_conn.cursor.return_value.__enter__.return_value = hub_cur
+        failures = (
+            PermissionError("outbox directory denied"),
+            {"ok": False, "removed": 0, "error": "unreadable record", "remaining": ["dead/record.json"]},
+        )
+        for failure in failures:
+            patch_args = ({"side_effect": failure} if isinstance(failure, Exception)
+                          else {"return_value": failure})
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as td, \
+                    mock.patch("khipu.db.connect", return_value=hub_conn), \
+                    mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": True}), \
+                    mock.patch("khipu.outbox.forget_identity", **patch_args):
+                out = forget.forget_everywhere(7, memory_root=Path(td))
+            self.assertFalse(out["ok"])
+            expected = ({"error": "PermissionError: outbox directory denied"}
+                        if isinstance(failure, Exception)
+                        else {"error": failure["error"], "remaining": failure["remaining"]})
+            self.assertEqual(out["partial_errors"]["outbox"], [expected])
+
     def test_touches_the_local_snapshot_too(self):
         ts = datetime(2026, 9, 5, 12, 20, 17, tzinfo=timezone.utc)
         hub_cur = _Cur((ts, "Shipped 0.4.0", "claude_code:abc"))

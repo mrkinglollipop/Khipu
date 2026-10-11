@@ -344,7 +344,8 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
         "snapshot": out["snapshot"].get("error"),
         "legacy_file": [item.get("reason") for item in out["legacy_files"] if item.get("reason")],
         "legacy_backups": [item.get("backups", {}).get("remaining", []) for item in out["legacy_files"]],
-        "outbox": [item.get("remaining", []) for item in out["outboxes"]],
+        "outbox": [{key: item[key] for key in ("error", "remaining") if item.get(key)}
+                   for item in out["outboxes"] if item.get("error") or item.get("remaining")],
     }
     out["partial_errors"] = {key: value for key, value in out["partial_errors"].items() if value}
     out["ok"] = out["complete"]

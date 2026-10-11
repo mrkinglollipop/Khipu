@@ -61,8 +61,6 @@ SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX = 12, 50
 GRAPH_LIMIT_DEFAULT, GRAPH_LIMIT_MAX = 25, 200
 GRAPH_HOPS_MAX = 4
 MAX_FRAME_BYTES = 1024 * 1024
-MAX_TOOL_TEXT_BYTES = 256 * 1024
-MAX_DETAIL_CHARS = 48 * 1024
 
 
 def _ensure_path() -> None:
@@ -483,7 +481,6 @@ TOOLS: list[dict] = [
                 },
             },
             "required": ["summary"],
-            "additionalProperties": False,
         },
     },
     {
@@ -667,15 +664,6 @@ TOOLS: list[dict] = [
 ]
 
 
-def _validate_arguments(name: str, args: dict) -> None:
-    schema = next((t["inputSchema"] for t in TOOLS if t["name"] == name), None)
-    if schema is None or schema.get("additionalProperties", True) is not False:
-        return
-    unknown = set(args) - schema.get("properties", {}).keys()
-    if unknown:
-        raise ValueError(f"unsupported arguments for {name}: {', '.join(sorted(unknown))}")
-
-
 def _positive_id(value, field: str) -> int:
     if type(value) is int and value > 0:
         return value
@@ -690,10 +678,6 @@ def _detail_response(kind: str, row: dict, **metadata) -> dict:
     row = dict(row)
     if kind == "episode":
         row.pop("raw", None)
-    body = row.get("body")
-    if isinstance(body, str) and len(body) > MAX_DETAIL_CHARS:
-        row.update(body=body[:MAX_DETAIL_CHARS], truncated=True,
-                   truncated_fields=["body"], body_total_chars=len(body))
     return {"kind": kind, **row, **metadata}
 
 
@@ -1138,7 +1122,6 @@ def _tool_capture(args: dict) -> dict:
     # configured and capture_mode != hub: still a hard reject — nothing would
     # ever act on a flag with no hook to read it. The CLI ``khipu capture``
     # does not go through this function.
-    _validate_arguments("khipu_capture", args)
     summary = args.get("summary")
     if not isinstance(summary, str) or not summary.strip():
         raise ValueError("khipu_capture requires a non-empty string 'summary'")
@@ -1269,6 +1252,12 @@ def _tool_owed_update(args: dict) -> dict:
             **({"until": str(args.get("until") or "")} if action == "snooze" else {})}
 
 
+class _ToolFailure(ValueError):
+    def __init__(self, payload: dict):
+        super().__init__(str(payload.get("error") or "tool failed"))
+        self.payload = payload
+
+
 def _tool_forget(args: dict) -> dict:
     """Complete forget of one episode (khipu.forget). From the gateway only a
     cloud harness's own captures may be forgotten: a local episode belongs to
@@ -1285,17 +1274,16 @@ def _tool_forget(args: dict) -> dict:
                 row = cur.fetchone()
         if row is None:
             raise ValueError(f"no such episode: {eid}")
-        harness, sep, sid = str(row[0] or "").partition(":")
-        if harness in LOCAL_HARNESSES or not sep or not sid or harness not in ("grokbot", "grok_bot"):
+        harness = str(row[0] or "").split(":", 1)[0]
+        if harness in LOCAL_HARNESSES:
             raise ValueError(
-                f"episode {eid} has local or unknown provenance ({harness or 'missing'}); "
-                "forget it on its owning Mac (khipu episode forget) — "
-                "the gateway forgets only recognized cloud captures"
+                f"episode {eid} was captured by {harness} on a Mac; forget it there "
+                "(khipu episode forget) — the gateway forgets only cloud captures"
             )
     out = forget_everywhere(eid)
-    if not out.get("ok"):
-        raise ValueError(str(out.get("error") or "forget failed"))
     out.pop("identity", None)
+    if not out.get("ok"):
+        raise _ToolFailure(out)
     return out
 
 
@@ -1471,14 +1459,9 @@ def _error(req_id, code: int, message: str) -> dict:
 
 
 def _tool_text(payload: dict, *, is_error: bool = False) -> dict:
-    text = json.dumps(payload, indent=2, default=str)
-    size = len(text.encode("utf-8"))
-    if size > MAX_TOOL_TEXT_BYTES:
-        text = json.dumps({"truncated": True, "original_bytes": size,
-                           "reason": "tool response exceeds byte budget; request narrower results"})
     return {
         "content": [
-            {"type": "text", "text": text}
+            {"type": "text", "text": json.dumps(payload, indent=2, default=str)}
         ],
         "isError": is_error,
     }
@@ -1623,8 +1606,9 @@ def _dispatch_message(msg: dict) -> dict | None:
         if _RELOAD_ON_CHANGE:
             _drop_modules_if_code_changed()
         try:
-            _validate_arguments(name, params.get("arguments", {}))
             payload = func(params.get("arguments") or {})
+        except _ToolFailure as exc:
+            return _result(req_id, _tool_text(exc.payload, is_error=True))
         except ValueError as exc:  # argument/mode rejections → tool error, not crash
             return _result(req_id, _tool_text({"error": str(exc)}, is_error=True))
         except KeyboardInterrupt:

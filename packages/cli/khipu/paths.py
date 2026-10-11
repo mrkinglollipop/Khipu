@@ -206,6 +206,8 @@ def import_local(*, source: Path, merge: bool = True) -> dict:
             dst = target / rel
             if dst.exists() and not merge:
                 continue
+            if dst.exists() and p.samefile(dst):
+                raise shutil.SameFileError(f"{p!s} and {dst!s} are the same file")
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.name in SENSITIVE_FILENAMES:
                 with p.open("rb") as source_file:
