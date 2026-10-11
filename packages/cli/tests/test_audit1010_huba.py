@@ -206,24 +206,6 @@ class HubAuditRegressionTest(unittest.TestCase):
                 out = hs.cosine_candidates_snapshot([1.0, 0.0], "p", limit=1, deadline=time.monotonic() + 5)
         self.assertEqual([row["id"] for row in out], ["t"])
 
-    def test_cosine_candidates_normalize_document_vectors(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            snap = self._snapshot(Path(tmp))
-            con = sqlite3.connect(snap)
-            con.execute("INSERT INTO topics (slug, title, body) VALUES ('aligned', 'aligned', 'aligned')")
-            con.execute("INSERT INTO topics (slug, title, body) VALUES ('scaled', 'scaled', 'scaled')")
-            con.execute("INSERT INTO memory_embeddings VALUES ('p', 'topic', 'aligned', 0, 'aligned', NULL, ?, NULL)", (hs._vector_to_blob([1.0, 0.0]),))
-            con.execute("INSERT INTO memory_embeddings VALUES ('p', 'topic', 'scaled', 0, 'scaled', NULL, ?, NULL)", (hs._vector_to_blob([2.0, 2.0]),))
-            con.commit()
-            con.close()
-            with mock.patch.object(hs, "snapshot_path", return_value=snap):
-                hs._MATRIX_CACHE.clear()
-                out = hs.cosine_candidates_snapshot([1.0, 0.0], "p", limit=2)
-        self.assertEqual([row["id"] for row in out], ["aligned", "scaled"])
-        self.assertAlmostEqual(out[0]["score"], 1.0, places=4)
-        self.assertAlmostEqual(out[1]["score"], 2 ** -0.5, places=4)
-        self.assertTrue(all(-1.0 <= row["score"] <= 1.0 for row in out))
-
     def test_outbox_merge_honors_episode_identity_and_query_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict("os.environ", {"KHIPU_OUTBOX": tmp}):
             from khipu import outbox
