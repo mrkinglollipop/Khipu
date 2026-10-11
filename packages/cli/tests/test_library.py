@@ -126,6 +126,9 @@ class FakeCursor:
             self._r = [(1,)] if p[0] in h.indexes else []
         elif s.startswith("SELECT indexname FROM pg_indexes"):
             self._r = [(n,) for n in sorted(h.indexes)]
+        elif s.startswith("SELECT indexdef FROM pg_indexes"):
+            # The fake hub never holds an index under a pre-hash name.
+            self._r = []
         elif s.startswith("CREATE INDEX IF NOT EXISTS"):
             h.indexes.add(s.split()[5])
         elif s.startswith("DROP INDEX IF EXISTS"):

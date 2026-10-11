@@ -192,6 +192,7 @@ class LegacyIndexDefinitionTest(unittest.TestCase):
     def test_delete_does_not_drop_a_wrong_legacy_index(self):
         spec = profiles.SEED_PROFILES[self.profile]
         cur = mock.Mock()
+        cur.fetchone.return_value = None
         with mock.patch.object(profiles, "load_spec", return_value=spec), \
                 mock.patch.object(profiles, "profile_users", return_value=[]), \
                 mock.patch.object(profiles, "_to_regclass", return_value=False), \
