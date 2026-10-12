@@ -279,3 +279,25 @@ class LogLineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProvisionalSkipsGraphCandidatesTest(unittest.TestCase):
+    def _graph_on(self):
+        return mock.patch("khipu.features.enabled", side_effect=lambda name: name == "graph_candidates")
+
+    def test_a_late_embedding_returns_the_keyword_rows_without_a_graph_call(self) -> None:
+        with _lane(embed=_slow(1.0, [1.0])), self._graph_on(), \
+                mock.patch("khipu.graph_candidates.replica_candidates", return_value=([], False)) as gc_call:
+            progress: dict = {}
+            out = rp._snapshot_search_hits(PROMPT, project=None, started=time.monotonic(), progress=progress)
+        gc_call.assert_not_called()
+        self.assertEqual(out["legs"], ["lexical"])
+        self.assertEqual(progress["provisional"]["legs"], ["lexical"])
+        self.assertEqual([h["id"] for h in out["hits"]], ["5"])
+
+    def test_the_full_pass_still_expands_the_graph_once(self) -> None:
+        with _lane(), self._graph_on(), \
+                mock.patch("khipu.graph_candidates.replica_candidates", return_value=([], False)) as gc_call:
+            out = rp._snapshot_search_hits(PROMPT, project=None, started=time.monotonic(), progress={})
+        self.assertEqual(gc_call.call_count, 1)
+        self.assertIn("cosine", out["legs"])

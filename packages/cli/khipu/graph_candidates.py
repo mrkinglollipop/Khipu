@@ -31,7 +31,9 @@ arithmetic (finding 8: a score-space boost collapsed recall in Hindsight).
 """
 from __future__ import annotations
 
+import json
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
@@ -403,10 +405,98 @@ def _slug_prefilter_word(slug: str) -> str:
     return max(words, key=len, default="")
 
 
+# slug -> its PER_SEED_CAP most recent live episodes as (ts, id, summary), for
+# the replica identity in "key". Turning every topic label into a slug costs
+# about 45,000 Python calls, and on each prompt that was a fifth of the
+# per-prompt lane's budget on a busy Mac (2026-10-12); a long-lived process
+# pays it once per replica generation instead.
+_SLUG_LOCK = threading.Lock()
+_SLUG_CACHE: dict[str, Any] = {}
+_SLUG_RELOADING = False
+
+
+def _slug_map_key() -> tuple[Any, ...] | None:
+    from khipu import hub_snapshot
+
+    path = hub_snapshot.snapshot_path()
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    # Pending erasures hide episodes without touching the file.
+    pending = frozenset(hub_snapshot._pending_erasure_ids(path))
+    return (str(path), st.st_mtime_ns, st.st_size, pending)
+
+
+def _build_slug_map() -> dict[str, list[tuple[Any, Any, Any]]]:
+    from khipu import hub_snapshot, topic_graph
+
+    con = hub_snapshot.open_snapshot()
+    try:
+        live = "WHERE deleted_at IS NULL " if "deleted_at" in hub_snapshot._snapshot_table_columns(con, "episodes") else ""
+        rows = con.execute(f"SELECT id, ts, summary, topics FROM episodes {live}ORDER BY ts DESC").fetchall()
+    finally:
+        con.close()
+    out: dict[str, list[tuple[Any, Any, Any]]] = {}
+    for eid, ts, summary, topics in rows:
+        try:
+            labels = json.loads(topics) if topics else []
+        except (ValueError, TypeError):
+            continue
+        for slug in {topic_graph.topic_slug_from_label(str(label)) for label in labels or []}:
+            bucket = out.setdefault(slug, [])
+            if len(bucket) < PER_SEED_CAP:
+                bucket.append((ts, eid, summary))
+    return out
+
+
+def _rebuild_slug_map(key: tuple[Any, ...]) -> None:
+    global _SLUG_RELOADING
+    try:
+        by_slug = _build_slug_map()
+    except Exception:  # noqa: BLE001 — the stale map keeps serving
+        by_slug = None
+    with _SLUG_LOCK:
+        if by_slug is not None:
+            _SLUG_CACHE.update({"key": key, "map": by_slug})
+        _SLUG_RELOADING = False
+
+
+def _episode_slug_map() -> dict[str, list[tuple[Any, Any, Any]]] | None:
+    """The cached map, serving the previous generation (and rebuilding it on
+    one daemon thread) when the replica has moved; built synchronously only
+    when there is none yet. None when it cannot be built: the SQL path runs."""
+    global _SLUG_RELOADING
+    key = _slug_map_key()
+    if key is None:
+        return None
+    with _SLUG_LOCK:
+        cached = _SLUG_CACHE.get("key")
+        if cached == key:
+            return _SLUG_CACHE["map"]
+        if cached is not None and cached[0] == key[0]:
+            if not _SLUG_RELOADING:
+                _SLUG_RELOADING = True
+                threading.Thread(target=_rebuild_slug_map, args=(key,), daemon=True).start()
+            return _SLUG_CACHE["map"]
+        try:
+            by_slug = _build_slug_map()
+        except Exception:  # noqa: BLE001 — fall back to the per-seed SQL join
+            return None
+        _SLUG_CACHE.update({"key": key, "map": by_slug})
+        return by_slug
+
+
 def _replica_topic_recent_episodes(con, slug: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
     from khipu.hub_snapshot import _snapshot_table_columns
     from khipu import topic_graph
 
+    by_slug = _episode_slug_map()
+    if by_slug is not None:
+        return [
+            _recent_episode_row(eid, ts, summary, seed_rank=seed_rank, seed_key=seed_key)
+            for ts, eid, summary in by_slug.get(slug, [])
+        ]
     # A single source of truth for the slug form (unlike the hub leg, which
     # cannot call into Python mid-query): registers the SAME function
     # topic_graph.persist_capture_graph already slugifies episode topics
@@ -430,16 +520,20 @@ def _replica_topic_recent_episodes(con, slug: str, *, seed_rank: int, seed_key: 
         f"ORDER BY e.ts DESC LIMIT ?",
         (*params, slug, PER_SEED_CAP),
     ).fetchall()
-    out = []
-    for eid, ts, summary in rows:
-        out.append({
-            "kind": "episode", "id": str(eid), "label": (summary or "")[:200],
-            "snippet": (summary or "")[:4000],
-            "_seed_rank": seed_rank, "_seed_key": seed_key,
-            "_relation": _CAPTURE_TOPIC_RELATION,
-            "_recency": _ts_key(ts),
-        })
-    return out
+    return [
+        _recent_episode_row(eid, ts, summary, seed_rank=seed_rank, seed_key=seed_key)
+        for eid, ts, summary in rows
+    ]
+
+
+def _recent_episode_row(eid, ts, summary, *, seed_rank: int, seed_key: str) -> dict[str, Any]:
+    return {
+        "kind": "episode", "id": str(eid), "label": (summary or "")[:200],
+        "snippet": (summary or "")[:4000],
+        "_seed_rank": seed_rank, "_seed_key": seed_key,
+        "_relation": _CAPTURE_TOPIC_RELATION,
+        "_recency": _ts_key(ts),
+    }
 
 
 def replica_candidates(
@@ -451,6 +545,9 @@ def replica_candidates(
     seeds = _seeds(fused)
     if not seeds:
         return [], False
+    from khipu import hub_snapshot
+
+    hub_snapshot.ensure_edge_indexes()
     previous_busy = int(con.execute("PRAGMA busy_timeout").fetchone()[0])
     bounded_con = _SqliteDeadlineConnection(con, deadline)
     try:
