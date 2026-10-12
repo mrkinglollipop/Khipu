@@ -509,6 +509,22 @@ def _warm_imports() -> None:
         _log(f"warm imports skipped: {type(exc).__name__}: {exc}")
 
 
+def _warm_caches() -> None:
+    """Load the replica's vector matrix and the topic slug map now, on a thread.
+    The service restarts on every code change, and a cold matrix load (about a
+    second, competing with the lexical scan for the same process) cost the
+    first prompts after each restart their whole budget (2026-10-12)."""
+    try:
+        from khipu import graph_candidates, hub_snapshot
+
+        profile = hub_snapshot.active_snapshot_profile()
+        if profile:
+            hub_snapshot._matrix_rows(hub_snapshot.snapshot_path(), profile, None)
+        graph_candidates._episode_slug_map()
+    except Exception as exc:  # noqa: BLE001 — the first prompt loads them instead
+        _log(f"warm caches skipped: {type(exc).__name__}: {exc}")
+
+
 def serve(
     path: Path | None = None, *, install_signals: bool = True, keep_alive: bool = True
 ) -> int:
@@ -528,6 +544,7 @@ def serve(
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda _s, _f: svc.stop())
     _warm_imports()
+    threading.Thread(target=_warm_caches, daemon=True).start()
     _log(f"serving {svc.path} pid={os.getpid()} version={__version__} stamp={svc.stamp}")
     try:
         return svc.run()
