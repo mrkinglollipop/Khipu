@@ -7,6 +7,7 @@ embedding provider, files live in a temp folder. No database, no network."""
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import io
 import json
@@ -171,6 +172,9 @@ class FakeCursor:
                     stale = [x for x in emb if x[4][1] is not None and x[4][1] != x[3]]
                     if emb:
                         self._r.append((n, prof, len(emb), len(stale)))
+        elif s.startswith("SELECT DISTINCT e.document FROM library_embeddings"):
+            self._r = [(doc,) for doc in sorted({key[1] for key in h.embs})
+                       if h.docs[doc]["source"] == p[0]]
         elif s.startswith("SELECT id, rel_path, content_hash FROM library_documents"):
             self._r = [(i, d["rel_path"], d["content_hash"]) for i, d in h.docs.items()
                        if d["source"] == p[0]]
@@ -451,6 +455,85 @@ class ScanTest(_Base):
         self.assertFalse(any(s.startswith(("INSERT INTO library_documents", "INSERT INTO library_chunks",
                                            "DELETE FROM library_chunks")) for s in new))
 
+    def test_scan_refuses_to_rebuild_most_embedded_documents_and_changes_nothing(self):
+        for i in range(30):
+            self.write(f"doc{i:02}.txt", f"text {i}")
+        library.scan(self.hub, "lib1")
+        # Embeddings in a different profile count too; the deletion cascades across profiles.
+        for (doc, idx), (_, digest) in self.hub.chunks.items():
+            self.hub.embs[("other@4", doc, idx)] = ("[1,0,0,0]", digest)
+        intact = dict(self.hub.chunks)
+        for key in self.hub.chunks:
+            self.hub.chunks[key] = ("broken layout", "broken")
+        new_file = self.write("000-new.txt", "must not be added before preflight")
+        before = copy.deepcopy((self.hub.docs, self.hub.chunks, self.hub.embs))
+        commits = self.hub.commits
+        start = len(self.hub.executed)
+        with mock.patch.object(self.hub, "rollback") as rollback:
+            with self.assertRaises(library.LibraryError) as ctx:
+                library.scan(self.hub, "lib1")
+        rollback.assert_called_once()
+        self.assertIn("30 embedded documents would be rebuilt out of 30", str(ctx.exception))
+        self.assertIn("vectors would be deleted", str(ctx.exception))
+        self.assertIn("nothing was changed", str(ctx.exception))
+        self.assertIn("khipu library scan lib1 --allow-rebuild", str(ctx.exception))
+        self.assertEqual((self.hub.docs, self.hub.chunks, self.hub.embs), before)
+        self.assertEqual(self.hub.commits, commits)
+        self.assertFalse(any(s.startswith(("INSERT", "UPDATE", "DELETE"))
+                             for s, _ in self.hub.executed[start:]))
+        new_file.unlink()
+        allowed = library.scan(self.hub, "lib1", allow_rebuild=True)
+        self.assertEqual((allowed["updated"], allowed["added"]), (30, 0))
+        self.assertEqual(self.hub.embs, {})
+        for (doc, idx), (_, digest) in self.hub.chunks.items():
+            self.hub.embs[(TINY.id, doc, idx)] = ("[1,0,0,0]", digest)
+        for key in list(intact)[:2]:
+            self.hub.chunks[key] = ("broken layout", "broken")
+        self.assertEqual(library.scan(self.hub, "lib1")["updated"], 2)
+        self.assertEqual(len(self.hub.embs), 28)
+
+    def test_mass_rebuild_threshold_is_strict_and_uses_the_embedded_fraction(self):
+        for i in range(300):
+            self.write(f"doc{i:03}.txt", f"text {i}")
+        library.scan(self.hub, "lib1")
+        for (doc, idx), (_, digest) in self.hub.chunks.items():
+            self.hub.embs[(TINY.id, doc, idx)] = ("[1,0,0,0]", digest)
+        keys = list(self.hub.chunks)
+        # Exactly ten percent is permitted, even though it exceeds twenty documents.
+        for key in keys[:30]:
+            self.hub.chunks[key] = ("broken", "bad")
+        self.assertEqual(library.scan(self.hub, "lib1")["updated"], 30)
+        for key in keys[:30]:
+            self.hub.embs[(TINY.id, *key)] = ("[1,0,0,0]", self.hub.chunks[key][1])
+        for key in keys[:31]:
+            self.hub.chunks[key] = ("broken", "bad")
+        with self.assertRaisesRegex(library.LibraryError, "31 embedded documents.*300"):
+            library.scan(self.hub, "lib1")
+
+    def test_file_unreadable_between_scan_phases_is_skipped_without_deletion(self):
+        path = self.write("existing.txt", "old text")
+        library.scan(self.hub, "lib1")
+        doc = next(iter(self.hub.docs))
+        self.hub.embs[(TINY.id, doc, 0)] = ("[1,0,0,0]", self.hub.chunks[(doc, 0)][1])
+        self.write("existing.txt", "changed text")
+        before = copy.deepcopy((self.hub.docs, self.hub.chunks, self.hub.embs))
+        original = Path.read_bytes
+        reads = 0
+
+        def read(p):
+            nonlocal reads
+            if p == path:
+                reads += 1
+                if reads == 2:
+                    raise PermissionError("unreadable after planning")
+            return original(p)
+
+        with mock.patch.object(Path, "read_bytes", read):
+            out = library.scan(self.hub, "lib1")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["skipped_detail"], {"unreadable": 1})
+        self.assertEqual((self.hub.docs, self.hub.chunks, self.hub.embs), before)
+
     def test_changed_file_is_rechunked_and_its_vectors_dropped(self):
         self.write("A/one.txt", "first version")
         self.write("A/two.txt", "stays")
@@ -610,6 +693,11 @@ class BackfillTest(_Base):
         embed.set_transport(transport)
         self.addCleanup(embed.set_transport, None)
         return library.backfill(self.hub, "lib1", **kw)
+
+    def test_library_backfill_draws_on_the_library_ceiling(self):
+        with mock.patch.object(embed, "embed_batch", return_value=[[1, 0, 0, 0]]) as call:
+            library.backfill(self.hub, "lib1", limit=1)
+        self.assertEqual(call.call_args.kwargs["budget"], "library")
 
     def test_a_small_backfill_leaves_an_existing_index_alone(self):
         name = profiles.profile_index_name(TINY.id, "library_embeddings")
@@ -900,7 +988,12 @@ class ImportTest(_Base):
         first = self.run_import()
         snapshot = (dict(self.hub.chunks), dict(self.hub.embs), set(self.hub.docs))
         second = self.run_import()
-        self.assertEqual(first, second)
+        counters = {"imported_documents", "unverified_documents"}
+        self.assertEqual({k: v for k, v in first.items() if k not in counters},
+                         {k: v for k, v in second.items() if k not in counters})
+        self.assertEqual(first["imported_documents"], 2)
+        self.assertEqual(second["imported_documents"], 0)
+        self.assertEqual(second["unverified_documents"], 0)
         self.assertEqual((dict(self.hub.chunks), dict(self.hub.embs), set(self.hub.docs)), snapshot)
 
     def test_profile_is_created_with_the_provider_inferred_from_the_model(self):
@@ -953,12 +1046,43 @@ class ImportTest(_Base):
         self.assertEqual((out["read"], out["imported"], out["skipped_bad_vector"],
                           out["skipped_bad_row"]), (4, 1, 1, 2))
 
-    def test_new_import_is_unverified_and_rebuilt_from_local_text_on_scan(self):
+    def test_imported_documents_record_the_file_hash_they_were_imported_against(self):
         imported = self.run_import()
-        self.assertEqual(imported["unverified_documents"], 2)
-        self.assertTrue(all(d["content_hash"] == "" for d in self.hub.docs.values()))
+        self.assertEqual(imported["imported_documents"], 2)
+        for doc in self.hub.docs.values():
+            digest = hashlib.sha256((self.root / doc["rel_path"]).read_bytes()).hexdigest()
+            self.assertEqual(doc["content_hash"], "imported:" + digest)
+
+    def test_scan_keeps_imported_chunks_and_vectors_while_the_file_is_unchanged(self):
+        self.run_import()
+        before = copy.deepcopy((self.hub.docs, self.hub.chunks, self.hub.embs))
+        start = len(self.hub.executed)
+        with mock.patch.object(embed, "chunk_text", side_effect=AssertionError("must not rechunk")):
+            scanned = library.scan(self.hub, "lib1")
+        self.assertEqual((self.hub.docs, self.hub.chunks, self.hub.embs), before)
+        self.assertEqual((scanned["updated"], scanned["unchanged"], scanned["imported_kept"]), (0, 2, 2))
+        self.assertFalse(any(s.startswith("SELECT chunk_idx") for s, _ in self.hub.executed[start:]))
+
+    def test_scan_rebuilds_an_imported_document_whose_file_changed(self):
+        self.run_import()
+        unchanged = next(doc for doc, d in self.hub.docs.items() if d["rel_path"] == "Lewis/Mere.md")
+        before_chunks = {k: v for k, v in self.hub.chunks.items() if k[0] == unchanged}
+        before_embs = {k: v for k, v in self.hub.embs.items() if k[1] == unchanged}
+        path = self.write("Heiser/Unseen.txt", "new local text")
         scanned = library.scan(self.hub, "lib1")
-        self.assertEqual(scanned["updated"], 2)
+        self.assertEqual((scanned["updated"], scanned["imported_kept"]), (1, 1))
+        changed = next(doc for doc in self.hub.docs if doc != unchanged)
+        self.assertEqual(self.hub.docs[changed]["content_hash"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(self.hub.chunks[(changed, 0)][0], "new local text")
+        self.assertEqual(self.hub.embs, before_embs)
+        self.assertEqual({k: v for k, v in self.hub.chunks.items() if k[0] == unchanged}, before_chunks)
+
+    def test_legacy_empty_import_hash_is_rebuilt(self):
+        self.run_import()
+        for doc in self.hub.docs.values():
+            doc["content_hash"] = ""
+        scanned = library.scan(self.hub, "lib1")
+        self.assertEqual((scanned["updated"], scanned["imported_kept"]), (2, 0))
         self.assertEqual(sorted(t for t, _ in self.hub.chunks.values()), ["alpha beta", "gamma delta"])
 
     def test_imported_chunks_cannot_replace_a_scans_chunks_for_the_same_file(self):
@@ -1161,7 +1285,7 @@ class CliTest(_Base):
         rc, out = self.run_cli(library_cmd="scan", name="lib1")
         self.assertEqual(rc, 0)
         self.assertEqual(
-            set(out), {"ok", "source", "added", "updated", "removed", "unchanged",
+            set(out), {"ok", "source", "added", "updated", "removed", "unchanged", "imported_kept",
                        "skipped", "skipped_detail", "documents", "chunks"})
         rc, out = self.run_cli(library_cmd="list")
         self.assertEqual((rc, list(out)), (0, ["libraries"]))
@@ -1186,6 +1310,17 @@ class CliTest(_Base):
         self.assertEqual(self.run_cli(library_cmd="enable", name="lib1")[1], {"ok": True, "name": "lib1", "enabled": True})
         rc, out = self.run_cli(library_cmd="remove", name="lib1", yes=True)
         self.assertEqual((rc, out["removed"]), (0, "lib1"))
+
+    def test_scan_cli_passes_allow_rebuild(self):
+        parser = cli.build_parser()
+        for argv, expected in ((["library", "scan", "lib1"], False),
+                               (["library", "scan", "lib1", "--allow-rebuild"], True)):
+            args = parser.parse_args(argv)
+            with mock.patch("khipu.db.connect", return_value=self.hub), \
+                    mock.patch.object(library, "scan", return_value={"ok": True}) as scan, \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(cli.cmd_library(args), 0)
+            scan.assert_called_once_with(self.hub, "lib1", allow_rebuild=expected)
 
     def test_parser_syntax(self):
         p = cli.build_parser()
@@ -1232,6 +1367,56 @@ class NightlyAndDoctorTest(_Base):
         by = {r["name"]: r for r in out["results"]}
         self.assertIn("error", by["lib2"])
         self.assertNotIn("error", by["zlib"])
+
+    def test_nightly_embeds_at_most_the_nightly_limit_and_zero_means_scan_only(self):
+        for i in range(5):
+            self.write(f"doc{i}.txt", f"text {i}")
+        embed.set_transport(_voyage_transport())
+        self.addCleanup(embed.set_transport, None)
+        with mock.patch.object(library, "NIGHTLY_LIBRARY_CHUNKS", 2), \
+                mock.patch.object(library, "backfill", wraps=library.backfill) as bf:
+            out = library.backfill_all(self.hub)
+        bf.assert_called_once_with(self.hub, "lib1", limit=2)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], "partial")
+        item = out["results"][0]
+        self.assertEqual((item["embedded"], item["remaining"], item["nightly_limit"]), (2, 4, 2))
+        self.assertEqual(item["status"], "partial")
+        with mock.patch.object(library, "NIGHTLY_LIBRARY_CHUNKS", 0), \
+                mock.patch.object(library, "backfill") as bf:
+            out = library.backfill_all(self.hub)
+        bf.assert_not_called()
+        self.assertTrue(out["ok"])
+        item = out["results"][0]
+        self.assertEqual((item["embedded"], item["failed"], item["remaining"], item["nightly_limit"]), (0, 0, 4, 0))
+        self.assertEqual(item["status"], "partial")
+        library.backfill(self.hub, "lib1")
+        with mock.patch.object(library, "NIGHTLY_LIBRARY_CHUNKS", 0), \
+                mock.patch.object(library, "backfill") as bf:
+            out = library.backfill_all(self.hub)
+        bf.assert_not_called()
+        self.assertEqual(out["results"][0]["status"], "complete")
+
+    def test_a_refused_scan_fails_that_library_and_skips_its_backfill(self):
+        for i in range(30):
+            self.write(f"doc{i}.txt", f"text {i}")
+        library.scan(self.hub, "lib1")
+        for (doc, idx), (_, digest) in self.hub.chunks.items():
+            self.hub.embs[(TINY.id, doc, idx)] = ("[1,0,0,0]", digest)
+            self.hub.docs[doc]["content_hash"] = ""
+        other = Path(self.tmp.name) / "other"
+        other.mkdir()
+        library.add_source(self.hub, "zlib", str(other), TINY.id)
+        before = copy.deepcopy((self.hub.docs, self.hub.chunks, self.hub.embs))
+        with mock.patch.object(library, "backfill", wraps=library.backfill) as bf:
+            out = library.backfill_all(self.hub)
+        bf.assert_called_once_with(self.hub, "zlib", limit=library.NIGHTLY_LIBRARY_CHUNKS)
+        self.assertFalse(out["ok"])
+        item = out["results"][0]
+        self.assertFalse(item["ok"])
+        self.assertIn("--allow-rebuild", item["error"])
+        self.assertEqual((self.hub.docs, self.hub.chunks, self.hub.embs), before)
+        self.assertTrue(out["results"][1]["ok"])
 
     def test_budget_exhaustion_skips_the_remaining_libraries(self):
         library.add_source(self.hub, "zlib", str(self.root), TINY.id)

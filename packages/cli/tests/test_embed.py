@@ -1334,7 +1334,7 @@ class EmbedDailyBudgetTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         from pathlib import Path
         path = Path(self.tmp.name) / "embed-budget.json"
-        self._p = mock.patch.object(em, "_budget_path", lambda: path)
+        self._p = mock.patch.object(em, "_budget_path", lambda scope="memory": path)
         self._p.start()
         self.addCleanup(self._p.stop)
         self.addCleanup(self.tmp.cleanup)
@@ -1623,7 +1623,7 @@ class EmbedBudgetUnlimitedTest(unittest.TestCase):
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.object(em, "_budget_path", lambda: Path(tmp) / "b.json"), \
+                mock.patch.object(em, "_budget_path", lambda scope="memory": Path(tmp) / "b.json"), \
                 mock.patch.object(em, "EMBED_DAILY_CALL_BUDGET", 0):
             for _ in range(5):
                 em._budget_take()

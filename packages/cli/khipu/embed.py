@@ -388,18 +388,19 @@ QUERY_EMBED_DELAY_S = 1.0
 # 0 turns the ceiling off. Local to this Mac
 # (~/.config/khipu/state/embed-budget.json), reset at UTC midnight.
 EMBED_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_EMBED_DAILY_CALLS", "10000"))
+LIBRARY_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_LIBRARY_EMBED_DAILY_CALLS", "2000"))
 # Query vectors are cached on the hub (memory_query_cache, migration 0014) so a
 # repeated question costs no API call; rows unused for this long are pruned by
 # the nightly.
 QUERY_CACHE_TTL_DAYS = 30
 
 
-def _budget_path() -> Path:
+def _budget_path(scope: str = "memory") -> Path:
     from khipu.paths import ensure_data_dir
 
     d = ensure_data_dir() / "state"
     d.mkdir(parents=True, exist_ok=True)
-    return d / "embed-budget.json"
+    return d / ("embed-budget-library.json" if scope == "library" else "embed-budget.json")
 
 
 def _budget_today() -> str:
@@ -418,17 +419,17 @@ def _read_budget(path: Path, day: str) -> int:
     return calls if raw_day == day else 0
 
 
-def budget_status() -> dict[str, Any]:
-    """Today's embed API calls against EMBED_DAILY_CALL_BUDGET."""
+def budget_status(scope: str = "memory") -> dict[str, Any]:
+    """Today's embed API calls against the selected scope's daily ceiling."""
     day = _budget_today()
     available, error = True, None
     try:
-        path = _budget_path()
+        path = _budget_path(scope)
         used = _read_budget(path, day)
     except (OSError, ValueError, TypeError) as exc:
         used = None
         available, error = False, f"{type(exc).__name__}: {exc}"
-    cap = EMBED_DAILY_CALL_BUDGET
+    cap = LIBRARY_DAILY_CALL_BUDGET if scope == "library" else EMBED_DAILY_CALL_BUDGET
     unlimited = cap <= 0
     return {
         "day": day,
@@ -487,12 +488,14 @@ def _lock_budget_file(lock, deadline: float):
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def _budget_take(*, deadline: float | None = None) -> None:
+def _budget_take(*, deadline: float | None = None, scope: str = "memory") -> None:
     """Atomically reserve one API call for today across local processes."""
     deadline = time.monotonic() + 1.0 if deadline is None else deadline
-    day, cap = _budget_today(), EMBED_DAILY_CALL_BUDGET
+    day = _budget_today()
+    cap = LIBRARY_DAILY_CALL_BUDGET if scope == "library" else EMBED_DAILY_CALL_BUDGET
+    variable = "KHIPU_LIBRARY_EMBED_DAILY_CALLS" if scope == "library" else "KHIPU_EMBED_DAILY_CALLS"
     try:
-        path = _budget_path()
+        path = _budget_path(scope)
         lock_path = path.with_suffix(path.suffix + ".lock")
         path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+", encoding="utf-8") as lock:
@@ -508,7 +511,7 @@ def _budget_take(*, deadline: float | None = None) -> None:
                 if cap > 0 and used >= cap:
                     raise RuntimeError(
                         f"embed budget exhausted: {used} calls today "
-                        f"(cap {cap}, KHIPU_EMBED_DAILY_CALLS)"
+                        f"(cap {cap}, {variable})"
                     )
                 with tempfile.NamedTemporaryFile(
                         "w", encoding="utf-8", dir=path.parent,
@@ -761,6 +764,7 @@ def _redact_provider_diagnostic(text: str, headers: dict[str, str]) -> str:
 def _post_json(
     url: str, body: dict[str, Any], headers: dict[str, str], *,
     provider: str, retries: int, timeout: float, delay: float, transport=None,
+    budget: str = "memory",
 ) -> dict[str, Any]:
     """POST ``body`` with the retry ladder every provider shares: 429/5xx and
     network errors back off ``delay`` doubling; anything else raises at once."""
@@ -768,7 +772,7 @@ def _post_json(
     payload: dict[str, Any] = {}
     for attempt in range(retries + 1):
         deadline = time.monotonic() + max(0, timeout)
-        _budget_take(deadline=deadline)
+        _budget_take(deadline=deadline, scope=budget)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeError("embed budget accounting deadline expired")
@@ -808,6 +812,7 @@ def embed_batch(
     delay: float = 2.0,
     transport=None,
     input_type: str | None = None,
+    budget: str = "memory",
 ) -> list[list[float]]:
     """Embed texts under ``profile``'s provider; dim-checked, L2-normalized when
     the profile says ``normalize='l2'`` (every shipped profile does).
@@ -830,7 +835,7 @@ def embed_batch(
         url, body, headers = builder(spec, part, input_type)
         payload = _post_json(
             url, body, headers, provider=spec.provider,
-            retries=retries, timeout=timeout, delay=delay, transport=transport,
+            retries=retries, timeout=timeout, delay=delay, transport=transport, budget=budget,
         )
         vecs = _parse_vectors(spec.provider, payload)
         if len(vecs) != len(part):

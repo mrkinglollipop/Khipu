@@ -348,7 +348,7 @@ class BudgetReservationTest(unittest.TestCase):
              mock.patch.object(embed.time, "monotonic", side_effect=[10., 10.25]):
             embed._post_json("unused", {}, {}, provider="local", retries=0,
                              timeout=1., delay=0, transport=transport)
-        take.assert_called_once_with(deadline=11.)
+        take.assert_called_once_with(deadline=11., scope="memory")
         self.assertEqual(transport.call_args.args[-1], 0.75)
 
     def test_rv3_busy_budget_lock_expires_without_provider_call(self):
@@ -395,7 +395,7 @@ class BudgetReservationTest(unittest.TestCase):
 
             from khipu import embed
             embed.EMBED_DAILY_CALL_BUDGET = 2
-            embed._budget_path = lambda: Path(os.environ["AUDIT_BUDGET_PATH"])
+            embed._budget_path = lambda scope="memory": Path(os.environ["AUDIT_BUDGET_PATH"])
             embed._budget_take()
             embed._budget_take()
             try:

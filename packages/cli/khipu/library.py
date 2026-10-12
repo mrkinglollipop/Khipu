@@ -43,6 +43,10 @@ from khipu import profiles
 NAME_RE = re.compile(r"^[a-z0-9_-]{1,40}$")
 EXTENSIONS = (".txt", ".md")
 MAX_FILE_BYTES = 64 * 1024 * 1024
+IMPORTED_HASH_PREFIX = "imported:"
+MASS_REBUILD_MIN_DOCS = 20
+MASS_REBUILD_MAX_FRACTION = 0.10
+NIGHTLY_LIBRARY_CHUNKS = int(os.environ.get("KHIPU_LIBRARY_NIGHTLY_CHUNKS", "500"))
 SCAN_COMMIT_EVERY = 25          # documents per commit
 IMPORT_BATCH = 500              # rows per executemany + commit
 STATUS_SAMPLE = 10
@@ -500,11 +504,11 @@ def _upsert_document(cur, source: str, rel: str, title: str, author: str | None,
     return int(cur.fetchone()[0])
 
 
-def scan(conn, name: str) -> dict[str, Any]:
+def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
     """Walk the root and make ``library_documents`` / ``library_chunks`` match
-    the files. A document is re-chunked only when its content hash changed
-    (its old chunks, and their embeddings, go first); documents whose file is
-    gone are deleted. No model call."""
+    the files. Imported layouts are kept while the file bytes are unchanged.
+    Other documents are rebuilt on hash or layout changes, deleting their
+    vectors; mass rebuilds require explicit permission. No model call."""
     with conn.cursor() as cur:
         src = get_source(cur, name)
         root = Path(src.root)
@@ -517,48 +521,59 @@ def scan(conn, name: str) -> dict[str, Any]:
             "SELECT id, rel_path, content_hash FROM library_documents WHERE source = %s", (name,)
         )
         existing = {r[1]: (int(r[0]), r[2]) for r in cur.fetchall()}
+        cur.execute(
+            "SELECT DISTINCT e.document FROM library_embeddings e"
+            " JOIN library_documents d ON d.id = e.document WHERE d.source = %s",
+            (name,),
+        )
+        embedded_ids = {int(r[0]) for r in cur.fetchall()}
         skipped: dict[str, int] = {}
         seen: set[str] = set()
-        added = updated = unchanged = pending = 0
-        for rel, path, st in _iter_files(root, skipped):
+        plan: list[tuple[str, str]] = []
+        added = updated = unchanged = imported_kept = pending = 0
+        rebuild_embedded = 0
+        for rel, path, _st in _iter_files(root, skipped):
             seen.add(rel)
             try:
                 data = path.read_bytes()
             except OSError:
                 skipped["unreadable"] = skipped.get("unreadable", 0) + 1
                 continue
+            digest = hashlib.sha256(data).hexdigest()
+            prior = existing.get(rel)
+            if prior and prior[1] == IMPORTED_HASH_PREFIX + digest:
+                plan.append((rel, "keep_imported"))
+                unchanged += 1
+                imported_kept += 1
+                continue
             try:
                 text = data.decode("utf-8")
             except UnicodeDecodeError:
                 skipped["unsupported_encoding"] = skipped.get("unsupported_encoding", 0) + 1
                 continue
-            digest = hashlib.sha256(data).hexdigest()
-            prior = existing.get(rel)
-            title, author, tags, body = document_metadata(text, rel)
-            chunks = list(enumerate(embed.chunk_text(_clean(body))))
             if prior and prior[1] == digest:
+                _title, _author, _tags, body = document_metadata(text, rel)
+                chunks = list(enumerate(embed.chunk_text(_clean(body))))
                 cur.execute(
                     "SELECT chunk_idx, chunk_text FROM library_chunks WHERE document = %s ORDER BY chunk_idx",
                     (prior[0],),
                 )
                 if list(cur.fetchall()) == chunks:
+                    plan.append((rel, "keep"))
                     unchanged += 1
                     continue
-            doc_id = _upsert_document(cur, name, rel, title, author, tags, len(data), st, digest)
-            if prior:
-                cur.execute("DELETE FROM library_chunks WHERE document = %s", (doc_id,))
-                updated += 1
-            else:
-                added += 1
-            rows = []
-            for idx, chunk in chunks:
-                rows.append((doc_id, idx, chunk, _md5(chunk)))
-            if rows:
-                cur.executemany(_INSERT_CHUNK, rows)
-            pending += 1
-            if pending >= SCAN_COMMIT_EVERY:
-                conn.commit()
-                pending = 0
+            plan.append((rel, "rebuild" if prior else "add"))
+            if prior and prior[0] in embedded_ids:
+                rebuild_embedded += 1
+        embedded_docs = len(embedded_ids)
+        if (not allow_rebuild and rebuild_embedded > max(
+                MASS_REBUILD_MIN_DOCS, MASS_REBUILD_MAX_FRACTION * embedded_docs)):
+            conn.rollback()
+            raise LibraryError(
+                f"{rebuild_embedded} embedded documents would be rebuilt out of {embedded_docs}; "
+                "their vectors would be deleted; nothing was changed. "
+                f"Run `khipu library scan {name} --allow-rebuild` to proceed"
+            )
         walk_incomplete = bool(skipped.get("traversal_error") or skipped.get("unreadable"))
         gone = [] if walk_incomplete else [existing[rel][0] for rel in existing if rel not in seen]
         if gone and not seen:
@@ -568,6 +583,40 @@ def scan(conn, name: str) -> dict[str, Any]:
                 "indexed; refusing to delete them all (use `khipu library remove` if the "
                 "folder was emptied on purpose)"
             )
+        for rel, decision in plan:
+            if decision.startswith("keep"):
+                continue
+            path = root / rel
+            try:
+                data = path.read_bytes()
+                st = path.stat()
+            except OSError:
+                skipped["unreadable"] = skipped.get("unreadable", 0) + 1
+                continue
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                skipped["unsupported_encoding"] = skipped.get("unsupported_encoding", 0) + 1
+                continue
+            digest = hashlib.sha256(data).hexdigest()
+            title, author, tags, body = document_metadata(text, rel)
+            doc_id = _upsert_document(cur, name, rel, title, author, tags, len(data), st, digest)
+            if decision == "rebuild":
+                cur.execute("DELETE FROM library_chunks WHERE document = %s", (doc_id,))
+                updated += 1
+            else:
+                added += 1
+            rows = [(doc_id, idx, chunk, _md5(chunk))
+                    for idx, chunk in enumerate(embed.chunk_text(_clean(body)))]
+            if rows:
+                cur.executemany(_INSERT_CHUNK, rows)
+            pending += 1
+            if pending >= SCAN_COMMIT_EVERY:
+                conn.commit()
+                pending = 0
+        walk_incomplete = bool(skipped.get("traversal_error") or skipped.get("unreadable"))
+        if walk_incomplete:
+            gone = []
         if gone:
             cur.execute("DELETE FROM library_documents WHERE id = ANY(%s)", (gone,))
         cur.execute("UPDATE library_documents SET scanned_at = now() WHERE source = %s", (name,))
@@ -576,7 +625,7 @@ def scan(conn, name: str) -> dict[str, Any]:
     incomplete = walk_incomplete or bool(skipped.get("unsupported_encoding"))
     out = {
         "ok": not incomplete, "source": name, "added": added, "updated": updated,
-        "removed": len(gone), "unchanged": unchanged,
+        "removed": len(gone), "unchanged": unchanged, "imported_kept": imported_kept,
         "skipped": sum(skipped.values()), "skipped_detail": skipped,
         "documents": counts["documents"], "chunks": counts["chunks"],
     }
@@ -599,7 +648,7 @@ def backfill(conn, name: str, *, limit: int | None = None, stale: bool = False,
              profile: str | None = None, job=None) -> dict[str, Any]:
     """Embed this library's chunks that have no vector under its profile
     (``stale=True`` also those whose text changed since they were embedded).
-    Same per-batch isolation and daily budget as the memory backfill: a failed
+    Per-batch isolation and a separate library daily budget: a failed
     batch is counted and skipped, an exhausted budget stops the run.
 
     ``profile`` embeds under another profile than the library's own (a re-embed
@@ -651,7 +700,7 @@ def backfill(conn, name: str, *, limit: int | None = None, stale: bool = False,
                 try:
                     vecs = embed.embed_batch(
                         api, profile=src.profile, retries=embed.BACKFILL_RETRIES,
-                        delay=embed.BACKFILL_DELAY_S, input_type="document",
+                        delay=embed.BACKFILL_DELAY_S, input_type="document", budget="library",
                     )
                     for v in vecs:
                         # The column is untyped, so the database will not reject a
@@ -702,7 +751,8 @@ def backfill(conn, name: str, *, limit: int | None = None, stale: bool = False,
 
 def backfill_all(conn) -> dict[str, Any]:
     """The nightly step: for every enabled library, scan (no model) then
-    backfill. One library failing never stops the next; an exhausted budget
+    backfill up to NIGHTLY_LIBRARY_CHUNKS (zero means scan only).
+    One library failing never stops the next; an exhausted library budget
     skips the rest. A hub without the library tables is a skip, not a failure."""
     with conn.cursor() as cur:
         cur.execute("SELECT to_regclass(%s) IS NOT NULL", ("public.library_sources",))
@@ -714,7 +764,7 @@ def backfill_all(conn) -> dict[str, Any]:
     out: dict[str, Any] = {"ok": True, "libraries": len(names), "results": []}
     budget_out = False
     for name in names:
-        item: dict[str, Any] = {"name": name}
+        item: dict[str, Any] = {"name": name, "nightly_limit": NIGHTLY_LIBRARY_CHUNKS}
         out["results"].append(item)
         if budget_out:
             item["skipped"] = "embed budget exhausted"
@@ -722,11 +772,21 @@ def backfill_all(conn) -> dict[str, Any]:
             continue
         try:
             sc = scan(conn, name)
-            bf = backfill(conn, name)
+            if NIGHTLY_LIBRARY_CHUNKS > 0:
+                bf = backfill(conn, name, limit=NIGHTLY_LIBRARY_CHUNKS)
+            else:
+                with conn.cursor() as cur:
+                    remaining = _remaining(cur, get_source(cur, name), False)
+                bf = {"ok": True, "embedded": 0, "failed": 0, "remaining": remaining,
+                      "status": "partial" if remaining else "complete"}
+            bf_ok = bf["ok"] or (
+                bf["remaining"] > 0 and bf["status"] == "partial"
+                and not (bf["failed"] or bf.get("budget_exhausted") or bf.get("cancelled"))
+            )
             item.update(
                 added=sc["added"], updated=sc["updated"], removed=sc["removed"],
                 embedded=bf["embedded"], failed=bf["failed"], remaining=bf["remaining"],
-                ok=sc["ok"] and bf["ok"],
+                ok=sc["ok"] and bf_ok,
                 status=bf["status"] if sc["ok"] else "partial",
             )
             if not sc["ok"]:
@@ -744,7 +804,7 @@ def backfill_all(conn) -> dict[str, Any]:
             item["error"] = f"{type(exc).__name__}: {exc}"
             item.update(ok=False, status="failed")
             out["ok"] = False
-    out["status"] = ("complete" if out["ok"] else
+    out["status"] = ("complete" if all(r.get("status") == "complete" for r in out["results"]) else
                      "partial" if any(r.get("status") != "failed" for r in out["results"])
                      else "failed")
     return out
@@ -905,8 +965,8 @@ def import_index(
     (wrong length for the profile, or not finite) or ``skipped_bad_row``
     (malformed), else written. Existing documents accept only identical chunk
     identities and text; an import cannot replace their corpus. New documents
-    may be imported under the active profile, but their file hash stays
-    unverified until a scan rebuilds them. Idempotent on (document, chunk_idx,
+    may be imported under the active profile and are kept as imported by later
+    scans while the file is unchanged. Idempotent on (document, chunk_idx,
     profile); streams in batches, never loads the index file.
     """
     if int(batch) < 1:
@@ -972,7 +1032,7 @@ def import_index(
             title, author, tags, _body = document_metadata(text, rel)
             doc_id = _upsert_document(
                 cur, name, rel, title, author, tags, len(data), st,
-                "",  # Imported windows do not prove completeness against the local bytes.
+                IMPORTED_HASH_PREFIX + hashlib.sha256(data).hexdigest(),
             )
             doc_ids[rel] = doc_id
             return doc_id
@@ -1055,6 +1115,7 @@ def import_index(
         "ok": not stats["skipped_conflict"], "source": name, **stats, "documents": len(touched),
         "profile": ids[0] if ids else (profile or None), "profiles": ids,
         "source_profile": src.profile,
+        "imported_documents": sum(1 for rel in doc_ids if rel not in existing),
         "unverified_documents": sum(
             1 for rel, doc_id in doc_ids.items() if doc_id in touched
             and (rel not in existing or not existing[rel][1])
