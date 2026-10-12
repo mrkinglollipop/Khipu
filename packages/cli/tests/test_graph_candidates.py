@@ -170,8 +170,26 @@ def test_slug_prefilter_word_is_always_a_whole_word_of_the_label():
     assert gc._slug_prefilter_word("c" * 80) == ""
 
 
+def _slug_map_after_build():
+    """The first call starts the build on a thread and answers None; wait
+    for that thread, then return the map a later call serves."""
+    first = gc._episode_slug_map()
+    deadline = time.monotonic() + 5
+    while gc._SLUG_RELOADING and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return first, gc._episode_slug_map()
+
+
+def test_the_first_prompt_of_a_process_is_answered_by_the_join_not_the_build(tmp_path):
+    with corpus.installed_corpus(tmp_path):
+        first, built = _slug_map_after_build()
+        assert first is None
+        assert built and built is gc._SLUG_CACHE.get("map")
+
+
 def test_the_slug_map_returns_the_rows_the_sql_join_returns(tmp_path):
     with corpus.installed_corpus(tmp_path):
+        _slug_map_after_build()
         con = hs.open_snapshot()
         for slug in ("sync-job", "webhook-endpoint", "billing-service", "no-such-topic"):
             cached = gc._replica_topic_recent_episodes(con, slug, seed_rank=0, seed_key=f"topic:{slug}")
@@ -183,7 +201,7 @@ def test_the_slug_map_returns_the_rows_the_sql_join_returns(tmp_path):
 
 def test_a_moved_replica_serves_the_old_slug_map_while_one_thread_rebuilds(tmp_path):
     with corpus.installed_corpus(tmp_path) as handle:
-        old = gc._episode_slug_map()
+        _, old = _slug_map_after_build()
         release = threading.Event()
         builds: list[int] = []
 

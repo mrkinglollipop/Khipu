@@ -464,8 +464,10 @@ def _rebuild_slug_map(key: tuple[Any, ...]) -> None:
 
 def _episode_slug_map() -> dict[str, list[tuple[Any, Any, Any]]] | None:
     """The cached map, serving the previous generation (and rebuilding it on
-    one daemon thread) when the replica has moved; built synchronously only
-    when there is none yet. None when it cannot be built: the SQL path runs."""
+    one daemon thread) when the replica has moved. None while there is no
+    generation yet or it cannot be built: the SQL path runs. The first build
+    also runs on a thread: a one-shot hook has exactly one prompt, and a
+    270 ms build on it would cost more than the join it replaces."""
     global _SLUG_RELOADING
     key = _slug_map_key()
     if key is None:
@@ -474,17 +476,12 @@ def _episode_slug_map() -> dict[str, list[tuple[Any, Any, Any]]] | None:
         cached = _SLUG_CACHE.get("key")
         if cached == key:
             return _SLUG_CACHE["map"]
+        if not _SLUG_RELOADING:
+            _SLUG_RELOADING = True
+            threading.Thread(target=_rebuild_slug_map, args=(key,), daemon=True).start()
         if cached is not None and cached[0] == key[0]:
-            if not _SLUG_RELOADING:
-                _SLUG_RELOADING = True
-                threading.Thread(target=_rebuild_slug_map, args=(key,), daemon=True).start()
             return _SLUG_CACHE["map"]
-        try:
-            by_slug = _build_slug_map()
-        except Exception:  # noqa: BLE001 — fall back to the per-seed SQL join
-            return None
-        _SLUG_CACHE.update({"key": key, "map": by_slug})
-        return by_slug
+        return None
 
 
 def _replica_topic_recent_episodes(con, slug: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
