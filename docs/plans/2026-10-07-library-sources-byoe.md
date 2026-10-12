@@ -133,3 +133,25 @@ only. `ALLOWED_SUBCOMMANDS` does not grow.
 - **E. This Mac**: import, gateway key, acceptance queries above, supersede the plan-lock decision.
 
 Each session reads this page first and inspects the code it extends before writing.
+
+## 2026-10-12: the import contract, after it was broken once
+
+An audit change (2026-10-10, never published; 0.4.11 predates it) made import store an empty file hash and made
+scan replace any chunk layout that was not its own. The first nightly on that code rebuilt every imported document
+of `biblical`, deleting 329,224 imported vectors, and began re-embedding through the paid provider on the call
+ceiling memory shares; every query and capture embedding was refused for seven hours. PRs #146 and #147 restore
+the promise ("use the vectors you already have") and make it hard to break again:
+
+- Import records `imported:<sha256 of the file>` on the documents it creates. Scan leaves such a document alone
+  while the file's bytes are unchanged, and rebuilds it only when the file really changed.
+- Scan plans before it writes and refuses to rebuild more than a tenth of a library's embedded documents
+  (minimum 20) without `khipu library scan NAME --allow-rebuild`. The nightly never passes the flag.
+- Library backfill has its own daily ceiling (`KHIPU_LIBRARY_EMBED_DAILY_CALLS`, 2,000) and counter file; the
+  nightly embeds at most `KHIPU_LIBRARY_NIGHTLY_CHUNKS` (500) chunks per library, 0 for scan only.
+- The memory ceiling default is 100,000 calls a day (`KHIPU_EMBED_DAILY_CALLS`): a runaway guard, not a quota.
+
+This Mac was restored the same day by `library remove`, `add` and `import` from the graphify index: 329,222
+vectors over 5,340 documents, zero model calls, then two scans that kept all 5,340 and deleted nothing. The 241
+files the index never covered (787 chunks) have no vectors until a backfill embeds them.
+
+Any release after 0.4.11 must include #146 before it ships.
