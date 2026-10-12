@@ -443,13 +443,16 @@ class NightlyAggregateRegressionTest(unittest.TestCase):
         self.assertTrue(health["briefs_build_ok"]["ok"])
         self.assertFalse(health["briefs_build_ok"]["applicable"])
 
-    def test_briefs_failed_or_unavailable_result_is_unhealthy(self) -> None:
+    def test_briefs_error_or_unavailable_result_is_unhealthy(self) -> None:
+        # A provider or table error for a topic is status "error"/"unavailable".
+        # A recorded per-topic "failed" brief beside built ones is not a failed
+        # night (tests/test_jobs_briefs.py covers that side).
         from khipu import briefs, features
 
         chosen = {"available": True, "topics": ["a", "b"]}
         results = [
             {"status": "ok"},
-            {"status": "failed", "error": "provider"},
+            {"status": "error", "error": "provider"},
         ]
         conn = mock.MagicMock()
         with (
