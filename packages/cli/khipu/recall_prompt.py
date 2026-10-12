@@ -563,7 +563,7 @@ def _snapshot_search_hits(
             provisional = _fuse_and_annotate(
                 prompt, tokens=tokens, project=project, tz=tz,
                 lexical_rows=copy.deepcopy(lexical_rows), cosine_rows=[],
-                legs=list(legs), degraded="embedding late",
+                legs=list(legs), degraded="embedding late", graph=False,
             )
             if progress is not None:
                 progress["provisional"] = provisional
@@ -595,13 +595,18 @@ def _snapshot_search_hits(
 def _fuse_and_annotate(
     prompt: str, *, tokens: list[str], project: str | None, tz: str | None,
     lexical_rows: list[dict[str, Any]], cosine_rows: list[dict[str, Any]],
-    legs: list[str], degraded: str | None,
+    legs: list[str], degraded: str | None, graph: bool = True,
 ) -> dict[str, Any]:
     """Everything after the legs finish: fusion, graph candidates, the
     relevance gate, row metadata, project/status ranking, time boost and
     validity. One function for the keyword-only result and the full one, so
     the two cannot drift apart. It rewrites the rows it is given and appends
-    to ``legs``; a caller that needs the originals again passes copies."""
+    to ``legs``; a caller that needs the originals again passes copies.
+
+    ``graph=False`` skips the graph-candidate leg: the keyword-only result is
+    built before the cosine wait on every prompt, and paying for graph
+    expansion twice pushed the lane past its budget on a busy Mac
+    (2026-10-12)."""
     from khipu import hub_snapshot
     from khipu.recency import apply_project_and_status
     from khipu.search_text import fuse_ranked_lists, token_hit_count
@@ -652,7 +657,7 @@ def _fuse_and_annotate(
     degraded_legs: list[str] = []
     from khipu import features as _features
 
-    if _features.enabled("graph_candidates"):
+    if graph and _features.enabled("graph_candidates"):
         try:
             from khipu import graph_candidates as _gc
 

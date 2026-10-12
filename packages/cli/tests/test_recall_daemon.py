@@ -386,6 +386,13 @@ def _replica(path: Path, rows: list[tuple[str, list[float]]]) -> None:
     con.close()
 
 
+def _wait_for_reload(case: unittest.TestCase) -> None:
+    deadline = time.monotonic() + 5
+    while hs._MATRIX_RELOADING and time.monotonic() < deadline:
+        time.sleep(0.01)
+    case.assertFalse(hs._MATRIX_RELOADING, "the background reload never finished")
+
+
 class MatrixCacheTest(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp(prefix="krd-"))
@@ -426,9 +433,34 @@ class MatrixCacheTest(unittest.TestCase):
         st = os.stat(self.snap)
         os.utime(self.snap, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000))
         opens_before = self.opens.call_count
+        # A reload costs a prompt its cosine leg, so the changed replica is
+        # answered from the previous generation while one thread reloads it.
+        stale = self._query()
+        self.assertEqual({r["id"] for r in stale}, {"near", "far"})
+        _wait_for_reload(self)
         after = self._query()
         self.assertEqual({r["id"] for r in after}, {"near", "far", "added"})
         self.assertEqual(self.opens.call_count - opens_before, 1)
+
+    def test_a_changed_replica_starts_exactly_one_loader(self) -> None:
+        old = hs._matrix_rows(self.snap, "p1", None)
+        release = threading.Event()
+        loads: list[int] = []
+
+        def slow_load(*_a, **_k):
+            loads.append(1)
+            release.wait(5)
+            return (["new"], {})
+
+        st = os.stat(self.snap)
+        os.utime(self.snap, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000))
+        with mock.patch.object(hs, "_load_matrix", side_effect=slow_load):
+            served = [hs._matrix_rows(self.snap, "p1", None) for _ in range(5)]
+            release.set()
+            _wait_for_reload(self)
+        self.assertEqual(served, [old] * 5)
+        self.assertEqual(len(loads), 1)
+        self.assertEqual(hs._matrix_rows(self.snap, "p1", None), (["new"], {}))
 
     def test_the_cache_holds_one_entry_and_is_keyed_by_the_profile(self) -> None:
         self._query()

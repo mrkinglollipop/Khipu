@@ -11,8 +11,12 @@ in for it).
 """
 from __future__ import annotations
 
+import os
+import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 from khipu import graph_candidates as gc
 from khipu import hub_snapshot as hs
@@ -164,3 +168,98 @@ def test_slug_prefilter_word_is_always_a_whole_word_of_the_label():
     assert len(slug) == 80 and gc._slug_prefilter_word(slug) == "alpha"
     # One 80-character word could be a fragment: no prefilter at all.
     assert gc._slug_prefilter_word("c" * 80) == ""
+
+
+def _slug_map_after_build():
+    """The first call starts the build on a thread and answers None; wait
+    for that thread, then return the map a later call serves."""
+    first = gc._episode_slug_map()
+    deadline = time.monotonic() + 5
+    while gc._SLUG_RELOADING and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return first, gc._episode_slug_map()
+
+
+def test_the_first_prompt_of_a_process_is_answered_by_the_join_not_the_build(tmp_path):
+    with corpus.installed_corpus(tmp_path):
+        first, built = _slug_map_after_build()
+        assert first is None
+        assert built and built is gc._SLUG_CACHE.get("map")
+
+
+def test_the_slug_map_returns_the_rows_the_sql_join_returns(tmp_path):
+    with corpus.installed_corpus(tmp_path):
+        _slug_map_after_build()
+        con = hs.open_snapshot()
+        for slug in ("sync-job", "webhook-endpoint", "billing-service", "no-such-topic"):
+            cached = gc._replica_topic_recent_episodes(con, slug, seed_rank=0, seed_key=f"topic:{slug}")
+            with mock.patch.object(gc, "_episode_slug_map", return_value=None):
+                joined = gc._replica_topic_recent_episodes(con, slug, seed_rank=0, seed_key=f"topic:{slug}")
+            assert cached == joined
+        assert gc._SLUG_CACHE.get("map"), "the map was built and kept"
+
+
+def test_a_moved_replica_serves_the_old_slug_map_while_one_thread_rebuilds(tmp_path):
+    with corpus.installed_corpus(tmp_path) as handle:
+        _, old = _slug_map_after_build()
+        release = threading.Event()
+        builds: list[int] = []
+
+        def slow_build():
+            builds.append(1)
+            release.wait(5)
+            return {"new": []}
+
+        st = os.stat(handle.snapshot_path)
+        os.utime(handle.snapshot_path, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000))
+        with mock.patch.object(gc, "_build_slug_map", side_effect=slow_build):
+            served = [gc._episode_slug_map() for _ in range(5)]
+            release.set()
+            deadline = time.monotonic() + 5
+            while gc._SLUG_RELOADING and time.monotonic() < deadline:
+                time.sleep(0.01)
+        assert served == [old] * 5
+        assert builds == [1]
+        assert gc._episode_slug_map() == {"new": []}
+
+
+def test_a_new_replica_has_the_edge_indexes(tmp_path):
+    with corpus.installed_corpus(tmp_path) as handle:
+        con = sqlite3.connect(handle.snapshot_path)
+        names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE tbl_name = 'edges'")}
+        con.close()
+    assert {"idx_edges_src_type", "idx_edges_dst_type"} <= names
+
+
+def test_an_older_replica_gets_the_edge_indexes_once(tmp_path):
+    with corpus.installed_corpus(tmp_path) as handle:
+        con = sqlite3.connect(handle.snapshot_path)
+        con.execute("DROP INDEX idx_edges_src_type")
+        con.execute("DROP INDEX idx_edges_dst_type")
+        con.commit()
+        con.close()
+        hs.ensure_edge_indexes()
+        con = sqlite3.connect(handle.snapshot_path)
+        names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE tbl_name = 'edges'")}
+        con.close()
+    assert {"idx_edges_src_type", "idx_edges_dst_type"} <= names
+
+
+def test_a_read_only_replica_runs_the_leg_without_the_indexes(tmp_path):
+    with corpus.installed_corpus(tmp_path) as handle:
+        con = sqlite3.connect(handle.snapshot_path)
+        con.execute("DROP INDEX idx_edges_src_type")
+        con.execute("DROP INDEX idx_edges_dst_type")
+        con.commit()
+        con.close()
+        os.chmod(handle.snapshot_path, 0o444)
+        try:
+            ro = hs.open_snapshot()
+            fused = [{"kind": "topic", "id": "billing-service", "score": 1.0}]
+            candidates, missed = gc.replica_candidates(ro, fused, deadline=time.monotonic() + 5)
+            hs.ensure_edge_indexes()  # a second attempt in the same process is a no-op
+        finally:
+            os.chmod(handle.snapshot_path, 0o644)
+    assert missed is False
+    assert any(c["id"] == "rate-limits" for c in candidates)
+    assert str(handle.snapshot_path) in hs._EDGE_INDEXES_TRIED

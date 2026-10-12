@@ -753,6 +753,8 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
             built_at TEXT,
             PRIMARY KEY (src, dst, type)
         );
+        CREATE INDEX IF NOT EXISTS idx_edges_src_type ON edges (src, type);
+        CREATE INDEX IF NOT EXISTS idx_edges_dst_type ON edges (dst, type);
         CREATE TABLE embedding_profiles (
             id TEXT PRIMARY KEY,
             provider TEXT,
@@ -823,6 +825,41 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
             CREATE INDEX idx_snapshot_deliverables_project ON deliverables (project);
             """
         )
+
+
+_EDGE_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_edges_src_type ON edges (src, type)",
+    "CREATE INDEX IF NOT EXISTS idx_edges_dst_type ON edges (dst, type)",
+)
+_EDGE_INDEXES_TRIED: set[str] = set()
+
+
+def ensure_edge_indexes() -> None:
+    """Add the graph-leg edge indexes to a replica dumped before they existed.
+
+    Without them every ``edges`` lookup by ``dst`` is a full scan of ~200,000
+    rows (2026-10-12). One attempt per replica path per process; a read-only,
+    locked or missing replica is logged and the leg runs without them — this
+    is called from the prompt path and must never raise into it."""
+    path = snapshot_path()
+    if str(path) in _EDGE_INDEXES_TRIED:
+        return
+    _EDGE_INDEXES_TRIED.add(str(path))
+    try:
+        # mode=rw: never create an empty replica where none exists.
+        con = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=0.25)
+        try:
+            names = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'edges'"
+            )}
+            if not {"idx_edges_src_type", "idx_edges_dst_type"} <= names:
+                for sql in _EDGE_INDEX_SQL:
+                    con.execute(sql)
+                con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        _log(f"replica edge indexes not created: {type(exc).__name__}: {exc}")
 
 
 def _pg_columns(cur, table: str) -> set[str]:
@@ -2600,14 +2637,78 @@ def active_snapshot_profile() -> str | None:
 # incremental write moves its mtime or size, and either one misses and reloads.
 _MATRIX_LOCK = threading.Lock()
 _MATRIX_CACHE: dict[str, Any] = {}
+_MATRIX_RELOADING = False
+
+
+def _load_matrix(
+    path: Path, profile: str, kind: str | None, *, deadline: float | None = None,
+) -> tuple[list[tuple[Any, ...]], dict[int, tuple[str, str, int, str]]]:
+    con = open_snapshot()
+    if deadline is not None:
+        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+    try:
+        params: list[Any] = [profile]
+        kind_clause = ""
+        if kind:
+            kind_clause = " AND kind = ?"
+            params.append(kind)
+        topic_live = ""
+        topic_cols = _snapshot_table_columns(con, "topics")
+        if "slug" in topic_cols and "deleted_at" in topic_cols:
+            topic_live = " AND (kind != 'topic' OR EXISTS (SELECT 1 FROM topics t WHERE t.slug = ref AND t.deleted_at IS NULL))"
+        rows = con.execute(
+            # A commitment has its own dedicated surface (khipu_owed), not
+            # generic search — same exclusion as embed._cosine_candidates.
+            # Retain the full logical row with the vector generation.
+            # A fresh text lookup after scoring can pair a replacement
+            # rowid with the identity from the prior snapshot generation.
+            f"SELECT rowid, kind, ref, chunk_idx, chunk_text, embedding FROM memory_embeddings "
+            f"WHERE profile = ? AND kind != 'commitment'{kind_clause} AND embedding IS NOT NULL{topic_live}",
+            params,
+        ).fetchall()
+    finally:
+        con.close()
+    # Stored vectors are L2-normalized on the write path (embed_batch,
+    # every shipped profile has normalize='l2'), so the rows are scored as
+    # read. Re-normalizing 16,000 rows in Python here cost about a second
+    # per load, holding the GIL, and the daemon reloads on most prompts
+    # because every incremental replica write changes the cache key
+    # (2026-10-11). A profile stored without normalization is a backlog
+    # item, not something to pay for on every prompt.
+    by_rowid = {rowid: (knd, ref, chunk_idx, text or "") for rowid, knd, ref, chunk_idx, text, _blob in rows}
+    return rows, by_rowid
+
+
+def _reload_matrix(path: Path, profile: str, kind: str | None, key: tuple[Any, ...]) -> None:
+    global _MATRIX_RELOADING
+    try:
+        rows, by_rowid = _load_matrix(path, profile, kind)
+    except Exception as exc:  # noqa: BLE001 — the stale generation keeps serving
+        _log(f"replica matrix background reload failed: {type(exc).__name__}: {exc}")
+        rows = None
+    with _MATRIX_LOCK:
+        old = _MATRIX_CACHE.get("key")
+        # A synchronous load for another profile may have replaced the entry
+        # meanwhile; only a newer generation of the same one is swapped in.
+        if rows is not None and old is not None and old[0] == key[0] and old[3:] == key[3:]:
+            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid})
+        _MATRIX_RELOADING = False
 
 
 def _matrix_rows(
     path: Path, profile: str, kind: str | None, *, deadline: float | None = None,
 ) -> tuple[list[tuple[Any, ...]], dict[int, tuple[str, str, int, str]]]:
     """(rows, by_rowid) for one profile on the replica at ``path``, from the
-    process cache while the file is unchanged. The load runs under the lock so
-    concurrent callers wait for one read instead of each doing their own."""
+    process cache while the file is unchanged. With no cached generation the
+    load runs under the lock, so concurrent callers wait for one read instead
+    of each doing their own.
+
+    Every incremental replica write (each capture, the queue drain every 300 s)
+    moves the key, and a synchronous reload costs about a second: the next
+    prompt then lost its cosine leg (2026-10-12). So a changed file is served
+    from the previous generation, one write behind (a write only adds rows),
+    while exactly one daemon thread loads the new one outside the lock."""
+    global _MATRIX_RELOADING
     try:
         st = path.stat()
         key: tuple[Any, ...] | None = (str(path), st.st_mtime_ns, st.st_size, profile, kind)
@@ -2617,41 +2718,17 @@ def _matrix_rows(
     if not _MATRIX_LOCK.acquire(timeout=remaining):
         raise TimeoutError("replica matrix deadline expired")
     try:
-        if key is not None and _MATRIX_CACHE.get("key") == key:
+        cached = _MATRIX_CACHE.get("key")
+        if key is not None and cached == key:
             return _MATRIX_CACHE["rows"], _MATRIX_CACHE["by_rowid"]
-        con = open_snapshot()
-        if deadline is not None:
-            con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
-        try:
-            params: list[Any] = [profile]
-            kind_clause = ""
-            if kind:
-                kind_clause = " AND kind = ?"
-                params.append(kind)
-            topic_live = ""
-            topic_cols = _snapshot_table_columns(con, "topics")
-            if "slug" in topic_cols and "deleted_at" in topic_cols:
-                topic_live = " AND (kind != 'topic' OR EXISTS (SELECT 1 FROM topics t WHERE t.slug = ref AND t.deleted_at IS NULL))"
-            rows = con.execute(
-                # A commitment has its own dedicated surface (khipu_owed), not
-                # generic search — same exclusion as embed._cosine_candidates.
-                # Retain the full logical row with the vector generation.
-                # A fresh text lookup after scoring can pair a replacement
-                # rowid with the identity from the prior snapshot generation.
-                f"SELECT rowid, kind, ref, chunk_idx, chunk_text, embedding FROM memory_embeddings "
-                f"WHERE profile = ? AND kind != 'commitment'{kind_clause} AND embedding IS NOT NULL{topic_live}",
-                params,
-            ).fetchall()
-        finally:
-            con.close()
-        # Stored vectors are L2-normalized on the write path (embed_batch,
-        # every shipped profile has normalize='l2'), so the rows are scored as
-        # read. Re-normalizing 16,000 rows in Python here cost about a second
-        # per load, holding the GIL, and the daemon reloads on most prompts
-        # because every incremental replica write changes the cache key
-        # (2026-10-11). A profile stored without normalization is a backlog
-        # item, not something to pay for on every prompt.
-        by_rowid = {rowid: (knd, ref, chunk_idx, text or "") for rowid, knd, ref, chunk_idx, text, _blob in rows}
+        if key is not None and cached is not None and cached[0] == key[0] and cached[3:] == key[3:]:
+            if not _MATRIX_RELOADING:
+                _MATRIX_RELOADING = True
+                threading.Thread(
+                    target=_reload_matrix, args=(path, profile, kind, key), daemon=True,
+                ).start()
+            return _MATRIX_CACHE["rows"], _MATRIX_CACHE["by_rowid"]
+        rows, by_rowid = _load_matrix(path, profile, kind, deadline=deadline)
         _MATRIX_CACHE.clear()
         if key is not None:
             _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid})

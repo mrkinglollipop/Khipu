@@ -117,10 +117,12 @@ def _reset_process_level_caches():
     # The recall service keeps the replica's matrix, the API key and the embed
     # transport for the life of its process. A test process is one long process
     # running many fake worlds, so none of it may carry across tests.
-    from khipu import embed, hub_snapshot, profiles
+    from khipu import embed, graph_candidates, hub_snapshot, profiles
 
     def _clear():
         hub_snapshot._MATRIX_CACHE.clear()
+        hub_snapshot._EDGE_INDEXES_TRIED.clear()
+        graph_candidates._SLUG_CACHE.clear()
         embed._KEY_CACHE.clear()
         embed._VOYAGE_KEY_CACHE.clear()
         embed._OPENAI_KEY_CACHE.clear()
