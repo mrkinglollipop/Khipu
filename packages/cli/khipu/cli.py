@@ -1471,7 +1471,7 @@ def cmd_library(args: argparse.Namespace) -> int:
             elif cmd == "set-profile":
                 out = library.set_profile(conn, args.name, args.profile)
             elif cmd == "scan":
-                out = library.scan(conn, args.name)
+                out = library.scan(conn, args.name, allow_rebuild=bool(getattr(args, "allow_rebuild", False)))
             elif cmd == "backfill":
                 # --bypass-harness (sonnet lane): dispatched agent, no delegation.
                 out = library.backfill(
@@ -3829,6 +3829,8 @@ def build_parser() -> argparse.ArgumentParser:
     lsp.add_argument("profile", help="Embedding profile id (see `embed profiles list`)")
     lsc = lib_sub.add_parser("scan", help="Walk the root and record documents + chunks (no model call)")
     lsc.add_argument("name")
+    lsc.add_argument("--allow-rebuild", action="store_true",
+                     help="Allow a mass rebuild that deletes existing vectors")
     lb = lib_sub.add_parser("backfill", help="Embed chunks that have no vector under the library's profile")
     lb.add_argument("name")
     lb.add_argument("--limit", type=int, default=None, help="Embed at most N chunks this run")
