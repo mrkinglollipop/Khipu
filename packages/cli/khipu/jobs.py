@@ -403,12 +403,27 @@ def _briefs_build_if_on() -> dict[str, Any] | None:
                     briefs.release_build_lock(cur)
                     conn.commit()
         out: dict[str, Any] = {"ok": True, "built": 0}
+        failed_topics: list[str] = []
+        could_not_run = 0
         for r in results:
             status = str(r.get("status") or "unavailable").lower()
             key = "succeeded" if status == "ok" else status
             out[key] = int(out.get(key, 0)) + 1
-            if status in {"failed", "error", "unavailable"} or r.get("ok") is False:
-                out["ok"] = False
+            if status == "failed":
+                failed_topics.append(str(r.get("topic")))
+            elif status in {"error", "unavailable"} or r.get("ok") is False:
+                could_not_run += 1
+        # A topic whose brief the model could not produce is recorded as a
+        # failed row, keeps its previous brief, and is retried only when its
+        # sources change: a handled outcome for one topic. Counting it as a
+        # failed night made one busy topic fail the nightly on three nights of
+        # four (2026-10-09..12). The night fails when the build could not run
+        # for a topic (provider or table error) or when nothing got through.
+        progressed = sum(int(out.get(k, 0)) for k in ("built", "succeeded", "unchanged"))
+        if could_not_run or (failed_topics and not progressed):
+            out["ok"] = False
+        if failed_topics:
+            out["failed_topics"] = failed_topics[:10]
         _nightly_log(f"[khipu-briefs] built {json.dumps(out, default=str)[:400]}")
         return out
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this

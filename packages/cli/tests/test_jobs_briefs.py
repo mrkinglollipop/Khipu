@@ -59,6 +59,24 @@ class BriefsBuildStepTest(unittest.TestCase):
         build.assert_called_once()
         m_release.assert_called_once()
 
+    def test_one_unusable_brief_is_reported_but_does_not_fail_the_night(self):
+        """The model returning an unusable brief for one topic is recorded for
+        that topic and retried when its sources change; with other briefs
+        built it is not a failed night. Nothing getting through, or a topic
+        the build could not run for, still is."""
+        mixed = mock.Mock(return_value=[
+            {"topic": "a", "status": "built"},
+            {"topic": "b", "status": "failed", "reason": "model returned non-JSON"},
+        ])
+        out = self._run(build=mixed)[0]
+        self.assertEqual(out, {"ok": True, "built": 1, "failed": 1, "failed_topics": ["b"]})
+        all_failed = mock.Mock(return_value=[{"topic": "b", "status": "failed"}])
+        self.assertFalse(self._run(build=all_failed)[0]["ok"])
+        errored = mock.Mock(return_value=[
+            {"topic": "a", "status": "built"}, {"topic": "c", "status": "error", "error": "HTTP 500"},
+        ])
+        self.assertFalse(self._run(build=errored)[0]["ok"])
+
     def test_lock_held_builds_nothing_and_is_ok(self):
         out, _, _, m_release, select, build = self._run(lock=False)
         self.assertTrue(out["ok"])
