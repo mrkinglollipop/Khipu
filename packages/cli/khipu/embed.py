@@ -384,10 +384,14 @@ QUERY_EMBED_DELAY_S = 1.0
 # 64-chunk backfill batch and a single Recall query cost the same). This is a
 # runaway-loop ceiling, not a quota: the key is on a paid plan (Matt,
 # 2026-09-05: "we won't want to miss embeddings because of a cap"), so the
-# default is far above any real day (the busiest day so far used ~300) and
-# 0 turns the ceiling off. Local to this Mac
-# (~/.config/khipu/state/embed-budget.json), reset at UTC midnight.
-EMBED_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_EMBED_DAILY_CALLS", "10000"))
+# default has to stay far above any real day and 0 turns the ceiling off.
+# A real day grew past the first default: by 2026-10-12 one capture cost a
+# dedup call, an episode call and one call per commitment, a 750-capture day
+# made about 640 calls an hour, and 10,000 was reached by evening two days
+# running, after which every query and capture embedding was refused until
+# midnight. Local to this Mac (~/.config/khipu/state/embed-budget.json),
+# reset at UTC midnight.
+EMBED_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_EMBED_DAILY_CALLS", "100000"))
 LIBRARY_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_LIBRARY_EMBED_DAILY_CALLS", "2000"))
 # Query vectors are cached on the hub (memory_query_cache, migration 0014) so a
 # repeated question costs no API call; rows unused for this long are pruned by

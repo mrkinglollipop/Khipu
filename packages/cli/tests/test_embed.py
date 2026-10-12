@@ -1631,4 +1631,6 @@ class EmbedBudgetUnlimitedTest(unittest.TestCase):
         self.assertTrue(st["unlimited"])
         self.assertFalse(st["exhausted"])
         self.assertEqual(st["calls"], 5)
-        self.assertGreaterEqual(em.EMBED_DAILY_CALL_BUDGET, 10000)
+        # A heavy real day made about 640 calls an hour (2026-10-12); the
+        # ceiling must clear a full day of that several times over.
+        self.assertGreaterEqual(em.EMBED_DAILY_CALL_BUDGET, 100000)
