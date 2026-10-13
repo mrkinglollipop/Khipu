@@ -13,16 +13,20 @@ from urllib.parse import urlparse
 from khipu.config import load_config, save_config
 
 ROLES = ("synth", "embed", "vision")
-PROVIDERS = frozenset({"cloud", "local"})
+PROVIDERS = frozenset({"gemini", "anthropic", "openai", "local"})
+DEFAULT_SYNTH_MODELS = {"gemini": "gemini-2.5-flash", "anthropic": "claude-haiku-5-5"}
 VISION_PROVIDERS = frozenset({"cloud", "local", "off"})
 DEFAULT_SYNTH_MODEL = "gemini-2.5-flash"
-# USD per million tokens for the cloud synth models, used only to estimate
-# spend in `khipu budget status` and doctor. A snapshot of Google's published
-# list prices on 2026-10-13, kept current by hand; thinking tokens bill as
-# output. A model missing here shows its tokens with a null cost.
-PRICES_USD_PER_MTOKEN: dict[str, dict[str, float]] = {
-    "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
-    "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
+# USD per million tokens, used only to estimate spend in budget status/doctor.
+# Published list-price snapshot; thinking tokens bill as output. Missing prices
+# (including cached input rates when used) yield a null cost.
+PRICES_USD_PER_MTOKEN: dict[str, dict[str, Any]] = {
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50, "cached_input": 0.03,
+                         "as_of": "2026-10-13", "source": "Google Gemini API published list prices"},
+    "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40,
+                              "as_of": "2026-10-13", "source": "Google Gemini API published list prices"},
+    "claude-haiku-5-5": {"input": 0.10, "output": 0.50, "cached_input": 0.01,
+                         "as_of": "2026-10-13", "source": "Anthropic published list prices, prompts up to 100k"},
 }
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -30,7 +34,7 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 def default_role(role: str) -> dict[str, str]:
     if role == "synth":
         return {
-            "provider": "cloud",
+            "provider": "gemini",
             "endpoint": "",
             "model_id": DEFAULT_SYNTH_MODEL,
         }
@@ -83,11 +87,12 @@ def chat_completions_url(endpoint: str) -> str:
 
 
 def _normalize_role(role: str, raw: Any, *, for_set: bool) -> dict[str, str]:
-    del for_set  # reserved: show vs set share the same role rules today
     if not isinstance(raw, dict):
         raise ValueError(f"{role}: expected an object")
     provider = str(raw.get("provider", "") or "").strip().lower()
-    allowed = VISION_PROVIDERS if role == "vision" else PROVIDERS
+    if role == "synth" and provider == "cloud":
+        provider = "gemini"
+    allowed = PROVIDERS if role == "synth" else (VISION_PROVIDERS if role == "vision" else frozenset({"cloud", "local"}))
     if provider not in allowed:
         raise ValueError(
             f"{role}: unknown provider {provider!r}; expected one of {sorted(allowed)}"
@@ -107,13 +112,15 @@ def _normalize_role(role: str, raw: Any, *, for_set: bool) -> dict[str, str]:
         endpoint = validate_endpoint(endpoint)
         return {"provider": "local", "endpoint": endpoint, "model_id": model_id}
 
-    # cloud
+    # API provider
     if role == "synth" and not model_id:
-        model_id = DEFAULT_SYNTH_MODEL
+        model_id = DEFAULT_SYNTH_MODELS.get(provider, "")
+        if not model_id:
+            raise ValueError("synth: openai provider requires --model (model_id)")
     if endpoint:
         # Persist a cleaned endpoint even on cloud (user may flip to local later).
         endpoint = validate_endpoint(endpoint) if endpoint else ""
-    return {"provider": "cloud", "endpoint": endpoint, "model_id": model_id}
+    return {"provider": provider, "endpoint": endpoint, "model_id": model_id}
 
 
 def validate_models_object(raw: Any, *, for_set: bool) -> dict[str, dict[str, str]]:
@@ -218,6 +225,8 @@ def set_models_merge_role(
     """
     if role not in ROLES:
         raise ValueError(f"unknown role: {role}")
+    if role == "synth" and provider.strip().lower() == "openai" and not (model_id or "").strip():
+        raise ValueError("synth: openai provider requires --model (model_id)")
     _require_stored_models_writable()
     current = show_models()
     base = {r: dict(current[r]) for r in ROLES}
@@ -229,7 +238,9 @@ def set_models_merge_role(
     if model_id is not None:
         patch["model_id"] = model_id
     else:
-        patch["model_id"] = base[role].get("model_id", "")
+        canonical = "gemini" if provider.strip().lower() == "cloud" else provider.strip().lower()
+        patch["model_id"] = ("" if role == "synth" and canonical != base[role]["provider"]
+                             else base[role].get("model_id", ""))
     base[role] = _normalize_role(role, patch, for_set=True)
     return _store_roles(base)
 
@@ -238,25 +249,32 @@ def synth_settings() -> dict[str, str]:
     """Per-call synth role for ``extract._generate``.
 
     ``KHIPU_SYNTH_PROVIDER`` is tests-only: production ignores it unless
-    ``KHIPU_TEST=1``. When both are set and the override is cloud/local, it
-    replaces the saved provider (including a saved ``local``).
+    ``KHIPU_TEST=1``. When both are set and the override is a known provider, it
+    replaces the saved provider (including a saved ``local``); cloud is canonicalized to Gemini.
     """
     shown = show_models()
     role = dict(shown["synth"])
     test_gate = (os.environ.get("KHIPU_TEST") or "").strip() == "1"
     env = (os.environ.get("KHIPU_SYNTH_PROVIDER") or "").strip().lower()
-    if test_gate and env in ("cloud", "local"):
-        role["provider"] = env
+    if test_gate and env in PROVIDERS | {"cloud"}:
+        canonical = "gemini" if env == "cloud" else env
+        if canonical != role["provider"] and canonical != "local":
+            role["model_id"] = DEFAULT_SYNTH_MODELS.get(canonical, "")
+        role["provider"] = canonical
     return role
 
 
 def cloud_model_id(settings: dict[str, str] | None = None) -> str:
     """Cloud synth model id at call time; ``KHIPU_EXTRACT_MODEL`` overrides."""
     role = settings if settings is not None else synth_settings()
-    model_id = (role.get("model_id") or "").strip() or DEFAULT_SYNTH_MODEL
+    provider = role.get("provider", "gemini")
+    model_id = (role.get("model_id") or "").strip() or DEFAULT_SYNTH_MODELS.get(
+        "gemini" if provider == "cloud" else provider, "")
     env = (os.environ.get("KHIPU_EXTRACT_MODEL") or "").strip()
     if env:
         return env
+    if not model_id:
+        raise RuntimeError("openai synth requires model_id")
     return model_id
 
 

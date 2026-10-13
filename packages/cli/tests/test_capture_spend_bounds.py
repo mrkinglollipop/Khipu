@@ -544,7 +544,7 @@ class SynthUsageTest(_SynthBudget):
         self.assertEqual(extract.synth_usage_path(), self.root / "data" / "state" / "synth-usage.jsonl")
         self.assertEqual(len(rows), 2)
         self.assertEqual({k: rows[0][k] for k in rows[0] if k != "ts"},
-                         {"model": "gemini-2.5-flash", "prompt_tokens": 1000, "output_tokens": 200,
+                         {"provider": "gemini", "cached_tokens": 0, "model": "gemini-2.5-flash", "prompt_tokens": 1000, "output_tokens": 200,
                           "thought_tokens": 50, "caller": "capture"})
         self.assertEqual((rows[1]["caller"], rows[1]["thought_tokens"]), ("synth", 0))
         self.assertRegex(rows[0]["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")

@@ -108,11 +108,11 @@ def _call_model(prompt: str, *, timeout: float) -> tuple[str, str]:
         ), model_id
     model_id = cloud_model_id(settings)
     try:
-        extract._key()
+        extract._provider_key(settings.get("provider") or "gemini")
     except RuntimeError as exc:
         raise _Unavailable(str(exc)) from exc
-    return extract._generate_cloud(
-        prompt, model_id=model_id, timeout=timeout, retries=0, caller="rerank"
+    return extract._generate(
+        prompt, timeout=timeout, retries=0, caller="rerank"
     ), model_id
 
 

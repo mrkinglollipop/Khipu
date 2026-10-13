@@ -250,7 +250,7 @@ def _check_gemini_generate(*, timeout: float) -> dict[str, Any]:
     provider = (settings.get("provider") or "cloud").strip().lower()
     model = (
         models_mod.cloud_model_id(settings)
-        if provider == "cloud"
+        if provider in {"cloud", "gemini"}
         else models_mod.DEFAULT_SYNTH_MODEL
     )
     url = (

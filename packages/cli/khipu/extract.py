@@ -11,7 +11,7 @@ extractor produces (summary / topics / decisions / preferences / scope), so the
 resulting rows are indistinguishable downstream (PG, file mirror, embeddings,
 topic pages, nightly consolidate).
 
-Synth routing (Settings → Models): cloud = Gemini REST; local = OpenAI-compatible
+Synth routing (Settings → Models): Gemini, Anthropic, OpenAI REST; local = OpenAI-compatible
 ``/v1/chat/completions``. Embeddings stay on the active Gemini profile.
 """
 from __future__ import annotations
@@ -132,25 +132,38 @@ def synth_usage_path() -> Path:
     return data_dir() / "state" / SYNTH_USAGE_NAME
 
 
-def _record_usage(data: Any, *, model_id: str, caller: str) -> None:
-    """Append one line of token counts from a Gemini response's
-    ``usageMetadata`` to synth-usage.jsonl. Fail-open: a response without the
+def _record_usage(data: Any, *, model_id: str, caller: str, provider: str = "gemini") -> None:
+    """Append provider token counts to synth-usage.jsonl. Fail-open: a response without the
     counts, or a file that cannot be written, never touches the call."""
     try:
-        meta = data.get("usageMetadata") if isinstance(data, dict) else None
-        if not isinstance(meta, dict):
+        if not isinstance(data, dict):
             return
-        prompt_tokens = meta.get("promptTokenCount")
-        output_tokens = meta.get("candidatesTokenCount")
-        if not isinstance(prompt_tokens, int) and not isinstance(output_tokens, int):
+        if provider == "gemini":
+            meta = data.get("usageMetadata") or {}
+            prompt_tokens = meta.get("promptTokenCount")
+            output_tokens = meta.get("candidatesTokenCount")
+            thought_tokens = meta.get("thoughtsTokenCount")
+            cached_tokens = meta.get("cachedContentTokenCount")
+        else:
+            meta = data.get("usage") or {}
+            prompt_tokens = meta.get("input_tokens" if provider == "anthropic" else "prompt_tokens")
+            output_tokens = meta.get("output_tokens" if provider == "anthropic" else "completion_tokens")
+            thought_tokens = 0
+            cached_tokens = (meta.get("cache_read_input_tokens") if provider == "anthropic"
+                             else (meta.get("prompt_tokens_details") or {}).get("cached_tokens"))
+        def count(value):
+            return max(0, value) if isinstance(value, int) and not isinstance(value, bool) else 0
+        if not any(isinstance(v, int) and not isinstance(v, bool)
+                   for v in (prompt_tokens, output_tokens, cached_tokens)):
             return
-        thought_tokens = meta.get("thoughtsTokenCount")
         row = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "provider": provider,
             "model": model_id,
-            "prompt_tokens": prompt_tokens if isinstance(prompt_tokens, int) else 0,
-            "output_tokens": output_tokens if isinstance(output_tokens, int) else 0,
-            "thought_tokens": thought_tokens if isinstance(thought_tokens, int) else 0,
+            "prompt_tokens": count(prompt_tokens),
+            "output_tokens": count(output_tokens),
+            "thought_tokens": count(thought_tokens),
+            "cached_tokens": count(cached_tokens),
             "caller": caller,
         }
         path = synth_usage_path()
@@ -187,8 +200,11 @@ def synth_usage_today() -> dict[str, Any]:
     from khipu.models import PRICES_USD_PER_MTOKEN
 
     day = time.strftime("%Y-%m-%d", time.gmtime())
-    keys = ("prompt_tokens", "output_tokens", "thought_tokens")
-    totals: dict[str, int] = {k: 0 for k in keys}
+    keys = ("prompt_tokens", "output_tokens", "thought_tokens", "cached_tokens")
+    def empty():
+        return {"calls": 0, **{k: 0 for k in keys}}
+    totals = empty()
+    by_provider: dict[str, dict[str, Any]] = {}
     by_model: dict[str, dict[str, Any]] = {}
     path = synth_usage_path()
     lines = _usage_lines_since(path, day) if path.is_file() else []
@@ -199,30 +215,44 @@ def synth_usage_today() -> dict[str, Any]:
             continue
         if not isinstance(row, dict) or not str(row.get("ts", "")).startswith(day):
             continue
-        m = by_model.setdefault(str(row.get("model") or "unknown"), {"calls": 0, **{k: 0 for k in keys}})
-        m["calls"] += 1
-        for k in keys:
-            v = row.get(k)
-            if isinstance(v, int) and not isinstance(v, bool):
-                m[k] += v
-                totals[k] += v
-    total_usd: float | None = 0.0
-    for model, m in by_model.items():
-        price = PRICES_USD_PER_MTOKEN.get(model)
-        if price is None:
-            m["estimated_usd"] = None
-            total_usd = None
-            continue
-        m["estimated_usd"] = round((m["prompt_tokens"] * price["input"]
-                                    + (m["output_tokens"] + m["thought_tokens"]) * price["output"]) / 1e6, 6)
-        if total_usd is not None:
-            total_usd += m["estimated_usd"]
-    return {"day": day, "calls": sum(m["calls"] for m in by_model.values()), **totals,
-            "by_model": by_model,
-            "estimated_usd": None if total_usd is None else round(total_usd, 6)}
+        provider = str(row.get("provider") or "gemini")
+        provider = "gemini" if provider == "cloud" else provider
+        model = str(row.get("model") or "unknown")
+        group = by_provider.setdefault(provider, {**empty(), "by_model": {}})
+        m = group["by_model"].setdefault(model, empty())
+        old = by_model.setdefault(model, empty())
+        for bucket in (totals, group, m, old):
+            bucket["calls"] += 1
+            for k in keys:
+                value = row.get(k)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    bucket[k] += max(0, value)
+    def add_cost(bucket, cost):
+        previous = bucket.get("estimated_usd", 0.0)
+        bucket["estimated_usd"] = None if cost is None or previous is None else previous + cost
+    for provider, group in by_provider.items():
+        for model, m in group["by_model"].items():
+            price = PRICES_USD_PER_MTOKEN.get(model)
+            cached = m["cached_tokens"]
+            if price is None or (cached and "cached_input" not in price):
+                cost = None
+            else:
+                # Anthropic input_tokens excludes cache reads; other APIs include them.
+                uncached = m["prompt_tokens"] if provider == "anthropic" else max(0, m["prompt_tokens"] - cached)
+                cost = round((uncached * price["input"] + cached * price.get("cached_input", 0)
+                              + (m["output_tokens"] + m["thought_tokens"]) * price["output"]) / 1e6, 6)
+            m["estimated_usd"] = cost
+            add_cost(group, cost)
+            add_cost(by_model[model], cost)
+            add_cost(totals, cost)
+    totals.setdefault("estimated_usd", 0.0)
+    for bucket in [totals, *by_provider.values(), *by_model.values()]:
+        if bucket.get("estimated_usd") is not None:
+            bucket["estimated_usd"] = round(bucket["estimated_usd"], 6)
+    return {"day": day, **totals, "by_model": by_model, "by_provider": by_provider}
 
 
-def _generate_cloud(prompt: str, *, model_id: str, timeout: int, retries: int,
+def _generate_gemini(prompt: str, *, model_id: str, timeout: int, retries: int,
                     caller: str = "synth") -> str:
     # Header auth, not ?key=. Same reasoning as khipu.embed: a live credential
     # in a URL is one logging or exception-formatting change away from the
@@ -256,13 +286,78 @@ def _generate_cloud(prompt: str, *, model_id: str, timeout: int, retries: int,
             parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
             return "".join(p.get("text", "") for p in parts)
         except urllib.error.HTTPError as e:
-            last = RuntimeError(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}")
+            last = RuntimeError(f"HTTP {e.code}")
             if e.code < 500 and e.code != 429:
                 break
         except Exception as e:  # noqa: BLE001 — network / timeout; retry
-            last = e
+            last = RuntimeError(type(e).__name__)
         time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"extract: model call failed: {last}")
+
+
+def _generate_cloud(prompt: str, **kwargs) -> str:
+    """Compatibility name for callers of the former Gemini-only gate."""
+    return _generate_gemini(prompt, **kwargs)
+
+
+def _provider_key(provider: str) -> str:
+    from khipu.keychain import resolve_anthropic_key, resolve_openai_key
+
+    if provider in {"cloud", "gemini"}:
+        return _key()
+    if provider == "anthropic":
+        return resolve_anthropic_key()
+    if provider == "openai":
+        return resolve_openai_key()
+    raise RuntimeError(f"unknown cloud synth provider: {provider}")
+
+
+def _generate_api(prompt: str, *, provider: str, model_id: str, timeout: int,
+                  retries: int, caller: str) -> str:
+    key = _provider_key(provider)
+    headers = {"Content-Type": "application/json"}
+    payload = {"model": model_id, "max_tokens": 4096, "temperature": 0.2,
+               "messages": [{"role": "user", "content": prompt}]}
+    if provider == "anthropic":
+        url = "https://api.anthropic.com/v1/messages"
+        headers.update({"x-api-key": key, "anthropic-version": "2023-06-01"})
+    else:
+        url = "https://api.openai.com/v1/chat/completions"
+        headers["Authorization"] = f"Bearer {key}"
+    body = json.dumps(payload).encode("utf-8")
+    last: Exception | None = None
+    for attempt in range(retries + 1):
+        _synth_budget_take()
+        req = urllib.request.Request(url, data=body, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            _record_usage(data, provider=provider, model_id=model_id, caller=caller)
+            if provider == "anthropic":
+                return "".join(part.get("text", "") for part in data.get("content", [])
+                               if isinstance(part.get("text"), str))
+            return str(data["choices"][0]["message"].get("content") or "")
+        except urllib.error.HTTPError as exc:
+            last = RuntimeError(f"HTTP {exc.code}")
+            if exc.code < 500 and exc.code != 429:
+                break
+        except Exception as exc:  # noqa: BLE001 — same retry policy as Gemini
+            # Transport exceptions can contain credentials; keep only the class.
+            last = RuntimeError(type(exc).__name__)
+        time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"extract: model call failed: {last}")
+
+
+def _generate_anthropic(prompt: str, *, model_id: str, timeout: int, retries: int,
+                        caller: str = "synth") -> str:
+    return _generate_api(prompt, provider="anthropic", model_id=model_id,
+                         timeout=timeout, retries=retries, caller=caller)
+
+
+def _generate_openai(prompt: str, *, model_id: str, timeout: int, retries: int,
+                     caller: str = "synth") -> str:
+    return _generate_api(prompt, provider="openai", model_id=model_id,
+                         timeout=timeout, retries=retries, caller=caller)
 
 
 def _response_format_rejected(code: int, body: str) -> bool:
@@ -361,7 +456,11 @@ def _generate(prompt: str, *, timeout: int = 45, retries: int = 2,
             timeout=timeout,
             retries=retries,
         )
-    return _generate_cloud(
+    adapters = {"cloud": _generate_cloud, "gemini": _generate_gemini,
+                "anthropic": _generate_anthropic, "openai": _generate_openai}
+    if provider not in adapters:
+        raise RuntimeError(f"unknown synth provider: {provider}")
+    return adapters[provider](
         prompt,
         model_id=cloud_model_id(settings),
         timeout=timeout,
