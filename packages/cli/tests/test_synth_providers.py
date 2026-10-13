@@ -456,7 +456,8 @@ def test_cli_exact_argv_stdin_env_usage_budget_and_no_capture(provider, tmp_path
                                             'transcript_path': str(transcript)}), 'claude_code')['reason'] == 'synth-cli'
         else:
             assert argv == ['codex', 'exec', '--json', '--ephemeral', '-s', 'read-only',
-                            '--skip-git-repo-check', '-m', 'm', '-o', argv[10], '-C', kw['cwd'], '-']
+                            '--skip-git-repo-check', '-m', 'm', '-o', argv[10], '-C', kw['cwd'],
+                            '--ignore-user-config', '-c', 'model_reasoning_effort=low', '-']
             assert not Path(argv[10]).is_relative_to(cwd)
         return cli_reply(provider, argv)
     with mock.patch.object(extract.subprocess, 'run', side_effect=run), \
@@ -674,6 +675,15 @@ def test_cli_binary_resolves_without_path_and_honours_the_override(tmp_path, mon
          mock.patch.object(synth_cli, 'binary', return_value='/resolved/claude'):
         extract._generate_claude_cli('p', model_id='m', retries=0)
     assert call.call_args.args[0][0] == '/resolved/claude'
+
+
+def test_codex_cli_effort_defaults_low_and_is_raisable(monkeypatch):
+    monkeypatch.delenv('KHIPU_CODEX_CLI_EFFORT', raising=False)
+    assert extract._codex_cli_effort() == 'low'
+    monkeypatch.setenv('KHIPU_CODEX_CLI_EFFORT', 'High')
+    assert extract._codex_cli_effort() == 'high'
+    monkeypatch.setenv('KHIPU_CODEX_CLI_EFFORT', 'turbo; rm -rf')
+    assert extract._codex_cli_effort() == 'low'
 
 
 def test_wrong_task_reply_from_a_cli_provider_falls_back_to_gemini_once():
