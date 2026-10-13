@@ -43,6 +43,8 @@ import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
 import { buildAttention, harnessLabel, type Attention } from "./doctorAttention";
 import { HealthReportRows } from "./healthRows";
+import { SummariserBudgetCard, SynthProviderFields, synthModelError } from "./SynthProvider";
+import type { DoctorSynthProvider } from "./SynthProvider";
 import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVerify";
 import { WorkingBanner } from "./WorkingBanner";
 import { FeedbackForm } from "./FeedbackForm";
@@ -132,7 +134,7 @@ type ModelsState = {
 
 const DEFAULT_MODELS: ModelsState = {
   synth: {
-    provider: "cloud",
+    provider: "gemini",
     endpoint: "",
     model_id: "gemini-2.5-flash",
   },
@@ -767,16 +769,33 @@ function parseJson(raw: string): unknown {
   }
 }
 
+// The summariser's API keys report from three places each (`khipu secrets`):
+// the Keychain, the environment and a key file.
+const SYNTH_KEY_FIELDS = [
+  "gemini_env",
+  "gemini_file_key_present",
+  "anthropic_in_keychain",
+  "anthropic_env",
+  "anthropic_file_key_present",
+  "openai_in_keychain",
+  "openai_env",
+  "openai_file_key_present",
+  "openrouter_in_keychain",
+  "openrouter_env",
+  "openrouter_file_key_present",
+] as const;
+
 type SecretsPresence = {
   dsn_in_keychain?: boolean;
   gemini_in_keychain?: boolean;
   openai_compat_in_keychain?: boolean;
-};
+} & Partial<Record<(typeof SYNTH_KEY_FIELDS)[number], boolean>>;
 
 const SECRET_PRESENCE_KEYS = [
   "dsn_in_keychain",
   "gemini_in_keychain",
   "openai_compat_in_keychain",
+  ...SYNTH_KEY_FIELDS,
 ] as const satisfies ReadonlyArray<keyof SecretsPresence>;
 
 function isSecretsPresence(value: unknown): value is SecretsPresence {
@@ -797,11 +816,9 @@ function isSecretsPresence(value: unknown): value is SecretsPresence {
 }
 
 function pickSecretsPresence(value: SecretsPresence): SecretsPresence {
-  return {
-    dsn_in_keychain: value.dsn_in_keychain,
-    gemini_in_keychain: value.gemini_in_keychain,
-    openai_compat_in_keychain: value.openai_compat_in_keychain,
-  };
+  const out: SecretsPresence = {};
+  for (const key of SECRET_PRESENCE_KEYS) out[key] = value[key];
+  return out;
 }
 
 function presenceLabel(
@@ -2636,6 +2653,11 @@ export default function App() {
       );
       return;
     }
+    const synthRefusal = synthModelError(models.synth.provider, models.synth.model_id);
+    if (synthRefusal) {
+      setModelsMsg(synthRefusal);
+      return;
+    }
     setModelsSaving(true);
     setModelsMsg(null);
     try {
@@ -2665,12 +2687,14 @@ export default function App() {
         await loadModels();
       }
       setModelsMsg("Saved.");
+      // Re-read the health report so the provider's key / CLI status follows.
+      void loadDoctor(true);
     } catch (e) {
       setModelsMsg(String(e));
     } finally {
       setModelsSaving(false);
     }
-  }, [models, loadModels]);
+  }, [models, loadModels, loadDoctor]);
 
   const toggleGraphSource = useCallback(
     async (id: string, enabled: boolean) => {
@@ -5288,8 +5312,10 @@ export default function App() {
                       <div className="section-head">Models</div>
                       <div className="section-body">
                         <p className="muted">
-                          Session summaries follow this card (Gemini cloud or a
-                          local OpenAI-compatible endpoint). The monthly topic
+                          Session summaries follow this card: an API key (Gemini,
+                          Claude Haiku, OpenAI, OpenRouter), the Claude or ChatGPT
+                          login you already use, or a local OpenAI-compatible
+                          endpoint. The monthly topic
                           pass runs its own model and is not switched here. The
                           model that searches by meaning is chosen under
                           Embeddings.
@@ -5301,53 +5327,18 @@ export default function App() {
                           </Callout>
                         ) : null}
 
-                        {(
-                          [["synth", "Session summaries"]] as const
-                        ).map(([role, label]) => {
-                          const row = models[role];
-                          return (
-                            <div key={role} className="rows" style={{ marginBottom: 12 }}>
-                              <div className="rows-head">{label}</div>
-                              <div className="toolbar">
-                                <label className="muted" htmlFor={`models-${role}-provider`}>
-                                  Provider
-                                </label>
-                                <select
-                                  id={`models-${role}-provider`}
-                                  value={row.provider}
-                                  onChange={(e) =>
-                                    updateModelRole(role, { provider: e.target.value })
-                                  }
-                                >
-                                  {(["cloud", "local"] as const).map((provider) => (
-                                    <option key={provider} value={provider}>
-                                      {provider}
-                                    </option>
-                                  ))}
-                                </select>
-                              </div>
-                              <div className="toolbar">
-                                <input
-                                  className="mono"
-                                  disabled={row.provider === "cloud"}
-                                  value={row.endpoint}
-                                  onChange={(e) =>
-                                    updateModelRole(role, { endpoint: e.target.value })
-                                  }
-                                  placeholder="http://127.0.0.1:11434"
-                                />
-                                <input
-                                  className="mono"
-                                  value={row.model_id}
-                                  onChange={(e) =>
-                                    updateModelRole(role, { model_id: e.target.value })
-                                  }
-                                  placeholder="model id"
-                                />
-                              </div>
-                            </div>
-                          );
-                        })}
+                        <SynthProviderFields
+                          row={models.synth}
+                          onChange={(patch) => updateModelRole("synth", patch)}
+                          presence={secretsPresence}
+                          doctorSynth={
+                            (doctorParsed?.synth_provider as DoctorSynthProvider | undefined) ?? null
+                          }
+                          onKeySaved={async () => {
+                            await loadSecretsPresence();
+                            await loadStatus(true);
+                          }}
+                        />
 
                         <div className="toolbar">
                           <button
@@ -5362,6 +5353,8 @@ export default function App() {
                         {modelsMsg ? <pre className="code">{modelsMsg}</pre> : null}
                       </div>
                     </div>
+
+                    <SummariserBudgetCard active={tab === "settings" && settingsSection === "capture"} />
 
                     <div className="section-card">
                       <div className="section-head">Keys</div>

@@ -8,6 +8,14 @@
 // checked at all — distinct from both).
 import { Check, CircleMinus, TriangleAlert } from "lucide-react";
 import type { Attention } from "./doctorAttention";
+import {
+  canonicalSynthProvider,
+  formatUsd,
+  synthCallsLine,
+  synthProviderInfo,
+  usageByProviderLines,
+} from "./SynthProvider";
+import type { DoctorSynthProvider, SynthBudget } from "./SynthProvider";
 
 export type HealthRowStatus = "ok" | "err" | "skipped";
 
@@ -17,6 +25,8 @@ export type HealthRow = {
   status: HealthRowStatus;
   /** Plain-words title — never the raw field name. */
   label: string;
+  /** What the check saw, from the doctor block paired with the flag. */
+  detail?: string;
 };
 
 // Canonical order + copy for the checks the bundled doctor emits today
@@ -41,6 +51,7 @@ const LABELS: Record<string, string> = {
   // only the legacy driver's exit code.
   notes_reconcile_ok: "Notes reconciled by the nightly",
   embed_provider_ok: "Embedding provider reachable",
+  synth_provider_ok: "Summariser provider ready",
   synth_budget_ok: "Summariser within today's call ceiling",
   commitments_hygiene_ok: "Commitments hygiene ran",
   mark_stale_ok: "Stale commitments aged out",
@@ -81,6 +92,37 @@ function isNotConfigured(key: string, notConfigured: string[]): boolean {
   return candidates.some((c) => c !== undefined && notConfigured.includes(c));
 }
 
+/** The `synth_provider` block: provider, model, and key present or CLI found. */
+export function synthProviderDetail(sp: DoctorSynthProvider | undefined): string | undefined {
+  if (!sp || typeof sp !== "object" || !sp.provider) return undefined;
+  const info = synthProviderInfo(sp.provider);
+  const parts = [info?.label ?? canonicalSynthProvider(sp.provider)];
+  if (sp.model) parts.push(sp.model);
+  if (info?.route === "login" || sp.auth === "subscription") {
+    const bin = info?.binary ?? "CLI";
+    parts.push(sp.binary ? `${bin} found` : `${bin} not found`);
+  } else if (info?.route !== "local") {
+    parts.push(sp.key_present ? "key present" : "no key");
+  }
+  return parts.join(" · ");
+}
+
+/** The `synth_budget` block: calls / cap / source, cost, per provider. */
+export function synthBudgetDetail(b: SynthBudget | undefined): string | undefined {
+  if (!b || typeof b !== "object") return undefined;
+  if (b.error && b.calls == null) return b.error;
+  const parts = [synthCallsLine(b), `about ${formatUsd(b.estimated_usd_today)} today`];
+  const lines = usageByProviderLines(b.usage_by_provider);
+  if (lines.length) parts.push(lines.join("; "));
+  return parts.join(" · ");
+}
+
+function detailFor(key: string, parsed: Record<string, unknown>): string | undefined {
+  if (key === "synth_provider_ok") return synthProviderDetail(parsed.synth_provider as DoctorSynthProvider | undefined);
+  if (key === "synth_budget_ok") return synthBudgetDetail(parsed.synth_budget as SynthBudget | undefined);
+  return undefined;
+}
+
 /** Pure: every top-level boolean `*_ok` field in `parsed` becomes one row —
  *  green, red, or (if `not_configured` names its check) grey "not set up".
  *  Sorted red first, then not-set-up, then green; stable within each group
@@ -98,10 +140,12 @@ export function healthRows(parsed: Record<string, unknown>): HealthRow[] {
 
   const rows: HealthRow[] = okKeys.map((key) => {
     const label = LABELS[key] ?? humanize(key);
+    const detail = detailFor(key, parsed);
+    const extra = detail ? { detail } : {};
     if (isNotConfigured(key, notConfigured)) {
-      return { key, status: "skipped", label };
+      return { key, status: "skipped", label, ...extra };
     }
-    return { key, status: parsed[key] ? "ok" : "err", label };
+    return { key, status: parsed[key] ? "ok" : "err", label, ...extra };
   });
 
   const statusRank: Record<HealthRowStatus, number> = {
@@ -135,6 +179,7 @@ const ATTENTION_KEY_FOR_OK: Record<string, string> = {
   index_freshness_ok: "index_freshness",
   embed_coverage_ok: "embed_coverage",
   synth_budget_ok: "synth_budget",
+  synth_provider_ok: "synth_provider",
   recall_probe_ok: "recall_probe",
   bundle_seal_ok: "bundle_seal",
   dsn_file_ok: "dsn_file",
@@ -179,6 +224,7 @@ export function HealthReportRows({
             <div key={row.key} className="row-item">
               <Check size={16} strokeWidth={1.75} aria-hidden className="ok" />
               <span className="row-main">{row.label}</span>
+              {row.detail ? <span className="row-meta wrap">{row.detail}</span> : null}
             </div>
           );
         }
@@ -210,7 +256,7 @@ export function HealthReportRows({
               className="err"
             />
             <span className="row-main">{row.label}</span>
-            <span className="row-meta">{sentence}</span>
+            <span className="row-meta">{row.detail ? `${sentence} ${row.detail}` : sentence}</span>
             {single?.fix ? (
               <button
                 type="button"

@@ -11,6 +11,7 @@ import { buildAttention, type Attention } from "./doctorAttention";
 import { LABEL as HARNESS_LABEL } from "./IntegrationsPanel";
 import type { RecallProbeStatus } from "./IntegrationsPanel";
 import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVerify";
+import { SynthAccess, defaultSynthModel, synthModelError } from "./SynthProvider";
 
 /** `docs/plans/2026-09-05-setup-that-cannot-strand-you.md` stage ids.
  *  Preflight (`khipu db preflight`) only ever reaches `reach..graph`; a full
@@ -79,7 +80,16 @@ type Presence = {
   gemini_in_keychain?: boolean;
   gemini_env?: boolean;
   openai_compat_in_keychain?: boolean;
+  [field: string]: unknown;
 };
+
+/** Booleans only, for the summariser's key status (`khipu secrets` fields). */
+function presenceFlags(p: Presence | null): Record<string, boolean> | null {
+  if (!p) return null;
+  const out: Record<string, boolean> = {};
+  for (const [k, v] of Object.entries(p)) if (typeof v === "boolean") out[k] = v;
+  return out;
+}
 type HarnessRow = {
   harness: string;
   detected?: boolean;
@@ -600,7 +610,14 @@ export function Welcome({
   const [keyMsg, setKeyMsg] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   type ModelChoice = "cloud" | "local" | "skip";
-  const [synthChoice, setSynthChoice] = useState<ModelChoice>("cloud");
+  /** `cloud` is Gemini; the others are `khipu models` synth providers. */
+  type SynthChoice = ModelChoice | "anthropic" | "claude-cli" | "codex-cli";
+  const [synthChoice, setSynthChoiceRaw] = useState<SynthChoice>("cloud");
+  const [synthModelId, setSynthModelId] = useState("");
+  const setSynthChoice = useCallback((next: SynthChoice) => {
+    setSynthChoiceRaw(next);
+    setSynthModelId(next === "cloud" || next === "local" || next === "skip" ? "" : defaultSynthModel(next));
+  }, []);
   const [embedChoice, setEmbedChoice] = useState<ModelChoice>("cloud");
   const [localSynthEndpoint, setLocalSynthEndpoint] = useState("http://127.0.0.1:11434/v1");
   const [localSynthModel, setLocalSynthModel] = useState("");
@@ -697,6 +714,11 @@ export function Welcome({
         setModelMsg("Local synth needs a base URL and model id.");
         return false;
       }
+      const synthRefusal = synthModelError(synthChoice, synthModelId);
+      if (synthRefusal) {
+        setModelMsg(synthRefusal);
+        return false;
+      }
       if (embedChoice === "local" && (!localEmbedEndpoint.trim() || !localEmbedModel.trim())) {
         setModelMsg("Local embed needs a base URL and model id.");
         return false;
@@ -705,7 +727,7 @@ export function Welcome({
         synth_choice: synthChoice,
         embed_choice: embedChoice,
         synth_endpoint: localSynthEndpoint.trim(),
-        synth_model_id: localSynthModel.trim(),
+        synth_model_id: synthChoice === "local" ? localSynthModel.trim() : synthModelId.trim(),
         embed_endpoint: localEmbedEndpoint.trim(),
         embed_model_id: localEmbedModel.trim(),
       };
@@ -725,6 +747,7 @@ export function Welcome({
     }
   }, [
     synthChoice,
+    synthModelId,
     embedChoice,
     localSynthEndpoint,
     localSynthModel,
@@ -1269,6 +1292,33 @@ export function Welcome({
                   <input
                     type="radio"
                     name="synth-choice"
+                    checked={synthChoice === "anthropic"}
+                    onChange={() => setSynthChoice("anthropic")}
+                  />
+                  {" "}Claude Haiku (API key)
+                </label>
+                <label className="radio-choice">
+                  <input
+                    type="radio"
+                    name="synth-choice"
+                    checked={synthChoice === "claude-cli"}
+                    onChange={() => setSynthChoice("claude-cli")}
+                  />
+                  {" "}Claude on my own login (claude -p)
+                </label>
+                <label className="radio-choice">
+                  <input
+                    type="radio"
+                    name="synth-choice"
+                    checked={synthChoice === "codex-cli"}
+                    onChange={() => setSynthChoice("codex-cli")}
+                  />
+                  {" "}ChatGPT on my own login (codex)
+                </label>
+                <label className="radio-choice">
+                  <input
+                    type="radio"
+                    name="synth-choice"
                     checked={synthChoice === "local"}
                     onChange={() => setSynthChoice("local")}
                   />
@@ -1314,6 +1364,31 @@ export function Welcome({
                     check={modelCheckFor(modelVerify, "gemini_generate")}
                     verifying={verifying}
                     onRetry={() => void verifyModelKeys()}
+                  />
+                </>
+              ) : null}
+              {synthChoice === "anthropic" || synthChoice === "claude-cli" || synthChoice === "codex-cli" ? (
+                <>
+                  <div className="toolbar" style={{ width: "100%" }}>
+                    <input
+                      className="mono"
+                      value={synthModelId}
+                      onChange={(e) => setSynthModelId(e.target.value)}
+                      placeholder={synthChoice === "codex-cli" ? "gpt-6-luna" : defaultSynthModel(synthChoice)}
+                      aria-label="Summariser model id"
+                    />
+                  </div>
+                  {synthModelError(synthChoice, synthModelId) ? (
+                    <p className="set-error" role="alert">
+                      {synthModelError(synthChoice, synthModelId)}
+                    </p>
+                  ) : null}
+                  <SynthAccess
+                    key={synthChoice}
+                    provider={synthChoice}
+                    presence={presenceFlags(presence)}
+                    doctorSynth={null}
+                    onKeySaved={loadPresence}
                   />
                 </>
               ) : null}

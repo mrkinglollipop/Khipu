@@ -194,6 +194,24 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(out["embed"]["active_profile"], "gemini-embedding-2@768")
         act.assert_called_once_with(provider="cloud")
 
+    def test_apply_welcome_names_a_synth_provider(self):
+        with mock.patch("khipu.embed.activate_welcome_embed") as act:
+            out = models.apply_welcome_models(synth_choice="claude-cli", embed_choice="skip")
+            self.assertEqual(out["models"]["synth"],
+                             {"provider": "claude-cli", "endpoint": "", "model_id": "haiku"})
+            out = models.apply_welcome_models(synth_choice="anthropic", embed_choice="skip")
+            self.assertEqual(out["models"]["synth"]["model_id"], "claude-haiku-5-5")
+            out = models.apply_welcome_models(synth_choice="codex-cli", embed_choice="skip",
+                                              synth_model_id="gpt-6-luna")
+            self.assertEqual(out["models"]["synth"],
+                             {"provider": "codex-cli", "endpoint": "", "model_id": "gpt-6-luna"})
+            with self.assertRaisesRegex(ValueError, "codex-cli provider requires --model"):
+                models.apply_welcome_models(synth_choice="codex-cli", embed_choice="skip")
+            with self.assertRaisesRegex(ValueError, "unknown synth_choice"):
+                models.apply_welcome_models(synth_choice="grok", embed_choice="skip")
+        act.assert_not_called()
+        self.assertEqual(models.show_models()["synth"]["model_id"], "gpt-6-luna")
+
     def test_apply_welcome_skip_does_not_activate(self):
         with mock.patch("khipu.embed.activate_welcome_embed") as act:
             out = models.apply_welcome_models(
