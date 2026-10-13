@@ -11,7 +11,7 @@ or functionality, every hard limit liftable, and "we need to work with power use
 | 0 | Spend made visible and bounded without dropping anything (PR #157: machine messages are not turns, `khipu budget`, usage accounting) | done 2026-10-13 |
 | 0b | Stop summarising re-emitted history after Claude Code compactions (dedupe by fingerprint) | done 2026-10-13 (PR #159) |
 | 1 | Provider abstraction for the synth role: `gemini`, `anthropic`, `openai`, `local`, with a price table and per-provider daily ceilings | done 2026-10-13 (PR #160); [evidence](2026-10-13-synth-providers-p1-verification.md) |
-| 2 | Subscription routes: `claude-cli` (`claude -p` on the user's own login) and `codex-cli` (`codex exec` on the user's own login) | open; needs phase 1 |
+| 2 | Subscription routes: `claude-cli` (`claude -p` on the user's own login) and `codex-cli` (`codex exec` on the user's own login) | built 2026-10-13, quality gate pending |
 | 3 | Settings UI for provider, model and key source in the desktop app; `khipu models set --role synth --provider … --model …` | open; needs phase 1 |
 
 One PR per phase, merged alone and soaked.
@@ -104,3 +104,37 @@ required setting and no default; never store a key in config.json.
 `claude-cli` and `codex-cli` adapters as in decisions 3 and 4, with the verify probe that proves no
 self-capture, a Settings note quoting the vendor's own terms with the date, and the quality gate of
 decision 5 run before either appears in the UI.
+
+## Phase 2 as built
+
+The exact invocations (prompt on stdin; `<cwd>` is an empty Khipu-owned temporary directory under
+`data_dir()/state/synth-cli/`, and `<file>` is a temporary last-message file outside that directory):
+
+```text
+claude -p --setting-sources "" --model <id> --output-format json --max-turns 1 --disallowedTools "Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,Agent" --session-id <uuid>
+codex exec --json --ephemeral -s read-only --skip-git-repo-check -m <id> -o <file> -C <cwd> -
+```
+
+The orchestrator's 2026-10-13 probe on Claude Code 2.1.296 established that `--bare` does not read
+OAuth or the Keychain and returns "Not logged in" on a subscription login. `--setting-sources ""`
+preserves authentication and loads no settings-file hooks. The adapter does not use `--bare`.
+Codex 0.162.0-alpha.17.2 help confirms that `-` reads stdin and `--ephemeral` persists no session files.
+Both adapters strip `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT` and every `KHIPU_*` environment variable,
+default to a 60-second call timeout, and charge the liftable synth ceiling once per attempt.
+
+Claude requires a valid UUID, so the exact capture marker is `state/synth-cli/sessions.json`, a
+locked, atomically replaced list of the newest 2,000 IDs. IDs are persisted before launch; Codex's
+emitted thread IDs are also registered. Hooks, transcript-path resolution and idle sweeps ignore
+marked sessions; corrupt or unreadable lists are treated as empty. This checkout has no separate
+Codex transcript crawler: native discovery consumes hook payload paths and sweep state files.
+An explicit `khipu integrations verify` makes one configured CLI call and watches for matching queue
+and hook state files for three seconds. Subscription rows count calls and tokens with estimated
+USD zero and `billing: "subscription"`. Rerank refuses these providers.
+
+Settings note, based on the orchestrator's Anthropic research dated 2026-10-07: `claude -p` and the
+Agent SDK on a Max/Pro login "still draw from your subscription limits". The vendor's restriction
+on routing products through a user's subscription credentials was recorded in that research as a
+paraphrase, not a verbatim quote. Khipu runs the user's own installed CLI as the user and holds no
+subscription credential. Re-check the vendor terms before release. No vendor research or live model
+call was performed in this build session. Decision 5's 50-window comparison remains pending; neither
+subscription provider becomes the default or receives a UI recommendation in this phase.

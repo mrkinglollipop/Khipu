@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest import mock
 
 from khipu import session_capture as sc
+from khipu import synth_cli
 from tests.fixtures.t3 import handoff_wrapper
 
 REPO = Path(__file__).resolve().parents[3]
@@ -34,6 +35,92 @@ def _write(path: Path, rows: list) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     return path
+
+
+class SynthCliExclusionTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.directory = Path(tmp.name)
+        patch = mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": tmp.name,
+                                            "KHIPU_CAPTURE_HOME": str(self.directory / "capture")})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def transcript(self):
+        return _write(self.directory / "transcript.jsonl", [
+            {"type": "user", "message": {"role": "user", "content": "Keep this decision. " * 30}},
+            {"type": "assistant", "message": {"role": "assistant", "content": "Kept it. " * 30}},
+        ])
+
+    def test_marked_hooks_and_codex_transcript_resolution_do_nothing(self):
+        sid = synth_cli.new_session()
+        path = self.transcript()
+        payload = {"session_id": sid, "transcript_path": str(path), "hook_event_name": "SessionEnd"}
+        for harness in ("claude_code", "codex"):
+            with self.subTest(harness=harness), mock.patch.object(sc, "_heartbeat") as beat, \
+                    mock.patch.object(synth_cli, "session_ids", wraps=synth_cli.session_ids) as load:
+                out = sc.hook_main(json.dumps(payload), harness)
+                self.assertEqual(out["reason"], "synth-cli")
+                self.assertFalse(out["due"])
+                load.assert_called_once_with()
+                beat.assert_not_called()
+            self.assertIsNone(sc.transcript_path(payload, harness))
+            self.assertFalse(sc._state_file(harness, sid).exists())
+        self.assertEqual(sc.queued_jobs(), [])
+        self.assertFalse(sc.state_dir().exists())
+
+    def test_sweep_skips_marker_in_filename_or_state_without_mutation(self):
+        sid = synth_cli.new_session()
+        path = self.transcript()
+        for track_sid in (sid, "other-track"):
+            sc.save_state("codex", track_sid, {"session_id": sid, "offset": 0,
+                                              "seen_ts": 1, "transcript_path": str(path)})
+        before = {p: p.read_bytes() for p in sc.state_dir().glob("*.json")}
+        with mock.patch.object(sc, "read_window") as read, \
+                mock.patch.object(synth_cli, "session_ids", wraps=synth_cli.session_ids) as load:
+            out = sc.sweep_idle(now=time.time() + 10000)
+        load.assert_called_once_with()
+        read.assert_not_called()
+        self.assertEqual(out["skipped"], {"synth-cli": 2})
+        self.assertEqual(out["jobs"], 0)
+        self.assertEqual(sc.queued_jobs(), [])
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+
+    def test_bad_markers_are_empty_and_do_not_suppress_capture(self):
+        path = self.transcript()
+        synth_cli.root().mkdir(parents=True)
+        marker = synth_cli.root() / "sessions.json"
+        for contents in ("{bad", "{}", '["marked", 1]'):
+            with self.subTest(contents=contents):
+                marker.write_text(contents)
+                self.assertEqual(synth_cli.session_ids(), set())
+                self.assertEqual(sc.transcript_path({"session_id": "marked", "transcript_path": str(path)}, "codex"), path)
+        with mock.patch.object(sc, "ancestor_pids", return_value=[]):
+            out = sc.hook_main(json.dumps({"session_id": "marked", "transcript_path": str(path),
+                                           "hook_event_name": "SessionEnd"}), "codex")
+        self.assertTrue(out["due"], out)
+        self.assertTrue(sc._state_file("codex", "marked").exists())
+        self.assertEqual(len(sc.queued_jobs()), 1)
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError()):
+            self.assertEqual(synth_cli.session_ids(), set())
+
+    def test_registry_bound_newest_last_and_atomic_parallel_writers(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        synth_cli.root().mkdir(parents=True)
+        marker = synth_cli.root() / "sessions.json"
+        marker.write_text(json.dumps([f"old-{i}" for i in range(2000)]))
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(synth_cli.register, [f"new-{i}" for i in range(8)]))
+        rows = json.loads(marker.read_text())
+        self.assertEqual(len(rows), 2000)
+        self.assertEqual(set(rows[-8:]), {f"new-{i}" for i in range(8)})
+        self.assertEqual(rows[0], "old-8")
+        synth_cli.register("old-100")
+        rows = json.loads(marker.read_text())
+        self.assertEqual(len(rows), 2000)
+        self.assertEqual(rows[-1], "old-100")
 
 
 class ClaudeCodeReaderTest(unittest.TestCase):
