@@ -73,6 +73,34 @@ def observe_sessions():
         _observed.reset(token)
 
 
+_CANDIDATES = {
+    "claude": ("~/.npm-global/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude",
+               "~/.local/bin/claude"),
+    "codex": ("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+              "/opt/homebrew/bin/codex", "/usr/local/bin/codex", "~/.npm-global/bin/codex"),
+}
+
+
+def binary(name: str) -> str | None:
+    """Absolute path of the user's CLI, or None. The launchd drain job runs with
+    a bare PATH (2026-10-13: every capture failed with FileNotFoundError the
+    minute the provider was switched), so PATH is only the first place looked;
+    ``KHIPU_<NAME>_CLI`` names an explicit binary."""
+    import shutil
+
+    override = (os.environ.get(f"KHIPU_{name.upper()}_CLI") or "").strip()
+    if override:
+        return override if Path(override).is_file() else None
+    found = shutil.which(name)
+    if found:
+        return found
+    for candidate in _CANDIDATES.get(name, ()):
+        p = Path(candidate).expanduser()
+        if p.is_file() or p.is_symlink():
+            return str(p)
+    return None
+
+
 def environment() -> dict[str, str]:
     return {k: v for k, v in os.environ.items()
             if k not in {"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"} and not k.startswith("KHIPU_")}
