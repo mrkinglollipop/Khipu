@@ -407,7 +407,7 @@ def _generate_claude_cli(prompt: str, *, model_id: str, timeout: int = 60, retri
         try:
             sid = synth_cli.new_session()
             with tempfile.TemporaryDirectory(prefix="work-", dir=synth_cli.root()) as cwd:
-                argv = ["claude", "-p", "--setting-sources", "", "--model", model_id,
+                argv = [synth_cli.binary("claude") or "claude", "-p", "--setting-sources", "", "--model", model_id,
                         "--system-prompt", CLAUDE_CLI_SYSTEM_PROMPT,
                         "--output-format", "json", "--max-turns", "1", "--disallowedTools",
                         "Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,Agent", "--session-id", sid]
@@ -448,7 +448,7 @@ def _generate_codex_cli(prompt: str, *, model_id: str, timeout: int = 60, retrie
             synth_cli.new_session()
             with tempfile.TemporaryDirectory(prefix="work-", dir=synth_cli.root()) as cwd, \
                     tempfile.NamedTemporaryFile(dir=synth_cli.root()) as output:
-                argv = ["codex", "exec", "--json", "--ephemeral", "-s", "read-only",
+                argv = [synth_cli.binary("codex") or "codex", "exec", "--json", "--ephemeral", "-s", "read-only",
                         "--skip-git-repo-check", "-m", model_id, "-o", output.name, "-C", cwd, "-"]
                 result = subprocess.run(argv, input=prompt, text=True, capture_output=True,
                                         cwd=cwd, env=env, timeout=timeout, check=False)

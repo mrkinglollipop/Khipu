@@ -340,6 +340,7 @@ def cli_reply(provider, argv, *, text='ab', error=False, code=0, usage=True):
 
 @pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
 def test_cli_exact_argv_stdin_env_usage_budget_and_no_capture(provider, tmp_path, monkeypatch):
+    monkeypatch.setattr(synth_cli, 'binary', lambda name: name)
     prompt = 'USER: retain every decision.\nUnicode: café'
     monkeypatch.setenv('CLAUDECODE', 'nested')
     monkeypatch.setenv('CLAUDE_CODE_ENTRYPOINT', 'cli')
@@ -472,14 +473,15 @@ def test_cli_doctor_subscription_path_only(provider, present):
     with ExitStack() as stack:
         for patch in _green_doctor_patches():
             stack.enter_context(patch)
-        stack.enter_context(mock.patch('shutil.which', return_value='/fake/bin' if present else None))
+        stack.enter_context(mock.patch.object(synth_cli, 'binary', return_value='/fake/bin' if present else None))
         stack.enter_context(mock.patch('khipu.probe.status', return_value={'ok': True}))
         stack.enter_context(mock.patch('khipu.recall_prompt.prompt_recall_outcomes', return_value={'ok': True}))
         stack.enter_context(mock.patch('khipu.drift.recall_quality', return_value={}))
         output = stack.enter_context(redirect_stdout(io.StringIO()))
         cli.cmd_doctor(cli.build_parser().parse_args(['doctor']))
     doc = json.loads(output.getvalue())
-    assert doc['synth_provider'] == {'provider': provider, 'model': 'm', 'key_present': None, 'auth': 'subscription'}
+    assert doc['synth_provider'] == {'provider': provider, 'model': 'm', 'key_present': None, 'auth': 'subscription',
+                                     'binary': '/fake/bin' if present else None}
     assert doc['synth_provider_ok'] is present
 
 
@@ -566,6 +568,29 @@ def test_subscription_cost_does_not_reprice_anthropic_alias():
         assert result['by_provider'][provider]['estimated_usd'] == 0.0
         assert result['by_provider'][provider]['billing'] == 'subscription'
     assert result['estimated_usd'] == .000204
+
+
+def test_cli_binary_resolves_without_path_and_honours_the_override(tmp_path, monkeypatch):
+    # The launchd drain job has a bare PATH; the known install locations are tried next.
+    monkeypatch.delenv('KHIPU_CLAUDE_CLI', raising=False)
+    monkeypatch.setattr('shutil.which', lambda name: None)
+    fake = tmp_path / 'claude'
+    fake.write_text('#!/bin/sh\n')
+    monkeypatch.setattr(synth_cli, '_CANDIDATES', {'claude': (str(fake),)})
+    assert synth_cli.binary('claude') == str(fake)
+    monkeypatch.setattr(synth_cli, '_CANDIDATES', {'claude': (str(tmp_path / 'missing'),)})
+    assert synth_cli.binary('claude') is None
+    monkeypatch.setenv('KHIPU_CLAUDE_CLI', str(fake))
+    assert synth_cli.binary('claude') == str(fake)
+    monkeypatch.setenv('KHIPU_CLAUDE_CLI', str(tmp_path / 'nope'))
+    assert synth_cli.binary('claude') is None
+    monkeypatch.delenv('KHIPU_CLAUDE_CLI')
+    monkeypatch.setattr('shutil.which', lambda name: '/on/path/claude')
+    assert synth_cli.binary('claude') == '/on/path/claude'
+    with mock.patch.object(extract.subprocess, 'run', side_effect=lambda argv, **kw: cli_reply('claude-cli', argv)) as call, \
+         mock.patch.object(synth_cli, 'binary', return_value='/resolved/claude'):
+        extract._generate_claude_cli('p', model_id='m', retries=0)
+    assert call.call_args.args[0][0] == '/resolved/claude'
 
 
 def test_wrong_task_reply_from_a_cli_provider_falls_back_to_gemini_once():

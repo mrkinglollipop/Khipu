@@ -308,10 +308,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                       "key_present": bool(_key_present)}
     synth_provider_ok = _provider == "local" or bool(_key_present)
     if _provider in CLI_PROVIDERS:
-        import shutil
+        from khipu.synth_cli import binary
 
-        synth_provider.update(key_present=None, auth="subscription")
-        synth_provider_ok = shutil.which(_provider.removesuffix("-cli")) is not None
+        synth_provider.update(key_present=None, auth="subscription",
+                              binary=binary(_provider.removesuffix("-cli")))
+        synth_provider_ok = synth_provider["binary"] is not None
     try:
         from khipu.jobs import index_freshness, job_status
 
