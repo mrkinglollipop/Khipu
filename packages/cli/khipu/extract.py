@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import subprocess
 import tempfile
@@ -467,6 +468,18 @@ def _cli_failure(text: str) -> bool:
                              "you've hit your limit", "you have hit your limit"))
 
 
+CODEX_CLI_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _codex_cli_effort() -> str:
+    """Reasoning effort for the summariser's Codex call. Without it Codex uses
+    the user's own config default, which on the maintainer's Mac is the top
+    effort: 50 to 77 s per capture in the 2026-10-13 gate. Summarising needs
+    none of that; ``KHIPU_CODEX_CLI_EFFORT`` raises it."""
+    effort = (os.environ.get("KHIPU_CODEX_CLI_EFFORT") or "low").strip().lower()
+    return effort if effort in CODEX_CLI_EFFORTS else "low"
+
+
 def _generate_codex_cli(prompt: str, *, model_id: str, timeout: int = 60, retries: int = 2,
                         caller: str = "synth") -> str:
     from khipu import synth_cli
@@ -480,7 +493,12 @@ def _generate_codex_cli(prompt: str, *, model_id: str, timeout: int = 60, retrie
             with tempfile.TemporaryDirectory(prefix="work-", dir=synth_cli.root()) as cwd, \
                     tempfile.NamedTemporaryFile(dir=synth_cli.root()) as output:
                 argv = [synth_cli.binary("codex") or "codex", "exec", "--json", "--ephemeral", "-s", "read-only",
-                        "--skip-git-repo-check", "-m", model_id, "-o", output.name, "-C", cwd, "-"]
+                        "--skip-git-repo-check", "-m", model_id, "-o", output.name, "-C", cwd,
+                        # The user's own Codex config (MCP servers, hooks) cost 30 s
+                        # of startup per call against 6 s without it (measured
+                        # 2026-10-13); the login is not part of that config.
+                        "--ignore-user-config",
+                        "-c", f"model_reasoning_effort={_codex_cli_effort()}", "-"]
                 result = subprocess.run(argv, input=prompt, text=True, capture_output=True,
                                         cwd=cwd, env=env, timeout=timeout, check=False)
                 usage = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
