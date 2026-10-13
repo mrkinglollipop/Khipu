@@ -4126,7 +4126,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     md_welcome.add_argument(
         "models_json",
-        help="JSON: synth_choice, embed_choice, optional local endpoint/model_id fields",
+        help="JSON: synth_choice (cloud, local, skip or a synth provider), embed_choice, optional endpoint/model_id fields",
     )
     md_welcome.set_defaults(func=cmd_models, models_cmd="welcome")
     md.set_defaults(func=cmd_models, models_cmd="show")

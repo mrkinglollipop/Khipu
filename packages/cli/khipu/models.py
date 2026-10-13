@@ -309,7 +309,10 @@ def apply_welcome_models(
     """Persist first-run synth/embed roles and activate embed when applicable."""
     synth_choice = (synth_choice or "skip").strip().lower()
     embed_choice = (embed_choice or "skip").strip().lower()
-    if synth_choice not in {"cloud", "local", "skip"}:
+    # Besides cloud/local/skip, the first run may name any synth provider
+    # (claude-cli, anthropic, ...); the model id defaults per provider and is
+    # required where there is no default, exactly as `khipu models set`.
+    if synth_choice not in {"cloud", "local", "skip"} | PROVIDERS:
         raise ValueError(f"unknown synth_choice: {synth_choice!r}")
     if embed_choice not in {"cloud", "local", "skip"}:
         raise ValueError(f"unknown embed_choice: {embed_choice!r}")
@@ -326,6 +329,9 @@ def apply_welcome_models(
             "endpoint": synth_endpoint,
             "model_id": synth_model_id,
         }
+    elif synth_choice != "skip":
+        synth = {"provider": synth_choice, "endpoint": "",
+                 "model_id": synth_model_id.strip() or DEFAULT_SYNTH_MODELS.get(synth_choice, "")}
     else:
         synth = {"provider": "cloud", "endpoint": "", "model_id": ""}
 

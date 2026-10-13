@@ -8,6 +8,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { healthRows, HealthReportRows } from "../healthRows";
+import { buildAttention } from "../doctorAttention";
 import type { Attention } from "../doctorAttention";
 
 afterEach(() => {
@@ -164,5 +165,64 @@ describe("HealthReportRows", () => {
     expect(driftRow?.textContent).toContain("not set up");
     expect(driftRow?.querySelector("svg.muted")).not.toBeNull();
     expect(driftRow?.querySelector("svg.err")).toBeNull();
+  });
+});
+
+describe("summariser rows (synth_provider / synth_budget)", () => {
+  const synthBlocks = {
+    synth_provider_ok: true,
+    synth_provider: { provider: "claude-cli", model: "haiku", key_present: null, auth: "subscription", binary: "/opt/bin/claude" },
+    synth_budget_ok: true,
+    synth_budget: {
+      calls: 1227,
+      cap: 5000,
+      cap_source: "config",
+      exhausted: false,
+      estimated_usd_today: 0.42,
+      usage_by_provider: {
+        gemini: { calls: 200, estimated_usd: 0.42 },
+        "claude-cli": { calls: 1027, estimated_usd: 0, billing: "subscription" },
+      },
+    },
+  };
+
+  it("labels the provider row and pairs both flags with their detail blocks", () => {
+    const rows = healthRows(fixture(synthBlocks));
+    const provider = rows.find((r) => r.key === "synth_provider_ok");
+    expect(provider?.label).toBe("Summariser provider ready");
+    expect(provider?.detail).toBe("Claude on my own login (claude -p) · haiku · claude found");
+    const budget = rows.find((r) => r.key === "synth_budget_ok");
+    expect(budget?.detail).toBe(
+      "1,227 of 5,000 calls today (set in Settings) · about $0.42 today · " +
+        "Gemini Flash (API key): 200 calls, $0.42; Claude on my own login (claude -p): 1027 calls, subscription",
+    );
+  });
+
+  it("an API provider without a key renders red with the attention sentence and the detail", () => {
+    const parsed = fixture({
+      ...synthBlocks,
+      synth_provider_ok: false,
+      synth_provider: { provider: "anthropic", model: "claude-haiku-5-5", key_present: false },
+    });
+    const { items } = buildAttention(parsed);
+    render(<HealthReportRows parsed={parsed} attention={items} />);
+    const row = screen.getByText("Summariser provider ready").closest(".row-item");
+    expect(row?.querySelector("svg.err")).not.toBeNull();
+    expect(row?.textContent).toContain("No key is stored for the anthropic summariser");
+    expect(row?.textContent).toContain("Claude Haiku (API key) · claude-haiku-5-5 · no key");
+  });
+
+  it("a spent ceiling shows calls of cap on its red row", () => {
+    const parsed = fixture({
+      ...synthBlocks,
+      synth_budget_ok: false,
+      synth_budget: { calls: 5000, cap: 5000, cap_source: "default", exhausted: true, estimated_usd_today: 10 },
+    });
+    const { items } = buildAttention(parsed);
+    expect(items.find((i) => i.key === "synth_budget")?.title).toBe("The summariser reached today's call ceiling");
+    render(<HealthReportRows parsed={parsed} attention={items} />);
+    const row = screen.getByText("Summariser within today's call ceiling").closest(".row-item");
+    expect(row?.textContent).toContain("5,000 of 5,000 calls today (default) · about $10.00 today");
+    expect(row?.textContent).toContain("lift it for today under Settings");
   });
 });

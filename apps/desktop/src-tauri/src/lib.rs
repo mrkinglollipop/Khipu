@@ -555,6 +555,15 @@ const JOBS_STATUS_ARGV: &[&str] = &["jobs", "status"];
 const RECALL_STATUS_ARGV: &[&str] = &["recall", "status"];
 const GATEWAY_TOKEN_STATUS_ARGV: &[&str] = &["gateway", "token", "status"];
 const GATEWAY_TOKEN_SET_ARGV: &[&str] = &["gateway", "token", "set"];
+/// Settings -> Capture -> summariser ceiling: read every scope's calls and cap,
+/// and give back the full synth ceiling for the rest of today. Fixed argv, so
+/// the webview cannot reach `--cap`, `--unlimited` or another scope here (the
+/// persisted ceiling goes through `config --set synth_daily_calls N`).
+const BUDGET_STATUS_ARGV: &[&str] = &["budget", "status"];
+const BUDGET_LIFT_SYNTH_TODAY_ARGV: &[&str] = &["budget", "lift", "synth", "--today"];
+/// `config --set KEY N`, a whole number >= 0 (0 = unlimited) (`INT_SETTINGS`).
+/// Only the summariser's ceiling is offered in the app.
+const DAILY_CALL_KEYS: &[&str] = &["synth_daily_calls"];
 
 fn fixed_argv(argv: &[&str]) -> Vec<String> {
     argv.iter().map(|s| s.to_string()).collect()
@@ -599,6 +608,18 @@ fn parse_unit_number(key: &str, raw: &str, allow_zero: bool) -> Result<String, S
         return Err(format!("{key} must be {low} and at most 1, got {raw:?}"));
     }
     Ok(format!("{v}"))
+}
+
+/// A daily call ceiling the CLI would accept, re-printed from the parsed value.
+fn parse_daily_calls(key: &str, raw: &str) -> Result<String, String> {
+    let v: u64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{key} must be a whole number of 0 or more, got {raw:?}"))?;
+    if v > 10_000_000 {
+        return Err(format!("{key} is too large, got {raw:?}"));
+    }
+    Ok(v.to_string())
 }
 
 fn checked_operand(key: &str, raw: &str, allow_empty: bool) -> Result<String, String> {
@@ -653,6 +674,7 @@ fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
             Ok(set(k, parse_unit_number(k, value, false)?))
         }
         "user_aliases" => Ok(set("user_aliases", checked_operand(key, value, true)?)),
+        k if DAILY_CALL_KEYS.contains(&k) => Ok(set(k, parse_daily_calls(k, value)?)),
         k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
         _ => Err(format!("not a settable key: {key:?}")),
     }
@@ -735,6 +757,16 @@ async fn khipu_config_set(key: String, value: String) -> Result<String, String> 
 #[tauri::command]
 async fn khipu_config_unset(key: String) -> Result<String, String> {
     run_khipu_cli_async(config_unset_argv(&key)?).await
+}
+
+#[tauri::command]
+async fn khipu_budget_status() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(BUDGET_STATUS_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_budget_lift_synth_today() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(BUDGET_LIFT_SYNTH_TODAY_ARGV)).await
 }
 
 #[tauri::command]
@@ -1499,7 +1531,15 @@ async fn check_remote_postgres(full: bool) -> Result<String, String> {
 /// arbitrary argv from the webview, and a secret must never travel as an
 /// argument. This command is the only way in, and it pipes the value to the
 /// CLI's stdin.
-const SETTABLE_SECRETS: &[&str] = &["gemini_api_key", "database_url", "openai_compat_api_key", "voyage_api_key"];
+const SETTABLE_SECRETS: &[&str] = &[
+    "gemini_api_key",
+    "anthropic_api_key",
+    "openai_api_key",
+    "openrouter_api_key",
+    "database_url",
+    "openai_compat_api_key",
+    "voyage_api_key",
+];
 
 #[tauri::command]
 async fn set_khipu_secret(account: String, value: String) -> Result<String, String> {
@@ -2327,6 +2367,8 @@ pub fn run() {
             khipu_config_show,
             khipu_config_set,
             khipu_config_unset,
+            khipu_budget_status,
+            khipu_budget_lift_synth_today,
             khipu_jobs_status,
             khipu_job_install,
             khipu_job_uninstall,
@@ -2618,7 +2660,18 @@ mod settable_secrets_tests {
 
     #[test]
     fn only_the_known_accounts_are_writable() {
-        assert_eq!(SETTABLE_SECRETS, &["gemini_api_key", "database_url", "openai_compat_api_key", "voyage_api_key"]);
+        assert_eq!(
+            SETTABLE_SECRETS,
+            &[
+                "gemini_api_key",
+                "anthropic_api_key",
+                "openai_api_key",
+                "openrouter_api_key",
+                "database_url",
+                "openai_compat_api_key",
+                "voyage_api_key",
+            ]
+        );
     }
 
     #[test]
@@ -2820,7 +2873,7 @@ mod settings_command_tests {
 
     #[test]
     fn none_of_these_verbs_join_the_generic_allowlist() {
-        for s in ["features", "config", "jobs", "recall", "gateway", "embed"] {
+        for s in ["features", "config", "jobs", "recall", "gateway", "embed", "budget"] {
             assert!(!ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of the allowlist");
         }
         assert_eq!(ALLOWED_SUBCOMMANDS.len(), 14);
@@ -2834,6 +2887,21 @@ mod settings_command_tests {
         assert_eq!(fixed_argv(RECALL_STATUS_ARGV), v(&["recall", "status"]));
         assert_eq!(fixed_argv(GATEWAY_TOKEN_STATUS_ARGV), v(&["gateway", "token", "status"]));
         assert_eq!(fixed_argv(GATEWAY_TOKEN_SET_ARGV), v(&["gateway", "token", "set"]));
+        assert_eq!(fixed_argv(BUDGET_STATUS_ARGV), v(&["budget", "status"]));
+        assert_eq!(fixed_argv(BUDGET_LIFT_SYNTH_TODAY_ARGV), v(&["budget", "lift", "synth", "--today"]));
+    }
+
+    #[test]
+    fn the_summariser_ceiling_is_a_whole_number_reprinted() {
+        assert_eq!(config_set_argv("synth_daily_calls", "5000").unwrap(), v(&["config", "--set", "synth_daily_calls", "5000"]));
+        assert_eq!(config_set_argv("synth_daily_calls", " 0 ").unwrap(), v(&["config", "--set", "synth_daily_calls", "0"]));
+        assert_eq!(config_set_argv("synth_daily_calls", "+12").unwrap(), v(&["config", "--set", "synth_daily_calls", "12"]));
+        for bad in ["", "-1", "1.5", "1e3", "abc", "--cap", "99999999999"] {
+            assert!(config_set_argv("synth_daily_calls", bad).is_err(), "accepted {bad:?}");
+        }
+        // The other ceilings are not offered by the app.
+        assert!(config_set_argv("embed_daily_calls", "10").is_err());
+        assert!(config_unset_argv("synth_daily_calls").is_err());
     }
 
     #[test]

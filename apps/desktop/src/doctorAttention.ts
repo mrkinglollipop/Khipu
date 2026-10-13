@@ -285,6 +285,37 @@ export function buildAttention(parsed: Record<string, unknown>): {
     });
   }
 
+  // The summariser: its provider can run (key present / CLI found), and it is
+  // inside today's call ceiling. Captures wait in the queue either way.
+  if ((parsed as { synth_provider_ok?: boolean }).synth_provider_ok === false) {
+    const sp = (parsed as { synth_provider?: { provider?: string; binary?: string | null; auth?: string } })
+      .synth_provider;
+    const login = sp?.auth === "subscription" || sp?.provider === "claude-cli" || sp?.provider === "codex-cli";
+    const bin = sp?.provider === "codex-cli" ? "codex" : "claude";
+    issues.push(login ? `Summariser CLI ${bin} not found` : "Summariser has no key");
+    items.push({
+      key: "synth_provider",
+      tone: "err",
+      title: "The summariser cannot run",
+      cause: login
+        ? `The ${bin} command was not found on this Mac. Install it and sign in, or pick another summariser under Settings › Capture. Captures wait in the queue meanwhile.`
+        : `No key is stored for the ${sp?.provider ?? "chosen"} summariser. Set it under Settings › Capture, next to the provider. Captures wait in the queue meanwhile.`,
+    });
+  }
+
+  if ((parsed as { synth_budget_ok?: boolean }).synth_budget_ok === false) {
+    const sb = (parsed as { synth_budget?: { calls?: number | null; cap?: number | null; error?: string } }).synth_budget;
+    issues.push(sb?.error ? `Summariser budget unreadable: ${sb.error}` : "Summariser reached today's call ceiling");
+    items.push({
+      key: "synth_budget",
+      tone: "warn",
+      title: sb?.error ? "The summariser's call count cannot be read" : "The summariser reached today's call ceiling",
+      cause: sb?.error
+        ? `${sb.error}. Captures wait in the queue; nothing is lost.`
+        : `${sb?.calls ?? "?"} of ${sb?.cap ?? "?"} calls used. Captures wait in the queue until UTC midnight, nothing is lost; lift it for today under Settings › Capture.`,
+    });
+  }
+
   const snap = (parsed as { hub_snapshot?: { ok?: boolean; reason?: string } }).hub_snapshot;
   if (snap && snap.ok === false) {
     issues.push(`Offline copy is stale${snap.reason ? `: ${snap.reason}` : ""}`);
