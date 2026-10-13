@@ -2,6 +2,8 @@
 
 Stored under the ``models`` key. Only synth routes this cut (see ``extract.py``);
 embed is persist-only display/storage; vision defaults to ``off`` with no ingest.
+OpenRouter model IDs are explicit vendor/model values, for example
+openai/gpt-6-luna, anthropic/claude-haiku-5-5, or google/gemini-2.5-flash.
 """
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ from khipu.config import load_config, save_config
 
 ROLES = ("synth", "embed", "vision")
 CLI_PROVIDERS = frozenset({"claude-cli", "codex-cli"})
-PROVIDERS = frozenset({"gemini", "anthropic", "openai", "local"}) | CLI_PROVIDERS
+PROVIDERS = frozenset({"gemini", "anthropic", "openai", "openrouter", "local"}) | CLI_PROVIDERS
 DEFAULT_SYNTH_MODELS = {"gemini": "gemini-2.5-flash", "anthropic": "claude-haiku-5-5",
                         "claude-cli": "haiku"}
 VISION_PROVIDERS = frozenset({"cloud", "local", "off"})
@@ -29,6 +31,12 @@ PRICES_USD_PER_MTOKEN: dict[str, dict[str, Any]] = {
                               "as_of": "2026-10-13", "source": "Google Gemini API published list prices"},
     "claude-haiku-5-5": {"input": 0.10, "output": 0.50, "cached_input": 0.01,
                          "as_of": "2026-10-13", "source": "Anthropic published list prices, prompts up to 100k"},
+    "openai/gpt-6-luna": {"input": 0.10, "output": 0.50, "cached_input": 0.02,
+                          "as_of": "2026-10-13",
+                          "source": "aggregator listing (OpenRouter), OpenAI page not confirmed"},
+    "gpt-6-luna": {"input": 0.10, "output": 0.50, "cached_input": 0.02,
+                   "as_of": "2026-10-13",
+                   "source": "aggregator listing (OpenRouter), OpenAI page not confirmed"},
     "haiku": {"input": 0, "output": 0, "cached_input": 0,
               "as_of": "2026-10-13", "source": "subscription route, billed to the user's plan"},
 }
@@ -225,11 +233,14 @@ def set_models_merge_role(
 
     If the stored ``models`` key is corrupt/invalid (the same conditions that
     set ``models_error`` on show), raise and do not write. Missing key is fine
-    and starts from defaults.
+    and starts from defaults. OpenRouter needs an explicit model; vendor/model
+    IDs such as openai/gpt-6-luna, anthropic/claude-haiku-5-5, and
+    google/gemini-2.5-flash are passed through unchanged.
     """
     if role not in ROLES:
         raise ValueError(f"unknown role: {role}")
-    if role == "synth" and provider.strip().lower() in {"openai", "codex-cli"} and not (model_id or "").strip():
+    if (role == "synth" and provider.strip().lower() in {"openai", "openrouter", "codex-cli"}
+            and not (model_id or "").strip()):
         raise ValueError(f"synth: {provider.strip().lower()} provider requires --model (model_id)")
     _require_stored_models_writable()
     current = show_models()
