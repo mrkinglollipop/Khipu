@@ -320,6 +320,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001
         embed_coverage = {"error": f"{type(e).__name__}: {e}"}
         embed_coverage_ok = False
+    # The summariser's daily call ceiling (embed scope "synth"). Red while it
+    # is spent: captures wait in the queue until UTC midnight.
+    try:
+        from khipu.embed import budget_status
+
+        synth_budget = budget_status("synth")
+        synth_budget_ok = not synth_budget.get("exhausted")
+    except Exception as e:  # noqa: BLE001
+        synth_budget = {"error": f"{type(e).__name__}: {e}"}
+        synth_budget_ok = False
     # Informational: per-library coverage and profile, beside embed coverage.
     # Never gates status (a library mid-backfill is not a broken hub).
     try:
@@ -568,6 +578,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "index_freshness": index_fresh,
         "embed_coverage": embed_coverage,
         "libraries": libraries,
+        "synth_budget": synth_budget,
         "literal_trgm": literal_trgm,
         "prompt_recall_snapshot": prompt_recall_snapshot,
         "prompt_recall_outcomes": prompt_recall_outcomes_block,
@@ -599,6 +610,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             and index_freshness_ok
             and jobs_ok
             and embed_coverage_ok
+            and synth_budget_ok
             and bool(_graph_backup.get("ok"))
             # graph_offsite_ok was reported but never aggregated, so a stale
             # offsite copy left doctor (and the soak probe reading doctor.ok)
@@ -646,6 +658,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "index_freshness_ok": index_freshness_ok,
         "jobs_ok": jobs_ok,
         "embed_coverage_ok": embed_coverage_ok,
+        "synth_budget_ok": synth_budget_ok,
         "recall_probe_ok": bool(recall_probe.get("ok")),
         "bundle_seal_ok": bool(bundle_seal_block.get("ok")),
         "literal_trgm_ok": bool(literal_trgm.get("ok")),

@@ -114,6 +114,14 @@ def _key() -> str:
     return key
 
 
+def _synth_budget_take() -> None:
+    """Charge one cloud synth call against today's ceiling (embed scope
+    ``synth``); raises ``khipu.embed.BudgetExhausted`` when it is spent."""
+    from khipu.embed import _budget_take
+
+    _budget_take(scope="synth")
+
+
 def _generate_cloud(prompt: str, *, model_id: str, timeout: int, retries: int) -> str:
     # Header auth, not ?key=. Same reasoning as khipu.embed: a live credential
     # in a URL is one logging or exception-formatting change away from the
@@ -135,6 +143,10 @@ def _generate_cloud(prompt: str, *, model_id: str, timeout: int, retries: int) -
     }).encode("utf-8")
     last: Exception | None = None
     for attempt in range(retries + 1):
+        # Every cloud synth caller (captures, briefs, hygiene, rerank) reaches
+        # the network only here, so this is the daily ceiling's single gate.
+        # BudgetExhausted propagates unwrapped, before the request is sent.
+        _synth_budget_take()
         req = urllib.request.Request(url, data=body, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:

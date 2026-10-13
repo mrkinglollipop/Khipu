@@ -42,6 +42,7 @@ def _green_doctor_patches():
             "episodes": {"missing": 0}, "topics": {"missing": 0},
         }),
         mock.patch("khipu.embed.literal_trgm_status", return_value={"ok": True}),
+        mock.patch("khipu.embed.budget_status", return_value={"calls": 0, "cap": 1000, "exhausted": False}),
         mock.patch("khipu.hub_snapshot.prompt_recall_snapshot_status", return_value={"ok": True, "fresh": True}),
         # Phase 6 (honesty): nightly-step evidence, embed lag, search-degrade
         # rate, gateway per-token liveness, unknown-harness heartbeat.

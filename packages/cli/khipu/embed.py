@@ -393,6 +393,16 @@ QUERY_EMBED_DELAY_S = 1.0
 # reset at UTC midnight.
 EMBED_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_EMBED_DAILY_CALLS", "100000"))
 LIBRARY_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_LIBRARY_EMBED_DAILY_CALLS", "2000"))
+# Scope "synth": the summariser/brief/rerank model calls (khipu.extract), one
+# unit per HTTP attempt. On 2026-10-13 the capture summariser ran the Google
+# project into its monthly spending cap: nothing bounded its calls per day, and
+# split capture windows made one call per 14,000-char part. This is the
+# ceiling; 0 turns it off.
+SYNTH_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_SYNTH_DAILY_CALLS", "1000"))
+
+
+class BudgetExhausted(RuntimeError):
+    """A daily call ceiling refused the call before any network request."""
 # Query vectors are cached on the hub (memory_query_cache, migration 0014) so a
 # repeated question costs no API call; rows unused for this long are pruned by
 # the nightly.
@@ -404,7 +414,17 @@ def _budget_path(scope: str = "memory") -> Path:
 
     d = ensure_data_dir() / "state"
     d.mkdir(parents=True, exist_ok=True)
-    return d / ("embed-budget-library.json" if scope == "library" else "embed-budget.json")
+    return d / {"library": "embed-budget-library.json",
+                "synth": "embed-budget-synth.json"}.get(scope, "embed-budget.json")
+
+
+def _budget_cap(scope: str) -> tuple[int, str]:
+    """(today's ceiling, the env variable that sets it) for ``scope``."""
+    if scope == "library":
+        return LIBRARY_DAILY_CALL_BUDGET, "KHIPU_LIBRARY_EMBED_DAILY_CALLS"
+    if scope == "synth":
+        return SYNTH_DAILY_CALL_BUDGET, "KHIPU_SYNTH_DAILY_CALLS"
+    return EMBED_DAILY_CALL_BUDGET, "KHIPU_EMBED_DAILY_CALLS"
 
 
 def _budget_today() -> str:
@@ -424,7 +444,7 @@ def _read_budget(path: Path, day: str) -> int:
 
 
 def budget_status(scope: str = "memory") -> dict[str, Any]:
-    """Today's embed API calls against the selected scope's daily ceiling."""
+    """Today's API calls against the selected scope's daily ceiling."""
     day = _budget_today()
     available, error = True, None
     try:
@@ -433,7 +453,7 @@ def budget_status(scope: str = "memory") -> dict[str, Any]:
     except (OSError, ValueError, TypeError) as exc:
         used = None
         available, error = False, f"{type(exc).__name__}: {exc}"
-    cap = LIBRARY_DAILY_CALL_BUDGET if scope == "library" else EMBED_DAILY_CALL_BUDGET
+    cap, _ = _budget_cap(scope)
     unlimited = cap <= 0
     return {
         "day": day,
@@ -496,8 +516,8 @@ def _budget_take(*, deadline: float | None = None, scope: str = "memory") -> Non
     """Atomically reserve one API call for today across local processes."""
     deadline = time.monotonic() + 1.0 if deadline is None else deadline
     day = _budget_today()
-    cap = LIBRARY_DAILY_CALL_BUDGET if scope == "library" else EMBED_DAILY_CALL_BUDGET
-    variable = "KHIPU_LIBRARY_EMBED_DAILY_CALLS" if scope == "library" else "KHIPU_EMBED_DAILY_CALLS"
+    cap, variable = _budget_cap(scope)
+    label = "synth call budget" if scope == "synth" else "embed budget"
     try:
         path = _budget_path(scope)
         lock_path = path.with_suffix(path.suffix + ".lock")
@@ -509,12 +529,12 @@ def _budget_take(*, deadline: float | None = None, scope: str = "memory") -> Non
                 except (OSError, ValueError, TypeError) as exc:
                     if cap > 0:
                         raise RuntimeError(
-                            f"embed budget accounting unavailable: {type(exc).__name__}: {exc}"
+                            f"{label} accounting unavailable: {type(exc).__name__}: {exc}"
                         ) from exc
                     used = 0
                 if cap > 0 and used >= cap:
-                    raise RuntimeError(
-                        f"embed budget exhausted: {used} calls today "
+                    raise BudgetExhausted(
+                        f"{label} exhausted: {used} calls today "
                         f"(cap {cap}, {variable})"
                     )
                 with tempfile.NamedTemporaryFile(
@@ -527,7 +547,7 @@ def _budget_take(*, deadline: float | None = None, scope: str = "memory") -> Non
     except RuntimeError:
         raise
     except OSError as exc:
-        raise RuntimeError(f"embed budget accounting unavailable: {type(exc).__name__}: {exc}") from exc
+        raise RuntimeError(f"{label} accounting unavailable: {type(exc).__name__}: {exc}") from exc
 
 
 QUERY_CACHE_SCHEME = "provider-input-v2"
