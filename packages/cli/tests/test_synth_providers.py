@@ -363,6 +363,7 @@ def test_cli_exact_argv_stdin_env_usage_budget_and_no_capture(provider, tmp_path
             assert str(UUID(sid)) == sid
             assert sid in synth_cli.session_ids()
             assert argv == ['claude', '-p', '--setting-sources', '', '--model', 'm',
+                            '--system-prompt', extract.CLAUDE_CLI_SYSTEM_PROMPT,
                             '--output-format', 'json', '--max-turns', '1', '--disallowedTools',
                             'Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,Agent', '--session-id', sid]
             transcript = tmp_path / 's.jsonl'
@@ -565,6 +566,25 @@ def test_subscription_cost_does_not_reprice_anthropic_alias():
         assert result['by_provider'][provider]['estimated_usd'] == 0.0
         assert result['by_provider'][provider]['billing'] == 'subscription'
     assert result['estimated_usd'] == .000204
+
+
+def test_wrong_task_reply_from_a_cli_provider_falls_back_to_gemini_once():
+    models.set_models_merge_role('synth', provider='claude-cli', model_id='haiku')
+    good = json.dumps({'summary': 'Reviewed the plan.', 'decisions': ['Ship it.']})
+    with mock.patch.object(extract, '_generate_claude_cli', return_value='{"relied_on": ["x"]}') as cli_call, \
+         mock.patch.object(extract, '_key', return_value='fake'), \
+         mock.patch.object(extract, '_generate_gemini', return_value=good) as gem:
+        out = extract.extract_memory('USER: summarise this please\nASSISTANT: ok', cwd='/p')
+    assert out['summary'] == 'Reviewed the plan.'
+    assert cli_call.call_count == 1 and gem.call_count == 1
+    assert gem.call_args.kwargs['caller'] == 'capture-fallback'
+    # No Gemini key: the original failure surfaces, nothing is swallowed.
+    with mock.patch.object(extract, '_generate_claude_cli', return_value='not json'), \
+         mock.patch.object(extract, '_key', side_effect=RuntimeError('no key')), \
+         mock.patch.object(extract, '_generate_gemini') as gem, \
+         pytest.raises(RuntimeError, match='non-JSON'):
+        extract.extract_memory('USER: hi\nASSISTANT: hello', cwd='/p')
+    assert gem.call_count == 0
 
 
 @pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
