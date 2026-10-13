@@ -11,7 +11,7 @@ or functionality, every hard limit liftable, and "we need to work with power use
 | 0 | Spend made visible and bounded without dropping anything (PR #157: machine messages are not turns, `khipu budget`, usage accounting) | done 2026-10-13 |
 | 0b | Stop summarising re-emitted history after Claude Code compactions (dedupe by fingerprint) | done 2026-10-13 (PR #159) |
 | 1 | Provider abstraction for the synth role: `gemini`, `anthropic`, `openai`, `local`, with a price table and per-provider daily ceilings | done 2026-10-13 (PR #160); [evidence](2026-10-13-synth-providers-p1-verification.md) |
-| 2 | Subscription routes: `claude-cli` (`claude -p` on the user's own login) and `codex-cli` (`codex exec` on the user's own login) | built 2026-10-13, quality gate pending |
+| 2 | Subscription routes: `claude-cli` (`claude -p` on the user's own login) and `codex-cli` (`codex exec` on the user's own login) | done 2026-10-13 (PRs #161, #162, #163); quality gate passed for Haiku 5.5 (49 windows, Opus judge on 15: Haiku better 11, Gemini 2, equal 2, about half the hallucinated items); the maintainer's Mac runs `claude-cli`; product default stays `gemini` until phase 3 |
 | 3 | Settings UI for provider, model and key source in the desktop app; `khipu models set --role synth --provider … --model …` | open; needs phase 1 |
 
 One PR per phase, merged alone and soaked.
