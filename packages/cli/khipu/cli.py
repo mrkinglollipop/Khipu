@@ -320,6 +320,29 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001
         embed_coverage = {"error": f"{type(e).__name__}: {e}"}
         embed_coverage_ok = False
+    # The summariser's daily call ceiling (embed scope "synth"). Red while it
+    # is spent: captures wait in the queue until UTC midnight, or until the
+    # owner lifts it (`khipu budget lift synth`). `warn` is the 80% notice and
+    # never gates. Today's tokens and estimated cost ride along.
+    try:
+        from khipu.embed import budget_status
+
+        synth_budget = budget_status("synth")
+        synth_budget_ok = not synth_budget.get("exhausted")
+    except Exception as e:  # noqa: BLE001
+        synth_budget = {"error": f"{type(e).__name__}: {e}"}
+        synth_budget_ok = False
+    try:
+        from khipu.extract import synth_usage_today
+
+        _usage = synth_usage_today()
+        synth_budget["tokens_today"] = {k: _usage[k] for k in
+                                        ("prompt_tokens", "output_tokens", "thought_tokens")}
+        synth_budget["estimated_usd_today"] = _usage["estimated_usd"]
+    except Exception as e:  # noqa: BLE001 — accounting is informational
+        synth_budget["tokens_today"] = None
+        synth_budget["estimated_usd_today"] = None
+        synth_budget["usage_error"] = f"{type(e).__name__}: {e}"
     # Informational: per-library coverage and profile, beside embed coverage.
     # Never gates status (a library mid-backfill is not a broken hub).
     try:
@@ -568,6 +591,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "index_freshness": index_fresh,
         "embed_coverage": embed_coverage,
         "libraries": libraries,
+        "synth_budget": synth_budget,
         "literal_trgm": literal_trgm,
         "prompt_recall_snapshot": prompt_recall_snapshot,
         "prompt_recall_outcomes": prompt_recall_outcomes_block,
@@ -599,6 +623,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             and index_freshness_ok
             and jobs_ok
             and embed_coverage_ok
+            and synth_budget_ok
             and bool(_graph_backup.get("ok"))
             # graph_offsite_ok was reported but never aggregated, so a stale
             # offsite copy left doctor (and the soak probe reading doctor.ok)
@@ -646,6 +671,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "index_freshness_ok": index_freshness_ok,
         "jobs_ok": jobs_ok,
         "embed_coverage_ok": embed_coverage_ok,
+        "synth_budget_ok": synth_budget_ok,
         "recall_probe_ok": bool(recall_probe.get("ok")),
         "bundle_seal_ok": bool(bundle_seal_block.get("ok")),
         "literal_trgm_ok": bool(literal_trgm.get("ok")),
@@ -2456,6 +2482,7 @@ def cmd_get(args: argparse.Namespace) -> int:
 def cmd_config(args: argparse.Namespace) -> int:
     from khipu.config import (
         FLOAT_SETTINGS,
+        INT_SETTINGS,
         LIST_SETTINGS,
         capture_mode,
         config_file,
@@ -2525,6 +2552,23 @@ def cmd_config(args: argparse.Namespace) -> int:
 
         path = relevance.set_cosine_floor(None)
         print(json.dumps({"ok": True, "relevance_cosine_floor": relevance.cosine_floor_status(),
+                          "config_file": str(path)}))
+        return 0
+    if (args.set and args.set[0] in INT_SETTINGS) or args.unset in INT_SETTINGS:
+        # Daily call ceilings (synth_daily_calls, embed_daily_calls,
+        # library_embed_daily_calls): whole numbers >= 0, 0 = unlimited.
+        from khipu.config import parse_int_setting, set_int_setting
+        from khipu.embed import budget_status
+
+        key = args.set[0] if args.set else args.unset
+        try:
+            value = parse_int_setting(key, args.set[1]) if args.set else None
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        path = set_int_setting(key, value)
+        print(json.dumps({"ok": True, key: value,
+                          "budget": budget_status(INT_SETTINGS[key]),
                           "config_file": str(path)}))
         return 0
     if args.set and args.set[0] in FLOAT_SETTINGS:
@@ -2598,6 +2642,67 @@ def cmd_config(args: argparse.Namespace) -> int:
         "config_file": str(config_file()),
         "config": load_config(),
     }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+BUDGET_LIFT_SCOPES = ("synth", "memory", "library")
+
+
+def _budget_status_all() -> dict:
+    """Every budget scope's day, calls, cap, remaining, exhausted and where the
+    cap came from; the synth scope adds today's tokens and estimated cost."""
+    from khipu.embed import budget_status
+    from khipu.extract import synth_usage_today
+
+    keys = ("day", "calls", "cap", "remaining", "exhausted", "warn", "cap_source")
+    out: dict = {}
+    for scope in BUDGET_LIFT_SCOPES:
+        st = budget_status(scope)
+        out[scope] = {k: st.get(k) for k in keys}
+        if st.get("error"):
+            out[scope]["error"] = st["error"]
+    try:
+        usage = synth_usage_today()
+        out["synth"]["tokens_today"] = {k: usage[k] for k in
+                                        ("prompt_tokens", "output_tokens", "thought_tokens")}
+        out["synth"]["usage_by_model"] = usage["by_model"]
+        out["synth"]["estimated_usd_today"] = usage["estimated_usd"]
+    except Exception as e:  # noqa: BLE001 — accounting is informational
+        out["synth"]["tokens_today"] = None
+        out["synth"]["estimated_usd_today"] = None
+        out["synth"]["usage_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def cmd_budget(args: argparse.Namespace) -> int:
+    """`khipu budget status` / `khipu budget lift SCOPE --today|--cap N|--unlimited`."""
+    if args.budget_cmd == "status":
+        print(json.dumps(_budget_status_all(), indent=2))
+        return 0
+    from khipu import session_capture
+    from khipu.config import INT_SETTINGS, set_int_setting
+    from khipu.embed import budget_reset_today, budget_status
+
+    scope = args.scope
+    key = next(k for k, s in INT_SETTINGS.items() if s == scope)
+    if args.today:
+        cleared = budget_reset_today(scope)
+        did = f"reset today's {scope} counter ({cleared['calls_cleared']} calls cleared)"
+        out = {"ok": True, "scope": scope, "action": "today", **cleared}
+    else:
+        if args.cap is not None and args.cap < 0:
+            print(json.dumps({"ok": False, "error": f"--cap must be >= 0, got {args.cap}"}))
+            return 2
+        cap = 0 if args.unlimited else args.cap
+        path = set_int_setting(key, cap)
+        did = (f"{scope} ceiling set to {'unlimited' if cap == 0 else cap} "
+               f"({key} in {path})")
+        out = {"ok": True, "scope": scope, "action": "unlimited" if args.unlimited else "cap",
+               key: cap, "config_file": str(path)}
+    session_capture._log(f"budget lift: {did}")
+    out["did"] = did
+    out["budget"] = budget_status(scope)
     print(json.dumps(out, indent=2))
     return 0
 
@@ -4492,11 +4597,14 @@ def build_parser() -> argparse.ArgumentParser:
         "capture_v2, graph_sqlite, gemini_key_file), a 0-1 similarity knob "
         "(dedup_similarity, commitment_close_similarity), the relevance "
         "floor (relevance.cosine_floor, above 0 up to 1; per embedding profile "
-        "relevance.cosine_floor_by_profile.<profile>) or the comma-"
+        "relevance.cosine_floor_by_profile.<profile>), a daily call "
+        "ceiling (synth_daily_calls, embed_daily_calls, "
+        "library_embed_daily_calls; whole number, 0 = unlimited) or the comma-"
         'separated user_aliases list (e.g. --set user_aliases "matt,matthew")',
     )
     cfg.add_argument("--unset", metavar="KEY",
-                     help="Remove a path setting, or relevance.cosine_floor / "
+                     help="Remove a path setting or a daily call ceiling, or "
+                     "relevance.cosine_floor / "
                      "relevance.cosine_floor_by_profile.<profile> to restore its default")
     cfg.add_argument(
         "--set-gateway-url",
@@ -4509,6 +4617,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Persist capture_mode to the Hub config file",
     )
     cfg.set_defaults(func=cmd_config)
+
+    bud = sub.add_parser("budget", help="Daily call ceilings: status, and lifting one")
+    bud_sub = bud.add_subparsers(dest="budget_cmd", required=True)
+    bud_sub.add_parser("status", help="Every scope's calls, ceiling and its source; synth tokens and cost")
+    lift = bud_sub.add_parser("lift", help="Lift a ceiling: today only, to N, or remove it")
+    lift.add_argument("scope", choices=BUDGET_LIFT_SCOPES)
+    how = lift.add_mutually_exclusive_group(required=True)
+    how.add_argument("--today", action="store_true",
+                     help="Reset today's counter: the full ceiling is available again until UTC midnight")
+    how.add_argument("--cap", type=int, metavar="N", help="Persist a new daily ceiling (0 = unlimited)")
+    how.add_argument("--unlimited", action="store_true", help="Persist no ceiling (cap 0)")
+    bud.set_defaults(func=cmd_budget)
 
     ig = sub.add_parser(
         "integrations",

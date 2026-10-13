@@ -501,7 +501,7 @@ def build_one(cur, topic_slug: str) -> dict[str, Any]:
 
     prompt = PROMPT.format(topic=topic_slug, sources=_render_sources(gathered["offered"]))
     try:
-        raw = extract._generate(prompt, timeout=120, retries=1)
+        raw = extract._generate(prompt, timeout=120, retries=1, caller="brief")
     except Exception as exc:  # noqa: BLE001 — transport/model failure; retried next run
         return {"topic": topic_slug, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
     parsed = extract.parse_model_json(raw)

@@ -393,6 +393,25 @@ QUERY_EMBED_DELAY_S = 1.0
 # reset at UTC midnight.
 EMBED_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_EMBED_DAILY_CALLS", "100000"))
 LIBRARY_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_LIBRARY_EMBED_DAILY_CALLS", "2000"))
+# Scope "synth": the summariser/brief/rerank model calls (khipu.extract), one
+# unit per HTTP attempt. On 2026-10-13 the capture summariser ran the Google
+# project into its monthly spending cap: nothing bounded its calls per day, and
+# split capture windows made one call per 14,000-char part. This is the
+# ceiling; 0 turns it off.
+SYNTH_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_SYNTH_DAILY_CALLS", "2000"))
+# Every ceiling is the owner's to lift: config.json (`khipu budget lift`,
+# `khipu config --set <key> N`) wins over the env, which wins over the default.
+BUDGET_SCOPES: dict[str, tuple[str, str]] = {
+    # scope: (config.json key, env variable)
+    "synth": ("synth_daily_calls", "KHIPU_SYNTH_DAILY_CALLS"),
+    "memory": ("embed_daily_calls", "KHIPU_EMBED_DAILY_CALLS"),
+    "library": ("library_embed_daily_calls", "KHIPU_LIBRARY_EMBED_DAILY_CALLS"),
+}
+BUDGET_WARN_FRACTION = 0.8
+
+
+class BudgetExhausted(RuntimeError):
+    """A daily call ceiling refused the call before any network request."""
 # Query vectors are cached on the hub (memory_query_cache, migration 0014) so a
 # repeated question costs no API call; rows unused for this long are pruned by
 # the nightly.
@@ -404,7 +423,29 @@ def _budget_path(scope: str = "memory") -> Path:
 
     d = ensure_data_dir() / "state"
     d.mkdir(parents=True, exist_ok=True)
-    return d / ("embed-budget-library.json" if scope == "library" else "embed-budget.json")
+    return d / {"library": "embed-budget-library.json",
+                "synth": "embed-budget-synth.json"}.get(scope, "embed-budget.json")
+
+
+def _budget_cap(scope: str) -> tuple[int, str]:
+    """(today's ceiling, where it came from: ``config`` / ``env`` / ``default``)
+    for ``scope``; 0 means unlimited. Read per call so a lift takes effect in
+    running processes."""
+    from khipu.config import int_setting
+
+    key, variable = BUDGET_SCOPES.get(scope, BUDGET_SCOPES["memory"])
+    stored = int_setting(key)
+    if stored is not None:
+        return stored, "config"
+    env = (os.environ.get(variable) or "").strip()
+    if env:
+        try:
+            return int(env), "env"
+        except ValueError:
+            pass
+    default = {"synth": SYNTH_DAILY_CALL_BUDGET,
+               "library": LIBRARY_DAILY_CALL_BUDGET}.get(scope, EMBED_DAILY_CALL_BUDGET)
+    return default, "default"
 
 
 def _budget_today() -> str:
@@ -424,7 +465,7 @@ def _read_budget(path: Path, day: str) -> int:
 
 
 def budget_status(scope: str = "memory") -> dict[str, Any]:
-    """Today's embed API calls against the selected scope's daily ceiling."""
+    """Today's API calls against the selected scope's daily ceiling."""
     day = _budget_today()
     available, error = True, None
     try:
@@ -433,18 +474,44 @@ def budget_status(scope: str = "memory") -> dict[str, Any]:
     except (OSError, ValueError, TypeError) as exc:
         used = None
         available, error = False, f"{type(exc).__name__}: {exc}"
-    cap = LIBRARY_DAILY_CALL_BUDGET if scope == "library" else EMBED_DAILY_CALL_BUDGET
+    cap, source = _budget_cap(scope)
     unlimited = cap <= 0
     return {
         "day": day,
         "calls": used,
         "cap": cap,
+        "cap_source": source,
         "unlimited": unlimited,
         "remaining": None if unlimited or not available else max(0, cap - used),
         "exhausted": False if unlimited else (not available or used >= cap),
+        # Early notice: most of a finite ceiling is spent.
+        "warn": bool(not unlimited and available and used >= BUDGET_WARN_FRACTION * cap),
         "available": available,
         **({"error": error} if error else {}),
     }
+
+
+def budget_reset_today(scope: str, *, deadline: float | None = None) -> dict[str, Any]:
+    """Zero today's counter for ``scope`` under the same lock ``_budget_take``
+    holds: the day's ceiling is available again. Returns the calls it cleared."""
+    deadline = time.monotonic() + 1.0 if deadline is None else deadline
+    day = _budget_today()
+    path = _budget_path(scope)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        with _lock_budget_file(lock, deadline):
+            try:
+                before = _read_budget(path, day)
+            except (OSError, ValueError, TypeError):
+                before = None
+            with tempfile.NamedTemporaryFile(
+                    "w", encoding="utf-8", dir=path.parent,
+                    prefix=path.name + ".", suffix=".tmp", delete=False) as tmp:
+                json.dump({"day": day, "calls": 0}, tmp)
+                tmp.flush()
+                tmp_path = Path(tmp.name)
+            os.replace(tmp_path, path)
+    return {"day": day, "calls_cleared": before}
 
 
 @contextmanager
@@ -496,8 +563,9 @@ def _budget_take(*, deadline: float | None = None, scope: str = "memory") -> Non
     """Atomically reserve one API call for today across local processes."""
     deadline = time.monotonic() + 1.0 if deadline is None else deadline
     day = _budget_today()
-    cap = LIBRARY_DAILY_CALL_BUDGET if scope == "library" else EMBED_DAILY_CALL_BUDGET
-    variable = "KHIPU_LIBRARY_EMBED_DAILY_CALLS" if scope == "library" else "KHIPU_EMBED_DAILY_CALLS"
+    cap, source = _budget_cap(scope)
+    variable = BUDGET_SCOPES.get(scope, BUDGET_SCOPES["memory"])[1]
+    label = "synth call budget" if scope == "synth" else "embed budget"
     try:
         path = _budget_path(scope)
         lock_path = path.with_suffix(path.suffix + ".lock")
@@ -509,13 +577,14 @@ def _budget_take(*, deadline: float | None = None, scope: str = "memory") -> Non
                 except (OSError, ValueError, TypeError) as exc:
                     if cap > 0:
                         raise RuntimeError(
-                            f"embed budget accounting unavailable: {type(exc).__name__}: {exc}"
+                            f"{label} accounting unavailable: {type(exc).__name__}: {exc}"
                         ) from exc
                     used = 0
                 if cap > 0 and used >= cap:
-                    raise RuntimeError(
-                        f"embed budget exhausted: {used} calls today "
-                        f"(cap {cap}, {variable})"
+                    raise BudgetExhausted(
+                        f"{label} exhausted: {used} calls today "
+                        f"(cap {cap} from {source}, {variable}; lift with "
+                        f"`khipu budget lift {scope}`)"
                     )
                 with tempfile.NamedTemporaryFile(
                         "w", encoding="utf-8", dir=path.parent,
@@ -527,7 +596,7 @@ def _budget_take(*, deadline: float | None = None, scope: str = "memory") -> Non
     except RuntimeError:
         raise
     except OSError as exc:
-        raise RuntimeError(f"embed budget accounting unavailable: {type(exc).__name__}: {exc}") from exc
+        raise RuntimeError(f"{label} accounting unavailable: {type(exc).__name__}: {exc}") from exc
 
 
 QUERY_CACHE_SCHEME = "provider-input-v2"

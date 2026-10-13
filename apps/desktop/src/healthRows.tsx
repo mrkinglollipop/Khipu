@@ -41,6 +41,7 @@ const LABELS: Record<string, string> = {
   // only the legacy driver's exit code.
   notes_reconcile_ok: "Notes reconciled by the nightly",
   embed_provider_ok: "Embedding provider reachable",
+  synth_budget_ok: "Summariser within today's call ceiling",
   commitments_hygiene_ok: "Commitments hygiene ran",
   mark_stale_ok: "Stale commitments aged out",
   // D6/F2/F4: topic-embedding lag and the search-degrade rate.
@@ -133,6 +134,7 @@ const ATTENTION_KEY_FOR_OK: Record<string, string> = {
   graph_offsite_ok: "graph_offsite",
   index_freshness_ok: "index_freshness",
   embed_coverage_ok: "embed_coverage",
+  synth_budget_ok: "synth_budget",
   recall_probe_ok: "recall_probe",
   bundle_seal_ok: "bundle_seal",
   dsn_file_ok: "dsn_file",

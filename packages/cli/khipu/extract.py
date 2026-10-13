@@ -21,6 +21,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 # Same contract as the legacy extractor so episodes look the same downstream.
@@ -114,7 +115,115 @@ def _key() -> str:
     return key
 
 
-def _generate_cloud(prompt: str, *, model_id: str, timeout: int, retries: int) -> str:
+def _synth_budget_take() -> None:
+    """Charge one cloud synth call against today's ceiling (embed scope
+    ``synth``); raises ``khipu.embed.BudgetExhausted`` when it is spent."""
+    from khipu.embed import _budget_take
+
+    _budget_take(scope="synth")
+
+
+SYNTH_USAGE_NAME = "synth-usage.jsonl"
+
+
+def synth_usage_path() -> Path:
+    from khipu.paths import data_dir
+
+    return data_dir() / "state" / SYNTH_USAGE_NAME
+
+
+def _record_usage(data: Any, *, model_id: str, caller: str) -> None:
+    """Append one line of token counts from a Gemini response's
+    ``usageMetadata`` to synth-usage.jsonl. Fail-open: a response without the
+    counts, or a file that cannot be written, never touches the call."""
+    try:
+        meta = data.get("usageMetadata") if isinstance(data, dict) else None
+        if not isinstance(meta, dict):
+            return
+        prompt_tokens = meta.get("promptTokenCount")
+        output_tokens = meta.get("candidatesTokenCount")
+        if not isinstance(prompt_tokens, int) and not isinstance(output_tokens, int):
+            return
+        thought_tokens = meta.get("thoughtsTokenCount")
+        row = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "model": model_id,
+            "prompt_tokens": prompt_tokens if isinstance(prompt_tokens, int) else 0,
+            "output_tokens": output_tokens if isinstance(output_tokens, int) else 0,
+            "thought_tokens": thought_tokens if isinstance(thought_tokens, int) else 0,
+            "caller": caller,
+        }
+        path = synth_usage_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception:  # noqa: BLE001 — accounting never fails the call
+        return
+
+
+def _usage_lines_since(path: Path, day: str, block: int = 65_536) -> list[str]:
+    """Lines of the append-only usage file from ``day`` on, read backwards from
+    the end so a year of history is not scanned on every status call."""
+    with path.open("rb") as fh:
+        fh.seek(0, 2)
+        pos = fh.tell()
+        buf = b""
+        while pos > 0:
+            step = min(block, pos)
+            pos -= step
+            fh.seek(pos)
+            buf = fh.read(step) + buf
+            first = buf.split(b"\n", 2)
+            # The first complete line of the buffer is older than ``day``.
+            if pos > 0 and len(first) > 2 and first[1][8:18].decode("ascii", "replace") < day:
+                break
+    return [ln for ln in buf.decode("utf-8", "replace").splitlines() if ln.strip()]
+
+
+def synth_usage_today() -> dict[str, Any]:
+    """Today's (UTC) synth token totals from synth-usage.jsonl, per model and
+    summed, with an estimated USD cost from ``models.PRICES_USD_PER_MTOKEN``.
+    ``estimated_usd`` is null when any model used today has no price."""
+    from khipu.models import PRICES_USD_PER_MTOKEN
+
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    keys = ("prompt_tokens", "output_tokens", "thought_tokens")
+    totals: dict[str, int] = {k: 0 for k in keys}
+    by_model: dict[str, dict[str, Any]] = {}
+    path = synth_usage_path()
+    lines = _usage_lines_since(path, day) if path.is_file() else []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or not str(row.get("ts", "")).startswith(day):
+            continue
+        m = by_model.setdefault(str(row.get("model") or "unknown"), {"calls": 0, **{k: 0 for k in keys}})
+        m["calls"] += 1
+        for k in keys:
+            v = row.get(k)
+            if isinstance(v, int) and not isinstance(v, bool):
+                m[k] += v
+                totals[k] += v
+    total_usd: float | None = 0.0
+    for model, m in by_model.items():
+        price = PRICES_USD_PER_MTOKEN.get(model)
+        if price is None:
+            m["estimated_usd"] = None
+            total_usd = None
+            continue
+        m["estimated_usd"] = round((m["prompt_tokens"] * price["input"]
+                                    + (m["output_tokens"] + m["thought_tokens"]) * price["output"]) / 1e6, 6)
+        if total_usd is not None:
+            total_usd += m["estimated_usd"]
+    return {"day": day, "calls": sum(m["calls"] for m in by_model.values()), **totals,
+            "by_model": by_model,
+            "estimated_usd": None if total_usd is None else round(total_usd, 6)}
+
+
+def _generate_cloud(prompt: str, *, model_id: str, timeout: int, retries: int,
+                    caller: str = "synth") -> str:
     # Header auth, not ?key=. Same reasoning as khipu.embed: a live credential
     # in a URL is one logging or exception-formatting change away from the
     # logs. The embed module was fixed in the 2026-08-17 audit and this one was
@@ -135,10 +244,15 @@ def _generate_cloud(prompt: str, *, model_id: str, timeout: int, retries: int) -
     }).encode("utf-8")
     last: Exception | None = None
     for attempt in range(retries + 1):
+        # Every cloud synth caller (captures, briefs, hygiene, rerank) reaches
+        # the network only here, so this is the daily ceiling's single gate.
+        # BudgetExhausted propagates unwrapped, before the request is sent.
+        _synth_budget_take()
         req = urllib.request.Request(url, data=body, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+            _record_usage(data, model_id=model_id, caller=caller)
             parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
             return "".join(p.get("text", "") for p in parts)
         except urllib.error.HTTPError as e:
@@ -225,7 +339,8 @@ def _generate_local(
     raise RuntimeError(f"extract: model call failed: {last}")
 
 
-def _generate(prompt: str, *, timeout: int = 45, retries: int = 2) -> str:
+def _generate(prompt: str, *, timeout: int = 45, retries: int = 2,
+              caller: str = "synth") -> str:
     """Route by per-call ``models.synth`` (Settings). Local never calls ``_key()``."""
     from khipu.models import cloud_model_id, synth_settings
 
@@ -251,6 +366,7 @@ def _generate(prompt: str, *, timeout: int = 45, retries: int = 2) -> str:
         model_id=cloud_model_id(settings),
         timeout=timeout,
         retries=retries,
+        caller=caller,
     )
 
 
@@ -570,7 +686,7 @@ def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
     decide whether to retry later (it must NOT mark the window consumed)."""
     if not transcript.strip():
         return None
-    raw = _generate(_build_prompt(cwd=cwd, transcript=transcript))
+    raw = _generate(_build_prompt(cwd=cwd, transcript=transcript), caller="capture")
     parsed = parse_model_json(raw)
     if parsed is None:
         parsed = _parse_without_decision_details(raw)

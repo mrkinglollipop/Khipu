@@ -90,6 +90,10 @@ MIN_TURNS = int(_env_int("KHIPU_CAPTURE_MIN_TURNS", "KHIPU_AEGIS_MIN_TURNS", "5"
 MIN_MINUTES = float(_env_int("KHIPU_CAPTURE_MIN_MINUTES", "KHIPU_AEGIS_MIN_MINUTES", "20"))
 MIN_CHARS = 200          # a window smaller than this is never worth a model call
 MAX_TRANSCRIPT = 14_000  # chars carried in a job (tail of the window)
+# Parts (= summariser calls = episodes) one capture may queue. 0 (default) =
+# every part; a positive value is the owner's opt-in to keep only the newest.
+# See the window-split note above _split_messages.
+MAX_PARTS_PER_CAPTURE = max(0, int(os.environ.get("KHIPU_CAPTURE_MAX_PARTS", "0")))
 FIRST_SIGHT_TAIL = 1_000_000  # bytes: first sight of a long transcript starts this far from its end
 
 # Liveness thresholds — "the hook is running but nothing is landing".
@@ -301,6 +305,47 @@ def _clean_user_text(text: str) -> str:
     else:
         text = strip_handoff(cleaned)
     return _CURSOR_WRAP.sub("", text)   # no strip: ACP user text arrives in chunks that must re-join exactly
+
+
+# "User" messages the harness writes, not the person: background-task
+# notifications, messages relayed between sessions, slash-command wrappers. An
+# orchestrator session receives hundreds of them; counted as user turns and
+# rendered in full they made a 398 MB transcript look like 529 turns and queue
+# 104 summariser calls in one capture (2026-10-13). None of them counts as a
+# user turn. A relayed cross-session message carries a teammate's words, so its
+# whole body stays (outer tag stripped); a task notification keeps its
+# <summary> text; the rest stay as one line so the summariser knows they
+# happened.
+MACHINE_USER_TAGS = (
+    "<task-notification",
+    "<cross-session-message",
+    "<cross-session-idle",
+    "<cross-session-delivery",
+    "<local-command-",
+    "<command-name>",
+)
+_TAG_NAME = re.compile(r"<([A-Za-z][\w-]*)")
+_OUTER_TAG = re.compile(r"^<[^>]*>|</[^>]*>\s*$")
+_SUMMARY = re.compile(r"<summary>(.*?)</summary>", re.S)
+
+
+def _machine_user_message(text: str) -> str | None:
+    """What the window keeps for a machine-generated user message, or None
+    when ``text`` (already cleaned) is something the person wrote."""
+    head = text.lstrip()
+    if not head.startswith(MACHINE_USER_TAGS):
+        return None
+    m = _TAG_NAME.match(head)
+    tag = m.group(1) if m else "notification"
+    if tag.startswith("cross-session-"):
+        return (_OUTER_TAG.sub("", head.strip()).strip()
+                or f"[notification: {tag}, {len(text):,} chars]")
+    if tag == "task-notification":
+        s = _SUMMARY.search(head)
+        summary = s.group(1).strip() if s else ""
+        if summary:
+            return f"[notification: task-notification] {summary}"
+    return f"[notification: {tag}, {len(text):,} chars]"
 
 
 # Parts Codex prepends to a user response_item that the user never typed:
@@ -694,11 +739,17 @@ def read_window(path: Path, offset: int) -> tuple[list[tuple[str, str]], int, in
                 continue
             role = role[6:]
         items.append((d, role, text))
+    last_user_counted = False   # the open user block already holds a real turn
     for d, role, text in items:
+        real = False
         if role == "user":
             text = _clean_user_text(text)
             if not text.strip():
                 continue
+            stand_in = _machine_user_message(text)
+            real = stand_in is None
+            if stand_in is not None:
+                text = stand_in
         if role == "tool":
             msgs.append(("tool", text))
             continue
@@ -710,7 +761,10 @@ def read_window(path: Path, offset: int) -> tuple[list[tuple[str, str]], int, in
         else:
             msgs.append((role, text))
             if role == "user":
-                users += 1
+                last_user_counted = False
+        if real and not last_user_counted:
+            users += 1
+            last_user_counted = True
     return msgs, end, users
 
 
@@ -726,13 +780,22 @@ def render(msgs: list[tuple[str, str]], *, max_chars: int = MAX_TRANSCRIPT) -> s
     return out
 
 
-# ---- window split (K3, no tail-clip) ---------------------------------------------
+# ---- window split (K3, lossless by default) --------------------------------------
 #
 # A window over max_chars used to be tail-clipped by render() — the middle was
 # gone, unrecorded. Now it is split on MESSAGE boundaries into several parts,
 # each queued as its own job (chronological, oldest first); every part is
-# extracted into its own episode. Oversize single messages are fragmented too;
-# no source window is tail-clipped.
+# extracted into its own episode. Oversize single messages are fragmented too.
+#
+# Lossless by default: every part is queued. MAX_PARTS_PER_CAPTURE
+# (KHIPU_CAPTURE_MAX_PARTS) is the owner's opt-in cap: when set,
+# _enqueue_window queues only the newest parts, records the dropped chars as
+# truncated_chars on the first kept part, logs it, and still advances the
+# offset past the whole window. Spend is bounded instead by the synth daily
+# call ceiling (khipu.embed scope "synth", `khipu budget`), which delays
+# captures rather than dropping them; on 2026-10-13 one orchestrator session
+# queued 89 and then 104 parts in a morning and ran the Google project into its
+# monthly spending cap.
 
 
 def _split_messages(msgs: list[tuple[str, str]], max_chars: int) -> list[list[tuple[str, str]]]:
@@ -760,7 +823,7 @@ def _split_messages(msgs: list[tuple[str, str]], max_chars: int) -> list[list[tu
 
 def _window_parts(msgs: list[tuple[str, str]], max_chars: int) -> list[dict[str, Any]]:
     """Chronological parts, each ``{"text": ..., "truncated_chars": ...}``.
-    The split is lossless, including windows beyond the former part cap."""
+    Lossless; the opt-in part cap is applied by ``_enqueue_window``."""
     groups = _split_messages(msgs, max_chars)
     return [{"text": render(g, max_chars=max_chars), "truncated_chars": 0} for g in groups]
 
@@ -1520,6 +1583,13 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     # K3: split on message boundaries instead of tail-clipping — every
     # part is queued and extracted into its own episode.
     parts = _window_parts(msgs, MAX_TRANSCRIPT)
+    if MAX_PARTS_PER_CAPTURE > 0 and len(parts) > MAX_PARTS_PER_CAPTURE:
+        dropped = parts[:-MAX_PARTS_PER_CAPTURE]
+        dropped_chars = sum(len(p["text"]) + int(p["truncated_chars"]) for p in dropped)
+        parts = [dict(p) for p in parts[-MAX_PARTS_PER_CAPTURE:]]
+        parts[0]["truncated_chars"] = int(parts[0]["truncated_chars"]) + dropped_chars
+        _log(f"[{harness}] {sid} window of {len(dropped) + len(parts)} parts clipped to "
+             f"{len(parts)} (dropped {dropped_chars:,} chars)")
     # A retry after a crash must identify the same logical window at delivery.
     window_id = hashlib.sha256(
         f"{harness}:{sid}:{off_before}:{new_off}".encode("utf-8")
@@ -1929,11 +1999,12 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         return out
     from khipu.capture import capture
     from khipu.config import capture_mode
+    from khipu.embed import BudgetExhausted
     from khipu.extract import extract_memory
 
     mode = capture_mode()
     started = 0
-    for original in jobs:
+    for idx, original in enumerate(jobs):
         if limit is not None and started >= limit:
             break
         if deadline is not None and time.monotonic() >= deadline:
@@ -1983,6 +2054,20 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         else:
             try:
                 payload = extract_memory(job.get("transcript", ""), cwd=job.get("cwd", ""))
+            except BudgetExhausted as e:
+                # Every later job would be refused the same way: stop here,
+                # keep them all, and say so once instead of once per job.
+                _release(jp)
+                waiting = len(jobs) - idx
+                from khipu.embed import budget_status
+
+                b = budget_status("synth")
+                out["synth_budget_exhausted"] = True
+                out["waiting"] = waiting
+                _record_drain(harness, captured=False, error=f"extract: {type(e).__name__}: {e}")
+                _log(f"drain: synth call budget exhausted for today ({b.get('calls')}/{b.get('cap')}); "
+                     f"{waiting} job(s) wait")
+                break
             except Exception as e:  # noqa: BLE001 — model/transport: keep the job, retry later
                 out["failed"] += 1
                 _release(jp)
@@ -2045,7 +2130,7 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
             payload["verbatim"] = verbatim
         if deliverables:
             payload["deliverables"] = deliverables
-        # K3: 0 unless the part-count ceiling forced a lossy merge.
+        # K3: 0 unless MAX_PARTS_PER_CAPTURE dropped the window's oldest parts.
         payload["truncated_chars"] = int(job.get("truncated_chars") or 0)
         if job.get("window_id"):
             payload["window_id"] = job["window_id"]

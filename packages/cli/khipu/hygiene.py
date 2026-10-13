@@ -403,7 +403,7 @@ def _model_judge(texts: list[str]) -> list[dict[str, Any]]:
         {"keep": True, "reason": "model returned no verdict"} for _ in texts
     ]
     try:
-        raw = _generate(_judge_prompt(texts), timeout=90, retries=1)
+        raw = _generate(_judge_prompt(texts), timeout=90, retries=1, caller="hygiene")
     except Exception as exc:  # noqa: BLE001 — keep everything on a failed call
         return [{"keep": True, "reason": f"judge unavailable: {type(exc).__name__}"} for _ in texts]
     parsed = parse_model_json(raw) or {}
@@ -616,7 +616,7 @@ def _model_adjudicate_pairs(pairs: list[tuple[str, str]]) -> list[bool]:
     from khipu.extract import _generate, parse_model_json
 
     try:
-        raw = _generate(_adjudicate_pairs_prompt(pairs), timeout=60, retries=1)
+        raw = _generate(_adjudicate_pairs_prompt(pairs), timeout=60, retries=1, caller="hygiene")
     except Exception:  # noqa: BLE001
         return [False] * len(pairs)
     parsed = parse_model_json(raw) or {}
