@@ -31,6 +31,20 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(doc["vision"]["provider"], "off")
         self.assertIsNone(doc["models_error"])
 
+    def test_subscription_models_defaults_alias_and_required_id(self):
+        self.assertTrue({"claude-cli", "codex-cli"}.issubset(models.PROVIDERS))
+        doc = models.set_models_merge_role("synth", provider="claude-cli")
+        self.assertEqual(doc["synth"]["model_id"], "haiku")
+        self.assertEqual(models.cloud_model_id(), "haiku")
+        doc = models.set_models_merge_role("synth", provider="claude-cli", model_id="claude-haiku-5-5")
+        self.assertEqual(models.cloud_model_id(doc["synth"]), "claude-haiku-5-5")
+        with self.assertRaisesRegex(ValueError, "codex-cli provider requires --model"):
+            models.set_models_merge_role("synth", provider="codex-cli")
+        doc = models.set_models_merge_role("synth", provider="codex-cli", model_id="explicit")
+        self.assertEqual(models.cloud_model_id(doc["synth"]), "explicit")
+        with self.assertRaisesRegex(RuntimeError, "codex-cli synth requires model_id"):
+            models.cloud_model_id({"provider": "codex-cli"})
+
     def test_loopback_http_ok_non_loopback_http_rejected(self):
         models.validate_endpoint("http://127.0.0.1:11434")
         models.validate_endpoint("http://localhost:8080/v1")

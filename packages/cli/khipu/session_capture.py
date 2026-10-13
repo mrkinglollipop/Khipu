@@ -263,7 +263,11 @@ def _in_claude_home(tp: str, osenv: dict) -> bool:
         return False
 
 
-def transcript_path(env: dict, harness: str = "") -> Path | None:
+def transcript_path(env: dict, harness: str = "", *, synth_sessions: set[str] | None = None) -> Path | None:
+    from khipu.synth_cli import session_ids
+
+    if session_id(env) in (session_ids() if synth_sessions is None else synth_sessions):
+        return None
     p = _get(env, "transcriptPath", "transcript_path")
     if p:
         return Path(str(p))
@@ -1720,6 +1724,12 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
         env = {}
     if not isinstance(env, dict):
         env = {}
+    from khipu.synth_cli import session_ids
+
+    synth_sessions = session_ids()
+    if session_id(env) in synth_sessions:
+        return {"reason": "synth-cli", "skipped": "synth-cli", "due": False,
+                "session_id": session_id(env)}
     if is_helper_session(session_cwd(env)):
         # T3's thread-title helper: nothing to record, and no heartbeat either
         # (a beat for a session that never wrote a line reads as liveness noise).
@@ -1749,9 +1759,9 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
             # when present, else fall back to the generic transcriptPath every
             # other event uses (Claude Code / Cursor).
             agent_tp = _get(env, "agent_transcript_path", "agentTranscriptPath")
-            path = Path(str(agent_tp)) if agent_tp else transcript_path(env, harness)
+            path = Path(str(agent_tp)) if agent_tp else transcript_path(env, harness, synth_sessions=synth_sessions)
         else:
-            path = transcript_path(env, harness)
+            path = transcript_path(env, harness, synth_sessions=synth_sessions)
         if path is None:
             if is_subagent_stop:
                 out["reason"] = "subagentstop: no transcript in payload"
@@ -1893,6 +1903,9 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
     The time budget is checked between files and before enqueueing.
     """
     out = {"scanned": 0, "read": 0, "swept": 0, "jobs": 0, "skipped": {}, "dry_run": dry_run}
+    from khipu.synth_cli import session_ids
+
+    synth_sessions = session_ids()
     if dry_run:
         out["sessions"] = []
 
@@ -1924,6 +1937,9 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
             if f.name.endswith(".capture-now.json") or not track_sid:
                 skip("flag")
                 continue
+            if track_sid in synth_sessions:
+                skip("synth-cli")
+                continue
             # A malformed state cannot safely carry its own retry stamp.
             error_file = f.with_suffix(".sweep-error")
             try:
@@ -1936,6 +1952,9 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                 st = json.loads(f.read_text(encoding="utf-8"))
                 if not isinstance(st, dict):
                     raise ValueError("session state is not an object")
+                if str(st.get("session_id") or "") in synth_sessions:
+                    skip("synth-cli")
+                    continue
                 if st.get("sweep_error") is not None and now - float(st["sweep_error"]) < 3600:
                     skip("error_cached")
                     continue

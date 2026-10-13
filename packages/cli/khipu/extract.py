@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -146,10 +148,13 @@ def _record_usage(data: Any, *, model_id: str, caller: str, provider: str = "gem
             cached_tokens = meta.get("cachedContentTokenCount")
         else:
             meta = data.get("usage") or {}
-            prompt_tokens = meta.get("input_tokens" if provider == "anthropic" else "prompt_tokens")
-            output_tokens = meta.get("output_tokens" if provider == "anthropic" else "completion_tokens")
+            native = provider in {"anthropic", "claude-cli", "codex-cli"}
+            default = 0 if provider in {"claude-cli", "codex-cli"} else None
+            prompt_tokens = meta.get("input_tokens" if native else "prompt_tokens", default)
+            output_tokens = meta.get("output_tokens" if native else "completion_tokens", default)
             thought_tokens = 0
-            cached_tokens = (meta.get("cache_read_input_tokens") if provider == "anthropic"
+            cached_tokens = (meta.get("cached_input_tokens", 0) if provider == "codex-cli" else
+                             meta.get("cache_read_input_tokens") if native
                              else (meta.get("prompt_tokens_details") or {}).get("cached_tokens"))
         def count(value):
             return max(0, value) if isinstance(value, int) and not isinstance(value, bool) else 0
@@ -197,7 +202,7 @@ def synth_usage_today() -> dict[str, Any]:
     """Today's (UTC) synth token totals from synth-usage.jsonl, per model and
     summed, with an estimated USD cost from ``models.PRICES_USD_PER_MTOKEN``.
     ``estimated_usd`` is null when any model used today has no price."""
-    from khipu.models import PRICES_USD_PER_MTOKEN
+    from khipu.models import CLI_PROVIDERS, PRICES_USD_PER_MTOKEN
 
     day = time.strftime("%Y-%m-%d", time.gmtime())
     keys = ("prompt_tokens", "output_tokens", "thought_tokens", "cached_tokens")
@@ -231,8 +236,12 @@ def synth_usage_today() -> dict[str, Any]:
         previous = bucket.get("estimated_usd", 0.0)
         bucket["estimated_usd"] = None if cost is None or previous is None else previous + cost
     for provider, group in by_provider.items():
+        if provider in CLI_PROVIDERS:
+            group["billing"] = "subscription"
         for model, m in group["by_model"].items():
-            price = PRICES_USD_PER_MTOKEN.get(model)
+            price = PRICES_USD_PER_MTOKEN.get("haiku" if provider in CLI_PROVIDERS else model)
+            if provider in CLI_PROVIDERS:
+                m["billing"] = "subscription"
             cached = m["cached_tokens"]
             if price is None or (cached and "cached_input" not in price):
                 cost = None
@@ -375,6 +384,84 @@ def _generate_openai(prompt: str, *, model_id: str, timeout: int, retries: int,
                          timeout=timeout, retries=retries, caller=caller)
 
 
+def _generate_claude_cli(prompt: str, *, model_id: str, timeout: int = 60, retries: int = 2,
+                         caller: str = "synth") -> str:
+    from khipu import synth_cli
+
+    env = synth_cli.environment()
+    last = "CLI call failed"
+    for attempt in range(retries + 1):
+        _synth_budget_take()
+        try:
+            sid = synth_cli.new_session()
+            with tempfile.TemporaryDirectory(prefix="work-", dir=synth_cli.root()) as cwd:
+                argv = ["claude", "-p", "--setting-sources", "", "--model", model_id,
+                        "--output-format", "json", "--max-turns", "1", "--disallowedTools",
+                        "Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,Agent", "--session-id", sid]
+                result = subprocess.run(argv, input=prompt, text=True, capture_output=True,
+                                        cwd=cwd, env=env, timeout=timeout, check=False)
+            data = json.loads(result.stdout)
+            text = data.get("result")
+            if not isinstance(text, str):
+                raise ValueError("missing result")
+            failed = data.get("is_error") or result.returncode or _cli_failure(text)
+            if not failed:
+                _record_usage(data, provider="claude-cli", model_id=model_id, caller=caller)
+                return text
+            last = synth_cli.error_text(text, prompt, env) or f"CLI exit {result.returncode}"
+        except Exception as exc:  # noqa: BLE001 — retry without logging argv/output/env
+            last = type(exc).__name__
+        time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"extract: model call failed: {last}") from None
+
+
+def _cli_failure(text: str) -> bool:
+    # Summaries may describe a login or rate-limit incident; only a standalone
+    # diagnostic is a failed call, never those words inside extracted JSON.
+    lower = text.strip().lower().removeprefix("api error: ").removeprefix("error: ")
+    return lower.startswith(("not logged in", "rate limit", "rate-limit", "usage limit",
+                             "you've hit your limit", "you have hit your limit"))
+
+
+def _generate_codex_cli(prompt: str, *, model_id: str, timeout: int = 60, retries: int = 2,
+                        caller: str = "synth") -> str:
+    from khipu import synth_cli
+
+    env = synth_cli.environment()
+    last = "CLI call failed"
+    for attempt in range(retries + 1):
+        _synth_budget_take()
+        try:
+            synth_cli.new_session()
+            with tempfile.TemporaryDirectory(prefix="work-", dir=synth_cli.root()) as cwd, \
+                    tempfile.NamedTemporaryFile(dir=synth_cli.root()) as output:
+                argv = ["codex", "exec", "--json", "--ephemeral", "-s", "read-only",
+                        "--skip-git-repo-check", "-m", model_id, "-o", output.name, "-C", cwd, "-"]
+                result = subprocess.run(argv, input=prompt, text=True, capture_output=True,
+                                        cwd=cwd, env=env, timeout=timeout, check=False)
+                usage = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
+                error = ""
+                for line in result.stdout.splitlines():
+                    event = json.loads(line)
+                    if event.get("type") == "thread.started" and event.get("thread_id"):
+                        synth_cli.register(str(event["thread_id"]))
+                    if event.get("type") == "turn.completed":
+                        usage = event.get("usage") or usage
+                    if event.get("type") in {"error", "turn.failed"}:
+                        error = str((event.get("error") or {}).get("message") or event.get("message")
+                                    or "CLI turn failed")
+                text = Path(output.name).read_text(encoding="utf-8")
+            if not result.returncode and not error and text.strip() and not _cli_failure(text):
+                _record_usage({"usage": usage}, provider="codex-cli", model_id=model_id, caller=caller)
+                return text
+            last = synth_cli.error_text(error or (text if _cli_failure(text) else ""), prompt, env)
+            last = last or f"CLI exit {result.returncode}: no successful last message"
+        except Exception as exc:  # noqa: BLE001 — same retry schedule as API adapters
+            last = type(exc).__name__
+        time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"extract: model call failed: {last}") from None
+
+
 def _response_format_rejected(code: int, body: str) -> bool:
     """Retry without json_object on HTTP 400/415, or if the body names it."""
     if code in (400, 415):
@@ -449,13 +536,15 @@ def _generate_local(
     raise RuntimeError(f"extract: model call failed: {last}")
 
 
-def _generate(prompt: str, *, timeout: int = 45, retries: int = 2,
+def _generate(prompt: str, *, timeout: int | None = None, retries: int = 2,
               caller: str = "synth") -> str:
     """Route by per-call ``models.synth`` (Settings). Local never calls ``_key()``."""
     from khipu.models import cloud_model_id, synth_settings
 
     settings = synth_settings()
     provider = (settings.get("provider") or "cloud").strip().lower()
+    if timeout is None:
+        timeout = 60 if provider in {"claude-cli", "codex-cli"} else 45
     if provider == "local":
         endpoint = (settings.get("endpoint") or "").strip()
         model_id = (settings.get("model_id") or "").strip()
@@ -472,7 +561,8 @@ def _generate(prompt: str, *, timeout: int = 45, retries: int = 2,
             retries=retries,
         )
     adapters = {"cloud": _generate_cloud, "gemini": _generate_gemini,
-                "anthropic": _generate_anthropic, "openai": _generate_openai}
+                "anthropic": _generate_anthropic, "openai": _generate_openai,
+                "claude-cli": _generate_claude_cli, "codex-cli": _generate_codex_cli}
     if provider not in adapters:
         raise RuntimeError(f"unknown synth provider: {provider}")
     return adapters[provider](

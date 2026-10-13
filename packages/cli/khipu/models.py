@@ -13,8 +13,10 @@ from urllib.parse import urlparse
 from khipu.config import load_config, save_config
 
 ROLES = ("synth", "embed", "vision")
-PROVIDERS = frozenset({"gemini", "anthropic", "openai", "local"})
-DEFAULT_SYNTH_MODELS = {"gemini": "gemini-2.5-flash", "anthropic": "claude-haiku-5-5"}
+CLI_PROVIDERS = frozenset({"claude-cli", "codex-cli"})
+PROVIDERS = frozenset({"gemini", "anthropic", "openai", "local"}) | CLI_PROVIDERS
+DEFAULT_SYNTH_MODELS = {"gemini": "gemini-2.5-flash", "anthropic": "claude-haiku-5-5",
+                        "claude-cli": "haiku"}
 VISION_PROVIDERS = frozenset({"cloud", "local", "off"})
 DEFAULT_SYNTH_MODEL = "gemini-2.5-flash"
 # USD per million tokens, used only to estimate spend in budget status/doctor.
@@ -27,6 +29,8 @@ PRICES_USD_PER_MTOKEN: dict[str, dict[str, Any]] = {
                               "as_of": "2026-10-13", "source": "Google Gemini API published list prices"},
     "claude-haiku-5-5": {"input": 0.10, "output": 0.50, "cached_input": 0.01,
                          "as_of": "2026-10-13", "source": "Anthropic published list prices, prompts up to 100k"},
+    "haiku": {"input": 0, "output": 0, "cached_input": 0,
+              "as_of": "2026-10-13", "source": "subscription route, billed to the user's plan"},
 }
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -116,7 +120,7 @@ def _normalize_role(role: str, raw: Any, *, for_set: bool) -> dict[str, str]:
     if role == "synth" and not model_id:
         model_id = DEFAULT_SYNTH_MODELS.get(provider, "")
         if not model_id:
-            raise ValueError("synth: openai provider requires --model (model_id)")
+            raise ValueError(f"synth: {provider} provider requires --model (model_id)")
     if endpoint:
         # Persist a cleaned endpoint even on cloud (user may flip to local later).
         endpoint = validate_endpoint(endpoint) if endpoint else ""
@@ -225,8 +229,8 @@ def set_models_merge_role(
     """
     if role not in ROLES:
         raise ValueError(f"unknown role: {role}")
-    if role == "synth" and provider.strip().lower() == "openai" and not (model_id or "").strip():
-        raise ValueError("synth: openai provider requires --model (model_id)")
+    if role == "synth" and provider.strip().lower() in {"openai", "codex-cli"} and not (model_id or "").strip():
+        raise ValueError(f"synth: {provider.strip().lower()} provider requires --model (model_id)")
     _require_stored_models_writable()
     current = show_models()
     base = {r: dict(current[r]) for r in ROLES}
@@ -265,7 +269,7 @@ def synth_settings() -> dict[str, str]:
 
 
 def cloud_model_id(settings: dict[str, str] | None = None) -> str:
-    """Cloud synth model id at call time; ``KHIPU_EXTRACT_MODEL`` overrides."""
+    """Synth model id at call time, including CLI routes; env override wins."""
     role = settings if settings is not None else synth_settings()
     provider = role.get("provider", "gemini")
     model_id = (role.get("model_id") or "").strip() or DEFAULT_SYNTH_MODELS.get(
@@ -274,7 +278,7 @@ def cloud_model_id(settings: dict[str, str] | None = None) -> str:
     if env:
         return env
     if not model_id:
-        raise RuntimeError("openai synth requires model_id")
+        raise RuntimeError(f"{provider} synth requires model_id")
     return model_id
 
 

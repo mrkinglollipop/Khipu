@@ -297,7 +297,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # Keychain is denied. It went stale on 2026-08-04 and nothing noticed until
     # 2026-08-18, because every check ran where the Keychain worked.
     dsn_file_ok = bool((secrets.get("dsn_file") or {}).get("ok", True))
-    from khipu.models import synth_settings, cloud_model_id
+    from khipu.models import CLI_PROVIDERS, synth_settings, cloud_model_id
 
     _synth = synth_settings()
     _provider = _synth["provider"]
@@ -307,6 +307,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                       "model": _synth["model_id"] if _provider == "local" else cloud_model_id(_synth),
                       "key_present": bool(_key_present)}
     synth_provider_ok = _provider == "local" or bool(_key_present)
+    if _provider in CLI_PROVIDERS:
+        import shutil
+
+        synth_provider.update(key_present=None, auth="subscription")
+        synth_provider_ok = shutil.which(_provider.removesuffix("-cli")) is not None
     try:
         from khipu.jobs import index_freshness, job_status
 
@@ -3253,6 +3258,11 @@ def cmd_integrations(args: argparse.Namespace) -> int:
         return 0
     if args.integ_cmd == "verify":
         results = [_verify(h) for h in targets]
+        synth_check = integ.verify_synth_provider()
+        if synth_check is not None:
+            for result in results:
+                result.setdefault("components", {})["synth_provider"] = synth_check
+                result["ok"] = result.get("ok", not result["detected"]) and synth_check["ok"]
         print(json.dumps(results, indent=2))
         return 0 if all(r.get("ok", not r["detected"]) for r in results) else 2
     fn = integ.install if args.integ_cmd == "install" else integ.uninstall
@@ -4096,7 +4106,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     md_set.add_argument(
         "--provider",
-        choices=("gemini", "anthropic", "openai", "cloud", "local", "off"),
+        choices=("gemini", "anthropic", "openai", "claude-cli", "codex-cli", "cloud", "local", "off"),
         default=None,
         help="Provider for --role merge",
     )

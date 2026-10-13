@@ -52,6 +52,17 @@ class ModelsCliTest(unittest.TestCase):
         self.assertEqual(doc["vision"]["provider"], "off")
         self.assertIsNone(doc["models_error"])
 
+    def test_subscription_set_without_key_and_codex_requires_model(self):
+        rc, raw = _run(["models", "set", "--role", "synth", "--provider", "claude-cli"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(raw)["models"]["synth"]["model_id"], "haiku")
+        rc, raw = _run(["models", "set", "--role", "synth", "--provider", "codex-cli"])
+        self.assertEqual(rc, 2)
+        self.assertIn("requires --model", json.loads(raw)["error"])
+        rc, raw = _run(["models", "set", "--role", "synth", "--provider", "codex-cli", "--model", "explicit"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(raw)["models"]["synth"]["model_id"], "explicit")
+
     def test_set_json_replace(self):
         rc, raw = _run(["models", "set", json.dumps(_VALID)])
         self.assertEqual(rc, 0)

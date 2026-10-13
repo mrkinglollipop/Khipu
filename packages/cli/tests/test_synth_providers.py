@@ -2,12 +2,16 @@
 import io
 import json
 import socket
+import subprocess
 import urllib.error
 from contextlib import ExitStack, redirect_stdout
+from pathlib import Path
 from unittest import mock
+from uuid import UUID
 
 import pytest
-from khipu import cli, config, embed, extract, keychain, models, rerank
+from khipu import cli, config, embed, extract, integrations, keychain, models, rerank, synth_cli
+from khipu import session_capture as sc
 from tests.test_cli_recall_quality import _green_doctor_patches
 
 
@@ -15,6 +19,7 @@ from tests.test_cli_recall_quality import _green_doctor_patches
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv('KHIPU_DATA_DIR', str(tmp_path))
     monkeypatch.setenv('KHIPU_KEYCHAIN', '0')
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'capture'))
     for key in ('ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY',
                 'KHIPU_EXTRACT_MODEL', 'KHIPU_SYNTH_PROVIDER', 'KHIPU_TEST'):
         monkeypatch.delenv(key, raising=False)
@@ -273,7 +278,8 @@ def test_extraction_fixture_prompt_is_byte_identical_across_adapters():
                          'scope': 'fixture', 'open_loops': [], 'closed_loops': []})
     prompts = []
     for provider, model in [('gemini', 'gemini-2.5-flash'),
-                             ('anthropic', 'claude-haiku-5-5'), ('openai', 'explicit')]:
+                             ('anthropic', 'claude-haiku-5-5'), ('openai', 'explicit'),
+                             ('claude-cli', 'haiku'), ('codex-cli', 'explicit')]:
         models.set_models_merge_role('synth', provider=provider, model_id=model)
         def respond(request, **kwargs):
             body = json.loads(request.data)
@@ -284,14 +290,21 @@ def test_extraction_fixture_prompt_is_byte_identical_across_adapters():
             if provider == 'anthropic':
                 return Reply({'content': [{'type': 'text', 'text': answer}]})
             return Reply({'choices': [{'message': {'content': answer}}]})
+        def respond_cli(argv, **kwargs):
+            prompts.append(kwargs['input'].encode())
+            if provider == 'claude-cli':
+                return subprocess.CompletedProcess(argv, 0, json.dumps({'result': answer}), '')
+            Path(argv[argv.index('-o') + 1]).write_text(answer)
+            return subprocess.CompletedProcess(argv, 0, '', '')
         with mock.patch.object(extract, '_provider_key', return_value='fake'), \
              mock.patch.object(extract, '_key', return_value='fake'), \
-             mock.patch.object(extract.urllib.request, 'urlopen', side_effect=respond):
+             mock.patch.object(extract.urllib.request, 'urlopen', side_effect=respond), \
+             mock.patch.object(extract.subprocess, 'run', side_effect=respond_cli):
             result = extract.extract_memory(transcript, cwd='/fixture')
         assert result['summary'] == 'Kept append-only history.'
         assert result['decisions'] == ['Keep append-only history.']
-    assert len(prompts) == 3
-    assert prompts[0] == prompts[1] == prompts[2]
+    assert len(prompts) == 5
+    assert all(prompt == prompts[0] for prompt in prompts)
     assert transcript.encode() in prompts[0]
 
 
@@ -303,3 +316,261 @@ def test_keychain_lookup_account_and_khipu_service(provider):
     security.assert_called_once_with('find-generic-password', '-s', keychain.SERVICE,
                                     '-a', provider + '_api_key', '-w')
     assert keychain.SERVICE == 'Khipu'
+
+
+def cli_adapter(provider):
+    return getattr(extract, '_generate_' + provider.replace('-', '_'))
+
+
+def cli_reply(provider, argv, *, text='ab', error=False, code=0, usage=True):
+    if provider == 'claude-cli':
+        data = {'result': text, 'is_error': error}
+        if usage:
+            data['usage'] = {'input_tokens': 1000, 'output_tokens': 200, 'cache_read_input_tokens': 400}
+        return subprocess.CompletedProcess(argv, code, json.dumps(data), 'ignored stderr')
+    Path(argv[argv.index('-o') + 1]).write_text(text)
+    events = [{'type': 'thread.started', 'thread_id': '00000000-0000-4000-8000-000000000001'}]
+    if usage:
+        events.append({'type': 'turn.completed', 'usage': {
+            'input_tokens': 1000, 'output_tokens': 200, 'cached_input_tokens': 400}})
+    if error:
+        events.append({'type': 'turn.failed', 'error': {'message': text}})
+    return subprocess.CompletedProcess(argv, code, '\n'.join(json.dumps(e) for e in events), 'ignored stderr')
+
+
+@pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
+def test_cli_exact_argv_stdin_env_usage_budget_and_no_capture(provider, tmp_path, monkeypatch):
+    prompt = 'USER: retain every decision.\nUnicode: café'
+    monkeypatch.setenv('CLAUDECODE', 'nested')
+    monkeypatch.setenv('CLAUDE_CODE_ENTRYPOINT', 'cli')
+    monkeypatch.setenv('KHIPU_CAPTURE_QUEUE_ONLY', '1')
+    monkeypatch.setenv('KHIPU_OTHER_CAPTURE_VARIABLE', 'nested')
+    monkeypatch.setenv('UNRELATED_ENV', 'preserved')
+    calls = []
+    def run(argv, **kw):
+        calls.append((argv, kw))
+        cwd = Path(kw['cwd'])
+        assert cwd.is_relative_to(tmp_path / 'state' / 'synth-cli')
+        assert list(cwd.iterdir()) == []
+        assert kw['input'].encode() == prompt.encode()
+        assert kw['text'] and kw['capture_output'] and not kw['check']
+        assert kw['timeout'] == 7
+        assert not any(k.startswith('KHIPU_') for k in kw['env'])
+        assert 'CLAUDECODE' not in kw['env'] and 'CLAUDE_CODE_ENTRYPOINT' not in kw['env']
+        assert kw['env']['UNRELATED_ENV'] == 'preserved'
+        if provider == 'claude-cli':
+            sid = argv[-1]
+            assert str(UUID(sid)) == sid
+            assert sid in synth_cli.session_ids()
+            assert argv == ['claude', '-p', '--setting-sources', '', '--model', 'm',
+                            '--output-format', 'json', '--max-turns', '1', '--disallowedTools',
+                            'Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,Agent', '--session-id', sid]
+            transcript = tmp_path / 's.jsonl'
+            transcript.write_text(json.dumps({'type': 'user', 'message': {'role': 'user', 'content': prompt * 10}}) + '\n')
+            assert sc.hook_main(json.dumps({'session_id': sid, 'hook_event_name': 'SessionEnd',
+                                            'transcript_path': str(transcript)}), 'claude_code')['reason'] == 'synth-cli'
+        else:
+            assert argv == ['codex', 'exec', '--json', '--ephemeral', '-s', 'read-only',
+                            '--skip-git-repo-check', '-m', 'm', '-o', argv[10], '-C', kw['cwd'], '-']
+            assert not Path(argv[10]).is_relative_to(cwd)
+        return cli_reply(provider, argv)
+    with mock.patch.object(extract.subprocess, 'run', side_effect=run), \
+         mock.patch.object(extract, '_provider_key', side_effect=AssertionError('no key lookup')):
+        assert cli_adapter(provider)(prompt, model_id='m', timeout=7, retries=0, caller='fixture') == 'ab'
+    assert len(calls) == 1
+    assert embed.budget_status('synth')['calls'] == 1
+    row = json.loads(extract.synth_usage_path().read_text())
+    assert (row['provider'], row['model'], row['caller']) == (provider, 'm', 'fixture')
+    assert (row['prompt_tokens'], row['output_tokens'], row['cached_tokens']) == (1000, 200, 400)
+    usage = cli._budget_status_all()['synth']['usage_by_provider'][provider]
+    assert usage['estimated_usd'] == 0.0 and usage['billing'] == 'subscription'
+    assert sc.queued_jobs() == [] and not sc.state_dir().exists()
+    assert not Path(calls[0][1]['cwd']).exists()
+    if provider == 'codex-cli':
+        assert not Path(calls[0][0][10]).exists()
+        assert '00000000-0000-4000-8000-000000000001' in synth_cli.session_ids()
+
+
+@pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
+@pytest.mark.parametrize('failure', ['is_error', 'exit', 'missing', 'timeout', 'logged_out', 'rate_limit'])
+def test_cli_retry_failure_redaction_and_budget(provider, failure, monkeypatch, caplog):
+    prompt = 'private prompt for failure fixture'
+    secret = 'private-environment-value'
+    monkeypatch.setenv('FIXTURE_SECRET', secret)
+    def run(argv, **kwargs):
+        if failure == 'missing':
+            raise FileNotFoundError(prompt + secret)
+        if failure == 'timeout':
+            raise subprocess.TimeoutExpired(argv, 1, output=prompt + secret)
+        text = {'logged_out': 'Not logged in', 'rate_limit': 'Rate limit exceeded'}.get(
+            failure, 'failure ' + prompt + secret + 'z' * 500)
+        return cli_reply(provider, argv, text=text, error=failure == 'is_error',
+                         code=1 if failure == 'exit' else 0)
+    with mock.patch.object(extract.subprocess, 'run', side_effect=run) as call, \
+         mock.patch.object(extract.time, 'sleep') as sleep:
+        with pytest.raises(RuntimeError, match='extract: model call failed:') as exc:
+            cli_adapter(provider)(prompt, model_id='m', timeout=1, retries=2)
+    assert call.call_count == 3 and embed.budget_status('synth')['calls'] == 3
+    assert [c.args[0] for c in sleep.call_args_list] == [1.5, 3.0, 4.5]
+    assert prompt not in str(exc.value) and secret not in str(exc.value)
+    assert prompt not in caplog.text and secret not in caplog.text
+    assert len(str(exc.value)) <= len('extract: model call failed: ') + 300
+    if failure == 'logged_out':
+        assert 'Not logged in' in str(exc.value)
+
+
+@pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
+def test_cli_failed_attempt_then_success_and_ceiling(provider):
+    config.set_int_setting('synth_daily_calls', 2)
+    def run(argv, **kwargs):
+        return cli_reply(provider, argv, text='ok')
+    with mock.patch.object(extract.subprocess, 'run') as call, \
+         mock.patch.object(extract.time, 'sleep'):
+        def attempts(argv, **kwargs):
+            if call.call_count == 1:
+                raise FileNotFoundError()
+            return run(argv, **kwargs)
+        call.side_effect = attempts
+        assert cli_adapter(provider)('p', model_id='m', retries=1) == 'ok'
+        assert call.call_count == 2
+        with pytest.raises(embed.BudgetExhausted):
+            cli_adapter(provider)('p', model_id='m', retries=0)
+        assert call.call_count == 2
+    assert len(extract.synth_usage_path().read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
+def test_cli_dispatch_default_timeout_and_missing_usage(provider):
+    models.set_models_merge_role('synth', provider=provider, model_id='custom')
+    with mock.patch.object(extract, '_generate_' + provider.replace('-', '_'), return_value='answer') as adapter:
+        assert extract._generate('prompt') == 'answer'
+        adapter.assert_called_once_with('prompt', model_id='custom', timeout=60, retries=2, caller='synth')
+        extract._generate('prompt', timeout=9, retries=0)
+        assert adapter.call_args.kwargs['timeout'] == 9
+    with mock.patch.object(extract.subprocess, 'run', side_effect=lambda argv, **kw: cli_reply(provider, argv, usage=False)):
+        assert extract._generate('prompt', retries=0) == 'ab'
+    row = json.loads(extract.synth_usage_path().read_text())
+    assert row['provider'] == provider and row['prompt_tokens'] == row['output_tokens'] == 0
+    assert extract.synth_usage_today()['calls'] == 1
+
+
+@pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
+def test_cli_rerank_refusal_before_key_or_adapter(provider):
+    models.set_models_merge_role('synth', provider=provider, model_id='m')
+    with mock.patch.object(extract, '_provider_key') as key, mock.patch.object(extract, '_generate') as adapter:
+        with pytest.raises(rerank._Unavailable, match='rerank needs an API provider'):
+            rerank._call_model('p', timeout=1)
+    key.assert_not_called()
+    adapter.assert_not_called()
+
+
+@pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
+@pytest.mark.parametrize('present', [True, False])
+def test_cli_doctor_subscription_path_only(provider, present):
+    models.set_models_merge_role('synth', provider=provider, model_id='m')
+    with ExitStack() as stack:
+        for patch in _green_doctor_patches():
+            stack.enter_context(patch)
+        stack.enter_context(mock.patch('shutil.which', return_value='/fake/bin' if present else None))
+        stack.enter_context(mock.patch('khipu.probe.status', return_value={'ok': True}))
+        stack.enter_context(mock.patch('khipu.recall_prompt.prompt_recall_outcomes', return_value={'ok': True}))
+        stack.enter_context(mock.patch('khipu.drift.recall_quality', return_value={}))
+        output = stack.enter_context(redirect_stdout(io.StringIO()))
+        cli.cmd_doctor(cli.build_parser().parse_args(['doctor']))
+    doc = json.loads(output.getvalue())
+    assert doc['synth_provider'] == {'provider': provider, 'model': 'm', 'key_present': None, 'auth': 'subscription'}
+    assert doc['synth_provider_ok'] is present
+
+
+@pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
+@pytest.mark.parametrize('answer', ['pong', 'Not logged in'])
+def test_cli_verify_fake_adapter_once_and_capture_watch(provider, answer):
+    models.set_models_merge_role('synth', provider=provider, model_id='m')
+    def adapter(prompt, **kw):
+        assert prompt == 'Reply with exactly the word pong.'
+        assert kw == {'model_id': 'm', 'timeout': 60, 'retries': 0, 'caller': 'verify'}
+        synth_cli.new_session()
+        return answer
+    with mock.patch.object(extract, '_generate_' + provider.replace('-', '_'), side_effect=adapter) as call, \
+         mock.patch.object(integrations.time, 'monotonic', side_effect=[0, .1, .2, .3, 3.4]):
+        result = integrations.verify_synth_provider()
+    assert call.call_count == 1
+    assert result['ok'] is (answer == 'pong') and result['self_capture'] is False
+    assert result['ms'] == 100
+    if answer != 'pong':
+        assert result['error'] == 'Not logged in'
+
+
+@pytest.mark.parametrize('artifact', ['queue', 'state'])
+def test_verify_detects_self_capture(artifact):
+    models.set_models_merge_role('synth', provider='claude-cli')
+    def adapter(*args, **kwargs):
+        sid = synth_cli.new_session()
+        if artifact == 'queue':
+            sc.enqueue({'ts': sc._mint_ts(), 'session_id': sid, 'harness': 'claude_code'})
+        else:
+            sc.save_state('claude_code', sid, {})
+        return 'pong'
+    with mock.patch.object(extract, '_generate_claude_cli', side_effect=adapter):
+        result = integrations.verify_synth_provider()
+    assert not result['ok'] and result['self_capture'] is True
+
+
+def test_integrations_verify_check_wiring_and_api_no_probe():
+    assert integrations.verify_synth_provider() is None
+    models.set_models_merge_role('synth', provider='claude-cli')
+    args = cli.build_parser().parse_args(['integrations', 'verify', 'codex'])
+    check = {'ok': True, 'ms': 123, 'self_capture': False}
+    with mock.patch.object(integrations, 'verify', return_value={'detected': True, 'ok': True}), \
+         mock.patch.object(integrations, 'verify_synth_provider', return_value=check) as probe, \
+         redirect_stdout(io.StringIO()) as output:
+        assert cli.cmd_integrations(args) == 0
+    probe.assert_called_once_with()
+    assert json.loads(output.getvalue())[0]['components']['synth_provider'] == check
+
+
+@pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
+def test_marker_write_failure_prevents_launch(provider):
+    with mock.patch.object(synth_cli, 'new_session', side_effect=PermissionError('private detail')), \
+         mock.patch.object(extract.subprocess, 'run') as run, mock.patch.object(extract.time, 'sleep'):
+        with pytest.raises(RuntimeError, match='extract: model call failed: PermissionError'):
+            cli_adapter(provider)('private prompt', model_id='m', retries=0)
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
+def test_cli_failure_keeps_drain_job_byte_for_byte(provider):
+    models.set_models_merge_role('synth', provider=provider, model_id='m')
+    path = sc.enqueue({'ts': sc._mint_ts(), 'harness': 'codex', 'session_id': 'ordinary-session',
+                       'transcript': 'USER: This decision must survive a failed CLI call.'})
+    before = path.read_bytes()
+    with mock.patch.object(extract.subprocess, 'run', side_effect=FileNotFoundError()), \
+         mock.patch.object(extract.time, 'sleep'), \
+         mock.patch('khipu.capture.capture') as capture:
+        result = sc.drain(limit=1)
+    assert result['failed'] == 1 and result['captured'] == 0
+    assert path.read_bytes() == before and sc.queued_jobs() == [path]
+    assert embed.budget_status('synth')['calls'] == 3
+    capture.assert_not_called()
+
+
+def test_subscription_cost_does_not_reprice_anthropic_alias():
+    for provider in ('anthropic', 'claude-cli', 'codex-cli'):
+        extract._record_usage({'usage': {'input_tokens': 1000, 'output_tokens': 200,
+                                         'cache_read_input_tokens': 400, 'cached_input_tokens': 400}},
+                              provider=provider, model_id='claude-haiku-5-5', caller='test')
+    result = extract.synth_usage_today()
+    assert result['by_provider']['anthropic']['estimated_usd'] == .000204
+    for provider in ('claude-cli', 'codex-cli'):
+        assert result['by_provider'][provider]['estimated_usd'] == 0.0
+        assert result['by_provider'][provider]['billing'] == 'subscription'
+    assert result['estimated_usd'] == .000204
+
+
+@pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
+def test_valid_summary_about_cli_errors_is_not_rejected(provider):
+    answer = json.dumps({'summary': 'Resolved Not logged in and rate limit errors.',
+                         'decisions': ['Keep CLI failures retryable.']})
+    with mock.patch.object(extract.subprocess, 'run', side_effect=lambda argv, **kw: cli_reply(provider, argv, text=answer)) as call:
+        assert cli_adapter(provider)('private transcript', model_id='m', retries=0) == answer
+    assert call.call_count == 1

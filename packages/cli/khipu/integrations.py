@@ -2419,6 +2419,55 @@ def _claude_incomplete(rows: list[dict]) -> str:
     return "; ".join(out)
 
 
+def verify_synth_provider() -> dict | None:
+    """Explicit integrations verify only: one subscription call and a capture watch."""
+    from khipu import extract, session_capture, synth_cli
+    from khipu.models import CLI_PROVIDERS, cloud_model_id, synth_settings
+
+    settings = synth_settings()
+    provider = settings["provider"]
+    if provider not in CLI_PROVIDERS:
+        return None
+    out = {"provider": provider, "ok": False, "self_capture": None}
+    started = time.monotonic()
+    with synth_cli.observe_sessions() as sessions:
+        try:
+            adapter = (extract._generate_claude_cli if provider == "claude-cli"
+                       else extract._generate_codex_cli)
+            text = adapter("Reply with exactly the word pong.", model_id=cloud_model_id(settings),
+                           timeout=60, retries=0, caller="verify")
+            out["ok"] = text.strip() == "pong"
+            if not out["ok"]:
+                out["error"] = synth_cli.error_text(text, "Reply with exactly the word pong.",
+                                                   synth_cli.environment())
+        except Exception as exc:  # noqa: BLE001 — adapter errors are already scrubbed
+            out["error"] = synth_cli.error_text(
+                str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__,
+                "Reply with exactly the word pong.", synth_cli.environment())
+        out["ms"] = round((time.monotonic() - started) * 1000)
+        if not sessions:
+            out.update(ok=False, error=out.get("error") or "no CLI session marker observed")
+            return out
+        deadline = time.monotonic() + 3
+        while True:
+            try:
+                state = any(session_capture._state_file(h, sid).exists()
+                            for h in session_capture.HARNESSES for sid in sessions)
+                queued = any(any(session_capture._safe(sid) in path.name for sid in sessions)
+                             for path in session_capture.queue_dir().glob("*"))
+                if state or queued:
+                    out.update(ok=False, self_capture=True)
+                    break
+            except OSError:
+                out.update(ok=False, error="capture watch unavailable")
+                break
+            if time.monotonic() >= deadline:
+                out["self_capture"] = False
+                break
+            time.sleep(0.1)
+    return out
+
+
 def verify(harness: str, *, project: str | None = None, home: str | None = None) -> dict:
     """``home`` (claude_code only): verify that one Claude home. Without it the
     pack is verified in every home that has Khipu; homes without it are listed

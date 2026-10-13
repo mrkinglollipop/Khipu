@@ -98,6 +98,8 @@ def _call_model(prompt: str, *, timeout: float) -> tuple[str, str]:
     from khipu.models import cloud_model_id, synth_settings
 
     settings = synth_settings()
+    if settings.get("provider") in {"claude-cli", "codex-cli"}:
+        raise _Unavailable("rerank needs an API provider")
     if (settings.get("provider") or "cloud").strip().lower() == "local":
         endpoint = (settings.get("endpoint") or "").strip()
         model_id = (settings.get("model_id") or "").strip()
