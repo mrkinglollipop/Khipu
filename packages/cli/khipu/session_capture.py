@@ -90,9 +90,10 @@ MIN_TURNS = int(_env_int("KHIPU_CAPTURE_MIN_TURNS", "KHIPU_AEGIS_MIN_TURNS", "5"
 MIN_MINUTES = float(_env_int("KHIPU_CAPTURE_MIN_MINUTES", "KHIPU_AEGIS_MIN_MINUTES", "20"))
 MIN_CHARS = 200          # a window smaller than this is never worth a model call
 MAX_TRANSCRIPT = 14_000  # chars carried in a job (tail of the window)
-# Parts (= summariser calls = episodes) one capture may queue; the newest are
-# kept. See the window-split note above _split_messages.
-MAX_PARTS_PER_CAPTURE = max(1, int(os.environ.get("KHIPU_CAPTURE_MAX_PARTS", "4")))
+# Parts (= summariser calls = episodes) one capture may queue. 0 (default) =
+# every part; a positive value is the owner's opt-in to keep only the newest.
+# See the window-split note above _split_messages.
+MAX_PARTS_PER_CAPTURE = max(0, int(os.environ.get("KHIPU_CAPTURE_MAX_PARTS", "0")))
 FIRST_SIGHT_TAIL = 1_000_000  # bytes: first sight of a long transcript starts this far from its end
 
 # Liveness thresholds — "the hook is running but nothing is landing".
@@ -310,8 +311,11 @@ def _clean_user_text(text: str) -> str:
 # notifications, messages relayed between sessions, slash-command wrappers. An
 # orchestrator session receives hundreds of them; counted as user turns and
 # rendered in full they made a 398 MB transcript look like 529 turns and queue
-# 104 summariser calls in one capture (2026-10-13). They stay in the window as
-# one line each so the summariser knows they happened.
+# 104 summariser calls in one capture (2026-10-13). None of them counts as a
+# user turn. A relayed cross-session message carries a teammate's words, so its
+# whole body stays (outer tag stripped); a task notification keeps its
+# <summary> text; the rest stay as one line so the summariser knows they
+# happened.
 MACHINE_USER_TAGS = (
     "<task-notification",
     "<cross-session-message",
@@ -320,25 +324,28 @@ MACHINE_USER_TAGS = (
     "<local-command-",
     "<command-name>",
 )
-CROSS_SESSION_KEEP = 240   # a relayed message carries a teammate's words
 _TAG_NAME = re.compile(r"<([A-Za-z][\w-]*)")
 _OUTER_TAG = re.compile(r"^<[^>]*>|</[^>]*>\s*$")
+_SUMMARY = re.compile(r"<summary>(.*?)</summary>", re.S)
 
 
 def _machine_user_message(text: str) -> str | None:
-    """The one-line stand-in for a machine-generated user message, or None
+    """What the window keeps for a machine-generated user message, or None
     when ``text`` (already cleaned) is something the person wrote."""
     head = text.lstrip()
     if not head.startswith(MACHINE_USER_TAGS):
         return None
     m = _TAG_NAME.match(head)
     tag = m.group(1) if m else "notification"
-    n = len(text)
     if tag.startswith("cross-session-"):
-        body = _OUTER_TAG.sub("", head.strip()).strip()
-        clip = body[:CROSS_SESSION_KEEP]
-        return f"{clip}{'…' if len(body) > len(clip) else ' '}[cross-session message, {n:,} chars]"
-    return f"[notification: {tag}, {n:,} chars]"
+        return (_OUTER_TAG.sub("", head.strip()).strip()
+                or f"[notification: {tag}, {len(text):,} chars]")
+    if tag == "task-notification":
+        s = _SUMMARY.search(head)
+        summary = s.group(1).strip() if s else ""
+        if summary:
+            return f"[notification: task-notification] {summary}"
+    return f"[notification: {tag}, {len(text):,} chars]"
 
 
 # Parts Codex prepends to a user response_item that the user never typed:
@@ -773,19 +780,22 @@ def render(msgs: list[tuple[str, str]], *, max_chars: int = MAX_TRANSCRIPT) -> s
     return out
 
 
-# ---- window split (K3, lossless up to MAX_PARTS_PER_CAPTURE) ---------------------
+# ---- window split (K3, lossless by default) --------------------------------------
 #
 # A window over max_chars used to be tail-clipped by render() — the middle was
 # gone, unrecorded. Now it is split on MESSAGE boundaries into several parts,
 # each queued as its own job (chronological, oldest first); every part is
 # extracted into its own episode. Oversize single messages are fragmented too.
 #
-# The split is lossless up to MAX_PARTS_PER_CAPTURE parts and tail-kept beyond
-# it: _enqueue_window queues the newest parts, records the dropped chars as
-# truncated_chars on the first kept part, and still advances the offset past
-# the whole window. With no cap, every part was a model call: on 2026-10-13 one
-# orchestrator session queued 89 and then 104 parts in a morning and ran the
-# Google project into its monthly spending cap.
+# Lossless by default: every part is queued. MAX_PARTS_PER_CAPTURE
+# (KHIPU_CAPTURE_MAX_PARTS) is the owner's opt-in cap: when set,
+# _enqueue_window queues only the newest parts, records the dropped chars as
+# truncated_chars on the first kept part, logs it, and still advances the
+# offset past the whole window. Spend is bounded instead by the synth daily
+# call ceiling (khipu.embed scope "synth", `khipu budget`), which delays
+# captures rather than dropping them; on 2026-10-13 one orchestrator session
+# queued 89 and then 104 parts in a morning and ran the Google project into its
+# monthly spending cap.
 
 
 def _split_messages(msgs: list[tuple[str, str]], max_chars: int) -> list[list[tuple[str, str]]]:
@@ -813,7 +823,7 @@ def _split_messages(msgs: list[tuple[str, str]], max_chars: int) -> list[list[tu
 
 def _window_parts(msgs: list[tuple[str, str]], max_chars: int) -> list[dict[str, Any]]:
     """Chronological parts, each ``{"text": ..., "truncated_chars": ...}``.
-    Lossless; the part cap is applied by ``_enqueue_window``."""
+    Lossless; the opt-in part cap is applied by ``_enqueue_window``."""
     groups = _split_messages(msgs, max_chars)
     return [{"text": render(g, max_chars=max_chars), "truncated_chars": 0} for g in groups]
 
@@ -1573,7 +1583,7 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     # K3: split on message boundaries instead of tail-clipping — every
     # part is queued and extracted into its own episode.
     parts = _window_parts(msgs, MAX_TRANSCRIPT)
-    if len(parts) > MAX_PARTS_PER_CAPTURE:
+    if MAX_PARTS_PER_CAPTURE > 0 and len(parts) > MAX_PARTS_PER_CAPTURE:
         dropped = parts[:-MAX_PARTS_PER_CAPTURE]
         dropped_chars = sum(len(p["text"]) + int(p["truncated_chars"]) for p in dropped)
         parts = [dict(p) for p in parts[-MAX_PARTS_PER_CAPTURE:]]

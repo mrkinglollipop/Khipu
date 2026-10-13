@@ -16,6 +16,14 @@ ROLES = ("synth", "embed", "vision")
 PROVIDERS = frozenset({"cloud", "local"})
 VISION_PROVIDERS = frozenset({"cloud", "local", "off"})
 DEFAULT_SYNTH_MODEL = "gemini-2.5-flash"
+# USD per million tokens for the cloud synth models, used only to estimate
+# spend in `khipu budget status` and doctor. A snapshot of Google's published
+# list prices on 2026-10-13, kept current by hand; thinking tokens bill as
+# output. A model missing here shows its tokens with a null cost.
+PRICES_USD_PER_MTOKEN: dict[str, dict[str, float]] = {
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
+    "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
+}
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 

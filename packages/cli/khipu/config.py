@@ -241,6 +241,53 @@ def set_list_setting(key: str, values: "str | list[str] | tuple[str, ...]") -> P
     return save_config(data)
 
 
+# ---------------------------------------------------------------------------
+# Daily call ceilings (khipu.embed budget scopes), whole numbers >= 0, 0 =
+# unlimited. Unlike the knobs above, the stored value wins over the env: the
+# owner lifts a ceiling with `khipu budget lift` / `khipu config --set` and a
+# launchd plist's env must not silently override that. Read by
+# khipu.embed._budget_cap; unset means "use the env, else the default".
+# ---------------------------------------------------------------------------
+
+INT_SETTINGS: dict[str, str] = {
+    "synth_daily_calls": "synth",
+    "embed_daily_calls": "memory",
+    "library_embed_daily_calls": "library",
+}
+
+
+def int_setting(key: str) -> int | None:
+    """The stored whole number for ``key``, or None when unset or invalid."""
+    if key not in INT_SETTINGS:
+        raise KeyError(f"unknown integer setting {key!r}; known: {sorted(INT_SETTINGS)}")
+    stored = load_config().get(key)
+    if isinstance(stored, int) and not isinstance(stored, bool) and stored >= 0:
+        return stored
+    return None
+
+
+def parse_int_setting(key: str, raw: "str | int") -> int:
+    """``raw`` as a whole number >= 0; ValueError names the key otherwise."""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a whole number >= 0, got {raw!r}") from None
+    if value < 0:
+        raise ValueError(f"{key} must be a whole number >= 0, got {value}")
+    return value
+
+
+def set_int_setting(key: str, value: "int | None") -> Path:
+    if key not in INT_SETTINGS:
+        raise KeyError(f"unknown integer setting {key!r}; known: {sorted(INT_SETTINGS)}")
+    data = _load_config_for_mutation()
+    if value is None:
+        data.pop(key, None)
+    else:
+        data[key] = parse_int_setting(key, value)
+    return save_config(data)
+
+
 def path_settings_status() -> dict:
     """Every path setting with its resolved value and where it came from."""
     out = {}

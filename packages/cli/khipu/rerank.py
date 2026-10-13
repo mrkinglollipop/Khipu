@@ -112,7 +112,7 @@ def _call_model(prompt: str, *, timeout: float) -> tuple[str, str]:
     except RuntimeError as exc:
         raise _Unavailable(str(exc)) from exc
     return extract._generate_cloud(
-        prompt, model_id=model_id, timeout=timeout, retries=0
+        prompt, model_id=model_id, timeout=timeout, retries=0, caller="rerank"
     ), model_id
 
 
