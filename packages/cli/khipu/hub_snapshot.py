@@ -26,6 +26,7 @@ import json
 import math
 import os
 import sqlite3
+import string
 import struct
 import sys
 import tempfile
@@ -79,7 +80,10 @@ _TABLES = (
 # older build's refresh replaces it wholesale, a newer build's incremental
 # writes land on an older file), so readers and incremental writers probe for
 # the table and never trust this number.
-SNAPSHOT_SCHEMA_VERSION = 3
+# Version 4 adds the external-content FTS5 tables `episodes_fts`/`topics_fts`
+# and their triggers; `search_snapshot` uses them when present and falls back
+# to LIKE on a file without them.
+SNAPSHOT_SCHEMA_VERSION = 4
 
 _DELIVERABLE_COLS = (
     "id",
@@ -678,8 +682,9 @@ def _blob_to_vector(blob: bytes) -> list[float]:
 
 
 def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VERSION) -> None:
-    """``version=3`` (default): the current shape, always what ``refresh()``
-    writes for a real dump. ``version=2``: the same without ``deliverables``.
+    """``version=4`` (default): the current shape, always what ``refresh()``
+    writes for a real dump. ``version=3``: the same without the FTS5 tables.
+    ``version=2``: the same without ``deliverables``.
     ``version=1``: the pre-Phase-2B shape (no
     ``decisions`` table, no ``topics.superseded_by``/``event_at``, no
     ``snapshot_meta``) — for tests exercising a reader's tolerance of an
@@ -825,6 +830,48 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
             CREATE INDEX idx_snapshot_deliverables_project ON deliverables (project);
             """
         )
+    if version >= 4:
+        try:
+            con.executescript(_FTS_SCHEMA_SQL)
+        except sqlite3.OperationalError as exc:
+            # A Python whose SQLite lacks FTS5 still writes a usable replica;
+            # search_snapshot finds no FTS tables and stays on LIKE.
+            _log(f"replica FTS tables not created: {exc}")
+
+
+_EPISODE_FTS_COLS = ("summary", "topics", "decisions", "preferences", "people")
+_TOPIC_FTS_COLS = ("body", "slug", "title")
+
+
+def _fts_table_sql(fts: str, base: str, cols: tuple[str, ...]) -> str:
+    """External-content FTS5 table over ``base`` plus the triggers that keep
+    it current, so every writer of ``base`` needs no FTS code. A ``delete``
+    must pass the exact values that were indexed, which ``old.*`` does."""
+    col_list = ", ".join(cols)
+    new_vals = ", ".join(f"new.{c}" for c in cols)
+    old_vals = ", ".join(f"old.{c}" for c in cols)
+    return f"""
+        CREATE VIRTUAL TABLE {fts} USING fts5(
+            {col_list}, content='{base}', content_rowid='rowid',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE TRIGGER {fts}_ai AFTER INSERT ON {base} BEGIN
+            INSERT INTO {fts}(rowid, {col_list}) VALUES (new.rowid, {new_vals});
+        END;
+        CREATE TRIGGER {fts}_ad AFTER DELETE ON {base} BEGIN
+            INSERT INTO {fts}({fts}, rowid, {col_list}) VALUES ('delete', old.rowid, {old_vals});
+        END;
+        CREATE TRIGGER {fts}_au AFTER UPDATE ON {base} BEGIN
+            INSERT INTO {fts}({fts}, rowid, {col_list}) VALUES ('delete', old.rowid, {old_vals});
+            INSERT INTO {fts}(rowid, {col_list}) VALUES (new.rowid, {new_vals});
+        END;
+    """
+
+
+_FTS_SCHEMA_SQL = (
+    _fts_table_sql("episodes_fts", "episodes", _EPISODE_FTS_COLS)
+    + _fts_table_sql("topics_fts", "topics", _TOPIC_FTS_COLS)
+)
 
 
 _EDGE_INDEX_SQL = (
@@ -1632,6 +1679,52 @@ def _token_match_sqlite(
     return " OR ".join(wheres), " + ".join(scores), where_params + score_params
 
 
+FTS_CANDIDATES = 50
+_FTS_STATE: dict[str, Any] = {"key": None, "ready": False}
+_FTS_FALLBACK_LOGGED = False
+_ASCII_FOLD = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def _fts_fallback(reason: str) -> None:
+    global _FTS_FALLBACK_LOGGED
+    if not _FTS_FALLBACK_LOGGED:
+        _FTS_FALLBACK_LOGGED = True
+        _log(f"replica keyword search on LIKE: {reason}")
+
+
+def _fts_ready(con: sqlite3.Connection) -> bool:
+    """Both FTS tables exist on the replica ``con`` reads. One ``sqlite_master``
+    lookup per replica generation (path, mtime, size) per process."""
+    path = snapshot_path()
+    try:
+        st = path.stat()
+        key: tuple[Any, ...] | None = (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None and _FTS_STATE["key"] == key:
+        return _FTS_STATE["ready"]
+    names = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name IN ('episodes_fts', 'topics_fts')"
+    )}
+    ready = names == {"episodes_fts", "topics_fts"}
+    _FTS_STATE.update(key=key, ready=ready)
+    if not ready:
+        _fts_fallback("replica has no FTS tables")
+    return ready
+
+
+def _fts_match_expr(tokens: Sequence[str]) -> str:
+    return " OR ".join('"' + tok.replace('"', '""') + '"*' for tok in tokens)
+
+
+def _like_coverage(texts: Sequence[Any], tokens: Sequence[str]) -> int:
+    """Distinct tokens found as a substring of any text, with SQLite LIKE's
+    ASCII-only case folding: the same count the LIKE path orders by."""
+    folded = [str(t or "").translate(_ASCII_FOLD) for t in texts]
+    return sum(1 for tok in tokens if any(tok in f for f in folded))
+
+
 def _id_shaped(term: str) -> bool:
     """Local copy of ``cli._id_shaped`` (W2.2) — this module must not import
     ``khipu.cli`` (that module already imports from here, and CLI/MCP fall
@@ -1797,6 +1890,27 @@ def search_snapshot(
     def oversample(n: int) -> int:
         return n * 4 if time_filtered and n > 0 else n
 
+    # FTS supplies candidates (prefix terms, bm25 order); the LIKE path's
+    # coverage order is then recomputed over the same columns, so rows both
+    # paths return come back in the same order. A token-less query stays on LIKE.
+    use_fts = bool(search_tokens(query)) and (topic_n > 0 or episode_n > 0) and _fts_ready(con)
+    match_expr = _fts_match_expr(tokens) if use_fts else ""
+
+    def fts_rows(sql: str, params: Sequence[Any], ntext: int, order: Any, n: int) -> list[Any] | None:
+        """Candidates from FTS sorted like the LIKE path; ``None`` on an FTS error."""
+        nonlocal use_fts
+        if not use_fts:
+            return None
+        try:
+            got = con.execute(sql, (match_expr, *params, max(FTS_CANDIDATES, oversample(n)))).fetchall()
+        except sqlite3.OperationalError as exc:
+            use_fts = False
+            _fts_fallback(f"FTS query failed: {exc}")
+            return None
+        order(got)
+        got.sort(key=lambda r: _like_coverage(r[-ntext:], tokens), reverse=True)
+        return [r[:-ntext] for r in got[:oversample(n)]]
+
     if topic_n > 0:
         topic_time_clause = ""
         topic_time_params: list[Any] = []
@@ -1811,9 +1925,25 @@ def search_snapshot(
             ORDER BY {topic_order}
             LIMIT ?
         """
-        split_at = len(topic_params) // 2 if search_tokens(query) else len(topic_params)
-        rows = con.execute(sql, (*topic_params[:split_at], *topic_time_params,
-                                 *topic_params[split_at:], oversample(topic_n))).fetchall()
+        rows = fts_rows(
+            f"""
+            WITH hits AS (
+                SELECT rowid AS rid, bm25(topics_fts) AS score FROM topics_fts WHERE topics_fts MATCH ?
+            )
+            SELECT 'topic' AS kind, slug AS id, COALESCE(title, slug) AS label,
+                   substr(body, 1, 4000) AS snippet, COALESCE(updated_at, created_at) AS ts,
+                   body, slug, COALESCE(title, '')
+            FROM hits JOIN topics ON topics.rowid = hits.rid
+            WHERE deleted_at IS NULL{topic_time_clause}
+            ORDER BY hits.score
+            LIMIT ?
+            """,
+            topic_time_params, 3, lambda got: got.sort(key=lambda r: r[1]), topic_n,
+        )
+        if rows is None:
+            split_at = len(topic_params) // 2 if search_tokens(query) else len(topic_params)
+            rows = con.execute(sql, (*topic_params[:split_at], *topic_time_params,
+                                     *topic_params[split_at:], oversample(topic_n))).fetchall()
         for r in rows:
             if not _in_range(r[4]):
                 continue
@@ -1862,9 +1992,31 @@ def search_snapshot(
         """
         # Token matching binds WHERE and ORDER BY separately; the thread
         # predicate sits between them in SQL and must sit there in params too.
-        split_at = len(episode_params) // 2 if search_tokens(query) else len(episode_params)
-        rows = con.execute(sql, (*episode_params[:split_at], *t3_params,
-                                 *identity_params, *episode_params[split_at:], oversample(episode_n))).fetchall()
+        def episode_sort(got: list[Any]) -> None:
+            # ts DESC, id DESC as SQLite orders it: NULL ts sorts last.
+            got.sort(key=lambda r: int(r[1]), reverse=True)
+            got.sort(key=lambda r: (r[4] is not None, r[4] or ""), reverse=True)
+
+        rows = fts_rows(
+            f"""
+            WITH hits AS (
+                SELECT rowid AS rid, bm25(episodes_fts) AS score FROM episodes_fts WHERE episodes_fts MATCH ?
+            )
+            SELECT 'episode' AS kind, CAST(id AS TEXT) AS id, summary AS label,
+                   summary AS snippet, ts, {session_expr} AS sid,
+                   {project_expr} AS proj, {harness_expr} AS harn,
+                   {", ".join(_episode_ilike_columns())}
+            FROM hits JOIN episodes ON episodes.id = hits.rid
+            WHERE {ep_live}({t3_predicate}){identity_clause}
+            ORDER BY hits.score
+            LIMIT ?
+            """,
+            (*t3_params, *identity_params), len(_episode_ilike_columns()), episode_sort, episode_n,
+        )
+        if rows is None:
+            split_at = len(episode_params) // 2 if search_tokens(query) else len(episode_params)
+            rows = con.execute(sql, (*episode_params[:split_at], *t3_params,
+                                     *identity_params, *episode_params[split_at:], oversample(episode_n))).fetchall()
         for r in rows:
             if not _in_range(r[4]):
                 continue
