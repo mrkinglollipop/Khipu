@@ -13,6 +13,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -354,6 +355,7 @@ class GrokBotPackTest(unittest.TestCase):
                                                                           "auth_refused_wrong_token": True}) as pg, \
                 mock.patch.object(integ, "gateway_liveness_check",
                                    return_value={"ok": True, "applicable": True, "tokens": {}}) as gwl, \
+                mock.patch.object(integ, "_gateway_healthz", side_effect=OSError("offline")), \
                 mock.patch("khipu.probe.run_probe", return_value={"ok": True, "harness": "grok_bot"}):
             v = integ.verify("grok_bot", project=str(self.proj))
         self.assertTrue(v["ok"], v)
@@ -365,6 +367,41 @@ class GrokBotPackTest(unittest.TestCase):
                 mock.patch("khipu.probe.run_probe", return_value={"ok": True, "harness": "grok_bot"}):
             v = integ.verify("grok_bot", project=str(self.proj))
         self.assertFalse(v["ok"])
+
+    def _status_with_healthz(self, healthz):
+        from khipu import integrations as integ
+
+        with mock.patch.object(integ, "_gateway_token", return_value="t" * 30), \
+                mock.patch.object(integ, "_gateway_healthz", side_effect=healthz) as hz:
+            st = integ.status("grok_bot")
+        if hz.called:
+            self.assertLessEqual(hz.call_args.kwargs["timeout"], 5)
+        return st
+
+    def test_status_reads_recent_gateway_traffic_as_installed(self):
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 120))
+        st = self._status_with_healthz(lambda *a, **k: {
+            "gateway_liveness": {"tokens": {"default": {"last_ok_at": recent}}}})
+        self.assertIs(st["installed"], True, st)
+        self.assertIs(st["mcp"], True, st)
+        self.assertEqual(st["last_beat_at"], recent)
+
+    def test_status_reports_unknown_when_the_gateway_is_unreachable(self):
+        def _down(*_a, **_k):
+            raise OSError("connection refused")
+
+        st = self._status_with_healthz(_down)
+        self.assertEqual(st["installed"], "unknown", st)
+        self.assertIs(st["mcp"], False)
+        self.assertIn("unreachable", st["reason"])
+        self.assertIsNone(st["last_beat_at"])
+
+    def test_status_without_a_gateway_is_unchanged(self):
+        with mock.patch.dict(os.environ, {"KHIPU_GATEWAY_URL": ""}):
+            st = self._status_with_healthz(lambda *a, **k: self.fail("no gateway, no call"))
+        self.assertEqual((st["detected"], st["mcp"], st["installed"], st["last_beat_at"]),
+                         (False, False, False, None))
+        self.assertNotIn("reason", st)
 
 
 if __name__ == "__main__":

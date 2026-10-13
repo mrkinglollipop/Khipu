@@ -60,6 +60,7 @@ root exists; an undetected harness is reported, not errored.
 """
 from __future__ import annotations
 
+import calendar
 import contextlib
 import json
 import os
@@ -1073,6 +1074,17 @@ _AEGIS_NATIVE_HOOK_HEADER_RE = re.compile(
     r"(?P<event>Stop|PreCompact|SessionEnd)[ \t]*\.[ \t]*hooks[ \t]*\]\]"
     r"[ \t]*(?:#.*)?$"
 )
+_AEGIS_NATIVE_GROUP_HEADER_RE = re.compile(
+    r"^[ \t]*\[\[[ \t]*hooks[ \t]*\.[ \t]*"
+    r"(?P<event>Stop|PreCompact|SessionEnd)[ \t]*\]\][ \t]*(?:#.*)?$"
+)
+
+
+def _toml_header_path(header: str) -> str:
+    """`[[ hooks . Stop . hooks ]] # x` -> `hooks.Stop.hooks` (bare keys only)."""
+    return re.sub(r"[ \t]", "", header.split("#", 1)[0]).strip("[]")
+
+
 # [memory] is NOT Khipu-owned the way [mcp_servers.khipu] is — it is Aegis's
 # own choice of memory backend, which some other tool may already claim. Only
 # used to detect whether the table exists at all; install never rewrites it
@@ -1203,6 +1215,32 @@ def _remove_native_aegis_hooks(text: str) -> str:
             removed.append((header.start(), end))
     if not removed:
         return text
+    # A `[[hooks.<Event>]]` parent whose every child table went above would be
+    # left as an empty group, which Grok Build rejects ("missing field `hooks`").
+    # Drop it too, but only when it holds nothing of its own (no matcher, no
+    # comment, no foreign child).
+    owned = list(removed)
+    for index, header in enumerate(headers):
+        if any(start <= header.start() < end for start, end in managed_spans):
+            continue
+        parent = _AEGIS_NATIVE_GROUP_HEADER_RE.match(header.group(0))
+        if parent is None:
+            continue
+        prefix = f"hooks.{parent.group('event')}."
+        children = []
+        for child in headers[index + 1:]:
+            if (any(start <= child.start() < end for start, end in managed_spans)
+                    or not _toml_header_path(child.group(0)).startswith(prefix)):
+                break
+            children.append(child)
+        if not children or not all(any(start <= child.start() < end for start, end in owned)
+                                   for child in children):
+            continue
+        end = min([children[0].start()] + [start for start, _stop in managed_spans
+                                           if header.start() < start < children[0].start()])
+        if not text[header.end():end].strip():
+            removed.append((header.start(), end))
+    removed.sort()
     pieces: list[str] = []
     cursor = 0
     for start, end in removed:
@@ -1699,22 +1737,61 @@ def _grok_bot_uninstall(dry: bool, project: str | None = None) -> dict:
     return out
 
 
+GROK_BOT_LIVE_WITHIN_S = 7 * 24 * 3600
+GROK_BOT_STATUS_TIMEOUT_S = 3
+
+
+def _grok_bot_liveness(url: str) -> dict:
+    """installed / last_beat_at from the gateway's own record of the primary
+    ("default") token's last successful call — the only evidence of an
+    account-level install Khipu can read. Fail-open: unreachable is "unknown"."""
+    token = _gateway_token()
+    if not token:
+        return {"installed": "unknown",
+                "reason": f"no gateway token ({GROK_BOT_TOKEN_ENV} or Keychain gateway_token)"}
+    try:
+        body = _gateway_healthz(url, token, timeout=GROK_BOT_STATUS_TIMEOUT_S)
+        entry = body["gateway_liveness"]["tokens"].get("default") or {}
+    except Exception as e:  # noqa: BLE001 — status must never crash on the network
+        return {"installed": "unknown", "reason": f"gateway unreachable: {type(e).__name__}"}
+    last_ok = entry.get("last_ok_at") if isinstance(entry, dict) else None
+    if not isinstance(last_ok, str):
+        return {"installed": False, "reason": "gateway has no successful call recorded"}
+    try:
+        age = time.time() - calendar.timegm(time.strptime(last_ok, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return {"installed": "unknown", "reason": f"unreadable last_ok_at {last_ok!r}"}
+    if age > GROK_BOT_LIVE_WITHIN_S:
+        return {"installed": False, "last_beat_at": last_ok,
+                "reason": "no successful gateway call in the last 7 days"}
+    return {"installed": True, "last_beat_at": last_ok}
+
+
 def _grok_bot_status(project: str | None = None) -> dict:
     d = _load_json(_grok_bot_mcp_path(project)) if project else {}
     entry = d.get("mcpServers", {}).get(GROK_BOT_SERVER, {})
     from khipu.config import gateway_url
 
-    return {"harness": "grok_bot", "detected": _grok_bot_detected(),
-            "gateway_url": gateway_url() or None,
-            # Account-level config lives in Cursor's cloud settings (a UI, not a
-            # file), so Khipu cannot read it: `mcp` reports the optional per-repo
-            # pin only. The authoritative check is `verify`, which probes the
-            # gateway itself, plus a real cloud-agent call in the gateway log.
-            "mcp": bool(entry) and entry.get("url", "").startswith(gateway_url() or "\0"),
-            "scope": "account_level (every repo) + optional per-repo pin",
-            "hook_stop": False, "hook_precompact": False,
-            "recall_rule": "mcp_instructions", "extract": "mcp_capture",
-            "project": project}
+    url = gateway_url()
+    out = {"harness": "grok_bot", "detected": _grok_bot_detected(),
+           "gateway_url": url or None,
+           # Account-level config lives in Cursor's cloud settings (a UI, not a
+           # file), so Khipu cannot read it: `mcp` is the optional per-repo pin
+           # OR recent traffic on the gateway itself. `verify` stays the
+           # authoritative end-to-end check.
+           "mcp": bool(entry) and entry.get("url", "").startswith(url or "\0"),
+           "scope": "account_level (every repo) + optional per-repo pin",
+           "hook_stop": False, "hook_precompact": False,
+           "recall_rule": "mcp_instructions", "extract": "mcp_capture",
+           "project": project}
+    if url:
+        live = _grok_bot_liveness(url)
+        out["mcp"] = out["mcp"] or live["installed"] is True
+        out["installed"] = True if out["mcp"] else live["installed"]
+        out["last_beat_at"] = live.get("last_beat_at")
+        if "reason" in live and out["installed"] is not True:
+            out["reason"] = live["reason"]
+    return out
 
 
 # ---- gateway bearer token file (Aegis's own resolution order) ----------------
@@ -1878,6 +1955,14 @@ def aegis_gateway_check() -> dict:
     return out
 
 
+def _gateway_healthz(url: str, token: str, *, timeout: float) -> Any:
+    import urllib.request
+
+    req = urllib.request.Request(url + "/healthz", headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
 def gateway_liveness_check() -> dict[str, Any]:
     """K9: read the gateway's own per-token last_ok_at/last_error_at back
     over the network (doctor runs on a different machine than the gateway)
@@ -1885,9 +1970,6 @@ def gateway_liveness_check() -> dict[str, Any]:
     last 24h had an error for a token and no success since; info when there
     is simply no traffic recorded yet. Applicable only when gateway_url is
     configured; deploying the gateway itself is the maintainer's step."""
-    import urllib.error
-    import urllib.request
-
     from khipu.config import gateway_url
 
     url = gateway_url()
@@ -1898,9 +1980,7 @@ def gateway_liveness_check() -> dict[str, Any]:
         return {"ok": False, "applicable": True,
                 "error": f"gateway_url configured but no bearer token ({GROK_BOT_TOKEN_ENV} or Keychain gateway_token)"}
     try:
-        req = urllib.request.Request(url + "/healthz", headers={"Authorization": f"Bearer {token}"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = json.loads(resp.read().decode())
+        body = _gateway_healthz(url, token, timeout=10)
     except Exception as e:  # noqa: BLE001 — a network hiccup is red, not a crash
         return {"ok": False, "applicable": True, "error": f"{type(e).__name__}: {e}",
                 "fix": "check the gateway is running and reachable"}
