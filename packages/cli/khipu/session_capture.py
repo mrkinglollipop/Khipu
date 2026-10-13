@@ -698,12 +698,54 @@ def land_transcript_images(
     return stats
 
 
-def read_window(path: Path, offset: int) -> tuple[list[tuple[str, str]], int, int]:
+# Claude Code writes the retained conversation back into the transcript after
+# every compaction: the same messages again, at new offsets, with new uuids
+# (timestamps are no marker; copies carry old and new ones). Reading forward
+# from the offset captured every copy again; one 398 MB orchestrator transcript
+# had 25,054 assistant lines for 2,483 distinct messages (2026-10-13). The
+# capture paths pass the session's fingerprints of already-captured messages
+# and an exact copy is dropped: nothing is lost.
+SEEN_TEXT_MAX = 60_000
+# Short messages ("ok", "yes", "continue") recur legitimately across a session
+# and must keep counting as turns; only messages at least this long are
+# fingerprinted. A re-emitted short copy costs nothing to summarise again.
+FINGERPRINT_MIN_CHARS = 40
+
+
+def text_fingerprint(role: str, text: str) -> str:
+    return hashlib.sha1(f"{role}\n{text}".encode("utf-8")).hexdigest()[:16]
+
+
+def remember_seen(st: dict, fresh: list[str]) -> None:
+    """Append ``fresh`` fingerprints to the state's ``seen_text`` (newest last),
+    bounded at SEEN_TEXT_MAX."""
+    if fresh:
+        st["seen_text"] = (list(st.get("seen_text") or []) + fresh)[-SEEN_TEXT_MAX:]
+
+
+def read_window(path: Path, offset: int, *, seen: Any = None,
+                stats: dict | None = None) -> tuple[list[tuple[str, str]], int, int]:
     """Parse the transcript from ``offset``. Returns (messages, new_offset,
     user_turns). Consecutive same-role text is coalesced; tool calls become
-    one-line markers; thoughts / reasoning / meta lines are dropped."""
+    one-line markers; thoughts / reasoning / meta lines are dropped.
+
+    With ``seen`` (fingerprints already captured in this session), a user or
+    assistant message whose fingerprint is in ``seen`` or earlier in this
+    window is dropped and is not a user turn. ``stats`` then receives
+    ``deduped_msgs``, ``deduped_chars`` and ``fresh`` (the window's new
+    fingerprints, oldest first), to be remembered only once the window is
+    captured: the offset does not move on a not-due run, and the next run
+    must still see these messages. ``skip_to`` is the byte offset just past
+    the window's leading run of lines that held nothing but already-seen
+    copies: a not-due run may move the offset there without losing anything,
+    so a 60 MB re-emission is not re-parsed on every Stop until a real turn."""
     msgs: list[tuple[str, str]] = []
     users = 0
+    known = set(seen) if seen is not None else None
+    fresh: list[str] = []
+    dropped = dropped_chars = 0
+    if stats is not None:
+        stats.update(deduped_msgs=0, deduped_chars=0, fresh=fresh, skip_to=offset)
     try:
         size = path.stat().st_size
     except OSError:
@@ -717,9 +759,11 @@ def read_window(path: Path, offset: int) -> tuple[list[tuple[str, str]], int, in
     if data and not data.endswith(b"\n"):  # partial trailing line: leave it for next time
         cut = data.rfind(b"\n")
         data, end = (data[:cut + 1], offset + cut + 1) if cut >= 0 else (b"", offset)
-    parsed: list[tuple[dict, str, str]] = []
-    for raw in data.decode("utf-8", "replace").splitlines():
-        raw = raw.strip()
+    parsed: list[tuple[dict, str, str, int]] = []
+    line_end = offset
+    for raw_bytes in data.split(b"\n"):
+        line_end += len(raw_bytes) + 1
+        raw = raw_bytes.decode("utf-8", "replace").strip()
         if not raw:
             continue
         try:
@@ -728,19 +772,20 @@ def read_window(path: Path, offset: int) -> tuple[list[tuple[str, str]], int, in
             continue
         if not isinstance(d, dict) or d.get("isMeta"):
             continue
-        parsed.extend((d, role, text) for role, text in _parse_line(d))
+        parsed.extend((d, role, text, min(line_end, end)) for role, text in _parse_line(d))
     # Codex rollouts: event_msg turns win; response_item turns are the
     # fallback for rollouts that carry no event_msg at all.
-    has_event_turns = any(r in ("user", "assistant") and d.get("type") == "event_msg" for d, r, _ in parsed)
-    items: list[tuple[dict, str, str]] = []
-    for d, role, text in parsed:
+    has_event_turns = any(r in ("user", "assistant") and d.get("type") == "event_msg" for d, r, _, _ in parsed)
+    items: list[tuple[dict, str, str, int]] = []
+    for d, role, text, line_end in parsed:
         if role.startswith("codex:"):
             if has_event_turns:
                 continue
             role = role[6:]
-        items.append((d, role, text))
+        items.append((d, role, text, line_end))
     last_user_counted = False   # the open user block already holds a real turn
-    for d, role, text in items:
+    head_open = True            # every message so far was an already-seen copy
+    for d, role, text, line_end in items:
         real = False
         if role == "user":
             text = _clean_user_text(text)
@@ -752,11 +797,32 @@ def read_window(path: Path, offset: int) -> tuple[list[tuple[str, str]], int, in
                 text = stand_in
         if role == "tool":
             msgs.append(("tool", text))
+            head_open = False
             continue
+        streamed = isinstance(d.get("params"), dict)
+        if known is not None and not streamed and len(text) >= FINGERPRINT_MIN_CHARS:
+            # ACP chunks are fragments of one message (" the", "\n"), never
+            # whole messages, so they are not fingerprinted.
+            fp = text_fingerprint(role, text)
+            if fp in known:
+                dropped += 1
+                dropped_chars += len(text)
+                if head_open and stats is not None:
+                    stats["skip_to"] = line_end
+                continue
+            known.add(fp)
+            fresh.append(fp)
+        if head_open and d.get("isCompactSummary") and stats is not None:
+            # Claude Code's own summary sits ahead of the copies it re-emits;
+            # it leaves the head open and rides along (``carry``) when the
+            # offset later steps past both.
+            stats.setdefault("carry", []).append((role, text))
+        else:
+            head_open = False
         if msgs and msgs[-1][0] == role:
             # ACP streams chunks (concatenate); the others emit whole
             # messages (join on a newline).
-            sep = "" if isinstance(d.get("params"), dict) else "\n"
+            sep = "" if streamed else "\n"
             msgs[-1] = (role, msgs[-1][1] + sep + text)
         else:
             msgs.append((role, text))
@@ -765,6 +831,8 @@ def read_window(path: Path, offset: int) -> tuple[list[tuple[str, str]], int, in
         if real and not last_user_counted:
             users += 1
             last_user_counted = True
+    if stats is not None:
+        stats.update(deduped_msgs=dropped, deduped_chars=dropped_chars)
     return msgs, end, users
 
 
@@ -1466,7 +1534,8 @@ def _heartbeat_unlocked(harness: str, out: dict) -> None:
     beat = _read_beat(harness)
     # Per-run fields are replaced wholesale: a "no transcript" run must not
     # inherit the previous run's new_turns/queued and look like it captured.
-    for k in ("event", "session_id", "due", "reason", "new_turns", "new_chars", "queued", "error"):
+    for k in ("event", "session_id", "due", "reason", "new_turns", "new_chars", "queued", "error",
+              "deduped_msgs", "deduped_chars"):
         beat.pop(k, None)
     beat.update({k: v for k, v in out.items()
                  if k not in ("transcript", "transcript_missing", "transcript_never_written",
@@ -1567,7 +1636,7 @@ def _redact_messages(msgs: list[tuple[str, str]], harness: str, sid: str) -> lis
 def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: str,
                     path: Path, st: dict, msgs: list[tuple[str, str]], new_off: int,
                     turns: int, job_parent: str | None = None, capture_note: str = "",
-                    preserve_mtime: bool = False) -> list[str]:
+                    preserve_mtime: bool = False, fresh_seen: list[str] | None = None) -> list[str]:
     """Queue every part before advancing the shared capture offset."""
     off_before = int(st.get("offset", 0))
     # W1.2/W1.3: resolve identity from the cwd, not the model. Never
@@ -1619,6 +1688,7 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     now = time.time()
     st.update(offset=new_off, last_ts=now, window_started_ts=now,
               queued=int(st.get("queued", 0)) + len(queued_names))
+    remember_seen(st, fresh_seen or [])
     save_state(harness, track_sid, st, preserve_mtime=preserve_mtime)
     return queued_names
 
@@ -1724,7 +1794,13 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                                                  "window_started_ts": time.time(), "captures": 0,
                                                  "transcript_path": str(path)})
             st = load_state(harness, track_sid)
-            msgs, new_off, turns = read_window(path, int(st.get("offset", 0)))
+            dedupe: dict[str, Any] = {}
+            msgs, new_off, turns = read_window(path, int(st.get("offset", 0)),
+                                               seen=st.get("seen_text") or (), stats=dedupe)
+            if dedupe.get("deduped_msgs"):
+                out.update(deduped_msgs=dedupe["deduped_msgs"], deduped_chars=dedupe["deduped_chars"])
+            carried = [tuple(m) for m in st.pop("carry", None) or []]
+            msgs = carried + msgs
             # Secrets never reach the summariser: a pasted key or a password in a
             # DSN is masked here, per message, before the window is queued to disk.
             from khipu.redact import redact_secrets
@@ -1779,14 +1855,23 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                         harness=harness, sid=track_sid if is_subagent_stop else sid, track_sid=track_sid,
                         cwd=session_cwd(env), event=event, path=path, st=st, msgs=msgs,
                         new_off=new_off, turns=turns, job_parent=st["parent_session_id"],
-                        capture_note=capture_note,
+                        capture_note=capture_note, fresh_seen=dedupe.get("fresh"),
                     )
                     out["queued"] = queued_names[0] if len(queued_names) == 1 else queued_names
                     if queued_names and capture_now is not None:
                         _ack_capture_now(harness, track_sid, capture_now)
+                    deduped = (f", deduped={dedupe['deduped_msgs']} msgs/{dedupe['deduped_chars']} chars"
+                               if dedupe.get("deduped_msgs") else "")
                     _log(f"{harness}:{sid}: {event} due ({reason}) -> queued {len(queued_names)} part(s) "
-                         f"({turns} turns, {len(full_text)} chars)")
+                         f"({turns} turns, {len(full_text)} chars{deduped})")
                 else:
+                    # Leading already-seen copies hold nothing to capture: step
+                    # past them so the next run does not re-parse them.
+                    if int(dedupe.get("skip_to") or 0) > int(st.get("offset", 0)):
+                        st["offset"] = dedupe["skip_to"]
+                        carried += dedupe.get("carry") or []
+                    if carried:
+                        st["carry"] = carried
                     save_state(harness, track_sid, st)
     except Exception as e:  # noqa: BLE001 — a hook must never fail a session
         out["error"] = f"{type(e).__name__}: {e}"
@@ -1903,9 +1988,12 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                         continue
                     try:
                         out["read"] += 1
-                        msgs, new_off, turns = read_window(path, offset)
+                        dedupe: dict[str, Any] = {}
+                        msgs, new_off, turns = read_window(path, offset, seen=st.get("seen_text") or (),
+                                                           stats=dedupe)
                         sid = str(st.get("session_id") or track_sid)
-                        msgs = _redact_messages(msgs, harness, sid)
+                        carried = [tuple(m) for m in st.get("carry") or []]
+                        msgs = _redact_messages(carried + msgs, harness, sid)
                         chars = len(render(msgs, max_chars=10**9))
                         latest = path.stat()
                         if (latest.st_mtime_ns, latest.st_size) != (info.st_mtime_ns, info.st_size) \
@@ -1924,6 +2012,8 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                         if not (idle_due or (chars >= MIN_CHARS and (turns or assistant_only))):
                             skip("nothing_new")
                             if not dry_run:
+                                if not dedupe.get("carry"):
+                                    st["offset"] = max(offset, int(dedupe.get("skip_to") or 0))
                                 save_state(harness, track_sid, st, preserve_mtime=True)
                             continue
                         if dry_run:
@@ -1933,11 +2023,12 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                                 "idle_minutes": (now - max(float(seen), info.st_mtime)) / 60,
                             })
                         else:
+                            st.pop("carry", None)  # now part of msgs
                             names = _enqueue_window(
                                 harness=harness, sid=sid, track_sid=track_sid, cwd=cwd,
                                 event="idle_sweep", path=path, st=st, msgs=msgs,
                                 new_off=new_off, turns=turns, job_parent=st.get("parent_session_id"),
-                                preserve_mtime=True,
+                                preserve_mtime=True, fresh_seen=dedupe.get("fresh"),
                             )
                             out["jobs"] += len(names)
                             _log(f"sweep {harness}:{sid}: queued {len(names)} part(s) "

@@ -209,8 +209,8 @@ class IdleSweepTest(unittest.TestCase):
         path, st = self.session()
         real_read = sc.read_window
 
-        def read(*args):
-            result = real_read(*args)
+        def read(*args, **kw):
+            result = real_read(*args, **kw)
             st["seen_ts"] = self.now
             sc.save_state("codex", "s1", st)
             return result
@@ -417,10 +417,10 @@ class IdleSweepTest(unittest.TestCase):
         os.utime(new_path, (self.old + 1, self.old + 1))
         real_read = sc.read_window
 
-        def read(path, offset):
+        def read(path, offset, **kw):
             if path == new_path:
                 raise OSError("cannot read")
-            return real_read(path, offset)
+            return real_read(path, offset, **kw)
 
         with mock.patch.object(sc, "read_window", side_effect=read) as reader:
             self.assertEqual(sc.sweep_idle(now=self.now, limit=1)["skipped"]["error"], 1)
