@@ -197,6 +197,70 @@ class AegisTomlTest(_AegisConfigCase):
         self.assertIn('command = "/opt/other"', text)
         tomllib.loads(text)
 
+    def _grok_normalized(self, event: str) -> str:
+        # The shape Grok Build writes back: blank lines between tables.
+        return (
+            f'[[hooks.{event}]]\n\n[[hooks.{event}.hooks]]\ntype = "command"\n'
+            f'command = "{integ.aegis_capture_hook()}"\ntimeout = 15\n\n'
+            f'[hooks.{event}.hooks.env]\nKHIPU_HARNESS = "aegis"\n\n'
+        )
+
+    def _assert_no_empty_groups(self, parsed: dict) -> None:
+        for event, groups in parsed.get("hooks", {}).items():
+            for group in groups:
+                self.assertTrue(group.get("hooks"), (event, group))
+
+    def test_doubled_normalized_config_installs_to_one_hook_per_event(self):
+        events = ("Stop", "PreCompact", "SessionEnd")
+        self.config.write_text('model = "x"\n\n' + "".join(
+            self._grok_normalized(event) for _ in range(2) for event in events))
+
+        integ.install("aegis")
+        parsed = tomllib.loads(self.config.read_text())
+        self._assert_no_empty_groups(parsed)
+        for event in events:
+            self.assertEqual(len(parsed["hooks"][event]), 1, event)
+            self.assertEqual(len(parsed["hooks"][event][0]["hooks"]), 1, event)
+            self.assertEqual(parsed["hooks"][event][0]["hooks"][0]["command"],
+                             integ.aegis_capture_hook())
+        self.assertEqual(parsed["model"], "x")
+        self.assertEqual(integ.install("aegis")["changes"], [])
+
+    def test_parent_holding_a_foreign_hook_keeps_parent_and_foreign_hook(self):
+        self.config.write_text(
+            self._grok_normalized("Stop") +
+            '[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "/opt/foreign"\n\n'
+            '[[hooks.PreCompact]]\nmatcher = "auto"\n\n' +
+            self._grok_normalized("PreCompact")[len("[[hooks.PreCompact]]\n\n"):]
+        )
+
+        integ.install("aegis")
+        parsed = tomllib.loads(self.config.read_text())
+        self._assert_no_empty_groups({"hooks": {"Stop": parsed["hooks"]["Stop"]}})
+        foreign = [group for group in parsed["hooks"]["Stop"]
+                   if any(h["command"] == "/opt/foreign" for h in group["hooks"])]
+        self.assertEqual(len(foreign), 1)
+        self.assertEqual([h["command"] for h in foreign[0]["hooks"]], ["/opt/foreign"])
+        # A parent with its own content (matcher) is never removed.
+        self.assertTrue(any(group.get("matcher") == "auto"
+                            for group in parsed["hooks"]["PreCompact"]))
+
+        integ.uninstall("aegis")
+        parsed = tomllib.loads(self.config.read_text())
+        self.assertEqual([h["command"] for group in parsed["hooks"]["Stop"]
+                          for h in group["hooks"]], ["/opt/foreign"])
+
+    def test_uninstall_on_normalized_shape_leaves_no_empty_groups(self):
+        self.config.write_text('[mcp_servers.khipu]\ncommand = "x"\n\n' + "".join(
+            self._grok_normalized(event) for event in ("Stop", "PreCompact", "SessionEnd")) +
+            '[[hooks.UserPromptSubmit]]\n\n[[hooks.UserPromptSubmit.hooks]]\n'
+            'type = "command"\ncommand = "/opt/foreign"\n')
+
+        integ.uninstall("aegis")
+        parsed = tomllib.loads(self.config.read_text())
+        self._assert_no_empty_groups(parsed)
+        self.assertEqual(set(parsed["hooks"]), {"UserPromptSubmit"})
+
     def test_codex_trailing_comment_header_round_trips(self):
         config = integ.CODEX_TOML
         config.parent.mkdir()
