@@ -262,7 +262,8 @@ def _generate_gemini(prompt: str, *, model_id: str, timeout: int, retries: int,
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model_id}:generateContent"
     )
-    headers = {"Content-Type": "application/json", "x-goog-api-key": _key()}
+    key = _key()
+    headers = {"Content-Type": "application/json", "x-goog-api-key": key}
     body = json.dumps({
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         # 2.5-flash "thinks" by default and thinking tokens count against
@@ -286,13 +287,27 @@ def _generate_gemini(prompt: str, *, model_id: str, timeout: int, retries: int,
             parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
             return "".join(p.get("text", "") for p in parts)
         except urllib.error.HTTPError as e:
-            last = RuntimeError(f"HTTP {e.code}")
+            last = RuntimeError(_http_error_text(e, key))
             if e.code < 500 and e.code != 429:
                 break
         except Exception as e:  # noqa: BLE001 — network / timeout; retry
             last = RuntimeError(type(e).__name__)
         time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"extract: model call failed: {last}")
+
+
+def _http_error_text(exc: urllib.error.HTTPError, key: str) -> str:
+    """``HTTP <code>: <body>`` with the body cut to 300 chars and the key value
+    masked. The body is what tells a spending cap from a rate limit (the
+    2026-10-13 incident was diagnosed from it); OpenAI echoes a masked key in
+    401 bodies, so the key is removed before the text can reach a log."""
+    try:
+        body = exc.read().decode("utf-8", "replace")[:300]
+    except Exception:  # noqa: BLE001 — the body is a courtesy
+        body = ""
+    if key:
+        body = body.replace(key, "***")
+    return f"HTTP {exc.code}: {body}" if body else f"HTTP {exc.code}"
 
 
 def _generate_cloud(prompt: str, **kwargs) -> str:
@@ -338,7 +353,7 @@ def _generate_api(prompt: str, *, provider: str, model_id: str, timeout: int,
                                if isinstance(part.get("text"), str))
             return str(data["choices"][0]["message"].get("content") or "")
         except urllib.error.HTTPError as exc:
-            last = RuntimeError(f"HTTP {exc.code}")
+            last = RuntimeError(_http_error_text(exc, key))
             if exc.code < 500 and exc.code != 429:
                 break
         except Exception as exc:  # noqa: BLE001 — same retry policy as Gemini

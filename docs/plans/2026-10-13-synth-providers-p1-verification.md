@@ -1,7 +1,7 @@
 # Summariser providers, phase 1: local verification
 
 Branch: `feat/synth-providers-p1`. Base: `844b6f0eaad8e59706e9d4afb1ef8383228d6262`.
-Worktree: `/Volumes/Cloud Storage/Code/Khipu/.claude/worktrees/synth-providers`.
+Worktree: a build worktree on branch `feat/synth-providers-p1`.
 
 Implemented Gemini/Anthropic/OpenAI synth adapters, provider defaults and alias normalization,
 credential resolution, cached-token usage and cost accounting, budget breakdowns, and doctor presence checks.
@@ -36,7 +36,7 @@ No live provider calls or online price checks were performed. Prices use the sup
 Provider quality/default promotion requires the separate scope quality gate; this phase makes no recommendation.
 
 The requested commit could not be created: the initial `git add` failed before staging with:
-`fatal: Unable to create '/Volumes/Cloud Storage/Code/Khipu/.git/worktrees/synth-providers/index.lock': Operation not permitted`.
+`fatal: Unable to create '<repo>/.git/worktrees/<name>/index.lock': Operation not permitted`.
 No merge, push, or pull request was performed. Changes remain in the requested worktree.
 Intended commit message:
 
