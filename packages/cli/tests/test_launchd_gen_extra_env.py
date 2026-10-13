@@ -34,6 +34,15 @@ def test_rendered_plist_redirects_bytecode_cache_outside_bundle():
         assert "Caches/Khipu/pycache" in env["PYTHONPYCACHEPREFIX"], job
 
 
+def test_recall_daemon_is_the_only_job_exempt_from_launchd_throttling():
+    """A job with no ProcessType gets launchd's CPU and I/O throttle. The
+    recall daemon answers inside a prompt's 1.2 s; the batch jobs must keep
+    the throttle so they never compete with the user's own work."""
+    assert plistlib.loads(launchd_gen.render_plist("recall_daemon"))["ProcessType"] == "Interactive"
+    for job in ("nightly", "monthly", "graph_build", "notes_watch", "queue_drain"):
+        assert "ProcessType" not in plistlib.loads(launchd_gen.render_plist(job)), job
+
+
 def test_queue_drain_plist_runs_sessions_drain_every_5_min():
     """K10: the Aegis capture queue had no drainer of its own."""
     data = plistlib.loads(launchd_gen.render_plist("queue_drain"))

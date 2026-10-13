@@ -6,7 +6,11 @@
      answers over a Unix socket, so a prompt no longer pays for a fresh
      interpreter. KeepAlive because it exits on purpose when the package's code
      changes on disk (a git pull) and must come back on the new code; nothing
-     depends on it, since the hook falls back to the one-shot path. -->
+     depends on it, since the hook falls back to the one-shot path.
+     ProcessType Interactive: without it launchd throttles the job's CPU and I/O
+     (it ran at priority 20 against 31 for every build on the machine), and a
+     prompt has 1.2 s; under a load average of 67 that throttle alone cost the
+     lane its budget (2026-10-13). -->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -32,6 +36,8 @@
 	<string>{{WORKING_DIRECTORY}}</string>
 	<key>KeepAlive</key>
 	<true/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
 	<key>StandardOutPath</key>
