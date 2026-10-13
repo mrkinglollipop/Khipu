@@ -317,7 +317,7 @@ class ExportTest(unittest.TestCase):
                 for p in patches:
                     p.stop()
             self.assertTrue(out["ok"], out)
-            self.assertEqual(out["schema_version"], 3)
+            self.assertEqual(out["schema_version"], hs.SNAPSHOT_SCHEMA_VERSION)
             self.assertEqual(out["counts"]["deliverables"], 1)
             con = sqlite3.connect(str(snap))
             try:
@@ -326,7 +326,7 @@ class ExportTest(unittest.TestCase):
                     con.execute(
                         "SELECT value FROM snapshot_meta WHERE key = 'schema_version'"
                     ).fetchone()[0],
-                    "3",
+                    str(hs.SNAPSHOT_SCHEMA_VERSION),
                 )
             finally:
                 con.close()

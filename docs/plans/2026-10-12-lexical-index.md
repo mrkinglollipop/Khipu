@@ -9,11 +9,11 @@ Related: `2026-10-11-replica-freshness.md` (same file, different problem), the p
 
 | Phase | What | State |
 |---|---|---|
-| 0 | Per-prompt lane cost outside the lexical leg (graph leg once, edge indexes, slug map, stale-served matrix) | in flight 2026-10-12, branch `fix/per-prompt-lane-cost`; merge and soak one night before phase 1 |
-| 1 | FTS5 index on the replica for topics and episodes, LIKE kept as the fallback | open |
+| 0 | Per-prompt lane cost outside the lexical leg (graph leg once, edge indexes, slug map, stale-served matrix) | done 2026-10-12 (PRs #151, #152) |
+| 1 | FTS5 index on the replica for topics and episodes, LIKE kept as the fallback | done 2026-10-13, brought forward at Matt's request (he needed to run many agents that night). Built as a **trigram** index with coverage counted in SQL, not as decision 2 below first said; see "What the build found" |
 | 2 | Retire the LIKE path once two nightlies have refreshed the index and the eval control is unchanged | open |
 
-One PR per phase, merged alone and soaked. Phase 1 waits for a clean nightly after phase 0.
+One PR per phase, merged alone and soaked.
 
 ## The defect, in one paragraph
 
@@ -55,15 +55,15 @@ copy built in 372 ms.
 ## Decisions
 
 1. **External-content FTS5 tables, one per kind** (`episodes_fts` over the five episode columns,
-   `topics_fts` over body, slug, title), `content=` the base table so the index holds no copy of the text
-   and the replica grows by the index alone (tens of MB, not a second copy of 20 MB). Triggers on the base
-   tables keep them current, so `upsert_episode` and the topic insert need no new code and cannot drift.
-   Tokenizer `unicode61` with `remove_diacritics 2`.
-2. **Query semantics stay substring-like where it matters.** Each token becomes a prefix term (`tok*`), OR-ed,
-   so `change` still finds `changed` and `changes`; it no longer finds `unchanged`. The candidate set comes
-   from FTS (top 50 by `bm25`), and the coverage order is recomputed in Python with the existing
-   `token_hit_count` over the same columns, so the result order for any row the old path also returned is
-   unchanged. This is the stop-condition the eval control checks.
+   `topics_fts` over body, slug, title), `content=` the base table so the index holds no copy of the text.
+   Triggers on the base tables keep them current, so `upsert_episode` and the topic insert need no new
+   code and cannot drift. Tokenizer `trigram` (see decision 2); the replica grew by 72 MB.
+2. **The FTS path returns the same rows in the same order as LIKE; only the speed changes.** Tokenizer
+   `trigram`, so a quoted token is a substring match exactly as `LIKE '%tok%'` is. Coverage (how many
+   distinct tokens hit any indexed column) is counted in SQL (`UNION ALL` of one `MATCH` per token,
+   `GROUP BY rowid`) and ordered with the LIKE path's own tie-breaks. A query with any token under three
+   characters goes to LIKE whole. `bm25` is not used. *(Superseded text: this decision first said unicode61
+   prefix terms with a bm25 top-50 pool; that was wrong, see below.)*
 3. **LIKE stays as the fallback** while the file lacks the FTS tables (a replica built by older code,
    until the next refresh) or an FTS query raises. Detection is one `sqlite_master` lookup cached per
    process per replica identity. Phase 2 removes the fallback only after two nightly refreshes and an
@@ -96,3 +96,24 @@ Read this page, then inspect `_create_schema`, `refresh()`, `search_snapshot`, `
 Stop conditions: if the eval control changes, stop and show the diff rather than loosening the comparison;
 if the index build in `refresh()` adds more than 60 s to the nightly dump, stop and report; if either Python
 turns out to lack FTS5 on another machine, the fallback must carry it, never an import-time failure.
+
+## What the build found (2026-10-13)
+
+- The first build followed the original decision 2 (unicode61, prefix terms, bm25 top 50). On a copy of the
+  live replica it returned the same rows as LIKE for 2 of 9 real queries: bm25 penalises long rows (a note
+  holding 6 of 7 query tokens ranked 221st of 829), and a prefix term cannot find a token inside a longer
+  word. The fixture corpus was too small to show it. Lesson: an order-preservation claim needs a parity run
+  on real data, not a fixture.
+- The second build is the trigram design above. `tests/tools/fts_parity.py` compares both paths on a copy of
+  the replica over the last 400 distinct logged queries plus the golden set: 403 of 403 queries that took
+  the FTS path were identical in rows and order (5 fell back for a short token), run twice independently.
+  Keyword search at a load average of about 30: LIKE p50 197 ms, p90 247 ms; FTS p50 12.6 ms, p90 18.5 ms,
+  max 63 ms. Index rebuild 3.3 s; a write with triggers 3 ms; `integrity-check` clean after insert,
+  replace, forget and 20 upserts through the real writers.
+- Known and accepted: trigram folds Unicode case where LIKE folds ASCII only, so a non-ASCII token could
+  match more rows on the FTS path (not seen in 408 queries). `topics` has an implicit rowid, which a
+  `VACUUM` would renumber under the index; nothing vacuums the replica, and a refresh rebuilds the file.
+  A replica written by older code (the desktop app's bundled CLI before its next build, a long-lived
+  process) has no FTS tables and stays on LIKE until the next refresh by current code.
+- Phase 2 (retire the LIKE path) stays open and is not urgent: LIKE is also the fallback for short tokens.
+

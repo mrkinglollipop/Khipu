@@ -79,7 +79,10 @@ _TABLES = (
 # older build's refresh replaces it wholesale, a newer build's incremental
 # writes land on an older file), so readers and incremental writers probe for
 # the table and never trust this number.
-SNAPSHOT_SCHEMA_VERSION = 3
+# Version 4 adds the external-content FTS5 tables `episodes_fts`/`topics_fts`
+# (trigram) and their triggers; `search_snapshot` uses them when present and
+# falls back to LIKE on a file without them.
+SNAPSHOT_SCHEMA_VERSION = 4
 
 _DELIVERABLE_COLS = (
     "id",
@@ -678,8 +681,9 @@ def _blob_to_vector(blob: bytes) -> list[float]:
 
 
 def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VERSION) -> None:
-    """``version=3`` (default): the current shape, always what ``refresh()``
-    writes for a real dump. ``version=2``: the same without ``deliverables``.
+    """``version=4`` (default): the current shape, always what ``refresh()``
+    writes for a real dump. ``version=3``: the same without the FTS5 tables.
+    ``version=2``: the same without ``deliverables``.
     ``version=1``: the pre-Phase-2B shape (no
     ``decisions`` table, no ``topics.superseded_by``/``event_at``, no
     ``snapshot_meta``) — for tests exercising a reader's tolerance of an
@@ -825,6 +829,50 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
             CREATE INDEX idx_snapshot_deliverables_project ON deliverables (project);
             """
         )
+    if version >= 4:
+        try:
+            con.executescript(_FTS_SCHEMA_SQL)
+        except sqlite3.OperationalError as exc:
+            # A Python whose SQLite lacks FTS5 still writes a usable replica;
+            # search_snapshot finds no FTS tables and stays on LIKE.
+            _log(f"replica FTS tables not created: {exc}")
+
+
+_EPISODE_FTS_COLS = ("summary", "topics", "decisions", "preferences", "people")
+_TOPIC_FTS_COLS = ("body", "slug", "title")
+
+
+def _fts_table_sql(fts: str, base: str, cols: tuple[str, ...]) -> str:
+    """External-content FTS5 table over ``base`` plus the triggers that keep
+    it current, so every writer of ``base`` needs no FTS code. A ``delete``
+    must pass the exact values that were indexed, which ``old.*`` does.
+    Trigram phrases are substring matches, which is what ``LIKE '%tok%'``
+    does; no ``remove_diacritics``, because LIKE does not strip them."""
+    col_list = ", ".join(cols)
+    new_vals = ", ".join(f"new.{c}" for c in cols)
+    old_vals = ", ".join(f"old.{c}" for c in cols)
+    return f"""
+        CREATE VIRTUAL TABLE {fts} USING fts5(
+            {col_list}, content='{base}', content_rowid='rowid',
+            tokenize='trigram'
+        );
+        CREATE TRIGGER {fts}_ai AFTER INSERT ON {base} BEGIN
+            INSERT INTO {fts}(rowid, {col_list}) VALUES (new.rowid, {new_vals});
+        END;
+        CREATE TRIGGER {fts}_ad AFTER DELETE ON {base} BEGIN
+            INSERT INTO {fts}({fts}, rowid, {col_list}) VALUES ('delete', old.rowid, {old_vals});
+        END;
+        CREATE TRIGGER {fts}_au AFTER UPDATE ON {base} BEGIN
+            INSERT INTO {fts}({fts}, rowid, {col_list}) VALUES ('delete', old.rowid, {old_vals});
+            INSERT INTO {fts}(rowid, {col_list}) VALUES (new.rowid, {new_vals});
+        END;
+    """
+
+
+_FTS_SCHEMA_SQL = (
+    _fts_table_sql("episodes_fts", "episodes", _EPISODE_FTS_COLS)
+    + _fts_table_sql("topics_fts", "topics", _TOPIC_FTS_COLS)
+)
 
 
 _EDGE_INDEX_SQL = (
@@ -1632,6 +1680,58 @@ def _token_match_sqlite(
     return " OR ".join(wheres), " + ".join(scores), where_params + score_params
 
 
+_FTS_STATE: dict[str, Any] = {"key": None, "ready": False}
+_FTS_FALLBACK_LOGGED = False
+# A trigram index cannot answer a token shorter than this; such a query goes
+# to LIKE whole, so one query never mixes the two matchers.
+_FTS_MIN_TOKEN = 3
+
+
+def _fts_fallback(reason: str) -> None:
+    global _FTS_FALLBACK_LOGGED
+    if not _FTS_FALLBACK_LOGGED:
+        _FTS_FALLBACK_LOGGED = True
+        _log(f"replica keyword search on LIKE: {reason}")
+
+
+def _fts_ready(con: sqlite3.Connection) -> bool:
+    """Both trigram FTS tables exist on the replica ``con`` reads. One
+    ``sqlite_master`` lookup per replica generation (path, mtime, size) per
+    process. A table with another tokenizer would not match like LIKE, so it
+    counts as absent."""
+    path = snapshot_path()
+    try:
+        st = path.stat()
+        key: tuple[Any, ...] | None = (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None and _FTS_STATE["key"] == key:
+        return _FTS_STATE["ready"]
+    names = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name IN ('episodes_fts', 'topics_fts') AND sql LIKE '%trigram%'"
+    )}
+    ready = names == {"episodes_fts", "topics_fts"}
+    _FTS_STATE.update(key=key, ready=ready)
+    if not ready:
+        _fts_fallback("replica has no trigram FTS tables")
+    return ready
+
+
+def _fts_match_terms(tokens: Sequence[str]) -> list[str]:
+    """One quoted phrase per token: a trigram phrase is a substring match."""
+    return ['"' + tok.replace('"', '""') + '"' for tok in tokens]
+
+
+def _fts_coverage_sql(fts: str, nterms: int) -> str:
+    """``(rid, n)`` per matching row, ``n`` = distinct tokens with a substring
+    hit in any indexed column: the LIKE path's coverage score."""
+    hits = " UNION ALL ".join(
+        f"SELECT rowid FROM {fts} WHERE {fts} MATCH ?" for _ in range(nterms)
+    )
+    return f"(SELECT rowid AS rid, count(*) AS n FROM ({hits}) GROUP BY rowid)"
+
+
 def _id_shaped(term: str) -> bool:
     """Local copy of ``cli._id_shaped`` (W2.2) — this module must not import
     ``khipu.cli`` (that module already imports from here, and CLI/MCP fall
@@ -1797,6 +1897,29 @@ def search_snapshot(
     def oversample(n: int) -> int:
         return n * 4 if time_filtered and n > 0 else n
 
+    # FTS replaces only the any-token WHERE and the coverage score; every
+    # other predicate, the tie-breaks and the LIMIT are the LIKE path's, so
+    # both return the same rows in the same order.
+    use_fts = (
+        bool(search_tokens(query))
+        and all(len(tok) >= _FTS_MIN_TOKEN for tok in tokens)
+        and (topic_n > 0 or episode_n > 0)
+        and _fts_ready(con)
+    )
+    match_terms = _fts_match_terms(tokens) if use_fts else []
+
+    def fts_rows(sql: str, params: Sequence[Any], n: int) -> list[Any] | None:
+        """Rows from the FTS statement; ``None`` on an FTS error."""
+        nonlocal use_fts
+        if not use_fts:
+            return None
+        try:
+            return con.execute(sql, (*match_terms, *params, oversample(n))).fetchall()
+        except sqlite3.OperationalError as exc:
+            use_fts = False
+            _fts_fallback(f"FTS query failed: {exc}")
+            return None
+
     if topic_n > 0:
         topic_time_clause = ""
         topic_time_params: list[Any] = []
@@ -1811,9 +1934,22 @@ def search_snapshot(
             ORDER BY {topic_order}
             LIMIT ?
         """
-        split_at = len(topic_params) // 2 if search_tokens(query) else len(topic_params)
-        rows = con.execute(sql, (*topic_params[:split_at], *topic_time_params,
-                                 *topic_params[split_at:], oversample(topic_n))).fetchall()
+        rows = fts_rows(
+            f"""
+            SELECT 'topic' AS kind, slug AS id, COALESCE(title, slug) AS label,
+                   substr(body, 1, 4000) AS snippet, COALESCE(updated_at, created_at) AS ts
+            FROM {_fts_coverage_sql("topics_fts", len(match_terms))} c
+            JOIN topics ON topics.rowid = c.rid
+            WHERE deleted_at IS NULL{topic_time_clause}
+            ORDER BY c.n DESC, slug ASC
+            LIMIT ?
+            """,
+            topic_time_params, topic_n,
+        )
+        if rows is None:
+            split_at = len(topic_params) // 2 if search_tokens(query) else len(topic_params)
+            rows = con.execute(sql, (*topic_params[:split_at], *topic_time_params,
+                                     *topic_params[split_at:], oversample(topic_n))).fetchall()
         for r in rows:
             if not _in_range(r[4]):
                 continue
@@ -1862,9 +1998,27 @@ def search_snapshot(
         """
         # Token matching binds WHERE and ORDER BY separately; the thread
         # predicate sits between them in SQL and must sit there in params too.
-        split_at = len(episode_params) // 2 if search_tokens(query) else len(episode_params)
-        rows = con.execute(sql, (*episode_params[:split_at], *t3_params,
-                                 *identity_params, *episode_params[split_at:], oversample(episode_n))).fetchall()
+        # ``episodes`` is open_snapshot's temp view, so join on the INTEGER
+        # PRIMARY KEY (the FTS rowid), not the view's rowid.
+        # ``id`` in ORDER BY resolves to the CAST(id AS TEXT) alias, as it
+        # does in the LIKE statement, so the tie-break is the same text order.
+        rows = fts_rows(
+            f"""
+            SELECT 'episode' AS kind, CAST(id AS TEXT) AS id, summary AS label,
+                   summary AS snippet, ts, {session_expr} AS sid,
+                   {project_expr} AS proj, {harness_expr} AS harn
+            FROM {_fts_coverage_sql("episodes_fts", len(match_terms))} c
+            JOIN episodes ON episodes.id = c.rid
+            WHERE {ep_live}({t3_predicate}){identity_clause}
+            ORDER BY c.n DESC, ts DESC, id DESC
+            LIMIT ?
+            """,
+            (*t3_params, *identity_params), episode_n,
+        )
+        if rows is None:
+            split_at = len(episode_params) // 2 if search_tokens(query) else len(episode_params)
+            rows = con.execute(sql, (*episode_params[:split_at], *t3_params,
+                                     *identity_params, *episode_params[split_at:], oversample(episode_n))).fetchall()
         for r in rows:
             if not _in_range(r[4]):
                 continue
