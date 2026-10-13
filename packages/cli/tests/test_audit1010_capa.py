@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -400,9 +401,14 @@ class CaptureCapaTest(unittest.TestCase):
                 "def hook_main(*args):\n"
                 " open(os.environ['ENQUEUE_MARKER'], 'w').write('queued')\n"
                 " return {'harness':'codex','event':'stop','due':True,'session_id':'s'}\n"
-                "def queued_jobs(): return [object()]\n"
+                "from pathlib import Path\n"
+                "def queue_dir(): return Path(os.environ['KHIPU_CAPTURE_HOME']) / 'queue'\n"
+                "def queued_jobs(): return [] if os.path.exists(os.environ['DRAIN_MARKER']) else [object()]\n"
                 "def drain(): open(os.environ['DRAIN_MARKER'], 'w').write('called'); time.sleep(1); return {'captured': 1}\n"
             )
+            # The hook's post-enqueue work lives in khipu.hook_background; the fake
+            # root runs the real module against the fake session_capture/embed.
+            shutil.copy(repo / "packages/cli/khipu/hook_background.py", package / "hook_background.py")
             (package / "embed.py").write_text(
                 "import os\n"
                 "def embed_recent_missing(limit):\n"
@@ -413,7 +419,8 @@ class CaptureCapaTest(unittest.TestCase):
                    "KHIPU_CAPTURE_HOME": str(Path(td) / "queue"), "PATH": os.environ["PATH"],
                    "KHIPU_HARNESS": "codex", "ENQUEUE_MARKER": str(Path(td) / "enqueue-marker"),
                    "DRAIN_MARKER": str(Path(td) / "drain-marker"),
-                   "EMBED_MARKER": str(Path(td) / "embed-marker")}
+                   "EMBED_MARKER": str(Path(td) / "embed-marker"),
+                   "KHIPU_HOOK_INLINE": "1"}
             payload = json.dumps({"hookEventName": "Stop", "session_id": "s"})
             fixed = subprocess.run(["sh", str(repo / "packages/cli/bin/khipu-stop-hook")], input=payload,
                                    text=True, env=env, capture_output=True, timeout=5, cwd=td)
