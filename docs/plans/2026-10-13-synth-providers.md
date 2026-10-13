@@ -141,3 +141,26 @@ paraphrase, not a verbatim quote. Khipu runs the user's own installed CLI as the
 subscription credential. Re-check the vendor terms before release. No vendor research or live model
 call was performed in this build session. Decision 5's 50-window comparison remains pending; neither
 subscription provider becomes the default or receives a UI recommendation in this phase.
+
+## Quality gate results (2026-10-13)
+
+Method: 49 real queued capture windows (redacted, the same extraction prompt for every model), then an
+Opus judge reading the transcript and every extraction for 15 of them. Two judged rounds.
+
+| Summariser | Route measured | Median per capture | First places (of 15) | Wrong or invented items | Total failures |
+|---|---|---|---|---|---|
+| Claude Haiku 5.5 | user's Claude login (`claude-cli`) | 10.7 s | 10 | 3 | 2 wrong-task replies, since fixed (#162) |
+| GPT-6 Luna, high effort | user's ChatGPT login (`codex-cli`) | 50 s with the user's Codex config | 3 | 2 | 0 |
+| GPT-6 Luna, low effort | `codex-cli`, user config skipped | 8.0 s | 2 | 2 | 3 empty records, one for a 14,000-char window |
+| Gemini 2.5 Flash | direct API | 2.9 s | 0 | about 10 | 1 empty record (a 561-char fragment) |
+
+Verdicts: Haiku is the best memory and qualifies as the default. Luna is more accurate than Gemini Flash
+where it answers (better in 12 of 15, about a fifth of the wrong items) but terse on open loops, and at low
+effort it emptied a real window; at medium it returns that window in 10 s. Gemini Flash is last on quality
+and first on speed. Consequences shipped: `claude-cli` runs with its own system prompt (#162); `codex-cli`
+skips the user's Codex config and runs at medium effort (#167, #168); an empty record for a window of
+2,000+ chars, or a reply that is not the capture JSON, from a non-Gemini provider gets one Gemini retry
+when a Gemini key exists (#162, #168). Recommended order for the Settings page (phase 3): Haiku, then
+Luna, then Gemini Flash; each on the user's own login where one exists, direct API or OpenRouter (#165)
+otherwise. Luna at medium effort has not been through the full judged round; do that before it is shown
+as "recommended" rather than "available".
