@@ -188,3 +188,9 @@ round is needed before reordering the recommendation. Separate finding from the 
 hook drains the queue inline inside the harness's 20 s hook timeout (median hold 10 s, 72 of 262 drains
 over 15 s on Gemini Flash), so summariser latency is felt at turn end; detaching the drain removes that
 and makes per-call latency a freshness matter only.
+
+Decisions after round 3 (owner, 2026-10-13): Grok and Composer are not pursued as summariser routes
+(no API id for the fast tiers, 30,000 tokens of harness per Grok Build call, $2/$6 on the API for no
+quality lead). The Stop hook no longer drains inline: it queues, starts `khipu.hook_background` in its own
+session and returns; up to `KHIPU_DRAIN_SLOTS` (default 4) hook-started drainers summarise at once, so
+per-call latency decides only how soon a memory is searchable.
