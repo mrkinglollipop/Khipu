@@ -226,5 +226,47 @@ class HookDedupeTest(unittest.TestCase):
             self.assertNotIn("deduped_msgs", out)
 
 
+    def test_not_due_run_steps_past_leading_copies_but_keeps_the_fresh_tail(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            tp = _append(Path(td) / ".claude" / "projects" / "p" / "s.jsonl", _conversation())
+            self.assertTrue(sc.hook_main(self._env(td, tp))["due"])
+            captured_end = sc.load_state("claude_code", "s1")["offset"]
+            # Compaction re-emits everything, then one fresh (not yet due) turn.
+            _append(tp, [COMPACT] + _reemitted())
+            copies_end = tp.stat().st_size
+            _append(tp, [_user(NEW_TURN)])
+            env = json.loads(self._env(td, tp))
+            env["hook_event_name"] = "Stop"
+            out = sc.hook_main(json.dumps(env))
+            self.assertFalse(out["due"], out)
+            self.assertEqual(out["deduped_msgs"], 6)
+            st = sc.load_state("claude_code", "s1")
+            self.assertGreater(st["offset"], captured_end)
+            self.assertLessEqual(st["offset"], copies_end)
+            self.assertEqual(len(st["seen_text"]), 6)  # nothing new remembered
+            env["hook_event_name"] = "SessionEnd"
+            out = sc.hook_main(json.dumps(env))
+            self.assertTrue(out["due"], out)
+            self.assertEqual(out["new_turns"], 1)
+            self.assertNotIn("deduped_msgs", out)  # the copies were not re-read
+            job = [json.loads(p.read_text()) for p in sc.queued_jobs()
+                   if NEW_TURN in json.loads(p.read_text())["transcript"]][0]
+            self.assertNotIn("question 0", job["transcript"])
+            # The compaction summary ahead of the copies was carried, not lost.
+            self.assertIn("This session is being continued", job["transcript"])
+
+
+class ShortMessagesTest(unittest.TestCase):
+    def test_short_repeats_are_kept_and_count_as_turns(self):
+        with tempfile.TemporaryDirectory() as td:
+            long_answer = _assistant("a long answer " + "a" * 80, "m")
+            tp = _append(Path(td) / "s.jsonl", [_user("ok"), long_answer, _user("ok"), long_answer])
+            msgs, _, users, stats = _window(tp, 0, ())
+            self.assertEqual(users, 2)
+            self.assertEqual([r for r, _ in msgs], ["user", "assistant", "user"])
+            self.assertEqual(stats["deduped_msgs"], 1)
+            self.assertEqual(stats["skip_to"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
