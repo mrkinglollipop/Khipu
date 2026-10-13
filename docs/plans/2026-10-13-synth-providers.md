@@ -164,3 +164,27 @@ when a Gemini key exists (#162, #168). Recommended order for the Settings page (
 Luna, then Gemini Flash; each on the user's own login where one exists, direct API or OpenRouter (#165)
 otherwise. Luna at medium effort has not been through the full judged round; do that before it is shown
 as "recommended" rather than "available".
+
+### Round 3: Grok 4.7, Composer 2.5 fast, Luna at medium (2026-10-13, same 15 windows, same judge method)
+
+| Summariser | Route | Median per capture | Cost per capture | First places | Wrong or invented | Mean rank (of 6) |
+|---|---|---|---|---|---|---|
+| Composer 2.5 fast, medium | Grok Build CLI | 21.9 s | $0.023 reported against the Grok subscription | 5 | 2 | 2.5 |
+| Composer 2.5 fast, low | Grok Build CLI | 22.2 s | $0.024 reported | 3 | 5 (4 in one window) | 2.7 |
+| Claude Haiku 5.5 (pre-#162 sample) | `claude-cli` | 10.8 s | subscription | 4 | 5 | 3.3 (2.8 without the two fixed wrong-task windows) |
+| Grok 4.7 fast, low | Grok Build CLI | 18.1 s | $0.14 reported | 2 | 4, with inversions | 3.7 |
+| Grok 4.7, low | OpenRouter API | 11.2 s | $0.012 | 1 | 1 | 4.3 |
+| GPT-6 Luna, medium | OpenRouter API | 7.7 s | $0.0006 | 0 | 1 | 4.4 |
+
+Findings: the Grok and Composer configs list about twice as many "decisions" as Haiku and the judge found
+the extra items to be filler (restated findings, environment facts, proposals not yet decided); what
+Composer adds over Haiku is open and closed loops. Luna is accurate but thin (9 open loops in 15 windows).
+Grok Build adds about 30,000 tokens of its own harness to every call, which `--tools none`,
+`--system-prompt-override` and a no-tools `--agents` agent do not remove; "Grok 4.7 fast" and Composer
+have no public API model id (Grok Build and Cursor only), and Grok 4.7 on the API lists at $2/$6 per
+million tokens. The top three are within the noise of a 15-window, single-judge sample (the judge notes
+that one judgement call on two nested-task windows moves Luna up and the Composers down); a 49-window
+round is needed before reordering the recommendation. Separate finding from the same afternoon: the Stop
+hook drains the queue inline inside the harness's 20 s hook timeout (median hold 10 s, 72 of 262 drains
+over 15 s on Gemini Flash), so summariser latency is felt at turn end; detaching the drain removes that
+and makes per-call latency a freshness matter only.
