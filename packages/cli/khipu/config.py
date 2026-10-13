@@ -129,6 +129,7 @@ PATH_SETTINGS: dict[str, tuple[str, ...]] = {
     "gemini_key_file": ("KHIPU_GEMINI_KEY_FILE",),
     "anthropic_key_file": ("KHIPU_ANTHROPIC_KEY_FILE",),
     "openai_key_file": ("KHIPU_OPENAI_KEY_FILE",),
+    "openrouter_key_file": ("KHIPU_OPENROUTER_KEY_FILE",),
 }
 
 

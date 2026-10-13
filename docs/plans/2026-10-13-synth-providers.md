@@ -47,7 +47,7 @@ One PR per phase, merged alone and soaked.
 ## Decisions
 
 1. **Provider is a user choice per role, never a silent switch.** `models.synth` gains `provider` values
-   `gemini` (today's `cloud`, kept as an alias), `anthropic`, `openai`, `local`, and in phase 2
+   `gemini` (today's `cloud`, kept as an alias), `anthropic`, `openai`, `openrouter`, `local`, and in phase 2
    `claude-cli`, `codex-cli`. The default for a new install stays `gemini` until the Settings copy and the
    verify probe for each provider exist. Changing provider never changes what is captured, only who
    summarises it; the extraction prompt and JSON contract are shared, with one adapter per provider that
@@ -106,6 +106,9 @@ self-capture, a Settings note quoting the vendor's own terms with the date, and 
 decision 5 run before either appears in the UI.
 
 ## Phase 2 as built
+
+OpenRouter uses one user key with any explicit vendor/model ID, reports its response cost per call, and
+remains quality-gated per model.
 
 The exact invocations (prompt on stdin; `<cwd>` is an empty Khipu-owned temporary directory under
 `data_dir()/state/synth-cli/`, and `<file>` is a temporary last-message file outside that directory):

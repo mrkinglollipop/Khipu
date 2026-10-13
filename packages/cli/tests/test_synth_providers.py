@@ -20,7 +20,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv('KHIPU_DATA_DIR', str(tmp_path))
     monkeypatch.setenv('KHIPU_KEYCHAIN', '0')
     monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'capture'))
-    for key in ('ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY',
+    for key in ('ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'GEMINI_API_KEY',
                 'KHIPU_EXTRACT_MODEL', 'KHIPU_SYNTH_PROVIDER', 'KHIPU_TEST'):
         monkeypatch.delenv(key, raising=False)
     def blocked(*args, **kwargs):
@@ -41,7 +41,8 @@ class Reply:
 
 
 @pytest.mark.parametrize('provider,model', [('gemini', 'gemini-2.5-flash'),
-                                           ('anthropic', 'claude-haiku-5-5'), ('openai', 'explicit')])
+                                           ('anthropic', 'claude-haiku-5-5'), ('openai', 'explicit'),
+                                           ('openrouter', 'openai/gpt-6-luna')])
 def test_request_prompt_usage_and_cost(provider, model):
     prompt = extract.PROMPT.format(cwd='/fixture', transcript='USER: Keep the decision.')
     data = {
@@ -53,6 +54,9 @@ def test_request_prompt_usage_and_cost(provider, model):
         'openai': {'choices': [{'message': {'content': 'ab'}}],
                    'usage': {'prompt_tokens': 1000, 'completion_tokens': 200,
                              'prompt_tokens_details': {'cached_tokens': 400}}},
+        'openrouter': {'choices': [{'message': {'content': 'ab'}}],
+                       'usage': {'prompt_tokens': 1000, 'completion_tokens': 200,
+                                 'prompt_tokens_details': {'cached_tokens': 400}, 'cost': .001}},
     }[provider]
     models.set_models_merge_role('synth', provider=provider, model_id=model)
     with mock.patch.object(extract, '_provider_key', return_value='fake-secret'), \
@@ -72,27 +76,39 @@ def test_request_prompt_usage_and_cost(provider, model):
                                              'thinkingConfig': {'thinkingBudget': 0}}
         assert headers['x-goog-api-key'] == 'fake-secret'
     else:
-        assert body == {'model': model, 'max_tokens': 4096, 'temperature': .2,
-                        'messages': [{'role': 'user', 'content': prompt}]}
+        expected = {'model': model, 'max_tokens': 4096, 'temperature': .2,
+                    'messages': [{'role': 'user', 'content': prompt}]}
+        if provider == 'openrouter':
+            expected['usage'] = {'include': True}
+        assert body == expected
         assert body['messages'][0]['content'].encode() == prompt.encode()
         if provider == 'anthropic':
             assert request.full_url == 'https://api.anthropic.com/v1/messages'
             assert headers['x-api-key'] == 'fake-secret'
             assert headers['anthropic-version'] == '2023-06-01'
+        elif provider == 'openrouter':
+            assert request.full_url == 'https://openrouter.ai/api/v1/chat/completions'
+            assert headers['authorization'] == 'Bearer fake-secret'
+            assert headers['http-referer'] == 'https://github.com/mrkinglollipop/Khipu'
+            assert headers['x-title'] == 'Khipu'
         else:
             assert request.full_url == 'https://api.openai.com/v1/chat/completions'
             assert headers['authorization'] == 'Bearer fake-secret'
     row = json.loads(extract.synth_usage_path().read_text())
     assert (row['provider'], row['cached_tokens'], row['prompt_tokens'], row['output_tokens']) == (provider, 400, 1000, 200)
+    if provider == 'openrouter':
+        assert row['cost_usd'] == .001
+    else:
+        assert 'cost_usd' not in row
     usage = extract.synth_usage_today()
     assert usage['by_provider'][provider]['by_model'][model]['calls'] == 1
-    cost = {'gemini': .000692, 'anthropic': .000204, 'openai': None}[provider]
+    cost = {'gemini': .000692, 'anthropic': .000204, 'openai': None, 'openrouter': .001}[provider]
     assert usage['estimated_usd'] == cost
     assert usage['by_provider'][provider]['estimated_usd'] == cost
     assert cli._budget_status_all()['synth']['usage_by_provider'] == usage['by_provider']
 
 
-@pytest.mark.parametrize('provider', ['gemini', 'anthropic', 'openai'])
+@pytest.mark.parametrize('provider', ['gemini', 'anthropic', 'openai', 'openrouter'])
 @pytest.mark.parametrize('code,attempts', [(429, 3), (500, 3), (400, 1), (401, 1), (403, 1)])
 def test_http_retry_accounting_and_redaction(provider, code, attempts):
     fn = getattr(extract, '_generate_' + provider)
@@ -109,7 +125,7 @@ def test_http_retry_accounting_and_redaction(provider, code, attempts):
     assert sleep.call_count == (attempts if attempts == 3 else 0)
 
 
-@pytest.mark.parametrize('provider', ['gemini', 'anthropic', 'openai'])
+@pytest.mark.parametrize('provider', ['gemini', 'anthropic', 'openai', 'openrouter'])
 def test_budget_ceiling_unwrapped_before_http(provider):
     fn = getattr(extract, '_generate_' + provider)
     config.set_int_setting('synth_daily_calls', 1)
@@ -133,6 +149,32 @@ def test_models_alias_defaults_switch_and_role_semantics():
     with pytest.raises(ValueError, match='requires --model'):
         models.set_models_merge_role('synth', provider='openai')
     assert config.load_config() == before
+    with pytest.raises(ValueError, match='requires --model'):
+        models.set_models_merge_role('synth', provider='openrouter')
+    assert config.load_config() == before
+    models.set_models_merge_role('synth', provider='openrouter', model_id='google/gemini-2.5-flash')
+    assert models.show_models()['synth'] == {
+        'provider': 'openrouter', 'endpoint': '', 'model_id': 'google/gemini-2.5-flash'
+    }
+    args = cli.build_parser().parse_args(
+        ['models', 'set', '--role', 'synth', '--provider', 'openrouter']
+    )
+    before_cli = config.load_config()
+    with redirect_stdout(io.StringIO()) as out:
+        assert args.func(args) == 2
+    assert json.loads(out.getvalue()) == {
+        'ok': False, 'error': 'synth: openrouter provider requires --model (model_id)'
+    }
+    assert config.load_config() == before_cli
+    args = cli.build_parser().parse_args(
+        ['models', 'set', '--role', 'synth', '--provider', 'openrouter',
+         '--model', 'openai/gpt-6-luna']
+    )
+    with redirect_stdout(io.StringIO()) as out:
+        assert args.func(args) == 0
+    assert json.loads(out.getvalue())['models']['synth'] == {
+        'provider': 'openrouter', 'endpoint': '', 'model_id': 'openai/gpt-6-luna'
+    }
     args = cli.build_parser().parse_args(['models', 'set', '--role', 'synth', '--provider', 'openai', '--model', 'explicit'])
     with redirect_stdout(io.StringIO()):
         assert args.func(args) == 0
@@ -151,7 +193,7 @@ def test_test_override_changes_model_and_env_model_wins(monkeypatch):
     assert models.cloud_model_id({'provider': 'openai'}) == 'override'
 
 
-@pytest.mark.parametrize('provider', ['anthropic', 'openai'])
+@pytest.mark.parametrize('provider', ['anthropic', 'openai', 'openrouter'])
 def test_key_resolution_and_secret_set(provider, tmp_path, monkeypatch):
     resolve = getattr(keychain, 'resolve_' + provider + '_key')
     account = provider + '_api_key'
@@ -161,6 +203,7 @@ def test_key_resolution_and_secret_set(provider, tmp_path, monkeypatch):
     path = tmp_path / 'fake-key'
     path.write_text('file-fixture\n')
     config.set_path_setting(provider + '_key_file', str(path))
+    assert 'file-fixture' not in config.config_file().read_text()
     assert resolve() == 'file-fixture'
     with mock.patch.object(keychain, 'get_password', return_value='kc-fixture'):
         assert resolve() == 'kc-fixture'
@@ -178,7 +221,7 @@ def test_key_resolution_and_secret_set(provider, tmp_path, monkeypatch):
     assert 'stdin-fixture' not in out.getvalue()
 
 
-@pytest.mark.parametrize('provider', ['gemini', 'anthropic', 'openai', 'local'])
+@pytest.mark.parametrize('provider', ['gemini', 'anthropic', 'openai', 'openrouter', 'local'])
 @pytest.mark.parametrize('present', [True, False])
 def test_doctor_selected_provider_key(provider, present, tmp_path):
     options = {'model_id': 'm'}
@@ -214,7 +257,7 @@ def test_empty_key_file_does_not_count_as_key(tmp_path):
         keychain.resolve_anthropic_key()
 
 
-@pytest.mark.parametrize('provider', ['anthropic', 'openai'])
+@pytest.mark.parametrize('provider', ['anthropic', 'openai', 'openrouter'])
 def test_rerank_dispatch_and_missing_key_mapping(provider):
     models.set_models_merge_role('synth', provider=provider, model_id='m')
     with mock.patch.object(extract, '_provider_key', return_value='fake'), \
@@ -245,7 +288,46 @@ def test_provider_grouping_legacy_rows_and_unknown_cost():
     assert budget['usage_by_provider']['openai']['estimated_usd'] is None
 
 
-@pytest.mark.parametrize('provider', ['gemini', 'anthropic', 'openai'])
+def test_usage_prefers_reported_cost_per_row_and_keeps_unknown_unpriced_null():
+    extract._record_usage(
+        {'usage': {'prompt_tokens': 1_000_000, 'completion_tokens': 1_000_000, 'cost': 0.0}},
+        provider='openrouter', model_id='gpt-6-luna', caller='test',
+    )
+    extract._record_usage(
+        {'usage': {'prompt_tokens': 1_000_000, 'completion_tokens': 0, 'cost': .25}},
+        provider='openrouter', model_id='gpt-6-luna', caller='test',
+    )
+    extract._record_usage(
+        {'usage': {'prompt_tokens': 1_000_000, 'completion_tokens': 0}},
+        provider='openrouter', model_id='gpt-6-luna', caller='test',
+    )
+    extract._record_usage(
+        {'usage': {'prompt_tokens': 1_000_000, 'completion_tokens': 0}},
+        provider='openai', model_id='gpt-6-luna', caller='test',
+    )
+    usage = extract.synth_usage_today()
+    assert usage['by_provider']['openrouter']['by_model']['gpt-6-luna']['estimated_usd'] == .35
+    assert usage['by_provider']['openai']['estimated_usd'] == .1
+    assert usage['by_model']['gpt-6-luna']['estimated_usd'] == .45
+    assert usage['estimated_usd'] == .45
+    extract._record_usage(
+        {'usage': {'prompt_tokens': 1, 'completion_tokens': 1}},
+        provider='openrouter', model_id='unpriced', caller='test',
+    )
+    usage = extract.synth_usage_today()
+    assert usage['by_provider']['openrouter']['by_model']['gpt-6-luna']['estimated_usd'] == .35
+    assert usage['by_model']['gpt-6-luna']['estimated_usd'] == .45
+    assert usage['by_provider']['openrouter']['estimated_usd'] is None
+    assert usage['estimated_usd'] is None
+
+
+def test_openrouter_status_has_all_key_presence_flags():
+    status = keychain.secrets_status()
+    fields = ('in_keychain', 'env', 'file_present', 'file_key_present')
+    assert {f'openrouter_{field}' for field in fields} <= set(status)
+
+
+@pytest.mark.parametrize('provider', ['gemini', 'anthropic', 'openai', 'openrouter'])
 def test_transport_retry_redaction_and_missing_key_no_charge(provider):
     fn = getattr(extract, '_generate_' + provider)
     with mock.patch.object(extract, '_provider_key', return_value='fake'), \
@@ -261,7 +343,7 @@ def test_transport_retry_redaction_and_missing_key_no_charge(provider):
     assert embed.budget_status('synth')['calls'] == 2
 
 
-@pytest.mark.parametrize('provider', ['anthropic', 'openai'])
+@pytest.mark.parametrize('provider', ['anthropic', 'openai', 'openrouter'])
 def test_rerank_configured_model_reaches_adapter(provider):
     models.set_models_merge_role('synth', provider=provider, model_id='custom-model')
     with mock.patch.object(extract, '_provider_key', return_value='fake'), \
@@ -279,6 +361,7 @@ def test_extraction_fixture_prompt_is_byte_identical_across_adapters():
     prompts = []
     for provider, model in [('gemini', 'gemini-2.5-flash'),
                              ('anthropic', 'claude-haiku-5-5'), ('openai', 'explicit'),
+                             ('openrouter', 'openai/gpt-6-luna'),
                              ('claude-cli', 'haiku'), ('codex-cli', 'explicit')]:
         models.set_models_merge_role('synth', provider=provider, model_id=model)
         def respond(request, **kwargs):
@@ -303,12 +386,12 @@ def test_extraction_fixture_prompt_is_byte_identical_across_adapters():
             result = extract.extract_memory(transcript, cwd='/fixture')
         assert result['summary'] == 'Kept append-only history.'
         assert result['decisions'] == ['Keep append-only history.']
-    assert len(prompts) == 5
+    assert len(prompts) == 6
     assert all(prompt == prompts[0] for prompt in prompts)
     assert transcript.encode() in prompts[0]
 
 
-@pytest.mark.parametrize('provider', ['anthropic', 'openai'])
+@pytest.mark.parametrize('provider', ['anthropic', 'openai', 'openrouter'])
 def test_keychain_lookup_account_and_khipu_service(provider):
     with mock.patch.object(keychain, 'keychain_available', return_value=True), \
          mock.patch.object(keychain, '_security', return_value=mock.Mock(returncode=0, stdout='fake-key\n')) as security:
@@ -609,6 +692,26 @@ def test_wrong_task_reply_from_a_cli_provider_falls_back_to_gemini_once():
          mock.patch.object(extract, '_generate_gemini') as gem, \
          pytest.raises(RuntimeError, match='non-JSON'):
         extract.extract_memory('USER: hi\nASSISTANT: hello', cwd='/p')
+    assert gem.call_count == 0
+
+
+def test_openrouter_invalid_capture_falls_back_only_when_gemini_key_resolves():
+    models.set_models_merge_role('synth', provider='openrouter', model_id='openai/gpt-6-luna')
+    good = json.dumps({'summary': 'Kept the decision.', 'decisions': ['Keep it.']})
+    with (
+        mock.patch.object(extract, '_generate_openrouter', return_value='not json') as adapter,
+        mock.patch.object(extract, '_key', return_value='fake'),
+        mock.patch.object(extract, '_generate_gemini', return_value=good) as gem,
+    ):
+        assert extract.extract_memory('USER: hi\nASSISTANT: done', cwd='/p')['summary'] == 'Kept the decision.'
+    assert adapter.call_count == gem.call_count == 1
+    with (
+        mock.patch.object(extract, '_generate_openrouter', return_value='not json'),
+        mock.patch.object(extract, '_key', side_effect=RuntimeError('no key')),
+        mock.patch.object(extract, '_generate_gemini') as gem,
+        pytest.raises(RuntimeError, match='non-JSON'),
+    ):
+        extract.extract_memory('USER: hi\nASSISTANT: done', cwd='/p')
     assert gem.call_count == 0
 
 

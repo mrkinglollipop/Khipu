@@ -2310,6 +2310,7 @@ SETTABLE_SECRETS = {
     "gemini_api_key": "gemini_in_keychain",
     "anthropic_api_key": "anthropic_in_keychain",
     "openai_api_key": "openai_in_keychain",
+    "openrouter_api_key": "openrouter_in_keychain",
     "database_url": "dsn_in_keychain",
     "openai_compat_api_key": "openai_compat_in_keychain",
     "voyage_api_key": "voyage_in_keychain",
@@ -4107,7 +4108,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     md_set.add_argument(
         "--provider",
-        choices=("gemini", "anthropic", "openai", "claude-cli", "codex-cli", "cloud", "local", "off"),
+        choices=("gemini", "anthropic", "openai", "openrouter", "claude-cli", "codex-cli", "cloud", "local", "off"),
         default=None,
         help="Provider for --role merge",
     )

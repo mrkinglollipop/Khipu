@@ -11,12 +11,13 @@ extractor produces (summary / topics / decisions / preferences / scope), so the
 resulting rows are indistinguishable downstream (PG, file mirror, embeddings,
 topic pages, nightly consolidate).
 
-Synth routing (Settings → Models): Gemini, Anthropic, OpenAI REST; local = OpenAI-compatible
+Synth routing (Settings → Models): Gemini, Anthropic, OpenAI, OpenRouter REST; local = OpenAI-compatible
 ``/v1/chat/completions``. Embeddings stay on the active Gemini profile.
 """
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 import tempfile
@@ -171,6 +172,9 @@ def _record_usage(data: Any, *, model_id: str, caller: str, provider: str = "gem
             "cached_tokens": count(cached_tokens),
             "caller": caller,
         }
+        cost = meta.get("cost")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost):
+            row["cost_usd"] = float(cost)
         path = synth_usage_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
@@ -201,7 +205,8 @@ def _usage_lines_since(path: Path, day: str, block: int = 65_536) -> list[str]:
 def synth_usage_today() -> dict[str, Any]:
     """Today's (UTC) synth token totals from synth-usage.jsonl, per model and
     summed, with an estimated USD cost from ``models.PRICES_USD_PER_MTOKEN``.
-    ``estimated_usd`` is null when any model used today has no price."""
+    A finite response cost takes precedence over the price table;
+    ``estimated_usd`` is null when any unpriced row has no response cost."""
     from khipu.models import CLI_PROVIDERS, PRICES_USD_PER_MTOKEN
 
     day = time.strftime("%Y-%m-%d", time.gmtime())
@@ -211,6 +216,28 @@ def synth_usage_today() -> dict[str, Any]:
     totals = empty()
     by_provider: dict[str, dict[str, Any]] = {}
     by_model: dict[str, dict[str, Any]] = {}
+    def token(row, name):
+        value = row.get(name)
+        return max(0, value) if isinstance(value, int) and not isinstance(value, bool) else 0
+    def row_cost(row, provider, model):
+        if provider in CLI_PROVIDERS:
+            return 0.0
+        reported = row.get("cost_usd")
+        if isinstance(reported, (int, float)) and not isinstance(reported, bool) and math.isfinite(reported):
+            return float(reported)
+        price = PRICES_USD_PER_MTOKEN.get(model)
+        cached = token(row, "cached_tokens")
+        if price is None or (cached and "cached_input" not in price):
+            return None
+        # Anthropic input_tokens excludes cache reads; other APIs include them.
+        uncached = token(row, "prompt_tokens") if provider == "anthropic" else max(
+            0, token(row, "prompt_tokens") - cached
+        )
+        return (uncached * price["input"] + cached * price.get("cached_input", 0)
+                + (token(row, "output_tokens") + token(row, "thought_tokens")) * price["output"]) / 1e6
+    def add_cost(bucket, cost):
+        previous = bucket.get("estimated_usd", 0.0)
+        bucket["estimated_usd"] = None if cost is None or previous is None else previous + cost
     path = synth_usage_path()
     lines = _usage_lines_since(path, day) if path.is_file() else []
     for line in lines:
@@ -229,33 +256,19 @@ def synth_usage_today() -> dict[str, Any]:
         for bucket in (totals, group, m, old):
             bucket["calls"] += 1
             for k in keys:
-                value = row.get(k)
-                if isinstance(value, int) and not isinstance(value, bool):
-                    bucket[k] += max(0, value)
-    def add_cost(bucket, cost):
-        previous = bucket.get("estimated_usd", 0.0)
-        bucket["estimated_usd"] = None if cost is None or previous is None else previous + cost
-    for provider, group in by_provider.items():
+                bucket[k] += token(row, k)
         if provider in CLI_PROVIDERS:
             group["billing"] = "subscription"
-        for model, m in group["by_model"].items():
-            price = PRICES_USD_PER_MTOKEN.get("haiku" if provider in CLI_PROVIDERS else model)
-            if provider in CLI_PROVIDERS:
-                m["billing"] = "subscription"
-            cached = m["cached_tokens"]
-            if price is None or (cached and "cached_input" not in price):
-                cost = None
-            else:
-                # Anthropic input_tokens excludes cache reads; other APIs include them.
-                uncached = m["prompt_tokens"] if provider == "anthropic" else max(0, m["prompt_tokens"] - cached)
-                cost = round((uncached * price["input"] + cached * price.get("cached_input", 0)
-                              + (m["output_tokens"] + m["thought_tokens"]) * price["output"]) / 1e6, 6)
-            m["estimated_usd"] = cost
-            add_cost(group, cost)
-            add_cost(by_model[model], cost)
-            add_cost(totals, cost)
+            m["billing"] = "subscription"
+        cost = row_cost(row, provider, model)
+        add_cost(m, cost)
+        add_cost(group, cost)
+        add_cost(old, cost)
+        add_cost(totals, cost)
     totals.setdefault("estimated_usd", 0.0)
-    for bucket in [totals, *by_provider.values(), *by_model.values()]:
+    buckets = [totals, *by_provider.values(), *by_model.values()]
+    buckets.extend(m for group in by_provider.values() for m in group["by_model"].values())
+    for bucket in buckets:
         if bucket.get("estimated_usd") is not None:
             bucket["estimated_usd"] = round(bucket["estimated_usd"], 6)
     return {"day": day, **totals, "by_model": by_model, "by_provider": by_provider}
@@ -325,7 +338,11 @@ def _generate_cloud(prompt: str, **kwargs) -> str:
 
 
 def _provider_key(provider: str) -> str:
-    from khipu.keychain import resolve_anthropic_key, resolve_openai_key
+    from khipu.keychain import (
+        resolve_anthropic_key,
+        resolve_openai_key,
+        resolve_openrouter_key,
+    )
 
     if provider in {"cloud", "gemini"}:
         return _key()
@@ -333,6 +350,8 @@ def _provider_key(provider: str) -> str:
         return resolve_anthropic_key()
     if provider == "openai":
         return resolve_openai_key()
+    if provider == "openrouter":
+        return resolve_openrouter_key()
     raise RuntimeError(f"unknown cloud synth provider: {provider}")
 
 
@@ -345,6 +364,12 @@ def _generate_api(prompt: str, *, provider: str, model_id: str, timeout: int,
     if provider == "anthropic":
         url = "https://api.anthropic.com/v1/messages"
         headers.update({"x-api-key": key, "anthropic-version": "2023-06-01"})
+    elif provider == "openrouter":
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers.update({"Authorization": f"Bearer {key}",
+                        "HTTP-Referer": "https://github.com/mrkinglollipop/Khipu",
+                        "X-Title": "Khipu"})
+        payload["usage"] = {"include": True}
     else:
         url = "https://api.openai.com/v1/chat/completions"
         headers["Authorization"] = f"Bearer {key}"
@@ -381,6 +406,12 @@ def _generate_anthropic(prompt: str, *, model_id: str, timeout: int, retries: in
 def _generate_openai(prompt: str, *, model_id: str, timeout: int, retries: int,
                      caller: str = "synth") -> str:
     return _generate_api(prompt, provider="openai", model_id=model_id,
+                         timeout=timeout, retries=retries, caller=caller)
+
+
+def _generate_openrouter(prompt: str, *, model_id: str, timeout: int, retries: int,
+                         caller: str = "synth") -> str:
+    return _generate_api(prompt, provider="openrouter", model_id=model_id,
                          timeout=timeout, retries=retries, caller=caller)
 
 
@@ -575,6 +606,7 @@ def _generate(prompt: str, *, timeout: int | None = None, retries: int = 2,
         )
     adapters = {"cloud": _generate_cloud, "gemini": _generate_gemini,
                 "anthropic": _generate_anthropic, "openai": _generate_openai,
+                "openrouter": _generate_openrouter,
                 "claude-cli": _generate_claude_cli, "codex-cli": _generate_codex_cli}
     if provider not in adapters:
         raise RuntimeError(f"unknown synth provider: {provider}")
@@ -908,6 +940,15 @@ def _parse_capture(raw: str) -> dict[str, Any] | None:
     return parsed
 
 
+def _fallback_provider() -> str | None:
+    """Use Gemini for one invalid-capture retry only when its key resolves."""
+    try:
+        _key()
+    except RuntimeError:
+        return None
+    return "gemini"
+
+
 def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
     """Return a capture payload (without ts/session_id) or None when the model
     judged nothing durable. Raises on transport/model failure so the caller can
@@ -925,11 +966,7 @@ def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
         from khipu.models import DEFAULT_SYNTH_MODEL, synth_settings
 
         provider = (synth_settings().get("provider") or "cloud").strip().lower()
-        if provider not in {"cloud", "gemini", "local"}:
-            try:
-                _key()
-            except RuntimeError:
-                raise RuntimeError(f"extract: model returned non-JSON: {raw[:200]!r}") from None
+        if provider not in {"cloud", "gemini", "local"} and _fallback_provider() == "gemini":
             raw = _generate_gemini(prompt, model_id=DEFAULT_SYNTH_MODEL, timeout=45, retries=2,
                                    caller="capture-fallback")
             parsed = _parse_capture(raw)
