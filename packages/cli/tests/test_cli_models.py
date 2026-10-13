@@ -47,7 +47,7 @@ class ModelsCliTest(unittest.TestCase):
         rc, raw = _run(["models"])
         self.assertEqual(rc, 0)
         doc = json.loads(raw)
-        self.assertEqual(doc["synth"]["provider"], "cloud")
+        self.assertEqual(doc["synth"]["provider"], "gemini")
         self.assertEqual(doc["synth"]["model_id"], "gemini-2.5-flash")
         self.assertEqual(doc["vision"]["provider"], "off")
         self.assertIsNone(doc["models_error"])

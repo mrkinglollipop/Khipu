@@ -127,6 +127,8 @@ PATH_SETTINGS: dict[str, tuple[str, ...]] = {
     "graph_sqlite": ("KHIPU_GRAPH_SQLITE", "ALZY_GRAPH_SQLITE"),
     # last-resort file the Gemini key may be read from
     "gemini_key_file": ("KHIPU_GEMINI_KEY_FILE",),
+    "anthropic_key_file": ("KHIPU_ANTHROPIC_KEY_FILE",),
+    "openai_key_file": ("KHIPU_OPENAI_KEY_FILE",),
 }
 
 

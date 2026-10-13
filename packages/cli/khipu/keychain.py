@@ -1,4 +1,4 @@
-"""macOS Keychain helpers for Khipu secrets (DSN + Gemini)."""
+"""macOS Keychain helpers for Khipu secrets (DSN and provider keys)."""
 from __future__ import annotations
 
 import os
@@ -11,6 +11,8 @@ SERVICE = os.environ.get("KHIPU_KEYCHAIN_SERVICE") or os.environ.get(
 LEGACY_SERVICE = "Alzy"
 DSN_ACCOUNT = "database_url"
 GEMINI_ACCOUNT = "gemini_api_key"
+ANTHROPIC_ACCOUNT = "anthropic_api_key"
+OPENAI_ACCOUNT = "openai_api_key"
 OPENAI_COMPAT_ACCOUNT = "openai_compat_api_key"
 VOYAGE_ACCOUNT = "voyage_api_key"
 CONFIG_DIR = Path.home() / ".config" / "khipu"
@@ -210,6 +212,49 @@ def _gemini_key_file() -> Path | None:
     return path_setting("gemini_key_file") or (Path(legacy) if legacy else None)
 
 
+def get_anthropic_key() -> str | None:
+    return get_password(ANTHROPIC_ACCOUNT)
+
+
+def set_anthropic_key(key: str) -> None:
+    set_password(ANTHROPIC_ACCOUNT, key.strip())
+
+
+def get_openai_key() -> str | None:
+    return get_password(OPENAI_ACCOUNT)
+
+
+def set_openai_key(key: str) -> None:
+    set_password(OPENAI_ACCOUNT, key.strip())
+
+
+def _resolve_provider_key(provider: str, *, key_file: Path | None = None) -> str:
+    from khipu.config import path_setting
+
+    env_name = f"{provider.upper()}_API_KEY"
+    env = (os.environ.get(env_name) or "").strip()
+    if env:
+        return env
+    key = get_anthropic_key() if provider == "anthropic" else get_openai_key()
+    if key:
+        return key
+    path = key_file or path_setting(f"{provider}_key_file")
+    if path is not None and path.is_file():
+        key = path.read_text(encoding="utf-8").strip()
+        if key:
+            return key
+    raise RuntimeError(f"No {provider.title()} key. Pipe it to `khipu secrets --set "
+                       f"{provider}_api_key`, or export {env_name}.")
+
+
+def resolve_anthropic_key(*, key_file: Path | None = None) -> str:
+    return _resolve_provider_key("anthropic", key_file=key_file)
+
+
+def resolve_openai_key(*, key_file: Path | None = None) -> str:
+    return _resolve_provider_key("openai", key_file=key_file)
+
+
 def dsn_file_health(path: Path | None = None) -> dict:
     """Is the on-disk DSN actually usable, without revealing it?
 
@@ -270,8 +315,17 @@ def secrets_status() -> dict:
     """
     from khipu.paths import data_dir
 
+    from khipu.config import path_setting
+
     gemini_file = _gemini_key_file()
     voyage_file = _voyage_key_file()
+    provider_files = {provider: path_setting(f"{provider}_key_file")
+                      for provider in ("anthropic", "openai")}
+    def file_has_key(path):
+        try:
+            return bool(path and path.is_file() and path.read_text(encoding="utf-8").strip())
+        except (OSError, UnicodeError):
+            return False
     active_dir = data_dir()
     dsn_in_keychain = bool(get_dsn())
     dsn_on_disk = (active_dir / "dsn").is_file() or (CONFIG_DIR / "dsn").is_file() \
@@ -284,12 +338,22 @@ def secrets_status() -> dict:
         "dsn": dsn_in_keychain or dsn_in_env or dsn_on_disk,
         "dsn_in_keychain": dsn_in_keychain,
         "gemini_in_keychain": bool(get_gemini_key()),
+        **{f"{provider}_in_keychain": bool(get_password(f"{provider}_api_key"))
+           for provider in ("anthropic", "openai")},
+        **{f"{provider}_env": bool((os.environ.get(f"{provider.upper()}_API_KEY") or "").strip())
+           for provider in ("anthropic", "openai")},
+        **{f"{provider}_file_present": bool(provider_files[provider] and
+                                            provider_files[provider].is_file())
+           for provider in ("anthropic", "openai")},
         "openai_compat_in_keychain": bool(get_openai_compat_key()),
         "voyage_in_keychain": bool(get_voyage_key()),
         "voyage_env": bool((os.environ.get("VOYAGE_API_KEY") or "").strip()),
         "voyage_file_present": bool(voyage_file and voyage_file.is_file()),
         "gemini_env": bool((os.environ.get("GEMINI_API_KEY") or "").strip()),
         "gemini_file_present": bool(gemini_file and gemini_file.is_file()),
+        "gemini_file_key_present": file_has_key(gemini_file),
+        **{f"{provider}_file_key_present": file_has_key(provider_files[provider])
+           for provider in ("anthropic", "openai")},
         "config_dir": str(active_dir),
         "default_config_dir": str(CONFIG_DIR),
         # The file DSN is the fallback every sandboxed harness lands on, so its

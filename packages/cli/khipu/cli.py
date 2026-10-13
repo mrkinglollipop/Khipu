@@ -297,6 +297,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # Keychain is denied. It went stale on 2026-08-04 and nothing noticed until
     # 2026-08-18, because every check ran where the Keychain worked.
     dsn_file_ok = bool((secrets.get("dsn_file") or {}).get("ok", True))
+    from khipu.models import synth_settings, cloud_model_id
+
+    _synth = synth_settings()
+    _provider = _synth["provider"]
+    _key_present = (_provider != "local" and any(secrets.get(f"{_provider}_{field}")
+                    for field in ("in_keychain", "env", "file_key_present")))
+    synth_provider = {"provider": _provider,
+                      "model": _synth["model_id"] if _provider == "local" else cloud_model_id(_synth),
+                      "key_present": bool(_key_present)}
+    synth_provider_ok = _provider == "local" or bool(_key_present)
     try:
         from khipu.jobs import index_freshness, job_status
 
@@ -339,6 +349,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         synth_budget["tokens_today"] = {k: _usage[k] for k in
                                         ("prompt_tokens", "output_tokens", "thought_tokens")}
         synth_budget["estimated_usd_today"] = _usage["estimated_usd"]
+        synth_budget["usage_by_provider"] = _usage["by_provider"]
     except Exception as e:  # noqa: BLE001 — accounting is informational
         synth_budget["tokens_today"] = None
         synth_budget["estimated_usd_today"] = None
@@ -592,6 +603,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "embed_coverage": embed_coverage,
         "libraries": libraries,
         "synth_budget": synth_budget,
+        "synth_provider": synth_provider,
         "literal_trgm": literal_trgm,
         "prompt_recall_snapshot": prompt_recall_snapshot,
         "prompt_recall_outcomes": prompt_recall_outcomes_block,
@@ -624,6 +636,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             and jobs_ok
             and embed_coverage_ok
             and synth_budget_ok
+            and synth_provider_ok
             and bool(_graph_backup.get("ok"))
             # graph_offsite_ok was reported but never aggregated, so a stale
             # offsite copy left doctor (and the soak probe reading doctor.ok)
@@ -672,6 +685,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "jobs_ok": jobs_ok,
         "embed_coverage_ok": embed_coverage_ok,
         "synth_budget_ok": synth_budget_ok,
+        "synth_provider_ok": synth_provider_ok,
         "recall_probe_ok": bool(recall_probe.get("ok")),
         "bundle_seal_ok": bool(bundle_seal_block.get("ok")),
         "literal_trgm_ok": bool(literal_trgm.get("ok")),
@@ -2288,6 +2302,8 @@ def cmd_notes(args: argparse.Namespace) -> int:
 # Keychain accounts: database_url reports as "dsn_in_keychain", not "database_*".
 SETTABLE_SECRETS = {
     "gemini_api_key": "gemini_in_keychain",
+    "anthropic_api_key": "anthropic_in_keychain",
+    "openai_api_key": "openai_in_keychain",
     "database_url": "dsn_in_keychain",
     "openai_compat_api_key": "openai_compat_in_keychain",
     "voyage_api_key": "voyage_in_keychain",
@@ -2667,6 +2683,7 @@ def _budget_status_all() -> dict:
         out["synth"]["tokens_today"] = {k: usage[k] for k in
                                         ("prompt_tokens", "output_tokens", "thought_tokens")}
         out["synth"]["usage_by_model"] = usage["by_model"]
+        out["synth"]["usage_by_provider"] = usage["by_provider"]
         out["synth"]["estimated_usd_today"] = usage["estimated_usd"]
     except Exception as e:  # noqa: BLE001 — accounting is informational
         out["synth"]["tokens_today"] = None
@@ -4079,13 +4096,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     md_set.add_argument(
         "--provider",
-        choices=("cloud", "local", "off"),
+        choices=("gemini", "anthropic", "openai", "cloud", "local", "off"),
         default=None,
         help="Provider for --role merge",
     )
     md_set.add_argument("--endpoint", default=None, help="Local endpoint origin")
     md_set.add_argument(
-        "--model-id",
+        "--model-id", "--model",
         dest="model_id",
         default=None,
         help="Model id for the role",

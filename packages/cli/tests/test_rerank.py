@@ -231,9 +231,9 @@ def test_the_call_uses_the_configured_cloud_synth_model_with_no_retries():
     settings = {"provider": "cloud", "endpoint": "", "model_id": "acme-model"}
     with mock.patch("khipu.models.synth_settings", return_value=settings), \
          mock.patch.object(extract, "_key", return_value="k"), \
-         mock.patch.object(extract, "_generate_cloud", return_value="[0]") as gen:
+         mock.patch.object(extract, "_generate", return_value="[0]") as gen:
         assert rerank._call_model("p", timeout=1.5) == ("[0]", "acme-model")
-    assert gen.call_args.kwargs == {"model_id": "acme-model", "timeout": 1.5, "retries": 0,
+    assert gen.call_args.kwargs == {"timeout": 1.5, "retries": 0,
                                      "caller": "rerank"}
 
 

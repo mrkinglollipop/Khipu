@@ -9,8 +9,8 @@ or functionality, every hard limit liftable, and "we need to work with power use
 | Phase | What | State |
 |---|---|---|
 | 0 | Spend made visible and bounded without dropping anything (PR #157: machine messages are not turns, `khipu budget`, usage accounting) | done 2026-10-13 |
-| 0b | Stop summarising re-emitted history after Claude Code compactions (dedupe by fingerprint) | in flight 2026-10-13, branch `fix/capture-dedupe-reemitted` |
-| 1 | Provider abstraction for the synth role: `gemini`, `anthropic`, `openai`, `local`, with a price table and per-provider daily ceilings | open |
+| 0b | Stop summarising re-emitted history after Claude Code compactions (dedupe by fingerprint) | done 2026-10-13 (PR #159) |
+| 1 | Provider abstraction for the synth role: `gemini`, `anthropic`, `openai`, `local`, with a price table and per-provider daily ceilings | done 2026-10-13 (PR #160); [evidence](2026-10-13-synth-providers-p1-verification.md) |
 | 2 | Subscription routes: `claude-cli` (`claude -p` on the user's own login) and `codex-cli` (`codex exec` on the user's own login) | open; needs phase 1 |
 | 3 | Settings UI for provider, model and key source in the desktop app; `khipu models set --role synth --provider … --model …` | open; needs phase 1 |
 

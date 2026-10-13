@@ -25,7 +25,7 @@ class ModelsTest(unittest.TestCase):
 
     def test_defaults_when_key_missing(self):
         doc = models.show_models()
-        self.assertEqual(doc["synth"]["provider"], "cloud")
+        self.assertEqual(doc["synth"]["provider"], "gemini")
         self.assertEqual(doc["synth"]["model_id"], "gemini-2.5-flash")
         self.assertEqual(doc["embed"]["model_id"], "")
         self.assertEqual(doc["vision"]["provider"], "off")
@@ -103,7 +103,7 @@ class ModelsTest(unittest.TestCase):
 
         config.save_config({"models": "not-an-object"})
         doc = models.show_models()
-        self.assertEqual(doc["synth"]["provider"], "cloud")
+        self.assertEqual(doc["synth"]["provider"], "gemini")
         self.assertIsNotNone(doc["models_error"])
         with self.assertRaises(ValueError):
             models.set_models_replace({"synth": "nope"})
@@ -163,7 +163,7 @@ class ModelsTest(unittest.TestCase):
         with mock.patch.dict(
             os.environ, {"KHIPU_TEST": "1", "KHIPU_SYNTH_PROVIDER": "cloud"}
         ):
-            self.assertEqual(models.synth_settings()["provider"], "cloud")
+            self.assertEqual(models.synth_settings()["provider"], "gemini")
         self.assertEqual(models.synth_settings()["provider"], "local")
 
     def test_apply_welcome_cloud_activates_embed(self):
