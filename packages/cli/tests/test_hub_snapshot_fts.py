@@ -61,7 +61,9 @@ _TOPICS = [
 
 _QUERIES = [
     "why did the nightly wipe the biblical library and what did we change in library scan",
-    "change",  # prefix: finds "changed" and "changes"
+    "change",  # substring: finds "changed" and "changes"
+    "brary",  # substring inside a longer word
+    "pr 36 library",  # a two-digit token sends the query to LIKE
     "search_snapshot fallback (LIKE)",  # punctuation splits the token
     "khipu-embed backfill",
     "gateway deploy stale",
@@ -117,10 +119,10 @@ class FtsParityTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def _both(self, query: str, limit: int = 12, **kw):
-        with mock.patch.object(hs, "_like_coverage", wraps=hs._like_coverage) as spy:
+        with mock.patch.object(hs, "_fts_match_terms", wraps=hs._fts_match_terms) as spy:
             fts = _search(self.fts, self.fts_dir, query, limit, **kw)
             used_fts = spy.called
-        with mock.patch.object(hs, "_like_coverage", wraps=hs._like_coverage) as spy:
+        with mock.patch.object(hs, "_fts_match_terms", wraps=hs._fts_match_terms) as spy:
             like = _search(self.like, self.like_dir, query, limit, **kw)
             self.assertFalse(spy.called, "a replica without FTS tables must stay on LIKE")
         return fts, like, used_fts
@@ -142,15 +144,20 @@ class FtsParityTest(unittest.TestCase):
                     fts, like, used_fts = self._both(query, limit)
                     self.assertEqual(_keys(fts), _keys(like))
                     self.assertEqual(fts, like)
-                    if query != "zzqq nothing matches":
-                        self.assertTrue(used_fts, "the FTS path did not run")
+                    self.assertEqual(used_fts, query != "pr 36 library", "wrong path taken")
 
-    def test_prefix_finds_inflected_forms(self) -> None:
-        fts, _, used_fts = self._both("change", kind="episode")
-        self.assertTrue(used_fts)
-        ids = {r["id"] for r in fts}
-        self.assertIn("2", ids)  # "changed"
-        self.assertIn("7", ids)  # "Changes"
+    def test_substring_inside_a_longer_word_matches_on_both_paths(self) -> None:
+        for query, expected in (("change", {"2", "7"}), ("brary", {"1", "2", "6", "8", "10"})):
+            with self.subTest(query=query):
+                fts, like, used_fts = self._both(query, kind="episode")
+                self.assertTrue(used_fts)
+                self.assertEqual(fts, like)
+                self.assertLessEqual(expected, {r["id"] for r in fts})
+
+    def test_short_token_sends_the_whole_query_to_like(self) -> None:
+        fts, like, used_fts = self._both("pr 36 library")
+        self.assertFalse(used_fts)
+        self.assertEqual(fts, like)
 
     def test_filters_behave_identically(self) -> None:
         cases = [
@@ -181,7 +188,7 @@ class FtsParityTest(unittest.TestCase):
         self.assertEqual(fts, like)
 
     def test_fts_error_falls_back_to_like(self) -> None:
-        with mock.patch.object(hs, "_fts_match_expr", return_value='"unterminated'):
+        with mock.patch.object(hs, "_fts_match_terms", return_value=['"unterminated']):
             fts = _search(self.fts, self.fts_dir, _QUERIES[0])
         like = _search(self.like, self.like_dir, _QUERIES[0])
         self.assertTrue(like)

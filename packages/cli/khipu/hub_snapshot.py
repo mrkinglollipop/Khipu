@@ -26,7 +26,6 @@ import json
 import math
 import os
 import sqlite3
-import string
 import struct
 import sys
 import tempfile
@@ -81,8 +80,8 @@ _TABLES = (
 # writes land on an older file), so readers and incremental writers probe for
 # the table and never trust this number.
 # Version 4 adds the external-content FTS5 tables `episodes_fts`/`topics_fts`
-# and their triggers; `search_snapshot` uses them when present and falls back
-# to LIKE on a file without them.
+# (trigram) and their triggers; `search_snapshot` uses them when present and
+# falls back to LIKE on a file without them.
 SNAPSHOT_SCHEMA_VERSION = 4
 
 _DELIVERABLE_COLS = (
@@ -846,14 +845,16 @@ _TOPIC_FTS_COLS = ("body", "slug", "title")
 def _fts_table_sql(fts: str, base: str, cols: tuple[str, ...]) -> str:
     """External-content FTS5 table over ``base`` plus the triggers that keep
     it current, so every writer of ``base`` needs no FTS code. A ``delete``
-    must pass the exact values that were indexed, which ``old.*`` does."""
+    must pass the exact values that were indexed, which ``old.*`` does.
+    Trigram phrases are substring matches, which is what ``LIKE '%tok%'``
+    does; no ``remove_diacritics``, because LIKE does not strip them."""
     col_list = ", ".join(cols)
     new_vals = ", ".join(f"new.{c}" for c in cols)
     old_vals = ", ".join(f"old.{c}" for c in cols)
     return f"""
         CREATE VIRTUAL TABLE {fts} USING fts5(
             {col_list}, content='{base}', content_rowid='rowid',
-            tokenize='unicode61 remove_diacritics 2'
+            tokenize='trigram'
         );
         CREATE TRIGGER {fts}_ai AFTER INSERT ON {base} BEGIN
             INSERT INTO {fts}(rowid, {col_list}) VALUES (new.rowid, {new_vals});
@@ -1679,10 +1680,11 @@ def _token_match_sqlite(
     return " OR ".join(wheres), " + ".join(scores), where_params + score_params
 
 
-FTS_CANDIDATES = 50
 _FTS_STATE: dict[str, Any] = {"key": None, "ready": False}
 _FTS_FALLBACK_LOGGED = False
-_ASCII_FOLD = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+# A trigram index cannot answer a token shorter than this; such a query goes
+# to LIKE whole, so one query never mixes the two matchers.
+_FTS_MIN_TOKEN = 3
 
 
 def _fts_fallback(reason: str) -> None:
@@ -1693,8 +1695,10 @@ def _fts_fallback(reason: str) -> None:
 
 
 def _fts_ready(con: sqlite3.Connection) -> bool:
-    """Both FTS tables exist on the replica ``con`` reads. One ``sqlite_master``
-    lookup per replica generation (path, mtime, size) per process."""
+    """Both trigram FTS tables exist on the replica ``con`` reads. One
+    ``sqlite_master`` lookup per replica generation (path, mtime, size) per
+    process. A table with another tokenizer would not match like LIKE, so it
+    counts as absent."""
     path = snapshot_path()
     try:
         st = path.stat()
@@ -1705,24 +1709,27 @@ def _fts_ready(con: sqlite3.Connection) -> bool:
         return _FTS_STATE["ready"]
     names = {r[0] for r in con.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table' "
-        "AND name IN ('episodes_fts', 'topics_fts')"
+        "AND name IN ('episodes_fts', 'topics_fts') AND sql LIKE '%trigram%'"
     )}
     ready = names == {"episodes_fts", "topics_fts"}
     _FTS_STATE.update(key=key, ready=ready)
     if not ready:
-        _fts_fallback("replica has no FTS tables")
+        _fts_fallback("replica has no trigram FTS tables")
     return ready
 
 
-def _fts_match_expr(tokens: Sequence[str]) -> str:
-    return " OR ".join('"' + tok.replace('"', '""') + '"*' for tok in tokens)
+def _fts_match_terms(tokens: Sequence[str]) -> list[str]:
+    """One quoted phrase per token: a trigram phrase is a substring match."""
+    return ['"' + tok.replace('"', '""') + '"' for tok in tokens]
 
 
-def _like_coverage(texts: Sequence[Any], tokens: Sequence[str]) -> int:
-    """Distinct tokens found as a substring of any text, with SQLite LIKE's
-    ASCII-only case folding: the same count the LIKE path orders by."""
-    folded = [str(t or "").translate(_ASCII_FOLD) for t in texts]
-    return sum(1 for tok in tokens if any(tok in f for f in folded))
+def _fts_coverage_sql(fts: str, nterms: int) -> str:
+    """``(rid, n)`` per matching row, ``n`` = distinct tokens with a substring
+    hit in any indexed column: the LIKE path's coverage score."""
+    hits = " UNION ALL ".join(
+        f"SELECT rowid FROM {fts} WHERE {fts} MATCH ?" for _ in range(nterms)
+    )
+    return f"(SELECT rowid AS rid, count(*) AS n FROM ({hits}) GROUP BY rowid)"
 
 
 def _id_shaped(term: str) -> bool:
@@ -1890,26 +1897,28 @@ def search_snapshot(
     def oversample(n: int) -> int:
         return n * 4 if time_filtered and n > 0 else n
 
-    # FTS supplies candidates (prefix terms, bm25 order); the LIKE path's
-    # coverage order is then recomputed over the same columns, so rows both
-    # paths return come back in the same order. A token-less query stays on LIKE.
-    use_fts = bool(search_tokens(query)) and (topic_n > 0 or episode_n > 0) and _fts_ready(con)
-    match_expr = _fts_match_expr(tokens) if use_fts else ""
+    # FTS replaces only the any-token WHERE and the coverage score; every
+    # other predicate, the tie-breaks and the LIMIT are the LIKE path's, so
+    # both return the same rows in the same order.
+    use_fts = (
+        bool(search_tokens(query))
+        and all(len(tok) >= _FTS_MIN_TOKEN for tok in tokens)
+        and (topic_n > 0 or episode_n > 0)
+        and _fts_ready(con)
+    )
+    match_terms = _fts_match_terms(tokens) if use_fts else []
 
-    def fts_rows(sql: str, params: Sequence[Any], ntext: int, order: Any, n: int) -> list[Any] | None:
-        """Candidates from FTS sorted like the LIKE path; ``None`` on an FTS error."""
+    def fts_rows(sql: str, params: Sequence[Any], n: int) -> list[Any] | None:
+        """Rows from the FTS statement; ``None`` on an FTS error."""
         nonlocal use_fts
         if not use_fts:
             return None
         try:
-            got = con.execute(sql, (match_expr, *params, max(FTS_CANDIDATES, oversample(n)))).fetchall()
+            return con.execute(sql, (*match_terms, *params, oversample(n))).fetchall()
         except sqlite3.OperationalError as exc:
             use_fts = False
             _fts_fallback(f"FTS query failed: {exc}")
             return None
-        order(got)
-        got.sort(key=lambda r: _like_coverage(r[-ntext:], tokens), reverse=True)
-        return [r[:-ntext] for r in got[:oversample(n)]]
 
     if topic_n > 0:
         topic_time_clause = ""
@@ -1927,18 +1936,15 @@ def search_snapshot(
         """
         rows = fts_rows(
             f"""
-            WITH hits AS (
-                SELECT rowid AS rid, bm25(topics_fts) AS score FROM topics_fts WHERE topics_fts MATCH ?
-            )
             SELECT 'topic' AS kind, slug AS id, COALESCE(title, slug) AS label,
-                   substr(body, 1, 4000) AS snippet, COALESCE(updated_at, created_at) AS ts,
-                   body, slug, COALESCE(title, '')
-            FROM hits JOIN topics ON topics.rowid = hits.rid
+                   substr(body, 1, 4000) AS snippet, COALESCE(updated_at, created_at) AS ts
+            FROM {_fts_coverage_sql("topics_fts", len(match_terms))} c
+            JOIN topics ON topics.rowid = c.rid
             WHERE deleted_at IS NULL{topic_time_clause}
-            ORDER BY hits.score
+            ORDER BY c.n DESC, slug ASC
             LIMIT ?
             """,
-            topic_time_params, 3, lambda got: got.sort(key=lambda r: r[1]), topic_n,
+            topic_time_params, topic_n,
         )
         if rows is None:
             split_at = len(topic_params) // 2 if search_tokens(query) else len(topic_params)
@@ -1992,26 +1998,22 @@ def search_snapshot(
         """
         # Token matching binds WHERE and ORDER BY separately; the thread
         # predicate sits between them in SQL and must sit there in params too.
-        def episode_sort(got: list[Any]) -> None:
-            # ts DESC, id DESC as SQLite orders it: NULL ts sorts last.
-            got.sort(key=lambda r: int(r[1]), reverse=True)
-            got.sort(key=lambda r: (r[4] is not None, r[4] or ""), reverse=True)
-
+        # ``episodes`` is open_snapshot's temp view, so join on the INTEGER
+        # PRIMARY KEY (the FTS rowid), not the view's rowid.
+        # ``id`` in ORDER BY resolves to the CAST(id AS TEXT) alias, as it
+        # does in the LIKE statement, so the tie-break is the same text order.
         rows = fts_rows(
             f"""
-            WITH hits AS (
-                SELECT rowid AS rid, bm25(episodes_fts) AS score FROM episodes_fts WHERE episodes_fts MATCH ?
-            )
             SELECT 'episode' AS kind, CAST(id AS TEXT) AS id, summary AS label,
                    summary AS snippet, ts, {session_expr} AS sid,
-                   {project_expr} AS proj, {harness_expr} AS harn,
-                   {", ".join(_episode_ilike_columns())}
-            FROM hits JOIN episodes ON episodes.id = hits.rid
+                   {project_expr} AS proj, {harness_expr} AS harn
+            FROM {_fts_coverage_sql("episodes_fts", len(match_terms))} c
+            JOIN episodes ON episodes.id = c.rid
             WHERE {ep_live}({t3_predicate}){identity_clause}
-            ORDER BY hits.score
+            ORDER BY c.n DESC, ts DESC, id DESC
             LIMIT ?
             """,
-            (*t3_params, *identity_params), len(_episode_ilike_columns()), episode_sort, episode_n,
+            (*t3_params, *identity_params), episode_n,
         )
         if rows is None:
             split_at = len(episode_params) // 2 if search_tokens(query) else len(episode_params)
