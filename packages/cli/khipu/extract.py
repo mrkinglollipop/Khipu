@@ -472,12 +472,12 @@ CODEX_CLI_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
 def _codex_cli_effort() -> str:
-    """Reasoning effort for the summariser's Codex call. Without it Codex uses
-    the user's own config default, which on the maintainer's Mac is the top
-    effort: 50 to 77 s per capture in the 2026-10-13 gate. Summarising needs
-    none of that; ``KHIPU_CODEX_CLI_EFFORT`` raises it."""
-    effort = (os.environ.get("KHIPU_CODEX_CLI_EFFORT") or "low").strip().lower()
-    return effort if effort in CODEX_CLI_EFFORTS else "low"
+    """Reasoning effort for the summariser's Codex call; ``KHIPU_CODEX_CLI_EFFORT``
+    changes it. Medium, not low: at low, gpt-6-luna returned an empty record
+    for a 14,000-char window full of decisions, every time (2026-10-13 gate);
+    at medium it returned them in 10 s against 7 s."""
+    effort = (os.environ.get("KHIPU_CODEX_CLI_EFFORT") or "medium").strip().lower()
+    return effort if effort in CODEX_CLI_EFFORTS else "medium"
 
 
 def _generate_codex_cli(prompt: str, *, model_id: str, timeout: int = 60, retries: int = 2,
@@ -967,6 +967,22 @@ def _fallback_provider() -> str | None:
     return "gemini"
 
 
+# A window at least this long that comes back with no summary and no items is
+# treated as a suspect reply, not as "nothing durable": short fragments are
+# legitimately empty (the gate's 481- and 561-char windows were).
+EMPTY_REPLY_MIN_CHARS = 2000
+
+
+def _blank_capture(parsed: dict[str, Any]) -> bool:
+    summary = parsed.get("summary")
+    if isinstance(summary, list):
+        if not all(isinstance(x, str) for x in summary):
+            return False  # malformed, not blank: the type check below rejects it
+        summary = " ".join(summary)
+    return not str(summary or "").strip() and not any(
+        parsed.get(k) for k in ("decisions", "preferences", "open_loops", "closed_loops"))
+
+
 def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
     """Return a capture payload (without ts/session_id) or None when the model
     judged nothing durable. Raises on transport/model failure so the caller can
@@ -976,18 +992,23 @@ def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
     prompt = _build_prompt(cwd=cwd, transcript=transcript)
     raw = _generate(prompt, caller="capture")
     parsed = _parse_capture(raw)
-    if parsed is None:
-        # A non-Gemini provider that answered with something other than the
-        # capture JSON (the 2026-10-13 gate: Haiku obeyed a prompt inside the
-        # transcript twice in 15 windows) gets one Gemini retry for this
-        # window rather than a failed job, when a Gemini key exists.
+    blank = parsed is not None and _blank_capture(parsed) and len(transcript) >= EMPTY_REPLY_MIN_CHARS
+    if parsed is None or blank:
+        # A non-Gemini provider gets one Gemini retry for this window, when a
+        # Gemini key exists, in two cases found by the 2026-10-13 gate: a reply
+        # that is not the capture JSON (Haiku obeyed a prompt inside the
+        # transcript twice in 15 windows), and an empty record for a window
+        # with real content (Luna at low effort emptied a 14,000-char window
+        # full of decisions). An empty record the retry confirms is kept.
         from khipu.models import DEFAULT_SYNTH_MODEL, synth_settings
 
         provider = (synth_settings().get("provider") or "cloud").strip().lower()
         if provider not in {"cloud", "gemini", "local"} and _fallback_provider() == "gemini":
-            raw = _generate_gemini(prompt, model_id=DEFAULT_SYNTH_MODEL, timeout=45, retries=2,
-                                   caller="capture-fallback")
-            parsed = _parse_capture(raw)
+            retry_raw = _generate_gemini(prompt, model_id=DEFAULT_SYNTH_MODEL, timeout=45, retries=2,
+                                         caller="capture-fallback")
+            retried = _parse_capture(retry_raw)
+            if retried is not None or parsed is None:
+                raw, parsed = retry_raw, retried
     if parsed is None:
         raise RuntimeError(f"extract: model returned non-JSON: {raw[:200]!r}")
     # A model that returns a list here used to become the episode summary via

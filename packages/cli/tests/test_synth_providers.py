@@ -457,7 +457,7 @@ def test_cli_exact_argv_stdin_env_usage_budget_and_no_capture(provider, tmp_path
         else:
             assert argv == ['codex', 'exec', '--json', '--ephemeral', '-s', 'read-only',
                             '--skip-git-repo-check', '-m', 'm', '-o', argv[10], '-C', kw['cwd'],
-                            '--ignore-user-config', '-c', 'model_reasoning_effort=low', '-']
+                            '--ignore-user-config', '-c', 'model_reasoning_effort=medium', '-']
             assert not Path(argv[10]).is_relative_to(cwd)
         return cli_reply(provider, argv)
     with mock.patch.object(extract.subprocess, 'run', side_effect=run), \
@@ -679,11 +679,40 @@ def test_cli_binary_resolves_without_path_and_honours_the_override(tmp_path, mon
 
 def test_codex_cli_effort_defaults_low_and_is_raisable(monkeypatch):
     monkeypatch.delenv('KHIPU_CODEX_CLI_EFFORT', raising=False)
-    assert extract._codex_cli_effort() == 'low'
+    assert extract._codex_cli_effort() == 'medium'
     monkeypatch.setenv('KHIPU_CODEX_CLI_EFFORT', 'High')
     assert extract._codex_cli_effort() == 'high'
     monkeypatch.setenv('KHIPU_CODEX_CLI_EFFORT', 'turbo; rm -rf')
-    assert extract._codex_cli_effort() == 'low'
+    assert extract._codex_cli_effort() == 'medium'
+
+
+def test_empty_record_for_a_real_window_is_retried_once_and_a_short_one_is_not():
+    models.set_models_merge_role('synth', provider='codex-cli', model_id='gpt-6-luna')
+    empty = json.dumps({'summary': '', 'decisions': [], 'open_loops': [], 'closed_loops': []})
+    good = json.dumps({'summary': 'Chose the watch rules.', 'decisions': ['Use rule A.']})
+    big = 'USER: decide the watch rules\nASSISTANT: ' + 'detail ' * 400
+    with mock.patch.object(extract, '_generate_codex_cli', return_value=empty), \
+         mock.patch.object(extract, '_key', return_value='fake'), \
+         mock.patch.object(extract, '_generate_gemini', return_value=good) as gem:
+        out = extract.extract_memory(big, cwd='/p')
+    assert out['summary'] == 'Chose the watch rules.' and gem.call_count == 1
+    # A short fragment is legitimately empty: no retry.
+    with mock.patch.object(extract, '_generate_codex_cli', return_value=empty), \
+         mock.patch.object(extract, '_key', return_value='fake'), \
+         mock.patch.object(extract, '_generate_gemini', return_value=good) as gem:
+        extract.extract_memory('ASSISTANT: ok, noted.', cwd='/p')
+    assert gem.call_count == 0
+    # The retry failing to parse never turns a valid empty record into an error.
+    with mock.patch.object(extract, '_generate_codex_cli', return_value=empty), \
+         mock.patch.object(extract, '_key', return_value='fake'), \
+         mock.patch.object(extract, '_generate_gemini', return_value='not json') as gem:
+        extract.extract_memory(big, cwd='/p')
+    assert gem.call_count == 1
+    # Gemini itself is never retried against itself.
+    models.set_models_merge_role('synth', provider='gemini', model_id='gemini-2.5-flash')
+    with mock.patch.object(extract, '_generate_gemini', return_value=empty) as gem:
+        extract.extract_memory(big, cwd='/p')
+    assert gem.call_count == 1
 
 
 def test_wrong_task_reply_from_a_cli_provider_falls_back_to_gemini_once():
