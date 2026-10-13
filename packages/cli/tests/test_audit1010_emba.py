@@ -523,10 +523,11 @@ class BackfillTailPruneTest(unittest.TestCase):
     def _bulk(self, *_args, **_kwargs):
         yield mock.Mock()
 
-    def _run(self, failing=False, chunks=None):
+    def _run(self, failing=False, chunks=None, old=None):
         cur = _PruneCursor()
-        old = {("episode", "7", 0): "old", ("episode", "7", 1): "tail1",
-               ("episode", "7", 2): "tail2"}
+        old = old if old is not None else {
+            ("episode", "7", 0): "old", ("episode", "7", 1): "tail1",
+            ("episode", "7", 2): "tail2"}
         with mock.patch("khipu.db.connect", return_value=_Conn(cur)), \
                 mock.patch.object(embed, "_resolve_profile", return_value="prof"), \
                 mock.patch.object(embed, "_existing_hashes", return_value=old), \
@@ -549,6 +550,13 @@ class BackfillTailPruneTest(unittest.TestCase):
     def test_successful_empty_replacement_prunes_every_old_chunk(self) -> None:
         cur = self._run(chunks=[])
         self.assertEqual(cur.deletes[0][3], [-1])
+
+    def test_a_source_with_no_stale_index_issues_no_delete(self) -> None:
+        # The steady state of every nightly: nothing to prune, so no round trip.
+        self.assertEqual(self._run(old={("episode", "7", 0): "old"}).deletes, [])
+        self.assertEqual(self._run(old={}).deletes, [])
+        # An unrelated source's stored indexes never trigger a delete here.
+        self.assertEqual(self._run(old={("episode", "9", 4): "x"}).deletes, [])
 
 
 class MediaLimitTest(unittest.TestCase):

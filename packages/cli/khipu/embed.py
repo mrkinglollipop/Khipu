@@ -1820,10 +1820,19 @@ def backfill(
                     conn.commit()
             stats["chunks_pruned"] = 0
             stats["topic_chunks_pruned"] = 0
+            # `have` already lists every stored chunk index, so only a source
+            # that holds an index outside its current chunks needs a DELETE.
+            # One statement per source (17,000 of them, each a round trip to
+            # the hub) made this loop the 15 minutes of every nightly backfill.
+            stored_idx: dict[tuple[str, str], set[int]] = {}
+            for stored_kind, stored_ref, stored_i in have:
+                stored_idx.setdefault((stored_kind, stored_ref), set()).add(stored_i)
             for (source_kind, ref), valid in valid_idx.items():
                 if (source_kind, ref) in failed_refs:
                     continue
                 if queued_by_ref.get((source_kind, ref), 0) < needed_by_ref[(source_kind, ref)]:
+                    continue
+                if stored_idx.get((source_kind, ref), set()) <= valid:
                     continue
                 cur.execute(
                     "DELETE FROM memory_embeddings WHERE profile = %s AND kind = %s "
