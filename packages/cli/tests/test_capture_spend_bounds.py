@@ -212,7 +212,7 @@ class _SynthBudget(unittest.TestCase):
 
 class SynthBudgetTest(_SynthBudget):
     def test_defaults(self):
-        self.assertEqual(em.SYNTH_DAILY_CALL_BUDGET, 2000)
+        self.assertEqual(em.SYNTH_DAILY_CALL_BUDGET, 5000)
         self.assertEqual(em.EMBED_DAILY_CALL_BUDGET, 100000)
         self.assertEqual(em.LIBRARY_DAILY_CALL_BUDGET, 2000)
         self.assertTrue(issubclass(em.BudgetExhausted, RuntimeError))
@@ -253,7 +253,7 @@ class SynthBudgetTest(_SynthBudget):
                     "warn", "available"):
             self.assertIn(key, st)
         self.assertEqual((st["calls"], st["cap"], st["remaining"], st["exhausted"], st["warn"],
-                          st["cap_source"]), (0, 2000, 2000, False, False, "default"))
+                          st["cap_source"]), (0, 5000, 5000, False, False, "default"))
 
     def test_generate_refuses_before_the_network_and_charges_per_attempt(self):
         calls = []
@@ -389,7 +389,7 @@ class BudgetCapPrecedenceTest(_SynthBudget):
     def test_config_over_env_over_default(self):
         from khipu.config import set_int_setting
 
-        self.assertEqual(em._budget_cap("synth"), (2000, "default"))
+        self.assertEqual(em._budget_cap("synth"), (5000, "default"))
         with mock.patch.dict(os.environ, {"KHIPU_SYNTH_DAILY_CALLS": "30"}):
             self.assertEqual(em._budget_cap("synth"), (30, "env"))
             set_int_setting("synth_daily_calls", 7)
@@ -430,7 +430,7 @@ class BudgetCapPrecedenceTest(_SynthBudget):
         rc, out = _run(["config", "--unset", "synth_daily_calls"])
         self.assertEqual(rc, 0)
         self.assertIsNone(int_setting("synth_daily_calls"))
-        self.assertEqual(em._budget_cap("synth"), (2000, "default"))
+        self.assertEqual(em._budget_cap("synth"), (5000, "default"))
 
 
 class BudgetCommandTest(_SynthBudget):

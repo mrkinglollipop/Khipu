@@ -20,7 +20,7 @@ One PR per phase, merged alone and soaked.
 
 - Today: `models.synth` is `gemini-2.5-flash` via the Gemini REST API, thinking off, 4,096 max output;
   a capture call is about 3,000 prompt tokens and 400 output tokens (measured from `usageMetadata` on
-  2026-10-13), roughly $0.002 a call; a heavy day is 1,000–2,000 calls.
+  2026-10-13), roughly $0.002 a call; a heavy day is 1,000–2,000 calls (the owner reached 1,227 by mid-afternoon on 2026-10-13 with four parallel drainers, so the shipped ceiling is 5,000).
 - Gemini 2.5 Flash $0.30 in / $2.50 out (batch half; cached input $0.03). Gemini 2.5 Flash-Lite $0.10 /
   $0.40. Google's models page now steers new projects to 3.x Flash-Lite and says 2.5 access is limited to
   projects that already used it; no shutdown date.

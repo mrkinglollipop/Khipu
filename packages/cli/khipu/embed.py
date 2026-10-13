@@ -397,8 +397,11 @@ LIBRARY_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_LIBRARY_EMBED_DAILY_CALLS"
 # unit per HTTP attempt. On 2026-10-13 the capture summariser ran the Google
 # project into its monthly spending cap: nothing bounded its calls per day, and
 # split capture windows made one call per 14,000-char part. This is the
-# ceiling; 0 turns it off.
-SYNTH_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_SYNTH_DAILY_CALLS", "2000"))
+# ceiling; 0 turns it off. 5,000 is sized for a power user running many
+# agents (the owner's 2026-10-13 stood at 1,227 by mid-afternoon with four
+# parallel drainers; 2,000 was too close), and at Gemini Flash prices it
+# bounds a runaway day at about $10.
+SYNTH_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_SYNTH_DAILY_CALLS", "5000"))
 # Every ceiling is the owner's to lift: config.json (`khipu budget lift`,
 # `khipu config --set <key> N`) wins over the env, which wins over the default.
 BUDGET_SCOPES: dict[str, tuple[str, str]] = {
