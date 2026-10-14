@@ -23,8 +23,10 @@ version with no file changing. The version moves only when the effective view
 changes (each account's state, until, scope, basis and disagreement; the
 rules; the note; the holds): who wrote an entry and when are shown but are
 not part of it, so the same report from many conversations does not move it.
-The version is kept in view.json; if that file is lost the count starts again,
-and a reader holding a later version than the current one treats it as unseen.
+The version is kept in view.json with a random ``epoch``; if that file is
+lost or replaced the count starts again under a new epoch, and ``since``
+answers a version newer than the current one, or from another epoch, with
+everything (``complete: false``).
 
 "Owner only" (rules, the note, pauses, lifts and clears) is a convention, not
 a lock: Khipu holds no credential. The CLI asks for a typed confirmation on a
@@ -65,7 +67,6 @@ HOLD_REASONS = {"machine_busy": "machine busy", "disk_low": "disk low", "keep": 
                 "outage": "outage", "other": "other"}
 DOWN_REASONS = {"not_signed_in": "not signed in", "not_installed": "not installed",
                 "out_of_service": "out of service"}
-HOLD_TEXT_MAX = 300
 EVIDENCE_MAX = 200
 NAME_MAX = 64
 HARNESS_WORDS = {"claude_code": "Claude Code", "codex": "Codex", "aegis": "Aegis", "grok": "Grok Build",
@@ -93,6 +94,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_conversation_hold": ("duration", 24 * 3600, "How long a conversation's hold lasts"),
     "routing_conversation_hold_max": ("duration", 7 * 86400,
                                       "Longest hold a conversation may set (0: no maximum)"),
+    "routing_hold_chars": ("count", 300, "Longest words in a hold (0: no limit)"),
     "routing_owner_hold_reminder": ("duration", 90 * 86400, "Remind you of your own holds after (0: never)"),
     "routing_disagreement_warn_after": ("duration", 30 * 60, "Warn when sources disagree for longer than (0: never)"),
     "routing_summary_chars": ("count", 1500,
@@ -410,8 +412,11 @@ def _clean(text, limit: int) -> str:
 
 def parse_until(raw: str, now: datetime) -> datetime:
     """A time the owner or a conversation typed: a length (``30m``, ``in 2h``)
-    or an ISO time; an ISO time with no zone is this Mac's local time."""
+    or an ISO time; an ISO time with no zone is this Mac's local time. A bare
+    number is refused: "8" could mean 8 seconds, 8 hours or 8 pm."""
     text = str(raw or "").strip()
+    if re.fullmatch(r"(?:in\s+)?\d+(?:\.\d+)?", text, re.I):
+        raise RouteError(f"--until needs a unit: 30m, 2h or 3d (got {raw!r}), or a time such as 2026-10-14T18:52Z")
     try:
         return now + timedelta(seconds=parse_duration(text))
     except ValueError:
@@ -481,18 +486,44 @@ def accounts() -> list[dict]:
     return out
 
 
+def _fold_accounts(config: dict) -> list[dict]:
+    """The accounts a fold shows before any entry names them: the configured
+    ``usage_accounts`` only (config.json is one of the fold's inputs). Never
+    the installed-CLI lookup: it depends on the caller's PATH, so two callers
+    would fold different account sets and move the version with nothing
+    changed. The fold adds every account an entry names."""
+    from khipu import usage
+
+    raw = config.get("usage_accounts")
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for entry in raw:
+        account = usage._account_from_entry(entry)
+        if account.get("invalid"):
+            continue
+        out.append({"key": usage._key(account), "label": account["label"], "harness": account["harness"],
+                    "home": account.get("home")})
+    return out
+
+
 def _label_for_key(key: str) -> str:
     from khipu import usage
 
     harness, _, home = key.partition("|")
     base = usage.LABELS.get(harness, harness or "?")
-    return f"{base} ({Path(home).name})" if home else base
+    return f"{base} ({_clean(Path(home).name, NAME_MAX)})" if home else base
 
 
-def resolve_account(name: str, known: list[dict] | None = None) -> str:
+def resolve_account(name: str, known: list[dict] | None = None, *, conversation: bool = False) -> str:
     """An account's key from its label, its key (``harness|login folder``) or
-    a bare harness name; RouteError when Khipu doesn't know it."""
+    a bare harness name; RouteError when Khipu doesn't know it. A login
+    folder inside a private folder, or whose name looks like a secret, is
+    refused for everyone; a conversation may name a login folder only when
+    it is one of the accounts Khipu knows, so no text of its own becomes an
+    account key or a pushed label."""
     from khipu import usage
+    from khipu.redact import redact_secrets
 
     known = accounts() if known is None else known
     raw = (name or "").strip()
@@ -500,10 +531,18 @@ def resolve_account(name: str, known: list[dict] | None = None) -> str:
         raise RouteError("name an account")
     if "|" in raw:
         harness, _, home = raw.partition("|")
-        harness = harness.strip().lower()
+        harness, home = harness.strip().lower(), home.strip()
         if harness not in usage.HARNESSES:
-            raise RouteError(f"{raw!r} names no CLI Khipu reads (claude, codex, grok, muse)")
-        return usage._key({"harness": harness, "home": home.strip() or None})
+            raise RouteError("that names no CLI Khipu reads (claude, codex, grok, muse)")
+        if home and (credential_location(home) or redact_secrets(home, force=True)[1]):
+            raise RouteError("that login folder is inside a private folder or its name looks like a secret; "
+                             "Khipu won't record it")
+        key = usage._key({"harness": harness, "home": home or None})
+        if conversation and home and key not in {a["key"] for a in known}:
+            labels = ", ".join(a["label"] for a in known) or "none"
+            raise RouteError(f"Khipu doesn't know that login folder; a conversation can report only on the "
+                             f"accounts Khipu knows: {labels}")
+        return key
     for account in known:
         if account["label"].casefold() == raw.casefold():
             return account["key"]
@@ -650,12 +689,43 @@ def _new_id(prefix: str) -> str:
     return prefix + secrets.token_hex(4)
 
 
-def _append_locked(event: dict) -> None:
-    line = json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n"
-    with open(events_file(), "a", encoding="utf-8") as fh:
-        fh.write(line)
-        fh.flush()
-        os.fsync(fh.fileno())
+def _append_locked(*events: dict) -> None:
+    """Append whole lines in one write, then fsync. A torn last line (a full
+    disk or a power loss part way through an earlier write) is ended first,
+    so it stays one unreadable line, counted in ``bad_lines``, and never
+    swallows the new one."""
+    data = "".join(json.dumps(e, sort_keys=True, ensure_ascii=False) + "\n" for e in events).encode("utf-8")
+    fd = os.open(events_file(), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            data = b"\n" + data
+        left = memoryview(data)
+        while left:
+            left = left[os.write(fd, left):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _last_written_at() -> datetime | None:
+    """The time on the newest readable line of the log (read from its tail)."""
+    try:
+        with open(events_file(), "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 65536))
+            tail = fh.read()
+    except OSError:
+        return None
+    for line in reversed(tail.split(b"\n")):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        at = _parse(event.get("written_at")) if isinstance(event, dict) else None
+        if at is not None:
+            return at
+    return None
 
 
 def read_events() -> tuple[list[dict], int]:
@@ -694,13 +764,30 @@ def _stat(path: Path | None) -> list | None:
     return [st.st_mtime_ns, st.st_size, st.st_ino]
 
 
-def _fingerprint(cfg: dict) -> dict:
-    """The inputs a fold reads; a read refolds when any of them changed."""
-    from khipu.config import config_file
+def _inputs() -> tuple[dict, dict, list[dict]]:
+    """The fold's inputs: (fingerprint, settings, accounts). Each file is
+    stat'ed before it is read, so a file saved in between makes the next
+    read refold; a fold from older settings is never kept under a newer
+    fingerprint."""
+    from khipu.config import config_file, load_config
 
+    events_stat, config_stat = _stat(events_file()), _stat(config_file())
+    config = load_config()
+    cfg = settings(config)
     seed = cfg.get("routing_rules_seed")
-    return {"events": _stat(events_file()), "config": _stat(config_file()),
-            "seed": _stat(Path(seed)) if seed else None}
+    fingerprint = {"events": events_stat, "config": config_stat, "seed": _stat(Path(seed)) if seed else None}
+    return fingerprint, cfg, _fold_accounts(config)
+
+
+def _evidence_account(event: dict, lane_map: dict, known: list[dict]) -> str | None:
+    """The account an evidence entry is about: its own, or its runner's lane
+    through ``routing_lane_map``; None when the lane isn't in the map (never
+    guessed)."""
+    key = event.get("account")
+    if key or not event.get("runner"):
+        return key or None
+    target = (lane_map.get(event["runner"]) or {}).get(event.get("lane") or "")
+    return _resolve_quiet(target, known) if target else None
 
 
 # ---- the fold ----------------------------------------------------------------------
@@ -747,10 +834,26 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
                      "cleared": True, "via": clear["via"], "evidence": None, "reason": None, "message_time": False})
 
     def stale(e: dict) -> bool:
-        return e["state"] in (OPEN, DOWN) and stale_after > 0 and (now - e["at"]).total_seconds() > stale_after
+        # Stale from the moment it turns stale_after old: the same instant
+        # fold() hands on as valid_until, so a read at that instant can't
+        # see it fresh and drop its last clock change.
+        return e["state"] in (OPEN, DOWN) and stale_after > 0 and (now - e["at"]).total_seconds() >= stale_after
 
     def later(e: dict, base: dict) -> bool:
         return _k(e) > _k(base)
+
+    # A cli, checked or owner time replaces an older guess for the same scope
+    # and window, even after that time has passed. Evidence that names no
+    # window can't be told apart from either, so it matches both.
+    strong_limits = [e for e in live if e["state"] == LIMITED and e["basis"] in STRONG_BASES]
+
+    def replaced(e: dict) -> bool:
+        return e["state"] == LIMITED and e["basis"] not in STRONG_BASES and any(
+            later(s, e) and s["scope"] == e["scope"]
+            and (s.get("window") is None or e.get("window") is None or s["window"] == e["window"])
+            for s in strong_limits)
+
+    live = [e for e in live if not replaced(e)]
 
     def limit_holds(limit: dict, pool: list[dict], scopes: tuple) -> bool:
         if limit["state"] != LIMITED or limit["until"] is None or limit["until"] <= now:
@@ -791,19 +894,23 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
     # A disagreement: the newest evidence after the one behind the shown state
     # says something else and could not override it by the order above. It
     # began with the first of the run of such reports that ends with it.
-    disagreement = None
-    if state in (LIMITED, DOWN) and behind is not None:
-        newer = sorted((e for e in whole if later(e, behind) and not stale(e) and not e.get("cleared")), key=_k)
+    def disagreement_after(base: dict, shown_state: str, pool: list[dict]) -> dict | None:
+        newer = sorted((e for e in pool if later(e, base) and not stale(e) and not e.get("cleared")), key=_k)
         run: list[dict] = []
         for e in reversed(newer):
-            if e["state"] == state:
+            if e["state"] == shown_state:
                 break
             run.append(e)
-        if run:
-            newest, first = run[0], run[-1]
-            disagreement = {"state": newest["state"], "source": newest["source"], "at": _iso(newest["at"]),
-                            "since": _iso(first["at"]), "id": newest["id"], "written_by": newest["written_by"],
-                            "until": _iso(newest["until"])}
+        if not run:
+            return None
+        newest, first = run[0], run[-1]
+        return {"state": newest["state"], "source": newest["source"], "at": _iso(newest["at"]),
+                "since": _iso(first["at"]), "id": newest["id"], "written_by": newest["written_by"],
+                "until": _iso(newest["until"])}
+
+    disagreement = None
+    if state in (LIMITED, DOWN) and behind is not None:
+        disagreement = disagreement_after(behind, state, whole)
 
     models = []
     for model in sorted({e["scope"] for e in live if e["scope"] != "all"}):
@@ -814,7 +921,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
         if pick is not None:
             models.append({"model": model, "until": _iso(pick["until"]), "basis": pick["basis"],
                            "source": pick["source"], "written_by": pick["written_by"], "at": _iso(pick["at"]),
-                           "id": pick["id"]})
+                           "id": pick["id"], "disagreement": disagreement_after(pick, LIMITED, pool)})
 
     def witness(e: dict | None) -> dict | None:
         if e is None:
@@ -851,7 +958,9 @@ def _effective_account(entry: dict) -> dict:
     last = entry.get("last_seen")
     return {"label": entry["label"], "state": entry["state"], "until": entry["until"], "basis": entry["basis"],
             "scope": entry["scope"], "reason": entry["reason"],
-            "models": [[m["model"], m["until"], m["basis"]] for m in entry["models"]],
+            "models": [[m["model"], m["until"], m["basis"],
+                        [m["disagreement"]["state"], m["disagreement"]["source"]] if m.get("disagreement") else None]
+                       for m in entry["models"]],
             "disagreement": [dis["state"], dis["source"]] if dis else None,
             "last_seen": last["state"] if last else None}
 
@@ -920,16 +1029,12 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     per_account: dict[str, list[dict]] = {}
     unmatched_raw: list[dict] = []
     for item in evidence:
-        key = item.get("account")
-        if not key and item.get("runner"):
-            target = (lane_map.get(item["runner"]) or {}).get(item.get("lane") or "")
-            key = _resolve_quiet(target, known) if target else None
-            if not key:
-                unmatched_raw.append(item)
-                continue
-            item["account"] = key
+        key = _evidence_account(item, lane_map, known)
         if not key:
+            if item.get("runner"):
+                unmatched_raw.append(item)
             continue
+        item["account"] = key
         per_account.setdefault(key, []).append(item)
     for key in [*per_account, *owner["pauses"], *owner["clears"]]:
         by_key.setdefault(key, {"key": key, "label": _label_for_key(key), "harness": key.partition("|")[0],
@@ -987,7 +1092,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         if dis["via"] == "app" or item is None:
             continue
         mattered = (item["until"] is not None and item["until"] > now) if item["state"] == LIMITED else not (
-            stale_after > 0 and (now - item["at"]).total_seconds() > stale_after)
+            stale_after > 0 and (now - item["at"]).total_seconds() >= stale_after)
         if mattered:
             outside_app.append(f"dismissal of report {dis['target']}")
 
@@ -1032,11 +1137,23 @@ def _load_view() -> dict | None:
 
 
 def _save_view(view: dict) -> None:
+    """Write the view to a temp file, fsync it, then replace view.json; a
+    failed save leaves no temp file behind."""
     path = view_file()
-    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, suffix=".tmp", encoding="utf-8") as fh:
-        json.dump(view, fh, indent=1, sort_keys=True, ensure_ascii=False)
-        tmp = Path(fh.name)
-    os.replace(tmp, path)
+    tmp: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, suffix=".tmp",
+                                         encoding="utf-8") as fh:
+            tmp = Path(fh.name)
+            json.dump(view, fh, indent=1, sort_keys=True, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        raise
 
 
 def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
@@ -1046,23 +1163,32 @@ def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
     return due is None or now < due
 
 
-def _import_seed_locked(events: list[dict], cfg: dict, now: datetime) -> str | None:
+_SEED_SHAPE = 'each entry is {"text", "source", "date"}'
+
+
+def _import_seed_locked(events: list[dict], cfg: dict, now: datetime) -> tuple[str | None, bool]:
     """Import the standing rules from ``routing_rules_seed`` once: never
     again after a ``seed_import`` event, whatever the file says later.
-    Returns why the file could not be imported, or None."""
+    Returns (why the file could not be imported or None, whether anything
+    was written). A file with an entry that has no text imports nothing and
+    writes no ``seed_import``, so the import runs once the file is fixed.
+    The rules and the marker go down in one write; a rule an earlier,
+    cut-off import already wrote is not added again."""
     path = cfg.get("routing_rules_seed")
     if not path or any(e.get("type") == "seed_import" for e in events):
-        return None
+        return None, False
     try:
         raw_text = Path(path).read_text(encoding="utf-8")
         data = json.loads(raw_text)
     except OSError:
-        return "Khipu can't read the rules seed file"
+        return "Khipu can't read the rules seed file", False
     except ValueError:
-        return "the rules seed file is not JSON"
+        return "the rules seed file is not JSON", False
     items = data.get("rules") if isinstance(data, dict) else data
     if not isinstance(items, list):
-        return 'the rules seed file must be a JSON list of {"text", "source", "date"}'
+        return f"the rules seed file must be a JSON list; {_SEED_SHAPE}", False
+    if not items:
+        return "the rules seed file lists no rules; nothing was imported", False
     rules = []
     for item in items:
         text = item.get("text") if isinstance(item, dict) else item
@@ -1070,25 +1196,43 @@ def _import_seed_locked(events: list[dict], cfg: dict, now: datetime) -> str | N
             rules.append({"text": text.strip(), "source": str((item.get("source") if isinstance(item, dict)
                                                                else "") or ""),
                           "date": str((item.get("date") if isinstance(item, dict) else "") or "")})
+    unusable = len(items) - len(rules)
+    if unusable:
+        return (f"{unusable} of the {len(items)} entries in the rules seed file have no text; nothing was imported "
+                f"({_SEED_SHAPE})"), False
+    present = {e.get("text") for e in events if e.get("type") == "rule_add" and e.get("seeded")}
     n = max((e["n"] for e in events if e.get("type") == "rule_add" and isinstance(e.get("n"), int)), default=0)
-    stamp = _iso(now)
+    last = _last_written_at()
+    stamp = _iso(last if last is not None and last > now else now)
     by = {"kind": "seed", "file": Path(path).name}
+    batch = []
     for rule in rules:
+        if rule["text"] in present:
+            continue
+        present.add(rule["text"])
         n += 1
-        _append_locked({"type": "rule_add", "id": _new_id("o"), "n": n, "text": rule["text"],
-                        "source": rule["source"], "date": rule["date"], "seeded": True, "written_by": by,
-                        "via": "seed", "written_at": stamp})
-    _append_locked({"type": "seed_import", "id": _new_id("o"), "file": Path(path).name, "count": len(rules),
-                    "sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(), "written_by": by,
-                    "via": "seed", "written_at": stamp})
-    return None
+        batch.append({"type": "rule_add", "id": _new_id("o"), "n": n, "text": rule["text"],
+                      "source": rule["source"], "date": rule["date"], "seeded": True, "written_by": by,
+                      "via": "seed", "written_at": stamp})
+    batch.append({"type": "seed_import", "id": _new_id("o"), "file": Path(path).name, "count": len(rules),
+                  "sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(), "written_by": by,
+                  "via": "seed", "written_at": stamp})
+    _append_locked(*batch)
+    return None, True
 
 
-def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprint: dict, record: bool) -> dict:
+def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprint: dict, record: bool,
+              *, saved: bool = True) -> dict:
+    """The view to keep. The version moves only when the effective view
+    changed and the view will be saved: an unsaved view keeps the last saved
+    version and carries ``saved: false``, and ``since`` answers it with
+    everything, so no reader takes an unsaved fold's number as one the
+    record keeps."""
     prev_effective = (prev or {}).get("effective") or {}
     version = int((prev or {}).get("version") or 0)
     changes = list((prev or {}).get("changes") or [])
-    if record and body["effective"] != prev_effective:
+    epoch = (prev or {}).get("epoch") or (secrets.token_hex(4) if record else None)
+    if record and saved and body["effective"] != prev_effective:
         version += 1
         changed = sorted(set(body["effective"]) | set(prev_effective),
                          key=lambda k: ({"rule": 0, "note": 1, "account": 2, "lane": 3, "hold": 4}.get(
@@ -1098,69 +1242,121 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
         changes.append({"version": version, "at": _iso(now), "entities": changed,
                         "lines": [change_line(k, view_for_lines, now, prev_effective) for k in changed]})
         changes = changes[-CHANGES_KEPT:]
-    return dict(body, schema=SCHEMA, version=version, folded_at=_iso(now), record=record, bad_lines=bad,
-                fingerprint=fingerprint, changes=changes)
+    out = dict(body, schema=SCHEMA, epoch=epoch, version=version, folded_at=_iso(now), checked_at=_iso(now),
+               record=record, bad_lines=bad, fingerprint=fingerprint, changes=changes)
+    if not saved:
+        out["saved"] = False
+    return out
 
 
-def _refold_locked(now: datetime, cfg: dict | None = None) -> dict:
-    cfg = settings() if cfg is None else cfg
-    events, _bad = read_events()
-    seed_error = _import_seed_locked(events, cfg, now)
-    fingerprint = _fingerprint(cfg)
+def _not_before_last_fold(now: datetime, prev: dict | None) -> datetime:
+    """A fold never goes back in time: ``now`` or the saved view's
+    ``folded_at``, whichever is later."""
+    folded = _parse((prev or {}).get("folded_at"))
+    return folded if folded is not None and folded > now else now
+
+
+def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
+    """Refold and save the view; the caller holds the lock."""
+    fingerprint, cfg, known = inputs or _inputs()
     events, bad = read_events()
+    seed_error, imported = _import_seed_locked(events, cfg, now)
+    if imported:
+        fingerprint = dict(fingerprint, events=_stat(events_file()))
+        events, bad = read_events()
     prev = _load_view()
-    body = fold(events, now=now, cfg=cfg, known=accounts())
+    now = _not_before_last_fold(now, prev)
+    body = fold(events, now=now, cfg=cfg, known=known)
     body["seed_error"] = seed_error
     view = _assemble(prev, body, now, bad, fingerprint, record=fingerprint["events"] is not None)
     _save_view(view)
     return view
 
 
+def _unsaved_view(now: datetime) -> dict:
+    """The view folded but not saved (a read-only or full data dir): the
+    answer is right; its version is the last saved one, and it carries
+    ``saved: false``."""
+    fingerprint, cfg, known = _inputs()
+    events, bad = read_events()
+    prev = _load_view()
+    now = _not_before_last_fold(now, prev)
+    body = fold(events, now=now, cfg=cfg, known=known)
+    body["seed_error"] = None
+    return _assemble(prev, body, now, bad, fingerprint, record=bool(events), saved=False)
+
+
 def read_view(now: datetime | None = None) -> dict:
     """The current view. Refolds when an input file changed or
-    ``valid_until`` has passed; otherwise answers from view.json. With no
+    ``valid_until`` has passed; otherwise answers from view.json. Either way
+    every input was checked just now, which ``checked_at`` says. With no
     record on this Mac (no events and no seed) nothing is written and the view
     has ``record: false`` and version 0."""
+    explicit = now is not None
     now = now or _now()
-    cfg = settings()
-    fingerprint = _fingerprint(cfg)
+    fingerprint, cfg, known = _inputs()
     prev = _load_view()
     if _fresh(prev, fingerprint, now):
-        return prev
+        return dict(prev, checked_at=_iso(now))
     if fingerprint["events"] is None and not cfg.get("routing_rules_seed"):
-        body = fold([], now=now, cfg=cfg, known=accounts())
+        body = fold([], now=now, cfg=cfg, known=known)
         body["seed_error"] = None
         return _assemble(None, body, now, 0, fingerprint, record=False)
     try:
         with _lock():
+            if not explicit:
+                now = _now()  # the clock once the lock is ours, not before waiting for it
+            inputs = _inputs()
             prev = _load_view()
-            fingerprint = _fingerprint(cfg)
-            if _fresh(prev, fingerprint, now):
-                return prev
-            return _refold_locked(now, cfg)
+            if _fresh(prev, inputs[0], now):
+                return dict(prev, checked_at=_iso(now))
+            return _refold_locked(now, inputs)
     except OSError:
         # A read-only data dir costs the saved view, never the answer.
-        events, bad = read_events()
-        body = fold(events, now=now, cfg=cfg, known=accounts())
-        body["seed_error"] = None
-        view = _assemble(prev, body, now, bad, fingerprint, record=bool(events))
-        view["saved"] = False
-        return view
+        return _unsaved_view(now)
 
 
-def _write(event: dict, now: datetime | None = None) -> tuple[dict, dict]:
-    """Append one event (id and time set by Khipu) and refold."""
-    now = now or _now()
+def _write(event: dict) -> tuple[dict, dict]:
+    """Append one event and refold. Khipu sets its id and ``written_at``: its
+    clock read once the lock is held, never earlier than the newest line
+    already in the log, so the log's times run in the order its lines were
+    written and an owner's clear is newer than every report before it. Once
+    the line is down the write is recorded: a view that can't be saved comes
+    back unsaved (``saved: false``), never as a failure that would make the
+    caller write it again."""
     event = dict(event)
     event.setdefault("id", _new_id("e"))
-    event["written_at"] = _iso(now)
+    view: dict | None = None
+    appended = False
     try:
         with _lock():
+            stamp = _now()
+            last = _last_written_at()
+            if last is not None and last > stamp:
+                stamp = last
+            event["written_at"] = _iso(stamp)
             _append_locked(event)
-            view = _refold_locked(now)
+            appended = True
+            try:
+                view = _refold_locked(stamp)
+            except OSError:
+                view = _unsaved_view(stamp)
     except OSError as exc:
-        raise RouteError(f"Khipu can't write its routing record: {exc}") from exc
+        if not appended:
+            raise RouteError(f"Khipu can't write its routing record: {exc}") from exc
+    if view is None:
+        try:
+            view = _unsaved_view(_parse(event["written_at"]) or _now())
+        except OSError:
+            view = {"version": None, "saved": False}
     return event, view
+
+
+def _done(written: dict, view: dict, **extra) -> dict:
+    out = {"ok": True, "id": written["id"], **extra, "version": view.get("version")}
+    if view.get("saved") is False:
+        out["saved"] = False
+    return out
 
 
 # ---- writes --------------------------------------------------------------------------
@@ -1185,7 +1381,7 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
     window_key = {"five-hour": "five_hour", "five_hour": "five_hour", "weekly": "weekly"}.get(window or "", None)
     if window and window_key is None:
         raise RouteError("--window must be five-hour or weekly")
-    key = resolve_account(account) if account else None
+    key = resolve_account(account, conversation=True) if account else None
     event: dict[str, Any] = {"type": "evidence", "source": "report", "state": state, "via": via,
                              "written_by": author or conversation_author()}
     if key:
@@ -1213,9 +1409,8 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
         event["until"] = _iso(min(stop, now + timedelta(seconds=cap)))
     elif state == DOWN:
         event["reason"] = "not_signed_in" if message and _SIGNIN.search(message) else "out_of_service"
-    written, view = _write(event, now)
-    return {"ok": True, "id": written["id"], "account": key, "state": state, "until": written.get("until"),
-            "basis": written.get("basis"), "version": view["version"]}
+    written, view = _write(event)
+    return _done(written, view, account=key, state=state, until=written.get("until"), basis=written.get("basis"))
 
 
 _REASON_ARGS = {"machine-busy": "machine_busy", "disk-low": "disk_low", "keep": "keep", "outage": "outage",
@@ -1227,21 +1422,24 @@ def add_hold(text: str, *, reason: str, scope: str, account: str | None = None, 
              now: datetime | None = None) -> dict:
     """A short note about one account, the Mac or all work. A conversation's
     hold lasts 24 hours by default and at most 7 days (settings); the owner's
-    lasts until he chooses, "until I clear it" included."""
+    lasts until he chooses, "until I clear it" included. Its words are at
+    most ``routing_hold_chars`` long (0: no limit)."""
     now = now or _now()
     cfg = settings()
     words = _one_line(text)
     if not words:
         raise RouteError("a hold needs its words")
-    if len(words) > HOLD_TEXT_MAX:
-        raise RouteError(f"a hold's words are at most {HOLD_TEXT_MAX} characters ({len(words)} given)")
+    most = cfg["routing_hold_chars"]
+    if most and len(words) > most:
+        raise RouteError(f"a hold's words are at most {most} characters ({len(words)} given); the setting "
+                         "routing_hold_chars raises the limit (0: no limit)")
     code = _REASON_ARGS.get(reason, reason)
     if code not in HOLD_REASONS:
         raise RouteError("--reason must be machine-busy, disk-low, keep, outage or other")
     if scope == "account":
         if not account:
             raise RouteError("name the account the hold is about")
-        hold_scope: dict = {"kind": "account", "account": resolve_account(account)}
+        hold_scope: dict = {"kind": "account", "account": resolve_account(account, conversation=not owner)}
     elif scope in ("machine", "all"):
         hold_scope = {"kind": scope}
     else:
@@ -1256,10 +1454,10 @@ def add_hold(text: str, *, reason: str, scope: str, account: str | None = None, 
         if longest:
             stop = min(stop, now + timedelta(seconds=longest))
     event = {"type": "hold", "id": _new_id("h"), "scope": hold_scope, "reason": code,
-             "text": words if owner else _clean(words, HOLD_TEXT_MAX), "until": _iso(stop), "owner": owner,
+             "text": words if owner else _clean(words, most), "until": _iso(stop), "owner": owner,
              "written_by": OWNER if owner else (author or conversation_author()), "via": via}
-    written, view = _write(event, now)
-    return {"ok": True, "id": written["id"], "until": written["until"], "version": view["version"]}
+    written, view = _write(event)
+    return _done(written, view, until=written["until"])
 
 
 def end_hold(hold_id: str, *, owner: bool = False, author: dict | None = None, via: str = "cli",
@@ -1271,15 +1469,15 @@ def end_hold(hold_id: str, *, owner: bool = False, author: dict | None = None, v
     if hold["owner"] and not owner:
         raise RouteError("that hold is the owner's: only he ends it (the app, or --owner on a terminal)")
     written, view = _write({"type": "hold_end", "target": hold_id, "via": via,
-                            "written_by": OWNER if owner else (author or conversation_author())}, now)
-    return {"ok": True, "id": written["id"], "ended": hold_id, "version": view["version"]}
+                            "written_by": OWNER if owner else (author or conversation_author())})
+    return _done(written, view, ended=hold_id)
 
 
-def _owner_write(event: dict, via: str, now: datetime | None) -> dict:
+def _owner_write(event: dict, via: str) -> dict:
     event = dict(event, written_by=OWNER, via=via)
     event.setdefault("id", _new_id("o"))
-    written, view = _write(event, now)
-    return {"ok": True, "id": written["id"], "version": view["version"]}
+    written, view = _write(event)
+    return _done(written, view)
 
 
 def pause(account: str, *, until: str | None = None, via: str, now: datetime | None = None) -> dict:
@@ -1288,7 +1486,7 @@ def pause(account: str, *, until: str | None = None, via: str, now: datetime | N
     stop = parse_until(until, now) if until else None
     if stop is not None and stop <= now:
         raise RouteError("--until must be in the future")
-    return dict(_owner_write({"type": "pause", "account": key, "until": _iso(stop)}, via, now), account=key)
+    return dict(_owner_write({"type": "pause", "account": key, "until": _iso(stop)}, via), account=key)
 
 
 def lift(account: str, *, via: str, now: datetime | None = None) -> dict:
@@ -1296,33 +1494,38 @@ def lift(account: str, *, via: str, now: datetime | None = None) -> dict:
     entry = next((a for a in read_view(now)["accounts"] if a["key"] == key), None)
     if entry is None or entry["state"] != PAUSED:
         raise RouteError("that account isn't paused")
-    return dict(_owner_write({"type": "lift", "account": key}, via, now), account=key)
+    return dict(_owner_write({"type": "lift", "account": key}, via), account=key)
 
 
 def clear(account: str, *, report_id: str | None = None, via: str, now: datetime | None = None) -> dict:
     """Clear the account (treat it as open until something newer reports on
-    it), or with ``report_id`` dismiss that one report."""
+    it), or with ``report_id`` dismiss that one report: any report the fold
+    counts for that account, one a job runner's lane reaches through the
+    lane map included."""
     key = resolve_account(account)
     if report_id:
         events, _bad = read_events()
-        ids = {str(e.get("id")) for e in events if e.get("type") == "evidence" and e.get("account") == key}
+        _fp, cfg, known = _inputs()
+        lane_map = cfg.get("routing_lane_map") or {}
+        ids = {str(e.get("id")) for e in events
+               if e.get("type") == "evidence" and _evidence_account(e, lane_map, known) == key}
         if report_id not in ids:
             raise RouteError(f"{report_id!r} is not a report about that account")
-        return dict(_owner_write({"type": "dismiss", "account": key, "target": report_id}, via, now), account=key)
-    return dict(_owner_write({"type": "clear", "account": key}, via, now), account=key)
+        return dict(_owner_write({"type": "dismiss", "account": key, "target": report_id}, via), account=key)
+    return dict(_owner_write({"type": "clear", "account": key}, via), account=key)
 
 
 def set_note(text: str, *, via: str, now: datetime | None = None) -> dict:
     """The owner's note to every conversation, kept and shown word for word."""
     if not isinstance(text, str) or not text.strip():
         raise RouteError("the note needs its words")
-    return _owner_write({"type": "note_set", "text": text.strip()}, via, now)
+    return _owner_write({"type": "note_set", "text": text.strip()}, via)
 
 
 def end_note(*, via: str, now: datetime | None = None) -> dict:
     if read_view(now)["note"] is None:
         raise RouteError("there is no note in effect")
-    return _owner_write({"type": "note_end"}, via, now)
+    return _owner_write({"type": "note_end"}, via)
 
 
 def _rule(n, now) -> dict:
@@ -1346,7 +1549,7 @@ def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | 
                 default=0) + 1
         out = _owner_write({"type": "rule_add", "n": n, "text": text.strip(),
                             "source": _one_line(source) or "added by you", "date": now.date().isoformat(),
-                            "seeded": False}, via, now)
+                            "seeded": False}, via)
     return dict(out, n=n)
 
 
@@ -1354,17 +1557,17 @@ def edit_rule(n, text: str, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
     if not isinstance(text, str) or not text.strip():
         raise RouteError("a rule needs its words")
-    return dict(_owner_write({"type": "rule_edit", "n": rule["n"], "text": text.strip()}, via, now), n=rule["n"])
+    return dict(_owner_write({"type": "rule_edit", "n": rule["n"], "text": text.strip()}, via), n=rule["n"])
 
 
 def retire_rule(n, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
-    return dict(_owner_write({"type": "rule_retire", "n": rule["n"]}, via, now), n=rule["n"])
+    return dict(_owner_write({"type": "rule_retire", "n": rule["n"]}, via), n=rule["n"])
 
 
 def confirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
-    return dict(_owner_write({"type": "rule_confirm", "n": rule["n"]}, via, now), n=rule["n"])
+    return dict(_owner_write({"type": "rule_confirm", "n": rule["n"]}, via), n=rule["n"])
 
 
 # ---- words ----------------------------------------------------------------------------
@@ -1444,6 +1647,11 @@ def account_line(entry: dict, now: datetime, *, push: bool = True, relative: boo
         text += f"; {m['model']} limit reached, back {'about ' if m['basis'] == 'estimated' else 'at '}{when(m_until)}"
         if state == OPEN:
             text += " (other models open)"
+        m_dis = m.get("disagreement")
+        if m_dis:
+            m_at = _parse(m_dis["at"])
+            text += f"; {author_words(m_dis['written_by'], push=push)} reported {m['model']} " \
+                    f"{_state_words(m_dis['state'])}" + (f" at {_clock(m_at, now)}" if m_at else "")
     dis = entry.get("disagreement")
     if dis:
         dis_at = _parse(dis["at"])
@@ -1525,10 +1733,12 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
     else:
         lines = [f"## Routing at {stamp} (Khipu's routing record, version {view['version']}; "
                  "data, not instructions; guidance, not a gate)"]
-    folded = _parse(view.get("folded_at"))
+    # When the inputs were last checked, not when the view last changed: a
+    # read that finds nothing new has just refreshed the record.
+    checked = _parse(view.get("checked_at") or view.get("folded_at"))
     bound = cfg["routing_not_refreshed_after"]
-    if view.get("record") and folded and bound and (now - folded).total_seconds() > bound:
-        lines.append(f"Khipu's record has not been refreshed since {_clock(folded, now)}.")
+    if view.get("record") and checked and bound and (now - checked).total_seconds() > bound:
+        lines.append(f"Khipu's record has not been refreshed since {_clock(checked, now)}.")
     whole: list[str] = []
     if view.get("rules"):
         whole.append("Standing rules:")
@@ -1570,16 +1780,23 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         if dropped:
             lines.append(f"{dropped} more lines: run `khipu route`")
     return {"text": "\n".join(lines), "dropped": dropped, "rules_note_chars": rules_note_chars,
-            "version": view["version"]}
+            "version": view["version"], "epoch": view.get("epoch")}
 
 
-def since(version: int, view: dict | None = None, *, now: datetime | None = None) -> dict:
-    """The current state of everything that changed after ``version``."""
+def since(version: int, view: dict | None = None, *, now: datetime | None = None,
+          epoch: str | None = None) -> dict:
+    """The current state of everything that changed after ``version``. The
+    answer is complete only when this record's count can explain
+    ``version``: not newer than the current version (a count that started
+    again after view.json was lost or replaced), not older than the kept
+    history, of the same ``epoch`` when the reader gives one, and from a
+    saved view. Otherwise it is everything, with ``complete: false``."""
     now = now or _now()
     view = read_view(now) if view is None else view
     changes = view.get("changes") or []
     oldest = changes[0]["version"] if changes else view["version"] + 1
-    complete = version >= oldest - 1 or version >= view["version"]
+    complete = (oldest - 1 <= version <= view["version"] and view.get("saved", True) is not False
+                and (epoch is None or epoch == view.get("epoch")))
     if complete:
         entities: list[str] = []
         for change in changes:
@@ -1588,8 +1805,8 @@ def since(version: int, view: dict | None = None, *, now: datetime | None = None
     else:
         entities = list(view.get("effective") or {})
     lines = [_current_line(e, view, now) for e in entities]
-    return {"since": version, "version": view["version"], "complete": complete, "entities": entities,
-            "lines": lines}
+    return {"since": version, "epoch": view.get("epoch"), "version": view["version"], "complete": complete,
+            "entities": entities, "lines": lines}
 
 
 def _current_line(entity: str, view: dict, now: datetime) -> str:
@@ -1607,6 +1824,11 @@ def _current_line(entity: str, view: dict, now: datetime) -> str:
         item = next((u for u in view["unmatched"] if u["runner"] == runner and u["lane"] == lane), None)
         if item:
             return lane_line(item, now)
+    if entity not in (view.get("effective") or {}):
+        # Gone from the view: the line stored when it went says what it was.
+        for change in reversed(view.get("changes") or []):
+            if entity in change["entities"]:
+                return change["lines"][change["entities"].index(entity)]
     return change_line(entity, view, now)
 
 
@@ -1628,10 +1850,12 @@ def doctor_block(now: datetime | None = None) -> dict:
         warnings.append(f"A limit came from {item['runner']}'s {item['lane']} lane, which isn't matched to an account.")
     after = cfg["routing_disagreement_warn_after"]
     for entry in view["accounts"]:
-        dis = entry.get("disagreement")
-        began = _parse(dis["since"]) if dis else None
-        if began and after and (now - began).total_seconds() > after:
-            warnings.append(f"Sources have disagreed about {entry['label']} for more than {_span(after)}.")
+        sides = [(entry["label"], entry.get("disagreement"))]
+        sides += [(f"{entry['label']} ({m['model']})", m.get("disagreement")) for m in entry.get("models") or []]
+        for name, dis in sides:
+            began = _parse(dis["since"]) if dis else None
+            if began and after and (now - began).total_seconds() > after:
+                warnings.append(f"Sources have disagreed about {name} for more than {_span(after)}.")
     text = summary(view, now=now) if view.get("record") else None
     if text and text["dropped"]:
         warnings.append(f"The summary had to leave out {text['dropped']} lines.")
@@ -1640,6 +1864,12 @@ def doctor_block(now: datetime | None = None) -> dict:
         warnings.append("Your rules and note are longer than the summary size.")
     if view.get("outside_app"):
         warnings.append("A rule, a pause, a clear or your note was written by something other than the app.")
+    if view.get("seed_error"):
+        warnings.append(f"The standing rules were not imported: {view['seed_error']}.")
+    bad = view.get("bad_lines") or 0
+    if bad:
+        warnings.append(f"{bad} line{'s' if bad != 1 else ''} of the routing record can't be read; "
+                        f"Khipu leaves {'them' if bad != 1 else 'it'} out.")
     return {"record": bool(view.get("record")), "version": view["version"], "folded_at": view.get("folded_at"),
             "valid_until": view.get("valid_until"),
             "accounts": [{"account": e["label"], "state": e["state"], "until": e["until"], "basis": e["basis"],
@@ -1700,6 +1930,10 @@ def _print_view(view: dict, now: datetime, account: str | None) -> None:
         dis = entry.get("disagreement")
         if dis:
             print(f"      report {dis['id']} disagrees; `khipu route clear` can dismiss one side")
+        for m in entry.get("models") or []:
+            if m.get("disagreement"):
+                print(f"      report {m['disagreement']['id']} disagrees about {m['model']}; "
+                      "`khipu route clear` can dismiss one side")
     holds = [h for h in view.get("holds") or []
              if account is None or (h["scope"].get("kind") == "account" and h["scope"].get("account") == account)]
     if holds:
@@ -1714,8 +1948,19 @@ def _print_view(view: dict, now: datetime, account: str | None) -> None:
         print(f"Rules seed: {view['seed_error']}")
 
 
+def _parse_since(raw) -> tuple[int, str | None]:
+    """``--since V`` or ``--since EPOCH:V`` (both as ``khipu route --json``
+    gives them)."""
+    epoch, _, number = str(raw).strip().rpartition(":")
+    try:
+        return int(number), (epoch or None)
+    except ValueError:
+        raise RouteError("--since takes a version number, or epoch:version") from None
+
+
 def run_cli(args) -> int:
-    """``khipu route``: read the record, or write one change to it."""
+    """``khipu route``: read the record, or write one change to it. An
+    owner's change is timed after its typed confirmation, not before."""
     cmd = getattr(args, "route_cmd", None)
     now = _now()
     try:
@@ -1723,12 +1968,13 @@ def run_cli(args) -> int:
             view = read_view(now)
             account = resolve_account(args.view_account) if getattr(args, "view_account", None) else None
             if args.since is not None:
-                out = since(args.since, view, now=now)
+                version, epoch = _parse_since(args.since)
+                out = since(version, view, now=now, epoch=epoch)
                 if args.json:
                     _print_json(out)
                 else:
                     if not out["complete"]:
-                        print(f"Version {args.since} is older than the kept history; this is everything.")
+                        print(f"Khipu can't tell what changed since version {version}; this is everything.")
                     print("\n".join(out["lines"]) if out["lines"] else "Nothing changed.")
                 return 0
             if args.summary or args.brief:
@@ -1762,6 +2008,7 @@ def run_cli(args) -> int:
                 if via is None:
                     _print_json({"ok": False, "error": _REFUSED})
                     return 2
+                now = _now()
             if len(words) == 2 and words[0] == "end":
                 _print_json(end_hold(words[1], owner=owner_flag, via=via, now=now))
                 return 0
@@ -1775,6 +2022,7 @@ def run_cli(args) -> int:
         if via is None:
             _print_json({"ok": False, "error": _REFUSED})
             return 2
+        now = _now()
         if cmd == "pause":
             out = pause(args.account, until=args.until, via=via, now=now)
         elif cmd == "lift":

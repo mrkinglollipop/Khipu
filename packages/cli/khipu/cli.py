@@ -4494,14 +4494,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="The routing record: which accounts are open, by whom and since when (Khipu reports; it never routes)",
     )
     rt.add_argument("--json", action="store_true", help="Print JSON")
-    rt.add_argument("--since", type=int, default=None, metavar="V",
-                    help="The current state of everything that changed after version V")
+    rt.add_argument("--since", default=None, metavar="V",
+                    help="The current state of everything that changed after version V (or EPOCH:V)")
     rt.add_argument("--summary", action="store_true", help="The summary a conversation gets at its start")
     rt.add_argument("--brief", action="store_true", help="The text a job runner puts into a brief")
     rt.add_argument("--account", dest="view_account", default=None, metavar="A", help="One account only")
     rt.set_defaults(func=cmd_route, route_cmd=None)
+    # Writes always print JSON; --json is accepted after any of them too, so a
+    # script that adds it to every khipu call doesn't lose its write. SUPPRESS
+    # keeps `route --json <write>` from being reset by the subcommand's default.
+    rt_json = argparse.ArgumentParser(add_help=False)
+    rt_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                         help="Print JSON (writes always do)")
     rt_sub = rt.add_subparsers(dest="route_cmd")
-    rep = rt_sub.add_parser("report", help="Record what a conversation learned about an account")
+    rep = rt_sub.add_parser("report", help="Record what a conversation learned about an account", parents=[rt_json])
     rep.add_argument("--account", default=None, metavar="A", help="The account (its label, or harness|login folder)")
     rep.add_argument("--runner", default=None, help="With --lane: a job runner's lane, matched through routing_lane_map")
     rep.add_argument("--lane", default=None)
@@ -4512,7 +4518,8 @@ def build_parser() -> argparse.ArgumentParser:
     rep.add_argument("--message", default=None, help="The limit message itself, word for word")
     rep.add_argument("--name", default=None, help="What the conversation calls itself (shown beside its author)")
     rep.add_argument("--evidence", default=None, help="One line of evidence")
-    hold = rt_sub.add_parser("hold", help='Add a hold: hold "<words>" --reason R; or end one: hold end <id>')
+    hold = rt_sub.add_parser("hold", help='Add a hold: hold "<words>" --reason R; or end one: hold end <id>',
+                             parents=[rt_json])
     hold.add_argument("words", nargs="+")
     hold.add_argument("--reason", default=None, choices=("machine-busy", "disk-low", "keep", "outage", "other"))
     hold.add_argument("--until", default=None, metavar="T")
@@ -4522,22 +4529,24 @@ def build_parser() -> argparse.ArgumentParser:
     hold_scope.add_argument("--all", action="store_true")
     hold.add_argument("--owner", action="store_true", help="The owner's hold (asks for a typed confirmation)")
     hold.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
-    rpause = rt_sub.add_parser("pause", help="Owner: mark an account paused (asks for a typed confirmation)")
+    rpause = rt_sub.add_parser("pause", help="Owner: mark an account paused (asks for a typed confirmation)",
+                               parents=[rt_json])
     rpause.add_argument("account")
     rpause.add_argument("--until", default=None, metavar="T")
     rpause.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
-    rlift = rt_sub.add_parser("lift", help="Owner: lift a pause (asks for a typed confirmation)")
+    rlift = rt_sub.add_parser("lift", help="Owner: lift a pause (asks for a typed confirmation)", parents=[rt_json])
     rlift.add_argument("account")
     rlift.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
-    rclear = rt_sub.add_parser("clear", help="Owner: clear an account, or dismiss one report (--report ID)")
+    rclear = rt_sub.add_parser("clear", help="Owner: clear an account, or dismiss one report (--report ID)",
+                               parents=[rt_json])
     rclear.add_argument("account")
     rclear.add_argument("--report", default=None, metavar="ID")
     rclear.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
-    rnote = rt_sub.add_parser("note", help="Owner: set or end the note to every conversation")
+    rnote = rt_sub.add_parser("note", help="Owner: set or end the note to every conversation", parents=[rt_json])
     rnote.add_argument("action", choices=("set", "end"))
     rnote.add_argument("text", nargs="?", default=None)
     rnote.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
-    rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire or confirm a standing rule")
+    rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire or confirm a standing rule", parents=[rt_json])
     rrule.add_argument("action", choices=("add", "edit", "retire", "confirm"))
     rrule.add_argument("params", nargs="*")
     rrule.add_argument("--source", default=None, help="Where the rule comes from (rule add)")
