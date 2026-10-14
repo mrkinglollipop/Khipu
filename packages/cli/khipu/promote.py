@@ -41,16 +41,19 @@ REPLAY_WINDOW_S = 24 * 60 * 60
 REPLAY_TAIL_BYTES = 2 * 1024 * 1024
 GATE_HARNESS = "claude_code"
 MCP_NOTE = "Running MCP servers keep the old code until their session restarts."
-# The replay builds its hook environment from these names only, so a
-# credential in the caller's environment never reaches it.
-REPLAY_ENV_KEYS = ("HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE")
-# Variables that would redirect a hook away from what the harness gives it.
-_HOOK_ENV_DROP = (
-    "KHIPU_ROOT", "ALZY_ROOT", "PYTHONPATH", "PYTHONHOME", "KHIPU_CAPTURE_HOME", "KHIPU_AEGIS_HOME",
-    "KHIPU_CAPTURE_QUEUE_ONLY", "KHIPU_CAPTURE_NO_DRAIN", "KHIPU_HARNESS", "KHIPU_HOOK_STDIN",
-    "KHIPU_HOOK_INLINE", "KHIPU_PARENT_SESSION", "KHIPU_RECALL_DEADLINE", "KHIPU_GATE",
-    "GROK_HOOK_NAME", "GROK_HOOK_EVENT", "CLAUDE_CODE_HOST_SESSION_ID",
-)
+# Every environment the gate hands a subprocess is built from these names
+# only: the gate never reads a variable whose name holds KEY or TOKEN, and no
+# credential in the caller's environment reaches a hook. Hooks find their keys
+# the way a live hook does (Keychain, key files).
+BASE_ENV_KEYS = ("HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+                 "KHIPU_PYTHON")
+# The caller's data dir: everything but an isolated run's own state lives
+# there, and an isolated run still reads its credentials from it.
+DATA_DIR_ENV_KEYS = ("KHIPU_DATA_DIR", "ALZY_DATA_DIR")
+# What a candidate needs before its capture may run: the isolated data dir
+# (khipu.paths) and the stop hook's gate mode (khipu.hook_background).
+_ISOLATION_MARKS = (("packages/cli/khipu/paths.py", 'ISOLATED_ENV = "KHIPU_ISOLATED_DIR"'),
+                    ("packages/cli/khipu/hook_background.py", 'os.environ.get("KHIPU_GATE") == "1"'))
 _SUMMARY_RE = re.compile(
     r"^(?P<stamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) \[khipu-prompt-recall\] "
     r"session=(?P<session>\S*) reason=(?P<reason>.*?) ms=(?P<ms>[0-9.]+) "
@@ -130,6 +133,23 @@ def state_file() -> Path:
     return config_dir() / "state" / "promotions.jsonl"
 
 
+def live_state_file() -> Path:
+    """Each slot's last-live commit, written on every successful flip."""
+    return config_dir() / "state" / "live-slots.json"
+
+
+def gate_runs_dir() -> Path:
+    """One isolated data dir per gate capture, kept until the hub confirms its
+    episode is gone."""
+    return config_dir() / "state" / "gate-runs"
+
+
+def is_promotion_root(root: Path) -> bool:
+    """True when ``root`` is the ``live`` link or one of the two slots."""
+    norm = os.path.normpath(str(root))
+    return any(norm == os.path.normpath(str(p)) for p in (live_link(), *slots()))
+
+
 def query_log_path() -> Path:
     """Khipu's search log (``khipu.query_log.log_path``: ``query_log.jsonl``
     in the data dir, the config dir unless it was moved)."""
@@ -173,22 +193,98 @@ def _hook_python() -> str:
     return brew if os.access(brew, os.X_OK) else sys.executable
 
 
+def _self_root() -> Path:
+    """The checkout this module runs from (not ``KHIPU_ROOT``)."""
+    return Path(__file__).resolve().parents[3]
+
+
 def _code_env(root: Path, base: dict[str, str] | None = None) -> dict[str, str]:
-    """``base`` (default: the caller's environment minus redirects) with
+    """``base`` (default: ``_base_env`` plus the data-dir names) with
     PYTHONPATH set the way the launchers set it for ``root``."""
-    env = _harness_env() if base is None else dict(base)
+    env = _base_env(DATA_DIR_ENV_KEYS) if base is None else dict(base)
     env["PYTHONPATH"] = f"{Path(root) / 'packages' / 'cli'}:{Path(root) / '.python_libs'}"
     env.setdefault("PYTHONPYCACHEPREFIX", str(Path.home() / "Library" / "Caches" / "Khipu" / "pycache"))
     return env
 
 
-def _harness_env() -> dict[str, str]:
-    """What a harness hands a hook: the caller's environment, minus anything
-    that would redirect the hook from its own root, queue or harness."""
-    env = dict(os.environ)
-    for key in _HOOK_ENV_DROP:
-        env.pop(key, None)
+def _base_env(extra: tuple[str, ...] = ()) -> dict[str, str]:
+    """The caller's values for ``BASE_ENV_KEYS`` and ``extra``, read one name
+    at a time; nothing else from the environment."""
+    env: dict[str, str] = {}
+    for key in (*BASE_ENV_KEYS, *extra):
+        if "KEY" in key or "TOKEN" in key:
+            raise ValueError(f"the gate never reads {key}")
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
     return env
+
+
+# ---- isolation ---------------------------------------------------------------
+
+
+def _seed_config(target: Path) -> None:
+    """The live ``config.json`` (settings, switches, key-file paths) copied
+    into an isolated dir, without the file-wiki paths and without any value
+    whose name says it is a secret."""
+    from khipu.config import ISOLATED_UNSET, config_file
+
+    try:
+        data = json.loads(config_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    keep = {}
+    for key, value in (data if isinstance(data, dict) else {}).items():
+        low = str(key).lower()
+        if key in ISOLATED_UNSET or any(word in low for word in ("token", "secret", "password")):
+            continue
+        if "key" in low and not low.endswith("_key_file"):
+            continue
+        keep[key] = value
+    (target / "config.json").write_text(json.dumps(keep, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _link_replica(target: Path) -> None:
+    """Read-only access to the live hub replica for a replay: links to the
+    replica, its meta file and its pending-erasure list. The recall lane only
+    opens the replica read-only (``mode=ro``)."""
+    from khipu import hub_snapshot
+
+    live = hub_snapshot.snapshot_path()
+    for src in (live, hub_snapshot.meta_path(), hub_snapshot._pending_erasure_dir(live)):
+        dst = target / src.name
+        if src.exists() and not (dst.exists() or dst.is_symlink()):
+            dst.symlink_to(src)
+
+
+def _isolate(directory: Path, *, replica: bool = False, legacy: bool = False) -> dict[str, str]:
+    """Make ``directory`` an isolated data dir and return the variables that
+    point a hook at it. ``KHIPU_ISOLATED_DIR`` is the one current code
+    honours (it keeps reading credentials from the caller's data dir, which
+    the caller's ``KHIPU_DATA_DIR`` names). ``legacy`` is for code older than
+    that variable (a replay's live baseline): ``KHIPU_DATA_DIR`` then points
+    into the isolated dir too, and such code finds the DSN in the Keychain."""
+    directory = Path(directory)
+    for sub in (directory, directory / "capture", directory / "logs"):
+        sub.mkdir(parents=True, exist_ok=True)
+    if not (directory / "config.json").exists():
+        _seed_config(directory)
+    if replica:
+        _link_replica(directory)
+    env = {"KHIPU_ISOLATED_DIR": str(directory), "KHIPU_CAPTURE_HOME": str(directory / "capture")}
+    if legacy:
+        env["KHIPU_DATA_DIR"] = str(directory)
+    return env
+
+
+def _honours_isolation(root: Path) -> bool:
+    for rel, mark in _ISOLATION_MARKS:
+        try:
+            if mark not in (Path(root) / rel).read_text(encoding="utf-8"):
+                return False
+        except OSError:
+            return False
+    return True
 
 
 # ---- processes ---------------------------------------------------------------
@@ -246,6 +342,8 @@ def flip(slot: Path) -> dict[str, Any]:
     if (link.exists() or link.is_symlink()) and not link.is_symlink():
         return {"ok": False, "error": f"{link} is a real file or directory, not a link; refusing"}
     before = os.readlink(link) if link.is_symlink() else None
+    from_slot = active_slot()
+    from_commit = _head(from_slot)
     tmp = link.parent / f".{LIVE_NAME}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     try:
         os.symlink(str(slot), tmp)
@@ -256,7 +354,34 @@ def flip(slot: Path) -> dict[str, Any]:
         except OSError:
             pass
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    return {"ok": True, "from": before, "to": str(slot)}
+    out: dict[str, Any] = {"ok": True, "from": before, "to": str(slot)}
+    # Both commits have now been live: the one just left and the one just
+    # entered. A rollback only ever goes back to a commit recorded here.
+    seen = {s.name: c for s, c in ((from_slot, from_commit), (slot, _head(slot))) if s is not None and c}
+    if seen:
+        try:
+            _remember_live(seen)
+        except OSError as exc:
+            out["live_state_error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def last_live() -> dict[str, str]:
+    """``{slot name: commit}``, the commit each slot last held while live."""
+    try:
+        data = json.loads(live_state_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if v} if isinstance(data, dict) else {}
+
+
+def _remember_live(seen: dict[str, str]) -> None:
+    path = live_state_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {**last_live(), **seen}
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _vendored_libs(repo: Path) -> Path | None:
@@ -368,12 +493,14 @@ def gate_doctor(candidate: Path) -> tuple[bool, str]:
         problems.append(f"config: {(out.get('config') or {}).get('error')}")
     if out and not out.get("dsn_present"):
         problems.append("no DSN")
-    if out and not out.get("dsn_file_ok", True):
-        problems.append("DSN file unhealthy")
     if out.get("job_failures"):
         problems.append(f"jobs failing: {out['job_failures']}")
     if out and not out.get("synth_provider_ok", True):
         problems.append(f"summariser provider: {out.get('synth_provider')}")
+    red = [key[:-3] for key, value in out.items()
+           if key.endswith("_ok") and value is False and key not in ("jobs_ok", "synth_provider_ok")]
+    if red:
+        problems.append("red: " + ", ".join(red))
     if not out:
         problems.append(f"exit {r.returncode}: {_tail(r.stderr or r.stdout)}")
     return False, "; ".join(problems) or f"exit {r.returncode}"
@@ -424,7 +551,9 @@ def sample_queries(log: Path, n: int = 5, *, now: float | None = None) -> list[d
             continue
         if now - stamp.timestamp() > REPLAY_WINDOW_S:
             continue
-        query, _masked = redact_secrets(row["query"].strip())
+        # Masked whatever KHIPU_REDACT_SECRETS says: the text leaves this
+        # process for a hook's stdin.
+        query, _masked = redact_secrets(row["query"].strip(), force=True)
         seen.pop(query, None)
         seen[query] = {"prompt": query, "harness": row.get("harness")}
     rows = list(seen.values())
@@ -434,24 +563,27 @@ def sample_queries(log: Path, n: int = 5, *, now: float | None = None) -> list[d
     return [rows[int(i * step)] for i in range(n)]
 
 
-def _replay_env(capture_home: Path) -> dict[str, str]:
-    env = {key: os.environ[key] for key in REPLAY_ENV_KEYS if key in os.environ}
-    # Its own log and dedup state, and the one-shot path: the warm service
-    # answers with whatever code it started on, which is not the candidate.
-    env["KHIPU_CAPTURE_HOME"] = str(capture_home)
+def _replay_env(isolated: Path, *, legacy: bool = False) -> dict[str, str]:
+    """An isolated data dir (its own log, dedup state, embedding cache and
+    budget) that reads the live replica, and the one-shot path: the warm
+    service answers with whatever code it started on, which is not the
+    candidate."""
+    env = _base_env(DATA_DIR_ENV_KEYS)
+    env.update(_isolate(isolated, replica=True, legacy=legacy))
     env["KHIPU_RECALL_DAEMON"] = "0"
     return env
 
 
-def _recall_once(hook: Path, sample: dict[str, Any], session: str) -> dict[str, Any]:
+def _recall_once(hook: Path, sample: dict[str, Any], session: str, *, legacy: bool = False) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="khipu-gate-recall-") as tmp:
         payload = {"session_id": session, "transcript_path": "", "cwd": str(Path.home()),
                    "hook_event_name": "UserPromptSubmit", "prompt": sample["prompt"]}
+        env = _replay_env(Path(tmp), legacy=legacy)
         t0 = time.monotonic()
-        r = _run([str(hook)], env=_replay_env(Path(tmp)), input=json.dumps(payload), timeout=15)
+        r = _run([str(hook)], env=env, input=json.dumps(payload), timeout=15)
         wall_ms = round((time.monotonic() - t0) * 1000)
         row = None
-        log = Path(tmp) / "logs" / "prompt-recall.log"
+        log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
         try:
             for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
                 row = _parse_summary(line) or row
@@ -487,9 +619,12 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
     nonce = uuid.uuid4().hex[:10]
     problems: list[str] = []
     notes: list[str] = []
+    live_legacy = live_root is None or not _honours_isolation(live_root)
+    cand_legacy = not _honours_isolation(Path(candidate))
     for i, sample in enumerate(samples):
-        live = _recall_once(live_hook, sample, f"khipu-gate-{nonce}-live-{i}") if live_hook.exists() else None
-        cand = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-cand-{i}")
+        live = (_recall_once(live_hook, sample, f"khipu-gate-{nonce}-live-{i}", legacy=live_legacy)
+                if live_hook.exists() else None)
+        cand = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-cand-{i}", legacy=cand_legacy)
         label = f"prompt {i + 1}"
         reason = cand["reason"] or ""
         if cand["exit"] != 0 or not cand["valid_json"]:
@@ -523,11 +658,90 @@ def _fixture(candidate: Path) -> Path:
     return Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "gate_transcript.jsonl"
 
 
+def _lookup(stored: str, env: dict[str, str]) -> list[int] | None:
+    """Live (not forgotten) hub episodes for ``stored``; None when the hub
+    could not be asked."""
+    r = _run([_hook_python(), "-c", _FIND_EPISODES, stored], env=env, timeout=60)
+    if r.returncode != 0:
+        return None
+    try:
+        return [int(x) for x in json.loads(r.stdout or "")]
+    except (ValueError, TypeError):
+        return None
+
+
+def _cleanup_env(run_dir: Path, code_root: Path) -> dict[str, str]:
+    return _code_env(Path(code_root), {**_base_env(DATA_DIR_ENV_KEYS), **_isolate(run_dir)})
+
+
+def _cleanup_session(stored: str, run_dir: Path, code_root: Path,
+                     ids: list[int] | None = None) -> dict[str, Any]:
+    """Forget every live hub episode of one gate session, from inside that
+    run's isolated dir (so the replica erasure and the outbox check stay
+    there), and mark the cleanup done only once the hub answers that none is
+    left."""
+    env = _cleanup_env(Path(run_dir), Path(code_root))
+    if ids is None:
+        ids = _lookup(stored, env)
+        if ids is None:
+            return {"ok": False, "error": "hub lookup failed"}
+    failed = []
+    for episode_id in ids:
+        f = _run([_hook_python(), "-m", "khipu", "episode", "forget", str(episode_id)], env=env, timeout=60)
+        if f.returncode != 0:
+            failed.append(episode_id)
+    left = _lookup(stored, env)
+    if left is None:
+        return {"ok": False, "forgotten": ids, "error": "hub lookup after forget failed"}
+    if left:
+        return {"ok": False, "forgotten": [i for i in ids if i not in left],
+                "error": f"still live in the hub: {left}" + (f" (forget failed for {failed})" if failed else "")}
+    record({"action": "gate-cleanup", "session_id": stored, "dir": str(run_dir),
+            "cleanup": "cleanup_done", "forgotten": ids})
+    shutil.rmtree(run_dir, ignore_errors=True)
+    return {"ok": True, "forgotten": ids}
+
+
+def pending_cleanups() -> list[dict[str, Any]]:
+    """Gate sessions whose hub episode is not yet confirmed gone: a
+    ``cleanup_pending`` line in promotions.jsonl, or a run dir's marker, with
+    no ``cleanup_done`` after it."""
+    latest: dict[str, dict[str, Any]] = {}
+    for row in records():
+        if row.get("action") == "gate-cleanup" and row.get("session_id"):
+            latest[str(row["session_id"])] = row
+    try:
+        markers = sorted(gate_runs_dir().glob("*/gate.json"))
+    except OSError:
+        markers = []
+    for marker in markers:
+        try:
+            row = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(row, dict) and row.get("session_id") and str(row["session_id"]) not in latest:
+            latest[str(row["session_id"])] = {**row, "dir": str(marker.parent)}
+    return [row for row in latest.values() if row.get("cleanup") == "cleanup_pending"]
+
+
+def retry_cleanups() -> list[dict[str, Any]]:
+    """One more try at every pending gate cleanup (run under the lock)."""
+    out = []
+    for row in pending_cleanups():
+        res = _cleanup_session(str(row["session_id"]), Path(row["dir"]), _self_root())
+        out.append({"session_id": row["session_id"], **res})
+    return out
+
+
 @_step
 def gate_capture(candidate: Path) -> tuple[bool, str]:
     """3. One real capture end to end: a fixture transcript through the
-    candidate's ``khipu-stop-hook`` (inline drain, its own queue), the episode
-    found in the hub, then forgotten."""
+    candidate's ``khipu-stop-hook`` (inline drain, gate mode), the episode
+    found in the hub, then forgotten. Everything but that one hub episode
+    lives in an isolated data dir under ``state/gate-runs/<session>``; the
+    session id is recorded there and in promotions.jsonl as
+    ``cleanup_pending`` before the hook runs, and the next promote or status
+    retries the cleanup until the hub confirms the episode is gone."""
     cand = Path(candidate)
     hook = _launcher(cand, "khipu-stop-hook")
     if not hook.is_file():
@@ -535,41 +749,47 @@ def gate_capture(candidate: Path) -> tuple[bool, str]:
     fixture = _fixture(cand)
     if not fixture.is_file():
         return False, f"no fixture transcript at {fixture}"
+    if not _honours_isolation(cand):
+        return False, ("the candidate predates the isolated gate capture (KHIPU_ISOLATED_DIR); "
+                       "its capture would touch live state, so it is not run")
     sid = f"khipu-gate-{uuid.uuid4().hex[:12]}"
     stored = f"{GATE_HARNESS}:{sid}"
-    with tempfile.TemporaryDirectory(prefix="khipu-gate-capture-") as tmp:
-        home = Path(tmp) / "capture"
-        transcript = Path(tmp) / "transcript.jsonl"
-        shutil.copyfile(fixture, transcript)
-        env = _harness_env()
-        env.update(KHIPU_CAPTURE_HOME=str(home), KHIPU_HOOK_INLINE="1",
-                   KHIPU_HARNESS=GATE_HARNESS, KHIPU_GATE="1")
-        payload = {"session_id": sid, "transcript_path": str(transcript),
-                   "hook_event_name": "SessionEnd", "cwd": tmp}
-        r = _run([str(hook)], env=env, input=json.dumps(payload), timeout=100)
-        left = sorted(p.name for p in (home / "queue").glob("*.json")) if (home / "queue").is_dir() else []
-        try:
-            log = (home / "logs" / "session-capture.log").read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            log = ""
-    py = _hook_python()
-    code_env = _code_env(cand)
-    found = _run([py, "-c", _FIND_EPISODES, stored], env=code_env, timeout=60)
+    run_dir = gate_runs_dir() / sid
+    iso = _isolate(run_dir)
+    marker = {"session_id": stored, "created": _now(), "cleanup": "cleanup_pending"}
+    (run_dir / "gate.json").write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    record({"action": "gate-cleanup", "dir": str(run_dir), **marker})
+    transcript = run_dir / "transcript.jsonl"
+    shutil.copyfile(fixture, transcript)
+    env = {**_base_env(DATA_DIR_ENV_KEYS), **iso, "KHIPU_HOOK_INLINE": "1", "KHIPU_HARNESS": GATE_HARNESS,
+           "KHIPU_GATE": "1"}
+    payload = {"session_id": sid, "transcript_path": str(transcript),
+               "hook_event_name": "SessionEnd", "cwd": str(run_dir)}
+    r = _run([str(hook)], env=env, input=json.dumps(payload), timeout=100)
+    queue = Path(iso["KHIPU_CAPTURE_HOME"]) / "queue"
+    left = sorted(p.name for p in queue.glob("*.json")) if queue.is_dir() else []
     try:
-        ids = [int(x) for x in json.loads(found.stdout or "[]")]
-    except (ValueError, TypeError):
-        return False, f"episode lookup failed: {_tail(found.stderr or found.stdout)}"
+        log = (Path(iso["KHIPU_CAPTURE_HOME"]) / "logs" / "session-capture.log").read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        log = ""
+    pending = "cleanup pending; the next `khipu promote` or `--status` retries it"
+    ids = _lookup(stored, _cleanup_env(run_dir, cand))
+    if ids is None:
+        return False, f"episode lookup failed after the stop hook (exit {r.returncode}); {pending}"
     if not ids:
         why = f"{len(left)} job(s) still queued" if left else "queue empty"
-        return False, (f"no episode for {stored} after the stop hook (exit {r.returncode}, {why}); "
-                       f"capture log: {_tail(log, 600) or 'empty'}")
-    forgotten, failed = [], []
-    for episode_id in ids:
-        f = _run([py, "-m", "khipu", "episode", "forget", str(episode_id)], env=code_env, timeout=60)
-        (forgotten if f.returncode == 0 else failed).append(episode_id)
-    if failed:
-        return False, f"episode(s) {ids} landed but forget failed for {failed}; forget them by hand"
-    return True, f"episode(s) {ids} landed for {stored} and were forgotten"
+        detail = (f"no episode for {stored} after the stop hook (exit {r.returncode}, {why}); "
+                  f"capture log: {_tail(log, 600) or 'empty'}")
+        if r.returncode == 124:
+            # A hook killed at the timeout may still land its episode.
+            return False, f"{detail}; {pending}"
+        _cleanup_session(stored, run_dir, cand, ids=[])
+        return False, detail
+    cleaned = _cleanup_session(stored, run_dir, cand, ids=ids)
+    if not cleaned["ok"]:
+        return False, f"episode(s) {ids} landed for {stored}; forget not confirmed ({cleaned['error']}); {pending}"
+    return True, f"episode(s) {ids} landed for {stored} and were forgotten (hub confirmed)"
 
 
 def _code_facts(root: Path) -> dict[str, Any]:
@@ -698,7 +918,10 @@ def _after_flip() -> dict[str, Any]:
     live = live_root()
     out: dict[str, Any] = {"kicked": [], "kick_failed": []}
     if live is not None:
-        r = _run([_hook_python(), "-m", "khipu", "jobs", "refresh"], env=_code_env(live), timeout=120)
+        from khipu.launchd_gen import PASSTHROUGH_ENV
+
+        env = _code_env(live, _base_env((*DATA_DIR_ENV_KEYS, *PASSTHROUGH_ENV)))
+        r = _run([_hook_python(), "-m", "khipu", "jobs", "refresh"], env=env, timeout=120)
         try:
             refreshed = json.loads(r.stdout or "{}")
         except ValueError:
@@ -730,6 +953,9 @@ def promote(ref: str = "origin/main") -> dict[str, Any]:
         entry: dict[str, Any] = {"action": "promote", "ref": ref,
                                  "from_slot": str(from_slot) if from_slot else None,
                                  "from_commit": _head(from_slot)}
+        cleanups = retry_cleanups()
+        if cleanups:
+            entry["cleanups"] = cleanups
         resolved = _fetch_and_resolve(repo, ref)
         if not resolved["ok"]:
             return record({**entry, "ok": False, "error": resolved["error"],
@@ -756,21 +982,11 @@ def promote(ref: str = "origin/main") -> dict[str, Any]:
         return record({**entry, "ok": True, "ms": round((time.monotonic() - t0) * 1000)})
 
 
-def _restore_point(target: Path) -> str | None:
-    """The commit ``target`` held when it was last live: the ``from_commit``
-    of the last successful promotion away from it."""
-    for row in reversed(records()):
-        if row.get("action") == "promote" and row.get("ok"):
-            if row.get("from_slot") == str(target):
-                return row.get("from_commit")
-            return None
-    return None
-
-
 def rollback() -> dict[str, Any]:
-    """Flip ``live`` to the other slot, with no gate. If a failed or gate-only
-    run has since moved that slot, it is first put back on the commit it was
-    live on."""
+    """Flip ``live`` to the other slot, with no gate, and only ever onto the
+    commit that slot last held while live (``live-slots.json``, written on
+    every flip). A slot a failed or gate-only run has moved since is put back
+    on that commit first; a slot with no such commit is refused."""
     t0 = time.monotonic()
     with _lock() as held:
         if not held:
@@ -783,14 +999,18 @@ def rollback() -> dict[str, Any]:
             return record({**entry, "ok": False, "error": "no live slot to roll back from"})
         if not (target / "packages" / "cli" / "khipu").is_dir():
             return record({**entry, "ok": False, "error": f"no checkout in {target} to roll back to"})
-        restore = _restore_point(target)
-        if restore and _head(target) != restore:
-            r = _git(["checkout", "--detach", "--quiet", restore], cwd=target)
-            if r.returncode != 0:
+        known = last_live().get(target.name)
+        if not known:
+            return record({**entry, "ok": False,
+                           "error": f"no commit is recorded as having been live in {target.name}; "
+                                    "nothing known-good to roll back to"})
+        if _head(target) != known:
+            r = _git(["checkout", "--detach", "--quiet", known], cwd=target)
+            if r.returncode != 0 or _head(target) != known:
                 return record({**entry, "ok": False,
-                               "error": f"could not put {target.name} back on {restore[:12]}: {_tail(r.stderr)}"})
-            entry["restored"] = restore
-        entry["commit"] = _head(target)
+                               "error": f"could not put {target.name} back on {known[:12]}: {_tail(r.stderr)}"})
+            entry["restored"] = known
+        entry["commit"] = known
         flipped = flip(target)
         if not flipped["ok"]:
             return record({**entry, "ok": False, "error": f"flip: {flipped['error']}"})
@@ -808,6 +1028,9 @@ def gate_only(step: str, ref: str | None = None) -> dict[str, Any]:
         if not held:
             return {"ok": False, "action": "gate-only", "error": "another promotion is running"}
         entry: dict[str, Any] = {"action": "gate-only", "step": step, "ref": ref}
+        cleanups = retry_cleanups()
+        if cleanups:
+            entry["cleanups"] = cleanups
         slot = inactive_slot()
         if ref:
             repo = _repo()
@@ -829,7 +1052,10 @@ def gate_only(step: str, ref: str | None = None) -> dict[str, Any]:
 
 def status() -> dict[str, Any]:
     """Live slot and commit, main's commit (as last fetched), how far live is
-    behind it, and the last gate result. Reads only; no fetch."""
+    behind it, and the last gate result. No fetch; the one thing it may do is
+    retry a pending gate cleanup (when no promotion holds the lock)."""
+    with _lock() as held:
+        cleanups = retry_cleanups() if held else []
     live = active_slot()
     live_commit = _head(live_link()) if live_root() is not None else None
     try:
@@ -856,6 +1082,9 @@ def status() -> dict[str, Any]:
                       if last_gate else None),
         "last_promotion": ({k: last_promotion.get(k) for k in ("ts", "ref", "commit", "slot")}
                            if last_promotion else None),
+        "last_live": last_live(),
+        "cleanups": cleanups,
+        "cleanup_pending": [str(r["session_id"]) for r in pending_cleanups()],
     }
 
 
@@ -870,6 +1099,8 @@ def format_result(out: dict[str, Any]) -> str:
         if gate:
             lines.append(f"last gate: {gate.get('ts')} {gate.get('action')} "
                          f"{'ok' if gate.get('ok') else 'FAILED'} {(gate.get('commit') or '')[:12]}")
+        if out.get("cleanup_pending"):
+            lines.append(f"gate episodes not yet confirmed forgotten: {out['cleanup_pending']}")
         return "\n".join(lines)
     head = f"{action}"
     if out.get("ref"):

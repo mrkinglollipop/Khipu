@@ -37,7 +37,11 @@ def resolve_dsn() -> str:
     try:
         from khipu.keychain import get_dsn, migrate_legacy_secrets
 
-        if not _MIGRATION_DONE:
+        from khipu.paths import isolated_dir
+
+        # The migration copies legacy files into the live config dir; an
+        # isolated run (the promotion gate) only reads.
+        if not _MIGRATION_DONE and isolated_dir() is None:
             migrate_legacy_secrets()
             _MIGRATION_DONE = True
         kc = get_dsn()

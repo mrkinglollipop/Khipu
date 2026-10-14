@@ -123,6 +123,11 @@ def khipu_home() -> Path:
     """Khipu's working area for native capture. `~/.grok/khipu` because Aegis's
     sandbox can write there and nowhere else useful; the other harnesses share
     it so there is exactly one queue and one drainer."""
+    from khipu.paths import isolated_dir
+
+    isolated = isolated_dir()
+    if isolated is not None:
+        return isolated / "capture"
     return Path(os.environ.get("KHIPU_CAPTURE_HOME") or os.environ.get("KHIPU_AEGIS_HOME")
                 or str(Path.home() / ".grok" / "khipu"))
 

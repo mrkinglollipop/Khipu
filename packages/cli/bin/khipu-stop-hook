@@ -68,7 +68,10 @@ PYTHONPATH="$ROOT/packages/cli:$ROOT/.python_libs${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
 # The log dir must exist before the `2>>` redirect below, or sh fails the
 # redirect and the hook silently does nothing (fresh machine, first run).
-mkdir -p "${HOME}/Library/Logs/khipu" 2>/dev/null
+# The promotion gate's isolated run (KHIPU_ISOLATED_DIR) logs inside it.
+LOG_DIR="${HOME}/Library/Logs/khipu"
+[ -n "${KHIPU_ISOLATED_DIR:-}" ] && LOG_DIR="${KHIPU_ISOLATED_DIR}/logs"
+mkdir -p "$LOG_DIR" 2>/dev/null
 # Bytecode cache goes OUTSIDE any signed .app bundle — see khipu.paths.pycache_dir.
 # Running the bundled Python's __pycache__ writes inside Contents/Resources/khipu
 # broke the code signature and made Gatekeeper report "Khipu is damaged" (0.3.15,
@@ -82,7 +85,7 @@ PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
 STDIN_JSON=$(cat 2>/dev/null)
 export KHIPU_HOOK_STDIN="$STDIN_JSON"
 # Queue-only mode leaves delivery to the next draining Stop or scheduled job.
-"$PY" - "$MEM" "${KHIPU_HARNESS:-}" <<'PY' 2>>"${HOME}/Library/Logs/khipu/stop-hook.log" || true
+"$PY" - "$MEM" "${KHIPU_HARNESS:-}" <<'PY' 2>>"$LOG_DIR/stop-hook.log" || true
 import json
 import os
 import signal

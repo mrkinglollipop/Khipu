@@ -133,9 +133,20 @@ PATH_SETTINGS: dict[str, tuple[str, ...]] = {
 }
 
 
+# The file wiki and the graph source: live trees an isolated run
+# (``paths.ISOLATED_ENV``, the promotion gate) must never write, so they read
+# as unset there whatever the environment or config says.
+ISOLATED_UNSET = frozenset({"memory_root", "memory_repo", "capture_v2", "graph_sqlite"})
+
+
 def path_setting(key: str) -> Path | None:
     if key not in PATH_SETTINGS:
         raise KeyError(f"unknown path setting {key!r}; known: {sorted(PATH_SETTINGS)}")
+    if key in ISOLATED_UNSET:
+        from khipu.paths import isolated_dir
+
+        if isolated_dir() is not None:
+            return None
     for env in PATH_SETTINGS[key]:
         v = (os.environ.get(env) or "").strip()
         if v:

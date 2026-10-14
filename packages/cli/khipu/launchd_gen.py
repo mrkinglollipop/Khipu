@@ -187,6 +187,14 @@ def render_context(root: Path | None = None) -> dict[str, str]:
     pythonpath_parts = [str(cli)]
     if lib.is_dir():
         pythonpath_parts.append(str(lib))
+    # A promoted live root (the ``live`` link or a slot) carries the vendored
+    # libs at ``<root>/.python_libs``, where the launchers look for them. Other
+    # roots render exactly as before.
+    from khipu.promote import is_promotion_root
+
+    own = root / ".python_libs"
+    if own.is_dir() and is_promotion_root(root):
+        pythonpath_parts.append(str(own))
     legacy = root.parent / ".python_libs"
     if legacy.is_dir():
         pythonpath_parts.append(str(legacy))

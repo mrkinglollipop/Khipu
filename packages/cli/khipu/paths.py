@@ -58,6 +58,22 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+# One directory that holds every piece of state a run writes, for the
+# promotion gate's end-to-end capture and replay (khipu.promote). When it is
+# set, ``data_dir()`` is this directory (config, outbox, hub replica, decision
+# sync, embedding and budget state), ``session_capture.khipu_home()`` is its
+# ``capture/`` (queue, hook state, heartbeats, hook logs), the launchers log
+# into its ``logs/``, the file-wiki path settings read as unset and the
+# file-wiki writer is skipped. Credentials are the one thing still read from
+# the configured data dir (``credential_dir``), through the normal lookups.
+ISOLATED_ENV = "KHIPU_ISOLATED_DIR"
+
+
+def isolated_dir() -> Path | None:
+    raw = (os.environ.get(ISOLATED_ENV) or "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
 def _env_override() -> Path | None:
     raw = (os.environ.get("KHIPU_DATA_DIR") or os.environ.get("ALZY_DATA_DIR") or "").strip()
     return Path(raw).expanduser() if raw else None
@@ -73,6 +89,17 @@ def pointer_file() -> Path:
 
 
 def data_dir() -> Path:
+    isolated = isolated_dir()
+    if isolated is not None:
+        return isolated
+    return credential_dir()
+
+
+def credential_dir() -> Path:
+    """The configured data dir (``KHIPU_DATA_DIR``, the pointer file, the
+    default), ignoring ``KHIPU_ISOLATED_DIR``: where the on-disk DSN and root
+    certificate are read from, so an isolated run reaches the hub through the
+    same lookups as a live one."""
     env = _env_override()
     if env:
         return env
@@ -124,10 +151,14 @@ def ensure_data_dir() -> Path:
 
 
 def dsn_file() -> Path:
+    if isolated_dir() is not None:
+        return credential_dir() / "dsn"
     return ensure_data_dir() / "dsn"
 
 
 def root_cert_file() -> Path:
+    if isolated_dir() is not None:
+        return credential_dir() / "root.crt"
     return ensure_data_dir() / "root.crt"
 
 

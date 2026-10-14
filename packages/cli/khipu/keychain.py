@@ -292,9 +292,9 @@ def dsn_file_health(path: Path | None = None) -> dict:
     from urllib.parse import parse_qs, unquote, urlsplit
 
     if path is None:
-        from khipu.paths import data_dir
+        from khipu.paths import credential_dir
 
-        path = data_dir() / "dsn"
+        path = credential_dir() / "dsn"
     out: dict[str, object] = {"path": str(path), "present": path.is_file(), "ok": True,
                               "reasons": []}
     if not path.is_file():

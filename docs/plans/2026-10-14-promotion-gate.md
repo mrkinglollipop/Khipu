@@ -95,18 +95,39 @@ launcher symlinks) before writing anything. Build:
 ### As built
 
 - `packages/cli/khipu/promote.py`; `khipu promote [ref] [--rollback] [--status] [--gate-only STEP] [--json]`;
-  `khipu doctor --quick` (imports, config, secrets presence, jobs, summariser provider; no hub or network).
+  `khipu doctor --quick` (see below).
 - The replay samples from `query_log.jsonl` (the hook's `prompt-recall.log` holds no prompt text, and
   prompt text is not logged there). Each run's hit ids, reason and time are read from that run's own
   hook log line.
-- Each gate hook run gets its own `KHIPU_CAPTURE_HOME` (queue, state, heartbeats and the hook log in a
-  temporary directory), so the gate never touches the live queue or the live hook log; the replay runs with
-  `KHIPU_RECALL_DAEMON=0` (the warm service would answer with the old code). The replica is only read.
-  The capture step's stop hook still appends to `~/Library/Logs/khipu/stop-hook.log` and runs a real Stop's
-  mirror, outbox replay, notes reconcile and embed catch-up, as any Stop does.
+- Isolation is one variable, `KHIPU_ISOLATED_DIR` (`khipu.paths`): when set, `data_dir()` is that directory
+  (config, outbox, hub replica, decision sync, embedding cache and budget state), `khipu_home()` is its
+  `capture/` (queue, hook state, heartbeats, hook logs), the stop hook logs into its `logs/`, the file-wiki
+  path settings (`memory_root`, `memory_repo`, `capture_v2`, `graph_sqlite`) read as unset and the file-wiki
+  leg is skipped. Credentials are still found the live way: Keychain, key files named in `config.json`, and the
+  DSN and root certificate read from the configured data dir (`paths.credential_dir`). The gate seeds each
+  isolated dir with the live `config.json` minus the file-wiki paths and any secret-named value.
+- The capture step's isolated dir is `~/.config/khipu/state/gate-runs/<session>`. Its session id is written
+  there (`gate.json`) and to `state/promotions.jsonl` as `cleanup_pending` before the stop hook runs; the
+  hook runs in gate mode (`KHIPU_GATE=1`: `hook_background.run` drains the isolated queue and skips the mirror,
+  outbox replay, notes reconcile and embed catch-up); the forget runs in the same dir. The only write outside
+  it is the one gate episode in the hub. Cleanup is done only when the hub answers that no live episode is
+  left for the session; until then every `khipu promote`, `--gate-only` and `--status` retries it. A candidate
+  whose code predates the isolation is refused rather than run.
+- The replay samples from `query_log.jsonl` (the hook's `prompt-recall.log` holds no prompt text), masked
+  with the capture masker even when `KHIPU_REDACT_SECRETS=0`. Each hook run (live and candidate) gets a fresh
+  isolated dir that links the live replica read-only, with `KHIPU_RECALL_DAEMON=0` (the warm service would
+  answer with the old code); a live baseline whose code predates `KHIPU_ISOLATED_DIR` gets `KHIPU_DATA_DIR`
+  pointed into the same dir. Each run's hit ids, reason and time are read from its own hook log line.
+- The gate builds every subprocess environment from a fixed list of names and never reads a variable whose
+  name holds KEY or TOKEN; hooks resolve their keys as a live hook does.
 - A slot is a detached worktree with a `.python_libs` link to the main checkout's (the launchers put
-  `<root>/.python_libs` on `PYTHONPATH` and it is untracked). `--rollback` first puts the other slot back on
-  the commit it was live on, if a failed or gate-only run has moved it since.
+  `<root>/.python_libs` on `PYTHONPATH` and it is untracked); the plists rendered for the `live` link or a slot
+  carry it too. Every flip writes each slot's last-live commit to `state/live-slots.json`; `--rollback` puts the
+  other slot back on that commit if a failed or gate-only run has moved it since, and refuses a slot with no
+  last-live commit, so it never activates a commit that was not live before.
+- `khipu doctor --quick` gates on every local check plain doctor gates on (`cli.LOCAL_GATES`, computed by the
+  same function: outbox, capture liveness, launchers, bundle seal, jobs, summariser provider and the rest)
+  plus imports, config and DSN presence; it skips only the hub, network and probe checks.
 
 ## Migrating this Mac by hand
 

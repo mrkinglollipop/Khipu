@@ -192,13 +192,243 @@ _QUICK_IMPORTS = (
 )
 
 
-def _cmd_doctor_quick(args: argparse.Namespace) -> int:
-    """`khipu doctor --quick`: imports, config, secrets presence, jobs and the
-    summariser provider, with no hub, network or probe check. The promotion
-    gate runs it under a candidate's launchd environment (khipu.promote)."""
-    import importlib
+# The `*_ok` keys of the checks that read only this Mac. Plain `doctor` and
+# `doctor --quick` both compute them with `_doctor_local_checks` and both gate
+# on every one; --quick leaves out only the hub, network and probe checks.
+LOCAL_GATES = (
+    "outbox_ok", "capture_liveness_ok", "git_sync_ok", "dsn_file_ok", "synth_provider_ok",
+    "jobs_ok", "index_freshness_ok", "synth_budget_ok", "graph_backup_ok", "bundle_seal_ok",
+    "prompt_recall_snapshot_ok", "prompt_recall_outcomes_ok", "recall_daemon_ok",
+    "nightly_steps_ok", "degraded_rate_ok", "launchers_ok",
+)
 
+
+def _doctor_local_checks(mem: Path | None) -> dict:
+    """Every doctor check that needs nothing but this Mac: no hub, no
+    network, no probe. Returns each check's block and its ``*_ok`` (the keys
+    in ``LOCAL_GATES``), plus ``not_configured`` names it found."""
     from khipu.keychain import secrets_status
+
+    not_configured: list[str] = []
+    # Outbox: a queued capture is something PG does not have yet — red until
+    # an explicit `khipu outbox drain` clears it. Doctor may maintain local
+    # diagnostic cache/credential state, but never replays this queue.
+    try:
+        from khipu.outbox import status as outbox_status
+
+        outbox = outbox_status()
+    except Exception as e:  # noqa: BLE001
+        outbox = {"pending": -1, "error": f"{type(e).__name__}: {e}"}
+    # D6: pending==0 alone missed a job that keeps failing to enqueue-then-
+    # drain and sits there forever with pending temporarily 0 between
+    # attempts; oldest_age_s (renamed here to the name the fix message uses)
+    # is the age signal that was missing. Red only past an hour — draining
+    # takes a few minutes normally, an hour is evidence something is stuck.
+    outbox["oldest_pending_seconds"] = outbox.get("oldest_age_s")
+    outbox_oldest_ok = (outbox.get("oldest_pending_seconds") or 0) <= 3600
+    outbox_ok = outbox.get("pending") == 0 and not outbox.get("dead") and outbox_oldest_ok
+    if not outbox_oldest_ok:
+        outbox["fix"] = "run `khipu sessions drain`"
+    # Capture liveness: is each harness ACTUALLY being recorded? Red on evidence
+    # of a failure (hook error, drain failure, stale queue, cadence never
+    # firing) — never on idleness. maintainer, 2026-08-17: a session that captured
+    # only at compaction looked healthy on every other check here. (Plain
+    # doctor adds the gateway rows, which need the network.)
+    try:
+        from khipu.session_capture import liveness_all
+
+        liveness = liveness_all()
+    except Exception as e:  # noqa: BLE001
+        liveness = {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "red": [],
+            "harnesses": {},
+        }
+    # Git sync: is the memory tree's nightly auto-sync landing on GitHub? It is
+    # soft-failed inside the nightly by design, so until this it could die and
+    # every light stayed green (state-of-play 2026-08-17 item 7). Judged from
+    # the heartbeat git_sync.py writes plus local repo evidence; not applicable
+    # (green) on any Mac that does not run the nightly.
+    try:
+        from khipu.git_sync_health import status as git_sync_status
+
+        git_sync = git_sync_status()
+    except Exception as e:  # noqa: BLE001
+        git_sync = {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "reasons": ["check failed"],
+        }
+    try:
+        secrets = secrets_status()
+    except Exception as e:  # noqa: BLE001 — malformed local diagnostics must not crash doctor
+        secrets = {"error": f"{type(e).__name__}: {e}", "dsn_file": {"ok": False}}
+    # The file DSN is what every sandboxed harness falls back to when the
+    # Keychain is denied. It went stale on 2026-08-04 and nothing noticed until
+    # 2026-08-18, because every check ran where the Keychain worked.
+    dsn_file_ok = bool((secrets.get("dsn_file") or {}).get("ok", True))
+    try:
+        synth_provider, synth_provider_ok = _synth_provider_block(secrets)
+    except Exception as e:  # noqa: BLE001
+        synth_provider, synth_provider_ok = {"error": f"{type(e).__name__}: {e}"}, False
+    try:
+        from khipu.jobs import index_freshness, job_status
+
+        jobs = job_status()
+        index_fresh = index_freshness(memory_root=mem)
+        index_freshness_ok = bool(index_fresh.get("ok"))
+    except Exception as e:  # noqa: BLE001
+        jobs = {"error": f"{type(e).__name__}: {e}"}
+        index_fresh = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        index_freshness_ok = False
+    known_job_failures = [
+        name for name in _JOBS_CHOICES
+        if isinstance(jobs.get(name), dict) and jobs[name].get("last_exit") not in (None, 0)
+        and (jobs[name].get("plist_loaded") or jobs[name].get("plist_mtime") is not None
+             or jobs[name].get("expected"))
+    ]
+    jobs_ok = not known_job_failures
+    # The summariser's daily call ceiling (embed scope "synth"). Red while it
+    # is spent: captures wait in the queue until UTC midnight, or until the
+    # owner lifts it (`khipu budget lift synth`). `warn` is the 80% notice and
+    # never gates. Today's tokens and estimated cost ride along.
+    try:
+        from khipu.embed import budget_status
+
+        synth_budget = budget_status("synth")
+        synth_budget_ok = not synth_budget.get("exhausted")
+    except Exception as e:  # noqa: BLE001
+        synth_budget = {"error": f"{type(e).__name__}: {e}"}
+        synth_budget_ok = False
+    try:
+        from khipu.extract import synth_usage_today
+
+        _usage = synth_usage_today()
+        synth_budget["tokens_today"] = {k: _usage[k] for k in
+                                        ("prompt_tokens", "output_tokens", "thought_tokens")}
+        synth_budget["estimated_usd_today"] = _usage["estimated_usd"]
+        synth_budget["usage_by_provider"] = _usage["by_provider"]
+    except Exception as e:  # noqa: BLE001 — accounting is informational
+        synth_budget["tokens_today"] = None
+        synth_budget["estimated_usd_today"] = None
+        synth_budget["usage_error"] = f"{type(e).__name__}: {e}"
+    try:
+        from khipu import graph_backup
+
+        graph_backup_block = graph_backup.local_health()
+    except Exception as e:  # noqa: BLE001
+        graph_backup_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # Bundle seal: red the moment a signed .app has gained a file it shouldn't
+    # have — this is the tripwire the 0.3.15 "Khipu is damaged" incident
+    # needed (see khipu.bundle_seal). `na` (maintainer checkout, no codesign)
+    # counts as ok so it never fails a machine the check does not apply to.
+    try:
+        from khipu import bundle_seal
+
+        bundle_seal_block = bundle_seal.check()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        bundle_seal_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # R1 follow-up: khipu.recall_prompt (the UserPromptSubmit hook) searches
+    # this local replica first and only falls back to the hub when it is
+    # missing or older than 24h — a degrade that is otherwise invisible.
+    # Never red on its own (the fallback IS the documented safe behaviour);
+    # this only surfaces WHY prompt-time recall might be slow right now.
+    try:
+        from khipu.hub_snapshot import prompt_recall_snapshot_status
+
+        prompt_recall_snapshot = prompt_recall_snapshot_status()
+    except Exception as e:  # noqa: BLE001
+        prompt_recall_snapshot = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # Phase 0 session C (finding B10): prompt_recall_snapshot above only
+    # tests replica freshness — it says nothing about whether the lane
+    # actually answers within its own budget. This reads the hook's own
+    # outcome log for the real timeout rate, the evidence that was missing
+    # while the lane silently discarded results on 85% of prompts.
+    try:
+        from khipu.recall_prompt import prompt_recall_outcomes
+
+        prompt_recall_outcomes_block = prompt_recall_outcomes()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        prompt_recall_outcomes_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # The warm recall service behind the per-prompt hook. Not running is fine
+    # (the hook falls back to the one-shot path); running on different code
+    # than the disk for over a minute is not — it should have restarted itself.
+    try:
+        from khipu.recall_daemon import daemon_health
+
+        recall_daemon_block = daemon_health()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        recall_daemon_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # D1: per-step nightly evidence — notes reconcile, embed backfill,
+    # commitments hygiene and mark-stale each get their own red/green
+    # instead of only the legacy driver's exit code (`jobs.ok` above).
+    try:
+        from khipu.jobs import nightly_step_health
+
+        nightly_steps = nightly_step_health()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        err = f"{type(e).__name__}: {e}"
+        nightly_steps = {
+            k: {"ok": False, "applicable": True, "error": err}
+            for k in ("notes_reconcile_ok", "embed_provider_ok",
+                      "commitments_hygiene_ok", "mark_stale_ok")
+        }
+    # A step that has never been recorded is skipped, not red — a fresh
+    # install or a Mac that just updated has nothing in nightly-last.json
+    # yet, which is not evidence of a failure (maintainer, 2026-09-14:
+    # "especially after they update"). Reuses the same not_configured /
+    # grey-row convention memory_root and graph_sqlite already use.
+    from khipu.jobs import skipped_step_names
+
+    not_configured.extend(skipped_step_names(nightly_steps))
+    try:
+        from khipu import query_log
+
+        degraded_rate = query_log.degraded_rate()
+    except Exception as e:  # noqa: BLE001
+        degraded_rate = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # The five launcher links, read-only. `consistent`
+    # (mixed roots — a stray worktree still live) is a warning, never a gate;
+    # `launchers_ok` (a pack's own config pointed at a dangling/not_a_link
+    # launcher) is a gate, same as every other check below.
+    try:
+        from khipu import integrations as integ
+
+        launchers = integ.launcher_health()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        launchers = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return {
+        "outbox": outbox, "outbox_ok": outbox_ok,
+        "capture_liveness": liveness, "capture_liveness_ok": bool(liveness.get("ok")),
+        "git_sync": git_sync, "git_sync_ok": bool(git_sync.get("ok")),
+        "secrets": secrets, "dsn_file_ok": dsn_file_ok,
+        "synth_provider": synth_provider, "synth_provider_ok": synth_provider_ok,
+        "jobs": jobs, "job_failures": known_job_failures, "jobs_ok": jobs_ok,
+        "index_freshness": index_fresh, "index_freshness_ok": index_freshness_ok,
+        "synth_budget": synth_budget, "synth_budget_ok": synth_budget_ok,
+        "graph_backup": graph_backup_block, "graph_backup_ok": bool(graph_backup_block.get("ok")),
+        "bundle_seal": bundle_seal_block, "bundle_seal_ok": bool(bundle_seal_block.get("ok")),
+        "prompt_recall_snapshot": prompt_recall_snapshot,
+        "prompt_recall_snapshot_ok": bool(prompt_recall_snapshot.get("ok")),
+        "prompt_recall_outcomes": prompt_recall_outcomes_block,
+        "prompt_recall_outcomes_ok": bool(prompt_recall_outcomes_block.get("ok")),
+        "recall_daemon": recall_daemon_block, "recall_daemon_ok": bool(recall_daemon_block.get("ok")),
+        "nightly_steps": nightly_steps,
+        "nightly_steps_ok": all(bool(v.get("ok")) for v in nightly_steps.values()),
+        "degraded_rate": degraded_rate, "degraded_rate_ok": bool(degraded_rate.get("ok")),
+        "launchers": launchers, "launchers_ok": bool(launchers.get("ok")),
+        "not_configured": not_configured,
+    }
+
+
+def _cmd_doctor_quick(args: argparse.Namespace) -> int:
+    """`khipu doctor --quick`: imports, config, DSN presence and every local
+    check plain doctor gates on (``LOCAL_GATES``: outbox, capture liveness,
+    launchers, bundle seal, jobs, summariser provider and the rest); it skips
+    only the hub, network and probe checks. The promotion gate runs it under
+    a candidate's launchd environment (khipu.promote)."""
+    import importlib
 
     imports: dict[str, str] = {}
     for name in _QUICK_IMPORTS:
@@ -213,28 +443,8 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
         config = {"ok": True, "path": str(config_file())}
     except Exception as e:  # noqa: BLE001
         config = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    try:
-        secrets = secrets_status()
-    except Exception as e:  # noqa: BLE001
-        secrets = {"error": f"{type(e).__name__}: {e}", "dsn_file": {"ok": False}}
-    dsn_file_ok = bool((secrets.get("dsn_file") or {}).get("ok", True)) and not secrets.get("error")
-    try:
-        synth_provider, synth_provider_ok = _synth_provider_block(secrets)
-    except Exception as e:  # noqa: BLE001
-        synth_provider, synth_provider_ok = {"error": f"{type(e).__name__}: {e}"}, False
-    try:
-        from khipu.jobs import job_status
-
-        jobs = job_status()
-    except Exception as e:  # noqa: BLE001
-        jobs = {"error": f"{type(e).__name__}: {e}"}
-    known_job_failures = [
-        name for name in _JOBS_CHOICES
-        if isinstance(jobs.get(name), dict) and jobs[name].get("last_exit") not in (None, 0)
-        and (jobs[name].get("plist_loaded") or jobs[name].get("plist_mtime") is not None
-             or jobs[name].get("expected"))
-    ]
-    jobs_ok = not known_job_failures and not jobs.get("error")
+    mem = Path(args.memory_root) if getattr(args, "memory_root", None) else None
+    local = _doctor_local_checks(mem)
     from khipu import __version__
 
     out = {
@@ -242,17 +452,12 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
         "version": __version__,
         "imports": {"ok": not imports, "failed": imports, "checked": len(_QUICK_IMPORTS)},
         "config": config,
-        "secrets": secrets,
-        "dsn_file_ok": dsn_file_ok,
-        "dsn_present": bool(secrets.get("dsn")),
-        "jobs": jobs,
-        "job_failures": known_job_failures,
-        "jobs_ok": jobs_ok,
-        "synth_provider": synth_provider,
-        "synth_provider_ok": synth_provider_ok,
-        "ok": (not imports and bool(config.get("ok")) and dsn_file_ok and bool(secrets.get("dsn"))
-               and jobs_ok and synth_provider_ok),
+        **local,
+        "dsn_present": bool(local["secrets"].get("dsn")) and not local["secrets"].get("error"),
+        "skipped": "hub, network and probe checks (run plain `khipu doctor` for those)",
     }
+    out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
+                 and all(bool(local[k]) for k in LOCAL_GATES))
     print(json.dumps(out, indent=2, default=str))
     return 0 if out["ok"] else 2
 
@@ -267,7 +472,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         snapshot_health,
         status_payload_snapshot,
     )
-    from khipu.keychain import secrets_status
 
     mem = Path(args.memory_root) if args.memory_root else None
     hub_ok = True
@@ -315,14 +519,27 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "topic_files_unreadable": [],
             }
     backup = backup_health()
+    # Every check that reads only this Mac; `doctor --quick` gates on the same
+    # set (khipu.promote's first gate step).
+    local = _doctor_local_checks(mem)
+    not_configured.extend(local.pop("not_configured"))
     try:
         from khipu import graph_backup
 
-        _graph_backup = graph_backup.local_health()
         _graph_offsite = graph_backup.offsite_health()
     except Exception as e:  # noqa: BLE001
-        _graph_backup = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         _graph_offsite = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    _graph_backup = local["graph_backup"]
+    liveness = local["capture_liveness"]
+    (outbox, outbox_ok, git_sync, secrets, dsn_file_ok, synth_provider, synth_provider_ok, jobs,
+     known_job_failures, jobs_ok, index_fresh, index_freshness_ok, synth_budget, synth_budget_ok,
+     prompt_recall_snapshot, prompt_recall_outcomes_block, recall_daemon_block, bundle_seal_block,
+     nightly_steps, degraded_rate, launchers) = (local[k] for k in (
+        "outbox", "outbox_ok", "git_sync", "secrets", "dsn_file_ok", "synth_provider",
+        "synth_provider_ok", "jobs", "job_failures", "jobs_ok", "index_freshness",
+        "index_freshness_ok", "synth_budget", "synth_budget_ok", "prompt_recall_snapshot",
+        "prompt_recall_outcomes", "recall_daemon", "bundle_seal", "nightly_steps", "degraded_rate",
+        "launchers"))
     # P2b gate: directional. Every file episode must exist in PG by identity
     # (ts, md5(summary)); PG holding MORE than the file is healthy (hub writes,
     # archived episodes survive the upsert-only reconcile), so the old
@@ -352,74 +569,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             graph = graph_drift()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         graph = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    # Outbox: a queued capture is something PG does not have yet — red until
-    # an explicit `khipu outbox drain` clears it. Doctor may maintain local
-    # diagnostic cache/credential state, but never replays this queue.
-    try:
-        from khipu.outbox import status as outbox_status
-
-        outbox = outbox_status()
-    except Exception as e:  # noqa: BLE001
-        outbox = {"pending": -1, "error": f"{type(e).__name__}: {e}"}
-    # D6: pending==0 alone missed a job that keeps failing to enqueue-then-
-    # drain and sits there forever with pending temporarily 0 between
-    # attempts; oldest_age_s (renamed here to the name the fix message uses)
-    # is the age signal that was missing. Red only past an hour — draining
-    # takes a few minutes normally, an hour is evidence something is stuck.
-    outbox["oldest_pending_seconds"] = outbox.get("oldest_age_s")
-    outbox_oldest_ok = (outbox.get("oldest_pending_seconds") or 0) <= 3600
-    outbox_ok = outbox.get("pending") == 0 and not outbox.get("dead") and outbox_oldest_ok
-    if not outbox_oldest_ok:
-        outbox["fix"] = "run `khipu sessions drain`"
-    # Capture liveness: is each harness ACTUALLY being recorded? Red on evidence
-    # of a failure (hook error, drain failure, stale queue, cadence never
-    # firing) — never on idleness. maintainer, 2026-08-17: a session that captured
-    # only at compaction looked healthy on every other check here.
-    try:
-        from khipu.session_capture import liveness_all
-
-        liveness = liveness_all()
-    except Exception as e:  # noqa: BLE001
-        liveness = {
-            "ok": False,
-            "error": f"{type(e).__name__}: {e}",
-            "red": [],
-            "harnesses": {},
-        }
-    # Git sync: is the memory tree's nightly auto-sync landing on GitHub? It is
-    # soft-failed inside the nightly by design, so until this it could die and
-    # every light stayed green (state-of-play 2026-08-17 item 7). Judged from
-    # the heartbeat git_sync.py writes plus local repo evidence; not applicable
-    # (green) on any Mac that does not run the nightly.
-    try:
-        from khipu.git_sync_health import status as git_sync_status
-
-        git_sync = git_sync_status()
-    except Exception as e:  # noqa: BLE001
-        git_sync = {
-            "ok": False,
-            "error": f"{type(e).__name__}: {e}",
-            "reasons": ["check failed"],
-        }
-    try:
-        secrets = secrets_status()
-    except Exception as e:  # noqa: BLE001 — malformed local diagnostics must not crash doctor
-        secrets = {"error": f"{type(e).__name__}: {e}", "dsn_file": {"ok": False}}
-    # The file DSN is what every sandboxed harness falls back to when the
-    # Keychain is denied. It went stale on 2026-08-04 and nothing noticed until
-    # 2026-08-18, because every check ran where the Keychain worked.
-    dsn_file_ok = bool((secrets.get("dsn_file") or {}).get("ok", True))
-    synth_provider, synth_provider_ok = _synth_provider_block(secrets)
-    try:
-        from khipu.jobs import index_freshness, job_status
-
-        jobs = job_status()
-        index_fresh = index_freshness(memory_root=mem)
-        index_freshness_ok = bool(index_fresh.get("ok"))
-    except Exception as e:  # noqa: BLE001
-        jobs = {"error": f"{type(e).__name__}: {e}"}
-        index_fresh = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-        index_freshness_ok = False
     try:
         from khipu.embed import coverage
 
@@ -433,30 +582,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001
         embed_coverage = {"error": f"{type(e).__name__}: {e}"}
         embed_coverage_ok = False
-    # The summariser's daily call ceiling (embed scope "synth"). Red while it
-    # is spent: captures wait in the queue until UTC midnight, or until the
-    # owner lifts it (`khipu budget lift synth`). `warn` is the 80% notice and
-    # never gates. Today's tokens and estimated cost ride along.
-    try:
-        from khipu.embed import budget_status
-
-        synth_budget = budget_status("synth")
-        synth_budget_ok = not synth_budget.get("exhausted")
-    except Exception as e:  # noqa: BLE001
-        synth_budget = {"error": f"{type(e).__name__}: {e}"}
-        synth_budget_ok = False
-    try:
-        from khipu.extract import synth_usage_today
-
-        _usage = synth_usage_today()
-        synth_budget["tokens_today"] = {k: _usage[k] for k in
-                                        ("prompt_tokens", "output_tokens", "thought_tokens")}
-        synth_budget["estimated_usd_today"] = _usage["estimated_usd"]
-        synth_budget["usage_by_provider"] = _usage["by_provider"]
-    except Exception as e:  # noqa: BLE001 — accounting is informational
-        synth_budget["tokens_today"] = None
-        synth_budget["estimated_usd_today"] = None
-        synth_budget["usage_error"] = f"{type(e).__name__}: {e}"
     # Informational: per-library coverage and profile, beside embed coverage.
     # Never gates status (a library mid-backfill is not a broken hub).
     try:
@@ -475,37 +600,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         literal_trgm = literal_trgm_status()
     except Exception as e:  # noqa: BLE001
         literal_trgm = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    # R1 follow-up: khipu.recall_prompt (the UserPromptSubmit hook) searches
-    # this local replica first and only falls back to the hub when it is
-    # missing or older than 24h — a degrade that is otherwise invisible.
-    # Never red on its own (the fallback IS the documented safe behaviour);
-    # this only surfaces WHY prompt-time recall might be slow right now.
-    try:
-        from khipu.hub_snapshot import prompt_recall_snapshot_status
-
-        prompt_recall_snapshot = prompt_recall_snapshot_status()
-    except Exception as e:  # noqa: BLE001
-        prompt_recall_snapshot = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    # Phase 0 session C (finding B10): prompt_recall_snapshot above only
-    # tests replica freshness — it says nothing about whether the lane
-    # actually answers within its own budget. This reads the hook's own
-    # outcome log for the real timeout rate, the evidence that was missing
-    # while the lane silently discarded results on 85% of prompts.
-    try:
-        from khipu.recall_prompt import prompt_recall_outcomes
-
-        prompt_recall_outcomes_block = prompt_recall_outcomes()
-    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
-        prompt_recall_outcomes_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    # The warm recall service behind the per-prompt hook. Not running is fine
-    # (the hook falls back to the one-shot path); running on different code
-    # than the disk for over a minute is not — it should have restarted itself.
-    try:
-        from khipu.recall_daemon import daemon_health
-
-        recall_daemon_block = daemon_health()
-    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
-        recall_daemon_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # --probe runs a fresh end-to-end capture-then-search probe. Plain doctor
     # reads its last result; diagnostic helpers may maintain local cache or
     # credential state but never replay a queue or refresh the hub replica.
@@ -541,16 +635,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         recall_quality_block = recall_quality(hub_snapshot=hub_snapshot)
     except Exception as e:  # noqa: BLE001
         recall_quality_block = {"error": f"{type(e).__name__}: {e}"}
-    # Bundle seal: red the moment a signed .app has gained a file it shouldn't
-    # have — this is the tripwire the 0.3.15 "Khipu is damaged" incident
-    # needed (see khipu.bundle_seal). `na` (maintainer checkout, no codesign)
-    # counts as ok so it never fails a machine the check does not apply to.
-    try:
-        from khipu import bundle_seal
-
-        bundle_seal_block = bundle_seal.check()
-    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
-        bundle_seal_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # P5: the last organisation run (index rewrite, size warnings, stale
     # report) — info only, never gates `ok` below. None (not red) when
     # organisation has never run on this Mac yet.
@@ -560,28 +644,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         notes_organise = organise.last_run()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         notes_organise = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    # D1: per-step nightly evidence — notes reconcile, embed backfill,
-    # commitments hygiene and mark-stale each get their own red/green
-    # instead of only the legacy driver's exit code (`jobs.ok` above).
-    try:
-        from khipu.jobs import nightly_step_health
-
-        nightly_steps = nightly_step_health()
-    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
-        err = f"{type(e).__name__}: {e}"
-        nightly_steps = {
-            k: {"ok": False, "applicable": True, "error": err}
-            for k in ("notes_reconcile_ok", "embed_provider_ok",
-                      "commitments_hygiene_ok", "mark_stale_ok")
-        }
-    # A step that has never been recorded is skipped, not red — a fresh
-    # install or a Mac that just updated has nothing in nightly-last.json
-    # yet, which is not evidence of a failure (maintainer, 2026-09-14:
-    # "especially after they update"). Reuses the same not_configured /
-    # grey-row convention memory_root and graph_sqlite already use.
-    from khipu.jobs import skipped_step_names
-
-    not_configured.extend(skipped_step_names(nightly_steps))
     # D6/F2/F4: topic-embedding lag and the search-degrade rate — both were
     # buried keys nothing aggregated before this (audit 2026-08-17 class).
     try:
@@ -590,12 +652,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         topics_lag = topics_embed_lag_minutes()
     except Exception as e:  # noqa: BLE001
         topics_lag = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    try:
-        from khipu import query_log
-
-        degraded_rate = query_log.degraded_rate()
-    except Exception as e:  # noqa: BLE001
-        degraded_rate = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # K9: gateway per-token liveness, read over the network from the
     # deployed gateway's own /healthz (never deployed by doctor itself).
     # Applicable only when a gateway_url is configured.
@@ -639,16 +695,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         unknown_harness = unknown_harness_heartbeats()
     except Exception as e:  # noqa: BLE001
         unknown_harness = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
-    # The five launcher links, read-only. `consistent`
-    # (mixed roots — a stray worktree still live) is a warning, never a gate;
-    # `launchers_ok` (a pack's own config pointed at a dangling/not_a_link
-    # launcher) is a gate, same as every other check below.
-    try:
-        from khipu import integrations as integ
-
-        launchers = integ.launcher_health()
-    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
-        launchers = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # One row per Claude home Khipu found (~/.claude, CLAUDE_CONFIG_DIR, T3's
     # accounts). Visibility only, like a detected-but-uninstalled Cursor.
     try:
@@ -682,13 +728,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         decision_links_block = _decisions.candidate_link_count()
     except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
         decision_links_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    known_job_failures = [
-        name for name in _JOBS_CHOICES
-        if isinstance(jobs.get(name), dict) and jobs[name].get("last_exit") not in (None, 0)
-        and (jobs[name].get("plist_loaded") or jobs[name].get("plist_mtime") is not None
-             or jobs[name].get("expected"))
-    ]
-    jobs_ok = not known_job_failures
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -802,6 +841,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "topics_embed_lag_ok": bool(topics_lag.get("ok")),
         "degraded_rate_ok": bool(degraded_rate.get("ok")),
         "launchers_ok": bool(launchers.get("ok")),
+        "nightly_steps_ok": local["nightly_steps_ok"],
     }
     print(json.dumps(out, indent=2, default=str))
     return 0 if out["ok"] else 2
