@@ -126,6 +126,15 @@ def _command(harness: str) -> str | None:
     return synth_cli.binary(harness)
 
 
+def _home_path(home: str) -> Path | None:
+    """``home`` with ``~`` expanded, or None when it names a user this Mac
+    does not have (``Path.expanduser`` raises RuntimeError for ``~nouser``)."""
+    try:
+        return Path(home).expanduser()
+    except RuntimeError:
+        return None
+
+
 def probe_environment(harness: str, home: str | None = None) -> dict[str, str]:
     """The child's whole environment, built from an allowlist: a value is read
     only for the names in ``_ENV_ALLOW`` and ``LC_*`` (other names are seen,
@@ -141,7 +150,8 @@ def probe_environment(harness: str, home: str | None = None) -> dict[str, str]:
             if value is not None:
                 env[name] = value
     if home and harness in _HOME_VARS:
-        env[_HOME_VARS[harness]] = str(Path(home).expanduser())
+        path = _home_path(home)
+        env[_HOME_VARS[harness]] = str(path if path is not None else home)
     if harness == "grok":
         env.update(_GROK_ENV)
     return env
@@ -722,6 +732,31 @@ def probe_muse(*, timeout: float = TIMEOUT_S) -> dict:
 # ---- accounts ----------------------------------------------------------------
 
 
+ACCOUNTS_MAX = 32
+LABEL_MAX = 64
+HOME_MAX = 1024
+_ACCOUNT_FIELDS = ("label", "harness", "home")
+
+
+def _account_from_entry(entry) -> dict:
+    """One ``usage_accounts`` entry as an account; a problem goes in
+    ``invalid`` (the report shows the entry instead of hiding it)."""
+    if not isinstance(entry, dict):
+        return {"label": "?", "harness": "?", "home": None, "invalid": "entry is not an object"}
+    harness = str(entry.get("harness") or "").strip().lower()
+    label = str(entry.get("label") or "").strip() or LABELS.get(harness, harness or "?")
+    home = entry.get("home")
+    home = str(home).strip() if isinstance(home, str) and home.strip() else None
+    account = {"label": label, "harness": harness or "?", "home": home}
+    if harness not in HARNESSES:
+        account["invalid"] = f"unknown harness {harness or '(none)'!r}; one of {', '.join(HARNESSES)}"
+    elif harness == "muse" and home:
+        account["invalid"] = "Muse has one login per user; a home cannot be chosen"
+    elif home and _home_path(home) is None:
+        account["invalid"] = f"home {home!r} names a user this Mac does not have"
+    return account
+
+
 def configured_accounts() -> list[dict]:
     """Config ``usage_accounts`` (``[{label, harness, home?}]``), or by default
     every installed CLI with its default home. Invalid entries come back with
@@ -731,29 +766,82 @@ def configured_accounts() -> list[dict]:
     raw = load_config().get("usage_accounts")
     if not isinstance(raw, list) or not raw:
         return [{"label": LABELS[h], "harness": h, "home": None} for h in HARNESSES if _command(h)]
-    out = []
-    for entry in raw:
+    return [_account_from_entry(entry) for entry in raw]
+
+
+def parse_usage_accounts(raw) -> list[dict]:
+    """``raw`` (JSON text or a list) as the ``usage_accounts`` entries to store,
+    or ValueError naming the first problem. Stricter than
+    ``configured_accounts``, which shows a hand-edited bad entry rather than
+    refusing it: ``khipu config --set usage_accounts`` stores only entries
+    that can be probed, each login once, each label once."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raise ValueError('usage_accounts must be JSON: a list of {"label", "harness", "home"} entries') from None
+    if not isinstance(raw, list):
+        raise ValueError('usage_accounts must be a list of {"label", "harness", "home"} entries')
+    if len(raw) > ACCOUNTS_MAX:
+        raise ValueError(f"usage_accounts holds at most {ACCOUNTS_MAX} entries, got {len(raw)}")
+    out: list[dict] = []
+    labels: set[str] = set()
+    logins: set[str] = set()
+    for n, entry in enumerate(raw, 1):
+        where = f"usage_accounts entry {n}"
         if not isinstance(entry, dict):
-            out.append({"label": "?", "harness": "?", "home": None, "invalid": "entry is not an object"})
-            continue
-        harness = str(entry.get("harness") or "").strip().lower()
-        label = str(entry.get("label") or "").strip() or LABELS.get(harness, harness or "?")
-        home = entry.get("home")
-        home = str(home).strip() if isinstance(home, str) and home.strip() else None
-        account = {"label": label, "harness": harness or "?", "home": home}
-        if harness not in HARNESSES:
-            account["invalid"] = f"unknown harness {harness or '(none)'!r}; one of {', '.join(HARNESSES)}"
-        elif harness == "muse" and home:
-            account["invalid"] = "Muse has one login per user; a home cannot be chosen"
-        out.append(account)
+            raise ValueError(f"{where} is not an object")
+        extra = sorted(str(k) for k in entry if k not in _ACCOUNT_FIELDS)
+        if extra:
+            raise ValueError(f"{where} has an unknown field {extra[0]!r}; the fields are label, harness and home")
+        for field in _ACCOUNT_FIELDS:
+            value = entry.get(field)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ValueError(f"{where}: {field} must be text")
+            if not value.isprintable():
+                raise ValueError(f"{where}: {field} must be one line of plain text")
+        if len((entry.get("label") or "").strip()) > LABEL_MAX:
+            raise ValueError(f"{where}: label is longer than {LABEL_MAX} characters")
+        if len((entry.get("home") or "").strip()) > HOME_MAX:
+            raise ValueError(f"{where}: home is longer than {HOME_MAX} characters")
+        account = _account_from_entry(entry)
+        if account.get("invalid"):
+            raise ValueError(f"{where}: {account['invalid']}")
+        if account["label"].casefold() in labels:
+            raise ValueError(f"two usage_accounts entries are named {account['label']!r}")
+        key = _key(account)
+        if key in logins:
+            raise ValueError(f"{where} ({account['label']}) reads the same login as an earlier entry")
+        labels.add(account["label"].casefold())
+        logins.add(key)
+        stored = {"label": account["label"], "harness": account["harness"]}
+        if account["home"]:
+            stored["home"] = account["home"]
+        out.append(stored)
     return out
+
+
+def accounts_status() -> dict:
+    """What ``khipu config`` shows: the stored ``usage_accounts`` (None when
+    unset), where the list comes from, and the accounts it resolves to."""
+    from khipu.config import load_config
+
+    raw = load_config().get("usage_accounts")
+    stored = raw if isinstance(raw, list) and raw else None
+    return {"value": stored, "source": "file" if stored is not None else "default",
+            "accounts": configured_accounts()}
 
 
 def _key(account: dict) -> str:
     """Cache identity: the harness and the home whose login answers (labels
     are display names and may change)."""
     home = account.get("home")
-    return f"{account['harness']}|{Path(home).expanduser() if home else ''}"
+    if not home:
+        return f"{account['harness']}|"
+    path = _home_path(home)
+    return f"{account['harness']}|{path if path is not None else home}"
 
 
 def _blank_row(account: dict) -> dict:

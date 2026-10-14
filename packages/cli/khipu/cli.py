@@ -2732,6 +2732,21 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": True, "relevance_cosine_floor": relevance.cosine_floor_status(),
                           "config_file": str(path)}))
         return 0
+    if (args.set and args.set[0] == "usage_accounts") or args.unset == "usage_accounts":
+        # The accounts `khipu usage` reads, as JSON (plan usage phase 2):
+        # `--set usage_accounts '[{"label": "Claude second", "harness":
+        # "claude", "home": "~/.claude-second"}]'`; `--unset` (or `[]`) goes
+        # back to every installed CLI with its default login.
+        from khipu import usage
+        from khipu.config import set_usage_accounts
+
+        try:
+            path = set_usage_accounts(args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, "usage_accounts": usage.accounts_status(), "config_file": str(path)}))
+        return 0
     if (args.set and args.set[0] in CHOICE_SETTINGS) or args.unset in CHOICE_SETTINGS:
         from khipu.config import choice_setting, set_choice_setting
 
@@ -2811,7 +2826,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             )
         )
         return 0
-    from khipu import relevance
+    from khipu import relevance, usage
     from khipu.config import float_settings_status, list_setting, path_settings_status
 
     out = {
@@ -2829,6 +2844,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "float_settings": float_settings_status(),
         "relevance_cosine_floor": relevance.cosine_floor_status(),
         "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
+        "usage_accounts": usage.accounts_status(),
         "config_file": str(config_file()),
         "config": load_config(),
     }
@@ -4843,11 +4859,13 @@ def build_parser() -> argparse.ArgumentParser:
         "ceiling (synth_daily_calls, embed_daily_calls, "
         "library_embed_daily_calls; whole number, 0 = unlimited), the "
         "summariser fallback (synth_fallback gemini|none: what a failed "
-        "window does on a provider other than Gemini) or the comma-"
-        'separated user_aliases list (e.g. --set user_aliases "matt,matthew")',
+        "window does on a provider other than Gemini), the comma-"
+        'separated user_aliases list (e.g. --set user_aliases "matt,matthew") '
+        "or the plan usage accounts as JSON (usage_accounts "
+        '\'[{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}]\')',
     )
     cfg.add_argument("--unset", metavar="KEY",
-                     help="Remove a path setting, a daily call ceiling or synth_fallback, or "
+                     help="Remove a path setting, a daily call ceiling, synth_fallback or usage_accounts, or "
                      "relevance.cosine_floor / "
                      "relevance.cosine_floor_by_profile.<profile> to restore its default")
     cfg.add_argument(

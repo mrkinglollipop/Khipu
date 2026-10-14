@@ -3,12 +3,20 @@
    --json` through two fixed-argv commands (`khipu_usage_status`, cache first;
    `khipu_usage_refresh`, probes now). Khipu only reports these figures; it
    never moves work between plans. The shape mirrors `khipu/usage.py`
-   (`report()`); a window a CLI does not report is absent, never zero. */
+   (`report()`); a window a CLI does not report is absent, never zero.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+   Figures can be old on purpose (Muse's last turn, Codex's rollout files, the
+   last good read kept after a failed probe). A window whose reset time has
+   passed has started again, so its old percent no longer applies: it never
+   raises the alert, turns the health row red or colours a bar. Every reset
+   time is the viewer's own local time, the same on the card, the callout and
+   the health report. */
+
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import type { FormEvent } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 import { EmptyState, ListRow, Tag } from "./ui";
-import { callCli } from "./settingsCli";
+import { callCli, useCliState } from "./settingsCli";
 import { fmtAgeSince } from "./time";
 import type { Attention } from "./doctorAttention";
 
@@ -56,31 +64,81 @@ export const PLAN_WARN_PCT = 75;
 export const PLAN_ALERT_PCT = 90;
 
 /** The fixed error codes `khipu/usage.py` reports, in plain words. A CLI's
- *  own text never reaches the row, so these are all there is to show. */
+ *  own text never reaches the row; the row's `note` is Khipu's own words. */
 const ERROR_PHRASE: Record<string, string> = {
   timeout: "didn't answer in time",
   not_signed_in: "not signed in",
   not_installed: "not installed",
   bad_reply: "unreadable reply",
   no_plan_limits: "no plan limits reported",
+  invalid_account: "not a valid account entry",
+  no_answer: "stopped without answering",
+  start_failed: "could not be started",
+  cli_error: "reported an error",
+  internal_error: "Khipu could not run the check",
+  pending: "first read still running",
 };
 
 export function usageErrorPhrase(code: string | null | undefined): string {
-  return (code && ERROR_PHRASE[code]) || "couldn't read";
+  if (code && ERROR_PHRASE[code]) return ERROR_PHRASE[code];
+  if (code && /^(exit|signal)_\d+$/.test(code)) return ERROR_PHRASE.no_answer;
+  return "couldn't read";
+}
+
+/** What the owner sees when `khipu usage` itself fails; the CLI's own text
+ *  goes to the console only. */
+export const PLAN_READ_FAILED = "The usage check did not run. Try again in a minute.";
+const PLAN_READ_UNREADABLE = "The usage check gave an answer Khipu could not read.";
+
+/** A refusal from `config --set` is Khipu's own sentence; a CLI that did not
+ *  run at all ("khipu exited 1: ...", "spawn khipu CLI failed ...") is not
+ *  shown, only logged. */
+function settingError(error: string): string {
+  if (/^(khipu exited|spawn khipu)/i.test(error)) {
+    console.error("khipu config failed:", error);
+    return "Khipu could not save the account list. Try again in a minute.";
+  }
+  return error;
+}
+
+/** One decimal place: the figure shown and the figure the 75% and 90% lines
+ *  are judged on are the same number. */
+export function roundPct(n: number): number {
+  return Math.round(n * 10) / 10;
 }
 
 function pctOf(w: UsageWindow): number | null {
   const v = w.used_pct;
-  return typeof v === "number" && Number.isFinite(v) ? v : null;
+  return typeof v === "number" && Number.isFinite(v) ? roundPct(v) : null;
 }
 
-/** The window closest to its limit, or null when the account reports none. */
-export function tightestWindow(row: UsageAccount): UsageWindow | null {
+export function fmtPct(n: number): string {
+  return `${roundPct(n)}%`;
+}
+
+function parseIso(iso: string | null | undefined): Date | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** True when the window's reset time has passed: its percent was counted
+ *  before the reset and no longer applies. */
+export function hasReset(w: UsageWindow, now: Date = new Date()): boolean {
+  const d = parseIso(w.resets_at);
+  return d != null && d.getTime() <= now.getTime();
+}
+
+/** Windows with a figure that still applies (reset not yet passed). */
+export function liveWindows(row: UsageAccount, now: Date = new Date()): UsageWindow[] {
+  return (row.windows ?? []).filter((w) => pctOf(w) != null && !hasReset(w, now));
+}
+
+/** The window closest to its limit among those still in force, or null. */
+export function tightestWindow(row: UsageAccount, now: Date = new Date()): UsageWindow | null {
   let best: UsageWindow | null = null;
-  for (const w of row.windows ?? []) {
-    const p = pctOf(w);
-    if (p == null) continue;
-    if (best == null || p > (pctOf(best) ?? -1)) best = w;
+  for (const w of liveWindows(row, now)) {
+    if (best == null || (pctOf(w) ?? -1) > (pctOf(best) ?? -1)) best = w;
   }
   return best;
 }
@@ -88,10 +146,11 @@ export function tightestWindow(row: UsageAccount): UsageWindow | null {
 /** The tightest window across every account. */
 export function tightestOverall(
   report: UsageReport | null | undefined,
+  now: Date = new Date(),
 ): { row: UsageAccount; window: UsageWindow } | null {
   let out: { row: UsageAccount; window: UsageWindow } | null = null;
   for (const row of report?.accounts ?? []) {
-    const w = tightestWindow(row);
+    const w = tightestWindow(row, now);
     if (w && (out == null || (pctOf(w) ?? -1) > (pctOf(out.window) ?? -1))) out = { row, window: w };
   }
   return out;
@@ -116,57 +175,75 @@ export function planName(row: UsageAccount): string {
   return plan ? `${label} ${plan.charAt(0).toUpperCase()}${plan.slice(1)}` : label;
 }
 
-export function fmtPct(n: number): string {
-  return `${Number.isInteger(n) ? n : n.toFixed(1)}%`;
-}
+const HOUR_MS = 60 * 60 * 1000;
+const WEEKDAY_ONLY_MS = 6 * 24 * HOUR_MS;
 
-function parseIso(iso: string | null | undefined): Date | null {
-  if (!iso) return null;
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
-/** The reset in the viewer's own time zone, e.g. "Tue 9:57 PM". */
-export function fmtResetLocal(iso: string | null | undefined): string | null {
-  const d = parseIso(iso);
-  return d ? d.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" }) : null;
-}
-
-const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-/** The reset in UTC, as the CLI and the health report write it: "Tue 04:57Z". */
-export function fmtResetUtc(iso: string | null | undefined): string | null {
+/** A reset in the viewer's own time zone: "Tue 9:57 PM" within the next six
+ *  days, otherwise with its date ("Tue, Oct 13, 3:00 PM"), so a passed or a
+ *  far reset never reads as the coming weekday. */
+export function fmtResetLocal(iso: string | null | undefined, now: Date = new Date()): string | null {
   const d = parseIso(iso);
   if (!d) return null;
-  const hh = String(d.getUTCHours()).padStart(2, "0");
-  const mm = String(d.getUTCMinutes()).padStart(2, "0");
-  return `${DAYS[d.getUTCDay()]} ${hh}:${mm}Z`;
+  const ahead = d.getTime() - now.getTime();
+  if (ahead > 0 && ahead < WEEKDAY_ONLY_MS) {
+    return d.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
+  }
+  return d.toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+/** "resets in 40 min", "resets Tue 9:57 PM", or "reset since Mon, Oct 12,
+ *  3:00 PM"; null when the CLI gave no reset time. */
+export function resetPhrase(iso: string | null | undefined, now: Date = new Date()): string | null {
+  const d = parseIso(iso);
+  if (!d) return null;
+  const ahead = d.getTime() - now.getTime();
+  if (ahead <= 0) return `reset since ${fmtResetLocal(iso, now)}`;
+  if (ahead < HOUR_MS) return `resets in ${Math.max(1, Math.round(ahead / 60000))} min`;
+  return `resets ${fmtResetLocal(iso, now)}`;
 }
 
 export function meterTone(pct: number): "err" | "warn" | null {
-  if (pct >= PLAN_ALERT_PCT) return "err";
-  if (pct >= PLAN_WARN_PCT) return "warn";
+  const p = roundPct(pct);
+  if (p >= PLAN_ALERT_PCT) return "err";
+  if (p >= PLAN_WARN_PCT) return "warn";
   return null;
 }
 
-/** "Codex Pro week at 94%, resets Tue 04:57Z" for the tightest window across
- *  every account; null when no account reports a window. */
-export function plansHealthDetail(report: UsageReport | null | undefined): string | null {
-  const t = tightestOverall(report);
-  if (!t) return null;
-  const reset = fmtResetUtc(t.window.resets_at);
-  return `${planName(t.row)} ${windowLabel(t.window)} at ${fmtPct(pctOf(t.window) ?? 0)}${reset ? `, resets ${reset}` : ""}`;
+/** Figures kept from an earlier read (a failed probe, an old observation). */
+function isLastKnown(row: UsageAccount): boolean {
+  return Boolean(row.stale) || row.ok === false;
 }
 
-/** One attention item when any window is at or above 90%. */
-export function planAttention(report: UsageReport | null | undefined): Attention[] {
+/** "Codex Pro week at 94%, resets Wed 10:00 PM"; "... at 95% when last read"
+ *  for kept figures. */
+function windowSentence(row: UsageAccount, w: UsageWindow, now: Date): string {
+  const reset = resetPhrase(w.resets_at, now);
+  const last = isLastKnown(row) ? " when last read" : "";
+  return `${planName(row)} ${windowLabel(w)} at ${fmtPct(pctOf(w) ?? 0)}${last}${reset ? `, ${reset}` : ""}`;
+}
+
+/** The tightest window still in force across every account; null when none. */
+export function plansHealthDetail(report: UsageReport | null | undefined, now: Date = new Date()): string | null {
+  const t = tightestOverall(report, now);
+  return t ? windowSentence(t.row, t.window, now) : null;
+}
+
+/** Accounts that answered nothing usable: a failed probe with no figures
+ *  kept. "Claude (not signed in)". */
+export function unreadAccounts(report: UsageReport | null | undefined, now: Date = new Date()): string[] {
+  return (report?.accounts ?? [])
+    .filter((row) => row.ok === false && liveWindows(row, now).length === 0)
+    .map((row) => `${row.account || row.harness || "Account"} (${usageErrorPhrase(row.error)})`);
+}
+
+/** One attention item when any window still in force is at or above 90%. */
+export function planAttention(report: UsageReport | null | undefined, now: Date = new Date()): Attention[] {
   const hot: string[] = [];
   for (const row of report?.accounts ?? []) {
-    for (const w of row.windows ?? []) {
+    for (const w of liveWindows(row, now)) {
       const p = pctOf(w);
       if (p == null || p < PLAN_ALERT_PCT) continue;
-      const reset = fmtResetUtc(w.resets_at);
-      hot.push(`${planName(row)} ${windowLabel(w)} at ${fmtPct(p)}${reset ? `, resets ${reset}` : ""}`);
+      hot.push(windowSentence(row, w, now));
     }
   }
   if (!hot.length) return [];
@@ -186,48 +263,84 @@ function parseReport(data: unknown): UsageReport | null {
   return Array.isArray(accounts) ? (data as UsageReport) : null;
 }
 
-/** The report, read cache first while `active`; `refresh` probes every account now. */
-export function usePlanUsage(active: boolean) {
+type ReadKind = "status" | "refresh";
+
+/** The report, read cache first whenever `active` changes to a truthy view
+ *  ("home", "settings"); `refresh` probes every account now. One read at a
+ *  time: a load asked for while any read runs gets that read's answer, and a
+ *  refresh asked for while a status read runs follows it, so a cache read can
+ *  never replace a fresh probe and no two reads start the CLIs twice. */
+export function usePlanUsage(active: unknown) {
   const [data, setData] = useState<UsageReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const latest = useRef(0);
+  const inflight = useRef<{ kind: ReadKind; promise: Promise<void> } | null>(null);
+  const queuedRefresh = useRef<Promise<void> | null>(null);
 
-  const run = useCallback(async (command: "khipu_usage_status" | "khipu_usage_refresh") => {
-    const request = ++latest.current;
-    const setBusy = command === "khipu_usage_refresh" ? setRefreshing : setLoading;
+  const read = useCallback((kind: ReadKind): Promise<void> => {
+    const setBusy = kind === "refresh" ? setRefreshing : setLoading;
     setBusy(true);
-    const res = await callCli<UsageReport>(command);
-    setBusy(false);
-    if (latest.current !== request) return;
-    if (!res.ok) {
-      setError(res.error);
-      return;
-    }
-    const report = parseReport(res.data);
-    if (report) {
-      setData(report);
-      setError(null);
-    } else {
-      setError("Khipu gave an unreadable answer.");
-    }
+    const entry: { kind: ReadKind; promise: Promise<void> } = { kind, promise: Promise.resolve() };
+    entry.promise = (async () => {
+      try {
+        const res = await callCli<UsageReport>(kind === "refresh" ? "khipu_usage_refresh" : "khipu_usage_status");
+        if (!res.ok) {
+          console.error("khipu usage failed:", res.error);
+          setError(PLAN_READ_FAILED);
+          return;
+        }
+        const report = parseReport(res.data);
+        if (report) {
+          setData(report);
+          setError(null);
+        } else {
+          setError(PLAN_READ_UNREADABLE);
+        }
+      } finally {
+        if (inflight.current === entry) inflight.current = null;
+        setBusy(false);
+      }
+    })();
+    inflight.current = entry;
+    return entry.promise;
   }, []);
 
-  const load = useCallback(() => run("khipu_usage_status"), [run]);
-  const refresh = useCallback(() => run("khipu_usage_refresh"), [run]);
+  const load = useCallback((): Promise<void> => inflight.current?.promise ?? read("status"), [read]);
+
+  /** A status read that starts after any read now running, for a change
+   *  (the account list) that the running read cannot have seen. */
+  const reread = useCallback(async (): Promise<void> => {
+    while (inflight.current || queuedRefresh.current) {
+      await (queuedRefresh.current ?? inflight.current?.promise);
+    }
+    return read("status");
+  }, [read]);
+
+  const refresh = useCallback((): Promise<void> => {
+    const current = inflight.current;
+    if (current?.kind === "refresh") return current.promise;
+    if (!current) return read("refresh");
+    if (!queuedRefresh.current) {
+      setRefreshing(true);
+      queuedRefresh.current = current.promise.then(() => {
+        queuedRefresh.current = null;
+        return read("refresh");
+      });
+    }
+    return queuedRefresh.current;
+  }, [read]);
 
   useEffect(() => {
     if (active) void load();
   }, [active, load]);
 
-  return { data, error, loading, refreshing, load, refresh };
+  return { data, error, loading, refreshing, load, refresh, reread };
 }
 
 export type PlanUsageState = ReturnType<typeof usePlanUsage>;
 
-function Meter({ pct, label }: { pct: number; label: string }) {
-  const tone = meterTone(pct);
+function Meter({ pct, label, tone }: { pct: number; label: string; tone: "err" | "warn" | null }) {
   const width = Math.min(100, Math.max(0, pct));
   return (
     <span
@@ -244,13 +357,19 @@ function Meter({ pct, label }: { pct: number; label: string }) {
   );
 }
 
+/** When the figures were read: Muse's last turn, the last good probe kept
+ *  after a failure, or this read. */
+function figuresAt(row: UsageAccount): string | null {
+  return row.observed_at || row.last_good_at || row.probed_at || null;
+}
+
 function StatusTags({ row }: { row: UsageAccount }) {
-  return (
-    <>
-      {row.observed_at ? <Tag>as of the last turn</Tag> : null}
-      {row.stale ? <Tag tone="warn">stale</Tag> : null}
-    </>
-  );
+  const age = fmtAgeSince(figuresAt(row));
+  if (row.observed_at) {
+    return <Tag tone={row.stale ? "warn" : "neutral"}>{age ? `as of the last turn, ${age} ago` : "as of the last turn"}</Tag>;
+  }
+  if (row.stale) return <Tag tone="warn">{age ? `figures from ${age} ago` : "stale"}</Tag>;
+  return null;
 }
 
 function RefreshButton({ busy, label, onClick }: { busy: boolean; label: string; onClick: () => void }) {
@@ -267,13 +386,21 @@ function RefreshButton({ busy, label, onClick }: { busy: boolean; label: string;
 }
 
 const NO_ACCOUNTS_HINT =
-  "No claude, codex, grok or muse command was found on this Mac, and usage_accounts in Khipu's config.json lists none.";
+  "No claude, codex, grok or muse command was found on this Mac, and no account is listed under Settings → Capture & models → Plans.";
+const ALL_RESET = "every limit has reset since it was read";
 
-/** One account on Home: its tightest window as a bar, or why there is none. */
-function PlanRow({ row }: { row: UsageAccount }) {
-  const w = tightestWindow(row);
+/** Figures exist, but every window has reset since they were read. */
+export function onlyResetWindows(row: UsageAccount, now: Date): boolean {
+  return liveWindows(row, now).length === 0 && (row.windows ?? []).some((w) => pctOf(w) != null);
+}
+
+/** One account on Home: its tightest window still in force as a bar, or why
+ *  there is none. */
+function PlanRow({ row, now }: { row: UsageAccount; now: Date }) {
+  const w = tightestWindow(row, now);
   const p = w ? pctOf(w) : null;
-  const reset = w ? fmtResetLocal(w.resets_at) : null;
+  const reset = w ? resetPhrase(w.resets_at, now) : null;
+  const allReset = onlyResetWindows(row, now);
   return (
     <ListRow className="plan-row">
       <span className="plan-name ellip">
@@ -282,20 +409,20 @@ function PlanRow({ row }: { row: UsageAccount }) {
       </span>
       {w && p != null ? (
         <>
-          <Meter pct={p} label={`${planName(row)} ${windowLabel(w)}`} />
+          <Meter pct={p} label={`${planName(row)} ${windowLabel(w)}`} tone={meterTone(p)} />
           <span className={`plan-pct ${meterTone(p) ?? ""}`}>{fmtPct(p)}</span>
           <span className="plan-when meta">
             {windowLabel(w)}
-            {reset ? ` · resets ${reset}` : ""}
+            {reset ? ` · ${reset}` : ""}
           </span>
         </>
       ) : (
         <span className="plan-none t2">
-          {row.ok === false ? usageErrorPhrase(row.error) : row.note || "no limits reported"}
+          {allReset ? ALL_RESET : row.ok === false ? usageErrorPhrase(row.error) : row.note || "no limits reported"}
         </span>
       )}
       <span className="plan-tags">
-        {row.ok === false && w ? <Tag tone="warn">{usageErrorPhrase(row.error)}</Tag> : null}
+        {row.ok === false && (w || allReset) ? <Tag tone="warn">{usageErrorPhrase(row.error)}</Tag> : null}
         <StatusTags row={row} />
       </span>
     </ListRow>
@@ -306,12 +433,13 @@ function PlanRow({ row }: { row: UsageAccount }) {
 export function PlansCard({ state }: { state: PlanUsageState }) {
   const { data, error, loading, refreshing, refresh } = state;
   const accounts = data?.accounts ?? [];
+  const now = new Date();
   return (
     <div className="card plans-card">
       <div className="card-head">
         Plans
         <span className="spacer" />
-        <RefreshButton busy={refreshing} label="Refresh" onClick={() => void refresh()} />
+        <RefreshButton busy={refreshing || loading} label="Refresh" onClick={() => void refresh()} />
       </div>
       {data == null ? (
         error ? (
@@ -327,11 +455,11 @@ export function PlansCard({ state }: { state: PlanUsageState }) {
       ) : (
         <>
           {accounts.map((row, i) => (
-            <PlanRow key={`${row.harness}|${row.home ?? ""}|${i}`} row={row} />
+            <PlanRow key={`${row.harness}|${row.home ?? ""}|${i}`} row={row} now={now} />
           ))}
           {error ? (
             <ListRow>
-              <span className="meta">Last read failed: {error}</span>
+              <span className="meta">The last read failed; these figures are from the read before it.</span>
             </ListRow>
           ) : null}
         </>
@@ -340,26 +468,45 @@ export function PlansCard({ state }: { state: PlanUsageState }) {
   );
 }
 
+/** "figures from 2 days ago · last tried 30s ago" for kept figures, "figures
+ *  from 30s ago" for a fresh read, "last tried 30s ago" with no figures. */
+function readWhen(row: UsageAccount, hasFigures: boolean): string {
+  const tried = row.last_attempt_at || row.probed_at || null;
+  const triedAge = fmtAgeSince(tried);
+  if (!hasFigures) return triedAge ? `last tried ${triedAge} ago` : "";
+  const figures = figuresAt(row);
+  const figuresAge = fmtAgeSince(figures);
+  const parts = figuresAge ? [`figures from ${figuresAge} ago`] : [];
+  const gap = figures && tried ? Math.abs(new Date(tried).getTime() - new Date(figures).getTime()) : 0;
+  if (triedAge && (row.ok === false || gap > 60_000)) parts.push(`last tried ${triedAge} ago`);
+  return parts.join(" · ");
+}
+
 /** Settings → Capture & models → Plans: every account, every window, its
- *  reset and when it was read, and Probe now. Accounts are read only here. */
-export function PlansSettingsCard({ active }: { active: boolean }) {
-  const st = usePlanUsage(active);
+ *  reset and when its figures were read, Probe now, and which accounts are
+ *  read (`usage_accounts`). Shares Home's reads (`state`). */
+export function PlansSettingsCard({ state, active }: { state: PlanUsageState; active: boolean }) {
+  const st = state;
   const accounts = st.data?.accounts ?? [];
+  const now = new Date();
   return (
     <div className="section-card">
       <div className="section-head">Plans</div>
       <div className="section-body">
         {st.error ? (
           <p className="set-error" role="alert">
-            Could not read plan usage: {st.error}
+            {st.error}
           </p>
         ) : null}
-        {st.data && accounts.length === 0 ? (
-          <p className="set-help">{NO_ACCOUNTS_HINT}</p>
+        {st.loading && st.data == null ? (
+          <p className="set-help" role="status">
+            Reading plan usage…
+          </p>
         ) : null}
+        {st.data && accounts.length === 0 ? <p className="set-help">{NO_ACCOUNTS_HINT}</p> : null}
         {accounts.map((row, i) => {
-          const probed = fmtAgeSince(row.last_attempt_at || row.probed_at);
           const windows = (row.windows ?? []).filter((w) => pctOf(w) != null);
+          const when = readWhen(row, windows.length > 0);
           return (
             <div key={`${row.harness}|${row.home ?? ""}|${i}`} className="rows plan-account" role="group" aria-label={row.account || row.harness}>
               <div className="row-item">
@@ -371,41 +518,213 @@ export function PlansSettingsCard({ active }: { active: boolean }) {
                 <StatusTags row={row} />
                 <span className="row-meta">
                   {row.home || "default login"}
-                  {probed ? ` · read ${probed} ago` : ""}
+                  {when ? ` · ${when}` : ""}
                 </span>
               </div>
               {windows.length === 0 ? (
                 <div className="row-item">
                   <span className="row-main t2">
-                    {row.ok === false ? usageErrorPhrase(row.error) : row.note || "no limits reported"}
+                    {row.note || (row.ok === false ? usageErrorPhrase(row.error) : "no limits reported")}
                   </span>
                 </div>
               ) : (
-                windows.map((w) => {
-                  const p = pctOf(w) as number;
-                  const reset = fmtResetLocal(w.resets_at);
-                  return (
-                    <div key={w.name} className="row-item plan-window">
-                      <span className="plan-wname">{windowLabel(w)}</span>
-                      <Meter pct={p} label={`${planName(row)} ${windowLabel(w)}`} />
-                      <span className={`plan-pct ${meterTone(p) ?? ""}`}>{fmtPct(p)}</span>
-                      <span className="row-meta">{reset ? `resets ${reset}` : "no reset reported"}</span>
+                <>
+                  {windows.map((w) => {
+                    const p = pctOf(w) as number;
+                    const reset = resetPhrase(w.resets_at, now);
+                    const tone = hasReset(w, now) ? null : meterTone(p);
+                    return (
+                      <div key={w.name} className="row-item plan-window">
+                        <span className="plan-wname">{windowLabel(w)}</span>
+                        <Meter pct={p} label={`${planName(row)} ${windowLabel(w)}`} tone={tone} />
+                        <span className={`plan-pct ${tone ?? ""}`}>{fmtPct(p)}</span>
+                        <span className="row-meta">{reset ?? "no reset reported"}</span>
+                      </div>
+                    );
+                  })}
+                  {row.note ? (
+                    <div className="row-item">
+                      <span className="row-main t2">{row.note}</span>
                     </div>
-                  );
-                })
+                  ) : null}
+                </>
               )}
             </div>
           );
         })}
         <div className="toolbar">
-          <RefreshButton busy={st.refreshing} label="Probe now" onClick={() => void st.refresh()} />
+          <RefreshButton busy={st.refreshing || st.loading} label="Probe now" onClick={() => void st.refresh()} />
           <span className="muted">Asks every CLI again now; takes up to about seven seconds.</span>
         </div>
-        <p className="set-help">
-          Accounts come from <code>usage_accounts</code> in Khipu's config.json (empty: every installed CLI, default
-          login). No command sets it yet; edit the file, then Probe now.
-        </p>
+        <UsageAccountsField active={active} onChanged={st.reread} />
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Which accounts are read: `config --set usage_accounts JSON` / `--unset`.
+// ---------------------------------------------------------------------------
+
+export type UsageAccountEntry = { label: string; harness: string; home?: string | null; invalid?: string };
+type UsageAccountsStatus = { value: UsageAccountEntry[] | null; source: "file" | "default"; accounts: UsageAccountEntry[] };
+
+export const USAGE_HARNESS_OPTIONS: Array<[string, string]> = [
+  ["claude", "Claude Code"],
+  ["codex", "Codex"],
+  ["grok", "Grok Build"],
+  ["muse", "Muse"],
+];
+
+function harnessName(h: string): string {
+  return USAGE_HARNESS_OPTIONS.find(([v]) => v === h)?.[1] ?? h;
+}
+
+/** The list to store: the valid entries shown, as `{label, harness, home?}`. */
+function storable(entries: UsageAccountEntry[]): Array<{ label: string; harness: string; home?: string }> {
+  return entries
+    .filter((e) => !e.invalid)
+    .map((e) => (e.home ? { label: e.label, harness: e.harness, home: e.home } : { label: e.label, harness: e.harness }));
+}
+
+export function UsageAccountsField({ active, onChanged }: { active: boolean; onChanged?: () => Promise<unknown> | void }) {
+  const cfg = useCliState<{ usage_accounts?: UsageAccountsStatus }>("khipu_config_show", active);
+  const status = cfg.data?.usage_accounts;
+  const entries = status?.accounts ?? [];
+  const [label, setLabel] = useState("");
+  const [harness, setHarness] = useState("claude");
+  const [home, setHome] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const id = useId();
+  const hasInvalid = entries.some((e) => e.invalid);
+
+  async function save(next: UsageAccountEntry[] | null): Promise<boolean> {
+    setSaving(true);
+    setErr(null);
+    const list = next == null ? [] : storable(next);
+    const res = list.length
+      ? await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(list) })
+      : await callCli("khipu_config_unset", { key: "usage_accounts" });
+    await cfg.reload();
+    setSaving(false);
+    if (!res.ok) {
+      setErr(settingError(res.error));
+      return false;
+    }
+    await onChanged?.();
+    return true;
+  }
+
+  async function add(e: FormEvent) {
+    e.preventDefault();
+    const entry: UsageAccountEntry = {
+      label: label.trim() || harnessName(harness),
+      harness,
+      home: harness === "muse" ? null : home.trim() || null,
+    };
+    if (await save([...entries, entry])) {
+      setLabel("");
+      setHome("");
+    }
+  }
+
+  return (
+    <div className="set-field">
+      <div className="set-labelrow">
+        <span className="set-label" id={`${id}-head`}>
+          Accounts read
+        </span>
+        {status ? <Tag tone="neutral">{status.source === "file" ? "Your list" : "Default"}</Tag> : null}
+      </div>
+      <p className="set-help">
+        {status?.source === "file"
+          ? "Only the accounts below are read."
+          : "Every installed CLI is read with its default login. Add an account to read a second login, such as another Claude or Grok sign-in."}
+      </p>
+      {cfg.error && !status ? (
+        <p className="set-error" role="alert">
+          Could not read the account list. Close and reopen this section to try again.
+        </p>
+      ) : null}
+      {entries.length ? (
+        <div className="rows" role="list" aria-labelledby={`${id}-head`}>
+          {entries.map((e, i) => (
+            <div key={`${e.harness}|${e.home ?? ""}|${i}`} className="row-item" role="listitem">
+              <span className="row-main">
+                {e.label}
+                <span className="meta"> {harnessName(e.harness)}</span>
+              </span>
+              {e.invalid ? <Tag tone="warn">not valid: {e.invalid}</Tag> : null}
+              <span className="row-meta">{e.home || "default login"}</span>
+              <button
+                type="button"
+                className="sm"
+                disabled={saving || !status}
+                aria-label={`Remove ${e.label}`}
+                onClick={() => void save(entries.filter((_, j) => j !== i))}
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <form className="toolbar" onSubmit={(e) => void add(e)} aria-label="Add an account">
+        <label className="muted" htmlFor={`${id}-label`}>
+          Name
+        </label>
+        <input
+          id={`${id}-label`}
+          value={label}
+          placeholder="Claude second…"
+          autoComplete="off"
+          spellCheck={false}
+          onChange={(e) => setLabel(e.target.value)}
+        />
+        <label className="muted" htmlFor={`${id}-harness`}>
+          CLI
+        </label>
+        <select id={`${id}-harness`} value={harness} onChange={(e) => setHarness(e.target.value)}>
+          {USAGE_HARNESS_OPTIONS.map(([v, name]) => (
+            <option key={v} value={v}>
+              {name}
+            </option>
+          ))}
+        </select>
+        <label className="muted" htmlFor={`${id}-home`}>
+          Login folder
+        </label>
+        <input
+          id={`${id}-home`}
+          value={harness === "muse" ? "" : home}
+          placeholder={harness === "muse" ? "Muse has one login" : "~/.claude-second…"}
+          disabled={harness === "muse"}
+          autoComplete="off"
+          spellCheck={false}
+          onChange={(e) => setHome(e.target.value)}
+        />
+        <button type="submit" className="sm" disabled={saving || !status}>
+          {saving ? <Loader2 size={14} className="spin" aria-hidden /> : null}
+          Add
+        </button>
+      </form>
+      <p className="set-help">
+        The login folder is where that CLI keeps a second sign-in; leave it empty for the default login.
+        {hasInvalid ? " Entries marked not valid are left out when you add or remove an account." : ""}
+      </p>
+      {status?.source === "file" ? (
+        <div className="toolbar">
+          <button type="button" className="sm" disabled={saving} onClick={() => void save(null)}>
+            Go back to every installed CLI
+          </button>
+        </div>
+      ) : null}
+      {err ? (
+        <p className="set-error" role="alert">
+          {err}
+        </p>
+      ) : null}
     </div>
   );
 }

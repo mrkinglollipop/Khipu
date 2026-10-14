@@ -338,6 +338,22 @@ def set_choice_setting(key: str, value: "str | None") -> Path:
     return save_config(data)
 
 
+def set_usage_accounts(raw: "str | list | None") -> Path:
+    """Store ``usage_accounts``, the accounts ``khipu usage`` reads (JSON text
+    or a list of ``{label, harness, home?}``, checked by
+    ``khipu.usage.parse_usage_accounts``). None or an empty list removes the
+    key: every installed CLI with its default login."""
+    from khipu.usage import parse_usage_accounts
+
+    entries = [] if raw is None else parse_usage_accounts(raw)
+    data = _load_config_for_mutation()
+    if entries:
+        data["usage_accounts"] = entries
+    else:
+        data.pop("usage_accounts", None)
+    return save_config(data)
+
+
 def path_settings_status() -> dict:
     """Every path setting with its resolved value and where it came from."""
     out = {}

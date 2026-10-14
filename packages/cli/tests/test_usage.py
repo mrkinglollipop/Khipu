@@ -777,3 +777,101 @@ def test_legitimate_absence_stays_ok(fake, tmp_path):
                                                                      "result": {"config": {}}}]))
     row = usage.probe_grok(None)
     assert row["ok"] is True and row["windows"] == []
+
+
+# ---- usage_accounts: settable from the app, a bad home never crashes -----------
+
+NO_USER_HOME = "~khipu-no-such-user-7f3a/.claude"
+
+
+def _config_cli(argv, capsys):
+    from khipu.cli import main
+
+    rc = main(["config", *argv])
+    return rc, json.loads(capsys.readouterr().out)
+
+
+def test_a_home_naming_no_user_is_an_invalid_row_not_a_crash(fake, tmp_path):
+    fake("claude", "claude.jsonl")
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    (data / "config.json").write_text(json.dumps({"usage_accounts": [
+        {"label": "Claude", "harness": "claude"},
+        {"label": "Typo", "harness": "claude", "home": NO_USER_HOME},
+    ]}))
+    rep = usage.report(fresh=True)
+    rows = {r["account"]: r for r in rep["accounts"]}
+    assert rows["Claude"]["ok"] is True
+    assert rows["Typo"]["ok"] is False and rows["Typo"]["error"] == "invalid_account"
+    assert "names a user this Mac does not have" in rows["Typo"]["note"]
+    # Neither the cache key nor the probe environment raises on such a home.
+    assert usage._key({"harness": "claude", "home": NO_USER_HOME}) == f"claude|{NO_USER_HOME}"
+    assert usage.probe_environment("claude", NO_USER_HOME)["CLAUDE_CONFIG_DIR"] == NO_USER_HOME
+
+
+def test_usage_accounts_are_set_shown_and_unset_through_config(fake, capsys):
+    from khipu import config
+
+    fake("claude", "claude.jsonl")
+    fake("grok", "grok.jsonl")
+    rc, out = _config_cli(["--set", "usage_accounts", json.dumps([
+        {"label": " Claude second ", "harness": "Claude", "home": "~/.claude-second"},
+        {"label": "Grok", "harness": "grok", "home": None},
+    ])], capsys)
+    assert rc == 0 and out["ok"] is True
+    stored = json.loads(config.config_file().read_text())["usage_accounts"]
+    assert stored == [{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"},
+                      {"label": "Grok", "harness": "grok"}]
+    assert out["usage_accounts"]["source"] == "file"
+    assert [a["label"] for a in out["usage_accounts"]["accounts"]] == ["Claude second", "Grok"]
+    rc, shown = _config_cli([], capsys)
+    assert rc == 0 and shown["usage_accounts"]["value"] == stored
+    rc, out = _config_cli(["--unset", "usage_accounts"], capsys)
+    assert rc == 0 and out["usage_accounts"] == {
+        "value": None, "source": "default",
+        "accounts": [{"label": "Claude", "harness": "claude", "home": None},
+                     {"label": "Grok", "harness": "grok", "home": None}]}
+    assert "usage_accounts" not in json.loads(config.config_file().read_text())
+    # An empty list is the default too.
+    assert _config_cli(["--set", "usage_accounts", json.dumps([{"harness": "codex"}])], capsys)[0] == 0
+    rc, out = _config_cli(["--set", "usage_accounts", "[]"], capsys)
+    assert rc == 0 and out["usage_accounts"]["source"] == "default"
+
+
+@pytest.mark.parametrize("value, needle", [
+    ("not json", "must be JSON"),
+    ('{"harness": "claude"}', "must be a list"),
+    ('["claude"]', "entry 1 is not an object"),
+    ('[{"harness": "cluade"}]', "unknown harness 'cluade'"),
+    ('[{"harness": "muse", "home": "/x"}]', "Muse has one login"),
+    ('[{"harness": "claude", "token": "x"}]', "unknown field 'token'"),
+    ('[{"harness": "claude", "home": 3}]', "home must be text"),
+    ('[{"harness": "claude", "label": "a\\nb"}]', "one line of plain text"),
+    (json.dumps([{"harness": "claude", "home": NO_USER_HOME}]), "names a user this Mac does not have"),
+    ('[{"harness": "claude"}, {"label": "claude", "harness": "codex"}]', "two usage_accounts entries are named"),
+    ('[{"label": "A", "harness": "claude", "home": "/x"}, {"label": "B", "harness": "claude", "home": "/x/"}]',
+     "reads the same login"),
+    (json.dumps([{"harness": "claude", "label": "x" * 65}]), "longer than 64"),
+    (json.dumps([{"harness": "claude", "label": f"c{i}"} for i in range(33)]), "at most 32"),
+])
+def test_usage_accounts_refuses_what_cannot_be_probed(fake, capsys, value, needle):
+    from khipu import config
+
+    rc, out = _config_cli(["--set", "usage_accounts", value], capsys)
+    assert rc == 2 and out["ok"] is False and needle in out["error"]
+    assert not config.config_file().exists()
+
+
+def test_every_error_code_has_a_plain_phrase_in_the_app():
+    """The desktop shows each fixed code as a plain phrase (PlansCard.tsx
+    ERROR_PHRASE); a code added here without one would read "couldn't read"."""
+    app = Path(__file__).resolve().parents[3] / "apps" / "desktop" / "src" / "PlansCard.tsx"
+    if not app.is_file():
+        pytest.skip("desktop sources not in this checkout")
+    block = app.read_text(encoding="utf-8").split("const ERROR_PHRASE", 1)[1].split("};", 1)[0]
+    codes = {value for name, value in vars(usage).items() if name.startswith("E_") and isinstance(value, str)}
+    assert codes, "no E_ codes found"
+    missing = sorted(code for code in codes if f"  {code}: " not in block)
+    assert not missing, f"no plain phrase in PlansCard.tsx for {missing}"
+    # exit_<n> / signal_<n> are matched by pattern there.
+    assert "(exit|signal)_" in app.read_text(encoding="utf-8")

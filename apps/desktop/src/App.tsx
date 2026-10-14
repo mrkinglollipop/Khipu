@@ -1078,14 +1078,6 @@ export default function App() {
   // the health report's red rows (`healthRows.tsx`) both read this so the
   // wording never drifts between the two (2026-08-17 / 2026-09-05).
   const [attention, setAttention] = useState<Attention[]>([]);
-  // Plan usage (docs/plans/2026-10-14-plan-usage.md, phase 2). Doctor does
-  // not carry it, so Home reads `khipu usage --json` itself and adds one
-  // attention item when any window is at or above 90%.
-  const plans = usePlanUsage(tab === "home");
-  const homeAttention = useMemo(
-    () => [...attention, ...planAttention(plans.data)],
-    [attention, plans.data],
-  );
   const [doctorCheckCount, setDoctorCheckCount] = useState(0);
   // Home's four tiles read these straight off the doctor payload; nothing here
   // is derived from a field the report does not carry.
@@ -2429,6 +2421,18 @@ export default function App() {
     ipv4?: string;
   } | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("database");
+  // Plan usage (docs/plans/2026-10-14-plan-usage.md, phase 2). Doctor does
+  // not carry it, so the app reads `khipu usage --json` itself and adds one
+  // attention item when any window still in force is at or above 90%. One
+  // reader shared by Home and Settings -> Capture & models, so the two never
+  // start the subscription CLIs twice; it re-reads on entering either view.
+  const plans = usePlanUsage(
+    tab === "home" ? "home" : tab === "settings" && settingsSection === "capture" ? "settings" : null,
+  );
+  const homeAttention = useMemo(
+    () => [...attention, ...planAttention(plans.data)],
+    [attention, plans.data],
+  );
   // "Connect to a server you run or another Mac…" reopens the first-run flow
   // at the Database step rather than restarting it — `welcomeInitialStepKey`
   // is bumped on every click so a second visit still jumps even when
@@ -5369,7 +5373,7 @@ export default function App() {
 
                     <SummariserBudgetCard active={tab === "settings" && settingsSection === "capture"} />
 
-                    <PlansSettingsCard active={tab === "settings" && settingsSection === "capture"} />
+                    <PlansSettingsCard state={plans} active={tab === "settings" && settingsSection === "capture"} />
 
                     <div className="section-card">
                       <div className="section-head">Keys</div>

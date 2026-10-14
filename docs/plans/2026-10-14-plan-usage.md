@@ -10,7 +10,7 @@ it first. Builds after the promotion gate (`2026-10-14-promotion-gate.md`) and g
 | Phase | What | State |
 |---|---|---|
 | 1 | `khipu usage`: one probe per installed subscription CLI, cached, as CLI JSON and an MCP tool | built 2026-10-14 (branch `feat/plan-usage-p1`): `khipu/usage.py`, `khipu usage`, MCP `khipu_usage`, fixtures `tests/fixtures/usage/`; real run on this Mac answered all four CLIs in 0.6–1.6 s |
-| 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | built 2026-10-14 (branch `feat/plan-usage-p2`, desktop 0.4.14): fixed-argv `khipu_usage_status` (`usage --json`) and `khipu_usage_refresh` (`usage --fresh --json`); `PlansCard.tsx` (Home card with Refresh, Settings → Capture & models card with Probe now; `usage_accounts` shown read only, as `config --set` cannot set it); health report "Plans" row and a Home attention item at 90%, read from `khipu_usage_status` because doctor does not carry usage |
+| 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | built 2026-10-14 (branch `feat/plan-usage-p2`, desktop 0.4.14): fixed-argv `khipu_usage_status` (`usage --json`) and `khipu_usage_refresh` (`usage --fresh --json`); `PlansCard.tsx` (Home card with Refresh, Settings → Capture & models card with Probe now and an add/remove list of the accounts read, through `config --set usage_accounts JSON` / `--unset`); health report "Plans" row and a Home attention item at 90%, read from `khipu_usage_status` because doctor does not carry usage; fix round below |
 
 Two PRs, phase 1 first.
 
@@ -98,6 +98,23 @@ Home card "Plans" with one row per account (plan, the tightest window as a bar, 
 Settings → Models lists the accounts with their labels and homes and a Probe now button; doctor warns
 when any window is above 90% ("Claude main five-hour at 94%, resets in 40 min") so the orchestrator sees
 it in the health report it already reads.
+
+**Fix round (2026-10-14, after a review of phase 2).** A window whose `resets_at` has passed has started
+again: it never raises the 90% item, turns the Plans row red or colours a bar, and reads "reset since
+<date>". Figures kept from an earlier read alert as "when last read" and carry their own age ("figures from 2
+days ago", "as of the last turn, 3 h ago"); Settings shows that age and the last attempt separately. Reset
+times are the viewer's local time everywhere in the app (the UTC "Z" form stays in the CLI and MCP text), with
+the date when the reset has passed or is six or more days out, and "resets in 40 min" under an hour. The 75% and
+90% lines are judged on the one-decimal figure shown. The Plans row is red, naming the accounts, when no
+account gave a figure and any failed, and names failed accounts beside the figures that were read. Every fixed
+error code has a plain phrase, and Settings shows the row's Khipu-written note (an invalid entry's reason, the
+`/login` hint). A failed `khipu usage` run shows a fixed sentence; its text goes to the console only. Home and
+Settings share one reader that runs one read at a time, so a cache read never replaces a fresh probe and the
+CLIs are never started twice by the app. `khipu config --set usage_accounts` takes JSON checked by
+`usage.parse_usage_accounts` (known harness, no home for Muse, a home that names a real user, each label and
+login once, at most 32); `khipu config` shows the stored list, its source and the accounts it resolves to. A
+home such as `~nouser/x` is an `invalid_account` row instead of a crash. Not done: the CLI's synchronous path
+still probes beside a refresh another process holds (an MCP background refresh); the app no longer causes that.
 
 ## Decisions
 
