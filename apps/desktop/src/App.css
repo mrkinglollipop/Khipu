@@ -2994,3 +2994,46 @@ input.switch:disabled {
   .lib-add .fields { grid-template-columns: 1fr; }
 }
 .lib-add select { text-overflow: ellipsis; }
+
+/* ---------------------------------------------------------------------------
+   Plans: Home card and Settings -> Capture & models
+   (docs/plans/2026-10-14-plan-usage.md, phase 2). The bar uses the
+   Embeddings track; the fill turns warn at 75% and err at 90%, and the
+   percent beside it carries the same figure in words.
+--------------------------------------------------------------------------- */
+.plans-card, .plan-account { --bar-track: color-mix(in srgb, var(--text-2) 68%, var(--surface-2)); }
+@media (prefers-color-scheme: dark) {
+  .plans-card, .plan-account { --bar-track: color-mix(in srgb, var(--text-2) 55%, var(--surface-2)); }
+}
+.plan-meter {
+  position: relative;
+  display: block;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bar-track);
+  overflow: hidden;
+  min-width: 3rem;
+}
+.plan-meter i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--accent); }
+.plan-meter.warn i { background: var(--warn); }
+.plan-meter.err i { background: var(--err); }
+.plan-pct { font-variant-numeric: tabular-nums; text-align: right; font-size: var(--t-sm); color: var(--text); }
+.plan-pct.warn { color: var(--warn); font-weight: 600; }
+.plan-pct.err { color: var(--err); font-weight: 600; }
+.card .row.plan-row {
+  display: grid;
+  grid-template-columns: minmax(7rem, 11rem) minmax(4rem, 1fr) 3.5rem minmax(0, 15rem) auto;
+  column-gap: var(--s3);
+}
+.plan-row .plan-none { grid-column: 2 / 5; font-size: var(--t-sm); }
+.plan-row .plan-when { overflow: hidden; text-overflow: ellipsis; }
+.plan-tags { display: inline-flex; gap: var(--s1); justify-content: flex-end; flex-wrap: wrap; }
+.plan-account + .plan-account { margin-top: var(--s2); }
+.plan-window .plan-wname { flex: 0 0 8rem; font-size: var(--t-sm); color: var(--text-2); }
+.plan-window .plan-meter { flex: 1; }
+.plan-window .plan-pct { flex: 0 0 3.5rem; }
+@media (max-width: 760px) {
+  .card .row.plan-row { grid-template-columns: minmax(6rem, 1fr) minmax(4rem, 2fr) 3.5rem; }
+  .plan-row .plan-when, .plan-row .plan-tags { grid-column: 1 / -1; justify-content: flex-start; }
+  .plan-row .plan-none { grid-column: 2 / -1; }
+}

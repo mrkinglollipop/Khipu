@@ -561,6 +561,12 @@ const GATEWAY_TOKEN_SET_ARGV: &[&str] = &["gateway", "token", "set"];
 /// persisted ceiling goes through `config --set synth_daily_calls N`).
 const BUDGET_STATUS_ARGV: &[&str] = &["budget", "status"];
 const BUDGET_LIFT_SYNTH_TODAY_ARGV: &[&str] = &["budget", "lift", "synth", "--today"];
+/// Home -> Plans and Settings -> Capture -> Plans: each subscription CLI's own
+/// plan headroom (docs/plans/2026-10-14-plan-usage.md, phase 2). Status reads
+/// the cache while it is younger than its max age (120 s); refresh probes
+/// every account now. Fixed argv: the webview cannot reach `--max-age`.
+const USAGE_STATUS_ARGV: &[&str] = &["usage", "--json"];
+const USAGE_REFRESH_ARGV: &[&str] = &["usage", "--fresh", "--json"];
 /// `config --set KEY N`, a whole number >= 0 (0 = unlimited) (`INT_SETTINGS`).
 /// Only the summariser's ceiling is offered in the app.
 const DAILY_CALL_KEYS: &[&str] = &["synth_daily_calls"];
@@ -777,6 +783,16 @@ async fn khipu_budget_status() -> Result<String, String> {
 #[tauri::command]
 async fn khipu_budget_lift_synth_today() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(BUDGET_LIFT_SYNTH_TODAY_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_usage_status() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(USAGE_STATUS_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_usage_refresh() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(USAGE_REFRESH_ARGV)).await
 }
 
 #[tauri::command]
@@ -2379,6 +2395,8 @@ pub fn run() {
             khipu_config_unset,
             khipu_budget_status,
             khipu_budget_lift_synth_today,
+            khipu_usage_status,
+            khipu_usage_refresh,
             khipu_jobs_status,
             khipu_job_install,
             khipu_job_uninstall,
@@ -2883,7 +2901,7 @@ mod settings_command_tests {
 
     #[test]
     fn none_of_these_verbs_join_the_generic_allowlist() {
-        for s in ["features", "config", "jobs", "recall", "gateway", "embed", "budget"] {
+        for s in ["features", "config", "jobs", "recall", "gateway", "embed", "budget", "usage"] {
             assert!(!ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of the allowlist");
         }
         assert_eq!(ALLOWED_SUBCOMMANDS.len(), 14);
@@ -2899,6 +2917,17 @@ mod settings_command_tests {
         assert_eq!(fixed_argv(GATEWAY_TOKEN_SET_ARGV), v(&["gateway", "token", "set"]));
         assert_eq!(fixed_argv(BUDGET_STATUS_ARGV), v(&["budget", "status"]));
         assert_eq!(fixed_argv(BUDGET_LIFT_SYNTH_TODAY_ARGV), v(&["budget", "lift", "synth", "--today"]));
+    }
+
+    #[test]
+    fn plan_usage_commands_are_fixed_argv() {
+        assert_eq!(fixed_argv(USAGE_STATUS_ARGV), v(&["usage", "--json"]));
+        assert_eq!(fixed_argv(USAGE_REFRESH_ARGV), v(&["usage", "--fresh", "--json"]));
+        // Neither reaches --max-age, and `usage` stays out of the generic allowlist.
+        for argv in [USAGE_STATUS_ARGV, USAGE_REFRESH_ARGV] {
+            assert!(!argv.iter().any(|a| a.starts_with("--max-age")));
+        }
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"usage"));
     }
 
     #[test]

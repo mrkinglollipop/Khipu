@@ -44,6 +44,7 @@ import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupS
 import { buildAttention, harnessLabel, type Attention } from "./doctorAttention";
 import { HealthReportRows } from "./healthRows";
 import { SummariserBudgetCard, SynthProviderFields, synthModelError } from "./SynthProvider";
+import { PlansCard, PlansSettingsCard, planAttention, usePlanUsage } from "./PlansCard";
 import type { DoctorSynthProvider } from "./SynthProvider";
 import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVerify";
 import { WorkingBanner } from "./WorkingBanner";
@@ -1077,6 +1078,14 @@ export default function App() {
   // the health report's red rows (`healthRows.tsx`) both read this so the
   // wording never drifts between the two (2026-08-17 / 2026-09-05).
   const [attention, setAttention] = useState<Attention[]>([]);
+  // Plan usage (docs/plans/2026-10-14-plan-usage.md, phase 2). Doctor does
+  // not carry it, so Home reads `khipu usage --json` itself and adds one
+  // attention item when any window is at or above 90%.
+  const plans = usePlanUsage(tab === "home");
+  const homeAttention = useMemo(
+    () => [...attention, ...planAttention(plans.data)],
+    [attention, plans.data],
+  );
   const [doctorCheckCount, setDoctorCheckCount] = useState(0);
   // Home's four tiles read these straight off the doctor payload; nothing here
   // is derived from a field the report does not carry.
@@ -3548,6 +3557,7 @@ export default function App() {
                 void loadActivity(true);
                 void refreshDsn(true);
                 void loadRightNow(true);
+                void plans.load();
               }}
             >
               <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
@@ -3555,7 +3565,7 @@ export default function App() {
             </button>
           </PanelHeader>
           <div className="panel-body wide">
-            {attention.map((a) => (
+            {homeAttention.map((a) => (
               <Callout
                 key={a.key}
                 tone={a.tone}
@@ -3637,6 +3647,8 @@ export default function App() {
               message={captureNowMsg}
               onCaptureNow={() => void runCaptureNow()}
             />
+
+            <PlansCard state={plans} />
 
             <div className="tiles">
               <Tile
@@ -3871,7 +3883,8 @@ export default function App() {
               <div className="rows-head">Full health report</div>
               <HealthReportRows
                 parsed={doctorParsed ?? {}}
-                attention={attention}
+                attention={homeAttention}
+                plans={plans.data}
                 busy={actionBusy || probeBusy}
                 onFixAction={(fix, harness) => {
                   if (fix.kind === "reinstall-hook" && harness) {
@@ -5355,6 +5368,8 @@ export default function App() {
                     </div>
 
                     <SummariserBudgetCard active={tab === "settings" && settingsSection === "capture"} />
+
+                    <PlansSettingsCard active={tab === "settings" && settingsSection === "capture"} />
 
                     <div className="section-card">
                       <div className="section-head">Keys</div>

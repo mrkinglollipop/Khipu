@@ -10,7 +10,7 @@ it first. Builds after the promotion gate (`2026-10-14-promotion-gate.md`) and g
 | Phase | What | State |
 |---|---|---|
 | 1 | `khipu usage`: one probe per installed subscription CLI, cached, as CLI JSON and an MCP tool | built 2026-10-14 (branch `feat/plan-usage-p1`): `khipu/usage.py`, `khipu usage`, MCP `khipu_usage`, fixtures `tests/fixtures/usage/`; real run on this Mac answered all four CLIs in 0.6–1.6 s |
-| 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | open |
+| 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | built 2026-10-14 (branch `feat/plan-usage-p2`, desktop 0.4.14): fixed-argv `khipu_usage_status` (`usage --json`) and `khipu_usage_refresh` (`usage --fresh --json`); `PlansCard.tsx` (Home card with Refresh, Settings → Capture & models card with Probe now; `usage_accounts` shown read only, as `config --set` cannot set it); health report "Plans" row and a Home attention item at 90%, read from `khipu_usage_status` because doctor does not carry usage |
 
 Two PRs, phase 1 first.
 

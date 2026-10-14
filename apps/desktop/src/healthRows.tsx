@@ -17,6 +17,8 @@ import {
   usageByProviderLines,
 } from "./SynthProvider";
 import type { DoctorSynthProvider, SynthBudget } from "./SynthProvider";
+import { PLAN_ALERT_PCT, plansHealthDetail, tightestOverall } from "./PlansCard";
+import type { UsageReport } from "./PlansCard";
 
 export type HealthRowStatus = "ok" | "err" | "skipped";
 
@@ -59,6 +61,8 @@ const LABELS: Record<string, string> = {
   // D6/F2/F4: topic-embedding lag and the search-degrade rate.
   topics_embed_lag_ok: "Search index catching up on time",
   degraded_rate_ok: "Search rarely falls back to keyword-only",
+  // Not a doctor field: read from `khipu usage --json` (plansHealthRow).
+  plans: "Plans",
 };
 
 const ORDER = Object.keys(LABELS);
@@ -126,11 +130,27 @@ function detailFor(key: string, parsed: Record<string, unknown>): string | undef
   return undefined;
 }
 
+/** The "Plans" row. Doctor does not carry plan usage, so it comes from
+ *  `khipu_usage_status`: the tightest window across accounts, red at 90%.
+ *  Null until the usage report has been read. */
+export function plansHealthRow(plans: UsageReport | null | undefined): HealthRow | null {
+  if (!plans || !Array.isArray(plans.accounts)) return null;
+  if (plans.accounts.length === 0) return { key: "plans", status: "skipped", label: LABELS.plans };
+  const tight = tightestOverall(plans);
+  const pct = tight?.window.used_pct ?? 0;
+  return {
+    key: "plans",
+    status: tight && pct >= PLAN_ALERT_PCT ? "err" : "ok",
+    label: LABELS.plans,
+    detail: plansHealthDetail(plans) ?? "no plan limits read",
+  };
+}
+
 /** Pure: every top-level boolean `*_ok` field in `parsed` becomes one row —
  *  green, red, or (if `not_configured` names its check) grey "not set up".
  *  Sorted red first, then not-set-up, then green; stable within each group
  *  in the order above, unknown keys last in their group. */
-export function healthRows(parsed: Record<string, unknown>): HealthRow[] {
+export function healthRows(parsed: Record<string, unknown>, plans?: UsageReport | null): HealthRow[] {
   const notConfiguredRaw = (parsed as { not_configured?: unknown })
     .not_configured;
   const notConfigured = Array.isArray(notConfiguredRaw)
@@ -150,6 +170,8 @@ export function healthRows(parsed: Record<string, unknown>): HealthRow[] {
     }
     return { key, status: parsed[key] ? "ok" : "err", label, ...extra };
   });
+  const plansRow = plansHealthRow(plans);
+  if (plansRow) rows.push(plansRow);
 
   const statusRank: Record<HealthRowStatus, number> = {
     err: 0,
@@ -206,11 +228,14 @@ function findAttention(okKey: string, attention: Attention[]): Attention[] {
 export function HealthReportRows({
   parsed,
   attention,
+  plans,
   onFixAction,
   busy,
 }: {
   parsed: Record<string, unknown>;
   attention: Attention[];
+  /** `khipu usage --json`, for the Plans row; no row until it is read. */
+  plans?: UsageReport | null;
   /** Fired when a row's fix button is pressed; the caller owns what each
    *  `fix.kind` actually does (reinstall hook / run probe / open revisions —
    *  see the Home attention callouts in App.tsx). Optional so this component
@@ -218,7 +243,7 @@ export function HealthReportRows({
   onFixAction?: (fix: NonNullable<Attention["fix"]>, harness?: string) => void;
   busy?: boolean;
 }) {
-  const rows = healthRows(parsed);
+  const rows = healthRows(parsed, plans);
   return (
     <div className="rows">
       {rows.map((row) => {
@@ -259,7 +284,10 @@ export function HealthReportRows({
               className="err"
             />
             <span className="row-main">{row.label}</span>
-            <span className="row-meta">{row.detail ? `${sentence} ${row.detail}` : sentence}</span>
+            <span className="row-meta">
+              {/* The Plans attention cause already names every window. */}
+              {row.detail && !(row.key === "plans" && matches.length) ? `${sentence} ${row.detail}` : sentence}
+            </span>
             {single?.fix ? (
               <button
                 type="button"
