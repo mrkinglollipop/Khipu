@@ -147,7 +147,12 @@ def read_only(path: Path, *, tail: int | None = None, limit: int = JSON_MAX) -> 
     ``limit``) and its modification time. Opened ``O_RDONLY`` (plus
     ``O_NONBLOCK``, so a FIFO never hangs a read) and never anything else:
     no write handle, no lock, no temp file. A path that resolves inside a
-    credential location raises PermissionError before anything is opened."""
+    credential location raises PermissionError before anything is opened.
+
+    A tail always starts on a whole line: the byte before it is read too,
+    and when that byte is not a newline the cut-off first line is left out.
+    A tail that starts at the top of the file, or right after a newline,
+    keeps its first line."""
     if private_path(path):
         raise PermissionError("inside a private folder")
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
@@ -155,9 +160,12 @@ def read_only(path: Path, *, tail: int | None = None, limit: int = JSON_MAX) -> 
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise OSError("not a regular file")
+        before = False  # whether the byte before the tail is read too
         if tail is not None:
-            os.lseek(fd, max(0, st.st_size - tail), os.SEEK_SET)
-            want = tail
+            begin = max(0, st.st_size - tail)
+            before = begin > 0
+            os.lseek(fd, begin - 1 if before else 0, os.SEEK_SET)
+            want = tail + 1 if before else tail
         else:
             if st.st_size > limit:
                 raise OSError(f"larger than {limit // (1024 * 1024)} MB")
@@ -170,7 +178,12 @@ def read_only(path: Path, *, tail: int | None = None, limit: int = JSON_MAX) -> 
                 break
             chunks.append(chunk)
             got += len(chunk)
-        return b"".join(chunks), st.st_mtime
+        data = b"".join(chunks)
+        if before:
+            # The byte before the tail: a newline means the tail starts a
+            # line; anything else means its first line is cut off.
+            data = data[1:] if data[:1] == b"\n" else data.partition(b"\n")[2]
+        return data, st.st_mtime
     finally:
         os.close(fd)
 
@@ -322,10 +335,9 @@ def runner_basis(at: datetime, until: datetime) -> str:
 
 
 def _parse_events(data: bytes, now: datetime) -> dict:
-    text = data.decode("utf-8", "replace")
-    lines = text.split("\n")
-    if len(data) >= TAIL_BYTES:
-        lines = lines[1:]  # the first line may be cut off by the tail
+    # ``read_only`` hands over whole lines only (a cut-off first line is
+    # already left out), so every line here is kept.
+    lines = data.decode("utf-8", "replace").split("\n")
     out: dict[str, list] = {"LIMITED": [], "ADDED": [], "LAUNCH": []}
     holds = 0
     first: datetime | None = None
@@ -398,6 +410,7 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
             else:
                 cache[key] = {"data": None, "good_at": None, "mtime": None, "since": since}
             files[key] = {"error": _short_error(exc), "good_at": cache[key].get("good_at"), "since": since}
+    cache["sightings"] = _sightings(cache, prev.get("sightings"))
     from khipu.routing import _after
 
     beat = cache["heartbeat"].get("data")
@@ -419,13 +432,61 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
     return status, cache
 
 
+def _same_until(a: datetime, b: datetime) -> bool:
+    return abs((a - b).total_seconds()) <= 1
+
+
+def _sightings(cache: dict, prev) -> dict:
+    """For each ``global.json`` limit, the time it is dated by, kept in the
+    view between reads (``source_cache``) so it outlives the tail:
+
+    - ``line`` true: the time of the newest LIMITED line Khipu has seen for
+      it (same lane, same end), kept after that line leaves the tail;
+    - ``line`` false: a limit whose line Khipu never saw is dated at the
+      oldest line the tail held when Khipu first found it (the latest that
+      line can have been written), and keeps that first time.
+
+    An owner's clear is weighed against this time like any other evidence:
+    a clear written after it outranks the limit, and a limit seen after the
+    clear stands even once its line has left the tail."""
+    prev = prev if isinstance(prev, dict) else {}
+    events = (cache.get("events") or {}).get("data") or {}
+    glob = cache.get("global") or {}
+    lines = []
+    for line in events.get("limited_lines") or []:
+        if isinstance(line, dict) and _parse(line.get("at")) and _parse(line.get("until")):
+            lines.append((line.get("lane"), _parse(line["at"]), _parse(line["until"])))
+    bound = _parse(events.get("first")) or _epoch(glob.get("mtime"))
+    out: dict[str, dict] = {}
+    for lane, item in ((glob.get("data") or {}).get("limited") or {}).items():
+        until = _epoch(item.get("until")) if isinstance(item, dict) else None
+        if until is None:
+            continue
+        old = prev.get(lane) if isinstance(prev.get(lane), dict) else {}
+        old_at, old_until = _parse(old.get("at")), _epoch(old.get("until"))
+        if old_at is None or old_until is None or not _same_until(old_until, until):
+            old_at = None  # a different limit on the lane, or none kept
+        old_line = old_at is not None and old.get("line") is True
+        seen = [at for name, at, end in lines if name == lane and _same_until(end, until)]
+        if seen:
+            at, line = max(seen + ([old_at] if old_line else [])), True
+        elif old_at is not None:
+            at, line = old_at, old_line
+        elif bound is not None:
+            at, line = bound, False
+        else:
+            continue
+        out[lane] = {"until": item["until"], "at": _iso(at), "line": line}
+    return out
+
+
 def runner_evidence(status: dict, cache: dict) -> list[dict]:
     """The evidence one runner gives, in the fold's shape: one limited entry
     per LIMITED line in the tail, and one per ``global.json`` limit still in
-    force whose LIMITED line is no longer in the tail (dated at the oldest
-    line the tail holds, the latest it can have been written, and marked
-    ``undated`` so an owner's clear always outranks it). Every entry is
-    marked ``silent`` when the runner's heartbeat has stopped."""
+    force whose LIMITED line is no longer in the tail, dated by its sighting
+    (``_sightings``): the time of its LIMITED line when Khipu saw it, or the
+    latest that line can have been written when Khipu never did. Every entry
+    is marked ``silent`` when the runner's heartbeat has stopped."""
     name = status["name"]
     by = {"kind": "runner", "name": name}
     events = (cache.get("events") or {}).get("data") or {}
@@ -441,9 +502,14 @@ def runner_evidence(status: dict, cache: dict) -> list[dict]:
                     "written_by": by, "via": "runner", "at": at, "evidence": line.get("text"), "reason": None,
                     "message_time": basis == "cli", "silent": status["silent"]})
     glob = cache.get("global") or {}
-    at = _parse(events.get("first")) or _epoch(glob.get("mtime"))
+    sightings = cache.get("sightings") if isinstance(cache.get("sightings"), dict) else {}
+    bound = _parse(events.get("first")) or _epoch(glob.get("mtime"))
     for lane, item in ((glob.get("data") or {}).get("limited") or {}).items():
         until = _epoch(item.get("until"))
+        sight = sightings.get(lane) if isinstance(sightings.get(lane), dict) else {}
+        sight_until = _epoch(sight.get("until"))
+        at = _parse(sight.get("at")) if sight_until and until and _same_until(sight_until, until) else None
+        at = at or bound
         if until is None or at is None or until <= at:
             continue  # an old limit the runner keeps on file; its time has passed
         if any(line["lane"] == lane and abs((_parse(line["until"]) - until).total_seconds()) <= 1 for line in lines):
@@ -454,7 +520,7 @@ def runner_evidence(status: dict, cache: dict) -> list[dict]:
                     "scope": "all", "window": None, "used_pct": None, "source": "runner", "written_by": by,
                     "via": "runner", "at": at, "reason": None, "message_time": exact,
                     "evidence": _redacted(f"global.json: {lane} limited ({item.get('reason') or 'no reason'})"),
-                    "silent": status["silent"], "undated": True})
+                    "silent": status["silent"]})
     return out
 
 

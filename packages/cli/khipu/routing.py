@@ -859,6 +859,36 @@ _AUTHOR_FIELDS = ("kind", "harness", "project", "session", "name", "file")
 _HOLD_KINDS = ("account", "machine", "all")
 
 
+def _next_after(numbers: Iterable[int], count: int, start: int) -> int:
+    """The first of ``count`` numbers that follow ``numbers`` (``start`` when
+    there are none), every one a number ``_checked`` reads back. A number a
+    line holds that leaves no room after it (a hand-edited or merged line at
+    the most a line can hold) is passed over, so the next line is never
+    written with a number that makes it unreadable."""
+    room = [n for n in numbers if n + count <= _WHOLE_MOST]
+    return max(room) + 1 if room else start
+
+
+def _crowded(numbers: Iterable[int]) -> bool:
+    """Whether a number a line holds leaves no room for one more after it."""
+    return any(n + 1 > _WHOLE_MOST for n in numbers)
+
+
+def _next_rules(events: list[dict], count: int) -> int:
+    """The number of the next rule (of ``count`` new rules), one ``_checked``
+    reads back and no rule already holds (a rule's number is its name)."""
+    taken = {e["n"] for e in events if e.get("type") == "rule_add" and isinstance(e.get("n"), int)}
+    first = _next_after(taken, count, 1)
+    if not any(first + i in taken for i in range(count)):
+        return first
+    # Only a hand-edited number near the most a line can hold gets here:
+    # take the lowest free run instead.
+    first = 1
+    while any(first + i in taken for i in range(count)):
+        first += 1
+    return first
+
+
 def _log_time(text: str) -> str | None:
     """A time from a line of the log in the form Khipu writes it (UTC, whole
     seconds), held within the years Python can hold; None when the text is
@@ -1011,7 +1041,7 @@ def _stamp_locked(clock: datetime, count: int = 1) -> list[dict]:
     orders the lines as in phase 1a."""
     events, _bad = read_events()
     seqs = [e["seq"] for e in events if isinstance(e.get("seq"), int)]
-    first = max(seqs) + 1 if seqs else len(events)
+    first = _next_after(seqs, count, len(events))
     times = [t for t in (_parse(e.get("written_at")) for e in events) if t is not None]
     last = _parse(events[-1].get("written_at")) if events else None
     clock_at = None
@@ -1127,10 +1157,10 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
         return not stale(e) and not (e["state"] == LIMITED and e["until"] is not None and e["until"] <= now)
 
     clear = owner["clears"].get(key)
-    # A runner's limit whose LIMITED line has left the tail can't be dated
-    # (``undated``): any clear of the account outranks it.
-    live = [e for e in items if e["id"] not in owner["dismissed"]
-            and (clear is None or (_k(e) > _k(clear) and not e.get("undated")))]
+    # A runner's limit whose LIMITED line has left the tail keeps the time
+    # Khipu saw that line (``routing_sources._sightings``), so a clear is
+    # weighed against it like any other evidence.
+    live = [e for e in items if e["id"] not in owner["dismissed"] and (clear is None or _k(e) > _k(clear))]
     # Unknown when the only source that still counts is a runner that has
     # stopped reporting: other evidence counts only while it is fresh (open
     # or down) or its limit has not passed (``counts``).
@@ -1641,13 +1671,15 @@ def _import_seed_locked(events: list[dict], cfg: dict, now: datetime) -> tuple[s
         return (f"{unusable} of the {len(items)} entries in the rules seed file have no text; nothing was imported "
                 f"({_SEED_SHAPE})"), False
     present = {e.get("text") for e in events if e.get("type") == "rule_add" and e.get("seeded")}
-    n = max((e["n"] for e in events if e.get("type") == "rule_add" and isinstance(e.get("n"), int)), default=0)
+    fresh = []
+    for rule in rules:
+        if rule["text"] not in present:
+            present.add(rule["text"])
+            fresh.append(rule)
+    n = _next_rules(events, len(fresh)) - 1 if fresh else 0
     by = {"kind": "seed", "file": Path(path).name}
     batch = []
-    for rule in rules:
-        if rule["text"] in present:
-            continue
-        present.add(rule["text"])
+    for rule in fresh:
         n += 1
         batch.append({"type": "rule_add", "id": _new_id("o"), "n": n, "text": rule["text"],
                       "source": rule["source"], "date": rule["date"], "seeded": True, "written_by": by,
@@ -2041,8 +2073,7 @@ def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | 
         raise RouteError("a rule needs its words")
     with _lock():
         events, _bad = read_events()
-        n = max((e["n"] for e in events if e.get("type") == "rule_add" and isinstance(e.get("n"), int)),
-                default=0) + 1
+        n = _next_rules(events, 1)
         out = _owner_write({"type": "rule_add", "n": n, "text": text.strip(),
                             "source": _one_line(source) or "added by you", "date": now.date().isoformat(),
                             "seeded": False}, via)
@@ -2416,6 +2447,10 @@ def doctor_block(now: datetime | None = None) -> dict:
     if newest is not None and (newest - now).total_seconds() > CLOCK_TOLERANCE:
         warnings.append(f"The routing record holds times ahead of this Mac's clock (as late as "
                         f"{_iso(newest)}); Khipu goes by the clock. Check the Mac's date and time.")
+    numbers = [e[f] for e in events for f in ("seq", "n") if isinstance(e.get(f), int)]
+    if _crowded(numbers):
+        warnings.append("The routing record holds a line numbered at the most a line can hold (edited by hand or "
+                        "merged); Khipu numbers new lines below it, so that line may sort out of order.")
     _fixed, behind, ahead = _write_order_times([_parse(e.get("written_at")) for e in events])
     # Lines that took the record's time because their Mac's clock read before
     # the whole record (``_stamp_locked``) are named by that reading.

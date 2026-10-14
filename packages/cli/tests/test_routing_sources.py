@@ -307,26 +307,30 @@ def test_every_runner_file_is_opened_read_only(home, monkeypatch, capsys):
             return False
         return any(text.startswith(os.path.realpath(f)) for f in folders)
 
-    runner_fds: dict[int, str] = {}  # a runner file's descriptor while it is open
+    # Every runner file by its device and inode: a lock is caught on any
+    # descriptor that reaches one, however it was opened (os.open, open(),
+    # io.open, Path.open or anything else).
+    runner_files = {(st.st_dev, st.st_ino): str(f) for f in (p for d in folders for p in Path(d).rglob("*"))
+                    if f.is_file() for st in [f.stat()]}
     locks: list[tuple[str, str]] = []
-    real_close = os.close
     real_flock, real_lockf, real_fcntl = fcntl.flock, fcntl.lockf, fcntl.fcntl
     set_lock = {getattr(fcntl, n) for n in ("F_SETLK", "F_SETLKW", "F_OFD_SETLK", "F_OFD_SETLKW") if hasattr(fcntl, n)}
+    # Open flags that take a lock themselves (macOS).
+    lock_bits = getattr(os, "O_SHLOCK", 0) | getattr(os, "O_EXLOCK", 0)
 
     def spy_os_open(path, flags, *a, **kw):
         fd = real_os_open(path, flags, *a, **kw)
         if inside(path):
             calls.append((os.fspath(path), flags))
-            runner_fds[fd] = os.fspath(path)
         return fd
 
-    def spy_close(fd):
-        runner_fds.pop(fd, None)
-        return real_close(fd)
-
     def runner_fd(target) -> str | None:
-        fd = target if isinstance(target, int) else getattr(target, "fileno", lambda: -1)()
-        return runner_fds.get(fd)
+        try:
+            fd = target if isinstance(target, int) else target.fileno()
+            st = os.fstat(fd)
+        except (AttributeError, OSError, ValueError):
+            return None
+        return runner_files.get((st.st_dev, st.st_ino))
 
     def spy_flock(target, op):
         if runner_fd(target):
@@ -349,7 +353,6 @@ def test_every_runner_file_is_opened_read_only(home, monkeypatch, capsys):
         return real_open(file, mode, *a, **kw)
 
     monkeypatch.setattr(os, "open", spy_os_open)
-    monkeypatch.setattr(os, "close", spy_close)
     monkeypatch.setattr(builtins, "open", spy_open)
     monkeypatch.setattr(io, "open", spy_open)
     monkeypatch.setattr(fcntl, "flock", spy_flock)
@@ -368,6 +371,7 @@ def test_every_runner_file_is_opened_read_only(home, monkeypatch, capsys):
         if isinstance(how, int):
             assert how & write_bits == 0, path
             assert how & os.O_ACCMODE == os.O_RDONLY, path
+            assert how & lock_bits == 0, path  # no lock taken by the open itself
         else:
             assert not set(how) & set("wax+"), path
     assert {f: _snapshot(Path(f)) for f in folders} == before  # nothing written or left behind
@@ -675,3 +679,101 @@ def test_a_private_pipeline_on_the_default_lanes_is_checked_against_them(home):
                        "fix_lanes=second max_checks=3 privacy")
     broken = [c["text"] for c in routing.doctor_block()["rule_checks"] if c["status"] == "broken"]
     assert broken == ["A standing rule may be broken: a Grok lane is set to work on pipe-50, which is marked private."]
+
+
+# ---- fix round 2 ------------------------------------------------------------------------
+
+
+def _limit(folder: Path, lanes: dict[str, datetime]) -> None:
+    """The runner's global.json, holding these lanes' limits."""
+    (folder / "state" / "global.json").write_text(json.dumps(
+        {"limited": {lane: {"until": until.timestamp(), "reason": "fix-40: account limit reached"}
+                     for lane, until in lanes.items()}}))
+
+
+def _scroll(folder: Path, at: datetime, size: int = 600 * 1024) -> None:
+    """Ordinary lines enough to push every earlier line out of the tail."""
+    line = f"{routing._iso(at)} pipe-41 NOTE " + "x" * 80 + "\n"
+    with open(folder / "events.log", "a", encoding="utf-8") as fh:
+        fh.write(line * (size // len(line) + 1))
+
+
+@pytest.mark.parametrize("clear_ago,line_ago", [(timedelta(hours=3), timedelta(hours=2)),
+                                                (timedelta(days=2), timedelta(days=1))])
+def test_a_limit_written_after_a_clear_stays_after_its_line_leaves_the_tail(home, clear_ago, line_ago):
+    _register(home)
+    _limit(home["a"], {})  # the runner starts with no limits
+    log = home["a"] / "events.log"
+    log.write_text("".join(line for line in log.read_text().splitlines(True) if " LIMITED " not in line))
+    home["clock"].now = T0 - clear_ago
+    routing.clear("Claude second", via="app")
+    home["clock"].now = T0
+    until = T0 + timedelta(days=5)
+    _append(home["a"], f"{routing._iso(T0 - line_ago)} pipe-40 LIMITED lane=second until={routing._iso(until)} "
+                       "job=fix-40 (account limit reached); the fix step is retried later")
+    _limit(home["a"], {"second": until})
+    second = _account(routing.read_view(), SECOND)
+    assert (second["state"], second["until"]) == ("limited", "2026-10-19T15:00:00Z")
+    _scroll(home["a"], T0 - timedelta(minutes=30))
+    view = routing.read_view()
+    kept = view["source_cache"]["runners"]["project A"]["events"]["data"]
+    assert kept["limited_lines"] == []  # the line has left the tail; global.json still holds the limit
+    second = _account(view, SECOND)
+    assert (second["state"], second["until"]) == ("limited", "2026-10-19T15:00:00Z")
+    assert second["witness"]["cleared"] is False and second["witness"]["at"] == routing._iso(T0 - line_ago)
+
+
+def test_a_limit_seen_before_a_clear_stays_cleared_after_the_tail_moves_past_the_clear(home):
+    _register(home)
+    # The fixture's second-account limit is known from global.json alone:
+    # dated at the oldest line the tail held when Khipu first read it.
+    assert _account(routing.read_view(), SECOND)["state"] == "limited"
+    home["clock"].advance(minutes=1)
+    routing.clear("Claude second", via="app")
+    home["clock"].advance(minutes=1)
+    _beat(home["a"], home["clock"].now)
+    filler = f"{routing._iso(home['clock'].now - timedelta(seconds=20))} pipe-42 HOLD lane=main " + "y" * 80 + "\n"
+    with open(home["a"] / "events.log", "a", encoding="utf-8") as fh:
+        fh.write(filler * (600 * 1024 // len(filler) + 1))
+    second = _account(routing.read_view(), SECOND)
+    assert (second["state"], second["witness"]["cleared"]) == ("open", True)
+
+
+def test_a_tail_keeps_a_whole_first_line(tmp_path):
+    first = "2026-10-14T12:00:00Z pipe-12 LIMITED lane=second until=2026-10-14T17:52:00Z job=fix-12 (limit)\n"
+    pad = "2026-10-14T12:00:01Z pipe-12 NOTE " + "z" * 60 + "\n"
+    body = first + pad * ((routing_sources.TAIL_BYTES - len(first)) // len(pad))
+    body += "w" * (routing_sources.TAIL_BYTES - len(body) - 1) + "\n"
+    assert len(body.encode()) == routing_sources.TAIL_BYTES
+    path = tmp_path / "events.log"
+
+    def lanes(text: str) -> list[str]:
+        path.write_text(text)
+        data, _mtime = routing_sources.read_only(path, tail=routing_sources.TAIL_BYTES)
+        return [line["lane"] for line in routing_sources._parse_events(data, T0)["limited_lines"]]
+
+    assert lanes(body) == ["second"]  # the whole file, read from its first byte
+    assert lanes("earlier line\n" + body) == ["second"]  # the tail starts right after a newline
+    # The tail starts inside a line: that cut-off line is left out.
+    assert lanes("cut" + body) == []
+    assert lanes(body[1:]) == []  # smaller than the tail: the whole file, its first line as written
+
+
+def test_a_line_numbered_at_the_most_a_line_can_hold_never_loses_the_next_write(home):
+    routing.report(account="Claude", state="open", author={"kind": "conversation", "harness": "codex"})
+    most = 2 ** 53
+    with open(routing.events_file(), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "evidence", "id": "edited", "source": "report", "state": "open",
+                             "account": "muse|", "written_at": routing._iso(T0), "seq": most}) + "\n")
+        fh.write(json.dumps({"type": "rule_add", "id": "o-edited", "n": most, "text": "An edited rule.",
+                             "written_at": routing._iso(T0), "seq": most}) + "\n")
+    home["clock"].advance(minutes=1)
+    routing.report(account="Codex", state="limited", until="1h", author={"kind": "conversation", "harness": "codex"})
+    added = routing.add_rule("A rule added after the edited one.", via="app")
+    events, bad = routing.read_events()
+    assert bad == 0 and len(events) == 5
+    assert all(e["seq"] <= most for e in events)
+    view = routing.read_view()
+    assert _account(view, "codex|")["state"] == "limited"
+    assert added["n"] < most and any(r["n"] == added["n"] for r in view["rules"])
+    assert any("numbered at the most a line can hold" in w for w in routing.doctor_block()["warnings"])

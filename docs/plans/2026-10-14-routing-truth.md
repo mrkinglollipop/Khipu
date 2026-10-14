@@ -254,8 +254,12 @@ MCP tool refuses them. Doctor warns when any of them was written by anything oth
    writer would race it. Until runners write the basis themselves, a runner's `until` counts as **cli** only
    when its seconds are zero and it is not exactly 30 minutes after the LIMITED line (the shape `limit_until`
    gives a parsed message plus two minutes); everything else is **estimated**. A file that fails to parse is
-   reported with its last good read, never guessed around. A registered path under a credential location
-   (`API Keys/`, `My Portfolio/`, any `auth.json`, keychain exports) is refused.
+   reported with its last good read, never guessed around. A `global.json` limit keeps the time of the
+   newest LIMITED line Khipu saw for it (same lane, same end) after that line leaves the tail; a limit whose
+   line Khipu never saw is dated at the oldest line the tail held when Khipu first found it. An owner clear
+   is weighed against that time, so a limit the runner wrote after the clear stands once its line has aged
+   out. A registered path under a credential location (`API Keys/`, `My Portfolio/`, any `auth.json`,
+   keychain exports) is refused.
 3. **Conversations reporting through a tool**: MCP `khipu_route_report` and `khipu route report`, for what a
    conversation learns first (a job ended on "You've hit your session limit"; Matt said Codex is nearly out).
    A report can mark an account limited, open or down, and can add holds. Its basis is **estimated** unless
