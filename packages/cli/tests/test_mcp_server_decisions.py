@@ -49,6 +49,7 @@ class ToolAnnotationsTest(unittest.TestCase):
     _EXPECTED_READ_ONLY = {
         "khipu_search", "khipu_get", "khipu_graph", "khipu_status",
         "khipu_owed", "khipu_decisions", "khipu_brief", "khipu_reflect",
+        "khipu_usage",
     }
     _EXPECTED_WRITE = {
         "khipu_capture", "khipu_owed_update", "khipu_decisions_update", "khipu_forget",
@@ -73,10 +74,14 @@ class ToolAnnotationsTest(unittest.TestCase):
         self.assertTrue(tool["annotations"].get("destructiveHint"))
 
     def test_read_only_tools_declare_a_closed_world(self):
-        for name in self._EXPECTED_READ_ONLY:
+        # khipu_usage reads memory nothing: it asks each subscription CLI,
+        # which asks its vendor, so it honestly declares an open world.
+        for name in self._EXPECTED_READ_ONLY - {"khipu_usage"}:
             tool = next(t for t in srv.TOOLS if t["name"] == name)
             with self.subTest(tool=name):
                 self.assertFalse(tool["annotations"].get("openWorldHint", True))
+        usage_tool = next(t for t in srv.TOOLS if t["name"] == "khipu_usage")
+        self.assertTrue(usage_tool["annotations"]["openWorldHint"])
 
 
 class ToolDecisionsTest(unittest.TestCase):

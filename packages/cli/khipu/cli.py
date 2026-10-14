@@ -1926,6 +1926,23 @@ def _snooze_until_sql(raw: str) -> tuple[str, object] | None:
     return None if expr == "NULL" else (expr, param)
 
 
+def cmd_usage(args: argparse.Namespace) -> int:
+    """`khipu usage`: each subscription CLI's own plan headroom (scope
+    docs/plans/2026-10-14-plan-usage.md). Reports only; routing stays with
+    the orchestrator."""
+    from khipu import usage
+
+    max_age = usage.DEFAULT_MAX_AGE_S if args.max_age is None else max(0.0, float(args.max_age))
+    rep = usage.report(fresh=bool(args.fresh), max_age=max_age)
+    if args.json:
+        print(json.dumps(rep, indent=2))
+    elif not rep["accounts"]:
+        print("No subscription CLI found (claude, codex, grok, muse); set usage_accounts in config.json.")
+    else:
+        print(usage.table(rep))
+    return 0
+
+
 def cmd_owed(args: argparse.Namespace) -> int:
     """W3.4: `khipu owed` — list, close, reopen, or snooze commitments."""
     from khipu.db import connect
@@ -4391,6 +4408,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --snooze: a date (2026-09-30) or a window (7d, 2w, 3m, 2 weeks)",
     )
     owed.set_defaults(func=cmd_owed)
+
+    us = sub.add_parser(
+        "usage",
+        help="Plan headroom of every subscription CLI (Claude, Codex, Grok, Muse), read from the CLIs",
+    )
+    us.add_argument("--json", action="store_true", help="Print the JSON report instead of a table")
+    us.add_argument("--fresh", action="store_true", help="Probe now; ignore the cache")
+    us.add_argument(
+        "--max-age", type=float, default=None, metavar="S",
+        help="Reuse a cached probe younger than S seconds (default 120); older figures are marked stale",
+    )
+    us.set_defaults(func=cmd_usage)
 
     dec = sub.add_parser(
         "decisions", help="Decisions registry: list / supersede / restore / retract / links (O2, Phase 2A)"

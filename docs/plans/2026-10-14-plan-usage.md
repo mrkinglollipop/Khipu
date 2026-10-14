@@ -9,7 +9,7 @@ it first. Builds after the promotion gate (`2026-10-14-promotion-gate.md`) and g
 
 | Phase | What | State |
 |---|---|---|
-| 1 | `khipu usage`: one probe per installed subscription CLI, cached, as CLI JSON and an MCP tool | open |
+| 1 | `khipu usage`: one probe per installed subscription CLI, cached, as CLI JSON and an MCP tool | built 2026-10-14 (branch `feat/plan-usage-p1`): `khipu/usage.py`, `khipu usage`, MCP `khipu_usage`, fixtures `tests/fixtures/usage/`; real run on this Mac answered all four CLIs in 0.6–1.6 s |
 | 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | open |
 
 Two PRs, phase 1 first.
@@ -36,10 +36,10 @@ Not allowed, by standing rule: calling the vendors' usage endpoints directly (`/
 account, plan, windows: [{name, used_pct, resets_at}], credits, probed_at, ms, ok, error}`. Accounts come
 from config `usage_accounts` (default: every installed CLI with its default home; Matt's Mac adds the
 second Claude account and the two Grok homes), each with a label. Probes run in parallel with a 5 s
-timeout each; a failed probe reports `ok: false` with the CLI's own words and never hides the others.
+timeout each; a failed probe reports `ok: false` with a fixed error code and never hides the others.
 Results are cached in `state/usage.json` with the probe time; the default max age is 120 s so an
 orchestrator polling every prompt costs nothing, `--fresh` bypasses it. Every probe is a child process
-with the same environment hygiene as the summariser CLIs (`synth_cli.environment`), stdin closed after
+with an allowlisted environment (`usage.probe_environment`), stdin closed after
 the request, and a hard kill at the timeout.
 
 **MCP tool `khipu_usage`** returns the same JSON plus a one-line `summary_text` per account ("Claude main:
@@ -62,6 +62,35 @@ timeout), the cache max-age, no environment variable or file read that names a c
 the hermetic suite and one real `khipu usage --fresh` on this Mac whose numbers match the CLIs' own
 `/usage`, `/status` and `/usage` screens read the same minute. Stop-condition: if any adapter needs a
 token or key to be passed, stop and ask.
+
+**As built (2026-10-14).** Codex and Grok exit on end of input before they answer, so their stdin stays
+open until the answer arrives and the kill closes it; Claude and Muse get stdin closed right after the
+requests. The Claude probe adds `--strict-mcp-config` (no MCP servers start; Khipu's own is one of them)
+and the Grok probe adds `--no-leader` (never attach to a shared agent). Every probe gets an allowlisted
+environment (fix round below) and sets only its own home; the whole process group is killed at the answer or the timeout.
+Only response frames are read: Grok's `_x.ai/mcp/servers_updated` notification carries the user's MCP
+server configuration, environment values included, and is dropped unread. On the HTTPS gateway
+`khipu_usage` answers `available: false` (that host runs no subscription CLI). A failed probe keeps the
+account's last good figures, marked `ok: false` and `stale: true`; `stale` is judged on the figures'
+own time (`observed_at` when the CLI gives one), so Muse's last-turn figures read stale once older than
+the max age. The second Claude home (`~/.claude-t3-second`) answers `rate_limits: null` as predicted.
+
+**Fix round (2026-10-14, after a Codex cross-family review).** Errors are fixed short codes
+(`timeout`, `not_signed_in`, `bad_reply`, `no_answer`, `exit_<n>`, `not_installed`, `cli_error`,
+`no_plan_limits`, `pending`); a CLI's own text is only matched to pick a code and never reaches a row, the
+cache, the CLI output or the MCP result. The probe environment is an allowlist (HOME, USER, LOGNAME, PATH,
+SHELL, TMPDIR, LANG, TERM, LC_*, plus the account's own home variable); no other value is read.
+Malformed nested replies are `bad_reply`; legitimate absence stays `ok: true` with no windows. The Codex
+fallback reads the five newest rollout files by mtime, the last 256 KiB of each, inside the probe's
+timeout. `probe_all` returns by an overall deadline (timeout + 2 s) on daemon threads and kills every
+process group still alive. The MCP tool is cache-first: it answers from the cache at once and starts at
+most one background refresh (flock `state/usage.refresh.lock`, shared across processes); an account never
+probed reads `pending`. The cache (version 2) is keyed by (harness, home); a failed probe keeps the last
+good figures with their own `probed_at`, `stale: true`, and records `last_attempt_at` / `last_error`.
+Grok Build 1.0.52 has no flag or variable that starts it with no MCP servers; the probe sets
+`GROK_CURSOR_MCPS_ENABLED=0` and `GROK_CLAUDE_MCPS_ENABLED=0`, which drop the imported Cursor and Claude
+servers (20 of 28 on this Mac, firecrawl among them); the eight in `~/.grok/config.toml` are still
+announced, and no MCP child was seen starting before the answer.
 
 ## Phase 2: visibility
 

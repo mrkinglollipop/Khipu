@@ -15,6 +15,8 @@ Tools:
   - ``khipu_status``  — PG counts + mirror lag (optional drift sample)
   - ``khipu_capture`` — hub writer on the HTTPS gateway / no-hook installs;
     local stdio + capture hook declines with an error pointing at the hook.
+  - ``khipu_usage``   — plan headroom per subscription CLI (local only; the
+    gateway answers ``available: false``)
 
 Zero-dependency by design: the official MCP SDK requires pydantic/anyio which
 are not vendored in ``.python_libs``. The stdio transport is newline-delimited
@@ -659,6 +661,32 @@ TOOLS: list[dict] = [
                 "project": {"type": "string", "description": "Prefer sources from this project (a preference, not a filter)"},
             },
             "required": ["question"],
+        },
+    },
+    {
+        "name": "khipu_usage",
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+        "description": (
+            "How much of each subscription plan is left, per configured "
+            "account (Claude, Codex, Grok, Muse): plan, windows (name, "
+            "used_pct, resets_at), credits, probed_at, ok/error, stale. Read "
+            "from each CLI with the login it already holds; no model call, no "
+            "tokens spent. Answers at once from the cache and refreshes in "
+            "the background (refreshing: true) when a row is older than "
+            "max_age seconds (default 120) or fresh: true; ask again a few "
+            "seconds later for the new figures. An account never probed reads "
+            "error: pending. Errors are short codes (timeout, not_signed_in, "
+            "bad_reply, exit_<n>, ...). A window a CLI does not report is "
+            "absent, not zero. Muse figures are as of its last turn "
+            "(observed_at). summary_text has one pasteable line per account. "
+            "Khipu reports; routing stays with you."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "fresh": {"type": "boolean", "description": "Start a refresh now even if the cache is young"},
+                "max_age": {"type": "number", "description": "Cache max age in seconds (default 120)"},
+            },
         },
     },
 ]
@@ -1434,6 +1462,27 @@ def _tool_reflect(args: dict) -> dict:
     return reflect.reflect(question, project=args.get("project") or None)
 
 
+USAGE_GATEWAY_REASON = (
+    "plan usage is read from the CLIs on the machine that runs them; the HTTPS gateway has none. "
+    "Use the local khipu MCP server or `khipu usage`."
+)
+
+
+def _tool_usage(args: dict) -> dict:
+    """khipu_usage: each subscription CLI's own plan headroom. Local only: the
+    gateway host runs no subscription CLI, so it says so instead of probing."""
+    if _via_https_gateway():
+        return {"available": False, "reason": USAGE_GATEWAY_REASON}
+    _ensure_path()
+    from khipu import usage
+
+    max_age = args.get("max_age")
+    if max_age is None or isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
+        max_age = usage.DEFAULT_MAX_AGE_S
+    # Cache-first: never waits on a probe; at most one refresh runs in the background.
+    return usage.report(fresh=bool(args.get("fresh")), max_age=max(0.0, float(max_age)), background=True)
+
+
 TOOL_FUNCS = {
     "khipu_search": _tool_search,
     "khipu_get": _tool_get,
@@ -1447,6 +1496,7 @@ TOOL_FUNCS = {
     "khipu_decisions_update": _tool_decisions_update,
     "khipu_brief": _tool_brief,
     "khipu_reflect": _tool_reflect,
+    "khipu_usage": _tool_usage,
 }
 
 

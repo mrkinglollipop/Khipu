@@ -22,7 +22,10 @@ class RuleTextTest(unittest.TestCase):
     def test_it_names_every_tool_the_mcp_server_exposes(self):
         from khipu.mcp_server import TOOLS
 
-        for tool in (t["name"] for t in TOOLS):
+        # khipu_usage is not memory (plan headroom for orchestrators): its
+        # tools/list description is enough, and the rule pushed into every
+        # session stays inside its size budget.
+        for tool in (t["name"] for t in TOOLS if t["name"] != "khipu_usage"):
             with self.subTest(tool=tool):
                 self.assertIn(tool, rr.RULE_MD)
 
