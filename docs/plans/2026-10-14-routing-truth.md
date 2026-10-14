@@ -24,7 +24,7 @@ can see and change all of it in the app. Khipu never decides where work goes.
 | Phase | What | Size | State |
 |---|---|---|---|
 | 0 | This scope; the mocks of the Home Routing card and Settings → Routing; a throwaway-hook check of five hook facts | S | done 2026-10-14 (scope and mocks approved; hook check: five of five yes, see Phase 0 results) |
-| 1a | The record and its fold: event log, versioned view with clock-driven refolds, rules, Matt's note, holds, owner clear; `khipu route`; the doctor block | M | built, in review (branch feat/routing-truth-1a) |
+| 1a | The record and its fold: event log, versioned view with clock-driven refolds, rules, Matt's note, holds, owner clear; `khipu route`; the doctor block | M | done 2026-10-14 (one known limit, see Known limits; its fix is in phase 1b) |
 | 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | open |
 | 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | open |
 | 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | open |
@@ -676,6 +676,11 @@ only; copied into fixtures by shape, with names changed) and the usage cache bef
   makes an account Unknown when the runner is its only source; a source path under a credential folder is
   refused; every runner file is opened read-only (assert that no write handle is opened); a `config.json` key
   outside the named list never reaches the record.
+- Settle write order when a line is written, not when the log is read: the known limit below. The writer
+  holds the log lock and sees the last line, so it can record a sequence number with each line and the fold
+  can order by that instead of guessing from times. Test the known limit's case: `[T0, T0+1m, three lines
+  dated 2001, N correct lines]` for N = 0, 1 and 10; the history keeps its times once N >= 1, and doctor names
+  the 2001 lines, not the T0 lines.
 - Stop-condition: if an adapter would need to write or lock a runner file, stop and ask.
 
 Useful alone: one command answers which accounts are open right now, according to whom, and since when.
@@ -897,6 +902,17 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
     at their limit (decision 7); the seven seeded rules and their wording, which still arrive marked
     "seeded" until he confirms each in Settings → Routing (decision 19); and his note as the place for his
     direction on where work should go (decision 18).
+
+## Known limits
+
+- **A Mac clock that reads low for a while (phase 1a, accepted by Matt 2026-10-14).** The fold decides which
+  out-of-order line has the wrong time from the log alone. When a Mac writes a run of lines while its clock is
+  more than `CLOCK_TOLERANCE` (5 minutes) behind, and that run is longer than the history written before it,
+  the fold keeps the low run and reads the earlier history as old: reports show as Unknown, an owner hold
+  comes due for its reminder early, and doctor names the correct lines as the ones with the wrong date. More
+  correct lines afterwards do not undo it. Nothing is lost: the log keeps every line as written, so the
+  phase 1b fix re-reads it correctly. Three fix rounds each closed one clock case and opened another, because
+  times alone cannot always say which clock was wrong; the phase 1b fix orders lines when they are written.
 
 ## Unverified
 
