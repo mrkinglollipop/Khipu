@@ -202,6 +202,17 @@ def _short_text(value, what: str, limit: int = NAME_MAX) -> str:
     return value
 
 
+def _loads(text):
+    """``json.loads``, with JSON nested too deeply to read raised as
+    ValueError like any other unreadable JSON. Python 3.11, the interpreter
+    the app ships, raises RecursionError there (3.14 reads it), and one such
+    line Khipu never wrote must not stop every read and write."""
+    try:
+        return json.loads(text)
+    except RecursionError:
+        raise ValueError("JSON nested too deeply to read") from None
+
+
 def _coerce(kind: str, value, key: str):
     """``value`` as the setting's stored form, or ValueError naming ``key``."""
     if kind == "duration":
@@ -240,7 +251,7 @@ def _coerce(kind: str, value, key: str):
         items = value
         if isinstance(value, str):
             text = value.strip()
-            items = json.loads(text) if text.startswith("[") else [p for p in text.split(",") if p.strip()]
+            items = _loads(text) if text.startswith("[") else [p for p in text.split(",") if p.strip()]
         if not isinstance(items, list) or not items or len(items) > 10:
             raise ValueError(f"{key} must be one to ten lengths of time, for example 10m,30m")
         return [_coerce("duration", item, key) for item in items]
@@ -256,7 +267,7 @@ def _coerce(kind: str, value, key: str):
                              "a keychain or an auth.json)")
         return str(path)
     if kind == "lane_map":
-        data = json.loads(value) if isinstance(value, str) else value
+        data = _loads(value) if isinstance(value, str) else value
         if not isinstance(data, dict) or len(data) > 64:
             raise ValueError(f'{key} must be JSON like {{"runner": {{"lane": "account"}}}}')
         out: dict[str, dict[str, str]] = {}
@@ -268,7 +279,7 @@ def _coerce(kind: str, value, key: str):
                            for lane, acct in lanes.items()}
         return out
     if kind == "sources":
-        data = json.loads(value) if isinstance(value, str) else value
+        data = _loads(value) if isinstance(value, str) else value
         if not isinstance(data, list) or len(data) > 32:
             raise ValueError(f'{key} must be a JSON list of {{"name", "kind": "lanes", "path"}}')
         out_list: list[dict] = []
@@ -453,17 +464,26 @@ def parse_until(raw: str, now: datetime) -> datetime:
     text = str(raw or "").strip()
     if re.fullmatch(r"(?:in\s+)?\d+(?:\.\d+)?", text, re.I):
         raise RouteError(f"--until needs a unit: 30m, 2h or 3d (got {raw!r}), or a time such as 2026-10-14T18:52Z")
+    too_far = f"--until is further ahead than Khipu can hold (got {raw!r}); give a time before the year 9999"
     try:
-        return now + timedelta(seconds=parse_duration(text))
+        seconds = parse_duration(text)
     except ValueError:
-        pass
+        seconds = None
+    if seconds is not None:
+        try:
+            return now + timedelta(seconds=seconds)
+        except OverflowError:
+            raise RouteError(too_far) from None
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         raise RouteError(f"--until takes a time (2026-10-14T18:52Z) or a length (30m, 2h, 3d), got {raw!r}") from None
-    if dt.tzinfo is None:
-        dt = dt.astimezone()
-    return dt.astimezone(timezone.utc).replace(microsecond=0)
+    try:
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        return dt.astimezone(timezone.utc).replace(microsecond=0)
+    except OverflowError:
+        raise RouteError(too_far) from None
 
 
 _RESET_ISO = re.compile(r"\bresets?\s+at\s+(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
@@ -762,7 +782,7 @@ def _last_written_at() -> datetime | None:
         return None
     for line in reversed(tail.split(b"\n")):
         try:
-            event = json.loads(line)
+            event = _loads(line)
         except ValueError:
             continue
         at = _parse(event.get("written_at")) if isinstance(event, dict) else None
@@ -818,7 +838,7 @@ def read_events() -> tuple[list[dict], int]:
         if not line.strip():
             continue
         try:
-            event = json.loads(line)
+            event = _loads(line)
         except ValueError:
             bad += 1
             continue
@@ -1241,7 +1261,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
 
 def _load_view() -> dict | None:
     try:
-        data = json.loads(view_file().read_text(encoding="utf-8"))
+        data = _loads(view_file().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) and data.get("schema") == SCHEMA else None
@@ -1293,7 +1313,7 @@ def _import_seed_locked(events: list[dict], cfg: dict, now: datetime) -> tuple[s
         return None, False
     try:
         raw_text = Path(path).read_text(encoding="utf-8")
-        data = json.loads(raw_text)
+        data = _loads(raw_text)
     except OSError:
         return "Khipu can't read the rules seed file", False
     except ValueError:
@@ -1478,9 +1498,12 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
            message: str | None = None, evidence: str | None = None, author: dict | None = None,
            via: str = "cli", now: datetime | None = None) -> dict:
     """What a conversation learned. Khipu sets the author and the basis: cli
-    only when Khipu itself reads a reset time out of the pasted limit message;
-    otherwise estimated, with ``until`` clamped to the window it names (five
-    hours when it names none) and 30 minutes (a setting) when omitted.
+    only when Khipu itself reads a reset time out of the pasted limit message
+    and that time is within the window the report names (seven days when it
+    names none); otherwise estimated, with ``until`` clamped to that window
+    (five hours when a report with no message time names none) and 30
+    minutes (a setting) when omitted. A message time cut down to the window
+    is a clamped time: estimated, never shown as the CLI's own.
 
     Only structured values reach other conversations, so the fields that are
     pushed take no free text: ``model`` is a model name, and a runner's lane
@@ -1537,9 +1560,15 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
         else:
             cap = WINDOW_SECONDS.get(window_key or "five_hour")
             event["basis"] = "estimated"
-            stop = parse_until(until, now) if until else now + timedelta(
-                seconds=cfg["routing_report_default_limit"] or 1800)
-        event["until"] = _iso(min(stop, now + timedelta(seconds=cap)))
+            stop = parse_until(until, now) if until else _after(now, cfg["routing_report_default_limit"] or 1800)
+        longest = _after(now, cap)
+        if stop > longest:
+            # Cut down to the window: a time no message gives is a guess,
+            # never shown as the CLI's own time (and so never a strong basis).
+            stop = longest
+            event["basis"] = "estimated"
+            event.pop("message_time", None)
+        event["until"] = _iso(stop)
     elif state == DOWN:
         event["reason"] = "not_signed_in" if message and _SIGNIN.search(message) else "out_of_service"
     written, view = _write(event)
@@ -1582,10 +1611,10 @@ def add_hold(text: str, *, reason: str, scope: str, account: str | None = None, 
         raise RouteError("--until must be in the future")
     if not owner:
         if stop is None:
-            stop = now + timedelta(seconds=cfg["routing_conversation_hold"] or 86400)
+            stop = _after(now, cfg["routing_conversation_hold"] or 86400)
         longest = cfg["routing_conversation_hold_max"]
         if longest:
-            stop = min(stop, now + timedelta(seconds=longest))
+            stop = min(stop, _after(now, longest))
     event = {"type": "hold", "id": _new_id("h"), "scope": hold_scope, "reason": code,
              "text": words if owner else _clean(words, most), "until": _iso(stop), "owner": owner,
              "written_by": OWNER if owner else (author or conversation_author()), "via": via}

@@ -1106,3 +1106,102 @@ def test_a_line_dated_at_the_end_of_time_neither_stops_nor_pins_the_fold(home):
     assert _account(routing.read_view(), SECOND)["state"] == "limited"
     _set(home, routing_stale_after=3_000_000 * 86400)  # the owner's "practically never"
     assert _account(routing.read_view(), "codex|")["state"] == "open"
+
+
+# ---- fix round 3 ---------------------------------------------------------------------------
+
+
+def test_a_message_time_beyond_the_named_window_comes_back_as_an_estimated_report(home, capsys):
+    # R2-1: the cut-down time is in no message, so it is a guess (estimated),
+    # never the CLI's own time, and any later open report can end it.
+    rc, out = _cli(["route", "report", "--account", "Codex", "--state", "limited", "--window", "five-hour",
+                    "--message", "You've hit your usage limit; resets at 2026-10-16T09:00:00Z"], capsys)
+    data = json.loads(out)
+    assert rc == 0 and (data["until"], data["basis"]) == ("2026-10-14T20:00:00Z", "estimated")
+    event = routing.read_events()[0][-1]
+    assert event["basis"] == "estimated" and "message_time" not in event
+    entry = _account(routing.read_view(), "codex|")
+    assert (entry["state"], entry["basis"]) == ("limited", "estimated")
+    line = routing.account_line(entry, home["clock"].now)
+    assert "back about 20:00Z" in line and "message" not in line
+    # With no window named, a message time past seven days is cut to seven days, estimated too.
+    out2 = _report(account="Claude", state="limited", message="resets at 2026-10-30T09:00:00Z")
+    assert (out2["until"], out2["basis"]) == ("2026-10-21T15:00:00Z", "estimated")
+    # A message time within the window stays the CLI's own.
+    out3 = _report(account="Muse", state="limited", window="five-hour", message="resets at 2026-10-14T18:52:00Z")
+    assert (out3["until"], out3["basis"]) == ("2026-10-14T18:52:00Z", "cli")
+    assert routing.read_events()[0][-1]["message_time"] is True
+    home["clock"].advance(minutes=5)
+    _report(account="Codex", state="open", author=OTHER)
+    assert _account(routing.read_view(), "codex|")["state"] == "open"
+
+
+@pytest.mark.parametrize("setting, until", [
+    ("routing_conversation_hold_max", T0 + timedelta(hours=24)),
+    ("routing_conversation_hold", T0 + timedelta(days=7)),
+])
+def test_a_hold_length_setting_too_long_to_add_never_stops_a_conversations_hold(home, capsys, setting, until):
+    # R2-2: now + the setting overflowed, so every conversation hold crashed and nothing was recorded.
+    rc, out = _cli(["config", "--set", setting, "3000000d"], capsys)
+    assert rc == 0
+    rc, out = _cli(["route", "hold", "x", "--reason", "other", "--all"], capsys)
+    assert rc == 0 and json.loads(out)["until"] == routing._iso(until)
+    assert len(routing.read_events()[0]) == 1
+
+
+def test_a_default_limit_setting_too_long_to_add_never_stops_an_untimed_report(home, capsys):
+    # R2-2: the untimed limited report added the setting to now and overflowed.
+    rc, _out = _cli(["config", "--set", "routing_report_default_limit", "3000000d"], capsys)
+    assert rc == 0
+    rc, out = _cli(["route", "report", "--account", "Codex", "--state", "limited"], capsys)
+    data = json.loads(out)
+    assert rc == 0 and (data["until"], data["basis"]) == ("2026-10-14T20:00:00Z", "estimated")
+    assert len(routing.read_events()[0]) == 1
+
+
+@pytest.mark.parametrize("raw", ["4000000d", "9999-12-31T23:59:00-05:00"])
+def test_an_until_too_far_ahead_to_hold_is_refused_not_a_traceback(home, capsys, raw):
+    # R2-2: --until 4000000d raised OverflowError out of report, hold and pause.
+    rc, out = _cli(["route", "report", "--account", "Codex", "--state", "limited", "--until", raw], capsys)
+    assert rc == 2 and "further ahead than Khipu can hold" in json.loads(out)["error"]
+    rc, out = _cli(["route", "hold", "x", "--reason", "other", "--all", "--until", raw], capsys)
+    assert rc == 2 and "further ahead than Khipu can hold" in json.loads(out)["error"]
+    with pytest.raises(routing.RouteError, match="further ahead than Khipu can hold"):
+        routing.pause("Codex", until=raw, via="app")
+    assert routing.read_events()[0] == []
+
+
+def test_json_nested_too_deeply_to_read_is_left_out_and_counted(home, monkeypatch):
+    # R2-3: Python 3.11, the interpreter the app ships, raises RecursionError
+    # on deeply nested JSON (3.14 reads it). One such line stopped every read,
+    # write and the doctor block; a setting or view file like it did the same.
+    _report(account="Codex", state="open")
+    nest = "[" * 5000 + "]" * 5000
+    deep = '{"type":"evidence","written_at":"2026-10-14T00:00:00Z","x":' + nest + "}"
+    try:
+        json.loads(deep)
+    except RecursionError:
+        pass  # this interpreter raises on its own, as 3.11 does
+    else:  # make this one behave as 3.11 does
+        real = json.loads
+
+        def loads(text, *args, **kw):
+            body = text.decode("utf-8", "replace") if isinstance(text, (bytes, bytearray)) else text
+            if body.lstrip().startswith("[" * 1000) or ":" + "[" * 1000 in body:  # nesting, not a string
+                raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+            return real(text, *args, **kw)
+
+        monkeypatch.setattr(routing.json, "loads", loads)
+    with open(routing.events_file(), "a", encoding="utf-8") as fh:
+        fh.write(deep + "\n")
+    view = routing.read_view()
+    assert view["bad_lines"] == 1 and _account(view, "codex|")["state"] == "open"
+    assert _report(account="Claude", state="open")["ok"] is True
+    assert len(routing.read_events()[0]) == 2
+    assert routing.doctor_block()["bad_lines"] == 1
+    # The same nesting in a hand-edited setting reads as the default; in the view file, as no view.
+    _set(home, routing_lane_map=nest)
+    assert routing.settings()["routing_lane_map"] == routing.SETTINGS["routing_lane_map"][1]
+    assert routing.settings_status()["routing_lane_map"]["source"] == "invalid"
+    routing.view_file().write_text(nest, encoding="utf-8")
+    assert _account(routing.read_view(), "claude|")["state"] == "open"
