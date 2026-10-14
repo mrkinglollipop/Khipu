@@ -1,0 +1,65 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Khipu Home mock: Routing, other states</title><link rel="stylesheet" href="App.css"><link rel="stylesheet" href="mock.css"></head>
+<body><div id="root"><div class="shell">
+<nav class="rail" aria-label="Primary"><div class="rail-drag"></div>
+<div class="brand"><img class="brand-icon" src="../../../apps/desktop/src/assets/khipu-icon.png" width="26" height="26" alt=""><span class="brand-name">Khipu</span></div>
+<div class="rail-nav"><div class="nav-group">
+<button type="button" class="nav active" aria-current="page"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 8 4l5 4.5V13H3z"/></svg><span class="nav-label">Home</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4"/><path d="m10 10 3.5 3.5"/></svg><span class="nav-label">Recall</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h10M3 8h7M3 12h5"/><path d="m11 11 1.5 1.5L15 10"/></svg><span class="nav-label">Owed</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></svg><span class="nav-label">Activity</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v3M11 3v3M3 6h10v3a5 5 0 0 1-10 0z"/><path d="M8 11v3"/></svg><span class="nav-label">Harnesses</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h10M3 11h10"/><circle cx="6" cy="5" r="1.5"/><circle cx="10" cy="11" r="1.5"/></svg><span class="nav-label">Settings</span></button>
+</div></div>
+<div class="rail-foot"><div class="rail-health"><span class="hdot ok" aria-hidden="true"></span><span>All harnesses recording</span></div>
+<div class="rail-meta"><button type="button" class="rail-feedback">Feedback</button><span class="version-chip">v0.4.14</span></div></div></nav>
+<main class="main"><section class="panel"><header class="panel-head"><div class="panel-head-text"><h1>Home</h1><p class="lede">Is memory working right now?</p></div></header>
+<div class="panel-body wide">
+<div class="callout warn stripe warn"><div class="txt"><b>A job runner stopped reporting</b><span>Your Project B job runner's last report was at 2:12 PM. Limits it finds won't reach your conversations until it runs again. Khipu stopped nothing.</span></div><div class="cta"><button type="button" class="sm">Routing settings</button></div></div>
+<div class="card routing-card">
+<div class="card-head">Routing<span class="spacer"></span><button type="button" class="sm link">Routing settings</button></div>
+<div role="list" aria-label="Accounts">
+<div class="row route-row" role="listitem"><span class="ellip">Claude main</span><span class="route-state"><span class="hdot warn" aria-hidden="true"></span>Opus limit reached, back Thu 9:00 AM; other models open</span><span class="route-src">Read from Claude 6 min ago</span><span class="route-act"><button type="button" class="sm" aria-label="Check Claude main now">Check now</button></span></div>
+<div class="row route-row" role="listitem"><span class="ellip">Claude second</span><span class="route-state"><span class="hdot" aria-hidden="true"></span>Its reset time passed at 2:52 PM; this account can't be checked without using a turn</span><span class="route-src">From Claude's own message, seen by your Project A job runner at 11:13 AM</span><span class="route-act"></span></div>
+<div class="row route-row" role="listitem"><span class="ellip">Codex</span><span class="route-state"><span class="hdot" aria-hidden="true"></span>Probably open: its limit was due to end at 3:04 PM, not checked yet</span><span class="route-src">Khipu checks at 3:06 PM</span><span class="route-act"><button type="button" class="sm" aria-label="Check Codex now">Check now</button></span></div>
+<div class="row route-row" role="listitem"><span class="ellip">Grok Build</span><span class="route-state"><span class="hdot warn" aria-hidden="true"></span>Limit reached, back about 3:30 PM (a guess)</span><span class="route-src">Reported without a time by a Claude Code conversation in Khipu at 3:00 PM; Khipu keeps a report like that for 30 minutes</span><span class="route-act"><button type="button" class="sm" aria-label="Check Grok Build now">Check now</button></span></div>
+<div class="row route-row" role="listitem"><span class="ellip">Muse</span><span class="route-state"><span class="hdot err" aria-hidden="true"></span>Down: not signed in</span><span class="route-src">Khipu's plan check 10 min ago</span><span class="route-act"></span></div>
+</div>
+<div class="route-sub"><h2 class="route-sub-head" id="holds-h">Holds</h2>
+<ul class="route-holds" aria-labelledby="holds-h">
+<li class="route-hold"><span>This Mac</span><span>No new launches while the Mac is busy (load over 75)</span><span class="route-src">Ends tomorrow 9:40 AM · set by a Claude Code conversation in project-a</span></li>
+<li class="route-hold"><span>Muse</span><span>Keep it for second-opinion reviews</span><span class="route-src">Ends Sat 8:00 PM · set by you yesterday</span></li>
+</ul></div>
+<div class="row route-rules"><details class="disclose"><summary class="disclosure"><svg class="disclosure-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg><span>7 standing rules, shown first to every conversation<span class="tag">6 to confirm in Settings</span></span></summary>
+<div class="disclose-body"><ol>
+<li>Grok never builds or fixes privacy or safety code.</li>
+<li>Every Grok result that is acted on gets a re-check from a different model family.</li>
+<li>Never a -fast tier.</li>
+<li>Never the paid xAI API.</li>
+<li>Khipu runs in Aegis only through Aegis's own pack, never through a Claude or other vendor import.</li>
+<li>Never send what is in API Keys or My Portfolio to Codex or Grok.</li>
+<li>Khipu's routing record is guidance, not a gate: an orchestrator with better live information may route differently, and says why.</li>
+</ol></div></details></div>
+<div class="row route-foot"><span class="meta">Khipu reports this; your agents decide where work goes.</span></div>
+</div>
+<div class="card route-legend">
+<div class="card-head">Mock only: other ways a row can read</div>
+<div class="row"><span class="route-state"><span class="hdot" aria-hidden="true"></span>Unknown: no report yet</span><span class="t2">Nothing has reported on this account since Khipu started keeping the record. Never shown as open.</span></div>
+<div class="row"><span class="route-state"><span class="hdot" aria-hidden="true"></span>Unknown: last seen open 14 h ago</span><span class="t2">From Khipu's plan check yesterday at 1:02 AM. Reports older than 12 hours count as out of date (a setting).</span></div>
+<div class="row"><span class="route-state"><span class="hdot" aria-hidden="true"></span>Unknown: its only reporter stopped</span><span class="t2">The job runner that reported this account stopped reporting at 2:12 PM; its last report was "open".</span></div>
+<div class="row"><span class="route-state"><span class="hdot err" aria-hidden="true"></span>Down: out of service</span><span class="t2">Reported by your Project A job runner at 9:10 AM. Ends when a check or a later report says it answers, or when you clear it.</span></div>
+<div class="row"><span class="route-state"><span class="hdot warn" aria-hidden="true"></span>Its reset time passed; not checked: the Mac was busy</span><span class="t2">Khipu waited three times for the Mac to be less busy, then wrote this down.</span></div>
+<div class="row"><span class="route-state"><span class="hdot" aria-hidden="true"></span>Paused by you until you clear it</span><span class="t2">A pause with no end date.</span></div>
+<div class="row"><span class="route-state"><span class="hdot warn" aria-hidden="true"></span>Khipu's record has not been refreshed since 2:58 PM</span><span class="t2">Shown above the account rows, and told to conversations, when Khipu itself has stopped updating.</span></div>
+<div class="row"><span class="route-state"><span class="hdot" aria-hidden="true"></span>No routing record on this Mac</span><span class="t2">On a Mac with no job runners or accounts set up, instead of showing every account as open.</span></div>
+</div>
+<div class="card health-card">
+<div class="card-head">Health report<span class="spacer"></span><button type="button" class="link sm">Raw report</button></div>
+<div class="rows">
+<div class="row-item"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="ok"><path d="M20 6 9 17l-5-5"/></svg><span class="row-main">Recording</span><span class="row-meta wrap">4 of 4 harnesses</span></div>
+<div class="row-item"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="ok"><path d="M20 6 9 17l-5-5"/></svg><span class="row-main">Search index</span><span class="row-meta wrap">99.8% indexed</span></div>
+<div class="row-item"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="ok"><path d="M20 6 9 17l-5-5"/></svg><span class="row-main">Plans</span><span class="row-meta wrap">5 accounts read 6 min ago</span></div>
+<div class="row-item"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="err"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg><span class="row-main">Routing</span><span class="row-meta wrap">Your Project B job runner stopped reporting at 2:12 PM. Last change 3:00 PM: Grok Build limit reached (a guess). No standing rule looks broken.</span><button type="button" class="sm">Routing settings</button></div>
+</div></div>
+</div>
+</section></main></div></div></body></html>

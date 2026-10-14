@@ -1,0 +1,204 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Khipu Settings mock: Routing</title><link rel="stylesheet" href="App.css"><link rel="stylesheet" href="mock.css"></head>
+<body><div id="root"><div class="shell">
+<nav class="rail" aria-label="Primary"><div class="rail-drag"></div>
+<div class="brand"><img class="brand-icon" src="../../../apps/desktop/src/assets/khipu-icon.png" width="26" height="26" alt=""><span class="brand-name">Khipu</span></div>
+<div class="rail-nav"><div class="nav-group">
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 8 4l5 4.5V13H3z"/></svg><span class="nav-label">Home</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4"/><path d="m10 10 3.5 3.5"/></svg><span class="nav-label">Recall</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h10M3 8h7M3 12h5"/><path d="m11 11 1.5 1.5L15 10"/></svg><span class="nav-label">Owed</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></svg><span class="nav-label">Activity</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v3M11 3v3M3 6h10v3a5 5 0 0 1-10 0z"/><path d="M8 11v3"/></svg><span class="nav-label">Harnesses</span></button>
+<button type="button" class="nav active" aria-current="page"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h10M3 11h10"/><circle cx="6" cy="5" r="1.5"/><circle cx="10" cy="11" r="1.5"/></svg><span class="nav-label">Settings</span></button>
+</div></div>
+<div class="rail-foot"><div class="rail-health"><span class="hdot ok" aria-hidden="true"></span><span>All harnesses recording</span></div>
+<div class="rail-meta"><button type="button" class="rail-feedback">Feedback</button><span class="version-chip">v0.4.14</span></div></div></nav>
+<main class="main"><section class="panel"><header class="panel-head"><div class="panel-head-text"><h1>Settings</h1><p class="lede">Capture, models, data and this Mac.</p></div></header>
+<div class="panel-body wide settings-body">
+<div class="settings-split">
+<div class="subnav" role="tablist" aria-label="Settings sections">
+<button type="button" role="tab" aria-selected="false">Database</button>
+<button type="button" role="tab" aria-selected="false">Capture & models</button>
+<button type="button" role="tab" aria-selected="true" class="on">Routing</button>
+<button type="button" role="tab" aria-selected="false">Optional features</button>
+<button type="button" role="tab" aria-selected="false">Embeddings</button>
+<button type="button" role="tab" aria-selected="false">Data & backups</button>
+<button type="button" role="tab" aria-selected="false">Another Mac</button>
+<button type="button" role="tab" aria-selected="false">Components</button>
+<button type="button" role="tab" aria-selected="false">Updates</button>
+<button type="button" role="tab" aria-selected="false">Advanced</button>
+</div>
+<div class="settings-pane">
+<p class="set-help set-intro">Khipu tells every conversation which accounts can take work, what you have paused and what your rules are. It never sends, stops or reorders work; your agents decide.</p>
+<div class="section-card">
+<div class="section-head">Accounts</div>
+<div class="section-body">
+<p class="set-help">The same accounts as Plans, from the list in Settings → Models. Reports come from four places: each account's plan check, your job runners, conversations, and you. Your routing table is not one of them.</p>
+<div class="rows" role="list" aria-label="Accounts">
+<div class="row-item route-acct" role="listitem"><span class="route-name">Claude main</span><span class="route-what"><span class="route-state"><span class="hdot warn" aria-hidden="true"></span>Limit reached, back at 1:52 PM</span><span class="route-src">Read from Claude 4 min ago · Khipu checks again at 1:54 PM</span></span><span class="route-acts"><button type="button" class="sm" aria-label="Check Claude main now">Check now</button><button type="button" class="sm" aria-label="Mark Claude main paused until…">Mark paused until…</button><button type="button" class="sm" aria-label="Clear the limit for Claude main">Clear</button></span></div>
+<div class="row-item route-acct" role="listitem"><span class="route-name">Claude second</span><span class="route-what"><span class="route-state"><span class="hdot warn" aria-hidden="true"></span>Limit reached, back at 2:52 PM <span class="tag warn"><span class="dot" aria-hidden="true"></span>Sources disagree</span></span><span class="route-src">From Claude's own message, seen by your Project A job runner 27 min ago · can't be checked without using a turn</span></span><span class="route-acts"><button type="button" class="sm" aria-label="Mark Claude second paused until…">Mark paused until…</button><button type="button" class="sm" aria-label="Clear the limit for Claude second">Clear</button></span><div class="route-disagree" role="group" aria-label="Claude second: two reports disagree"><span><b>Two reports disagree.</b></span><ul><li><b>Limit reached, back at 2:52 PM</b>: from Claude's own message, seen by your Project A job runner at 11:13 AM.</li><li><b>Open</b>: reported by a Claude Code conversation in project-b at 11:31 AM.</li></ul><span>Claude's own message outranks a conversation's report, so the limit shows; conversations are told both. Dismiss removes only that report.</span><div class="toolbar"><button type="button" class="sm">Dismiss the runner's report</button><button type="button" class="sm">Dismiss the conversation's report</button></div></div></div>
+<div class="row-item route-acct" role="listitem"><span class="route-name">Codex</span><span class="route-what"><span class="route-state"><span class="hdot ok" aria-hidden="true"></span>Open</span><span class="route-src">Read from Codex 4 min ago · 58% of its week used</span></span><span class="route-acts"><button type="button" class="sm" aria-label="Mark Codex paused until…" aria-expanded="true" aria-controls="pause-codex">Mark paused until…</button></span><form class="route-pause" id="pause-codex" aria-label="Mark Codex paused"><div class="toolbar"><label for="pause-codex-until">Mark Codex paused until</label><select id="pause-codex-until"><option>In 1 hour, 12:40 PM</option><option>Tonight, 9:00 PM</option><option selected>Tomorrow, 9:00 AM</option><option>Friday, 9:00 AM</option><option>A date and time…</option><option>Until I clear it</option></select></div><div class="toolbar"><label for="pause-codex-note">Note for your agents</label><input id="pause-codex-note" placeholder="Optional: why you want it left alone" autocomplete="off"></div><p class="set-help">This doesn't stop anything that is running; it tells conversations you want Codex left alone. They hear it on their next prompt, or when they ask.</p><div class="toolbar"><button type="submit" class="primary sm">Mark Codex paused</button><button type="button" class="sm link">Cancel</button></div></form></div>
+<div class="row-item route-acct" role="listitem"><span class="route-name">Grok Build</span><span class="route-what"><span class="route-state"><span class="hdot" aria-hidden="true"></span>Paused by you until Friday, 9:00 AM</span><span class="route-src">Set by you yesterday at 6:05 PM. Your note: “Keep its week for the Friday audit.”</span></span><span class="route-acts"><button type="button" class="sm" aria-label="Change the pause for Grok Build">Change…</button><button type="button" class="sm" aria-label="Lift the pause for Grok Build">Lift the pause</button></span></div>
+<div class="row-item route-acct" role="listitem"><span class="route-name">Muse</span><span class="route-what"><span class="route-state"><span class="hdot warn" aria-hidden="true"></span>Limit reached, back Sat 8:00 PM</span><span class="route-src">Reported by a Claude Code conversation in project-a at 10:45 AM · can't be checked without using a turn</span></span><span class="route-acts"><button type="button" class="sm" aria-label="Mark Muse paused until…">Mark paused until…</button><button type="button" class="sm" aria-label="Clear the limit for Muse">Clear</button></span></div>
+</div>
+<p class="set-help">Check now asks the account's plan right away; no model call is made. Clear ends a limit or a "down" report at once, and Khipu treats the account as open until something newer reports on it; if Claude or a job runner reports the limit again, it comes back.</p>
+</div></div>
+
+<div class="section-card">
+<div class="section-head">Your note to every conversation<span class="spacer"></span><span class="meta">written Oct 13</span></div>
+<div class="section-body">
+<blockquote class="route-quote">“We don't need cursor. Just grok. Secondary account for Claude too until that's canceled.”</blockquote>
+<div class="toolbar"><button type="button" class="sm">Edit note</button><button type="button" class="sm">End this note</button></div>
+<p class="set-help">Conversations see this word for word, right after your standing rules, and it is never shortened. Khipu never turns it into a choice of account. Earlier notes stay in Recent changes.</p>
+</div></div>
+
+<div class="section-card">
+<div class="section-head">Standing rules<span class="spacer"></span><span class="tag">7 rules · 6 to confirm</span></div>
+<div class="section-body">
+<p class="set-help">Every conversation sees these first, in full, before anything else. They are never shortened or cut. Rules marked Seeded were copied from your routing table and your instructions; confirm each one, or edit or remove it.</p>
+<ol class="rows route-rule-list" role="list" aria-label="Standing rules">
+<li class="row-item route-rule"><span class="route-rule-n" aria-hidden="true">1.</span><span class="route-rule-body"><span class="row-main">Grok never builds or fixes privacy or safety code.</span><span class="route-rule-meta">From your routing table, Oct 13 (the Grok builder verdict) <span class="tag warn">Seeded, confirm</span><span class="tag">Watched</span></span></span><span class="route-acts"><button type="button" class="sm" aria-label="Confirm rule 1">Confirm</button><button type="button" class="sm" aria-label="Edit rule 1">Edit</button><button type="button" class="sm" aria-label="Remove rule 1">Remove</button></span></li>
+<li class="row-item route-rule"><span class="route-rule-n" aria-hidden="true">2.</span><span class="route-rule-body"><span class="row-main">Every Grok result that is acted on gets a re-check from a different model family.</span><span class="route-rule-meta">From your routing table, Oct 13 <span class="tag warn">Seeded, confirm</span><span class="tag">Watched</span></span></span><span class="route-acts"><button type="button" class="sm" aria-label="Confirm rule 2">Confirm</button><button type="button" class="sm" aria-label="Edit rule 2">Edit</button><button type="button" class="sm" aria-label="Remove rule 2">Remove</button></span></li>
+<li class="row-item route-rule"><span class="route-rule-n" aria-hidden="true">3.</span><span class="route-rule-body"><span class="row-main">Never a -fast tier.</span><span class="route-rule-meta">From your routing table (no date) and your instructions file, Jul 26 <span class="tag warn">Seeded, confirm</span><span class="tag">Watched</span></span></span><span class="route-acts"><button type="button" class="sm" aria-label="Confirm rule 3">Confirm</button><button type="button" class="sm" aria-label="Edit rule 3">Edit</button><button type="button" class="sm" aria-label="Remove rule 3">Remove</button></span></li>
+<li class="row-item route-rule"><span class="route-rule-n" aria-hidden="true">4.</span><span class="route-rule-body"><span class="row-main">Never the paid xAI API.</span><span class="route-rule-meta">From your routing table (no date) <span class="tag warn">Seeded, confirm</span><span class="tag">Not watched by Khipu</span></span></span><span class="route-acts"><button type="button" class="sm" aria-label="Confirm rule 4">Confirm</button><button type="button" class="sm" aria-label="Edit rule 4">Edit</button><button type="button" class="sm" aria-label="Remove rule 4">Remove</button></span></li>
+<li class="row-item route-rule"><span class="route-rule-n" aria-hidden="true">5.</span><span class="route-rule-body"><span class="row-main">Khipu runs in Aegis only through Aegis's own pack, never through a Claude or other vendor import.</span><span class="route-rule-meta">Your words, Aug 17: “I don't want Khipu running in Aegis through anything Claude.” <span class="tag warn">Seeded, confirm</span><span class="tag">Not watched by Khipu</span></span></span><span class="route-acts"><button type="button" class="sm" aria-label="Confirm rule 5">Confirm</button><button type="button" class="sm" aria-label="Edit rule 5">Edit</button><button type="button" class="sm" aria-label="Remove rule 5">Remove</button></span></li>
+<li class="row-item route-rule"><span class="route-rule-n" aria-hidden="true">6.</span><span class="route-rule-body"><span class="row-main">Never send what is in API Keys or My Portfolio to Codex or Grok.</span><span class="route-rule-meta">From your instructions file, Oct 7 <span class="tag warn">Seeded, confirm</span><span class="tag">Not watched by Khipu</span></span></span><span class="route-acts"><button type="button" class="sm" aria-label="Confirm rule 6">Confirm</button><button type="button" class="sm" aria-label="Edit rule 6">Edit</button><button type="button" class="sm" aria-label="Remove rule 6">Remove</button></span><div class="route-confirm" role="group" aria-label="Remove rule 6?"><span>Remove this rule? Conversations stop seeing it on their next prompt. You can undo this from Recent changes.</span><div class="toolbar"><button type="button" class="sm danger">Remove rule 6</button><button type="button" class="sm link">Keep it</button></div></div></li>
+<li class="row-item route-rule"><span class="route-rule-n" aria-hidden="true">7.</span><span class="route-rule-body"><span class="row-main">Khipu's routing record is guidance, not a gate: an orchestrator with better live information may route differently, and says why.</span><span class="route-rule-meta">From your routing table; your words, Oct 13: “Flexibility is a big deal” <span class="tag ok">Confirmed today</span><span class="tag">Not watched by Khipu</span></span></span><span class="route-acts"><button type="button" class="sm" aria-label="Edit rule 7">Edit</button><button type="button" class="sm" aria-label="Remove rule 7">Remove</button></span></li>
+</ol>
+<form class="route-form" aria-label="Add a standing rule"><div class="toolbar"><label for="new-rule">New rule</label><input id="new-rule" value="Codex is kept for cross-family checks while it is nearly spent." autocomplete="off"><button type="button" class="sm">Add rule…</button></div><div class="route-confirm" role="group" aria-label="Add this rule?"><span>Add this as rule 8? Every conversation sees it first, in full, from its next prompt.</span><div class="toolbar"><button type="submit" class="primary sm">Add rule 8</button><button type="button" class="sm link">Cancel</button></div></div></form>
+<p class="set-help">Khipu doesn't enforce rules. A rule marked Watched has a check: when it looks broken you get a warning on Home and in the health report, and nothing is stopped. A rule marked Not watched by Khipu has no check Khipu can run.</p>
+</div></div>
+
+<div class="section-card">
+<div class="section-head">Holds</div>
+<div class="section-body">
+<p class="set-help">Short notes about one account, this Mac or all work. Every hold from a conversation ends on its own.</p>
+<div class="rows" role="list" aria-label="Holds">
+<div class="row-item route-acct" role="listitem"><span class="route-name">This Mac</span><span class="route-what"><span class="route-state">No new launches while the Mac is busy (load over 75)</span><span class="route-src">Machine busy · set by a Claude Code conversation in project-a at 9:40 AM · ends tomorrow 9:40 AM</span></span><span class="route-acts"><button type="button" class="sm" aria-label="End the hold on this Mac">End now</button></span></div>
+<div class="row-item route-acct" role="listitem"><span class="route-name">All work</span><span class="route-what"><span class="route-state">Clean up finished worktrees before starting new builds</span><span class="route-src">Disk low · set by a Claude Code conversation in project-b at 8:12 AM · ends today 8:12 PM</span></span><span class="route-acts"><button type="button" class="sm" aria-label="End the hold on all work">End now</button></span></div>
+<div class="row-item route-acct" role="listitem"><span class="route-name">Muse</span><span class="route-what"><span class="route-state">Keep it for second-opinion reviews</span><span class="route-src">Keep for one purpose · set by you yesterday · ends Sat 8:00 PM</span></span><span class="route-acts"><button type="button" class="sm" aria-label="Change the hold on Muse">Change…</button><button type="button" class="sm" aria-label="End the hold on Muse">End now</button></span></div>
+</div>
+<p class="set-help">Conversations are told who set each hold, what kind it is and when it ends. The words of a hold set by a conversation show here and when a conversation asks; only your own holds are sent word for word.</p>
+<form class="route-form" aria-label="Add a hold"><div class="toolbar"><label for="hold-text">Words</label><input id="hold-text" placeholder="What conversations should know" autocomplete="off"></div><div class="toolbar"><label for="hold-about">About</label><select id="hold-about"><option>All work</option><option>This Mac</option><option>Claude main</option><option>Claude second</option><option>Codex</option><option>Grok Build</option><option>Muse</option></select><label for="hold-kind">Kind</label><select id="hold-kind"><option>Machine busy</option><option>Disk low</option><option>Keep for one purpose</option><option>Outage</option><option>Other</option></select><label for="hold-ends">Ends</label><select id="hold-ends"><option>In 4 hours</option><option>Tonight, 9:00 PM</option><option selected>Tomorrow, 9:00 AM</option><option>Friday, 9:00 AM</option><option>A date and time…</option><option>Until I clear it</option></select></div><div class="toolbar"><button type="submit" class="sm">Add hold</button></div></form>
+<div class="rows">
+<div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name" id="lim-hold-conv">How long a conversation's hold lasts</span><span class="set-help">When a conversation doesn't say; it can ask for longer, up to the most.</span></span><span class="route-val">24 hours · at most 7 days</span><button type="button" class="sm" aria-label="Change how long a conversation's hold lasts">Change…</button></div>
+<div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name" id="lim-hold-own">Remind me about my own holds after</span><span class="set-help">A reminder on Home; your hold stays until you end it.</span></span><span class="route-val">90 days</span><button type="button" class="sm" aria-label="Change when to remind you about your own holds">Change…</button></div>
+</div>
+</div></div>
+
+<div class="section-card">
+<div class="section-head">Checking for resets</div>
+<div class="opt-list">
+<div class="opt-row"><input id="reset-check" class="switch" type="checkbox" role="switch" checked aria-describedby="reset-check-tag reset-check-what"><div class="opt-text"><div class="opt-title"><label class="opt-name" for="reset-check">Check each limited account again just after its reset time</label><span class="tag " id="reset-check-tag">Comes later</span></div><p id="reset-check-what" class="opt-what">When an account has reached its limit, Khipu asks its plan again shortly after the reset time, so conversations hear it is open without anyone asking.</p><p class="opt-cost"><b>Cost.</b> One plan check, about a second, and no model call. At most three per reset: 2 minutes after the reset time, then 10 and 30 minutes after if the limit is still there.</p><p class="opt-cost"><b>Next.</b> Claude main today at 1:54 PM.</p><p class="opt-cost"><b>Not checked.</b> Accounts that are open, because a reset changes nothing for them. Claude second and Muse, which can't be checked without using a turn; their rows say so when the time passes.</p><p class="opt-found"><b>Changed Oct 14.</b> Before this, Khipu checked plans only when someone asked.</p></div></div>
+</div>
+<div class="section-body">
+<div class="rows">
+<div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name" id="lim-grace">Wait after the reset time</span><span class="set-help">So the account has had time to reset.</span></span><span class="route-val">2 minutes</span><button type="button" class="sm" aria-label="Change the wait after the reset time">Change…</button></div>
+<div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name" id="lim-retry">Try again after</span><span class="set-help">Only when the limit is still there at the first check.</span></span><span class="route-val">10 and 30 minutes</span><button type="button" class="sm" aria-label="Change when to try again">Change…</button></div>
+<div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name" id="lim-busy">Wait while the Mac is busy</span><span class="set-help">Then the check is written down as not done.</span></span><span class="route-val">Load over 75 · 5 minutes · up to 3 times</span><button type="button" class="sm" aria-label="Change the wait while the Mac is busy">Change…</button></div>
+</div>
+</div></div>
+
+<div class="section-card">
+<div class="section-head">Telling conversations</div>
+<p class="opt-group-note">A running conversation hears a change as soon as its app allows. Any conversation can also ask Khipu. Switching these off stops only the telling.</p>
+<div class="opt-list">
+<div class="opt-row"><input id="push-all" class="switch" type="checkbox" role="switch" checked aria-describedby="push-all-tag push-all-what"><div class="opt-text"><div class="opt-title"><label class="opt-name" for="push-all">Tell conversations about routing</label><span class="tag " id="push-all-tag">Also in Optional features</span></div><p id="push-all-what" class="opt-what">Turns all of the telling on or off. The same switch is in Optional features.</p></div></div>
+<div class="opt-row"><input id="push-start" class="switch" type="checkbox" role="switch" checked aria-describedby="push-start-tag push-start-what"><div class="opt-text"><div class="opt-title"><label class="opt-name" for="push-start">At the start of a conversation, and after it is compacted</label><span class="tag ok" id="push-start-tag">Start</span></div><p id="push-start-what" class="opt-what">The full summary: your rules, your note, every account and the holds.</p></div></div>
+<div class="opt-row"><input id="push-prompt" class="switch" type="checkbox" role="switch" checked aria-describedby="push-prompt-tag push-prompt-what"><div class="opt-text"><div class="opt-title"><label class="opt-name" for="push-prompt">Before each prompt</label><span class="tag ok" id="push-prompt-tag">Next prompt</span></div><p id="push-prompt-what" class="opt-what">Only what changed since the conversation last heard, as it stands now. A conversation that fell far behind gets the full summary again.</p></div></div>
+<div class="opt-row"><input id="push-hand" class="switch" type="checkbox" role="switch" aria-describedby="push-hand-tag push-hand-what"><div class="opt-text"><div class="opt-title"><label class="opt-name" for="push-hand">Before handing work to another agent</label><span class="tag " id="push-hand-tag">Comes later</span></div><p id="push-hand-what" class="opt-what">Reaches an orchestrator in the middle of a long turn, just before it hands work on. Claude Code first; other apps once Khipu has checked they can take it.</p></div></div>
+</div>
+<div class="section-body">
+<h3 class="sub-title" id="hear-h">What each kind of conversation hears</h3>
+<div class="rows" role="list" aria-labelledby="hear-h">
+<div class="row-item route-hear" role="listitem"><span class="route-name">Claude Code</span><span class="set-help">At the start and before each prompt, on both Claude accounts.</span></div>
+<div class="row-item route-hear" role="listitem"><span class="route-name">Codex</span><span class="set-help">At the start and before each prompt.</span></div>
+<div class="row-item route-hear" role="listitem"><span class="route-name">Cursor</span><span class="set-help">At the start only; Cursor has no step before each prompt.</span></div>
+<div class="row-item route-hear" role="listitem"><span class="route-name">Grok Build</span><span class="set-help">When it asks Khipu. Before each tool use only after your go.</span></div>
+<div class="row-item route-hear" role="listitem"><span class="route-name">Aegis</span><span class="set-help">When its own client asks Khipu.</span></div>
+<div class="row-item route-hear" role="listitem"><span class="route-name">Cloud agents</span><span class="set-help">When they ask, from the copy for cloud agents.</span></div>
+</div>
+<h3 class="sub-title">Sizes and times</h3>
+<div class="rows">
+<div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name">Longest summary at the start of a conversation</span><span class="set-help">Your rules and your note are never cut; this limits what follows them.</span></span><span class="route-val">1,500 characters</span><button type="button" class="sm" aria-label="Change the longest summary" aria-expanded="true">Change…</button><form class="route-pause" aria-label="Change the longest summary"><div class="toolbar"><label for="lim-sum-v">Longest summary</label><select id="lim-sum-v"><option>1,000 characters</option><option selected>1,500 characters</option><option>3,000 characters</option><option>6,000 characters</option><option>No limit</option></select><button type="submit" class="primary sm">Save</button><button type="button" class="sm link">Cancel</button></div></form></div>
+<div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name" id="lim-upd">Longest update before a prompt</span><span class="set-help">Rules and your note are never cut.</span></span><span class="route-val">400 characters</span><button type="button" class="sm" aria-label="Change the longest update">Change…</button></div>
+<div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name" id="lim-time">Time allowed before a prompt</span><span class="set-help">If reading takes longer, the update waits for the next prompt; memory search is not slowed.</span></span><span class="route-val">50 ms</span><button type="button" class="sm" aria-label="Change the time allowed">Change…</button></div>
+<div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name" id="lim-full">Send everything again when a conversation is this far behind</span><span class="set-help">Also when it comes back after being idle.</span></span><span class="route-val">20 changes or 6 hours</span><button type="button" class="sm" aria-label="Change when to send everything again">Change…</button></div>
+<div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name" id="lim-stale">Treat a report as out of date after</span><span class="set-help">An account with only out-of-date reports shows as Unknown, never as open.</span></span><span class="route-val">12 hours</span><button type="button" class="sm" aria-label="Change when a report is out of date">Change…</button></div>
+<div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name" id="lim-dis">Warn when two reports disagree for</span><span class="set-help">The warning shows on Home and in the health report.</span></span><span class="route-val">30 minutes</span><button type="button" class="sm" aria-label="Change when to warn about a disagreement">Change…</button></div>
+<div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name" id="lim-fresh">Say the record is not refreshed after</span><span class="set-help">Conversations are told when Khipu itself has stopped updating.</span></span><span class="route-val">5 minutes</span><button type="button" class="sm" aria-label="Change when to say the record is not refreshed">Change…</button></div>
+</div>
+<p class="set-help">Your old "routing off" switches are not set. Setting either one (<span class="mono">ROUTING_NOW_OFF=1</span>, or the file <span class="mono">/tmp/.routing_now_disable</span>) also turns this off.</p>
+</div></div>
+
+<div class="section-card">
+<div class="section-head">Job runner folders<span class="spacer"></span><button type="button" class="sm">Add a folder…</button></div>
+<div class="section-body">
+<div class="rows" role="list" aria-label="Job runner folders">
+<div class="row-item route-acct" role="listitem"><span class="route-name">Project A</span><span class="route-what"><span class="route-state"><span class="hdot ok" aria-hidden="true"></span>Read 20 s ago · 6 lanes</span><span class="route-src"><span class="mono">&lt;project A runner state dir&gt;</span> · reports every 20 s</span></span><span class="route-acts"><button type="button" class="sm" aria-label="Remove the Project A folder">Remove</button></span></div>
+<div class="row-item route-acct" role="listitem"><span class="route-name">Project B</span><span class="route-what"><span class="route-state"><span class="hdot err" aria-hidden="true"></span>Stopped reporting at 10:02 AM</span><span class="route-src"><span class="mono">&lt;project B runner state dir&gt;</span> · last good read 10:02 AM, 1 h 38 min ago</span></span><span class="route-acts"><button type="button" class="sm" aria-label="Remove the Project B folder">Remove</button></span></div>
+</div>
+<p class="set-help">Khipu only reads these folders. It never writes to them, never changes a runner's settings, and reads only its limits, its job starts, its heartbeat and the few lane settings it needs to watch your rules. Every line it keeps is checked for secrets first. A folder inside API Keys, My Portfolio or any sign-in file is refused.</p>
+</div></div>
+
+<div class="section-card">
+<div class="section-head">Which account each job lane uses</div>
+<div class="section-body">
+<div class="rows"><h3 class="rows-head route-day" id="lm-pa">Project A</h3><div role="list" aria-labelledby="lm-pa">
+<div class="row-item route-lane" role="listitem"><span class="mono">secondary</span><span aria-hidden="true">→</span><span>Claude second</span><span class="route-act"><button type="button" class="sm" aria-label="Change the account for secondary">Change…</button></span></div>
+<div class="row-item route-lane" role="listitem"><span class="mono">main</span><span aria-hidden="true">→</span><span>Claude main</span><span class="route-act"><button type="button" class="sm" aria-label="Change the account for main">Change…</button></span></div>
+<div class="row-item route-lane" role="listitem"><span class="mono">codex</span><span aria-hidden="true">→</span><span>Codex</span><span class="route-act"><button type="button" class="sm" aria-label="Change the account for codex">Change…</button></span></div>
+<div class="row-item route-lane" role="listitem"><span class="mono">grok</span><span aria-hidden="true">→</span><span>Grok Build (default Grok sign-in)</span><span class="route-act"><button type="button" class="sm" aria-label="Change the account for grok">Change…</button></span></div>
+<div class="row-item route-lane" role="listitem"><span class="mono">grokcheck</span><span aria-hidden="true">→</span><span>Grok Build (default Grok sign-in)</span><span class="route-act"><button type="button" class="sm" aria-label="Change the account for grokcheck">Change…</button></span></div>
+<div class="row-item route-lane" role="listitem"><span class="mono">muse</span><span aria-hidden="true">→</span><span>Muse</span><span class="route-act"><button type="button" class="sm" aria-label="Change the account for muse">Change…</button></span></div>
+</div></div>
+<div class="rows"><h3 class="rows-head route-day" id="lm-pb">Project B</h3><div role="list" aria-labelledby="lm-pb">
+<div class="row-item route-lane" role="listitem"><span class="mono">secondary</span><span aria-hidden="true">→</span><span>Claude second</span><span class="route-act"><button type="button" class="sm" aria-label="Change the account for Project B secondary">Change…</button></span></div>
+<div class="row-item route-lane" role="listitem"><span class="mono">codex</span><span aria-hidden="true">→</span><span>Codex</span><span class="route-act"><button type="button" class="sm" aria-label="Change the account for Project B codex">Change…</button></span></div>
+<div class="row-item route-lane" role="listitem"><span class="mono">opus-batch</span><span aria-hidden="true">→</span><span><span class="tag warn">Not matched</span> <label class="sr-only" for="lane-ob">Account for opus-batch</label><select id="lane-ob"><option>Choose an account…</option><option>Claude main</option><option>Claude second</option></select></span><span class="route-act"><button type="button" class="sm primary">Save</button></span></div>
+</div></div>
+<p class="set-help">A limit on one lane closes every lane on the same account. A lane that isn't matched is never guessed; conversations are told a limit came from an unmatched lane.</p>
+</div></div>
+
+<div class="section-card">
+<div class="section-head">Routing table file</div>
+<div class="section-body">
+<div class="rows"><div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name mono">~/…/routing/ROUTING-NOW.md</span><span class="set-help">Read only. Khipu notes when its NOW block changes; it never takes an account's state from it. After you switch over, Khipu writes only its own part and your hand-written lines stay.</span></span><span class="route-val">NOW block changed 9:20 AM</span><button type="button" class="sm" aria-label="Change the routing table file">Change…</button></div></div>
+</div></div>
+
+<div class="section-card">
+<div class="section-head">Copy for cloud agents</div>
+<div class="opt-list">
+<div class="opt-row"><input id="cloud-copy" class="switch" type="checkbox" role="switch" aria-describedby="cloud-copy-tag cloud-copy-what"><div class="opt-text"><div class="opt-title"><label class="opt-name" for="cloud-copy">Keep a copy for cloud agents</label><span class="tag " id="cloud-copy-tag">Comes later</span></div><p id="cloud-copy-what" class="opt-what">Lets Grok Bot, other cloud agents and a second Mac ask what is open. Account names only; no folders or sign-in homes.</p></div></div>
+<div class="opt-row"><input id="cloud-holds" class="switch" type="checkbox" role="switch" aria-describedby="cloud-holds-what"><div class="opt-text"><div class="opt-title"><label class="opt-name" for="cloud-holds">Include the words of holds</label></div><p id="cloud-holds-what" class="opt-what">Off: cloud agents see a hold's kind and end, not its words.</p></div></div>
+<div class="opt-row"><input id="cloud-rules" class="switch" type="checkbox" role="switch" aria-describedby="cloud-rules-what"><div class="opt-text"><div class="opt-title"><label class="opt-name" for="cloud-rules">Include your standing rules and your note</label></div><p id="cloud-rules-what" class="opt-what">A separate choice from the hold words.</p></div></div>
+</div>
+<div class="section-body"><div class="rows">
+<div class="row-item route-limit"><span class="route-limit-text"><span class="route-limit-name" id="lim-cloud">Mark the copy out of date after</span><span class="set-help">Readers are told this Mac has not reported since then.</span></span><span class="route-val">10 minutes</span><button type="button" class="sm" aria-label="Change when the copy is out of date">Change…</button></div>
+</div></div></div>
+
+<div class="section-card">
+<div class="section-head">Recent changes</div>
+<div class="section-body route-days">
+<div class="rows"><h3 class="rows-head route-day" id="day-today">Today</h3><div role="list" aria-labelledby="day-today">
+<div class="row-item route-event" role="listitem"><span class="row-meta">11:36 AM</span><span class="row-main"><b>Claude main</b> limit reached, back at 1:52 PM <span class="t2">(was open; five-hour limit used up)</span></span><span class="route-who">Claude's plan check</span></div>
+<div class="row-item route-event" role="listitem"><span class="row-meta">11:31 AM</span><span class="row-main"><b>Claude second</b> reported open; the limit still shows <span class="t2">(sources disagree)</span></span><span class="route-who">A Claude Code conversation in project-b</span></div>
+<div class="row-item route-event" role="listitem"><span class="row-meta">11:13 AM</span><span class="row-main"><b>Claude second</b> limit reached, back at 2:52 PM <span class="t2">(from Claude's own message)</span></span><span class="route-who">Your Project A job runner</span></div>
+<div class="row-item route-event" role="listitem"><span class="row-meta">10:57 AM</span><span class="row-main"><b>Codex</b> open again <span class="t2">(its limit ended at 10:55 AM; checked just after)</span></span><span class="route-who">Reset check</span></div>
+<div class="row-item route-event" role="listitem"><span class="row-meta">10:45 AM</span><span class="row-main"><b>Muse</b> limit reached, back Sat 8:00 PM <span class="t2">(weekly allowance)</span></span><span class="route-who">A Claude Code conversation in project-a</span></div>
+<div class="row-item route-event" role="listitem"><span class="row-meta">10:05 AM</span><span class="row-main"><b>Standing rule 7</b> confirmed</span><span class="route-who">You, in Settings</span></div>
+<div class="row-item route-event" role="listitem"><span class="row-meta">9:40 AM</span><span class="row-main"><b>Hold</b> on this Mac: machine busy, ends tomorrow 9:40 AM</span><span class="route-who">A Claude Code conversation in project-a</span></div>
+<div class="row-item route-event" role="listitem"><span class="row-meta">9:20 AM</span><span class="row-main"><b>Routing table</b> NOW block changed <span class="t2">(stamped by the Project A orchestrator)</span></span><span class="route-who">Your routing table</span></div>
+<div class="row-item route-event" role="listitem"><span class="row-meta">8:47 AM</span><span class="row-main"><b>Codex</b> limit reached, back about 10:55 AM <span class="t2">(a guess: reported by a conversation)</span></span><span class="route-who">A Claude Code conversation in Khipu</span></div>
+</div></div>
+<div class="rows"><h3 class="rows-head route-day" id="day-yest">Yesterday</h3><div role="list" aria-labelledby="day-yest">
+<div class="row-item route-event" role="listitem"><span class="row-meta">7:22 PM</span><span class="row-main"><b>Claude main</b> open again <span class="t2">(was at its limit)</span></span><span class="route-who">Claude's plan check</span></div>
+<div class="row-item route-event" role="listitem"><span class="row-meta">6:05 PM</span><span class="row-main"><b>Grok Build</b> paused until Friday, 9:00 AM</span><span class="route-who">You, in Settings</span></div>
+<div class="row-item route-event" role="listitem"><span class="row-meta">4:10 PM</span><span class="row-main"><b>Hold</b> on all work ended <span class="t2">(disk low; it reached its end)</span></span><span class="route-who">Khipu</span></div>
+<div class="row-item route-event" role="listitem"><span class="row-meta">1:30 PM</span><span class="row-main"><b>Muse</b> cleared <span class="t2">(was down)</span></span><span class="route-who">You, in Settings</span></div>
+</div></div>
+</div></div>
+</div>
+</div>
+</div>
+</section></main></div></div></body></html>

@@ -1,0 +1,86 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Khipu Home mock: Routing</title><link rel="stylesheet" href="App.css"><link rel="stylesheet" href="mock.css"></head>
+<body><div id="root"><div class="shell">
+<nav class="rail" aria-label="Primary"><div class="rail-drag"></div>
+<div class="brand"><img class="brand-icon" src="../../../apps/desktop/src/assets/khipu-icon.png" width="26" height="26" alt=""><span class="brand-name">Khipu</span></div>
+<div class="rail-nav"><div class="nav-group">
+<button type="button" class="nav active" aria-current="page"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 8 4l5 4.5V13H3z"/></svg><span class="nav-label">Home</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4"/><path d="m10 10 3.5 3.5"/></svg><span class="nav-label">Recall</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h10M3 8h7M3 12h5"/><path d="m11 11 1.5 1.5L15 10"/></svg><span class="nav-label">Owed</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></svg><span class="nav-label">Activity</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v3M11 3v3M3 6h10v3a5 5 0 0 1-10 0z"/><path d="M8 11v3"/></svg><span class="nav-label">Harnesses</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h10M3 11h10"/><circle cx="6" cy="5" r="1.5"/><circle cx="10" cy="11" r="1.5"/></svg><span class="nav-label">Settings</span></button>
+</div></div>
+<div class="rail-foot"><div class="rail-health"><span class="hdot ok" aria-hidden="true"></span><span>All harnesses recording</span></div>
+<div class="rail-meta"><button type="button" class="rail-feedback">Feedback</button><span class="version-chip">v0.4.14</span></div></div></nav>
+<main class="main"><section class="panel"><header class="panel-head"><div class="panel-head-text"><h1>Home</h1><p class="lede">Is memory working right now?</p></div><div class="panel-head-actions"><button type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>Refresh</button></div></header>
+<div class="panel-body wide">
+<div class="callout warn stripe warn"><div class="txt"><b>A plan is nearly used up</b><span>Claude main Max five-hour at 100%, resets Wed 1:52 PM. Work sent to it may be refused until it resets.</span></div><div class="cta"><button type="button" class="sm">Details</button></div></div>
+<div class="callout ok"><div class="txt"><b>Everything is recording and in sync</b><span>41 checks passed, 3 not configured on this Mac.</span></div><div class="cta"><button type="button" class="sm">Details</button></div></div>
+<div class="card">
+<div class="card-head">Right now<span class="spacer"></span><button type="button" class="sm">Capture now</button></div>
+<div class="row"><span class="hdot ok" aria-hidden="true"></span><span class="grow ellip t2">Claude Code</span><span class="meta">nothing waiting · last capture 4 min ago</span></div>
+<div class="row"><span class="hdot ok" aria-hidden="true"></span><span class="grow ellip t2">Codex</span><span class="meta">1 turn waiting for capture · last capture 22 min ago</span></div>
+<div class="row"><span class="hdot ok" aria-hidden="true"></span><span class="grow ellip t2">Cursor</span><span class="meta">nothing waiting · last capture 19 min ago</span></div>
+<div class="row"><span class="hdot ok" aria-hidden="true"></span><span class="grow ellip t2">Grok Build</span><span class="meta">nothing waiting · last capture 1 h ago</span></div>
+<div class="row"><span class="meta">Queue depth 1 · captured today 37</span></div>
+</div>
+<div class="card plans-card">
+<div class="card-head">Plans<span class="spacer"></span><button type="button" class="sm"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>Refresh</button></div>
+<div class="row plan-row"><span class="plan-name ellip">Claude main<span class="meta"> max</span></span><span class="plan-meter err" role="meter" aria-label="Claude main Max five-hour" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100" aria-valuetext="100% used"><i style="width:100%"></i></span><span class="plan-pct err">100%</span><span class="plan-when meta">five-hour · resets Wed 1:52 PM</span><span class="plan-tags"></span></div>
+<div class="row plan-row"><span class="plan-name ellip">Claude second<span class="meta"> max</span></span><span class="plan-none t2">no plan limits reported</span><span class="plan-tags"></span></div>
+<div class="row plan-row"><span class="plan-name ellip">Codex<span class="meta"> pro</span></span><span class="plan-meter" role="meter" aria-label="Codex Pro week" aria-valuemin="0" aria-valuemax="100" aria-valuenow="58" aria-valuetext="58% used"><i style="width:58%"></i></span><span class="plan-pct">58%</span><span class="plan-when meta">week · resets Sun 8:00 PM</span><span class="plan-tags"></span></div>
+<div class="row plan-row"><span class="plan-name ellip">Grok Build<span class="meta"> SuperGrok Heavy</span></span><span class="plan-meter" role="meter" aria-label="Grok Build SuperGrok Heavy week" aria-valuemin="0" aria-valuemax="100" aria-valuenow="34" aria-valuetext="34% used"><i style="width:34%"></i></span><span class="plan-pct">34%</span><span class="plan-when meta">week · resets Mon 7:00 PM</span><span class="plan-tags"></span></div>
+<div class="row plan-row"><span class="plan-name ellip">Muse</span><span class="plan-meter" role="meter" aria-label="Muse five-hour" aria-valuemin="0" aria-valuemax="100" aria-valuenow="12" aria-valuetext="12% used"><i style="width:12%"></i></span><span class="plan-pct">12%</span><span class="plan-when meta">five-hour · resets Wed 1:31 PM</span><span class="plan-tags"><span class="tag">as of the last turn, 2 h ago</span></span></div>
+</div>
+<div class="card routing-card">
+<div class="card-head">Routing<span class="spacer"></span><button type="button" class="sm link">Routing settings</button></div>
+<div role="list" aria-label="Accounts">
+<div class="row route-row" role="listitem"><span class="ellip">Claude main</span><span class="route-state"><span class="hdot warn" aria-hidden="true"></span>Limit reached, back at 1:52 PM</span><span class="route-src">Read from Claude 4 min ago · Khipu checks again at 1:54 PM</span><span class="route-act"><button type="button" class="sm" aria-label="Check Claude main now">Check now</button></span></div>
+<div class="row route-row" role="listitem"><span class="ellip">Claude second</span><span class="route-state"><span class="hdot warn" aria-hidden="true"></span>Limit reached, back at 2:52 PM</span><span class="route-src">From Claude's own message, seen by your Project A job runner 27 min ago · can't be checked without using a turn</span><span class="route-act"></span></div>
+<div class="row route-row" role="listitem"><span class="ellip">Codex</span><span class="route-state"><span class="hdot ok" aria-hidden="true"></span>Open</span><span class="route-src">Read from Codex 4 min ago · 58% of its week used</span><span class="route-act"></span></div>
+<div class="row route-row" role="listitem"><span class="ellip">Grok Build</span><span class="route-state"><span class="hdot" aria-hidden="true"></span>Paused by you until Friday, 9:00 AM</span><span class="route-src">Set by you yesterday at 6:05 PM</span><span class="route-act"></span></div>
+<div class="row route-row" role="listitem"><span class="ellip">Muse</span><span class="route-state"><span class="hdot warn" aria-hidden="true"></span>Limit reached, back Sat 8:00 PM</span><span class="route-src">Reported by a Claude Code conversation in project-a at 10:45 AM · can't be checked without using a turn</span><span class="route-act"></span></div>
+</div>
+<div class="route-sub"><h2 class="route-sub-head" id="holds-h">Holds</h2>
+<ul class="route-holds" aria-labelledby="holds-h">
+<li class="route-hold"><span>This Mac</span><span>No new launches while the Mac is busy (load over 75)</span><span class="route-src">Ends tomorrow 9:40 AM · set by a Claude Code conversation in project-a</span></li>
+<li class="route-hold"><span>Muse</span><span>Keep it for second-opinion reviews</span><span class="route-src">Ends Sat 8:00 PM · set by you yesterday</span></li>
+</ul></div>
+<div class="route-sub"><h2 class="route-sub-head">Your note to every conversation<span class="meta"> · Oct 13, shown word for word after your rules</span></h2>
+<blockquote class="route-quote">“We don't need cursor. Just grok. Secondary account for Claude too until that's canceled.”</blockquote></div>
+<div class="row route-rules"><details class="disclose"><summary class="disclosure"><svg class="disclosure-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg><span>7 standing rules, shown first to every conversation<span class="tag">6 to confirm in Settings</span></span></summary>
+<div class="disclose-body"><ol>
+<li>Grok never builds or fixes privacy or safety code.</li>
+<li>Every Grok result that is acted on gets a re-check from a different model family.</li>
+<li>Never a -fast tier.</li>
+<li>Never the paid xAI API.</li>
+<li>Khipu runs in Aegis only through Aegis's own pack, never through a Claude or other vendor import.</li>
+<li>Never send what is in API Keys or My Portfolio to Codex or Grok.</li>
+<li>Khipu's routing record is guidance, not a gate: an orchestrator with better live information may route differently, and says why.</li>
+</ol></div></details></div>
+<div class="row route-foot"><span class="meta">Khipu reports this; your agents decide where work goes.</span></div>
+</div>
+<div class="tiles">
+<div class="tile"><div class="label">Database</div><div class="value">Connected</div><div class="sub">Offline copy 6 min ago</div></div>
+<div class="tile"><div class="label">Recording</div><div class="value">4 of 4</div><div class="sub">Claude Code · Codex · Cursor · Grok Build</div></div>
+<div class="tile"><div class="label">Search index</div><div class="value">99.8%</div><div class="sub">Everything indexed</div></div>
+<div class="tile"><div class="label">Backups</div><div class="value">Fresh</div><div class="sub">Database 9 h ago · off-site copy 9 h ago</div></div>
+</div>
+<div class="cols">
+<div class="card col">
+<div class="card-head">Recent captures<span class="spacer"></span><button type="button" class="link sm">Open Activity</button></div>
+<div class="row"><span class="hdot ok" aria-hidden="true"></span><span class="meta">11:36 AM</span><span class="tag">Khipu</span><span class="grow ellip t2">Routing mocks: Home card, Settings page and the two-sources case</span></div>
+<div class="row"><span class="hdot ok" aria-hidden="true"></span><span class="meta">11:18 AM</span><span class="tag">Khipu</span><span class="grow ellip t2">Plan usage phase 2 fix round 3 gated and merged</span></div>
+<div class="row"><span class="hdot ok" aria-hidden="true"></span><span class="meta">10:41 AM</span><span class="tag">Project A</span><span class="grow ellip t2">Job runner: Muse stopped answering, retried twice</span></div>
+<div class="row"><span class="hdot ok" aria-hidden="true"></span><span class="meta">9:57 AM</span><span class="tag">Khipu</span><span class="grow ellip t2">Owner: Khipu does not route, it reports</span></div>
+</div>
+<div class="card col">
+<div class="card-head">Needs you<span class="spacer"></span><button type="button" class="link sm">Open Owed</button></div>
+<div class="row"><span class="tag kind warn">Blocker</span><span class="grow ellip t2">Approve the routing mocks before the build starts</span><span class="meta">12 min ago</span></div>
+<div class="row"><span class="tag kind">Question</span><span class="grow ellip t2">Should Grok Build get changes before its next tool use?</span><span class="meta">2 days ago</span></div>
+<div class="row"><span class="tag kind">Follow-up</span><span class="grow ellip t2">Read the 2026-10-15 nightly log for the backfill line</span><span class="meta">1 day ago</span></div>
+</div>
+</div>
+</div>
+</section></main></div></div></body></html>
