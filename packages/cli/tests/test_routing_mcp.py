@@ -168,7 +168,7 @@ def test_an_owners_hold_and_a_claimed_author_or_basis_are_refused(home):
                                                       "text": "keep it", **extra})
         assert is_error and "Khipu sets who wrote this" in body["error"], extra
     is_error, body = _call("khipu_route_report", {"state": "open", "account": "Codex", "cwd": "/elsewhere"})
-    assert is_error and "takes no 'cwd'" in body["error"]
+    assert is_error and "takes no argument by that name" in body["error"] and "/elsewhere" not in body["error"]
     assert _events() == []
     # An owner's hold can't be ended from a conversation either.
     routing.add_hold("keep Claude second for reviews", reason="keep", scope="account", account="Claude second",
@@ -239,8 +239,10 @@ def test_khipu_route_returns_the_words_the_push_leaves_out(home, monkeypatch):
     assert _route(since=str(first))["entities"] == []
     _report(state="open", account="Codex")
     after = _route(since=f"{view['epoch']}:{first}")
-    assert after["complete"] is True and after["entities"] == ["account:codex|"]
-    assert _route(since="0", account="Codex")["entities"] == ["account:codex|"]
+    codex_id = routing.account_id("codex|")
+    assert after["complete"] is True and after["entities"] == [f"account:{codex_id}"]
+    assert _route(since="0", account="Codex")["entities"] == [f"account:{codex_id}"]
+    assert _route(since="0", account=codex_id)["entities"] == [f"account:{codex_id}"]
 
 
 def test_khipu_route_takes_the_same_privacy_path_as_the_cli(home, capsys):
@@ -451,13 +453,14 @@ def test_no_khipu_route_answer_carries_a_path_on_this_mac(home):
             for path in forbidden:
                 assert path not in text, (path, text)
     third = next(a for a in first["accounts"] if a["label"] == "Claude third")
-    assert "home" not in third and third["key"] == "Claude third"
+    assert "home" not in third and "key" not in third and third["id"].startswith("acct-")
     assert all("path" not in r for r in first["sources"]["runners"])
     assert "path" not in first["sources"]["table"]
-    assert first["holds"][-1]["scope"]["account"] == "Claude third"
-    assert "account:Claude third" in _route(since="-1")["entities"]
-    # The label the answer gives is one khipu_route_report takes back.
-    _report(state="open", account=third["key"])
+    assert first["holds"][-1]["scope"]["account"] == third["id"]
+    assert f"account:{third['id']}" in _route(since="-1")["entities"]
+    # The id the answer gives is one khipu_route and khipu_route_report take back.
+    assert [a["id"] for a in _route(account=third["id"])["accounts"]] == [third["id"]]
+    assert _report(state="open", account=third["id"])["label"] == "Claude third"
 
 
 def _hold_the_routing_lock(home):
@@ -597,19 +600,25 @@ def _private_accounts(home, *, deep: bool = False):
 
 def test_no_khipu_route_report_answer_carries_a_path_on_this_mac(home):
     # R2-1: a write's answer goes back to the conversation as a read's does,
-    # with each login folder's key given as the account's label.
+    # each account by its id and its label, never its key.
     private = _private_accounts(home)
     answers = [_report(state="limited", account="Claude third", message="x"),
                _report(state="open", account="Claude second"),
-               _report(state="limited", account="claude|" + str(private / ".claude-third"), until="1h"),
                _report(action="hold", scope="account", account="Claude third", reason="keep", text="keep it")]
+    # A key or a login folder is not a name a conversation can give: it
+    # could test guesses of the owner's folders against the record.
+    for named in ("claude|" + str(private / ".claude-third"), str(private / ".claude-third")):
+        is_error, body = _call("khipu_route_report", {"state": "limited", "account": named, "until": "1h"})
+        assert is_error and str(home["tmp"]) not in body["error"], body
+        answers.append(body)
     hold_id = _route()["holds"][0]["id"]
     answers.append(_report(action="end_hold", hold_id=hold_id))
     for answer in answers:
         for text in _strings(answer):
             for path in (str(home["tmp"]), "/logins/claude-second", "/logins"):
                 assert path not in text, (path, text)
-    assert answers[0]["account"] == "Claude third" and answers[1]["account"] == "Claude second"
+    assert answers[0]["label"] == "Claude third" and answers[1]["label"] == "Claude second"
+    assert answers[0]["account"] == routing.account_id("claude|" + str(private / ".claude-third"))
     # The record keeps the key; only the answer gives the label.
     assert _events()[0]["account"] == "claude|" + str(private / ".claude-third")
 
@@ -849,3 +858,108 @@ def test_a_server_started_in_the_home_folder_names_no_project(home, monkeypatch)
     project.mkdir(parents=True)
     monkeypatch.chdir(project)
     assert routing.conversation_author()["project"] == "proj-q"
+
+
+# ---- fix round 4 ---------------------------------------------------------------------------
+
+
+def _outside_owner_words(text: str, needle: str, owner_words: list[str]) -> bool:
+    """Whether ``needle`` stands in ``text`` anywhere but inside a whole
+    occurrence of one of the owner's own texts."""
+    covered = []
+    for words in owner_words:
+        start = text.find(words)
+        while words and start != -1:
+            covered.append((start, start + len(words)))
+            start = text.find(words, start + 1)
+    at = text.find(needle)
+    while at != -1:
+        if not any(a <= at and at + len(needle) <= b for a, b in covered):
+            return True
+        at = text.find(needle, at + 1)
+    return False
+
+
+def test_no_mcp_answer_holds_a_configured_path_or_an_account_key(home):
+    # R4-1: every answer a conversation gets is built from a projection that
+    # never holds an account key, a login folder, a runner folder or the
+    # table's path; only the owner's own words may, shown whole.
+    private = home["tmp"] / "Users" / "someone"
+    runner = private / "runnerA"
+    (runner / "state").mkdir(parents=True)
+    table = private / "ROUTING-NOW.md"
+    table.write_text("NOW\n")
+    where = str(private / ".claude-third")
+    (home["data"] / "config.json").write_text(json.dumps({
+        "usage_accounts": ACCOUNTS + [{"label": "Claude third", "harness": "claude", "home": where}],
+        "routing_sources": [{"name": "lanes", "kind": "lanes", "path": str(runner)}],
+        "routing_table": str(table)}))
+    keys = [a["key"] for a in routing.accounts()]
+    assert "claude|" + where in keys
+    forbidden = [where, "/logins/claude-second", str(runner), str(table), *keys]
+    note = f"Claude third ({where}) is kept for reviews."
+    owner_hold = ".claude-third"  # the owner's words, a piece of a login folder
+    assert owner_hold in where
+    answers: list = []
+
+    def read_all():
+        first = _route()
+        answers.extend([first, _route(account="Claude third"), _route(account=routing.account_id(keys[0])),
+                        _route(since="0"), _route(since="0", account="Claude third"),
+                        _route(since=f"{first['epoch']}:{max(0, first['version'] - 1)}"),
+                        ms._routing_light(), routing.light_status()])
+
+    answers.append(_report(state="limited", account="Claude third", message="x",
+                           evidence=f"saw it in {where}/x.log", name=f"runner at {where}"))
+    read_all()
+    answers.append(_report(action="hold", scope="account", account="Claude third", reason="keep",
+                           text=f"keep {where} for reviews"))
+    read_all()
+    routing.set_note(note, via="app")
+    read_all()
+    routing.add_hold(owner_hold, reason="keep", scope="account", account="Claude third", owner=True, via="app")
+    read_all()
+    answers.append(_route(since="0"))
+    # Error answers: a name that is a key, a path, and a failure whose text names one.
+    for named in ("claude|" + where, where):
+        answers.append(_call("khipu_route", {"account": named})[1])
+        answers.append(_call("khipu_route_report", {"state": "open", "account": named})[1])
+    with mock.patch.object(routing, "read_view", side_effect=RuntimeError(f"broke reading {where} {table}")):
+        answers.append(_call("khipu_route", {})[1])
+        answers.append(_call("khipu_route_report", {"action": "end_hold", "hold_id": "h-x"})[1])
+    owner_words = [note, owner_hold]
+    for answer in answers:
+        for text in _strings(answer):
+            for needle in forbidden:
+                assert not _outside_owner_words(text, needle, owner_words), (needle, text)
+    # The owner's words are whole in every answer that carries them.
+    view = _route()
+    assert view["note"]["text"] == note and note in routing.light_status()["text"]
+    held = next(h for h in view["holds"] if h["owner"])
+    assert held["text"] == owner_hold and f"“{owner_hold}”" in held["line"]
+    third = next(a for a in view["accounts"] if a["label"] == "Claude third")
+    assert held["scope"] == {"kind": "account", "account": third["id"]}
+
+
+def test_a_down_report_after_khipus_own_read_voids_its_confirmation(home):
+    # R4-2: Khipu's read is the confirmation only while nothing newer has
+    # said the account is not open: a limit or a down, from any source.
+    fake = FakeTime(home["clock"])
+    _probe_open(home)
+    home["clock"].advance(seconds=1)
+    out = routing.wait("Codex", confirmed=True, timeout=0, sleep=fake.sleep, clock=fake.monotonic)
+    assert out["open"] is True, out
+    home["clock"].advance(seconds=30)
+    _report(state="down", account="Codex", message="Codex is out of service")
+    home["clock"].advance(seconds=30)
+    _report(state="open", account="Codex")
+    out = routing.wait("Codex", confirmed=True, timeout=0, sleep=fake.sleep, clock=fake.monotonic)
+    assert out["open"] is False and out["state"] == "open", out
+    view = _route(account="Codex")
+    assert view["accounts"][0]["confirmed_at"] is None
+    # A new read of Khipu's own, after the down, confirms it again.
+    home["clock"].advance(seconds=30)
+    _probe_open(home)
+    home["clock"].advance(seconds=1)
+    out = routing.wait("Codex", confirmed=True, timeout=0, sleep=fake.sleep, clock=fake.monotonic)
+    assert out["open"] is True, out

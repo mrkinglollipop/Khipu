@@ -717,7 +717,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "since": {"type": "string",
                           "description": "Only what changed after this version (V or epoch:V)"},
-                "account": {"type": "string", "description": "One account: its label, or harness|login folder"},
+                "account": {"type": "string", "description": "One account: its label or its id, as khipu_route lists them"},
             },
         },
     },
@@ -745,7 +745,7 @@ TOOLS: list[dict] = [
                            "description": "Default report"},
                 "state": {"type": "string", "enum": ["limited", "open", "down"], "description": "report: the state"},
                 "account": {"type": "string",
-                            "description": "The account (its label, as khipu_route shows it, or harness|login folder)"},
+                            "description": "The account: its label or its id, as khipu_route lists them"},
                 "runner": {"type": "string", "description": "report, with lane: a job runner's lane the lane map names"},
                 "lane": {"type": "string"},
                 "until": {"type": "string", "description": "When the limit or hold ends (a time, or 30m, 2h)"},

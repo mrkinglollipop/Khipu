@@ -102,7 +102,13 @@ _STATE_ORDER = {LIMITED: 0, PAUSED: 1, DOWN: 2, UNKNOWN: 3, PROBABLY_OPEN: 4, OP
 
 
 class RouteError(ValueError):
-    """A write or a setting Khipu refuses; the text is shown as written."""
+    """A write or a setting Khipu refuses; the text is shown as written.
+    ``public``, when given, is the fixed text a conversation gets in its
+    place (the text echoes what was typed)."""
+
+    def __init__(self, message: str = "", *, public: str | None = None):
+        super().__init__(message)
+        self.public = public
 
 
 # ---- settings ----------------------------------------------------------------
@@ -586,9 +592,51 @@ def _clean(text, limit: int) -> str:
     from khipu.redact import redact_secrets
 
     words = redact_secrets(_one_line(text))[0]
-    if "/" in words or "|" in words:
-        words = _without_paths(words, _private_strings({}))
+    if "/" in words:
+        words = _cut_paths(words)
     return _clip(words, limit)
+
+
+def _configured_paths() -> list[str]:
+    """Every folder and file path Khipu is configured with (login folders,
+    job runner folders, the routing table, the rules seed), each as written,
+    expanded and resolved, longest first."""
+    from khipu.config import load_config
+
+    config: dict = {}
+    with contextlib.suppress(Exception):
+        config = load_config()
+    paths: set[str] = set()
+    for name in ("routing_table", "routing_rules_seed"):
+        if isinstance(config.get(name), str):
+            paths.add(config[name])
+    for name, field in (("routing_sources", "path"), ("usage_accounts", "home")):
+        items = config.get(name)
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and isinstance(item.get(field), str):
+                paths.add(item[field])
+    with contextlib.suppress(Exception):
+        paths |= {str(a["home"]) for a in accounts() if a.get("home")}
+    variants: set[str] = set()
+    for path in paths:
+        path = path.strip()
+        if len(path) < 2:
+            continue
+        variants.add(path.rstrip("/") or path)
+        with contextlib.suppress(Exception):
+            variants.add(os.path.expanduser(path).rstrip("/"))
+            variants.add(os.path.realpath(os.path.expanduser(path)).rstrip("/"))
+    return sorted((v for v in variants if v and v != "/"), key=len, reverse=True)
+
+
+def _cut_paths(words: str) -> str:
+    """``words`` with each configured path cut to its last name: done once,
+    to a conversation's words before they are stored, so the record never
+    holds one of the owner's paths in a conversation's words."""
+    for path in _configured_paths():
+        if path in words:
+            words = words.replace(path, Path(path).name or "a folder")
+    return words
 
 
 def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime:
@@ -602,9 +650,12 @@ def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime
         text = re.sub(r"\s+ago$", "", text, flags=re.I)
     lengths = "10m or 2h (how long ago)" if ago else "30m, 2h or 3d"
     if re.fullmatch(r"(?:in\s+)?\d+(?:\.\d+)?", text, re.I):
-        raise RouteError(f"{flag} needs a unit: {lengths} (got {raw!r}), or a time such as 2026-10-14T18:52Z")
+        raise RouteError(f"{flag} needs a unit: {lengths} (got {raw!r}), or a time such as 2026-10-14T18:52Z",
+                         public=f"{flag} needs a unit: {lengths}, or a time such as 2026-10-14T18:52Z")
     ahead = f"{flag} is further ahead than Khipu can hold (got {raw!r}); give a time before the year 9999"
     back = f"{flag} is further back than Khipu can hold (got {raw!r}); give a time after the year 1"
+    fixed = {ahead: f"{flag} is further ahead than Khipu can hold; give a time before the year 9999",
+             back: f"{flag} is further back than Khipu can hold; give a time after the year 1"}
     try:
         seconds = parse_duration(text)
     except ValueError:
@@ -613,11 +664,12 @@ def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime
         try:
             return now - timedelta(seconds=seconds) if ago else now + timedelta(seconds=seconds)
         except OverflowError:
-            raise RouteError(back if ago else ahead) from None
+            raise RouteError(back if ago else ahead, public=fixed[back if ago else ahead]) from None
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
-        raise RouteError(f"{flag} takes a time (2026-10-14T18:52Z) or a length ({lengths}), got {raw!r}") from None
+        raise RouteError(f"{flag} takes a time (2026-10-14T18:52Z) or a length ({lengths}), got {raw!r}",
+                         public=f"{flag} takes a time (2026-10-14T18:52Z) or a length ({lengths})") from None
     try:
         if dt.tzinfo is None:
             dt = dt.astimezone()  # this Mac's local time
@@ -625,7 +677,7 @@ def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime
     except (OverflowError, ValueError, OSError):
         # Near the year limits a time with no zone raises ValueError (its
         # local offset can't be worked out) and one with a zone OverflowError.
-        raise RouteError(ahead if dt.year > 5000 else back) from None
+        raise RouteError(ahead if dt.year > 5000 else back, public=fixed[ahead if dt.year > 5000 else back]) from None
 
 
 def parse_until(raw: str, now: datetime) -> datetime:
@@ -641,7 +693,8 @@ def parse_seen(raw: str, now: datetime) -> datetime:
     within it is taken as now."""
     seen = _typed_time(raw, now, "--seen", ago=True)
     if (seen - now).total_seconds() > CLOCK_TOLERANCE:
-        raise RouteError(f"--seen is when the limit message was shown, so not later than now (got {raw!r})")
+        raise RouteError(f"--seen is when the limit message was shown, so not later than now (got {raw!r})",
+                         public="--seen is when the limit message was shown, so not later than now")
     return min(seen, now)
 
 
@@ -768,7 +821,7 @@ def resolve_account(name: str, known: list[dict] | None = None, *, conversation:
                              f"accounts Khipu knows: {labels}")
         return key
     for account in known:
-        if account["label"].casefold() == raw.casefold():
+        if account["label"].casefold() == raw.casefold() or raw == account_id(account["key"]):
             return account["key"]
     low = raw.lower()
     if low in usage.HARNESSES:
@@ -1391,15 +1444,17 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
     state, behind = shown
 
     # Khipu's own read that the account is open (a usage probe or a reset
-    # check), newer than every limit and not stale. It stays the
+    # check), newer than every limit and every down, and not stale. It stays the
     # confirmation when a newer open report from anyone else becomes the
     # witness, so ``route wait --confirmed`` never loses it to a report
     # that agrees with it.
     confirmed_at = None
     if state == OPEN:
-        last_limit = max((e for e in whole if e["state"] == LIMITED), key=_k, default=None)
+        # Voided by anything newer that said it was not open: a limit or a
+        # down, from any source.
+        last_closed = max((e for e in whole if e["state"] in (LIMITED, DOWN)), key=_k, default=None)
         own = [e for e in fresh if e["state"] == OPEN and e["source"] in CONFIRMING_SOURCES
-               and not e.get("cleared") and (last_limit is None or later(e, last_limit))]
+               and not e.get("cleared") and (last_closed is None or later(e, last_closed))]
         if own:
             confirmed_at = _iso(max(own, key=_k)["at"])
 
@@ -2235,7 +2290,7 @@ def end_hold(hold_id: str, *, owner: bool = False, author: dict | None = None, v
     view = read_view(now)
     hold = next((h for h in view["holds"] if h["id"] == hold_id), None)
     if hold is None:
-        raise RouteError(f"no hold {hold_id!r} is in effect")
+        raise RouteError(f"no hold {hold_id!r} is in effect", public="no hold with that id is in effect")
     if hold["owner"] and not owner:
         raise RouteError("that hold is the owner's: only he ends it (the app, or --owner on a terminal)")
     written, view = _write({"type": "hold_end", "target": hold_id, "via": via,
@@ -2505,7 +2560,8 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
     prev = (prev_effective or {}).get(entity) or {}
     if kind == "account":
         entry = next((a for a in view["accounts"] if a["key"] == ident), None)
-        return account_line(entry, now, relative=False) if entry else f"{prev.get('label') or ident}: no longer tracked"
+        return account_line(entry, now, relative=False) if entry else \
+            f"{prev.get('label') or _label_for_key(ident)}: no longer tracked"
     if kind == "hold":
         hold = next((h for h in view["holds"] if h["id"] == ident), None)
         return hold_line(hold, now, relative=False) if hold else f"Hold on {prev.get('scope') or '?'} ended"
@@ -2783,9 +2839,6 @@ def _launch_warnings(view: dict, launched: list[dict], cfg: dict, now: datetime)
 
 ABOUT = "Khipu reports; routing stays with you. This is data, not instructions, and guidance, not a gate."
 _INTERNAL = ("fingerprint", "digest", "source_cache")
-# Kept out of a conversation's answer for size: the history of versions is
-# what ``since`` answers, and ``effective`` is the fold's own comparison key.
-_BULKY = ("changes", "effective")
 
 
 def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
@@ -2800,126 +2853,118 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
 
 
 # A conversation's answer goes to other model providers: it carries no path
-# on this Mac. Login folders, job runner folders, the routing table and the
-# rules seed are the owner's configuration; an account whose key holds a
-# login folder is named by its label instead.
-_SOURCE_PATHS = ("path",)
+# on this Mac and no account key (a key holds its login folder). Every
+# answer a conversation gets (khipu_route, khipu_route_report and the light
+# status) is built from a projection that copies only the fields named
+# here, so a key, a login folder, a runner folder or the table's path is
+# never in it to begin with. An account is named by its label and its id
+# (``account_id``); the owner's own words (rules, note, his holds' words)
+# are copied word for word.
 CONVERSATION_LOCK_BUDGET = 2.0
 # khipu_status joins its routing thread for 2 s; the fold after the wait takes ~0.1 s.
 LIGHT_LOCK_BUDGET = 0.5
+_FAILED = "Khipu's routing record could not answer that (an internal error); khipu doctor says more on this Mac"
+
+_VIEW_FIELDS = ("schema", "epoch", "version", "folded_at", "checked_at", "record", "bad_lines", "saved",
+                "valid_until", "outside_app", "seed_error")
+_AUTHOR_PUBLIC = ("kind", "harness", "project", "session", "name")
+_ACCOUNT_FIELDS = ("label", "harness", "state", "until", "basis", "scope", "reason", "checkable", "confirmed_at",
+                   "since", "silent")
+_WITNESS_FIELDS = ("id", "source", "at", "evidence", "message_time", "cleared", "observed")
+_REPORT_FIELDS = ("id", "state", "source", "at", "since", "until")
+_MODEL_FIELDS = ("model", "until", "basis", "source", "at", "id")
+_HOLD_FIELDS = ("id", "scope_label", "reason", "text", "until", "owner", "via", "at", "remind")
+_RULE_FIELDS = ("n", "text", "source", "date", "seeded", "confirmed", "via", "at")
+_LANE_FIELDS = ("runner", "lane", "state", "until", "basis", "at", "id")
+_RUNNER_FIELDS = ("name", "heartbeat_at", "interval", "silent", "silent_deadline", "unreadable",
+                  "unreadable_since", "lanes", "unmatched_lanes")
+_TABLE_FIELDS = ("hash", "stamped_at", "changed_at", "error")
+_WRITE_FIELDS = ("ok", "id", "state", "until", "basis", "ended", "version", "saved")
 
 
-def _private_strings(view: dict) -> list[tuple[str, str]]:
-    """(text, replacement) for every path the answer must not carry, longest
-    first: each account key that holds a login folder becomes its label,
-    then each folder or file path its last name."""
-    from khipu.config import load_config
-
-    keys: dict[str, str] = {}
-    paths: set[str] = set()
-    known = list(view.get("accounts") or [])
-    with contextlib.suppress(Exception):
-        known += accounts()
-    for entry in known:
-        key = str(entry.get("key") or "")
-        _harness, _, home = key.partition("|")
-        if home:
-            keys.setdefault(key, str(entry.get("label") or _label_for_key(key)))
-            paths.add(home)
-        if entry.get("home"):
-            paths.add(str(entry["home"]))
-    sources = view.get("sources") or {}
-    for runner in sources.get("runners") or []:
-        if runner.get("path"):
-            paths.add(str(runner["path"]))
-    if (sources.get("table") or {}).get("path"):
-        paths.add(str(sources["table"]["path"]))
-    config: dict = {}
-    with contextlib.suppress(Exception):
-        config = load_config()
-    for name in ("routing_table", "routing_rules_seed"):
-        if isinstance(config.get(name), str):
-            paths.add(config[name])
-    for name, field in (("routing_sources", "path"), ("usage_accounts", "home")):
-        items = config.get(name)
-        for item in items if isinstance(items, list) else []:
-            if isinstance(item, dict) and isinstance(item.get(field), str):
-                paths.add(item[field])
-    variants: set[str] = set()
-    for path in paths:
-        path = path.strip()
-        if len(path) < 2:
-            continue
-        variants.add(path.rstrip("/") or path)
-        with contextlib.suppress(Exception):
-            variants.add(os.path.expanduser(path).rstrip("/"))
-            variants.add(os.path.realpath(os.path.expanduser(path)).rstrip("/"))
-    pairs = sorted(keys.items(), key=lambda kv: -len(kv[0]))
-    pairs += sorted(((p, Path(p).name or "a folder") for p in variants if p and p != "/"),
-                    key=lambda kv: -len(kv[0]))
-    return pairs
+def account_id(key: str) -> str:
+    """An account's id in a conversation's answers: a short hash of its key,
+    the same for the same account every time, that says nothing of the
+    login folder the key holds. ``resolve_account`` takes it back."""
+    return "acct-" + hashlib.sha256(str(key).encode("utf-8", "surrogatepass")).hexdigest()[:12]
 
 
-def _without_paths(value, pairs: list[tuple[str, str]]):
-    if isinstance(value, dict):
-        return {_without_paths(k, pairs): _without_paths(v, pairs) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_without_paths(v, pairs) for v in value]
-    if isinstance(value, str):
-        for old, new in pairs:
-            if old in value:
-                value = value.replace(old, new)
-    return value
-
-
-def _owner_texts(view: dict | None) -> list[str]:
-    """The owner's own words in ``view``: the standing rules, the note and
-    his holds' words. Shown word for word (Decision 5), so a path in them is
-    his to keep: no answer cuts it."""
-    view = view or {}
-    texts = [r.get("text") for r in view.get("rules") or []]
-    texts.append((view.get("note") or {}).get("text"))
-    texts += [h.get("text") for h in view.get("holds") or [] if h.get("owner")]
-    return [t for t in texts if isinstance(t, str) and t]
-
-
-def _without_paths_but_the_owners(value, pairs: list[tuple[str, str]], keep: list[str]):
-    """``_without_paths`` on everything but the owner's own words
-    (``_owner_texts``): wherever one of them stands, in a field of its own
-    or inside a line, it is left whole and only the text around it is cut.
-    Both answers a conversation reads (``khipu_route`` and the light
-    status) use it, so they agree."""
-    keep = sorted({k for k in keep if k}, key=len, reverse=True)
-    if not keep:
-        return _without_paths(value, pairs)
-    pattern = re.compile("|".join(re.escape(k) for k in keep))
-
-    def scrub(item):
-        if isinstance(item, dict):
-            return {scrub(k): scrub(v) for k, v in item.items()}
-        if isinstance(item, list):
-            return [scrub(v) for v in item]
-        if not isinstance(item, str):
-            return item
-        parts, pos = [], 0
-        for match in pattern.finditer(item):
-            parts += [_without_paths(item[pos:match.start()], pairs), match.group(0)]
-            pos = match.end()
-        return "".join(parts) + _without_paths(item[pos:], pairs)
-
-    return scrub(value)
-
-
-def _conversation_sources(sources: dict | None) -> dict | None:
-    """The sources block without a folder or file path."""
-    if not isinstance(sources, dict):
-        return sources
-    out = dict(sources)
-    out["runners"] = [{k: v for k, v in r.items() if k not in _SOURCE_PATHS}
-                      for r in sources.get("runners") or []]
-    if isinstance(sources.get("table"), dict):
-        out["table"] = {k: v for k, v in sources["table"].items() if k not in _SOURCE_PATHS}
+def _pick(item, fields: tuple) -> dict | None:
+    """The named fields of ``item`` and nothing else; a ``written_by`` among
+    them as ``_public_author`` gives it."""
+    if not isinstance(item, dict):
+        return None
+    out = {k: item[k] for k in fields if k in item}
+    if "written_by" in item:
+        by = item["written_by"]
+        out["written_by"] = {k: by[k] for k in _AUTHOR_PUBLIC if k in by} if isinstance(by, dict) else None
     return out
+
+
+def _public_account(entry: dict, now: datetime) -> dict:
+    out = {"id": account_id(entry["key"]), **_pick(entry, _ACCOUNT_FIELDS)}
+    out["models"] = [dict(_pick(m, _MODEL_FIELDS), disagreement=_pick(m.get("disagreement"), _REPORT_FIELDS))
+                     for m in entry.get("models") or [] if isinstance(m, dict)]
+    out["witness"] = _pick(entry.get("witness"), _WITNESS_FIELDS)
+    out["disagreement"] = _pick(entry.get("disagreement"), _REPORT_FIELDS)
+    out["last_seen"] = _pick(entry.get("last_seen"), _REPORT_FIELDS)
+    out["underlying"] = _pick(entry.get("underlying"), ("state", "until", "basis"))
+    out["line"] = account_line(entry, now, push=False)
+    return out
+
+
+def _public_hold(hold: dict, now: datetime) -> dict:
+    scope = hold.get("scope") if isinstance(hold.get("scope"), dict) else {}
+    out = _pick(hold, _HOLD_FIELDS)
+    out["scope"] = {"kind": scope.get("kind")}
+    if scope.get("kind") == "account" and scope.get("account"):
+        out["scope"]["account"] = account_id(scope["account"])
+    out["line"] = hold_line(hold, now, push=False)
+    return out
+
+
+def _public_sources(sources) -> dict | None:
+    """The sources' status with no folder or file path: each runner by its
+    name, the table by its hash and times."""
+    if not isinstance(sources, dict):
+        return None
+    runners = []
+    for runner in sources.get("runners") or []:
+        item = _pick(runner, _RUNNER_FIELDS) or {}
+        files = runner.get("files") if isinstance(runner.get("files"), dict) else {}
+        item["files"] = {str(n): _pick(f, ("error", "good_at", "since")) for n, f in files.items()}
+        runners.append(item)
+    return {"runners": runners, "refused": [str(r) for r in sources.get("refused") or []],
+            "invalid": sources.get("invalid"), "usage": _pick(sources.get("usage"), ("accounts", "newest")),
+            "table": _pick(sources.get("table"), _TABLE_FIELDS)}
+
+
+def _public_entity(entity: str) -> str:
+    kind, _, ident = entity.partition(":")
+    return f"account:{account_id(ident)}" if kind == "account" else entity
+
+
+def _label_of(key: str, known: list[dict]) -> str:
+    return next((a["label"] for a in known if a["key"] == key), None) or _label_for_key(key)
+
+
+def _account_for_a_conversation(name, known: list[dict]) -> str:
+    """The key of the account a conversation names by its label or its id
+    (as khipu_route lists them), or by a bare harness name. Never a key or
+    a login folder: a conversation that could name one could test guesses
+    of the owner's folders against the record."""
+    from khipu import usage
+
+    raw = str(name or "").strip()
+    for account in known:
+        if raw == account_id(account["key"]) or account["label"].casefold() == raw.casefold():
+            return account["key"]
+    low = raw.lower()
+    if low in usage.HARNESSES:
+        return resolve_account(low, known)
+    labels = ", ".join(sorted({a["label"] for a in known})) or "none"
+    raise RouteError("Khipu doesn't know the account you named; name it by its label or its id, as khipu_route "
+                     f"lists them. Known: {labels}")
 
 
 def _holds_on(key: str, view: dict) -> set[str]:
@@ -2934,80 +2979,71 @@ def _holds_on(key: str, view: dict) -> set[str]:
     return ids
 
 
-def _conversation_pairs(view: dict | None) -> list[tuple[str, str]]:
-    """``_private_strings`` plus Khipu's own data folder: what no answer or
-    error a conversation gets may carry."""
-    pairs = []
-    with contextlib.suppress(Exception):
-        pairs = _private_strings(view or {})
-    with contextlib.suppress(Exception):
-        from khipu.paths import data_dir
-
-        folder = str(data_dir())
-        for path in {folder, os.path.realpath(folder)}:
-            if len(path.rstrip("/")) > 1:
-                pairs.append((path.rstrip("/"), "Khipu's data folder"))
-    return sorted(pairs, key=lambda kv: ("|" not in kv[0], -len(kv[0])))
-
-
 @contextlib.contextmanager
 def _for_a_conversation():
     """Every failure a conversation's tool call meets comes back as a
-    RouteError with no path on this Mac in it: a routing file that can't be
-    read or written is said in a fixed phrase, and any other text is
-    scrubbed of the paths Khipu knows."""
+    RouteError in a fixed message: a routing file that can't be read or
+    written is said in a fixed phrase, a refusal in Khipu's own words (the
+    words it gives a conversation when its text would echo what was typed),
+    and anything else as ``_FAILED``, never an exception's own text."""
     try:
         yield
     except OSError as exc:
         raise RouteError(f"Khipu can't read its routing record ({_io_phrase(exc, 'read')})") from None
-    except ValueError as exc:  # RouteError and every argument refusal: its own words, scrubbed
-        raise RouteError(_without_paths(str(exc), _conversation_pairs(None))) from None
-    except Exception as exc:  # noqa: BLE001 - its text may name a file
-        raise RouteError(_without_paths(f"{type(exc).__name__}: {exc}", _conversation_pairs(None))) from None
+    except RouteError as exc:
+        raise RouteError(exc.public if exc.public is not None else str(exc)) from None
+    except Exception:  # noqa: BLE001 - its text may name a file
+        raise RouteError(_FAILED) from None
 
 
 def conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
                       lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
-    """What MCP ``khipu_route`` answers (``_conversation_view``), with no
-    path on this Mac in it, read waiting at most ``lock_wait`` seconds for
-    the routing lock (an unsaved fold after that)."""
+    """What MCP ``khipu_route`` answers (``_conversation_view``), read
+    waiting at most ``lock_wait`` seconds for the routing lock (an unsaved
+    fold after that)."""
     with _for_a_conversation(), lock_budget(lock_wait):
-        out, view = _conversation_view(since_version=since_version, account=account, now=now)
-        return _without_paths_but_the_owners(out, _conversation_pairs(view), _owner_texts(view))
+        return _conversation_view(since_version=since_version, account=account, now=now)
 
 
-def _conversation_view(*, since_version=None, account: str | None = None,
-                       now: datetime | None = None) -> tuple[dict, dict]:
-    """What MCP ``khipu_route`` answers. With ``since_version`` (V or
+def _conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None) -> dict:
+    """What MCP ``khipu_route`` answers, built field by field from the view
+    (see the note above ``account_id``). With ``since_version`` (V or
     EPOCH:V) the current state of everything that changed after it, as
-    ``khipu route --since``. Otherwise the view as ``khipu route --json``
-    gives it, without the history, plus the words the push leaves out: each
-    hold's line with its words, each account's evidence line and the name a
-    conversation gave itself."""
+    ``khipu route --since``, each account entity by its id. Otherwise the
+    view as ``khipu route --json`` gives it, without the history and the
+    paths, plus the words the push leaves out: each hold's line with its
+    words, each account's evidence line and the name a conversation gave
+    itself."""
     now = now or _now()
     view = read_view(now)
-    key = resolve_account(account) if account else None
+    key = None
+    if account:
+        key = _account_for_a_conversation(account, accounts() + list(view.get("accounts") or []))
     if since_version is not None and str(since_version).strip():
         version, epoch = _parse_since(since_version)
         out = since(version, view, now=now, epoch=epoch)
+        pairs = list(zip(out["entities"], out["lines"]))
         if key is not None:
             mine = {f"account:{key}"} | {f"hold:{i}" for i in _holds_on(key, view)}
-            keep = [i for i, e in enumerate(out["entities"]) if e in mine]
-            out = dict(out, entities=[out["entities"][i] for i in keep], lines=[out["lines"][i] for i in keep])
-        return dict(out, about=ABOUT), view
-    out = public_view(view, now, key)
-    for name in _BULKY:
-        out.pop(name, None)
-    out["accounts"] = [{k: v for k, v in e.items() if k != "home"} for e in out["accounts"]]
-    out["sources"] = _conversation_sources(view.get("sources"))
-    out["holds"] = [dict(h, line=hold_line(h, now, push=False)) for h in view.get("holds") or []
+            pairs = [(e, line) for e, line in pairs if e in mine]
+        return {"since": out["since"], "epoch": out["epoch"], "version": out["version"],
+                "complete": out["complete"], "entities": [_public_entity(e) for e, _line in pairs],
+                "lines": [line for _e, line in pairs], "about": ABOUT}
+    out = {k: view[k] for k in _VIEW_FIELDS if k in view}
+    out["generated_at"] = _iso(now)
+    out["seed"] = _pick(view.get("seed"), ("at", "count"))
+    out["rules"] = [_pick(r, _RULE_FIELDS) for r in view.get("rules") or []]
+    out["note"] = _pick(view.get("note"), ("text", "at", "via"))
+    out["accounts"] = [_public_account(e, now) for e in view["accounts"] if key is None or e["key"] == key]
+    out["sources"] = _public_sources(view.get("sources"))
+    out["holds"] = [_public_hold(h, now) for h in view.get("holds") or []
                     if key is None or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)]
     if key is None:
-        out["unmatched"] = [dict(u, line=lane_line(u, now)) for u in view.get("unmatched") or []]
+        out["unmatched"] = [dict(_pick(u, _LANE_FIELDS), line=lane_line(u, now)) for u in view.get("unmatched") or []]
         out["dark_runners"] = [runner_line(r, now) for r in (view.get("sources") or {}).get("runners") or []
                                if r.get("silent") or r.get("unreadable")]
     out["about"] = ABOUT
-    return out, view
+    return out
 
 
 # What a conversation may write through MCP, and what it may not. The owner's
@@ -3036,9 +3072,9 @@ def conversation_write(args: dict, *, author: dict, now: datetime | None = None,
                        lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
     """What MCP ``khipu_route_report`` writes (``_conversation_write``),
     waiting at most ``lock_wait`` seconds for the routing lock (refused as
-    busy after that). Its answer and its errors go back to the conversation
-    as ``khipu_route``'s do: with no path on this Mac in them, an account
-    named by its label, never its login folder's key.
+    busy after that). Its answer is built field by field, as
+    ``khipu_route``'s is: the account by its id and its label, never its
+    key; its errors are fixed messages (``_for_a_conversation``).
 
     A tool call is never a shell: an author with no harness Khipu can
     detect (a server launched by a harness that sets no variable Khipu
@@ -3047,8 +3083,12 @@ def conversation_write(args: dict, *, author: dict, now: datetime | None = None,
     if by.get("harness") in (None, "", SHELL):
         by["harness"] = UNKNOWN_HARNESS
     with _for_a_conversation(), lock_budget(lock_wait):
-        out = _conversation_write(args, author=by, now=now)
-        return _without_paths(out, _conversation_pairs(None))
+        written = _conversation_write(args, author=by, now=now)
+        out = {k: written[k] for k in _WRITE_FIELDS if k in written}
+        if written.get("account"):
+            out["account"] = account_id(written["account"])
+            out["label"] = _label_of(written["account"], accounts())
+        return out
 
 
 def _conversation_write(args: dict, *, author: dict, now: datetime | None = None) -> dict:
@@ -3072,7 +3112,7 @@ def _conversation_write(args: dict, *, author: dict, now: datetime | None = None
                          "terminal.")
     unknown = sorted(k for k in args if k not in _ACTION_ARGS[action])
     if unknown:
-        raise RouteError(f"{action} takes no {unknown[0]!r}; it takes: "
+        raise RouteError(f"{action} takes no argument by that name; it takes: "
                          + ", ".join(sorted(_ACTION_ARGS[action] - {"action"})))
 
     def text(name: str) -> str | None:
@@ -3083,19 +3123,23 @@ def _conversation_write(args: dict, *, author: dict, now: datetime | None = None
             raise RouteError(f"{name} must be text")
         return str(value)
 
+    def account() -> str | None:
+        named = text("account")
+        return _account_for_a_conversation(named, accounts()) if named and named.strip() else None
+
     by = dict(author)
     name = text("name")
     if name and _one_line(name):
         by["name"] = _clean(name, NAME_MAX)
     if action == "report":
         state = (text("state") or "").strip().lower()
-        return report(state=state, account=text("account"), runner=text("runner"), lane=text("lane"),
+        return report(state=state, account=account(), runner=text("runner"), lane=text("lane"),
                       until=text("until"), window=text("window"), model=text("model"), message=text("message"),
                       evidence=text("evidence"), seen=text("seen"), author=by, via="mcp", now=now)
     if action == "hold":
         scope = (text("scope") or ("account" if args.get("account") else "")).strip().lower()
         return add_hold(text("text") or "", reason=(text("reason") or "").strip().lower(), scope=scope,
-                        account=text("account"), until=text("until"), owner=False, author=by, via="mcp", now=now)
+                        account=account(), until=text("until"), owner=False, author=by, via="mcp", now=now)
     hold_id = (text("hold_id") or "").strip()
     if not hold_id:
         raise RouteError("name the hold to end (hold_id, as khipu_route lists it)")
@@ -3112,10 +3156,10 @@ def light_status(now: datetime | None = None) -> dict:
         now = now or _now()
         view = read_view(now)
         out = summary(view, now=now)
-    light = {"text": out["text"], "version": out["version"], "epoch": out["epoch"], "dropped": out["dropped"],
-             "about": ABOUT}
-    # As khipu_route answers: no path on this Mac but in the owner's words.
-    return _without_paths_but_the_owners(light, _conversation_pairs(view), _owner_texts(view))
+    # The summary is the push: built from labels and names, with the
+    # owner's own words whole; it holds no key and no configured path.
+    return {"text": out["text"], "version": out["version"], "epoch": out["epoch"], "dropped": out["dropped"],
+            "about": ABOUT}
 
 
 # ---- khipu route wait --------------------------------------------------------------------

@@ -443,7 +443,7 @@ at most three checks per reset: the first and two retries.
   and refuse without one.
 - `khipu route wait <account> [--confirmed] [--timeout S]` exits 0 when the account is open (with
   `--confirmed`, only once a check has confirmed it: a usage probe or reset check that read it open after its
-  newest limit and is not stale, even when a newer open report from a conversation is now the witness). An
+  newest limit or down report, from any source, and is not stale, even when a newer open report from a conversation is now the witness). An
   orchestrator's relaunch script waits on the record instead of a typed time that cannot move. It waits; it
   launches nothing.
 - `khipu route sources` lists each registered runner folder with its last good read and any parse error.
@@ -451,8 +451,13 @@ at most three checks per reset: the first and two retries.
   reports that the push leaves out. Its description ends "Khipu reports; routing stays with you", and it
   never returns a pick or a ranking. MCP `khipu_route_report` writes reports and holds only, takes its author
   from the session, and refuses rules, the note, pauses and clears. Its answer and the light status's
-  `routing` field follow one policy: the owner's rules, note and hold words are shown word for word (a path
-  in them included), and every other field and line has each configured path cut to its last name. A
+  `routing` field follow one policy: each is built from a projection that copies only named fields and never
+  holds an account key, a login folder, a runner folder or the table's path. An account is named by its label
+  and a stable opaque id (a short hash of its key), which both tools take back with the label; a since
+  entity names an account by that id; Khipu's own sentences use labels only; an error is a fixed message,
+  never an exception's text or a path. The owner's rules, note and hold words are shown word for word (a
+  path in them included); nothing is scrubbed out of an answer after it is built. A conversation's words
+  have each configured path cut to its last name once, before they are stored. A
   conversation's words inside a line are shown in printable ASCII only: quotation marks become a straight
   single quote, any other character is written as its escape (`\u02ee`), and "you", "owner" and "standing
   rule" are marked as theirs ("[you]"), so no lookalike can close Khipu's quote or speak for the owner. A
