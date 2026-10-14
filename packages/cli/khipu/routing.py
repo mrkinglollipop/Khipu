@@ -69,8 +69,18 @@ DOWN_REASONS = {"not_signed_in": "not signed in", "not_installed": "not installe
                 "out_of_service": "out of service"}
 EVIDENCE_MAX = 200
 NAME_MAX = 64
+# The harness names Khipu writes as a conversation's author; any other value
+# (KHIPU_HARNESS is the caller's own environment) is stored as "unknown".
 HARNESS_WORDS = {"claude_code": "Claude Code", "codex": "Codex", "aegis": "Aegis", "grok": "Grok Build",
-                 "cursor": "Cursor", "muse": "Muse"}
+                 "grok_build": "Grok Build", "cursor": "Cursor", "muse": "Muse"}
+SHELL, UNKNOWN_HARNESS = "shell", "unknown"
+# A model name as a CLI gives it (opus, gpt-6.1-sol, claude-opus-4.1): never
+# a conversation's sentence, which would reach the push as a model's name.
+_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+# How far ahead of this Mac's clock a time already in the record may be and
+# still be taken over the clock (another writer's clock read a moment ago).
+# A time further ahead is not trusted: the clock is used, and doctor warns.
+CLOCK_TOLERANCE = 300
 # Display order of account lines: what closes work first.
 _STATE_ORDER = {LIMITED: 0, PAUSED: 1, DOWN: 2, UNKNOWN: 3, PROBABLY_OPEN: 4, OPEN: 5}
 
@@ -235,11 +245,16 @@ def _coerce(kind: str, value, key: str):
             raise ValueError(f"{key} must be one to ten lengths of time, for example 10m,30m")
         return [_coerce("duration", item, key) for item in items]
     if kind == "path":
-        text = _short_text(value, key, 1024)
-        if credential_location(text):
+        # Absolute only: a relative name would be read against whichever
+        # folder each reader (the app, doctor, a hook) runs in, and the
+        # private-folder check would see only the typed names.
+        path = Path(_short_text(value, key, 1024)).expanduser()
+        if not path.is_absolute():
+            raise ValueError(f"{key} needs the file's full path (starting with / or ~)")
+        if credential_location(path):
             raise ValueError(f"{key} can't name a file inside a private folder (API Keys, My Portfolio, "
                              "a keychain or an auth.json)")
-        return str(Path(text).expanduser())
+        return str(path)
     if kind == "lane_map":
         data = json.loads(value) if isinstance(value, str) else value
         if not isinstance(data, dict) or len(data) > 64:
@@ -344,6 +359,27 @@ def _now() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
 
+def _after(dt: datetime, seconds: float) -> datetime:
+    """``dt`` plus ``seconds``, held at the last time Python can hold
+    instead of overflowing (a line dated 9999, a setting of a million days):
+    a fold never fails on arithmetic."""
+    try:
+        return dt + timedelta(seconds=seconds)
+    except OverflowError:
+        return datetime.max.replace(tzinfo=timezone.utc, microsecond=0)
+
+
+def _not_behind(now: datetime, other: datetime | None) -> datetime:
+    """``other`` when it is ahead of ``now`` by at most ``CLOCK_TOLERANCE``,
+    else ``now``. The record's times run forward, but a time further ahead of
+    this Mac's clock than that (a clock that read ahead once, a line appended
+    by hand) is not taken over the clock: it would pin every later write and
+    fold to it, and limits and holds ending before it would show as ended."""
+    if other is not None and now < other and (other - now).total_seconds() <= CLOCK_TOLERANCE:
+        return other
+    return now
+
+
 def _iso(dt: datetime | None) -> str | None:
     if dt is None:
         return None
@@ -355,9 +391,9 @@ def _parse(text) -> datetime | None:
         return None
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
+        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
 
 
 def _clock(dt: datetime, now: datetime) -> str:
@@ -590,7 +626,9 @@ def conversation_author(environ: dict | None = None, cwd: str | None = None, nam
         elif env.get("CODEX_THREAD_ID") or env.get("CODEX_SANDBOX") or env.get("CODEX_HOME"):
             harness = "codex"
         else:
-            harness = "shell"
+            harness = SHELL
+    if harness not in HARNESS_WORDS and harness != SHELL:
+        harness = UNKNOWN_HARNESS
     session = (env.get("KHIPU_SESSION_ID") or env.get("CLAUDE_CODE_SESSION_ID") or env.get("CODEX_THREAD_ID")
                or "").strip()
     if cwd is None:
@@ -598,7 +636,7 @@ def conversation_author(environ: dict | None = None, cwd: str | None = None, nam
             cwd = os.getcwd()
         except OSError:
             cwd = None
-    out = {"kind": "conversation", "harness": _clean(harness, 32), "project": _project_name(cwd),
+    out = {"kind": "conversation", "harness": harness, "project": _project_name(cwd),
            "session": _clean(session, 64) or None}
     if name and _one_line(name):
         out["name"] = _clean(name, NAME_MAX)
@@ -626,8 +664,13 @@ def author_words(by: dict | None, *, push: bool = True) -> str:
         return "Khipu rules seed"
     if kind != "conversation":
         return "an unknown writer"
-    harness = by.get("harness") or "shell"
-    words = "a shell command" if harness == "shell" else f"a {HARNESS_WORDS.get(harness, harness)} conversation"
+    harness = by.get("harness") or SHELL
+    if harness == SHELL:
+        words = "a shell command"
+    elif isinstance(harness, str) and harness in HARNESS_WORDS:
+        words = f"a {HARNESS_WORDS[harness]} conversation"
+    else:  # never the stored text: it came from the writer's environment
+        words = "a conversation from an unknown harness"
     if by.get("project"):
         words += f" in {by['project']}"
     if not push:
@@ -728,9 +771,42 @@ def _last_written_at() -> datetime | None:
     return None
 
 
+# The type each field has when Khipu writes it. A line with another type (a
+# hand-edited or foreign line: a list for an account, a number for a key)
+# would stop every fold, so it is counted as unreadable and left out.
+_TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", "basis", "source", "window",
+                "evidence", "until", "written_at", "via", "text", "file", "date", "sha256")
+_WHOLE_FIELDS = ("n", "count")
+
+
+def _well_formed(event: dict) -> bool:
+    def text_or_none(value) -> bool:
+        return value is None or isinstance(value, str)
+
+    if not all(text_or_none(event.get(field)) for field in _TEXT_FIELDS):
+        return False
+    for field in _WHOLE_FIELDS:
+        value = event.get(field)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            return False
+    scope = event.get("scope")
+    if event["type"] == "hold":
+        if scope is not None and not (isinstance(scope, dict)
+                                      and text_or_none(scope.get("kind")) and text_or_none(scope.get("account"))):
+            return False
+    elif not text_or_none(scope):
+        return False
+    by = event.get("written_by")
+    if by is not None and not (isinstance(by, dict) and all(text_or_none(v) for v in by.values())):
+        return False
+    used = event.get("used_pct")
+    return used is None or (isinstance(used, (int, float)) and not isinstance(used, bool))
+
+
 def read_events() -> tuple[list[dict], int]:
     """Every event in order with its line number (``_seq``), and how many
-    lines could not be read (kept in the file, left out of the fold)."""
+    lines could not be read (kept in the file, left out of the fold): not
+    JSON, no type, or a field of a type Khipu never writes."""
     try:
         text = events_file().read_text(encoding="utf-8")
     except OSError:
@@ -746,7 +822,7 @@ def read_events() -> tuple[list[dict], int]:
         except ValueError:
             bad += 1
             continue
-        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str) or not _well_formed(event):
             bad += 1
             continue
         event["_seq"] = len(events)
@@ -804,7 +880,7 @@ def _evidence(event: dict, cfg: dict) -> dict | None:
         return None
     until = _parse(event.get("until"))
     if state == LIMITED and until is None:
-        until = at + timedelta(seconds=cfg["routing_report_default_limit"] or 1800)
+        until = _after(at, cfg["routing_report_default_limit"] or 1800)
     return {"id": str(event.get("id") or f"line{event['_seq']}"), "account": event.get("account"),
             "runner": event.get("runner"), "lane": event.get("lane"), "state": state,
             "until": until if state == LIMITED else None,
@@ -965,6 +1041,32 @@ def _effective_account(entry: dict) -> dict:
             "last_seen": last["state"] if last else None}
 
 
+def _in_write_order(events: list[dict]) -> list[dict]:
+    """The log's lines with times that never run backwards: no line counts as
+    later than a line written after it. The log is in write order (one writer
+    at a time, under the lock) and a write takes the newest line's time only
+    when that is a little ahead of its clock (``_not_behind``), so a line
+    stamped further ahead (a clock that read ahead) is followed by earlier
+    times; it counts from the time of the next line, never as newer than an
+    owner's clear or a report written after it."""
+    out = list(events)
+    floor: datetime | None = None
+    for i in range(len(out) - 1, -1, -1):
+        at = _parse(out[i].get("written_at"))
+        if at is None:
+            continue
+        if floor is not None and at > floor:
+            out[i] = dict(out[i], written_at=_iso(floor))
+            at = floor
+        floor = at
+    return out
+
+
+def _lane_mapped(runner, lane, lane_map: dict) -> bool:
+    lanes = lane_map.get(runner) if isinstance(runner, str) else None
+    return isinstance(lanes, dict) and isinstance(lane, str) and lane in lanes
+
+
 def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
          extra: Iterable[dict] = ()) -> dict:
     """The view of ``events`` (and of evidence from sources, ``extra``, in the
@@ -972,6 +1074,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     process, calls no model."""
     lane_map = cfg.get("routing_lane_map") or {}
     stale_after = cfg["routing_stale_after"]
+    events = _in_write_order(events)
     evidence: list[dict] = []
     owner: dict[str, Any] = {"pauses": {}, "lifts": {}, "clears": {}, "dismissed": set()}
     dismissals: list[dict] = []
@@ -1031,7 +1134,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     for item in evidence:
         key = _evidence_account(item, lane_map, known)
         if not key:
-            if item.get("runner"):
+            # A conversation's runner and lane count only as a pair the lane
+            # map names (the owner's words); never its own text as a lane.
+            if item.get("runner") and (item["source"] != "report"
+                                       or _lane_mapped(item["runner"], item.get("lane"), lane_map)):
                 unmatched_raw.append(item)
             continue
         item["account"] = key
@@ -1061,10 +1167,14 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
 
     reminder = cfg["routing_owner_hold_reminder"]
     active_holds = []
+    reminders: list[datetime] = []  # owner holds whose reminder is still to come
     for hold in sorted(holds.values(), key=lambda h: h["at"], reverse=True):
         if "ended_at" in hold or (hold["until"] is not None and hold["until"] <= now):
             continue
-        remind = bool(hold["owner"] and reminder and (now - hold["at"]).total_seconds() > reminder)
+        due = _after(hold["at"], reminder) if hold["owner"] and reminder else None
+        remind = due is not None and now >= due
+        if due is not None and not remind:
+            reminders.append(due)
         active_holds.append({"id": hold["id"], "scope": hold["scope"], "scope_label": hold["scope_label"],
                              "reason": hold["reason"], "text": hold["text"], "until": _iso(hold["until"]),
                              "owner": hold["owner"], "written_by": hold["written_by"], "via": hold["via"],
@@ -1102,12 +1212,13 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         if item["state"] == LIMITED and item["until"] and item["until"] > now:
             times.append(item["until"])
         elif item["state"] in (OPEN, DOWN) and stale_after > 0:
-            times.append(item["at"] + timedelta(seconds=stale_after))
+            times.append(_after(item["at"], stale_after))
     for clear in owner["clears"].values():
         if stale_after > 0:
-            times.append(clear["at"] + timedelta(seconds=stale_after))
+            times.append(_after(clear["at"], stale_after))
     times += [p["until"] for p in owner["pauses"].values() if p["until"] is not None]
     times += [_parse(h["until"]) for h in active_holds if h["until"]]
+    times += reminders
     future = [t for t in times if t is not None and t > now]
 
     effective: dict[str, Any] = {f"account:{e['key']}": _effective_account(e) for e in entries}
@@ -1159,6 +1270,9 @@ def _save_view(view: dict) -> None:
 def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
     if not view or view.get("fingerprint") != fingerprint:
         return False
+    folded = _parse(view.get("folded_at"))
+    if folded is not None and (folded - now).total_seconds() > CLOCK_TOLERANCE:
+        return False  # folded at a time further ahead of this clock than it trusts: fold again at now
     due = _parse(view.get("valid_until"))
     return due is None or now < due
 
@@ -1202,8 +1316,7 @@ def _import_seed_locked(events: list[dict], cfg: dict, now: datetime) -> tuple[s
                 f"({_SEED_SHAPE})"), False
     present = {e.get("text") for e in events if e.get("type") == "rule_add" and e.get("seeded")}
     n = max((e["n"] for e in events if e.get("type") == "rule_add" and isinstance(e.get("n"), int)), default=0)
-    last = _last_written_at()
-    stamp = _iso(last if last is not None and last > now else now)
+    stamp = _iso(_not_behind(now, _last_written_at()))
     by = {"kind": "seed", "file": Path(path).name}
     batch = []
     for rule in rules:
@@ -1250,10 +1363,9 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
 
 
 def _not_before_last_fold(now: datetime, prev: dict | None) -> datetime:
-    """A fold never goes back in time: ``now`` or the saved view's
-    ``folded_at``, whichever is later."""
-    folded = _parse((prev or {}).get("folded_at"))
-    return folded if folded is not None and folded > now else now
+    """A fold does not go back in time: the saved view's ``folded_at`` when
+    it is a little later than ``now`` (``_not_behind``), else ``now``."""
+    return _not_behind(now, _parse((prev or {}).get("folded_at")))
 
 
 def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
@@ -1318,9 +1430,11 @@ def read_view(now: datetime | None = None) -> dict:
 
 def _write(event: dict) -> tuple[dict, dict]:
     """Append one event and refold. Khipu sets its id and ``written_at``: its
-    clock read once the lock is held, never earlier than the newest line
-    already in the log, so the log's times run in the order its lines were
-    written and an owner's clear is newer than every report before it. Once
+    clock read once the lock is held, or the newest line's time when that is
+    a little later (``_not_behind``), so the log's times run in the order its
+    lines were written and an owner's clear is newer than every report before
+    it; a line stamped further ahead than that is ordered by the fold
+    (``_in_write_order``), not followed. Once
     the line is down the write is recorded: a view that can't be saved comes
     back unsaved (``saved: false``), never as a failure that would make the
     caller write it again."""
@@ -1330,10 +1444,7 @@ def _write(event: dict) -> tuple[dict, dict]:
     appended = False
     try:
         with _lock():
-            stamp = _now()
-            last = _last_written_at()
-            if last is not None and last > stamp:
-                stamp = last
+            stamp = _not_behind(_now(), _last_written_at())
             event["written_at"] = _iso(stamp)
             _append_locked(event)
             appended = True
@@ -1369,7 +1480,14 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
     """What a conversation learned. Khipu sets the author and the basis: cli
     only when Khipu itself reads a reset time out of the pasted limit message;
     otherwise estimated, with ``until`` clamped to the window it names (five
-    hours when it names none) and 30 minutes (a setting) when omitted."""
+    hours when it names none) and 30 minutes (a setting) when omitted.
+
+    Only structured values reach other conversations, so the fields that are
+    pushed take no free text: ``model`` is a model name, and a runner's lane
+    is one the lane map (``routing_lane_map``) names. Evidence the fold
+    would not show is refused, never recorded and answered ok: a model's
+    limit is reported with ``--state limited``, and down is about the whole
+    account."""
     now = now or _now()
     cfg = settings()
     if state not in (LIMITED, OPEN, DOWN):
@@ -1381,15 +1499,30 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
     window_key = {"five-hour": "five_hour", "five_hour": "five_hour", "weekly": "weekly"}.get(window or "", None)
     if window and window_key is None:
         raise RouteError("--window must be five-hour or weekly")
+    scope = str(model).strip() if model is not None else ""
+    if scope:
+        if not _MODEL_NAME.fullmatch(scope) or scope.casefold() == "all":
+            raise RouteError("--model takes a model's name as its CLI gives it, for example opus or gpt-6.1-sol: "
+                             "letters, digits and . _ : - only, at most 64 characters")
+        if state == DOWN:
+            raise RouteError("down is about the whole account: leave out --model (a model's own limit is "
+                             "--state limited --model M)")
     key = resolve_account(account, conversation=True) if account else None
     event: dict[str, Any] = {"type": "evidence", "source": "report", "state": state, "via": via,
                              "written_by": author or conversation_author()}
     if key:
         event["account"] = key
     else:
-        event.update(runner=_clean(runner, NAME_MAX), lane=_clean(lane, NAME_MAX))
-    if model and _one_line(model):
-        event["scope"] = _clean(model, NAME_MAX)
+        runner, lane = str(runner).strip(), str(lane).strip()
+        lane_map = cfg.get("routing_lane_map") or {}
+        if not _lane_mapped(runner, lane, lane_map):
+            runners = _clip(", ".join(sorted(lane_map)), 300) or "none"
+            raise RouteError("Khipu doesn't know that runner's lane; a conversation can report on a lane only "
+                             "when the lane map (Settings \u2192 Routing, routing_lane_map) names it, or on the "
+                             f"account with --account. Runners in the lane map: {runners}")
+        event.update(runner=runner, lane=lane)
+    if scope:
+        event["scope"] = scope
     if window_key:
         event["window"] = window_key
     line = evidence if evidence and _one_line(evidence) else message
@@ -1870,6 +2003,11 @@ def doctor_block(now: datetime | None = None) -> dict:
     if bad:
         warnings.append(f"{bad} line{'s' if bad != 1 else ''} of the routing record can't be read; "
                         f"Khipu leaves {'them' if bad != 1 else 'it'} out.")
+    events, _bad = read_events()
+    newest = max((at for at in (_parse(e.get("written_at")) for e in events) if at is not None), default=None)
+    if newest is not None and (newest - now).total_seconds() > CLOCK_TOLERANCE:
+        warnings.append(f"The routing record holds times ahead of this Mac's clock (as late as "
+                        f"{_iso(newest)}); Khipu goes by the clock. Check the Mac's date and time.")
     return {"record": bool(view.get("record")), "version": view["version"], "folded_at": view.get("folded_at"),
             "valid_until": view.get("valid_until"),
             "accounts": [{"account": e["label"], "state": e["state"], "until": e["until"], "basis": e["basis"],

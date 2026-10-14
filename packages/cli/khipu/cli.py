@@ -4509,12 +4509,14 @@ def build_parser() -> argparse.ArgumentParser:
     rt_sub = rt.add_subparsers(dest="route_cmd")
     rep = rt_sub.add_parser("report", help="Record what a conversation learned about an account", parents=[rt_json])
     rep.add_argument("--account", default=None, metavar="A", help="The account (its label, or harness|login folder)")
-    rep.add_argument("--runner", default=None, help="With --lane: a job runner's lane, matched through routing_lane_map")
+    rep.add_argument("--runner", default=None,
+                     help="With --lane: a job runner's lane; only a lane routing_lane_map names")
     rep.add_argument("--lane", default=None)
     rep.add_argument("--state", required=True, choices=("limited", "open", "down"))
     rep.add_argument("--until", default=None, metavar="T", help="When the limit ends (a guess unless --message says)")
     rep.add_argument("--window", default=None, choices=("five-hour", "weekly"))
-    rep.add_argument("--model", default=None, help="The model a model-scoped limit closes")
+    rep.add_argument("--model", default=None,
+                     help="The model a model-scoped limit closes (a model's name; not with --state down)")
     rep.add_argument("--message", default=None, help="The limit message itself, word for word")
     rep.add_argument("--name", default=None, help="What the conversation calls itself (shown beside its author)")
     rep.add_argument("--evidence", default=None, help="One line of evidence")

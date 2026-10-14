@@ -420,6 +420,9 @@ at most three checks per reset: the first and two retries.
 - `khipu route report (--account A | --runner R --lane L) --state limited|open|down [--until T] [--window
   five-hour|weekly] [--model M] [--message "<the limit message>"] [--name "<what the conversation calls
   itself>"] [--evidence "<line>"]` records what a conversation learned. Khipu sets the author and the basis.
+  The fields that are pushed take no free text: `--model` is a model's name (not with `--state down`, which is
+  about the whole account), a conversation's `--runner`/`--lane` must be a lane the lane map names, and a
+  harness Khipu doesn't know is recorded as unknown.
 - `khipu route hold "<text>" --reason R --until T [--account A | --machine | --all]` adds a hold, and `khipu
   route hold end <id>` ends one.
 - The owner's commands: `khipu route pause <account> [--until T]`, `khipu route lift <account>`, `khipu
