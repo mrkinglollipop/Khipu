@@ -120,13 +120,18 @@ def _epoch(value) -> datetime | None:
 
 # What ``redact_secrets`` leaves that a runner's line or argument can carry:
 # an xAI key, and the value after a secret flag (``--api-key VALUE``,
-# ``--password=VALUE``), which no pattern there knows is a secret.
+# ``--password=VALUE``), which no pattern there knows is a secret. The word
+# after a secret flag is masked whatever it looks like: a token may start
+# with a dash, and masking a following flag by mistake costs nothing.
 _XAI_KEY = re.compile(r"\bxai-[A-Za-z0-9_-]{16,}")
+_FLAG_WORDS = r"(?:key|token|secret|password|passwd|pwd|credential|auth)"
 _SECRET_FLAG = re.compile(
-    r"(?i)(?<![\w-])(--?[a-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd|pwd|credential|auth)[a-z0-9_-]*)"
-    r"(\s*=\s*|\s+)(?!--?[a-z])(\S+)")
-_SECRET_FLAG_ONLY = re.compile(
-    r"(?i)^--?[a-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd|pwd|credential|auth)[a-z0-9_-]*$")
+    r"(?i)(?<![\w-])(--?[a-z0-9_-]*" + _FLAG_WORDS + r"[a-z0-9_-]*)(\s*=\s*|\s+)(\S+)")
+_SECRET_FLAG_ONLY = re.compile(r"(?i)^--?[a-z0-9_-]*" + _FLAG_WORDS + r"[a-z0-9_-]*$")
+# Bumped whenever ``_redacted`` masks more: a source cache kept by a view
+# saved under an older version is dropped, never carried forward, so text
+# that older masking let through cannot outlive the fix.
+REDACTION = 2
 
 
 def _redacted(text, limit: int = LINE_MAX) -> str:
@@ -757,9 +762,11 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
     nothing, takes no runner's lock."""
     entries, refused, invalid = registered(config)
     prev_cache = prev_cache if isinstance(prev_cache, dict) else {}
+    if prev_cache.get("redaction") != REDACTION:
+        prev_cache = {}
     lane_map = cfg.get("routing_lane_map") or {}
     runners: list[dict] = []
-    cache: dict[str, Any] = {"runners": {}}
+    cache: dict[str, Any] = {"runners": {}, "redaction": REDACTION}
     evidence: list[dict] = []
     for entry in entries:
         status, kept = read_runner(entry, now, (prev_cache.get("runners") or {}).get(entry["name"]),

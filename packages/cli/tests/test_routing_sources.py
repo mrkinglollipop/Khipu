@@ -970,3 +970,33 @@ def test_the_first_bound_counts_every_line_in_the_tail(home):
     assert cache["events"]["data"]["first"] == routing._iso(oldest)
     assert cache["sightings"]["main"]["at"] == routing._iso(oldest)
     assert cache["sightings"]["main"]["line"] is False
+
+
+def test_the_word_after_a_secret_flag_is_masked_whatever_it_looks_like():
+    # R5-1: a value starting with a dash read as the next flag, and a bare
+    # --key was not a secret flag at all.
+    for line in ("job --api-key -Kq3fakeSecretValue9", "job --token -abcFAKEtoken123",
+                 "job --key fakeKeyValue12345", "job --password=-Hunter2fake"):
+        masked = routing_sources._redacted(line)
+        assert masked.startswith("job ") and not any(
+            v in masked for v in ("Kq3fake", "abcFAKE", "fakeKeyValue", "Hunter2fake")), masked
+
+
+def test_a_source_cache_from_older_masking_is_dropped_not_carried(home):
+    # R5-2: a file that can't be read keeps its last good read; a read kept
+    # under older masking must not carry its text on.
+    _register(home)
+    routing.read_view()
+    view = json.loads(routing.view_file().read_text())
+    cache = view["source_cache"]
+    cache.pop("redaction", None)
+    cache["runners"]["project A"]["events"]["data"]["limited_lines"] = [
+        {"text": "job=z xai-OLDVIEWfakeKey0123456789abcdefABCD"}]
+    routing._save_view(view)
+    (home["a"] / "events.log").unlink()
+    home["clock"].advance(seconds=5)
+    routing.read_view()
+    assert "OLDVIEWfakeKey" not in routing.view_file().read_text()
+    kept = json.loads(routing.view_file().read_text())["source_cache"]
+    assert kept["redaction"] == routing_sources.REDACTION
+
