@@ -124,8 +124,9 @@ def test_a_muse_guess_and_a_second_account_line_with_a_parsed_time(home):
     assert routing_sources.runner_basis(at, datetime(2026, 10, 14, 3, 39, 2, tzinfo=timezone.utc)) == "estimated"
     assert routing_sources.runner_basis(T0, T0 + timedelta(minutes=30)) == "estimated"
     assert routing_sources.runner_basis(T0 + timedelta(seconds=13), T0 + timedelta(hours=2, minutes=52)) == "cli"
-    # Every evidence line kept is the runner's line, redacted and clipped.
-    assert second["witness"]["evidence"].startswith("pipe-12 LIMITED lane=second until=2026-10-14T17:52:00Z")
+    # Every evidence line is worded by Khipu from the line's parsed fields,
+    # never the runner's own text.
+    assert second["witness"]["evidence"] == "project A runner: lane second limited until 17:52Z (pipeline pipe-12)"
 
 
 def test_a_probe_at_100_percent_replaces_a_runners_guess(home):
@@ -452,7 +453,8 @@ def test_the_table_pointer_moves_the_version_and_never_carries_its_prose(home):
     assert view["version"] == first + 1 and view["changes"][-1]["entities"] == ["table"]
     line = view["changes"][-1]["lines"][0]
     assert line.startswith("The routing table's NOW block changed at ")
-    assert line.endswith("(stamped 'updated: 2026-10-14 15:04Z by an orchestrator').")
+    assert line.endswith("(stamped 15:04Z).")
+    assert "by an orchestrator" not in routing.view_file().read_text()
     assert "PROSE-MARKER" not in routing.view_file().read_text()
 
 
@@ -1000,3 +1002,135 @@ def test_a_source_cache_from_older_masking_is_dropped_not_carried(home):
     kept = json.loads(routing.view_file().read_text())["source_cache"]
     assert kept["redaction"] == routing_sources.REDACTION
 
+
+
+# ---- fix round 6: only parsed fields and checked names, never a source's text -------------
+#
+# Each test below reproduces one class of leak found against round 5 with
+# fake values, and asserts the fake secret reaches nothing Khipu stores
+# (its data folder) and none of khipu route, route --json, route --summary,
+# route sources, route sources --json and doctor's block.
+
+
+def _nowhere(home, capsys, *secrets: str) -> None:
+    """The source files themselves (the runner folders, and the usage cache
+    a test writes as input) are not Khipu's: everything else is checked."""
+    source = home["data"] / "state" / "usage.json"
+    texts = [json.dumps(routing.doctor_block())]
+    for argv in (_args(), _args(json=True), _args(summary=True), _args(route_cmd="sources"),
+                 _args(route_cmd="sources", json=True)):
+        assert routing.run_cli(argv) == 0
+        texts.append(capsys.readouterr().out)
+    for path in home["data"].rglob("*"):
+        if path.is_file() and path != source:
+            texts.append(path.read_bytes().decode("utf-8", "replace"))
+    for secret in secrets:
+        assert not any(secret in text for text in texts), secret
+
+
+def _reason(home, lane: str, until: datetime, reason) -> None:
+    _limit(home["a"], {lane: until})
+    glob = json.loads((home["a"] / "state" / "global.json").read_text())
+    glob["limited"][lane]["reason"] = reason
+    (home["a"] / "state" / "global.json").write_text(json.dumps(glob))
+
+
+def _limited(home, rest: str) -> None:
+    _append(home["a"], f"2026-10-14T14:58:00Z pipe-61 LIMITED lane=codex until=2026-10-14T15:30:00Z job=x {rest}")
+
+
+def test_r6_flag_spellings_the_mask_missed_never_reach_the_record(home, capsys):
+    # Class 1: -k, -p, --bearer, --pass and --pass= were no secret flags.
+    _register(home)
+    fakes = ["kFlagFakeValueOne", "pFlagFakeValueTwo", "bearerFakeValueThree", "passFakeValueFour",
+             "passEqFakeValueFive"]
+    rest = f"-k {fakes[0]} -p {fakes[1]} --bearer {fakes[2]} --pass {fakes[3]} --pass={fakes[4]}"
+    _limited(home, rest)
+    _reason(home, "main", T0 + timedelta(hours=1), rest)
+    view = routing.read_view()
+    assert _account(view, "codex|")["state"] == "limited"
+    _nowhere(home, capsys, *fakes)
+
+
+def test_r6_a_flag_followed_by_a_quote_or_a_list_never_reaches_the_record(home, capsys):
+    # Class 2: argv=["--api-key", "X"] in a line, and a reason written as a
+    # list (which was turned into text).
+    _register(home)
+    _limited(home, 'argv=["--api-key", "listArgFakeValueSix"]')
+    _reason(home, "main", T0 + timedelta(hours=1), ["--api-key", "listReasonFakeSeven"])
+    routing.read_view()
+    _nowhere(home, capsys, "listArgFakeValueSix", "listReasonFakeSeven")
+
+
+def test_r6_a_quoted_value_of_several_words_never_reaches_the_record(home, capsys):
+    # Class 3: only the first word after the flag was masked.
+    _register(home)
+    rest = '--token "a quotedFakeEight" --password=\'w quotedFakeNine\' password="w1 quotedFakeTen"'
+    _limited(home, rest)
+    _reason(home, "main", T0 + timedelta(hours=1), rest)
+    routing.read_view()
+    _nowhere(home, capsys, "quotedFakeEight", "quotedFakeNine", "quotedFakeTen")
+
+
+def test_r6_shapes_redaction_does_not_know_never_reach_the_record(home, capsys):
+    # Class 4: ?key=, bare key=, ?sig=, "Authorization: Token", a short
+    # bearer value or one holding "!", and the table's updated: line.
+    _register(home)
+    fakes = ["queryKeyFakeEleven", "bareKeyFakeTwelve", "sigFakeThirteen", "tokenHdrFakeFourteen", "shrtFk15",
+             "bang!FakeSixteen", "tableKeyFakeSeventeen"]
+    rest = (f"url=https://h.test/x?key={fakes[0]} key={fakes[1]} https://h.test/y?sig={fakes[2]} "
+            f"Authorization: Token {fakes[3]} Bearer {fakes[4]} Bearer {fakes[5]}")
+    _limited(home, rest)
+    _reason(home, "main", T0 + timedelta(hours=1), rest)
+    table = home["tmp"] / "routing-table.md"
+    _table(table, "lane order", f"2026-10-14 13:48Z by x https://h.test/?key={fakes[6]}")
+    _set(home, routing_table=str(table))
+    view = routing.read_view()
+    assert view["sources"]["table"]["stamped_at"] == "2026-10-14T13:48:00Z"
+    _nowhere(home, capsys, *fakes)
+
+
+def test_r6_a_usage_row_for_an_account_not_configured_is_skipped(home, capsys):
+    # Class 5: a row keyed by a folder that is no configured account became
+    # an account, with its raw key and folder.
+    _register(home)
+    secret = "sk-ant-api03-Fake18" + "z" * 30
+    _usage(home, {f"codex|/x/{secret}": _row(T0 - timedelta(minutes=1), [
+        {"name": "five_hour", "used_pct": 100.0, "resets_at": routing._iso(T0 + timedelta(hours=2))}])})
+    view = routing.read_view()
+    assert all(secret not in a["key"] for a in view["accounts"])
+    assert view["sources"]["usage"]["accounts"] == 0
+    _nowhere(home, capsys, secret, "Fake18")
+
+
+def test_r6_a_secret_split_by_whitespace_keeps_neither_half(home, capsys):
+    # Class 6: the first half was masked and the second half kept.
+    _register(home)
+    rest = "token=sk-ant-api03-" + "A" * 24 + " secondHalfFakeNineteen"
+    _limited(home, rest)
+    _reason(home, "main", T0 + timedelta(hours=1), rest)
+    routing.read_view()
+    _nowhere(home, capsys, "secondHalfFakeNineteen", "A" * 24)
+
+
+def test_r6_a_name_field_that_fails_the_shape_check_is_withheld(home, capsys):
+    # Every name a runner file gives (lane, pipeline, model, kind) is kept
+    # only in the strict shape and when it doesn't look like a key.
+    _register(home)
+    secret = "xai-" + "NameFakeKey20abcdefghijklmnop"
+    _append(home["a"], f"2026-10-14T14:58:00Z {secret} LIMITED lane={secret} until=2026-10-14T15:30:00Z")
+    config = json.loads((home["a"] / "config.json").read_text())
+    config["lanes"]["grok"]["model"] = secret
+    config["lanes"]["grok"]["kind"] = ["grok", secret]
+    config["lanes"][secret] = {"kind": "grok", "model": "grok-4.7"}
+    (home["a"] / "config.json").write_text(json.dumps(config))
+    view = routing.read_view()
+    kept = view["source_cache"]["runners"]["project A"]["config"]["data"]["lanes"]
+    assert kept["grok"]["model"] == routing_sources.WITHHELD and kept["grok"]["kind"] is None
+    assert routing_sources.WITHHELD in kept
+    for name in ("muse", "second-sonnet", "gpt-6.1-sol", "launch-muse.sh", "pipe-12"):
+        assert routing_sources.safe_name(name) == name
+    for name in ("sk-ant-x", "a b", "AIzaFake", "x" * 65, "abc123def456ghi789jkl012mno", "lane=x"):
+        assert routing_sources.safe_name(name) == routing_sources.WITHHELD, name
+    assert routing_sources.safe_name(7) is None and routing_sources.safe_name(["a"]) is None
+    _nowhere(home, capsys, secret, "NameFakeKey20")

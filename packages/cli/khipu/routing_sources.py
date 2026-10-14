@@ -10,21 +10,27 @@ reports; nothing here picks, ranks, refuses, launches or reorders work.
   rule checks only, these keys of ``config.json`` and nothing else: each
   lane's ``kind``, ``model``, ``launch`` and ``confirm_lane``, and
   ``defaults.check_lane`` and ``defaults.fix_lanes``. Every file is opened
-  read-only (``os.O_RDONLY``), no lock of the runner's is taken, and every
-  line kept passes through ``redact_secrets`` first (plus a mask for xAI
-  keys and the value after a secret flag such as ``--api-key``). A lane's
-  ``launch`` arguments are never kept: only the facts the rule checks need
-  are derived from them as they are read (whether a model ending in -fast is
-  named, whether the model is one of the arguments, and the launch script's
-  name). A folder, or a file
-  that resolves, inside a credential location is refused and never opened.
+  read-only (``os.O_RDONLY``) and no lock of the runner's is taken. No text
+  of a runner file is stored or shown: no line, no reason, no argument.
+  Only parsed, typed fields are kept (times, the line kind, numbers, flags)
+  and names (lane, pipeline, model, kind) that pass ``safe_name``; every
+  evidence line is worded by Khipu from those fields, and the existing
+  redaction runs over it as a second layer. A lane's ``launch`` arguments
+  are never kept: only the facts the rule checks need are derived from them
+  as they are read (whether a model ending in -fast is named, whether the
+  model is one of the arguments, and the launch script's name). A folder,
+  or a file that resolves, inside a credential location is refused and
+  never opened.
 - Khipu's usage cache (``state/usage.json``): a window at 100% or more is a
   limit until its ``resets_at`` (basis cli) for its scope (a model, or the
   whole account); figures with headroom (every window under 100%) are open
   (basis checked), and a window at 100% with no reset time ahead gives no
   evidence for its scope; ``not_signed_in`` and ``not_installed`` are down.
+  Only rows of configured accounts are read; a row for any other key is
+  skipped whole.
 - The routing table (setting ``routing_table``), read only and never as
-  account state: its NOW block's ``updated:`` line and a hash of the block.
+  account state: the time its NOW block's ``updated:`` line gives and a
+  hash of the block; the line's text is never kept.
 
 Everything here reads files and returns plain data; the fold
 (``routing.fold``) stays pure.
@@ -128,10 +134,11 @@ _FLAG_WORDS = r"(?:key|token|secret|password|passwd|pwd|credential|auth)"
 _SECRET_FLAG = re.compile(
     r"(?i)(?<![\w-])(--?[a-z0-9_-]*" + _FLAG_WORDS + r"[a-z0-9_-]*)(\s*=\s*|\s+)(\S+)")
 _SECRET_FLAG_ONLY = re.compile(r"(?i)^--?[a-z0-9_-]*" + _FLAG_WORDS + r"[a-z0-9_-]*$")
-# Bumped whenever ``_redacted`` masks more: a source cache kept by a view
-# saved under an older version is dropped, never carried forward, so text
-# that older masking let through cannot outlive the fix.
-REDACTION = 2
+# Bumped whenever what the source cache keeps narrows: a source cache kept
+# by a view saved under an older version is dropped, never carried forward,
+# so text that older rules let through cannot outlive the fix. 3: no free
+# text at all, only parsed fields and names that pass ``safe_name``.
+REDACTION = 3
 
 
 def _redacted(text, limit: int = LINE_MAX) -> str:
@@ -147,10 +154,42 @@ def _redacted(text, limit: int = LINE_MAX) -> str:
 
 
 def _name(value, limit: int = 64) -> str | None:
-    """A lane, model or pipeline name a runner wrote, as plain short text."""
+    """An owner's runner name from Khipu's own settings, as plain short
+    text (never a runner file's words: those go through ``safe_name``)."""
     if not isinstance(value, str) or not value.strip():
         return None
     return _redacted(value.strip(), limit)
+
+
+# A name from a runner file, the usage cache or the table is kept only in
+# this shape, only when redaction leaves it alone, and only when it does not
+# look like a key; anything else is this fixed placeholder. An allowlist:
+# masking free text has lost to new secret shapes round after round.
+WITHHELD = "(name withheld)"
+_NAME_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_KEY_PREFIX = re.compile(r"(?:^|[._-])(?:sk-|xai-|AIza|gh[pousr]_|github_pat_|AKIA|ASIA|xox|eyJ)")
+_KEY_RUN = re.compile(r"[A-Za-z0-9]{24,}")
+
+
+def _key_like(text: str) -> bool:
+    """A known key prefix, or a run of 24 or more letters and digits that
+    holds both."""
+    if _KEY_PREFIX.search(text):
+        return True
+    return any(re.search(r"[A-Za-z]", run) and re.search(r"[0-9]", run) for run in _KEY_RUN.findall(text))
+
+
+def safe_name(value) -> str | None:
+    """A lane, pipeline, model, kind or window name a source file gives: the
+    name when it matches the strict shape, survives redaction unchanged and
+    does not look like a key; ``WITHHELD`` otherwise. Anything that is not
+    text is dropped (None), never turned into text."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    name = value.strip()
+    if not _NAME_SHAPE.match(name) or _key_like(name) or _redacted(name, 128) != name:
+        return WITHHELD
+    return name
 
 
 def _sid(*parts) -> str:
@@ -217,7 +256,12 @@ def read_only(path: Path, *, tail: int | None = None, limit: int = JSON_MAX) -> 
         os.close(fd)
 
 
+_OWN_ERRORS = re.compile(r"not a regular file|larger than \d+ MB")
+
+
 def _short_error(exc: BaseException) -> str:
+    """A fixed phrase for why a file could not be read: never the
+    exception's own text."""
     if isinstance(exc, FileNotFoundError):
         return "missing"
     if isinstance(exc, PermissionError):
@@ -226,7 +270,10 @@ def _short_error(exc: BaseException) -> str:
         return "a number out of range"
     if isinstance(exc, (ValueError, UnicodeDecodeError, RecursionError)):
         return "not readable JSON"
-    return _redacted(str(exc) or type(exc).__name__, 80)
+    if isinstance(exc, IsADirectoryError):
+        return "a folder, not a file"
+    message = exc.args[0] if len(exc.args) == 1 and isinstance(exc.args[0], str) else ""
+    return message if _OWN_ERRORS.fullmatch(message) else "can't be read"
 
 
 # ---- which runner folders ---------------------------------------------------------
@@ -280,7 +327,8 @@ def fingerprint(config: dict, cfg: dict) -> dict:
         folder = Path(entry["path"])
         runners.append([entry["name"], [_stat(folder.joinpath(*parts)) for parts in RUNNER_FILES.values()]])
     table = cfg.get("routing_table")
-    return {"runners": runners, "usage": _stat(usage.cache_file()), "table": _stat(Path(table)) if table else None}
+    return {"runners": runners, "usage": _stat(usage.cache_file()), "table": _stat(Path(table)) if table else None,
+            "redaction": REDACTION}
 
 
 def any_configured(config: dict, cfg: dict) -> bool:
@@ -304,11 +352,12 @@ def _parse_global(data: bytes) -> dict:
         raise ValueError("limited is not an object")
     out = {}
     for lane, item in limited.items():
-        lane_name = _name(lane)
+        lane_name = safe_name(lane)
         until = item.get("until") if isinstance(item, dict) else None
         if lane_name is None or _epoch(until) is None:
             continue
-        out[lane_name] = {"until": _number(until), "reason": _redacted(item.get("reason"), 120) or None}
+        # The lane and its end only: the runner's reason is free text.
+        out[lane_name] = {"until": _number(until)}
     return {"limited": out}
 
 
@@ -327,14 +376,15 @@ def _parse_heartbeat(data: bytes) -> dict:
 
 
 _SCRIPT_EXT = (".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".rb", ".pl")
-_PLAIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+_LAUNCH_COMMAND = "the launch command"
 
 
 def _script_name(launch: list[str]) -> str:
     """The launch script's file name, the only text a launch list gives the
     record: the first argument that is a script file, else the program run,
     and only when it is a plain short file name that redaction leaves alone
-    and that no secret flag precedes; otherwise a fixed phrase."""
+    (``safe_name``) and that no secret flag precedes; otherwise a fixed
+    phrase."""
     after_flag = False
     candidates = []
     for arg in launch:
@@ -345,9 +395,9 @@ def _script_name(launch: list[str]) -> str:
         candidates.append(launch[0])
     for arg in candidates:
         name = Path(arg).name
-        if _PLAIN_NAME.match(name) and _redacted(name, 64) == name:
+        if safe_name(name) == name:
             return name
-    return "the launch command"
+    return _LAUNCH_COMMAND
 
 
 def launch_facts(model, launch) -> dict:
@@ -361,16 +411,23 @@ def launch_facts(model, launch) -> dict:
 
 
 def _config_facts(lanes) -> dict:
-    """A config read kept by an older view, with any launch list it held
-    turned into the facts and dropped."""
+    """A config read kept by an older view, rebuilt from the allowed fields
+    only: names that pass ``safe_name``, the launch facts (any launch list it
+    held turned into the facts and dropped), and nothing else."""
     out = {}
     for lane, spec in (lanes.items() if isinstance(lanes, dict) else ()):
-        if not isinstance(spec, dict):
+        lane_name = safe_name(lane)
+        if lane_name is None or not isinstance(spec, dict):
             continue
-        spec = dict(spec)
         if "launch" in spec or "fast" not in spec:
-            spec.update(launch_facts(spec.get("model"), spec.pop("launch", None)))
-        out[lane] = spec
+            facts = launch_facts(spec.get("model"), spec.get("launch"))
+        else:
+            script = spec.get("script")
+            facts = {"fast": spec.get("fast") is True, "model_in_launch": spec.get("model_in_launch") is True,
+                     "script": script if isinstance(script, str) and safe_name(script) == script
+                     else _LAUNCH_COMMAND}
+        out[lane_name] = {"kind": safe_name(spec.get("kind")), "model": safe_name(spec.get("model")),
+                          "confirm_lane": safe_name(spec.get("confirm_lane")), **facts}
     return out
 
 
@@ -384,18 +441,18 @@ def _parse_config(data: bytes) -> dict:
         raise ValueError("no lanes")
     lanes = {}
     for lane, spec in list(doc["lanes"].items())[:64]:
-        lane_name = _name(lane)
+        lane_name = safe_name(lane)
         if lane_name is None or not isinstance(spec, dict):
             continue
         lanes[lane_name] = {
-            "kind": _name(spec.get("kind")), "model": _name(spec.get("model")),
-            "confirm_lane": _name(spec.get("confirm_lane")),
+            "kind": safe_name(spec.get("kind")), "model": safe_name(spec.get("model")),
+            "confirm_lane": safe_name(spec.get("confirm_lane")),
             **launch_facts(spec.get("model"), spec.get("launch")),
         }
     defaults = doc.get("defaults") if isinstance(doc.get("defaults"), dict) else {}
     fix = defaults.get("fix_lanes")
-    return {"lanes": lanes, "check_lane": _name(defaults.get("check_lane")),
-            "fix_lanes": [n for n in (_name(x) for x in fix[:32]) if n] if isinstance(fix, list) else []}
+    return {"lanes": lanes, "check_lane": safe_name(defaults.get("check_lane")),
+            "fix_lanes": [n for n in (safe_name(x) for x in fix[:32]) if n] if isinstance(fix, list) else []}
 
 
 def runner_basis(at: datetime, until: datetime) -> str:
@@ -445,30 +502,31 @@ def _parse_events(data: bytes, now: datetime, limits: dict[str, datetime] | None
         m = _LINE.match(line.strip())
         if not m or at is None:
             continue
-        kind, pipeline, rest = m.group(3), _name(m.group(2)), m.group(4)
+        # The line's own words never leave this loop: only its time, its
+        # kind, and names that pass ``safe_name``.
+        kind, pipeline, rest = m.group(3), safe_name(m.group(2)), m.group(4)
         fields = dict(_FIELD.findall(rest))
         if kind == "HOLD":
             holds += 1
         elif kind == "LIMITED":
-            lane, until = _name(fields.get("lane")), _parse(fields.get("until"))
+            lane, until = safe_name(fields.get("lane")), _parse(fields.get("until"))
             if lane and until:
                 if lane in limits and _same_until(limits[lane], until):
                     matched[lane] = at if lane not in matched else max(matched[lane], at)
                 out["LIMITED"].append({"at": _iso(at), "pipeline": pipeline, "lane": lane, "until": _iso(until),
-                                       "basis": runner_basis(at, until),
-                                       "text": _redacted(f"{m.group(2)} LIMITED {rest}")})
+                                       "basis": runner_basis(at, until)})
         elif kind == "ADDED":
             # A line that names no check lane or no fix lanes leaves the
             # runner's defaults (config.json) to pick them: kept as None.
-            check = _name(fields.get("check_lane")) if "check_lane" in fields else None
-            fix = [n for n in (_name(x) for x in fields["fix_lanes"].split(",")) if n] \
+            check = safe_name(fields.get("check_lane")) if "check_lane" in fields else None
+            fix = [n for n in (safe_name(x) for x in fields["fix_lanes"].split(",")) if n] \
                 if "fix_lanes" in fields else None
             out["ADDED"].append({"at": _iso(at), "pipeline": pipeline,
                                  "private": bool(re.search(r"(?:^|\s)privacy(?:\s|$)", rest)),
                                  "lanes": [n for n in [check, *(fix or [])] if n],
                                  "check_lane": check, "fix_lanes": fix})
         elif kind == "LAUNCH":
-            lane = _name(fields.get("lane"))
+            lane = safe_name(fields.get("lane"))
             if lane and now - at <= LAUNCH_KEEP:
                 out["LAUNCH"].append({"at": _iso(at), "pipeline": pipeline, "lane": lane})
     for kind, cap in dict(KEEP_LINES, **(keep or {})).items():
@@ -602,6 +660,17 @@ def _sightings(cache: dict, prev) -> dict:
     return out
 
 
+def _until_words(at: datetime, until: datetime) -> str:
+    return until.strftime("%H:%MZ") if until.date() == at.date() else until.strftime("%Y-%m-%d %H:%MZ")
+
+
+def _runner_words(runner: str, lane, at: datetime, until: datetime, *, pipeline=None, file: bool = False) -> str:
+    """An evidence line worded by Khipu from parsed fields, never a runner's
+    own text: "project A runner: lane muse limited until 16:00Z"."""
+    where = " (global.json)" if file else (f" (pipeline {pipeline})" if pipeline else "")
+    return _redacted(f"{runner} runner: lane {lane or WITHHELD} limited until {_until_words(at, until)}{where}")
+
+
 def runner_evidence(status: dict, cache: dict) -> list[dict]:
     """The evidence one runner gives, in the fold's shape: one limited entry
     per LIMITED line in the tail, and one per ``global.json`` limit still in
@@ -621,7 +690,8 @@ def runner_evidence(status: dict, cache: dict) -> list[dict]:
         out.append({"id": "r" + _sid(name, line["at"], line.get("lane"), line["until"], line.get("pipeline")),
                     "account": None, "runner": name, "lane": line["lane"], "state": "limited", "until": until,
                     "basis": basis, "scope": "all", "window": None, "used_pct": None, "source": "runner",
-                    "written_by": by, "via": "runner", "at": at, "evidence": line.get("text"), "reason": None,
+                    "written_by": by, "via": "runner", "at": at, "reason": None,
+                    "evidence": _runner_words(name, line.get("lane"), at, until, pipeline=line.get("pipeline")),
                     "message_time": basis == "cli", "silent": status["silent"]})
     glob = cache.get("global") or {}
     sightings = cache.get("sightings") if isinstance(cache.get("sightings"), dict) else {}
@@ -642,7 +712,7 @@ def runner_evidence(status: dict, cache: dict) -> list[dict]:
                     "lane": lane, "state": "limited", "until": until, "basis": "cli" if exact else "estimated",
                     "scope": "all", "window": None, "used_pct": None, "source": "runner", "written_by": by,
                     "via": "runner", "at": at, "reason": None, "message_time": exact,
-                    "evidence": _redacted(f"global.json: {lane} limited ({item.get('reason') or 'no reason'})"),
+                    "evidence": _runner_words(name, lane, at, until, file=True),
                     "silent": status["silent"]})
     return out
 
@@ -650,26 +720,49 @@ def runner_evidence(status: dict, cache: dict) -> list[dict]:
 # ---- the usage cache ----------------------------------------------------------------
 
 
-def usage_evidence() -> tuple[list[dict], dict]:
+def configured_keys(config: dict) -> set[str]:
+    """The usage cache keys of the configured accounts: each valid
+    ``usage_accounts`` entry, or with none set every harness's default
+    login (what ``usage.configured_accounts`` reads, without its PATH
+    lookup, so every caller gets the same set)."""
+    from khipu import usage
+
+    raw = config.get("usage_accounts")
+    if not isinstance(raw, list) or not raw:
+        return {f"{harness}|" for harness in usage.HARNESSES}
+    out = set()
+    for entry in raw:
+        account = usage._account_from_entry(entry)
+        if not account.get("invalid"):
+            out.add(usage._key(account))
+    return out
+
+
+def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict]:
     """Evidence from Khipu's own usage cache (``khipu usage``), and a short
     status of it. A window at 100% or more closes its scope until its reset
     (basis cli); figures with headroom (every window under 100%) reopen it
     (basis checked); a window at 100% with no reset time ahead gives no
     evidence for its scope, never open; a probe that found the CLI not
     signed in or not installed is down. Figures Muse
-    or Codex keep from their last turn are marked ``observed``."""
+    or Codex keep from their last turn are marked ``observed``. Only rows
+    whose key is a configured account (``configured``) are read; any other
+    row is skipped whole, so no key of its own becomes an account."""
     from khipu import usage
 
     rows = usage._load_cache()
     out: list[dict] = []
     newest: datetime | None = None
     by = {"kind": "probe"}
+    used = 0
     for key, row in sorted(rows.items()):
-        if key.partition("|")[0] not in usage.HARNESSES:
+        if key.partition("|")[0] not in usage.HARNESSES or (configured is not None and key not in configured):
             continue
+        used += 1
         attempt = _parse(row.get("last_attempt_at") or row.get("probed_at"))
         error = None if row.get("ok") else (row.get("last_error") or row.get("error"))
-        if error in (usage.E_SIGNIN, usage.E_NOT_INSTALLED) and attempt is not None:
+        error = next((e for e in (usage.E_SIGNIN, usage.E_NOT_INSTALLED) if e == error), None)
+        if error is not None and attempt is not None:
             out.append({"id": "p" + _sid(key, "down", _iso(attempt)), "account": key, "runner": None, "lane": None,
                         "state": "down", "until": None, "basis": "checked", "scope": "all", "window": None,
                         "used_pct": None, "source": "probe", "written_by": by, "via": "probe", "at": attempt,
@@ -686,8 +779,7 @@ def usage_evidence() -> tuple[list[dict], dict]:
         observed = row.get("source") in ("last_observed", "rollout")
         groups: dict[str, list[dict]] = {}
         for w in windows:
-            model = w.get("model")
-            groups.setdefault(model if isinstance(model, str) and model.strip() else "all", []).append(w)
+            groups.setdefault(safe_name(w.get("model")) or "all", []).append(w)
         for scope, group in sorted(groups.items()):
             full: list[tuple[datetime, dict]] = []
             top = None
@@ -703,12 +795,12 @@ def usage_evidence() -> tuple[list[dict], dict]:
             # still ahead of the probe, the scope gives no evidence at all.
             if top is None or (top >= 100 and not full):
                 continue
-            base = {"account": key, "runner": None, "lane": None, "scope": _redacted(scope, 64), "source": "probe",
+            base = {"account": key, "runner": None, "lane": None, "scope": scope, "source": "probe",
                     "written_by": by, "via": "probe", "at": at, "reason": None, "message_time": False,
                     "observed": observed}
             if full:
                 reset, w = max(full, key=lambda item: item[0])
-                name = str(w.get("name") or "")
+                name = safe_name(w.get("name")) or ""
                 window = "weekly" if name.startswith("weekly") else name or None
                 out.append(dict(base, id="p" + _sid(key, scope, "limited", _iso(at), _iso(reset)), state="limited",
                                 until=reset, basis="cli", window=window, used_pct=_number(w.get("used_pct")),
@@ -717,20 +809,19 @@ def usage_evidence() -> tuple[list[dict], dict]:
                 out.append(dict(base, id="p" + _sid(key, scope, "open", _iso(at)), state="open", until=None,
                                 basis="checked", window=None, used_pct=top,
                                 evidence=f"usage probe: highest window at {top}%"))
-    return out, {"accounts": len(rows), "newest": _iso(newest)}
+    return out, {"accounts": used, "newest": _iso(newest)}
 
 
 # ---- the routing table (a pointer, never account state) ------------------------------
 
 
 def read_table(path: str | None) -> dict | None:
-    """The table's NOW block as a pointer: a hash of the block, its
-    ``updated:`` line (clipped and redacted) and the time it gives, and the
-    file's modification time. Its prose is never kept."""
+    """The table's NOW block as a pointer: a hash of the block, the time
+    its ``updated:`` line gives, and the file's modification time. No text
+    of the table is kept, the ``updated:`` line's included."""
     if not path:
         return None
-    out: dict[str, Any] = {"path": path, "hash": None, "updated": None, "stamped_at": None, "changed_at": None,
-                           "error": None}
+    out: dict[str, Any] = {"path": path, "hash": None, "stamped_at": None, "changed_at": None, "error": None}
     try:
         data, mtime = read_only(Path(path), limit=TABLE_MAX)
     except (OSError, ValueError) as exc:
@@ -745,7 +836,6 @@ def read_table(path: str | None) -> dict | None:
     out["changed_at"] = _iso(_epoch(mtime))
     line = _UPDATED.search(block)
     if line:
-        out["updated"] = _redacted(line.group(0), 120)
         stamp = _STAMP.search(line.group(0))
         if stamp:
             out["stamped_at"] = _iso(_parse(f"{stamp.group(1)}T{stamp.group(2)}:{stamp.group(3)}:"
@@ -778,7 +868,7 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
         runners.append(status)
         cache["runners"][entry["name"]] = kept
         evidence += runner_evidence(status, kept)
-    usage_items, usage_status = usage_evidence()
+    usage_items, usage_status = usage_evidence(configured_keys(config))
     evidence += usage_items
     status = {"runners": runners, "refused": refused, "invalid": invalid, "usage": usage_status,
               "table": read_table(cfg.get("routing_table"))}

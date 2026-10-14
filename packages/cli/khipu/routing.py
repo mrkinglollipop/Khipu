@@ -1086,8 +1086,10 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
     events_stat, config_stat = _stat(events_file()), _stat(config_file())
     config = load_config()
     cfg = settings(config)
-    # routing_sources is read entry by entry (one bad entry costs only itself).
-    cfg["_raw_sources"] = {"routing_sources": config.get("routing_sources")}
+    # routing_sources is read entry by entry (one bad entry costs only itself);
+    # usage_accounts says which usage cache rows are read at all.
+    cfg["_raw_sources"] = {"routing_sources": config.get("routing_sources"),
+                           "usage_accounts": config.get("usage_accounts")}
     seed = cfg.get("routing_rules_seed")
     fingerprint = {"events": events_stat, "config": config_stat, "seed": _stat(Path(seed)) if seed else None,
                    "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
@@ -1740,7 +1742,7 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
     body = _scrub(body)
     prev_effective = (prev or {}).get("effective") or {}
     version = int((prev or {}).get("version") or 0)
-    changes = list((prev or {}).get("changes") or [])
+    changes = [_without_table_text(c) for c in (prev or {}).get("changes") or []]
     epoch = (prev or {}).get("epoch") or (secrets.token_hex(4) if record else None)
     if record and saved and body["effective"] != prev_effective:
         version += 1
@@ -1757,6 +1759,18 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
     if not saved:
         out["saved"] = False
     return out
+
+
+_OLD_TABLE_STAMP = re.compile(r"^(The routing table's NOW block changed.*?) \(stamped '.*'\)\.$", re.S)
+
+
+def _without_table_text(change) -> Any:
+    """A change kept from an older view, with the table's ``updated:`` line
+    text an older version quoted dropped from its line."""
+    if not isinstance(change, dict) or not isinstance(change.get("lines"), list):
+        return change
+    lines = [_OLD_TABLE_STAMP.sub(r"\1.", line) if isinstance(line, str) else line for line in change["lines"]]
+    return dict(change, lines=lines)
 
 
 def _not_before_last_fold(now: datetime, prev: dict | None) -> datetime:
@@ -2264,14 +2278,15 @@ def runner_line(runner: dict, now: datetime) -> str:
 
 
 def table_line(table: dict | None, now: datetime) -> str:
-    """The routing table's NOW block as a pointer: that it changed and its
-    stamp, never its prose."""
+    """The routing table's NOW block as a pointer: that it changed and the
+    time its stamp gives, never its text."""
     if not table:
         return "The routing table is no longer read"
     if table.get("error"):
         return f"Khipu can't read the routing table's NOW block ({table['error']})"
     at = _parse(table.get("changed_at"))
-    stamp = f" (stamped '{table['updated']}')" if table.get("updated") else ""
+    stamped = _parse(table.get("stamped_at"))
+    stamp = f" (stamped {_clock(stamped, now)})" if stamped else ""
     return "The routing table's NOW block changed" + (f" at {_clock(at, now)}" if at else "") + f"{stamp}."
 
 

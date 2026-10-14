@@ -180,8 +180,8 @@ Every entry carries these fields:
   as a guess.
 - `scope`: all, or a model name when the window is model-scoped (the Claude probe already returns windows
   with a `model`, `usage.parse_claude`).
-- `window` (five-hour, weekly or none) and `used_pct` when a probe gave them; `evidence`, one clipped and
-  redacted line (the runner's LIMITED line, the probe's error code); and `source` (a runner's name, probe,
+- `window` (five-hour, weekly or none) and `used_pct` when a probe gave them; `evidence`, one line Khipu words from
+  parsed fields (a runner's lane, end and pipeline; the probe's error code), never a source's own text; and `source` (a runner's name, probe,
   check, report or owner). The routing table is never a source of account state.
 
 **Holds** are short notes about one account, the machine, or all work. Each has a scope, a reason from a
@@ -250,8 +250,10 @@ MCP tool refuses them. Doctor warns when any of them was written by anything oth
    checks only, these keys of `config.json` and nothing else: each lane's `kind`, `model`, `launch` argument
    list and `confirm_lane`, and `defaults.check_lane` and `defaults.fix_lanes`. Nothing else in `config.json`
    is read or kept. The `launch` arguments are never kept: only what the checks need is kept from them (whether
-   a model ending in -fast is named, whether the model is one of them, and the launch script's file name). Every line Khipu stores or pushes from a runner first passes through Khipu's existing
-   secret redaction (`khipu.redact.redact_secrets`). Khipu never takes a runner's lock and never writes:
+   a model ending in -fast is named, whether the model is one of them, and the launch script's file name). Runner and table text is never stored or
+   shown: Khipu keeps only parsed fields (times, the line kind, numbers) and names (lane, pipeline, model, kind)
+   that pass a strict shape check and do not look like a key, with Khipu's existing secret redaction
+   (`khipu.redact.redact_secrets`) as a second layer; usage cache rows are read only for configured accounts. Khipu never takes a runner's lock and never writes:
    `lanes.py` saves `global.json` at the end of a pass without its own mutex (`lanes.py:1860`), so a second
    writer would race it. Until runners write the basis themselves, a runner's `until` counts as **cli** only
    when its seconds are zero and it is not exactly 30 minutes after the LIMITED line (the shape `limit_until`
@@ -275,9 +277,9 @@ MCP tool refuses them. Doctor warns when any of them was written by anything oth
    note, owner pauses or clears.
 4. **The owner in the app**: pauses and lifts, clears and dismissals, holds, the rules and his note.
 5. **Until the cutover only: the table, read only, and never as account state.** Setting `routing_table`
-   names the file. Khipu reads the NOW block's `updated:` line and a hash of the block. When the hash changes,
-   the version moves with one line: "The routing table's NOW block changed at HH:MMZ (stamped '<updated
-   line>')." Khipu does not push the table's prose, which is free text from a file any process rewrites
+   names the file. Khipu reads the time the NOW block's `updated:` line gives and a hash of the block. When the
+   hash changes, the version moves with one line: "The routing table's NOW block changed at HH:MMZ (stamped
+   HH:MMZ)." Khipu does not push the table's prose, which is free text from a file any process rewrites
    without a lock, and it never writes the file before phase 8.
 
 ### Folding the sources into one state
@@ -675,7 +677,7 @@ place.
 Inspect a real `global.json`, `events.log`, `heartbeat.json` and `config.json` from a lanes runner (read
 only; copied into fixtures by shape, with names changed) and the usage cache before writing the adapters.
 
-- Build the read-only runner adapter (only the named `config.json` keys; every stored line redacted), the lane
+- Build the read-only runner adapter (only the named `config.json` keys; only parsed fields and checked names stored), the lane
   map with unmatched lanes, the usage-cache source with model-scoped windows, the silent-runner and
   unreadable-file entries, and the table pointer.
 - Tests: fixtures shaped like the real runner files, including a Muse LIMITED line with a 30-minute guess and
