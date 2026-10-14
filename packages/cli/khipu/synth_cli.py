@@ -1,9 +1,11 @@
 """Exact session exclusion shared by subscription adapters and native capture."""
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
+import re
 import tempfile
 import uuid
 from contextlib import contextmanager
@@ -82,13 +84,54 @@ _CANDIDATES = {
     "grok": ("~/.grok/bin/grok", "/opt/homebrew/bin/grok", "/usr/local/bin/grok", "~/.local/bin/grok"),
     "muse": ("/opt/homebrew/bin/muse", "/usr/local/bin/muse", "~/.local/bin/muse"),
 }
+# Where a Node version manager puts a CLI installed with ``npm i -g`` (or its
+# own global add), none of them on launchd's PATH: tried last, in this order.
+# A ``*`` is a Node version folder, newest version first.
+_NODE_MANAGER_DIRS = ("~/.nvm/versions/node/*/bin", "~/.volta/bin", "~/Library/pnpm", "~/.bun/bin",
+                      "~/.local/share/fnm/node-versions/*/installation/bin", "~/.asdf/shims")
+
+
+def _node_version(folder: str) -> tuple[int, ...]:
+    """``v22.10.1`` as (22, 10, 1), compared as numbers (v9 is older than
+    v22); a folder that is not a version sorts after every version."""
+    m = re.match(r"v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", folder)
+    return tuple(int(g or 0) for g in m.groups()) if m else (-1,)
+
+
+def _node_manager_candidates(name: str):
+    for pattern in _NODE_MANAGER_DIRS:
+        base, star, tail = pattern.partition("/*/")
+        try:
+            root = Path(base).expanduser()
+        except RuntimeError:  # no home to expand
+            continue
+        if not star:
+            yield root / name
+            continue
+        try:
+            versions = [d for d in root.iterdir() if d.is_dir()]
+        except OSError:
+            continue
+        for folder in sorted(versions, key=lambda d: (_node_version(d.name), d.name), reverse=True):
+            yield folder / tail / name
+
+
+def _executable(path: Path) -> bool:
+    with contextlib.suppress(OSError):
+        return path.is_file() and os.access(path, os.X_OK)
+    return False
 
 
 def binary(name: str) -> str | None:
     """Absolute path of the user's CLI, or None. The launchd drain job runs with
     a bare PATH (2026-10-13: every capture failed with FileNotFoundError the
     minute the provider was switched), so PATH is only the first place looked;
-    ``KHIPU_<NAME>_CLI`` names an explicit binary."""
+    ``KHIPU_<NAME>_CLI`` names an explicit binary and is looked at before
+    anything else. After PATH come the usual install folders, then the folders
+    a Node version manager installs into (``_NODE_MANAGER_DIRS``), where only
+    an executable file counts. A Node CLI found there still needs node on its
+    PATH: the plan usage probes add the CLI's own folder
+    (``usage._probe_path``)."""
     import shutil
 
     override = (os.environ.get(f"KHIPU_{name.upper()}_CLI") or "").strip()
@@ -100,6 +143,9 @@ def binary(name: str) -> str | None:
     for candidate in _CANDIDATES.get(name, ()):
         p = Path(candidate).expanduser()
         if p.is_file() or p.is_symlink():
+            return str(p)
+    for p in _node_manager_candidates(name):
+        if _executable(p):
             return str(p)
     return None
 

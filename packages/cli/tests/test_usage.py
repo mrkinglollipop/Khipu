@@ -3,7 +3,8 @@
 Every adapter runs against a fake child process that answers with a reply
 recorded from the real CLI on 2026-10-14 (numbers fixed, ids and emails
 replaced; tests/fixtures/usage/). No test starts a real CLI: ``_command`` is
-patched in every test that probes.
+patched in every test that probes, except the Node version manager test, whose
+lookup sees only a temp HOME and launchd's PATH.
 """
 from __future__ import annotations
 
@@ -585,11 +586,11 @@ def test_probe_environment_is_an_allowlist(fake, tmp_path, monkeypatch):
 LAUNCHD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 
 
-def _npm_shim(tmp_path, fixture: str, out: Path) -> Path:
-    """An npm-style install: ``prefix/bin/codex`` links to a
+def _npm_shim(tmp_path, fixture: str, out: Path, prefix: Path | None = None, name: str = "codex") -> Path:
+    """An npm-style install: ``prefix/bin/<name>`` links to a
     ``#!/usr/bin/env node`` script, and node sits beside the link (nvm's
     layout). This node is a shell script running the fake CLI's Python."""
-    prefix = tmp_path / "npm-prefix"
+    prefix = prefix or tmp_path / "npm-prefix"
     package = prefix / "lib" / "node_modules" / "codex-fixture" / "bin"
     package.mkdir(parents=True)
     (prefix / "bin").mkdir()
@@ -604,7 +605,7 @@ def _npm_shim(tmp_path, fixture: str, out: Path) -> Path:
         runpy.run_path(sys.argv[0], run_name="__main__")
     """))
     script.chmod(0o755)
-    shim = prefix / "bin" / "codex"
+    shim = prefix / "bin" / name
     shim.symlink_to(Path("..") / "lib" / "node_modules" / "codex-fixture" / "bin" / "codex.js")
     return shim
 
@@ -621,6 +622,65 @@ def test_a_node_shim_answers_under_the_bare_launchd_path(fake, tmp_path, monkeyp
     assert row["ok"] is True and row["source"] == "live", row
     assert row["plan"] == "pro"
     assert _child(out)["argv"] == ["app-server"]
+
+
+def _launchd_lookup(monkeypatch, home: Path):
+    """``synth_cli.binary`` as Khipu.app runs it: launchd's PATH, ``home`` as
+    HOME, no override, and of the usual install folders only those under HOME
+    (so a CLI this Mac has in /opt/homebrew or /Applications never answers)."""
+    from khipu import synth_cli
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", LAUNCHD_PATH)
+    for harness in usage.HARNESSES:
+        monkeypatch.delenv(f"KHIPU_{harness.upper()}_CLI", raising=False)
+    monkeypatch.setattr(synth_cli, "_CANDIDATES", {h: tuple(c for c in v if c.startswith("~"))
+                                                   for h, v in synth_cli._CANDIDATES.items()})
+    return synth_cli
+
+
+def _stub(path: Path, mode: int = 0o755) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 9\n")
+    path.chmod(mode)
+    return path
+
+
+def test_an_nvm_cli_is_found_and_answers_under_the_bare_launchd_path(tmp_path, monkeypatch):
+    """Khipu.app's PATH names no Node version manager folder, so a Claude Code
+    installed with ``npm i -g`` under nvm was left out of plan usage. The
+    newest Node's copy wins: v22 over v20, and over v9, which a sort by text
+    would put first. Its node, beside it, answers through ``_probe_path``."""
+    (tmp_path / "fake_cli.py").write_text(FAKE_CLI)
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
+    home = tmp_path / "home"
+    versions = home / ".nvm" / "versions" / "node"
+    for older in ("v20.11.1", "v9.11.2"):
+        _stub(versions / older / "bin" / "claude")
+    out = tmp_path / "claude-child.json"
+    shim = _npm_shim(tmp_path, "claude.jsonl", out, prefix=versions / "v22.0.0", name="claude")
+    synth_cli = _launchd_lookup(monkeypatch, home)
+    assert synth_cli.binary("claude") == str(shim)
+    assert usage.configured_accounts() == [{"label": "Claude", "harness": "claude", "home": None}]
+    assert str(shim.parent) in usage.probe_environment("claude", None, str(shim))["PATH"].split(os.pathsep)
+    row = usage.probe_claude()
+    assert row["ok"] is True and row["plan"] == "max", row
+    assert _child(out)["argv"][:1] == ["-p"]
+
+
+def test_a_node_manager_match_that_is_not_executable_is_skipped(tmp_path, monkeypatch):
+    synth_cli = _launchd_lookup(monkeypatch, tmp_path)
+    _stub(tmp_path / ".nvm" / "versions" / "node" / "v22.0.0" / "bin" / "codex", 0o644)
+    (tmp_path / ".volta" / "bin" / "codex").mkdir(parents=True)  # a folder by the CLI's name
+    assert synth_cli.binary("codex") is None
+    older = _stub(tmp_path / ".nvm" / "versions" / "node" / "v20.11.1" / "bin" / "codex")
+    assert synth_cli.binary("codex") == str(older)
+    for folder in (".volta/bin", "Library/pnpm", ".bun/bin", ".local/share/fnm/node-versions/v24.1.0/installation/bin",
+                   ".asdf/shims"):
+        found = _stub(tmp_path / folder / "grok")
+        assert synth_cli.binary("grok") == str(found), folder
+        found.chmod(0o644)
+    assert synth_cli.binary("grok") is None
 
 
 def test_probe_path_keeps_the_callers_own_and_adds_the_cli_folders(tmp_path, monkeypatch):

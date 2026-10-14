@@ -75,8 +75,9 @@ _GROK_ENV = {"GROK_CURSOR_MCPS_ENABLED": "0", "GROK_CLAUDE_MCPS_ENABLED": "0"}
 # Added after the caller's PATH. Khipu.app starts under launchd's bare PATH
 # (/usr/bin:/bin:/usr/sbin:/sbin, promote.LAUNCHD_PATH), and an npm-installed
 # CLI is a ``#!/usr/bin/env node`` shim that exits 127 there before it answers
-# unless node's folder is on PATH: the CLI's own folder (nvm keeps node beside
-# it), the folder of the file it links to, then these.
+# unless node's folder is on PATH. So the child's PATH gains the folder
+# synth_cli.binary found the CLI in (under nvm and fnm, node sits in that same
+# folder), the folder of the file it links to, then these.
 _TOOL_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "~/.npm-global/bin", "~/.local/bin")
 _SYSTEM_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
