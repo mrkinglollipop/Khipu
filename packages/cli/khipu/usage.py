@@ -93,16 +93,38 @@ E_CLI = "cli_error"
 E_INVALID = "invalid_account"
 E_INTERNAL = "internal_error"
 E_PENDING = "pending"
-_NOTES = {
-    E_NO_LIMITS: "this login reports no plan limits (a login made with a setup token answers none); "
-                 "run /login in this home",
-    E_SIGNIN: "the CLI is not signed in for this home",
-    E_NOT_INSTALLED: "CLI not found on PATH",
-    E_PENDING: "first probe running; ask again in a few seconds",
-}
-# Plain words only: the app shows notes as written. The live read's own code
-# goes in the row's ``live_error`` field, never into the note.
+# The CLIs by the names the app's form gives them.
+CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok Build", "muse": "Muse"}
+# Plain words only: the app shows notes as written to an owner who is not
+# technical, so a note names a login folder, never a home, a PATH, a token or
+# a probe. The live read's own code goes in the row's ``live_error`` field,
+# never into the note.
 ROLLOUT_NOTE = "Codex did not answer just now; these figures are from its last turn"
+
+
+def _note(code: str | None, harness: str | None = None, home: str | None = None) -> str | None:
+    """Khipu's own sentence for a failure ``code`` on one account, or None."""
+    name = CLI_NAMES.get(harness or "", "This CLI")
+    folder = " with this login folder" if home else ""
+    if code == E_NOT_INSTALLED:
+        return f"{name} is not installed on this Mac"
+    if code == E_SIGNIN:
+        return f"{name} is not signed in{folder}. Open {name}{folder} and sign in again"
+    if code == E_NO_LIMITS:
+        return f"This sign-in reports no plan limits. Open {name}{folder} and sign in again (/login)"
+    if code == E_PENDING:
+        return "Reading for the first time; ask again in a few seconds"
+    return None
+
+
+def _rollout_note(code: str, home: str | None) -> str:
+    """The note on Codex's last-turn figures after its live read failed with
+    ``code``: a signed-out Codex says so, since reading again will not help."""
+    if code == E_SIGNIN:
+        folder = " with this login folder" if home else ""
+        return (f"Codex is not signed in{folder}, so these figures are from its last turn. "
+                f"Open Codex{folder} and sign in again")
+    return ROLLOUT_NOTE
 _SIGNIN = re.compile(r"not (signed|logged) in|(log|sign) ?in (is )?required|please (log|sign) ?in|"
                      r"unauthori[sz]ed|unauthenticated|authentication (failed|required)|\b401\b", re.I)
 
@@ -642,7 +664,7 @@ def probe_codex(home: str | None = None, *, timeout: float = TIMEOUT_S) -> dict:
         fallback = codex_rollout(home, deadline=deadline)
         if fallback is None:
             raise
-        fallback["note"] = ROLLOUT_NOTE
+        fallback["note"] = _rollout_note(exc.code, home)
         fallback["live_error"] = exc.code
         return fallback
 
@@ -742,22 +764,50 @@ HOME_MAX = 1024
 _ACCOUNT_FIELDS = ("label", "harness", "home")
 
 
+class AccountsError(ValueError):
+    """A ``usage_accounts`` list ``khipu config --set`` refuses. ``code`` is
+    fixed (the app turns it into its own sentence and never shows the text);
+    ``index`` is the 0-based entry at fault, ``field`` the one field at fault
+    (label, harness or home) and ``other`` the earlier entry it repeats."""
+
+    def __init__(self, message: str, code: str, *, index: int | None = None, field: str | None = None,
+                 other: int | None = None):
+        super().__init__(message)
+        self.code, self.index, self.field, self.other = code, index, field, other
+
+    def refusal(self) -> dict:
+        return {"ok": False, "error": str(self), "code": self.code, "index": self.index, "field": self.field,
+                "other": self.other}
+
+
+def _entry_problem(harness: str, home: str | None) -> tuple[str, str, str] | None:
+    """Why an entry cannot be read, as (code, field, plain reason), or None.
+    The reason is shown in the app as written: no home, harness or path."""
+    if harness not in HARNESSES:
+        named = f'the CLI "{harness}"' if harness else "an entry with no CLI"
+        return "unknown_cli", "harness", (f"Khipu does not read {named}; it reads Claude Code, Codex, "
+                                          "Grok Build and Muse")
+    if harness == "muse" and home:
+        return "muse_folder", "home", "Muse has one sign-in, so it takes no login folder"
+    if home and _home_path(home) is None:
+        return "no_such_folder", "home", (f"Khipu cannot find the login folder {home}; start it with ~/ "
+                                          "(for example ~/.codex-work) or give the full path")
+    return None
+
+
 def _account_from_entry(entry) -> dict:
     """One ``usage_accounts`` entry as an account; a problem goes in
     ``invalid`` (the report shows the entry instead of hiding it)."""
     if not isinstance(entry, dict):
-        return {"label": "?", "harness": "?", "home": None, "invalid": "entry is not an object"}
+        return {"label": "?", "harness": "?", "home": None, "invalid": "this entry is not an account"}
     harness = str(entry.get("harness") or "").strip().lower()
     label = str(entry.get("label") or "").strip() or LABELS.get(harness, harness or "?")
     home = entry.get("home")
     home = str(home).strip() if isinstance(home, str) and home.strip() else None
     account = {"label": label, "harness": harness or "?", "home": home}
-    if harness not in HARNESSES:
-        account["invalid"] = f"unknown harness {harness or '(none)'!r}; one of {', '.join(HARNESSES)}"
-    elif harness == "muse" and home:
-        account["invalid"] = "Muse has one login per user; a home cannot be chosen"
-    elif home and _home_path(home) is None:
-        account["invalid"] = f"home {home!r} names a user this Mac does not have"
+    problem = _entry_problem(harness, home)
+    if problem:
+        account["invalid"] = problem[2]
     return account
 
 
@@ -775,51 +825,61 @@ def configured_accounts() -> list[dict]:
 
 def parse_usage_accounts(raw) -> list[dict]:
     """``raw`` (JSON text or a list) as the ``usage_accounts`` entries to store,
-    or ValueError naming the first problem. Stricter than
-    ``configured_accounts``, which shows a hand-edited bad entry rather than
-    refusing it: ``khipu config --set usage_accounts`` stores only entries
-    that can be probed, each login once, each label once."""
+    or ``AccountsError`` (a ValueError) naming the first problem with a fixed
+    code. Stricter than ``configured_accounts``, which shows a hand-edited bad
+    entry rather than refusing it: ``khipu config --set usage_accounts``
+    stores only entries that can be probed, each login once, each label once."""
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
         except ValueError:
-            raise ValueError('usage_accounts must be JSON: a list of {"label", "harness", "home"} entries') from None
+            raise AccountsError('usage_accounts must be JSON: a list of {"label", "harness", "home"} entries',
+                                "bad_list") from None
     if not isinstance(raw, list):
-        raise ValueError('usage_accounts must be a list of {"label", "harness", "home"} entries')
+        raise AccountsError('usage_accounts must be a list of {"label", "harness", "home"} entries', "bad_list")
     if len(raw) > ACCOUNTS_MAX:
-        raise ValueError(f"usage_accounts holds at most {ACCOUNTS_MAX} entries, got {len(raw)}")
+        raise AccountsError(f"usage_accounts holds at most {ACCOUNTS_MAX} entries, got {len(raw)}", "too_many")
     out: list[dict] = []
-    labels: set[str] = set()
-    logins: set[str] = set()
-    for n, entry in enumerate(raw, 1):
-        where = f"usage_accounts entry {n}"
+    labels: dict[str, int] = {}
+    logins: dict[str, int] = {}
+    for i, entry in enumerate(raw):
+        where = f"usage_accounts entry {i + 1}"
         if not isinstance(entry, dict):
-            raise ValueError(f"{where} is not an object")
+            raise AccountsError(f"{where} is not an object", "bad_entry", index=i)
         extra = sorted(str(k) for k in entry if k not in _ACCOUNT_FIELDS)
         if extra:
-            raise ValueError(f"{where} has an unknown field {extra[0]!r}; the fields are label, harness and home")
+            raise AccountsError(f"{where} has an unknown field {extra[0]!r}; the fields are label, harness and home",
+                                "bad_entry", index=i)
         for field in _ACCOUNT_FIELDS:
             value = entry.get(field)
             if value is None:
                 continue
             if not isinstance(value, str):
-                raise ValueError(f"{where}: {field} must be text")
+                raise AccountsError(f"{where}: {field} must be text", "not_one_line", index=i, field=field)
             if not value.isprintable():
-                raise ValueError(f"{where}: {field} must be one line of plain text")
-        if len((entry.get("label") or "").strip()) > LABEL_MAX:
-            raise ValueError(f"{where}: label is longer than {LABEL_MAX} characters")
-        if len((entry.get("home") or "").strip()) > HOME_MAX:
-            raise ValueError(f"{where}: home is longer than {HOME_MAX} characters")
+                raise AccountsError(f"{where}: {field} must be one line of plain text", "not_one_line",
+                                    index=i, field=field)
+        for field, limit in (("label", LABEL_MAX), ("home", HOME_MAX)):
+            if len((entry.get(field) or "").strip()) > limit:
+                raise AccountsError(f"{where}: {field} is longer than {limit} characters", "too_long",
+                                    index=i, field=field)
+        harness = str(entry.get("harness") or "").strip().lower()
+        home = (entry.get("home") or "").strip() or None
+        problem = _entry_problem(harness, home)
+        if problem:
+            code, field, reason = problem
+            raise AccountsError(f"{where}: {reason}", code, index=i, field=field)
         account = _account_from_entry(entry)
-        if account.get("invalid"):
-            raise ValueError(f"{where}: {account['invalid']}")
-        if account["label"].casefold() in labels:
-            raise ValueError(f"two usage_accounts entries are named {account['label']!r}")
+        name = account["label"].casefold()
+        if name in labels:
+            raise AccountsError(f"two usage_accounts entries are named {account['label']!r}", "name_taken",
+                                index=i, field="label", other=labels[name])
         key = _key(account)
         if key in logins:
-            raise ValueError(f"{where} ({account['label']}) reads the same login as an earlier entry")
-        labels.add(account["label"].casefold())
-        logins.add(key)
+            raise AccountsError(f"{where} ({account['label']}) reads the same login as an earlier entry",
+                                "login_taken", index=i, field="home", other=logins[key])
+        labels[name] = i
+        logins[key] = i
         stored = {"label": account["label"], "harness": account["harness"]}
         if account["home"]:
             stored["home"] = account["home"]
@@ -834,8 +894,14 @@ def accounts_status() -> dict:
 
     raw = load_config().get("usage_accounts")
     stored = raw if isinstance(raw, list) and raw else None
+    try:
+        user_home = str(Path.home())
+    except RuntimeError:
+        user_home = None
+    # ``user_home`` lets the app compare "~/.x" with "/Users/me/.x" the way
+    # the stored list is checked, before anything is saved.
     return {"value": stored, "source": "file" if stored is not None else "default",
-            "accounts": configured_accounts()}
+            "accounts": configured_accounts(), "user_home": user_home}
 
 
 def _key(account: dict) -> str:
@@ -858,7 +924,7 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S) -> dict:
     harness, home = account["harness"], account.get("home")
     started = time.monotonic()
     if account.get("invalid"):
-        data = {"ok": False, "error": E_INVALID, "note": f"this account entry is not valid: {account['invalid']}"}
+        data = {"ok": False, "error": E_INVALID, "note": f"This account entry is not valid: {account['invalid']}"}
     elif harness == "claude":
         data = probe_claude(home, timeout=timeout)
     elif harness == "codex":
@@ -873,12 +939,12 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S) -> dict:
     row.update(data)
     row.update({"probed_at": _iso(_now().timestamp()), "ms": int((time.monotonic() - started) * 1000)})
     if not row.get("ok") and not row.get("note"):
-        row["note"] = _NOTES.get(row.get("error"))
+        row["note"] = _note(row.get("error"), harness, home)
     return row
 
 
 def _failed_row(account: dict, code: str) -> dict:
-    return dict(_blank_row(account), ok=False, error=code, note=_NOTES.get(code),
+    return dict(_blank_row(account), ok=False, error=code, note=_note(code, account["harness"], account.get("home")),
                 probed_at=_iso(_now().timestamp()), ms=None)
 
 
@@ -1095,7 +1161,7 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
         refreshing = _start_refresh([accounts[i] for i in due], timeout)
         for i in due:
             if rows[i] is None:
-                rows[i] = dict(_blank_row(accounts[i]), ok=False, error=E_PENDING, note=_NOTES[E_PENDING],
+                rows[i] = dict(_blank_row(accounts[i]), ok=False, error=E_PENDING, note=_note(E_PENDING),
                                probed_at=None, ms=None, cached=False)
             rows[i]["refreshing"] = refreshing
     elif due:

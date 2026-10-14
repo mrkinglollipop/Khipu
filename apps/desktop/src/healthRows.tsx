@@ -20,6 +20,7 @@ import type { DoctorSynthProvider, SynthBudget } from "./SynthProvider";
 import {
   PLAN_ALERT_PCT,
   onlyResetWindows,
+  liveReadFailures,
   plansHealthDetail,
   roundPct,
   tightestOverall,
@@ -140,20 +141,32 @@ function detailFor(key: string, parsed: Record<string, unknown>): string | undef
   return undefined;
 }
 
-/** The "Plans" row. Doctor does not carry plan usage, so it comes from
- *  `khipu_usage_status`: the tightest window still in force across accounts,
- *  red at 90%. A window whose reset has passed counts for nothing. Green only
- *  on evidence: when no account gave a figure and any failed, the row is red
- *  and names them; failed accounts are named beside the figures that were
- *  read. Null until the usage report has been read. */
+/** The "Plans" row, from `khipu_usage_status` (doctor's own `plan_usage`
+ *  block is the cache only, for agents): the tightest window still in force
+ *  across accounts, red at 90%. A window whose reset has passed counts for
+ *  nothing. Green only on evidence: when no account gave a figure and any
+ *  failed, the row is red and names them; failed accounts, and accounts
+ *  showing a fallback because their live read failed, are named beside the
+ *  figures that were read. Null until the usage report has been read. */
 export function plansHealthRow(plans: UsageReport | null | undefined, now: Date = new Date()): HealthRow | null {
   if (!plans || !Array.isArray(plans.accounts)) return null;
   if (plans.accounts.length === 0) return { key: "plans", status: "skipped", label: LABELS.plans };
   const unread = unreadAccounts(plans, now);
   const tight = tightestOverall(plans, now);
+  // A live read that failed (Codex signed out) is named even though its
+  // last-turn figures were read, so the owner learns to sign it in.
+  const live = liveReadFailures(plans);
+  const notes = [...(unread.length ? [`could not read ${unread.join(", ")}`] : []), ...live];
+  const note = notes.length ? { note: notes.join("; ") } : {};
   if (!tight) {
     if (unread.length) {
-      return { key: "plans", status: "err", label: LABELS.plans, detail: `could not read any plan: ${unread.join(", ")}` };
+      return {
+        key: "plans",
+        status: "err",
+        label: LABELS.plans,
+        detail: `could not read any plan: ${unread.join(", ")}`,
+        ...(live.length ? { note: live.join("; ") } : {}),
+      };
     }
     const allReset = plans.accounts.some((row) => onlyResetWindows(row, now));
     return {
@@ -161,6 +174,7 @@ export function plansHealthRow(plans: UsageReport | null | undefined, now: Date 
       status: "ok",
       label: LABELS.plans,
       detail: allReset ? "every limit has reset since it was read" : "no plan limits reported",
+      ...note,
     };
   }
   const pct = roundPct(tight.window.used_pct ?? 0);
@@ -169,7 +183,7 @@ export function plansHealthRow(plans: UsageReport | null | undefined, now: Date 
     status: pct >= PLAN_ALERT_PCT ? "err" : "ok",
     label: LABELS.plans,
     detail: plansHealthDetail(plans, now) ?? undefined,
-    ...(unread.length ? { note: `could not read ${unread.join(", ")}` } : {}),
+    ...note,
   };
 }
 

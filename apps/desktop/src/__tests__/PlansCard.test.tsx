@@ -11,9 +11,13 @@ import {
   PlansCard,
   PlansSettingsCard,
   accountClash,
+  accountsRefusal,
   defaultAccountLabel,
   fmtPct,
   fmtResetLocal,
+  formProblem,
+  liveReadFailures,
+  loginKey,
   meterTone,
   planAttention,
   plansHealthDetail,
@@ -112,7 +116,8 @@ let fresh: UsageReport;
 let holdStatus: boolean;
 let pending: Record<string, Deferred[]>;
 let configShow: Record<string, unknown>;
-let refuse: string | null;
+/** The CLI's `{"ok": false, ...}` refusal of `config --set`, or null. */
+let refuse: Record<string, unknown> | null;
 const calls: Array<[string, unknown]> = [];
 
 function release(cmd: string) {
@@ -155,7 +160,7 @@ beforeEach(() => {
     }
     if (cmd === "khipu_config_show") return JSON.stringify(configShow);
     if (cmd === "khipu_config_set" || cmd === "khipu_config_unset") {
-      return JSON.stringify(refuse ? { ok: false, error: refuse } : { ok: true });
+      return JSON.stringify(refuse ? { ok: false, ...refuse } : { ok: true });
     }
     throw new Error(`unexpected command ${cmd}`);
   });
@@ -502,9 +507,9 @@ describe("PlansSettingsCard", () => {
     const r = realReport();
     r.accounts!.push(
       { harness: "claude", account: "Typo", ok: false, error: "invalid_account", windows: [],
-        note: "invalid usage_accounts entry: unknown harness 'cluade'; one of claude, codex, grok, muse" },
+        note: 'This account entry is not valid: Khipu does not read the CLI "cluade"; it reads Claude Code, Codex, Grok Build and Muse' },
       { harness: "claude", account: "Claude second", ok: false, error: "no_plan_limits", windows: [],
-        note: "this login reports no plan limits (a login made with a setup token answers none); run /login in this home",
+        note: "This sign-in reports no plan limits. Open Claude Code with this login folder and sign in again (/login)",
         last_attempt_at: "2026-10-14T13:59:00Z" },
     );
     Object.assign(r.accounts![1], {
@@ -515,8 +520,12 @@ describe("PlansSettingsCard", () => {
     render(<Settings />);
     const typo = within(await screen.findByRole("group", { name: "Typo" }));
     expect(typo.getByText("not a valid account entry")).toBeTruthy();
-    expect(typo.getByText(/unknown harness 'cluade'/)).toBeTruthy();
-    expect(within(screen.getByRole("group", { name: "Claude second" })).getByText(/run \/login in this home/)).toBeTruthy();
+    expect(typo.getByText(/Khipu does not read the CLI "cluade"/)).toBeTruthy();
+    expect(
+      within(screen.getByRole("group", { name: "Claude second" })).getByText(
+        /Open Claude Code with this login folder and sign in again \(\/login\)/,
+      ),
+    ).toBeTruthy();
     const codex = within(screen.getByRole("group", { name: "Codex" }));
     expect(codex.getByText(/figures from 2 days ago · last tried 30s ago/)).toBeTruthy();
   });
@@ -558,7 +567,7 @@ describe("PlansSettingsCard", () => {
         source: "file",
         accounts: [
           { label: "Claude", harness: "claude", home: null },
-          { label: "Odd", harness: "gemini", home: null, invalid: "unknown harness 'gemini'" },
+          { label: "Odd", harness: "gemini", home: null, invalid: 'Khipu does not read the CLI "gemini"' },
         ],
       },
     };
@@ -569,15 +578,18 @@ describe("PlansSettingsCard", () => {
       fireEvent.click(screen.getByRole("button", { name: "Add" }));
     });
     await waitFor(() => expect(screen.getByText("Your list")).toBeTruthy());
-    expect(screen.getByText("not valid: unknown harness 'gemini'")).toBeTruthy();
+    expect(screen.getByText('not valid: Khipu does not read the CLI "gemini"')).toBeTruthy();
     calls.length = 0;
     fireEvent.click(screen.getByRole("button", { name: "Remove Claude" }));
     // Nothing valid is left, so the list goes back to the default.
     await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "usage_accounts" }]));
 
-    refuse = "usage_accounts entry 1: home '~mat/.x' names a user this Mac does not have";
+    refuse = { error: "usage_accounts holds at most 32 entries, got 33", code: "too_many", index: null, field: null };
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     fireEvent.click(await screen.findByRole("button", { name: "Go back to every installed CLI" }));
-    expect(await screen.findByText(refuse)).toBeTruthy();
+    expect(await screen.findByText("Khipu reads at most 32 accounts. Remove one before adding another.")).toBeTruthy();
+    expect(screen.queryByText(/usage_accounts/)).toBeNull();
+    spy.mockRestore();
   });
 
   it("never shows the CLI's own text when saving the list fails to run", async () => {
@@ -673,6 +685,146 @@ describe("adding an account", () => {
     expect((addButton() as HTMLButtonElement).disabled).toBe(false);
     release("khipu_usage_status");
     await waitFor(() => expect(exposed?.loading).toBe(false));
+  });
+});
+
+describe("a refused account list, in plain words (fix round 3)", () => {
+  const addButton = () => screen.getByRole("button", { name: "Add" });
+  const configSets = () => calls.filter(([c]) => c === "khipu_config_set");
+  let spy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    configShow = {
+      usage_accounts: {
+        value: null, source: "default", user_home: "/Users/me",
+        accounts: [
+          { label: "Claude", harness: "claude", home: null },
+          { label: "Codex", harness: "codex", home: null },
+          { label: "Codex work", harness: "codex", home: "~/.codex-work" },
+        ],
+      },
+    };
+  });
+  afterEach(() => spy.mockRestore());
+
+  async function typeAccount(fields: { name?: string; cli?: string; folder?: string }) {
+    render(<Settings />);
+    await waitFor(() => expect(screen.getByText("Default")).toBeTruthy());
+    if (fields.name != null) fireEvent.change(screen.getByLabelText("Name"), { target: { value: fields.name } });
+    if (fields.cli != null) fireEvent.change(screen.getByLabelText("CLI"), { target: { value: fields.cli } });
+    if (fields.folder != null) fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: fields.folder } });
+    fireEvent.click(addButton());
+  }
+
+  it("catches a Login folder with the slash after ~ forgotten before saving", async () => {
+    await typeAccount({ cli: "codex", folder: "~.codex-work" });
+    expect(
+      await screen.findByText(
+        "Start the Login folder with ~/ (for example ~/.codex-work), or give the full path starting with /.",
+      ),
+    ).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByLabelText("Login folder"));
+    expect(configSets()).toHaveLength(0);
+    expect(formProblem({ label: "x", harness: "codex", home: "codex-work" })?.field).toBe("home");
+    expect(formProblem({ label: "x", harness: "codex", home: "~/.codex-work" })).toBeNull();
+    expect(formProblem({ label: "x", harness: "codex", home: "/Volumes/Work/.codex" })).toBeNull();
+  });
+
+  it("compares a login after expanding ~, as khipu config does", async () => {
+    await typeAccount({ name: "Work full path", cli: "codex", folder: "/Users/me/.codex-work/" });
+    expect(
+      await screen.findByText(
+        "Codex with the login folder /Users/me/.codex-work/ is already listed as Codex work. Choose a different Login folder.",
+      ),
+    ).toBeTruthy();
+    expect(configSets()).toHaveLength(0);
+    expect(loginKey("~/.codex-work", "/Users/me/")).toBe("/Users/me/.codex-work");
+    expect(loginKey("/Users/me//./.codex-work/", "/Users/me")).toBe("/Users/me/.codex-work");
+    expect(loginKey(null, "/Users/me")).toBe("");
+  });
+
+  it("caps the Name at 64 characters and refuses a longer one before saving", async () => {
+    await typeAccount({ name: "n".repeat(65), cli: "grok", folder: "~/.grok-work" });
+    expect(screen.getByLabelText("Name").getAttribute("maxLength")).toBe("64");
+    expect(await screen.findByText("That Name is too long: use 64 characters or fewer.")).toBeTruthy();
+    expect(configSets()).toHaveLength(0);
+  });
+
+  it("says a CLI refusal in its own words, points at the field and names the account by its Name", async () => {
+    // khipu config compares the expanded folder; with no user_home known the
+    // app cannot, so the refusal arrives with a code, the entry and the field.
+    (configShow.usage_accounts as Record<string, unknown>).user_home = null;
+    refuse = {
+      error: "usage_accounts entry 4 (Work full path) reads the same login as an earlier entry",
+      code: "login_taken", index: 3, field: "home", other: 2,
+    };
+    await typeAccount({ name: "Work full path", cli: "codex", folder: "/Users/me/.codex-work" });
+    expect(
+      await screen.findByText(
+        "Codex with the login folder /Users/me/.codex-work reads the same sign-in as Codex work. Choose a different Login folder.",
+      ),
+    ).toBeTruthy();
+    const folder = screen.getByLabelText("Login folder");
+    expect(folder.getAttribute("aria-invalid")).toBe("true");
+    expect(document.activeElement).toBe(folder);
+    expect(screen.queryByText(/usage_accounts|entry 4|reads the same login/)).toBeNull();
+  });
+
+  it("never shows the text of a refusal it has no sentence for, or of the app's own check", async () => {
+    refuse = { error: "usage_accounts entry 3: home '~nouser/x' names a user this Mac does not have" };
+    await typeAccount({ cli: "codex", folder: "~/.codex-two" });
+    expect(
+      await screen.findByText("Khipu could not save the account list. Check the Name and Login folder and try again."),
+    ).toBeTruthy();
+    expect(screen.queryByText(/usage_accounts|home '/)).toBeNull();
+    // The app's own command refuses before the CLI runs: an invoke error, not JSON.
+    expect(
+      accountsRefusal({ error: "usage_accounts entry 3: label is too long" }, [], 2).message,
+    ).toBe("Khipu could not save the account list. Check the Name and Login folder and try again.");
+    const sent = [{ label: "Claude", harness: "claude" }, { label: "Typo", harness: "claude", home: "~nouser/x" }];
+    expect(
+      accountsRefusal({ error: "x", refusal: { code: "no_such_folder", index: 1, field: "home" } }, sent, 1),
+    ).toEqual({
+      field: "home",
+      message: "Khipu cannot find the login folder ~nouser/x. Start it with ~/ (for example ~/.codex-work), or give the full path starting with /.",
+    });
+    expect(accountsRefusal({ error: "x", refusal: { code: "name_taken", index: 1, field: "label", other: 0 } }, sent, null))
+      .toEqual({ field: null, message: "Two accounts are named Typo. Remove one of them." });
+  });
+});
+
+describe("a Codex whose live read failed (fix round 3)", () => {
+  function signedOutCodex(): UsageReport {
+    const r = realReport();
+    Object.assign(r.accounts![1], {
+      ok: true, source: "rollout", observed_at: "2026-10-11T14:00:00Z", stale: true, live_error: "not_signed_in",
+      note: "Codex is not signed in, so these figures are from its last turn. Open Codex and sign in again",
+    });
+    return r;
+  }
+
+  it("says not signed in beside its last-turn figures on Home and in Settings", async () => {
+    status = signedOutCodex();
+    const { unmount } = render(<Home />);
+    await waitFor(() => expect(screen.getByText("40%")).toBeTruthy());
+    const codex = within(rowFor("Codex"));
+    expect(codex.getByText("not signed in")).toBeTruthy();
+    expect(codex.getByText("as of the last turn, 3 days ago")).toBeTruthy();
+    unmount();
+    render(<Settings />);
+    const group = within(await screen.findByRole("group", { name: "Codex" }));
+    expect(group.getByText("not signed in")).toBeTruthy();
+    expect(group.getByText(/Open Codex and sign in again/)).toBeTruthy();
+  });
+
+  it("names it in the health report's Plans row", () => {
+    const r = signedOutCodex();
+    expect(liveReadFailures(r)).toEqual(["Codex is showing its last turn (not signed in)"]);
+    const row = plansHealthRow(r, NOW)!;
+    expect(row.status).toBe("ok");
+    expect(row.note).toBe("Codex is showing its last turn (not signed in)");
+    expect(liveReadFailures(realReport())).toEqual([]);
   });
 });
 

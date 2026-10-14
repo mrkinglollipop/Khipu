@@ -2755,6 +2755,11 @@ def cmd_config(args: argparse.Namespace) -> int:
 
         try:
             path = set_usage_accounts(args.set[1] if args.set else None)
+        except usage.AccountsError as err:
+            # A fixed code, the entry and the field at fault: the app says it
+            # in its own words and never shows the text.
+            print(json.dumps(err.refusal()))
+            return 2
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2

@@ -9,8 +9,8 @@ it first. Builds after the promotion gate (`2026-10-14-promotion-gate.md`) and g
 
 | Phase | What | State |
 |---|---|---|
-| 1 | `khipu usage`: one probe per installed subscription CLI, cached, as CLI JSON and an MCP tool | built 2026-10-14 (branch `feat/plan-usage-p1`): `khipu/usage.py`, `khipu usage`, MCP `khipu_usage`, fixtures `tests/fixtures/usage/`; real run on this Mac answered all four CLIs in 0.6–1.6 s |
-| 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | built 2026-10-14 (branch `feat/plan-usage-p2`, desktop 0.4.14): fixed-argv `khipu_usage_status` (`usage --json`) and `khipu_usage_refresh` (`usage --fresh --json`); `PlansCard.tsx` (Home card with Refresh, Settings → Capture & models card with Probe now and an add/remove list of the accounts read, through `config --set usage_accounts JSON` / `--unset`); health report "Plans" row and a Home attention item at 90%, read from `khipu_usage_status` (it can probe on demand; the item is re-judged every minute while it shows and at its earliest reset); `khipu doctor` carries a cache-only `plan_usage` block and a `warnings` line per window still in force at 90% or more, never gating `ok`, and `khipu_status` (complete schema) carries the same `warnings`; fix rounds 1 and 2 below |
+| 1 | `khipu usage`: one probe per installed subscription CLI, cached, as CLI JSON and an MCP tool | built and merged 2026-10-14 (PR #182, branch `feat/plan-usage-p1`): `khipu/usage.py`, `khipu usage`, MCP `khipu_usage`, fixtures `tests/fixtures/usage/`; real run on this Mac answered all four CLIs in 0.6–1.6 s |
+| 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | built 2026-10-14 (branch `feat/plan-usage-p2`, desktop 0.4.14): fixed-argv `khipu_usage_status` (`usage --json`) and `khipu_usage_refresh` (`usage --fresh --json`); `PlansCard.tsx` (Home card with Refresh, Settings → Capture & models card with Probe now and an add/remove list of the accounts read, through `config --set usage_accounts JSON` / `--unset`); health report "Plans" row and a Home attention item at 90%, read from `khipu_usage_status` (it can probe on demand; the item is re-judged every minute while it shows and at its earliest reset); `khipu doctor` carries a cache-only `plan_usage` block and a `warnings` line per window still in force at 90% or more, never gating `ok`, and `khipu_status` (complete schema) carries the same `warnings`; fix rounds 1, 2 and 3 below; not merged yet |
 
 Two PRs, phase 1 first.
 
@@ -130,6 +130,22 @@ when `khipu usage` has not read it), and doctor's new `warnings` list gets one l
 at 90% or more on the one-decimal figure the app shows ("Plan nearly used up: Codex (pro) week at 94%, resets
 Thu 02:00Z", "as of …" for kept or old figures). Neither gates `ok`. `khipu_status` (complete schema) carries
 the same `warnings`; its light per-prompt payload does not.
+
+**Fix round 3 (2026-10-14).** A refused account list never shows the text `khipu config` wrote: `config --set
+usage_accounts` answers a fixed `code` with the entry's own `index`, the `field` at fault and the `other` entry
+it repeats (`usage.AccountsError`), and Settings turns each code into its own sentence, naming accounts by their
+Name and pointing at the Name or Login folder field; a refusal with no code, or from the app's own command,
+reads "Khipu could not save the account list…" and its text goes to the console only. Before anything is sent,
+the form refuses a Login folder that does not start with `~/` or `/` (the slash forgotten in `~.codex-work`),
+a Name over 64 characters (the field also stops at 64) and a line break, and compares logins after expanding
+`~` with the owner's folder, which `khipu config` now reports as `usage_accounts.user_home`. When Codex's live
+read fails and its last-turn figures are shown, Home and Settings tag the row with the reason ("not signed in")
+and the health report's Plans row names it ("Codex is showing its last turn (not signed in)"); a signed-out
+Codex's note says to sign in again instead of "did not answer just now". Every note Khipu writes is in owner
+words, per CLI and per login folder ("Grok Build is not installed on this Mac", "This sign-in reports no plan
+limits. Open Claude Code with this login folder and sign in again (/login)"), and an invalid entry's reason
+names a login folder and a CLI, never a home or a harness; a test holds every note to no snake_case and no
+jargon (home, PATH, token, probe, harness).
 
 ## Decisions
 

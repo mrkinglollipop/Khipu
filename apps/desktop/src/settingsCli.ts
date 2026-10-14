@@ -8,7 +8,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-export type CliResult<T> = { ok: true; data: T } | { ok: false; error: string };
+/** `refusal` is the CLI's whole `{"ok": false, ...}` answer when it refused
+ *  the change, so a screen can read a fixed code instead of the text. */
+export type CliResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; error: string; refusal?: Record<string, unknown> };
 
 function errText(e: unknown): string {
   if (typeof e === "string") return e;
@@ -50,7 +54,8 @@ export async function callCli<T = Record<string, unknown>>(
     return { ok: false, error: raw.trim().slice(0, 300) || "Khipu gave an unreadable answer." };
   }
   if (data && typeof data === "object" && (data as { ok?: unknown }).ok === false) {
-    return { ok: false, error: refusalText(data as Record<string, unknown>) };
+    const refusal = data as Record<string, unknown>;
+    return { ok: false, error: refusalText(refusal), refusal };
   }
   return { ok: true, data: data as T };
 }

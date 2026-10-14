@@ -93,17 +93,6 @@ export function usageErrorPhrase(code: string | null | undefined): string {
 export const PLAN_READ_FAILED = "The usage check did not run. Try again in a minute.";
 const PLAN_READ_UNREADABLE = "The usage check gave an answer Khipu could not read.";
 
-/** A refusal from `config --set` is Khipu's own sentence; a CLI that did not
- *  run at all ("khipu exited 1: ...", "spawn khipu CLI failed ...") is not
- *  shown, only logged. */
-function settingError(error: string): string {
-  if (/^(khipu exited|spawn khipu)/i.test(error)) {
-    console.error("khipu config failed:", error);
-    return "Khipu could not save the account list. Try again in a minute.";
-  }
-  return error;
-}
-
 /** One decimal place: the figure shown and the figure the 75% and 90% lines
  *  are judged on are the same number. */
 export function roundPct(n: number): number {
@@ -237,6 +226,22 @@ export function unreadAccounts(report: UsageReport | null | undefined, now: Date
   return (report?.accounts ?? [])
     .filter((row) => row.ok === false && liveWindows(row, now).length === 0)
     .map((row) => `${row.account || row.harness || "Account"} (${usageErrorPhrase(row.error)})`);
+}
+
+/** Accounts whose figures came from a fallback because the live read failed
+ *  (Codex signed out, say): "Codex is showing its last turn (not signed in)". */
+export function liveReadFailures(report: UsageReport | null | undefined): string[] {
+  return (report?.accounts ?? [])
+    .filter((row) => row.ok !== false && row.live_error)
+    .map((row) => `${row.account || row.harness || "Account"} is showing its last turn (${usageErrorPhrase(row.live_error)})`);
+}
+
+/** The tag for a row: why its read failed (figures kept from before), or why
+ *  its live read failed (figures from a fallback); null when neither. */
+function failureTag(row: UsageAccount): string | null {
+  if (row.ok === false) return usageErrorPhrase(row.error);
+  if (row.live_error) return usageErrorPhrase(row.live_error);
+  return null;
 }
 
 /** One attention item when any window still in force is at or above 90%. */
@@ -475,6 +480,7 @@ function PlanRow({ row, now }: { row: UsageAccount; now: Date }) {
       )}
       <span className="plan-tags">
         {row.ok === false && (w || allReset) ? <Tag tone="warn">{usageErrorPhrase(row.error)}</Tag> : null}
+        {row.ok !== false && row.live_error ? <Tag tone="warn">{usageErrorPhrase(row.live_error)}</Tag> : null}
         <StatusTags row={row} />
       </span>
     </ListRow>
@@ -566,7 +572,7 @@ export function PlansSettingsCard({ state, active }: { state: PlanUsageState; ac
                   {row.account || row.harness}
                   {row.plan ? <span className="meta"> {row.plan}</span> : null}
                 </span>
-                {row.ok === false ? <Tag tone="warn">{usageErrorPhrase(row.error)}</Tag> : null}
+                {failureTag(row) ? <Tag tone="warn">{failureTag(row)}</Tag> : null}
                 <StatusTags row={row} />
                 <span className="row-meta">
                   {row.home || "default login"}
@@ -619,7 +625,13 @@ export function PlansSettingsCard({ state, active }: { state: PlanUsageState; ac
 // ---------------------------------------------------------------------------
 
 export type UsageAccountEntry = { label: string; harness: string; home?: string | null; invalid?: string };
-type UsageAccountsStatus = { value: UsageAccountEntry[] | null; source: "file" | "default"; accounts: UsageAccountEntry[] };
+type UsageAccountsStatus = {
+  value: UsageAccountEntry[] | null;
+  source: "file" | "default";
+  accounts: UsageAccountEntry[];
+  /** The owner's own folder, so "~/.x" and "/Users/me/.x" compare as one login. */
+  user_home?: string | null;
+};
 
 export const USAGE_HARNESS_OPTIONS: Array<[string, string]> = [
   ["claude", "Claude Code"],
@@ -633,6 +645,7 @@ function harnessName(h: string): string {
 }
 
 const LABEL_MAX = 64;
+const FOLDER_MAX = 1024;
 
 /** The name an account gets when the Name field is left empty: the CLI's
  *  name, with the login folder when there is one ("Codex (~/.codex-work)"),
@@ -646,22 +659,65 @@ export function defaultAccountLabel(harness: string, home: string | null | undef
   return `${name} (${folder.length > room ? `…${folder.slice(folder.length - room + 1)}` : folder})`;
 }
 
-/** A login folder as typed, for comparing two entries: no trailing slash. */
-function folderKey(home: string | null | undefined): string {
-  return (home ?? "").trim().replace(/\/+$/, "");
+/** A login folder for comparing two entries, the way `khipu config` does:
+ *  "~" expanded to the owner's folder when it is known, repeated slashes,
+ *  "/." and a trailing slash dropped. "" is the default login. */
+export function loginKey(home: string | null | undefined, userHome?: string | null): string {
+  let f = (home ?? "").trim();
+  if (!f) return "";
+  if (userHome && (f === "~" || f.startsWith("~/"))) f = `${userHome.replace(/\/+$/, "")}${f.slice(1)}`;
+  const key = f
+    .replace(/\/{2,}/g, "/")
+    .replace(/(?:\/\.)+(?=\/|$)/g, "")
+    .replace(/\/+$/, "");
+  return key || "/";
+}
+
+export type FormProblem = { field: "name" | "home" | null; message: string };
+
+// eslint-disable-next-line no-control-regex
+const CONTROL = /[\u0000-\u001f\u007f]/;
+
+/** Why the Name or Login folder as typed cannot be saved, or null: the checks
+ *  `khipu config` and the app's own command make, said in plain words before
+ *  anything is sent. A folder starts with "~/" or "/": "~.codex-work" (the
+ *  slash forgotten) names no folder this Mac has. */
+export function formProblem(entry: UsageAccountEntry): FormProblem | null {
+  const label = entry.label.trim();
+  if (CONTROL.test(label)) return { field: "name", message: "The Name must be one line of plain text." };
+  if (label.length > LABEL_MAX) {
+    return { field: "name", message: `That Name is too long: use ${LABEL_MAX} characters or fewer.` };
+  }
+  const folder = (entry.home ?? "").trim();
+  if (!folder) return null;
+  if (CONTROL.test(folder)) return { field: "home", message: "The Login folder must be one line of plain text." };
+  if (folder.length > FOLDER_MAX) return { field: "home", message: "That Login folder is too long." };
+  if (!(folder === "~" || folder.startsWith("~/") || folder.startsWith("/"))) {
+    return {
+      field: "home",
+      message: "Start the Login folder with ~/ (for example ~/.codex-work), or give the full path starting with /.",
+    };
+  }
+  return null;
 }
 
 /** Why `entry` cannot be added beside `entries`, in plain words, or null.
  *  The same two rules `khipu config` applies (each login once, each name
- *  once), checked here so the owner is pointed at the field to change. */
-export function accountClash(entries: UsageAccountEntry[], entry: UsageAccountEntry): { field: "name" | "home"; message: string } | null {
+ *  once, a login compared after "~" is expanded), checked here so the owner
+ *  is pointed at the field to change. */
+export function accountClash(
+  entries: UsageAccountEntry[],
+  entry: UsageAccountEntry,
+  userHome?: string | null,
+): FormProblem | null {
   const valid = entries.filter((e) => !e.invalid);
-  const login = valid.find((e) => e.harness === entry.harness && folderKey(e.home) === folderKey(entry.home));
+  const key = loginKey(entry.home, userHome);
+  const login = valid.find((e) => e.harness === entry.harness && loginKey(e.home, userHome) === key);
   if (login && entry.harness === "muse") {
     return { field: "name", message: `Muse is already listed as ${login.label}. Muse has one login, so it is read once.` };
   }
   if (login) {
-    const where = folderKey(entry.home) ? `the login folder ${entry.home}` : "its default login";
+    const where = key ? `the login folder ${entry.home}` : "its default login";
     return {
       field: "home",
       message: `${harnessName(entry.harness)} with ${where} is already listed as ${login.label}. Choose a different Login folder.`,
@@ -675,11 +731,85 @@ export function accountClash(entries: UsageAccountEntry[], entry: UsageAccountEn
   return null;
 }
 
+type StoredEntry = { label: string; harness: string; home?: string };
+
 /** The list to store: the valid entries shown, as `{label, harness, home?}`. */
-function storable(entries: UsageAccountEntry[]): Array<{ label: string; harness: string; home?: string }> {
+function storable(entries: UsageAccountEntry[]): StoredEntry[] {
   return entries
     .filter((e) => !e.invalid)
     .map((e) => (e.home ? { label: e.label, harness: e.harness, home: e.home } : { label: e.label, harness: e.harness }));
+}
+
+/** What a refusal is about: the entry at fault (null when the list as a
+ *  whole is), the earlier entry it repeats, and whether it is the entry
+ *  being added from the form (then the owner is pointed at a field). */
+type RefusalCtx = { entry: StoredEntry | null; other: StoredEntry | null; field: string | null; added: boolean };
+
+function fieldWords(c: RefusalCtx): string {
+  const which = c.field === "label" ? "Name" : "Login folder";
+  return c.added || !c.entry ? `The ${which}` : `The ${which} of ${c.entry.label}`;
+}
+
+const ACCOUNTS_NOT_SAVED = "Khipu could not save the account list. Check the Name and Login folder and try again.";
+
+/** Each refusal code `khipu config --set usage_accounts` gives, as Khipu's
+ *  own sentence. The CLI's text never reaches the owner: it names the
+ *  setting, counts entries the owner never added and says "home". */
+const ACCOUNT_REFUSAL: Record<string, (c: RefusalCtx) => string> = {
+  bad_list: () => ACCOUNTS_NOT_SAVED,
+  bad_entry: () => ACCOUNTS_NOT_SAVED,
+  too_many: () => "Khipu reads at most 32 accounts. Remove one before adding another.",
+  not_one_line: (c) => `${fieldWords(c)} must be one line of plain text.`,
+  too_long: (c) =>
+    c.field === "label"
+      ? `${fieldWords(c)} is too long: use ${LABEL_MAX} characters or fewer.`
+      : `${fieldWords(c)} is too long.`,
+  unknown_cli: () => "Khipu reads Claude Code, Codex, Grok Build and Muse. Choose one of them under CLI.",
+  muse_folder: () => "Muse has one sign-in, so leave the Login folder empty.",
+  no_such_folder: (c) =>
+    `Khipu cannot find the login folder ${c.entry?.home ?? ""}${c.added || !c.entry ? "" : ` of ${c.entry.label}`}. ` +
+    "Start it with ~/ (for example ~/.codex-work), or give the full path starting with /.",
+  name_taken: (c) =>
+    c.added
+      ? `An account is already named ${c.other?.label ?? c.entry?.label ?? ""}. Type a different Name.`
+      : `Two accounts are named ${c.entry?.label ?? ""}. Remove one of them.`,
+  login_taken: (c) => {
+    if (!c.added) {
+      return `${c.entry?.label ?? "An account"} and ${c.other?.label ?? "another account"} read the same sign-in. Remove one of them.`;
+    }
+    const where = c.entry?.home ? `the login folder ${c.entry.home}` : "its default login";
+    const other = c.other?.label ?? "an account already listed";
+    return `${harnessName(c.entry?.harness ?? "")} with ${where} reads the same sign-in as ${other}. Choose a different Login folder.`;
+  },
+};
+
+/** A failed save in plain words, never the text the CLI or the app's own
+ *  command wrote (that goes to the console): `sent` is the list sent and
+ *  `added` the index of the entry typed in the form, if any. */
+export function accountsRefusal(
+  res: { error: string; refusal?: Record<string, unknown> },
+  sent: StoredEntry[],
+  added: number | null,
+): FormProblem {
+  console.error("khipu config --set usage_accounts refused:", res.error);
+  if (/^(khipu exited|spawn khipu)/i.test(res.error)) {
+    return { field: null, message: "Khipu could not save the account list. Try again in a minute." };
+  }
+  const r = res.refusal ?? {};
+  const code = typeof r.code === "string" ? r.code : "";
+  const index = typeof r.index === "number" ? r.index : null;
+  const otherIndex = typeof r.other === "number" ? r.other : null;
+  const field = typeof r.field === "string" ? r.field : null;
+  const say = Object.prototype.hasOwnProperty.call(ACCOUNT_REFUSAL, code) ? ACCOUNT_REFUSAL[code] : null;
+  if (!say) return { field: null, message: ACCOUNTS_NOT_SAVED };
+  const ctx: RefusalCtx = {
+    entry: index != null ? (sent[index] ?? null) : null,
+    other: otherIndex != null ? (sent[otherIndex] ?? null) : null,
+    field,
+    added: index != null && index === added,
+  };
+  const at = !ctx.added ? null : field === "label" ? "name" : field === "home" ? "home" : null;
+  return { field: at, message: say(ctx) };
 }
 
 export function UsageAccountsField({ active, onChanged }: { active: boolean; onChanged?: () => Promise<unknown> | void }) {
@@ -700,7 +830,11 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
   /** Stores the list; `onSaved` runs the moment the write succeeds. The
    *  re-read that follows probes a new account (seconds), so nothing here
    *  waits on it: the form is free again as soon as the list is saved. */
-  async function save(next: UsageAccountEntry[] | null, onSaved?: () => void): Promise<boolean> {
+  async function save(
+    next: UsageAccountEntry[] | null,
+    onSaved?: () => void,
+    added: number | null = null,
+  ): Promise<boolean> {
     setSaving(true);
     setErr(null);
     setClash(null);
@@ -712,7 +846,10 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
     await cfg.reload();
     setSaving(false);
     if (!res.ok) {
-      setErr(settingError(res.error));
+      const problem = accountsRefusal(res, list, added);
+      setErr(problem.message);
+      setClash(problem.field);
+      if (problem.field) (problem.field === "name" ? nameRef : homeRef).current?.focus();
       return false;
     }
     void onChanged?.();
@@ -727,17 +864,22 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       harness,
       home: folder,
     };
-    const problem = accountClash(entries, entry);
+    const problem = formProblem(entry) ?? accountClash(entries, entry, status?.user_home);
     if (problem) {
       setErr(problem.message);
       setClash(problem.field);
-      (problem.field === "name" ? nameRef : homeRef).current?.focus();
+      if (problem.field) (problem.field === "name" ? nameRef : homeRef).current?.focus();
       return;
     }
-    await save([...entries, entry], () => {
-      setLabel("");
-      setHome("");
-    });
+    const next = [...entries, entry];
+    await save(
+      next,
+      () => {
+        setLabel("");
+        setHome("");
+      },
+      storable(next).length - 1,
+    );
   }
 
   return (
@@ -789,6 +931,7 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
           id={`${id}-label`}
           ref={nameRef}
           value={label}
+          maxLength={LABEL_MAX}
           placeholder="Claude second…"
           autoComplete="off"
           spellCheck={false}
@@ -816,6 +959,7 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
           id={`${id}-home`}
           ref={homeRef}
           value={harness === "muse" ? "" : home}
+          maxLength={FOLDER_MAX}
           placeholder={harness === "muse" ? "Muse has one login" : "~/.claude-second…"}
           disabled={harness === "muse"}
           autoComplete="off"

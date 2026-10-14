@@ -250,8 +250,14 @@ def test_codex_falls_back_to_the_newest_rollout(fake, tmp_path):
     assert row["windows"] == [{"name": "five_hour", "used_pct": 71.0, "resets_at": "2026-01-01T02:00:00Z",
                                "window_mins": 300, "slot": "primary"}]
     # The note is plain words (the app shows it as written); the code has its own field.
-    assert row["note"] == usage.ROLLOUT_NOTE and row["live_error"] == "not_signed_in"
+    assert row["live_error"] == "not_signed_in"
     assert not re.search(r"[a-z]+_[a-z0-9_]+|\(", row["note"])
+    # A signed-out Codex says so: reading again will not help, signing in will.
+    assert row["note"] != usage.ROLLOUT_NOTE
+    assert row["note"] == ("Codex is not signed in with this login folder, so these figures are from its last "
+                           "turn. Open Codex with this login folder and sign in again")
+    assert usage._rollout_note("not_signed_in", None).startswith("Codex is not signed in, so these figures")
+    assert usage._rollout_note("timeout", None) == usage.ROLLOUT_NOTE
 
 
 def test_codex_without_live_answer_or_rollout_fails(fake, tmp_path):
@@ -345,11 +351,12 @@ def test_configured_accounts_keep_invalid_entries_visible(fake, tmp_path):
     ]}))
     accounts = usage.configured_accounts()
     assert accounts[0] == {"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}
-    assert "unknown harness" in accounts[1]["invalid"]
+    assert accounts[1]["invalid"] == ('Khipu does not read the CLI "gemini"; it reads Claude Code, Codex, '
+                                      "Grok Build and Muse")
     assert "Muse" in accounts[2]["invalid"]
     row = usage.probe_account(accounts[1])
     assert row["ok"] is False and row["error"] == "invalid_account"
-    assert row["note"].startswith("this account entry is not valid: ")
+    assert row["note"].startswith("This account entry is not valid: Khipu does not read")
     assert "usage_accounts" not in row["note"]
 
 
@@ -808,7 +815,7 @@ def test_a_home_naming_no_user_is_an_invalid_row_not_a_crash(fake, tmp_path):
     rows = {r["account"]: r for r in rep["accounts"]}
     assert rows["Claude"]["ok"] is True
     assert rows["Typo"]["ok"] is False and rows["Typo"]["error"] == "invalid_account"
-    assert "names a user this Mac does not have" in rows["Typo"]["note"]
+    assert f"Khipu cannot find the login folder {NO_USER_HOME}; start it with ~/" in rows["Typo"]["note"]
     # Neither the cache key nor the probe environment raises on such a home.
     assert usage._key({"harness": "claude", "home": NO_USER_HOME}) == f"claude|{NO_USER_HOME}"
     assert usage.probe_environment("claude", NO_USER_HOME)["CLAUDE_CONFIG_DIR"] == NO_USER_HOME
@@ -835,7 +842,8 @@ def test_usage_accounts_are_set_shown_and_unset_through_config(fake, capsys):
     assert rc == 0 and out["usage_accounts"] == {
         "value": None, "source": "default",
         "accounts": [{"label": "Claude", "harness": "claude", "home": None},
-                     {"label": "Grok", "harness": "grok", "home": None}]}
+                     {"label": "Grok", "harness": "grok", "home": None}],
+        "user_home": str(Path.home())}
     assert "usage_accounts" not in json.loads(config.config_file().read_text())
     # An empty list is the default too.
     assert _config_cli(["--set", "usage_accounts", json.dumps([{"harness": "codex"}])], capsys)[0] == 0
@@ -843,28 +851,60 @@ def test_usage_accounts_are_set_shown_and_unset_through_config(fake, capsys):
     assert rc == 0 and out["usage_accounts"]["source"] == "default"
 
 
-@pytest.mark.parametrize("value, needle", [
-    ("not json", "must be JSON"),
-    ('{"harness": "claude"}', "must be a list"),
-    ('["claude"]', "entry 1 is not an object"),
-    ('[{"harness": "cluade"}]', "unknown harness 'cluade'"),
-    ('[{"harness": "muse", "home": "/x"}]', "Muse has one login"),
-    ('[{"harness": "claude", "token": "x"}]', "unknown field 'token'"),
-    ('[{"harness": "claude", "home": 3}]', "home must be text"),
-    ('[{"harness": "claude", "label": "a\\nb"}]', "one line of plain text"),
-    (json.dumps([{"harness": "claude", "home": NO_USER_HOME}]), "names a user this Mac does not have"),
-    ('[{"harness": "claude"}, {"label": "claude", "harness": "codex"}]', "two usage_accounts entries are named"),
+_TWO = [{"label": "Claude", "harness": "claude"}, {"label": "Codex", "harness": "codex"}]
+# (value, words in the CLI's error, the refusal's code, index, field, other).
+_REFUSALS = [
+    ("not json", "must be JSON", "bad_list", None, None, None),
+    ('{"harness": "claude"}', "must be a list", "bad_list", None, None, None),
+    ('["claude"]', "entry 1 is not an object", "bad_entry", 0, None, None),
+    ('[{"harness": "cluade"}]', 'Khipu does not read the CLI "cluade"', "unknown_cli", 0, "harness", None),
+    ('[{"harness": "muse", "home": "/x"}]', "Muse has one sign-in", "muse_folder", 0, "home", None),
+    ('[{"harness": "claude", "token": "x"}]', "unknown field 'token'", "bad_entry", 0, None, None),
+    ('[{"harness": "claude", "home": 3}]', "home must be text", "not_one_line", 0, "home", None),
+    ('[{"harness": "claude", "label": "a\\nb"}]', "one line of plain text", "not_one_line", 0, "label", None),
+    # The app's own entries come after the defaults it lists: the index is the entry's own.
+    (json.dumps([*_TWO, {"label": "Typo", "harness": "codex", "home": "~.codex-work"}]),
+     "Khipu cannot find the login folder ~.codex-work", "no_such_folder", 2, "home", None),
+    (json.dumps([{"harness": "claude", "home": NO_USER_HOME}]), "cannot find the login folder", "no_such_folder",
+     0, "home", None),
+    ('[{"harness": "claude"}, {"label": "claude", "harness": "codex"}]', "two usage_accounts entries are named",
+     "name_taken", 1, "label", 0),
     ('[{"label": "A", "harness": "claude", "home": "/x"}, {"label": "B", "harness": "claude", "home": "/x/"}]',
-     "reads the same login"),
-    (json.dumps([{"harness": "claude", "label": "x" * 65}]), "longer than 64"),
-    (json.dumps([{"harness": "claude", "label": f"c{i}"} for i in range(33)]), "at most 32"),
-])
-def test_usage_accounts_refuses_what_cannot_be_probed(fake, capsys, value, needle):
+     "reads the same login", "login_taken", 1, "home", 0),
+    (json.dumps([*_TWO, {"label": "Work", "harness": "codex", "home": "~/.codex-work"},
+                 {"label": "Work again", "harness": "codex", "home": str(Path.home() / ".codex-work")}]),
+     "reads the same login", "login_taken", 3, "home", 2),
+    (json.dumps([*_TWO, {"harness": "claude", "label": "x" * 65}]), "longer than 64", "too_long", 2, "label", None),
+    (json.dumps([{"harness": "claude", "home": "/" + "x" * 1024}]), "longer than 1024", "too_long", 0, "home", None),
+    (json.dumps([{"harness": "claude", "label": f"c{i}"} for i in range(33)]), "at most 32", "too_many", None, None,
+     None),
+]
+
+
+@pytest.mark.parametrize("value, needle, code, index, field, other", _REFUSALS,
+                         ids=[f"{row[2]}-{n}" for n, row in enumerate(_REFUSALS)])
+def test_usage_accounts_refuses_what_cannot_be_probed(fake, capsys, value, needle, code, index, field, other):
     from khipu import config
 
     rc, out = _config_cli(["--set", "usage_accounts", value], capsys)
     assert rc == 2 and out["ok"] is False and needle in out["error"]
+    # A fixed code with the entry and field at fault, so the app can say it in
+    # its own words and point at the field instead of showing this text.
+    assert (out["code"], out["index"], out["field"], out["other"]) == (code, index, field, other)
     assert not config.config_file().exists()
+
+
+def test_every_refusal_code_has_a_sentence_in_the_app():
+    """Settings turns each refusal code into its own sentence (PlansCard.tsx
+    ACCOUNT_REFUSAL); a code added here without one would read as the
+    generic "could not save"."""
+    app = Path(__file__).resolve().parents[3] / "apps" / "desktop" / "src" / "PlansCard.tsx"
+    if not app.is_file():
+        pytest.skip("desktop sources not in this checkout")
+    block = app.read_text(encoding="utf-8").split("const ACCOUNT_REFUSAL", 1)[1].split("\n};", 1)[0]
+    codes = {row[2] for row in _REFUSALS}
+    missing = sorted(code for code in codes if f"  {code}: " not in block)
+    assert not missing, f"no sentence in PlansCard.tsx for {missing}"
 
 
 def test_every_error_code_has_a_plain_phrase_in_the_app():
@@ -885,21 +925,56 @@ def test_every_error_code_has_a_plain_phrase_in_the_app():
 # ---- notes on kept figures, plain words only ---------------------------------------
 
 
+# Words an owner who is not technical should not meet in a note the app shows.
+# PATH in capitals only: "the full path" is plain English, "PATH" is not.
+_JARGON = re.compile(r"\b(?:(?-i:PATH)|home|homes|token|tokens|probe|probes|probing|harness|setup)\b|usage_accounts",
+                     re.I)
+
+
+def _every_note() -> list[str]:
+    codes = [value for name, value in vars(usage).items() if name.startswith("E_") and isinstance(value, str)]
+    notes = [usage.ROLLOUT_NOTE]
+    for code in codes:
+        for harness in usage.HARNESSES:
+            for home in (None, "~/.x"):
+                notes += [usage._note(code, harness, home), usage._rollout_note(code, home)]
+    notes += [usage._account_from_entry(entry)["invalid"] for entry in (
+        "claude", {"harness": "gemini"}, {"harness": ""}, {"harness": "muse", "home": "/x"},
+        {"harness": "claude", "home": NO_USER_HOME})]
+    return [note for note in notes if note]
+
+
 def test_no_note_khipu_writes_carries_a_code():
-    """The app shows a row's note as written: no snake_case code in any."""
-    for note in [*usage._NOTES.values(), usage.ROLLOUT_NOTE]:
+    """The app shows a row's note as written: no snake_case code and no
+    jargon (home, PATH, token, probe) in any."""
+    notes = _every_note()
+    assert len(notes) > 20
+    for note in notes:
         assert not re.search(r"\b[a-z]+_[a-z0-9_]+\b", note), note
+        assert not _JARGON.search(note.replace(NO_USER_HOME, "")), note
+    assert usage._note("not_installed", "grok") == "Grok Build is not installed on this Mac"
+    assert usage._note("not_signed_in", "claude", "~/.claude-second") == (
+        "Claude Code is not signed in with this login folder. Open Claude Code with this login folder and sign in "
+        "again")
+    assert usage._note("no_plan_limits", "claude", "~/.claude-t3-second") == (
+        "This sign-in reports no plan limits. Open Claude Code with this login folder and sign in again (/login)")
+
+
+def test_a_failed_probe_row_carries_the_plain_note_for_its_account(fake):
+    row = usage.probe_account({"label": "Grok work", "harness": "grok", "home": "~/.grok-work"})
+    assert row["ok"] is False and row["error"] == "not_installed"
+    assert row["note"] == "Grok Build is not installed on this Mac"
 
 
 def test_a_failed_probe_shows_its_own_note_on_the_kept_figures(fake, monkeypatch):
     usage._save_cache({"claude|": _cached(_ago(60 * 24), note=None)})
-    failed = dict(_row(ok=False, error="no_plan_limits"), note=usage._NOTES["no_plan_limits"])
+    failed = dict(_row(ok=False, error="no_plan_limits"), note=usage._note("no_plan_limits", "claude"))
     monkeypatch.setattr(usage, "probe_all", lambda accounts, *, timeout: [failed])
     row = usage.report(accounts=[{"label": "Claude", "harness": "claude", "home": None}], fresh=True)["accounts"][0]
     assert row["ok"] is False and row["windows"][0]["used_pct"] == 55
-    assert row["note"] == usage._NOTES["no_plan_limits"] and "/login" in row["note"]
+    assert row["note"] == usage._note("no_plan_limits", "claude") and "/login" in row["note"]
     saved = json.loads(usage.cache_file().read_text())["rows"]["claude|"]
-    assert saved["note"] == usage._NOTES["no_plan_limits"]
+    assert saved["note"] == usage._note("no_plan_limits", "claude")
 
 
 def test_a_fallback_note_does_not_outlive_its_good_read(fake, monkeypatch):
