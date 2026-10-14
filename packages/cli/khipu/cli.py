@@ -147,7 +147,119 @@ def cmd_revisions(args: argparse.Namespace) -> int:
     return 0 if out["conflicts"]["ok"] else 2
 
 
+def _synth_provider_block(secrets: dict) -> tuple[dict, bool]:
+    """The summariser provider row doctor reports: which provider and model,
+    whether its key (or, for a CLI provider, its binary) is there, and what a
+    failed window falls back to. Presence only, never key material."""
+    from khipu.models import CLI_PROVIDERS, synth_settings, cloud_model_id
+
+    _synth = synth_settings()
+    _provider = _synth["provider"]
+    _key_present = (_provider != "local" and any(secrets.get(f"{_provider}_{field}")
+                    for field in ("in_keychain", "env", "file_key_present")))
+    synth_provider = {"provider": _provider,
+                      "model": _synth["model_id"] if _provider == "local" else cloud_model_id(_synth),
+                      "key_present": bool(_key_present)}
+    synth_provider_ok = _provider == "local" or bool(_key_present)
+    if _provider in CLI_PROVIDERS:
+        from khipu.synth_cli import binary
+
+        synth_provider.update(key_present=None, auth="subscription",
+                              binary=binary(_provider.removesuffix("-cli")))
+        synth_provider_ok = synth_provider["binary"] is not None
+    # What a failed window does on a provider other than Gemini (Settings
+    # shows and sets it): a retry on Gemini needs a Gemini key to run.
+    from khipu.config import choice_setting
+
+    _fallback, _fallback_source = choice_setting("synth_fallback")
+    synth_provider["fallback"] = {
+        "setting": _fallback, "source": _fallback_source,
+        "gemini_key": any(secrets.get(f"gemini_{field}")
+                          for field in ("in_keychain", "env", "file_key_present")),
+    }
+    return synth_provider, synth_provider_ok
+
+
+# What `doctor --quick` imports: the modules every hook, job and the MCP
+# server load, plus the third-party packages they need. A module missing
+# under the launchd environment shows here instead of at the next 06:05Z run.
+_QUICK_IMPORTS = (
+    "khipu.config", "khipu.db", "khipu.keychain", "khipu.session_capture",
+    "khipu.hook_background", "khipu.capture", "khipu.extract", "khipu.embed",
+    "khipu.recall_prompt", "khipu.recall_rule", "khipu.recall_daemon",
+    "khipu.hub_snapshot", "khipu.forget", "khipu.mcp_server", "khipu.jobs",
+    "psycopg",
+)
+
+
+def _cmd_doctor_quick(args: argparse.Namespace) -> int:
+    """`khipu doctor --quick`: imports, config, secrets presence, jobs and the
+    summariser provider, with no hub, network or probe check. The promotion
+    gate runs it under a candidate's launchd environment (khipu.promote)."""
+    import importlib
+
+    from khipu.keychain import secrets_status
+
+    imports: dict[str, str] = {}
+    for name in _QUICK_IMPORTS:
+        try:
+            importlib.import_module(name)
+        except Exception as e:  # noqa: BLE001 — a failed import is the finding
+            imports[name] = f"{type(e).__name__}: {e}"
+    try:
+        from khipu.config import config_file, load_config
+
+        load_config()
+        config = {"ok": True, "path": str(config_file())}
+    except Exception as e:  # noqa: BLE001
+        config = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    try:
+        secrets = secrets_status()
+    except Exception as e:  # noqa: BLE001
+        secrets = {"error": f"{type(e).__name__}: {e}", "dsn_file": {"ok": False}}
+    dsn_file_ok = bool((secrets.get("dsn_file") or {}).get("ok", True)) and not secrets.get("error")
+    try:
+        synth_provider, synth_provider_ok = _synth_provider_block(secrets)
+    except Exception as e:  # noqa: BLE001
+        synth_provider, synth_provider_ok = {"error": f"{type(e).__name__}: {e}"}, False
+    try:
+        from khipu.jobs import job_status
+
+        jobs = job_status()
+    except Exception as e:  # noqa: BLE001
+        jobs = {"error": f"{type(e).__name__}: {e}"}
+    known_job_failures = [
+        name for name in _JOBS_CHOICES
+        if isinstance(jobs.get(name), dict) and jobs[name].get("last_exit") not in (None, 0)
+        and (jobs[name].get("plist_loaded") or jobs[name].get("plist_mtime") is not None
+             or jobs[name].get("expected"))
+    ]
+    jobs_ok = not known_job_failures and not jobs.get("error")
+    from khipu import __version__
+
+    out = {
+        "quick": True,
+        "version": __version__,
+        "imports": {"ok": not imports, "failed": imports, "checked": len(_QUICK_IMPORTS)},
+        "config": config,
+        "secrets": secrets,
+        "dsn_file_ok": dsn_file_ok,
+        "dsn_present": bool(secrets.get("dsn")),
+        "jobs": jobs,
+        "job_failures": known_job_failures,
+        "jobs_ok": jobs_ok,
+        "synth_provider": synth_provider,
+        "synth_provider_ok": synth_provider_ok,
+        "ok": (not imports and bool(config.get("ok")) and dsn_file_ok and bool(secrets.get("dsn"))
+               and jobs_ok and synth_provider_ok),
+    }
+    print(json.dumps(out, indent=2, default=str))
+    return 0 if out["ok"] else 2
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
+    if getattr(args, "quick", False):
+        return _cmd_doctor_quick(args)
     from khipu.drift import backup_health, sample_drift, status_payload
     from khipu.hub_snapshot import (
         hub_connection_failed,
@@ -297,32 +409,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # Keychain is denied. It went stale on 2026-08-04 and nothing noticed until
     # 2026-08-18, because every check ran where the Keychain worked.
     dsn_file_ok = bool((secrets.get("dsn_file") or {}).get("ok", True))
-    from khipu.models import CLI_PROVIDERS, synth_settings, cloud_model_id
-
-    _synth = synth_settings()
-    _provider = _synth["provider"]
-    _key_present = (_provider != "local" and any(secrets.get(f"{_provider}_{field}")
-                    for field in ("in_keychain", "env", "file_key_present")))
-    synth_provider = {"provider": _provider,
-                      "model": _synth["model_id"] if _provider == "local" else cloud_model_id(_synth),
-                      "key_present": bool(_key_present)}
-    synth_provider_ok = _provider == "local" or bool(_key_present)
-    if _provider in CLI_PROVIDERS:
-        from khipu.synth_cli import binary
-
-        synth_provider.update(key_present=None, auth="subscription",
-                              binary=binary(_provider.removesuffix("-cli")))
-        synth_provider_ok = synth_provider["binary"] is not None
-    # What a failed window does on a provider other than Gemini (Settings
-    # shows and sets it): a retry on Gemini needs a Gemini key to run.
-    from khipu.config import choice_setting
-
-    _fallback, _fallback_source = choice_setting("synth_fallback")
-    synth_provider["fallback"] = {
-        "setting": _fallback, "source": _fallback_source,
-        "gemini_key": any(secrets.get(f"gemini_{field}")
-                          for field in ("in_keychain", "env", "file_key_present")),
-    }
+    synth_provider, synth_provider_ok = _synth_provider_block(secrets)
     try:
         from khipu.jobs import index_freshness, job_status
 
@@ -2985,6 +3072,34 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     return 0 if not out.get("failed") else 1
 
 
+def cmd_promote(args: argparse.Namespace) -> int:
+    """`khipu promote [ref]`: gate a ref in the inactive live slot and flip to
+    it on a pass; `--rollback`, `--status`, `--gate-only STEP` (see
+    khipu.promote and docs/plans/2026-10-14-promotion-gate.md)."""
+    from khipu import promote as pm
+
+    chosen = [flag for flag in ("rollback", "status", "gate_only") if getattr(args, flag, None)]
+    if len(chosen) > 1:
+        print(json.dumps({"ok": False, "error": "choose one of --rollback, --status, --gate-only"}))
+        return 2
+    if (args.rollback or args.status) and args.ref:
+        print(json.dumps({"ok": False, "error": "a ref applies to a promotion or --gate-only only"}))
+        return 2
+    if args.status:
+        out = pm.status()
+    elif args.rollback:
+        out = pm.rollback()
+    elif args.gate_only:
+        out = pm.gate_only(args.gate_only, args.ref)
+    else:
+        out = pm.promote(args.ref or "origin/main")
+    if args.json:
+        print(json.dumps(out, indent=2, default=str))
+    else:
+        print(pm.format_result(out))
+    return 0 if out.get("ok") else 1
+
+
 def cmd_jobs(args: argparse.Namespace) -> int:
     """Scheduled LaunchAgents: status, install, refresh (re-render after an
     app update so a stale bundled-Python path or Application Support path
@@ -3738,6 +3853,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--harness",
         default=None,
         help="Harness label for --probe (default: $KHIPU_HARNESS or 'doctor')",
+    )
+    d.add_argument(
+        "--quick",
+        action="store_true",
+        help="Imports, config, secrets presence, jobs and the summariser provider only: "
+        "no hub, network or probe checks (the promotion gate's first step)",
     )
     d.set_defaults(func=cmd_doctor)
 
@@ -4811,6 +4932,18 @@ def build_parser() -> argparse.ArgumentParser:
     jbu = jb_sub.add_parser("uninstall", help="Unload + remove the named jobs (default: all)")
     jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon}")
     jb.set_defaults(func=cmd_jobs)
+
+    pmt = sub.add_parser(
+        "promote",
+        help="Gate a ref in the inactive live slot and make it live on a pass (--rollback, --status, --gate-only)",
+    )
+    pmt.add_argument("ref", nargs="?", default=None, help="Ref to promote (default: origin/main)")
+    pmt.add_argument("--rollback", action="store_true", help="Flip live back to the other slot, no gate")
+    pmt.add_argument("--status", action="store_true", help="Live commit, main commit, drift, last gate result")
+    pmt.add_argument("--gate-only", choices=("doctor", "recall", "capture", "version"), default=None,
+                     metavar="STEP", help="Run one gate step (doctor, recall, capture, version); never flips")
+    pmt.add_argument("--json", action="store_true", help="Print the full result as JSON")
+    pmt.set_defaults(func=cmd_promote)
 
     snap = sub.add_parser(
         "snapshot",

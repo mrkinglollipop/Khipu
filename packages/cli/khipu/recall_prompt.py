@@ -1497,6 +1497,30 @@ def _stdin_payload(raw: str) -> dict[str, Any]:
         return {}
 
 
+# The promotion gate (khipu.promote.gate_recall_replay) replays real prompts
+# from this log and nowhere else, so each summary line ends with the prompt
+# that produced it: secrets masked, clipped, JSON-quoted, last on the line so
+# the summary pattern above it is unchanged.
+REPLAY_PROMPT_CHARS = 400
+
+
+def replay_field(payload: dict[str, Any]) -> str:
+    """`` replay={"prompt": ..., "cwd": ...}`` for a summary line, or "" when
+    there is no prompt or anything about it fails. Never raises."""
+    try:
+        prompt = payload.get("prompt") or payload.get("message") or ""
+        if not isinstance(prompt, str) or not prompt.strip():
+            return ""
+        from khipu.redact import redact_secrets
+
+        prompt, _count = redact_secrets(prompt[: REPLAY_PROMPT_CHARS * 2])
+        cwd = payload.get("cwd") or payload.get("cwd_path") or ""
+        blob = json.dumps({"prompt": prompt[:REPLAY_PROMPT_CHARS], "cwd": str(cwd)}, ensure_ascii=True)
+        return f" replay={blob}"
+    except Exception:  # noqa: BLE001 — logging must never break the hook
+        return ""
+
+
 def log_terminal_outcome(raw: str, reason: str, *, ms: float = 0.0) -> None:
     payload = _stdin_payload(raw)
     session = payload.get("session_id") or payload.get("sessionId") or "?"
@@ -1517,7 +1541,8 @@ def finish_delivery(delivery: dict[str, Any], *, delivered: bool, reason: str | 
         stage = f" stage={result['stage']}" if result.get("stage") else ""
         ms = round((time.monotonic() - delivery["started"]) * 1000, 1) if "started" in delivery else result["ms"]
         _log(f"session={session} reason={result['reason']} ms={ms} hits={hit_ids} "
-             f"legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}")
+             f"legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}"
+             f"{replay_field(payload)}")
 
 
 def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
@@ -1547,6 +1572,7 @@ def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
         _log(
             f"session={session_id or '?'} reason={result['reason']} ms={result['ms']} "
             f"hits={hit_ids} legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}"
+            f"{replay_field(payload)}"
         )
     ctx = result["context"]
     if shape == "cursor":

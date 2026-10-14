@@ -257,7 +257,9 @@ class LogLineTest(unittest.TestCase):
                     self.assertIsNotNone(rp._LOG_LINE_RE.match(line), line)
                 self.assertIn("degraded=embedding late (limit)", lines["limit"])
                 self.assertNotIn("stage=", lines["limit"])
-                self.assertTrue(lines["timeout"].endswith(" stage=keyword"), lines["timeout"])
+                # stage= is the last summary field; only the promotion gate's
+                # replay= (the prompt, JSON-quoted) may follow it.
+                self.assertRegex(lines["timeout"], r" stage=keyword( replay=\{.*\})?$")
                 self.assertNotIn("stage=", lines["ok"])
                 classified = {
                     name: rp._classify_call_reason(rp._LOG_LINE_RE.match(line).group("reason"))

@@ -97,12 +97,25 @@ def _shim_dir() -> Path:
     return HOME / ".config" / "khipu" / "bin"
 
 
+def _live_root() -> Path | None:
+    """The promoted live checkout (``~/.config/khipu/live``, khipu.promote)
+    when that link exists and resolves, else None. Read from HOME at call
+    time, same as ``_shim_dir``."""
+    link = HOME / ".config" / "khipu" / "live"
+    return link if link.is_symlink() and link.is_dir() else None
+
+
 def _bin_script(name: str) -> Path:
-    """Bundled .app layout uses ``<root>/bin/``; dev checkouts use ``packages/cli/bin/``."""
-    bundled = _root() / "bin" / name
+    """Bundled .app layout uses ``<root>/bin/``; dev checkouts use ``packages/cli/bin/``.
+
+    With a promoted live checkout the launchers point through the ``live``
+    link (its path, not its target), so a promotion flips every harness at
+    once; without one this is exactly the checkout this code runs from."""
+    root = _live_root() or _root()
+    bundled = root / "bin" / name
     if bundled.is_file():
         return bundled
-    return _root() / "packages" / "cli" / "bin" / name
+    return root / "packages" / "cli" / "bin" / name
 
 
 _INSTALL_DEPTH = 0

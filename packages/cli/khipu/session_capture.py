@@ -1685,6 +1685,10 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
             job.update(t3_thread_id=thread, via="t3")
         if capture_note:
             job["capture_note"] = capture_note
+        if os.environ.get("KHIPU_GATE") == "1":
+            # The promotion gate's own end-to-end capture (khipu.promote):
+            # it is forgotten as soon as it lands.
+            job["gate"] = True
         p = enqueue(job)
         queued_names.append(p.name)
     # Advance only after every part is on disk: a crash partway

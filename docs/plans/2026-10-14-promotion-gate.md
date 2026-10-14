@@ -7,7 +7,7 @@ Approved in principle, Matt 2026-10-13 ("I think you should proceed as you recom
 
 | Phase | What | State |
 |---|---|---|
-| 1 | A pinned live checkout; every launcher, launchd job and MCP server resolves into it; `khipu promote` flips it after a live gate; `--rollback` flips back | open |
+| 1 | A pinned live checkout; every launcher, launchd job and MCP server resolves into it; `khipu promote` flips it after a live gate; `--rollback` flips back | built, awaiting migration (branch `feat/promotion-gate-p1`) |
 | 2 | `khipu doctor` and the app's Home show "merged, not live" drift and the last promotion's gate result | open |
 
 Two PRs, phase 1 first. Phase 1 is itself the first change promoted through the gate.
@@ -88,6 +88,75 @@ launcher symlinks) before writing anything. Build:
   `live` link behaves as today (the public install path must not change).
 - Verify with the hermetic suite, then by promoting phase 1 itself through its own gate on this Mac and
   reading the next nightly.
+
+### As built
+
+- `packages/cli/khipu/promote.py`; `khipu promote [ref] [--rollback] [--status] [--gate-only STEP] [--json]`;
+  `khipu doctor --quick` (imports, config, secrets presence, jobs, summariser provider; no hub or network).
+- The per-prompt hook's log line now ends with `replay={"prompt": ..., "cwd": ...}` (secrets masked, 400
+  characters at most): the log had no prompt text, and the replay step reads that log and nothing else.
+  With no `replay=` line from the last day the recall step fails, it never passes on missing evidence.
+- Each gate hook run gets its own `KHIPU_CAPTURE_HOME` (queue, state, heartbeats and the hook log in a
+  temporary directory), so the gate never touches the live queue or the live hook log; the replay runs with
+  `KHIPU_RECALL_DAEMON=0` (the warm service would answer with the old code). The replica is only read.
+  The capture step's stop hook still appends to `~/Library/Logs/khipu/stop-hook.log` and runs a real Stop's
+  mirror, outbox replay, notes reconcile and embed catch-up, as any Stop does.
+- A slot is a detached worktree with a `.python_libs` link to the main checkout's (the launchers put
+  `<root>/.python_libs` on `PYTHONPATH` and it is untracked). `--rollback` first puts the other slot back on
+  the commit it was live on, if a failed or gate-only run has moved it since.
+
+## Migrating this Mac by hand
+
+Run once by the orchestrator after review, in this order; record it in Khipu-ops. `MAIN` is the main
+checkout, read from the launcher that runs it today; `PY` is the interpreter the launchers use.
+
+```sh
+L="$HOME/.config/khipu"
+MAIN="$(cd "$(dirname "$(readlink "$L/bin/khipu-mcp")")/../../.." && pwd)"
+echo "$MAIN"                           # must be the main checkout; stop if it is not
+PY=/opt/homebrew/bin/python3.11
+unset KHIPU_ROOT
+
+# 0. Merge the PR and pull MAIN the old way one last time, then use a few prompts so the hook log
+#    holds replay= lines from the last day (the recall step refuses without them).
+git -C "$MAIN" pull --ff-only
+grep -c ' replay=' "$HOME/.grok/khipu/logs/prompt-recall.log"   # must be > 0
+
+# 1. Stop-condition: every launcher must be a symlink. Any output here: stop and ask.
+for f in khipu-mcp khipu-stop-hook khipu-recall-hook khipu-prompt-recall khipu-aegis-capture; do
+  [ -L "$L/bin/$f" ] || echo "NOT A LINK: $L/bin/$f"
+done
+
+# 2. Slot live-a on the commit that is live now, and the live link to it (nothing that runs changes yet).
+git -C "$MAIN" fetch origin
+git -C "$MAIN" worktree add --detach "$L/live-a" "$(git -C "$MAIN" rev-parse HEAD)"
+ln -s "$MAIN/.python_libs" "$L/live-a/.python_libs"
+ln -s "$L/live-a" "$L/live"
+
+# 3. Point the five launchers through the link (what `khipu integrations install` now writes).
+for f in khipu-mcp khipu-stop-hook khipu-recall-hook khipu-prompt-recall khipu-aegis-capture; do
+  ln -sfn "$L/live/packages/cli/bin/$f" "$L/bin/$f"
+done
+
+# 4. Re-render the plists from the link and restart the two resident jobs.
+export PYTHONPATH="$L/live/packages/cli:$L/live/.python_libs"
+"$PY" -m khipu jobs refresh            # read "refreshed" / "external": an external plist is left as is
+plutil -extract EnvironmentVariables.KHIPU_ROOT raw "$HOME/Library/LaunchAgents/com.khipu.queue-drain.plist"
+#   must print $HOME/.config/khipu/live; any job listed under "external" needs its plist re-pointed by hand
+launchctl kickstart -k "gui/$(id -u)/com.khipu.recall-daemon"
+launchctl kickstart -k "gui/$(id -u)/com.khipu.queue-drain"
+
+# 5. Check, then promote through the gate (one real capture is written to the hub and forgotten).
+"$PY" -m khipu doctor | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["launchers"])'
+"$PY" -m khipu promote --status
+"$PY" -m khipu promote origin/main      # creates live-b, gates it, flips on a pass
+"$PY" -m khipu promote --status
+```
+
+Then read the next nightly. Rollback is `"$PY" -m khipu promote --rollback`. To undo the migration
+entirely: re-point the five links at `$MAIN/packages/cli/bin/`, `rm "$L/live"`, run `jobs refresh` with
+`PYTHONPATH="$MAIN/packages/cli:$MAIN/.python_libs"`, kick the two jobs, then
+`git -C "$MAIN" worktree remove --force "$L/live-a"` (and `live-b`).
 
 ## Phase 2: visibility
 
