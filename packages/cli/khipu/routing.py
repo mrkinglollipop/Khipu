@@ -127,6 +127,10 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_sources": ("sources", [], "Job runner folders"),
     "routing_table": ("path", None, "Routing table file"),
     "routing_runner_silent_intervals": ("count", 5, "A job runner has stopped reporting after this many intervals"),
+    "routing_runner_tail_bytes": ("count", 512 * 1024,
+                                  "How much of the end of a job runner's events.log is read, in bytes (0: all of it)"),
+    "routing_runner_limited_lines": ("count", 200,
+                                     "How many of a job runner's newest LIMITED lines are kept (0: no limit)"),
     # Telling conversations (phases 3a to 3c and 6)
     "routing_push_start": ("switch", True, "Tell conversations at the start and after compaction"),
     "routing_push_prompt": ("switch", True, "Tell conversations before each prompt"),
@@ -1033,10 +1037,12 @@ def _stamp_locked(clock: datetime, count: int = 1) -> list[dict]:
     newest line's time when that is a little ahead of it (``_not_behind``).
     When the clock reads more than ``CLOCK_TOLERANCE`` before every line of a
     record of two lines or more (a Mac whose clock reads 2001), the record is
-    older than the clock says: the line takes the newest line's time and
-    keeps the clock's reading beside it (``clock_at``), so a run of such
-    lines never ages the history written before it, however long the run,
-    and doctor names those lines. A clock behind only some of the record (a
+    older than the clock says: the line takes the newest time the fold
+    settles for the record (``_record_times``) and keeps the clock's reading
+    beside it (``clock_at``), so a run of such lines never ages the history
+    written before it, however long the run, and doctor names those lines.
+    A copied time is never a witness to itself: the fold counts each such
+    line from the line written before it. A clock behind only some of the record (a
     line written ahead, then a right clock) keeps its own time, and the fold
     orders the lines as in phase 1a."""
     events, _bad = read_events()
@@ -1044,10 +1050,11 @@ def _stamp_locked(clock: datetime, count: int = 1) -> list[dict]:
     first = _next_after(seqs, count, len(events))
     times = [t for t in (_parse(e.get("written_at")) for e in events) if t is not None]
     last = _parse(events[-1].get("written_at")) if events else None
+    settled = [t for t in _record_times(events)[0] if t is not None]
     clock_at = None
     stamp = _not_behind(clock, last)
-    if len(times) >= 2 and last is not None and (min(times) - clock).total_seconds() > CLOCK_TOLERANCE:
-        stamp, clock_at = last, clock
+    if len(times) >= 2 and settled and (min(times) - clock).total_seconds() > CLOCK_TOLERANCE:
+        stamp, clock_at = settled[-1], clock
     out = []
     for i in range(count):
         line = {"written_at": _iso(stamp), "seq": first + i}
@@ -1378,11 +1385,39 @@ def _write_order_times(times: list[datetime | None]) -> tuple[list[datetime | No
     return out, behind, ahead
 
 
+def _copied(event: dict) -> bool:
+    """Whether a line's time was copied from the record (``_stamp_locked``:
+    its Mac's clock read before the whole record) rather than read from a
+    clock."""
+    return _parse(event.get("clock_at")) is not None
+
+
+def _record_times(events: list[dict]) -> tuple[list[datetime | None], list[datetime], list[datetime]]:
+    """``_write_order_times`` for the log's lines. A line whose time was
+    copied from the record (``_copied``) is not a witness to that time: it
+    neither lengthens nor starts a run, and it counts from the line written
+    before it once that line's time is settled. Otherwise a line from a
+    clock reading 2001 that copied the time of one line written ahead would
+    make two lines agree on that time, and the fold would keep it and lift
+    every correct line after it. Doctor names copied lines by their clock's
+    reading (``clock_at``), not here."""
+    raw = [_parse(e.get("written_at")) for e in events]
+    copied = [_copied(e) for e in events]
+    fixed, behind, ahead = _write_order_times([None if c else t for t, c in zip(raw, copied)])
+    before: datetime | None = None
+    for i, (t, c) in enumerate(zip(raw, copied)):
+        if c and t is not None:
+            fixed[i] = before if before is not None else t
+        if fixed[i] is not None:
+            before = fixed[i]
+    return fixed, behind, ahead
+
+
 def _in_write_order(events: list[dict]) -> list[dict]:
     """The log's lines with times that never run backwards: no line counts as
-    later than a line written after it (``_write_order_times``)."""
+    later than a line written after it (``_record_times``)."""
     raw = [_parse(e.get("written_at")) for e in events]
-    fixed, _behind, _ahead = _write_order_times(raw)
+    fixed, _behind, _ahead = _record_times(events)
     return [dict(e, written_at=_iso(f)) if f is not None and f != r else e
             for e, r, f in zip(events, raw, fixed)]
 
@@ -2451,7 +2486,7 @@ def doctor_block(now: datetime | None = None) -> dict:
     if _crowded(numbers):
         warnings.append("The routing record holds a line numbered at the most a line can hold (edited by hand or "
                         "merged); Khipu numbers new lines below it, so that line may sort out of order.")
-    _fixed, behind, ahead = _write_order_times([_parse(e.get("written_at")) for e in events])
+    _fixed, behind, ahead = _record_times(events)
     # Lines that took the record's time because their Mac's clock read before
     # the whole record (``_stamp_locked``) are named by that reading.
     for event in events:

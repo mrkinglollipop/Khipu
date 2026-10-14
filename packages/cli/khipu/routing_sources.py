@@ -39,7 +39,11 @@ from typing import Any
 # A runner's files, relative to its folder (the lanes runner's own layout).
 RUNNER_FILES = {"global": ("state", "global.json"), "heartbeat": ("state", "heartbeat.json"),
                 "events": ("events.log",), "config": ("config.json",)}
-TAIL_BYTES = 512 * 1024          # the bounded tail of events.log read on each fold
+# The bounded tail of events.log read on each fold, and how many lines of
+# each kind are kept from it: the defaults of the settings
+# ``routing_runner_tail_bytes`` and ``routing_runner_limited_lines`` (ADDED
+# and LAUNCH lines keep their own caps, which only shorten doctor's checks).
+TAIL_BYTES = 512 * 1024
 JSON_MAX = 4 * 1024 * 1024       # a state file larger than this is not read
 TABLE_MAX = 2 * 1024 * 1024
 # The lanes runner rests a lane 30 minutes when the message gives no reset
@@ -152,7 +156,7 @@ def read_only(path: Path, *, tail: int | None = None, limit: int = JSON_MAX) -> 
     A tail always starts on a whole line: the byte before it is read too,
     and when that byte is not a newline the cut-off first line is left out.
     A tail that starts at the top of the file, or right after a newline,
-    keeps its first line."""
+    keeps its first line. A tail of 0 is the whole file."""
     if private_path(path):
         raise PermissionError("inside a private folder")
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
@@ -162,6 +166,7 @@ def read_only(path: Path, *, tail: int | None = None, limit: int = JSON_MAX) -> 
             raise OSError("not a regular file")
         before = False  # whether the byte before the tail is read too
         if tail is not None:
+            tail = tail or st.st_size  # 0: the whole file
             begin = max(0, st.st_size - tail)
             before = begin > 0
             os.lseek(fd, begin - 1 if before else 0, os.SEEK_SET)
@@ -334,9 +339,27 @@ def runner_basis(at: datetime, until: datetime) -> str:
     return "estimated"
 
 
-def _parse_events(data: bytes, now: datetime) -> dict:
+def _limits(glob) -> dict[str, datetime]:
+    """Each lane's limit end in a ``global.json`` read (``_parse_global``)."""
+    out: dict[str, datetime] = {}
+    for lane, item in ((glob or {}).get("limited") or {}).items() if isinstance(glob, dict) else ():
+        until = _epoch(item.get("until")) if isinstance(item, dict) else None
+        if until is not None:
+            out[lane] = until
+    return out
+
+
+def _parse_events(data: bytes, now: datetime, limits: dict[str, datetime] | None = None,
+                  keep: dict[str, int] | None = None) -> dict:
+    """The kept lines of one tail of events.log. ``matched`` names, for each
+    ``global.json`` limit (``limits``), the newest LIMITED line anywhere in
+    the tail for it (same lane, same end), found before the line caps
+    (``keep``, 0: no cap) drop older lines, so a limit whose line is still in
+    the tail is always dated by that line, never by ``first``."""
     # ``read_only`` hands over whole lines only (a cut-off first line is
     # already left out), so every line here is kept.
+    limits = limits or {}
+    matched: dict[str, datetime] = {}
     lines = data.decode("utf-8", "replace").split("\n")
     out: dict[str, list] = {"LIMITED": [], "ADDED": [], "LAUNCH": []}
     holds = 0
@@ -356,6 +379,8 @@ def _parse_events(data: bytes, now: datetime) -> dict:
         elif kind == "LIMITED":
             lane, until = _name(fields.get("lane")), _parse(fields.get("until"))
             if lane and until:
+                if lane in limits and _same_until(limits[lane], until):
+                    matched[lane] = at if lane not in matched else max(matched[lane], at)
                 out["LIMITED"].append({"at": _iso(at), "pipeline": pipeline, "lane": lane, "until": _iso(until),
                                        "basis": runner_basis(at, until),
                                        "text": _redacted(f"{m.group(2)} LIMITED {rest}")})
@@ -373,16 +398,19 @@ def _parse_events(data: bytes, now: datetime) -> dict:
             lane = _name(fields.get("lane"))
             if lane and now - at <= LAUNCH_KEEP:
                 out["LAUNCH"].append({"at": _iso(at), "pipeline": pipeline, "lane": lane})
-    for kind, keep in KEEP_LINES.items():
-        out[kind] = out[kind][-keep:]
+    for kind, cap in dict(KEEP_LINES, **(keep or {})).items():
+        if cap:
+            out[kind] = out[kind][-cap:]
     return {"limited_lines": out["LIMITED"], "added": out["ADDED"], "launches": out["LAUNCH"],
-            "holds": holds, "first": _iso(first)}
+            "holds": holds, "first": _iso(first),
+            "matched": {lane: {"until": _iso(limits[lane]), "at": _iso(at)} for lane, at in matched.items()}}
 
 
 _PARSERS = {"global": _parse_global, "heartbeat": _parse_heartbeat, "config": _parse_config}
 
 
-def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals: int) -> tuple[dict, dict]:
+def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals: int,
+                tail_bytes: int = TAIL_BYTES, limited_lines: int = KEEP_LINES["LIMITED"]) -> tuple[dict, dict]:
     """(status, cache) for one runner. A file that can't be read or parsed
     keeps its last good read (from ``prev``, the cache the last saved view
     kept) and is reported with the time it was last read well and since when
@@ -396,8 +424,11 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
         last = prev.get(key) if isinstance(prev.get(key), dict) else {}
         try:
             if key == "events":
-                data, mtime = read_only(path, tail=TAIL_BYTES)
-                parsed = _parse_events(data, now)
+                # global.json is read first (RUNNER_FILES order): its limits
+                # are matched against every LIMITED line of the tail.
+                data, mtime = read_only(path, tail=tail_bytes)
+                parsed = _parse_events(data, now, _limits((cache.get("global") or {}).get("data")),
+                                       {"LIMITED": limited_lines})
             else:
                 data, mtime = read_only(path)
                 parsed = _PARSERS[key](data)
@@ -436,15 +467,35 @@ def _same_until(a: datetime, b: datetime) -> bool:
     return abs((a - b).total_seconds()) <= 1
 
 
+def _in_tail(events: dict, lane: str, until: datetime) -> list[datetime]:
+    """The times of LIMITED lines in the tail for this limit (same lane,
+    same end): the lines kept, and the newest line matched before the line
+    caps (``matched``), so a line the caps dropped still dates its limit."""
+    out = []
+    for line in events.get("limited_lines") or []:
+        if isinstance(line, dict) and line.get("lane") == lane and _parse(line.get("at")):
+            end = _parse(line.get("until"))
+            if end is not None and _same_until(end, until):
+                out.append(_parse(line["at"]))
+    matched = events.get("matched") if isinstance(events.get("matched"), dict) else {}
+    hit = matched.get(lane) if isinstance(matched.get(lane), dict) else {}
+    end, at = _parse(hit.get("until")), _parse(hit.get("at"))
+    if end is not None and at is not None and _same_until(end, until):
+        out.append(at)
+    return out
+
+
 def _sightings(cache: dict, prev) -> dict:
     """For each ``global.json`` limit, the time it is dated by, kept in the
     view between reads (``source_cache``) so it outlives the tail:
 
     - ``line`` true: the time of the newest LIMITED line Khipu has seen for
-      it (same lane, same end), kept after that line leaves the tail;
-    - ``line`` false: a limit whose line Khipu never saw is dated at the
-      oldest line the tail held when Khipu first found it (the latest that
-      line can have been written), and keeps that first time.
+      it (same lane, same end) anywhere in the tail, including a line the
+      line cap dropped (``_in_tail``), kept after that line leaves the tail;
+    - ``line`` false: a limit with no line anywhere in the tail is dated at
+      the oldest line the tail held when Khipu first found it (its line was
+      written before the tail began, so this is the latest it can have been
+      written), and keeps that first time.
 
     An owner's clear is weighed against this time like any other evidence:
     a clear written after it outranks the limit, and a limit seen after the
@@ -452,10 +503,6 @@ def _sightings(cache: dict, prev) -> dict:
     prev = prev if isinstance(prev, dict) else {}
     events = (cache.get("events") or {}).get("data") or {}
     glob = cache.get("global") or {}
-    lines = []
-    for line in events.get("limited_lines") or []:
-        if isinstance(line, dict) and _parse(line.get("at")) and _parse(line.get("until")):
-            lines.append((line.get("lane"), _parse(line["at"]), _parse(line["until"])))
     bound = _parse(events.get("first")) or _epoch(glob.get("mtime"))
     out: dict[str, dict] = {}
     for lane, item in ((glob.get("data") or {}).get("limited") or {}).items():
@@ -467,7 +514,7 @@ def _sightings(cache: dict, prev) -> dict:
         if old_at is None or old_until is None or not _same_until(old_until, until):
             old_at = None  # a different limit on the lane, or none kept
         old_line = old_at is not None and old.get("line") is True
-        seen = [at for name, at, end in lines if name == lane and _same_until(end, until)]
+        seen = _in_tail(events, lane, until)
         if seen:
             at, line = max(seen + ([old_at] if old_line else [])), True
         elif old_at is not None:
@@ -509,7 +556,8 @@ def runner_evidence(status: dict, cache: dict) -> list[dict]:
         sight = sightings.get(lane) if isinstance(sightings.get(lane), dict) else {}
         sight_until = _epoch(sight.get("until"))
         at = _parse(sight.get("at")) if sight_until and until and _same_until(sight_until, until) else None
-        at = at or bound
+        if at is None and until is not None:
+            at = max(_in_tail(events, lane, until), default=None) or bound
         if until is None or at is None or until <= at:
             continue  # an old limit the runner keeps on file; its time has passed
         if any(line["lane"] == lane and abs((_parse(line["until"]) - until).total_seconds()) <= 1 for line in lines):
@@ -645,7 +693,9 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
     evidence: list[dict] = []
     for entry in entries:
         status, kept = read_runner(entry, now, (prev_cache.get("runners") or {}).get(entry["name"]),
-                                   cfg.get("routing_runner_silent_intervals") or 0)
+                                   cfg.get("routing_runner_silent_intervals") or 0,
+                                   cfg.get("routing_runner_tail_bytes", TAIL_BYTES),
+                                   cfg.get("routing_runner_limited_lines", KEEP_LINES["LIMITED"]))
         mapped = lane_map.get(entry["name"]) or {}
         status["unmatched_lanes"] = [lane for lane in status["lanes"] if lane not in mapped]
         runners.append(status)

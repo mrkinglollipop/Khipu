@@ -777,3 +777,91 @@ def test_a_line_numbered_at_the_most_a_line_can_hold_never_loses_the_next_write(
     assert _account(view, "codex|")["state"] == "limited"
     assert added["n"] < most and any(r["n"] == added["n"] for r in view["rules"])
     assert any("numbered at the most a line can hold" in w for w in routing.doctor_block()["warnings"])
+
+
+# ---- fix round 3 ------------------------------------------------------------------------
+
+
+def _bounces(folder: Path, start: datetime, count: int) -> None:
+    """Muse LIMITED lines with the runner's 30-minute guess, one every 14 s."""
+    with open(folder / "events.log", "a", encoding="utf-8") as fh:
+        for i in range(count):
+            at = start + timedelta(seconds=14 * (i + 1))
+            fh.write(f"{routing._iso(at)} pipe-17 LIMITED lane=muse until="
+                     f"{routing._iso(at + timedelta(minutes=29, seconds=59))} job=recheck-17-auto-r{i} "
+                     "(account limit reached); the check step is retried later\n")
+
+
+@pytest.mark.parametrize("bounces", [150, 250])
+def test_a_limit_written_after_a_clear_stands_when_the_line_cap_drops_its_line(home, bounces):
+    # R3-1: with more LIMITED lines after it than the cap keeps, the limit's
+    # own line was dropped while still in the tail, and the limit was dated
+    # at the oldest line of the tail, before the owner's clear: it showed open.
+    _register(home)
+    _limit(home["a"], {})
+    log = home["a"] / "events.log"
+    log.write_text("".join(line for line in log.read_text().splitlines(True) if " LIMITED " not in line))
+    _append(home["a"], f"{routing._iso(T0 - timedelta(hours=5))} pipe-30 ADDED branch=project-a/early "
+                       "stage=built check_lane=codex fix_lanes=second max_checks=3")
+    home["clock"].now = T0 - timedelta(hours=3)
+    routing.clear("Claude second", via="app")
+    home["clock"].now = T0
+    until = T0 + timedelta(days=5)
+    _append(home["a"], f"{routing._iso(T0 - timedelta(hours=2))} pipe-40 LIMITED lane=second "
+                       f"until={routing._iso(until)} job=fix-40 (account limit reached); the fix step is retried later")
+    _bounces(home["a"], T0 - timedelta(hours=2), bounces)
+    _limit(home["a"], {"second": until})
+    assert log.stat().st_size < routing_sources.TAIL_BYTES  # every line is inside the tail
+    second = _account(routing.read_view(), SECOND)
+    assert (second["state"], second["until"]) == ("limited", routing._iso(until)), second
+    assert second["witness"]["at"] == routing._iso(T0 - timedelta(hours=2))
+    assert second["witness"]["cleared"] is False
+
+
+def test_the_runner_tail_and_its_line_caps_are_settings(home):
+    # R3-1, decision 13: the tail read and the lines kept from it are
+    # settings the owner can raise or remove (0: the whole file, every line).
+    _register(home)
+    _bounces(home["a"], T0 - timedelta(hours=2), 250)
+    cache = routing.read_view()["source_cache"]["runners"]["project A"]["events"]["data"]
+    assert len(cache["limited_lines"]) == 200
+    _set(home, routing_runner_limited_lines=0)
+    home["clock"].advance(seconds=1)
+    cache = routing.read_view()["source_cache"]["runners"]["project A"]["events"]["data"]
+    assert len(cache["limited_lines"]) == 253  # the fixture's three and the 250 bounces
+    _set(home, routing_runner_tail_bytes=300)
+    home["clock"].advance(seconds=1)
+    cache = routing.read_view()["source_cache"]["runners"]["project A"]["events"]["data"]
+    assert len(cache["limited_lines"]) == 1
+    _set(home, routing_runner_tail_bytes=0)
+    home["clock"].advance(seconds=1)
+    cache = routing.read_view()["source_cache"]["runners"]["project A"]["events"]["data"]
+    assert len(cache["limited_lines"]) == 253
+    status = routing.settings_status()
+    assert status["routing_runner_tail_bytes"]["default"] == routing_sources.TAIL_BYTES
+    assert status["routing_runner_limited_lines"]["default"] == routing_sources.KEEP_LINES["LIMITED"]
+
+
+def test_a_low_clock_line_after_one_line_written_ahead_never_lifts_the_lines_after_it(home):
+    # R3-2: a line from a clock reading 2001 took the time of the one line
+    # written ahead before it, which made two lines agree on that time, so
+    # the fold kept the ahead time and lifted every correct line after it.
+    clock = home["clock"]
+    author = {"kind": "conversation", "harness": "claude_code"}
+    routing.report(account="Codex", state="open", author=author)
+    clock.advance(minutes=1)
+    routing.report(account="Muse", state="open", author=author)
+    clock.now = T0 + timedelta(hours=2)  # a clock reading ahead, once
+    routing.report(account="Muse", state="open", author=author)
+    clock.now = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    routing.report(account="Muse", state="open", author=author)
+    assert "clock_at" in routing.read_events()[0][-1]
+    clock.now = T0 + timedelta(minutes=10)
+    routing.report(account="Claude", state="open", author=author)
+    clock.now = T0 + timedelta(minutes=10, hours=12, seconds=60)
+    claude = _account(routing.read_view(), "claude|")
+    assert claude["state"] == "unknown", claude
+    warnings = routing.doctor_block()["warnings"]
+    assert any("1 line dated well before" in w and "2001-01-01T00:00:00Z" in w for w in warnings), warnings
+    assert any("dated well after" in w and routing._iso(T0 + timedelta(hours=2)) in w for w in warnings), warnings
+    assert not any("2 lines dated well before" in w for w in warnings), warnings

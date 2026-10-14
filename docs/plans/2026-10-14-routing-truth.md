@@ -245,7 +245,8 @@ MCP tool refuses them. Doctor warns when any of them was written by anything oth
    nothing until its `/login`.
 2. **Runners' files, read and never written.** Each registered runner folder (setting `routing_sources`, a
    list of `{name, kind: "lanes", path}`) is read for `state/global.json` `limited`; the `ADDED`, `LIMITED`,
-   `LAUNCH` and `HOLD` lines of `events.log` (a bounded tail); `state/heartbeat.json`; and, for doctor's rule
+   `LAUNCH` and `HOLD` lines of `events.log` (a bounded tail: the last 512 KB, keeping the newest 200 LIMITED
+   lines, both settings); `state/heartbeat.json`; and, for doctor's rule
    checks only, these keys of `config.json` and nothing else: each lane's `kind`, `model`, `launch` argument
    list and `confirm_lane`, and `defaults.check_lane` and `defaults.fix_lanes`. Nothing else in `config.json`
    is read or kept. Every line Khipu stores or pushes from a runner first passes through Khipu's existing
@@ -255,8 +256,9 @@ MCP tool refuses them. Doctor warns when any of them was written by anything oth
    when its seconds are zero and it is not exactly 30 minutes after the LIMITED line (the shape `limit_until`
    gives a parsed message plus two minutes); everything else is **estimated**. A file that fails to parse is
    reported with its last good read, never guessed around. A `global.json` limit keeps the time of the
-   newest LIMITED line Khipu saw for it (same lane, same end) after that line leaves the tail; a limit whose
-   line Khipu never saw is dated at the oldest line the tail held when Khipu first found it. An owner clear
+   newest LIMITED line Khipu saw for it (same lane, same end) after that line leaves the tail, matched against
+   every line of the tail, including lines the LIMITED line cap leaves out; a limit with no line anywhere in
+   the tail is dated at the oldest line the tail held when Khipu first found it. An owner clear
    is weighed against that time, so a limit the runner wrote after the clear stands once its line has aged
    out. A registered path under a credential location (`API Keys/`, `My Portfolio/`, any `auth.json`,
    keychain exports) is refused.
@@ -918,7 +920,8 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
   names that Mac's lines as the ones with the wrong date, and also warns that the record holds times ahead of
   this Mac's clock. It is the mirror of the fixed limit below, and times alone cannot tell the two apart. A
   clock behind only part of the record (some lines written before it) is not affected: those lines keep the
-  phase 1a handling.
+  phase 1a handling. A single line written ahead after a correct history is not this case: a line that copied
+  its time is never a witness to that time, so the ahead line is pulled back once a correct line follows.
 - **A clock that reads low, but not before the record began (phase 1a handling kept).** A Mac whose clock is
   more than `CLOCK_TOLERANCE` behind writes its own time when the record holds lines written before that time.
   If such a run is longer than the lines written in the stretch it is behind, the fold still keeps the low
@@ -937,8 +940,9 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
 - **A Mac clock that reads low for a while (phase 1a, accepted by Matt 2026-10-14; fixed in phase 1b).**
   Fixed by settling each line when it is written: the writer holds the log lock, sees the record, and records
   a sequence number (`seq`) with its line, which the fold orders by; when the writer's clock reads more than
-  `CLOCK_TOLERANCE` before every line of a record of two lines or more, its line takes the newest line's time
-  and keeps the clock's reading in `clock_at`, and doctor names it from that reading. Lines without `seq`
+  `CLOCK_TOLERANCE` before every line of a record of two lines or more, its line takes the newest time the fold
+  settles for the record and keeps the clock's reading in `clock_at`, and doctor names it from that reading.
+  The fold counts such a line from the line written before it and never as a witness to its copied time. Lines without `seq`
   (written by phase 1a) keep their handling. Proved by `test_a_run_of_lines_from_a_clock_reading_2001_never_ages_the_history`
   (a history of two lines; N = 0, 1 and 10: the history keeps its times for every N, and doctor names the
   2001 lines, never the T0 lines). A history of one line is not covered (Known limits). The text as accepted: The fold decides which
