@@ -963,3 +963,16 @@ def test_a_down_report_after_khipus_own_read_voids_its_confirmation(home):
     home["clock"].advance(seconds=1)
     out = routing.wait("Codex", confirmed=True, timeout=0, sleep=fake.sleep, clock=fake.monotonic)
     assert out["open"] is True, out
+
+
+def test_an_account_id_cannot_be_computed_from_a_guessed_login_folder(home):
+    # A bare hash of the key let a reader confirm a guessed login folder
+    # offline; the id is keyed by this install's own secret.
+    import hashlib
+
+    key = "claude|/logins/claude-second"
+    listed = routing.account_id(key)
+    assert listed == routing.account_id(key)
+    assert listed != "acct-" + hashlib.sha256(key.encode()).hexdigest()[:12]
+    salt = routing.routing_dir() / "id-salt"
+    assert salt.exists() and (salt.stat().st_mode & 0o777) == 0o600

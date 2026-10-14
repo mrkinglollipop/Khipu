@@ -53,6 +53,7 @@ import bisect
 import contextlib
 import fcntl
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -2882,11 +2883,47 @@ _TABLE_FIELDS = ("hash", "stamped_at", "changed_at", "error")
 _WRITE_FIELDS = ("ok", "id", "state", "until", "basis", "ended", "version", "saved")
 
 
+_ID_SALTS: dict[str, bytes] = {}
+
+
+def _id_salt() -> bytes:
+    """This install's secret for account ids, made once and kept 0600 in the
+    routing folder. Without it an id would be a bare hash of the key, and a
+    reader could confirm a guessed login folder offline. If the folder can't
+    be written, a salt for this process only: ids then change between
+    processes, which costs a conversation a re-read, never a leak."""
+    path = routing_dir() / "id-salt"
+    cached = _ID_SALTS.get(str(path))
+    if cached is not None:
+        return cached
+    salt = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(os.urandom(32))
+    except FileExistsError:
+        pass
+    except OSError:
+        salt = os.urandom(32)
+    if salt is None:
+        try:
+            salt = path.read_bytes()
+        except OSError:
+            salt = b""
+        if len(salt) < 16:
+            salt = os.urandom(32)
+    _ID_SALTS[str(path)] = salt
+    return salt
+
+
 def account_id(key: str) -> str:
-    """An account's id in a conversation's answers: a short hash of its key,
-    the same for the same account every time, that says nothing of the
-    login folder the key holds. ``resolve_account`` takes it back."""
-    return "acct-" + hashlib.sha256(str(key).encode("utf-8", "surrogatepass")).hexdigest()[:12]
+    """An account's id in a conversation's answers: a keyed hash of its key
+    under this install's secret, the same for the same account every time,
+    that says nothing of the login folder the key holds and can't be
+    computed from a guess of it. ``resolve_account`` takes it back."""
+    digest = hmac.new(_id_salt(), str(key).encode("utf-8", "surrogatepass"), hashlib.sha256).hexdigest()
+    return "acct-" + digest[:12]
 
 
 def _pick(item, fields: tuple) -> dict | None:
