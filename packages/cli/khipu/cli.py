@@ -728,6 +728,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         decision_links_block = _decisions.candidate_link_count()
     except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
         decision_links_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # Plan usage (docs/plans/2026-10-14-plan-usage.md, phase 2): each account's
+    # tightest window still in force, read from the usage cache only (no CLI
+    # is probed, nothing waits), and one warning per window at 90% or more.
+    # Visibility only: it never gates `ok`.
+    try:
+        from khipu import usage as _usage
+
+        plan_usage_block = _usage.doctor_block()
+    except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
+        plan_usage_block = {"accounts": [], "warnings": [], "error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -764,6 +774,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         **({"t3": t3_health} if t3_health is not None else {}),
         "features": features_block,
         "decision_links": decision_links_block,
+        "plan_usage": plan_usage_block,
+        # Warnings that never gate `ok` (today: plans nearly used up).
+        "warnings": list(plan_usage_block.get("warnings") or []),
         "not_configured": not_configured,
         "ok": (
             hub_ok

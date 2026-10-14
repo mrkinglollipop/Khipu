@@ -12,7 +12,7 @@
    time is the viewer's own local time, the same on the card, the callout and
    the health report. */
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 import { EmptyState, ListRow, Tag } from "./ui";
@@ -47,6 +47,9 @@ export type UsageAccount = {
   last_attempt_at?: string | null;
   last_error?: string | null;
   last_good_at?: string | null;
+  /** Codex's live read failed and the figures came from its last turn: the
+   *  fixed code of that failure (the note says it in plain words). */
+  live_error?: string | null;
   cached?: boolean;
   refreshing?: boolean;
   stale?: boolean;
@@ -255,6 +258,55 @@ export function planAttention(report: UsageReport | null | undefined, now: Date 
       cause: `${hot.join("; ")}. Work sent to it may be refused until it resets.`,
     },
   ];
+}
+
+/** The earliest reset still ahead among windows at or above 90%: the moment
+ *  the attention item next changes on its own. Null when there is none. */
+export function nextAlertReset(report: UsageReport | null | undefined, now: Date = new Date()): number | null {
+  let next: number | null = null;
+  for (const row of report?.accounts ?? []) {
+    for (const w of liveWindows(row, now)) {
+      const p = pctOf(w);
+      const d = parseIso(w.resets_at);
+      if (p == null || p < PLAN_ALERT_PCT || !d) continue;
+      if (next == null || d.getTime() < next) next = d.getTime();
+    }
+  }
+  return next;
+}
+
+const MINUTE_MS = 60_000;
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** `planAttention` kept current while a view stays open: judged afresh when
+ *  new figures arrive, every minute while the item shows (so "resets in N
+ *  min" counts down), and at the earliest reset among its windows (so a
+ *  window that has reset drops out then, not at the next read). */
+export function usePlanAttention(report: UsageReport | null | undefined): Attention[] {
+  const [now, setNow] = useState(() => new Date());
+  const [seen, setSeen] = useState(report);
+  let at = now;
+  if (seen !== report) {
+    // New figures: judge them on the clock now, not the last tick's.
+    at = new Date();
+    setSeen(report);
+    setNow(at);
+  }
+  const items = useMemo(() => planAttention(report, at), [report, at]);
+  const showing = items.length > 0;
+  const next = nextAlertReset(report, at);
+  useEffect(() => {
+    if (!showing) return;
+    const tick = window.setInterval(() => setNow(new Date()), MINUTE_MS);
+    return () => window.clearInterval(tick);
+  }, [showing]);
+  useEffect(() => {
+    if (next == null) return;
+    const wait = Math.min(MAX_TIMER_MS, Math.max(0, next - Date.now()) + 50);
+    const timer = window.setTimeout(() => setNow(new Date()), wait);
+    return () => window.clearTimeout(timer);
+  }, [next]);
+  return items;
 }
 
 function parseReport(data: unknown): UsageReport | null {
@@ -580,6 +632,49 @@ function harnessName(h: string): string {
   return USAGE_HARNESS_OPTIONS.find(([v]) => v === h)?.[1] ?? h;
 }
 
+const LABEL_MAX = 64;
+
+/** The name an account gets when the Name field is left empty: the CLI's
+ *  name, with the login folder when there is one ("Codex (~/.codex-work)"),
+ *  so a second login never takes the name of the default one. At most 64
+ *  characters, as `khipu config` stores. */
+export function defaultAccountLabel(harness: string, home: string | null | undefined): string {
+  const name = harnessName(harness);
+  const folder = (home ?? "").trim();
+  if (!folder) return name;
+  const room = LABEL_MAX - name.length - 3;
+  return `${name} (${folder.length > room ? `…${folder.slice(folder.length - room + 1)}` : folder})`;
+}
+
+/** A login folder as typed, for comparing two entries: no trailing slash. */
+function folderKey(home: string | null | undefined): string {
+  return (home ?? "").trim().replace(/\/+$/, "");
+}
+
+/** Why `entry` cannot be added beside `entries`, in plain words, or null.
+ *  The same two rules `khipu config` applies (each login once, each name
+ *  once), checked here so the owner is pointed at the field to change. */
+export function accountClash(entries: UsageAccountEntry[], entry: UsageAccountEntry): { field: "name" | "home"; message: string } | null {
+  const valid = entries.filter((e) => !e.invalid);
+  const login = valid.find((e) => e.harness === entry.harness && folderKey(e.home) === folderKey(entry.home));
+  if (login && entry.harness === "muse") {
+    return { field: "name", message: `Muse is already listed as ${login.label}. Muse has one login, so it is read once.` };
+  }
+  if (login) {
+    const where = folderKey(entry.home) ? `the login folder ${entry.home}` : "its default login";
+    return {
+      field: "home",
+      message: `${harnessName(entry.harness)} with ${where} is already listed as ${login.label}. Choose a different Login folder.`,
+    };
+  }
+  const name = entry.label.trim().toLowerCase();
+  const named = valid.find((e) => e.label.trim().toLowerCase() === name);
+  if (named) {
+    return { field: "name", message: `An account is already named ${named.label}. Type a different Name.` };
+  }
+  return null;
+}
+
 /** The list to store: the valid entries shown, as `{label, harness, home?}`. */
 function storable(entries: UsageAccountEntry[]): Array<{ label: string; harness: string; home?: string }> {
   return entries
@@ -596,37 +691,53 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
   const [home, setHome] = useState("");
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [clash, setClash] = useState<"name" | "home" | null>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
+  const homeRef = useRef<HTMLInputElement>(null);
   const id = useId();
   const hasInvalid = entries.some((e) => e.invalid);
 
-  async function save(next: UsageAccountEntry[] | null): Promise<boolean> {
+  /** Stores the list; `onSaved` runs the moment the write succeeds. The
+   *  re-read that follows probes a new account (seconds), so nothing here
+   *  waits on it: the form is free again as soon as the list is saved. */
+  async function save(next: UsageAccountEntry[] | null, onSaved?: () => void): Promise<boolean> {
     setSaving(true);
     setErr(null);
+    setClash(null);
     const list = next == null ? [] : storable(next);
     const res = list.length
       ? await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(list) })
       : await callCli("khipu_config_unset", { key: "usage_accounts" });
+    if (res.ok) onSaved?.();
     await cfg.reload();
     setSaving(false);
     if (!res.ok) {
       setErr(settingError(res.error));
       return false;
     }
-    await onChanged?.();
+    void onChanged?.();
     return true;
   }
 
   async function add(e: FormEvent) {
     e.preventDefault();
+    const folder = harness === "muse" ? null : home.trim() || null;
     const entry: UsageAccountEntry = {
-      label: label.trim() || harnessName(harness),
+      label: label.trim() || defaultAccountLabel(harness, folder),
       harness,
-      home: harness === "muse" ? null : home.trim() || null,
+      home: folder,
     };
-    if (await save([...entries, entry])) {
+    const problem = accountClash(entries, entry);
+    if (problem) {
+      setErr(problem.message);
+      setClash(problem.field);
+      (problem.field === "name" ? nameRef : homeRef).current?.focus();
+      return;
+    }
+    await save([...entries, entry], () => {
       setLabel("");
       setHome("");
-    }
+    });
   }
 
   return (
@@ -676,11 +787,17 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
         </label>
         <input
           id={`${id}-label`}
+          ref={nameRef}
           value={label}
           placeholder="Claude second…"
           autoComplete="off"
           spellCheck={false}
-          onChange={(e) => setLabel(e.target.value)}
+          aria-invalid={clash === "name" || undefined}
+          aria-describedby={err ? `${id}-err` : undefined}
+          onChange={(e) => {
+            setLabel(e.target.value);
+            if (clash) setClash(null);
+          }}
         />
         <label className="muted" htmlFor={`${id}-harness`}>
           CLI
@@ -697,12 +814,18 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
         </label>
         <input
           id={`${id}-home`}
+          ref={homeRef}
           value={harness === "muse" ? "" : home}
           placeholder={harness === "muse" ? "Muse has one login" : "~/.claude-second…"}
           disabled={harness === "muse"}
           autoComplete="off"
           spellCheck={false}
-          onChange={(e) => setHome(e.target.value)}
+          aria-invalid={clash === "home" || undefined}
+          aria-describedby={err ? `${id}-err` : undefined}
+          onChange={(e) => {
+            setHome(e.target.value);
+            if (clash) setClash(null);
+          }}
         />
         <button type="submit" className="sm" disabled={saving || !status}>
           {saving ? <Loader2 size={14} className="spin" aria-hidden /> : null}
@@ -710,7 +833,8 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
         </button>
       </form>
       <p className="set-help">
-        The login folder is where that CLI keeps a second sign-in; leave it empty for the default login.
+        The login folder is where that CLI keeps a second sign-in; leave it empty for the default login. With no
+        Name, the account is named after its CLI and login folder.
         {hasInvalid ? " Entries marked not valid are left out when you add or remove an account." : ""}
       </p>
       {status?.source === "file" ? (
@@ -721,7 +845,7 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
         </div>
       ) : null}
       {err ? (
-        <p className="set-error" role="alert">
+        <p className="set-error" role="alert" id={`${id}-err`}>
           {err}
         </p>
       ) : null}

@@ -12,6 +12,7 @@ import builtins
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import textwrap
@@ -248,7 +249,9 @@ def test_codex_falls_back_to_the_newest_rollout(fake, tmp_path):
     assert row["plan"] == "pro"
     assert row["windows"] == [{"name": "five_hour", "used_pct": 71.0, "resets_at": "2026-01-01T02:00:00Z",
                                "window_mins": 300, "slot": "primary"}]
-    assert "live read failed (not_signed_in)" in row["note"]
+    # The note is plain words (the app shows it as written); the code has its own field.
+    assert row["note"] == usage.ROLLOUT_NOTE and row["live_error"] == "not_signed_in"
+    assert not re.search(r"[a-z]+_[a-z0-9_]+|\(", row["note"])
 
 
 def test_codex_without_live_answer_or_rollout_fails(fake, tmp_path):
@@ -346,7 +349,8 @@ def test_configured_accounts_keep_invalid_entries_visible(fake, tmp_path):
     assert "Muse" in accounts[2]["invalid"]
     row = usage.probe_account(accounts[1])
     assert row["ok"] is False and row["error"] == "invalid_account"
-    assert row["note"].startswith("invalid usage_accounts entry")
+    assert row["note"].startswith("this account entry is not valid: ")
+    assert "usage_accounts" not in row["note"]
 
 
 def test_summary_and_table():
@@ -542,7 +546,8 @@ def test_secret_bearing_cli_text_never_reaches_any_output(fake, tmp_path, monkey
     assert by["grok"]["error"] == "cli_error"
     assert by["claude"]["error"] == "cli_error"
     assert by["muse"]["error"] == "exit_7"
-    assert by["codex"]["ok"] is True and by["codex"]["note"].startswith("live read failed (exit_7)")
+    assert by["codex"]["ok"] is True and by["codex"]["note"] == usage.ROLLOUT_NOTE
+    assert by["codex"]["live_error"] == "exit_7"
     assert cli.main(["usage", "--fresh"]) == 0
     printed += capsys.readouterr().out
     mcp_out = mcp_server.TOOL_FUNCS["khipu_usage"]({"fresh": True})
@@ -875,3 +880,145 @@ def test_every_error_code_has_a_plain_phrase_in_the_app():
     assert not missing, f"no plain phrase in PlansCard.tsx for {missing}"
     # exit_<n> / signal_<n> are matched by pattern there.
     assert "(exit|signal)_" in app.read_text(encoding="utf-8")
+
+
+# ---- notes on kept figures, plain words only ---------------------------------------
+
+
+def test_no_note_khipu_writes_carries_a_code():
+    """The app shows a row's note as written: no snake_case code in any."""
+    for note in [*usage._NOTES.values(), usage.ROLLOUT_NOTE]:
+        assert not re.search(r"\b[a-z]+_[a-z0-9_]+\b", note), note
+
+
+def test_a_failed_probe_shows_its_own_note_on_the_kept_figures(fake, monkeypatch):
+    usage._save_cache({"claude|": _cached(_ago(60 * 24), note=None)})
+    failed = dict(_row(ok=False, error="no_plan_limits"), note=usage._NOTES["no_plan_limits"])
+    monkeypatch.setattr(usage, "probe_all", lambda accounts, *, timeout: [failed])
+    row = usage.report(accounts=[{"label": "Claude", "harness": "claude", "home": None}], fresh=True)["accounts"][0]
+    assert row["ok"] is False and row["windows"][0]["used_pct"] == 55
+    assert row["note"] == usage._NOTES["no_plan_limits"] and "/login" in row["note"]
+    saved = json.loads(usage.cache_file().read_text())["rows"]["claude|"]
+    assert saved["note"] == usage._NOTES["no_plan_limits"]
+
+
+def test_a_fallback_note_does_not_outlive_its_good_read(fake, monkeypatch):
+    usage._save_cache({"codex|": _cached(_ago(5), harness="codex", label="Codex", source="rollout",
+                                         note=usage.ROLLOUT_NOTE, live_error="exit_1")})
+    monkeypatch.setattr(usage, "probe_all", lambda accounts, *, timeout: [
+        _row("codex", "Codex", ok=False, error="timeout", note=None)])
+    row = usage.report(accounts=[{"label": "Codex", "harness": "codex", "home": None}], fresh=True)["accounts"][0]
+    assert row["ok"] is False and row["error"] == "timeout" and row["source"] == "rollout"
+    assert row["windows"][0]["used_pct"] == 55
+    assert row["note"] is None and "live_error" not in row
+
+
+# ---- doctor and khipu_status: the cache only ------------------------------------------
+
+
+def _never_probe(monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("doctor and khipu_status read the cache only")
+
+    for name in ("probe_all", "probe_account", "_converse", "_start_refresh", "_try_refresh_lock",
+                 "probe_claude", "probe_codex", "probe_grok", "probe_muse"):
+        monkeypatch.setattr(usage, name, boom)
+
+
+def _seed_plans(tmp_path, *, claude_pct=94.0):
+    """Four accounts: Claude main fresh with a five-hour window at 94%
+    resetting in 40 min, Codex a day old (99% week already reset, five-hour
+    under the line), Grok kept after a failed read at 89.96% (shown 90%),
+    Muse never read."""
+    now = datetime.now(timezone.utc)
+    soon = usage._iso((now + timedelta(minutes=40, seconds=20)).timestamp())
+    later = usage._iso((now + timedelta(days=2)).timestamp())
+    past = usage._iso((now - timedelta(hours=1)).timestamp())
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    (data / "config.json").write_text(json.dumps({"usage_accounts": [
+        {"label": "Claude main", "harness": "claude"}, {"label": "Codex", "harness": "codex"},
+        {"label": "Grok", "harness": "grok"}, {"label": "Muse", "harness": "muse"}]}))
+    usage._save_cache({
+        "claude|": _cached(_ago(1), windows=[{"name": "five_hour", "used_pct": claude_pct, "resets_at": soon},
+                                            {"name": "weekly", "used_pct": 30, "resets_at": later}]),
+        "codex|": _cached(_ago(60 * 24), harness="codex", label="Codex", plan="pro", windows=[
+            {"name": "weekly", "used_pct": 99, "resets_at": past},
+            {"name": "five_hour", "used_pct": 89.94, "resets_at": soon}]),
+        "grok|": dict(_cached(_ago(30), harness="grok", label="Grok", plan="heavy",
+                              windows=[{"name": "weekly", "used_pct": 89.96, "resets_at": later}]),
+                      ok=False, error="timeout"),
+    })
+    return {"soon": soon, "later": later}
+
+
+def test_doctor_block_reads_the_cache_only_and_warns_at_90(fake, tmp_path, monkeypatch):
+    times = _seed_plans(tmp_path)
+    _never_probe(monkeypatch)
+    block = usage.doctor_block()
+    by = {a["account"]: a for a in block["accounts"]}
+    assert block["source"] == "cache" and block["alert_pct"] == 90
+    assert (by["Claude main"]["window"], by["Claude main"]["used_pct"], by["Claude main"]["stale"]) == (
+        "five-hour", 94, False)
+    assert by["Claude main"]["resets_at"] == times["soon"]
+    # A reset window's old figure no longer applies: the tightest still in force is the five-hour.
+    assert (by["Codex"]["window"], by["Codex"]["used_pct"], by["Codex"]["stale"]) == ("five-hour", 89.9, True)
+    assert by["Grok"]["ok"] is False and by["Grok"]["error"] == "timeout" and by["Grok"]["stale"] is True
+    assert by["Muse"]["never_read"] is True and by["Muse"]["window"] is None
+    grok_at = by["Grok"]["figures_at"]
+    assert block["warnings"] == [
+        "Plan nearly used up: Claude main (max) five-hour at 94%, resets in 40 min",
+        f"Plan nearly used up: Grok (heavy) week at 90% as of {usage._when(grok_at)}, "
+        f"resets {usage._when(times['later'])}",
+    ]
+
+
+def _doctor(capsys) -> tuple[int, dict]:
+    from contextlib import ExitStack
+    from unittest import mock
+
+    from khipu import cli
+    from tests.test_cli_recall_quality import _green_doctor_patches
+
+    patches = [*_green_doctor_patches(),
+               mock.patch("khipu.probe.status", return_value={"ok": True, "reason": None}),
+               mock.patch("khipu.drift.recall_quality", return_value={}),
+               mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25})]
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        rc = cli.cmd_doctor(cli.build_parser().parse_args(["doctor"]))
+    return rc, json.loads(capsys.readouterr().out)
+
+
+def test_doctor_carries_plan_usage_and_its_warning_and_never_gates_ok(fake, tmp_path, monkeypatch, capsys):
+    _seed_plans(tmp_path, claude_pct=10)
+    _never_probe(monkeypatch)
+    rc_calm, calm = _doctor(capsys)
+    assert calm["warnings"] == calm["plan_usage"]["warnings"]
+    assert not any("Claude main" in w for w in calm["warnings"])
+    _seed_plans(tmp_path, claude_pct=94)
+    rc_hot, hot = _doctor(capsys)
+    assert [a["account"] for a in hot["plan_usage"]["accounts"]] == ["Claude main", "Codex", "Grok", "Muse"]
+    assert hot["warnings"][0] == "Plan nearly used up: Claude main (max) five-hour at 94%, resets in 40 min"
+    assert hot["warnings"] == hot["plan_usage"]["warnings"]
+    assert (rc_hot, hot["ok"]) == (rc_calm, calm["ok"])
+
+
+def test_khipu_status_carries_the_same_warning_line(fake, tmp_path, monkeypatch):
+    from unittest import mock
+
+    _seed_plans(tmp_path)
+    _never_probe(monkeypatch)
+    with mock.patch("khipu.drift.status_payload", return_value={"counts": {"episodes": 1}}), \
+            mock.patch("khipu.hub_snapshot.snapshot_freshness", return_value={"ok": True}):
+        out = mcp_server._tool_status({})
+    assert out["warnings"] == usage.doctor_block()["warnings"]
+    assert out["warnings"][0].startswith("Plan nearly used up: Claude main (max) five-hour at 94%")
+
+
+def test_doctor_block_never_raises_on_a_broken_cache(fake, tmp_path, monkeypatch):
+    _never_probe(monkeypatch)
+    usage.cache_file().parent.mkdir(parents=True, exist_ok=True)
+    usage.cache_file().write_text("{not json")
+    assert usage.doctor_block()["warnings"] == []

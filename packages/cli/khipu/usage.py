@@ -100,6 +100,9 @@ _NOTES = {
     E_NOT_INSTALLED: "CLI not found on PATH",
     E_PENDING: "first probe running; ask again in a few seconds",
 }
+# Plain words only: the app shows notes as written. The live read's own code
+# goes in the row's ``live_error`` field, never into the note.
+ROLLOUT_NOTE = "Codex did not answer just now; these figures are from its last turn"
 _SIGNIN = re.compile(r"not (signed|logged) in|(log|sign) ?in (is )?required|please (log|sign) ?in|"
                      r"unauthori[sz]ed|unauthenticated|authentication (failed|required)|\b401\b", re.I)
 
@@ -639,7 +642,8 @@ def probe_codex(home: str | None = None, *, timeout: float = TIMEOUT_S) -> dict:
         fallback = codex_rollout(home, deadline=deadline)
         if fallback is None:
             raise
-        fallback["note"] = f"live read failed ({exc.code}); figures from the last Codex turn"
+        fallback["note"] = ROLLOUT_NOTE
+        fallback["live_error"] = exc.code
         return fallback
 
 
@@ -854,7 +858,7 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S) -> dict:
     harness, home = account["harness"], account.get("home")
     started = time.monotonic()
     if account.get("invalid"):
-        data = {"ok": False, "error": E_INVALID, "note": f"invalid usage_accounts entry: {account['invalid']}"}
+        data = {"ok": False, "error": E_INVALID, "note": f"this account entry is not valid: {account['invalid']}"}
     elif harness == "claude":
         data = probe_claude(home, timeout=timeout)
     elif harness == "codex":
@@ -980,14 +984,17 @@ def _release(fd: int | None) -> None:
 def _merge(previous: dict | None, row: dict) -> dict:
     """A good probe replaces the row. A failed one keeps the last good figures
     with their own ``probed_at`` (and ``last_good_at``); the attempt goes in
-    ``last_attempt_at`` / ``last_error``, however many failures in a row."""
+    ``last_attempt_at`` / ``last_error``, however many failures in a row.
+    The note is the failure's own (the ``/login`` hint, say): a note that
+    came with the kept figures (the Codex fallback's) held only while that
+    read was good."""
     attempt = row.get("probed_at")
     if row.get("ok"):
         return dict(row, last_attempt_at=attempt, last_error=None, last_good_at=attempt)
     if previous and previous.get("last_good_at"):
-        kept = dict(previous)
+        kept = {k: v for k, v in previous.items() if k != "live_error"}
         kept.update(ok=False, error=row.get("error"), last_attempt_at=attempt, last_error=row.get("error"),
-                    ms=row.get("ms"), account=row.get("account"), home=row.get("home"))
+                    ms=row.get("ms"), account=row.get("account"), home=row.get("home"), note=row.get("note"))
         return kept
     return dict(row, last_attempt_at=attempt, last_error=row.get("error"), last_good_at=None)
 
@@ -1199,3 +1206,98 @@ def table(rep: dict) -> str:
     for r in [header, *lines]:
         out.append("  ".join(c.ljust(widths[i]) for i, c in enumerate(r[:-1])) + "  " + r[-1])
     return "\n".join(line.rstrip() for line in out)
+
+
+# ---- doctor and khipu_status: the cache only --------------------------------------
+
+# The line the app's Home callout uses too (PlansCard.tsx PLAN_ALERT_PCT).
+ALERT_PCT = 90.0
+
+
+def _shown_pct(value) -> float | None:
+    """The one-decimal figure the app shows and judges its lines on
+    (``Math.round(x * 10) / 10``), or None when the CLI gave no number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return math.floor(value * 10 + 0.5) / 10
+
+
+def _window_words(window: dict) -> str:
+    """'five-hour', 'week', 'Fable week', 'day', '60 min'."""
+    name = window.get("name") or "window"
+    if name == "five_hour":
+        return "five-hour"
+    if name == "weekly":
+        return "week"
+    if name == "daily":
+        return "day"
+    if name.startswith("weekly_"):
+        return f"{window.get('model') or name.removeprefix('weekly_').replace('_', ' ')} week"
+    mins = re.fullmatch(r"(\d+)_min", name)
+    return f"{mins.group(1)} min" if mins else name.replace("_", " ")
+
+
+def _reset_words(iso: str | None, now: datetime) -> str | None:
+    """'resets in 40 min' under an hour, else 'resets Sun 15:00Z'."""
+    when = _parse_time(iso)
+    if when is None:
+        return None
+    ahead = (when - now).total_seconds()
+    if ahead < 3600:
+        return f"resets in {max(1, round(ahead / 60))} min"
+    return f"resets {_when(iso)}"
+
+
+def _in_force(window: dict, now: datetime) -> bool:
+    """A window with a figure whose reset has not passed (a passed reset has
+    started the window again, so its old figure no longer applies)."""
+    if not isinstance(window, dict) or _shown_pct(window.get("used_pct")) is None:
+        return False
+    when = _parse_time(window.get("resets_at"))
+    return when is None or when > now
+
+
+def doctor_block(*, max_age: float = DEFAULT_MAX_AGE_S, now: datetime | None = None) -> dict:
+    """What ``khipu doctor`` and ``khipu_status`` carry: per configured
+    account, its tightest window still in force (label, used %, reset time,
+    stale flag), and one warning line per window still in force at
+    ``ALERT_PCT`` or more. Read from the usage cache only: no CLI is probed,
+    no lock is waited on, and nothing here ever gates doctor's ``ok``."""
+    now = now or _now()
+    cache = _load_cache()
+    accounts: list[dict] = []
+    warnings: list[str] = []
+    for account in configured_accounts():
+        entry = {"account": account["label"], "harness": account["harness"], "home": account.get("home"),
+                 "ok": None, "error": None, "plan": None, "window": None, "used_pct": None, "resets_at": None,
+                 "figures_at": None, "stale": False}
+        if account.get("invalid"):
+            entry.update(ok=False, error=E_INVALID)
+            accounts.append(entry)
+            continue
+        row = cache.get(_key(account))
+        if not row:
+            entry["never_read"] = True  # `khipu usage` has not read this account yet
+            accounts.append(entry)
+            continue
+        age = _age_s(row, now)
+        stale = bool((not row.get("ok") and row.get("last_good_at")) or (age is not None and age > max_age))
+        live = [w for w in row.get("windows") or [] if _in_force(w, now)]
+        tight = max(live, key=lambda w: _shown_pct(w.get("used_pct")), default=None)
+        entry.update(ok=bool(row.get("ok")), error=row.get("error"), plan=row.get("plan"),
+                     figures_at=row.get("observed_at") or row.get("probed_at"), stale=stale)
+        if tight is not None:
+            entry.update(window=_window_words(tight), used_pct=_shown_pct(tight.get("used_pct")),
+                         resets_at=tight.get("resets_at"))
+        accounts.append(entry)
+        head = account["label"] + (f" ({row['plan']})" if row.get("plan") else "")
+        kept = f" as of {_when(entry['figures_at'])}" if stale or not row.get("ok") else ""
+        for window in sorted(live, key=lambda w: -_shown_pct(w.get("used_pct"))):
+            pct = _shown_pct(window.get("used_pct"))
+            if pct < ALERT_PCT:
+                continue
+            reset = _reset_words(window.get("resets_at"), now)
+            warnings.append(f"Plan nearly used up: {head} {_window_words(window)} at {pct:g}%{kept}"
+                            + (f", {reset}" if reset else ""))
+    return {"source": "cache", "max_age_s": max_age, "alert_pct": ALERT_PCT, "accounts": accounts,
+            "warnings": warnings}

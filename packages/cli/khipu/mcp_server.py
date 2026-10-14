@@ -376,7 +376,9 @@ TOOLS: list[dict] = [
             "depends on `prompt`). Pass `full=true` with `prompt` to get "
             "the complete schema below anyway (unchanged, still pays the "
             "full sequential cost). Omitting `prompt` always returns the "
-            "complete schema, exactly as before this note."
+            "complete schema, exactly as before this note. The complete "
+            "schema's `warnings` lists plans nearly used up (a window still "
+            "in force at 90% or more), read from the khipu_usage cache only."
         ),
         "inputSchema": {
             "type": "object",
@@ -1011,7 +1013,22 @@ def _tool_status(args: dict) -> dict:
         payload["hub_error"] = f"{type(exc).__name__}: {exc}"
     _attach_prior_work(payload, args)
     _attach_contract(payload)
+    _attach_plan_warnings(payload)
     return payload
+
+
+def _attach_plan_warnings(payload: dict) -> None:
+    """The same plan warnings ``khipu doctor`` carries ("Plan nearly used up:
+    Codex (pro) week at 94%, resets Thu 02:00Z"), read from the usage cache
+    only: never a probe, never a wait. Optional: a failure here must never
+    cost the caller the status it asked for."""
+    try:
+        from khipu import usage
+
+        warnings = usage.doctor_block()["warnings"]
+    except Exception:  # noqa: BLE001
+        return
+    payload["warnings"] = [*(payload.get("warnings") or []), *warnings]
 
 
 _BUDGET_MS_MIN = 100

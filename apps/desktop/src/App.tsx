@@ -44,7 +44,7 @@ import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupS
 import { buildAttention, harnessLabel, type Attention } from "./doctorAttention";
 import { HealthReportRows } from "./healthRows";
 import { SummariserBudgetCard, SynthProviderFields, synthModelError } from "./SynthProvider";
-import { PlansCard, PlansSettingsCard, planAttention, usePlanUsage } from "./PlansCard";
+import { PlansCard, PlansSettingsCard, usePlanAttention, usePlanUsage } from "./PlansCard";
 import type { DoctorSynthProvider } from "./SynthProvider";
 import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVerify";
 import { WorkingBanner } from "./WorkingBanner";
@@ -2421,18 +2421,19 @@ export default function App() {
     ipv4?: string;
   } | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("database");
-  // Plan usage (docs/plans/2026-10-14-plan-usage.md, phase 2). Doctor does
-  // not carry it, so the app reads `khipu usage --json` itself and adds one
-  // attention item when any window still in force is at or above 90%. One
-  // reader shared by Home and Settings -> Capture & models, so the two never
-  // start the subscription CLIs twice; it re-reads on entering either view.
+  // Plan usage (docs/plans/2026-10-14-plan-usage.md, phase 2). Doctor carries
+  // only the cached figures; the app reads `khipu usage --json` itself (it can
+  // probe on demand) and adds one attention item when any window still in
+  // force is at or above 90%. One reader shared by Home and Settings ->
+  // Capture & models, so the two never start the subscription CLIs twice; it
+  // re-reads on entering either view. The item is re-judged every minute
+  // while it shows and at its earliest reset, so it never outlives a reset
+  // or freezes its countdown while Home stays open.
   const plans = usePlanUsage(
     tab === "home" ? "home" : tab === "settings" && settingsSection === "capture" ? "settings" : null,
   );
-  const homeAttention = useMemo(
-    () => [...attention, ...planAttention(plans.data)],
-    [attention, plans.data],
-  );
+  const planItems = usePlanAttention(plans.data);
+  const homeAttention = useMemo(() => [...attention, ...planItems], [attention, planItems]);
   // "Connect to a server you run or another Mac…" reopens the first-run flow
   // at the Database step rather than restarting it — `welcomeInitialStepKey`
   // is bumped on every click so a second visit still jumps even when

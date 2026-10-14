@@ -10,7 +10,7 @@ it first. Builds after the promotion gate (`2026-10-14-promotion-gate.md`) and g
 | Phase | What | State |
 |---|---|---|
 | 1 | `khipu usage`: one probe per installed subscription CLI, cached, as CLI JSON and an MCP tool | built 2026-10-14 (branch `feat/plan-usage-p1`): `khipu/usage.py`, `khipu usage`, MCP `khipu_usage`, fixtures `tests/fixtures/usage/`; real run on this Mac answered all four CLIs in 0.6–1.6 s |
-| 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | built 2026-10-14 (branch `feat/plan-usage-p2`, desktop 0.4.14): fixed-argv `khipu_usage_status` (`usage --json`) and `khipu_usage_refresh` (`usage --fresh --json`); `PlansCard.tsx` (Home card with Refresh, Settings → Capture & models card with Probe now and an add/remove list of the accounts read, through `config --set usage_accounts JSON` / `--unset`); health report "Plans" row and a Home attention item at 90%, read from `khipu_usage_status` because doctor does not carry usage; fix round below |
+| 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | built 2026-10-14 (branch `feat/plan-usage-p2`, desktop 0.4.14): fixed-argv `khipu_usage_status` (`usage --json`) and `khipu_usage_refresh` (`usage --fresh --json`); `PlansCard.tsx` (Home card with Refresh, Settings → Capture & models card with Probe now and an add/remove list of the accounts read, through `config --set usage_accounts JSON` / `--unset`); health report "Plans" row and a Home attention item at 90%, read from `khipu_usage_status` (it can probe on demand; the item is re-judged every minute while it shows and at its earliest reset); `khipu doctor` carries a cache-only `plan_usage` block and a `warnings` line per window still in force at 90% or more, never gating `ok`, and `khipu_status` (complete schema) carries the same `warnings`; fix rounds 1 and 2 below |
 
 Two PRs, phase 1 first.
 
@@ -96,7 +96,7 @@ announced, and no MCP child was seen starting before the answer.
 
 Home card "Plans" with one row per account (plan, the tightest window as a bar, reset time, stale tag);
 Settings → Models lists the accounts with their labels and homes and a Probe now button; doctor warns
-when any window is above 90% ("Claude main five-hour at 94%, resets in 40 min") so the orchestrator sees
+when any window is at 90% or more ("Claude main five-hour at 94%, resets in 40 min") so the orchestrator sees
 it in the health report it already reads.
 
 **Fix round (2026-10-14, after a review of phase 2).** A window whose `resets_at` has passed has started
@@ -115,6 +115,21 @@ CLIs are never started twice by the app. `khipu config --set usage_accounts` tak
 login once, at most 32); `khipu config` shows the stored list, its source and the accounts it resolves to. A
 home such as `~nouser/x` is an `invalid_account` row instead of a crash. Not done: the CLI's synchronous path
 still probes beside a refresh another process holds (an MCP background refresh); the app no longer causes that.
+
+**Fix round 2 (2026-10-14).** The Home 90% item is re-judged every minute while it shows and at the earliest
+reset among its windows (`usePlanAttention`), so it never outlives a reset or freezes its "resets in 40 min"
+while Home stays open. The Codex fallback's note is plain words; the failed live read's code is in the row's
+`live_error`. A failed probe that keeps the last good figures carries its own note (the `/login` hint) and drops
+the kept read's. An invalid entry's note reads "this account entry is not valid: …". An account added in
+Settings with no Name is named after its CLI and login folder ("Codex (~/.codex-work)"); the form refuses a
+name or a login already listed in plain words, pointing at the field to change, before anything is saved, and
+empties as soon as the list is saved (the re-read that probes the new account is not waited on). `khipu doctor`
+gains `plan_usage`, read from the usage cache only (no CLI is probed, nothing waits): per configured account the
+tightest window still in force with its label, used %, reset time, figures time and stale flag (`never_read`
+when `khipu usage` has not read it), and doctor's new `warnings` list gets one line per window still in force
+at 90% or more on the one-decimal figure the app shows ("Plan nearly used up: Codex (pro) week at 94%, resets
+Thu 02:00Z", "as of …" for kept or old figures). Neither gates `ok`. `khipu_status` (complete schema) carries
+the same `warnings`; its light per-prompt payload does not.
 
 ## Decisions
 

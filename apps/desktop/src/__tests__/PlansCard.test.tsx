@@ -10,6 +10,8 @@ import {
   PLAN_READ_FAILED,
   PlansCard,
   PlansSettingsCard,
+  accountClash,
+  defaultAccountLabel,
   fmtPct,
   fmtResetLocal,
   meterTone,
@@ -19,6 +21,7 @@ import {
   tightestOverall,
   tightestWindow,
   usageErrorPhrase,
+  usePlanAttention,
   usePlanUsage,
 } from "../PlansCard";
 import type { PlanUsageState, UsageAccount, UsageReport } from "../PlansCard";
@@ -559,6 +562,9 @@ describe("PlansSettingsCard", () => {
         ],
       },
     };
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Grok work" } });
+    fireEvent.change(screen.getByLabelText("CLI"), { target: { value: "grok" } });
+    fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.grok-work" } });
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Add" }));
     });
@@ -583,9 +589,127 @@ describe("PlansSettingsCard", () => {
       if (cmd === "khipu_config_show") return JSON.stringify(configShow);
       return JSON.stringify(status);
     });
+    fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.claude-second" } });
     fireEvent.click(screen.getByRole("button", { name: "Add" }));
     expect(await screen.findByText("Khipu could not save the account list. Try again in a minute.")).toBeTruthy();
     expect(screen.queryByText(/Traceback/)).toBeNull();
     spy.mockRestore();
+  });
+});
+
+describe("adding an account", () => {
+  const addButton = () => screen.getByRole("button", { name: "Add" });
+  const configSets = () => calls.filter(([c]) => c === "khipu_config_set");
+
+  it("names an account added with no Name after its CLI and login folder", async () => {
+    render(<Settings />);
+    await waitFor(() => expect(screen.getByText("Default")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("CLI"), { target: { value: "codex" } });
+    fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.codex-work" } });
+    fireEvent.click(addButton());
+    await waitFor(() =>
+      expect(calls).toContainEqual([
+        "khipu_config_set",
+        {
+          key: "usage_accounts",
+          value: JSON.stringify([
+            { label: "Claude", harness: "claude" },
+            { label: "Codex", harness: "codex" },
+            { label: "Codex (~/.codex-work)", harness: "codex", home: "~/.codex-work" },
+          ]),
+        },
+      ]),
+    );
+    expect(defaultAccountLabel("grok", null)).toBe("Grok Build");
+    const long = defaultAccountLabel("grok", `/Volumes/Work/${"x".repeat(100)}/grok`);
+    expect(long).toHaveLength(64);
+    expect(long).toMatch(/^Grok Build \(…x+\/grok\)$/);
+  });
+
+  it("asks for a different Name or Login folder in plain words, before anything is saved", async () => {
+    render(<Settings />);
+    await waitFor(() => expect(screen.getByText("Default")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "codex" } });
+    fireEvent.change(screen.getByLabelText("CLI"), { target: { value: "codex" } });
+    fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.codex-work" } });
+    fireEvent.click(addButton());
+    expect(await screen.findByText("An account is already named Codex. Type a different Name.")).toBeTruthy();
+    const name = screen.getByLabelText("Name");
+    expect(name.getAttribute("aria-invalid")).toBe("true");
+    expect(document.activeElement).toBe(name);
+    expect(configSets()).toHaveLength(0);
+
+    fireEvent.change(name, { target: { value: "Codex again" } });
+    expect(name.getAttribute("aria-invalid")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "" } });
+    fireEvent.click(addButton());
+    expect(
+      await screen.findByText("Codex with its default login is already listed as Codex. Choose a different Login folder."),
+    ).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByLabelText("Login folder"));
+    expect(configSets()).toHaveLength(0);
+    expect(screen.queryByText(/usage_accounts/)).toBeNull();
+    // Muse has one login: the message does not send the owner to a field they cannot use.
+    expect(
+      accountClash([{ label: "Muse", harness: "muse", home: null }], { label: "Muse two", harness: "muse", home: null })
+        ?.message,
+    ).toBe("Muse is already listed as Muse. Muse has one login, so it is read once.");
+  });
+
+  it("clears the form once the list is saved, while the new account is still being read", async () => {
+    render(<Settings />);
+    await screen.findByRole("group", { name: "Claude" });
+    await waitFor(() => expect(screen.getByText("Default")).toBeTruthy());
+    holdStatus = true;
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Claude second" } });
+    fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.claude-second" } });
+    fireEvent.click(addButton());
+    await waitFor(() => expect(configSets()).toHaveLength(1));
+    // The re-read that probes the new account is still running...
+    await waitFor(() => expect(pending.khipu_usage_status).toHaveLength(1));
+    // ...and the form is already empty and ready, so a second press cannot repeat the entry.
+    await waitFor(() => expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe(""));
+    expect((screen.getByLabelText("Login folder") as HTMLInputElement).value).toBe("");
+    expect((addButton() as HTMLButtonElement).disabled).toBe(false);
+    release("khipu_usage_status");
+    await waitFor(() => expect(exposed?.loading).toBe(false));
+  });
+});
+
+describe("the 90% item while Home stays open", () => {
+  function AttentionProbe({ report }: { report: UsageReport }) {
+    const items = usePlanAttention(report);
+    return <div data-testid="plan-attention">{items.map((a) => a.cause).join(" | ")}</div>;
+  }
+
+  it("counts down every minute and drops out at the reset, with no new read", () => {
+    vi.useFakeTimers({ now: NOW, toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const r = realReport();
+    r.accounts![0].windows![0] = { name: "five_hour", used_pct: 95, resets_at: "2026-10-14T14:30:00Z", window_mins: 300 };
+    render(<AttentionProbe report={r} />);
+    const text = () => screen.getByTestId("plan-attention").textContent;
+    expect(text()).toContain("Claude Max five-hour at 95%, resets in 30 min");
+    act(() => {
+      vi.advanceTimersByTime(10 * 60_000);
+    });
+    expect(text()).toContain("Claude Max five-hour at 95%, resets in 20 min");
+    act(() => {
+      vi.advanceTimersByTime(20 * 60_000);
+    });
+    expect(text()).toBe("");
+  });
+
+  it("judges figures that arrive later on the clock at their arrival", () => {
+    vi.useFakeTimers({ now: NOW, toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const calm = realReport();
+    const { rerender } = render(<AttentionProbe report={calm} />);
+    expect(screen.getByTestId("plan-attention").textContent).toBe("");
+    // Nothing ticks while nothing is near its limit; two hours later a read
+    // brings a window that reset an hour ago.
+    vi.setSystemTime(new Date("2026-10-14T16:00:00Z"));
+    const late = realReport();
+    late.accounts![0].windows![0] = { name: "five_hour", used_pct: 97, resets_at: "2026-10-14T15:00:00Z", window_mins: 300 };
+    rerender(<AttentionProbe report={late} />);
+    expect(screen.getByTestId("plan-attention").textContent).toBe("");
   });
 });
