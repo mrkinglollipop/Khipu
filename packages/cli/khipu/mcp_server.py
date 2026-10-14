@@ -671,9 +671,12 @@ TOOLS: list[dict] = [
             "account (Claude, Codex, Grok, Muse): plan, windows (name, "
             "used_pct, resets_at), credits, probed_at, ok/error, stale. Read "
             "from each CLI with the login it already holds; no model call, no "
-            "tokens spent. Cached for max_age seconds (default 120), so "
-            "polling every prompt is free; fresh: true probes now (about a "
-            "second each, in parallel). A window a CLI does not report is "
+            "tokens spent. Answers at once from the cache and refreshes in "
+            "the background (refreshing: true) when a row is older than "
+            "max_age seconds (default 120) or fresh: true; ask again a few "
+            "seconds later for the new figures. An account never probed reads "
+            "error: pending. Errors are short codes (timeout, not_signed_in, "
+            "bad_reply, exit_<n>, ...). A window a CLI does not report is "
             "absent, not zero. Muse figures are as of its last turn "
             "(observed_at). summary_text has one pasteable line per account. "
             "Khipu reports; routing stays with you."
@@ -681,7 +684,7 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "fresh": {"type": "boolean", "description": "Probe now instead of using the cache"},
+                "fresh": {"type": "boolean", "description": "Start a refresh now even if the cache is young"},
                 "max_age": {"type": "number", "description": "Cache max age in seconds (default 120)"},
             },
         },
@@ -1476,7 +1479,8 @@ def _tool_usage(args: dict) -> dict:
     max_age = args.get("max_age")
     if max_age is None or isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
         max_age = usage.DEFAULT_MAX_AGE_S
-    return usage.report(fresh=bool(args.get("fresh")), max_age=max(0.0, float(max_age)))
+    # Cache-first: never waits on a probe; at most one refresh runs in the background.
+    return usage.report(fresh=bool(args.get("fresh")), max_age=max(0.0, float(max_age)), background=True)
 
 
 TOOL_FUNCS = {
