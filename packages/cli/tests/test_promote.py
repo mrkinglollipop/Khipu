@@ -1053,3 +1053,126 @@ def test_an_isolated_run_keeps_state_inside_and_reads_credentials_from_the_calle
     assert config.path_setting("memory_root") is None
     monkeypatch.delenv("KHIPU_ISOLATED_DIR")
     assert config.path_setting("memory_root") == home / "wiki"
+
+
+# ---- fix round 2: the replica, live-only writers, overrides ----------------
+
+
+def _temp_replica(path: Path) -> None:
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(path))
+    con.executescript(
+        "CREATE TABLE episodes (id INTEGER PRIMARY KEY, summary TEXT, deleted_at TEXT);"
+        "CREATE TABLE memory_embeddings (kind TEXT, ref TEXT, vector BLOB);"
+        "CREATE TABLE edges (src TEXT, dst TEXT, type TEXT);"
+        "INSERT INTO episodes VALUES (1, 'the promotion gate', NULL);"
+        "INSERT INTO edges VALUES ('episode:1', 'topic:gate', 'mentions');")
+    con.commit()
+    con.close()
+
+
+def test_an_isolated_replay_never_changes_the_live_replica(home, monkeypatch, tmp_path):
+    import sqlite3
+
+    from khipu import hub_snapshot
+
+    live = hub_snapshot.snapshot_path()
+    _temp_replica(live)  # no edge indexes: what a replica dumped before them looks like
+    before = (live.read_bytes(), live.stat().st_mtime_ns)
+    # The real candidate hook, replayed the way the gate replays it.
+    real_run = pm._run
+    monkeypatch.setattr(pm, "_run", lambda argv, *, env=None, **kw: real_run(
+        argv, env={**env, "KHIPU_KEYCHAIN": "0"}, **kw))
+    res = pm._recall_once(pm._launcher(pm._self_root(), "khipu-prompt-recall"),
+                          {"prompt": "the promotion gate"}, "khipu-gate-replica")
+    assert res["exit"] == 0, res
+    # The graph leg's maintenance and the reader, in process, through the link.
+    iso = tmp_path / "iso"
+    pm._isolate(iso, replica=True)
+    assert (iso / live.name).is_symlink()
+    monkeypatch.setenv("KHIPU_ISOLATED_DIR", str(iso))
+    hub_snapshot._EDGE_INDEXES_TRIED.clear()
+    hub_snapshot.ensure_edge_indexes()
+    con = hub_snapshot.open_snapshot()
+    try:
+        assert con.execute("SELECT summary FROM episodes").fetchall() == [("the promotion gate",)]
+        with pytest.raises(sqlite3.OperationalError):
+            con.execute("CREATE INDEX idx_x ON edges (src)")
+    finally:
+        con.close()
+    assert (live.read_bytes(), live.stat().st_mtime_ns) == before
+    names = {r[0] for r in sqlite3.connect(f"file:{live}?mode=ro", uri=True).execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index'")}
+    assert not {"idx_edges_src_type", "idx_edges_dst_type"} & names
+    assert not [p for p in live.parent.iterdir() if p.name.startswith(live.name + "-")]
+
+
+def test_live_only_writers_refuse_inside_an_isolated_run(home, monkeypatch, tmp_path):
+    from khipu import join, keychain, paths
+
+    caller = Path(os.environ["KHIPU_DATA_DIR"])
+    caller.mkdir(parents=True, exist_ok=True)
+    (caller / "dsn").write_text("postgresql://live\n")
+    monkeypatch.setenv("KHIPU_ISOLATED_DIR", str(tmp_path / "iso"))
+    with pytest.raises(paths.IsolatedWriteRefused):
+        paths.set_data_dir(tmp_path / "moved")
+    with pytest.raises(paths.IsolatedWriteRefused):
+        paths.import_local(source=tmp_path / "kit.zip")
+    for target in (paths.dsn_file(), paths.root_cert_file()):
+        with pytest.raises(paths.IsolatedWriteRefused):
+            join.write_private_file(target, b"overwritten\n")
+    with pytest.raises(paths.IsolatedWriteRefused):
+        keychain.set_password(keychain.DSN_ACCOUNT, "overwritten")
+    assert (caller / "dsn").read_text() == "postgresql://live\n"
+    assert not paths.pointer_file().exists() or "moved" not in paths.pointer_file().read_text()
+    assert not (tmp_path / "moved").exists()
+    # Readers still read the caller's files.
+    assert paths.dsn_file() == caller / "dsn"
+
+
+def test_credential_reads_never_migrate_inside_an_isolated_run(home, monkeypatch, tmp_path):
+    from khipu import keychain
+
+    monkeypatch.setenv("KHIPU_ISOLATED_DIR", str(tmp_path / "iso"))
+    monkeypatch.setattr(keychain, "keychain_available", lambda: True)
+    monkeypatch.setattr(keychain, "get_password",
+                        lambda account, service=keychain.SERVICE: "legacy" if service != keychain.SERVICE else None)
+    monkeypatch.setattr(keychain, "_security", lambda *a, **k: pytest.fail("no Keychain write"))
+    assert keychain.get_dsn() == "legacy" and keychain.get_gemini_key() == "legacy"
+    assert keychain.migrate_legacy_secrets() == {"dsn_migrated": False, "gemini_migrated": False,
+                                                 "config_dir_migrated": False}
+
+
+def test_isolation_outranks_live_overrides(home, monkeypatch, tmp_path):
+    from khipu import graph_backup, outbox, recall_eval
+
+    iso = tmp_path / "iso"
+    monkeypatch.setenv("KHIPU_OUTBOX", str(home / "live-outbox"))
+    monkeypatch.setenv("KHIPU_GRAPH_SNAPSHOT_DIR", str(home / "live-graph"))
+    monkeypatch.setenv("KHIPU_RECALL_GOLDEN", str(home / "golden.jsonl"))
+    assert outbox.outbox_dir() == home / "live-outbox"
+    monkeypatch.setenv("KHIPU_ISOLATED_DIR", str(iso))
+    assert outbox.outbox_dir() == iso / "outbox" and outbox.dead_dir() == iso / "outbox" / "dead"
+    assert graph_backup._default_snapshot_dir() == iso / "backups" / "graph"
+    assert recall_eval.default_golden_path() == iso / "recall-golden.jsonl"
+    outbox.enqueue({"ts": "2026-10-14T00:00:00Z", "summary": "gate", "session_id": "claude_code:khipu-gate-o"},
+                   reason="test")
+    assert list((iso / "outbox").glob("*.json")) and not (home / "live-outbox").exists()
+
+
+def test_the_recall_client_logs_inside_the_isolated_dir(home, monkeypatch, tmp_path):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "khipu_recall_client_t", pm._launcher(pm._self_root(), "khipu-recall-client.py"))
+    client = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(client)
+    iso = tmp_path / "iso"
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(home / "live-capture"))
+    monkeypatch.setenv("KHIPU_ISOLATED_DIR", str(iso))
+    assert client.socket_path() == str(iso / "capture" / "recall.sock")
+    client.log_failure('{"session_id": "khipu-gate-c"}', "timeout", 0.0)
+    assert "session=khipu-gate-c" in (iso / "capture" / "logs" / "prompt-recall.log").read_text()
+    assert not (home / "live-capture").exists()

@@ -334,6 +334,11 @@ def open_snapshot() -> sqlite3.Connection:
             "WHERE m.kind != 'episode' OR "
             f"(m.ref NOT IN ({blocked_refs}){tombstone_filter})"
         )
+    from khipu.paths import isolated_dir
+
+    if isolated_dir() is not None:
+        # After the TEMP views: an isolated run never changes the replica.
+        con.execute("PRAGMA query_only=ON")
     return con
 
 
@@ -891,6 +896,12 @@ def ensure_edge_indexes() -> None:
     is called from the prompt path and must never raise into it."""
     path = snapshot_path()
     if str(path) in _EDGE_INDEXES_TRIED:
+        return
+    from khipu.paths import isolated_dir
+
+    if isolated_dir() is not None:
+        # An isolated run (the promotion gate's replay) may be reading the
+        # live replica through a link: no maintenance, read only.
         return
     _EDGE_INDEXES_TRIED.add(str(path))
     try:

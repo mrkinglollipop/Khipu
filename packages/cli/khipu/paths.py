@@ -74,6 +74,21 @@ def isolated_dir() -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
+class IsolatedWriteRefused(RuntimeError):
+    """A live-only write (data-dir pointer, DSN, certificate, Keychain) was
+    attempted inside an isolated run."""
+
+
+def refuse_if_isolated(what: str) -> None:
+    """Raise when an isolated run (``KHIPU_ISOLATED_DIR``) tries to write
+    something only the live install owns. Readers never call this."""
+    isolated = isolated_dir()
+    if isolated is not None:
+        raise IsolatedWriteRefused(
+            f"refusing to write {what} inside an isolated run ({ISOLATED_ENV}={isolated}); "
+            "the live data-dir pointer, DSN, certificate and Keychain are written only outside it")
+
+
 def _env_override() -> Path | None:
     raw = (os.environ.get("KHIPU_DATA_DIR") or os.environ.get("ALZY_DATA_DIR") or "").strip()
     return Path(raw).expanduser() if raw else None
@@ -121,6 +136,7 @@ def credential_dir() -> Path:
 
 
 def set_data_dir(path: Path) -> Path:
+    refuse_if_isolated("the data-dir pointer")
     target = path.expanduser().resolve()
     target.mkdir(parents=True, exist_ok=True)
     DEFAULT_DIR.mkdir(parents=True, exist_ok=True)
@@ -226,6 +242,7 @@ def backup_local(*, dest: Path) -> dict:
 
 
 def import_local(*, source: Path, merge: bool = True) -> dict:
+    refuse_if_isolated("an imported data folder")
     source = source.expanduser()
     target = ensure_data_dir()
     imported = 0

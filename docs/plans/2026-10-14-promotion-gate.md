@@ -105,7 +105,12 @@ launcher symlinks) before writing anything. Build:
   path settings (`memory_root`, `memory_repo`, `capture_v2`, `graph_sqlite`) read as unset and the file-wiki
   leg is skipped. Credentials are still found the live way: Keychain, key files named in `config.json`, and the
   DSN and root certificate read from the configured data dir (`paths.credential_dir`). The gate seeds each
-  isolated dir with the live `config.json` minus the file-wiki paths and any secret-named value.
+  isolated dir with the live `config.json` minus the file-wiki paths and any secret-named value. Inside an
+  isolated run the replica is opened read-only (`mode=ro`, `PRAGMA query_only=ON`) with no index
+  maintenance; `KHIPU_OUTBOX`, `KHIPU_GRAPH_SNAPSHOT_DIR` and `KHIPU_RECALL_GOLDEN` yield to the isolated dir;
+  the recall client's socket and log are under it; credential migration is skipped; and every live-only
+  writer (data-dir pointer, folder import, DSN and certificate files, Keychain) refuses with
+  `IsolatedWriteRefused`.
 - The capture step's isolated dir is `~/.config/khipu/state/gate-runs/<session>`. Its session id is written
   there (`gate.json`) and to `state/promotions.jsonl` as `cleanup_pending` before the stop hook runs; the
   hook runs in gate mode (`KHIPU_GATE=1`: `hook_background.run` drains the isolated queue and skips the mirror,

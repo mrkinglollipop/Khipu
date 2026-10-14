@@ -15,9 +15,10 @@ Reads the hook payload on stdin. Argument: ``claude`` (default) or ``cursor``.
   no connection at all   prints nothing, exit 3 (the caller runs the one-shot
                          path instead)
 
-The socket path is the service's: ``KHIPU_CAPTURE_HOME``, then
-``KHIPU_AEGIS_HOME``, then ``~/.grok/khipu``, plus ``recall.sock`` — the same
-resolution as ``khipu.session_capture.khipu_home``.
+The socket path is the service's: ``KHIPU_ISOLATED_DIR``/capture (an isolated
+gate run), else ``KHIPU_CAPTURE_HOME``, then ``KHIPU_AEGIS_HOME``, then
+``~/.grok/khipu``, plus ``recall.sock`` — the same resolution as
+``khipu.session_capture.khipu_home``; failures log beside it.
 """
 import json
 import os
@@ -33,6 +34,11 @@ MAX_ANSWER_BYTES = 8 * 1024 * 1024
 
 
 def socket_path():
+    isolated = os.environ.get("KHIPU_ISOLATED_DIR")
+    if isolated:
+        # khipu.paths.ISOLATED_ENV: the gate's isolated run, its own capture
+        # home (no service listens there, so the hook falls back to one-shot).
+        return os.path.join(isolated, "capture", "recall.sock")
     home = (
         os.environ.get("KHIPU_CAPTURE_HOME")
         or os.environ.get("KHIPU_AEGIS_HOME")
