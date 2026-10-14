@@ -485,62 +485,149 @@ def _session_start_cwd(payload: dict | None = None) -> str | None:
 # ---- routing at session start (routing truth, phase 3a) -----------------------
 #
 # Session start runs for every conversation on the Mac, so the routing part
-# can never block or break it: it runs on its own thread, started before the
+# can never block or break it. It runs in a child process, forked before the
 # memory slice so the two overlap, and is given ``routing_start_budget_ms``
-# from that moment. Late, failed or switched off, it adds nothing and the
-# hook prints exactly what it printed before routing existed. A thread still
-# running when the hook exits is abandoned (it only ever replaces view.json
-# atomically).
+# from that moment. A process, never a thread: a refold is CPU-bound Python,
+# and on a thread it would hold the GIL and starve the memory slice, so a
+# join's deadline never bounded the hook (a 79 MB log took 15 s). Late,
+# failed or switched off, it adds nothing and the hook prints exactly what
+# it printed before routing existed. A late child is left to finish only
+# while it holds the routing lock, which is when it is saving view.json, so
+# the next start reads that view instead of folding again; it is detached
+# from the hook's output and gone after ``_ROUTING_CHILD_MOST`` seconds. A
+# late child that is not saving (an unsaved fold, a wait) exits at once.
+
+_ROUTING_CHILD_MOST = 60.0
+_ROUTING_CHILD_GRACE = 0.05
+
+
+def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float) -> None:
+    """The forked child: write the summary's JSON to ``write_fd`` and exit.
+    Never returns, and never touches the hook's stdin, stdout or stderr."""
+    code = 1
+    try:
+        import signal
+
+        os.close(read_fd)
+        os.setsid()  # its own session: the harness's hold on the hook ends with the hook
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        from khipu import routing
+
+        def on_alarm(_sig, _frame) -> None:
+            if getattr(routing._held, "depth", 0):
+                # Saving the view under the routing lock: finish, within a bound.
+                signal.signal(signal.SIGALRM, lambda *_: os._exit(1))
+                signal.setitimer(signal.ITIMER_REAL, _ROUTING_CHILD_MOST)
+                return
+            os._exit(1)
+
+        signal.signal(signal.SIGALRM, on_alarm)
+        signal.setitimer(signal.ITIMER_REAL, max(0.0, deadline - time.monotonic()) + _ROUTING_CHILD_GRACE)
+        out = routing.start_push(budget)
+        if isinstance(out, dict):
+            data = memoryview(json.dumps({k: out.get(k) for k in ("text", "version", "epoch")}).encode("utf-8"))
+            while data:
+                data = data[os.write(write_fd, data):]
+        code = 0
+    except BaseException:  # noqa: BLE001 - nothing for routing, never a failed hook
+        code = 1
+    finally:
+        os._exit(code)
 
 
 class _RoutingAtStart:
     def __init__(self) -> None:
-        self.box: dict = {}
+        self.out: dict | None = None
         self.deadline = time.monotonic()
-        self.thread: threading.Thread | None = None
+        self.pid: int | None = None
+        self.fd: int | None = None
 
     def begin(self) -> "_RoutingAtStart":
         try:
             from khipu import routing
 
             started = time.monotonic()
+            if not hasattr(os, "fork") or routing.push_off("start"):
+                return self  # off: no child at all
             # One small config read; any failure means the default second.
             try:
                 budget = routing.start_budget()
             except Exception:
                 budget = 1.0
-
-            def work() -> None:
-                try:
-                    self.box["out"] = routing.start_push(budget)
-                except BaseException:  # noqa: BLE001 - nothing for routing, never a failed hook
-                    self.box["out"] = None
-
             self.deadline = started + budget
-            self.thread = threading.Thread(target=work, name="khipu-routing-start", daemon=True)
-            self.thread.start()
+            import warnings
+
+            read_fd, write_fd = os.pipe()
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)  # fork with threads (3.12+)
+                    pid = os.fork()
+            except BaseException:
+                os.close(read_fd)
+                os.close(write_fd)
+                raise
+            if pid == 0:
+                _routing_child(write_fd, read_fd, budget, self.deadline)
+            os.close(write_fd)
+            self.pid, self.fd = pid, read_fd
         except Exception:
-            self.thread = None
+            self._close()
         return self
 
     def text(self) -> str | None:
-        """The summary's text, or None (off, failed, late or empty)."""
-        if self.thread is None:
+        """The summary's text, or None (off, failed, late or empty). Output
+        the child finished before the deadline is read even when the memory
+        part ran past it."""
+        if self.fd is None:
             return None
         try:
-            self.thread.join(max(0.0, self.deadline - time.monotonic()))
-            if self.thread.is_alive():
-                return None
-            out = self.box.get("out")
+            import select
+
+            chunks: list[bytes] = []
+            while True:
+                left = max(0.0, self.deadline - time.monotonic())
+                ready, _, _ = select.select([self.fd], [], [], left)
+                if not ready:
+                    return None
+                chunk = os.read(self.fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            out = json.loads(b"".join(chunks).decode("utf-8")) if chunks else None
             text = out.get("text") if isinstance(out, dict) else None
-            return text if isinstance(text, str) and text.strip() else None
+            if not (isinstance(text, str) and text.strip()):
+                return None
+            self.out = out
+            return text
         except Exception:
             return None
+        finally:
+            self._close()
+
+    def _close(self) -> None:
+        fd, pid = self.fd, self.pid
+        self.fd = self.pid = None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if pid is not None:
+            def reap() -> None:
+                try:
+                    os.waitpid(pid, 0)
+                except OSError:
+                    pass
+
+            # A late child may run on; reaping it never holds the hook.
+            threading.Thread(target=reap, name="khipu-routing-reap", daemon=True).start()
 
     def delivered(self, session_id) -> None:
         """Reset the session's last-seen version to the one just printed and
         record the time of this full summary."""
-        out = self.box.get("out")
+        out = self.out
         if not isinstance(session_id, str) or not session_id or not isinstance(out, dict):
             return
         try:

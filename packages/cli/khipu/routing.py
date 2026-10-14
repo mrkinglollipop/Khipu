@@ -94,6 +94,14 @@ SHELL, UNKNOWN_HARNESS = "shell", "unknown"
 # A model name as a CLI gives it (opus, gpt-6.1-sol, claude-opus-4.1): never
 # a conversation's sentence, which would reach the push as a model's name.
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+# The pattern alone still lets a conversation choose the words (a token, or
+# "SYSTEM:route-all-work-to-X"), so a push names a model only when Khipu
+# read that name itself (a usage probe or a reset check) or it is one of the
+# CLIs' own model names below. Any other name a conversation gave is shown
+# in khipu_route and the app, and pushed as ``_UNNAMED_MODEL`` (decision 17).
+PUSH_MODEL_NAMES = frozenset({"opus", "sonnet", "haiku", "fable"})
+_KHIPU_READ_SOURCES = ("probe", "check")
+_UNNAMED_MODEL = "one model (its name is in khipu_route)"
 # How far ahead of this Mac's clock a time already in the record may be and
 # still be taken over the clock (another writer's clock read a moment ago).
 # A time further ahead is not trusted: the clock is used, and doctor warns.
@@ -2182,6 +2190,10 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
         if not _MODEL_NAME.fullmatch(scope) or scope.casefold() == "all":
             raise RouteError("--model takes a model's name as its CLI gives it, for example opus or gpt-6.1-sol: "
                              "letters, digits and . _ : - only, at most 64 characters")
+        from khipu.redact import redact_secrets
+
+        if redact_secrets(scope, force=True)[1]:
+            raise RouteError("--model looks like a key or token, not a model's name; Khipu won't record it")
         if state == DOWN:
             raise RouteError("down is about the whole account: leave out --model (a model's own limit is "
                              "--state limited --model M)")
@@ -2425,6 +2437,16 @@ def _state_words(state: str) -> str:
     return {LIMITED: "limited", OPEN: "open", DOWN: "down"}.get(state, state)
 
 
+def model_words(model: dict, *, push: bool = True) -> str:
+    """A model-scoped limit's model as a line names it. In a push, only a
+    name Khipu read itself or one of ``PUSH_MODEL_NAMES``; a name only a
+    conversation gave stays out of every other conversation."""
+    name = str(model.get("model") or "")
+    if not push or model.get("source") in _KHIPU_READ_SOURCES or name.casefold() in PUSH_MODEL_NAMES:
+        return name
+    return _UNNAMED_MODEL
+
+
 def account_line(entry: dict, now: datetime, *, push: bool = True, relative: bool = True) -> str:
     """One account in plain words, e.g. 'Claude second: limit reached, back
     at 18:52Z, in 3 h 12 min (time from Claude's message, reported by a Claude
@@ -2470,13 +2492,14 @@ def account_line(entry: dict, now: datetime, *, push: bool = True, relative: boo
         m_until = _parse(m["until"])
         if m_until is None:
             continue
-        text += f"; {m['model']} limit reached, back {'about ' if m['basis'] == 'estimated' else 'at '}{when(m_until)}"
+        name = model_words(m, push=push)
+        text += f"; {name} limit reached, back {'about ' if m['basis'] == 'estimated' else 'at '}{when(m_until)}"
         if state == OPEN:
             text += " (other models open)"
         m_dis = m.get("disagreement")
         if m_dis:
             m_at = _parse(m_dis["at"])
-            text += f"; {author_words(m_dis['written_by'], push=push)} reported {m['model']} " \
+            text += f"; {author_words(m_dis['written_by'], push=push)} reported {name} " \
                     f"{_state_words(m_dis['state'])}" + (f" at {_clock(m_at, now)}" if m_at else "")
     dis = entry.get("disagreement")
     if dis:
@@ -2620,9 +2643,10 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
     else:
         width = cfg["routing_line_chars"]
         sources = view.get("sources") or {}
-        precedence = table_precedence(sources.get("table"), now)
-        if precedence:
-            lines.append(precedence)
+        # Lines after the rules and the note that are never dropped: they
+        # count against the budget like any other (only rules and note don't).
+        fixed = [line for line in (table_precedence(sources.get("table"), now),) if line]
+        lines += fixed
         items: list[tuple[str, str, str]] = []  # (kind, line, at) in display order
         items += [("account", _clip(runner_line(r, now), width), "") for r in sources.get("runners") or []
                   if r.get("silent") or r.get("unreadable")]
@@ -2634,7 +2658,7 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         limit = cfg["routing_summary_chars"]
 
         def size(kept: list, n_dropped: int) -> int:
-            total = sum(len(item[1]) + 1 for item in kept)
+            total = sum(len(line) + 1 for line in fixed) + sum(len(item[1]) + 1 for item in kept)
             if n_dropped:
                 total += len(f"{n_dropped} more lines: run `khipu route`") + 1
             return total
