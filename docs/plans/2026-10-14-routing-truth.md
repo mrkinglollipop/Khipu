@@ -957,6 +957,12 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
   phase 1b fix re-reads it correctly. Three fix rounds each closed one clock case and opened another, because
   times alone cannot always say which clock was wrong; the phase 1b fix orders lines when they are written.
 
+- **A key made only of letters, used as a lane, model or pipeline name (phase 1b).** Khipu keeps no text
+  from runner files or the table, only parsed fields and names. A name is withheld when it fails the shape
+  check, matches a known key prefix, is UUID-shaped, or holds a run of 16 or more letters and digits mixing
+  both. A secret made of letters only, or short enough to look like a word, cannot be told from a name and is
+  shown as one. Runner names are written by the owner's own tools, so this needs a key pasted in as a name.
+
 ## Unverified
 
 - Two edges of the phase 0 hook check. The desktop wakes and typed prompts that left no hook-context

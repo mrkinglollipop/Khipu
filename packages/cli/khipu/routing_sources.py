@@ -167,14 +167,18 @@ def _name(value, limit: int = 64) -> str | None:
 # masking free text has lost to new secret shapes round after round.
 WITHHELD = "(name withheld)"
 _NAME_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-_KEY_PREFIX = re.compile(r"(?:^|[._-])(?:sk-|xai-|AIza|gh[pousr]_|github_pat_|AKIA|ASIA|xox|eyJ)")
-_KEY_RUN = re.compile(r"[A-Za-z0-9]{24,}")
+_KEY_PREFIX = re.compile(
+    r"(?:^|[._-])(?:sk-|sk_|rk_|pk_live|xai-|AIza|gh[pousr]_|github_pat_|gl(?:pat|ptt|dt|oas|rt)-|AKIA|ASIA|xox|eyJ"
+    r"|hf_|npm_|pypi-|shp(?:at|ss|ca)_|dop_v1_|SG\.)")
+_KEY_RUN = re.compile(r"[A-Za-z0-9]{16,}")
+_UUID = re.compile(r"[0-9A-Za-z]{8}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{12}")
 
 
 def _key_like(text: str) -> bool:
-    """A known key prefix, or a run of 24 or more letters and digits that
-    holds both."""
-    if _KEY_PREFIX.search(text):
+    """A known key prefix, a UUID, or a run of 16 or more letters and digits
+    that holds both. A key made of letters only cannot be told from a name;
+    that residue is why a name is only ever shown, never trusted."""
+    if _KEY_PREFIX.search(text) or _UUID.search(text):
         return True
     return any(re.search(r"[A-Za-z]", run) and re.search(r"[0-9]", run) for run in _KEY_RUN.findall(text))
 
@@ -754,11 +758,11 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
     out: list[dict] = []
     newest: datetime | None = None
     by = {"kind": "probe"}
-    used = 0
+    accounts_read = 0
     for key, row in sorted(rows.items()):
         if key.partition("|")[0] not in usage.HARNESSES or (configured is not None and key not in configured):
             continue
-        used += 1
+        accounts_read += 1
         attempt = _parse(row.get("last_attempt_at") or row.get("probed_at"))
         error = None if row.get("ok") else (row.get("last_error") or row.get("error"))
         error = next((e for e in (usage.E_SIGNIN, usage.E_NOT_INSTALLED) if e == error), None)
@@ -809,7 +813,7 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
                 out.append(dict(base, id="p" + _sid(key, scope, "open", _iso(at)), state="open", until=None,
                                 basis="checked", window=None, used_pct=top,
                                 evidence=f"usage probe: highest window at {top}%"))
-    return out, {"accounts": used, "newest": _iso(newest)}
+    return out, {"accounts": accounts_read, "newest": _iso(newest)}
 
 
 # ---- the routing table (a pointer, never account state) ------------------------------

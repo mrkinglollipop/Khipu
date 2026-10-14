@@ -1134,3 +1134,27 @@ def test_r6_a_name_field_that_fails_the_shape_check_is_withheld(home, capsys):
         assert routing_sources.safe_name(name) == routing_sources.WITHHELD, name
     assert routing_sources.safe_name(7) is None and routing_sources.safe_name(["a"]) is None
     _nowhere(home, capsys, secret, "NameFakeKey20")
+
+
+def test_names_shaped_like_other_vendors_keys_are_withheld():
+    # Attack L1: a GitLab token, a UUID-format key and a 16-23 character run
+    # of letters and digits passed the name check.
+    for name in ("glpat" + "-ZQXabcdefghij0123456", "zqx4e8a0-e29b-41d4-a716-446655440000",
+                 "zqx0a1b2c3d4e5f6a7b8c9d", "hf_FakeTokenValue", "npm_FakeTokenValue"):
+        assert routing_sources.safe_name(name) == routing_sources.WITHHELD, name
+    for name in ("claude-opus-5-5", "muse-wonder-full-1.0", "gemini-embedding-2", "repo-familiarization-5e5cf7",
+                 "secondary-sonnet", "grokcheck"):
+        assert routing_sources.safe_name(name) == name, name
+
+
+def test_a_window_with_no_number_neither_crashes_nor_miscounts_the_accounts(home):
+    # Attack R1: the account counter was overwritten by each window's
+    # percentage, and a window with no number made the next row raise.
+    _usage(home, {
+        "claude|": _row(T0 - timedelta(minutes=1), [{"name": "five_hour", "used_pct": 40.0},
+                                                    {"name": "credits", "used_pct": None}]),
+        "codex|": _row(T0 - timedelta(minutes=1), [{"name": "five_hour", "used_pct": 10.0}]),
+    })
+    routing.read_view()
+    _, status = routing_sources.usage_evidence()
+    assert status["accounts"] == 2
