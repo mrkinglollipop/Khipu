@@ -497,24 +497,52 @@ def _clip(text: str, limit: int) -> str:
     return text
 
 
-_QUOTES = re.compile("[\u0022\u201c\u201d\u201e\u201f\u00ab\u00bb\u2033\u301d\u301e\uff02]")
-_BY_YOU = re.compile(r"\b(by|from) you\b", re.I)
+# Every mark that can open or close a quote: Unicode's initial and final
+# quotation marks (Pi, Pf) by category, plus the double, low, CJK, dingbat
+# and fullwidth marks that are filed elsewhere.
+_QUOTE_MARKS = frozenset("\u0022\u201a\u201e\u2033\u2036\u275b\u275c\u275d\u275e\u275f\u2760\u2e42"
+                         "\u301d\u301e\u301f\uff02")
+_YOU = re.compile(r"\byou\b", re.I)
+
+
+def _hidden(ch: str) -> bool:
+    """A character that shows nothing: a format character (zero-width
+    spaces and joiners, soft hyphens, direction marks) or a variation
+    selector."""
+    import unicodedata
+
+    code = ord(ch)
+    return (unicodedata.category(ch) == "Cf" or 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF
+            or code == 0x034F)
 
 
 def their_words(text) -> str:
-    """A conversation's words as a line quotes them: every double quote
-    mark becomes a single one, so the words can't close the quote around
-    them and go on in Khipu's voice, and "by you" (the owner's words in
-    Khipu's lines) is marked as theirs, "by [you]"."""
-    out = _QUOTES.sub("'", _one_line(text))
-    return _BY_YOU.sub(lambda m: f"{m.group(1)} [you]", out)
+    """A conversation's words as a line quotes them. Hidden characters go
+    and the words are NFKC-normalised, so what is matched is what shows;
+    every quotation mark becomes a single straight quote, so the words
+    can't close the quote around them and go on in Khipu's voice; and
+    every "you" (the owner, in Khipu's lines: "set by you", "until you
+    clear it") is marked as theirs, "[you]"."""
+    import unicodedata
+
+    out = unicodedata.normalize("NFKC", "".join(c for c in str(text or "") if not _hidden(c)))
+    out = "".join(c for c in out if not _hidden(c))
+    out = "".join("'" if c in _QUOTE_MARKS or unicodedata.category(c) in ("Pi", "Pf") else c
+                  for c in _one_line(out))
+    return _YOU.sub(lambda m: f"[{m.group(0)}]", out)
 
 
 def _clean(text, limit: int) -> str:
-    """One line, secrets masked, clipped: for any words a conversation gives."""
+    """One line, secrets masked, each path Khipu is configured with (login
+    folders, runner folders, the routing table) cut to its last name, then
+    clipped: for any words a conversation gives. The paths go before the
+    clip, so a clip never leaves part of one behind."""
     from khipu.redact import redact_secrets
 
-    return _clip(redact_secrets(_one_line(text))[0], limit)
+    words = redact_secrets(_one_line(text))[0]
+    if "/" in words or "|" in words:
+        words = _without_paths(words, _private_strings({}))
+    return _clip(words, limit)
 
 
 def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime:
@@ -1933,7 +1961,7 @@ def _write(event: dict) -> tuple[dict, dict]:
     except Exception as exc:  # noqa: BLE001 - after the append, nothing here may fail the write
         if not appended:
             if isinstance(exc, OSError):
-                raise RouteError(f"Khipu can't write its routing record: {exc}") from exc
+                raise RouteError(f"Khipu can't write its routing record ({_io_phrase(exc, 'write')})") from None
             raise
     if view is None:
         try:
@@ -1941,6 +1969,24 @@ def _write(event: dict) -> tuple[dict, dict]:
         except Exception:  # noqa: BLE001 - the line is down: the write is recorded whatever the view does
             view = {"version": None, "saved": False}
     return event, view
+
+
+def _io_phrase(exc: OSError, verb: str) -> str:
+    """A fixed phrase for why a routing file could not be read or written:
+    never the exception's own text, which names the file."""
+    import errno
+
+    if isinstance(exc, LockBusy):
+        return "the routing record is busy: another Khipu process holds its lock"
+    if isinstance(exc, PermissionError) or exc.errno in (errno.EACCES, errno.EPERM):
+        return f"not allowed to {verb} it"
+    if exc.errno == errno.EROFS:
+        return "read-only disk"
+    if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return "the disk is full"
+    if isinstance(exc, FileNotFoundError):
+        return "a folder is missing"
+    return f"can't {verb} it"
 
 
 def _done(written: dict, view: dict, **extra) -> dict:
@@ -2673,6 +2719,8 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
 # login folder is named by its label instead.
 _SOURCE_PATHS = ("path",)
 CONVERSATION_LOCK_BUDGET = 2.0
+# khipu_status joins its routing thread for 2 s; the fold after the wait takes ~0.1 s.
+LIGHT_LOCK_BUDGET = 0.5
 
 
 def _private_strings(view: dict) -> list[tuple[str, str]]:
@@ -2762,14 +2810,46 @@ def _holds_on(key: str, view: dict) -> set[str]:
     return ids
 
 
+def _conversation_pairs(view: dict | None) -> list[tuple[str, str]]:
+    """``_private_strings`` plus Khipu's own data folder: what no answer or
+    error a conversation gets may carry."""
+    pairs = []
+    with contextlib.suppress(Exception):
+        pairs = _private_strings(view or {})
+    with contextlib.suppress(Exception):
+        from khipu.paths import data_dir
+
+        folder = str(data_dir())
+        for path in {folder, os.path.realpath(folder)}:
+            if len(path.rstrip("/")) > 1:
+                pairs.append((path.rstrip("/"), "Khipu's data folder"))
+    return sorted(pairs, key=lambda kv: ("|" not in kv[0], -len(kv[0])))
+
+
+@contextlib.contextmanager
+def _for_a_conversation():
+    """Every failure a conversation's tool call meets comes back as a
+    RouteError with no path on this Mac in it: a routing file that can't be
+    read or written is said in a fixed phrase, and any other text is
+    scrubbed of the paths Khipu knows."""
+    try:
+        yield
+    except OSError as exc:
+        raise RouteError(f"Khipu can't read its routing record ({_io_phrase(exc, 'read')})") from None
+    except ValueError as exc:  # RouteError and every argument refusal: its own words, scrubbed
+        raise RouteError(_without_paths(str(exc), _conversation_pairs(None))) from None
+    except Exception as exc:  # noqa: BLE001 - its text may name a file
+        raise RouteError(_without_paths(f"{type(exc).__name__}: {exc}", _conversation_pairs(None))) from None
+
+
 def conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
                       lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
     """What MCP ``khipu_route`` answers (``_conversation_view``), with no
     path on this Mac in it, read waiting at most ``lock_wait`` seconds for
     the routing lock (an unsaved fold after that)."""
-    with lock_budget(lock_wait):
+    with _for_a_conversation(), lock_budget(lock_wait):
         out, view = _conversation_view(since_version=since_version, account=account, now=now)
-    return _without_paths(out, _private_strings(view))
+        return _without_paths(out, _conversation_pairs(view))
 
 
 def _conversation_view(*, since_version=None, account: str | None = None,
@@ -2828,13 +2908,32 @@ _AUTHOR_ARGS = ("author", "written_by", "by", "owner", "via", "basis", "written_
                 "project")
 
 
-def conversation_write(args: dict, *, author: dict, now: datetime | None = None) -> dict:
-    """What MCP ``khipu_route_report`` writes: a report, a hold or the end of
-    a conversation's hold, and nothing else. ``author`` is set by the caller
-    from its own knowledge (the MCP server's environment and folder), never
-    from ``args``: an argument that tries to say who wrote it, or what basis
-    a time has, is refused. The owner's changes (rules, the note, pauses,
-    lifts, clears and dismissals) are refused with a plain message."""
+def conversation_write(args: dict, *, author: dict, now: datetime | None = None,
+                       lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
+    """What MCP ``khipu_route_report`` writes (``_conversation_write``),
+    waiting at most ``lock_wait`` seconds for the routing lock (refused as
+    busy after that). Its answer and its errors go back to the conversation
+    as ``khipu_route``'s do: with no path on this Mac in them, an account
+    named by its label, never its login folder's key.
+
+    A tool call is never a shell: an author with no harness Khipu can
+    detect (a server launched by a harness that sets no variable Khipu
+    reads) is recorded as from an unknown harness."""
+    by = dict(author or {})
+    if by.get("harness") in (None, "", SHELL):
+        by["harness"] = UNKNOWN_HARNESS
+    with _for_a_conversation(), lock_budget(lock_wait):
+        out = _conversation_write(args, author=by, now=now)
+        return _without_paths(out, _conversation_pairs(None))
+
+
+def _conversation_write(args: dict, *, author: dict, now: datetime | None = None) -> dict:
+    """A report, a hold or the end of a conversation's hold, and nothing
+    else. ``author`` is set by the caller from its own knowledge (the MCP
+    server's environment and folder), never from ``args``: an argument that
+    tries to say who wrote it, or what basis a time has, is refused. The
+    owner's changes (rules, the note, pauses, lifts, clears and dismissals)
+    are refused with a plain message."""
     args = dict(args or {})
     action = str(args.get("action") or "report").strip().lower().replace("-", "_")
     if action in OWNER_ACTIONS:
@@ -2882,8 +2981,10 @@ def conversation_write(args: dict, *, author: dict, now: datetime | None = None)
 def light_status(now: datetime | None = None) -> dict:
     """The ``routing`` field of ``khipu_status``'s light payload: the summary
     a conversation gets at its start (``khipu route --summary``), for a
-    harness with no hooks."""
-    with lock_budget(CONVERSATION_LOCK_BUDGET):
+    harness with no hooks. It waits for the routing lock only
+    ``LIGHT_LOCK_BUDGET``, well inside the time khipu_status gives it, so a
+    held lock still answers, from an unsaved fold."""
+    with lock_budget(LIGHT_LOCK_BUDGET):
         out = summary(now=now)
     return {"text": out["text"], "version": out["version"], "epoch": out["epoch"], "dropped": out["dropped"],
             "about": ABOUT}

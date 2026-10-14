@@ -1631,9 +1631,9 @@ def _tool_route_report(args: dict) -> dict:
     from khipu import routing
 
     # A write waits for the routing lock as long as a read does, then is
-    # refused as busy (nothing written), never left hanging.
-    with routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
-        return routing.conversation_write(args, author=routing.conversation_author())
+    # refused as busy (nothing written), never left hanging. An MCP call is
+    # never a shell: an undetected harness is recorded as unknown.
+    return routing.conversation_write(args, author=routing.conversation_author())
 
 
 TOOL_FUNCS = {
