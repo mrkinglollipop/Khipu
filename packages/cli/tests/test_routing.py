@@ -1,0 +1,603 @@
+"""khipu.routing, phase 1a of docs/plans/2026-10-14-routing-truth.md: the
+record, its fold, `khipu route` and the doctor block.
+
+Hermetic: every test gets its own data dir (KHIPU_DATA_DIR) holding a
+config.json whose ``usage_accounts`` names the accounts, so no installed CLI
+is looked for, and a fake clock (``routing._now``). Nothing here starts a
+process: one test makes any attempt fail.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from khipu import routing
+
+T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
+ACCOUNTS = [{"label": "Claude", "harness": "claude"},
+            {"label": "Claude second", "harness": "claude", "home": "/logins/claude-second"},
+            {"label": "Codex", "harness": "codex"},
+            {"label": "Muse", "harness": "muse"}]
+SECOND = "claude|/logins/claude-second"
+ME = {"kind": "conversation", "harness": "claude_code", "project": "project-a", "session": "s-one"}
+OTHER = {"kind": "conversation", "harness": "codex", "project": "project-b", "session": "s-two"}
+
+
+class Clock:
+    def __init__(self, start: datetime):
+        self.now = start
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **kw) -> datetime:
+        self.now = self.now + timedelta(**kw)
+        return self.now
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS}))
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
+    clock = Clock(T0)
+    monkeypatch.setattr(routing, "_now", clock)
+    return {"data": data, "clock": clock, "tmp": tmp_path}
+
+
+def _set(home, **values) -> None:
+    path = home["data"] / "config.json"
+    config = json.loads(path.read_text())
+    config.update(values)
+    path.write_text(json.dumps(config))
+
+
+def _account(view: dict, key: str) -> dict:
+    return next(a for a in view["accounts"] if a["key"] == key)
+
+
+def _report(**kw) -> dict:
+    kw.setdefault("author", ME)
+    return routing.report(**kw)
+
+
+# ---- the fold, row by row (the pure function) ------------------------------------------
+
+
+def _ev(seq: int, state: str, at: datetime, source: str = "report", **kw) -> dict:
+    event = {"type": "evidence", "id": f"e{seq}", "_seq": seq, "account": SECOND, "state": state,
+             "source": source, "written_at": routing._iso(at), "written_by": ME}
+    for key, value in kw.items():
+        event[key] = routing._iso(value) if isinstance(value, datetime) else value
+    return event
+
+
+def _fold(events: list[dict], now: datetime, **cfg) -> dict:
+    settings = routing.settings({})
+    settings.update(cfg)
+    known = [{"key": SECOND, "label": "Claude second", "harness": "claude", "home": "/logins/claude-second"}]
+    return routing.fold(events, now=now, cfg=settings, known=known)
+
+
+def _state(events: list[dict], now: datetime, **cfg) -> dict:
+    return _account(_fold(events, now, **cfg), SECOND)
+
+
+def test_fold_order_row_by_row():
+    now = T0 + timedelta(hours=1)
+    cli_limit = _ev(1, "limited", T0, "probe", basis="cli", until=T0 + timedelta(hours=4))
+    guess = _ev(2, "limited", T0 + timedelta(minutes=5), basis="estimated", until=T0 + timedelta(hours=3))
+    down = _ev(3, "down", T0 + timedelta(minutes=10), "probe", reason="not_signed_in")
+    pause = {"type": "pause", "id": "p4", "_seq": 4, "account": SECOND, "until": None, "via": "app",
+             "written_at": routing._iso(T0 + timedelta(minutes=15)), "written_by": {"kind": "owner"}}
+
+    # Row 1: an owner pause shows over everything, the rest stays underneath.
+    entry = _state([cli_limit, guess, down, pause], now)
+    assert (entry["state"], entry["until"], entry["basis"]) == ("paused", None, "owner")
+    assert entry["underlying"]["state"] == "down"
+    lift = {"type": "lift", "id": "l5", "_seq": 5, "account": SECOND, "via": "app",
+            "written_at": routing._iso(T0 + timedelta(minutes=20)), "written_by": {"kind": "owner"}}
+
+    # Row 2: down, from a probe, over a cli limit.
+    entry = _state([cli_limit, guess, down, pause, lift], now)
+    assert (entry["state"], entry["reason"]) == ("down", "not signed in")
+    # ... until a later probe answers.
+    answered = _ev(6, "limited", T0 + timedelta(minutes=25), "probe", basis="cli", until=T0 + timedelta(hours=2))
+    entry = _state([cli_limit, guess, down, answered], now)
+    assert entry["state"] == "limited"
+
+    # Row 3: an unexpired cli limit; within the row the latest wins.
+    entry = _state([cli_limit, guess, answered], now)
+    assert (entry["state"], entry["basis"], entry["until"]) == ("limited", "cli", routing._iso(T0 + timedelta(hours=2)))
+
+    # Row 4: an unexpired estimated limit, shown as a guess.
+    entry = _state([guess], now)
+    assert (entry["state"], entry["basis"]) == ("limited", "estimated")
+    assert "back about" in routing.account_line(entry, now) and "a guess" in routing.account_line(entry, now)
+
+    # Row 5: open evidence newer than any limit; a limit whose time has passed.
+    opened = _ev(7, "open", T0 + timedelta(minutes=30), "probe")
+    entry = _state([guess, opened], now)
+    assert entry["state"] == "open" and entry["witness"]["source"] == "probe"
+    assert routing.account_line(entry, now).startswith("Claude second: open; read from Claude 30 min ago")
+    passed = _ev(8, "limited", T0, basis="cli", until=T0 + timedelta(minutes=40))
+    entry = _state([passed], now)
+    assert (entry["state"], entry["until"]) == ("probably_open", routing._iso(T0 + timedelta(minutes=40)))
+    assert "probably open: its limit was due to end at 15:40Z, not checked yet" in routing.account_line(entry, now)
+
+    # Row 6: no evidence, or only stale evidence.
+    assert _state([], now)["state"] == "unknown"
+    assert routing.account_line(_state([], now), now) == "Claude second: unknown: no report yet"
+    old = _ev(9, "open", T0 - timedelta(hours=13))
+    entry = _state([old], now)
+    assert (entry["state"], entry["last_seen"]["state"]) == ("unknown", "open")
+    assert routing.account_line(entry, now) == "Claude second: unknown: last seen open 14 h ago"
+
+
+def test_an_account_that_cannot_be_checked_says_so_when_its_reset_passes():
+    muse = {"key": "muse|", "label": "Muse", "harness": "muse", "home": None}
+    event = dict(_ev(1, "limited", T0, basis="estimated", until=T0 + timedelta(minutes=30)), account="muse|")
+    view = routing.fold([event], now=T0 + timedelta(hours=1), cfg=routing.settings({}), known=[muse])
+    line = routing.account_line(view["accounts"][0], T0 + timedelta(hours=1))
+    assert line == "Muse: its reset time passed (15:30Z); this account can't be checked without using a turn"
+
+
+# ---- through the record ----------------------------------------------------------------
+
+
+def test_an_open_report_cannot_end_a_cli_limit_but_does_end_an_estimated_one(home):
+    _report(account="Claude second", state="limited", message="Limit reached, resets at 2026-10-14T18:52:00Z")
+    home["clock"].advance(minutes=18)
+    _report(account="Claude second", state="open", author=OTHER)
+    entry = _account(routing.read_view(), SECOND)
+    assert (entry["state"], entry["basis"], entry["until"]) == ("limited", "cli", "2026-10-14T18:52:00Z")
+    assert (entry["disagreement"]["state"], entry["disagreement"]["source"]) == ("open", "report")
+    assert routing.account_line(entry, home["clock"].now).endswith(
+        "; a Codex conversation in project-b reported it open at 15:18Z")
+    # A newer report that agrees with the shown state ends the disagreement.
+    home["clock"].advance(minutes=1)
+    _report(account="Claude second", state="limited", until="1h")
+    entry = _account(routing.read_view(), SECOND)
+    assert (entry["state"], entry["basis"], entry["disagreement"]) == ("limited", "cli", None)
+
+    _report(account="Codex", state="limited", until="2h")
+    home["clock"].advance(minutes=5)
+    _report(account="Codex", state="open", author=OTHER)
+    entry = _account(routing.read_view(), "codex|")
+    assert entry["state"] == "open" and entry["disagreement"] is None
+
+
+def test_a_clear_holds_until_newer_evidence_arrives(home):
+    _report(account="Claude second", state="limited", message="resets at 2026-10-14T18:52:00Z")
+    home["clock"].advance(minutes=1)
+    routing.clear("Claude second", via="app")
+    entry = _account(routing.read_view(), SECOND)
+    assert entry["state"] == "open" and entry["witness"]["cleared"] is True
+    assert "cleared by you" in routing.account_line(entry, home["clock"].now)
+    # Nothing older comes back, however often the record is read.
+    home["clock"].advance(hours=1)
+    assert _account(routing.read_view(), SECOND)["state"] == "open"
+    # Newer evidence does.
+    _report(account="Claude second", state="limited", until="30m")
+    entry = _account(routing.read_view(), SECOND)
+    assert (entry["state"], entry["basis"]) == ("limited", "estimated")
+
+
+def test_dismissing_one_side_of_a_disagreement(home):
+    limit = _report(account="Claude second", state="limited", message="resets at 2026-10-14T18:52:00Z")
+    home["clock"].advance(minutes=10)
+    opened = _report(account="Claude second", state="open", author=OTHER)
+    assert _account(routing.read_view(), SECOND)["disagreement"]["id"] == opened["id"]
+
+    routing.clear("Claude second", report_id=opened["id"], via="app")
+    entry = _account(routing.read_view(), SECOND)
+    assert (entry["state"], entry["disagreement"]) == ("limited", None)
+
+    other = _report(account="Claude second", state="open", author=OTHER)
+    assert _account(routing.read_view(), SECOND)["disagreement"]["id"] == other["id"]
+    routing.clear("Claude second", report_id=limit["id"], via="app")
+    entry = _account(routing.read_view(), SECOND)
+    assert (entry["state"], entry["disagreement"]) == ("open", None)
+    assert entry["witness"]["id"] == other["id"]
+
+    with pytest.raises(routing.RouteError):
+        routing.clear("Codex", report_id=other["id"], via="app")
+
+
+def test_a_model_scoped_limit_closes_only_its_model(home):
+    _report(account="Claude", state="open")
+    _report(account="Claude", state="limited", model="Opus", window="weekly",
+            message="Opus weekly limit reached, resets at 2026-10-16T09:00:00Z")
+    entry = _account(routing.read_view(), "claude|")
+    assert entry["state"] == "open"
+    assert [(m["model"], m["until"], m["basis"]) for m in entry["models"]] == [
+        ("Opus", "2026-10-16T09:00:00Z", "cli")]
+    line = routing.account_line(entry, home["clock"].now)
+    assert line.startswith("Claude: open; reported by")
+    assert "; Opus limit reached, back at Fri 09:00Z" in line and "(other models open)" in line
+    # An open report about the whole account leaves the Opus limit alone.
+    home["clock"].advance(minutes=5)
+    _report(account="Claude", state="open", author=OTHER)
+    assert _account(routing.read_view(), "claude|")["models"][0]["model"] == "Opus"
+
+
+def test_stale_open_evidence_becomes_unknown_and_a_limit_does_not_go_stale_before_its_time(home):
+    _report(account="Codex", state="open")
+    _report(account="Claude second", state="limited", window="weekly",
+            message="weekly limit, resets at 2026-10-18T15:00:00Z")
+    home["clock"].advance(hours=12, minutes=1)
+    view = routing.read_view()
+    codex = _account(view, "codex|")
+    assert (codex["state"], codex["last_seen"]["state"]) == ("unknown", "open")
+    assert routing.account_line(codex, home["clock"].now) == "Codex: unknown: last seen open 12 h 1 min ago"
+    home["clock"].advance(days=3)
+    assert _account(routing.read_view(), SECOND)["state"] == "limited"
+
+
+def test_a_limits_end_and_a_holds_end_become_a_version_with_no_file_changing(home):
+    _report(account="Codex", state="limited", until="40m")
+    routing.add_hold("keep Codex for the audit", reason="keep", scope="account", account="Codex", until="2h",
+                     author=ME)
+    events, config = routing.events_file(), home["data"] / "config.json"
+    before = (events.read_bytes(), events.stat().st_mtime_ns, config.stat().st_mtime_ns)
+    first = routing.read_view()
+    assert first["valid_until"] == routing._iso(T0 + timedelta(minutes=40))
+
+    home["clock"].advance(minutes=41)
+    second = routing.read_view()
+    assert second["version"] == first["version"] + 1
+    assert _account(second, "codex|")["state"] == "probably_open"
+    assert second["changes"][-1]["lines"] == [
+        "Codex: probably open: its limit was due to end at 15:40Z, not checked yet"]
+
+    home["clock"].advance(hours=2)
+    third = routing.read_view()
+    assert third["version"] == second["version"] + 1 and third["holds"] == []
+    assert third["changes"][-1]["lines"] == ["Hold on Codex ended"]
+    assert (events.read_bytes(), events.stat().st_mtime_ns, config.stat().st_mtime_ns) == before
+
+
+def test_the_same_report_from_two_sessions_does_not_move_the_version(home):
+    message = "You've hit your session limit, resets at 2026-10-14T18:52:00Z"
+    first = _report(account="Claude second", state="limited", message=message)
+    home["clock"].advance(minutes=3)
+    second = _report(account="Claude second", state="limited", message=message, author=OTHER)
+    assert second["version"] == first["version"]
+    _report(account="Codex", state="open")
+    version = routing.read_view()["version"]
+    home["clock"].advance(minutes=1)
+    assert _report(account="Codex", state="open", author=OTHER)["version"] == version
+    # Who said so is still shown: the newest witness.
+    assert _account(routing.read_view(), "codex|")["witness"]["written_by"] == OTHER
+
+
+def test_the_version_moves_only_when_the_view_changes(home):
+    assert routing.read_view()["version"] == 0  # no record: nothing written
+    assert not routing.events_file().exists()
+    one = _report(account="Codex", state="limited", until="1h")["version"]
+    assert one == 1
+    assert routing.read_view()["version"] == 1
+    assert routing.read_view()["version"] == 1
+    home["clock"].advance(minutes=1)
+    assert routing.read_view()["version"] == 1, "a read with nothing due moves nothing"
+    assert _report(account="Codex", state="open")["version"] == 2
+    view = routing.read_view()
+    assert [c["version"] for c in view["changes"]] == [1, 2]
+    assert view["changes"][-1]["entities"] == ["account:codex|"]
+
+
+def test_a_conversations_until_is_clamped_and_is_30_minutes_when_omitted(home):
+    now = home["clock"].now
+    assert _report(account="Codex", state="limited")["until"] == routing._iso(now + timedelta(minutes=30))
+    assert _report(account="Codex", state="limited", until="3d")["until"] == routing._iso(now + timedelta(hours=5))
+    assert _report(account="Codex", state="limited", until="3d", window="weekly")["until"] == routing._iso(
+        now + timedelta(days=3))
+    assert _report(account="Codex", state="limited", until="30d", window="weekly")["until"] == routing._iso(
+        now + timedelta(days=7))
+    assert _report(account="Codex", state="limited", until="9h", window="five-hour")["until"] == routing._iso(
+        now + timedelta(hours=5))
+    _set(home, routing_report_default_limit="45m")
+    assert _report(account="Codex", state="limited")["until"] == routing._iso(now + timedelta(minutes=45))
+
+
+def test_a_pasted_limit_message_gives_basis_cli_and_a_bare_report_gives_estimated(home):
+    out = _report(account="Claude second", state="limited",
+                  message="You've hit your session limit · resets 8pm (America/New_York)")
+    assert (out["basis"], out["until"]) == ("cli", "2026-10-15T00:00:00Z")  # 8 pm EDT
+    out = _report(account="Muse", state="limited", message="usage limit; resets at 2026-10-14T17:10:00Z")
+    assert (out["basis"], out["until"]) == ("cli", "2026-10-14T17:10:00Z")
+    out = _report(account="Codex", state="limited", until="2026-10-14T16:00:00Z")
+    assert (out["basis"], out["until"]) == ("estimated", "2026-10-14T16:00:00Z")
+    out = _report(account="Codex", state="limited", message="You've hit a limit, try again later")
+    assert out["basis"] == "estimated"
+    # A conversation cannot declare a basis; there is no way to pass one.
+    with pytest.raises(TypeError):
+        routing.report(account="Codex", state="limited", basis="cli", author=ME)  # type: ignore[call-arg]
+
+
+def test_a_down_report_is_ended_by_a_later_report(home):
+    _report(account="Codex", state="down", message="Error: not logged in")
+    entry = _account(routing.read_view(), "codex|")
+    assert (entry["state"], entry["reason"]) == ("down", "not signed in")
+    _report(account="Codex", state="open", author=OTHER)
+    assert _account(routing.read_view(), "codex|")["state"] == "open"
+
+
+def test_a_pause_shows_over_a_limit_until_it_ends_or_is_lifted(home):
+    _report(account="Codex", state="limited", until="4h")
+    routing.pause("Codex", until="1h", via="app")
+    entry = _account(routing.read_view(), "codex|")
+    assert (entry["state"], entry["underlying"]["state"]) == ("paused", "limited")
+    home["clock"].advance(minutes=61)
+    assert _account(routing.read_view(), "codex|")["state"] == "limited"
+    routing.pause("Codex", via="app")
+    line = routing.account_line(_account(routing.read_view(), "codex|"), home["clock"].now)
+    assert line == "Codex: paused by you until you lift it"
+    routing.lift("Codex", via="app")
+    assert _account(routing.read_view(), "codex|")["state"] == "limited"
+    with pytest.raises(routing.RouteError):
+        routing.lift("Codex", via="app")
+
+
+def test_a_lane_not_in_the_map_is_reported_and_never_guessed(home):
+    _report(runner="project A", lane="opus-batch", state="limited", until="1h")
+    view = routing.read_view()
+    assert [(u["runner"], u["lane"]) for u in view["unmatched"]] == [("project A", "opus-batch")]
+    assert all(a["state"] == "unknown" for a in view["accounts"])
+    assert "A limit came from project A's opus-batch lane, which isn't matched to an account." in \
+        routing.doctor_block()["warnings"]
+    _set(home, routing_lane_map={"project A": {"opus-batch": "Claude second", "grokcheck": "grok"}})
+    view = routing.read_view()
+    assert view["unmatched"] == [] and _account(view, SECOND)["state"] == "limited"
+
+
+def test_holds_from_a_conversation_expire_and_the_owners_words_alone_are_pushed(home):
+    out = routing.add_hold("hold new launches when load1 is over 75", reason="machine-busy", scope="machine",
+                           author=ME)
+    assert out["until"] == routing._iso(T0 + timedelta(hours=24))
+    longest = routing.add_hold("keep Codex", reason="keep", scope="account", account="Codex", until="30d",
+                               author=ME)
+    assert longest["until"] == routing._iso(T0 + timedelta(days=7))
+    routing.add_hold("disk under 20 GB, no builds", reason="disk-low", scope="all", owner=True, via="app")
+    with pytest.raises(routing.RouteError):
+        routing.add_hold("x" * 301, reason="other", scope="all", author=ME)
+    text = routing.summary()["text"]
+    assert "Hold on all work: disk low, until you clear it; set by you: “disk under 20 GB, no builds”" in text
+    assert "load1" not in text and "keep Codex" not in text
+    with pytest.raises(routing.RouteError):  # a conversation cannot end the owner's hold
+        routing.end_hold(next(h["id"] for h in routing.read_view()["holds"] if h["owner"]), author=ME)
+
+
+# ---- rules, the note and the seed -----------------------------------------------------------
+
+
+def test_the_public_default_has_no_rules(home):
+    view = routing.read_view()
+    assert view["rules"] == [] and view["note"] is None
+    assert routing.SETTINGS["routing_rules_seed"][1] is None
+    _report(account="Codex", state="open")
+    assert routing.read_view()["rules"] == []
+    assert "Standing rules" not in routing.summary()["text"]
+
+
+SEED = [{"text": "Grok never builds or fixes privacy or safety code.", "source": "NOW block", "date": "2026-10-13"},
+        {"text": "Never a -fast tier.", "source": "user-global instructions", "date": "2026-07-26"}]
+
+
+def test_the_seed_imports_once(home):
+    seed = home["tmp"] / "rules-seed.json"
+    seed.write_text(json.dumps(SEED))
+    _set(home, routing_rules_seed=str(seed))
+    view = routing.read_view()
+    assert [(r["n"], r["text"], r["seeded"], r["confirmed"]) for r in view["rules"]] == [
+        (1, SEED[0]["text"], True, False), (2, SEED[1]["text"], True, False)]
+    assert view["rules"][0]["written_by"] == {"kind": "seed", "file": "rules-seed.json"}
+    # A changed seed file is never imported again.
+    seed.write_text(json.dumps(SEED + [{"text": "A third rule"}]))
+    home["clock"].advance(minutes=1)
+    assert len(routing.read_view()["rules"]) == 2
+    events, _bad = routing.read_events()
+    assert sum(1 for e in events if e["type"] == "seed_import") == 1
+    assert sum(1 for e in events if e["type"] == "rule_add") == 2
+    before = routing.read_view()["version"]
+    routing.confirm_rule(1, via="app")
+    view = routing.read_view()
+    assert (view["rules"][0]["confirmed"], view["rules"][1]["confirmed"]) == (True, False)
+    assert view["version"] == before + 1, "a confirmed rule is pushed again without its seeded mark"
+    text = routing.summary()["text"]
+    assert f"1. {SEED[0]['text']}\n" in text
+    assert f"2. {SEED[1]['text']} (seeded; the owner has not confirmed it yet)" in text
+    assert routing.doctor_block()["rules_to_confirm"] == 1
+
+
+def test_rules_and_the_note_arrive_whole_whatever_their_length(home):
+    long_rule = "Never send what is in the private folders to another model family; " * 6
+    routing.add_rule(long_rule, via="app")
+    note = "Codex first for builds today; Grok for read-only surveys; keep the second Claude account for reviews. " * 20
+    routing.set_note(note, via="app")
+    _report(account="Codex", state="open")
+    out = routing.summary()
+    assert long_rule.strip() in out["text"] and note.strip() in out["text"]
+    assert out["text"].index("Standing rules:") < out["text"].index("Note from the owner")
+    assert "Your rules and note are longer than the summary size." in routing.doctor_block()["warnings"]
+    routing.end_note(via="app")
+    assert routing.read_view()["note"] is None
+
+
+def test_the_summary_drops_whole_lines_oldest_holds_first_then_open_accounts(home):
+    _set(home, routing_summary_chars=420)
+    _report(account="Codex", state="limited", until="1h")
+    _report(account="Claude", state="open")
+    for i in range(4):
+        home["clock"].advance(minutes=1)
+        routing.add_hold(f"owner hold number {i}", reason="other", scope="machine", owner=True, via="app")
+    out = routing.summary()
+    lines = out["text"].splitlines()
+    assert out["dropped"] > 0 and lines[-1] == f"{out['dropped']} more lines: run `khipu route`"
+    assert any(line.startswith("Codex: limit reached") for line in lines)
+    kept_holds = [line for line in lines if line.startswith("Hold on")]
+    assert all("number 3" in line or "number 2" in line for line in kept_holds), kept_holds
+    assert sum(len(line) + 1 for line in lines[1:]) <= 420
+    assert f"The summary had to leave out {out['dropped']} lines." in routing.doctor_block()["warnings"]
+
+
+def test_a_conversations_own_words_never_reach_the_summary(home):
+    author = dict(ME, name="the night builder")
+    routing.report(account="Codex", state="limited", until="1h", evidence="lane codex-a hit a limit at 03:12",
+                   author=author)
+    text = routing.summary()["text"]
+    assert "night builder" not in text and "codex-a" not in text and "s-one" not in text
+    full = routing.account_line(_account(routing.read_view(), "codex|"), home["clock"].now, push=False)
+    assert "the night builder" in full and "(session s-one)" in full
+
+
+# ---- the CLI ---------------------------------------------------------------------------------
+
+
+def _cli(argv: list[str], capsys) -> tuple[int, str]:
+    from khipu import cli
+
+    rc = cli.main(argv)
+    return rc, capsys.readouterr().out
+
+
+def test_owner_commands_refuse_without_a_typed_confirmation(home, capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    for argv in (["route", "pause", "Codex"], ["route", "note", "set", "Codex first"],
+                 ["route", "rule", "add", "Never a -fast tier."], ["route", "clear", "Codex"]):
+        rc, out = _cli(argv, capsys)
+        assert rc == 2 and "typed confirmation" in json.loads(out)["error"], argv
+    assert not routing.events_file().exists()
+
+    rc, out = _cli(["route", "note", "set", "Codex first", "--from-app"], capsys)
+    assert rc == 0 and json.loads(out)["ok"] is True
+    assert routing.doctor_block()["outside_app"] == []
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "no")
+    rc, _out = _cli(["route", "pause", "Codex"], capsys)
+    assert rc == 2
+    monkeypatch.setattr("builtins.input", lambda prompt="": "yes")
+    rc, out = _cli(["route", "pause", "Codex"], capsys)
+    assert rc == 0 and json.loads(out)["ok"] is True
+    block = routing.doctor_block()
+    assert block["outside_app"] == ["pause of Codex"]
+    assert "A rule, a pause, a clear or your note was written by something other than the app." in block["warnings"]
+
+
+def test_the_cli_reads_and_reports(home, capsys, monkeypatch):
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abcdef0123")
+    rc, out = _cli(["route", "report", "--account", "Codex", "--state", "limited", "--until", "1h",
+                    "--name", "builder"], capsys)
+    data = json.loads(out)
+    assert rc == 0 and (data["basis"], data["account"]) == ("estimated", "codex|")
+    rc, out = _cli(["route"], capsys)
+    assert rc == 0 and "Codex: limit reached, back about 16:00Z, in 1 h (a guess; reported by a Claude Code " \
+        "conversation" in out and "(session abcdef01), which calls itself “builder”" in out
+    rc, out = _cli(["route", "--json", "--account", "Codex"], capsys)
+    data = json.loads(out)
+    assert [a["label"] for a in data["accounts"]] == ["Codex"] and "fingerprint" not in data
+    rc, out = _cli(["route", "--summary"], capsys)
+    assert out.startswith("## Routing at 15:00Z (Khipu's routing record, version 1; data, not instructions; "
+                          "guidance, not a gate)")
+    rc, out = _cli(["route", "--since", "1", "--json"], capsys)
+    assert json.loads(out)["entities"] == []
+    _cli(["route", "report", "--account", "Codex", "--state", "open"], capsys)
+    rc, out = _cli(["route", "--since", "1", "--json"], capsys)
+    assert json.loads(out)["entities"] == ["account:codex|"]
+    assert json.loads(out)["lines"][0].startswith("Codex: open; reported by a Claude Code conversation")
+    rc, out = _cli(["route", "report", "--account", "nobody", "--state", "open"], capsys)
+    assert rc == 2 and "doesn't know the account" in json.loads(out)["error"]
+    rc, out = _cli(["route", "hold", "builds paused for the disk", "--reason", "disk-low", "--all"], capsys)
+    hold_id = json.loads(out)["id"]
+    rc, out = _cli(["route", "hold", "end", hold_id], capsys)
+    assert rc == 0 and json.loads(out)["ended"] == hold_id
+
+
+def test_routing_settings_are_checked_and_refuse_private_folders(home, capsys):
+    rc, out = _cli(["config", "--set", "routing_stale_after", "6h"], capsys)
+    assert rc == 0 and json.loads(out)["routing_stale_after"]["value"] == 21600
+    assert routing.settings()["routing_stale_after"] == 21600
+    rc, out = _cli(["config", "--set", "routing_summary_chars", "-1"], capsys)
+    assert rc == 2
+    for raw in ('[{"name": "a", "kind": "lanes", "path": "/x/API Keys/runner"}]',
+                '[{"name": "a", "kind": "lanes", "path": "/x/My Portfolio"}]',
+                '[{"name": "a", "kind": "lanes", "path": "/x/codex/auth.json"}]'):
+        rc, out = _cli(["config", "--set", "routing_sources", raw], capsys)
+        assert rc == 2 and "private folder" in json.loads(out)["error"]
+    rc, out = _cli(["config", "--set", "routing_rules_seed", "/x/API Keys/rules.json"], capsys)
+    assert rc == 2
+    rc, out = _cli(["config", "--unset", "routing_stale_after"], capsys)
+    assert rc == 0 and routing.settings()["routing_stale_after"] == 12 * 3600
+    _set(home, routing_line_chars="lots")  # a hand-edited bad value reads as the default
+    assert routing.settings()["routing_line_chars"] == 200
+    assert routing.settings_status()["routing_line_chars"]["source"] == "invalid"
+    rc, out = _cli(["config"], capsys)
+    assert "routing_reset_check_retries" in json.loads(out)["routing"]
+
+
+# ---- doctor, and the stop-conditions ----------------------------------------------------------
+
+
+def test_doctor_carries_the_routing_block_and_its_warnings_never_gate_ok(home, capsys):
+    from contextlib import ExitStack
+    from unittest import mock
+
+    from khipu import cli
+    from tests.test_cli_recall_quality import _green_doctor_patches
+
+    def doctor() -> tuple[int, dict]:
+        patches = [*_green_doctor_patches(),
+                   mock.patch("khipu.probe.status", return_value={"ok": True, "reason": None}),
+                   mock.patch("khipu.drift.recall_quality", return_value={}),
+                   mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25}),
+                   mock.patch("khipu.usage.doctor_block", return_value={"accounts": [], "warnings": []})]
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            rc = cli.cmd_doctor(cli.build_parser().parse_args(["doctor"]))
+        return rc, json.loads(capsys.readouterr().out)
+
+    rc_calm, calm = doctor()
+    assert calm["routing"]["record"] is False and calm["routing"]["warnings"] == []
+    _report(account="Codex", state="limited", until="1h")
+    rc_hot, hot = doctor()
+    assert hot["routing"]["version"] == 1
+    assert hot["warnings"] == ["Codex is marked limited only on a guess."]
+    assert (rc_hot, hot["ok"]) == (rc_calm, calm["ok"])
+
+
+def test_a_long_disagreement_is_warned_about(home):
+    _report(account="Claude second", state="limited", message="resets at 2026-10-14T18:52:00Z")
+    home["clock"].advance(minutes=1)
+    _report(account="Claude second", state="open", author=OTHER)
+    assert not any("disagreed" in w for w in routing.doctor_block()["warnings"])
+    home["clock"].advance(minutes=31)
+    assert "Sources have disagreed about Claude second for more than 30 min." in routing.doctor_block()["warnings"]
+
+
+def test_reading_and_writing_start_no_process(home, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("the routing record starts no process")
+
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    monkeypatch.setattr(subprocess, "run", refuse)
+    _report(account="Codex", state="limited", until="1h")
+    routing.add_hold("words", reason="other", scope="all", author=ME)
+    home["clock"].advance(hours=2)
+    routing.read_view()
+    routing.summary()
+    routing.doctor_block()
+
+
+def test_a_bad_line_in_the_log_is_left_out_and_counted(home):
+    _report(account="Codex", state="open")
+    with open(routing.events_file(), "a", encoding="utf-8") as fh:
+        fh.write("{not json\n")
+    view = routing.read_view()
+    assert view["bad_lines"] == 1 and _account(view, "codex|")["state"] == "open"
