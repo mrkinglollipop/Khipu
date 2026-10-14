@@ -1114,24 +1114,34 @@ def _owner_event(event: dict) -> dict:
 def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, cfg: dict) -> dict:
     key = account["key"]
     stale_after = cfg["routing_stale_after"]
-    clear = owner["clears"].get(key)
-    # A runner's limit whose LIMITED line has left the tail can't be dated
-    # (``undated``): any clear of the account outranks it.
-    live = [e for e in items if e["id"] not in owner["dismissed"]
-            and (clear is None or (_k(e) > _k(clear) and not e.get("undated")))]
-    # Unknown when the only source is a runner that has stopped reporting.
-    only_silent = bool(live) and all(e.get("silent") for e in live)
-    if clear is not None:
-        # Clear: treat as open until something newer reports on it.
-        live.append({"id": clear["id"], "state": OPEN, "until": None, "basis": "owner", "scope": "all",
-                     "source": "owner", "written_by": clear["written_by"], "at": clear["at"], "seq": clear["seq"],
-                     "cleared": True, "via": clear["via"], "evidence": None, "reason": None, "message_time": False})
 
     def stale(e: dict) -> bool:
         # Stale from the moment it turns stale_after old: the same instant
         # fold() hands on as valid_until, so a read at that instant can't
         # see it fresh and drop its last clock change.
         return e["state"] in (OPEN, DOWN) and stale_after > 0 and (now - e["at"]).total_seconds() >= stale_after
+
+    def counts(e: dict) -> bool:
+        # Evidence that still says something about now: not stale, and not
+        # a limit whose time has passed.
+        return not stale(e) and not (e["state"] == LIMITED and e["until"] is not None and e["until"] <= now)
+
+    clear = owner["clears"].get(key)
+    # A runner's limit whose LIMITED line has left the tail can't be dated
+    # (``undated``): any clear of the account outranks it.
+    live = [e for e in items if e["id"] not in owner["dismissed"]
+            and (clear is None or (_k(e) > _k(clear) and not e.get("undated")))]
+    # Unknown when the only source that still counts is a runner that has
+    # stopped reporting: other evidence counts only while it is fresh (open
+    # or down) or its limit has not passed (``counts``).
+    only_silent = any(e.get("silent") for e in live) and not any(
+        not e.get("silent") and counts(e) for e in live)
+    if clear is not None:
+        # Clear: treat as open until something newer reports on it.
+        live.append({"id": clear["id"], "state": OPEN, "until": None, "basis": "owner", "scope": "all",
+                     "source": "owner", "written_by": clear["written_by"], "at": clear["at"], "seq": clear["seq"],
+                     "cleared": True, "via": clear["via"], "evidence": None, "reason": None, "message_time": False})
+
 
     def later(e: dict, base: dict) -> bool:
         return _k(e) > _k(base)
@@ -1245,6 +1255,9 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
     pause = owner["pauses"].get(key)
     lift = owner["lifts"].get(key)
     if pause and (lift is None or _k(lift) < _k(pause)) and (pause["until"] is None or pause["until"] > now):
+        # The pause is what is shown: it began when Matt paused, not when
+        # the limit under it was first reported.
+        entry.pop("since", None)
         entry.update(state=PAUSED, until=_iso(pause["until"]), basis="owner", reason=None, disagreement=None,
                      last_seen=None, underlying=underlying,
                      witness={"id": pause["id"], "source": "owner", "written_by": pause["written_by"],
@@ -2467,7 +2480,8 @@ def _launch_warnings(view: dict, launched: list[dict], cfg: dict, now: datetime)
         at = _parse(item["at"])
         if entry is None or at is None or key in said:
             continue
-        began = _parse(entry.get("since") or (entry.get("witness") or {}).get("at"))
+        witnessed = (entry.get("witness") or {}).get("at")
+        began = _parse(witnessed if entry["state"] == PAUSED else entry.get("since") or witnessed)
         until = _parse(entry.get("until"))
         if began is None or at < began:
             continue

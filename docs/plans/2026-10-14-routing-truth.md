@@ -239,7 +239,8 @@ MCP tool refuses them. Doctor warns when any of them was written by anything oth
 
 1. **Khipu's usage probes** (`khipu usage`, cache `state/usage.json`). A window at 100% or more makes the
    account limited until that window's `resets_at` (basis cli), for that window's scope. A probe written
-   after a limited entry that shows headroom reopens the account (basis checked). `not_signed_in` and
+   after a limited entry that shows headroom (every window under 100%) reopens the account (basis checked);
+   a window at 100% with no reset time ahead is never headroom and gives no evidence for its scope. `not_signed_in` and
    `not_installed` make it down. Muse rows are last-observed and labelled so. The second Claude home answers
    nothing until its `/login`.
 2. **Runners' files, read and never written.** Each registered runner folder (setting `routing_sources`, a
@@ -514,9 +515,11 @@ into the app's attention items. They never gate `ok`. The texts Matt reads:
   passes `-m grok-4.7`) is reported as "can't be checked: the model is set inside <script>", never as
   passing.
 - "A standing rule may be broken: a Grok lane is set to work on <pipeline>, which is marked private." (from
-  the pipeline's ADDED line)
+  the pipeline's ADDED line; when it names no check lane or no fix lanes, the runner's `defaults.check_lane`
+  or `defaults.fix_lanes` stand in for them)
 - "A standing rule may be broken: <runner>'s Grok check lane has no confirming lane from another model
-  family." (`confirm_lane`)
+  family." (`confirm_lane`: none set, a lane the settings lack, or a Grok lane.) When the confirming lane's
+  `kind` is not set, it "can't be checked", never reported as passing.
 - Whether a Grok lane uses the paid xAI API "can't be checked: the launch environment is set inside
   <script>", never reported as passing.
 - "A job was started on <account> while you had it paused", or "…after it had reached its limit." (LAUNCH
@@ -915,7 +918,15 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
 - **A clock that reads low, but not before the record began (phase 1a handling kept).** A Mac whose clock is
   more than `CLOCK_TOLERANCE` behind writes its own time when the record holds lines written before that time.
   If such a run is longer than the lines written in the stretch it is behind, the fold still keeps the low
-  run, as in phase 1a. The case the phase 1a limit describes (a clock reading 2001, behind every line) is fixed.
+  run, as in phase 1a. The case the phase 1a limit describes (a clock reading 2001, behind every line) is fixed
+  for a record that holds two lines or more; a record of one line is the next limit.
+- **A record of one line (phase 1b).** A writer takes the record's time only when the record holds two lines or
+  more. With one line, a run of lines from a clock reading before it (a clock reading 2001) keeps its own
+  times, and once that run is longer than the history, the fold keeps the low run as in phase 1a: the one
+  line reads as old (an open report shows as Unknown), and doctor names that line as the one with the wrong
+  date. Stamping a record of one line would let a single line written ahead of the clock pin every later
+  line (the mirror case above), so it is left. It cannot start once the record holds two lines, and the log
+  keeps every line as written. Shown by `test_a_low_clock_run_after_a_one_line_record_keeps_the_phase_1a_handling`.
 
 ## Fixed limits
 
@@ -925,8 +936,8 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
   `CLOCK_TOLERANCE` before every line of a record of two lines or more, its line takes the newest line's time
   and keeps the clock's reading in `clock_at`, and doctor names it from that reading. Lines without `seq`
   (written by phase 1a) keep their handling. Proved by `test_a_run_of_lines_from_a_clock_reading_2001_never_ages_the_history`
-  (N = 0, 1 and 10: the history keeps its times for every N, and doctor names the 2001 lines, never the T0
-  lines). The text as accepted: The fold decides which
+  (a history of two lines; N = 0, 1 and 10: the history keeps its times for every N, and doctor names the
+  2001 lines, never the T0 lines). A history of one line is not covered (Known limits). The text as accepted: The fold decides which
   out-of-order line has the wrong time from the log alone. When a Mac writes a run of lines while its clock is
   more than `CLOCK_TOLERANCE` (5 minutes) behind, and that run is longer than the history written before it,
   the fold keeps the low run and reads the earlier history as old: reports show as Unknown, an owner hold

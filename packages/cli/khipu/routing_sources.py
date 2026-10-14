@@ -15,8 +15,9 @@ reports; nothing here picks, ranks, refuses, launches or reorders work.
   that resolves, inside a credential location is refused and never opened.
 - Khipu's usage cache (``state/usage.json``): a window at 100% or more is a
   limit until its ``resets_at`` (basis cli) for its scope (a model, or the
-  whole account); figures with headroom are open (basis checked);
-  ``not_signed_in`` and ``not_installed`` are down.
+  whole account); figures with headroom (every window under 100%) are open
+  (basis checked), and a window at 100% with no reset time ahead gives no
+  evidence for its scope; ``not_signed_in`` and ``not_installed`` are down.
 - The routing table (setting ``routing_table``), read only and never as
   account state: its NOW block's ``updated:`` line and a hash of the block.
 
@@ -50,6 +51,9 @@ GUESS_SLACK = 5
 LINE_MAX = 200
 KEEP_LINES = {"LIMITED": 200, "ADDED": 300, "LAUNCH": 300}
 LAUNCH_KEEP = timedelta(days=2)
+# A heartbeat interval longer than this is not a heartbeat (the runners write
+# 20 and 30 seconds); the file is reported as out of range.
+INTERVAL_MAX = 24 * 3600
 
 _LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+(\S+)\s+(ADDED|LIMITED|LAUNCH|HOLD)\b[ \t]*(.*)$")
 _FIELD = re.compile(r"(?:^|\s)([a-z_]+)=(\S+)")
@@ -77,12 +81,29 @@ def _parse(text) -> datetime | None:
         return None
 
 
-def _epoch(value) -> datetime | None:
-    """A runner's epoch seconds (a float in global.json and heartbeat.json)."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+class OutOfRange(ValueError):
+    """A number a file holds that no time or interval can be."""
+
+
+def _number(value) -> float | None:
+    """A finite number a file holds, as a float, or None. JSON reads an
+    integer of any length, which a float can't always hold."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
-        return datetime.fromtimestamp(value, timezone.utc)
+        out = float(value)
+    except OverflowError:
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _epoch(value) -> datetime | None:
+    """A runner's epoch seconds (a float in global.json and heartbeat.json)."""
+    number = _number(value)
+    if number is None:
+        return None
+    try:
+        return datetime.fromtimestamp(number, timezone.utc)
     except (OverflowError, OSError, ValueError):
         return None
 
@@ -159,6 +180,8 @@ def _short_error(exc: BaseException) -> str:
         return "missing"
     if isinstance(exc, PermissionError):
         return "not allowed to read it"
+    if isinstance(exc, (OutOfRange, OverflowError)):
+        return "a number out of range"
     if isinstance(exc, (ValueError, UnicodeDecodeError, RecursionError)):
         return "not readable JSON"
     return _redacted(str(exc) or type(exc).__name__, 80)
@@ -243,19 +266,22 @@ def _parse_global(data: bytes) -> dict:
         until = item.get("until") if isinstance(item, dict) else None
         if lane_name is None or _epoch(until) is None:
             continue
-        out[lane_name] = {"until": float(until), "reason": _redacted(item.get("reason"), 120) or None}
+        out[lane_name] = {"until": _number(until), "reason": _redacted(item.get("reason"), 120) or None}
     return {"limited": out}
 
 
 def _parse_heartbeat(data: bytes) -> dict:
     doc = json.loads(data.decode("utf-8"))
-    if not isinstance(doc, dict) or _epoch(doc.get("time")) is None:
+    if not isinstance(doc, dict) or doc.get("time") is None:
         raise ValueError("no time")
-    interval = doc.get("interval")
-    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not math.isfinite(interval) \
-            or interval <= 0:
+    if _epoch(doc["time"]) is None:
+        raise OutOfRange("time out of range")
+    if doc.get("interval") is None:
         raise ValueError("no interval")
-    return {"time": float(doc["time"]), "interval": float(interval)}
+    interval = _number(doc["interval"])
+    if interval is None or not 0 < interval <= INTERVAL_MAX:
+        raise OutOfRange("interval out of range")
+    return {"time": _number(doc["time"]), "interval": interval}
 
 
 def _parse_config(data: bytes) -> dict:
@@ -322,10 +348,15 @@ def _parse_events(data: bytes, now: datetime) -> dict:
                                        "basis": runner_basis(at, until),
                                        "text": _redacted(f"{m.group(2)} LIMITED {rest}")})
         elif kind == "ADDED":
-            lanes = [fields.get("check_lane", "")] + fields.get("fix_lanes", "").split(",")
+            # A line that names no check lane or no fix lanes leaves the
+            # runner's defaults (config.json) to pick them: kept as None.
+            check = _name(fields.get("check_lane")) if "check_lane" in fields else None
+            fix = [n for n in (_name(x) for x in fields["fix_lanes"].split(",")) if n] \
+                if "fix_lanes" in fields else None
             out["ADDED"].append({"at": _iso(at), "pipeline": pipeline,
                                  "private": bool(re.search(r"(?:^|\s)privacy(?:\s|$)", rest)),
-                                 "lanes": [n for n in (_name(x) for x in lanes) if n]})
+                                 "lanes": [n for n in [check, *(fix or [])] if n],
+                                 "check_lane": check, "fix_lanes": fix})
         elif kind == "LAUNCH":
             lane = _name(fields.get("lane"))
             if lane and now - at <= LAUNCH_KEEP:
@@ -360,19 +391,22 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
                 parsed = _PARSERS[key](data)
             cache[key] = {"data": parsed, "good_at": _iso(now), "mtime": mtime, "since": None}
             files[key] = {"error": None, "good_at": _iso(now), "since": None}
-        except (OSError, ValueError, UnicodeDecodeError, RecursionError) as exc:
+        except (OSError, ValueError, UnicodeDecodeError, RecursionError, OverflowError, TypeError) as exc:
             since = last.get("since") or _iso(now)
             if last.get("data") is not None:
                 cache[key] = dict(last, since=since)
             else:
                 cache[key] = {"data": None, "good_at": None, "mtime": None, "since": since}
             files[key] = {"error": _short_error(exc), "good_at": cache[key].get("good_at"), "since": since}
-    beat = cache["heartbeat"].get("data") or {}
+    from khipu.routing import _after
+
+    beat = cache["heartbeat"].get("data")
+    beat = beat if isinstance(beat, dict) else {}
     beat_at = _epoch(beat.get("time"))
-    interval = beat.get("interval")
+    interval = _number(beat.get("interval"))
     deadline = None
     if beat_at is not None and interval and silent_intervals:
-        deadline = beat_at + timedelta(seconds=interval * silent_intervals)
+        deadline = _after(beat_at, interval * silent_intervals)
     silent = beat_at is None or (deadline is not None and now >= deadline)
     errors = [f for f in files.values() if f["error"]]
     status = {
@@ -430,8 +464,10 @@ def runner_evidence(status: dict, cache: dict) -> list[dict]:
 def usage_evidence() -> tuple[list[dict], dict]:
     """Evidence from Khipu's own usage cache (``khipu usage``), and a short
     status of it. A window at 100% or more closes its scope until its reset
-    (basis cli); figures with headroom reopen it (basis checked); a probe
-    that found the CLI not signed in or not installed is down. Figures Muse
+    (basis cli); figures with headroom (every window under 100%) reopen it
+    (basis checked); a window at 100% with no reset time ahead gives no
+    evidence for its scope, never open; a probe that found the CLI not
+    signed in or not installed is down. Figures Muse
     or Codex keep from their last turn are marked ``observed``."""
     from khipu import usage
 
@@ -454,7 +490,7 @@ def usage_evidence() -> tuple[list[dict], dict]:
         if not (row.get("ok") or row.get("last_good_at")):
             continue
         at = _parse(row.get("observed_at") or row.get("probed_at"))
-        windows = [w for w in row.get("windows") or [] if isinstance(w, dict)]
+        windows = [w for w in row.get("windows") if isinstance(w, dict)] if isinstance(row.get("windows"), list) else []
         if at is None or not windows:
             continue
         newest = at if newest is None else max(newest, at)
@@ -467,14 +503,16 @@ def usage_evidence() -> tuple[list[dict], dict]:
             full: list[tuple[datetime, dict]] = []
             top = None
             for w in group:
-                used = w.get("used_pct")
-                if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
+                used = _number(w.get("used_pct"))
+                if used is None:
                     continue
                 top = used if top is None else max(top, used)
                 reset = _parse(w.get("resets_at"))
                 if used >= 100 and reset is not None and reset > at:
                     full.append((reset, w))
-            if top is None:
+            # A window at its limit is never headroom: with no reset time
+            # still ahead of the probe, the scope gives no evidence at all.
+            if top is None or (top >= 100 and not full):
                 continue
             base = {"account": key, "runner": None, "lane": None, "scope": _redacted(scope, 64), "source": "probe",
                     "written_by": by, "via": "probe", "at": at, "reason": None, "message_time": False,
@@ -484,8 +522,8 @@ def usage_evidence() -> tuple[list[dict], dict]:
                 name = str(w.get("name") or "")
                 window = "weekly" if name.startswith("weekly") else name or None
                 out.append(dict(base, id="p" + _sid(key, scope, "limited", _iso(at), _iso(reset)), state="limited",
-                                until=reset, basis="cli", window=window, used_pct=w.get("used_pct"),
-                                evidence=_redacted(f"usage probe: {name or 'window'} at {w.get('used_pct')}%")))
+                                until=reset, basis="cli", window=window, used_pct=_number(w.get("used_pct")),
+                                evidence=_redacted(f"usage probe: {name or 'window'} at {_number(w.get('used_pct'))}%")))
             else:
                 out.append(dict(base, id="p" + _sid(key, scope, "open", _iso(at)), state="open", until=None,
                                 basis="checked", window=None, used_pct=top,
@@ -613,15 +651,27 @@ def rule_checks(cache: dict, rules: list[dict]) -> list[dict]:
                                     f"the launch environment is set inside {_script(launch)}"})
             if "grok_confirm" in watch and kind == "grokcheck":
                 confirm = spec.get("confirm_lane")
-                if not confirm or ((lanes.get(confirm) or {}).get("kind") or "").lower().startswith("grok"):
+                other = lanes.get(confirm) if confirm else None
+                other_kind = ((other or {}).get("kind") or "").lower()
+                if other is None or other_kind.startswith("grok"):  # none named, or a lane the settings lack
                     out.append({"rule": watch["grok_confirm"], "status": "broken",
                                 "text": f"A standing rule may be broken: {name}'s Grok check lane has no "
                                         "confirming lane from another model family."})
+                elif not other_kind:
+                    out.append({"rule": watch["grok_confirm"], "status": "cannot_check",
+                                "text": f"{name}'s Grok check lane: whether its confirming lane {confirm} is from "
+                                        "another model family can't be checked: its kind isn't set"})
         if "grok_private" in watch:
             grok = {lane for lane, spec in lanes.items() if (spec.get("kind") or "").lower().startswith("grok")}
             events = (kept.get("events") or {}).get("data") or {}
             for added in events.get("added") or []:
-                if added.get("private") and grok & set(added.get("lanes") or []):
+                named = set(added.get("lanes") or [])
+                # Lanes the line leaves to the runner's defaults.
+                if "check_lane" in added and added["check_lane"] is None and config.get("check_lane"):
+                    named.add(config["check_lane"])
+                if "fix_lanes" in added and added["fix_lanes"] is None:
+                    named |= set(config.get("fix_lanes") or [])
+                if added.get("private") and grok & named:
                     out.append({"rule": watch["grok_private"], "status": "broken",
                                 "text": f"A standing rule may be broken: a Grok lane is set to work on "
                                         f"{added.get('pipeline')}, which is marked private."})
