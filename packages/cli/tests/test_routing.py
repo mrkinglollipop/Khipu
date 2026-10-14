@@ -305,7 +305,7 @@ def test_a_conversations_until_is_clamped_and_is_30_minutes_when_omitted(home):
 
 
 def test_a_pasted_limit_message_gives_basis_cli_and_a_bare_report_gives_estimated(home):
-    out = _report(account="Claude second", state="limited",
+    out = _report(account="Claude second", state="limited", seen="1m",
                   message="You've hit your session limit · resets 8pm (America/New_York)")
     assert (out["basis"], out["until"]) == ("cli", "2026-10-15T00:00:00Z")  # 8 pm EDT
     out = _report(account="Muse", state="limited", message="usage limit; resets at 2026-10-14T17:10:00Z")
@@ -1205,3 +1205,203 @@ def test_json_nested_too_deeply_to_read_is_left_out_and_counted(home, monkeypatc
     assert routing.settings_status()["routing_lane_map"]["source"] == "invalid"
     routing.view_file().write_text(nest, encoding="utf-8")
     assert _account(routing.read_view(), "claude|")["state"] == "open"
+
+
+# ---- fix round 4 ---------------------------------------------------------------------------
+
+
+def test_a_line_cut_inside_a_character_is_left_out_and_counted(home):
+    # R3-1: the log was decoded whole, so a write cut inside a multi-byte
+    # character raised UnicodeDecodeError from every read, write and doctor.
+    routing.add_hold("words", reason="other", scope="all", author=ME)
+    line = json.dumps({"type": "evidence", "id": "et", "source": "report", "state": "open", "account": "codex|",
+                       "written_at": routing._iso(T0), "evidence": "limit reached…"}, ensure_ascii=False)
+    raw = line.encode("utf-8")
+    cut = raw[: raw.index("…".encode("utf-8")) + 1]  # one byte of the three
+    with open(routing.events_file(), "ab") as fh:
+        fh.write(cut)
+    with pytest.raises(UnicodeDecodeError):
+        routing.events_file().read_text(encoding="utf-8")
+    view = routing.read_view()
+    assert view["bad_lines"] == 1 and len(view["holds"]) == 1
+    out = routing.clear("Codex", via="app")
+    assert out["ok"] is True and out["version"] == routing.read_view()["version"]
+    assert [e["type"] for e in routing.read_events()[0]] == ["hold", "clear"]
+    assert _account(routing.read_view(), "codex|")["state"] == "open"
+    block = routing.doctor_block()
+    assert block["bad_lines"] == 1
+    assert "1 line of the routing record can't be read; Khipu leaves it out." in block["warnings"]
+    # A whole line of bytes that are not UTF-8, between good lines, costs that line alone.
+    with open(routing.events_file(), "ab") as fh:
+        fh.write(b'{"type": "note_set", "text": "\xff\xfe"}\n')
+    routing.add_hold("more", reason="other", scope="all", author=ME)
+    view = routing.read_view()
+    assert view["bad_lines"] == 2 and len(view["holds"]) == 2
+
+
+def test_a_write_is_recorded_once_even_when_its_refold_fails(home, monkeypatch):
+    # R3-1: the line was appended, then the refold raised, so the caller saw
+    # a failure and a retry wrote the same change twice.
+    def broken(*_args, **_kw):
+        raise RuntimeError("a fold that fails")
+
+    monkeypatch.setattr(routing, "_refold_locked", broken)
+    monkeypatch.setattr(routing, "_unsaved_view", broken)
+    out = routing.clear("Codex", via="app")
+    assert out["ok"] is True and out["saved"] is False and out["version"] is None
+    assert [e["type"] for e in routing.read_events()[0]] == ["clear"]
+
+
+def test_a_lone_surrogate_in_the_log_a_write_or_a_label_never_stops_a_read_or_a_write(home, capsys):
+    # R3-2: a "\ud800" escape in a line passed every check, reached the view
+    # and made every save raise UnicodeEncodeError; text from argv or the
+    # environment (bytes that are not UTF-8 arrive as lone surrogates) made
+    # the write itself raise; a label in config.json did the same to the view.
+    _set(home, usage_accounts=ACCOUNTS + [{"label": "Grok \ud800", "harness": "grok"}])
+    _report(account="Codex", state="open")
+    lines = [{"type": "note_set", "id": "on", "text": "Codex first \ud800", "via": "app",
+              "written_by": {"kind": "owner"}},
+             {"type": "evidence", "id": "es", "source": "report", "state": "limited", "account": "claude|",
+              "until": routing._iso(T0 + timedelta(hours=1)), "evidence": "limit \udc80 reached",
+              "written_by": dict(ME, name="me \ud83d"), "via": "cli"}]
+    with open(routing.events_file(), "a", encoding="utf-8") as fh:
+        for line in lines:
+            fh.write(json.dumps(dict(line, written_at=routing._iso(T0))) + "\n")  # ASCII: the escapes as written
+    view = routing.read_view()
+    assert view["bad_lines"] == 0 and view["note"]["text"] == "Codex first �"
+    entry = _account(view, "claude|")
+    assert entry["state"] == "limited" and entry["witness"]["evidence"] == "limit � reached"
+    assert entry["witness"]["written_by"]["name"] == "me �"
+    assert any(a["label"] == "Grok �" for a in view["accounts"])
+    routing.view_file().read_bytes().decode("utf-8")
+    assert routing.set_note("from argv \udcff", via="app")["ok"] is True
+    assert routing.read_view()["note"]["text"] == "from argv �"
+    out = _report(account="Codex", state="limited", until="1h", evidence="seen \udcfd",
+                  author=dict(ME, session="s-\udcfe"))
+    assert out["ok"] is True and out.get("saved") is None
+    routing.events_file().read_bytes().decode("utf-8")
+    assert routing.read_events()[0][-1]["written_by"]["session"] == "s-�"
+    assert routing.summary()["text"] and routing.doctor_block()["bad_lines"] == 0
+    assert _cli(["route"], capsys)[0] == 0
+
+
+def test_a_holds_scope_keeps_only_its_kind_and_account(home):
+    # R3-2: a hold's whole scope object was copied into the view while only
+    # its kind and account were checked.
+    _report(account="Codex", state="open")
+    base = {"type": "hold", "reason": "keep", "text": "x", "written_at": routing._iso(T0), "written_by": ME,
+            "via": "cli"}
+    lines = [json.dumps(dict(base, id="h1", scope={"kind": "machine", "note": "\ud800", "more": {"a": [1, {}]}})),
+             json.dumps(dict(base, id="h2", scope={"kind": "account", "account": "codex|", "extra": [1, 2]})),
+             json.dumps(dict(base, id="h3", scope={"kind": "planet"})),
+             json.dumps(dict(base, id="h4", scope={"kind": "account"})),
+             json.dumps(dict(base, id="h5", scope={"kind": "machine", "x": "DEEP"})).replace(
+                 '"DEEP"', "[" * 3000 + "]" * 3000)]
+    with open(routing.events_file(), "a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    view = routing.read_view()
+    scopes = {h["id"]: h["scope"] for h in view["holds"]}
+    assert scopes["h1"] == {"kind": "machine"} and scopes["h2"] == {"kind": "account", "account": "codex|"}
+    assert "h3" not in scopes and "h4" not in scopes
+    # Read where the interpreter can (3.14), unreadable where it can't (3.11): never a stop either way.
+    assert scopes.get("h5", {"kind": "machine"}) == {"kind": "machine"}
+    assert view["bad_lines"] == 2 + ("h5" not in scopes)
+    assert routing.add_hold("more", reason="other", scope="all", author=ME)["ok"] is True
+    assert routing.doctor_block()["holds"] == len(scopes) + 1
+
+
+@pytest.mark.parametrize("line", [
+    {"type": "evidence", "id": "e1", "source": "report", "state": "open", "account": "codex|", "written_at": "soon"},
+    {"type": "evidence", "id": "e2", "source": "report", "state": "open", "account": "codex|", "written_at": None},
+    {"type": "hold", "id": "h1", "reason": "keep", "text": "x", "until": "tomorrow-ish"},
+    {"type": "hold", "id": "h2", "reason": "keep", "text": "x", "owner": "yes"},
+    {"type": "rule_add", "id": "r1", "n": 10 ** 20, "text": "x"},
+    {"type": "evidence", "id": "e3", "source": "probe", "state": "open", "account": "codex|",
+     "used_pct": float("nan")},
+])
+def test_a_line_with_a_time_or_a_value_khipu_never_writes_is_left_out_and_counted(home, line):
+    # R3-2: such a line was folded on (a hold with no time to end, a
+    # conversation's hold read as the owner's) or silently skipped uncounted.
+    _report(account="Codex", state="open")
+    line = {k: v for k, v in dict({"written_at": routing._iso(T0), "written_by": ME, "via": "cli"},
+                                  **line).items() if v is not None}
+    with open(routing.events_file(), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(line) + "\n")
+    view = routing.read_view()
+    assert view["bad_lines"] == 1 and _account(view, "codex|")["state"] == "open"
+    assert view["holds"] == [] and view["rules"] == []
+    assert len(routing.read_events()[0]) == 1 and routing.doctor_block()["bad_lines"] == 1
+
+
+def test_a_time_past_the_years_python_holds_is_held_at_the_limit(home):
+    # R3-2: a hold's time past the year 9999 in UTC read as no time at all.
+    _report(account="Codex", state="open")
+    with open(routing.events_file(), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "hold", "id": "hm", "reason": "keep", "text": "x", "written_by": ME,
+                             "via": "cli", "written_at": routing._iso(T0),
+                             "until": "9999-12-31T23:59:59-05:00"}) + "\n")
+    view = routing.read_view()
+    assert view["bad_lines"] == 0 and view["holds"][0]["until"] == "9999-12-31T23:59:59Z"
+
+
+def test_a_view_file_changed_by_hand_is_never_answered_from(home):
+    # R3-2: view.json's version, changes and whole view were copied and
+    # answered from unchecked; a hand edit with the inputs unchanged stopped
+    # every read (a list where accounts go, a version that is not a number).
+    _report(account="Codex", state="open")
+    epoch = routing.read_view()["epoch"]
+    saved = json.loads(routing.view_file().read_text(encoding="utf-8"))
+    saved.update(version="seven", accounts=5, changes=[{"version": "x"}], note={"text": "\ud800"})
+    routing.view_file().write_text(json.dumps(saved), encoding="utf-8")
+    assert "Codex: open" in routing.summary()["text"]
+    view = routing.read_view()
+    assert (view["version"], _account(view, "codex|")["state"]) == (1, "open") and view["epoch"] != epoch
+    assert routing.since(0)["complete"] is True
+    assert routing.clear("Codex", via="app")["ok"] is True and routing.doctor_block()["record"] is True
+
+
+@pytest.mark.parametrize("raw, words", [
+    ("9999-12-31T23:59:59", "further ahead"), ("0001-01-01T00:00:00", "further back"),
+    ("9999-12-31T23:59:59-05:00", "further ahead"), ("0001-01-01T00:00:00+05:00", "further back"),
+])
+def test_an_until_at_the_year_limits_is_refused_with_or_without_a_zone(home, capsys, raw, words):
+    # R3-3: a time with no zone near the year limits raised ValueError out of
+    # its conversion to this Mac's time; one with a zone near year 1 was
+    # refused as too far ahead.
+    rc, out = _cli(["route", "report", "--account", "Codex", "--state", "limited", "--until", raw], capsys)
+    assert rc == 2 and words in json.loads(out)["error"]
+    rc, out = _cli(["route", "hold", "x", "--reason", "other", "--all", "--until", raw], capsys)
+    assert rc == 2 and words in json.loads(out)["error"]
+    with pytest.raises(routing.RouteError, match=words):
+        routing.pause("Codex", until=raw, via="app")
+    assert routing.read_events()[0] == []
+
+
+def test_a_clock_reset_time_is_the_messages_own_only_with_when_it_was_seen(home, capsys):
+    # R3-4: "resets 8pm (zone)" names no day; it was read as the next 8 pm
+    # after the report, so a message seen at 7:50 pm and reported at 8:10 pm
+    # was taken as resetting at 8 pm the next day, as the CLI's own time.
+    message = "You've hit your session limit · resets 8pm (America/New_York)"
+    home["clock"].now = datetime(2026, 10, 15, 0, 10, tzinfo=timezone.utc)  # 8:10 pm EDT
+    out = _report(account="Claude second", state="limited", message=message, seen="2026-10-14T23:50:00Z")
+    assert (out["basis"], out["until"]) == ("cli", "2026-10-15T00:00:00Z")  # that evening's 8 pm
+    assert routing.read_events()[0][-1]["message_time"] is True
+    entry = _account(routing.read_view(), SECOND)
+    assert (entry["state"], entry["until"]) == ("probably_open", "2026-10-15T00:00:00Z")
+    # Without the time it was seen, the day is a guess: estimated, inside the five-hour window.
+    out = _report(account="Codex", state="limited", message=message)
+    assert (out["basis"], out["until"]) == ("estimated", "2026-10-15T05:10:00Z")
+    assert "message_time" not in routing.read_events()[0][-1]
+    line = routing.account_line(_account(routing.read_view(), "codex|"), home["clock"].now)
+    assert "back about" in line and "message" not in line
+    # A guess the conversation types itself is taken over Khipu's guess of the day.
+    assert _report(account="Muse", state="limited", message=message, until="2h")["until"] == "2026-10-15T02:10:00Z"
+    # On the command line: --seen as how long ago, and the refusals.
+    rc, text = _cli(["route", "report", "--account", "Claude", "--state", "limited", "--message", message,
+                     "--seen", "20m"], capsys)
+    assert rc == 0 and (json.loads(text)["basis"], json.loads(text)["until"]) == ("cli", "2026-10-15T00:00:00Z")
+    for argv, words in ((["--seen", "20m"], "give the message too"),
+                        (["--message", message, "--seen", "2026-10-15T01:00:00Z"], "not later than now"),
+                        (["--message", message, "--seen", "20"], "needs a unit")):
+        rc, text = _cli(["route", "report", "--account", "Codex", "--state", "limited", *argv], capsys)
+        assert rc == 2 and words in json.loads(text)["error"], argv

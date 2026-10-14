@@ -4518,6 +4518,9 @@ def build_parser() -> argparse.ArgumentParser:
     rep.add_argument("--model", default=None,
                      help="The model a model-scoped limit closes (a model's name; not with --state down)")
     rep.add_argument("--message", default=None, help="The limit message itself, word for word")
+    rep.add_argument("--seen", default=None, metavar="T",
+                     help="When the message was shown (a time, or how long ago: 10m); a reset clock time "
+                          "with no day counts as the CLI's own only with it")
     rep.add_argument("--name", default=None, help="What the conversation calls itself (shown beside its author)")
     rep.add_argument("--evidence", default=None, help="One line of evidence")
     hold = rt_sub.add_parser("hold", help='Add a hold: hold "<words>" --reason R; or end one: hold end <id>',

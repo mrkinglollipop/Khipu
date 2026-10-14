@@ -260,9 +260,11 @@ MCP tool refuses them. Doctor warns when any of them was written by anything oth
    A report can mark an account limited, open or down, and can add holds. Its basis is **estimated** unless
    it passes the limit message itself and Khipu parses a reset time out of it (the forms "resets 8pm
    (America/New_York)" and "resets at <ISO time>"), which makes it **cli**; a conversation cannot declare a
-   basis. Its `until` is clamped to the length of the window it names (five hours or seven days) and is 30
-   minutes when omitted. Its author is set by Khipu, as above. A report cannot write rules, the note, owner
-   pauses or clears.
+   basis. "resets 8pm (zone)" names no day, so it is **cli** only with `--seen`, when the message was shown
+   (the next 8 pm after that); without it the day is guessed from the report's time and the report is
+   **estimated**. Its `until` is clamped to the length of the window it names (five hours or seven days)
+   and is 30 minutes when omitted. Its author is set by Khipu, as above. A report cannot write rules, the
+   note, owner pauses or clears.
 4. **The owner in the app**: pauses and lifts, clears and dismissals, holds, the rules and his note.
 5. **Until the cutover only: the table, read only, and never as account state.** Setting `routing_table`
    names the file. Khipu reads the NOW block's `updated:` line and a hash of the block. When the hash changes,
@@ -418,11 +420,11 @@ at most three checks per reset: the first and two retries.
   exactly the session-start text, `--brief` is what a runner pastes into a brief, and `--since` prints the
   current state of everything that changed after a version.
 - `khipu route report (--account A | --runner R --lane L) --state limited|open|down [--until T] [--window
-  five-hour|weekly] [--model M] [--message "<the limit message>"] [--name "<what the conversation calls
-  itself>"] [--evidence "<line>"]` records what a conversation learned. Khipu sets the author and the basis.
-  The fields that are pushed take no free text: `--model` is a model's name (not with `--state down`, which is
-  about the whole account), a conversation's `--runner`/`--lane` must be a lane the lane map names, and a
-  harness Khipu doesn't know is recorded as unknown.
+  five-hour|weekly] [--model M] [--message "<the limit message>"] [--seen T] [--name "<what the conversation
+  calls itself>"] [--evidence "<line>"]` records what a conversation learned. Khipu sets the author and the
+  basis. The fields that are pushed take no free text: `--model` is a model's name (not with `--state down`,
+  which is about the whole account), a conversation's `--runner`/`--lane` must be a lane the lane map names,
+  and a harness Khipu doesn't know is recorded as unknown.
 - `khipu route hold "<text>" --reason R --until T [--account A | --machine | --all]` adds a hold, and `khipu
   route hold end <id>` ends one.
 - The owner's commands: `khipu route pause <account> [--until T]`, `khipu route lift <account>`, `khipu

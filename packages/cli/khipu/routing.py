@@ -15,7 +15,11 @@ The record lives beside the usage cache:
 An account is a login, keyed as the usage cache keys it (``usage._key``:
 ``<harness>|<absolute login home>``), never a lane. Every entry carries who
 wrote it, set by Khipu and never taken from the writer's say-so, and when, by
-Khipu's clock.
+Khipu's clock. Each line of the log is read on its own, from its bytes, into
+the fields Khipu writes (``_line_event``): one line that is not UTF-8, not
+JSON or not of a shape Khipu writes is counted and left out, and no text in
+any input (a lone surrogate) or object (deep or odd) can stop a read or a
+write.
 
 Every read refolds when an input file changed or the view's ``valid_until``
 has passed, so a limit's end, a hold's end or an entry going stale becomes a
@@ -24,7 +28,8 @@ changes (each account's state, until, scope, basis and disagreement; the
 rules; the note; the holds): who wrote an entry and when are shown but are
 not part of it, so the same report from many conversations does not move it.
 The version is kept in view.json with a random ``epoch``; if that file is
-lost or replaced the count starts again under a new epoch, and ``since``
+lost, replaced or changed by anything but Khipu (it carries a digest of
+itself) the count starts again under a new epoch, and ``since``
 answers a version newer than the current one, or from another epoch, with
 everything (``complete: false``).
 
@@ -211,6 +216,33 @@ def _loads(text):
         return json.loads(text)
     except RecursionError:
         raise ValueError("JSON nested too deeply to read") from None
+
+
+_SURROGATE = re.compile(f"[{chr(0xD800)}-{chr(0xDFFF)}]")
+
+
+def _no_surrogates(text: str) -> str:
+    """``text`` with each lone surrogate replaced by U+FFFD. A JSON escape
+    such as ``\\ud800``, or a name from argv or the environment holding bytes
+    that are not UTF-8, gives one; no UTF-8 file can hold it, so one left in
+    would stop every write of the log and every save of the view."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return _SURROGATE.sub("\ufffd", text)
+    return text
+
+
+def _scrub(value):
+    """``value`` (dicts, lists and text Khipu built) with every lone
+    surrogate replaced, in keys too."""
+    if isinstance(value, str):
+        return _no_surrogates(value)
+    if isinstance(value, dict):
+        return {_no_surrogates(k) if isinstance(k, str) else k: _scrub(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scrub(v) for v in value]
+    return value
 
 
 def _coerce(kind: str, value, key: str):
@@ -457,33 +489,58 @@ def _clean(text, limit: int) -> str:
     return _clip(redact_secrets(_one_line(text))[0], limit)
 
 
-def parse_until(raw: str, now: datetime) -> datetime:
-    """A time the owner or a conversation typed: a length (``30m``, ``in 2h``)
-    or an ISO time; an ISO time with no zone is this Mac's local time. A bare
-    number is refused: "8" could mean 8 seconds, 8 hours or 8 pm."""
+def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime:
+    """A time typed for ``flag``: a length (after ``now``, or before it with
+    ``ago``) or an ISO time; an ISO time with no zone is this Mac's local
+    time. A bare number is refused: "8" could mean 8 seconds, 8 hours or
+    8 pm. A time outside the years Python holds (1 to 9999), with a zone or
+    without one, is refused as a RouteError, never raised as a traceback."""
     text = str(raw or "").strip()
+    if ago:
+        text = re.sub(r"\s+ago$", "", text, flags=re.I)
+    lengths = "10m or 2h (how long ago)" if ago else "30m, 2h or 3d"
     if re.fullmatch(r"(?:in\s+)?\d+(?:\.\d+)?", text, re.I):
-        raise RouteError(f"--until needs a unit: 30m, 2h or 3d (got {raw!r}), or a time such as 2026-10-14T18:52Z")
-    too_far = f"--until is further ahead than Khipu can hold (got {raw!r}); give a time before the year 9999"
+        raise RouteError(f"{flag} needs a unit: {lengths} (got {raw!r}), or a time such as 2026-10-14T18:52Z")
+    ahead = f"{flag} is further ahead than Khipu can hold (got {raw!r}); give a time before the year 9999"
+    back = f"{flag} is further back than Khipu can hold (got {raw!r}); give a time after the year 1"
     try:
         seconds = parse_duration(text)
     except ValueError:
         seconds = None
     if seconds is not None:
         try:
-            return now + timedelta(seconds=seconds)
+            return now - timedelta(seconds=seconds) if ago else now + timedelta(seconds=seconds)
         except OverflowError:
-            raise RouteError(too_far) from None
+            raise RouteError(back if ago else ahead) from None
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
-        raise RouteError(f"--until takes a time (2026-10-14T18:52Z) or a length (30m, 2h, 3d), got {raw!r}") from None
+        raise RouteError(f"{flag} takes a time (2026-10-14T18:52Z) or a length ({lengths}), got {raw!r}") from None
     try:
         if dt.tzinfo is None:
-            dt = dt.astimezone()
+            dt = dt.astimezone()  # this Mac's local time
         return dt.astimezone(timezone.utc).replace(microsecond=0)
-    except OverflowError:
-        raise RouteError(too_far) from None
+    except (OverflowError, ValueError, OSError):
+        # Near the year limits a time with no zone raises ValueError (its
+        # local offset can't be worked out) and one with a zone OverflowError.
+        raise RouteError(ahead if dt.year > 5000 else back) from None
+
+
+def parse_until(raw: str, now: datetime) -> datetime:
+    """A time the owner or a conversation typed for ``--until``: a length
+    (``30m``, ``in 2h``) or an ISO time (see ``_typed_time``)."""
+    return _typed_time(raw, now, "--until")
+
+
+def parse_seen(raw: str, now: datetime) -> datetime:
+    """When a conversation saw a limit message (``--seen``): an ISO time or
+    how long ago (``10m``, ``10m ago``). Never later than now: a time ahead
+    of this Mac's clock by more than ``CLOCK_TOLERANCE`` is refused, and one
+    within it is taken as now."""
+    seen = _typed_time(raw, now, "--seen", ago=True)
+    if (seen - now).total_seconds() > CLOCK_TOLERANCE:
+        raise RouteError(f"--seen is when the limit message was shown, so not later than now (got {raw!r})")
+    return min(seen, now)
 
 
 _RESET_ISO = re.compile(r"\bresets?\s+at\s+(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
@@ -493,36 +550,45 @@ _RESET_CLOCK = re.compile(r"\bresets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]
 _SIGNIN = re.compile(r"not (signed|logged) in|(log|sign) ?in (is )?required|please (log|sign) ?in", re.I)
 
 
-def parse_limit_message(text: str, now: datetime) -> datetime | None:
+def parse_limit_message(text: str, now: datetime, seen: datetime | None = None) -> tuple[datetime | None, bool]:
     """The reset time in a limit message Khipu reads itself, in the two forms
-    the scope names: "resets 8pm (America/New_York)" (the next 8 pm there)
-    and "resets at <ISO time>" (UTC when it names no zone). None otherwise."""
+    the scope names, and whether that time is the message's own.
+    "resets at <ISO time>" (UTC when it names no zone) always is. "resets
+    8pm (America/New_York)" names no day: it is the next 8 pm there after
+    ``seen``, when the message was shown, and the message's own time only
+    then. Without ``seen`` the day is taken from ``now``, which is a guess:
+    a message shown at 7:50 pm and reported at 8:10 pm would land a day
+    late. (None, False) when the message has neither form."""
     if not text:
-        return None
+        return None, False
     m = _RESET_ISO.search(text)
     if m:
-        return _parse(m.group(1).replace(" ", "T"))
+        when = _parse(m.group(1).replace(" ", "T"))
+        return when, when is not None
     m = _RESET_CLOCK.search(text)
     if not m:
-        return None
+        return None, False
     hour, minute, half, zone = int(m.group(1)), int(m.group(2) or 0), m.group(3).lower(), m.group(4)
     if not (1 <= hour <= 12 and 0 <= minute <= 59):
-        return None
+        return None, False
     try:
         from zoneinfo import ZoneInfo
 
         tz = ZoneInfo(zone)
     except (KeyError, ValueError, OSError):
-        return None
+        return None, False
     hour24 = hour % 12 + (12 if half == "p" else 0)
-    local_now = now.astimezone(tz)
-    day = local_now.date()
-    for _ in range(2):
-        cand = datetime(day.year, day.month, day.day, hour24, minute, tzinfo=tz)
-        if cand > local_now:
-            return cand.astimezone(timezone.utc)
-        day = day + timedelta(days=1)
-    return None
+    try:
+        local_then = (seen or now).astimezone(tz)
+        day = local_then.date()
+        for _ in range(2):
+            cand = datetime(day.year, day.month, day.day, hour24, minute, tzinfo=tz)
+            if cand > local_then:
+                return cand.astimezone(timezone.utc), seen is not None
+            day = day + timedelta(days=1)
+    except (OverflowError, ValueError):  # a day past the years Python holds
+        pass
+    return None, False
 
 
 # ---- accounts and authors -----------------------------------------------------------
@@ -756,8 +822,10 @@ def _append_locked(*events: dict) -> None:
     """Append whole lines in one write, then fsync. A torn last line (a full
     disk or a power loss part way through an earlier write) is ended first,
     so it stays one unreadable line, counted in ``bad_lines``, and never
-    swallows the new one."""
-    data = "".join(json.dumps(e, sort_keys=True, ensure_ascii=False) + "\n" for e in events).encode("utf-8")
+    swallows the new one. Lone surrogates (text from argv, the environment
+    or a seed file) are replaced first: UTF-8 can't hold them."""
+    data = "".join(json.dumps(_scrub(e), sort_keys=True, ensure_ascii=False) + "\n"
+                   for e in events).encode("utf-8")
     fd = os.open(events_file(), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         size = os.fstat(fd).st_size
@@ -781,68 +849,142 @@ def _last_written_at() -> datetime | None:
     except OSError:
         return None
     for line in reversed(tail.split(b"\n")):
-        try:
-            event = _loads(line)
-        except ValueError:
-            continue
-        at = _parse(event.get("written_at")) if isinstance(event, dict) else None
-        if at is not None:
-            return at
+        event = _line_event(line) if line.strip() else None
+        if event is not None:
+            return _parse(event["written_at"])
     return None
 
 
-# The type each field has when Khipu writes it. A line with another type (a
-# hand-edited or foreign line: a list for an account, a number for a key)
-# would stop every fold, so it is counted as unreadable and left out.
+# The fields Khipu writes, by the type each has. A line is read into these
+# alone: any other field is dropped, and a line with one of these of another
+# type (a hand-edited or foreign line: a list for an account, a number for a
+# key) would stop every fold, so it is counted as unreadable and left out.
 _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", "basis", "source", "window",
                 "evidence", "until", "written_at", "via", "text", "file", "date", "sha256")
+_TIME_FIELDS = ("written_at", "until")
 _WHOLE_FIELDS = ("n", "count")
+_WHOLE_MOST = 2 ** 53
+_SWITCH_FIELDS = ("message_time", "owner", "seeded")
+_AUTHOR_FIELDS = ("kind", "harness", "project", "session", "name", "file")
+_HOLD_KINDS = ("account", "machine", "all")
 
 
-def _well_formed(event: dict) -> bool:
-    def text_or_none(value) -> bool:
-        return value is None or isinstance(value, str)
+def _log_time(text: str) -> str | None:
+    """A time from a line of the log in the form Khipu writes it (UTC, whole
+    seconds), held within the years Python can hold; None when the text is
+    no time at all."""
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        dt = dt.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        dt = (datetime.max if dt.year > 5000 else datetime.min).replace(tzinfo=timezone.utc)
+    return _iso(dt)
 
-    if not all(text_or_none(event.get(field)) for field in _TEXT_FIELDS):
-        return False
+
+def _checked(data: dict) -> dict | None:
+    """The event Khipu folds from one parsed line: only the fields Khipu
+    writes, each of the type Khipu writes it with, text with any lone
+    surrogate replaced and times in Khipu's form; None when the line is not
+    one Khipu could have written (it is counted as unreadable). A hold's
+    scope keeps only its kind and account, so nothing else in a line, deep
+    or odd, reaches the view."""
+    out: dict[str, Any] = {"type": _no_surrogates(data["type"])}
+    for field in _TEXT_FIELDS:
+        value = data.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            return None
+        out[field] = _no_surrogates(value)
+    for field in _TIME_FIELDS:
+        if field in out:
+            out[field] = _log_time(out[field])
+            if out[field] is None:
+                return None
+    if "written_at" not in out:
+        return None  # every line Khipu writes carries its time
     for field in _WHOLE_FIELDS:
-        value = event.get(field)
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
-            return False
-    scope = event.get("scope")
-    if event["type"] == "hold":
-        if scope is not None and not (isinstance(scope, dict)
-                                      and text_or_none(scope.get("kind")) and text_or_none(scope.get("account"))):
-            return False
-    elif not text_or_none(scope):
-        return False
-    by = event.get("written_by")
-    if by is not None and not (isinstance(by, dict) and all(text_or_none(v) for v in by.values())):
-        return False
-    used = event.get("used_pct")
-    return used is None or (isinstance(used, (int, float)) and not isinstance(used, bool))
+        value = data.get(field)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or abs(value) > _WHOLE_MOST:
+            return None
+        out[field] = value
+    for field in _SWITCH_FIELDS:
+        value = data.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, bool):
+            return None
+        out[field] = value
+    used = data.get("used_pct")
+    if used is not None:
+        if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
+            return None
+        out["used_pct"] = used
+    by = data.get("written_by")
+    if by is not None:
+        if not isinstance(by, dict) or not all(v is None or isinstance(v, str) for v in by.values()):
+            return None
+        out["written_by"] = {k: _no_surrogates(by[k]) for k in _AUTHOR_FIELDS if isinstance(by.get(k), str)}
+    scope = data.get("scope")
+    if scope is not None:
+        if out["type"] != "hold":
+            if not isinstance(scope, str):
+                return None
+            out["scope"] = _no_surrogates(scope)
+        else:
+            kind = scope.get("kind") if isinstance(scope, dict) else None
+            if kind not in _HOLD_KINDS:
+                return None
+            if kind == "account":
+                account = scope.get("account")
+                if not isinstance(account, str) or not account:
+                    return None
+                out["scope"] = {"kind": kind, "account": _no_surrogates(account)}
+            else:
+                out["scope"] = {"kind": kind}
+    return out
+
+
+def _line_event(raw: bytes) -> dict | None:
+    """One line of the log, decoded on its own from its bytes: the checked
+    event (``_checked``), or None when the line is not UTF-8 (a write cut
+    off inside a character), not JSON, nested too deeply to read, has no
+    type or is not one Khipu could have written."""
+    try:
+        data = _loads(raw.decode("utf-8"))
+    except ValueError:  # UnicodeDecodeError is a ValueError
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("type"), str):
+        return None
+    return _checked(data)
 
 
 def read_events() -> tuple[list[dict], int]:
     """Every event in order with its line number (``_seq``), and how many
-    lines could not be read (kept in the file, left out of the fold): not
-    JSON, no type, or a field of a type Khipu never writes."""
+    lines could not be read (kept in the file, left out of the fold). The
+    file is read as bytes and each line decoded on its own, so one line that
+    is not UTF-8, not JSON or not of a shape Khipu writes (``_line_event``)
+    costs that line alone, never the read."""
     try:
-        text = events_file().read_text(encoding="utf-8")
+        data = events_file().read_bytes()
     except OSError:
         return [], 0
     events: list[dict] = []
     bad = 0
-    # split("\n"), not splitlines(): a JSON string may hold U+2028.
-    for line in text.split("\n"):
+    # Split on the newline byte: UTF-8 never uses it inside a character, and
+    # a JSON string may hold U+2028, which splitlines() would cut at.
+    for line in data.split(b"\n"):
         if not line.strip():
             continue
-        try:
-            event = _loads(line)
-        except ValueError:
-            bad += 1
-            continue
-        if not isinstance(event, dict) or not isinstance(event.get("type"), str) or not _well_formed(event):
+        event = _line_event(line)
+        if event is None:
             bad += 1
             continue
         event["_seq"] = len(events)
@@ -1259,24 +1401,39 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
 # ---- the view: refold on read, versions -----------------------------------------------
 
 
+def _digest(view: dict) -> str:
+    """The sha256 of the view as JSON, its own ``digest`` left out."""
+    body = {k: v for k, v in view.items() if k != "digest"}
+    text = json.dumps(body, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
 def _load_view() -> dict | None:
+    """The saved view, or None when there is none Khipu can trust: missing,
+    unreadable, of another schema, or changed since Khipu saved it (its
+    ``digest`` no longer matches). A view edited by hand or by another
+    program is never copied from (its version, its changes) or answered
+    from: the log is refolded instead, as when view.json is lost, and the
+    version count starts again under a new epoch."""
     try:
         data = _loads(view_file().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        if not isinstance(data, dict) or data.get("schema") != SCHEMA or data.get("digest") != _digest(data):
+            return None
+    except (OSError, ValueError, RecursionError):
         return None
-    return data if isinstance(data, dict) and data.get("schema") == SCHEMA else None
+    return data
 
 
 def _save_view(view: dict) -> None:
-    """Write the view to a temp file, fsync it, then replace view.json; a
-    failed save leaves no temp file behind."""
+    """Write the view, with its digest, to a temp file, fsync it, then
+    replace view.json; a failed save leaves no temp file behind."""
     path = view_file()
     tmp: Path | None = None
     try:
         with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, suffix=".tmp",
                                          encoding="utf-8") as fh:
             tmp = Path(fh.name)
-            json.dump(view, fh, indent=1, sort_keys=True, ensure_ascii=False)
+            json.dump(dict(view, digest=_digest(view)), fh, indent=1, sort_keys=True, ensure_ascii=False)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
@@ -1323,13 +1480,18 @@ def _import_seed_locked(events: list[dict], cfg: dict, now: datetime) -> tuple[s
         return f"the rules seed file must be a JSON list; {_SEED_SHAPE}", False
     if not items:
         return "the rules seed file lists no rules; nothing was imported", False
+    def words(item: Any, field: str) -> str:
+        value = item.get(field) if isinstance(item, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            return ""  # never str() of a list or an object, however deep
+        return _no_surrogates(str(value))
+
     rules = []
     for item in items:
         text = item.get("text") if isinstance(item, dict) else item
         if isinstance(text, str) and text.strip():
-            rules.append({"text": text.strip(), "source": str((item.get("source") if isinstance(item, dict)
-                                                               else "") or ""),
-                          "date": str((item.get("date") if isinstance(item, dict) else "") or "")})
+            rules.append({"text": _no_surrogates(text.strip()), "source": words(item, "source"),
+                          "date": words(item, "date")})
     unusable = len(items) - len(rules)
     if unusable:
         return (f"{unusable} of the {len(items)} entries in the rules seed file have no text; nothing was imported "
@@ -1360,7 +1522,10 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
     changed and the view will be saved: an unsaved view keeps the last saved
     version and carries ``saved: false``, and ``since`` answers it with
     everything, so no reader takes an unsaved fold's number as one the
-    record keeps."""
+    record keeps. Every text in it has its lone surrogates replaced first
+    (an account's label in config.json can hold one), so the view can
+    always be saved and compares equal to itself once saved."""
+    body = _scrub(body)
     prev_effective = (prev or {}).get("effective") or {}
     version = int((prev or {}).get("version") or 0)
     changes = list((prev or {}).get("changes") or [])
@@ -1455,9 +1620,9 @@ def _write(event: dict) -> tuple[dict, dict]:
     lines were written and an owner's clear is newer than every report before
     it; a line stamped further ahead than that is ordered by the fold
     (``_in_write_order``), not followed. Once
-    the line is down the write is recorded: a view that can't be saved comes
-    back unsaved (``saved: false``), never as a failure that would make the
-    caller write it again."""
+    the line is down the write is recorded: a view that can't be saved or
+    folded comes back unsaved (``saved: false``), never as a failure that
+    would make the caller write it again."""
     event = dict(event)
     event.setdefault("id", _new_id("e"))
     view: dict | None = None
@@ -1468,17 +1633,16 @@ def _write(event: dict) -> tuple[dict, dict]:
             event["written_at"] = _iso(stamp)
             _append_locked(event)
             appended = True
-            try:
-                view = _refold_locked(stamp)
-            except OSError:
-                view = _unsaved_view(stamp)
-    except OSError as exc:
+            view = _refold_locked(stamp)
+    except Exception as exc:  # noqa: BLE001 - after the append, nothing here may fail the write
         if not appended:
-            raise RouteError(f"Khipu can't write its routing record: {exc}") from exc
+            if isinstance(exc, OSError):
+                raise RouteError(f"Khipu can't write its routing record: {exc}") from exc
+            raise
     if view is None:
         try:
             view = _unsaved_view(_parse(event["written_at"]) or _now())
-        except OSError:
+        except Exception:  # noqa: BLE001 - the line is down: the write is recorded whatever the view does
             view = {"version": None, "saved": False}
     return event, view
 
@@ -1495,8 +1659,8 @@ def _done(written: dict, view: dict, **extra) -> dict:
 
 def report(*, state: str, account: str | None = None, runner: str | None = None, lane: str | None = None,
            until: str | None = None, window: str | None = None, model: str | None = None,
-           message: str | None = None, evidence: str | None = None, author: dict | None = None,
-           via: str = "cli", now: datetime | None = None) -> dict:
+           message: str | None = None, evidence: str | None = None, seen: str | None = None,
+           author: dict | None = None, via: str = "cli", now: datetime | None = None) -> dict:
     """What a conversation learned. Khipu sets the author and the basis: cli
     only when Khipu itself reads a reset time out of the pasted limit message
     and that time is within the window the report names (seven days when it
@@ -1504,6 +1668,12 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
     (five hours when a report with no message time names none) and 30
     minutes (a setting) when omitted. A message time cut down to the window
     is a clamped time: estimated, never shown as the CLI's own.
+
+    A message's clock time with no day ("resets 8pm (America/New_York)") is
+    the message's own time only with ``seen``, when the message was shown:
+    it is the next 8 pm after that. Without it the day is a guess (the next
+    8 pm after the report), so the report is estimated, its ``until`` taken
+    over that guess when given.
 
     Only structured values reach other conversations, so the fields that are
     pushed take no free text: ``model`` is a model name, and a runner's lane
@@ -1530,6 +1700,11 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
         if state == DOWN:
             raise RouteError("down is about the whole account: leave out --model (a model's own limit is "
                              "--state limited --model M)")
+    seen_at = None
+    if seen is not None and str(seen).strip():
+        if not (message and message.strip()):
+            raise RouteError("--seen is when the limit message was shown: give the message too (--message)")
+        seen_at = parse_seen(seen, now)
     key = resolve_account(account, conversation=True) if account else None
     event: dict[str, Any] = {"type": "evidence", "source": "report", "state": state, "via": via,
                              "written_by": author or conversation_author()}
@@ -1552,15 +1727,20 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
     if line and _one_line(line):
         event["evidence"] = _clean(line, EVIDENCE_MAX)
     if state == LIMITED:
-        parsed = parse_limit_message(message or "", now)
-        if parsed is not None:
+        parsed, own = parse_limit_message(message or "", now, seen_at)
+        if parsed is not None and own:
             cap = WINDOW_SECONDS.get(window_key or "weekly")
             event.update(basis="cli", message_time=True)
             stop = parsed
         else:
             cap = WINDOW_SECONDS.get(window_key or "five_hour")
             event["basis"] = "estimated"
-            stop = parse_until(until, now) if until else _after(now, cfg["routing_report_default_limit"] or 1800)
+            if until:
+                stop = parse_until(until, now)
+            elif parsed is not None:  # a clock time with no day: the next one after now, a guess
+                stop = parsed
+            else:
+                stop = _after(now, cfg["routing_report_default_limit"] or 1800)
         longest = _after(now, cap)
         if stop > longest:
             # Cut down to the window: a time no message gives is a guess,
@@ -2156,6 +2336,7 @@ def run_cli(args) -> int:
                 out["accounts"] = [dict(e, line=account_line(e, now, push=False)) for e in view["accounts"]
                                    if account is None or e["key"] == account]
                 out.pop("fingerprint", None)
+                out.pop("digest", None)
                 _print_json(out)
             else:
                 _print_view(view, now, account)
@@ -2163,7 +2344,8 @@ def run_cli(args) -> int:
         if cmd == "report":
             out = report(state=args.state, account=args.account, runner=args.runner, lane=args.lane,
                          until=args.until, window=args.window, model=args.model, message=args.message,
-                         evidence=args.evidence, author=conversation_author(name=args.name), now=now)
+                         evidence=args.evidence, seen=getattr(args, "seen", None),
+                         author=conversation_author(name=args.name), now=now)
             _print_json(out)
             return 0
         if cmd == "hold":
