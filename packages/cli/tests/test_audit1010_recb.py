@@ -312,10 +312,16 @@ class TopicHitsReadFailureTest(unittest.TestCase):
         checkpoint.assert_not_called()
 
 
+def recall_rule_ceiling() -> int:
+    from tests.test_recall_rule import RULE_MD_CEILING
+
+    return RULE_MD_CEILING
+
+
 class RuleDescriptionTruthTest(unittest.TestCase):
     def test_forget_text_names_current_retention_limits_and_fits_ceiling(self):
         self.assertIn("graph-derived data", recall_rule.RULE_MD)
         self.assertIn("closed commitments remain", recall_rule.RULE_MD)
         self.assertIn("backup copies are retained", recall_rule.RULE_MD)
-        self.assertLess(len(recall_rule.RULE_MD.strip()), 5200)
+        self.assertLess(len(recall_rule.RULE_MD.strip()), recall_rule_ceiling())
 

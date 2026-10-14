@@ -26,7 +26,7 @@ can see and change all of it in the app. Khipu never decides where work goes.
 | 0 | This scope; the mocks of the Home Routing card and Settings → Routing; a throwaway-hook check of five hook facts | S | done 2026-10-14 (scope and mocks approved; hook check: five of five yes, see Phase 0 results) |
 | 1a | The record and its fold: event log, versioned view with clock-driven refolds, rules, Matt's note, holds, owner clear; `khipu route`; the doctor block | M | done 2026-10-14 (one known limit, see Known limits; its fix is in phase 1b) |
 | 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | built, in review (branch feat/routing-truth-1b) |
-| 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | open |
+| 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | built, in review (branch feat/routing-truth-2) |
 | 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | open |
 | 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | open |
 | 3c | The daemon refolds on change and on the clock; the promotion gate's replay covers routing | S | open |

@@ -1968,7 +1968,7 @@ def cmd_usage(args: argparse.Namespace) -> int:
 
 def cmd_route(args: argparse.Namespace) -> int:
     """`khipu route`: the routing record (scope docs/plans/2026-10-14-routing-truth.md,
-    phase 1a). Khipu reports which accounts are open, by whom and since when;
+    phases 1a to 2). Khipu reports which accounts are open, by whom and since when;
     it never chooses, refuses, launches or reorders work."""
     from khipu import routing
 
@@ -4553,6 +4553,15 @@ def build_parser() -> argparse.ArgumentParser:
     rnote.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     rt_sub.add_parser("sources", help="Each job runner folder with its last good read and any error",
                       parents=[rt_json])
+    rwait = rt_sub.add_parser(
+        "wait", parents=[rt_json],
+        help="Wait until an account is open; exits 0 then, 1 at the timeout (it waits; it launches nothing)")
+    rwait.add_argument("account", help="The account (its label, or harness|login folder)")
+    rwait.add_argument("--confirmed", action="store_true",
+                       help="Only once Khipu itself has read it open (a usage probe or a reset check), "
+                            "not when its limit's time has merely passed")
+    rwait.add_argument("--timeout", default=None, metavar="S",
+                       help="Give up after S seconds (or 30m, 2h); default: no end")
     rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire or confirm a standing rule", parents=[rt_json])
     rrule.add_argument("action", choices=("add", "edit", "retire", "confirm"))
     rrule.add_argument("params", nargs="*")
