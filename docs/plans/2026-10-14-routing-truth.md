@@ -25,7 +25,7 @@ can see and change all of it in the app. Khipu never decides where work goes.
 |---|---|---|---|
 | 0 | This scope; the mocks of the Home Routing card and Settings → Routing; a throwaway-hook check of five hook facts | S | done 2026-10-14 (scope and mocks approved; hook check: five of five yes, see Phase 0 results) |
 | 1a | The record and its fold: event log, versioned view with clock-driven refolds, rules, Matt's note, holds, owner clear; `khipu route`; the doctor block | M | done 2026-10-14 (one known limit, see Known limits; its fix is in phase 1b) |
-| 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | open |
+| 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | built, in review (branch feat/routing-truth-1b) |
 | 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | open |
 | 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | open |
 | 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | open |
@@ -905,7 +905,28 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
 
 ## Known limits
 
-- **A Mac clock that reads low for a while (phase 1a, accepted by Matt 2026-10-14).** The fold decides which
+- **A record that starts ahead of the clock (phase 1b).** When the record's first two or more lines came from
+  a Mac whose clock read ahead, a Mac whose clock reads before all of them takes the newest line's time,
+  keeping its own reading beside it (`clock_at`), until its clock passes the record's first line; doctor then
+  names that Mac's lines as the ones with the wrong date, and also warns that the record holds times ahead of
+  this Mac's clock. It is the mirror of the fixed limit below, and times alone cannot tell the two apart. A
+  clock behind only part of the record (some lines written before it) is not affected: those lines keep the
+  phase 1a handling.
+- **A clock that reads low, but not before the record began (phase 1a handling kept).** A Mac whose clock is
+  more than `CLOCK_TOLERANCE` behind writes its own time when the record holds lines written before that time.
+  If such a run is longer than the lines written in the stretch it is behind, the fold still keeps the low
+  run, as in phase 1a. The case the phase 1a limit describes (a clock reading 2001, behind every line) is fixed.
+
+## Fixed limits
+
+- **A Mac clock that reads low for a while (phase 1a, accepted by Matt 2026-10-14; fixed in phase 1b).**
+  Fixed by settling each line when it is written: the writer holds the log lock, sees the record, and records
+  a sequence number (`seq`) with its line, which the fold orders by; when the writer's clock reads more than
+  `CLOCK_TOLERANCE` before every line of a record of two lines or more, its line takes the newest line's time
+  and keeps the clock's reading in `clock_at`, and doctor names it from that reading. Lines without `seq`
+  (written by phase 1a) keep their handling. Proved by `test_a_run_of_lines_from_a_clock_reading_2001_never_ages_the_history`
+  (N = 0, 1 and 10: the history keeps its times for every N, and doctor names the 2001 lines, never the T0
+  lines). The text as accepted: The fold decides which
   out-of-order line has the wrong time from the log alone. When a Mac writes a run of lines while its clock is
   more than `CLOCK_TOLERANCE` (5 minutes) behind, and that run is longer than the history written before it,
   the fold keeps the low run and reads the earlier history as old: reports show as Unknown, an owner hold
@@ -919,8 +940,17 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
 - Two edges of the phase 0 hook check. The desktop wakes and typed prompts that left no hook-context
   attachment (about a third): probably a hook that printed nothing, not shown. And whether Codex's live user
   hooks also ran during the scratch runs, since `--ignore-user-config` was used.
-- Whether the runner-basis rule (zero seconds, not exactly 30 minutes) holds for project B's copy of
-  `lanes.py`, which differs from project A's.
+- Checked 2026-10-14 (phase 1b): the runner-basis rule holds for project B's copy of `lanes.py` (the copy with
+  the newest heartbeat). Its `limit_until`, `LIMIT_SECONDS`, `LIMIT_MAX_REST`, `iso` and LIMITED line format
+  are the same as project A's; the two differ only in verdict hedging and the `confirm_lane` handling. One
+  correction to the rule as written: both copies take the 30-minute rest from one clock reading and stamp the
+  LIMITED line from a later one, both cut to whole seconds, so the guess lands up to a few seconds short of
+  30 minutes (a real line: 03:09:03 with until 03:39:02). Khipu reads a gap within 5 seconds of 30 minutes as
+  the guess. Project B's folder keeps the same layout (`events.log`, `config.json`, `state/global.json`,
+  `state/heartbeat.json`), with a 30-second heartbeat interval against project A's 20.
+- Which standing rules doctor watches is read from the rules' own words (phase 1b): "-fast", "xAI", Grok with
+  privacy or safety, and Grok with a re-check or another model family. A rule worded otherwise is not watched;
+  the app's "Watched" mark (phase 4) should show this to Matt.
 - Whether Grok Build's PreToolUse context reaches its model in headless runs.
 - What Muse reads at start, and whether it sees the table at all.
 - Whether `~/.grok` and `~/.grok-dispatch` are two logins on one Grok plan. If they are, they share one limit,

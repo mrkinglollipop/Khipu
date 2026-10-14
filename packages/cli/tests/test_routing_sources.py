@@ -1,0 +1,501 @@
+"""khipu.routing_sources, phase 1b of docs/plans/2026-10-14-routing-truth.md:
+the job runner adapter (read only), the lane map, the usage cache source,
+silent and unreadable runners, the table pointer, and write order settled
+when a line is written.
+
+Hermetic: each test gets its own data dir and a fake clock, and copies the
+runner fixtures (tests/fixtures/routing, shaped like a real lanes runner's
+files with every name changed) into its own temp folder.
+"""
+from __future__ import annotations
+
+import builtins
+import hashlib
+import io
+import json
+import os
+import shutil
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from khipu import routing, routing_sources
+
+FIXTURES = Path(__file__).parent / "fixtures" / "routing"
+T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
+ACCOUNTS = [{"label": "Claude", "harness": "claude"},
+            {"label": "Claude second", "harness": "claude", "home": "/logins/claude-second"},
+            {"label": "Codex", "harness": "codex"},
+            {"label": "Grok", "harness": "grok"},
+            {"label": "Muse", "harness": "muse"}]
+SECOND = "claude|/logins/claude-second"
+LANES_A = {"second": "Claude second", "main": "Claude", "codex": "Codex", "grok": "Grok", "grokcheck": "Grok",
+           "muse": "Muse"}
+LANES_B = {"second": "Claude second", "second-sonnet": "Claude second", "codex": "Codex", "grok": "Grok"}
+
+
+class Clock:
+    def __init__(self, start: datetime):
+        self.now = start
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **kw) -> datetime:
+        self.now = self.now + timedelta(**kw)
+        return self.now
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    runners = tmp_path / "runners"
+    shutil.copytree(FIXTURES / "lanes-a", runners / "project-a")
+    shutil.copytree(FIXTURES / "lanes-b", runners / "project-b")
+    (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS}))
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
+    clock = Clock(T0)
+    monkeypatch.setattr(routing, "_now", clock)
+    return {"data": data, "clock": clock, "tmp": tmp_path, "a": runners / "project-a", "b": runners / "project-b"}
+
+
+def _set(home, **values) -> None:
+    path = home["data"] / "config.json"
+    config = json.loads(path.read_text())
+    config.update(values)
+    path.write_text(json.dumps(config))
+
+
+def _register(home, *, b: bool = False, lanes_a: dict | None = None, lanes_b: dict | None = None) -> None:
+    sources = [{"name": "project A", "kind": "lanes", "path": str(home["a"])}]
+    lane_map = {"project A": LANES_A if lanes_a is None else lanes_a}
+    if b:
+        sources.append({"name": "project B", "kind": "lanes", "path": str(home["b"])})
+        lane_map["project B"] = LANES_B if lanes_b is None else lanes_b
+    _set(home, routing_sources=sources, routing_lane_map=lane_map)
+
+
+def _account(view: dict, key: str) -> dict:
+    return next(a for a in view["accounts"] if a["key"] == key)
+
+
+def _beat(folder: Path, at: datetime, interval: float = 20.0) -> None:
+    (folder / "state" / "heartbeat.json").write_text(json.dumps(
+        {"pid": 1, "time": at.timestamp(), "at": routing._iso(at), "interval": interval, "error": None}))
+
+
+def _append(folder: Path, line: str) -> None:
+    with open(folder / "events.log", "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def _usage(home, rows: dict) -> None:
+    path = home["data"] / "state" / "usage.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 2, "rows": rows}))
+
+
+def _row(at: datetime, windows: list[dict], **kw) -> dict:
+    row = {"ok": True, "windows": windows, "probed_at": routing._iso(at), "last_attempt_at": routing._iso(at),
+           "last_good_at": routing._iso(at), "source": "live", "error": None}
+    row.update(kw)
+    return row
+
+
+# ---- the runner fixtures ---------------------------------------------------------------
+
+
+def test_a_muse_guess_and_a_second_account_line_with_a_parsed_time(home):
+    _register(home)
+    view = routing.read_view()
+    muse = _account(view, "muse|")
+    assert (muse["state"], muse["basis"], muse["until"]) == ("limited", "estimated", "2026-10-14T15:20:02Z")
+    second = _account(view, SECOND)
+    assert (second["state"], second["basis"], second["until"]) == ("limited", "cli", "2026-10-14T17:52:00Z")
+    assert second["witness"]["source"] == "runner" and second["witness"]["message_time"] is True
+    assert "time from Claude's message, seen by project A lanes (read by Khipu)" in routing.account_line(second, T0)
+    assert "back about 15:20Z" in routing.account_line(muse, T0) and "a guess" in routing.account_line(muse, T0)
+    # The basis rule, on the real shapes: a 30-minute rest cut to whole
+    # seconds lands a second short of 30 minutes, and is still the guess.
+    at = datetime(2026, 10, 14, 3, 9, 3, tzinfo=timezone.utc)
+    assert routing_sources.runner_basis(at, datetime(2026, 10, 14, 3, 39, 2, tzinfo=timezone.utc)) == "estimated"
+    assert routing_sources.runner_basis(T0, T0 + timedelta(minutes=30)) == "estimated"
+    assert routing_sources.runner_basis(T0 + timedelta(seconds=13), T0 + timedelta(hours=2, minutes=52)) == "cli"
+    # Every evidence line kept is the runner's line, redacted and clipped.
+    assert second["witness"]["evidence"].startswith("pipe-12 LIMITED lane=second until=2026-10-14T17:52:00Z")
+
+
+def test_a_probe_at_100_percent_replaces_a_runners_guess(home):
+    _register(home)
+    assert _account(routing.read_view(), "muse|")["basis"] == "estimated"
+    resets = T0 + timedelta(days=2)
+    _usage(home, {"muse|": _row(T0 - timedelta(minutes=2), [
+        {"name": "weekly", "used_pct": 100.0, "resets_at": routing._iso(resets), "window_mins": 10080}],
+        source="last_observed", observed_at=routing._iso(T0 - timedelta(minutes=2)))})
+    muse = _account(routing.read_view(), "muse|")
+    assert (muse["state"], muse["basis"], muse["until"]) == ("limited", "cli", routing._iso(resets))
+    assert muse["witness"]["source"] == "probe" and muse["witness"]["observed"] is True
+    assert "read from Muse's last turn" in routing.account_line(muse, T0)
+
+
+def test_a_later_probe_with_headroom_reopens(home):
+    _register(home)
+    windows = [{"name": "five_hour", "used_pct": 40.0, "resets_at": routing._iso(T0 + timedelta(hours=2))}]
+    # A probe from before the limit was seen does not end it.
+    _usage(home, {SECOND: _row(T0 - timedelta(hours=2), windows)})
+    assert _account(routing.read_view(), SECOND)["state"] == "limited"
+    home["clock"].advance(minutes=5)
+    _usage(home, {SECOND: _row(T0 + timedelta(minutes=4), windows)})
+    second = _account(routing.read_view(), SECOND)
+    assert (second["state"], second["witness"]["source"]) == ("open", "probe")
+    assert routing.account_line(second, home["clock"].now).startswith("Claude second: open; read from Claude 1 min ago")
+
+
+def test_two_lanes_on_one_account_close_together(home):
+    _register(home, b=True)
+    _append(home["a"], "2026-10-14T14:58:00Z pipe-20 LIMITED lane=grokcheck until=2026-10-14T20:02:00Z "
+                       "job=check-20 (account limit reached); the check step is retried later")
+    view = routing.read_view()
+    grok = _account(view, "grok|")
+    assert (grok["state"], grok["until"]) == ("limited", "2026-10-14T20:02:00Z")
+    assert view["unmatched"] == []
+    # Project A's and project B's "second" lanes are one Claude account: one line, the newest sighting.
+    seconds = [a for a in view["accounts"] if a["key"] == SECOND]
+    assert len(seconds) == 1 and seconds[0]["witness"]["written_by"] == {"kind": "runner", "name": "project B"}
+    # B launched on that account after A had seen its limit: doctor says so.
+    assert "A job was started on Claude second after it had reached its limit." in \
+        routing.doctor_block()["warnings"]
+
+
+def test_a_limit_from_an_unmatched_lane_is_reported_and_never_guessed(home):
+    _register(home, lanes_a={k: v for k, v in LANES_A.items() if k != "second"})
+    view = routing.read_view()
+    assert [(u["runner"], u["lane"]) for u in view["unmatched"]] == [("project A", "second")]
+    assert _account(view, SECOND)["state"] == "unknown"
+    assert "A limit came from project A's second lane, which isn't matched to an account." in \
+        routing.doctor_block()["warnings"]
+    runner = view["sources"]["runners"][0]
+    assert runner["unmatched_lanes"] == ["second"]
+
+
+def test_a_runner_file_that_fails_to_parse_is_reported_with_its_last_good_read(home, capsys):
+    # The second account's limit is known from global.json alone (its LIMITED line is not in the tail).
+    lines = (home["a"] / "events.log").read_text().splitlines()
+    (home["a"] / "events.log").write_text("\n".join(x for x in lines if "pipe-12 LIMITED" not in x) + "\n")
+    _register(home)
+    assert _account(routing.read_view(), SECOND)["state"] == "limited"
+    home["clock"].advance(minutes=1)
+    (home["a"] / "state" / "global.json").write_text("{not json")
+    (home["a"] / "state" / "heartbeat.json").write_text("[]")
+    view = routing.read_view()
+    second = _account(view, SECOND)
+    assert (second["state"], second["until"]) == ("limited", "2026-10-14T17:52:00Z")  # the last good read
+    runner = view["sources"]["runners"][0]
+    assert runner["unreadable"] and not runner["silent"]  # the last good heartbeat still counts
+    assert runner["files"]["global"] == {"error": "not readable JSON", "good_at": "2026-10-14T15:00:00Z",
+                                         "since": "2026-10-14T15:01:00Z"}
+    assert "Khipu can't read project A's files since 15:01Z." in routing.doctor_block()["warnings"]
+    change = view["changes"][-1]
+    assert "runner:project A" in change["entities"]
+    assert routing.run_cli(_args(route_cmd="sources")) == 0
+    out = capsys.readouterr().out
+    assert "global: can't read it (not readable JSON) since 15:01Z; last good read 15:00Z" in out
+    # Fixed: read again.
+    shutil.copy(FIXTURES / "lanes-a" / "state" / "global.json", home["a"] / "state" / "global.json")
+    _beat(home["a"], home["clock"].now)
+    assert not routing.read_view()["sources"]["runners"][0]["unreadable"]
+
+
+def test_a_cleared_runner_limit_stays_cleared_until_the_runner_writes_a_newer_limited_line(home):
+    _register(home)
+    assert _account(routing.read_view(), SECOND)["state"] == "limited"
+    home["clock"].advance(minutes=1)
+    routing.clear("Claude second", via="app")
+    assert _account(routing.read_view(), SECOND)["state"] == "open"
+    home["clock"].advance(minutes=1)
+    _beat(home["a"], home["clock"].now)  # the runner keeps rewriting its files: nothing new about the limit
+    (home["a"] / "state" / "global.json").write_text((home["a"] / "state" / "global.json").read_text() + " ")
+    second = _account(routing.read_view(), SECOND)
+    assert (second["state"], second["witness"]["cleared"]) == ("open", True)
+    home["clock"].advance(minutes=1)
+    _append(home["a"], "2026-10-14T15:03:00Z pipe-21 LIMITED lane=second until=2026-10-14T19:52:00Z "
+                       "job=fix-21 (account limit reached); the fix step is retried later")
+    second = _account(routing.read_view(), SECOND)
+    assert (second["state"], second["until"]) == ("limited", "2026-10-14T19:52:00Z")
+
+
+def test_a_stale_heartbeat_makes_an_account_unknown_when_the_runner_is_its_only_source(home):
+    _register(home)
+    view = routing.read_view()
+    assert _account(view, SECOND)["state"] == "limited"
+    assert view["valid_until"] == "2026-10-14T15:01:30Z"  # 14:59:50 plus five 20-second intervals
+    home["clock"].now = T0 + timedelta(minutes=2)
+    view = routing.read_view()  # no file changed: the clock alone
+    second = _account(view, SECOND)
+    assert second["state"] == "unknown" and second["last_seen"]["state"] == "limited"
+    assert "runner:project A" in view["changes"][-1]["entities"]
+    assert "Your project A job runner stopped reporting at 14:59Z" in view["changes"][-1]["lines"]
+    assert "Your project A job runner stopped reporting at 14:59Z." in routing.doctor_block()["warnings"]
+    # With another source for the account, the runner's limit still counts.
+    _usage(home, {SECOND: _row(T0 - timedelta(hours=3), [{"name": "five_hour", "used_pct": 10.0,
+                                                          "resets_at": routing._iso(T0)}])})
+    assert _account(routing.read_view(), SECOND)["state"] == "limited"
+
+
+def test_a_source_path_under_a_credential_folder_is_refused(home, monkeypatch):
+    keys = home["tmp"] / "API Keys" / "runner"
+    shutil.copytree(FIXTURES / "lanes-a", keys)
+    portfolio = home["tmp"] / "My Portfolio" / "runner"
+    shutil.copytree(FIXTURES / "lanes-a", portfolio)
+    link = home["tmp"] / "linked-runner"
+    link.symlink_to(portfolio)
+    # A file inside a registered folder that resolves into one is refused too.
+    (home["b"] / "state" / "global.json").unlink()
+    (home["b"] / "state" / "global.json").symlink_to(keys / "state" / "global.json")
+    # Written by hand: `khipu config` would refuse the first two.
+    _set(home, routing_sources=[{"name": "keys", "kind": "lanes", "path": str(keys)},
+                                {"name": "linked", "kind": "lanes", "path": str(link)},
+                                {"name": "project B", "kind": "lanes", "path": str(home["b"])}],
+         routing_lane_map={"project B": LANES_B})
+    opened: list[str] = []
+    real_open = os.open
+
+    def spy(path, flags, *a, **kw):
+        opened.append(os.path.realpath(os.fspath(path)))
+        return real_open(path, flags, *a, **kw)
+
+    monkeypatch.setattr(os, "open", spy)
+    view = routing.read_view()
+    assert view["sources"]["refused"] == ["keys", "linked"]
+    assert [r["name"] for r in view["sources"]["runners"]] == ["project B"]
+    assert view["sources"]["runners"][0]["files"]["global"]["error"] == "not allowed to read it"
+    assert not any("API Keys" in p or "My Portfolio" in p for p in opened)
+    assert "A job runner folder was refused because it is inside a private folder." in \
+        routing.doctor_block()["warnings"]
+    assert _account(view, SECOND)["state"] == "limited"  # project B's own events.log still counts
+
+
+def _snapshot(folder: Path) -> dict:
+    return {str(p.relative_to(folder)): (p.stat().st_mtime_ns,
+                                         hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None)
+            for p in sorted(folder.rglob("*"))}
+
+
+def _args(**kw):
+    import argparse
+
+    base = {"route_cmd": None, "json": False, "since": None, "summary": False, "brief": False, "view_account": None}
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_every_runner_file_is_opened_read_only(home, monkeypatch, capsys):
+    _register(home, b=True)
+    routing.add_rule("Never a -fast tier.", via="app")
+    folders = [str(home["a"]), str(home["b"])]
+    before = {f: _snapshot(Path(f)) for f in folders}
+    calls: list[tuple[str, object]] = []
+    real_os_open, real_open, real_io_open = os.open, builtins.open, io.open
+
+    def inside(path) -> bool:
+        try:
+            text = os.path.realpath(os.fspath(path))
+        except TypeError:
+            return False
+        return any(text.startswith(os.path.realpath(f)) for f in folders)
+
+    def spy_os_open(path, flags, *a, **kw):
+        if inside(path):
+            calls.append((os.fspath(path), flags))
+        return real_os_open(path, flags, *a, **kw)
+
+    def spy_open(file, mode="r", *a, **kw):
+        if not isinstance(file, int) and inside(file):
+            calls.append((os.fspath(file), mode))
+        return real_open(file, mode, *a, **kw)
+
+    monkeypatch.setattr(os, "open", spy_os_open)
+    monkeypatch.setattr(builtins, "open", spy_open)
+    monkeypatch.setattr(io, "open", spy_open)
+    routing.read_view()
+    routing.doctor_block()
+    assert routing.run_cli(_args(route_cmd="sources", json=True)) == 0
+    home["clock"].advance(minutes=3)  # a refold after the heartbeat went quiet
+    routing.read_view()
+    monkeypatch.setattr(io, "open", real_io_open)
+    assert calls, "the runner files were never read"
+    write_bits = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+    for path, how in calls:
+        if isinstance(how, int):
+            assert how & write_bits == 0, path
+            assert how & os.O_ACCMODE == os.O_RDONLY, path
+        else:
+            assert not set(how) & set("wax+"), path
+    assert {f: _snapshot(Path(f)) for f in folders} == before  # nothing written, locked or left behind
+    capsys.readouterr()
+
+
+def test_a_config_key_outside_the_named_list_never_reaches_the_record(home, capsys):
+    _register(home, b=True)
+    routing.add_rule("Never a -fast tier.", via="app")
+    view = routing.read_view()
+    kept = view["source_cache"]["runners"]["project A"]["config"]["data"]
+    assert set(kept) == {"lanes", "check_lane", "fix_lanes"}
+    assert all(set(spec) == {"kind", "model", "launch", "confirm_lane"} for spec in kept["lanes"].values())
+    texts = [routing.view_file().read_text(), routing.events_file().read_text(),
+             json.dumps(routing.doctor_block())]
+    for argv in (_args(json=True), _args(route_cmd="sources", json=True), _args(summary=True)):
+        assert routing.run_cli(argv) == 0
+        texts.append(capsys.readouterr().out)
+    assert not any("CANARY" in text for text in texts)
+
+
+def test_a_pasted_secret_in_a_runner_line_is_redacted(home):
+    _register(home)
+    secret = "sk-ant-api03-" + "x" * 40
+    _append(home["a"], f"2026-10-14T14:59:00Z pipe-30 LIMITED lane=main until=2026-10-14T16:00:00Z "
+                       f"job=fix-30 (account limit reached: key {secret})")
+    view = routing.read_view()
+    assert secret not in routing.view_file().read_text()
+    assert _account(view, "claude|")["state"] == "limited"
+
+
+# ---- the usage cache --------------------------------------------------------------------
+
+
+def test_the_usage_cache_gives_model_scoped_limits_and_down(home):
+    resets = T0 + timedelta(days=2)
+    _usage(home, {
+        "claude|": _row(T0 - timedelta(minutes=1), [
+            {"name": "five_hour", "used_pct": 20.0, "resets_at": routing._iso(T0 + timedelta(hours=3))},
+            {"name": "weekly", "used_pct": 60.0, "resets_at": routing._iso(resets)},
+            {"name": "weekly_opus", "used_pct": 100.0, "resets_at": routing._iso(resets), "model": "Opus"}]),
+        "codex|": {"ok": False, "error": "not_signed_in", "last_error": "not_signed_in", "windows": [],
+                   "probed_at": routing._iso(T0), "last_attempt_at": routing._iso(T0)},
+    })
+    view = routing.read_view()
+    assert view["record"] is True
+    claude = _account(view, "claude|")
+    assert claude["state"] == "open" and [m["model"] for m in claude["models"]] == ["Opus"]
+    line = routing.account_line(claude, T0)
+    assert "Opus limit reached, back at Fri 15:00Z" in line and "(other models open)" in line
+    codex = _account(view, "codex|")
+    assert (codex["state"], codex["reason"]) == ("down", "not signed in")
+
+
+# ---- the table pointer --------------------------------------------------------------------
+
+
+def _table(path: Path, body: str, stamp: str) -> None:
+    path.write_text(f"# Routing now\n\n## NOW\n```\nupdated: {stamp} by an orchestrator\n{body}\n```\n\n"
+                    "## Change log\n- an entry\n")
+
+
+def test_the_table_pointer_moves_the_version_and_never_carries_its_prose(home):
+    table = home["tmp"] / "routing-table.md"
+    _table(table, "PROSE-MARKER lane order one", "2026-10-14 13:48Z")
+    _set(home, routing_table=str(table))
+    view = routing.read_view()
+    first = view["version"]
+    assert routing.summary(view, now=T0)["text"].splitlines()[1] == (
+        "These account lines are newer than the routing table's account rows; the table's NOW block was "
+        "last stamped 13:48Z, 1 h 12 min ago.")
+    home["clock"].advance(minutes=5)
+    routing.read_view()
+    assert routing.read_view()["version"] == first  # nothing changed
+    _table(table, "PROSE-MARKER lane order two", "2026-10-14 15:04Z")
+    view = routing.read_view()
+    assert view["version"] == first + 1 and view["changes"][-1]["entities"] == ["table"]
+    line = view["changes"][-1]["lines"][0]
+    assert line.startswith("The routing table's NOW block changed at ")
+    assert line.endswith("(stamped 'updated: 2026-10-14 15:04Z by an orchestrator').")
+    assert "PROSE-MARKER" not in routing.view_file().read_text()
+
+
+# ---- write order, settled when a line is written (the phase 1a known limit) -----------------
+
+
+@pytest.mark.parametrize("n", [0, 1, 10])
+def test_a_run_of_lines_from_a_clock_reading_2001_never_ages_the_history(home, n):
+    clock = home["clock"]
+    routing.report(account="Claude", state="open", author={"kind": "conversation", "harness": "claude_code"})
+    clock.advance(minutes=1)
+    routing.add_hold("keep Codex", reason="keep", scope="account", account="Codex", owner=True, via="app")
+    clock.now = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    for _ in range(3):
+        routing.report(account="Muse", state="open", author={"kind": "conversation", "harness": "codex"})
+    for i in range(n):
+        clock.now = T0 + timedelta(minutes=10 + i)
+        routing.report(account="Codex", state="open", author={"kind": "conversation", "harness": "codex"})
+    events, _bad = routing.read_events()
+    assert [e["seq"] for e in events] == list(range(len(events)))
+    assert routing._in_write_order(events)[0]["written_at"] == routing._iso(T0)  # the history keeps its times
+    assert routing._in_write_order(events)[1]["written_at"] == routing._iso(T0 + timedelta(minutes=1))
+    clock.now = T0 + timedelta(minutes=30)
+    view = routing.read_view()
+    assert _account(view, "claude|")["state"] == "open"
+    assert _account(view, "claude|")["witness"]["at"] == routing._iso(T0)
+    assert view["holds"][0]["remind"] is False
+    warnings = routing.doctor_block()["warnings"]
+    assert any("dated well before" in w and "2001-01-01T00:00:00Z" in w for w in warnings), warnings
+    assert not any("dated well after" in w for w in warnings), warnings
+
+
+def test_the_fold_orders_lines_by_their_sequence_number(home):
+    for account in ("Claude", "Codex"):
+        routing.report(account=account, state="open", author={"kind": "conversation", "harness": "codex"})
+        home["clock"].advance(minutes=1)
+    path = routing.events_file()
+    lines = path.read_text().splitlines()
+    path.write_text("\n".join(reversed(lines)) + "\n")  # a copy that came back out of order
+    events, _bad = routing.read_events()
+    assert [e["seq"] for e in events] == [0, 1] and [e["_seq"] for e in events] == [0, 1]
+    # A line with no sequence number (phase 1a) keeps its place in the file.
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "evidence", "id": "old", "source": "report", "state": "open",
+                             "account": "muse|", "written_at": routing._iso(T0)}) + "\n")
+    events, _bad = routing.read_events()
+    assert [e.get("seq") for e in events] == [0, 1, None]
+    routing.report(account="Muse", state="limited", until="1h", author={"kind": "conversation", "harness": "codex"})
+    assert routing.read_events()[0][-1]["seq"] == 2
+
+
+# ---- doctor's checks from the runner files ------------------------------------------------
+
+
+def test_doctor_checks_watched_rules_against_runner_settings_and_never_passes_what_it_cannot_see(home):
+    _register(home)
+    assert routing.doctor_block()["rule_checks"] == []  # no rules: nothing is watched (the public default)
+    for text in ("Grok never builds or fixes privacy or safety code.",
+                 "Every Grok result that is acted on gets a re-check from a different model family.",
+                 "Never a -fast tier.", "Never the paid xAI API."):
+        routing.add_rule(text, via="app")
+    config = json.loads((home["a"] / "config.json").read_text())
+    config["lanes"]["codex"]["model"] = "gpt-6.1-sol-fast"
+    del config["lanes"]["grokcheck"]["confirm_lane"]
+    (home["a"] / "config.json").write_text(json.dumps(config))
+    _append(home["a"], "2026-10-14T14:59:30Z pipe-40 ADDED branch=project-a/private-thing stage=built "
+                       "check_lane=codex fix_lanes=grok,second max_checks=3 privacy")
+    block = routing.doctor_block()
+    broken = [c["text"] for c in block["rule_checks"] if c["status"] == "broken"]
+    assert broken == [
+        "A standing rule may be broken: project A's settings name a model ending in -fast for its codex lane.",
+        "A standing rule may be broken: project A's Grok check lane has no confirming lane from another model "
+        "family.",
+        "A standing rule may be broken: a Grok lane is set to work on pipe-40, which is marked private."]
+    assert all(text in block["warnings"] for text in broken)
+    unseen = [c["text"] for c in block["rule_checks"] if c["status"] == "cannot_check"]
+    assert "project A's grok lane: can't be checked: the model is set inside launch-grok.sh" in unseen
+    assert ("project A's grok lane: whether it uses the paid xAI API can't be checked: the launch environment "
+            "is set inside launch-grok.sh") in unseen
+    assert not any(c["status"] not in ("broken", "cannot_check") for c in block["rule_checks"])
+
+
+def test_a_launch_while_paused_is_named(home):
+    _register(home)
+    routing.pause("Claude", via="app")
+    home["clock"].advance(minutes=1)
+    _append(home["a"], "2026-10-14T15:00:30Z pipe-41 LAUNCH fix job=fix-41 lane=main round=1 worktree=/work/a/41")
+    assert "A job was started on Claude while you had it paused." in routing.doctor_block()["warnings"]
