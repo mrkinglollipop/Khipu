@@ -11,6 +11,7 @@ import {
   SynthProviderFields,
   canonicalSynthProvider,
   defaultSynthModel,
+  synthFallbackLine,
   synthModelError,
 } from "../SynthProvider";
 import type { DoctorSynthProvider, SynthRow, SynthSecretsPresence } from "../SynthProvider";
@@ -194,6 +195,103 @@ describe("SynthProviderFields", () => {
       />,
     );
     expect(screen.getByText("codex not found")).toBeTruthy();
+  });
+});
+
+describe("summariser fallback (synth_fallback)", () => {
+  const anthropicRow = { provider: "anthropic", endpoint: "", model_id: "claude-haiku-5-5" };
+  const fallbackSelect = () => screen.getByLabelText("If the provider fails") as HTMLSelectElement;
+
+  it("shows the stored value, and Gemini when doctor does not say", () => {
+    render(
+      <Harness
+        initial={anthropicRow}
+        doctorSynth={{ provider: "anthropic", fallback: { setting: "none", source: "config", gemini_key: true } }}
+      />,
+    );
+    expect(fallbackSelect().value).toBe("none");
+    expect(fallbackSelect().disabled).toBe(false);
+    expect(screen.getByText(/count under By provider as gemini/)).toBeTruthy();
+    cleanup();
+    render(<Harness initial={anthropicRow} />);
+    expect(fallbackSelect().value).toBe("gemini");
+  });
+
+  it("saves a change as synth_fallback and reloads", async () => {
+    const reload = vi.fn();
+    render(
+      <SynthProviderFields
+        row={anthropicRow}
+        onChange={() => {}}
+        presence={null}
+        doctorSynth={{ provider: "anthropic", fallback: { setting: "gemini", source: "default", gemini_key: true } }}
+        onKeySaved={reload}
+      />,
+    );
+    fireEvent.change(fallbackSelect(), { target: { value: "none" } });
+    await waitFor(() => expect(reload).toHaveBeenCalled());
+    expect(calls).toContainEqual(["khipu_config_set", { key: "synth_fallback", value: "none" }]);
+    expect(fallbackSelect().value).toBe("none");
+  });
+
+  it("shows the CLI error when the save fails", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_config_set") throw new Error("synth_fallback must be gemini or none");
+      throw new Error(`unexpected command ${cmd}`);
+    });
+    render(<Harness initial={anthropicRow} />);
+    fireEvent.change(fallbackSelect(), { target: { value: "none" } });
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/must be gemini or none/));
+    expect(fallbackSelect().value).toBe("gemini");
+  });
+
+  it("is disabled when Gemini is the provider", () => {
+    render(
+      <Harness
+        initial={{ provider: "gemini", endpoint: "", model_id: "gemini-2.5-flash" }}
+        doctorSynth={{ provider: "gemini", fallback: { setting: "gemini", source: "default", gemini_key: false } }}
+      />,
+    );
+    expect(fallbackSelect().disabled).toBe(true);
+    expect(screen.getByText("Gemini is the provider; there is nothing to fall back to.")).toBeTruthy();
+    expect(screen.queryByText("No Gemini key")).toBeNull();
+  });
+
+  it("warns when the fallback is on and no Gemini key resolves", () => {
+    render(
+      <Harness
+        initial={{ provider: "claude-cli", endpoint: "", model_id: "haiku" }}
+        doctorSynth={{
+          provider: "claude-cli",
+          binary: "/usr/local/bin/claude",
+          fallback: { setting: "gemini", source: "default", gemini_key: false },
+        }}
+      />,
+    );
+    expect(screen.getByText("No Gemini key")).toBeTruthy();
+    expect(screen.getByText(/or the fallback cannot run/)).toBeTruthy();
+    cleanup();
+    render(
+      <Harness
+        initial={{ provider: "claude-cli", endpoint: "", model_id: "haiku" }}
+        doctorSynth={{ provider: "claude-cli", fallback: { setting: "none", source: "config", gemini_key: false } }}
+      />,
+    );
+    expect(screen.queryByText("No Gemini key")).toBeNull();
+  });
+
+  it("words the fallback for the health report", () => {
+    expect(synthFallbackLine({ provider: "anthropic", fallback: { setting: "gemini", gemini_key: true } })).toBe(
+      "Fallback: Gemini Flash (key present)",
+    );
+    expect(synthFallbackLine({ provider: "anthropic", fallback: { setting: "gemini", gemini_key: false } })).toBe(
+      "Fallback: Gemini Flash, no key",
+    );
+    expect(synthFallbackLine({ provider: "codex-cli", fallback: { setting: "none", gemini_key: true } })).toBe(
+      "Fallback: off",
+    );
+    expect(synthFallbackLine({ provider: "gemini", fallback: { setting: "gemini", gemini_key: true } })).toBeNull();
+    expect(synthFallbackLine({ provider: "anthropic" })).toBeNull();
   });
 });
 

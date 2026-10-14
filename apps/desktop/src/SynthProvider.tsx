@@ -92,7 +92,32 @@ export type DoctorSynthProvider = {
   key_present?: boolean | null;
   auth?: string;
   binary?: string | null;
+  /** Gemini Flash retry for a window the provider failed (`synth_fallback`).
+   *  Present even when the provider is Gemini, where it means nothing. */
+  fallback?: SynthFallbackStatus;
 };
+
+export type SynthFallback = "gemini" | "none";
+
+export type SynthFallbackStatus = {
+  setting?: SynthFallback;
+  source?: "config" | "default";
+  /** A Gemini key resolves (Keychain, env or key file), so the retry can run. */
+  gemini_key?: boolean;
+};
+
+/** The stored fallback, Gemini when doctor does not say. */
+export function synthFallbackSetting(doctorSynth: DoctorSynthProvider | null | undefined): SynthFallback {
+  return doctorSynth?.fallback?.setting === "none" ? "none" : "gemini";
+}
+
+/** Health-report words for the fallback, or null where it does not apply
+ *  (provider is Gemini, or doctor gave no fallback block). */
+export function synthFallbackLine(sp: DoctorSynthProvider | null | undefined): string | null {
+  if (!sp?.fallback || canonicalSynthProvider(sp.provider ?? "") === "gemini") return null;
+  if (synthFallbackSetting(sp) === "none") return "Fallback: off";
+  return sp.fallback.gemini_key === false ? "Fallback: Gemini Flash, no key" : "Fallback: Gemini Flash (key present)";
+}
 
 export function SynthQualityNote() {
   return (
@@ -322,6 +347,86 @@ export function SynthProviderFields({
         doctorSynth={doctorSynth}
         onKeySaved={onKeySaved}
       />
+      <SynthFallbackField provider={provider} doctorSynth={doctorSynth} onSaved={onKeySaved} />
+    </div>
+  );
+}
+
+/** "If the provider fails": retry the window on Gemini Flash, or leave it
+ *  queued. Saved straight away with `config --set synth_fallback`. */
+export function SynthFallbackField({
+  provider,
+  doctorSynth,
+  onSaved,
+}: {
+  provider: string;
+  doctorSynth: DoctorSynthProvider | null;
+  onSaved?: () => Promise<void> | void;
+}) {
+  const stored = synthFallbackSetting(doctorSynth);
+  const [pending, setPending] = useState<SynthFallback | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const isGemini = canonicalSynthProvider(provider) === "gemini";
+  const value = pending ?? stored;
+
+  async function save(next: SynthFallback) {
+    setPending(next);
+    setSaving(true);
+    setErr(null);
+    const res = await callCli("khipu_config_set", { key: "synth_fallback", value: next });
+    if (res.ok) {
+      await onSaved?.();
+    } else {
+      setErr(res.error);
+      setPending(null);
+    }
+    setSaving(false);
+  }
+
+  const noKey =
+    !isGemini && value === "gemini" && doctorSynth?.fallback != null && doctorSynth.fallback.gemini_key === false;
+
+  return (
+    <div className="set-field">
+      <div className="toolbar">
+        <label className="muted" htmlFor="models-synth-fallback">
+          If the provider fails
+        </label>
+        <select
+          id="models-synth-fallback"
+          value={value}
+          disabled={isGemini || saving}
+          onChange={(e) => void save(e.target.value as SynthFallback)}
+        >
+          <option value="gemini">Retry that window on Gemini Flash</option>
+          <option value="none">Do not fall back; the capture waits and is retried later</option>
+        </select>
+        {noKey ? (
+          <Tag tone="warn" dot>
+            No Gemini key
+          </Tag>
+        ) : null}
+      </div>
+      {isGemini ? (
+        <p className="set-help">Gemini is the provider; there is nothing to fall back to.</p>
+      ) : (
+        <p className="set-help">
+          Fallback calls are billed to the Gemini key, about $0.002 per window, and count under By provider
+          as gemini. Nothing is ever dropped either way: with no fallback the capture waits in the queue and is
+          retried.
+        </p>
+      )}
+      {noKey ? (
+        <p className="set-help">
+          Set a Gemini key (choose Gemini Flash above to see its key field) or the fallback cannot run.
+        </p>
+      ) : null}
+      {err ? (
+        <p className="set-error" role="alert">
+          {err}
+        </p>
+      ) : null}
     </div>
   );
 }

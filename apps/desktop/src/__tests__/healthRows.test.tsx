@@ -198,6 +198,18 @@ describe("summariser rows (synth_provider / synth_budget)", () => {
     );
   });
 
+  it("adds the fallback to a non-Gemini provider's detail", () => {
+    const rows = healthRows(
+      fixture({
+        ...synthBlocks,
+        synth_provider: { ...synthBlocks.synth_provider, fallback: { setting: "gemini", source: "default", gemini_key: false } },
+      }),
+    );
+    expect(rows.find((r) => r.key === "synth_provider_ok")?.detail).toBe(
+      "Claude on my own login (claude -p) · haiku · claude found · Fallback: Gemini Flash, no key",
+    );
+  });
+
   it("an API provider without a key renders red with the attention sentence and the detail", () => {
     const parsed = fixture({
       ...synthBlocks,

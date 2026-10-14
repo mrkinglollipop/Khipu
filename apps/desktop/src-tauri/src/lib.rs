@@ -564,6 +564,9 @@ const BUDGET_LIFT_SYNTH_TODAY_ARGV: &[&str] = &["budget", "lift", "synth", "--to
 /// `config --set KEY N`, a whole number >= 0 (0 = unlimited) (`INT_SETTINGS`).
 /// Only the summariser's ceiling is offered in the app.
 const DAILY_CALL_KEYS: &[&str] = &["synth_daily_calls"];
+/// `config --set synth_fallback gemini|none`: retry a window the summariser
+/// provider failed on Gemini Flash, or leave it queued.
+const SYNTH_FALLBACKS: &[&str] = &["gemini", "none"];
 
 fn fixed_argv(argv: &[&str]) -> Vec<String> {
     argv.iter().map(|s| s.to_string()).collect()
@@ -675,6 +678,13 @@ fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
         }
         "user_aliases" => Ok(set("user_aliases", checked_operand(key, value, true)?)),
         k if DAILY_CALL_KEYS.contains(&k) => Ok(set(k, parse_daily_calls(k, value)?)),
+        "synth_fallback" => {
+            let v = value.trim();
+            if !SYNTH_FALLBACKS.contains(&v) {
+                return Err(format!("synth_fallback must be gemini or none, got {value:?}"));
+            }
+            Ok(set("synth_fallback", v.to_string()))
+        }
         k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
         _ => Err(format!("not a settable key: {key:?}")),
     }
@@ -2902,6 +2912,16 @@ mod settings_command_tests {
         // The other ceilings are not offered by the app.
         assert!(config_set_argv("embed_daily_calls", "10").is_err());
         assert!(config_unset_argv("synth_daily_calls").is_err());
+    }
+
+    #[test]
+    fn the_summariser_fallback_is_gemini_or_none() {
+        assert_eq!(config_set_argv("synth_fallback", "gemini").unwrap(), v(&["config", "--set", "synth_fallback", "gemini"]));
+        assert_eq!(config_set_argv("synth_fallback", " none ").unwrap(), v(&["config", "--set", "synth_fallback", "none"]));
+        for bad in ["", "Gemini", "off", "anthropic", "--set", "none\n--x", "gemini none"] {
+            let err = config_set_argv("synth_fallback", bad).unwrap_err();
+            assert!(err.contains("gemini") && err.contains("none"), "bad error for {bad:?}: {err}");
+        }
     }
 
     #[test]

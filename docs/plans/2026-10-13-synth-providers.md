@@ -142,6 +142,22 @@ subscription credential. Re-check the vendor terms before release. No vendor res
 call was performed in this build session. Decision 5's 50-window comparison remains pending; neither
 subscription provider becomes the default or receives a UI recommendation in this phase.
 
+## Fallback on a failed window (2026-10-14)
+
+The first nightly on the login route showed the gap: `claude -p` answered "You've hit your session
+limit" on the owner's account twice overnight (02:17 to 03:03Z and 06:01 to 06:18Z), 47 windows
+failed and waited up to five hours for the reset. Nothing was lost, but the memory was unsearchable
+until then. A provider failure (the provider's own retries spent: an account limit, not logged in,
+a transport error) now gets the same one Gemini retry as a non-capture reply or a blank record, when a
+Gemini key resolves. A failed retry surfaces the provider's error, so the job stays queued exactly as
+before; the synth ceiling (`BudgetExhausted`) is never worked around. Setting `synth_fallback`
+(`gemini`, the default, or `none`; `khipu config --set synth_fallback none`) turns it off for an owner
+who wants a window to wait rather than spend. Doctor's `synth_provider` check reports
+`fallback: {setting, source, gemini_key}`; Settings shows it as "If the provider fails" under the
+provider, with a "No Gemini key" warning when the retry could not run, and the health report's
+summariser row ends with the fallback state. Fallback calls are recorded under provider `gemini`
+with caller `capture-fallback`.
+
 ## Quality gate results (2026-10-13)
 
 Method: 49 real queued capture windows (redacted, the same extraction prompt for every model), then an
