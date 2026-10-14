@@ -40,6 +40,7 @@ warns when one of them was written by anything other than the app.
 """
 from __future__ import annotations
 
+import bisect
 import contextlib
 import fcntl
 import hashlib
@@ -1203,49 +1204,82 @@ def _effective_account(entry: dict) -> dict:
             "last_seen": last["state"] if last else None}
 
 
-def _write_order_times(times: list[datetime | None], now: datetime) -> tuple[list[datetime | None], list[datetime]]:
-    """The times of the log's lines made to run in write order, and the raw
-    times of lines that were far behind the line before them. The log is in
-    write order (one writer at a time, under the lock) and a write takes the
-    newest line's time only when that is a little ahead of its clock
-    (``_not_behind``), so when two lines are out of order the fold's clock
-    says which one is wrong:
+def _write_order_times(times: list[datetime | None]) -> tuple[list[datetime | None], list[datetime],
+                                                                list[datetime]]:
+    """The times of the log's lines made to run in write order, the raw times
+    of lines lifted by more than ``CLOCK_TOLERANCE`` (dated well before the
+    lines around them) and the raw times of lines pulled down by more than
+    that (dated well after them). Read from the log alone, never from a
+    clock, so a given log always folds to the same times.
 
-    - a line further ahead of ``now`` than ``CLOCK_TOLERANCE`` (a clock that
-      read ahead, a line appended by hand) is the wrong one: it counts from
-      the time of the line after it, never as newer than an owner's clear or
-      a report written after it;
-    - any other line behind the line before it (a Mac whose clock read behind
-      when it wrote, an old line copied back in) is the wrong one: it counts
-      from the time of the line before it, so one late, low time never ages
-      the history written before it."""
+    The log is in write order (one writer at a time, under the lock), and a
+    write takes the newest line's time only when that is a little ahead of
+    its clock (``_not_behind``), so lines out of order mean some Mac's clock
+    read wrong (or a line was appended by hand). The lines kept as written
+    are the most lines whose times run forward (each no more than
+    ``CLOCK_TOLERANCE`` behind the kept line before it); when two such sets
+    are as large, the one ending later in the log is kept, then the one
+    reaching back to earlier lines. Every other line counts from the kept
+    lines around it: one dated after the kept line written after it counts
+    from that line, one dated before the kept line written before it counts
+    from that line. So one late, low time never ages the history written
+    before it, one time written ahead never pins the lines written after it
+    once as many say otherwise, and a tie goes to the lines written later."""
     out = list(times)
-    floor: datetime | None = None
-    for i in range(len(out) - 1, -1, -1):
-        at = out[i]
-        if at is None:
-            continue
-        if floor is not None and at > floor and (at - now).total_seconds() > CLOCK_TOLERANCE:
-            out[i] = at = floor
-        floor = at
+    lines = [i for i, at in enumerate(times) if at is not None]
+    if not lines:
+        return out, [], []
+    keys = sorted({times[i] for i in lines})
+    tree = [0] * (len(keys) + 1)  # prefix maximum of run lengths, by time
+    length: dict[int, int] = {}
+    for i in lines:
+        best, k = 0, bisect.bisect_right(keys, _after(times[i], CLOCK_TOLERANCE))
+        while k > 0:
+            best, k = max(best, tree[k]), k - (k & -k)
+        length[i] = best + 1
+        k = bisect.bisect_left(keys, times[i]) + 1
+        while k <= len(keys):
+            tree[k], k = max(tree[k], best + 1), k + (k & -k)
+    by_length: dict[int, list[int]] = {}
+    for i in lines:
+        by_length.setdefault(length[i], []).append(i)
+    kept = [by_length[max(by_length)][-1]]
+    while length[kept[-1]] > 1:
+        last = kept[-1]
+        reach = _after(times[last], CLOCK_TOLERANCE)
+        kept.append(next(i for i in by_length[length[last] - 1] if i < last and times[i] <= reach))
+    keep = set(kept)
+    before: datetime | None = None
+    for i in lines:
+        if i in keep:
+            before = times[i]
+        elif before is not None and times[i] < before:
+            out[i] = before
+    after: datetime | None = None
+    for i in reversed(lines):
+        if i in keep:
+            after = times[i]
+        elif after is not None and out[i] > after:
+            out[i] = after
     behind: list[datetime] = []
+    ahead: list[datetime] = []
     ceiling: datetime | None = None
-    for i, at in enumerate(out):
-        if at is None:
-            continue
-        if ceiling is not None and at < ceiling:
-            if (ceiling - at).total_seconds() > CLOCK_TOLERANCE:
-                behind.append(at)
-            out[i] = at = ceiling
-        ceiling = at
-    return out, behind
+    for i in lines:
+        if ceiling is not None and out[i] < ceiling:
+            out[i] = ceiling
+        ceiling = out[i]
+        if (out[i] - times[i]).total_seconds() > CLOCK_TOLERANCE:
+            behind.append(times[i])
+        elif (times[i] - out[i]).total_seconds() > CLOCK_TOLERANCE:
+            ahead.append(times[i])
+    return out, behind, ahead
 
 
-def _in_write_order(events: list[dict], now: datetime) -> list[dict]:
+def _in_write_order(events: list[dict]) -> list[dict]:
     """The log's lines with times that never run backwards: no line counts as
     later than a line written after it (``_write_order_times``)."""
     raw = [_parse(e.get("written_at")) for e in events]
-    fixed, _behind = _write_order_times(raw, now)
+    fixed, _behind, _ahead = _write_order_times(raw)
     return [dict(e, written_at=_iso(f)) if f is not None and f != r else e
             for e, r, f in zip(events, raw, fixed)]
 
@@ -1262,7 +1296,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     process, calls no model."""
     lane_map = cfg.get("routing_lane_map") or {}
     stale_after = cfg["routing_stale_after"]
-    events = _in_write_order(events, now)
+    events = _in_write_order(events)
     evidence: list[dict] = []
     owner: dict[str, Any] = {"pauses": {}, "lifts": {}, "clears": {}, "dismissed": set()}
     dismissals: list[dict] = []
@@ -2243,12 +2277,14 @@ def doctor_block(now: datetime | None = None) -> dict:
     if newest is not None and (newest - now).total_seconds() > CLOCK_TOLERANCE:
         warnings.append(f"The routing record holds times ahead of this Mac's clock (as late as "
                         f"{_iso(newest)}); Khipu goes by the clock. Check the Mac's date and time.")
-    _fixed, behind = _write_order_times([_parse(e.get("written_at")) for e in events], now)
-    if behind:
-        warnings.append(f"The routing record holds {len(behind)} line{'s' if len(behind) != 1 else ''} dated well "
-                        f"before the line written just before {'them' if len(behind) != 1 else 'it'} (as early as "
-                        f"{_iso(min(behind))}); Khipu counts each from the line before it. Check the date and time "
-                        f"on the Mac that wrote {'them' if len(behind) != 1 else 'it'}.")
+    _fixed, behind, ahead = _write_order_times([_parse(e.get("written_at")) for e in events])
+    for found, side, edge, which in ((behind, "before", "early", min), (ahead, "after", "late", max)):
+        if found:
+            them = "them" if len(found) != 1 else "it"
+            warnings.append(f"The routing record holds {len(found)} line{'s' if len(found) != 1 else ''} dated "
+                            f"well {side} the lines written around {them} (as {edge} as {_iso(which(found))}); "
+                            f"Khipu counts each from the line {side} it. Check the date and time on the Mac "
+                            f"that wrote {them}.")
     return {"record": bool(view.get("record")), "version": view["version"], "folded_at": view.get("folded_at"),
             "valid_until": view.get("valid_until"),
             "accounts": [{"account": e["label"], "state": e["state"], "until": e["until"], "basis": e["basis"],

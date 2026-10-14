@@ -1447,17 +1447,77 @@ def test_a_line_dated_at_the_start_of_time_neither_stops_nor_ages_the_fold(home)
     assert _account(routing.read_view(), "muse|")["state"] == "open"
 
 
-def test_the_fold_lifts_a_low_line_and_pulls_back_only_a_line_ahead_of_its_clock():
-    # R4-1, the pure fold: a line ahead of the fold's clock still counts from
-    # the line after it; a line behind the one before it counts from that one.
+def test_the_fold_lifts_a_low_line_and_pulls_back_a_line_written_ahead():
+    # R4-1, the pure fold (R5-1: from the log alone): a line ahead of the
+    # lines around it counts from the line after it; a line behind them
+    # counts from the line before it.
     now = T0 + timedelta(minutes=10)
     first = _ev(1, "open", T0)
     ahead = _ev(2, "limited", datetime(9999, 12, 31, tzinfo=timezone.utc), basis="cli",
                 until=datetime(9999, 12, 31, 1, tzinfo=timezone.utc))
     low = _ev(3, "open", datetime(2001, 1, 1, tzinfo=timezone.utc), "probe")
-    entry = _state([first, ahead, low], now)
-    assert entry["state"] == "open" and entry["witness"]["id"] == "e3"
-    assert entry["witness"]["at"] == routing._iso(T0)
-    assert _state([first, low], now)["witness"]["at"] == routing._iso(T0)
-    ordered = routing._in_write_order([first, ahead, low], now)
-    assert [e["written_at"] for e in ordered] == [routing._iso(T0)] * 3
+    later = _ev(4, "open", T0 + timedelta(minutes=5), "probe")
+    entry = _state([first, ahead, low, later], now)
+    assert entry["state"] == "open" and entry["witness"]["id"] == "e4"
+    assert entry["witness"]["at"] == routing._iso(T0 + timedelta(minutes=5))
+    assert _state([first, low, later], now)["witness"]["at"] == routing._iso(T0 + timedelta(minutes=5))
+    # Two lines alone are a tie, and a tie goes to the line written later.
+    assert [e["written_at"] for e in routing._in_write_order([first, low])] == [low["written_at"]] * 2
+    ordered = routing._in_write_order([first, ahead, low, later])
+    assert [e["written_at"] for e in ordered] == [routing._iso(T0)] + [routing._iso(T0 + timedelta(minutes=5))] * 3
+    # Alone after the line written ahead, the low line is the one fewer lines
+    # agree with until a line written after it says otherwise.
+    assert [e["written_at"] for e in routing._in_write_order([first, ahead, low])][2] == ahead["written_at"]
+
+
+# ---- fix round 6 ---------------------------------------------------------------------------
+
+
+def test_the_same_log_folds_to_the_same_times_whatever_the_clock():
+    # R5-1: which of two out-of-order lines was wrong depended on the fold's
+    # clock, so once the clock passed a line written ahead, a down report two
+    # days old came back as fresh with nothing new written.
+    ahead = _ev(1, "open", T0 + timedelta(days=2), "probe")
+    down = _ev(2, "down", T0 + timedelta(hours=1), "probe", reason="not_signed_in")
+    states = [_state([ahead, down], T0 + delta)["state"]
+              for delta in (timedelta(hours=1, minutes=1), timedelta(hours=14), timedelta(days=2, minutes=1))]
+    assert states == ["down", "unknown", "unknown"]
+    times = {routing._write_order_times([routing._parse(e["written_at"]) for e in (ahead, down)])[0][1]
+             for _ in range(2)}
+    assert times == {T0 + timedelta(hours=1)}
+
+
+def test_doctor_names_the_line_written_ahead_never_the_line_after_it(home):
+    # R5-1: once the clock passed the line written ahead, doctor blamed the
+    # Mac whose clock was right and the warning about the ahead line went away.
+    routing.events_file().parent.mkdir(parents=True, exist_ok=True)
+    with open(routing.events_file(), "a", encoding="utf-8") as fh:
+        for at, state in ((T0 + timedelta(days=2), "open"), (T0 + timedelta(hours=1), "down")):
+            fh.write(json.dumps({"type": "evidence", "id": f"e{state}", "source": "probe", "state": state,
+                                 "account": "codex|", "reason": "not_signed_in" if state == "down" else None,
+                                 "written_by": ME, "via": "cli", "written_at": routing._iso(at)}) + "\n")
+    for delta, state in ((timedelta(hours=1, minutes=1), "down"), (timedelta(hours=14), "unknown"),
+                         (timedelta(days=2, minutes=1), "unknown")):
+        home["clock"].now = T0 + delta
+        assert _account(routing.read_view(), "codex|")["state"] == state, delta
+        warnings = routing.doctor_block()["warnings"]
+        assert not any("dated well before" in w for w in warnings), (delta, warnings)
+        assert any("dated well after" in w and routing._iso(T0 + timedelta(days=2)) in w for w in warnings), \
+            (delta, warnings)
+
+
+def test_a_run_written_ahead_gives_way_once_more_lines_say_otherwise():
+    # R5-1: the line that is wrong is the one fewer lines agree with; a tie
+    # goes to the lines written later, so a time written ahead never pins the
+    # lines written after it at the true time.
+    t = [T0, T0 + timedelta(days=2), T0 + timedelta(days=2, minutes=1), T0 + timedelta(minutes=5),
+         T0 + timedelta(minutes=6), T0 + timedelta(minutes=7)]
+    fixed, behind, ahead = routing._write_order_times(t)
+    assert fixed == [T0, T0 + timedelta(minutes=5), T0 + timedelta(minutes=5), T0 + timedelta(minutes=5),
+                     T0 + timedelta(minutes=6), T0 + timedelta(minutes=7)]
+    assert (behind, ahead) == ([], t[1:3])
+    # A late, low line after lines that agree with each other is the one lifted.
+    low = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    fixed, behind, ahead = routing._write_order_times([T0, T0 + timedelta(minutes=1), low, None])
+    assert fixed == [T0, T0 + timedelta(minutes=1), T0 + timedelta(minutes=1), None]
+    assert (behind, ahead) == ([low], [])
