@@ -25,7 +25,7 @@ can see and change all of it in the app. Khipu never decides where work goes.
 |---|---|---|---|
 | 0 | This scope; the mocks of the Home Routing card and Settings → Routing; a throwaway-hook check of five hook facts | S | done 2026-10-14 (scope and mocks approved; hook check: five of five yes, see Phase 0 results) |
 | 1a | The record and its fold: event log, versioned view with clock-driven refolds, rules, Matt's note, holds, owner clear; `khipu route`; the doctor block | M | done 2026-10-14 (one known limit, see Known limits; its fix is in phase 1b) |
-| 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | open |
+| 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | built, in review (branch feat/routing-truth-1b) |
 | 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | open |
 | 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | open |
 | 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | open |
@@ -180,8 +180,8 @@ Every entry carries these fields:
   as a guess.
 - `scope`: all, or a model name when the window is model-scoped (the Claude probe already returns windows
   with a `model`, `usage.parse_claude`).
-- `window` (five-hour, weekly or none) and `used_pct` when a probe gave them; `evidence`, one clipped and
-  redacted line (the runner's LIMITED line, the probe's error code); and `source` (a runner's name, probe,
+- `window` (five-hour, weekly or none) and `used_pct` when a probe gave them; `evidence`, one line Khipu words from
+  parsed fields (a runner's lane, end and pipeline; the probe's error code), never a source's own text; and `source` (a runner's name, probe,
   check, report or owner). The routing table is never a source of account state.
 
 **Holds** are short notes about one account, the machine, or all work. Each has a scope, a reason from a
@@ -239,22 +239,32 @@ MCP tool refuses them. Doctor warns when any of them was written by anything oth
 
 1. **Khipu's usage probes** (`khipu usage`, cache `state/usage.json`). A window at 100% or more makes the
    account limited until that window's `resets_at` (basis cli), for that window's scope. A probe written
-   after a limited entry that shows headroom reopens the account (basis checked). `not_signed_in` and
+   after a limited entry that shows headroom (every window under 100%) reopens the account (basis checked);
+   a window at 100% with no reset time ahead is never headroom and gives no evidence for its scope. `not_signed_in` and
    `not_installed` make it down. Muse rows are last-observed and labelled so. The second Claude home answers
    nothing until its `/login`.
 2. **Runners' files, read and never written.** Each registered runner folder (setting `routing_sources`, a
    list of `{name, kind: "lanes", path}`) is read for `state/global.json` `limited`; the `ADDED`, `LIMITED`,
-   `LAUNCH` and `HOLD` lines of `events.log` (a bounded tail); `state/heartbeat.json`; and, for doctor's rule
+   `LAUNCH` and `HOLD` lines of `events.log` (a bounded tail: the last 512 KB, keeping the newest 200 LIMITED
+   lines, both settings); `state/heartbeat.json`; and, for doctor's rule
    checks only, these keys of `config.json` and nothing else: each lane's `kind`, `model`, `launch` argument
    list and `confirm_lane`, and `defaults.check_lane` and `defaults.fix_lanes`. Nothing else in `config.json`
-   is read or kept. Every line Khipu stores or pushes from a runner first passes through Khipu's existing
-   secret redaction (`khipu.redact.redact_secrets`). Khipu never takes a runner's lock and never writes:
+   is read or kept. The `launch` arguments are never kept: only what the checks need is kept from them (whether
+   a model ending in -fast is named, whether the model is one of them, and the launch script's file name). Runner and table text is never stored or
+   shown: Khipu keeps only parsed fields (times, the line kind, numbers) and names (lane, pipeline, model, kind)
+   that pass a strict shape check and do not look like a key, with Khipu's existing secret redaction
+   (`khipu.redact.redact_secrets`) as a second layer; usage cache rows are read only for configured accounts. Khipu never takes a runner's lock and never writes:
    `lanes.py` saves `global.json` at the end of a pass without its own mutex (`lanes.py:1860`), so a second
    writer would race it. Until runners write the basis themselves, a runner's `until` counts as **cli** only
    when its seconds are zero and it is not exactly 30 minutes after the LIMITED line (the shape `limit_until`
    gives a parsed message plus two minutes); everything else is **estimated**. A file that fails to parse is
-   reported with its last good read, never guessed around. A registered path under a credential location
-   (`API Keys/`, `My Portfolio/`, any `auth.json`, keychain exports) is refused.
+   reported with its last good read, never guessed around. A `global.json` limit keeps the time of the
+   newest LIMITED line Khipu saw for it (same lane, same end) after that line leaves the tail, matched against
+   every line of the tail, including lines the LIMITED line cap leaves out; a limit with no line anywhere in
+   the tail is dated at the oldest line the tail held when Khipu first found it. An owner clear
+   is weighed against that time, so a limit the runner wrote after the clear stands once its line has aged
+   out. A registered path under a credential location (`API Keys/`, `My Portfolio/`, any `auth.json`,
+   keychain exports) is refused.
 3. **Conversations reporting through a tool**: MCP `khipu_route_report` and `khipu route report`, for what a
    conversation learns first (a job ended on "You've hit your session limit"; Matt said Codex is nearly out).
    A report can mark an account limited, open or down, and can add holds. Its basis is **estimated** unless
@@ -267,9 +277,9 @@ MCP tool refuses them. Doctor warns when any of them was written by anything oth
    note, owner pauses or clears.
 4. **The owner in the app**: pauses and lifts, clears and dismissals, holds, the rules and his note.
 5. **Until the cutover only: the table, read only, and never as account state.** Setting `routing_table`
-   names the file. Khipu reads the NOW block's `updated:` line and a hash of the block. When the hash changes,
-   the version moves with one line: "The routing table's NOW block changed at HH:MMZ (stamped '<updated
-   line>')." Khipu does not push the table's prose, which is free text from a file any process rewrites
+   names the file. Khipu reads the time the NOW block's `updated:` line gives and a hash of the block. When the
+   hash changes, the version moves with one line: "The routing table's NOW block changed at HH:MMZ (stamped
+   HH:MMZ)." Khipu does not push the table's prose, which is free text from a file any process rewrites
    without a lock, and it never writes the file before phase 8.
 
 ### Folding the sources into one state
@@ -514,9 +524,11 @@ into the app's attention items. They never gate `ok`. The texts Matt reads:
   passes `-m grok-4.7`) is reported as "can't be checked: the model is set inside <script>", never as
   passing.
 - "A standing rule may be broken: a Grok lane is set to work on <pipeline>, which is marked private." (from
-  the pipeline's ADDED line)
+  the pipeline's ADDED line; when it names no check lane or no fix lanes, the runner's `defaults.check_lane`
+  or `defaults.fix_lanes` stand in for them)
 - "A standing rule may be broken: <runner>'s Grok check lane has no confirming lane from another model
-  family." (`confirm_lane`)
+  family." (`confirm_lane`: none set, a lane the settings lack, or a Grok lane.) When the confirming lane's
+  `kind` is not set, it "can't be checked", never reported as passing.
 - Whether a Grok lane uses the paid xAI API "can't be checked: the launch environment is set inside
   <script>", never reported as passing.
 - "A job was started on <account> while you had it paused", or "…after it had reached its limit." (LAUNCH
@@ -665,7 +677,7 @@ place.
 Inspect a real `global.json`, `events.log`, `heartbeat.json` and `config.json` from a lanes runner (read
 only; copied into fixtures by shape, with names changed) and the usage cache before writing the adapters.
 
-- Build the read-only runner adapter (only the named `config.json` keys; every stored line redacted), the lane
+- Build the read-only runner adapter (only the named `config.json` keys; only parsed fields and checked names stored), the lane
   map with unmatched lanes, the usage-cache source with model-scoped windows, the silent-runner and
   unreadable-file entries, and the table pointer.
 - Tests: fixtures shaped like the real runner files, including a Muse LIMITED line with a 30-minute guess and
@@ -905,7 +917,38 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
 
 ## Known limits
 
-- **A Mac clock that reads low for a while (phase 1a, accepted by Matt 2026-10-14).** The fold decides which
+- **A record that starts ahead of the clock (phase 1b).** When the record's first two or more lines came from
+  a Mac whose clock read ahead, a Mac whose clock reads before all of them takes the newest line's time,
+  keeping its own reading beside it (`clock_at`), until its clock passes the record's first line; doctor then
+  names that Mac's lines as the ones with the wrong date, and also warns that the record holds times ahead of
+  this Mac's clock. It is the mirror of the fixed limit below, and times alone cannot tell the two apart. A
+  clock behind only part of the record (some lines written before it) is not affected: those lines keep the
+  phase 1a handling. A single line written ahead after a correct history is not this case: a line that copied
+  its time is never a witness to that time, so the ahead line is pulled back once a correct line follows.
+- **A clock that reads low, but not before the record began (phase 1a handling kept).** A Mac whose clock is
+  more than `CLOCK_TOLERANCE` behind writes its own time when the record holds lines written before that time.
+  If such a run is longer than the lines written in the stretch it is behind, the fold still keeps the low
+  run, as in phase 1a. The case the phase 1a limit describes (a clock reading 2001, behind every line) is fixed
+  for a record that holds two lines or more; a record of one line is the next limit.
+- **A record of one line (phase 1b).** A writer takes the record's time only when the record holds two lines or
+  more. With one line, a run of lines from a clock reading before it (a clock reading 2001) keeps its own
+  times, and once that run is longer than the history, the fold keeps the low run as in phase 1a: the one
+  line reads as old (an open report shows as Unknown), and doctor names that line as the one with the wrong
+  date. Stamping a record of one line would let a single line written ahead of the clock pin every later
+  line (the mirror case above), so it is left. It cannot start once the record holds two lines, and the log
+  keeps every line as written. Shown by `test_a_low_clock_run_after_a_one_line_record_keeps_the_phase_1a_handling`.
+
+## Fixed limits
+
+- **A Mac clock that reads low for a while (phase 1a, accepted by Matt 2026-10-14; fixed in phase 1b).**
+  Fixed by settling each line when it is written: the writer holds the log lock, sees the record, and records
+  a sequence number (`seq`) with its line, which the fold orders by; when the writer's clock reads more than
+  `CLOCK_TOLERANCE` before every line of a record of two lines or more, its line takes the newest time the fold
+  settles for the record and keeps the clock's reading in `clock_at`, and doctor names it from that reading.
+  The fold counts such a line from the line written before it and never as a witness to its copied time. Lines without `seq`
+  (written by phase 1a) keep their handling. Proved by `test_a_run_of_lines_from_a_clock_reading_2001_never_ages_the_history`
+  (a history of two lines; N = 0, 1 and 10: the history keeps its times for every N, and doctor names the
+  2001 lines, never the T0 lines). A history of one line is not covered (Known limits). The text as accepted: The fold decides which
   out-of-order line has the wrong time from the log alone. When a Mac writes a run of lines while its clock is
   more than `CLOCK_TOLERANCE` (5 minutes) behind, and that run is longer than the history written before it,
   the fold keeps the low run and reads the earlier history as old: reports show as Unknown, an owner hold
@@ -919,8 +962,17 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
 - Two edges of the phase 0 hook check. The desktop wakes and typed prompts that left no hook-context
   attachment (about a third): probably a hook that printed nothing, not shown. And whether Codex's live user
   hooks also ran during the scratch runs, since `--ignore-user-config` was used.
-- Whether the runner-basis rule (zero seconds, not exactly 30 minutes) holds for project B's copy of
-  `lanes.py`, which differs from project A's.
+- Checked 2026-10-14 (phase 1b): the runner-basis rule holds for project B's copy of `lanes.py` (the copy with
+  the newest heartbeat). Its `limit_until`, `LIMIT_SECONDS`, `LIMIT_MAX_REST`, `iso` and LIMITED line format
+  are the same as project A's; the two differ only in verdict hedging and the `confirm_lane` handling. One
+  correction to the rule as written: both copies take the 30-minute rest from one clock reading and stamp the
+  LIMITED line from a later one, both cut to whole seconds, so the guess lands up to a few seconds short of
+  30 minutes (a real line: 03:09:03 with until 03:39:02). Khipu reads a gap within 5 seconds of 30 minutes as
+  the guess. Project B's folder keeps the same layout (`events.log`, `config.json`, `state/global.json`,
+  `state/heartbeat.json`), with a 30-second heartbeat interval against project A's 20.
+- Which standing rules doctor watches is read from the rules' own words (phase 1b): "-fast", "xAI", Grok with
+  privacy or safety, and Grok with a re-check or another model family. A rule worded otherwise is not watched;
+  the app's "Watched" mark (phase 4) should show this to Matt.
 - Whether Grok Build's PreToolUse context reaches its model in headless runs.
 - What Muse reads at start, and whether it sees the table at all.
 - Whether `~/.grok` and `~/.grok-dispatch` are two logins on one Grok plan. If they are, they share one limit,

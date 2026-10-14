@@ -1,0 +1,10 @@
+{
+  "holds": {
+    "pipe-15": {"key": "lane:second", "kind": "lane", "reason": "no lane free for the check step: second limited until 2026-10-14T17:52:00Z", "since": 1791988800.123}
+  },
+  "launches": [1791982800.5, 1791989700.25],
+  "limited": {
+    "muse": {"reason": "recheck-17-auto-r1: account limit reached", "until": 1791991202.7},
+    "second": {"reason": "recheck-12-auto-r8: account limit reached", "until": 1792000320.0}
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "jobs_dir": "/runner/project-b/jobs",
+  "state_dir": "/runner/project-b/state",
+  "events_log": "/runner/project-b/events.log",
+  "review_tail": "CANARY-b",
+  "lanes": {
+    "second": {"cap": 6, "kind": "claude", "model": "opus", "done_suffixes": ["DONE"],
+               "launch": ["bash", "/runner/project-b/launch-claude.sh", "{name}", "second", "opus", "{worktree}"]},
+    "second-sonnet": {"cap": 2, "kind": "claude", "model": "sonnet", "done_suffixes": ["DONE"],
+                      "launch": ["bash", "/runner/project-b/launch-claude.sh", "{name}", "second", "sonnet",
+                                 "{worktree}"]},
+    "codex": {"cap": 2, "kind": "codex", "model": "gpt-6.1-sol", "done_suffixes": ["DONE"],
+              "launch": ["bash", "/runner/project-b/launch-codex.sh", "{name}", "gpt-6.1-sol", "{effort}",
+                         "{worktree}"]},
+    "grok": {"cap": 0, "kind": "grok", "model": "grok-4.7", "done_suffixes": ["DONE"],
+             "launch": ["bash", "/runner/project-b/launch-grok.sh", "{name}", "{effort}", "{worktree}"]}
+  },
+  "defaults": {"check_lane": "codex", "fix_lanes": ["second", "codex"], "max_checks": 3, "effort": "high"}
+}

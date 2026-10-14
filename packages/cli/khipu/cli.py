@@ -4551,6 +4551,8 @@ def build_parser() -> argparse.ArgumentParser:
     rnote.add_argument("action", choices=("set", "end"))
     rnote.add_argument("text", nargs="?", default=None)
     rnote.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    rt_sub.add_parser("sources", help="Each job runner folder with its last good read and any error",
+                      parents=[rt_json])
     rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire or confirm a standing rule", parents=[rt_json])
     rrule.add_argument("action", choices=("add", "edit", "retire", "confirm"))
     rrule.add_argument("params", nargs="*")

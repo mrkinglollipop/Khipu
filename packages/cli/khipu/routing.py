@@ -1,4 +1,9 @@
-"""Routing truth, phase 1a: one record of which accounts are open.
+"""Routing truth, phases 1a and 1b: one record of which accounts are open.
+
+Phase 1b folds in the sources (``khipu.routing_sources``): job runners'
+files, read and never written; Khipu's usage cache; and the routing table's
+NOW block as a pointer only. Each line of the log carries its sequence
+number, settled by the writer under the lock (``_stamp_locked``).
 
 Scope: docs/plans/2026-10-14-routing-truth.md (the Record, Folding the
 sources, Doctor warnings, Phase 1a and Decisions). Khipu reports; it never
@@ -122,6 +127,10 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_sources": ("sources", [], "Job runner folders"),
     "routing_table": ("path", None, "Routing table file"),
     "routing_runner_silent_intervals": ("count", 5, "A job runner has stopped reporting after this many intervals"),
+    "routing_runner_tail_bytes": ("count", 512 * 1024,
+                                  "How much of the end of a job runner's events.log is read, in bytes (0: all of it)"),
+    "routing_runner_limited_lines": ("count", 200,
+                                     "How many of a job runner's newest LIMITED lines are kept (0: no limit)"),
     # Telling conversations (phases 3a to 3c and 6)
     "routing_push_start": ("switch", True, "Tell conversations at the start and after compaction"),
     "routing_push_prompt": ("switch", True, "Tell conversations before each prompt"),
@@ -840,34 +849,48 @@ def _append_locked(*events: dict) -> None:
         os.close(fd)
 
 
-def _last_written_at() -> datetime | None:
-    """The time on the newest readable line of the log (read from its tail)."""
-    try:
-        with open(events_file(), "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            fh.seek(max(0, fh.tell() - 65536))
-            tail = fh.read()
-    except OSError:
-        return None
-    for line in reversed(tail.split(b"\n")):
-        event = _line_event(line) if line.strip() else None
-        if event is not None:
-            return _parse(event["written_at"])
-    return None
-
-
 # The fields Khipu writes, by the type each has. A line is read into these
 # alone: any other field is dropped, and a line with one of these of another
 # type (a hand-edited or foreign line: a list for an account, a number for a
 # key) would stop every fold, so it is counted as unreadable and left out.
 _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", "basis", "source", "window",
-                "evidence", "until", "written_at", "via", "text", "file", "date", "sha256")
-_TIME_FIELDS = ("written_at", "until")
-_WHOLE_FIELDS = ("n", "count")
+                "evidence", "until", "written_at", "via", "text", "file", "date", "sha256", "clock_at")
+_TIME_FIELDS = ("written_at", "until", "clock_at")
+_WHOLE_FIELDS = ("n", "count", "seq")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded")
 _AUTHOR_FIELDS = ("kind", "harness", "project", "session", "name", "file")
 _HOLD_KINDS = ("account", "machine", "all")
+
+
+def _next_after(numbers: Iterable[int], count: int, start: int) -> int:
+    """The first of ``count`` numbers that follow ``numbers`` (``start`` when
+    there are none), every one a number ``_checked`` reads back. A number a
+    line holds that leaves no room after it (a hand-edited or merged line at
+    the most a line can hold) is passed over, so the next line is never
+    written with a number that makes it unreadable."""
+    room = [n for n in numbers if n + count <= _WHOLE_MOST]
+    return max(room) + 1 if room else start
+
+
+def _crowded(numbers: Iterable[int]) -> bool:
+    """Whether a number a line holds leaves no room for one more after it."""
+    return any(n + 1 > _WHOLE_MOST for n in numbers)
+
+
+def _next_rules(events: list[dict], count: int) -> int:
+    """The number of the next rule (of ``count`` new rules), one ``_checked``
+    reads back and no rule already holds (a rule's number is its name)."""
+    taken = {e["n"] for e in events if e.get("type") == "rule_add" and isinstance(e.get("n"), int)}
+    first = _next_after(taken, count, 1)
+    if not any(first + i in taken for i in range(count)):
+        return first
+    # Only a hand-edited number near the most a line can hold gets here:
+    # take the lowest free run instead.
+    first = 1
+    while any(first + i in taken for i in range(count)):
+        first += 1
+    return first
 
 
 def _log_time(text: str) -> str | None:
@@ -968,11 +991,17 @@ def _line_event(raw: bytes) -> dict | None:
 
 
 def read_events() -> tuple[list[dict], int]:
-    """Every event in order with its line number (``_seq``), and how many
-    lines could not be read (kept in the file, left out of the fold). The
-    file is read as bytes and each line decoded on its own, so one line that
-    is not UTF-8, not JSON or not of a shape Khipu writes (``_line_event``)
-    costs that line alone, never the read."""
+    """Every event in write order with its place in that order (``_seq``),
+    and how many lines could not be read (kept in the file, left out of the
+    fold). The file is read as bytes and each line decoded on its own, so one
+    line that is not UTF-8, not JSON or not of a shape Khipu writes
+    (``_line_event``) costs that line alone, never the read.
+
+    Write order is settled when a line is written: the writer holds the lock,
+    sees the last line and records the next sequence number (``seq``) with
+    its line, and the lines that carry one are put in that order. Lines with
+    no ``seq`` (written by phase 1a, or appended by hand) keep their place in
+    the file."""
     try:
         data = events_file().read_bytes()
     except OSError:
@@ -988,9 +1017,51 @@ def read_events() -> tuple[list[dict], int]:
         if event is None:
             bad += 1
             continue
-        event["_seq"] = len(events)
         events.append(event)
+    slots = [i for i, e in enumerate(events) if isinstance(e.get("seq"), int)]
+    if slots:
+        ordered = sorted((events[i] for i in slots), key=lambda e: e["seq"])  # stable: file order breaks a tie
+        for i, event in zip(slots, ordered):
+            events[i] = event
+    for i, event in enumerate(events):
+        event["_seq"] = i
     return events, bad
+
+
+def _stamp_locked(clock: datetime, count: int = 1) -> list[dict]:
+    """The time and sequence number of the next ``count`` lines, settled now,
+    while the writer holds the lock and sees the record as it stands.
+
+    The sequence number follows the highest one written (or the number of
+    readable lines before the first). The time is the writer's clock, or the
+    newest line's time when that is a little ahead of it (``_not_behind``).
+    When the clock reads more than ``CLOCK_TOLERANCE`` before every line of a
+    record of two lines or more (a Mac whose clock reads 2001), the record is
+    older than the clock says: the line takes the newest time the fold
+    settles for the record (``_record_times``) and keeps the clock's reading
+    beside it (``clock_at``), so a run of such lines never ages the history
+    written before it, however long the run, and doctor names those lines.
+    A copied time is never a witness to itself: the fold counts each such
+    line from the line written before it. A clock behind only some of the record (a
+    line written ahead, then a right clock) keeps its own time, and the fold
+    orders the lines as in phase 1a."""
+    events, _bad = read_events()
+    seqs = [e["seq"] for e in events if isinstance(e.get("seq"), int)]
+    first = _next_after(seqs, count, len(events))
+    times = [t for t in (_parse(e.get("written_at")) for e in events) if t is not None]
+    last = _parse(events[-1].get("written_at")) if events else None
+    settled = [t for t in _record_times(events)[0] if t is not None]
+    clock_at = None
+    stamp = _not_behind(clock, last)
+    if len(times) >= 2 and settled and (min(times) - clock).total_seconds() > CLOCK_TOLERANCE:
+        stamp, clock_at = settled[-1], clock
+    out = []
+    for i in range(count):
+        line = {"written_at": _iso(stamp), "seq": first + i}
+        if clock_at is not None:
+            line["clock_at"] = _iso(clock_at)
+        out.append(line)
+    return out
 
 
 def _stat(path: Path | None) -> list | None:
@@ -1010,12 +1081,30 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
     fingerprint."""
     from khipu.config import config_file, load_config
 
+    from khipu import routing_sources
+
     events_stat, config_stat = _stat(events_file()), _stat(config_file())
     config = load_config()
     cfg = settings(config)
+    # routing_sources is read entry by entry (one bad entry costs only itself);
+    # usage_accounts says which usage cache rows are read at all.
+    cfg["_raw_sources"] = {"routing_sources": config.get("routing_sources"),
+                           "usage_accounts": config.get("usage_accounts")}
     seed = cfg.get("routing_rules_seed")
-    fingerprint = {"events": events_stat, "config": config_stat, "seed": _stat(Path(seed)) if seed else None}
+    fingerprint = {"events": events_stat, "config": config_stat, "seed": _stat(Path(seed)) if seed else None,
+                   "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
     return fingerprint, cfg, _fold_accounts(config)
+
+
+def _sources(cfg: dict, now: datetime, prev: dict | None) -> tuple[list[dict], dict | None, dict]:
+    """(evidence, status, cache) from the sources (phase 1b): job runners'
+    files, the usage cache and the table pointer. Reads only. ``prev`` is the
+    last saved view, whose cache holds each runner file's last good read."""
+    from khipu import routing_sources
+
+    if not routing_sources.any_configured(cfg["_raw_sources"], cfg):
+        return [], None, {}
+    return routing_sources.collect(cfg["_raw_sources"], cfg, now, (prev or {}).get("source_cache"))
 
 
 def _evidence_account(event: dict, lane_map: dict, known: list[dict]) -> str | None:
@@ -1064,19 +1153,34 @@ def _owner_event(event: dict) -> dict:
 def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, cfg: dict) -> dict:
     key = account["key"]
     stale_after = cfg["routing_stale_after"]
-    clear = owner["clears"].get(key)
-    live = [e for e in items if e["id"] not in owner["dismissed"] and (clear is None or _k(e) > _k(clear))]
-    if clear is not None:
-        # Clear: treat as open until something newer reports on it.
-        live.append({"id": clear["id"], "state": OPEN, "until": None, "basis": "owner", "scope": "all",
-                     "source": "owner", "written_by": clear["written_by"], "at": clear["at"], "seq": clear["seq"],
-                     "cleared": True, "via": clear["via"], "evidence": None, "reason": None, "message_time": False})
 
     def stale(e: dict) -> bool:
         # Stale from the moment it turns stale_after old: the same instant
         # fold() hands on as valid_until, so a read at that instant can't
         # see it fresh and drop its last clock change.
         return e["state"] in (OPEN, DOWN) and stale_after > 0 and (now - e["at"]).total_seconds() >= stale_after
+
+    def counts(e: dict) -> bool:
+        # Evidence that still says something about now: not stale, and not
+        # a limit whose time has passed.
+        return not stale(e) and not (e["state"] == LIMITED and e["until"] is not None and e["until"] <= now)
+
+    clear = owner["clears"].get(key)
+    # A runner's limit whose LIMITED line has left the tail keeps the time
+    # Khipu saw that line (``routing_sources._sightings``), so a clear is
+    # weighed against it like any other evidence.
+    live = [e for e in items if e["id"] not in owner["dismissed"] and (clear is None or _k(e) > _k(clear))]
+    # Unknown when the only source that still counts is a runner that has
+    # stopped reporting: other evidence counts only while it is fresh (open
+    # or down) or its limit has not passed (``counts``).
+    only_silent = any(e.get("silent") for e in live) and not any(
+        not e.get("silent") and counts(e) for e in live)
+    if clear is not None:
+        # Clear: treat as open until something newer reports on it.
+        live.append({"id": clear["id"], "state": OPEN, "until": None, "basis": "owner", "scope": "all",
+                     "source": "owner", "written_by": clear["written_by"], "at": clear["at"], "seq": clear["seq"],
+                     "cleared": True, "via": clear["via"], "evidence": None, "reason": None, "message_time": False})
+
 
     def later(e: dict, base: dict) -> bool:
         return _k(e) > _k(base)
@@ -1104,9 +1208,9 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
 
     whole = [e for e in live if e["scope"] == "all"]
     fresh = [e for e in whole if not stale(e)]
-    shown: tuple[str, dict | None] | None = None
+    shown: tuple[str, dict | None] | None = (UNKNOWN, None) if only_silent else None
     downs = [e for e in fresh if e["state"] == DOWN]
-    if downs:
+    if downs and shown is None:
         down = max(downs, key=_k)
         if not any(e["source"] in ("probe", "check", "report") and later(e, down) for e in whole):
             shown = (DOWN, down)
@@ -1152,7 +1256,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
         disagreement = disagreement_after(behind, state, whole)
 
     models = []
-    for model in sorted({e["scope"] for e in live if e["scope"] != "all"}):
+    for model in sorted({e["scope"] for e in live if e["scope"] != "all" and not only_silent}):
         pool = [e for e in live if e["scope"] == model]
         held = [e for e in pool if limit_holds(e, pool, (model,))]
         strong_m = [e for e in held if e["basis"] in STRONG_BASES]
@@ -1167,7 +1271,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
             return None
         return {"id": e["id"], "source": e["source"], "written_by": e["written_by"], "at": _iso(e["at"]),
                 "evidence": e.get("evidence"), "message_time": e.get("message_time", False),
-                "cleared": bool(e.get("cleared"))}
+                "cleared": bool(e.get("cleared")), "observed": bool(e.get("observed"))}
 
     underlying = {"state": state, "until": _iso(behind["until"]) if behind and state in (LIMITED, PROBABLY_OPEN)
                   else None, "basis": behind["basis"] if behind and state in (LIMITED, PROBABLY_OPEN) else None}
@@ -1177,6 +1281,11 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
              if state == DOWN and behind else None,
              "models": models, "witness": witness(behind), "disagreement": disagreement, "last_seen": None,
              "underlying": None, "checkable": account["harness"] != "muse"}
+    if state == LIMITED:
+        # When the limit now shown was first reported (doctor's launch check).
+        entry["since"] = _iso(min((e["at"] for e in whole if limit_holds(e, whole, ("all",))), default=None))
+    if only_silent:
+        entry["silent"] = True
     if state == UNKNOWN:
         last = max(whole, key=_k, default=None)
         if last is not None:
@@ -1185,6 +1294,9 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
     pause = owner["pauses"].get(key)
     lift = owner["lifts"].get(key)
     if pause and (lift is None or _k(lift) < _k(pause)) and (pause["until"] is None or pause["until"] > now):
+        # The pause is what is shown: it began when Matt paused, not when
+        # the limit under it was first reported.
+        entry.pop("since", None)
         entry.update(state=PAUSED, until=_iso(pause["until"]), basis="owner", reason=None, disagreement=None,
                      last_seen=None, underlying=underlying,
                      witness={"id": pause["id"], "source": "owner", "written_by": pause["written_by"],
@@ -1275,11 +1387,39 @@ def _write_order_times(times: list[datetime | None]) -> tuple[list[datetime | No
     return out, behind, ahead
 
 
+def _copied(event: dict) -> bool:
+    """Whether a line's time was copied from the record (``_stamp_locked``:
+    its Mac's clock read before the whole record) rather than read from a
+    clock."""
+    return _parse(event.get("clock_at")) is not None
+
+
+def _record_times(events: list[dict]) -> tuple[list[datetime | None], list[datetime], list[datetime]]:
+    """``_write_order_times`` for the log's lines. A line whose time was
+    copied from the record (``_copied``) is not a witness to that time: it
+    neither lengthens nor starts a run, and it counts from the line written
+    before it once that line's time is settled. Otherwise a line from a
+    clock reading 2001 that copied the time of one line written ahead would
+    make two lines agree on that time, and the fold would keep it and lift
+    every correct line after it. Doctor names copied lines by their clock's
+    reading (``clock_at``), not here."""
+    raw = [_parse(e.get("written_at")) for e in events]
+    copied = [_copied(e) for e in events]
+    fixed, behind, ahead = _write_order_times([None if c else t for t, c in zip(raw, copied)])
+    before: datetime | None = None
+    for i, (t, c) in enumerate(zip(raw, copied)):
+        if c and t is not None:
+            fixed[i] = before if before is not None else t
+        if fixed[i] is not None:
+            before = fixed[i]
+    return fixed, behind, ahead
+
+
 def _in_write_order(events: list[dict]) -> list[dict]:
     """The log's lines with times that never run backwards: no line counts as
-    later than a line written after it (``_write_order_times``)."""
+    later than a line written after it (``_record_times``)."""
     raw = [_parse(e.get("written_at")) for e in events]
-    fixed, _behind, _ahead = _write_order_times(raw)
+    fixed, _behind, _ahead = _record_times(events)
     return [dict(e, written_at=_iso(f)) if f is not None and f != r else e
             for e, r, f in zip(events, raw, fixed)]
 
@@ -1290,10 +1430,13 @@ def _lane_mapped(runner, lane, lane_map: dict) -> bool:
 
 
 def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
-         extra: Iterable[dict] = ()) -> dict:
+         extra: Iterable[dict] = (), sources: dict | None = None) -> dict:
     """The view of ``events`` (and of evidence from sources, ``extra``, in the
-    same shape with ``seq`` -1) at ``now``. Pure: reads no file, starts no
-    process, calls no model."""
+    same shape with ``seq`` -1) at ``now``. ``sources`` is the sources'
+    status (``routing_sources.collect``): a runner that stops reporting or
+    whose files stop parsing, and a change to the table's NOW block, are
+    changes to the view. Pure: reads no file, starts no process, calls no
+    model."""
     lane_map = cfg.get("routing_lane_map") or {}
     stale_after = cfg["routing_stale_after"]
     events = _in_write_order(events)
@@ -1441,6 +1584,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     times += [p["until"] for p in owner["pauses"].values() if p["until"] is not None]
     times += [_parse(h["until"]) for h in active_holds if h["until"]]
     times += reminders
+    for runner in (sources or {}).get("runners") or []:
+        times.append(_parse(runner.get("silent_deadline")))  # when it counts as stopped reporting
     future = [t for t in times if t is not None and t > now]
 
     effective: dict[str, Any] = {f"account:{e['key']}": _effective_account(e) for e in entries}
@@ -1453,8 +1598,14 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         effective["note"] = {"text": note_out["text"]}
     effective.update({f"lane:{u['runner']}/{u['lane']}": {"state": u["state"], "until": u["until"],
                                                           "basis": u["basis"]} for u in lanes})
+    for runner in (sources or {}).get("runners") or []:
+        effective[f"runner:{runner['name']}"] = {"silent": bool(runner.get("silent")),
+                                                 "unreadable": bool(runner.get("unreadable"))}
+    table = (sources or {}).get("table")
+    if table is not None:
+        effective["table"] = {"hash": table.get("hash"), "error": bool(table.get("error"))}
     return {"accounts": entries, "holds": active_holds, "rules": active_rules, "note": note_out,
-            "unmatched": lanes, "outside_app": outside_app, "seed": seed,
+            "unmatched": lanes, "outside_app": outside_app, "seed": seed, "sources": sources,
             "valid_until": _iso(min(future)) if future else None, "effective": effective}
 
 
@@ -1557,21 +1708,24 @@ def _import_seed_locked(events: list[dict], cfg: dict, now: datetime) -> tuple[s
         return (f"{unusable} of the {len(items)} entries in the rules seed file have no text; nothing was imported "
                 f"({_SEED_SHAPE})"), False
     present = {e.get("text") for e in events if e.get("type") == "rule_add" and e.get("seeded")}
-    n = max((e["n"] for e in events if e.get("type") == "rule_add" and isinstance(e.get("n"), int)), default=0)
-    stamp = _iso(_not_behind(now, _last_written_at()))
+    fresh = []
+    for rule in rules:
+        if rule["text"] not in present:
+            present.add(rule["text"])
+            fresh.append(rule)
+    n = _next_rules(events, len(fresh)) - 1 if fresh else 0
     by = {"kind": "seed", "file": Path(path).name}
     batch = []
-    for rule in rules:
-        if rule["text"] in present:
-            continue
-        present.add(rule["text"])
+    for rule in fresh:
         n += 1
         batch.append({"type": "rule_add", "id": _new_id("o"), "n": n, "text": rule["text"],
                       "source": rule["source"], "date": rule["date"], "seeded": True, "written_by": by,
-                      "via": "seed", "written_at": stamp})
+                      "via": "seed"})
     batch.append({"type": "seed_import", "id": _new_id("o"), "file": Path(path).name, "count": len(rules),
                   "sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(), "written_by": by,
-                  "via": "seed", "written_at": stamp})
+                  "via": "seed"})
+    for line, stamp in zip(batch, _stamp_locked(now, len(batch))):
+        line.update(stamp)
     _append_locked(*batch)
     return None, True
 
@@ -1588,12 +1742,12 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
     body = _scrub(body)
     prev_effective = (prev or {}).get("effective") or {}
     version = int((prev or {}).get("version") or 0)
-    changes = list((prev or {}).get("changes") or [])
+    changes = [_without_table_text(c) for c in (prev or {}).get("changes") or []]
     epoch = (prev or {}).get("epoch") or (secrets.token_hex(4) if record else None)
     if record and saved and body["effective"] != prev_effective:
         version += 1
         changed = sorted(set(body["effective"]) | set(prev_effective),
-                         key=lambda k: ({"rule": 0, "note": 1, "account": 2, "lane": 3, "hold": 4}.get(
+                         key=lambda k: ({"rule": 0, "note": 1, "account": 2, "lane": 3, "runner": 4, "table": 5, "hold": 6}.get(
                              k.partition(":")[0], 5), k))
         changed = [k for k in changed if body["effective"].get(k) != prev_effective.get(k)]
         view_for_lines = dict(body, version=version)
@@ -1605,6 +1759,18 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
     if not saved:
         out["saved"] = False
     return out
+
+
+_OLD_TABLE_STAMP = re.compile(r"^(The routing table's NOW block changed.*?) \(stamped '.*'\)\.$", re.S)
+
+
+def _without_table_text(change) -> Any:
+    """A change kept from an older view, with the table's ``updated:`` line
+    text an older version quoted dropped from its line."""
+    if not isinstance(change, dict) or not isinstance(change.get("lines"), list):
+        return change
+    lines = [_OLD_TABLE_STAMP.sub(r"\1.", line) if isinstance(line, str) else line for line in change["lines"]]
+    return dict(change, lines=lines)
 
 
 def _not_before_last_fold(now: datetime, prev: dict | None) -> datetime:
@@ -1623,9 +1789,12 @@ def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
         events, bad = read_events()
     prev = _load_view()
     now = _not_before_last_fold(now, prev)
-    body = fold(events, now=now, cfg=cfg, known=known)
+    extra, status, cache = _sources(cfg, now, prev)
+    body = fold(events, now=now, cfg=cfg, known=known, extra=extra, sources=status)
     body["seed_error"] = seed_error
-    view = _assemble(prev, body, now, bad, fingerprint, record=fingerprint["events"] is not None)
+    body["source_cache"] = cache
+    view = _assemble(prev, body, now, bad, fingerprint,
+                     record=fingerprint["events"] is not None or status is not None)
     _save_view(view)
     return view
 
@@ -1638,24 +1807,30 @@ def _unsaved_view(now: datetime) -> dict:
     events, bad = read_events()
     prev = _load_view()
     now = _not_before_last_fold(now, prev)
-    body = fold(events, now=now, cfg=cfg, known=known)
+    extra, status, cache = _sources(cfg, now, prev)
+    body = fold(events, now=now, cfg=cfg, known=known, extra=extra, sources=status)
     body["seed_error"] = None
-    return _assemble(prev, body, now, bad, fingerprint, record=bool(events), saved=False)
+    body["source_cache"] = cache
+    return _assemble(prev, body, now, bad, fingerprint, record=bool(events) or status is not None, saved=False)
 
 
 def read_view(now: datetime | None = None) -> dict:
     """The current view. Refolds when an input file changed or
     ``valid_until`` has passed; otherwise answers from view.json. Either way
     every input was checked just now, which ``checked_at`` says. With no
-    record on this Mac (no events and no seed) nothing is written and the view
-    has ``record: false`` and version 0."""
+    record on this Mac (no events, no seed and no source: no job runner
+    folder, no routing table and no usage cache) nothing is written and the
+    view has ``record: false`` and version 0."""
     explicit = now is not None
     now = now or _now()
     fingerprint, cfg, known = _inputs()
     prev = _load_view()
     if _fresh(prev, fingerprint, now):
         return dict(prev, checked_at=_iso(now))
-    if fingerprint["events"] is None and not cfg.get("routing_rules_seed"):
+    from khipu import routing_sources
+
+    if fingerprint["events"] is None and not cfg.get("routing_rules_seed") \
+            and not routing_sources.any_configured(cfg["_raw_sources"], cfg):
         body = fold([], now=now, cfg=cfg, known=known)
         body["seed_error"] = None
         return _assemble(None, body, now, 0, fingerprint, record=False)
@@ -1679,7 +1854,8 @@ def _write(event: dict) -> tuple[dict, dict]:
     a little later (``_not_behind``), so the log's times run in the order its
     lines were written and an owner's clear is newer than every report before
     it; a line stamped further ahead than that is ordered by the fold
-    (``_in_write_order``), not followed. Once
+    (``_in_write_order``), not followed. The view is refolded and saved at
+    that clock reading in every case, as ``read_view`` folds. Once
     the line is down the write is recorded: a view that can't be saved or
     folded comes back unsaved (``saved: false``), never as a failure that
     would make the caller write it again."""
@@ -1687,13 +1863,18 @@ def _write(event: dict) -> tuple[dict, dict]:
     event.setdefault("id", _new_id("e"))
     view: dict | None = None
     appended = False
+    clock: datetime | None = None
     try:
         with _lock():
-            stamp = _not_behind(_now(), _last_written_at())
-            event["written_at"] = _iso(stamp)
+            clock = _now()
+            event.update(_stamp_locked(clock)[0])
             _append_locked(event)
             appended = True
-            view = _refold_locked(stamp)
+            # Folded and saved at the clock, as a read folds, never at the
+            # line's own time: a line that copied the record's time
+            # (``clock_at``) would otherwise save a view that the next read
+            # folds back, moving the version on every write and read.
+            view = _refold_locked(clock)
     except Exception as exc:  # noqa: BLE001 - after the append, nothing here may fail the write
         if not appended:
             if isinstance(exc, OSError):
@@ -1701,7 +1882,7 @@ def _write(event: dict) -> tuple[dict, dict]:
             raise
     if view is None:
         try:
-            view = _unsaved_view(_parse(event["written_at"]) or _now())
+            view = _unsaved_view(clock or _now())
         except Exception:  # noqa: BLE001 - the line is down: the write is recorded whatever the view does
             view = {"version": None, "saved": False}
     return event, view
@@ -1947,8 +2128,7 @@ def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | 
         raise RouteError("a rule needs its words")
     with _lock():
         events, _bad = read_events()
-        n = max((e["n"] for e in events if e.get("type") == "rule_add" and isinstance(e.get("n"), int)),
-                default=0) + 1
+        n = _next_rules(events, 1)
         out = _owner_write({"type": "rule_add", "n": n, "text": text.strip(),
                             "source": _one_line(source) or "added by you", "date": now.date().isoformat(),
                             "seeded": False}, via)
@@ -1986,7 +2166,7 @@ def _witness_words(entry: dict, push: bool) -> str:
     source, by = w.get("source"), w.get("written_by")
     cli_name = _harness_label(entry)
     if source == "probe":
-        return f"read from {cli_name}"
+        return f"read from {cli_name}'s last turn" if w.get("observed") else f"read from {cli_name}"
     if source == "check":
         return "checked by Khipu"
     if source == "owner":
@@ -2085,6 +2265,40 @@ def lane_line(item: dict, now: datetime, *, relative: bool = True) -> str:
     return text
 
 
+def runner_line(runner: dict, now: datetime) -> str:
+    """A job runner that has gone dark, or is back, in plain words."""
+    name = runner["name"]
+    if runner.get("silent"):
+        at = _parse(runner.get("heartbeat_at"))
+        return f"Your {name} job runner stopped reporting" + (f" at {_clock(at, now)}" if at else "")
+    if runner.get("unreadable"):
+        since = _parse(runner.get("unreadable_since"))
+        return f"Khipu can't read {name}'s files" + (f" since {_clock(since, now)}" if since else "")
+    return f"Your {name} job runner is reporting"
+
+
+def table_line(table: dict | None, now: datetime) -> str:
+    """The routing table's NOW block as a pointer: that it changed and the
+    time its stamp gives, never its text."""
+    if not table:
+        return "The routing table is no longer read"
+    if table.get("error"):
+        return f"Khipu can't read the routing table's NOW block ({table['error']})"
+    at = _parse(table.get("changed_at"))
+    stamped = _parse(table.get("stamped_at"))
+    stamp = f" (stamped {_clock(stamped, now)})" if stamped else ""
+    return "The routing table's NOW block changed" + (f" at {_clock(at, now)}" if at else "") + f"{stamp}."
+
+
+def table_precedence(table: dict | None, now: datetime) -> str | None:
+    """Until the cutover: these account lines are newer than the table's."""
+    if not table or table.get("error") or not table.get("hash"):
+        return None
+    at = _parse(table.get("stamped_at")) or _parse(table.get("changed_at"))
+    when = f" was last stamped {_clock(at, now)}, {_ago(at, now)}" if at else " has no stamp"
+    return f"These account lines are newer than the routing table's account rows; the table's NOW block{when}."
+
+
 def rule_line(rule: dict) -> str:
     """A standing rule, whole. A seeded rule the owner has not confirmed
     says so: that mark is its only claim of ownership."""
@@ -2117,6 +2331,12 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
         runner, _, lane = ident.partition("/")
         item = next((u for u in view["unmatched"] if u["runner"] == runner and u["lane"] == lane), None)
         return lane_line(item, now, relative=False) if item else f"{runner} lane {lane}: its limit is over"
+    sources = view.get("sources") or {}
+    if kind == "runner":
+        item = next((r for r in sources.get("runners") or [] if r["name"] == ident), None)
+        return runner_line(item, now) if item else f"The {ident} job runner folder is no longer read"
+    if entity == "table":
+        return table_line(sources.get("table"), now)
     return entity
 
 
@@ -2154,7 +2374,13 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         lines.append("No routing record on this Mac.")
     else:
         width = cfg["routing_line_chars"]
+        sources = view.get("sources") or {}
+        precedence = table_precedence(sources.get("table"), now)
+        if precedence:
+            lines.append(precedence)
         items: list[tuple[str, str, str]] = []  # (kind, line, at) in display order
+        items += [("account", _clip(runner_line(r, now), width), "") for r in sources.get("runners") or []
+                  if r.get("silent") or r.get("unreadable")]
         for entry in view["accounts"]:
             items.append(("open" if entry["state"] == OPEN else "account",
                           _clip(account_line(entry, now), width), ""))
@@ -2277,7 +2503,17 @@ def doctor_block(now: datetime | None = None) -> dict:
     if newest is not None and (newest - now).total_seconds() > CLOCK_TOLERANCE:
         warnings.append(f"The routing record holds times ahead of this Mac's clock (as late as "
                         f"{_iso(newest)}); Khipu goes by the clock. Check the Mac's date and time.")
-    _fixed, behind, ahead = _write_order_times([_parse(e.get("written_at")) for e in events])
+    numbers = [e[f] for e in events for f in ("seq", "n") if isinstance(e.get(f), int)]
+    if _crowded(numbers):
+        warnings.append("The routing record holds a line numbered at the most a line can hold (edited by hand or "
+                        "merged); Khipu numbers new lines below it, so that line may sort out of order.")
+    _fixed, behind, ahead = _record_times(events)
+    # Lines that took the record's time because their Mac's clock read before
+    # the whole record (``_stamp_locked``) are named by that reading.
+    for event in events:
+        written, clock = _parse(event.get("written_at")), _parse(event.get("clock_at"))
+        if written and clock and (written - clock).total_seconds() > CLOCK_TOLERANCE:
+            behind.append(clock)
     for found, side, edge, which in ((behind, "before", "early", min), (ahead, "after", "late", max)):
         if found:
             them = "them" if len(found) != 1 else "it"
@@ -2285,6 +2521,20 @@ def doctor_block(now: datetime | None = None) -> dict:
                             f"well {side} the lines written around {them} (as {edge} as {_iso(which(found))}); "
                             f"Khipu counts each from the line {side} it. Check the date and time on the Mac "
                             f"that wrote {them}.")
+    sources = view.get("sources") or {}
+    warnings += [runner_line(r, now) + "." for r in sources.get("runners") or []
+                 if r.get("silent") or r.get("unreadable")]
+    if sources.get("refused"):
+        warnings.append("A job runner folder was refused because it is inside a private folder.")
+    if sources.get("invalid"):
+        warnings.append(f"{sources['invalid']} job runner folder setting{'s are' if sources['invalid'] != 1 else ' is'} "
+                        "not valid and left out (each needs a name, kind \"lanes\" and the folder's full path).")
+    from khipu import routing_sources
+
+    cache = view.get("source_cache") or {}
+    checks = routing_sources.rule_checks(cache, view.get("rules") or [])
+    warnings += [c["text"] for c in checks if c["status"] == "broken"]
+    warnings += _launch_warnings(view, routing_sources.launches(cache), cfg, now)
     return {"record": bool(view.get("record")), "version": view["version"], "folded_at": view.get("folded_at"),
             "valid_until": view.get("valid_until"),
             "accounts": [{"account": e["label"], "state": e["state"], "until": e["until"], "basis": e["basis"],
@@ -2292,7 +2542,47 @@ def doctor_block(now: datetime | None = None) -> dict:
             "holds": len(view.get("holds") or []), "rules": len(view.get("rules") or []),
             "rules_to_confirm": sum(1 for r in view.get("rules") or [] if r["seeded"] and not r["confirmed"]),
             "note": view.get("note") is not None, "outside_app": view.get("outside_app") or [],
-            "seed_error": view.get("seed_error"), "bad_lines": view.get("bad_lines", 0), "warnings": warnings}
+            "seed_error": view.get("seed_error"), "bad_lines": view.get("bad_lines", 0),
+            "sources": _sources_brief(sources), "rule_checks": checks, "warnings": warnings}
+
+
+def _sources_brief(sources: dict) -> dict:
+    """The sources' status as doctor and ``khipu route sources`` show it."""
+    return {"runners": [{k: r.get(k) for k in ("name", "path", "files", "heartbeat_at", "interval", "silent",
+                                                 "unreadable", "unreadable_since", "lanes", "unmatched_lanes")}
+                        for r in sources.get("runners") or []],
+            "refused": sources.get("refused") or [], "invalid": sources.get("invalid") or 0,
+            "usage": sources.get("usage"), "table": sources.get("table")}
+
+
+def _launch_warnings(view: dict, launched: list[dict], cfg: dict, now: datetime) -> list[str]:
+    """"A job was started on <account> while you had it paused", or "...after
+    it had reached its limit": a LAUNCH line, through the lane map, after the
+    pause or the limit now shown began (and before the limit's end)."""
+    lane_map = cfg.get("routing_lane_map") or {}
+    known = [{"key": a["key"], "label": a["label"], "harness": a["harness"], "home": a.get("home")}
+             for a in view["accounts"]]
+    by_key = {a["key"]: a for a in view["accounts"]}
+    out: list[str] = []
+    said: set[str] = set()
+    for item in launched:
+        key = _evidence_account({"runner": item["runner"], "lane": item["lane"]}, lane_map, known)
+        entry = by_key.get(key or "")
+        at = _parse(item["at"])
+        if entry is None or at is None or key in said:
+            continue
+        witnessed = (entry.get("witness") or {}).get("at")
+        began = _parse(witnessed if entry["state"] == PAUSED else entry.get("since") or witnessed)
+        until = _parse(entry.get("until"))
+        if began is None or at < began:
+            continue
+        if entry["state"] == PAUSED:
+            out.append(f"A job was started on {entry['label']} while you had it paused.")
+            said.add(key)
+        elif entry["state"] == LIMITED and (until is None or at < until):
+            out.append(f"A job was started on {entry['label']} after it had reached its limit.")
+            said.add(key)
+    return out
 
 
 # ---- the CLI ---------------------------------------------------------------------------
@@ -2355,12 +2645,50 @@ def _print_view(view: dict, now: datetime, account: str | None) -> None:
         print("Holds:")
         for hold in holds:
             print(f"  [{hold['id']}] {hold_line(hold, now, push=False)}")
+    dark = [r for r in (view.get("sources") or {}).get("runners") or [] if r.get("silent") or r.get("unreadable")]
+    if dark and account is None:
+        print("Job runners:")
+        for runner in dark:
+            print(f"  {runner_line(runner, now)}")
     if view.get("unmatched") and account is None:
         print("Lanes not matched to an account:")
         for item in view["unmatched"]:
             print(f"  {lane_line(item, now)}")
     if view.get("seed_error"):
         print(f"Rules seed: {view['seed_error']}")
+
+
+def _print_sources(out: dict, now: datetime) -> None:
+    """``khipu route sources``: each job runner folder with its last good
+    read and any error, the usage cache and the routing table."""
+    if not (out["runners"] or out["refused"] or out["invalid"] or out["table"]):
+        print("No job runner folders are registered (routing_sources).")
+    for runner in out["runners"]:
+        print(f"{runner['name']}: {runner['path']}")
+        beat = _parse(runner.get("heartbeat_at"))
+        if runner.get("silent"):
+            print("  stopped reporting" + (f" at {_clock(beat, now)}" if beat else " (no heartbeat read)"))
+        elif beat:
+            print(f"  reporting; last heartbeat {_ago(beat, now)}")
+        for name, f in sorted((runner.get("files") or {}).items()):
+            good = _parse(f.get("good_at"))
+            last = f"last good read {_clock(good, now)}" if good else "never read"
+            print(f"  {name}: " + (f"can't read it ({f['error']}) since {_clock(_parse(f['since']), now)}; {last}"
+                                   if f.get("error") else last))
+        if runner.get("unmatched_lanes"):
+            print("  lanes not matched to an account: " + ", ".join(runner["unmatched_lanes"]))
+    for name in out["refused"]:
+        print(f"{name}: refused, because it is inside a private folder")
+    if out["invalid"]:
+        print(f"{out['invalid']} job runner folder setting(s) not valid")
+    usage = out.get("usage") or {}
+    newest = _parse(usage.get("newest"))
+    print(f"Usage cache: {usage.get('accounts') or 0} account(s)" + (f", newest figures {_ago(newest, now)}"
+                                                                      if newest else ""))
+    table = out.get("table")
+    if table:
+        print(f"Routing table: {table['path']}")
+        print(f"  {table_line(table, now)}")
 
 
 def _parse_since(raw) -> tuple[int, str | None]:
@@ -2405,9 +2733,17 @@ def run_cli(args) -> int:
                                    if account is None or e["key"] == account]
                 out.pop("fingerprint", None)
                 out.pop("digest", None)
+                out.pop("source_cache", None)
                 _print_json(out)
             else:
                 _print_view(view, now, account)
+            return 0
+        if cmd == "sources":
+            out = _sources_brief(read_view(now).get("sources") or {})
+            if args.json:
+                _print_json(out)
+            else:
+                _print_sources(out, now)
             return 0
         if cmd == "report":
             out = report(state=args.state, account=args.account, runner=args.runner, lane=args.lane,
