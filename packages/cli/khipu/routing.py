@@ -149,6 +149,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_push_delegation": ("switch", True, "Tell conversations before handing work to another agent"),
     "routing_prompt_chars": ("count", 400, "Longest update before a prompt, rules and note aside (0: no limit)"),
     "routing_prompt_budget_ms": ("count", 50, "Time allowed before a prompt, in milliseconds"),
+    "routing_start_budget_ms": ("count", 1000, "Time allowed at the start of a conversation, in milliseconds"),
     "routing_resend_after_versions": ("count", 20, "Send everything again after this many changes (0: never)"),
     "routing_resend_after": ("duration", 6 * 3600, "Send everything again after (0: never)"),
     "routing_not_refreshed_after": ("duration", 5 * 60, "The record counts as not refreshed after (0: never)"),
@@ -3183,13 +3184,14 @@ def _conversation_write(args: dict, *, author: dict, now: datetime | None = None
     return end_hold(hold_id, owner=False, author=by, via="mcp", now=now)
 
 
-def light_status(now: datetime | None = None) -> dict:
+def light_status(now: datetime | None = None, *, lock_wait: float = LIGHT_LOCK_BUDGET) -> dict:
     """The ``routing`` field of ``khipu_status``'s light payload: the summary
     a conversation gets at its start (``khipu route --summary``), for a
-    harness with no hooks. It waits for the routing lock only
-    ``LIGHT_LOCK_BUDGET``, well inside the time khipu_status gives it, so a
-    held lock still answers, from an unsaved fold."""
-    with lock_budget(LIGHT_LOCK_BUDGET):
+    harness with no hooks, and the text the session-start hook pushes
+    (``start_push``). It waits for the routing lock only ``lock_wait``
+    (``LIGHT_LOCK_BUDGET``, well inside the time khipu_status gives it), so
+    a held lock still answers, from an unsaved fold."""
+    with lock_budget(lock_wait):
         now = now or _now()
         view = read_view(now)
         out = summary(view, now=now)
@@ -3197,6 +3199,57 @@ def light_status(now: datetime | None = None) -> dict:
     # owner's own words whole; it holds no key and no configured path.
     return {"text": out["text"], "version": out["version"], "epoch": out["epoch"], "dropped": out["dropped"],
             "about": ABOUT}
+
+
+# ---- the push at session start (phase 3a) ------------------------------------------------
+#
+# The session-start hook (``recall_rule.session_start_main``) adds the full
+# summary to what it already prints. It is the same text as ``light_status``:
+# one projection, built from labels and names with the owner's words whole.
+# Matt's old bypass for the routing table's hook turns this off too.
+ROUTING_NOW_DISABLE_FILE = "/tmp/.routing_now_disable"
+PUSH_MOMENTS = {"start": "routing_push_start", "prompt": "routing_push_prompt",
+                "delegation": "routing_push_delegation"}
+# The session-start hook is given 10 s by its harness; routing never takes
+# more than this, whatever the setting says, so the memory part still lands.
+START_BUDGET_MOST_MS = 8000
+
+
+def push_off(moment: str) -> str | None:
+    """Why nothing is pushed at ``moment`` (start, prompt or delegation), or
+    None when the push is on: ``ROUTING_NOW_OFF=1`` or the file
+    ``/tmp/.routing_now_disable`` (the old hook's bypass), the
+    ``routing_push`` feature (off by default), then the moment's setting."""
+    if (os.environ.get("ROUTING_NOW_OFF") or "").strip().lower() in _TRUE:
+        return "ROUTING_NOW_OFF"
+    if os.path.exists(ROUTING_NOW_DISABLE_FILE):
+        return "routing_now_disable"
+    from khipu import features
+
+    if not features.enabled("routing_push"):
+        return "routing_push off"
+    key = PUSH_MOMENTS[moment]
+    if not settings()[key]:
+        return f"{key} off"
+    return None
+
+
+def start_budget() -> float:
+    """Seconds the session-start hook gives routing (``routing_start_budget_ms``,
+    at most ``START_BUDGET_MOST_MS``)."""
+    ms = settings()["routing_start_budget_ms"]
+    return min(max(0, ms), START_BUDGET_MOST_MS) / 1000.0
+
+
+def start_push(budget: float | None = None) -> dict | None:
+    """The full summary for the session-start hook, or None when the push is
+    off. Waits for the routing lock at most half of ``budget`` (then answers
+    from an unsaved fold, as ``light_status`` does). The hook bounds the
+    whole call and treats any exception as nothing to push."""
+    if push_off("start"):
+        return None
+    budget = start_budget() if budget is None else budget
+    return light_status(lock_wait=budget / 2)
 
 
 # ---- khipu route wait --------------------------------------------------------------------

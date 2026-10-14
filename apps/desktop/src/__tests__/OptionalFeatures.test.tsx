@@ -20,6 +20,7 @@ const NAMES = [
   "graph_candidates",
   "decision_details",
   "auto_supersede",
+  "routing_push",
 ];
 
 type Backend = {
@@ -98,9 +99,9 @@ function switchFor(label: RegExp) {
 }
 
 describe("OptionalFeatures", () => {
-  it("shows the nine switches, the six recommended ones first, then the rejected group apart", async () => {
+  it("shows the ten switches, the six recommended ones first, routing apart, then the rejected group", async () => {
     render(<OptionalFeatures active />);
-    await waitFor(() => expect(screen.getAllByRole("switch")).toHaveLength(10)); // nine plus the recall service
+    await waitFor(() => expect(screen.getAllByRole("switch")).toHaveLength(11)); // ten plus the recall service
     const order = screen.getAllByRole("switch").map((el) => el.id);
     expect(order).toEqual([
       "feat-validity_ranking",
@@ -110,6 +111,7 @@ describe("OptionalFeatures", () => {
       "feat-reflect",
       "feat-briefs",
       "feat-recall-service",
+      "feat-routing_push",
       "feat-graph_candidates",
       "feat-decision_details",
       "feat-auto_supersede",
@@ -121,6 +123,9 @@ describe("OptionalFeatures", () => {
     expect(screen.getByText(/about 0\.8 s to a search/)).toBeInTheDocument();
     expect(screen.getByText(/up to 40 topics a night/)).toBeInTheDocument();
     expect(screen.getByText(/only when you ask/)).toBeInTheDocument();
+    const routing = screen.getByText("Routing", { selector: ".section-head" }).closest(".section-card") as HTMLElement;
+    expect(within(routing).getByRole("switch", { name: /Tell conversations which accounts are open/ })).not.toBeChecked();
+    expect(within(routing).getByText(/never chooses where work goes/)).toBeInTheDocument();
   });
 
   it("reflects what the CLI reports as on and off", async () => {

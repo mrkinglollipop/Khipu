@@ -511,7 +511,7 @@ async fn khipu_capture_now() -> Result<String, String> {
 // read it as a flag). The gateway token travels on stdin. None of these verbs
 // join `ALLOWED_SUBCOMMANDS`.
 
-/// The nine switches in `khipu.features.FEATURES`.
+/// The ten switches in `khipu.features.FEATURES`.
 const FEATURE_NAMES: &[&str] = &[
     "validity_ranking",
     "time_interpretation",
@@ -522,6 +522,7 @@ const FEATURE_NAMES: &[&str] = &[
     "graph_candidates",
     "decision_details",
     "auto_supersede",
+    "routing_push",
 ];
 
 /// The scheduled jobs `khipu jobs install|uninstall` accepts (`_JOBS_CHOICES`).
@@ -3058,7 +3059,7 @@ mod settings_command_tests {
 
     #[test]
     fn every_switch_builds_an_on_and_an_off_argv() {
-        assert_eq!(FEATURE_NAMES.len(), 9);
+        assert_eq!(FEATURE_NAMES.len(), 10);
         for n in FEATURE_NAMES {
             assert_eq!(feature_set_argv(n, true).unwrap(), v(&["features", "--set", n, "on"]));
             assert_eq!(feature_set_argv(n, false).unwrap(), v(&["features", "--set", n, "off"]));

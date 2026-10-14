@@ -30,6 +30,8 @@ import json
 import os
 import sqlite3
 import sys
+import threading
+import time
 from pathlib import Path
 
 from khipu.t3 import is_helper_session
@@ -448,24 +450,106 @@ def _pushed_memory_slice(cwd: str | None) -> str:
     return "\n".join(lines)
 
 
-def _session_start_cwd() -> str | None:
+def _session_start_payload() -> dict:
+    """The hook's stdin payload, or {} (no input, not JSON, unreadable)."""
     try:
         raw = sys.stdin.read()
         if raw.strip():
             payload = json.loads(raw)
             if isinstance(payload, dict):
-                cwd = payload.get("cwd") or payload.get("cwd_path")
-                if isinstance(cwd, str) and cwd.strip():
-                    return cwd
-                # Cursor sessionStart: common input uses workspace_roots, not cwd.
-                roots = payload.get("workspace_roots")
-                if isinstance(roots, list) and roots:
-                    first = roots[0]
-                    if isinstance(first, str) and first.strip():
-                        return first
+                return payload
+    except Exception:
+        return {}
+    return {}
+
+
+def _session_start_cwd(payload: dict | None = None) -> str | None:
+    """The session's folder from the payload (read from stdin when not given)."""
+    try:
+        if payload is None:
+            payload = _session_start_payload()
+        cwd = payload.get("cwd") or payload.get("cwd_path")
+        if isinstance(cwd, str) and cwd.strip():
+            return cwd
+        # Cursor sessionStart: common input uses workspace_roots, not cwd.
+        roots = payload.get("workspace_roots")
+        if isinstance(roots, list) and roots:
+            first = roots[0]
+            if isinstance(first, str) and first.strip():
+                return first
     except Exception:
         return None
     return None
+
+
+# ---- routing at session start (routing truth, phase 3a) -----------------------
+#
+# Session start runs for every conversation on the Mac, so the routing part
+# can never block or break it: it runs on its own thread, started before the
+# memory slice so the two overlap, and is given ``routing_start_budget_ms``
+# from that moment. Late, failed or switched off, it adds nothing and the
+# hook prints exactly what it printed before routing existed. A thread still
+# running when the hook exits is abandoned (it only ever replaces view.json
+# atomically).
+
+
+class _RoutingAtStart:
+    def __init__(self) -> None:
+        self.box: dict = {}
+        self.deadline = time.monotonic()
+        self.thread: threading.Thread | None = None
+
+    def begin(self) -> "_RoutingAtStart":
+        try:
+            from khipu import routing
+
+            started = time.monotonic()
+            # One small config read; any failure means the default second.
+            try:
+                budget = routing.start_budget()
+            except Exception:
+                budget = 1.0
+
+            def work() -> None:
+                try:
+                    self.box["out"] = routing.start_push(budget)
+                except BaseException:  # noqa: BLE001 - nothing for routing, never a failed hook
+                    self.box["out"] = None
+
+            self.deadline = started + budget
+            self.thread = threading.Thread(target=work, name="khipu-routing-start", daemon=True)
+            self.thread.start()
+        except Exception:
+            self.thread = None
+        return self
+
+    def text(self) -> str | None:
+        """The summary's text, or None (off, failed, late or empty)."""
+        if self.thread is None:
+            return None
+        try:
+            self.thread.join(max(0.0, self.deadline - time.monotonic()))
+            if self.thread.is_alive():
+                return None
+            out = self.box.get("out")
+            text = out.get("text") if isinstance(out, dict) else None
+            return text if isinstance(text, str) and text.strip() else None
+        except Exception:
+            return None
+
+    def delivered(self, session_id) -> None:
+        """Reset the session's last-seen version to the one just printed and
+        record the time of this full summary."""
+        out = self.box.get("out")
+        if not isinstance(session_id, str) or not session_id or not isinstance(out, dict):
+            return
+        try:
+            from khipu import recall_prompt, routing
+
+            recall_prompt.mark_routing_full(session_id, version=out["version"], epoch=out.get("epoch"),
+                                            at=routing._iso(routing._now()))
+        except Exception:
+            pass
 
 
 def session_start_main(*, shape: str | None = None) -> None:
@@ -474,25 +558,34 @@ def session_start_main(*, shape: str | None = None) -> None:
     ``shape`` is ``cursor`` (flat ``additional_context``) or ``claude`` (nested
     ``hookSpecificOutput``). Default is Claude. Cursor installs pass ``--cursor``
     on the shim argv; a process-wide env var must not reshape Claude SessionStart.
+    With routing's push on, the full routing summary follows the memory part.
     """
-    cwd = _session_start_cwd()
+    payload = _session_start_payload()
+    cwd = _session_start_cwd(payload)
     if is_helper_session(cwd):
         print("{}")  # T3's thread-title helper: no recall
         return
+    routing = _RoutingAtStart().begin()
     ctx = session_start_context(cwd)
+    extra = routing.text()
+    if extra:
+        ctx = f"{ctx}\n\n{extra}"
     if shape is None:
         shape = "cursor" if "--cursor" in sys.argv[1:] else "claude"
     want = shape.strip().lower()
     if want == "cursor":
-        print(json.dumps({"additional_context": ctx}))
-        return
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
-                    "additionalContext": ctx,
-                }
+        out = {"additional_context": ctx}
+    else:
+        out = {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": ctx,
             }
-        )
-    )
+        }
+    print(json.dumps(out))
+    if extra:
+        try:
+            sys.stdout.flush()
+        except Exception:
+            return
+        routing.delivered(payload.get("session_id") or payload.get("sessionId"))
