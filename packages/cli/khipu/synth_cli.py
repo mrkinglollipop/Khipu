@@ -101,9 +101,17 @@ def binary(name: str) -> str | None:
     return None
 
 
+# The summariser runs on the owner's default Claude login (``~/.claude``), never
+# on the login of whichever session queued the capture: a Stop hook fired from
+# a session on a second account carries that account's CLAUDE_CONFIG_DIR, and on
+# 2026-10-14 the drains it spawned billed Haiku to the second account and hit
+# its five-hour limit while the main account was idle.
+_DROPPED = {"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CONFIG_DIR"}
+
+
 def environment() -> dict[str, str]:
     return {k: v for k, v in os.environ.items()
-            if k not in {"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"} and not k.startswith("KHIPU_")}
+            if k not in _DROPPED and not k.startswith("KHIPU_")}
 
 
 def error_text(message: str, prompt: str, env: dict[str, str]) -> str:

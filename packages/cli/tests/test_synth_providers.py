@@ -830,3 +830,15 @@ def test_cli_failure_recognises_the_session_limit_diagnostic():
     assert extract._cli_failure("You've hit your session limit · resets 4:50am (America/New_York)")
     assert extract._cli_failure("API Error: You've hit your limit")
     assert not extract._cli_failure('{"summary": "You\'ve hit your limit was the error we fixed."}')
+
+
+def test_cli_environment_uses_the_default_claude_login(monkeypatch):
+    # A capture queued by a session on a second account must not bill that
+    # account: CLAUDE_CONFIG_DIR is dropped with the harness markers.
+    monkeypatch.setenv('CLAUDE_CONFIG_DIR', '/tmp/second-account')
+    monkeypatch.setenv('CLAUDECODE', '1')
+    monkeypatch.setenv('KHIPU_HOOK_STDIN', 'x')
+    monkeypatch.setenv('HOME', '/tmp/home-kept')
+    env = synth_cli.environment()
+    assert 'CLAUDE_CONFIG_DIR' not in env and 'CLAUDECODE' not in env and 'KHIPU_HOOK_STDIN' not in env
+    assert env['HOME'] == '/tmp/home-kept'
