@@ -738,6 +738,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         plan_usage_block = _usage.doctor_block()
     except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
         plan_usage_block = {"accounts": [], "warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # Routing truth (docs/plans/2026-10-14-routing-truth.md, phase 1a): the
+    # record's version, each account's line and its warnings. Read from the
+    # record only (nothing is probed); visibility only, it never gates `ok`.
+    try:
+        from khipu import routing as _routing
+
+        routing_block = _routing.doctor_block()
+    except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
+        routing_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -775,8 +784,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "features": features_block,
         "decision_links": decision_links_block,
         "plan_usage": plan_usage_block,
-        # Warnings that never gate `ok` (today: plans nearly used up).
-        "warnings": list(plan_usage_block.get("warnings") or []),
+        "routing": routing_block,
+        # Warnings that never gate `ok` (plans nearly used up; routing).
+        "warnings": list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or []),
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -1956,6 +1966,15 @@ def cmd_usage(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_route(args: argparse.Namespace) -> int:
+    """`khipu route`: the routing record (scope docs/plans/2026-10-14-routing-truth.md,
+    phase 1a). Khipu reports which accounts are open, by whom and since when;
+    it never chooses, refuses, launches or reorders work."""
+    from khipu import routing
+
+    return routing.run_cli(args)
+
+
 def cmd_owed(args: argparse.Namespace) -> int:
     """W3.4: `khipu owed` — list, close, reopen, or snooze commitments."""
     from khipu.db import connect
@@ -2765,6 +2784,20 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 2
         print(json.dumps({"ok": True, "usage_accounts": usage.accounts_status(), "config_file": str(path)}))
         return 0
+    from khipu import routing as _routing
+
+    if (args.set and args.set[0] in _routing.SETTINGS) or args.unset in _routing.SETTINGS:
+        # Every size, time and switch of the routing record (routing truth
+        # scope, decision 13): `--set routing_stale_after 12h`, `--unset` for
+        # the default again.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = _routing.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: _routing.settings_status()[key], "config_file": str(path)}))
+        return 0
     if (args.set and args.set[0] in CHOICE_SETTINGS) or args.unset in CHOICE_SETTINGS:
         from khipu.config import choice_setting, set_choice_setting
 
@@ -2863,6 +2896,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "relevance_cosine_floor": relevance.cosine_floor_status(),
         "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
         "usage_accounts": usage.accounts_status(),
+        "routing": _routing.settings_status(),
         "config_file": str(config_file()),
         "config": load_config(),
     }
@@ -4454,6 +4488,74 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reuse a cached probe younger than S seconds (default 120); older figures are marked stale",
     )
     us.set_defaults(func=cmd_usage)
+
+    rt = sub.add_parser(
+        "route",
+        help="The routing record: which accounts are open, by whom and since when (Khipu reports; it never routes)",
+    )
+    rt.add_argument("--json", action="store_true", help="Print JSON")
+    rt.add_argument("--since", default=None, metavar="V",
+                    help="The current state of everything that changed after version V (or EPOCH:V)")
+    rt.add_argument("--summary", action="store_true", help="The summary a conversation gets at its start")
+    rt.add_argument("--brief", action="store_true", help="The text a job runner puts into a brief")
+    rt.add_argument("--account", dest="view_account", default=None, metavar="A", help="One account only")
+    rt.set_defaults(func=cmd_route, route_cmd=None)
+    # Writes always print JSON; --json is accepted after any of them too, so a
+    # script that adds it to every khipu call doesn't lose its write. SUPPRESS
+    # keeps `route --json <write>` from being reset by the subcommand's default.
+    rt_json = argparse.ArgumentParser(add_help=False)
+    rt_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                         help="Print JSON (writes always do)")
+    rt_sub = rt.add_subparsers(dest="route_cmd")
+    rep = rt_sub.add_parser("report", help="Record what a conversation learned about an account", parents=[rt_json])
+    rep.add_argument("--account", default=None, metavar="A", help="The account (its label, or harness|login folder)")
+    rep.add_argument("--runner", default=None,
+                     help="With --lane: a job runner's lane; only a lane routing_lane_map names")
+    rep.add_argument("--lane", default=None)
+    rep.add_argument("--state", required=True, choices=("limited", "open", "down"))
+    rep.add_argument("--until", default=None, metavar="T", help="When the limit ends (a guess unless --message says)")
+    rep.add_argument("--window", default=None, choices=("five-hour", "weekly"))
+    rep.add_argument("--model", default=None,
+                     help="The model a model-scoped limit closes (a model's name; not with --state down)")
+    rep.add_argument("--message", default=None, help="The limit message itself, word for word")
+    rep.add_argument("--seen", default=None, metavar="T",
+                     help="When the message was shown (a time, or how long ago: 10m); a reset clock time "
+                          "with no day counts as the CLI's own only with it")
+    rep.add_argument("--name", default=None, help="What the conversation calls itself (shown beside its author)")
+    rep.add_argument("--evidence", default=None, help="One line of evidence")
+    hold = rt_sub.add_parser("hold", help='Add a hold: hold "<words>" --reason R; or end one: hold end <id>',
+                             parents=[rt_json])
+    hold.add_argument("words", nargs="+")
+    hold.add_argument("--reason", default=None, choices=("machine-busy", "disk-low", "keep", "outage", "other"))
+    hold.add_argument("--until", default=None, metavar="T")
+    hold_scope = hold.add_mutually_exclusive_group()
+    hold_scope.add_argument("--account", default=None, metavar="A")
+    hold_scope.add_argument("--machine", action="store_true")
+    hold_scope.add_argument("--all", action="store_true")
+    hold.add_argument("--owner", action="store_true", help="The owner's hold (asks for a typed confirmation)")
+    hold.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    rpause = rt_sub.add_parser("pause", help="Owner: mark an account paused (asks for a typed confirmation)",
+                               parents=[rt_json])
+    rpause.add_argument("account")
+    rpause.add_argument("--until", default=None, metavar="T")
+    rpause.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    rlift = rt_sub.add_parser("lift", help="Owner: lift a pause (asks for a typed confirmation)", parents=[rt_json])
+    rlift.add_argument("account")
+    rlift.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    rclear = rt_sub.add_parser("clear", help="Owner: clear an account, or dismiss one report (--report ID)",
+                               parents=[rt_json])
+    rclear.add_argument("account")
+    rclear.add_argument("--report", default=None, metavar="ID")
+    rclear.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    rnote = rt_sub.add_parser("note", help="Owner: set or end the note to every conversation", parents=[rt_json])
+    rnote.add_argument("action", choices=("set", "end"))
+    rnote.add_argument("text", nargs="?", default=None)
+    rnote.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire or confirm a standing rule", parents=[rt_json])
+    rrule.add_argument("action", choices=("add", "edit", "retire", "confirm"))
+    rrule.add_argument("params", nargs="*")
+    rrule.add_argument("--source", default=None, help="Where the rule comes from (rule add)")
+    rrule.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
 
     dec = sub.add_parser(
         "decisions", help="Decisions registry: list / supersede / restore / retract / links (O2, Phase 2A)"

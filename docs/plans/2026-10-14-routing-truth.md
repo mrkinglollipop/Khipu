@@ -24,7 +24,7 @@ can see and change all of it in the app. Khipu never decides where work goes.
 | Phase | What | Size | State |
 |---|---|---|---|
 | 0 | This scope; the mocks of the Home Routing card and Settings → Routing; a throwaway-hook check of five hook facts | S | done 2026-10-14 (scope and mocks approved; hook check: five of five yes, see Phase 0 results) |
-| 1a | The record and its fold: event log, versioned view with clock-driven refolds, rules, Matt's note, holds, owner clear; `khipu route`; the doctor block | M | open (needs plan usage phase 2 merged) |
+| 1a | The record and its fold: event log, versioned view with clock-driven refolds, rules, Matt's note, holds, owner clear; `khipu route`; the doctor block | M | done 2026-10-14 (one known limit, see Known limits; its fix is in phase 1b) |
 | 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | open |
 | 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | open |
 | 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | open |
@@ -260,9 +260,11 @@ MCP tool refuses them. Doctor warns when any of them was written by anything oth
    A report can mark an account limited, open or down, and can add holds. Its basis is **estimated** unless
    it passes the limit message itself and Khipu parses a reset time out of it (the forms "resets 8pm
    (America/New_York)" and "resets at <ISO time>"), which makes it **cli**; a conversation cannot declare a
-   basis. Its `until` is clamped to the length of the window it names (five hours or seven days) and is 30
-   minutes when omitted. Its author is set by Khipu, as above. A report cannot write rules, the note, owner
-   pauses or clears.
+   basis. "resets 8pm (zone)" names no day, so it is **cli** only with `--seen`, when the message was shown
+   (the next 8 pm after that); without it the day is guessed from the report's time and the report is
+   **estimated**. Its `until` is clamped to the length of the window it names (five hours or seven days)
+   and is 30 minutes when omitted. Its author is set by Khipu, as above. A report cannot write rules, the
+   note, owner pauses or clears.
 4. **The owner in the app**: pauses and lifts, clears and dismissals, holds, the rules and his note.
 5. **Until the cutover only: the table, read only, and never as account state.** Setting `routing_table`
    names the file. Khipu reads the NOW block's `updated:` line and a hash of the block. When the hash changes,
@@ -418,8 +420,11 @@ at most three checks per reset: the first and two retries.
   exactly the session-start text, `--brief` is what a runner pastes into a brief, and `--since` prints the
   current state of everything that changed after a version.
 - `khipu route report (--account A | --runner R --lane L) --state limited|open|down [--until T] [--window
-  five-hour|weekly] [--model M] [--message "<the limit message>"] [--name "<what the conversation calls
-  itself>"] [--evidence "<line>"]` records what a conversation learned. Khipu sets the author and the basis.
+  five-hour|weekly] [--model M] [--message "<the limit message>"] [--seen T] [--name "<what the conversation
+  calls itself>"] [--evidence "<line>"]` records what a conversation learned. Khipu sets the author and the
+  basis. The fields that are pushed take no free text: `--model` is a model's name (not with `--state down`,
+  which is about the whole account), a conversation's `--runner`/`--lane` must be a lane the lane map names,
+  and a harness Khipu doesn't know is recorded as unknown.
 - `khipu route hold "<text>" --reason R --until T [--account A | --machine | --all]` adds a hold, and `khipu
   route hold end <id>` ends one.
 - The owner's commands: `khipu route pause <account> [--until T]`, `khipu route lift <account>`, `khipu
@@ -671,6 +676,11 @@ only; copied into fixtures by shape, with names changed) and the usage cache bef
   makes an account Unknown when the runner is its only source; a source path under a credential folder is
   refused; every runner file is opened read-only (assert that no write handle is opened); a `config.json` key
   outside the named list never reaches the record.
+- Settle write order when a line is written, not when the log is read: the known limit below. The writer
+  holds the log lock and sees the last line, so it can record a sequence number with each line and the fold
+  can order by that instead of guessing from times. Test the known limit's case: `[T0, T0+1m, three lines
+  dated 2001, N correct lines]` for N = 0, 1 and 10; the history keeps its times once N >= 1, and doctor names
+  the 2001 lines, not the T0 lines.
 - Stop-condition: if an adapter would need to write or lock a runner file, stop and ask.
 
 Useful alone: one command answers which accounts are open right now, according to whom, and since when.
@@ -892,6 +902,17 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
     at their limit (decision 7); the seven seeded rules and their wording, which still arrive marked
     "seeded" until he confirms each in Settings → Routing (decision 19); and his note as the place for his
     direction on where work should go (decision 18).
+
+## Known limits
+
+- **A Mac clock that reads low for a while (phase 1a, accepted by Matt 2026-10-14).** The fold decides which
+  out-of-order line has the wrong time from the log alone. When a Mac writes a run of lines while its clock is
+  more than `CLOCK_TOLERANCE` (5 minutes) behind, and that run is longer than the history written before it,
+  the fold keeps the low run and reads the earlier history as old: reports show as Unknown, an owner hold
+  comes due for its reminder early, and doctor names the correct lines as the ones with the wrong date. More
+  correct lines afterwards do not undo it. Nothing is lost: the log keeps every line as written, so the
+  phase 1b fix re-reads it correctly. Three fix rounds each closed one clock case and opened another, because
+  times alone cannot always say which clock was wrong; the phase 1b fix orders lines when they are written.
 
 ## Unverified
 
