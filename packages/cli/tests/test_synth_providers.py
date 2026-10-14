@@ -842,3 +842,32 @@ def test_cli_environment_uses_the_default_claude_login(monkeypatch):
     env = synth_cli.environment()
     assert 'CLAUDE_CONFIG_DIR' not in env and 'CLAUDECODE' not in env and 'KHIPU_HOOK_STDIN' not in env
     assert env['HOME'] == '/tmp/home-kept'
+
+
+@pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
+def test_cli_child_path_carries_the_cli_folder_under_a_bare_path(provider, tmp_path, monkeypatch):
+    # The launchd drain runs with a bare system PATH; a CLI found under a Node
+    # version manager needs its own folder (where node lives) on the child's PATH.
+    folder = tmp_path / '.nvm' / 'versions' / 'node' / 'v22.0.0' / 'bin'
+    folder.mkdir(parents=True)
+    name = provider.removesuffix('-cli')
+    fake = folder / name
+    fake.write_text('#!/bin/sh\nexit 0\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')
+    models.set_models_merge_role('synth', provider=provider, model_id='m')
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen['argv0'] = argv[0]
+        seen['path'] = kw['env']['PATH']
+        raise RuntimeError('stop')
+
+    with mock.patch.object(synth_cli, 'binary', return_value=str(fake)), \
+         mock.patch.object(extract.subprocess, 'run', side_effect=fake_run), \
+         mock.patch.object(extract.time, 'sleep'), \
+         pytest.raises(RuntimeError):
+        getattr(extract, f'_generate_{name}_cli')('p', model_id='m', retries=0)
+    assert seen['argv0'] == str(fake)
+    assert str(folder) in seen['path'].split(':')
+    assert seen['path'].split(':')[:4] == ['/usr/bin', '/bin', '/usr/sbin', '/sbin']

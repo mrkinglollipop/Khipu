@@ -561,12 +561,23 @@ const GATEWAY_TOKEN_SET_ARGV: &[&str] = &["gateway", "token", "set"];
 /// persisted ceiling goes through `config --set synth_daily_calls N`).
 const BUDGET_STATUS_ARGV: &[&str] = &["budget", "status"];
 const BUDGET_LIFT_SYNTH_TODAY_ARGV: &[&str] = &["budget", "lift", "synth", "--today"];
+/// Home -> Plans and Settings -> Capture -> Plans: each subscription CLI's own
+/// plan headroom (docs/plans/2026-10-14-plan-usage.md, phase 2). Status reads
+/// the cache while it is younger than its max age (120 s); refresh probes
+/// every account now. Fixed argv: the webview cannot reach `--max-age`.
+const USAGE_STATUS_ARGV: &[&str] = &["usage", "--json"];
+const USAGE_REFRESH_ARGV: &[&str] = &["usage", "--fresh", "--json"];
 /// `config --set KEY N`, a whole number >= 0 (0 = unlimited) (`INT_SETTINGS`).
 /// Only the summariser's ceiling is offered in the app.
 const DAILY_CALL_KEYS: &[&str] = &["synth_daily_calls"];
 /// `config --set synth_fallback gemini|none`: retry a window the summariser
 /// provider failed on Gemini Flash, or leave it queued.
 const SYNTH_FALLBACKS: &[&str] = &["gemini", "none"];
+/// `config --set usage_accounts JSON` / `config --unset usage_accounts`: the
+/// accounts Home -> Plans reads (Settings -> Capture & models -> Plans).
+const USAGE_ACCOUNTS_KEY: &str = "usage_accounts";
+const USAGE_HARNESSES: &[&str] = &["claude", "codex", "grok", "muse"];
+const USAGE_ACCOUNTS_MAX: usize = 32;
 
 fn fixed_argv(argv: &[&str]) -> Vec<String> {
     argv.iter().map(|s| s.to_string()).collect()
@@ -646,6 +657,63 @@ fn checked_operand(key: &str, raw: &str, allow_empty: bool) -> Result<String, St
     Ok(v.to_string())
 }
 
+/// The account list parsed and re-serialised, so only a JSON list of
+/// `{label, harness, home}` text fields ever reaches argv. The CLI checks the
+/// rest (a home that names no user, two entries for one login or one label).
+fn checked_usage_accounts(raw: &str) -> Result<String, String> {
+    let not_a_list = || "usage_accounts must be a JSON list of accounts".to_string();
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|_| not_a_list())?;
+    let entries = value.as_array().ok_or_else(not_a_list)?;
+    if entries.len() > USAGE_ACCOUNTS_MAX {
+        return Err(format!("usage_accounts holds at most {USAGE_ACCOUNTS_MAX} entries"));
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let n = i + 1;
+        let obj = entry
+            .as_object()
+            .ok_or_else(|| format!("usage_accounts entry {n} is not an object"))?;
+        let mut clean = serde_json::Map::new();
+        for (field, v) in obj {
+            let limit = match field.as_str() {
+                "label" => 64,
+                "harness" => 16,
+                "home" => 1024,
+                _ => return Err(format!("usage_accounts entry {n} has an unknown field {field:?}")),
+            };
+            if v.is_null() {
+                continue;
+            }
+            let s = v
+                .as_str()
+                .ok_or_else(|| format!("usage_accounts entry {n}: {field} must be text"))?
+                .trim();
+            if has_control(s) {
+                return Err(format!("usage_accounts entry {n}: {field} must be one line"));
+            }
+            if s.chars().count() > limit {
+                return Err(format!("usage_accounts entry {n}: {field} is too long"));
+            }
+            if !s.is_empty() {
+                clean.insert(field.clone(), serde_json::Value::String(s.to_string()));
+            }
+        }
+        let harness = clean
+            .get("harness")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !USAGE_HARNESSES.contains(&harness.as_str()) {
+            return Err(format!(
+                "usage_accounts entry {n}: harness must be claude, codex, grok or muse"
+            ));
+        }
+        clean.insert("harness".to_string(), serde_json::Value::String(harness));
+        out.push(serde_json::Value::Object(clean));
+    }
+    serde_json::to_string(&out).map_err(|e| e.to_string())
+}
+
 fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
     let set = |k: &str, v: String| {
         vec!["config".to_string(), "--set".to_string(), k.to_string(), v]
@@ -685,6 +753,7 @@ fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
             }
             Ok(set("synth_fallback", v.to_string()))
         }
+        USAGE_ACCOUNTS_KEY => Ok(set(USAGE_ACCOUNTS_KEY, checked_usage_accounts(value)?)),
         k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
         _ => Err(format!("not a settable key: {key:?}")),
     }
@@ -694,7 +763,7 @@ fn config_unset_argv(key: &str) -> Result<Vec<String>, String> {
     let by_profile = key
         .strip_prefix(COSINE_FLOOR_BY_PROFILE_PREFIX)
         .is_some_and(|id| checked_profile(id).is_ok());
-    if !PATH_KEYS.contains(&key) && key != COSINE_FLOOR_KEY && !by_profile {
+    if !PATH_KEYS.contains(&key) && key != COSINE_FLOOR_KEY && key != USAGE_ACCOUNTS_KEY && !by_profile {
         return Err(format!("not a resettable key: {key:?}"));
     }
     Ok(vec!["config".to_string(), format!("--unset={key}")])
@@ -777,6 +846,16 @@ async fn khipu_budget_status() -> Result<String, String> {
 #[tauri::command]
 async fn khipu_budget_lift_synth_today() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(BUDGET_LIFT_SYNTH_TODAY_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_usage_status() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(USAGE_STATUS_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_usage_refresh() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(USAGE_REFRESH_ARGV)).await
 }
 
 #[tauri::command]
@@ -2379,6 +2458,8 @@ pub fn run() {
             khipu_config_unset,
             khipu_budget_status,
             khipu_budget_lift_synth_today,
+            khipu_usage_status,
+            khipu_usage_refresh,
             khipu_jobs_status,
             khipu_job_install,
             khipu_job_uninstall,
@@ -2883,7 +2964,7 @@ mod settings_command_tests {
 
     #[test]
     fn none_of_these_verbs_join_the_generic_allowlist() {
-        for s in ["features", "config", "jobs", "recall", "gateway", "embed", "budget"] {
+        for s in ["features", "config", "jobs", "recall", "gateway", "embed", "budget", "usage"] {
             assert!(!ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of the allowlist");
         }
         assert_eq!(ALLOWED_SUBCOMMANDS.len(), 14);
@@ -2899,6 +2980,17 @@ mod settings_command_tests {
         assert_eq!(fixed_argv(GATEWAY_TOKEN_SET_ARGV), v(&["gateway", "token", "set"]));
         assert_eq!(fixed_argv(BUDGET_STATUS_ARGV), v(&["budget", "status"]));
         assert_eq!(fixed_argv(BUDGET_LIFT_SYNTH_TODAY_ARGV), v(&["budget", "lift", "synth", "--today"]));
+    }
+
+    #[test]
+    fn plan_usage_commands_are_fixed_argv() {
+        assert_eq!(fixed_argv(USAGE_STATUS_ARGV), v(&["usage", "--json"]));
+        assert_eq!(fixed_argv(USAGE_REFRESH_ARGV), v(&["usage", "--fresh", "--json"]));
+        // Neither reaches --max-age, and `usage` stays out of the generic allowlist.
+        for argv in [USAGE_STATUS_ARGV, USAGE_REFRESH_ARGV] {
+            assert!(!argv.iter().any(|a| a.starts_with("--max-age")));
+        }
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"usage"));
     }
 
     #[test]
@@ -2922,6 +3014,46 @@ mod settings_command_tests {
             let err = config_set_argv("synth_fallback", bad).unwrap_err();
             assert!(err.contains("gemini") && err.contains("none"), "bad error for {bad:?}: {err}");
         }
+    }
+
+    #[test]
+    fn usage_accounts_are_a_json_list_reprinted() {
+        let argv = config_set_argv(
+            "usage_accounts",
+            r#" [ {"label": " Claude second ", "harness": "Claude", "home": "~/.claude-second"},
+                  {"harness": "grok", "home": null, "label": ""} ] "#,
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            v(&[
+                "config",
+                "--set",
+                "usage_accounts",
+                r#"[{"harness":"claude","home":"~/.claude-second","label":"Claude second"},{"harness":"grok"}]"#,
+            ])
+        );
+        assert_eq!(config_set_argv("usage_accounts", "[]").unwrap(), v(&["config", "--set", "usage_accounts", "[]"]));
+        let many = format!("[{}]", vec![r#"{"harness":"claude"}"#; 33].join(","));
+        let long_label = format!(r#"[{{"harness":"claude","label":"{}"}}]"#, "x".repeat(65));
+        for bad in [
+            "",
+            "--set",
+            "{}",
+            "\"claude\"",
+            "[1]",
+            "[\"claude\"]",
+            r#"[{"harness":"cluade"}]"#,
+            r#"[{"label":"No harness"}]"#,
+            r#"[{"harness":"claude","token":"x"}]"#,
+            r#"[{"harness":"claude","home":3}]"#,
+            r#"[{"harness":"claude","label":"a\nb"}]"#,
+            many.as_str(),
+            long_label.as_str(),
+        ] {
+            assert!(config_set_argv("usage_accounts", bad).is_err(), "accepted {bad:?}");
+        }
+        assert_eq!(config_unset_argv("usage_accounts").unwrap(), v(&["config", "--unset=usage_accounts"]));
     }
 
     #[test]

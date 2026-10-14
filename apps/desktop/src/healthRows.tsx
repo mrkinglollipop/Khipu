@@ -17,6 +17,16 @@ import {
   usageByProviderLines,
 } from "./SynthProvider";
 import type { DoctorSynthProvider, SynthBudget } from "./SynthProvider";
+import {
+  PLAN_ALERT_PCT,
+  onlyResetWindows,
+  liveReadFailures,
+  plansHealthDetail,
+  roundPct,
+  tightestOverall,
+  unreadAccounts,
+} from "./PlansCard";
+import type { UsageReport } from "./PlansCard";
 
 export type HealthRowStatus = "ok" | "err" | "skipped";
 
@@ -28,6 +38,9 @@ export type HealthRow = {
   label: string;
   /** What the check saw, from the doctor block paired with the flag. */
   detail?: string;
+  /** Shown after the row's sentence whatever its status (the Plans row:
+   *  accounts that could not be read beside the figures that were). */
+  note?: string;
 };
 
 // Canonical order + copy for the checks the bundled doctor emits today
@@ -59,6 +72,8 @@ const LABELS: Record<string, string> = {
   // D6/F2/F4: topic-embedding lag and the search-degrade rate.
   topics_embed_lag_ok: "Search index catching up on time",
   degraded_rate_ok: "Search rarely falls back to keyword-only",
+  // Not a doctor field: read from `khipu usage --json` (plansHealthRow).
+  plans: "Plans",
 };
 
 const ORDER = Object.keys(LABELS);
@@ -126,11 +141,62 @@ function detailFor(key: string, parsed: Record<string, unknown>): string | undef
   return undefined;
 }
 
+/** The "Plans" row, from `khipu_usage_status` (doctor's own `plan_usage`
+ *  block is the cache only, for agents): the tightest window still in force
+ *  across accounts, red at 90%. A window whose reset has passed counts for
+ *  nothing. Green only on evidence: when no account gave a figure and any
+ *  failed, the row is red and names them; failed accounts, and accounts
+ *  showing a fallback because their live read failed, are named beside the
+ *  figures that were read. Null until the usage report has been read. */
+export function plansHealthRow(plans: UsageReport | null | undefined, now: Date = new Date()): HealthRow | null {
+  if (!plans || !Array.isArray(plans.accounts)) return null;
+  if (plans.accounts.length === 0) return { key: "plans", status: "skipped", label: LABELS.plans };
+  const unread = unreadAccounts(plans, now);
+  const tight = tightestOverall(plans, now);
+  // A live read that failed (Codex signed out) is named even though its
+  // last-turn figures were read, so the owner learns to sign it in.
+  const live = liveReadFailures(plans);
+  const notes = [...(unread.length ? [`could not read ${unread.join(", ")}`] : []), ...live];
+  const note = notes.length ? { note: notes.join("; ") } : {};
+  if (!tight) {
+    if (unread.length) {
+      return {
+        key: "plans",
+        status: "err",
+        label: LABELS.plans,
+        detail: `could not read any plan: ${unread.join(", ")}`,
+        ...(live.length ? { note: live.join("; ") } : {}),
+      };
+    }
+    const allReset = plans.accounts.some((row) => onlyResetWindows(row, now));
+    return {
+      key: "plans",
+      status: "ok",
+      label: LABELS.plans,
+      detail: allReset ? "every limit has reset since it was read" : "no plan limits reported",
+      ...note,
+    };
+  }
+  const pct = roundPct(tight.window.used_pct ?? 0);
+  return {
+    key: "plans",
+    status: pct >= PLAN_ALERT_PCT ? "err" : "ok",
+    label: LABELS.plans,
+    detail: plansHealthDetail(plans, now) ?? undefined,
+    ...note,
+  };
+}
+
+function sentenceCase(s: string): string {
+  const t = s.trim();
+  return t ? `${t.charAt(0).toUpperCase()}${t.slice(1)}${/[.!?]$/.test(t) ? "" : "."}` : t;
+}
+
 /** Pure: every top-level boolean `*_ok` field in `parsed` becomes one row —
  *  green, red, or (if `not_configured` names its check) grey "not set up".
  *  Sorted red first, then not-set-up, then green; stable within each group
  *  in the order above, unknown keys last in their group. */
-export function healthRows(parsed: Record<string, unknown>): HealthRow[] {
+export function healthRows(parsed: Record<string, unknown>, plans?: UsageReport | null): HealthRow[] {
   const notConfiguredRaw = (parsed as { not_configured?: unknown })
     .not_configured;
   const notConfigured = Array.isArray(notConfiguredRaw)
@@ -150,6 +216,8 @@ export function healthRows(parsed: Record<string, unknown>): HealthRow[] {
     }
     return { key, status: parsed[key] ? "ok" : "err", label, ...extra };
   });
+  const plansRow = plansHealthRow(plans);
+  if (plansRow) rows.push(plansRow);
 
   const statusRank: Record<HealthRowStatus, number> = {
     err: 0,
@@ -206,11 +274,14 @@ function findAttention(okKey: string, attention: Attention[]): Attention[] {
 export function HealthReportRows({
   parsed,
   attention,
+  plans,
   onFixAction,
   busy,
 }: {
   parsed: Record<string, unknown>;
   attention: Attention[];
+  /** `khipu usage --json`, for the Plans row; no row until it is read. */
+  plans?: UsageReport | null;
   /** Fired when a row's fix button is pressed; the caller owns what each
    *  `fix.kind` actually does (reinstall hook / run probe / open revisions —
    *  see the Home attention callouts in App.tsx). Optional so this component
@@ -218,16 +289,17 @@ export function HealthReportRows({
   onFixAction?: (fix: NonNullable<Attention["fix"]>, harness?: string) => void;
   busy?: boolean;
 }) {
-  const rows = healthRows(parsed);
+  const rows = healthRows(parsed, plans);
   return (
     <div className="rows">
       {rows.map((row) => {
         if (row.status === "ok") {
+          const text = [row.detail, row.note].filter(Boolean).join("; ");
           return (
             <div key={row.key} className="row-item">
               <Check size={16} strokeWidth={1.75} aria-hidden className="ok" />
               <span className="row-main">{row.label}</span>
-              {row.detail ? <span className="row-meta wrap">{row.detail}</span> : null}
+              {text ? <span className="row-meta wrap">{text}</span> : null}
             </div>
           );
         }
@@ -250,6 +322,16 @@ export function HealthReportRows({
           ? matches.map((m) => m.cause).join(" ")
           : "needs attention — see the raw report";
         const single = matches.length === 1 ? matches[0] : undefined;
+        // The Plans attention cause already names every window at 90%; with
+        // none (nothing could be read) the row's own detail says why.
+        const text =
+          row.key === "plans"
+            ? [matches.length ? sentence : sentenceCase(row.detail ?? sentence), row.note ? sentenceCase(row.note) : ""]
+                .filter(Boolean)
+                .join(" ")
+            : row.detail
+              ? `${sentence} ${row.detail}`
+              : sentence;
         return (
           <div key={row.key} className="row-item">
             <TriangleAlert
@@ -259,7 +341,7 @@ export function HealthReportRows({
               className="err"
             />
             <span className="row-main">{row.label}</span>
-            <span className="row-meta">{row.detail ? `${sentence} ${row.detail}` : sentence}</span>
+            <span className="row-meta">{text}</span>
             {single?.fix ? (
               <button
                 type="button"

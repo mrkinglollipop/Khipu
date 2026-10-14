@@ -728,6 +728,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         decision_links_block = _decisions.candidate_link_count()
     except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
         decision_links_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # Plan usage (docs/plans/2026-10-14-plan-usage.md, phase 2): each account's
+    # tightest window still in force, read from the usage cache only (no CLI
+    # is probed, nothing waits), and one warning per window at 90% or more.
+    # Visibility only: it never gates `ok`.
+    try:
+        from khipu import usage as _usage
+
+        plan_usage_block = _usage.doctor_block()
+    except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
+        plan_usage_block = {"accounts": [], "warnings": [], "error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -764,6 +774,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         **({"t3": t3_health} if t3_health is not None else {}),
         "features": features_block,
         "decision_links": decision_links_block,
+        "plan_usage": plan_usage_block,
+        # Warnings that never gate `ok` (today: plans nearly used up).
+        "warnings": list(plan_usage_block.get("warnings") or []),
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -2732,6 +2745,26 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": True, "relevance_cosine_floor": relevance.cosine_floor_status(),
                           "config_file": str(path)}))
         return 0
+    if (args.set and args.set[0] == "usage_accounts") or args.unset == "usage_accounts":
+        # The accounts `khipu usage` reads, as JSON (plan usage phase 2):
+        # `--set usage_accounts '[{"label": "Claude second", "harness":
+        # "claude", "home": "~/.claude-second"}]'`; `--unset` (or `[]`) goes
+        # back to every installed CLI with its default login.
+        from khipu import usage
+        from khipu.config import set_usage_accounts
+
+        try:
+            path = set_usage_accounts(args.set[1] if args.set else None)
+        except usage.AccountsError as err:
+            # A fixed code, the entry and the field at fault: the app says it
+            # in its own words and never shows the text.
+            print(json.dumps(err.refusal()))
+            return 2
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, "usage_accounts": usage.accounts_status(), "config_file": str(path)}))
+        return 0
     if (args.set and args.set[0] in CHOICE_SETTINGS) or args.unset in CHOICE_SETTINGS:
         from khipu.config import choice_setting, set_choice_setting
 
@@ -2811,7 +2844,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             )
         )
         return 0
-    from khipu import relevance
+    from khipu import relevance, usage
     from khipu.config import float_settings_status, list_setting, path_settings_status
 
     out = {
@@ -2829,6 +2862,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "float_settings": float_settings_status(),
         "relevance_cosine_floor": relevance.cosine_floor_status(),
         "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
+        "usage_accounts": usage.accounts_status(),
         "config_file": str(config_file()),
         "config": load_config(),
     }
@@ -4843,11 +4877,13 @@ def build_parser() -> argparse.ArgumentParser:
         "ceiling (synth_daily_calls, embed_daily_calls, "
         "library_embed_daily_calls; whole number, 0 = unlimited), the "
         "summariser fallback (synth_fallback gemini|none: what a failed "
-        "window does on a provider other than Gemini) or the comma-"
-        'separated user_aliases list (e.g. --set user_aliases "matt,matthew")',
+        "window does on a provider other than Gemini), the comma-"
+        'separated user_aliases list (e.g. --set user_aliases "matt,matthew") '
+        "or the plan usage accounts as JSON (usage_accounts "
+        '\'[{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}]\')',
     )
     cfg.add_argument("--unset", metavar="KEY",
-                     help="Remove a path setting, a daily call ceiling or synth_fallback, or "
+                     help="Remove a path setting, a daily call ceiling, synth_fallback or usage_accounts, or "
                      "relevance.cosine_floor / "
                      "relevance.cosine_floor_by_profile.<profile> to restore its default")
     cfg.add_argument(

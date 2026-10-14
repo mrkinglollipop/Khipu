@@ -434,13 +434,19 @@ def _generate_claude_cli(prompt: str, *, model_id: str, timeout: int = 60, retri
     from khipu import synth_cli
 
     env = synth_cli.environment()
+    cli = synth_cli.binary("claude") or "claude"
+    # A CLI found in a Node version manager's folder needs that folder (and
+    # its node) on PATH; launchd hands the drain a bare system PATH.
+    from khipu.usage import _probe_path
+
+    env["PATH"] = _probe_path(env.get("PATH"), cli if os.path.isabs(cli) else None)
     last = "CLI call failed"
     for attempt in range(retries + 1):
         _synth_budget_take()
         try:
             sid = synth_cli.new_session()
             with tempfile.TemporaryDirectory(prefix="work-", dir=synth_cli.root()) as cwd:
-                argv = [synth_cli.binary("claude") or "claude", "-p", "--setting-sources", "", "--model", model_id,
+                argv = [cli, "-p", "--setting-sources", "", "--model", model_id,
                         "--system-prompt", CLAUDE_CLI_SYSTEM_PROMPT,
                         "--output-format", "json", "--max-turns", "1", "--disallowedTools",
                         "Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,Agent", "--session-id", sid]
@@ -487,6 +493,12 @@ def _generate_codex_cli(prompt: str, *, model_id: str, timeout: int = 60, retrie
     from khipu import synth_cli
 
     env = synth_cli.environment()
+    cli = synth_cli.binary("codex") or "codex"
+    # A CLI found in a Node version manager's folder needs that folder (and
+    # its node) on PATH; launchd hands the drain a bare system PATH.
+    from khipu.usage import _probe_path
+
+    env["PATH"] = _probe_path(env.get("PATH"), cli if os.path.isabs(cli) else None)
     last = "CLI call failed"
     for attempt in range(retries + 1):
         _synth_budget_take()
@@ -494,7 +506,7 @@ def _generate_codex_cli(prompt: str, *, model_id: str, timeout: int = 60, retrie
             synth_cli.new_session()
             with tempfile.TemporaryDirectory(prefix="work-", dir=synth_cli.root()) as cwd, \
                     tempfile.NamedTemporaryFile(dir=synth_cli.root()) as output:
-                argv = [synth_cli.binary("codex") or "codex", "exec", "--json", "--ephemeral", "-s", "read-only",
+                argv = [cli, "exec", "--json", "--ephemeral", "-s", "read-only",
                         "--skip-git-repo-check", "-m", model_id, "-o", output.name, "-C", cwd,
                         # The user's own Codex config (MCP servers, hooks) cost 30 s
                         # of startup per call against 6 s without it (measured

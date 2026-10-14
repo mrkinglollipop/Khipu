@@ -3,7 +3,8 @@
 Every adapter runs against a fake child process that answers with a reply
 recorded from the real CLI on 2026-10-14 (numbers fixed, ids and emails
 replaced; tests/fixtures/usage/). No test starts a real CLI: ``_command`` is
-patched in every test that probes.
+patched in every test that probes, except the Node version manager test, whose
+lookup sees only a temp HOME and launchd's PATH.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import builtins
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import textwrap
@@ -248,7 +250,15 @@ def test_codex_falls_back_to_the_newest_rollout(fake, tmp_path):
     assert row["plan"] == "pro"
     assert row["windows"] == [{"name": "five_hour", "used_pct": 71.0, "resets_at": "2026-01-01T02:00:00Z",
                                "window_mins": 300, "slot": "primary"}]
-    assert "live read failed (not_signed_in)" in row["note"]
+    # The note is plain words (the app shows it as written); the code has its own field.
+    assert row["live_error"] == "not_signed_in"
+    assert not re.search(r"[a-z]+_[a-z0-9_]+|\(", row["note"])
+    # A signed-out Codex says so: reading again will not help, signing in will.
+    assert row["note"] != usage.ROLLOUT_NOTE
+    assert row["note"] == ("Codex is not signed in with this login folder, so these figures are from its last "
+                           "turn. Open Codex with this login folder and sign in again")
+    assert usage._rollout_note("not_signed_in", None).startswith("Codex is not signed in, so these figures")
+    assert usage._rollout_note("timeout", None) == usage.ROLLOUT_NOTE
 
 
 def test_codex_without_live_answer_or_rollout_fails(fake, tmp_path):
@@ -342,11 +352,13 @@ def test_configured_accounts_keep_invalid_entries_visible(fake, tmp_path):
     ]}))
     accounts = usage.configured_accounts()
     assert accounts[0] == {"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}
-    assert "unknown harness" in accounts[1]["invalid"]
+    assert accounts[1]["invalid"] == ('Khipu does not read the CLI "gemini"; it reads Claude Code, Codex, '
+                                      "Grok Build and Muse")
     assert "Muse" in accounts[2]["invalid"]
     row = usage.probe_account(accounts[1])
     assert row["ok"] is False and row["error"] == "invalid_account"
-    assert row["note"].startswith("invalid usage_accounts entry")
+    assert row["note"].startswith("This account entry is not valid: Khipu does not read")
+    assert "usage_accounts" not in row["note"]
 
 
 def test_summary_and_table():
@@ -542,7 +554,8 @@ def test_secret_bearing_cli_text_never_reaches_any_output(fake, tmp_path, monkey
     assert by["grok"]["error"] == "cli_error"
     assert by["claude"]["error"] == "cli_error"
     assert by["muse"]["error"] == "exit_7"
-    assert by["codex"]["ok"] is True and by["codex"]["note"].startswith("live read failed (exit_7)")
+    assert by["codex"]["ok"] is True and by["codex"]["note"] == usage.ROLLOUT_NOTE
+    assert by["codex"]["live_error"] == "exit_7"
     assert cli.main(["usage", "--fresh"]) == 0
     printed += capsys.readouterr().out
     mcp_out = mcp_server.TOOL_FUNCS["khipu_usage"]({"fresh": True})
@@ -568,6 +581,125 @@ def test_probe_environment_is_an_allowlist(fake, tmp_path, monkeypatch):
         assert probe()["ok"] is True
         child = _child(out)["env"]
         assert "SERVICE_TOKEN" not in child and "UNLISTED_THING" not in child, harness
+
+
+LAUNCHD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def _npm_shim(tmp_path, fixture: str, out: Path, prefix: Path | None = None, name: str = "codex") -> Path:
+    """An npm-style install: ``prefix/bin/<name>`` links to a
+    ``#!/usr/bin/env node`` script, and node sits beside the link (nvm's
+    layout). This node is a shell script running the fake CLI's Python."""
+    prefix = prefix or tmp_path / "npm-prefix"
+    package = prefix / "lib" / "node_modules" / "codex-fixture" / "bin"
+    package.mkdir(parents=True)
+    (prefix / "bin").mkdir()
+    node = prefix / "bin" / "node"
+    node.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    node.chmod(0o755)
+    script = package / "codex.js"
+    script.write_text("#!/usr/bin/env node\n" + textwrap.dedent(f"""
+        import runpy, sys
+        sys.argv = [{str(tmp_path / "fake_cli.py")!r}, {str(FIXTURES / fixture)!r}, "answer", {str(out)!r},
+                    *sys.argv[1:]]
+        runpy.run_path(sys.argv[0], run_name="__main__")
+    """))
+    script.chmod(0o755)
+    shim = prefix / "bin" / name
+    shim.symlink_to(Path("..") / "lib" / "node_modules" / "codex-fixture" / "bin" / "codex.js")
+    return shim
+
+
+def test_a_node_shim_answers_under_the_bare_launchd_path(fake, tmp_path, monkeypatch):
+    """Khipu.app runs under launchd's PATH, where ``/usr/bin/env node`` finds
+    no node: an npm-installed Codex exited 127 on every probe from the app
+    while ``khipu usage`` in Terminal worked."""
+    out = tmp_path / "codex-child.json"
+    shim = _npm_shim(tmp_path, "codex.jsonl", out)
+    monkeypatch.setattr(usage, "_command", lambda harness: str(shim) if harness == "codex" else None)
+    monkeypatch.setenv("PATH", LAUNCHD_PATH)
+    row = usage.probe_codex()
+    assert row["ok"] is True and row["source"] == "live", row
+    assert row["plan"] == "pro"
+    assert _child(out)["argv"] == ["app-server"]
+
+
+def _launchd_lookup(monkeypatch, home: Path):
+    """``synth_cli.binary`` as Khipu.app runs it: launchd's PATH, ``home`` as
+    HOME, no override, and of the usual install folders only those under HOME
+    (so a CLI this Mac has in /opt/homebrew or /Applications never answers)."""
+    from khipu import synth_cli
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", LAUNCHD_PATH)
+    for harness in usage.HARNESSES:
+        monkeypatch.delenv(f"KHIPU_{harness.upper()}_CLI", raising=False)
+    monkeypatch.setattr(synth_cli, "_CANDIDATES", {h: tuple(c for c in v if c.startswith("~"))
+                                                   for h, v in synth_cli._CANDIDATES.items()})
+    return synth_cli
+
+
+def _stub(path: Path, mode: int = 0o755) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 9\n")
+    path.chmod(mode)
+    return path
+
+
+def test_an_nvm_cli_is_found_and_answers_under_the_bare_launchd_path(tmp_path, monkeypatch):
+    """Khipu.app's PATH names no Node version manager folder, so a Claude Code
+    installed with ``npm i -g`` under nvm was left out of plan usage. The
+    newest Node's copy wins: v22 over v20, and over v9, which a sort by text
+    would put first. Its node, beside it, answers through ``_probe_path``."""
+    (tmp_path / "fake_cli.py").write_text(FAKE_CLI)
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
+    home = tmp_path / "home"
+    versions = home / ".nvm" / "versions" / "node"
+    for older in ("v20.11.1", "v9.11.2"):
+        _stub(versions / older / "bin" / "claude")
+    out = tmp_path / "claude-child.json"
+    shim = _npm_shim(tmp_path, "claude.jsonl", out, prefix=versions / "v22.0.0", name="claude")
+    synth_cli = _launchd_lookup(monkeypatch, home)
+    assert synth_cli.binary("claude") == str(shim)
+    assert usage.configured_accounts() == [{"label": "Claude", "harness": "claude", "home": None}]
+    assert str(shim.parent) in usage.probe_environment("claude", None, str(shim))["PATH"].split(os.pathsep)
+    row = usage.probe_claude()
+    assert row["ok"] is True and row["plan"] == "max", row
+    assert _child(out)["argv"][:1] == ["-p"]
+
+
+def test_a_node_manager_match_that_is_not_executable_is_skipped(tmp_path, monkeypatch):
+    synth_cli = _launchd_lookup(monkeypatch, tmp_path)
+    _stub(tmp_path / ".nvm" / "versions" / "node" / "v22.0.0" / "bin" / "codex", 0o644)
+    (tmp_path / ".volta" / "bin" / "codex").mkdir(parents=True)  # a folder by the CLI's name
+    assert synth_cli.binary("codex") is None
+    older = _stub(tmp_path / ".nvm" / "versions" / "node" / "v20.11.1" / "bin" / "codex")
+    assert synth_cli.binary("codex") == str(older)
+    for folder in (".volta/bin", "Library/pnpm", ".bun/bin", ".local/share/fnm/node-versions/v24.1.0/installation/bin",
+                   ".asdf/shims"):
+        found = _stub(tmp_path / folder / "grok")
+        assert synth_cli.binary("grok") == str(found), folder
+        found.chmod(0o644)
+    assert synth_cli.binary("grok") is None
+
+
+def test_probe_path_keeps_the_callers_own_and_adds_the_cli_folders(tmp_path, monkeypatch):
+    out = tmp_path / "unused.json"
+    (tmp_path / "fake_cli.py").write_text(FAKE_CLI)
+    shim = _npm_shim(tmp_path, "codex.jsonl", out)
+    monkeypatch.setenv("HOME", str(tmp_path / "owner"))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    path = usage.probe_environment("codex", None, str(shim))["PATH"].split(os.pathsep)
+    assert path[:2] == ["/usr/bin", "/bin"], "the caller's own PATH comes first"
+    assert path[2] == str(shim.parent)
+    assert path[3] == os.path.dirname(os.path.realpath(shim))
+    for folder in ("/opt/homebrew/bin", "/usr/local/bin", str(tmp_path / "owner" / ".npm-global" / "bin"),
+                   str(tmp_path / "owner" / ".local" / "bin"), "/usr/sbin", "/sbin"):
+        assert folder in path, folder
+    assert len(path) == len(set(path)), "each folder once"
+    # With no PATH at all (and no binary) the child still gets the usual folders.
+    monkeypatch.delenv("PATH")
+    assert usage.probe_environment("muse")["PATH"].split(os.pathsep)[:2] == ["/opt/homebrew/bin", "/usr/local/bin"]
 
 
 def test_every_probe_runs_in_a_fresh_empty_temp_cwd(fake):
@@ -777,3 +909,336 @@ def test_legitimate_absence_stays_ok(fake, tmp_path):
                                                                      "result": {"config": {}}}]))
     row = usage.probe_grok(None)
     assert row["ok"] is True and row["windows"] == []
+
+
+# ---- usage_accounts: settable from the app, a bad home never crashes -----------
+
+NO_USER_HOME = "~khipu-no-such-user-7f3a/.claude"
+
+
+def _config_cli(argv, capsys):
+    from khipu.cli import main
+
+    rc = main(["config", *argv])
+    return rc, json.loads(capsys.readouterr().out)
+
+
+def test_a_home_naming_no_user_is_an_invalid_row_not_a_crash(fake, tmp_path):
+    fake("claude", "claude.jsonl")
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    (data / "config.json").write_text(json.dumps({"usage_accounts": [
+        {"label": "Claude", "harness": "claude"},
+        {"label": "Typo", "harness": "claude", "home": NO_USER_HOME},
+    ]}))
+    rep = usage.report(fresh=True)
+    rows = {r["account"]: r for r in rep["accounts"]}
+    assert rows["Claude"]["ok"] is True
+    assert rows["Typo"]["ok"] is False and rows["Typo"]["error"] == "invalid_account"
+    assert f"Khipu cannot find the login folder {NO_USER_HOME}; start it with ~/" in rows["Typo"]["note"]
+    # Neither the cache key nor the probe environment raises on such a home.
+    assert usage._key({"harness": "claude", "home": NO_USER_HOME}) == f"claude|{NO_USER_HOME}"
+    assert usage.probe_environment("claude", NO_USER_HOME)["CLAUDE_CONFIG_DIR"] == NO_USER_HOME
+
+
+def test_a_relative_login_folder_is_an_invalid_entry_never_probed(fake, tmp_path):
+    """A hand-edited ".claude-second" was listed as valid and probed inside a
+    fresh temp folder, so it always read "not signed in" and asked the owner
+    to sign in again, which could never fix it."""
+    out = fake("claude", "claude.jsonl")
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    (data / "config.json").write_text(json.dumps({"usage_accounts": [
+        {"label": "Second", "harness": "claude", "home": ".claude-second"},
+        {"label": "Work", "harness": "codex", "home": "codex-work"},
+    ]}))
+    accounts = {a["label"]: a for a in usage.configured_accounts()}
+    assert accounts["Second"]["invalid"].startswith("Khipu cannot find the login folder .claude-second; start it with ~/")
+    assert accounts["Work"]["invalid"].startswith("Khipu cannot find the login folder codex-work")
+    rows = {r["account"]: r for r in usage.report(fresh=True)["accounts"]}
+    assert rows["Second"]["ok"] is False and rows["Second"]["error"] == "invalid_account"
+    assert rows["Second"]["note"].startswith("This account entry is not valid: Khipu cannot find the login folder")
+    assert not out.exists(), "an invalid entry is never probed"
+
+
+def test_usage_accounts_are_set_shown_and_unset_through_config(fake, capsys):
+    from khipu import config
+
+    fake("claude", "claude.jsonl")
+    fake("grok", "grok.jsonl")
+    rc, out = _config_cli(["--set", "usage_accounts", json.dumps([
+        {"label": " Claude second ", "harness": "Claude", "home": "~/.claude-second"},
+        {"label": "Grok", "harness": "grok", "home": None},
+    ])], capsys)
+    assert rc == 0 and out["ok"] is True
+    stored = json.loads(config.config_file().read_text())["usage_accounts"]
+    assert stored == [{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"},
+                      {"label": "Grok", "harness": "grok"}]
+    assert out["usage_accounts"]["source"] == "file"
+    assert [a["label"] for a in out["usage_accounts"]["accounts"]] == ["Claude second", "Grok"]
+    rc, shown = _config_cli([], capsys)
+    assert rc == 0 and shown["usage_accounts"]["value"] == stored
+    rc, out = _config_cli(["--unset", "usage_accounts"], capsys)
+    assert rc == 0 and out["usage_accounts"] == {
+        "value": None, "source": "default",
+        "accounts": [{"label": "Claude", "harness": "claude", "home": None},
+                     {"label": "Grok", "harness": "grok", "home": None}],
+        "user_home": str(Path.home())}
+    assert "usage_accounts" not in json.loads(config.config_file().read_text())
+    # An empty list is the default too.
+    assert _config_cli(["--set", "usage_accounts", json.dumps([{"harness": "codex"}])], capsys)[0] == 0
+    rc, out = _config_cli(["--set", "usage_accounts", "[]"], capsys)
+    assert rc == 0 and out["usage_accounts"]["source"] == "default"
+
+
+_TWO = [{"label": "Claude", "harness": "claude"}, {"label": "Codex", "harness": "codex"}]
+# (value, words in the CLI's error, the refusal's code, index, field, other).
+_REFUSALS = [
+    ("not json", "must be JSON", "bad_list", None, None, None),
+    ('{"harness": "claude"}', "must be a list", "bad_list", None, None, None),
+    ('["claude"]', "entry 1 is not an object", "bad_entry", 0, None, None),
+    ('[{"harness": "cluade"}]', 'Khipu does not read the CLI "cluade"', "unknown_cli", 0, "harness", None),
+    ('[{"harness": "muse", "home": "/x"}]', "Muse has one sign-in", "muse_folder", 0, "home", None),
+    ('[{"harness": "claude", "token": "x"}]', "unknown field 'token'", "bad_entry", 0, None, None),
+    ('[{"harness": "claude", "home": 3}]', "home must be text", "not_one_line", 0, "home", None),
+    ('[{"harness": "claude", "label": "a\\nb"}]', "one line of plain text", "not_one_line", 0, "label", None),
+    # The app's own entries come after the defaults it lists: the index is the entry's own.
+    (json.dumps([*_TWO, {"label": "Typo", "harness": "codex", "home": "~.codex-work"}]),
+     "Khipu cannot find the login folder ~.codex-work", "no_such_folder", 2, "home", None),
+    (json.dumps([{"harness": "claude", "home": NO_USER_HOME}]), "cannot find the login folder", "no_such_folder",
+     0, "home", None),
+    # A relative folder (the "~/" left off) resolves inside each probe's fresh temp folder: never readable.
+    (json.dumps([{"harness": "claude", "home": ".claude-second"}]),
+     "Khipu cannot find the login folder .claude-second; start it with ~/", "no_such_folder", 0, "home", None),
+    (json.dumps([*_TWO, {"label": "Work", "harness": "codex", "home": "codex-work"}]),
+     "Khipu cannot find the login folder codex-work", "no_such_folder", 2, "home", None),
+    ('[{"harness": "claude"}, {"label": "claude", "harness": "codex"}]', "two usage_accounts entries are named",
+     "name_taken", 1, "label", 0),
+    ('[{"label": "A", "harness": "claude", "home": "/x"}, {"label": "B", "harness": "claude", "home": "/x/"}]',
+     "reads the same login", "login_taken", 1, "home", 0),
+    (json.dumps([*_TWO, {"label": "Work", "harness": "codex", "home": "~/.codex-work"},
+                 {"label": "Work again", "harness": "codex", "home": str(Path.home() / ".codex-work")}]),
+     "reads the same login", "login_taken", 3, "home", 2),
+    (json.dumps([*_TWO, {"harness": "claude", "label": "x" * 65}]), "longer than 64", "too_long", 2, "label", None),
+    (json.dumps([{"harness": "claude", "home": "/" + "x" * 1024}]), "longer than 1024", "too_long", 0, "home", None),
+    (json.dumps([{"harness": "claude", "label": f"c{i}"} for i in range(33)]), "at most 32", "too_many", None, None,
+     None),
+]
+
+
+@pytest.mark.parametrize("value, needle, code, index, field, other", _REFUSALS,
+                         ids=[f"{row[2]}-{n}" for n, row in enumerate(_REFUSALS)])
+def test_usage_accounts_refuses_what_cannot_be_probed(fake, capsys, value, needle, code, index, field, other):
+    from khipu import config
+
+    rc, out = _config_cli(["--set", "usage_accounts", value], capsys)
+    assert rc == 2 and out["ok"] is False and needle in out["error"]
+    # A fixed code with the entry and field at fault, so the app can say it in
+    # its own words and point at the field instead of showing this text.
+    assert (out["code"], out["index"], out["field"], out["other"]) == (code, index, field, other)
+    assert not config.config_file().exists()
+
+
+def test_every_refusal_code_has_a_sentence_in_the_app():
+    """Settings turns each refusal code into its own sentence (PlansCard.tsx
+    ACCOUNT_REFUSAL); a code added here without one would read as the
+    generic "could not save"."""
+    app = Path(__file__).resolve().parents[3] / "apps" / "desktop" / "src" / "PlansCard.tsx"
+    if not app.is_file():
+        pytest.skip("desktop sources not in this checkout")
+    block = app.read_text(encoding="utf-8").split("const ACCOUNT_REFUSAL", 1)[1].split("\n};", 1)[0]
+    codes = {row[2] for row in _REFUSALS}
+    missing = sorted(code for code in codes if f"  {code}: " not in block)
+    assert not missing, f"no sentence in PlansCard.tsx for {missing}"
+
+
+def test_every_error_code_has_a_plain_phrase_in_the_app():
+    """The desktop shows each fixed code as a plain phrase (PlansCard.tsx
+    ERROR_PHRASE); a code added here without one would read "couldn't read"."""
+    app = Path(__file__).resolve().parents[3] / "apps" / "desktop" / "src" / "PlansCard.tsx"
+    if not app.is_file():
+        pytest.skip("desktop sources not in this checkout")
+    block = app.read_text(encoding="utf-8").split("const ERROR_PHRASE", 1)[1].split("};", 1)[0]
+    codes = {value for name, value in vars(usage).items() if name.startswith("E_") and isinstance(value, str)}
+    assert codes, "no E_ codes found"
+    missing = sorted(code for code in codes if f"  {code}: " not in block)
+    assert not missing, f"no plain phrase in PlansCard.tsx for {missing}"
+    # exit_<n> / signal_<n> are matched by pattern there.
+    assert "(exit|signal)_" in app.read_text(encoding="utf-8")
+
+
+# ---- notes on kept figures, plain words only ---------------------------------------
+
+
+# Words an owner who is not technical should not meet in a note the app shows.
+# PATH in capitals only: "the full path" is plain English, "PATH" is not.
+_JARGON = re.compile(r"\b(?:(?-i:PATH)|home|homes|token|tokens|probe|probes|probing|harness|setup)\b|usage_accounts",
+                     re.I)
+
+
+def _every_note() -> list[str]:
+    codes = [value for name, value in vars(usage).items() if name.startswith("E_") and isinstance(value, str)]
+    notes = [usage.ROLLOUT_NOTE]
+    for code in codes:
+        for harness in usage.HARNESSES:
+            for home in (None, "~/.x"):
+                notes += [usage._note(code, harness, home), usage._rollout_note(code, home)]
+    notes += [usage._account_from_entry(entry)["invalid"] for entry in (
+        "claude", {"harness": "gemini"}, {"harness": ""}, {"harness": "muse", "home": "/x"},
+        {"harness": "claude", "home": NO_USER_HOME}, {"harness": "claude", "home": ".claude-second"})]
+    return [note for note in notes if note]
+
+
+def test_no_note_khipu_writes_carries_a_code():
+    """The app shows a row's note as written: no snake_case code and no
+    jargon (home, PATH, token, probe) in any."""
+    notes = _every_note()
+    assert len(notes) > 20
+    for note in notes:
+        assert not re.search(r"\b[a-z]+_[a-z0-9_]+\b", note), note
+        assert not _JARGON.search(note.replace(NO_USER_HOME, "")), note
+    assert usage._note("not_installed", "grok") == "Grok Build is not installed on this Mac"
+    assert usage._note("not_signed_in", "claude", "~/.claude-second") == (
+        "Claude Code is not signed in with this login folder. Open Claude Code with this login folder and sign in "
+        "again")
+    assert usage._note("no_plan_limits", "claude", "~/.claude-t3-second") == (
+        "This sign-in reports no plan limits. Open Claude Code with this login folder and sign in again (/login)")
+
+
+def test_a_failed_probe_row_carries_the_plain_note_for_its_account(fake):
+    row = usage.probe_account({"label": "Grok work", "harness": "grok", "home": "~/.grok-work"})
+    assert row["ok"] is False and row["error"] == "not_installed"
+    assert row["note"] == "Grok Build is not installed on this Mac"
+
+
+def test_a_failed_probe_shows_its_own_note_on_the_kept_figures(fake, monkeypatch):
+    usage._save_cache({"claude|": _cached(_ago(60 * 24), note=None)})
+    failed = dict(_row(ok=False, error="no_plan_limits"), note=usage._note("no_plan_limits", "claude"))
+    monkeypatch.setattr(usage, "probe_all", lambda accounts, *, timeout: [failed])
+    row = usage.report(accounts=[{"label": "Claude", "harness": "claude", "home": None}], fresh=True)["accounts"][0]
+    assert row["ok"] is False and row["windows"][0]["used_pct"] == 55
+    assert row["note"] == usage._note("no_plan_limits", "claude") and "/login" in row["note"]
+    saved = json.loads(usage.cache_file().read_text())["rows"]["claude|"]
+    assert saved["note"] == usage._note("no_plan_limits", "claude")
+
+
+def test_a_fallback_note_does_not_outlive_its_good_read(fake, monkeypatch):
+    usage._save_cache({"codex|": _cached(_ago(5), harness="codex", label="Codex", source="rollout",
+                                         note=usage.ROLLOUT_NOTE, live_error="exit_1")})
+    monkeypatch.setattr(usage, "probe_all", lambda accounts, *, timeout: [
+        _row("codex", "Codex", ok=False, error="timeout", note=None)])
+    row = usage.report(accounts=[{"label": "Codex", "harness": "codex", "home": None}], fresh=True)["accounts"][0]
+    assert row["ok"] is False and row["error"] == "timeout" and row["source"] == "rollout"
+    assert row["windows"][0]["used_pct"] == 55
+    assert row["note"] is None and "live_error" not in row
+
+
+# ---- doctor and khipu_status: the cache only ------------------------------------------
+
+
+def _never_probe(monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("doctor and khipu_status read the cache only")
+
+    for name in ("probe_all", "probe_account", "_converse", "_start_refresh", "_try_refresh_lock",
+                 "probe_claude", "probe_codex", "probe_grok", "probe_muse"):
+        monkeypatch.setattr(usage, name, boom)
+
+
+def _seed_plans(tmp_path, *, claude_pct=94.0):
+    """Four accounts: Claude main fresh with a five-hour window at 94%
+    resetting in 40 min, Codex a day old (99% week already reset, five-hour
+    under the line), Grok kept after a failed read at 89.96% (shown 90%),
+    Muse never read."""
+    now = datetime.now(timezone.utc)
+    soon = usage._iso((now + timedelta(minutes=40, seconds=20)).timestamp())
+    later = usage._iso((now + timedelta(days=2)).timestamp())
+    past = usage._iso((now - timedelta(hours=1)).timestamp())
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    (data / "config.json").write_text(json.dumps({"usage_accounts": [
+        {"label": "Claude main", "harness": "claude"}, {"label": "Codex", "harness": "codex"},
+        {"label": "Grok", "harness": "grok"}, {"label": "Muse", "harness": "muse"}]}))
+    usage._save_cache({
+        "claude|": _cached(_ago(1), windows=[{"name": "five_hour", "used_pct": claude_pct, "resets_at": soon},
+                                            {"name": "weekly", "used_pct": 30, "resets_at": later}]),
+        "codex|": _cached(_ago(60 * 24), harness="codex", label="Codex", plan="pro", windows=[
+            {"name": "weekly", "used_pct": 99, "resets_at": past},
+            {"name": "five_hour", "used_pct": 89.94, "resets_at": soon}]),
+        "grok|": dict(_cached(_ago(30), harness="grok", label="Grok", plan="heavy",
+                              windows=[{"name": "weekly", "used_pct": 89.96, "resets_at": later}]),
+                      ok=False, error="timeout"),
+    })
+    return {"soon": soon, "later": later}
+
+
+def test_doctor_block_reads_the_cache_only_and_warns_at_90(fake, tmp_path, monkeypatch):
+    times = _seed_plans(tmp_path)
+    _never_probe(monkeypatch)
+    block = usage.doctor_block()
+    by = {a["account"]: a for a in block["accounts"]}
+    assert block["source"] == "cache" and block["alert_pct"] == 90
+    assert (by["Claude main"]["window"], by["Claude main"]["used_pct"], by["Claude main"]["stale"]) == (
+        "five-hour", 94, False)
+    assert by["Claude main"]["resets_at"] == times["soon"]
+    # A reset window's old figure no longer applies: the tightest still in force is the five-hour.
+    assert (by["Codex"]["window"], by["Codex"]["used_pct"], by["Codex"]["stale"]) == ("five-hour", 89.9, True)
+    assert by["Grok"]["ok"] is False and by["Grok"]["error"] == "timeout" and by["Grok"]["stale"] is True
+    assert by["Muse"]["never_read"] is True and by["Muse"]["window"] is None
+    grok_at = by["Grok"]["figures_at"]
+    assert block["warnings"] == [
+        "Plan nearly used up: Claude main (max) five-hour at 94%, resets in 40 min",
+        f"Plan nearly used up: Grok (heavy) week at 90% as of {usage._when(grok_at)}, "
+        f"resets {usage._when(times['later'])}",
+    ]
+
+
+def _doctor(capsys) -> tuple[int, dict]:
+    from contextlib import ExitStack
+    from unittest import mock
+
+    from khipu import cli
+    from tests.test_cli_recall_quality import _green_doctor_patches
+
+    patches = [*_green_doctor_patches(),
+               mock.patch("khipu.probe.status", return_value={"ok": True, "reason": None}),
+               mock.patch("khipu.drift.recall_quality", return_value={}),
+               mock.patch("khipu.recall_prompt.prompt_recall_outcomes", return_value={"ok": True, "count": 25})]
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        rc = cli.cmd_doctor(cli.build_parser().parse_args(["doctor"]))
+    return rc, json.loads(capsys.readouterr().out)
+
+
+def test_doctor_carries_plan_usage_and_its_warning_and_never_gates_ok(fake, tmp_path, monkeypatch, capsys):
+    _seed_plans(tmp_path, claude_pct=10)
+    _never_probe(monkeypatch)
+    rc_calm, calm = _doctor(capsys)
+    assert calm["warnings"] == calm["plan_usage"]["warnings"]
+    assert not any("Claude main" in w for w in calm["warnings"])
+    _seed_plans(tmp_path, claude_pct=94)
+    rc_hot, hot = _doctor(capsys)
+    assert [a["account"] for a in hot["plan_usage"]["accounts"]] == ["Claude main", "Codex", "Grok", "Muse"]
+    assert hot["warnings"][0] == "Plan nearly used up: Claude main (max) five-hour at 94%, resets in 40 min"
+    assert hot["warnings"] == hot["plan_usage"]["warnings"]
+    assert (rc_hot, hot["ok"]) == (rc_calm, calm["ok"])
+
+
+def test_khipu_status_carries_the_same_warning_line(fake, tmp_path, monkeypatch):
+    from unittest import mock
+
+    _seed_plans(tmp_path)
+    _never_probe(monkeypatch)
+    with mock.patch("khipu.drift.status_payload", return_value={"counts": {"episodes": 1}}), \
+            mock.patch("khipu.hub_snapshot.snapshot_freshness", return_value={"ok": True}):
+        out = mcp_server._tool_status({})
+    assert out["warnings"] == usage.doctor_block()["warnings"]
+    assert out["warnings"][0].startswith("Plan nearly used up: Claude main (max) five-hour at 94%")
+
+
+def test_doctor_block_never_raises_on_a_broken_cache(fake, tmp_path, monkeypatch):
+    _never_probe(monkeypatch)
+    usage.cache_file().parent.mkdir(parents=True, exist_ok=True)
+    usage.cache_file().write_text("{not json")
+    assert usage.doctor_block()["warnings"] == []

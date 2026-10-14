@@ -72,6 +72,14 @@ _ENV_ALLOW = ("HOME", "USER", "LOGNAME", "PATH", "SHELL", "TMPDIR", "LANG", "TER
 # seen starting before the billing answer; the probe reads no notification and
 # kills the whole process group at the answer or the deadline.
 _GROK_ENV = {"GROK_CURSOR_MCPS_ENABLED": "0", "GROK_CLAUDE_MCPS_ENABLED": "0"}
+# Added after the caller's PATH. Khipu.app starts under launchd's bare PATH
+# (/usr/bin:/bin:/usr/sbin:/sbin, promote.LAUNCHD_PATH), and an npm-installed
+# CLI is a ``#!/usr/bin/env node`` shim that exits 127 there before it answers
+# unless node's folder is on PATH. So the child's PATH gains the folder
+# synth_cli.binary found the CLI in (under nvm and fnm, node sits in that same
+# folder), the folder of the file it links to, then these.
+_TOOL_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "~/.npm-global/bin", "~/.local/bin")
+_SYSTEM_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
 _CLAUDE_ARGS = ("-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                 "--setting-sources", "project", "--no-session-persistence",
@@ -93,13 +101,38 @@ E_CLI = "cli_error"
 E_INVALID = "invalid_account"
 E_INTERNAL = "internal_error"
 E_PENDING = "pending"
-_NOTES = {
-    E_NO_LIMITS: "this login reports no plan limits (a login made with a setup token answers none); "
-                 "run /login in this home",
-    E_SIGNIN: "the CLI is not signed in for this home",
-    E_NOT_INSTALLED: "CLI not found on PATH",
-    E_PENDING: "first probe running; ask again in a few seconds",
-}
+# The CLIs by the names the app's form gives them.
+CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok Build", "muse": "Muse"}
+# Plain words only: the app shows notes as written to an owner who is not
+# technical, so a note names a login folder, never a home, a PATH, a token or
+# a probe. The live read's own code goes in the row's ``live_error`` field,
+# never into the note.
+ROLLOUT_NOTE = "Codex did not answer just now; these figures are from its last turn"
+
+
+def _note(code: str | None, harness: str | None = None, home: str | None = None) -> str | None:
+    """Khipu's own sentence for a failure ``code`` on one account, or None."""
+    name = CLI_NAMES.get(harness or "", "This CLI")
+    folder = " with this login folder" if home else ""
+    if code == E_NOT_INSTALLED:
+        return f"{name} is not installed on this Mac"
+    if code == E_SIGNIN:
+        return f"{name} is not signed in{folder}. Open {name}{folder} and sign in again"
+    if code == E_NO_LIMITS:
+        return f"This sign-in reports no plan limits. Open {name}{folder} and sign in again (/login)"
+    if code == E_PENDING:
+        return "Reading for the first time; ask again in a few seconds"
+    return None
+
+
+def _rollout_note(code: str, home: str | None) -> str:
+    """The note on Codex's last-turn figures after its live read failed with
+    ``code``: a signed-out Codex says so, since reading again will not help."""
+    if code == E_SIGNIN:
+        folder = " with this login folder" if home else ""
+        return (f"Codex is not signed in{folder}, so these figures are from its last turn. "
+                f"Open Codex{folder} and sign in again")
+    return ROLLOUT_NOTE
 _SIGNIN = re.compile(r"not (signed|logged) in|(log|sign) ?in (is )?required|please (log|sign) ?in|"
                      r"unauthori[sz]ed|unauthenticated|authentication (failed|required)|\b401\b", re.I)
 
@@ -126,22 +159,51 @@ def _command(harness: str) -> str | None:
     return synth_cli.binary(harness)
 
 
-def probe_environment(harness: str, home: str | None = None) -> dict[str, str]:
+def _home_path(home: str) -> Path | None:
+    """``home`` with ``~`` expanded, or None when it names a user this Mac
+    does not have (``Path.expanduser`` raises RuntimeError for ``~nouser``)."""
+    try:
+        return Path(home).expanduser()
+    except RuntimeError:
+        return None
+
+
+def _probe_path(inherited: str | None, binary: str | None) -> str:
+    """The child's PATH: the caller's own entries first, then the CLI's folder,
+    the folder of the file it links to, the usual tool folders and the system
+    ones, each once (see ``_TOOL_DIRS``)."""
+    dirs = [d for d in (inherited or "").split(os.pathsep) if d]
+    if binary:
+        with contextlib.suppress(OSError, ValueError):
+            dirs.append(os.path.dirname(os.path.abspath(binary)))
+            dirs.append(os.path.dirname(os.path.realpath(binary)))
+    for folder in _TOOL_DIRS:
+        with contextlib.suppress(RuntimeError):
+            dirs.append(str(Path(folder).expanduser()))
+    dirs.extend(_SYSTEM_DIRS)
+    return os.pathsep.join(dict.fromkeys(dirs))
+
+
+def probe_environment(harness: str, home: str | None = None, binary: str | None = None) -> dict[str, str]:
     """The child's whole environment, built from an allowlist: a value is read
     only for the names in ``_ENV_ALLOW`` and ``LC_*`` (other names are seen,
-    never read), then the account's own home and, for Grok, the compat knobs."""
+    never read), then the account's own home and, for Grok, the compat knobs.
+    PATH gains the folders a ``binary`` that is a node shim needs to find node
+    when Khipu runs under launchd's bare PATH (``_probe_path``)."""
     env: dict[str, str] = {}
     for name in _ENV_ALLOW:
         value = os.environ.get(name)
         if value is not None:
             env[name] = value
+    env["PATH"] = _probe_path(env.get("PATH"), binary)
     for name in list(os.environ):  # names only
         if name.startswith("LC_"):
             value = os.environ.get(name)
             if value is not None:
                 env[name] = value
     if home and harness in _HOME_VARS:
-        env[_HOME_VARS[harness]] = str(Path(home).expanduser())
+        path = _home_path(home)
+        env[_HOME_VARS[harness]] = str(path if path is not None else home)
     if harness == "grok":
         env.update(_GROK_ENV)
     return env
@@ -483,7 +545,7 @@ def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S) -
          "request": {"subtype": "get_usage", "skip_behaviors": True}},
     ]
     frames = _converse([binary, *_CLAUDE_ARGS], messages, _claude_is_answer,
-                       env=probe_environment("claude", config_dir), deadline=time.monotonic() + timeout,
+                       env=probe_environment("claude", config_dir, binary), deadline=time.monotonic() + timeout,
                        close_stdin=True)
     return parse_claude(frames)
 
@@ -622,14 +684,15 @@ def probe_codex(home: str | None = None, *, timeout: float = TIMEOUT_S) -> dict:
             {"id": 2, "method": "account/rateLimits/read"},
         ]
         frames = _converse([binary, "app-server"], messages, lambda f: f.get("id") == 2,
-                           env=probe_environment("codex", home), deadline=deadline - min(1.0, timeout * 0.2),
+                           env=probe_environment("codex", home, binary), deadline=deadline - min(1.0, timeout * 0.2),
                            close_stdin=False)
         return parse_codex(frames)
     except ProbeError as exc:
         fallback = codex_rollout(home, deadline=deadline)
         if fallback is None:
             raise
-        fallback["note"] = f"live read failed ({exc.code}); figures from the last Codex turn"
+        fallback["note"] = _rollout_note(exc.code, home)
+        fallback["live_error"] = exc.code
         return fallback
 
 
@@ -670,7 +733,7 @@ def probe_grok(grok_home: str | None = None, *, timeout: float = TIMEOUT_S) -> d
         {"jsonrpc": "2.0", "id": 2, "method": "_x.ai/billing", "params": {}},
     ]
     frames = _converse([binary, "agent", "--no-leader", "stdio"], messages, lambda f: f.get("id") == 2,
-                       env=probe_environment("grok", grok_home), deadline=time.monotonic() + timeout,
+                       env=probe_environment("grok", grok_home, binary), deadline=time.monotonic() + timeout,
                        close_stdin=False)
     return parse_grok(frames)
 
@@ -715,11 +778,68 @@ def probe_muse(*, timeout: float = TIMEOUT_S) -> dict:
         {"jsonrpc": "2.0", "id": 2, "method": "usage/read", "params": {}},
     ]
     frames = _converse([binary, "serve", "--no-session-log"], messages, lambda f: f.get("id") == 2,
-                       env=probe_environment("muse"), deadline=time.monotonic() + timeout, close_stdin=True)
+                       env=probe_environment("muse", None, binary), deadline=time.monotonic() + timeout, close_stdin=True)
     return parse_muse(frames)
 
 
 # ---- accounts ----------------------------------------------------------------
+
+
+ACCOUNTS_MAX = 32
+LABEL_MAX = 64
+HOME_MAX = 1024
+_ACCOUNT_FIELDS = ("label", "harness", "home")
+
+
+class AccountsError(ValueError):
+    """A ``usage_accounts`` list ``khipu config --set`` refuses. ``code`` is
+    fixed (the app turns it into its own sentence and never shows the text);
+    ``index`` is the 0-based entry at fault, ``field`` the one field at fault
+    (label, harness or home) and ``other`` the earlier entry it repeats."""
+
+    def __init__(self, message: str, code: str, *, index: int | None = None, field: str | None = None,
+                 other: int | None = None):
+        super().__init__(message)
+        self.code, self.index, self.field, self.other = code, index, field, other
+
+    def refusal(self) -> dict:
+        return {"ok": False, "error": str(self), "code": self.code, "index": self.index, "field": self.field,
+                "other": self.other}
+
+
+def _entry_problem(harness: str, home: str | None) -> tuple[str, str, str] | None:
+    """Why an entry cannot be read, as (code, field, plain reason), or None.
+    The reason is shown in the app as written: no home, harness or path."""
+    if harness not in HARNESSES:
+        named = f'the CLI "{harness}"' if harness else "an entry with no CLI"
+        return "unknown_cli", "harness", (f"Khipu does not read {named}; it reads Claude Code, Codex, "
+                                          "Grok Build and Muse")
+    if harness == "muse" and home:
+        return "muse_folder", "home", "Muse has one sign-in, so it takes no login folder"
+    path = _home_path(home) if home else None
+    # A relative folder (".claude-second", the "~/" left off) can never be
+    # read: each probe starts in a fresh empty temp folder, so it would always
+    # find an empty, signed-out login.
+    if home and (path is None or not path.is_absolute()):
+        return "no_such_folder", "home", (f"Khipu cannot find the login folder {home}; start it with ~/ "
+                                          "(for example ~/.codex-work) or give the full path")
+    return None
+
+
+def _account_from_entry(entry) -> dict:
+    """One ``usage_accounts`` entry as an account; a problem goes in
+    ``invalid`` (the report shows the entry instead of hiding it)."""
+    if not isinstance(entry, dict):
+        return {"label": "?", "harness": "?", "home": None, "invalid": "this entry is not an account"}
+    harness = str(entry.get("harness") or "").strip().lower()
+    label = str(entry.get("label") or "").strip() or LABELS.get(harness, harness or "?")
+    home = entry.get("home")
+    home = str(home).strip() if isinstance(home, str) and home.strip() else None
+    account = {"label": label, "harness": harness or "?", "home": home}
+    problem = _entry_problem(harness, home)
+    if problem:
+        account["invalid"] = problem[2]
+    return account
 
 
 def configured_accounts() -> list[dict]:
@@ -731,29 +851,98 @@ def configured_accounts() -> list[dict]:
     raw = load_config().get("usage_accounts")
     if not isinstance(raw, list) or not raw:
         return [{"label": LABELS[h], "harness": h, "home": None} for h in HARNESSES if _command(h)]
-    out = []
-    for entry in raw:
+    return [_account_from_entry(entry) for entry in raw]
+
+
+def parse_usage_accounts(raw) -> list[dict]:
+    """``raw`` (JSON text or a list) as the ``usage_accounts`` entries to store,
+    or ``AccountsError`` (a ValueError) naming the first problem with a fixed
+    code. Stricter than ``configured_accounts``, which shows a hand-edited bad
+    entry rather than refusing it: ``khipu config --set usage_accounts``
+    stores only entries that can be probed, each login once, each label once."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raise AccountsError('usage_accounts must be JSON: a list of {"label", "harness", "home"} entries',
+                                "bad_list") from None
+    if not isinstance(raw, list):
+        raise AccountsError('usage_accounts must be a list of {"label", "harness", "home"} entries', "bad_list")
+    if len(raw) > ACCOUNTS_MAX:
+        raise AccountsError(f"usage_accounts holds at most {ACCOUNTS_MAX} entries, got {len(raw)}", "too_many")
+    out: list[dict] = []
+    labels: dict[str, int] = {}
+    logins: dict[str, int] = {}
+    for i, entry in enumerate(raw):
+        where = f"usage_accounts entry {i + 1}"
         if not isinstance(entry, dict):
-            out.append({"label": "?", "harness": "?", "home": None, "invalid": "entry is not an object"})
-            continue
+            raise AccountsError(f"{where} is not an object", "bad_entry", index=i)
+        extra = sorted(str(k) for k in entry if k not in _ACCOUNT_FIELDS)
+        if extra:
+            raise AccountsError(f"{where} has an unknown field {extra[0]!r}; the fields are label, harness and home",
+                                "bad_entry", index=i)
+        for field in _ACCOUNT_FIELDS:
+            value = entry.get(field)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise AccountsError(f"{where}: {field} must be text", "not_one_line", index=i, field=field)
+            if not value.isprintable():
+                raise AccountsError(f"{where}: {field} must be one line of plain text", "not_one_line",
+                                    index=i, field=field)
+        for field, limit in (("label", LABEL_MAX), ("home", HOME_MAX)):
+            if len((entry.get(field) or "").strip()) > limit:
+                raise AccountsError(f"{where}: {field} is longer than {limit} characters", "too_long",
+                                    index=i, field=field)
         harness = str(entry.get("harness") or "").strip().lower()
-        label = str(entry.get("label") or "").strip() or LABELS.get(harness, harness or "?")
-        home = entry.get("home")
-        home = str(home).strip() if isinstance(home, str) and home.strip() else None
-        account = {"label": label, "harness": harness or "?", "home": home}
-        if harness not in HARNESSES:
-            account["invalid"] = f"unknown harness {harness or '(none)'!r}; one of {', '.join(HARNESSES)}"
-        elif harness == "muse" and home:
-            account["invalid"] = "Muse has one login per user; a home cannot be chosen"
-        out.append(account)
+        home = (entry.get("home") or "").strip() or None
+        problem = _entry_problem(harness, home)
+        if problem:
+            code, field, reason = problem
+            raise AccountsError(f"{where}: {reason}", code, index=i, field=field)
+        account = _account_from_entry(entry)
+        name = account["label"].casefold()
+        if name in labels:
+            raise AccountsError(f"two usage_accounts entries are named {account['label']!r}", "name_taken",
+                                index=i, field="label", other=labels[name])
+        key = _key(account)
+        if key in logins:
+            raise AccountsError(f"{where} ({account['label']}) reads the same login as an earlier entry",
+                                "login_taken", index=i, field="home", other=logins[key])
+        labels[name] = i
+        logins[key] = i
+        stored = {"label": account["label"], "harness": account["harness"]}
+        if account["home"]:
+            stored["home"] = account["home"]
+        out.append(stored)
     return out
+
+
+def accounts_status() -> dict:
+    """What ``khipu config`` shows: the stored ``usage_accounts`` (None when
+    unset), where the list comes from, and the accounts it resolves to."""
+    from khipu.config import load_config
+
+    raw = load_config().get("usage_accounts")
+    stored = raw if isinstance(raw, list) and raw else None
+    try:
+        user_home = str(Path.home())
+    except RuntimeError:
+        user_home = None
+    # ``user_home`` lets the app compare "~/.x" with "/Users/me/.x" the way
+    # the stored list is checked, before anything is saved.
+    return {"value": stored, "source": "file" if stored is not None else "default",
+            "accounts": configured_accounts(), "user_home": user_home}
 
 
 def _key(account: dict) -> str:
     """Cache identity: the harness and the home whose login answers (labels
     are display names and may change)."""
     home = account.get("home")
-    return f"{account['harness']}|{Path(home).expanduser() if home else ''}"
+    if not home:
+        return f"{account['harness']}|"
+    path = _home_path(home)
+    return f"{account['harness']}|{path if path is not None else home}"
 
 
 def _blank_row(account: dict) -> dict:
@@ -766,7 +955,7 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S) -> dict:
     harness, home = account["harness"], account.get("home")
     started = time.monotonic()
     if account.get("invalid"):
-        data = {"ok": False, "error": E_INVALID, "note": f"invalid usage_accounts entry: {account['invalid']}"}
+        data = {"ok": False, "error": E_INVALID, "note": f"This account entry is not valid: {account['invalid']}"}
     elif harness == "claude":
         data = probe_claude(home, timeout=timeout)
     elif harness == "codex":
@@ -781,12 +970,12 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S) -> dict:
     row.update(data)
     row.update({"probed_at": _iso(_now().timestamp()), "ms": int((time.monotonic() - started) * 1000)})
     if not row.get("ok") and not row.get("note"):
-        row["note"] = _NOTES.get(row.get("error"))
+        row["note"] = _note(row.get("error"), harness, home)
     return row
 
 
 def _failed_row(account: dict, code: str) -> dict:
-    return dict(_blank_row(account), ok=False, error=code, note=_NOTES.get(code),
+    return dict(_blank_row(account), ok=False, error=code, note=_note(code, account["harness"], account.get("home")),
                 probed_at=_iso(_now().timestamp()), ms=None)
 
 
@@ -892,14 +1081,17 @@ def _release(fd: int | None) -> None:
 def _merge(previous: dict | None, row: dict) -> dict:
     """A good probe replaces the row. A failed one keeps the last good figures
     with their own ``probed_at`` (and ``last_good_at``); the attempt goes in
-    ``last_attempt_at`` / ``last_error``, however many failures in a row."""
+    ``last_attempt_at`` / ``last_error``, however many failures in a row.
+    The note is the failure's own (the ``/login`` hint, say): a note that
+    came with the kept figures (the Codex fallback's) held only while that
+    read was good."""
     attempt = row.get("probed_at")
     if row.get("ok"):
         return dict(row, last_attempt_at=attempt, last_error=None, last_good_at=attempt)
     if previous and previous.get("last_good_at"):
-        kept = dict(previous)
+        kept = {k: v for k, v in previous.items() if k != "live_error"}
         kept.update(ok=False, error=row.get("error"), last_attempt_at=attempt, last_error=row.get("error"),
-                    ms=row.get("ms"), account=row.get("account"), home=row.get("home"))
+                    ms=row.get("ms"), account=row.get("account"), home=row.get("home"), note=row.get("note"))
         return kept
     return dict(row, last_attempt_at=attempt, last_error=row.get("error"), last_good_at=None)
 
@@ -1000,7 +1192,7 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
         refreshing = _start_refresh([accounts[i] for i in due], timeout)
         for i in due:
             if rows[i] is None:
-                rows[i] = dict(_blank_row(accounts[i]), ok=False, error=E_PENDING, note=_NOTES[E_PENDING],
+                rows[i] = dict(_blank_row(accounts[i]), ok=False, error=E_PENDING, note=_note(E_PENDING),
                                probed_at=None, ms=None, cached=False)
             rows[i]["refreshing"] = refreshing
     elif due:
@@ -1111,3 +1303,98 @@ def table(rep: dict) -> str:
     for r in [header, *lines]:
         out.append("  ".join(c.ljust(widths[i]) for i, c in enumerate(r[:-1])) + "  " + r[-1])
     return "\n".join(line.rstrip() for line in out)
+
+
+# ---- doctor and khipu_status: the cache only --------------------------------------
+
+# The line the app's Home callout uses too (PlansCard.tsx PLAN_ALERT_PCT).
+ALERT_PCT = 90.0
+
+
+def _shown_pct(value) -> float | None:
+    """The one-decimal figure the app shows and judges its lines on
+    (``Math.round(x * 10) / 10``), or None when the CLI gave no number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return math.floor(value * 10 + 0.5) / 10
+
+
+def _window_words(window: dict) -> str:
+    """'five-hour', 'week', 'Fable week', 'day', '60 min'."""
+    name = window.get("name") or "window"
+    if name == "five_hour":
+        return "five-hour"
+    if name == "weekly":
+        return "week"
+    if name == "daily":
+        return "day"
+    if name.startswith("weekly_"):
+        return f"{window.get('model') or name.removeprefix('weekly_').replace('_', ' ')} week"
+    mins = re.fullmatch(r"(\d+)_min", name)
+    return f"{mins.group(1)} min" if mins else name.replace("_", " ")
+
+
+def _reset_words(iso: str | None, now: datetime) -> str | None:
+    """'resets in 40 min' under an hour, else 'resets Sun 15:00Z'."""
+    when = _parse_time(iso)
+    if when is None:
+        return None
+    ahead = (when - now).total_seconds()
+    if ahead < 3600:
+        return f"resets in {max(1, round(ahead / 60))} min"
+    return f"resets {_when(iso)}"
+
+
+def _in_force(window: dict, now: datetime) -> bool:
+    """A window with a figure whose reset has not passed (a passed reset has
+    started the window again, so its old figure no longer applies)."""
+    if not isinstance(window, dict) or _shown_pct(window.get("used_pct")) is None:
+        return False
+    when = _parse_time(window.get("resets_at"))
+    return when is None or when > now
+
+
+def doctor_block(*, max_age: float = DEFAULT_MAX_AGE_S, now: datetime | None = None) -> dict:
+    """What ``khipu doctor`` and ``khipu_status`` carry: per configured
+    account, its tightest window still in force (label, used %, reset time,
+    stale flag), and one warning line per window still in force at
+    ``ALERT_PCT`` or more. Read from the usage cache only: no CLI is probed,
+    no lock is waited on, and nothing here ever gates doctor's ``ok``."""
+    now = now or _now()
+    cache = _load_cache()
+    accounts: list[dict] = []
+    warnings: list[str] = []
+    for account in configured_accounts():
+        entry = {"account": account["label"], "harness": account["harness"], "home": account.get("home"),
+                 "ok": None, "error": None, "plan": None, "window": None, "used_pct": None, "resets_at": None,
+                 "figures_at": None, "stale": False}
+        if account.get("invalid"):
+            entry.update(ok=False, error=E_INVALID)
+            accounts.append(entry)
+            continue
+        row = cache.get(_key(account))
+        if not row:
+            entry["never_read"] = True  # `khipu usage` has not read this account yet
+            accounts.append(entry)
+            continue
+        age = _age_s(row, now)
+        stale = bool((not row.get("ok") and row.get("last_good_at")) or (age is not None and age > max_age))
+        live = [w for w in row.get("windows") or [] if _in_force(w, now)]
+        tight = max(live, key=lambda w: _shown_pct(w.get("used_pct")), default=None)
+        entry.update(ok=bool(row.get("ok")), error=row.get("error"), plan=row.get("plan"),
+                     figures_at=row.get("observed_at") or row.get("probed_at"), stale=stale)
+        if tight is not None:
+            entry.update(window=_window_words(tight), used_pct=_shown_pct(tight.get("used_pct")),
+                         resets_at=tight.get("resets_at"))
+        accounts.append(entry)
+        head = account["label"] + (f" ({row['plan']})" if row.get("plan") else "")
+        kept = f" as of {_when(entry['figures_at'])}" if stale or not row.get("ok") else ""
+        for window in sorted(live, key=lambda w: -_shown_pct(w.get("used_pct"))):
+            pct = _shown_pct(window.get("used_pct"))
+            if pct < ALERT_PCT:
+                continue
+            reset = _reset_words(window.get("resets_at"), now)
+            warnings.append(f"Plan nearly used up: {head} {_window_words(window)} at {pct:g}%{kept}"
+                            + (f", {reset}" if reset else ""))
+    return {"source": "cache", "max_age_s": max_age, "alert_pct": ALERT_PCT, "accounts": accounts,
+            "warnings": warnings}

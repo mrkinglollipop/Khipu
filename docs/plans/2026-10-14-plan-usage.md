@@ -9,8 +9,8 @@ it first. Builds after the promotion gate (`2026-10-14-promotion-gate.md`) and g
 
 | Phase | What | State |
 |---|---|---|
-| 1 | `khipu usage`: one probe per installed subscription CLI, cached, as CLI JSON and an MCP tool | built 2026-10-14 (branch `feat/plan-usage-p1`): `khipu/usage.py`, `khipu usage`, MCP `khipu_usage`, fixtures `tests/fixtures/usage/`; real run on this Mac answered all four CLIs in 0.6–1.6 s |
-| 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | open |
+| 1 | `khipu usage`: one probe per installed subscription CLI, cached, as CLI JSON and an MCP tool | built and merged 2026-10-14 (PR #182, branch `feat/plan-usage-p1`): `khipu/usage.py`, `khipu usage`, MCP `khipu_usage`, fixtures `tests/fixtures/usage/`; real run on this Mac answered all four CLIs in 0.6–1.6 s |
+| 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | built 2026-10-14 (branch `feat/plan-usage-p2`, desktop 0.4.14): fixed-argv `khipu_usage_status` (`usage --json`) and `khipu_usage_refresh` (`usage --fresh --json`); `PlansCard.tsx` (Home card with Refresh, Settings → Capture & models card with Probe now and an add/remove list of the accounts read, through `config --set usage_accounts JSON` / `--unset`); health report "Plans" row and a Home attention item at 90%, read from `khipu_usage_status` (it can probe on demand; the item is re-judged every minute while it shows and at its earliest reset); `khipu doctor` carries a cache-only `plan_usage` block and a `warnings` line per window still in force at 90% or more, never gating `ok`, and `khipu_status` (complete schema) carries the same `warnings`; every probe's PATH adds the CLI's own folder, the folder it links to and the usual tool folders, so an npm-installed CLI answers from the app under launchd's bare PATH; a relative login folder is refused; the form stops a 33rd account before saving; fix rounds 1 to 4 below; not merged yet |
 
 Two PRs, phase 1 first.
 
@@ -96,8 +96,71 @@ announced, and no MCP child was seen starting before the answer.
 
 Home card "Plans" with one row per account (plan, the tightest window as a bar, reset time, stale tag);
 Settings → Models lists the accounts with their labels and homes and a Probe now button; doctor warns
-when any window is above 90% ("Claude main five-hour at 94%, resets in 40 min") so the orchestrator sees
+when any window is at 90% or more ("Claude main five-hour at 94%, resets in 40 min") so the orchestrator sees
 it in the health report it already reads.
+
+**Fix round (2026-10-14, after a review of phase 2).** A window whose `resets_at` has passed has started
+again: it never raises the 90% item, turns the Plans row red or colours a bar, and reads "reset since
+<date>". Figures kept from an earlier read alert as "when last read" and carry their own age ("figures from 2
+days ago", "as of the last turn, 3 h ago"); Settings shows that age and the last attempt separately. Reset
+times are the viewer's local time everywhere in the app (the UTC "Z" form stays in the CLI and MCP text), with
+the date when the reset has passed or is six or more days out, and "resets in 40 min" under an hour. The 75% and
+90% lines are judged on the one-decimal figure shown. The Plans row is red, naming the accounts, when no
+account gave a figure and any failed, and names failed accounts beside the figures that were read. Every fixed
+error code has a plain phrase, and Settings shows the row's Khipu-written note (an invalid entry's reason, the
+`/login` hint). A failed `khipu usage` run shows a fixed sentence; its text goes to the console only. Home and
+Settings share one reader that runs one read at a time, so a cache read never replaces a fresh probe and the
+CLIs are never started twice by the app. `khipu config --set usage_accounts` takes JSON checked by
+`usage.parse_usage_accounts` (known harness, no home for Muse, a home that names a real user, each label and
+login once, at most 32); `khipu config` shows the stored list, its source and the accounts it resolves to. A
+home such as `~nouser/x` is an `invalid_account` row instead of a crash. Not done: the CLI's synchronous path
+still probes beside a refresh another process holds (an MCP background refresh); the app no longer causes that.
+
+**Fix round 2 (2026-10-14).** The Home 90% item is re-judged every minute while it shows and at the earliest
+reset among its windows (`usePlanAttention`), so it never outlives a reset or freezes its "resets in 40 min"
+while Home stays open. The Codex fallback's note is plain words; the failed live read's code is in the row's
+`live_error`. A failed probe that keeps the last good figures carries its own note (the `/login` hint) and drops
+the kept read's. An invalid entry's note reads "this account entry is not valid: …". An account added in
+Settings with no Name is named after its CLI and login folder ("Codex (~/.codex-work)"); the form refuses a
+name or a login already listed in plain words, pointing at the field to change, before anything is saved, and
+empties as soon as the list is saved (the re-read that probes the new account is not waited on). `khipu doctor`
+gains `plan_usage`, read from the usage cache only (no CLI is probed, nothing waits): per configured account the
+tightest window still in force with its label, used %, reset time, figures time and stale flag (`never_read`
+when `khipu usage` has not read it), and doctor's new `warnings` list gets one line per window still in force
+at 90% or more on the one-decimal figure the app shows ("Plan nearly used up: Codex (pro) week at 94%, resets
+Thu 02:00Z", "as of …" for kept or old figures). Neither gates `ok`. `khipu_status` (complete schema) carries
+the same `warnings`; its light per-prompt payload does not.
+
+**Fix round 3 (2026-10-14).** A refused account list never shows the text `khipu config` wrote: `config --set
+usage_accounts` answers a fixed `code` with the entry's own `index`, the `field` at fault and the `other` entry
+it repeats (`usage.AccountsError`), and Settings turns each code into its own sentence, naming accounts by their
+Name and pointing at the Name or Login folder field; a refusal with no code, or from the app's own command,
+reads "Khipu could not save the account list…" and its text goes to the console only. Before anything is sent,
+the form refuses a Login folder that does not start with `~/` or `/` (the slash forgotten in `~.codex-work`),
+a Name over 64 characters (the field also stops at 64) and a line break, and compares logins after expanding
+`~` with the owner's folder, which `khipu config` now reports as `usage_accounts.user_home`. When Codex's live
+read fails and its last-turn figures are shown, Home and Settings tag the row with the reason ("not signed in")
+and the health report's Plans row names it ("Codex is showing its last turn (not signed in)"); a signed-out
+Codex's note says to sign in again instead of "did not answer just now". Every note Khipu writes is in owner
+words, per CLI and per login folder ("Grok Build is not installed on this Mac", "This sign-in reports no plan
+limits. Open Claude Code with this login folder and sign in again (/login)"), and an invalid entry's reason
+names a login folder and a CLI, never a home or a harness; a test holds every note to no snake_case and no
+jargon (home, PATH, token, probe, harness).
+
+**Fix round 4 (2026-10-14).** The app is the main reader now and starts under launchd's bare PATH
+(`/usr/bin:/bin:/usr/sbin:/sbin`), where an npm-installed CLI (a `#!/usr/bin/env node` shim found through
+`synth_cli.binary`'s fallback folders) exited 127 before it answered, so Home and Settings read "stopped without
+answering" while `khipu usage` in Terminal worked. `usage.probe_environment` now builds the child's PATH as the
+caller's own entries, then the CLI's folder (nvm keeps node beside it), the folder of the file it links to,
+`/opt/homebrew/bin`, `/usr/local/bin`, `~/.npm-global/bin`, `~/.local/bin` and the system folders, each once; no
+other variable is read. A login folder that is not absolute once `~` is expanded (`.claude-second`, the `~/` left
+off) is refused by `khipu config --set usage_accounts` as `no_such_folder` and shown as a not-valid entry, never
+probed: each probe starts in a fresh empty temp folder, so such a folder always read signed out. Settings stops a
+33rd account before anything is saved ("Khipu reads at most 32 accounts. Remove one before adding another."), and
+says the same when the app's own command refuses a list over the cap with no code; a failure that is not about the
+entry typed (Khipu not starting, the app's own command) reads "Khipu could not save the account list. Try again in a
+minute." and never points at the Name or Login folder. The doctor block and `khipu_status` warnings were already
+built in round 2 and are unchanged.
 
 ## Decisions
 
