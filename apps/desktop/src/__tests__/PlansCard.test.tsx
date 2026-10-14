@@ -7,6 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
+  ACCOUNTS_MAX,
   PLAN_READ_FAILED,
   PlansCard,
   PlansSettingsCard,
@@ -775,13 +776,13 @@ describe("a refused account list, in plain words (fix round 3)", () => {
     refuse = { error: "usage_accounts entry 3: home '~nouser/x' names a user this Mac does not have" };
     await typeAccount({ cli: "codex", folder: "~/.codex-two" });
     expect(
-      await screen.findByText("Khipu could not save the account list. Check the Name and Login folder and try again."),
+      await screen.findByText("Khipu could not save the account list. Try again in a minute."),
     ).toBeTruthy();
     expect(screen.queryByText(/usage_accounts|home '/)).toBeNull();
     // The app's own command refuses before the CLI runs: an invoke error, not JSON.
     expect(
       accountsRefusal({ error: "usage_accounts entry 3: label is too long" }, [], 2).message,
-    ).toBe("Khipu could not save the account list. Check the Name and Login folder and try again.");
+    ).toBe("Khipu could not save the account list. Try again in a minute.");
     const sent = [{ label: "Claude", harness: "claude" }, { label: "Typo", harness: "claude", home: "~nouser/x" }];
     expect(
       accountsRefusal({ error: "x", refusal: { code: "no_such_folder", index: 1, field: "home" } }, sent, 1),
@@ -791,6 +792,72 @@ describe("a refused account list, in plain words (fix round 3)", () => {
     });
     expect(accountsRefusal({ error: "x", refusal: { code: "name_taken", index: 1, field: "label", other: 0 } }, sent, null))
       .toEqual({ field: null, message: "Two accounts are named Typo. Remove one of them." });
+  });
+});
+
+describe("the account cap and failures that are not about an entry (fix round 4)", () => {
+  const configSets = () => calls.filter(([c]) => c === "khipu_config_set");
+  const TOO_MANY = "Khipu reads at most 32 accounts. Remove one before adding another.";
+  let spy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    spy = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => spy.mockRestore());
+
+  it("refuses a 33rd account before saving, saying to remove one", async () => {
+    expect(ACCOUNTS_MAX).toBe(32);
+    const accounts = Array.from({ length: 32 }, (_, i) => ({ label: `Claude ${i}`, harness: "claude", home: `~/.claude-${i}` }));
+    configShow = { usage_accounts: { value: accounts, source: "file", user_home: "/Users/me", accounts } };
+    render(<Settings />);
+    await waitFor(() => expect(screen.getByText("Your list")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Codex work" } });
+    fireEvent.change(screen.getByLabelText("CLI"), { target: { value: "codex" } });
+    fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.codex-work" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    expect(await screen.findByText(TOO_MANY)).toBeTruthy();
+    expect(configSets()).toHaveLength(0);
+    expect(screen.getByLabelText("Name").getAttribute("aria-invalid")).toBeNull();
+    expect(screen.getByLabelText("Login folder").getAttribute("aria-invalid")).toBeNull();
+    // An entry marked not valid is left out of what is stored, so it does not count.
+    const withInvalid = [...accounts.slice(1), { label: "Odd", harness: "gemini", home: null, invalid: "not read" }];
+    configShow = { usage_accounts: { value: withInvalid, source: "file", user_home: "/Users/me", accounts: withInvalid } };
+    cleanup();
+    render(<Settings />);
+    await waitFor(() => expect(screen.getByText("Your list")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Codex work" } });
+    fireEvent.change(screen.getByLabelText("CLI"), { target: { value: "codex" } });
+    fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.codex-work" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    await waitFor(() => expect(configSets()).toHaveLength(1));
+    expect(screen.queryByText(TOO_MANY)).toBeNull();
+  });
+
+  it("says the cap when the app's own command refuses a list over it, with no code", () => {
+    const sent = Array.from({ length: 33 }, (_, i) => ({ label: `c${i}`, harness: "claude" }));
+    expect(accountsRefusal({ error: "usage_accounts holds at most 32 entries" }, sent, 32)).toEqual({
+      field: null,
+      message: TOO_MANY,
+    });
+  });
+
+  it("never points at the Name or Login folder for a failure that is not about them", () => {
+    const sent = [{ label: "Claude", harness: "claude" }, { label: "Work", harness: "codex", home: "~/.codex-work" }];
+    for (const error of [
+      "khipu worker join failed: task panicked",
+      "bundled Python not found at /Applications/Khipu.app/Contents/Resources/python/bin/python3",
+      "khipu exited 1: Traceback (most recent call last)",
+      "spawn khipu: No such file or directory",
+    ]) {
+      const problem = accountsRefusal({ error }, sent, 1);
+      expect(problem).toEqual({ field: null, message: "Khipu could not save the account list. Try again in a minute." });
+      expect(problem.message).not.toMatch(/Name|Login folder/);
+    }
+    for (const code of ["bad_list", "bad_entry"]) {
+      expect(accountsRefusal({ error: "x", refusal: { code, index: 1 } }, sent, 1).message).not.toMatch(
+        /Name|Login folder/,
+      );
+    }
   });
 });
 

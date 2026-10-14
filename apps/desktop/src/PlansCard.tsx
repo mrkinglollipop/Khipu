@@ -646,6 +646,8 @@ function harnessName(h: string): string {
 
 const LABEL_MAX = 64;
 const FOLDER_MAX = 1024;
+/** The most accounts read: `khipu config` and the app's own command refuse a longer list. */
+export const ACCOUNTS_MAX = 32;
 
 /** The name an account gets when the Name field is left empty: the CLI's
  *  name, with the login folder when there is one ("Codex (~/.codex-work)"),
@@ -750,7 +752,10 @@ function fieldWords(c: RefusalCtx): string {
   return c.added || !c.entry ? `The ${which}` : `The ${which} of ${c.entry.label}`;
 }
 
-const ACCOUNTS_NOT_SAVED = "Khipu could not save the account list. Check the Name and Login folder and try again.";
+/** A failure that is not about the entry typed (the list as sent, Khipu not
+ *  starting, the app's own command): it never points at the fields. */
+const ACCOUNTS_NOT_SAVED = "Khipu could not save the account list. Try again in a minute.";
+const TOO_MANY = `Khipu reads at most ${ACCOUNTS_MAX} accounts. Remove one before adding another.`;
 
 /** Each refusal code `khipu config --set usage_accounts` gives, as Khipu's
  *  own sentence. The CLI's text never reaches the owner: it names the
@@ -758,7 +763,7 @@ const ACCOUNTS_NOT_SAVED = "Khipu could not save the account list. Check the Nam
 const ACCOUNT_REFUSAL: Record<string, (c: RefusalCtx) => string> = {
   bad_list: () => ACCOUNTS_NOT_SAVED,
   bad_entry: () => ACCOUNTS_NOT_SAVED,
-  too_many: () => "Khipu reads at most 32 accounts. Remove one before adding another.",
+  too_many: () => TOO_MANY,
   not_one_line: (c) => `${fieldWords(c)} must be one line of plain text.`,
   too_long: (c) =>
     c.field === "label"
@@ -792,16 +797,17 @@ export function accountsRefusal(
   added: number | null,
 ): FormProblem {
   console.error("khipu config --set usage_accounts refused:", res.error);
-  if (/^(khipu exited|spawn khipu)/i.test(res.error)) {
-    return { field: null, message: "Khipu could not save the account list. Try again in a minute." };
-  }
   const r = res.refusal ?? {};
   const code = typeof r.code === "string" ? r.code : "";
   const index = typeof r.index === "number" ? r.index : null;
   const otherIndex = typeof r.other === "number" ? r.other : null;
   const field = typeof r.field === "string" ? r.field : null;
   const say = Object.prototype.hasOwnProperty.call(ACCOUNT_REFUSAL, code) ? ACCOUNT_REFUSAL[code] : null;
-  if (!say) return { field: null, message: ACCOUNTS_NOT_SAVED };
+  if (!say) {
+    // The app's own command refuses a list over the cap before the CLI runs,
+    // as an error with no code: judged on the list sent, never on its text.
+    return { field: null, message: sent.length > ACCOUNTS_MAX ? TOO_MANY : ACCOUNTS_NOT_SAVED };
+  }
   const ctx: RefusalCtx = {
     entry: index != null ? (sent[index] ?? null) : null,
     other: otherIndex != null ? (sent[otherIndex] ?? null) : null,
@@ -858,6 +864,13 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
 
   async function add(e: FormEvent) {
     e.preventDefault();
+    if (storable(entries).length >= ACCOUNTS_MAX) {
+      // Checked before anything is sent: the refusal would otherwise come
+      // from the app's own command, with no code to say it by.
+      setErr(TOO_MANY);
+      setClash(null);
+      return;
+    }
     const folder = harness === "muse" ? null : home.trim() || null;
     const entry: UsageAccountEntry = {
       label: label.trim() || defaultAccountLabel(harness, folder),

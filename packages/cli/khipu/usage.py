@@ -72,6 +72,13 @@ _ENV_ALLOW = ("HOME", "USER", "LOGNAME", "PATH", "SHELL", "TMPDIR", "LANG", "TER
 # seen starting before the billing answer; the probe reads no notification and
 # kills the whole process group at the answer or the deadline.
 _GROK_ENV = {"GROK_CURSOR_MCPS_ENABLED": "0", "GROK_CLAUDE_MCPS_ENABLED": "0"}
+# Added after the caller's PATH. Khipu.app starts under launchd's bare PATH
+# (/usr/bin:/bin:/usr/sbin:/sbin, promote.LAUNCHD_PATH), and an npm-installed
+# CLI is a ``#!/usr/bin/env node`` shim that exits 127 there before it answers
+# unless node's folder is on PATH: the CLI's own folder (nvm keeps node beside
+# it), the folder of the file it links to, then these.
+_TOOL_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "~/.npm-global/bin", "~/.local/bin")
+_SYSTEM_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
 _CLAUDE_ARGS = ("-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                 "--setting-sources", "project", "--no-session-persistence",
@@ -160,15 +167,34 @@ def _home_path(home: str) -> Path | None:
         return None
 
 
-def probe_environment(harness: str, home: str | None = None) -> dict[str, str]:
+def _probe_path(inherited: str | None, binary: str | None) -> str:
+    """The child's PATH: the caller's own entries first, then the CLI's folder,
+    the folder of the file it links to, the usual tool folders and the system
+    ones, each once (see ``_TOOL_DIRS``)."""
+    dirs = [d for d in (inherited or "").split(os.pathsep) if d]
+    if binary:
+        with contextlib.suppress(OSError, ValueError):
+            dirs.append(os.path.dirname(os.path.abspath(binary)))
+            dirs.append(os.path.dirname(os.path.realpath(binary)))
+    for folder in _TOOL_DIRS:
+        with contextlib.suppress(RuntimeError):
+            dirs.append(str(Path(folder).expanduser()))
+    dirs.extend(_SYSTEM_DIRS)
+    return os.pathsep.join(dict.fromkeys(dirs))
+
+
+def probe_environment(harness: str, home: str | None = None, binary: str | None = None) -> dict[str, str]:
     """The child's whole environment, built from an allowlist: a value is read
     only for the names in ``_ENV_ALLOW`` and ``LC_*`` (other names are seen,
-    never read), then the account's own home and, for Grok, the compat knobs."""
+    never read), then the account's own home and, for Grok, the compat knobs.
+    PATH gains the folders a ``binary`` that is a node shim needs to find node
+    when Khipu runs under launchd's bare PATH (``_probe_path``)."""
     env: dict[str, str] = {}
     for name in _ENV_ALLOW:
         value = os.environ.get(name)
         if value is not None:
             env[name] = value
+    env["PATH"] = _probe_path(env.get("PATH"), binary)
     for name in list(os.environ):  # names only
         if name.startswith("LC_"):
             value = os.environ.get(name)
@@ -518,7 +544,7 @@ def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S) -
          "request": {"subtype": "get_usage", "skip_behaviors": True}},
     ]
     frames = _converse([binary, *_CLAUDE_ARGS], messages, _claude_is_answer,
-                       env=probe_environment("claude", config_dir), deadline=time.monotonic() + timeout,
+                       env=probe_environment("claude", config_dir, binary), deadline=time.monotonic() + timeout,
                        close_stdin=True)
     return parse_claude(frames)
 
@@ -657,7 +683,7 @@ def probe_codex(home: str | None = None, *, timeout: float = TIMEOUT_S) -> dict:
             {"id": 2, "method": "account/rateLimits/read"},
         ]
         frames = _converse([binary, "app-server"], messages, lambda f: f.get("id") == 2,
-                           env=probe_environment("codex", home), deadline=deadline - min(1.0, timeout * 0.2),
+                           env=probe_environment("codex", home, binary), deadline=deadline - min(1.0, timeout * 0.2),
                            close_stdin=False)
         return parse_codex(frames)
     except ProbeError as exc:
@@ -706,7 +732,7 @@ def probe_grok(grok_home: str | None = None, *, timeout: float = TIMEOUT_S) -> d
         {"jsonrpc": "2.0", "id": 2, "method": "_x.ai/billing", "params": {}},
     ]
     frames = _converse([binary, "agent", "--no-leader", "stdio"], messages, lambda f: f.get("id") == 2,
-                       env=probe_environment("grok", grok_home), deadline=time.monotonic() + timeout,
+                       env=probe_environment("grok", grok_home, binary), deadline=time.monotonic() + timeout,
                        close_stdin=False)
     return parse_grok(frames)
 
@@ -751,7 +777,7 @@ def probe_muse(*, timeout: float = TIMEOUT_S) -> dict:
         {"jsonrpc": "2.0", "id": 2, "method": "usage/read", "params": {}},
     ]
     frames = _converse([binary, "serve", "--no-session-log"], messages, lambda f: f.get("id") == 2,
-                       env=probe_environment("muse"), deadline=time.monotonic() + timeout, close_stdin=True)
+                       env=probe_environment("muse", None, binary), deadline=time.monotonic() + timeout, close_stdin=True)
     return parse_muse(frames)
 
 
@@ -789,7 +815,11 @@ def _entry_problem(harness: str, home: str | None) -> tuple[str, str, str] | Non
                                           "Grok Build and Muse")
     if harness == "muse" and home:
         return "muse_folder", "home", "Muse has one sign-in, so it takes no login folder"
-    if home and _home_path(home) is None:
+    path = _home_path(home) if home else None
+    # A relative folder (".claude-second", the "~/" left off) can never be
+    # read: each probe starts in a fresh empty temp folder, so it would always
+    # find an empty, signed-out login.
+    if home and (path is None or not path.is_absolute()):
         return "no_such_folder", "home", (f"Khipu cannot find the login folder {home}; start it with ~/ "
                                           "(for example ~/.codex-work) or give the full path")
     return None

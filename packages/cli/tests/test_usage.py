@@ -582,6 +582,66 @@ def test_probe_environment_is_an_allowlist(fake, tmp_path, monkeypatch):
         assert "SERVICE_TOKEN" not in child and "UNLISTED_THING" not in child, harness
 
 
+LAUNCHD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def _npm_shim(tmp_path, fixture: str, out: Path) -> Path:
+    """An npm-style install: ``prefix/bin/codex`` links to a
+    ``#!/usr/bin/env node`` script, and node sits beside the link (nvm's
+    layout). This node is a shell script running the fake CLI's Python."""
+    prefix = tmp_path / "npm-prefix"
+    package = prefix / "lib" / "node_modules" / "codex-fixture" / "bin"
+    package.mkdir(parents=True)
+    (prefix / "bin").mkdir()
+    node = prefix / "bin" / "node"
+    node.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    node.chmod(0o755)
+    script = package / "codex.js"
+    script.write_text("#!/usr/bin/env node\n" + textwrap.dedent(f"""
+        import runpy, sys
+        sys.argv = [{str(tmp_path / "fake_cli.py")!r}, {str(FIXTURES / fixture)!r}, "answer", {str(out)!r},
+                    *sys.argv[1:]]
+        runpy.run_path(sys.argv[0], run_name="__main__")
+    """))
+    script.chmod(0o755)
+    shim = prefix / "bin" / "codex"
+    shim.symlink_to(Path("..") / "lib" / "node_modules" / "codex-fixture" / "bin" / "codex.js")
+    return shim
+
+
+def test_a_node_shim_answers_under_the_bare_launchd_path(fake, tmp_path, monkeypatch):
+    """Khipu.app runs under launchd's PATH, where ``/usr/bin/env node`` finds
+    no node: an npm-installed Codex exited 127 on every probe from the app
+    while ``khipu usage`` in Terminal worked."""
+    out = tmp_path / "codex-child.json"
+    shim = _npm_shim(tmp_path, "codex.jsonl", out)
+    monkeypatch.setattr(usage, "_command", lambda harness: str(shim) if harness == "codex" else None)
+    monkeypatch.setenv("PATH", LAUNCHD_PATH)
+    row = usage.probe_codex()
+    assert row["ok"] is True and row["source"] == "live", row
+    assert row["plan"] == "pro"
+    assert _child(out)["argv"] == ["app-server"]
+
+
+def test_probe_path_keeps_the_callers_own_and_adds_the_cli_folders(tmp_path, monkeypatch):
+    out = tmp_path / "unused.json"
+    (tmp_path / "fake_cli.py").write_text(FAKE_CLI)
+    shim = _npm_shim(tmp_path, "codex.jsonl", out)
+    monkeypatch.setenv("HOME", str(tmp_path / "owner"))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    path = usage.probe_environment("codex", None, str(shim))["PATH"].split(os.pathsep)
+    assert path[:2] == ["/usr/bin", "/bin"], "the caller's own PATH comes first"
+    assert path[2] == str(shim.parent)
+    assert path[3] == os.path.dirname(os.path.realpath(shim))
+    for folder in ("/opt/homebrew/bin", "/usr/local/bin", str(tmp_path / "owner" / ".npm-global" / "bin"),
+                   str(tmp_path / "owner" / ".local" / "bin"), "/usr/sbin", "/sbin"):
+        assert folder in path, folder
+    assert len(path) == len(set(path)), "each folder once"
+    # With no PATH at all (and no binary) the child still gets the usual folders.
+    monkeypatch.delenv("PATH")
+    assert usage.probe_environment("muse")["PATH"].split(os.pathsep)[:2] == ["/opt/homebrew/bin", "/usr/local/bin"]
+
+
 def test_every_probe_runs_in_a_fresh_empty_temp_cwd(fake):
     for harness, fixture, probe in (("claude", "claude.jsonl", usage.probe_claude),
                                     ("codex", "codex.jsonl", usage.probe_codex),
@@ -821,6 +881,26 @@ def test_a_home_naming_no_user_is_an_invalid_row_not_a_crash(fake, tmp_path):
     assert usage.probe_environment("claude", NO_USER_HOME)["CLAUDE_CONFIG_DIR"] == NO_USER_HOME
 
 
+def test_a_relative_login_folder_is_an_invalid_entry_never_probed(fake, tmp_path):
+    """A hand-edited ".claude-second" was listed as valid and probed inside a
+    fresh temp folder, so it always read "not signed in" and asked the owner
+    to sign in again, which could never fix it."""
+    out = fake("claude", "claude.jsonl")
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    (data / "config.json").write_text(json.dumps({"usage_accounts": [
+        {"label": "Second", "harness": "claude", "home": ".claude-second"},
+        {"label": "Work", "harness": "codex", "home": "codex-work"},
+    ]}))
+    accounts = {a["label"]: a for a in usage.configured_accounts()}
+    assert accounts["Second"]["invalid"].startswith("Khipu cannot find the login folder .claude-second; start it with ~/")
+    assert accounts["Work"]["invalid"].startswith("Khipu cannot find the login folder codex-work")
+    rows = {r["account"]: r for r in usage.report(fresh=True)["accounts"]}
+    assert rows["Second"]["ok"] is False and rows["Second"]["error"] == "invalid_account"
+    assert rows["Second"]["note"].startswith("This account entry is not valid: Khipu cannot find the login folder")
+    assert not out.exists(), "an invalid entry is never probed"
+
+
 def test_usage_accounts_are_set_shown_and_unset_through_config(fake, capsys):
     from khipu import config
 
@@ -867,6 +947,11 @@ _REFUSALS = [
      "Khipu cannot find the login folder ~.codex-work", "no_such_folder", 2, "home", None),
     (json.dumps([{"harness": "claude", "home": NO_USER_HOME}]), "cannot find the login folder", "no_such_folder",
      0, "home", None),
+    # A relative folder (the "~/" left off) resolves inside each probe's fresh temp folder: never readable.
+    (json.dumps([{"harness": "claude", "home": ".claude-second"}]),
+     "Khipu cannot find the login folder .claude-second; start it with ~/", "no_such_folder", 0, "home", None),
+    (json.dumps([*_TWO, {"label": "Work", "harness": "codex", "home": "codex-work"}]),
+     "Khipu cannot find the login folder codex-work", "no_such_folder", 2, "home", None),
     ('[{"harness": "claude"}, {"label": "claude", "harness": "codex"}]', "two usage_accounts entries are named",
      "name_taken", 1, "label", 0),
     ('[{"label": "A", "harness": "claude", "home": "/x"}, {"label": "B", "harness": "claude", "home": "/x/"}]',
@@ -940,7 +1025,7 @@ def _every_note() -> list[str]:
                 notes += [usage._note(code, harness, home), usage._rollout_note(code, home)]
     notes += [usage._account_from_entry(entry)["invalid"] for entry in (
         "claude", {"harness": "gemini"}, {"harness": ""}, {"harness": "muse", "home": "/x"},
-        {"harness": "claude", "home": NO_USER_HOME})]
+        {"harness": "claude", "home": NO_USER_HOME}, {"harness": "claude", "home": ".claude-second"})]
     return [note for note in notes if note]
 
 

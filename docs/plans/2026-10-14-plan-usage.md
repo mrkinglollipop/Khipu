@@ -10,7 +10,7 @@ it first. Builds after the promotion gate (`2026-10-14-promotion-gate.md`) and g
 | Phase | What | State |
 |---|---|---|
 | 1 | `khipu usage`: one probe per installed subscription CLI, cached, as CLI JSON and an MCP tool | built and merged 2026-10-14 (PR #182, branch `feat/plan-usage-p1`): `khipu/usage.py`, `khipu usage`, MCP `khipu_usage`, fixtures `tests/fixtures/usage/`; real run on this Mac answered all four CLIs in 0.6–1.6 s |
-| 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | built 2026-10-14 (branch `feat/plan-usage-p2`, desktop 0.4.14): fixed-argv `khipu_usage_status` (`usage --json`) and `khipu_usage_refresh` (`usage --fresh --json`); `PlansCard.tsx` (Home card with Refresh, Settings → Capture & models card with Probe now and an add/remove list of the accounts read, through `config --set usage_accounts JSON` / `--unset`); health report "Plans" row and a Home attention item at 90%, read from `khipu_usage_status` (it can probe on demand; the item is re-judged every minute while it shows and at its earliest reset); `khipu doctor` carries a cache-only `plan_usage` block and a `warnings` line per window still in force at 90% or more, never gating `ok`, and `khipu_status` (complete schema) carries the same `warnings`; fix rounds 1, 2 and 3 below; not merged yet |
+| 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | built 2026-10-14 (branch `feat/plan-usage-p2`, desktop 0.4.14): fixed-argv `khipu_usage_status` (`usage --json`) and `khipu_usage_refresh` (`usage --fresh --json`); `PlansCard.tsx` (Home card with Refresh, Settings → Capture & models card with Probe now and an add/remove list of the accounts read, through `config --set usage_accounts JSON` / `--unset`); health report "Plans" row and a Home attention item at 90%, read from `khipu_usage_status` (it can probe on demand; the item is re-judged every minute while it shows and at its earliest reset); `khipu doctor` carries a cache-only `plan_usage` block and a `warnings` line per window still in force at 90% or more, never gating `ok`, and `khipu_status` (complete schema) carries the same `warnings`; every probe's PATH adds the CLI's own folder, the folder it links to and the usual tool folders, so an npm-installed CLI answers from the app under launchd's bare PATH; a relative login folder is refused; the form stops a 33rd account before saving; fix rounds 1 to 4 below; not merged yet |
 
 Two PRs, phase 1 first.
 
@@ -146,6 +146,21 @@ words, per CLI and per login folder ("Grok Build is not installed on this Mac", 
 limits. Open Claude Code with this login folder and sign in again (/login)"), and an invalid entry's reason
 names a login folder and a CLI, never a home or a harness; a test holds every note to no snake_case and no
 jargon (home, PATH, token, probe, harness).
+
+**Fix round 4 (2026-10-14).** The app is the main reader now and starts under launchd's bare PATH
+(`/usr/bin:/bin:/usr/sbin:/sbin`), where an npm-installed CLI (a `#!/usr/bin/env node` shim found through
+`synth_cli.binary`'s fallback folders) exited 127 before it answered, so Home and Settings read "stopped without
+answering" while `khipu usage` in Terminal worked. `usage.probe_environment` now builds the child's PATH as the
+caller's own entries, then the CLI's folder (nvm keeps node beside it), the folder of the file it links to,
+`/opt/homebrew/bin`, `/usr/local/bin`, `~/.npm-global/bin`, `~/.local/bin` and the system folders, each once; no
+other variable is read. A login folder that is not absolute once `~` is expanded (`.claude-second`, the `~/` left
+off) is refused by `khipu config --set usage_accounts` as `no_such_folder` and shown as a not-valid entry, never
+probed: each probe starts in a fresh empty temp folder, so such a folder always read signed out. Settings stops a
+33rd account before anything is saved ("Khipu reads at most 32 accounts. Remove one before adding another."), and
+says the same when the app's own command refuses a list over the cap with no code; a failure that is not about the
+entry typed (Khipu not starting, the app's own command) reads "Khipu could not save the account list. Try again in a
+minute." and never points at the Name or Login folder. The doctor block and `khipu_status` warnings were already
+built in round 2 and are unchanged.
 
 ## Decisions
 
