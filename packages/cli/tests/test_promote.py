@@ -30,6 +30,8 @@ def home(tmp_path, monkeypatch):
     h.mkdir()
     monkeypatch.setenv("HOME", str(h))
     monkeypatch.setattr(integrations, "HOME", h)
+    # paths.DEFAULT_DIR was fixed at import; point the data dir (query_log.jsonl) here too.
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(h / ".config" / "khipu"))
     return h
 
 
@@ -254,54 +256,76 @@ class _SpyEnviron(dict):
         return dict(super().items())
 
 
-def _summary(when: datetime, reason: str, hits: list[str], prompt: str | None) -> str:
+def _summary(when: datetime, reason: str, hits: list[str]) -> str:
+    """A prompt-recall summary line, as the hook writes into its own log."""
     stamp = when.strftime("%Y-%m-%dT%H:%M:%SZ")
-    line = (f"{stamp} [khipu-prompt-recall] session=s1 reason={reason} ms=300.0 hits={hits} "
+    return (f"{stamp} [khipu-prompt-recall] session=s1 reason={reason} ms=300.0 hits={hits} "
             f"legs=['lexical'] degraded=None")
-    if prompt is not None:
-        line += " replay=" + json.dumps({"prompt": prompt, "cwd": "/work/project"})
-    return line
 
 
-def test_replay_reads_only_the_hook_log_and_never_a_credential(home, monkeypatch):
-    import khipu.recall_prompt  # noqa: F401 — imported before the spy is installed
+def _query(when: datetime, query, harness: str = "claude_code") -> str:
+    return json.dumps({"ts": when.strftime("%Y-%m-%dT%H:%M:%SZ"), "harness": harness, "query": query,
+                       "mode": "hybrid", "filters": {}, "result_count": 3, "top": []})
 
-    now = datetime.now(timezone.utc)
-    log = home / ".grok" / "khipu" / "logs" / "prompt-recall.log"
-    log.parent.mkdir(parents=True)
-    log.write_text("\n".join([
-        _summary(now - timedelta(days=3), "ok", ["episode:1"], "too old to replay"),
-        _summary(now - timedelta(hours=5), "trivial acknowledgment", [], "ok thanks"),
-        _summary(now - timedelta(hours=4), "ok", ["episode:2"], None),
-        _summary(now - timedelta(hours=3), "ok", ["episode:3", "topic:x"], "where did we leave the gate"),
-        _summary(now - timedelta(hours=2), "ok", ["episode:4"], "what about the release card"),
-        "2026-10-14T00:00:00Z [khipu-prompt-recall] snapshot unusable (x) — falling back to hub",
-    ]) + "\n")
-    # Things the replay must never touch.
-    secret_file = home / ".config" / "khipu" / "dsn"
-    secret_file.parent.mkdir(parents=True)
-    secret_file.write_text("postgresql://user:hunter2@db.example.invalid/khipu")
-    monkeypatch.setenv("FAKE_PROVIDER_API_KEY", "sk-test-not-real")
-    monkeypatch.setenv("GATEWAY_TOKEN", "not-real-either")
+
+def _query_log(home: Path) -> Path:
+    from khipu.query_log import log_path
+
+    path = log_path()
+    assert str(path).startswith(str(home))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _hooks(home: Path) -> Path:
     live_hook = home / ".config" / "khipu" / "bin" / "khipu-prompt-recall"
-    live_hook.parent.mkdir(parents=True)
+    live_hook.parent.mkdir(parents=True, exist_ok=True)
     live_hook.write_text("#!/bin/sh\n")
     candidate = _fake_checkout(home / "candidate")
     (candidate / "packages" / "cli" / "bin" / "khipu-prompt-recall").write_text("#!/bin/sh\n")
+    return candidate
 
-    envs = []
 
+def _fake_hook(hits_for, envs=None, payloads=None):
     def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
-        envs.append(dict(env))
-        payload = json.loads(input)
+        if envs is not None:
+            envs.append(dict(env))
+        if payloads is not None:
+            payloads.append(json.loads(input))
         capture_home = Path(env["KHIPU_CAPTURE_HOME"])
         (capture_home / "logs").mkdir(parents=True, exist_ok=True)
-        hits = ["episode:3"] if "candidate" in argv[0] else ["episode:3", "topic:x"]
         with (capture_home / "logs" / "prompt-recall.log").open("a") as fh:
-            fh.write(_summary(datetime.now(timezone.utc), "ok", hits, payload["prompt"]) + "\n")
+            fh.write(_summary(datetime.now(timezone.utc), "ok", hits_for(argv[0])) + "\n")
         return subprocess.CompletedProcess(argv, 0, '{"hookSpecificOutput": {}}\n', "")
+    return fake_run
 
-    monkeypatch.setattr(pm, "_run", fake_run)
+
+def test_replay_reads_only_the_query_log_and_never_a_credential(home, monkeypatch):
+    import khipu.query_log  # noqa: F401 — imported before the spy is installed
+    import khipu.redact  # noqa: F401
+
+    now = datetime.now(timezone.utc)
+    log = _query_log(home)
+    log.write_text("\n".join([
+        _query(now - timedelta(days=3), "too old to replay"),
+        _query(now - timedelta(hours=5), None),  # a redacted gateway line
+        _query(now - timedelta(hours=4), "   "),
+        _query(now - timedelta(hours=3), "where did we leave the gate"),
+        _query(now - timedelta(hours=2), "where did we leave the gate", harness="codex"),
+        _query(now - timedelta(hours=1), "deploy note api_key=sk-live-abcdefghijklmnopqrstuvwxyz0123456789",
+               harness="mcp"),
+        "not json",
+    ]) + "\n")
+    # Things the replay must never touch.
+    secret_file = home / ".config" / "khipu" / "dsn"
+    secret_file.parent.mkdir(parents=True, exist_ok=True)
+    secret_file.write_text("postgresql://user:hunter2@db.example.invalid/khipu")
+    monkeypatch.setenv("FAKE_PROVIDER_API_KEY", "sk-test-not-real")
+    monkeypatch.setenv("GATEWAY_TOKEN", "not-real-either")
+    candidate = _hooks(home)
+    envs, payloads = [], []
+    monkeypatch.setattr(pm, "_run", _fake_hook(
+        lambda hook: ["episode:3"] if "candidate" in hook else ["episode:3", "topic:x"], envs, payloads))
     opened = []
     real_open = builtins.open
 
@@ -319,10 +343,15 @@ def test_replay_reads_only_the_hook_log_and_never_a_credential(home, monkeypatch
     assert out["ok"], out
     assert set(out) == {"ok", "ms", "detail"}
     assert "2 prompt(s) replayed" in out["detail"]
-    assert len(envs) == 4  # live and candidate, for each of the two replayable prompts
+    assert len(envs) == 4  # live and candidate, for each of the two distinct queries
     for env in envs:
         assert not [k for k in env if "KEY" in k or "TOKEN" in k], env
         assert env["KHIPU_RECALL_DAEMON"] == "0"
+    prompts = [p["prompt"] for p in payloads]
+    assert "where did we leave the gate" in prompts
+    assert not [p for p in prompts if "sk-live-abcdefghij" in p], prompts  # masked before it is sent
+    for p in payloads:
+        assert p["hook_event_name"] == "UserPromptSubmit" and p["session_id"].startswith("khipu-gate-")
     assert "*every variable*" not in reads
     assert not [k for k in reads if "KEY" in k or "TOKEN" in k], reads
     files = [p for p in opened if isinstance(p, Path)]
@@ -333,43 +362,19 @@ def test_replay_reads_only_the_hook_log_and_never_a_credential(home, monkeypatch
 
 
 def test_replay_refuses_an_empty_answer_where_live_had_one(home, monkeypatch):
-    now = datetime.now(timezone.utc)
-    log = home / ".grok" / "khipu" / "logs" / "prompt-recall.log"
-    log.parent.mkdir(parents=True)
-    log.write_text(_summary(now - timedelta(hours=1), "ok", ["episode:9"], "the queue drain path") + "\n")
-    live_hook = home / ".config" / "khipu" / "bin" / "khipu-prompt-recall"
-    live_hook.parent.mkdir(parents=True)
-    live_hook.write_text("#!/bin/sh\n")
-    candidate = _fake_checkout(home / "candidate")
-    (candidate / "packages" / "cli" / "bin" / "khipu-prompt-recall").write_text("#!/bin/sh\n")
-
-    def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
-        capture_home = Path(env["KHIPU_CAPTURE_HOME"])
-        (capture_home / "logs").mkdir(parents=True, exist_ok=True)
-        hits = [] if "candidate" in argv[0] else ["episode:9"]
-        (capture_home / "logs" / "prompt-recall.log").write_text(
-            _summary(datetime.now(timezone.utc), "ok", hits, "the queue drain path") + "\n")
-        return subprocess.CompletedProcess(argv, 0, "{}\n", "")
-
-    monkeypatch.setattr(pm, "_run", fake_run)
+    _query_log(home).write_text(_query(datetime.now(timezone.utc) - timedelta(hours=1), "the queue drain path") + "\n")
+    candidate = _hooks(home)
+    monkeypatch.setattr(pm, "_run", _fake_hook(lambda hook: [] if "candidate" in hook else ["episode:9"]))
     out = pm.gate_recall_replay(candidate)
     assert not out["ok"] and "empty answer where live had 1 hit" in out["detail"]
 
 
 def test_replay_with_nothing_to_replay_is_a_failure_not_a_pass(home):
-    out = pm.gate_recall_replay(_fake_checkout(home / "candidate"))
-    assert not out["ok"] and "no replayable prompt" in out["detail"]
-
-
-def test_the_hook_log_line_carries_its_prompt_for_replay():
-    from khipu.recall_prompt import replay_field
-
-    field = replay_field({"prompt": "where did we leave the gate", "cwd": "/work"})
-    line = _summary(datetime.now(timezone.utc), "ok", ["episode:1"], None) + field
-    row = pm._parse_summary(line)
-    assert row["prompt"] == "where did we leave the gate" and row["cwd"] == "/work"
-    assert row["hits"] == ["episode:1"]
-    assert replay_field({"prompt": ""}) == "" and replay_field({}) == ""
+    candidate = _hooks(home)
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"] and out["detail"] == "no queries in the last day; use Khipu once and re-run"
+    _query_log(home).write_text(_query(datetime.now(timezone.utc) - timedelta(days=2), "stale") + "\n")
+    assert pm.gate_recall_replay(candidate)["detail"] == "no queries in the last day; use Khipu once and re-run"
 
 
 # ---- capture and version ---------------------------------------------------

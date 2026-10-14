@@ -52,9 +52,12 @@ the symlink alone):
    `PYTHONPATH`, with the launchd environment (`launchd_gen.render_context`, bare `PATH`), so a missing
    binary or module shows here and not at 06:05Z.
 2. Per-prompt recall replay: the candidate's `khipu-prompt-recall` run as the hook would run it, on five
-   real prompts sampled from the last day's `prompt-recall.log` (the hook's own log is the only truth for
-   that lane), against the live replica, each inside the 1.2 s budget; compare the returned ids with the
-   current live code's answer for the same prompts and refuse on an empty answer where live had one.
+   real queries sampled from the last day of Khipu's own `query_log.jsonl` (any harness, non-empty
+   `query`, de-duplicated, secrets masked with the capture path's masker), each wrapped as the harness's
+   UserPromptSubmit stdin JSON, against the live replica, each inside the 1.2 s budget; compare the
+   returned ids with the current live code's answer for the same queries and refuse on an empty answer
+   where live had one. No usable line from the last day fails the step ("no queries in the last day; use
+   Khipu once and re-run"); it never passes on missing evidence.
 3. One real capture end to end: queue a fixture transcript (a redacted window from `tests/fixtures`,
    marked `gate: true`) through the candidate's `khipu-stop-hook`, drain it with the candidate code, see
    the episode land in the hub, then `khipu forget` it. This exercises the summariser provider, the
@@ -84,7 +87,7 @@ launcher symlinks) before writing anything. Build:
   launchers and plists, promote the current main. Stop-condition: if any launcher is a plain file rather
   than a symlink, stop and ask.
 - Tests: slot flip is atomic and reversible; a failing gate step leaves the symlink untouched; the gate's
-  replay reads only the hook log and never a credential; `integrations install` on a machine with no
+  replay reads only `query_log.jsonl` and never a credential; `integrations install` on a machine with no
   `live` link behaves as today (the public install path must not change).
 - Verify with the hermetic suite, then by promoting phase 1 itself through its own gate on this Mac and
   reading the next nightly.
@@ -93,9 +96,9 @@ launcher symlinks) before writing anything. Build:
 
 - `packages/cli/khipu/promote.py`; `khipu promote [ref] [--rollback] [--status] [--gate-only STEP] [--json]`;
   `khipu doctor --quick` (imports, config, secrets presence, jobs, summariser provider; no hub or network).
-- The per-prompt hook's log line now ends with `replay={"prompt": ..., "cwd": ...}` (secrets masked, 400
-  characters at most): the log had no prompt text, and the replay step reads that log and nothing else.
-  With no `replay=` line from the last day the recall step fails, it never passes on missing evidence.
+- The replay samples from `query_log.jsonl` (the hook's `prompt-recall.log` holds no prompt text, and
+  prompt text is not logged there). Each run's hit ids, reason and time are read from that run's own
+  hook log line.
 - Each gate hook run gets its own `KHIPU_CAPTURE_HOME` (queue, state, heartbeats and the hook log in a
   temporary directory), so the gate never touches the live queue or the live hook log; the replay runs with
   `KHIPU_RECALL_DAEMON=0` (the warm service would answer with the old code). The replica is only read.
@@ -117,10 +120,9 @@ echo "$MAIN"                           # must be the main checkout; stop if it i
 PY=/opt/homebrew/bin/python3.11
 unset KHIPU_ROOT
 
-# 0. Merge the PR and pull MAIN the old way one last time, then use a few prompts so the hook log
-#    holds replay= lines from the last day (the recall step refuses without them).
-git -C "$MAIN" pull --ff-only
-grep -c ' replay=' "$HOME/.grok/khipu/logs/prompt-recall.log"   # must be > 0
+# 0. Use Khipu search once (any harness, or `"$PY" -m khipu search ...`) so query_log.jsonl holds a
+#    query from the last day; the recall step refuses without one. MAIN is not pulled: live-a below
+#    is what runs now, and the merged phase 1 reaches live only through the gate in step 5.
 
 # 1. Stop-condition: every launcher must be a symlink. Any output here: stop and ask.
 for f in khipu-mcp khipu-stop-hook khipu-recall-hook khipu-prompt-recall khipu-aegis-capture; do
@@ -170,7 +172,7 @@ the fixed-argv allowlist). Health report row. Settings → Advanced: the slot pa
 - Two slots, not N: a rollback needs exactly one known-good predecessor; older ones are in git.
 - Worktrees of the same repository rather than clones: one object store, one fetch, and `git worktree
   list` shows the live slots next to the session worktrees ([[khipu-live-launchers-follow-main-checkout]]).
-- The gate replays real prompts from the hook log rather than a golden set: the golden set is for
+- The gate replays real queries from `query_log.jsonl` rather than a golden set: the golden set is for
   quality (`recall-golden.jsonl`), the gate is for "does the lane answer at all under the live
   environment".
 - The capture step writes one real episode and forgets it rather than mocking the hub: the hub write and

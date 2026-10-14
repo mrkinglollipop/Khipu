@@ -130,11 +130,12 @@ def state_file() -> Path:
     return config_dir() / "state" / "promotions.jsonl"
 
 
-def hook_log_path() -> Path:
-    """The per-prompt hook's own log (``khipu.recall_prompt._log_path``)."""
-    home = os.environ.get("KHIPU_CAPTURE_HOME") or os.environ.get("KHIPU_AEGIS_HOME")
-    base = Path(home) if home else Path.home() / ".grok" / "khipu"
-    return base / "logs" / "prompt-recall.log"
+def query_log_path() -> Path:
+    """Khipu's search log (``khipu.query_log.log_path``: ``query_log.jsonl``
+    in the data dir, the config dir unless it was moved)."""
+    from khipu.query_log import log_path
+
+    return log_path()
 
 
 def _repo() -> Path:
@@ -386,17 +387,8 @@ def _parse_summary(line: str) -> dict[str, Any] | None:
         hits = [str(h) for h in ast.literal_eval(m.group("hits"))]
     except (ValueError, SyntaxError):
         hits = []
-    out: dict[str, Any] = {"stamp": m.group("stamp"), "session": m.group("session"),
-                           "reason": m.group("reason"), "ms": float(m.group("ms")), "hits": hits}
-    if " replay=" in line:
-        try:
-            replay = json.loads(line.rsplit(" replay=", 1)[1])
-        except ValueError:
-            replay = None
-        if isinstance(replay, dict) and isinstance(replay.get("prompt"), str):
-            out["prompt"] = replay["prompt"]
-            out["cwd"] = str(replay.get("cwd") or "")
-    return out
+    return {"stamp": m.group("stamp"), "session": m.group("session"),
+            "reason": m.group("reason"), "ms": float(m.group("ms")), "hits": hits}
 
 
 def _read_tail(path: Path, max_bytes: int = REPLAY_TAIL_BYTES) -> str:
@@ -406,10 +398,12 @@ def _read_tail(path: Path, max_bytes: int = REPLAY_TAIL_BYTES) -> str:
         return fh.read().decode("utf-8", errors="replace")
 
 
-def sample_prompts(log: Path, n: int = 5, *, now: float | None = None) -> list[dict[str, Any]]:
-    """Up to ``n`` distinct prompts the hook searched for in the last day,
-    spread evenly over the day, read from the hook's own log and nothing else."""
-    from khipu.recall_prompt import _classify_call_reason
+def sample_queries(log: Path, n: int = 5, *, now: float | None = None) -> list[dict[str, Any]]:
+    """Up to ``n`` distinct searches from the last day of ``query_log.jsonl``
+    (any harness, non-empty ``query``), spread evenly over the day, each masked
+    with the capture path's secret masker before it goes anywhere. Reads that
+    log and nothing else."""
+    from khipu.redact import redact_secrets
 
     now = time.time() if now is None else now
     try:
@@ -418,17 +412,21 @@ def sample_prompts(log: Path, n: int = 5, *, now: float | None = None) -> list[d
         return []
     seen: dict[str, dict[str, Any]] = {}
     for line in text.splitlines():
-        row = _parse_summary(line)
-        if not row or not (row.get("prompt") or "").strip():
-            continue
         try:
-            stamp = datetime.strptime(row["stamp"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            row = json.loads(line)
         except ValueError:
             continue
-        if now - stamp.timestamp() > REPLAY_WINDOW_S or _classify_call_reason(row["reason"]) is None:
+        if not isinstance(row, dict) or not isinstance(row.get("query"), str) or not row["query"].strip():
             continue
-        seen.pop(row["prompt"], None)
-        seen[row["prompt"]] = row
+        try:
+            stamp = datetime.strptime(str(row.get("ts")), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if now - stamp.timestamp() > REPLAY_WINDOW_S:
+            continue
+        query, _masked = redact_secrets(row["query"].strip())
+        seen.pop(query, None)
+        seen[query] = {"prompt": query, "harness": row.get("harness")}
     rows = list(seen.values())
     if len(rows) <= n:
         return rows
@@ -447,8 +445,8 @@ def _replay_env(capture_home: Path) -> dict[str, str]:
 
 def _recall_once(hook: Path, sample: dict[str, Any], session: str) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="khipu-gate-recall-") as tmp:
-        payload = {"session_id": session, "prompt": sample["prompt"], "cwd": sample.get("cwd") or "",
-                   "hook_event_name": "UserPromptSubmit"}
+        payload = {"session_id": session, "transcript_path": "", "cwd": str(Path.home()),
+                   "hook_event_name": "UserPromptSubmit", "prompt": sample["prompt"]}
         t0 = time.monotonic()
         r = _run([str(hook)], env=_replay_env(Path(tmp)), input=json.dumps(payload), timeout=15)
         wall_ms = round((time.monotonic() - t0) * 1000)
@@ -471,15 +469,14 @@ def _recall_once(hook: Path, sample: dict[str, Any], session: str) -> dict[str, 
 
 @_step
 def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
-    """2. Replay real prompts from the last day of the per-prompt hook's log
-    through the candidate's ``khipu-prompt-recall``, exactly as a harness runs
-    it (stdin JSON), each inside the 1.2 s budget, and compare the hit ids with
-    the live code's answer; an empty answer where live had one refuses."""
-    log = hook_log_path()
-    samples = sample_prompts(log, n)
+    """2. Replay real searches from the last day of ``query_log.jsonl``
+    through the candidate's ``khipu-prompt-recall``, each wrapped as the
+    harness's UserPromptSubmit stdin JSON, each inside the 1.2 s budget, and
+    compare the hit ids with the live code's answer; an empty answer where
+    live had one refuses."""
+    samples = sample_queries(query_log_path(), n)
     if not samples:
-        return False, (f"no replayable prompt in the last day of {log} (summary lines carry "
-                       "replay= from the release that added this gate on)")
+        return False, "no queries in the last day; use Khipu once and re-run"
     live_root = _live_code_root()
     live_hook = config_dir() / "bin" / "khipu-prompt-recall"
     if not live_hook.exists() and live_root is not None:
