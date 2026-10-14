@@ -78,6 +78,9 @@ _CANDIDATES = {
                "~/.local/bin/claude"),
     "codex": ("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
               "/opt/homebrew/bin/codex", "/usr/local/bin/codex", "~/.npm-global/bin/codex"),
+    # The plan usage probes (khipu.usage) look these two up the same way.
+    "grok": ("~/.grok/bin/grok", "/opt/homebrew/bin/grok", "/usr/local/bin/grok", "~/.local/bin/grok"),
+    "muse": ("/opt/homebrew/bin/muse", "/usr/local/bin/muse", "~/.local/bin/muse"),
 }
 
 

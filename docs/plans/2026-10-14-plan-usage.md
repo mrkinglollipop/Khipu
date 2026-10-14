@@ -9,7 +9,7 @@ it first. Builds after the promotion gate (`2026-10-14-promotion-gate.md`) and g
 
 | Phase | What | State |
 |---|---|---|
-| 1 | `khipu usage`: one probe per installed subscription CLI, cached, as CLI JSON and an MCP tool | open |
+| 1 | `khipu usage`: one probe per installed subscription CLI, cached, as CLI JSON and an MCP tool | built 2026-10-14 (branch `feat/plan-usage-p1`): `khipu/usage.py`, `khipu usage`, MCP `khipu_usage`, fixtures `tests/fixtures/usage/`; real run on this Mac answered all four CLIs in 0.6–1.6 s |
 | 2 | Home card and Settings → Models rows; doctor warning when a plan is nearly spent | open |
 
 Two PRs, phase 1 first.
@@ -62,6 +62,19 @@ timeout), the cache max-age, no environment variable or file read that names a c
 the hermetic suite and one real `khipu usage --fresh` on this Mac whose numbers match the CLIs' own
 `/usage`, `/status` and `/usage` screens read the same minute. Stop-condition: if any adapter needs a
 token or key to be passed, stop and ask.
+
+**As built (2026-10-14).** Codex and Grok exit on end of input before they answer, so their stdin stays
+open until the answer arrives and the kill closes it; Claude and Muse get stdin closed right after the
+requests. The Claude probe adds `--strict-mcp-config` (no MCP servers start; Khipu's own is one of them)
+and the Grok probe adds `--no-leader` (never attach to a shared agent). Every probe drops every home
+variable and every login-override variable (`*_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, ...) from its copy of the
+environment and sets only its own home; the whole process group is killed at the answer or the timeout.
+Only response frames are read: Grok's `_x.ai/mcp/servers_updated` notification carries the user's MCP
+server configuration, environment values included, and is dropped unread. On the HTTPS gateway
+`khipu_usage` answers `available: false` (that host runs no subscription CLI). A failed probe keeps the
+account's last good figures, marked `ok: false` and `stale: true`; `stale` is judged on the figures'
+own time (`observed_at` when the CLI gives one), so Muse's last-turn figures read stale once older than
+the max age. The second Claude home (`~/.claude-t3-second`) answers `rate_limits: null` as predicted.
 
 ## Phase 2: visibility
 
