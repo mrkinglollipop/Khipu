@@ -240,6 +240,8 @@ def test_doctor_selected_provider_key(provider, present, tmp_path):
         output = stack.enter_context(redirect_stdout(io.StringIO()))
         cli.cmd_doctor(cli.build_parser().parse_args(['doctor']))
     doc = json.loads(output.getvalue())
+    fallback = doc['synth_provider'].pop('fallback')
+    assert fallback == {'setting': 'gemini', 'source': 'default', 'gemini_key': provider == 'gemini' and present}
     assert doc['synth_provider'] == {'provider': provider, 'model': 'm', 'key_present': present and provider != 'local'}
     assert doc['synth_provider_ok'] == (present or provider == 'local')
     if not present and provider != 'local':
@@ -564,6 +566,8 @@ def test_cli_doctor_subscription_path_only(provider, present):
         output = stack.enter_context(redirect_stdout(io.StringIO()))
         cli.cmd_doctor(cli.build_parser().parse_args(['doctor']))
     doc = json.loads(output.getvalue())
+    # The green doctor patches report a Gemini key, so the fallback can run.
+    assert doc['synth_provider'].pop('fallback') == {'setting': 'gemini', 'source': 'default', 'gemini_key': True}
     assert doc['synth_provider'] == {'provider': provider, 'model': 'm', 'key_present': None, 'auth': 'subscription',
                                      'binary': '/fake/bin' if present else None}
     assert doc['synth_provider_ok'] is present
@@ -761,3 +765,68 @@ def test_valid_summary_about_cli_errors_is_not_rejected(provider):
     with mock.patch.object(extract.subprocess, 'run', side_effect=lambda argv, **kw: cli_reply(provider, argv, text=answer)) as call:
         assert cli_adapter(provider)('private transcript', model_id='m', retries=0) == answer
     assert call.call_count == 1
+
+
+def test_provider_failure_falls_back_to_gemini_and_a_failed_retry_keeps_the_first_error():
+    models.set_models_merge_role('synth', provider='claude-cli', model_id='haiku')
+    good = json.dumps({'summary': 'Closed the loop.', 'decisions': ['Done.']})
+    limit = RuntimeError("extract: model call failed: You've hit your session limit · resets 4:50am")
+    with mock.patch.object(extract, '_generate_claude_cli', side_effect=limit) as cli_call, \
+         mock.patch.object(extract, '_key', return_value='fake'), \
+         mock.patch.object(extract, '_generate_gemini', return_value=good) as gem:
+        out = extract.extract_memory('USER: wrap up\nASSISTANT: closed it', cwd='/p')
+    assert out['summary'] == 'Closed the loop.'
+    assert cli_call.call_count == 1 and gem.call_count == 1
+    assert gem.call_args.kwargs['caller'] == 'capture-fallback'
+    # The retry failing too surfaces the provider's error, so the drain keeps the job.
+    with mock.patch.object(extract, '_generate_claude_cli', side_effect=limit), \
+         mock.patch.object(extract, '_key', return_value='fake'), \
+         mock.patch.object(extract, '_generate_gemini', side_effect=RuntimeError('gemini down')), \
+         pytest.raises(RuntimeError, match='session limit'):
+        extract.extract_memory('USER: wrap up\nASSISTANT: closed it', cwd='/p')
+    # The synth ceiling is never worked around by a fallback call.
+    from khipu.embed import BudgetExhausted
+    with mock.patch.object(extract, '_generate_claude_cli', side_effect=BudgetExhausted('synth: 5/5')), \
+         mock.patch.object(extract, '_key', return_value='fake'), \
+         mock.patch.object(extract, '_generate_gemini') as gem, \
+         pytest.raises(BudgetExhausted):
+        extract.extract_memory('USER: wrap up\nASSISTANT: closed it', cwd='/p')
+    assert gem.call_count == 0
+
+
+def test_synth_fallback_setting_off_keeps_the_failure_and_is_set_through_config():
+    from khipu import config as cfg
+    models.set_models_merge_role('synth', provider='claude-cli', model_id='haiku')
+    assert cfg.choice_setting('synth_fallback') == ('gemini', 'default')
+    cfg.set_choice_setting('synth_fallback', 'None')
+    assert cfg.choice_setting('synth_fallback') == ('none', 'config')
+    with pytest.raises(ValueError, match='gemini, none'):
+        cfg.set_choice_setting('synth_fallback', 'claude')
+    with mock.patch.object(extract, '_generate_claude_cli', return_value='not json'), \
+         mock.patch.object(extract, '_key', return_value='fake'), \
+         mock.patch.object(extract, '_generate_gemini') as gem, \
+         pytest.raises(RuntimeError, match='non-JSON'):
+        extract.extract_memory('USER: hi\nASSISTANT: hello', cwd='/p')
+    assert gem.call_count == 0
+    cfg.set_choice_setting('synth_fallback', None)
+    assert cfg.choice_setting('synth_fallback') == ('gemini', 'default')
+    # The CLI route the app uses, and the doctor field Settings reads.
+    from khipu.cli import main
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = main(['config', '--set', 'synth_fallback', 'none'])
+    assert rc == 0 and json.loads(buf.getvalue())['synth_fallback'] == 'none'
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert main(['config', '--set', 'synth_fallback', 'bogus']) == 2
+    assert 'gemini, none' in json.loads(buf.getvalue())['error']
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert main(['config', '--unset', 'synth_fallback']) == 0
+    assert cfg.choice_setting('synth_fallback') == ('gemini', 'default')
+
+
+def test_cli_failure_recognises_the_session_limit_diagnostic():
+    assert extract._cli_failure("You've hit your session limit · resets 4:50am (America/New_York)")
+    assert extract._cli_failure("API Error: You've hit your limit")
+    assert not extract._cli_failure('{"summary": "You\'ve hit your limit was the error we fixed."}')

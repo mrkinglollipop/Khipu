@@ -313,6 +313,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         synth_provider.update(key_present=None, auth="subscription",
                               binary=binary(_provider.removesuffix("-cli")))
         synth_provider_ok = synth_provider["binary"] is not None
+    # What a failed window does on a provider other than Gemini (Settings
+    # shows and sets it): a retry on Gemini needs a Gemini key to run.
+    from khipu.config import choice_setting
+
+    _fallback, _fallback_source = choice_setting("synth_fallback")
+    synth_provider["fallback"] = {
+        "setting": _fallback, "source": _fallback_source,
+        "gemini_key": any(secrets.get(f"gemini_{field}")
+                          for field in ("in_keychain", "env", "file_key_present")),
+    }
     try:
         from khipu.jobs import index_freshness, job_status
 
@@ -2504,6 +2514,7 @@ def cmd_get(args: argparse.Namespace) -> int:
 
 def cmd_config(args: argparse.Namespace) -> int:
     from khipu.config import (
+        CHOICE_SETTINGS,
         FLOAT_SETTINGS,
         INT_SETTINGS,
         LIST_SETTINGS,
@@ -2576,6 +2587,18 @@ def cmd_config(args: argparse.Namespace) -> int:
         path = relevance.set_cosine_floor(None)
         print(json.dumps({"ok": True, "relevance_cosine_floor": relevance.cosine_floor_status(),
                           "config_file": str(path)}))
+        return 0
+    if (args.set and args.set[0] in CHOICE_SETTINGS) or args.unset in CHOICE_SETTINGS:
+        from khipu.config import choice_setting, set_choice_setting
+
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = set_choice_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        value, source = choice_setting(key)
+        print(json.dumps({"ok": True, key: value, "source": source, "config_file": str(path)}))
         return 0
     if (args.set and args.set[0] in INT_SETTINGS) or args.unset in INT_SETTINGS:
         # Daily call ceilings (synth_daily_calls, embed_daily_calls,
@@ -4628,11 +4651,13 @@ def build_parser() -> argparse.ArgumentParser:
         "floor (relevance.cosine_floor, above 0 up to 1; per embedding profile "
         "relevance.cosine_floor_by_profile.<profile>), a daily call "
         "ceiling (synth_daily_calls, embed_daily_calls, "
-        "library_embed_daily_calls; whole number, 0 = unlimited) or the comma-"
+        "library_embed_daily_calls; whole number, 0 = unlimited), the "
+        "summariser fallback (synth_fallback gemini|none: what a failed "
+        "window does on a provider other than Gemini) or the comma-"
         'separated user_aliases list (e.g. --set user_aliases "matt,matthew")',
     )
     cfg.add_argument("--unset", metavar="KEY",
-                     help="Remove a path setting or a daily call ceiling, or "
+                     help="Remove a path setting, a daily call ceiling or synth_fallback, or "
                      "relevance.cosine_floor / "
                      "relevance.cosine_floor_by_profile.<profile> to restore its default")
     cfg.add_argument(

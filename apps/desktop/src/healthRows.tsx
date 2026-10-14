@@ -12,6 +12,7 @@ import {
   canonicalSynthProvider,
   formatUsd,
   synthCallsLine,
+  synthFallbackLine,
   synthProviderInfo,
   usageByProviderLines,
 } from "./SynthProvider";
@@ -104,6 +105,8 @@ export function synthProviderDetail(sp: DoctorSynthProvider | undefined): string
   } else if (info?.route !== "local") {
     parts.push(sp.key_present ? "key present" : "no key");
   }
+  const fallback = synthFallbackLine(sp);
+  if (fallback) parts.push(fallback);
   return parts.join(" · ");
 }
 

@@ -291,6 +291,42 @@ def set_int_setting(key: str, value: "int | None") -> Path:
     return save_config(data)
 
 
+# ---------------------------------------------------------------------------
+# Choice settings: one of a fixed set of words. `synth_fallback` says what
+# happens when a summariser provider other than Gemini fails a window
+# (account limit, not logged in, transport error, a reply that is not the
+# capture JSON): `gemini` retries that window on Gemini Flash when a Gemini
+# key resolves, `none` leaves the job queued for a later retry. Unset = gemini.
+# ---------------------------------------------------------------------------
+
+CHOICE_SETTINGS: dict[str, tuple[str, ...]] = {
+    "synth_fallback": ("gemini", "none"),
+}
+
+
+def choice_setting(key: str) -> tuple[str, str]:
+    """``(value, source)``: the stored word and ``config``, or the first
+    choice and ``default`` when unset or invalid."""
+    choices = CHOICE_SETTINGS[key]
+    stored = load_config().get(key)
+    if isinstance(stored, str) and stored.strip().lower() in choices:
+        return stored.strip().lower(), "config"
+    return choices[0], "default"
+
+
+def set_choice_setting(key: str, value: "str | None") -> Path:
+    choices = CHOICE_SETTINGS[key]
+    data = _load_config_for_mutation()
+    if value is None:
+        data.pop(key, None)
+    else:
+        word = str(value).strip().lower()
+        if word not in choices:
+            raise ValueError(f"{key} must be one of {', '.join(choices)}, got {value!r}")
+        data[key] = word
+    return save_config(data)
+
+
 def path_settings_status() -> dict:
     """Every path setting with its resolved value and where it came from."""
     out = {}

@@ -21,6 +21,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -464,8 +465,9 @@ def _cli_failure(text: str) -> bool:
     # Summaries may describe a login or rate-limit incident; only a standalone
     # diagnostic is a failed call, never those words inside extracted JSON.
     lower = text.strip().lower().removeprefix("api error: ").removeprefix("error: ")
+    # "You've hit your limit" and "You've hit your session limit" (2026-10-14).
     return lower.startswith(("not logged in", "rate limit", "rate-limit", "usage limit",
-                             "you've hit your limit", "you have hit your limit"))
+                             "you've hit your", "you have hit your"))
 
 
 CODEX_CLI_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -959,12 +961,26 @@ def _parse_capture(raw: str) -> dict[str, Any] | None:
 
 
 def _fallback_provider() -> str | None:
-    """Use Gemini for one invalid-capture retry only when its key resolves."""
+    """Gemini, for one retry of a window another provider failed, when the
+    owner has not turned the fallback off (``synth_fallback``) and a Gemini
+    key resolves; None otherwise."""
+    from khipu.config import choice_setting
+
+    if choice_setting("synth_fallback")[0] == "none":
+        return None
     try:
         _key()
     except RuntimeError:
         return None
     return "gemini"
+
+
+def _fallback_applies() -> bool:
+    """The configured provider is one a Gemini retry can stand in for."""
+    from khipu.models import synth_settings
+
+    provider = (synth_settings().get("provider") or "cloud").strip().lower()
+    return provider not in {"cloud", "gemini", "local"} and _fallback_provider() == "gemini"
 
 
 # A window at least this long that comes back with no summary and no items is
@@ -990,25 +1006,46 @@ def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
     if not transcript.strip():
         return None
     prompt = _build_prompt(cwd=cwd, transcript=transcript)
-    raw = _generate(prompt, caller="capture")
+    from khipu.models import DEFAULT_SYNTH_MODEL
+
+    def _gemini_retry() -> str:
+        return _generate_gemini(prompt, model_id=DEFAULT_SYNTH_MODEL, timeout=45, retries=2,
+                                caller="capture-fallback")
+
+    from khipu.embed import BudgetExhausted
+
+    try:
+        raw = _generate(prompt, caller="capture")
+    except BudgetExhausted:
+        raise
+    except RuntimeError as exc:
+        # The provider's own retries are spent (an account limit, not logged
+        # in, a transport error). On 2026-10-14 the login route hit its
+        # five-hour limit twice overnight and 47 windows waited up to five
+        # hours for the reset; with a fallback the memory is searchable now
+        # and the window costs about $0.002. A failed retry surfaces the
+        # original error, so the job stays queued exactly as before.
+        if not _fallback_applies():
+            raise
+        print(f"[khipu-extract] gemini fallback after the provider failed: {str(exc)[:160]}",
+              file=sys.stderr, flush=True)
+        try:
+            raw = _gemini_retry()
+        except Exception:  # noqa: BLE001 — report the first failure, not the retry's
+            raise exc from None
     parsed = _parse_capture(raw)
     blank = parsed is not None and _blank_capture(parsed) and len(transcript) >= EMPTY_REPLY_MIN_CHARS
-    if parsed is None or blank:
+    if (parsed is None or blank) and _fallback_applies():
         # A non-Gemini provider gets one Gemini retry for this window, when a
         # Gemini key exists, in two cases found by the 2026-10-13 gate: a reply
         # that is not the capture JSON (Haiku obeyed a prompt inside the
         # transcript twice in 15 windows), and an empty record for a window
         # with real content (Luna at low effort emptied a 14,000-char window
         # full of decisions). An empty record the retry confirms is kept.
-        from khipu.models import DEFAULT_SYNTH_MODEL, synth_settings
-
-        provider = (synth_settings().get("provider") or "cloud").strip().lower()
-        if provider not in {"cloud", "gemini", "local"} and _fallback_provider() == "gemini":
-            retry_raw = _generate_gemini(prompt, model_id=DEFAULT_SYNTH_MODEL, timeout=45, retries=2,
-                                         caller="capture-fallback")
-            retried = _parse_capture(retry_raw)
-            if retried is not None or parsed is None:
-                raw, parsed = retry_raw, retried
+        retry_raw = _gemini_retry()
+        retried = _parse_capture(retry_raw)
+        if retried is not None or parsed is None:
+            raw, parsed = retry_raw, retried
     if parsed is None:
         raise RuntimeError(f"extract: model returned non-JSON: {raw[:200]!r}")
     # A model that returns a list here used to become the episode summary via
