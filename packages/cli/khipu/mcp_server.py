@@ -730,8 +730,9 @@ TOOLS: list[dict] = [
             "or down; paste the limit message word for word as `message` and "
             "Khipu reads the reset time from it), `hold` (a short note about one "
             "account, this Mac or all work, with a reason: machine-busy, "
-            "disk-low, keep, outage or other; it ends within 24 hours unless "
-            "`until` says sooner), or `end_hold` (`hold_id`). Khipu sets who "
+            "disk-low, keep, outage or other; it ends after 24 hours by default, "
+            "and `until` can set another end, at most 7 days away by default "
+            "(the owner's settings)), or `end_hold` (`hold_id`). Khipu sets who "
             "wrote it and how sure each time is; a time you give is recorded "
             "as a guess. Standing rules, the owner's note, pauses and clears "
             "are the owner's and are refused here. Khipu reports; routing "
@@ -1629,7 +1630,10 @@ def _tool_route_report(args: dict) -> dict:
     _ensure_path()
     from khipu import routing
 
-    return routing.conversation_write(args, author=routing.conversation_author())
+    # A write waits for the routing lock as long as a read does, then is
+    # refused as busy (nothing written), never left hanging.
+    with routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
+        return routing.conversation_write(args, author=routing.conversation_author())
 
 
 TOOL_FUNCS = {

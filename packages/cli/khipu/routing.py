@@ -497,6 +497,19 @@ def _clip(text: str, limit: int) -> str:
     return text
 
 
+_QUOTES = re.compile("[\u0022\u201c\u201d\u201e\u201f\u00ab\u00bb\u2033\u301d\u301e\uff02]")
+_BY_YOU = re.compile(r"\b(by|from) you\b", re.I)
+
+
+def their_words(text) -> str:
+    """A conversation's words as a line quotes them: every double quote
+    mark becomes a single one, so the words can't close the quote around
+    them and go on in Khipu's voice, and "by you" (the owner's words in
+    Khipu's lines) is marked as theirs, "by [you]"."""
+    out = _QUOTES.sub("'", _one_line(text))
+    return _BY_YOU.sub(lambda m: f"{m.group(1)} [you]", out)
+
+
 def _clean(text, limit: int) -> str:
     """One line, secrets masked, clipped: for any words a conversation gives."""
     from khipu.redact import redact_secrets
@@ -778,7 +791,7 @@ def author_words(by: dict | None, *, push: bool = True) -> str:
         if by.get("session"):
             words += f" (session {str(by['session'])[:8]})"
         if by.get("name"):
-            words += f", which calls itself “{by['name']}”"
+            words += f", which calls itself “{their_words(by['name'])}”"
     return words
 
 
@@ -800,12 +813,49 @@ def view_file() -> Path:
 
 
 _held = threading.local()
+_LOCK_POLL = 0.05
+
+
+class LockBusy(OSError):
+    """The routing lock stayed held past this thread's lock budget."""
+
+
+@contextlib.contextmanager
+def lock_budget(seconds: float | None):
+    """Bound how long this thread waits for the routing lock (None: no
+    bound). A read that runs out answers from an unsaved fold (``saved:
+    false``); a write that runs out is refused as a RouteError, and nothing
+    is written. Every caller that must answer in time (MCP tools, ``khipu
+    route wait --timeout``) reads inside one."""
+    before = getattr(_held, "deadline", None)
+    _held.deadline = None if seconds is None else time.monotonic() + max(0.0, seconds)
+    try:
+        yield
+    finally:
+        _held.deadline = before
+
+
+def _acquire(fd: int) -> None:
+    deadline = getattr(_held, "deadline", None)
+    if deadline is None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise LockBusy("the routing record is busy (another Khipu process holds its lock)") from None
+            time.sleep(min(_LOCK_POLL, left))
 
 
 @contextlib.contextmanager
 def _lock():
     """Khipu's own routing lock (flock, released if the holder dies);
-    re-entrant within a thread. Never another program's lock."""
+    re-entrant within a thread. Never another program's lock. Waits no
+    longer than this thread's ``lock_budget``."""
     if getattr(_held, "depth", 0):
         _held.depth += 1
         try:
@@ -817,7 +867,7 @@ def _lock():
     folder.mkdir(parents=True, exist_ok=True)
     fd = os.open(folder / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _acquire(fd)
         _held.depth = 1
         try:
             yield
@@ -2258,7 +2308,7 @@ def hold_line(hold: dict, now: datetime, *, push: bool = True, relative: bool = 
     text = f"Hold on {hold['scope_label']}: {HOLD_REASONS.get(hold['reason'], 'other')}, {end}; set by " \
            f"{author_words(hold['written_by'], push=push)}"
     if hold.get("text") and (hold.get("owner") or not push):
-        text += f": “{hold['text']}”"
+        text += f": “{hold['text'] if hold.get('owner') else their_words(hold['text'])}”"
     return text
 
 
@@ -2617,7 +2667,113 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     return out
 
 
-def conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None) -> dict:
+# A conversation's answer goes to other model providers: it carries no path
+# on this Mac. Login folders, job runner folders, the routing table and the
+# rules seed are the owner's configuration; an account whose key holds a
+# login folder is named by its label instead.
+_SOURCE_PATHS = ("path",)
+CONVERSATION_LOCK_BUDGET = 2.0
+
+
+def _private_strings(view: dict) -> list[tuple[str, str]]:
+    """(text, replacement) for every path the answer must not carry, longest
+    first: each account key that holds a login folder becomes its label,
+    then each folder or file path its last name."""
+    from khipu.config import load_config
+
+    keys: dict[str, str] = {}
+    paths: set[str] = set()
+    known = list(view.get("accounts") or [])
+    with contextlib.suppress(Exception):
+        known += accounts()
+    for entry in known:
+        key = str(entry.get("key") or "")
+        _harness, _, home = key.partition("|")
+        if home:
+            keys.setdefault(key, str(entry.get("label") or _label_for_key(key)))
+            paths.add(home)
+        if entry.get("home"):
+            paths.add(str(entry["home"]))
+    sources = view.get("sources") or {}
+    for runner in sources.get("runners") or []:
+        if runner.get("path"):
+            paths.add(str(runner["path"]))
+    if (sources.get("table") or {}).get("path"):
+        paths.add(str(sources["table"]["path"]))
+    config: dict = {}
+    with contextlib.suppress(Exception):
+        config = load_config()
+    for name in ("routing_table", "routing_rules_seed"):
+        if isinstance(config.get(name), str):
+            paths.add(config[name])
+    for name, field in (("routing_sources", "path"), ("usage_accounts", "home")):
+        items = config.get(name)
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and isinstance(item.get(field), str):
+                paths.add(item[field])
+    variants: set[str] = set()
+    for path in paths:
+        path = path.strip()
+        if len(path) < 2:
+            continue
+        variants.add(path.rstrip("/") or path)
+        with contextlib.suppress(Exception):
+            variants.add(os.path.expanduser(path).rstrip("/"))
+            variants.add(os.path.realpath(os.path.expanduser(path)).rstrip("/"))
+    pairs = sorted(keys.items(), key=lambda kv: -len(kv[0]))
+    pairs += sorted(((p, Path(p).name or "a folder") for p in variants if p and p != "/"),
+                    key=lambda kv: -len(kv[0]))
+    return pairs
+
+
+def _without_paths(value, pairs: list[tuple[str, str]]):
+    if isinstance(value, dict):
+        return {_without_paths(k, pairs): _without_paths(v, pairs) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_without_paths(v, pairs) for v in value]
+    if isinstance(value, str):
+        for old, new in pairs:
+            if old in value:
+                value = value.replace(old, new)
+    return value
+
+
+def _conversation_sources(sources: dict | None) -> dict | None:
+    """The sources block without a folder or file path."""
+    if not isinstance(sources, dict):
+        return sources
+    out = dict(sources)
+    out["runners"] = [{k: v for k, v in r.items() if k not in _SOURCE_PATHS}
+                      for r in sources.get("runners") or []]
+    if isinstance(sources.get("table"), dict):
+        out["table"] = {k: v for k, v in sources["table"].items() if k not in _SOURCE_PATHS}
+    return out
+
+
+def _holds_on(key: str, view: dict) -> set[str]:
+    """The ids of every hold scoped to the account ``key``: those in effect
+    and those that have ended (their stored scope)."""
+    ids = {h["id"] for h in view.get("holds") or []
+           if h["scope"].get("kind") == "account" and h["scope"].get("account") == key}
+    with contextlib.suppress(Exception):
+        events, _bad = read_events()
+        ids |= {str(e.get("id")) for e in events if e.get("type") == "hold" and isinstance(e.get("scope"), dict)
+                and e["scope"].get("kind") == "account" and e["scope"].get("account") == key}
+    return ids
+
+
+def conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
+                      lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
+    """What MCP ``khipu_route`` answers (``_conversation_view``), with no
+    path on this Mac in it, read waiting at most ``lock_wait`` seconds for
+    the routing lock (an unsaved fold after that)."""
+    with lock_budget(lock_wait):
+        out, view = _conversation_view(since_version=since_version, account=account, now=now)
+    return _without_paths(out, _private_strings(view))
+
+
+def _conversation_view(*, since_version=None, account: str | None = None,
+                       now: datetime | None = None) -> tuple[dict, dict]:
     """What MCP ``khipu_route`` answers. With ``since_version`` (V or
     EPOCH:V) the current state of everything that changed after it, as
     ``khipu route --since``. Otherwise the view as ``khipu route --json``
@@ -2631,12 +2787,15 @@ def conversation_view(*, since_version=None, account: str | None = None, now: da
         version, epoch = _parse_since(since_version)
         out = since(version, view, now=now, epoch=epoch)
         if key is not None:
-            keep = [i for i, e in enumerate(out["entities"]) if e == f"account:{key}"]
+            mine = {f"account:{key}"} | {f"hold:{i}" for i in _holds_on(key, view)}
+            keep = [i for i, e in enumerate(out["entities"]) if e in mine]
             out = dict(out, entities=[out["entities"][i] for i in keep], lines=[out["lines"][i] for i in keep])
-        return dict(out, about=ABOUT)
+        return dict(out, about=ABOUT), view
     out = public_view(view, now, key)
     for name in _BULKY:
         out.pop(name, None)
+    out["accounts"] = [{k: v for k, v in e.items() if k != "home"} for e in out["accounts"]]
+    out["sources"] = _conversation_sources(view.get("sources"))
     out["holds"] = [dict(h, line=hold_line(h, now, push=False)) for h in view.get("holds") or []
                     if key is None or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)]
     if key is None:
@@ -2644,7 +2803,7 @@ def conversation_view(*, since_version=None, account: str | None = None, now: da
         out["dark_runners"] = [runner_line(r, now) for r in (view.get("sources") or {}).get("runners") or []
                                if r.get("silent") or r.get("unreadable")]
     out["about"] = ABOUT
-    return out
+    return out, view
 
 
 # What a conversation may write through MCP, and what it may not. The owner's
@@ -2724,7 +2883,8 @@ def light_status(now: datetime | None = None) -> dict:
     """The ``routing`` field of ``khipu_status``'s light payload: the summary
     a conversation gets at its start (``khipu route --summary``), for a
     harness with no hooks."""
-    out = summary(now=now)
+    with lock_budget(CONVERSATION_LOCK_BUDGET):
+        out = summary(now=now)
     return {"text": out["text"], "version": out["version"], "epoch": out["epoch"], "dropped": out["dropped"],
             "about": ABOUT}
 
@@ -2749,21 +2909,24 @@ def is_open(entry: dict | None, *, confirmed: bool = False) -> bool:
 def wait(account: str, *, confirmed: bool = False, timeout: float | None = None, interval: float = WAIT_INTERVAL,
          sleep=time.sleep, clock=time.monotonic) -> dict:
     """Wait until the record shows ``account`` open (``is_open``), reading
-    the view every ``interval`` seconds, at most ``timeout`` seconds (None
-    or 0: no end). It waits and reports; it launches, refuses and reorders
+    the view every ``interval`` seconds, at most ``timeout`` seconds (None:
+    no end; 0: check once). Each read waits for the routing lock no longer
+    than the time left, and answers from an unsaved fold when it runs out. It waits and reports; it launches, refuses and reorders
     nothing, and each read starts no process."""
     key = resolve_account(account)
     start = clock()
     while True:
         now = _now()
-        view = read_view(now)
+        left = None if timeout is None else timeout - (clock() - start)
+        with lock_budget(None if left is None else max(0.0, left)):
+            view = read_view(now)
         entry = next((e for e in view["accounts"] if e["key"] == key), None)
         line = account_line(entry, now, push=False) if entry else f"{_label_for_key(key)}: unknown: no report yet"
         out = {"account": key, "state": entry["state"] if entry else UNKNOWN, "line": line,
                "version": view["version"], "confirmed": confirmed}
         if is_open(entry, confirmed=confirmed):
             return dict(out, ok=True, open=True)
-        left = None if not timeout else timeout - (clock() - start)
+        left = None if timeout is None else timeout - (clock() - start)
         if left is not None and left <= 0:
             return dict(out, ok=False, open=False, timed_out=True)
         sleep(max(0.0, min(interval, left)) if left is not None else interval)

@@ -4561,7 +4561,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Only once Khipu itself has read it open (a usage probe or a reset check), "
                             "not when its limit's time has merely passed")
     rwait.add_argument("--timeout", default=None, metavar="S",
-                       help="Give up after S seconds (or 30m, 2h); default: no end")
+                       help="Give up after S seconds (or 30m, 2h; 0 checks once); default: no end")
     rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire or confirm a standing rule", parents=[rt_json])
     rrule.add_argument("action", choices=("add", "edit", "retire", "confirm"))
     rrule.add_argument("params", nargs="*")
