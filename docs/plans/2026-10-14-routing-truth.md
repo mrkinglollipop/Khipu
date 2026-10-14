@@ -23,7 +23,7 @@ can see and change all of it in the app. Khipu never decides where work goes.
 
 | Phase | What | Size | State |
 |---|---|---|---|
-| 0 | This scope; the mocks of the Home Routing card and Settings → Routing; a throwaway-hook check of five hook facts | S | scope and mocks approved 2026-10-14; hook check: see Phase 0 results |
+| 0 | This scope; the mocks of the Home Routing card and Settings → Routing; a throwaway-hook check of five hook facts | S | done 2026-10-14 (scope and mocks approved; hook check: five of five yes, see Phase 0 results) |
 | 1a | The record and its fold: event log, versioned view with clock-driven refolds, rules, Matt's note, holds, owner clear; `khipu route`; the doctor block | M | open (needs plan usage phase 2 merged) |
 | 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | open |
 | 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | open |
@@ -593,8 +593,42 @@ configuration, it stays in Unverified and the check moves on.
 
 #### Phase 0 results
 
-Not recorded yet. Each of the five answers is written here with its evidence; until then all five stay in
-Unverified.
+Done 2026-10-14. All five facts answered yes, on Claude Code 2.1.296 and codex-cli 0.162.0-alpha.17.2, in a
+scratch configuration home; no live hook configuration was read or changed. Claude Code ran once, headless
+(`claude -p --model haiku --setting-sources "" --settings <scratch> --strict-mcp-config
+--no-session-persistence`, one `--agents` probe subagent limited to Bash, recorded with `--output-format
+stream-json --include-hook-events --forward-subagent-text`); the stream showed only the scratch hooks firing.
+Codex ran four times with `codex exec --ignore-user-config --dangerously-bypass-hook-trust` and the hooks
+passed as `-c hooks.<Event>=[...]`. Every hook logged its payload's field names and returned a distinct
+sentinel in `additionalContext`.
+
+| # | Fact | Answer | How it was shown |
+|---|---|---|---|
+| 1 | A PreToolUse hook's `additionalContext` reaches the model | Yes, on Claude Code and Codex | Claude Code: the stream shows the PreToolUse hook's output and the model's final text repeats the sentinel, noting it arrived after its Bash call and again after its Agent call. Codex: the agent reported the sentinel "in a developer message". In both, the context arrives with the tool result, after the call has gone out. |
+| 2 | PreToolUse fires on a subagent's tool calls | Yes, on Claude Code | The hook log has a PreToolUse payload carrying `agent_id` and `agent_type` (`probe`), which the main session's calls do not carry. The subagent reported seeing its own sentinel; the parent did not. |
+| 3 | SubagentStart's `additionalContext` reaches the subagent's model | Yes, on Claude Code | The log has the SubagentStart event for the probe, and the stream shows its hook output. The subagent said the sentinel was in its context before its first tool call; the parent never saw it. |
+| 4 | Codex's SessionStart fires after compaction and on resume | Yes, both | Compaction (`-c model_auto_compact_token_limit=2000`): the log runs `SessionStart source=startup`, `UserPromptSubmit`, `PreCompact`, `PostCompact`, `SessionStart source=compact`, so it fires after a compaction partway through a turn. Resume (`codex exec resume`): `SessionStart source=resume`, then `UserPromptSubmit`. The binary's schema lists the sources startup, resume, clear, compact and fork. |
+| 5 | A desktop task-notification wake counts as a prompt for UserPromptSubmit | Yes, reproduced headless and backed by desktop transcripts | Headless: the probe subagent ran in the background; the first turn ended, a `task_notification` arrived, then UserPromptSubmit fired (second log entry, with a `prompt` key) and its sentinel reached the model for a second turn. Desktop: transcripts from the last two days, read for structural fields only and never content, show wakes (`origin.kind` task-notification) followed by a UserPromptSubmit hook-context attachment in 48 sessions on versions 2.1.266 to 2.1.295. About a third of wakes, and a similar share of typed prompts, have no attachment; that fits a hook that fired and printed nothing, but is not verified. |
+
+What this means for the later phases:
+
+- Phase 6 can be built in full on both harnesses. PreToolUse context reaches the model in Claude Code and in
+  Codex, and SubagentStart context reaches a Claude Code subagent, so the full summary at subagent start can
+  go in as planned.
+- The PreToolUse push arrives after the call it fires on. It reaches the orchestrator with the tool result,
+  once the delegation has gone out, so it can only change the next step (the hook never denies). Giving the
+  current state to the child of the call in flight is SubagentStart's job.
+- The phase 6 hook must key on `agent_id`. PreToolUse also fires inside subagents; without the check (skip
+  them, or key the seen marker per agent) every subagent tool call would repeat the push and spend the budget.
+- Phase 3a's session-start summary covers compacted and resumed Codex sessions the same way it covers Claude
+  Code's, including a compaction partway through a turn.
+- In phase 3b every background-task wake runs the per-prompt hook with the notification as the prompt, many
+  times in a desktop session, and each run also triggers the recall search. The "nothing changed, send nothing"
+  rule and the seen marker matter there, and a wake must not trigger the full summary. A wake is also the
+  natural moment to tell a long orchestration about a limit that changed mid-turn.
+- A new Codex hook does not run until it is trusted: Codex keeps that in `hooks.state.<key>.trusted_hash`
+  and shows "1 hook needs review before it can run". The scratch hooks ran only because of
+  `--dangerously-bypass-hook-trust`, so any hook phase 3 or phase 6 adds has to plan for the trust step.
 
 ### Phase 1a: the record and `khipu route` (M, one session)
 
@@ -861,9 +895,9 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
 
 ## Unverified
 
-- The five hook facts that phase 0 checks: PreToolUse context reaching the model; PreToolUse on a subagent's
-  tool calls; SubagentStart context reaching the subagent's model; Codex's SessionStart after compaction and
-  on resume; a desktop task-notification wake counting as a prompt.
+- Two edges of the phase 0 hook check. The desktop wakes and typed prompts that left no hook-context
+  attachment (about a third): probably a hook that printed nothing, not shown. And whether Codex's live user
+  hooks also ran during the scratch runs, since `--ignore-user-config` was used.
 - Whether the runner-basis rule (zero seconds, not exactly 30 minutes) holds for project B's copy of
   `lanes.py`, which differs from project A's.
 - Whether Grok Build's PreToolUse context reaches its model in headless runs.
