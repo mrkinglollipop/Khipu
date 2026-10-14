@@ -499,10 +499,19 @@ def _clip(text: str, limit: int) -> str:
 
 # Every mark that can open or close a quote: Unicode's initial and final
 # quotation marks (Pi, Pf) by category, plus the double, low, CJK, dingbat
-# and fullwidth marks that are filed elsewhere.
+# and fullwidth marks that are filed elsewhere. They become a single
+# straight quote, which reads as what it was; every other character outside
+# printable ASCII is written as its escape (``their_words``).
 _QUOTE_MARKS = frozenset("\u0022\u201a\u201e\u2033\u2036\u275b\u275c\u275d\u275e\u275f\u2760\u2e42"
                          "\u301d\u301e\u301f\uff02")
-_YOU = re.compile(r"\byou\b", re.I)
+# Words that speak for the owner in Khipu's lines ("set by you", "until you
+# clear it", "Note from the owner", "Standing rule"), matched on the words'
+# skeleton (``_skeleton``), so a digit or a letter that looks like one of
+# their letters still matches.
+_OWNER_WORDS = re.compile(r"\b(?:you|owner|standing\s+rules?)\b")
+# The digits that look like a letter of those words (a digit for a letter
+# keeps the word's bounds where they were).
+_ASCII_LOOKALIKES = str.maketrans({"0": "o", "1": "i", "3": "e", "5": "s"})
 
 
 def _hidden(ch: str) -> bool:
@@ -516,20 +525,57 @@ def _hidden(ch: str) -> bool:
             or code == 0x034F)
 
 
+def _ascii_char(ch: str) -> str:
+    """One character of a conversation's words in printable ASCII: as it
+    is; a quotation mark as a straight single quote; a dash as a hyphen; a
+    letter with accents as the letter without them; anything else as its
+    escape (``\\u02ee``), so it shows as what it is and never as a mark of
+    the line around it."""
+    import unicodedata
+
+    if ch == "\\":
+        return "\\\\"
+    if " " <= ch <= "~":
+        return "'" if ch == '"' else ch
+    if ch in _QUOTE_MARKS or unicodedata.category(ch) in ("Pi", "Pf"):
+        return "'"
+    if unicodedata.category(ch) == "Pd":
+        return "-"
+    if unicodedata.category(ch) == "Zs":
+        return " "
+    base = "".join(c for c in unicodedata.normalize("NFKD", ch) if not unicodedata.combining(c))
+    if len(base) == 1 and base.isascii() and base.isalpha():
+        return base
+    code = ord(ch)
+    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
+
+
+def _skeleton(text: str) -> str:
+    """``text`` (printable ASCII) as owner words are matched on it: lower
+    case, with the ASCII characters that look like a letter as that letter,
+    one character for one so a match's place is its place in ``text``."""
+    return text.lower().translate(_ASCII_LOOKALIKES)
+
+
 def their_words(text) -> str:
     """A conversation's words as a line quotes them. Hidden characters go
-    and the words are NFKC-normalised, so what is matched is what shows;
-    every quotation mark becomes a single straight quote, so the words
-    can't close the quote around them and go on in Khipu's voice; and
-    every "you" (the owner, in Khipu's lines: "set by you", "until you
-    clear it") is marked as theirs, "[you]"."""
+    and the words are NFKC-normalised; then only printable ASCII is kept as
+    it is (``_ascii_char``): a quotation mark becomes a single straight
+    quote and any other character is written as its escape, so no
+    lookalike of a quotation mark or of a letter can close the quote
+    around the words or read as Khipu's own. Every word that speaks for
+    the owner ("you", "owner", "standing rule") is marked as theirs,
+    "[you]", matched on the words' skeleton (``_skeleton``)."""
     import unicodedata
 
     out = unicodedata.normalize("NFKC", "".join(c for c in str(text or "") if not _hidden(c)))
-    out = "".join(c for c in out if not _hidden(c))
-    out = "".join("'" if c in _QUOTE_MARKS or unicodedata.category(c) in ("Pi", "Pf") else c
-                  for c in _one_line(out))
-    return _YOU.sub(lambda m: f"[{m.group(0)}]", out)
+    out = "".join(_ascii_char(c) for c in _one_line(out) if not _hidden(c))
+    skeleton = _skeleton(out)
+    marked, pos = [], 0
+    for match in _OWNER_WORDS.finditer(skeleton):
+        marked += [out[pos:match.start()], f"[{out[match.start():match.end()]}]"]
+        pos = match.end()
+    return "".join(marked) + out[pos:]
 
 
 def _clean(text, limit: int) -> str:
@@ -741,11 +787,36 @@ def _resolve_quiet(name: str, known: list[dict]) -> str | None:
         return None
 
 
+def _not_a_project(path: str) -> bool:
+    """A folder that names no project: a scratch folder, the root, or the
+    home folder or one of the folders that holds it (the server's folder
+    when a harness starts it in the home folder, whose name is the login
+    name)."""
+    from khipu.identity import _is_scratch_cwd
+
+    if _is_scratch_cwd(path):
+        return True
+    try:
+        here = Path(os.path.realpath(path))
+    except (OSError, ValueError):
+        return True
+    if here == Path(here.anchor):
+        return True
+    for raw in {os.path.expanduser("~"), os.environ.get("HOME") or ""}:
+        if not raw or raw == "~":
+            continue
+        with contextlib.suppress(OSError, ValueError):
+            home = Path(os.path.realpath(raw))
+            if here == home or here in home.parents:
+                return True
+    return False
+
+
 def _project_name(cwd: str | None) -> str | None:
-    from khipu.identity import WORKTREE_MARKERS, _is_scratch_cwd
+    from khipu.identity import WORKTREE_MARKERS
 
     path = str(cwd or "")
-    if not path or _is_scratch_cwd(path):
+    if not path or _not_a_project(path):
         return None
     for marker in WORKTREE_MARKERS:
         if marker in path:
@@ -813,11 +884,13 @@ def author_words(by: dict | None, *, push: bool = True) -> str:
         words = f"a {HARNESS_WORDS[harness]} conversation"
     else:  # never the stored text: it came from the writer's environment
         words = "a conversation from an unknown harness"
+    # The project and the session come from the writer's folder and
+    # environment, so they are shown as a conversation's words are.
     if by.get("project"):
-        words += f" in {by['project']}"
+        words += f" in {their_words(by['project'])}"
     if not push:
         if by.get("session"):
-            words += f" (session {str(by['session'])[:8]})"
+            words += f" (session {their_words(str(by['session'])[:8])})"
         if by.get("name"):
             words += f", which calls itself “{their_words(by['name'])}”"
     return words
@@ -1317,6 +1390,19 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
         shown = (UNKNOWN, None)
     state, behind = shown
 
+    # Khipu's own read that the account is open (a usage probe or a reset
+    # check), newer than every limit and not stale. It stays the
+    # confirmation when a newer open report from anyone else becomes the
+    # witness, so ``route wait --confirmed`` never loses it to a report
+    # that agrees with it.
+    confirmed_at = None
+    if state == OPEN:
+        last_limit = max((e for e in whole if e["state"] == LIMITED), key=_k, default=None)
+        own = [e for e in fresh if e["state"] == OPEN and e["source"] in CONFIRMING_SOURCES
+               and not e.get("cleared") and (last_limit is None or later(e, last_limit))]
+        if own:
+            confirmed_at = _iso(max(own, key=_k)["at"])
+
     # A disagreement: the newest evidence after the one behind the shown state
     # says something else and could not override it by the order above. It
     # began with the first of the run of such reports that ends with it.
@@ -1363,7 +1449,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
              "reason": DOWN_REASONS.get(behind.get("reason") or "", "out of service")
              if state == DOWN and behind else None,
              "models": models, "witness": witness(behind), "disagreement": disagreement, "last_seen": None,
-             "underlying": None, "checkable": account["harness"] != "muse"}
+             "underlying": None, "checkable": account["harness"] != "muse", "confirmed_at": confirmed_at}
     if state == LIMITED:
         # When the limit now shown was first reported (doctor's launch check).
         entry["since"] = _iso(min((e["at"] for e in whole if limit_holds(e, whole, ("all",))), default=None))
@@ -1381,7 +1467,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
         # the limit under it was first reported.
         entry.pop("since", None)
         entry.update(state=PAUSED, until=_iso(pause["until"]), basis="owner", reason=None, disagreement=None,
-                     last_seen=None, underlying=underlying,
+                     last_seen=None, underlying=underlying, confirmed_at=None,
                      witness={"id": pause["id"], "source": "owner", "written_by": pause["written_by"],
                               "at": _iso(pause["at"]), "evidence": None, "message_time": False, "cleared": False})
     return entry
@@ -2786,6 +2872,44 @@ def _without_paths(value, pairs: list[tuple[str, str]]):
     return value
 
 
+def _owner_texts(view: dict | None) -> list[str]:
+    """The owner's own words in ``view``: the standing rules, the note and
+    his holds' words. Shown word for word (Decision 5), so a path in them is
+    his to keep: no answer cuts it."""
+    view = view or {}
+    texts = [r.get("text") for r in view.get("rules") or []]
+    texts.append((view.get("note") or {}).get("text"))
+    texts += [h.get("text") for h in view.get("holds") or [] if h.get("owner")]
+    return [t for t in texts if isinstance(t, str) and t]
+
+
+def _without_paths_but_the_owners(value, pairs: list[tuple[str, str]], keep: list[str]):
+    """``_without_paths`` on everything but the owner's own words
+    (``_owner_texts``): wherever one of them stands, in a field of its own
+    or inside a line, it is left whole and only the text around it is cut.
+    Both answers a conversation reads (``khipu_route`` and the light
+    status) use it, so they agree."""
+    keep = sorted({k for k in keep if k}, key=len, reverse=True)
+    if not keep:
+        return _without_paths(value, pairs)
+    pattern = re.compile("|".join(re.escape(k) for k in keep))
+
+    def scrub(item):
+        if isinstance(item, dict):
+            return {scrub(k): scrub(v) for k, v in item.items()}
+        if isinstance(item, list):
+            return [scrub(v) for v in item]
+        if not isinstance(item, str):
+            return item
+        parts, pos = [], 0
+        for match in pattern.finditer(item):
+            parts += [_without_paths(item[pos:match.start()], pairs), match.group(0)]
+            pos = match.end()
+        return "".join(parts) + _without_paths(item[pos:], pairs)
+
+    return scrub(value)
+
+
 def _conversation_sources(sources: dict | None) -> dict | None:
     """The sources block without a folder or file path."""
     if not isinstance(sources, dict):
@@ -2849,7 +2973,7 @@ def conversation_view(*, since_version=None, account: str | None = None, now: da
     the routing lock (an unsaved fold after that)."""
     with _for_a_conversation(), lock_budget(lock_wait):
         out, view = _conversation_view(since_version=since_version, account=account, now=now)
-        return _without_paths(out, _conversation_pairs(view))
+        return _without_paths_but_the_owners(out, _conversation_pairs(view), _owner_texts(view))
 
 
 def _conversation_view(*, since_version=None, account: str | None = None,
@@ -2985,9 +3109,13 @@ def light_status(now: datetime | None = None) -> dict:
     ``LIGHT_LOCK_BUDGET``, well inside the time khipu_status gives it, so a
     held lock still answers, from an unsaved fold."""
     with lock_budget(LIGHT_LOCK_BUDGET):
-        out = summary(now=now)
-    return {"text": out["text"], "version": out["version"], "epoch": out["epoch"], "dropped": out["dropped"],
-            "about": ABOUT}
+        now = now or _now()
+        view = read_view(now)
+        out = summary(view, now=now)
+    light = {"text": out["text"], "version": out["version"], "epoch": out["epoch"], "dropped": out["dropped"],
+             "about": ABOUT}
+    # As khipu_route answers: no path on this Mac but in the owner's words.
+    return _without_paths_but_the_owners(light, _conversation_pairs(view), _owner_texts(view))
 
 
 # ---- khipu route wait --------------------------------------------------------------------
@@ -3003,7 +3131,12 @@ def is_open(entry: dict | None, *, confirmed: bool = False) -> bool:
     if entry is None:
         return False
     if confirmed:
-        return entry["state"] == OPEN and (entry.get("witness") or {}).get("source") in CONFIRMING_SOURCES
+        # Khipu's own read stands whichever open report is the witness now:
+        # the fold keeps it as ``confirmed_at`` while it is newer than every
+        # limit and not stale.
+        # A view saved before ``confirmed_at`` existed still counts its witness.
+        return entry["state"] == OPEN and bool(entry.get("confirmed_at") or (
+            "confirmed_at" not in entry and (entry.get("witness") or {}).get("source") in CONFIRMING_SOURCES))
     return entry["state"] in (OPEN, PROBABLY_OPEN)
 
 

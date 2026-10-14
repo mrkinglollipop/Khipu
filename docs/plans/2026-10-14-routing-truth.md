@@ -442,13 +442,22 @@ at most three checks per reset: the first and two retries.
   set|end`, and `khipu route rule add|edit|retire|confirm`. They ask for a typed confirmation on a terminal
   and refuse without one.
 - `khipu route wait <account> [--confirmed] [--timeout S]` exits 0 when the account is open (with
-  `--confirmed`, only once a check has confirmed it). An orchestrator's relaunch script waits on the record
-  instead of a typed time that cannot move. It waits; it launches nothing.
+  `--confirmed`, only once a check has confirmed it: a usage probe or reset check that read it open after its
+  newest limit and is not stale, even when a newer open report from a conversation is now the witness). An
+  orchestrator's relaunch script waits on the record instead of a typed time that cannot move. It waits; it
+  launches nothing.
 - `khipu route sources` lists each registered runner folder with its last good read and any parse error.
 - MCP `khipu_route` reads the view, with optional `since` and `account`, and includes the words of holds and
   reports that the push leaves out. Its description ends "Khipu reports; routing stays with you", and it
   never returns a pick or a ranking. MCP `khipu_route_report` writes reports and holds only, takes its author
-  from the session, and refuses rules, the note, pauses and clears.
+  from the session, and refuses rules, the note, pauses and clears. Its answer and the light status's
+  `routing` field follow one policy: the owner's rules, note and hold words are shown word for word (a path
+  in them included), and every other field and line has each configured path cut to its last name. A
+  conversation's words inside a line are shown in printable ASCII only: quotation marks become a straight
+  single quote, any other character is written as its escape (`\u02ee`), and "you", "owner" and "standing
+  rule" are marked as theirs ("[you]"), so no lookalike can close Khipu's quote or speak for the owner. A
+  conversation's project is its folder's name, and none when that folder is the home folder, one that holds
+  it, the root or a scratch folder.
 - `khipu_status`'s light payload gains a `routing` field holding the summary, so a harness without hooks
   gets it with a call it already makes. The recall rule and the MCP `instructions` gain one line, and
   `features.contract()` gains a `routing` capability.
