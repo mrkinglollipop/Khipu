@@ -249,7 +249,8 @@ MCP tool refuses them. Doctor warns when any of them was written by anything oth
    lines, both settings); `state/heartbeat.json`; and, for doctor's rule
    checks only, these keys of `config.json` and nothing else: each lane's `kind`, `model`, `launch` argument
    list and `confirm_lane`, and `defaults.check_lane` and `defaults.fix_lanes`. Nothing else in `config.json`
-   is read or kept. Every line Khipu stores or pushes from a runner first passes through Khipu's existing
+   is read or kept. The `launch` arguments are never kept: only what the checks need is kept from them (whether
+   a model ending in -fast is named, whether the model is one of them, and the launch script's file name). Every line Khipu stores or pushes from a runner first passes through Khipu's existing
    secret redaction (`khipu.redact.redact_secrets`). Khipu never takes a runner's lock and never writes:
    `lanes.py` saves `global.json` at the end of a pass without its own mutex (`lanes.py:1860`), so a second
    writer would race it. Until runners write the basis themselves, a runner's `until` counts as **cli** only

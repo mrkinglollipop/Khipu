@@ -11,7 +11,12 @@ reports; nothing here picks, ranks, refuses, launches or reorders work.
   lane's ``kind``, ``model``, ``launch`` and ``confirm_lane``, and
   ``defaults.check_lane`` and ``defaults.fix_lanes``. Every file is opened
   read-only (``os.O_RDONLY``), no lock of the runner's is taken, and every
-  line kept passes through ``redact_secrets`` first. A folder, or a file
+  line kept passes through ``redact_secrets`` first (plus a mask for xAI
+  keys and the value after a secret flag such as ``--api-key``). A lane's
+  ``launch`` arguments are never kept: only the facts the rule checks need
+  are derived from them as they are read (whether a model ending in -fast is
+  named, whether the model is one of the arguments, and the launch script's
+  name). A folder, or a file
   that resolves, inside a credential location is refused and never opened.
 - Khipu's usage cache (``state/usage.json``): a window at 100% or more is a
   limit until its ``resets_at`` (basis cli) for its scope (a model, or the
@@ -59,6 +64,7 @@ LAUNCH_KEEP = timedelta(days=2)
 # 20 and 30 seconds); the file is reported as out of range.
 INTERVAL_MAX = 24 * 3600
 
+_STAMPED = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s")
 _LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+(\S+)\s+(ADDED|LIMITED|LAUNCH|HOLD)\b[ \t]*(.*)$")
 _FIELD = re.compile(r"(?:^|\s)([a-z_]+)=(\S+)")
 _NOW_BLOCK = re.compile(r"## NOW\s*\n```\n(.*?)\n```", re.S)
@@ -112,13 +118,26 @@ def _epoch(value) -> datetime | None:
         return None
 
 
+# What ``redact_secrets`` leaves that a runner's line or argument can carry:
+# an xAI key, and the value after a secret flag (``--api-key VALUE``,
+# ``--password=VALUE``), which no pattern there knows is a secret.
+_XAI_KEY = re.compile(r"\bxai-[A-Za-z0-9_-]{16,}")
+_SECRET_FLAG = re.compile(
+    r"(?i)(?<![\w-])(--?[a-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd|pwd|credential|auth)[a-z0-9_-]*)"
+    r"(\s*=\s*|\s+)(?!--?[a-z])(\S+)")
+_SECRET_FLAG_ONLY = re.compile(
+    r"(?i)^--?[a-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd|pwd|credential|auth)[a-z0-9_-]*$")
+
+
 def _redacted(text, limit: int = LINE_MAX) -> str:
     """One line of a runner's words, secrets masked whatever the redaction
     switch says, clipped."""
-    from khipu.redact import redact_secrets
+    from khipu.redact import MASK, redact_secrets
 
     one = " ".join(str(text or "").split())
     one = redact_secrets(one, force=True)[0]
+    one = _XAI_KEY.sub(MASK, one)
+    one = _SECRET_FLAG.sub(lambda m: m.group(1) + m.group(2) + MASK, one)
     return one if len(one) <= limit else one[: max(1, limit - 1)].rstrip() + "…"
 
 
@@ -302,10 +321,59 @@ def _parse_heartbeat(data: bytes) -> dict:
     return {"time": _number(doc["time"]), "interval": interval}
 
 
+_SCRIPT_EXT = (".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".rb", ".pl")
+_PLAIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+
+
+def _script_name(launch: list[str]) -> str:
+    """The launch script's file name, the only text a launch list gives the
+    record: the first argument that is a script file, else the program run,
+    and only when it is a plain short file name that redaction leaves alone
+    and that no secret flag precedes; otherwise a fixed phrase."""
+    after_flag = False
+    candidates = []
+    for arg in launch:
+        if not after_flag and arg.endswith(_SCRIPT_EXT):
+            candidates.append(arg)
+        after_flag = bool(_SECRET_FLAG_ONLY.match(arg))
+    if launch:
+        candidates.append(launch[0])
+    for arg in candidates:
+        name = Path(arg).name
+        if _PLAIN_NAME.match(name) and _redacted(name, 64) == name:
+            return name
+    return "the launch command"
+
+
+def launch_facts(model, launch) -> dict:
+    """What doctor's rule checks need from a lane's launch arguments, derived
+    as they are read; the arguments themselves are never kept."""
+    args = [a.strip() for a in launch[:64] if isinstance(a, str)] if isinstance(launch, list) else []
+    model = model.strip() if isinstance(model, str) else ""
+    return {"fast": any(t.endswith("-fast") for t in [model, *args]),
+            "model_in_launch": bool(model) and model in args,
+            "script": _script_name(args)}
+
+
+def _config_facts(lanes) -> dict:
+    """A config read kept by an older view, with any launch list it held
+    turned into the facts and dropped."""
+    out = {}
+    for lane, spec in (lanes.items() if isinstance(lanes, dict) else ()):
+        if not isinstance(spec, dict):
+            continue
+        spec = dict(spec)
+        if "launch" in spec or "fast" not in spec:
+            spec.update(launch_facts(spec.get("model"), spec.pop("launch", None)))
+        out[lane] = spec
+    return out
+
+
 def _parse_config(data: bytes) -> dict:
-    """Only the named keys: each lane's kind, model, launch and
-    confirm_lane, and defaults.check_lane and defaults.fix_lanes. Nothing
-    else in config.json is kept."""
+    """Only the named keys: each lane's kind, model and confirm_lane, the
+    facts its launch arguments give (``launch_facts``: never the arguments),
+    and defaults.check_lane and defaults.fix_lanes. Nothing else in
+    config.json is kept."""
     doc = json.loads(data.decode("utf-8"))
     if not isinstance(doc, dict) or not isinstance(doc.get("lanes"), dict):
         raise ValueError("no lanes")
@@ -314,12 +382,10 @@ def _parse_config(data: bytes) -> dict:
         lane_name = _name(lane)
         if lane_name is None or not isinstance(spec, dict):
             continue
-        launch = spec.get("launch")
         lanes[lane_name] = {
             "kind": _name(spec.get("kind")), "model": _name(spec.get("model")),
-            "launch": [_redacted(a, 300) for a in launch[:32] if isinstance(a, str)]
-            if isinstance(launch, list) else [],
             "confirm_lane": _name(spec.get("confirm_lane")),
+            **launch_facts(spec.get("model"), spec.get("launch")),
         }
     defaults = doc.get("defaults") if isinstance(doc.get("defaults"), dict) else {}
     fix = defaults.get("fix_lanes")
@@ -365,13 +431,15 @@ def _parse_events(data: bytes, now: datetime, limits: dict[str, datetime] | None
     holds = 0
     first: datetime | None = None
     for line in lines:
+        # ``first`` is the oldest line of every kind the tail holds, not
+        # only the kinds kept below.
+        stamped = _STAMPED.match(line.strip())
+        at = _parse(stamped.group(1)) if stamped else None
+        if at is not None:
+            first = at if first is None else min(first, at)
         m = _LINE.match(line.strip())
-        if not m:
+        if not m or at is None:
             continue
-        at = _parse(m.group(1))
-        if at is None:
-            continue
-        first = at if first is None else min(first, at)
         kind, pipeline, rest = m.group(3), _name(m.group(2)), m.group(4)
         fields = dict(_FIELD.findall(rest))
         if kind == "HOLD":
@@ -438,6 +506,8 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
             since = last.get("since") or _iso(now)
             if last.get("data") is not None:
                 cache[key] = dict(last, since=since)
+                if key == "config" and isinstance(last["data"], dict):
+                    cache[key]["data"] = dict(last["data"], lanes=_config_facts(last["data"].get("lanes")))
             else:
                 cache[key] = {"data": None, "good_at": None, "mtime": None, "since": since}
             files[key] = {"error": _short_error(exc), "good_at": cache[key].get("good_at"), "since": since}
@@ -711,13 +781,6 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
 # ---- doctor's rule checks (read from config.json and ADDED lines only) ------------------
 
 
-def _script(launch: list[str]) -> str:
-    for arg in launch:
-        if "/" in arg or arg.endswith((".sh", ".py")):
-            return Path(arg).name or arg
-    return launch[0] if launch else "the launch command"
-
-
 def watched(rules: list[dict]) -> dict[str, int]:
     """Which checks the active standing rules ask for: the check's name to
     the rule's number. The public product ships with no rules, so nothing is
@@ -747,24 +810,23 @@ def rule_checks(cache: dict, rules: list[dict]) -> list[dict]:
     out: list[dict] = []
     for name, kept in sorted(((cache or {}).get("runners") or {}).items()):
         config = (kept.get("config") or {}).get("data") or {}
-        lanes = config.get("lanes") or {}
+        lanes = _config_facts(config.get("lanes"))
         for lane, spec in sorted(lanes.items()):
-            launch = spec.get("launch") or []
             kind = (spec.get("kind") or "").lower()
-            model = spec.get("model")
+            script = spec.get("script") or "the launch command"
             if "fast_tier" in watch:
-                if any(str(t).endswith("-fast") for t in [model or "", *launch]):
+                if spec.get("fast"):
                     out.append({"rule": watch["fast_tier"], "status": "broken",
                                 "text": f"A standing rule may be broken: {name}'s settings name a model ending in "
                                         f"-fast for its {lane} lane."})
-                elif not model or model not in launch:
+                elif not spec.get("model_in_launch"):
                     out.append({"rule": watch["fast_tier"], "status": "cannot_check",
                                 "text": f"{name}'s {lane} lane: can't be checked: the model is set inside "
-                                        f"{_script(launch)}"})
+                                        f"{script}"})
             if "paid_xai" in watch and kind.startswith("grok"):
                 out.append({"rule": watch["paid_xai"], "status": "cannot_check",
                             "text": f"{name}'s {lane} lane: whether it uses the paid xAI API can't be checked: "
-                                    f"the launch environment is set inside {_script(launch)}"})
+                                    f"the launch environment is set inside {script}"})
             if "grok_confirm" in watch and kind == "grokcheck":
                 confirm = spec.get("confirm_lane")
                 other = lanes.get(confirm) if confirm else None

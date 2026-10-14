@@ -384,7 +384,8 @@ def test_a_config_key_outside_the_named_list_never_reaches_the_record(home, caps
     view = routing.read_view()
     kept = view["source_cache"]["runners"]["project A"]["config"]["data"]
     assert set(kept) == {"lanes", "check_lane", "fix_lanes"}
-    assert all(set(spec) == {"kind", "model", "launch", "confirm_lane"} for spec in kept["lanes"].values())
+    assert all(set(spec) == {"kind", "model", "confirm_lane", "fast", "model_in_launch", "script"}
+               for spec in kept["lanes"].values())
     texts = [routing.view_file().read_text(), routing.events_file().read_text(),
              json.dumps(routing.doctor_block())]
     for argv in (_args(json=True), _args(route_cmd="sources", json=True), _args(summary=True)):
@@ -656,8 +657,9 @@ def _confirm_checks(lanes: dict) -> list[dict]:
 
 
 def test_a_grok_check_lane_whose_confirming_lane_is_missing_or_unknown_never_passes():
-    gc = {"kind": "grokcheck", "model": None, "launch": [], "confirm_lane": None}
-    other = {"kind": "claude", "model": None, "launch": [], "confirm_lane": None}
+    facts = {"fast": False, "model_in_launch": False, "script": None}
+    gc = dict(facts, kind="grokcheck", model=None, confirm_lane=None)
+    other = dict(facts, kind="claude", model=None, confirm_lane=None)
     assert _confirm_checks({"gc": dict(gc, confirm_lane="c"), "c": other}) == []
     missing = _confirm_checks({"gc": dict(gc, confirm_lane="nosuch")})
     assert [c["status"] for c in missing] == ["broken"]
@@ -865,3 +867,106 @@ def test_a_low_clock_line_after_one_line_written_ahead_never_lifts_the_lines_aft
     assert any("1 line dated well before" in w and "2001-01-01T00:00:00Z" in w for w in warnings), warnings
     assert any("dated well after" in w and routing._iso(T0 + timedelta(hours=2)) in w for w in warnings), warnings
     assert not any("2 lines dated well before" in w for w in warnings), warnings
+
+
+# ---- fix round 4 ------------------------------------------------------------------------
+
+FAKE_XAI = "xai-" + "Q7fakeKeyNotReal0123456789abcdefGHIJKLmnop"
+FAKE_API_VALUE = "plainApiValue-not-a-real-one-4471"
+FAKE_PASSWORD = "plainPassword-not-real-9902"
+
+
+def test_launch_arguments_never_reach_the_record_only_the_facts_the_checks_need(home, capsys):
+    # R4-3: each launch argument was redacted on its own, so a secret passed
+    # as its own argument (an xAI key, the value after --api-key or
+    # --password) was kept unmasked in view.json's source_cache.
+    _register(home)
+    routing.add_rule("Never a -fast tier.", via="app")
+    routing.add_rule("Never the paid xAI API.", via="app")
+    config = json.loads((home["a"] / "config.json").read_text())
+    config["lanes"]["grok"]["launch"] = ["grok", "--api-key", FAKE_API_VALUE, "--password", FAKE_PASSWORD,
+                                         FAKE_XAI, "-m", "grok-4.7"]
+    config["lanes"]["grok"]["model"] = "grok-4.7"
+    config["lanes"]["muse"]["launch"] = ["bash", "/runner/project-a/launch-muse.sh", "muse-1.0-fast"]
+    (home["a"] / "config.json").write_text(json.dumps(config))
+    _append(home["a"], f"2026-10-14T14:58:00Z pipe-60 LIMITED lane=codex until=2026-10-14T15:30:00Z job=x "
+                       f"--api-key {FAKE_API_VALUE} --password {FAKE_PASSWORD} {FAKE_XAI}")
+    _limit(home["a"], {"main": T0 + timedelta(hours=1)})
+    glob = json.loads((home["a"] / "state" / "global.json").read_text())
+    glob["limited"]["main"]["reason"] = f"--api-key {FAKE_API_VALUE} --password={FAKE_PASSWORD} {FAKE_XAI}"
+    (home["a"] / "state" / "global.json").write_text(json.dumps(glob))
+    view = routing.read_view()
+    kept = view["source_cache"]["runners"]["project A"]["config"]["data"]
+    assert all("launch" not in spec for spec in kept["lanes"].values())
+    grok, muse = kept["lanes"]["grok"], kept["lanes"]["muse"]
+    assert (grok["fast"], grok["model_in_launch"], grok["script"]) == (False, True, "grok")
+    assert (muse["fast"], muse["script"]) == (True, "launch-muse.sh")
+    checks = routing.doctor_block()["rule_checks"]
+    assert any(c["status"] == "broken" and "-fast for its muse lane" in c["text"] for c in checks), checks
+    assert any("project A's grok lane: whether it uses the paid xAI API can't be checked: the launch environment "
+               "is set inside grok" == c["text"] for c in checks), checks
+    texts = [json.dumps(routing.doctor_block())]
+    for argv in (_args(json=True), _args(route_cmd="sources", json=True), _args(summary=True)):
+        assert routing.run_cli(argv) == 0
+        texts.append(capsys.readouterr().out)
+    for path in home["data"].rglob("*"):
+        if path.is_file():
+            texts.append(path.read_bytes().decode("utf-8", "replace"))
+    for secret in (FAKE_XAI, FAKE_API_VALUE, FAKE_PASSWORD):
+        assert not any(secret in text for text in texts), secret
+
+
+def test_a_launch_list_kept_by_an_older_view_is_dropped_when_config_json_fails(home):
+    # R4-3: a view saved before the fix kept the argv; a config.json that
+    # can't be read keeps its last good read, which must not carry it on.
+    _register(home)
+    routing.read_view()
+    view = json.loads(routing.view_file().read_text())
+    lanes = view["source_cache"]["runners"]["project A"]["config"]["data"]["lanes"]
+    lanes["grok"] = {"kind": "grok", "model": "grok-4.7", "confirm_lane": None,
+                     "launch": ["grok", "--api-key", FAKE_API_VALUE, "x-fast"]}
+    routing._save_view(view)
+    (home["a"] / "config.json").write_text("{not json")
+    home["clock"].advance(seconds=1)
+    view = routing.read_view()
+    grok = view["source_cache"]["runners"]["project A"]["config"]["data"]["lanes"]["grok"]
+    assert "launch" not in grok and grok["fast"] is True
+    assert FAKE_API_VALUE not in routing.view_file().read_text()
+
+
+def test_a_write_from_a_clock_behind_the_record_never_moves_the_version_on_read(home):
+    # R4-1: a write that copied the record's time (clock_at set)
+    # refolded and saved the view at that copied time, while a read folds at
+    # the clock, so every write and read pair flipped the view and moved the
+    # version.
+    clock = home["clock"]
+    author = {"kind": "conversation", "harness": "claude_code"}
+    routing.report(account="Claude", state="limited", until="30m", author=author)
+    clock.advance(hours=1)  # the limit has ended at the record's newest time, not at the clock below
+    routing.report(account="Codex", state="open", author=author)
+    clock.now = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    for _ in range(2):
+        written = routing.report(account="Muse", state="open", author=author)
+        assert "clock_at" in routing.read_events()[0][-1]
+        versions = {written["version"]}
+        for _ in range(3):
+            clock.advance(seconds=1)
+            versions.add(routing.read_view()["version"])
+        assert len(versions) == 1, versions
+        assert json.loads(routing.view_file().read_text())["folded_at"].startswith("2001-")
+
+
+def test_the_first_bound_counts_every_line_in_the_tail(home):
+    # R4-2: ``first`` (which dates a global.json limit with no line in the
+    # tail) was taken over ADDED, LIMITED, LAUNCH and HOLD lines only, so a
+    # tail of other lines fell back to global.json's modification time.
+    _register(home)
+    oldest = T0 - timedelta(hours=3)
+    (home["a"] / "events.log").write_text(
+        f"{routing._iso(oldest)} pipe-70 VERDICT check 1 on codex said CLEAR\n"
+        f"{routing._iso(oldest + timedelta(minutes=5))} pipe-70 DONE fix round 1\n")
+    _limit(home["a"], {"main": T0 + timedelta(hours=1)})
+    cache = routing.read_view()["source_cache"]["runners"]["project A"]
+    assert cache["events"]["data"]["first"] == routing._iso(oldest)
+    assert cache["sightings"]["main"]["at"] == routing._iso(oldest)
+    assert cache["sightings"]["main"]["line"] is False

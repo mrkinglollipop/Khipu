@@ -1840,7 +1840,8 @@ def _write(event: dict) -> tuple[dict, dict]:
     a little later (``_not_behind``), so the log's times run in the order its
     lines were written and an owner's clear is newer than every report before
     it; a line stamped further ahead than that is ordered by the fold
-    (``_in_write_order``), not followed. Once
+    (``_in_write_order``), not followed. The view is refolded and saved at
+    that clock reading in every case, as ``read_view`` folds. Once
     the line is down the write is recorded: a view that can't be saved or
     folded comes back unsaved (``saved: false``), never as a failure that
     would make the caller write it again."""
@@ -1848,13 +1849,18 @@ def _write(event: dict) -> tuple[dict, dict]:
     event.setdefault("id", _new_id("e"))
     view: dict | None = None
     appended = False
+    clock: datetime | None = None
     try:
         with _lock():
-            event.update(_stamp_locked(_now())[0])
-            stamp = _parse(event["written_at"])
+            clock = _now()
+            event.update(_stamp_locked(clock)[0])
             _append_locked(event)
             appended = True
-            view = _refold_locked(stamp)
+            # Folded and saved at the clock, as a read folds, never at the
+            # line's own time: a line that copied the record's time
+            # (``clock_at``) would otherwise save a view that the next read
+            # folds back, moving the version on every write and read.
+            view = _refold_locked(clock)
     except Exception as exc:  # noqa: BLE001 - after the append, nothing here may fail the write
         if not appended:
             if isinstance(exc, OSError):
@@ -1862,7 +1868,7 @@ def _write(event: dict) -> tuple[dict, dict]:
             raise
     if view is None:
         try:
-            view = _unsaved_view(_parse(event["written_at"]) or _now())
+            view = _unsaved_view(clock or _now())
         except Exception:  # noqa: BLE001 - the line is down: the write is recorded whatever the view does
             view = {"version": None, "saved": False}
     return event, view
