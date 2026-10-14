@@ -2111,7 +2111,7 @@ dependencies = [
 
 [[package]]
 name = "khipu"
-version = "0.4.12"
+version = "0.4.13"
 dependencies = [
  "reqwest",
  "serde",
