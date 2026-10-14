@@ -1,4 +1,8 @@
-"""Routing truth, phases 1a and 1b: one record of which accounts are open.
+"""Routing truth, phases 1a, 1b and 2: one record of which accounts are open.
+
+Phase 2 adds what a conversation reads and writes through MCP
+(``conversation_view``, ``conversation_write``) and ``khipu route wait``
+(``wait``); the MCP tools themselves live in ``khipu.mcp_server``.
 
 Phase 1b folds in the sources (``khipu.routing_sources``): job runners'
 files, read and never written; Khipu's usage cache; and the routing table's
@@ -49,6 +53,7 @@ import bisect
 import contextlib
 import fcntl
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -57,6 +62,7 @@ import secrets
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -97,7 +103,13 @@ _STATE_ORDER = {LIMITED: 0, PAUSED: 1, DOWN: 2, UNKNOWN: 3, PROBABLY_OPEN: 4, OP
 
 
 class RouteError(ValueError):
-    """A write or a setting Khipu refuses; the text is shown as written."""
+    """A write or a setting Khipu refuses; the text is shown as written.
+    ``public``, when given, is the fixed text a conversation gets in its
+    place (the text echoes what was typed)."""
+
+    def __init__(self, message: str = "", *, public: str | None = None):
+        super().__init__(message)
+        self.public = public
 
 
 # ---- settings ----------------------------------------------------------------
@@ -492,11 +504,140 @@ def _clip(text: str, limit: int) -> str:
     return text
 
 
+# Every mark that can open or close a quote: Unicode's initial and final
+# quotation marks (Pi, Pf) by category, plus the double, low, CJK, dingbat
+# and fullwidth marks that are filed elsewhere. They become a single
+# straight quote, which reads as what it was; every other character outside
+# printable ASCII is written as its escape (``their_words``).
+_QUOTE_MARKS = frozenset("\u0022\u201a\u201e\u2033\u2036\u275b\u275c\u275d\u275e\u275f\u2760\u2e42"
+                         "\u301d\u301e\u301f\uff02")
+# Words that speak for the owner in Khipu's lines ("set by you", "until you
+# clear it", "Note from the owner", "Standing rule"), matched on the words'
+# skeleton (``_skeleton``), so a digit or a letter that looks like one of
+# their letters still matches.
+_OWNER_WORDS = re.compile(r"\b(?:you|owner|standing\s+rules?)\b")
+# The digits that look like a letter of those words (a digit for a letter
+# keeps the word's bounds where they were).
+_ASCII_LOOKALIKES = str.maketrans({"0": "o", "1": "i", "3": "e", "5": "s"})
+
+
+def _hidden(ch: str) -> bool:
+    """A character that shows nothing: a format character (zero-width
+    spaces and joiners, soft hyphens, direction marks) or a variation
+    selector."""
+    import unicodedata
+
+    code = ord(ch)
+    return (unicodedata.category(ch) == "Cf" or 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF
+            or code == 0x034F)
+
+
+def _ascii_char(ch: str) -> str:
+    """One character of a conversation's words in printable ASCII: as it
+    is; a quotation mark as a straight single quote; a dash as a hyphen; a
+    letter with accents as the letter without them; anything else as its
+    escape (``\\u02ee``), so it shows as what it is and never as a mark of
+    the line around it."""
+    import unicodedata
+
+    if ch == "\\":
+        return "\\\\"
+    if " " <= ch <= "~":
+        return "'" if ch == '"' else ch
+    if ch in _QUOTE_MARKS or unicodedata.category(ch) in ("Pi", "Pf"):
+        return "'"
+    if unicodedata.category(ch) == "Pd":
+        return "-"
+    if unicodedata.category(ch) == "Zs":
+        return " "
+    base = "".join(c for c in unicodedata.normalize("NFKD", ch) if not unicodedata.combining(c))
+    if len(base) == 1 and base.isascii() and base.isalpha():
+        return base
+    code = ord(ch)
+    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
+
+
+def _skeleton(text: str) -> str:
+    """``text`` (printable ASCII) as owner words are matched on it: lower
+    case, with the ASCII characters that look like a letter as that letter,
+    one character for one so a match's place is its place in ``text``."""
+    return text.lower().translate(_ASCII_LOOKALIKES)
+
+
+def their_words(text) -> str:
+    """A conversation's words as a line quotes them. Hidden characters go
+    and the words are NFKC-normalised; then only printable ASCII is kept as
+    it is (``_ascii_char``): a quotation mark becomes a single straight
+    quote and any other character is written as its escape, so no
+    lookalike of a quotation mark or of a letter can close the quote
+    around the words or read as Khipu's own. Every word that speaks for
+    the owner ("you", "owner", "standing rule") is marked as theirs,
+    "[you]", matched on the words' skeleton (``_skeleton``)."""
+    import unicodedata
+
+    out = unicodedata.normalize("NFKC", "".join(c for c in str(text or "") if not _hidden(c)))
+    out = "".join(_ascii_char(c) for c in _one_line(out) if not _hidden(c))
+    skeleton = _skeleton(out)
+    marked, pos = [], 0
+    for match in _OWNER_WORDS.finditer(skeleton):
+        marked += [out[pos:match.start()], f"[{out[match.start():match.end()]}]"]
+        pos = match.end()
+    return "".join(marked) + out[pos:]
+
+
 def _clean(text, limit: int) -> str:
-    """One line, secrets masked, clipped: for any words a conversation gives."""
+    """One line, secrets masked, each path Khipu is configured with (login
+    folders, runner folders, the routing table) cut to its last name, then
+    clipped: for any words a conversation gives. The paths go before the
+    clip, so a clip never leaves part of one behind."""
     from khipu.redact import redact_secrets
 
-    return _clip(redact_secrets(_one_line(text))[0], limit)
+    words = redact_secrets(_one_line(text))[0]
+    if "/" in words:
+        words = _cut_paths(words)
+    return _clip(words, limit)
+
+
+def _configured_paths() -> list[str]:
+    """Every folder and file path Khipu is configured with (login folders,
+    job runner folders, the routing table, the rules seed), each as written,
+    expanded and resolved, longest first."""
+    from khipu.config import load_config
+
+    config: dict = {}
+    with contextlib.suppress(Exception):
+        config = load_config()
+    paths: set[str] = set()
+    for name in ("routing_table", "routing_rules_seed"):
+        if isinstance(config.get(name), str):
+            paths.add(config[name])
+    for name, field in (("routing_sources", "path"), ("usage_accounts", "home")):
+        items = config.get(name)
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and isinstance(item.get(field), str):
+                paths.add(item[field])
+    with contextlib.suppress(Exception):
+        paths |= {str(a["home"]) for a in accounts() if a.get("home")}
+    variants: set[str] = set()
+    for path in paths:
+        path = path.strip()
+        if len(path) < 2:
+            continue
+        variants.add(path.rstrip("/") or path)
+        with contextlib.suppress(Exception):
+            variants.add(os.path.expanduser(path).rstrip("/"))
+            variants.add(os.path.realpath(os.path.expanduser(path)).rstrip("/"))
+    return sorted((v for v in variants if v and v != "/"), key=len, reverse=True)
+
+
+def _cut_paths(words: str) -> str:
+    """``words`` with each configured path cut to its last name: done once,
+    to a conversation's words before they are stored, so the record never
+    holds one of the owner's paths in a conversation's words."""
+    for path in _configured_paths():
+        if path in words:
+            words = words.replace(path, Path(path).name or "a folder")
+    return words
 
 
 def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime:
@@ -510,9 +651,12 @@ def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime
         text = re.sub(r"\s+ago$", "", text, flags=re.I)
     lengths = "10m or 2h (how long ago)" if ago else "30m, 2h or 3d"
     if re.fullmatch(r"(?:in\s+)?\d+(?:\.\d+)?", text, re.I):
-        raise RouteError(f"{flag} needs a unit: {lengths} (got {raw!r}), or a time such as 2026-10-14T18:52Z")
+        raise RouteError(f"{flag} needs a unit: {lengths} (got {raw!r}), or a time such as 2026-10-14T18:52Z",
+                         public=f"{flag} needs a unit: {lengths}, or a time such as 2026-10-14T18:52Z")
     ahead = f"{flag} is further ahead than Khipu can hold (got {raw!r}); give a time before the year 9999"
     back = f"{flag} is further back than Khipu can hold (got {raw!r}); give a time after the year 1"
+    fixed = {ahead: f"{flag} is further ahead than Khipu can hold; give a time before the year 9999",
+             back: f"{flag} is further back than Khipu can hold; give a time after the year 1"}
     try:
         seconds = parse_duration(text)
     except ValueError:
@@ -521,11 +665,12 @@ def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime
         try:
             return now - timedelta(seconds=seconds) if ago else now + timedelta(seconds=seconds)
         except OverflowError:
-            raise RouteError(back if ago else ahead) from None
+            raise RouteError(back if ago else ahead, public=fixed[back if ago else ahead]) from None
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
-        raise RouteError(f"{flag} takes a time (2026-10-14T18:52Z) or a length ({lengths}), got {raw!r}") from None
+        raise RouteError(f"{flag} takes a time (2026-10-14T18:52Z) or a length ({lengths}), got {raw!r}",
+                         public=f"{flag} takes a time (2026-10-14T18:52Z) or a length ({lengths})") from None
     try:
         if dt.tzinfo is None:
             dt = dt.astimezone()  # this Mac's local time
@@ -533,7 +678,7 @@ def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime
     except (OverflowError, ValueError, OSError):
         # Near the year limits a time with no zone raises ValueError (its
         # local offset can't be worked out) and one with a zone OverflowError.
-        raise RouteError(ahead if dt.year > 5000 else back) from None
+        raise RouteError(ahead if dt.year > 5000 else back, public=fixed[ahead if dt.year > 5000 else back]) from None
 
 
 def parse_until(raw: str, now: datetime) -> datetime:
@@ -549,7 +694,8 @@ def parse_seen(raw: str, now: datetime) -> datetime:
     within it is taken as now."""
     seen = _typed_time(raw, now, "--seen", ago=True)
     if (seen - now).total_seconds() > CLOCK_TOLERANCE:
-        raise RouteError(f"--seen is when the limit message was shown, so not later than now (got {raw!r})")
+        raise RouteError(f"--seen is when the limit message was shown, so not later than now (got {raw!r})",
+                         public="--seen is when the limit message was shown, so not later than now")
     return min(seen, now)
 
 
@@ -676,7 +822,7 @@ def resolve_account(name: str, known: list[dict] | None = None, *, conversation:
                              f"accounts Khipu knows: {labels}")
         return key
     for account in known:
-        if account["label"].casefold() == raw.casefold():
+        if account["label"].casefold() == raw.casefold() or raw == account_id(account["key"]):
             return account["key"]
     low = raw.lower()
     if low in usage.HARNESSES:
@@ -695,11 +841,36 @@ def _resolve_quiet(name: str, known: list[dict]) -> str | None:
         return None
 
 
+def _not_a_project(path: str) -> bool:
+    """A folder that names no project: a scratch folder, the root, or the
+    home folder or one of the folders that holds it (the server's folder
+    when a harness starts it in the home folder, whose name is the login
+    name)."""
+    from khipu.identity import _is_scratch_cwd
+
+    if _is_scratch_cwd(path):
+        return True
+    try:
+        here = Path(os.path.realpath(path))
+    except (OSError, ValueError):
+        return True
+    if here == Path(here.anchor):
+        return True
+    for raw in {os.path.expanduser("~"), os.environ.get("HOME") or ""}:
+        if not raw or raw == "~":
+            continue
+        with contextlib.suppress(OSError, ValueError):
+            home = Path(os.path.realpath(raw))
+            if here == home or here in home.parents:
+                return True
+    return False
+
+
 def _project_name(cwd: str | None) -> str | None:
-    from khipu.identity import WORKTREE_MARKERS, _is_scratch_cwd
+    from khipu.identity import WORKTREE_MARKERS
 
     path = str(cwd or "")
-    if not path or _is_scratch_cwd(path):
+    if not path or _not_a_project(path):
         return None
     for marker in WORKTREE_MARKERS:
         if marker in path:
@@ -767,13 +938,15 @@ def author_words(by: dict | None, *, push: bool = True) -> str:
         words = f"a {HARNESS_WORDS[harness]} conversation"
     else:  # never the stored text: it came from the writer's environment
         words = "a conversation from an unknown harness"
+    # The project and the session come from the writer's folder and
+    # environment, so they are shown as a conversation's words are.
     if by.get("project"):
-        words += f" in {by['project']}"
+        words += f" in {their_words(by['project'])}"
     if not push:
         if by.get("session"):
-            words += f" (session {str(by['session'])[:8]})"
+            words += f" (session {their_words(str(by['session'])[:8])})"
         if by.get("name"):
-            words += f", which calls itself “{by['name']}”"
+            words += f", which calls itself “{their_words(by['name'])}”"
     return words
 
 
@@ -795,12 +968,49 @@ def view_file() -> Path:
 
 
 _held = threading.local()
+_LOCK_POLL = 0.05
+
+
+class LockBusy(OSError):
+    """The routing lock stayed held past this thread's lock budget."""
+
+
+@contextlib.contextmanager
+def lock_budget(seconds: float | None):
+    """Bound how long this thread waits for the routing lock (None: no
+    bound). A read that runs out answers from an unsaved fold (``saved:
+    false``); a write that runs out is refused as a RouteError, and nothing
+    is written. Every caller that must answer in time (MCP tools, ``khipu
+    route wait --timeout``) reads inside one."""
+    before = getattr(_held, "deadline", None)
+    _held.deadline = None if seconds is None else time.monotonic() + max(0.0, seconds)
+    try:
+        yield
+    finally:
+        _held.deadline = before
+
+
+def _acquire(fd: int) -> None:
+    deadline = getattr(_held, "deadline", None)
+    if deadline is None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise LockBusy("the routing record is busy (another Khipu process holds its lock)") from None
+            time.sleep(min(_LOCK_POLL, left))
 
 
 @contextlib.contextmanager
 def _lock():
     """Khipu's own routing lock (flock, released if the holder dies);
-    re-entrant within a thread. Never another program's lock."""
+    re-entrant within a thread. Never another program's lock. Waits no
+    longer than this thread's ``lock_budget``."""
     if getattr(_held, "depth", 0):
         _held.depth += 1
         try:
@@ -812,7 +1022,7 @@ def _lock():
     folder.mkdir(parents=True, exist_ok=True)
     fd = os.open(folder / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _acquire(fd)
         _held.depth = 1
         try:
             yield
@@ -1234,6 +1444,21 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
         shown = (UNKNOWN, None)
     state, behind = shown
 
+    # Khipu's own read that the account is open (a usage probe or a reset
+    # check), newer than every limit and every down, and not stale. It stays the
+    # confirmation when a newer open report from anyone else becomes the
+    # witness, so ``route wait --confirmed`` never loses it to a report
+    # that agrees with it.
+    confirmed_at = None
+    if state == OPEN:
+        # Voided by anything newer that said it was not open: a limit or a
+        # down, from any source.
+        last_closed = max((e for e in whole if e["state"] in (LIMITED, DOWN)), key=_k, default=None)
+        own = [e for e in fresh if e["state"] == OPEN and e["source"] in CONFIRMING_SOURCES
+               and not e.get("cleared") and (last_closed is None or later(e, last_closed))]
+        if own:
+            confirmed_at = _iso(max(own, key=_k)["at"])
+
     # A disagreement: the newest evidence after the one behind the shown state
     # says something else and could not override it by the order above. It
     # began with the first of the run of such reports that ends with it.
@@ -1280,7 +1505,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
              "reason": DOWN_REASONS.get(behind.get("reason") or "", "out of service")
              if state == DOWN and behind else None,
              "models": models, "witness": witness(behind), "disagreement": disagreement, "last_seen": None,
-             "underlying": None, "checkable": account["harness"] != "muse"}
+             "underlying": None, "checkable": account["harness"] != "muse", "confirmed_at": confirmed_at}
     if state == LIMITED:
         # When the limit now shown was first reported (doctor's launch check).
         entry["since"] = _iso(min((e["at"] for e in whole if limit_holds(e, whole, ("all",))), default=None))
@@ -1298,7 +1523,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
         # the limit under it was first reported.
         entry.pop("since", None)
         entry.update(state=PAUSED, until=_iso(pause["until"]), basis="owner", reason=None, disagreement=None,
-                     last_seen=None, underlying=underlying,
+                     last_seen=None, underlying=underlying, confirmed_at=None,
                      witness={"id": pause["id"], "source": "owner", "written_by": pause["written_by"],
                               "at": _iso(pause["at"]), "evidence": None, "message_time": False, "cleared": False})
     return entry
@@ -1878,7 +2103,7 @@ def _write(event: dict) -> tuple[dict, dict]:
     except Exception as exc:  # noqa: BLE001 - after the append, nothing here may fail the write
         if not appended:
             if isinstance(exc, OSError):
-                raise RouteError(f"Khipu can't write its routing record: {exc}") from exc
+                raise RouteError(f"Khipu can't write its routing record ({_io_phrase(exc, 'write')})") from None
             raise
     if view is None:
         try:
@@ -1886,6 +2111,24 @@ def _write(event: dict) -> tuple[dict, dict]:
         except Exception:  # noqa: BLE001 - the line is down: the write is recorded whatever the view does
             view = {"version": None, "saved": False}
     return event, view
+
+
+def _io_phrase(exc: OSError, verb: str) -> str:
+    """A fixed phrase for why a routing file could not be read or written:
+    never the exception's own text, which names the file."""
+    import errno
+
+    if isinstance(exc, LockBusy):
+        return "the routing record is busy: another Khipu process holds its lock"
+    if isinstance(exc, PermissionError) or exc.errno in (errno.EACCES, errno.EPERM):
+        return f"not allowed to {verb} it"
+    if exc.errno == errno.EROFS:
+        return "read-only disk"
+    if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return "the disk is full"
+    if isinstance(exc, FileNotFoundError):
+        return "a folder is missing"
+    return f"can't {verb} it"
 
 
 def _done(written: dict, view: dict, **extra) -> dict:
@@ -2048,7 +2291,7 @@ def end_hold(hold_id: str, *, owner: bool = False, author: dict | None = None, v
     view = read_view(now)
     hold = next((h for h in view["holds"] if h["id"] == hold_id), None)
     if hold is None:
-        raise RouteError(f"no hold {hold_id!r} is in effect")
+        raise RouteError(f"no hold {hold_id!r} is in effect", public="no hold with that id is in effect")
     if hold["owner"] and not owner:
         raise RouteError("that hold is the owner's: only he ends it (the app, or --owner on a terminal)")
     written, view = _write({"type": "hold_end", "target": hold_id, "via": via,
@@ -2253,7 +2496,7 @@ def hold_line(hold: dict, now: datetime, *, push: bool = True, relative: bool = 
     text = f"Hold on {hold['scope_label']}: {HOLD_REASONS.get(hold['reason'], 'other')}, {end}; set by " \
            f"{author_words(hold['written_by'], push=push)}"
     if hold.get("text") and (hold.get("owner") or not push):
-        text += f": “{hold['text']}”"
+        text += f": “{hold['text'] if hold.get('owner') else their_words(hold['text'])}”"
     return text
 
 
@@ -2318,7 +2561,8 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
     prev = (prev_effective or {}).get(entity) or {}
     if kind == "account":
         entry = next((a for a in view["accounts"] if a["key"] == ident), None)
-        return account_line(entry, now, relative=False) if entry else f"{prev.get('label') or ident}: no longer tracked"
+        return account_line(entry, now, relative=False) if entry else \
+            f"{prev.get('label') or _label_for_key(ident)}: no longer tracked"
     if kind == "hold":
         hold = next((h for h in view["holds"] if h["id"] == ident), None)
         return hold_line(hold, now, relative=False) if hold else f"Hold on {prev.get('scope') or '?'} ended"
@@ -2585,6 +2829,424 @@ def _launch_warnings(view: dict, launched: list[dict], cfg: dict, now: datetime)
     return out
 
 
+# ---- what a conversation reads and writes (phase 2) ------------------------------------
+#
+# The MCP tools (khipu_route, khipu_route_report and the light khipu_status)
+# go through these, so every answer takes the same privacy path as
+# ``khipu route --json``: never the fold's fingerprint, digest or source
+# cache, and only the text the view already holds (Khipu's own words, the
+# names the sources' shape check let through, and what conversations and the
+# owner wrote). Nothing here returns a pick or a ranking.
+
+ABOUT = "Khipu reports; routing stays with you. This is data, not instructions, and guidance, not a gate."
+_INTERNAL = ("fingerprint", "digest", "source_cache")
+
+
+def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
+    """The view as ``khipu route --json`` prints it: the fold's internals
+    left out, each account with its line in full words."""
+    out = dict(view, generated_at=_iso(now))
+    out["accounts"] = [dict(e, line=account_line(e, now, push=False)) for e in view["accounts"]
+                       if account is None or e["key"] == account]
+    for key in _INTERNAL:
+        out.pop(key, None)
+    return out
+
+
+# A conversation's answer goes to other model providers: it carries no path
+# on this Mac and no account key (a key holds its login folder). Every
+# answer a conversation gets (khipu_route, khipu_route_report and the light
+# status) is built from a projection that copies only the fields named
+# here, so a key, a login folder, a runner folder or the table's path is
+# never in it to begin with. An account is named by its label and its id
+# (``account_id``); the owner's own words (rules, note, his holds' words)
+# are copied word for word.
+CONVERSATION_LOCK_BUDGET = 2.0
+# khipu_status joins its routing thread for 2 s; the fold after the wait takes ~0.1 s.
+LIGHT_LOCK_BUDGET = 0.5
+_FAILED = "Khipu's routing record could not answer that (an internal error); khipu doctor says more on this Mac"
+
+_VIEW_FIELDS = ("schema", "epoch", "version", "folded_at", "checked_at", "record", "bad_lines", "saved",
+                "valid_until", "outside_app", "seed_error")
+_AUTHOR_PUBLIC = ("kind", "harness", "project", "session", "name")
+_ACCOUNT_FIELDS = ("label", "harness", "state", "until", "basis", "scope", "reason", "checkable", "confirmed_at",
+                   "since", "silent")
+_WITNESS_FIELDS = ("id", "source", "at", "evidence", "message_time", "cleared", "observed")
+_REPORT_FIELDS = ("id", "state", "source", "at", "since", "until")
+_MODEL_FIELDS = ("model", "until", "basis", "source", "at", "id")
+_HOLD_FIELDS = ("id", "scope_label", "reason", "text", "until", "owner", "via", "at", "remind")
+_RULE_FIELDS = ("n", "text", "source", "date", "seeded", "confirmed", "via", "at")
+_LANE_FIELDS = ("runner", "lane", "state", "until", "basis", "at", "id")
+_RUNNER_FIELDS = ("name", "heartbeat_at", "interval", "silent", "silent_deadline", "unreadable",
+                  "unreadable_since", "lanes", "unmatched_lanes")
+_TABLE_FIELDS = ("hash", "stamped_at", "changed_at", "error")
+_WRITE_FIELDS = ("ok", "id", "state", "until", "basis", "ended", "version", "saved")
+
+
+_ID_SALTS: dict[str, bytes] = {}
+
+
+def _id_salt() -> bytes:
+    """This install's secret for account ids, made once and kept 0600 in the
+    routing folder. Without it an id would be a bare hash of the key, and a
+    reader could confirm a guessed login folder offline. If the folder can't
+    be written, a salt for this process only: ids then change between
+    processes, which costs a conversation a re-read, never a leak."""
+    path = routing_dir() / "id-salt"
+    cached = _ID_SALTS.get(str(path))
+    if cached is not None:
+        return cached
+    salt = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(os.urandom(32))
+    except FileExistsError:
+        pass
+    except OSError:
+        salt = os.urandom(32)
+    if salt is None:
+        try:
+            salt = path.read_bytes()
+        except OSError:
+            salt = b""
+        if len(salt) < 16:
+            salt = os.urandom(32)
+    _ID_SALTS[str(path)] = salt
+    return salt
+
+
+def account_id(key: str) -> str:
+    """An account's id in a conversation's answers: a keyed hash of its key
+    under this install's secret, the same for the same account every time,
+    that says nothing of the login folder the key holds and can't be
+    computed from a guess of it. ``resolve_account`` takes it back."""
+    digest = hmac.new(_id_salt(), str(key).encode("utf-8", "surrogatepass"), hashlib.sha256).hexdigest()
+    return "acct-" + digest[:12]
+
+
+def _pick(item, fields: tuple) -> dict | None:
+    """The named fields of ``item`` and nothing else; a ``written_by`` among
+    them as ``_public_author`` gives it."""
+    if not isinstance(item, dict):
+        return None
+    out = {k: item[k] for k in fields if k in item}
+    if "written_by" in item:
+        by = item["written_by"]
+        out["written_by"] = {k: by[k] for k in _AUTHOR_PUBLIC if k in by} if isinstance(by, dict) else None
+    return out
+
+
+def _public_account(entry: dict, now: datetime) -> dict:
+    out = {"id": account_id(entry["key"]), **_pick(entry, _ACCOUNT_FIELDS)}
+    out["models"] = [dict(_pick(m, _MODEL_FIELDS), disagreement=_pick(m.get("disagreement"), _REPORT_FIELDS))
+                     for m in entry.get("models") or [] if isinstance(m, dict)]
+    out["witness"] = _pick(entry.get("witness"), _WITNESS_FIELDS)
+    out["disagreement"] = _pick(entry.get("disagreement"), _REPORT_FIELDS)
+    out["last_seen"] = _pick(entry.get("last_seen"), _REPORT_FIELDS)
+    out["underlying"] = _pick(entry.get("underlying"), ("state", "until", "basis"))
+    out["line"] = account_line(entry, now, push=False)
+    return out
+
+
+def _public_hold(hold: dict, now: datetime) -> dict:
+    scope = hold.get("scope") if isinstance(hold.get("scope"), dict) else {}
+    out = _pick(hold, _HOLD_FIELDS)
+    out["scope"] = {"kind": scope.get("kind")}
+    if scope.get("kind") == "account" and scope.get("account"):
+        out["scope"]["account"] = account_id(scope["account"])
+    out["line"] = hold_line(hold, now, push=False)
+    return out
+
+
+def _public_sources(sources) -> dict | None:
+    """The sources' status with no folder or file path: each runner by its
+    name, the table by its hash and times."""
+    if not isinstance(sources, dict):
+        return None
+    runners = []
+    for runner in sources.get("runners") or []:
+        item = _pick(runner, _RUNNER_FIELDS) or {}
+        files = runner.get("files") if isinstance(runner.get("files"), dict) else {}
+        item["files"] = {str(n): _pick(f, ("error", "good_at", "since")) for n, f in files.items()}
+        runners.append(item)
+    return {"runners": runners, "refused": [str(r) for r in sources.get("refused") or []],
+            "invalid": sources.get("invalid"), "usage": _pick(sources.get("usage"), ("accounts", "newest")),
+            "table": _pick(sources.get("table"), _TABLE_FIELDS)}
+
+
+def _public_entity(entity: str) -> str:
+    kind, _, ident = entity.partition(":")
+    return f"account:{account_id(ident)}" if kind == "account" else entity
+
+
+def _label_of(key: str, known: list[dict]) -> str:
+    return next((a["label"] for a in known if a["key"] == key), None) or _label_for_key(key)
+
+
+def _account_for_a_conversation(name, known: list[dict]) -> str:
+    """The key of the account a conversation names by its label or its id
+    (as khipu_route lists them), or by a bare harness name. Never a key or
+    a login folder: a conversation that could name one could test guesses
+    of the owner's folders against the record."""
+    from khipu import usage
+
+    raw = str(name or "").strip()
+    for account in known:
+        if raw == account_id(account["key"]) or account["label"].casefold() == raw.casefold():
+            return account["key"]
+    low = raw.lower()
+    if low in usage.HARNESSES:
+        return resolve_account(low, known)
+    labels = ", ".join(sorted({a["label"] for a in known})) or "none"
+    raise RouteError("Khipu doesn't know the account you named; name it by its label or its id, as khipu_route "
+                     f"lists them. Known: {labels}")
+
+
+def _holds_on(key: str, view: dict) -> set[str]:
+    """The ids of every hold scoped to the account ``key``: those in effect
+    and those that have ended (their stored scope)."""
+    ids = {h["id"] for h in view.get("holds") or []
+           if h["scope"].get("kind") == "account" and h["scope"].get("account") == key}
+    with contextlib.suppress(Exception):
+        events, _bad = read_events()
+        ids |= {str(e.get("id")) for e in events if e.get("type") == "hold" and isinstance(e.get("scope"), dict)
+                and e["scope"].get("kind") == "account" and e["scope"].get("account") == key}
+    return ids
+
+
+@contextlib.contextmanager
+def _for_a_conversation():
+    """Every failure a conversation's tool call meets comes back as a
+    RouteError in a fixed message: a routing file that can't be read or
+    written is said in a fixed phrase, a refusal in Khipu's own words (the
+    words it gives a conversation when its text would echo what was typed),
+    and anything else as ``_FAILED``, never an exception's own text."""
+    try:
+        yield
+    except OSError as exc:
+        raise RouteError(f"Khipu can't read its routing record ({_io_phrase(exc, 'read')})") from None
+    except RouteError as exc:
+        raise RouteError(exc.public if exc.public is not None else str(exc)) from None
+    except Exception:  # noqa: BLE001 - its text may name a file
+        raise RouteError(_FAILED) from None
+
+
+def conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
+                      lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
+    """What MCP ``khipu_route`` answers (``_conversation_view``), read
+    waiting at most ``lock_wait`` seconds for the routing lock (an unsaved
+    fold after that)."""
+    with _for_a_conversation(), lock_budget(lock_wait):
+        return _conversation_view(since_version=since_version, account=account, now=now)
+
+
+def _conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None) -> dict:
+    """What MCP ``khipu_route`` answers, built field by field from the view
+    (see the note above ``account_id``). With ``since_version`` (V or
+    EPOCH:V) the current state of everything that changed after it, as
+    ``khipu route --since``, each account entity by its id. Otherwise the
+    view as ``khipu route --json`` gives it, without the history and the
+    paths, plus the words the push leaves out: each hold's line with its
+    words, each account's evidence line and the name a conversation gave
+    itself."""
+    now = now or _now()
+    view = read_view(now)
+    key = None
+    if account:
+        key = _account_for_a_conversation(account, accounts() + list(view.get("accounts") or []))
+    if since_version is not None and str(since_version).strip():
+        version, epoch = _parse_since(since_version)
+        out = since(version, view, now=now, epoch=epoch)
+        pairs = list(zip(out["entities"], out["lines"]))
+        if key is not None:
+            mine = {f"account:{key}"} | {f"hold:{i}" for i in _holds_on(key, view)}
+            pairs = [(e, line) for e, line in pairs if e in mine]
+        return {"since": out["since"], "epoch": out["epoch"], "version": out["version"],
+                "complete": out["complete"], "entities": [_public_entity(e) for e, _line in pairs],
+                "lines": [line for _e, line in pairs], "about": ABOUT}
+    out = {k: view[k] for k in _VIEW_FIELDS if k in view}
+    out["generated_at"] = _iso(now)
+    out["seed"] = _pick(view.get("seed"), ("at", "count"))
+    out["rules"] = [_pick(r, _RULE_FIELDS) for r in view.get("rules") or []]
+    out["note"] = _pick(view.get("note"), ("text", "at", "via"))
+    out["accounts"] = [_public_account(e, now) for e in view["accounts"] if key is None or e["key"] == key]
+    out["sources"] = _public_sources(view.get("sources"))
+    out["holds"] = [_public_hold(h, now) for h in view.get("holds") or []
+                    if key is None or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)]
+    if key is None:
+        out["unmatched"] = [dict(_pick(u, _LANE_FIELDS), line=lane_line(u, now)) for u in view.get("unmatched") or []]
+        out["dark_runners"] = [runner_line(r, now) for r in (view.get("sources") or {}).get("runners") or []
+                               if r.get("silent") or r.get("unreadable")]
+    out["about"] = ABOUT
+    return out
+
+
+# What a conversation may write through MCP, and what it may not. The owner's
+# changes are refused whatever the arguments say: "owner only" is a
+# convention (Khipu holds no credential), and a tool call is never the owner.
+CONVERSATION_ACTIONS = ("report", "hold", "end_hold")
+OWNER_ACTIONS = {"pause": "Pausing an account", "lift": "Lifting a pause", "clear": "Clearing an account",
+                 "dismiss": "Dismissing a report", "note": "The owner's note", "set_note": "The owner's note",
+                 "end_note": "The owner's note", "rule": "A standing rule", "add_rule": "A standing rule",
+                 "edit_rule": "A standing rule", "retire_rule": "A standing rule",
+                 "confirm_rule": "A standing rule"}
+OWNER_REFUSAL = ("{what} is the owner's to change: in the app (Settings \u2192 Routing) or on a terminal with "
+                 "`khipu route`, which asks for a typed confirmation. A conversation can report what it "
+                 "learned about an account and add or end its holds.")
+_ACTION_ARGS = {
+    "report": {"action", "state", "account", "runner", "lane", "until", "window", "model", "message", "seen",
+               "evidence", "name"},
+    "hold": {"action", "text", "reason", "scope", "account", "until", "name"},
+    "end_hold": {"action", "hold_id", "name"},
+}
+_AUTHOR_ARGS = ("author", "written_by", "by", "owner", "via", "basis", "written_at", "session", "harness",
+                "project")
+
+
+def conversation_write(args: dict, *, author: dict, now: datetime | None = None,
+                       lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
+    """What MCP ``khipu_route_report`` writes (``_conversation_write``),
+    waiting at most ``lock_wait`` seconds for the routing lock (refused as
+    busy after that). Its answer is built field by field, as
+    ``khipu_route``'s is: the account by its id and its label, never its
+    key; its errors are fixed messages (``_for_a_conversation``).
+
+    A tool call is never a shell: an author with no harness Khipu can
+    detect (a server launched by a harness that sets no variable Khipu
+    reads) is recorded as from an unknown harness."""
+    by = dict(author or {})
+    if by.get("harness") in (None, "", SHELL):
+        by["harness"] = UNKNOWN_HARNESS
+    with _for_a_conversation(), lock_budget(lock_wait):
+        written = _conversation_write(args, author=by, now=now)
+        out = {k: written[k] for k in _WRITE_FIELDS if k in written}
+        if written.get("account"):
+            out["account"] = account_id(written["account"])
+            out["label"] = _label_of(written["account"], accounts())
+        return out
+
+
+def _conversation_write(args: dict, *, author: dict, now: datetime | None = None) -> dict:
+    """A report, a hold or the end of a conversation's hold, and nothing
+    else. ``author`` is set by the caller from its own knowledge (the MCP
+    server's environment and folder), never from ``args``: an argument that
+    tries to say who wrote it, or what basis a time has, is refused. The
+    owner's changes (rules, the note, pauses, lifts, clears and dismissals)
+    are refused with a plain message."""
+    args = dict(args or {})
+    action = str(args.get("action") or "report").strip().lower().replace("-", "_")
+    if action in OWNER_ACTIONS:
+        raise RouteError(OWNER_REFUSAL.format(what=OWNER_ACTIONS[action]))
+    if action not in CONVERSATION_ACTIONS:
+        raise RouteError("action must be report, hold or end_hold (rules, the note, pauses and clears are "
+                         "the owner's)")
+    claimed = [k for k in _AUTHOR_ARGS if k in args]
+    if claimed:
+        raise RouteError(f"Khipu sets who wrote this and the basis of its times; it takes no {claimed[0]!r} from "
+                         "a conversation. An owner's hold is set in the app (Settings \u2192 Routing) or on a "
+                         "terminal.")
+    unknown = sorted(k for k in args if k not in _ACTION_ARGS[action])
+    if unknown:
+        raise RouteError(f"{action} takes no argument by that name; it takes: "
+                         + ", ".join(sorted(_ACTION_ARGS[action] - {"action"})))
+
+    def text(name: str) -> str | None:
+        value = args.get(name)
+        if value is None:
+            return None
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            raise RouteError(f"{name} must be text")
+        return str(value)
+
+    def account() -> str | None:
+        named = text("account")
+        return _account_for_a_conversation(named, accounts()) if named and named.strip() else None
+
+    by = dict(author)
+    name = text("name")
+    if name and _one_line(name):
+        by["name"] = _clean(name, NAME_MAX)
+    if action == "report":
+        state = (text("state") or "").strip().lower()
+        return report(state=state, account=account(), runner=text("runner"), lane=text("lane"),
+                      until=text("until"), window=text("window"), model=text("model"), message=text("message"),
+                      evidence=text("evidence"), seen=text("seen"), author=by, via="mcp", now=now)
+    if action == "hold":
+        scope = (text("scope") or ("account" if args.get("account") else "")).strip().lower()
+        return add_hold(text("text") or "", reason=(text("reason") or "").strip().lower(), scope=scope,
+                        account=account(), until=text("until"), owner=False, author=by, via="mcp", now=now)
+    hold_id = (text("hold_id") or "").strip()
+    if not hold_id:
+        raise RouteError("name the hold to end (hold_id, as khipu_route lists it)")
+    return end_hold(hold_id, owner=False, author=by, via="mcp", now=now)
+
+
+def light_status(now: datetime | None = None) -> dict:
+    """The ``routing`` field of ``khipu_status``'s light payload: the summary
+    a conversation gets at its start (``khipu route --summary``), for a
+    harness with no hooks. It waits for the routing lock only
+    ``LIGHT_LOCK_BUDGET``, well inside the time khipu_status gives it, so a
+    held lock still answers, from an unsaved fold."""
+    with lock_budget(LIGHT_LOCK_BUDGET):
+        now = now or _now()
+        view = read_view(now)
+        out = summary(view, now=now)
+    # The summary is the push: built from labels and names, with the
+    # owner's own words whole; it holds no key and no configured path.
+    return {"text": out["text"], "version": out["version"], "epoch": out["epoch"], "dropped": out["dropped"],
+            "about": ABOUT}
+
+
+# ---- khipu route wait --------------------------------------------------------------------
+
+WAIT_INTERVAL = 5.0
+CONFIRMING_SOURCES = ("probe", "check")
+
+
+def is_open(entry: dict | None, *, confirmed: bool = False) -> bool:
+    """Whether ``khipu route wait`` counts the account as open. Open, or
+    probably open (its limit's time has passed); with ``confirmed`` only
+    open as Khipu itself read it, by a usage probe or a reset check."""
+    if entry is None:
+        return False
+    if confirmed:
+        # Khipu's own read stands whichever open report is the witness now:
+        # the fold keeps it as ``confirmed_at`` while it is newer than every
+        # limit and not stale.
+        # A view saved before ``confirmed_at`` existed still counts its witness.
+        return entry["state"] == OPEN and bool(entry.get("confirmed_at") or (
+            "confirmed_at" not in entry and (entry.get("witness") or {}).get("source") in CONFIRMING_SOURCES))
+    return entry["state"] in (OPEN, PROBABLY_OPEN)
+
+
+def wait(account: str, *, confirmed: bool = False, timeout: float | None = None, interval: float = WAIT_INTERVAL,
+         sleep=time.sleep, clock=time.monotonic) -> dict:
+    """Wait until the record shows ``account`` open (``is_open``), reading
+    the view every ``interval`` seconds, at most ``timeout`` seconds (None:
+    no end; 0: check once). Each read waits for the routing lock no longer
+    than the time left, and answers from an unsaved fold when it runs out. It waits and reports; it launches, refuses and reorders
+    nothing, and each read starts no process."""
+    key = resolve_account(account)
+    start = clock()
+    while True:
+        now = _now()
+        left = None if timeout is None else timeout - (clock() - start)
+        with lock_budget(None if left is None else max(0.0, left)):
+            view = read_view(now)
+        entry = next((e for e in view["accounts"] if e["key"] == key), None)
+        line = account_line(entry, now, push=False) if entry else f"{_label_for_key(key)}: unknown: no report yet"
+        out = {"account": key, "state": entry["state"] if entry else UNKNOWN, "line": line,
+               "version": view["version"], "confirmed": confirmed}
+        if is_open(entry, confirmed=confirmed):
+            return dict(out, ok=True, open=True)
+        left = None if timeout is None else timeout - (clock() - start)
+        if left is not None and left <= 0:
+            return dict(out, ok=False, open=False, timed_out=True)
+        sleep(max(0.0, min(interval, left)) if left is not None else interval)
+
+
 # ---- the CLI ---------------------------------------------------------------------------
 
 
@@ -2728,13 +3390,7 @@ def run_cli(args) -> int:
                     print(text["text"])
                 return 0
             if args.json:
-                out = dict(view, generated_at=_iso(now))
-                out["accounts"] = [dict(e, line=account_line(e, now, push=False)) for e in view["accounts"]
-                                   if account is None or e["key"] == account]
-                out.pop("fingerprint", None)
-                out.pop("digest", None)
-                out.pop("source_cache", None)
-                _print_json(out)
+                _print_json(public_view(view, now, account))
             else:
                 _print_view(view, now, account)
             return 0
@@ -2745,6 +3401,21 @@ def run_cli(args) -> int:
             else:
                 _print_sources(out, now)
             return 0
+        if cmd == "wait":
+            timeout = None
+            if args.timeout is not None:
+                try:
+                    timeout = parse_duration(args.timeout)
+                except ValueError as err:
+                    raise RouteError(f"--timeout: {err}") from None
+            out = wait(args.account, confirmed=bool(args.confirmed), timeout=timeout)
+            if getattr(args, "json", False):
+                _print_json(out)
+            elif out["open"]:
+                print(out["line"])
+            else:
+                print(f"Still not open after the timeout. {out['line']}")
+            return 0 if out["open"] else 1
         if cmd == "report":
             out = report(state=args.state, account=args.account, runner=args.runner, lane=args.lane,
                          until=args.until, window=args.window, model=args.model, message=args.message,

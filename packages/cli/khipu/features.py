@@ -82,6 +82,9 @@ _CAPABILITIES = (
     "reflect",
     "search.relevance_floor",
     "recall.daemon",
+    # Routing truth, phase 2: khipu_route, khipu_route_report and the
+    # `routing` field of khipu_status's light payload.
+    "routing",
 )
 
 

@@ -90,6 +90,9 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
   episode ids; cite the episodes, not the brief. `available: false` means off.
 - `khipu_reflect` answers one question from memory with each claim cited, or
   abstains. It calls a model: ask it for a synthesis, not a lookup.
+- `khipu_route` reads which accounts are open, limited, paused or down, with
+  the owner's rules and note: read it before handing work to another account.
+  `khipu_route_report` records a limit you hit. Khipu reports; you route.
 - Capture writes: on a local Mac with a Khipu capture hook (`khipu-stop-hook`
   or `khipu-aegis-capture`) the hook is the writer, not you — but `khipu_capture`
   works there too: call it (or `khipu capture now` in a shell) when you

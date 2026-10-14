@@ -111,6 +111,8 @@ class ProtocolTest(unittest.TestCase):
                 "khipu_brief",
                 "khipu_reflect",
                 "khipu_usage",
+                "khipu_route",
+                "khipu_route_report",
             },
         )
         for tool in out["result"]["tools"]:
@@ -832,7 +834,7 @@ class StatusLightPayloadTest(unittest.TestCase):
         self.assertEqual(
             set(out),
             {"hub_ok", "prior_work", "prior_work_text", "prior_work_meta", "notes_freshness",
-             "contract"},
+             "contract", "routing"},
         )
         self.assertNotIn("counts", out)
 

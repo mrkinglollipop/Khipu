@@ -26,7 +26,7 @@ can see and change all of it in the app. Khipu never decides where work goes.
 | 0 | This scope; the mocks of the Home Routing card and Settings → Routing; a throwaway-hook check of five hook facts | S | done 2026-10-14 (scope and mocks approved; hook check: five of five yes, see Phase 0 results) |
 | 1a | The record and its fold: event log, versioned view with clock-driven refolds, rules, Matt's note, holds, owner clear; `khipu route`; the doctor block | M | done 2026-10-14 (one known limit, see Known limits; its fix is in phase 1b) |
 | 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | built, in review (branch feat/routing-truth-1b) |
-| 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | open |
+| 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | built, in review (branch feat/routing-truth-2) |
 | 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | open |
 | 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | open |
 | 3c | The daemon refolds on change and on the clock; the promotion gate's replay covers routing | S | open |
@@ -442,13 +442,27 @@ at most three checks per reset: the first and two retries.
   set|end`, and `khipu route rule add|edit|retire|confirm`. They ask for a typed confirmation on a terminal
   and refuse without one.
 - `khipu route wait <account> [--confirmed] [--timeout S]` exits 0 when the account is open (with
-  `--confirmed`, only once a check has confirmed it). An orchestrator's relaunch script waits on the record
-  instead of a typed time that cannot move. It waits; it launches nothing.
+  `--confirmed`, only once a check has confirmed it: a usage probe or reset check that read it open after its
+  newest limit or down report, from any source, and is not stale, even when a newer open report from a conversation is now the witness). An
+  orchestrator's relaunch script waits on the record instead of a typed time that cannot move. It waits; it
+  launches nothing.
 - `khipu route sources` lists each registered runner folder with its last good read and any parse error.
 - MCP `khipu_route` reads the view, with optional `since` and `account`, and includes the words of holds and
   reports that the push leaves out. Its description ends "Khipu reports; routing stays with you", and it
   never returns a pick or a ranking. MCP `khipu_route_report` writes reports and holds only, takes its author
-  from the session, and refuses rules, the note, pauses and clears.
+  from the session, and refuses rules, the note, pauses and clears. Its answer and the light status's
+  `routing` field follow one policy: each is built from a projection that copies only named fields and never
+  holds an account key, a login folder, a runner folder or the table's path. An account is named by its label
+  and a stable opaque id (a short hash of its key), which both tools take back with the label; a since
+  entity names an account by that id; Khipu's own sentences use labels only; an error is a fixed message,
+  never an exception's text or a path. The owner's rules, note and hold words are shown word for word (a
+  path in them included); nothing is scrubbed out of an answer after it is built. A conversation's words
+  have each configured path cut to its last name once, before they are stored. A
+  conversation's words inside a line are shown in printable ASCII only: quotation marks become a straight
+  single quote, any other character is written as its escape (`\u02ee`), and "you", "owner" and "standing
+  rule" are marked as theirs ("[you]"), so no lookalike can close Khipu's quote or speak for the owner. A
+  conversation's project is its folder's name, and none when that folder is the home folder, one that holds
+  it, the root or a scratch folder.
 - `khipu_status`'s light payload gains a `routing` field holding the summary, so a harness without hooks
   gets it with a call it already makes. The recall rule and the MCP `instructions` gain one line, and
   `features.contract()` gains a `routing` capability.

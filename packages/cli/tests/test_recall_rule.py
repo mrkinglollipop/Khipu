@@ -369,12 +369,28 @@ class SliceBudgetTest(unittest.TestCase):
         self.assertEqual(out, lines)
 
 
+# Part 4 (mcp_server.py) of the Phase 2A brief set 5,200 characters. Routing
+# truth phase 2 (docs/plans/2026-10-14-routing-truth.md, Tools: "The recall
+# rule and the MCP instructions gain one line") added the khipu_route line,
+# about 230 characters, so the ceiling is 5,500: raised for that line, not
+# for growth in general.
+RULE_MD_CEILING = 5500
+
+
 class RuleMdCeilingTest(unittest.TestCase):
     """Part 4 (mcp_server.py) of the Phase 2A brief: "Keep its total length
-    under 5,200 characters and add a test for that ceiling.\""""
+    under 5,200 characters and add a test for that ceiling." (Raised by one
+    line for routing truth phase 2; see RULE_MD_CEILING.)"""
 
     def test_rule_md_stays_under_the_character_ceiling(self):
-        self.assertLess(len(rr.RULE_MD.strip()), 5200)
+        self.assertLess(len(rr.RULE_MD.strip()), RULE_MD_CEILING)
+
+    def test_it_carries_the_routing_line(self):
+        """Routing truth phase 2: the one line that tells every harness the
+        routing record exists, and that Khipu reports, never routes."""
+        self.assertIn("khipu_route", rr.RULE_MD)
+        self.assertIn("khipu_route_report", rr.RULE_MD)
+        self.assertIn("Khipu reports; you route.", rr.RULE_MD)
 
     def test_it_names_both_decisions_tools(self):
         self.assertIn("khipu_decisions", rr.RULE_MD)
