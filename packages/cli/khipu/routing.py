@@ -1203,25 +1203,51 @@ def _effective_account(entry: dict) -> dict:
             "last_seen": last["state"] if last else None}
 
 
-def _in_write_order(events: list[dict]) -> list[dict]:
-    """The log's lines with times that never run backwards: no line counts as
-    later than a line written after it. The log is in write order (one writer
-    at a time, under the lock) and a write takes the newest line's time only
-    when that is a little ahead of its clock (``_not_behind``), so a line
-    stamped further ahead (a clock that read ahead) is followed by earlier
-    times; it counts from the time of the next line, never as newer than an
-    owner's clear or a report written after it."""
-    out = list(events)
+def _write_order_times(times: list[datetime | None], now: datetime) -> tuple[list[datetime | None], list[datetime]]:
+    """The times of the log's lines made to run in write order, and the raw
+    times of lines that were far behind the line before them. The log is in
+    write order (one writer at a time, under the lock) and a write takes the
+    newest line's time only when that is a little ahead of its clock
+    (``_not_behind``), so when two lines are out of order the fold's clock
+    says which one is wrong:
+
+    - a line further ahead of ``now`` than ``CLOCK_TOLERANCE`` (a clock that
+      read ahead, a line appended by hand) is the wrong one: it counts from
+      the time of the line after it, never as newer than an owner's clear or
+      a report written after it;
+    - any other line behind the line before it (a Mac whose clock read behind
+      when it wrote, an old line copied back in) is the wrong one: it counts
+      from the time of the line before it, so one late, low time never ages
+      the history written before it."""
+    out = list(times)
     floor: datetime | None = None
     for i in range(len(out) - 1, -1, -1):
-        at = _parse(out[i].get("written_at"))
+        at = out[i]
         if at is None:
             continue
-        if floor is not None and at > floor:
-            out[i] = dict(out[i], written_at=_iso(floor))
-            at = floor
+        if floor is not None and at > floor and (at - now).total_seconds() > CLOCK_TOLERANCE:
+            out[i] = at = floor
         floor = at
-    return out
+    behind: list[datetime] = []
+    ceiling: datetime | None = None
+    for i, at in enumerate(out):
+        if at is None:
+            continue
+        if ceiling is not None and at < ceiling:
+            if (ceiling - at).total_seconds() > CLOCK_TOLERANCE:
+                behind.append(at)
+            out[i] = at = ceiling
+        ceiling = at
+    return out, behind
+
+
+def _in_write_order(events: list[dict], now: datetime) -> list[dict]:
+    """The log's lines with times that never run backwards: no line counts as
+    later than a line written after it (``_write_order_times``)."""
+    raw = [_parse(e.get("written_at")) for e in events]
+    fixed, _behind = _write_order_times(raw, now)
+    return [dict(e, written_at=_iso(f)) if f is not None and f != r else e
+            for e, r, f in zip(events, raw, fixed)]
 
 
 def _lane_mapped(runner, lane, lane_map: dict) -> bool:
@@ -1236,7 +1262,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     process, calls no model."""
     lane_map = cfg.get("routing_lane_map") or {}
     stale_after = cfg["routing_stale_after"]
-    events = _in_write_order(events)
+    events = _in_write_order(events, now)
     evidence: list[dict] = []
     owner: dict[str, Any] = {"pauses": {}, "lifts": {}, "clears": {}, "dismissed": set()}
     dismissals: list[dict] = []
@@ -2217,6 +2243,12 @@ def doctor_block(now: datetime | None = None) -> dict:
     if newest is not None and (newest - now).total_seconds() > CLOCK_TOLERANCE:
         warnings.append(f"The routing record holds times ahead of this Mac's clock (as late as "
                         f"{_iso(newest)}); Khipu goes by the clock. Check the Mac's date and time.")
+    _fixed, behind = _write_order_times([_parse(e.get("written_at")) for e in events], now)
+    if behind:
+        warnings.append(f"The routing record holds {len(behind)} line{'s' if len(behind) != 1 else ''} dated well "
+                        f"before the line written just before {'them' if len(behind) != 1 else 'it'} (as early as "
+                        f"{_iso(min(behind))}); Khipu counts each from the line before it. Check the date and time "
+                        f"on the Mac that wrote {'them' if len(behind) != 1 else 'it'}.")
     return {"record": bool(view.get("record")), "version": view["version"], "folded_at": view.get("folded_at"),
             "valid_until": view.get("valid_until"),
             "accounts": [{"account": e["label"], "state": e["state"], "until": e["until"], "basis": e["basis"],

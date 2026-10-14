@@ -1405,3 +1405,59 @@ def test_a_clock_reset_time_is_the_messages_own_only_with_when_it_was_seen(home,
                         (["--message", message, "--seen", "20"], "needs a unit")):
         rc, text = _cli(["route", "report", "--account", "Codex", "--state", "limited", *argv], capsys)
         assert rc == 2 and words in json.loads(text)["error"], argv
+
+
+# ---- fix round 5 ---------------------------------------------------------------------------
+
+
+def test_a_line_dated_behind_the_clock_neither_ages_the_record_nor_brings_holds_due(home):
+    # R4-1: the fold pulled every earlier line down to a late, low time (a Mac
+    # whose clock read 2001 when it wrote), so a report ten minutes old showed
+    # as 9417 days old and the owner's hold came due for its reminder, with
+    # no warning from doctor.
+    _report(account="Claude", state="open")
+    routing.add_hold("keep Codex", reason="keep", scope="account", account="Codex", owner=True, via="app")
+    home["clock"].now = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    _report(account="Muse", state="open", author=OTHER)
+    home["clock"].now = T0 + timedelta(minutes=10)
+    view = routing.read_view()
+    assert _account(view, "claude|")["state"] == "open"
+    assert _account(view, "muse|")["state"] == "open"
+    assert view["holds"][0]["remind"] is False
+    assert any("dated well before" in w for w in routing.doctor_block()["warnings"])
+
+
+def test_a_line_dated_at_the_start_of_time_neither_stops_nor_ages_the_fold(home):
+    # R4-1: the year-1 twin of the end-of-time test.
+    _report(account="Claude", state="open")
+    routing.add_hold("keep all", reason="keep", scope="all", owner=True, via="app")
+    with open(routing.events_file(), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "evidence", "id": "e0001", "source": "report", "state": "open",
+                             "account": "codex|", "written_by": ME, "via": "cli",
+                             "written_at": "0001-01-01T00:00:00Z"}) + "\n")
+    home["clock"].advance(minutes=10)
+    view = routing.read_view()
+    assert view["bad_lines"] == 0
+    assert _account(view, "claude|")["state"] == "open" and _account(view, "codex|")["state"] == "open"
+    assert view["holds"][0]["remind"] is False
+    warnings = routing.doctor_block()["warnings"]
+    assert any("dated well before" in w for w in warnings)
+    assert not any("ahead of this Mac's clock" in w for w in warnings)
+    _report(account="Muse", state="open")
+    assert _account(routing.read_view(), "muse|")["state"] == "open"
+
+
+def test_the_fold_lifts_a_low_line_and_pulls_back_only_a_line_ahead_of_its_clock():
+    # R4-1, the pure fold: a line ahead of the fold's clock still counts from
+    # the line after it; a line behind the one before it counts from that one.
+    now = T0 + timedelta(minutes=10)
+    first = _ev(1, "open", T0)
+    ahead = _ev(2, "limited", datetime(9999, 12, 31, tzinfo=timezone.utc), basis="cli",
+                until=datetime(9999, 12, 31, 1, tzinfo=timezone.utc))
+    low = _ev(3, "open", datetime(2001, 1, 1, tzinfo=timezone.utc), "probe")
+    entry = _state([first, ahead, low], now)
+    assert entry["state"] == "open" and entry["witness"]["id"] == "e3"
+    assert entry["witness"]["at"] == routing._iso(T0)
+    assert _state([first, low], now)["witness"]["at"] == routing._iso(T0)
+    ordered = routing._in_write_order([first, ahead, low], now)
+    assert [e["written_at"] for e in ordered] == [routing._iso(T0)] * 3
