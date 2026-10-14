@@ -67,10 +67,10 @@ def default_golden_path() -> Path:
     # never in the public repo. KHIPU_RECALL_GOLDEN overrides for CI/soak.
     import os
 
-    from khipu.paths import data_dir
+    from khipu.paths import data_dir, isolated_dir
 
     env = os.environ.get("KHIPU_RECALL_GOLDEN")
-    return Path(env) if env else data_dir() / "recall-golden.jsonl"
+    return Path(env) if env and isolated_dir() is None else data_dir() / "recall-golden.jsonl"
 
 
 def load_golden(path: Path) -> list[dict[str, Any]]:

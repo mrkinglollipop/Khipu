@@ -153,8 +153,19 @@ def _repo_root() -> Path:
     return repo_root()
 
 
-def _bundled_python() -> Path:
-    root = _repo_root()
+def _install_root() -> Path:
+    """The root a rendered plist points at: the promoted live checkout
+    (``~/.config/khipu/live``, see khipu.promote) when that link exists, else
+    the checkout this code runs from, exactly as before. The link path itself
+    is rendered, not its target, so a promotion that flips the link needs no
+    re-render."""
+    from khipu.promote import live_root
+
+    return live_root() or _repo_root()
+
+
+def _bundled_python(root: Path | None = None) -> Path:
+    root = _install_root() if root is None else root
     for rel in (
         "python/bin/python3.11",
         "python/bin/python3",
@@ -165,13 +176,25 @@ def _bundled_python() -> Path:
     return Path(shutil.which("python3.11") or shutil.which("python3") or "python3")
 
 
-def render_context() -> dict[str, str]:
-    root = _repo_root()
+def render_context(root: Path | None = None) -> dict[str, str]:
+    """The values every template is rendered with. ``root`` defaults to
+    ``_install_root()``; the promotion gate passes a candidate slot to see the
+    environment a job would get from it."""
+    explicit = root is not None
+    root = Path(root) if explicit else _install_root()
     cli = root / "packages" / "cli"
     lib = root / "lib"
     pythonpath_parts = [str(cli)]
     if lib.is_dir():
         pythonpath_parts.append(str(lib))
+    # A promoted live root (the ``live`` link or a slot) carries the vendored
+    # libs at ``<root>/.python_libs``, where the launchers look for them. Other
+    # roots render exactly as before.
+    from khipu.promote import is_promotion_root
+
+    own = root / ".python_libs"
+    if own.is_dir() and is_promotion_root(root):
+        pythonpath_parts.append(str(own))
     legacy = root.parent / ".python_libs"
     if legacy.is_dir():
         pythonpath_parts.append(str(legacy))
@@ -188,7 +211,7 @@ def render_context() -> dict[str, str]:
     pycache.mkdir(parents=True, exist_ok=True)
     return {
         "KHIPU_ROOT": str(root),
-        "KHIPU_PYTHON": str(_bundled_python()),
+        "KHIPU_PYTHON": str(_bundled_python(root) if explicit else _bundled_python()),
         "PYTHONPATH": ":".join(pythonpath_parts),
         "WORKING_DIRECTORY": str(support),
         "PYTHONPYCACHEPREFIX": str(pycache),

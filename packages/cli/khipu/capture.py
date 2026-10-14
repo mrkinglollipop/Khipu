@@ -813,6 +813,13 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
+    from khipu.paths import isolated_dir
+
+    if isolated_dir() is not None:
+        # The promotion gate's capture: the hub row is the thing under test,
+        # and the live file wiki must not gain (or later lose) its line.
+        _log("isolated run (KHIPU_ISOLATED_DIR): file wiki leg skipped")
+        return 0
     capture_v2 = _capture_v2()
     if capture_v2 is None:
         _log("capture_v2 not configured (khipu config --set capture_v2 PATH); "

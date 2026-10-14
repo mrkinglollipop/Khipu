@@ -61,7 +61,7 @@ if [ -d "$ROOT/lib" ] && [ -x "$ROOT/python/bin/python3.11" ]; then
   PYTHONPATH="$ROOT/packages/cli:$ROOT/lib${PYTHONPATH:+:$PYTHONPATH}"
 fi
 export PYTHONPATH
-mkdir -p "${HOME}/Library/Logs/khipu" 2>/dev/null
+[ -n "${KHIPU_ISOLATED_DIR:-}" ] || mkdir -p "${HOME}/Library/Logs/khipu" 2>/dev/null
 # Bytecode cache goes OUTSIDE any signed .app bundle — see khipu.paths.pycache_dir.
 PYTHONPYCACHEPREFIX="${HOME}/Library/Caches/Khipu/pycache"
 mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null

@@ -84,9 +84,11 @@ def enabled() -> bool:
     return os.environ.get("KHIPU_REDACT_SECRETS", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
-def redact_secrets(text: str) -> tuple[str, int]:
-    """Return (redacted text, number of replacements). Idempotent."""
-    if not text or not enabled():
+def redact_secrets(text: str, *, force: bool = False) -> tuple[str, int]:
+    """Return (redacted text, number of replacements). Idempotent.
+    ``force`` masks even when ``KHIPU_REDACT_SECRETS`` turns masking off (the
+    promotion gate's replay, which sends logged queries to a subprocess)."""
+    if not text or not (force or enabled()):
         return text or "", 0
     total = 0
     out = text

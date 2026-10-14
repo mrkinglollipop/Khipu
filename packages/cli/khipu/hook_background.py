@@ -100,11 +100,19 @@ def _drain(sid: str, harness: str) -> None:
 
 def run(mem_root: str, harness: str, sid: str) -> None:
     """Drain, mirror, replay the outbox, reconcile notes, catch up embeddings.
-    Every step fails open and is logged with the session id."""
+    Every step fails open and is logged with the session id.
+
+    The promotion gate's own capture (``KHIPU_GATE=1``, khipu.promote) drains
+    its isolated queue and stops there: the mirror, the outbox replay, the
+    notes reconcile and the embed catch-up all act on live state that is not
+    the gate's."""
     try:
         _drain(sid, harness)
     except Exception as e:  # noqa: BLE001 — fail-open, always
         _say(sid, harness, f"drain skipped: {type(e).__name__}: {e}")
+    if os.environ.get("KHIPU_GATE") == "1":
+        _say(sid, harness, "gate run: mirror, outbox drain, notes-reconcile and embed catch-up skipped")
+        return
     try:
         from khipu.config import path_setting
         from khipu.mirror import sync_recent_episodes

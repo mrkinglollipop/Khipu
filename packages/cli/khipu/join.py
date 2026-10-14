@@ -240,6 +240,9 @@ def write_kit_file(path: Path, blob: bytes) -> Path:
 
 def write_private_file(path: Path, data: bytes) -> Path:
     """Atomically replace a secret file without a permissive creation window."""
+    from khipu.paths import refuse_if_isolated
+
+    refuse_if_isolated(str(path))
     dest = Path(path).expanduser()
     dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".tmp", dir=dest.parent)

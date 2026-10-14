@@ -49,7 +49,18 @@ def get_password(account: str, *, service: str = SERVICE) -> str | None:
     return val or None
 
 
+def _may_migrate() -> bool:
+    """Legacy-secret migration writes the live Keychain and config dir; an
+    isolated run (``KHIPU_ISOLATED_DIR``) only reads."""
+    from khipu.paths import isolated_dir
+
+    return isolated_dir() is None
+
+
 def set_password(account: str, password: str, *, service: str = SERVICE) -> None:
+    from khipu.paths import refuse_if_isolated
+
+    refuse_if_isolated(f"Keychain item {account}")
     if not keychain_available():
         raise RuntimeError("macOS security(1) unavailable or KHIPU_KEYCHAIN=0")
     if "\n" in password or "\r" in password:
@@ -82,6 +93,8 @@ def migrate_legacy_secrets() -> dict:
         "gemini_migrated": False,
         "config_dir_migrated": False,
     }
+    if not _may_migrate():
+        return report
     if keychain_available():
         for account, flag in (
             (DSN_ACCOUNT, "dsn_migrated"),
@@ -112,10 +125,11 @@ def get_dsn() -> str | None:
         return val
     legacy = get_password(DSN_ACCOUNT, service=LEGACY_SERVICE)
     if legacy:
-        try:
-            set_password(DSN_ACCOUNT, legacy)
-        except Exception:
-            pass
+        if _may_migrate():
+            try:
+                set_password(DSN_ACCOUNT, legacy)
+            except Exception:
+                pass
         return legacy
     return None
 
@@ -130,10 +144,11 @@ def get_gemini_key() -> str | None:
         return val
     legacy = get_password(GEMINI_ACCOUNT, service=LEGACY_SERVICE)
     if legacy:
-        try:
-            set_password(GEMINI_ACCOUNT, legacy)
-        except Exception:
-            pass
+        if _may_migrate():
+            try:
+                set_password(GEMINI_ACCOUNT, legacy)
+            except Exception:
+                pass
         return legacy
     return None
 
@@ -292,9 +307,9 @@ def dsn_file_health(path: Path | None = None) -> dict:
     from urllib.parse import parse_qs, unquote, urlsplit
 
     if path is None:
-        from khipu.paths import data_dir
+        from khipu.paths import credential_dir
 
-        path = data_dir() / "dsn"
+        path = credential_dir() / "dsn"
     out: dict[str, object] = {"path": str(path), "present": path.is_file(), "ok": True,
                               "reasons": []}
     if not path.is_file():

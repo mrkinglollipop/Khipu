@@ -37,6 +37,11 @@ def _live_graph() -> Path | None:
 
 
 def _default_snapshot_dir() -> Path:
+    from khipu.paths import isolated_dir
+
+    isolated = isolated_dir()
+    if isolated is not None:
+        return isolated / "backups" / "graph"
     raw = (os.environ.get("KHIPU_GRAPH_SNAPSHOT_DIR") or "").strip()
     if raw:
         return Path(raw)

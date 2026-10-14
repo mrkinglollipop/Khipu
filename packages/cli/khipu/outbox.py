@@ -47,10 +47,14 @@ def _log(msg: str) -> None:
 
 
 def outbox_dir() -> Path:
+    from khipu.paths import data_dir, isolated_dir
+
+    isolated = isolated_dir()
+    if isolated is not None:
+        return isolated / "outbox"
     env = os.environ.get("KHIPU_OUTBOX")
     if env:
         return Path(env)
-    from khipu.paths import data_dir
 
     return data_dir() / "outbox"
 
