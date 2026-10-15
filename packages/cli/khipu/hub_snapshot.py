@@ -37,6 +37,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
+from khipu.text_pages import (
+    PAGE_BYTES_DEFAULT,
+    db_start,
+    fetch_bytes,
+    page_args,
+    page_utf8,
+)
+
 # psycopg is imported where the hub is actually reached: the per-prompt hook
 # reads only the sqlite replica, and the driver's import (200-450 ms on a busy
 # machine) used to land inside that hook's wall-clock limit.
@@ -2389,29 +2397,43 @@ def episode_detail_snapshot(episode_id: int) -> dict[str, Any] | None:
     }
 
 
-def topic_detail_snapshot(slug: str) -> dict[str, Any] | None:
+def topic_detail_snapshot(slug: str, *, offset: int = 0,
+                          max_bytes: int = PAGE_BYTES_DEFAULT) -> dict[str, Any] | None:
+    """The replica's answer to ``activity.topic_detail``: same arguments, same
+    page and fields. Only the page's bytes are read from the blob."""
     slug = (slug or "").strip()
     if not slug:
         return None
+    offset, max_bytes = page_args(offset, max_bytes)
     con = open_snapshot()
+    # A replica written before content_hash was exported has no such column.
+    hash_col = (
+        "content_hash" if "content_hash" in _snapshot_table_columns(con, "topics")
+        else "NULL"
+    )
     row = con.execute(
-        """
-        SELECT slug, title, body, status, created_at, updated_at, links, source_path
+        f"""
+        SELECT slug, title,
+               substr(CAST(body AS BLOB), ?, ?), length(CAST(body AS BLOB)),
+               status, created_at, updated_at, links, source_path, {hash_col}
         FROM topics WHERE slug = ? AND deleted_at IS NULL
         """,
-        (slug,),
+        (db_start(offset), fetch_bytes(max_bytes), slug),
     ).fetchone()
     if not row:
         return None
+    page = page_utf8(row[2], offset, max_bytes, row[3])
     return {
+        "id": row[0],
         "slug": row[0],
         "title": row[1],
-        "body": row[2],
-        "status": row[3],
-        "created_at": row[4],
-        "updated_at": row[5],
-        "links": json.loads(row[6] or "[]"),
-        "source_path": row[7],
+        "status": row[4],
+        "created_at": row[5],
+        "updated_at": row[6],
+        "links": json.loads(row[7] or "[]"),
+        "source_path": row[8],
+        "content_hash": row[9],
+        **page,
     }
 
 

@@ -370,18 +370,20 @@ class BoundsTest(unittest.TestCase):
         self.assertIn("frame too large", out[0]["error"]["message"])
         self.assertEqual(out[1]["id"], 9)
 
-    def test_large_records_retain_full_content_and_identity(self):
+    def test_large_episodes_retain_full_content_and_identity(self):
+        # Episodes do not page (their fields are capped at write time). Topic
+        # bodies page through the real hub and replica reads, followed to the
+        # end, in test_record_paging.py.
         for content in ("x" * 400000 + "THE_END", "漢" * 45000 + "末尾"):
-            for kind, field in (("topic", "body"), ("episode", "summary")):
-                row = {"id": 7, "slug": "big", field: content}
-                with self.subTest(kind=kind, content_length=len(content)), \
-                        mock.patch("khipu.activity." + kind + "_detail", return_value=row), \
-                        mock.patch("khipu.decisions.decision_states_for_episode", return_value={}):
-                    out = srv.handle_message(request("khipu_get", {"id": "7", "kind": kind}))
-                    self.assertFalse(out["result"]["isError"])
-                    body = json.loads(out["result"]["content"][0]["text"])
-                    self.assertEqual(body.get(field), content)
-                    self.assertEqual(body.get("id"), 7)
+            row = {"id": 7, "summary": content}
+            with self.subTest(content_length=len(content)), \
+                    mock.patch("khipu.activity.episode_detail", return_value=row), \
+                    mock.patch("khipu.decisions.decision_states_for_episode", return_value={}):
+                out = srv.handle_message(request("khipu_get", {"id": "7", "kind": "episode"}))
+                self.assertFalse(out["result"]["isError"])
+                body = json.loads(out["result"]["content"][0]["text"])
+                self.assertEqual(body.get("summary"), content)
+                self.assertEqual(body.get("id"), 7)
 
     def test_incomplete_body_timeout_releases_handler(self):
         h = handler()
