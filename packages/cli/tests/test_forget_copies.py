@@ -159,6 +159,18 @@ class ForgetCopiesTest(unittest.TestCase):
         self.assertFalse(out["complete"])
         self.assertEqual(self.located(out, backup)["state"], "unreadable")
 
+    def test_an_unlistable_root_reports_legacy_logs_not_checked(self):
+        """A searchable root can hide a rotated copy when names cannot list."""
+        self.put("episodes_2026.jsonl", [self.a])
+        self.root.chmod(0o311)
+        self.addCleanup(self.root.chmod, 0o755)
+        out = run_forget(self.world, 1, self.root)
+        self.assertFalse(out["complete"])
+        location = self.located(out, self.root)
+        self.assertEqual(location["place"], "legacy logs")
+        self.assertEqual(location["state"], "not checked")
+        self.assertIn("directory could not be listed", location["why"])
+
     def test_an_outbox_job_in_a_directory_that_denies_stat_keeps_the_forget_partial(self):
         job = self.root / "outbox" / "dead" / "capture.json"
         job.parent.mkdir(parents=True)

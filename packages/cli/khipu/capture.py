@@ -779,6 +779,26 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                 payload["project"] = _resolve_project_alias(cur, payload["project"]) or payload["project"]
             dedup = dedup_before_insert(cur, payload, source=source)
             if dedup["action"] in ("skip", "merge"):
+                # ``episode_sources`` deliberately retains the source key on
+                # a tombstoned row: a delayed outbox replay must find that
+                # tombstone instead of treating the missing live row as an
+                # invitation to insert it again. It is a terminal outcome,
+                # not an ordinary dedup skip, so callers can avoid every
+                # secondary persistence leg (legacy file, mirror, vectors).
+                cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
+                            (dedup.get("matched_episode"),))
+                matched = cur.fetchone()
+                target = matched[0] if matched else {}
+                if isinstance(target, dict) and target.get("deleted_at"):
+                    conn.commit()
+                    return {
+                        "episode_inserted": False,
+                        "topics_written": 0,
+                        "episode_id": dedup.get("matched_episode"),
+                        "source_key": source["source_key"],
+                        "dedup": dedup,
+                        "forgotten_source": True,
+                    }
                 # The job is done once this returns (the outbox deletes it),
                 # so this is the last chance to record its trusted owner. Only
                 # an identity match (an exact window, a window_id, or a receipt
@@ -1083,6 +1103,9 @@ def capture(payload: dict[str, Any], *, mode: str | None = None,
         stats = write_pg(payload)
         if result is not None:
             result.update(stats)
+        if stats.get("forgotten_source"):
+            _log("capture source belongs to a forgotten episode; skipping persistence legs")
+            return 0
     except CaptureIdentityConflict as exc:
         _log(str(exc))
         return EX_SOFTWARE

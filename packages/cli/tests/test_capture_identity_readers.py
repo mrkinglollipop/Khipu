@@ -178,6 +178,43 @@ class CaptureHandsTheIdOnTest(unittest.TestCase):
         self.assertEqual(out["replayed"], 1)
         self.assertEqual(seen, [9])
 
+    def test_exact_replay_of_a_forgotten_source_stops_before_every_writer(self):
+        """A queued pre-forget capture must not recreate any retained copy.
+
+        This deliberately uses the real ``write_pg`` against the source-table
+        fake, then enters through ``capture`` so the file and embedding legs
+        are part of the assertion as well.
+        """
+        payload = {"ts": "2026-10-15T00:00:00Z", "summary": "forgotten source",
+                   "harness": "codex", "session_id": "codex:gone",
+                   "transcript_range": "0:10"}
+        cur = _SourcesFakeCursor({1: {
+            "id": 1, "ts": payload["ts"], "summary": payload["summary"],
+            "session_id": payload["session_id"], "harness": payload["harness"],
+            "transcript_range": payload["transcript_range"], "topics": [],
+            "decisions": [], "preferences": [], "raw": dict(payload),
+            "deleted_at": "2026-10-15T00:01:00Z",
+        }})
+        source = ci.source_identity(dict(payload))
+        cur.sources[source["source_key"]] = {
+            "episode_id": 1, "role": "origin", "payload_sha256": source["payload_sha256"],
+        }
+        db._TABLE_COLUMNS_CACHE.clear()
+        self.addCleanup(db._TABLE_COLUMNS_CACHE.clear)
+        result = {}
+        with mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
+                mock.patch("khipu.config.path_setting", return_value=None), \
+                mock.patch("khipu.topic_graph.persist_capture_graph", return_value={}), \
+                mock.patch("khipu.capture.run_capture_v2", return_value=0) as file_mirror, \
+                mock.patch("khipu.mirror.mirror_episode") as replica_write_through, \
+                mock.patch("khipu.embed.embed_on_capture") as embed, \
+                mock.patch("khipu.t3.thread_for_session", return_value=None):
+            self.assertEqual(cap.capture(dict(payload), mode="dual", result=result), 0)
+        file_mirror.assert_not_called()
+        replica_write_through.assert_not_called()
+        embed.assert_not_called()
+        self.assertTrue(result["forgotten_source"])
+
 
 class EmbedOnCaptureByIdTest(unittest.TestCase):
     def _first_query(self, **kw):

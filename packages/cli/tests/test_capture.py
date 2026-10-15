@@ -380,6 +380,11 @@ class _EpisodesFakeCursor:
                     if e["ts"] == ts and hashlib.md5(e["summary"].encode()).hexdigest() == md]
             self._result = [(hits[0],)] if hits else []
             return
+        if s.startswith("SELECT to_jsonb(e) FROM episodes e WHERE id = %s"):
+            (target_id,) = params
+            episode = self.episodes.get(target_id)
+            self._result = [(episode,)] if episode else []
+            return
         if s.startswith("SELECT topics, decisions, preferences, people, raw, ts, summary"):
             (target_id,) = params
             e = self.episodes.get(target_id)
@@ -528,16 +533,12 @@ class WritePgOrchestrationTest(unittest.TestCase):
         }}
         cur = _EpisodesFakeCursor(existing)
         conn = _FakeConn(cur)
-        original_execute = cur.execute
+        original_refresh = cap._refresh_merged_episode
 
-        def execute(sql, params=None):
-            if sql.startswith("SELECT to_jsonb(e)"):
-                self.assertGreater(conn.commits, 0, "embedding must read committed target metadata")
-                cur._result = [(dict(cur.episodes[params[0]]),)]
-            else:
-                original_execute(sql, params)
+        def refresh_after_commit(cursor, episode_id):
+            self.assertGreater(conn.commits, 0, "embedding must read committed target metadata")
+            return original_refresh(cursor, episode_id)
 
-        cur.execute = execute
         payload = {
             "ts": "2026-09-03T00:02:00Z", "session_id": "claude_code:c631b166",
             "summary": "one conversation captured twice",
@@ -552,6 +553,7 @@ class WritePgOrchestrationTest(unittest.TestCase):
                 mock.patch("khipu.commitments.open_from_episode",
                            side_effect=lambda c, pl, eid: opened.append((pl, eid)) or 1), \
                 mock.patch("khipu.commitments.auto_close", return_value=0), \
+                mock.patch.object(cap, "_refresh_merged_episode", side_effect=refresh_after_commit), \
                 mock.patch.object(cap, "_reembed_merged_episode",
                                   side_effect=lambda ts, sm, m, episode_id=None:
                                   reembedded.append((ts, sm, m, episode_id))), \

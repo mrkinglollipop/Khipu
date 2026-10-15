@@ -511,37 +511,48 @@ INCOMPLETE_STATES = frozenset(LOCATION_STATES[:4])
 
 def legacy_locations(memory_root: Path) -> list[tuple[str, Path]]:
     """Every file under the memory root that can hold a copy of a legacy line,
-    as (place, path): each active log ``drift.episode_files`` knows (rotated
-    years included), ``.bak`` copies beside them, retained forget backups, and
-    temporary files a crashed rewrite left behind."""
-    from khipu.drift import episode_files
+    as (place, path): each active log (rotated years included), ``.bak``
+    copy beside them, retained forget backups, and temporary files a crashed
+    rewrite left behind. Listing errors deliberately escape: the caller turns
+    them into a named ``not checked`` location rather than silently treating
+    an unreadable directory as empty."""
 
     root = Path(memory_root)
-    out = [("legacy log", path) for path in episode_files(root)]
-    listed = {path for _place, path in out}
+    with os.scandir(root) as listing:
+        names = sorted(entry.name for entry in listing)
+    out: list[tuple[str, Path]] = []
     # Any other file named like a log is a copy someone made (.bak, .orig, ~),
     # and a scrub writes its temp as ".<name>.tmp" beside it.
-    for path in sorted([*root.glob("episodes*"), *root.glob(".episodes*")]):
-        if path in listed or not _present_file(path):
+    for name in names:
+        if not (name.startswith("episodes") or name.startswith(".episodes")):
+            continue
+        path = root / name
+        if not _present_file(path):
             continue
         if path.name.endswith(".tmp"):
             out.append(("temporary file", path))
         elif path.name == "episodes.jsonl" or (
                 path.name.startswith("episodes_") and path.suffix == ".jsonl"
                 and ".bak" not in path.name):
-            # An active log drift could not stat: listed so its read fails loudly.
+            # An active log whose entry could not be stat'ed is still listed,
+            # so its read fails loudly rather than hiding a possible copy.
             out.append(("legacy log", path))
         else:
             out.append(("legacy copy", path))
     backup_dir = root / BACKUP_DIR
-    if backup_dir.is_dir():
-        for path in sorted(backup_dir.iterdir()):
-            if not _present_file(path):
-                continue
-            if not path.name.startswith("."):
-                out.append(("forget backup", path))
-            elif path.name.endswith(".tmp"):
-                out.append(("temporary file", path))
+    try:
+        with os.scandir(backup_dir) as listing:
+            backup_names = sorted(entry.name for entry in listing)
+    except FileNotFoundError:
+        backup_names = []
+    for name in backup_names:
+        path = backup_dir / name
+        if not _present_file(path):
+            continue
+        if not path.name.startswith("."):
+            out.append(("forget backup", path))
+        elif path.name.endswith(".tmp"):
+            out.append(("temporary file", path))
     return out
 
 
@@ -655,8 +666,15 @@ def _legacy_pass(root: Path, ts_iso: str | None, summary_md5: str | None) -> dic
     try:
         places = legacy_locations(root)
     except OSError as exc:
+        failed = Path(exc.filename) if exc.filename else root
+        is_backup_dir = failed == root / BACKUP_DIR
+        place = "forget backups" if is_backup_dir else "legacy logs"
+        why = f"{place} directory could not be listed: {type(exc).__name__}"
         return {**out, "reason": f"unreadable: {exc}",
-                "backups": {"ok": False, "removed": 0, "remaining": [str(root)]}, "locations": []}
+                "backups": {"ok": not is_backup_dir, "removed": 0,
+                            "remaining": [str(failed)] if is_backup_dir else []},
+                "locations": [{"place": place, "path": str(failed),
+                               "state": "not checked", "why": why}]}
     if not any(path == main for _place, path in places):
         out["reason"] = "no legacy file"
     temps = []
