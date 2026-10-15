@@ -1798,6 +1798,30 @@ def test_an_older_full_summary_never_moves_the_marker_back(home):
     assert _marker() == {"version": 1, "epoch": "e2", "full_at": earlier}
 
 
+def test_a_full_summary_resets_a_marker_ahead_of_the_record(home, monkeypatch):
+    """Adversarial review of the no-rewind rule: a marker ahead of the record
+    in its own epoch (a view.json restored from a backup) gets the full
+    summary, "the record's count started again"; refusing to move the
+    marker back made every later prompt send it again. A full summary read
+    against this very marker sets it back; one read against an older marker
+    (a newer block delivered since) does not."""
+    _record()
+    _push_on(monkeypatch)
+    view = routing.read_view()
+    ahead = {"version": view["version"] + 5, "epoch": view["epoch"], "full_at": routing._iso(T0)}
+    assert recall_prompt._update_routing_marker(SESSION, lambda _old: dict(ahead), 0.05)
+    assert "## Routing" in _cold(monkeypatch)
+    assert _last_log().endswith(" routing=full")
+    assert _marker()["version"] == view["version"]
+    assert "## Routing" not in _cold(monkeypatch)  # heard: not sent again
+    assert _last_log().endswith(" routing=none")
+    # Read against version 2, delivered after version 3 was heard: kept at 3.
+    assert recall_prompt._update_routing_marker(SESSION, lambda _old: dict(ahead, version=3), 0.05)
+    assert recall_prompt.mark_routing_seen(SESSION, version=2, epoch=view["epoch"],
+                                           full_at=routing._iso(T0), based_on=2)
+    assert _marker()["version"] == 3
+
+
 def test_a_pipe_that_never_stops_is_drained_only_briefly(home):
     """Finding R5-3: a continuously readable pipe kept the drain loop going."""
     read_fd, write_fd = os.pipe()

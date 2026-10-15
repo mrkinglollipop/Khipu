@@ -1142,6 +1142,16 @@ def _lock():
 # ---- after a flip ------------------------------------------------------------
 
 
+def _before_flip() -> dict[str, Any] | None:
+    """Compile the code still live through the ``live`` link, just before
+    the flip. A cache written before checked-hash bytecode (timestamp pycs)
+    would otherwise serve the old slot's code to hooks between the flip and
+    ``_after_flip``'s compile, wherever a file kept its size and mtime second.
+    Rewritten checked-hash, each one is checked against the new source."""
+    live = live_root()
+    return precompile(live) if live is not None else None
+
+
 def _after_flip() -> dict[str, Any]:
     """Re-render any plist the new live code renders differently, then
     restart the two long-running jobs that hold the old modules."""
@@ -1210,6 +1220,7 @@ def promote(ref: str = "origin/main") -> dict[str, Any]:
             return record({**entry, "ok": False, "failed_step": failed["step"],
                            "error": f"{failed['step']}: {failed['detail']}",
                            "ms": round((time.monotonic() - t0) * 1000)})
+        entry["precompile_live"] = _before_flip()
         flipped = flip(slot)
         if not flipped["ok"]:
             return record({**entry, "ok": False, "error": f"flip: {flipped['error']}",
@@ -1247,6 +1258,7 @@ def rollback() -> dict[str, Any]:
                                "error": f"could not put {target.name} back on {known[:12]}: {_tail(r.stderr)}"})
             entry["restored"] = known
         entry["commit"] = known
+        entry["precompile_live"] = _before_flip()
         flipped = flip(target)
         if not flipped["ok"]:
             return record({**entry, "ok": False, "error": f"flip: {flipped['error']}"})

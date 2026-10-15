@@ -244,20 +244,23 @@ def mark_routing_full(session_id: str, *, version: int, epoch: str | None, at: s
 
 
 def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_at: str | None = None,
-                      unrefreshed: str | None = None, wait: float = 0.05) -> bool:
+                      unrefreshed: str | None = None, based_on=None, wait: float = 0.05) -> bool:
     """Move the session's last-seen routing version to ``version`` once a
     block was delivered (routing truth, phases 3a and 3b). With ``full_at``
     the marker starts again from a full summary; otherwise only the version
     moves. Within one epoch nothing moves back (two prompts of one session
     delivered out of order): a full summary older than what was heard
-    leaves the marker as it is. ``unrefreshed`` records that the not-refreshed
+    leaves the marker as it is. One exception: a full summary read against
+    this very marker (``based_on``, the version its child read, and nothing
+    delivered since) sets a version ahead of the record back to it (the
+    record's count started again, as after a restored view.json). ``unrefreshed`` records that the not-refreshed
     line for that read was said. Waits for the session's lock at most
     ``wait``; a busy lock or a failed write records nothing (the block is
     sent again) and is never raised."""
     def change(old: dict) -> dict:
         if full_at is not None:
             if old.get("epoch") == epoch and isinstance(old.get("version"), int) and (
-                    old["version"] > version
+                    (old["version"] > version and not (based_on is not None and old["version"] == based_on))
                     or (old["version"] == version and _later(old.get("full_at"), full_at))):
                 return old  # a later block was heard first: an older full summary moves nothing back
             new = {"version": version, "epoch": epoch, "full_at": full_at}
@@ -470,6 +473,7 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
                                                 "generation")}
                 if isinstance(answer["text"], str) and len(answer["text"]) > _ROUTING_TEXT_MOST:
                     answer["text"] = answer["text"][:_ROUTING_TEXT_MOST]
+                answer["seen"] = marker.get("version")  # what the marker was when this answer was read
                 answer["pointer_said"] = marker.get("pointer") == {"version": out.get("version"),
                                                                    "epoch": out.get("epoch")}
                 answer["at"] = routing._iso(routing._now())
@@ -1656,7 +1660,7 @@ class _RoutingAtPrompt:
         if recall_rule._utf16_len(combined) <= recall_rule._HOOK_CONTEXT_BUDGET:
             pending = {"session": self.session, "version": out["version"], "epoch": out.get("epoch"),
                        "full": out["kind"] == "full", "unrefreshed": out.get("unrefreshed"),
-                       "at": out.get("at")}
+                       "at": out.get("at"), "based_on": out.get("seen")}
             return combined, {"status": label, "pending": pending}
         # Too long to go with this prompt. The block is not delivered, so the
         # session's last-seen version does not move and a later prompt with
@@ -1687,7 +1691,8 @@ def _routing_delivered(info: dict | None, delivered: bool) -> str:
             # The child's clock when it read (this process never imports routing).
             full_at = pending.get("at") if pending["full"] else None
             if not mark_routing_seen(pending["session"], version=pending["version"], epoch=pending["epoch"],
-                                     full_at=full_at, unrefreshed=pending.get("unrefreshed")):
+                                     full_at=full_at, unrefreshed=pending.get("unrefreshed"),
+                                     based_on=pending.get("based_on") if pending["full"] else None):
                 status = f"{status}:unmarked"
     return f" routing={status}"
 
