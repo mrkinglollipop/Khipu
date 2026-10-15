@@ -552,17 +552,99 @@ def _parse_events(data: bytes, now: datetime, limits: dict[str, datetime] | None
             lane = safe_name(fields.get("lane"))
             if lane and now - at <= LAUNCH_KEEP:
                 out["LAUNCH"].append({"at": _iso(at), "pipeline": pipeline, "lane": lane})
-    # ADDED lines the cap drops are counted: the privacy check judges only
-    # the lines kept, so it says it was not fully checked.
-    added_dropped = 0
     for kind, cap in dict(KEEP_LINES, **(keep or {})).items():
         if cap:
-            if kind == "ADDED":
-                added_dropped = max(len(out[kind]) - cap, 0)
             out[kind] = out[kind][-cap:]
     return {"limited_lines": out["LIMITED"], "added": out["ADDED"], "launches": out["LAUNCH"],
-            "holds": holds, "first": _iso(first), **({"added_dropped": added_dropped} if added_dropped else {}),
+            "holds": holds, "first": _iso(first),
             "matched": {lane: {"until": _iso(limits[lane]), "at": _iso(at)} for lane, at in matched.items()}}
+
+
+# The privacy check reads the whole events log, not its tail: once from the
+# start, a chunk per refresh, then only what was added. The cursor names the
+# file (device and inode), how far it has read, and a hash of its start (a
+# file rewritten in place); the private ADDED lines found are kept with it.
+SCAN_CHUNK = 2 * 1024 * 1024
+SCAN_HEAD = 4096
+PRIVATE_MAX = 5000
+
+
+def _read_range(path: Path, start: int, length: int) -> bytes:
+    """``length`` bytes of one runner file from ``start``, opened as
+    ``read_only`` opens it."""
+    if private_path(path):
+        raise PermissionError("inside a private folder")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        os.lseek(fd, start, os.SEEK_SET)
+        chunks, got = [], 0
+        while got < length:
+            chunk = os.read(fd, min(65536, length - got))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _valid_cursor(cursor, st) -> bool:
+    return (isinstance(cursor, dict) and cursor.get("dev") == st.st_dev and cursor.get("ino") == st.st_ino
+            and type(cursor.get("offset")) is int and 0 <= cursor["offset"] <= st.st_size
+            and isinstance(cursor.get("head"), str) and isinstance(cursor.get("private"), list)
+            and type(cursor.get("lines")) is int and type(cursor.get("dropped")) is int)
+
+
+def _head_hash(path: Path, upto: int) -> str:
+    return hashlib.sha256(_read_range(path, 0, min(upto, SCAN_HEAD))).hexdigest()
+
+
+def scan_events(path: Path, cursor, now: datetime) -> dict:
+    """One step of the privacy check's read of the whole events log: from the
+    cursor to at most ``SCAN_CHUNK`` bytes on, whole lines only. A missing or
+    damaged cursor, another file at the path (``rotated``), a file shorter
+    than what was read (``truncated``) or one whose start changed
+    (``rewritten``) starts again from the first byte and forgets what it
+    held. ``done`` once it has read up to the end of the file."""
+    st = os.stat(path)
+    reset = None
+    if not isinstance(cursor, dict):
+        reset = "new" if cursor is None else "damaged"
+    elif (cursor.get("dev"), cursor.get("ino")) != (st.st_dev, st.st_ino):
+        reset = "rotated"
+    elif type(cursor.get("offset")) is int and cursor["offset"] > st.st_size:
+        reset = "truncated"
+    elif not _valid_cursor(cursor, st):
+        reset = "damaged"
+    elif cursor["offset"] and _head_hash(path, cursor["offset"]) != cursor["head"]:
+        reset = "rewritten"
+    if reset:
+        cursor = {"dev": st.st_dev, "ino": st.st_ino, "offset": 0, "head": "", "private": [], "lines": 0,
+                  "dropped": 0}
+    start = cursor["offset"]
+    want = min(SCAN_CHUNK, st.st_size - start)
+    data = _read_range(path, start, want)
+    cut = data.rfind(b"\n")
+    dropped = cursor["dropped"]
+    if cut != -1:
+        whole = data[:cut + 1]
+    elif len(data) == SCAN_CHUNK:  # one line longer than a chunk: passed over, counted
+        whole, cut, dropped = b"", len(data) - 1, dropped + 1
+    else:
+        whole = b""  # a last line still being written: read it next time
+    found = [a for a in _parse_events(whole, now, {}, {"ADDED": 0})["added"] if a["private"]] if whole else []
+    private = cursor["private"] + found
+    if len(private) > PRIVATE_MAX:
+        dropped += len(private) - PRIVATE_MAX
+        private = private[-PRIVATE_MAX:]
+    offset = start + cut + 1 if cut != -1 else start
+    head = cursor["head"] if start >= SCAN_HEAD and cursor["head"] else (_head_hash(path, offset) if offset else "")
+    return {"dev": st.st_dev, "ino": st.st_ino, "offset": offset, "size": st.st_size, "head": head,
+            "private": private, "lines": cursor["lines"] + whole.count(b"\n"), "dropped": dropped,
+            "done": start + want >= st.st_size, "reset": reset}
 
 
 _PARSERS = {"global": _parse_global, "heartbeat": _parse_heartbeat, "config": _parse_config}
@@ -588,10 +670,7 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
                 data, mtime = read_only(path, tail=tail_bytes)
                 parsed = _parse_events(data, now, _limits((cache.get("global") or {}).get("data")),
                                        {"LIMITED": limited_lines})
-                # Lines older than the tail were never read: the privacy
-                # check over ADDED lines is not a full one.
-                if tail_bytes and os.stat(path).st_size > tail_bytes:
-                    parsed["older_cut"] = True
+
             else:
                 data, mtime = read_only(path)
                 parsed = _PARSERS[key](data)
@@ -602,6 +681,8 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
             same = last.get("data") is not None and last.get("data") == parsed and last.get("seen_at")
             cache[key] = {"data": parsed, "good_at": _iso(now), "seen_at": last["seen_at"] if same else _iso(now),
                           "mtime": mtime, "since": None}
+            if key == "events":
+                cache[key]["scan"] = scan_events(path, last.get("scan"), now)
             files[key] = {"error": None, "good_at": _iso(now), "since": None}
         except (OSError, ValueError, UnicodeDecodeError, RecursionError, OverflowError, TypeError) as exc:
             since = last.get("since") or _iso(now)
@@ -993,8 +1074,10 @@ def rule_checks(cache: dict, rules: list[dict]) -> list[dict]:
                                         "another model family can't be checked: its kind isn't set"})
         if "grok_private" in watch:
             grok = {lane for lane, spec in lanes.items() if (spec.get("kind") or "").lower().startswith("grok")}
-            events = (kept.get("events") or {}).get("data") or {}
-            for added in events.get("added") or []:
+            events_kept = kept.get("events") or {}
+            scan = events_kept.get("scan") if isinstance(events_kept.get("scan"), dict) else None
+            events = events_kept.get("data") or {}
+            for added in (scan["private"] if scan else events.get("added") or []):
                 named = set(added.get("lanes") or [])
                 # Lanes the line leaves to the runner's defaults.
                 if "check_lane" in added and added["check_lane"] is None and config.get("check_lane"):
@@ -1036,8 +1119,8 @@ def _check_lanes(check: str, lanes: dict) -> tuple[int, int]:
 # result: a rule's result is its worst check's, so it is "ok" only when every
 # check it asks for ran on every runner and passed.
 _CELL_ORDER = ("broken", "not_read", "failed", "stale", "no_lane", "cannot_check", "ok")
-_RESULT_ORDER = ("broken", "failed", "stale", "not_read", "incomplete", "no_runner", "cannot_check", "no_lane", "ok")
-_NOT_NOW = ("failed", "stale", "not_read", "incomplete")
+_RESULT_ORDER = ("broken", "failed", "stale", "not_read", "checking", "incomplete", "no_runner", "cannot_check", "no_lane", "ok")
+_NOT_NOW = ("failed", "stale", "not_read", "checking", "incomplete")
 
 
 def _skipped(check: str, kept: dict) -> dict:
@@ -1051,12 +1134,9 @@ def _skipped(check: str, kept: dict) -> dict:
         ({"kinds"} if check != "fast_tier" else set())
     out = {k: v for k, v in (config.get("skipped") or {}).items() if v and k in wanted}
     if check == "grok_private":
-        events = (kept.get("events") or {}).get("data")
-        events = events if isinstance(events, dict) else {}
-        if events.get("added_dropped"):
-            out["added"] = events["added_dropped"]
-        if events.get("older_cut"):
-            out["older_added"] = True
+        scan = (kept.get("events") or {}).get("scan")
+        if isinstance(scan, dict) and scan.get("dropped"):
+            out["added"] = scan["dropped"]
     return out
 
 
@@ -1085,6 +1165,8 @@ def _cell(check: str, runner: str, kept: dict, findings: list[dict], now, stale_
     broken = [c for c in mine if c.get("status") == "broken"]
     config = config_kept.get("data") if reads["settings"]["read"] else {}
     skipped = _skipped(check, kept)
+    scan = (kept.get("events") or {}).get("scan") if check == "grok_private" else None
+    scan = scan if isinstance(scan, dict) else None
     about, judged = _check_lanes(check, _config_facts(config.get("lanes")))
     if broken:
         outcome = "broken"
@@ -1094,6 +1176,8 @@ def _cell(check: str, runner: str, kept: dict, findings: list[dict], now, stale_
         outcome = "failed"
     elif any(r["stale"] for r in reads.values()):
         outcome = "stale"
+    elif check == "grok_private" and not (scan or {}).get("done"):
+        outcome = "checking"  # the whole-log read has not reached the end yet
     elif skipped:
         outcome = "incomplete"  # never a pass on part of the input
     elif not about:
@@ -1104,6 +1188,8 @@ def _cell(check: str, runner: str, kept: dict, findings: list[dict], now, stale_
         outcome = "ok"
     return {"runner": runner, "outcome": outcome, "lanes": judged, "unchecked": about - judged, "reads": reads,
             **({"skipped": skipped} if skipped else {}),
+            **({"scan": {"read": scan.get("offset"), "size": scan.get("size"), "lines": scan.get("lines"),
+                         "done": bool(scan.get("done")), "reset": scan.get("reset")}} if scan else {}),
             "text": broken[0]["text"] if broken else None, "more": max(len(broken) - 1, 0),
             "why": next((c["text"] for c in mine if c.get("status") == "cannot_check"), None)}
 

@@ -499,17 +499,39 @@ describe("Settings -> Routing: standing rules", () => {
         checks: [{ check: "fast_tier", result: "incomplete", at: null, lanes: 1024, unchecked: 0, cells: [
           { runner: "project A", outcome: "incomplete", lanes: 1024, unchecked: 0, reads: { settings: read }, skipped: { lanes: 3 } },
           { runner: "project B", outcome: "incomplete", lanes: 2, unchecked: 0, reads: { settings: read, events: read },
-            skipped: { lanes: 1, added: 12, older_added: true } },
+            skipped: { lanes: 1, added: 12 } },
         ] }],
       }],
     };
     await page();
     const three = row("Standing rules", "3.");
     expect(three).toHaveTextContent(
-      "Checked by Khipu, but not fully: Khipu left out 3 lanes in project A; and 1 lane, 12 lines of added work and the older added work in project B.",
+      "Checked by Khipu, but not fully: Khipu left out 3 lanes in project A; and 1 lane and 12 lines of added work in project B.",
     );
     expect(three).not.toHaveTextContent("nothing wrong found");
     expect(screen.getByRole("button", { name: "May be broken, 0 rules" })).toBeInTheDocument();
+  });
+
+  // The privacy check reads each runner's whole events log once, then only what is new.
+  it("says it is still checking a long log, and what an ok check covered", async () => {
+    const read = { read: true, good_at: "2026-10-14T15:36:00Z", failed: false, since: null, stale: false };
+    const cell = (scan: object, outcome: string) => ({ runner: "project A", outcome, lanes: 2, unchecked: 0, reads: { settings: read, events: read }, scan });
+    const rule = (result: string, scan: object) => ({
+      ...view(),
+      rules: [{ n: 3, text: "Grok never builds or fixes privacy or safety code.", source: "from your routing table", date: "2026-10-13" }],
+      rule_results: [{ rule: 3, check: "grok_private", result, at: result === "ok" ? "2026-10-14T15:36:00Z" : null, lanes: 2, unchecked: 0,
+        checks: [{ check: "grok_private", result, at: result === "ok" ? "2026-10-14T15:36:00Z" : null, lanes: 2, unchecked: 0, cells: [cell(scan, result)] }] }],
+    });
+    answers.khipu_route_view = rule("checking", { read: 2_000_000, size: 8_000_000, lines: 9000, done: false });
+    await page();
+    expect(row("Standing rules", "3.")).toHaveTextContent(
+      "Checked by Khipu, but still checking: Khipu has read 25% of project A's list of added work so far.",
+    );
+    expect(row("Standing rules", "3.")).not.toHaveTextContent("nothing wrong found");
+    cleanup();
+    answers.khipu_route_view = rule("ok", { read: 8_000_000, size: 8_000_000, lines: 36000, done: true });
+    await page();
+    expect(row("Standing rules", "3.")).toHaveTextContent("nothing wrong found, 4 min ago. It read all 36,000 lines of added work.");
   });
 
   // Codex review round 2 (C): each check's line is its own, never another check's finding.

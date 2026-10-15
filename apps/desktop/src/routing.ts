@@ -157,7 +157,9 @@ export type RuleCell = {
   more?: number;
   why?: string | null;
   /** What a cap or a name Khipu can't use left out of this runner's files. */
-  skipped?: { lanes?: number; fix_lanes?: number; kinds?: number; added?: number; older_added?: boolean };
+  skipped?: { lanes?: number; fix_lanes?: number; kinds?: number; added?: number };
+  /** The privacy check's read of the whole events log: bytes read of its size, lines read, finished. */
+  scan?: { read?: number; size?: number; lines?: number; done?: boolean; reset?: string | null };
 };
 
 export type RuleCheckResult = Omit<RuleResult, "rule" | "checks"> & { check: string; cells?: RuleCell[] };
@@ -168,7 +170,7 @@ export type RuleResult = {
   checks?: RuleCheckResult[];
   /** Which of Khipu's four checks gave this result. */
   check?: "fast_tier" | "paid_xai" | "grok_private" | "grok_confirm" | string;
-  result: "ok" | "broken" | "cannot_check" | "no_lane" | "no_runner" | "not_read" | "failed" | "stale" | "incomplete" | string;
+  result: "ok" | "broken" | "cannot_check" | "no_lane" | "no_runner" | "not_read" | "failed" | "stale" | "checking" | "incomplete" | string;
   /** When the check last ran on the files it judged; only for "ok". */
   at?: string | null;
   /** Lanes it judged, and lanes it is about but couldn't judge. */
@@ -641,7 +643,6 @@ function leftOutLine(cells: RuleCell[]): string {
         k.kinds ? count(k.kinds, "lane whose kind it can't name", "lanes whose kind it can't name") : "",
         k.fix_lanes ? count(k.fix_lanes, "default fix lane", "default fix lanes") : "",
         k.added ? count(k.added, "line of added work", "lines of added work") : "",
-        k.older_added ? "the older added work" : "",
       ].filter(Boolean);
       const list = items.length > 1 ? `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}` : items[0] ?? "some input";
       return `${list} in ${c.runner}`;
@@ -686,12 +687,24 @@ function resultLine(result: RuleResult | RuleCheckResult, f: string, nowMs: numb
       const n = result.unchecked ?? 0;
       const rest = n ? ` ${n === 1 ? "1 lane" : `${n} lanes`} couldn't be checked: ${CANNOT_SEE[result.check ?? ""] ?? CANNOT_SEE.fast_tier}` : "";
       const head = top ? `${by} in your job runners' settings: nothing wrong found` : `${by}: passed`;
-      return { text: `${head}${ago ? `, ${ago}` : ""}.${rest}`, tone: "ok" };
+      const scanned = cells.filter((c) => c.scan?.done);
+      const lines = scanned.reduce((sum, c) => sum + (c.scan?.lines ?? 0), 0);
+      const covered = scanned.length ? ` It read all ${lines.toLocaleString("en-US")} ${lines === 1 ? "line" : "lines"} of added work.` : "";
+      return { text: `${head}${ago ? `, ${ago}` : ""}.${rest}${covered}`, tone: "ok" };
     }
     case "not_read":
     case "failed":
     case "stale":
       return { text: `${by}, but not now: ${notNowLine(cells, nowMs)}`, tone: "" };
+    case "checking": {
+      const parts = cells
+        .filter((c) => c.outcome === "checking")
+        .map((c) => {
+          const pct = c.scan?.size ? Math.floor(((c.scan.read ?? 0) / c.scan.size) * 100) : 0;
+          return `${pct}% of ${c.runner}'s list of added work`;
+        });
+      return { text: `${by}, but still checking: Khipu has read ${parts.join(" and ") || "part of your job runners' added work"} so far.`, tone: "" };
+    }
     case "incomplete":
       return { text: `${by}, but not fully: ${leftOutLine(cells)}`, tone: "" };
     case "cannot_check":

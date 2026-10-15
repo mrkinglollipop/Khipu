@@ -777,18 +777,87 @@ def test_lanes_whose_names_collide_are_counted_as_left_out():
     assert kinds["skipped"] == {"kinds": 1}
 
 
-def test_added_work_lines_the_tail_leaves_out_mean_the_privacy_check_is_not_full(home, capsys):
+PRIVATE_GROK = ("2026-10-14T11:00:00Z pipe-9 ADDED branch=project-a/secret stage=built check_lane=grokcheck "
+                "fix_lanes=grok max_checks=3 privacy")
+
+
+def _filler(n: int) -> str:
+    return "".join(f"2026-10-14T11:{(i // 60) % 60:02d}:{i % 60:02d}Z pipe-{1000 + i} ADDED branch=project-a/x{i} "
+                   f"stage=built check_lane=codex fix_lanes=second max_checks=3\n" for i in range(n))
+
+
+def _privacy(home, capsys) -> dict:
+    """One refresh of the app's view, a minute later each time; the privacy
+    rule's result."""
+    home["clock"].advance(minutes=1)
+    assert routing.run_cli(_args(json=True)) == 0
+    return _results(json.loads(capsys.readouterr().out))[1]
+
+
+def _privacy_rule(home) -> None:
     _register(home)
     routing.add_rule("Grok never builds or fixes privacy or safety code.", via="app")
-    for i in range(40):
-        _append(home["a"], f"2026-10-14T14:59:{i % 60:02d}Z pipe-{i} ADDED branch=project-a/x stage=built "
-                           "check_lane=codex fix_lanes=second max_checks=3")
-    _set(home, routing_runner_tail_bytes=600)
-    assert routing.run_cli(_args(json=True)) == 0
-    result = _results(json.loads(capsys.readouterr().out))[1]
-    (cell,) = result["checks"][0]["cells"]
-    assert result["result"] == "incomplete" and cell["outcome"] == "incomplete"
-    assert cell["skipped"].get("older_added") is True
+
+
+def test_a_log_larger_than_the_old_window_is_covered_from_its_first_line(home, capsys):
+    """The privacy check reads the whole events log once, then only what is
+    new: a private Grok line before the last 512 KB is still found."""
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    log.write_text(PRIVATE_GROK + "\n" + _filler(6000))
+    assert log.stat().st_size > routing_sources.TAIL_BYTES
+    result = _privacy(home, capsys)
+    assert result["result"] == "broken" and "pipe-9" in result["text"]
+    log.write_text(_filler(6000))  # same file rewritten in place, clean
+    assert _privacy(home, capsys)["result"] == "ok"
+
+
+def test_a_rotated_log_is_read_again_from_its_start(home, capsys):
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    log.write_text(_filler(50))
+    assert _privacy(home, capsys)["result"] == "ok"
+    log.rename(home["a"] / "events.log.1")
+    log.write_text(PRIVATE_GROK + "\n")  # a new, smaller file
+    result = _privacy(home, capsys)
+    assert result["result"] == "broken" and result["checks"][0]["cells"][0]["scan"]["reset"] == "rotated"
+
+
+def test_a_truncated_log_is_read_again_and_forgets_what_it_held(home, capsys):
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    log.write_text(PRIVATE_GROK + "\n" + _filler(50))
+    assert _privacy(home, capsys)["result"] == "broken"
+    with open(log, "w", encoding="utf-8") as fh:  # truncated in place, then grown past the old offset
+        fh.write(_filler(200))
+    result = _privacy(home, capsys)
+    assert result["result"] == "ok" and result["checks"][0]["cells"][0]["scan"]["reset"] == "rewritten"
+    with open(log, "w", encoding="utf-8") as fh:  # truncated to less than was read
+        fh.write(_filler(3))
+    assert _privacy(home, capsys)["checks"][0]["cells"][0]["scan"]["reset"] == "truncated"
+
+
+def test_a_corrupt_cursor_means_one_full_scan():
+    for cursor in (None, "junk", {"ino": "x", "offset": -5}, {"dev": 1, "ino": 2, "offset": 10 ** 12}):
+        assert routing_sources._valid_cursor(cursor, os.stat(__file__)) is False
+
+
+def test_a_long_scan_says_checking_until_it_has_read_the_whole_log(home, capsys, monkeypatch):
+    monkeypatch.setattr(routing_sources, "SCAN_CHUNK", 64 * 1024)
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    log.write_text(_filler(3000) + PRIVATE_GROK + "\n")
+    first = _privacy(home, capsys)
+    cell = first["checks"][0]["cells"][0]
+    assert first["result"] == "checking" and 0 < cell["scan"]["read"] < cell["scan"]["size"]
+    for _ in range(20):
+        result = _privacy(home, capsys)
+        if result["result"] != "checking":
+            break
+    assert result["result"] == "broken"
+    _append(home["a"], "2026-10-14T15:00:00Z pipe-77 ADDED branch=project-a/y stage=built check_lane=codex "
+                       "fix_lanes=second max_checks=3")
+    assert _privacy(home, capsys)["result"] == "broken"  # what it found stays found; only new bytes are read
 
 
 def test_a_launch_while_paused_is_named(home):
