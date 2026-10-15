@@ -1014,12 +1014,89 @@ def _read_outcome(path: Path) -> dict[str, Any] | None:
     return got if isinstance(got, dict) and isinstance(got.get("op_id"), str) else None
 
 
+def _unreadable_error(op_id: str, what: str) -> LedgerError:
+    return LedgerError(f"what this Mac holds for op id {op_id} ({what}) cannot be read, so this write was not "
+                       "sent or queued; check the row before writing it again", "op_unreadable")
+
+
+def _load_record(path: Path, op_id: str, what: str) -> dict[str, Any] | None:
+    """A record kept for an op id: None when there is none, and a refusal,
+    never None, when one is there but cannot be read."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise _unreadable_error(op_id, what) from exc
+    try:
+        got = json.loads(text)
+    except ValueError as exc:
+        raise _unreadable_error(op_id, what) from exc
+    if not isinstance(got, dict) or not isinstance(got.get("op_id"), str):
+        raise _unreadable_error(op_id, what)
+    return got
+
+
 def _outcome(op_id: str) -> dict[str, Any] | None:
     """The outcome stored for exactly ``op_id``: the id inside the file must
-    match byte for byte, whatever the file system made of its name."""
+    match byte for byte, whatever the file system made of its name. One an
+    older Khipu kept under the old name still counts when it could not be
+    moved."""
     _migrate_outcomes()
-    got = _read_outcome(_outcome_path(op_id))
+    got = _load_record(_outcome_path(op_id), op_id, "its outcome")
+    if got is not None and got["op_id"] == op_id:
+        return got
+    # The old name only when it is this id's own: a disk that ignores case
+    # hands back another id's file for it, which says nothing of this one.
+    try:
+        names = os.listdir(_legacy_outcomes_dir())
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise _unreadable_error(op_id, "its outcome") from exc
+    if f"{op_id}.json" not in names:
+        return None
+    got = _load_record(_legacy_outcomes_dir() / f"{op_id}.json", op_id, "its outcome")
     return got if got is not None and got["op_id"] == op_id else None
+
+
+def _rejected_path(op_id: str, digest: str) -> Path:
+    key = f"{op_id}\n{digest}".encode("utf-8")
+    return outbox_dir() / "op-rejected" / f"{hashlib.sha256(key).hexdigest()}.json"
+
+
+def _record_rejected(op: dict[str, Any], exc: LedgerError) -> None:
+    """The hub holds another write under this op id, for good: this write is
+    refused under it from now on, here too. Kept by id and digest, so the
+    write the hub does hold stays free to be retried."""
+    from khipu.outbox import _atomic_write
+
+    with _op_lock():
+        path = _rejected_path(op["op_id"], op_digest(op))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(path, {"op_id": op["op_id"], "digest": op_digest(op), "refused": str(exc),
+                             "reason_word": exc.reason, "at": _z(_now())})
+
+
+def _keep_rejected(op: dict[str, Any], exc: LedgerError) -> None:
+    """``_record_rejected`` where a failure to write it must not hold the line:
+    the hub's binding still refuses the write each time it is sent."""
+    try:
+        _record_rejected(op, exc)
+    except OSError as err:
+        print(f"[khipu-ledger] the hub's refusal of op id {op['op_id']} was not kept here: "
+              f"{type(err).__name__}", file=sys.stderr)
+
+
+def _purged_here(op: dict[str, Any]) -> bool:
+    """Whether the offline copy marks ``op``'s row removed for good."""
+    from khipu import hub_snapshot
+
+    try:
+        version = hub_snapshot.ledger_gone_version(op["project"], op["row_id"])
+    except Exception as exc:  # noqa: BLE001  (an unreadable copy is not a "no")
+        raise _unreadable_error(op["op_id"], "the offline copy") from exc
+    return version is not None and version >= _purged_version()
 
 
 def _migrate_outcomes() -> None:
@@ -1110,18 +1187,18 @@ def queued_ops() -> list[dict[str, Any]]:
     return out
 
 
-def enqueue(op: dict[str, Any], reason: str = "") -> Path:
+def enqueue(op: dict[str, Any], reason: str = "") -> Path | None:
     """Put ``op`` at the back of the line. A job's name is its place: after
     every waiting job's, under a lock, so a clock that steps back or another
-    process enqueueing at the same moment cannot put a later write first."""
+    process enqueueing at the same moment cannot put a later write first.
+    Returns the job already in line for a retry, and None for a retry of a
+    write that landed: it is answered, never queued again."""
     from khipu.outbox import _atomic_write
 
     with _op_lock():
-        claim = _claim(op)
-        if claim is not None and claim[0] == "queued":
-            return claim[1]
-        if claim is not None and claim[0] == "refused":
-            raise _refusal(claim[1], op["op_id"])
+        known = _known(op)
+        if known is not None:
+            return known[1] if known[0] == "queued" else None
         last = 0
         for path in _outbox_jobs():
             head = path.name.split("-", 1)[0]
@@ -1132,33 +1209,55 @@ def enqueue(op: dict[str, Any], reason: str = "") -> Path:
         return dst
 
 
-def _claim(op: dict[str, Any]) -> tuple[str, Any] | None:
-    """What this Mac holds for ``op``'s op id, read under the op lock:
-    ("queued", job path), or (status, outcome) for an outcome, or None when
-    the id is free here. Raises op_id_reused when the id holds another write.
-    A job that leaves the line between the look and the read is answered by
-    the outcome written before it left."""
+def _known(op: dict[str, Any], *, line: bool = True) -> tuple[str, Any] | None:
+    """Everything this Mac knows of exactly ``op``'s op id and digest, from
+    every place it is kept: the hub's refusal of the id for this write, the
+    outcome (under its hashed name or an older Khipu's), and, unless ``line``
+    is False, the line. Read under the op lock, first on every write path and
+    by the drain before it sends a job. None when the id is free here;
+    ("landed", outcome) or ("queued", job path); a refusal or a reused id is
+    raised as the answer. Any of these that is there but cannot be read
+    refuses the write (op_unreadable): an unread record is never taken for a
+    free id. Whether a landed write's row was purged since is the hub's to
+    say, or the offline copy's when the hub is away (``_landed_retry``)."""
     if not getattr(_op_lock_held, "depth", 0):
-        raise RuntimeError("_claim needs the op lock")
-    digest = op_digest(op)
-    path = _job_path(op["op_id"])
-    if path is not None:
+        raise RuntimeError("_known needs the op lock")
+    op_id, digest = op["op_id"], op_digest(op)
+    if _load_record(_rejected_path(op_id, digest), op_id, "the hub's refusal of it") is not None:
+        raise _reused_error(op)
+    known = _outcome(op_id)
+    if known is not None:
+        if known.get("digest") != digest:
+            raise _reused_error(op)
+        status = known.get("status")
+        if status == "refused":
+            raise _refusal(known, op_id)
+        if status != "landed":
+            raise _unreadable_error(op_id, "its outcome")
+        return "landed", known
+    if not line:
+        return None
+    try:
+        names = sorted(os.listdir(outbox_dir()))
+    except FileNotFoundError:
+        names = []
+    except OSError as exc:
+        raise _unreadable_error(op_id, "the line") from exc
+    for name in names:
+        if name.split("-", 1)[-1] != f"{op_id}.json":
+            continue
+        path = outbox_dir() / name
         try:
             held = json.loads(path.read_text(encoding="utf-8"))["op"]
         except FileNotFoundError:
-            path = None
-        except (OSError, ValueError, KeyError, TypeError):
-            held = None
-        if path is not None:
-            if not isinstance(held, dict) or op_digest(held) != digest:
-                raise _reused_error(op)
-            return "queued", path
-    known = _outcome(op["op_id"])
-    if known is None:
-        return None
-    if known.get("digest") != digest:
-        raise _reused_error(op)
-    return str(known.get("status") or ""), known
+            # It left the line after the look: its outcome, written first, answers.
+            return _known(op) if _outcome(op_id) is not None else None
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise _unreadable_error(op_id, "its place in line") from exc
+        if not isinstance(held, dict) or op_digest(held) != digest:
+            raise _reused_error(op)
+        return "queued", path
+    return None
 
 
 def outbox_status() -> dict[str, Any]:
@@ -1241,12 +1340,32 @@ def _drain_locked(conn, out: dict[str, Any], waiting: frozenset[str] = frozenset
                 out["refused"] += 1
                 continue
             try:
+                with _op_lock():
+                    known = _known(op, line=False)
+            except LedgerError as exc:
+                known = None if exc.reason == "op_unreadable" else exc  # unread: the hub's binding answers
+            if known is not None:
+                # Decided here already (a process ended between keeping the
+                # outcome and the job leaving the line): it leaves now, unsent.
+                # A reused id is set aside without binding the id here.
+                if isinstance(known, LedgerError) and known.reason == "op_id_reused":
+                    _refuse_job(path, {**job, "refused": str(known), "reason_word": known.reason})
+                elif isinstance(known, LedgerError):
+                    _finish_job(path, job, "refused", refused=str(known), reason_word=known.reason)
+                elif _finish_job(path, job, "landed"):
+                    out["landed"] += 1
+                    continue
+                out["refused"] += 1
+                continue
+            try:
                 result = apply_op(conn, op, late=op.get("op_id") not in waiting)
             except LedgerError as exc:
                 if exc.reason == "op_id_reused":
                     # The hub holds another write under this id: the id is not
-                    # this job's to bind here. It is kept aside as refused.
+                    # this job's to bind here. It is kept aside as refused, and
+                    # this write is refused under the id from now on.
                     with _op_lock():
+                        _keep_rejected(op, exc)
                         _refuse_job(path, {**job, "refused": str(exc), "reason_word": exc.reason})
                 else:
                     _finish_job(path, job, "refused", refused=str(exc), reason_word=exc.reason)
@@ -1318,6 +1437,13 @@ def write(op: dict[str, Any], *, conn=None) -> dict[str, Any]:
     Waiting writes go first, so writes land in the order they were made."""
     _check_op(op, settings())
     op_digest(op)
+    # What this Mac already knows of the op id answers before anything is
+    # queued or sent: a refusal is raised here, and a landed write is never
+    # sent or queued again.
+    with _op_lock():
+        known = _known(op)
+    if known is not None and known[0] == "landed":
+        return _landed_retry(op, known[1], conn)
     owned = conn is None
     try:
         if owned:
@@ -1366,23 +1492,44 @@ def _known_op(op: dict[str, Any]) -> dict[str, Any] | None:
     """The answer for an op id this Mac already holds: queued, landed with its
     first result, or refused again. Another write under the id is refused."""
     with _op_lock():
-        claim = _claim(op)
-    if claim is None:
+        known = _known(op)
+    if known is None:
         return None
-    status, held = claim
-    if status == "queued":
+    if known[0] == "queued":
         return _queued_reply(op)
-    if status == "refused":
-        raise _refusal(held, op["op_id"])
-    if status == "landed" and isinstance(held.get("result"), dict):
+    held = known[1]
+    if isinstance(held.get("result"), dict):
         result = dict(held["result"])
         result.pop("retried", None)
         return result
-    if status == "landed":
-        # Landed long ago: the result was pruned, how it ended was kept.
-        return {"ok": True, "verb": op["verb"], "id": op["row_id"], "retried": True,
-                "line": f"{op['verb']} {op['row_id']}: landed earlier"}
-    return None
+    # Landed long ago: the result was pruned, how it ended was kept.
+    return {"ok": True, "verb": op["verb"], "id": op["row_id"], "retried": True,
+            "line": f"{op['verb']} {op['row_id']}: landed earlier"}
+
+
+def _landed_retry(op: dict[str, Any], outcome: dict[str, Any], conn=None) -> dict[str, Any]:
+    """A retry of a write that landed. The hub's own record answers when the
+    hub does (it knows of a purge since, and the offline copy is repaired);
+    else the outcome kept here. It is never sent or queued again."""
+    owned = conn is None
+    try:
+        if owned:
+            conn = _connect()
+        stored = _landed_result(conn, op)
+        if stored is not None:
+            _replica_sync(conn, op["project"], stored.get("affected") or [])
+            return {**stored, "retried": True}
+    except LedgerError:
+        raise
+    except Exception:  # noqa: BLE001  (the hub away or failing: what this Mac knows answers)
+        pass
+    finally:
+        if owned and conn is not None:
+            conn.close()
+    # As the hub would answer: a row removed for good since is the answer.
+    if _purged_here(op):
+        raise LedgerError(f"row {op['row_id']} was removed for good", "purged")
+    return _known_op(op) or {}
 
 
 def _reserve_direct(op: dict[str, Any]) -> Path | None:
@@ -1391,12 +1538,10 @@ def _reserve_direct(op: dict[str, Any]) -> Path | None:
     the op id check and taking the place are one step under the op lock, so
     a write queued by another process is either seen here first or stands
     behind this one, and keeps standing behind it if the hub goes away
-    mid-write. None when other writes wait: this one joins them instead."""
+    mid-write. None when other writes wait, or the op id is already held:
+    this one joins the line, which answers it."""
     with _op_lock():
-        claim = _claim(op)
-        if claim is not None and claim[0] == "refused":
-            raise _refusal(claim[1], op["op_id"])
-        if (claim is not None and claim[0] == "queued") or _outbox_jobs():
+        if _known(op) is not None or _outbox_jobs():
             return None
         return enqueue(op, reason="sent at once")
 
@@ -1410,7 +1555,11 @@ def _apply_own_job(conn, op: dict[str, Any], path: Path) -> dict[str, Any]:
         result = apply_op(conn, op)
     except LedgerError as exc:
         if exc.reason == "op_id_reused":
-            _drop_job(path)  # the hub holds another write under this id; nothing is ours to keep
+            # The hub holds another write under this id: this write is refused
+            # under it from now on, and nothing else of it is kept.
+            with _op_lock():
+                _keep_rejected(op, exc)
+                _drop_job(path)
         else:
             _finish_job(path, job, "refused", refused=str(exc), reason_word=exc.reason)
             (_refused_dir() / path.name).unlink(missing_ok=True)  # its writer is told here
@@ -1439,7 +1588,7 @@ def _write_in_line(conn, op: dict[str, Any]) -> dict[str, Any]:
     # From here the job is in the line: the answer can only be what became of
     # it (landed, refused, or still queued), never a fresh offline check.
     try:
-        while path.exists():
+        while path is not None and path.exists():
             with _drain_lock() as got:
                 if got:
                     out = _drain_locked(conn, _drain_result(), frozenset({op["op_id"]}))
@@ -1451,19 +1600,21 @@ def _write_in_line(conn, op: dict[str, Any]) -> dict[str, Any]:
             time.sleep(0.05)
     except Exception as exc:  # noqa: BLE001  (the job is kept; it is still queued)
         print(f"[khipu-ledger] a waiting write stays queued: {type(exc).__name__}", file=sys.stderr)
-    if path.exists():
+    if path is not None and path.exists():
         return _queued_reply(op)
-    # Gone from the line: the outcome its drain wrote first is the answer,
-    # shared by every writer of this op id and never consumed by one of them.
-    known = _outcome(op["op_id"])
-    if known is not None and known.get("digest") == op_digest(op):
-        if known.get("status") == "landed":
-            return _known_op(op) or {}
-        if known.get("status") == "refused":
+    # Gone from the line: what this Mac now knows of the op id is the answer
+    # (the outcome its drain wrote first, shared by every writer of this op
+    # id and never consumed by one of them, or the hub's refusal of the id).
+    try:
+        with _op_lock():
+            known = _known(op)
+    except LedgerError as exc:
+        if path is not None and exc.reason not in ("op_id_reused", "op_unreadable"):
             # Its writer is told here, so it is not also kept as a refused job.
             (_refused_dir() / path.name).unlink(missing_ok=True)
-            raise LedgerError(str(known.get("refused") or "the ledger refused this write"),
-                              str(known.get("reason_word") or "refused"))
+        raise
+    if known is not None:
+        return _known_op(op) or {}
     # No outcome on this Mac: only the hub's own record of the op is evidence
     # that it landed. It is read, never applied again.
     try:
@@ -1487,7 +1638,10 @@ def _landed_result(conn, op: dict[str, Any]) -> dict[str, Any] | None:
             got = cur.fetchone()
             marker = _marker(cur, op["project"], op["row_id"]) if got is not None else None
     finally:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001  (a read: what it fetched still answers)
+            pass
     if got is None:
         return None
     if tuple(got[:3]) != (op["project"], op["row_id"], op["verb"]) or got[3] != op_digest(op):

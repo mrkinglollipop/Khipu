@@ -1679,3 +1679,127 @@ def test_a_hub_reused_refusal_in_the_line_does_not_bind_the_id_here(monkeypatch,
     # The id's owner retrying here is answered by the hub, not by the losing write.
     monkeypatch.setattr(ledger, "apply_op", lambda _conn, _op, **_kw: {"ok": True, "line": "set r: mine"})
     assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "mine"}, op_id="dup"), conn=Conn())["ok"]
+
+
+# ---- round 7: one answer for what this Mac already knows of an op id --------------
+
+
+def test_a_landed_retry_never_joins_the_line_behind_a_later_write(monkeypatch, tmp_path):
+    import fcntl
+
+    ledger = _offline(monkeypatch, tmp_path)
+    monkeypatch.setattr(ledger, "DRAIN_WAIT_S", 0)
+    old = ledger.new_op("set", P, "r", fields={"evidence": "old"}, op_id="old-op")
+    ledger._record_outcome(old, "landed", result={"ok": True, "line": "set r: evidence", "affected": ["r"]})
+    ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "later"}, op_id="later-op"))
+    fd = os.open(str(ledger.outbox_dir() / ".drain.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # another process is draining the line
+    try:
+        for conn in (_Conn(), None):  # the hub reachable, then away
+            got = ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "old"}, op_id="old-op"), conn=conn)
+            assert got["ok"] and not got.get("queued") and got["line"] == "set r: evidence"
+    finally:
+        os.close(fd)
+    assert [q["op_id"] for q in ledger.queued_ops()] == ["later-op"]
+
+
+def test_a_legacy_outcome_answers_its_retry_when_it_cannot_be_moved(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    op = ledger.new_op("set", P, "r", fields={"evidence": "x"}, op_id="landed-op")
+    legacy = ledger.outbox_dir() / "outcomes"
+    legacy.mkdir(parents=True)
+    (legacy / "landed-op.json").write_text(json.dumps({"op_id": "landed-op", "digest": ledger.op_digest(op),
+                                                       "status": "landed", "result": {"ok": True, "line": "set r"}}))
+    ledger._outcomes_dir().write_text("blocks the new folder")  # the move cannot happen
+    got = ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "x"}, op_id="landed-op"))
+    assert got == {"ok": True, "line": "set r"} and ledger.queued_ops() == []
+    # A record that is there but cannot be read refuses the write; it never frees the id.
+    ledger._outcomes_dir().unlink()
+    ledger._outcomes_dir().mkdir()
+    ledger._outcome_path("torn").write_text("{not json")
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "x"}, op_id="torn"))
+    assert err.value.reason == "op_unreadable" and ledger.queued_ops() == []
+
+
+def test_a_write_the_hub_refused_as_reused_is_refused_again_while_away(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+
+    def loser(op_id):
+        return ledger.new_op("set", P, "r", fields={"evidence": "losing"}, op_id=op_id)
+
+    real_apply = ledger.apply_op
+    monkeypatch.setattr(ledger, "apply_op", lambda _c, op, **_kw: (_ for _ in ()).throw(ledger._reused_error(op)))
+    assert ledger.write(loser("drained"))["queued"]
+    assert ledger.drain(conn=_Conn())["refused"] == 1  # refused in the line
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(loser("direct"), conn=_Conn())  # refused as a direct write
+    assert err.value.reason == "op_id_reused"
+    monkeypatch.setattr(ledger, "apply_op", real_apply)
+    for op_id in ("drained", "direct"):
+        with pytest.raises(ledger.LedgerError) as err:
+            ledger.write(loser(op_id))
+        assert err.value.reason == "op_id_reused" and ledger.queued_ops() == []
+    # The id's owner, whose write the hub holds, is not refused here.
+    assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "mine"}, op_id="drained"))["queued"]
+
+
+def test_a_retry_of_a_write_on_a_row_purged_since_is_refused_as_purged(monkeypatch, tmp_path):
+    from khipu import hub_snapshot as hs
+
+    ledger = _offline(monkeypatch, tmp_path)
+    added = ledger.new_op("add", P, "r", fields={"title": "R", "kind": "slice"}, op_id="original-add")
+    ledger._record_outcome(added, "landed", result={"ok": True, "verb": "add", "id": "r", "line": "added r"})
+    con = sqlite3.connect(str(_snapshot(tmp_path)))
+    con.execute("INSERT INTO ledger_gone VALUES (?, ?, ?)", (P, "r", hs.LEDGER_PURGED_VERSION))
+    con.commit()
+    con.close()
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("add", P, "r", fields={"title": "R", "kind": "slice"}, op_id="original-add"))
+    assert err.value.reason == "purged" and ledger.queued_ops() == []
+    # An offline copy that is there but cannot be read refuses the retry rather than guess.
+    hs.snapshot_path().write_bytes(b"not a database" * 100)
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("add", P, "r", fields={"title": "R", "kind": "slice"}, op_id="original-add"))
+    assert err.value.reason == "op_unreadable" and ledger.queued_ops() == []
+
+
+def test_a_write_that_lands_through_the_line_is_answered_landed_though_the_copy_is_torn(monkeypatch, tmp_path):
+    from khipu import hub_snapshot as hs
+
+    ledger = _offline(monkeypatch, tmp_path)
+    _snapshot(tmp_path).write_bytes(b"not a database" * 100)
+    assert hs.snapshot_path().is_file()
+    monkeypatch.setattr(ledger, "apply_op", lambda _c, op, **_kw: {"ok": True, "line": f"set r: {op['op_id']}"})
+    ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "earlier"}, op_id="earlier"))
+    assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "mine"}, op_id="mine"),
+                        conn=_Conn()) == {"ok": True, "line": "set r: mine"}
+    # A torn old outcome a disk that ignores case hands back says nothing of another id.
+    legacy = ledger.outbox_dir() / "outcomes"
+    legacy.mkdir()
+    (legacy / "CaseID.json").write_text("{torn")
+    assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "x"}, op_id="caseid"), conn=_Conn())["ok"]
+
+
+def test_the_drain_never_resends_a_decided_job_or_stalls_on_a_refusal_it_cannot_keep(monkeypatch, tmp_path):
+    from khipu.outbox import _atomic_write
+
+    ledger = _offline(monkeypatch, tmp_path)
+    sent = []
+
+    def apply(_c, op, **_kw):
+        sent.append(op["op_id"])
+        if op["op_id"] == "dup":
+            raise ledger._reused_error(op)
+        return {"ok": True}
+
+    monkeypatch.setattr(ledger, "apply_op", apply)
+    landed = ledger.new_op("set", P, "r", fields={"evidence": "x"}, op_id="landed")
+    ledger._record_outcome(landed, "landed", result={"ok": True})
+    # A process ended after keeping the outcome, before the job left the line.
+    _atomic_write(ledger.outbox_dir() / f"{1:020d}-landed.json", {"op": landed, "reason": ""})
+    ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "y"}, op_id="dup"))
+    ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "z"}, op_id="next"))
+    (ledger.outbox_dir() / "op-rejected").write_text("the refusal cannot be kept")
+    assert ledger.drain(conn=_Conn())["refused"] == 1
+    assert sent == ["dup", "next"] and ledger.queued_ops() == []

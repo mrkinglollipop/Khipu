@@ -1038,6 +1038,24 @@ def ledger_in_snapshot() -> bool:
         con.close()
 
 
+def ledger_gone_version(project: str, row_id: str) -> int | None:
+    """The replica's gone marker version for one row; None when the replica,
+    its marker table or the marker is missing. Unlike the readers above it
+    raises when the replica is there but cannot be read: a caller deciding
+    whether a row was purged must not take an unreadable copy for "no"."""
+    if not snapshot_path().is_file():
+        return None
+    con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
+    try:
+        if con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ledger_gone'").fetchone() is None:
+            return None
+        got = con.execute("SELECT version FROM ledger_gone WHERE project = ? AND row_id = ?",
+                          (project, row_id)).fetchone()
+    finally:
+        con.close()
+    return int(got[0]) if got else None
+
+
 def ledger_read_snapshot(project: str) -> dict[str, Any] | None:
     """``project``'s words, live rows and history from the replica, with the
     replica's time; None when the replica or its ledger tables are missing."""
