@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -142,7 +143,23 @@ def _log_lines() -> list[str]:
     (_call("Bash", {"command": "echo start\nclaude -p 'multi\nline prompt'"}), "claude -p"),
     (_call("Bash", {"command": "bash -lc 'codex exec \"do it\"'"}), "codex exec"),
     (_call("shell", {"command": ["bash", "-lc", "claude -p hi"]}), "claude -p"),
-    (_call("exec_command", {"command": ["codex", "exec", "hi"]}), "codex exec"),
+    # Codex's real shapes: exec_command's string is in "cmd", shell_command's in "command".
+    (_call("exec_command", {"cmd": "codex exec hi", "workdir": "/work", "yield_time_ms": 1000}), "codex exec"),
+    (_call("exec_command", {"cmd": "cd /work && claude -p 'go'", "login": True}), "claude -p"),
+    (_call("shell_command", {"command": "grok -p 'audit'", "workdir": "/work"}), "grok"),
+    (_call("local_shell", {"command": ["codex", "exec", "hi"]}), "codex exec"),
+    (_call("spawn_agent", {"message": "review the diff", "task_name": "review"}), "agent"),
+    # Wrapper options with operands, and claude's attached print argument.
+    (_call("Bash", {"command": "env -u FOO codex exec hi"}), "codex exec"),
+    (_call("Bash", {"command": "env -i -C /work --unset=BAR X=1 claude -p hi"}), "claude -p"),
+    (_call("Bash", {"command": "timeout -s KILL 600 codex exec hi"}), "codex exec"),
+    (_call("Bash", {"command": "timeout --kill-after 5 --signal=TERM 10m codex exec hi"}), "codex exec"),
+    (_call("Bash", {"command": "claude -p'hello'"}), "claude -p"),
+    (_call("Bash", {"command": "claude --print=hello"}), "claude -p"),
+    # A real command after a heredoc, a comment and a redirection is still seen.
+    (_call("Bash", {"command": "cat > brief.md <<'EOF'\nplain text\nEOF\ncodex exec - < brief.md"}), "codex exec"),
+    (_call("Bash", {"command": "# hand it on\nclaude -p hi 2>&1 | tee out.log"}), "claude -p"),
+    (_call("Bash", {"command": "out=$(codex exec hi)"}), "codex exec"),
 ])
 def test_delegation_calls_are_matched(payload, kind):
     assert routing_delegation.delegation_kind(payload, frozenset()) == kind
@@ -161,9 +178,44 @@ def test_delegation_calls_are_matched(payload, kind):
     _call("Bash", {"command": "python3 run_tests.py"}),
     _call("Bash", {"command": ""}),
     {"hook_event_name": "PreToolUse", "session_id": SESSION},
+    # Quoted words and heredoc bodies are data, never commands.
+    _call("Bash", {"command": "printf '%s\\n' ';' 'grok'"}),
+    _call("Bash", {"command": "echo \"a && codex exec hi\""}),
+    _call("Bash", {"command": "cat <<'EOF'\ncodex exec hi\nEOF"}),
+    _call("Bash", {"command": "cat <<-EOF > notes.md\n\tclaude -p hi\n\tEOF\necho done"}),
+    _call("Bash", {"command": "cat <<EOF\nunclosed\ncodex exec hi"}),
+    _call("Bash", {"command": "git commit -m x # then codex exec it"}),
+    _call("Bash", {"command": "grep -c claude <<< 'codex exec hi'"}),
+    _call("exec_command", {"cmd": "ls -la"}),
+    _call("spawn_agents_on_csv", {"csv": "x"}),
+    _call("send_input", {"message": "codex exec hi"}),
 ])
 def test_other_calls_are_not_matched(payload):
     assert routing_delegation.delegation_kind(payload, frozenset()) is None
+
+
+def test_an_ordinary_command_costs_near_nothing(monkeypatch):
+    # Routing off (the default): a shell call reads no settings at all.
+    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "0")
+    read = mock.Mock(side_effect=AssertionError("settings read"))
+    monkeypatch.setattr(routing_delegation, "_configured_script_names", read)
+    monkeypatch.setattr(routing_delegation, "_dispatch_scripts", read)
+    assert routing_delegation.pre_tool_use(_call("Bash", {"command": "codex exec hi"})) == ({}, None, None)
+    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
+    monkeypatch.setattr(routing_delegation, "_configured_script_names", lambda: [])
+    for size in (300_000, 1_000_000):
+        call = _call("Bash", {"command": "echo " + "a " * (size // 2)})
+        started = time.monotonic()
+        assert routing_delegation.delegation_kind(call) is None
+        assert time.monotonic() - started < 0.05, size
+    # A long command that names a delegation is read within the scan budget, never longer.
+    call = _call("Bash", {"command": "echo " + "claude " * 200_000})
+    started = time.monotonic()
+    assert routing_delegation.delegation_kind(call) is None
+    assert time.monotonic() - started < routing_delegation._SCAN_BUDGET_S + 0.1
+    # A real delegation with a long inline brief is still seen.
+    brief = "x " * 40_000
+    assert routing_delegation.delegation_kind(_call("Bash", {"command": f"claude -p '{brief}'"})) == "claude -p"
 
 
 def test_a_configured_dispatch_script_is_matched_by_file_name(home):
@@ -180,7 +232,8 @@ def test_the_dispatch_scripts_setting_takes_file_names_only(home):
     assert routing.settings()["routing_dispatch_scripts"] == ["dispatch.py", "run-job.sh"]
     routing.set_setting("routing_dispatch_scripts", "[]")
     assert routing.settings()["routing_dispatch_scripts"] == []
-    for bad in ("/bin/dispatch.py", "a b", "..", '["x/y"]', json.dumps([f"s{i}.py" for i in range(17)])):
+    for bad in ("/bin/dispatch.py", "a b", "..", "-c", '["-x.py"]', '["x/y"]',
+                json.dumps([f"s{i}.py" for i in range(17)])):
         with pytest.raises(ValueError):
             routing.set_setting("routing_dispatch_scripts", bad)
 
@@ -417,6 +470,11 @@ def test_the_codex_installer_adds_both_hooks_and_names_the_review_step(fake_home
     assert "trusted_hash" not in integ.CODEX_TOML.read_text() + integ.CODEX_HOOKS.read_text()
     again = integ.install("codex")
     assert again["changes"] == [] and "next_step" not in again
+    # The matcher lets through every tool the hook can classify, Codex's native subagent tool included.
+    for tool in ("Agent", "Task", "spawn_agent", "Bash", "shell", "shell_command", "exec_command", "local_shell",
+                 "delegate_task", "mcp__t3__delegate_task"):
+        assert re.search(integ.DELEGATION_MATCHER, tool), tool
+        assert routing_delegation.might_delegate(_call(tool)), tool
     assert integ.status("codex")["delegation_push"] == "installed"
     integ.uninstall("codex")
     hooks = json.loads(integ.CODEX_HOOKS.read_text())["hooks"]

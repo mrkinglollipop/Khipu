@@ -3620,7 +3620,7 @@ mod settings_command_tests {
         );
         assert_eq!(config_set_argv("routing_dispatch_scripts", "[]").unwrap(), v(&["config", "--set", "routing_dispatch_scripts", "[]"]));
         assert_eq!(config_unset_argv("routing_dispatch_scripts").unwrap(), v(&["config", "--unset=routing_dispatch_scripts"]));
-        for bad in [r#"["/bin/dispatch.py"]"#, r#"["a b"]"#, r#"[".."]"#, r#"["-x"]"#, r#"["a\nb"]"#, r#"[3]"#,
+        for bad in [r#"["/bin/dispatch.py"]"#, r#"["a b"]"#, r#"[".."]"#, r#"["-x"]"#, r#"["-c"]"#, r#"["a\nb"]"#, r#"[3]"#,
                     "dispatch.py", r#"{"a": 1}"#] {
             assert!(config_set_argv("routing_dispatch_scripts", bad).is_err(), "{bad}");
         }

@@ -566,6 +566,11 @@ describe("Settings -> Routing: telling conversations", () => {
     fireEvent.click(within(form).getByRole("button", { name: "Save" }));
     expect(await within(form).findByRole("alert")).toHaveTextContent(/no folder/);
     expect(calls("khipu_config_set")).toEqual([]);
+    // A name that starts with a dash would read as an option: refused, as the CLI and Rust do.
+    fireEvent.change(input, { target: { value: "-c" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    expect(await within(form).findByRole("alert")).toHaveTextContent(/no folder/);
+    expect(calls("khipu_config_set")).toEqual([]);
     fireEvent.change(input, { target: { value: " dispatch.py, run-job.sh,dispatch.py " } });
     fireEvent.click(within(form).getByRole("button", { name: "Save" }));
     await waitFor(() =>

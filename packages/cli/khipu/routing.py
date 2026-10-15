@@ -342,9 +342,9 @@ def _coerce(kind: str, value, key: str):
         names: list[str] = []
         for item in items:
             name = _short_text(item, f"{key}: a file name")
-            if not _SCRIPT_NAME.fullmatch(name) or name in (".", ".."):
+            if not _SCRIPT_NAME.fullmatch(name) or name in (".", "..") or name.startswith("-"):
                 raise ValueError(f"{key}: {name!r} must be a file name only: letters, digits, dots, dashes "
-                                 "and underscores, no folder")
+                                 "and underscores, not starting with a dash, no folder")
             if name not in names:
                 names.append(name)
         return names

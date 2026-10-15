@@ -339,7 +339,7 @@ def codex_sessionend_hook() -> str:
 # (the hook itself then looks at the call and stays silent for the rest), and
 # SubagentStart. PreToolUse holds the call, so its timeout is the per-prompt
 # hook's; the hook never denies, whatever happens.
-DELEGATION_MATCHER = "Agent|Task|Bash|shell|exec_command|local_shell|delegate_task"
+DELEGATION_MATCHER = "Agent|Task|spawn_agent|Bash|shell|shell_command|exec_command|local_shell|delegate_task"
 DELEGATION_TIMEOUT = PROMPT_RECALL_TIMEOUT
 SUBAGENT_START_TIMEOUT = 10
 DELEGATION_EVENTS = ("PreToolUse", "SubagentStart")
