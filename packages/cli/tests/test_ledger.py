@@ -1384,7 +1384,7 @@ def test_an_old_outcome_keeps_its_op_ids_digest(monkeypatch, tmp_path):
     ledger._record_outcome(ledger.new_op("set", P, "r", fields={"evidence": "one"}, op_id="same"), "landed",
                            result={"ok": True})
     old = time.time() - ledger.OUTCOME_KEEP_S - 60
-    os.utime(ledger._outcomes_dir() / "same.json", (old, old))
+    os.utime(ledger._outcome_path("same"), (old, old))
     ledger._prune_outcomes()
     assert "result" not in ledger._outcome("same")
     with pytest.raises(ledger.LedgerError) as err:
@@ -1589,7 +1589,7 @@ def test_a_retry_of_a_long_landed_write_while_away_is_answered_as_landed(monkeyp
     op = ledger.new_op("set", P, "r", fields={"evidence": "one"}, op_id="old")
     ledger._record_outcome(op, "landed", result={"ok": True, "line": "set r: evidence"})
     old = time.time() - ledger.OUTCOME_KEEP_S - 60
-    os.utime(ledger._outcomes_dir() / "old.json", (old, old))
+    os.utime(ledger._outcome_path("old"), (old, old))
     ledger._prune_outcomes()
     got = ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "one"}, op_id="old"))
     assert got["ok"] and not got.get("queued") and ledger.queued_ops() == []
@@ -1605,3 +1605,77 @@ def test_the_hubs_record_of_a_purged_rows_op_answers_purged(hub):
     with _real_connect(hub) as conn, pytest.raises(ledger.LedgerError) as err:
         ledger._landed_result(conn, dict(op))
     assert err.value.reason == "purged"
+
+
+def test_case_distinct_op_ids_are_distinct_writes(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    first = ledger.new_op("set", P, "r", fields={"evidence": "one"}, op_id="CaseID")
+    ledger._record_outcome(first, "landed", result={"ok": True, "line": "set r: evidence"})
+    got = ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "one"}, op_id="caseid"))
+    assert got.get("queued") and [q["op_id"] for q in ledger.queued_ops()] == ["caseid"]
+    assert ledger._outcome("caseid") is None and ledger._outcome("CaseID")["op_id"] == "CaseID"
+
+
+def test_an_outcome_named_by_its_op_id_is_moved_and_answers_only_that_exact_id(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    op = ledger.new_op("set", P, "r", fields={"evidence": "one"}, op_id="CaseID")
+    legacy = ledger.outbox_dir() / "outcomes"
+    legacy.mkdir(parents=True)
+    # As an older Khipu named it, and as a case-insensitive disk hands it back for "caseid".
+    (legacy / "caseid.json").write_text(json.dumps({"op_id": "CaseID", "digest": ledger.op_digest(op),
+                                               "status": "landed", "result": {"ok": True, "line": "landed"}}))
+    got = ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "one"}, op_id="caseid"))
+    assert got.get("queued") and [q["op_id"] for q in ledger.queued_ops()] == ["caseid"]
+    assert ledger._outcome("CaseID")["status"] == "landed"
+    assert list(legacy.iterdir()) == []
+    assert [p.name for p in ledger._outcomes_dir().glob("*.json")] == [ledger._outcome_path("CaseID").name]
+    assert "caseid" not in ledger._outcome_path("CaseID").name.lower()
+
+
+def test_an_offline_refusal_binds_its_op_id(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    view = {"vocab": ledger.default_vocab(), "rows": [_copy_row("a")], "history": [], "gone": {},
+            "as_of": None, "offline": True}
+    monkeypatch.setattr(ledger, "_offline_view", lambda _p: view)
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("add", P, "a", fields={"title": "again", "kind": "slice"}, op_id="once"))
+    assert err.value.reason == "exists"
+    assert ledger._outcome("once")["status"] == "refused"
+    with pytest.raises(ledger.LedgerError) as err:  # another write under the refused id
+        ledger.write(ledger.new_op("add", P, "b", fields={"title": "B", "kind": "slice"}, op_id="once"))
+    assert err.value.reason == "op_id_reused" and ledger.queued_ops() == []
+    view["rows"] = []  # a retry is answered as first refused, even once the copy would allow it
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("add", P, "a", fields={"title": "again", "kind": "slice"}, op_id="once"))
+    assert err.value.reason == "exists" and ledger.queued_ops() == []
+
+
+def test_old_outcomes_that_disagree_are_each_kept_aside(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    ledger._record_outcome(ledger.new_op("set", P, "r", fields={"evidence": "one"}, op_id="C1"), "landed")
+    legacy = ledger.outbox_dir() / "outcomes"
+    legacy.mkdir(parents=True)
+    for digest in ("b1", "b2"):  # an older Khipu still running writes the old name twice
+        (legacy / "C1.json").write_text(json.dumps({"op_id": "C1", "digest": digest, "status": "landed"}))
+        ledger._migrate_outcomes()
+    kept = sorted(json.loads(p.read_text())["digest"] for p in legacy.glob("*.conflict"))
+    assert kept == ["b1", "b2"] and ledger._outcome("C1")["status"] == "landed"
+
+
+def test_a_hub_reused_refusal_in_the_line_does_not_bind_the_id_here(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "theirs"}, op_id="dup"))["queued"]
+
+    class Conn:
+        def close(self):
+            pass
+
+    def hub_holds_another(_conn, op, **_kw):
+        raise ledger._reused_error(op)
+
+    monkeypatch.setattr(ledger, "apply_op", hub_holds_another)
+    assert ledger.drain(conn=Conn())["refused"] == 1
+    assert ledger._outcome("dup") is None and len(list(ledger._refused_dir().glob("*.json"))) == 1
+    # The id's owner retrying here is answered by the hub, not by the losing write.
+    monkeypatch.setattr(ledger, "apply_op", lambda _conn, _op, **_kw: {"ok": True, "line": "set r: mine"})
+    assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "mine"}, op_id="dup"), conn=Conn())["ok"]

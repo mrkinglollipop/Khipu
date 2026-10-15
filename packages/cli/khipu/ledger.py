@@ -938,7 +938,19 @@ def _refused_dir() -> Path:
 
 
 def _outcomes_dir() -> Path:
+    return outbox_dir() / "op-outcomes"
+
+
+def _legacy_outcomes_dir() -> Path:
+    """Where an older Khipu kept outcomes, each named by its op id: on a disk
+    that ignores case, "CaseID" and "caseid" were one file there."""
     return outbox_dir() / "outcomes"
+
+
+def _outcome_path(op_id: str) -> Path:
+    """An op id's outcome file, named by a hash of its exact bytes: a disk that
+    ignores case or folds Unicode can never make two op ids share one name."""
+    return _outcomes_dir() / f"{hashlib.sha256(op_id.encode('utf-8')).hexdigest()}.json"
 
 
 OUTCOME_KEEP_S = 7 * 86400
@@ -989,18 +1001,62 @@ def _record_outcome(op: dict[str, Any], status: str, **detail: Any) -> None:
             if known.get("digest") != op_digest(op):
                 raise _reused_error(op)
             return
-        d = _outcomes_dir()
-        d.mkdir(parents=True, exist_ok=True)
-        _atomic_write(d / f"{op['op_id']}.json", {"op_id": op["op_id"], "digest": op_digest(op), "status": status,
+        _outcomes_dir().mkdir(parents=True, exist_ok=True)
+        _atomic_write(_outcome_path(op["op_id"]), {"op_id": op["op_id"], "digest": op_digest(op), "status": status,
                                                   "at": _z(_now()), **detail})
 
 
-def _outcome(op_id: str) -> dict[str, Any] | None:
+def _read_outcome(path: Path) -> dict[str, Any] | None:
     try:
-        got = json.loads((_outcomes_dir() / f"{op_id}.json").read_text(encoding="utf-8"))
+        got = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return got if isinstance(got, dict) else None
+    return got if isinstance(got, dict) and isinstance(got.get("op_id"), str) else None
+
+
+def _outcome(op_id: str) -> dict[str, Any] | None:
+    """The outcome stored for exactly ``op_id``: the id inside the file must
+    match byte for byte, whatever the file system made of its name."""
+    _migrate_outcomes()
+    got = _read_outcome(_outcome_path(op_id))
+    return got if got is not None and got["op_id"] == op_id else None
+
+
+def _migrate_outcomes() -> None:
+    """Move outcomes an older Khipu named by op id to their hashed names, each
+    under the op id written inside it. Where a case-insensitive disk had
+    already merged two ids into one file, the id inside is the one that
+    wrote it, so the other id is free again, as it always should have been.
+    A hashed outcome already there stands; a disagreeing old one is kept
+    aside as ``.conflict``, never deleted."""
+    from khipu.outbox import _atomic_write
+
+    legacy = _legacy_outcomes_dir()
+    try:
+        old = sorted(legacy.glob("*.json"))
+    except OSError:
+        return
+    if not old:
+        return
+    with _op_lock():
+        for path in old:
+            got = _read_outcome(path)
+            if got is None:
+                continue
+            try:
+                stamp = path.stat()
+                dst = _outcome_path(got["op_id"])
+                held = _read_outcome(dst)
+                if held is None:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    _atomic_write(dst, got)
+                    os.utime(dst, (stamp.st_atime, stamp.st_mtime))  # its age still decides pruning
+                elif held.get("op_id") != got["op_id"] or held.get("digest") != got.get("digest"):
+                    path.rename(path.with_name(f"{path.name}.{uuid.uuid4().hex}.conflict"))
+                    continue
+                path.unlink(missing_ok=True)
+            except OSError:
+                continue
 
 
 def _prune_outcomes() -> None:
@@ -1011,11 +1067,12 @@ def _prune_outcomes() -> None:
 
     cutoff = time.time() - OUTCOME_KEEP_S
     try:
+        _migrate_outcomes()
         with _op_lock():
             for path in _outcomes_dir().glob("*.json"):
                 if path.stat().st_mtime >= cutoff:
                     continue
-                got = _outcome(path.stem)
+                got = _read_outcome(path)
                 if got is None or got.get("pruned"):
                     continue
                 kept = {"op_id": got.get("op_id"), "digest": got.get("digest"), "status": got.get("status"),
@@ -1186,7 +1243,13 @@ def _drain_locked(conn, out: dict[str, Any], waiting: frozenset[str] = frozenset
             try:
                 result = apply_op(conn, op, late=op.get("op_id") not in waiting)
             except LedgerError as exc:
-                _finish_job(path, job, "refused", refused=str(exc), reason_word=exc.reason)
+                if exc.reason == "op_id_reused":
+                    # The hub holds another write under this id: the id is not
+                    # this job's to bind here. It is kept aside as refused.
+                    with _op_lock():
+                        _refuse_job(path, {**job, "refused": str(exc), "reason_word": exc.reason})
+                else:
+                    _finish_job(path, job, "refused", refused=str(exc), reason_word=exc.reason)
                 out["refused"] += 1
                 continue
             except Exception as exc:  # noqa: BLE001
@@ -1288,7 +1351,13 @@ def _queue_while_away(op: dict[str, Any], reason: str) -> dict[str, Any]:
         held = _known_op(op)
         if held is not None:
             return held
-        _check_offline(op)
+        try:
+            _check_offline(op)
+        except LedgerError as exc:
+            # Bound before it is answered, as the hub binds its refusals: the
+            # id stands for this refused write and is never free for another.
+            _record_outcome(op, "refused", refused=str(exc), reason_word=exc.reason)
+            raise
         enqueue(op, reason=reason)
     return _queued_reply(op)
 
@@ -1419,8 +1488,10 @@ def _landed_result(conn, op: dict[str, Any]) -> dict[str, Any] | None:
             marker = _marker(cur, op["project"], op["row_id"]) if got is not None else None
     finally:
         conn.rollback()
-    if got is None or tuple(got[:3]) != (op["project"], op["row_id"], op["verb"]) or got[3] != op_digest(op):
+    if got is None:
         return None
+    if tuple(got[:3]) != (op["project"], op["row_id"], op["verb"]) or got[3] != op_digest(op):
+        raise _reused_error(op)
     if marker:
         raise _purged_error(op["row_id"], marker)
     stored = dict(got[4] or {})
