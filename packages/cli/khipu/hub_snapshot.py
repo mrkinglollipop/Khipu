@@ -1043,7 +1043,9 @@ def ledger_gone_version(project: str, row_id: str) -> int | None:
     its marker table or the marker is missing. Unlike the readers above it
     raises when the replica is there but cannot be read: a caller deciding
     whether a row was purged must not take an unreadable copy for "no"."""
-    if not snapshot_path().is_file():
+    try:
+        os.stat(snapshot_path())
+    except FileNotFoundError:
         return None
     con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
     try:

@@ -1496,12 +1496,12 @@ def test_a_later_writer_cannot_take_a_place_ahead_of_the_lock_holders_decision(m
     real_jobs, real_enqueue = ledger._outbox_jobs, ledger.enqueue
     at_check, later_queued, first_look, landed = threading.Event(), threading.Event(), [True], []
 
-    def jobs():
+    def jobs(**kw):
         if threading.current_thread().name == "older" and first_look[0]:
             first_look[0] = False
             at_check.set()
             later_queued.wait(1)  # a later write that can queue now would go first
-        return real_jobs()
+        return real_jobs(**kw)
 
     def enqueue(op, reason=""):
         path = real_enqueue(op, reason)
@@ -1800,6 +1800,109 @@ def test_the_drain_never_resends_a_decided_job_or_stalls_on_a_refusal_it_cannot_
     _atomic_write(ledger.outbox_dir() / f"{1:020d}-landed.json", {"op": landed, "reason": ""})
     ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "y"}, op_id="dup"))
     ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "z"}, op_id="next"))
-    (ledger.outbox_dir() / "op-rejected").write_text("the refusal cannot be kept")
+    real_record = ledger._record_rejected
+    monkeypatch.setattr(ledger, "_record_rejected", lambda *_a: (_ for _ in ()).throw(OSError("disk full")))
+    out = ledger.drain(conn=_Conn())  # the refusal cannot be kept: the job stays and nothing passes it
+    assert out["stopped_early"] and sent == ["dup"] and [q["op_id"] for q in ledger.queued_ops()] == ["dup", "next"]
+    monkeypatch.setattr(ledger, "_record_rejected", real_record)
     assert ledger.drain(conn=_Conn())["refused"] == 1
-    assert sent == ["dup", "next"] and ledger.queued_ops() == []
+    assert sent == ["dup", "dup", "next"] and ledger.queued_ops() == []
+
+
+# ---- round 8: an error is never taken for "nothing known" ------------------------------
+
+
+def test_the_drain_keeps_a_job_whose_record_cannot_be_read_and_sends_nothing(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    op = ledger.new_op("set", P, "r", fields={"evidence": "x"}, op_id="refused")
+    path = ledger.enqueue(op)
+    ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "y"}, op_id="behind"))
+    ledger._record_outcome(op, "refused", refused="no such row", reason_word="not_found")
+    ledger._outcome_path("refused").write_text("{torn")
+    sent = []
+    monkeypatch.setattr(ledger, "apply_op", lambda _c, o, **_kw: sent.append(o["op_id"]) or {"ok": True})
+    out = ledger.drain(conn=_Conn())
+    assert sent == [] and path.exists() and out["stopped_early"] and out["refused"] == 0
+    assert [q["op_id"] for q in ledger.queued_ops()] == ["refused", "behind"]
+
+
+@pytest.mark.parametrize("mode", ["away", "waiting"])
+def test_a_landed_write_learned_of_after_the_first_look_still_answers_purged(monkeypatch, tmp_path, mode):
+    from khipu import hub_snapshot as hs
+
+    ledger = _offline(monkeypatch, tmp_path)
+    op = ledger.new_op("add", P, "r", fields={"title": "R", "kind": "slice"}, op_id="raced")
+
+    def connect():  # another writer lands this op and the copy learns of a purge meanwhile
+        ledger._record_outcome(op, "landed", result={"ok": True, "line": "added r", "verb": "add", "id": "r"})
+        con = sqlite3.connect(str(_snapshot(tmp_path)))
+        con.execute("INSERT INTO ledger_gone VALUES (?, ?, ?)", (P, "r", hs.LEDGER_PURGED_VERSION))
+        con.commit()
+        con.close()
+        if mode == "away":
+            raise ledger.HubAway("synthetic")
+        return _Conn()
+
+    monkeypatch.setattr(ledger, "_connect", connect)
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("add", P, "r", fields={"title": "R", "kind": "slice"}, op_id="raced"))
+    assert err.value.reason == "purged" and ledger.queued_ops() == []
+
+
+def test_a_rejection_that_cannot_be_kept_never_reopens_the_id(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    ledger.outbox_dir().mkdir(parents=True, exist_ok=True)
+    sent = []
+
+    def reused(_c, o, **_kw):
+        sent.append(o["op_id"])
+        raise ledger._reused_error(o)
+
+    monkeypatch.setattr(ledger, "apply_op", reused)
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "losing"}, op_id="lost"), conn=_Conn())
+    assert err.value.reason == "op_id_reused"
+    (ledger.outbox_dir() / "op-rejected").rename(ledger.outbox_dir() / "kept-aside")
+    (ledger.outbox_dir() / "op-rejected").write_text("not a folder")  # where the refusal is kept is blocked
+    for conn in (_Conn(), None):  # nothing is sent, queued or answered as free while it is blocked
+        with pytest.raises(ledger.LedgerError) as err:
+            ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "losing"}, op_id="lost"), conn=conn)
+        assert err.value.reason == "op_unreadable"
+    assert sent == ["lost"] and ledger.queued_ops() == []
+
+
+def test_an_unreadable_line_or_copy_never_becomes_a_refusal_that_binds_the_id(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    view = {"vocab": ledger.default_vocab(), "rows": [], "history": [], "gone": {}, "as_of": None, "offline": True}
+    monkeypatch.setattr(ledger, "_offline_view", lambda _p: view)
+    ledger.enqueue(ledger.new_op("add", P, "new", fields={"title": "N", "kind": "slice"}, op_id="add-new"))
+    good = ledger._outbox_jobs()[0].read_text()
+    ledger._outbox_jobs()[0].write_text("{torn")  # the add the set depends on cannot be read
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("set", P, "new", fields={"evidence": "e"}, op_id="set-new"))
+    assert err.value.reason == "op_unreadable" and ledger._outcome("set-new") is None
+    ledger._outbox_jobs()[0].write_text(good)
+    ledger._replica_pending_path().write_text("{torn")  # which rows the copy lags on cannot be read
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("set", P, "other", fields={"evidence": "e"}, op_id="set-other"))
+    assert err.value.reason == "op_unreadable" and ledger._outcome("set-other") is None
+    ledger._replica_pending_path().unlink()
+    assert ledger.write(ledger.new_op("set", P, "new", fields={"evidence": "e"}, op_id="set-new"))["queued"]
+
+
+def test_a_landed_job_whose_outcome_cannot_be_kept_stays_in_line(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    path = ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "x"}, op_id="landed"))
+    ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "y"}, op_id="behind"))
+    sent = []
+
+    def apply(_c, o, **_kw):
+        sent.append(o["op_id"])
+        ledger._outcome_path(o["op_id"]).parent.mkdir(parents=True, exist_ok=True)
+        ledger._outcome_path(o["op_id"]).write_text("{torn")  # its record goes bad as it lands
+        return {"ok": True}
+
+    monkeypatch.setattr(ledger, "apply_op", apply)
+    out = ledger.drain(conn=_Conn())
+    assert sent == ["landed"] and path.exists() and out["stopped_early"] and out["refused"] == 0
+    assert not list(ledger._refused_dir().glob("*.json")) if ledger._refused_dir().exists() else True
