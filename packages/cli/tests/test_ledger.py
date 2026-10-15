@@ -839,3 +839,53 @@ def test_a_usage_error_masks_a_key_shaped_argument(argv):
     with redirect_stderr(err), pytest.raises(SystemExit):
         cli.build_parser().parse_args(["ledger", *argv])
     assert SECRET_ID not in err.getvalue() and "error:" in err.getvalue()
+
+
+def test_offline_checks_know_removed_purged_and_queued_removals_and_children(hub, tmp_path, monkeypatch):
+    from khipu import hub_snapshot as hs
+    from khipu import ledger
+
+    path = _snapshot(tmp_path)
+    ok("add", "keep", "--title", "Kept", "--kind", "slice")
+    ok("add", "kid", "--title", "Child", "--kind", "slice", "--parent", "keep")
+    for rid in ("gone-1", "gone-2", "x"):
+        ok("add", rid, "--title", "Short-lived", "--kind", "slice")
+    ok("remove", "gone-1")
+    ok("remove", "gone-2")
+    with _real_connect(hub) as conn:
+        ledger.purge(conn, P, "gone-2")
+    con = sqlite3.connect(str(path))  # a fresh refresh: markers come from the dump too
+    con.execute("DELETE FROM ledger_gone")
+    with _real_connect(hub) as conn:
+        with conn.cursor() as cur:
+            con.execute("DELETE FROM ledger_rows")
+            con.execute("DELETE FROM ledger_history")
+            con.execute("DELETE FROM ledger_vocab")
+            con.execute("DELETE FROM ledger_projects")
+            hs._insert_ledger(cur, con)
+    con.commit()
+    con.close()
+    _away(monkeypatch)
+    assert run("add", "gone-1", "--title", "Again", "--kind", "slice", "--project", P, "--json")[1].count(
+        '"reason": "removed"') == 1
+    assert '"reason": "purged"' in run("add", "gone-2", "--title", "Again", "--kind", "slice", "--project", P,
+                                       "--json")[1]
+    assert ok("remove", "x").splitlines()[0] == "removed x: queued"
+    assert '"reason": "removed"' in run("add", "x", "--title", "Again", "--kind", "slice", "--project", P,
+                                        "--json")[1]
+    assert '"reason": "has_children"' in run("remove", "keep", "--project", P, "--json")[1]
+    assert ok("remove", "keep", "--children", "move-up").splitlines()[0] == "removed keep: queued"
+
+
+def test_offline_checks_do_not_refuse_a_row_the_copy_has_not_caught_up_with(hub, tmp_path, monkeypatch):
+    from khipu import hub_snapshot as hs
+
+    _snapshot(tmp_path)
+    ok("add", "a", "--title", "In the copy", "--kind", "slice")
+    lock = hs._acquire_refresh_lock()
+    try:
+        ok("add", "b", "--title", "Landed while the copy was busy", "--kind", "slice")
+    finally:
+        hs._release_refresh_lock(lock)
+    _away(monkeypatch)
+    assert ok("set", "b", "--state", "IN FLIGHT").splitlines()[0] == "set b: queued"

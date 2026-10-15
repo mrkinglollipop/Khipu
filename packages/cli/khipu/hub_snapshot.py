@@ -1055,11 +1055,14 @@ def ledger_read_snapshot(project: str) -> dict[str, Any] | None:
                 if isinstance(entry[key], str):
                     entry[key] = json.loads(entry[key])
             history.append(entry)
+        gone: dict[str, int] = {}
+        if _snapshot_table_columns(con, "ledger_gone"):
+            gone = dict(con.execute("SELECT row_id, version FROM ledger_gone WHERE project = ?", (project,)))
     except (sqlite3.Error, ValueError):
         return None
     finally:
         con.close()
-    return {"vocab": vocab, "rows": rows, "history": history, "as_of": meta().get("refreshed_at")}
+    return {"vocab": vocab, "rows": rows, "history": history, "gone": gone, "as_of": meta().get("refreshed_at")}
 
 
 _EPISODE_FTS_COLS = ("summary", "topics", "decisions", "preferences", "people")

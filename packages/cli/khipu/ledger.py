@@ -1114,15 +1114,46 @@ def _check_offline(op: dict[str, Any]) -> None:
         if fields.get("kind"):
             fields["kind"] = _word(vocab, "kind", fields["kind"])
     merged = _overlay(view or {"vocab": vocab, "rows": [], "as_of": None, "offline": True}, project)
-    rows = {r["row_id"] for r in merged["rows"]}
-    if op["verb"] == "add" and op["row_id"] in rows:
-        raise LedgerError(f"row {op['row_id']} already exists; use set to update it", "exists")
+    rows = {r["row_id"]: r for r in merged["rows"]}
+    row_id = op["row_id"]
+    # A change that landed while the copy was busy is not in it yet: the copy
+    # cannot say whether this row exists, so the hub decides when it answers.
+    if f"{project}#{row_id}" in _pending_keys():
+        return
+    removed_in_queue = any(q.get("verb") == "remove" and q.get("row_id") == row_id for q in queued)
+    gone = (view or {}).get("gone") or {}
+    if op["verb"] == "add":
+        if row_id in rows:
+            raise LedgerError(f"row {row_id} already exists; use set to update it", "exists")
+        if row_id in gone or removed_in_queue:
+            if gone.get(row_id, 0) >= _purged_version():
+                raise LedgerError(f"row {row_id} was removed for good", "purged")
+            raise LedgerError(f"row {row_id} was removed; it can be restored in the app", "removed")
+        return
     # Without the project in the offline copy, a row missing here may still be
     # on the hub; only a row removed by a waiting write is known to be gone.
-    known = bool(view and view["rows"]) or any(q.get("verb") == "remove" and q.get("row_id") == op["row_id"]
-                                               for q in queued)
-    if op["verb"] in ("set", "remove") and known and op["row_id"] not in rows:
-        raise LedgerError(f"no such row: {op['row_id']}", "not_found")
+    known = bool(view and view["rows"]) or removed_in_queue or row_id in gone
+    if op["verb"] in ("set", "remove") and known and row_id not in rows:
+        raise LedgerError(f"no such row: {row_id}", "not_found")
+    if op["verb"] == "remove" and op.get("children") not in ("remove", "move-up"):
+        children = [r for r in rows.values() if r["parent"] == row_id]
+        if children:
+            raise LedgerError(f"row {row_id} has {len(children)} child row(s); say --children remove to remove "
+                              "them too, or --children move-up to move them to its parent", "has_children")
+
+
+def _purged_version() -> int:
+    from khipu.hub_snapshot import LEDGER_PURGED_VERSION
+
+    return LEDGER_PURGED_VERSION
+
+
+def _pending_keys() -> set[str]:
+    try:
+        with _replica_pending() as pending:
+            return set(pending)
+    except OSError:
+        return set()
 
 
 # ---- reading ------------------------------------------------------------------
@@ -1147,8 +1178,8 @@ def _offline_view(project: str) -> dict[str, Any] | None:
     rows = [{**r, "created_at": _parse_time(r["created_at"]), "updated_at": _parse_time(r["updated_at"]),
              "refs": json.loads(r["refs"] or "{}") if isinstance(r["refs"], str) else (r["refs"] or {}),
              "removed_at": None, "removed_by": None, "removed_note": ""} for r in got["rows"]]
-    return {"vocab": got["vocab"], "rows": rows, "history": got["history"], "as_of": got.get("as_of"),
-            "offline": True}
+    return {"vocab": got["vocab"], "rows": rows, "history": got["history"], "gone": got.get("gone") or {},
+            "as_of": got.get("as_of"), "offline": True}
 
 
 def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
