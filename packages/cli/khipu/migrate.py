@@ -30,7 +30,6 @@ LOCAL_ORIGIN_SETTING = "khipu.local_origin"
 LOCAL_ORIGIN_NONE = "none"
 _STEP_MARKER = "-- khipu:step"
 _STEP_ANYWHERE_RE = re.compile(r"-- khipu:step\b")
-_DOLLAR_TAG_RE = re.compile(r"\$([A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$")
 
 
 class MigrationStepError(ValueError):
@@ -39,8 +38,43 @@ class MigrationStepError(ValueError):
     there would cut that construct in two, so the file is refused instead."""
 
 
+def _ident_start(c: str) -> bool:
+    # PostgreSQL's scanner takes every byte at or above 0x80 as an identifier
+    # letter, so any non-ASCII character counts, whatever its plane.
+    return ("a" <= c.lower() <= "z") or c == "_" or ord(c) > 127
+
+
 def _ident_char(c: str) -> bool:
-    return c.isalnum() or c in "_$" or ord(c) > 127
+    return _ident_start(c) or c.isdigit() and c.isascii() or c == "$"
+
+
+def _dollar_tag(sql: str, i: int) -> str | None:
+    """The whole opening delimiter ($tag$ or $$) at i, else None."""
+    j = i + 1
+    if j < len(sql) and _ident_start(sql[j]):
+        j += 1
+        while j < len(sql) and _ident_char(sql[j]) and sql[j] != "$":
+            j += 1
+    return sql[i:j + 1] if j < len(sql) and sql[j] == "$" else None
+
+
+def _continuation(sql: str, i: int) -> int | None:
+    """Where a string closed just before i continues: PostgreSQL joins two
+    quoted strings separated only by whitespace (line comments included) that
+    holds a newline, and the continuation keeps the first part's mode. The
+    position of the continuing quote, else None."""
+    newline, n = False, len(sql)
+    while i < n:
+        if sql[i] == "\n":
+            newline, i = True, i + 1
+        elif sql[i] in " \t\r\f":
+            i += 1
+        elif sql.startswith("--", i):
+            end = sql.find("\n", i)
+            i = n if end < 0 else end
+        else:
+            break
+    return i if newline and i < n and sql[i] == "'" else None
 
 
 def _lex(sql: str) -> tuple[list[tuple[int, int]], list[bool]]:
@@ -82,16 +116,21 @@ def _lex(sql: str) -> tuple[list[tuple[int, int]], list[bool]]:
                 elif sql[i] == c:
                     if sql.startswith(c * 2, i):
                         i += 2
-                    else:
-                        i += 1
+                        continue
+                    i += 1
+                    # Comments skipped here are inside the string: a marker
+                    # among them is never recorded, so it is refused.
+                    nxt = _continuation(sql, i) if c == "'" else None
+                    if nxt is None:
                         break
+                    i = nxt + 1
                 else:
                     i += 1
         elif c == "$" and (i == 0 or not _ident_char(sql[i - 1])) \
-                and (m := _DOLLAR_TAG_RE.match(sql, i)):
+                and (tag := _dollar_tag(sql, i)):
             has_code[-1] = True
-            close = sql.find(m.group(0), m.end())
-            i = n if close < 0 else close + len(m.group(0))
+            close = sql.find(tag, i + len(tag))
+            i = n if close < 0 else close + len(tag)
         else:
             if not c.isspace():
                 has_code[-1] = True

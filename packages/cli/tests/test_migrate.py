@@ -225,6 +225,78 @@ class StepMarkerLexingTest(unittest.TestCase):
         self.assertIn("$t$ $$ ' $t$", parts[0])
         self.assertIn("SELECT $1, a$b", parts[1])
 
+    def test_an_escape_string_keeps_escape_mode_across_a_continuation(self):
+        # E'a' then whitespace with a newline then 'more' is one E string
+        # (PostgreSQL concatenates it), so \' in the continuation is an escape.
+        top = "SELECT E'a'\n'it\\'s';\n-- khipu:step 2\nSELECT 2;\n"
+        self.assertEqual(len(migrate.steps(top)), 2, "the marker after the string is top level")
+        for name, sql in (
+                ("newline", "SELECT E'a'\n'b\\'\n-- khipu:step 2\n';\n"),
+                ("line comment", "SELECT E'a' -- note\n'b\\'\n-- khipu:step 2\n';\n"),
+                ("marker between the parts", "SELECT E'a'\n-- khipu:step 2\n'b';\n")):
+            with self.subTest(name), self.assertRaises(migrate.MigrationStepError):
+                migrate.steps(sql)
+
+    def test_a_dollar_tag_may_hold_any_non_ascii_character(self):
+        for tag in ("\U00010400", "a\U00010400", "\u00e9t\u00e9", "_\U0001F600x", "\u4e2d1"):
+            with self.subTest(tag=tag), self.assertRaises(migrate.MigrationStepError):
+                migrate.steps(f"SELECT ${tag}$\n-- khipu:step 2\n${tag}$;\n")
+
+    def test_random_sql_never_splits_inside_a_quoted_or_commented_region(self):
+        import random
+
+        marker = "\n-- khipu:step x\n"
+        pieces = ["a", " ", "\n", "--", "/", "*", ";", "$", "'", '"', "\\", marker]
+        tags = ["", "t", "tag_1", "_x9", "\u00e9", "\U00010400", "a\U00010400", "\u4e2d"]
+
+        def body(rng, bad):
+            return "".join(p for p in rng.choices(pieces, k=rng.randint(0, 8)) if p not in bad)
+
+        def region(rng):
+            """One quoted or commented region, and whether marker text is in it."""
+            kind = rng.choice(["str", "estr", "cont", "ident", "dollar", "block", "line"])
+            if kind == "str":
+                text = "'" + body(rng, {"'", "\\"}).replace("'", "''") + "'"
+            elif kind in ("estr", "cont"):
+                inner = body(rng, {"'", "\\"}) + rng.choice(["", "\\'", "\\\\", "''"])
+                text = "E'" + inner + "'"
+                if kind == "cont":
+                    text += rng.choice(["\n", " \n ", " -- c\n"]) + "'" + rng.choice(
+                        ["", "\\'", "x"]) + body(rng, {"'", "\\"}) + "'"
+            elif kind == "ident":
+                text = '"' + body(rng, {'"'}) + '"'
+            elif kind == "dollar":
+                tag = rng.choice(tags)
+                inner = body(rng, {"$"}) + rng.choice(["", "$$" if tag else "", "'"])
+                text = f"${tag}$" + inner + f"${tag}$"
+            elif kind == "block":
+                text = "/*" + body(rng, {"/", "*"}) + "/* " + body(rng, {"/", "*"}) + " */*/"
+            else:
+                text = "-- " + body(rng, {"\n", marker}) + "\n"
+                if rng.random() < 0.3:
+                    text = "-- note -- khipu:step y\n"
+            return text, "khipu:step" in text
+
+        rng = random.Random(20261015)
+        for case in range(3000):
+            sections, embedded = [], False
+            for _ in range(rng.randint(1, 4)):
+                tokens = ["SELECT 1"]
+                for _ in range(rng.randint(0, 4)):
+                    text, has = region(rng)
+                    embedded |= has
+                    tokens.append(text)
+                    tokens.append(rng.choice([" ", " x$y ", " $1 ", ", "]))
+                sections.append(" ".join(tokens) + ";")
+            sql = "".join(s + (f"\n-- khipu:step {k}\n" if k < len(sections) - 1 else "\n")
+                          for k, s in enumerate(sections))
+            with self.subTest(case=case, sql=sql):
+                if embedded:
+                    with self.assertRaises(migrate.MigrationStepError):
+                        migrate.steps(sql)
+                else:
+                    self.assertEqual([p.strip() for p in migrate.steps(sql)], sections)
+
     def test_a_file_without_markers_is_one_step_unchanged(self):
         sql = "SELECT 'x';\n"
         self.assertEqual(migrate.steps(sql), [sql])
