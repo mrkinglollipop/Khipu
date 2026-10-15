@@ -1241,3 +1241,14 @@ def test_the_owner_can_dismiss_a_runners_side_of_a_disagreement(home):
     # An id that is no report about the account is still refused.
     with pytest.raises(routing.RouteError):
         routing.clear("Claude second", report_id="r-nothing", via="app")
+
+
+def test_the_table_says_why_it_cannot_be_read_in_a_fixed_phrase(tmp_path):
+    """A folder named as the routing table reads "a folder, not a file", so
+    the app can say so; a missing file and a file with no NOW block keep
+    their own phrases (final fix round, S2)."""
+    (tmp_path / "dir").mkdir()
+    (tmp_path / "plain.md").write_text("no block here\n")
+    assert routing_sources.read_table(str(tmp_path / "dir"))["error"] == "a folder, not a file"
+    assert routing_sources.read_table(str(tmp_path / "nope.md"))["error"] == "missing"
+    assert routing_sources.read_table(str(tmp_path / "plain.md"))["error"] == "no NOW block"

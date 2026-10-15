@@ -229,6 +229,8 @@ def read_only(path: Path, *, tail: int | None = None, limit: int = JSON_MAX) -> 
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     try:
         st = os.fstat(fd)
+        if stat.S_ISDIR(st.st_mode):
+            raise IsADirectoryError("a folder, not a file")
         if not stat.S_ISREG(st.st_mode):
             raise OSError("not a regular file")
         before = False  # whether the byte before the tail is read too

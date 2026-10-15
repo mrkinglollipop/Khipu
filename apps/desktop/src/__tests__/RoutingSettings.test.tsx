@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { RoutingSettings } from "../RoutingSettings";
 import type { RouteAccount, RouteView } from "../routing";
-import { changeDays, chosenEnd, durationWords, endChoices, isoLocal, limitWords, ruleOrigin } from "../routingWords";
+import { changeDays, chosenEnd, durationWords, endChoices, isoLocal, limitWords, ruleOrigin, settingWords, tableErrorWords } from "../routingWords";
 // The stylesheet as written, for the headless Chrome layout check (vitest
 // hands CSS imports over empty). The app has no @types/node.
 // @ts-expect-error node:fs has no types here
@@ -679,7 +679,7 @@ describe("Settings -> Routing: choosing the routing table file (R2-1)", () => {
     fireEvent.change(within(form).getByLabelText("File"), { target: { value: "/private/auth.json" } });
     fireEvent.click(within(form).getByRole("button", { name: "Save" }));
     expect(await within(form).findByRole("alert")).toHaveTextContent(
-      "Khipu didn't make that change: routing_table can't name a file inside a private folder",
+      "Khipu didn't make that change: Routing table file can't name a file inside a private folder",
     );
     fireEvent.click(within(form).getByRole("button", { name: "Stop reading it" }));
     await waitFor(() => expect(calls("khipu_config_unset")).toEqual([{ key: "routing_table" }]));
@@ -856,4 +856,43 @@ describe.skipIf(!CHROME)("Settings -> Routing laid out (fix round 1)", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 90000);
+});
+
+// ---- Final fix round --------------------------------------------------------------------------
+
+describe("Settings -> Routing: the routing table file in plain words", () => {
+  it("names the setting as its row does, never by its key (S1)", async () => {
+    answers.khipu_config_set = { ok: false, error: "routing_table needs the file's full path (starting with / or ~)" };
+    await page();
+    fireEvent.click(await screen.findByRole("button", { name: "Change the routing table file" }));
+    const form = screen.getByRole("form", { name: "Change the routing table file" });
+    fireEvent.change(within(form).getByLabelText("File"), { target: { value: "/notes/other.md" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    const alert = await within(form).findByRole("alert");
+    expect(alert).toHaveTextContent("Khipu didn't make that change: Routing table file needs the file's full path");
+    expect(alert.textContent).not.toContain("routing_table");
+    expect(settingWords("set routing_table, not routing_tables", "routing_table", "Routing table file"))
+      .toBe("set routing table file, not routing_tables");
+  });
+
+  it.each([
+    ["missing", "Can't read it: no file at that path"],
+    ["a folder, not a file", "Can't read it: that is a folder, not a file"],
+    ["no NOW block", "Can't read it: it has no NOW block"],
+  ])("says why the file can't be read: %s (S2)", async (error, words) => {
+    answers.khipu_route_view = () => {
+      const v = view();
+      v.sources = { ...v.sources, table: { path: "/notes/routing/ROUTING-NOW.md", error } };
+      return v;
+    };
+    await page();
+    expect(await screen.findByText(words)).toBeInTheDocument();
+  });
+
+  it("maps the CLI's other phrases and never shows one it does not know (S2)", () => {
+    expect(tableErrorWords("larger than 2 MB")).toBe("it is larger than 2 MB");
+    expect(tableErrorWords("not allowed to read it")).toBe("Khipu isn't allowed to read it");
+    expect(tableErrorWords("not a regular file")).toBe("that is not a plain file");
+    expect(tableErrorWords("something new")).toBe("it can't be read");
+  });
 });

@@ -43,7 +43,9 @@ import {
   holdKind,
   limitWords,
   ruleOrigin,
+  settingWords,
   stateSaid,
+  tableErrorWords,
 } from "./routingWords";
 import type { LimitUnit } from "./routingWords";
 
@@ -117,15 +119,18 @@ function useWriter(reread: () => Promise<unknown>): Writer {
   return { busy, errors, run, fail };
 }
 
-function WriteError({ w, id }: { w: Writer; id: string }) {
+/** `say` puts a refusal in the control's own words, as a setting's name
+ *  for its internal key. */
+function WriteError({ w, id, say }: { w: Writer; id: string; say?: (msg: string) => string }) {
   const msg = w.errors[id];
   if (!msg) return null;
   return (
     <p className="set-error" role="alert">
-      Khipu didn't make that change: {msg}
+      Khipu didn't make that change: {say ? say(msg) : msg}
     </p>
   );
 }
+
 
 function Busy({ on }: { on: boolean }) {
   return on ? <Loader2 size={14} className="spin" aria-hidden /> : null;
@@ -1970,7 +1975,7 @@ function TableSection({
   const formId = `table-${useId().replace(/:/g, "")}`;
   const id = "table-file";
   let val = "Not read yet";
-  if (table?.error) val = "Can't read it";
+  if (table?.error) val = `Can't read it: ${tableErrorWords(table.error)}`;
   else if (table?.changed_at) val = `NOW block changed ${whenLocal(table.changed_at, now)}`;
   else if (table) val = "Read; no change seen yet";
   const close = () => {
@@ -2052,7 +2057,7 @@ function TableSection({
                 <p className="set-help">
                   The file's full path, starting with / or ~/. Khipu won't read a file inside a private folder.
                 </p>
-                <WriteError w={w} id={id} />
+                <WriteError w={w} id={id} say={(m) => settingWords(m, "routing_table", "Routing table file")} />
                 <div className="toolbar">
                   <button type="submit" className="primary sm" disabled={w.busy === id}>
                     <Busy on={w.busy === id} />

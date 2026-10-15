@@ -13,7 +13,7 @@ import { tightestWindow } from "./PlansCard";
 import {
   accountSource,
   accountState,
-  brokenChecks,
+  brokenRules,
   disagreementWords,
   holdReminder,
   holdSource,
@@ -122,8 +122,16 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
   const holds = data.holds ?? [];
   const rules = data.rules ?? [];
   const toConfirm = rules.filter((r) => r.seeded && !r.confirmed).length;
-  const broken = brokenChecks(data);
-  const brokenAt = new Map(broken.map((c) => [c.rule, c.at ?? null] as const));
+  // Counted per rule: one rule broken on two lanes is one rule that may be
+  // broken. Its mark shows the latest sighting.
+  const broken = brokenRules(data);
+  const brokenAt = new Map(
+    broken.map((g) => {
+      const seen = g.checks.map((c) => c.at).filter((at): at is string => !!at && !Number.isNaN(Date.parse(at)));
+      const latest = seen.sort((x, y) => Date.parse(x) - Date.parse(y)).pop() ?? null;
+      return [g.rule, latest] as const;
+    }),
+  );
   const stale = notRefreshedWords(state, now);
   return (
     <div className="card routing-card">

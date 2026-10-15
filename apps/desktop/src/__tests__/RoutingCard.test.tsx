@@ -22,7 +22,7 @@ const appCss: string = readFileSync(
   `${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/App.css`,
   "utf8",
 );
-import { accountSource, accountState, lastChangeWords, useRouting } from "../routing";
+import { accountSource, accountState, lastChangeWords, notRefreshedWords, ruleWords, useRouting } from "../routing";
 import type { RouteAccount, RouteView, RoutingState } from "../routing";
 import { routingAttention } from "../doctorAttention";
 import { HealthReportRows, routingHealthRow } from "../healthRows";
@@ -131,7 +131,7 @@ const PLANS: UsageReport = {
 };
 
 function stateOf(data: RouteView | null, extra: Partial<RoutingState> = {}): RoutingState {
-  return { data, error: null, loading: false, lastOkAt: data ? new Date().toISOString() : null, load: vi.fn(), ...extra };
+  return { data, error: null, loading: false, lastOkAt: data ? new Date().toISOString() : null, firstRead: false, load: vi.fn(), ...extra };
 }
 
 function rowFor(label: string): HTMLElement {
@@ -355,7 +355,7 @@ describe("Home Routing card, two sources disagree and a rule may be broken", () 
       key: "routing:rules",
       tone: "warn",
       title: "A standing rule may be broken",
-      cause: "Your rule 3 says: Never a -fast tier. Your Project A job runner's settings name a model ending in -fast for its grokcheck lane (seen at 11:22 AM in its settings file). Khipu stopped nothing; it only reports.",
+      cause: "Your rule says never a -fast tier. Your Project A job runner's settings name a model ending in -fast for its grokcheck lane (seen at 11:22 AM in its settings file). Khipu stopped nothing; it only reports.",
     }]);
     const row = routingHealthRow(conflictView(), MORNING);
     expect(row?.status).toBe("err");
@@ -593,5 +593,101 @@ describe("Home Routing card, fix round 2", () => {
     }];
     const [item] = routingAttention(v, MORNING);
     expect(item.cause).toBe(m![1].replace(/&#x27;|&#39;/g, "'"));
+  });
+});
+
+describe("Home Routing card, final fix round", () => {
+  const fast = (runner: string, lane: string, at: string) => ({
+    rule: 3, status: "broken", at, runner, file: "settings",
+    text: `A standing rule may be broken: ${runner}'s settings name a model ending in -fast for its ${lane} lane.`,
+  });
+
+  it("counts a rule broken on two lanes once and quotes it once, the lanes under it (C1)", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(MORNING);
+    const v = mainView();
+    v.accounts = [];
+    v.rule_checks = [fast("Project A", "grokcheck", "2026-10-14T15:22:00Z"), fast("Project B", "grokfix", "2026-10-14T15:30:00Z")];
+    const [item] = routingAttention(v, MORNING);
+    expect(item.title).toBe("A standing rule may be broken");
+    expect(item.cause).toBe(
+      "Your rule says never a -fast tier. "
+      + "Your Project A job runner's settings name a model ending in -fast for its grokcheck lane (seen at 11:22 AM in its settings file). "
+      + "Your Project B job runner's settings name a model ending in -fast for its grokfix lane (seen at 11:30 AM in its settings file). "
+      + "Khipu stopped nothing; it only reports.");
+    render(<RoutingCard state={stateOf(v)} />);
+    expect(screen.getByText(/7 standing rules/)).toHaveTextContent("1 may be broken");
+    expect(screen.getByText(/Never a -fast tier\./).closest("li")).toHaveTextContent("may be broken, 11:30 AM");
+  });
+
+  it("counts two broken rules as two and names each by its number (C1)", () => {
+    const v = mainView();
+    v.accounts = [];
+    v.rule_checks = [
+      fast("Project A", "grokcheck", "2026-10-14T15:22:00Z"),
+      fast("Project A", "grokfix", "2026-10-14T15:22:00Z"),
+      { rule: 2, status: "broken", at: "2026-10-14T15:22:00Z", runner: "Project A", file: "settings",
+        text: "A standing rule may be broken: Project A's Grok check lane has no confirming lane from another model family." },
+    ];
+    const [item] = routingAttention(v, MORNING);
+    expect(item.title).toBe("2 standing rules may be broken");
+    expect(item.cause.match(/Your rule 3 says never a -fast tier\./g)).toHaveLength(1);
+    expect(item.cause).toContain("Your rule 2 says every Grok result that is acted on gets a re-check from a different model family. Your Project A job runner's Grok check lane");
+  });
+
+  it("names the job runner whose events log a rule was judged on (C3)", () => {
+    const v = mainView();
+    v.accounts = [];
+    v.rules = [...(v.rules ?? []), { n: 8, text: "Grok never works on a private pipeline." }];
+    v.rule_checks = [{
+      rule: 8, status: "broken", at: "2026-10-14T15:22:00Z", runner: "Project A", file: "events",
+      text: "A standing rule may be broken: a Grok lane is set to work on payroll, which is marked private.",
+    }];
+    const [item] = routingAttention(v, MORNING);
+    expect(item.cause).toBe(
+      "Your rule says Grok never works on a private pipeline. A Grok lane is set to work on payroll, which is marked private "
+      + "(seen at 11:22 AM in your Project A job runner's events log). Khipu stopped nothing; it only reports.");
+  });
+
+  it("keeps a rule's opening name as written and lower-cases a common opening word (C2)", () => {
+    expect(ruleWords("Never a -fast tier.")).toBe("never a -fast tier");
+    expect(ruleWords("Grok never builds or fixes privacy or safety code.")).toBe("Grok never builds or fixes privacy or safety code");
+    expect(ruleWords("Khipu runs in Aegis only through Aegis's own pack.")).toBe("Khipu runs in Aegis only through Aegis's own pack");
+    expect(ruleWords("API keys stay on this Mac.")).toBe("API keys stay on this Mac");
+  });
+
+  it("does not call the record old while the first read after Home turns active is under way (C4)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(MORNING);
+    invokeMock.mockResolvedValueOnce(JSON.stringify(mainView()));
+    const { result, rerender } = renderHook(({ on }) => useRouting(on), { initialProps: { on: true } });
+    await waitFor(() => expect(result.current.data?.version).toBe(9));
+    rerender({ on: false });
+    // Ten minutes away from Home, then back: the read it starts hangs.
+    vi.setSystemTime(new Date(MORNING.getTime() + 10 * 60_000));
+    let answer: (raw: string) => void = () => {};
+    invokeMock.mockImplementationOnce(() => new Promise<string>((res) => { answer = res; }));
+    rerender({ on: true });
+    expect(result.current.loading).toBe(true);
+    expect(notRefreshedWords(result.current, new Date())).toBeNull();
+    await act(async () => {
+      answer(JSON.stringify({ ...mainView(), checked_at: new Date().toISOString() }));
+    });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(notRefreshedWords(result.current, new Date())).toBeNull();
+    // A read that fails then, with the last good one past the bound, says so.
+    invokeMock.mockRejectedValueOnce("boom");
+    vi.setSystemTime(new Date(MORNING.getTime() + 20 * 60_000));
+    await act(async () => {
+      await result.current.load();
+    });
+    expect(notRefreshedWords(result.current, new Date())).toBe("Khipu's record has not been refreshed since 11:50 AM");
+  });
+
+  it("says the record is old when its own checked_at is past the bound, even on a good read (C4)", () => {
+    const v = { ...mainView(), checked_at: "2026-10-14T18:58:00Z" };
+    expect(notRefreshedWords({ data: v, lastOkAt: AFTERNOON.toISOString(), error: null }, AFTERNOON))
+      .toBe("Khipu's record has not been refreshed since 2:58 PM");
+    expect(notRefreshedWords({ data: v, lastOkAt: AFTERNOON.toISOString(), error: null, firstRead: true }, AFTERNOON)).toBeNull();
   });
 });

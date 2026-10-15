@@ -29,8 +29,8 @@ can see and change all of it in the app. Khipu never decides where work goes.
 | 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | done 2026-10-14 (PR #188) |
 | 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | done 2026-10-14 (PR #189) |
 | 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | done 2026-10-15 (PR #190) |
-| 3c | The daemon refolds on change and on the clock; the promotion gate's replay covers routing | S | built, in review (branch feat/routing-truth-3c) |
-| 4 | App: Home Routing card, Settings → Routing for what phases 1a to 3c built, health row, attention items | M–L | open (mock approved 2026-10-14; needs plan usage phase 2 merged) |
+| 3c | The daemon refolds on change and on the clock; the promotion gate's replay covers routing | S | done 2026-10-15 (PR #191) |
+| 4 | App: Home Routing card, Settings → Routing for what phases 1a to 3c built, health row, attention items | M–L | built, in review (branch feat/routing-truth-4) |
 | 5 | The background check at each known reset time, with its part of the app | S | open |
 | 6 | Push at the moment of delegation, with its part of the app | S–M | open (shaped by the phase 0 hook check; the Grok Build part needs Matt's go) |
 | 7 | Copy for cloud agents through the hub, read by cloud harnesses and a second Mac, with its part of the app | M | open |
@@ -548,11 +548,6 @@ into the app's attention items. They never gate `ok`. The texts Matt reads:
   `kind` is not set, it "can't be checked", never reported as passing.
 - Whether a Grok lane uses the paid xAI API "can't be checked: the launch environment is set inside
   <script>", never reported as passing.
-
-The app's attention item for a broken rule quotes the rule first, by its number and word for word: "Your rule
-3 says: Never a -fast tier. Your Project A job runner's settings name ... (seen at 11:22 AM in its settings
-file). Khipu stopped nothing; it only reports." The number matches the rule the card marks, and the rule's own
-first letter stays as written (lower-casing it would turn "Grok" or "Khipu" into "grok" or "khipu").
 - "A job was started on <account> while you had it paused", or "…after it had reached its limit." (LAUNCH
   lines, through the lane map)
 - "Your <runner> job runner stopped reporting at HH:MM", or "Khipu can't read <runner>'s files since HH:MM."
@@ -819,23 +814,6 @@ Inspect `PlansCard.tsx`, the fixed-argv commands in `lib.rs` (`khipu_usage_statu
   ships a control that does nothing.
 
 Useful alone: Matt sees and changes all of it without a terminal.
-
-Built differently from the mock (Settings fix round 1):
-
-- The pause form's "Note for your agents" field and a paused row's "Your note: ..." are not built: the record
-  has no note on a pause yet (`route pause` takes none), so under the stop-condition above they stay out.
-  Adding them needs a `--note` on `route pause`, the note in the fold, the summary and the tools; Matt's call
-  whether it joins a later phase.
-- The old off switches: Khipu sees only its own environment, never the shell a conversation starts from, so
-  the page says whether `/tmp/.routing_now_disable` exists and, unless Khipu's own environment has
-  `ROUTING_NOW_OFF=1`, that it can't see the shell's setting. It never says the setting is unset.
-- Dismiss buttons are named by whose report they remove ("Dismiss the runner's report", "Dismiss the
-  conversation's report"), as the mock words them, and work on a job runner's limit too.
-- Settings fix round 2: the routing table file row has the mock's Change... button (Choose... when no file is
-  set): a full path starting with / or ~/, checked in the app and by the CLI, plus Stop reading it. The app no
-  longer caps the owner's words at 4,000 characters; a hold follows `routing_hold_chars` (0: no limit) and a
-  note or a rule has no length limit. The only cap left is the size of one argument the app hands the CLI,
-  128 KB of text, and the page says so by the note, the rules and a hold's words.
 
 ### Phase 5: the check at reset times (S, one session)
 

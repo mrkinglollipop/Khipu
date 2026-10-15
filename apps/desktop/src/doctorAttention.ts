@@ -9,12 +9,13 @@
 
 import {
   aheadWords,
-  brokenChecks,
+  brokenRules,
   capitalise,
   longDisagreements,
   quietRunners,
   runnerWords,
   pastWords,
+  ruleWords,
   spanWords,
 } from "./routing";
 import type { RouteView } from "./routing";
@@ -355,26 +356,38 @@ export function buildAttention(parsed: Record<string, unknown>): {
 export function routingAttention(view: RouteView | null | undefined, now: Date = new Date()): Attention[] {
   if (!view || !view.record) return [];
   const items: Attention[] = [];
-  const broken = brokenChecks(view);
-  if (broken.length) {
-    const lines = broken.map((c) => {
-      const rule = (view.rules ?? []).find((r) => r.n === c.rule);
-      const said = rule ? `Your rule ${rule.n} says: ${rule.text.replace(/\.$/, "")}. ` : "";
-      let what = c.text.replace(/^A standing rule may be broken: /, "").replace(/\.$/, "");
-      // "Project A's settings name..." -> "Your Project A job runner's
-      // settings name...", as the card and the mock name a runner.
-      if (c.runner && what.startsWith(`${c.runner}'s `)) {
-        what = `Your ${c.runner} job runner's ${what.slice(c.runner.length + 3)}`;
-      }
-      what = capitalise(what);
-      const file = c.file === "settings" ? " in its settings file" : c.file === "events" ? " in its events log" : "";
-      const seen = c.at ? ` (seen ${pastWords(c.at, now)}${file})` : "";
-      return `${said}${what}${seen}.`;
+  const groups = brokenRules(view);
+  if (groups.length) {
+    // One rule, quoted once, then each runner or lane that breaks it, in
+    // the approved mock's words: "Your rule says never a -fast tier. Your
+    // Project A job runner's settings name ...". With more than one rule
+    // broken, each is named by its number so the card's marks match.
+    const lines = groups.map(({ rule: n, checks }) => {
+      const rule = (view.rules ?? []).find((r) => r.n === n);
+      const said = rule
+        ? `Your rule${groups.length > 1 ? ` ${rule.n}` : ""} says ${ruleWords(rule.text)}. `
+        : "";
+      const under = checks.map((c) => {
+        let what = c.text.replace(/^A standing rule may be broken: /, "").replace(/\.$/, "");
+        // "Project A's settings name..." -> "Your Project A job runner's
+        // settings name...", as the card and the mock name a runner.
+        if (c.runner && what.startsWith(`${c.runner}'s `)) {
+          what = `Your ${c.runner} job runner's ${what.slice(c.runner.length + 3)}`;
+        }
+        what = capitalise(what);
+        // "its" only when the sentence has named the runner already.
+        const owner = c.runner && !what.includes(c.runner) ? `your ${c.runner} job runner's` : "its";
+        const file =
+          c.file === "settings" ? ` in ${owner} settings file` : c.file === "events" ? ` in ${owner} events log` : "";
+        const seen = c.at ? ` (seen ${pastWords(c.at, now)}${file})` : "";
+        return `${what}${seen}.`;
+      });
+      return `${said}${under.join(" ")}`;
     });
     items.push({
       key: "routing:rules",
       tone: "warn",
-      title: broken.length === 1 ? "A standing rule may be broken" : `${broken.length} standing rules may be broken`,
+      title: groups.length === 1 ? "A standing rule may be broken" : `${groups.length} standing rules may be broken`,
       cause: `${lines.join(" ")} Khipu stopped nothing; it only reports.`,
     });
   }

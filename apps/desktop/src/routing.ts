@@ -474,6 +474,37 @@ export function brokenChecks(view: RouteView): RuleCheck[] {
   return (view.rule_checks ?? []).filter((c) => c.status === "broken");
 }
 
+/** The broken checks grouped by rule, in the order each rule first appears:
+ *  one rule broken on two lanes is one broken rule, not two. */
+export function brokenRules(view: RouteView): { rule: number; checks: RuleCheck[] }[] {
+  const out: { rule: number; checks: RuleCheck[] }[] = [];
+  for (const c of brokenChecks(view)) {
+    const g = out.find((x) => x.rule === c.rule);
+    if (g) g.checks.push(c);
+    else out.push({ rule: c.rule, checks: [c] });
+  }
+  return out;
+}
+
+// Words a rule commonly opens with that are not names, so "Never a -fast
+// tier." reads "never a -fast tier" after "Your rule says". Any other first
+// word keeps its letter as written: "Grok", "Khipu" or "Codex" is a name.
+const RULE_OPENERS = new Set([
+  "a", "after", "all", "always", "an", "any", "ask", "at", "avoid", "before", "both", "check", "do",
+  "don't", "each", "every", "for", "from", "give", "if", "in", "keep", "leave", "let", "make", "never",
+  "no", "not", "nothing", "on", "once", "one", "only", "prefer", "put", "read", "route", "run", "send",
+  "some", "stop", "the", "treat", "until", "use", "wait", "when", "while", "with", "without", "write",
+]);
+
+/** A rule's text as it reads after "Your rule says": the closing period
+ *  dropped and a common opening word lower-cased; a name stays as written. */
+export function ruleWords(text: string): string {
+  const t = text.trim().replace(/\.$/, "");
+  const first = t.split(/\s/, 1)[0] ?? "";
+  const plain = /^[A-Z][a-z']*[,:;]?$/.test(first) && RULE_OPENERS.has(first.replace(/[,:;]$/, "").toLowerCase());
+  return plain ? t.charAt(0).toLowerCase() + t.slice(1) : t;
+}
+
 export function quietRunners(view: RouteView): RouteRunner[] {
   return (view.sources?.runners ?? []).filter((r) => r.silent || r.unreadable);
 }
@@ -545,6 +576,15 @@ export function useRouting(active: boolean) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [lastOkAt, setLastOkAt] = useState<string | null>(null);
+  // True from the moment `active` turns true until the read it starts
+  // settles, so the card does not call a record old while that read is under
+  // way. Set during render, not in an effect, so not even one frame shows it.
+  const [wasActive, setWasActive] = useState(active);
+  const [firstRead, setFirstRead] = useState(active);
+  if (active !== wasActive) {
+    setWasActive(active);
+    if (active) setFirstRead(true);
+  }
   const inflight = useRef<Promise<void> | null>(null);
 
   const load = useCallback((fresh = false): Promise<void> => {
@@ -571,6 +611,7 @@ export function useRouting(active: boolean) {
       } finally {
         inflight.current = null;
         setLoading(false);
+        setFirstRead(false);
       }
     })();
     inflight.current = p;
@@ -584,21 +625,28 @@ export function useRouting(active: boolean) {
     return () => window.clearInterval(tick);
   }, [active, load]);
 
-  return { data, error, loading, lastOkAt, load };
+  return { data, error, loading, lastOkAt, firstRead, load };
 }
 
 export type RoutingState = ReturnType<typeof useRouting>;
 
-/** "Khipu's record has not been refreshed since 2:58 PM" when the last good
- *  read is older than the record's own bound (5 minutes by default). */
+/** "Khipu's record has not been refreshed since 2:58 PM" when a read failed
+ *  and the last good one is older than the record's own bound (5 minutes by
+ *  default), or when the record's own `checked_at` is past that bound. Never
+ *  while the first read after Home turns active again is under way: the view
+ *  is old then only because nobody was looking. */
 export function notRefreshedWords(
-  state: { data: RouteView | null; lastOkAt: string | null },
+  state: { data: RouteView | null; lastOkAt: string | null; error?: string | null; firstRead?: boolean },
   now: Date,
 ): string | null {
-  const { data, lastOkAt } = state;
-  if (!data || !lastOkAt || !data.record) return null;
+  const { data, lastOkAt, error, firstRead } = state;
+  if (!data || !lastOkAt || !data.record || firstRead) return null;
   const bound = data.warn_after?.not_refreshed ?? 5 * 60;
-  const at = parse(lastOkAt);
-  if (!bound || !at || now.getTime() - at.getTime() <= bound * 1000) return null;
+  if (!bound) return null;
+  const past = (iso: string | null | undefined) => {
+    const at = parse(iso);
+    return !!at && now.getTime() - at.getTime() > bound * 1000;
+  };
+  if (!(error && past(lastOkAt)) && !past(data.checked_at)) return null;
   return `Khipu's record has not been refreshed since ${whenLocal(data.checked_at ?? lastOkAt, now)}`;
 }

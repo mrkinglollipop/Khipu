@@ -309,3 +309,26 @@ export function changeDays(view: RouteView, now: Date): ChangeDay[] {
   }
   return days;
 }
+
+/** The CLI names a setting by its key ("routing_table needs ..."); the page
+ *  names it as the setting's own row does ("Routing table file needs ..."). */
+export function settingWords(msg: string, key: string, words: string): string {
+  return msg.replace(new RegExp(`\\b${key}\\b`, "g"), (_m: string, at: number) =>
+    at === 0 ? words : words.charAt(0).toLowerCase() + words.slice(1),
+  );
+}
+
+/** Why the routing table file can't be read, from the CLI's fixed phrase
+ *  (`routing_sources._short_error`, or "no NOW block"), in plain words. */
+export function tableErrorWords(error: string): string {
+  const big = /^larger than (\d+) MB$/.exec(error);
+  if (big) return `it is larger than ${big[1]} MB`;
+  const words: Record<string, string> = {
+    missing: "no file at that path",
+    "a folder, not a file": "that is a folder, not a file",
+    "not a regular file": "that is not a plain file",
+    "no NOW block": "it has no NOW block",
+    "not allowed to read it": "Khipu isn't allowed to read it",
+  };
+  return words[error] ?? "it can't be read";
+}
