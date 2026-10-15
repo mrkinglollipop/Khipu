@@ -965,6 +965,17 @@ def test_owner_commands_refuse_without_a_typed_confirmation(home, capsys, monkey
     assert "A rule, a pause, a clear or your note was written by something other than the app." in block["warnings"]
 
 
+def test_rule_at_owner_request_is_live_without_terminal_confirmation_but_owner_actions_are_not(home, capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc, out = _cli(["route", "rule", "add", "--at-owner-request", "Keep browser work read-only."], capsys)
+    assert rc == 0 and json.loads(out)["n"] == 1
+    rc, out = _cli(["route", "rule", "edit", "1", "--at-owner-request", "Keep all browser work read-only."], capsys)
+    assert rc == 0 and json.loads(out)["n"] == 1
+    for action in ("confirm", "retire", "undo", "dismiss"):
+        rc, out = _cli(["route", "rule", action, "1"], capsys)
+        assert rc == 2 and "typed confirmation" in json.loads(out)["error"]
+
+
 def test_the_cli_reads_and_reports(home, capsys, monkeypatch):
     monkeypatch.setenv("CLAUDECODE", "1")
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abcdef0123")
@@ -2116,6 +2127,55 @@ def test_a_removed_rule_comes_back_whole_with_restore(home, capsys):
     rc, out = _cli(["route", "rule", "restore", "--from-app", "--", "9"], capsys)
     assert rc == 2 and "no standing rule 9" in json.loads(out)["error"]
     assert routing.doctor_block()["outside_app"] == []
+
+
+def test_owner_requested_rules_are_live_pending_and_owner_can_confirm_undo_or_dismiss(home):
+    start = routing.read_view()["version"]
+    added = routing.request_rule("Keep browser work read-only.", author=ME)
+    rule = routing.read_view()["rules"][0]
+    assert added["n"] == 1 and rule["pending"] and rule["pending_kind"] == "added"
+    assert "added by a Claude Code conversation at the owner's request" in routing.summary()["text"]
+    delta = routing.since(start)
+    assert delta["entities"] == ["rule:1"] and "owner has not confirmed" in delta["lines"][0]
+    assert routing.doctor_block()["pending_conversation_rules"] == 1
+    routing.confirm_rule(1, via="app")
+    confirmed = routing.read_view()["rules"][0]
+    assert not confirmed["pending"] and confirmed["prior_text"] is None
+
+    routing.add_rule("Original wording.", via="app")
+    before_edit = routing.read_view()["version"]
+    routing.request_rule("First replacement.", n=2, author=ME)
+    routing.request_rule("Second replacement.", n=2, author=OTHER)
+    changed = next(r for r in routing.read_view()["rules"] if r["n"] == 2)
+    assert (changed["text"], changed["prior_text"], changed["pending_kind"]) == (
+        "Second replacement.", "Original wording.", "changed")
+    assert changed["pending_by"] == "a Codex conversation"
+    assert "it replaced: 'Original wording.'" in routing.summary()["text"]
+    account_delta = routing.conversation_view(since_version=before_edit, account="Codex")
+    assert account_delta["entities"] == ["rule:2"]
+    assert "it replaced: 'Original wording.'" in account_delta["lines"][0]
+    routing.confirm_rule(2, via="app")
+    assert "owner has not confirmed" not in routing.summary()["text"]
+    assert "it replaced: 'Original wording.'" not in routing.summary()["text"]
+    routing.request_rule("Second replacement.", n=2, author=OTHER)
+    routing.undo_rule_request(2, via="app")
+    undone = next(r for r in routing.read_view()["rules"] if r["n"] == 2)
+    assert (undone["text"], undone["pending"], undone["confirmed"]) == ("Original wording.", False, True)
+
+    routing.request_rule("Temporary pending rule.", author=ME)
+    routing.request_rule("Still temporary.", n=3, author=OTHER)
+    assert next(r for r in routing.read_view()["rules"] if r["n"] == 3)["pending_kind"] == "added"
+    routing.dismiss_rule_request(3, via="app")
+    assert all(r["n"] != 3 for r in routing.read_view()["rules"])
+
+
+def test_undo_pending_seeded_rule_keeps_it_unconfirmed(home):
+    routing._write({"type": "rule_add", "n": 1, "text": "Seeded rule.", "seeded": True,
+                    "source": "seed", "date": "2026-10-14", "written_by": {"kind": "seed"}, "via": "seed"})
+    routing.request_rule("Requested replacement.", n=1, author=ME)
+    routing.undo_rule_request(1, via="app")
+    rule = routing.read_view()["rules"][0]
+    assert (rule["text"], rule["confirmed"], rule["pending"]) == ("Seeded rule.", False, False)
 
 
 def test_the_apps_argv_keeps_a_dash_value_as_words_never_a_flag(home, capsys):

@@ -142,6 +142,13 @@ function rowFor(label: string): HTMLElement {
 }
 
 describe("Home Routing card, the main mock", () => {
+  it("counts pending conversation rules as needing confirmation", () => {
+    const data = mainView();
+    data.rules = [{ n: 1, text: "Keep deployment work local.", pending: true, pending_kind: "added", confirmed: false }];
+    render(<RoutingCard state={stateOf(data)} plans={PLANS} />);
+    expect(screen.getByText(/1 standing rule, shown first to every conversation/)).toHaveTextContent("1 not confirmed yet");
+  });
+
   it("shows each account in the Plans order with its state, who said so and when", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(MORNING);

@@ -745,6 +745,7 @@ function RuleRow({
   w,
   now,
   onRemoved,
+  back,
 }: {
   r: RouteRule;
   watched: boolean;
@@ -753,11 +754,13 @@ function RuleRow({
   w: Writer;
   now: Date;
   onRemoved: (r: RouteRule) => void;
+  back: Back;
 }) {
   const [draft, setDraft] = useState(r.text);
   const [editConfirm, setEditConfirm] = useState(false);
   const mine = ask?.n === r.n ? ask.kind : null;
-  const toConfirm = r.seeded && !r.confirmed;
+  const pending = !!r.pending;
+  const toConfirm = pending || (r.seeded && !r.confirmed);
   const id = `rule:${r.n}`;
   const fieldId = useId();
   const confirmBtn = useRef<HTMLButtonElement>(null);
@@ -784,15 +787,34 @@ function RuleRow({
         <span className="row-main">{r.text}</span>
         <span className="route-rule-meta">
           {origin}
-          {toConfirm ? <Tag tone="warn">Seeded, confirm</Tag> : null}
+          {pending ? <Tag tone="warn">{r.pending_kind === "changed" ? "Changed, reconfirm" : "Added, confirm"}</Tag> : null}
+          {!pending && toConfirm ? <Tag tone="warn">Seeded, confirm</Tag> : null}
           {r.seeded && r.confirmed ? <Tag tone="ok">Confirmed</Tag> : null}
           <Tag>{watched ? "Watched" : "Not watched by Khipu"}</Tag>
+          {pending ? (
+            <span className="set-help">
+              {`${r.pending_kind === "changed" ? "Changed" : "Added"} by ${r.pending_by ?? "a conversation"} at the owner's request; the owner has not confirmed it yet.`}
+              {r.pending_kind === "changed" && r.prior_text ? ` It replaced: “${r.prior_text}”` : ""}
+            </span>
+          ) : null}
         </span>
       </span>
       <span className="route-acts">
         {toConfirm ? (
           <button ref={confirmBtn} type="button" className="sm" aria-label={`Confirm rule ${r.n}`} aria-expanded={mine === "confirm"} onClick={() => setAsk({ n: r.n, kind: "confirm" })}>
             Confirm
+          </button>
+        ) : null}
+        {pending ? (
+          <button
+            type="button"
+            className="sm"
+            disabled={w.isBusy(`${id}:undo`)}
+            aria-label={`Undo pending rule ${r.n}`}
+            onClick={() => void w.run(`${id}:undo`, "khipu_route_rule", { action: r.pending_kind === "added" ? "dismiss" : "undo", n: r.n }, null, back)}
+          >
+            <Busy on={w.isBusy(`${id}:undo`)} />
+            Undo
           </button>
         ) : null}
         <button
@@ -813,9 +835,10 @@ function RuleRow({
           Remove
         </button>
       </span>
+      {pending ? <WriteError w={w} id={`${id}:undo`} /> : null}
       {mine === "confirm" ? (
         <ConfirmGroup label={`Confirm rule ${r.n}?`} onClose={close} back={() => confirmBtn.current ?? editBtn.current}>
-          <span>Confirm rule {r.n} as written? It loses its Seeded mark and stays first in every conversation.</span>
+          <span>{pending ? `Confirm this pending ${r.pending_kind === "changed" ? "change" : "addition"}?` : `Confirm rule ${r.n} as written? It loses its Seeded mark.`} It stays first in every conversation.</span>
           <WriteError w={w} id={id} />
           <div className="toolbar">
             <button
@@ -913,7 +936,7 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
   const [adding, setAdding] = useState(false);
   const fieldId = useId();
   const addBtn = useRef<HTMLButtonElement>(null);
-  const toConfirm = rules.filter((r) => r.seeded && !r.confirmed).length;
+  const toConfirm = rules.filter((r) => r.pending || (r.seeded && !r.confirmed)).length;
   async function add(e: FormEvent) {
     e.preventDefault();
     if (!draft.trim()) {
@@ -944,13 +967,13 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
         <p className="set-help">
           Every conversation sees these first, in full, before anything else. They are never shortened or cut, and
           Khipu sets no limit on their length (the app hands over up to {WORDS_MOST_KB} KB of text at once). Rules
-          marked Seeded were copied from your routing table and your instructions; confirm each one, or edit or remove
-          it.
+          marked Seeded were copied from your routing table and your instructions. A conversation can add or change a
+          rule at your request; those rows show what changed and stay pending until you confirm or undo them.
         </p>
         {rules.length ? (
           <ol className="rows route-rule-list" role="list" aria-label="Standing rules">
             {rules.map((r) => (
-              <RuleRow key={r.n} r={r} watched={(data.watched_rules ?? []).includes(r.n)} ask={ask} setAsk={setAsk} w={w} now={now} onRemoved={setRemoved} />
+              <RuleRow key={r.n} r={r} watched={(data.watched_rules ?? []).includes(r.n)} ask={ask} setAsk={setAsk} w={w} now={now} onRemoved={setRemoved} back={() => addBtn.current} />
             ))}
           </ol>
         ) : (

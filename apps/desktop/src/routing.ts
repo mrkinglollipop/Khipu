@@ -82,6 +82,12 @@ export type RouteRule = {
   text: string;
   seeded?: boolean;
   confirmed?: boolean;
+  /** A live conversation request awaiting the owner's reconfirmation. */
+  pending?: boolean;
+  pending_kind?: "added" | "changed" | null;
+  pending_by?: string | null;
+  /** The wording Undo restores for a pending change. */
+  prior_text?: string | null;
   date?: string | null;
   /** Where the rule came from, in the owner's or the seed's words. */
   source?: string | null;

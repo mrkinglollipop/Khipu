@@ -82,6 +82,10 @@ def _report(**arguments) -> dict:
     return body
 
 
+def _rule(**arguments) -> tuple[bool, dict]:
+    return _call("khipu_route_rule", arguments)
+
+
 def _events() -> list[dict]:
     path = routing.events_file()
     if not path.exists():
@@ -100,6 +104,36 @@ def _a_full_record() -> None:
     _report(state="open", account="Claude")
     _report(state="down", account="Grok", message="Please sign in again")
     _report(action="hold", scope="all", reason="machine-busy", text="hold new launches while load1 is over 75")
+
+
+def test_conversation_rule_is_live_pending_and_cannot_impersonate_the_owner(home, monkeypatch):
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "rule-request-1")
+    error, body = _rule(text="Keep deployment work local.", owner_request="The owner asked for this during review.")
+    assert not error and body["n"] == 1
+    view = _route()
+    rule = view["rules"][0]
+    assert rule["pending"] and rule["pending_kind"] == "added"
+    assert rule["pending_by"] == "a Claude Code conversation"
+    assert "owner has not confirmed" in routing.summary()["text"]
+    event = _events()[-1]
+    assert event["owner_request"] == "The owner asked for this during review."
+    assert event["written_by"]["kind"] == "conversation"
+    assert event["written_by"] != {"kind": "owner"}
+
+    before = len(_events())
+    error, body = _rule(text="Impersonated owner rule.", owner_request="The owner asked for this.",
+                        written_by={"kind": "owner"}, via="app")
+    assert error and "takes" in body["error"] and len(_events()) == before
+
+    for bad in ({"text": "x", "owner_request": "line one\nline two"},
+                {"text": "x", "owner_request": ""},
+                {"text": "x", "owner_request": "ok", "action": "confirm"}):
+        error, body = _rule(**bad)
+        assert error and "owner_request" in body.get("error", "") or (error and "takes" in body.get("error", ""))
+    for action in ("confirm_rule", "retire_rule", "undo_rule", "dismiss_rule"):
+        error, body = _call("khipu_route_report", {"action": action})
+        assert error and "owner's" in body["error"]
 
 
 # ---- no answer contains a pick or a ranking ------------------------------------------------
