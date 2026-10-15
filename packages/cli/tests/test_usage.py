@@ -324,6 +324,25 @@ def test_failed_probe_keeps_the_last_figures_marked_stale(fake, monkeypatch):
     assert "[stale]" in rep["summary_text"][0] and "probe failed" in rep["summary_text"][0]
 
 
+def test_a_held_refresh_lock_keeps_the_last_figures_on_the_foreground_read(fake, monkeypatch):
+    # Routing fix round 2, R2-5: with the refresh lock held (a reset check or
+    # a background refresh), the foreground report dropped each due
+    # account's cached figures and said "Reading for the first time".
+    accounts = [{"label": "Codex", "harness": "codex", "home": None},
+                {"label": "Claude", "harness": "claude", "home": None}]
+    usage._save_cache({"codex|": _cached(_ago(60), harness="codex", account="Codex")})
+    monkeypatch.setattr(usage, "_try_refresh_lock", lambda: None)
+    monkeypatch.setattr(usage, "probe_all", lambda *_a, **_k: pytest.fail("no probe beside the held lock"))
+    rep = usage.report(accounts=accounts)
+    codex, claude = rep["accounts"]
+    assert rep["refreshing"] is True
+    assert codex["windows"][0]["used_pct"] == 55 and codex["error"] is None
+    assert codex["stale"] is True and codex["refreshing"] is True and codex["cached"] is True
+    assert (claude["error"], claude["refreshing"]) == ("pending", True)
+    fresh = usage.report(accounts=accounts, fresh=True)["accounts"][0]
+    assert fresh["windows"][0]["used_pct"] == 55 and fresh["refreshing"] is True
+
+
 def test_old_observation_is_stale_even_after_a_fresh_probe(fake, monkeypatch):
     monkeypatch.setattr(usage, "probe_all", lambda accounts, *, timeout: [
         _row("muse", "Muse", source="last_observed", observed_at="2026-01-01T00:00:00Z")])

@@ -597,7 +597,7 @@ def test_sleep_wake_checks_each_overdue_account_once_with_source_poll_off(home, 
 
     def same_limit(account):
         calls.append(account["label"])
-        return {"ok": True, "windows": [
+        return {"ok": True, "source": "live", "windows": [
             {"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]}
 
     monkeypatch.setattr("khipu.usage.probe_account", same_limit)
@@ -623,7 +623,7 @@ def test_with_the_push_off_reset_checks_never_poll_and_wake_only_at_the_next_che
 
     def same_limit(account):
         probed.append(account["label"])
-        return {"ok": True, "windows": [{"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]}
+        return {"ok": True, "source": "live", "windows": [{"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]}
 
     monkeypatch.setattr("khipu.usage.probe_account", same_limit)
     schedule = _schedule(home, interval=10.0)
@@ -650,6 +650,43 @@ def test_with_the_push_off_reset_checks_never_poll_and_wake_only_at_the_next_che
     assert schedule.due() == ["look"]
     _helper_poll(schedule)
     assert schedule.valid_until == (until + timedelta(minutes=10)).timestamp() and probed == ["Claude"]
+
+
+def test_with_the_push_off_a_pause_ending_over_a_passed_limit_wakes_the_check(home, monkeypatch):
+    # Fix round 2, R2-3: the checks-only helper read reset checks from the
+    # saved view alone, so a pause ending over a passed limit (a change the
+    # clock alone makes) never made the overdue check due.
+    clocks = home["clocks"]
+    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "0")
+    monkeypatch.setenv("ROUTING_NOW_OFF", "1")
+    _set(home, routing_push_prompt=False, routing_reset_check=True, routing_busy_load=0)
+    until = T0 + timedelta(minutes=20)
+    routing.report(account="Claude", state="limited", until=routing._iso(until), author=ME)
+    pause_end = T0 + timedelta(hours=2)
+    routing.pause("Claude", until=routing._iso(pause_end), via="app")
+    monkeypatch.setattr(routing, "poll_refold", lambda **_k: pytest.fail("the poll child refolded with the push off"))
+    probed: list[datetime] = []
+
+    def headroom(_account):
+        probed.append(clocks.now)
+        return {"ok": True, "source": "live", "windows": [
+            {"name": "five_hour", "used_pct": 10, "resets_at": routing._iso(T0 + timedelta(hours=7))}]}
+
+    monkeypatch.setattr("khipu.usage.probe_account", headroom)
+    schedule = _schedule(home, interval=10.0)
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.checks_only and schedule.due() == ["look"]
+    _helper_poll(schedule)
+    assert probed == [] and schedule.valid_until == pause_end.timestamp()
+    while clocks.now + timedelta(minutes=1) < pause_end:
+        clocks.run(60)
+        recall_prompt._look_at_settings(schedule, routing)
+        assert schedule.due() == []
+    clocks.run((pause_end - clocks.now).total_seconds())
+    assert schedule.due() == ["clock"]
+    out = _helper_poll(schedule)
+    assert probed == [pause_end] and [c["outcome"] for c in out["reset_checks"]] == ["open"]
+    assert schedule.valid_until is None or schedule.valid_until > clocks.wall()
 
 
 def test_stopping_a_poll_child_unwinds_and_kills_its_vendor_process(home, monkeypatch, tmp_path):

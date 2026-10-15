@@ -717,3 +717,35 @@ describe("Home Routing card, final fix round", () => {
     expect(notRefreshedWords({ data: v, lastOkAt: AFTERNOON.toISOString(), error: null, firstRead: true }, AFTERNOON)).toBeNull();
   });
 });
+
+describe("Home Routing card, phase 5 fix round 2", () => {
+  it("says a reset check's outcome in the state, never 'not checked yet' beside it (R2-2)", () => {
+    const now = new Date("2026-10-14T15:22:00Z");
+    const reasons = [
+      "Khipu read the same limit again",
+      "Khipu could not read this account's usage",
+      "The Mac is busy; Khipu will try again",
+      "Another Khipu usage check is running; Khipu will try again",
+    ];
+    for (const reason of reasons) {
+      const a = acct("Claude", "claude", {
+        state: "probably_open", until: "2026-10-14T15:20:00Z", basis: "cli",
+        witness: { source: "check", written_by: { kind: "check" }, at: "2026-10-14T15:22:00Z" },
+        reset_check: { status: "same_limit", checks: 1, reason },
+      });
+      const state = accountState(a, now).text;
+      expect(state).toBe(`Its reset time passed at 11:20 AM; ${reason}`);
+      expect(state).not.toContain("not checked yet");
+      const source = accountSource(a, now);
+      expect(source).toBe("Checked by Khipu just now");
+      expect(source).not.toContain(reason);
+    }
+    // A later limit the check read still names its reason under the limit.
+    const later = acct("Claude", "claude", {
+      state: "limited", until: "2026-10-14T17:00:00Z", basis: "cli",
+      witness: { source: "check", written_by: { kind: "check" }, at: "2026-10-14T15:22:00Z" },
+      reset_check: { status: "later_limit", checks: 1, reason: "Khipu read a later reset time" },
+    });
+    expect(accountSource(later, now)).toBe("Checked by Khipu just now · Khipu read a later reset time");
+  });
+});

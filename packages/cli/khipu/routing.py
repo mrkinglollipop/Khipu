@@ -773,6 +773,15 @@ def accounts() -> list[dict]:
     return out
 
 
+def _usage_accounts_listed() -> bool:
+    """Whether config.json lists ``usage_accounts`` (else plan usage reads
+    each installed CLI at its default login, as ``usage.configured_accounts``)."""
+    from khipu.config import load_config
+
+    raw = load_config().get("usage_accounts")
+    return isinstance(raw, list) and bool(raw)
+
+
 def _fold_accounts(config: dict) -> list[dict]:
     """The accounts a fold shows before any entry names them: the configured
     ``usage_accounts`` only (config.json is one of the fold's inputs). Never
@@ -1108,6 +1117,7 @@ _RESET_STATUSES = frozenset({
     "same_limit", "later_limit", "open", "cannot_check", "busy", "busy_exhausted",
     "lock_wait", "lock_exhausted", "error",
 })
+_WAIT_STATUSES = frozenset({"busy", "busy_exhausted", "lock_wait", "lock_exhausted"})
 _RESET_REASONS = frozenset({
     "This account can't be checked without using a turn",
     "The Mac is busy; Khipu will try again",
@@ -1817,9 +1827,16 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 }
                 # A Check now before the reset time (``counted`` false) has
                 # its outcome in its own evidence: it never spends, waits
-                # out or moves the reset's own checks (fix round 1, F2). Only
-                # "can't be checked" is a fact about the account itself.
-                if not (event.get("counted") is False and until is not None and status != "cannot_check"):
+                # out or moves the reset's own checks (fix round 1, F2). Its
+                # "can't be checked" too: a sign-in failure is not a fact
+                # about the account, and one that is (Muse) shows from the
+                # account's ``checkable`` (fix round 2, R2-8).
+                # A wait is written from what its writer read before; one
+                # that holds fewer checks than the reset's record was read
+                # before a check completed, and never rolls it back (R2-6).
+                prior = reset_checks.get(identity)
+                stale = (status in _WAIT_STATUSES and prior is not None and checks < prior["checks"])
+                if not (event.get("counted") is False and until is not None) and not stale:
                     reset_checks[identity] = record
                     # A check that read the same limit with an earlier reset
                     # time moves the entry's until there: the reset is the
@@ -2296,7 +2313,8 @@ def check_account(account: str, *, scheduled: bool = False, now: datetime | None
         return {"until": until, "state_id": _state_id(entry),
                 "counted": until is not None and (scheduled or now >= _after(until, wait)),
                 "checks": int(reset.get("checks") or 0), "busy_tries": int(reset.get("busy_tries") or 0),
-                "lock_tries": int(reset.get("lock_tries") or 0)}
+                "lock_tries": int(reset.get("lock_tries") or 0),
+                "record": (_iso(until), reset.get("status"), reset.get("checks"), reset.get("next_at"))}
 
     def write_one(event: dict) -> None:
         if on_write is not None:
@@ -2316,8 +2334,11 @@ def check_account(account: str, *, scheduled: bool = False, now: datetime | None
 
     def deferred(s: dict, kind: str) -> dict:
         words = _WAIT_WORDS[kind]
-        if not s["counted"]:
-            write_one(event(s, words["status"], words["later"]))
+        # Only a reset check tries again: with reset checks off, or after the
+        # reset's three checks, nothing will (fix round 2, R2-4). Such a wait
+        # is written uncounted, so it never schedules a check.
+        if not (s["counted"] and _setting(cfg, "routing_reset_check") and s["checks"] < 3):
+            write_one(event(dict(s, counted=False), words["status"], words["later"]))
             return {"ok": True, "account": key, "outcome": words["status"], "reason": words["later"]}
         tries = s[words["field"]] + 1
         exhausted = tries > int(_setting(cfg, "routing_busy_tries"))
@@ -2356,9 +2377,18 @@ def check_account(account: str, *, scheduled: bool = False, now: datetime | None
             raise RouteError("Khipu checks only accounts that are limited, probably open or unknown")
         if entry.get("configured") is False:
             raise RouteError(_NOT_CONFIGURED)
+    first = current(entry)
     fd = usage._try_refresh_lock()
     if fd is None:
-        return deferred(current(entry), "lock")
+        # The check holding the lock may have written its outcome since the
+        # first read: defer from the record as it is now, and when that
+        # reset's record moved, leave it to the check that moved it (fix
+        # round 2, R2-6).
+        s = current(look())
+        if s["record"] != first["record"]:
+            words = _WAIT_WORDS["lock"]
+            return {"ok": True, "account": key, "outcome": words["status"], "reason": words["later"]}
+        return deferred(s, "lock")
     try:
         # The first view only decides whether this call may contend for the
         # shared usage lock. Re-read after winning it: another helper or a
@@ -2377,13 +2407,24 @@ def check_account(account: str, *, scheduled: bool = False, now: datetime | None
             return deferred(s, "busy")
         configured = next((a for a in accounts() if a["key"] == key), None)
         if configured is None:
+            if not entry.get("home") and not _usage_accounts_listed():
+                # With no usage_accounts, plan usage reads each CLI it finds
+                # at its default login: one it cannot find is not installed,
+                # and nothing in Settings -> Models is wrong (fix round 2, R2-7).
+                return done(s, "error", _probe_reason(usage.E_NOT_INSTALLED))
             raise RouteError(_NOT_CONFIGURED)
         row = probe(configured) if probe is not None else (
             usage.probe_account(configured) if in_child else _probe_check_child(configured, None, close_fd=fd))
-        if row.get("error") in (usage.E_SIGNIN, usage.E_NO_LIMITS):
+        # Only a live read is a reading (fix round 2, R2-1). Codex's rollout
+        # fallback is its last turn's figures, kept when the live read
+        # failed: they may predate the limit, so they never reopen the
+        # account or move its limit. A signed-out read, live or behind the
+        # fallback, is "can't be checked".
+        failure = row.get("live_error") or row.get("error")
+        if failure in (usage.E_SIGNIN, usage.E_NO_LIMITS):
             return done(s, "cannot_check", _CANNOT_CHECK)
-        if not row.get("ok"):
-            return done(s, "error", _probe_reason(row.get("error")))
+        if not row.get("ok") or row.get("live_error") or row.get("source") != "live":
+            return done(s, "error", _probe_reason(failure))
         evidence, whole_limits, headroom = _check_evidence(key, row)
         if headroom:
             return done(s, "open", "Khipu read this account as open", evidence)

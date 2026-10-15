@@ -1214,9 +1214,15 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
             # not start a second child merely because this is the CLI path:
             # report the in-flight read in the same shape as the background
             # path instead.
+            # An account read before keeps its last figures, marked stale
+            # and refreshing as the background path's; only one never read
+            # is pending (routing fix round 2, R2-5).
             refreshing = True
             for i in due:
-                if rows[i] is None:
+                cached = cache.get(_key(accounts[i]))
+                if rows[i] is None and cached:
+                    rows[i] = dict(cached, account=accounts[i]["label"], home=accounts[i].get("home"), cached=True)
+                elif rows[i] is None:
                     rows[i] = dict(_blank_row(accounts[i]), ok=False, error=E_PENDING, note=_note(E_PENDING),
                                    probed_at=None, ms=None, cached=False)
                 rows[i]["refreshing"] = True

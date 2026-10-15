@@ -1082,15 +1082,34 @@ def _poll_once(routing, on_fold=None, on_probe=None) -> dict:
     return out
 
 
+def _pause_ends(routing, view: dict | None) -> list:
+    """When each owner's pause in the saved view ends over a limit with a
+    reset time: the clock alone then shows the limit (or its passed reset)
+    again, and with it a reset check the saved view cannot hold yet (fix
+    round 2, R2-3). Holds never hide an account's state, so only pauses."""
+    if not isinstance(view, dict):
+        return []
+    out = []
+    for e in view.get("accounts") or []:
+        if not isinstance(e, dict) or e.get("state") != "paused":
+            continue
+        under = e.get("underlying") if isinstance(e.get("underlying"), dict) else {}
+        end = routing._parse(e.get("until"))
+        if end is not None and under.get("state") in ("limited", "probably_open") \
+                and routing._parse(under.get("until")) is not None:
+            out.append(end)
+    return out
+
+
 def _next_reset_check(routing, view: dict | None, now) -> Any:
     """The soonest reset check the saved view holds (overdue ones included),
-    or None."""
+    or the end of a pause that hides one (``_pause_ends``), or None."""
     if not isinstance(view, dict):
         return None
     cfg = routing.settings()
     times = [t for e in view.get("accounts") or [] if isinstance(e, dict)
              and (t := routing.reset_check_due(e, now, cfg)) is not None]
-    return min(times, default=None)
+    return min([*times, *_pause_ends(routing, view)], default=None)
 
 
 def _check_resets_only(routing, on_fold=None, on_probe=None) -> dict:
@@ -1098,11 +1117,19 @@ def _check_resets_only(routing, on_fold=None, on_probe=None) -> dict:
     no ``poll_refold``, no read of the sources. It reads the saved view, runs
     one due reset check if there is one (that check's read refolds as any
     reader's does), and answers ``due``: the next reset check, so the helper
-    sleeps until then (fix round 1, F1)."""
+    sleeps until then (fix round 1, F1). When a pause the saved view holds
+    over a limit has ended, it refolds once, as a reader does, so the check
+    that ending makes due is seen and run (fix round 2, R2-3)."""
     out = {"folded": False, "saved": True, "busy": False, "version": None, "valid_until": None,
            "interval": None, "reset_checks": [], "view_stat": None}
     now = routing._now()
-    due = _next_reset_check(routing, routing._load_view(), now)
+    view = routing._load_view()
+    if any(end <= now for end in _pause_ends(routing, view)):
+        if on_fold is not None:
+            on_fold()
+        view = routing.read_view(now)
+        out["folded"] = True
+    due = _next_reset_check(routing, view, now)
     if due is not None and due <= now:
         if on_probe is not None:
             on_probe()

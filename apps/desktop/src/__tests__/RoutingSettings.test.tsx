@@ -640,7 +640,8 @@ describe("Settings -> Routing: checking for resets", () => {
     expect(busy).toHaveTextContent("Never wait · 5 minutes · 3 attempts");
     const retries = screen.getByLabelText("First retry in seconds").closest(".route-limit")!;
     expect(retries).toHaveTextContent("No retries");
-    expect(screen.getByLabelText("First retry in seconds")).toHaveValue("");
+    // The fields take the stored retries in an effect after the render that shows them.
+    await waitFor(() => expect(screen.getByLabelText("First retry in seconds")).toHaveValue(""));
     fireEvent.click(screen.getByRole("button", { name: "Change: Wait while the Mac is busy" }));
     expect(within(screen.getByLabelText("Load")).getByRole("option", { name: /^Never wait/ })).toBeInTheDocument();
     expect(within(screen.getByLabelText("Busy attempts")).getByRole("option", { name: /^None: record it at once/ })).toBeInTheDocument();
