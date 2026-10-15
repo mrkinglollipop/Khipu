@@ -539,6 +539,26 @@ Taken in this scope (conventional defaults, reversible; say if any should change
 11. **Moving a login folder moves everything keyed to it,** reports and evidence included, and leaves a
     forwarding entry so nothing is counted twice (Section 7).
 
+
+Matt, 2026-10-15 (about 16:55 ET), answering open questions 1 to 8 with the recommendations:
+
+12. **Quiet for what already existed.** After the update, and for a login left unticked in setup, found folders
+    show only in Settings (no Home card) until a conversation uses them.
+13. **Rename keeps free text.** Rules, the note and agents' scripts keep the old name; Khipu does not rewrite
+    them and keeps no hidden alias; the rename dialog lists each rule and the note that mention the old name
+    with an Edit link.
+14. **Stopping the last account** gives an explicit "Read no accounts" state after a confirmation, never a
+    fallback to every installed CLI.
+15. **The account list has an owner gate.** `khipu config --set usage_accounts` gets the same typed
+    confirmation (or `--at-owner-request`) as priority and rules; no MCP tool adds, renames or removes an
+    account.
+16. **Stop tracking defaults:** remove from priority, end its pause and remove it from lanes are on by default;
+    holds are listed and kept unless ticked.
+17. **The same person in two folders** can't be detected without reading credentials; the dialog says so and
+    shows no guessed hint from matching plan figures.
+18. **Accounts are per Mac.** Syncing later only with an identity that doesn't depend on a path.
+19. **Live proof is read-only;** one live Track on this Mac only on Matt's go, undone at once.
+
 Review history: a twelve-stage review (`dd33e77`) and an independent Codex review of it (11 findings, all
 confirmed against the code on 2026-10-15) are folded into the text below.
 
@@ -599,7 +619,7 @@ opens: each CLI's default login and every other signed-in folder, as in `add-acc
 - A ticked login plus Next is the owner's answer and counts as Track (the "never add silently" test covers
   automatic discovery only). Signed-in logins start ticked; a login that is not signed in or couldn't be
   checked starts unticked. A login left unticked is neither tracked nor turned down: it stays a Found row in
-  Settings and never reaches Home (open question 1 covers this quiet rule).
+  Settings and never reaches Home (decision 12 covers this quiet rule).
 - **Nothing installed:** the callout keeps Check again and gains Add another account… The dialog's step 1 then
   lists all four CLIs as not installed with Next off.
 - **Installed, but Khipu can't run it:** a third state beside installed and not installed, decided by running
@@ -646,7 +666,7 @@ opens: each CLI's default login and every other signed-in folder, as in `add-acc
   folder survives an Add.
 - **The first discovery run after the update** is quiet for a curated list: folders that already existed show
   only as Found rows in Settings; a folder reaches Home only after a conversation uses it after the update
-  (open question 1). Conversation counts start at the update; sessions saved before it count only where their
+  (decision 12). Conversation counts start at the update; sessions saved before it count only where their
   `transcript_path` maps to a folder (below), otherwise "not counted yet", never 0.
 - Priority, holds, pauses, clears, rule checks and route reports made before the update keep resolving,
   because no key changes (decision 6). Test: after the first Add, everything made on `claude|` still names
@@ -770,7 +790,7 @@ conversations' bare CLI word resolves to it. Default names: a folder with a suff
 **Priority:** a new account is not ranked (decision 5); the priority editor and setup's Move up and Move down
 place it.
 
-**Who may do it:** see open question 4 and Agents, below.
+**Who may do it:** see decision 15 and Agents, below.
 
 #### 6. Signing in a new account
 
@@ -814,7 +834,7 @@ it is removed only if Khipu made it and it is still empty when the owner chooses
 have" shows a leftover as "Not signed in". Khipu never deletes a folder that has signed in.
 
 **The same account twice.** Khipu detects only the same folder (path identity). It cannot tell that one person
-is signed in to two folders without reading credentials; open question 6.
+is signed in to two folders without reading credentials; decision 17.
 
 **Codex in the Keychain:** before Sign in to another account ships for Codex, 9D proves with two scratch folders
 that a second `CODEX_HOME` keeps its own sign-in; if not, Codex gets only Use a login I already have.
@@ -856,7 +876,7 @@ that a second `CODEX_HOME` keeps its own sign-in; if not, Codex gets only Use a 
   a rule-1 problem until chosen. Test: two accounts labelled "Same", a lane naming "Same": nothing converted,
   the repair shows, evidence for that lane attaches to neither until chosen; the rename dialog says how many lanes point at it. Free text (standing rules, the note, hold
   reasons, conversation reports, past Recent changes lines) keeps the old name and is not rewritten; the
-  rename dialog lists the rules and note that mention the old name with a link to edit each (open question 2).
+  rename dialog lists the rules and note that mention the old name with a link to edit each (decision 13).
   The rename is one Recent changes line and the push's change line "Claude client is now called Claude work".
   Renaming an account on the default list first writes the list out (Tracking, step 1).
 
@@ -869,7 +889,7 @@ Not offered again, the automatic-tracking switch and Home's Found card. A join k
 Not offered again list. The same login signed in on two Macs is two accounts in Khipu, each with its own
 routing state; names are unique only within a Mac. The Add and Stop tracking dialogs say "on this Mac". An
 account whose folder is missing on this Mac shows "Login folder not found on this Mac" (Living). Syncing is a
-separate future decision that needs an identity that does not depend on a path (open question 7).
+separate future decision that needs an identity that does not depend on a path (decision 18).
 
 #### 9. Stop tracking and after
 
@@ -895,7 +915,7 @@ account.
 
 **The last account:** saving an empty list today unsets it and brings every installed CLI back. Phase 9 adds an
 explicit "Read no accounts" state stored apart from an unset list; Plans, Home and routing then say "No
-accounts tracked" with Add an account…. Stop tracking the last account asks first (open question 3).
+accounts tracked" with Add an account…. Stop tracking the last account asks first (decision 14).
 
 **Tracking it again:** step 3 suggests its last name; its key is unchanged, so holds and history that were kept
 attach again; the priority place comes back only if the entry was kept; Recent changes says "tracked again".
@@ -945,7 +965,7 @@ uninstall` removes Khipu-owned hook entries only (`cli.py:5225`) and leaves all 
   folder" rather than a path (`usage._note`). The app keeps the full rows through its own command. Tests: one
   per row kind asserting no field or nested value contains the home folder, `~/`, or the account's folder
   name.
-- Whether `khipu config --set usage_accounts` gets an owner gate is open question 4.
+- Whether `khipu config --set usage_accounts` gets an owner gate is decision 15.
 
 ### Adding an account by hand (the dialog)
 
@@ -1007,7 +1027,7 @@ footer says "on this Mac".
   `KHIPU_CLAUDE_CLI` and `KHIPU_CODEX_CLI` (`synth_cli.py:137`) pointing at fake CLIs: exit 0, exit non-zero,
   hang, ignore SIGTERM, print a device code. A test-only short `SIGN_IN_WAIT_S` is honoured only under a test
   home. Stop and cancel is proven by a process listing before and after showing no leftover login process.
-- **A live Track on this Mac** happens only on Matt's go, with Undo shown working (open question 8).
+- **A live Track on this Mac** happens only on Matt's go, with Undo shown working (decision 19).
 - Every mock state is reproduced through the fake-CLI seam and saved as a screenshot file per state at 1280 and
   960, compared with the mock.
 
@@ -1044,8 +1064,8 @@ status check writes into a scratch folder (guardrail).
 `routing.py` (`routing_lane_map`, priority, holds) first. Build: naming rules and path-identity duplicates in
 `parse_usage_accounts`; invalid entries kept; the one save path (default write-out home-less, canonical home,
 first cache row, change line); Not offered again; the switch; Rename with the lane map moved to keys; Stop
-tracking's writes and the "Read no accounts" state (per Matt's answer to question 3); re-key for a moved
-folder; folder-not-found before reads; the routing wording; the owner gate (per question 4). Tests: every key
+tracking's writes and the "Read no accounts" state (decision 14); re-key for a moved
+folder; folder-not-found before reads; the routing wording; the owner gate (decision 15). Tests: every key
 unchanged by the write-out and by stop then track again on `~/.claude`; a symlink, full path or trailing slash
 refused as the same login; names that equal a CLI word refused; a mapped lane keeps its evidence after rename;
 stop with defaults leaves no row; re-key moves every owner record; a missing folder never yields the sign-in
@@ -1084,24 +1104,8 @@ on any difference.
 
 ### Open questions for Matt
 
-1. **Quiet for what already existed.** After the update, and for a login left unticked in setup, should found
-   folders show only in Settings (no Home card) until a conversation uses them? Recommended: yes.
-2. **Rename and free text.** Rules, the note and agents' scripts that name an account keep the old name.
-   Recommended: Khipu does not rewrite them; the rename dialog lists each rule and the note that mention the
-   old name with an edit link (no hidden alias).
-3. **Stopping the last account.** Recommended: an explicit "Read no accounts" state, asked first, rather than
-   falling back to every installed CLI.
-4. **Who may change the account list outside the app.** `khipu config --set usage_accounts` has no owner gate
-   today, so any conversation with a shell can add or remove accounts. Recommended: give it the same typed
-   confirmation (or `--at-owner-request`) as priority and rules; no MCP tool.
-5. **Stop tracking defaults.** Recommended: remove from priority, end its pause and remove it from lanes on by
-   default; holds listed but kept unless ticked.
-6. **The same person in two folders.** Khipu can't tell without reading credentials. Recommended: say so in
-   the dialog and show no guessed hint from matching plan figures.
-7. **Two Macs.** Recommended: per Mac now; syncing accounts later only with an identity that doesn't depend on
-   a path.
-8. **Live proof.** Recommended: the live run on this Mac is read-only; one live Track only on your go, undone
-   at once.
+Questions 1 to 8 were answered on 2026-10-15 and are decisions 12 to 19. Two stay open:
+
 9. **Codex's session-file fallback for tracked accounts.** When Codex's live plan read fails, Khipu reads the
    last `rate_limits` from the tail of its five newest session files, inside the login folder. Those are the
    same transcripts Khipu's capture already reads, and only the figures are kept. Recommended: keep it for
