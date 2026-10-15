@@ -880,9 +880,24 @@ def _mark_lag(project: str, row_ids: list[str]) -> None:
 
 def replica_catch_up(conn) -> dict[str, Any]:
     """Copy every id still waiting for the offline copy from the hub as it is
-    now. Safe to repeat: the copy keeps the newest version of each row.
-    Fail-open."""
+    now. Safe to repeat: the copy keeps the newest version of each row. Taken
+    under the ledger lock, as a write is: a write holds it from its lag marker
+    to its commit, so the hub is never read between the two. Busy when a
+    write holds it (the ids stay waiting). Fail-open."""
     out: dict[str, Any] = {"copied": 0, "left": 0}
+    try:
+        with _ledger_lock(wait_s=0):
+            return _replica_catch_up_locked(conn, out)
+    except LedgerError as exc:
+        if exc.reason != "busy":
+            raise
+        return {**out, "busy": True, "left": replica_pending()}
+    except Exception as exc:  # noqa: BLE001  (the hub write already landed)
+        out["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        return out
+
+
+def _replica_catch_up_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
     try:
         from khipu import hub_snapshot
 
@@ -905,6 +920,13 @@ def replica_catch_up(conn) -> dict[str, Any]:
                 found = [_row_dict(r) for r in cur.fetchall()]
                 rows = [r for r in found if r["removed_at"] is None]
                 gone = {r["row_id"]: r["version"] for r in found if r["removed_at"] is not None}
+                # Removed for good only where the hub recorded the purge: an id
+                # with no row may be a write not committed yet, never a purge.
+                cur.execute("SELECT row_id FROM ledger_removed WHERE project = %s AND row_id = ANY(%s) "
+                            "AND purged_at IS NOT NULL", (project, ids))
+                live_ids = {r["row_id"] for r in found}
+                gone.update({row[0]: hub_snapshot.LEDGER_PURGED_VERSION for row in cur.fetchall()
+                             if row[0] not in live_ids})
                 cur.execute(f"SELECT {', '.join(_HIST_COLS)} FROM ledger_history WHERE project = %s "
                             "AND row_id = ANY(%s) ORDER BY id", (project, [r["row_id"] for r in rows]))
                 history = [dict(zip(_HIST_COLS, h, strict=True)) for h in cur.fetchall()]
@@ -938,7 +960,7 @@ def catch_up_offline_copy() -> dict[str, Any]:
     except HubAway:
         return {"copied": 0, "left": replica_pending(), "away": True}
     try:
-        return replica_catch_up(conn)
+        return replica_catch_up(conn)  # busy while a write holds the ledger lock
     finally:
         conn.close()
 
@@ -1318,8 +1340,13 @@ def _known(op: dict[str, Any], *, line: bool = True) -> tuple[str, Any] | None:
 
 
 def outbox_status() -> dict[str, Any]:
-    jobs = _outbox_jobs()
-    refused = sorted(_refused_dir().glob("*.json")) if _refused_dir().is_dir() else []
+    """Pending, refused and the oldest wait. A folder that cannot be listed
+    reports ``pending: None`` and ``unreadable``, never zero."""
+    try:
+        jobs = _outbox_jobs(strict=True)
+        refused = [n for n in os.listdir(_refused_dir()) if n.endswith(".json")] if _refused_dir().is_dir() else []
+    except (LedgerError, OSError) as exc:
+        return {"pending": None, "refused": None, "oldest_age_s": None, "unreadable": str(exc)[:200]}
     oldest = None
     for path in jobs:
         try:
@@ -1340,8 +1367,11 @@ def drain(conn=None) -> dict[str, Any]:
     keeps doctor red; nothing is dropped. Stops at the first sign the hub is
     away and keeps the rest. Busy when a write holds the ledger lock."""
     out = _drain_result()
-    if not _outbox_jobs():
-        return out
+    try:
+        if not _outbox_jobs(strict=True):
+            return out
+    except LedgerError as exc:  # a line that cannot be listed is never an empty one
+        return {**out, "stopped_early": True, "unreadable": str(exc)[:200]}
     try:
         with _ledger_lock(wait_s=0):
             return _drain_locked(conn, out)

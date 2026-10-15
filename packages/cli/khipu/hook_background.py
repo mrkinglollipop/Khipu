@@ -139,7 +139,7 @@ def run(mem_root: str, harness: str, sid: str) -> None:
         from khipu.ledger import _outbox_jobs as ledger_jobs
         from khipu.ledger import drain as ledger_drain
 
-        if ledger_jobs():
+        if ledger_jobs(strict=True):  # a folder that cannot be listed is reported, not skipped
             _say(sid, harness, f"ledger outbox drain {ledger_drain()}")
         from khipu.ledger import catch_up_offline_copy, replica_pending
 

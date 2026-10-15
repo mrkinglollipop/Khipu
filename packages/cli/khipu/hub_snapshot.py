@@ -1088,8 +1088,10 @@ def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mappi
                           rows: Sequence[Mapping[str, Any]], history: Sequence[Mapping[str, Any]],
                           row_ids: Sequence[str], gone: Mapping[str, int] | None = None) -> dict[str, Any]:
     """Write ``row_ids`` of ``project`` through to the replica: each live one
-    in ``rows`` (with its whole ``history``), each removed one in ``gone`` at
-    the version it was removed at, and any other id as purged. A row and its
+    in ``rows`` (with its whole ``history``), and each removed one in ``gone``
+    at the version it was removed at (``LEDGER_PURGED_VERSION`` for a purge
+    the hub recorded). Any other id is left as it is: a row missing from the
+    hub may be a write not committed yet, so absence is never a purge. A row and its
     history are replaced whole, and only by a newer or equal revision: its
     version, then its last history id (a late conditional write adds history
     without a new version). A removed or purged id leaves a marker, so a writer
@@ -1107,9 +1109,6 @@ def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mappi
         return {"ok": False, "error": "hub snapshot missing", "missing": True}
     gone = dict(gone or {})
     live = {r["row_id"]: r for r in rows}
-    for row_id in row_ids:
-        if row_id not in live and row_id not in gone:
-            gone[row_id] = LEDGER_PURGED_VERSION
     try:
         con = sqlite3.connect(str(path))
         try:

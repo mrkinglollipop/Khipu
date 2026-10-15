@@ -672,7 +672,7 @@ def test_a_late_sync_never_brings_back_a_removed_row_or_an_older_value(monkeypat
     # Restored (version 5) comes back; purged (gone with no version) never does.
     assert hs.ledger_write_snapshot("p", proj, vocab, [_replica_row("r", 5, "restored")], [], ["r"])["ok"]
     assert _replica_titles() == {"r": "restored"}
-    assert hs.ledger_write_snapshot("p", proj, vocab, [], [], ["r"])["ok"]
+    assert hs.ledger_write_snapshot("p", proj, vocab, [], [], ["r"], gone={"r": hs.LEDGER_PURGED_VERSION})["ok"]
     assert hs.ledger_write_snapshot("p", proj, vocab, [_replica_row("r", 9, "after purge")], [], ["r"])["ok"]
     assert _replica_titles() == {}
 
@@ -933,7 +933,7 @@ def test_an_older_catch_up_never_clears_a_newer_changes_retry(monkeypatch, tmp_p
     older.start()
     try:
         assert entered.wait(5)
-        assert ledger.replica_catch_up(_ReplicaHub(2))["left"] == 0
+        assert ledger.replica_catch_up(_ReplicaHub(2)).get("busy")  # one catch-up at a time
         lock = hs._acquire_refresh_lock()  # the removal's copy is skipped and must be retried
         assert lock is not None
         try:
@@ -1212,10 +1212,12 @@ def test_an_older_catch_up_never_erases_history_added_without_a_new_version(monk
     try:
         assert entered.wait(5)
         # A late conditional write: history grows, the row's version does not.
-        ledger._replica_sync(_HistoryHub([1, 2]), "p", ["r"])
+        ledger._replica_sync(_HistoryHub([1, 2]), "p", ["r"])  # its catch-up waits its turn
     finally:
         release.set()
         older.join(5)
+    assert ledger.replica_pending() == 1  # the older one never clears the newer change's marker
+    ledger.replica_catch_up(_HistoryHub([1, 2]))
     assert [h["id"] for h in hs.ledger_read_snapshot("p")["history"]] == [1, 2]
     assert ledger.replica_pending() == 0
 
@@ -2060,3 +2062,55 @@ def test_a_cascades_child_rows_get_their_lag_markers_before_the_commit(choice, h
     assert got["queued"] and [q["op_id"] for q in ledger.queued_ops()] == ["unmarked"]  # kept, not refused
     assert _sql(hub, "SELECT evidence FROM ledger_rows WHERE row_id = 'q'") == [("",)]
     assert _sql(hub, "SELECT count(*) FROM ledger_ops WHERE op_id = 'unmarked'") == [(0,)]  # nothing committed
+
+
+# ---- round 11: the copy's catch-up is a write too; a listing that fails is not empty ------
+
+
+def test_catch_up_tombstones_only_a_purge_the_hub_recorded_and_waits_for_a_write(hub, monkeypatch, tmp_path):
+    from khipu import hub_snapshot as hs
+    from khipu import ledger
+
+    _snapshot(tmp_path)
+    ok("add", "kept", "--title", "Kept", "--kind", "slice")
+    ok("add", "gone", "--title", "Gone", "--kind", "slice")
+    ok("remove", "gone")
+    ok("purge", "gone", "--from-app")
+    with ledger._replica_pending() as pending:  # an add marked before its commit, not committed yet
+        pending.update({f"{P}#ghost": "t", f"{P}#gone": "t"})
+    fd = _hold_ledger_lock(ledger)  # a write is between its marker and its commit
+    try:
+        assert ledger.catch_up_offline_copy().get("busy") and ledger.replica_pending() == 2
+    finally:
+        os.close(fd)
+    with _real_connect(hub) as conn:
+        ledger.replica_catch_up(conn)
+    assert hs.ledger_gone_version(P, "ghost") is None  # absent is not purged
+    assert hs.ledger_gone_version(P, "gone") == hs.LEDGER_PURGED_VERSION  # the hub's purge record is
+    ok("add", "ghost", "--title", "Ghost", "--kind", "slice")
+    assert "ghost" in _replica_titles(P)
+
+
+def test_a_queue_listing_that_fails_reports_unreadable_never_empty(monkeypatch, tmp_path):
+    import errno
+
+    ledger = _offline(monkeypatch, tmp_path)
+    ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "x"}, op_id="waiting"))
+    real_listdir = os.listdir
+
+    def listdir(path="."):
+        if Path(path) == ledger.outbox_dir():
+            raise OSError(errno.EIO, "synthetic: the folder cannot be listed")
+        return real_listdir(path)
+
+    monkeypatch.setattr(os, "listdir", listdir)
+    monkeypatch.setattr(ledger, "_connect", _Conn)
+    monkeypatch.setattr(ledger, "purge_due", lambda _c: {"ok": True, "purged": 0})
+    monkeypatch.setattr(ledger, "replica_catch_up", lambda _c: {"copied": 0})
+    drained = ledger.drain(conn=_Conn())
+    assert drained["stopped_early"] and drained.get("unreadable")
+    status = ledger.outbox_status()
+    assert status["pending"] is None and status.get("unreadable")
+    assert ledger.nightly()["ok"] is False
+    monkeypatch.setattr(os, "listdir", real_listdir)
+    assert [q["op_id"] for q in ledger.queued_ops()] == ["waiting"]
