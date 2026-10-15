@@ -42,22 +42,34 @@ function report(rows?: unknown[]) {
   };
 }
 
-type Opts = { rows?: unknown[]; accounts?: unknown[]; featuresFail?: boolean; hang?: boolean };
+type Opts = {
+  rows?: unknown[];
+  accounts?: unknown[];
+  featuresFail?: boolean;
+  hang?: boolean;
+  routeFail?: boolean;
+  priority?: unknown;
+  refreshFail?: boolean;
+  source?: "file" | "default";
+};
 
 function fake(o: Opts = {}) {
   invokeMock.mockImplementation(async (cmd: string) => {
     if (o.hang) return new Promise(() => {});
     switch (cmd) {
-      case "khipu_usage_status":
       case "khipu_usage_refresh":
+        if (o.refreshFail) throw new Error("probe failed");
+        return JSON.stringify(report(o.rows));
+      case "khipu_usage_status":
         return JSON.stringify(report(o.rows));
       case "khipu_config_show":
-        return JSON.stringify({ usage_accounts: { source: "default", accounts: o.accounts ?? ENTRIES, user_home: "/Users/test" } });
+        return JSON.stringify({ usage_accounts: { source: o.source ?? "default", accounts: o.accounts ?? ENTRIES, user_home: "/Users/test" } });
       case "khipu_features_show":
         if (o.featuresFail) throw new Error("no");
         return JSON.stringify({ features: { routing_push: { enabled: true, source: "default" } } });
       case "khipu_route_view":
-        return JSON.stringify({ accounts: [], priority: null });
+        if (o.routeFail) throw new Error("route failed");
+        return JSON.stringify({ accounts: [], priority: o.priority ?? null });
       default:
         return JSON.stringify({ ok: true });
     }
@@ -165,6 +177,84 @@ describe("Setup › Accounts step", () => {
     fake({ rows: ENTRIES.map((e) => ({ harness: e.harness, account: e.label, home: null, ok: false, error: "not_installed", windows: [] })) });
     mount();
     expect(await screen.findByText("No accounts found on this Mac")).toBeInTheDocument();
+  });
+});
+
+describe("Setup › Accounts step, review fixes", () => {
+  it("a failed routing read never writes a priority, and Next still saves other changes", async () => {
+    fake({ routeFail: true });
+    const { onNext } = mount();
+    await ready();
+    await screen.findByText(/couldn't read your current order/);
+    expect(screen.getByRole("button", { name: "Move Codex up" })).toBeDisabled();
+    fireEvent.click(screen.getAllByLabelText("Read this account's plan")[3]);
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(calls("khipu_route_priority")).toHaveLength(0);
+    expect(calls("khipu_config_set")).toHaveLength(1);
+  });
+
+  it("rechecking an account after a move keeps it in the order and the priority", async () => {
+    fake();
+    const { onNext } = mount();
+    await ready();
+    const boxes = () => screen.getAllByLabelText("Read this account's plan");
+    fireEvent.click(boxes()[1]);
+    fireEvent.click(screen.getByRole("button", { name: "Move Muse up" }));
+    fireEvent.click(boxes()[1]);
+    expect(screen.getByRole("button", { name: "Move Codex up" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    const pri = calls("khipu_route_priority");
+    expect(pri).toHaveLength(1);
+    expect(pri[0][1].entries.map((e: { account: string }) => e.account)).toEqual(["claude|", "codex|", "muse|", "grok|"]);
+  });
+
+  it("a priority entry with no plan row is kept when the order is saved", async () => {
+    fake({
+      priority: {
+        entries: [
+          { account: "claude|/Users/test/.claude-second", label: "Claude second", role: "builds", until: null },
+          { account: "claude|", label: "Claude Code", role: null, until: null },
+        ],
+        until: null,
+      },
+    });
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(screen.getByRole("button", { name: "Move Codex up" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    const entries = calls("khipu_route_priority")[0][1].entries;
+    expect(entries).toContainEqual({ account: "claude|/Users/test/.claude-second", role: "builds", until: null });
+  });
+
+  it("a failed Check again says so beside the figures it keeps", async () => {
+    fake({ refreshFail: true });
+    mount();
+    await ready();
+    fireEvent.click(screen.getByRole("button", { name: "Check Grok Build again" }));
+    expect(await screen.findByText(/last check didn't work/)).toBeInTheDocument();
+    expect(screen.getByText("Signed in, Max, 62% of its week left")).toBeInTheDocument();
+  });
+
+  it("an account left out of your own list is not called not found", async () => {
+    fake({
+      source: "file",
+      accounts: [ENTRIES[0]],
+      rows: [report().accounts[0]],
+    });
+    mount();
+    await screen.findByText("Signed in, Max, 62% of its week left");
+    await screen.findByText(/Not in your account list: Codex, Grok Build and Muse/);
+    expect(screen.queryByText(/Not found on this Mac/)).not.toBeInTheDocument();
+  });
+
+  it("an explicit not installed result is called not found", async () => {
+    fake({ source: "file", rows: [report().accounts[0], { harness: "codex", account: "Codex", ok: false, error: "not_installed" }],
+      accounts: ENTRIES.slice(0, 2) });
+    mount();
+    await screen.findByText(/Not found on this Mac: Codex\./);
   });
 });
 

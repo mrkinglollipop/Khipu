@@ -91,9 +91,15 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
 
   const rows = usage.data?.accounts ?? null;
   const found = useMemo(() => (rows ?? []).filter((r) => !(r.ok === false && r.error === "not_installed")), [rows]);
-  const notFound = rows
-    ? USAGE_HARNESS_OPTIONS.filter(([h]) => !found.some((r) => r.harness === h)).map(([, name]) => name)
-    : [];
+  // "Not found" only on evidence: a not_installed row, or, with the default
+  // list (every CLI whose command is on this Mac), a CLI with no row at all.
+  // A CLI left out of the owner's own list is only not listed.
+  const absent = rows ? USAGE_HARNESS_OPTIONS.filter(([h]) => !found.some((r) => r.harness === h)) : [];
+  const notInstalled = new Set((rows ?? []).filter((r) => r.ok === false && r.error === "not_installed").map((r) => r.harness));
+  const notFound = absent
+    .filter(([h]) => notInstalled.has(h) || status?.source === "default")
+    .map(([, name]) => name);
+  const notListed = status?.source === "file" ? absent.filter(([h]) => !notInstalled.has(h)).map(([, name]) => name) : [];
 
   const [unread, setUnread] = useState<Set<string>>(new Set());
   const reading = found.filter((r) => !unread.has(accountId(r.harness, r.home, userHome)));
@@ -112,11 +118,21 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
       .sort((a, b) => rank(a.r) - rank(b.r) || a.i - b.i)
       .map(({ r }) => routeKey(r));
   }, [found, heldEntries]);
+  // `moved` is always an order of every account found, so an account
+  // unchecked and checked again comes back in its place; the list shown and
+  // the priority written are the accounts still read, in that order.
   const [moved, setMoved] = useState<string[] | null>(null);
+  const byKey = new Map(found.map((r) => [routeKey(r), r]));
+  const full = moved
+    ? [...moved.filter((k) => byKey.has(k)), ...startOrder.filter((k) => !moved.includes(k))]
+    : startOrder;
   const readingKeys = new Set(reading.map(routeKey));
   const start = startOrder.filter((k) => readingKeys.has(k));
-  const order = (moved ?? startOrder).filter((k) => readingKeys.has(k));
-  const byKey = new Map(found.map((r) => [routeKey(r), r]));
+  const order = full.filter((k) => readingKeys.has(k));
+  // The order can be changed only once the priority already set has been
+  // read, so a write never drops its roles, ends or accounts.
+  const routeRead = route.data != null;
+  const routeFailed = !routeRead && route.error != null && !route.loading;
 
   const master = features.data?.features?.routing_push;
   const [tell, setTell] = useState<boolean | null>(null);
@@ -129,10 +145,13 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
   }, [active]);
 
   const move = (i: number, by: number) => {
-    const next = [...order];
-    const j = i + by;
-    if (j < 0 || j >= next.length) return;
-    [next[i], next[j]] = [next[j], next[i]];
+    const a = order[i];
+    const b = order[i + by];
+    if (a == null || b == null) return;
+    const next = [...full];
+    const ia = next.indexOf(a);
+    const ib = next.indexOf(b);
+    [next[ia], next[ib]] = [next[ib], next[ia]];
     setMoved(next);
   };
 
@@ -156,11 +175,16 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
           return;
         }
       }
-      if (order.length > 0 && !samePriority(order, start)) {
+      if (routeRead && order.length > 0 && !samePriority(order, start)) {
         const entries = order.map((k) => {
           const r = byKey.get(k);
           const was = heldEntries.find((e) => e.account === k || (r && e.label === r.account));
           return { account: k, role: was?.role ?? null, until: was?.until ?? null };
+        });
+        // Priority accounts with no plan row here keep their place.
+        heldEntries.forEach((e, h) => {
+          if (found.some((r) => e.account === routeKey(r) || e.label === r.account)) return;
+          entries.splice(Math.min(h, entries.length), 0, { account: e.account, role: e.role ?? null, until: e.until ?? null });
         });
         const res = await callCli("khipu_route_priority", { action: "set", entries, until: held?.until ?? null });
         if (!res.ok) {
@@ -283,6 +307,11 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
               );
             })}
           </ul>
+          {usage.error ? (
+            <p className="set-error" role="alert">
+              The last check didn't work: {usage.error} The lines above are from the check before it.
+            </p>
+          ) : null}
           {reading.length === 0 ? (
             <p className="set-help">Khipu reads at least one account. With none chosen, it keeps reading every account it finds.</p>
           ) : null}
@@ -293,13 +322,24 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
               Accounts and routing if you install {notFound.length === 1 ? "it" : "them"}.
             </p>
           ) : null}
+          {notListed.length ? (
+            <p className="acct-none">
+              <span className="hdot" aria-hidden="true" />
+              Not in your account list: {listOf(notListed)}. Khipu reads only the accounts listed in Settings →
+              Accounts and routing.
+            </p>
+          ) : null}
           {order.length > 1 ? (
             <div className="acct-block">
               <h2 className="acct-h" id="setup-prio-h">
                 Which should your agents try first? <span className="meta">Optional</span>
               </h2>
               <p className="set-help">
-                {held ? "This is the order you set before. Change it, or leave it as it is." : "Leave the order as it is and Khipu sets no priority."}
+                {routeFailed
+                  ? "Khipu couldn't read your current order, so it can't be changed here. Set it later in Settings → Accounts and routing."
+                  : !routeRead
+                    ? "Reading your current order…"
+                    : held ? "This is the order you set before. Change it, or leave it as it is." : "Leave the order as it is and Khipu sets no priority."}
               </p>
               <ol className="order-list" aria-labelledby="setup-prio-h">
                 {order.map((k, i) => {
@@ -310,10 +350,10 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
                       <span className="order-n" aria-hidden="true">{i + 1}.</span>
                       <span className="order-name">{name}</span>
                       <span className="order-btns">
-                        <button type="button" className="sm" aria-label={`Move ${name} up`} disabled={i === 0 || saving} onClick={() => move(i, -1)}>
+                        <button type="button" className="sm" aria-label={`Move ${name} up`} disabled={i === 0 || saving || !routeRead} onClick={() => move(i, -1)}>
                           Move up
                         </button>
-                        <button type="button" className="sm" aria-label={`Move ${name} down`} disabled={i === order.length - 1 || saving}
+                        <button type="button" className="sm" aria-label={`Move ${name} down`} disabled={i === order.length - 1 || saving || !routeRead}
                           onClick={() => move(i, 1)}>
                           Move down
                         </button>
