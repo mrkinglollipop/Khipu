@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -79,14 +80,17 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
     if row is None:
         return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
     ts, summary, session_id = row
-    legacy_identities = [{
+    live = {
         "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
         "summary_md5": hashlib.md5((summary or "").encode("utf-8")).hexdigest(),
-    }]
+    }
+    # Every legacy line this episode may have left behind, in order: its live
+    # identity, then each source row's, then the pre-0027 raw original. None is
+    # erased until the one ownership check below has cleared it.
+    candidates = [live]
     has_merged_sources = False
     source_rows: list[dict[str, Any]] | None = None
     unidentified_sources = 0
-    shared_identities: list[dict[str, Any]] = []
     from khipu.capture_identity import sources_for_episode, sources_ready
 
     raw = None
@@ -96,7 +100,8 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         raw = raw_row[0] if isinstance(raw_row, tuple) and len(raw_row) == 1 else None
     except Exception:  # noqa: BLE001 — old schema/driver must still forget the hub row
         raw = None
-    if sources_ready(cur):
+    sources = sources_ready(cur)
+    if sources:
         # Every source row, origin and merged, keeps the (ts, summary_md5) it
         # was first written under, so each legacy line this episode ever had
         # is named exactly, whatever edits and merges did to the live summary
@@ -111,31 +116,11 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         has_merged_sources = any(src["role"] == "merged" for src in source_rows)
         unidentified_sources += sum(1 for src in source_rows
                                    if src["ts"] is None or src["summary_md5"] is None)
-        from_sources: list[dict[str, Any]] = []
         for src in source_rows:
             ident = {"ts": src["ts"], "summary_md5": src["summary_md5"]}
             if (isinstance(ident["ts"], str) and ident["summary_md5"]
-                    and not any(_same_identity(ident, known) for known in legacy_identities)):
-                legacy_identities.append(ident)
-                from_sources.append(ident)
-        # A legacy line another episode also holds is evidence of that episode.
-        # Erasing it would lose that episode's line, so it stays and the forget
-        # reports itself incomplete. The live identity is exempt: the legacy
-        # unique key already makes it this episode's alone.
-        if from_sources:
-            cur.execute(
-                "SELECT c.n FROM unnest(%s::timestamptz[], %s::text[]) "
-                "WITH ORDINALITY AS c(ts, md, n) WHERE EXISTS ("
-                "SELECT 1 FROM episode_sources s WHERE s.episode_id <> %s "
-                "AND s.ts = c.ts AND s.summary_md5 = c.md) OR EXISTS ("
-                "SELECT 1 FROM episodes e WHERE e.id <> %s AND e.ts = c.ts "
-                "AND md5(e.summary) = c.md)",
-                ([i["ts"] for i in from_sources], [i["summary_md5"] for i in from_sources],
-                 episode_id, episode_id),
-            )
-            held = {int(r[0]) - 1 for r in cur.fetchall()}
-            shared_identities = [from_sources[i] for i in sorted(held)]
-            legacy_identities = [i for i in legacy_identities if i not in shared_identities]
+                    and not any(_same_identity(ident, known) for known in candidates)):
+                candidates.append(ident)
     # Pre-0027 hub (or a 0027 hub where raw named nothing to recover): an
     # edited summary can still have an original legacy identity in raw. For merged episodes, raw describes a retained source,
     # not an identity that forget can safely erase without a capture-identity
@@ -144,8 +129,15 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         has_merged_sources = bool(raw.get("merged_from"))
         original = _raw_identity(raw)
         if (not has_merged_sources and original is not None
-                and any(original[key] != legacy_identities[0][key] for key in ("ts", "summary_md5"))):
-            legacy_identities.append(original)
+                and not any(_same_identity(original, known) for known in candidates)):
+            candidates.append(original)
+    # A legacy line another episode also holds is evidence of that episode.
+    # Erasing it would lose that episode's line, so it stays and the forget
+    # reports itself incomplete. The live identity gets no exemption: an edit
+    # frees a legacy key, so another episode's original line can match it.
+    held = _held_elsewhere(cur, episode_id, candidates, sources=sources)
+    shared_identities = [i for i in candidates if i in held]
+    legacy_identities = [i for i in candidates if i not in held]
     cur.execute(
         "UPDATE episodes SET deleted_at = now() WHERE id = %s AND deleted_at IS NULL",
         (episode_id,),
@@ -204,7 +196,7 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         "decisions_retracted": decisions_retracted,
         "briefs_staled": briefs_staled,
         "graph": "topic nodes are shared across episodes; none removed",
-        "identity": legacy_identities[0],
+        "identity": live,
         "legacy_identities": legacy_identities,
         "has_merged_sources": has_merged_sources,
         "source_rows": source_rows,
@@ -272,15 +264,71 @@ def _sources_missing_from_rows(raw: Any, rows: list[dict[str, Any]]
     return recovered, missing
 
 
+def _instant(value: Any) -> datetime | None:
+    """A timestamp as a UTC instant to the second, or None when unreadable.
+    Naive means UTC; a trailing Z is read as +00:00."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    try:
+        return value.astimezone(timezone.utc).replace(microsecond=0)
+    except OverflowError:  # year 1 or 9999 shifted past the calendar's edge
+        return None
+
+
 def _same_identity(a: dict[str, Any], b: dict[str, Any]) -> bool:
     """Two legacy identities name the same file line: same summary md5 and the
-    same second, compared the way _line_matches compares a line."""
-    return (a.get("summary_md5") == b.get("summary_md5")
-            and _ts_key(str(a.get("ts") or "")) == _ts_key(str(b.get("ts") or "")))
+    same UTC second, whatever offset either was written with."""
+    ta, tb = _instant(a.get("ts")), _instant(b.get("ts"))
+    return (bool(a.get("summary_md5")) and a.get("summary_md5") == b.get("summary_md5")
+            and ta is not None and ta == tb)
 
 
-def _ts_key(ts_iso: str) -> str:
-    return ts_iso.replace("Z", "+00:00")[:19]
+def _held_elsewhere(cur, episode_id: int, identities: list[dict[str, Any]], *,
+                    sources: bool) -> list[dict[str, Any]]:
+    """The identities some other live episode also holds: as its live row, its
+    raw origin, a raw merge receipt, or (with ``sources``) a source row. The
+    database matches on summary md5; the time is compared here as an instant,
+    so a text offset cannot hide a holder."""
+    md = sorted({i["summary_md5"] for i in identities if i.get("summary_md5")})
+    if not md:
+        return []
+    parts = [
+        "SELECT md5(e.summary) AS md, e.ts AS ts, NULL::text AS ts_text FROM episodes e "
+        "WHERE e.id <> %(id)s AND e.deleted_at IS NULL AND md5(e.summary) = ANY(%(md)s::text[])",
+        "SELECT md5(e.raw->>'summary'), NULL::timestamptz, e.raw->>'ts' FROM episodes e "
+        "WHERE e.id <> %(id)s AND e.deleted_at IS NULL "
+        "AND jsonb_typeof(e.raw->'summary') = 'string' "
+        "AND md5(e.raw->>'summary') = ANY(%(md)s::text[])",
+        "SELECT md5(r.v->'payload'->>'summary'), NULL::timestamptz, r.v->'payload'->>'ts' "
+        "FROM episodes e CROSS JOIN LATERAL jsonb_array_elements(CASE "
+        "WHEN jsonb_typeof(e.raw->'merged_from') = 'array' THEN e.raw->'merged_from' "
+        "ELSE '[]'::jsonb END) AS r(v) "
+        "WHERE e.id <> %(id)s AND e.deleted_at IS NULL AND jsonb_typeof(r.v) = 'object' "
+        "AND jsonb_typeof(r.v->'payload') = 'object' "
+        "AND jsonb_typeof(r.v->'payload'->'summary') = 'string' "
+        "AND md5(r.v->'payload'->>'summary') = ANY(%(md)s::text[])",
+    ]
+    if sources:
+        parts.append(
+            "SELECT s.summary_md5, s.ts, NULL::text FROM episode_sources s "
+            "JOIN episodes e ON e.id = s.episode_id "
+            "WHERE s.episode_id <> %(id)s AND e.deleted_at IS NULL AND s.deleted_at IS NULL "
+            "AND s.summary_md5 = ANY(%(md)s::text[])")
+    cur.execute("SELECT held.md, held.ts, held.ts_text FROM (" + " UNION ALL ".join(parts)
+                + ") AS held", {"id": episode_id, "md": md})
+    holders = set()
+    for held_md, held_ts, held_text in cur.fetchall():
+        when = _instant(held_ts if held_ts is not None else held_text)
+        if when is not None:
+            holders.add((held_md, when))
+    return [i for i in identities if (i.get("summary_md5"), _instant(i.get("ts"))) in holders]
 
 
 def _line_matches(line: str, ts_iso: str, summary_md5: str) -> bool:
@@ -293,11 +341,11 @@ def _line_matches(line: str, ts_iso: str, summary_md5: str) -> bool:
     summary = obj.get("summary") or ""
     if not isinstance(summary, str) or hashlib.md5(summary.encode("utf-8")).hexdigest() != summary_md5:
         return False
-    raw_ts = str(obj.get("ts") or "")
-    # The file stores what the hook minted (2026-09-05T12:20:17Z); PG returns
-    # an aware datetime. Compare on the first 19 characters (to the second)
-    # after normalising the zone suffix.
-    return _ts_key(raw_ts) == _ts_key(ts_iso)
+    # The file stores what the hook minted (2026-09-05T12:20:17Z or with an
+    # offset); PG returns an aware datetime. Compare as UTC instants to the
+    # second, never as wall-clock text.
+    when = _instant(obj.get("ts"))
+    return when is not None and when == _instant(ts_iso)
 
 
 def _has_unidentified_records(lines: list[str]) -> bool:
@@ -308,7 +356,8 @@ def _has_unidentified_records(lines: list[str]) -> bool:
             obj = json.loads(line)
         except ValueError:
             return True
-        if not isinstance(obj, dict) or not isinstance(obj.get("summary"), str) or not isinstance(obj.get("ts"), str):
+        if (not isinstance(obj, dict) or not isinstance(obj.get("summary"), str)
+                or not isinstance(obj.get("ts"), str) or _instant(obj["ts"]) is None):
             return True
     return False
 
@@ -349,6 +398,10 @@ def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: st
     """Remove matching lines from the legacy file and retained backups.
     A rewrite preserves a backup containing only the remaining records."""
     identity = {"ts": ts_iso, "summary_md5": summary_md5}
+    if _instant(ts_iso) is None or not summary_md5:
+        # Nothing to match on: touch no file, and say so so the forget is partial.
+        return {"file": None, "removed": 0, "reason": "unreadable identity", "identity": identity,
+                "backups": {"ok": True, "removed": 0, "remaining": []}}
     if memory_root is None:
         return {"file": None, "removed": 0, "reason": "memory_root not configured", "identity": identity,
                 "backups": {"ok": True, "removed": 0, "remaining": []}}
@@ -505,12 +558,15 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
         except Exception:  # noqa: BLE001
             memory_root = None
             root_resolved = False
-    identities = out.get("legacy_identities") or [out.get("identity") or {}]
+    # An all-shared episode has an empty list: never fall back to its live line.
+    identities = (out["legacy_identities"] if "legacy_identities" in out
+                  else [out.get("identity") or {}])
     out["legacy_files"] = [
         forget_in_legacy_file(memory_root, ident.get("ts", ""), ident.get("summary_md5", ""))
         for ident in identities
     ]
-    out["legacy_file"] = out["legacy_files"][0]
+    out["legacy_file"] = (out["legacy_files"][0] if out["legacy_files"]
+                          else {"file": None, "removed": 0})
     if not root_resolved or any(str(item.get("reason") or "").startswith(("unreadable", "backup", "rewrite"))
                                   for item in out["legacy_files"]):
         partial.append("legacy_file")

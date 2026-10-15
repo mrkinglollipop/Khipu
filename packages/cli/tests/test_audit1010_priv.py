@@ -452,6 +452,9 @@ class ForgetPrivacyTest(unittest.TestCase):
         class Cur:
             rowcount = 1
 
+            def fetchall(self):
+                return []
+
             def execute(self, sql, _params=None):
                 self.sql = sql
 
@@ -488,6 +491,9 @@ class ForgetPrivacyTest(unittest.TestCase):
         class Cur:
             rowcount = 1
 
+            def fetchall(self):
+                return []
+
             def execute(self, sql, _params=None):
                 self.sql = sql
 
@@ -523,6 +529,9 @@ class ForgetPrivacyTest(unittest.TestCase):
         class Cur:
             rowcount = 1
 
+            def fetchall(self):
+                return []
+
             def execute(self, sql, _params=None):
                 self.sql = sql
 
@@ -549,6 +558,7 @@ class ForgetPrivacyTest(unittest.TestCase):
     def test_absent_unconfigured_stores_are_complete_but_existing_failed_replica_is_partial(self):
         ts = datetime(2026, 10, 10, tzinfo=timezone.utc)
         cur = mock.Mock()
+        cur.fetchall.return_value = []
         cur.fetchone.return_value = (ts, "forget me", "codex:session")
         cur.rowcount = 1
         conn = mock.MagicMock()
@@ -575,6 +585,7 @@ class ForgetPrivacyTest(unittest.TestCase):
     def test_unidentifiable_legacy_records_withhold_complete_forget(self):
         ts = datetime(2026, 10, 10, tzinfo=timezone.utc)
         cur = mock.Mock()
+        cur.fetchall.return_value = []
         cur.fetchone.return_value = (ts, "forget me", "codex:session")
         cur.rowcount = 1
         conn = mock.MagicMock()
@@ -636,6 +647,9 @@ class ForgetPrivacyTest(unittest.TestCase):
         class Cur:
             rowcount = 1
 
+            def fetchall(self):
+                return []
+
             def execute(self, sql, _params=None):
                 self.sql = sql
 
@@ -658,6 +672,9 @@ class ForgetPrivacyTest(unittest.TestCase):
 
         class Cur:
             rowcount = 1
+
+            def fetchall(self):
+                return []
             sql = ""
             def execute(self, sql, _params=None): self.sql = sql
             def fetchone(self):
@@ -693,6 +710,7 @@ class ForgetPrivacyTest(unittest.TestCase):
     def test_snapshot_or_unconfigured_legacy_makes_completion_partial(self):
         ts = datetime(2026, 10, 10, tzinfo=timezone.utc)
         cur = mock.Mock()
+        cur.fetchall.return_value = []
         cur.fetchone.return_value = (ts, "forget me", "codex:session")
         cur.rowcount = 1
         conn = mock.MagicMock()

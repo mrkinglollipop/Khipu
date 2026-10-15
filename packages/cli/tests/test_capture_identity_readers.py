@@ -227,10 +227,12 @@ class MissingInPgReaderTest(unittest.TestCase):
 class _ForgetCur:
     """forget_episode's statements; ``sources`` is None for a pre-0027 hub."""
 
-    def __init__(self, row, raw, sources, shared_md5=()):
+    def __init__(self, row, raw, sources, holders=()):
         self.row, self.raw, self.sources = row, raw, sources
-        self.shared_md5 = set(shared_md5)
+        # (md5, timestamptz or None, text ts or None) rows the ownership query returns.
+        self.holders = list(holders)
         self.shared_queries = 0
+        self.held_sql = ""
         self.rowcount = 0
         self._one = None
         self._all: list = []
@@ -249,11 +251,11 @@ class _ForgetCur:
             self._one = (self.raw,)
         elif s.startswith("SELECT source_key, role, ts, summary_md5"):
             self._all = list(self.sources or [])
-        elif "unnest(" in s:
-            # Candidates are (ts[], md5[]); report the 1-based position of each
-            # one another episode also holds.
+        elif "AS held" in s:
+            # One query for every candidate: the holders whose md5 is asked for.
             self.shared_queries += 1
-            self._all = [(n,) for n, md in enumerate(params[1], 1) if md in self.shared_md5]
+            self.held_sql = s
+            self._all = [h for h in self.holders if h[0] in params["md"]]
 
     def __enter__(self):
         return self
@@ -291,7 +293,8 @@ class ForgetReaderTest(unittest.TestCase):
                    ("k2", "merged", datetime(2026, 10, 1, 9, 2, tzinfo=timezone.utc),
                     _md5("second capture"), "p2")]
         cur = _ForgetCur((self.TS, "edited text", "claude_code:a"), self.RAW, sources,
-                         shared_md5={_md5("second capture")})
+                         holders=[(_md5("second capture"),
+                                   datetime(2026, 10, 1, 9, 2, tzinfo=timezone.utc), None)])
         out = forget.forget_episode(cur, 3)
         self.assertEqual(cur.shared_queries, 1)
         self.assertEqual([i["summary_md5"] for i in out["shared_identities"]],
@@ -300,13 +303,15 @@ class ForgetReaderTest(unittest.TestCase):
                          {_md5("edited text"), _md5("first text")})
         self.assertEqual(out["unidentified_sources"], 0)
 
-    def test_nothing_shared_by_default_and_probe_false_never_asks(self):
+    def test_nothing_shared_by_default_and_probe_false_asks_without_sources(self):
         sources = [("k1", "origin", self.TS, _md5("first text"), None)]
         cur = _ForgetCur((self.TS, "edited text", "claude_code:a"), self.RAW, sources)
         self.assertEqual(forget.forget_episode(cur, 3)["shared_identities"], [])
+        self.assertIn("episode_sources", cur.held_sql)
         cur = _ForgetCur((self.TS, "edited text", "claude_code:a"), self.RAW, None)
         out = forget.forget_episode(cur, 3)
-        self.assertEqual((cur.shared_queries, out["shared_identities"]), (0, []))
+        self.assertEqual((cur.shared_queries, out["shared_identities"]), (1, []))
+        self.assertNotIn("episode_sources", cur.held_sql)
 
     def test_source_rows_without_a_timestamp_or_md5_are_counted(self):
         sources = [("k1", "origin", None, _md5("first text"), None),

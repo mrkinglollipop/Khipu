@@ -32,6 +32,9 @@ class _FakeCur:
         elif s.startswith("DELETE FROM memory_embeddings"):
             self.rowcount = 1
 
+    def fetchall(self):
+        return []
+
     def fetchone(self):
         if self.episode_id is None:
             return None
