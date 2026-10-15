@@ -1608,12 +1608,14 @@ def _gaps(plan, have: dict[tuple[str, str, int], str]):
     return missing, stale
 
 
-def memory_gaps(cur, profile: str, plan=None):
+def memory_gaps(cur, profile: str, plan=None, *, cached: bool = False):
     """``(plan, missing, stale)`` for ``profile``: ``missing`` are plan keys with
     no vector, ``stale`` are plan keys whose embedded hash differs from the
-    chunk's current hash (what ``backfill`` re-embeds)."""
+    chunk's current hash (what ``backfill`` re-embeds). ``cached`` builds the
+    plan from this Mac's fingerprint cache (same answer, see
+    ``memory_chunk_plan``)."""
     if plan is None:
-        plan = memory_chunk_plan(cur)
+        plan = memory_chunk_plan(cur, cached=cached)
     missing, stale = _gaps(plan, _existing_hashes(cur, profile))
     return plan, missing, stale
 
@@ -3102,19 +3104,28 @@ def literal_trgm_status() -> dict[str, Any]:
     return {"ok": True}
 
 
-def topics_embed_lag_minutes(*, profile: str | None = None) -> dict[str, Any]:
+def topics_embed_lag_minutes(
+    *, profile: str | None = None, gaps: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """D6/F2: how long has the OLDEST currently-unembedded topic been
     waiting? The Stop-hook catch-up (F2) and the nightly backfill both
     embed topics as they change; coverage() only ever reported a missing
     COUNT, never how stale the oldest gap is — this is the number that
     actually says whether either catch-up is keeping up. Red past 60
-    minutes (D6's threshold); a hub with nothing unembedded reads 0/ok."""
+    minutes (D6's threshold); a hub with nothing unembedded reads 0/ok.
+
+    ``gaps`` is what ``coverage(detail=True, keep_gaps=...)`` kept in the same
+    run: used when it is for the same profile, so doctor plans the memory
+    space once instead of twice."""
     from khipu.db import connect
 
     with connect() as conn:
         with conn.cursor() as cur:
             profile = _resolve_profile(cur, profile)
-            _plan, missing, stale = memory_gaps(cur, profile)
+            if gaps is not None and gaps.get("profile") == profile:
+                missing, stale = gaps["missing"], gaps["stale"]
+            else:
+                _plan, missing, stale = memory_gaps(cur, profile, cached=gaps is not None)
             gap_refs = sorted({ref for kind, ref, _idx in [*missing, *stale] if kind == "topic"})
             cur.execute(
                 "SELECT MIN(COALESCE(t.event_at, t.updated_at)) FROM topics t "
@@ -3141,13 +3152,23 @@ def topics_embed_lag_minutes(*, profile: str | None = None) -> dict[str, Any]:
     }
 
 
-def coverage(*, profile: str | None = None, detail: bool = False) -> dict[str, Any]:
+def coverage(
+    *,
+    profile: str | None = None,
+    detail: bool = False,
+    cached_plan: bool = False,
+    keep_gaps: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Per-kind coverage for active or named profile — the 'status UI that can't lie'.
 
     ``detail=True`` adds the chunk-level block (``chunks``, ``embedded``,
     ``missing``, ``stale``, ``pct``, ``sample_missing``, ``sample_stale`` — the
     names a library's ``status`` uses). It chunks every episode and topic, so
-    ``embed status`` asks for it and doctor / activate do not."""
+    ``embed status`` asks for it and doctor / activate do not.
+
+    ``cached_plan`` builds that plan from this Mac's fingerprint cache (same
+    answer, a fraction of the transfer). ``keep_gaps``, a dict, receives the
+    profile and its missing/stale keys for ``topics_embed_lag_minutes``."""
     from khipu.db import connect
 
     with connect() as conn:
@@ -3222,8 +3243,10 @@ def coverage(*, profile: str | None = None, detail: bool = False) -> dict[str, A
             qcache = query_cache_status(cur)
             chunk_block: dict[str, Any] = {}
             if detail:
-                plan, missing, stale = memory_gaps(cur, profile)
+                plan, missing, stale = memory_gaps(cur, profile, cached=cached_plan)
                 chunk_block = memory_coverage_fields(plan, missing, stale)
+                if keep_gaps is not None:
+                    keep_gaps.update(profile=profile, missing=missing, stale=stale)
     e = by.get("episode", {"refs": 0, "chunks": 0})
     t = by.get("topic", {"refs": 0, "chunks": 0})
     m = by.get("media", {"refs": 0, "chunks": 0})

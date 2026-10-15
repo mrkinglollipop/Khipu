@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -109,7 +110,7 @@ def local_health(
             "max_age_hours": BACKUP_MAX_AGE_HOURS,
         }
 
-    integrity = _integrity_check(snap)
+    integrity, integrity_checked_at = _integrity_verdict(snap)
     if integrity.lower() != "ok":
         return {
             "ok": False,
@@ -141,6 +142,7 @@ def local_health(
         "mtime": mtime.isoformat(),
         "age_seconds": age_seconds,
         "max_age_hours": BACKUP_MAX_AGE_HOURS,
+        "integrity_checked_at": integrity_checked_at,
     }
     if not fresh:
         out["reason"] = (
@@ -264,6 +266,98 @@ def _integrity_check(path: Path, *, timeout: int = INTEGRITY_TIMEOUT_SECONDS) ->
     return (r.stdout or "").strip() or "unknown"
 
 
+# PRAGMA integrity_check reads every page of the snapshot: on a 3.8 GB graph it
+# took 26 s, so every `khipu doctor` (and the desktop app's Home, which runs
+# it on every open) waited on it. A snapshot is written once and never edited,
+# so a passing verdict is remembered for that exact file (path, size, inode,
+# mtime and ctime: any write changes ctime, which no caller can set back) and
+# re-checked at most a day later. A failing verdict is never remembered.
+INTEGRITY_CACHE_MAX_AGE_SECONDS = 24 * 3600
+
+
+def _integrity_cache_file() -> Path:
+    from khipu.paths import pycache_dir
+
+    return pycache_dir().parent / "graph-snapshot-integrity.json"
+
+
+def _file_identity(path: Path) -> dict | None:
+    """The file's identity, or None when a verdict for it must not be
+    remembered: unreadable, or with a SQLite WAL or rollback journal beside
+    it (committed WAL pages change the database without touching the main
+    file's size or times)."""
+    for suffix in ("-wal", "-journal"):
+        if Path(f"{path}{suffix}").exists():
+            return None
+    try:
+        st = path.stat()
+        resolved = str(path.resolve())
+    except OSError:
+        return None
+    return {
+        "path": resolved,
+        "bytes": st.st_size,
+        "inode": st.st_ino,
+        "mtime_ns": st.st_mtime_ns,
+        "ctime_ns": st.st_ctime_ns,
+    }
+
+
+def _remember_integrity_ok(path: Path, checked_at: datetime, before: dict | None) -> None:
+    """Remember a pass only for the identity the file had before the check
+    and still has after it: a write during the check leaves nothing."""
+    ident = _file_identity(path)
+    if ident is None or before is None or ident != before:
+        return
+    target = _integrity_cache_file()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(
+            json.dumps({**ident, "result": "ok", "checked_at": checked_at.isoformat()}),
+            encoding="utf-8",
+        )
+        os.replace(tmp, target)
+    except OSError:
+        pass  # an unwritable cache only means the next doctor checks again
+
+
+def _remembered_integrity_ok(path: Path, now: datetime) -> str | None:
+    """The ``checked_at`` of a remembered passing verdict for this exact file,
+    or None when there is none, it is for another file, or it is too old."""
+    ident = _file_identity(path)
+    if ident is None:
+        return None
+    try:
+        data = json.loads(_integrity_cache_file().read_text(encoding="utf-8"))
+        if data.get("result") != "ok" or any(data.get(k) != v for k, v in ident.items()):
+            return None
+        checked = datetime.fromisoformat(str(data["checked_at"]))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if checked.tzinfo is None:
+        return None
+    age = (now - checked).total_seconds()
+    if age < 0 or age > INTEGRITY_CACHE_MAX_AGE_SECONDS:
+        return None
+    return checked.isoformat()
+
+
+def _integrity_verdict(path: Path) -> tuple[str, str]:
+    """``(integrity, checked_at)``: a remembered pass for this unchanged file
+    from the last day, else a fresh ``PRAGMA integrity_check`` (remembered when
+    it passes)."""
+    now = _utcnow()
+    remembered = _remembered_integrity_ok(path, now)
+    if remembered is not None:
+        return "ok", remembered
+    before = _file_identity(path)
+    integrity = _integrity_check(path)
+    if integrity.lower() == "ok":
+        _remember_integrity_ok(path, now, before)
+    return integrity, now.isoformat()
+
+
 def _required_graph_tables(path: Path) -> str | None:
     """Return the missing required graph table names, if any, without writing."""
     try:
@@ -317,8 +411,12 @@ def record_local(*, snapshot: Path | None = None) -> dict:
     if snap is None or not snap.is_file():
         return {"ok": False, "reason": "no snapshot found"}
 
+    before = _file_identity(snap)
     integrity = _integrity_check(snap)
     ok = integrity.lower() == "ok"
+    if ok:
+        # The nightly just checked the file it wrote; doctor reuses that.
+        _remember_integrity_ok(snap, _utcnow(), before)
     try:
         nbytes = snap.stat().st_size
     except OSError as exc:

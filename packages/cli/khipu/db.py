@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import psycopg
@@ -25,6 +26,7 @@ def _env(*names: str) -> str:
 # spawns plus a legacy-directory walk before a single query ran, and doctor
 # opens a connection per check (audit 2026-08-17).
 _MIGRATION_DONE = False
+_MIGRATION_LOCK = threading.Lock()
 
 
 def resolve_dsn() -> str:
@@ -42,8 +44,11 @@ def resolve_dsn() -> str:
         # The migration copies legacy files into the live config dir; an
         # isolated run (the promotion gate) only reads.
         if not _MIGRATION_DONE and isolated_dir() is None:
-            migrate_legacy_secrets()
-            _MIGRATION_DONE = True
+            # doctor connects from several threads at once; one migrates.
+            with _MIGRATION_LOCK:
+                if not _MIGRATION_DONE:
+                    migrate_legacy_secrets()
+                    _MIGRATION_DONE = True
         kc = get_dsn()
         if kc:
             return kc
@@ -73,7 +78,7 @@ def conninfo_with_local_root_cert(dsn: str) -> str:
 
     Stored DSNs are ``postgres://`` URIs. Putting ``sslrootcert=/Users/…``
     in the query string has shown up at TLS time as
-    ``root certificate file "/Users/matthewsc" does not exist`` (the first
+    ``root certificate file "/Users/<16 chars>" does not exist`` (the first
     16 chars of the path) even when ``~/.config/khipu/root.crt`` was on
     disk. Percent-encoding slashes in the URI does not survive libpq's
     decode. Keyword/value conninfo plus an overwrite from the local cert
