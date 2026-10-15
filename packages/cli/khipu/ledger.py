@@ -743,6 +743,14 @@ def apply_op(conn, op: dict[str, Any], *, late: bool = False) -> dict[str, Any]:
                 conn.commit()
                 raise
             cur.execute("UPDATE ledger_ops SET result = %s WHERE op_id = %s", (Jsonb(result), op["op_id"]))
+            # Every row it changes, a cascade's children included, is written
+            # down as lagging in the offline copy before the commit: a
+            # write-through that fails after it still leaves them to the hub.
+            # Not written down, not committed.
+            try:
+                _mark_lag(op["project"], result.get("affected") or [])
+            except OSError as exc:
+                raise _unreadable_error(op["op_id"], "the rows the offline copy lags on") from exc
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -1428,6 +1436,8 @@ def _drain_jobs(conn, jobs: list[Path], out: dict[str, Any], waiting: frozenset[
         try:
             result = apply_op(conn, op, late=op_id not in waiting)
         except LedgerError as exc:
+            if exc.reason == "op_unreadable":
+                raise  # nothing was committed: the job keeps its place
             if op_id in waiting:
                 answers[op_id] = exc
             if exc.reason == "op_id_reused":

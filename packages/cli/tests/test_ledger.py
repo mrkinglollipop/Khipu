@@ -2040,3 +2040,23 @@ def test_the_nightly_reports_a_busy_ledger(monkeypatch, tmp_path):
     finally:
         os.close(fd)
     assert got["ok"] is False and got["busy"] is True and [q["op_id"] for q in ledger.queued_ops()] == ["waiting"]
+
+
+@pytest.mark.parametrize("choice", ["remove", "move-up"])
+def test_a_cascades_child_rows_get_their_lag_markers_before_the_commit(choice, hub, monkeypatch):
+    from khipu import ledger
+
+    ok("add", "p", "--title", "Parent", "--kind", "slice")
+    ok("add", "c1", "--title", "Child", "--kind", "slice", "--parent", "p")
+    ok("add", "g1", "--title", "Grandchild", "--kind", "slice", "--parent", "c1")
+    ledger._replica_pending_path().unlink(missing_ok=True)
+    monkeypatch.setattr(ledger, "_replica_sync", lambda *_a: None)  # the write-through after the commit fails
+    ok("remove", "p", "--children", choice)
+    marked = {k.partition("#")[2] for k in json.loads(ledger._replica_pending_path().read_text())}
+    assert {"p", "c1"} <= marked and (choice == "move-up" or "g1" in marked)
+    ok("add", "q", "--title", "Q", "--kind", "slice")
+    monkeypatch.setattr(ledger, "_mark_lag", lambda *_a: (_ for _ in ()).throw(OSError("synthetic: cannot write")))
+    got = ledger.write(ledger.new_op("set", P, "q", fields={"evidence": "e"}, op_id="unmarked"))
+    assert got["queued"] and [q["op_id"] for q in ledger.queued_ops()] == ["unmarked"]  # kept, not refused
+    assert _sql(hub, "SELECT evidence FROM ledger_rows WHERE row_id = 'q'") == [("",)]
+    assert _sql(hub, "SELECT count(*) FROM ledger_ops WHERE op_id = 'unmarked'") == [(0,)]  # nothing committed
