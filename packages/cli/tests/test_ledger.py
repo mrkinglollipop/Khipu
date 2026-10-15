@@ -1075,3 +1075,93 @@ def test_waiting_writes_keep_their_order_when_the_clock_steps_back(monkeypatch, 
     ids = [ledger.enqueue(ledger.new_op("set", P, "r1", fields={"evidence": str(i)}, op_id=f"op{i}")) and f"op{i}"
            for i in range(3)]
     assert [op["op_id"] for op in ledger.queued_ops()] == ids
+
+
+def test_an_op_id_holding_a_dash_never_hides_another_queued_write(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    assert ledger.write(ledger.new_op("set", P, "r1", fields={"evidence": "1"}, op_id="slice-done"))["queued"]
+    assert ledger.write(ledger.new_op("set", P, "r2", fields={"evidence": "2"}, op_id="done"))["queued"]
+    assert [op["op_id"] for op in ledger.queued_ops()] == ["slice-done", "done"]
+
+
+def test_an_op_id_reused_for_another_row_is_refused(hub):
+    ok("add", "a", "--title", "A", "--kind", "slice")
+    ok("add", "b", "--title", "B", "--kind", "slice")
+    ok("set", "a", "--state", "DONE", "--op-id", "step1")
+    assert ok("set", "a", "--state", "DONE", "--op-id", "step1").strip() == "set a: state"  # a true retry
+    rc, out, err = run("set", "b", "--state", "DONE", "--op-id", "step1", "--project", P)
+    assert rc == 1 and "already used for a different write" in out + err
+    assert _sql(hub, "SELECT state FROM ledger_rows WHERE row_id = 'b'") == [("NOT STARTED",)]
+
+
+@pytest.mark.parametrize("fault", ["tables_missing", "broken_job"])
+def test_a_write_in_line_is_told_what_became_of_it_when_an_older_job_fails(fault, monkeypatch, tmp_path):
+    import psycopg
+
+    ledger = _offline(monkeypatch, tmp_path)
+    ledger.enqueue(ledger.new_op("set", P, "r1", fields={"evidence": "0"}, op_id="older"))
+
+    def apply(_conn, op, **_kw):
+        if op["op_id"] == "older":
+            if fault == "tables_missing":
+                raise psycopg.errors.UndefinedTable('relation "ledger_rows" does not exist')
+            raise ValueError("a job that fails every time")
+        return {"ok": True, "line": "landed mine"}
+
+    monkeypatch.setattr(ledger, "apply_op", apply)
+    got = ledger.write(ledger.new_op("set", P, "r1", fields={"evidence": "1"}, op_id="mine"), conn=object())
+    queued = [op["op_id"] for op in ledger.queued_ops()]
+    if fault == "tables_missing":  # the line waits for khipu migrate, and says so
+        assert got["queued"] and queued == ["older", "mine"]
+    else:  # the broken job is set aside, kept, and the line moves on
+        assert got == {"ok": True, "line": "landed mine"} and queued == []
+        assert [p.name.split("-", 1)[1] for p in ledger._refused_dir().glob("*.json")] == ["older.json"]
+
+
+def _copy_row(row_id, parent=""):
+    return {**_replica_row(row_id, 1), "parent": parent, "created_at": None, "updated_at": None,
+            "removed_at": None, "removed_by": None, "removed_note": ""}
+
+
+def test_a_set_after_a_queued_restore_is_not_refused_offline(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    view = {"vocab": ledger.default_vocab(), "rows": [_copy_row("x"), _copy_row("y")], "history": [], "gone": {},
+            "as_of": None, "offline": True}
+    monkeypatch.setattr(ledger, "_offline_view", lambda _p: view)
+    ledger.enqueue(ledger.new_op("remove", P, "x", op_id="rm"))
+    ledger.enqueue(ledger.new_op("restore", P, "x", op_id="rs", from_app=True))
+    assert ledger.write(ledger.new_op("set", P, "x", fields={"evidence": "after restore"}))["queued"]
+    assert ledger.write(ledger.new_op("remove", P, "y"))["queued"]
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("set", P, "y", fields={"evidence": "after remove"}))
+    assert err.value.reason == "not_found"
+
+
+def test_a_pending_parent_still_sees_the_children_the_copy_knows(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    view = {"vocab": ledger.default_vocab(), "rows": [_copy_row("p"), _copy_row("c", parent="p")], "history": [],
+            "gone": {}, "as_of": None, "offline": True}
+    monkeypatch.setattr(ledger, "_offline_view", lambda _p: view)
+    with ledger._replica_pending() as pending:
+        pending[f"{P}#p"] = "a"
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("remove", P, "p"))
+    assert err.value.reason == "has_children"
+
+
+def test_a_change_during_the_first_refresh_is_retried_once_the_copy_exists(monkeypatch, tmp_path):
+    from khipu import hub_snapshot as hs
+    from khipu import ledger
+
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(ledger, "_vocab", lambda *_a: {"state": [], "kind": []})
+    lock = hs._acquire_refresh_lock()  # the first refresh is dumping; no copy on disk yet
+    assert lock is not None
+    try:
+        ledger._replica_sync(_ReplicaHub(2), "p", ["r"])
+        assert ledger.replica_pending() == 1
+    finally:
+        hs._release_refresh_lock(lock)
+    _snapshot(tmp_path)  # that refresh read the hub before the change
+    assert ledger.replica_catch_up(_ReplicaHub(2))["left"] == 0
+    assert _replica_titles() == {"r": "v2"}

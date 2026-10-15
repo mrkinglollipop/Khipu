@@ -679,8 +679,12 @@ def apply_op(conn, op: dict[str, Any], *, late: bool = False) -> dict[str, Any]:
                 marker = _marker(cur, op["project"], op["row_id"])
                 if marker:
                     raise _purged_error(op["row_id"], marker)
-                cur.execute("SELECT result FROM ledger_ops WHERE op_id = %s", (op["op_id"],))
-                result = dict(cur.fetchone()[0] or {})
+                cur.execute("SELECT project, row_id, verb, result FROM ledger_ops WHERE op_id = %s", (op["op_id"],))
+                *first, stored = cur.fetchone()
+                if tuple(first) != (op["project"], op["row_id"], op["verb"]):
+                    raise LedgerError(f"op id {op['op_id']} was already used for a different write; "
+                                      "nothing was changed", "op_id_reused")
+                result = dict(stored or {})
                 conn.rollback()
                 return {**result, "retried": True}
             verb = _VERBS[op["verb"]]
@@ -792,10 +796,6 @@ def _replica_sync(conn, project: str, row_ids: list[str]) -> None:
     if not row_ids:
         return
     try:
-        from khipu import hub_snapshot
-
-        if not hub_snapshot.snapshot_path().is_file():
-            return
         with _replica_pending() as pending:
             for row_id in row_ids:
                 key = f"{project}#{row_id}"
@@ -838,7 +838,8 @@ def replica_catch_up(conn) -> dict[str, Any]:
                 history = [dict(zip(_HIST_COLS, h, strict=True)) for h in cur.fetchall()]
             conn.rollback()
             got = hub_snapshot.ledger_write_snapshot(project, proj, vocab, rows, history, ids, gone=gone)
-            # No offline copy at all: the next refresh copies everything.
+            # No offline copy and no refresh dumping one: the next refresh
+            # starts after this change and copies everything.
             if got.get("ok") or got.get("missing"):
                 done += [f"{project}#{i}" for i in ids]
             else:
@@ -890,6 +891,15 @@ def _outbox_jobs() -> list[Path]:
         return []
 
 
+def _job_path(op_id: str) -> Path | None:
+    """The waiting job for exactly ``op_id``. An op id may hold "-", so a name
+    is split at its first "-" only, never matched by suffix."""
+    for path in _outbox_jobs():
+        if path.name.split("-", 1)[-1] == f"{op_id}.json":
+            return path
+    return None
+
+
 def queued_ops() -> list[dict[str, Any]]:
     out = []
     for path in _outbox_jobs():
@@ -913,9 +923,9 @@ def enqueue(op: dict[str, Any], reason: str = "") -> Path:
     fd = os.open(str(d / ".enqueue.lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        existing = list(d.glob(f"*-{op['op_id']}.json"))
-        if existing:
-            return existing[0]
+        existing = _job_path(op["op_id"])
+        if existing is not None:
+            return existing
         last = 0
         for path in _outbox_jobs():
             head = path.name.split("-", 1)[0]
@@ -1013,10 +1023,17 @@ def _drain_locked(conn, out: dict[str, Any], waiting: frozenset[str] = frozenset
                 out["refused"] += 1
                 continue
             except Exception as exc:  # noqa: BLE001
-                if _away(exc):
+                # The hub away, its tables not migrated yet, or a passing
+                # database fault: the job keeps its place and the line waits.
+                if _away(exc) or _tables_missing(exc) or _transient(exc):
                     out["stopped_early"] = True
                     break
-                raise
+                # Anything else would fail every time and hold the line for
+                # good: it is set aside as refused, kept, and doctor goes red.
+                _refuse_job(path, {**job, "refused": f"this write failed: {type(exc).__name__}"[:200],
+                                   "reason_word": "failed"})
+                out["refused"] += 1
+                continue
             path.unlink(missing_ok=True)
             out["landed"] += 1
             out.setdefault("results", {})[op.get("op_id")] = result
@@ -1024,6 +1041,15 @@ def _drain_locked(conn, out: dict[str, Any], waiting: frozenset[str] = frozenset
     finally:
         if owned and conn is not None:
             conn.close()
+
+
+def _transient(exc: BaseException) -> bool:
+    try:
+        import psycopg
+
+        return isinstance(exc, psycopg.OperationalError)
+    except ImportError:
+        return False
 
 
 def _refuse_job(path: Path, job: dict[str, Any]) -> None:
@@ -1088,9 +1114,8 @@ def _write_in_line(conn, op: dict[str, Any]) -> dict[str, Any]:
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
-    except Exception as exc:  # noqa: BLE001
-        if not _away(exc):
-            raise
+    except Exception as exc:  # noqa: BLE001  (the job is kept; it is still queued)
+        print(f"[khipu-ledger] a waiting write stays queued: {type(exc).__name__}", file=sys.stderr)
     if path.exists():
         return _queued_reply(op)
     refused = _refused_dir() / path.name
@@ -1105,12 +1130,12 @@ def _write_in_line(conn, op: dict[str, Any]) -> dict[str, Any]:
                           str(job.get("reason_word") or "refused"))
     if op["op_id"] in results:
         return results[op["op_id"]]
-    # Another process's drain landed it: a retried op id returns its first result.
+    # Another process's drain landed it (gone from the line, not refused): a
+    # retried op id returns its first result. If that cannot be read now (the
+    # hub dropped, or the row was purged since), it still landed.
     try:
         result = apply_op(conn, op)
-    except Exception as exc:  # noqa: BLE001
-        if not _away(exc):
-            raise
+    except Exception:  # noqa: BLE001
         return {**_queued_reply(op), "queued": False, "line": f"{op['verb']} {op['row_id']}: landed"}
     result.pop("retried", None)
     return result
@@ -1141,27 +1166,38 @@ def _check_offline(op: dict[str, Any]) -> None:
         if fields.get("kind"):
             fields["kind"] = _word(vocab, "kind", fields["kind"])
     row_id = op["row_id"]
-    removed_in_queue = any(q.get("verb") == "remove" and q.get("row_id") == row_id for q in queued)
-    # A change that landed while the copy was busy is not in it yet: for this
-    # row the copy says nothing, so only what the waiting writes establish is
-    # checked here, and the hub decides the rest when it answers.
-    if f"{project}#{row_id}" in _pending_keys():
-        view = None
+    last = [q.get("verb") for q in queued if q.get("row_id") == row_id and q.get("verb") in ("remove", "restore")]
+    removed_in_queue = bool(last) and last[-1] == "remove"
+    restored_in_queue = bool(last) and last[-1] == "restore"
+    # A change that landed while the copy was busy is not in it yet: the copy
+    # says nothing about such a row, so it is left out and only what the
+    # waiting writes establish is checked for it; the hub decides the rest.
+    unsure = {k.partition("#")[2] for k in _pending_keys() if k.partition("#")[0] == project}
+    if view and unsure:
+        view = {**view, "rows": [r for r in view["rows"] if r["row_id"] not in unsure],
+                "gone": {k: v for k, v in (view.get("gone") or {}).items() if k not in unsure}}
     merged = _overlay(view or {"vocab": vocab, "rows": [], "as_of": None, "offline": True}, project)
     rows = {r["row_id"]: r for r in merged["rows"]}
     gone = (view or {}).get("gone") or {}
+    # Such a row may exist on the hub though the copy lacks it: whether it
+    # exists is left to the hub, but the children the copy knows still count.
+    hub_decides = row_id not in rows and (restored_in_queue or row_id in unsure) and not removed_in_queue
+    if hub_decides and op["verb"] == "add" and restored_in_queue:
+        raise LedgerError(f"row {row_id} already exists; use set to update it", "exists")
+    if hub_decides and op["verb"] == "add":
+        return
     if op["verb"] == "add":
         if row_id in rows:
             raise LedgerError(f"row {row_id} already exists; use set to update it", "exists")
-        if row_id in gone or removed_in_queue:
+        if (row_id in gone and not restored_in_queue) or removed_in_queue:
             if gone.get(row_id, 0) >= _purged_version():
                 raise LedgerError(f"row {row_id} was removed for good", "purged")
             raise LedgerError(f"row {row_id} was removed; it can be restored in the app", "removed")
         return
     # Without the project in the offline copy, a row missing here may still be
     # on the hub; only a row removed by a waiting write is known to be gone.
-    known = bool(view and view["rows"]) or removed_in_queue or row_id in gone
-    if op["verb"] in ("set", "remove") and known and row_id not in rows:
+    known = bool(view and view["rows"]) or removed_in_queue or (row_id in gone and not restored_in_queue)
+    if op["verb"] in ("set", "remove") and known and row_id not in rows and not hub_decides:
         raise LedgerError(f"no such row: {row_id}", "not_found")
     if op["verb"] == "remove" and op.get("children") not in ("remove", "move-up"):
         children = [r for r in rows.values() if r["parent"] == row_id]
@@ -1213,6 +1249,7 @@ def _offline_view(project: str) -> dict[str, Any] | None:
 def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
     """Apply the waiting writes to an offline view, in the order they were made."""
     rows = {r["row_id"]: r for r in view["rows"]}
+    removed: dict[str, dict[str, Any]] = {}
     vocab = view["vocab"] if view["vocab"]["state"] else default_vocab()
     pending = 0
     for op in queued_ops():
@@ -1237,8 +1274,11 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
                     if key in fields:
                         row[key] = _word(vocab, "state", fields[key]) if key == "state" else fields[key]
                 row["updated_at"], row["queued"] = at, True
+            elif op["verb"] == "restore" and row_id in removed and row_id not in rows:
+                rows[row_id] = removed.pop(row_id)
             elif op["verb"] == "remove" and row_id in rows:
-                parent = rows.pop(row_id)["parent"]
+                removed[row_id] = rows.pop(row_id)
+                parent = removed[row_id]["parent"]
                 if op.get("children") == "move-up":
                     for row in rows.values():
                         if row["parent"] == row_id:
@@ -1251,7 +1291,7 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
                             break
                         gone |= more
                     for k in gone - {row_id}:
-                        rows.pop(k, None)
+                        removed[k] = rows.pop(k)
         except LedgerError:
             continue
     return {**view, "vocab": vocab, "rows": sorted(rows.values(), key=lambda r: r["seq"]), "pending": pending}

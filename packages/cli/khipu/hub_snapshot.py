@@ -935,11 +935,14 @@ def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mappi
     a newer change and lands after it changes nothing. Under the refresh lock,
     like every incremental write here. Fail-open."""
     path = snapshot_path()
-    if not path.is_file():
-        return {"ok": False, "error": "hub snapshot missing", "missing": True}
+    # Missing is judged under the lock: a first refresh still dumping has no
+    # file yet, but may have read the hub before this change.
     lock = _acquire_refresh_lock()
     if lock is None:
         return {"ok": False, "error": "hub snapshot refresh in progress"}
+    if not path.is_file():
+        _release_refresh_lock(lock)
+        return {"ok": False, "error": "hub snapshot missing", "missing": True}
     gone = dict(gone or {})
     live = {r["row_id"]: r for r in rows}
     for row_id in row_ids:
