@@ -1999,9 +1999,17 @@ def _lag_deliverables(cur, con, since, hub_now, limit) -> dict[str, Any]:
             "checked": len(rows), "truncated": len(rows) >= limit}
 
 
+def _chunk_signature(chunks: Sequence[tuple[Any, Any]]) -> str:
+    """``(chunk_idx, content_hash)`` pairs as one comparable string; the hub
+    builds the same string with ``string_agg`` in ``_lag_vectors``."""
+    return ",".join(f"{int(i)}:{h or ''}" for i, h in sorted(chunks, key=lambda c: int(c[0])))
+
+
 def _lag_vectors(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str, Any]:
-    """Vectors of the active profile, by presence of ``(kind, ref)``: a
-    re-embed of a ref the replica already holds is not seen here."""
+    """Vectors of the active profile built since the dump, per ``(kind,
+    ref)``: missing when the replica holds no chunk for the ref, a different
+    set of ``(chunk_idx, content_hash)`` (a re-embed of changed text, a
+    chunk added or dropped), or only chunks built before the hub's newest."""
     prof_cols = _pg_columns(cur, "embedding_profiles")
     if not {"id", "is_active"} <= prof_cols:
         return {"lag_seconds": None, "not_applicable": "hub has no embedding profiles"}
@@ -2014,24 +2022,41 @@ def _lag_vectors(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str
     if "deleted_at" in _pg_columns(cur, "episodes"):
         gone = (" AND NOT (kind = 'episode' AND EXISTS (SELECT 1 FROM episodes e "
                 "WHERE e.id::text = memory_embeddings.ref AND e.deleted_at IS NOT NULL))")
+    # Every chunk of a ref with any chunk built since the dump, so the
+    # signature compares whole refs.
     cur.execute(
-        "SELECT kind, ref, MAX(built_at) AS b FROM memory_embeddings "
-        f"WHERE profile = %s AND built_at > %s{gone} GROUP BY kind, ref ORDER BY b, kind, ref LIMIT %s",
-        (profile, since, limit),
+        "SELECT kind, ref, MAX(built_at) AS b, "
+        "string_agg(chunk_idx::text || ':' || COALESCE(content_hash, ''), ',' ORDER BY chunk_idx) "
+        "FROM memory_embeddings WHERE profile = %s AND (kind, ref) IN "
+        f"(SELECT kind, ref FROM memory_embeddings WHERE profile = %s AND built_at > %s){gone} "
+        "GROUP BY kind, ref ORDER BY b, kind, ref LIMIT %s",
+        (profile, profile, since, limit),
     )
-    rows = cur.fetchall()
+    fetched = cur.fetchall()
+    rows = [r for r in fetched
+            if not (r[0] == "episode" and str(r[1]).isdigit() and int(r[1]) in pending)]
+    held: dict[tuple[str, str], list[tuple[Any, Any, Any]]] = {}
+    for kind in {r[0] for r in rows}:
+        refs = [str(r[1]) for r in rows if r[0] == kind]
+        for part in _chunks(refs):
+            for ref, idx, chash, built in con.execute(
+                "SELECT ref, chunk_idx, content_hash, built_at FROM main.memory_embeddings "
+                f"WHERE profile = ? AND kind = ? AND ref IN ({', '.join('?' * len(part))})",
+                [profile, kind, *part],
+            ):
+                held.setdefault((kind, str(ref)), []).append((idx, chash, built))
     missing = []
-    for kind, ref, built in rows:
-        if kind == "episode" and str(ref).isdigit() and int(ref) in pending:
+    for kind, ref, built, signature in rows:
+        mine = held.get((kind, str(ref)))
+        if not mine or _chunk_signature([(i, h) for i, h, _ in mine]) != (signature or ""):
+            missing.append(built)
             continue
-        hit = con.execute(
-            "SELECT 1 FROM main.memory_embeddings WHERE profile = ? AND kind = ? AND ref = ? LIMIT 1",
-            (profile, kind, str(ref)),
-        ).fetchone()
-        if hit is None:
+        newest_held = max((d for d in (_utc(b) for _, _, b in mine) if d is not None), default=None)
+        hub_built = _utc(built)
+        if newest_held is not None and hub_built is not None and newest_held < hub_built:
             missing.append(built)
     return {"lag_seconds": _lag_from(hub_now, missing), "missing": len(missing), "profile": profile,
-            "checked": len(rows), "truncated": len(rows) >= limit}
+            "checked": len(fetched), "truncated": len(fetched) >= limit}
 
 
 def measure_lag(cur, *, limit: int = FRESHNESS_PROBE_LIMIT) -> dict[str, Any]:
@@ -3284,32 +3309,50 @@ def semantic_search_snapshot(
 SNAPSHOT_MAX_AGE_S = 24 * 60 * 60
 
 
+def _recent_measurement(health: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The last measurement against the hub when it was made of this same
+    dump within ``LAST_KNOWN_TRUST_S``; else None."""
+    last = _read_last_known()
+    if not last or last.get("refreshed_at") != health.get("refreshed_at"):
+        return None
+    measured = _utc(last.get("measured_at"))
+    # measured_at is the hub's clock: allow it a few minutes ahead of this Mac's.
+    if measured is None or not -300 <= (datetime.now(timezone.utc) - measured).total_seconds() <= LAST_KNOWN_TRUST_S:
+        return None
+    return last
+
+
 def snapshot_is_fresh(*, max_age_s: int = SNAPSHOT_MAX_AGE_S) -> tuple[bool, dict[str, Any]]:
     """(is_fresh, health) for the per-prompt recall lane, from this Mac's
     evidence only (it runs inside a hook and never reaches the hub).
 
-    The full dump's age is one input, not the gate: a dump younger than
-    ``max_age_s`` is trusted; an older one is still trusted while a
-    measurement against the hub, made after that same dump and within
-    ``LAST_KNOWN_TRUST_S``, found every table in step with nothing cut
-    short (``health["trusted_by"] == "measurement"``). A missing file, or a
-    dump with no time on record, is never trusted. ``health`` carries the
-    age and reason for logging either way.
+    A recent measurement of this same dump (``_recent_measurement``)
+    decides first: one that found a table behind is never trusted, whatever
+    the dump's age (``health["distrusted_by"] == "measurement"``), and one
+    that found every table in step with nothing cut short is trusted even
+    past ``max_age_s`` (``health["trusted_by"] == "measurement"``). With no
+    such verdict, a dump younger than ``max_age_s`` is trusted. A missing
+    file, or a dump with no time on record, is never trusted. ``health``
+    carries the age and reason for logging either way.
     """
     health = snapshot_health()
     if not health.get("exists"):
         return False, health
     age = health.get("age_seconds")
-    if age is not None and age <= max_age_s:
+    if age is None:
+        return False, health
+    last = _recent_measurement(health)
+    lag = (last or {}).get("lag_seconds")
+    if last is not None and isinstance(lag, (int, float)) and lag > SNAPSHOT_LAG_BEHIND_S:
+        health["distrusted_by"] = "measurement"
+        health["last_known"] = last
+        return False, health
+    if age <= max_age_s:
         return True, health
-    last = _read_last_known()
-    if age is not None and last and last.get("in_step") is True and last.get("refreshed_at") == health.get("refreshed_at"):
-        measured = _utc(last.get("measured_at"))
-        # measured_at is the hub's clock: allow it a few minutes ahead of this Mac's.
-        if measured is not None and -300 <= (datetime.now(timezone.utc) - measured).total_seconds() <= LAST_KNOWN_TRUST_S:
-            health["trusted_by"] = "measurement"
-            health["last_known"] = last
-            return True, health
+    if last is not None and last.get("in_step") is True:
+        health["trusted_by"] = "measurement"
+        health["last_known"] = last
+        return True, health
     return False, health
 
 

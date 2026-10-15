@@ -97,13 +97,25 @@ class FakeCursor:
             rows = [(d["id"], _ny(d["created_at"])) for d in h.deliverables if d["created_at"] > p[0]][: p[1]]
         elif "FROM embedding_profiles WHERE is_active" in sql:
             rows = [(PROFILE,)]
-        elif "FROM memory_embeddings" in sql:
-            by_ref: dict[tuple, datetime] = {}
+        elif "FROM memory_embeddings" in sql and "string_agg" not in sql:
+            # The presence-only probe this module had before chunk identity
+            # was compared, kept so the re-embed tests show what it missed.
+            latest: dict[tuple, datetime] = {}
             for v in h.vectors:
                 if v["built_at"] > p[1]:
                     key = (v["kind"], v["ref"])
-                    by_ref[key] = max(by_ref.get(key, v["built_at"]), v["built_at"])
-            rows = sorted(((k, r, _ny(b)) for (k, r), b in by_ref.items()), key=lambda r: r[2])[: p[2]]
+                    latest[key] = max(latest.get(key, v["built_at"]), v["built_at"])
+            rows = sorted(((k, r, _ny(b)) for (k, r), b in latest.items()), key=lambda r: r[2])[: p[2]]
+        elif "FROM memory_embeddings" in sql:
+            recent = {(v["kind"], v["ref"]) for v in h.vectors if v["built_at"] > p[2]}
+            by_ref: dict[tuple, list[dict]] = {}
+            for v in h.vectors:
+                if (v["kind"], v["ref"]) in recent:
+                    by_ref.setdefault((v["kind"], v["ref"]), []).append(v)
+            rows = sorted(((k, r, _ny(max(c["built_at"] for c in cs)),
+                            ",".join(f"{c.get('chunk_idx', 0)}:{c.get('content_hash') or ''}"
+                                     for c in sorted(cs, key=lambda c: c.get("chunk_idx", 0))))
+                           for (k, r), cs in by_ref.items()), key=lambda r: r[2])[: p[3]]
         else:
             raise AssertionError(f"unexpected hub query: {sql}")
         self._rows = rows
@@ -301,7 +313,7 @@ class CaptureWithoutEmbeddingsTest(ReplicaCase):
         self.hub.episodes.append({"id": 2, "ingested_at": NOW - timedelta(hours=3)})
         third = NOW - timedelta(minutes=1)
         self.hub.episodes.append({"id": 3, "ingested_at": third})
-        self.hub.vectors.append({"kind": "episode", "ref": "3", "built_at": third})
+        self.hub.vectors.append({"kind": "episode", "ref": "3", "built_at": third, "content_hash": "c"})
         res = hs.upsert_episode({"id": 3, "summary": "three", "ingested_at": _ts(third)},
                                 [{"profile": PROFILE, "kind": "episode", "ref": 3, "chunk_idx": 0,
                                   "chunk_text": "three", "content_hash": "c", "embedding": [0.1],
@@ -313,6 +325,49 @@ class CaptureWithoutEmbeddingsTest(ReplicaCase):
         self.assertEqual(episodes["missing"], 1)
         self.assertEqual(episodes["lag_seconds"], 3 * 3600.0)
         self.assertEqual(out["tables"]["vectors"]["missing"], 0)
+
+
+class ReembedTest(ReplicaCase):
+    """The hub holds newer vectors for a ref the replica already has: the
+    replica still answers recall with the old ones."""
+
+    def _hub_chunk(self, **kw) -> None:
+        self.hub.vectors.append({"kind": "episode", "ref": "1", "chunk_idx": 0,
+                                 "built_at": NOW - timedelta(hours=2), **kw})
+
+    def test_changed_text_is_behind(self) -> None:
+        self.hub.vectors.clear()
+        self._hub_chunk(content_hash="new")
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["missing"], 1)
+        self.assertEqual(out["tables"]["vectors"]["lag_seconds"], 7200.0)
+        self.assertEqual(out["state"], "behind")
+
+    def test_an_added_chunk_is_behind(self) -> None:
+        self.hub.vectors.append({"kind": "episode", "ref": "1", "chunk_idx": 1,
+                                 "built_at": NOW - timedelta(hours=2)})
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["missing"], 1)
+        self.assertEqual(out["state"], "behind")
+
+    def test_a_rebuild_of_the_same_text_is_behind(self) -> None:
+        self.hub.vectors.clear()
+        self._hub_chunk()
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["missing"], 1)
+
+    def test_writing_the_hub_rows_clears_it(self) -> None:
+        self.hub.vectors.clear()
+        built = NOW - timedelta(hours=2)
+        self._hub_chunk(content_hash="new")
+        res = hs.upsert_episode({"id": 1, "summary": "one", "ingested_at": _ts(DUMP - timedelta(hours=1))},
+                                [{"profile": PROFILE, "kind": "episode", "ref": 1, "chunk_idx": 0,
+                                  "chunk_text": "one", "content_hash": "new", "embedding": [0.1],
+                                  "built_at": _ts(built)}])
+        self.assertTrue(res["ok"], res)
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["missing"], 0)
+        self.assertEqual(out["state"], "fresh")
 
 
 class CursorAndErrorEvidenceTest(ReplicaCase):
@@ -438,6 +493,23 @@ class RecallTrustTest(ReplicaCase):
             self.assertFalse(hs.snapshot_is_fresh()[0], "a measurement that found a gap")
             self._write({**record, "measured_at": _ts(real_now), "refreshed_at": _ts(DUMP - timedelta(days=1))})
             self.assertFalse(hs.snapshot_is_fresh()[0], "a measurement of an earlier dump")
+
+    def test_a_young_dump_measured_behind_is_not_trusted(self) -> None:
+        self.hub.episodes.append({"id": 2, "ingested_at": NOW - timedelta(hours=2)})
+        young = self.health(age_s=60)
+        out = hs.snapshot_freshness(None, young, lag=hs.measure_lag(self.hub.cursor()))
+        self.assertEqual(out["state"], "behind")
+        record = json.loads((self.dir / "freshness.json").read_text())
+        real_now = datetime.now(timezone.utc)
+        with mock.patch.object(hs, "snapshot_health", side_effect=lambda: dict(young)):
+            self._write({**record, "measured_at": _ts(real_now - timedelta(minutes=5))})
+            fresh, health = hs.snapshot_is_fresh()
+            self.assertFalse(fresh, "recall must not trust a replica measured as behind")
+            self.assertEqual(health["distrusted_by"], "measurement")
+            self._write({**record, "measured_at": _ts(real_now - timedelta(seconds=hs.LAST_KNOWN_TRUST_S + 60))})
+            self.assertTrue(hs.snapshot_is_fresh()[0], "an old verdict gives way to the dump's age")
+            self._write({**record, "measured_at": _ts(real_now), "refreshed_at": _ts(DUMP - timedelta(days=1))})
+            self.assertTrue(hs.snapshot_is_fresh()[0], "a verdict on an earlier dump says nothing of this one")
 
     def test_a_young_dump_is_trusted_and_a_missing_one_never(self) -> None:
         with mock.patch.object(hs, "snapshot_health", return_value=self.health(age_s=60)):
