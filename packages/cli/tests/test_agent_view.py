@@ -25,7 +25,7 @@ from khipu import agent_view, cli, db, gateway, routing, usage
 from khipu import mcp_server as ms
 
 NAME = "probe-login"  # the login folder's name without its dot
-USER = "probeuser"
+USER = "ProbeUser"
 FIXED = "PermissionError: Khipu could not read or write one of its files"
 
 
@@ -166,7 +166,7 @@ def test_the_owners_note_reaches_agents_as_written(owner, capsys):
     text = f"Use login {owner['login']} or ~/.{NAME} for {USER}"
     routing.set_note(text, via="app")
     routing.conversation_write({"state": "limited", "account": "Work", "until": "1h",
-                                "evidence": f"Login failed at {owner['login']} for {USER}"},
+                                "evidence": f"Login failed at {owner['login']} for /{USER}"},
                                author={"harness": "claude-code"})
     err, out = call("khipu_route")
     assert not err and text in json.dumps(out)
@@ -194,15 +194,15 @@ def test_a_filesystem_error_in_a_tool_is_said_in_fixed_words(owner, monkeypatch)
     assert err and out["error"] == FIXED
 
 
-def test_a_value_error_naming_a_folder_is_scrubbed(owner, monkeypatch):
+def test_a_value_error_naming_a_folder_and_user_path_is_scrubbed(owner, monkeypatch):
     def fail(**kw):
-        raise ValueError(f"bad folder {owner['login']} for {USER}")
+        raise ValueError(f"bad folder {owner['login']} for /{USER}")
 
     monkeypatch.setattr(usage, "report", fail)
     err, out = call("khipu_usage")
-    # The bare user name remains outside a path, so the final containment
-    # check withholds the whole value, including the otherwise safe prefix.
-    assert err and out["error"] == agent_view.WITHHELD and _leaks(out, owner) == []
+    ident = routing.account_id(usage._key(owner["account"]))
+    assert err and out["error"] == f"bad folder {ident} for /the user"
+    assert _leaks(out, owner) == []
 
 
 def test_gateway_status_hub_error_is_said_in_fixed_words(owner, monkeypatch):
@@ -299,7 +299,7 @@ def test_every_agent_surface_is_clean(owner, monkeypatch, tmp_path, capsys):
     outputs: dict = {}
     outputs["khipu_usage"] = call("khipu_usage")
     outputs["khipu_route_report"] = call("khipu_route_report", state="limited", account="Work", until="1h",
-                                         evidence=f"Login failed at {owner['login']} (~/.{NAME}) for {USER}")
+                                         evidence=f"Login failed at {owner['login']} (~/.{NAME}) for /{USER}")
     outputs["khipu_route"] = call("khipu_route")
     outputs["khipu_route since"] = call("khipu_route", since="0")
     outputs["summary"] = routing.summary()
@@ -368,6 +368,123 @@ def test_the_table_is_built_once_per_record_version(owner, monkeypatch):
     assert builds == [1, 1], "another set of accounts is another table"
 
 
+@pytest.mark.parametrize("login,payload", [
+    ("/srv/FreshAccount/.qz-fresh-login", "/srv/FreshAccount/.qz-fresh-login"),
+    ("/srv/FreshAccount/.qz-fresh-login", ".qz-fresh-login"),
+    ("/home/freshperson/.qz-fresh-login", "freshperson"),
+])
+def test_t3_login_added_after_warming_table_never_reaches_usage(owner, monkeypatch, login, payload):
+    from khipu import t3
+
+    raw = {"accounts": [row(owner["account"], version=payload)]}
+    monkeypatch.setattr(usage, "report", lambda **kw: raw)
+    assert agent_view.scrub("safe") == "safe"
+    before = agent_view._TABLE["table"]
+    settings = t3.settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"providerInstances": {"fresh": {
+        "driver": "claudeAgent", "config": {
+            "homePath": login}}}}))
+    err, out = call("khipu_usage")
+    assert not err
+    assert payload.casefold() not in json.dumps(out).casefold()
+    assert agent_view._TABLE["table"] is not before
+
+
+@pytest.mark.parametrize("source", [
+    "config", "record", "record_version", "discovery", "environment", "configured_paths",
+    "memory_root", "volumes", "username", "resolved_path", "t3_stamp",
+])
+def test_each_table_source_invalidates_warm_cache(owner, monkeypatch, tmp_path, source):
+    from types import SimpleNamespace
+
+    from khipu import claude_homes, t3
+    from khipu.config import config_file
+
+    fresh = "/srv/FreshAccount/.qz-new-login"
+    view = {"version": 1, "accounts": []}
+    monkeypatch.setattr(agent_view, "_saved_view", lambda: view)
+    discovered = []
+    if source == "discovery":
+        monkeypatch.setattr(claude_homes, "discover", lambda: discovered)
+    if source == "resolved_path":
+        old = tmp_path / "old-target"
+        new = tmp_path / "new-target"
+        old.mkdir()
+        new.mkdir()
+        link = tmp_path / "login-link"
+        link.symlink_to(old, target_is_directory=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(link))
+        fresh = str(new)
+    agent_view.scrub("neutral")
+    before = agent_view._TABLE["table"]
+    if source == "config":
+        config_file().write_text(json.dumps({"usage_accounts": [{"harness": "claude", "home": fresh}]}))
+    elif source == "record":
+        view["accounts"].append({"key": f"claude|{fresh}"})
+    elif source == "record_version":
+        view["version"] += 1
+    elif source == "discovery":
+        discovered.append(SimpleNamespace(path=Path(fresh), is_default=False))
+    elif source == "environment":
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", fresh)
+    elif source == "configured_paths":
+        monkeypatch.setattr(routing, "_configured_paths", lambda: [fresh])
+    elif source == "memory_root":
+        monkeypatch.setenv("KHIPU_MEMORY_ROOT", fresh)
+    elif source == "volumes":
+        listdir = agent_view.os.listdir
+        monkeypatch.setattr(agent_view.os, "listdir",
+                            lambda path: ["FreshVolume"] if str(path) == "/Volumes" else listdir(path))
+        fresh = "/Volumes/FreshVolume"
+    elif source == "username":
+        monkeypatch.setattr(agent_view.getpass, "getuser", lambda: "freshperson")
+        fresh = "freshperson"
+    elif source == "resolved_path":
+        link.unlink()
+        link.symlink_to(new, target_is_directory=True)
+    elif source == "t3_stamp":
+        settings = t3.settings_path()
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text("{}")
+    agent_view.scrub("neutral")
+    assert agent_view._TABLE["table"] is not before, source
+    if source not in ("record_version", "t3_stamp"):
+        assert fresh not in agent_view.scrub(fresh), source
+
+
+@pytest.mark.parametrize("login,user,prose", [
+    (".home", "probeuser", "open a folder after login"),
+    (".folder", "probeuser", "go home after login"),
+    (".zq-private", "home", "go home after the login and open a folder"),
+])
+def test_plain_words_survive_but_private_path_components_do_not(tmp_path, monkeypatch, login, user, prose):
+    _, accounts = _setup(tmp_path, monkeypatch, user, [login])
+    monkeypatch.setattr(agent_view.getpass, "getuser", lambda: user)
+    monkeypatch.setattr(usage, "report", lambda **kw: {"accounts": [row(accounts[0], plan=prose)]})
+    err, out = call("khipu_usage")
+    assert not err and out["accounts"][0]["plan"] == prose
+    for path in ("/Users/home/x", "~/.home", login, f"/{user}/x", f"{user}/x"):
+        assert path.casefold() not in agent_view.scrub(path).casefold(), path
+
+
+@pytest.mark.parametrize("source", ["folder", "user"])
+@pytest.mark.parametrize("name", [
+    ".home", ".folder", ".jqx", ".z", "Work", "work9", "two words", "café", "Å", "q-z", "q_x", "123",
+])
+def test_distinctive_names_and_their_aliases_are_removed_in_prose(tmp_path, monkeypatch, source, name):
+    user = name if source == "user" else "probeuser"
+    _setup(tmp_path, monkeypatch, user, [name] if source == "folder" else [".qz-private"])
+    monkeypatch.setattr(agent_view.getpass, "getuser", lambda: user)
+    forms = _forms_of(name) if source == "folder" else [
+        name, name.upper(), name.swapcase(), unicodedata.normalize("NFD", name), f"weekly_{name}"]
+    for form in forms:
+        # An underscore is a token separator even without a path slash.
+        text = f"Provider reports {form.replace('weekly_/', 'weekly_')} today"
+        assert _survivors(agent_view.scrub(text), [name]) == [], text
+    assert agent_view.scrub("ordinary harmless prose") == "ordinary harmless prose"
+
+
 # ---- round 2: names matched exactly, invalid entries, owner words now -------------
 
 
@@ -394,7 +511,7 @@ def _setup(tmp_path, monkeypatch, user: str, names: list[str], home=None):
 
 def _forms_of(name: str) -> list[str]:
     bare = name.lstrip(".")
-    return [name, bare, bare.upper(), bare.swapcase(), unicodedata.normalize("NFD", name), f"weekly_{bare}"]
+    return [name, bare, bare.upper(), bare.swapcase(), unicodedata.normalize("NFD", name), f"weekly_/{bare}"]
 
 
 def _survivors(value, words: list[str]) -> list[tuple[str, str]]:
@@ -419,14 +536,14 @@ def _seed(home, accounts, user: str):
         forms = _forms_of(name)
         if i % 2:
             rows[usage._key(account)] = row(account, plan=forms[i % len(forms)], version=user.upper(),
-                                            windows=[{"name": f"weekly_{name.lstrip('.')}", "used_pct": 95,
+                                            windows=[{"name": f"weekly_/{name.lstrip('.')}", "used_pct": 95,
                                                       "model": forms[2], "window_mins": 10080,
                                                       "resets_at": usage._iso(time.time() + 86400)}])
         else:
             rows[usage._key(account)] = row(account, ok=False, error=forms[1], live_error=forms[3],
-                                            note=f"{user} could not read {forms[4]}", windows=[])
+                                            note=f"/{user} could not read {forms[4]}", windows=[])
         routing.conversation_write({"action": "report", "state": "limited", "account": account["label"],
-                                    "until": "1h", "evidence": " and ".join(forms) + f" for {user}"},
+                                    "until": "1h", "evidence": " and ".join(f"/{f}" for f in forms) + f" for /{user}"},
                                    author={"harness": "claude-code"})
     usage._save_cache(rows)
 
@@ -503,9 +620,9 @@ def _random_name(rng: random.Random) -> str:
     (".login", "probeuser", ".login"),
     (".home", "probeuser", ".home"),
     (".folder", "probeuser", ".folder"),
-    (".zq-private", "home", "home"),
-    (".zq-private", "login", "login"),
-    (".zq-private", "user", "user"),
+    (".zq-private", "Home", "home"),
+    (".zq-private", "Login", "login"),
+    (".zq-private", "User", "user"),
 ])
 def test_casefold_and_reserved_secrets_never_reach_agents(
         tmp_path, monkeypatch, capsys, login, user, payload):
@@ -536,10 +653,10 @@ def test_name_matching_uses_dot_tokens_and_plain_path_components(tmp_path, monke
     _setup(tmp_path, monkeypatch, "login", [".home", ".folder", "plainroot"])
     monkeypatch.setattr(agent_view.getpass, "getuser", lambda: "login")
     table = agent_view._rules()
-    for text in ("read .home now", "read .folder now", "read /login/file",
+    for text in ("read .home now", "read .folder now", "read home now", "read folder now", "read /login/file",
                  "read ~/plainroot/file", "plainroot/file", "login/file"):
         assert table.names.search(text), text
-    for text in ("go home to login", "a plainroot in prose", ".homework", "plainrooted/file"):
+    for text in ("go to login", "a plainroot in prose", ".homework", "plainrooted/file"):
         assert not table.names.search(text), text
 
 

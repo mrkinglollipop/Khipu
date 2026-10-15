@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import getpass
+import hashlib
 import os
 import re
 import threading
@@ -165,48 +166,40 @@ def _user_names(paths: Iterable[str]) -> set[str]:
     return {n for n in names if n.strip()}
 
 
+def _name_regex(variants, token_names, *, whole_value=False):
+    variants = sorted(set(variants), key=len, reverse=True)
+    tokens = "|".join(re.escape(n) for n in variants if _fold(n) in token_names)
+    plain = "|".join(re.escape(n) for n in variants if _fold(n) not in token_names)
+    patterns = []
+    if tokens:
+        patterns.append(rf"(?<![^\W_])(?:{tokens})(?![^\W_])")
+    if plain:
+        # Lowercase ASCII words need path context so ordinary prose survives.
+        patterns.append(rf"(?:(?<=/)(?:{plain})(?![^\W_])|(?<![\w./~])(?:{plain})(?=/))")
+        if whole_value:
+            patterns.append(rf"^(?:{plain})$")
+    return re.compile("|".join(patterns), re.I) if patterns else None
+
+
 class _Table:
-    """One scrub's replacements, built once per config and record version:
+    """One scrub's replacements, rebuilt whenever a source changes:
     ``roots`` every known path (login folders, the home folder, volumes, the
     memory root, configured folders) taken whole with the path after it;
-    ``names`` dotted folder tokens and plain names in path components; and the
+    ``names`` distinctive tokens and lowercase words in path components; and the
     owner's words as the saved record holds them now."""
 
-    __slots__ = ("roots", "root_to", "names", "name_to", "owner", "secrets")
+    __slots__ = ("roots", "root_to", "names", "name_to", "owner", "secrets", "name_secrets")
 
-    def __init__(self, roots, root_to, names, name_to, owner):
+    def __init__(self, roots, root_to, names, name_to, owner, token_names):
         self.roots, self.root_to, self.names, self.name_to, self.owner = roots, root_to, names, name_to, owner
-        self.secrets = tuple({r for r, _ in root_to if r != "~"} | set(name_to))
+        self.secrets = tuple({r for r, _ in root_to if r != "~"}
+                             | {n for n in name_to if not n.isalnum()})
+        # A single-name value can itself be a relative path. In prose a
+        # plain name is private only as a whole path component.
+        self.name_secrets = _name_regex(name_to, token_names, whole_value=True)
 
 
-def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
-    view = _saved_view()
-    home = _home_dir()
-    root_to: dict[str, object] = {}  # folded path -> an _Id or a word
-    name_to: dict[str, object] = {}  # folded name -> an _Id or USER_WORD
-    paths: list[str] = []
-    spelled: set[str] = set()  # names as written, beside their folded keys
-    for harness, raw in _homes(extra_keys, view):
-        ident = _Id(harness, raw)
-        if raw is None:
-            folder = _DEFAULT_FOLDERS.get(harness)
-            if not folder or not home:
-                continue
-            raw = os.path.join(home, folder)
-            name_to.setdefault(_fold(folder), ident)
-            spelled.add(folder)
-        else:
-            folder = unicodedata.normalize("NFC", Path(raw.rstrip("/")).name).strip()
-            name = folder.lstrip(".")
-            # The name as written, and as Khipu itself writes it into a
-            # window's name ("weekly_<slug>", usage.parse_claude).
-            for form in (folder, name, re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")):
-                if form:
-                    name_to.setdefault(_fold(form), ident)
-                    spelled.add(form)
-        for form in _forms(raw, home):
-            root_to.setdefault(_fold(form), ident)
-            paths.append(form)
+def _other_paths() -> list[str]:
     others: list[str] = []
     with contextlib.suppress(Exception):
         from khipu import routing
@@ -220,7 +213,46 @@ def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
         memory = path_setting("memory_root")
         if memory:
             others.append(str(memory).rstrip("/"))
-    for path in others:
+    return others
+
+
+def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
+    view = _saved_view()
+    home = _home_dir()
+    root_to: dict[str, object] = {}  # folded path -> an _Id or a word
+    name_to: dict[str, object] = {}  # folded name -> an _Id or USER_WORD
+    paths: list[str] = []
+    spelled: set[str] = set()  # names as written, beside their folded keys
+    token_names: set[str] = set()
+
+    def add_name(form, to, plain):
+        name_to.setdefault(_fold(form), to)
+        spelled.add(form)
+        if not plain:
+            token_names.add(_fold(form))
+
+    for harness, raw in _homes(extra_keys, view):
+        ident = _Id(harness, raw)
+        if raw is None:
+            folder = _DEFAULT_FOLDERS.get(harness)
+            if not folder or not home:
+                continue
+            raw = os.path.join(home, folder)
+            add_name(folder, ident, plain=False)
+        else:
+            folder = unicodedata.normalize("NFC", Path(raw.rstrip("/")).name).strip()
+            name = folder.lstrip(".")
+            # The name as written, and as Khipu itself writes it into a
+            # window's name ("weekly_<slug>", usage.parse_claude).
+            for form in (folder, name, re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")):
+                if form:
+                    # Aliases retain the original name's classification:
+                    # stripping a dot or casefolding must not make it prose.
+                    add_name(form, ident, plain=re.fullmatch(r"[a-z]+", folder) is not None)
+        for form in _forms(raw, home):
+            root_to.setdefault(_fold(form), ident)
+            paths.append(form)
+    for path in _other_paths():
         if len(path.rstrip("/")) > 1:
             root_to.setdefault(_fold(path.rstrip("/")), FOLDER_WORD)
             paths.append(path)
@@ -230,23 +262,14 @@ def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
         root_to.setdefault("~", HOME_WORD)
         paths.append(home)
     for user in _user_names(paths):
-        name_to.setdefault(_fold(user), USER_WORD)
-        spelled.add(unicodedata.normalize("NFC", user))
+        add_name(unicodedata.normalize("NFC", user), USER_WORD,
+                 plain=re.fullmatch(r"[a-z]+", user) is not None)
     order = sorted(root_to, key=len, reverse=True)
     alts = "|".join(re.escape(r) for r in order)
     roots = re.compile(rf"(?:{alts})(?![^\s/\"'`,;)\]}}]){_TAIL}", re.I) if alts else None
-    variants = sorted(set(name_to) | spelled, key=len, reverse=True)
-    tokens = "|".join(re.escape(n) for n in variants if not n.isalnum())
-    plain = "|".join(re.escape(n) for n in variants if n.isalnum())
-    patterns = []
-    if tokens:
-        patterns.append(rf"(?<![^\W_])(?:{tokens})(?![^\W_])")
-    if plain:
-        # A bare name needs a slash before it or a following slash at the
-        # start of a relative path; ordinary prose is not a path component.
-        patterns.append(rf"(?:(?<=/)(?:{plain})(?![^\W_])|(?<![\w./~])(?:{plain})(?=/))")
-    names = re.compile("|".join(patterns), re.I) if patterns else None
-    return _Table(roots, [(r, root_to[r]) for r in order], names, name_to, keep_owner_words(view))
+    names = _name_regex(set(name_to) | spelled, token_names)
+    return _Table(roots, [(r, root_to[r]) for r in order], names, name_to,
+                  keep_owner_words(view), token_names)
 
 
 _TABLE_TTL_S = 60.0
@@ -254,27 +277,46 @@ _TABLE: dict = {"sig": None, "at": 0.0, "table": None}
 
 
 def _signature(extra_keys) -> tuple:
-    """What the table depends on: the config, the saved routing record, the
-    caller's accounts and the home folder."""
-    def stat(path_fn):
-        try:
-            st = path_fn().stat()
-            return (st.st_mtime_ns, st.st_size, st.st_ino)
-        except Exception:  # noqa: BLE001
-            return None
+    """File stamps and effective values of every replacement-table source.
 
-    from khipu import routing
+    Discovery and path expansion must run even on cache hits: environment
+    overrides, symlink targets and newly discovered logins need not change
+    the config or routing record.
+    """
+    def stat(path):
+        try:
+            st = path.stat()
+            return (str(path), st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            return (str(path), None)
+
+    from khipu import routing, t3
     from khipu.config import config_file
 
+    view = _saved_view()
+    home = _home_dir()
+    homes = _homes(extra_keys, view)
+    paths = _other_paths()
+    for harness, raw in homes:
+        if raw is None:
+            folder = _DEFAULT_FOLDERS.get(harness)
+            if not folder or not home:
+                continue
+            raw = os.path.join(home, folder)
+        paths.extend(_forms(raw, home))
+    if home:
+        paths.append(home)
+    forms = tuple(sorted((path, tuple(sorted(_forms(path, home)))) for path in paths))
     keys = tuple(sorted(str(k) for k in extra_keys)) if extra_keys is not None else None
-    return (stat(config_file), stat(routing.view_file), keys, os.environ.get("HOME"),
-            os.environ.get("KHIPU_DATA_DIR"))
+    discovered = hashlib.sha256(repr((homes, forms, sorted(_user_names(paths)))).encode("utf-8")).digest()
+    return (stat(config_file()), stat(routing.view_file()), stat(t3.settings_path()),
+            view.get("epoch"), view.get("version"), tuple(keep_owner_words(view)),
+            discovered, keys, home)
 
 
 def _table(extra_keys) -> _Table:
-    """The cached table, rebuilt when what it depends on changed (the owner's
-    words with it) or after ``_TABLE_TTL_S`` (discovered logins can appear
-    between record versions)."""
+    """The cached table, rebuilt on any source change or TTL expiry."""
+    extra_keys = tuple(extra_keys) if extra_keys is not None else None
     try:
         sig = _signature(extra_keys)
     except Exception:  # noqa: BLE001
@@ -316,7 +358,8 @@ def _scrub_text(text: str, table: _Table, keep: list[str]) -> str:
     # Check the finished value even when it contained no apparent path or
     # token. Owner words remain masked until this fail-closed check is done.
     folded = _fold(text)
-    if unmatched_root or any(secret in folded for secret in table.secrets):
+    if unmatched_root or any(secret in folded for secret in table.secrets) \
+            or (table.name_secrets is not None and table.name_secrets.search(folded)):
         text = WITHHELD + "".join(f" \x00{i}\x00" for i in range(len(held)))
     for i, word in enumerate(held):
         text = text.replace(f"\x00{i}\x00", word)
