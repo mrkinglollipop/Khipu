@@ -87,7 +87,7 @@ function AccountRow({
           <span>{dis}</span>
         </div>
       ))}
-      {a.checkable !== false && ["limited", "probably_open", "unknown"].includes(a.state) ? (
+      {a.checkable !== false && a.configured !== false && ["limited", "probably_open", "unknown"].includes(a.state) ? (
         <span className="route-acts">
           <button type="button" className="sm" disabled={checking !== null} onClick={() => onCheck(a.key)}>
             {checking === a.key ? "Checking…" : "Check now"}

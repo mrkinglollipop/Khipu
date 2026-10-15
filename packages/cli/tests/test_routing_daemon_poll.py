@@ -608,6 +608,50 @@ def test_sleep_wake_checks_each_overdue_account_once_with_source_poll_off(home, 
     assert second["due"] > home["clocks"].wall()
 
 
+def test_with_the_push_off_reset_checks_never_poll_and_wake_only_at_the_next_check(home, monkeypatch):
+    # Fix round 1, F1: reset checks (on by default) kept the helper's poll
+    # interval with the push off, so every interval a child ran poll_refold.
+    clocks = home["clocks"]
+    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "0")
+    monkeypatch.setenv("ROUTING_NOW_OFF", "1")
+    _set(home, routing_push_prompt=False, routing_reset_check=True, routing_busy_load=0)
+    assert routing.push_off("prompt") and routing.poll_interval() == 10.0
+    until = T0 + timedelta(minutes=20)
+    routing.report(account="Claude", state="limited", until=routing._iso(until), author=ME)
+    monkeypatch.setattr(routing, "poll_refold", lambda **_k: pytest.fail("the poll child refolded with the push off"))
+    probed: list[str] = []
+
+    def same_limit(account):
+        probed.append(account["label"])
+        return {"ok": True, "windows": [{"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]}
+
+    monkeypatch.setattr("khipu.usage.probe_account", same_limit)
+    schedule = _schedule(home, interval=10.0)
+    recall_prompt._look_at_settings(schedule, routing)
+    assert not schedule.off and schedule.checks_only and schedule.interval is None
+    assert schedule.due() == ["look"]  # the start reads the saved view once, without a refold
+    _helper_poll(schedule)
+    first = until + timedelta(minutes=2)
+    assert probed == [] and schedule.valid_until == first.timestamp() and schedule.next_poll is None
+    while clocks.now + timedelta(seconds=5) < first:  # no poll interval, no view.json change: nothing due
+        clocks.run(5)
+        recall_prompt._look_at_settings(schedule, routing)
+        assert schedule.due() == []
+    clocks.run((first - clocks.now).total_seconds())
+    assert schedule.due() == ["clock"]
+    out = _helper_poll(schedule)
+    assert probed == ["Claude"] and [c["outcome"] for c in out["reset_checks"]] == ["same_limit"]
+    assert schedule.valid_until == (until + timedelta(minutes=10)).timestamp()
+    recall_prompt._look_at_settings(schedule, routing)  # the check's own save makes nothing due
+    assert schedule.due() == []
+    # A limit written later is a changed view.json: a look, still no refold.
+    routing.report(account="Codex", state="limited", until=routing._iso(until + timedelta(hours=1)), author=ME)
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due() == ["look"]
+    _helper_poll(schedule)
+    assert schedule.valid_until == (until + timedelta(minutes=10)).timestamp() and probed == ["Claude"]
+
+
 def test_stopping_a_poll_child_unwinds_and_kills_its_vendor_process(home, monkeypatch, tmp_path):
     from khipu import usage
 

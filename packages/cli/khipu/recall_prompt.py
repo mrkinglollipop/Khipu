@@ -789,6 +789,14 @@ def daemon_routing_on(environ=None) -> bool:
 # fold, unsaved, and a write folds under the routing lock (its new line makes
 # any fold beside it unsavable). With the per-prompt push off the helper forks
 # no poll child, and the daemon stops the helper.
+#
+# Reset checks (phase 5) are the helper's second job, and they keep it
+# running with the push off. Then nothing polls (fix round 1, F1): the
+# schedule has no poll interval and never wakes at the view's
+# ``valid_until``; it wakes only at the accounts' next reset checks, after a
+# wake from sleep, and when view.json changed (a write may have added a
+# limit to check). That child (``_check_resets_only``) reads the saved view,
+# never the sources, and never refolds unless a check is due.
 
 # A wall-clock jump past the monotonic clock longer than this is a wake from
 # sleep (or the clock being set); everything due then runs once.
@@ -824,7 +832,10 @@ class RefoldSchedule:
     whatever is due runs once, and ``ran`` starts the next wait. Due at once
     when it is made: a daemon that starts reads the view's ``valid_until``
     before it waits for it. ``configure`` gives it the settings as the
-    helper reads them: with the push off nothing is due at all."""
+    helper reads them: with the push off nothing is due at all, and with
+    only reset checks on (``checks_only``) there is no poll interval and
+    ``valid_until`` holds the next reset check instead (``look``: the start
+    or a changed view.json, read without a refold)."""
 
     def __init__(self, interval: float | None, *, wall: Callable[[], float] = time.time,
                  mono: Callable[[], float] = time.monotonic, jump: float = _WAKE_JUMP_S) -> None:
@@ -836,9 +847,10 @@ class RefoldSchedule:
         self.woke = False
         self.runs = 0
         self.off = False
+        self.checks_only = False
         self.view_seen: Any = None
 
-    def configure(self, interval: Any, *, off: bool) -> None:
+    def configure(self, interval: Any, *, off: bool, checks_only: bool = False) -> None:
         """The switches and the poll interval as the helper last read them
         (``_look_at_settings``). With the push off nothing is due, neither
         the poll nor the clock; switched on again, a poll is due at once. A
@@ -850,9 +862,18 @@ class RefoldSchedule:
         if off:
             self.off = True
             return
-        if self.off:
-            self.off, self.interval, self.next_poll = False, interval, mono
+        if checks_only != self.checks_only:
+            # Between the two jobs: no deadline of the other job's carries
+            # over, and a look is due at once for this one's.
+            self.off, self.checks_only = False, checks_only
+            self.interval = None if checks_only else interval
+            self.valid_until, self.next_poll = None, mono
             return
+        if self.off:
+            self.off, self.interval, self.next_poll = False, None if checks_only else interval, mono
+            return
+        if checks_only:
+            return  # the poll interval is the push's; reset checks wake only at their times
         if interval == self.interval:
             return
         self.interval = interval
@@ -894,7 +915,7 @@ class RefoldSchedule:
         if self.valid_until is not None and wall >= self.valid_until:
             why.append("clock")
         if self.next_poll is not None and mono >= self.next_poll:
-            why.append("poll")
+            why.append("look" if self.checks_only else "poll")
         return why
 
     def ran(self, valid_until: float | None = None, *, ok: bool = True, interval: Any = _KEEP) -> None:
@@ -905,7 +926,7 @@ class RefoldSchedule:
         wall, mono = self._look()
         self.runs += 1
         self.woke = False
-        if interval is not _KEEP:
+        if interval is not _KEEP and not self.checks_only:
             self.interval = interval if isinstance(interval, (int, float)) and interval > 0 else None
         if valid_until is not None and valid_until <= wall:
             ok, valid_until = False, None
@@ -935,11 +956,13 @@ def _look_at_settings(schedule: RefoldSchedule, routing) -> None:
     ``routing_poll_interval`` as they are now. Settings it cannot read leave
     the schedule as it was."""
     try:
-        off = bool(routing.push_off("prompt")) and not bool(routing.settings().get("routing_reset_check"))
+        push_off = bool(routing.push_off("prompt"))
+        checks = bool(routing.settings().get("routing_reset_check"))
         interval = routing.poll_interval()
     except Exception:  # noqa: BLE001 - unreadable settings: as they were
         return
-    schedule.configure(interval, off=off)
+    # The push off leaves only the reset checks, which never poll (F1).
+    schedule.configure(interval, off=push_off and not checks, checks_only=push_off and checks)
     _look_at_view(schedule, routing)
 
 
@@ -1015,8 +1038,16 @@ def _poll_once(routing, on_fold=None, on_probe=None) -> dict:
     the same read of view.json (``_view_snapshot``): a save by a prompt
     between the poll's own save and its stat is acknowledged only with that
     save's own deadline, and one that changed under the read is left unseen
-    (the helper's next look polls again)."""
+    (the helper's next look polls again).
+
+    With the per-prompt push off it never polls or refolds: only the reset
+    checks run (``_check_resets_only``, fix round 1, F1)."""
     reset_on = bool(routing.settings().get("routing_reset_check"))
+    if routing.push_off("prompt"):
+        if not reset_on:
+            return {"folded": False, "saved": True, "busy": False, "version": None, "valid_until": None,
+                    "interval": None, "reset_checks": [], "view_stat": None, "due": None}
+        return _check_resets_only(routing, on_fold=on_fold, on_probe=on_probe)
     out = routing.poll_refold(on_fold=on_fold)
     # Poll first so its ``folded`` answer stays truthful. When reset checks are
     # off, do not read the view through the scheduler at all. With checks on,
@@ -1047,6 +1078,41 @@ def _poll_once(routing, on_fold=None, on_probe=None) -> dict:
                 (next_at := routing.reset_check_due(entry, now, cfg)) is not None and next_at <= now
                 for entry in view.get("accounts", [])):
             due = now
+    out["due"] = due.timestamp() if due is not None else None
+    return out
+
+
+def _next_reset_check(routing, view: dict | None, now) -> Any:
+    """The soonest reset check the saved view holds (overdue ones included),
+    or None."""
+    if not isinstance(view, dict):
+        return None
+    cfg = routing.settings()
+    times = [t for e in view.get("accounts") or [] if isinstance(e, dict)
+             and (t := routing.reset_check_due(e, now, cfg)) is not None]
+    return min(times, default=None)
+
+
+def _check_resets_only(routing, on_fold=None, on_probe=None) -> dict:
+    """The helper's child with the per-prompt push off and reset checks on:
+    no ``poll_refold``, no read of the sources. It reads the saved view, runs
+    one due reset check if there is one (that check's read refolds as any
+    reader's does), and answers ``due``: the next reset check, so the helper
+    sleeps until then (fix round 1, F1)."""
+    out = {"folded": False, "saved": True, "busy": False, "version": None, "valid_until": None,
+           "interval": None, "reset_checks": [], "view_stat": None}
+    now = routing._now()
+    due = _next_reset_check(routing, routing._load_view(), now)
+    if due is not None and due <= now:
+        if on_probe is not None:
+            on_probe()
+        out["reset_checks"] = routing.run_due_reset_checks(max_checks=1, in_child=True, on_write=on_fold)
+    seen, view = _view_snapshot(routing)
+    out["view_stat"] = seen
+    now = routing._now()
+    due = _next_reset_check(routing, view if seen is not None else routing._load_view(), now)
+    if due is not None and due < now:
+        due = now  # another account is overdue (a wake's burst): one more child, one account each
     out["due"] = due.timestamp() if due is not None else None
     return out
 

@@ -873,11 +873,14 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     }
     if key == ROUTING_RETRIES_KEY {
         if has_control(v) { return Err("retry times must be one line".to_string()); }
-        let parsed: Vec<u64> = serde_json::from_str(v).map_err(|_| "retry times must be two whole seconds in a JSON list".to_string())?;
-        if parsed.len() != 2 || parsed.iter().any(|n| *n == 0 || *n > 10 * 366 * 86_400) || parsed[0] >= parsed[1] {
-            return Err("retry times must be two increasing positive whole seconds".to_string());
+        let parsed: Vec<u64> = serde_json::from_str(v).map_err(|_| "retry times must be whole seconds in a JSON list".to_string())?;
+        // None, one or two retries (an empty list: no retries, fix round 1, F7).
+        if parsed.len() > 2 || parsed.iter().any(|n| *n == 0 || *n > 10 * 366 * 86_400)
+            || parsed.windows(2).any(|w| w[0] >= w[1]) {
+            return Err("retry times must be at most two increasing positive whole seconds".to_string());
         }
-        return Ok(format!("[{},{}]", parsed[0], parsed[1]));
+        let items: Vec<String> = parsed.iter().map(|n| n.to_string()).collect();
+        return Ok(format!("[{}]", items.join(",")));
     }
     if ROUTING_NUMBER_KEYS.contains(&key) {
         // Digits with at most one decimal point: never a sign, an exponent,
@@ -3552,11 +3555,16 @@ mod settings_command_tests {
         assert_eq!(config_set_argv("routing_reset_check", "on").unwrap(), v(&["config", "--set", "routing_reset_check", "on"]));
         assert_eq!(config_set_argv("routing_reset_check_wait", "120").unwrap(), v(&["config", "--set", "routing_reset_check_wait", "120"]));
         assert_eq!(config_set_argv("routing_reset_check_retries", "[600,1800]").unwrap(), v(&["config", "--set", "routing_reset_check_retries", "[600,1800]"]));
+        // The retries can be removed, or kept to one (fix round 1, F7).
+        assert_eq!(config_set_argv("routing_reset_check_retries", "[]").unwrap(), v(&["config", "--set", "routing_reset_check_retries", "[]"]));
+        assert_eq!(config_set_argv("routing_reset_check_retries", "[600]").unwrap(), v(&["config", "--set", "routing_reset_check_retries", "[600]"]));
+        assert_eq!(config_set_argv("routing_busy_load", "0").unwrap(), v(&["config", "--set", "routing_busy_load", "0"]));
         assert_eq!(config_set_argv("routing_busy_load", "75").unwrap(), v(&["config", "--set", "routing_busy_load", "75"]));
         assert_eq!(config_set_argv("routing_busy_wait", "300").unwrap(), v(&["config", "--set", "routing_busy_wait", "300"]));
         assert_eq!(config_set_argv("routing_busy_tries", "3").unwrap(), v(&["config", "--set", "routing_busy_tries", "3"]));
         for (k, bad) in [("routing_reset_check", "yes"), ("routing_reset_check_wait", "-1"),
                          ("routing_reset_check_retries", "[600,600]"), ("routing_reset_check_retries", "[600,\n1800]"),
+                         ("routing_reset_check_retries", "[0]"), ("routing_reset_check_retries", "[1,2,3]"),
                          ("routing_busy_load", "-1"), ("routing_busy_wait", "one"), ("routing_busy_tries", "-3")] {
             assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }

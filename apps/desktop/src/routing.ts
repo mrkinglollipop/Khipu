@@ -52,6 +52,9 @@ export type RouteAccount = {
   basis?: string | null;
   reason?: string | null;
   checkable?: boolean;
+  /** False when plan usage no longer reads the account (removed in
+   *  Settings -> Models while limited): no reset check and no Check now. */
+  configured?: boolean;
   witness?: RouteWitness | null;
   disagreement?: RouteReport | null;
   last_seen?: RouteReport | null;
@@ -295,9 +298,11 @@ export function accountState(a: RouteAccount, now: Date): { text: string; tone: 
       return { text: "Open", tone: "ok" };
     case "probably_open":
       text =
-        a.checkable === false
-          ? `Its reset time passed ${pastWords(a.until, now)}; this account can't be checked without using a turn`
-          : `Probably open: its limit was due to end ${pastWords(a.until, now)}, not checked yet`;
+        a.configured === false
+          ? `Probably open: its limit was due to end ${pastWords(a.until, now)}; Khipu can't check this account: it isn't in Settings \u2192 Models`
+          : a.checkable === false
+            ? `Its reset time passed ${pastWords(a.until, now)}; this account can't be checked without using a turn`
+            : `Probably open: its limit was due to end ${pastWords(a.until, now)}, not checked yet`;
       break;
     default:
       if (a.silent) text = "Unknown: its only reporter stopped";

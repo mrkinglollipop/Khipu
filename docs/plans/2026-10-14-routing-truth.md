@@ -426,6 +426,7 @@ three times, and then records "not checked: the Mac was busy". Every outcome is 
 "Khipu reset check". A daemon restart recomputes the schedule from the view, and after the Mac sleeps every
 check that fell due runs once when it wakes. At most one probe process runs at a time, and an account gets
 at most three checks per reset: the first and two retries.
+Only a check at or after the reset time plus the wait counts toward those three; a Check now before then (or on an account with no reset time) records its outcome and leaves the reset's checks, waits and next check as they were. Each check gets its own busy-Mac waits. An account the record holds but plan usage no longer reads (removed in Settings → Models) gets no check and no Check now (phase 5 fix round 1).
 
 ### Tools
 
@@ -979,6 +980,7 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
   on. With the push off, nothing polls: the helper reads the switches (the feature, the old hook's bypass,
   `routing_push_prompt`) and `routing_poll_interval` before every poll and every 5 seconds and forks no poll
   child while the push is off, and the daemon stops an idle helper within 2 seconds of the push going off.
+  With the push off and reset checks on (phase 5), the helper keeps running for the checks alone and still never polls: it has no poll interval, never wakes at `valid_until`, and wakes only at the next reset check, after a wake from sleep, or when view.json changed; that child reads the saved view and refolds only through a check that is due (fix round 1).
   `khipu route`, the tools and doctor refold when they read, as before. A poll interval set to 0 and back is
   used within 5 seconds, not at the view's `valid_until`. The helper also looks at view.json every 5 seconds
   and polls once when it changed, so the `valid_until` a write saved there is waited for: a limit written after its last poll

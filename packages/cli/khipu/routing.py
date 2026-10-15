@@ -315,8 +315,8 @@ def _coerce(kind: str, value, key: str):
         if isinstance(value, str):
             text = value.strip()
             items = _loads(text) if text.startswith("[") else [p for p in text.split(",") if p.strip()]
-        if not isinstance(items, list) or not items or len(items) > 10:
-            raise ValueError(f"{key} must be one to ten lengths of time, for example 10m,30m")
+        if not isinstance(items, list) or len(items) > 10:
+            raise ValueError(f"{key} must be at most ten lengths of time, for example 10m,30m (none: [])")
         return [_coerce("duration", item, key) for item in items]
     if kind == "path":
         # Absolute only: a relative name would be read against whichever
@@ -1096,11 +1096,11 @@ def _append_locked(*events: dict) -> None:
 # key) would stop every fold, so it is counted as unreadable and left out.
 _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", "basis", "source", "window",
                 "evidence", "until", "written_at", "via", "text", "file", "date", "sha256", "clock_at",
-                "status", "reset_id", "reset_until", "next_at", "state_id")
-_TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at")
+                "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to")
+_TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries")
 _WHOLE_MOST = 2 ** 53
-_SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default")
+_SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted")
 _AUTHOR_FIELDS = ("kind", "harness", "project", "session", "name", "file")
 _HOLD_KINDS = ("account", "machine", "all")
 
@@ -1121,6 +1121,15 @@ _RESET_REASONS = frozenset({
     "Khipu read this account as open",
     "Khipu read a later reset time",
     "Khipu read the same limit again",
+    # Fix round 1: an owner's Check now that will not be tried again
+    # promises nothing (F8); a wait that runs out after a completed check
+    # does not say the account was never checked (F5); an account Khipu no
+    # longer reads is not checked (F3).
+    "The Mac is busy; try again later",
+    "Another Khipu usage check is running; try again later",
+    "not checked again: the Mac was busy",
+    "not checked again: another Khipu usage check kept running",
+    "Khipu can't check this account: it isn't in Settings \u2192 Models",
 })
 
 
@@ -1799,13 +1808,25 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                         or lock_tries < 0):
                     continue
                 identity = (account, scope, window, _iso(until))
-                reset_checks[identity] = {
+                record = {
                     "reset_until": until, "checks": checks, "busy_tries": busy_tries,
                     "lock_tries": lock_tries, "status": status, "scope": scope, "window": window,
                     "next_at": _parse(event.get("next_at")),
                     "state_id": event.get("state_id") if isinstance(event.get("state_id"), str) else None,
                     "reason": reason,
                 }
+                # A Check now before the reset time (``counted`` false) has
+                # its outcome in its own evidence: it never spends, waits
+                # out or moves the reset's own checks (fix round 1, F2). Only
+                # "can't be checked" is a fact about the account itself.
+                if not (event.get("counted") is False and until is not None and status != "cannot_check"):
+                    reset_checks[identity] = record
+                    # A check that read the same limit with an earlier reset
+                    # time moves the entry's until there: the reset is the
+                    # same one, so its checks go with it (fix round 1, F4).
+                    moved = _parse(event.get("reset_moved_to"))
+                    if moved is not None and until is not None and moved < until:
+                        reset_checks[(account, scope, window, _iso(moved))] = record
                 at = _parse(event.get("written_at"))
                 if at is not None:
                     causes[f"account:{account}"] = {"at": at, "seq": event.get("_seq", -1),
@@ -1882,6 +1903,13 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             hold["scope_label"] = "this Mac" if hold["scope"].get("kind") == "machine" else "all work"
 
     entries = [_fold_account(a, per_account.get(a["key"], []), owner, now, cfg) for a in by_key.values()]
+    # Whether plan usage reads the account (fix round 1, F3): the configured
+    # ``usage_accounts`` when there are any, else each CLI at its default
+    # login. One the record names but Khipu no longer reads (removed in
+    # Settings -> Models while limited) gets no reset check and no Check now.
+    known_keys = {a["key"] for a in known}
+    for entry in entries:
+        entry["configured"] = entry["key"] in known_keys if known_keys else not entry.get("home")
     for entry in entries:
         until = _parse(entry.get("until"))
         reset = reset_checks.get((entry["key"], "all", None, _iso(until)))
@@ -1998,6 +2026,8 @@ def reset_check_due(entry: dict, now: datetime, cfg: dict) -> datetime | None:
     """
     if not cfg.get("routing_reset_check") or entry.get("state") not in (LIMITED, PROBABLY_OPEN):
         return None
+    if entry.get("configured") is False:
+        return None
     until = _parse(entry.get("until"))
     if until is None:
         return None
@@ -2040,7 +2070,8 @@ def _check_author() -> dict:
 
 def _reset_event(account: str, until: datetime | None, *, checks: int, busy_tries: int, lock_tries: int,
                  status: str, state_id: str | None = None,
-                 next_at: datetime | None = None, reason: str | None = None) -> dict:
+                 next_at: datetime | None = None, reason: str | None = None, counted: bool = True,
+                 moved_to: datetime | None = None) -> dict:
     event: dict[str, Any] = {"type": "reset_check", "account": account, "scope": "all",
                              "checks": min(3, max(0, checks)), "busy_tries": max(0, busy_tries),
                              "lock_tries": max(0, lock_tries), "status": status,
@@ -2053,6 +2084,10 @@ def _reset_event(account: str, until: datetime | None, *, checks: int, busy_trie
         event["state_id"] = state_id
     if reason in _RESET_REASONS:
         event["reason"] = reason
+    if not counted:
+        event["counted"] = False
+    if moved_to is not None:
+        event["reset_moved_to"] = _iso(moved_to)
     return event
 
 
@@ -2197,28 +2232,71 @@ def _probe_reason(code: Any) -> str:
     return "Khipu could not read this account's usage"
 
 
+_NOT_CONFIGURED = "Khipu can't check this account: it isn't in Settings \u2192 Models"
+_CANNOT_CHECK = "This account can't be checked without using a turn"
+# The words for a wait, by what it waits for: the Mac's load or another
+# usage check holding the shared lock. ``later`` is an owner's Check now that
+# nothing will try again (F8); ``out`` is the last wait run out, before any
+# check of this reset completed or after one did (F5).
+_WAIT_WORDS = {
+    "busy": {"status": "busy", "out_status": "busy_exhausted", "field": "busy_tries",
+             "again": "The Mac is busy; Khipu will try again", "later": "The Mac is busy; try again later",
+             "out": ("not checked: the Mac was busy", "not checked again: the Mac was busy")},
+    "lock": {"status": "lock_wait", "out_status": "lock_exhausted", "field": "lock_tries",
+             "again": "Another Khipu usage check is running; Khipu will try again",
+             "later": "Another Khipu usage check is running; try again later",
+             "out": ("not checked: another Khipu usage check kept running",
+                     "not checked again: another Khipu usage check kept running")},
+}
+
+
+def _setting(cfg: dict, key: str) -> Any:
+    """A setting as ``settings`` gives it, 0 kept as 0: only a missing value
+    is the default (fix round 1, F6: ``or 3`` made 0 tries mean 3)."""
+    value = cfg.get(key)
+    return SETTINGS[key][1] if value is None else value
+
+
 def check_account(account: str, *, scheduled: bool = False, now: datetime | None = None,
                   probe=None, load=None, in_child: bool = False, on_write=None) -> dict:
     """Run one reset or owner-requested check under the shared usage lock.
 
     The caller is already the routing helper's child.  No daemon thread or
     process probes usage; tests supply ``probe`` and ``load`` fakes.
+
+    A check counts against its reset's three only at or after the reset time
+    plus the wait; every scheduled check does. An owner's Check now before
+    then, or on an account with no reset time, is written with ``counted``
+    false: its outcome is recorded (and its evidence moves the account as any
+    probe's does), but it never spends the reset's checks or waits and never
+    moves its next check (fix round 1, F2). A completed check gives the next
+    one its own waits (F5).
     """
     from khipu import usage
 
     now = now or _now()
     key = resolve_account(account)
-    view = read_view(now)
-    entry = next((e for e in view.get("accounts", []) if e.get("key") == key), None)
-    if entry is None:
-        raise RouteError("Khipu doesn't know the account you named")
-    if not scheduled and entry.get("state") not in (LIMITED, PROBABLY_OPEN, UNKNOWN):
-        raise RouteError("Khipu checks only accounts that are limited, probably open or unknown")
-    if scheduled:
-        due = reset_check_due(entry, now, settings())
-        if due is None or due > now:
-            return {"ok": True, "account": key, "outcome": "not_due"}
     cfg = settings()
+    wait = float(_setting(cfg, "routing_reset_check_wait"))
+
+    def look() -> dict:
+        view = read_view(now)
+        entry = next((e for e in view.get("accounts", []) if e.get("key") == key), None)
+        if entry is None:
+            raise RouteError("Khipu doesn't know the account you named")
+        return entry
+
+    def due_now(entry: dict) -> bool:
+        due = reset_check_due(entry, now, cfg)
+        return due is not None and due <= now
+
+    def current(entry: dict) -> dict:
+        until = _parse(entry.get("until"))
+        reset = entry.get("reset_check") or {}
+        return {"until": until, "state_id": _state_id(entry),
+                "counted": until is not None and (scheduled or now >= _after(until, wait)),
+                "checks": int(reset.get("checks") or 0), "busy_tries": int(reset.get("busy_tries") or 0),
+                "lock_tries": int(reset.get("lock_tries") or 0)}
 
     def write_one(event: dict) -> None:
         if on_write is not None:
@@ -2230,102 +2308,96 @@ def check_account(account: str, *, scheduled: bool = False, now: datetime | None
             on_write()
         _write_many(events)
 
-    until = _parse(entry.get("until"))
-    state_id = _state_id(entry)
-    reset = entry.get("reset_check") or {}
-    checks = int(reset.get("checks") or 0)
-    busy_tries = int(reset.get("busy_tries") or 0)
-    lock_tries = int(reset.get("lock_tries") or 0)
+    def event(s: dict, status: str, reason: str, **kw) -> dict:
+        fields = {"checks": s["checks"], "busy_tries": s["busy_tries"], "lock_tries": s["lock_tries"]}
+        fields.update({k: kw.pop(k) for k in list(kw) if k in fields})
+        return _reset_event(key, s["until"], status=status, reason=reason, state_id=s["state_id"],
+                            counted=s["counted"], **fields, **kw)
+
+    def deferred(s: dict, kind: str) -> dict:
+        words = _WAIT_WORDS[kind]
+        if not s["counted"]:
+            write_one(event(s, words["status"], words["later"]))
+            return {"ok": True, "account": key, "outcome": words["status"], "reason": words["later"]}
+        tries = s[words["field"]] + 1
+        exhausted = tries > int(_setting(cfg, "routing_busy_tries"))
+        next_at = None if exhausted else max(_after(now, float(_setting(cfg, "routing_busy_wait"))),
+                                             _after(s["until"], wait))
+        status = words["out_status"] if exhausted else words["status"]
+        reason = words["out"][s["checks"] > 0] if exhausted else words["again"]
+        write_one(event(s, status, reason, next_at=next_at, **{words["field"]: tries}))
+        return {"ok": True, "account": key, "outcome": status, "reason": reason}
+
+    def done(s: dict, status: str, reason: str, evidence: list[dict] | None = None,
+             moved_to: datetime | None = None) -> dict:
+        checks, next_at, tries = s["checks"], None, {}
+        if s["counted"]:
+            tries = {"busy_tries": 0, "lock_tries": 0}  # the next check waits afresh (F5)
+            if status != "cannot_check":
+                checks = min(3, checks + 1)
+                if status in ("same_limit", "error"):
+                    next_at = _retry_after_check(moved_to or s["until"], checks, now, cfg)
+        line = event(s, status, reason, checks=checks, next_at=next_at, moved_to=moved_to, **tries)
+        if evidence:
+            write_many([*evidence, line])
+        else:
+            write_one(line)
+        out = {"ok": True, "account": key, "outcome": status, "reason": reason}
+        if status != "cannot_check":
+            out["checks"] = checks
+        return out
+
+    entry = look()
+    if scheduled:
+        if not due_now(entry):
+            return {"ok": True, "account": key, "outcome": "not_due"}
+    else:
+        if entry.get("state") not in (LIMITED, PROBABLY_OPEN, UNKNOWN):
+            raise RouteError("Khipu checks only accounts that are limited, probably open or unknown")
+        if entry.get("configured") is False:
+            raise RouteError(_NOT_CONFIGURED)
     fd = usage._try_refresh_lock()
     if fd is None:
-        lock_tries += 1
-        exhausted = lock_tries > int(cfg.get("routing_busy_tries") or 3)
-        next_at = None if exhausted or until is None else max(
-            _after(now, float(cfg.get("routing_busy_wait") or 300)),
-            _after(until, float(cfg.get("routing_reset_check_wait") or 0)),
-        )
-        reason = ("not checked: another Khipu usage check kept running" if exhausted
-                  else "Another Khipu usage check is running; Khipu will try again")
-        write_one(_reset_event(key, until, checks=checks, busy_tries=busy_tries, lock_tries=lock_tries,
-                               status="lock_exhausted" if exhausted else "lock_wait", next_at=next_at,
-                               reason=reason, state_id=state_id))
-        return {"ok": True, "account": key,
-                "outcome": "lock_exhausted" if exhausted else "lock_wait", "reason": reason}
+        return deferred(current(entry), "lock")
     try:
         # The first view only decides whether this call may contend for the
         # shared usage lock. Re-read after winning it: another helper or a
         # manual check may have consumed the last retry while this caller was
         # waiting. Keep the lock through the outcome write so two processes
         # cannot both spend check three for one reset.
-        view = read_view(now)
-        entry = next((e for e in view.get("accounts", []) if e.get("key") == key), None)
-        if entry is None:
-            raise RouteError("Khipu doesn't know the account you named")
-        if scheduled:
-            due = reset_check_due(entry, now, settings())
-            if due is None or due > now:
-                return {"ok": True, "account": key, "outcome": "not_due"}
-        until = _parse(entry.get("until"))
-        state_id = _state_id(entry)
-        reset = entry.get("reset_check") or {}
-        checks = int(reset.get("checks") or 0)
-        busy_tries = int(reset.get("busy_tries") or 0)
-        lock_tries = int(reset.get("lock_tries") or 0)
+        entry = look()
+        if scheduled and not due_now(entry):
+            return {"ok": True, "account": key, "outcome": "not_due"}
+        s = current(entry)
         if entry.get("harness") == "muse" or entry.get("checkable") is False:
-            reason = "This account can't be checked without using a turn"
-            write_one(_reset_event(key, until, checks=checks, busy_tries=busy_tries, lock_tries=lock_tries,
-                                   status="cannot_check", reason=reason, state_id=state_id))
-            return {"ok": True, "account": key, "outcome": "cannot_check", "reason": reason}
+            return done(s, "cannot_check", _CANNOT_CHECK)
         load1 = (load or (lambda: os.getloadavg()[0]))()
-        if cfg.get("routing_busy_load") and load1 > float(cfg["routing_busy_load"]):
-            busy_tries += 1
-            exhausted = busy_tries > int(cfg.get("routing_busy_tries") or 3)
-            next_at = None if exhausted or until is None else max(
-                _after(now, float(cfg.get("routing_busy_wait") or 300)),
-                _after(until, float(cfg.get("routing_reset_check_wait") or 0)),
-            )
-            reason = "not checked: the Mac was busy" if exhausted else "The Mac is busy; Khipu will try again"
-            write_one(_reset_event(key, until, checks=checks, busy_tries=busy_tries, lock_tries=lock_tries,
-                                   status="busy_exhausted" if exhausted else "busy", next_at=next_at,
-                                   reason=reason, state_id=state_id))
-            return {"ok": True, "account": key,
-                    "outcome": "busy_exhausted" if exhausted else "busy", "reason": reason}
+        busy_load = float(_setting(cfg, "routing_busy_load"))
+        if busy_load > 0 and load1 > busy_load:
+            return deferred(s, "busy")
         configured = next((a for a in accounts() if a["key"] == key), None)
         if configured is None:
-            raise RouteError("Khipu doesn't know the account you named")
+            raise RouteError(_NOT_CONFIGURED)
         row = probe(configured) if probe is not None else (
             usage.probe_account(configured) if in_child else _probe_check_child(configured, None, close_fd=fd))
         if row.get("error") in (usage.E_SIGNIN, usage.E_NO_LIMITS):
-            reason = "This account can't be checked without using a turn"
-            write_one(_reset_event(key, until, checks=checks, busy_tries=busy_tries, lock_tries=lock_tries,
-                                   status="cannot_check", reason=reason, state_id=state_id))
-            return {"ok": True, "account": key, "outcome": "cannot_check", "reason": reason}
+            return done(s, "cannot_check", _CANNOT_CHECK)
         if not row.get("ok"):
-            checks = min(3, checks + 1)
-            reason = _probe_reason(row.get("error"))
-            next_at = _retry_after_check(until, checks, now, cfg)
-            write_one(_reset_event(key, until, checks=checks, busy_tries=busy_tries, lock_tries=lock_tries,
-                                   status="error", reason=reason, state_id=state_id, next_at=next_at))
-            return {"ok": True, "account": key, "outcome": "error", "reason": reason, "checks": checks}
-
+            return done(s, "error", _probe_reason(row.get("error")))
         evidence, whole_limits, headroom = _check_evidence(key, row)
         if headroom:
-            status, outcome, reason = "open", "open", "Khipu read this account as open"
-        elif whole_limits:
-            latest = max(whole_limits)
-            status = "later_limit" if until is not None and latest > until else "same_limit"
-            outcome = status
-            reason = ("Khipu read a later reset time" if status == "later_limit"
-                      else "Khipu read the same limit again")
-        else:
-            status, outcome = "error", "error"
-            reason = "Khipu checked this account, but it did not report enough usage information"
-        checks = min(3, checks + 1)
-        next_at = _retry_after_check(until, checks, now, cfg) if status in ("same_limit", "error") else None
-        outcome_event = _reset_event(key, until, checks=checks, busy_tries=busy_tries, lock_tries=lock_tries,
-                                     status=status, reason=reason, state_id=state_id, next_at=next_at)
-        write_many([*evidence, outcome_event])
-        return {"ok": True, "account": key, "outcome": outcome, "reason": reason, "checks": checks}
+            return done(s, "open", "Khipu read this account as open", evidence)
+        if not whole_limits:
+            return done(s, "error", "Khipu checked this account, but it did not report enough usage information",
+                        evidence)
+        latest = max(whole_limits)
+        until = s["until"]
+        if until is not None and latest > until:
+            return done(s, "later_limit", "Khipu read a later reset time", evidence)
+        # The same limit. A reset time earlier than the one reported is
+        # still this reset: its checks move with it (F4).
+        return done(s, "same_limit", "Khipu read the same limit again", evidence,
+                    moved_to=latest if until is not None and latest < until else None)
     finally:
         usage._release(fd)
 
@@ -2341,15 +2413,28 @@ def run_due_reset_checks(now: datetime | None = None, *, probe=None, load=None,
     now = now or _now()
     out: list[dict] = []
     seen: set[str] = set()
-    while max_checks is None or len(out) < max_checks:
+    ran = 0
+    while max_checks is None or ran < max_checks:
         view, cfg = read_view(now), settings()
         entry = next((e for e in view.get("accounts", []) if e.get("key") not in seen
                       and (due := reset_check_due(e, now, cfg)) is not None and due <= now), None)
         if entry is None:
             break
         seen.add(entry["key"])
-        out.append(check_account(entry["key"], scheduled=True, now=now, probe=probe, load=load,
-                                 in_child=in_child, on_write=on_write))
+        try:
+            out.append(check_account(entry["key"], scheduled=True, now=now, probe=probe, load=load,
+                                     in_child=in_child, on_write=on_write))
+            ran += 1
+        except RouteError:
+            # One account's failure never strands the rest (fix round 1,
+            # F3): an account Khipu no longer reads is recorded as not
+            # checked, so it stops being due, and the next due account runs.
+            if entry["key"] not in {a["key"] for a in accounts()}:
+                with contextlib.suppress(RouteError, OSError):
+                    _write(_reset_event(entry["key"], _parse(entry.get("until")), checks=0, busy_tries=0,
+                                        lock_tries=0, status="cannot_check", reason=_NOT_CONFIGURED,
+                                        state_id=_state_id(entry)))
+            out.append({"ok": False, "account": entry["key"], "outcome": "not_checked"})
     return out
 
 
@@ -3211,6 +3296,8 @@ def account_line(entry: dict, now: datetime, *, push: bool = True, relative: boo
         reset_reason = (entry.get("reset_check") or {}).get("reason")
         if reset_reason in _RESET_REASONS:
             text = f"{label}: its reset time passed ({_clock(until, now)}); {reset_reason}"
+        elif entry.get("configured") is False:
+            text = f"{label}: probably open: its limit was due to end at {_clock(until, now)}; {_NOT_CONFIGURED}"
         elif entry.get("checkable", True):
             text = f"{label}: probably open: its limit was due to end at {_clock(until, now)}, not checked yet"
         else:

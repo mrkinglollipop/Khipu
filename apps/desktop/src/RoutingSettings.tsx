@@ -492,7 +492,7 @@ function AccountRow({ a, w, now, reportDefault }: { a: RouteAccount; w: Writer; 
         {a.next_check ? <span className="route-src">Khipu checks again at {whenLocal(a.next_check, now)}.</span> : null}
       </span>
       <span className="route-acts">
-        {a.checkable !== false && ["limited", "probably_open", "unknown"].includes(a.state) ? (
+        {a.checkable !== false && a.configured !== false && ["limited", "probably_open", "unknown"].includes(a.state) ? (
           <>
             <button type="button" className="sm" disabled={w.anyBusy}
               onClick={() => void w.run(`check:${a.key}`, "khipu_route_check", { account: a.key })}>
@@ -567,7 +567,7 @@ function ResetChecksSection({ data, cfg, w, reread }: { data: RouteView | null; 
         <div className="rows">
           <LimitRow name="Wait after the reset time" help="Khipu checks after this wait." fields={[{ key: "routing_reset_check_wait", label: "Wait", unit: "time", options: [60, 120, 300] }]} cfg={cfg} w={w} reread={reread} />
           <RetryTimesRow cfg={cfg} w={w} reread={reread} />
-          <LimitRow name="Wait while the Mac is busy" help="If load is over this number, Khipu waits before checking." fields={[{ key: "routing_busy_load", label: "Load", unit: "load", options: [50, 75, 90] }, { key: "routing_busy_wait", label: "Wait", unit: "time", options: [60, 300, 600] }, { key: "routing_busy_tries", label: "Busy attempts", unit: "changes", options: [1, 3, 5] }]} cfg={cfg} w={w} reread={reread} />
+          <LimitRow name="Wait while the Mac is busy" help="If load is over this number, Khipu waits before checking." fields={[{ key: "routing_busy_load", label: "Load", unit: "load", options: [50, 75, 90, 0], zero: "Never wait" }, { key: "routing_busy_wait", label: "Wait", unit: "time", options: [60, 300, 600, 0], zero: "Try again at the next look" }, { key: "routing_busy_tries", label: "Busy attempts", unit: "attempts", options: [1, 3, 5, 0], zero: "None: record it at once" }]} cfg={cfg} w={w} reread={reread} />
         </div>
         <p className="set-help">{next.length ? `Khipu checks again at ${next.join("; ")}.` : "No reset checks are scheduled."}</p>
         <p className="set-help">{(data?.accounts ?? []).filter((a) => a.reset_check?.reason).map((a) => `${a.label}: ${a.reset_check?.reason}`).join("; ") || "No account has a reset-check reason."}</p>
@@ -1143,23 +1143,29 @@ function LimitRow({
 
 function RetryTimesRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Writer; reread: () => Promise<unknown> }) {
   const raw = cfg?.routing?.routing_reset_check_retries?.value;
-  const values = Array.isArray(raw) && raw.length === 2 && raw.every((v) => typeof v === "number") ? raw as number[] : null;
+  const values = Array.isArray(raw) && raw.every((v) => typeof v === "number") ? raw as number[] : null;
   const [first, setFirst] = useState("600");
   const [second, setSecond] = useState("1800");
   const [dirty, setDirty] = useState(false);
   useEffect(() => {
     if (values && !dirty) {
-      setFirst(String(values[0]));
-      setSecond(String(values[1]));
+      setFirst(values[0] != null ? String(values[0]) : "");
+      setSecond(values[1] != null ? String(values[1]) : "");
     }
-  }, [values?.[0], values?.[1], dirty]);
+  }, [values?.length, values?.[0], values?.[1], dirty]);
   const id = "reset-retries";
-  const valid = /^\d+$/.test(first) && /^\d+$/.test(second) && Number(first) > 0 && Number(second) > Number(first);
+  // None, one or two retries: both empty removes them (fix round 1, F7).
+  const a = first.trim();
+  const b = second.trim();
+  const whole = (t: string) => /^\d+$/.test(t) && Number(t) > 0;
+  const valid = (a === "" && b === "") || (whole(a) && (b === "" || (whole(b) && Number(b) > Number(a))));
+  const value = `[${[a, b].filter((t) => t !== "").join(",")}]`;
+  const shown = values == null ? "…" : values.length === 0 ? "No retries" : values.map((v) => limitWords(v, "time")).join(" and ");
   return <div className="row-item route-limit">
-    <span className="route-limit-text"><span className="route-limit-name">Try again after</span><span className="set-help">Two separate retry times when the same limit remains.</span></span>
-    <span className="route-val">{values ? `${limitWords(values[0], "time")} and ${limitWords(values[1], "time")}` : "…"}</span>
-    <span className="toolbar"><label>First retry (seconds)<input aria-label="First retry in seconds" value={first} onChange={(e) => { setDirty(true); setFirst(e.target.value); }} /></label><label>Second retry (seconds)<input aria-label="Second retry in seconds" value={second} onChange={(e) => { setDirty(true); setSecond(e.target.value); }} /></label><button type="button" className="sm" disabled={!valid || w.isBusy(id)} onClick={() => void w.run(id, "khipu_config_set", { key: "routing_reset_check_retries", value: `[${first},${second}]` }, async () => { await reread(); setDirty(false); })}><Busy on={w.isBusy(id)} />Save</button></span>
-    {!valid ? <span className="set-error" role="alert">Use two positive whole seconds, with the second later than the first.</span> : null}<WriteError w={w} id={id} />
+    <span className="route-limit-text"><span className="route-limit-name">Try again after</span><span className="set-help">Up to two retry times when the same limit remains. Leave both empty for no retries.</span></span>
+    <span className="route-val">{shown}</span>
+    <span className="toolbar"><label>First retry (seconds)<input aria-label="First retry in seconds" value={first} onChange={(e) => { setDirty(true); setFirst(e.target.value); }} /></label><label>Second retry (seconds)<input aria-label="Second retry in seconds" value={second} onChange={(e) => { setDirty(true); setSecond(e.target.value); }} /></label><button type="button" className="sm" disabled={!valid || w.isBusy(id)} onClick={() => void w.run(id, "khipu_config_set", { key: "routing_reset_check_retries", value }, async () => { await reread(); setDirty(false); })}><Busy on={w.isBusy(id)} />Save</button></span>
+    {!valid ? <span className="set-error" role="alert">Use positive whole seconds, the second later than the first, or leave both empty for no retries.</span> : null}<WriteError w={w} id={id} />
   </div>;
 }
 

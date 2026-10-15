@@ -631,6 +631,36 @@ describe("Settings -> Routing: checking for resets", () => {
     expect(await screen.findByRole("status")).toHaveTextContent("not checked: the Mac was busy");
   });
 
+  it("words the busy-Mac row and offers no wait, no attempts and no retries (fix round 1, F7)", async () => {
+    expect(limitWords(3, "attempts")).toBe("3 attempts");
+    expect(limitWords(1, "attempts")).toBe("1 attempt");
+    answers.khipu_config_show = config({ routing_busy_load: setting(0), routing_reset_check_retries: setting([]) });
+    await page();
+    const busy = screen.getByRole("button", { name: "Change: Wait while the Mac is busy" }).closest(".route-limit")!;
+    expect(busy).toHaveTextContent("Never wait · 5 minutes · 3 attempts");
+    const retries = screen.getByLabelText("First retry in seconds").closest(".route-limit")!;
+    expect(retries).toHaveTextContent("No retries");
+    expect(screen.getByLabelText("First retry in seconds")).toHaveValue("");
+    fireEvent.click(screen.getByRole("button", { name: "Change: Wait while the Mac is busy" }));
+    expect(within(screen.getByLabelText("Load")).getByRole("option", { name: /^Never wait/ })).toBeInTheDocument();
+    expect(within(screen.getByLabelText("Busy attempts")).getByRole("option", { name: /^None: record it at once/ })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("First retry in seconds"), { target: { value: "900" } });
+    fireEvent.click(within(retries as HTMLElement).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls("khipu_config_set")).toContainEqual({ key: "routing_reset_check_retries", value: "[900]" }));
+    fireEvent.change(screen.getByLabelText("First retry in seconds"), { target: { value: "" } });
+    fireEvent.change(screen.getByLabelText("Second retry in seconds"), { target: { value: "" } });
+    fireEvent.click(within(retries as HTMLElement).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls("khipu_config_set")).toContainEqual({ key: "routing_reset_check_retries", value: "[]" }));
+  });
+
+  it("offers no Check now for an account Khipu no longer reads (fix round 1, F3)", async () => {
+    const v = view();
+    v.accounts![0]!.configured = false;
+    answers.khipu_route_view = v;
+    await page();
+    expect(within(row("Accounts", "Claude main")).queryByRole("button", { name: "Check now" })).toBeNull();
+  });
+
   it("shows a Check now refusal beside its account", async () => {
     answers.khipu_route_check = { ok: false, error: "another usage check is running" };
     await page();
