@@ -207,10 +207,80 @@ def declined_file() -> Path:
     return usage.cache_file().with_name(DECLINED_NAME)
 
 
-def _load_store() -> dict:
+# Discovery's own files sit in Khipu's data folder (``state/`` next to the
+# usage cache). Each is reached through descriptors with O_NOFOLLOW below the
+# data folder, so a ``state`` folder or file swapped for a symlink can never
+# redirect a read or a write into a login folder; T3's settings likewise below
+# the home folder.
+_O_DIR = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+READ_MAX = 16 * 1024 * 1024
+
+
+@contextlib.contextmanager
+def _dir_fd(base: Path, parts: tuple[str, ...], *, create: bool = False):
+    """A descriptor for ``base/parts...``, following ``base`` itself but no
+    symlink in ``parts``; None when missing or a step is a symlink."""
+    fds: list[int] = []
     try:
-        data = json.loads(store_file().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        try:
+            if create:
+                base.mkdir(parents=True, exist_ok=True)
+            fds.append(os.open(base, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)))
+            for part in parts:
+                if create:
+                    with contextlib.suppress(FileExistsError):
+                        os.mkdir(part, 0o700, dir_fd=fds[-1])
+                fds.append(os.open(part, _O_DIR, dir_fd=fds[-1]))
+        except OSError:
+            yield None
+            return
+        yield fds[-1]
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def _read_at(dfd: int | None, name: str) -> str | None:
+    if dfd is None:
+        return None
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > READ_MAX:
+            return None
+        data = b""
+        while len(data) <= READ_MAX:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            data += chunk
+        return data.decode("utf-8") if len(data) <= READ_MAX else None
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        os.close(fd)
+
+
+def _data_state(*, create: bool = False):
+    """The descriptor for Khipu's ``state`` folder beside the usage cache."""
+    return _dir_fd(usage.cache_file().parent.parent, (usage.cache_file().parent.name,), create=create)
+
+
+def read_nofollow(base: Path, parts: tuple[str, ...]) -> str | None:
+    """``base/parts...`` as text, with no symlink below ``base``."""
+    with _dir_fd(base, parts[:-1]) as dfd:
+        return _read_at(dfd, parts[-1])
+
+
+def _load_store() -> dict:
+    with _data_state() as dfd:
+        text = _read_at(dfd, STORE_NAME)
+    try:
+        data = json.loads(text) if text is not None else None
+    except ValueError:
         data = None
     if not isinstance(data, dict) or data.get("version") != STORE_VERSION:
         data = {"version": STORE_VERSION}
@@ -221,25 +291,32 @@ def _load_store() -> dict:
 
 
 def _save_store(data: dict) -> None:
-    path = store_file()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, suffix=".tmp",
-                                         encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, sort_keys=True)
-            tmp = Path(fh.name)
-        os.replace(tmp, path)
-    except OSError:
-        pass
+    text = json.dumps(data, indent=2, sort_keys=True)
+    with _data_state(create=True) as dfd:
+        if dfd is None:
+            return
+        tmp = f"{STORE_NAME}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+            try:
+                os.write(fd, text.encode("utf-8"))
+            finally:
+                os.close(fd)
+            os.rename(tmp, STORE_NAME, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp, dir_fd=dfd)
 
 
 def turned_down() -> list[dict]:
     """The folders the owner chose Not this one for, or stopped tracking
     (``[{cli, path, identity, why, at}]``). 9B writes this file; a missing or
     corrupt one is an empty list."""
+    with _data_state() as dfd:
+        text = _read_at(dfd, DECLINED_NAME)
     try:
-        data = json.loads(declined_file().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = json.loads(text) if text is not None else None
+    except ValueError:
         return []
     if not isinstance(data, list):
         return []
@@ -358,16 +435,10 @@ def _source_sessions(now_ts: float) -> list[tuple[str, Path, int]]:
     folders: dict[tuple[str, str], list] = {}
     is_dir: dict[str, bool] = {}
     forgotten_at = sc.login_homes_forgotten_at()
-    for state_path in sc._state_files():
-        prefix, sep, _rest = state_path.name.partition("--")
+    for name, state in sc.iter_states():
+        prefix, sep, _rest = name.partition("--")
         cli = SESSION_CLIS.get(prefix)
         if not sep or cli is None:
-            continue
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(state, dict):
             continue
         folder = session_folder(cli, state, now_ts=now_ts, forgotten_at=forgotten_at)
         if folder is None:
@@ -387,7 +458,10 @@ def _source_t3() -> list[tuple[str, Path, str]]:
     """Source 3: (cli, folder, instance name) for T3's Claude and Codex
     instances; an empty ``homePath`` is the default login."""
     out = []
-    for inst in t3.provider_instances(t3.settings_path(_home()), tuple(T3_DRIVERS)):
+    home = _home()
+    rel = t3.settings_path(home).relative_to(home).parts
+    text = read_nofollow(home, rel)
+    for inst in t3.provider_instances(None, tuple(T3_DRIVERS), text=text):
         cli = T3_DRIVERS[inst["driver"]]
         folder = _expand(inst["home_path"]) if inst["home_path"] else default_folder(cli)
         if folder is not None and _is_dir(folder):
@@ -722,12 +796,13 @@ def _view(store: dict) -> dict:
 
 
 def _try_lock() -> int | None:
-    path = usage.cache_file().with_name(LOCK_NAME)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError:
-        return None
+    with _data_state(create=True) as dfd:
+        if dfd is None:
+            return None
+        try:
+            fd = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+        except OSError:
+            return None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -874,7 +949,17 @@ def cli_states() -> dict:
             results[cli] = {"cli": cli, "cli_name": usage.CLI_NAMES[cli], "path": None, "state": "cant_run",
                             "version": None, "reason": R_INTERNAL}
 
-    threads = [threading.Thread(target=work, args=(cli,), daemon=True, name=f"khipu-cli-{cli}") for cli in CLIS]
+    queue, lock = list(CLIS), threading.Lock()
+
+    def worker() -> None:
+        while True:
+            with lock:
+                if not queue:
+                    return
+                cli = queue.pop(0)
+            work(cli)
+
+    threads = [threading.Thread(target=worker, daemon=True, name="khipu-cli") for _ in range(PARALLEL)]
     for thread in threads:
         thread.start()
     end = time.monotonic() + CHILD_TIMEOUT_S + usage.OVERALL_GRACE_S

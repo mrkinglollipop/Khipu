@@ -331,7 +331,7 @@ def test_forget_clears_every_file_and_leaves_the_rest_untouched(mac, capsys):
     _write_state(d / "claude_code--b.json", b, 2222)
     plain = _write_state(d / "aegis--c.json", {"seen_ts": 1.0, "offset": 2}, 3333)
     assert main(["usage", "--forget-login-paths"]) == 0
-    assert json.loads(capsys.readouterr().out) == {"ok": True, "cleared": 2}
+    assert json.loads(capsys.readouterr().out) == {"ok": True, "finished": True, "cleared": 2, "pending": 0}
     assert json.loads((d / "codex--a.json").read_text()) == {k: v for k, v in a.items() if k != sc.LOGIN_HOME_FIELD}
     assert json.loads((d / "claude_code--b.json").read_text()) == {k: v for k, v in b.items()
                                                                      if k != sc.LOGIN_HOME_FIELD}
@@ -364,7 +364,7 @@ def test_discovery_forgets_sessions_past_retention_or_before_forget(mac, monkeyp
     discover.discover(check="~/.codex-mine", at=NOW + 10)
     derived_bytes = derived.read_bytes()
     # (b) Forget stamps the time; every session seen at or before it is ignored.
-    assert sc.forget_login_homes(now=NOW + 20) == 3
+    assert sc.forget_login_homes(now=NOW + 20) == {"cleared": 3, "pending": 0}
     assert sc.login_homes_forgotten_at() == NOW + 20
     assert derived.read_bytes() == derived_bytes, "a file without the field is never rewritten"
     assert discover._source_sessions(NOW + 60) == []
@@ -391,28 +391,29 @@ def test_clearing_takes_the_hooks_lock_and_never_loses_its_save(mac, monkeypatch
     assert lock == sc._state_file("claude_code", "held").with_suffix(".lock")
     lock.mkdir()
     try:
-        assert sc.forget_login_homes() == 0
+        assert sc.forget_login_homes() == {"cleared": 0, "pending": 1}
         assert sc.sweep_login_homes(force=True) == 0
         assert path.read_bytes() == held and path.stat().st_mtime == 1000
         assert lock.is_dir(), "someone else's lock is left alone"
     finally:
         lock.rmdir()
     # The race: a hook save landing between the clear's read and its replace.
-    real = Path.read_text
+    sc._pending_erasures_clear()
+    real = sc._read_state_at
     hook: dict = {}
 
-    def read_then_save(self, *a, **kw):
-        text = real(self, *a, **kw)
-        if self == path and not hook:
+    def read_then_save(dfd, name):
+        text = real(dfd, name)
+        if name == path.name and not hook:
             with sc._state_lock("claude_code", "held") as acquired:
                 hook["acquired"] = acquired
                 if acquired:
                     sc.save_state("claude_code", "held", dict(old, offset=99, seen_ts=time.time()))
         return text
 
-    monkeypatch.setattr(Path, "read_text", read_then_save)
+    monkeypatch.setattr(sc, "_read_state_at", read_then_save)
     sc.forget_login_homes()
-    monkeypatch.setattr(Path, "read_text", real)
+    monkeypatch.setattr(sc, "_read_state_at", real)
     final = json.loads(path.read_text())
     assert hook["acquired"] is False or final["offset"] == 99, "the hook's save was lost"
     assert not lock.exists(), "the lock is always removed"
@@ -880,10 +881,24 @@ def _forbid_reads(monkeypatch, folders, allow=()) -> list[str]:
     def under(real: str, bases) -> bool:
         return any(real == r or real.startswith(r + os.sep) for r in bases)
 
-    def inside(path) -> bool:
+    def fd_path(fd: int) -> str | None:
+        try:
+            return os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024).rstrip(b"\0"))
+        except (OSError, ValueError):
+            return None  # a pipe or a closed descriptor: nothing on disk
+
+    def inside(path, dir_fd=None, nofollow=False) -> bool:
         if isinstance(path, int):
-            return False
-        real = os.path.realpath(os.fspath(path))
+            path, dir_fd = ".", path
+        text = os.fspath(path)
+        if dir_fd is not None and not os.path.isabs(text):
+            base = fd_path(dir_fd)
+            if base is None:
+                return False
+            text = os.path.join(base, text)
+        # O_NOFOLLOW never goes through a final symlink: judge the link itself.
+        real = (os.path.join(os.path.realpath(os.path.dirname(text)), os.path.basename(text)) if nofollow
+                else os.path.realpath(text))
         return under(real, roots) and not under(real, allowed)
 
     touched: list[str] = []
@@ -891,12 +906,14 @@ def _forbid_reads(monkeypatch, folders, allow=()) -> list[str]:
     def guard(fn):
         def wrapped(path=None, *a, **kw):
             target = path if path is not None else "."
-            if inside(target):
+            flags = a[0] if a and isinstance(a[0], int) else kw.get("flags", 0)
+            if inside(target, kw.get("dir_fd"), bool(flags & os.O_NOFOLLOW) if fn is real_os_open else False):
                 touched.append(str(target))
                 raise AssertionError(f"read inside a login folder: {target}")
             return fn(path, *a, **kw) if path is not None else fn(*a, **kw)
         return wrapped
 
+    real_os_open = os.open
     monkeypatch.setattr(builtins, "open", guard(builtins.open))
     monkeypatch.setattr(io, "open", guard(io.open))
     monkeypatch.setattr(os, "open", guard(os.open))
@@ -1125,3 +1142,136 @@ def test_the_lock_is_a_real_flock_next_to_the_usage_cache(mac):
             os.close(other)
     finally:
         usage._release(fd)
+
+
+# ---- Codex review of 0cec87d ------------------------------------------------------------
+
+
+def test_a_symlinked_state_folder_never_redirects_a_read_into_a_login_folder(mac, monkeypatch):
+    """Khipu's capture ``state`` folder, or the capture root itself, swapped
+    for a symlink into a login folder: nothing in it is listed or read, and
+    Forget and the sweep write nothing there."""
+    login = mac.folder(".claude-client")
+    planted = {"seen_ts": NOW, sc.LOGIN_HOME_FIELD: str(login)}
+    (login / "claude_code--x.json").write_text(json.dumps(planted))
+    (login / ".credentials.json").write_text("{}")
+    capture = mac.tmp / "capture"
+    capture.mkdir(exist_ok=True)
+    (capture / "state").symlink_to(login)
+    touched = _forbid_reads(monkeypatch, [login])
+    assert discover._source_sessions(NOW) == []
+    assert sc.forget_login_homes() == {"cleared": 0, "pending": 0}
+    assert sc.sweep_login_homes(force=True) == 0
+    discover.discover(now=True)
+    assert touched == []
+    monkeypatch.undo()
+    assert json.loads((login / "claude_code--x.json").read_text()) == planted
+    # The capture root itself a symlink into a login folder.
+    (capture / "state").unlink()
+    capture.rmdir()
+    (login / "state").mkdir()
+    (login / "state" / "claude_code--y.json").write_text(json.dumps(planted))
+    capture.symlink_to(login)
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(capture))
+    monkeypatch.setenv("HOME", str(mac.home))
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(mac.tmp / "data"))
+    touched = _forbid_reads(monkeypatch, [login])
+    assert discover._source_sessions(NOW) == []
+    assert sc.forget_login_homes() == {"cleared": 0, "pending": 0}
+    assert touched == []
+
+
+def test_a_state_entry_swapped_for_a_symlink_after_listing_is_never_followed(mac, monkeypatch):
+    login = mac.folder(".codex-work")
+    target = login / "auth.json"
+    target.write_text(json.dumps({"seen_ts": NOW, sc.LOGIN_HOME_FIELD: str(login)}))
+    good = mac.session("codex", "good", login_home=str(mac.folder(".codex-mine")))
+    swapped = mac.session("codex", "swap", login_home=str(login))
+    real_names = sc._state_names
+
+    def names_then_swap(dfd):
+        names = real_names(dfd)
+        swapped.unlink()
+        swapped.symlink_to(target)  # the listing saw a file; the open meets a symlink
+        return names
+
+    monkeypatch.setattr(sc, "_state_names", names_then_swap)
+    touched = _forbid_reads(monkeypatch, [login])
+    got = discover._source_sessions(NOW)
+    assert touched == []
+    assert [str(p) for _c, p, _n in got] == [str(mac.home / ".codex-mine")]
+    swapped.unlink()
+    swapped.write_text(json.dumps({"seen_ts": NOW, sc.LOGIN_HOME_FIELD: str(login)}))
+    swapped.unlink()
+    swapped.symlink_to(target)
+    monkeypatch.setattr(sc, "_state_names", real_names)
+    assert sc.forget_login_homes() == {"cleared": 1, "pending": 0}  # the good file only
+    assert touched == []
+    assert sc.LOGIN_HOME_FIELD not in json.loads(good.read_text())
+    monkeypatch.undo()  # the test itself may now look inside the fake login folder
+    assert json.loads(target.read_text())[sc.LOGIN_HOME_FIELD] == str(login), "nothing written through the link"
+
+
+def test_forget_on_a_busy_session_is_not_finished_until_the_next_sweep(mac, capsys):
+    from khipu.cli import main
+
+    d = sc.state_dir()
+    path = mac.session("claude_code", "busy", login_home="/x/.claude-a", offset=7)
+    free = mac.session("codex", "free", login_home="/x/.codex-b")
+    lock = path.with_suffix(".lock")
+    lock.mkdir()
+    sc.sweep_login_homes(force=True)  # the daily sweep has just run
+    assert main(["usage", "--forget-login-paths"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"ok": True, "finished": False, "cleared": 1, "pending": 1,
+                   "note": "Not finished: 1 conversation was busy; Khipu clears it when it is free"}
+    assert sc.LOGIN_HOME_FIELD in json.loads(path.read_text())
+    assert sc.LOGIN_HOME_FIELD not in json.loads(free.read_text())
+    # Still held: a sweep keeps it pending, and asking again says so.
+    assert sc.sweep_login_homes() == 0
+    assert sc.login_homes_pending() == 1
+    lock.rmdir()
+    # Unlocked: the next sweep (even inside its daily wait) applies the erasure.
+    assert sc.sweep_login_homes() == 1
+    assert json.loads(path.read_text()) == {"seen_ts": NOW, "offset": 7}
+    assert sc.login_homes_pending() == 0
+    assert main(["usage", "--forget-login-paths"]) == 0
+    assert json.loads(capsys.readouterr().out)["finished"] is True
+    assert not (d / "login-homes.pending").exists()
+
+
+def test_the_hook_applies_a_pending_erasure_after_its_own_lock_is_released(mac, monkeypatch):
+    folder = mac.folder(".claude-client")
+    transcript = _claude_transcript(folder / "projects" / "p" / "s3.jsonl")
+    payload = json.dumps({"hook_event_name": "Stop", "session_id": "s3", "transcript_path": str(transcript),
+                          "cwd": str(mac.tmp)})
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(folder))
+    sc.hook_main(payload, "claude_code")
+    path = sc._state_file("claude_code", "s3")
+    assert json.loads(path.read_text())[sc.LOGIN_HOME_FIELD] == str(folder)
+    lock = path.with_suffix(".lock")
+    lock.mkdir()
+    assert sc.forget_login_homes() == {"cleared": 0, "pending": 1}
+    lock.rmdir()
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    sc.hook_main(payload, "claude_code")  # loads the old state, saves it, then releases its lock
+    assert sc.LOGIN_HOME_FIELD not in json.loads(path.read_text())
+    assert sc.login_homes_pending() == 0
+
+
+def test_version_checks_run_at_most_two_at_a_time(mac, monkeypatch):
+    spans = mac.rec / "spans"
+    for cli in discover.CLIS:
+        mac.install(cli, textwrap.dedent(f"""\
+            s=$("{sys.executable}" -c 'import time;print(time.time())')
+            /bin/sleep 0.6
+            e=$("{sys.executable}" -c 'import time;print(time.time())')
+            echo "$s $e" >> "{spans}"
+            echo "1.0.0"
+        """))
+    states = discover.cli_states()
+    assert all(states[c]["state"] == "installed" for c in discover.CLIS), states
+    rows = [tuple(map(float, line.split())) for line in spans.read_text().splitlines()]
+    assert len(rows) == 4
+    most = max(sum(1 for s, e in rows if s <= t < e) for t, _ in rows)
+    assert most <= discover.PARALLEL == 2

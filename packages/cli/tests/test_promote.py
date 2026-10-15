@@ -1117,7 +1117,34 @@ def test_gate_mode_stop_hook_background_drains_and_does_nothing_else(home, monke
 
 _WRITE_EVENTS = {"os.mkdir", "os.rename", "os.replace", "os.remove", "os.rmdir", "os.symlink",
                  "os.link", "os.truncate", "shutil.rmtree", "shutil.copyfile", "shutil.move"}
-_SPY: dict = {"on": False, "writes": []}
+_SPY: dict = {"on": False, "writes": [], "at": {}}
+# Where each os.* call made relative to a directory descriptor (dir_fd) points:
+# the descriptor's own path, read with F_GETPATH at the time of the call.
+_DIR_FD_ARG = {"os.mkdir": 2, "os.rmdir": 1, "os.remove": 1, "os.rename": (2, 3), "os.replace": (2, 3),
+               "os.utime": 3, "os.chmod": 2}
+
+
+def _fd_path(fd) -> str | None:
+    import fcntl
+
+    if not isinstance(fd, int) or fd < 0 or not hasattr(fcntl, "F_GETPATH"):
+        return None
+    try:
+        return os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024).rstrip(b"\0"))
+    except OSError:
+        return None
+
+
+def _at(event, args, i, path):
+    """``path`` made absolute through the call's dir_fd, when it has one;
+    a relative name is remembered so a plain ``open`` of it resolves too."""
+    slot = _DIR_FD_ARG.get(event)
+    slot = slot[i] if isinstance(slot, tuple) else slot
+    base = _fd_path(args[slot]) if slot is not None and len(args) > slot else None
+    if base and not os.path.isabs(path):
+        _SPY["at"][path] = base
+        return os.path.join(base, path)
+    return path
 
 
 def _audit(event, args):
@@ -1134,10 +1161,10 @@ def _audit(event, args):
         if "mode=ro" not in target and target != ":memory:":
             _SPY["writes"].append((event, target.removeprefix("file:").split("?")[0]))
     elif event in _WRITE_EVENTS and args:
-        for path in args[:2] if event in ("os.rename", "os.replace", "os.symlink", "os.link",
-                                          "shutil.copyfile", "shutil.move") else args[:1]:
+        for i, path in enumerate(args[:2] if event in ("os.rename", "os.replace", "os.symlink", "os.link",
+                                                       "shutil.copyfile", "shutil.move") else args[:1]):
             if isinstance(path, (str, bytes, os.PathLike)):
-                _SPY["writes"].append((event, os.fsdecode(path)))
+                _SPY["writes"].append((event, _at(event, args, i, os.fsdecode(path))))
 
 
 sys_audit_installed = []
@@ -1151,6 +1178,7 @@ def write_spy():
         sys.addaudithook(_audit)
         sys_audit_installed.append(True)
     _SPY["writes"] = []
+    _SPY["at"] = {}
     _SPY["on"] = True
     try:
         yield _SPY["writes"]
@@ -1162,6 +1190,10 @@ def _outside(writes, *allowed: Path) -> list:
     roots = [os.path.realpath(str(a)) for a in allowed]
     bad = []
     for event, path in writes:
+        # ``open`` reports no dir_fd: a relative name opened through one is
+        # placed where the os.* call on the same name (its rename) placed it.
+        if not os.path.isabs(path) and path in _SPY["at"]:
+            path = os.path.join(_SPY["at"][path], path)
         real = os.path.realpath(path)
         if not any(real == r or real.startswith(r + os.sep) for r in roots):
             bad.append((event, path))

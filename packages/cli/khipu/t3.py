@@ -305,16 +305,19 @@ CODEX_DRIVER = "codex"
 _DRIVER_NAMES = {CLAUDE_DRIVER: "Claude", CODEX_DRIVER: "Codex"}
 
 
-def provider_instances(settings_file: Path, drivers) -> list[dict[str, Any]]:
+def provider_instances(settings_file: Path | None, drivers, *, text: str | None = None) -> list[dict[str, Any]]:
     """Every instance in T3's ``settings.json`` (``providerInstances``)
     whose ``driver`` is one of ``drivers``, as ``{id, driver, name,
     home_path, enabled}``. Only ``driver``, ``displayName``,
     ``config.homePath`` and ``enabled`` are read into the result: the file
     can hold tokens. ``home_path`` is ``""`` when T3 runs the instance from
-    its CLI's default login folder."""
+    its CLI's default login folder. ``text``: the file's contents, already
+    read by a caller that opens it its own way (discovery, no symlinks)."""
     wanted = set(drivers)
     try:
-        data = json.loads(settings_file.read_text(encoding="utf-8"))
+        if settings_file is not None:
+            text = settings_file.read_text(encoding="utf-8")
+        data = json.loads(text) if text is not None else None
     except (OSError, ValueError):
         return []
     instances = data.get("providerInstances") if isinstance(data, dict) else None
