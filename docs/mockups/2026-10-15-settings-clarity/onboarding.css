@@ -77,3 +77,12 @@ body.mockpage{padding:var(--s4) var(--s4) 48px;background:var(--bg)}
 @media (max-width:1100px){.pair{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:760px){.acct-row{grid-template-columns:auto minmax(0,1fr)}.acct-read{grid-column:2}}
 *,*::before,*::after{animation:none!important;transition:none!important}
+/* What's new card on Home (2026-10-15, Matt: dialog and card both, so closing one by accident leaves the other). */
+.wn-card .card-head{display:flex;align-items:center}
+.wn-card-h{margin:0;font:inherit;font-weight:650;color:var(--text);letter-spacing:inherit;text-transform:inherit}
+.wn-card .wn-rows{list-style:none;margin:0;padding:0}
+.wn-card .wn-row{display:flex;align-items:center;gap:var(--s3);padding:var(--s2) var(--s4);border-bottom:1px solid var(--border);font-size:var(--t-sm)}
+.wn-card .wn-row .wn-t{flex:1;min-width:0}
+.wn-card .wn-row button{flex:none}
+.wn-card-foot{font-size:var(--t-sm)}
+.wn-card .wn-rows{border:0;border-radius:0}

@@ -31,9 +31,9 @@
 .route-hold .route-src{text-align:right}
 .route-quote{margin:0;padding:var(--s1) 0 0 var(--s3);border-left:2px solid var(--border-strong);font-size:var(--t-sm);color:var(--text);line-height:1.5}
 .card .row.route-rules{display:block;padding:0 var(--s4)}
-.route-rules details.disclose{border-top:0;padding-top:0}
-.route-rules summary.disclosure{color:var(--text-2)}
-.route-rules summary.disclosure .tag{margin-left:var(--s1)}
+.route-rules .fold.disclose{border-top:0;padding-top:0}
+.route-rules .fold-btn{color:var(--text-2)}
+.route-rules .fold-btn .tag{margin-left:var(--s1)}
 .route-rules ol{margin:0;padding-left:1.4em;display:flex;flex-direction:column;gap:var(--s1);font-size:var(--t-sm);color:var(--text-2);line-height:1.45}
 .route-rules .route-rule-broken{color:var(--text)}
 .card .row.route-foot .meta{white-space:normal}
@@ -106,18 +106,18 @@ h3.rows-head.route-day{margin:0}
 .route-bar{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap}
 .route-bar .spacer{flex:1}
 .route-bar .grp-btns{display:inline-flex;gap:var(--s2)}
-details.disclose.route-group{border:1px solid var(--border);border-radius:var(--r-md);background:var(--surface);box-shadow:var(--shadow-sm);padding:0;overflow:hidden}
-details.disclose.route-group > summary.disclosure{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s1) var(--s3);padding:11px 16px;font-size:var(--t-md);color:var(--text)}
-details.disclose.route-group > summary.disclosure:hover{background:var(--surface-2)}
-details.disclose.route-group[open] > summary.disclosure{border-bottom:1px solid var(--border)}
+.fold.disclose.route-group{border:1px solid var(--border);border-radius:var(--r-md);background:var(--surface);box-shadow:var(--shadow-sm);padding:0;overflow:hidden}
+.fold.disclose.route-group > .fold-btn{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s1) var(--s3);padding:11px 16px;font-size:var(--t-md);color:var(--text)}
+.fold.disclose.route-group > .fold-btn:hover{background:var(--surface-2)}
+.fold.disclose.route-group[data-open=true] > .fold-btn{border-bottom:1px solid var(--border)}
 .route-group .gname{font-size:14px;font-weight:600;flex:0 0 13rem;display:inline-flex;align-items:center;gap:var(--s2)}
 .route-group .gline{font-size:var(--t-sm);color:var(--text-2);font-weight:400;flex:1 1 15rem;min-width:0}
 .route-group .gtags{display:inline-flex;gap:6px;flex-wrap:wrap;margin-left:auto}
 .route-group > .disclose-body{padding:12px 16px 16px;gap:var(--s2)}
 .route-group .disclose-body .disclose-body{padding:0 0 var(--s2)}
-details.disclose.route-sub-fold{border-top:1px solid var(--border);margin-top:var(--s2);padding-top:var(--s1)}
-details.disclose.route-sub-fold > summary.disclosure{font-size:var(--t-sm);color:var(--text);font-weight:600;flex-wrap:wrap;gap:var(--s1) var(--s2)}
-details.disclose.route-sub-fold > summary .sline{font-weight:400;color:var(--text-2)}
+.fold.disclose.route-sub-fold{border-top:1px solid var(--border);margin-top:var(--s2);padding-top:var(--s1)}
+.fold.disclose.route-sub-fold > .fold-btn{font-size:var(--t-sm);color:var(--text);font-weight:600;flex-wrap:wrap;gap:var(--s1) var(--s2)}
+.fold.disclose.route-sub-fold > .fold-btn .sline{font-weight:400;color:var(--text-2)}
 .needs{border-radius:var(--r-md)}
 .needs .txt{gap:var(--s2)}
 .needs ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
@@ -128,12 +128,12 @@ details.disclose.route-sub-fold > summary .sline{font-weight:400;color:var(--tex
 .acct-list{display:flex;flex-direction:column}
 .acct-list > [role=listitem]{border-bottom:1px solid var(--border)}
 .acct-list > [role=listitem]:last-child{border-bottom:0}
-details.acct-line{padding:0}
-details.acct-line > summary{display:flex;flex-wrap:wrap;align-items:center;gap:2px var(--s3);padding:8px 2px;cursor:pointer;list-style:none;font-size:var(--t-md);color:var(--text)}
-details.acct-line > summary::-webkit-details-marker{display:none}
-details.acct-line > summary:hover{background:var(--surface-2)}
-details.acct-line .disclosure-chevron{color:var(--muted);transition:transform 140ms ease}
-details.acct-line[open] > summary .disclosure-chevron{transform:rotate(90deg)}
+.fold.acct-line{padding:0}
+.fold.acct-line > .fold-btn{display:flex;flex-wrap:wrap;align-items:center;gap:2px var(--s3);padding:8px 2px;cursor:pointer;list-style:none;font-size:var(--t-md);color:var(--text)}
+.fold.acct-line > .fold-btn::-webkit-details-marker{display:none}
+.fold.acct-line > .fold-btn:hover{background:var(--surface-2)}
+.fold.acct-line .disclosure-chevron{color:var(--muted);transition:transform 140ms ease}
+.fold.acct-line[data-open=true] > .fold-btn .disclosure-chevron{transform:rotate(90deg)}
 .acct-line .an{flex:0 0 7.5rem;font-weight:600}
 .acct-line .as{flex:1 1 13rem;min-width:0;display:inline-flex;align-items:center;gap:var(--s2)}
 .acct-line .ap{flex:1 1 15rem;min-width:0;font-size:var(--t-sm);color:var(--text-2)}
@@ -183,3 +183,23 @@ button.chip[aria-pressed=true]{border-color:color-mix(in srgb,var(--accent) 50%,
 .needs ul{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px var(--s5)}
 @media (max-width:1100px){.needs ul{grid-template-columns:1fr}.acct-line .as{flex:1 1 13rem}.route-group .gname{flex:0 0 12rem}}
 .acct-body .route-src,.lane-sub .route-src{text-align:left}
+
+/* Review fix (2026-10-15): account lines are a grid, so a long status wraps inside its own column and never runs
+   into the week figure; below 600 px of list width the week and pace drop under the status. */
+.acct-list{container-type:inline-size}
+.fold.acct-line > button.fold-btn{display:grid;grid-template-columns:14px 8rem minmax(0,1fr) minmax(0,1.15fr) auto;column-gap:var(--s3);row-gap:2px;align-items:start;padding:10px 4px;font-size:var(--t-md);color:var(--text)}
+.fold.acct-line > button.fold-btn > .disclosure-chevron{margin-top:3px}
+.acct-line .an,.acct-line .as,.acct-line .ap{flex:none;min-width:0;white-space:normal}
+.acct-line .as{display:flex;align-items:baseline;gap:var(--s2);line-height:1.4}
+.acct-line .as .hdot{flex:none;transform:translateY(-1px)}
+.acct-line .ap{display:flex;flex-direction:column;gap:1px;line-height:1.4}
+.acct-line .ap-week{color:var(--text-2)}
+.acct-line .ap-pace{color:var(--muted);font-size:var(--t-xs)}
+.acct-line .at{margin-left:0;justify-content:flex-end;flex-wrap:wrap}
+@container (max-width:600px){.fold.acct-line > button.fold-btn{grid-template-columns:14px 7.5rem minmax(0,1fr) !important}
+  .fold.acct-line > button.fold-btn{grid-template-columns:14px 7.5rem minmax(0,1fr)}
+  .acct-line .ap,.acct-line .at{grid-column:3/-1;justify-content:flex-start}
+}
+.route-filter select.sort{min-width:13rem}
+.route-group > .fold-body > .disclose-body{padding:12px 16px 16px;gap:var(--s2)}
+.fold.acct-line > button.fold-btn{grid-template-columns:14px 8rem minmax(0,1fr) minmax(0,1.15fr) 9.5rem}

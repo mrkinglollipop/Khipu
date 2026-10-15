@@ -5,8 +5,8 @@ a Plans section "looks like it's not attached to anything", seemingly Grok's, "d
 from Grok, and it shows a bunch of errors"; Settings → Routing is "way, way, way too long" and should be
 collapsed, expandable, sortable and maybe filterable; nobody can know what "Watched" and "Not watched by
 Khipu" mean; and new and updating users need to be able to set all of this up and learn what the new
-features do. This page is the scope, waiting for Matt's approval with the mocks in
-`docs/mockups/2026-10-15-settings-clarity/`. A build session reads it first. It changes how existing data is
+features do. This page is the scope, **APPROVED by Matt 2026-10-15** with his four answers folded in (Decisions,
+below), with the mocks in `docs/mockups/2026-10-15-settings-clarity/`. A build session reads it first. It changes how existing data is
 shown and adds one setup step and a better what's-new; it adds no new routing behaviour. It builds on routing
 truth (`2026-10-14-routing-truth.md`) and plan usage (`2026-10-14-plan-usage.md`), and it leaves room for Work
 (`2026-10-15-work-view.md`), where the Owed tab folds in. Every phase reaches this Mac only through the
@@ -15,25 +15,25 @@ promotion gate (`2026-10-14-promotion-gate.md`).
 **What Matt gets, in plain words.** Capture & models reads as three short questions (when is a conversation
 saved, how do commitments close, which model writes the summaries) with each key in one place. Every account
 in Plans is one block with its name on it, and when an account can't be read it says so once, in words, next
-to the name, including that he paused it. Settings → Routing opens as a one-screen overview: a short "Needs
+to the name, including that he paused it. Settings → Routing, renamed Accounts and routing, opens as a one-screen overview: a short "Needs
 you" list at the top, then one line per group that he can open, with accounts he can sort and filter. A rule
-says "Khipu checks this" and what the check found, or that Khipu can't check it. A new user meets accounts and
-routing in setup; an existing user sees one short "What's new" after an update, each item with a Show me
-button, once.
+says "Checked by Khipu" and what the check found, or that Khipu can't check it. A new user meets accounts and
+routing in setup; an existing user sees what is new after an update twice over, once as a dialog and once as
+a card on Home that stays until he closes it, each item with a Show me button.
 
 ## Status
 
 | Phase | What | Size | State |
 |---|---|---|---|
-| 0 | This scope and the mocks | S | written 2026-10-15, waiting for Matt |
+| 0 | This scope and the mocks | S | approved by Matt 2026-10-15 |
 | 1 | Three fixes: no false "off" while loading, no "Live" beside "no turn yet", no negative ages | S | open |
 | 2 | Plans: one block per account, one failure line, paused shown, on Home and in Settings | S–M | open |
 | 3 | Routing overview: groups that fold, the Needs you list, Plans moves into Accounts | M | open |
 | 4 | Routing lists: sort and filter accounts, filter and search rules, filter recent changes | S–M | open |
-| 5 | Standing rules: "Khipu checks this" with the check's result | S | open |
+| 5 | Standing rules: "Checked by Khipu" with the check's result | S | open |
 | 6 | Capture & models: three cards and one Keys list | M | open |
 | 7 | Setup: an Accounts step | S–M | open |
-| 8 | What's new after an update, and its history in Settings → Updates | S | open |
+| 8 | What's new after an update (dialog and Home card), and its history in Settings → Updates | S | open |
 
 One PR per phase. Phase 1 goes first because it fixes things that are wrong today. Phases 2 to 6 can go in any
 order after 3, except that 4 and 5 need 3. Phases 7 and 8 go last, because they introduce what the earlier
@@ -123,8 +123,10 @@ none goes to a terminal), and every hard limit stays liftable with its Change…
    message.
 5. **Plain words, no em-dashes, local times, fictional data in mocks.**
 6. **Remembered per Mac, never forced.** Which groups are open is remembered on this Mac. The app never opens,
-   pops up or badges anything to get attention except the one what's-new dialog per update (phase 8) and the
-   problem counts in rule 1.
+   pops up or badges anything to get attention except what's new after an update (one dialog and one Home
+   card, phase 8) and the problem counts in rule 1.
+7. **Every status has words.** A dot's colour always sits next to words that say the same thing; nothing is
+   told by colour alone.
 
 ## Design
 
@@ -164,7 +166,7 @@ Then three cards and one list, in this order:
   when the page opens if a key has never been checked, and from Check now, not only after a save. One line
   under the list: "Keys are kept in this Mac's login Keychain, never in a file." The Gemini, Claude API,
   OpenAI, OpenRouter and local endpoint keys all live here; the provider rows only show status.
-- **Plans leaves this page** and moves to Settings → Routing → Accounts (section 3), where the same accounts
+- **Plans leaves this page** and moves to Settings → Accounts and routing → Accounts (section 3), where the same accounts
   already are. Its accounts list ("which accounts Khipu reads") moves with it.
 
 Embeddings stays its own section; the summaries card says in one line that search by meaning is set there.
@@ -192,17 +194,20 @@ read (fixes polish item b); a successful read with no figures says when it was c
 **Settings.** Each account is its own bordered block with its name and plan as the block's heading; every line
 about it (each window, the read times, the failure, sign-in, Check now, Details) sits inside the block, so
 nothing floats. A paused account's block says so first. A failure is one line, with "Details" opening the
-short code, the last attempt and the last good read. The block list sits in Routing → Accounts (section 3);
+short code, the last attempt and the last good read. The block list sits in Accounts and routing → Accounts (section 3);
 Home's card and the Routing accounts list use the same account order and names.
 
 **Backend.** `_note()` gets plain notes for every code it can return (`timeout`: "didn't answer in time";
 `cli_error`: "reported an error when asked"; `bad_reply`: "answered in a way Khipu can't read"; `no_answer`:
 "didn't answer"), so the app never invents its own wording, and a test fails if a code has no note.
 
-Whether to keep reading a paused account's plan is a question for Matt (Open questions). The mocks keep reading
-it, because a read costs no turn and shows when the pause can end.
+A paused account's plan keeps being read (Matt, 2026-10-15): a read costs no turn and shows when the pause can
+end.
 
-### 3. Settings → Routing: an overview that folds (Matt's point 3)
+### 3. Settings → Accounts and routing: an overview that folds (Matt's point 3)
+
+The section is renamed from "Routing" to "Accounts and routing" (Matt, 2026-10-15), since Plans now lives
+here. Every link, deep link and what's-new item uses the new name.
 
 Mocks: `routing-before.html`, `routing.html`, `routing-open.html`, `routing-states.html`.
 
@@ -226,14 +231,17 @@ The page opens as an overview about one and a half screens tall at 1280 by 800 (
 | Telling conversations | "On: at the start and before each prompt" | no |
 | Checking for resets | "On: up to 3 checks after each reset" | no |
 | Job runners and lanes | "2 folders, 9 lanes" plus "1 stopped reporting" | no |
-| Routing table file | the file's name | no |
+| Old routing table file | "ROUTING-NOW.md, read only" | no |
 | Recent changes | "14 changes today" | no |
 
-- **Accounts, open.** One line per account: name, state with its dot, and a short pace ("83% of its week
-  left, resets Sat"). Opening a line shows what today's row shows (source, next check, the pace sentence,
+- **Accounts, open.** One line per account: name, state in words with its dot, what is left of the week, and
+  under it the spend pace as the app says it today ("About 1.8% an hour to use it all (a lot left, little
+  time)"); an account Khipu can't read says why it has no pace. The line is a grid: a long state such as
+  "Limit reached for five hours, back at 6:10 PM" wraps in its own column and never runs into the week figure;
+  in a narrow window the week and pace drop under the state. Opening a line shows what today's row shows (source, next check, the pace sentence,
   Check now, which also reads the plan again, Mark paused until…, Lift, Clear, the disagreement panel) and
-  the account's Plans block from section 2, so plan figures and routing state for one account are in one place. Above the lines: a sort
-  (Your priority, Back soonest, Most left, Name; default Your priority) and filter chips with counts (All,
+  the account's Plans block from section 2, so plan figures and routing state for one account are in one place. Above the lines: a "Sort by"
+  menu (Your priority, Back soonest, Most left, Spend pace fastest first, Name; default Your priority) and filter chips with counts (All,
   Needs a look, Open, At the limit, Paused). A filter that hides a problem still counts it on the chip; "Needs
   a look" is every account with a problem. "Which accounts Khipu reads" (today's accounts field under Plans)
   is the last line of the group.
@@ -243,9 +251,13 @@ The page opens as an overview about one and a half screens tall at 1280 by 800 (
 - **Recent changes, open.** Today's changes, with "Show earlier days" below; filters by who (You,
   Conversations, Job runners, Khipu) and by kind (Accounts, Rules and note, Holds, Settings).
 - Long lists inside a group (more than 8 rules, more than 8 lanes) get a search box.
+- **Old routing table file** stays, because the app still reads `ROUTING-NOW.md` (setting `routing_table`,
+  `routing_sources.py` `read_table`). Its help says plainly that it is an old file kept by hand before Khipu had
+  its own record, that Khipu reads it but never writes to it and never takes an account's state from it.
+  "NOW block" becomes "current-state section".
 
 Which groups are open, the sort and the filters are remembered on this Mac. A link from elsewhere (Home's
-"Routing settings", an attention item, a what's-new item) opens Settings → Routing with that group open and
+"Routing settings", an attention item, a what's-new item) opens Settings → Accounts and routing with that group open and
 scrolled into view.
 
 Tabs were the other design considered (Accounts, Rules, Telling, Job runners, History). Folding groups won:
@@ -267,12 +279,12 @@ New words:
 - The group's help line: "Every conversation sees these rules first, in full. Khipu can check 4 of them by
   reading your job runners' settings; if one looks broken you get a warning. Khipu never stops any work."
 - A rule Khipu checks shows a line under it with the check's result, never just a label:
-  - "Khipu checks this in your job runners' settings: nothing wrong found, checked 4 min ago."
-  - "Khipu checks this: may be broken. The lane fast-review in project-a uses a model ending in -fast." (warn
+  - "Checked by Khipu in your job runners' settings: nothing wrong found, 4 min ago."
+  - "Checked by Khipu: may be broken. The lane fast-review in project-a uses a model ending in -fast." (warn
     tone, on the rule's own row as well as on Home)
-  - "Khipu checks this, but can't yet: add a job runner folder so it has something to read." (no folder
-    added), "...but none of your job runners has a lane this rule is about yet.", or "...but the model is set
-    inside the launch script, which Khipu doesn't read."
+  - "Checked by Khipu, but not yet: add a job runner folder so it has something to read." (no folder
+    added), "Checked by Khipu, but not yet: none of your job runners has a lane this rule is about.", or
+    "Checked by Khipu, but not here: the model is set inside the launch script, which Khipu doesn't read."
 - A rule Khipu can't check shows, in grey: "Passed to every conversation as written. Khipu has no way to check
   this one."
 - A filter row above the rules: All, To confirm, Checked by Khipu, May be broken.
@@ -296,20 +308,26 @@ and tell your agents which accounts have room. It never sends or stops work; you
   leaving it as is sets no priority. One line on pace: "Khipu also works out how fast each week is being used,
   so your agents can spend what would otherwise expire."
 - The master switch "Tell my conversations about this", on (the current default).
-- "Standing rules and holds can be added later in Settings → Routing." Next continues; nothing on this step is
+- "Standing rules and holds can be added later in Settings → Accounts and routing." Next continues; nothing on this step is
   required, and Skip for now leaves everything at today's defaults.
 - "Run setup again" can open straight at this step. When Work ships, its phase adds its own line to this step
   ("Work: what each project is doing"), not a new step.
 
-**After an update: What's new, once.**
+**After an update: What's new, as a dialog and a Home card** (Matt, 2026-10-15: both, so closing one by
+accident still leaves the other).
 
 - On the first launch after an update, one dialog lists everything new since the version this Mac last showed,
-  newest first, each item one line with a Show me button that opens the exact place (Settings → Routing with
+  newest first, each item one line with a Show me button that opens the exact place (Settings → Accounts and routing with
   a group open, Settings → Capture & models, setup at the Accounts step, Home). At most five items, then "and
-  3 more in Settings → Updates". One button closes it: Got it. Show me closes it too.
+  3 more in Settings → Updates". One button closes it: Got it. Show me closes it too. The dialog says the
+  same list stays on Home.
+- The same items also appear as a "New in 0.5.0" card at the top of Home: the first three with Show me, "5 more
+  since 0.4.12" and a link to Settings → Updates, and a Close button. It stays until closed there; closing the
+  dialog does not close the card, and closing the card does not bring the dialog back.
 - An item can be marked "set it up": for routing, when this Mac has no routing record or no account read yet,
   the item's button is "Set up accounts" and opens setup at the Accounts step; otherwise it is Show me.
-- Nothing else: no badge, no dot, no reminder, no second dialog. Closing it is final for that version.
+- Nothing else: no badge, no dot, no reminder, no second dialog. Closing the dialog and the card is final for
+  that version.
 - Settings → Updates gains "What's new", every notice by version, each with its Show me, so it can be found
   again any time.
 - A fresh install shows no dialog: setup covers it, and finishing setup records the version.
@@ -335,7 +353,7 @@ Mock: `polish.html`.
 - Change what Khipu records or tells conversations, or how routing works.
 - Remove any option. Options move (Plans, commitment settings, keys) or fold, and every one stays usable.
 - Add a new kind of check for standing rules. Only the result of the four existing checks becomes visible.
-- Nag. One dialog per update, nothing else.
+- Nag. One dialog and one closable Home card per update, nothing else.
 
 ## Phases
 
@@ -431,18 +449,45 @@ Read this page and `setup-accounts.html` first. Inspect `Welcome.tsx` (`STEPS`, 
 Read this page and `whats-new.html` first. Inspect `postUpdateNotices.ts`, `PostUpdateNoticeDialog.tsx` and the
 Updates section in `App.tsx`.
 
-- Build: items per version; every item since the last shown version, at most five; Show me to any section,
+- Build: items per version; every item since the last shown version, at most five; the Home card with its
+  own closed state, stored apart from the dialog's; Show me to any section,
   group or setup step; Set up accounts when routing is not set up; the What's new list in Settings → Updates;
   this release's items (Routing, Priority and pace, the clearer Settings, the Accounts step).
 - Tests: skipping three versions lists all their items; a fresh install shows none and finishing setup records
-  the version; Got it never brings it back; each Show me lands on its place.
+  the version; Got it never brings the dialog back and leaves the card; closing the card leaves no dialog;
+  each Show me lands on its place.
 
-## Open questions for Matt
+## Decisions (Matt, 2026-10-15)
 
-1. Plans in Settings moves into Settings → Routing → Accounts, next to each account's routing state. Should the
-   section then be called "Accounts and routing" rather than "Routing"? (The mocks keep "Routing".)
-2. The new label for a watched rule: "Khipu checks this" (the mocks), or "Checked by Khipu"?
-3. When you pause an account, should Khipu keep reading its plan? A read uses no turn, and the mocks keep
-   reading so you can see when the pause can end; stopping would leave its figures going stale.
-4. What's new as a dialog on the first launch after an update (the mocks), or as a card at the top of Home that
-   stays until closed?
+1. The Settings section "Routing" is renamed "Accounts and routing".
+2. A rule Khipu checks is labelled "Checked by Khipu", not "Khipu checks this".
+3. Khipu keeps reading a paused account's plan.
+4. What's new is both a one-time dialog on the first launch after an update and a closable card on Home, so
+   closing one by accident still leaves the other; the full history stays in Settings → Updates.
+
+## Review (2026-10-15, before approval)
+
+Orchestrator review, fixed in the mocks: Claude main's long state overlapped its week figure in the folded
+Accounts list (now a grid that wraps); every readable account shows its spend pace, and "Spend pace, fastest
+first" is a sort choice; the routing table section stays because the app still reads the file, and says it is
+an old, read-only file.
+
+Better Design rules, every critical and serious finding fixed in the mocks:
+
+- rule/no-color-only-meaning: every dot sits next to words (account states, tags, rule results, job runners).
+- rule/icon-button-needs-name, rule/form-input-needs-label: the sort is a labelled "Sort by" menu; each filter
+  chip group has a label ("Show accounts", "Show rules", "Changes by", "Changes to") and each counted chip a
+  name with its count ("Paused, 1 account"); Open all groups and Close all groups say what they do.
+- rule/no-click-on-non-interactive: every fold is a button with `aria-expanded` and `aria-controls`, not a
+  `details` summary; the mocks' small `folds.js` makes them work by mouse and keyboard.
+- rule/focus-needs-visible-indicator: fold buttons get the app's focus ring (inset, so it is not clipped).
+- rule/touch-target-min-44px: group and account fold rows are at least 44 px tall; filter chips and the sort
+  menu are 32 px. The app's 26 px small buttons stay, as a desktop pointer size.
+- rule/no-skipped-heading-levels: Plans account headings (h4), the standing rules and day headings and the
+  Updates version headings (h3) sit directly under the page's h1 and are now h2.
+- Content: no em-dashes; counts are pluralised by number ("1 rule", "2 rules"); empty states name the next
+  action; no line only repeats its label.
+
+Terms replaced for someone outside the team: "NOW block" became "current-state section"; "Routing table file"
+became "Old routing table file"; "No window with a reset time ahead" became "Its plan shows no limit that
+resets"; "Khipu checks this" became "Checked by Khipu"; "Routing" became "Accounts and routing".
