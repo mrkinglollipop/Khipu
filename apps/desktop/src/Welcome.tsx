@@ -11,6 +11,7 @@ import { buildAttention, type Attention } from "./doctorAttention";
 import { LABEL as HARNESS_LABEL } from "./IntegrationsPanel";
 import type { RecallProbeStatus } from "./IntegrationsPanel";
 import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVerify";
+import { SetupAccountsStep } from "./SetupAccounts";
 import { SynthAccess, defaultSynthModel, synthModelError } from "./SynthProvider";
 
 /** `docs/plans/2026-09-05-setup-that-cannot-strand-you.md` stage ids.
@@ -43,7 +44,7 @@ export function welcomeCompleted(): boolean {
 
 export const SUPPORT_EMAIL = "support@kinglollipop.com";
 
-type StepId = "welcome" | "database" | "model" | "graph" | "agents" | "finish";
+export type StepId = "welcome" | "database" | "model" | "graph" | "agents" | "accounts" | "finish";
 type DbMode = "join" | "local" | "remote";
 
 const STEPS: { id: StepId; label: string }[] = [
@@ -52,6 +53,7 @@ const STEPS: { id: StepId; label: string }[] = [
   { id: "model", label: "Model" },
   { id: "graph", label: "Graph" },
   { id: "agents", label: "Agents" },
+  { id: "accounts", label: "Accounts" },
   { id: "finish", label: "Finish" },
 ];
 
@@ -997,18 +999,19 @@ export function Welcome({
             Khipu gives your coding agents a memory that outlives the session.
             Each agent records what happened, the database keeps it as searchable
             text and a map of what connects to what, and the next session reads it
-            back — from any of your Macs.
+            back, from any of your Macs.
           </p>
           <p className="muted">
-            Setup is six steps. Each one checks itself, so you can close this and
+            Setup is seven steps. Each one checks itself, so you can close this and
             come back; nothing here has to be finished in one go.
           </p>
           <ul className="welcome-list">
-            <li><strong>Database</strong> — join a Khipu you already have, set one up on this Mac, or connect to one you run.</li>
-            <li><strong>Model</strong> — cloud Gemini, a local model, or skip for now (recording waits, nothing is lost).</li>
-            <li><strong>Graph</strong> — installs the graph builder next to the app.</li>
-            <li><strong>Agents</strong> — one click per harness to wire in recording.</li>
-            <li><strong>Finish</strong> — a health check, and where to get help.</li>
+            <li><strong>Database</strong>: join a Khipu you already have, set one up on this Mac, or connect to one you run.</li>
+            <li><strong>Model</strong>: cloud Gemini, a local model, or skip for now (recording waits, nothing is lost).</li>
+            <li><strong>Graph</strong>: installs the graph builder next to the app.</li>
+            <li><strong>Agents</strong>: one click per harness to wire in recording.</li>
+            <li className="new-line"><strong>Accounts</strong>: see how much of each plan is left and tell your agents which accounts have room. Optional.</li>
+            <li><strong>Finish</strong>: a health check, and where to get help.</li>
           </ul>
         </>
       ) : null}
@@ -1729,6 +1732,9 @@ export function Welcome({
         </>
       ) : null}
 
+      {step === "accounts" ? (
+        <SetupAccountsStep active={step === "accounts"} onBack={() => go(-1)} onNext={() => go(1)} />
+      ) : (
       <div className="toolbar welcome-nav">
         <button type="button" onClick={() => go(-1)} disabled={idx === 0}>
           <ChevronLeft size={14} aria-hidden /> Back
@@ -1773,6 +1779,7 @@ export function Welcome({
           </button>
         )}
       </div>
+      )}
     </div>
   );
 }
