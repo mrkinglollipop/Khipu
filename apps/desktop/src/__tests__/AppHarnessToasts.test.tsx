@@ -3,7 +3,7 @@
 // whose first act is to clear that same message. Each action's result must
 // still be on screen once its reloads have settled.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
 
@@ -117,10 +117,25 @@ async function openHarnessesCard(): Promise<HTMLElement> {
   return findCard() as HTMLElement;
 }
 
-/** Waits for the action's own doctor read, then lets the toast go up. */
-async function settled(before: number) {
+const doctorAnswers = () =>
+  invokeMock.mock.calls
+    .map((c, i) => (c[0] === "run_khipu" && c[1]?.args?.[0] === "doctor" ? invokeMock.mock.results[i]?.value : null))
+    .filter((v) => v !== null);
+
+/** Waits for the action's own doctor read (whose start clears the message)
+ * and for every doctor answer so far, then for the toast, and checks it is
+ * still there once App has handled everything queued after it. Waits on
+ * those events, never on a fixed time a busy machine can overrun. */
+async function keepsToast(before: number, text: string | RegExp) {
   await waitFor(() => expect(doctorCalls()).toBeGreaterThan(before));
-  await new Promise((r) => setTimeout(r, 50));
+  await act(async () => {
+    await Promise.allSettled(doctorAnswers());
+  });
+  expect(await screen.findByText(text)).toBeInTheDocument();
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
+  expect(screen.getByText(text)).toBeInTheDocument();
 }
 
 describe("App — Harnesses toasts survive the reload that follows an action", () => {
@@ -129,10 +144,7 @@ describe("App — Harnesses toasts survive the reload that follows an action", (
     const card = await openHarnessesCard();
     const before = doctorCalls();
     fireEvent.click(within(card).getByRole("button", { name: "Install Khipu in T3 · Secondary" }));
-    await settled(before);
-    expect(
-      screen.getByText("Installed in T3 · Secondary. Restart its sessions to load it; Verify on the card checks it."),
-    ).toBeInTheDocument();
+    await keepsToast(before, "Installed in T3 · Secondary. Restart its sessions to load it; Verify on the card checks it.");
   });
 
   it("keeps the card-level Install's failed-verify result", async () => {
@@ -143,8 +155,7 @@ describe("App — Harnesses toasts survive the reload that follows an action", (
     const card = await openHarnessesCard();
     const before = doctorCalls();
     fireEvent.click(within(card).getByRole("button", { name: /^(Install|Reinstall)$/ }));
-    await settled(before);
-    expect(screen.getByText(/Installed; verify failed: claude_code hook: Stop hook not found/)).toBeInTheDocument();
+    await keepsToast(before, /Installed; verify failed: claude_code hook: Stop hook not found/);
   });
 
   it("keeps a Remove's hooks-kept result", async () => {
@@ -156,8 +167,7 @@ describe("App — Harnesses toasts survive the reload that follows an action", (
     const before = doctorCalls();
     fireEvent.click(within(card).getByRole("button", { name: "Remove Khipu from Default" }));
     fireEvent.click(within(await screen.findByRole("dialog", { name: "Remove Khipu from Default?" })).getByRole("button", { name: "Remove Khipu" }));
-    await settled(before);
-    expect(screen.getByText(/hooks were kept \(still used by T3 · Secondary\)/)).toBeInTheDocument();
+    await keepsToast(before, /hooks were kept \(still used by T3 · Secondary\)/);
   });
 
   it("keeps the doctor's own failure next to the action's result", async () => {
@@ -165,9 +175,6 @@ describe("App — Harnesses toasts survive the reload that follows an action", (
     const card = await openHarnessesCard();
     const before = doctorCalls();
     fireEvent.click(within(card).getByRole("button", { name: "Install Khipu in T3 · Secondary" }));
-    await settled(before);
-    expect(
-      screen.getByText(/^Installed in T3 · Secondary\..*The health check then failed: Error: hub unreachable$/),
-    ).toBeInTheDocument();
+    await keepsToast(before, /^Installed in T3 · Secondary\..*The health check then failed: Error: hub unreachable$/);
   });
 });

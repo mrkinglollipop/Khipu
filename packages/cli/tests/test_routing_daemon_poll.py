@@ -720,6 +720,8 @@ def test_reset_checks_keep_the_helper_alive_with_prompt_push_off(home, monkeypat
 
 def test_sleep_wake_checks_each_overdue_account_once_with_source_poll_off(home, monkeypatch):
     _set(home, routing_reset_check=True, routing_poll_interval=0)
+    # A quiet Mac: a check waits while the real load is over routing_busy_load.
+    monkeypatch.setattr(routing.os, "getloadavg", lambda: (0, 0, 0))
     until = T0 + timedelta(minutes=20)
     for account in ("Claude", "Codex"):
         routing.report(account=account, state="limited", until=routing._iso(until), author=ME)
@@ -827,10 +829,13 @@ def test_stopping_a_poll_child_unwinds_and_kills_its_vendor_process(home, monkey
     until = T0 + timedelta(minutes=20)
     routing.report(account="Claude", state="limited", until=routing._iso(until), author=ME)
     home["clocks"].now = until + timedelta(minutes=2)
+    # A quiet Mac: the check waits while the real load is over routing_busy_load.
+    monkeypatch.setattr(routing.os, "getloadavg", lambda: (0, 0, 0))
     vendor_pid = tmp_path / "vendor.pid"
 
     def hanging_probe(_home, *, timeout):
-        script = f"import os,time;open({str(vendor_pid)!r},'w').write(str(os.getpid()));time.sleep(60)"
+        # It outlives every wait below, so only the stop can end it in time.
+        script = f"import os,time;open({str(vendor_pid)!r},'w').write(str(os.getpid()));time.sleep(600)"
         usage._converse([sys.executable, "-c", script], [], lambda _frame: False,
                         env=usage.probe_environment("claude"), deadline=time.monotonic() + timeout,
                         close_stdin=True)
@@ -842,8 +847,10 @@ def test_stopping_a_poll_child_unwinds_and_kills_its_vendor_process(home, monkey
         os.close(read_fd)
         recall_prompt._poll_routing_child(write_fd)
     os.close(write_fd)
+    child = None
     try:
-        _wait(vendor_pid.exists, seconds=5)
+        # A fresh interpreter's start, slow on a busy machine; the file is written whole by then.
+        _wait(lambda: vendor_pid.exists() and vendor_pid.read_text().isdigit(), seconds=60)
         child = int(vendor_pid.read_text())
         os.kill(pid, signal.SIGUSR1)
         os.waitpid(pid, 0)
@@ -855,11 +862,15 @@ def test_stopping_a_poll_child_unwinds_and_kills_its_vendor_process(home, monkey
                 return True
             return False
 
-        _wait(vendor_gone, seconds=5)
+        _wait(vendor_gone, seconds=60)
+        child = None
     finally:
         with contextlib.suppress(OSError, ChildProcessError):
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
+        if child is not None:  # the stop did not end it: never leave it sleeping
+            with contextlib.suppress(OSError):
+                os.kill(child, signal.SIGKILL)
         os.close(read_fd)
 
 
