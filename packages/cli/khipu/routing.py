@@ -3894,22 +3894,35 @@ def rule_pointer(rule: dict) -> str:
 
 
 PRIORITY_POINTER = "Your priority was set by a conversation at the owner's request; " + _TOO_LONG
+OWNER_PRIORITY_POINTER = "Your priority is too long to show here: read it with `khipu_route`."
+_TOO_LONG_SHORT = "Some lines are too long to show here: read them with `khipu_route`."
 
 
-def _fit_theirs(items: list[tuple[str, str]], limit: int) -> tuple[list[str], int]:
+def _ended_words(n: int) -> str:
+    """How many priority entries ended, in fixed words: a pointer never
+    lists their labels, so it stays the same size however many end."""
+    return "One priority entry ended." if n == 1 else f"{n} priority entries ended."
+
+
+def _fit_theirs(items: list[tuple[str, str]], limit: int, room: int | None = None) -> tuple[list[str], int]:
     """Conversation-written lines (a pending rule or priority) against a
-    size budget, in order: each whole when it fits in what is left of half
-    of ``limit`` (the other half stays for the account lines), never
-    clipped. One fixed line stands, in the place of the first, for those
-    that don't fit: its own pointer when it is one, else how many. Returns
-    one entry per item ("" for the others the fixed line covers) and the
+    size budget, in order: each whole when it fits in what is left of
+    ``room`` (half of ``limit`` unless given; the rest stays for the account
+    lines), never clipped. One fixed line stands, in the place of the first,
+    for those that don't fit: its own pointer when it is one, else how many,
+    else a shorter one, each only when it fits ``room`` too. Returns one
+    entry per item ("" for the others the fixed line covers) and the
     characters they take. ``limit`` 0: no limit."""
-    room = limit // 2
+    room = limit // 2 if room is None else room
+    # Whole lines leave room for the shortest fixed line unless all of them
+    # fit, so a line that doesn't fit is never left out without a word.
+    whole = sum(len(line) + 1 for line, _pointer in items)
+    keep = 0 if not limit or whole <= room else len(_TOO_LONG_SHORT) + 1
     out: list[str] = []
     used = 0
     missed: list[int] = []
     for i, (line, _pointer) in enumerate(items):
-        if not limit or used + len(line) + 1 <= room:
+        if not limit or used + len(line) + 1 + keep <= room:
             out.append(line)
             used += len(line) + 1
         else:
@@ -3917,10 +3930,11 @@ def _fit_theirs(items: list[tuple[str, str]], limit: int) -> tuple[list[str], in
             missed.append(i)
     if missed:
         first = missed[0]
-        out[first] = items[first][1] if len(missed) == 1 else (
+        ladder = ([items[first][1]] if len(missed) == 1 else [
             f"{len(missed)} unconfirmed changes a conversation made at the owner's request are too long to show "
-            "here: read them with `khipu_route`.")
-        used += len(out[first]) + 1
+            "here: read them with `khipu_route`."]) + [_TOO_LONG_SHORT]
+        out[first] = next((line for line in ladder if used + len(line) + 1 <= room), "")
+        used += len(out[first]) + 1 if out[first] else 0
     return out, used
 
 
@@ -5234,33 +5248,89 @@ def _not_refreshed(view: dict, now: datetime, cfg: dict) -> str | None:
     return None
 
 
+# Whose a push's head line is: the owner's standing rules and note are whole
+# and outside the budget ("rules and note aside"); a conversation's words
+# share half of it (``_fit_theirs``); the owner's priority takes what is
+# left: whole, else without Khipu's facts (they repeat the account lines),
+# else a fixed pointer.
+OWNERS, THEIRS, PRIORITY = "owner", "theirs", "priority"
+
+
 def _priority_push(view: dict, now: datetime, *, changed: bool = False,
-                   changed_lines: dict | None = None) -> list[tuple[str, str | None]]:
-    """The priority's line in a change push, whole and before the account
-    lines: in every push while a priority is set (with what Khipu read about
-    each account), and its end when it changed to none. Each comes with its
-    pointer when a conversation wrote it (``_fit_theirs``), else None."""
+                   changed_lines: dict | None = None) -> list[tuple[str, str | tuple[str, ...], str]]:
+    """The priority's line in a change push, before the account lines, as
+    (line, fallback, whose): in every push while a priority is set (with what
+    Khipu read about each account), and its end when it changed to none. A
+    conversation's has one pointer; the owner's has the line without the
+    facts, then a pointer. A pointer is fixed words of a bounded size,
+    however many entries ended."""
+    ended = len(view.get("priority_ended") or []) if changed else 0
+    lead = [_ended_words(ended)] if ended else []
     if view.get("priority"):
         facts = plan_facts(view, now)
         line = priority_change_line(view, now, facts=facts) if changed else \
             priority_line(view["priority"], now, view=view, facts=facts)
         if not view["priority"].get("pending"):
-            return [(line, None)]
-        ended = [f"Priority on {label} ended." for label in view.get("priority_ended") or []] if changed else []
-        return [(line, " ".join([*ended, PRIORITY_POINTER]))]
+            plain = priority_change_line(view, now) if changed else priority_line(view["priority"], now)
+            return [(line, (plain, " ".join([*lead, OWNER_PRIORITY_POINTER])), PRIORITY)]
+        return [(line, " ".join([*lead, PRIORITY_POINTER]), THEIRS)]
     if changed and changed_lines is not None:
-        return [(line, None) for e, line in zip(changed_lines["entities"], changed_lines["lines"]) if e == "priority"]
+        return [(line, (" ".join([*lead, "No priority set."]),), PRIORITY)
+                for e, line in zip(changed_lines["entities"], changed_lines["lines"]) if e == "priority"]
     return []
 
 
-def _head_lines(items: list[tuple[str, str | None]], limit: int) -> tuple[list[str], int]:
-    """The lines before a push's other lines: the owner's whole (pointer
-    None), a conversation's fitted to ``limit`` (``_fit_theirs``). Returns
-    them and the characters the conversation's take."""
-    fitted, used = _fit_theirs([(line, pointer) for line, pointer in items if pointer is not None], limit)
-    chosen = iter(fitted)
-    shown = [line if pointer is None else next(chosen) for line, pointer in items]
-    return [line for line in shown if line], used
+def _fit_push(head: list[tuple[str, str | tuple[str, ...] | None, str]], others: list[str], limit: int, *,
+              stale: str | None = None, overflow=None) -> list[str]:
+    """Every budgeted part of a push against ``limit`` together, so no
+    combination exceeds it: the not-refreshed line, a conversation's words
+    (at most half, ``_fit_theirs``), the owner's priority (whole, else
+    without the facts, else its pointer), the other lines dropped whole from
+    the bottom, and ``overflow(n)`` naming how many were dropped. A part that can't fit even as its
+    pointer is left out. The owner's rules and note (``OWNERS``) are whole
+    and outside the budget. ``limit`` 0: no limit."""
+    def fits(n: int) -> bool:
+        return not limit or used + n + 1 <= limit
+
+    used = 0
+    top: list[str] = []
+    if stale and fits(len(stale)):
+        top.append(stale)
+        used += len(stale) + 1
+    theirs = [(line, pointer) for line, pointer, whose in head if whose == THEIRS]
+    fitted, taken = _fit_theirs(theirs, limit, room=min(limit // 2, limit - used))
+    used += taken
+    # Room kept before the owner's priority takes the rest: the first other
+    # line (an account changing state is news) and the overflow line.
+    tail = len(overflow(len(others))) + 1 if others and overflow and limit else 0
+    first = len(others[0]) + 1 + (tail if len(others) > 1 else 0) if others and limit else 0
+    chosen: dict[int, str] = {}
+    for i, (line, fallback, whose) in enumerate(head):
+        if whose != PRIORITY:
+            continue
+        ladder = [(x, keep) for keep in (first, tail, 0) for x in (line, *fallback)]
+        pick = next((x for x, keep in ladder if fits(len(x) + keep)), "")
+        chosen[i] = pick
+        used += len(pick) + 1 if pick else 0
+    theirs_left = iter(fitted)
+    for i, (line, _pointer, whose) in enumerate(head):
+        shown = line if whose == OWNERS else next(theirs_left) if whose == THEIRS else chosen[i]
+        if shown:
+            top.append(shown)
+    kept = list(others)
+    if limit:
+        while kept:
+            dropped = len(others) - len(kept)
+            size = sum(len(line) + 1 for line in kept) + (len(overflow(dropped)) + 1 if dropped else 0)
+            if used + size <= limit:
+                break
+            kept.pop()
+    top += kept
+    if len(kept) < len(others) and overflow:
+        line = overflow(len(others) - len(kept))
+        if fits(len(line) + sum(len(x) + 1 for x in kept)):
+            top.append(line)
+    return top
 
 
 def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = None,
@@ -5272,8 +5342,6 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
     block ends with how many, and where to read them."""
     cfg = cfg or settings()
     lines = [CHANGES_HEADING.format(at=_clock(now, now))]
-    if stale:
-        lines.append(stale)
     width, limit = cfg["routing_line_chars"], cfg["routing_prompt_chars"]
     ranked = sorted(((_change_group(e, view), i, line) for i, (e, line)
                      in enumerate(zip(changed["entities"], changed["lines"]))), key=lambda t: (t[0], t[1]))
@@ -5281,35 +5349,22 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
     pending = {f"rule:{r['n']}": r for r in view.get("rules") or [] if r.get("pending")}
     # Pending conversation requests remain explicit in every change push
     # until their owner resolves them, even when this version changes an
-    # unrelated account. Their words count against the budget; the owner's
-    # are whole and outside it.
-    head: list[tuple[str, str | None]] = [(rule_line(r), rule_pointer(r)) for e, r in pending.items()
-                                          if e not in changed_rules]
+    # unrelated account. Every part but the owner's rules and note counts
+    # against the budget, together (``_fit_push``).
+    head: list[tuple[str, str | None, str]] = [(rule_line(r), rule_pointer(r), THEIRS)
+                                               for e, r in pending.items() if e not in changed_rules]
     for group, e, line in ranked:
         entity = changed["entities"][e]
         if group == 0 and entity != "priority":
-            head.append((line, "Standing rule " + rule_pointer(pending[entity]) if entity in pending else None))
+            head.append((line, "Standing rule " + rule_pointer(pending[entity]), THEIRS) if entity in pending
+                        else (line, None, OWNERS))
     head += _priority_push(view, now, changed="priority" in changed["entities"], changed_lines=changed)
-    shown, theirs_chars = _head_lines(head, limit)
-    lines += shown
-    if limit:
-        limit = max(1, limit - theirs_chars)
     others = [_clip(line, width) for group, _, line in ranked if group != 0]
 
     def overflow(n: int) -> str:
         return f"{n} more change{'s' if n != 1 else ''}: `khipu_route` since {changed['since']}"
 
-    kept = list(others)
-    if limit:
-        while kept:
-            dropped = len(others) - len(kept)
-            size = sum(len(line) + 1 for line in kept) + (len(overflow(dropped)) + 1 if dropped else 0)
-            if size <= limit:
-                break
-            kept.pop()
-    lines += kept
-    if len(kept) < len(others):
-        lines.append(overflow(len(others) - len(kept)))
+    lines += _fit_push(head, others, limit, stale=stale, overflow=overflow)
     return "\n".join(lines), len(changed["entities"])
 
 
@@ -5340,10 +5395,10 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
         said = stale is not None and marker.get("unrefreshed") == view.get("checked_at")
         if seen == view["version"]:
             if stale and not said:
-                # Nothing changed, but the record has not been refreshed past its bound: one line, once.
-                head = [(rule_line(r), rule_pointer(r)) for r in view.get("rules") or [] if r.get("pending")]
-                shown, _used = _head_lines(head + _priority_push(view, now), cfg["routing_prompt_chars"])
-                text = "\n".join([CHANGES_HEADING.format(at=_clock(now, now)), *shown, stale])
+                # Nothing changed, but the record has not been refreshed past its bound: one line, once,
+                # under the same budget as any change push.
+                nothing = {"entities": [], "lines": [], "since": seen}
+                text, _count = changes_text(nothing, view, now, cfg, stale=stale)
                 return dict(base, kind="changes", text=text, count=0, unrefreshed=view.get("checked_at"))
             return dict(base, kind="none", text=None, count=0)
         changed = since(seen, view, now=now, epoch=marker.get("epoch"))

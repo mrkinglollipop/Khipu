@@ -688,6 +688,115 @@ def test_many_conversation_requests_take_at_most_half_the_budget(home):
     assert "unconfirmed changes a conversation made" in summary and any(x.startswith("Codex") for x in summary.splitlines())
 
 
+def _many_accounts(home, n: int) -> list[str]:
+    labels = [f"Account {i}" for i in range(n)]
+    _set(home, usage_accounts=[{"label": label, "harness": "codex", "home": f"/logins/account-{i}"}
+                               for i, label in enumerate(labels)])
+    return labels
+
+
+def _push_body(text: str) -> str:
+    return text.split("\n", 1)[1] if "\n" in text else ""
+
+
+def test_expired_entries_and_a_long_role_fit_the_push_budget(home):
+    # Eleven entries end at once and the one left has a long role: the
+    # announcements and the pointer together still fit the budget.
+    labels = _many_accounts(home, 12)
+    routing.request_priority([{"account": label, "until": "1h"} for label in labels[:-1]]
+                             + [{"account": labels[-1], "role": "R" * 2000}],
+                             owner_request="the owner asked", author=ME)
+    before = routing.read_view()
+    home["clock"].advance(hours=2)
+    view = routing.read_view()
+    assert len(view["priority_ended"]) == 11
+    changed = routing.since(before["version"], view, now=home["clock"].now)
+    text, _count = routing.changes_text(changed, view, home["clock"].now)
+    body = _push_body(text)
+    assert len(body) <= 400, body
+    assert "R" * 2000 not in body and "khipu_route" in body
+
+
+def test_the_owners_priority_and_its_ends_fit_the_push_budget(home):
+    labels = _many_accounts(home, 12)
+    routing.set_priority([{"account": label, "role": "work " * 20, "until": "1h"} for label in labels[:-1]]
+                         + [{"account": labels[-1], "role": "work " * 20}], via="app")
+    before = routing.read_view()
+    home["clock"].advance(hours=2)
+    view = routing.read_view()
+    changed = routing.since(before["version"], view, now=home["clock"].now)
+    body = _push_body(routing.changes_text(changed, view, home["clock"].now)[0])
+    assert len(body) <= 400, body
+    assert "khipu_route" in body
+    # Every entry ends: the announcements alone would not fit either.
+    home["clock"].advance(days=30)
+    routing.clear_priority(via="app")
+    last = routing.read_view()
+    changed = routing.since(view["version"], last, now=home["clock"].now)
+    body = _push_body(routing.changes_text(changed, last, home["clock"].now)[0])
+    assert len(body) <= 400, body
+
+
+@pytest.mark.parametrize("sizes", [(300, 300, 135, 900), (700, 49, 900), (740, 900), (100,) * 7 + (900,)])
+def test_a_request_that_does_not_fit_always_leaves_a_pointer(sizes):
+    # Whole lines may not take the room the fixed line needs: a request that
+    # doesn't fit is never dropped without a word.
+    items = [(chr(97 + i) * n, "P" * 60) for i, n in enumerate(sizes)]
+    out, used = routing._fit_theirs(items, 1500)
+    assert used <= 750
+    missed = [i for i, (line, _p) in enumerate(items) if out[i] != line]
+    assert missed
+    shown = out[missed[0]]
+    assert shown in ("P" * 60, routing._TOO_LONG_SHORT) or "unconfirmed changes" in shown, out
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_no_combination_of_push_parts_exceeds_the_budget(home, seed):
+    # Property-style: the owner's priority or a conversation's, short or long
+    # roles, entries that end, pending rule requests, changed accounts, the
+    # not-refreshed line and the overflow pointer, against budgets from tiny
+    # to large. The body (all but the heading) never exceeds the budget; the
+    # owner's standing rules and note are the only lines outside it, and
+    # this test sets none.
+    import random
+
+    rnd = random.Random(seed)
+    limit = rnd.choice([60, 120, 200, 300, 400, 700])
+    _set(home, routing_prompt_chars=limit, routing_line_chars=rnd.choice([80, 200]))
+    labels = _many_accounts(home, rnd.randint(1, 14))
+    start = routing.read_view()
+    entries = []
+    for label in rnd.sample(labels, rnd.randint(1, len(labels))):
+        entry = {"account": label, "role": rnd.choice(["", "builds", "w " * rnd.randint(10, 1200)])}
+        if rnd.random() < 0.6:
+            entry["until"] = "1h"
+        entries.append({k: v for k, v in entry.items() if v})
+    who = rnd.choice(["owner", "conversation", "none"])
+    if who == "owner":
+        routing.set_priority(entries, via="app")
+    elif who == "conversation":
+        routing.request_priority(entries, owner_request="the owner asked", author=ME)
+    for i in range(rnd.randint(0, 6)):
+        routing.request_rule(f"rule {i} " + "x" * rnd.choice([5, 150, 900]), owner_request="the owner asked",
+                             author=dict(ME, session=f"s-{seed}-{i}"))
+    for label in rnd.sample(labels, rnd.randint(0, len(labels))):
+        routing.report(state="limited", account=label, until="3h", author=OTHER)
+    first = routing.read_view()
+    stale = "Khipu's record has not been refreshed since 13:00Z." if rnd.random() < 0.5 else None
+    for _ in range(2):
+        for view, since_version in ((first, start["version"]),):
+            changed = routing.since(since_version, view, now=home["clock"].now)
+            text, _count = routing.changes_text(changed, view, home["clock"].now, stale=stale)
+            body = _push_body(text)
+            assert len(body) <= limit, (limit, body)
+        home["clock"].advance(hours=2)
+        later = routing.read_view()
+        changed = routing.since(first["version"], later, now=home["clock"].now)
+        body = _push_body(routing.changes_text(changed, later, home["clock"].now, stale=stale)[0])
+        assert len(body) <= limit, (limit, body)
+        first = later
+
+
 def test_an_unstamped_owner_line_is_unchecked_whatever_its_via_or_seq(home, capsys):
     from khipu import cli
 
