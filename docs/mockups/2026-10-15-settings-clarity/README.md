@@ -60,7 +60,9 @@ Phase 9 (addendum, finding and adding accounts; mock-only layout in `add-account
   couldn't be checked, a missing login folder, signed out with earlier figures, a plan that changed after
   signing in again, newly tracked and not ranked, a CLI Khipu can't run, nothing installed, the Grok sign-in
   code and no code, rename with what is and isn't updated, stopping the last account, no accounts tracked,
-  Looking…, and setup with a signed-out default login and with nothing installed.
+  Looking…, and setup with a signed-out default login and with nothing installed. After the Codex review: Set
+  the Node folder… and Choose the CLI… (no terminal step), the CLI settings rows, a lane whose account name is
+  ambiguous, and Forget which logins conversations used.
 
 Decisions in the mock:
 

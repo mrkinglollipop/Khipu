@@ -530,6 +530,17 @@ Taken in this scope (conventional defaults, reversible; say if any should change
    The lane map moves from labels to keys (see Rename) so a rename breaks nothing structured.
 8. **A failed check is never "not signed in".** It is "couldn't check" with its reason, never offered, never
    turned down, retried later.
+9. **Agents get a public projection, never raw rows.** `khipu_usage`, `khipu_route` and any listing of accounts
+   go through one projection that keeps the name, account id, plan, windows, state and a plain note, and drops
+   `home` and every path (Agents' view).
+10. **The CLI and its Node folder can be set in the app.** Two new per-Mac settings, `cli_path.<cli>` and
+    `node_folder`, read by `synth_cli.binary` after `KHIPU_<NAME>_CLI` and added to the probe PATH by
+    `usage._probe_path`, so a CLI the app can't start is repaired without a terminal (Section 1).
+11. **Moving a login folder moves everything keyed to it,** reports and evidence included, and leaves a
+    forwarding entry so nothing is counted twice (Section 7).
+
+Review history: a twelve-stage review (`dd33e77`) and an independent Codex review of it (11 findings, all
+confirmed against the code on 2026-10-15) are folded into the text below.
 
 ### Today
 
@@ -564,8 +575,13 @@ No Grok or Muse docs beyond `--help` were checked. A device-code sign-in prints 
 - **Rule 6 is amended for phase 9:** besides what's new after an update, the app may show the Found card and
   the automatic-tracking card on Home. A find is not a rule-1 problem: no rail or Settings tab badge and no
   Needs you line; "2 found" is a neutral tag on the Accounts group's closed line only.
-- **Never read inside a login folder.** Discovery lists names in the home folder, stats a folder itself, and
-  asks the CLI. Nothing opens, lists or reads a file inside a login folder.
+- **Never read inside a login folder.** Discovery, `--try` and sign-in list names in the home folder, stat a
+  folder itself, and ask the CLI. Nothing they run opens, lists or reads a file inside a login folder. Two reads
+  inside login folders exist today and are named, not hidden: the capture hook reads the transcripts it saves
+  (its job), and Codex's plan read falls back to the last `rate_limits` in its newest session files
+  (`usage.py:691`, `codex_rollout`, which scans `<CODEX_HOME>/sessions` and reads the tail of up to five
+  files). That fallback is switched off for discovery and `--try` (fix now, 9A); whether tracked accounts keep
+  it is open question 9.
 - **Never prompt.** No discovery or check can start a login or any command that waits for a person (see
   Discovery, "How a prompt is made impossible").
 - **Login-folder paths stay with the owner.** They show in the app; they are never returned by `khipu_get`,
@@ -588,15 +604,24 @@ opens: each CLI's default login and every other signed-in folder, as in `add-acc
   lists all four CLIs as not installed with Next off.
 - **Installed, but Khipu can't run it:** a third state beside installed and not installed, decided by running
   `<cli> --version` with `probe_environment`'s environment and PATH (the same call that supplies the version).
-  It shows where Khipu found the CLI and one next step: "Khipu found Codex at <path> but can't start it. Open
-  it once in a terminal app to finish its install, or choose the CLI…". Never "not signed in", never a
-  generic read failure.
+  It shows where Khipu found the CLI and the in-app fixes, never a terminal step (decision 10):
+  - **Set the Node folder…** when the CLI is a Node script whose `node` Khipu can't find (the usual cause under
+    launchd's bare PATH): a folder picker that opens at the version manager's folder and accepts only a folder
+    holding an executable `node`; saved as `node_folder` and added to the probe PATH.
+  - **Choose the CLI…** when Khipu found the wrong file or none: a file picker that accepts only an executable
+    file; saved as `cli_path.<cli>`.
+  - **Check again** re-runs `<cli> --version` with the new settings and says what changed.
+  Both settings show in Settings → Accounts and routing → Accounts under the CLI's name, with Clear. A CLI
+  whose own install is broken (its files are missing) is the one case Khipu can't repair: it says "Codex's
+  install looks incomplete; reinstall it from its maker" and links the maker's page when one is verified (open
+  question 10). Never "not signed in", never a generic read failure.
 - **CLIs under a Node version manager.** The app starts under launchd's bare PATH, so finding the CLI depends
   on `synth_cli.binary`'s list. The build adds the install places it can verify that the list misses: fnm's
   `~/Library/Application Support/fnm/node-versions/*/installation/bin` and `~/.fnm/node-versions/*/installation/bin`,
   and Claude Code's `~/.claude/local/claude`. nvm resolves to the newest Node folder holding the CLI, not
-  `nvm alias default`; the scope accepts that. For any install still missed, step 1 offers **Choose the CLI…**,
-  a file picker that saves the path the way `KHIPU_<NAME>_CLI` does.
+  `nvm alias default`; the scope accepts that, and Set the Node folder… overrides it. For any install still
+  missed, step 1 offers **Choose the CLI…** (above). Today only the `KHIPU_<NAME>_CLI` environment variable
+  can name a CLI (`synth_cli.py:137`), which the app can't set for itself; the two settings close that.
 - **Download links:** the app names the CLI and links only to a download page verified at build time and
   checked into the code (Claude Code and Codex); for Grok Build and Muse it names the CLI and shows no link
   until a page is verified.
@@ -665,8 +690,10 @@ check uses a turn or a paid call; checks reach the network the same way today's 
 **How a prompt is made impossible** (the class behind a past `muse login` started by accident while listing
 folders): discovery builds an argv only by lookup in `STATUS_ARGV` or the existing probe argv, never from text;
 every child gets `stdin=DEVNULL`, `start_new_session=True` (no controlling terminal), the `probe_environment`
-allowlist, a fresh temp cwd and a kill of its whole process group at its deadline. Tests fail if any discovery
-argv holds `login`, `logout` or a verb outside the table, and a fake CLI that opens `/dev/tty` or reads stdin is
+allowlist, a fresh temp cwd and a kill of its whole process group at its deadline. Tests assert that every
+discovery argv equals one exact allowed tuple (`(claude, "auth", "status", "--json")`, `(codex, "login",
+"status")`, `probe_grok`'s and `probe_muse`'s fixed argv), so `codex login status` passes and a bare
+`codex login`, `muse login` or any added argument fails, and a fake CLI that opens `/dev/tty` or reads stdin is
 killed and classified, never left waiting.
 
 **When it runs and what it costs:** at app start, every 6 hours while the app is open, when Accounts and routing
@@ -674,10 +701,14 @@ or setup's step opens, and from Look for accounts now. Never while a sign-in is 
 across processes (its own lock, `usage.discover.lock`, `flock LOCK_NB`; a second trigger gets the last result
 marked "Looking…"); discovery and the plan refresh do not wait on each other. At most 12 folders a run, at most
 2 children at a time, 5 seconds per child, under an overall deadline as `probe_all` has (timeout plus
-`OVERALL_GRACE_S`, `kill_all`). Order: folders used by conversations first, then newest first seen; the rest wait
-for the next run, and the run says how many were left. A folder already tracked or turned down is never
-checked; one that is not signed in or couldn't be checked is checked again at most once a day, or on Look for
-accounts now. Discovery never writes the usage cache for an unsaved folder.
+`OVERALL_GRACE_S`, `kill_all`). Order: folders used by conversations first, then newest first seen, then least recently
+checked; the rest wait for the next run, and the run says how many were left. A folder already tracked or
+turned down is never checked. An undecided folder that was signed in at its last check is not checked again for
+24 hours (its Found row keeps that result and its time); one that is not signed in or couldn't be checked is
+checked again at most once a day; Look for accounts now ignores both waits. So every candidate is checked
+within ceil(candidates / 12) runs, and no group of twelve can take every run. Test: with 30 undecided signed-in
+folders, every folder is checked within three runs, and a folder first seen after them is checked by the run
+after it appears. Discovery never writes the usage cache for an unsaved folder.
 
 **What it keeps** (per Mac, in Khipu's own data, never the routing record): each candidate's CLI, path, path
 identity, first seen, last checked, last result and conversations in the last 7 days (counted from
@@ -755,11 +786,17 @@ F`): it accepts only a folder Khipu itself created for this attempt, under the h
 `~/.<cli>-<slug>`. Rust builds the argv from the CLI enum and the folder Khipu returned at creation, never from
 webview text. The existing Sign in again path and its refusal tests stay as they are.
 
-**Start, status, cancel.** Sign-in becomes three calls: start returns at once with an attempt id and records
-pid, process group, folder and start time in Khipu's state; status reads it; cancel kills the process group (as
-`_killpg` does). One sign-in at a time. If the dialog closes or the app quits, Khipu kills the attempt's process
-group on the next start and on quit; until then the login may still finish and write into the folder, which
-the next check then sees. "Open the sign-in page again" is replaced by **Start again** (kill, then start), since
+**Start, status, cancel.** Sign-in becomes three calls: start returns at once with an attempt id; status reads
+it; cancel ends it. One sign-in at a time, owned atomically: start takes an exclusive lock
+(`usage.sign_in.lock`, `flock LOCK_NB`) and writes the attempt record with a temp file and rename, so two
+starts can never both own an attempt. The record holds the attempt id, folder, pid, process group, the
+process's own start time and its argv as the system reports them (`ps -o lstart=,command= -p <pid>` or
+`proc_pidinfo`), and Khipu's own start time. **Before any kill** (cancel, Start again, the reaper), Khipu reads
+the live process's start time and argv again and kills the group only if both match the record and the argv is
+one of the fixed sign-in tuples; otherwise the record is stale (the process ended and its number may now
+belong to something else), and Khipu deletes the record without killing anything. The reaper runs on the next
+start and on quit; until then the login may still finish and write into the folder, which the next check then
+sees. "Open the sign-in page again" is replaced by **Start again** (kill, then start), since
 nothing reads a Claude or Codex login's output.
 
 **Claude and Codex:** the browser opens; the dialog waits up to 15 minutes ("Waiting for you to finish signing in
@@ -799,13 +836,25 @@ that a second `CODEX_HOME` keeps its own sign-in; if not, Codex gets only Use a 
   sign-in note.
 - **Folder moved or renamed:** when a tracked account's folder is gone and discovery finds an untracked folder
   for the same CLI, its Found row asks "Is this Claude work, moved?". Yes re-keys the account to the new folder
-  and carries its pause, clear, hold, priority entry and lane-map entries to the new key in one owner write. No
-  tracks it as new and says the old account's records stay until removed.
+  in one owner write that carries everything keyed to the old key: pause, clear, holds, priority entry,
+  lane-map entries, and also the conversation reports and limit evidence (`routing.py` filters evidence by
+  `_evidence_account(...) == key`, about line 3466, and folds reports per key). The record keeps a forwarding
+  entry `old key → new key`, so reports and evidence written later under the old key (a conversation still
+  running from the old path) fold into the new account instead of making a second one; Recent changes keeps
+  its old lines and adds "Claude work's login folder moved to ~/.claude-office". The usage cache row moves too.
+  No tracks it as new and says the old account's records stay until removed. Test: move an account that is at
+  its limit with a pause and a report; after the move it is still at its limit and paused, one account shows
+  in the view and the push, and a report under the old key lands on the new account.
 - **Paused accounts** keep having their plans read (phase 2 decision).
 - **Rename everywhere:** structured places (Plans, account rows, a hold's scope label, the priority list, the
   routing block, `khipu_route`) show the new name from the next fold. `routing_lane_map` stores the account
-  key from 9B on (existing label values are converted once, by the same match routing uses today), so lanes
-  keep working; the rename dialog says how many lanes point at it. Free text (standing rules, the note, hold
+  key from 9B on, so lanes keep working. The one-time conversion of existing label values does not use today's
+  first-match resolver (`routing.resolve_account`, `routing.py:879`, returns the first account whose label
+  matches, and a hand-edited list can hold two accounts with the same label): a label that matches exactly one
+  account is converted; a label that matches two or more, or none, is left as it is and shown in Job runners and
+  lanes as "Lane review-2 names Claude, which two accounts are called; choose one" with a chooser, and counts as
+  a rule-1 problem until chosen. Test: two accounts labelled "Same", a lane naming "Same": nothing converted,
+  the repair shows, evidence for that lane attaches to neither until chosen; the rename dialog says how many lanes point at it. Free text (standing rules, the note, hold
   reasons, conversation reports, past Recent changes lines) keeps the old name and is not rewritten; the
   rename dialog lists the rules and note that mention the old name with a link to edit each (open question 2).
   The rename is one Recent changes line and the push's change line "Claude client is now called Claude work".
@@ -862,9 +911,17 @@ sign-in; folders Khipu created stay.
 | Not offered again | its own file in Khipu's data | Offer again; deleting Khipu's data |
 | Automatic-tracking switch, Found card closed | `config.json` / Khipu's data, per Mac | the switch; deleting Khipu's data |
 | Candidates, counts, last run | Khipu's data | pruned when a folder is gone; deleting Khipu's data |
-| Login path per session | session state files | session state pruning, as today |
+| Login path per session | session state files (`session_capture`; never pruned today, `session_capture.py:119`) | the new retention below |
 | Plan read cache | `state/usage.json`, keyed `harness|home` | Stop tracking (that row); deleting Khipu's data |
 | Folders Khipu made | Khipu's data (the list), the folder itself on disk | never removed once signed in |
+
+**Login paths in session state:** session state files are never pruned today, so the path would be kept
+forever. 9A adds retention for the new field only: the path is cleared from a session's state 30 days after its
+`seen_ts` (the count window is 7 days, so nothing that counts is lost) by the same pass that writes it, and
+`khipu usage --forget-login-paths`, reached in the app as "Forget which logins conversations used" in Accounts
+and routing, clears it from every state file at once. Reset and "delete Khipu's data" remove the files as
+today. Tests: a path older than 30 days is cleared on the next capture; Forget clears every file and leaves
+the rest of each state untouched; a state file without the field is never rewritten.
 
 Wiping Khipu's state: `config.json` goes, so Khipu reads only the default logins again, a second account stops
 being read until found and tracked again, and declined folders are offered again. `khipu integrations
@@ -879,7 +936,15 @@ uninstall` removes Khipu-owned hook entries only (`cli.py:5225`) and leaves all 
 - What agents see change: a new account appears in `khipu_route` and `khipu route --summary` as "newly tracked,
   not read yet" (unknown, never open) until its first read; a rename as "<old> is now called <new>"; a stopped
   account as "no longer tracked" while kept records name it.
-- No agent-facing output carries a login-folder path; listings give the name and account id.
+- **No agent-facing output carries a login-folder path (fix now, 9A).** Today `khipu_usage`
+  (`mcp_server.py:1702`) returns `usage.report()` as it is, and every row carries `home` (`usage._blank_row`
+  and the cached and pending rows in `report`), so agents see login-folder paths now. The fix is one explicit
+  public projection used by `khipu_usage` (and by `khipu_route` wherever it embeds plan rows): an allowlist of
+  fields (name, account id, CLI, plan, windows, state, ok, error code, plain note, read times), never `home`
+  or any path, applied to fresh, cached, pending, failed and invalid rows alike; notes already say "this login
+  folder" rather than a path (`usage._note`). The app keeps the full rows through its own command. Tests: one
+  per row kind asserting no field or nested value contains the home folder, `~/`, or the account's folder
+  name.
 - Whether `khipu config --set usage_accounts` gets an owner gate is open question 4.
 
 ### Adding an account by hand (the dialog)
@@ -895,7 +960,16 @@ footer says "on this Mac".
    folder…), or Sign in to another account (Section 6; Grok Build and Muse by code; Muse only re-signs).
 3. **Name and read once:** the name (rules in Section 5) and one read of the unsaved account: Live with figures;
    signed in but unreadable with the plain reason and Read again now (can still be saved); not signed in with
-   Sign in now or Save without signing in; login folder not found. Refusals before saving: same real folder
+   Sign in now or Save without signing in; login folder not found.
+   **Sign in now for an existing folder** is a defined transition, since neither command allows it today
+   (`khipu_account_sign_in` needs a saved account; the new-folder command needs a folder Khipu made): Sign in
+   now first saves the account (the one save path, Section 5), with the change line "Claude old: tracked, not
+   signed in", then calls the existing `khipu_account_sign_in` for it, unchanged. If the owner cancels or the
+   sign-in fails, the account stays tracked and shows "Not signed in" with Sign in again, and the dialog says
+   so before it starts ("Khipu tracks Claude old first, then opens the sign-in page"). The existing command and
+   its refusal tests are not loosened. Test through Rust (`cargo test`) and the Tauri command, not only the
+   rendered props: Sign in now on an untracked folder saves then signs in; with the save refused (name taken),
+   no sign-in starts. Refusals before saving: same real folder
    already tracked (with Show it), name taken (with a suggestion).
 
 ### Guardrails for the build (stop-conditions)
@@ -921,6 +995,13 @@ footer says "on this Mac".
 - **Read-only live run:** in the installed app, open Accounts, press Look for accounts now, and save screenshots
   of the real Found rows at 1280 and 960. Snapshot `usage_accounts`, the priority list and Not offered again
   before and after; they must be identical.
+- **Private evidence, public artefacts.** Live screenshots and snapshots show this Mac's real folder names and
+  account names, and the repo is public. They are written only to a private folder outside every repo (the
+  session's scratch folder), never committed, attached to a PR or pasted into a public comment. What goes in
+  the PR is a sanitized record: counts ("3 found, 1 couldn't check"), pass or fail per check, and screenshots
+  from the fake-CLI seam with fictional names. A publication check runs before every commit and PR body in
+  phase 9: it fails if staged files or the PR text contain the owner's home path, a real login-folder name from
+  the live run, or an account name that appears only in the live config.
 - **Every write path** (Track, Not this one, Offer again, Rename, Stop tracking, the switch, the first save that
   writes the defaults out, sign-in) runs in the installed app only under a throwaway HOME and Khipu home, with
   `KHIPU_CLAUDE_CLI` and `KHIPU_CODEX_CLI` (`synth_cli.py:137`) pointing at fake CLIs: exit 0, exit non-zero,
@@ -936,6 +1017,15 @@ Oracles as for every phase above: hermetic pytest from `packages/cli` under a te
 `KHIPU_KEYCHAIN=0` and `ruff check --no-cache packages/cli`; `npx vitest run` and `npm run build` in
 `apps/desktop`; `cargo test` in `src-tauri` when Rust changes. At most three runs per change.
 
+**Fix now, before the rest of phase 9 (packages/cli; part of 9A, shippable on its own).** Two gaps are live
+today, not only in this plan, and go first, in their own PR, independent of discovery:
+1. `khipu_usage` returns login-folder paths to agents (`mcp_server.py:1702` passes `usage.report()` through;
+   rows carry `home`). Add the public projection (Agents' view) and its per-row-kind leak tests.
+2. Codex's plan read falls back to reading session files inside the login folder (`usage.py:691`,
+   `codex_rollout`). Add a `rollout=False` switch to `probe_codex` that discovery and `--try` will use, test
+   that with it off a failed live read returns its failure code and opens nothing under the folder, and test the
+   failure branch with it on. Tracked accounts keep the fallback until Matt answers open question 9.
+
 **9A, discovery engine and CLI (packages/cli; one session).** Read this section, `usage.py`, `claude_homes.py`,
 `t3.py`, `session_capture.py` and `synth_cli.py` first. Build: the login path recorded per session; sources 1 to
 4; `STATUS_ARGV` and the one-shot runner; the discovery lock, caps, order and once-a-day recheck; what it
@@ -944,8 +1034,11 @@ can't-run state; the privacy redaction of names and paths. Tests: the name filte
 symlinks, permission errors, the 12 cap and order, a hanging CLI killed at 5 s, a fake CLI that reads stdin or
 opens `/dev/tty`, no argv outside the table, the never-read-inside test, old state files, the count window,
 Claude and Codex with and without their variables, a corrupt state file never failing the hook, only the path
-recorded, a second run refused while one runs, paths absent from MCP output. Stop if a status check writes
-into a scratch folder (guardrail).
+recorded, a second run refused while one runs, paths absent from MCP output, exact argv tuples (`codex login
+status` allowed, `codex login` refused), the rotation test (30 folders all checked within three runs), the
+30-day path retention and Forget, and `cli_path.<cli>` and `node_folder` honoured by `synth_cli.binary` and the
+probe PATH (a scratch nvm-style shim under launchd's bare PATH starts once the Node folder is set). Stop if a
+status check writes into a scratch folder (guardrail).
 
 **9B, tracking and managing (packages/cli, routing, Rust; one session).** Read Sections 5, 7 and 9 and
 `routing.py` (`routing_lane_map`, priority, holds) first. Build: naming rules and path-identity duplicates in
@@ -956,7 +1049,9 @@ folder; folder-not-found before reads; the routing wording; the owner gate (per 
 unchanged by the write-out and by stop then track again on `~/.claude`; a symlink, full path or trailing slash
 refused as the same login; names that equal a CLI word refused; a mapped lane keeps its evidence after rename;
 stop with defaults leaves no row; re-key moves every owner record; a missing folder never yields the sign-in
-note; a hand-edited invalid entry survives an Add.
+note; a hand-edited invalid entry survives an Add; a move carries reports and evidence and the forwarding
+entry folds a late report under the old key into the new account; an ambiguous lane label is left for repair,
+never converted to the first match.
 
 **9C, app surfaces (apps/desktop; one session).** Read `add-account*.html` and `PlansCard.tsx` first. Build: the
 dialog (steps 1 and 3, every state but sign-in), Found rows, Looking…, couldn't check, last run line, Home's
@@ -964,7 +1059,10 @@ Found and automatic-tracking cards with Close and their order, Not offered again
 tracking dialogs, the folder-not-found and moved rows, the signed-out row, the "Read no accounts" state, setup's
 step (found list, nothing found with Add, Sign in now, Run setup again rules), the What's new sentence. Tests:
 props-driven vitest per mock state; Close never turns down; automatic tracking off saves nothing; setup's
-unticked login reaches no Home card; focus trapped in the dialog and returned after the folder picker.
+unticked login reaches no Home card; focus trapped in the dialog and returned after the folder picker; Set
+the Node folder… and Choose the CLI… save their settings and Check again re-runs (through the Tauri command,
+not props alone); Sign in now on an untracked folder saves first and then calls `khipu_account_sign_in`
+(`cargo test` plus a command-level test).
 
 **9D, sign-in (packages/cli, Rust, apps/desktop; one session).** Read Section 6 and `usage.sign_in`,
 `lib.rs` `sign_in_argv` first. Build: folder creation, the new-folder command, start, status and cancel, the
@@ -973,11 +1071,15 @@ Codex Keychain and Grok guardrails first. Tests (cargo): the argv builder accept
 `~/.codex-<slug>` (and Grok once its guardrail passes) that Khipu created, and refuses `..`, control characters,
 symlink escapes and Muse folders; cancel stops only its own group. (pytest, `popen` fake): only that folder's
 variable is set; failure, timeout and cancel save nothing; the code pattern keeps only the link and code, caps
-bytes, and nothing reaches logs; Escape during sign-in asks the same as Stop and cancel. Stop if either
+bytes, and nothing reaches logs; Escape during sign-in asks the same as Stop and cancel; two starts at once
+leave exactly one owner; a stale record whose pid now belongs to another process (a fake process with a
+different start time or argv) is deleted and nothing is killed; after a simulated crash the next start reaps
+only a matching process. Stop if either
 guardrail fails, and ship the rest.
 
 **9E, proof and promotion (one session).** After 9A to 9D are merged: the Proof on this Mac list through the
-promotion gate, screenshots per state at 1280 and 960, the snapshots identical before and after. Stop and report
+promotion gate, screenshots per state at 1280 and 960, the snapshots identical before and after, live
+evidence kept private and only the sanitized record published, the publication check green. Stop and report
 on any difference.
 
 ### Open questions for Matt
@@ -1000,3 +1102,12 @@ on any difference.
    a path.
 8. **Live proof.** Recommended: the live run on this Mac is read-only; one live Track only on your go, undone
    at once.
+9. **Codex's session-file fallback for tracked accounts.** When Codex's live plan read fails, Khipu reads the
+   last `rate_limits` from the tail of its five newest session files, inside the login folder. Those are the
+   same transcripts Khipu's capture already reads, and only the figures are kept. Recommended: keep it for
+   tracked accounts (removing it loses figures when Codex's live read fails, against "no loss of
+   functionality"), never for discovery or `--try`, and say so in Settings next to Codex's figures ("from its
+   last conversation").
+10. **A CLI whose install is broken.** Khipu can set a CLI's path and its Node folder in the app, but it can't
+    repair or reinstall another maker's program. Recommended: accept that as the one boundary; Khipu says what
+    is wrong and links the maker's verified install page, and never runs an installer for you.
