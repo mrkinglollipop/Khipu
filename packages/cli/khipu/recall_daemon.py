@@ -206,8 +206,17 @@ class RecallService:
         recheck_s: float = STALE_RECHECK_S,
         clock: Callable[[], float] = time.monotonic,
         idle_check: bool = True,
+        routing_forkserver: bool = True,
     ) -> None:
         self.path = Path(path)
+        # The per-prompt routing child is forked by a small helper this
+        # service spawns on first use, never by this process (its heap is
+        # the vector matrix: a fork of it slowed the search). False forks
+        # from this process, as the one-shot hook does: a test seam, so a
+        # test's patched clock and fold reach the read.
+        from khipu import recall_prompt
+
+        self.routing_forkserver = recall_prompt.RoutingForkServer() if routing_forkserver else None
         self._stamp_fn = stamp_fn
         self._recheck_s = recheck_s
         self._clock = clock
@@ -283,6 +292,8 @@ class RecallService:
         return True
 
     def close(self) -> None:
+        if self.routing_forkserver is not None:
+            self.routing_forkserver.close()
         listener, self._listener = self._listener, None
         if listener is not None:
             listener.close()
@@ -354,6 +365,8 @@ class RecallService:
             environ = recall_prompt.caller_environ(req.get("env"))
             if environ is not None:
                 options["environ"] = environ
+            if self.routing_forkserver is not None:
+                options["routing_forkserver"] = self.routing_forkserver
             out = recall_prompt.hook_main(raw, shape=shape, **options)
             if not isinstance(out, dict):
                 raise TypeError("recall handler returned a non-object")
@@ -519,7 +532,8 @@ def _warm_imports() -> None:
     """Pay the package's import cost at start, not on the first prompt."""
     try:
         from khipu import embed, hub_snapshot, recall_prompt, vector_scan  # noqa: F401
-        # What the per-prompt routing child runs, so a fork never imports it.
+        # Routing's switches are decided here for every prompt (the child
+        # itself runs in the routing helper, which imports what it reads).
         from khipu import routing
 
         routing.prompt_imports()

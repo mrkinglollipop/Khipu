@@ -169,8 +169,10 @@ def _without_routing(monkeypatch, run) -> str:
 
 @pytest.fixture
 def daemon(home):
+    # Forks from this process (the seam), so a test's patched clock and fold
+    # reach the read; ``helper_daemon`` below runs the real routing helper.
     svc = recall_daemon.RecallService(home["capture"] / "recall.sock", stamp_fn=lambda: "fixed",
-                                      idle_check=False)
+                                      idle_check=False, routing_forkserver=False)
     assert svc.bind()
     thread = threading.Thread(target=svc.run, daemon=True)
     thread.start()
@@ -1056,3 +1058,117 @@ def test_an_unsaved_view_with_no_saved_one_is_the_same_view_until_it_changes(hom
         folder.chmod(0o755)
     assert not routing.view_file().exists()
 
+
+
+# ---- fix round 3 -------------------------------------------------------------------------------
+
+
+def _count_forks(monkeypatch) -> list[int]:
+    """Every os.fork this (the daemon's) process makes."""
+    forks: list[int] = []
+    real_fork = os.fork
+
+    def fork():
+        pid = real_fork()
+        if pid:
+            forks.append(pid)
+        return pid
+
+    monkeypatch.setattr(recall_prompt.os, "fork", fork)
+    return forks
+
+
+@pytest.mark.parametrize("off", ["setting", "file"])
+def test_a_switched_off_push_starts_nothing_in_the_daemon(home, monkeypatch, daemon, off):
+    """Finding R3-1: with routing_push_prompt off, or the old hook's bypass
+    file present, the daemon still forked itself on every prompt, because
+    only the child read those two switches."""
+    _record()
+    code, before = _client(home)
+    assert code == 0 and "## Prior work" in before
+    _wait_log(1)
+    _push_on(monkeypatch)
+    if off == "setting":
+        _set(home, routing_push_prompt=False)
+    else:
+        Path(routing.ROUTING_NOW_DISABLE_FILE).write_text("")
+    forks = _count_forks(monkeypatch)
+    recall_prompt._save_recent_batches(SESSION, [])
+    code, out = _client(home)
+    assert code == 0 and out == before
+    assert " routing=" not in _wait_log(2)
+    assert forks == []
+
+
+@pytest.fixture
+def helper_daemon(home):
+    """The service as ``serve`` runs it: the routing child comes from its helper."""
+    home["clock"].now = datetime.now(timezone.utc).replace(microsecond=0)  # the helper's child has the real clock
+    svc = recall_daemon.RecallService(home["capture"] / "recall.sock", stamp_fn=lambda: "fixed",
+                                      idle_check=False)
+    assert svc.bind()
+    thread = threading.Thread(target=svc.run, daemon=True)
+    thread.start()
+    yield svc
+    svc.stop()
+    thread.join(5)
+    svc.close()
+
+
+def test_the_daemon_never_forks_itself_for_routing(home, monkeypatch, helper_daemon):
+    """Finding R3-1: every prompt with the push on forked the whole daemon
+    (about 18 ms at the live size) and slowed its search about four times
+    while the child lived. One helper, spawned once, forks the children."""
+    _record()
+    _push_on(monkeypatch)
+    forks = _count_forks(monkeypatch)
+    code, out = _client(home)
+    assert code == 0 and "## Prior work" in out and _routing_part(out).startswith(FULL)
+    assert _wait_log(1).endswith(" routing=full")
+    assert isinstance(_marker()["version"], int) and _marker()["full_at"]
+    home["search"]["hits"] = [dict(HITS[0], id="42")]
+    code, out = _client(home)
+    assert code == 0 and "## Prior work" in out and "## Routing" not in out
+    assert _wait_log(2).endswith(" routing=none")
+    assert forks == [] and helper_daemon.routing_forkserver.spawned == 1
+
+
+@pytest.mark.parametrize("off", [{"env": {"ROUTING_NOW_OFF": "1"}}, {"setting": False}])
+def test_a_switched_off_push_never_asks_the_helper(home, monkeypatch, helper_daemon, off):
+    _record()
+    _push_on(monkeypatch)
+    if "setting" in off:
+        _set(home, routing_push_prompt=off["setting"])
+    code, out = _client(home, env=off.get("env"))
+    assert code == 0 and "## Prior work" in out and "## Routing" not in out
+    assert " routing=" not in _wait_log(1)
+    assert helper_daemon.routing_forkserver.spawned == 0
+
+
+def test_a_dead_helper_is_started_again_and_recall_is_unchanged(home, monkeypatch, helper_daemon):
+    _record()
+    _push_on(monkeypatch)
+    monkeypatch.setattr(recall_prompt, "_FORKSERVER_RESPAWN_S", 0.0)
+    code, out = _client(home)
+    assert code == 0 and _routing_part(out).startswith(FULL)
+    _wait_log(1)
+    helper = helper_daemon.routing_forkserver._proc
+    helper.kill()
+    helper.wait(5)
+    _set(home, routing_resend_after_versions=1)
+    routing.report(account="Claude", state="limited", until="1h", author=ME)
+    home["search"]["hits"] = [dict(HITS[0], id="42")]
+    code, out = _client(home)
+    assert code == 0 and "## Prior work" in out and "## Routing" in out
+    assert helper_daemon.routing_forkserver.spawned == 2
+
+
+def test_the_helper_ends_with_the_daemon(home, monkeypatch, helper_daemon):
+    _record()
+    _push_on(monkeypatch)
+    code, _out = _client(home)
+    assert code == 0
+    helper = helper_daemon.routing_forkserver._proc
+    assert helper.poll() is None
+    helper_daemon.close()
+    assert helper.wait(5) == 0

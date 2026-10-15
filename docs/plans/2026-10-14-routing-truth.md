@@ -773,8 +773,11 @@ before writing it.
 
 - Build the daemon's poll and refold, its sleep that never passes `valid_until`, and the run of everything
   that fell due after the Mac wakes. Extend the gate's recall replay so a candidate fails the step when its
-  routing read exceeds the budget or its search answers change with routing on. Put the per-prompt budget
-  rate in doctor.
+  routing read exceeds the budget or its search answers change with routing on. The replay also measures the
+  search's milliseconds with routing on against routing off, on a daemon whose vector matrix is warm (the
+  daemon never forks itself for routing: its routing helper, spawned once, forks each prompt's child; a fork
+  of the daemon cost about 18 ms and slowed its search about four times while the child lived). Put the
+  per-prompt budget rate in doctor.
 - Stop-condition: if, over at least 200 replayed prompts, timeouts with routing on exceed those with routing
   off by more than 2 in 100 prompts, switch push off and stop.
 - Live check after promotion: one Claude Code conversation and one Codex conversation each see a state change
