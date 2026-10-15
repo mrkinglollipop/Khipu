@@ -1411,3 +1411,240 @@ def test_prompts_past_the_in_flight_limit_skip_at_once(home, monkeypatch):
         assert svc.routing_forkserver._in_flight == 0 and svc.routing_forkserver._proc is helper
     finally:
         _end(svc, thread)
+
+
+# ---- fix round 5 -------------------------------------------------------------------------------
+
+
+def _live_children(pid: int) -> list[int]:
+    """The live (not yet ended) children of ``pid``."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,stat="], capture_output=True, text=True).stdout
+    kids = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == str(pid) and not parts[2].startswith("Z"):
+            kids.append(int(parts[0]))
+    return kids
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stalled_view() -> None:
+    """view.json becomes a FIFO nobody writes: every read of it blocks."""
+    routing.read_view()
+    routing.view_file().unlink()
+    os.mkfifo(routing.view_file())
+
+
+def test_readers_a_prompt_stopped_waiting_for_end_soon_and_are_capped(home, monkeypatch):
+    """Finding R5-1: a reader whose prompt stopped waiting lived on for a
+    minute and the helper took any number of them, so a stalled view.json
+    (a FIFO here) left one live reader per prompt. Now a reader that is not
+    refolding ends a couple of seconds after its prompt's latest wait, and
+    past ``_FORKSERVER_CHILDREN_MOST`` live readers a prompt logs
+    routing=skipped:busy."""
+    _record()
+    home["clock"].now = datetime.now(timezone.utc).replace(microsecond=0)
+    _set(home, routing_prompt_budget_ms=50)
+    _stalled_view()
+    _push_on(monkeypatch)
+    svc, thread = _fresh_daemon(home, "stall")
+    try:
+        assert svc.routing_forkserver.wait_ready(10)
+        helper = svc.routing_forkserver._proc
+        first = len(_log_lines()) + 1
+        count = recall_prompt._FORKSERVER_CHILDREN_MOST + 6
+        for i in range(count):
+            _timed(svc, f"{PROMPT} {i}")
+        statuses = _statuses(first, count)
+        assert "skipped:busy" in statuses, statuses
+        assert all(s in ("skipped:budget", "skipped:busy") for s in statuses), statuses
+        assert len(_live_children(helper.pid)) <= recall_prompt._FORKSERVER_CHILDREN_MOST
+        for _ in range(300):  # a couple of seconds after each prompt's latest wait, and the helper reaps
+            if not _live_children(helper.pid):
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(f"readers still live: {_live_children(helper.pid)}")
+        before = len(_log_lines())
+        _timed(svc)
+        assert _statuses(before + 1, 1) == ["skipped:budget"]  # room again
+    finally:
+        _end(svc, thread)
+        routing.view_file().unlink()
+
+
+def test_the_helper_ends_its_readers_when_it_stops(home, monkeypatch):
+    """Finding R5-1: a stopped helper left its readers running."""
+    _record()
+    home["clock"].now = datetime.now(timezone.utc).replace(microsecond=0)
+    _set(home, routing_prompt_budget_ms=50)
+    _stalled_view()
+    _push_on(monkeypatch)
+    svc, thread = _fresh_daemon(home, "stop")
+    try:
+        assert svc.routing_forkserver.wait_ready(10)
+        helper = svc.routing_forkserver._proc
+        for i in range(3):
+            _timed(svc, f"{PROMPT} {i}")
+        kids = _live_children(helper.pid)
+        assert kids
+    finally:
+        _end(svc, thread)
+    stopped = time.monotonic()
+    while any(_alive(pid) for pid in kids) and time.monotonic() - stopped < 1.0:
+        time.sleep(0.02)
+    routing.view_file().unlink()
+    assert not any(_alive(pid) for pid in kids), "readers outlived their helper"
+
+
+def test_a_cold_reader_ends_soon_after_its_prompt(home, monkeypatch):
+    """Finding R5-1, the one-shot path: its own child gets the same short life."""
+    _record()
+    _set(home, routing_prompt_budget_ms=50)
+    _stalled_view()
+    _push_on(monkeypatch)
+    pids = _count_forks(monkeypatch)
+    try:
+        began = time.monotonic()
+        _cold(monkeypatch)
+        assert _last_log().endswith(" routing=skipped:budget") and len(pids) == 1
+        while _alive(pids[0]) and time.monotonic() - began < 5.0:
+            time.sleep(0.02)
+        assert not _alive(pids[0]), "the cold reader lived on"
+        assert time.monotonic() - began < 1.0 + recall_prompt._ROUTING_CHILD_MOST + 0.5
+    finally:
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        routing.view_file().unlink()
+
+
+def _lock_contended(monkeypatch) -> None:
+    def busy():
+        raise BlockingIOError("the routing lock is held")
+
+    monkeypatch.setattr(routing, "_lock", busy)
+
+
+def test_an_unsaved_change_is_never_taken_for_no_change(home, monkeypatch):
+    """Finding R5-2: a fold that could not be saved kept the saved view's
+    version, so the version check answered "none" and the change was never
+    pushed while saves kept failing. Now the prompt skips
+    (routing=skipped:unsaved), the seen marker stays, and the next prompt
+    that can save delivers it."""
+    _record()
+    _push_on(monkeypatch)
+    before = _seen_now()
+    saved = routing.view_file().read_bytes()
+    home["clock"].advance(minutes=10)
+    routing.report(account="Claude", state="limited", until="2h", author=ME)
+    routing.view_file().write_bytes(saved)  # as if the fold after the report had not been saved
+    with monkeypatch.context() as m:
+        _lock_contended(m)
+        with pytest.raises(routing.PushUnsaved):
+            routing.prompt_push(before, budget=1.0)
+        assert "## Routing" not in _cold(monkeypatch)
+        assert _last_log().endswith(" routing=skipped:unsaved")
+        assert _marker() == before
+    home["search"]["hits"] = [dict(HITS[0], id="42")]
+    out = _cold(monkeypatch)
+    assert _routing_part(out).startswith(CHANGES) and "Claude: limit reached" in _routing_part(out)
+    assert _last_log().endswith(" routing=changes:1")
+
+
+def test_an_unsaved_view_that_changed_nothing_still_sends_nothing(home, monkeypatch):
+    _record()
+    _push_on(monkeypatch)
+    before = _seen_now()
+    home["clock"].advance(minutes=1)
+    Path(routing.events_file()).touch()  # an input changed; the state did not
+    with monkeypatch.context() as m:
+        _lock_contended(m)
+        assert routing.prompt_push(before, budget=1.0)["kind"] == "none"
+        assert "## Routing" not in _cold(monkeypatch)
+        assert _last_log().endswith(" routing=none")
+    assert _marker() == before
+
+
+def _fake_reader(lines: list[tuple[float, bytes]], *, budget: float = 0.01):
+    """A ``_RoutingAtPrompt`` reading a pipe a thread writes ``lines`` to,
+    each after its delay; the ready line comes first, at once."""
+    read_fd, write_fd = os.pipe()
+    at = recall_prompt._RoutingAtPrompt()
+    at.forked = time.monotonic()
+    at.cap = at.forked + recall_prompt._ROUTING_WAIT_MOST
+    at.fd, at.status, at.session = read_fd, "skipped:budget", SESSION
+    os.write(write_fd, f"{time.monotonic()!r} {budget!r}\n".encode())
+
+    def write() -> None:
+        try:
+            for delay, data in lines:
+                time.sleep(delay)
+                os.write(write_fd, data(at) if callable(data) else data)
+        except OSError:
+            pass
+        finally:
+            os.close(write_fd)
+
+    writer = threading.Thread(target=write, daemon=True)
+    writer.start()
+    return at, writer
+
+
+def test_an_answer_finished_after_the_budget_is_not_taken(home):
+    """Finding R5-3: once the budget ran out the wait became zero-time but
+    still read whatever was buffered, so an answer written about 90 ms after
+    the child was ready was taken against a 10 ms budget."""
+    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0}
+
+    def late(_at) -> bytes:
+        return json.dumps(dict(answer, done=time.monotonic())).encode() + b"\n"
+
+    at, writer = _fake_reader([(0.09, late)])
+    writer.join(5)  # the answer is buffered before the prompt reads it, as after a slow search
+    assert at.collect() is None and at.status == "skipped:budget"
+    at, writer = _fake_reader([(0.0, late)], budget=0.5)
+    writer.join(5)
+    out = at.collect()
+    assert out is not None and out["kind"] == "full"
+
+
+def test_a_pipe_that_never_stops_is_drained_only_briefly(home):
+    """Finding R5-3: a continuously readable pipe kept the drain loop going."""
+    read_fd, write_fd = os.pipe()
+    at = recall_prompt._RoutingAtPrompt()
+    at.forked = time.monotonic()
+    at.cap = at.forked + recall_prompt._ROUTING_WAIT_MOST
+    at.fd, at.status, at.session = read_fd, "skipped:budget", SESSION
+    os.write(write_fd, f"{time.monotonic()!r} 0.01\n".encode())
+    writer = subprocess.Popen(["cat", "/dev/zero"], stdout=write_fd)  # never stops, never ends a line
+    os.close(write_fd)
+    try:
+        time.sleep(0.05)
+        done = {}
+
+        def run() -> None:
+            began = time.monotonic()
+            done["out"] = at.collect()
+            done["took"] = time.monotonic() - began
+
+        reader = threading.Thread(target=run, daemon=True)
+        reader.start()
+        reader.join(3)
+        assert "took" in done, "the drain never ended"
+        assert done["out"] is None and done["took"] < 0.5, done
+        assert at.status in ("skipped:budget", "skipped:no-answer")
+    finally:
+        writer.kill()
+        writer.wait(5)

@@ -2054,6 +2054,9 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
                record=record, bad_lines=bad, fingerprint=fingerprint, changes=changes)
     if not saved:
         out["saved"] = False
+        # Its version is the saved view's, but what it says may not be: the
+        # per-prompt push must not take it for "nothing changed" (fix round 5).
+        out["unsaved_change"] = bool(prev) and record and body["effective"] != prev_effective
     return out
 
 
@@ -3425,6 +3428,13 @@ class FoldBusy(OSError):
     """Another prompt's child is already refolding the record."""
 
 
+class PushUnsaved(Exception):
+    """The view changed but could not be saved (the routing lock was held,
+    or the data dir is read-only), so it still carries the saved view's
+    version: this prompt sends nothing and the session's last-seen version
+    stays, and a later prompt that saves sends the change."""
+
+
 def prompt_imports() -> None:
     """Import what ``prompt_push`` imports lazily. The per-prompt child calls
     it before its budget starts, so the budget times the read and not a cold
@@ -3573,13 +3583,18 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
     sent. Waits for the routing lock at most half of ``budget``; the caller
     bounds the whole call. ``on_fold`` is called when this prompt starts to
     refold the record (``_prompt_view``). Raises when the view cannot be
-    read (the caller sends nothing)."""
+    read (the caller sends nothing), and raises ``PushUnsaved`` when the
+    view changed but could not be saved and the session would get changes:
+    its version is still the saved one's, so the version check would say
+    nothing changed (fix round 5)."""
     with lock_budget(budget / 2):
         now = now or _now()
         view = _prompt_view(now, on_fold=on_fold)
     cfg = settings()
     base = {"version": view["version"], "epoch": view.get("epoch")}
     why = _full_reason(marker, view, now, cfg)
+    if why is None and view.get("unsaved_change"):
+        raise PushUnsaved("the routing view changed and could not be saved")
     if why is None:
         seen = marker["version"]
         stale = _not_refreshed(view, now, cfg)

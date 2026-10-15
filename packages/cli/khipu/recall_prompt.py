@@ -330,17 +330,23 @@ def _update_routing_marker(session_id: str, change, wait: float) -> bool:
 # thread), drops the hook's stdin, stdout and stderr and every other
 # inherited descriptor, and starts its own session, so a late child never
 # holds the harness's pipe. A late child is killed ``_ROUTING_CHILD_MOST``
-# seconds after that latest wait, unless it is refolding the record: then it
+# seconds after that latest wait (fix round 5: a minute left a live reader
+# per prompt while view.json stalled), unless it is refolding the record: then it
 # runs on until it has saved the view (the next prompt then reads it fast),
 # at most ``_ROUTING_FOLD_MOST`` seconds; only one prompt folds at a time
 # (``routing.FoldBusy``). Late, failed or switched
 # off, it adds nothing and recall's output is byte for byte what it was.
 
-_ROUTING_CHILD_MOST = 60.0
+_ROUTING_CHILD_MOST = 2.0
 # A child that holds ``prompt-fold.lock`` and refolds the record runs on until
 # the fold has saved the view, at most this long: a fold killed before it
 # saves would only start again at the next prompt, and the one after.
 _ROUTING_FOLD_MOST = 900.0
+# Once a prompt's wait for routing is over, it reads what the child already
+# wrote for at most this long, and never more than this many bytes in all: a
+# pipe that never stops being readable never holds the prompt (fix round 5).
+_ROUTING_DRAIN_MOST = 0.02
+_ROUTING_ANSWER_MOST = 2 << 20
 # The longest a prompt waits for routing (``routing.PROMPT_BUDGET_MOST_MS``),
 # known here without importing routing: the hook's own process never does.
 _ROUTING_WAIT_MOST = 1.0
@@ -395,7 +401,10 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
         # and the stop signals' default actions. The recall daemon's own
         # handlers (stop the service) are inherited by a fork and would only
         # set an event here while the child folds on.
-        for sig in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        # SIGUSR1 is the routing helper's "I am stopping": it ends a child
+        # that is not refolding (its default action), and a refolding child
+        # ignores it and runs on until it has saved the view.
+        for sig in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1):
             signal.signal(sig, signal.SIG_DFL)
         signal.setitimer(signal.ITIMER_REAL, max(0.0, deadline - time.monotonic()) + _ROUTING_CHILD_MOST)
         os.setsid()
@@ -432,6 +441,7 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
                 # fold lock is ours), until it has saved the view.
                 signal.setitimer(signal.ITIMER_REAL, max(signal.getitimer(signal.ITIMER_REAL)[0],
                                                          _ROUTING_FOLD_MOST))
+                signal.signal(signal.SIGUSR1, signal.SIG_IGN)
 
             try:
                 marker = routing_marker(session_id)
@@ -442,8 +452,13 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
                 answer["at"] = routing._iso(routing._now())
             except routing.FoldBusy:
                 answer = {"skip": "fold-busy"}
+            except routing.PushUnsaved:
+                answer = {"skip": "unsaved"}  # the marker stays: a later prompt sends it
             except Exception as exc:  # noqa: BLE001 - its class only: a message can hold a path
                 answer = {"skip": f"error-{type(exc).__name__}"}
+            # When the answer was finished: the hook takes it only if that was
+            # within the read's budget, however long it took to read the pipe.
+            answer["done"] = time.monotonic()
             _write_all(write_fd, json.dumps(answer).encode("utf-8") + b"\n")
         code = 0
     except BaseException:  # noqa: BLE001 - nothing for routing, never a failed hook
@@ -465,6 +480,13 @@ _FORKSERVER_READY_MOST = 30.0
 # routing for the rest (routing=skipped:busy) rather than queue them all
 # behind one helper: the record is read again at the next prompt.
 _FORKSERVER_IN_FLIGHT_MOST = 16
+# The most live children the helper keeps. A child outlives its prompt by up
+# to ``_ROUTING_CHILD_MOST`` seconds (a refolding one longer), so while the
+# record is slow to read a prompt past this skips routing (routing=skipped:busy)
+# until children end, rather than leave one live reader per prompt (fix round 5).
+_FORKSERVER_CHILDREN_MOST = 8
+# How long a stopping helper waits for the children it ended.
+_FORKSERVER_REAP_MOST = 0.5
 
 
 class RoutingHelperStarting(Exception):
@@ -700,9 +722,12 @@ def daemon_routing_on(environ=None) -> bool:
 def routing_forkserver_main(fd: int) -> int:
     """The helper's loop: import what the read needs once, say it is ready
     (one line on stdout), then fork one child per request until the daemon
-    closes stdin. The children are this process's, so it reaps them; they
-    end on their own (their alarm). A request whose prompt has stopped
-    waiting starts no child."""
+    closes stdin. The children are this process's, so it reaps them and
+    counts the live ones: past ``_FORKSERVER_CHILDREN_MOST`` a request is
+    answered busy and starts no child. A request whose prompt has stopped
+    waiting starts no child. When it stops, it ends its children (SIGUSR1)
+    and reaps them; a child refolding the record ignores that and is left to
+    finish saving the view (its own alarm bounds it)."""
     import select
     import signal
     import socket
@@ -715,45 +740,73 @@ def routing_forkserver_main(fd: int) -> int:
     routing.prompt_imports()
     import warnings
 
+    children: set[int] = set()
+
+    def reap() -> None:
+        while children:
+            try:
+                pid, _status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                children.clear()
+                return
+            if not pid:
+                return
+            children.discard(pid)
+
     try:
         _write_all(1, b"ready\n")
     except OSError:
         return 0  # the daemon is gone
-    while True:
-        try:
-            while os.waitpid(-1, os.WNOHANG)[0]:
-                pass
-        except ChildProcessError:
-            pass
-        ready, _, _ = select.select([sock, 0], [], [], 1.0)
-        if 0 in ready and not os.read(0, 4096):
-            return 0  # the daemon closed us, or died
-        if sock not in ready:
-            continue
-        try:
-            msg, fds, _flags, _addr = socket.recv_fds(sock, _FORKSERVER_REQUEST_MOST * 2, 4)
-        except OSError:
-            return 0
-        if not fds:
-            continue
-        for extra in fds[1:]:
-            os.close(extra)
-        write_fd = fds[0]
-        try:
-            req = json.loads(msg.decode("utf-8"))
-            session_id, cap = req.get("session"), float(req["cap"])
-            if time.monotonic() >= cap:
-                raise TimeoutError("the prompt stopped waiting")
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                pid = os.fork()
-        except Exception:  # noqa: BLE001 - a bad or late request, or a failed fork: the hook reads end of file
+    try:
+        while True:
+            reap()
+            ready, _, _ = select.select([sock, 0], [], [], 1.0)
+            if 0 in ready and not os.read(0, 4096):
+                return 0  # the daemon closed us, or died
+            if sock not in ready:
+                continue
+            try:
+                msg, fds, _flags, _addr = socket.recv_fds(sock, _FORKSERVER_REQUEST_MOST * 2, 4)
+            except OSError:
+                return 0
+            if not fds:
+                continue
+            for extra in fds[1:]:
+                os.close(extra)
+            write_fd = fds[0]
+            try:
+                req = json.loads(msg.decode("utf-8"))
+                session_id, cap = req.get("session"), float(req["cap"])
+                if time.monotonic() >= cap:
+                    raise TimeoutError("the prompt stopped waiting")
+                reap()
+                if len(children) >= _FORKSERVER_CHILDREN_MOST:
+                    # Ready with no budget, and the answer: the prompt logs routing=skipped:busy.
+                    os.set_blocking(write_fd, False)
+                    _write_all(write_fd, f"{time.monotonic()!r} 0.0\n".encode("ascii") + b'{"skip": "busy"}\n')
+                    raise RuntimeError("too many live routing children")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    pid = os.fork()
+            except Exception:  # noqa: BLE001 - a bad, late or refused request, or a failed fork: the hook reads end of file
+                os.close(write_fd)
+                continue
+            if pid == 0:
+                # The daemon decided the switches already.
+                _prompt_routing_child(write_fd, session_id, None, cap, decided=True)
+            children.add(pid)
             os.close(write_fd)
-            continue
-        if pid == 0:
-            # The daemon decided the switches already.
-            _prompt_routing_child(write_fd, session_id, None, cap, decided=True)
-        os.close(write_fd)
+    finally:
+        for pid in list(children):
+            try:
+                os.kill(pid, signal.SIGUSR1)
+            except OSError:
+                children.discard(pid)
+        until = time.monotonic() + _FORKSERVER_REAP_MOST
+        while children and time.monotonic() < until:
+            reap()
+            if children:
+                time.sleep(0.01)
 
 
 class _RoutingAtPrompt:
@@ -845,24 +898,38 @@ class _RoutingAtPrompt:
     def collect(self, limit: float | None = None) -> dict | None:
         """The child's answer, or None (off, failed or late). Waits until the
         budget has run from the moment the child was ready to read, never
-        past ``self.cap`` nor ``limit`` (the request's deadline); an answer
-        finished before then is read even when the search ran past it."""
+        past ``self.cap`` nor ``limit`` (the request's deadline). An answer
+        the child finished within the budget (the time on its line) is read
+        even when the search ran past it; one finished later is not, however
+        early it is read (fix round 5). Once the wait is over, what is
+        already buffered is read for at most ``_ROUTING_DRAIN_MOST`` seconds,
+        and never more than ``_ROUTING_ANSWER_MOST`` bytes in all."""
         if self.fd is None:
             return None
         try:
             import select
 
-            buf, began = b"", None
+            buf, began, total, drain_until = b"", None, 0, None
             while True:
                 until = self.cap if began is None else min(self.cap, began + self.budget)
                 if limit is not None:
                     until = min(until, limit)
-                ready, _, _ = select.select([self.fd], [], [], max(0.0, until - time.monotonic()))
+                now = time.monotonic()
+                if now >= until:
+                    if drain_until is None:
+                        drain_until = now + _ROUTING_DRAIN_MOST
+                    elif now >= drain_until:
+                        return None
+                ready, _, _ = select.select([self.fd], [], [], max(0.0, until - now))
                 if not ready:
                     return None
                 chunk = os.read(self.fd, 65536)
                 if not chunk:
                     break
+                total += len(chunk)
+                if total > _ROUTING_ANSWER_MOST:
+                    self.status = "skipped:no-answer"
+                    return None
                 buf += chunk
                 if began is None and b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
@@ -886,6 +953,10 @@ class _RoutingAtPrompt:
             if out.get("kind") not in ("none", "changes", "full") or not isinstance(out.get("version"), int):
                 self.status = "skipped:no-answer"
                 return None
+            done = out.get("done")
+            if not isinstance(done, (int, float)) or isinstance(done, bool) \
+                    or done > min(self.cap, began + self.budget):
+                return None  # finished after its budget: routing=skipped:budget, the marker unmoved
             return out
         except Exception:
             self.status = "skipped:error"
