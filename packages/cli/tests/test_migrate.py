@@ -178,6 +178,63 @@ class RunTest(unittest.TestCase):
         self.assertNotIn("schema_migrations", parts[0] + parts[1])
 
 
+
+class StepMarkerLexingTest(unittest.TestCase):
+    """A "-- khipu:step" line splits a migration only at top level. Inside a
+    string, a quoted identifier, a dollar-quoted body or a block comment it is
+    data, and the runner refuses the file rather than guess."""
+
+    NESTED = {
+        "multiline string": "INSERT INTO t VALUES ('a\n-- khipu:step 2\nb');\n",
+        "dollar-quoted body": "DO $body$\nBEGIN\n-- khipu:step 2\nPERFORM 1;\nEND\n$body$;\n",
+        "block comment": "/* outer /* nested */\n-- khipu:step 2\n*/\nSELECT 1;\n",
+        "quoted identifier": 'SELECT 1 AS "x\n-- khipu:step 2\ny";\n',
+        "untagged dollar quote": "SELECT $$\n-- khipu:step 2\n$$;\n",
+        "escape string": "SELECT E'it\\'s\n-- khipu:step 2\n';\n",
+        "inside a top-level comment": "SELECT 1; -- see -- khipu:step 2\n",
+    }
+
+    def test_a_marker_that_is_not_at_top_level_refuses_the_file(self):
+        for name, sql in self.NESTED.items():
+            with self.subTest(name):
+                with self.assertRaises(migrate.MigrationStepError):
+                    migrate.steps(sql)
+
+    def test_the_runner_refuses_before_running_any_part_of_the_file(self):
+        d = _dir([])
+        (d / "0000_a.sql").write_text("SELECT 1;\n-- khipu:step 2\n" + self.NESTED["dollar-quoted body"])
+        cur = FakeCursor(applied=set())
+        conn = FakeConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                self.assertRaises(migrate.MigrationStepError):
+            migrate.run(directory=d)
+        self.assertEqual(conn.commits, 0)
+        self.assertFalse(any("SELECT 1" in s for s, _ in cur.executed))
+
+    def test_top_level_markers_split_around_quoted_and_commented_text(self):
+        sql = ("-- header only\n"
+               "-- khipu:step 1\n"
+               "SELECT 'a -- not a comment; ''still'' text', \"col\"\"name\";\n"
+               "/* a /* nested */ comment */ SELECT $t$ $$ ' $t$;\n"
+               "-- khipu:step 2\n"
+               "SELECT $1, a$b FROM x;\n"
+               "-- khipu:step 3\n"
+               "/* only a comment */\n")
+        parts = migrate.steps(sql)
+        self.assertEqual(len(parts), 2, "the header and the comment-only step are not transactions")
+        self.assertIn("$t$ $$ ' $t$", parts[0])
+        self.assertIn("SELECT $1, a$b", parts[1])
+
+    def test_a_file_without_markers_is_one_step_unchanged(self):
+        sql = "SELECT 'x';\n"
+        self.assertEqual(migrate.steps(sql), [sql])
+
+    def test_every_repo_migration_splits_cleanly(self):
+        for version, path in migrate.available():
+            with self.subTest(version):
+                self.assertTrue(migrate.steps(path.read_text(encoding="utf-8")))
+
+
 class RepoMigrationsTest(unittest.TestCase):
     def test_the_repo_migrations_are_discoverable_and_self_recording(self):
         files = migrate.available()

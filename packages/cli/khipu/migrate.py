@@ -5,7 +5,8 @@ CONFLICT DO NOTHING``), so applying is idempotent at the SQL level; this runner
 additionally skips files whose version is already recorded, so a re-run on a
 live database executes nothing. Files run in name order inside one transaction
 each: a failing migration leaves the database at the previous version. A file
-may split itself with "-- khipu:step" lines; each section is then its own
+may split itself with top-level step marker lines (two dashes, a space and
+"khipu:step", at the start of a line); each section is then its own
 transaction, so a lock taken by one step is released before the next, and the
 file records its version only in its last step: a failed step leaves the
 version unrecorded and a re-run applies the whole file again (each step must
@@ -27,16 +28,95 @@ _VERSION_RE = re.compile(r"^(\d{4}_[a-z0-9_]+)\.sql$")
 LOCAL_ORIGIN_SETTING = "khipu.local_origin"
 # The value that applies such a migration without claiming any existing row.
 LOCAL_ORIGIN_NONE = "none"
-_STEP_RE = re.compile(r"^-- khipu:step\b.*$", re.MULTILINE)
+_STEP_MARKER = "-- khipu:step"
+_STEP_ANYWHERE_RE = re.compile(r"-- khipu:step\b")
+_DOLLAR_TAG_RE = re.compile(r"\$([A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$")
+
+
+class MigrationStepError(ValueError):
+    """A step marker that is not a top-level line of its own: inside a
+    string, a quoted identifier, a dollar-quoted body or a comment. Splitting
+    there would cut that construct in two, so the file is refused instead."""
+
+
+def _ident_char(c: str) -> bool:
+    return c.isalnum() or c in "_$" or ord(c) > 127
+
+
+def _lex(sql: str) -> tuple[list[tuple[int, int]], list[bool]]:
+    """Top-level step marker lines (start, end), and for each section between
+    them whether it holds anything but whitespace and comments. Follows the
+    PostgreSQL lexical rules a marker could hide in: single-quoted strings
+    ('' and, after E, backslash escapes), double-quoted identifiers, dollar
+    quotes with optional tags, line comments and nested block comments."""
+    markers: list[tuple[int, int]] = []
+    has_code = [False]
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "-" and sql.startswith("--", i):
+            end = sql.find("\n", i)
+            end = n if end < 0 else end
+            if (i == 0 or sql[i - 1] == "\n") and sql.startswith(_STEP_MARKER, i) \
+                    and _STEP_ANYWHERE_RE.match(sql, i):
+                markers.append((i, end))
+                has_code.append(False)
+            i = end
+        elif c == "/" and sql.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if sql.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif sql.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif c in "'\"":
+            escapes = c == "'" and i > 0 and sql[i - 1] in "eE" \
+                and (i < 2 or not _ident_char(sql[i - 2]))
+            has_code[-1] = True
+            i += 1
+            while i < n:
+                if escapes and sql[i] == "\\":
+                    i += 2
+                elif sql[i] == c:
+                    if sql.startswith(c * 2, i):
+                        i += 2
+                    else:
+                        i += 1
+                        break
+                else:
+                    i += 1
+        elif c == "$" and (i == 0 or not _ident_char(sql[i - 1])) \
+                and (m := _DOLLAR_TAG_RE.match(sql, i)):
+            has_code[-1] = True
+            close = sql.find(m.group(0), m.end())
+            i = n if close < 0 else close + len(m.group(0))
+        else:
+            if not c.isspace():
+                has_code[-1] = True
+            i += 1
+    return markers, has_code
 
 
 def steps(sql: str) -> list[str]:
-    """The transactions a migration file runs as, in order."""
-    parts = _STEP_RE.split(sql)
+    """The transactions a migration file runs as, in order. Raises
+    MigrationStepError when marker text appears anywhere but as a top-level
+    line of its own."""
+    markers, has_code = _lex(sql)
+    starts = {start for start, _ in markers}
+    stray = [m.start() for m in _STEP_ANYWHERE_RE.finditer(sql) if m.start() not in starts]
+    if stray:
+        line = sql.count("\n", 0, stray[0]) + 1
+        raise MigrationStepError(
+            f"'{_STEP_MARKER}' on line {line} is inside a string, quoted identifier, "
+            "dollar-quoted body or comment; a step marker must be a top-level line of its own")
+    if not markers:
+        return [sql]
+    bounds = [0, *(x for m in markers for x in m), len(sql)]
+    parts = [sql[bounds[k]:bounds[k + 1]] for k in range(0, len(bounds), 2)]
     # A section of comments alone (the file's header) is not a transaction.
-    return [p for p in parts
-            if any(ln.strip() and not ln.strip().startswith("--") for ln in p.splitlines())
-            ] or [sql]
+    return [p for p, code in zip(parts, has_code) if code] or [sql]
 
 
 def migrations_dir() -> Path:
@@ -117,8 +197,11 @@ def _run_migrations(conn, *, dry_run: bool, directory: Path | None,
     result["ran"] = []
     if dry_run:
         return result
-    for version, path in pending:
-        sql = path.read_text(encoding="utf-8")
+    # Every file is split before any runs, so a refused file never leaves
+    # the database partly migrated.
+    split = [(version, path, path.read_text(encoding="utf-8")) for version, path in pending]
+    split = [(version, path, sql, steps(sql)) for version, path, sql in split]
+    for version, path, sql, parts in split:
         value = None
         if LOCAL_ORIGIN_SETTING in sql:
             # Raises MachineIdentityError before the file runs when this
@@ -129,7 +212,6 @@ def _run_migrations(conn, *, dry_run: bool, directory: Path | None,
         # One transaction per file, or per step of a file that splits itself.
         # psycopg's connection is a transaction already; commit after each so
         # a later failure cannot roll back an earlier, successful one.
-        parts = steps(sql)
         for i, part in enumerate(parts):
             with conn.cursor() as cur:
                 if value is not None:

@@ -30,9 +30,10 @@
 -- lock_timeout: a lock that is not granted within 5 seconds (a long
 -- transaction holding episodes) fails the step instead of queueing behind it
 -- and blocking every reader and writer queued after it. `khipu migrate` runs
--- each "-- khipu:step" section as its own transaction, so the ACCESS EXCLUSIVE
--- lock of step 1 (a catalog-only ALTER: no default, no rewrite) is released
--- before the index build (step 2, a SHARE lock) and the backfill (step 3, row
+-- each step section (from one top-level khipu:step marker line to the next)
+-- as its own transaction, so the ACCESS EXCLUSIVE lock of step 1 (a
+-- catalog-only ALTER: no default, no rewrite) is released before the index
+-- build (step 2, a SHARE lock) and the backfill (step 3, row
 -- locks only). The version is recorded in step 3 only, so a step that fails,
 -- on a lock timeout or anything else, leaves the version unrecorded: step 1
 -- failing changes nothing, a later step failing leaves at most the empty
