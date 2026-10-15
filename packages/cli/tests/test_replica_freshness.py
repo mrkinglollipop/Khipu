@@ -51,6 +51,7 @@ class FakeHub:
         self.decisions: list[dict] = []
         self.deliverables: list[dict] = []
         self.vectors: list[dict] = []
+        self.profile: dict = {"id": PROFILE}
         self.queries: list[str] = []
         self.page_reads = 0
 
@@ -72,6 +73,34 @@ def _micro(dt: datetime | None) -> str:
     if dt is None:
         return ""
     return str((dt - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1))
+
+
+def _select_list(sql: str) -> list[str]:
+    return [c.strip() for c in sql[len("SELECT "):sql.index(" FROM ")].split(",")]
+
+
+def _ep_line(e: dict, sql: str) -> str:
+    """An episode as ``_episode_line_sql`` spells it, for the columns that
+    SQL names."""
+    parts = [str(e["id"])]
+    if "md5(COALESCE(summary" in sql:
+        parts.append(hashlib.md5((e.get("summary") or "").encode()).hexdigest())
+    for col in ("project", "repo_root"):
+        if f"COALESCE({col}::text" in sql:
+            parts.append(e.get(col) or "")
+    if "merged_from" in sql:
+        parts.append(str(len((e.get("raw") or {}).get("merged_from") or [])))
+    return "\t".join(parts)
+
+
+def _topic_line(t: dict, sql: str) -> str:
+    parts = [t["slug"], t.get("content_hash") or ""]
+    for col in ("status", "superseded_by"):
+        if f"COALESCE({col}::text" in sql:
+            parts.append(t.get(col) or "")
+    if "extract(epoch FROM event_at)" in sql:
+        parts.append(_micro(t.get("event_at")))
+    return "\t".join(parts)
 
 
 def _vec_row(v: dict) -> tuple:
@@ -115,17 +144,36 @@ class FakeCursor:
         elif "FROM memory_embeddings" in sql and "ORDER BY built_at, kind" in sql:
             rows = sorted((_vec_row(v) for v in h.live_vectors() if v["built_at"] and v["built_at"] > p[1]),
                           key=lambda r: (r[4], r[0], r[1], r[2]))[: p[2]]
+        elif "FROM episodes WHERE id <> ALL" in sql:
+            skip = set(p[0])
+            live = sorted((e for e in h.episodes if e.get("deleted_at") is None and e["id"] not in skip),
+                          key=lambda e: e["id"])
+            if "md5(string_agg" in sql:
+                by_bucket: dict[int, list[str]] = {}
+                for e in live:
+                    by_bucket.setdefault(e["id"] // 256, []).append(_ep_line(e, sql))
+                rows = [(b, hashlib.md5("\n".join(lines).encode()).hexdigest()) for b, lines in by_bucket.items()]
+            else:
+                rows = [(e["id"], _ny(e["ingested_at"]), _ep_line(e, sql)) for e in live
+                        if e["id"] // 256 in set(p[1])][: p[2]]
+        elif "FROM episodes WHERE id = ANY" in sql:
+            rows = [(e["id"], _ny(e["deleted_at"]) if e.get("deleted_at") else None)
+                    for e in h.episodes if e["id"] in set(p[0])]
+        elif "FROM topics WHERE slug = ANY" in sql:
+            rows = [(t["slug"], _ny(t["deleted_at"]) if t.get("deleted_at") else None)
+                    for t in h.topics if t["slug"] in set(p[0])]
         elif "md5(string_agg" in sql and "FROM decisions" in sql:
             text = "\n".join("\t".join([str(d["id"]), _micro(d.get("superseded_at")),
                                          _micro(d.get("retracted_at")), str(d.get("superseded_by") or "")])
                              for d in sorted(h.decisions, key=lambda d: d["id"]))
             rows = [(hashlib.md5(text.encode()).hexdigest() if h.decisions else None,)]
         elif "md5(string_agg" in sql and "memory_embeddings" not in sql:
-            live = sorted((t["slug"], t.get("content_hash")) for t in h.topics if t.get("deleted_at") is None)
-            text = "\n".join(f"{s}\t{c or ''}" for s, c in live)
+            live = sorted((t for t in h.topics if t.get("deleted_at") is None), key=lambda t: t["slug"])
+            text = "\n".join(_topic_line(t, sql) for t in live)
             rows = [(hashlib.md5(text.encode()).hexdigest() if live else None,)]
         elif sql.startswith("SELECT slug, content_hash"):
-            rows = [(t["slug"], t.get("content_hash"), _ny(t["updated_at"]))
+            cols = _select_list(sql)
+            rows = [tuple(_ny(t[c]) if c.endswith("_at") and t.get(c) else t.get(c) for c in cols)
                     for t in h.topics if t.get("deleted_at") is None]
         elif "FROM decisions WHERE" in sql:
             out = []
@@ -138,7 +186,7 @@ class FakeCursor:
         elif "FROM deliverables WHERE created_at >" in sql:
             rows = [(d["id"], _ny(d["created_at"])) for d in h.deliverables if d["created_at"] > p[0]][: p[1]]
         elif "FROM embedding_profiles WHERE is_active" in sql:
-            rows = [(PROFILE,)]
+            rows = [tuple(h.profile.get(c) for c in _select_list(sql))]
         elif "FROM memory_embeddings" in sql and "string_agg" not in sql:
             # The presence-only probe this module had before chunk identity
             # was compared, kept so the re-embed tests show what it missed.
@@ -186,6 +234,8 @@ class ReplicaCase(unittest.TestCase):
         con.execute("INSERT INTO topics (slug, body, content_hash, updated_at) VALUES ('alpha', 'a', 'h1', ?)",
                     (_ts(before),))
         con.execute("INSERT INTO decisions (id, text, created_at) VALUES (10, 'd', ?)", (_ts(before),))
+        con.execute("INSERT INTO embedding_profiles (id, provider, model, dim, is_active) "
+                    "VALUES (?, 'gemini', 'gemini-embedding-2', 768, 1)", (PROFILE,))
         con.execute("INSERT INTO memory_embeddings (profile, kind, ref, chunk_idx, built_at) "
                     "VALUES (?, 'episode', '1', 0, ?)", (PROFILE, _ts(before)))
         con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('refreshed_at', ?)", (_ts(DUMP),))
@@ -985,3 +1035,150 @@ class OutsideTheCutoffTest(VectorCase):
         lag = hs.measure_lag(self.hub.cursor())
         self.assertNotIn("error", lag["tables"]["vectors"])
         self.assertEqual(lag["tables"]["vectors"]["missing"], 0)
+
+
+class ChangeKindTest(VectorCase):
+    """Every kind of change the replica can miss, each seen by some check.
+    Added: episodes and deliverables by the cutoff, the rest by digest.
+    Edited in place: episodes, topics (content, status, supersession, event
+    time), decisions and vectors by digest. Deleted or tombstoned: the
+    tombstone check, and the episode and topic digests for anything the
+    hub no longer holds live (a forget's deliverable deletes ride on the
+    episode's tombstone). Purged or restored: the digests. Re-embedded: the
+    vector generation. Profile switched or respecified: the vector check.
+    Sidecar lost: the dump times are read from the replica itself."""
+
+    EPISODES = {*_HUB_COLUMNS["episodes"], "summary", "project", "repo_root", "raw"}
+    TOPICS = {*_HUB_COLUMNS["topics"], "status", "superseded_by", "event_at"}
+    PROFILES = {*_HUB_COLUMNS["embedding_profiles"], "provider", "model", "dim", "normalize"}
+
+    def columns(self, **tables: set):
+        merged = {**_HUB_COLUMNS, **tables}
+        return mock.patch.object(hs, "_pg_columns", side_effect=lambda _cur, t: merged.get(t, set()))
+
+    def table(self, name: str) -> dict:
+        return hs.measure_lag(self.hub.cursor())["tables"][name]
+
+    def test_an_episode_edited_on_the_hub_is_behind_until_written(self) -> None:
+        self.hub.episodes[0]["summary"] = "one"
+        edits = {"merged summary": {"summary": "one\n\ntwo"}, "project": {"project": "khipu"},
+                 "repo_root": {"repo_root": "repo"}, "merged capture": {"raw": {"merged_from": [{"source_id": 7}]}}}
+        with self.columns(episodes=self.EPISODES):
+            self.assertEqual(self.measure()["state"], "fresh")
+            for name, edit in edits.items():
+                with self.subTest(edit=name):
+                    self.hub.episodes[0] = {"id": 1, "summary": "one", "ingested_at": DUMP - timedelta(hours=1),
+                                            **edit}
+                    episodes = self.table("episodes")
+                    self.assertEqual(episodes["missing"], 1, episodes)
+                    self.assertEqual(episodes["lag_seconds"], (NOW - DUMP).total_seconds())
+            res = hs.upsert_episode({k: _ny(v) if isinstance(v, datetime) else v
+                                     for k, v in self.hub.episodes[0].items()}, [])
+            self.assertTrue(res["ok"], res)
+            self.assertEqual(self.measure()["state"], "fresh")
+
+    def test_an_episode_written_outside_the_window_or_restored_is_behind(self) -> None:
+        self.hub.episodes.append({"id": 2, "ingested_at": DUMP - timedelta(days=2)})
+        episodes = self.table("episodes")
+        self.assertEqual((episodes["missing"], episodes["lag_seconds"]), (1, (NOW - DUMP).total_seconds()))
+        self.hub.episodes.pop()
+        con = sqlite3.connect(self.snap)
+        con.execute("UPDATE episodes SET deleted_at = ? WHERE id = 1", (_ts(DUMP - timedelta(days=1)),))
+        con.commit()
+        con.close()
+        self.assertEqual(self.table("episodes")["missing"], 1)
+
+    def test_an_episode_the_hub_no_longer_holds_live_is_behind(self) -> None:
+        self.hub.episodes[0]["deleted_at"] = NOW - timedelta(minutes=10)
+        episodes = self.table("episodes")
+        self.assertEqual((episodes["missing"], episodes["lag_seconds"]), (1, 600.0))
+        self.hub.episodes.clear()
+        self.hub.vectors.clear()
+        episodes = self.table("episodes")
+        self.assertEqual((episodes["missing"], episodes["lag_seconds"]), (1, (NOW - DUMP).total_seconds()))
+        self.assertEqual(self.measure()["state"], "behind")
+
+    def test_a_topic_purged_on_the_hub_is_behind(self) -> None:
+        # Codex round 5: tombstoned and purged elsewhere, still live here.
+        self.hub.topics.clear()
+        out = self.measure()
+        self.assertEqual(out["tables"]["topics"]["missing"], 1)
+        self.assertEqual(out["tables"]["topics"]["lag_seconds"], (NOW - DUMP).total_seconds())
+        self.assertEqual(out["state"], "behind")
+        self.hub.topics.append({"slug": "alpha", "content_hash": "h1", "updated_at": DUMP,
+                                "deleted_at": NOW - timedelta(minutes=10)})
+        self.assertEqual(self.table("topics")["lag_seconds"], 600.0, "a tombstone is dated by its own time")
+
+    def test_a_topic_restored_on_the_hub_is_behind(self) -> None:
+        con = sqlite3.connect(self.snap)
+        con.execute("UPDATE topics SET deleted_at = ? WHERE slug = 'alpha'", (_ts(DUMP - timedelta(days=1)),))
+        con.commit()
+        con.close()
+        self.assertEqual(self.table("topics")["missing"], 1)
+
+    def test_a_topic_superseded_or_redated_on_the_hub_is_behind(self) -> None:
+        edits = {"status": {"status": "superseded"}, "superseded_by": {"superseded_by": "beta"},
+                 "event_at": {"event_at": DUMP - timedelta(days=30)}}
+        with self.columns(topics=self.TOPICS):
+            self.assertEqual(self.measure()["state"], "fresh")
+            for name, edit in edits.items():
+                with self.subTest(edit=name):
+                    self.hub.topics[0] = {"slug": "alpha", "content_hash": "h1",
+                                          "updated_at": DUMP - timedelta(hours=1), **edit}
+                    topics = self.table("topics")
+                    self.assertEqual((topics["missing"], topics["lag_seconds"]), (1, (NOW - DUMP).total_seconds()))
+
+    def test_the_active_profile_switched_on_the_hub_is_behind(self) -> None:
+        # Codex round 5: the replica holds P2's vectors, matching the hub's,
+        # but still activates P1, so local recall searches P1.
+        other = "openai-3-small@1536"
+        before = DUMP - timedelta(hours=1)
+        con = sqlite3.connect(self.snap)
+        con.execute("INSERT INTO embedding_profiles (id, provider, model, dim, is_active) "
+                    "VALUES (?, 'openai', 'text-embedding-3-small', 1536, 0)", (other,))
+        con.execute("INSERT INTO memory_embeddings (profile, kind, ref, chunk_idx, content_hash, built_at) "
+                    "VALUES (?, 'episode', '1', 0, 'a', ?)", (other, _ts(before)))
+        con.commit()
+        con.close()
+        self._hub(("episode", "1", 0, "a", before))
+        self.hub.profile = {"id": other}
+        out = self.measure()
+        vectors = out["tables"]["vectors"]
+        self.assertEqual((vectors["missing"], vectors["replica_profile"]), (1, PROFILE))
+        self.assertEqual(vectors["lag_seconds"], (NOW - DUMP).total_seconds())
+        self.assertEqual(out["state"], "behind")
+
+    def test_the_active_profile_respecified_on_the_hub_is_behind(self) -> None:
+        spec = {"id": PROFILE, "provider": "gemini", "model": "gemini-embedding-2", "dim": 768, "normalize": None}
+        with self.columns(embedding_profiles=self.PROFILES):
+            self.hub.profile = dict(spec)
+            self.assertEqual(self.table("vectors")["missing"], 0)
+            self.hub.profile = {**spec, "dim": 1536}
+            self.assertEqual(self.table("vectors")["missing"], 1)
+
+    def test_a_lost_sidecar_keeps_the_hubs_dump_time(self) -> None:
+        # Codex round 5: the replica's own record outlives the sidecar.
+        con = sqlite3.connect(self.snap)
+        con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('hub_dumped_at', ?)", (_ts(DUMP),))
+        con.commit()
+        con.close()
+        (self.dir / "meta.json").unlink()
+        lag = hs.measure_lag(self.hub.cursor())
+        self.assertTrue(lag["measured"], lag)
+        self.assertEqual(hs._utc(lag["since"]), DUMP - timedelta(seconds=hs.FRESHNESS_OVERLAP_S))
+        res = hs.upsert_embeddings([{"profile": PROFILE, "kind": "episode", "ref": "1", "chunk_idx": 0,
+                                     "embedding": [0.1], "built_at": _ts(DUMP)}])
+        self.assertTrue(res["ok"], res)
+        side = json.loads((self.dir / "meta.json").read_text())
+        self.assertEqual(hs._utc(side["hub_dumped_at"]), DUMP)
+
+    def test_a_deliverable_deleted_by_a_forget_on_the_hub_is_caught_by_its_tombstone(self) -> None:
+        con = sqlite3.connect(self.snap)
+        con.execute("INSERT INTO deliverables (id, project, kind, episode_id, created_at) "
+                    "VALUES (5, 'p', 'file', 1, ?)", (_ts(DUMP - timedelta(hours=1)),))
+        con.commit()
+        con.close()
+        self.hub.episodes[0]["deleted_at"] = NOW - timedelta(hours=1)
+        out = self.measure()
+        self.assertEqual(out["tables"]["tombstones"]["missing"], 1)
+        self.assertEqual(out["state"], "behind")

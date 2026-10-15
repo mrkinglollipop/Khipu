@@ -273,13 +273,34 @@ describe("offline copy row (hub_snapshot_ok)", () => {
   });
 
   it("with the database unreachable it gives the last comparison", () => {
-    const measured = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+    const checked = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
     const parsed = fixture({
       hub_snapshot_ok: true,
-      hub_snapshot: { ok: true, state: "unknown", age_seconds: 3 * 3600, last_known: { measured_at: measured, state: "fresh" } },
+      hub_snapshot: {
+        ok: true, state: "unknown", age_seconds: 3 * 3600,
+        last_known: { measured_at: checked, checked_at: checked, state: "fresh" },
+      },
     });
     expect(healthRows(parsed).find((r) => r.key === "hub_snapshot_ok")?.detail).toBe(
       "not compared with the database just now · rebuilt in full 3 h ago · 2 h ago it was in step with the database",
+    );
+  });
+
+  it("ages the last comparison by this Mac's clock, never the database's", () => {
+    // The database's clock runs 45 minutes ahead of this Mac's.
+    const hubTime = new Date(Date.now() + 45 * 60 * 1000).toISOString();
+    const macTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const block = (last: Record<string, string>) => fixture({
+      hub_snapshot_ok: true,
+      hub_snapshot: { ok: true, state: "unknown", age_seconds: 2 * 3600, last_known: { state: "fresh", ...last } },
+    });
+    const detail = (last: Record<string, string>) =>
+      healthRows(block(last)).find((r) => r.key === "hub_snapshot_ok")?.detail;
+    expect(detail({ measured_at: hubTime, checked_at: macTime })).toBe(
+      "not compared with the database just now · rebuilt in full 2 h ago · 10 min ago it was in step with the database",
+    );
+    expect(detail({ measured_at: hubTime })).toBe(
+      "not compared with the database just now · rebuilt in full 2 h ago · when last compared it was in step with the database",
     );
   });
 

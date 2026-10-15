@@ -226,14 +226,16 @@ def meta() -> dict[str, Any]:
     except (OSError, ValueError):
         data = {"readable": False}
     # The image is authoritative: a copied/removed sidecar must not make an
-    # incremental write look like a fresh full replica.
+    # incremental write look like a fresh full replica, nor strand the
+    # dump's hub time that freshness is measured from.
     try:
         con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
         try:
             if _snapshot_table_columns(con, "snapshot_meta"):
-                row = con.execute("SELECT value FROM snapshot_meta WHERE key = 'refreshed_at'").fetchone()
-                if row and row[0]:
-                    data["refreshed_at"] = row[0]
+                for key in ("refreshed_at", "hub_dumped_at"):
+                    row = con.execute("SELECT value FROM snapshot_meta WHERE key = ?", (key,)).fetchone()
+                    if row and _utc(row[0]) is not None:
+                        data[key] = row[0]
         finally:
             con.close()
     except (OSError, sqlite3.Error):
@@ -1864,9 +1866,60 @@ def _present(con: sqlite3.Connection, sql: str, keys: Sequence[Any]) -> set[Any]
     return found
 
 
-def _lag_episodes(cur, con, since, hub_now, limit) -> dict[str, Any]:
+# Episode columns the hub edits in place, with no time of their own: a
+# capture merged into an existing episode (summary, and always one more
+# ``raw.merged_from`` entry), a summary correction, and hygiene filling
+# project and repo_root. ``raw`` is compared by that count alone.
+_EPISODE_TRACKED = ("summary", "project", "repo_root", "raw")
+_EPISODE_BUCKET_IDS = 256
+
+
+def _md5_text(text: str) -> str:
+    import hashlib
+
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def _episode_line_sql(cols: Sequence[str]) -> str:
+    parts = ["id::text"]
+    for c in cols:
+        if c == "summary":
+            parts.append("md5(COALESCE(summary, ''))")
+        elif c == "raw":
+            parts.append("COALESCE(jsonb_array_length(CASE WHEN jsonb_typeof(raw::jsonb -> 'merged_from') = 'array' "
+                         "THEN raw::jsonb -> 'merged_from' END), 0)::text")
+        else:
+            parts.append(f"COALESCE({c}::text, '')")
+    return " || E'\\t' || ".join(parts)
+
+
+def _episode_line(eid: int, vals: Sequence[tuple[str, Any]]) -> str:
+    parts = [str(eid)]
+    for c, v in vals:
+        if c == "summary":
+            parts.append(_md5_text(v or ""))
+        elif c == "raw":
+            try:
+                raw = json.loads(v) if isinstance(v, str) else v
+            except ValueError:
+                raw = None
+            merged = raw.get("merged_from") if isinstance(raw, dict) else None
+            parts.append(str(len(merged)) if isinstance(merged, list) else "0")
+        else:
+            parts.append("" if v is None else str(v))
+    return "\t".join(parts)
+
+
+def _lag_episodes(cur, con, since, hub_now, limit, hub_dump, pending: set[int]) -> dict[str, Any]:
+    """Episodes ingested since the cutoff, dated by their own time; then
+    every live episode on both sides, compared by bucket digest of
+    ``_episode_line``, which catches what no cutoff can: an edit in place,
+    an episode written outside the window, and one the replica holds live
+    that the hub tombstoned (dated by that) or no longer has (dated from
+    the dump). Queued local erasures are left out on both sides."""
     hub_cols = _pg_columns(cur, "episodes")
-    live = " AND deleted_at IS NULL" if "deleted_at" in hub_cols else ""
+    has_del = "deleted_at" in hub_cols
+    live = " AND deleted_at IS NULL" if has_del else ""
     cur.execute(
         f"SELECT id, ingested_at FROM episodes WHERE ingested_at > %s{live} "
         "ORDER BY ingested_at, id LIMIT %s",
@@ -1874,9 +1927,62 @@ def _lag_episodes(cur, con, since, hub_now, limit) -> dict[str, Any]:
     )
     rows = cur.fetchall()
     held = _present(con, "SELECT id FROM main.episodes WHERE id IN ({})", [int(r[0]) for r in rows])
-    missing = [r for r in rows if int(r[0]) not in held]
-    return {"lag_seconds": _lag_from(hub_now, [r[1] for r in missing]), "missing": len(missing),
-            "checked": len(rows), "truncated": len(rows) >= limit}
+    stale: dict[int, Any] = {int(r[0]): r[1] for r in rows if int(r[0]) not in held}
+    checked = len(rows)
+    truncated = len(rows) >= limit
+
+    rep_cols = _snapshot_table_columns(con, "episodes")
+    cols = [c for c in _EPISODE_TRACKED if c in hub_cols and c in rep_cols]
+    replica: dict[int, str] = {}
+    for r in con.execute(f"SELECT {', '.join(['id', *cols])} FROM main.episodes"
+                         + (" WHERE deleted_at IS NULL" if "deleted_at" in rep_cols else "")):
+        if int(r[0]) not in pending:
+            replica[int(r[0])] = _episode_line(int(r[0]), list(zip(cols, r[1:])))
+    rep_buckets: dict[int, list[int]] = {}
+    for eid in replica:
+        rep_buckets.setdefault(eid // _EPISODE_BUCKET_IDS, []).append(eid)
+    rep_digests = {b: _md5_text("\n".join(replica[i] for i in sorted(ids))) for b, ids in rep_buckets.items()}
+    where = f"WHERE id <> ALL(%s::bigint[]){live}"
+    skip = sorted(pending)
+    cur.execute(
+        f"SELECT id / {_EPISODE_BUCKET_IDS} AS bucket, "
+        f"md5(string_agg({_episode_line_sql(cols)}, E'\\n' ORDER BY id)) FROM episodes {where} GROUP BY 1",
+        (skip,),
+    )
+    hub_digests = {int(b): d for b, d in cur.fetchall()}
+    differing = sorted(b for b in set(hub_digests) | set(rep_digests) if hub_digests.get(b) != rep_digests.get(b))
+    floor = _utc(hub_dump)
+    if differing:
+        room = max(limit - checked, 0)
+        cur.execute(
+            f"SELECT id, ingested_at, {_episode_line_sql(cols)} FROM episodes {where} "
+            f"AND id / {_EPISODE_BUCKET_IDS} = ANY(%s::bigint[]) ORDER BY id LIMIT %s",
+            (skip, differing, room + 1),
+        )
+        hub_rows = cur.fetchall()
+        whole = set(differing)
+        if len(hub_rows) > room:
+            truncated = True
+            # Only buckets read to their end can say what the hub lacks.
+            cut = int(hub_rows[room][0]) // _EPISODE_BUCKET_IDS
+            whole = {b for b in differing if b < cut}
+            hub_rows = hub_rows[:room]
+        checked += len(hub_rows)
+        hub_ids: set[int] = set()
+        for eid, ingested, line in hub_rows:
+            hub_ids.add(int(eid))
+            if replica.get(int(eid)) != line and int(eid) not in stale:
+                stale[int(eid)] = _since_dump(ingested, floor)
+        gone = sorted(i for b in whole for i in rep_buckets.get(b, ()) if i not in hub_ids)
+        if gone:
+            deleted: dict[int, Any] = {}
+            if has_del:
+                cur.execute("SELECT id, deleted_at FROM episodes WHERE id = ANY(%s::bigint[])", (gone,))
+                deleted = {int(i): d for i, d in cur.fetchall()}
+            for eid in gone:
+                stale[eid] = _since_dump(deleted.get(eid), floor)
+    return {"lag_seconds": _lag_from(hub_now, list(stale.values())), "missing": len(stale),
+            "checked": checked, "buckets_differing": len(differing), "truncated": truncated}
 
 
 def _lag_tombstones(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str, Any]:
@@ -1905,50 +2011,85 @@ def _lag_tombstones(cur, con, since, hub_now, limit, pending: set[int]) -> dict[
             "checked": checked, "truncated": truncated}
 
 
-def _topic_manifest_digest(pairs: Sequence[tuple[Any, Any]]) -> str | None:
+def _since_dump(when: Any, floor: datetime | None) -> datetime | None:
+    """A change the replica lacks happened after the dump (else the dump
+    would hold it): its own time, but never earlier than the dump's, both
+    on the hub's clock."""
+    when = _utc(when)
+    return max(when, floor) if when is not None and floor is not None else (floor or when)
+
+
+# Topic columns besides content_hash that change with no new content: a
+# supersession (organise) and an event time (notes).
+_TOPIC_TRACKED = ("status", "superseded_by", "event_at")
+
+
+def _manifest_field_sql(col: str) -> str:
+    if col.endswith("_at"):
+        return f"COALESCE(floor(extract(epoch FROM {col}) * 1000000)::bigint::text, '')"
+    return f"COALESCE({col}::text, '')"
+
+
+def _manifest_field(col: str, val: Any) -> str:
+    if col.endswith("_at"):
+        return _vec_built_key(val)
+    return "" if val is None else str(val)
+
+
+def _topic_line(slug: Any, chash: Any, extra: Sequence[tuple[str, Any]]) -> str:
+    return "\t".join([str(slug), chash or "", *(_manifest_field(c, v) for c, v in extra)])
+
+
+def _topic_manifest_digest(lines: Sequence[tuple[Any, str]]) -> str | None:
     import hashlib
 
-    if not pairs:
+    if not lines:
         return None
-    text = "\n".join(f"{slug}\t{h or ''}" for slug, h in sorted(pairs, key=lambda p: str(p[0])))
+    text = "\n".join(line for _slug, line in sorted(lines, key=lambda p: str(p[0])))
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
 def _lag_topics(cur, con, hub_now, hub_dump) -> dict[str, Any]:
-    """Topics are compared whole, by ``(slug, content_hash)`` of every live
-    topic: ``updated_at`` is backdated by the file mirror, so no timestamp
-    cursor can see a correction. A digest first (one row from the hub); the
-    full manifest only when the digests differ."""
+    """Topics are compared whole, by ``(slug, content_hash, status,
+    superseded_by, event_at)`` of every live topic on both sides:
+    ``updated_at`` is backdated by the file mirror, so no timestamp cursor
+    can see a correction. A digest first (one row from the hub); the full
+    manifest only when the digests differ. A topic the replica holds live
+    and the hub does not was tombstoned (dated by that) or purged there
+    (dated from the dump)."""
     hub_cols = _pg_columns(cur, "topics")
     if not {"slug", "content_hash"} <= hub_cols:
         return {"lag_seconds": None, "not_applicable": "hub topics have no content_hash"}
+    rep_cols = _snapshot_table_columns(con, "topics")
+    extra = [c for c in _TOPIC_TRACKED if c in hub_cols and c in rep_cols]
     live = " WHERE deleted_at IS NULL" if "deleted_at" in hub_cols else ""
-    replica = con.execute(
-        "SELECT slug, content_hash FROM main.topics"
-        + (" WHERE deleted_at IS NULL" if "deleted_at" in _snapshot_table_columns(con, "topics") else "")
-    ).fetchall()
-    cur.execute(
-        "SELECT md5(string_agg(slug || E'\\t' || COALESCE(content_hash, ''), E'\\n' "
-        f"ORDER BY slug COLLATE \"C\")) FROM topics{live}"
-    )
+    replica = {
+        str(r[0]): _topic_line(r[0], r[1], list(zip(extra, r[2:])))
+        for r in con.execute(
+            f"SELECT {', '.join(['slug', 'content_hash', *extra])} FROM main.topics"
+            + (" WHERE deleted_at IS NULL" if "deleted_at" in rep_cols else "")
+        )
+    }
+    line_sql = " || E'\\t' || ".join(["slug", "COALESCE(content_hash, '')", *map(_manifest_field_sql, extra)])
+    cur.execute(f"SELECT md5(string_agg({line_sql}, E'\\n' ORDER BY slug COLLATE \"C\")) FROM topics{live}")
     row = cur.fetchone()
-    if (row[0] if row else None) == _topic_manifest_digest(replica):
+    if (row[0] if row else None) == _topic_manifest_digest(list(replica.items())):
         return {"lag_seconds": 0.0, "missing": 0, "checked": len(replica), "truncated": False}
-    upd = ", updated_at" if "updated_at" in hub_cols else ", NULL"
-    cur.execute(f"SELECT slug, content_hash{upd} FROM topics{live}")
+    upd = "updated_at" if "updated_at" in hub_cols else "NULL"
+    cur.execute(f"SELECT {', '.join(['slug', 'content_hash', upd, *extra])} FROM topics{live}")
     hub_rows = cur.fetchall()
-    held = {slug: h for slug, h in replica}
-    differing = [r for r in hub_rows if r[0] not in held or (held[r[0]] or "") != (r[1] or "")]
-    # A topic that differs changed after the dump (else the dump would hold
-    # it), whatever its backdated updated_at says; the dump's time is the
-    # hub's own.
     floor = _utc(hub_dump)
-    stamps = []
-    for r in differing:
-        when = _utc(r[2])
-        stamps.append(max(when, floor) if when is not None and floor is not None else (floor or when))
-    lag = _lag_from(hub_now, stamps) if differing else 0.0
-    return {"lag_seconds": lag, "missing": len(differing), "checked": len(hub_rows), "truncated": False}
+    stamps = [_since_dump(r[2], floor) for r in hub_rows
+              if replica.get(str(r[0])) != _topic_line(r[0], r[1], list(zip(extra, r[3:])))]
+    gone = sorted(set(replica) - {str(r[0]) for r in hub_rows})
+    if gone:
+        deleted: dict[str, Any] = {}
+        if "deleted_at" in hub_cols:
+            cur.execute("SELECT slug, deleted_at FROM topics WHERE slug = ANY(%s::text[])", (gone,))
+            deleted = {str(s): d for s, d in cur.fetchall()}
+        stamps += [_since_dump(deleted.get(slug), floor) for slug in gone]
+    return {"lag_seconds": _lag_from(hub_now, stamps), "missing": len(stamps), "checked": len(hub_rows),
+            "truncated": False}
 
 
 def _decision_digest_line(row: Sequence[Any]) -> str:
@@ -2098,6 +2239,47 @@ def _vec_manifest_digests(rows: Sequence[tuple[Any, Any, Any, Any, Any]]) -> dic
     }
 
 
+# What makes two embedding profiles the same to recall, besides the id.
+_PROFILE_SPEC = ("provider", "model", "dim", "normalize", "endpoint")
+
+
+def _profile_spec(record: Mapping[str, Any], cols: Sequence[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {"id": str(record.get("id"))}
+    for c in cols:
+        v = record.get(c)
+        if c == "dim":
+            v = int(v) if v is not None else None
+        elif c == "normalize":
+            v = v or "l2"
+        elif c == "endpoint":
+            v = v or None
+        out[c] = v
+    return out
+
+
+def _replica_active_profile(con: sqlite3.Connection, cols: Sequence[str]) -> dict[str, Any] | None:
+    """The profile ``active_snapshot_profile_spec`` would pick, with the
+    endpoint the dump saved beside it."""
+    have = _snapshot_table_columns(con, "embedding_profiles")
+    if not {"id", "is_active"} <= have:
+        return None
+    row_cols = [c for c in cols if c in have]
+    row = con.execute(f"SELECT {', '.join(['id', *row_cols])} FROM embedding_profiles "
+                      "WHERE is_active = 1 LIMIT 1").fetchone()
+    if not row:
+        return None
+    record: dict[str, Any] = dict(zip(["id", *row_cols], row))
+    if "endpoint" in cols and _snapshot_table_columns(con, "snapshot_meta"):
+        saved = con.execute("SELECT value FROM snapshot_meta WHERE key = ?",
+                            (f"embedding_profile:{record['id']}",)).fetchone()
+        try:
+            loaded = json.loads(saved[0]) if saved else {}
+        except (TypeError, ValueError):
+            loaded = {}
+        record["endpoint"] = loaded.get("endpoint") if isinstance(loaded, dict) else None
+    return _profile_spec(record, cols)
+
+
 def _lag_vectors(cur, con, hub_dump, hub_now, limit, pending: set[int]) -> dict[str, Any]:
     """Vectors of the active profile, reconciled chunk by chunk, with no
     cutoff.
@@ -2119,11 +2301,16 @@ def _lag_vectors(cur, con, hub_dump, hub_now, limit, pending: set[int]) -> dict[
     prof_cols = _pg_columns(cur, "embedding_profiles")
     if not {"id", "is_active"} <= prof_cols:
         return {"lag_seconds": None, "not_applicable": "hub has no embedding profiles"}
-    cur.execute("SELECT id FROM embedding_profiles WHERE is_active ORDER BY id LIMIT 1")
+    spec_cols = [c for c in _PROFILE_SPEC if c in prof_cols]
+    cur.execute(f"SELECT {', '.join(['id', *spec_cols])} FROM embedding_profiles WHERE is_active ORDER BY id LIMIT 1")
     prof = cur.fetchone()
     if not prof:
         return {"lag_seconds": None, "not_applicable": "no active embedding profile"}
     profile = prof[0]
+    # Recall on this Mac uses the replica's own active profile: matching
+    # vectors under the hub's profile are no use if that is another one.
+    hub_spec = _profile_spec(dict(zip(["id", *spec_cols], prof)), spec_cols)
+    rep_spec = _replica_active_profile(con, spec_cols)
     gone = ""
     if "deleted_at" in _pg_columns(cur, "episodes"):
         gone = (" AND NOT (kind = 'episode' AND EXISTS (SELECT 1 FROM episodes e "
@@ -2169,6 +2356,9 @@ def _lag_vectors(cur, con, hub_dump, hub_now, limit, pending: set[int]) -> dict[
 
     floor = _utc(hub_dump)
     stale: dict[tuple[str, str, int], Any] = {}
+    if rep_spec != hub_spec:
+        # Switched or respecified on the hub after the dump; when is unknown.
+        stale[("profile", str(profile), -1)] = floor
     checked = 0
     truncated = False
     bucket_expr = f"substr(md5({key_text}), 1, {_VEC_BUCKET_HEX})"
@@ -2232,6 +2422,8 @@ def _lag_vectors(cur, con, hub_dump, hub_now, limit, pending: set[int]) -> dict[
 
     out = {"lag_seconds": _lag_from(hub_now, list(stale.values())), "missing": len(stale), "profile": profile,
            "checked": checked, "buckets_differing": len(differing), "truncated": truncated}
+    if rep_spec != hub_spec:
+        out["replica_profile"] = rep_spec.get("id") if rep_spec else None
     if unverified:
         out["unverified"] = unverified
     return out
@@ -2261,7 +2453,7 @@ def measure_lag(cur, *, limit: int = FRESHNESS_PROBE_LIMIT) -> dict[str, Any]:
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         probes = {
-            "episodes": lambda: _lag_episodes(cur, con, since, hub_now, limit),
+            "episodes": lambda: _lag_episodes(cur, con, since, hub_now, limit, hub_dump, pending),
             "tombstones": lambda: _lag_tombstones(cur, con, since, hub_now, limit, pending),
             "topics": lambda: _lag_topics(cur, con, hub_now, hub_dump),
             "decisions": lambda: _lag_decisions(cur, con, since, hub_now, limit, hub_dump),

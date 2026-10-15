@@ -157,7 +157,7 @@ export type HubSnapshotBlock = {
   reason?: string;
   age_seconds?: number | null;
   tables?: Record<string, HubSnapshotTable>;
-  last_known?: { measured_at?: string; state?: string } | null;
+  last_known?: { measured_at?: string; checked_at?: string; state?: string } | null;
   refresh_error?: { at?: string; error?: string } | null;
 };
 
@@ -209,10 +209,13 @@ export function hubSnapshotDetail(block: HubSnapshotBlock | undefined): string |
   if (unmeasured.length) parts.push(`could not compare ${unmeasured.join(", ")}`);
   if (state === "fresh" && !lagging.length) parts.push("every kind of change in step");
   const last = block.last_known;
-  if (state === "unknown" && last?.measured_at) {
-    const ago = fmtAgeSince(last.measured_at);
-    const was = SNAPSHOT_STATE_WORDS[last.state ?? ""];
-    if (ago && was) parts.push(`${ago} ago it was ${was}`);
+  const was = SNAPSHOT_STATE_WORDS[last?.state ?? ""];
+  if (state === "unknown" && was) {
+    // measured_at is the database's clock; only checked_at (this Mac's) can
+    // be aged against this Mac's now.
+    const ago = fmtAgeSince(last?.checked_at);
+    if (ago) parts.push(`${ago} ago it was ${was}`);
+    else if (last?.measured_at) parts.push(`when last compared it was ${was}`);
   }
   return parts.length ? parts.join(" · ") : undefined;
 }
