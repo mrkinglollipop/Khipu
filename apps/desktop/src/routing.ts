@@ -8,6 +8,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { callCli } from "./settingsCli";
+import { fmtAgoSince } from "./time";
 
 export type RouteAuthor = { kind?: string; harness?: string; project?: string; session?: string; name?: string };
 
@@ -139,6 +140,23 @@ export type RuleCheck = {
   file?: "settings" | "events" | string;
 };
 
+/** What a checked rule's last check found (`routing_sources.rule_results`). */
+export type RuleResult = {
+  rule: number;
+  /** Which of Khipu's four checks gave this result. */
+  check?: "fast_tier" | "paid_xai" | "grok_private" | "grok_confirm" | string;
+  result: "ok" | "broken" | "cannot_check" | "no_lane" | "no_runner" | "unreadable" | string;
+  /** When the check last ran on the files it judged; only for "ok". */
+  at?: string | null;
+  /** Lanes it judged, and lanes it is about but couldn't judge. */
+  lanes?: number;
+  unchecked?: number;
+  /** A broken check's own words, and how many more broken lanes. */
+  text?: string | null;
+  more?: number;
+  why?: string | null;
+};
+
 /** One account in the owner's priority, in his order (phase 4b). */
 export type RoutePriorityEntry = {
   /** The account's key, as Settings -> Routing sends it back. */
@@ -200,6 +218,8 @@ export type RouteView = {
   old_switches?: { env?: boolean; file?: boolean };
   changes?: RouteChange[];
   rule_checks?: RuleCheck[];
+  /** One result per checked rule (settings clarity phase 5). */
+  rule_results?: RuleResult[];
   /** Seconds; 0 means never. */
   warn_after?: { disagreement?: number; not_refreshed?: number };
   /** Seconds a limit reported without a time lasts. */
@@ -562,6 +582,54 @@ export function brokenRules(view: RouteView): { rule: number; checks: RuleCheck[
     else out.push({ rule: c.rule, checks: [c] });
   }
   return out;
+}
+
+const BROKEN_LEAD = "A standing rule may be broken: ";
+
+// Why a check could not judge any lane, by check (`routing_sources.rule_checks`).
+const CANNOT_SEE: Record<string, string> = {
+  fast_tier: "the model is set inside the launch script, which Khipu doesn't read.",
+  paid_xai: "the launch environment is set inside the launch script, which Khipu doesn't read.",
+  grok_confirm: "the confirming lane's kind isn't set in your job runner's settings.",
+  grok_private: "Khipu hasn't read your job runner's list of added work yet.",
+};
+
+/** The line under a standing rule: what Khipu's check found, or that Khipu
+ *  has no check for it. `tone` is "ok", "warn" or "" (grey). A rule Khipu
+ *  checks says "nothing wrong found" only from a result of "ok", which the
+ *  CLI gives only after a check that ran. */
+export function ruleResultLine(
+  watched: boolean,
+  result: RuleResult | undefined,
+  nowMs: number = Date.now(),
+): { text: string; tone: "ok" | "warn" | "" } {
+  if (!watched) return { text: "Passed to every conversation as written. Khipu has no way to check this one.", tone: "" };
+  switch (result?.result) {
+    case "broken": {
+      const words = (result.text ?? "").replace(BROKEN_LEAD, "");
+      const more = result.more ? ` ${result.more === 1 ? "1 more lane" : `${result.more} more lanes`} too.` : "";
+      return {
+        text: `Checked by Khipu: may be broken.${words ? ` ${words.charAt(0).toUpperCase()}${words.slice(1)}` : ""}${more}`,
+        tone: "warn",
+      };
+    }
+    case "ok": {
+      const ago = fmtAgoSince(result.at, nowMs);
+      const n = result.unchecked ?? 0;
+      const rest = n ? ` ${n === 1 ? "1 lane" : `${n} lanes`} couldn't be checked: ${CANNOT_SEE[result.check ?? ""] ?? CANNOT_SEE.fast_tier}` : "";
+      return { text: `Checked by Khipu in your job runners' settings: nothing wrong found${ago ? `, ${ago}` : ""}.${rest}`, tone: "ok" };
+    }
+    case "cannot_check":
+      return { text: `Checked by Khipu, but not here: ${CANNOT_SEE[result.check ?? ""] ?? CANNOT_SEE.fast_tier}`, tone: "" };
+    case "no_lane":
+      return { text: "Checked by Khipu, but not yet: none of your job runners has a lane this rule is about.", tone: "" };
+    case "no_runner":
+      return { text: "Checked by Khipu, but not yet: add a job runner folder so it has something to read.", tone: "" };
+    case "unreadable":
+      return { text: "Checked by Khipu, but not now: Khipu can't read your job runners' settings.", tone: "" };
+    default:
+      return { text: "Checked by Khipu. Reading what the last check found…", tone: "" };
+  }
 }
 
 // Words a rule commonly opens with that are not names, so "Never a -fast

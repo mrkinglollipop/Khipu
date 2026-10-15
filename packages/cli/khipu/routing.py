@@ -4605,6 +4605,11 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     # (phase 4): each watched rule's check, as doctor carries it, and the
     # two times the app words its warnings by.
     out["rule_checks"] = routing_sources.rule_checks(view.get("source_cache") or {}, view.get("rules") or [])
+    # Settings -> Accounts and routing (clarity phase 5): what each checked
+    # rule's last check found and when it ran, so a rule row says "nothing
+    # wrong found" only after a check that ran.
+    out["rule_results"] = routing_sources.rule_results(view.get("source_cache") or {}, view.get("rules") or [],
+                                                       out["rule_checks"])
     out["warn_after"] = {"disagreement": cfg["routing_disagreement_warn_after"],
                          "not_refreshed": cfg["routing_not_refreshed_after"]}
     # How long a limit reported without a time lasts (the card says so).

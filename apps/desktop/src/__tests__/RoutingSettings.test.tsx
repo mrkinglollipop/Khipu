@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { RoutingSettings } from "../RoutingSettings";
+import { brokenRules, ruleResultLine } from "../routing";
 import type { RouteAccount, RouteView } from "../routing";
 import { changeDays, chosenEnd, durationWords, endChoices, isoLocal, limitWords, ruleOrigin, settingWords, tableErrorWords } from "../routingWords";
 // The stylesheet as written, for the headless Chrome layout check (vitest
@@ -378,11 +379,93 @@ describe("Settings -> Routing: standing rules", () => {
     const three = row("Standing rules", "3.");
     expect(three).toHaveTextContent("From your routing table, Oct 13");
     expect(three).toHaveTextContent("Seeded, confirm");
-    expect(three).toHaveTextContent("Watched");
+    expect(three).toHaveTextContent("Checked by Khipu");
     const seven = row("Standing rules", "7.");
     expect(seven).toHaveTextContent("Confirmed");
-    expect(seven).toHaveTextContent("Not watched by Khipu");
+    expect(seven).toHaveTextContent("Passed to every conversation as written. Khipu has no way to check this one.");
     expect(within(seven).queryByRole("button", { name: "Confirm rule 7" })).toBeNull();
+    expect(screen.queryByText(/Watched/)).toBeNull();
+  });
+
+  // Settings clarity phase 5: a checked rule says what its check found.
+  it("says nothing wrong found only from a check that ran, with its time", async () => {
+    await page();
+    // The view carries no result for rule 3 yet: no pass is claimed.
+    expect(row("Standing rules", "3.")).not.toHaveTextContent("nothing wrong found");
+    cleanup();
+    answers.khipu_route_view = { ...view(), rule_results: [{ rule: 3, check: "fast_tier", result: "ok", at: "2026-10-14T15:36:00Z", lanes: 3, unchecked: 0 }] };
+    await page();
+    expect(row("Standing rules", "3.")).toHaveTextContent(
+      "Checked by Khipu in your job runners' settings: nothing wrong found, 4 min ago.",
+    );
+  });
+
+  it("says it can't check yet with no job runner folder, or no lane the rule is about", () => {
+    expect(ruleResultLine(true, { rule: 3, result: "no_runner" }).text).toBe(
+      "Checked by Khipu, but not yet: add a job runner folder so it has something to read.",
+    );
+    expect(ruleResultLine(true, { rule: 3, result: "no_lane" }).text).toBe(
+      "Checked by Khipu, but not yet: none of your job runners has a lane this rule is about.",
+    );
+    expect(ruleResultLine(true, { rule: 3, check: "fast_tier", result: "cannot_check" }).text).toBe(
+      "Checked by Khipu, but not here: the model is set inside the launch script, which Khipu doesn't read.",
+    );
+    expect(ruleResultLine(true, { rule: 3, result: "unreadable" })).toEqual({
+      text: "Checked by Khipu, but not now: Khipu can't read your job runners' settings.",
+      tone: "",
+    });
+    expect(ruleResultLine(true, { rule: 1, check: "grok_private", result: "cannot_check" }).text).toBe(
+      "Checked by Khipu, but not here: Khipu hasn't read your job runner's list of added work yet.",
+    );
+    expect(ruleResultLine(true, { rule: 2, check: "grok_confirm", result: "ok", at: "2026-10-14T15:36:00Z", unchecked: 1 }).text).toContain(
+      "1 lane couldn't be checked: the confirming lane's kind isn't set",
+    );
+    for (const r of ["no_runner", "no_lane", "cannot_check", "unreadable", "broken"])
+      expect(ruleResultLine(true, { rule: 3, result: r, at: "2026-10-14T15:36:00Z" }).text).not.toContain("nothing wrong found");
+  });
+
+  it("shows a broken check on the rule's own row and in Home's list", async () => {
+    const text = "A standing rule may be broken: Project A's settings name a model ending in -fast for its codex lane.";
+    const v: RouteView = {
+      ...view(),
+      rule_checks: [{ rule: 3, status: "broken", text, at: "2026-10-14T15:36:00Z", runner: "Project A", file: "settings" }],
+      rule_results: [{ rule: 3, check: "fast_tier", result: "broken", text, more: 0 }],
+    };
+    answers.khipu_route_view = v;
+    await page();
+    const three = row("Standing rules", "3.");
+    expect(three).toHaveClass("broken");
+    expect(three).toHaveTextContent(
+      "Checked by Khipu: may be broken. Project A's settings name a model ending in -fast for its codex lane.",
+    );
+    // Home's Routing card and attention list read the same check.
+    expect(brokenRules(v).map((g) => g.rule)).toEqual([3]);
+  });
+
+  it("words the help line by how many rules Khipu can check", async () => {
+    await page();
+    expect(screen.getByText(/Khipu can check 1 of them by reading your job runners' settings/)).toBeInTheDocument();
+    expect(screen.getByText(/Khipu never stops any work\./)).toBeInTheDocument();
+  });
+
+  it("filters rules with named, counted chips", async () => {
+    answers.khipu_route_view = {
+      ...view(),
+      rule_results: [{ rule: 3, check: "fast_tier", result: "broken", text: "A standing rule may be broken: x.", more: 0 }],
+    };
+    await page();
+    const chips = screen.getByRole("group", { name: "Show rules" });
+    const all = within(chips).getByRole("button", { name: "All, 2 rules" });
+    expect(all).toHaveAttribute("aria-pressed", "true");
+    within(chips).getByRole("button", { name: "To confirm, 1 rule" });
+    within(chips).getByRole("button", { name: "Checked by Khipu, 1 rule" });
+    const broken = within(chips).getByRole("button", { name: "May be broken, 1 rule" });
+    fireEvent.click(broken);
+    expect(broken).toHaveAttribute("aria-pressed", "true");
+    const list = screen.getByRole("list", { name: "Standing rules" });
+    expect(within(list).getAllByRole("listitem").map((li) => li.textContent?.slice(0, 2))).toEqual(["3."]);
+    fireEvent.click(within(chips).getByRole("button", { name: "All, 2 rules" }));
+    expect(within(screen.getByRole("list", { name: "Standing rules" })).getAllByRole("listitem")).toHaveLength(2);
   });
 
   it("confirms a rule only after asking", async () => {

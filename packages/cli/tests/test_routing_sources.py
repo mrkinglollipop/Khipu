@@ -563,6 +563,58 @@ def test_route_json_carries_what_the_app_card_needs(home, capsys):
     assert not {"fingerprint", "digest", "source_cache"} & set(out)
 
 
+def _results(out: dict) -> dict[int, dict]:
+    return {r["rule"]: r for r in out["rule_results"]}
+
+
+def test_a_rule_says_nothing_wrong_found_only_after_a_check_that_ran(home, capsys):
+    """Settings clarity phase 5: each checked rule's result and the time its
+    check ran; "ok" needs a lane the check could judge."""
+    for text in ("Grok never builds or fixes privacy or safety code.",
+                 "Every Grok result that is acted on gets a re-check from a different model family.",
+                 "Never a -fast tier.", "Never the paid xAI API.", "Be kind to the Mac."):
+        routing.add_rule(text, via="app")
+    # No job runner folder added: every checked rule says it can't check yet.
+    assert routing.run_cli(_args(json=True)) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert {n: r["result"] for n, r in _results(out).items()} == {1: "no_runner", 2: "no_runner", 3: "no_runner",
+                                                                    4: "no_runner"}
+    assert all(r["at"] is None for r in out["rule_results"])
+    _register(home)
+    assert routing.run_cli(_args(json=True)) == 0
+    out = json.loads(capsys.readouterr().out)
+    results = _results(out)
+    assert 5 not in results  # a rule with no check has no result
+    assert [results[n]["result"] for n in (1, 2, 3, 4)] == ["ok", "ok", "ok", "cannot_check"]
+    assert results[1]["at"] == routing._iso(T0) and results[3]["at"] == routing._iso(T0)
+    assert results[3]["lanes"] > 0 and results[3]["unchecked"] > 0  # the grok lane's model is in its script
+    assert results[4]["at"] is None and "paid xAI API can't be checked" in results[4]["why"]
+
+
+def test_a_broken_check_is_the_rules_result_and_a_lane_less_rule_says_so(home, capsys):
+    _register(home, lanes_a={"codex": "Codex"})
+    routing.add_rule("Never a -fast tier.", via="app")
+    routing.add_rule("Never the paid xAI API.", via="app")
+    config = json.loads((home["a"] / "config.json").read_text())
+    config["lanes"] = {"codex": dict(config["lanes"]["codex"], model="gpt-6.1-sol-fast")}
+    (home["a"] / "config.json").write_text(json.dumps(config))
+    assert routing.run_cli(_args(json=True)) == 0
+    out = json.loads(capsys.readouterr().out)
+    results = _results(out)
+    assert results[1]["result"] == "broken" and results[1]["at"] is None
+    assert results[1]["text"] == ("A standing rule may be broken: project A's settings name a model ending in "
+                                  "-fast for its codex lane.")
+    assert results[2]["result"] == "no_lane"  # no Grok lane: nothing for the xAI check to read
+
+
+def test_a_runner_whose_settings_were_never_read_is_not_a_pass(home):
+    rules = [{"n": 1, "text": "Never a -fast tier."}]
+    cache = {"runners": {"project A": {"config": {"data": None, "good_at": None}}}}
+    assert routing_sources.rule_results(cache, rules) == [
+        {"check": "fast_tier", "result": "unreadable", "at": None, "lanes": 0, "unchecked": 0, "text": None,
+         "more": 0, "why": None, "rule": 1, "checks": ["fast_tier"]}]
+
+
 def test_a_launch_while_paused_is_named(home):
     _register(home)
     routing.pause("Claude", via="app")

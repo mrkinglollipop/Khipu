@@ -30,7 +30,7 @@ a card on Home that stays until he closes it, each item with a Show me button.
 | 2 | Plans: one block per account, one failure line, paused shown, on Home and in Settings | S–M | open |
 | 3 | Routing overview: groups that fold, the Needs you list, Plans moves into Accounts | M | open |
 | 4 | Routing lists: sort and filter accounts, filter and search rules, filter recent changes | S–M | open |
-| 5 | Standing rules: "Checked by Khipu" with the check's result | S | open |
+| 5 | Standing rules: "Checked by Khipu" with the check's result | S | built, in review (branch feat/clarity-rules) |
 | 6 | Capture & models: three cards and one Keys list | M | open |
 | 7 | Setup: an Accounts step | S–M | open |
 | 8 | What's new after an update (dialog and Home card), and its history in Settings → Updates | S | open |

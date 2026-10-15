@@ -975,6 +975,94 @@ def rule_checks(cache: dict, rules: list[dict]) -> list[dict]:
     return out
 
 
+# Which lanes each check reads, and whether it could judge one (the same
+# tests ``rule_checks`` applies, so a lane counted as checked here is one it
+# could have reported as broken).
+def _check_lanes(check: str, lanes: dict) -> tuple[int, int]:
+    """(lanes this check is about, of those the ones it could judge)."""
+    about = judged = 0
+    for spec in lanes.values():
+        kind = (spec.get("kind") or "").lower()
+        if check == "fast_tier":
+            about += 1
+            judged += bool(spec.get("fast") or spec.get("model_in_launch"))
+        elif check == "paid_xai" and kind.startswith("grok"):
+            about += 1  # the launch environment is never read
+        elif check == "grok_confirm" and kind == "grokcheck":
+            about += 1
+            other = lanes.get(spec.get("confirm_lane")) if spec.get("confirm_lane") else None
+            judged += other is None or bool((other or {}).get("kind"))
+        elif check == "grok_private" and kind.startswith("grok"):
+            about += 1
+            judged += 1
+    return about, judged
+
+
+_RESULT_ORDER = ("broken", "unreadable", "no_runner", "ok", "cannot_check", "no_lane")
+
+
+def rule_results(cache: dict, rules: list[dict], checks: list[dict] | None = None) -> list[dict]:
+    """One result per rule Khipu has a check for, for the app's rule rows:
+
+    - ``broken``: a check found the rule may be broken (``text`` says how);
+    - ``ok``: a check ran on at least one lane and found nothing, ``at`` the
+      newest read of the files it judged; ``unchecked`` lanes it couldn't;
+    - ``cannot_check``: every lane it is about is set where Khipu can't see;
+    - ``no_lane``: no job runner has a lane the rule is about;
+    - ``no_runner``: no job runner folder added, so nothing to read;
+    - ``unreadable``: folders added but no settings file was ever read.
+
+    "Nothing wrong found" is only ever ``ok``, which needs a check that ran."""
+    watch = watched(rules)
+    if not watch:
+        return []
+    checks = rule_checks(cache, rules) if checks is None else checks
+    runners = ((cache or {}).get("runners") or {}).items()
+    by_rule: dict[int, list[dict]] = {}
+    for check, n in watch.items():
+        about = judged = 0
+        at = None
+        read = 0
+        for _name, kept in runners:
+            config_kept = kept.get("config") or {}
+            config = config_kept.get("data")
+            if not isinstance(config, dict):
+                continue
+            read += 1
+            a, j = _check_lanes(check, _config_facts(config.get("lanes")))
+            if check == "grok_private" and not isinstance((kept.get("events") or {}).get("data"), dict):
+                j = 0  # its ADDED lines were never read
+            about, judged = about + a, judged + j
+            if j:
+                when = (kept.get("events") if check == "grok_private" else config_kept) or {}
+                when = when.get("good_at")
+                at = max(at, when) if at and when else (at or when)
+        mine = [c for c in checks if c.get("rule") == n]
+        broken = [c for c in mine if c.get("status") == "broken"]
+        if broken:
+            result = "broken"
+        elif not runners:
+            result = "no_runner"
+        elif not read:
+            result = "unreadable"
+        elif not about:
+            result = "no_lane"
+        elif judged:
+            result = "ok"
+        else:
+            result = "cannot_check"
+        by_rule.setdefault(n, []).append({
+            "check": check, "result": result, "at": at if result == "ok" else None,
+            "lanes": judged, "unchecked": about - judged,
+            "text": broken[0]["text"] if broken else None, "more": max(len(broken) - 1, 0),
+            "why": next((c["text"] for c in mine if c.get("status") == "cannot_check"), None)})
+    out = []
+    for n, found in by_rule.items():
+        found.sort(key=lambda r: _RESULT_ORDER.index(r["result"]))
+        out.append(dict(found[0], rule=n, checks=[r["check"] for r in found]))
+    return sorted(out, key=lambda r: r["rule"])
+
+
 def launches(cache: dict) -> list[dict]:
     """Every LAUNCH line kept, with its runner."""
     out = []
