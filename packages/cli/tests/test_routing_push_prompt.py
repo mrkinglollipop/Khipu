@@ -682,7 +682,23 @@ def test_a_block_too_long_for_the_harness_limit_leaves_a_pointer(home, monkeypat
     assert ctx.endswith(recall_prompt.ROUTING_TOO_LONG)
     assert _u16(ctx) <= 10_000
     assert _last_log().endswith(" routing=pointer:full")
-    assert _marker()["version"] == routing.read_view()["version"]  # told where to read it: recorded
+    view = routing.read_view()
+    # Told where to read it, not given it: the session has not heard the summary.
+    assert _marker() == {"pointer": {"version": view["version"], "epoch": view["epoch"]}}
+    # The pointer is said once per version, not on every prompt.
+    home["search"]["hits"] = [dict(HITS[0], id="42")]
+    out = _cold(monkeypatch)
+    assert "## Routing" not in out and "## Prior work" in out
+    assert _last_log().endswith(" routing=pointer-said:full")
+    home["search"]["hits"] = []
+    assert json.loads(_cold(monkeypatch)) == {}
+    assert _last_log().endswith(" routing=pointer-said:full")
+    # A new version says it again, once.
+    routing.add_rule("Never a -fast tier.", via="app")
+    home["search"]["hits"] = [dict(HITS[0], id="43")]
+    assert _ctx(_cold(monkeypatch)).endswith(recall_prompt.ROUTING_TOO_LONG)
+    assert _last_log().endswith(" routing=pointer:full")
+    assert "version" not in _marker()
 
 
 def test_a_block_and_the_recall_part_together_stay_within_the_harness_limit(home, monkeypatch):
@@ -706,3 +722,171 @@ def test_a_mac_with_no_record_hears_it_once_and_nothing_is_written(home, monkeyp
     assert "## Routing" not in _cold(monkeypatch)
     assert _last_log().endswith(" routing=none")
     assert not routing.routing_dir().exists()
+
+
+def _block_of(text_len_target: int, marker: dict) -> str:
+    """Set the note so the routing block for ``marker`` is ``text_len_target``
+    UTF-16 units long; returns the block."""
+    routing.set_note("short", via="app")
+    small = routing.prompt_push(marker, budget=1.0)["text"]
+    routing.set_note("n" * (len("short") + text_len_target - _u16(small)), via="app")
+    text = routing.prompt_push(marker, budget=1.0)["text"]
+    assert _u16(text) == text_len_target
+    return text
+
+
+@pytest.mark.parametrize("kind", ["full", "changes"])
+def test_a_block_pushed_out_by_the_recall_part_is_not_recorded_as_heard(home, monkeypatch, kind):
+    """Finding F1 of fix round 1: the pointer replaced the block, yet the
+    session was marked as having heard it, so the next prompt with room sent
+    nothing."""
+    from khipu import recall_rule
+
+    _record()
+    seen = _seen_now() if kind == "changes" else {}
+    block = _block_of(recall_rule._HOOK_CONTEXT_BUDGET - 60, seen)  # fits alone, not with recall
+    _push_on(monkeypatch)
+    ctx = _ctx(_cold(monkeypatch))
+    assert ctx.startswith("## Prior work") and ctx.endswith(recall_prompt.ROUTING_TOO_LONG)
+    label = "full" if kind == "full" else "changes:1"
+    assert _last_log().endswith(f" routing=pointer:{label}")
+    assert _marker().get("version") == seen.get("version")  # not heard: the marker did not move
+    assert _marker().get("full_at") == seen.get("full_at")
+    # The same hits again: recall is deduplicated, so the block now fits and is sent whole.
+    out = _cold(monkeypatch)
+    assert " reason=dedup " in _last_log()
+    assert _routing_part(out) == block
+    assert _last_log().endswith(f" routing={label}")
+    view = routing.read_view()
+    assert _marker()["version"] == view["version"] and "pointer" not in _marker()
+    if kind == "full":
+        assert _marker()["full_at"] == routing._iso(routing._now())
+
+
+def test_a_pushed_out_block_is_sent_again_on_the_daemon_path(home, monkeypatch, daemon):
+    from khipu import recall_rule
+
+    _record()
+    block = _block_of(recall_rule._HOOK_CONTEXT_BUDGET - 60, {})
+    _push_on(monkeypatch)
+    code, out = _client(home)
+    assert code == 0 and _ctx(out).endswith(recall_prompt.ROUTING_TOO_LONG)
+    assert _wait_log(1).endswith(" routing=pointer:full")
+    assert "version" not in _marker()
+    code, out = _client(home)  # deduplicated: room for the block
+    assert code == 0 and _routing_part(out) == block
+    assert _wait_log(2).endswith(" routing=full")
+    assert _marker()["version"] == routing.read_view()["version"]
+
+
+def test_the_routing_clock_starts_when_the_read_starts(home, monkeypatch):
+    """Finding F2 of fix round 1: the budget was counted from before the
+    hook imported and configured routing, which a fresh interpreter spends
+    most of 50 ms on, so a gated prompt never got its routing lines."""
+    from khipu import features
+
+    _record()
+    config = json.loads((home["data"] / "config.json").read_text())
+    config.pop("routing_prompt_budget_ms")  # the default, 50 ms
+    (home["data"] / "config.json").write_text(json.dumps(config))
+    assert routing.prompt_budget() == 0.05
+    real = features.enabled
+
+    def slow_start(name):  # a cold interpreter reading its config
+        time.sleep(0.1)
+        return real(name)
+
+    monkeypatch.setattr(features, "enabled", slow_start)
+    _push_on(monkeypatch)
+    out = _cold(monkeypatch, prompt="ok")
+    assert _recall_part(out) == "" and _routing_part(out).startswith(FULL)
+    assert _last_log().endswith(" routing=full")
+
+
+def test_a_gated_prompt_on_the_cold_path_gets_routing_at_the_default_budget(home):
+    """The one-shot path in a fresh interpreter, as the launcher runs it with
+    the recall daemon down, at the default budget."""
+    home["clock"].now = datetime.now(timezone.utc).replace(microsecond=0)
+    _record()
+    routing.read_view()
+    config = json.loads((home["data"] / "config.json").read_text())
+    config.pop("routing_prompt_budget_ms")
+    (home["data"] / "config.json").write_text(json.dumps(config))
+    env = dict(os.environ, KHIPU_FEATURE_ROUTING_PUSH="1", KHIPU_RECALL_DAEMON="0",
+               PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+    env.pop("KHIPU_RECALL_DEADLINE", None)
+    lines = []
+    for attempt in range(3):  # a loaded machine may lose one; the old clock lost every one
+        payload = dict(_payload("ok"), session_id=f"cold-{attempt}")
+        proc = subprocess.run([sys.executable, "-c", "from khipu.recall_prompt import prompt_recall_main; "
+                               "prompt_recall_main(shape='claude')"],
+                              input=json.dumps(payload).encode(), env=env, capture_output=True, timeout=30)
+        assert proc.returncode == 0
+        lines.append(_last_log())
+        if _routing_part(proc.stdout.decode()).startswith(FULL):
+            assert lines[-1].endswith(" routing=full")
+            return
+    raise AssertionError(lines)
+
+
+@pytest.mark.parametrize("name", ["SIGTERM", "SIGINT", "SIGHUP"])
+def test_a_late_routing_child_ends_on_a_stop_signal(home, monkeypatch, name):
+    """Finding F3 of fix round 1: the child kept the recall daemon's Python
+    SIGTERM and SIGINT handlers, so a stop signal only set an event and the
+    child folded on until its alarm, a minute later."""
+    import signal
+
+    sig = getattr(signal, name)
+    _record()
+    _damage(home, monkeypatch, "huge-log")
+    monkeypatch.setattr(routing, "fold", _cpu_bound_fold(30.0))
+    _push_on(monkeypatch)
+    pids = []
+    real_fork = os.fork
+
+    def fork():
+        pid = real_fork()
+        if pid:
+            pids.append(pid)
+        return pid
+
+    monkeypatch.setattr(recall_prompt.os, "fork", fork)
+    before = signal.getsignal(sig)
+    signal.signal(sig, lambda *_a: None)  # as ``recall_daemon.serve`` does: stop the service, not the process
+    try:
+        _cold(monkeypatch)
+        assert _last_log().endswith(" routing=skipped:budget") and len(pids) == 1
+        os.kill(pids[0], 0)  # still folding
+        os.kill(pids[0], sig)
+        for _ in range(150):
+            try:
+                os.kill(pids[0], 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(f"the routing child ignored {name}")
+    finally:
+        signal.signal(sig, before)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_the_routing_imports_cover_everything_the_read_imports(home):
+    """The budget starts after ``routing.prompt_imports``: a module the read
+    imports lazily and that list misses would be timed by the budget again."""
+    _record()
+    routing.read_view()
+    code = ("import sys\n"
+            "from khipu import recall_prompt, routing\n"
+            "routing.prompt_imports()\n"
+            "before = set(sys.modules)\n"
+            "routing.prompt_push(recall_prompt.routing_marker('fresh'), budget=1.0)\n"
+            "print(sorted(m for m in set(sys.modules) - before if m.startswith('khipu')))\n")
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+    proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr.decode()[-2000:]
+    assert proc.stdout.decode().strip() == "[]"

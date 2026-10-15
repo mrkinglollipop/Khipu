@@ -3375,6 +3375,14 @@ class FoldBusy(OSError):
     """Another prompt's child is already refolding the record."""
 
 
+def prompt_imports() -> None:
+    """Import what ``prompt_push`` imports lazily. The per-prompt child calls
+    it before its budget starts, so the budget times the read and not a cold
+    interpreter's imports (tens of milliseconds on the one-shot path); the
+    recall daemon calls it at start, so its children have nothing to import."""
+    from khipu import config, features, paths, redact, routing_sources, session_capture, usage  # noqa: F401
+
+
 def prompt_budget() -> float:
     """Seconds the per-prompt hook gives routing (``routing_prompt_budget_ms``,
     at most ``PROMPT_BUDGET_MOST_MS``)."""

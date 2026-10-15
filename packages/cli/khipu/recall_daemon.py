@@ -516,7 +516,9 @@ def _warm_imports() -> None:
     try:
         from khipu import embed, hub_snapshot, recall_prompt, vector_scan  # noqa: F401
         # What the per-prompt routing child runs, so a fork never imports it.
-        from khipu import config, features, routing, routing_sources, usage  # noqa: F401
+        from khipu import routing
+
+        routing.prompt_imports()
     except Exception as exc:  # noqa: BLE001 — the first prompt will import them anyway
         _log(f"warm imports skipped: {type(exc).__name__}: {exc}")
 
