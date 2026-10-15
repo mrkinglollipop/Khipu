@@ -283,8 +283,9 @@ def _window_payload(**extra):
 class DedupEarlyReturnClaimsTest(_OutboxOriginBase):
     """write_pg returns early when a capture lands on an existing row (an
     exact-window or receipt skip, or a merge) and the outbox then deletes the
-    job: a trusted queued or local origin must claim that row first, under the
-    NULL guard; a live gateway caller never claims."""
+    job: on a skip, a trusted queued or local origin must claim that row first,
+    under the NULL guard; a similarity merge never claims, and a live gateway
+    caller never claims."""
 
     def _drain_onto(self, cur, payload, *, label="caller-a", patches=None):
         self._queue(payload, label=label)
@@ -320,11 +321,19 @@ class DedupEarlyReturnClaimsTest(_OutboxOriginBase):
         self.assertEqual(cur.inserts, [])
         self.assertEqual(cur.episodes[1]["origin"], "gateway:caller-a")
 
-    def test_merge_claims_the_target_for_the_queued_owner(self):
-        cur = _merge_target()
-        origin = self._drain_onto(cur, _merge_payload(), patches=_MERGE_TEXT)
-        self.assertEqual(cur.updated_ids, [1], "the capture merged into the existing row")
-        self.assertEqual(origin, "gateway:caller-a")
+    def test_a_similarity_merge_never_changes_the_target_origin(self):
+        # Origin is used for authorization; a text resemblance is not identity.
+        for name, owner in (("unowned", None), ("owned", "local:cccccccccccc")):
+            with self.subTest(name):
+                for job in outbox.jobs():
+                    job.unlink()
+                khipu_db._TABLE_COLUMNS_CACHE.clear()
+                cur = _merge_target()
+                cur.episodes[1]["origin"] = owner
+                origin = self._drain_onto(cur, _merge_payload(), patches=_MERGE_TEXT)
+                self.assertEqual(cur.updated_ids, [1], "the capture merged into the existing row")
+                self.assertEqual(origin, owner)
+                self.assertEqual(cur.claims, [])
 
     def test_an_owned_row_keeps_its_owner(self):
         cur = _DedupClaimCursor({**_WINDOW, "origin": "local:cccccccccccc"})
@@ -351,7 +360,12 @@ class DedupEarlyReturnClaimsTest(_OutboxOriginBase):
                     self._replay(_cli_drain, cur=cur)
                 self.assertEqual(cur.inserts, [])
                 self.assertIsNone(cur.episodes[1]["origin"])
-                self.assertIn("ROLLBACK TO SAVEPOINT capture_claim", [c for c, _ in cur.calls])
+                if name == "merge":
+                    # A merge never attempts a claim, so there is nothing to fail.
+                    self.assertEqual(cur.updated_ids, [1])
+                else:
+                    self.assertIn("ROLLBACK TO SAVEPOINT capture_claim",
+                                  [c for c, _ in cur.calls])
 
     def test_a_live_gateway_caller_never_claims_on_any_early_return(self):
         cases = (("exact window", _DedupClaimCursor(dict(_WINDOW)), _window_payload(), None),

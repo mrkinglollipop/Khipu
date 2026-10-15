@@ -647,7 +647,8 @@ def _stamp_origin(cur) -> str | None:
 
 def _claim_unowned_episode(cur, episode_id: int | None, origin: str | None) -> None:
     """Give an existing unowned row the owner of the capture that landed on it
-    instead of inserting (a replay, an exact-window skip, a merge): the row a
+    instead of inserting (a replay or an exact-window skip; never a similarity
+    merge, which is not an identity match): the row a
     file-mirror sync wrote without an origin. Only this machine, or the origin
     an outbox envelope recorded when the capture was queued, may claim: a live
     gateway caller must never claim an unowned row by replaying its
@@ -701,16 +702,21 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
             dedup = dedup_before_insert(cur, payload, source=source)
             if dedup["action"] in ("skip", "merge"):
                 # The job is done once this returns (the outbox deletes it),
-                # so this is the last chance to record its trusted owner. A
-                # failed claim must not fail a skip or roll back a merge.
-                cur.execute("SAVEPOINT capture_claim")
-                try:
-                    _claim_unowned_episode(cur, dedup.get("matched_episode"), _stamp_origin(cur))
-                except Exception as exc:  # noqa: BLE001 — the row stays, unowned
-                    cur.execute("ROLLBACK TO SAVEPOINT capture_claim")
-                    _log(f"origin claim failed ({type(exc).__name__}: {exc})")
-                else:
-                    cur.execute("RELEASE SAVEPOINT capture_claim")
+                # so this is the last chance to record its trusted owner. Only
+                # an identity match (a skip: exact window, window_id or merge
+                # receipt) claims; a merge is a cosine or Jaccard text match,
+                # and origin is used for authorization, so a resemblance must
+                # never transfer ownership. A failed claim must not fail the skip.
+                if dedup["action"] == "skip":
+                    cur.execute("SAVEPOINT capture_claim")
+                    try:
+                        _claim_unowned_episode(cur, dedup.get("matched_episode"),
+                                               _stamp_origin(cur))
+                    except Exception as exc:  # noqa: BLE001 — the row stays, unowned
+                        cur.execute("ROLLBACK TO SAVEPOINT capture_claim")
+                        _log(f"origin claim failed ({type(exc).__name__}: {exc})")
+                    else:
+                        cur.execute("RELEASE SAVEPOINT capture_claim")
                 conn.commit()
                 if dedup["action"] == "merge":
                     _refresh_merged_episode(cur, dedup["matched_episode"])
