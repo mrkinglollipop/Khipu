@@ -2029,15 +2029,17 @@ def cmd_usage(args: argparse.Namespace) -> int:
 
     max_age = usage.DEFAULT_MAX_AGE_S if args.max_age is None else max(0.0, float(args.max_age))
     label = getattr(args, "account", None)
-    account = usage.configured_account(label) if label is not None else None
-    if label is not None and account is None:
-        print(json.dumps({"ok": False, "error": usage.E_NOT_CONFIGURED}))
+    key = getattr(args, "account_key", None)
+    account, error = (usage.resolve_account(label, key) if label is not None or key is not None
+                      else (None, None))
+    if error:
+        print(json.dumps({"ok": False, "error": error}))
         return 2
     if getattr(args, "sign_in", False):
         if account is None:
             print(json.dumps({"ok": False, "error": "name the account with --account"}))
             return 2
-        out = usage.sign_in(account["label"])
+        out = usage.sign_in(account["label"], key=usage.account_key(account))
         print(json.dumps(out, indent=2))
         return 0 if out["ok"] else 1
     one = {"accounts": [account]} if account else {}
@@ -4574,6 +4576,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     us.add_argument("--account", default=None, metavar="LABEL",
                     help="Only this configured account (its label, as Settings shows it)")
+    us.add_argument("--account-key", default=None, metavar="KEY",
+                    help="Only the account with this key (harness|login folder); wins over a label two accounts share")
     us.add_argument("--sign-in", action="store_true",
                     help="With --account: start that CLI's own login in its login folder (opens the browser), "
                          "wait for it, then read the account again")

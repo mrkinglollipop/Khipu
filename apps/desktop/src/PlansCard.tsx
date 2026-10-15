@@ -81,6 +81,7 @@ const ERROR_PHRASE: Record<string, string> = {
   internal_error: "Khipu could not run the check",
   pending: "first read still running",
   not_configured: "not in the account list",
+  ambiguous_account: "shares its name with another account",
   no_sign_in: "signs in from its own CLI",
   sign_in_timeout: "sign-in not finished in time",
 };
@@ -444,6 +445,9 @@ export function signInOutcome(res: { ok: boolean; data?: SignInAnswer; refusal?:
     return "Khipu stopped waiting after 15 minutes. Press Sign in again to start over.";
   }
   if (answer.error === "not_configured") return "That account is no longer in the list below, so Khipu didn't start a sign-in.";
+  if (answer.error === "ambiguous_account") {
+    return "Two accounts share that name, so Khipu didn't start a sign-in. Give each its own name in the list below.";
+  }
   if (after) return `The sign-in didn't finish. ${after}.`;
   return `The sign-in didn't start: ${res.error ?? "Khipu couldn't run it"}.`;
 }

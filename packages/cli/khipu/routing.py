@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import bisect
 import contextlib
+import contextvars
 import fcntl
 import hashlib
 import hmac
@@ -1120,7 +1121,7 @@ def _append_locked(*events: dict) -> None:
 _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", "basis", "source", "window",
                 "evidence", "until", "written_at", "via", "text", "file", "date", "sha256", "clock_at",
                 "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to", "schedule_id",
-                "owner_request", "prior_text")
+                "owner_request", "prior_text", "auth", "auth_chain")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries")
 _WHOLE_MOST = 2 ** 53
@@ -1349,6 +1350,7 @@ def read_events() -> tuple[list[dict], int]:
             bad += 1
             continue
         events.append(event)
+    _mark_unchecked(events)  # in file order: a line's own seq can't move it before the first stamped one
     slots = [i for i, e in enumerate(events) if isinstance(e.get("seq"), int)]
     if slots:
         ordered = sorted((events[i] for i in slots), key=lambda e: e["seq"])  # stable: file order breaks a tie
@@ -1357,6 +1359,32 @@ def read_events() -> tuple[list[dict], int]:
     for i, event in enumerate(events):
         event["_seq"] = i
     return events, bad
+
+
+_AUTH_OF_VIA = {"app": "app", "cli": "terminal"}
+# Lines only the owner writes; the fold counts one with no author as his.
+_OWNER_ONLY = frozenset({"pause", "lift", "clear", "dismiss", "note_set", "note_end", "rule_confirm", "rule_retire",
+                         "rule_restore", "rule_undo", "rule_dismiss", "priority_confirm", "priority_undo",
+                         "priority_clear"})
+
+
+def _mark_unchecked(events: list[dict]) -> None:
+    """From the first owner's line in the file that says how it was
+    authorised (written by a Khipu that checks), an owner's line without
+    the check its ``via`` calls for (the app's for ``app``, a typed yes for
+    ``cli``; no other ``via`` writes an owner's line) is read with ``via``
+    ending ``-unchecked``: it did not come through the CLI's owner check, so
+    the app's history and doctor show it as odd. Lines before that one were
+    written before the check existed."""
+    start = next((i for i, e in enumerate(events) if e.get("auth")), None)
+    if start is None:
+        return
+    for event in events[start:]:
+        via = event.get("via")
+        by = event.get("written_by") or (OWNER if event.get("type") in _OWNER_ONLY else {})
+        if (by.get("kind") == "owner"
+                and (via not in _AUTH_OF_VIA or event.get("auth") != _AUTH_OF_VIA[via])):
+            event["via"] = f"{via or 'unknown'}-unchecked"
 
 
 def _stamp_locked(clock: datetime, count: int = 1) -> list[dict]:
@@ -2136,17 +2164,19 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
 
     # Owner writes in effect that did not come from the app (a convention;
     # doctor warns). Seeded rules carry their own "seeded" mark instead.
-    outside_app = []
+    # Those whose line claims the app or a terminal but did not pass the
+    # CLI's owner check (``_mark_unchecked``) are also listed as unchecked.
+    odd: list[tuple[str, Any]] = []
     if note is not None and note["via"] != "app":
-        outside_app.append("note")
+        odd.append(("note", note["via"]))
     if priority_out is not None and not priority_out["pending"] and priority_out["via"] != "app":
-        outside_app.append("priority")
-    outside_app += [f"rule {r['n']}" for r in active_rules
-                    if r["written_by"].get("kind") == "owner" and r["via"] != "app"]
-    outside_app += [f"pause of {e['label']}" for e in entries
-                    if e["state"] == PAUSED and (owner["pauses"][e["key"]]["via"] != "app")]
-    outside_app += [f"clear of {e['label']}" for e in entries
-                    if (e.get("witness") or {}).get("cleared") and owner["clears"][e["key"]]["via"] != "app"]
+        odd.append(("priority", priority_out["via"]))
+    odd += [(f"rule {r['n']}", r["via"]) for r in active_rules
+            if r["written_by"].get("kind") == "owner" and r["via"] != "app"]
+    odd += [(f"pause of {e['label']}", owner["pauses"][e["key"]]["via"]) for e in entries
+            if e["state"] == PAUSED and (owner["pauses"][e["key"]]["via"] != "app")]
+    odd += [(f"clear of {e['label']}", owner["clears"][e["key"]]["via"]) for e in entries
+            if (e.get("witness") or {}).get("cleared") and owner["clears"][e["key"]]["via"] != "app"]
     targets = {item["id"]: item for item in evidence}
     for dis in dismissals:
         item = targets.get(dis["target"])
@@ -2155,7 +2185,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         mattered = (item["until"] is not None and item["until"] > now) if item["state"] == LIMITED else not (
             stale_after > 0 and (now - item["at"]).total_seconds() >= stale_after)
         if mattered:
-            outside_app.append(f"dismissal of report {dis['target']}")
+            odd.append((f"dismissal of report {dis['target']}", dis["via"]))
+    outside_app = [what for what, _via in odd]
+    unchecked = [what for what, via in odd if str(via).endswith("-unchecked")]
+    unchecked += [f"hold {h['id']}" for h in active_holds if h["owner"] and str(h["via"]).endswith("-unchecked")]
 
     # The next change the clock alone will cause.
     times: list[datetime] = []
@@ -2206,7 +2239,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     if table is not None:
         effective["table"] = {"hash": table.get("hash"), "error": bool(table.get("error"))}
     return {"accounts": entries, "holds": active_holds, "rules": active_rules, "note": note_out,
-            "priority": priority_out, "priority_ended": priority_ended, "unmatched": lanes, "outside_app": outside_app, "seed": seed, "sources": sources,
+            "priority": priority_out, "priority_ended": priority_ended, "unmatched": lanes, "outside_app": outside_app,
+            "unchecked": unchecked, "seed": seed, "sources": sources,
             "valid_until": _iso(min(future)) if future else None, "effective": effective,
             "causes": {k: dict(c, at=_iso(c["at"])) for k, c in causes.items()}}
 
@@ -3344,7 +3378,7 @@ def add_hold(text: str, *, reason: str, scope: str, account: str | None = None, 
     event = {"type": "hold", "id": _new_id("h"), "scope": hold_scope, "reason": code,
              "text": words if owner else _clean(words, most), "until": _iso(stop), "owner": owner,
              "written_by": OWNER if owner else (author or conversation_author()), "via": via}
-    written, view = _write(event)
+    written, view = _write(_owner_stamp(event) if owner else event)
     return _done(written, view, until=written["until"])
 
 
@@ -3356,13 +3390,14 @@ def end_hold(hold_id: str, *, owner: bool = False, author: dict | None = None, v
         raise RouteError(f"no hold {hold_id!r} is in effect", public="no hold with that id is in effect")
     if hold["owner"] and not owner:
         raise RouteError("that hold is the owner's: only he ends it (the app, or --owner on a terminal)")
-    written, view = _write({"type": "hold_end", "target": hold_id, "via": via,
-                            "written_by": OWNER if owner else (author or conversation_author())})
+    event = {"type": "hold_end", "target": hold_id, "via": via,
+             "written_by": OWNER if owner else (author or conversation_author())}
+    written, view = _write(_owner_stamp(event) if owner else event)
     return _done(written, view, ended=hold_id)
 
 
 def _owner_write(event: dict, via: str) -> dict:
-    event = dict(event, written_by=OWNER, via=via)
+    event = _owner_stamp(dict(event, written_by=OWNER, via=via))
     event.setdefault("id", _new_id("o"))
     written, view = _write(event)
     return _done(written, view)
@@ -3848,6 +3883,47 @@ def rule_line(rule: dict) -> str:
     return f"{rule['n']}. {rule['text']}{mark}"
 
 
+_TOO_LONG = "the owner has not confirmed it yet. It is too long to show here: read it with `khipu_route`."
+
+
+def rule_pointer(rule: dict) -> str:
+    """A pending rule's line when its words don't fit the budget: fixed
+    words, none of the conversation's."""
+    return f"{rule['n']}. A conversation {rule.get('pending_kind') or 'added'} this rule at the owner's request; " \
+        + _TOO_LONG
+
+
+PRIORITY_POINTER = "Your priority was set by a conversation at the owner's request; " + _TOO_LONG
+
+
+def _fit_theirs(items: list[tuple[str, str]], limit: int) -> tuple[list[str], int]:
+    """Conversation-written lines (a pending rule or priority) against a
+    size budget, in order: each whole when it fits in what is left of half
+    of ``limit`` (the other half stays for the account lines), never
+    clipped. One fixed line stands, in the place of the first, for those
+    that don't fit: its own pointer when it is one, else how many. Returns
+    one entry per item ("" for the others the fixed line covers) and the
+    characters they take. ``limit`` 0: no limit."""
+    room = limit // 2
+    out: list[str] = []
+    used = 0
+    missed: list[int] = []
+    for i, (line, _pointer) in enumerate(items):
+        if not limit or used + len(line) + 1 <= room:
+            out.append(line)
+            used += len(line) + 1
+        else:
+            out.append("")
+            missed.append(i)
+    if missed:
+        first = missed[0]
+        out[first] = items[first][1] if len(missed) == 1 else (
+            f"{len(missed)} unconfirmed changes a conversation made at the owner's request are too long to show "
+            "here: read them with `khipu_route`.")
+        used += len(out[first]) + 1
+    return out, used
+
+
 def note_line(note: dict, now: datetime) -> str:
     at = _parse(note.get("at"))
     return f"Note from the owner ({_clock(at, now) if at else '?'}): {note['text']}"
@@ -4130,18 +4206,30 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
     bound = cfg["routing_not_refreshed_after"]
     if view.get("record") and checked and bound and (now - checked).total_seconds() > bound:
         lines.append(f"Khipu's record has not been refreshed since {_clock(checked, now)}.")
+    # The owner's words are whole and outside the budget; a conversation's
+    # (a pending rule or priority) count against it (``_fit_theirs``).
     whole: list[str] = []
+    theirs: list[tuple[int, str, str]] = []  # (place in whole, line, pointer)
     if view.get("rules"):
         whole.append("Standing rules:")
-        whole += [rule_line(r) for r in view["rules"]]
+        for r in view["rules"]:
+            if r.get("pending"):
+                theirs.append((len(whole), rule_line(r), rule_pointer(r)))
+            whole.append(rule_line(r))
     if view.get("note"):
         whole.append(note_line(view["note"], now))
     facts = plan_facts(view, now) if view.get("record") else {}
     # The owner's priority, whole and before every account line (phase 4b).
     if view.get("priority"):
-        whole.append(priority_line(view["priority"], now, view=view, facts=facts))
-    lines += whole
-    rules_note_chars = sum(len(line) + 1 for line in whole)
+        line = priority_line(view["priority"], now, view=view, facts=facts)
+        if view["priority"].get("pending"):
+            theirs.append((len(whole), line, PRIORITY_POINTER))
+        whole.append(line)
+    rules_note_chars = sum(len(line) + 1 for i, line in enumerate(whole) if i not in {t[0] for t in theirs})
+    fitted, theirs_chars = _fit_theirs([(line, pointer) for _i, line, pointer in theirs], cfg["routing_summary_chars"])
+    for (i, _line, _pointer), chosen in zip(theirs, fitted):
+        whole[i] = chosen
+    lines += [line for line in whole if line]
     dropped = 0
     if not view.get("record"):
         lines.append("No routing record on this Mac.")
@@ -4177,7 +4265,7 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         limit = cfg["routing_summary_chars"]
 
         def size(kept: list, n_dropped: int) -> int:
-            total = sum(len(line) + 1 for line in fixed) + sum(len(item[1]) + 1 for item in kept)
+            total = theirs_chars + sum(len(line) + 1 for line in fixed) + sum(len(item[1]) + 1 for item in kept)
             if n_dropped:
                 total += len(f"{n_dropped} more lines: run `khipu route`") + 1
             return total
@@ -4287,6 +4375,10 @@ def doctor_block(now: datetime | None = None) -> dict:
     if view.get("outside_app"):
         warnings.append("A rule, a pause, a clear, your note or your priority was written by something other than "
                         "the app.")
+    if view.get("unchecked"):
+        warnings.append("Owner changes in effect did not pass Khipu's owner check (they claim the app or a terminal, "
+                        "but no checked command wrote them): " + ", ".join(view["unchecked"]) + ". Check them in "
+                        "Settings \u2192 Routing.")
     warnings += _priority_warnings(view, now, cfg)
     if any(r.get("pending") for r in view.get("rules") or []):
         warnings.append("One or more standing rules were added or changed at the owner's request and still need confirmation.")
@@ -4355,6 +4447,7 @@ def doctor_block(now: datetime | None = None) -> dict:
                                     if r["seeded"] and not r["confirmed"] and not r.get("pending")),
             "pending_conversation_rules": pending_rules,
             "note": view.get("note") is not None, "outside_app": view.get("outside_app") or [],
+            "unchecked": view.get("unchecked") or [],
             "seed_error": view.get("seed_error"), "bad_lines": view.get("bad_lines", 0),
             "sources": _sources_brief(sources), "rule_checks": checks, "warnings": warnings}
 
@@ -4515,7 +4608,7 @@ LIGHT_LOCK_BUDGET = 0.5
 _FAILED = "Khipu's routing record could not answer that (an internal error); khipu doctor says more on this Mac"
 
 _VIEW_FIELDS = ("schema", "epoch", "version", "folded_at", "checked_at", "record", "bad_lines", "saved",
-                "valid_until", "outside_app", "seed_error")
+                "valid_until", "outside_app", "unchecked", "seed_error")
 _AUTHOR_PUBLIC = ("kind", "harness", "project", "session", "name")
 _ACCOUNT_FIELDS = ("label", "harness", "state", "until", "basis", "scope", "reason", "checkable", "confirmed_at",
                    "since", "silent")
@@ -5141,18 +5234,33 @@ def _not_refreshed(view: dict, now: datetime, cfg: dict) -> str | None:
     return None
 
 
-def _priority_push(view: dict, now: datetime, *, changed: bool = False, changed_lines: dict | None = None) -> list[str]:
+def _priority_push(view: dict, now: datetime, *, changed: bool = False,
+                   changed_lines: dict | None = None) -> list[tuple[str, str | None]]:
     """The priority's line in a change push, whole and before the account
     lines: in every push while a priority is set (with what Khipu read about
-    each account), and its end when it changed to none."""
+    each account), and its end when it changed to none. Each comes with its
+    pointer when a conversation wrote it (``_fit_theirs``), else None."""
     if view.get("priority"):
         facts = plan_facts(view, now)
-        if changed:
-            return [priority_change_line(view, now, facts=facts)]
-        return [priority_line(view["priority"], now, view=view, facts=facts)]
+        line = priority_change_line(view, now, facts=facts) if changed else \
+            priority_line(view["priority"], now, view=view, facts=facts)
+        if not view["priority"].get("pending"):
+            return [(line, None)]
+        ended = [f"Priority on {label} ended." for label in view.get("priority_ended") or []] if changed else []
+        return [(line, " ".join([*ended, PRIORITY_POINTER]))]
     if changed and changed_lines is not None:
-        return [line for e, line in zip(changed_lines["entities"], changed_lines["lines"]) if e == "priority"]
+        return [(line, None) for e, line in zip(changed_lines["entities"], changed_lines["lines"]) if e == "priority"]
     return []
+
+
+def _head_lines(items: list[tuple[str, str | None]], limit: int) -> tuple[list[str], int]:
+    """The lines before a push's other lines: the owner's whole (pointer
+    None), a conversation's fitted to ``limit`` (``_fit_theirs``). Returns
+    them and the characters the conversation's take."""
+    fitted, used = _fit_theirs([(line, pointer) for line, pointer in items if pointer is not None], limit)
+    chosen = iter(fitted)
+    shown = [line if pointer is None else next(chosen) for line, pointer in items]
+    return [line for line in shown if line], used
 
 
 def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = None,
@@ -5170,13 +5278,22 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
     ranked = sorted(((_change_group(e, view), i, line) for i, (e, line)
                      in enumerate(zip(changed["entities"], changed["lines"]))), key=lambda t: (t[0], t[1]))
     changed_rules = {e for e in changed["entities"] if e.startswith("rule:")}
+    pending = {f"rule:{r['n']}": r for r in view.get("rules") or [] if r.get("pending")}
     # Pending conversation requests remain explicit in every change push
     # until their owner resolves them, even when this version changes an
-    # unrelated account.
-    lines += [rule_line(r) for r in view.get("rules") or []
-              if r.get("pending") and f"rule:{r['n']}" not in changed_rules]
-    lines += [line for group, e, line in ranked if group == 0 and changed["entities"][e] != "priority"]
-    lines += _priority_push(view, now, changed="priority" in changed["entities"], changed_lines=changed)
+    # unrelated account. Their words count against the budget; the owner's
+    # are whole and outside it.
+    head: list[tuple[str, str | None]] = [(rule_line(r), rule_pointer(r)) for e, r in pending.items()
+                                          if e not in changed_rules]
+    for group, e, line in ranked:
+        entity = changed["entities"][e]
+        if group == 0 and entity != "priority":
+            head.append((line, "Standing rule " + rule_pointer(pending[entity]) if entity in pending else None))
+    head += _priority_push(view, now, changed="priority" in changed["entities"], changed_lines=changed)
+    shown, theirs_chars = _head_lines(head, limit)
+    lines += shown
+    if limit:
+        limit = max(1, limit - theirs_chars)
     others = [_clip(line, width) for group, _, line in ranked if group != 0]
 
     def overflow(n: int) -> str:
@@ -5224,9 +5341,9 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
         if seen == view["version"]:
             if stale and not said:
                 # Nothing changed, but the record has not been refreshed past its bound: one line, once.
-                text = "\n".join([CHANGES_HEADING.format(at=_clock(now, now)),
-                                  *[rule_line(r) for r in view.get("rules") or [] if r.get("pending")],
-                                  *_priority_push(view, now), stale])
+                head = [(rule_line(r), rule_pointer(r)) for r in view.get("rules") or [] if r.get("pending")]
+                shown, _used = _head_lines(head + _priority_push(view, now), cfg["routing_prompt_chars"])
+                text = "\n".join([CHANGES_HEADING.format(at=_clock(now, now)), *shown, stale])
                 return dict(base, kind="changes", text=text, count=0, unrefreshed=view.get("checked_at"))
             return dict(base, kind="none", text=None, count=0)
         changed = since(seen, view, now=now, epoch=marker.get("epoch"))
@@ -5340,10 +5457,111 @@ def wait(account: str, *, confirmed: bool = False, timeout: float | None = None,
 # ---- the CLI ---------------------------------------------------------------------------
 
 
+# How the owner's change being written was authorised (``_owner_via``),
+# stamped on its line by ``_owner_stamp``. Unset outside ``run_cli``, so an
+# owner write made by importing this module carries no stamp, and the fold
+# marks it unchecked (``_mark_unchecked``).
+_OWNER_AUTH: contextvars.ContextVar[dict | None] = contextvars.ContextVar("khipu_routing_owner_auth", default=None)
+
+APP_BUNDLE_ID = "com.matt.khipu"
+_CHAIN_MOST = 8
+
+
+def _proc_info(pid: int) -> tuple[int, str, float] | None:
+    """A process's parent, the path of the file it runs and when it
+    started, as the kernel has them (never its argv, which the process sets
+    itself); None when they can't be read. The test seam for the caller
+    check."""
+    if sys.platform != "darwin" or pid <= 0:
+        return None
+    try:
+        import ctypes
+        import struct
+
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+        info = ctypes.create_string_buffer(136)  # struct proc_bsdinfo
+        if lib.proc_pidinfo(pid, 3, ctypes.c_uint64(0), info, 136) != 136:  # PROC_PIDTBSDINFO
+            return None
+        path = ctypes.create_string_buffer(4096)  # PROC_PIDPATHINFO_MAXSIZE
+        if lib.proc_pidpath(pid, path, 4096) <= 0:
+            return None
+        sec, usec = struct.unpack_from("QQ", info, 120)  # pbi_start_tvsec, pbi_start_tvusec
+        return struct.unpack_from("I", info, 16)[0], os.fsdecode(path.value), sec + usec / 1e6
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _app_bundles() -> list[Path]:
+    """Where an installed Khipu.app lives. The test seam for the caller check."""
+    return [Path("/Applications/Khipu.app"), Path.home() / "Applications" / "Khipu.app"]
+
+
+def _app_main(bundle: Path) -> str | None:
+    """The real path of a Khipu.app's own executable, by its Info.plist; None
+    when the bundle is missing or is not Khipu's."""
+    import plistlib
+
+    try:
+        with open(bundle / "Contents" / "Info.plist", "rb") as fh:
+            info = plistlib.load(fh)
+        name = info.get("CFBundleExecutable")
+        if info.get("CFBundleIdentifier") != APP_BUNDLE_ID or not isinstance(name, str) or "/" in name:
+            return None
+        main = bundle / "Contents" / "MacOS" / name
+        return os.path.realpath(main) if main.is_file() else None
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+
+
+def _caller() -> dict:
+    """Who started this process. Walks up from the parent past copies of
+    this same interpreter; the first other process is the caller. ``app`` is
+    true only when that caller runs the main executable of an installed
+    Khipu.app: the app starts the CLI directly, while a conversation's
+    command has its shell or its harness there. ``chain`` names each process
+    walked (file names only), for the record."""
+    me = _proc_info(os.getpid())
+    if me is None:
+        return {"app": False, "chain": []}
+    pid, own, born = me[0], os.path.realpath(me[1]), me[2] if len(me) > 2 else None
+    chain: list[str] = []
+    for _ in range(_CHAIN_MOST):
+        info = _proc_info(pid)
+        if info is None:
+            break
+        parent, exe = info[0], info[1]
+        started = info[2] if len(info) > 2 else None
+        if born is not None and started is not None and started > born:
+            break  # the parent died and its number was given to a newer process
+        born = started
+        chain.append(os.path.basename(exe))
+        real = os.path.realpath(exe)
+        if real == own:
+            pid = parent
+            continue
+        for bundle in _app_bundles():
+            if _app_main(bundle) == real:
+                where = "/Applications" if bundle.parent == Path("/Applications") else "~/Applications"
+                return {"app": True, "chain": chain, "where": where}
+        break
+    return {"app": False, "chain": chain}
+
+
 def _owner_via(args) -> str | None:
-    """'app' for the app's own fixed-argv calls, 'cli' after a typed
-    confirmation on a terminal, else None (refused)."""
+    """'app' when the app itself started this ``--from-app`` call
+    (``_caller``), 'cli' after a typed confirmation on a terminal, else None
+    (refused). Either way how it was authorised is set for the write
+    (``_OWNER_AUTH``).
+
+    Same-user processes can't be told apart for certain: the check stops a
+    conversation from passing ``--from-app`` itself, not one that drives the
+    app's window, edits the record file or answers the prompt on a terminal
+    it opens."""
     if getattr(args, "from_app", False):
+        caller = _caller()
+        if not caller["app"]:
+            return None
+        _OWNER_AUTH.set({"auth": "app", "auth_chain": " < ".join(caller["chain"] + [caller["where"]])})
         return "app"
     try:
         if not sys.stdin.isatty():
@@ -5351,11 +5569,19 @@ def _owner_via(args) -> str | None:
         answer = input("This is an owner's change to the routing record. Type yes to confirm: ")
     except (EOFError, OSError):
         return None
-    return "cli" if answer.strip().lower() == "yes" else None
+    if answer.strip().lower() != "yes":
+        return None
+    _OWNER_AUTH.set({"auth": "terminal", "auth_chain": " < ".join(_caller()["chain"])})
+    return "cli"
+
+
+def _owner_stamp(event: dict) -> dict:
+    """The owner's line with how it was authorised, when ``_owner_via`` did."""
+    return dict(event, **(_OWNER_AUTH.get() or {}))
 
 
 _REFUSED = ("This is the owner's command: it needs a typed confirmation on a terminal, or the app "
-            "(Settings \u2192 Routing).")
+            "(Settings \u2192 Routing). --from-app is accepted only when the Khipu app itself runs the command.")
 
 
 def _print_json(data: dict) -> None:
@@ -5515,6 +5741,7 @@ def run_cli(args) -> int:
     owner's change is timed after its typed confirmation, not before."""
     cmd = getattr(args, "route_cmd", None)
     now = _now()
+    auth = _OWNER_AUTH.set(None)
     try:
         if cmd is None:
             view = read_view(now)
@@ -5653,3 +5880,5 @@ def run_cli(args) -> int:
     except RouteError as err:
         _print_json({"ok": False, "error": str(err)})
         return 2
+    finally:
+        _OWNER_AUTH.reset(auth)

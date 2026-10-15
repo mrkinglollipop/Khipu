@@ -42,14 +42,14 @@ class Clock:
 
 
 @pytest.fixture
-def home(tmp_path, monkeypatch):
+def home(tmp_path, monkeypatch, khipu_app):
     data = tmp_path / "data"
     data.mkdir()
     (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS}))
     monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
     clock = Clock(T0)
     monkeypatch.setattr(routing, "_now", clock)
-    return {"data": data, "clock": clock, "tmp": tmp_path}
+    return {"data": data, "clock": clock, "tmp": tmp_path, "callers": khipu_app}
 
 
 def _set(home, **values) -> None:

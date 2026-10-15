@@ -1320,12 +1320,14 @@ fn expand_home(path: &str, user_home: Option<&str>) -> String {
     }
 }
 
-/// `usage --sign-in --account=LABEL` for the configured account that reads
-/// `harness` at `home` (None: the CLI's default login). `config` is
-/// `khipu config`'s answer: the account must be one of its
+/// `usage --sign-in --account=LABEL --account-key=HARNESS|FOLDER` for the
+/// configured account that reads `harness` at `home` (None: the CLI's default
+/// login). `config` is `khipu config`'s answer: the account must be one of its
 /// `usage_accounts.accounts`, valid, and of a CLI the app can sign in; its
-/// label comes from that list, never from the webview. The CLI resolves the
-/// label again and builds the login's own argv itself.
+/// label and folder come from that list, never from the webview. The key is
+/// the account's identity (`khipu.usage._key`), so two hand-edited accounts
+/// sharing a label stay apart; the CLI resolves it again, refuses a label
+/// that names more than one account, and builds the login's own argv itself.
 fn sign_in_argv(config: &Value, harness: &str, home: Option<&str>) -> Result<Vec<String>, String> {
     if !SIGN_IN_HARNESSES.contains(&harness) {
         return Err("Khipu can't start this CLI's sign-in; sign in from the CLI itself".to_string());
@@ -1349,7 +1351,16 @@ fn sign_in_argv(config: &Value, harness: &str, home: Option<&str>) -> Result<Vec
     if label.is_empty() || has_control(label) {
         return Err("that account has no label Khipu can name".to_string());
     }
-    Ok(vec!["usage".to_string(), "--sign-in".to_string(), format!("--account={label}")])
+    let folder = account.get("home").and_then(Value::as_str).map(str::trim).unwrap_or("");
+    if has_control(folder) {
+        return Err("that account has a login folder Khipu can't name".to_string());
+    }
+    Ok(vec![
+        "usage".to_string(),
+        "--sign-in".to_string(),
+        format!("--account={label}"),
+        format!("--account-key={harness}|{folder}"),
+    ])
 }
 
 #[tauri::command]
@@ -4570,17 +4581,27 @@ mod priority_and_sign_in_tests {
     #[test]
     fn sign_in_names_only_a_configured_account_and_passes_no_extra_arguments() {
         let c = config();
-        assert_eq!(sign_in_argv(&c, "claude", None).unwrap(), v(&["usage", "--sign-in", "--account=Claude"]));
+        assert_eq!(sign_in_argv(&c, "claude", None).unwrap(), v(&["usage", "--sign-in", "--account=Claude", "--account-key=claude|"]));
         assert_eq!(
             sign_in_argv(&c, "claude", Some("~/.claude-second")).unwrap(),
-            v(&["usage", "--sign-in", "--account=Claude second"])
+            v(&["usage", "--sign-in", "--account=Claude second", "--account-key=claude|~/.claude-second"])
         );
         // The same folder written in full is the same login.
         assert_eq!(
             sign_in_argv(&c, "claude", Some("/home/owner/.claude-second")).unwrap(),
-            v(&["usage", "--sign-in", "--account=Claude second"])
+            v(&["usage", "--sign-in", "--account=Claude second", "--account-key=claude|~/.claude-second"])
         );
-        assert_eq!(sign_in_argv(&c, "codex", Some("")).unwrap(), v(&["usage", "--sign-in", "--account=Codex"]));
+        assert_eq!(sign_in_argv(&c, "codex", Some("")).unwrap(), v(&["usage", "--sign-in", "--account=Codex", "--account-key=codex|"]));
+    }
+
+    #[test]
+    fn sign_in_carries_the_accounts_identity_when_two_share_a_label() {
+        let c = serde_json::json!({"usage_accounts": {"user_home": "/home/owner", "accounts": [
+            {"label": "Same", "harness": "claude", "home": null},
+            {"label": "Same", "harness": "codex", "home": null},
+        ]}});
+        assert_eq!(sign_in_argv(&c, "codex", None).unwrap(), v(&["usage", "--sign-in", "--account=Same", "--account-key=codex|"]));
+        assert_eq!(sign_in_argv(&c, "claude", None).unwrap(), v(&["usage", "--sign-in", "--account=Same", "--account-key=claude|"]));
     }
 
     #[test]

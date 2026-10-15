@@ -8,6 +8,7 @@ here starts a CLI: the sign-in tests hand ``usage.sign_in`` a fake Popen.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import datetime, timedelta, timezone
 
@@ -69,7 +70,7 @@ FIGURES = {
 
 
 @pytest.fixture
-def home(tmp_path, monkeypatch):
+def home(tmp_path, monkeypatch, khipu_app):
     data = tmp_path / "data"
     data.mkdir()
     (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS}))
@@ -77,7 +78,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-one")
     clock = Clock(T0)
     monkeypatch.setattr(routing, "_now", clock)
-    out = {"data": data, "clock": clock, "tmp": tmp_path}
+    out = {"data": data, "clock": clock, "tmp": tmp_path, "callers": khipu_app}
     _cache(out, FIGURES)
     return out
 
@@ -410,7 +411,7 @@ class FakeProc:
         return self.code
 
 
-def _sign_in(home, monkeypatch, label, proc=None):
+def _sign_in(home, monkeypatch, label, proc=None, key=None):
     seen = {}
 
     def popen(argv, **kw):
@@ -421,7 +422,7 @@ def _sign_in(home, monkeypatch, label, proc=None):
     monkeypatch.setattr(usage, "report", lambda **kw: {"accounts": [{"account": kw["accounts"][0]["label"],
                                                                      "ok": True, "probed": True}]})
     monkeypatch.setattr(usage, "_killpg", lambda proc: seen.setdefault("killed", True))
-    out = usage.sign_in(label, popen=popen, wait=1)
+    out = usage.sign_in(label, key=key, popen=popen, wait=1)
     return out, seen
 
 
@@ -446,6 +447,32 @@ def test_sign_in_refuses_an_account_that_is_not_configured_and_offers_none_for_g
     assert out == {"ok": False, "error": "not_configured"} and seen == {}
     out, seen = _sign_in(home, monkeypatch, "Grok")
     assert out == {"ok": False, "error": "no_sign_in", "cli": "Grok Build"} and seen == {}
+
+
+def test_sign_in_follows_the_accounts_key_and_refuses_a_label_two_accounts_share(home, monkeypatch):
+    # Hand-edited: a Claude and a Codex account written with one label.
+    _set(home, usage_accounts=[{"label": "Same", "harness": "claude"}, {"label": "Same", "harness": "codex"},
+                               {"label": "Other", "harness": "claude", "home": "/logins/claude-other"}])
+    out, seen = _sign_in(home, monkeypatch, "Same", key="codex|")
+    assert out["ok"] and seen["argv"] == ["/opt/bin/codex", "login"]
+    out, seen = _sign_in(home, monkeypatch, "Same", key="claude|")
+    assert out["ok"] and seen["argv"] == ["/opt/bin/claude", "auth", "login", "--claudeai"]
+    out, seen = _sign_in(home, monkeypatch, "Same")
+    assert out == {"ok": False, "error": "ambiguous_account"} and seen == {}
+    # A label and a key that name different accounts are refused, never one of them picked.
+    out, seen = _sign_in(home, monkeypatch, "Same", key="claude|/logins/claude-other")
+    assert out == {"ok": False, "error": "not_configured"} and seen == {}
+    out, seen = _sign_in(home, monkeypatch, "Other", key="claude|/logins/claude-other")
+    assert out["ok"] and seen["env"]["CLAUDE_CONFIG_DIR"] == "/logins/claude-other"
+    out, seen = _sign_in(home, monkeypatch, "Same", key="claude|/logins/nobody")
+    assert out == {"ok": False, "error": "not_configured"} and seen == {}
+    # A label only one account has still resolves on its own.
+    out, seen = _sign_in(home, monkeypatch, "Other")
+    assert out["ok"]
+    # Hand-edited: two labels on one login folder; the label settles the key's tie.
+    _set(home, usage_accounts=[{"label": "One", "harness": "codex"}, {"label": "Two", "harness": "codex"}])
+    out, seen = _sign_in(home, monkeypatch, "Two", key="codex|")
+    assert out["ok"] and seen["argv"] == ["/opt/bin/codex", "login"]
 
 
 def test_a_sign_in_left_open_is_stopped_and_the_account_read_again(home, monkeypatch):
@@ -494,3 +521,196 @@ def test_the_apps_argv_parses_as_the_app_means_it(home, capsys):
     assert cli.main(["route", "priority", "--from-app", "--", "clear"]) == 0
     assert routing.read_view().get("priority") is None
     capsys.readouterr()
+
+
+# ---- fix round: --from-app is accepted only when the app started the command -----------------
+
+_OWNER_ARGVS = [
+    ["route", "priority", "--from-app", "--", "confirm"],
+    ["route", "priority", "--from-app", "--", "undo"],
+    ["route", "priority", "--from-app", "--", "clear"],
+    ["route", "priority", "--from-app", "--entries=[{\"account\": \"Codex\"}]", "--", "set"],
+    ["route", "rule", "--from-app", "--", "confirm", "1"],
+    ["route", "rule", "--from-app", "--", "undo", "1"],
+    ["route", "rule", "--from-app", "--", "retire", "1"],
+    ["route", "rule", "--from-app", "--", "add", "Any rule"],
+    ["route", "note", "--from-app", "--", "set", "Any note"],
+    ["route", "pause", "--from-app", "--", "Codex"],
+    ["route", "clear", "--from-app", "--", "Codex"],
+    ["route", "hold", "--from-app", "--reason=other", "--machine", "--", "keep it"],
+]
+
+
+def _owner_world(home, capsys):
+    """A rule and a priority each waiting for the owner, both from a conversation."""
+    from khipu import cli
+
+    assert cli.main(["route", "rule", "--at-owner-request=the owner asked", "--", "add", "Never a fast tier."]) == 0
+    assert cli.main(["route", "rule", "--from-app", "--", "add", "Be kind to the Mac."]) == 0
+    assert cli.main(["route", "rule", "--at-owner-request=the owner asked", "--", "edit", "2", "Be nice."]) == 0
+    routing.request_priority([{"account": "Codex"}], owner_request="the owner asked", author=ME)
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("argv", _OWNER_ARGVS, ids=lambda a: " ".join(a[1:2] + a[-2:]))
+@pytest.mark.parametrize("tree", ["shell", "python under a shell", "a shell under the app", "lookalike"])
+def test_from_app_is_refused_unless_the_app_itself_started_the_command(home, capsys, argv, tree):
+    from khipu import cli
+
+    _owner_world(home, capsys)
+    callers = home["callers"]
+    if tree == "shell":
+        callers.as_shell()
+    elif tree == "python under a shell":
+        callers.as_shell("/usr/bin/python3", "/opt/homebrew/bin/python3.12")
+    elif tree == "a shell under the app":
+        callers.as_shell()
+        callers.tree[900] = (901, "/bin/zsh")
+        callers.tree[901] = (1, str(callers.app))
+    else:
+        fake = home["tmp"] / "Khipu.app" / "Contents" / "MacOS" / "khipu-desktop"
+        fake.parent.mkdir(parents=True)
+        fake.write_text("")
+        callers.tree = {**callers.tree, 900: (1, str(fake))}
+    before = routing.events_file().read_bytes()
+    rc = cli.main(argv)
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 2 and out["ok"] is False and "--from-app" in out["error"]
+    assert routing.events_file().read_bytes() == before
+
+
+def test_an_owner_line_records_how_it_was_authorised(home, capsys):
+    from khipu import cli
+
+    _owner_world(home, capsys)
+    assert cli.main(["route", "priority", "--from-app", "--", "confirm"]) == 0
+    events, _bad = routing.read_events()
+    line = events[-1]
+    assert line["type"] == "priority_confirm" and line["via"] == "app" and line["auth"] == "app"
+    assert line["auth_chain"].startswith("khipu-desktop")
+    # A conversation's own lines carry no owner authorisation.
+    assert all("auth" not in e for e in events if (e.get("written_by") or {}).get("kind") == "conversation")
+
+
+def test_an_owner_write_that_skipped_the_check_shows_as_unchecked(home, capsys):
+    from khipu import cli
+
+    _owner_world(home, capsys)
+    assert cli.main(["route", "rule", "--from-app", "--", "confirm", "1"]) == 0
+    # Imported and called directly, as a conversation could: no check ran.
+    routing.confirm_priority(via="app")
+    routing.confirm_rule(2, via="app")
+    view = routing.read_view()
+    assert view["priority"]["via"] == "app-unchecked"
+    assert view["unchecked"] == ["priority", "rule 2"]
+    assert next(r for r in view["rules"] if r["n"] == 1)["via"] == "app"
+    warnings = routing.doctor_block()["warnings"]
+    assert any("did not pass Khipu's owner check" in w and "priority, rule 2" in w for w in warnings)
+
+
+def test_lines_from_before_the_check_are_not_marked(home):
+    routing.set_note("Written before the check existed.", via="app")
+    assert routing.read_view()["note"]["via"] == "app" and routing.read_view()["unchecked"] == []
+
+
+def test_the_real_process_lookup_reads_this_process():
+    import sys
+
+    if sys.platform != "darwin":
+        pytest.skip("macOS process lookup")
+    parent, exe, _started = routing._proc_info(os.getpid())
+    assert parent == os.getppid()
+    assert os.path.realpath(exe) == os.path.realpath(sys.executable) or "python" in os.path.basename(exe).lower()
+    # pytest is not started by an installed Khipu.app.
+    assert routing._caller()["app"] is False
+
+
+# ---- fix round: a conversation's words count against the size budgets ------------------------
+
+LONG = "use it hard " * 170  # about 2,000 characters
+
+
+def test_a_conversations_long_priority_fits_the_summary_budget_as_a_pointer(home):
+    _set(home, routing_summary_chars=1500)
+    routing.set_note("Owner's note.", via="app")
+    routing.request_priority([{"account": "Codex", "role": LONG}], owner_request="the owner asked", author=ME)
+    out = routing.summary(now=home["clock"].now)
+    text = out["text"]
+    assert LONG.strip() not in text and routing.PRIORITY_POINTER in text
+    head = text.splitlines()[0]
+    assert len(text) - len(head) - 1 - len("Note from the owner (") <= 1500 + 40
+    # The owner's own words stay whole, however long.
+    routing.set_priority([{"account": "Codex", "role": LONG}], via="app")
+    assert LONG.strip() in _summary(home)
+
+
+def test_a_conversations_long_priority_fits_the_push_budget_as_a_pointer(home):
+    _set(home, routing_prompt_chars=400)
+    start = routing.read_view()
+    routing.request_priority([{"account": "Codex", "role": LONG}], owner_request="the owner asked", author=ME)
+    view = routing.read_view()
+    changed = routing.since(start["version"], view, now=home["clock"].now)
+    text, _count = routing.changes_text(changed, view, home["clock"].now)
+    assert LONG.strip() not in text and routing.PRIORITY_POINTER in text
+    assert len(text) - len(text.splitlines()[0]) - 1 <= 400
+
+
+def test_a_conversations_long_rule_request_fits_both_budgets_as_a_pointer(home):
+    _set(home, routing_prompt_chars=400, routing_summary_chars=1500)
+    start = routing.read_view()
+    routing.request_rule(LONG, owner_request="the owner asked", author=ME)
+    view = routing.read_view()
+    changed = routing.since(start["version"], view, now=home["clock"].now)
+    text, _count = routing.changes_text(changed, view, home["clock"].now)
+    assert LONG.strip() not in text and "too long to show here" in text
+    assert len(text) - len(text.splitlines()[0]) - 1 <= 400
+    summary = _summary(home)
+    assert LONG.strip() not in summary and "1. A conversation added this rule" in summary
+    # A short request still arrives whole.
+    routing.request_rule("Short words.", owner_request="the owner asked", author=ME)
+    assert "Short words." in _summary(home)
+
+
+def test_many_conversation_requests_take_at_most_half_the_budget(home):
+    _set(home, routing_prompt_chars=400, routing_summary_chars=1500)
+    start = routing.read_view()
+    for i in range(12):
+        routing.request_rule(f"rule {i} " + "x" * 500, owner_request="the owner asked",
+                             author=dict(ME, session=f"s-{i}"))
+    routing.report(state="limited", account="Codex", until="2h", author=OTHER)
+    view = routing.read_view()
+    changed = routing.since(start["version"], view, now=home["clock"].now)
+    text, _count = routing.changes_text(changed, view, home["clock"].now)
+    assert len(text) - len(text.splitlines()[0]) - 1 <= 400
+    assert "12 unconfirmed changes a conversation made" in text
+    assert any(x.startswith("Codex") for x in text.splitlines())  # the owner's accounts keep their room
+    summary = _summary(home)
+    assert "unconfirmed changes a conversation made" in summary and any(x.startswith("Codex") for x in summary.splitlines())
+
+
+def test_an_unstamped_owner_line_is_unchecked_whatever_its_via_or_seq(home, capsys):
+    from khipu import cli
+
+    assert cli.main(["route", "note", "--from-app", "--", "set", "Checked."]) == 0
+    capsys.readouterr()
+    # Appended by hand: a seq that would sort it before the stamped line, and
+    # an owner's line claiming another way in.
+    with routing.events_file().open("a") as fh:
+        fh.write(json.dumps({"type": "rule_add", "n": 7, "text": "Forged early.", "seq": -5, "via": "app",
+                             "written_by": {"kind": "owner"}, "written_at": "2026-10-15T14:00:00Z"}) + "\n")
+        fh.write(json.dumps({"type": "pause", "account": "codex|", "via": "mcp",
+                             "written_by": {"kind": "owner"}, "written_at": "2026-10-15T14:00:00Z"}) + "\n")
+    view = routing.read_view()
+    assert "rule 7" in view["unchecked"] and "pause of Codex" in view["unchecked"]
+
+
+def test_a_reused_process_number_is_not_the_app(home, capsys):
+    from khipu import cli
+
+    callers = home["callers"]
+    me = os.getpid()
+    # The app died and its number now belongs to a process started after this one.
+    callers.tree = {me: (900, "/usr/bin/python3", 100.0), 900: (1, str(callers.app), 200.0)}
+    assert cli.main(["route", "note", "--from-app", "--", "set", "x"]) == 2
+    callers.tree = {me: (900, "/usr/bin/python3", 100.0), 900: (1, str(callers.app), 50.0)}
+    assert cli.main(["route", "note", "--from-app", "--", "set", "x"]) == 0

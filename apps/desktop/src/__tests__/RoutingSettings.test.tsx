@@ -269,6 +269,13 @@ describe("Settings -> Routing: who made each change", () => {
     expect(owner).toHaveLength(5);
     for (const r of owner) expect(r.who).toBe("You, in Settings");
   });
+
+  it("says when a change marked as yours did not pass Khipu's owner check", () => {
+    const unchecked = OWNER_ENDINGS.map((c) => ({ ...c, items: c.items.map((i) => ({ ...i, via: "app-unchecked" })) }));
+    const rows = changeDays({ ...view(), changes: unchecked } as RouteView, MORNING).flatMap((d) => d.rows);
+    expect(rows).toHaveLength(3);
+    for (const r of rows) expect(r.who).toBe("Marked as you, but not checked by Khipu");
+  });
 });
 
 describe("Settings -> Routing: accounts", () => {
