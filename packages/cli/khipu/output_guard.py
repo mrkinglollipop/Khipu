@@ -14,12 +14,13 @@ import sys
 from contextlib import redirect_stderr, redirect_stdout
 from contextvars import ContextVar
 from functools import wraps
-from urllib.parse import parse_qsl, quote, quote_plus, unquote, unquote_plus, urlsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlsplit
 
 REPLACEMENT = "REDACTED"
 _SECRET_NAME = re.compile(r"key|token|passphrase|password|secret|auth", re.I)
 _USERINFO = re.compile(r'(?i)\b([a-z][a-z0-9+.-]*://)[^/?#\r\n"<>]*@')
 _URL = re.compile(r'(?i)\b[a-z][a-z0-9+.-]*://[^\s"<>\\]+')
+_ENCODED_RUN = re.compile(r'[^\s"<>\\]*%[0-9a-fA-F]{2}[^\s"<>\\]*')
 _JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
 _ACTIVE: ContextVar[set[str] | None] = ContextVar("command_output_secrets", default=None)
 
@@ -70,35 +71,44 @@ def secret_result(name: str):
     return decorate
 
 
-def _strip_urls(text: str) -> str:
-    # Accept spaces in malformed userinfo: url tokenizers stop too early there.
-    text = _USERINFO.sub(r"\1", text)
-
+def _strip_urls(text: str, secrets: set[str]) -> str:
     def clean(match):
         url = match.group()
-        base, sep, query = url.partition("?")
-        if not sep:
+        try:
+            parts = urlsplit(url)
+        except ValueError:
             return url
-        query, fragment_sep, fragment = query.partition("#")
-        kept = [part for part in query.split("&")
-                if not _SECRET_NAME.search(unquote_plus(part.partition("=")[0]))]
-        return base + ("?" + "&".join(kept) if kept else "") + fragment_sep + fragment
+        userinfo, sep, host = parts.netloc.rpartition("@")
+        if sep and any(secret in unquote_plus(userinfo) for secret in secrets):
+            parts = parts._replace(netloc=host)
+        kept = []
+        for part in parts.query.split("&"):
+            key, sep, value = part.partition("=")
+            if _SECRET_NAME.search(unquote_plus(key)):
+                continue
+            if any(secret in unquote_plus(value) for secret in secrets):
+                value = REPLACEMENT
+            kept.append(key + sep + value)
+        return parts._replace(query="&".join(kept)).geturl()
 
-    return _URL.sub(clean, text)
+    # Also remove unknown userinfo and malformed userinfo containing spaces.
+    return _USERINFO.sub(r"\1", _URL.sub(clean, text))
 
 
 def sanitize(text: str) -> str:
     """Protect JSON string contents and plain text, including encoded values."""
-    variants = set()
-    for secret in _ACTIVE.get() or ():
-        for form in (secret, quote(secret, safe=""), quote_plus(secret), quote(secret)):
-            variants.add(form)
-            variants.add(re.sub(r"%[0-9A-F]{2}", lambda m: m.group().lower(), form))
+    secrets = _ACTIVE.get() or set()
 
     def clean(value):
-        for variant in sorted(variants, key=len, reverse=True):
-            value = value.replace(variant, REPLACEMENT)
-        return _strip_urls(value)
+        # Raw secrets can contain spaces which would split a URL into tokens.
+        for secret in sorted(secrets, key=len, reverse=True):
+            value = value.replace(secret, REPLACEMENT)
+        value = _strip_urls(value, secrets)
+        value = _ENCODED_RUN.sub(
+            lambda match: REPLACEMENT if any(
+                secret in unquote_plus(match.group()) for secret in secrets
+            ) else match.group(), value)
+        return value
 
     def clean_json(match):
         try:

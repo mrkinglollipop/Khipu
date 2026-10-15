@@ -4,7 +4,7 @@ import json
 import random
 import string
 from contextlib import ExitStack
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, unquote_plus
 from unittest import mock
 
 import pytest
@@ -70,6 +70,71 @@ COMMANDS = [
     (["graph-backup", "drill"], gb, "scratch_drill"),
     (["graph-backup", "status"], gb, "status_payload"),
 ]
+
+
+def encoded_secret(value, encoding):
+    if encoding == "over-encoded":
+        return "".join(f"%{byte:02x}" for byte in value.encode())
+    return quote(value, safe="").replace("%2F", "%2f").replace("%A9", "%a9")
+
+
+@pytest.mark.parametrize("encoding", ["mixed-case", "over-encoded"])
+@pytest.mark.parametrize("argv,module,name", COMMANDS, ids=[" ".join(c[0][:2]) for c in COMMANDS])
+def test_encoded_secrets_in_views_and_text_across_commands(argv, module, name, encoding,
+                                                         tmp_path, monkeypatch, capsys):
+    import sys
+
+    password, api, phrase, token = secrets = [f"{kind}-round6/+é" for kind in
+                                            ("db", "api", "phrase", "token")]
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("KHIPU_DATABASE_URL", "postgresql://u:" + quote(password, safe="") + "@hub.example/db")
+    monkeypatch.setenv("KHIPU_JOIN_PASSPHRASE", phrase)
+    (tmp_path / "config.json").write_text(json.dumps({"gateway_token": token,
+        "providers": {"one": {"api_key": api}}}))
+    path = tmp_path / "kit.khipujoin"
+    path.write_text(json.dumps({"format": join.FORMAT_VERSION,
+                               "database_url": "postgresql://u@hub.example/db"}))
+    if argv[:2] == ["join", "import"]:
+        argv = [*argv, str(path)]
+
+    def fail(*args, **kwargs):
+        config.load_config()
+        db.resolve_dsn()
+        join.decrypt_payload(path.read_bytes(), phrase)
+        query = "&".join(f"view{i}=prefix-{encoded_secret(secret, encoding)}-suffix"
+                         for i, secret in enumerate(secrets))
+        for stream in (sys.stdout, sys.stderr):
+            print(json.dumps({"url": "https://gateway.example/join?ready=yes&" + query}), file=stream)
+            for secret in secrets:
+                print("detail: prefix-" + encoded_secret(secret, encoding) + "-suffix", file=stream)
+        raise join.JoinError("synthetic failure")
+
+    with mock.patch.object(module, name, side_effect=fail):
+        assert cli.main(argv) in (1, 2)
+    captured = capsys.readouterr()
+    for text in (captured.out, captured.err):
+        decoded = unquote_plus(text)
+        for secret in secrets:
+            assert secret not in decoded
+        assert "ready=yes" in text
+        assert "REDACTED" in text
+
+
+@pytest.mark.parametrize("encoding", ["mixed-case", "over-encoded"])
+def test_successful_import_redacts_encoded_view(encoding, tmp_path, monkeypatch, capsys):
+    secret = "api-round6/+é"
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
+    path = tmp_path / "kit.khipujoin"
+    path.write_text(json.dumps({"format": join.FORMAT_VERSION,
+        "database_url": "postgresql://u@hub.example/db", "gemini_api_key": secret,
+        "gateway_url": "https://gateway.example/join?ready=yes&view=" + encoded_secret(secret, encoding)}))
+    with (mock.patch.object(join, "read_passphrase", return_value="synthetic phrase"),
+          mock.patch.object(keychain, "set_dsn"), mock.patch.object(keychain, "set_gemini_key"),
+          mock.patch.object(join, "verify_live_counts", return_value={"ok": True})):
+        assert cli.main(["join", "import", "--file", str(path), "--skip-migrate-check"]) == 0
+    captured = capsys.readouterr()
+    assert secret not in unquote_plus(captured.out + captured.err)
+    assert json.loads(captured.out)["summary"]["gateway_url"] == "https://gateway.example/join?ready=yes&view=REDACTED"
 
 
 @pytest.mark.parametrize("argv,module,name", COMMANDS, ids=[" ".join(c[0][:2]) for c in COMMANDS])
