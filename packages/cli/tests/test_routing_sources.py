@@ -619,12 +619,14 @@ def test_a_failed_runner_read_is_never_dated_by_a_fresh_one(home, capsys):
     home["clock"].advance(hours=24)
     assert routing.run_cli(_args(json=True)) == 0
     result = _results(json.loads(capsys.readouterr().out))[1]
-    assert result["result"] == "stale" and result["at"] is None
+    assert result["result"] == "failed" and result["at"] is None
     (check,) = result["checks"]
-    sources = {s["runner"]: s for s in check["sources"]}
-    assert sources["project A"]["failed"] is True and sources["project A"]["good_at"] == routing._iso(T0)
-    assert sources["project B"]["failed"] is False
-    assert sources["project B"]["good_at"] == routing._iso(T0 + timedelta(hours=24))
+    cells = {c["runner"]: c for c in check["cells"]}
+    assert cells["project A"]["outcome"] == "failed"
+    settings = cells["project A"]["reads"]["settings"]
+    assert settings["failed"] is True and settings["good_at"] == routing._iso(T0)
+    assert cells["project B"]["outcome"] == "ok" and cells["project B"]["reads"]["settings"]["failed"] is False
+    assert cells["project B"]["reads"]["settings"]["good_at"] == routing._iso(T0 + timedelta(hours=24))
 
 
 def test_a_source_read_too_long_ago_is_stale_and_coverage_takes_the_oldest_time():
@@ -642,7 +644,7 @@ def test_a_source_read_too_long_ago_is_stale_and_coverage_takes_the_oldest_time(
     old = {"runners": {"A": runner(now - timedelta(hours=13)), "B": runner(now - timedelta(minutes=1))}}
     (stale,) = routing_sources.rule_results(old, rules, now=now, stale_after=12 * 3600)
     assert stale["result"] == "stale" and stale["at"] is None
-    assert [s["runner"] for s in stale["checks"][0]["sources"] if s["stale"]] == ["A"]
+    assert [c["runner"] for c in stale["checks"][0]["cells"] if c["outcome"] == "stale"] == ["A"]
 
 
 def test_a_rule_with_several_checks_passes_only_when_every_check_passed(home, capsys):
@@ -662,8 +664,73 @@ def test_a_runner_whose_settings_were_never_read_is_not_a_pass(home):
     rules = [{"n": 1, "text": "Never a -fast tier."}]
     cache = {"runners": {"project A": {"config": {"data": None, "good_at": None}}}}
     (result,) = routing_sources.rule_results(cache, rules)
-    assert (result["rule"], result["result"], result["at"]) == (1, "unreadable", None)
-    assert [(c["check"], c["result"], c["sources"]) for c in result["checks"]] == [("fast_tier", "unreadable", [])]
+    assert (result["rule"], result["result"], result["at"]) == (1, "not_read", None)
+    (check,) = result["checks"]
+    assert (check["check"], check["result"]) == ("fast_tier", "not_read")
+    assert [(c["runner"], c["outcome"], c["reads"]["settings"]["read"]) for c in check["cells"]] == [
+        ("project A", "not_read", False)]
+    # A registered runner the cache never held is a source too.
+    (result,) = routing_sources.rule_results({"runners": {}}, rules, runners=["project B"])
+    assert result["result"] == "not_read" and result["checks"][0]["cells"][0]["runner"] == "project B"
+
+
+def _cell(result: dict, check: str, runner: str) -> dict:
+    found = next(c for c in result["checks"] if c["check"] == check)
+    return next(c for c in found["cells"] if c["runner"] == runner)
+
+
+def test_a_runner_never_read_is_a_source_of_the_check_and_never_a_pass(home, capsys):
+    """Codex review round 2 (A): B's settings are malformed before Khipu ever
+    read them; B is still a source of the check, so the rule is not a pass."""
+    _register(home, b=True)
+    (home["b"] / "config.json").write_text("{not json")
+    routing.add_rule("Never a -fast tier.", via="app")
+    assert routing.run_cli(_args(json=True)) == 0
+    result = _results(json.loads(capsys.readouterr().out))[1]
+    assert result["result"] != "ok" and result["at"] is None
+    cell = _cell(result, "fast_tier", "project B")
+    assert cell["outcome"] in ("not_read", "failed")
+    assert cell["reads"]["settings"]["read"] is False
+    assert _cell(result, "fast_tier", "project A")["outcome"] == "ok"
+
+
+def test_the_privacy_check_needs_fresh_settings_as_well_as_events(home, capsys):
+    """Codex review round 2 (B): the privacy check reads its lanes from the
+    settings, so failed settings stop it even while the events still read."""
+    _register(home)
+    routing.add_rule("Grok never builds or fixes privacy or safety code.", via="app")
+    assert routing.run_cli(_args(json=True)) == 0
+    assert _results(json.loads(capsys.readouterr().out))[1]["result"] == "ok"
+    (home["a"] / "config.json").write_text("{not json")
+    home["clock"].advance(hours=24)
+    _append(home["a"], "2026-10-15T14:59:00Z pipe-7 HOLD unrelated")
+    assert routing.run_cli(_args(json=True)) == 0
+    result = _results(json.loads(capsys.readouterr().out))[1]
+    assert result["result"] != "ok" and result["at"] is None
+    cell = _cell(result, "grok_private", "project A")
+    settings = cell["reads"]["settings"]
+    assert settings["failed"] is True and settings["good_at"] == routing._iso(T0)
+    assert cell["reads"]["events"]["failed"] is False
+    assert cell["outcome"] == "failed"
+
+
+def test_a_broken_check_never_marks_another_check_of_the_same_rule(home, capsys):
+    """Codex review round 2 (C): broken findings match the check and runner,
+    never the rule number."""
+    _register(home)
+    routing.add_rule("Never a -fast tier or the paid xAI API.", via="app")
+    config = json.loads((home["a"] / "config.json").read_text())
+    config["lanes"]["codex"]["model"] = "gpt-6.1-sol-fast"
+    (home["a"] / "config.json").write_text(json.dumps(config))
+    assert routing.run_cli(_args(json=True)) == 0
+    result = _results(json.loads(capsys.readouterr().out))[1]
+    checks = {c["check"]: c for c in result["checks"]}
+    assert result["result"] == "broken"
+    assert checks["fast_tier"]["result"] == "broken"
+    assert checks["fast_tier"]["text"] == ("A standing rule may be broken: project A's settings name a model "
+                                           "ending in -fast for its codex lane.")
+    assert checks["paid_xai"]["result"] == "cannot_check" and checks["paid_xai"]["text"] is None
+    assert "paid xAI API can't be checked" in checks["paid_xai"]["why"]
 
 
 def test_a_launch_while_paused_is_named(home):

@@ -1163,7 +1163,7 @@ function RuleRow({
   const origin = ruleOrigin(r.source, r.date, now);
   const checks = ruleResultLines(watched, result, now.getTime());
   return (
-    <li className={`row-item route-rule${result?.result === "broken" && checks.some((c) => c.tone === "warn") ? " broken" : ""}`}>
+    <li className={`row-item route-rule${watched && result?.result === "broken" ? " broken" : ""}`}>
       <span className="route-rule-n" aria-hidden>
         {r.n}.
       </span>
@@ -1327,8 +1327,10 @@ const rulesWord = (n: number) => `${n} rule${n === 1 ? "" : "s"}`;
 
 function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }) {
   const rules = data.rules ?? [];
-  const watchedRules = data.watched_rules ?? [];
   const results = data.rule_results ?? [];
+  // Which rules Khipu checks: those with a result (the same matrix the lines
+  // come from); an older Khipu without results names them in watched_rules.
+  const watchedRules = data.rule_results ? results.map((x) => x.rule) : (data.watched_rules ?? []);
   const resultOf = (n: number) => results.find((x) => x.rule === n);
   const [filter, setFilter] = useState<RuleFilter>("all");
   const filterLabel = useId();

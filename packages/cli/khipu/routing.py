@@ -4607,10 +4607,13 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["rule_checks"] = routing_sources.rule_checks(view.get("source_cache") or {}, view.get("rules") or [])
     # Settings -> Accounts and routing (clarity phase 5): what each checked
     # rule's last check found and when it ran, so a rule row says "nothing
-    # wrong found" only after a check that ran.
+    # wrong found" only after a check that ran. Every registered runner is a
+    # source, a runner Khipu never read included.
+    registered = [r.get("name") for r in (view.get("sources") or {}).get("runners") or [] if isinstance(r, dict)]
     out["rule_results"] = routing_sources.rule_results(view.get("source_cache") or {}, view.get("rules") or [],
                                                        out["rule_checks"], now=now,
-                                                       stale_after=cfg["routing_stale_after"] or 0)
+                                                       stale_after=cfg["routing_stale_after"] or 0,
+                                                       runners=registered)
     out["warn_after"] = {"disagreement": cfg["routing_disagreement_warn_after"],
                          "not_refreshed": cfg["routing_not_refreshed_after"]}
     # How long a limit reported without a time lasts (the card says so).

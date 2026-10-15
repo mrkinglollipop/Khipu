@@ -425,13 +425,14 @@ describe("Settings -> Routing: standing rules", () => {
   });
 
   it("never shows a stale check as fresh", async () => {
-    const src = (runner: string, o: object = {}) => ({ runner, good_at: "2026-10-13T15:36:00Z", failed: false, since: null, stale: false, ...o });
+    const cell = (runner: string, outcome: string, o: object = {}) => ({
+      runner, outcome, reads: { settings: { read: true, good_at: "2026-10-13T15:36:00Z", failed: false, since: null, stale: false, ...o } } });
     answers.khipu_route_view = {
       ...view(),
       rule_results: [{
-        rule: 3, check: "fast_tier", result: "stale", lanes: 2, unchecked: 0,
-        checks: [{ check: "fast_tier", result: "stale", lanes: 2, unchecked: 0,
-          sources: [src("Project A", { failed: true, since: "2026-10-14T15:00:00Z", stale: true }), src("Project B", { good_at: "2026-10-14T15:36:00Z" })] }],
+        rule: 3, check: "fast_tier", result: "failed", lanes: 2, unchecked: 0,
+        checks: [{ check: "fast_tier", result: "failed", lanes: 2, unchecked: 0,
+          cells: [cell("Project A", "failed", { failed: true, since: "2026-10-14T15:00:00Z", stale: true }), cell("Project B", "ok", { good_at: "2026-10-14T15:36:00Z" })] }],
       }],
     };
     await page();
@@ -441,7 +442,7 @@ describe("Settings -> Routing: standing rules", () => {
     expect(three).not.toHaveTextContent("just now");
     expect(three).not.toHaveTextContent("Project B");
     expect(ruleResultLine(true, { rule: 3, result: "stale", checks: [{ check: "fast_tier", result: "stale",
-      sources: [src("Project A", { good_at: "2026-10-14T03:00:00Z", stale: true })] }] }, Date.parse("2026-10-14T16:00:00Z"))).toEqual({
+      cells: [cell("Project A", "stale", { good_at: "2026-10-14T03:00:00Z", stale: true })] }] }, Date.parse("2026-10-14T16:00:00Z"))).toEqual({
       text: "Checked by Khipu, but not now: Khipu last read Project A's settings 13 h ago.", tone: "" });
   });
 
@@ -464,6 +465,51 @@ describe("Settings -> Routing: standing rules", () => {
     expect(three).not.toHaveTextContent("nothing wrong found");
     expect(three.querySelectorAll(".rule-result")).toHaveLength(2);
     expect(three).not.toHaveClass("broken");
+  });
+
+  // Codex review round 2 (A): a runner Khipu never read is named, never passed over.
+  it("names a job runner Khipu has never read and claims no pass", async () => {
+    const read = (o: object = {}) => ({ read: true, good_at: "2026-10-14T15:36:00Z", failed: false, since: null, stale: false, ...o });
+    answers.khipu_route_view = {
+      ...view(),
+      rule_results: [{
+        rule: 3, check: "fast_tier", result: "not_read", at: null, lanes: 0, unchecked: 0,
+        checks: [{ check: "fast_tier", result: "not_read", at: null, lanes: 0, unchecked: 0, cells: [
+          { runner: "project A", outcome: "ok", lanes: 3, unchecked: 0, reads: { settings: read() } },
+          { runner: "project B", outcome: "not_read", lanes: 0, unchecked: 0,
+            reads: { settings: read({ read: false, good_at: null, failed: true, since: "2026-10-14T15:36:00Z" }) } },
+        ] }],
+      }],
+    };
+    await page();
+    const three = row("Standing rules", "3.");
+    expect(three).toHaveTextContent("Checked by Khipu, but not now: Khipu has never read project B's settings.");
+    expect(three).not.toHaveTextContent("nothing wrong found");
+    expect(three).not.toHaveTextContent("just now");
+    expect(three).not.toHaveTextContent("project A");
+  });
+
+  // Codex review round 2 (C): each check's line is its own, never another check's finding.
+  it("keeps a broken check's finding off the rule's other check", async () => {
+    const text = "A standing rule may be broken: project A's settings name a model ending in -fast for its codex lane.";
+    answers.khipu_route_view = {
+      ...view(),
+      rule_results: [{
+        rule: 3, check: "fast_tier", result: "broken", text, more: 0,
+        checks: [
+          { check: "fast_tier", result: "broken", text, more: 0, cells: [] },
+          { check: "paid_xai", result: "cannot_check", text: null, more: 0, lanes: 0, unchecked: 1, cells: [] },
+        ],
+      }],
+    };
+    await page();
+    const three = row("Standing rules", "3.");
+    expect(three).toHaveClass("broken");
+    const lines = [...three.querySelectorAll(".rule-result")].map((x) => x.textContent ?? "");
+    const xai = lines.find((l) => l.includes("for the paid xAI API")) ?? "";
+    expect(xai).toBe("Checked by Khipu for the paid xAI API, but not here: the launch environment is set inside the launch script, which Khipu doesn't read.");
+    expect(xai).not.toContain("-fast");
+    expect(lines.find((l) => l.includes("-fast"))).toBe("Checked by Khipu for models ending in -fast: may be broken. Project A's settings name a model ending in -fast for its codex lane.");
   });
 
   it("shows a broken check on the rule's own row and in Home's list", async () => {

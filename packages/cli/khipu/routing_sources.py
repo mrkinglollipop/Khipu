@@ -890,30 +890,38 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
 # ---- doctor's rule checks (read from config.json and ADDED lines only) ------------------
 
 
+def _asks_for(text) -> list[str]:
+    """The checks one rule's own words ask for."""
+    text = str(text or "").lower()
+    out = []
+    if "-fast" in text:
+        out.append("fast_tier")
+    if "xai" in text:
+        out.append("paid_xai")
+    if "grok" in text and ("privacy" in text or "safety" in text):
+        out.append("grok_private")
+    if "grok" in text and ("re-check" in text or "recheck" in text or "model family" in text):
+        out.append("grok_confirm")
+    return out
+
+
 def watched(rules: list[dict]) -> dict[str, int]:
     """Which checks the active standing rules ask for: the check's name to
-    the rule's number. The public product ships with no rules, so nothing is
-    checked there."""
+    the first rule's number that asks for it. The public product ships with
+    no rules, so nothing is checked there."""
     out: dict[str, int] = {}
     for rule in rules:
-        text = str(rule.get("text") or "").lower()
-        n = rule.get("n")
-        if "-fast" in text:
-            out.setdefault("fast_tier", n)
-        if "xai" in text:
-            out.setdefault("paid_xai", n)
-        if "grok" in text and ("privacy" in text or "safety" in text):
-            out.setdefault("grok_private", n)
-        if "grok" in text and ("re-check" in text or "recheck" in text or "model family" in text):
-            out.setdefault("grok_confirm", n)
+        for check in _asks_for(rule.get("text")):
+            out.setdefault(check, rule.get("n"))
     return out
 
 
 def rule_checks(cache: dict, rules: list[dict]) -> list[dict]:
     """Each watched rule against each runner's settings and ADDED lines:
     ``broken`` (a doctor warning) or ``cannot_check`` (never reported as
-    passing), with the runner it was judged on and which of its files
-    (``settings`` or ``events``) so the app can name both."""
+    passing), with the check that found it (``check``), the runner it was
+    judged on and which of its files (``settings`` or ``events``) so the app
+    can name both."""
     watch = watched(rules)
     if not watch:
         return []
@@ -934,15 +942,15 @@ def rule_checks(cache: dict, rules: list[dict]) -> list[dict]:
             script = spec.get("script") or "the launch command"
             if "fast_tier" in watch:
                 if spec.get("fast"):
-                    out.append({"rule": watch["fast_tier"], "status": "broken", **on_settings,
+                    out.append({"rule": watch["fast_tier"], "check": "fast_tier", "status": "broken", **on_settings,
                                 "text": f"A standing rule may be broken: {name}'s settings name a model ending in "
                                         f"-fast for its {lane} lane."})
                 elif not spec.get("model_in_launch"):
-                    out.append({"rule": watch["fast_tier"], "status": "cannot_check", **on_settings,
+                    out.append({"rule": watch["fast_tier"], "check": "fast_tier", "status": "cannot_check", **on_settings,
                                 "text": f"{name}'s {lane} lane: can't be checked: the model is set inside "
                                         f"{script}"})
             if "paid_xai" in watch and kind.startswith("grok"):
-                out.append({"rule": watch["paid_xai"], "status": "cannot_check", **on_settings,
+                out.append({"rule": watch["paid_xai"], "check": "paid_xai", "status": "cannot_check", **on_settings,
                             "text": f"{name}'s {lane} lane: whether it uses the paid xAI API can't be checked: "
                                     f"the launch environment is set inside {script}"})
             if "grok_confirm" in watch and kind == "grokcheck":
@@ -950,11 +958,11 @@ def rule_checks(cache: dict, rules: list[dict]) -> list[dict]:
                 other = lanes.get(confirm) if confirm else None
                 other_kind = ((other or {}).get("kind") or "").lower()
                 if other is None or other_kind.startswith("grok"):  # none named, or a lane the settings lack
-                    out.append({"rule": watch["grok_confirm"], "status": "broken", **on_settings,
+                    out.append({"rule": watch["grok_confirm"], "check": "grok_confirm", "status": "broken", **on_settings,
                                 "text": f"A standing rule may be broken: {name}'s Grok check lane has no "
                                         "confirming lane from another model family."})
                 elif not other_kind:
-                    out.append({"rule": watch["grok_confirm"], "status": "cannot_check", **on_settings,
+                    out.append({"rule": watch["grok_confirm"], "check": "grok_confirm", "status": "cannot_check", **on_settings,
                                 "text": f"{name}'s Grok check lane: whether its confirming lane {confirm} is from "
                                         "another model family can't be checked: its kind isn't set"})
         if "grok_private" in watch:
@@ -968,7 +976,7 @@ def rule_checks(cache: dict, rules: list[dict]) -> list[dict]:
                 if "fix_lanes" in added and added["fix_lanes"] is None:
                     named |= set(config.get("fix_lanes") or [])
                 if added.get("private") and grok & named:
-                    out.append({"rule": watch["grok_private"], "status": "broken",
+                    out.append({"rule": watch["grok_private"], "check": "grok_private", "status": "broken",
                                 "at": added.get("at") or events_at, "runner": name, "file": "events",
                                 "text": f"A standing rule may be broken: a Grok lane is set to work on "
                                         f"{added.get('pipeline')}, which is marked private."})
@@ -998,101 +1006,126 @@ def _check_lanes(check: str, lanes: dict) -> tuple[int, int]:
     return about, judged
 
 
-# The worst outcome first: a rule's result is its worst check's, so it is
-# "ok" only when every check it asks for ran and passed.
-_RESULT_ORDER = ("broken", "stale", "unreadable", "no_runner", "cannot_check", "no_lane", "ok")
+# Worst first. A cell's outcome on one runner, then a check's or a rule's
+# result: a rule's result is its worst check's, so it is "ok" only when every
+# check it asks for ran on every runner and passed.
+_CELL_ORDER = ("broken", "not_read", "failed", "stale", "no_lane", "cannot_check", "ok")
+_RESULT_ORDER = ("broken", "failed", "stale", "not_read", "no_runner", "cannot_check", "no_lane", "ok")
+_NOT_NOW = ("failed", "stale", "not_read")
 
 
-def _source(name: str, kept: dict, now: datetime | None, stale_after: float) -> dict:
-    """One runner file's freshness: when it was last read well, whether the
-    latest read failed (``since`` set by ``read_runner``), and whether that
-    good read is older than ``stale_after`` seconds."""
-    good = _parse(kept.get("good_at"))
-    stale = bool(now and stale_after and (good is None or (now - good).total_seconds() > stale_after))
-    return {"runner": name, "good_at": kept.get("good_at"), "failed": bool(kept.get("since")),
-            "since": kept.get("since"), "stale": stale}
+def _read(kept: dict, now: datetime | None, stale_after: float) -> dict:
+    """One runner file's read as a check depends on it: ``read`` (it was
+    ever read well and its data kept), ``good_at`` (that read), ``failed``
+    and ``since`` (the latest read failed, set by ``read_runner``), and
+    ``stale`` (that good read is older than ``stale_after`` seconds, 0:
+    never)."""
+    read = isinstance(kept.get("data"), dict)
+    good = _parse(kept.get("good_at")) if read else None
+    return {"read": read, "good_at": kept.get("good_at") if read else None, "failed": bool(kept.get("since")),
+            "since": kept.get("since"),
+            "stale": bool(good and now and stale_after and (now - good).total_seconds() > stale_after)}
 
 
-def _one_check(check: str, n, runners: list, checks: list[dict], now, stale_after: float) -> dict:
-    about = judged = read = 0
-    sources: list[dict] = []
-    for name, kept in runners:
-        config_kept = kept.get("config") or {}
-        config = config_kept.get("data")
-        if not isinstance(config, dict):
-            continue
-        read += 1
-        a, j = _check_lanes(check, _config_facts(config.get("lanes")))
-        if not a:
-            continue
-        # The file the check judges: the ADDED lines for Grok on private
-        # work, the settings for the others.
-        kept_file = (kept.get("events") or {}) if check == "grok_private" else config_kept
-        if check == "grok_private" and not isinstance(kept_file.get("data"), dict):
-            j = 0  # its ADDED lines were never read
-        src = _source(name, kept_file, now, stale_after)
-        sources.append(src)
-        about += a
-        if not (src["failed"] or src["stale"]):  # a kept read from a failed file is not a check that ran
-            judged += j
-    mine = [c for c in checks if c.get("rule") == n and c.get("runner") not in
-            {s["runner"] for s in sources if s["failed"] or s["stale"]}]
-    broken = [c for c in checks if c.get("rule") == n and c.get("status") == "broken"]
+def _cell(check: str, runner: str, kept: dict, findings: list[dict], now, stale_after: float) -> dict:
+    """One check on one runner, from that runner's own reads and findings
+    only. Every check reads its lanes from the settings; the privacy check
+    also reads the ADDED lines (``events``)."""
+    config_kept = kept.get("config") or {}
+    reads = {"settings": _read(config_kept, now, stale_after)}
+    if check == "grok_private":
+        reads["events"] = _read(kept.get("events") or {}, now, stale_after)
+    mine = [c for c in findings if c.get("check") == check and c.get("runner") == runner]
+    broken = [c for c in mine if c.get("status") == "broken"]
+    config = config_kept.get("data") if reads["settings"]["read"] else {}
+    about, judged = _check_lanes(check, _config_facts(config.get("lanes")))
     if broken:
-        result = "broken"
-    elif not runners:
-        result = "no_runner"
-    elif not read:
-        result = "unreadable"
-    elif any(s["failed"] or s["stale"] for s in sources):
-        result = "stale"
+        outcome = "broken"
+    elif not all(r["read"] for r in reads.values()):
+        outcome = "not_read"
+    elif any(r["failed"] for r in reads.values()):
+        outcome = "failed"
+    elif any(r["stale"] for r in reads.values()):
+        outcome = "stale"
     elif not about:
-        result = "no_lane"
-    elif judged:
-        result = "ok"
+        outcome = "no_lane"
+    elif not judged:
+        outcome = "cannot_check"
     else:
-        result = "cannot_check"
-    # Coverage is as old as its oldest source, never dated by the newest.
-    times = [s["good_at"] for s in sources if s["good_at"]]
-    return {"check": check, "result": result, "at": min(times) if result == "ok" and times else None,
-            "lanes": judged, "unchecked": about - judged, "sources": sources,
+        outcome = "ok"
+    return {"runner": runner, "outcome": outcome, "lanes": judged, "unchecked": about - judged, "reads": reads,
             "text": broken[0]["text"] if broken else None, "more": max(len(broken) - 1, 0),
             "why": next((c["text"] for c in mine if c.get("status") == "cannot_check"), None)}
 
 
-def rule_results(cache: dict, rules: list[dict], checks: list[dict] | None = None, *,
-                 now: datetime | None = None, stale_after: float = 0) -> list[dict]:
-    """One result per rule Khipu has a check for, for the app's rule rows,
-    with every check the rule asks for in ``checks`` (each with its own
-    ``sources``: each runner file's last good read, failure and staleness).
-    The rule's ``result`` is its worst check's:
+def _check_result(check: str, cells: list[dict]) -> dict:
+    """A check's result from its own cells only: ``ok`` only when every cell
+    is ok, no_lane or cannot_check and at least one is ok; its time is the
+    oldest good read any of its cells depends on."""
+    outcomes = {c["outcome"] for c in cells}
+    if not cells:
+        result = "no_runner"
+    elif "broken" in outcomes:
+        result = "broken"
+    elif outcomes & set(_NOT_NOW):
+        result = next(r for r in _NOT_NOW if r in outcomes)
+    elif "ok" in outcomes:
+        result = "ok"
+    elif "cannot_check" in outcomes:
+        result = "cannot_check"
+    else:
+        result = "no_lane"
+    broken = [c for c in cells if c["outcome"] == "broken"]
+    counted = [c for c in cells if c["outcome"] in ("ok", "cannot_check")]
+    times = [r["good_at"] for c in cells for r in c["reads"].values() if r["good_at"]]
+    return {"check": check, "result": result, "at": min(times) if result == "ok" and times else None,
+            "lanes": sum(c["lanes"] for c in counted), "unchecked": sum(c["unchecked"] for c in counted),
+            "text": broken[0]["text"] if broken else None, "more": max(sum(1 + c["more"] for c in broken) - 1, 0),
+            "why": next((c["why"] for c in counted if c["why"]), None), "cells": cells}
 
-    - ``broken``: a check found the rule may be broken (``text`` says how);
-    - ``stale``: a file a check judges failed to read or was last read longer
-      ago than ``stale_after``, so that check has not run on it;
-    - ``unreadable``: folders added but no settings file was ever read;
+
+def rule_results(cache: dict, rules: list[dict], checks: list[dict] | None = None, *,
+                 now: datetime | None = None, stale_after: float = 0, runners: list[str] | None = None) -> list[dict]:
+    """One result per active rule Khipu has a check for, built from a matrix
+    of rule x check x job runner. A rule's checks are the ones its own words
+    ask for; every registered runner (``runners``, with every runner the
+    cache holds) is a source of every check, read well or never. Each check
+    in ``checks`` carries its ``cells``: per runner, the ``outcome`` and the
+    freshness of each read it depends on (``_read``). The rule's ``result``
+    is its worst check's:
+
+    - ``broken``: a check found the rule may be broken on a runner (``text``
+      says how; broken findings match the check and runner, never the rule);
+    - ``failed`` / ``stale`` / ``not_read``: a read a check depends on failed,
+      is older than ``stale_after``, or never succeeded, so that check has not
+      run there (the cells say which runner and which file);
     - ``no_runner``: no job runner folder added, so nothing to read;
     - ``cannot_check``: every lane a check is about is set where Khipu can't see;
     - ``no_lane``: no job runner has a lane the check is about;
-    - ``ok``: every check ran on fresh reads and found nothing; ``at`` is the
-      oldest of those reads; ``unchecked`` lanes it couldn't judge.
+    - ``ok``: every check ran on every runner and found nothing; ``at`` is the
+      oldest read it relied on; ``unchecked`` lanes it couldn't judge.
 
     "Nothing wrong found" is only ever ``ok``."""
-    watch = watched(rules)
-    if not watch:
+    wanted = [(rule, _asks_for(rule.get("text"))) for rule in rules]
+    wanted = [(rule, asks) for rule, asks in wanted if asks]
+    if not wanted:
         return []
-    checks = rule_checks(cache, rules) if checks is None else checks
-    runners = sorted(((cache or {}).get("runners") or {}).items())
-    by_rule: dict[int, list[dict]] = {}
-    for check, n in watch.items():
-        by_rule.setdefault(n, []).append(_one_check(check, n, runners, checks, now, stale_after))
+    findings = rule_checks(cache, rules) if checks is None else checks
+    kept = (cache or {}).get("runners") or {}
+    names = sorted(set(kept) | {n for n in runners or [] if n})
+    by_check: dict[str, dict] = {}
     out = []
-    for n, found in by_rule.items():
-        found.sort(key=lambda r: _RESULT_ORDER.index(r["result"]))
+    for rule, asks in wanted:
+        for check in asks:
+            if check not in by_check:
+                by_check[check] = _check_result(check, [_cell(check, name, kept.get(name) or {}, findings, now,
+                                                              stale_after) for name in names])
+        found = sorted((dict(by_check[c]) for c in dict.fromkeys(asks)), key=lambda r: _RESULT_ORDER.index(r["result"]))
         worst = found[0]
         at = min(r["at"] for r in found) if all(r["result"] == "ok" for r in found) else None
-        out.append({k: v for k, v in worst.items() if k != "sources"} | {"rule": n, "at": at, "checks": found})
-    return sorted(out, key=lambda r: r["rule"])
+        out.append({k: v for k, v in worst.items() if k != "cells"} | {"rule": rule.get("n"), "at": at,
+                                                                       "checks": found})
+    return sorted(out, key=lambda r: r["rule"] if isinstance(r["rule"], int) else 0)
 
 
 def launches(cache: dict) -> list[dict]:

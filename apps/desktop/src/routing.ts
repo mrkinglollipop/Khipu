@@ -140,10 +140,25 @@ export type RuleCheck = {
   file?: "settings" | "events" | string;
 };
 
-/** What a checked rule's last check found (`routing_sources.rule_results`). */
-export type RuleSource = { runner: string; good_at?: string | null; failed?: boolean; since?: string | null; stale?: boolean };
+// What a checked rule's last check found (`routing_sources.rule_results`).
 
-export type RuleCheckResult = Omit<RuleResult, "rule" | "checks"> & { check: string; sources?: RuleSource[] };
+/** One file a check depends on, on one job runner: ever read well, when, and
+ *  whether the latest read failed or the good one is too old. */
+export type RuleRead = { read?: boolean; good_at?: string | null; failed?: boolean; since?: string | null; stale?: boolean };
+
+/** One check on one job runner, from that runner's own reads and findings. */
+export type RuleCell = {
+  runner: string;
+  outcome: "broken" | "not_read" | "failed" | "stale" | "no_lane" | "cannot_check" | "ok" | string;
+  lanes?: number;
+  unchecked?: number;
+  reads?: { settings?: RuleRead; events?: RuleRead };
+  text?: string | null;
+  more?: number;
+  why?: string | null;
+};
+
+export type RuleCheckResult = Omit<RuleResult, "rule" | "checks"> & { check: string; cells?: RuleCell[] };
 
 export type RuleResult = {
   rule: number;
@@ -151,7 +166,7 @@ export type RuleResult = {
   checks?: RuleCheckResult[];
   /** Which of Khipu's four checks gave this result. */
   check?: "fast_tier" | "paid_xai" | "grok_private" | "grok_confirm" | string;
-  result: "ok" | "broken" | "cannot_check" | "no_lane" | "no_runner" | "unreadable" | "stale" | string;
+  result: "ok" | "broken" | "cannot_check" | "no_lane" | "no_runner" | "not_read" | "failed" | "stale" | string;
   /** When the check last ran on the files it judged; only for "ok". */
   at?: string | null;
   /** Lanes it judged, and lanes it is about but couldn't judge. */
@@ -608,25 +623,35 @@ const CHECK_FOR: Record<string, string> = {
   grok_confirm: "for re-checks of Grok work",
 };
 
-// The sources a stale result is about: the failed or stale ones.
-function staleLine(check: string | undefined, sources: RuleSource[], nowMs: number): string {
-  const file = check === "grok_private" ? "list of added work" : "settings";
-  const parts = sources.filter((x) => x.failed || x.stale).map((x) => {
-    const ago = fmtAgoSince(x.good_at, nowMs);
-    return x.failed
-      ? `Khipu couldn't read ${x.runner}'s ${file}${ago ? `; it last read them ${ago}` : ""}`
-      : `Khipu last read ${x.runner}'s ${file} ${ago ?? "a long time ago"}`;
-  });
+const FILE_WORDS: Record<string, string> = { settings: "settings", events: "list of added work" };
+const NOT_NOW = new Set(["not_read", "failed", "stale"]);
+
+// Why a check has not run now: each runner it could not use, and each of
+// that runner's files it never read, couldn't read, or read too long ago.
+function notNowLine(cells: RuleCell[], nowMs: number): string {
+  const parts = cells
+    .filter((c) => NOT_NOW.has(c.outcome))
+    .flatMap((c) =>
+      Object.entries(c.reads ?? {}).flatMap(([key, r]) => {
+        const file = `${c.runner}'s ${FILE_WORDS[key] ?? key}`;
+        const ago = fmtAgoSince(r?.good_at, nowMs);
+        if (!r || r.read === false) return [`Khipu has never read ${file}`];
+        if (r.failed) return [`Khipu couldn't read ${file}${ago ? `; it last read them ${ago}` : ""}`];
+        if (r.stale) return [`Khipu last read ${file} ${ago ?? "a long time ago"}`];
+        return [];
+      }),
+    );
   return `${parts.join(" and ") || "Khipu can't tell how recent its read was"}.`;
 }
 
 type Line = { text: string; tone: "ok" | "warn" | "" };
 
 // One result's line. `f` names the check ("" for a rule with one check);
-// `top` is the whole rule's one line, which says "nothing wrong found".
+// `top` says "nothing wrong found" (every check passed), else an ok check
+// says "passed".
 function resultLine(result: RuleResult | RuleCheckResult, f: string, nowMs: number, top: boolean): Line {
   const by = `Checked by Khipu${f}`;
-  const sources = "checks" in result && result.checks ? result.checks.flatMap((c) => c.sources ?? []) : (result as RuleCheckResult).sources ?? [];
+  const cells = "cells" in result && result.cells ? result.cells : "checks" in result && result.checks ? result.checks.flatMap((c) => c.cells ?? []) : [];
   switch (result.result) {
     case "broken": {
       const words = (result.text ?? "").replace(BROKEN_LEAD, "");
@@ -640,15 +665,17 @@ function resultLine(result: RuleResult | RuleCheckResult, f: string, nowMs: numb
       const head = top ? `${by} in your job runners' settings: nothing wrong found` : `${by}: passed`;
       return { text: `${head}${ago ? `, ${ago}` : ""}.${rest}`, tone: "ok" };
     }
+    case "not_read":
+    case "failed":
     case "stale":
-      return { text: `${by}, but not now: ${staleLine(result.check, sources, nowMs)}`, tone: "" };
+      return { text: `${by}, but not now: ${notNowLine(cells, nowMs)}`, tone: "" };
     case "cannot_check":
       return { text: `${by}, but not here: ${CANNOT_SEE[result.check ?? ""] ?? CANNOT_SEE.fast_tier}`, tone: "" };
     case "no_lane":
       return { text: `${by}, but not yet: none of your job runners has a lane this rule is about.`, tone: "" };
     case "no_runner":
       return { text: `${by}, but not yet: add a job runner folder so it has something to read.`, tone: "" };
-    case "unreadable":
+    case "unreadable": // an older Khipu's word for not_read, with no cells to name
       return { text: `${by}, but not now: Khipu can't read your job runners' settings.`, tone: "" };
     default:
       return { text: `${by}. Reading what the last check found…`, tone: "" };
@@ -666,12 +693,15 @@ export function ruleResultLine(watched: boolean, result: RuleResult | undefined,
   return result ? resultLine(result, "", nowMs, true) : resultLine({ rule: 0, result: "" }, "", nowMs, true);
 }
 
-/** Every line under a standing rule: one per check when it has several and
- *  they did not all pass, each naming its check; else `ruleResultLine`. */
+/** Every line under a standing rule: one per check, each from its own
+ *  cells, naming its check when the rule has several. "Nothing wrong found"
+ *  only when every check passed; else a passing check says "passed". */
 export function ruleResultLines(watched: boolean, result: RuleResult | undefined, nowMs: number = Date.now()): Line[] {
   const checks = result?.checks ?? [];
-  if (!watched || !result || checks.length < 2 || result.result === "ok") return [ruleResultLine(watched, result, nowMs)];
-  return checks.map((c) => resultLine(c, ` ${CHECK_FOR[c.check] ?? ""}`.trimEnd(), nowMs, false));
+  if (!watched || !result || !checks.length) return [ruleResultLine(watched, result, nowMs)];
+  const allOk = checks.every((c) => c.result === "ok");
+  if (checks.length === 1) return [resultLine(checks[0], "", nowMs, allOk)];
+  return checks.map((c) => resultLine(c, ` ${CHECK_FOR[c.check] ?? ""}`.trimEnd(), nowMs, allOk));
 }
 
 // Words a rule commonly opens with that are not names, so "Never a -fast
