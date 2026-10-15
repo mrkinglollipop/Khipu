@@ -17,7 +17,7 @@ import type { FormEvent } from "react";
 import { ChevronRight, Loader2, RefreshCw } from "lucide-react";
 import { EmptyState, ListRow, Tag } from "./ui";
 import { callCli, useCliState } from "./settingsCli";
-import { fmtAgeSince } from "./time";
+import { fmtAgoSince } from "./time";
 import type { Attention } from "./doctorAttention";
 import { accountState } from "./routing";
 import type { RouteView } from "./routing";
@@ -32,6 +32,8 @@ export type UsageWindow = {
 };
 
 export type UsageAccount = {
+  /** `harness|login folder`, the routing record's key for the account. */
+  key?: string | null;
   harness?: string;
   account?: string;
   home?: string | null;
@@ -406,16 +408,21 @@ export type PlanUsageState = ReturnType<typeof usePlanUsage>;
 
 /** Whether Khipu can read the account now, in plain words: "Live: read 2 min
  *  ago", "Signed in, but its plan figures can't be read", "Not signed in",
- *  "CLI not installed". */
-export function liveWords(row: UsageAccount): { text: string; live: boolean } {
+ *  "CLI not installed". A read that worked but brought no figures (Muse
+ *  before its first turn) is never "Live": it says when it was checked, and
+ *  `checked` marks it so nobody is asked to sign in. */
+export function liveWords(row: UsageAccount): { text: string; live: boolean; checked?: boolean } {
   const code = row.ok === false ? row.error : row.live_error ?? null;
   if (code === "not_installed") return { text: "CLI not installed", live: false };
   if (code === "not_signed_in") return { text: "Not signed in", live: false };
   if (code === "no_plan_limits") return { text: "Signed in, but its plan figures can't be read", live: false };
   if (code === "pending") return { text: "Reading it for the first time", live: false };
   if (row.ok === false) return { text: `Can't be read just now (${usageErrorPhrase(code)})`, live: false };
-  const age = fmtAgeSince(row.last_attempt_at || row.probed_at);
-  return { text: age ? `Live: read ${age} ago` : "Live", live: true };
+  const age = fmtAgoSince(row.last_attempt_at || row.probed_at);
+  if (!(row.windows ?? []).some((w) => pctOf(w) != null)) {
+    return { text: age ? `Checked ${age}, no figures yet` : "Checked, no figures yet", live: false, checked: true };
+  }
+  return { text: age ? `Live: read ${age}` : "Live", live: true };
 }
 
 /** The CLIs whose own login the app can start (`khipu.usage.SIGN_IN_ARGS`):
@@ -579,14 +586,14 @@ export function planStatus(row: UsageAccount, now: Date = new Date()): PlanStatu
   const code = troubleCode(row);
   const hasFigures = liveWindows(row, now).length > 0;
   const figures: PlanStatus["figures"] = !hasFigures ? "none" : code ? "kept" : "live";
-  const age = fmtAgeSince(figuresAt(row));
+  const age = fmtAgoSince(figuresAt(row));
   if (code && SIGN_IN_CODES.has(code)) {
     return { figures, say: code === "no_plan_limits" ? "Its sign-in reports no plan limits" : "Not signed in", tone: "warn", code };
   }
   if (code === "pending") return { figures, say: "Reading it for the first time", tone: "grey", code };
   if (code) {
     if (hasFigures) {
-      const from = row.observed_at ? `figures from its last turn, ${age} ago` : `figures from ${age} ago`;
+      const from = row.observed_at ? `figures from its last turn, ${age}` : `figures from ${age}`;
       return { figures, say: `Can't read it now; ${age ? from : "showing earlier figures"}`, tone: "warn", code };
     }
     if (onlyResetWindows(row, now)) {
@@ -598,24 +605,25 @@ export function planStatus(row: UsageAccount, now: Date = new Date()): PlanStatu
   if (!hasFigures) {
     if (row.harness === "muse") return { figures, say: MUSE_NO_TURN, tone: "grey", code };
     // A read that worked but found no figures says when it was checked.
-    const checked = fmtAgeSince(row.last_attempt_at || row.probed_at);
-    const say = checked ? `${NO_RESETTING_LIMIT.slice(0, -1)}; checked ${checked} ago` : NO_RESETTING_LIMIT;
+    const checked = fmtAgoSince(row.last_attempt_at || row.probed_at);
+    const say = checked ? `${NO_RESETTING_LIMIT.slice(0, -1)}; checked ${checked}` : NO_RESETTING_LIMIT;
     return { figures, say, tone: "grey", code };
   }
   if (row.observed_at) {
-    return { figures, say: age ? `as of its last turn, ${age} ago` : "as of its last turn", tone: "grey", code };
+    return { figures, say: age ? `as of its last turn, ${age}` : "as of its last turn", tone: "grey", code };
   }
-  if (row.stale && age) return { figures, say: `figures from ${age} ago`, tone: "grey", code };
+  if (row.stale && age) return { figures, say: `figures from ${age}`, tone: "grey", code };
   return { figures, say: null, tone: null, code };
 }
 
 /** "Paused by you until Wed, Oct 21, 9:26 PM" for each account the routing
- *  record says the owner paused, by its name. Empty when the record could not
- *  be read: Plans then shows no pause rather than guessing. */
+ *  record says the owner paused, by its stable key (a name can be reused by
+ *  another login). Empty when the record could not be read: Plans then shows
+ *  no pause rather than guessing. */
 export function planPauses(view: RouteView | null | undefined, now: Date = new Date()): Map<string, string> {
   const out = new Map<string, string>();
   for (const a of view?.accounts ?? []) {
-    if (a.state === "paused") out.set(a.label, accountState(a, now).text);
+    if (a.state === "paused") out.set(a.key, accountState(a, now).text);
   }
   return out;
 }
@@ -685,7 +693,7 @@ export function PlansCard({ state, routing, onOpenAccounts }: {
   const accounts = data?.accounts ?? [];
   const now = new Date();
   const pauses = planPauses(routing, now);
-  const failedAge = fmtAgeSince(errorAt);
+  const failedAge = fmtAgoSince(errorAt);
   return (
     <div className="card plans-card">
       <div className="card-head">
@@ -694,7 +702,7 @@ export function PlansCard({ state, routing, onOpenAccounts }: {
         {data != null && error ? (
           <span className="plans-head-note">
             <span className="hdot warn" aria-hidden="true" />
-            Last read failed {failedAge ? `${failedAge} ago` : "just now"}; showing earlier figures
+            Last read failed {failedAge ?? "just now"}; showing earlier figures
           </span>
         ) : null}
         <RefreshButton busy={refreshing || loading} label="Refresh" onClick={() => void refresh()} />
@@ -722,7 +730,7 @@ export function PlansCard({ state, routing, onOpenAccounts }: {
       ) : (
         accounts.map((row, i) => (
           <PlanRow key={`${row.harness}|${row.home ?? ""}|${i}`} row={row} now={now}
-            pause={pauses.get(accountName(row))} onSignedIn={reread} />
+            pause={row.key ? pauses.get(row.key) : undefined} onSignedIn={reread} />
         ))
       )}
     </div>
@@ -734,8 +742,8 @@ function whenAndAge(iso: string | null | undefined): string | null {
   const d = parseIso(iso);
   if (!d) return null;
   const local = d.toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
-  const age = fmtAgeSince(iso);
-  return age ? `${local}, ${age} ago` : local;
+  const age = fmtAgoSince(iso);
+  return age ? `${local}, ${age}` : local;
 }
 
 /** The one failure line of a Settings block: the cause, what Khipu still
@@ -769,8 +777,8 @@ function PlanBlock({ row, now, pause, onSignedIn }: {
   const windows = (row.windows ?? []).filter((w) => pctOf(w) != null);
   const fail = failureLine(row, status, now);
   const dim = status.figures === "kept" || (status.code != null && status.figures === "none");
-  const triedAge = fmtAgeSince(row.last_attempt_at || row.probed_at);
-  const figuresAge = fmtAgeSince(figuresAt(row));
+  const triedAge = fmtAgoSince(row.last_attempt_at || row.probed_at);
+  const figuresAge = fmtAgoSince(figuresAt(row));
   const login = row.home || "default login";
   return (
     <section className={status.tone === "warn" ? "plan-block warn" : "plan-block"} role="group" aria-label={name}>
@@ -815,14 +823,14 @@ function PlanBlock({ row, now, pause, onSignedIn }: {
       <div className="plan-reads">
         {status.figures === "live" && !row.observed_at && !row.stale ? (
           <Tag tone="ok" dot>
-            {triedAge ? `Live: read ${triedAge} ago` : "Live"}
+            {triedAge ? `Live: read ${triedAge}` : "Live"}
           </Tag>
         ) : row.observed_at && windows.length && !fail?.includes("last turn") ? (
-          <span>{figuresAge ? `As of its last turn, ${figuresAge} ago` : "As of its last turn"}</span>
+          <span>{figuresAge ? `As of its last turn, ${figuresAge}` : "As of its last turn"}</span>
         ) : windows.length ? (
-          <span>{figuresAge ? `Figures from ${figuresAge} ago` : "Earlier figures"}</span>
+          <span>{figuresAge ? `Figures from ${figuresAge}` : "Earlier figures"}</span>
         ) : !status.code && triedAge ? (
-          <span>Checked {triedAge} ago</span>
+          <span>Checked {triedAge}</span>
         ) : null}
         <span>{login}</span>
       </div>
@@ -882,7 +890,7 @@ export function PlansSettingsCard({ state, active, routing }: {
           <div className="plan-blocks">
             {accounts.map((row, i) => (
               <PlanBlock key={`${row.harness}|${row.home ?? ""}|${i}`} row={row} now={now}
-                pause={pauses.get(accountName(row))} onSignedIn={st.reread} />
+                pause={row.key ? pauses.get(row.key) : undefined} onSignedIn={st.reread} />
             ))}
           </div>
         ) : null}

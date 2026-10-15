@@ -7,7 +7,7 @@
 import { EmptyState, ListRow } from "./ui";
 import { LABEL as HARNESS_LABEL } from "./IntegrationsPanel";
 import type { LivenessPayload } from "./IntegrationsPanel";
-import { fmtAge } from "./time";
+import { fmtAgo } from "./time";
 
 export function RightNowCard({
   liveness,
@@ -69,7 +69,7 @@ export function RightNowCard({
                     : "nothing waiting"}
                   {" · last capture "}
                   {h.last_captured_age_s != null
-                    ? `${fmtAge(h.last_captured_age_s)} ago`
+                    ? `${fmtAgo(h.last_captured_age_s)}`
                     : "never"}
                 </span>
               </ListRow>

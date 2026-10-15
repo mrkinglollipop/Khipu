@@ -313,6 +313,18 @@ def test_cache_max_age_and_fresh(fake, monkeypatch):
     assert saved["rows"]["claude|"]["windows"][0]["used_pct"] == 3
 
 
+def test_every_report_row_carries_the_routing_records_key(fake, monkeypatch):
+    """Settings clarity review P2: the app pairs a plan row with its routing
+    account by this key, never by a label another login may reuse."""
+    monkeypatch.setattr(usage, "probe_all", lambda accounts, *, timeout: [_row(ok=False, error="timeout")
+                                                                          for _ in accounts])
+    accounts = [{"label": "Claude", "harness": "codex", "home": None},
+                {"label": "Claude", "harness": "claude", "home": "/tmp"}]
+    rows = usage.report(accounts=accounts, fresh=True)["accounts"]
+    assert [r["key"] for r in rows] == [usage.account_key(a) for a in accounts]
+    assert rows[0]["key"] == "codex|" and rows[0]["account"] == "Claude"
+
+
 def test_failed_probe_keeps_the_last_figures_marked_stale(fake, monkeypatch):
     usage._save_cache({"claude|": _cached(_ago(10))})
     monkeypatch.setattr(usage, "probe_all", lambda accounts, *, timeout: [_row(ok=False, error="timeout")])

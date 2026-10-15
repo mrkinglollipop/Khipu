@@ -1251,7 +1251,10 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
             for i, row in zip(due, merged):
                 rows[i] = dict(row, cached=False)
     now = _now()
-    for row in rows:
+    for account, row in zip(accounts, rows):
+        # The identity the routing record keys this account by, so the app
+        # matches the two by login, never by a name that may be reused.
+        row["key"] = _key(account)
         age = _age_s(row, now)
         row["stale"] = bool((not row.get("ok") and row.get("last_good_at"))
                             or (age is not None and age > max_age))

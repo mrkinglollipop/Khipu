@@ -58,7 +58,7 @@ function realReport(): UsageReport {
     refreshing: false,
     accounts: [
       {
-        harness: "claude", account: "Claude", home: null, plan: "max",
+        key: "claude|", harness: "claude", account: "Claude", home: null, plan: "max",
         windows: [
           { name: "five_hour", used_pct: 16, resets_at: "2026-10-14T18:00:00Z", window_mins: 300 },
           { name: "weekly", used_pct: 17, resets_at: "2026-10-17T12:00:00Z", window_mins: 10080 },
@@ -70,7 +70,7 @@ function realReport(): UsageReport {
         cached: false, stale: false,
       },
       {
-        harness: "codex", account: "Codex", home: null, plan: "pro",
+        key: "codex|", harness: "codex", account: "Codex", home: null, plan: "pro",
         windows: [
           { name: "weekly", used_pct: 40, resets_at: CODEX_RESET, window_mins: 10080, slot: "primary" },
         ],
@@ -80,7 +80,7 @@ function realReport(): UsageReport {
         cached: false, stale: false,
       },
       {
-        harness: "grok", account: "Grok", home: null, plan: "SuperGrok Heavy",
+        key: "grok|", harness: "grok", account: "Grok", home: null, plan: "SuperGrok Heavy",
         windows: [{ name: "weekly", used_pct: 43.5, resets_at: GROK_RESET }],
         credits: { prepaid_balance: 44.0 }, version: "1.0.52", source: "live", observed_at: null,
         error: null, note: null, ok: true, probed_at: "2026-10-14T13:57:29Z", ms: 0,
@@ -88,7 +88,7 @@ function realReport(): UsageReport {
         cached: false, stale: false,
       },
       {
-        harness: "muse", account: "Muse", home: null, plan: null, windows: [], credits: null,
+        key: "muse|", harness: "muse", account: "Muse", home: null, plan: null, windows: [], credits: null,
         version: "1.4.6", source: "last_observed", observed_at: null, error: null,
         note: "no turn observed yet", ok: true, probed_at: "2026-10-14T13:57:29Z", ms: 0,
         last_attempt_at: "2026-10-14T13:57:29Z", last_error: null, last_good_at: "2026-10-14T13:57:29Z",
@@ -223,6 +223,7 @@ describe("PlansCard on Home", () => {
     expect(muse.queryByText(/0%/)).toBeNull();
     expect(muse.queryByText(/Live/)).toBeNull();
     expect(screen.queryByText(/Live/)).toBeNull();
+    expect(muse.queryByText(/Sign in/)).toBeNull();
   });
 
   it("warns at 75% and alerts at 90%", async () => {
@@ -1012,7 +1013,7 @@ describe("one status phrase per account (settings clarity, phase 2)", () => {
   it("shows the owner's pause first, from the routing record", async () => {
     status = tableReport();
     render(<HomeWith routing={pausedGrok} />);
-    const pause = planPauses(pausedGrok, new Date()).get("Grok")!;
+    const pause = planPauses(pausedGrok, new Date()).get("grok|")!;
     expect(pause).toMatch(/^Paused by you until /);
     await waitFor(() => expect(within(rowFor("Grok")).getByText(pause)).toBeTruthy());
     const tail = rowFor("Grok").querySelector(".plan-none")!;
@@ -1074,5 +1075,51 @@ describe("one status phrase per account (settings clarity, phase 2)", () => {
     expect(planStatus(r.accounts![0], NOW)).toEqual({ figures: "live", say: null, tone: null, code: null });
     expect(planStatus(r.accounts![1], NOW).figures).toBe("kept");
     expect(planStatus(r.accounts![2], NOW).figures).toBe("none");
+  });
+});
+
+describe("per-account lookups use the backend's stable key, never the label (review P2)", () => {
+  // Claude was paused, then removed from the list, and its name reused for a
+  // Codex login: the record still holds the paused "claude|" account.
+  const record: RouteView = {
+    accounts: [
+      { key: "claude|", label: "Work", harness: "claude", state: "paused", until: "2026-10-21T21:26:00Z" },
+      { key: "claude|/logins/second", label: "Old name", harness: "claude", state: "paused", until: null },
+    ],
+  };
+  function reused(): UsageReport {
+    const r = realReport();
+    return {
+      ...r,
+      accounts: [
+        { ...r.accounts![1], account: "Work", key: "codex|" },
+        { ...r.accounts![0], account: "Claude second", home: "~/.claude-second", key: "claude|/logins/second" },
+      ],
+    };
+  }
+
+  it("never gives a pause to another account that carries the paused one's name", async () => {
+    status = reused();
+    function Both() {
+      const state = usePlanUsage("settings");
+      return (
+        <>
+          <PlansCard state={state} routing={record} />
+          <PlansSettingsCard state={state} active routing={record} />
+        </>
+      );
+    }
+    render(<Both />);
+    const work = await screen.findByRole("group", { name: "Work" });
+    expect(within(work).queryByText(/Paused by you/)).toBeNull();
+    expect(within(rowFor("Work")).queryByText(/Paused by you/)).toBeNull();
+    // Matched by key, the renamed account keeps its own pause.
+    expect(within(screen.getByRole("group", { name: "Claude second" })).getByText("Paused by you until you clear it")).toBeTruthy();
+    expect(within(rowFor("Claude second")).getByText("Paused by you until you clear it")).toBeTruthy();
+  });
+
+  it("shows no pause for a row with no key rather than guessing by name", () => {
+    expect(planPauses(record).get("Work")).toBeUndefined();
+    expect(planPauses(record).get("claude|")).toMatch(/^Paused by you until /);
   });
 });

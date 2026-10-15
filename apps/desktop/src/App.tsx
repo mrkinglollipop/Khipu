@@ -55,7 +55,7 @@ import { FeedbackForm } from "./FeedbackForm";
 import { PostUpdateNoticeDialog } from "./PostUpdateNoticeDialog";
 import { OptionalFeatures } from "./OptionalFeatures";
 import { EmbeddingsPanel } from "./EmbeddingsPanel";
-import { fmtAge, fmtAgeSince, fmtClock } from "./time";
+import { fmtAgo, fmtAgoFromRead, fmtClock } from "./time";
 import {
   CaptureTuningCard,
   GatewayUrlCard,
@@ -402,7 +402,22 @@ type Commitment = {
   priority?: number;
   seen_count?: number;
   last_seen_at?: string | null;
+  /** Seconds old at the read, counted on the hub's own clock (`khipu owed`),
+   *  and when this Mac read the list (set here, on this Mac's clock). An age
+   *  shown is one plus the time since the other, so a hub clock that runs
+   *  ahead of or behind this Mac never moves it. */
+  opened_age_s?: number | null;
+  last_seen_age_s?: number | null;
+  read_at_ms?: number;
 };
+
+/** How long ago `opened_at` / `last_seen_at` was, from the hub's age at the
+ *  read; a hub too old to send ages falls back to this Mac's clock. */
+function owedAgo(c: Commitment, which: "opened" | "last_seen"): string | null {
+  return which === "opened"
+    ? fmtAgoFromRead(c.opened_age_s, c.read_at_ms, c.opened_at)
+    : fmtAgoFromRead(c.last_seen_age_s, c.read_at_ms, c.last_seen_at);
+}
 
 /** The three Owed groups (phase 4 addendum + phase 5 brief). "Needs you" is
  *  exactly `owner === "user"`, which the CLI resolves; the app never
@@ -1673,7 +1688,8 @@ export default function App() {
           `--limit=${OWED_LIMIT}`,
         ]);
         const parsed = parseJson(raw);
-        const rows = Array.isArray(parsed) ? (parsed as Commitment[]) : [];
+        const readAt = Date.now();
+        const rows = Array.isArray(parsed) ? (parsed as Commitment[]).map((c) => ({ ...c, read_at_ms: readAt })) : [];
         if (!latest()) return;
         setOwedByStatus((prev) => ({ ...prev, [status]: rows }));
         setOwedFetchedAt((prev) => ({ ...prev, [status]: Date.now() }));
@@ -3204,8 +3220,8 @@ export default function App() {
   const backupAge = backupHealth?.freshest_backup_age_seconds;
   const offsiteAge = doctorGraphOffsite?.latest?.age_seconds;
   const backupSub = [
-    backupAge != null ? `Database ${fmtAge(backupAge)} ago` : null,
-    offsiteAge != null ? `off-site copy ${fmtAge(offsiteAge)} ago` : null,
+    backupAge != null ? `Database ${fmtAgo(backupAge)}` : null,
+    offsiteAge != null ? `off-site copy ${fmtAgo(offsiteAge)}` : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -3349,7 +3365,7 @@ export default function App() {
         // "Seen again" is evidence a later session re-stated the item; it is
         // shown only when it actually happened (seen_count > 1), and a
         // pre-migration hub answers 1 for every row.
-        const seen = (c.seen_count ?? 1) > 1 ? fmtAgeSince(c.last_seen_at) : null;
+        const seen = (c.seen_count ?? 1) > 1 ? owedAgo(c, "last_seen") : null;
         return (
           <ListRow key={c.id} className="owed-row">
             <span className="w88">
@@ -3365,7 +3381,7 @@ export default function App() {
                 className="meta owed-seen"
                 title={`Restated by ${c.seen_count} captures`}
               >
-                seen {seen} ago
+                seen {seen}
               </span>
             ) : null}
             <span className="w128">
@@ -3693,7 +3709,7 @@ export default function App() {
                 }
                 sub={
                   snapshotHealth?.age_seconds != null
-                    ? `Offline copy ${fmtAge(snapshotHealth.age_seconds)} ago`
+                    ? `Offline copy ${fmtAgo(snapshotHealth.age_seconds)}`
                     : undefined
                 }
                 tone={dbReachable === false ? "err" : "neutral"}
@@ -3809,18 +3825,23 @@ export default function App() {
                     hint="Questions, blockers and the follow-ups you own appear here."
                   />
                 ) : (
-                  needsYouRows.slice(0, 4).map((c) => {
-                    const age = fmtAgeSince(c.opened_at);
-                    return (
-                      <ListRow key={c.id}>
-                        <Tag kind tone={c.kind === "blocker" ? "warn" : "neutral"}>
-                          {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
-                        </Tag>
-                        <span className="grow ellip t2">{c.text}</span>
-                        {age ? <span className="meta">{age} ago</span> : null}
-                      </ListRow>
-                    );
-                  })
+                  <>
+                    {needsYouRows.slice(0, 4).map((c) => {
+                      const age = owedAgo(c, "opened");
+                      return (
+                        <ListRow key={c.id}>
+                          <Tag kind tone={c.kind === "blocker" ? "warn" : "neutral"}>
+                            {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
+                          </Tag>
+                          <span className="grow ellip t2">{c.text}</span>
+                          {age ? <span className="meta">{age}</span> : null}
+                        </ListRow>
+                      );
+                    })}
+                    <ListRow>
+                      <span className="meta">Ages are counted from when this Mac read the list.</span>
+                    </ListRow>
+                  </>
                 )}
               </div>
             </div>
@@ -3845,12 +3866,12 @@ export default function App() {
                 <div className="rows-head">Backups of the connections index</div>
                 {renderHealthRow("Snapshot", doctorGraphBackup, (c) =>
                   c.ok
-                    ? `Fresh — newest copy ${fmtAge(c.age_seconds)} ago (limit ${c.max_age_hours}h)`
+                    ? `Fresh — newest copy ${fmtAgo(c.age_seconds)} (limit ${c.max_age_hours}h)`
                     : (c.reason ?? "stale or missing"),
                 )}
                 {renderHealthRow("Off-site copy", doctorGraphOffsite, (c) =>
                   c.ok
-                    ? `Fresh — last copy ${fmtAge(c.latest?.age_seconds)} ago (limit ${c.max_age_days}d)`
+                    ? `Fresh — last copy ${fmtAgo(c.latest?.age_seconds)} (limit ${c.max_age_days}d)`
                     : (c.reason ?? "stale or missing"),
                 )}
               </div>

@@ -34,9 +34,10 @@ const NO_RECORD_HINT =
 /** The account rows in the Plans card's order, so the two read as a pair;
  *  accounts Plans does not list keep the record's order after them. */
 export function inPlansOrder(accounts: RouteAccount[], plans?: UsageReport | null): RouteAccount[] {
-  const order = (plans?.accounts ?? []).map((row) => row.account || row.harness || "");
+  // Matched by the stable key, never the label: a name can be reused.
+  const order = (plans?.accounts ?? []).map((row) => row.key ?? null);
   const rank = (a: RouteAccount) => {
-    const i = order.indexOf(a.label);
+    const i = order.indexOf(a.key);
     return i === -1 ? order.length : i;
   };
   return accounts
@@ -47,7 +48,7 @@ export function inPlansOrder(accounts: RouteAccount[], plans?: UsageReport | nul
 
 /** "58% of its week used" for an open account, from the Plans read. */
 function planFigure(a: RouteAccount, plans: UsageReport | null | undefined, now: Date): PlanFigure | null {
-  const row = (plans?.accounts ?? []).find((r) => (r.account || r.harness) === a.label);
+  const row = (plans?.accounts ?? []).find((r) => r.key != null && r.key === a.key);
   const w = row ? tightestWindow(row, now) : null;
   if (!w || typeof w.used_pct !== "number") return null;
   return { pct: w.used_pct, window: windowWords(w.name) };
