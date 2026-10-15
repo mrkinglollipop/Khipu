@@ -965,14 +965,27 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
 
 - **The daemon's poll runs only while its routing helper runs (phase 3c).** The refold between prompts runs in
   a child of the recall daemon's routing helper, and the daemon starts the helper only when the per-prompt push
-  is on (at its start, or at the first prompt with the push on), then keeps it running. With the push off,
-  nothing polls: `khipu route`, the tools and doctor refold when they read, as before. While the poll's child
-  is folding, a prompt that also finds the view out of date waits for it within its own budget and otherwise
-  skips routing for that prompt (`routing=skipped:fold-busy`); its marker stays, so the change arrives with the
-  next prompt.
+  is on (at its start, or at the first prompt with the push on), then keeps it running while the push stays
+  on. With the push off, nothing polls: the helper reads the switches (the feature, the old hook's bypass,
+  `routing_push_prompt`) and `routing_poll_interval` before every poll and every 5 seconds and forks no poll
+  child while the push is off, and the daemon stops an idle helper within 2 seconds of the push going off.
+  `khipu route`, the tools and doctor refold when they read, as before. A poll interval set to 0 and back is
+  used within 5 seconds, not at the view's `valid_until`. One fold at a time: a prompt's fold, the poll's, the
+  session start's and a reader's (`khipu route`, the tools, doctor) each take their turn under
+  `prompt-fold.lock`, wait for a running fold within their own budget and answer the view it saved; a reader
+  whose budget runs out answers from its own fold, unsaved, and a prompt skips routing for that prompt
+  (`routing=skipped:fold-busy`); its marker stays, so the change arrives with the next prompt. A write folds
+  under the routing lock, since its new line makes any fold beside it unsavable. Doctor's per-prompt rate
+  counts every prompt that went without its routing lines for lack of time: `skipped:budget`,
+  `skipped:fold-busy` and `skipped:busy`, each also shown apart.
 - **The gate's replay runs the one-shot hook, not a warm daemon (phase 3c).** The promotion gate replays each
-  search through the candidate's hook with routing off and on and fails it when the routing read runs out of
-  its budget, fails, or changes the search's answer. It measures the search's milliseconds both ways on the
+  search through the candidate's hook with routing off and on and fails it when the routing read is skipped
+  for any reason but a benign one (`fold-busy`, `unsaved`): it ran out of its budget, failed, or its reader
+  died before it answered (`skipped:no-answer`); when the candidate's own code says its push is on and its
+  hook logs no routing status; or when routing changes the search's answer. A failing pair is replayed once
+  more before the step fails (a read that refolded once because a runner's heartbeat changed mid-replay is
+  timing, not the candidate). Every process the gate starts runs in an empty folder of its own, so a gate run
+  from a checkout never imports that checkout's code in place of the candidate's. It measures the search's milliseconds both ways on the
   one-shot path only: the warm service runs the live code, not the candidate's. The warm-daemon measure is
   `python -m khipu.routing_replay` (the stop-condition: at least 200 prompts each way through a warm recall
   service with its routing helper, timeouts per 100 for each).

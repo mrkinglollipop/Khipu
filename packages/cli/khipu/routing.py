@@ -2120,9 +2120,11 @@ def _start_view(now: datetime) -> dict:
     view, and only when no input and no saved view changed meanwhile.
     Otherwise the fold is answered unsaved. So a long fold never keeps a
     conversation's write waiting. A rules seed that is due goes through
-    ``read_view``: importing it writes the log, under the lock."""
-    inputs = _inputs()
-    fingerprint, cfg, known = inputs
+    ``read_view``: importing it writes the log, under the lock. It folds in
+    its turn (``_fold_turn``): while another fold runs it waits for it,
+    within this thread's ``lock_budget``, and answers the view that fold
+    saved; past the budget it answers from its own fold, unsaved."""
+    fingerprint, cfg, _known = _inputs()
     prev = _load_view()
     if _fresh(prev, fingerprint, now):
         return dict(prev, checked_at=_iso(now))
@@ -2131,6 +2133,21 @@ def _start_view(now: datetime) -> dict:
     if fingerprint["events"] is None and not cfg.get("routing_rules_seed") \
             and not routing_sources.any_configured(cfg["_raw_sources"], cfg):
         return read_view(now)  # no record: nothing to fold or save, and no lock
+    try:
+        with _fold_turn():
+            return _start_fold(now, save=True)
+    except FoldBusy:
+        return _start_fold(now, save=False)
+
+
+def _start_fold(now: datetime, *, save: bool) -> dict:
+    """``_start_view``'s fold, once it is this thread's turn (``save``) or
+    the turn did not come in time (not ``save``: answered unsaved)."""
+    inputs = _inputs()
+    fingerprint, cfg, known = inputs
+    prev = _load_view()
+    if _fresh(prev, fingerprint, now):
+        return dict(prev, checked_at=_iso(now))  # the fold it waited for saved it
     events, bad = read_events()
     if cfg.get("routing_rules_seed") and not any(e.get("type") == "seed_import" for e in events):
         return read_view(now)
@@ -2139,6 +2156,8 @@ def _start_view(now: datetime) -> dict:
         body["seed_error"] = None
         record = fingerprint["events"] is not None or status is not None
         try:
+            if not save:
+                raise LockBusy("another fold is running")
             with _lock():
                 if _inputs()[0] == fingerprint and (_load_view() or {}).get("digest") == (prev or {}).get("digest"):
                     view = _assemble(prev, body, fold_now, bad, fingerprint, record=record)
@@ -2185,7 +2204,9 @@ def read_view(now: datetime | None = None) -> dict:
         body["seed_error"] = None
         return _assemble(None, body, now, 0, fingerprint, record=False)
     try:
-        with _lock():
+        # Its turn to fold first (a running fold, the daemon's poll say, is
+        # waited for and its saved view answered), then the routing lock.
+        with _fold_turn(), _lock():
             if not explicit:
                 now = _now()  # the clock once the lock is ours, not before waiting for it
             inputs = _inputs()
@@ -2194,7 +2215,8 @@ def read_view(now: datetime | None = None) -> dict:
                 return dict(prev, checked_at=_iso(now))
             return _refold_locked(now, inputs)
     except OSError:
-        # A read-only data dir costs the saved view, never the answer.
+        # A read-only data dir, or a lock held past this thread's budget,
+        # costs the saved view, never the answer.
         return _unsaved_view(now)
 
 
@@ -3469,20 +3491,56 @@ def prompt_budget() -> float:
 
 
 def _take_fold_lock(fd: int) -> None:
-    """Take ``prompt-fold.lock``, waiting for another fold (a prompt's, or
-    the recall daemon's poll) no longer than this thread's ``lock_budget``:
-    a fold that ends in that time has saved the view, which ``_start_view``
-    then answers as it is. Raises ``FoldBusy`` when it does not end in time."""
+    """Take ``prompt-fold.lock``, waiting for another fold (a prompt's, the
+    recall daemon's poll, a session start's or a reader's) no longer than
+    this thread's ``lock_budget`` (with none, until it ends): a fold that
+    ends in that time has saved the view, which the waiter then answers as
+    it is. Raises ``FoldBusy`` when it does not end in time."""
     deadline = getattr(_held, "deadline", None)
+    if deadline is None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return
         except BlockingIOError:
-            left = (deadline - time.monotonic()) if deadline is not None else 0.0
+            left = deadline - time.monotonic()
             if left <= 0:
                 raise FoldBusy("another prompt is refolding the routing record") from None
             time.sleep(min(0.005, left))
+
+
+@contextlib.contextmanager
+def _fold_turn():
+    """This thread's turn to fold the record: ``prompt-fold.lock``, taken
+    before the routing lock (never while this thread holds it), re-entrant
+    within a thread. Every fold of the record that is not a write's takes
+    it, so a prompt's fold, the daemon's poll, the session start's fold and
+    a reader's (``read_view``) never fold the same record side by side, and
+    each waiter finds the view the running fold saved. Waits no longer than
+    this thread's ``lock_budget`` and raises ``FoldBusy`` past it. A write
+    folds under the routing lock without it: the line it appended changes
+    the inputs, so a fold running beside it is not saved."""
+    if getattr(_held, "folding", 0) or getattr(_held, "depth", 0):
+        _held.folding = getattr(_held, "folding", 0) + 1
+        try:
+            yield
+        finally:
+            _held.folding -= 1
+        return
+    folder = routing_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    fd = os.open(folder / PROMPT_FOLD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        _take_fold_lock(fd)
+        _held.folding = 1
+        try:
+            yield
+        finally:
+            _held.folding = 0
+    finally:
+        os.close(fd)
 
 
 def _prompt_view(now: datetime, on_fold=None) -> dict:
@@ -3511,16 +3569,10 @@ def _prompt_view(now: datetime, on_fold=None) -> dict:
     if fingerprint["events"] is None and not cfg.get("routing_rules_seed") \
             and not routing_sources.any_configured(cfg["_raw_sources"], cfg):
         return read_view(now)  # no record: nothing to fold, and nothing written
-    folder = routing_dir()
-    folder.mkdir(parents=True, exist_ok=True)
-    fd = os.open(folder / PROMPT_FOLD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        _take_fold_lock(fd)
+    with _fold_turn():
         if on_fold is not None:
             on_fold()
         return _start_view(now)
-    finally:
-        os.close(fd)
 
 
 def _full_reason(marker: dict | None, view: dict, now: datetime, cfg: dict) -> str | None:
@@ -3656,9 +3708,12 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
 # sources and the log every ``routing_poll_interval`` and at the view's
 # ``valid_until`` (the next change the clock alone causes), and refolds when
 # either says the view is out of date, so a prompt finds view.json fresh and
-# reads it inside its budget. One fold at a time: it takes the prompt's fold
-# lock (``prompt-fold.lock``), and a prompt that finds it held skips routing
-# for that prompt (its marker stays, so the change arrives with the next one).
+# reads it inside its budget. One fold at a time (``_fold_turn``): it takes
+# the fold lock (``prompt-fold.lock``), as a prompt's fold, the session
+# start's and a reader's do; a prompt that finds it held past its budget
+# skips routing for that prompt (its marker stays, so the change arrives with
+# the next one), and a reader past its budget answers from its own unsaved
+# fold.
 
 
 def poll_interval(cfg: dict | None = None) -> float | None:

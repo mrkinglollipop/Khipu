@@ -67,6 +67,12 @@ CLIENT_COLD_RETRY_S = 1.4
 # In-flight requests get this long to finish once the service is stopping.
 DRAIN_S = 3.0
 _ACCEPT_TICK_S = 0.5
+# How often the idle service reads its routing switches (``keep_routing``):
+# a push switched off stops the routing helper, and its poll, within this.
+_ROUTING_LOOK_S = 2.0
+# A helper that a prompt used this recently is kept even with this service's
+# push off (that prompt's environment had it on); its poll is off regardless.
+_ROUTING_IDLE_STOP_S = 60.0
 # sockaddr_un.sun_path is 104 bytes on macOS, 108 on Linux; stay under both.
 _SUN_PATH_MAX = 100
 _SHAPES = ("claude", "cursor")
@@ -224,6 +230,8 @@ class RecallService:
         from khipu import recall_prompt
 
         self.routing_forkserver = recall_prompt.RoutingForkServer() if routing_forkserver else None
+        self._routing_on: bool | None = None
+        self._routing_look_at = 0.0
         self._stamp_fn = stamp_fn
         self._recheck_s = recheck_s
         self._clock = clock
@@ -313,12 +321,25 @@ class RecallService:
         return True
 
     def keep_routing(self) -> bool:
-        """Start the routing helper again if it died after it started, so
-        the record keeps being refolded between prompts (phase 3c: the
-        helper polls the sources and the log and refolds at the view's
-        ``valid_until``; the refold runs in a child of the helper, never on
-        this process's GIL). Never waits."""
+        """While this service's switches have the per-prompt push on, start
+        the routing helper again if it died after it started, so the record
+        keeps being refolded between prompts (phase 3c: the helper polls the
+        sources and the log and refolds at the view's ``valid_until``; the
+        refold runs in a child of the helper, never on this process's GIL).
+        With the push off (the feature, the bypass or ``routing_push_prompt``)
+        it stops the helper: nothing polls. The switches are read at most
+        every ``_ROUTING_LOOK_S``. Never waits; True when the helper was
+        asked to start again."""
         if self.routing_forkserver is None or self._stopping.is_set():
+            return False
+        now = time.monotonic()
+        if self._routing_on is None or now >= self._routing_look_at:
+            from khipu import recall_prompt
+
+            self._routing_on = recall_prompt.daemon_routing_on()
+            self._routing_look_at = now + _ROUTING_LOOK_S
+        if not self._routing_on:
+            self.routing_forkserver.stop(idle_for=_ROUTING_IDLE_STOP_S)
             return False
         return self.routing_forkserver.keep_alive()
 

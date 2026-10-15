@@ -173,6 +173,70 @@ def test_a_clock_set_backwards_also_counts_as_a_jump(home):
     assert "wake" in schedule.due()
 
 
+def test_a_poll_turned_on_again_is_seen_without_waiting_for_valid_until(home):
+    # The helper used to learn the interval only from a poll's answer: after
+    # the owner set it to 0 it looked again only at valid_until (hours away).
+    clocks = home["clocks"]
+    _set(home, routing_poll_interval=0, features={"routing_push": True})
+    schedule = _schedule(home, interval=None)
+    schedule.ran(clocks.wall() + 7200, interval=routing.poll_interval())
+    assert schedule.due() == [] and schedule.next_poll is None
+    _set(home, routing_poll_interval="2s")
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due() == ["poll"]  # looks at once
+    schedule.ran(clocks.wall() + 7200)
+    clocks.run(2.0)
+    assert schedule.due() == ["poll"]
+    # A shorter interval takes effect now, not after the longer wait.
+    _set(home, routing_poll_interval="1h")
+    recall_prompt._look_at_settings(schedule, routing)
+    schedule.ran(clocks.wall() + 7200)
+    _set(home, routing_poll_interval="5s")
+    recall_prompt._look_at_settings(schedule, routing)
+    clocks.run(5.0)
+    assert schedule.due() == ["poll"]
+
+
+def test_with_the_push_off_nothing_is_due_and_on_again_a_poll_is_due_at_once(home, monkeypatch):
+    clocks = home["clocks"]
+    schedule = _schedule(home, interval=10.0)
+    schedule.ran(clocks.wall() + 30)
+    recall_prompt._look_at_settings(schedule, routing)  # the feature is off in this data dir
+    clocks.run(60)  # past the poll and valid_until both
+    assert schedule.due() == [] and schedule.sleep_for(5.0) == 5.0
+    _set(home, features={"routing_push": True})
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due()
+    _set(home, routing_push_prompt=False)  # the prompt's own switch
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due() == []
+    _set(home, routing_push_prompt=True)
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due()
+    monkeypatch.setenv("ROUTING_NOW_OFF", "1")  # the old hook's bypass
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due() == []
+
+
+def test_a_stopping_helper_sleeps_while_only_a_folding_poll_child_is_left():
+    # The reap wait slept only while a prompt's child was left, so a folding
+    # poll child (it ignores the stop signal) left it spinning on waitpid.
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    pollers = {123}
+    recall_prompt._reap_until(lambda: len(pollers), lambda: None, 0.5, sleep=sleep, clock=lambda: clock[0])
+    assert 40 <= len(sleeps) <= 51 and clock[0] >= 0.5
+    pollers.clear()
+    sleeps.clear()
+    recall_prompt._reap_until(lambda: len(pollers), lambda: None, 0.5, sleep=sleep, clock=lambda: clock[0])
+    assert sleeps == []
+
+
 # ---- the poll ------------------------------------------------------------------------------------
 
 
@@ -235,6 +299,72 @@ def test_the_poll_waits_for_a_prompts_fold_and_never_folds_beside_it(home):
     assert out["busy"] and not out["folded"]
     assert routing.LIGHT_LOCK_BUDGET - 0.05 <= waited < routing.LIGHT_LOCK_BUDGET + 1.0
     assert routing.poll_refold()["folded"]
+
+
+def _folding_elsewhere(seconds: float):
+    """Another process's fold (the poll's, as it holds prompt-fold.lock):
+    a thread that takes the lock on its own descriptor, refolds and saves
+    the view after ``seconds``, then lets go. Returns (thread, started, the
+    threads that folded)."""
+    import fcntl
+
+    folded: list[str] = []
+    real_fold = routing.fold
+
+    def counted(*a, **k):
+        folded.append(threading.current_thread().name)
+        return real_fold(*a, **k)
+
+    started = threading.Event()
+
+    def poll():
+        with open(routing.routing_dir() / routing.PROMPT_FOLD_LOCK, "a") as fd:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            started.set()
+            time.sleep(seconds)
+            with routing._lock():
+                routing._refold_locked(routing._now())
+
+    thread = threading.Thread(target=poll, name="the-poll")
+    return thread, started, folded, counted
+
+
+@pytest.mark.parametrize("reader", ["read_view", "start_view"])
+def test_a_reader_waits_for_the_running_fold_and_never_folds_beside_it(home, monkeypatch, reader):
+    routing.report(account="Claude", state="open", author=ME)
+    home["clocks"].run(2)
+    _set(home, routing_poll_interval="30s")  # a changed setting: the view is out of date
+    assert not routing._fresh(routing._load_view(), routing._inputs()[0], routing._now())
+    thread, started, folded, counted = _folding_elsewhere(0.4)
+    monkeypatch.setattr(routing, "fold", counted)
+    thread.start()
+    assert started.wait(5)
+    if reader == "read_view":
+        view = routing.read_view()
+    else:
+        with routing.lock_budget(5):
+            view = routing._start_view(routing._now())
+    thread.join(5)
+    assert folded == ["the-poll"]  # once, by the fold that was running
+    saved = routing._load_view()
+    assert view.get("saved", True) is not False and view["digest"] == saved["digest"]
+    assert routing._fresh(saved, routing._inputs()[0], routing._now())
+
+
+def test_a_reader_that_cannot_wait_for_the_running_fold_answers_unsaved(home, monkeypatch):
+    routing.report(account="Claude", state="open", author=ME)
+    home["clocks"].run(2)
+    _set(home, routing_poll_interval="30s")
+    thread, started, folded, counted = _folding_elsewhere(1.0)
+    monkeypatch.setattr(routing, "fold", counted)
+    thread.start()
+    assert started.wait(5)
+    began = time.monotonic()
+    with routing.lock_budget(0.2):
+        view = routing.read_view()
+    waited = time.monotonic() - began
+    thread.join(5)
+    assert view["saved"] is False and waited < 0.9
 
 
 def test_no_record_folds_and_writes_nothing(home):
@@ -312,6 +442,38 @@ def test_the_daemon_starts_a_dead_helper_again_between_prompts(home, monkeypatch
     assert _wait(lambda: helper.routing_forkserver.wait_ready(0.1) and helper.routing_forkserver.spawned == 2)
 
 
+def test_the_daemon_stops_the_helper_when_the_push_goes_off_and_never_starts_it_again(home, monkeypatch, helper):
+    monkeypatch.setattr(recall_prompt, "_FORKSERVER_RESPAWN_S", 0.0)
+    monkeypatch.setattr(recall_daemon, "_ROUTING_LOOK_S", 0.0)
+    assert helper.start_routing()
+    assert helper.routing_forkserver.wait_ready(10)
+    proc = helper.routing_forkserver._proc
+    _set(home, routing_push_prompt=False)
+    assert not helper.keep_routing()
+    proc.wait(5)  # stopped: nothing polls
+    assert helper.routing_forkserver._proc is None
+    assert not helper.keep_routing() and helper.routing_forkserver._proc is None
+    _set(home, routing_push_prompt=True)
+    assert helper.keep_routing()  # on again: started again
+    assert _wait(lambda: helper.routing_forkserver.wait_ready(0.1) and helper.routing_forkserver.spawned == 2)
+
+
+def test_the_helper_picks_up_a_poll_interval_turned_on_again(home, monkeypatch, helper):
+    monkeypatch.setattr(recall_prompt, "_SETTINGS_LOOK_S", 0.5)
+    _set(home, routing_poll_interval=0)
+    monkeypatch.setattr(routing, "_now", lambda: datetime.now(timezone.utc))
+    routing.report(account="Codex", state="limited", until="2h", author=ME)
+    assert helper.start_routing()
+    assert helper.routing_forkserver.wait_ready(10)
+    version = _wait(lambda: routing._load_view())["version"]
+    _set(home, routing_poll_interval="1s")
+    with monkeypatch.context() as m:
+        m.setattr(routing, "_refold_locked", lambda *a, **k: (_ for _ in ()).throw(OSError("full disk")))
+        routing.report(account="Claude", state="limited", until="1h", author=ME)
+    view = _wait(lambda: (v := routing._load_view()) and v["version"] > version and v, seconds=10)
+    assert next(a for a in view["accounts"] if a["label"] == "Claude")["state"] == routing.LIMITED
+
+
 # ---- doctor: the per-prompt budget rate -----------------------------------------------------------
 
 
@@ -333,6 +495,16 @@ def test_the_budget_rate_counts_only_prompts_with_the_push_on(home):
     rate = recall_prompt.prompt_routing_budget_rate(warn_pct=1.0)
     assert rate["available"] and rate["count"] == 5 and rate["skipped_budget"] == 1
     assert rate["rate_pct"] == 20.0 and not rate["warn"]  # too few prompts to judge
+
+
+def test_the_budget_rate_counts_every_prompt_that_went_without_routing_for_lack_of_time(home):
+    # skipped:fold-busy waited for the poll's fold past its budget; skipped:busy
+    # found the helper full: both went without their routing lines for lack of time.
+    _hook_log(["none"] * 15 + ["skipped:fold-busy"] * 3 + ["skipped:budget", "skipped:busy", "skipped:unsaved"])
+    rate = recall_prompt.prompt_routing_budget_rate(warn_pct=10.0)
+    assert rate["count"] == 21 and rate["skipped"] == 5
+    assert rate["skipped_budget"] == 1 and rate["skipped_fold_busy"] == 3 and rate["skipped_busy"] == 1
+    assert rate["rate_pct"] == round(500 / 21, 2) and rate["warn"]
 
 
 def test_doctor_warns_past_the_slow_read_threshold(home):

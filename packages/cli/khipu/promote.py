@@ -63,16 +63,33 @@ _SUMMARY_RE = re.compile(
 # the search's degraded note before it.
 _ROUTING_FIELD_RE = re.compile(r" routing=(?P<status>\S+)\s*$")
 _DEGRADED_RE = re.compile(r" degraded=(?P<degraded>.*?)(?= stage=| routing=|\s*$)")
-# Routing statuses that fail a candidate's replay with the push on: the read
-# ran out of its budget, or the routing code failed.
-ROUTING_FAILS = ("skipped:budget", "skipped:error")
+# Routing statuses a candidate's replay with the push on may log and still
+# pass: it waited for another fold past its budget (``fold-busy``: on a live
+# Mac, the daemon's poll), or the view changed and could not be saved
+# (``unsaved``). Every other ``skipped:*`` fails it: the read ran out of its
+# budget, the routing code failed, or its child died before it answered
+# (``no-answer``), which on a live Mac skips routing on every prompt.
+ROUTING_SKIPS_OK = ("skipped:fold-busy", "skipped:unsaved")
 # The routing record's own files, copied into a replay's isolated dir so the
 # candidate reads a record of the live size (never written back).
 ROUTING_RECORD_FILES = ("events.jsonl", "view.json")
-# Folds the copied record with the candidate's own code before a replay with
-# routing on, as the recall daemon's poll keeps it folded on a live Mac, so
-# the prompt times the read and not a first fold of a record it never saw.
-_PREFOLD = "from khipu import routing\nrouting.read_view()\n"
+# Asks the candidate's own code whether its per-prompt push is on in the
+# replay's environment (a candidate with no routing push says no), and folds
+# the copied record with it first (argv[1] "1"), as the recall daemon's poll
+# keeps it folded on a live Mac, so the prompt times the read and not a first
+# fold of a record it never saw. Its one line: {"push": true | false}.
+_PREFOLD = (
+    "import json, sys\n"
+    "try:\n"
+    "    from khipu import routing\n"
+    "except ImportError:\n"
+    "    routing = None\n"
+    "off = getattr(routing, 'push_off', None)\n"
+    "on = off is not None and not off('prompt')\n"
+    "if on and sys.argv[1:] == ['1']:\n"
+    "    routing.read_view()\n"
+    "print(json.dumps({'push': on}))\n"
+)
 _FIND_EPISODES = (
     "import json, sys\n"
     "from khipu.db import connect\n"
@@ -306,10 +323,15 @@ def _honours_isolation(root: Path) -> bool:
 
 def _run(argv: list[str], *, env: dict[str, str] | None = None, input: str | None = None,
          cwd: str | None = None, timeout: float = 120) -> subprocess.CompletedProcess:
-    """Every subprocess the gate starts goes through here (tests mock it)."""
+    """Every subprocess the gate starts goes through here (tests mock it).
+    With no ``cwd`` it runs in an empty folder of its own, never the
+    caller's: ``python -c`` and ``-m`` put the working folder first on
+    sys.path, so a gate run from a checkout's packages/cli would otherwise
+    import that checkout's khipu instead of the code it is checking."""
     try:
-        return subprocess.run(argv, env=env, input=input, cwd=cwd, capture_output=True,
-                              text=True, timeout=timeout, check=False)
+        with tempfile.TemporaryDirectory(prefix="khipu-gate-cwd-") as neutral:
+            return subprocess.run(argv, env=env, input=input, cwd=cwd or neutral, capture_output=True,
+                                  text=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
         out = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         return subprocess.CompletedProcess(argv, 124, out, f"timed out after {timeout:g}s")
@@ -615,15 +637,21 @@ def _recall_once(hook: Path, sample: dict[str, Any], session: str, *, legacy: bo
     """One prompt through ``hook`` in its own isolated dir. ``routing``
     True or False sets the routing push on or off for this run (None leaves
     it to the copied settings); with it on, the live routing record is
-    copied in and folded first with the code at ``root``."""
+    copied in and folded first with the code at ``root``, which also says
+    whether its push is on here (``push``: True, False, or None when it
+    could not say)."""
+    push = None
     with tempfile.TemporaryDirectory(prefix="khipu-gate-recall-") as tmp:
         payload = {"session_id": session, "transcript_path": "", "cwd": str(Path.home()),
                    "hook_event_name": "UserPromptSubmit", "prompt": sample["prompt"]}
         env = _replay_env(Path(tmp), legacy=legacy)
         if routing is not None:
             env["KHIPU_FEATURE_ROUTING_PUSH"] = "1" if routing else "0"
-        if routing and _copy_routing_record(Path(tmp)) and root is not None:
-            _run([_hook_python(), "-c", _PREFOLD], env=_code_env(Path(root), env), timeout=60)
+        if routing and root is not None:
+            copied = _copy_routing_record(Path(tmp))
+            p = _run([_hook_python(), "-c", _PREFOLD, "1" if copied else "0"], env=_code_env(Path(root), env),
+                     timeout=60)
+            push = _probe_answer(p)
         t0 = time.monotonic()
         r = _run([str(hook)], env=env, input=json.dumps(payload), timeout=15)
         wall_ms = round((time.monotonic() - t0) * 1000)
@@ -642,17 +670,46 @@ def _recall_once(hook: Path, sample: dict[str, Any], session: str, *, legacy: bo
     return {"exit": r.returncode, "valid_json": valid, "wall_ms": wall_ms,
             "reason": row["reason"] if row else None, "ms": row["ms"] if row else None,
             "hits": row["hits"] if row else [], "routing": row["routing"] if row else None,
-            "degraded": row["degraded"] if row else None}
+            "degraded": row["degraded"] if row else None, "push": push}
+
+
+def _probe_answer(r: subprocess.CompletedProcess) -> bool | None:
+    """What the candidate's probe (``_PREFOLD``) said about its push, or None."""
+    if r.returncode != 0:
+        return None
+    try:
+        out = json.loads((r.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+    push = out.get("push") if isinstance(out, dict) else None
+    return push if isinstance(push, bool) else None
+
+
+def _routing_skip_problem(status: str) -> str | None:
+    """Why a run with routing on that logged ``status`` fails, or None."""
+    if not status.startswith("skipped:") or status.startswith(ROUTING_SKIPS_OK):
+        return None
+    if status == "skipped:budget":
+        return "its routing read ran out of its budget"
+    if status.startswith("skipped:error"):
+        return "its routing read failed"
+    if status == "skipped:no-answer":
+        return "its routing read gave no answer (the reader died or wrote nothing it could read)"
+    return "its routing read was skipped"
 
 
 def _routing_problem(label: str, off: dict[str, Any], on: dict[str, Any]) -> str | None:
     """Why the candidate's run with routing on fails the step, or None: its
-    routing read ran out of its budget or failed, or its search answer is
-    not the one it gave with routing off."""
+    routing read was skipped for any reason but a benign one
+    (``ROUTING_SKIPS_OK``), its code said the push was on and the hook
+    logged no routing status, or its search answer is not the one it gave
+    with routing off."""
     status = on.get("routing") or ""
-    if status.startswith(ROUTING_FAILS):
-        what = "its routing read ran out of its budget" if status == "skipped:budget" else "its routing read failed"
+    what = _routing_skip_problem(status)
+    if what:
         return f"{label}: with routing on, {what} (routing={status})"
+    if on.get("push") is True and not status and on.get("reason") is not None:
+        return f"{label}: with routing on, the candidate's push is on but its hook logged no routing status"
     if on["exit"] != 0 or not on["valid_json"]:
         return f"{label}: with routing on, hook exit {on['exit']}, valid_json={on['valid_json']}"
     if on["hits"] != off["hits"]:
@@ -669,9 +726,12 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
     compare the hit ids with the live code's answer; an empty answer where
     live had one refuses. Each search is replayed through the candidate
     twice, with the routing push off and on (phase 3c): the candidate fails
-    when its routing read runs out of its budget or fails, or when its
-    search answer differs with routing on (a differing pair is replayed once
-    more first, so a search that was late once is not taken for routing)."""
+    when its routing read is skipped for any reason but a benign one (it
+    ran out of its budget, failed, or its reader died before it answered),
+    when its push is on and its hook logs no routing status, or when its
+    search answer differs with routing on (a failing pair is replayed once
+    more first, so a search or a read that was late once is not taken for
+    the candidate's routing)."""
     samples = sample_queries(query_log_path(), n)
     if not samples:
         return False, "no queries in the last day; use Khipu once and re-run"
@@ -713,8 +773,11 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
         on = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-route-{i}", legacy=cand_legacy, routing=True,
                           root=Path(candidate))
         problem = _routing_problem(label, cand, on)
-        if problem and on["hits"] != cand["hits"] and not (on.get("routing") or "").startswith(ROUTING_FAILS):
-            # Once more, both ways: a search late once (embedding late, a cold cache) is not routing.
+        if problem:
+            # Once more, both ways, before the step fails: a search late once
+            # (embedding late, a cold cache) is not routing, and nor is a read
+            # that refolded once because a runner's heartbeat was rewritten
+            # between the prefold and the hook's read.
             cand = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-cand-{i}-again", legacy=cand_legacy,
                                 routing=False)
             on = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-route-{i}-again", legacy=cand_legacy,

@@ -329,6 +329,8 @@ def _hooks(home: Path) -> Path:
 
 def _fake_hook(hits_for, envs=None, payloads=None):
     def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
+        if argv[1:2] == ["-c"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")  # the candidate's routing probe
         if envs is not None:
             envs.append(dict(env))
         if payloads is not None:
@@ -398,7 +400,8 @@ def test_replay_reads_only_the_query_log_and_never_a_credential(home, monkeypatc
     assert out["ok"], out
     assert set(out) == {"ok", "ms", "detail"}
     assert "2 prompt(s) replayed" in out["detail"]
-    # Live, and the candidate with routing off and on, for each of the two distinct queries.
+    # Live, and the candidate with routing off and on, for each of the two distinct queries
+    # (the candidate's routing probe is not a hook run).
     assert len(envs) == 6
     assert sorted(env["KHIPU_FEATURE_ROUTING_PUSH"] for env in envs) == ["0"] * 4 + ["1"] * 2
     for env in envs:
@@ -435,22 +438,27 @@ def test_replay_refuses_an_empty_answer_where_live_had_one(home, monkeypatch):
 
 
 def _routing_hook(runs: list, *, on_status="full", on_hits=("episode:3",), off_hits=("episode:3",),
-                  first_on_hits=None):
+                  first_on_hits=None, first_on_status=None, push=None):
     """A fake hook that answers with routing on (the run's environment says
-    so) as ``on_status`` and ``on_hits``; ``first_on_hits`` only the first time."""
+    so) as ``on_status`` and ``on_hits``; ``first_on_hits`` and
+    ``first_on_status`` only the first time (None: no routing field).
+    ``push`` is what the candidate's probe says (None: it says nothing)."""
     def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
         if argv[1:2] == ["-c"]:
             runs.append(("prefold", env["PYTHONPATH"], env["KHIPU_ISOLATED_DIR"]))
-            return subprocess.CompletedProcess(argv, 0, "", "")
+            out = "" if push is None else json.dumps({"push": push}) + "\n"
+            return subprocess.CompletedProcess(argv, 0, out, "")
         on = env.get("KHIPU_FEATURE_ROUTING_PUSH") == "1"
         iso = Path(env["KHIPU_ISOLATED_DIR"])
         record = (iso / "state" / "routing" / "events.jsonl").is_file()
         runs.append(("on" if on else "off", "/candidate/packages/" in argv[0], record))
         hits = list(off_hits)
+        status = on_status
         if on:
-            hits = list(first_on_hits if first_on_hits is not None and
-                        sum(1 for r in runs if r[0] == "on") == 1 else on_hits)
-        line = _summary(datetime.now(timezone.utc), "ok", hits) + (f" routing={on_status}" if on else "")
+            first = sum(1 for r in runs if r[0] == "on") == 1
+            hits = list(first_on_hits if first_on_hits is not None and first else on_hits)
+            status = first_on_status if first_on_status is not None and first else on_status
+        line = _summary(datetime.now(timezone.utc), "ok", hits) + (f" routing={status}" if on and status else "")
         log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text(line + "\n")
@@ -470,7 +478,55 @@ def test_replay_fails_a_candidate_whose_routing_read_is_over_budget(home, monkey
     out = pm.gate_recall_replay(candidate)
     assert not out["ok"]
     assert "with routing on, its routing read ran out of its budget (routing=skipped:budget)" in out["detail"]
-    assert [r[:2] for r in runs] == [("off", False), ("off", True), ("on", True)]
+    # Run out twice: the failing pair was replayed once more before the step failed.
+    assert [r[:2] for r in runs if r[0] != "prefold"] == [("off", False), ("off", True), ("on", True),
+                                                          ("off", True), ("on", True)]
+
+
+def test_replay_passes_a_candidate_whose_routing_read_ran_out_once_only(home, monkeypatch):
+    # A runner's heartbeat rewritten between the prefold and the hook's read
+    # makes the hook refold inline once; that is timing, not the candidate.
+    candidate = _one_query(home)
+    runs: list = []
+    monkeypatch.setattr(pm, "_run", _routing_hook(runs, first_on_status="skipped:budget"))
+    out = pm.gate_recall_replay(candidate)
+    assert out["ok"], out
+    assert "(routing=full)" in out["detail"]
+
+
+@pytest.mark.parametrize("status", ["skipped:no-answer", "skipped:no-fork", "skipped:starting",
+                                    "skipped:busy", "skipped:no-session", "skipped:somethingnew"])
+def test_replay_fails_every_routing_skip_but_the_benign_ones(home, monkeypatch, status):
+    # skipped:no-answer: the routing child died before it answered (an import
+    # the candidate cannot load, a BaseException); every prompt would skip routing.
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _routing_hook([], on_status=status))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"], out
+    assert f"(routing={status})" in out["detail"]
+
+
+@pytest.mark.parametrize("status", ["skipped:fold-busy", "skipped:unsaved"])
+def test_replay_passes_a_prompt_that_waited_for_another_fold_or_could_not_save(home, monkeypatch, status):
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _routing_hook([], on_status=status))
+    out = pm.gate_recall_replay(candidate)
+    assert out["ok"], out
+
+
+def test_replay_fails_when_the_candidate_says_its_push_is_on_and_its_hook_logs_no_routing(home, monkeypatch):
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _routing_hook([], on_status=None, push=True))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"], out
+    assert "logged no routing status" in out["detail"]
+
+
+def test_replay_passes_without_a_routing_field_when_the_candidate_says_its_push_is_off(home, monkeypatch):
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _routing_hook([], on_status=None, push=False))
+    out = pm.gate_recall_replay(candidate)
+    assert out["ok"] and "routing did not run" in out["detail"]
 
 
 def test_replay_fails_a_candidate_whose_routing_read_fails(home, monkeypatch):
@@ -488,7 +544,8 @@ def test_replay_fails_a_candidate_whose_search_answers_differ_with_routing_on(ho
     assert not out["ok"]
     assert "the search answer changed with routing on" in out["detail"]
     # The differing pair was replayed once more before the step failed.
-    assert [r[:2] for r in runs] == [("off", False), ("off", True), ("on", True), ("off", True), ("on", True)]
+    assert [r[:2] for r in runs if r[0] != "prefold"] == [("off", False), ("off", True), ("on", True),
+                                                          ("off", True), ("on", True)]
 
 
 def test_replay_passes_a_search_that_differed_once_and_agrees_again(home, monkeypatch):
@@ -523,6 +580,31 @@ def test_replay_says_so_when_routing_did_not_run(home, monkeypatch):
     monkeypatch.setattr(pm, "_run", _fake_hook(lambda hook: ["episode:3"]))
     out = pm.gate_recall_replay(candidate)
     assert out["ok"] and "routing did not run" in out["detail"]
+
+
+def test_the_gate_never_runs_python_in_the_callers_folder(tmp_path, monkeypatch):
+    # ``python -c`` and ``-m`` put the working folder first on sys.path: run
+    # from a checkout's packages/cli, the prefold and the replayed hook
+    # imported that checkout's khipu instead of the candidate's.
+    planted = tmp_path / "caller"
+    (planted / "khipu").mkdir(parents=True)
+    (planted / "khipu" / "__init__.py").write_text("MARK = 'the caller'\n")
+    candidate = tmp_path / "candidate" / "packages" / "cli"
+    (candidate / "khipu").mkdir(parents=True)
+    (candidate / "khipu" / "__init__.py").write_text("MARK = 'the candidate'\n")
+    monkeypatch.chdir(planted)
+    env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(candidate)}
+    script = "import khipu; print(khipu.MARK)"
+    for argv in ([pm._hook_python(), "-c", script], [pm._hook_python(), "-m", "khipu"]):
+        if argv[1] == "-m":
+            (candidate / "khipu" / "__main__.py").write_text("import khipu; print(khipu.MARK)\n")
+            (planted / "khipu" / "__main__.py").write_text("import khipu; print(khipu.MARK)\n")
+        r = pm._run(argv, env=env, timeout=60)
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "the candidate", argv
+    # A caller that names a folder still gets it.
+    r = pm._run([pm._hook_python(), "-c", "import os; print(os.getcwd())"], env=env, cwd=str(tmp_path), timeout=60)
+    assert Path(r.stdout.strip()).resolve() == tmp_path.resolve()
 
 
 def test_replay_with_nothing_to_replay_is_a_failure_not_a_pass(home):
