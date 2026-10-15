@@ -2044,6 +2044,53 @@ def test_the_nightly_reports_a_busy_ledger(monkeypatch, tmp_path):
     assert got["ok"] is False and got["busy"] is True and [q["op_id"] for q in ledger.queued_ops()] == ["waiting"]
 
 
+def test_the_nightly_reports_a_lock_timeout_and_keeps_the_write_queued(monkeypatch, tmp_path):
+    from psycopg.errors import LockNotAvailable
+
+    from khipu import jobs
+
+    ledger = _offline(monkeypatch, tmp_path)
+    ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "x"}, op_id="waiting"))
+
+    class Conn:
+        rollbacks = 0
+        inserts = 0
+
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, query, params):
+            assert query.startswith("INSERT INTO ledger_ops ")
+            assert params[0] == "waiting"
+            self.inserts += 1
+            raise LockNotAvailable("synthetic: ledger insert timed out")
+
+        def rollback(self):
+            self.rollbacks += 1
+
+        def close(self):
+            pass
+
+    conn = Conn()
+    monkeypatch.setattr(ledger, "_connect", lambda: conn)
+    monkeypatch.setattr(ledger, "purge_due", lambda _c: {"ok": True, "purged": 0})
+    monkeypatch.setattr(ledger, "replica_catch_up", lambda _c: {"copied": 0})
+    got = ledger.nightly()
+    assert conn.inserts == 1 and conn.rollbacks == 1
+    assert [q["op_id"] for q in ledger.queued_ops()] == ["waiting"]
+    assert got["stopped_early"] is True
+    assert got["ok"] is False
+    assert "writes remain queued" in got["error"]
+    step = jobs._step_result(got)
+    assert step["ok"] is False and step["error"] == got["error"]
+
+
 @pytest.mark.parametrize("choice", ["remove", "move-up"])
 def test_a_cascades_child_rows_get_their_lag_markers_before_the_commit(choice, hub, monkeypatch):
     from khipu import ledger

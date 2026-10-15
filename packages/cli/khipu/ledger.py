@@ -2254,10 +2254,13 @@ def nightly() -> dict[str, Any]:
         drained = drain(conn)
         purged = purge_due(conn)
         replica_catch_up(conn)
-        out = {"ok": not (drained.get("refused") or drained.get("busy") or drained.get("unreadable")),
+        waiting = drained.get("stopped_early") or (drained.get("pending") or 0) > 0
+        out = {"ok": not (drained.get("refused") or drained.get("busy") or drained.get("unreadable") or waiting),
                "landed": drained["landed"], "refused": drained["refused"], "purged": purged.get("purged", 0)}
         if drained.get("busy"):
             out.update(busy=True, error="a ledger write held the lock; waiting writes stay queued")
+        if waiting:
+            out["error"] = "ledger writes remain queued"
         if drained.get("stopped_early"):
             out["stopped_early"] = True
         if drained.get("unreadable"):
