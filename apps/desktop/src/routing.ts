@@ -139,6 +139,47 @@ export type RuleCheck = {
   file?: "settings" | "events" | string;
 };
 
+/** One account in the owner's priority, in his order (phase 4b). */
+export type RoutePriorityEntry = {
+  /** The account's key, as Settings -> Routing sends it back. */
+  account: string;
+  label: string;
+  /** The owner's words for its role. */
+  role?: string | null;
+  until?: string | null;
+  /** False when the account is no longer in Settings -> Models. */
+  in_settings?: boolean;
+};
+
+/** The owner's priority: his order of accounts, never Khipu's. A pending one
+ *  was set by a conversation at his request and waits for his Confirm. */
+export type RoutePriority = {
+  entries: RoutePriorityEntry[];
+  until?: string | null;
+  at?: string | null;
+  via?: string | null;
+  pending?: boolean;
+  confirmed?: boolean;
+  pending_by?: string | null;
+  owner_request?: string | null;
+  replaced?: { entries: RoutePriorityEntry[]; until?: string | null } | null;
+};
+
+/** What Khipu read of an account's plan (`routing.plan_fact`): its longest
+ *  window, how much is left and the pace that would use it by its reset. */
+export type PlanFact = {
+  readable: boolean;
+  why?: string;
+  window?: string;
+  used_pct?: number;
+  left_pct?: number;
+  resets_at?: string;
+  seconds?: number;
+  pace_pct_per_hour?: number;
+  hurry?: boolean;
+  words?: string;
+};
+
 export type RouteView = {
   record?: boolean;
   version?: number;
@@ -163,6 +204,11 @@ export type RouteView = {
   warn_after?: { disagreement?: number; not_refreshed?: number };
   /** Seconds a limit reported without a time lasts. */
   report_default_limit?: number;
+  priority?: RoutePriority | null;
+  /** Each account's plan facts, by its key. */
+  plan_facts?: Record<string, PlanFact>;
+  /** Whether conversations hear accounts in pace order when no priority is set. */
+  pace_order?: boolean;
 };
 
 export type Tone = "ok" | "warn" | "err" | null;
@@ -681,4 +727,44 @@ export function notRefreshedWords(
   };
   if (!(error && past(lastOkAt)) && !past(data.checked_at)) return null;
   return `Khipu's record has not been refreshed since ${whenLocal(data.checked_at ?? lastOkAt, now)}`;
+}
+
+// ---------------------------------------------------------------------------
+// The owner's priority and the spend pace (phase 4b). The priority is the
+// owner's own order, shown as he gave it; the pace is arithmetic on figures
+// Khipu read. Neither is a choice Khipu makes.
+// ---------------------------------------------------------------------------
+
+/** "Claude second until Sat 3:00 PM, then Codex, then Claude". */
+export function priorityOrder(p: RoutePriority, now: Date): string {
+  return p.entries
+    .map((e) => (e.until ? `${e.label} until ${whenLocal(e.until, now)}` : e.label))
+    .join(", then ");
+}
+
+/** "Priority: Claude second until Sat 3:00 PM, then Codex". */
+export function priorityHeadline(p: RoutePriority, now: Date): string {
+  const whole = p.until ? ` (all of it until ${whenLocal(p.until, now)})` : "";
+  return `Priority: ${priorityOrder(p, now)}${whole}`;
+}
+
+/** Who set a priority that waits for the owner, in his words. */
+export function priorityPendingWords(p: RoutePriority): string {
+  return `Set by ${p.pending_by || "a conversation"} at your request; you haven't confirmed it yet.`;
+}
+
+function rateWords(pace: number): string {
+  if (pace >= 10) return pace.toFixed(0);
+  if (pace >= 0.1) return String(Math.round(pace * 10) / 10);
+  return pace >= 0.01 ? String(Math.round(pace * 100) / 100) : "less than 0.01";
+}
+
+/** "88% of its week left, resets Sat 3:00 PM: about 1.7% an hour to use it
+ *  all (a lot left, little time)", or why there is no pace. */
+export function paceWords(fact: PlanFact | null | undefined, now: Date): string | null {
+  if (!fact) return null;
+  if (!fact.readable) return capitalise(fact.why || "plan figures can't be read");
+  const head = `${fact.left_pct}% of its ${fact.window} left, resets ${whenLocal(fact.resets_at, now)}`;
+  if (!fact.left_pct || fact.left_pct <= 0) return `${head}: nothing left to use until then`;
+  return `${head}: about ${rateWords(fact.pace_pct_per_hour ?? 0)}% an hour to use it all (${fact.words})`;
 }

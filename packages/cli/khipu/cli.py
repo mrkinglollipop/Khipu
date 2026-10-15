@@ -2028,7 +2028,22 @@ def cmd_usage(args: argparse.Namespace) -> int:
     from khipu import usage
 
     max_age = usage.DEFAULT_MAX_AGE_S if args.max_age is None else max(0.0, float(args.max_age))
-    rep = usage.report(fresh=bool(args.fresh), max_age=max_age)
+    label = getattr(args, "account", None)
+    key = getattr(args, "account_key", None)
+    account, error = (usage.resolve_account(label, key) if label is not None or key is not None
+                      else (None, None))
+    if error:
+        print(json.dumps({"ok": False, "error": error}))
+        return 2
+    if getattr(args, "sign_in", False):
+        if account is None:
+            print(json.dumps({"ok": False, "error": "name the account with --account"}))
+            return 2
+        out = usage.sign_in(account["label"], key=usage.account_key(account))
+        print(json.dumps(out, indent=2))
+        return 0 if out["ok"] else 1
+    one = {"accounts": [account]} if account else {}
+    rep = usage.report(fresh=bool(args.fresh), max_age=max_age, **one)
     if args.json:
         print(json.dumps(rep, indent=2))
     elif not rep["accounts"]:
@@ -4609,6 +4624,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-age", type=float, default=None, metavar="S",
         help="Reuse a cached probe younger than S seconds (default 120); older figures are marked stale",
     )
+    us.add_argument("--account", default=None, metavar="LABEL",
+                    help="Only this configured account (its label, as Settings shows it)")
+    us.add_argument("--account-key", default=None, metavar="KEY",
+                    help="Only the account with this key (harness|login folder); wins over a label two accounts share")
+    us.add_argument("--sign-in", action="store_true",
+                    help="With --account: start that CLI's own login in its login folder (opens the browser), "
+                         "wait for it, then read the account again")
     us.set_defaults(func=cmd_usage)
 
     rt = sub.add_parser(
@@ -4686,6 +4708,17 @@ def build_parser() -> argparse.ArgumentParser:
                             "not when its limit's time has merely passed")
     rwait.add_argument("--timeout", default=None, metavar="S",
                        help="Give up after S seconds (or 30m, 2h; 0 checks once); default: no end")
+    rprio = rt_sub.add_parser(
+        "priority", parents=[rt_json],
+        help="The owner's priority: show it; set, confirm, undo or clear it (asks for a typed confirmation)")
+    rprio.add_argument("action", nargs="?", default="show", choices=("show", "set", "confirm", "undo", "clear"))
+    rprio.add_argument("accounts", nargs="*", help="set: the accounts in your order (or --entries)")
+    rprio.add_argument("--entries", default=None, metavar="JSON",
+                       help='set: [{"account": "...", "role": "your words", "until": "T"}, ...] in your order')
+    rprio.add_argument("--until", default=None, metavar="T", help="set: when the whole priority ends")
+    rprio.add_argument("--at-owner-request", default=None, metavar="REQUEST",
+                       help="A conversation: the owner's request, in one line (set only; stays unconfirmed)")
+    rprio.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire, restore or confirm a standing rule", parents=[rt_json])
     rrule.add_argument("action", choices=("add", "edit", "retire", "restore", "confirm", "undo", "dismiss"))
     rrule.add_argument("params", nargs="*")

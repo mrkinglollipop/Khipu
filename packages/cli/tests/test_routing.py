@@ -42,14 +42,14 @@ class Clock:
 
 
 @pytest.fixture
-def home(tmp_path, monkeypatch):
+def home(tmp_path, monkeypatch, khipu_app):
     data = tmp_path / "data"
     data.mkdir()
     (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS}))
     monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
     clock = Clock(T0)
     monkeypatch.setattr(routing, "_now", clock)
-    return {"data": data, "clock": clock, "tmp": tmp_path}
+    return {"data": data, "clock": clock, "tmp": tmp_path, "callers": khipu_app}
 
 
 def _set(home, **values) -> None:
@@ -962,7 +962,8 @@ def test_owner_commands_refuse_without_a_typed_confirmation(home, capsys, monkey
     assert rc == 0 and json.loads(out)["ok"] is True
     block = routing.doctor_block()
     assert block["outside_app"] == ["pause of Codex"]
-    assert "A rule, a pause, a clear or your note was written by something other than the app." in block["warnings"]
+    assert "A rule, a pause, a clear, your note or your priority was written by something other than the app." \
+        in block["warnings"]
 
 
 def test_rule_at_owner_request_is_live_without_terminal_confirmation_but_owner_actions_are_not(home, capsys, monkeypatch):

@@ -132,3 +132,45 @@ def _reset_process_level_caches():
     _clear()
     yield
     _clear()
+
+
+class FakeCallers:
+    """The process tree the routing owner check walks (``routing._caller``),
+    faked through its seams: this process's parent is an installed Khipu.app
+    by default, or a shell after ``as_shell()``."""
+
+    def __init__(self, root, monkeypatch):
+        import plistlib
+
+        from khipu import routing
+
+        self.bundle = root / "Applications" / "Khipu.app"
+        (self.bundle / "Contents" / "MacOS").mkdir(parents=True)
+        self.app = self.bundle / "Contents" / "MacOS" / "khipu-desktop"
+        self.app.write_text("")
+        with open(self.bundle / "Contents" / "Info.plist", "wb") as fh:
+            plistlib.dump({"CFBundleIdentifier": routing.APP_BUNDLE_ID, "CFBundleExecutable": "khipu-desktop"}, fh)
+        self.tree = {}
+        self.as_app()
+        monkeypatch.setattr(routing, "_app_bundles", lambda: [self.bundle])
+        monkeypatch.setattr(routing, "_proc_info", lambda pid: self.tree.get(pid))
+
+    def as_app(self):
+        """Started by the app itself, as the app's Rust code does."""
+        self.tree = {os.getpid(): (900, "/usr/bin/python3"), 900: (1, str(self.app))}
+
+    def as_shell(self, *between):
+        """Started from a shell (a conversation's command), with ``between``
+        executables (each one a parent of the last) below the shell."""
+        tree = {os.getpid(): (900, "/usr/bin/python3")}
+        pid = 900
+        for exe in between:
+            tree[pid] = (pid + 1, exe)
+            pid += 1
+        tree[pid] = (1, "/bin/zsh")
+        self.tree = tree
+
+
+@pytest.fixture
+def khipu_app(tmp_path, monkeypatch):
+    return FakeCallers(tmp_path / "apps", monkeypatch)

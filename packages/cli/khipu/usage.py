@@ -1243,6 +1243,104 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
             "accounts": rows, "summary_text": [summary_line(r) for r in rows]}
 
 
+def account_key(account: dict) -> str:
+    """The identity an owner action carries: ``harness|login folder`` as
+    ``_key`` writes it. Labels are display names and may repeat."""
+    return _key(account)
+
+
+def resolve_account(label: str | None = None, key: str | None = None) -> tuple[dict | None, str | None]:
+    """The one valid configured account an owner action names, as
+    ``(account, None)``, or ``(None, error)``. A ``key`` (``account_key``)
+    wins over the label; a label alone that more than one account carries is
+    refused (``E_AMBIGUOUS``), never resolved to the first."""
+    valid = [a for a in configured_accounts() if not a.get("invalid")]
+    if key is not None:
+        harness, _, home = key.partition("|")
+        wanted = _key({"harness": harness, "home": home or None})
+        found = [a for a in valid if _key(a) == wanted]
+        if label is not None:
+            # Both given: they must name the same account (a tie on the key
+            # is settled by the label, never by list order).
+            found = [a for a in found if a["label"] == label]
+    else:
+        found = [a for a in valid if a["label"] == label]
+    if len(found) > 1:
+        return None, E_AMBIGUOUS
+    return (found[0], None) if found else (None, E_NOT_CONFIGURED)
+
+
+def configured_account(label: str) -> dict | None:
+    """The configured account with this label (``configured_accounts``),
+    never an entry that is not valid; None when there is none or when more
+    than one carries it (``resolve_account`` says which)."""
+    return resolve_account(label)[0]
+
+
+# ---- signing in again from the app ---------------------------------------------
+#
+# Each CLI's own login, as its ``--help`` gives it, for the CLIs whose login
+# opens the owner's browser and asks nothing on a terminal. Grok Build's
+# ``grok login`` and Muse's ``muse login`` are left out: Muse shows a code to
+# approve, and nothing in Grok's help says its login asks nothing on a
+# terminal, so the app says "Sign in from Grok Build" (or Muse) instead.
+# The argv is fixed; only the account's own login folder (its
+# ``CLAUDE_CONFIG_DIR`` or ``CODEX_HOME``, set by ``probe_environment``)
+# changes. Khipu never reads, prints or stores what the login writes.
+SIGN_IN_ARGS = {"claude": ("auth", "login", "--claudeai"), "codex": ("login",)}
+# How long Khipu waits for the owner to finish in the browser before it stops
+# the login it started (pressing Sign in again starts a new one).
+SIGN_IN_WAIT_S = 15 * 60
+E_NOT_CONFIGURED = "not_configured"
+E_AMBIGUOUS = "ambiguous_account"
+E_NO_SIGN_IN = "no_sign_in"
+E_SIGN_IN_TIMEOUT = "sign_in_timeout"
+
+
+def sign_in_argv(harness: str, binary: str) -> list[str] | None:
+    """The login's whole argv for ``harness``, or None when Khipu offers no
+    sign-in for it."""
+    args = SIGN_IN_ARGS.get(harness)
+    return [binary, *args] if args else None
+
+
+def sign_in(label: str | None, *, key: str | None = None, wait: float = SIGN_IN_WAIT_S,
+            timeout: float = TIMEOUT_S, popen=None) -> dict:
+    """Start the configured account's own login in its own login folder, in
+    its own session with no terminal (it opens the browser), wait for it to
+    end, then read that account's plan again. Returns the outcome and the
+    account's new row; the login's own output is never read."""
+    account, error = resolve_account(label, key)
+    if account is None:
+        return {"ok": False, "error": error}
+    harness = account["harness"]
+    binary = _command(harness)
+    if harness not in SIGN_IN_ARGS:
+        return {"ok": False, "error": E_NO_SIGN_IN, "cli": CLI_NAMES.get(harness, harness)}
+    if not binary:
+        return {"ok": False, "error": E_NOT_INSTALLED}
+    argv = sign_in_argv(harness, binary)
+    env = probe_environment(harness, account.get("home"), binary)
+    start = popen or subprocess.Popen
+    with tempfile.TemporaryDirectory(prefix="khipu-sign-in-") as cwd:
+        proc = start(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            code = proc.wait(timeout=wait)
+        except subprocess.TimeoutExpired:
+            _killpg(proc)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5)
+            code = None
+    row = report(fresh=True, accounts=[account], timeout=timeout)["accounts"][0]
+    out = {"ok": code == 0, "account": account["label"], "row": row}
+    if code is None:
+        out["error"] = E_SIGN_IN_TIMEOUT
+    elif code != 0:
+        out["error"] = _exit_code(code)
+    return out
+
+
 # ---- text ----------------------------------------------------------------------
 
 

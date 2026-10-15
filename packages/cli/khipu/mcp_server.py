@@ -25,6 +25,9 @@ Tools:
   - ``khipu_route_rule``: a conversation may record the owner's requested
     standing-rule addition or edit; it is live but stays pending until the
     owner confirms it in Settings or at a terminal.
+  - ``khipu_route_priority``: a conversation may record the owner's priority
+    (his order of accounts) at his request; live, unconfirmed until he
+    confirms it; confirming, undoing and clearing stay his.
 
 Zero-dependency by design: the official MCP SDK requires pydantic/anyio which
 are not vendored in ``.python_libs``. The stdio transport is newline-delimited
@@ -818,6 +821,42 @@ TOOLS: list[dict] = [
                 "owner_request": {"type": "string", "description": "This conversation's one-line words describing the owner's request"},
             },
             "required": ["text", "owner_request"],
+        },
+    },
+    {
+        "name": "khipu_route_priority",
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        "description": (
+            "Record the owner's priority at his request: the full ordered list "
+            "of accounts he wants used first (each by its label or its id, as "
+            "khipu_route lists them), with his words for each one's role and an "
+            "optional end. It is live for every conversation at once, marked "
+            "with this conversation and unconfirmed, with the priority it "
+            "replaced shown beside it, until the owner confirms or undoes it "
+            "in Settings -> Routing. Khipu keeps his order as given and never "
+            "reorders it. This tool cannot confirm, undo or clear a priority."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entries": {
+                    "type": "array", "minItems": 1,
+                    "description": "The accounts in the owner's order",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "account": {"type": "string", "description": "Its label or its id, as khipu_route lists them"},
+                            "role": {"type": "string", "description": "The owner's words for its role"},
+                            "until": {"type": "string", "description": "When this entry ends (a time, or 2d, 30h)"},
+                        },
+                        "required": ["account"],
+                    },
+                },
+                "until": {"type": "string", "description": "When the whole priority ends (a time, or 3d)"},
+                "owner_request": {"type": "string",
+                                  "description": "This conversation's one-line words describing the owner's request"},
+            },
+            "required": ["entries", "owner_request"],
         },
     },
 ]
@@ -1716,6 +1755,30 @@ def _tool_route_rule(args: dict) -> dict:
                                 author=routing.conversation_author(), via="mcp")
 
 
+def _tool_route_priority(args: dict) -> dict:
+    """Record the owner's priority at his request through the conversation
+    author path; it never speaks as the owner, and its answer names each
+    account by its label and id, never a key or a login folder."""
+    if _via_https_gateway():
+        return {"available": False, "reason": ROUTING_GATEWAY_REASON}
+    _ensure_path()
+    from khipu import routing
+
+    if not isinstance(args, dict) or set(args) - {"entries", "until", "owner_request"}:
+        raise ValueError("khipu_route_priority takes entries, owner_request and optional until")
+    entries = args.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("entries must be the owner's accounts, in his order")
+    owner_request = args.get("owner_request")
+    if not isinstance(owner_request, str) or not owner_request.strip() or "\n" in owner_request or "\r" in owner_request:
+        raise ValueError("owner_request must be one line of text")
+    until = args.get("until")
+    if until is not None and not isinstance(until, str):
+        raise ValueError("until must be text")
+    return routing.conversation_priority(entries, until=until, owner_request=owner_request,
+                                         author=routing.conversation_author())
+
+
 TOOL_FUNCS = {
     "khipu_search": _tool_search,
     "khipu_get": _tool_get,
@@ -1733,6 +1796,7 @@ TOOL_FUNCS = {
     "khipu_route": _tool_route,
     "khipu_route_report": _tool_route_report,
     "khipu_route_rule": _tool_route_rule,
+    "khipu_route_priority": _tool_route_priority,
 }
 
 
