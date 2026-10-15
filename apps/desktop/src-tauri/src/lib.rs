@@ -4558,7 +4558,7 @@ mod priority_and_sign_in_tests {
     }
 
     fn config() -> Value {
-        serde_json::json!({"usage_accounts": {"user_home": "/Users/me", "accounts": [
+        serde_json::json!({"usage_accounts": {"user_home": "/home/owner", "accounts": [
             {"label": "Claude", "harness": "claude", "home": null},
             {"label": "Claude second", "harness": "claude", "home": "~/.claude-second"},
             {"label": "Codex", "harness": "codex", "home": null},
@@ -4577,7 +4577,7 @@ mod priority_and_sign_in_tests {
         );
         // The same folder written in full is the same login.
         assert_eq!(
-            sign_in_argv(&c, "claude", Some("/Users/me/.claude-second")).unwrap(),
+            sign_in_argv(&c, "claude", Some("/home/owner/.claude-second")).unwrap(),
             v(&["usage", "--sign-in", "--account=Claude second"])
         );
         assert_eq!(sign_in_argv(&c, "codex", Some("")).unwrap(), v(&["usage", "--sign-in", "--account=Codex"]));
