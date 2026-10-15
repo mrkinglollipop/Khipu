@@ -106,7 +106,31 @@ class ClientTest(unittest.TestCase):
         request = json.loads(svc.received[0])
         self.assertEqual(request.pop("protocol"), 1)
         self.assertIsInstance(request.pop("deadline"), float)
-        self.assertEqual(request, {"op": "recall", "raw": '{"prompt": "hello"}', "shape": "claude"})
+        self.assertEqual(request, {"op": "recall", "raw": '{"prompt": "hello"}', "shape": "claude", "env": {}})
+
+    def test_the_hooks_routing_switches_and_nothing_else_go_with_the_request(self) -> None:
+        """Finding R2-1 of fix round 2: the service read routing's switches
+        from its own environment, so a hook's ROUTING_NOW_OFF=1 was lost."""
+        svc = self._serve(lambda _line: b"{}\n")
+        env = {"PATH": os.environ.get("PATH", ""), "KHIPU_CAPTURE_HOME": str(self.home),
+               "ROUTING_NOW_OFF": "1", "KHIPU_FEATURE_ROUTING_PUSH": "0", "KHIPU_FEATURE_OTHER": "1",
+               "SOME_TOKEN": "tok-" + "abc123"}
+        subprocess.run([sys.executable, "-S", "-E", "-B", str(CLIENT)], input=b'{"prompt": "hello"}',
+                       capture_output=True, env=env, timeout=30)
+        request = json.loads(svc.received[0])
+        self.assertEqual(request["env"], {"ROUTING_NOW_OFF": "1", "KHIPU_FEATURE_ROUTING_PUSH": "0"})
+
+    def test_the_clients_switch_list_is_the_hooks(self) -> None:
+        from khipu import features, recall_prompt
+
+        import ast
+
+        tree = ast.parse(CLIENT.read_text(encoding="utf-8"))
+        sent = next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
+                    and any(getattr(t, "id", None) == "ROUTING_SWITCHES" for t in node.targets))
+        self.assertEqual(sent, recall_prompt.ROUTING_SWITCHES)
+        self.assertIn(features._ENV_PREFIX + "ROUTING_PUSH", recall_prompt.ROUTING_SWITCHES)
+        self.assertIn("ROUTING_NOW_OFF", recall_prompt.ROUTING_SWITCHES)
 
     def test_the_cursor_shape_is_passed_on(self) -> None:
         svc = self._serve(lambda _line: b"{}\n")

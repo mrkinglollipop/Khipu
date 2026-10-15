@@ -31,6 +31,9 @@ ANSWER_TIMEOUT_S = 1.6
 NO_CONNECTION = 3
 NO_BUDGET = 4
 MAX_ANSWER_BYTES = 8 * 1024 * 1024
+# The hook's routing switches (khipu.recall_prompt.ROUTING_SWITCHES): the
+# service reads them as this hook's, not as its own environment's.
+ROUTING_SWITCHES = ("ROUTING_NOW_OFF", "KHIPU_FEATURE_ROUTING_PUSH")
 
 
 def socket_path():
@@ -113,8 +116,9 @@ def main(argv):
         return NO_CONNECTION
     line = None
     try:
+        env = {k: os.environ[k] for k in ROUTING_SWITCHES if k in os.environ}
         request = json.dumps({"op": "recall", "raw": raw, "shape": shape,
-                              "protocol": 1, "deadline": deadline}) + "\n"
+                              "protocol": 1, "deadline": deadline, "env": env}) + "\n"
         sock.settimeout(max(0.001, deadline - time.monotonic()))
         sock.sendall(request.encode("utf-8"))
         line = read_answer(sock, deadline)

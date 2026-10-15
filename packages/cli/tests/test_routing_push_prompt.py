@@ -180,10 +180,11 @@ def daemon(home):
     svc.close()
 
 
-def _client(home, prompt: str = PROMPT) -> tuple[int, str]:
-    """The real client, started as the launcher starts it."""
+def _client(home, prompt: str = PROMPT, env: dict | None = None) -> tuple[int, str]:
+    """The real client, started as the launcher starts it (``env``: more of
+    the hook's own environment)."""
     env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ["HOME"],
-           "KHIPU_CAPTURE_HOME": str(home["capture"])}
+           "KHIPU_CAPTURE_HOME": str(home["capture"]), **(env or {})}
     proc = subprocess.run([sys.executable, "-S", "-E", "-B", str(CLIENT), "claude"],
                           input=json.dumps(_payload(prompt)).encode(), env=env, capture_output=True, timeout=10)
     return proc.returncode, proc.stdout.decode()
@@ -792,9 +793,9 @@ def test_the_routing_clock_starts_when_the_read_starts(home, monkeypatch):
     assert routing.prompt_budget() == 0.05
     real = features.enabled
 
-    def slow_start(name):  # a cold interpreter reading its config
+    def slow_start(name, environ=None):  # a cold interpreter reading its config
         time.sleep(0.1)
-        return real(name)
+        return real(name, environ=environ)
 
     monkeypatch.setattr(features, "enabled", slow_start)
     _push_on(monkeypatch)
@@ -890,3 +891,168 @@ def test_the_routing_imports_cover_everything_the_read_imports(home):
     proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, timeout=30)
     assert proc.returncode == 0, proc.stderr.decode()[-2000:]
     assert proc.stdout.decode().strip() == "[]"
+
+
+# ---- fix round 2 -------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("switch", [{"ROUTING_NOW_OFF": "1"}, {"KHIPU_FEATURE_ROUTING_PUSH": "0"}])
+def test_the_hooks_own_switches_turn_the_push_off_on_the_daemon_path(home, monkeypatch, daemon, switch):
+    """Finding R2-1: the service read ROUTING_NOW_OFF and the feature switch
+    from its own environment, so a hook that set them still got routing."""
+    _record()
+    code, before = _client(home)
+    assert code == 0 and "## Prior work" in before and "## Routing" not in before
+    _wait_log(1)
+    _push_on(monkeypatch)  # the service's own environment: on
+    recall_prompt._save_recent_batches(SESSION, [])
+    code, out = _client(home, env=switch)
+    assert code == 0 and out == before
+    assert " routing=" not in _wait_log(2)
+    assert _marker() == {}
+    recall_prompt._save_recent_batches(SESSION, [])
+    code, out = _client(home)  # the hook's environment says nothing: the service's own stands
+    assert code == 0 and _routing_part(out).startswith(FULL)
+    assert _wait_log(3).endswith(" routing=full")
+
+
+def test_the_hooks_own_feature_switch_turns_the_push_on_on_the_daemon_path(home, daemon):
+    _record()
+    code, out = _client(home, env={"KHIPU_FEATURE_ROUTING_PUSH": "1"})
+    assert code == 0 and _routing_part(out).startswith(FULL)
+    assert _wait_log(1).endswith(" routing=full")
+
+
+def test_the_hook_never_imports_routing_itself(home, monkeypatch):
+    """Finding R2-3: the hook imported routing and read its settings before
+    the search started, about 25 ms on every cold-path prompt's critical path.
+    Only the child imports it; the hook's own process never does."""
+    _record()
+    _push_on(monkeypatch)
+    script = (
+        "import io, json, sys\n"
+        "from khipu import recall_prompt\n"
+        "seen = {}\n"
+        "def search(*_a, **_k):\n"
+        "    seen['at_search'] = 'khipu.routing' in sys.modules\n"
+        "    return {'hits': [{'kind': 'episode', 'id': '41', 'score': 0.9, 'snippet': 'kept the hook fail-open',"
+        " 'label': 'kept the hook fail-open'}], 'legs': ['lexical'], 'degraded': None}\n"
+        "recall_prompt._search_hits = search\n"
+        "recall_prompt._deliverable_context_line = lambda *_a, **_k: ''\n"
+        f"sys.stdin = io.StringIO({json.dumps(json.dumps(_payload()))})\n"
+        "out = io.StringIO()\n"
+        "real, sys.stdout = sys.stdout, out\n"
+        "recall_prompt.prompt_recall_main(shape='claude')\n"
+        "sys.stdout = real\n"
+        "seen['after'] = 'khipu.routing' in sys.modules\n"
+        "print(json.dumps({'seen': seen, 'out': out.getvalue()}))\n"
+    )
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    proc = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr.decode()
+    result = json.loads(proc.stdout.decode().splitlines()[-1])
+    assert result["seen"] == {"at_search": False, "after": False}
+    assert _routing_part(result["out"]).startswith(FULL)
+    assert _last_log().endswith(" routing=full")
+    assert _marker()["full_at"]  # the child's clock (this subprocess has no fake one)
+
+
+def test_a_switched_off_setting_is_decided_in_the_child_and_logs_nothing(home, monkeypatch):
+    _record()
+    _push_on(monkeypatch)
+    _set(home, routing_push_prompt=False)
+    out = _cold(monkeypatch, session=None)
+    assert "## Routing" not in out
+    assert " routing=" not in _last_log()
+
+
+def test_a_fold_longer_than_the_childs_bound_still_saves_the_view(home, monkeypatch):
+    """Finding R2-2: a refold slower than the child's bound was killed before
+    it saved the view, so every later prompt started the same fold again."""
+    _record()
+    routing.view_file().unlink()
+    _set(home, routing_prompt_budget_ms=50)
+    monkeypatch.setattr(recall_prompt, "_ROUTING_CHILD_MOST", 0.2)
+    monkeypatch.setattr(routing, "fold", _cpu_bound_fold(2.5))
+    _push_on(monkeypatch)
+    out = _cold(monkeypatch)
+    assert "## Routing" not in out and _last_log().endswith(" routing=skipped:budget")
+    _wait_saved()
+    monkeypatch.setattr(routing, "fold", _cpu_bound_fold(30.0))  # would be late if it folded again
+    home["search"]["hits"] = [dict(HITS[0], id="42")]
+    assert _routing_part(_cold(monkeypatch)).startswith(FULL)
+
+
+def _fold_cost(home, events: list[dict]) -> int:
+    """How many times the fold compares two reports' order (``_k``)."""
+    path = routing.events_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+    read, _bad = routing.read_events()
+    _fingerprint, cfg, known = routing._inputs()
+    calls = [0]
+    real = routing._k
+
+    def counted(item):
+        calls[0] += 1
+        return real(item)
+
+    routing._k = counted
+    try:
+        routing.fold(read, now=T0, cfg=cfg, known=known)
+    finally:
+        routing._k = real
+    return calls[0]
+
+
+def _reports(n: int, shape: str) -> list[dict]:
+    """``n`` reports on one account, a second apart: limits and opens taking
+    turns, or guessed limits and cli limits taking turns."""
+    out = []
+    for i in range(n):
+        at = routing._iso(T0 - timedelta(seconds=n - i))
+        event = {"type": "evidence", "id": f"r{i:06d}", "account": "codex|", "source": "report",
+                 "written_at": at, "via": "cli", "written_by": ME, "seq": i + 1}
+        if shape == "limit-open":
+            event.update(state="limited" if i % 2 else "open",
+                         until=routing._iso(T0 + timedelta(hours=1)) if i % 2 else None)
+        else:
+            event.update(state="limited", until=routing._iso(T0 + timedelta(hours=1)),
+                         basis="cli" if i % 2 else "estimated")
+        out.append({k: v for k, v in event.items() if v is not None})
+    return out
+
+
+@pytest.mark.parametrize("shape", ["limit-open", "guess-cli"])
+def test_a_fold_is_linear_in_the_size_of_the_log(home, shape):
+    """Finding R2-2's second half: the fold compared every report with every
+    other (5k reports took 0.67 s, 20k took 10 s), so a big log could never
+    be folded within any bound."""
+    small = _fold_cost(home, _reports(500, shape))
+    big = _fold_cost(home, _reports(2000, shape))
+    assert big < 5 * small, (small, big)
+
+
+def test_an_unsaved_view_with_no_saved_one_is_the_same_view_until_it_changes(home, monkeypatch):
+    """Finding R2-4: with view.json gone and the routing folder read-only,
+    every unsaved fold drew a new random epoch, so every prompt got the full
+    summary although nothing had changed."""
+    _record()
+    routing.view_file().unlink()
+    _push_on(monkeypatch)
+    folder = routing.routing_dir()
+    (folder / routing.PROMPT_FOLD_LOCK).touch()  # an earlier prompt's
+    folder.chmod(0o555)
+    try:
+        first = _cold(monkeypatch)
+        assert _routing_part(first).startswith(FULL)
+        assert _last_log().endswith(" routing=full")
+        epoch = _marker()["epoch"]
+        home["search"]["hits"] = [dict(HITS[0], id="42")]
+        assert "## Routing" not in _cold(monkeypatch)
+        assert _last_log().endswith(" routing=none")
+        assert _marker()["epoch"] == epoch
+    finally:
+        folder.chmod(0o755)
+    assert not routing.view_file().exists()
+

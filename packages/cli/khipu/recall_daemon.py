@@ -350,6 +350,10 @@ class RecallService:
                 if time.monotonic() >= deadline:
                     return {"ok": False, "error": "timeout>request deadline"}
                 options = {"deadline": deadline, "delivery": delivery}
+            # Routing's switches as the hook's own environment set them, not this service's.
+            environ = recall_prompt.caller_environ(req.get("env"))
+            if environ is not None:
+                options["environ"] = environ
             out = recall_prompt.hook_main(raw, shape=shape, **options)
             if not isinstance(out, dict):
                 raise TypeError("recall handler returned a non-object")

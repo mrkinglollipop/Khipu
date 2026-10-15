@@ -1366,6 +1366,15 @@ def _k(item: dict) -> tuple:
     return (item["at"], item["seq"])
 
 
+def _window_key(window: Any) -> Any:
+    """A report's window as a dict key: text (or None) as it is. A window
+    Khipu never writes (not text) is keyed by its JSON, so it still matches
+    an equal one and never stops a fold."""
+    if window is None or isinstance(window, str):
+        return window
+    return ("json", json.dumps(window, sort_keys=True, default=str))
+
+
 def _evidence(event: dict, cfg: dict) -> dict | None:
     at = _parse(event.get("written_at"))
     state = event.get("state")
@@ -1428,26 +1437,50 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
 
     # A cli, checked or owner time replaces an older guess for the same scope
     # and window, even after that time has passed. Evidence that names no
-    # window can't be told apart from either, so it matches both.
-    strong_limits = [e for e in live if e["state"] == LIMITED and e["basis"] in STRONG_BASES]
+    # window can't be told apart from either, so it matches both. Each
+    # question below is answered from the newest key of the evidence that
+    # could answer it, found once, never by scanning every report again for
+    # every report: a fold stays linear in the size of the log.
+    newest_strong: dict[Any, tuple] = {}  # scope: the newest strong limit, any window
+    newest_strong_in: dict[tuple, tuple] = {}  # (scope, window): the newest strong limit naming it (or none)
+    for s in live:
+        if s["state"] == LIMITED and s["basis"] in STRONG_BASES:
+            k, slot = _k(s), (s["scope"], _window_key(s.get("window")))
+            newest_strong[s["scope"]] = max(newest_strong.get(s["scope"], k), k)
+            newest_strong_in[slot] = max(newest_strong_in.get(slot, k), k)
 
     def replaced(e: dict) -> bool:
-        return e["state"] == LIMITED and e["basis"] not in STRONG_BASES and any(
-            later(s, e) and s["scope"] == e["scope"]
-            and (s.get("window") is None or e.get("window") is None or s["window"] == e["window"])
-            for s in strong_limits)
+        if e["state"] != LIMITED or e["basis"] in STRONG_BASES:
+            return False
+        if e.get("window") is None:
+            newest = newest_strong.get(e["scope"])
+        else:
+            newest = max((k for k in (newest_strong_in.get((e["scope"], None)),
+                                      newest_strong_in.get((e["scope"], _window_key(e["window"]))))
+                          if k is not None), default=None)
+        return newest is not None and newest > _k(e)
 
     live = [e for e in live if not replaced(e)]
 
-    def limit_holds(limit: dict, pool: list[dict], scopes: tuple) -> bool:
-        if limit["state"] != LIMITED or limit["until"] is None or limit["until"] <= now:
-            return False
-        if limit["basis"] in STRONG_BASES:  # ended early only by a probe or check with headroom
-            return not any(e["state"] == OPEN and e["source"] in ("probe", "check") and e["scope"] in scopes
-                           and later(e, limit) for e in pool)
-        return not any(e["state"] == OPEN and e["scope"] in scopes and later(e, limit) for e in pool)
+    def limit_holds_in(pool: list[dict], scopes: tuple):
+        """``holds(limit)``: whether ``limit`` (one of ``pool``) still holds:
+        its time has not passed and no newer open evidence in ``scopes`` ends
+        it (for a cli, checked or owner time, only a probe or check with
+        headroom does)."""
+        any_open = max((_k(e) for e in pool if e["state"] == OPEN and e["scope"] in scopes), default=None)
+        own_open = max((_k(e) for e in pool if e["state"] == OPEN and e["scope"] in scopes
+                        and e["source"] in ("probe", "check")), default=None)
+
+        def holds(limit: dict) -> bool:
+            if limit["state"] != LIMITED or limit["until"] is None or limit["until"] <= now:
+                return False
+            newest = own_open if limit["basis"] in STRONG_BASES else any_open
+            return newest is None or not newest > _k(limit)
+
+        return holds
 
     whole = [e for e in live if e["scope"] == "all"]
+    whole_holds = limit_holds_in(whole, ("all",))
     fresh = [e for e in whole if not stale(e)]
     shown: tuple[str, dict | None] | None = (UNKNOWN, None) if only_silent else None
     downs = [e for e in fresh if e["state"] == DOWN]
@@ -1456,11 +1489,11 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
         if not any(e["source"] in ("probe", "check", "report") and later(e, down) for e in whole):
             shown = (DOWN, down)
     if shown is None:
-        strong = [e for e in whole if e["basis"] in STRONG_BASES and limit_holds(e, whole, ("all",))]
+        strong = [e for e in whole if e["basis"] in STRONG_BASES and whole_holds(e)]
         if strong:
             shown = (LIMITED, max(strong, key=_k))
     if shown is None:
-        weak = [e for e in whole if e["basis"] not in STRONG_BASES and limit_holds(e, whole, ("all",))]
+        weak = [e for e in whole if e["basis"] not in STRONG_BASES and whole_holds(e)]
         if weak:
             shown = (LIMITED, max(weak, key=_k))
     if shown is None:
@@ -1514,7 +1547,8 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
     models = []
     for model in sorted({e["scope"] for e in live if e["scope"] != "all" and not only_silent}):
         pool = [e for e in live if e["scope"] == model]
-        held = [e for e in pool if limit_holds(e, pool, (model,))]
+        model_holds = limit_holds_in(pool, (model,))
+        held = [e for e in pool if model_holds(e)]
         strong_m = [e for e in held if e["basis"] in STRONG_BASES]
         pick = max(strong_m or held, key=_k, default=None)
         if pick is not None:
@@ -1539,7 +1573,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
              "underlying": None, "checkable": account["harness"] != "muse", "confirmed_at": confirmed_at}
     if state == LIMITED:
         # When the limit now shown was first reported (doctor's launch check).
-        entry["since"] = _iso(min((e["at"] for e in whole if limit_holds(e, whole, ("all",))), default=None))
+        entry["since"] = _iso(min((e["at"] for e in whole if whole_holds(e)), default=None))
     if only_silent:
         entry["silent"] = True
     if state == UNKNOWN:
@@ -1999,7 +2033,13 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
     prev_effective = (prev or {}).get("effective") or {}
     version = int((prev or {}).get("version") or 0)
     changes = [_without_table_text(c) for c in (prev or {}).get("changes") or []]
-    epoch = (prev or {}).get("epoch") or (secrets.token_hex(4) if record else None)
+    epoch = (prev or {}).get("epoch")
+    if not epoch and record:
+        # A new count starts under a new epoch. An unsaved fold with no saved
+        # view before it starts no count: its epoch is drawn from what it
+        # says, so the same record read again (a read-only data dir, the
+        # lock busy) is the same view, and a changed one is a new one.
+        epoch = secrets.token_hex(4) if saved else _content_epoch(body)
     if record and saved and body["effective"] != prev_effective:
         version += 1
         changed = sorted(set(body["effective"]) | set(prev_effective),
@@ -2015,6 +2055,13 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
     if not saved:
         out["saved"] = False
     return out
+
+
+def _content_epoch(body: dict) -> str:
+    """The epoch of an unsaved view that has no saved one before it: the
+    first 8 hex digits of the sha256 of its effective state."""
+    text = json.dumps(body.get("effective") or {}, sort_keys=True, ensure_ascii=True, default=str)
+    return hashlib.sha256(text.encode("ascii")).hexdigest()[:8]
 
 
 _OLD_TABLE_STAMP = re.compile(r"^(The routing table's NOW block changed.*?) \(stamped '.*'\)\.$", re.S)
@@ -3313,18 +3360,21 @@ PUSH_MOMENTS = {"start": "routing_push_start", "prompt": "routing_push_prompt",
 START_BUDGET_MOST_MS = 8000
 
 
-def push_off(moment: str) -> str | None:
+def push_off(moment: str, environ=None) -> str | None:
     """Why nothing is pushed at ``moment`` (start, prompt or delegation), or
     None when the push is on: ``ROUTING_NOW_OFF=1`` or the file
     ``/tmp/.routing_now_disable`` (the old hook's bypass), the
-    ``routing_push`` feature (off by default), then the moment's setting."""
-    if (os.environ.get("ROUTING_NOW_OFF") or "").strip().lower() in _TRUE:
+    ``routing_push`` feature (off by default), then the moment's setting.
+    ``environ`` is the hook's own environment where that is not this
+    process's (the recall daemon answers for a hook started elsewhere)."""
+    env = os.environ if environ is None else environ
+    if (env.get("ROUTING_NOW_OFF") or "").strip().lower() in _TRUE:
         return "ROUTING_NOW_OFF"
     if os.path.exists(ROUTING_NOW_DISABLE_FILE):
         return "routing_now_disable"
     from khipu import features
 
-    if not features.enabled("routing_push"):
+    if not features.enabled("routing_push", environ=env):
         return "routing_push off"
     key = PUSH_MOMENTS[moment]
     if not settings()[key]:
@@ -3390,14 +3440,18 @@ def prompt_budget() -> float:
     return min(max(0, ms), PROMPT_BUDGET_MOST_MS) / 1000.0
 
 
-def _prompt_view(now: datetime) -> dict:
+def _prompt_view(now: datetime, on_fold=None) -> dict:
     """The view for a prompt. A fresh view.json is answered as it is. When
     an input changed or ``valid_until`` has passed (the clock caused a
     change and nothing refolded yet), the record is refolded inline, as the
     session-start child does it (``_start_view``: outside the routing lock,
     which is taken only to save). Only one prompt refolds at a time: while
     another prompt's child holds ``prompt-fold.lock`` this raises
-    ``FoldBusy`` instead of folding the same record again."""
+    ``FoldBusy`` instead of folding the same record again. ``on_fold`` is
+    called once the lock is held: the per-prompt child then lets this fold
+    run on until it has saved the view, so a fold slower than a prompt's
+    wait still ends with a saved view instead of starting again on every
+    prompt."""
     try:
         os.stat(events_file())
     except FileNotFoundError:
@@ -3419,6 +3473,8 @@ def _prompt_view(now: datetime) -> dict:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise FoldBusy("another prompt is refolding the routing record") from None
+        if on_fold is not None:
+            on_fold()
         return _start_view(now)
     finally:
         os.close(fd)
@@ -3508,17 +3564,19 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
     return "\n".join(lines), len(changed["entities"])
 
 
-def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None) -> dict:
+def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None,
+                on_fold=None) -> dict:
     """What the per-prompt hook adds for a conversation whose last-seen
     marker is ``marker`` (``recall_prompt.routing_marker``):
     ``{"kind": "none" | "changes" | "full", "text", "version", "epoch",
     "count", "unrefreshed"}``. ``none`` means nothing changed and nothing is
     sent. Waits for the routing lock at most half of ``budget``; the caller
-    bounds the whole call. Raises when the view cannot be read (the caller
-    sends nothing)."""
+    bounds the whole call. ``on_fold`` is called when this prompt starts to
+    refold the record (``_prompt_view``). Raises when the view cannot be
+    read (the caller sends nothing)."""
     with lock_budget(budget / 2):
         now = now or _now()
-        view = _prompt_view(now)
+        view = _prompt_view(now, on_fold=on_fold)
     cfg = settings()
     base = {"version": view["version"], "epoch": view.get("epoch")}
     why = _full_reason(marker, view, now, cfg)

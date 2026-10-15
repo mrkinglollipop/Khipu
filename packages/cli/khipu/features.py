@@ -105,11 +105,12 @@ def _check_known(name: str) -> None:
         raise KeyError(f"unknown feature {name!r}; known: {sorted(FEATURES)}")
 
 
-def enabled(name: str) -> bool:
-    """Environment, then config.json ``features``, then False (default off).
-    Raises ``KeyError`` for a name outside ``FEATURES``."""
+def enabled(name: str, environ=None) -> bool:
+    """Environment (``environ``, default this process's), then config.json
+    ``features``, then False (default off). Raises ``KeyError`` for a name
+    outside ``FEATURES``."""
     _check_known(name)
-    raw = os.environ.get(_ENV_PREFIX + name.upper())
+    raw = (os.environ if environ is None else environ).get(_ENV_PREFIX + name.upper())
     if raw is not None:
         parsed = parse_bool(raw)
         if parsed is not None:
