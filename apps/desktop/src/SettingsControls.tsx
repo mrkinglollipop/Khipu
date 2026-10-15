@@ -484,9 +484,9 @@ const JOB_ROWS: ReadonlyArray<readonly [string, string, string]> = [
 ];
 
 function jobWhen(iso: string | null | undefined): string {
-  if (!iso) return "not run yet";
+  if (!iso) return "no run on record";
   const t = Date.parse(iso);
-  if (Number.isNaN(t)) return "not run yet";
+  if (Number.isNaN(t)) return "no run on record";
   const seconds = (Date.now() - t) / 1000;
   if (seconds < 3600) return "ran within the hour";
   return `ran ${fmtAgo(seconds)}`;

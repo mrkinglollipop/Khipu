@@ -153,6 +153,67 @@ class TopicsCatchupContractTest(unittest.TestCase):
         self.assertEqual(out["topics_embedded"], 1)
         self.assertTrue(any(p[1] == "topic" and p[2] == "note:fresh" for p in cur.inserts))
 
+    def test_an_edited_note_with_an_old_updated_at_is_re_embedded(self):
+        # Live 2026-10-15: notes-watch rewrote two notes' bodies but their
+        # frontmatter kept updated_at at 2026-10-09, and they already had
+        # (now stale) vectors, so neither the newest-updated_at pass nor the
+        # no-vector pass picked them up; they waited for the nightly.
+        class _Cur:
+            def __init__(self):
+                self.inserts = []
+                self._result = []
+
+            def execute(self, sql, params=None):
+                s = " ".join(sql.split())
+                if "FROM topics t WHERE t.deleted_at IS NULL" in s and "xmin" in s:
+                    self._result = [("note:edited", "Edited", "new body text",
+                                     {"slug": "note:edited", "title": "Edited",
+                                      "body": "new body text"})]
+                elif s.startswith("SELECT kind, ref, chunk_idx, content_hash FROM memory_embeddings"):
+                    self._result = [("topic", "note:edited", 0, "hash-of-the-old-body")]
+                elif s.startswith("INSERT INTO memory_embeddings"):
+                    self.inserts.append(params)
+                    self._result = [(datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc),)]
+                else:
+                    self._result = []
+
+            def fetchall(self):
+                return list(self._result)
+
+            def fetchone(self):
+                return self._result[0] if self._result else None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class _Conn:
+            def __init__(self, cur):
+                self._cur = cur
+
+            def cursor(self):
+                return self._cur
+
+            def commit(self):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        cur = _Cur()
+        with mock.patch("khipu.db.connect", return_value=_Conn(cur)), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"), \
+                mock.patch.object(em, "embed_batch",
+                                   side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]):
+            out = em.embed_recent_missing(limit=10)
+        self.assertEqual(out["topics_embedded"], 1)
+        self.assertTrue(any(p[1] == "topic" and p[2] == "note:edited" for p in cur.inserts))
+
 
 # ---- R7: event_at, never now() -----------------------------------------------
 

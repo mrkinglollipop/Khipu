@@ -3142,14 +3142,21 @@ def topics_embed_lag_minutes(
             else:
                 _plan, missing, stale = memory_gaps(cur, profile, cached=gaps is not None)
             gap_refs = sorted({ref for kind, ref, _idx in [*missing, *stale] if kind == "topic"})
+            # The wait starts when the text changed, which the hub does not
+            # record. event_at is when the note's event happened, not a write.
+            # Its last updated_at/created_at or its newest vector bounds the
+            # change from below, so this never under-reports the wait.
             cur.execute(
-                "SELECT MIN(COALESCE(t.event_at, t.updated_at)) FROM topics t "
+                "SELECT MIN(GREATEST(t.updated_at, t.created_at, ("
+                "SELECT MAX(m.built_at) FROM memory_embeddings m "
+                "WHERE m.profile = %s AND m.kind = 'topic' AND m.ref = t.slug"
+                "))) FROM topics t "
                 "WHERE t.deleted_at IS NULL AND ("
                 "t.slug = ANY(%s) OR NOT EXISTS ("
                 "SELECT 1 FROM memory_embeddings m "
                 "WHERE m.profile = %s AND m.kind = 'topic' AND m.ref = t.slug"
                 "))",
-                (gap_refs, profile),
+                (profile, gap_refs, profile),
             )
             row = cur.fetchone()
     oldest = row[0] if row else None
@@ -3465,6 +3472,19 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     "AND m.kind = 'topic' AND m.ref = t.slug) "
                     "ORDER BY t.updated_at DESC NULLS LAST LIMIT %s",
                     (profile, COMMITMENT_CATCHUP_LIMIT),
+                )
+                seen_topic_slugs = {str(row[0]) for row in topic_rows}
+                topic_rows.extend(
+                    row for row in cur.fetchall() if str(row[0]) not in seen_topic_slugs
+                )
+                # A note edited in place keeps its frontmatter updated_at, so
+                # neither pass above sees it once it already has vectors. The
+                # row's xmin moves on every write: the youngest rows are the
+                # ones written most recently, whatever updated_at says.
+                cur.execute(
+                    "SELECT t.slug, t.title, t.body, row_to_json(t) FROM topics t WHERE t.deleted_at IS NULL "
+                    " ORDER BY age(t.xmin) ASC LIMIT %s",
+                    (max(COMMITMENT_CATCHUP_LIMIT * 10, 50),),
                 )
                 seen_topic_slugs = {str(row[0]) for row in topic_rows}
                 topic_rows.extend(
