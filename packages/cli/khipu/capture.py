@@ -645,6 +645,23 @@ def _stamp_origin(cur) -> str | None:
         return None
 
 
+def _claim_unowned_episode(cur, episode_id: int | None, origin: str | None) -> None:
+    """Give an existing unowned row the owner of the capture that landed on it
+    instead of inserting (a replay, an exact-window skip, a merge): the row a
+    file-mirror sync wrote without an origin. Only this machine, or the origin
+    an outbox envelope recorded when the capture was queued, may claim: a live
+    gateway caller must never claim an unowned row by replaying its
+    timestamp and summary, or its session window, or by matching its text."""
+    from khipu.request_context import in_replay
+
+    if episode_id is None or not origin:
+        return
+    if not (origin.startswith("local:") or in_replay()):
+        return
+    cur.execute("UPDATE episodes SET origin = %s WHERE id = %s AND origin IS NULL",
+                (origin, episode_id))
+
+
 def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
 
@@ -683,6 +700,9 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                 payload["project"] = _resolve_project_alias(cur, payload["project"]) or payload["project"]
             dedup = dedup_before_insert(cur, payload, source=source)
             if dedup["action"] in ("skip", "merge"):
+                # The job is done once this returns (the outbox deletes it),
+                # so this is the last chance to record its trusted owner.
+                _claim_unowned_episode(cur, dedup.get("matched_episode"), _stamp_origin(cur))
                 conn.commit()
                 if dedup["action"] == "merge":
                     _refresh_merged_episode(cur, dedup["matched_episode"])
@@ -761,16 +781,7 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     (payload["ts"], _md5_hex(payload["summary"])),
                 )
                 existing = cur.fetchone()
-                from khipu.request_context import in_replay
-
-                if existing and origin and (origin.startswith("local:") or in_replay()):
-                    # An outbox replay of a capture whose row a file-mirror
-                    # sync already wrote without an origin. Locally, or with
-                    # the origin the outbox envelope recorded when the capture
-                    # was queued: a live gateway caller must never claim an
-                    # unowned row by replaying its timestamp and summary.
-                    cur.execute("UPDATE episodes SET origin = %s WHERE id = %s AND origin IS NULL",
-                                (origin, existing[0]))
+                _claim_unowned_episode(cur, existing[0] if existing else None, origin)
                 cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
                             (existing[0] if existing else None,))
                 row = cur.fetchone()

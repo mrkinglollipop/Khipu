@@ -10,6 +10,8 @@ own context. Hermetic: fake cursor, fake machine id, a temporary outbox.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
 import os
 import tempfile
@@ -219,6 +221,140 @@ class ReplayRestoresOriginTest(_OutboxOriginBase):
         self._replay(_cli_drain)
         with mock.patch("khipu.machine_identity.local_origin", return_value=DRAINER):
             self.assertEqual(rc.request_origin(), DRAINER)
+
+
+class _DedupClaimCursor(_OriginFakeCursor):
+    """The origin fake seeded with one unowned row a file sync wrote, applying
+    origin claims under their NULL guard, with an optional window_id column."""
+
+    def __init__(self, row: dict, *, window_col: bool = False):
+        super().__init__()
+        self.episodes[1] = {"ts": "2026-10-15T11:00:00Z", "summary": "written by a file sync",
+                            "topics": [], "decisions": [], "preferences": [], "raw": {},
+                            "tags": [], "origin": None, **row}
+        self._existing_keys = {(e["ts"], hashlib.md5(e["summary"].encode()).hexdigest())
+                               for e in self.episodes.values()}
+        self.next_id = 2
+        self.window_col = window_col
+        self.claims: list[tuple] = []
+        self.guarded = False
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        if s.startswith("UPDATE episodes SET origin"):
+            self.guarded = "origin IS NULL" in s
+            self.claims.append(params)
+            origin, eid = params
+            if self.guarded and self.episodes[eid].get("origin") is None:
+                self.episodes[eid]["origin"] = origin
+            return
+        if s.startswith("SELECT id FROM episodes WHERE harness") and "window_id" in s:
+            key = tuple(params)
+            self._result = [(eid,) for eid, e in self.episodes.items()
+                            if (e.get("harness"), e.get("session_id"), e.get("transcript_range"),
+                                e.get("window_id"), (e.get("raw") or {}).get("part")) == key][:1]
+            return
+        super().execute(sql, params)
+        if self.window_col and s.startswith("SELECT column_name FROM information_schema.columns") \
+                and params == ("episodes",):
+            self._result = list(self._result) + [("window_id",)]
+
+
+_WINDOW = {"harness": "claude_code", "session_id": "claude_code:abc", "transcript_range": "0:100"}
+_SIMILAR = "user experiencing slow performance from oracle processes in a worktree"
+_MERGE_TEXT = {"_dedup_text": lambda p: p.get("summary") or ""}
+
+
+def _merge_target():
+    return _DedupClaimCursor({**_WINDOW, "summary": _SIMILAR, "project": "acme/widget"})
+
+
+def _merge_payload():
+    return {"ts": "2026-10-15T12:00:00Z", "summary": _SIMILAR, "harness": "claude_code",
+            "session_id": "claude_code:other", "transcript_range": "50:200",
+            "project": "acme/widget", "decisions": ["a new decision"]}
+
+
+def _window_payload(**extra):
+    return {"ts": "2026-10-15T12:00:00Z", "summary": "the same window, captured again",
+            **_WINDOW, **extra}
+
+
+class DedupEarlyReturnClaimsTest(_OutboxOriginBase):
+    """write_pg returns early when a capture lands on an existing row (an
+    exact-window or receipt skip, or a merge) and the outbox then deletes the
+    job: a trusted queued or local origin must claim that row first, under the
+    NULL guard; a live gateway caller never claims."""
+
+    def _drain_onto(self, cur, payload, *, label="caller-a", patches=None):
+        self._queue(payload, label=label)
+        with mock.patch.multiple(cap, **patches) if patches else contextlib.nullcontext():
+            self._replay(_cli_drain, cur=cur)
+        self.assertEqual(cur.inserts, [], "the capture must land on the existing row")
+        return cur.episodes[1].get("origin")
+
+    def test_exact_window_skip_claims_for_the_queued_gateway_caller(self):
+        cur = _DedupClaimCursor(dict(_WINDOW))
+        self.assertEqual(self._drain_onto(cur, _window_payload()), "gateway:caller-a")
+        self.assertTrue(cur.guarded)
+
+    def test_exact_window_skip_claims_for_the_queuing_machine(self):
+        cur = _DedupClaimCursor(dict(_WINDOW))
+        self.assertEqual(self._drain_onto(cur, _window_payload(), label=None), QUEUER)
+
+    def test_window_id_skip_claims_for_the_queued_owner(self):
+        cur = _DedupClaimCursor({**_WINDOW, "window_id": "w1", "raw": {"part": "2"}},
+                                window_col=True)
+        payload = _window_payload(window_id="w1", part="2")
+        self.assertEqual(self._drain_onto(cur, payload), "gateway:caller-a")
+
+    def test_receipt_skip_claims_for_the_queued_owner(self):
+        from khipu.capture_identity import source_identity
+
+        payload = {"ts": "2026-10-15T12:00:00Z", "summary": "folded in earlier",
+                   "session_id": "grokbot:review"}
+        job = self._queue(payload)
+        receipt = source_identity(dict(job["payload"]))["payload_sha256"]
+        cur = _DedupClaimCursor({"raw": {"merged_from": [{"source_id": receipt}]}})
+        self._replay(_cli_drain, cur=cur)
+        self.assertEqual(cur.inserts, [])
+        self.assertEqual(cur.episodes[1]["origin"], "gateway:caller-a")
+
+    def test_merge_claims_the_target_for_the_queued_owner(self):
+        cur = _merge_target()
+        origin = self._drain_onto(cur, _merge_payload(), patches=_MERGE_TEXT)
+        self.assertEqual(cur.updated_ids, [1], "the capture merged into the existing row")
+        self.assertEqual(origin, "gateway:caller-a")
+
+    def test_an_owned_row_keeps_its_owner(self):
+        cur = _DedupClaimCursor({**_WINDOW, "origin": "local:cccccccccccc"})
+        self.assertEqual(self._drain_onto(cur, _window_payload()), "local:cccccccccccc")
+
+    def test_an_unknown_queued_origin_claims_nothing(self):
+        self._queue(_window_payload(), label=None, gateway_process=True)
+        cur = _DedupClaimCursor(dict(_WINDOW))
+        self._replay(_cli_drain, cur=cur)
+        self.assertEqual(cur.claims, [])
+        self.assertIsNone(cur.episodes[1]["origin"])
+
+    def test_a_live_gateway_caller_never_claims_on_any_early_return(self):
+        cases = (("exact window", _DedupClaimCursor(dict(_WINDOW)), _window_payload(), None),
+                 ("merge", _merge_target(), _merge_payload(), _MERGE_TEXT))
+        for name, cur, payload, patches in cases:
+            with self.subTest(name), \
+                    mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
+                    mock.patch("khipu.machine_identity.local_origin", return_value=DRAINER), \
+                    mock.patch("khipu.embed.embed_on_capture", return_value={}), \
+                    mock.patch("khipu.topic_graph.persist_capture_graph", return_value={}), \
+                    mock.patch("khipu.config.path_setting", return_value=None), \
+                    mock.patch("khipu.embed.embed_one", side_effect=RuntimeError("no key")), \
+                    mock.patch("khipu.hygiene.classify_topics", return_value=([], [], False)), \
+                    mock.patch.multiple(cap, **patches) if patches else contextlib.nullcontext(), \
+                    rc.gateway_request("caller-b"):
+                stats = cap.write_pg(payload)
+                self.assertIn(stats["dedup"]["action"], ("skip", "merge"))
+                self.assertEqual(cur.claims, [])
+                self.assertIsNone(cur.episodes[1]["origin"])
 
 
 if __name__ == "__main__":
