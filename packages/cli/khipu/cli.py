@@ -3274,7 +3274,7 @@ def cmd_join(args: argparse.Namespace) -> int:
         write_kit_file,
     )
 
-    from khipu.join import LITERAL_PASSPHRASE_REFUSAL, read_passphrase
+    from khipu.join import LITERAL_PASSPHRASE_REFUSAL, public_error, read_passphrase
 
     if getattr(args, "passphrase", None) is not None:
         print(json.dumps({"ok": False, "error": LITERAL_PASSPHRASE_REFUSAL}))
@@ -3316,7 +3316,7 @@ def cmd_join(args: argparse.Namespace) -> int:
 
             payload = decrypt_payload(blob, passphrase)
         except Exception as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(json.dumps({"ok": False, "error": public_error(exc, "Join export")}))
             return 1
         print(
             json.dumps(
@@ -3337,14 +3337,17 @@ def cmd_join(args: argparse.Namespace) -> int:
             blob = Path(args.file).expanduser().read_bytes()
             summary = import_kit(blob, passphrase)
         except Exception as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(json.dumps({"ok": False, "error": public_error(exc, "Join import")}))
             return 1
         migrate_out: dict | None = None
         counts = verify_live_counts(summary.get("expected") or {})
         if not getattr(args, "skip_migrate_check", False) and not counts.get("error"):
             from khipu.migrate import run
 
-            migrate_out = run(dry_run=False)
+            try:
+                migrate_out = run(dry_run=False)
+            except Exception as exc:  # noqa: BLE001 — its text can quote the DSN
+                migrate_out = {"ok": False, "error": public_error(exc, "Applying migrations")}
         hub_ok = bool(counts.get("ok"))
         result = {
             "ok": True,
@@ -3374,7 +3377,7 @@ def cmd_join(args: argparse.Namespace) -> int:
                 allow_unencrypted=allow_unencrypted,
             )
         except Exception as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(json.dumps({"ok": False, "error": public_error(exc, "Join advertise")}))
             return 1
         print(json.dumps(out, indent=2))
         return 0 if out.get("ok") else 1
@@ -3388,7 +3391,7 @@ def cmd_join(args: argparse.Namespace) -> int:
             out_path = Path(out_arg).expanduser() if out_arg else None
             result = receive_join_kit(passphrase, pin, out_path=out_path)
         except Exception as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(json.dumps({"ok": False, "error": public_error(exc, "Join receive")}))
             return 1
         print(json.dumps(result, indent=2))
         return 0 if result.get("kit_imported") or result.get("ok") else 2

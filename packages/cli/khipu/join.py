@@ -16,6 +16,8 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
+from khipu.join_errors import JoinError, public_error, redact_connection_text  # noqa: F401
+
 FORMAT_VERSION = "khipu-join-v1"
 _PBKDF2_ITERATIONS = 390_000
 _LOCALHOST_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -59,9 +61,20 @@ def dsn_requires_sslrootcert(dsn: str) -> bool:
 
 
 def classify_hub_connect_error(exc: BaseException, loc: str) -> str:
-    """Distinguish TLS/cert misconfig from real network unreachability."""
+    """Distinguish TLS/cert misconfig from real network unreachability. The
+    exception's own text is read, never repeated: it can quote the DSN."""
     text = str(exc)
     low = text.lower()
+    try:
+        from psycopg import ProgrammingError
+    except Exception:  # noqa: BLE001
+        ProgrammingError = ()  # type: ignore[assignment]
+    if (ProgrammingError and isinstance(exc, ProgrammingError)) or "connection info string" in low \
+            or "percent-encoded" in low or "invalid uri" in low:
+        return (
+            "The database address saved on this Mac could not be read. Set it again in "
+            "Settings, Database, then try once more."
+        )
     # Do not match generic "ssl " — libpq "SSL SYSCALL error: … timed out"
     # is a network failure, not a missing root.crt.
     certish = (
@@ -75,14 +88,14 @@ def classify_hub_connect_error(exc: BaseException, loc: str) -> str:
     )
     if certish:
         return (
-            f"TLS/certificate problem talking to {loc}: {text}. "
+            f"TLS/certificate problem talking to {loc} ({type(exc).__name__}). "
             "The hub network path may be fine — this Mac needs a valid local "
             "root.crt and sslrootcert in the DSN. Re-export the join kit from the "
             "working Mac (Settings → Set up another Mac) so the certificate is "
             "included, then import again. This is not a Tailscale routing failure."
         )
     return (
-        f"{loc} unreachable ({type(exc).__name__}: {text}) — "
+        f"{loc} unreachable ({type(exc).__name__}) — "
         "the hub must be reachable (Tailscale, VPN, SSH tunnel, or shared server); "
         "this is not a join-kit passphrase problem"
     )
@@ -100,7 +113,7 @@ def _derive_key(passphrase: str, salt: bytes) -> bytes:
 
 def encrypt_payload(payload: dict[str, Any], passphrase: str) -> bytes:
     if not passphrase.strip():
-        raise ValueError("passphrase is required to encrypt a join kit")
+        raise JoinError("passphrase is required to encrypt a join kit")
     salt = secrets.token_bytes(16)
     nonce = secrets.token_bytes(12)
     key = _derive_key(passphrase, salt)
@@ -119,18 +132,18 @@ def decrypt_payload(blob: bytes, passphrase: str = "") -> dict[str, Any]:
     try:
         envelope = json.loads(blob.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("join kit is not valid JSON") from exc
+        raise JoinError("join kit is not valid JSON") from exc
     if not isinstance(envelope, dict):
-        raise ValueError("join kit must be a JSON object")
+        raise JoinError("join kit must be a JSON object")
     # AirDrop / file kits may be plaintext (the file is the secret).
     if envelope.get("format") == FORMAT_VERSION and "database_url" in envelope:
         return envelope
     if envelope.get("v") != FORMAT_VERSION:
-        raise ValueError(f"unsupported join kit version: {envelope.get('v')!r}")
+        raise JoinError(f"unsupported join kit version: {envelope.get('v')!r}")
     if "ciphertext_b64" not in envelope:
-        raise ValueError("join kit envelope is malformed")
+        raise JoinError("join kit envelope is malformed")
     if not passphrase.strip():
-        raise ValueError(
+        raise JoinError(
             "this join kit is passphrase-protected — enter the phrase you typed "
             "when saving it"
         )
@@ -139,15 +152,15 @@ def decrypt_payload(blob: bytes, passphrase: str = "") -> dict[str, Any]:
         nonce = base64.b64decode(envelope["nonce_b64"])
         ciphertext = base64.b64decode(envelope["ciphertext_b64"])
     except (KeyError, ValueError) as exc:
-        raise ValueError("join kit envelope is malformed") from exc
+        raise JoinError("join kit envelope is malformed") from exc
     key = _derive_key(passphrase.strip(), salt)
     try:
         plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
     except Exception as exc:
-        raise ValueError("passphrase incorrect or join kit is corrupt") from exc
+        raise JoinError("passphrase incorrect or join kit is corrupt") from exc
     payload = json.loads(plaintext.decode("utf-8"))
     if not isinstance(payload, dict):
-        raise ValueError("join kit payload must be a JSON object")
+        raise JoinError("join kit payload must be a JSON object")
     return payload
 
 
@@ -201,26 +214,30 @@ def export_kit(passphrase: str, *, allow_unencrypted: bool = False) -> bytes:
     """Build a join kit. Encrypted unless the owner explicitly opts out."""
     phrase = (passphrase or "").strip()
     if not phrase and not allow_unencrypted:
-        raise ValueError(UNENCRYPTED_REFUSAL)
+        raise JoinError(UNENCRYPTED_REFUSAL)
     from khipu.config import capture_mode, gateway_url
     from khipu.keychain import get_dsn, get_gemini_key, get_openai_compat_key
     from khipu.paths import root_cert_file
 
     dsn = get_dsn()
     if not dsn:
-        raise RuntimeError(
+        raise JoinError(
             "No database URL in Keychain. Configure the hub DSN before exporting a join kit."
         )
     cert_path = root_cert_file()
     root_crt_pem: str | None = None
     if cert_path.is_file():
         root_crt_pem = cert_path.read_text(encoding="utf-8")
+    try:
+        counts = _fetch_live_counts()
+    except Exception as exc:  # noqa: BLE001 — its text can quote the DSN
+        raise JoinError(classify_hub_connect_error(exc, _dsn_host_port())) from None
     payload: dict[str, Any] = {
         "format": FORMAT_VERSION,
         "database_url": dsn,
         "capture_mode": capture_mode(),
         "models": _models_export_blob(),
-        "expected": _fetch_live_counts(),
+        "expected": counts,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     gateway = gateway_url()
@@ -333,17 +350,17 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
     payload = decrypt_payload(blob, passphrase)
     dsn = str(payload.get("database_url") or "").strip()
     if not dsn:
-        raise ValueError("join kit is missing database_url")
+        raise JoinError("join kit is missing database_url")
     if "\n" in dsn or "\r" in dsn:
-        raise ValueError("database_url must not contain a newline")
+        raise JoinError("database_url must not contain a newline")
     if is_localhost_dsn(dsn):
-        raise ValueError(
+        raise JoinError(
             "join kit database_url points at localhost — that database lives only on "
             "the exporting Mac; use a reachable hub host (Tailscale, VPN, or shared server)"
         )
     mode = str(payload.get("capture_mode") or "").strip().lower()
     if mode and mode not in CAPTURE_MODES:
-        raise ValueError(f"capture_mode must be one of {CAPTURE_MODES}, got {mode!r}")
+        raise JoinError(f"capture_mode must be one of {CAPTURE_MODES}, got {mode!r}")
 
     # Validate the entire owned payload before changing a file or credential.
     # libpq's parse errors quote the text around the fault, which can be the
@@ -351,27 +368,30 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
     try:
         conninfo_to_dict(dsn)
     except Exception:
-        raise ValueError(
+        raise JoinError(
             "join kit database_url is not a valid database address; export the kit again "
             "on the working Mac"
         ) from None
     gateway = payload.get("gateway_url")
     if gateway is not None and not isinstance(gateway, str):
-        raise ValueError("gateway_url must be a string")
+        raise JoinError("gateway_url must be a string")
     gateway_text = gateway.strip().rstrip("/") if isinstance(gateway, str) else ""
     if gateway_text and not gateway_text.startswith("https://"):
-        raise ValueError("gateway_url must be an https:// URL (it carries a bearer token)")
+        raise JoinError("gateway_url must be an https:// URL (it carries a bearer token)")
     models = payload.get("models")
     if models is not None:
         if not isinstance(models, dict) or not models:
-            raise ValueError("models must be a non-empty JSON object")
-        validate_models_object(models, for_set=True)
+            raise JoinError("models must be a non-empty JSON object")
+        try:
+            validate_models_object(models, for_set=True)
+        except ValueError as exc:
+            raise JoinError(f"join kit models are not valid: {exc}") from None
     for field in ("gemini_api_key", "openai_compat_api_key"):
         secret = payload.get(field)
         if secret is not None and not isinstance(secret, str):
-            raise ValueError(f"{field} must be a string")
+            raise JoinError(f"{field} must be a string")
         if isinstance(secret, str) and ("\n" in secret or "\r" in secret):
-            raise ValueError(f"{field} must not contain a newline")
+            raise JoinError(f"{field} must not contain a newline")
     # Every config/model setter shares this document. Refuse existing corrupt
     # bytes before certificate, DSN, or Keychain mutation begins.
     existing_config = config_mod._load_config_for_mutation()
@@ -384,11 +404,11 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
     config_path = config_mod.config_file()
     root_pem = payload.get("root_crt_pem")
     if root_pem is not None and not isinstance(root_pem, str):
-        raise ValueError("root_crt_pem must be a string")
+        raise JoinError("root_crt_pem must be a string")
     if isinstance(root_pem, str) and not root_pem.strip():
-        raise ValueError("root_crt_pem must not be empty")
+        raise JoinError("root_crt_pem must not be empty")
     if not (isinstance(root_pem, str) and root_pem.strip()) and dsn_requires_sslrootcert(dsn) and not cert_path.is_file():
-        raise ValueError(
+        raise JoinError(
             "join kit is missing the hub TLS root certificate (root_crt_pem). "
             "On the working Mac confirm Settings data folder has root.crt "
             "(usually ~/.config/khipu/root.crt), export the join kit again, "
@@ -414,7 +434,7 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
             receipt = keychain._security("find-generic-password", "-s", keychain.SERVICE,
                                          "-a", account, "-w")
             if receipt.returncode not in (0, 44):
-                raise RuntimeError(f"cannot snapshot join credential {account}")
+                raise JoinError(f"cannot snapshot join credential {account}")
             credentials[account] = receipt.stdout.strip() if receipt.returncode == 0 else None
     modified_credentials = []
     try:
@@ -424,7 +444,7 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
         if cert_path.is_file():
             dsn = rewrite_dsn_sslrootcert(dsn, str(cert_path))
         elif conninfo_to_dict(dsn).get("sslrootcert"):
-            raise ValueError(f"sslrootcert is set but {cert_path} was not written — cannot join")
+            raise JoinError(f"sslrootcert is set but {cert_path} was not written — cannot join")
 
         for account, setter, value in credential_updates:
             if account in credentials:
@@ -448,7 +468,7 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
                     receipt = keychain._security("delete-generic-password", "-s", keychain.SERVICE,
                                                  "-a", account)
                     if receipt.returncode not in (0, 44):
-                        raise RuntimeError("credential deletion failed")
+                        raise JoinError("credential deletion failed")
             except Exception:
                 rollback_errors.append(f"credential {account}")
         for path, snapshot in snapshots.items():
@@ -457,7 +477,7 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
             except OSError:
                 rollback_errors.append(f"file {path.name}")
         if rollback_errors:
-            raise RuntimeError("join import failed; rollback failed for " + ", ".join(rollback_errors)) from exc
+            raise JoinError("join import failed; rollback failed for " + ", ".join(rollback_errors)) from exc
         raise
 
     return _sanitize_summary(payload)

@@ -267,6 +267,100 @@ class PassphraseInputTest(unittest.TestCase):
         export.assert_called_once_with("typed", allow_unencrypted=False)
 
 
+SECRET = "SYNTHETIC_DSN_PASSWORD"
+RAW = f'invalid percent-encoded token: "%{SECRET}"'
+
+
+class JoinErrorTextTest(unittest.TestCase):
+    """No join path prints an exception's raw text: Khipu's own messages go
+    through the redactor, anything else becomes a fixed message."""
+
+    def _cli(self, argv, **patches):
+        import contextlib
+        import io
+
+        from khipu import cli
+
+        buf = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, {"KHIPU_JOIN_PASSPHRASE": "phrase"}))
+            for target, side_effect in patches.items():
+                stack.enter_context(mock.patch(target.replace("__", "."), side_effect=side_effect))
+            stack.enter_context(contextlib.redirect_stdout(buf))
+            rc = cli.main(argv)
+        return rc, buf.getvalue()
+
+    def test_export_never_prints_raw_exception_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, out = self._cli(["join", "export", "--out", str(Path(tmp) / "k.khipujoin")],
+                                khipu__join__export_kit=Exception(RAW))
+        self.assertEqual(rc, 1)
+        self.assertNotIn(SECRET, out)
+        self.assertIn("Exception", json.loads(out)["error"])
+
+    def test_advertise_never_prints_raw_exception_text(self) -> None:
+        rc, out = self._cli(["join", "advertise"], khipu__join_pair__advertise_join_kit=Exception(RAW))
+        self.assertEqual(rc, 1)
+        self.assertNotIn(SECRET, out)
+
+    def test_import_and_receive_never_print_raw_exception_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            kit = Path(tmp) / "k.khipujoin"
+            kit.write_bytes(b"{}")
+            rc, out = self._cli(["join", "import", "--file", str(kit)],
+                                khipu__join__import_kit=Exception(RAW))
+        self.assertEqual(rc, 1)
+        self.assertNotIn(SECRET, out)
+        rc, out = self._cli(["join", "receive", "--pin", "123456"],
+                            khipu__join_pair__receive_join_kit=Exception(RAW))
+        self.assertEqual(rc, 1)
+        self.assertNotIn(SECRET, out)
+
+    def test_khipu_messages_are_kept_but_redacted(self) -> None:
+        msg = ("bad postgresql://admin:hunter2pw@hub.example/db and "
+               "host=hub password=hunter3pw and password='hunter4 pw'")
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, out = self._cli(["join", "export", "--out", str(Path(tmp) / "k.khipujoin")],
+                                khipu__join__export_kit=j.JoinError(msg))
+        err = json.loads(out)["error"]
+        for leaked in ("hunter2pw", "hunter3pw", "hunter4", "admin:"):
+            self.assertNotIn(leaked, err)
+        self.assertIn("hub.example/db", err)
+
+    def test_export_kit_hub_failure_carries_no_raw_text(self) -> None:
+        for raw, expect in ((RAW, "could not be read"),
+                            (f"connection refused {SECRET}", "hub.invalid:5432 unreachable")):
+            with self.subTest(raw=raw):
+                msg = self._export_failure(raw)
+                self.assertNotIn(SECRET, msg)
+                self.assertIn(expect, msg)
+
+    def _export_failure(self, raw: str) -> str:
+        def boom():
+            raise RuntimeError(raw)
+
+        with (
+            mock.patch("khipu.keychain.get_dsn", return_value="postgresql://u:x@hub.invalid/db"),
+            mock.patch("khipu.config.capture_mode", return_value="hub"),
+            mock.patch("khipu.paths.root_cert_file", return_value=Path("/no/such/root.crt")),
+            mock.patch.object(j, "_models_export_blob", return_value={}),
+            mock.patch.object(j, "_fetch_live_counts", side_effect=boom),
+            mock.patch.object(j, "_dsn_host_port", return_value="hub.invalid:5432"),
+        ):
+            with self.assertRaises(j.JoinError) as ctx:
+                j.export_kit("phrase")
+        return str(ctx.exception)
+
+    def test_hub_connect_classifier_carries_no_raw_text(self) -> None:
+        for exc in (RuntimeError(RAW), RuntimeError(f"root certificate {RAW}")):
+            self.assertNotIn(SECRET, j.classify_hub_connect_error(exc, "hub:5432"))
+
+    def test_nearby_connect_error_carries_no_raw_text(self) -> None:
+        from khipu import join_pair
+
+        self.assertNotIn(SECRET, join_pair.friendly_connect_error(OSError(RAW), [("h", 1)]))
+
+
 class LocalhostRefuseTest(unittest.TestCase):
     def test_is_localhost_dsn(self) -> None:
         for dsn in (
