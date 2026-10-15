@@ -309,9 +309,9 @@ class RecallService:
 
     def start_routing(self) -> bool:
         """Start the routing helper now, on a thread, when this service's own
-        switches have the per-prompt push on, so the first prompt never waits
-        for it (a prompt with the push on starts it otherwise). Never waits;
-        True when it was asked to start."""
+        switches have either per-prompt push or reset checks on. This keeps
+        clock checks alive without requiring a prompt. Never waits; True when
+        it was asked to start."""
         if self.routing_forkserver is None:
             return False
         from khipu import recall_prompt
@@ -322,13 +322,12 @@ class RecallService:
         return True
 
     def keep_routing(self) -> bool:
-        """While this service's switches have the per-prompt push on, start
+        """While per-prompt push or reset checks are on, start
         the routing helper if none is running (never started, or died), so the record
         keeps being refolded between prompts (phase 3c: the helper polls the
         sources and the log and refolds at the view's ``valid_until``; the
         refold runs in a child of the helper, never on this process's GIL).
-        With the push off (the feature, the bypass or ``routing_push_prompt``)
-        it stops the helper: nothing polls. The switches are read at most
+        With both jobs off it stops the helper: nothing polls. The switches are read at most
         every ``_ROUTING_LOOK_S``. Never waits; True when the helper was
         asked to start again."""
         if self.routing_forkserver is None or self._stopping.is_set():

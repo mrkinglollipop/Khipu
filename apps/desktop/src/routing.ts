@@ -57,6 +57,8 @@ export type RouteAccount = {
   last_seen?: RouteReport | null;
   models?: RouteModel[];
   silent?: boolean;
+  next_check?: string | null;
+  reset_check?: { checks?: number; busy_tries?: number; status?: string; next_at?: string | null; reason?: string | null } | null;
 };
 
 export type RouteHold = {
@@ -361,7 +363,8 @@ export function accountSource(
     }
     parts.push(said);
   }
-  if (a.state === "limited" && a.checkable === false) parts.push("can't be checked without using a turn");
+  if (a.reset_check?.reason) parts.push(a.reset_check.reason);
+  else if (a.state === "limited" && a.checkable === false) parts.push("can't be checked without using a turn");
   if (a.state === "open" && a.witness?.source === "probe" && plan) {
     parts.push(`${Math.round(plan.pct)}% of its ${plan.window} used`);
   }

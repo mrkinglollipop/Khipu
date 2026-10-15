@@ -760,6 +760,8 @@ def daemon_routing_on(environ=None) -> bool:
         from khipu import features, routing
 
         env = os.environ if environ is None else environ
+        if routing.settings().get("routing_reset_check"):
+            return True
         if not features.enabled("routing_push", environ=env):
             return False
         if features.parse_bool(env.get("ROUTING_NOW_OFF") or "") is True:
@@ -810,7 +812,7 @@ _SETTINGS_LOOK_S = 5.0
 # A poll child that is not refolding (it is looking at the files and the
 # view) ends after this long, and on the helper's stop signal; once it holds
 # the fold lock it runs on until it has saved the view (``_ROUTING_FOLD_MOST``).
-_POLL_LOOK_MOST = 5.0
+_POLL_LOOK_MOST = 12.0
 _KEEP = object()
 
 
@@ -933,7 +935,7 @@ def _look_at_settings(schedule: RefoldSchedule, routing) -> None:
     ``routing_poll_interval`` as they are now. Settings it cannot read leave
     the schedule as it was."""
     try:
-        off = bool(routing.push_off("prompt"))
+        off = bool(routing.push_off("prompt")) and not bool(routing.settings().get("routing_reset_check"))
         interval = routing.poll_interval()
     except Exception:  # noqa: BLE001 - unreadable settings: as they were
         return
@@ -1005,7 +1007,7 @@ def _view_snapshot(routing) -> tuple[Any, dict | None]:
     return None, None
 
 
-def _poll_once(routing, on_fold=None) -> dict:
+def _poll_once(routing, on_fold=None, on_probe=None) -> dict:
     """One poll as the helper's child runs it: ``routing.poll_refold``'s
     answer with ``due`` (``valid_until`` in wall-clock seconds) and, when it
     folded and saved the view, ``view_stat``: view.json's stat after that
@@ -1014,14 +1016,37 @@ def _poll_once(routing, on_fold=None) -> dict:
     between the poll's own save and its stat is acknowledged only with that
     save's own deadline, and one that changed under the read is left unseen
     (the helper's next look polls again)."""
+    reset_on = bool(routing.settings().get("routing_reset_check"))
     out = routing.poll_refold(on_fold=on_fold)
+    # Poll first so its ``folded`` answer stays truthful. When reset checks are
+    # off, do not read the view through the scheduler at all. With checks on,
+    # this process is already the bounded helper child: one account per child,
+    # never an untracked grandchild.
+    checks = []
+    if reset_on:
+        if on_probe is not None:
+            on_probe()
+        checks = routing.run_due_reset_checks(max_checks=1, in_child=True, on_write=on_fold)
+    out["reset_checks"] = checks
     due = routing._parse(out.get("valid_until"))
     out["view_stat"] = None
-    if out.get("folded") and out.get("saved"):
+    if (out.get("folded") and out.get("saved")) or checks:
         seen, view = _view_snapshot(routing)
         if seen is not None:
             out["view_stat"] = seen
             due = routing._parse(view.get("valid_until"))
+    # fold.valid_until contains only future clock changes. If this child
+    # handled one account from a wake burst, another account may still be
+    # overdue and therefore absent from that field. Ask the scheduler to run
+    # another bounded child even when the source poll interval is off.
+    if checks:
+        view = routing._load_view()
+        now = routing._now()
+        cfg = routing.settings()
+        if view is not None and any(
+                (next_at := routing.reset_check_due(entry, now, cfg)) is not None and next_at <= now
+                for entry in view.get("accounts", [])):
+            due = now
     out["due"] = due.timestamp() if due is not None else None
     return out
 
@@ -1054,8 +1079,16 @@ def _poll_routing_child(write_fd: int) -> None:
     try:
         import signal
 
+        class PollStopped(BaseException):
+            pass
+
+        def stop(_sig, _frame) -> None:
+            # Raise through usage.probe_account so its _Run finally block
+            # kills and reaps the vendor process group before this child exits.
+            raise PollStopped()
+
         for sig in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1):
-            signal.signal(sig, signal.SIG_DFL)
+            signal.signal(sig, stop)
         signal.setitimer(signal.ITIMER_REAL, _POLL_LOOK_MOST)
         _detach_child((write_fd,))
         from khipu import routing
@@ -1064,7 +1097,12 @@ def _poll_routing_child(write_fd: int) -> None:
             signal.setitimer(signal.ITIMER_REAL, _ROUTING_FOLD_MOST)
             signal.signal(signal.SIGUSR1, signal.SIG_IGN)
 
-        out = _poll_once(routing, on_fold=fold_started)
+        def probe_started() -> None:
+            signal.setitimer(signal.ITIMER_REAL, _POLL_LOOK_MOST)
+            for sig in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1):
+                signal.signal(sig, stop)
+
+        out = _poll_once(routing, on_fold=fold_started, on_probe=probe_started)
         _write_all(write_fd, json.dumps(out).encode("utf-8") + b"\n")
         code = 0
     except BaseException:  # noqa: BLE001 - the helper reads end of file and tries again later

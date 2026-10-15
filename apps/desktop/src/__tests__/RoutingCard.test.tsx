@@ -7,7 +7,7 @@
 (globalThis as unknown as { process: { env: Record<string, string> } }).process.env.TZ = "America/New_York";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, renderHook, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 import { RoutingCard, inPlansOrder } from "../RoutingCard";
 // The stylesheet as written (vitest hands CSS imports over empty, `?raw`
 // included). The app has no @types/node; vitest runs this file in node.
@@ -163,8 +163,34 @@ describe("Home Routing card, the main mock", () => {
     expect(rowFor("Muse")).toHaveTextContent("Limit reached, back about Sat 8:00 PM (a guess)");
     expect(rowFor("Muse")).toHaveTextContent(
       "Reported by a Claude Code conversation in project-a 55 min ago · can't be checked without using a turn");
-    // No control that does nothing: Check now arrives with phase 5.
-    expect(screen.queryByRole("button", { name: /check/i })).toBeNull();
+    expect(within(rowFor("Claude main")).getByRole("button", { name: "Check now" })).toBeInTheDocument();
+    expect(within(rowFor("Muse")).queryByRole("button", { name: "Check now" })).toBeNull();
+  });
+
+  it("shows each account's next local check and keeps one Check now request in flight", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(MORNING);
+    const v = mainView();
+    const claude = v.accounts!.find((a) => a.label === "Claude main")!;
+    claude.next_check = "2026-10-14T18:02:00Z";
+    let finish: ((value: string) => void) | undefined;
+    invokeMock.mockImplementation(() => new Promise<string>((resolve) => { finish = resolve; }));
+    render(<RoutingCard state={stateOf(v)} plans={PLANS} />);
+    expect(rowFor("Claude main")).toHaveTextContent("Khipu checks again at 2:02 PM.");
+    fireEvent.click(within(rowFor("Claude main")).getByRole("button", { name: "Check now" }));
+    expect(within(rowFor("Claude second")).getByRole("button", { name: "Check now" })).toBeDisabled();
+    finish!(JSON.stringify({ ok: true, reason: "This account can't be checked without using a turn" }));
+    await waitFor(() => expect(rowFor("Claude main")).toHaveTextContent("This account can't be checked without using a turn"));
+    expect(invokeMock).toHaveBeenCalledWith("khipu_route_check", { account: "claude|" });
+  });
+
+  it("shows a Check now refusal in the account row", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(MORNING);
+    invokeMock.mockResolvedValue(JSON.stringify({ ok: false, error: "another usage check is running" }));
+    render(<RoutingCard state={stateOf(mainView())} plans={PLANS} />);
+    fireEvent.click(within(rowFor("Claude main")).getByRole("button", { name: "Check now" }));
+    await waitFor(() => expect(rowFor("Claude main")).toHaveTextContent("another usage check is running"));
   });
 
   it("shows the holds, the note word for word with its date, the folded rules and the footer", () => {

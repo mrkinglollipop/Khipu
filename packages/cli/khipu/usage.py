@@ -952,26 +952,38 @@ def _blank_row(account: dict) -> dict:
 
 
 def probe_account(account: dict, *, timeout: float = TIMEOUT_S) -> dict:
-    harness, home = account["harness"], account.get("home")
-    started = time.monotonic()
-    if account.get("invalid"):
-        data = {"ok": False, "error": E_INVALID, "note": f"This account entry is not valid: {account['invalid']}"}
-    elif harness == "claude":
-        data = probe_claude(home, timeout=timeout)
-    elif harness == "codex":
-        data = probe_codex(home, timeout=timeout)
-    elif harness == "grok":
-        data = probe_grok(home, timeout=timeout)
-    elif harness == "muse":
-        data = probe_muse(timeout=timeout)
-    else:
-        data = {"ok": False, "error": E_INVALID}
-    row = _blank_row(account)
-    row.update(data)
-    row.update({"probed_at": _iso(_now().timestamp()), "ms": int((time.monotonic() - started) * 1000)})
-    if not row.get("ok") and not row.get("note"):
-        row["note"] = _note(row.get("error"), harness, home)
-    return row
+    # probe_all supplies one shared run for its worker threads. A standalone
+    # reset check owns one too, so a helper alarm or stop can unwind this call
+    # and kill every vendor process group before the child exits.
+    owned_run = getattr(_local, "run", None) is None
+    if owned_run:
+        _local.run = _Run()
+    try:
+        harness, home = account["harness"], account.get("home")
+        started = time.monotonic()
+        if account.get("invalid"):
+            data = {"ok": False, "error": E_INVALID,
+                    "note": f"This account entry is not valid: {account['invalid']}"}
+        elif harness == "claude":
+            data = probe_claude(home, timeout=timeout)
+        elif harness == "codex":
+            data = probe_codex(home, timeout=timeout)
+        elif harness == "grok":
+            data = probe_grok(home, timeout=timeout)
+        elif harness == "muse":
+            data = probe_muse(timeout=timeout)
+        else:
+            data = {"ok": False, "error": E_INVALID}
+        row = _blank_row(account)
+        row.update(data)
+        row.update({"probed_at": _iso(_now().timestamp()), "ms": int((time.monotonic() - started) * 1000)})
+        if not row.get("ok") and not row.get("note"):
+            row["note"] = _note(row.get("error"), harness, home)
+        return row
+    finally:
+        if owned_run:
+            _local.run.kill_all()
+            _local.run = None
 
 
 def _failed_row(account: dict, code: str) -> dict:
@@ -1197,13 +1209,25 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
             rows[i]["refreshing"] = refreshing
     elif due:
         fd = _try_refresh_lock()  # keeps a background refresh from starting meanwhile; never waited on
-        try:
-            probed = probe_all([accounts[i] for i in due], timeout=timeout)
-            merged = _store([accounts[i] for i in due], probed)
-        finally:
-            _release(fd)
-        for i, row in zip(due, merged):
-            rows[i] = dict(row, cached=False)
+        if fd is None:
+            # A reset check and every foreground refresh share this lock.  Do
+            # not start a second child merely because this is the CLI path:
+            # report the in-flight read in the same shape as the background
+            # path instead.
+            refreshing = True
+            for i in due:
+                if rows[i] is None:
+                    rows[i] = dict(_blank_row(accounts[i]), ok=False, error=E_PENDING, note=_note(E_PENDING),
+                                   probed_at=None, ms=None, cached=False)
+                rows[i]["refreshing"] = True
+        else:
+            try:
+                probed = probe_all([accounts[i] for i in due], timeout=timeout)
+                merged = _store([accounts[i] for i in due], probed)
+            finally:
+                _release(fd)
+            for i, row in zip(due, merged):
+                rows[i] = dict(row, cached=False)
     now = _now()
     for row in rows:
         age = _age_s(row, now)

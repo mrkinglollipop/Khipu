@@ -98,7 +98,7 @@ export function agoSpan(iso: string, now: Date): string {
   return `${Math.round(hours / 24)} days ago`;
 }
 
-export type LimitUnit = "time" | "chars" | "ms" | "changes" | "bytes" | "lines" | "intervals" | "pct";
+export type LimitUnit = "time" | "chars" | "ms" | "changes" | "bytes" | "lines" | "intervals" | "pct" | "load";
 
 /** "512 KB", "1 MB", "300 bytes": a size in bytes. */
 function bytesWords(value: number): string {
@@ -120,6 +120,7 @@ export function limitWords(value: number, unit: LimitUnit, zero?: string): strin
   if (unit === "lines") return plural("line");
   if (unit === "intervals") return plural("interval");
   if (unit === "pct") return `${value.toLocaleString()}%`;
+  if (unit === "load") return `load ${value.toLocaleString()}`;
   return plural("change");
 }
 

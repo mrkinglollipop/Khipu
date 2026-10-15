@@ -13,8 +13,10 @@ tests use fake clocks; the helper's tests run the real helper process.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import signal
 import shutil
 import sys
 import tempfile
@@ -62,7 +64,8 @@ class Clocks:
 def home(tmp_path, monkeypatch):
     data = tmp_path / "data"
     data.mkdir()
-    (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS, "routing_prompt_budget_ms": 1000}))
+    (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS, "routing_prompt_budget_ms": 1000,
+                                                   "routing_reset_check": False}))
     capture = Path(tempfile.mkdtemp(prefix="krd-", dir="/tmp"))  # AF_UNIX paths are short
     monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(capture))
@@ -566,6 +569,86 @@ def test_the_helper_refolds_at_valid_until_with_no_prompt_and_never_in_the_daemo
     view = _wait(lambda: (v := routing._load_view()) and v["version"] > version and v)
     codex = next(a for a in view["accounts"] if a["label"] == "Codex")
     assert codex["state"] == routing.PROBABLY_OPEN
+
+
+def test_reset_checks_keep_the_helper_alive_with_prompt_push_off(home, monkeypatch):
+    _set(home, routing_push_prompt=False, routing_reset_check=True, routing_poll_interval=0)
+    monkeypatch.setattr(recall_daemon, "_ROUTING_LOOK_S", 0.0)
+    svc = recall_daemon.RecallService(home["capture"] / "reset-only.sock", stamp_fn=lambda: "fixed",
+                                      idle_check=False)
+    try:
+        assert recall_prompt.daemon_routing_on()
+        assert svc.start_routing()
+        assert svc.routing_forkserver.wait_ready(10)
+        _set(home, routing_reset_check=False)
+        assert not svc.keep_routing()
+        assert svc.routing_forkserver._proc is None
+    finally:
+        svc.close()
+
+
+def test_sleep_wake_checks_each_overdue_account_once_with_source_poll_off(home, monkeypatch):
+    _set(home, routing_reset_check=True, routing_poll_interval=0)
+    until = T0 + timedelta(minutes=20)
+    for account in ("Claude", "Codex"):
+        routing.report(account=account, state="limited", until=routing._iso(until), author=ME)
+    home["clocks"].now = until + timedelta(hours=2)
+    calls = []
+
+    def same_limit(account):
+        calls.append(account["label"])
+        return {"ok": True, "windows": [
+            {"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]}
+
+    monkeypatch.setattr("khipu.usage.probe_account", same_limit)
+    first = recall_prompt._poll_once(routing)
+    assert first["due"] == home["clocks"].wall()
+    second = recall_prompt._poll_once(routing)
+    assert sorted(calls) == ["Claude", "Codex"]
+    assert second["due"] > home["clocks"].wall()
+
+
+def test_stopping_a_poll_child_unwinds_and_kills_its_vendor_process(home, monkeypatch, tmp_path):
+    from khipu import usage
+
+    _set(home, routing_reset_check=True, routing_poll_interval=0)
+    until = T0 + timedelta(minutes=20)
+    routing.report(account="Claude", state="limited", until=routing._iso(until), author=ME)
+    home["clocks"].now = until + timedelta(minutes=2)
+    vendor_pid = tmp_path / "vendor.pid"
+
+    def hanging_probe(_home, *, timeout):
+        script = f"import os,time;open({str(vendor_pid)!r},'w').write(str(os.getpid()));time.sleep(60)"
+        usage._converse([sys.executable, "-c", script], [], lambda _frame: False,
+                        env=usage.probe_environment("claude"), deadline=time.monotonic() + timeout,
+                        close_stdin=True)
+
+    monkeypatch.setattr(usage, "probe_claude", hanging_probe)
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        recall_prompt._poll_routing_child(write_fd)
+    os.close(write_fd)
+    try:
+        _wait(vendor_pid.exists, seconds=5)
+        child = int(vendor_pid.read_text())
+        os.kill(pid, signal.SIGUSR1)
+        os.waitpid(pid, 0)
+
+        def vendor_gone():
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                return True
+            return False
+
+        _wait(vendor_gone, seconds=5)
+    finally:
+        with contextlib.suppress(OSError, ChildProcessError):
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        os.close(read_fd)
 
 
 def test_the_helper_refolds_after_a_source_change(home, monkeypatch, helper):

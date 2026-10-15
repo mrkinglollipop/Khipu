@@ -30,8 +30,8 @@ can see and change all of it in the app. Khipu never decides where work goes.
 | 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | done 2026-10-14 (PR #189) |
 | 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | done 2026-10-15 (PR #190) |
 | 3c | The daemon refolds on change and on the clock; the promotion gate's replay covers routing | S | done 2026-10-15 (PR #191) |
-| 4 | App: Home Routing card, Settings → Routing for what phases 1a to 3c built, health row, attention items | M–L | built, in review (branch feat/routing-truth-4) |
-| 5 | The background check at each known reset time, with its part of the app | S | open |
+| 4 | App: Home Routing card, Settings → Routing for what phases 1a to 3c built, health row, attention items | M–L | done 2026-10-15 (PR #192) |
+| 5 | The background check at each known reset time, with its part of the app | S | built, in review (branch feat/routing-truth-5) |
 | 6 | Push at the moment of delegation, with its part of the app | S–M | open (shaped by the phase 0 hook check; the Grok Build part needs Matt's go) |
 | 7 | Copy for cloud agents through the hub, read by cloud harnesses and a second Mac, with its part of the app | M | open |
 | 8 | Cutover: the NOW block of `ROUTING-NOW.md` becomes a generated view; the old SessionStart hook is narrowed or retired | S per step | needs Matt's go |

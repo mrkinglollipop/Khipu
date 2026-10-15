@@ -602,6 +602,8 @@ const ROUTING_DURATION_KEYS: &[&str] = &[
     "routing_not_refreshed_after",
     "routing_report_default_limit",
     "routing_poll_interval",
+    "routing_reset_check_wait",
+    "routing_busy_wait",
 ];
 /// Whole numbers of 0 or more.
 const ROUTING_COUNT_KEYS: &[&str] = &[
@@ -615,11 +617,13 @@ const ROUTING_COUNT_KEYS: &[&str] = &[
     "routing_runner_silent_intervals",
     "routing_runner_tail_bytes",
     "routing_runner_limited_lines",
+    "routing_busy_tries",
 ];
 /// Numbers of 0 or more, a fraction allowed (a percentage).
-const ROUTING_NUMBER_KEYS: &[&str] = &["routing_slow_read_pct"];
+const ROUTING_NUMBER_KEYS: &[&str] = &["routing_slow_read_pct", "routing_busy_load"];
 /// On or off.
-const ROUTING_SWITCH_KEYS: &[&str] = &["routing_push_start", "routing_push_prompt"];
+const ROUTING_SWITCH_KEYS: &[&str] = &["routing_push_start", "routing_push_prompt", "routing_reset_check"];
+const ROUTING_RETRIES_KEY: &str = "routing_reset_check_retries";
 const ROUTING_SOURCES_KEY: &str = "routing_sources";
 const ROUTING_LANE_MAP_KEY: &str = "routing_lane_map";
 /// The routing table file: a full path, read only (fix round 2, R2-1).
@@ -766,6 +770,7 @@ fn routing_key(key: &str) -> bool {
         || ROUTING_COUNT_KEYS.contains(&key)
         || ROUTING_NUMBER_KEYS.contains(&key)
         || ROUTING_SWITCH_KEYS.contains(&key)
+        || key == ROUTING_RETRIES_KEY
         || key == ROUTING_SOURCES_KEY
         || key == ROUTING_LANE_MAP_KEY
         || key == ROUTING_TABLE_KEY
@@ -865,6 +870,14 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     }
     if key == ROUTING_TABLE_KEY {
         return checked_routing_path("the routing table file", v);
+    }
+    if key == ROUTING_RETRIES_KEY {
+        if has_control(v) { return Err("retry times must be one line".to_string()); }
+        let parsed: Vec<u64> = serde_json::from_str(v).map_err(|_| "retry times must be two whole seconds in a JSON list".to_string())?;
+        if parsed.len() != 2 || parsed.iter().any(|n| *n == 0 || *n > 10 * 366 * 86_400) || parsed[0] >= parsed[1] {
+            return Err("retry times must be two increasing positive whole seconds".to_string());
+        }
+        return Ok(format!("[{},{}]", parsed[0], parsed[1]));
     }
     if ROUTING_NUMBER_KEYS.contains(&key) {
         // Digits with at most one decimal point: never a sign, an exponent,
@@ -1156,6 +1169,12 @@ fn route_lift_argv(account: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+/// Check one already configured account.  The CLI validates it against the
+/// routing record before it starts its fixed usage probe.
+fn route_check_argv(account: &str) -> Result<Vec<String>, String> {
+    Ok(vec!["route".to_string(), "check".to_string(), "--".to_string(), checked_route_account(account)?])
+}
+
 /// Clear the account, or with `report` dismiss that one report.
 fn route_clear_argv(account: &str, report: Option<&str>) -> Result<Vec<String>, String> {
     let mut argv = route_base("clear");
@@ -1236,6 +1255,11 @@ async fn khipu_route_pause(account: String, until: Option<String>) -> Result<Str
 #[tauri::command]
 async fn khipu_route_lift(account: String) -> Result<String, String> {
     run_khipu_cli_async(route_lift_argv(&account)?).await
+}
+
+#[tauri::command]
+async fn khipu_route_check(account: String) -> Result<String, String> {
+    run_khipu_cli_async(route_check_argv(&account)?).await
 }
 
 #[tauri::command]
@@ -2879,6 +2903,7 @@ pub fn run() {
             khipu_route_view,
             khipu_route_pause,
             khipu_route_lift,
+            khipu_route_check,
             khipu_route_clear,
             khipu_route_note_set,
             khipu_route_note_end,
@@ -3427,6 +3452,7 @@ mod settings_command_tests {
         );
         assert_eq!(route_pause_argv("Codex", None).unwrap(), v(&["route", "pause", "--from-app", "--", "Codex"]));
         assert_eq!(route_lift_argv("Codex").unwrap(), v(&["route", "lift", "--from-app", "--", "Codex"]));
+        assert_eq!(route_check_argv("Codex").unwrap(), v(&["route", "check", "--", "Codex"]));
         assert_eq!(route_clear_argv("Codex", None).unwrap(), v(&["route", "clear", "--from-app", "--", "Codex"]));
         assert_eq!(
             route_clear_argv("Codex", Some("e1a2b3c4")).unwrap(),
@@ -3483,6 +3509,8 @@ mod settings_command_tests {
         assert!(route_rule_argv("edit", Some(1), Some("a\rb")).is_err());
         assert!(route_hold_add_argv("one\ntwo", "other", "all", None, None).is_err());
         assert!(route_pause_argv("--owner", None).is_err());
+        assert!(route_check_argv("--owner").is_err());
+        assert!(route_check_argv("Codex\n--from-app").is_err());
         assert!(route_pause_argv("Codex\n--until=1h", None).is_err());
         assert!(route_pause_argv("Codex", Some("--from-app")).is_err());
         assert!(route_pause_argv("Codex", Some("1h")).is_err());
@@ -3521,8 +3549,20 @@ mod settings_command_tests {
                          ("routing_stale_after", "999999999999")] {
             assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }
-        // Phase 5 to 7 settings are not offered yet.
-        for k in ["routing_reset_check", "routing_push_delegation", "routing_cloud_copy", "routing_rules_seed"] {
+        assert_eq!(config_set_argv("routing_reset_check", "on").unwrap(), v(&["config", "--set", "routing_reset_check", "on"]));
+        assert_eq!(config_set_argv("routing_reset_check_wait", "120").unwrap(), v(&["config", "--set", "routing_reset_check_wait", "120"]));
+        assert_eq!(config_set_argv("routing_reset_check_retries", "[600,1800]").unwrap(), v(&["config", "--set", "routing_reset_check_retries", "[600,1800]"]));
+        assert_eq!(config_set_argv("routing_busy_load", "75").unwrap(), v(&["config", "--set", "routing_busy_load", "75"]));
+        assert_eq!(config_set_argv("routing_busy_wait", "300").unwrap(), v(&["config", "--set", "routing_busy_wait", "300"]));
+        assert_eq!(config_set_argv("routing_busy_tries", "3").unwrap(), v(&["config", "--set", "routing_busy_tries", "3"]));
+        for (k, bad) in [("routing_reset_check", "yes"), ("routing_reset_check_wait", "-1"),
+                         ("routing_reset_check_retries", "[600,600]"), ("routing_reset_check_retries", "[600,\n1800]"),
+                         ("routing_busy_load", "-1"), ("routing_busy_wait", "one"), ("routing_busy_tries", "-3")] {
+            assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
+        }
+        assert_eq!(config_unset_argv("routing_reset_check").unwrap(), v(&["config", "--unset=routing_reset_check"]));
+        // Phase 6 and 7 settings are not offered yet.
+        for k in ["routing_push_delegation", "routing_cloud_copy", "routing_rules_seed"] {
             assert!(config_set_argv(k, "on").is_err(), "{k}");
             assert!(config_unset_argv(k).is_err(), "{k}");
         }

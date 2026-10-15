@@ -2,11 +2,11 @@
    docs/mockups/2026-10-14-routing/home-routing*.html): one row per account
    in the scope's words, who said so and how long ago, the holds with their
    end and author, the owner's note word for word with its date, and the
-   standing rules folded. Read only: Check now arrives with the reset check
-   (phase 5), and the controls that change the record live in Settings ->
+   standing rules folded. Check now uses the reset-check path; the controls
+   that change the record live in Settings ->
    Routing. Khipu reports this; agents decide where work goes. */
 
-import { useId } from "react";
+import { useId, useState } from "react";
 import { Disclosure, EmptyState, ListRow, Tag } from "./ui";
 import type { UsageReport } from "./PlansCard";
 import { tightestWindow } from "./PlansCard";
@@ -24,6 +24,7 @@ import {
   windowWords,
 } from "./routing";
 import type { PlanFigure, RouteAccount, RoutingState } from "./routing";
+import { callCli } from "./settingsCli";
 
 const NO_RECORD_HINT =
   "Khipu starts one when a plan check, a job runner folder or a conversation reports on an account. Until then no account is shown as open.";
@@ -54,12 +55,15 @@ function AccountRow({
   a,
   now,
   plans,
-  reportDefault,
+  reportDefault, onCheck, checking, checkResult,
 }: {
   a: RouteAccount;
   now: Date;
   plans?: UsageReport | null;
   reportDefault?: number;
+  onCheck: (key: string) => void;
+  checking: string | null;
+  checkResult: { account: string; text: string; error: boolean } | null;
 }) {
   const st = accountState(a, now);
   const src = accountSource(a, now, a.state === "open" ? planFigure(a, plans, now) : null, reportDefault);
@@ -74,6 +78,7 @@ function AccountRow({
         {st.text}
       </span>
       <span className="route-src">{src}</span>
+      {a.next_check ? <span className="route-src">Khipu checks again at {whenLocal(a.next_check, now)}.</span> : null}
       {notes.map((dis) => (
         <div className="route-note" key={dis}>
           <Tag tone="warn" dot>
@@ -82,6 +87,14 @@ function AccountRow({
           <span>{dis}</span>
         </div>
       ))}
+      {a.checkable !== false && ["limited", "probably_open", "unknown"].includes(a.state) ? (
+        <span className="route-acts">
+          <button type="button" className="sm" disabled={checking !== null} onClick={() => onCheck(a.key)}>
+            {checking === a.key ? "Checking…" : "Check now"}
+          </button>
+          {checkResult?.account === a.key ? <span className={checkResult.error ? "set-error" : "route-src"} role="status">{checkResult.text}</span> : null}
+        </span>
+      ) : null}
     </div>
   );
 }
@@ -94,6 +107,17 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
   const { data, error, loading } = state;
   const holdsId = useId();
   const now = new Date();
+  const [checking, setChecking] = useState<string | null>(null);
+  const [checkResult, setCheckResult] = useState<{ account: string; text: string; error: boolean } | null>(null);
+  const check = async (account: string) => {
+    if (checking !== null) return;
+    setChecking(account); setCheckResult(null);
+    try {
+      const out = await callCli<{ reason?: string }>("khipu_route_check", { account });
+      setCheckResult({ account, text: out.ok ? (out.data?.reason ?? "Checked.") : out.error, error: !out.ok });
+      await state.load(true);
+    } finally { setChecking((active) => active === account ? null : active); }
+  };
   const head = <div className="card-head">Routing</div>;
   if (data == null) {
     return (
@@ -153,7 +177,8 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
       ) : (
         <div role="list" aria-label="Accounts">
           {accounts.map((a) => (
-            <AccountRow key={a.key} a={a} now={now} plans={plans} reportDefault={data.report_default_limit} />
+            <AccountRow key={a.key} a={a} now={now} plans={plans} reportDefault={data.report_default_limit}
+              onCheck={check} checking={checking} checkResult={checkResult} />
           ))}
         </div>
       )}

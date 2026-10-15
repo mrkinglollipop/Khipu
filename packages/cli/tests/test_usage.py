@@ -1242,3 +1242,12 @@ def test_doctor_block_never_raises_on_a_broken_cache(fake, tmp_path, monkeypatch
     usage.cache_file().parent.mkdir(parents=True, exist_ok=True)
     usage.cache_file().write_text("{not json")
     assert usage.doctor_block()["warnings"] == []
+
+
+def test_foreground_report_never_probes_without_the_shared_refresh_lock(fake, monkeypatch):
+    account = {"label": "Claude", "harness": "claude", "home": None}
+    monkeypatch.setattr(usage, "_try_refresh_lock", lambda: None)
+    monkeypatch.setattr(usage, "probe_all", lambda *_a, **_kw: pytest.fail("started beside the lock holder"))
+    out = usage.report(fresh=True, accounts=[account])
+    assert out["refreshing"] is True
+    assert out["accounts"][0]["error"] == usage.E_PENDING
