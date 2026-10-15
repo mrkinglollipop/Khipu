@@ -32,7 +32,7 @@ a card on Home that stays until he closes it, each item with a Show me button.
 | 4 | Routing lists: sort and filter accounts, filter and search rules, filter recent changes | S–M | open |
 | 5 | Standing rules: "Checked by Khipu" with the check's result | S | open |
 | 6 | Capture & models: three cards and one Keys list | M | open |
-| 7 | Setup: an Accounts step | S–M | open |
+| 7 | Setup: an Accounts step | S–M | built, in review (branch feat/clarity-setup) |
 | 8 | What's new after an update (dialog and Home card), and its history in Settings → Updates | S | open |
 
 One PR per phase. Phase 1 goes first because it fixes things that are wrong today. Phases 2 to 6 can go in any

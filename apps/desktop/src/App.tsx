@@ -2451,10 +2451,15 @@ export default function App() {
   // at the Database step rather than restarting it — `welcomeInitialStepKey`
   // is bumped on every click so a second visit still jumps even when
   // `welcomeInitialStep` itself does not change value.
-  const [welcomeInitialStep, setWelcomeInitialStep] = useState<"database" | undefined>(undefined);
+  const [welcomeInitialStep, setWelcomeInitialStep] = useState<"database" | "accounts" | undefined>(undefined);
   const [welcomeInitialStepKey, setWelcomeInitialStepKey] = useState(0);
   const openDatabaseStepInFirstRun = useCallback(() => {
     setWelcomeInitialStep("database");
+    setWelcomeInitialStepKey((k) => k + 1);
+    setTab("first-run");
+  }, []);
+  const openAccountsStepInFirstRun = useCallback(() => {
+    setWelcomeInitialStep("accounts");
     setWelcomeInitialStepKey((k) => k + 1);
     setTab("first-run");
   }, []);
@@ -5891,6 +5896,9 @@ export default function App() {
                         <div className="toolbar">
                           <button type="button" onClick={() => setTab("first-run")}>
                             Run setup again
+                          </button>
+                          <button type="button" onClick={openAccountsStepInFirstRun}>
+                            Set up accounts again
                           </button>
                           <button type="button" onClick={() => setTab("revisions")}>
                             Conflicting edits
