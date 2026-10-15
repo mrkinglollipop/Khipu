@@ -9,6 +9,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 import { RoutingCard, inPlansOrder } from "../RoutingCard";
+// The stylesheet as written (vitest hands CSS imports over empty, `?raw`
+// included). The app has no @types/node; vitest runs this file in node.
+// @ts-expect-error node:fs has no types here
+import { readFileSync } from "node:fs";
+
+const appCss: string = readFileSync(
+  `${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/App.css`,
+  "utf8",
+);
 import { accountSource, accountState, lastChangeWords, useRouting } from "../routing";
 import type { RouteAccount, RouteView, RoutingState } from "../routing";
 import { routingAttention } from "../doctorAttention";
@@ -214,6 +223,33 @@ describe("Home Routing card, the other states", () => {
     ["unknown, its only reporter stopped", {
       silent: true, last_seen: { state: "open", source: "runner", written_by: { kind: "runner", name: "Project B" }, at: "2026-10-14T18:12:00Z" },
     }, "Unknown: its only reporter stopped", "Seen by your Project B job runner 53 min ago"],
+    // Fix round 1 (F5): a Clear that went out of date is the owner's
+    // Clear, never a sighting of the account open.
+    ["unknown, last cleared by you", {
+      harness: "codex", last_seen: { state: "open", source: "owner", by: "you", cleared: true, at: "2026-10-14T06:05:00Z" },
+    }, "Unknown: last cleared by you 13 h ago", "Cleared by you at 2:05 AM"],
+    // Fix round 1 (F6): times read as part of the sentence.
+    ["a model-scoped limit ending today", {
+      harness: "claude", state: "open",
+      witness: { source: "probe", at: "2026-10-14T18:59:00Z" },
+      models: [{ model: "Opus", until: "2026-10-14T20:00:00Z", basis: "cli", source: "probe" }],
+    }, "Opus limit reached, back at 4:00 PM; other models open", "Read from Claude 6 min ago"],
+    ["a reset that passed yesterday and can't be checked", {
+      harness: "muse", state: "probably_open", until: "2026-10-14T00:00:00Z", basis: "cli", checkable: false,
+      witness: { source: "runner", written_by: { kind: "runner", name: "Project A" }, at: "2026-10-13T15:13:00Z", message_time: true },
+    }, "Its reset time passed yesterday at 8:00 PM; this account can't be checked without using a turn",
+      "From Muse's own message, seen by your Project A job runner yesterday at 11:13 AM"],
+    ["probably open since an earlier day", {
+      harness: "codex", state: "probably_open", until: "2026-10-12T00:00:00Z", basis: "cli",
+      witness: { source: "probe", at: "2026-10-11T14:00:00Z" },
+    }, "Probably open: its limit was due to end Sun at 8:00 PM, not checked yet", "Read from Codex Sun at 10:00 AM"],
+    // Fix round 1 (F7): a report that gave no time says so, and how long
+    // Khipu keeps it.
+    ["a guess from a report without a time", {
+      harness: "grok", state: "limited", until: "2026-10-14T19:30:00Z", basis: "estimated",
+      witness: { ...conv("Khipu"), at: "2026-10-14T19:00:00Z", until_default: true },
+    }, "Limit reached, back about 3:30 PM (a guess)",
+      "Reported without a time by a Claude Code conversation in Khipu 5 min ago; Khipu keeps a report like that for 30 minutes"],
     ["paused with no end", {
       state: "paused", until: null, witness: { source: "owner", at: "2026-10-14T18:00:00Z" },
     }, "Paused by you until you clear it", "Set by you at 2:00 PM"],
@@ -287,7 +323,7 @@ describe("Home Routing card, two sources disagree and a rule may be broken", () 
       }),
     ];
     v.rule_checks = [{
-      rule: 3, status: "broken", at: "2026-10-14T15:22:00Z",
+      rule: 3, status: "broken", at: "2026-10-14T15:22:00Z", runner: "Project A", file: "settings",
       text: "A standing rule may be broken: Project A's settings name a model ending in -fast for its grokcheck lane.",
     }, { rule: 4, status: "cannot_check", text: "Project A's grok lane: whether it uses the paid xAI API can't be checked: the launch environment is set inside grok" }];
     return v;
@@ -315,7 +351,7 @@ describe("Home Routing card, two sources disagree and a rule may be broken", () 
       key: "routing:rules",
       tone: "warn",
       title: "A standing rule may be broken",
-      cause: "Your rule 3 says: Never a -fast tier. Project A's settings name a model ending in -fast for its grokcheck lane (seen at 11:22 AM). Khipu stopped nothing; it only reports.",
+      cause: "Your rule 3 says: Never a -fast tier. Your Project A job runner's settings name a model ending in -fast for its grokcheck lane (seen at 11:22 AM in its settings file). Khipu stopped nothing; it only reports.",
     }]);
     const row = routingHealthRow(conflictView(), MORNING);
     expect(row?.status).toBe("err");
@@ -345,7 +381,7 @@ describe("routing attention and health row edges", () => {
       key: "routing:lane:Project A/opus-batch",
       tone: "warn",
       title: "A limit came from a lane not matched to an account",
-      cause: "A limit came from Project A's opus-batch lane, which isn't matched to an account; it ends 2:00 PM. Conversations are told the lane's name only, never a guessed account.",
+      cause: "A limit came from Project A's opus-batch lane, which isn't matched to an account; it ends at 2:00 PM. Conversations are told the lane's name only, never a guessed account.",
     }]);
   });
 
@@ -384,5 +420,66 @@ describe("useRouting", () => {
   it("does not read while inactive", () => {
     renderHook(() => useRouting(false));
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("Home Routing card, fix round 1", () => {
+  it("names a model's own disagreement on the row the attention item points at (F1)", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(AFTERNOON);
+    const v = mainView();
+    v.accounts = [acct("Claude main", "claude", {
+      state: "open",
+      witness: { source: "probe", at: "2026-10-14T18:59:00Z" },
+      models: [{
+        model: "Opus", until: "2026-10-16T13:00:00Z", basis: "cli", source: "report",
+        disagreement: { state: "open", ...conv("project-c"), at: "2026-10-14T17:00:00Z", since: "2026-10-14T17:00:00Z" },
+      }],
+    })];
+    render(<RoutingCard state={stateOf(v)} />);
+    const row = rowFor("Claude main");
+    expect(row).toHaveTextContent("Opus limit reached, back Fri 9:00 AM; other models open");
+    expect(within(row).getByText("Sources disagree")).toBeInTheDocument();
+    expect(row).toHaveTextContent(
+      "A Claude Code conversation in project-c reported Opus open at 1:00 PM. Claude's own message outranks a conversation's report, so the Opus limit shows here; conversations are told both.");
+    // The attention item names the same model, and the card has its note.
+    const items = routingAttention(v, AFTERNOON).filter((a) => a.key.startsWith("routing:disagree"));
+    expect(items.map((a) => a.title)).toEqual(["Sources disagree about Claude main (Opus)"]);
+  });
+
+  it("reminds the owner of his own old hold, and only that one (F2)", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(MORNING);
+    const v = mainView();
+    v.holds = [
+      { id: "old", scope_label: "Muse", reason: "keep", text: "Keep it for reviews", until: null, owner: true, by: "you",
+        at: "2026-07-01T15:00:00Z", remind: true },
+      { id: "new", scope_label: "Codex", reason: "keep", text: "Keep it for builds", until: null, owner: true, by: "you",
+        at: "2026-10-13T15:00:00Z", remind: false },
+    ];
+    render(<RoutingCard state={stateOf(v)} />);
+    const items = within(screen.getByRole("list", { name: "Holds" })).getAllByRole("listitem");
+    expect(items[0]).toHaveTextContent("You set this 105 days ago. Is it still needed?");
+    expect(within(items[0]).getByText("Reminder")).toBeInTheDocument();
+    expect(items[1]).not.toHaveTextContent("Is it still needed?");
+    expect(within(items[1]).queryByText("Reminder")).toBeNull();
+  });
+
+  it("breaks a long word in the note, the rules and the holds instead of running past the card (F3)", () => {
+    const style = document.createElement("style");
+    style.textContent = appCss;
+    document.head.appendChild(style);
+    try {
+      const long = "/a/very/long/path/with/no/spaces/".repeat(10);
+      const v = mainView();
+      v.note = { text: `See ${long}`, at: "2026-10-13T14:00:00Z" };
+      v.holds = [{ ...v.holds![0], text: long }];
+      v.rules = [{ n: 1, text: long }];
+      const { container } = render(<RoutingCard state={stateOf(v)} />);
+      const card = container.querySelector(".routing-card") as HTMLElement;
+      expect(getComputedStyle(card).overflowWrap).toBe("anywhere");
+    } finally {
+      style.remove();
+    }
   });
 });

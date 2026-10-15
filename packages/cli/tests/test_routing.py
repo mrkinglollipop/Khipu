@@ -1525,3 +1525,44 @@ def test_a_run_written_ahead_gives_way_once_more_lines_say_otherwise():
     fixed, behind, ahead = routing._write_order_times([T0, T0 + timedelta(minutes=1), low, None])
     assert fixed == [T0, T0 + timedelta(minutes=1), T0 + timedelta(minutes=1), None]
     assert (behind, ahead) == ([low], [])
+
+
+def test_a_stale_clear_is_named_as_the_owners_clear_not_a_sighting(home, capsys):
+    """Fix round 1 (F5): when an owner Clear goes out of date, the last word
+    on the account was his Clear; nobody saw it open. The fold, the line and
+    `khipu route --json` say so."""
+    _report(account="Codex", state="limited")
+    home["clock"].advance(minutes=1)
+    routing.clear("Codex", via="app")
+    home["clock"].advance(hours=13)
+    entry = _account(routing.read_view(), "codex|")
+    assert entry["state"] == "unknown"
+    assert entry["last_seen"]["source"] == "owner" and entry["last_seen"]["cleared"] is True
+    line = routing.account_line(entry, home["clock"].now)
+    assert "unknown: last cleared by you" in line and "last seen open" not in line
+    _rc, text = _cli(["route", "--json"], capsys)
+    codex = next(a for a in json.loads(text)["accounts"] if a["label"] == "Codex")
+    assert codex["last_seen"]["cleared"] is True and codex["last_seen"]["by"] == "you"
+    # A sighting that was not a Clear stays a sighting.
+    _report(account="Muse", state="open")
+    home["clock"].advance(hours=13)
+    muse = _account(routing.read_view(), "muse|")
+    assert muse["state"] == "unknown" and muse["last_seen"]["cleared"] is False
+
+
+def test_a_limit_reported_without_a_time_is_marked_so(home, capsys):
+    """Fix round 1 (F7): a conversation's limit report that names no time
+    lasts the default; the witness says so and `khipu route --json` carries
+    the default, so the card can say "without a time" and for how long."""
+    _report(account="Codex", state="limited")
+    _report(account="Muse", state="limited", until="1h")
+    _rc, text = _cli(["route", "--json"], capsys)
+    out = json.loads(text)
+    by_label = {a["label"]: a for a in out["accounts"]}
+    assert by_label["Codex"]["witness"]["until_default"] is True
+    assert by_label["Muse"]["witness"]["until_default"] is False
+    assert out["report_default_limit"] == 30 * 60
+    # A line with no time (an older or hand-written one) is read the same way.
+    assert _state([_ev(0, "limited", T0)], T0 + timedelta(minutes=1))["witness"]["until_default"] is True
+    timed = _state([_ev(0, "limited", T0, until=T0 + timedelta(hours=1))], T0 + timedelta(minutes=1))
+    assert timed["witness"]["until_default"] is False

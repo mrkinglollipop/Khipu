@@ -21,6 +21,8 @@ export type RouteWitness = {
   message_time?: boolean;
   cleared?: boolean;
   observed?: boolean;
+  /** A limit reported with no time: it lasts `report_default_limit`. */
+  until_default?: boolean;
 };
 
 export type RouteReport = RouteWitness & {
@@ -63,6 +65,8 @@ export type RouteHold = {
   owner?: boolean;
   by?: string;
   at?: string | null;
+  /** An owner hold older than the reminder setting (90 days by default). */
+  remind?: boolean;
 };
 
 export type RouteRule = { n: number; text: string; seeded?: boolean; confirmed?: boolean; date?: string | null };
@@ -79,7 +83,15 @@ export type RouteLane = { runner: string; lane: string; until?: string | null };
 
 export type RouteChange = { version: number; at: string; entities: string[] };
 
-export type RuleCheck = { rule: number; status: string; text: string; at?: string | null };
+export type RuleCheck = {
+  rule: number;
+  status: string;
+  text: string;
+  at?: string | null;
+  /** The job runner it was judged on, and which of its files. */
+  runner?: string;
+  file?: "settings" | "events" | string;
+};
 
 export type RouteView = {
   record?: boolean;
@@ -95,6 +107,8 @@ export type RouteView = {
   rule_checks?: RuleCheck[];
   /** Seconds; 0 means never. */
   warn_after?: { disagreement?: number; not_refreshed?: number };
+  /** Seconds a limit reported without a time lasts. */
+  report_default_limit?: number;
 };
 
 export type Tone = "ok" | "warn" | "err" | null;
@@ -135,10 +149,19 @@ export function whenLocal(iso: string | null | undefined, now: Date): string {
 }
 
 /** "at 2:52 PM" today, else "Sat 8:00 PM": a time ahead. */
-function aheadWords(iso: string | null | undefined, now: Date): string {
+export function aheadWords(iso: string | null | undefined, now: Date): string {
   const d = parse(iso);
   if (!d) return "";
   return dayWords(d, now) ? whenLocal(iso, now) : `at ${clock(d)}`;
+}
+
+/** "at 1:52 PM" today, else "yesterday at 1:52 PM" or "Mon at 8:00 PM":
+ *  a time that has passed, as the end of a sentence. */
+export function pastWords(iso: string | null | undefined, now: Date): string {
+  const d = parse(iso);
+  if (!d) return "";
+  const day = dayWords(d, now);
+  return day ? `${day} at ${clock(d)}` : `at ${clock(d)}`;
 }
 
 /** "just now", "4 min ago" within the hour, "at 11:13 AM" today, else
@@ -194,7 +217,7 @@ function modelLimits(a: RouteAccount, now: Date): string[] {
     .map((m) =>
       m.basis === "estimated"
         ? `${m.model} limit reached, back about ${whenLocal(m.until, now)} (a guess)`
-        : `${m.model} limit reached, back ${whenLocal(m.until, now)}`,
+        : `${m.model} limit reached, back ${aheadWords(m.until, now)}`,
     );
 }
 
@@ -228,11 +251,12 @@ export function accountState(a: RouteAccount, now: Date): { text: string; tone: 
     case "probably_open":
       text =
         a.checkable === false
-          ? `Its reset time passed at ${whenLocal(a.until, now)}; this account can't be checked without using a turn`
-          : `Probably open: its limit was due to end at ${whenLocal(a.until, now)}, not checked yet`;
+          ? `Its reset time passed ${pastWords(a.until, now)}; this account can't be checked without using a turn`
+          : `Probably open: its limit was due to end ${pastWords(a.until, now)}, not checked yet`;
       break;
     default:
       if (a.silent) text = "Unknown: its only reporter stopped";
+      else if (a.last_seen?.cleared) text = `Unknown: last cleared by you ${ageWords(a.last_seen.at, now)}`;
       else if (a.last_seen) text = `Unknown: last seen ${stateWord(a.last_seen.state)} ${ageWords(a.last_seen.at, now)}`;
       else text = "Unknown: no report yet";
   }
@@ -260,7 +284,8 @@ function witnessWords(w: RouteWitness, harness: string, state: string): string {
     }
     default: {
       const by = w.by || "a conversation";
-      return w.message_time ? `From ${cli}'s own message, reported by ${by}` : `Reported by ${by}`;
+      if (w.message_time) return `From ${cli}'s own message, reported by ${by}`;
+      return w.until_default ? `Reported without a time by ${by}` : `Reported by ${by}`;
     }
   }
 }
@@ -274,13 +299,24 @@ export function windowWords(name: string | undefined): string {
   return (name && WINDOW_WORDS[name]) || (name ?? "window").replace(/_/g, " ");
 }
 
-/** Who said so and when, plus what else the row should say. */
-export function accountSource(a: RouteAccount, now: Date, plan?: PlanFigure | null): string {
+/** Who said so and when, plus what else the row should say. `reportDefault`
+ *  is the record's `report_default_limit` (seconds), named when the limit
+ *  shown came from a report without a time. */
+export function accountSource(
+  a: RouteAccount,
+  now: Date,
+  plan?: PlanFigure | null,
+  reportDefault: number = 30 * 60,
+): string {
   const parts: string[] = [];
   const w = a.state === "unknown" ? a.last_seen : a.witness;
   if (w) {
     const when = saidWhen(w.at, now);
-    parts.push(`${witnessWords(w, a.harness, a.state)}${when ? ` ${when}` : ""}`);
+    let said = `${witnessWords(w, a.harness, a.state)}${when ? ` ${when}` : ""}`;
+    if (a.state === "limited" && w.until_default && w.source !== "runner" && !w.message_time) {
+      said += `; Khipu keeps a report like that for ${spanWords(reportDefault)}`;
+    }
+    parts.push(said);
   }
   if (a.state === "limited" && a.checkable === false) parts.push("can't be checked without using a turn");
   if (a.state === "open" && a.witness?.source === "probe" && plan) {
@@ -289,14 +325,14 @@ export function accountSource(a: RouteAccount, now: Date, plan?: PlanFigure | nu
   return parts.join(" · ");
 }
 
-/** Which report shows over the other, when two sources disagree. */
-function strongerWords(a: RouteAccount): string {
-  const w = a.witness;
-  const cli = cliName(a.harness);
-  if (w?.source === "probe") return `Khipu's read of ${cli}`;
-  if (w?.source === "check") return "Khipu's check";
-  if (w?.source === "owner") return "Your own word";
-  if (w?.message_time) return `${cli}'s own message`;
+/** Which report shows over the other, when two sources disagree: the
+ *  source of the one shown and whether its time is the CLI's own. */
+function strongerWords(source: string | undefined, ownTime: boolean, harness: string): string {
+  const cli = cliName(harness);
+  if (source === "probe") return `Khipu's read of ${cli}`;
+  if (source === "check") return "Khipu's check";
+  if (source === "owner") return "Your own word";
+  if (ownTime) return `${cli}'s own message`;
   return "The stronger report";
 }
 
@@ -306,6 +342,21 @@ function weakerWords(d: RouteReport): string {
   return "the other report";
 }
 
+function disagreementSentence(
+  d: RouteReport,
+  harness: string,
+  subject: string,
+  stronger: string,
+  shown: string,
+  now: Date,
+): string {
+  const by = d.by ? capitalise(d.by) : capitalise(witnessWords(d, harness, d.state ?? ""));
+  return (
+    `${by} reported ${subject} ${stateWord(d.state)} ${saidWhen(d.at, now)}. ` +
+    `${stronger} outranks ${weakerWords(d)}, so ${shown} shows here; conversations are told both.`
+  );
+}
+
 /** "A Claude Code conversation in project-b reported it open at 11:31 AM.
  *  Claude's own message outranks a conversation's report, so the limit
  *  shows here; conversations are told both." Null when nothing disagrees. */
@@ -313,11 +364,22 @@ export function disagreementWords(a: RouteAccount, now: Date): string | null {
   const d = a.disagreement;
   if (!d) return null;
   const shown = a.state === "limited" ? "the limit" : `"${stateWord(a.state)}"`;
-  const by = d.by ? capitalise(d.by) : capitalise(witnessWords(d, a.harness, d.state ?? ""));
-  return (
-    `${by} reported it ${stateWord(d.state)} ${saidWhen(d.at, now)}. ` +
-    `${strongerWords(a)} outranks ${weakerWords(d)}, so ${shown} shows here; conversations are told both.`
-  );
+  const w = a.witness;
+  return disagreementSentence(d, a.harness, "it", strongerWords(w?.source, !!w?.message_time, a.harness), shown, now);
+}
+
+/** The same for each model whose own limit a report disagrees with: "A
+ *  Claude Code conversation in project-c reported Opus open at 1:00 PM.
+ *  Claude's own message outranks a conversation's report, so the Opus limit
+ *  shows here; conversations are told both." Only models whose limit is
+ *  shown (its end is ahead), as the attention item names them. */
+export function modelDisagreementWords(a: RouteAccount, now: Date): string[] {
+  return (a.models ?? [])
+    .filter((m) => m.disagreement && ahead(m.until, now))
+    .map((m) => {
+      const stronger = strongerWords(m.source, m.basis === "cli" && m.source !== "probe", a.harness);
+      return disagreementSentence(m.disagreement!, a.harness, m.model, stronger, `the ${m.model} limit`, now);
+    });
 }
 
 /** A hold's end and author: "Ends tomorrow 9:40 AM · set by a Claude Code
@@ -326,6 +388,17 @@ export function holdSource(h: RouteHold, now: Date): string {
   const end = h.until ? `Ends ${whenLocal(h.until, now)}` : "Until you clear it";
   const by = h.owner ? `set by you ${saidWhen(h.at, now)}`.trim() : `set by ${h.by || "a conversation"}`;
   return `${end} · ${by}`;
+}
+
+/** The reminder the owner gets on his own old hold (the CLI sets `remind`
+ *  once it is older than the reminder setting, 90 days by default): "You
+ *  set this 120 days ago. Is it still needed?" Null otherwise. */
+export function holdReminder(h: RouteHold, now: Date): string | null {
+  if (!h.remind) return null;
+  const at = parse(h.at);
+  const days = at ? Math.floor((now.getTime() - at.getTime()) / DAY_MS) : null;
+  const when = days != null && days > 0 ? `${days} day${days === 1 ? "" : "s"} ago` : "a while ago";
+  return `You set this ${when}. Is it still needed?`;
 }
 
 const HOLD_REASON_WORDS: Record<string, string> = {
@@ -346,7 +419,9 @@ export function longDisagreements(view: RouteView, now: Date): { label: string; 
   const out: { label: string; since: string }[] = [];
   for (const a of view.accounts ?? []) {
     const sides: [string, RouteReport | null | undefined][] = [[a.label, a.disagreement]];
-    for (const m of a.models ?? []) sides.push([`${a.label} (${m.model})`, m.disagreement]);
+    // Only a model whose limit the card shows (its end is ahead), so the
+    // item always points at a note on the card (modelDisagreementWords).
+    for (const m of a.models ?? []) if (ahead(m.until, now)) sides.push([`${a.label} (${m.model})`, m.disagreement]);
     for (const [label, d] of sides) {
       const began = parse(d?.since ?? d?.at);
       if (began && now.getTime() - began.getTime() > after * 1000) out.push({ label, since: began.toISOString() });
@@ -367,7 +442,7 @@ export function quietRunners(view: RouteView): RouteRunner[] {
 export function runnerWords(r: RouteRunner, now: Date): string {
   if (r.silent) {
     return r.heartbeat_at
-      ? `Your ${r.name} job runner stopped reporting at ${whenLocal(r.heartbeat_at, now)}.`
+      ? `Your ${r.name} job runner stopped reporting ${pastWords(r.heartbeat_at, now)}.`
       : `Your ${r.name} job runner has not reported yet.`;
   }
   return r.unreadable_since

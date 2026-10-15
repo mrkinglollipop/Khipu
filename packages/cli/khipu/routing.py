@@ -1099,7 +1099,7 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
 _TIME_FIELDS = ("written_at", "until", "clock_at")
 _WHOLE_FIELDS = ("n", "count", "seq")
 _WHOLE_MOST = 2 ** 53
-_SWITCH_FIELDS = ("message_time", "owner", "seeded")
+_SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default")
 _AUTHOR_FIELDS = ("kind", "harness", "project", "session", "name", "file")
 _HOLD_KINDS = ("account", "machine", "all")
 
@@ -1381,6 +1381,9 @@ def _evidence(event: dict, cfg: dict) -> dict | None:
     if at is None or state not in (LIMITED, OPEN, DOWN):
         return None
     until = _parse(event.get("until"))
+    # A limit reported with no time lasts the default (the app says the
+    # report came "without a time"); ``report`` marks the lines it wrote so.
+    until_default = state == LIMITED and (until is None or bool(event.get("until_default")))
     if state == LIMITED and until is None:
         until = _after(at, cfg["routing_report_default_limit"] or 1800)
     return {"id": str(event.get("id") or f"line{event['_seq']}"), "account": event.get("account"),
@@ -1391,7 +1394,7 @@ def _evidence(event: dict, cfg: dict) -> dict | None:
             "source": event.get("source") if event.get("source") in SOURCES else "report",
             "written_by": event.get("written_by") or {}, "via": event.get("via"), "at": at, "seq": event["_seq"],
             "evidence": event.get("evidence"), "reason": event.get("reason"),
-            "message_time": bool(event.get("message_time"))}
+            "message_time": bool(event.get("message_time")), "until_default": until_default}
 
 
 def _owner_event(event: dict) -> dict:
@@ -1561,7 +1564,8 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
             return None
         return {"id": e["id"], "source": e["source"], "written_by": e["written_by"], "at": _iso(e["at"]),
                 "evidence": e.get("evidence"), "message_time": e.get("message_time", False),
-                "cleared": bool(e.get("cleared")), "observed": bool(e.get("observed"))}
+                "cleared": bool(e.get("cleared")), "observed": bool(e.get("observed")),
+                "until_default": bool(e.get("until_default"))}
 
     underlying = {"state": state, "until": _iso(behind["until"]) if behind and state in (LIMITED, PROBABLY_OPEN)
                   else None, "basis": behind["basis"] if behind and state in (LIMITED, PROBABLY_OPEN) else None}
@@ -1579,8 +1583,11 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
     if state == UNKNOWN:
         last = max(whole, key=_k, default=None)
         if last is not None:
+            # ``cleared``: the last word was the owner's Clear, which nobody
+            # saw as open; the app and the line say "last cleared by you".
             entry["last_seen"] = {"state": last["state"], "at": _iso(last["at"]), "source": last["source"],
-                                  "written_by": last["written_by"], "until": _iso(last["until"])}
+                                  "written_by": last["written_by"], "until": _iso(last["until"]),
+                                  "cleared": bool(last.get("cleared"))}
     pause = owner["pauses"].get(key)
     lift = owner["lifts"].get(key)
     if pause and (lift is None or _k(lift) < _k(pause)) and (pause["until"] is None or pause["until"] > now):
@@ -2376,6 +2383,7 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
                 stop = parsed
             else:
                 stop = _after(now, cfg["routing_report_default_limit"] or 1800)
+                event["until_default"] = True
         longest = _after(now, cap)
         if stop > longest:
             # Cut down to the window: a time no message gives is a guess,
@@ -2622,7 +2630,9 @@ def account_line(entry: dict, now: datetime, *, push: bool = True, relative: boo
                    "without using a turn"
     else:
         last = entry.get("last_seen")
-        if last:
+        if last and last.get("cleared"):
+            text = f"{label}: unknown: last cleared by you{age(_parse(last['at']))}"
+        elif last:
             text = f"{label}: unknown: last seen {_state_words(last['state'])}{age(_parse(last['at']))}"
         else:
             text = f"{label}: unknown: no report yet"
@@ -3045,6 +3055,8 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["rule_checks"] = routing_sources.rule_checks(view.get("source_cache") or {}, view.get("rules") or [])
     out["warn_after"] = {"disagreement": cfg["routing_disagreement_warn_after"],
                          "not_refreshed": cfg["routing_not_refreshed_after"]}
+    # How long a limit reported without a time lasts (the card says so).
+    out["report_default_limit"] = cfg["routing_report_default_limit"] or 1800
     for key in _INTERNAL:
         out.pop(key, None)
     return out
@@ -3082,8 +3094,9 @@ _VIEW_FIELDS = ("schema", "epoch", "version", "folded_at", "checked_at", "record
 _AUTHOR_PUBLIC = ("kind", "harness", "project", "session", "name")
 _ACCOUNT_FIELDS = ("label", "harness", "state", "until", "basis", "scope", "reason", "checkable", "confirmed_at",
                    "since", "silent")
-_WITNESS_FIELDS = ("id", "source", "at", "evidence", "message_time", "cleared", "observed")
+_WITNESS_FIELDS = ("id", "source", "at", "evidence", "message_time", "cleared", "observed", "until_default")
 _REPORT_FIELDS = ("id", "state", "source", "at", "since", "until")
+_LAST_SEEN_FIELDS = (*_REPORT_FIELDS, "cleared")
 _MODEL_FIELDS = ("model", "until", "basis", "source", "at", "id")
 _HOLD_FIELDS = ("id", "scope_label", "reason", "text", "until", "owner", "via", "at", "remind")
 _RULE_FIELDS = ("n", "text", "source", "date", "seeded", "confirmed", "via", "at")
@@ -3155,7 +3168,7 @@ def _public_account(entry: dict, now: datetime) -> dict:
                      for m in entry.get("models") or [] if isinstance(m, dict)]
     out["witness"] = _pick(entry.get("witness"), _WITNESS_FIELDS)
     out["disagreement"] = _pick(entry.get("disagreement"), _REPORT_FIELDS)
-    out["last_seen"] = _pick(entry.get("last_seen"), _REPORT_FIELDS)
+    out["last_seen"] = _pick(entry.get("last_seen"), _LAST_SEEN_FIELDS)
     out["underlying"] = _pick(entry.get("underlying"), ("state", "until", "basis"))
     out["line"] = account_line(entry, now, push=False)
     return out

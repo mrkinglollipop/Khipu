@@ -1184,3 +1184,37 @@ def test_a_window_with_no_number_neither_crashes_nor_miscounts_the_accounts(home
     routing.read_view()
     _, status = routing_sources.usage_evidence()
     assert status["accounts"] == 2
+
+
+def test_a_broken_rule_keeps_the_time_khipu_first_saw_it(home, capsys):
+    """Fix round 1 (F4): a check judged on a runner's settings is dated by
+    when Khipu first read the file as it reads now, not by the latest
+    refresh; a changed file is a new sighting. Each check names its runner
+    and file so the app can say "in its settings file"."""
+    _register(home)
+    routing.add_rule("Never a -fast tier.", via="app")
+    config = json.loads((home["a"] / "config.json").read_text())
+    config["lanes"]["codex"]["model"] = "gpt-6.1-sol-fast"
+    (home["a"] / "config.json").write_text(json.dumps(config))
+
+    def broken() -> dict:
+        assert routing.run_cli(_args(json=True)) == 0
+        out = json.loads(capsys.readouterr().out)
+        found = [c for c in out["rule_checks"] if c["status"] == "broken"]
+        assert len(found) == 1
+        return found[0]
+
+    first = broken()
+    assert first["at"] == routing._iso(T0)
+    assert first["runner"] == "project A" and first["file"] == "settings"
+    # The runner keeps running: its heartbeat moves, the settings don't.
+    for minutes in (20, 40):
+        home["clock"].now = T0 + timedelta(minutes=minutes)
+        _beat(home["a"], home["clock"].now)
+        assert broken()["at"] == routing._iso(T0)
+    # The settings change (still broken): Khipu saw this version later.
+    config["lanes"]["codex"]["model"] = "gpt-6.1-astra-fast"
+    (home["a"] / "config.json").write_text(json.dumps(config))
+    home["clock"].now = T0 + timedelta(minutes=50)
+    _beat(home["a"], home["clock"].now)
+    assert broken()["at"] == routing._iso(T0 + timedelta(minutes=50))

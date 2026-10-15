@@ -3043,6 +3043,12 @@ input.switch:disabled {
    docs/mockups/2026-10-14-routing/mock.css). The name column matches the
    Plans card so the two read as a pair.
 --------------------------------------------------------------------------- */
+/* The note, the rules and hold words are shown word for word, paths and
+   links included: a word with no space in it breaks rather than running
+   past the card and scrolling the whole column sideways. Set on the card so
+   every text in it inherits it (nowrap pieces such as the state and the
+   tags are unaffected). */
+.routing-card { overflow-wrap: anywhere; }
 .card .row.route-row {
   display: grid;
   grid-template-columns: minmax(7rem, 11rem) auto minmax(0, 1fr);

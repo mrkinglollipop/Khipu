@@ -15,7 +15,9 @@ import {
   accountState,
   brokenChecks,
   disagreementWords,
+  holdReminder,
   holdSource,
+  modelDisagreementWords,
   holdWords,
   notRefreshedWords,
   whenLocal,
@@ -48,10 +50,22 @@ function planFigure(a: RouteAccount, plans: UsageReport | null | undefined, now:
   return { pct: w.used_pct, window: windowWords(w.name) };
 }
 
-function AccountRow({ a, now, plans }: { a: RouteAccount; now: Date; plans?: UsageReport | null }) {
+function AccountRow({
+  a,
+  now,
+  plans,
+  reportDefault,
+}: {
+  a: RouteAccount;
+  now: Date;
+  plans?: UsageReport | null;
+  reportDefault?: number;
+}) {
   const st = accountState(a, now);
-  const src = accountSource(a, now, a.state === "open" ? planFigure(a, plans, now) : null);
-  const dis = disagreementWords(a, now);
+  const src = accountSource(a, now, a.state === "open" ? planFigure(a, plans, now) : null, reportDefault);
+  // The account's own disagreement and each model's: the attention item
+  // "Sources disagree about X (Opus)" points at one of these notes.
+  const notes = [disagreementWords(a, now), ...modelDisagreementWords(a, now)].filter((d): d is string => !!d);
   return (
     <div className="row route-row" role="listitem">
       <span className="ellip">{a.label}</span>
@@ -60,14 +74,14 @@ function AccountRow({ a, now, plans }: { a: RouteAccount; now: Date; plans?: Usa
         {st.text}
       </span>
       <span className="route-src">{src}</span>
-      {dis ? (
-        <div className="route-note">
+      {notes.map((dis) => (
+        <div className="route-note" key={dis}>
           <Tag tone="warn" dot>
             Sources disagree
           </Tag>
           <span>{dis}</span>
         </div>
-      ) : null}
+      ))}
     </div>
   );
 }
@@ -131,7 +145,7 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
       ) : (
         <div role="list" aria-label="Accounts">
           {accounts.map((a) => (
-            <AccountRow key={a.key} a={a} now={now} plans={plans} />
+            <AccountRow key={a.key} a={a} now={now} plans={plans} reportDefault={data.report_default_limit} />
           ))}
         </div>
       )}
@@ -141,13 +155,24 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
             Holds
           </h2>
           <ul className="route-holds" aria-labelledby={holdsId}>
-            {holds.map((h) => (
-              <li key={h.id} className="route-hold">
-                <span>{h.scope_label.charAt(0).toUpperCase() + h.scope_label.slice(1)}</span>
-                <span>{holdWords(h)}</span>
-                <span className="route-src">{holdSource(h, now)}</span>
-              </li>
-            ))}
+            {holds.map((h) => {
+              const remind = holdReminder(h, now);
+              return (
+                <li key={h.id} className="route-hold">
+                  <span>{h.scope_label.charAt(0).toUpperCase() + h.scope_label.slice(1)}</span>
+                  <span>{holdWords(h)}</span>
+                  <span className="route-src">{holdSource(h, now)}</span>
+                  {remind ? (
+                    <span className="route-note route-remind">
+                      <Tag tone="warn" dot>
+                        Reminder
+                      </Tag>
+                      <span>{remind}</span>
+                    </span>
+                  ) : null}
+                </li>
+              );
+            })}
           </ul>
         </div>
       ) : null}

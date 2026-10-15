@@ -8,13 +8,14 @@
 // app has an honest fix) a button.
 
 import {
+  aheadWords,
   brokenChecks,
   capitalise,
   longDisagreements,
   quietRunners,
   runnerWords,
+  pastWords,
   spanWords,
-  whenLocal,
 } from "./routing";
 import type { RouteView } from "./routing";
 
@@ -359,8 +360,15 @@ export function routingAttention(view: RouteView | null | undefined, now: Date =
     const lines = broken.map((c) => {
       const rule = (view.rules ?? []).find((r) => r.n === c.rule);
       const said = rule ? `Your rule ${rule.n} says: ${rule.text.replace(/\.$/, "")}. ` : "";
-      const what = capitalise(c.text.replace(/^A standing rule may be broken: /, "").replace(/\.$/, ""));
-      const seen = c.at ? ` (seen at ${whenLocal(c.at, now)})` : "";
+      let what = c.text.replace(/^A standing rule may be broken: /, "").replace(/\.$/, "");
+      // "Project A's settings name..." -> "Your Project A job runner's
+      // settings name...", as the card and the mock name a runner.
+      if (c.runner && what.startsWith(`${c.runner}'s `)) {
+        what = `Your ${c.runner} job runner's ${what.slice(c.runner.length + 3)}`;
+      }
+      what = capitalise(what);
+      const file = c.file === "settings" ? " in its settings file" : c.file === "events" ? " in its events log" : "";
+      const seen = c.at ? ` (seen ${pastWords(c.at, now)}${file})` : "";
       return `${said}${what}${seen}.`;
     });
     items.push({
@@ -376,7 +384,7 @@ export function routingAttention(view: RouteView | null | undefined, now: Date =
       tone: "warn",
       title: r.silent ? "A job runner stopped reporting" : "Khipu can't read a job runner's files",
       cause: r.silent
-        ? `${r.heartbeat_at ? `Your ${r.name} job runner's last report was at ${whenLocal(r.heartbeat_at, now)}.` : `Your ${r.name} job runner has not reported yet.`} Limits it finds won't reach your conversations until it runs again. Khipu stopped nothing.`
+        ? `${r.heartbeat_at ? `Your ${r.name} job runner's last report was ${pastWords(r.heartbeat_at, now)}.` : `Your ${r.name} job runner has not reported yet.`} Limits it finds won't reach your conversations until it runs again. Khipu stopped nothing.`
         : `${runnerWords(r, now)} Limits it finds won't reach your conversations until Khipu can read them again. Khipu stopped nothing.`,
     });
   }
@@ -394,7 +402,7 @@ export function routingAttention(view: RouteView | null | undefined, now: Date =
       key: `routing:lane:${u.runner}/${u.lane}`,
       tone: "warn",
       title: "A limit came from a lane not matched to an account",
-      cause: `A limit came from ${u.runner}'s ${u.lane} lane, which isn't matched to an account${u.until ? `; it ends ${whenLocal(u.until, now)}` : ""}. Conversations are told the lane's name only, never a guessed account.`,
+      cause: `A limit came from ${u.runner}'s ${u.lane} lane, which isn't matched to an account${u.until ? `; it ends ${aheadWords(u.until, now)}` : ""}. Conversations are told the lane's name only, never a guessed account.`,
     });
   }
   return items;
