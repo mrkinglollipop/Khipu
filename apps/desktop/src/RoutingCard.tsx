@@ -20,10 +20,12 @@ import {
   modelDisagreementWords,
   holdWords,
   notRefreshedWords,
+  priorityHeadline,
+  priorityPendingWords,
   whenLocal,
   windowWords,
 } from "./routing";
-import type { PlanFigure, RouteAccount, RoutingState } from "./routing";
+import type { PlanFigure, RouteAccount, RoutePriority, RoutingState } from "./routing";
 import { callCli } from "./settingsCli";
 
 const NO_RECORD_HINT =
@@ -99,6 +101,53 @@ function AccountRow({
   );
 }
 
+/** The owner's priority at the top of the card, in his order. One a
+ *  conversation set at his request carries its mark and Confirm or Undo. */
+function PriorityRow({ p, now, reload }: { p: RoutePriority; now: Date; reload: () => Promise<void> }) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const act = async (action: "confirm" | "undo") => {
+    if (busy) return;
+    setBusy(action);
+    setError(null);
+    try {
+      const out = await callCli("khipu_route_priority", { action });
+      if (!out.ok) setError(out.error);
+      await reload();
+    } finally {
+      setBusy(null);
+    }
+  };
+  return (
+    <ListRow className="route-priority">
+      <span className="route-state">{priorityHeadline(p, now)}</span>
+      {p.pending ? (
+        <>
+          <span className="route-note">
+            <Tag tone="warn" dot>
+              Not confirmed
+            </Tag>
+            <span>{priorityPendingWords(p)}</span>
+          </span>
+          <span className="route-acts">
+            <button type="button" className="sm" disabled={busy !== null} onClick={() => void act("confirm")}>
+              {busy === "confirm" ? "Confirming…" : "Confirm"}
+            </button>
+            <button type="button" className="sm" disabled={busy !== null} onClick={() => void act("undo")}>
+              {busy === "undo" ? "Undoing…" : "Undo"}
+            </button>
+          </span>
+          {error ? (
+            <span className="set-error" role="alert">
+              Khipu didn't make that change: {error}
+            </span>
+          ) : null}
+        </>
+      ) : null}
+    </ListRow>
+  );
+}
+
 function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
 }
@@ -169,6 +218,7 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
           {error ? <span className="route-src">{error}</span> : null}
         </ListRow>
       ) : null}
+      {data.priority ? <PriorityRow p={data.priority} now={now} reload={() => state.load(true)} /> : null}
       {accounts.length === 0 ? (
         <EmptyState
           title="No accounts to show"

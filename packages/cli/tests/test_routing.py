@@ -962,7 +962,8 @@ def test_owner_commands_refuse_without_a_typed_confirmation(home, capsys, monkey
     assert rc == 0 and json.loads(out)["ok"] is True
     block = routing.doctor_block()
     assert block["outside_app"] == ["pause of Codex"]
-    assert "A rule, a pause, a clear or your note was written by something other than the app." in block["warnings"]
+    assert "A rule, a pause, a clear, your note or your priority was written by something other than the app." \
+        in block["warnings"]
 
 
 def test_rule_at_owner_request_is_live_without_terminal_confirmation_but_owner_actions_are_not(home, capsys, monkeypatch):

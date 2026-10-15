@@ -178,6 +178,12 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_busy_load": ("number", 75.0, "Wait while the Mac is busy: load over (0: never wait)"),
     "routing_busy_wait": ("duration", 300, "How long to wait while the Mac is busy"),
     "routing_busy_tries": ("count", 3, "How many times to wait while the Mac is busy"),
+    # The owner's priority and spend pace (phase 4b)
+    "routing_pace_order": ("switch", True,
+                           "With no priority set, list accounts by how soon their allowance runs out unused"),
+    "routing_priority_unconfirmed_warn_after": ("duration", 86400,
+                                                "Warn when a priority a conversation set is still unconfirmed "
+                                                "after (0: never)"),
     # Copy for cloud agents (phase 7)
     "routing_cloud_copy": ("switch", False, "Copy for cloud agents"),
     "routing_cloud_copy_hold_words": ("switch", False, "Include hold words in the copy"),
@@ -1200,6 +1206,36 @@ def _log_time(text: str) -> str | None:
     return _iso(dt)
 
 
+PRIORITY_MOST = 64  # entries one priority line can hold when read back; the writers refuse a repeat
+
+
+def _checked_entries(kind: str, entries) -> list[dict] | None:
+    """A priority line's ordered entries as Khipu writes them (each an
+    account key, the label it had, the owner's words for its role and an
+    end), in the order written; None when they are not (the line is
+    counted as unreadable)."""
+    if kind != "priority_set" or not isinstance(entries, list) or len(entries) > PRIORITY_MOST:
+        return None
+    out = []
+    for item in entries:
+        if not isinstance(item, dict) or not isinstance(item.get("account"), str) or not item["account"]:
+            return None
+        entry: dict[str, Any] = {"account": _no_surrogates(item["account"])}
+        for field in ("label", "role"):
+            value = item.get(field)
+            if value is not None and not isinstance(value, str):
+                return None
+            entry[field] = _no_surrogates(value) if value else None
+        until = item.get("until")
+        if until is not None:
+            until = _log_time(until) if isinstance(until, str) else None
+            if until is None:
+                return None
+        entry["until"] = until
+        out.append(entry)
+    return out
+
+
 def _checked(data: dict) -> dict | None:
     """The event Khipu folds from one parsed line: only the fields Khipu
     writes, each of the type Khipu writes it with, text with any lone
@@ -1241,6 +1277,11 @@ def _checked(data: dict) -> dict | None:
         if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
             return None
         out["used_pct"] = used
+    if "entries" in data:
+        entries = _checked_entries(out["type"], data["entries"])
+        if entries is None:
+            return None
+        out["entries"] = entries
     by = data.get("written_by")
     if by is not None:
         if not isinstance(by, dict) or not all(v is None or isinstance(v, str) for v in by.values()):
@@ -1779,6 +1820,64 @@ def _lane_mapped(runner, lane, lane_map: dict) -> bool:
     return isinstance(lanes, dict) and isinstance(lane, str) and lane in lanes
 
 
+def _priority_now(held: dict, now: datetime, labels: dict, in_settings: dict,
+                  known_keys: set) -> tuple[list[dict], list[str]]:
+    """(the entries of a priority still in effect at ``now``, in the order
+    the owner gave them; the labels of those whose end has passed). Khipu
+    never reorders, ranks or fills in the list: an ended entry drops out and
+    the rest keep their places. An account the record no longer lists keeps
+    the label it was set with and is marked as not in Settings -> Models."""
+    active: list[dict] = []
+    ended: list[str] = []
+    whole = held.get("until")
+    for item in held["entries"]:
+        key = item["account"]
+        label = labels.get(key) or item.get("label") or _label_for_key(key)
+        until = _parse(item.get("until"))
+        if (until is not None and until <= now) or (whole is not None and whole <= now):
+            ended.append(label)
+            continue
+        if any(a["account"] == key for a in active):
+            continue  # an account named twice keeps its first place
+        configured = in_settings.get(key, key in known_keys if known_keys else not key.partition("|")[2])
+        active.append({"account": key, "label": label, "role": item.get("role"), "until": item.get("until"),
+                       "in_settings": bool(configured)})
+    return active, ended
+
+
+def _fold_priority(priority: dict | None, now: datetime, labels: dict, in_settings: dict,
+                   known_keys: set) -> tuple[dict | None, list[str]]:
+    """The owner's priority as the view shows it, and the labels of entries
+    whose end has passed (a change line names them). None once every entry
+    has ended: conversations then hear "No priority set"."""
+    if priority is None:
+        return None, []
+    active, ended = _priority_now(priority, now, labels, in_settings, known_keys)
+    if not active:
+        return None, ended
+    replaced = None
+    if priority["pending"] and priority.get("prior"):
+        held, _gone = _priority_now(priority["prior"], now, labels, in_settings, known_keys)
+        if held:
+            replaced = {"entries": held, "until": _iso(priority["prior"]["until"])}
+    by = priority["written_by"]
+    pending = priority["pending"]
+    return {"entries": active, "until": _iso(priority["until"]), "at": _iso(priority["at"]), "written_by": by,
+            "via": priority["via"], "pending": pending, "confirmed": not pending,
+            "pending_by": author_words(by, push=True) if pending else None,
+            "pending_author": by if pending else None, "owner_request": priority.get("owner_request"),
+            "replaced": replaced, "confirmed_at": _iso(priority.get("confirmed_at"))}, ended
+
+
+def _effective_priority(priority: dict) -> dict:
+    def rows(entries: list[dict]) -> list[list]:
+        return [[e["label"], e["role"], e["until"], e["in_settings"]] for e in entries]
+
+    replaced = priority.get("replaced")
+    return {"entries": rows(priority["entries"]), "until": priority["until"], "pending": priority["pending"],
+            "by": priority["pending_by"], "replaced": rows(replaced["entries"]) if replaced else None}
+
+
 def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
          extra: Iterable[dict] = (), sources: dict | None = None) -> dict:
     """The view of ``events`` (and of evidence from sources, ``extra``, in the
@@ -1796,6 +1895,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     holds: dict[str, dict] = {}
     rules: dict[int, dict] = {}
     note: dict | None = None
+    priority: dict | None = None
     seed: dict | None = None
     reset_checks: dict[tuple[str, str, str | None, str | None], dict] = {}
     # The newest written change to each entity (an owner's pause, lift,
@@ -1930,6 +2030,24 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             note = {"text": event["text"], "at": info["at"], "written_by": info["written_by"], "via": info["via"]}
         elif kind == "note_end":
             note = None
+        elif kind == "priority_set" and isinstance(event.get("entries"), list):
+            pending = bool(event.get("pending"))
+            new = {"entries": event["entries"], "until": info["until"], "at": info["at"],
+                   "written_by": info["written_by"], "via": info["via"], "pending": pending,
+                   "owner_request": event.get("owner_request") if pending else None, "prior": None}
+            if pending:
+                # Undo brings back what the owner last had: a second request
+                # before he answers keeps the priority the first replaced.
+                new["prior"] = priority["prior"] if priority and priority["pending"] else priority
+            priority = new
+        elif kind == "priority_confirm" and priority is not None and priority["pending"]:
+            # Confirmed, it is the owner's: his write, through the app or a typed yes.
+            priority = dict(priority, pending=False, prior=None, confirmed_at=info["at"],
+                            written_by=info["written_by"], via=info["via"])
+        elif kind == "priority_undo" and priority is not None and priority["pending"]:
+            priority = priority["prior"]
+        elif kind == "priority_clear":
+            priority = None
         elif kind == "seed_import":
             seed = {"at": _iso(info["at"]), "file": event.get("file"), "count": event.get("count")}
     evidence.extend(dict(item, seq=item.get("seq", -1)) for item in extra)
@@ -2012,12 +2130,17 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                     for _n, r in sorted(rules.items()) if not r["retired"]]
     note_out = None if note is None else {"text": note["text"], "at": _iso(note["at"]),
                                           "written_by": note["written_by"], "via": note["via"]}
+    labels = {e["key"]: e["label"] for e in entries}
+    in_settings = {e["key"]: e["configured"] for e in entries}
+    priority_out, priority_ended = _fold_priority(priority, now, labels, in_settings, known_keys)
 
     # Owner writes in effect that did not come from the app (a convention;
     # doctor warns). Seeded rules carry their own "seeded" mark instead.
     outside_app = []
     if note is not None and note["via"] != "app":
         outside_app.append("note")
+    if priority_out is not None and not priority_out["pending"] and priority_out["via"] != "app":
+        outside_app.append("priority")
     outside_app += [f"rule {r['n']}" for r in active_rules
                     if r["written_by"].get("kind") == "owner" and r["via"] != "app"]
     outside_app += [f"pause of {e['label']}" for e in entries
@@ -2047,6 +2170,11 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     times += [p["until"] for p in owner["pauses"].values() if p["until"] is not None]
     times += [_parse(h["until"]) for h in active_holds if h["until"]]
     times += reminders
+    # Each end in the priority (and in the one a pending request replaced,
+    # which Undo brings back) is a change the clock makes.
+    for held in (priority, (priority or {}).get("prior")):
+        if held:
+            times += [held["until"], *(_parse(e.get("until")) for e in held["entries"])]
     for entry in entries:
         due = reset_check_due(entry, now, cfg)
         if due is not None:
@@ -2067,6 +2195,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                       for r in active_rules})
     if note_out is not None:
         effective["note"] = {"text": note_out["text"]}
+    if priority_out is not None:
+        effective["priority"] = _effective_priority(priority_out)
     effective.update({f"lane:{u['runner']}/{u['lane']}": {"state": u["state"], "until": u["until"],
                                                           "basis": u["basis"]} for u in lanes})
     for runner in (sources or {}).get("runners") or []:
@@ -2076,7 +2206,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     if table is not None:
         effective["table"] = {"hash": table.get("hash"), "error": bool(table.get("error"))}
     return {"accounts": entries, "holds": active_holds, "rules": active_rules, "note": note_out,
-            "unmatched": lanes, "outside_app": outside_app, "seed": seed, "sources": sources,
+            "priority": priority_out, "priority_ended": priority_ended, "unmatched": lanes, "outside_app": outside_app, "seed": seed, "sources": sources,
             "valid_until": _iso(min(future)) if future else None, "effective": effective,
             "causes": {k: dict(c, at=_iso(c["at"])) for k, c in causes.items()}}
 
@@ -2583,6 +2713,8 @@ def _touched(kind: str | None, event: dict, info: dict) -> str | None:
         return f"rule:{event['n']}"
     if kind in ("note_set", "note_end"):
         return "note"
+    if kind in ("priority_set", "priority_confirm", "priority_undo", "priority_clear"):
+        return "priority"
     return None
 
 
@@ -2733,7 +2865,7 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
     if record and saved and body["effective"] != prev_effective:
         version += 1
         changed = sorted(set(body["effective"]) | set(prev_effective),
-                         key=lambda k: ({"rule": 0, "note": 1, "account": 2, "lane": 3, "runner": 4, "table": 5, "hold": 6}.get(
+                         key=lambda k: ({"rule": 0, "note": 1, "priority": 1, "account": 2, "lane": 3, "runner": 4, "table": 5, "hold": 6}.get(
                              k.partition(":")[0], 5), k))
         changed = [k for k in changed if body["effective"].get(k) != prev_effective.get(k)]
         view_for_lines = dict(body, version=version)
@@ -2783,7 +2915,7 @@ def _change_item(entity: str, body: dict, prev_effective: dict, causes: dict | N
             source, author, via = "owner", (latest or {}).get("written_by") or OWNER, (latest or {}).get("via")
         else:
             source, author, via = w.get("source"), w.get("written_by"), w.get("via")
-    elif kind in ("hold", "rule") or entity == "note":
+    elif kind in ("hold", "rule") or entity in ("note", "priority"):
         if cause is not None:
             author, via = cause.get("written_by"), cause.get("via")
         if kind == "rule" and item["now"] is None:
@@ -3418,6 +3550,121 @@ def dismiss_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
     return dict(_owner_write({"type": "rule_dismiss", "n": rule["n"]}, via), n=rule["n"])
 
 
+# ---- the owner's priority (phase 4b) -----------------------------------------------------
+#
+# The owner's stated order of accounts, each with his words for its role and
+# an optional end. Khipu keeps it and reports it word for word, first after
+# the rules and the note; it never computes, reorders, fills in or enforces
+# it. A conversation sets it only at the owner's request, marked unconfirmed;
+# confirming, undoing and clearing are the owner's.
+
+
+def _priority_entries(raw, *, now: datetime, conversation: bool) -> list[dict]:
+    """The ordered entries a write stores, in the order given: each account
+    resolved to its key (a conversation names one by its label or its id),
+    the label it has now, the role in one line and the end as a time. An
+    account named twice is refused, never merged or moved."""
+    known = accounts()
+    if not isinstance(raw, list) or not raw:
+        raise RouteError("a priority names at least one account, in order; to remove it, clear it")
+    if len(raw) > PRIORITY_MOST:
+        raise RouteError(f"a priority holds at most {PRIORITY_MOST} entries")
+    out: list[dict] = []
+    for i, item in enumerate(raw, 1):
+        if isinstance(item, str):
+            item = {"account": item}
+        if not isinstance(item, dict) or set(item) - {"account", "role", "until"}:
+            raise RouteError(f"priority entry {i} takes account, role and until")
+        name = item.get("account")
+        if not isinstance(name, str) or not name.strip():
+            raise RouteError(f"priority entry {i} needs its account")
+        key = _account_for_a_conversation(name, known) if conversation else resolve_account(name, known)
+        label = _label_of(key, known)
+        if any(e["account"] == key for e in out):
+            raise RouteError(f"{label} is named twice; each account has one place in the priority")
+        role = item.get("role")
+        if role is not None and not isinstance(role, str):
+            raise RouteError(f"priority entry {i}: the role must be words")
+        role = (_clean(role, 0) if conversation else _one_line(role)) if role else ""
+        until = item.get("until")
+        end = None
+        if until is not None and str(until).strip():
+            end = parse_until(str(until), now)
+            if end <= now:
+                raise RouteError(f"priority entry {i}: its end must be in the future")
+        out.append({"account": key, "label": label, "role": role or None, "until": _iso(end)})
+    return out
+
+
+def _priority_until(until, now: datetime) -> str | None:
+    if until is None or not str(until).strip():
+        return None
+    end = parse_until(str(until), now)
+    if end <= now:
+        raise RouteError("the priority's end must be in the future")
+    return _iso(end)
+
+
+def set_priority(entries, *, until=None, via: str, now: datetime | None = None) -> dict:
+    """The owner's priority, as given: confirmed, and in place of any
+    request still waiting for him."""
+    now = now or _now()
+    rows = _priority_entries(entries, now=now, conversation=False)
+    out = _owner_write({"type": "priority_set", "entries": rows, "until": _priority_until(until, now)}, via)
+    return dict(out, entries=[e["label"] for e in rows])
+
+
+def request_priority(entries, *, until=None, owner_request: str | None = None, author: dict | None = None,
+                     via: str = "mcp", now: datetime | None = None) -> dict:
+    """A priority a conversation sets at the owner's request: live at once,
+    marked with that conversation and unconfirmed, with the priority it
+    replaced kept for Undo. A request waiting from another conversation is
+    the owner's to answer first, as with a standing rule."""
+    now = now or _now()
+    request_words = _one_line(owner_request)
+    if not request_words:
+        raise RouteError("describe the owner's request in one line")
+    rows = _priority_entries(entries, now=now, conversation=True)
+    end = _priority_until(until, now)
+    by = dict(author or conversation_author())
+    if by.get("kind") != "conversation":
+        by = conversation_author()
+    with _lock():
+        held = read_view(now).get("priority")
+        if held and held.get("pending") and not _same_author(held.get("pending_author"), by):
+            raise RouteError("the priority already has an unconfirmed change from another conversation; the owner "
+                             "confirms or undoes it in Settings → Routing first")
+        written, view = _write({"type": "priority_set", "entries": rows, "until": end, "pending": True,
+                                "owner_request": _clean(request_words, 0), "written_by": by, "via": via})
+    return dict(_done(written, view), entries=[e["label"] for e in rows])
+
+
+def _held_priority(now: datetime | None, *, pending: bool | None = None) -> dict:
+    held = read_view(now).get("priority")
+    if held is None:
+        raise RouteError("there is no priority set")
+    if pending is True and not held.get("pending"):
+        raise RouteError("the priority is already yours: nothing is waiting for your confirmation")
+    return held
+
+
+def confirm_priority(*, via: str, now: datetime | None = None) -> dict:
+    _held_priority(now, pending=True)
+    return _owner_write({"type": "priority_confirm"}, via)
+
+
+def undo_priority(*, via: str, now: datetime | None = None) -> dict:
+    """Put back the priority a conversation's request replaced (none, when
+    there was none)."""
+    _held_priority(now, pending=True)
+    return _owner_write({"type": "priority_undo"}, via)
+
+
+def clear_priority(*, via: str, now: datetime | None = None) -> dict:
+    _held_priority(now)
+    return _owner_write({"type": "priority_clear"}, via)
+
+
 # ---- words ----------------------------------------------------------------------------
 
 
@@ -3606,6 +3853,230 @@ def note_line(note: dict, now: datetime) -> str:
     return f"Note from the owner ({_clock(at, now) if at else '?'}): {note['text']}"
 
 
+# ---- plan facts and spend pace (phase 4b) --------------------------------------------------
+#
+# Arithmetic on figures plan usage already read (the usage cache), never a
+# choice: what is left of each account's longest window, the time until it
+# resets, and the even pace that would use it all by then. An account whose
+# figures can't be read says so and gets no pace, never a guess.
+
+# The pace counts as "a lot left, little time" from this many times the
+# window's own even pace (100% over its whole length); below it, "plenty of time".
+PACE_HURRY = 1.5
+_WINDOW_MINUTES = {"five_hour": 300, "daily": 1440, "weekly": 10080}
+# Figures older than this are shown with their age.
+_FIGURES_AGE_SHOWN = 3600
+
+
+def _window_minutes(window: dict) -> int | None:
+    mins = window.get("window_mins")
+    if isinstance(mins, int) and not isinstance(mins, bool) and mins > 0:
+        return mins
+    name = str(window.get("name") or "")
+    if name in _WINDOW_MINUTES:
+        return _WINDOW_MINUTES[name]
+    if name.startswith("weekly_"):
+        return _WINDOW_MINUTES["weekly"]
+    match = re.fullmatch(r"(\d+)_min", name)
+    return int(match.group(1)) if match and int(match.group(1)) > 0 else None
+
+
+def _longest_window(row: dict, now: datetime) -> dict | None:
+    """The row's longest window still in force (a figure, and a reset time
+    still ahead): a window whose reset has passed has started again, so its
+    figure no longer says anything. The whole account's window before a
+    model's of the same length."""
+    best, best_key = None, None
+    for window in row.get("windows") or []:
+        if not isinstance(window, dict):
+            continue
+        used = window.get("used_pct")
+        resets = _parse(window.get("resets_at"))
+        mins = _window_minutes(window)
+        if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
+            continue
+        if resets is None or resets <= now or mins is None:
+            continue
+        key = (mins, not window.get("model"))
+        if best_key is None or key > best_key:
+            best, best_key = window, key
+    return best
+
+
+def plan_fact(row: dict | None, now: datetime) -> dict:
+    """One account's plan figures as facts: ``readable`` with its longest
+    window, how much of it is used and left, when it resets and the pace
+    that would use the rest by then; or not, with why in plain words."""
+    from khipu import usage
+
+    if not isinstance(row, dict):
+        return {"readable": False, "why": "plan figures not read yet"}
+    error = row.get("error") if not row.get("ok") else row.get("live_error")
+    if error in (usage.E_SIGNIN, usage.E_NO_LIMITS):
+        return {"readable": False, "why": "plan figures can't be read: sign in again", "error": error}
+    if not row.get("ok"):
+        if error == usage.E_NOT_INSTALLED:
+            return {"readable": False, "why": "plan figures can't be read: its CLI is not installed", "error": error}
+        return {"readable": False, "why": "plan figures can't be read just now", "error": error}
+    window = _longest_window(row, now)
+    if window is None:
+        return {"readable": False, "why": "its plan reports no window with a reset time ahead"}
+    used = min(100.0, max(0.0, float(window["used_pct"])))
+    used = math.floor(used * 10 + 0.5) / 10
+    left = round(100.0 - used, 1)
+    resets = _parse(window["resets_at"])
+    seconds = (resets - now).total_seconds()
+    pace = left / (seconds / 3600)
+    even = 100.0 / (_window_minutes(window) / 60)
+    if left <= 0:
+        words = "nothing left until it resets"
+    else:
+        words = "a lot left, little time" if pace >= even * PACE_HURRY else "plenty of time"
+    fact = {"readable": True, "window": usage._window_words(window), "used_pct": used, "left_pct": left,
+            "resets_at": _iso(resets), "seconds": int(seconds), "pace_pct_per_hour": round(pace, 3),
+            "hurry": left > 0 and pace >= even * PACE_HURRY, "words": words}
+    figures_at = _parse(row.get("observed_at") or row.get("probed_at"))
+    if figures_at is not None and (now - figures_at).total_seconds() > _FIGURES_AGE_SHOWN:
+        fact["figures_at"] = _iso(figures_at)
+    return fact
+
+
+def plan_facts(view: dict, now: datetime) -> dict[str, dict]:
+    """``plan_fact`` for each account the view holds, from the usage cache
+    (read once; nothing is probed)."""
+    from khipu import usage
+
+    try:
+        rows = usage._load_cache()
+    except Exception:  # noqa: BLE001 - a cache that can't be read is "not read yet", never a failed summary
+        rows = {}
+    out = {}
+    for entry in view.get("accounts") or []:
+        try:
+            out[entry["key"]] = plan_fact(rows.get(entry["key"]), now)
+        except Exception:  # noqa: BLE001 - one hand-edited row costs its own figures, never the summary
+            out[entry["key"]] = {"readable": False, "why": "plan figures can't be read just now"}
+    return out
+
+
+def _rate_words(pace: float) -> str:
+    if pace >= 10:
+        return f"{pace:.0f}"
+    if pace >= 0.1:
+        return f"{round(pace, 1):g}"
+    return f"{round(pace, 2):g}" if pace >= 0.01 else "less than 0.01"
+
+
+def _figures_age(fact: dict, now: datetime) -> str:
+    at = _parse(fact.get("figures_at"))
+    return f" (figures from {_ago(at, now)})" if at else ""
+
+
+def pace_words(fact: dict, now: datetime) -> str:
+    """'88% of its week left, resets Sat 15:00Z (2 d 4 h): about 1.7% an hour
+    to use it all; a lot left, little time', or why there is no pace."""
+    if not fact.get("readable"):
+        return fact.get("why") or "plan figures can't be read"
+    resets = _parse(fact["resets_at"])
+    text = (f"{fact['left_pct']:g}% of its {fact['window']} left, resets {_clock(resets, now)} "
+            f"({_span(fact['seconds'])})")
+    if fact["left_pct"] <= 0:
+        text += ": nothing left to use until then"
+    else:
+        text += f": about {_rate_words(fact['pace_pct_per_hour'])}% an hour to use it all; {fact['words']}"
+    return text + _figures_age(fact, now)
+
+
+def used_words(fact: dict, now: datetime) -> str:
+    """'12% of its week used, resets in 2 d 4 h', or why there are no figures."""
+    if not fact.get("readable"):
+        return fact.get("why") or "plan figures can't be read"
+    return f"{fact['used_pct']:g}% of its {fact['window']} used, resets in {_span(fact['seconds'])}" \
+        + _figures_age(fact, now)
+
+
+def _state_fact(entry: dict, now: datetime, relative: bool) -> str:
+    """An account's state in a few words, for a priority entry."""
+    until = _parse(entry.get("until"))
+    when = (f"{_clock(until, now)}, {_remaining(until, now)}" if relative else _clock(until, now)) if until else ""
+    state = entry.get("state")
+    if state == LIMITED:
+        return f"limited until {'about ' if entry.get('basis') == 'estimated' else ''}{when}" if until else "limited"
+    if state == PAUSED:
+        return f"paused by you until {when}" if until else "paused by you"
+    if state == DOWN:
+        return f"down: {entry.get('reason') or 'out of service'}"
+    return {OPEN: "open", PROBABLY_OPEN: "probably open"}.get(state, "unknown")
+
+
+def _priority_items(entries: list[dict], now: datetime, *, theirs: bool, view: dict | None,
+                    facts: dict | None, relative: bool) -> list[str]:
+    by_key = {a["key"]: a for a in (view or {}).get("accounts") or []}
+    out = []
+    for i, item in enumerate(entries, 1):
+        text = f"{i}. {item['label']}"
+        if not item.get("in_settings", True):
+            text += " (not in Settings → Models)"
+        until = _parse(item.get("until"))
+        if until is not None:
+            text += f", until {_clock(until, now)}" + (f", {_remaining(until, now)}" if relative else "")
+        if item.get("role"):
+            # A conversation's words are quoted, so a role can't read as more
+            # entries of the list; the owner's are his, word for word.
+            text += f": “{their_words(item['role'])}”" if theirs else f": {item['role']}"
+        if facts is not None:
+            said = []
+            entry = by_key.get(item["account"])
+            if entry is not None:
+                said.append(_state_fact(entry, now, relative))
+            fact = facts.get(item["account"])
+            if fact is not None and (fact.get("readable") or entry is not None):
+                said.append(used_words(fact, now))
+            if said:
+                text += f" ({'; '.join(said)})"
+        out.append(text)
+    return out
+
+
+def priority_line(priority: dict, now: datetime, *, view: dict | None = None, facts: dict | None = None,
+                  relative: bool = True) -> str:
+    """The owner's priority in one line, in his order and his words, never
+    clipped: 'Your priority (your words; guidance, not a gate): 1. Claude
+    second, until Sat 15:00Z: all Claude work first (open; 12% of its week
+    used, resets in 2 d 4 h); 2. Codex: cross-family reviews.' With ``facts``
+    each entry carries what Khipu read about that account, never a
+    judgement. A priority a conversation set says so, with the one it
+    replaced."""
+    pending = bool(priority.get("pending"))
+    if pending:
+        head = (f"Your priority (set by {priority.get('pending_by') or 'a conversation'} at the owner's request; "
+                "the owner has not confirmed it yet; guidance, not a gate")
+    else:
+        head = "Your priority (your words; guidance, not a gate"
+    until = _parse(priority.get("until"))
+    if until is not None:
+        head += f"; until {_clock(until, now)}" + (f", {_remaining(until, now)}" if relative else "")
+    items = _priority_items(priority["entries"], now, theirs=pending, view=view, facts=facts, relative=relative)
+    text = f"{head}): " + "; ".join(items) + "."
+    if pending:
+        replaced = priority.get("replaced")
+        if replaced:
+            old = _priority_items(replaced["entries"], now, theirs=False, view=None, facts=None, relative=relative)
+            text += " It replaced: " + "; ".join(old) + "."
+        else:
+            text += " It replaced: no priority."
+    return text
+
+
+def priority_change_line(view: dict, now: datetime, *, facts: dict | None = None, relative: bool = True) -> str:
+    """What changed in the priority: each entry whose end has passed, then
+    the priority as it stands, or "No priority set"."""
+    ended = [f"Priority on {label} ended." for label in view.get("priority_ended") or []]
+    held = view.get("priority")
+    now_line = priority_line(held, now, view=view, facts=facts, relative=relative) if held else "No priority set."
+    return " ".join([*ended, now_line])
+
+
 def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | None = None) -> str:
     """The plain change line for one entity in a new version: its current
     state, with absolute times only (it is stored)."""
@@ -3623,6 +4094,8 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
         return f"Standing rule {rule_line(rule)}" if rule else f"Standing rule {ident} retired"
     if entity == "note":
         return note_line(view["note"], now) if view.get("note") else "The owner's note ended"
+    if entity == "priority":
+        return priority_change_line(view, now, relative=False)
     if kind == "lane":
         runner, _, lane = ident.partition("/")
         item = next((u for u in view["unmatched"] if u["runner"] == runner and u["lane"] == lane), None)
@@ -3663,6 +4136,10 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         whole += [rule_line(r) for r in view["rules"]]
     if view.get("note"):
         whole.append(note_line(view["note"], now))
+    facts = plan_facts(view, now) if view.get("record") else {}
+    # The owner's priority, whole and before every account line (phase 4b).
+    if view.get("priority"):
+        whole.append(priority_line(view["priority"], now, view=view, facts=facts))
     lines += whole
     rules_note_chars = sum(len(line) + 1 for line in whole)
     dropped = 0
@@ -3674,13 +4151,27 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         # Lines after the rules and the note that are never dropped: they
         # count against the budget like any other (only rules and note don't).
         fixed = [line for line in (table_precedence(sources.get("table"), now),) if line]
+        accounts_in_order = list(view["accounts"])
+        if not view.get("priority") and cfg["routing_pace_order"] and any(
+                f.get("readable") for f in facts.values()):
+            # Arithmetic, not a choice: the account whose allowance would run
+            # out unused soonest first; the owner's priority, when he sets
+            # one, comes first instead and is never reordered.
+            fixed.append("Accounts by how soon their allowance runs out unused (Khipu's arithmetic, not your "
+                         "priority):")
+            accounts_in_order.sort(key=lambda e: -(facts.get(e["key"]) or {}).get("pace_pct_per_hour", -1.0))
         lines += fixed
         items: list[tuple[str, str, str]] = []  # (kind, line, at) in display order
         items += [("account", _clip(runner_line(r, now), width), "") for r in sources.get("runners") or []
                   if r.get("silent") or r.get("unreadable")]
-        for entry in view["accounts"]:
-            items.append(("open" if entry["state"] == OPEN else "account",
-                          _clip(account_line(entry, now), width), ""))
+        for entry in accounts_in_order:
+            # The pace is Khipu's own fixed words, added after the clip so a
+            # long account line never cuts it off.
+            line = _clip(account_line(entry, now), width)
+            fact = facts.get(entry["key"])
+            if fact is not None and entry.get("configured", True):
+                line += f"; {pace_words(fact, now)}"
+            items.append(("open" if entry["state"] == OPEN else "account", line, ""))
         items += [("lane", _clip(lane_line(u, now), width), "") for u in view.get("unmatched") or []]
         items += [("hold", _clip(hold_line(h, now), width), h["at"]) for h in view.get("holds") or []]
         limit = cfg["routing_summary_chars"]
@@ -3794,7 +4285,9 @@ def doctor_block(now: datetime | None = None) -> dict:
             warnings.append("The routing summary is too long to arrive at session start; conversations get a "
                             "line telling them to call khipu_route instead. Shorten the rules or the note.")
     if view.get("outside_app"):
-        warnings.append("A rule, a pause, a clear or your note was written by something other than the app.")
+        warnings.append("A rule, a pause, a clear, your note or your priority was written by something other than "
+                        "the app.")
+    warnings += _priority_warnings(view, now, cfg)
     if any(r.get("pending") for r in view.get("rules") or []):
         warnings.append("One or more standing rules were added or changed at the owner's request and still need confirmation.")
     if view.get("seed_error"):
@@ -3847,7 +4340,11 @@ def doctor_block(now: datetime | None = None) -> dict:
                         "went without their routing lines until a later prompt. Raise the time allowed before "
                         "a prompt in Settings \u2192 Routing, or see whether the Mac is busy.")
     pending_rules = sum(1 for r in view.get("rules") or [] if r.get("pending"))
-    return {"record": bool(view.get("record")), "version": view["version"], "folded_at": view.get("folded_at"),
+    held = view.get("priority")
+    return {"priority": {"set": held is not None, "pending": bool(held and held.get("pending")),
+                         "entries": [e["label"] for e in (held or {}).get("entries") or []],
+                         "line": priority_line(held, now, view=view) if held else None},
+            "record": bool(view.get("record")), "version": view["version"], "folded_at": view.get("folded_at"),
             "prompt_budget": budget,
             "valid_until": view.get("valid_until"),
             "accounts": [{"account": e["label"], "state": e["state"], "until": e["until"], "basis": e["basis"],
@@ -3860,6 +4357,28 @@ def doctor_block(now: datetime | None = None) -> dict:
             "note": view.get("note") is not None, "outside_app": view.get("outside_app") or [],
             "seed_error": view.get("seed_error"), "bad_lines": view.get("bad_lines", 0),
             "sources": _sources_brief(sources), "rule_checks": checks, "warnings": warnings}
+
+
+def _priority_warnings(view: dict, now: datetime, cfg: dict) -> list[str]:
+    """Doctor's lines about the owner's priority (phase 4b): set by a
+    conversation and unconfirmed for longer than the owner's setting, its
+    first account limited, paused or down, an account not in Settings."""
+    held = view.get("priority")
+    if not held:
+        return []
+    out = []
+    after = cfg["routing_priority_unconfirmed_warn_after"]
+    at = _parse(held.get("at"))
+    if held.get("pending") and after and at is not None and (now - at).total_seconds() > after:
+        out.append(f"Your priority was set by {held.get('pending_by') or 'a conversation'} at your request "
+                   f"{_ago(at, now)} and is not confirmed yet; confirm or undo it in Settings \u2192 Routing.")
+    first = held["entries"][0]
+    entry = next((a for a in view["accounts"] if a["key"] == first["account"]), None)
+    if entry is not None and entry["state"] in (LIMITED, PAUSED, DOWN):
+        out.append(f"The first account in your priority, {first['label']}, is {_state_fact(entry, now, True)}.")
+    out += [f"Your priority names {e['label']}, which isn't in Settings \u2192 Models." for e in held["entries"]
+            if not e.get("in_settings", True)]
+    return out
 
 
 def prompt_budget_block(cfg: dict | None = None) -> dict:
@@ -3938,6 +4457,12 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     # A pending rule's requester as the fold keeps it, for Khipu's own
     # same-conversation check; ``pending_by`` is its words.
     out["rules"] = [{k: v for k, v in r.items() if k != "pending_author"} for r in view.get("rules") or []]
+    # The owner's priority and each account's plan facts (phase 4b); the app
+    # words them itself, in local times.
+    if view.get("priority"):
+        out["priority"] = {k: v for k, v in view["priority"].items() if k != "pending_author"}
+    out["plan_facts"] = plan_facts(view, now)
+    out["pace_order"] = cfg["routing_pace_order"]
     # What the app's Routing card and attention items need beside the view
     # (phase 4): each watched rule's check, as doctor carries it, and the
     # two times the app words its warnings by.
@@ -4075,6 +4600,34 @@ def _public_account(entry: dict, now: datetime) -> dict:
     return out
 
 
+_PRIORITY_ENTRY_FIELDS = ("label", "role", "until", "in_settings")
+_FACT_FIELDS = ("readable", "why", "window", "used_pct", "left_pct", "resets_at", "seconds", "pace_pct_per_hour",
+                "hurry", "words", "figures_at")
+
+
+def _public_fact(fact: dict | None) -> dict | None:
+    return _pick(fact, _FACT_FIELDS)
+
+
+def _public_priority(view: dict, now: datetime, facts: dict) -> dict | None:
+    """The owner's priority as data for a conversation: each entry by its
+    label and its id, his words for its role, its end; whether the owner
+    confirmed it; and its line as the push gives it."""
+    held = view.get("priority")
+    if not held:
+        return None
+
+    def entries(rows: list[dict]) -> list[dict]:
+        return [dict(_pick(e, _PRIORITY_ENTRY_FIELDS), id=account_id(e["account"])) for e in rows]
+
+    replaced = held.get("replaced")
+    return {"entries": entries(held["entries"]), "until": held.get("until"), "confirmed": not held.get("pending"),
+            "pending": bool(held.get("pending")), "pending_by": held.get("pending_by"),
+            "owner_request": held.get("owner_request"), "at": held.get("at"), "via": held.get("via"),
+            "replaced": {"entries": entries(replaced["entries"]), "until": replaced.get("until")} if replaced else None,
+            "line": priority_line(held, now, view=view, facts=facts)}
+
+
 def _public_hold(hold: dict, now: datetime) -> dict:
     scope = hold.get("scope") if isinstance(hold.get("scope"), dict) else {}
     out = _pick(hold, _HOLD_FIELDS)
@@ -4187,7 +4740,8 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
         pairs = list(zip(out["entities"], out["lines"]))
         if key is not None:
             mine = {f"account:{key}"} | {f"hold:{i}" for i in _holds_on(key, view)}
-            pairs = [(e, line) for e, line in pairs if e in mine or e.startswith("rule:") or e == "note"]
+            pairs = [(e, line) for e, line in pairs
+                     if e in mine or e.startswith("rule:") or e in ("note", "priority")]
         return {"since": out["since"], "epoch": out["epoch"], "version": out["version"],
                 "complete": out["complete"], "entities": [_public_entity(e) for e, _line in pairs],
                 "lines": [line for _e, line in pairs], "about": ABOUT}
@@ -4196,7 +4750,10 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
     out["seed"] = _pick(view.get("seed"), ("at", "count"))
     out["rules"] = [_pick(r, _RULE_FIELDS) for r in view.get("rules") or []]
     out["note"] = _pick(view.get("note"), ("text", "at", "via"))
-    out["accounts"] = [_public_account(e, now) for e in view["accounts"] if key is None or e["key"] == key]
+    facts = plan_facts(view, now)
+    out["priority"] = _public_priority(view, now, facts)
+    out["accounts"] = [dict(_public_account(e, now), plan=_public_fact(facts.get(e["key"])))
+                       for e in view["accounts"] if key is None or e["key"] == key]
     out["sources"] = _public_sources(view.get("sources"))
     out["holds"] = [_public_hold(h, now) for h in view.get("holds") or []
                     if key is None or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)]
@@ -4217,7 +4774,9 @@ OWNER_ACTIONS = {"pause": "Pausing an account", "lift": "Lifting a pause", "clea
                  "end_note": "The owner's note", "rule": "A standing rule", "add_rule": "A standing rule",
                  "edit_rule": "A standing rule", "retire_rule": "A standing rule",
                  "confirm_rule": "A standing rule", "undo_rule": "A standing rule",
-                 "dismiss_rule": "A standing rule"}
+                 "dismiss_rule": "A standing rule", "priority": "The owner's priority",
+                 "set_priority": "The owner's priority", "confirm_priority": "The owner's priority",
+                 "undo_priority": "The owner's priority", "clear_priority": "The owner's priority"}
 OWNER_REFUSAL = ("{what} is the owner's to change: in the app (Settings \u2192 Routing) or on a terminal with "
                  "`khipu route`, which asks for a typed confirmation. A conversation can report what it "
                  "learned about an account and add or end its holds.")
@@ -4307,6 +4866,24 @@ def _conversation_write(args: dict, *, author: dict, now: datetime | None = None
     if not hold_id:
         raise RouteError("name the hold to end (hold_id, as khipu_route lists it)")
     return end_hold(hold_id, owner=False, author=by, via="mcp", now=now)
+
+
+def conversation_priority(entries, *, until=None, owner_request: str, author: dict,
+                          now: datetime | None = None, lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
+    """What MCP ``khipu_route_priority`` writes (``request_priority``), with
+    a conversation's fixed messages and lock budget, answered field by field:
+    each account by its label and its id, never its key."""
+    by = dict(author or {})
+    if by.get("harness") in (None, "", SHELL):
+        by["harness"] = UNKNOWN_HARNESS
+    with _for_a_conversation(), lock_budget(lock_wait):
+        written = request_priority(entries, until=until, owner_request=owner_request, author=by, via="mcp", now=now)
+        view = read_view(now)
+        held = _public_priority(view, now or _now(), plan_facts(view, now or _now()))
+        out = {k: written[k] for k in _WRITE_FIELDS if k in written}
+        out["priority"] = held
+        out["about"] = ABOUT
+        return out
 
 
 def light_status(now: datetime | None = None, *, lock_wait: float = LIGHT_LOCK_BUDGET,
@@ -4538,7 +5115,7 @@ def _change_group(entity: str, view: dict) -> int:
     sources gone dark (1), then reopenings (2), then holds (3), then the
     table pointer (4)."""
     kind, _, ident = entity.partition(":")
-    if kind == "rule" or entity == "note":
+    if kind == "rule" or entity in ("note", "priority"):
         return 0
     if kind == "account":
         entry = next((a for a in view["accounts"] if a["key"] == ident), None)
@@ -4564,6 +5141,20 @@ def _not_refreshed(view: dict, now: datetime, cfg: dict) -> str | None:
     return None
 
 
+def _priority_push(view: dict, now: datetime, *, changed: bool = False, changed_lines: dict | None = None) -> list[str]:
+    """The priority's line in a change push, whole and before the account
+    lines: in every push while a priority is set (with what Khipu read about
+    each account), and its end when it changed to none."""
+    if view.get("priority"):
+        facts = plan_facts(view, now)
+        if changed:
+            return [priority_change_line(view, now, facts=facts)]
+        return [priority_line(view["priority"], now, view=view, facts=facts)]
+    if changed and changed_lines is not None:
+        return [line for e, line in zip(changed_lines["entities"], changed_lines["lines"]) if e == "priority"]
+    return []
+
+
 def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = None,
                  stale: str | None = None) -> tuple[str, int]:
     """(the block, how many changes it names) for ``since``'s answer
@@ -4584,7 +5175,8 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
     # unrelated account.
     lines += [rule_line(r) for r in view.get("rules") or []
               if r.get("pending") and f"rule:{r['n']}" not in changed_rules]
-    lines += [line for group, _, line in ranked if group == 0]
+    lines += [line for group, e, line in ranked if group == 0 and changed["entities"][e] != "priority"]
+    lines += _priority_push(view, now, changed="priority" in changed["entities"], changed_lines=changed)
     others = [_clip(line, width) for group, _, line in ranked if group != 0]
 
     def overflow(n: int) -> str:
@@ -4633,7 +5225,8 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
             if stale and not said:
                 # Nothing changed, but the record has not been refreshed past its bound: one line, once.
                 text = "\n".join([CHANGES_HEADING.format(at=_clock(now, now)),
-                                  *[rule_line(r) for r in view.get("rules") or [] if r.get("pending")], stale])
+                                  *[rule_line(r) for r in view.get("rules") or [] if r.get("pending")],
+                                  *_priority_push(view, now), stale])
                 return dict(base, kind="changes", text=text, count=0, unrefreshed=view.get("checked_at"))
             return dict(base, kind="none", text=None, count=0)
         changed = since(seen, view, now=now, epoch=marker.get("epoch"))
@@ -4783,11 +5376,16 @@ def _print_view(view: dict, now: datetime, account: str | None) -> None:
             print(f"  {rule['n']}. {rule['text']}{mark}")
     if view.get("note"):
         print(note_line(view["note"], now))
+    facts = plan_facts(view, now)
+    if view.get("priority"):
+        print(priority_line(view["priority"], now, view=view, facts=facts))
     entries = [e for e in view["accounts"] if account is None or e["key"] == account]
     if entries:
         print("Accounts:")
     for entry in entries:
         print(f"  {account_line(entry, now, push=False)}")
+        if entry["key"] in facts and entry.get("configured", True):
+            print(f"      plan: {pace_words(facts[entry['key']], now)}")
         w = entry.get("witness") or {}
         if w.get("evidence"):
             print(f"      evidence: {w['evidence']}")
@@ -4861,6 +5459,55 @@ def _parse_since(raw) -> tuple[int, str | None]:
         return int(number), (epoch or None)
     except ValueError:
         raise RouteError("--since takes a version number, or epoch:version") from None
+
+
+def _priority_entries_arg(args) -> list:
+    """``--entries JSON`` (the app's form: ``[{"account", "role", "until"}]``)
+    or the accounts typed in order."""
+    if getattr(args, "entries", None) is not None:
+        try:
+            return _loads(args.entries)
+        except ValueError:
+            raise RouteError('--entries must be JSON: [{"account": "...", "role": "...", "until": "..."}]') from None
+    return list(args.accounts or [])
+
+
+def _priority_cli(args, now: datetime) -> int:
+    """``khipu route priority``: show it; set it at the owner's request (a
+    conversation, ``--at-owner-request``); or the owner's set, confirm, undo
+    and clear, after a typed yes or from the app."""
+    action = args.action or "show"
+    if action == "show":
+        view = read_view(now)
+        held = view.get("priority")
+        if args.json:
+            _print_json({"priority": _public_priority(view, now, plan_facts(view, now))})
+        else:
+            print(priority_line(held, now, view=view, facts=plan_facts(view, now)) if held else "No priority set.")
+        return 0
+    if getattr(args, "at_owner_request", None) is not None:
+        if action != "set":
+            raise RouteError("--at-owner-request is only for priority set: confirming, undoing and clearing are "
+                             "the owner's")
+        _print_json(request_priority(_priority_entries_arg(args), until=args.until,
+                                     owner_request=args.at_owner_request, author=conversation_author(),
+                                     via="cli", now=now))
+        return 0
+    via = _owner_via(args)
+    if via is None:
+        _print_json({"ok": False, "error": _REFUSED})
+        return 2
+    now = _now()
+    if action == "set":
+        out = set_priority(_priority_entries_arg(args), until=args.until, via=via, now=now)
+    elif action == "confirm":
+        out = confirm_priority(via=via, now=now)
+    elif action == "undo":
+        out = undo_priority(via=via, now=now)
+    else:
+        out = clear_priority(via=via, now=now)
+    _print_json(out)
+    return 0
 
 
 def run_cli(args) -> int:
@@ -4945,6 +5592,8 @@ def run_cli(args) -> int:
             _print_json(add_hold(" ".join(words), reason=args.reason, scope=scope, account=args.account,
                                  until=args.until, owner=owner_flag, via=via, now=now))
             return 0
+        if cmd == "priority":
+            return _priority_cli(args, now)
         if cmd == "rule" and getattr(args, "at_owner_request", None) is not None:
             # The rule's words are the positional words, as for the owner's
             # add and edit; the flag carries the owner's request.

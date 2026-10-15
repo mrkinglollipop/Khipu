@@ -80,6 +80,9 @@ const ERROR_PHRASE: Record<string, string> = {
   cli_error: "reported an error",
   internal_error: "Khipu could not run the check",
   pending: "first read still running",
+  not_configured: "not in the account list",
+  no_sign_in: "signs in from its own CLI",
+  sign_in_timeout: "sign-in not finished in time",
 };
 
 export function usageErrorPhrase(code: string | null | undefined): string {
@@ -397,6 +400,103 @@ export function usePlanUsage(active: unknown) {
 
 export type PlanUsageState = ReturnType<typeof usePlanUsage>;
 
+// ---------------------------------------------------------------------------
+// Whether Khipu can read each account, and signing in again from the app.
+// ---------------------------------------------------------------------------
+
+/** Whether Khipu can read the account now, in plain words: "Live: read 2 min
+ *  ago", "Signed in, but its plan figures can't be read", "Not signed in",
+ *  "CLI not installed". */
+export function liveWords(row: UsageAccount): { text: string; live: boolean } {
+  const code = row.ok === false ? row.error : row.live_error ?? null;
+  if (code === "not_installed") return { text: "CLI not installed", live: false };
+  if (code === "not_signed_in") return { text: "Not signed in", live: false };
+  if (code === "no_plan_limits") return { text: "Signed in, but its plan figures can't be read", live: false };
+  if (code === "pending") return { text: "Reading it for the first time", live: false };
+  if (row.ok === false) return { text: `Can't be read just now (${usageErrorPhrase(code)})`, live: false };
+  const age = fmtAgeSince(row.last_attempt_at || row.probed_at);
+  return { text: age ? `Live: read ${age} ago` : "Live", live: true };
+}
+
+/** The CLIs whose own login the app can start (`khipu.usage.SIGN_IN_ARGS`):
+ *  each opens the browser and asks nothing on a terminal. */
+const SIGN_IN_CLIS = new Set(["claude", "codex"]);
+const CLI_TITLE: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", muse: "Muse" };
+
+/** "button" when the app can start this account's own login, "elsewhere"
+ *  when the owner signs in from the CLI itself, null when it is live or its
+ *  CLI is not installed. */
+export function signInOffer(row: UsageAccount): "button" | "elsewhere" | null {
+  const { live } = liveWords(row);
+  const code = row.ok === false ? row.error : row.live_error ?? null;
+  if (live || code === "not_installed" || code === "pending" || code === "invalid_account") return null;
+  return SIGN_IN_CLIS.has(row.harness ?? "") ? "button" : "elsewhere";
+}
+
+type SignInAnswer = { ok?: boolean; error?: string; row?: UsageAccount };
+
+/** What the owner reads once a sign-in ends, from the account read just after. */
+export function signInOutcome(res: { ok: boolean; data?: SignInAnswer; refusal?: Record<string, unknown>; error?: string }): string {
+  const answer = (res.ok ? res.data : (res.refusal as SignInAnswer | undefined)) ?? {};
+  const after = answer.row ? liveWords(answer.row).text : null;
+  if (res.ok && answer.ok) return after ? `Signed in. ${after}.` : "Signed in.";
+  if (answer.error === "sign_in_timeout") {
+    return "Khipu stopped waiting after 15 minutes. Press Sign in again to start over.";
+  }
+  if (answer.error === "not_configured") return "That account is no longer in the list below, so Khipu didn't start a sign-in.";
+  if (after) return `The sign-in didn't finish. ${after}.`;
+  return `The sign-in didn't start: ${res.error ?? "Khipu couldn't run it"}.`;
+}
+
+/** The account's live words, and for one that is not live its Sign in
+ *  again button (or where to sign in). The button starts the account's own
+ *  login in its own login folder; the browser opens; Khipu reads the
+ *  account again when the login ends, and the card shows its new state. */
+export function AccountReach({ row, onSignedIn }: { row: UsageAccount; onSignedIn?: () => Promise<unknown> | void }) {
+  const [busy, setBusy] = useState(false);
+  const [said, setSaid] = useState<string | null>(null);
+  const live = liveWords(row);
+  const offer = signInOffer(row);
+  const name = row.account || row.harness || "this account";
+  const signIn = async () => {
+    if (busy) return;
+    setBusy(true);
+    setSaid(null);
+    try {
+      const res = await callCli<SignInAnswer>("khipu_account_sign_in", { harness: row.harness, home: row.home ?? null });
+      setSaid(signInOutcome(res));
+      await onSignedIn?.();
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <span className="plan-reach">
+      <Tag tone={live.live ? "ok" : "warn"} dot>
+        {live.text}
+      </Tag>
+      {offer === "button" ? (
+        <button type="button" className="sm" disabled={busy} aria-busy={busy || undefined}
+          aria-label={`Sign ${name} in again`} onClick={() => void signIn()}>
+          {busy ? <Loader2 size={14} className="spin" aria-hidden /> : null}
+          Sign in again
+        </button>
+      ) : offer === "elsewhere" ? (
+        <span className="meta">Sign in from {CLI_TITLE[row.harness ?? ""] ?? "its CLI"}</span>
+      ) : null}
+      {busy ? (
+        <span className="meta" role="status">
+          Finish signing in in your browser; Khipu reads the account again when you're done.
+        </span>
+      ) : said ? (
+        <span className="meta" role="status">
+          {said}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
 function Meter({ pct, label, tone }: { pct: number; label: string; tone: "err" | "warn" | null }) {
   const width = Math.min(100, Math.max(0, pct));
   return (
@@ -453,7 +553,7 @@ export function onlyResetWindows(row: UsageAccount, now: Date): boolean {
 
 /** One account on Home: its tightest window still in force as a bar, or why
  *  there is none. */
-function PlanRow({ row, now }: { row: UsageAccount; now: Date }) {
+function PlanRow({ row, now, onSignedIn }: { row: UsageAccount; now: Date; onSignedIn?: () => Promise<unknown> | void }) {
   const w = tightestWindow(row, now);
   const p = w ? pctOf(w) : null;
   const reset = w ? resetPhrase(w.resets_at, now) : null;
@@ -483,13 +583,14 @@ function PlanRow({ row, now }: { row: UsageAccount; now: Date }) {
         {row.ok !== false && row.live_error ? <Tag tone="warn">{usageErrorPhrase(row.live_error)}</Tag> : null}
         <StatusTags row={row} />
       </span>
+      <AccountReach row={row} onSignedIn={onSignedIn} />
     </ListRow>
   );
 }
 
 /** Home → Plans: one row per account, the tightest window of each. */
 export function PlansCard({ state }: { state: PlanUsageState }) {
-  const { data, error, loading, refreshing, refresh } = state;
+  const { data, error, loading, refreshing, refresh, reread } = state;
   const accounts = data?.accounts ?? [];
   const now = new Date();
   return (
@@ -513,7 +614,7 @@ export function PlansCard({ state }: { state: PlanUsageState }) {
       ) : (
         <>
           {accounts.map((row, i) => (
-            <PlanRow key={`${row.harness}|${row.home ?? ""}|${i}`} row={row} now={now} />
+            <PlanRow key={`${row.harness}|${row.home ?? ""}|${i}`} row={row} now={now} onSignedIn={reread} />
           ))}
           {error ? (
             <ListRow>
@@ -578,6 +679,9 @@ export function PlansSettingsCard({ state, active }: { state: PlanUsageState; ac
                   {row.home || "default login"}
                   {when ? ` · ${when}` : ""}
                 </span>
+              </div>
+              <div className="row-item">
+                <AccountReach row={row} onSignedIn={st.reread} />
               </div>
               {windows.length === 0 ? (
                 <div className="row-item">
