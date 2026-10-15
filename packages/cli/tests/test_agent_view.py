@@ -12,7 +12,12 @@ from __future__ import annotations
 
 import io
 import json
+import random
+import re
 import time
+import unicodedata
+
+from pathlib import Path
 
 import pytest
 
@@ -43,7 +48,7 @@ def owner(tmp_path, monkeypatch):
     monkeypatch.setattr(usage, "_command", lambda h: None)
     monkeypatch.setattr(ms, "_attach_prior_work", lambda *a: None)
     monkeypatch.setattr(ms, "_attach_contract", lambda *a: None)
-    monkeypatch.setattr(agent_view, "_OWNER_WORDS", set())
+    monkeypatch.setattr(agent_view, "_TABLE", {"sig": None, "at": 0.0, "table": None})
     return {"account": usage.configured_accounts()[0], "login": str(login), "home": str(home)}
 
 
@@ -346,7 +351,7 @@ def test_known_roots_with_spaces_are_scrubbed_whole(tmp_path, monkeypatch):
         for word in ("Home Dir", "Mem Root", "Run Ners", "Application Support", "Project Notes", "Lane One",
                      "someone", str(tmp_path)):
             assert word not in text, (word, text)
-    assert out[0] == "read a folder now"
+    assert out[0] == "read the home folder now"
 
 
 def test_the_table_is_built_once_per_record_version(owner, monkeypatch):
@@ -359,3 +364,148 @@ def test_the_table_is_built_once_per_record_version(owner, monkeypatch):
     assert builds == [1]
     agent_view.scrub("x", extra_keys=["claude|/elsewhere/.claude-z"])
     assert builds == [1, 1], "another set of accounts is another table"
+
+
+# ---- round 2: names matched exactly, invalid entries, owner words now -------------
+
+
+def _setup(tmp_path, monkeypatch, user: str, names: list[str], home=None):
+    """Accounts whose login folders are ``names`` under ``home``
+    (``tmp_path/Users/<user>`` by default), HOME set to that folder."""
+    home = home or tmp_path / "Users" / user
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    accounts = []
+    for i, name in enumerate(names):
+        (home / name).mkdir(parents=True, exist_ok=True)
+        accounts.append({"label": f"Acct {i}", "harness": "claude", "home": str(home / name)})
+    (data / "config.json").write_text(json.dumps({"usage_accounts": accounts}))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
+    monkeypatch.delenv(ms.GATEWAY_ACTIVE_ENV, raising=False)
+    monkeypatch.setattr(ms, "_GATEWAY_ACTIVE", False)
+    monkeypatch.setattr(ms, "_RELOAD_ON_CHANGE", False)
+    monkeypatch.setattr(usage, "_command", lambda h: None)
+    monkeypatch.setattr(agent_view, "_TABLE", {"sig": None, "at": 0.0, "table": None})
+    return home, usage.configured_accounts()
+
+
+def _forms_of(name: str) -> list[str]:
+    bare = name.lstrip(".")
+    return [name, bare, bare.upper(), bare.swapcase(), unicodedata.normalize("NFD", name), f"weekly_{bare}"]
+
+
+def _survivors(value, words: list[str]) -> list[tuple[str, str]]:
+    """(word, text) for each whole-word appearance of a word, in any case or
+    normal form: no letter or digit either side, in any script."""
+    found = []
+    for text in _strings(value):
+        folded = unicodedata.normalize("NFC", text).casefold()
+        for word in words:
+            w = unicodedata.normalize("NFC", word.lstrip(".")).casefold()
+            if re.search(rf"(?<![^\W_]){re.escape(w)}(?![^\W_])", folded):
+                found.append((word, text))
+    return found
+
+
+def _seed(home, accounts, user: str):
+    """Every account's name in a cached row's vendor fields and a failed
+    read, and in a conversation's report about it."""
+    rows = {}
+    for i, account in enumerate(accounts):
+        name = Path(account["home"]).name
+        forms = _forms_of(name)
+        if i % 2:
+            rows[usage._key(account)] = row(account, plan=forms[i % len(forms)], version=user.upper(),
+                                            windows=[{"name": f"weekly_{name.lstrip('.')}", "used_pct": 95,
+                                                      "model": forms[2], "window_mins": 10080,
+                                                      "resets_at": usage._iso(time.time() + 86400)}])
+        else:
+            rows[usage._key(account)] = row(account, ok=False, error=forms[1], live_error=forms[3],
+                                            note=f"{user} could not read {forms[4]}", windows=[])
+        routing.conversation_write({"action": "report", "state": "limited", "account": account["label"],
+                                    "until": "1h", "evidence": " and ".join(forms) + f" for {user}"},
+                                   author={"harness": "claude-code"})
+    usage._save_cache(rows)
+
+
+def _agent_surfaces(capsys) -> dict:
+    out = {"khipu_usage": call("khipu_usage")[1], "khipu_route": call("khipu_route")[1],
+           "summary": routing.summary(), "start push": routing.light_status(start=True),
+           "prompt push": routing.prompt_push(None, budget=5)}
+    payload: dict = {}
+    ms._attach_plan_warnings(payload)
+    out["khipu_status warnings"] = payload
+    assert cli.main(["route", "--summary"]) == 0
+    out["route --summary"] = capsys.readouterr().out
+    return out
+
+
+def test_hard_folder_names_and_a_short_user_name_never_reach_an_agent(tmp_path, monkeypatch, capsys):
+    names = [".Team Red", ".café-login", ".abc", ".xy"]
+    home, accounts = _setup(tmp_path, monkeypatch, "li", names)
+    _seed(home, accounts, "li")
+    for surface, out in _agent_surfaces(capsys).items():
+        assert _survivors(out, [*names, "li"]) == [], surface
+
+
+def test_an_invalid_entry_never_shows_any_part_of_its_path(tmp_path, monkeypatch):
+    # Khipu lowercases an entry's CLI, so HOME is given in lowercase too (the
+    # Mac's folders ignore case): the entry's path then starts with HOME
+    # exactly as written, the way it does under /tmp.
+    home, _ = _setup(tmp_path, monkeypatch, "probeuser", [])
+    home = Path(str(home).lower())
+    monkeypatch.setenv("HOME", str(home))
+    from khipu.config import config_file
+
+    config_file().write_text(json.dumps({"usage_accounts": [
+        {"harness": str(home / ".probe-login"), "home": "relative-folder"},
+        {"harness": "claude", "home": "~/Some Login/.zq-login"}]}))
+    err, out = call("khipu_usage")
+    assert not err
+    assert _survivors(out, ["probe-login", "relative-folder", "Some Login", "zq-login", "probeuser"]) == []
+    assert str(tmp_path).lower() not in str(out).lower()
+
+
+def test_an_ended_note_is_no_longer_kept(owner, monkeypatch):
+    routing.set_note(owner["login"], via="app")
+    assert owner["login"] in json.dumps(call("khipu_route")[1])
+    routing.end_note(via="app")
+    call("khipu_route")
+
+    def fail(**_kw):
+        raise ValueError(f"Provider failed at {owner['login']}")
+    monkeypatch.setattr(usage, "report", fail)
+    err, out = call("khipu_usage")
+    assert err and owner["login"] not in out["error"] and NAME not in out["error"], out
+
+
+def _random_name(rng: random.Random) -> str:
+    # Letters that never appear in an account id (hex) or Khipu's own words.
+    alphabet = "qxzjQXZJéøÅÉ"
+    word = lambda n: "".join(rng.choice(alphabet) for _ in range(n))  # noqa: E731
+    shape = rng.choice(["short", "space", "dots", "long"])
+    if shape == "short":
+        name = word(rng.randint(1, 3))
+    elif shape == "space":
+        name = f"{word(rng.randint(1, 4))} {word(rng.randint(1, 4))}"
+    elif shape == "dots":
+        name = f"{word(2)}.{word(rng.randint(1, 3))}"
+    else:
+        name = word(rng.randint(5, 12))
+    return ("." if rng.random() < 0.6 else "") + name
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_generated_folder_and_user_names_never_reach_an_agent(tmp_path, monkeypatch, capsys, seed):
+    rng = random.Random(seed)
+    names: list[str] = []
+    while len(names) < 3:
+        name = _random_name(rng)
+        if all(name.lstrip(".").casefold() != n.lstrip(".").casefold() for n in names):
+            names.append(name)
+    user = _random_name(rng).lstrip(".").replace(" ", "") or "qz"
+    home, accounts = _setup(tmp_path, monkeypatch, user, names)
+    _seed(home, accounts, user)
+    for surface, out in _agent_surfaces(capsys).items():
+        assert _survivors(out, [*names, user]) == [], (seed, surface, names, user)

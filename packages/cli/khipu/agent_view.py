@@ -16,11 +16,11 @@ scrub would alter what was remembered.
 
 One deliberate exception: the owner's note and his standing (confirmed, not
 pending) rules reach agents as he wrote them, paths included. They are his own
-words to agents, so callers pass them as ``keep`` (``keep_owner_words``) and
-they come through untouched wherever they appear. A rule a conversation
-proposed and the owner has not confirmed is not his words yet, and every hold
-(the owner's too: its line is clipped, so it can't be matched whole) is
-scrubbed like anything else.
+words to agents, so they pass through untouched: those in the record now
+(``keep_owner_words``, rebuilt whenever the record changes), never one he has
+ended. A rule a conversation proposed and the owner has not confirmed is not
+his words yet, and every hold (the owner's too: its line is clipped, so it
+can't be matched whole) is scrubbed like anything else.
 """
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Iterable
 
@@ -37,26 +38,31 @@ HOME_WORD = "the home folder"
 USER_WORD = "the user"
 FOLDER_WORD = "a folder"
 LOGIN_WORD = "a login folder"
-# Names too common to replace as words: a folder called ".claude" is the
-# default login, and "claude" is also the CLI's name in every line.
-_PLAIN_NAMES = {"claude", "codex", "grok", "muse", "cursor", "config", "home", "users", "logins", "root",
-                "user", "private", "tmp", "var", "volumes"}
-# A name is a whole word between letters and digits: "_" and "-" separate,
-# since a CLI's reply turns a name into "weekly_<name>".
-_NAME_EDGE = r"A-Za-z0-9"
+# Names never replaced as words: each CLI's own name (".claude" is the
+# default login, and "claude" is in every line), and the words the scrub
+# itself writes. Their paths are still replaced.
+_KEPT_NAMES = {"claude", "codex", "grok", "muse", "the", "a", "home", "folder", "user", "login"}
+# A private-looking path Khipu doesn't know: a "~/" path, or one under a
+# folder that holds people's or temp files. It ends at the first space.
 _PATHLIKE = re.compile(r"~/[^\s\"'`,;)\]}]*"
                        r"|(?<![\w.])/(?i:Users|home|private|tmp|var|Volumes|root)(?:/[^\s\"'`,;)\]}]*)?")
+_SEG = r"[^\s\"'`,;)\]}/]+"
+# After a known root, the path that follows it: inner segments may hold
+# spaces (a "/" follows them); the last ends at one.
+_TAIL = rf"(?:/{_SEG}(?:\s{_SEG})*(?=/))*(?:/[^\s\"'`,;)\]}}]*)?"
 # Each harness's login folder when none is configured: its key is "harness|".
 _DEFAULT_FOLDERS = {"claude": ".claude", "codex": ".codex", "grok": ".grok"}
-_OWNER_WORDS: set[str] = set()
-_OWNER_LOCK = threading.Lock()
+_LOCK = threading.Lock()
+
+
+def _fold(text: str) -> str:
+    return unicodedata.normalize("NFC", text).casefold()
 
 
 def keep_owner_words(view) -> list[str]:
     """The owner's note and each standing rule he confirmed, from a routing
-    view, as text to pass through untouched. Remembered for this process, so
-    a later scrub of the same words (the MCP boundary after routing's own)
-    keeps them too."""
+    view as it is now, as text to pass through untouched. Never remembered
+    beyond the call: a note he ended is no longer his words to agents."""
     words: list[str] = []
     if not isinstance(view, dict):
         return words
@@ -67,10 +73,6 @@ def keep_owner_words(view) -> list[str]:
         if isinstance(rule, dict) and not rule.get("pending") and isinstance(rule.get("text"), str) \
                 and rule["text"].strip():
             words.append(rule["text"])
-    with _OWNER_LOCK:
-        if len(_OWNER_WORDS) > 500:
-            _OWNER_WORDS.clear()
-        _OWNER_WORDS.update(words)
     return words
 
 
@@ -82,7 +84,15 @@ def _home_dir() -> str | None:
     return home.rstrip("/") if home and home not in ("~", "/") else None
 
 
-def _homes(extra_keys: Iterable[str] | None) -> list[tuple[str, str | None]]:
+def _saved_view() -> dict:
+    with contextlib.suppress(Exception):
+        from khipu import routing
+
+        return routing._load_view() or {}
+    return {}
+
+
+def _homes(extra_keys: Iterable[str] | None, view: dict) -> list[tuple[str, str | None]]:
     """Every (harness, login folder) Khipu knows: configured (invalid entries
     included), discovered Claude homes, the routing record's accounts, the
     caller's ``extra_keys`` ("harness|home") and each default login."""
@@ -99,12 +109,7 @@ def _homes(extra_keys: Iterable[str] | None) -> list[tuple[str, str | None]]:
         for found in claude_homes.discover():
             out.append(("claude", None if found.is_default else str(found.path)))
     keys = list(extra_keys or [])
-    if extra_keys is None:
-        with contextlib.suppress(Exception):
-            from khipu import routing
-
-            view = routing._load_view() or {}
-            keys += [a.get("key") for a in view.get("accounts") or [] if isinstance(a, dict)]
+    keys += [a.get("key") for a in view.get("accounts") or [] if isinstance(a, dict)]
     for key in keys:
         if isinstance(key, str) and "|" in key:
             harness, _, home = key.partition("|")
@@ -133,24 +138,17 @@ class _Id:
         return self._value
 
 
-def _forms(raw: str) -> set[str]:
-    """``raw`` as typed, expanded and resolved, and in its ~/ form."""
+def _forms(raw: str, home: str | None) -> set[str]:
+    """``raw`` as typed, expanded and resolved, in its ~/ form, each in NFC."""
     raw = raw.strip()
     forms = {raw.rstrip("/") or raw}
     with contextlib.suppress(Exception):
         expanded = os.path.expanduser(raw).rstrip("/")
-        forms.add(expanded)
-        forms.add(os.path.realpath(expanded).rstrip("/"))
-    home = _home_dir()
+        forms |= {expanded, os.path.realpath(expanded).rstrip("/")}
     if home:
-        for form in list(forms):
-            if form.startswith(home + "/"):
-                forms.add("~" + form[len(home):])
-        with contextlib.suppress(Exception):
-            real_home = os.path.realpath(home)
-            for form in list(forms):
-                if form.startswith(real_home + "/"):
-                    forms.add("~" + form[len(real_home):])
+        for base in {home, os.path.realpath(home)}:
+            forms |= {"~" + f[len(base):] for f in list(forms) if f.startswith(base + "/")}
+    forms |= {unicodedata.normalize("NFC", f) for f in forms}
     return {f for f in forms if len(f) > 1 and f not in ("~", "/")}
 
 
@@ -167,26 +165,30 @@ def _user_names(paths: Iterable[str]) -> set[str]:
         home = Path.home()
         if home.parent.name.lower() in ("users", "home"):
             names.add(home.name)
-    return {n for n in names if n and len(n) >= 3 and n.lower() not in _PLAIN_NAMES}
+    return {n for n in names if n.strip()}
 
 
-def _word(name: str) -> re.Pattern:
-    """``name`` as a whole word, any case, its parts joined by "-", "_", "."
-    or nothing ("probe-login", "probe_login", "probelogin"), a leading dot
-    included."""
-    parts = [re.escape(p) for p in re.split(rf"[^{_NAME_EDGE}]+", name) if p]
-    body = r"[-_.]?".join(parts) or re.escape(name)
-    return re.compile(rf"(?<![{_NAME_EDGE}.])\.?{body}(?![{_NAME_EDGE}])", re.I)
+class _Table:
+    """One scrub's replacements, built once per config and record version:
+    ``roots`` every known path (login folders, the home folder, volumes, the
+    memory root, configured folders) taken whole with the path after it;
+    ``names`` every login folder name and user name as a whole word; and the
+    owner's words as the saved record holds them now."""
+
+    __slots__ = ("roots", "root_to", "names", "name_to", "owner")
+
+    def __init__(self, roots, root_to, names, name_to, owner):
+        self.roots, self.root_to, self.names, self.name_to, self.owner = roots, root_to, names, name_to, owner
 
 
-def _rules(extra_keys: Iterable[str] | None = None) -> "_Table":
-    """The replacement table: literal paths longest first, word patterns and
-    the known roots with spaces."""
-    literal: dict[str, object] = {}  # each value a str or an _Id
-    folder_words: dict[str, object] = {}
-    paths: list[str] = []
+def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
+    view = _saved_view()
     home = _home_dir()
-    for harness, raw in _homes(extra_keys):
+    root_to: dict[str, object] = {}  # folded path -> an _Id or a word
+    name_to: dict[str, object] = {}  # folded name -> an _Id or USER_WORD
+    paths: list[str] = []
+    spelled: set[str] = set()  # names as written, beside their folded keys
+    for harness, raw in _homes(extra_keys, view):
         ident = _Id(harness, raw)
         if raw is None:
             folder = _DEFAULT_FOLDERS.get(harness)
@@ -194,64 +196,53 @@ def _rules(extra_keys: Iterable[str] | None = None) -> "_Table":
                 continue
             raw = os.path.join(home, folder)
         else:
-            name = Path(raw.rstrip("/")).name.lstrip(".")
-            if len(name) >= 4 and name.lower() not in _PLAIN_NAMES:
-                folder_words.setdefault(name, ident)
-        for form in _forms(raw):
-            literal.setdefault(form, ident)
+            name = unicodedata.normalize("NFC", Path(raw.rstrip("/")).name).lstrip(".").strip()
+            # The name as written, and as Khipu itself writes it into a
+            # window's name ("weekly_<slug>", usage.parse_claude).
+            for form in (name, re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")):
+                if form and _fold(form) not in _KEPT_NAMES:
+                    name_to.setdefault(_fold(form), ident)
+                    spelled.add(form)
+        for form in _forms(raw, home):
+            root_to.setdefault(_fold(form), ident)
             paths.append(form)
+    others: list[str] = []
     with contextlib.suppress(Exception):
         from khipu import routing
 
-        for path in routing._configured_paths():
-            literal.setdefault(path, FOLDER_WORD)
-            paths.append(path)
-    if home:
-        literal.setdefault(home, HOME_WORD)
-        paths.append(home)
-        with contextlib.suppress(Exception):
-            literal.setdefault(os.path.realpath(home).rstrip("/"), HOME_WORD)
-    words = [(_word(n), r) for n, r in sorted(folder_words.items(), key=lambda kv: -len(kv[0]))]
-    words += [(_word(n), USER_WORD) for n in sorted(_user_names(paths), key=len, reverse=True)]
-    any_word = re.compile("|".join(f"(?:{w.pattern})" for w, _r in words), re.I) if words else None
-    roots = _roots(paths, home)
-    return _Table(sorted(literal.items(), key=lambda kv: -len(kv[0])), words, any_word, roots)
-
-
-class _Table:
-    """One scrub's replacements, built once per config and record version."""
-
-    __slots__ = ("literal", "words", "any_word", "roots")
-
-    def __init__(self, literal, words, any_word, roots):
-        self.literal, self.words, self.any_word, self.roots = literal, words, any_word, roots
-
-
-def _roots(paths: list[str], home: str | None) -> re.Pattern | None:
-    """Known folders whose names may hold a space (the home folder, each
-    volume, the memory root, every configured folder), matched whole with
-    whatever path follows them: a generic path ends at the first space, so
-    "/Volumes/Shared Disk/x" would leave "Disk/x" behind."""
-    found = {p for p in paths if p.startswith("/")}
-    if home:
-        found.add(home)
+        others += routing._configured_paths()
     with contextlib.suppress(Exception):
-        found |= {os.path.join("/Volumes", n) for n in os.listdir("/Volumes")}
+        others += [os.path.join("/Volumes", n) for n in os.listdir("/Volumes")]
     with contextlib.suppress(Exception):
         from khipu.config import path_setting
 
         memory = path_setting("memory_root")
         if memory:
-            found.add(str(memory).rstrip("/"))
-    found = {f for f in found if " " in f}
-    if not found:
-        return None
-    alts = "|".join(re.escape(f) for f in sorted(found, key=len, reverse=True))
-    # Inner segments may hold spaces (a "/" follows them); the last ends at one.
-    return re.compile(rf"(?:{alts})(?:/{_SEG}(?:\s{_SEG})*(?=/))*(?:/[^\s\"'`,;)\]}}]*)?")
+            others.append(str(memory).rstrip("/"))
+    for path in others:
+        if len(path.rstrip("/")) > 1:
+            root_to.setdefault(_fold(path.rstrip("/")), FOLDER_WORD)
+            paths.append(path)
+    if home:
+        for form in {home, os.path.realpath(home)}:
+            root_to.setdefault(_fold(form), HOME_WORD)
+        root_to.setdefault("~", HOME_WORD)
+        paths.append(home)
+    for user in _user_names(paths):
+        if _fold(user) not in _KEPT_NAMES:
+            name_to.setdefault(_fold(user), USER_WORD)
+            spelled.add(unicodedata.normalize("NFC", user))
+    order = sorted(root_to, key=len, reverse=True)
+    alts = "|".join(re.escape(r) for r in order)
+    roots = re.compile(rf"(?:{alts})(?![^\s/\"'`,;)\]}}]){_TAIL}", re.I) if alts else None
+    # A name is a whole word: no letter or digit either side, in any script
+    # ("_" separates: a CLI's reply writes "weekly_<name>"), a leading dot
+    # included; matched in any case, as written and casefolded.
+    words = "|".join(re.escape(n) for n in sorted(set(name_to) | set(spelled), key=len, reverse=True))
+    names = re.compile(rf"(?<![^\W_])\.?(?:{words})(?![^\W_])", re.I) if words else None
+    return _Table(roots, [(r, root_to[r]) for r in order], names, name_to, keep_owner_words(view))
 
 
-_SEG = r"[^\s\"'`,;)\]}/]+"
 _TABLE_TTL_S = 60.0
 _TABLE: dict = {"sig": None, "at": 0.0, "table": None}
 
@@ -275,43 +266,46 @@ def _signature(extra_keys) -> tuple:
 
 
 def _table(extra_keys) -> _Table:
-    """The cached table, rebuilt when what it depends on changed or after
-    ``_TABLE_TTL_S`` (discovered logins can appear between record versions)."""
+    """The cached table, rebuilt when what it depends on changed (the owner's
+    words with it) or after ``_TABLE_TTL_S`` (discovered logins can appear
+    between record versions)."""
     try:
         sig = _signature(extra_keys)
     except Exception:  # noqa: BLE001
         return _rules(extra_keys)
     now = time.monotonic()
-    with _OWNER_LOCK:
+    with _LOCK:
         if _TABLE["sig"] == sig and now - _TABLE["at"] < _TABLE_TTL_S:
             return _TABLE["table"]
     table = _rules(extra_keys)
-    with _OWNER_LOCK:
+    with _LOCK:
         _TABLE.update(sig=sig, at=now, table=table)
     return table
 
 
+def _lookup(mapping: dict, found: str, fallback: str) -> str:
+    return str(mapping.get(_fold(found), fallback))
+
+
 def _scrub_text(text: str, table: _Table, keep: list[str]) -> str:
-    if "/" not in text and "~" not in text and (table.any_word is None or not table.any_word.search(text)):
+    if not text.isascii():
+        text = unicodedata.normalize("NFC", text)
+    pathy = "/" in text or "~" in text
+    if not pathy and (table.names is None or not table.names.search(text)):
         return text  # nothing path-like and no known name: the usual case, kept cheap
-    for i, word in enumerate(keep):
-        if word and word in text:
-            text = text.replace(word, f"\x00{i}\x00")
-    if "/" in text or "~" in text:
-        # Login folders become their ids first; then a known root with a
-        # space goes whole with what follows it; then the other known paths.
-        for path, replacement in table.literal:
-            if isinstance(replacement, _Id) and path in text:
-                text = text.replace(path, str(replacement))
+    held = [w for w in keep if w and w in text]
+    for i, word in enumerate(held):
+        text = text.replace(word, f"\x00{i}\x00")
+    if pathy:
         if table.roots is not None:
-            text = table.roots.sub(FOLDER_WORD, text)
-        for path, replacement in table.literal:
-            if not isinstance(replacement, _Id) and path in text:
-                text = text.replace(path, replacement)
+            def root(m: re.Match) -> str:
+                found = _fold(m.group(0))
+                return next((str(to) for r, to in table.root_to if found.startswith(r)), FOLDER_WORD)
+            text = table.roots.sub(root, text)
         text = _PATHLIKE.sub(FOLDER_WORD, text)
-    for pattern, replacement in table.words:
-        text = pattern.sub(lambda _m, r=replacement: str(r), text)
-    for i, word in enumerate(keep):
+    if table.names is not None:
+        text = table.names.sub(lambda m: _lookup(table.name_to, m.group(0).lstrip("."), LOGIN_WORD), text)
+    for i, word in enumerate(held):
         text = text.replace(f"\x00{i}\x00", word)
     return text
 
@@ -332,11 +326,11 @@ def _walk(value, table, keep):
 def scrub(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] | None = None):
     """``value`` (a string, or dicts and lists of them, keys included) with
     every login folder, home folder, user name and private path taken out.
-    ``keep``: the owner's own words, passed through as written."""
-    with _OWNER_LOCK:
-        owner = set(_OWNER_WORDS)
-    words = sorted({w for w in [*keep, *owner] if isinstance(w, str) and w}, key=len, reverse=True)
-    return _walk(value, _table(extra_keys), words)
+    ``keep``: the owner's own words, passed through as written, besides those
+    the saved record holds now."""
+    table = _table(extra_keys)
+    words = sorted({w for w in [*keep, *table.owner] if isinstance(w, str) and w}, key=len, reverse=True)
+    return _walk(value, table, words)
 
 
 def error_text(exc: BaseException) -> str:
