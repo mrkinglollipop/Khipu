@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Callout } from "./ui";
 
@@ -52,11 +52,14 @@ export function useModelVerify() {
   const [verifying, setVerifying] = useState(false);
   // Set when a run could not execute at all; such a run is never stored as a check.
   const [runError, setRunError] = useState<string | null>(null);
+  const latest = useRef(0);
 
   /** One cheap, real API call per configured provider
    *  (`khipu.modelcheck.check_model_keys` via the `khipu_secrets_verify`
    *  fixed-argv command), never the key itself. */
   const verify = useCallback(async () => {
+    // Only the newest run may report; an older one finishing late is dropped.
+    const run = ++latest.current;
     setVerifying(true);
     let out: ModelVerifyResult | null = null;
     let failure: string | null = null;
@@ -70,6 +73,7 @@ export function useModelVerify() {
     } catch (e) {
       failure = String(e);
     }
+    if (run !== latest.current) return;
     if (!out || !Array.isArray(out.checks)) {
       setRunError(failure ?? "the answer could not be read");
       setVerifying(false);

@@ -318,6 +318,85 @@ describe("a check that could not run", () => {
   });
 });
 
+describe("an older verify run cannot overwrite a newer one", () => {
+  type Deferred = { resolve: (v: string) => void; reject: (e: unknown) => void };
+  function setup() {
+    const store = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, v: string) => void store.set(key, v),
+      removeItem: (key: string) => void store.delete(key),
+    });
+    const runs: Deferred[] = [];
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd !== "khipu_secrets_verify") return Promise.reject(new Error(`unexpected command ${cmd}`));
+      return new Promise<string>((resolve, reject) => runs.push({ resolve, reject }));
+    });
+    function Probe() {
+      const v = useModelVerify();
+      return (
+        <>
+          <button onClick={() => void v.verify()}>go</button>
+          <output data-testid="s">{JSON.stringify([v.checkedAt != null, v.result?.ok ?? null, v.runError, v.verifying])}</output>
+        </>
+      );
+    }
+    render(<Probe />);
+    return { store, runs };
+  }
+  const refused = JSON.stringify({
+    ok: false,
+    checks: [{ id: "gemini_generate", ok: false, title: "Key check failed", detail: "refused", model: null, seconds: 1 }],
+  });
+
+  it("ignores a late success from an older run after a newer run refused the key", async () => {
+    const { store, runs } = setup();
+    fireEvent.click(screen.getByText("go"));
+    fireEvent.click(screen.getByText("go"));
+    expect(runs).toHaveLength(2);
+    await act(async () => runs[1].resolve(refused));
+    expect(screen.getByTestId("s").textContent).toBe(JSON.stringify([true, false, null, false]));
+    const stored = store.get("khipu.modelVerify.v1");
+    await act(async () => runs[0].resolve(JSON.stringify(okResult)));
+    expect(screen.getByTestId("s").textContent).toBe(JSON.stringify([true, false, null, false]));
+    expect(store.get("khipu.modelVerify.v1")).toBe(stored);
+    vi.unstubAllGlobals();
+  });
+
+  it("ignores a late error from an older run and keeps the newer run's verifying state", async () => {
+    const { store, runs } = setup();
+    fireEvent.click(screen.getByText("go"));
+    fireEvent.click(screen.getByText("go"));
+    await act(async () => runs[0].reject(new Error("old spawn failed")));
+    expect(screen.getByTestId("s").textContent).toBe(JSON.stringify([false, null, null, true]));
+    await act(async () => runs[1].resolve(refused));
+    expect(screen.getByTestId("s").textContent).toBe(JSON.stringify([true, false, null, false]));
+    expect(store.has("khipu.modelVerify.v1")).toBe(true);
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("a check that could not run, on the local row", () => {
+  it("replaces Works with Check could not run and says so in the row words", () => {
+    render(
+      <SynthProviderChoices
+        row={{ provider: "local", endpoint: "http://127.0.0.1:11434", model_id: "llama3" }}
+        onChange={() => {}}
+        presence={{ ...NONE, openai_compat_in_keychain: true }}
+        verifyResult={{
+          ok: true,
+          checks: [{ id: "openai_compat_generate", ok: true, title: "Key works", detail: "", model: null, seconds: 1 }],
+        }}
+        runError="spawn failed"
+        doctorSynth={null}
+      />,
+    );
+    expect(screen.queryByText("Works")).toBeNull();
+    expect(screen.getByText("Check could not run")).toBeTruthy();
+    expect(document.querySelector(".choice-key")?.textContent ?? "").toMatch(/could not run \(spawn failed\)/);
+  });
+});
+
 describe("Capture & models, composed", () => {
   it("says the Keychain sentence once across every card", async () => {
     const { container } = render(
@@ -394,7 +473,8 @@ describe("replacing a key drops its old check", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(rowOf("Gemini").textContent).toContain("the check could not run: Error: spawn failed"));
     expect(screen.queryByText("Key works")).toBeNull();
-    expect(screen.getByText("Check could not run")).toBeTruthy();
+    // The Gemini row and the local row both carry the tag.
+    expect(screen.getAllByText("Check could not run")).toHaveLength(2);
     const words = container.querySelector(".choice-key")?.textContent ?? "";
     expect(words).not.toMatch(/works/);
     expect(words).toMatch(/could not run/);

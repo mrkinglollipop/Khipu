@@ -298,6 +298,7 @@ function providerTag(
   }
   if (info.route === "local") {
     const st = keyStatus(presence, verifyResult, "openai_compat");
+    if (runError) return { tone: "err", dot: true, text: "Check could not run" };
     if (st.check === "ok") return { tone: "ok", dot: true, text: "Works" };
     if (st.check === "failed") return { tone: "err", dot: true, text: "Check failed" };
     return notChecked;
@@ -342,6 +343,7 @@ function KeyLine({
         <span>
           If the endpoint asks for a key, add it as Local endpoint in Keys below. Save models, then use Check now
           there.
+          {runError ? ` The check could not run (${runError}).` : ""}
         </span>
       </p>
     );
@@ -574,12 +576,15 @@ export function SynthFallbackField({
   const cfg = useCliState<ConfigShape>("khipu_config_show", true);
   const configured = cfg.data?.config?.synth_fallback;
   // The stored word, read through config; doctor's copy only when that read fails.
-  const stored: SynthFallback =
+  // null when neither source can be read: no radio is then shown as chosen.
+  const stored: SynthFallback | null =
     cfg.data != null
       ? String(configured ?? "").trim().toLowerCase() === "none"
         ? "none"
         : "gemini"
-      : synthFallbackSetting(doctorSynth);
+      : doctorSynth?.fallback != null
+        ? synthFallbackSetting(doctorSynth)
+        : null;
   const [pending, setPending] = useState<SynthFallback | null>(null);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -587,7 +592,7 @@ export function SynthFallbackField({
   const value = pending ?? stored;
 
   async function save(next: SynthFallback) {
-    if (next === value) return;
+    if (value != null && next === value) return;
     setPending(next);
     setSaving(true);
     setErr(null);
@@ -648,6 +653,8 @@ export function SynthFallbackField({
       ) : null}
       {isGemini ? (
         <p className="set-help">Gemini is the provider; there is nothing to fall back to.</p>
+      ) : value == null ? (
+        <p className="set-help">Nothing is dropped either way: a failed capture waits and is retried. Saved when you choose.</p>
       ) : value === "gemini" ? (
         <p className="set-help">
           Fallback uses the Gemini key, about $0.002 a conversation. Nothing is dropped either way. Saved when you

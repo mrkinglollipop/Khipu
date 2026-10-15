@@ -462,6 +462,27 @@ describe("summariser fallback (synth_fallback)", () => {
     await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "synth_fallback", value: "none" }]));
   });
 
+  it("shows no radio checked and still saves either choice when the config read fails and doctor has no fallback block", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      calls.push([cmd, args]);
+      if (cmd === "khipu_config_show") throw new Error("config unreadable");
+      if (cmd === "khipu_config_set") return JSON.stringify({ ok: true });
+      throw new Error(`unexpected command ${cmd}`);
+    });
+    render(<Harness initial={anthropicRow} doctorSynth={{ provider: "anthropic" }} />);
+    await screen.findByText(/Can't read the stored choice/);
+    expect(retry().checked).toBe(false);
+    expect(wait().checked).toBe(false);
+    fireEvent.click(retry());
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "synth_fallback", value: "gemini" }]));
+    cleanup();
+    calls.length = 0;
+    render(<Harness initial={anthropicRow} doctorSynth={{ provider: "anthropic" }} />);
+    await screen.findByText(/Can't read the stored choice/);
+    fireEvent.click(wait());
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "synth_fallback", value: "none" }]));
+  });
+
   it("words the fallback for the health report", () => {
     expect(synthFallbackLine({ provider: "anthropic", fallback: { setting: "gemini", gemini_key: true } })).toBe(
       "Fallback: Gemini Flash (key present)",
