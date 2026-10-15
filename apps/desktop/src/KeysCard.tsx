@@ -129,6 +129,8 @@ type VerifyApi = {
   runError?: string | null;
   /** Drops the earlier results for these check ids when a key is replaced. */
   forget?: (ids: readonly string[]) => void;
+  /** Drops any run in flight; called the moment a key change starts. */
+  invalidate?: () => void;
 };
 
 function parseOk(raw: unknown): { ok?: boolean; error?: string } | null {
@@ -174,6 +176,7 @@ function KeyRow({
   async function save() {
     const v = value.trim();
     if (!v || saving) return;
+    api.invalidate?.();
     setSaving(true);
     setErr(null);
     try {

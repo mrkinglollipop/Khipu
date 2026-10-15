@@ -91,9 +91,17 @@ export function useModelVerify() {
     }
   }, []);
 
+  /** A key change is starting: any run already in flight checked the old key,
+   *  so nothing it returns may be shown or stored. Call before any await. */
+  const invalidate = useCallback(() => {
+    latest.current += 1;
+    setVerifying(false);
+  }, []);
+
   /** A key was replaced: its earlier results no longer describe it. Drop them
    *  from state and from the copy kept on this Mac. */
   const forget = useCallback((ids: readonly string[]) => {
+    latest.current += 1;
     setResult((prev) => {
       if (!prev) return prev;
       const next = { ...prev, checks: prev.checks.filter((c) => !ids.includes(c.id)) };
@@ -109,7 +117,7 @@ export function useModelVerify() {
     });
   }, []);
 
-  return { result, checkedAt, verifying, verify, runError, forget };
+  return { result, checkedAt, verifying, verify, runError, forget, invalidate };
 }
 
 /** "Not checked" (`modelcheck._skip`) means no key is configured for this

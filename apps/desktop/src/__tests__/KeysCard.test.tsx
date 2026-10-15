@@ -376,6 +376,53 @@ describe("an older verify run cannot overwrite a newer one", () => {
   });
 });
 
+describe("a replacement invalidates a check already running", () => {
+  it("drops an older run that succeeds while the replacement is still saving", async () => {
+    const store = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, v: string) => void store.set(key, v),
+      removeItem: (key: string) => void store.delete(key),
+    });
+    const runs: Array<(v: string) => void> = [];
+    let finishRefresh: () => void = () => {};
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "set_khipu_secret") return Promise.resolve(JSON.stringify({ ok: true }));
+      if (cmd === "khipu_secrets_verify") return new Promise<string>((resolve) => runs.push(resolve));
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    const presence = { ...NONE, gemini_in_keychain: true };
+    function Page() {
+      const mv = useModelVerify();
+      return (
+        <KeysCard
+          active
+          presence={presence}
+          presenceError={null}
+          verify={mv}
+          onKeySaved={() => new Promise<void>((r) => (finishRefresh = r))}
+        />
+      );
+    }
+    render(<Page />);
+    // The open-time check is in flight with the old key.
+    await waitFor(() => expect(runs).toHaveLength(1));
+    fireEvent.click(screen.getByRole("button", { name: "Replace the Gemini key" }));
+    const input = screen.getByLabelText("New value for the Gemini key");
+    fireEvent.change(input, { target: { value: "AIza-new" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    // The old check succeeds during the presence refresh.
+    await act(async () => runs[0](JSON.stringify(okResult)));
+    expect(store.get("khipu.modelVerify.v1") ?? "").not.toContain("Key works");
+    await act(async () => finishRefresh());
+    await waitFor(() => expect(runs).toHaveLength(2));
+    await act(async () => runs[1](JSON.stringify(badResult)));
+    expect(rowOf("Gemini").textContent).not.toMatch(/Works/);
+    expect(JSON.parse(store.get("khipu.modelVerify.v1") ?? "{}").result).toEqual(badResult);
+    vi.unstubAllGlobals();
+  });
+});
+
 describe("a check that could not run, on the local row", () => {
   it("replaces Works with Check could not run and says so in the row words", () => {
     render(
