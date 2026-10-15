@@ -11,7 +11,8 @@ probe's cleanup, the ``khipu_forget`` MCP tool) so all of it happens:
   3. commitments it opened → closed, close_reason 'forgotten', plus their vectors
   4. its decision rows → retracted, retract_reason 'forgotten' (migration 0024)
   5. its deliverable rows → deleted
-  6. its lines in the legacy file and retained forget backups
+  6. its lines in every legacy log, .bak copy and retained forget backup;
+     a crash-left temporary file holding one is reported, never edited
   7. the local sqlite replica, if one exists (deleted_at + its embeddings)
   8. every brief citing it → stale (migration 0025)
 
@@ -30,8 +31,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import stat
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -72,9 +77,11 @@ def _briefs_ready(cur) -> bool:
         return False
 
 
-def forget_episode(cur, episode_id: int) -> dict[str, Any]:
+def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> dict[str, Any]:
     """The hub half. Caller commits. Returns the counts and the (ts, summary
-    md5) identity the legacy file uses, or ``{"ok": False}`` when unknown."""
+    md5) identity the legacy file uses, or ``{"ok": False}`` when unknown.
+    With ``memory_root`` the legacy lines themselves are hashed too, so a line
+    another episode holds only by payload hash is recognised as shared."""
     cur.execute("SELECT ts, summary, session_id FROM episodes WHERE id = %s", (episode_id,))
     row = cur.fetchone()
     if row is None:
@@ -136,8 +143,13 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
     # reports itself incomplete. The live identity gets no exemption: an edit
     # frees a legacy key, so another episode's original line can match it.
     held = _held_elsewhere(cur, episode_id, candidates, sources=sources)
-    shared_identities = [i for i in candidates if i in held]
-    legacy_identities = [i for i in candidates if i not in held]
+    # Another episode can hold a line by payload hash alone: a source row whose
+    # legacy identity was never recorded, or a merge receipt without its payload.
+    hashes = _candidate_hashes(candidates, source_rows or [], raw, memory_root)
+    owned = _owned_elsewhere(cur, episode_id, set().union(*hashes), sources=sources)
+    shared = [i in held or bool(h & owned) for i, h in zip(candidates, hashes)]
+    shared_identities = [i for i, s in zip(candidates, shared) if s]
+    legacy_identities = [i for i, s in zip(candidates, shared) if not s]
     cur.execute(
         "UPDATE episodes SET deleted_at = now() WHERE id = %s AND deleted_at IS NULL",
         (episode_id,),
@@ -264,13 +276,25 @@ def _sources_missing_from_rows(raw: Any, rows: list[dict[str, Any]]
     return recovered, missing
 
 
+_FRACTION = re.compile(r"(\d{2}:\d{2}:\d{2})[.,](\d+)")
+
+
 def _instant(value: Any) -> datetime | None:
     """A timestamp as a UTC instant to the second, or None when unreadable.
-    Naive means UTC; a trailing Z is read as +00:00."""
+    Naive means UTC; a trailing Z is read as +00:00. A fraction is rounded to
+    microseconds the way Postgres reads it (fromisoformat truncates), so
+    09:00:00.9999999 is 09:00:01."""
     if isinstance(value, str):
+        text = value.strip().replace("Z", "+00:00")
+        fraction = _FRACTION.search(text)
+        micro = 0
+        if fraction:
+            text = text[:fraction.start()] + fraction.group(1) + text[fraction.end():]
+            micro = int(Decimal("0." + fraction.group(2)).quantize(
+                Decimal("0.000001"), rounding=ROUND_HALF_EVEN) * 1_000_000)
         try:
-            value = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        except (ValueError, TypeError):
+            value = datetime.fromisoformat(text) + timedelta(microseconds=micro)
+        except (ValueError, TypeError, OverflowError):
             return None
     if not isinstance(value, datetime):
         return None
@@ -331,104 +355,216 @@ def _held_elsewhere(cur, episode_id: int, identities: list[dict[str, Any]], *,
     return [i for i in identities if (i.get("summary_md5"), _instant(i.get("ts"))) in holders]
 
 
-def _line_matches(line: str, ts_iso: str, summary_md5: str) -> bool:
+def _candidate_hashes(candidates: list[dict[str, Any]], source_rows: list[dict[str, Any]],
+                      raw: Any, memory_root: Path | None) -> list[set[str]]:
+    """For each candidate identity, every payload hash a copy of its line is
+    known by: this episode's source rows and raw payloads, and each legacy
+    line carrying the identity, as written and as redacted."""
+    import copy
+
+    from khipu.capture import _redact_capture_values
+    from khipu.capture_identity import payload_sha256
+
+    out: list[set[str]] = [set() for _ in candidates]
+
+    def add(ident: dict[str, Any], *values: Any) -> None:
+        for n, cand in enumerate(candidates):
+            if _same_identity(ident, cand):
+                out[n].update(v for v in values if isinstance(v, str) and v)
+
+    for src in source_rows:
+        add(src, src.get("payload_sha256"))
+    if isinstance(raw, dict):
+        ident = _raw_identity(raw)
+        if ident is not None:
+            add(ident, payload_sha256(raw))
+        receipts = raw.get("merged_from")
+        for receipt in receipts if isinstance(receipts, list) else []:
+            payload = receipt.get("payload") if isinstance(receipt, dict) else None
+            ident = _raw_identity(payload) if isinstance(payload, dict) else None
+            if ident is not None:
+                add(ident, receipt.get("source_id"), payload_sha256(payload))
+    if memory_root is None:
+        return out
+    keys = [(c.get("summary_md5"), _instant(c.get("ts"))) for c in candidates]
+    try:
+        places = legacy_locations(Path(memory_root))
+    except OSError:
+        return out
+    for _place, path in places:
+        # An unreadable file is reported by the scrub step, not here.
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            continue
+        for line in lines:
+            obj = _line_object(line)
+            if obj is None or _line_key(obj) not in keys:
+                continue
+            try:
+                digests = (payload_sha256(obj),
+                           payload_sha256(_redact_capture_values(copy.deepcopy(obj))))
+            except UnicodeEncodeError:  # a lone surrogate elsewhere in the line
+                continue
+            for n, key in enumerate(keys):
+                if key == _line_key(obj):
+                    out[n].update(digests)
+    return out
+
+
+def _owned_elsewhere(cur, episode_id: int, hashes: set[str], *, sources: bool) -> set[str]:
+    """The payload hashes some other live episode holds: as a raw merge
+    receipt's source id or (with ``sources``) a source row's payload hash or
+    source key."""
+    if not hashes:
+        return set()
+    parts = [
+        "SELECT r.v->>'source_id' AS h "
+        "FROM episodes e CROSS JOIN LATERAL jsonb_array_elements(CASE "
+        "WHEN jsonb_typeof(e.raw->'merged_from') = 'array' THEN e.raw->'merged_from' "
+        "ELSE '[]'::jsonb END) AS r(v) "
+        "WHERE e.id <> %(id)s AND e.deleted_at IS NULL AND jsonb_typeof(r.v) = 'object' "
+        "AND r.v->>'source_id' = ANY(%(h)s::text[])",
+    ]
+    if sources:
+        for column in ("payload_sha256", "source_key"):
+            parts.append(
+                f"SELECT s.{column} FROM episode_sources s JOIN episodes e ON e.id = s.episode_id "
+                "WHERE s.episode_id <> %(id)s AND e.deleted_at IS NULL AND s.deleted_at IS NULL "
+                f"AND s.{column} = ANY(%(h)s::text[])")
+    cur.execute("SELECT owned.h FROM (" + " UNION ALL ".join(parts) + ") AS owned",
+                {"id": episode_id, "h": sorted(hashes)})
+    return {row[0] for row in cur.fetchall() if row and isinstance(row[0], str)}
+
+
+def _line_object(line: str) -> dict[str, Any] | None:
     try:
         obj = json.loads(line)
     except ValueError:
-        return False
-    if not isinstance(obj, dict):
-        return False
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _line_key(obj: dict[str, Any]) -> tuple[str, datetime] | None:
+    """A legacy line's (summary md5, UTC instant), or None when unreadable.
+    The file stores what the hook minted (2026-09-05T12:20:17Z or with an
+    offset); PG returns an aware datetime. Compare as UTC instants to the
+    second, never as wall-clock text."""
     summary = obj.get("summary") or ""
-    if not isinstance(summary, str) or hashlib.md5(summary.encode("utf-8")).hexdigest() != summary_md5:
-        return False
-    # The file stores what the hook minted (2026-09-05T12:20:17Z or with an
-    # offset); PG returns an aware datetime. Compare as UTC instants to the
-    # second, never as wall-clock text.
     when = _instant(obj.get("ts"))
-    return when is not None and when == _instant(ts_iso)
+    if not isinstance(summary, str) or when is None:
+        return None
+    try:
+        digest = hashlib.md5(summary.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:  # a lone surrogate is valid JSON but not UTF-8
+        return None
+    return digest, when
+
+
+def _line_matches(line: str, ts_iso: str | None, summary_md5: str | None) -> bool:
+    obj = _line_object(line)
+    key = _line_key(obj) if obj is not None else None
+    return key is not None and bool(summary_md5) and key == (summary_md5, _instant(ts_iso))
 
 
 def _has_unidentified_records(lines: list[str]) -> bool:
     for line in lines:
         if not line.strip():
             continue
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            return True
-        if (not isinstance(obj, dict) or not isinstance(obj.get("summary"), str)
-                or not isinstance(obj.get("ts"), str) or _instant(obj["ts"]) is None):
+        obj = _line_object(line)
+        if (obj is None or not isinstance(obj.get("summary"), str)
+                or not isinstance(obj.get("ts"), str) or _line_key(obj) is None):
             return True
     return False
 
 
-def _scrub_retained_backups(memory_root: Path, ts_iso: str, summary_md5: str) -> dict[str, Any]:
-    """Remove a forgotten line from every retained legacy backup.
+BACKUP_DIR = ".khipu-forget-backups"
 
-    A backup made while forgetting one of two identities can contain the
-    other; each identity pass therefore scrubs all old copies as well.
-    """
-    backup_dir = memory_root / ".khipu-forget-backups"
-    if not backup_dir.is_dir():
-        return {"ok": True, "removed": 0, "remaining": []}
-    removed = 0
-    remaining: list[str] = []
-    for backup in backup_dir.glob("episodes.jsonl.*"):
-        if not backup.is_file():
+# Worst first: a location reports the worst state any identity pass saw.
+LOCATION_STATES = ("unreadable", "copy remains", "unidentified records", "removed", "clean")
+# States that leave a forgotten line, or a line nobody can identify, on disk.
+INCOMPLETE_STATES = frozenset(LOCATION_STATES[:3])
+
+
+def legacy_locations(memory_root: Path) -> list[tuple[str, Path]]:
+    """Every file under the memory root that can hold a copy of a legacy line,
+    as (place, path): each active log ``drift.episode_files`` knows (rotated
+    years included), ``.bak`` copies beside them, retained forget backups, and
+    temporary files a crashed rewrite left behind."""
+    from khipu.drift import episode_files
+
+    root = Path(memory_root)
+    out = [("legacy log", path) for path in episode_files(root)]
+    listed = {path for _place, path in out}
+    # Any other file named like a log is a copy someone made (.bak, .orig, ~),
+    # and a scrub writes its temp as ".<name>.tmp" beside it.
+    for path in sorted([*root.glob("episodes*"), *root.glob(".episodes*")]):
+        if path in listed or not _present_file(path):
             continue
-        try:
-            lines = backup.read_text(encoding="utf-8").splitlines(keepends=True)
-            keep = [line for line in lines if not _line_matches(line, ts_iso, summary_md5)]
-            if _has_unidentified_records(keep):
-                remaining.append(f"{backup}: unidentified legacy records")
-            if len(keep) == len(lines):
+        if path.name.endswith(".tmp"):
+            out.append(("temporary file", path))
+        elif path.name == "episodes.jsonl" or (
+                path.name.startswith("episodes_") and path.suffix == ".jsonl"
+                and ".bak" not in path.name):
+            # An active log drift could not stat: listed so its read fails loudly.
+            out.append(("legacy log", path))
+        else:
+            out.append(("legacy copy", path))
+    backup_dir = root / BACKUP_DIR
+    if backup_dir.is_dir():
+        for path in sorted(backup_dir.iterdir()):
+            if not _present_file(path):
                 continue
-            from khipu.paths import write_sensitive_bytes
-
-            tmp = backup.with_name(f".{backup.name}.tmp")
-            write_sensitive_bytes(tmp, "".join(keep).encode("utf-8"))
-            tmp.replace(backup)
-            removed += len(lines) - len(keep)
-        except (OSError, UnicodeError) as exc:
-            remaining.append(f"{backup}: {type(exc).__name__}")
-    return {"ok": not remaining, "removed": removed, "remaining": remaining}
+            if not path.name.startswith("."):
+                out.append(("forget backup", path))
+            elif path.name.endswith(".tmp"):
+                out.append(("temporary file", path))
+    return out
 
 
-def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: str) -> dict[str, Any]:
-    """Remove matching lines from the legacy file and retained backups.
-    A rewrite preserves a backup containing only the remaining records."""
-    identity = {"ts": ts_iso, "summary_md5": summary_md5}
-    if _instant(ts_iso) is None or not summary_md5:
-        # Nothing to match on: touch no file, and say so so the forget is partial.
-        return {"file": None, "removed": 0, "reason": "unreadable identity", "identity": identity,
-                "backups": {"ok": True, "removed": 0, "remaining": []}}
-    if memory_root is None:
-        return {"file": None, "removed": 0, "reason": "memory_root not configured", "identity": identity,
-                "backups": {"ok": True, "removed": 0, "remaining": []}}
-    path = Path(memory_root) / "episodes.jsonl"
-    backups = _scrub_retained_backups(Path(memory_root), ts_iso, summary_md5)
-    if not path.is_file():
-        return {"file": str(path), "removed": 0, "reason": "no legacy file", "identity": identity,
-                "backups": backups}
+def _present_file(path: Path) -> bool:
+    """A regular file, or an entry that cannot be stat'ed: a directory that
+    lists names but denies stat must not hide a copy, so its entries count as
+    present and the read that follows reports them unreadable."""
     try:
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        return stat.S_ISREG(path.stat().st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _replace_target(path: Path) -> Path:
+    """The file a rewrite must replace: a symlinked log is rewritten at its
+    target, so the link survives and no copy stays behind it."""
+    return Path(os.path.realpath(path))
+
+
+def _read_lines(path: Path) -> list[str]:
+    return path.read_text(encoding="utf-8").splitlines(keepends=True)
+
+
+def _rewrite_log(root: Path, path: Path, ts_iso: str | None, summary_md5: str | None) -> dict[str, Any]:
+    """Remove matching lines from one active log. The rewrite preserves a
+    backup containing only the remaining records."""
+    try:
+        lines = _read_lines(path)
     except (OSError, UnicodeError) as exc:
-        return {"file": str(path), "removed": 0, "reason": f"unreadable: {exc}", "identity": identity,
-                "backups": backups}
+        return {"state": "unreadable", "removed": 0, "reason": f"unreadable: {exc}"}
     keep = [ln for ln in lines if not _line_matches(ln, ts_iso, summary_md5)]
     unidentified = _has_unidentified_records(keep)
     reason = {"reason": "unreadable legacy identities remain"} if unidentified else {}
     removed = len(lines) - len(keep)
     if not removed:
-        return {"file": str(path), "removed": 0, "identity": identity, "backups": backups, **reason}
-    backup_dir = Path(memory_root) / ".khipu-forget-backups"
+        return {"state": "unidentified records" if unidentified else "clean", "removed": 0, **reason}
+    backup_dir = root / BACKUP_DIR
     try:
         backup_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        return {"file": str(path), "removed": 0, "reason": f"backup unavailable: {exc}", "identity": identity,
-                "backups": {"ok": False, "removed": 0, "remaining": [str(backup_dir)]}}
+        return {"state": "copy remains", "removed": 0, "reason": f"backup unavailable: {exc}",
+                "problem": str(backup_dir)}
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    backup = backup_dir / f"episodes.jsonl.{stamp}"
+    backup = backup_dir / f"{path.name}.{stamp}"
     # A retained backup may never retain the line just forgotten. It exists to
     # protect the remaining file, not to create a new plaintext copy of data
     # the caller asked to erase.
@@ -436,15 +572,123 @@ def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: st
 
     try:
         write_sensitive_bytes(backup, "".join(keep).encode("utf-8"))
-        tmp = path.with_suffix(".jsonl.tmp")
+        target = _replace_target(path)
+        tmp = target.with_name(f"{target.name}.tmp")
         write_sensitive_bytes(tmp, "".join(keep).encode("utf-8"))
-        tmp.replace(path)
-        backups = _scrub_retained_backups(Path(memory_root), ts_iso, summary_md5)
+        tmp.replace(target)
     except (OSError, UnicodeError) as exc:
-        return {"file": str(path), "removed": 0, "reason": f"rewrite failed: {exc}", "identity": identity,
-                "backups": {"ok": False, "removed": 0, "remaining": [str(path)]}}
-    return {"file": str(path), "removed": removed, "backup": str(backup), "identity": identity,
-            "backups": backups, **reason}
+        return {"state": "copy remains", "removed": 0, "reason": f"rewrite failed: {exc}",
+                "problem": str(path)}
+    return {"state": "unidentified records" if unidentified else "removed", "removed": removed,
+            "backup": str(backup), **reason}
+
+
+def _scrub_copy(path: Path, ts_iso: str | None, summary_md5: str | None) -> dict[str, Any]:
+    """Remove matching lines in place from a .bak copy or a retained backup.
+    A backup made while forgetting one of two identities can contain the
+    other, so each identity pass scrubs every old copy."""
+    try:
+        lines = _read_lines(path)
+        keep = [ln for ln in lines if not _line_matches(ln, ts_iso, summary_md5)]
+        unidentified = _has_unidentified_records(keep)
+        problem = {"problem": f"{path}: unidentified legacy records"} if unidentified else {}
+        if len(keep) == len(lines):
+            return {"state": "unidentified records" if unidentified else "clean", "removed": 0,
+                    **problem}
+        from khipu.paths import write_sensitive_bytes
+
+        target = _replace_target(path)
+        tmp = target.with_name(f".{target.name}.tmp")
+        write_sensitive_bytes(tmp, "".join(keep).encode("utf-8"))
+        tmp.replace(target)
+    except (OSError, UnicodeError) as exc:
+        return {"state": "unreadable", "removed": 0, "problem": f"{path}: {type(exc).__name__}"}
+    return {"state": "unidentified records" if unidentified else "removed",
+            "removed": len(lines) - len(keep), **problem}
+
+
+def _temp_state(path: Path, ts_iso: str | None, summary_md5: str | None) -> str | None:
+    """What a crash-left temporary file holds. It is never edited: a writer may
+    still own it. A torn line could be the forgotten one, so it counts as
+    unreadable. None when it has gone since it was listed."""
+    try:
+        lines = _read_lines(path)
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError):
+        return "unreadable"
+    if any(_line_matches(ln, ts_iso, summary_md5) for ln in lines):
+        return "copy remains"
+    return "unreadable" if _has_unidentified_records(lines) else "clean"
+
+
+def _legacy_pass(root: Path, ts_iso: str | None, summary_md5: str | None) -> dict[str, Any]:
+    """One identity pass over every legacy location. With no identity it
+    only reports what each location is."""
+    main = root / "episodes.jsonl"
+    out: dict[str, Any] = {"file": str(main), "removed": 0}
+    backups: dict[str, Any] = {"ok": True, "removed": 0, "remaining": []}
+    locations: list[dict[str, str]] = []
+    try:
+        places = legacy_locations(root)
+    except OSError as exc:
+        return {**out, "reason": f"unreadable: {exc}",
+                "backups": {"ok": False, "removed": 0, "remaining": [str(root)]}, "locations": []}
+    if not any(path == main for _place, path in places):
+        out["reason"] = "no legacy file"
+    temps = []
+    for place, path in places:
+        if place == "temporary file":
+            temps.append((place, path))
+            continue
+        if place == "legacy log":
+            result = _rewrite_log(root, path, ts_iso, summary_md5)
+            if path == main:
+                out.update({k: result[k] for k in ("reason", "backup") if k in result})
+            if result.get("problem"):
+                backups["remaining"].append(result["problem"])
+        else:
+            result = _scrub_copy(path, ts_iso, summary_md5)
+            backups["removed"] += result["removed"]
+            if result.get("problem"):
+                backups["remaining"].append(result["problem"])
+        out["removed"] += result["removed"]
+        locations.append({"place": place, "path": str(path), "state": result["state"]})
+    # Temporary files are read after the rewrites: a rewrite reuses its log's
+    # temp name, so a crash-left one there is replaced by the clean rewrite.
+    for place, path in temps:
+        state = _temp_state(path, ts_iso, summary_md5)
+        if state is not None:
+            locations.append({"place": place, "path": str(path), "state": state})
+    backups["ok"] = not backups["remaining"]
+    return {**out, "backups": backups, "locations": locations}
+
+
+def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: str) -> dict[str, Any]:
+    """Remove matching lines from every legacy log, .bak copy and retained
+    backup, and report crash-left temporary files that hold one. ``file`` is
+    the main log; ``locations`` names every file looked at and its state."""
+    identity = {"ts": ts_iso, "summary_md5": summary_md5}
+    if _instant(ts_iso) is None or not summary_md5:
+        # Nothing to match on: touch no file, and say so so the forget is partial.
+        return {"file": None, "removed": 0, "reason": "unreadable identity", "identity": identity,
+                "backups": {"ok": True, "removed": 0, "remaining": []}, "locations": []}
+    if memory_root is None:
+        return {"file": None, "removed": 0, "reason": "memory_root not configured", "identity": identity,
+                "backups": {"ok": True, "removed": 0, "remaining": []}, "locations": []}
+    return {**_legacy_pass(Path(memory_root), ts_iso, summary_md5), "identity": identity}
+
+
+def _merge_locations(*groups: list[dict[str, str]]) -> list[dict[str, str]]:
+    """One entry per path; the worst state any pass saw wins."""
+    merged: dict[str, dict[str, str]] = {}
+    for group in groups:
+        for loc in group:
+            known = merged.get(loc["path"])
+            if known is None or (LOCATION_STATES.index(loc["state"])
+                                 < LOCATION_STATES.index(known["state"])):
+                merged[loc["path"]] = dict(loc)
+    return list(merged.values())
 
 
 def _source_copy(payload: dict[str, Any], source_rows: list[dict[str, Any]]) -> bool:
@@ -484,11 +728,12 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
     an episode whose source row was never recorded) any job from the same
     session counts, as before."""
     remaining: list[str] = []
+    inspected: list[dict[str, str]] = []
     reason = "outbox: not cleaned (capture identity needed)"
     if source_rows:
         reason = "outbox: copy retained (erase by source key lands in phase 3)"
     elif has_merged_sources:
-        return {"ok": False, "removed": 0, "remaining": [reason]}
+        return {"ok": False, "removed": 0, "remaining": [reason], "inspected": inspected}
     try:
         from khipu.outbox import _locked_outbox, outbox_dir, dead_dir, quarantine_dir
 
@@ -502,38 +747,67 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
                 except FileNotFoundError:
                     continue
                 for path in paths:
-                    if path.suffix != ".json" or not path.is_file():
+                    # A crash in the atomic writer leaves ".<job>.<random>.tmp"
+                    # holding a whole or torn job. A quarantine ".error" file
+                    # (and its temp) holds only an error string.
+                    if path.suffix == ".json":
+                        place = "outbox job"
+                    elif path.suffix == ".tmp" and ".error." not in path.name:
+                        place = "outbox temp"
+                    else:
+                        continue
+                    if not _present_file(path):
                         continue
                     try:
                         envelope = json.loads(path.read_bytes())
                         payload = envelope.get("payload") if isinstance(envelope, dict) else None
                         if not isinstance(payload, dict):
                             raise ValueError("job payload is not an object")
+                    except FileNotFoundError:
+                        continue  # drained or renamed since the listing
                     except (OSError, ValueError, TypeError) as exc:
                         remaining.append(f"{reason}; {path}: {type(exc).__name__}")
+                        inspected.append({"place": place, "path": str(path), "state": "unreadable"})
                         continue
                     if source_rows:
-                        if _source_copy(payload, source_rows):
+                        copy_found = _source_copy(payload, source_rows)
+                        if copy_found:
                             remaining.append(f"{reason}; {path}")
+                        inspected.append({"place": place, "path": str(path),
+                                          "state": "copy remains" if copy_found else "clean"})
                         continue
                     # Without a session id there is no way to tell this job from
                     # the forgotten episode's capture, so any retained job counts.
                     if not session_id or payload.get("session_id") == session_id:
-                        remaining.append(reason)
-                        return {"ok": False, "removed": 0, "remaining": remaining}
+                        # A job keeps the bare reason callers already match on;
+                        # a temp is named, since nothing else lists it.
+                        remaining.append(reason if place == "outbox job" else f"{reason}; {path}")
+                        inspected.append({"place": place, "path": str(path), "state": "copy remains"})
+                        return {"ok": False, "removed": 0, "remaining": remaining,
+                                "inspected": inspected}
+                    inspected.append({"place": place, "path": str(path), "state": "clean"})
     except Exception as exc:  # noqa: BLE001 — surface an incomplete forget
         return {"ok": False, "removed": 0, "remaining": [*remaining, reason],
-                "error": f"{type(exc).__name__}: {exc}"}
-    return {"ok": not remaining, "removed": 0, "remaining": remaining}
+                "error": f"{type(exc).__name__}: {exc}", "inspected": inspected}
+    return {"ok": not remaining, "removed": 0, "remaining": remaining, "inspected": inspected}
 
 
 def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> dict[str, Any]:
     """Hub + legacy file. Opens its own connection and commits."""
     from khipu.db import connect
 
+    root_resolved = True
+    if memory_root is None:
+        try:
+            from khipu.config import path_setting
+
+            memory_root = path_setting("memory_root")
+        except Exception:  # noqa: BLE001
+            memory_root = None
+            root_resolved = False
     with connect() as conn:
         with conn.cursor() as cur:
-            out = forget_episode(cur, episode_id)
+            out = forget_episode(cur, episode_id, memory_root=memory_root)
         conn.commit()
     if not out.get("ok"):
         return out
@@ -549,15 +823,6 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
         out["snapshot"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     if not out["snapshot"].get("ok"):
         partial.append("snapshot")
-    root_resolved = True
-    if memory_root is None:
-        try:
-            from khipu.config import path_setting
-
-            memory_root = path_setting("memory_root")
-        except Exception:  # noqa: BLE001
-            memory_root = None
-            root_resolved = False
     # An all-shared episode has an empty list: never fall back to its live line.
     identities = (out["legacy_identities"] if "legacy_identities" in out
                   else [out.get("identity") or {}])
@@ -567,8 +832,16 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
     ]
     out["legacy_file"] = (out["legacy_files"][0] if out["legacy_files"]
                           else {"file": None, "removed": 0})
-    if not root_resolved or any(str(item.get("reason") or "").startswith(("unreadable", "backup", "rewrite"))
-                                  for item in out["legacy_files"]):
+    legacy_locs = _merge_locations(*(item.get("locations", []) for item in out["legacy_files"]))
+    if not out["legacy_files"] and memory_root is not None:
+        # Nothing to erase (every identity is shared), but every location is
+        # still listed, and one that cannot be read still counts.
+        legacy_locs = _legacy_pass(Path(memory_root), None, None)["locations"]
+    blocked = [f"{loc['place']} {loc['path']}: {loc['state']}" for loc in legacy_locs
+               if loc["state"] in INCOMPLETE_STATES]
+    if (not root_resolved or blocked
+            or any(str(item.get("reason") or "").startswith(("unreadable", "backup", "rewrite"))
+                   for item in out["legacy_files"])):
         partial.append("legacy_file")
     if any(not item.get("backups", {}).get("ok", True) for item in out["legacy_files"]):
         partial.append("legacy_backups")
@@ -577,6 +850,8 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
     out["outboxes"] = [_outbox_remainder(out.get("session_id"),
                                        has_merged_sources=out.get("has_merged_sources", False),
                                        source_rows=out.get("source_rows"))]
+    out["locations"] = _merge_locations(
+        legacy_locs, *(item.get("inspected", []) for item in out["outboxes"]))
     out["outbox"] = {"ok": all(item.get("ok") for item in out["outboxes"]),
                      "removed": sum(int(item.get("removed") or 0) for item in out["outboxes"])}
     if not out["outbox"]["ok"]:
@@ -588,7 +863,8 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
     out["remaining"] = out["outboxes"][0].get("remaining", [])
     out["partial_errors"] = {
         "snapshot": out["snapshot"].get("error"),
-        "legacy_file": [item.get("reason") for item in out["legacy_files"] if item.get("reason")],
+        "legacy_file": [*(item.get("reason") for item in out["legacy_files"] if item.get("reason")),
+                        *blocked],
         "legacy_backups": [item.get("backups", {}).get("remaining", []) for item in out["legacy_files"]],
         "outbox": [{key: item[key] for key in ("error", "remaining") if item.get(key)}
                    for item in out["outboxes"] if item.get("error") or item.get("remaining")],

@@ -181,6 +181,19 @@ class _WorldCur:
                     rows += [(r["summary_md5"], r["ts"], None) for r in self.world["sources"]
                              if r["episode_id"] == other["id"]]
             self._all = [r for r in rows if r[0] in wanted]
+        elif "AS owned" in s:
+            # Payload hashes another live episode holds: a source row's payload
+            # hash or source key, or a raw merge receipt's source id.
+            wanted = set(params["h"])
+            rows = []
+            for other in self._others(params["id"]):
+                for receipt in other["raw"].get("merged_from", []):
+                    rows.append((receipt.get("source_id"),))
+                if "episode_sources" in s:
+                    for r in self.world["sources"]:
+                        if r["episode_id"] == other["id"]:
+                            rows += [(r["payload_sha256"],), (r["source_key"],)]
+            self._all = [r for r in rows if r[0] in wanted]
         elif "unnest(" in s:
             # The pre-fix query: positions of source-derived candidates another
             # episode's live row or source rows hold.
@@ -301,6 +314,41 @@ class ForgetOwnershipTest(unittest.TestCase):
         self.assertNotIn("A original", left)
         self.assertFalse(out["complete"])
         self.assertIn("legacy_shared", out["partial"])
+
+    def hash_only_world(self, *, via: str) -> tuple[dict, dict]:
+        """B holds A's legacy line by payload hash alone: a merge receipt
+        without its payload and, with ``via="source"``, a source row whose
+        legacy identity was never recorded (summary_md5 NULL)."""
+        a = self._payload("2026-10-01T09:00:00Z", "shared capture A", "codex:A")
+        b = self._payload("2026-10-01T09:01:00Z", "live episode B", "codex:B")
+        digest = ci.payload_sha256(a)
+        raw_b = dict(b)
+        sources = [self._source(1, a), self._source(2, b)]
+        if via == "receipt":
+            raw_b["merged_from"] = [{"source_id": digest, "ts": a["ts"],
+                                     "session_id": a["session_id"]}]
+        else:
+            sources.append({"episode_id": 2, "role": "merged", "ts": BASE, "summary_md5": None,
+                            "source_key": digest, "payload_sha256": digest})
+        world = {"episodes": {
+            1: {"id": 1, "ts": BASE, "summary": a["summary"], "session_id": "codex:A",
+                "raw": dict(a), "deleted": False},
+            2: {"id": 2, "ts": BASE.replace(minute=1), "summary": b["summary"],
+                "session_id": "codex:B", "raw": raw_b, "deleted": False}},
+            "sources": sources, "lines": [a, b], "sources_enabled": True}
+        return world, a
+
+    def test_a_line_another_episode_holds_only_by_payload_hash_is_kept(self):
+        for via in ("source", "receipt"):
+            with self.subTest(via=via), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                world, a = self.hash_only_world(via=via)
+                write_lines(root, world["lines"])
+                out = run_forget(world, 1, root)
+                left = [json.loads(ln) for ln in remaining_lines(root)]
+                self.assertIn(a, left)
+                self.assertFalse(out["complete"])
+                self.assertIn("legacy_shared", out["partial"])
 
     def test_a_line_minted_with_an_offset_is_removed(self):
         # The line says 11:00:00+02:00; PG and the source row say 09:00:00 UTC.

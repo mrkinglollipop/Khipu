@@ -142,6 +142,20 @@ class ForgetOwnershipScratchTest(unittest.TestCase):
         self.assertFalse(out["complete"])
         self.assertIn("legacy_shared", out["partial"])
 
+    def test_a_line_another_episode_holds_only_by_payload_hash_is_kept(self):
+        for via in ("source", "receipt"):
+            with self.subTest(via=via), tempfile.TemporaryDirectory() as td:
+                _truncate()
+                root = Path(td)
+                world, a = self.scenarios.hash_only_world(via=via)
+                seed(world)
+                write_lines(root, world["lines"])
+                out = run_forget(world, 1, root, connect=self.connect)
+                left = [json.loads(ln) for ln in remaining_lines(root)]
+                self.assertIn(a, left)
+                self.assertFalse(out["complete"])
+                self.assertIn("legacy_shared", out["partial"])
+
     def test_a_line_minted_with_an_offset_is_removed(self):
         c = self._payload("2026-10-01T11:00:00+02:00", "offset captured evidence", "codex:A")
         world = {"episodes": {1: {"id": 1, "ts": BASE, "summary": c["summary"],
