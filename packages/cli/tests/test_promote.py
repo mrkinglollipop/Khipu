@@ -234,13 +234,17 @@ def test_a_passing_gate_flips_and_restarts(home, monkeypatch, tmp_path):
                         lambda slot, commit, repo: (_fake_checkout(slot), {"ok": True})[1])
     monkeypatch.setattr(pm, "_head", lambda root: "headsha" if root else None)
     monkeypatch.setattr(pm, "GATE_STEPS", {name: _ok() for name in pm.GATE_ORDER})
-    calls = []
+    calls, envs, live_at = [], [], []
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
+        envs.append(kwargs.get("env") or {})
+        if argv[1:3] == ["-c", pm._PRECOMPILE] and argv[-1] == str(pm.live_link() / "packages" / "cli" / "khipu"):
+            live_at.append(os.readlink(pm.live_link()))  # the slot live while it compiled
         return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "refreshed": []}), "")
 
     monkeypatch.setattr(pm, "_run", fake_run)
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")  # as every harness that starts a hook has it
     from khipu.jobs import PLIST_QUEUE_DRAIN, _plist_path
 
     _plist_path(PLIST_QUEUE_DRAIN).parent.mkdir(parents=True, exist_ok=True)
@@ -248,10 +252,73 @@ def test_a_passing_gate_flips_and_restarts(home, monkeypatch, tmp_path):
     out = pm.promote()
     assert out["ok"], out
     assert os.readlink(pm.live_link()) == str(b)
+    # Live hooks never write bytecode: the slot is compiled by its own path
+    # before its gate, and the live link's path just before the flip (the old
+    # code, checked-hash) and after it (the new code), before the restarts.
+    compiled = [argv[-1] for argv in calls if argv[1:3] == ["-c", pm._PRECOMPILE]]
+    live_pkg = str(pm.live_link() / "packages" / "cli" / "khipu")
+    assert compiled == [str(b / "packages" / "cli" / "khipu"), live_pkg, live_pkg]
+    assert live_at == [str(a), str(b)]
+    assert out["precompile"]["ok"] and out["precompile_live"]["ok"] and out["after"]["precompile"]["ok"]
+    restarts = [i for i, argv in enumerate(calls) if argv[:1] == ["launchctl"] or argv[-2:] == ["jobs", "refresh"]]
+    assert max(i for i, argv in enumerate(calls) if argv[-1] == live_pkg) < min(restarts)
+    for argv, env in zip(calls, envs):
+        if argv[1:3] == ["-c", pm._PRECOMPILE]:
+            assert "PYTHONDONTWRITEBYTECODE" not in env
+            assert env["PYTHONPYCACHEPREFIX"] == str(Path.home() / "Library" / "Caches" / "Khipu" / "pycache")
     assert any(argv[-2:] == ["jobs", "refresh"] for argv in calls)
     assert any(argv[:3] == ["launchctl", "kickstart", "-k"] and argv[3].endswith(PLIST_QUEUE_DRAIN)
                for argv in calls)
     assert pm.MCP_NOTE in pm.format_result(out)
+
+
+def test_precompile_never_leaves_the_previous_slots_bytecode_in_use(home, tmp_path, monkeypatch):
+    """Codex review of the cold-start fix: two slots' versions of a module
+    with the same size and mtime second matched the timestamp pyc compiled
+    under ``live`` for the old slot, so compileall skipped it and a fresh hook
+    imported the old code. Bytecode is checked-hash and forced, and the live
+    path is compiled again just before the flip (a cache from before this
+    change held timestamp pycs): a hook imports the live source right after
+    the flip, before the precompile that follows it, and after it. Real compiles, real imports, as a live hook (no bytecode
+    writes)."""
+    import sys
+
+    files = []
+    for name, value in (("slot-a", "old"), ("slot-b", "new")):
+        pkg = tmp_path / name / "packages" / "cli" / "khipu"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("")
+        (pkg / "probe.py").write_text(f"VALUE = '{value}'\n")
+        files.append(pkg / "probe.py")
+    stamp = files[0].stat().st_mtime_ns
+    for f in files:
+        os.utime(f, ns=(stamp, stamp))
+    live = tmp_path / "live"
+    live.symlink_to(tmp_path / "slot-a")
+
+    def imported() -> str:
+        env = pm._code_env(live)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        r = pm._run([sys.executable, "-c", "from khipu.probe import VALUE; print(VALUE)"], env=env)
+        assert r.returncode == 0, r.stderr
+        return r.stdout.strip()
+
+    # A cache from before checked-hash bytecode: timestamp pycs under ``live``.
+    env = pm._code_env(live)
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
+    legacy = "import compileall, sys\nsys.exit(0 if compileall.compile_dir(sys.argv[1], quiet=1) else 1)\n"
+    assert pm._run([sys.executable, "-c", legacy, str(live / "packages" / "cli" / "khipu")], env=env).returncode == 0
+    assert imported() == "old"
+    monkeypatch.setattr(pm, "live_root", lambda: live)
+    monkeypatch.setattr(pm, "_hook_python", lambda: sys.executable)
+    assert pm._before_flip()["ok"]  # promote's and rollback's step just before the flip
+    swap = tmp_path / "swap"
+    swap.symlink_to(tmp_path / "slot-b")
+    os.replace(swap, live)
+    assert imported() == "new"  # the old slot's bytecode is never served, even before a precompile
+    assert pm.precompile(tmp_path / "slot-b", python=sys.executable)["ok"]
+    assert pm.precompile(live, python=sys.executable)["ok"]
+    assert imported() == "new"
 
 
 # ---- the replay ------------------------------------------------------------
