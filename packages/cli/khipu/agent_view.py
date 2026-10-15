@@ -29,6 +29,7 @@ import getpass
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -178,8 +179,9 @@ def _word(name: str) -> re.Pattern:
     return re.compile(rf"(?<![{_NAME_EDGE}.])\.?{body}(?![{_NAME_EDGE}])", re.I)
 
 
-def _rules(extra_keys: Iterable[str] | None = None):
-    """(literal replacements longest first, word patterns) for one scrub."""
+def _rules(extra_keys: Iterable[str] | None = None) -> "_Table":
+    """The replacement table: literal paths longest first, word patterns and
+    the known roots with spaces."""
     literal: dict[str, object] = {}  # each value a str or an _Id
     folder_words: dict[str, object] = {}
     paths: list[str] = []
@@ -211,35 +213,119 @@ def _rules(extra_keys: Iterable[str] | None = None):
             literal.setdefault(os.path.realpath(home).rstrip("/"), HOME_WORD)
     words = [(_word(n), r) for n, r in sorted(folder_words.items(), key=lambda kv: -len(kv[0]))]
     words += [(_word(n), USER_WORD) for n in sorted(_user_names(paths), key=len, reverse=True)]
-    return sorted(literal.items(), key=lambda kv: -len(kv[0])), words
+    any_word = re.compile("|".join(f"(?:{w.pattern})" for w, _r in words), re.I) if words else None
+    roots = _roots(paths, home)
+    return _Table(sorted(literal.items(), key=lambda kv: -len(kv[0])), words, any_word, roots)
 
 
-def _scrub_text(text: str, rules, keep: list[str]) -> str:
-    literal, words = rules
+class _Table:
+    """One scrub's replacements, built once per config and record version."""
+
+    __slots__ = ("literal", "words", "any_word", "roots")
+
+    def __init__(self, literal, words, any_word, roots):
+        self.literal, self.words, self.any_word, self.roots = literal, words, any_word, roots
+
+
+def _roots(paths: list[str], home: str | None) -> re.Pattern | None:
+    """Known folders whose names may hold a space (the home folder, each
+    volume, the memory root, every configured folder), matched whole with
+    whatever path follows them: a generic path ends at the first space, so
+    "/Volumes/Shared Disk/x" would leave "Disk/x" behind."""
+    found = {p for p in paths if p.startswith("/")}
+    if home:
+        found.add(home)
+    with contextlib.suppress(Exception):
+        found |= {os.path.join("/Volumes", n) for n in os.listdir("/Volumes")}
+    with contextlib.suppress(Exception):
+        from khipu.config import path_setting
+
+        memory = path_setting("memory_root")
+        if memory:
+            found.add(str(memory).rstrip("/"))
+    found = {f for f in found if " " in f}
+    if not found:
+        return None
+    alts = "|".join(re.escape(f) for f in sorted(found, key=len, reverse=True))
+    # Inner segments may hold spaces (a "/" follows them); the last ends at one.
+    return re.compile(rf"(?:{alts})(?:/{_SEG}(?:\s{_SEG})*(?=/))*(?:/[^\s\"'`,;)\]}}]*)?")
+
+
+_SEG = r"[^\s\"'`,;)\]}/]+"
+_TABLE_TTL_S = 60.0
+_TABLE: dict = {"sig": None, "at": 0.0, "table": None}
+
+
+def _signature(extra_keys) -> tuple:
+    """What the table depends on: the config, the saved routing record, the
+    caller's accounts and the home folder."""
+    def stat(path_fn):
+        try:
+            st = path_fn().stat()
+            return (st.st_mtime_ns, st.st_size, st.st_ino)
+        except Exception:  # noqa: BLE001
+            return None
+
+    from khipu import routing
+    from khipu.config import config_file
+
+    keys = tuple(sorted(str(k) for k in extra_keys)) if extra_keys is not None else None
+    return (stat(config_file), stat(routing.view_file), keys, os.environ.get("HOME"),
+            os.environ.get("KHIPU_DATA_DIR"))
+
+
+def _table(extra_keys) -> _Table:
+    """The cached table, rebuilt when what it depends on changed or after
+    ``_TABLE_TTL_S`` (discovered logins can appear between record versions)."""
+    try:
+        sig = _signature(extra_keys)
+    except Exception:  # noqa: BLE001
+        return _rules(extra_keys)
+    now = time.monotonic()
+    with _OWNER_LOCK:
+        if _TABLE["sig"] == sig and now - _TABLE["at"] < _TABLE_TTL_S:
+            return _TABLE["table"]
+    table = _rules(extra_keys)
+    with _OWNER_LOCK:
+        _TABLE.update(sig=sig, at=now, table=table)
+    return table
+
+
+def _scrub_text(text: str, table: _Table, keep: list[str]) -> str:
+    if "/" not in text and "~" not in text and (table.any_word is None or not table.any_word.search(text)):
+        return text  # nothing path-like and no known name: the usual case, kept cheap
     for i, word in enumerate(keep):
         if word and word in text:
             text = text.replace(word, f"\x00{i}\x00")
-    for path, replacement in literal:
-        if path in text:
-            text = text.replace(path, str(replacement))
-    text = _PATHLIKE.sub(FOLDER_WORD, text)
-    for pattern, replacement in words:
+    if "/" in text or "~" in text:
+        # Login folders become their ids first; then a known root with a
+        # space goes whole with what follows it; then the other known paths.
+        for path, replacement in table.literal:
+            if isinstance(replacement, _Id) and path in text:
+                text = text.replace(path, str(replacement))
+        if table.roots is not None:
+            text = table.roots.sub(FOLDER_WORD, text)
+        for path, replacement in table.literal:
+            if not isinstance(replacement, _Id) and path in text:
+                text = text.replace(path, replacement)
+        text = _PATHLIKE.sub(FOLDER_WORD, text)
+    for pattern, replacement in table.words:
         text = pattern.sub(lambda _m, r=replacement: str(r), text)
     for i, word in enumerate(keep):
         text = text.replace(f"\x00{i}\x00", word)
     return text
 
 
-def _walk(value, rules, keep):
+def _walk(value, table, keep):
     if isinstance(value, str):
-        return _scrub_text(value, rules, keep)
+        return _scrub_text(value, table, keep)
     if isinstance(value, dict):
-        return {(_scrub_text(k, rules, keep) if isinstance(k, str) else k): _walk(v, rules, keep)
+        return {(_scrub_text(k, table, keep) if isinstance(k, str) else k): _walk(v, table, keep)
                 for k, v in value.items()}
     if isinstance(value, list):
-        return [_walk(v, rules, keep) for v in value]
+        return [_walk(v, table, keep) for v in value]
     if isinstance(value, tuple):
-        return tuple(_walk(v, rules, keep) for v in value)
+        return tuple(_walk(v, table, keep) for v in value)
     return value
 
 
@@ -250,7 +336,7 @@ def scrub(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] | None =
     with _OWNER_LOCK:
         owner = set(_OWNER_WORDS)
     words = sorted({w for w in [*keep, *owner] if isinstance(w, str) and w}, key=len, reverse=True)
-    return _walk(value, _rules(extra_keys), words)
+    return _walk(value, _table(extra_keys), words)
 
 
 def error_text(exc: BaseException) -> str:

@@ -319,3 +319,43 @@ def test_every_agent_surface_is_clean(owner, monkeypatch, tmp_path, capsys):
     assert outputs["tool error"][0] is True
     for name, out in outputs.items():
         assert _leaks(out, owner) == [], name
+
+
+def test_known_roots_with_spaces_are_scrubbed_whole(tmp_path, monkeypatch):
+    # A path the scrub doesn't know, under a known root whose name holds a
+    # space (the home folder, the memory root, a configured folder), is
+    # taken out whole: a generic path ends at the first space and would
+    # leave "Storage/..." behind.
+    home = tmp_path / "Home Dir" / "someone"
+    memory = tmp_path / "Mem Root"
+    runner = tmp_path / "Run Ners"
+    for d in (home, memory, runner):
+        d.mkdir(parents=True)
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "config.json").write_text(json.dumps({
+        "memory_root": str(memory),
+        "routing_sources": [{"name": "lanes", "kind": "lanes", "path": str(runner)}]}))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
+    texts = [f"read {home}/Library/Application Support/khipu/x.json now",
+             f"memory at {memory}/topics/plan.md, then {memory}/Project Notes/a.md",
+             f"runner {runner}/state/Lane One/s.json failed"]
+    out = agent_view.scrub(texts)
+    for text in out:
+        for word in ("Home Dir", "Mem Root", "Run Ners", "Application Support", "Project Notes", "Lane One",
+                     "someone", str(tmp_path)):
+            assert word not in text, (word, text)
+    assert out[0] == "read a folder now"
+
+
+def test_the_table_is_built_once_per_record_version(owner, monkeypatch):
+    builds = []
+    real = agent_view._rules
+    monkeypatch.setattr(agent_view, "_rules", lambda *a, **k: builds.append(1) or real(*a, **k))
+    monkeypatch.setattr(agent_view, "_TABLE", {"sig": None, "at": 0.0, "table": None})
+    for _ in range(5):
+        agent_view.scrub(["plain words", "more plain words"])
+    assert builds == [1]
+    agent_view.scrub("x", extra_keys=["claude|/elsewhere/.claude-z"])
+    assert builds == [1, 1], "another set of accounts is another table"
