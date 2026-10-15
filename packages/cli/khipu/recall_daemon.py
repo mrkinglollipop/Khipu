@@ -55,6 +55,9 @@ STALE_RECHECK_S = 5.0
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 # A client that connects and says nothing must not hold a thread forever.
 CONN_READ_TIMEOUT_S = 10.0
+# The client tries the one-shot path after a failed answer only while this
+# much of its deadline is left (bin/khipu-recall-client.py).
+CLIENT_COLD_RETRY_S = 1.4
 # In-flight requests get this long to finish once the service is stopping.
 DRAIN_S = 3.0
 _ACCEPT_TICK_S = 0.5
@@ -203,8 +206,18 @@ class RecallService:
         recheck_s: float = STALE_RECHECK_S,
         clock: Callable[[], float] = time.monotonic,
         idle_check: bool = True,
+        routing_forkserver: bool = True,
     ) -> None:
         self.path = Path(path)
+        # The per-prompt routing child is forked by a small helper this
+        # service spawns (``start_routing`` at start when the push is on,
+        # else on a thread at the first prompt with the push on), never by
+        # this process (its heap is the vector matrix: a fork of it slowed
+        # the search). False forks from this process, as the one-shot hook
+        # does: a test seam, so a test's patched clock and fold reach the read.
+        from khipu import recall_prompt
+
+        self.routing_forkserver = recall_prompt.RoutingForkServer() if routing_forkserver else None
         self._stamp_fn = stamp_fn
         self._recheck_s = recheck_s
         self._clock = clock
@@ -279,7 +292,23 @@ class RecallService:
         self._ino = os.stat(self.path).st_ino
         return True
 
+    def start_routing(self) -> bool:
+        """Start the routing helper now, on a thread, when this service's own
+        switches have the per-prompt push on, so the first prompt never waits
+        for it (a prompt with the push on starts it otherwise). Never waits;
+        True when it was asked to start."""
+        if self.routing_forkserver is None:
+            return False
+        from khipu import recall_prompt
+
+        if not recall_prompt.daemon_routing_on():
+            return False
+        self.routing_forkserver.prepare()
+        return True
+
     def close(self) -> None:
+        if self.routing_forkserver is not None:
+            self.routing_forkserver.close()
         listener, self._listener = self._listener, None
         if listener is not None:
             listener.close()
@@ -347,6 +376,12 @@ class RecallService:
                 if time.monotonic() >= deadline:
                     return {"ok": False, "error": "timeout>request deadline"}
                 options = {"deadline": deadline, "delivery": delivery}
+            # Routing's switches as the hook's own environment set them, not this service's.
+            environ = recall_prompt.caller_environ(req.get("env"))
+            if environ is not None:
+                options["environ"] = environ
+            if self.routing_forkserver is not None:
+                options["routing_forkserver"] = self.routing_forkserver
             out = recall_prompt.hook_main(raw, shape=shape, **options)
             if not isinstance(out, dict):
                 raise TypeError("recall handler returned a non-object")
@@ -356,7 +391,14 @@ class RecallService:
         if delivery is not None:
             result = delivery.get("result") or {}
             if recall_prompt._outcome_for(result.get("reason", "ok"), result.get("hits", [])) in ("error", "timeout"):
-                return {"ok": False, "error": result["reason"]}
+                # A failed search answers an error, so the client can still try
+                # the one-shot path. When it no longer can (too little time
+                # left), routing lines this prompt carries are delivered on
+                # their own (phase 3b): the search's outcome is logged as it was.
+                routed = (delivery.get("routing") or {}).get("pending")
+                left = options.get("deadline", 0) - time.monotonic()
+                if not routed or left >= CLIENT_COLD_RETRY_S:
+                    return {"ok": False, "error": result["reason"]}
         with self._lock:
             self.served += 1
         return {"ok": True, "output": out} if req.get("protocol") == 1 else out
@@ -505,6 +547,11 @@ def _warm_imports() -> None:
     """Pay the package's import cost at start, not on the first prompt."""
     try:
         from khipu import embed, hub_snapshot, recall_prompt, vector_scan  # noqa: F401
+        # Routing's switches are decided here for every prompt (the child
+        # itself runs in the routing helper, which imports what it reads).
+        from khipu import routing
+
+        routing.prompt_imports()
     except Exception as exc:  # noqa: BLE001 — the first prompt will import them anyway
         _log(f"warm imports skipped: {type(exc).__name__}: {exc}")
 
@@ -544,6 +591,7 @@ def serve(
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda _s, _f: svc.stop())
     _warm_imports()
+    svc.start_routing()
     threading.Thread(target=_warm_caches, daemon=True).start()
     _log(f"serving {svc.path} pid={os.getpid()} version={__version__} stamp={svc.stamp}")
     try:

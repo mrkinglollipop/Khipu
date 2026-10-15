@@ -93,8 +93,8 @@ export const ROUTING_FEATURES: ReadonlyArray<FeatureRow> = [
   {
     name: "routing_push",
     label: "Tell conversations which accounts are open",
-    what: "At the start of each conversation, and again after it is compacted, Khipu adds your standing rules and your note in full, then one line per account (open, limit reached, paused or down) and any holds. It reports; it never chooses where work goes.",
-    cost: "Adds up to the routing start budget at the start of a conversation: one second by default, never more than eight seconds. Setting ROUTING_NOW_OFF=1, or creating the file /tmp/.routing_now_disable, also turns it off.",
+    what: "At the start of each conversation, and again after it is compacted, Khipu adds your standing rules and your note in full, then one line per account (open, limit reached, paused or down) and any holds. Before each prompt it adds only what changed since that conversation last heard, and nothing when nothing changed. It reports; it never chooses where work goes.",
+    cost: "Adds up to the routing start budget at the start of a conversation (one second by default, never more than eight seconds) and up to the routing prompt budget before a prompt (50 milliseconds by default, never more than one second), read alongside memory recall. Setting ROUTING_NOW_OFF=1, or creating the file /tmp/.routing_now_disable, also turns it off.",
   },
 ];
 

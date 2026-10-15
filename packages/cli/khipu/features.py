@@ -39,7 +39,7 @@ FEATURES: dict[str, str] = {
     "briefs": "Generate source-backed incremental topic briefs instead of the legacy topic-page pipeline.",
     "reflect": "Run an optional cited-reflection step over dependable evidence.",
     "relevance_floor": "Drop rows with no keyword hit and a cosine similarity below an absolute floor, so an unrelated prompt returns nothing.",
-    "routing_push": "Tell each conversation, at its start and after compaction, the owner's standing rules and note and which accounts are open, limited, paused or down (Khipu's routing record; it reports and never routes).",
+    "routing_push": "Tell each conversation, at its start and after compaction, the owner's standing rules and note and which accounts are open, limited, paused or down, and before each prompt what changed since it last heard (Khipu's routing record; it reports and never routes).",
 }
 
 _ENV_PREFIX = "KHIPU_FEATURE_"
@@ -105,11 +105,12 @@ def _check_known(name: str) -> None:
         raise KeyError(f"unknown feature {name!r}; known: {sorted(FEATURES)}")
 
 
-def enabled(name: str) -> bool:
-    """Environment, then config.json ``features``, then False (default off).
-    Raises ``KeyError`` for a name outside ``FEATURES``."""
+def enabled(name: str, environ=None) -> bool:
+    """Environment (``environ``, default this process's), then config.json
+    ``features``, then False (default off). Raises ``KeyError`` for a name
+    outside ``FEATURES``."""
     _check_known(name)
-    raw = os.environ.get(_ENV_PREFIX + name.upper())
+    raw = (os.environ if environ is None else environ).get(_ENV_PREFIX + name.upper())
     if raw is not None:
         parsed = parse_bool(raw)
         if parsed is not None:

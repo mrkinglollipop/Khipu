@@ -25,10 +25,10 @@ can see and change all of it in the app. Khipu never decides where work goes.
 |---|---|---|---|
 | 0 | This scope; the mocks of the Home Routing card and Settings → Routing; a throwaway-hook check of five hook facts | S | done 2026-10-14 (scope and mocks approved; hook check: five of five yes, see Phase 0 results) |
 | 1a | The record and its fold: event log, versioned view with clock-driven refolds, rules, Matt's note, holds, owner clear; `khipu route`; the doctor block | M | done 2026-10-14 (one known limit, see Known limits; its fix is in phase 1b) |
-| 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | built, in review (branch feat/routing-truth-1b) |
-| 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | built, in review (branch feat/routing-truth-2) |
-| 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | built, in review (branch feat/routing-truth-3a) |
-| 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | open |
+| 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | done 2026-10-14 (PRs #186 and #187) |
+| 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | done 2026-10-14 (PR #188) |
+| 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | done 2026-10-14 (PR #189) |
+| 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | built, in review (branch feat/routing-truth-3b; four Opus check rounds, then a Codex review on credits, since Grok is paused) |
 | 3c | The daemon refolds on change and on the clock; the promotion gate's replay covers routing | S | open |
 | 4 | App: Home Routing card, Settings → Routing for what phases 1a to 3c built, health row, attention items | M–L | open (mock approved 2026-10-14; needs plan usage phase 2 merged) |
 | 5 | The background check at each known reset time, with its part of the app | S | open |
@@ -773,8 +773,11 @@ before writing it.
 
 - Build the daemon's poll and refold, its sleep that never passes `valid_until`, and the run of everything
   that fell due after the Mac wakes. Extend the gate's recall replay so a candidate fails the step when its
-  routing read exceeds the budget or its search answers change with routing on. Put the per-prompt budget
-  rate in doctor.
+  routing read exceeds the budget or its search answers change with routing on. The replay also measures the
+  search's milliseconds with routing on against routing off, on a daemon whose vector matrix is warm (the
+  daemon never forks itself for routing: its routing helper, spawned once, forks each prompt's child; a fork
+  of the daemon cost about 18 ms and slowed its search about four times while the child lived). Put the
+  per-prompt budget rate in doctor.
 - Stop-condition: if, over at least 200 replayed prompts, timeouts with routing on exceed those with routing
   off by more than 2 in 100 prompts, switch push off and stop.
 - Live check after promotion: one Claude Code conversation and one Codex conversation each see a state change
@@ -954,6 +957,11 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
   date. Stamping a record of one line would let a single line written ahead of the clock pin every later
   line (the mirror case above), so it is left. It cannot start once the record holds two lines, and the log
   keeps every line as written. Shown by `test_a_low_clock_run_after_a_one_line_record_keeps_the_phase_1a_handling`.
+- **A routing folder that can never be saved (phase 3b).** When the view cannot be saved (a read-only data
+  folder), a change is never taken for no change: each prompt logs `routing=skipped:unsaved` and leaves the
+  seen marker where it was, so the change arrives at the first prompt after a save succeeds. On a folder that
+  stays read-only, a conversation that already has a marker gets no per-prompt changes until then; new and
+  compacted conversations still get the full summary at session start.
 
 ## Fixed limits
 

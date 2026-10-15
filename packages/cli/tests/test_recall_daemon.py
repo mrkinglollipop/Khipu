@@ -108,8 +108,11 @@ class ProtocolTest(_ServiceCase):
         self.assertEqual(out, answer)
         self.assertEqual(default, answer)
         self.assertEqual(hook.call_args_list[0].args, ('{"prompt": "hi"}',))
-        self.assertEqual(hook.call_args_list[0].kwargs, {"shape": "cursor"})
-        self.assertEqual(hook.call_args_list[1].kwargs, {"shape": "claude"})
+        # The service's routing helper goes with every request (routing fix round 3).
+        helper = r.svc.routing_forkserver
+        self.assertIsNotNone(helper)
+        self.assertEqual(hook.call_args_list[0].kwargs, {"shape": "cursor", "routing_forkserver": helper})
+        self.assertEqual(hook.call_args_list[1].kwargs, {"shape": "claude", "routing_forkserver": helper})
 
     def test_ping_reports_the_process_and_counts_recall_requests(self) -> None:
         r = self.running()
@@ -158,7 +161,7 @@ class ProtocolTest(_ServiceCase):
         r = self.running()
         both_inside = threading.Barrier(2, timeout=5)
 
-        def hook(raw, *, shape):
+        def hook(raw, *, shape, routing_forkserver=None):
             both_inside.wait()  # only passes when a second request is in the handler too
             return {"echo": raw}
 
