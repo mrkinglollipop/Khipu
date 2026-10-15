@@ -168,4 +168,5 @@ built in round 2 and are unchanged.
   the vendor changes because the CLI is updated with it.
 - Cache with a short max age rather than a daemon: a daemon would poll accounts nobody is using; a
   cached probe costs a second only when someone asks.
+- Routing truth phase 5 is the narrow exception: its resident helper checks an account only after a known limited reset time, never an open account; see `2026-10-14-routing-truth.md` phase 5 and decision 7.
 - Khipu reports; it does not route. The routing table and the orchestrator read `khipu_usage` and decide.

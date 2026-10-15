@@ -10,9 +10,8 @@
    work. Every write goes through one fixed-argv Tauri command that passes
    `--from-app` (src-tauri/src/lib.rs, `route_*_argv`) or `config --set`,
    then the page re-reads the record: what it shows is what the CLI reports.
-   Left out until their phases: Check now and the reset-check settings
-   (phase 5), the switch before handing work to another agent (phase 6) and
-   the copy for cloud agents (phase 7). */
+   The switch before handing work to another agent (phase 6) and the copy for
+   cloud agents (phase 7) join with their phases. */
 
 import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent, ReactNode, RefObject } from "react";
@@ -70,6 +69,7 @@ type Writer = {
   /** Whether any write is running or waiting. */
   anyBusy: boolean;
   errors: Record<string, string>;
+  results: Record<string, string>;
   /**
    * Run one write, re-read, and keep the CLI's error under `id`. Writes run
    * one at a time, in the order they were asked for, so a second change
@@ -92,6 +92,7 @@ function useWriter(reread: () => Promise<unknown>): Writer {
   // The writes running or waiting, oldest first.
   const [pending, setPending] = useState<string[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [results, setResults] = useState<Record<string, string>>({});
   const queue = useRef<Promise<unknown>>(Promise.resolve());
   // The control focused when a write began, and where focus goes if the
   // write takes that control away (fix round 2, R2-2). Settled after the
@@ -132,6 +133,15 @@ function useWriter(reread: () => Promise<unknown>): Writer {
           const res = await callCli(command, built);
           await (after ?? reread)();
           fail(id, res.ok ? null : res.error);
+          setResults((previous) => {
+            const next = { ...previous };
+            if (!res.ok) delete next[id];
+            else {
+              const data = res.data as { reason?: unknown };
+              next[id] = typeof data?.reason === "string" && data.reason ? data.reason : "Checked.";
+            }
+            return next;
+          });
           ok = res.ok;
         }
       } finally {
@@ -146,7 +156,7 @@ function useWriter(reread: () => Promise<unknown>): Writer {
     queue.current = job.catch(() => undefined);
     return job;
   };
-  return { isBusy: (id) => pending.includes(id), anyBusy: pending.length > 0, errors, run, fail };
+  return { isBusy: (id) => pending.includes(id), anyBusy: pending.length > 0, errors, results, run, fail };
 }
 
 /** One routing setting's value as `khipu config` reports it now, read just
@@ -479,8 +489,19 @@ function AccountRow({ a, w, now, reportDefault }: { a: RouteAccount; w: Writer; 
           ) : null}
         </span>
         {src ? <span className="route-src">{src}</span> : null}
+        {a.next_check ? <span className="route-src">Khipu checks again at {whenLocal(a.next_check, now)}.</span> : null}
       </span>
       <span className="route-acts">
+        {a.checkable !== false && a.configured !== false && ["limited", "probably_open", "unknown"].includes(a.state) ? (
+          <>
+            <button type="button" className="sm" disabled={w.anyBusy}
+              onClick={() => void w.run(`check:${a.key}`, "khipu_route_check", { account: a.key })}>
+              <Busy on={w.isBusy(`check:${a.key}`)} />
+              Check now
+            </button>
+            {w.results[`check:${a.key}`] ? <span className="route-src" role="status">{w.results[`check:${a.key}`]}</span> : null}
+          </>
+        ) : null}
         <button
           ref={pauseBtn}
           type="button"
@@ -519,12 +540,38 @@ function AccountRow({ a, w, now, reportDefault }: { a: RouteAccount; w: Writer; 
       </span>
       {pausing ? <PauseForm a={a} formId={formId} w={w} onClose={close} /> : null}
       <DisagreePanel a={a} w={w} now={now} back={() => pauseBtn.current} />
-      {w.errors[liftId] || w.errors[clearId] ? (
+      {w.errors[`check:${a.key}`] || w.errors[liftId] || w.errors[clearId] ? (
         <div className="route-pause" role="group" aria-label={`${a.label}: the change failed`}>
+          <WriteError w={w} id={`check:${a.key}`} />
           <WriteError w={w} id={liftId} />
           <WriteError w={w} id={clearId} />
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function ResetChecksSection({ data, cfg, w, reread }: { data: RouteView | null; cfg: RouteConfig | null; w: Writer; reread: () => Promise<unknown> }) {
+  const enabled = cfg?.routing?.routing_reset_check?.value === true;
+  const next = (data?.accounts ?? []).filter((a) => a.next_check).map((a) => `${a.label}: ${whenLocal(a.next_check!, new Date())}`);
+  return (
+    <div className="section-card">
+      <div className="section-head">Checking for resets</div>
+      <div className="section-body">
+        <SwitchRow id="route-reset-check" label="Check an account at its reset time"
+          what="Khipu reads only an account's usage. It never sends a model turn."
+          tag={<Tag>{enabled ? "On" : "Off"}</Tag>} checked={enabled} disabled={!cfg || w.anyBusy}
+          busy={w.isBusy("reset-check")}
+          onChange={(on) => void w.run("reset-check", "khipu_config_set", { key: "routing_reset_check", value: on ? "on" : "off" }, reread)}
+          error={<WriteError w={w} id="reset-check" />} />
+        <div className="rows">
+          <LimitRow name="Wait after the reset time" help="Khipu checks after this wait." fields={[{ key: "routing_reset_check_wait", label: "Wait", unit: "time", options: [60, 120, 300] }]} cfg={cfg} w={w} reread={reread} />
+          <RetryTimesRow cfg={cfg} w={w} reread={reread} />
+          <LimitRow name="Wait while the Mac is busy" help="If load is over this number, Khipu waits before checking." fields={[{ key: "routing_busy_load", label: "Load", unit: "load", options: [50, 75, 90, 0], zero: "Never wait" }, { key: "routing_busy_wait", label: "Wait", unit: "time", options: [60, 300, 600, 0], zero: "Try again at the next look" }, { key: "routing_busy_tries", label: "Busy attempts", unit: "attempts", options: [1, 3, 5, 0], zero: "None: record it at once" }]} cfg={cfg} w={w} reread={reread} />
+        </div>
+        <p className="set-help">{next.length ? `Khipu checks again at ${next.join("; ")}.` : "No reset checks are scheduled."}</p>
+        <p className="set-help">{(data?.accounts ?? []).filter((a) => a.reset_check?.reason).map((a) => `${a.label}: ${a.reset_check?.reason}`).join("; ") || "No account has a reset-check reason."}</p>
+      </div>
     </div>
   );
 }
@@ -1092,6 +1139,34 @@ function LimitRow({
       ) : null}
     </div>
   );
+}
+
+function RetryTimesRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Writer; reread: () => Promise<unknown> }) {
+  const raw = cfg?.routing?.routing_reset_check_retries?.value;
+  const values = Array.isArray(raw) && raw.every((v) => typeof v === "number") ? raw as number[] : null;
+  const [first, setFirst] = useState("600");
+  const [second, setSecond] = useState("1800");
+  const [dirty, setDirty] = useState(false);
+  useEffect(() => {
+    if (values && !dirty) {
+      setFirst(values[0] != null ? String(values[0]) : "");
+      setSecond(values[1] != null ? String(values[1]) : "");
+    }
+  }, [values?.length, values?.[0], values?.[1], dirty]);
+  const id = "reset-retries";
+  // None, one or two retries: both empty removes them (fix round 1, F7).
+  const a = first.trim();
+  const b = second.trim();
+  const whole = (t: string) => /^\d+$/.test(t) && Number(t) > 0;
+  const valid = (a === "" && b === "") || (whole(a) && (b === "" || (whole(b) && Number(b) > Number(a))));
+  const value = `[${[a, b].filter((t) => t !== "").join(",")}]`;
+  const shown = values == null ? "…" : values.length === 0 ? "No retries" : values.map((v) => limitWords(v, "time")).join(" and ");
+  return <div className="row-item route-limit">
+    <span className="route-limit-text"><span className="route-limit-name">Try again after</span><span className="set-help">Up to two retry times when the same limit remains. Leave both empty for no retries.</span></span>
+    <span className="route-val">{shown}</span>
+    <span className="toolbar"><label>First retry (seconds)<input aria-label="First retry in seconds" value={first} onChange={(e) => { setDirty(true); setFirst(e.target.value); }} /></label><label>Second retry (seconds)<input aria-label="Second retry in seconds" value={second} onChange={(e) => { setDirty(true); setSecond(e.target.value); }} /></label><button type="button" className="sm" disabled={!valid || w.isBusy(id)} onClick={() => void w.run(id, "khipu_config_set", { key: "routing_reset_check_retries", value }, async () => { await reread(); setDirty(false); })}><Busy on={w.isBusy(id)} />Save</button></span>
+    {!valid ? <span className="set-error" role="alert">Use positive whole seconds, the second later than the first, or leave both empty for no retries.</span> : null}<WriteError w={w} id={id} />
+  </div>;
 }
 
 const M = 60;
@@ -2369,6 +2444,7 @@ export function RoutingSettings({ active, plans }: { active: boolean; plans?: Us
           <NoteSection data={data} w={w} now={now} />
           <RulesSection data={data} w={w} now={now} />
           <HoldsSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
+          <ResetChecksSection data={data} cfg={config.data} w={w} reread={rereadConfig} />
         </>
       ) : !route.error ? (
         <p className="set-help" role="status">

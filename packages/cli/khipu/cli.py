@@ -4507,6 +4507,8 @@ def build_parser() -> argparse.ArgumentParser:
     rt_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                          help="Print JSON (writes always do)")
     rt_sub = rt.add_subparsers(dest="route_cmd")
+    rcheck = rt_sub.add_parser("check", help="Check one account now without spending a turn", parents=[rt_json])
+    rcheck.add_argument("account", help="The account (its label, or harness|login folder)")
     rep = rt_sub.add_parser("report", help="Record what a conversation learned about an account", parents=[rt_json])
     rep.add_argument("--account", default=None, metavar="A", help="The account (its label, or harness|login folder)")
     rep.add_argument("--runner", default=None,

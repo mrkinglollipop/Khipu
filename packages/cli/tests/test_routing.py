@@ -8,13 +8,16 @@ process: one test makes any attempt fail.
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from khipu import routing
+from khipu import routing, usage
 
 T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
 ACCOUNTS = [{"label": "Claude", "harness": "claude"},
@@ -144,6 +147,474 @@ def test_an_account_that_cannot_be_checked_says_so_when_its_reset_passes():
     view = routing.fold([event], now=T0 + timedelta(hours=1), cfg=routing.settings({}), known=[muse])
     line = routing.account_line(view["accounts"][0], T0 + timedelta(hours=1))
     assert line == "Muse: its reset time passed (15:30Z); this account can't be checked without using a turn"
+
+
+def test_reset_check_schedule_uses_one_reset_identity_and_bounded_retries():
+    cfg = routing.settings({})
+    until = T0 + timedelta(hours=2)
+    entry = {"state": "limited", "until": routing._iso(until), "checkable": True}
+    assert routing.reset_check_due(entry, T0, cfg) == until + timedelta(seconds=120)
+    entry["reset_check"] = {"checks": 1, "busy_tries": 0, "status": "same_limit"}
+    assert routing.reset_check_due(entry, T0, cfg) == until + timedelta(minutes=10)
+    entry["reset_check"]["checks"] = 2
+    assert routing.reset_check_due(entry, T0, cfg) == until + timedelta(minutes=30)
+    entry["reset_check"]["checks"] = 3
+    assert routing.reset_check_due(entry, T0, cfg) is None
+
+
+def test_reset_check_schedule_defers_busy_and_never_checks_open_or_model_only_limits():
+    cfg = routing.settings({})
+    until = T0 + timedelta(hours=2)
+    entry = {"state": "limited", "until": routing._iso(until), "checkable": True,
+             "reset_check": {"checks": 0, "busy_tries": 1, "status": "busy", "next_at": routing._iso(T0 + timedelta(minutes=5))}}
+    assert routing.reset_check_due(entry, T0, cfg) == T0 + timedelta(minutes=5)
+    assert routing.reset_check_due(dict(entry, state="open"), T0, cfg) is None
+    assert routing.reset_check_due({"state": "open", "until": None,
+                                    "models": [{"until": routing._iso(until)}]}, T0, cfg) is None
+
+
+def test_same_limit_reset_check_keeps_its_retry_count_after_its_own_evidence(home, monkeypatch):
+    until = T0 + timedelta(minutes=20)
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    home["clock"].now = until + timedelta(minutes=2)
+    monkeypatch.setattr(usage, "probe_account", lambda account: {
+        "ok": True, "source": "live", "windows": [{"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}],
+    })
+    out = routing.check_account("Claude", scheduled=True, now=home["clock"](), load=lambda: 0)
+    assert out["outcome"] == "same_limit"
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["reset_check"]["checks"] == 1
+    assert routing.reset_check_due(entry, home["clock"](), routing.settings()) == until + timedelta(minutes=10)
+
+
+def test_same_reset_report_does_not_reset_the_check_budget(home):
+    until = T0 + timedelta(minutes=20)
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    home["clock"].now = until + timedelta(minutes=2)
+    row = {"ok": True, "source": "live", "windows": [
+        {"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]}
+    assert routing.check_account("Claude", scheduled=True, now=home["clock"](), probe=lambda _a: row,
+                                 load=lambda: 0)["checks"] == 1
+    # A separate source repeats the same reset. The reset, not that report's
+    # witness id, owns the durable counter.
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["reset_check"]["checks"] == 1
+    assert entry["next_check"] == routing._iso(until + timedelta(minutes=10))
+    # A new process can reconstruct the same identity and schedule from only
+    # the durable log.
+    events, bad = routing.read_events()
+    assert bad == 0
+    restarted = routing.fold(events, now=home["clock"](), cfg=routing.settings(), known=routing.accounts())
+    assert _account(restarted, "claude|")["next_check"] == routing._iso(until + timedelta(minutes=10))
+
+
+def test_malformed_or_untrusted_reset_check_metadata_is_ignored():
+    until = T0 + timedelta(hours=2)
+    limit = _ev(1, "limited", T0, "probe", basis="cli", until=until)
+    bad = {"type": "reset_check", "account": SECOND, "reset_until": routing._iso(until), "checks": "three",
+           "busy_tries": 0, "status": "same_limit", "written_at": routing._iso(T0), "written_by": {"kind": "check"}}
+    untrusted = dict(bad, checks=1, written_by={"kind": "conversation"})
+    entry = _state([limit, bad, untrusted], T0 + timedelta(minutes=1))
+    assert "reset_check" not in entry
+
+
+def test_later_reset_restarts_the_schedule_from_the_later_time(home, monkeypatch):
+    first, later = T0 + timedelta(minutes=20), T0 + timedelta(hours=2)
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(first)}")
+    home["clock"].now = first + timedelta(minutes=2)
+    monkeypatch.setattr(usage, "probe_account", lambda account: {"ok": True, "source": "live", "windows": [
+        {"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(later)}]})
+    assert routing.check_account("Claude", scheduled=True, now=home["clock"](), load=lambda: 0)["outcome"] == "later_limit"
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["next_check"] == routing._iso(later + timedelta(minutes=2))
+
+
+def test_busy_defers_three_times_then_records_exhaustion(home):
+    until = T0 + timedelta(minutes=20)
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    home["clock"].now = until + timedelta(minutes=2)
+    for _ in range(3):
+        out = routing.check_account("Claude", scheduled=True, now=home["clock"](), load=lambda: 100)
+        assert out["outcome"] == "busy"
+        home["clock"].advance(minutes=5)
+    out = routing.check_account("Claude", scheduled=True, now=home["clock"](), load=lambda: 100)
+    assert out["outcome"] == "busy_exhausted"
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["reset_check"]["status"] == "busy_exhausted"
+
+
+def test_reset_checks_never_probe_muse_unreadable_or_a_locked_usage_refresh(home, monkeypatch):
+    until = T0 + timedelta(minutes=20)
+    _report(account="Muse", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    home["clock"].now = until + timedelta(minutes=2)
+    monkeypatch.setattr(usage, "probe_account", lambda *_a: pytest.fail("Muse must not probe"))
+    assert routing.check_account("Muse", scheduled=True, now=home["clock"]())["outcome"] == "cannot_check"
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(home['clock']() + timedelta(minutes=20))}")
+    home["clock"].advance(minutes=22)
+    monkeypatch.setattr(usage, "_try_refresh_lock", lambda: None)
+    out = routing.check_account("Claude", scheduled=True, now=home["clock"](), load=lambda: 0)
+    assert out["outcome"] == "lock_wait"
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["reset_check"]["status"] == "lock_wait"
+    assert entry["reset_check"]["written_by"] == {"kind": "check"}
+    assert entry["next_check"] == routing._iso(home["clock"]() + timedelta(minutes=5))
+
+
+def test_unreadable_claude_account_records_cannot_check_without_vendor_text(home):
+    until = T0 + timedelta(minutes=20)
+    _report(account="Claude second", state="limited",
+            message=f"Limit reached, resets at {routing._iso(until)}")
+    home["clock"].now = until + timedelta(minutes=2)
+    out = routing.check_account("Claude second", scheduled=True, now=home["clock"](), load=lambda: 0,
+                                probe=lambda _a: {"ok": False, "error": usage.E_NO_LIMITS,
+                                                  "note": "/private/login detail"})
+    assert out["outcome"] == "cannot_check"
+    entry = _account(routing.read_view(home["clock"]()), SECOND)
+    assert entry["reset_check"]["reason"] == "This account can't be checked without using a turn"
+    assert "/private" not in json.dumps(entry)
+
+
+def test_wake_runs_a_due_reset_once_not_once_per_poll(home, monkeypatch):
+    until = T0 + timedelta(minutes=20)
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    home["clock"].now = until + timedelta(hours=2)
+    calls = []
+    monkeypatch.setattr(usage, "probe_account", lambda account: calls.append(account) or {"ok": True, "source": "live", "windows": [
+        {"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]})
+    assert len(routing.run_due_reset_checks(home["clock"](), probe=usage.probe_account, load=lambda: 0)) == 1
+    assert routing.run_due_reset_checks(home["clock"](), probe=usage.probe_account, load=lambda: 0) == []
+    assert len(calls) == 1
+
+
+def test_scheduled_check_revalidates_the_retry_budget_after_winning_the_usage_lock(home, monkeypatch):
+    until = T0 + timedelta(minutes=20)
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    home["clock"].now = until + timedelta(minutes=30)
+    routing._write(routing._reset_event("claude|", until, checks=2, busy_tries=0, lock_tries=0,
+                                        status="same_limit", next_at=home["clock"]()))
+    real_lock = usage._try_refresh_lock
+
+    def another_check_finished():
+        routing._write(routing._reset_event("claude|", until, checks=3, busy_tries=0, lock_tries=0,
+                                            status="same_limit"))
+        return real_lock()
+
+    monkeypatch.setattr(usage, "_try_refresh_lock", another_check_finished)
+    out = routing.check_account("Claude", scheduled=True, now=home["clock"](), load=lambda: 0,
+                                probe=lambda _a: pytest.fail("the stale caller must not spend a fourth probe"))
+    assert out["outcome"] == "not_due"
+    assert _account(routing.read_view(home["clock"]()), "claude|")["reset_check"]["checks"] == 3
+
+
+def test_error_outcomes_are_honest_durable_and_bounded(home):
+    until = T0 + timedelta(minutes=20)
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    home["clock"].now = until + timedelta(minutes=2)
+    out = routing.check_account("Claude", scheduled=True, now=home["clock"](), load=lambda: 0,
+                                probe=lambda _a: {"ok": False, "error": usage.E_TIMEOUT, "windows": []})
+    assert out == {"ok": True, "account": "claude|", "outcome": "error",
+                   "reason": "Khipu could not check this account because the usage check timed out", "checks": 1}
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["reset_check"]["status"] == "error"
+    assert entry["reset_check"]["reason"] == out["reason"]
+    assert entry["next_check"] == routing._iso(until + timedelta(minutes=10))
+
+
+def test_unknown_manual_failure_is_visible_and_open_accounts_are_not_checked(home):
+    out = routing.check_account("Claude", now=home["clock"](), load=lambda: 0,
+                                probe=lambda _a: {"ok": False, "error": usage.E_BAD, "windows": []})
+    assert out["outcome"] == "error"
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["state"] == "unknown"
+    assert entry["reset_check"]["reason"] == "Khipu could not read this account's usage"
+    _report(account="Codex", state="open")
+    with pytest.raises(routing.RouteError, match="limited, probably open or unknown"):
+        routing.check_account("Codex", now=home["clock"](), probe=lambda _a: pytest.fail("must not probe"),
+                              load=lambda: 0)
+
+
+def test_one_probe_preserves_whole_and_model_scoped_windows(home):
+    first = T0 + timedelta(minutes=20)
+    whole_later = T0 + timedelta(hours=2)
+    model_later = T0 + timedelta(hours=3)
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(first)}")
+    home["clock"].now = first + timedelta(minutes=2)
+    row = {"ok": True, "source": "live", "windows": [
+        {"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(whole_later)},
+        {"name": "weekly_model", "model": "Opus", "used_pct": 100,
+         "resets_at": routing._iso(model_later)},
+    ]}
+    out = routing.check_account("Claude", scheduled=True, now=home["clock"](), probe=lambda _a: row,
+                                load=lambda: 0)
+    assert out["outcome"] == "later_limit"
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["until"] == routing._iso(whole_later)
+    assert [(m["model"], m["until"]) for m in entry["models"]] == [("Opus", routing._iso(model_later))]
+    assert entry["next_check"] == routing._iso(whole_later + timedelta(minutes=2))
+
+
+# ---- fix round 1 of phase 5 -------------------------------------------------------------
+
+
+def _same_limit(until: datetime) -> dict:
+    return {"ok": True, "source": "live", "windows": [{"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]}
+
+
+def test_check_now_before_the_reset_never_spends_the_resets_checks(home, monkeypatch):
+    # F2: an early Check now counted against the reset's three and wrote
+    # next_at, so three early clicks left no check after the reset at all.
+    until = T0 + timedelta(hours=2)
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    probes: list[datetime] = []
+
+    def probe(_account):
+        probes.append(home["clock"]())
+        return _same_limit(until)
+
+    for minute in (0, 1, 2):
+        home["clock"].now = T0 + timedelta(minutes=minute)
+        out = routing.check_account("Claude", now=home["clock"](), probe=probe, load=lambda: 0)
+        assert out["outcome"] == "same_limit" and out["checks"] == 0
+    # Nor do early clicks while the Mac is busy or another usage check runs.
+    for _ in range(4):
+        out = routing.check_account("Claude", now=home["clock"](), probe=probe, load=lambda: 100)
+        assert out == {"ok": True, "account": "claude|", "outcome": "busy",
+                       "reason": "The Mac is busy; try again later"}
+    with monkeypatch.context() as m:
+        m.setattr(usage, "_try_refresh_lock", lambda: None)
+        for _ in range(4):
+            out = routing.check_account("Claude", now=home["clock"](), probe=probe, load=lambda: 0)
+            assert out["outcome"] == "lock_wait"
+            assert out["reason"] == "Another Khipu usage check is running; try again later"
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["next_check"] == routing._iso(until + timedelta(minutes=2))
+    probes.clear()
+    home["clock"].now = until + timedelta(minutes=2)
+    assert len(routing.run_due_reset_checks(home["clock"](), probe=probe, load=lambda: 0)) == 1
+    assert routing.run_due_reset_checks(home["clock"](), probe=probe, load=lambda: 0) == []
+    assert probes == [until + timedelta(minutes=2)]
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["reset_check"]["checks"] == 1
+    assert entry["next_check"] == routing._iso(until + timedelta(minutes=10))
+
+
+def test_check_now_after_the_reset_and_its_wait_counts_as_the_check(home):
+    until = T0 + timedelta(minutes=20)
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    home["clock"].now = until + timedelta(minutes=3)
+    out = routing.check_account("Claude", now=home["clock"](), probe=lambda _a: _same_limit(until), load=lambda: 0)
+    assert out["checks"] == 1
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["next_check"] == routing._iso(until + timedelta(minutes=10))
+
+
+def test_check_now_on_unknown_account_reports_a_new_limit(home):
+    until = T0 + timedelta(hours=3)
+    assert _account(routing.read_view(), "claude|")["state"] == "unknown"
+    out = routing.check_account("Claude", probe=lambda _a: _same_limit(until), load=lambda: 0)
+    assert (out["outcome"], out["reason"]) == ("later_limit", "Khipu read a limit")
+    entry = _account(routing.read_view(), "claude|")
+    assert (entry["state"], entry["until"]) == ("limited", routing._iso(until))
+    events, unreadable = routing.read_events()
+    assert unreadable == 0 and events[-1]["reason"] == "Khipu read a limit"
+    assert entry["next_check"] == routing._iso(until + timedelta(minutes=2))
+
+
+def test_an_account_removed_from_settings_while_limited_is_never_checked(home, capsys):
+    # F3: the record still held Claude, so it stayed due and showed Check now;
+    # its check raised and every poll child failed before reaching Codex.
+    until = T0 + timedelta(minutes=20)
+    for account in ("Claude", "Codex"):
+        _report(account=account, state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    _set(home, usage_accounts=[a for a in ACCOUNTS if a["label"] != "Claude"])
+    home["clock"].now = until + timedelta(minutes=3)
+    rc, out = _cli(["route", "--json"], capsys)
+    claude = _account(json.loads(out), "claude|")
+    assert rc == 0 and claude["configured"] is False and claude.get("next_check") is None
+    assert claude["line"].endswith("Khipu can't check this account: it isn't in Settings → Models")
+    assert _account(json.loads(out), "codex|")["configured"] is True
+    with pytest.raises(routing.RouteError, match="isn't in Settings"):
+        routing.check_account("claude|", now=home["clock"](), probe=lambda _a: pytest.fail("no probe"),
+                              load=lambda: 0)
+    probed: list[str] = []
+
+    def probe(account):
+        probed.append(account["label"])
+        return _same_limit(until)
+
+    out = routing.run_due_reset_checks(home["clock"](), probe=probe, load=lambda: 0, max_checks=1)
+    assert [o["account"] for o in out] == ["codex|"] and probed == ["Codex"]
+
+
+def test_a_due_account_that_cannot_be_checked_never_strands_the_next_one(home, monkeypatch):
+    # F3: an account listed but no longer readable (its CLI gone) raised out
+    # of run_due_reset_checks; it is now recorded and the next account runs.
+    until = T0 + timedelta(minutes=20)
+    for account in ("Claude", "Codex"):
+        _report(account=account, state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    home["clock"].now = until + timedelta(minutes=3)
+    real = routing.accounts
+    monkeypatch.setattr(routing, "accounts", lambda: [a for a in real() if a["key"] != "claude|"])
+    probed: list[str] = []
+
+    def probe(account):
+        probed.append(account["label"])
+        return _same_limit(until)
+
+    out = routing.run_due_reset_checks(home["clock"](), probe=probe, load=lambda: 0, max_checks=1)
+    assert [o["outcome"] for o in out] == ["not_checked", "same_limit"] and probed == ["Codex"]
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["reset_check"]["reason"] == "Khipu can't check this account: it isn't in Settings → Models"
+    assert entry.get("next_check") is None
+    assert routing.run_due_reset_checks(home["clock"](), probe=probe, load=lambda: 0) == []
+
+
+def test_a_check_that_reads_an_earlier_reset_time_keeps_one_probe_per_check(home):
+    # F4: the check's own cli time moved until earlier, the saved outcome no
+    # longer matched, and the counter started again: two probes in a minute.
+    reported, read = T0 + timedelta(minutes=30), T0 + timedelta(minutes=25)
+    _report(account="Claude", state="limited", until=routing._iso(reported))
+    assert _account(routing.read_view(home["clock"]()), "claude|")["basis"] == "estimated"
+    probes: list[datetime] = []
+
+    def probe(_account):
+        probes.append(home["clock"]())
+        return _same_limit(read)
+
+    home["clock"].now = T0 + timedelta(minutes=32)
+    assert [o["outcome"] for o in routing.run_due_reset_checks(home["clock"](), probe=probe, load=lambda: 0)] \
+        == ["same_limit"]
+    assert routing.run_due_reset_checks(home["clock"](), probe=probe, load=lambda: 0) == []
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert (entry["until"], entry["basis"]) == (routing._iso(read), "cli")
+    assert entry["reset_check"]["checks"] == 1
+    assert entry["next_check"] == routing._iso(read + timedelta(minutes=10))
+    for minute in (35, 55, 90):
+        home["clock"].now = T0 + timedelta(minutes=minute)
+        routing.run_due_reset_checks(home["clock"](), probe=probe, load=lambda: 0)
+    assert probes == [T0 + timedelta(minutes=m) for m in (32, 35, 55)]
+
+
+def _run_at_next_check(home, load: float) -> dict:
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    home["clock"].now = routing._parse(entry["next_check"])
+    out = routing.run_due_reset_checks(home["clock"](), probe=lambda _a: _same_limit(T0 + timedelta(minutes=20)),
+                                       load=lambda: load)
+    assert len(out) == 1
+    return out[0]
+
+
+def test_each_check_gets_its_own_busy_waits(home):
+    # F5: busy_tries ran across the whole reset, so a retry could wait only
+    # once before "not checked", though the account had been checked.
+    until = T0 + timedelta(minutes=20)
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    seen = [_run_at_next_check(home, load) for load in (100, 100, 0, 100, 100, 100, 100)]
+    assert [o["outcome"] for o in seen] == ["busy", "busy", "same_limit", "busy", "busy", "busy", "busy_exhausted"]
+    assert seen[-1]["reason"] == "not checked again: the Mac was busy"
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert routing.account_line(entry, home["clock"]()).endswith("not checked again: the Mac was busy")
+
+
+def test_zero_busy_tries_and_zero_busy_wait_are_settings_not_defaults(home):
+    # F6: ``or 3`` and ``or 300`` read 0 as the default.
+    _set(home, routing_busy_tries=0, routing_busy_wait=0)
+    assert (routing.settings()["routing_busy_tries"], routing.settings()["routing_busy_wait"]) == (0, 0)
+    until = T0 + timedelta(minutes=20)
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    home["clock"].now = until + timedelta(minutes=2)
+    out = routing.check_account("Claude", scheduled=True, now=home["clock"](), load=lambda: 100,
+                                probe=lambda _a: pytest.fail("no probe while busy"))
+    assert (out["outcome"], out["reason"]) == ("busy_exhausted", "not checked: the Mac was busy")
+    _set(home, routing_busy_tries=3)
+    _report(account="Codex", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    assert routing.check_account("Codex", scheduled=True, now=home["clock"](), load=lambda: 100)["outcome"] == "busy"
+    # A wait of 0: tried again at the helper's next look.
+    assert _account(routing.read_view(home["clock"]()), "codex|")["next_check"] == routing._iso(home["clock"]())
+
+
+def test_a_check_now_nothing_will_retry_promises_nothing(home, monkeypatch):
+    # F8: an unknown account's busy Check now said "Khipu will try again".
+    out = routing.check_account("Codex", now=home["clock"](), load=lambda: 100,
+                                probe=lambda _a: pytest.fail("no probe while busy"))
+    assert out["reason"] == "The Mac is busy; try again later"
+    monkeypatch.setattr(usage, "_try_refresh_lock", lambda: None)
+    out = routing.check_account("Codex", now=home["clock"](), load=lambda: 0)
+    assert out["reason"] == "Another Khipu usage check is running; try again later"
+    entry = _account(routing.read_view(home["clock"]()), "codex|")
+    assert entry.get("next_check") is None
+    assert "will try again" not in json.dumps(entry)
+
+
+def test_the_retries_can_be_removed(home, capsys):
+    # F7: decision 13, every interval can be removed: an empty list is no retries.
+    rc, out = _cli(["config", "--set", "routing_reset_check_retries", "[]"], capsys)
+    assert rc == 0 and json.loads(out)["routing_reset_check_retries"]["value"] == []
+    until = T0 + timedelta(minutes=20)
+    _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+    home["clock"].now = until + timedelta(minutes=2)
+    routing.check_account("Claude", scheduled=True, now=home["clock"](), probe=lambda _a: _same_limit(until),
+                          load=lambda: 0)
+    assert _account(routing.read_view(home["clock"]()), "claude|").get("next_check") is None
+
+
+def test_manual_probe_child_is_bounded_and_reaped(home, monkeypatch, tmp_path):
+    pid_file = tmp_path / "probe-child.pid"
+
+    def stuck(_account):
+        pid_file.write_text(str(os.getpid()))
+        time.sleep(60)
+
+    monkeypatch.setattr(usage, "probe_account", stuck)
+    monkeypatch.setattr(usage, "TIMEOUT_S", 0.05)
+    monkeypatch.setattr(usage, "OVERALL_GRACE_S", 0.05)
+    started = time.monotonic()
+    row = routing._probe_check_child({"label": "Claude", "harness": "claude"}, None)
+    assert row["error"] == usage.E_TIMEOUT and time.monotonic() - started < 2
+    pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_probe_child_keeps_the_refresh_lock_until_cleanup_if_its_parent_dies(home, monkeypatch, tmp_path):
+    probe_pid_file = tmp_path / "orphan-probe.pid"
+
+    def stuck(_account):
+        probe_pid_file.write_text(str(os.getpid()))
+        time.sleep(60)
+
+    monkeypatch.setattr(usage, "probe_account", stuck)
+    monkeypatch.setattr(usage, "TIMEOUT_S", 0.3)
+    monkeypatch.setattr(usage, "OVERALL_GRACE_S", 0.1)
+    caller = os.fork()
+    if caller == 0:
+        try:
+            routing.check_account("Claude", now=home["clock"](), load=lambda: 0)
+        finally:
+            os._exit(0)
+    try:
+        deadline = time.monotonic() + 2
+        while not probe_pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert probe_pid_file.exists()
+        probe_pid = int(probe_pid_file.read_text())
+        os.kill(caller, 9)
+        os.waitpid(caller, 0)
+        assert usage._try_refresh_lock() is None  # live probe still excludes another refresh
+        fd = None
+        deadline = time.monotonic() + 2
+        while fd is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+            fd = usage._try_refresh_lock()
+        assert fd is not None
+        usage._release(fd)
+        with pytest.raises(ProcessLookupError):
+            os.kill(probe_pid, 0)
+    finally:
+        with contextlib.suppress(OSError, ChildProcessError):
+            os.kill(caller, 9)
+            os.waitpid(caller, 0)
 
 
 # ---- through the record ----------------------------------------------------------------
@@ -522,6 +993,16 @@ def test_the_cli_reads_and_reports(home, capsys, monkeypatch):
     hold_id = json.loads(out)["id"]
     rc, out = _cli(["route", "hold", "end", hold_id], capsys)
     assert rc == 0 and json.loads(out)["ended"] == hold_id
+
+
+def test_route_check_passes_one_literal_account_argument(home, capsys, monkeypatch):
+    seen = []
+    monkeypatch.setattr(routing, "check_account", lambda account, **_kw: seen.append(account) or {
+        "ok": True, "account": account, "outcome": "error", "reason": "Khipu could not read this account's usage"})
+    literal = "Claude; $(touch never)"
+    rc, out = _cli(["route", "check", literal], capsys)
+    assert rc == 0 and seen == [literal]
+    assert json.loads(out)["account"] == literal
 
 
 def test_routing_settings_are_checked_and_refuse_private_folders(home, capsys):
@@ -1717,9 +2198,6 @@ def test_recent_changes_name_the_owner_in_settings_for_every_change_made_in_the_
 # setting that is not an option at all. Each leaves this list in the PR that
 # builds it, so the test below then asks for its control.
 NOT_IN_THE_APP_YET = {
-    # Phase 5: the check at reset times.
-    "routing_reset_check", "routing_reset_check_wait", "routing_reset_check_retries",
-    "routing_busy_load", "routing_busy_wait", "routing_busy_tries",
     # Phase 6: the push before handing work to another agent.
     "routing_push_delegation",
     # Phase 7: the copy for cloud agents.
@@ -1773,3 +2251,169 @@ def test_every_limit_a_refusal_names_can_be_raised_in_the_app():
         assert key in routing.SETTINGS, key
         assert key in allowed, f"{key} is not in the app's allowlist"
         assert f'key: "{key}"' in page, f"{key} has no row on Settings -> Routing"
+
+
+# ---- fix round 2 of phase 5 -------------------------------------------------------------
+
+
+def _limited(account: str, until: datetime) -> None:
+    _report(account=account, state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
+
+
+def test_a_reset_check_never_takes_codex_last_turn_figures_as_a_reading(home):
+    # R2-1: the rollout fallback (the last turn's figures, used when the live
+    # read failed) reopened the account as "checked by Khipu just now".
+    until = T0 + timedelta(minutes=20)
+    _limited("Codex", until)
+
+    def rollout(live_error: str) -> dict:
+        return {"ok": True, "source": "rollout", "live_error": live_error,
+                "observed_at": routing._iso(T0 - timedelta(hours=1)),
+                "windows": [{"name": "five_hour", "used_pct": 40, "resets_at": routing._iso(T0 + timedelta(hours=4))}]}
+
+    home["clock"].now = until + timedelta(minutes=2)
+    out = routing.check_account("Codex", scheduled=True, now=home["clock"](), load=lambda: 0, in_child=True,
+                                probe=lambda _a: rollout(usage.E_NOT_INSTALLED))
+    assert (out["outcome"], out["reason"]) == (
+        "error", "Khipu could not check this account because its CLI is not installed")
+    entry = _account(routing.read_view(home["clock"]()), "codex|")
+    assert entry["state"] == "probably_open" and entry["witness"]["source"] != "check"
+    assert "open; checked by Khipu" not in routing.account_line(entry, home["clock"]())
+    home["clock"].now = until + timedelta(minutes=10)
+    out = routing.check_account("Codex", scheduled=True, now=home["clock"](), load=lambda: 0,
+                                probe=lambda _a: rollout(usage.E_TIMEOUT))
+    assert (out["outcome"], out["reason"]) == (
+        "error", "Khipu could not check this account because the usage check timed out")
+    # Signed out: the account can't be checked, never "open".
+    home["clock"].now = until + timedelta(minutes=30)
+    out = routing.check_account("Codex", scheduled=True, now=home["clock"](), load=lambda: 0,
+                                probe=lambda _a: rollout(usage.E_SIGNIN))
+    assert out["outcome"] == "cannot_check"
+    entry = _account(routing.read_view(home["clock"]()), "codex|")
+    assert entry["state"] == "probably_open"
+    assert routing.account_line(entry, home["clock"]()).endswith("This account can't be checked without using a turn")
+    # A live read is still a reading.
+    _limited("Codex", home["clock"]() + timedelta(minutes=20))
+    home["clock"].advance(minutes=22)
+    out = routing.check_account("Codex", scheduled=True, now=home["clock"](), load=lambda: 0, probe=lambda _a: {
+        "ok": True, "source": "live", "windows": [{"name": "five_hour", "used_pct": 40,
+                                                   "resets_at": routing._iso(T0 + timedelta(hours=6))}]})
+    assert out["outcome"] == "open"
+    assert _account(routing.read_view(home["clock"]()), "codex|")["state"] == "open"
+
+
+def test_a_check_now_nothing_will_retry_after_the_reset_promises_nothing(home, monkeypatch):
+    # R2-4: with reset checks off, a counted Check now that found the Mac
+    # busy (or the lock held) wrote "Khipu will try again", and nothing did.
+    _set(home, routing_reset_check=False)
+    until = T0 + timedelta(minutes=20)
+    _limited("Claude", until)
+    home["clock"].now = until + timedelta(minutes=5)
+    out = routing.check_account("Claude", now=home["clock"](), load=lambda: 99,
+                                probe=lambda _a: pytest.fail("no probe while busy"))
+    assert out["reason"] == "The Mac is busy; try again later"
+    with monkeypatch.context() as m:
+        m.setattr(usage, "_try_refresh_lock", lambda: None)
+        out = routing.check_account("Claude", now=home["clock"](), load=lambda: 0)
+        assert out["reason"] == "Another Khipu usage check is running; try again later"
+    for _ in range(24):
+        home["clock"].advance(minutes=5)
+        assert routing.run_due_reset_checks(home["clock"](), probe=lambda _a: pytest.fail("no check"),
+                                            load=lambda: 0) == []
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry.get("next_check") is None
+    assert "will try again" not in routing.account_line(entry, home["clock"]())
+    assert "will try again" not in json.dumps(entry)
+
+
+def test_a_check_now_after_three_checks_never_schedules_a_fourth(home, monkeypatch):
+    # R2-4 / R2-6: a counted deferral after the reset's three checks wrote a
+    # busy or lock_wait record with a next check, and a fourth probe followed.
+    until = T0 + timedelta(minutes=20)
+    _limited("Claude", until)
+    routing._write(routing._reset_event("claude|", until, checks=3, busy_tries=0, lock_tries=0,
+                                        status="same_limit"))
+    home["clock"].now = until + timedelta(hours=1)
+    out = routing.check_account("Claude", now=home["clock"](), load=lambda: 99,
+                                probe=lambda _a: pytest.fail("no probe while busy"))
+    assert out["reason"] == "The Mac is busy; try again later"
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["reset_check"]["checks"] == 3 and entry.get("next_check") is None
+
+
+def test_a_lock_deferral_never_rolls_back_a_check_written_meanwhile(home, monkeypatch):
+    # R2-6: the deferral wrote its record from the snapshot read before the
+    # lock attempt, over the third check another process had just written.
+    until = T0 + timedelta(minutes=20)
+    _limited("Claude", until)
+    routing._write(routing._reset_event("claude|", until, checks=2, busy_tries=0, lock_tries=0,
+                                        status="same_limit", next_at=until + timedelta(minutes=30)))
+    home["clock"].now = T0 + timedelta(hours=1, minutes=10)
+
+    def third_check_holds_the_lock():
+        routing._write(routing._reset_event("claude|", until, checks=3, busy_tries=0, lock_tries=0,
+                                            status="same_limit"))
+        return None
+
+    monkeypatch.setattr(usage, "_try_refresh_lock", third_check_holds_the_lock)
+    out = routing.check_account("Claude", now=home["clock"](), load=lambda: 0)
+    assert out["outcome"] == "lock_wait"
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert (entry["reset_check"]["checks"], entry["reset_check"]["status"]) == (3, "same_limit")
+    assert entry.get("next_check") is None
+    # And the fold never lets a stale deferral roll a reset's checks back.
+    routing._write(routing._reset_event("claude|", until, checks=2, busy_tries=0, lock_tries=1,
+                                        status="lock_wait", next_at=home["clock"]()))
+    entry = _account(routing.read_view(home["clock"]()), "claude|")
+    assert entry["reset_check"]["checks"] == 3 and entry.get("next_check") is None
+
+
+def test_a_cli_khipu_cannot_find_is_not_called_missing_from_settings(home, monkeypatch):
+    # R2-7: with no usage_accounts, a CLI not on PATH was scheduled, then
+    # recorded as "it isn't in Settings -> Models", which is not so.
+    _set(home, usage_accounts=None)
+    monkeypatch.setattr(usage, "_command", lambda harness: "/fake/bin/claude" if harness == "claude" else None)
+    until = T0 + timedelta(minutes=20)
+    _limited("Codex", until)
+    home["clock"].now = until + timedelta(minutes=2)
+    entry = _account(routing.read_view(home["clock"]()), "codex|")
+    assert entry["configured"] is True and entry["next_check"] == routing._iso(home["clock"]())
+    out = routing.run_due_reset_checks(home["clock"](), probe=lambda _a: pytest.fail("nothing to probe"),
+                                       load=lambda: 0)
+    reason = "Khipu could not check this account because its CLI is not installed"
+    assert [(o["outcome"], o.get("reason")) for o in out] == [("error", reason)]
+    entry = _account(routing.read_view(home["clock"]()), "codex|")
+    line = routing.account_line(entry, home["clock"]())
+    assert line.endswith(reason) and "Settings" not in line
+    out = routing.check_account("Codex", now=home["clock"](), load=lambda: 0,
+                                probe=lambda _a: pytest.fail("nothing to probe"))
+    assert (out["outcome"], out["reason"]) == ("error", reason)
+
+
+def test_a_sign_in_failure_before_the_reset_leaves_the_resets_check_in_place(home):
+    # R2-8: an early Check now that read a sign-in failure stored
+    # "can't be checked" under the reset, so the reset's check never ran.
+    until = T0 + timedelta(hours=2)
+    _limited("Claude second", until)
+    out = routing.check_account("Claude second", now=home["clock"](), load=lambda: 0,
+                                probe=lambda _a: {"ok": False, "error": usage.E_SIGNIN, "windows": []})
+    assert out["outcome"] == "cannot_check"
+    entry = _account(routing.read_view(home["clock"]()), SECOND)
+    assert entry["next_check"] == routing._iso(until + timedelta(minutes=2))
+    probes: list[datetime] = []
+
+    def signed_in(_account):
+        probes.append(home["clock"]())
+        return {"ok": True, "source": "live", "windows": [{"name": "five_hour", "used_pct": 10,
+                                                           "resets_at": routing._iso(until + timedelta(hours=5))}]}
+
+    home["clock"].now = until + timedelta(minutes=2)
+    assert [o["outcome"] for o in routing.run_due_reset_checks(home["clock"](), probe=signed_in, load=lambda: 0)] \
+        == ["open"]
+    assert probes == [until + timedelta(minutes=2)]
+    # Muse's "can't be checked" is a fact about the account: still shown.
+    _limited("Muse", until + timedelta(hours=1))
+    routing.check_account("Muse", now=home["clock"](), load=lambda: 0, probe=lambda _a: pytest.fail("no probe"))
+    home["clock"].now = until + timedelta(hours=1, minutes=1)
+    entry = _account(routing.read_view(home["clock"]()), "muse|")
+    assert routing.account_line(entry, home["clock"]()).endswith("can't be checked without using a turn")

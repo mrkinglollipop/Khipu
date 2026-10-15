@@ -64,7 +64,8 @@ def home(tmp_path, monkeypatch):
     # A generous routing budget, so a loaded test machine never makes a content test flaky;
     # the latency tests set their own.
     (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS,
-                                                  "routing_prompt_budget_ms": 1000}))
+                                                  "routing_prompt_budget_ms": 1000,
+                                                  "routing_reset_check": False}))
     capture = Path(tempfile.mkdtemp(prefix="krp-", dir="/tmp"))  # AF_UNIX paths are short
     monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(capture))

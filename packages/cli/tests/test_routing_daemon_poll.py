@@ -13,8 +13,11 @@ tests use fake clocks; the helper's tests run the real helper process.
 """
 from __future__ import annotations
 
+import contextlib
+import errno
 import json
 import os
+import signal
 import shutil
 import sys
 import tempfile
@@ -62,7 +65,8 @@ class Clocks:
 def home(tmp_path, monkeypatch):
     data = tmp_path / "data"
     data.mkdir()
-    (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS, "routing_prompt_budget_ms": 1000}))
+    (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS, "routing_prompt_budget_ms": 1000,
+                                                   "routing_reset_check": False}))
     capture = Path(tempfile.mkdtemp(prefix="krd-", dir="/tmp"))  # AF_UNIX paths are short
     monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(capture))
@@ -224,9 +228,139 @@ def _helper_poll(schedule) -> dict:
     """A poll as the helper runs it: the view's stat first, then the child's
     poll, then the helper takes its answer."""
     schedule.view_seen = recall_prompt._view_stat(routing)
-    out = recall_prompt._poll_once(routing)
+    out = recall_prompt._poll_once(routing, blocked_resets=schedule.live_blocks())
+    out = json.loads(json.dumps(out))  # a child's answer crosses the pipe as JSON
     recall_prompt._take_poll_answer(schedule, out)
     return out
+
+
+@pytest.mark.parametrize("push", [False, True])
+@pytest.mark.parametrize("failure", [errno.ENOSPC, errno.EACCES])
+def test_failed_reset_outcome_write_stops_repeated_probes(home, monkeypatch, push, failure):
+    clocks = home["clocks"]
+    _set(home, routing_push_prompt=push, routing_reset_check=True, routing_busy_load=0)
+    until = T0 + timedelta(minutes=20)
+    routing.report(account="Claude", state="limited", until=routing._iso(until), author=ME)
+    clocks.run(22 * 60)
+    probed = []
+
+    def probe(account):
+        probed.append(account["label"])
+        return {"ok": True, "source": "live", "windows": [
+            {"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]}
+
+    def cannot_append(*_events):
+        raise OSError(failure, "fake write failure")
+
+    monkeypatch.setattr("khipu.usage.probe_account", probe)
+    append = routing._append_locked
+    monkeypatch.setattr(routing, "_append_locked", cannot_append)
+    schedule = _schedule(home)
+    outcomes = []
+    for _ in range(int(recall_prompt._BLOCKED_RESET_RETRY_S // 10) - 2):  # within the block
+        recall_prompt._look_at_settings(schedule, routing)
+        if schedule.due():
+            outcomes.extend(_helper_poll(schedule)["reset_checks"])
+        clocks.run(10)
+    assert probed == ["Claude"]
+    assert [o["outcome"] for o in outcomes] == ["write_failed"]
+    # A later account and a genuinely new reset are still eligible.
+    monkeypatch.setattr(routing, "_append_locked", append)
+    routing.report(account="Codex", state="limited", until=routing._iso(until), author=ME)
+    recall_prompt._look_at_settings(schedule, routing)
+    _helper_poll(schedule)
+    assert probed == ["Claude", "Codex"]
+    new_until = clocks.now + timedelta(minutes=1)
+    routing.report(account="Claude", state="limited", until=routing._iso(new_until), author=ME)
+    clocks.run(3 * 60)
+    recall_prompt._look_at_settings(schedule, routing)
+    _helper_poll(schedule)
+    assert probed == ["Claude", "Codex", "Claude"]
+
+
+def test_a_reset_whose_outcome_could_not_be_written_is_checked_again_once_the_disk_recovers(home, monkeypatch):
+    # Re-check of fix round 3: the block on a reset whose outcome could not be
+    # written never ended, so after the disk recovered that reset was never
+    # checked again. A block lasts _BLOCKED_RESET_RETRY_S, then the same reset
+    # is probed again: at most one probe per that wait while the disk is broken.
+    clocks = home["clocks"]
+    _set(home, routing_push_prompt=False, routing_reset_check=True, routing_busy_load=0)
+    until = T0 + timedelta(minutes=20)
+    routing.report(account="Claude", state="limited", until=routing._iso(until), author=ME)
+    clocks.run(22 * 60)
+    probed = []
+
+    def probe(account):
+        probed.append(clocks.now)
+        return {"ok": True, "source": "live", "windows": [
+            {"name": "five_hour", "used_pct": 0, "resets_at": routing._iso(until)}]}
+
+    def cannot_append(*_events):
+        raise OSError(errno.ENOSPC, "fake write failure")
+
+    monkeypatch.setattr("khipu.usage.probe_account", probe)
+    append = routing._append_locked
+    monkeypatch.setattr(routing, "_append_locked", cannot_append)
+    schedule = _schedule(home)
+    wait = recall_prompt._BLOCKED_RESET_RETRY_S
+
+    def step(seconds: float) -> None:
+        for _ in range(int(seconds // 10)):
+            recall_prompt._look_at_settings(schedule, routing)
+            if schedule.due():
+                _helper_poll(schedule)
+            clocks.run(10)
+
+    step(wait - 20)
+    assert len(probed) == 1  # blocked: no probe every 10 s while the disk is broken
+    monkeypatch.setattr(routing, "_append_locked", append)  # the disk recovers
+    step(wait)
+    assert len(probed) == 2  # the same reset is checked again
+    entry = next(a for a in routing.read_view()["accounts"] if a["key"] == "claude|")
+    assert entry["state"] == "open", entry
+
+
+@pytest.mark.parametrize("setting,old,new", [
+    ("routing_reset_check_wait", 3600, 120),
+    ("routing_reset_check_retries", [3600, 7200], [600, 1800]),
+    ("routing_busy_wait", 3600, 300),
+])
+def test_checks_only_helper_honours_changed_reset_settings(home, monkeypatch, setting, old, new):
+    clocks = home["clocks"]
+    _set(home, routing_push_prompt=False, routing_reset_check=True, routing_busy_load=1, **{setting: old})
+    until = T0 + timedelta(minutes=20)
+    routing.report(account="Claude", state="limited", until=routing._iso(until), author=ME)
+    probed = []
+
+    def probe(_account):
+        probed.append(clocks.now)
+        return {"ok": True, "source": "live", "windows": [
+            {"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]}
+
+    monkeypatch.setattr("khipu.usage.probe_account", probe)
+    monkeypatch.setattr(routing.os, "getloadavg", lambda: (0, 0, 0))
+    if setting != "routing_reset_check_wait":
+        clocks.run(22 * 60)
+        routing.check_account("Claude", scheduled=True, probe=probe,
+                              load=lambda: 2 if setting == "routing_busy_wait" else 0)
+    schedule = _schedule(home)
+    recall_prompt._look_at_settings(schedule, routing)
+    _helper_poll(schedule)
+    old_due = schedule.valid_until
+    _set(home, **{setting: new})
+    clocks.run(5)
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due() == ["look"]
+    _helper_poll(schedule)
+    expected = until + timedelta(minutes={"routing_reset_check_wait": 2,
+                                          "routing_reset_check_retries": 10, "routing_busy_wait": 7}[setting])
+    assert schedule.valid_until == expected.timestamp() < old_due
+    clocks.run((expected - clocks.now).total_seconds())
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due()
+    before = len(probed)
+    _helper_poll(schedule)
+    assert probed[before:] == [expected]
 
 
 @pytest.mark.parametrize("interval", [0, "1h"])
@@ -566,6 +700,167 @@ def test_the_helper_refolds_at_valid_until_with_no_prompt_and_never_in_the_daemo
     view = _wait(lambda: (v := routing._load_view()) and v["version"] > version and v)
     codex = next(a for a in view["accounts"] if a["label"] == "Codex")
     assert codex["state"] == routing.PROBABLY_OPEN
+
+
+def test_reset_checks_keep_the_helper_alive_with_prompt_push_off(home, monkeypatch):
+    _set(home, routing_push_prompt=False, routing_reset_check=True, routing_poll_interval=0)
+    monkeypatch.setattr(recall_daemon, "_ROUTING_LOOK_S", 0.0)
+    svc = recall_daemon.RecallService(home["capture"] / "reset-only.sock", stamp_fn=lambda: "fixed",
+                                      idle_check=False)
+    try:
+        assert recall_prompt.daemon_routing_on()
+        assert svc.start_routing()
+        assert svc.routing_forkserver.wait_ready(10)
+        _set(home, routing_reset_check=False)
+        assert not svc.keep_routing()
+        assert svc.routing_forkserver._proc is None
+    finally:
+        svc.close()
+
+
+def test_sleep_wake_checks_each_overdue_account_once_with_source_poll_off(home, monkeypatch):
+    _set(home, routing_reset_check=True, routing_poll_interval=0)
+    until = T0 + timedelta(minutes=20)
+    for account in ("Claude", "Codex"):
+        routing.report(account=account, state="limited", until=routing._iso(until), author=ME)
+    home["clocks"].now = until + timedelta(hours=2)
+    calls = []
+
+    def same_limit(account):
+        calls.append(account["label"])
+        return {"ok": True, "source": "live", "windows": [
+            {"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]}
+
+    monkeypatch.setattr("khipu.usage.probe_account", same_limit)
+    first = recall_prompt._poll_once(routing)
+    assert first["due"] == home["clocks"].wall()
+    second = recall_prompt._poll_once(routing)
+    assert sorted(calls) == ["Claude", "Codex"]
+    assert second["due"] > home["clocks"].wall()
+
+
+def test_with_the_push_off_reset_checks_never_poll_and_wake_only_at_the_next_check(home, monkeypatch):
+    # Fix round 1, F1: reset checks (on by default) kept the helper's poll
+    # interval with the push off, so every interval a child ran poll_refold.
+    clocks = home["clocks"]
+    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "0")
+    monkeypatch.setenv("ROUTING_NOW_OFF", "1")
+    _set(home, routing_push_prompt=False, routing_reset_check=True, routing_busy_load=0)
+    assert routing.push_off("prompt") and routing.poll_interval() == 10.0
+    until = T0 + timedelta(minutes=20)
+    routing.report(account="Claude", state="limited", until=routing._iso(until), author=ME)
+    monkeypatch.setattr(routing, "poll_refold", lambda **_k: pytest.fail("the poll child refolded with the push off"))
+    probed: list[str] = []
+
+    def same_limit(account):
+        probed.append(account["label"])
+        return {"ok": True, "source": "live", "windows": [{"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]}
+
+    monkeypatch.setattr("khipu.usage.probe_account", same_limit)
+    schedule = _schedule(home, interval=10.0)
+    recall_prompt._look_at_settings(schedule, routing)
+    assert not schedule.off and schedule.checks_only and schedule.interval is None
+    assert schedule.due() == ["look"]  # the start reads the saved view once, without a refold
+    _helper_poll(schedule)
+    first = until + timedelta(minutes=2)
+    assert probed == [] and schedule.valid_until == first.timestamp() and schedule.next_poll is None
+    while clocks.now + timedelta(seconds=5) < first:  # no poll interval, no view.json change: nothing due
+        clocks.run(5)
+        recall_prompt._look_at_settings(schedule, routing)
+        assert schedule.due() == []
+    clocks.run((first - clocks.now).total_seconds())
+    assert schedule.due() == ["clock"]
+    out = _helper_poll(schedule)
+    assert probed == ["Claude"] and [c["outcome"] for c in out["reset_checks"]] == ["same_limit"]
+    assert schedule.valid_until == (until + timedelta(minutes=10)).timestamp()
+    recall_prompt._look_at_settings(schedule, routing)  # the check's own save makes nothing due
+    assert schedule.due() == []
+    # A limit written later is a changed view.json: a look, still no refold.
+    routing.report(account="Codex", state="limited", until=routing._iso(until + timedelta(hours=1)), author=ME)
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due() == ["look"]
+    _helper_poll(schedule)
+    assert schedule.valid_until == (until + timedelta(minutes=10)).timestamp() and probed == ["Claude"]
+
+
+def test_with_the_push_off_a_pause_ending_over_a_passed_limit_wakes_the_check(home, monkeypatch):
+    # Fix round 2, R2-3: the checks-only helper read reset checks from the
+    # saved view alone, so a pause ending over a passed limit (a change the
+    # clock alone makes) never made the overdue check due.
+    clocks = home["clocks"]
+    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "0")
+    monkeypatch.setenv("ROUTING_NOW_OFF", "1")
+    _set(home, routing_push_prompt=False, routing_reset_check=True, routing_busy_load=0)
+    until = T0 + timedelta(minutes=20)
+    routing.report(account="Claude", state="limited", until=routing._iso(until), author=ME)
+    pause_end = T0 + timedelta(hours=2)
+    routing.pause("Claude", until=routing._iso(pause_end), via="app")
+    monkeypatch.setattr(routing, "poll_refold", lambda **_k: pytest.fail("the poll child refolded with the push off"))
+    probed: list[datetime] = []
+
+    def headroom(_account):
+        probed.append(clocks.now)
+        return {"ok": True, "source": "live", "windows": [
+            {"name": "five_hour", "used_pct": 10, "resets_at": routing._iso(T0 + timedelta(hours=7))}]}
+
+    monkeypatch.setattr("khipu.usage.probe_account", headroom)
+    schedule = _schedule(home, interval=10.0)
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.checks_only and schedule.due() == ["look"]
+    _helper_poll(schedule)
+    assert probed == [] and schedule.valid_until == pause_end.timestamp()
+    while clocks.now + timedelta(minutes=1) < pause_end:
+        clocks.run(60)
+        recall_prompt._look_at_settings(schedule, routing)
+        assert schedule.due() == []
+    clocks.run((pause_end - clocks.now).total_seconds())
+    assert schedule.due() == ["clock"]
+    out = _helper_poll(schedule)
+    assert probed == [pause_end] and [c["outcome"] for c in out["reset_checks"]] == ["open"]
+    assert schedule.valid_until is None or schedule.valid_until > clocks.wall()
+
+
+def test_stopping_a_poll_child_unwinds_and_kills_its_vendor_process(home, monkeypatch, tmp_path):
+    from khipu import usage
+
+    _set(home, routing_reset_check=True, routing_poll_interval=0)
+    until = T0 + timedelta(minutes=20)
+    routing.report(account="Claude", state="limited", until=routing._iso(until), author=ME)
+    home["clocks"].now = until + timedelta(minutes=2)
+    vendor_pid = tmp_path / "vendor.pid"
+
+    def hanging_probe(_home, *, timeout):
+        script = f"import os,time;open({str(vendor_pid)!r},'w').write(str(os.getpid()));time.sleep(60)"
+        usage._converse([sys.executable, "-c", script], [], lambda _frame: False,
+                        env=usage.probe_environment("claude"), deadline=time.monotonic() + timeout,
+                        close_stdin=True)
+
+    monkeypatch.setattr(usage, "probe_claude", hanging_probe)
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        recall_prompt._poll_routing_child(write_fd)
+    os.close(write_fd)
+    try:
+        _wait(vendor_pid.exists, seconds=5)
+        child = int(vendor_pid.read_text())
+        os.kill(pid, signal.SIGUSR1)
+        os.waitpid(pid, 0)
+
+        def vendor_gone():
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                return True
+            return False
+
+        _wait(vendor_gone, seconds=5)
+    finally:
+        with contextlib.suppress(OSError, ChildProcessError):
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        os.close(read_fd)
 
 
 def test_the_helper_refolds_after_a_source_change(home, monkeypatch, helper):

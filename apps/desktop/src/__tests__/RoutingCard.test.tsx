@@ -7,7 +7,7 @@
 (globalThis as unknown as { process: { env: Record<string, string> } }).process.env.TZ = "America/New_York";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, renderHook, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 import { RoutingCard, inPlansOrder } from "../RoutingCard";
 // The stylesheet as written (vitest hands CSS imports over empty, `?raw`
 // included). The app has no @types/node; vitest runs this file in node.
@@ -163,8 +163,34 @@ describe("Home Routing card, the main mock", () => {
     expect(rowFor("Muse")).toHaveTextContent("Limit reached, back about Sat 8:00 PM (a guess)");
     expect(rowFor("Muse")).toHaveTextContent(
       "Reported by a Claude Code conversation in project-a 55 min ago · can't be checked without using a turn");
-    // No control that does nothing: Check now arrives with phase 5.
-    expect(screen.queryByRole("button", { name: /check/i })).toBeNull();
+    expect(within(rowFor("Claude main")).getByRole("button", { name: "Check now" })).toBeInTheDocument();
+    expect(within(rowFor("Muse")).queryByRole("button", { name: "Check now" })).toBeNull();
+  });
+
+  it("shows each account's next local check and keeps one Check now request in flight", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(MORNING);
+    const v = mainView();
+    const claude = v.accounts!.find((a) => a.label === "Claude main")!;
+    claude.next_check = "2026-10-14T18:02:00Z";
+    let finish: ((value: string) => void) | undefined;
+    invokeMock.mockImplementation(() => new Promise<string>((resolve) => { finish = resolve; }));
+    render(<RoutingCard state={stateOf(v)} plans={PLANS} />);
+    expect(rowFor("Claude main")).toHaveTextContent("Khipu checks again at 2:02 PM.");
+    fireEvent.click(within(rowFor("Claude main")).getByRole("button", { name: "Check now" }));
+    expect(within(rowFor("Claude second")).getByRole("button", { name: "Check now" })).toBeDisabled();
+    finish!(JSON.stringify({ ok: true, reason: "This account can't be checked without using a turn" }));
+    await waitFor(() => expect(rowFor("Claude main")).toHaveTextContent("This account can't be checked without using a turn"));
+    expect(invokeMock).toHaveBeenCalledWith("khipu_route_check", { account: "claude|" });
+  });
+
+  it("shows a Check now refusal in the account row", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(MORNING);
+    invokeMock.mockResolvedValue(JSON.stringify({ ok: false, error: "another usage check is running" }));
+    render(<RoutingCard state={stateOf(mainView())} plans={PLANS} />);
+    fireEvent.click(within(rowFor("Claude main")).getByRole("button", { name: "Check now" }));
+    await waitFor(() => expect(rowFor("Claude main")).toHaveTextContent("another usage check is running"));
   });
 
   it("shows the holds, the note word for word with its date, the folded rules and the footer", () => {
@@ -689,5 +715,37 @@ describe("Home Routing card, final fix round", () => {
     expect(notRefreshedWords({ data: v, lastOkAt: AFTERNOON.toISOString(), error: null }, AFTERNOON))
       .toBe("Khipu's record has not been refreshed since 2:58 PM");
     expect(notRefreshedWords({ data: v, lastOkAt: AFTERNOON.toISOString(), error: null, firstRead: true }, AFTERNOON)).toBeNull();
+  });
+});
+
+describe("Home Routing card, phase 5 fix round 2", () => {
+  it("says a reset check's outcome in the state, never 'not checked yet' beside it (R2-2)", () => {
+    const now = new Date("2026-10-14T15:22:00Z");
+    const reasons = [
+      "Khipu read the same limit again",
+      "Khipu could not read this account's usage",
+      "The Mac is busy; Khipu will try again",
+      "Another Khipu usage check is running; Khipu will try again",
+    ];
+    for (const reason of reasons) {
+      const a = acct("Claude", "claude", {
+        state: "probably_open", until: "2026-10-14T15:20:00Z", basis: "cli",
+        witness: { source: "check", written_by: { kind: "check" }, at: "2026-10-14T15:22:00Z" },
+        reset_check: { status: "same_limit", checks: 1, reason },
+      });
+      const state = accountState(a, now).text;
+      expect(state).toBe(`Its reset time passed at 11:20 AM; ${reason}`);
+      expect(state).not.toContain("not checked yet");
+      const source = accountSource(a, now);
+      expect(source).toBe("Checked by Khipu just now");
+      expect(source).not.toContain(reason);
+    }
+    // A later limit the check read still names its reason under the limit.
+    const later = acct("Claude", "claude", {
+      state: "limited", until: "2026-10-14T17:00:00Z", basis: "cli",
+      witness: { source: "check", written_by: { kind: "check" }, at: "2026-10-14T15:22:00Z" },
+      reset_check: { status: "later_limit", checks: 1, reason: "Khipu read a later reset time" },
+    });
+    expect(accountSource(later, now)).toBe("Checked by Khipu just now · Khipu read a later reset time");
   });
 });

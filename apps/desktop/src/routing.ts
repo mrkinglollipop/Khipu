@@ -52,11 +52,16 @@ export type RouteAccount = {
   basis?: string | null;
   reason?: string | null;
   checkable?: boolean;
+  /** False when plan usage no longer reads the account (removed in
+   *  Settings -> Models while limited): no reset check and no Check now. */
+  configured?: boolean;
   witness?: RouteWitness | null;
   disagreement?: RouteReport | null;
   last_seen?: RouteReport | null;
   models?: RouteModel[];
   silent?: boolean;
+  next_check?: string | null;
+  reset_check?: { checks?: number; busy_tries?: number; status?: string; next_at?: string | null; reason?: string | null } | null;
 };
 
 export type RouteHold = {
@@ -292,10 +297,15 @@ export function accountState(a: RouteAccount, now: Date): { text: string; tone: 
       if (models.length) return { text: `${models.join("; ")}; other models open`, tone: "warn" };
       return { text: "Open", tone: "ok" };
     case "probably_open":
-      text =
-        a.checkable === false
-          ? `Its reset time passed ${pastWords(a.until, now)}; this account can't be checked without using a turn`
-          : `Probably open: its limit was due to end ${pastWords(a.until, now)}, not checked yet`;
+      // A reset check's outcome is the state's own words, as the CLI's line
+      // says it (fix round 2, R2-2): never "not checked yet" beside "Checked by Khipu".
+      text = a.reset_check?.reason
+        ? `Its reset time passed ${pastWords(a.until, now)}; ${a.reset_check.reason}`
+        : a.configured === false
+          ? `Probably open: its limit was due to end ${pastWords(a.until, now)}; Khipu can't check this account: it isn't in Settings \u2192 Models`
+          : a.checkable === false
+            ? `Its reset time passed ${pastWords(a.until, now)}; this account can't be checked without using a turn`
+            : `Probably open: its limit was due to end ${pastWords(a.until, now)}, not checked yet`;
       break;
     default:
       if (a.silent) text = "Unknown: its only reporter stopped";
@@ -361,7 +371,11 @@ export function accountSource(
     }
     parts.push(said);
   }
-  if (a.state === "limited" && a.checkable === false) parts.push("can't be checked without using a turn");
+  // A probably-open row already says its reset check's reason in its state.
+  if (a.reset_check?.reason) {
+    if (a.state !== "probably_open") parts.push(a.reset_check.reason);
+  }
+  else if (a.state === "limited" && a.checkable === false) parts.push("can't be checked without using a turn");
   if (a.state === "open" && a.witness?.source === "probe" && plan) {
     parts.push(`${Math.round(plan.pct)}% of its ${plan.window} used`);
   }

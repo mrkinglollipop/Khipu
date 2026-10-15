@@ -760,6 +760,8 @@ def daemon_routing_on(environ=None) -> bool:
         from khipu import features, routing
 
         env = os.environ if environ is None else environ
+        if routing.settings().get("routing_reset_check"):
+            return True
         if not features.enabled("routing_push", environ=env):
             return False
         if features.parse_bool(env.get("ROUTING_NOW_OFF") or "") is True:
@@ -787,6 +789,14 @@ def daemon_routing_on(environ=None) -> bool:
 # fold, unsaved, and a write folds under the routing lock (its new line makes
 # any fold beside it unsavable). With the per-prompt push off the helper forks
 # no poll child, and the daemon stops the helper.
+#
+# Reset checks (phase 5) are the helper's second job, and they keep it
+# running with the push off. Then nothing polls (fix round 1, F1): the
+# schedule has no poll interval and never wakes at the view's
+# ``valid_until``; it wakes only at the accounts' next reset checks, after a
+# wake from sleep, and when view.json changed (a write may have added a
+# limit to check). That child (``_check_resets_only``) reads the saved view,
+# never the sources, and never refolds unless a check is due.
 
 # A wall-clock jump past the monotonic clock longer than this is a wake from
 # sleep (or the clock being set); everything due then runs once.
@@ -810,8 +820,15 @@ _SETTINGS_LOOK_S = 5.0
 # A poll child that is not refolding (it is looking at the files and the
 # view) ends after this long, and on the helper's stop signal; once it holds
 # the fold lock it runs on until it has saved the view (``_ROUTING_FOLD_MOST``).
-_POLL_LOOK_MOST = 5.0
+_POLL_LOOK_MOST = 12.0
 _KEEP = object()
+
+
+# A reset whose outcome could not be written (a full or read-only disk) is
+# not probed again for this long, then is checked again: at most one probe
+# per this many seconds while the disk stays broken, and the check resumes
+# once it recovers.
+_BLOCKED_RESET_RETRY_S = 300.0
 
 
 class RefoldSchedule:
@@ -822,7 +839,10 @@ class RefoldSchedule:
     whatever is due runs once, and ``ran`` starts the next wait. Due at once
     when it is made: a daemon that starts reads the view's ``valid_until``
     before it waits for it. ``configure`` gives it the settings as the
-    helper reads them: with the push off nothing is due at all."""
+    helper reads them: with the push off nothing is due at all, and with
+    only reset checks on (``checks_only``) there is no poll interval and
+    ``valid_until`` holds the next reset check instead (``look``: the start
+    or a changed view.json, read without a refold)."""
 
     def __init__(self, interval: float | None, *, wall: Callable[[], float] = time.time,
                  mono: Callable[[], float] = time.monotonic, jump: float = _WAKE_JUMP_S) -> None:
@@ -834,23 +854,52 @@ class RefoldSchedule:
         self.woke = False
         self.runs = 0
         self.off = False
+        self.checks_only = False
         self.view_seen: Any = None
+        self.reset_settings: Any = None
+        self.blocked_resets: dict[str, str] = {}
+        # When each block was set (wall clock, so a Mac's sleep counts): a block lasts
+        # ``_BLOCKED_RESET_RETRY_S``, then the same reset is checked again, so
+        # a disk that recovers gets its check (re-check of fix round 3).
+        self.blocked_at: dict[str, float] = {}
 
-    def configure(self, interval: Any, *, off: bool) -> None:
+    def live_blocks(self, now: float | None = None) -> dict[str, str]:
+        """The blocks still in force; expired ones are dropped."""
+        now = self._wall() if now is None else now
+        for key in [k for k, at in self.blocked_at.items() if now - at >= _BLOCKED_RESET_RETRY_S]:
+            self.blocked_at.pop(key, None)
+            self.blocked_resets.pop(key, None)
+        return dict(self.blocked_resets)
+
+    def configure(self, interval: Any, *, off: bool, checks_only: bool = False,
+                  reset_settings: Any = None) -> None:
         """The switches and the poll interval as the helper last read them
         (``_look_at_settings``). With the push off nothing is due, neither
         the poll nor the clock; switched on again, a poll is due at once. A
         poll interval turned on again is due at once too, and a shorter one
         is used from now, not after the longer wait."""
         mono = self._mono()
+        if reset_settings != self.reset_settings:
+            self.reset_settings = reset_settings
+            if checks_only:
+                self.next_poll = mono
         interval = interval if isinstance(interval, (int, float)) and not isinstance(interval, bool) \
             and interval > 0 else None
         if off:
             self.off = True
             return
-        if self.off:
-            self.off, self.interval, self.next_poll = False, interval, mono
+        if checks_only != self.checks_only:
+            # Between the two jobs: no deadline of the other job's carries
+            # over, and a look is due at once for this one's.
+            self.off, self.checks_only = False, checks_only
+            self.interval = None if checks_only else interval
+            self.valid_until, self.next_poll = None, mono
             return
+        if self.off:
+            self.off, self.interval, self.next_poll = False, None if checks_only else interval, mono
+            return
+        if checks_only:
+            return  # the poll interval is the push's; reset checks wake only at their times
         if interval == self.interval:
             return
         self.interval = interval
@@ -892,7 +941,7 @@ class RefoldSchedule:
         if self.valid_until is not None and wall >= self.valid_until:
             why.append("clock")
         if self.next_poll is not None and mono >= self.next_poll:
-            why.append("poll")
+            why.append("look" if self.checks_only else "poll")
         return why
 
     def ran(self, valid_until: float | None = None, *, ok: bool = True, interval: Any = _KEEP) -> None:
@@ -903,7 +952,7 @@ class RefoldSchedule:
         wall, mono = self._look()
         self.runs += 1
         self.woke = False
-        if interval is not _KEEP:
+        if interval is not _KEEP and not self.checks_only:
             self.interval = interval if isinstance(interval, (int, float)) and interval > 0 else None
         if valid_until is not None and valid_until <= wall:
             ok, valid_until = False, None
@@ -933,11 +982,16 @@ def _look_at_settings(schedule: RefoldSchedule, routing) -> None:
     ``routing_poll_interval`` as they are now. Settings it cannot read leave
     the schedule as it was."""
     try:
-        off = bool(routing.push_off("prompt"))
+        push_off = bool(routing.push_off("prompt"))
+        cfg = routing.settings()
+        checks = bool(cfg.get("routing_reset_check"))
         interval = routing.poll_interval()
     except Exception:  # noqa: BLE001 - unreadable settings: as they were
         return
-    schedule.configure(interval, off=off)
+    # The push off leaves only the reset checks, which never poll (F1).
+    schedule.configure(interval, off=push_off and not checks, checks_only=push_off and checks,
+                       reset_settings={k: v for k, v in cfg.items()
+                                       if k.startswith(("routing_reset_check", "routing_busy_"))})
     _look_at_view(schedule, routing)
 
 
@@ -1005,7 +1059,14 @@ def _view_snapshot(routing) -> tuple[Any, dict | None]:
     return None, None
 
 
-def _poll_once(routing, on_fold=None) -> dict:
+def _failed_reset_writes(checks: list[dict]) -> dict[str, str]:
+    """Resets the helper must stop checking when their outcome was lost."""
+    return {c["account"]: c["reset_until"] for c in checks if isinstance(c, dict)
+            and c.get("outcome") == "write_failed" and isinstance(c.get("account"), str)
+            and isinstance(c.get("reset_until"), str)}
+
+
+def _poll_once(routing, on_fold=None, on_probe=None, *, blocked_resets=None) -> dict:
     """One poll as the helper's child runs it: ``routing.poll_refold``'s
     answer with ``due`` (``valid_until`` in wall-clock seconds) and, when it
     folded and saved the view, ``view_stat``: view.json's stat after that
@@ -1013,15 +1074,114 @@ def _poll_once(routing, on_fold=None) -> dict:
     the same read of view.json (``_view_snapshot``): a save by a prompt
     between the poll's own save and its stat is acknowledged only with that
     save's own deadline, and one that changed under the read is left unseen
-    (the helper's next look polls again)."""
+    (the helper's next look polls again).
+
+    With the per-prompt push off it never polls or refolds: only the reset
+    checks run (``_check_resets_only``, fix round 1, F1)."""
+    reset_on = bool(routing.settings().get("routing_reset_check"))
+    if routing.push_off("prompt"):
+        if not reset_on:
+            return {"folded": False, "saved": True, "busy": False, "version": None, "valid_until": None,
+                    "interval": None, "reset_checks": [], "view_stat": None, "due": None}
+        return _check_resets_only(routing, on_fold=on_fold, on_probe=on_probe, blocked_resets=blocked_resets)
     out = routing.poll_refold(on_fold=on_fold)
+    # Poll first so its ``folded`` answer stays truthful. When reset checks are
+    # off, do not read the view through the scheduler at all. With checks on,
+    # this process is already the bounded helper child: one account per child,
+    # never an untracked grandchild.
+    checks = []
+    if reset_on:
+        if on_probe is not None:
+            on_probe()
+        checks = routing.run_due_reset_checks(max_checks=1, in_child=True, on_write=on_fold,
+                                              blocked_resets=blocked_resets)
+    out["reset_checks"] = checks
     due = routing._parse(out.get("valid_until"))
     out["view_stat"] = None
-    if out.get("folded") and out.get("saved"):
+    if (out.get("folded") and out.get("saved")) or checks:
         seen, view = _view_snapshot(routing)
         if seen is not None:
             out["view_stat"] = seen
             due = routing._parse(view.get("valid_until"))
+    # fold.valid_until contains only future clock changes. If this child
+    # handled one account from a wake burst, another account may still be
+    # overdue and therefore absent from that field. Ask the scheduler to run
+    # another bounded child even when the source poll interval is off.
+    if checks:
+        view = routing._load_view()
+        now = routing._now()
+        cfg = routing.settings()
+        blocked = {**(blocked_resets or {}), **_failed_reset_writes(checks)}
+        if view is not None and any(
+                blocked.get(entry["key"]) != entry.get("until")
+                and (next_at := routing.reset_check_due(entry, now, cfg)) is not None and next_at <= now
+                for entry in view.get("accounts", [])):
+            due = now
+    out["due"] = due.timestamp() if due is not None else None
+    return out
+
+
+def _pause_ends(routing, view: dict | None) -> list:
+    """When each owner's pause in the saved view ends over a limit with a
+    reset time: the clock alone then shows the limit (or its passed reset)
+    again, and with it a reset check the saved view cannot hold yet (fix
+    round 2, R2-3). Holds never hide an account's state, so only pauses."""
+    if not isinstance(view, dict):
+        return []
+    out = []
+    for e in view.get("accounts") or []:
+        if not isinstance(e, dict) or e.get("state") != "paused":
+            continue
+        under = e.get("underlying") if isinstance(e.get("underlying"), dict) else {}
+        end = routing._parse(e.get("until"))
+        if end is not None and under.get("state") in ("limited", "probably_open") \
+                and routing._parse(under.get("until")) is not None:
+            out.append(end)
+    return out
+
+
+def _next_reset_check(routing, view: dict | None, now, blocked_resets=None) -> Any:
+    """The soonest reset check the saved view holds (overdue ones included),
+    or the end of a pause that hides one (``_pause_ends``), or None."""
+    if not isinstance(view, dict):
+        return None
+    cfg = routing.settings()
+    times = [t for e in view.get("accounts") or [] if isinstance(e, dict)
+             and (blocked_resets or {}).get(e.get("key")) != e.get("until")
+             and (t := routing.reset_check_due(e, now, cfg)) is not None]
+    return min([*times, *_pause_ends(routing, view)], default=None)
+
+
+def _check_resets_only(routing, on_fold=None, on_probe=None, *, blocked_resets=None) -> dict:
+    """The helper's child with the per-prompt push off and reset checks on:
+    no ``poll_refold``, no read of the sources. It reads the saved view, runs
+    one due reset check if there is one (that check's read refolds as any
+    reader's does), and answers ``due``: the next reset check, so the helper
+    sleeps until then (fix round 1, F1). When a pause the saved view holds
+    over a limit has ended, it refolds once, as a reader does, so the check
+    that ending makes due is seen and run (fix round 2, R2-3)."""
+    out = {"folded": False, "saved": True, "busy": False, "version": None, "valid_until": None,
+           "interval": None, "reset_checks": [], "view_stat": None}
+    now = routing._now()
+    view = routing._load_view()
+    if any(end <= now for end in _pause_ends(routing, view)):
+        if on_fold is not None:
+            on_fold()
+        view = routing.read_view(now)
+        out["folded"] = True
+    due = _next_reset_check(routing, view, now, blocked_resets)
+    if due is not None and due <= now:
+        if on_probe is not None:
+            on_probe()
+        out["reset_checks"] = routing.run_due_reset_checks(max_checks=1, in_child=True, on_write=on_fold,
+                                                           blocked_resets=blocked_resets)
+    seen, view = _view_snapshot(routing)
+    out["view_stat"] = seen
+    now = routing._now()
+    blocked = {**(blocked_resets or {}), **_failed_reset_writes(out["reset_checks"])}
+    due = _next_reset_check(routing, view if seen is not None else routing._load_view(), now, blocked)
+    if due is not None and due < now:
+        due = now  # another account is overdue (a wake's burst): one more child, one account each
     out["due"] = due.timestamp() if due is not None else None
     return out
 
@@ -1033,16 +1193,26 @@ def _take_poll_answer(schedule: "RefoldSchedule", out: dict | None) -> None:
     if out is None:
         schedule.ran(ok=False)
         return
+    failed = _failed_reset_writes(out.get("reset_checks") or [])
+    now = schedule._wall()
+    for key, until in failed.items():
+        if schedule.blocked_resets.get(key) != until:
+            schedule.blocked_at[key] = now  # a new block, or a block on a later reset
+        schedule.blocked_resets[key] = until
     seen = out.get("view_stat")
     if isinstance(seen, list) and not schedule.off:
         schedule.view_seen = seen
     due = out.get("due")
     due = float(due) if isinstance(due, (int, float)) and not isinstance(due, bool) else None
+    if schedule.blocked_at:
+        # Wake when the first block ends: the reset it held is checked again.
+        ends = min(schedule.blocked_at.values()) + _BLOCKED_RESET_RETRY_S
+        due = ends if due is None else min(due, ends)
     ok = not out.get("busy") and out.get("saved", True) is not False
     schedule.ran(due, ok=ok, interval=out.get("interval"))
 
 
-def _poll_routing_child(write_fd: int) -> None:
+def _poll_routing_child(write_fd: int, *, blocked_resets=None) -> None:
     """The helper's poll child: ``routing.poll_refold`` and its answer (one
     JSON line, with ``due``: ``valid_until`` in wall-clock seconds) on
     ``write_fd``. Never returns. Bounded by its own kernel alarm: a look at
@@ -1054,8 +1224,16 @@ def _poll_routing_child(write_fd: int) -> None:
     try:
         import signal
 
+        class PollStopped(BaseException):
+            pass
+
+        def stop(_sig, _frame) -> None:
+            # Raise through usage.probe_account so its _Run finally block
+            # kills and reaps the vendor process group before this child exits.
+            raise PollStopped()
+
         for sig in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1):
-            signal.signal(sig, signal.SIG_DFL)
+            signal.signal(sig, stop)
         signal.setitimer(signal.ITIMER_REAL, _POLL_LOOK_MOST)
         _detach_child((write_fd,))
         from khipu import routing
@@ -1064,7 +1242,12 @@ def _poll_routing_child(write_fd: int) -> None:
             signal.setitimer(signal.ITIMER_REAL, _ROUTING_FOLD_MOST)
             signal.signal(signal.SIGUSR1, signal.SIG_IGN)
 
-        out = _poll_once(routing, on_fold=fold_started)
+        def probe_started() -> None:
+            signal.setitimer(signal.ITIMER_REAL, _POLL_LOOK_MOST)
+            for sig in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1):
+                signal.signal(sig, stop)
+
+        out = _poll_once(routing, on_fold=fold_started, on_probe=probe_started, blocked_resets=blocked_resets)
         _write_all(write_fd, json.dumps(out).encode("utf-8") + b"\n")
         code = 0
     except BaseException:  # noqa: BLE001 - the helper reads end of file and tries again later
@@ -1152,7 +1335,7 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
             return None
         if pid == 0:
             os.close(read_fd)
-            _poll_routing_child(write_fd)
+            _poll_routing_child(write_fd, blocked_resets=schedule.live_blocks())
         pollers.add(pid)
         os.close(write_fd)
         return read_fd
