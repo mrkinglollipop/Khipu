@@ -1419,3 +1419,125 @@ def test_a_queued_cascade_from_a_parent_missing_from_the_copy_reaches_its_childr
         with pytest.raises(ledger.LedgerError) as err:
             ledger.write(ledger.new_op("set", P, row_id, fields={"evidence": "must be refused"}))
         assert err.value.reason == "not_found"
+
+
+# ---- round 5: an op id, once taken, is taken for good; one lock decides it -------
+
+
+class _Conn:
+    def close(self):
+        pass
+
+
+def test_a_purged_rows_op_ids_are_never_taken_again(hub):
+    ok("add", "a", "--title", "A", "--kind", "slice")
+    ok("add", "b", "--title", "B", "--kind", "slice")
+    ok("set", "a", "--evidence", "first", "--op-id", "kept")
+    ok("remove", "a")
+    assert ok("purge", "a", "--from-app").strip() == "removed a for good"
+    rc, out, err = run("set", "b", "--evidence", "first", "--op-id", "kept", "--project", P)
+    assert rc == 1 and "already used for a different write" in out + err
+    assert _sql(hub, "SELECT evidence FROM ledger_rows WHERE row_id = 'b'") != [("first",)]
+    # Only the binding is kept: its id, its write's digest and how it ended.
+    assert _sql(hub, "SELECT row_id, verb, result FROM ledger_ops WHERE op_id = 'kept'") == [
+        ("a", "set", {"ok": True, "purged": True})]
+
+
+def test_a_refused_op_id_stays_refused_and_never_runs_another_write(hub):
+    ok("add", "a", "--title", "A", "--kind", "slice")
+    ok("add", "b", "--title", "B", "--kind", "slice")
+    ok("set", "a", "--state", "IN FLIGHT")
+    first = run("set", "a", "--state", "DONE", "--if-state", "NOT STARTED", "--op-id", "once", "--project", P)
+    assert first[0] == 1 and "IN FLIGHT now" in first[2]
+    rc, out, err = run("set", "b", "--state", "DONE", "--op-id", "once", "--project", P)
+    assert rc == 1 and "already used for a different write" in out + err
+    ok("set", "a", "--state", "NOT STARTED")
+    # The same write again gets the answer it first had, though it would pass now.
+    again = run("set", "a", "--state", "DONE", "--if-state", "NOT STARTED", "--op-id", "once", "--project", P)
+    assert again[0] == 1 and "IN FLIGHT now" in again[2]
+    assert _sql(hub, "SELECT row_id, state FROM ledger_rows ORDER BY row_id") == [("a", "NOT STARTED"),
+                                                                                  ("b", "NOT STARTED")]
+
+
+def test_a_direct_write_honours_an_op_id_this_mac_saw_refused(monkeypatch, tmp_path):
+    from khipu import ledger
+
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
+    first = ledger.new_op("set", P, "r1", fields={"evidence": "first"}, op_id="shared")
+    ledger._record_outcome(first, "refused", refused="condition moved", reason_word="moved")
+    applied = []
+    monkeypatch.setattr(ledger, "apply_op", lambda _c, op, **_kw: applied.append(op["row_id"]) or {"ok": True})
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("set", P, "r2", fields={"evidence": "second"}, op_id="shared"), conn=_Conn())
+    assert err.value.reason == "op_id_reused"
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(dict(first, digest=None), conn=_Conn())
+    assert err.value.reason == "moved"
+    assert applied == [] and ledger._outcome("shared")["digest"] == ledger.op_digest(dict(first, digest=None))
+
+
+def test_a_retry_of_a_landed_write_repairs_the_offline_copy(hub, tmp_path, monkeypatch):
+    from khipu import ledger
+
+    _snapshot(tmp_path)
+    ok("add", "a", "--title", "Before", "--kind", "slice")
+    real_sync = ledger._replica_sync
+    # The write lands, and the process ends before the offline copy hears of it.
+    monkeypatch.setattr(ledger, "_replica_sync", lambda *_a: None)
+    ok("set", "a", "--title", "After", "--op-id", "once")
+    monkeypatch.setattr(ledger, "_replica_sync", real_sync)
+    assert _replica_titles(P) == {"a": "Before"}
+    assert ok("set", "a", "--title", "After", "--op-id", "once").strip() == "set a: title"
+    assert _replica_titles(P) == {"a": "After"}
+
+
+def test_a_later_writer_cannot_take_a_place_ahead_of_the_lock_holders_decision(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    real_jobs, real_enqueue = ledger._outbox_jobs, ledger.enqueue
+    at_check, later_queued, first_look, landed = threading.Event(), threading.Event(), [True], []
+
+    def jobs():
+        if threading.current_thread().name == "older" and first_look[0]:
+            first_look[0] = False
+            at_check.set()
+            later_queued.wait(1)  # a later write that can queue now would go first
+        return real_jobs()
+
+    def enqueue(op, reason=""):
+        path = real_enqueue(op, reason)
+        if op["op_id"] == "later":
+            later_queued.set()
+        return path
+
+    monkeypatch.setattr(ledger, "_outbox_jobs", jobs)
+    monkeypatch.setattr(ledger, "enqueue", enqueue)
+    monkeypatch.setattr(ledger, "apply_op", lambda _c, op, **_kw: landed.append(op["op_id"]) or {"ok": True})
+
+    def writer(name):
+        ledger.write(ledger.new_op("set", P, "r", fields={"evidence": name}, op_id=name), conn=_Conn())
+
+    older = threading.Thread(target=writer, args=("older",), name="older")
+    later = threading.Thread(target=writer, args=("later",), name="later")
+    older.start()
+    assert at_check.wait(5)
+    later.start()
+    older.join(10)
+    later.join(10)
+    assert landed == ["older", "later"]
+
+
+def test_a_retry_whose_job_lands_while_it_looks_is_answered_as_landed(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    op = ledger.new_op("set", P, "r", fields={"evidence": "same"}, op_id="retry")
+    ledger.enqueue(op)
+    ledger._record_outcome(op, "landed", result={"ok": True, "line": "already landed"})
+    real_job_path = ledger._job_path
+
+    def gone_after_lookup(op_id):
+        found = real_job_path(op_id)
+        if found is not None:
+            found.unlink()
+        return found
+
+    monkeypatch.setattr(ledger, "_job_path", gone_after_lookup)
+    assert ledger._known_op(dict(op)) == {"ok": True, "line": "already landed"}
