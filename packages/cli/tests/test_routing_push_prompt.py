@@ -16,6 +16,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1107,12 +1108,18 @@ def helper_daemon(home):
     svc = recall_daemon.RecallService(home["capture"] / "recall.sock", stamp_fn=lambda: "fixed",
                                       idle_check=False)
     assert svc.bind()
+    assert not svc.start_routing()  # the push is off when it starts
     thread = threading.Thread(target=svc.run, daemon=True)
     thread.start()
     yield svc
     svc.stop()
     thread.join(5)
     svc.close()
+
+
+def _helper_ready(svc) -> None:
+    svc.routing_forkserver.prepare()
+    assert svc.routing_forkserver.wait_ready(10)
 
 
 def test_the_daemon_never_forks_itself_for_routing(home, monkeypatch, helper_daemon):
@@ -1122,6 +1129,7 @@ def test_the_daemon_never_forks_itself_for_routing(home, monkeypatch, helper_dae
     _record()
     _push_on(monkeypatch)
     forks = _count_forks(monkeypatch)
+    _helper_ready(helper_daemon)
     code, out = _client(home)
     assert code == 0 and "## Prior work" in out and _routing_part(out).startswith(FULL)
     assert _wait_log(1).endswith(" routing=full")
@@ -1149,6 +1157,7 @@ def test_a_dead_helper_is_started_again_and_recall_is_unchanged(home, monkeypatc
     _record()
     _push_on(monkeypatch)
     monkeypatch.setattr(recall_prompt, "_FORKSERVER_RESPAWN_S", 0.0)
+    _helper_ready(helper_daemon)
     code, out = _client(home)
     assert code == 0 and _routing_part(out).startswith(FULL)
     _wait_log(1)
@@ -1159,6 +1168,12 @@ def test_a_dead_helper_is_started_again_and_recall_is_unchanged(home, monkeypatc
     routing.report(account="Claude", state="limited", until="1h", author=ME)
     home["search"]["hits"] = [dict(HITS[0], id="42")]
     code, out = _client(home)
+    # The prompt that finds it dead never waits for the next one to start.
+    assert code == 0 and "## Prior work" in out and "## Routing" not in out
+    assert _wait_log(2).endswith(" routing=skipped:starting")
+    assert helper_daemon.routing_forkserver.wait_ready(10)
+    home["search"]["hits"] = [dict(HITS[0], id="43")]
+    code, out = _client(home)
     assert code == 0 and "## Prior work" in out and "## Routing" in out
     assert helper_daemon.routing_forkserver.spawned == 2
 
@@ -1166,9 +1181,233 @@ def test_a_dead_helper_is_started_again_and_recall_is_unchanged(home, monkeypatc
 def test_the_helper_ends_with_the_daemon(home, monkeypatch, helper_daemon):
     _record()
     _push_on(monkeypatch)
+    _helper_ready(helper_daemon)
     code, _out = _client(home)
     assert code == 0
     helper = helper_daemon.routing_forkserver._proc
     assert helper.poll() is None
     helper_daemon.close()
     assert helper.wait(5) == 0
+
+
+# ---- the helper's start and a burst of prompts (fix round 4) ---------------------------------
+
+
+def _fresh_daemon(home, name: str):
+    """A service started as ``serve`` starts it, on its own socket."""
+    svc = recall_daemon.RecallService(home["capture"] / f"{name}.sock", stamp_fn=lambda: "fixed",
+                                      idle_check=False)
+    assert svc.bind()
+    svc.start_routing()
+    thread = threading.Thread(target=svc.run, daemon=True)
+    thread.start()
+    return svc, thread
+
+
+def _end(svc, thread) -> None:
+    svc.stop()
+    thread.join(5)
+    svc.close()
+
+
+def _timed(svc, prompt: str = PROMPT) -> float:
+    """One prompt as the client sends it (request, answer, ack): the seconds
+    from the request to the answer."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(5)
+    sock.connect(str(svc.path))
+    try:
+        req = {"op": "recall", "raw": json.dumps(_payload(prompt)), "shape": "claude", "protocol": 1,
+               "deadline": time.monotonic() + 1.6}
+        began = time.monotonic()
+        sock.sendall(json.dumps(req).encode() + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        took = time.monotonic() - began
+        assert json.loads(buf.split(b"\n", 1)[0]).get("ok")
+        sock.sendall(b'{"op":"ack"}\n')
+        return took
+    finally:
+        sock.close()
+
+
+def _burst(svc, count: int) -> list[float]:
+    times: list[float] = []
+    lock = threading.Lock()
+    go = threading.Event()
+
+    def one(i: int) -> None:
+        go.wait(5)
+        took = _timed(svc, f"{PROMPT} {i}")
+        with lock:
+            times.append(took)
+
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(count)]
+    for t in threads:
+        t.start()
+    go.set()
+    for t in threads:
+        t.join(15)
+    assert len(times) == count
+    return times
+
+
+def _statuses(first: int, count: int) -> list[str]:
+    _wait_log(first + count - 1)
+    lines = _log_lines()[first - 1:first - 1 + count]
+    return [line.rsplit(" routing=", 1)[1] if " routing=" in line else "" for line in lines]
+
+
+def _routed(status: str) -> bool:
+    return status in ("full", "changes", "none") or status.startswith("pointer:")
+
+
+def _until_routed(svc) -> None:
+    """Prompts until one is routed: the helper is up and ready."""
+    for _ in range(100):
+        before = len(_log_lines())
+        _timed(svc)
+        if _routed(_statuses(before + 1, 1)[0]):
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"routing never arrived: {_log_lines()[-3:]}")
+
+
+def _median(values: list[float]) -> float:
+    values = sorted(values)
+    return values[len(values) // 2]
+
+
+@pytest.mark.parametrize("when", ["at-start", "later"])
+def test_the_first_prompt_after_a_daemon_start_is_no_slower_with_the_push_on(home, monkeypatch, when):
+    """Finding R4-1: the helper was spawned inside the first prompt with the
+    push on, which waited up to a second for it to import routing (150 to
+    350 ms more than a warm daemon). The daemon starts it when it starts, or
+    from a thread on the first prompt with the push on; until it is ready a
+    prompt logs routing=skipped:starting and never waits for it."""
+    _record()
+    home["clock"].now = datetime.now(timezone.utc).replace(microsecond=0)
+    _set(home, routing_prompt_budget_ms=50)
+    off, on = [], []
+    for i in range(3):
+        monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+        svc, thread = _fresh_daemon(home, f"off{i}")
+        try:
+            off.append(_timed(svc))
+        finally:
+            _end(svc, thread)
+        if when == "at-start":
+            _push_on(monkeypatch)
+        svc, thread = _fresh_daemon(home, f"on{i}")
+        try:
+            _push_on(monkeypatch)
+            before = len(_log_lines())
+            on.append(_timed(svc))
+            status = _statuses(before + 1, 1)[0]
+            assert status == "skipped:starting" or _routed(status), status
+            _until_routed(svc)  # once ready, it routes
+            assert svc.routing_forkserver.spawned == 1
+        finally:
+            _end(svc, thread)
+    print(f"first prompt medians: off {_median(off):.4f} on {_median(on):.4f}")
+    assert _median(on) <= _median(off) + 0.04, (on, off)
+
+
+def test_a_burst_of_prompts_keeps_the_helper_and_adds_little(home, monkeypatch):
+    """Finding R4-2: 30 prompts at once on a fresh daemon filled the
+    helper's datagram queue while it imported; the send blocked, the helper
+    was killed under the lock (stalling the prompts behind it) and the
+    respawn throttle skipped routing for the next bursts: a median of 217 ms
+    with the push on against 31 ms off, and none of the 30 routed."""
+    _record()
+    home["clock"].now = datetime.now(timezone.utc).replace(microsecond=0)
+    _set(home, routing_prompt_budget_ms=50)
+    svc, thread = _fresh_daemon(home, "off")
+    try:
+        off = _burst(svc, 30)
+    finally:
+        _end(svc, thread)
+    _push_on(monkeypatch)
+    svc, thread = _fresh_daemon(home, "on")
+    try:
+        first = len(_log_lines()) + 1
+        on = _burst(svc, 30)
+        statuses = _statuses(first, 30)
+        assert all(_routed(s) or s in ("skipped:starting", "skipped:busy") for s in statuses), statuses
+        assert svc.routing_forkserver.wait_ready(10)
+        helper = svc.routing_forkserver._proc
+        for _ in range(2):  # later bursts route, on the same helper
+            first = len(_log_lines()) + 1
+            again = _burst(svc, 30)
+            later = _statuses(first, 30)
+            assert any(_routed(s) for s in later), later
+            # Never a helper starting again; a child late under the load, or
+            # waiting on another's fold, skips as it always did.
+            assert all(_routed(s) or s in ("skipped:busy", "skipped:budget", "skipped:fold-busy")
+                       for s in later), later
+            assert svc.routing_forkserver._proc is helper and helper.poll() is None
+        assert svc.routing_forkserver.spawned == 1
+    finally:
+        _end(svc, thread)
+    print(f"burst medians: off {_median(off):.4f} fresh {_median(on):.4f} warm {_median(again):.4f}")
+    assert _median(on) <= _median(off) + 0.04, (sorted(on), sorted(off))
+    assert _median(again) <= _median(off) + 0.04, (sorted(again), sorted(off))
+
+
+def test_a_full_helper_queue_skips_only_that_prompt_and_keeps_the_helper(home, monkeypatch):
+    """Finding R4-2: a send to a full queue blocked up to 0.1 s and then
+    killed the helper, waiting for it under the lock. Now it never blocks:
+    the prompt logs routing=skipped:busy and the helper stays."""
+    _record()
+    home["clock"].now = datetime.now(timezone.utc).replace(microsecond=0)
+    _set(home, routing_prompt_budget_ms=50)
+    monkeypatch.setattr(recall_prompt, "_FORKSERVER_IN_FLIGHT_MOST", 1000)  # the queue fills first
+    _push_on(monkeypatch)
+    svc, thread = _fresh_daemon(home, "full")
+    try:
+        assert svc.routing_forkserver.wait_ready(10)
+        helper = svc.routing_forkserver._proc
+        os.kill(helper.pid, signal.SIGSTOP)  # it reads nothing: its queue fills
+        try:
+            first = len(_log_lines()) + 1
+            times = _burst(svc, 40)
+            statuses = _statuses(first, 40)
+        finally:
+            os.kill(helper.pid, signal.SIGCONT)
+        busy = statuses.count("skipped:busy")
+        assert busy and all(s in ("skipped:busy", "skipped:budget") for s in statuses), statuses
+        assert max(sorted(times)[:busy]) < 0.5, sorted(times)  # a full queue is never waited on
+        assert svc.routing_forkserver._proc is helper and helper.poll() is None
+        assert svc.routing_forkserver._in_flight == 0
+        time.sleep(0.2)
+        _until_routed(svc)
+        assert svc.routing_forkserver._proc is helper and svc.routing_forkserver.spawned == 1
+    finally:
+        _end(svc, thread)
+
+
+def test_prompts_past_the_in_flight_limit_skip_at_once(home, monkeypatch):
+    _record()
+    home["clock"].now = datetime.now(timezone.utc).replace(microsecond=0)
+    _set(home, routing_prompt_budget_ms=50)
+    monkeypatch.setattr(recall_prompt, "_FORKSERVER_IN_FLIGHT_MOST", 2)
+    _push_on(monkeypatch)
+    svc, thread = _fresh_daemon(home, "cap")
+    try:
+        assert svc.routing_forkserver.wait_ready(10)
+        helper = svc.routing_forkserver._proc
+        os.kill(helper.pid, signal.SIGSTOP)
+        try:
+            first = len(_log_lines()) + 1
+            _burst(svc, 6)
+            statuses = _statuses(first, 6)
+        finally:
+            os.kill(helper.pid, signal.SIGCONT)
+        assert sorted(statuses) == ["skipped:budget"] * 2 + ["skipped:busy"] * 4, statuses
+        assert svc.routing_forkserver._in_flight == 0 and svc.routing_forkserver._proc is helper
+    finally:
+        _end(svc, thread)

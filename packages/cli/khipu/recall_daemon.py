@@ -210,10 +210,11 @@ class RecallService:
     ) -> None:
         self.path = Path(path)
         # The per-prompt routing child is forked by a small helper this
-        # service spawns on first use, never by this process (its heap is
-        # the vector matrix: a fork of it slowed the search). False forks
-        # from this process, as the one-shot hook does: a test seam, so a
-        # test's patched clock and fold reach the read.
+        # service spawns (``start_routing`` at start when the push is on,
+        # else on a thread at the first prompt with the push on), never by
+        # this process (its heap is the vector matrix: a fork of it slowed
+        # the search). False forks from this process, as the one-shot hook
+        # does: a test seam, so a test's patched clock and fold reach the read.
         from khipu import recall_prompt
 
         self.routing_forkserver = recall_prompt.RoutingForkServer() if routing_forkserver else None
@@ -289,6 +290,20 @@ class RecallService:
         sock.settimeout(_ACCEPT_TICK_S)
         self._listener = sock
         self._ino = os.stat(self.path).st_ino
+        return True
+
+    def start_routing(self) -> bool:
+        """Start the routing helper now, on a thread, when this service's own
+        switches have the per-prompt push on, so the first prompt never waits
+        for it (a prompt with the push on starts it otherwise). Never waits;
+        True when it was asked to start."""
+        if self.routing_forkserver is None:
+            return False
+        from khipu import recall_prompt
+
+        if not recall_prompt.daemon_routing_on():
+            return False
+        self.routing_forkserver.prepare()
         return True
 
     def close(self) -> None:
@@ -576,6 +591,7 @@ def serve(
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda _s, _f: svc.stop())
     _warm_imports()
+    svc.start_routing()
     threading.Thread(target=_warm_caches, daemon=True).start()
     _log(f"serving {svc.path} pid={os.getpid()} version={__version__} stamp={svc.stamp}")
     try:

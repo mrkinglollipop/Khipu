@@ -314,7 +314,9 @@ def _update_routing_marker(session_id: str, change, wait: float) -> bool:
 # switches itself (routing is already imported there: a file check and the
 # settings, well under a millisecond, so a switched-off push costs nothing)
 # and asks ``RoutingForkServer``, one small helper it spawned once with a
-# fresh interpreter, to fork the child instead. Either way the child says
+# fresh interpreter, to fork the child instead (a prompt never waits for the
+# helper to start or for room in its queue: it skips routing; fix round 4).
+# Either way the child says
 # when it is ready; the read is given ``routing_prompt_budget_ms`` from
 # that moment. However slow the start, the
 # prompt never waits for routing more than ``routing.PROMPT_BUDGET_MOST_MS``
@@ -456,27 +458,57 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
 _FORKSERVER_REQUEST_MOST = 1024
 # A helper that died is started again at most this often.
 _FORKSERVER_RESPAWN_S = 5.0
+# The longest a helper may take to import what the read needs and say it is
+# ready; one that takes longer is stopped (and started again later).
+_FORKSERVER_READY_MOST = 30.0
+# The most prompts waiting on the helper at once. A burst past it skips
+# routing for the rest (routing=skipped:busy) rather than queue them all
+# behind one helper: the record is read again at the next prompt.
+_FORKSERVER_IN_FLIGHT_MOST = 16
+
+
+class RoutingHelperStarting(Exception):
+    """The helper is not ready yet (starting, or started again after it
+    died): this prompt skips routing (routing=skipped:starting)."""
+
+
+class RoutingHelperBusy(Exception):
+    """The helper has as many prompts as it takes, or its queue is full:
+    this prompt skips routing (routing=skipped:busy). The helper is kept."""
 
 
 class RoutingForkServer:
-    """The recall daemon's routing helper: one small process, spawned once
-    with a fresh interpreter (never a fork of the daemon) on the first
-    prompt with the push on, that forks each prompt's routing child. A fork
-    of the helper costs about a millisecond and leaves the daemon's heap
-    alone; a fork of the daemon itself cost about 18 ms, and the search ran
-    about four times slower while the child lived (fix round 3). It ends
-    when the daemon closes it or dies (its stdin reaches end of file)."""
+    """The recall daemon's routing helper: one small process, spawned with a
+    fresh interpreter (never a fork of the daemon) that forks each prompt's
+    routing child. A fork of the helper costs about a millisecond and leaves
+    the daemon's heap alone; a fork of the daemon itself cost about 18 ms,
+    and the search ran about four times slower while the child lived (fix
+    round 3). It ends when the daemon closes it or dies (its stdin reaches
+    end of file).
+
+    A prompt never waits for the helper to start, and never waits on a
+    process while it holds the lock (fix round 4). ``prepare`` starts it on
+    a thread: the daemon calls it when it starts with the push on, and the
+    first prompt with the push on calls it otherwise. The helper says it is
+    ready once its imports are done; until then a prompt sends it nothing
+    and skips routing. A request is sent without blocking: a full queue
+    skips only that prompt and keeps the helper, and a dead helper is
+    reaped on a thread."""
 
     def __init__(self, argv: list[str] | None = None) -> None:
         self._argv = argv
         self._lock = threading.Lock()
         self._proc = None
         self._sock = None
+        self._ready = False
+        self._starting = False
+        self._ready_event = threading.Event()
         self._next_spawn = 0.0
         self._closed = False
+        self._in_flight = 0
         self.spawned = 0  # how many helpers this daemon started (doctor and tests)
 
-    def _spawn(self) -> None:
+    def _spawn(self):
         import socket
         import subprocess
 
@@ -489,75 +521,188 @@ class RoutingForkServer:
                                   "sys.exit(recall_prompt.routing_forkserver_main(int(sys.argv[1])))"]
             # close_fds=False lets Python use posix_spawn: no fork of this
             # process, and only the helper's socket is inheritable.
-            self._proc = subprocess.Popen([*argv, str(theirs.fileno())], stdin=subprocess.PIPE,
-                                          stdout=subprocess.DEVNULL, close_fds=False, env=env)
+            proc = subprocess.Popen([*argv, str(theirs.fileno())], stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, close_fds=False, env=env)
         except BaseException:
             ours.close()
             raise
         finally:
             theirs.close()
-        ours.settimeout(0.1)
-        self._sock = ours
-        self.spawned += 1
+        ours.setblocking(False)  # a full queue is an error at once, never a wait
+        return proc, ours
 
-    def _alive(self) -> bool:
-        return self._proc is not None and self._sock is not None and self._proc.poll() is None
+    def prepare(self) -> None:
+        """Start the helper on a thread unless it is up, starting, or was
+        started too recently. Never waits."""
+        with self._lock:
+            self._prepare_locked()
+
+    def _prepare_locked(self) -> None:
+        if self._closed or self._starting or self._proc is not None:
+            return
+        now = time.monotonic()
+        if now < self._next_spawn:
+            return
+        self._next_spawn = now + _FORKSERVER_RESPAWN_S
+        self._starting = True
+        threading.Thread(target=self._start, name="khipu-routing-helper-start", daemon=True).start()
+
+    def _start(self) -> None:
+        proc = sock = None
+        try:
+            proc, sock = self._spawn()
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("routing helper closed")
+                self._proc, self._sock = proc, sock
+                self.spawned += 1
+            import select
+
+            # The helper writes one line once its imports are done.
+            line, until = b"", time.monotonic() + _FORKSERVER_READY_MOST
+            fd = proc.stdout.fileno()
+            while b"\n" not in line:
+                ready, _, _ = select.select([fd], [], [], max(0.0, until - time.monotonic()))
+                chunk = os.read(fd, 64) if ready else b""
+                if not chunk:
+                    raise RuntimeError("routing helper never said it was ready")
+                line += chunk
+            with self._lock:
+                if self._proc is not proc:
+                    proc = sock = None  # closed meanwhile: close() stops it
+                    return
+                self._ready = True
+                self._ready_event.set()
+                proc = sock = None  # the server's now
+        except Exception:  # noqa: BLE001 - routing is skipped until a later start works
+            with self._lock:
+                if proc is not None and self._proc is proc:
+                    self._proc = self._sock = None
+        finally:
+            with self._lock:
+                self._starting = False
+            _stop_helper(proc, sock)
+
+    def wait_ready(self, timeout: float) -> bool:
+        """True once the helper is ready (tests and doctor; never a prompt)."""
+        return self._ready_event.wait(timeout)
+
+    def _detach_locked(self):
+        """Forget the current helper; the caller stops it outside the lock."""
+        proc, sock = self._proc, self._sock
+        self._proc = self._sock = None
+        self._ready = False
+        self._ready_event.clear()
+        return proc, sock
 
     def start(self, write_fd: int, session_id, cap: float) -> None:
-        """Have the helper fork the child for one prompt. Raises when it
-        cannot (the prompt's routing is then skipped, recall unchanged)."""
+        """Have the helper fork the child for one prompt, without waiting.
+        Raises ``RoutingHelperStarting`` or ``RoutingHelperBusy``, or another
+        error, when it cannot (the prompt's routing is then skipped, recall
+        unchanged). A request that was sent holds a place until ``release``."""
+        import errno
         import socket
 
         payload = json.dumps({"session": session_id if isinstance(session_id, str) else None,
                               "cap": cap}).encode("utf-8")
         if len(payload) > _FORKSERVER_REQUEST_MOST:
             raise ValueError("routing request too long")
+        dead = None
         with self._lock:
             if self._closed:
                 raise RuntimeError("routing helper closed")  # the daemon is stopping
-            if not self._alive():
-                self._stop_locked()
-                now = time.monotonic()
-                if now < self._next_spawn:
-                    raise RuntimeError("routing helper restarting")
-                self._next_spawn = now + _FORKSERVER_RESPAWN_S
-                self._spawn()
-            sock = self._sock
+            if self._ready and self._proc.poll() is not None:  # poll never waits
+                dead = self._detach_locked()
+            if not self._ready:
+                self._prepare_locked()
+                starting = True
+            else:
+                starting = False
+                if self._in_flight >= _FORKSERVER_IN_FLIGHT_MOST:
+                    raise RoutingHelperBusy()
+                self._in_flight += 1
+                sock = self._sock
+        if dead is not None:
+            _reap_later(*dead)
+        if starting:
+            raise RoutingHelperStarting()
         try:
             socket.send_fds(sock, [payload], [write_fd])
-        except OSError:
-            with self._lock:
-                if self._sock is sock:
-                    self._stop_locked()
-            raise
+        except OSError as exc:
+            self.release()
+            if isinstance(exc, BlockingIOError) or exc.errno in (errno.ENOBUFS, errno.EAGAIN):
+                raise RoutingHelperBusy() from exc
+            with self._lock:  # the helper went away: start another, reap this one later
+                dead = self._detach_locked() if self._sock is sock else None
+                self._prepare_locked()
+            if dead is not None:
+                _reap_later(*dead)
+            raise RoutingHelperStarting() from exc
 
-    def _stop_locked(self) -> None:
-        sock, proc = self._sock, self._proc
-        self._sock = self._proc = None
-        if sock is not None:
-            sock.close()
-        if proc is not None:
-            try:
-                if proc.stdin is not None:
-                    proc.stdin.close()  # end of file: the helper exits
-                proc.wait(1.0)
-            except Exception:  # noqa: BLE001 - a helper that will not end is killed
-                proc.kill()
-                try:
-                    proc.wait(1.0)
-                except Exception:  # noqa: BLE001
-                    pass
+    def release(self) -> None:
+        """A prompt that ``start`` sent is done with the helper."""
+        with self._lock:
+            self._in_flight = max(0, self._in_flight - 1)
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            self._stop_locked()
+            dead = self._detach_locked()
+        _stop_helper(*dead)
+
+
+def _stop_helper(proc, sock) -> None:
+    """End a helper (its stdin's end of file), killing one that will not.
+    Waits up to two seconds: never call it holding the server's lock."""
+    if sock is not None:
+        sock.close()
+    if proc is None:
+        return
+    try:
+        if proc.stdin is not None:
+            proc.stdin.close()  # end of file: the helper exits
+        proc.wait(1.0)
+    except Exception:  # noqa: BLE001 - a helper that will not end is killed
+        proc.kill()
+        try:
+            proc.wait(1.0)
+        except Exception:  # noqa: BLE001
+            pass
+    if proc.stdout is not None:
+        proc.stdout.close()
+
+
+def _reap_later(proc, sock) -> None:
+    if sock is not None:
+        sock.close()
+    if proc is not None:
+        threading.Thread(target=_stop_helper, args=(proc, None), name="khipu-routing-helper-reap",
+                         daemon=True).start()
+
+
+def daemon_routing_on(environ=None) -> bool:
+    """Whether the recall daemon's own switches have the per-prompt push on
+    (the feature, the bypass and the settings). Imports routing: only the
+    daemon, where it is already imported, asks this."""
+    try:
+        from khipu import features, routing
+
+        env = os.environ if environ is None else environ
+        if not features.enabled("routing_push", environ=env):
+            return False
+        if features.parse_bool(env.get("ROUTING_NOW_OFF") or "") is True:
+            return False
+        return not routing.push_off("prompt", environ=env)
+    except Exception:  # noqa: BLE001 - the first prompt with the push on starts it instead
+        return False
 
 
 def routing_forkserver_main(fd: int) -> int:
-    """The helper's loop: import what the read needs once, then fork one
-    child per request until the daemon closes stdin. The children are this
-    process's, so it reaps them; they end on their own (their alarm)."""
+    """The helper's loop: import what the read needs once, say it is ready
+    (one line on stdout), then fork one child per request until the daemon
+    closes stdin. The children are this process's, so it reaps them; they
+    end on their own (their alarm). A request whose prompt has stopped
+    waiting starts no child."""
     import select
     import signal
     import socket
@@ -570,6 +715,10 @@ def routing_forkserver_main(fd: int) -> int:
     routing.prompt_imports()
     import warnings
 
+    try:
+        _write_all(1, b"ready\n")
+    except OSError:
+        return 0  # the daemon is gone
     while True:
         try:
             while os.waitpid(-1, os.WNOHANG)[0]:
@@ -593,10 +742,12 @@ def routing_forkserver_main(fd: int) -> int:
         try:
             req = json.loads(msg.decode("utf-8"))
             session_id, cap = req.get("session"), float(req["cap"])
+            if time.monotonic() >= cap:
+                raise TimeoutError("the prompt stopped waiting")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", DeprecationWarning)
                 pid = os.fork()
-        except Exception:  # noqa: BLE001 - a bad request or a failed fork: the hook reads end of file
+        except Exception:  # noqa: BLE001 - a bad or late request, or a failed fork: the hook reads end of file
             os.close(write_fd)
             continue
         if pid == 0:
@@ -616,6 +767,7 @@ class _RoutingAtPrompt:
         self.pid: int | None = None
         self.fd: int | None = None
         self.session: str | None = None
+        self.helper: RoutingForkServer | None = None
 
     def begin(self, session_id, environ=None, forkserver: "RoutingForkServer | None" = None) -> "_RoutingAtPrompt":
         """Start the child. ``environ`` is the hook's environment when it is
@@ -659,8 +811,17 @@ class _RoutingAtPrompt:
                 self.fd = read_fd
                 try:
                     forkserver.start(write_fd, session_id, self.cap)
+                except RoutingHelperStarting:
+                    self.status = "skipped:starting"  # never waits for the helper
+                    self._close()
+                    return self
+                except RoutingHelperBusy:
+                    self.status = "skipped:busy"
+                    self._close()
+                    return self
                 finally:
                     os.close(write_fd)  # the helper holds its own copy, and its child
+                self.helper = forkserver  # holds a place until _close
                 self.status = "skipped:budget"  # until an answer arrives in time
                 return self
             try:
@@ -733,8 +894,10 @@ class _RoutingAtPrompt:
             self._close()
 
     def _close(self) -> None:
-        fd, pid = self.fd, self.pid
-        self.fd = self.pid = None
+        fd, pid, helper = self.fd, self.pid, self.helper
+        self.fd = self.pid = self.helper = None
+        if helper is not None:
+            helper.release()
         if fd is not None:
             try:
                 os.close(fd)
