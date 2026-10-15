@@ -63,6 +63,7 @@ _SUMMARY_RE = re.compile(
 # the search's degraded note before it.
 _ROUTING_FIELD_RE = re.compile(r" routing=(?P<status>\S+)\s*$")
 _DEGRADED_RE = re.compile(r" degraded=(?P<degraded>.*?)(?= stage=| routing=|\s*$)")
+_LEGS_RE = re.compile(r" legs=(?P<legs>\[.*?\]) degraded=")
 # Routing statuses a candidate's replay with the push on may log and still
 # pass: it waited for another fold past its budget (``fold-busy``: on a live
 # Mac, the daemon's poll), or the view changed and could not be saved
@@ -552,10 +553,12 @@ def _parse_summary(line: str) -> dict[str, Any] | None:
         hits = []
     routed = _ROUTING_FIELD_RE.search(line)
     degraded = _DEGRADED_RE.search(line)
+    legs = _LEGS_RE.search(line)
     return {"stamp": m.group("stamp"), "session": m.group("session"),
             "reason": m.group("reason"), "ms": float(m.group("ms")), "hits": hits,
             "routing": routed.group("status") if routed else None,
-            "degraded": degraded.group("degraded") if degraded else None}
+            "degraded": degraded.group("degraded") if degraded else None,
+            "legs": legs.group("legs") if legs else None}
 
 
 def _read_tail(path: Path, max_bytes: int = REPLAY_TAIL_BYTES) -> str:
@@ -670,7 +673,8 @@ def _recall_once(hook: Path, sample: dict[str, Any], session: str, *, legacy: bo
     return {"exit": r.returncode, "valid_json": valid, "wall_ms": wall_ms,
             "reason": row["reason"] if row else None, "ms": row["ms"] if row else None,
             "hits": row["hits"] if row else [], "routing": row["routing"] if row else None,
-            "degraded": row["degraded"] if row else None, "push": push}
+            "degraded": row["degraded"] if row else None, "legs": row["legs"] if row else None,
+            "push": push}
 
 
 def _probe_answer(r: subprocess.CompletedProcess) -> bool | None:
@@ -716,13 +720,22 @@ def _search_problem(run: dict[str, Any]) -> str | None:
     return None
 
 
+def _comparable(off: dict[str, Any], on: dict[str, Any]) -> bool:
+    """Whether two runs' search answers can be compared: the same legs ran
+    and the same degraded note. Each run is a cold one-shot hook, so an
+    embedding late in one of them (a lexical-only answer) is timing, not
+    routing."""
+    return off.get("degraded") == on.get("degraded") and off.get("legs") == on.get("legs")
+
+
 def _routing_problem(label: str, off: dict[str, Any], on: dict[str, Any]) -> str | None:
     """Why the candidate's run with routing on fails the step, or None: its
     routing read was skipped for any reason but a benign one
     (``ROUTING_SKIPS_OK``), its code said the push was on and the hook
     logged no routing status, its own search fails as a run with routing
     off would (``_search_problem``), or its search answer is not the one it
-    gave with routing off."""
+    gave with routing off when both ran the same legs with the same
+    degraded note (``_comparable``)."""
     status = on.get("routing") or ""
     what = _routing_skip_problem(status)
     if what:
@@ -732,7 +745,7 @@ def _routing_problem(label: str, off: dict[str, Any], on: dict[str, Any]) -> str
     what = _search_problem(on)
     if what:
         return f"{label}: with routing on, {what}"
-    if on["hits"] != off["hits"]:
+    if _comparable(off, on) and on["hits"] != off["hits"]:
         return (f"{label}: the search answer changed with routing on ({len(on['hits'])} hit(s) against "
                 f"{len(off['hits'])} with it off)")
     return None
@@ -751,9 +764,11 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
     when its push is on and its hook logs no routing status, when its
     search with routing on times out, fails or runs past the 1.2 s budget
     (the same test as with routing off), or when its search answer differs
-    with routing on (a failing pair is replayed once
-    more first, so a search or a read that was late once is not taken for
-    the candidate's routing)."""
+    with routing on while both runs ran the same legs with the same degraded
+    note. A failing pair, or one whose legs or degraded note differ, is
+    replayed once more first, so a search or a read that was late once is
+    not taken for the candidate's routing; a pair whose legs or degraded
+    note still differ is noted, not failed (timing, not routing)."""
     samples = sample_queries(query_log_path(), n)
     if not samples:
         return False, "no queries in the last day; use Khipu once and re-run"
@@ -786,11 +801,12 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
         on = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-route-{i}", legacy=cand_legacy, routing=True,
                           root=Path(candidate))
         problem = _routing_problem(label, cand, on)
-        if problem:
-            # Once more, both ways, before the step fails: a search late once
-            # (embedding late, a cold cache) is not routing, and nor is a read
-            # that refolded once because a runner's heartbeat was rewritten
-            # between the prefold and the hook's read.
+        if problem or not _comparable(cand, on):
+            # Once more, both ways, before the step fails or the answers go
+            # uncompared: a search late once (embedding late, a cold cache)
+            # is not routing, and nor is a read that refolded once because a
+            # runner's heartbeat was rewritten between the prefold and the
+            # hook's read.
             cand = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-cand-{i}-again", legacy=cand_legacy,
                                 routing=False)
             on = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-route-{i}-again", legacy=cand_legacy,
@@ -805,6 +821,8 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
             routed_runs += 1
             on_ms = f"{on['ms']:.0f} ms" if on.get("ms") is not None else "no time"
             note += f", {on_ms} with routing on (routing={on['routing']})"
+        if not _comparable(cand, on):
+            note += ", answers not compared (their legs or degraded note differed twice: timing, not routing)"
         notes.append(note)
     if problems:
         return False, "; ".join(problems)

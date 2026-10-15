@@ -70,8 +70,9 @@ _ACCEPT_TICK_S = 0.5
 # How often the idle service reads its routing switches (``keep_routing``):
 # a push switched off stops the routing helper, and its poll, within this.
 _ROUTING_LOOK_S = 2.0
-# A helper that a prompt used this recently is kept even with this service's
-# push off (that prompt's environment had it on); its poll is off regardless.
+# A helper that a prompt wanted this recently (ready or still starting) is
+# kept even with this service's push off (that prompt's environment had it
+# on); one still starting is never stopped. Its poll follows its own switches.
 _ROUTING_IDLE_STOP_S = 60.0
 # sockaddr_un.sun_path is 104 bytes on macOS, 108 on Linux; stay under both.
 _SUN_PATH_MAX = 100

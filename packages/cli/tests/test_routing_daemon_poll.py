@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -220,9 +221,12 @@ def test_with_the_push_off_nothing_is_due_and_on_again_a_poll_is_due_at_once(hom
 
 
 def _helper_poll(schedule) -> dict:
-    """A poll as the helper starts it: the view's stat first, then the child's poll."""
+    """A poll as the helper runs it: the view's stat first, then the child's
+    poll, then the helper takes its answer."""
     schedule.view_seen = recall_prompt._view_stat(routing)
-    return _poll(schedule)
+    out = recall_prompt._poll_once(routing)
+    recall_prompt._take_poll_answer(schedule, out)
+    return out
 
 
 @pytest.mark.parametrize("interval", [0, "1h"])
@@ -256,11 +260,47 @@ def test_a_limit_written_after_the_last_poll_is_waited_for_with_no_poll_followin
     assert _helper_poll(schedule)["folded"]
     codex = next(a for a in routing._load_view()["accounts"] if a["label"] == "Codex")
     assert codex["state"] == routing.PROBABLY_OPEN
-    # Its own save is one more look at a fresh view, then nothing.
-    recall_prompt._look_at_settings(schedule, routing)
-    assert schedule.due() == ["poll"] and not _helper_poll(schedule)["folded"]
+    # Its own save makes no poll due.
     recall_prompt._look_at_settings(schedule, routing)
     assert not schedule.due()
+
+
+def _beat(folder: Path, at: datetime) -> None:
+    (folder / "state" / "heartbeat.json").write_text(json.dumps(
+        {"pid": 1, "time": at.timestamp(), "at": routing._iso(at), "interval": 20.0, "error": None}))
+
+
+@pytest.mark.parametrize("interval", [60, 0])
+def test_the_helpers_own_save_never_makes_another_poll_due(home, tmp_path, interval):
+    # The helper took view.json's stat before its poll child saved, so its
+    # own save made the next look's poll due: with a runner rewriting its
+    # heartbeat every second it refolded every 5 s, whatever the interval.
+    clocks = home["clocks"]
+    runner = tmp_path / "runner"
+    shutil.copytree(Path(__file__).parent / "fixtures" / "routing" / "lanes-a", runner)
+    _set(home, routing_poll_interval=interval, features={"routing_push": True},
+         routing_sources=[{"name": "project A", "kind": "lanes", "path": str(runner)}],
+         routing_lane_map={"project A": {"codex": "Codex"}})
+    routing.report(account="Claude", state="open", author=ME)
+    schedule = _schedule(home, interval=routing.poll_interval())
+    outside = {100, 200}
+    folds: list[tuple[int, list[str]]] = []
+    next_look = 0.0
+    for second in range(300):
+        _beat(runner, clocks.now)  # the runner's heartbeat, every second
+        if second in outside:
+            routing.report(account="Codex", state="open", author=ME)  # a save by someone else
+        if clocks.mono() >= next_look or schedule.due():  # the helper's loop
+            recall_prompt._look_at_settings(schedule, routing)
+            next_look = clocks.mono() + recall_prompt._SETTINGS_LOOK_S
+            why = schedule.due()
+            if why and _helper_poll(schedule)["folded"]:
+                folds.append((second, why))
+        clocks.run(1.0)
+    # Besides the clock (the view's valid_until): the start, one per interval, one per outside save.
+    not_clock = [f for f in folds if "clock" not in f[1]]
+    most = 1 + (300 // interval if interval else 0) + len(outside)
+    assert len(not_clock) <= most, folds
 
 
 def test_a_changed_view_makes_no_poll_due_with_the_push_off(home):
@@ -512,6 +552,38 @@ def test_the_daemon_stops_the_helper_when_the_push_goes_off_and_never_starts_it_
     assert _wait(lambda: helper.routing_forkserver.wait_ready(0.1) and helper.routing_forkserver.spawned == 2)
 
 
+def test_a_starting_helper_a_prompt_wanted_is_never_stopped_with_the_daemons_push_off(home, monkeypatch):
+    # The push on only in the hook's environment, the daemon's own switches
+    # off: keep_routing's idle stop killed the helper while it started (no
+    # request had reached a ready helper yet), so it never became ready.
+    monkeypatch.setattr(recall_daemon, "_ROUTING_LOOK_S", 0.0)
+    svc = recall_daemon.RecallService(home["capture"] / "recall.sock", stamp_fn=lambda: "fixed",
+                                      idle_check=False, routing_forkserver=False)
+    slow = [sys.executable, "-c", "import sys, time\ntime.sleep(0.5)\nfrom khipu import recall_prompt\n"
+            "sys.exit(recall_prompt.routing_forkserver_main(int(sys.argv[1])))"]
+    fs = svc.routing_forkserver = recall_prompt.RoutingForkServer(argv=slow)
+    try:
+        assert not recall_prompt.daemon_routing_on()
+        read_fd, write_fd = os.pipe()
+        try:
+            with pytest.raises(recall_prompt.RoutingHelperStarting):
+                fs.start(write_fd, SESSION, time.monotonic() + 1.0)  # the prompt's push is on
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+        until = time.monotonic() + 10
+        while not fs.wait_ready(0.02) and time.monotonic() < until:
+            svc.keep_routing()  # as often as the daemon's accept loop
+        assert fs.wait_ready(0) and fs.spawned == 1
+        svc.keep_routing()
+        assert fs._proc is not None  # wanted within _ROUTING_IDLE_STOP_S: kept
+        monkeypatch.setattr(recall_daemon, "_ROUTING_IDLE_STOP_S", 0.0)
+        svc.keep_routing()
+        assert fs._proc is None  # idle with the daemon's push off: stopped
+    finally:
+        fs.close()
+
+
 def test_the_helper_picks_up_a_poll_interval_turned_on_again(home, monkeypatch, helper):
     monkeypatch.setattr(recall_prompt, "_SETTINGS_LOOK_S", 0.5)
     _set(home, routing_poll_interval=0)
@@ -558,6 +630,15 @@ def _hook_log(statuses: list[str | None], *, when: datetime | None = None) -> No
             fh.write(f"{stamp} [khipu-prompt-recall] session=s{i} reason=ok ms=300.0 hits=[] legs=['lexical'] "
                      f"degraded=None{routed}\n")
         fh.write(f"{stamp} [khipu-prompt-recall] snapshot unusable (no replica)\n")
+
+
+def test_the_budget_rate_counts_prompts_whose_helper_was_still_starting(home):
+    # A helper that never becomes ready logs routing=skipped:starting on
+    # every prompt: doctor's rate showed 0% while no prompt got its lines.
+    _hook_log(["none"] * 10 + ["skipped:starting"] * 10)
+    rate = recall_prompt.prompt_routing_budget_rate(warn_pct=10.0)
+    assert rate["skipped"] == 10 and rate["skipped_starting"] == 10
+    assert rate["rate_pct"] == 50.0 and rate["warn"]
 
 
 def test_the_budget_rate_counts_only_prompts_with_the_push_on(home):

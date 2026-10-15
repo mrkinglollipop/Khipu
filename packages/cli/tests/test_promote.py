@@ -587,6 +587,40 @@ def test_the_search_test_is_the_same_for_both_runs():
     assert pm._routing_problem("prompt 1", off, on) is None
 
 
+def _late_embedding_hook(rng, late: float):
+    """A fake candidate whose routing is fine and whose embedding is late at
+    random, with routing on or off alike: late, the search answers from the
+    lexical leg alone (``degraded=embedding late``, fewer hits)."""
+    def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
+        if argv[1:2] == ["-c"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"push": True}) + "\n", "")
+        on = env.get("KHIPU_FEATURE_ROUTING_PUSH") == "1"
+        if rng.random() < late:
+            hits, legs, degraded = ["episode:3"], ["lexical"], "embedding late"
+        else:
+            hits, legs, degraded = ["episode:3", "episode:5"], ["lexical", "cosine"], None
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = (f"{stamp} [khipu-prompt-recall] session=s1 reason=ok ms=300.0 hits={hits} legs={legs} "
+                f"degraded={degraded}" + (" routing=full" if on else ""))
+        log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(line + "\n")
+        return subprocess.CompletedProcess(argv, 0, '{"hookSpecificOutput": {}}\n', "")
+    return fake_run
+
+
+def test_replay_passes_a_good_candidate_whose_embedding_is_late_at_random(home, monkeypatch):
+    # Each run is a cold one-shot hook: a late embedding gives a lexical-only
+    # answer whatever routing does. A pair whose degraded note or legs differ
+    # is timing, not routing, and never fails the step.
+    import random
+
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _late_embedding_hook(random.Random(7), late=0.3))
+    failed = [out["detail"] for out in (pm.gate_recall_replay(candidate) for _ in range(100)) if not out["ok"]]
+    assert failed == []
+
+
 def test_replay_passes_a_search_that_differed_once_and_agrees_again(home, monkeypatch):
     candidate = _one_query(home)
     monkeypatch.setattr(pm, "_run", _routing_hook([], first_on_hits=()))
