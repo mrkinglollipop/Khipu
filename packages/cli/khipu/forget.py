@@ -85,6 +85,8 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
     }]
     has_merged_sources = False
     source_rows: list[dict[str, Any]] | None = None
+    unidentified_sources = 0
+    shared_identities: list[dict[str, Any]] = []
     from khipu.capture_identity import sources_for_episode, sources_ready
 
     if sources_ready(cur):
@@ -94,11 +96,33 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         # since (RSN-6). The live identity above stays first.
         source_rows = sources_for_episode(cur, episode_id)
         has_merged_sources = any(src["role"] == "merged" for src in source_rows)
+        unidentified_sources = sum(1 for src in source_rows
+                                   if src["ts"] is None or src["summary_md5"] is None)
+        from_sources: list[dict[str, Any]] = []
         for src in source_rows:
             ident = {"ts": src["ts"], "summary_md5": src["summary_md5"]}
             if (isinstance(ident["ts"], str) and ident["summary_md5"]
                     and not any(_same_identity(ident, known) for known in legacy_identities)):
                 legacy_identities.append(ident)
+                from_sources.append(ident)
+        # A legacy line another episode also holds is evidence of that episode.
+        # Erasing it would lose that episode's line, so it stays and the forget
+        # reports itself incomplete. The live identity is exempt: the legacy
+        # unique key already makes it this episode's alone.
+        if from_sources:
+            cur.execute(
+                "SELECT c.n FROM unnest(%s::timestamptz[], %s::text[]) "
+                "WITH ORDINALITY AS c(ts, md, n) WHERE EXISTS ("
+                "SELECT 1 FROM episode_sources s WHERE s.episode_id <> %s "
+                "AND s.ts = c.ts AND s.summary_md5 = c.md) OR EXISTS ("
+                "SELECT 1 FROM episodes e WHERE e.id <> %s AND e.ts = c.ts "
+                "AND md5(e.summary) = c.md)",
+                ([i["ts"] for i in from_sources], [i["summary_md5"] for i in from_sources],
+                 episode_id, episode_id),
+            )
+            held = {int(r[0]) - 1 for r in cur.fetchall()}
+            shared_identities = [from_sources[i] for i in sorted(held)]
+            legacy_identities = [i for i in legacy_identities if i not in shared_identities]
     # Pre-0027 hub (or no source row recorded): an edited summary can still have an original legacy
     # identity in raw. For merged episodes, raw describes a retained source,
     # not an identity that forget can safely erase without a capture-identity
@@ -183,6 +207,8 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         "legacy_identities": legacy_identities,
         "has_merged_sources": has_merged_sources,
         "source_rows": source_rows,
+        "unidentified_sources": unidentified_sources,
+        "shared_identities": shared_identities,
     }
 
 
@@ -315,10 +341,18 @@ def _source_copy(payload: dict[str, Any], source_rows: list[dict[str, Any]]) -> 
     own, but it shares the key of the row its retry would land on)."""
     from khipu.capture_identity import payload_sha256, source_key
 
+    import copy
+
+    from khipu.capture import _redact_capture_values
+
     keys = {src["source_key"] for src in source_rows}
     hashes = {src["payload_sha256"] for src in source_rows if src.get("payload_sha256")}
-    if source_key(payload) in keys or payload_sha256(payload) in hashes:
-        return True
+    # A job queued by the legacy mirror path may be unredacted while its source
+    # row was keyed after redaction, so the redacted copy is compared as well.
+    redacted = _redact_capture_values(copy.deepcopy(payload))
+    for form in (payload, redacted):
+        if source_key(form) in keys or payload_sha256(form) in hashes:
+            return True
     summary = payload.get("summary")
     if not isinstance(summary, str):
         return False
@@ -422,6 +456,8 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
         partial.append("legacy_file")
     if any(not item.get("backups", {}).get("ok", True) for item in out["legacy_files"]):
         partial.append("legacy_backups")
+    if out.get("unidentified_sources", 0) > 0 and "legacy_file" not in partial:
+        partial.append("legacy_file")
     out["outboxes"] = [_outbox_remainder(out.get("session_id"),
                                        has_merged_sources=out.get("has_merged_sources", False),
                                        source_rows=out.get("source_rows"))]
@@ -429,6 +465,8 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
                      "removed": sum(int(item.get("removed") or 0) for item in out["outboxes"])}
     if not out["outbox"]["ok"]:
         partial.append("outbox")
+    if out.get("shared_identities"):
+        partial.append("legacy_shared")
     out["complete"] = not partial
     out["partial"] = partial
     out["remaining"] = out["outboxes"][0].get("remaining", [])
@@ -439,6 +477,12 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
         "outbox": [{key: item[key] for key in ("error", "remaining") if item.get(key)}
                    for item in out["outboxes"] if item.get("error") or item.get("remaining")],
     }
+    if out.get("unidentified_sources", 0) > 0:
+        out["partial_errors"]["legacy_file"] = [
+            *out["partial_errors"].get("legacy_file", []),
+            f"source rows without a legacy identity: {out['unidentified_sources']}"]
+    if out.get("shared_identities"):
+        out["partial_errors"]["legacy_shared"] = out["shared_identities"]
     out["partial_errors"] = {key: value for key, value in out["partial_errors"].items() if value}
     out["ok"] = out["complete"]
     if partial:

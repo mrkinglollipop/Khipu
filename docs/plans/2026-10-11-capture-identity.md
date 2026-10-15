@@ -10,7 +10,7 @@ CAP-14, ARCH-10, CAP-22, ARCH-8 (P1); review RV1-01 (P0).
 | Phase | What | State |
 |---|---|---|
 | 1 | `episode_sources` table, backfill, dual write; nothing reads it yet | built, in review (branch feat/capture-identity-p1) |
-| 2 | Every identity lookup reads sources; `write_pg` returns the episode id | open |
+| 2 | Every identity lookup reads sources; `write_pg` returns the episode id | built, in review (branch feat/capture-identity-p2) |
 | 3 | Uniqueness moves to the source key; the three backed-out fixes return | open |
 
 One PR per phase, merged alone and soaked on main (hooks are live from the main checkout) before the next
@@ -149,6 +149,21 @@ Inspect every `(ts, md5(summary))` reader listed under source facts before touch
 
 Stop-condition: every reader keeps its old path when the table is absent. A hub without 0027 must behave
 exactly as today; add one test per reader that runs with the probe forced false.
+
+Build notes (phase 2, 2026-10-15):
+
+- `write_pg` keeps its dict return and adds `source_key`; `episode_id` is set on every branch (from
+  `RETURNING id` on insert, the legacy-key holder on a conflict, the matched row on skip or merge).
+  `capture(..., result=)` passes the stats to the MCP tool.
+- The exact-window source-key match runs only when it is no broader than the column match: payload-hash
+  keys, or natural keys with a harness and, when windowed, a part. The 764 historical window-without-part
+  episodes keep inserting through the column path.
+- The file-line anti-join counts a line present when either the live identity or any source row matches.
+- Forget leaves a source-derived line that another episode also holds (reported as `legacy_shared`) and
+  reports `legacy_file` partial when a source row has no `ts` or `summary_md5`.
+- Timed on a scratch database with 20,000 episodes and source rows: anti-join over 20,100 keys 182 ms
+  (146 ms without the table); source-key lookup 0.09 ms. The live replica and live capture timing gate
+  below has not been run.
 
 Timing gate (standing policy since 2026-10-11): anything on the capture or per-prompt path is timed against
 the live replica and a live capture before merge, not only under pytest.

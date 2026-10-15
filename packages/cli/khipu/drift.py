@@ -113,6 +113,8 @@ def episodes_missing_in_pg(cur, keys: list[tuple[str, str]]) -> list[tuple[str, 
     alone re-inserted the original line as a new episode (ARCH-10). Without
     the table this is exactly the pre-0027 query.
     """
+    if not keys:
+        return []
     from khipu.capture_identity import sources_ready
 
     sources_sql = ""

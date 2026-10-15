@@ -17,7 +17,7 @@ from unittest import mock
 from khipu import capture as cap
 from khipu import capture_identity as ci
 from khipu import db, drift, forget, outbox
-from tests.test_capture_identity import _SourcesFakeCursor, _WritePgCase
+from tests.test_capture_identity import SECRET, _SourcesFakeCursor, _WritePgCase
 from tests.test_capture import _FakeConn
 
 
@@ -92,6 +92,32 @@ class ExactWindowReaderTest(unittest.TestCase):
             self.assertIsNone(cap._dedup_exact_window(cur, dict(self.PAYLOAD)))
         self.assertFalse(any("episode_sources" in s for s in cur.calls))
         self.assertTrue(any("raw @>" in s for s in cur.calls), "receipt match still runs")
+
+
+    def test_windowed_capture_without_a_part_ignores_the_source_key(self):
+        # Historical episodes share one key when they have a window_id but no
+        # part; the column match inserts them, so the key must not skip them.
+        base = {"harness": "codex", "session_id": "codex:a", "transcript_range": "0:9",
+                "window_id": "w1"}
+        cur = _LookupCur({ci.source_key({**base, "summary": "one"}): 41})
+        with mock.patch("khipu.capture_identity.sources_ready", return_value=True), \
+                mock.patch("khipu.db.has_columns", return_value=True):
+            first = cap._dedup_exact_window(cur, {**base, "summary": "one"})
+            second = cap._dedup_exact_window(cur, {**base, "summary": "two"})
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertFalse(any("episode_sources" in s for s in cur.calls))
+
+    def test_a_part_or_no_window_keeps_the_source_key(self):
+        parted = {**self.PAYLOAD, "window_id": "w1", "part": "1/2"}
+        cur = _LookupCur({ci.source_key(parted): 8})
+        with mock.patch("khipu.capture_identity.sources_ready", return_value=True):
+            self.assertEqual(cap._dedup_exact_window(cur, dict(parted)), 8)
+        # No natural key: the key is the payload hash, an exact replay.
+        bare = {"summary": "s"}
+        cur = _LookupCur({ci.source_key(bare): 9})
+        with mock.patch("khipu.capture_identity.sources_ready", return_value=True):
+            self.assertEqual(cap._dedup_exact_window(cur, dict(bare)), 9)
 
 
 class CaptureHandsTheIdOnTest(unittest.TestCase):
@@ -186,8 +212,10 @@ class MissingInPgReaderTest(unittest.TestCase):
 class _ForgetCur:
     """forget_episode's statements; ``sources`` is None for a pre-0027 hub."""
 
-    def __init__(self, row, raw, sources):
+    def __init__(self, row, raw, sources, shared_md5=()):
         self.row, self.raw, self.sources = row, raw, sources
+        self.shared_md5 = set(shared_md5)
+        self.shared_queries = 0
         self.rowcount = 0
         self._one = None
         self._all: list = []
@@ -206,6 +234,11 @@ class _ForgetCur:
             self._one = (self.raw,)
         elif s.startswith("SELECT source_key, role, ts, summary_md5"):
             self._all = list(self.sources or [])
+        elif "unnest(" in s:
+            # Candidates are (ts[], md5[]); report the 1-based position of each
+            # one another episode also holds.
+            self.shared_queries += 1
+            self._all = [(n,) for n, md in enumerate(params[1], 1) if md in self.shared_md5]
 
     def fetchone(self):
         return self._one
@@ -231,6 +264,78 @@ class ForgetReaderTest(unittest.TestCase):
                                ("2026-10-01T09:02:00", _md5("second capture"))})
         self.assertTrue(out["has_merged_sources"])
         self.assertEqual([r["source_key"] for r in out["source_rows"]], ["k1", "k2"])
+
+    def test_a_line_another_episode_holds_is_dropped_and_reported(self):
+        sources = [("k1", "origin", self.TS, _md5("first text"), None),
+                   ("k2", "merged", datetime(2026, 10, 1, 9, 2, tzinfo=timezone.utc),
+                    _md5("second capture"), "p2")]
+        cur = _ForgetCur((self.TS, "edited text", "claude_code:a"), self.RAW, sources,
+                         shared_md5={_md5("second capture")})
+        out = forget.forget_episode(cur, 3)
+        self.assertEqual(cur.shared_queries, 1)
+        self.assertEqual([i["summary_md5"] for i in out["shared_identities"]],
+                         [_md5("second capture")])
+        self.assertEqual({i["summary_md5"] for i in out["legacy_identities"]},
+                         {_md5("edited text"), _md5("first text")})
+        self.assertEqual(out["unidentified_sources"], 0)
+
+    def test_nothing_shared_by_default_and_probe_false_never_asks(self):
+        sources = [("k1", "origin", self.TS, _md5("first text"), None)]
+        cur = _ForgetCur((self.TS, "edited text", "claude_code:a"), self.RAW, sources)
+        self.assertEqual(forget.forget_episode(cur, 3)["shared_identities"], [])
+        cur = _ForgetCur((self.TS, "edited text", "claude_code:a"), self.RAW, None)
+        out = forget.forget_episode(cur, 3)
+        self.assertEqual((cur.shared_queries, out["shared_identities"]), (0, []))
+
+    def test_source_rows_without_a_timestamp_or_md5_are_counted(self):
+        sources = [("k1", "origin", None, _md5("first text"), None),
+                   ("k2", "merged", self.TS, None, None)]
+        cur = _ForgetCur((self.TS, "edited text", "claude_code:a"), self.RAW, sources)
+        self.assertEqual(forget.forget_episode(cur, 3)["unidentified_sources"], 2)
+
+    def _everywhere(self, result):
+        cur = mock.MagicMock()
+        cur.__enter__.return_value = cur
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
+                mock.patch.object(forget, "forget_episode", return_value=result), \
+                mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot",
+                           return_value={"ok": True}), \
+                mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(Path(td) / "outbox")}):
+            return forget.forget_everywhere(3, memory_root=Path(td))
+
+    def _result(self, **extra):
+        ident = {"ts": "2026-10-01T09:00:00+00:00", "summary_md5": _md5("x")}
+        return {"ok": True, "id": 3, "session_id": "claude_code:a", "identity": ident,
+                "legacy_identities": [ident], "has_merged_sources": False,
+                "source_rows": [], **extra}
+
+    def test_unidentified_sources_make_the_forget_partial(self):
+        out = self._everywhere(self._result(unidentified_sources=2, shared_identities=[]))
+        self.assertFalse(out["complete"])
+        self.assertIn("legacy_file", out["partial"])
+        self.assertIn("source rows without a legacy identity: 2",
+                      out["partial_errors"]["legacy_file"])
+
+    def test_shared_identities_make_the_forget_partial(self):
+        shared = [{"ts": "2026-10-01T09:02:00+00:00", "summary_md5": _md5("y")}]
+        out = self._everywhere(self._result(unidentified_sources=0, shared_identities=shared))
+        self.assertFalse(out["complete"])
+        self.assertEqual(out["partial"].count("legacy_shared"), 1)
+        self.assertEqual(out["partial_errors"]["legacy_shared"], shared)
+
+    def test_a_job_unredacted_on_disk_matches_its_redacted_source_row(self):
+        queued = {"ts": "2026-10-01T09:02:00Z", "summary": f"key {SECRET}",
+                  "session_id": "claude_code:a", "transcript_range": "0:9"}
+        from khipu.capture import _redact_capture_values
+        import copy
+
+        redacted = _redact_capture_values(copy.deepcopy(queued))
+        self.assertNotEqual(redacted, queued)
+        rows = [{"source_key": "other", "role": "origin", "ts": None, "summary_md5": None,
+                 "payload_sha256": ci.payload_sha256(redacted)}]
+        self.assertTrue(forget._source_copy(queued, rows))
+        self.assertFalse(forget._source_copy(dict(queued, summary="unrelated"), rows))
 
     def test_probe_false_keeps_the_raw_path(self):
         cur = _ForgetCur((self.TS, "edited text", "claude_code:a"), self.RAW, None)

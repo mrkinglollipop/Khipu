@@ -83,6 +83,21 @@ def _receipts(payload: dict[str, Any], source: dict[str, Any] | None) -> list[st
     return out + [legacy] if legacy not in out else out
 
 
+def _source_key_is_safe(payload: dict[str, Any]) -> bool:
+    """The source key may answer only when it is no broader than the column
+    match that follows it. Without a natural key it is the payload hash (an
+    exact replay). With one, it needs a harness, and a window_id needs its part:
+    the 0027 backfill found historical episodes with a window_id but no part
+    that share one key, where the column match still inserts each of them."""
+    from khipu.capture_identity import has_natural_key
+
+    if not has_natural_key(payload):
+        return True
+    if not payload.get("harness"):
+        return False
+    return not payload.get("window_id") or bool(payload.get("part"))
+
+
 def _dedup_exact_window(cur, payload: dict[str, Any], *,
                         source: dict[str, Any] | None = None) -> int | None:
     """K3: every sibling PART of one split window shares the same (harness,
@@ -97,7 +112,7 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
     for sources recorded before the key existed."""
     from khipu.capture_identity import episode_for_source, source_key, sources_ready
 
-    if sources_ready(cur):
+    if sources_ready(cur) and _source_key_is_safe(payload):
         recorded = episode_for_source(cur, source["source_key"] if source else source_key(payload))
         if recorded is not None:
             return recorded
