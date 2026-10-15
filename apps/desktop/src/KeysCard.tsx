@@ -42,7 +42,7 @@ export const KEYS: readonly KeyInfo[] = [
     account: "anthropic_api_key",
     uses: "Summaries with Claude Haiku",
     env: "ANTHROPIC_API_KEY",
-    checks: [],
+    checks: ["anthropic_models"],
     addLabel: "a Claude API key",
   },
   {
@@ -51,7 +51,7 @@ export const KEYS: readonly KeyInfo[] = [
     account: "openai_api_key",
     uses: "Summaries with OpenAI",
     env: "OPENAI_API_KEY",
-    checks: [],
+    checks: ["openai_models"],
     addLabel: "an OpenAI key",
   },
   {
@@ -60,7 +60,7 @@ export const KEYS: readonly KeyInfo[] = [
     account: "openrouter_api_key",
     uses: "Summaries through OpenRouter",
     env: "OPENROUTER_API_KEY",
-    checks: [],
+    checks: ["openrouter_models"],
     addLabel: "an OpenRouter key",
   },
   {
@@ -127,6 +127,8 @@ type VerifyApi = {
   verify: () => Promise<void>;
   /** A run that could not execute; shown on every checkable stored key. */
   runError?: string | null;
+  /** Drops the earlier results for these check ids when a key is replaced. */
+  forget?: (ids: readonly string[]) => void;
 };
 
 function parseOk(raw: unknown): { ok?: boolean; error?: string } | null {
@@ -179,6 +181,7 @@ function KeyRow({
       if (out?.ok) {
         setValue("");
         setEditing(false);
+        api.forget?.(info.checks);
         await onKeySaved();
         if (checkable) await api.verify();
       } else {
@@ -200,7 +203,7 @@ function KeyRow({
   } else if (st.source === "none") {
     tone = "muted";
     body = info.optional ? "Optional, not stored" : "Not stored";
-  } else if (checkable && api.runError) {
+  } else if (api.runError) {
     tone = "err";
     body = `${info.name}: the check could not run: ${api.runError}`;
   } else {
@@ -209,11 +212,9 @@ function KeyRow({
         ? `Works${age ? `, ${age}` : ""}`
         : st.check === "failed"
           ? `${info.name}: ${st.detail}`
-          : checkable
-            ? st.source === "env"
-              ? "Not checked"
-              : "Stored, not checked"
-            : "";
+          : st.source === "env"
+            ? "Not checked"
+            : "Stored, not checked";
     tone = st.check === "ok" ? "ok" : st.check === "failed" ? "err" : "neutral";
     if (st.source === "env") {
       body = (
@@ -222,14 +223,12 @@ function KeyRow({
           {result ? ` ${result}${st.check === "ok" ? "." : ""}` : ""}
         </span>
       );
-    } else if (result) {
-      body = result;
     } else {
-      body = st.source === "file" ? "Read from a key file" : "Stored in this Mac's Keychain";
+      body = result;
     }
   }
 
-  const failed = stored && (st.check === "failed" || (checkable && Boolean(api.runError)));
+  const failed = stored && (st.check === "failed" || Boolean(api.runError));
   return (
     <div
       className={`row-item key-row${failed ? " err" : ""}`}
@@ -333,14 +332,18 @@ export function KeysCard({
   verify: VerifyApi;
   onKeySaved: () => Promise<void> | void;
 }) {
-  // A key that was never checked is checked once when the page opens.
+  // A stored key with no real check is checked once when the page opens.
   const autoChecked = useRef(false);
   useEffect(() => {
-    if (!active || autoChecked.current || !presence || verify.checkedAt != null || verify.verifying) return;
-    const anyCheckable = KEYS.some(
-      (k) => k.checks.length > 0 && keyStatus(presence, null, k.id).source !== "none",
-    );
-    if (!anyCheckable) return;
+    if (!active || autoChecked.current || !presence || verify.verifying) return;
+    // Any stored key with no real result yet (a skipped "Not checked" is not
+    // one) is checked once, whatever the last run's time says.
+    const anyUnchecked = KEYS.some((k) => {
+      if (k.checks.length === 0) return false;
+      const st = keyStatus(presence, verify.result, k.id);
+      return st.source !== "none" && st.source !== "unknown" && st.check == null;
+    });
+    if (!anyUnchecked) return;
     autoChecked.current = true;
     void verify.verify();
   }, [active, presence, verify]);

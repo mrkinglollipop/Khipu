@@ -229,7 +229,8 @@ describe("SynthProviderChoices", () => {
       />,
     );
     expect(screen.getByText("Key works")).toBeTruthy();
-    expect(screen.getByText("Key stored")).toBeTruthy();
+    expect(screen.queryByText("Key stored")).toBeNull();
+    expect(screen.getAllByText("Not checked").length).toBeGreaterThan(0);
     expect(screen.getAllByText("No key")).toHaveLength(2);
     cleanup();
     render(
@@ -307,7 +308,7 @@ describe("SynthProviderChoices", () => {
       />,
     );
     expect(screen.getByText("Uses the Claude API key: set in the environment.")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Show it in Keys below" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Check it in Keys below" })).toBeTruthy();
     cleanup();
     render(
       <Harness
@@ -423,11 +424,42 @@ describe("summariser fallback (synth_fallback)", () => {
     expect(screen.getByText(/While that key is refused, a failed capture waits and is retried/)).toBeTruthy();
   });
 
-  it("shows Reading… instead of a false choice until doctor answers", () => {
-    render(<Harness initial={anthropicRow} />);
+  it("shows Reading… only while the config read is in flight, then both choices", async () => {
+    let release: (v: string) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_config_show") return new Promise<string>((r) => (release = r));
+      throw new Error(`unexpected command ${cmd}`);
+    });
+    render(<Harness initial={anthropicRow} doctorSynth={{ provider: "anthropic" }} />);
     expect(screen.queryByRole("radio", { name: "Retry on Gemini Flash" })).toBeNull();
     expect(screen.getByRole("group", { name: "If the provider fails" }).textContent).toContain("Reading…");
-    expect(screen.queryByText(/Fallback uses the Gemini key/)).toBeNull();
+    release(JSON.stringify({ config: { synth_fallback: "none" } }));
+    await waitFor(() => expect(wait().checked).toBe(true));
+    expect(screen.queryByText("Reading…")).toBeNull();
+  });
+
+  it("reads the stored fallback from config when doctor has no fallback block", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_config_show") return JSON.stringify({ config: {} });
+      throw new Error(`unexpected command ${cmd}`);
+    });
+    render(<Harness initial={anthropicRow} doctorSynth={{ provider: "anthropic", key_present: true }} />);
+    await waitFor(() => expect(retry().checked).toBe(true));
+    expect(wait().disabled).toBe(false);
+  });
+
+  it("keeps both choices usable, with a failure sentence, when the config read fails", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      calls.push([cmd, args]);
+      if (cmd === "khipu_config_show") throw new Error("config unreadable");
+      if (cmd === "khipu_config_set") return JSON.stringify({ ok: true });
+      throw new Error(`unexpected command ${cmd}`);
+    });
+    render(<Harness initial={anthropicRow} doctorSynth={{ provider: "anthropic" }} />);
+    await screen.findByText(/Can't read the stored choice/);
+    expect(retry().disabled).toBe(false);
+    fireEvent.click(wait());
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "synth_fallback", value: "none" }]));
   });
 
   it("words the fallback for the health report", () => {

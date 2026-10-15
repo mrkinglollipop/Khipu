@@ -140,10 +140,10 @@ describe("KeysCard", () => {
 
   it("puts words beside every status, and a key with no check says where it is stored", () => {
     renderKeys({ ...NONE, anthropic_in_keychain: true, openai_file_key_present: true });
-    expect(within(rowOf("Claude API")).getByText("Stored in this Mac's Keychain")).toBeTruthy();
-    expect(within(rowOf("OpenAI")).getByText("Read from a key file")).toBeTruthy();
+    expect(within(rowOf("Claude API")).getByText("Stored, not checked")).toBeTruthy();
+    expect(within(rowOf("OpenAI")).getByText("Stored, not checked")).toBeTruthy();
     expect(within(rowOf("Gemini")).getByText("Not stored")).toBeTruthy();
-    expect(within(rowOf("Claude API")).queryByRole("button", { name: /Check/ })).toBeNull();
+    expect(within(rowOf("Claude API")).getByRole("button", { name: "Check the Claude API key now" })).toBeTruthy();
   });
 
   it("shows an environment key as the one used, with no Add or Replace", () => {
@@ -184,9 +184,42 @@ describe("KeysCard", () => {
     await act(async () => {});
     expect(first.verify).not.toHaveBeenCalled();
     cleanup();
-    const second = renderKeys({ ...NONE, anthropic_in_keychain: true });
+    const second = renderKeys(NONE);
     await act(async () => {});
     expect(second.verify).not.toHaveBeenCalled();
+  });
+
+  it("checks once on open when a stored key has only a skipped result, even with a timestamp", async () => {
+    const skipped: ModelVerifyResult = {
+      ok: true,
+      checks: [
+        { id: "openai_compat_generate", ok: true, title: "Not checked", detail: "", model: null, seconds: 0 },
+      ],
+    };
+    const { verify } = renderKeys(
+      { ...NONE, openai_compat_in_keychain: true },
+      { result: skipped, checkedAt: Date.now() },
+    );
+    await waitFor(() => expect(verify).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(verify).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives Claude API, OpenAI and OpenRouter real checks like Gemini", () => {
+    const res: ModelVerifyResult = {
+      ok: true,
+      checks: ["anthropic_models", "openai_models", "openrouter_models"].map((id) => ({
+        id, ok: true, title: "Key works", detail: "", model: null, seconds: 1,
+      })),
+    };
+    renderKeys(
+      { ...NONE, anthropic_in_keychain: true, openai_in_keychain: true, openrouter_in_keychain: true },
+      { result: res, checkedAt: Date.now() - 120_000 },
+    );
+    for (const name of ["Claude API", "OpenAI", "OpenRouter"]) {
+      expect(within(rowOf(name)).getByText("Works, checked 2 min ago")).toBeTruthy();
+      expect(within(rowOf(name)).getByRole("button", { name: `Check the ${name} key now` })).toBeTruthy();
+    }
   });
 
   it("checks from Check now, and shows Checking… while it runs", () => {
@@ -213,8 +246,8 @@ describe("KeysCard", () => {
     await waitFor(() => expect(onKeySaved).toHaveBeenCalled());
     expect(calls).toContainEqual(["set_khipu_secret", { account: "openai_api_key", value: "sk-test-123" }]);
     expect(screen.queryByLabelText("Value for an OpenAI key")).toBeNull();
-    // OpenAI has no check, so nothing is verified after saving it.
-    expect(verify).not.toHaveBeenCalled();
+    // OpenAI has a real check now, so saving it runs the check.
+    await waitFor(() => expect(verify).toHaveBeenCalledTimes(1));
   });
 
   it("checks after saving a Gemini key, and Enter saves while Escape cancels", async () => {
@@ -252,7 +285,9 @@ describe("a check that could not run", () => {
     const row = rowOf("Gemini");
     expect(row.className).toMatch(/\berr\b/);
     expect(row.textContent).toContain("Gemini: the check could not run: spawn failed");
-    expect(rowOf("Claude API").className).not.toMatch(/\berr\b/);
+    expect(rowOf("Claude API").className).toMatch(/\berr\b/);
+    expect(rowOf("Claude API").textContent).toContain("Claude API: the check could not run: spawn failed");
+    expect(rowOf("OpenAI").className).not.toMatch(/\berr\b/);
   });
 
   it("is not stored as a check, so the open-time check still runs next time", async () => {
@@ -316,5 +351,54 @@ describe("Capture & models, composed", () => {
     expect(text.match(/never in a file/g)).toHaveLength(1);
     // One field per setting, no key field inside the provider rows.
     expect(container.querySelectorAll(".choices input[type=password]")).toHaveLength(0);
+  });
+});
+
+describe("replacing a key drops its old check", () => {
+  it("does not leave Key works on the provider row after a rejected re-check", async () => {
+    const store = new Map<string, string>();
+    store.set("khipu.modelVerify.v1", JSON.stringify({ result: okResult, at: Date.now() - 60_000 }));
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, v: string) => void store.set(key, v),
+      removeItem: (key: string) => void store.delete(key),
+    });
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      calls.push([cmd, args]);
+      if (cmd === "set_khipu_secret") return JSON.stringify({ ok: true });
+      if (cmd === "khipu_secrets_verify") throw new Error("spawn failed");
+      throw new Error(`unexpected command ${cmd}`);
+    });
+    const presence = { ...NONE, gemini_in_keychain: true };
+    function Page() {
+      const mv = useModelVerify();
+      return (
+        <>
+          <SynthProviderChoices
+            row={{ provider: "gemini", endpoint: "", model_id: "gemini-2.5-flash" }}
+            onChange={() => {}}
+            presence={presence}
+            verifyResult={mv.result}
+            runError={mv.runError}
+            doctorSynth={null}
+          />
+          <KeysCard active presence={presence} presenceError={null} verify={mv} onKeySaved={async () => {}} />
+        </>
+      );
+    }
+    const { container } = render(<Page />);
+    expect(screen.getByText("Key works")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Replace the Gemini key" }));
+    const input = screen.getByLabelText("New value for the Gemini key");
+    fireEvent.change(input, { target: { value: "AIza-new" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(rowOf("Gemini").textContent).toContain("the check could not run: Error: spawn failed"));
+    expect(screen.queryByText("Key works")).toBeNull();
+    expect(screen.getByText("Check could not run")).toBeTruthy();
+    const words = container.querySelector(".choice-key")?.textContent ?? "";
+    expect(words).not.toMatch(/works/);
+    expect(words).toMatch(/could not run/);
+    expect(store.get("khipu.modelVerify.v1") ?? "").not.toContain("gemini_generate");
+    vi.unstubAllGlobals();
   });
 });

@@ -215,10 +215,17 @@ class CheckModelKeysScopeTest(unittest.TestCase):
              mock.patch.object(mc, "_check_gemini_generate",
                                 return_value={"id": "gemini_generate", "ok": True}), \
              mock.patch.object(mc, "_check_openai_compat_generate",
-                                return_value={"id": "openai_compat_generate", "ok": True}):
+                                return_value={"id": "openai_compat_generate", "ok": True}), \
+             mock.patch.object(mc, "_check_anthropic_models",
+                                return_value={"id": "anthropic_models", "ok": True}), \
+             mock.patch.object(mc, "_check_openai_models",
+                                return_value={"id": "openai_models", "ok": True}), \
+             mock.patch.object(mc, "_check_openrouter_models",
+                                return_value={"id": "openrouter_models", "ok": True}):
             out = mc.check_model_keys(which="all")
         self.assertEqual([c["id"] for c in out["checks"]],
-                          ["gemini_embed", "gemini_generate", "openai_compat_generate"])
+                          ["gemini_embed", "gemini_generate", "openai_compat_generate",
+                           "anthropic_models", "openai_models", "openrouter_models"])
         self.assertTrue(out["ok"])
 
     def test_gemini_scope_skips_openai_check_entirely(self):
@@ -242,6 +249,10 @@ class CheckModelKeysScopeTest(unittest.TestCase):
         self.assertEqual([c["id"] for c in out["checks"]], ["openai_compat_generate"])
 
     def test_one_failure_makes_ok_false_even_if_others_skipped(self):
+        for name in ("_check_anthropic_models", "_check_openai_models", "_check_openrouter_models"):
+            patcher = mock.patch.object(mc, name, return_value={"id": name, "ok": True})
+            patcher.start()
+            self.addCleanup(patcher.stop)
         with mock.patch.object(mc, "_check_gemini_embed",
                                 return_value={"id": "gemini_embed", "ok": False}), \
              mock.patch.object(mc, "_check_gemini_generate",
@@ -252,6 +263,10 @@ class CheckModelKeysScopeTest(unittest.TestCase):
         self.assertFalse(out["ok"])
 
     def test_all_skipped_is_still_ok(self):
+        for name in ("_check_anthropic_models", "_check_openai_models", "_check_openrouter_models"):
+            patcher = mock.patch.object(mc, name, return_value={"id": name, "ok": True})
+            patcher.start()
+            self.addCleanup(patcher.stop)
         with mock.patch.object(mc, "_check_gemini_embed",
                                 return_value={"id": "gemini_embed", "ok": True, "detail": "no key stored"}), \
              mock.patch.object(mc, "_check_gemini_generate",
@@ -264,6 +279,86 @@ class CheckModelKeysScopeTest(unittest.TestCase):
     def test_unknown_which_raises(self):
         with self.assertRaises(ValueError):
             mc.check_model_keys(which="bogus")
+
+
+class KeyListingChecksTest(unittest.TestCase):
+    """anthropic_models / openai_models / openrouter_models: one free GET each."""
+
+    SECRET = "sk-test-SECRET-do-not-leak-123"
+    CASES = (
+        ("anthropic_models", "_check_anthropic_models", "resolve_anthropic_key",
+         "https://api.anthropic.com/v1/models", "x-api-key"),
+        ("openai_models", "_check_openai_models", "resolve_openai_key",
+         "https://api.openai.com/v1/models", "Authorization"),
+        ("openrouter_models", "_check_openrouter_models", "resolve_openrouter_key",
+         "https://openrouter.ai/api/v1/key", "Authorization"),
+    )
+
+    def _run(self, fn_name, resolver, *, get=None, no_key=False):
+        key_patch = (mock.patch.object(mc.keychain, resolver, side_effect=RuntimeError("no key"))
+                     if no_key else mock.patch.object(mc.keychain, resolver, return_value=self.SECRET))
+        with key_patch, mock.patch.object(mc, "_get_once", side_effect=get) as g:
+            return getattr(mc, fn_name)(timeout=3.0), g
+
+    def _assert_no_leak(self, result):
+        self.assertNotIn(self.SECRET, json.dumps(result))
+
+    def test_success_is_key_works_and_sends_the_key_only_as_a_header(self):
+        for cid, fn, res, url, header in self.CASES:
+            with self.subTest(cid):
+                result, g = self._run(fn, res, get=lambda u, h, t: (200, "{}"))
+                self.assertEqual(result["id"], cid)
+                self.assertTrue(result["ok"])
+                self.assertTrue(result["title"].startswith("Key works"))
+                u, h, t = g.call_args.args
+                self.assertTrue(u.startswith(url))
+                self.assertIn(self.SECRET, h[header])
+                self.assertNotIn(self.SECRET, u)
+                self.assertEqual(t, 3.0)
+                self._assert_no_leak(result)
+
+    def test_401_is_refused_in_plain_words(self):
+        for cid, fn, res, *_ in self.CASES:
+            with self.subTest(cid):
+                result, _g = self._run(fn, res, get=lambda u, h, t: (401, "{}"))
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["detail"], mc._UNAUTHORIZED_DETAIL)
+                self._assert_no_leak(result)
+
+    def test_403_is_refused_too(self):
+        result, _g = self._run("_check_openai_models", "resolve_openai_key",
+                               get=lambda u, h, t: (403, "{}"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["detail"], mc._UNAUTHORIZED_DETAIL)
+
+    def test_timeout_and_network_errors_use_network_wording(self):
+        for exc in (TimeoutError("slow"), urllib.error.URLError("down"), OSError("x")):
+            for cid, fn, res, *_ in self.CASES:
+                with self.subTest(cid=cid, exc=type(exc).__name__):
+                    result, _g = self._run(fn, res, get=mock.Mock(side_effect=exc))
+                    self.assertFalse(result["ok"])
+                    self.assertEqual(result["detail"], mc._NETWORK_DETAIL)
+                    self._assert_no_leak(result)
+
+    def test_no_key_is_skipped_without_a_request(self):
+        for cid, fn, res, *_ in self.CASES:
+            with self.subTest(cid):
+                result, g = self._run(fn, res, no_key=True)
+                g.assert_not_called()
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["title"], "Not checked")
+                self.assertEqual(result["detail"], "no key stored")
+
+    def test_which_scopes_select_one_check(self):
+        for which, cid in (("anthropic", "anthropic_models"),
+                           ("openai_key", "openai_models"),
+                           ("openrouter", "openrouter_models")):
+            with self.subTest(which):
+                with mock.patch.object(mc.keychain, "resolve_anthropic_key", side_effect=RuntimeError()), \
+                     mock.patch.object(mc.keychain, "resolve_openai_key", side_effect=RuntimeError()), \
+                     mock.patch.object(mc.keychain, "resolve_openrouter_key", side_effect=RuntimeError()):
+                    out = mc.check_model_keys(which=which)
+                self.assertEqual([c["id"] for c in out["checks"]], [cid])
 
 
 class CliSecretsVerifyTest(unittest.TestCase):

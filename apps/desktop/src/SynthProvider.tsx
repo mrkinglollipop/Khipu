@@ -10,7 +10,7 @@ import { useId, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Loader2 } from "lucide-react";
 import { Tag } from "./ui";
-import { callCli, useCliState } from "./settingsCli";
+import { callCli, useCliState, type ConfigShape } from "./settingsCli";
 import { SettingField } from "./SettingsControls";
 import { keyInfo, keyStatus, type KeyId } from "./KeysCard";
 import { fmtClock } from "./time";
@@ -287,6 +287,7 @@ function providerTag(
   presence: SynthSecretsPresence | null,
   verifyResult: ModelVerifyResult | null,
   doctorSynth: DoctorSynthProvider | null,
+  runError?: string | null,
 ): TagView {
   const notChecked: TagView = { tone: "neutral", dot: false, text: "Not checked" };
   if (info.route === "login") {
@@ -305,9 +306,10 @@ function providerTag(
   const st = keyStatus(presence, verifyResult, keyId);
   if (st.source === "unknown") return notChecked;
   if (st.source === "none") return { tone: "neutral", dot: false, text: "No key" };
+  if (runError) return { tone: "err", dot: true, text: "Check could not run" };
   if (st.check === "ok") return { tone: "ok", dot: true, text: "Key works" };
   if (st.check === "failed") return { tone: "err", dot: true, text: "Key check failed" };
-  return keyInfo(keyId).checks.length ? notChecked : { tone: "neutral", dot: false, text: "Key stored" };
+  return notChecked;
 }
 
 function KeyLine({
@@ -315,11 +317,13 @@ function KeyLine({
   presence,
   verifyResult,
   doctorSynth,
+  runError,
 }: {
   info: SynthProviderInfo;
   presence: SynthSecretsPresence | null;
   verifyResult: ModelVerifyResult | null;
   doctorSynth: DoctorSynthProvider | null;
+  runError?: string | null;
 }) {
   if (info.route === "login") {
     const checked = doctorSynth != null && canonicalSynthProvider(doctorSynth.provider ?? "") === info.id;
@@ -345,18 +349,18 @@ function KeyLine({
   const keyId = PROVIDER_KEY[info.id];
   const k = keyInfo(keyId);
   const st = keyStatus(presence, verifyResult, keyId);
-  const checkable = k.checks.length > 0;
   let phrase: string;
   if (st.source === "unknown") phrase = "not read yet";
   else if (st.source === "none") phrase = "not stored";
+  else if (runError) phrase = `the check could not run (${runError})`;
   else if (st.check === "ok") phrase = "works";
   else if (st.check === "failed") phrase = "the check failed";
   else if (st.source === "env") phrase = "set in the environment";
-  else phrase = checkable ? "stored, not checked yet" : "stored";
+  else phrase = "stored, not checked yet";
   const link =
     st.source === "none"
       ? "Add it in Keys below"
-      : st.check === "failed" || (checkable && st.check == null && st.source !== "unknown")
+      : st.check === "failed" || runError || (st.check == null && st.source !== "unknown")
         ? "Check it in Keys below"
         : "Show it in Keys below";
   return (
@@ -379,6 +383,7 @@ function ChoiceBody({
   presence,
   verifyResult,
   doctorSynth,
+  runError,
 }: {
   info: SynthProviderInfo | undefined;
   providerId: string;
@@ -387,6 +392,7 @@ function ChoiceBody({
   presence: SynthSecretsPresence | null;
   verifyResult: ModelVerifyResult | null;
   doctorSynth: DoctorSynthProvider | null;
+  runError?: string | null;
 }) {
   const endpointId = useId();
   const modelId = useId();
@@ -449,7 +455,13 @@ function ChoiceBody({
         </p>
       ) : null}
       {info ? (
-        <KeyLine info={info} presence={presence} verifyResult={verifyResult} doctorSynth={doctorSynth} />
+        <KeyLine
+          info={info}
+          presence={presence}
+          verifyResult={verifyResult}
+          doctorSynth={doctorSynth}
+          runError={runError}
+        />
       ) : null}
     </div>
   );
@@ -464,12 +476,15 @@ export function SynthProviderChoices({
   presence,
   verifyResult,
   doctorSynth,
+  runError,
 }: {
   row: SynthRow;
   onChange: (patch: Partial<SynthRow>) => void;
   presence: SynthSecretsPresence | null;
   verifyResult: ModelVerifyResult | null;
   doctorSynth: DoctorSynthProvider | null;
+  /** A verify run that could not execute; shown on every stored key route. */
+  runError?: string | null;
 }) {
   const provider = canonicalSynthProvider(row.provider);
   const known = synthProviderInfo(provider);
@@ -483,6 +498,7 @@ export function SynthProviderChoices({
       presence={presence}
       verifyResult={verifyResult}
       doctorSynth={doctorSynth}
+      runError={runError}
     />
   );
   return (
@@ -505,7 +521,7 @@ export function SynthProviderChoices({
       )}
       {SYNTH_PROVIDERS.map((p) => {
         const on = p.id === provider;
-        const tag = providerTag(p, presence, verifyResult, doctorSynth);
+        const tag = providerTag(p, presence, verifyResult, doctorSynth, runError);
         return (
           <div key={p.id} className={on ? "choice on" : "choice"}>
             <label className="choice-head">
@@ -555,7 +571,15 @@ export function SynthFallbackField({
   verifyResult?: ModelVerifyResult | null;
   onSaved?: () => Promise<void> | void;
 }) {
-  const stored = synthFallbackSetting(doctorSynth);
+  const cfg = useCliState<ConfigShape>("khipu_config_show", true);
+  const configured = cfg.data?.config?.synth_fallback;
+  // The stored word, read through config; doctor's copy only when that read fails.
+  const stored: SynthFallback =
+    cfg.data != null
+      ? String(configured ?? "").trim().toLowerCase() === "none"
+        ? "none"
+        : "gemini"
+      : synthFallbackSetting(doctorSynth);
   const [pending, setPending] = useState<SynthFallback | null>(null);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -569,6 +593,8 @@ export function SynthFallbackField({
     setErr(null);
     const res = await callCli("khipu_config_set", { key: "synth_fallback", value: next });
     if (res.ok) {
+      const fresh = await cfg.reload();
+      if (fresh) setPending(null);
       await onSaved?.();
     } else {
       setErr(res.error);
@@ -581,7 +607,7 @@ export function SynthFallbackField({
     !isGemini && value === "gemini" && doctorSynth?.fallback != null && doctorSynth.fallback.gemini_key === false;
   const refused = keyStatus(presence, verifyResult, "gemini").check === "failed";
   const off = isGemini || saving;
-  const reading = pending == null && doctorSynth?.fallback == null;
+  const reading = pending == null && cfg.data == null && cfg.error == null && doctorSynth?.fallback == null;
   if (reading) {
     return (
       <fieldset className="set-field">
@@ -617,6 +643,9 @@ export function SynthFallbackField({
           Wait and retry later on the same provider
         </label>
       </div>
+      {cfg.data == null && cfg.error != null ? (
+        <p className="set-help">Can't read the stored choice ({cfg.error}). Choosing one still saves it.</p>
+      ) : null}
       {isGemini ? (
         <p className="set-help">Gemini is the provider; there is nothing to fall back to.</p>
       ) : value === "gemini" ? (

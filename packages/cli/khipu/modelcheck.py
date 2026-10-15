@@ -37,8 +37,11 @@ from khipu import embed as embed_mod
 from khipu import keychain
 from khipu import models as models_mod
 
-CHECK_IDS = ("gemini_embed", "gemini_generate", "openai_compat_generate")
-WHICH_VALUES = ("all", "gemini", "openai")
+CHECK_IDS = (
+    "gemini_embed", "gemini_generate", "openai_compat_generate",
+    "anthropic_models", "openai_models", "openrouter_models",
+)
+WHICH_VALUES = ("all", "gemini", "openai", "anthropic", "openai_key", "openrouter")
 
 EMBED_PROBE_TEXT = "prove the key"  # exactly three words
 GENERATE_PROBE_PROMPT = "Reply with the single word ok"
@@ -307,12 +310,72 @@ def _check_openai_compat_generate(*, timeout: float) -> dict[str, Any]:
     return _fail_http("openai_compat_generate", code=code, model=model, start=start)
 
 
+def _get_once(url: str, headers: dict[str, str], timeout: float) -> tuple[int, str]:
+    """One GET, no retries. Same contract as ``_post_once``."""
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+
+
+def _check_key_listing(
+    check_id: str, *, resolve: Any, url: str, headers: dict[str, str], label: str,
+    timeout: float,
+) -> dict[str, Any]:
+    """Free, no-generation key proof: one GET that the provider only answers
+    200 to for a valid key. The key lives in a local variable only."""
+    try:
+        key = resolve()
+    except RuntimeError:
+        return _skip(check_id, label)
+    start = time.monotonic()
+    try:
+        code, _text = _get_once(
+            url, {k: v.replace("{key}", key) for k, v in headers.items()}, timeout,
+        )
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return _fail_network(check_id, model=label, start=start)
+    if code == 200:
+        return _pass(check_id, model=label, start=start)
+    return _fail_http(check_id, code=code, model=label, start=start)
+
+
+def _check_anthropic_models(*, timeout: float) -> dict[str, Any]:
+    return _check_key_listing(
+        "anthropic_models", resolve=keychain.resolve_anthropic_key,
+        url="https://api.anthropic.com/v1/models?limit=1",
+        headers={"x-api-key": "{key}", "anthropic-version": "2023-06-01"},
+        label="Claude API", timeout=timeout,
+    )
+
+
+def _check_openai_models(*, timeout: float) -> dict[str, Any]:
+    return _check_key_listing(
+        "openai_models", resolve=keychain.resolve_openai_key,
+        url="https://api.openai.com/v1/models",
+        headers={"Authorization": "Bearer {key}"},
+        label="OpenAI", timeout=timeout,
+    )
+
+
+def _check_openrouter_models(*, timeout: float) -> dict[str, Any]:
+    return _check_key_listing(
+        "openrouter_models", resolve=keychain.resolve_openrouter_key,
+        url="https://openrouter.ai/api/v1/key",
+        headers={"Authorization": "Bearer {key}"},
+        label="OpenRouter", timeout=timeout,
+    )
+
+
 def check_model_keys(*, which: str = "all", timeout: float = 20.0) -> dict[str, Any]:
     """Prove every configured model key with one real, cheap call each.
 
     ``which``: "all" (default) — every configured provider; "gemini" — the
     Gemini embed + generate checks only; "openai" — the OpenAI-compatible
-    local synth check only.
+    local synth check only; "anthropic", "openai_key", "openrouter" — that
+    provider's free key check only.
 
     Returns ``{"ok": bool, "checks": [...]}`` — ``ok`` is True iff no attempted
     check failed (a provider with nothing configured is skipped, not failed,
@@ -327,5 +390,11 @@ def check_model_keys(*, which: str = "all", timeout: float = 20.0) -> dict[str, 
         checks.append(_check_gemini_generate(timeout=timeout))
     if which in ("all", "openai"):
         checks.append(_check_openai_compat_generate(timeout=timeout))
+    if which in ("all", "anthropic"):
+        checks.append(_check_anthropic_models(timeout=timeout))
+    if which in ("all", "openai_key"):
+        checks.append(_check_openai_models(timeout=timeout))
+    if which in ("all", "openrouter"):
+        checks.append(_check_openrouter_models(timeout=timeout))
     ok = all(c["ok"] for c in checks)
     return {"ok": ok, "checks": checks}

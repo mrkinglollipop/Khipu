@@ -5260,6 +5260,7 @@ export default function App() {
                           onChange={(patch) => updateModelRole("synth", patch)}
                           presence={secretsPresence}
                           verifyResult={modelCheck.result}
+                          runError={modelCheck.runError}
                           doctorSynth={
                             (doctorParsed?.synth_provider as DoctorSynthProvider | undefined) ?? null
                           }

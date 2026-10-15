@@ -87,7 +87,25 @@ export function useModelVerify() {
     }
   }, []);
 
-  return { result, checkedAt, verifying, verify, runError };
+  /** A key was replaced: its earlier results no longer describe it. Drop them
+   *  from state and from the copy kept on this Mac. */
+  const forget = useCallback((ids: readonly string[]) => {
+    setResult((prev) => {
+      if (!prev) return prev;
+      const next = { ...prev, checks: prev.checks.filter((c) => !ids.includes(c.id)) };
+      next.ok = next.checks.every((c) => c.ok);
+      try {
+        const raw = localStorage.getItem(VERIFY_STORE);
+        const at = raw ? (JSON.parse(raw) as { at?: number }).at : undefined;
+        localStorage.setItem(VERIFY_STORE, JSON.stringify({ result: next, at: typeof at === "number" ? at : Date.now() }));
+      } catch {
+        // Storage can be unavailable; the state above is still right.
+      }
+      return next;
+    });
+  }, []);
+
+  return { result, checkedAt, verifying, verify, runError, forget };
 }
 
 /** "Not checked" (`modelcheck._skip`) means no key is configured for this
