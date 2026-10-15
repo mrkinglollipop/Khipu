@@ -229,9 +229,20 @@ describe("Settings -> Routing: the words and choices", () => {
       { version: 1, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: { text: "Added", pending: true, pending_kind: "added", pending_by: "a Codex conversation" }, was: null }] },
       { version: 2, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: { text: "Added", pending: false }, was: { text: "Added", pending: true } }] },
       { version: 3, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: { text: "Original", pending: false }, was: { text: "Changed", pending: true, prior_text: "Original" } }] },
-      { version: 4, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: null, was: { text: "Temporary", pending: true } }] },
+      { version: 4, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: null, was: { text: "Temporary", pending: true, pending_kind: "added" } }] },
     ] } as RouteView, MORNING).flatMap((day) => day.rows);
     expect(rows.map((r) => r.text)).toEqual(["dismissed", "undone", "confirmed", "added by a Codex conversation at the owner's request; the owner has not confirmed it yet"]);
+  });
+
+  it("words the owner's own edit or removal of a pending change as that, and shows a pending change's new words", () => {
+    const at = "2026-10-14T15:40:00Z";
+    const rows = changeDays({ changes: [
+      { version: 1, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: { text: "New", pending: true, pending_kind: "changed", pending_by: "a Codex conversation", prior_text: "Old" }, was: { text: "Old" } }] },
+      { version: 2, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: { text: "Owner's own", pending: false }, was: { text: "New", pending: true, pending_kind: "changed", prior_text: "Old" } }] },
+      { version: 3, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: null, was: { text: "Again", pending: true, pending_kind: "changed", prior_text: "Owner's own" } }] },
+    ] } as RouteView, MORNING).flatMap((day) => day.rows);
+    expect(rows.map((r) => r.text)).toEqual(["removed", "changed", "changed by a Codex conversation at the owner's request; the owner has not confirmed it yet"]);
+    expect(rows[2].aside).toBe("“New”; it replaced “Old”");
   });
 });
 

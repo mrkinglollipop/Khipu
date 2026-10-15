@@ -115,7 +115,7 @@ def test_pending_rule_mark_and_prior_words_repeat_with_an_unrelated_next_push(ho
     pushed = routing.prompt_push(marker, budget=1.0)
     assert pushed["kind"] == "changes"
     assert "changed by a Claude Code conversation at the owner's request" in pushed["text"]
-    assert "it replaced: 'Original rule wording.'" in pushed["text"]
+    assert "it replaced: “Original rule wording.”" in pushed["text"]
     assert pushed["version"] > before["version"]
 
 
