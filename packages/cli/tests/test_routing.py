@@ -801,6 +801,25 @@ def test_recent_changes_name_the_report_that_made_each_change(home, capsys):
     assert opus_disputed["by"].startswith("a Claude Code conversation in project-a"), opus_disputed
 
 
+def test_a_report_that_settles_a_model_disagreement_is_named_for_it(home, capsys):
+    # Codex re-check of finding 4: a newer report that ended a model's
+    # disagreement without changing its limit was credited to the
+    # unrelated report that opened the account.
+    _report(account="Claude", state="open")
+    home["clock"].advance(minutes=5)
+    msg = "Opus weekly limit reached, resets at 2026-10-16T09:00:00Z"
+    _report(account="Claude", state="limited", model="Opus", window="weekly", author=OTHER, message=msg)
+    home["clock"].advance(minutes=5)
+    _report(account="Claude", model="Opus", state="open")
+    home["clock"].advance(minutes=5)
+    _report(account="Claude", state="limited", model="Opus", window="weekly", author=OTHER, message=msg)
+    rc, out = _cli(["route", "--json"], capsys)
+    items = [i for c in json.loads(out)["changes"] for i in c["items"] if i["entity"] == "account:claude|"]
+    settled = items[-1]
+    assert len(settled["now"]["models"][0]) < 4 or settled["now"]["models"][0][3] is None, settled
+    assert settled["by"].startswith("a Codex conversation in project-b"), settled
+
+
 def test_a_quiet_read_is_not_called_unrefreshed(home):
     _report(account="Codex", state="open")
     home["clock"].advance(minutes=10)

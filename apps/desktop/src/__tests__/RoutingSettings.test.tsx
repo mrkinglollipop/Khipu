@@ -1095,4 +1095,21 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
     expect(screen.getByRole("switch", { name: "Tell conversations about routing" })).toBeEnabled();
     expect(screen.queryByText(/Couldn't read this setting/)).toBeNull();
   });
+
+  it("says the master switch couldn't be read when the read after a change fails, not the old value (Codex re-check)", async () => {
+    let reads = 0;
+    answers.khipu_features_show = () => {
+      reads += 1;
+      if (reads > 1) throw new Error("khipu features: timed out");
+      return { features: { routing_push: { enabled: true, source: "file" } } };
+    };
+    answers.khipu_feature_set = () => ({ ok: true });
+    await page();
+    const sw = await screen.findByRole("switch", { name: "Tell conversations about routing" });
+    await waitFor(() => expect(sw).toBeChecked());
+    fireEvent.click(sw);
+    const alert = await screen.findByText(/Couldn't read this setting/);
+    expect(alert).toHaveTextContent("khipu features: timed out");
+    expect(screen.getByRole("switch", { name: "Tell conversations about routing" })).toBeDisabled();
+  });
 });

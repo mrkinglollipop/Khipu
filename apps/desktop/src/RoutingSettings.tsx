@@ -1433,8 +1433,10 @@ function TellingSection({
   const master = features?.features?.routing_push;
   // The switch's state could not be read (the read failed, or it has no
   // answer for this switch): say so and offer to read it again, never a
-  // silent off (Codex review, finding 7).
-  const unread = !master && (featuresError != null || features != null);
+  // silent off (Codex review, finding 7). A failed read after a write also
+  // counts: the switch may show a value that is no longer true, so it is
+  // marked unread and held until a read succeeds.
+  const unread = featuresError != null || (!master && features != null);
   const [retrying, setRetrying] = useState(false);
   const locked = master?.source === "env";
   const moment = (key: string) => cfg?.routing?.[key]?.value === true;
@@ -1454,7 +1456,7 @@ function TellingSection({
           what="Turns all of the telling on or off. The same switch is in Optional features."
           tag={locked ? <Tag>Locked</Tag> : <Tag>Also in Optional features</Tag>}
           checked={master?.enabled === true}
-          disabled={!master || locked || w.anyBusy}
+          disabled={!master || unread || locked || w.anyBusy}
           busy={w.isBusy("push")}
           onChange={(next) => void w.run("push", "khipu_feature_set", { name: "routing_push", enabled: next }, rereadFeatures)}
           error={

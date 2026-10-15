@@ -2169,7 +2169,11 @@ def _account_change_cause(entry: dict, now_eff: dict | None, was_eff: dict | Non
         if was_m is None or now_m[:3] != was_m[:3]:
             behind.append(model)
         if (was_m[3] if was_m is not None and len(was_m) > 3 else None) != (now_m[3] if len(now_m) > 3 else None):
-            behind.append(model.get("disagreement"))
+            # A side that disagrees now is behind the change; a disagreement
+            # that ended leaves the model's own report, as an account's
+            # ended disagreement leaves the report the account shows
+            # (Codex re-check: the newer report that settled it).
+            behind.append(model.get("disagreement") or model)
     found = [b for b in behind if isinstance(b, dict) and _parse(b.get("at")) is not None]
     return max(found, key=lambda b: _parse(b["at"]), default=shown)
 
