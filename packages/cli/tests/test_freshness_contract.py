@@ -110,6 +110,8 @@ class TopicsCatchupContractTest(unittest.TestCase):
                 elif "FROM topics t WHERE t.deleted_at IS NULL" in s:
                     self._result = [("note:fresh", "Fresh", "body text",
                                      {"slug": "note:fresh", "title": "Fresh", "body": "body text"})]
+                elif s.startswith("SELECT 1 FROM topics") and "FOR SHARE" in s:
+                    self._result = [(1,)]  # the topic is still live
                 elif s.startswith("INSERT INTO memory_embeddings"):
                     self.inserts.append(params)
                     self._result = [(datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc),)]  # RETURNING built_at

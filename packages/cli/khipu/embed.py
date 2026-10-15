@@ -3507,6 +3507,15 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 vecs = embed_batch(api, profile=profile) if api else []
                 rows = [("topic", slug, i, c, _md5(c), v)
                         for (i, c), v in zip(indexed_chunks, vecs)]
+                # The topic may have been tombstoned or purged while the
+                # embedding call ran. Held shared until the commit below, so a
+                # purge (which locks the row first) waits or has already won.
+                cur.execute("SELECT 1 FROM topics WHERE slug = %s AND deleted_at IS NULL FOR SHARE",
+                            (slug,))
+                if cur.fetchone() is None:
+                    conn.commit()
+                    out["topics_embedded"] -= 1
+                    continue
                 built = _upsert_chunks(cur, profile, rows)
                 cur.execute(
                     "DELETE FROM memory_embeddings WHERE profile = %s AND kind = 'topic' "

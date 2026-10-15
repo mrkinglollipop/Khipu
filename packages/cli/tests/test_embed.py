@@ -547,6 +547,8 @@ class _CatchupCursor:
         elif "FROM topics t WHERE t.deleted_at IS NULL" in s:
             self._result = [(slug, title, body, {"slug": slug, "title": title, "body": body})
                             for slug, title, body in self.topic_rows]
+        elif s.startswith("SELECT 1 FROM topics") and "FOR SHARE" in s:
+            self._result = [(1,)]  # every listed topic is still live
         elif s.startswith("INSERT INTO memory_embeddings"):
             self.inserts.append(params)
             self._result = [(_HUB_BUILT,)]  # RETURNING built_at

@@ -776,7 +776,9 @@ class CatchupStalenessTest(unittest.TestCase):
                 self.topic_sql = []
             def execute(self, sql, params=None):
                 text = " ".join(sql.split())
-                if text.startswith("SELECT kind, ref, chunk_idx"):
+                if text.startswith("SELECT 1 FROM topics") and "FOR SHARE" in text:
+                    self.result = [(1,)]  # the topic is still live
+                elif text.startswith("SELECT kind, ref, chunk_idx"):
                     self.result = [("topic", "stale", 0, "old")]
                 elif "FROM episodes e" in text or "FROM commitments c" in text:
                     self.result = []
@@ -786,6 +788,7 @@ class CatchupStalenessTest(unittest.TestCase):
                 else:
                     self.result = []
             def fetchall(self): return list(self.result)
+            def fetchone(self): return self.result[0] if self.result else None
             def __enter__(self): return self
             def __exit__(self, *_): return False
         cur = Cur()
@@ -943,7 +946,10 @@ class ReplicaCatchupTest(unittest.TestCase):
                         self.rows = [row]
                     if existing and "FROM episodes e" in sql and "NOT EXISTS" not in sql:
                         self.rows = [(7, "A", [], [], [], [])]
+                    if sql.startswith("SELECT 1 FROM topics") and "FOR SHARE" in sql:
+                        self.rows = [(1,)]  # the topic is still live
                 def fetchall(self): return self.rows
+                def fetchone(self): return self.rows[0] if self.rows else None
                 def __enter__(self): return self
                 def __exit__(self, *_): return False
             def hashes(_cur, _profile, kind, refs):

@@ -22,6 +22,7 @@ hub answers. It skips when a snapshot already exists and is younger than
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -382,6 +383,75 @@ def _queue_erasure(episode_id: int, path: Path | None = None) -> bool:
         return True
     except OSError:
         return False
+
+
+def _purged_topics_dir(path: Path | None = None) -> Path:
+    path = path or snapshot_path()
+    return path.parent / ".hub_snapshot.purged-topics"
+
+
+def _purged_topic_marker(path: Path, slug: str) -> Path:
+    # A slug may hold "/" or ":", so the file is named by its hash and holds it.
+    return _purged_topics_dir(path) / hashlib.sha256(slug.encode("utf-8")).hexdigest()
+
+
+def _mark_purged_topic(slug: str, path: Path | None = None) -> bool:
+    """Record a purged topic beside the replica before the replica is
+    touched, so an embedding catch-up whose replica write lands after the
+    purge can never put the topic back, even when the purge could not take
+    the lock."""
+    path = path or snapshot_path()
+    marker = _purged_topic_marker(path, slug)
+    try:
+        marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, slug.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        dfd = os.open(marker.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        return True
+    except OSError:
+        return False
+
+
+def _purged_topic_slugs(path: Path | None = None) -> set[str]:
+    try:
+        markers = list(_purged_topics_dir(path).iterdir())
+    except FileNotFoundError:
+        return set()
+    out = set()
+    for marker in markers:
+        try:
+            out.add(marker.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError):
+            continue
+    return out
+
+
+def _purge_marker_time(path: Path, slug: str) -> float:
+    return _purged_topic_marker(path, slug).stat().st_mtime
+
+
+def _clear_purged_topics(path: Path | None = None, *, dumped_after: float) -> None:
+    """Drop the markers a full dump already reflects: the hub delete commits
+    before its marker is written, so a dump that began at or after a marker
+    cannot hold that topic unless it was legitimately created again."""
+    try:
+        markers = list(_purged_topics_dir(path).iterdir())
+    except FileNotFoundError:
+        return
+    for marker in markers:
+        try:
+            if marker.stat().st_mtime <= dumped_after:
+                marker.unlink()
+        except OSError:
+            continue
 
 
 def _apply_pending_erasures(con: sqlite3.Connection, path: Path) -> None:
@@ -1343,6 +1413,8 @@ def refresh() -> dict[str, Any]:
         ensure_data_dir()
         dest = snapshot_path()
         started_at = _utcnow_iso()
+        # Markers older than this are reflected in the dump that follows.
+        dump_started = time.time()
         tmp_dir = dest.parent
         fd, tmp_name = tempfile.mkstemp(
             prefix=".hub_snapshot.", suffix=".sqlite", dir=tmp_dir
@@ -1383,6 +1455,7 @@ def refresh() -> dict[str, Any]:
             con.commit()
             con.close()
             os.replace(tmp_path, dest)
+            _clear_purged_topics(dest, dumped_after=dump_started)
             size_bytes = dest.stat().st_size
             new_meta: dict[str, Any] = {"schema_version": SNAPSHOT_SCHEMA_VERSION, "refreshed_at": refreshed_at, "size_bytes": size_bytes, "counts": counts}
             if hub_dumped_at:
@@ -1647,7 +1720,12 @@ def upsert_embeddings(
         con = sqlite3.connect(str(path))
         try:
             topic_cols = _snapshot_table_columns(con, "topics")
+            # A catch-up that read a topic before it was purged must not put
+            # it back: its hub write may have committed before the purge.
+            purged = _purged_topic_slugs(path)
             for row in topic_rows:
+                if row["slug"] in purged:
+                    continue
                 old = con.execute("SELECT deleted_at FROM topics WHERE slug = ?", (row["slug"],)).fetchone()
                 if old and old[0] is not None:
                     continue
@@ -1664,6 +1742,8 @@ def upsert_embeddings(
                             (profile, kind, ref))
             for erow in embedding_rows:
                 if erow.get("kind") == "episode" and str(erow.get("ref")) in {str(i) for i in _pending_erasure_ids(path)}:
+                    continue
+                if erow.get("kind") == "topic" and str(erow.get("ref")) in purged:
                     continue
                 ecols = [c for c in _EMBED_COLS if c in erow]
                 evals = []
@@ -1761,6 +1841,9 @@ def purge_topic_in_snapshot(slug: str) -> dict[str, Any]:
     path = snapshot_path()
     if not path.is_file():
         return {"ok": True, "applicable": False, "reason": "this Mac has no local replica"}
+    if not _mark_purged_topic(slug, path):
+        return {"ok": False, "applicable": True,
+                "reason": "could not record the purge beside the replica"}
     lock = _acquire_refresh_lock()
     if lock is None:
         return {"ok": False, "applicable": True, "reason": "a replica refresh is in progress"}

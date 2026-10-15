@@ -2359,7 +2359,9 @@ def cmd_topic(args: argparse.Namespace) -> int:
     slug = args.slug
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT deleted_at FROM topics WHERE slug = %s", (slug,))
+            # Locked first: an embedding catch-up holds this row shared while it
+            # writes vectors, so neither can leave vectors for a purged topic.
+            cur.execute("SELECT deleted_at FROM topics WHERE slug = %s FOR UPDATE", (slug,))
             row = cur.fetchone()
             if row is None:
                 print(json.dumps({"ok": False, "error": f"no such topic: {slug}"}))
