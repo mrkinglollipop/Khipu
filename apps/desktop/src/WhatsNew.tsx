@@ -1,9 +1,12 @@
 import { useId, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import {
+  BUILD_CAPABILITIES,
   CARD_MAX_ITEMS,
+  cardView,
   itemAction,
   noticesBetween,
+  type Capability,
   type CardState,
   type NoticeItem,
   type NoticeTarget,
@@ -33,25 +36,29 @@ export function revealSettingsGroup(group: string, frames = 12): void {
 }
 
 type ShowProps = {
+  /** What this build has; defaults to BUILD_CAPABILITIES. */
+  caps?: ReadonlySet<Capability>;
   needsRoutingSetup: boolean;
   onShow: (target: NoticeTarget) => void;
 };
 
-function ItemRow({ item, needsRoutingSetup, onShow }: ShowProps & { item: NoticeItem }) {
-  const action = itemAction(item, needsRoutingSetup);
+function ItemRow({ item, needsRoutingSetup, caps, onShow }: ShowProps & { item: NoticeItem }) {
+  const action = itemAction(item, needsRoutingSetup, caps);
   return (
     <li className="wn-row">
       <span className="wn-t">
         <b>{item.title}</b> <span className="t2">{item.short ?? item.text}</span>
       </span>
-      <button
-        type="button"
-        className="sm"
-        aria-label={`${action.label}: ${item.title}`}
-        onClick={() => onShow(action.target)}
-      >
-        {action.label}
-      </button>
+      {action ? (
+        <button
+          type="button"
+          className="sm"
+          aria-label={`${action.label}: ${item.title}`}
+          onClick={() => onShow(action.target)}
+        >
+          {action.label}
+        </button>
+      ) : null}
     </li>
   );
 }
@@ -60,21 +67,24 @@ function ItemRow({ item, needsRoutingSetup, onShow }: ShowProps & { item: Notice
  * stays until Close is pressed here; the dialog is a separate thing. */
 export function WhatsNewCard({
   card,
+  appVersion,
+  caps = BUILD_CAPABILITIES,
   needsRoutingSetup,
   onShow,
   onClose,
   onSeeAll,
-}: ShowProps & { card: CardState; onClose: () => void; onSeeAll: () => void }) {
+}: ShowProps & { card: CardState; appVersion: string; onClose: () => void; onSeeAll: () => void }) {
   const headingId = useId();
-  const items = noticesBetween(card.since, card.version).flatMap((n) => n.items);
-  if (items.length === 0) return null;
+  const view = cardView(card, appVersion, caps);
+  if (!view) return null;
+  const items = view.items;
   const shown = items.slice(0, CARD_MAX_ITEMS);
   const more = items.length - shown.length;
   return (
     <div className="card wn-card" role="region" aria-labelledby={headingId}>
       <div className="card-head">
         <h2 id={headingId} className="wn-card-h">
-          New in {card.version}
+          New in {view.version}
         </h2>
         <span className="spacer" />
         <button type="button" className="sm" aria-label="Close the What's new card" onClick={onClose}>
@@ -83,7 +93,7 @@ export function WhatsNewCard({
       </div>
       <ul className="wn-rows" role="list">
         {shown.map((item) => (
-          <ItemRow key={`${item.title}-${item.text}`} item={item} needsRoutingSetup={needsRoutingSetup} onShow={onShow} />
+          <ItemRow key={`${item.title}-${item.text}`} item={item} needsRoutingSetup={needsRoutingSetup} caps={caps} onShow={onShow} />
         ))}
       </ul>
       {more > 0 ? (
@@ -105,10 +115,15 @@ const OPEN_VERSIONS = 3;
 
 /** Settings -> Updates: every notice up to the installed version, newest
  * first. The newest three versions are open; older ones sit in a fold. */
-export function WhatsNewHistory({ appVersion, needsRoutingSetup, onShow }: ShowProps & { appVersion: string }) {
+export function WhatsNewHistory({
+  appVersion,
+  needsRoutingSetup,
+  caps = BUILD_CAPABILITIES,
+  onShow,
+}: ShowProps & { appVersion: string }) {
   const [open, setOpen] = useState(false);
   const foldId = useId();
-  const versions = /^\d/.test(appVersion) ? noticesBetween("", appVersion) : [];
+  const versions = /^\d/.test(appVersion) ? noticesBetween("", appVersion, caps) : [];
   if (versions.length === 0) return null;
   const head = versions.slice(0, OPEN_VERSIONS);
   const rest = versions.slice(OPEN_VERSIONS);
@@ -125,7 +140,7 @@ export function WhatsNewHistory({ appVersion, needsRoutingSetup, onShow }: ShowP
       </h2>
       <ul className="wn-rows" role="list">
         {n.items.map((item) => (
-          <ItemRow key={`${item.title}-${item.text}`} item={item} needsRoutingSetup={needsRoutingSetup} onShow={onShow} />
+          <ItemRow key={`${item.title}-${item.text}`} item={item} needsRoutingSetup={needsRoutingSetup} caps={caps} onShow={onShow} />
         ))}
       </ul>
     </div>

@@ -30,7 +30,51 @@ export type NoticeTarget =
     }
   | { kind: "setup"; step: string };
 
+/** A feature or place that only some builds have. An item whose `requires`
+ * is missing from the build is left out everywhere; an item whose target is
+ * missing shows no button. Add a capability to BUILD_CAPABILITIES in the
+ * change that ships it.
+ * - routing-overview: Settings "Accounts and routing", its folding groups and
+ *   their `data-settings-group` anchors (settings clarity phase 3).
+ * - plans-per-account: Plans as one block per account, pause shown (phase 2).
+ * - rule-results: "Checked by Khipu" with the check's result (phase 5).
+ * - capture-models-cards: Capture & models as three cards (phase 6).
+ * - setup-accounts-step: setup's "Your accounts" step (phase 7). */
+export type Capability =
+  | "routing-overview"
+  | "plans-per-account"
+  | "rule-results"
+  | "capture-models-cards"
+  | "setup-accounts-step";
+
+export const ALL_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>([
+  "routing-overview",
+  "plans-per-account",
+  "rule-results",
+  "capture-models-cards",
+  "setup-accounts-step",
+]);
+
+/** What this build has. */
+export const BUILD_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>([]);
+
+/** Setup steps every build has; any other step needs a capability. */
+const BASE_SETUP_STEPS = ["welcome", "database", "model", "graph", "agents", "finish"];
+const SETUP_STEP_CAPABILITY: Record<string, Capability> = { accounts: "setup-accounts-step" };
+
+export function targetAvailable(target: NoticeTarget, caps: ReadonlySet<Capability>): boolean {
+  if (target.kind === "settings") return !target.group || caps.has("routing-overview");
+  if (target.kind === "setup") {
+    if (BASE_SETUP_STEPS.includes(target.step)) return true;
+    const cap = SETUP_STEP_CAPABILITY[target.step];
+    return cap != null && caps.has(cap);
+  }
+  return true;
+}
+
 export type NoticeItem = {
+  /** The feature this item describes; left out of builds without it. */
+  requires?: Capability;
   title: string;
   /** One line in the dialog. */
   text: string;
@@ -134,6 +178,7 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
     version: "0.4.16",
     items: [
       {
+        requires: "routing-overview",
         title: "Accounts and routing",
         text: "Khipu tells your conversations which accounts have room.",
         target: { kind: "settings", section: "routing", group: "accounts" },
@@ -146,24 +191,28 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
         target: { kind: "settings", section: "routing", group: "priority" },
       },
       {
+        requires: "plans-per-account",
         title: "Plans",
         text: "Plans now names each account and says when you paused one.",
         short: "Plans names each account and says when you paused one.",
         target: { kind: "home" },
       },
       {
+        requires: "capture-models-cards",
         title: "Capture & models",
         text: "Capture & models is shorter: summaries, keys and commitments each have one place.",
         short: "Shorter, with keys and commitments in one place each.",
         target: { kind: "settings", section: "capture" },
       },
       {
+        requires: "rule-results",
         title: "Standing rules",
         text: "Each standing rule says whether it is checked by Khipu and what the check found.",
         short: "Each says whether it is checked by Khipu and what the check found.",
         target: { kind: "settings", section: "routing", group: "rules" },
       },
       {
+        requires: "setup-accounts-step",
         title: "Setup",
         text: "Setup has a new Your accounts step.",
         short: "A new Your accounts step.",
@@ -176,6 +225,7 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
         target: { kind: "settings", section: "updates" },
       },
       {
+        requires: "plans-per-account",
         title: "Home",
         text: "Plan rows on Home say why a figure is missing.",
         short: "Plan rows say why a figure is missing.",
@@ -261,9 +311,11 @@ export function versionGreaterThan(a: string, b: string): boolean {
 export function noticesBetween(
   since: string,
   upTo: string,
+  caps: ReadonlySet<Capability> = BUILD_CAPABILITIES,
   notices: VersionNotice[] = POST_UPDATE_NOTICES,
 ): VersionNotice[] {
   return notices
+    .map((n) => ({ ...n, items: n.items.filter((i) => !i.requires || caps.has(i.requires)) }))
     .filter(
       (n) =>
         n.items.length > 0 &&
@@ -277,9 +329,10 @@ export function noticesBetween(
 export function itemsBetween(
   since: string,
   upTo: string,
+  caps: ReadonlySet<Capability> = BUILD_CAPABILITIES,
   notices: VersionNotice[] = POST_UPDATE_NOTICES,
 ): NoticeItem[] {
-  return noticesBetween(since, upTo, notices).flatMap((n) => n.items);
+  return noticesBetween(since, upTo, caps, notices).flatMap((n) => n.items);
 }
 
 export type LaunchPlan = {
@@ -300,12 +353,13 @@ export function planLaunch(
   storedVersion: string,
   currentVersion: string,
   card: CardState | null,
+  caps: ReadonlySet<Capability> = BUILD_CAPABILITIES,
   notices: VersionNotice[] = POST_UPDATE_NOTICES,
 ): LaunchPlan {
   if (!storedVersion || !currentVersion || !versionGreaterThan(currentVersion, storedVersion)) {
     return { dialog: null, card };
   }
-  const items = itemsBetween(storedVersion, currentVersion, notices);
+  const items = itemsBetween(storedVersion, currentVersion, caps, notices);
   if (items.length === 0) return { dialog: null, card };
   const since = card && versionGreaterThan(storedVersion, card.since) ? card.since : storedVersion;
   return {
@@ -323,13 +377,50 @@ export function routingNeedsSetup(view: { record?: boolean; accounts?: unknown[]
 }
 
 /** The button for one item: its words and where it goes. */
-export function itemAction(item: NoticeItem, needsRoutingSetup: boolean): { label: string; target: NoticeTarget } {
-  if (item.setUp === "routing" && needsRoutingSetup) return { label: "Set up accounts", target: ACCOUNTS_SETUP };
-  return { label: "Show me", target: item.target };
+export function itemAction(
+  item: NoticeItem,
+  needsRoutingSetup: boolean,
+  caps: ReadonlySet<Capability> = BUILD_CAPABILITIES,
+): { label: string; target: NoticeTarget } | null {
+  if (item.setUp === "routing" && needsRoutingSetup) {
+    // Set up accounts or nothing: Show me would land on an empty routing page.
+    return targetAvailable(ACCOUNTS_SETUP, caps) ? { label: "Set up accounts", target: ACCOUNTS_SETUP } : null;
+  }
+  return targetAvailable(item.target, caps) ? { label: "Show me", target: item.target } : null;
+}
+
+/** The Home card as this version shows it: items after `since` up to the
+ * older of the card's version and the running one, so a downgrade never
+ * shows news from a newer build. Null when nothing is left to show. */
+export function cardView(
+  card: CardState,
+  currentVersion: string,
+  caps: ReadonlySet<Capability> = BUILD_CAPABILITIES,
+): { since: string; version: string; items: NoticeItem[] } | null {
+  if (!/^\d/.test(currentVersion)) return null;
+  const upTo = versionGreaterThan(card.version, currentVersion) ? currentVersion : card.version;
+  const items = itemsBetween(card.since, upTo, caps);
+  return items.length > 0 ? { since: card.since, version: upTo, items } : null;
+}
+
+/** Raise the shown-version watermark, never lower it: after a downgrade and a
+ * re-upgrade, news already dismissed stays dismissed. */
+export function raiseLastNoticedVersion(version: string): void {
+  const stored = readLastNoticedVersion();
+  if (!stored || versionGreaterThan(version, stored)) writeLastNoticedVersion(version);
+}
+
+/** One launch: plan from what this Mac stored, keep the card, raise the
+ * watermark. */
+export function launchWhatsNew(currentVersion: string, caps: ReadonlySet<Capability> = BUILD_CAPABILITIES): LaunchPlan {
+  const plan = planLaunch(readLastNoticedVersion(), currentVersion, readCardState(), caps);
+  writeCardState(plan.card);
+  raiseLastNoticedVersion(currentVersion);
+  return plan;
 }
 
 /** Finishing setup covers what's new, so it records the running version.
  * Does nothing while the version is still unknown ("…" or "unknown"). */
 export function recordVersionOnSetupFinish(appVersion: string): void {
-  if (/^\d+\.\d+\.\d+/.test(appVersion)) writeLastNoticedVersion(appVersion);
+  if (/^\d+\.\d+\.\d+/.test(appVersion)) raiseLastNoticedVersion(appVersion);
 }

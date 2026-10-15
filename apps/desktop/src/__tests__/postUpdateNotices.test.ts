@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ACCOUNTS_SETUP,
+  ALL_CAPABILITIES,
   CARD_MAX_ITEMS,
   DIALOG_MAX_ITEMS,
   POST_UPDATE_NOTICES,
@@ -94,9 +95,9 @@ describe("routing setup and item buttons", () => {
     expect(routingNeedsSetup({ record: true, accounts: [{}] })).toBe(false);
   });
   it("the routing item says Set up accounts and targets the accounts step when needed", () => {
-    expect(itemAction(routing, true)).toEqual({ label: "Set up accounts", target: ACCOUNTS_SETUP });
+    expect(itemAction(routing, true, ALL_CAPABILITIES)).toEqual({ label: "Set up accounts", target: ACCOUNTS_SETUP });
     expect(ACCOUNTS_SETUP).toEqual({ kind: "setup", step: "accounts" });
-    expect(itemAction(routing, false)).toEqual({ label: "Show me", target: routing.target });
+    expect(itemAction(routing, false, ALL_CAPABILITIES)).toEqual({ label: "Show me", target: routing.target });
   });
 });
 
@@ -115,7 +116,7 @@ describe("the notice list", () => {
     expect(v[v.length - 1]).toBe("0.3.16");
   });
   it("this release has more items than the dialog and card show", () => {
-    const items = itemsBetween("0.4.8", "0.4.16");
+    const items = itemsBetween("0.4.8", "0.4.16", ALL_CAPABILITIES);
     expect(items.length).toBe(8);
     expect(DIALOG_MAX_ITEMS).toBe(5);
     expect(CARD_MAX_ITEMS).toBe(3);

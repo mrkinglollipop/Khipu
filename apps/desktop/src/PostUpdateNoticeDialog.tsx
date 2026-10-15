@@ -1,5 +1,12 @@
 import { useCallback, useId, useRef } from "react";
-import { DIALOG_MAX_ITEMS, itemAction, type LaunchPlan, type NoticeTarget } from "./postUpdateNotices";
+import {
+  BUILD_CAPABILITIES,
+  DIALOG_MAX_ITEMS,
+  itemAction,
+  type Capability,
+  type LaunchPlan,
+  type NoticeTarget,
+} from "./postUpdateNotices";
 import { Dialog } from "./ui";
 import "./whatsNew.css";
 
@@ -7,6 +14,8 @@ type Props = {
   plan: LaunchPlan["dialog"];
   /** True when this Mac has no routing record or no account yet. */
   needsRoutingSetup: boolean;
+  /** What this build has; defaults to BUILD_CAPABILITIES. */
+  caps?: ReadonlySet<Capability>;
   /** A Show me button: go to the place; the dialog closes too. */
   onShow: (target: NoticeTarget) => void;
   onDismiss: () => void;
@@ -16,7 +25,7 @@ type Props = {
  * update. Native `<dialog>` + showModal() (see `ui.Dialog`): modality, focus
  * trap and Escape come from the element. Got it, Escape and Show me all close
  * it; none of them touches the Home card. */
-export function PostUpdateNoticeDialog({ plan, needsRoutingSetup, onShow, onDismiss }: Props) {
+export function PostUpdateNoticeDialog({ plan, needsRoutingSetup, caps = BUILD_CAPABILITIES, onShow, onDismiss }: Props) {
   const primaryRef = useRef<HTMLButtonElement>(null);
   const headingId = useId();
   const close = useCallback(() => onDismiss(), [onDismiss]);
@@ -47,24 +56,26 @@ export function PostUpdateNoticeDialog({ plan, needsRoutingSetup, onShow, onDism
         </header>
         <ul className="wn-list" role="list">
           {shown.map((item) => {
-            const action = itemAction(item, needsRoutingSetup);
+            const action = itemAction(item, needsRoutingSetup, caps);
             return (
               <li className="wn-item" key={`${item.title}-${item.text}`}>
                 <div className="wn-text">
                   <b>{item.title}</b>
                   <span>{item.text}</span>
                 </div>
-                <button
-                  type="button"
-                  className="sm"
-                  aria-label={`${action.label}: ${item.title}`}
-                  onClick={() => {
-                    onShow(action.target);
-                    close();
-                  }}
-                >
-                  {action.label}
-                </button>
+                {action ? (
+                  <button
+                    type="button"
+                    className="sm"
+                    aria-label={`${action.label}: ${item.title}`}
+                    onClick={() => {
+                      onShow(action.target);
+                      close();
+                    }}
+                  >
+                    {action.label}
+                  </button>
+                ) : null}
               </li>
             );
           })}

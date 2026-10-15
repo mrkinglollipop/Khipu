@@ -63,13 +63,10 @@ import {
   PathOverridesCard,
 } from "./SettingsControls";
 import {
-  planLaunch,
-  readCardState,
-  readLastNoticedVersion,
+  launchWhatsNew,
   recordVersionOnSetupFinish,
   routingNeedsSetup,
   writeCardState,
-  writeLastNoticedVersion,
   type CardState,
   type LaunchPlan,
   type NoticeTarget,
@@ -2909,11 +2906,9 @@ export default function App() {
         setAppVersion(v);
         // What's new: the dialog shows once, the Home card stays until it is
         // closed there, then remember this version (see postUpdateNotices.ts).
-        const plan = planLaunch(readLastNoticedVersion(), v, readCardState());
+        const plan = launchWhatsNew(v);
         setNoticeDialog(plan.dialog);
         setNoticeCard(plan.card);
-        writeCardState(plan.card);
-        writeLastNoticedVersion(v);
       })
       .catch(() => setAppVersion("unknown"));
   }, []);
@@ -3630,6 +3625,7 @@ export default function App() {
             {noticeCard ? (
               <WhatsNewCard
                 card={noticeCard}
+                appVersion={appVersion}
                 needsRoutingSetup={needsRoutingSetup}
                 onShow={openNoticeTarget}
                 onClose={() => {
