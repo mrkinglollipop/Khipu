@@ -44,7 +44,7 @@ flowchart TB
 
 ## P1 — Join kit (credentials, not a DB dump)
 
-**Format:** passphrase-encrypted JSON (`Khipu-join.khipujoin`, versioned `khipu-join-v1`). Payload: Keychain secrets (`database_url`, `gemini_api_key`, optional `openai_compat_api_key`), PEM `root.crt` bytes, `capture_mode`, `models` blob, `gateway_url` if set, expected `{episodes, topics, nodes}` counts, created_at. **No** `memory_root` / `graph_sqlite` paths. **No** snapshot (too large for AirDrop pairing).
+**Format:** (as built: encrypted only when a passphrase is given; without one the kit is plain JSON, written owner-only) passphrase-encrypted JSON (`Khipu-join.khipujoin`, versioned `khipu-join-v1`). Payload: Keychain secrets (`database_url`, `gemini_api_key`, optional `openai_compat_api_key`), PEM `root.crt` bytes, `capture_mode`, `models` blob, `gateway_url` if set, expected `{episodes, topics, nodes}` counts, created_at. **No** `memory_root` / `graph_sqlite` paths. **No** snapshot (too large for AirDrop pairing).
 
 **Import (load-bearing):** write `root.crt` to [data_dir](packages/cli/khipu/paths.py); **rewrite** DSN `sslrootcert` to that path (Mac 1’s absolute path will not exist — scar from Alzy cert move). Set Keychain via existing `set_dsn` / `set_gemini_key` / `set_openai_compat_key` in [keychain.py](packages/cli/khipu/keychain.py) and the mode-600 `dsn` file fallback (UI: existing `set_khipu_secret`). Restore `models` via [models.py](packages/cli/khipu/models.py) and `capture_mode` via [config.py](packages/cli/khipu/config.py).
 
@@ -95,7 +95,7 @@ Skip ops-only tables (`ops_events`). Refresh is **full replace**, not incrementa
 
 **Read path:** [db.connect](packages/cli/khipu/db.py) stays **Postgres-only** (writers, migrate, graph_sync, capture). Do **not** point `connect()` at `hub_snapshot.sqlite` — that would make the snapshot a write SSOT. Search / graph / get / MCP in [mcp_server.py](packages/cli/khipu/mcp_server.py) (and CLI equivalents): try hub with a short timeout; on failure, open a **separate** sqlite connection to the snapshot + merge [outbox](packages/cli/khipu/outbox.py) payloads as extra episodes. Every stale result includes `stale: true` and `snapshot_refreshed_at`. `khipu_status` / doctor: hub down is red; snapshot age is a separate signal (not “green amnesia”).
 
-**Graph offline:** reuse hop/CTE neighbor logic against sqlite `nodes`/`edges`. Do **not** require SQL/PGQ `GRAPH_TABLE` in sqlite (PG 19-only). Keyword search: port [_search_query](packages/cli/khipu/cli.py) ILIKE/token coverage to sqlite. **Semantic:** if local embed provider is configured, embed the query locally and cosine against snapshot blobs; else semantic flag errors with “hub unreachable, keyword only” — do not call Gemini while offline and pretend.
+**Graph offline:** reuse hop/CTE neighbor logic against sqlite `nodes`/`edges`. Do **not** require SQL/PGQ `GRAPH_TABLE` in sqlite (PG 19-only). Keyword search: port [_search_query](packages/cli/khipu/cli.py) ILIKE/token coverage to sqlite. **Semantic:** (as built: a provider of type `local` may be a remote HTTPS endpoint, so the query goes wherever it points) if local embed provider is configured, embed the query locally and cosine against snapshot blobs; else semantic flag errors with “hub unreachable, keyword only” — do not call Gemini while offline and pretend.
 
 **Reconnect:** existing outbox drain; then snapshot refresh; then scoped graph sync if this Mac is a feeder. Topic LWW unchanged.
 

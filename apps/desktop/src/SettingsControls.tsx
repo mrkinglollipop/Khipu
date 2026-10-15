@@ -418,6 +418,63 @@ export function PathOverridesCard({ active }: { active: boolean }) {
 }
 
 // ---------------------------------------------------------------------------
+// Data: where the graph backup's off-site copy goes.
+// ---------------------------------------------------------------------------
+
+/** Same shape the Tauri command and the CLI enforce: `remote:path`, one token,
+ *  the remote name first. This only saves a round trip. */
+export function backupRemoteError(raw: string): string | null {
+  const v = raw.trim().replace(/\/+$/, "");
+  const i = v.indexOf(":");
+  const remote = i > 0 ? v.slice(0, i) : "";
+  const path = i > 0 ? v.slice(i + 1) : "";
+  if (!remote || !path || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(remote) || /\s/.test(v)) {
+    return "Enter an rclone remote and folder, such as r2:my-bucket/khipu-graph.";
+  }
+  return null;
+}
+
+const BACKUP_SOURCE_WORDS: Record<string, string> = {
+  env: "the environment variable KHIPU_GRAPH_BACKUP_REMOTE",
+  config: "this Mac's settings",
+  default: "the default",
+};
+
+export function GraphBackupRemoteCard({ active }: { active: boolean }) {
+  const cfg = useCliState<ConfigShape>("khipu_config_show", active);
+  const row = cfg.data?.graph_backup_remote;
+  const source = row?.source ?? "default";
+  return (
+    <div className="section-card">
+      <div className="section-head">Graph backup destination</div>
+      <div className="section-body">
+        <p className="set-help">
+          On the Mac that builds the graph, a copy of the latest graph snapshot goes here about once a week, through
+          rclone. The remote must be named r2.
+        </p>
+        {cfg.error && !cfg.data ? (
+          <p className="set-error" role="alert">
+            Could not read the settings: {cfg.error}
+          </p>
+        ) : null}
+        <SettingField
+          label="Off-site copy goes to"
+          mono
+          value={row?.value ?? ""}
+          placeholder={row?.default ?? "r2:khipu-backups/khipu-graph"}
+          lockedBy={source === "env" ? "KHIPU_GRAPH_BACKUP_REMOTE" : null}
+          canReset={source === "config"}
+          resetLabel="Use the default"
+          onReset={() => unsetConfig("graph_backup_remote", cfg.reload)}
+          help={row ? `Comes from ${BACKUP_SOURCE_WORDS[source] ?? source}.` : "Reading the setting…"}
+          onSave={async (v) => backupRemoteError(v) ?? writeConfig("graph_backup_remote", v.trim(), cfg.reload)}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Advanced: per-job install / remove.
 // ---------------------------------------------------------------------------
 

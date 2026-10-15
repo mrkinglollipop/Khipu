@@ -61,6 +61,7 @@ import {
   GatewayUrlCard,
   JobsCard,
   PathOverridesCard,
+  GraphBackupRemoteCard,
 } from "./SettingsControls";
 import {
   noticeForUpgrade,
@@ -5601,6 +5602,8 @@ export default function App() {
                     </div>
 
                     <PathOverridesCard active={tab === "settings" && settingsSection === "data"} />
+
+                    <GraphBackupRemoteCard active={tab === "settings" && settingsSection === "data"} />
 
                     <div className="section-card">
                       <div className="section-head">Backup</div>

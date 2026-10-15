@@ -4,609 +4,90 @@
 
 **Khipu gives AI coding agents a memory that outlives the session.**
 
-A Mac app, a Python CLI, and a set of harness integrations that capture what
-happened in an agent session, store it in PostgreSQL as searchable prose plus a
-knowledge graph, and hand it back the next time it's relevant — on any machine.
+The name comes from Andean knotted-cord records (*khipu*): memory encoded as structure, not as a pile of chat transcripts.
 
-The name comes from Andean knotted-cord records (*khipu*): memory encoded as
-structure, not as a pile of chat transcripts.
+## What it is
 
----
+Every coding agent forgets. Close the window and the decisions, the constraints and the approaches you already ruled out are gone.
 
-## In short
-
-Every coding agent forgets. Close the window and the decisions, the constraints,
-the three approaches you already ruled out — all gone. The usual workaround is a
-pile of markdown files and hand-rolled hooks, which works until you own a second
-computer.
-
-Khipu replaces that with one product and one database.
+Khipu is a Mac app, a Python CLI and a set of agent integrations. It captures what happened in an agent session, stores it in PostgreSQL as searchable prose plus a knowledge graph, and puts it back in front of the agent when it is relevant. It works across machines.
 
 ```mermaid
 flowchart LR
-  A["Agent session<br/>ends or compacts"] --> B["Hook fires"]
-  B --> C["Summarise<br/>the window"]
+  A["Agent session<br/>ends or compacts"] --> B["Hook queues<br/>a capture job"]
+  B --> C["Background drainer<br/>summarises it"]
   C --> D[("PostgreSQL")]
-  D --> E["Next session<br/>searches it"]
+  D --> E["Next session<br/>gets prior work"]
   E --> A
-
-  classDef s fill:#f4ebe3,stroke:#8b6914,color:#1a1a1a
-  classDef d fill:#c45c3e,stroke:#8f3d28,color:#ffffff
-  class A,B,C,E s
-  class D d
 ```
 
-Three things make it work:
+## Who it is for
 
-**Capture is automatic.** A hook in each agent harness watches the session. When
-enough has happened — five user turns, or twenty minutes — it summarises the
-window into an *episode* and writes it. It captures before a compaction or a
-session end.
+People who use coding agents every day, on one Mac or several, and want the agents to remember. It is a personal system: one database, your machines, your agents.
 
-**Storage is central and shared.** One PostgreSQL instance holds everything.
-Every Mac reads the same database, so memory is not trapped on whichever laptop
-happened to be open.
+## What it does
 
-**Recall is on demand.** Agents search when it would change their answer —
-by keyword, by meaning, or by walking the graph of how things connect.
+- **Capture.** Hooks in your agents queue a capture after about five user turns or twenty minutes, and always at compaction or session end. A background step summarises each window and writes it to the database.
+- **Recall.** Prior work is pushed into context at session start and on each prompt (Claude Code and Codex). Agents and you can also search by best match, exact words or meaning, or walk the graph.
+- **Commitments.** Open loops from sessions become an Owed list you can close, reopen or snooze.
+- **Decisions.** A registry tracks which decisions still stand, and which were superseded or retracted.
+- **Briefs and reflect.** Optional, off by default: source-backed topic briefs, and answers from memory that cite their sources.
+- **Libraries.** Index a folder of `.txt` and `.md` files as another search space.
+- **Routing and plan usage.** Shows each subscription account's headroom and state. Khipu reports; routing stays with you.
+- **Desktop app.** Home, Recall, Owed, Activity, Harnesses and Settings, plus a first-run setup flow.
+- **Multi-Mac and gateway.** Join another Mac with a join kit. An HTTPS gateway serves cloud agents that cannot reach the database, such as Grok Bot.
+- **Backups.** Health checks for backups and restore drills, an offline copy of memory, and local data backup and restore.
 
----
+Supported agents: Claude Code, Cursor, Codex and Aegis locally, and Grok Bot through the gateway. Claude accounts run inside T3 Code are covered by the Claude Code install.
 
-## How it works, in depth
+Planned: a Work view and work ledger, gateway provenance, and a settings clarity pass.
 
-### 1. Capture — how a session becomes memory
+## Install
 
-Each harness gets a small hook script. It runs on every turn but does almost
-nothing most of the time; its only job is to decide whether enough has
-accumulated to be worth a model call.
+Requires macOS 12 or later on Apple silicon.
 
-```mermaid
-sequenceDiagram
-    participant A as Agent harness
-    participant H as Khipu hook
-    participant S as State file
-    participant G as Gemini
-    participant PG as PostgreSQL
-
-    A->>H: turn ends
-    H->>S: pending_turns += 1
-    alt fewer than 5 turns and under 20 min
-        H-->>A: exit 0, nothing written
-    else threshold reached, or compact / session end
-        H->>H: read transcript window (tail, max 14k chars)
-        H->>G: summarise
-        G-->>H: summary, topics, decisions, preferences
-        H->>PG: INSERT episode + upsert topics
-        H->>S: reset counters, stamp heartbeat
-    end
-```
-
-The window is capped at 14,000 characters so a long session doesn't turn into an
-expensive call, and a window under 200 characters is never worth summarising at
-all. Summarisation uses `gemini-2.5-flash`.
-
-**If the write fails, it is not dropped.** The episode goes to a local outbox
-and replays later. `doctor` reports red for as long as anything is pending, so a
-silent backlog is not possible.
-
-**The hook stamps a heartbeat every time it runs.** That is what makes the
-liveness check honest: Khipu can tell the difference between *the hook is
-broken* and *you haven't used that harness lately*, because a claim about what a
-component is doing has to be gated on evidence that it actually ran.
-
-### 2. Storage — what actually gets written
-
-```mermaid
-erDiagram
-    episodes {
-        bigserial id
-        timestamptz ts
-        text session_id
-        text summary
-        jsonb topics
-        jsonb decisions
-        jsonb preferences
-    }
-    topics {
-        text slug PK
-        text title
-        text body
-        text status
-        text content_hash
-    }
-    topic_revisions {
-        text slug FK
-        timestamptz revised_at
-        text body
-    }
-    nodes {
-        text id PK
-        text type
-        text name
-        jsonb payload
-    }
-    edges {
-        text src FK
-        text dst FK
-        text type
-        float weight
-    }
-    memory_embeddings {
-        text profile FK
-        text kind
-        text ref
-        vector embedding
-    }
-
-    topics ||--o{ topic_revisions : "versioned by"
-    nodes  ||--o{ edges : "source of"
-    nodes  ||--o{ edges : "target of"
-    episodes ||--o{ memory_embeddings : "embedded as"
-    topics   ||--o{ memory_embeddings : "embedded as"
-```
-
-Two shapes of memory, deliberately:
-
-| | What it is | Written by |
-|---|---|---|
-| **Episodes** | What happened in one session window, with the decisions and preferences pulled out. Near-duplicate captures can merge into the matching episode. | Capture hooks |
-| **Topics** | A living page per subject, rewritten as understanding improves. Every version kept in `topic_revisions`. | Capture, plus edits |
-
-Episodes are historical records, but near-duplicate captures can merge into a
-matching episode; its raw metadata records their sessions, timestamps and matches.
-Topics are the current best understanding
-and change constantly — which is why they carry a `content_hash` and a full
-revision trail.
-
-The **graph** (`nodes` / `edges`) sits alongside as a PostgreSQL 19 SQL/PGQ
-property graph named `alzy_graph`. One-hop queries use native `MATCH`; anything
-deeper falls back to a recursive CTE in the CLI.
-
-### 3. Recall — three ways to ask
-
-```bash
-khipu search "why did we pick pgvector"              # keyword
-khipu search "why did we pick pgvector" --semantic   # meaning
-khipu graph <node-id> --hops 2                       # connections
-```
-
-**Keyword** search is token-coverage `ILIKE` across topic bodies, episode
-summaries plus capture extract fields (topics, decisions, preferences, people),
-and node names — a multi-word query ranks by how many tokens hit, not whether
-the whole phrase appears as one substring. It queries each kind separately
-with its own ordering, so a flood of matching episodes cannot starve out the
-one topic page you actually wanted.
-
-**Semantic** search embeds the query with the **active** embedding profile
-(`gemini-embedding-2@768`; `gemini-embedding-001` @ 768 retained as inactive
-rollback), oversamples cosine neighbors, then fuses that order with query-term
-overlap over the same embedded text (summary + extract), not the teaser
-snippet. Reciprocal-rank fusion still prefers hits that name the question.
-Embeddings are keyed by content hash, so re-embedding only touches text that
-actually changed.
-
-**Graph** traversal expands wiki/path/graphify nodes. Digit ids from search
-are episodes: the neighborhood is that capture's topic slugs, not a node
-named `9320`.
-
-Agents reach these through the MCP tools `khipu_search`, `khipu_get`,
-`khipu_graph`, `khipu_status`, and `khipu_capture`. Search returns
-word-boundary teasers; `khipu_get` loads the full episode, topic, or media
-(path/sha256/mime). Claude Code SessionStart injects the recall rule plus a
-small cwd-scoped (else recents) slice so memory is pushed, not only pulled.
-Cursor keeps the project `.cursor/rules/khipu.mdc` pull path and, when
-`khipu install cursor` is applied, also appends a `sessionStart` hook that
-emits Cursor's `additional_context` (not Claude's nested `additionalContext`)
-with a longer timeout so a hub PG slice can finish — without replacing the
-harness `session_start.sh` entry.
-
-### 4. Where it runs
-
-```mermaid
-flowchart LR
-  subgraph harnesses ["Agent harnesses"]
-    direction TB
-    CC["Claude Code"]
-    CU["Cursor"]
-    CX["Codex"]
-    AE["Aegis"]
-  end
-
-  subgraph khipu ["Khipu — on your Mac"]
-    direction TB
-    HOOK["Capture hooks"]
-    CLI["khipu CLI"]
-    APP["Desktop app"]
-    OUT["Outbox"]
-  end
-
-  subgraph server ["Private server"]
-    direction TB
-    GW["HTTPS gateway<br/>token · rate limit"]
-    PG[("PostgreSQL 19<br/>pgvector · SQL/PGQ")]
-    BK["WAL-G backups<br/>+ restore drills"]
-  end
-
-  GB["Grok Bot<br/>(cloud, no filesystem)"]
-
-  CC --> HOOK
-  CU --> HOOK
-  CX --> HOOK
-  AE --> HOOK
-  APP --> CLI
-  HOOK --> CLI
-  CLI --> PG
-  CLI -. "write failed" .-> OUT
-  OUT -. replay .-> PG
-  GB -- "MCP over HTTPS" --> GW
-  GW --> PG
-  PG --> BK
-
-  classDef h fill:#f4ebe3,stroke:#8b6914,color:#1a1a1a
-  classDef k fill:#e8f2f0,stroke:#2a6f6a,color:#1a1a1a
-  classDef d fill:#c45c3e,stroke:#8f3d28,color:#ffffff
-  classDef b fill:#f7f3ee,stroke:#6b5a4e,color:#1a1a1a
-  class CC,CU,CX,AE,GB h
-  class HOOK,CLI,APP,OUT k
-  class PG,GW d
-  class BK b
-```
-
-Five harnesses are supported. Four run locally and talk to PostgreSQL directly
-over a private network. **Grok Bot is the exception** — it runs on an ephemeral
-cloud VM with no filesystem to install hooks into, so it reaches Khipu through
-an HTTPS MCP gateway guarded by a bearer token. The database is never exposed
-publicly; the gateway is the only door, and it holds the token, the rate limit,
-and a cap on JSON-RPC batch size.
-
-`khipu integrations install <harness>` writes the config for a harness;
-`khipu integrations verify <harness>` proves it works by actually exercising it,
-rather than by checking that a file exists.
-
-### 5. Nothing is cut over irreversibly
-
-Khipu replaced a working system, so the migration was built to be reversible at
-every step. `capture_mode` is a setting, not a pipeline:
-
-```mermaid
-stateDiagram-v2
-  direction LR
-
-  [*] --> dual: migration default
-
-  state "legacy — old writers only" as legacy
-  state "dual — legacy + mirror to PG" as dual
-  state "hub — Khipu writes + outbox" as hub
-
-  dual --> hub: Khipu writes proven
-  hub --> dual: roll back default
-  dual --> legacy: full roll back
-  legacy --> dual: resume migration
-```
-
-| Mode | Behaviour |
-|---|---|
-| `legacy` | Existing capture scripts only — full rollback |
-| `dual` | Legacy capture continues and mirrors into PostgreSQL — the migration default |
-| `hub` | Khipu owns writes, with the outbox behind it |
-
-Reads moved to PostgreSQL first. Writes stayed on the proven path until capture,
-outbox, and parity checks were all demonstrably working. Flipping the default to
-`hub` deletes nothing.
-
-### 6. Keeping the copies honest
-
-Memory exists as files *and* as database rows during the migration, which means
-they can disagree. Three mechanisms stop that from going unnoticed:
-
-| Command | What it checks |
-|---|---|
-| `khipu reconcile` | Sweeps files into PostgreSQL. Idempotent — upserts on `(ts, md5(summary))`, so re-running never duplicates |
-| `khipu sources` | List, enable, or disable graph membership roots; writes `graph_sources.resolved.json` for graphify |
-| `khipu doctor` | Drift between files and rows, directionally: every file episode must exist in PostgreSQL |
-| `khipu revisions` | Conflicting topic edits across machines |
-
-Deletions are tombstones (`topics.deleted_at`), never silent drops, and a purge
-requires explicit confirmation.
-
-### 7. Operations
-
-`khipu doctor` is the single health command. Checks that AND into `ok` must
-pass; `graph_offsite_ok` keeps a graph producer red when its `r2` remote is missing:
-
-| Check | Red when |
-|---|---|
-| `backup_ok` | Postgres WAL-G / pg_dump stale or restore drill failed |
-| `graph_backup_ok` | Latest local graph snapshot is missing, empty, or older than 36h (producer only) |
-| `graph_offsite_ok` | Weekly R2 copy of the latest snapshot is missing or stale (producer only; blocked until `r2` remote exists) |
-| `drift_ok` | A file episode has no row in PostgreSQL |
-| `graph_drift_ok` | Graph nodes and edges disagree with their source |
-| `outbox_ok` | A write is queued and hasn't replayed |
-| `capture_liveness_ok` | A hook is running but never deciding a capture is due |
-| `git_sync_ok` | The memory repo hasn't synced since the last nightly |
-| `dsn_file_ok` | The on-disk connection string points at a certificate that doesn't exist |
-
-Backups run nightly to object storage via WAL-G, with continuous WAL archiving
-and **automated restore drills** — a backup that has never been restored is not
-a backup. Local (Radio A) dump/restore uses `docker exec` inside the Postgres
-container; set `KHIPU_PG_DUMP` / `KHIPU_PG_RESTORE` to use host binaries instead.
-
----
-
-## Repo layout
-
-| Path | What it is |
-|---|---|
-| [`packages/cli/`](packages/cli/) | Python CLI and library — capture, search, graph, doctor, migrate, mirror, gateway, MCP server |
-| [`apps/desktop/`](apps/desktop/) | Tauri 2 + React desktop app |
-| [`ops/migrations/`](ops/migrations/) | Database schema, applied by `khipu migrate` |
-| [`ops/docker/`](ops/docker/) | PostgreSQL 19 + pgvector image recipe |
-
-Operational runbooks, deployment scripts, and design notes for the maintainer's
-own installation live in a private companion repository — they describe one
-person's servers, not the product.
-
-## Status
-
-| Phase | State |
-|---|---|
-| **P1** PostgreSQL, ETL, mirror, CLI, Tauri shell | Shipped |
-| **P2** Truthful signals, graph hop symmetry, idempotent reconcile, tombstones | Shipped |
-| **P3** PG 19, dual-write capture, vectors and semantic search, five harness packs, recall rules | Shipped |
-| **Soak** ≥ 7 days with two Macs on the same database | In progress |
-| **P4** Model roles, embedding profiles, corpus picker (Settings + `khipu sources`), selective vision | Partial — Settings Models + corpus picker shipped; **native** PNG/JPEG ingest into `gemini-embedding-2@768` (per-source `embed_media`, `khipu embed-media-backfill`) shipped; embed-profiles UI, Firecrawl, caption/`models.vision` still Planned |
-
-## Setting it up
-
-Khipu is a personal system: one database, your machines, your agents. Install
-the desktop app — it walks you through the rest. Cloning the repo is only for
-developers and self-hosters (see below).
-
-**Requirements.** macOS on Apple silicon (the desktop app and its Keychain
-integration are Mac-only). Everything else — where the database lives, which
-model to use — is a choice the app walks you through; nothing needs deciding
-in advance.
-
-### Install the desktop app
-
-1. Download the latest `Khipu_*.dmg` from the
-   [GitHub releases page](https://github.com/mrkinglollipop/Khipu/releases/latest),
-   or [kinglollipop.com/khipu/download](https://kinglollipop.com/khipu/download).
+1. Download the latest `Khipu_*.dmg` from the [GitHub releases page](https://github.com/mrkinglollipop/Khipu/releases/latest).
 2. Open the DMG and drag **Khipu.app** to **Applications**.
-3. Launch **Khipu**. First launch opens **Welcome**, a short walkthrough:
-   Database, Model, Graph, Agents, Finish. Every step ends in one of three
-   states, shown plainly on screen: **working** (a real check passed, not
-   just "saved"), **needs you** (one plain-words action — never a raw error
-   code), or **fixing it…** (the app is doing the work; wait it out).
+3. Launch Khipu.
 
-Six screens after that, one per job: **Home** (is memory working right now),
-**Recall** (ask what it remembers), **Owed** (what you still owe on each
-project), **Activity** (every session it recorded), **Harnesses** (which
-agents are wired in and actually recording), and **Settings**.
+The app checks GitHub Releases at launch. Install an update from Settings, then Updates, then Check for updates. If macOS blocks a release that is not notarized, right-click **Khipu.app** and choose **Open** once.
 
-The app updates itself from GitHub Releases. Gatekeeper: if macOS blocks an
-older, non-notarized release, right-click **Khipu.app** → **Open** once. See
-[`apps/desktop/README.md`](apps/desktop/README.md).
+## First run
 
-### The Database step — three choices, one proof each
+The first launch opens a six-step setup: Welcome, Database, Model, Graph, Agents, Finish. Each step checks itself, so you can stop and resume.
 
-Each choice makes the schema current and schedules the three background upkeep
-jobs. A real memory round trip — written, found by search, shown as a timed line
-("1.8 s"), not a checkmark — can be skipped in legacy mode or without a model key.
+- **Database.** Choose one: join a Khipu you already have, set up a new database on this Mac (needs Docker), or connect to a database you already run.
+- **Model.** Pick the summariser: cloud Gemini, Claude Haiku with an API key, Claude or ChatGPT on your own login, or a local OpenAI-compatible endpoint. You can skip this for now.
+- **Graph.** Installs the graph builder. You can skip it and do it later in Settings.
+- **Agents.** Lists the agents it found. Install and verify each one in Harnesses.
+- **Finish.** Runs a health check and lists anything unresolved, each with one fix.
 
-- **Join another Mac.** Pick this if a Mac in your life already runs Khipu —
-  you want the *same* memory, not a second one. On the working Mac: Settings
-  → Another Mac → type a passphrase → **Save join kit…**, then AirDrop the
-  file (or use the six-digit PIN over the same Wi‑Fi). On the new Mac:
-  Welcome → **Join existing Khipu**, with the same passphrase. The kit holds
-  the database password and any API keys, so a passphrase is required; an
-  unencrypted kit is made only if you tick "I understand: make it
-  unencrypted" (`khipu join export --allow-unencrypted` on the command line).
-  Kits saved unencrypted before this still import. Proves: live episode, topic and node counts are non-zero
-  when the join kit expects them to be.
-- **Set up a new database on this Mac.** Pick this if nobody has Khipu yet.
-  Needs [Docker Desktop](https://docs.docker.com/desktop/setup/install/mac-install/)
-  (or OrbStack/Colima) — the app notices once it's installed and turns the
-  button on by itself. Proves: a backup was taken and test-restored. A
-  database set up this way lives on this Mac's disk only — another Mac can't
-  reach it directly; use **Join another Mac** there instead, or move it later
-  (below).
-- **Connect to a server you run.** Pick this for a Postgres server you
-  already host — your own machine, a cloud VM, a managed provider. Paste its
-  connection string ("looks like `postgresql://user:pass@host:5432/dbname`;
-  your host shows this under connection details"). Needs Postgres 19+ with
-  the `vector` extension, reachable from every Mac that will use Khipu.
-  Proves: the server answers, the account has enough privilege, and the
-  schema is current.
+Details are in [docs/setup.md](docs/setup.md).
 
-### Model, Graph, Agents, Finish
+## Learn more
 
-**Model** (optional — Skip for now is always there): paste a cloud Gemini key
-or point at a local OpenAI-compatible endpoint. The key is proven with one
-real, cheap call the moment you save it — "Key works · gemini-embedding-2",
-not just "saved". **Graph** installs the connections builder next to the app
-(also skippable; add it later from Settings → Components). **Agents** wires
-Claude Code, Cursor, Aegis and Codex — one Install per harness; restart that
-harness, start any session, and its card turns green by itself, no extra
-click needed. **Finish** lists anything still unproven with its one fix, and
-**Continue anyway** always works — nothing on this screen can leave you
-stuck.
+| Topic | Page |
+| --- | --- |
+| How capture, storage and recall work | [docs/how-it-works.md](docs/how-it-works.md) |
+| Setup, step by step, and self-hosting | [docs/setup.md](docs/setup.md) |
+| Every CLI command | [docs/cli.md](docs/cli.md) |
+| The MCP tools agents use | [docs/mcp-tools.md](docs/mcp-tools.md) |
+| Agent integrations and hooks | [docs/integrations.md](docs/integrations.md) |
+| The desktop app | [docs/desktop-app.md](docs/desktop-app.md) |
+| Routing and plan usage | [docs/routing.md](docs/routing.md) |
+| Health checks, jobs, backups, gateway | [docs/operations.md](docs/operations.md) |
+| Questions and answers | [docs/faq.md](docs/faq.md) |
 
-### Moving your memory to another database
-
-Settings → **Database** → **Move this memory to another database…**. Point
-it at the target — a new local database, or a server. It checks the target
-first, without touching anything. Confirm, and it copies every table,
-verifies the row counts match, then switches over; the old database is left
-untouched. Afterward, any other Mac needs a fresh join kit from the new one.
-
-### Developer and self-host setup
-
-Clone the repo to hack on Khipu itself, run the CLI outside the bundled app,
-or run the pieces the desktop app doesn't cover (the cloud-agent gateway):
-
-```bash
-git clone https://github.com/mrkinglollipop/Khipu.git && cd Khipu
-python3.11 -m pip install --target .python_libs -r packages/cli/requirements.txt
-```
-
-`.python_libs/` is per-machine and git-ignored. Everything below assumes
-`PYTHONPATH="packages/cli:.python_libs"` and `python3.11 -m khipu` (alias it
-to `khipu` if you like). A Dockerfile for Postgres 19 + pgvector is in
-[`ops/docker/`](ops/docker/) — the same image the app's own "set up a new
-database" button builds.
-
-```bash
-# Point at your database — the password goes in the Keychain, never a file or ps output.
-printf '%s' 'postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=verify-full&sslrootcert=/path/root.crt' \
-  | khipu secrets --set database_url
-khipu migrate                              # apply the schema; --dry-run to preview
-khipu integrations install claude_code     # or cursor, codex, aegis
-khipu integrations verify  claude_code     # proves it by exercising it, not by checking a file exists
-```
-
-Then `khipu doctor` should be green. Anything it could not check is named
-under `not_configured` — normal on a fresh install.
-
-**Build the desktop app locally:** `cd apps/desktop && npm install && npm run
-tauri dev` (needs Rust and Xcode command-line tools). Release builds:
-[`apps/desktop/README.md`](apps/desktop/README.md).
-
-**Cloud agents (Grok Bot / Cursor cloud) — optional.** These run on ephemeral
-VMs with no filesystem to install hooks into, so they reach Khipu through an
-HTTPS gateway instead — the one component meant to face the internet, so the
-database never has to:
-
-```bash
-docker build -f ops/docker/Dockerfile.gateway -t khipu/gateway .
-docker run -d --name khipu-gateway --network host \
-  -e KHIPU_DATABASE_URL='postgresql://…' \
-  -e GEMINI_API_KEY='…' \
-  -e KHIPU_GATEWAY_TOKEN="$(openssl rand -hex 32)" \
-  khipu/gateway
-```
-
-It listens on `127.0.0.1:8787` only; put a TLS-terminating reverse proxy
-(Caddy or nginx, a real certificate) in front. The token must be at least 24
-characters and is the only credential a cloud agent ever holds — Postgres
-stays private. Then, on your Mac:
-
-```bash
-khipu config --set-gateway-url https://khipu.example.com
-khipu integrations install grok_bot --project /path/to/repo   # writes .cursor/mcp.json + a rule
-khipu integrations verify grok_bot                            # probes the public URL, wrong-token negative included
-```
-
-Add the same token as a secret named `KHIPU_GATEWAY_TOKEN` in Cursor's cloud
-agent settings; `.cursor/mcp.json` references it as `${env:KHIPU_GATEWAY_TOKEN}`
-and never contains the value. Local harnesses never use the gateway.
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request.
-
-## FAQ
-
-**Does Khipu send my code or conversations anywhere?**
-Only to your own PostgreSQL server and the model providers you configure.
-Summarisation sends transcript windows, capped at 14,000 characters, to Google
-Gemini or a configured OpenAI-compatible endpoint. Embeddings send memory chunks
-and search queries to Google Gemini, Voyage, or a configured OpenAI-compatible
-endpoint, which may be local or remote. Nothing goes to the maintainer. There is
-no telemetry.
-
-**Do I have to run PostgreSQL 19? It's a beta.**
-Yes, for now — SQL/PGQ property graphs arrived in 19 and the graph layer uses
-them natively. A Dockerfile that builds 19 + pgvector is in `ops/docker/`.
-
-**Why is the database "private network only"? Can I just open a port?**
-Please don't. Khipu's threat model is that the database is reachable only from
-your machines (Tailscale, WireGuard, an SSH tunnel). The gateway is the only
-component designed to face the internet, and it exists precisely so the
-database never has to.
-
-**Can I use a model other than Gemini?**
-Yes. **Synth** (session summaries) supports cloud Gemini or a local
-OpenAI-compatible endpoint (Settings → **Capture & models**, or Welcome →
-Model). **Embed**
-(search vectors) defaults to Gemini Embedding 2 @768 when you choose cloud
-embed at first-run; you can skip embed until a profile is configured. Switching
-embed later creates a new profile and re-embed job. **Native** image vectors
-(PNG/JPEG into the same `gemini-embedding-2@768` profile) are opt-in per source
-via `embed_media` + `khipu embed-media-backfill`. Caption / `models.vision`
-ingest is still not shipped (picker defaults to off).
-
-**What happens when I'm offline, or the database is down?**
-Captures queue in a local outbox and replay when the database is back;
-`khipu doctor` stays red until the outbox is empty, so a silent backlog is not
-possible. Reads fall back to a full local `hub_snapshot.sqlite` (episodes,
-topics, revisions, nodes, edges, embeddings) refreshed whenever the hub was
-last reachable — results are tagged `stale: true`. Keyword search always works
-offline; semantic search needs a local embed provider configured (cloud Gemini
-is not called while pretending to be online). The snapshot is never a write
-SSOT — writers still use Postgres or the outbox. Capture mode (`legacy` /
-`dual` / `hub`) is a CLI setting (`khipu config --set-capture-mode`); there is
-no desktop toggle for it yet.
-
-**How much does the capture cost in Gemini calls?**
-One summarisation call per capture, and a capture happens after five user turns
-or twenty minutes — plus one at every compaction or session end. A window under
-200 characters is never sent. Embeddings are keyed by content hash, so text that
-has not changed is never re-embedded.
-
-**Do I need the gateway?**
-For cloud agents (Grok Bot / Cursor cloud agents), yes — it's the only way in.
-Claude Code, Cursor and Codex on your Mac talk to the database directly over
-your private network and need no gateway. Aegis is the exception, not an
-extra-configuration-free member of that list: its sandbox cannot reach
-Postgres or the Keychain, so it always talks to Khipu over the gateway too,
-with a bearer token it reads from `KHIPU_GATEWAY_TOKEN` or the file named in
-its own `[memory.khipu] token_file`. Once `gateway_url` is configured, run
-`khipu gateway token set` once to stage that token — `khipu integrations
-verify aegis` names the same fix if it is ever missing or refused. If you
-never use Aegis or a cloud agent, skip the gateway entirely.
-
-**Something is red in `khipu doctor`. What now?**
-Each check names what it wants. `not_configured` is not red — it lists checks
-that do not apply on this machine. For anything else, the check's own payload
-(`drift`, `outbox`, `capture_liveness`, `git_sync`, `backup`) says what it saw.
-
-**Can I run this on Linux or Windows?**
-The CLI is plain Python and should run anywhere; the Keychain integration and
-the desktop app are macOS-only today. Use `KHIPU_DATABASE_URL` /
-`GEMINI_API_KEY` in the environment instead of the Keychain.
-
-**Is my memory locked in?**
-No. It is ordinary tables in your own PostgreSQL — `episodes`, `topics`,
-`nodes`, `edges` — and `khipu regen-memory` can write topics back out as
-markdown at any time.
+For contributors: [CONTRIBUTING.md](CONTRIBUTING.md). Package READMEs: [packages/cli](packages/cli/README.md) and [apps/desktop](apps/desktop/README.md).
 
 ## Support
 
-Email **[support@kinglollipop.com](mailto:support@kinglollipop.com)** for help,
-questions, or a commercial licence conversation. If something is broken,
-include the output of `khipu doctor` — it never contains secrets — and which
-harness you were using. Bugs and feature requests are also welcome as GitHub
-issues; security problems should go by email or through
-[GitHub's private advisory form](https://github.com/mrkinglollipop/Khipu/security/advisories/new)
-rather than a public issue.
-
----
+Email [support@kinglollipop.com](mailto:support@kinglollipop.com) for help, questions or a commercial licence conversation. If something is broken, include the output of `khipu doctor` and which agent you were using. Read it before you send it: doctor output includes recent capture summaries, paths and error text, and it is not redacted, so remove anything private. Bugs and feature requests are welcome as GitHub issues. Report security problems by email or through [GitHub's private advisory form](https://github.com/mrkinglollipop/Khipu/security/advisories/new), not a public issue.
 
 ## Licence
 
-Khipu is licensed under the **[GNU Affero General Public License v3.0](LICENSE)**.
+Khipu is licensed under the [GNU Affero General Public License v3.0](LICENSE). A modified version must also be released under AGPL-3.0, and that includes running it as a hosted service. For a commercial licence, contact the maintainer.
 
-AGPL-3.0 is a strong copyleft licence. Anyone may use, modify and redistribute
-Khipu, but a modified version must itself be released under AGPL-3.0 — and
-Section 13 extends that to network use, so running a modified Khipu as a hosted
-service obliges you to offer its source to the people using that service.
-Hosting instead of shipping is not a way around it.
+Contributions are covered by the same licence plus a [Contributor Licence Agreement](CLA.md). See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Commercial use is not forbidden, but it is only possible on those terms. If you
-want to build on Khipu without releasing your own source, contact the maintainer
-about a commercial licence.
-
-Contributions are covered by the same licence plus a
-[Contributor Licence Agreement](CLA.md) — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
-
-The Khipu name and icon are not covered by the licence and remain the
-maintainer's marks.
+The Khipu name and icon are not covered by the licence and remain the maintainer's marks.

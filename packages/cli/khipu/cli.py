@@ -2939,14 +2939,15 @@ def cmd_config(args: argparse.Namespace) -> int:
     if (args.set and args.set[0] == "graph_backup_remote") or args.unset == "graph_backup_remote":
         # Where `graph-backup offsite` copies the graph snapshot (rclone
         # remote:path); `--unset` goes back to the default.
-        from khipu.config import graph_backup_remote, set_graph_backup_remote
+        from khipu.config import graph_backup_remote_status, set_graph_backup_remote
 
         try:
             path = set_graph_backup_remote(args.set[1] if args.set else None)
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
-        print(json.dumps({"ok": True, "graph_backup_remote": graph_backup_remote(), "config_file": str(path)}))
+        print(json.dumps({"ok": True, "graph_backup_remote": graph_backup_remote_status(),
+                          "config_file": str(path)}))
         return 0
     from khipu import routing as _routing
 
@@ -3042,7 +3043,12 @@ def cmd_config(args: argparse.Namespace) -> int:
         )
         return 0
     from khipu import relevance, usage
-    from khipu.config import float_settings_status, list_setting, path_settings_status
+    from khipu.config import (
+        float_settings_status,
+        graph_backup_remote_status,
+        list_setting,
+        path_settings_status,
+    )
 
     out = {
         "capture_mode": capture_mode(),
@@ -3061,6 +3067,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
         "usage_accounts": usage.accounts_status(),
         "routing": _routing.settings_status(),
+        "graph_backup_remote": graph_backup_remote_status(),
         "config_file": str(config_file()),
         "config": load_config(),
     }

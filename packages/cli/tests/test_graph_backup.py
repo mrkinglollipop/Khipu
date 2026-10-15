@@ -168,6 +168,19 @@ class DestRemoteTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"KHIPU_GRAPH_BACKUP_REMOTE": "r2:from-env/g"}):
             self.assertEqual(graph_backup.resolve_dest_remote(), "r2:from-env/g")
 
+    def test_status_names_the_source(self):
+        from khipu.config import graph_backup_remote_status, set_graph_backup_remote
+
+        self.assertEqual(graph_backup_remote_status()["source"], "default")
+        set_graph_backup_remote("r2:my-bucket/graph")
+        self.assertEqual(
+            graph_backup_remote_status(),
+            {"value": "r2:my-bucket/graph", "source": "config",
+             "default": "r2:khipu-backups/khipu-graph"},
+        )
+        with mock.patch.dict(os.environ, {"KHIPU_GRAPH_BACKUP_REMOTE": "r2:from-env/g"}):
+            self.assertEqual(graph_backup_remote_status()["source"], "env")
+
     def test_override_without_remote_name_is_refused(self):
         from khipu.config import set_graph_backup_remote
 

@@ -355,6 +355,21 @@ def graph_backup_remote() -> str:
     return stored.rstrip("/") if stored else DEFAULT_GRAPH_BACKUP_REMOTE
 
 
+def graph_backup_remote_status() -> dict:
+    """The destination and where it came from: env, config or default."""
+    if (os.environ.get("KHIPU_GRAPH_BACKUP_REMOTE") or "").strip():
+        source = "env"
+    elif str(load_config().get("graph_backup_remote", "") or "").strip():
+        source = "config"
+    else:
+        source = "default"
+    return {
+        "value": graph_backup_remote(),
+        "source": source,
+        "default": DEFAULT_GRAPH_BACKUP_REMOTE,
+    }
+
+
 def set_graph_backup_remote(value: "str | None") -> Path:
     data = _load_config_for_mutation()
     text = (value or "").strip().rstrip("/")

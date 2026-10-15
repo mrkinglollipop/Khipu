@@ -6,6 +6,7 @@ import {
   CaptureTuningCard,
   GatewayTokenCard,
   GatewayUrlCard,
+  GraphBackupRemoteCard,
   JobsCard,
   PathOverridesCard,
 } from "../SettingsControls";
@@ -285,5 +286,49 @@ describe("GatewayTokenCard", () => {
     fireEvent.submit(field.closest("form")!);
     expect(await screen.findByRole("alert")).toHaveTextContent("token is empty");
     expect(field.value).toBe("abc");
+  });
+});
+
+describe("GraphBackupRemoteCard", () => {
+  const def = "r2:khipu-backups/khipu-graph";
+
+  it("shows the default and where it came from, and saves a valid destination", async () => {
+    config.graph_backup_remote = { value: def, source: "default", default: def };
+    render(<GraphBackupRemoteCard active />);
+    const field = (await screen.findByLabelText("Off-site copy goes to")) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe(def));
+    expect(screen.getByText("Comes from the default.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Use the default" })).not.toBeInTheDocument();
+    fireEvent.change(field, { target: { value: " r2:my-bucket/graph " } });
+    fireEvent.submit(field.closest("form")!);
+    await waitFor(() =>
+      expect(calls).toContainEqual(["khipu_config_set", { key: "graph_backup_remote", value: "r2:my-bucket/graph" }]),
+    );
+  });
+
+  it("refuses a value without a remote name before calling the CLI", async () => {
+    config.graph_backup_remote = { value: def, source: "default", default: def };
+    render(<GraphBackupRemoteCard active />);
+    const field = (await screen.findByLabelText("Off-site copy goes to")) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe(def));
+    fireEvent.change(field, { target: { value: "just-a-bucket" } });
+    fireEvent.submit(field.closest("form")!);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/rclone remote and folder/);
+    expect(calls.some(([cmd]) => cmd === "khipu_config_set")).toBe(false);
+  });
+
+  it("offers the default again for a saved value and locks an environment one", async () => {
+    config.graph_backup_remote = { value: "r2:mine/g", source: "config", default: def };
+    render(<GraphBackupRemoteCard active />);
+    expect(await screen.findByText("Comes from this Mac's settings.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Use the default" }));
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "graph_backup_remote" }]));
+    cleanup();
+    config.graph_backup_remote = { value: "r2:env/g", source: "env", default: def };
+    render(<GraphBackupRemoteCard active />);
+    const field = (await screen.findByLabelText("Off-site copy goes to")) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe("r2:env/g"));
+    expect(field).toBeDisabled();
+    expect(screen.getByText("Comes from the environment variable KHIPU_GRAPH_BACKUP_REMOTE.")).toBeInTheDocument();
   });
 });
