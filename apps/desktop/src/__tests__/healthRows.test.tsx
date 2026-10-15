@@ -238,3 +238,79 @@ describe("summariser rows (synth_provider / synth_budget)", () => {
     expect(row?.textContent).toContain("lift it for today under Settings");
   });
 });
+
+describe("offline copy row (hub_snapshot_ok)", () => {
+  it("a copy behind the database stays green and says which kinds of change it lacks", () => {
+    const parsed = fixture({
+      hub_snapshot_ok: true,
+      hub_snapshot: {
+        ok: true,
+        state: "behind",
+        age_seconds: 7 * 3600,
+        tables: {
+          episodes: { lag_seconds: 0, missing: 0 },
+          topics: { lag_seconds: 7 * 3600, missing: 2 },
+          decisions: { lag_seconds: null, error: "UndefinedTable: decisions" },
+        },
+      },
+    });
+    const row = healthRows(parsed).find((r) => r.key === "hub_snapshot_ok");
+    expect(row?.status).toBe("ok");
+    expect(row?.label).toBe("Offline copy of memory");
+    expect(row?.detail).toBe(
+      "behind the database · rebuilt in full 7 h ago · topics 7 h behind, 2 to catch up · could not compare decisions",
+    );
+  });
+
+  it("an in-step copy says so", () => {
+    const parsed = fixture({
+      hub_snapshot_ok: true,
+      hub_snapshot: { ok: true, state: "fresh", age_seconds: 600, tables: { episodes: { lag_seconds: 0, missing: 0 } } },
+    });
+    expect(healthRows(parsed).find((r) => r.key === "hub_snapshot_ok")?.detail).toBe(
+      "in step with the database · rebuilt in full 10 min ago · every kind of change in step",
+    );
+  });
+
+  it("with the database unreachable it gives the last comparison", () => {
+    const measured = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+    const parsed = fixture({
+      hub_snapshot_ok: true,
+      hub_snapshot: { ok: true, state: "unknown", age_seconds: 3 * 3600, last_known: { measured_at: measured, state: "fresh" } },
+    });
+    expect(healthRows(parsed).find((r) => r.key === "hub_snapshot_ok")?.detail).toBe(
+      "not compared with the database just now · rebuilt in full 3 h ago · 2 h ago it was in step with the database",
+    );
+  });
+
+  it("a failed rebuild is red, names the error and promises no Settings action", () => {
+    const parsed = fixture({
+      hub_snapshot_ok: false,
+      hub_snapshot: {
+        ok: false,
+        state: "stale",
+        reason: "snapshot_refresh_failed",
+        age_seconds: 20 * 3600,
+        refresh_error: { at: "2026-10-15T06:05:00+00:00", error: "OperationalError: timeout" },
+      },
+    });
+    const { items } = buildAttention(parsed);
+    const item = items.find((i) => i.key === "hub_snapshot");
+    expect(item?.title).toBe("The offline copy of your memory is out of date");
+    expect(item?.cause).toContain("The last full rebuild failed: OperationalError: timeout.");
+    expect(item?.cause).not.toContain("Settings");
+    render(<HealthReportRows parsed={parsed} attention={items} />);
+    const row = screen.getByText("Offline copy of memory").closest(".row-item");
+    expect(row?.querySelector("svg.err")).not.toBeNull();
+    expect(row?.textContent).toContain("the last rebuild failed: OperationalError: timeout");
+  });
+
+  it("an overdue rebuild says how long ago the nightly job last ran it", () => {
+    const parsed = fixture({
+      hub_snapshot_ok: false,
+      hub_snapshot: { ok: false, state: "stale", reason: "snapshot_refresh_overdue", age_seconds: 30 * 3600 },
+    });
+    const item = buildAttention(parsed).items.find((i) => i.key === "hub_snapshot");
+    expect(item?.cause).toContain("The nightly job rebuilds it in full and last did so 30 h ago.");
+  });
+});

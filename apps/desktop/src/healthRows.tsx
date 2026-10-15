@@ -29,6 +29,7 @@ import {
 import type { UsageReport } from "./PlansCard";
 import { brokenChecks, lastChangeWords, quietRunners, runnerWords } from "./routing";
 import type { RouteView } from "./routing";
+import { fmtAge, fmtAgeSince } from "./time";
 
 export type HealthRowStatus = "ok" | "err" | "skipped";
 
@@ -50,6 +51,7 @@ export type HealthRow = {
 // falls through to `humanize()` below and sorts after these by status group.
 const LABELS: Record<string, string> = {
   hub_ok: "Database reachable",
+  hub_snapshot_ok: "Offline copy of memory",
   dsn_file_ok: "Connection stored on this Mac",
   drift_ok: "Memory index matches the database",
   graph_drift_ok: "Connections index matches the database",
@@ -139,7 +141,84 @@ export function synthBudgetDetail(b: SynthBudget | undefined): string | undefine
   return parts.join(" · ");
 }
 
+/** Doctor's `hub_snapshot` block (packages/cli/khipu/hub_snapshot.py
+ *  `snapshot_freshness`): one overall state and, per kind of change, how
+ *  far the offline copy is behind the database. */
+export type HubSnapshotTable = {
+  lag_seconds?: number | null;
+  missing?: number;
+  truncated?: boolean;
+  error?: string;
+  not_applicable?: string;
+};
+export type HubSnapshotBlock = {
+  ok?: boolean;
+  state?: string;
+  reason?: string;
+  age_seconds?: number | null;
+  tables?: Record<string, HubSnapshotTable>;
+  last_known?: { measured_at?: string; state?: string } | null;
+  refresh_error?: { at?: string; error?: string } | null;
+};
+
+const SNAPSHOT_STATE_WORDS: Record<string, string> = {
+  fresh: "in step with the database",
+  behind: "behind the database",
+  stale: "out of date",
+  unknown: "not compared with the database just now",
+};
+
+const SNAPSHOT_TABLE_WORDS: Record<string, string> = {
+  episodes: "episodes",
+  tombstones: "forgotten items",
+  topics: "topics",
+  decisions: "decisions",
+  deliverables: "deliverables",
+  vectors: "search vectors",
+};
+
+/** "behind the database · rebuilt in full 7 h ago · topics 7 h behind, 2 to
+ *  catch up". Undefined when doctor sent no block. */
+export function hubSnapshotDetail(block: HubSnapshotBlock | undefined): string | undefined {
+  if (!block || typeof block !== "object") return undefined;
+  const parts: string[] = [];
+  const state = block.state ?? "";
+  if (SNAPSHOT_STATE_WORDS[state]) parts.push(SNAPSHOT_STATE_WORDS[state]);
+  if (block.age_seconds != null) parts.push(`rebuilt in full ${fmtAge(block.age_seconds)} ago`);
+  if (block.reason === "snapshot_refresh_failed" && block.refresh_error?.error) {
+    parts.push(`the last rebuild failed: ${block.refresh_error.error}`);
+  }
+  const lagging: string[] = [];
+  const unmeasured: string[] = [];
+  for (const [name, t] of Object.entries(block.tables ?? {})) {
+    if (!t || typeof t !== "object") continue;
+    const words = SNAPSHOT_TABLE_WORDS[name] ?? name;
+    if (t.error) {
+      unmeasured.push(words);
+      continue;
+    }
+    const missing = typeof t.missing === "number" ? t.missing : 0;
+    if (missing > 0) {
+      const more = t.truncated ? " or more" : "";
+      lagging.push(`${words} ${fmtAge(t.lag_seconds ?? 0)} behind, ${missing}${more} to catch up`);
+    } else if (t.truncated) {
+      lagging.push(`${words} too many changes to compare`);
+    }
+  }
+  parts.push(...lagging);
+  if (unmeasured.length) parts.push(`could not compare ${unmeasured.join(", ")}`);
+  if (state === "fresh" && !lagging.length) parts.push("every kind of change in step");
+  const last = block.last_known;
+  if (state === "unknown" && last?.measured_at) {
+    const ago = fmtAgeSince(last.measured_at);
+    const was = SNAPSHOT_STATE_WORDS[last.state ?? ""];
+    if (ago && was) parts.push(`${ago} ago it was ${was}`);
+  }
+  return parts.length ? parts.join(" · ") : undefined;
+}
+
 function detailFor(key: string, parsed: Record<string, unknown>): string | undefined {
+  if (key === "hub_snapshot_ok") return hubSnapshotDetail(parsed.hub_snapshot as HubSnapshotBlock | undefined);
   if (key === "synth_provider_ok") return synthProviderDetail(parsed.synth_provider as DoctorSynthProvider | undefined);
   if (key === "synth_budget_ok") return synthBudgetDetail(parsed.synth_budget as SynthBudget | undefined);
   return undefined;

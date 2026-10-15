@@ -403,6 +403,15 @@ def status_payload(
                 notes_freshness_block = notes_freshness(cur)
             except Exception as exc:  # noqa: BLE001 — status must stay resilient
                 notes_freshness_block = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            # Replica freshness phase 1: the local replica against the hub,
+            # table by table, on this same connection. Read-only; callers
+            # hand it to hub_snapshot.snapshot_freshness(lag=...).
+            try:
+                from khipu.hub_snapshot import measure_lag
+
+                replica_lag = measure_lag(cur)
+            except Exception as exc:  # noqa: BLE001 — status must stay resilient
+                replica_lag = {"measured": False, "reason": f"{type(exc).__name__}: {exc}"[:300]}
     latest_capture_ts, latest_capture_ingested_at = (
         latest_capture_row if latest_capture_row is not None else (None, None)
     )
@@ -421,6 +430,7 @@ def status_payload(
         "dsn_ok": True,
         "dsn_source": _dsn_source(),
         "notes_freshness": notes_freshness_block,
+        "replica_lag": replica_lag,
     }
     try:
         from khipu.activity import recent_episodes
