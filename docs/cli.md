@@ -29,7 +29,7 @@ There are 57 top-level commands. The sections below cover all of them.
 
 `doctor` flags:
 
-- `--quick`: checks imports, config, secret presence, jobs and the summariser only. No hub, no network. It is the first step of the promotion gate.
+- `--quick`: runs all the local health checks (imports, config, outbox, capture liveness, jobs, backups, launchers and the rest) and leaves out the hub, network and probe checks. It is the first step of the promotion gate.
 - `--probe`: runs a fresh end-to-end recall probe. It writes a nonce episode, then soft-deletes it.
 - `--sample N`: caps the topic drift pass.
 - `--harness`: the harness label the probe records (default `$KHIPU_HARNESS`, or `doctor`).
@@ -196,7 +196,7 @@ Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `-
 | `grok-bot-config` | Prints the account-level cloud-agent config and the secret name to add. |
 
 - Harness choices for `integrations`: `all`, `claude_code`, `cursor`, `aegis`, `codex`, `grok_bot`. Flags: `--dry-run`, `--home`, `--project`, `--no-verify`. There is no top-level `install` command.
-- `sessions status` takes `--harness all|claude_code|cursor|codex|aegis`. `sessions liveness` exits 2 if any harness has not been recorded. `drain` and `sweep` take `--limit` and `--dry-run`.
+- `sessions status` takes `--harness all|claude_code|cursor|codex|aegis`. `sessions liveness` exits 2 if any harness's capture is failing (its last hook run errored, its last capture failed with nothing landed since, a job has waited too long, or turns keep arriving without a capture). A harness that has never run the hook counts as healthy. `drain` and `sweep` take `--limit` and `--dry-run`.
 - `gateway token set` reads the token from stdin, or from an environment variable with `--from-env [VAR]` (default `KHIPU_GATEWAY_TOKEN`). It never prints the token.
 
 ## Jobs, releases and maintenance

@@ -79,7 +79,7 @@ The summariser is the `synth` role. Gemini (`gemini-2.5-flash`) is the default. 
 
 Use `khipu models show` and `khipu models set --role synth --provider ...`. API keys live in the Keychain. If another provider fails, `synth_fallback` can retry once on Gemini.
 
-Transcript windows go to whichever provider you configure. Choose with that in mind.
+Transcript windows go to whichever provider you configure. One default to know: when a provider other than Gemini, `cloud` or `local` fails a window (an account limit, not logged in, a transport error, or a reply that is not capture JSON) and a Gemini key is configured, that window is retried once on Gemini Flash, so its text goes to Google. `synth_fallback` defaults to `gemini`; set it to `none` (`khipu config --set synth_fallback none`, or the fallback setting in the app) to leave the job queued instead.
 
 ### Two queues, two meanings
 
@@ -287,7 +287,7 @@ Briefs are off by default. Turn on the `briefs` switch, then use `khipu briefs p
 
 ### Forget
 
-`khipu episode forget ID` removes one episode completely. It sets the tombstone, removes the vectors, closes commitments it opened, retracts its decisions, deletes its deliverables, removes the legacy file lines and backups, updates the local replica, and marks briefs that cited it stale. Graph topic nodes are left alone.
+`khipu episode forget ID` hides one episode from every reader. It does not erase the episode row: it sets a tombstone (`deleted_at`), so search, Activity and doctor skip it, but the summary and its provenance stay in the `episodes` table. It also removes the episode's vectors, closes the commitments it opened (reason `forgotten`; the closed rows stay), retracts its decisions, deletes its deliverables, removes its lines from the legacy file and Khipu's own forget backups, updates the local replica, and marks briefs that cited it stale. Graph topic nodes are shared across episodes and are left alone, and database backups made before the forget still contain it. The file, replica and outbox steps are best effort: if one fails, the result reports `complete: false` and lists what remains under `partial`.
 
 `khipu episode edit ID --summary "..."` corrects an episode and re-embeds it. `khipu topic purge SLUG --yes` hard-deletes a topic that is already tombstoned. In the app, use Activity.
 
@@ -352,7 +352,7 @@ Five integration packs exist (`claude_code`, `cursor`, `codex`, `aegis`, `grok_b
 
 Claude accounts run inside T3 Code are wired by the Claude Code install, one set of hooks per Claude home. Search can filter by T3 thread. Stock Grok Build has no pack of its own.
 
-The database is never exposed publicly. The gateway is the only door, and it enforces a bearer token, a request body cap, rate limits per address and per token, an auth-failure throttle, a JSON-RPC batch cap, and refusal of browser origins unless allowed. Over the gateway, `khipu_capture` writes immediately (there is no hook), and usage and routing answer "not available".
+Khipu never opens the database to the internet itself; keep it on a private network. The gateway is the only part meant to face the internet, and it enforces a bearer token, a request body cap, rate limits per address and per token, an auth-failure throttle, a JSON-RPC batch cap, and refusal of browser origins unless allowed. Over the gateway, `khipu_capture` writes immediately (there is no hook), and usage and routing answer "not available".
 
 Install and check a harness with `khipu integrations install <harness>` and `khipu integrations verify <harness>`. Verify exercises the integration. It does not just check that a file exists.
 
@@ -399,6 +399,6 @@ During the migration, memory exists as files and as database rows, so they can d
 | `khipu revisions` | Shows conflicting topic edits across machines. The newest edit wins and the older version is kept. |
 | `khipu sources` | Lists, enables, disables, adds and removes graph roots. `sources export` writes the file graphify reads. |
 
-`khipu doctor --quick` checks only local things (imports, config, secrets present, jobs, summariser) with no network. `khipu doctor --probe` runs a fresh end-to-end recall test.
+`khipu doctor --quick` runs all the local health checks (imports, config, outbox, capture liveness, jobs, backups, launchers and more) and leaves out the hub, network and probe checks. `khipu doctor --probe` runs a fresh end-to-end recall test.
 
 For the full list of checks, backups and the promotion gate, see [operations.md](operations.md). For common questions see [faq.md](faq.md).

@@ -5,18 +5,18 @@ Short answers to the questions people ask most. Each links to the page with the 
 ## Privacy and data
 
 **Does Khipu send my code or conversations anywhere?**
-Only to your own PostgreSQL server and the model providers you configure.
+Memory goes to your own PostgreSQL server, and text goes to the model providers you configure:
 
-- Summaries: transcript windows go to the summariser provider you pick, in parts of at most 14,000 characters. The default is Google Gemini. You can switch to Anthropic, OpenAI, OpenRouter, or a local OpenAI-compatible endpoint. You can also use the `claude` or `codex` CLI on your own login, in which case Khipu holds no credential.
+- Summaries: transcript windows go to the summariser provider you pick, in parts of at most 14,000 characters. The default is Google Gemini. You can switch to Anthropic, OpenAI, OpenRouter, or a local OpenAI-compatible endpoint. You can also use the `claude` or `codex` CLI on your own login, in which case Khipu holds no credential. By default, if a provider other than Gemini or local fails a window and a Gemini key is configured, that window is retried once on Gemini Flash. Set `synth_fallback` to `none` to turn that off.
 - Embeddings: memory chunks and search queries go to the embedding provider of the active profile. That can be Google Gemini, Voyage, or an OpenAI-compatible endpoint, local or remote.
 
-Nothing goes to the maintainer. There is no telemetry.
+There is no telemetry. The app checks GitHub Releases for updates. Something reaches the maintainer only when you send it from the app's feedback form: your message, reply-to email, app version, macOS version and any files you attach.
 
 **Is my memory locked in?**
 No. It is ordinary tables in your own PostgreSQL, such as `episodes`, `topics`, `nodes` and `edges`. `khipu regen-memory` can write topics back out as markdown (a `MEMORY.from-khipu.md` file) at any time. `khipu backup-local` zips the Mac-local data folder, and `khipu import-local` restores it.
 
 **Can I delete something Khipu remembered?**
-Yes. `khipu episode forget ID` removes an episode and its vectors. It also closes the commitments the episode opened, retracts its decisions, and updates the local offline copy. `khipu episode edit ID --summary "..."` corrects a summary and re-embeds it. `khipu topic purge SLUG --yes` hard-deletes a topic that is already tombstoned. In the desktop app, open a capture under Activity to correct or forget it. Agents can forget through the `forget` MCP tool. See [mcp-tools.md](mcp-tools.md).
+Partly. `khipu episode forget ID` hides an episode from search, Activity and every agent tool, but it tombstones the row rather than erasing it: the summary and its provenance stay in your database, and database backups made earlier still hold it. It removes the episode's vectors, closes the commitments it opened, retracts its decisions, and updates the local offline copy. File, replica and outbox cleanup is best effort, and the result says `complete: false` and lists what remains if a step fails. `khipu episode edit ID --summary "..."` corrects a summary and re-embeds it. `khipu topic purge SLUG --yes` hard-deletes a topic that is already tombstoned. In the desktop app, open a capture under Activity to correct or forget it. Agents can forget through the `forget` MCP tool. See [mcp-tools.md](mcp-tools.md).
 
 ## Database
 

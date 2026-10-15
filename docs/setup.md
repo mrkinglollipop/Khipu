@@ -115,7 +115,7 @@ khipu integrations install claude_code     # or cursor, codex, aegis, grok_bot, 
 khipu integrations verify  claude_code     # proves it by exercising it
 ```
 
-Then `khipu doctor` should be green. Anything it could not check is named under `not_configured`, which is normal on a fresh install. `khipu doctor --quick` checks only imports, config, secrets, jobs and the summariser, with no network.
+Then `khipu doctor` should be green. Anything it could not check is named under `not_configured`, which is normal on a fresh install. `khipu doctor --quick` runs all the local health checks and leaves out the hub, network and probe checks.
 
 To run the database setup pipeline from the CLI, use `khipu db connect` (flags: `--dsn`, `--use-stored`, `--root-crt`, `--no-jobs`, `--no-prove`). `khipu db preflight --dsn DSN` runs only the checks: it does not store the connection, install jobs or run the round trip, but it may still update the server's schema and privileges.
 

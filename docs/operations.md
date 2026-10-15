@@ -33,7 +33,7 @@ The desktop app lists the jobs under Settings, Advanced.
 
 ```bash
 khipu doctor            # full check
-khipu doctor --quick    # imports, config, secrets presence, jobs, summariser only; no hub, no network
+khipu doctor --quick    # all local health checks; leaves out hub, network and probe checks
 khipu doctor --probe    # also runs a fresh end-to-end recall probe (writes, then soft-deletes, a test episode)
 khipu doctor --sample N # cap the topic drift pass
 ```
@@ -93,7 +93,7 @@ What it is:
 - It serves the same tools as the local MCP server, with exceptions: `khipu_usage` and the routing tools (`khipu_route`, `khipu_route_report`, `khipu_route_rule`, `khipu_route_priority`) answer `available: false` through it, and `khipu_forget` only forgets episodes captured by cloud harnesses. Capture is accepted only in `hub` mode. See [mcp-tools.md](mcp-tools.md).
 - For library search the gateway host also needs the embedding key of every enabled library profile. A missing key drops that library's meaning leg and reports `degraded_legs`. It does not fail the search.
 
-The database is never exposed. The gateway is the only door.
+Khipu never opens the database to the internet itself; keep it on a private network. The gateway is the only part meant to face the internet.
 
 ### Run it
 

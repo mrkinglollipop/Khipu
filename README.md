@@ -82,7 +82,7 @@ For contributors: [CONTRIBUTING.md](CONTRIBUTING.md). Package READMEs: [packages
 
 ## Support
 
-Email [support@kinglollipop.com](mailto:support@kinglollipop.com) for help, questions or a commercial licence conversation. If something is broken, include the output of `khipu doctor` (it never contains secrets) and which agent you were using. Bugs and feature requests are welcome as GitHub issues. Report security problems by email or through [GitHub's private advisory form](https://github.com/mrkinglollipop/Khipu/security/advisories/new), not a public issue.
+Email [support@kinglollipop.com](mailto:support@kinglollipop.com) for help, questions or a commercial licence conversation. If something is broken, include the output of `khipu doctor` and which agent you were using. Read it before you send it: doctor output includes recent capture summaries, paths and error text, and it is not redacted, so remove anything private. Bugs and feature requests are welcome as GitHub issues. Report security problems by email or through [GitHub's private advisory form](https://github.com/mrkinglollipop/Khipu/security/advisories/new), not a public issue.
 
 ## Licence
 

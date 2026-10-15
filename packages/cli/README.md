@@ -78,7 +78,7 @@ Capture is driven by the Stop, PreCompact and SessionEnd hooks (`bin/khipu-stop-
 
 - `legacy`: files only.
 - `dual` (default): files and the database.
-- `hub`: the database only.
+- `hub`: the database is the record. By default Khipu still mirrors each capture to the legacy files; set `KHIPU_HUB_FILE_MIRROR=0` to turn the mirror off.
 
 Change it with `python3 -m khipu config --set-capture-mode dual` or in the desktop app under Settings, Capture & models. The app control is locked when `KHIPU_CAPTURE_MODE` is set.
 
