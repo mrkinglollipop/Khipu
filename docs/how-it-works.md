@@ -205,7 +205,7 @@ Topics and episodes are never silently dropped. Both carry a `deleted_at` column
 Hooks put prior work in front of the agent before it acts.
 
 - **Session start** (Claude Code, Codex, Cursor): the recall rule plus a slice scoped to the current project (open commitments, recent episodes, linked topics), plus, when the `routing_push` switch is on (it is off by default), the routing summary. See [routing.md](routing.md). The slice also lists standing decisions from the last 14 days.
-- **Every prompt** (Claude Code and Codex): a bounded search on the prompt itself. It pushes at most three hits under a "Prior work on this topic" heading, capped at 600 characters. It has a 1.2 second budget, skips trivial prompts, skips hits already shown in the last three prompts, and never calls a model. It reads the local replica first and does not search libraries. If anything fails it returns nothing.
+- **Every prompt** (Claude Code and Codex): a bounded search on the prompt itself. It pushes at most three hits under a "Prior work on this topic" heading, capped at 600 characters. It has a 1.2 second budget, skips trivial prompts, and skips hits already shown in the last three prompts. It calls no summariser or chat model. When an embedding profile is active and the prompt's vector is not already cached, it makes one embedding call (secrets masked first), so the prompt text goes to that profile's embedding provider. It reads the local replica first and does not search libraries. If anything fails it returns nothing.
 - **Aegis** gets no push. Its hooks run as observers and their output is discarded. Aegis agents pull with `khipu_status` and `khipu_owed`.
 - **Cursor** gets the session-start push and a project rule file, but no per-prompt hook.
 

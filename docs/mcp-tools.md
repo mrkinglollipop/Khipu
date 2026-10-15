@@ -9,7 +9,7 @@ The tool list is returned verbatim by the server's `tools/list`. This page group
 - **Locally (stdio).** The launcher is `packages/cli/bin/khipu-mcp`. `khipu integrations install` writes it into each harness's MCP config. See [Integrations](integrations.md).
 - **Over HTTPS (the gateway).** The gateway serves the same tool list. A few tools answer differently there:
   - The five routing tools (`khipu_usage`, `khipu_route`, `khipu_route_report`, `khipu_route_rule`, `khipu_route_priority`) and the `routing` field of `khipu_status` reply `{available: false, reason}`. They are local only.
-  - `khipu_forget` only forgets episodes captured by cloud harnesses.
+  - `khipu_forget` refuses only episodes whose session id starts with a local harness name (`claude_code`, `cursor`, `codex` or `aegis`); any other episode, including one with no session id, can be forgotten through it, because the gateway does not check that the episode came from a cloud harness. A stricter check is planned.
   - `khipu_capture` writes immediately (see below).
 - **Features that are off.** `khipu_brief` and `khipu_reflect` reply `{available: false}` while their feature switches are off. Both default to off. `khipu features` shows the switches.
 
@@ -108,7 +108,7 @@ Behaviour depends on where it runs:
 
 ### khipu_forget
 
-Tombstone one episode. Parameter: `id` (required). The row is not erased: its summary and provenance stay in the database. Search and `khipu_get` skip it, but today the recent-capture lists (Activity, doctor, status, the full `khipu_status` and the session-start fallback) can still show it; a fix is planned. Its vectors and legacy file lines are removed, the commitments it opened are closed (the closed rows stay) and its decisions are retracted. Graph topic nodes and earlier database backups are not touched. The legacy file and replica steps can fail, and outbox jobs for the session are reported, not removed; either returns `complete: false` with the remaining stores in `partial`. Use it for a wrong capture or a test. Over the gateway it only works on episodes from cloud harnesses.
+Tombstone one episode. Parameter: `id` (required). The row is not erased: its summary and provenance stay in the database. Search and `khipu_get` skip it, but today the recent-capture lists (Activity, doctor, status, the full `khipu_status` and the session-start fallback) can still show it; a fix is planned. Its vectors and legacy file lines are removed, the commitments it opened are closed (the closed rows stay) and its decisions are retracted. Graph topic nodes and earlier database backups are not touched. The legacy file and replica steps can fail, and outbox jobs for the session are reported, not removed; either returns `complete: false` with the remaining stores in `partial`. Use it for a wrong capture or a test. Over the gateway it refuses only episodes whose session id starts with a local harness name (`claude_code`, `cursor`, `codex` or `aegis`); any other episode, including one with no session id, can be forgotten through it, because the gateway does not check that the episode came from a cloud harness. A stricter check is planned.
 
 ## Commitments and decisions
 

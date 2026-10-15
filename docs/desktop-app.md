@@ -76,7 +76,7 @@ A snoozed item does not go stale while the snooze lasts.
 Every capture, newest first, grouped by day. Open one to read it. Two owner actions are on each episode:
 
 - **Edit summary.** Corrects the text. Khipu re-embeds it so search follows the fix.
-- **Forget.** Removes it from memory. A confirmation dialog comes first. (An episode opened in Recall has the same Forget button.)
+- **Forget.** Tombstones the episode: search and agent tools stop returning it, but its row stays in the database and, today, it can still appear in the Activity list (a fix is planned). See [how-it-works.md](how-it-works.md#forget). A confirmation dialog comes first. (An episode opened in Recall has the same Forget button.)
 
 ## Harnesses
 
