@@ -1,0 +1,130 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Khipu Work mock</title><link rel="stylesheet" href="App.css"><link rel="stylesheet" href="mock.css"></head>
+<body><div id="root"><div class="shell">
+<nav class="rail" aria-label="Primary"><div class="rail-drag"></div>
+<div class="brand"><img class="brand-icon" src="../../../apps/desktop/src/assets/khipu-icon.png" width="26" height="26" alt=""><span class="brand-name">Khipu</span></div>
+<div class="rail-nav"><div class="nav-group">
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 8 4l5 4.5V13H3z"/></svg><span class="nav-label">Home</span></button>
+<button type="button" class="nav active" aria-current="page"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M6 3v10M10 3v10"/></svg><span class="nav-label">Work</span><span class="nav-badge" aria-label="12 waiting on you, some blocking"><span class="bdot" aria-hidden="true"></span>12</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4"/><path d="m10 10 3.5 3.5"/></svg><span class="nav-label">Recall</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h10M3 8h7M3 12h5"/><path d="m11 11 1.5 1.5L15 10"/></svg><span class="nav-label">Owed</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></svg><span class="nav-label">Activity</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v3M11 3v3M3 6h10v3a5 5 0 0 1-10 0z"/><path d="M8 11v3"/></svg><span class="nav-label">Harnesses</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h10M3 11h10"/><circle cx="6" cy="5" r="1.5"/><circle cx="10" cy="11" r="1.5"/></svg><span class="nav-label">Settings</span></button>
+</div></div>
+<div class="rail-foot"><div class="rail-health"><span class="hdot ok" aria-hidden="true"></span><span>All harnesses recording</span></div>
+<div class="rail-meta"><button type="button" class="rail-feedback">Feedback</button><span class="version-chip">v0.4.15</span></div></div></nav>
+<main class="main"><section class="panel">
+<header class="panel-head"><div class="panel-head-text"><h1>Work</h1><p class="lede">What is done, what is running, and what is waiting on you</p></div><div class="panel-head-actions"><span class="meta">Updated 3 s ago</span></div></header>
+<div class="panel-body wide">
+
+<div class="card">
+<div class="card-head"><h2 class="wk-head">Waiting on you</h2><span class="meta">&nbsp;23 across 5 projects · 3 blocking</span><span class="spacer"></span></div>
+<div class="wk-filters"><div class="seg" role="group" aria-label="Show"><button type="button" class="on" aria-pressed="true">All 23</button><button type="button" aria-pressed="false">Blocking 3</button><button type="button" aria-pressed="false">Atlas 9</button><button type="button" aria-pressed="false">Harbor 6</button><button type="button" aria-pressed="false">Lumen 4</button><button type="button" aria-pressed="false">Quarry 2</button><button type="button" aria-pressed="false">Khipu 2</button></div></div>
+<div role="list" aria-label="Waiting on you">
+<div class="row wk-wait" role="listitem"><span class="wk-wait-main"><span class="wk-wait-line"><span class="tag err">Blocking</span><span class="wk-wait-text">Choose the sign-in provider for the tester build</span></span><span class="wk-wait-sub"><span>Atlas</span><span>·</span><span>Ledger: needs you</span><span>·</span><span>3 slices wait on this</span></span></span><span class="wk-age long">2 days</span><span class="wk-acts"><button type="button" class="sm primary">Answered…</button><button type="button" class="sm">Open in ledger</button></span></div>
+<div class="row wk-wait" role="listitem"><span class="wk-wait-main"><span class="wk-wait-line"><span class="tag err">Blocking</span><span class="wk-wait-text">Add the payment provider's test account to the staging settings</span></span><span class="wk-wait-sub"><span>Harbor</span><span>·</span><span>Owed: blocker</span></span></span><span class="wk-age long">3 days</span><span class="wk-acts"><button type="button" class="sm primary">Done</button><button type="button" class="sm">Snooze</button><button type="button" class="sm link">Open in Owed</button></span></div>
+<div class="row wk-wait" role="listitem"><span class="wk-wait-main"><span class="wk-wait-line"><span class="tag err">Blocking</span><span class="wk-wait-text">Approve shipping 2.4.0 to testers</span></span><span class="wk-wait-sub"><span>Atlas</span><span>·</span><span>Ledger: needs you</span><span>·</span><span>Train 2.4.0</span><span class="tag">Also in Owed</span></span></span><span class="wk-age">5 h</span><span class="wk-acts"><button type="button" class="sm primary">Done</button><button type="button" class="sm">Open link</button><button type="button" class="sm">Open in ledger</button></span></div>
+<div class="row wk-wait" role="listitem"><span class="wk-wait-main"><span class="wk-wait-line"><span class="wk-wait-text">Confirm a standing rule a conversation changed</span></span><span class="wk-wait-sub"><span>Khipu</span><span>·</span><span>Routing</span><span>·</span><span>Rule 9, changed by a Claude Code conversation in Harbor</span></span></span><span class="wk-age">1 h</span><span class="wk-acts"><button type="button" class="sm">Open Routing settings</button></span></div>
+<div class="row wk-wait" role="listitem"><span class="wk-wait-main"><span class="wk-wait-line"><span class="wk-wait-text">Keep the old export format for one more release?</span></span><span class="wk-wait-sub"><span>Harbor</span><span>·</span><span>Owed: question</span><span>·</span><span>Looks like “Decide on the export format” in the ledger</span><button type="button" class="sm link">These are the same</button><button type="button" class="sm link">Not the same</button></span></span><span class="wk-age">1 day</span><span class="wk-acts"><button type="button" class="sm primary">Done</button><button type="button" class="sm">Snooze</button><button type="button" class="sm link">Open in Owed</button></span></div>
+<div class="row wk-wait" role="listitem"><span class="wk-wait-main"><span class="wk-wait-line"><span class="wk-wait-text">Pick the name for the 1.0 release</span></span><span class="wk-wait-sub"><span>Lumen</span><span>·</span><span>Ledger: needs you</span></span></span><span class="wk-age">1 day</span><span class="wk-acts"><button type="button" class="sm primary">Answered…</button><button type="button" class="sm">Open in ledger</button></span></div>
+<div class="row wk-wait" role="listitem"><span class="wk-wait-main"><span class="wk-wait-line"><span class="wk-wait-text">Renew the test device profile before it runs out on Monday</span></span><span class="wk-wait-sub"><span>Quarry</span><span>·</span><span>Ledger: needs you</span><span>·</span><span>Owner: the Quarry orchestrator</span></span></span><span class="wk-age">2 days</span><span class="wk-acts"><button type="button" class="sm primary">Done</button><button type="button" class="sm">Open in ledger</button></span></div>
+<div class="row wk-wait" role="listitem"><span class="wk-wait-main"><span class="wk-wait-line"><span class="wk-wait-text">Read the review of the welcome screen wording and say which version to keep</span></span><span class="wk-wait-sub"><span>Atlas</span><span>·</span><span>Ledger: needs you</span><span>·</span><span>Pull request 43</span></span></span><span class="wk-age">6 h</span><span class="wk-acts"><button type="button" class="sm primary">Answered…</button><button type="button" class="sm">Open link</button><button type="button" class="sm">Open in ledger</button></span></div>
+</div>
+<div class="row wk-more"><button type="button" class="sm" aria-expanded="false">Show all 23</button></div>
+</div>
+
+<div class="card">
+<div class="card-head"><h2 class="wk-head">Running now</h2><span class="meta">&nbsp;5 jobs in 3 projects</span></div>
+<div role="list" aria-label="Running jobs">
+<div class="row wk-job" role="listitem"><span class="wk-proj">Atlas</span><span class="wk-job-what"><span class="wk-job-title">Fixing the two review findings <span class="wk-for">· pull request 41</span></span></span><span class="wk-acct"><span class="hdot ok" aria-hidden="true"></span>Claude second · opus</span><span class="wk-dur">27 min</span><span class="wk-state"><span class="hdot run" aria-hidden="true"></span>Running</span>
+<ul class="wk-now" aria-label="What it says it is doing"><li><time>3:39 PM</time><span>Both findings reproduced in a test.</span></li><li><time>3:40 PM</time><span>Running the full test suite before pushing.</span></li></ul></div>
+<div class="row wk-job" role="listitem"><span class="wk-proj">Atlas</span><span class="wk-job-what"><span class="wk-job-title">Checking the welcome screen wording <span class="wk-for">· pull request 43</span></span></span><span class="wk-acct"><span class="hdot ok" aria-hidden="true"></span>Codex · gpt-6.1-sol</span><span class="wk-dur">9 min</span><span class="wk-state"><span class="hdot run" aria-hidden="true"></span>Running</span>
+<ul class="wk-now" aria-label="What it says it is doing"><li><time>3:38 PM</time><span>Comparing the new text against the style rules; two lines are long.</span></li></ul></div>
+<div class="row wk-job" role="listitem"><span class="wk-proj">Harbor</span><span class="wk-job-what"><span class="wk-job-title">Export keeps each user's time zone <span class="wk-for">· ledger s-12</span></span></span><span class="wk-acct"><span class="hdot ok" aria-hidden="true"></span>Claude second · sonnet</span><span class="wk-dur">41 min</span><span class="wk-state"><span class="hdot run" aria-hidden="true"></span>Running</span>
+<span class="wk-quiet">No word from this job for 18 min</span></div>
+<div class="row wk-job" role="listitem"><span class="wk-proj">Harbor</span><span class="wk-job-what"><span class="wk-job-title">Second check of the retry fix <span class="wk-for">· pull request 112</span></span></span><span class="wk-acct"><span class="hdot warn" aria-hidden="true"></span>Muse · limit until Sat</span><span class="wk-dur">12 min</span><span class="wk-state"><span class="hdot idle" aria-hidden="true"></span>Waiting to start</span></div>
+<div class="row wk-job" role="listitem"><span class="wk-proj">Quarry</span><span class="wk-job-what"><span class="wk-job-title">Checking the import screen <span class="wk-for">· pull request 7</span> <span class="tag warn">as of 3:17 PM</span></span></span><span class="wk-acct"><span class="hdot ok" aria-hidden="true"></span>Codex · gpt-6.1-sol</span><span class="wk-dur">33 min</span><span class="wk-state"><span class="hdot run" aria-hidden="true"></span>Running</span></div>
+</div>
+</div>
+
+<div class="card routing-card">
+<div class="card-head"><h2 class="wk-head">Accounts</h2><span class="spacer"></span><button type="button" class="sm link">Routing settings</button></div>
+<div role="list" aria-label="Accounts">
+<div class="row route-row" role="listitem"><span class="ellip">Claude main</span><span class="route-state"><span class="hdot ok" aria-hidden="true"></span>Open</span><span class="route-src">Read from Claude 6 min ago · 41% of its five hours used</span></div>
+<div class="row route-row" role="listitem"><span class="ellip">Claude second</span><span class="route-state"><span class="hdot ok" aria-hidden="true"></span>Open</span><span class="route-src">Reported by your Atlas job runner 2 min ago</span></div>
+<div class="row route-row" role="listitem"><span class="ellip">Codex</span><span class="route-state"><span class="hdot ok" aria-hidden="true"></span>Open</span><span class="route-src">Read from Codex 6 min ago · 22% of its week used</span></div>
+<div class="row route-row" role="listitem"><span class="ellip">Grok Build</span><span class="route-state"><span class="hdot" aria-hidden="true"></span>Paused by you until Wed 5:26 PM</span><span class="route-src">Set by you yesterday at 2:20 PM</span></div>
+<div class="row route-row" role="listitem"><span class="ellip">Muse</span><span class="route-state"><span class="hdot warn" aria-hidden="true"></span>Limit reached, back Sat 8:00 PM</span><span class="route-src">Reported by a Claude Code conversation in Harbor at 11:05 AM · can't be checked without using a turn</span></div>
+</div>
+</div>
+
+<div class="wk-boards">
+
+<div class="card wk-board">
+<div class="card-head"><h2 class="wk-head">Atlas</h2><span class="meta">&nbsp;· 2 running · 1 flagged · 9 waiting on you</span><span class="spacer"></span><button type="button" class="sm">Open the ledger</button></div>
+<div class="wk-src"><span class="hdot ok" aria-hidden="true"></span><span>Updated 12 s ago by your Atlas job runner</span></div>
+<div class="wk-sec">GOALS</div>
+<div class="row wk-goal"><span class="wk-goal-title">Sign-in rework</span><span class="wk-bar" role="img" aria-label="4 verified, 1 merged, 1 built, 1 in progress"><i class="b-ver" style="width:57%"></i><i class="b-mer" style="width:14%"></i><i class="b-bui" style="width:15%"></i><i class="b-fly" style="width:14%"></i></span><span class="wk-goal-n">4 of 7 verified</span></div>
+<div class="row wk-goal"><span class="wk-goal-title">Tester build 2.4.0</span><span class="wk-bar" role="img" aria-label="2 verified, 1 needs you, 2 queued"><i class="b-ver" style="width:40%"></i><i class="b-need" style="width:20%"></i></span><span class="wk-goal-n">2 of 5 verified · 1 needs you</span></div>
+<div class="wk-sec">LOOSE ENDS</div>
+<div class="wk-loose"><span><b>3</b> in progress</span><span><b>2</b> built, not merged</span><span><b>4</b> merged, not verified</span><span><b>6</b> queued</span><span class="t2">Oldest: “Clean up the old settings screen”, no change for 9 days</span></div>
+<div class="wk-sec">PULL REQUESTS</div>
+<div role="list" aria-label="Atlas pull requests">
+<div class="row wk-pr" role="listitem"><span class="wk-pr-n">43</span><span class="wk-pr-title">Welcome screen wording</span><span class="tag">Being checked</span></div>
+<div class="row wk-pr flagged" role="listitem"><span class="wk-pr-n">41</span><span class="wk-pr-title">Sign-in screen remembers the last account</span><span class="tag warn">Flagged · being fixed</span><span class="wk-pr-verdict"><b>Codex, 3:10 PM:</b> Two findings: the error text is cut off on small screens; one test is missing.</span></div>
+<div class="row wk-pr" role="listitem"><span class="wk-pr-n">39</span><span class="wk-pr-title">Faster first launch</span><span class="tag ok">Cleared</span><span class="wk-pr-verdict"><b>Claude, 1:44 PM:</b> No findings. Launch time is down on every test device.</span></div>
+<div class="row wk-pr" role="listitem"><span class="wk-pr-n">38</span><span class="wk-pr-title">Offline banner</span><span class="tag ok">Merged</span><span class="wk-disagree">The runner says this merged; the ledger still says built, not merged.</span></div>
+</div>
+<div class="wk-sec">RELEASE TRAINS</div>
+<div class="row wk-train"><span class="wk-train-name">2.4.0</span><span class="tag">Testing</span>
+<ul class="wk-runs" aria-label="Test runs"><li><span class="hdot ok" aria-hidden="true"></span>Unit tests passed</li><li><span class="hdot run" aria-hidden="true"></span>Device tests running</li><li><span class="hdot idle" aria-hidden="true"></span>Screenshots waiting</li></ul>
+<span class="wk-train-sum">Waiting for 41 before the device run can finish</span></div>
+<div class="wk-sec">MERGED THIS WEEK</div>
+<div class="row wk-merge"><span class="wk-pr-n">38</span><span class="t2 ellip">Offline banner</span><span class="meta">today 2:02 PM</span></div>
+<div class="row wk-merge"><span class="wk-pr-n">36</span><span class="t2 ellip">Settings search</span><span class="meta">Tue</span></div>
+</div>
+
+<div class="card wk-board">
+<div class="card-head"><h2 class="wk-head">Harbor</h2><span class="meta">&nbsp;· 1 running · 1 flagged · 6 waiting on you</span><span class="spacer"></span><button type="button" class="sm">Open the ledger</button></div>
+<div class="wk-src"><span class="hdot ok" aria-hidden="true"></span><span>Updated 8 s ago by your Harbor job runner</span></div>
+<div class="wk-sec">GOALS</div>
+<div class="row wk-goal"><span class="wk-goal-title">Export rework</span><span class="wk-bar" role="img" aria-label="1 verified, 1 in progress, 1 needs you, 1 not started"><i class="b-ver" style="width:25%"></i><i class="b-fly" style="width:25%"></i><i class="b-need" style="width:25%"></i></span><span class="wk-goal-n">1 of 4 verified · 1 needs you</span></div>
+<div class="wk-sec">LOOSE ENDS</div>
+<div class="wk-loose"><span><b>1</b> in progress</span><span><b>1</b> built, not merged</span><span><b>2</b> queued</span></div>
+<div class="wk-sec">PULL REQUESTS</div>
+<div role="list" aria-label="Harbor pull requests">
+<div class="row wk-pr flagged" role="listitem"><span class="wk-pr-n">112</span><span class="wk-pr-title">Retry failed uploads</span><span class="tag warn">Flagged · being fixed</span><span class="wk-pr-verdict"><b>Claude, 2:51 PM:</b> One finding: the retry loop never gives up when the server is down.</span></div>
+<div class="row wk-pr" role="listitem"><span class="wk-pr-n">110</span><span class="wk-pr-title">Export keeps each user's time zone</span><span class="tag">Built</span></div>
+</div>
+<div class="wk-sec">MERGED THIS WEEK</div>
+<div class="row wk-merge"><span class="wk-pr-n">108</span><span class="t2 ellip">Smaller nightly report</span><span class="meta">Mon</span></div>
+</div>
+
+<div class="card wk-board">
+<div class="card-head"><h2 class="wk-head">Quarry</h2><span class="meta">&nbsp;· 2 waiting on you</span><span class="spacer"></span><button type="button" class="sm">Open the ledger</button></div>
+<div class="wk-src warn"><span class="hdot warn" aria-hidden="true"></span><span>No update for 23 min; showing what it said at 3:17 PM.</span><span class="spacer"></span><button type="button" class="sm link">Why?</button></div>
+<div class="wk-sec">GOALS</div>
+<div class="row wk-goal"><span class="wk-goal-title">Import from spreadsheets</span><span class="wk-bar" role="img" aria-label="3 verified, 2 merged, 1 in progress"><i class="b-ver" style="width:50%"></i><i class="b-mer" style="width:33%"></i><i class="b-fly" style="width:17%"></i></span><span class="wk-goal-n">3 of 6 verified</span></div>
+<div class="wk-sec">PULL REQUESTS</div>
+<div class="row wk-pr" role="listitem"><span class="wk-pr-n">7</span><span class="wk-pr-title">Import screen</span><span class="tag">Being checked</span></div>
+</div>
+
+<div class="card wk-board">
+<div class="card-head"><h2 class="wk-head">Lumen</h2><span class="meta">&nbsp;· 4 waiting on you</span><span class="spacer"></span><button type="button" class="sm">Open the ledger</button></div>
+<div class="wk-src"><span class="hdot" aria-hidden="true"></span><span>No job runner reports for this project. The ledger is below.</span><span class="spacer"></span><button type="button" class="sm link">Add a summary file</button></div>
+<div class="wk-sec">GOALS</div>
+<div class="row wk-goal"><span class="wk-goal-title">1.0 release</span><span class="wk-bar" role="img" aria-label="5 verified, 1 needs you, 2 queued"><i class="b-ver" style="width:62%"></i><i class="b-need" style="width:13%"></i></span><span class="wk-goal-n">5 of 8 verified · 1 needs you</span></div>
+<div class="wk-sec">LOOSE ENDS</div>
+<div class="wk-loose"><span><b>2</b> queued</span><span><b>1</b> merged, not verified</span></div>
+</div>
+
+<div class="card wk-board folded">
+<div class="card-head"><h2 class="wk-head">Pebble</h2><span class="meta">&nbsp;· Nothing running, nothing waiting · 12 open rows in the ledger · updated 40 s ago</span><span class="spacer"></span><button type="button" class="sm" aria-expanded="false">Show</button></div>
+</div>
+
+</div>
+<p class="wk-foot">Khipu keeps your ledger and shows what your job runners report. It never starts, stops or moves work.</p>
+</div>
+
+</section></main></div></div></body></html>

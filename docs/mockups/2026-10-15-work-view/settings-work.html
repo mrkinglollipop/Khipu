@@ -1,0 +1,122 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Khipu Settings mock: Work</title><link rel="stylesheet" href="App.css"><link rel="stylesheet" href="mock.css"></head>
+<body><div id="root"><div class="shell">
+<nav class="rail" aria-label="Primary"><div class="rail-drag"></div>
+<div class="brand"><img class="brand-icon" src="../../../apps/desktop/src/assets/khipu-icon.png" width="26" height="26" alt=""><span class="brand-name">Khipu</span></div>
+<div class="rail-nav"><div class="nav-group">
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 8 4l5 4.5V13H3z"/></svg><span class="nav-label">Home</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M6 3v10M10 3v10"/></svg><span class="nav-label">Work</span><span class="nav-badge" aria-label="12 waiting on you, some blocking"><span class="bdot" aria-hidden="true"></span>12</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4"/><path d="m10 10 3.5 3.5"/></svg><span class="nav-label">Recall</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h10M3 8h7M3 12h5"/><path d="m11 11 1.5 1.5L15 10"/></svg><span class="nav-label">Owed</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></svg><span class="nav-label">Activity</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v3M11 3v3M3 6h10v3a5 5 0 0 1-10 0z"/><path d="M8 11v3"/></svg><span class="nav-label">Harnesses</span></button>
+<button type="button" class="nav active" aria-current="page"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h10M3 11h10"/><circle cx="6" cy="5" r="1.5"/><circle cx="10" cy="11" r="1.5"/></svg><span class="nav-label">Settings</span></button>
+</div></div>
+<div class="rail-foot"><div class="rail-health"><span class="hdot ok" aria-hidden="true"></span><span>All harnesses recording</span></div>
+<div class="rail-meta"><button type="button" class="rail-feedback">Feedback</button><span class="version-chip">v0.4.15</span></div></div></nav>
+<main class="main"><section class="panel">
+<header class="panel-head"><div class="panel-head-text"><h1>Settings</h1><p class="lede">Capture, models, data and this Mac.</p></div></header>
+<div class="panel-body wide settings-body">
+<div class="settings-split">
+<div class="subnav" role="tablist" aria-label="Settings sections">
+<button type="button" role="tab" aria-selected="false">Database</button>
+<button type="button" role="tab" aria-selected="false">Capture & models</button>
+<button type="button" role="tab" aria-selected="false">Routing</button>
+<button type="button" role="tab" aria-selected="true" class="on">Work</button>
+<button type="button" role="tab" aria-selected="false">Optional features</button>
+<button type="button" role="tab" aria-selected="false">Embeddings</button>
+<button type="button" role="tab" aria-selected="false">Data & backups</button>
+<button type="button" role="tab" aria-selected="false">Another Mac</button>
+<button type="button" role="tab" aria-selected="false">Components</button>
+<button type="button" role="tab" aria-selected="false">Updates</button>
+<button type="button" role="tab" aria-selected="false">Advanced</button>
+</div>
+<div class="settings-pane">
+<p class="set-help set-intro">Work keeps the ledger of what is done and what is not in each project, and shows what your job runners report. Conversations write the ledger through Khipu and you can change any row. Khipu never starts, stops or moves work.</p>
+
+<div class="section-card">
+<div class="section-head">Projects in the ledger</div>
+<div class="section-body">
+<div class="rows" role="list" aria-label="Ledger projects">
+<div class="row-item wk-proj-row" role="listitem"><span class="wk-proj-name">Atlas</span><span class="wk-proj-what"><span>1,120 rows · 19 open · 9 need you</span><span class="set-help">Imported from a tracker on Monday; the old file is watched for changes.</span></span><span class="wk-proj-acts"><button type="button" class="sm">Rename</button><button type="button" class="sm">Hide</button></span></div>
+<div class="row-item wk-proj-row" role="listitem"><span class="wk-proj-name">Harbor</span><span class="wk-proj-what"><span>680 rows · 6 open · 3 need you</span><span class="set-help">Imported from a tracker on Monday; the old file is watched for changes.</span></span><span class="wk-proj-acts"><button type="button" class="sm">Rename</button><button type="button" class="sm">Hide</button></span></div>
+<div class="row-item wk-proj-row" role="listitem"><span class="wk-proj-name">Lumen</span><span class="wk-proj-what"><span>48 rows · 3 open · 1 needs you</span><span class="set-help">Started in Khipu by a conversation on Oct 20.</span></span><span class="wk-proj-acts"><button type="button" class="sm">Rename</button><button type="button" class="sm">Hide</button></span></div>
+</div>
+<p class="set-help">A project appears when its first row is added. Rows are never deleted; Hide only takes a project off the Work tab.</p>
+</div></div>
+
+<div class="section-card">
+<div class="section-head">Import a tracker</div>
+<div class="section-body">
+<p class="set-help">Bring in a tracker you already keep. Khipu reads the file, never changes it, and keeps every row and every history entry.</p>
+<div class="wk-import" aria-label="Import preview">
+<div class="toolbar"><label for="imp-file">File</label><input id="imp-file" value="…/tracker/tracker.json" readonly><button type="button" class="sm">Choose file…</button></div>
+<div class="toolbar"><label for="imp-proj">Into project</label><select id="imp-proj"><option>Quarry (new)</option><option>Atlas</option><option>Harbor</option><option>Lumen</option></select></div>
+<div class="wk-found">Found 203 rows and 511 history entries. Nothing is written until you choose Import.</div>
+<table class="wk-count"><caption class="sr-only">What the file holds</caption>
+<thead><tr><th scope="col">In the file</th><th scope="col">Rows</th></tr></thead>
+<tbody><tr><td>Done</td><td>121</td></tr><tr><td>Merged, not verified</td><td>38</td></tr><tr><td>Verified</td><td>17</td></tr><tr><td>Queued</td><td>12</td></tr><tr><td>Needs you</td><td>9</td></tr><tr><td>Dropped</td><td>6</td></tr></tbody></table>
+<p class="set-help">2 rows name a parent that isn't in the file; they are kept and marked “Parent not found”. 1 row's evidence looks like a password; that part will be hidden in Khipu and stays only in the old file.</p>
+<div class="toolbar"><button type="button" class="sm primary">Import</button><button type="button" class="sm">Cancel</button></div>
+</div>
+<h3 class="sub-title">Last import</h3>
+<div class="wk-import">
+<div class="wk-found">Atlas: imported and checked on Monday at 8:40 AM. Every count matches and the file read back the same.</div>
+<table class="wk-count"><caption class="sr-only">Import check for Atlas</caption>
+<thead><tr><th scope="col">Checked</th><th scope="col">In the file</th><th scope="col">In Khipu</th><th scope="col">Result</th></tr></thead>
+<tbody><tr><td>Rows</td><td>1,120</td><td>1,120</td><td class="ok">Same</td></tr><tr><td>History entries</td><td>2,904</td><td>2,904</td><td class="ok">Same</td></tr><tr><td>Rows with a parent</td><td>214</td><td>214</td><td class="ok">Same</td></tr><tr><td>Rows in each state</td><td>9 states</td><td>9 states</td><td class="ok">Same</td></tr><tr><td>Read back, field by field</td><td colspan="2">1,120 rows</td><td class="ok">Same</td></tr></tbody></table>
+</div>
+<h3 class="sub-title">Old tracker files</h3>
+<div class="rows" role="list" aria-label="Old tracker files">
+<div class="row-item wk-proj-row" role="listitem"><span class="wk-proj-name">Atlas</span><span class="wk-proj-what"><span class="wk-path">…/atlas/tracker/tracker.json</span><span class="set-help"><span class="tag warn">Changed after import</span> 4 new history entries today at 1:20 PM</span></span><span class="wk-proj-acts"><button type="button" class="sm primary">Bring in the changes</button><button type="button" class="sm">Stop watching</button></span></div>
+<div class="row-item wk-proj-row" role="listitem"><span class="wk-proj-name">Harbor</span><span class="wk-proj-what"><span class="wk-path">…/harbor/tracker/tracker.json</span><span class="set-help">No change since the import</span></span><span class="wk-proj-acts"><button type="button" class="sm">Stop watching</button></span></div>
+</div>
+</div></div>
+
+<div class="section-card">
+<div class="section-head">Job runner summary files</div>
+<div class="section-body">
+<p class="set-help">Each project's job runner can write one small summary file. Khipu only reads it: what is running, pull requests and release trains.</p>
+<div class="rows" role="list" aria-label="Summary files">
+<div class="row-item wk-proj-row" role="listitem"><span class="wk-proj-name">Atlas</span><span class="wk-proj-what"><span class="wk-path">…/atlas-runner/state/work-summary.json</span><span class="set-help"><span class="hdot ok" aria-hidden="true"></span> Updated 12 s ago · 3 jobs, 12 pull requests, 1 release train</span></span><span class="wk-proj-acts"><button type="button" class="sm">Change file…</button><button type="button" class="sm">Turn off</button><button type="button" class="sm">Remove</button></span></div>
+<div class="row-item wk-proj-row" role="listitem"><span class="wk-proj-name">Harbor</span><span class="wk-proj-what"><span class="wk-path">…/harbor-runner/state/work-summary.json</span><span class="set-help"><span class="hdot ok" aria-hidden="true"></span> Updated 8 s ago · what jobs are doing is hidden</span></span><span class="wk-proj-acts"><button type="button" class="sm">Change file…</button><button type="button" class="sm">Turn off</button><button type="button" class="sm">Remove</button></span></div>
+<div class="row-item wk-proj-row" role="listitem"><span class="wk-proj-name">Quarry</span><span class="wk-proj-what"><span class="wk-path">…/quarry-runner/state/work-summary.json</span><span class="set-help"><span class="tag">Turned off</span></span></span><span class="wk-proj-acts"><button type="button" class="sm">Turn on</button><button type="button" class="sm">Remove</button></span></div>
+</div>
+<div class="opt-list">
+<div class="opt-row"><input id="now-atlas" class="switch" type="checkbox" role="switch" checked aria-describedby="now-what"><div class="opt-text"><div class="opt-title"><label class="opt-name" for="now-atlas">Show what Atlas jobs say they are doing</label></div><p id="now-what" class="opt-what">The last few lines a job wrote about its own progress, never its tool output. One switch per project.</p></div></div>
+</div>
+<div class="wk-add" aria-label="Add a summary file">
+<div class="toolbar"><label for="add-proj">Project</label><select id="add-proj"><option>Lumen</option><option>A new project…</option></select></div>
+<div class="toolbar"><label for="add-file">Summary file</label><input id="add-file" value="…/lumen-runner/state/work-summary.json"><button type="button" class="sm">Choose file…</button></div>
+<div class="wk-found">Found 1 job, 4 pull requests and no release trains, updated 6 s ago.</div>
+<div class="toolbar"><button type="button" class="sm primary">Add</button><button type="button" class="sm">Cancel</button></div>
+</div>
+<p class="set-help">Suggested from your job runner folders: <button type="button" class="sm link">Add the Pebble runner</button></p>
+</div></div>
+
+<div class="section-card">
+<div class="section-head">Limits</div>
+<div class="section-body"><div class="rows" role="list" aria-label="Limits">
+<div class="row-item wk-limit" role="listitem"><span class="wk-limit-text"><span class="wk-limit-name">Largest summary file Khipu reads</span><span class="set-help">A bigger file is not read; the last good read shows.</span></span><span class="wk-val">256 KB</span><button type="button" class="sm" aria-label="Change the largest summary file">Change…</button></div>
+<div class="row-item wk-limit" role="listitem"><span class="wk-limit-text"><span class="wk-limit-name">Jobs, pull requests and trains shown per project</span><span class="set-help">The newest are kept, and the board says how many were left out.</span></span><span class="wk-val">50 · 200 · 20</span><button type="button" class="sm" aria-label="Change the counts shown per project">Change…</button></div>
+<div class="row-item wk-limit" role="listitem" style="flex-wrap:wrap"><span class="wk-limit-text"><span class="wk-limit-name">A summary is out of date after</span><span class="set-help">Automatic: five of the runner's own intervals, at least 2 minutes.</span></span><span class="wk-val">Automatic</span><button type="button" class="sm" aria-label="Change when a summary is out of date" aria-expanded="true">Change…</button>
+<div class="wk-add" style="grid-column:1/-1"><div class="toolbar"><label for="stale-v">Out of date after</label><select id="stale-v"><option>Automatic</option><option>2 minutes</option><option>10 minutes</option><option>1 hour</option><option>No limit</option></select><button type="button" class="sm primary">Save</button><button type="button" class="sm">Cancel</button></div></div></div>
+<div class="row-item wk-limit" role="listitem"><span class="wk-limit-text"><span class="wk-limit-name">A job is quiet after</span><span class="set-help">A running job with no word for this long says so.</span></span><span class="wk-val">15 minutes</span><button type="button" class="sm" aria-label="Change when a job is quiet">Change…</button></div>
+<div class="row-item wk-limit" role="listitem"><span class="wk-limit-text"><span class="wk-limit-name">A project has stopped reporting after</span><span class="set-help">Its board folds and its jobs leave Running now. Its ledger stays.</span></span><span class="wk-val">24 hours</span><button type="button" class="sm" aria-label="Change when a project has stopped reporting">Change…</button></div>
+<div class="row-item wk-limit" role="listitem"><span class="wk-limit-text"><span class="wk-limit-name">Longest ledger title</span><span class="set-help">A longer title is refused with its length, never cut.</span></span><span class="wk-val">2,000 characters</span><button type="button" class="sm" aria-label="Change the longest ledger title">Change…</button></div>
+<div class="row-item wk-limit" role="listitem"><span class="wk-limit-text"><span class="wk-limit-name">An open row has had no change after</span><span class="set-help">Shown as “No change for 9 days” on the row.</span></span><span class="wk-val">7 days</span><button type="button" class="sm" aria-label="Change when an open row has had no change">Change…</button></div>
+</div></div></div>
+
+<div class="section-card">
+<div class="section-head">Hidden from Waiting on you</div>
+<div class="section-body"><div class="rows" role="list" aria-label="Hidden items">
+<div class="row-item wk-hidden" role="listitem"><span><span class="row-main">Look at the nightly report size again next month</span> <span class="meta">Owed · Harbor · hidden yesterday</span></span><button type="button" class="sm">Unhide</button></div>
+</div>
+<p class="set-help">Only Owed items can be hidden; they come back by themselves when they change. Ledger rows are closed, not hidden.</p>
+</div></div>
+
+</div>
+</div>
+</div>
+
+</section></main></div></div></body></html>
