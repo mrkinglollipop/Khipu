@@ -1,6 +1,6 @@
 # Khipu
 
-![Khipu icon](apps/desktop/src/assets/khipu-icon.png)
+<img src="docs/assets/khipu-icon.png" alt="Khipu icon" width="160">
 
 **Khipu gives AI coding agents a memory that outlives the session.**
 

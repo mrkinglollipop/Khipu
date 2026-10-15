@@ -78,6 +78,7 @@ if not hasattr(_t3, 'cache_thread'):
     # deploy that added this name; t3 is stdlib-only, so reloading is safe.
     import importlib
     importlib.reload(_t3)
+from khipu.lines import split_lines
 from khipu.t3 import cache_thread, is_helper_session, strip_handoff
 
 HARNESSES = ("claude_code", "cursor", "codex", "aegis")
@@ -686,7 +687,7 @@ def land_transcript_images(
         source_roots.append(Path(raw).expanduser())
     allow_roots = _land_allow_roots(path, dest_root, source_roots)
     seen: set[str] = set()
-    for raw_line in data.decode("utf-8", "replace").splitlines():
+    for raw_line in split_lines(data):
         raw_line = raw_line.strip()
         if not raw_line:
             continue
@@ -2266,7 +2267,7 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         if job.get("part"):
             payload["part"] = job["part"]
         if dry_run:
-            print(json.dumps(payload, indent=2))
+            print(wire.dumps(payload, indent=2, ensure_ascii=True))
             out["captured"] += 1
             _release(jp)
             continue
@@ -2579,10 +2580,10 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "--drain":
         dry = (os.environ.get("KHIPU_CAPTURE_DRY") or os.environ.get("KHIPU_AEGIS_DRY")) == "1"
-        print(json.dumps(drain(dry_run=dry), indent=2))
+        print(wire.dumps(drain(dry_run=dry), indent=2, ensure_ascii=True))
         return 0
     if argv and argv[0] == "--status":
-        print(json.dumps(liveness_all(), indent=2))
+        print(wire.dumps(liveness_all(), indent=2, ensure_ascii=True))
         return 0
     harness = argv[1] if len(argv) >= 2 and argv[0] == "--harness" else None
     out = hook_main(wire.read_stdin(), harness)

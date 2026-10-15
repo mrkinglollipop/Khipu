@@ -204,8 +204,14 @@ class SocketPathTest(unittest.TestCase):
     def test_the_client_imports_only_the_standard_library(self) -> None:
         lines = CLIENT.read_text(encoding="utf-8").splitlines()
         imports = {ln.split()[1].split(".")[0] for ln in lines if ln.startswith("import ")}
-        self.assertLessEqual(imports, {"json", "os", "socket", "sys", "time"})
+        self.assertLessEqual(imports, {"importlib", "json", "os", "socket", "sys", "time"})
         self.assertEqual([ln for ln in lines if ln.startswith("from ")], [])
+        # The client loads khipu/wire.py by path for its stdout; it must stay
+        # stdlib-only too.
+        wire = (CLIENT.parent.parent / "khipu" / "wire.py").read_text(encoding="utf-8").splitlines()
+        self.assertLessEqual({ln.split()[1].split(".")[0] for ln in wire if ln.startswith("import ")},
+                             {"json", "math", "re", "sys"})
+        self.assertEqual([ln for ln in wire if ln.startswith("from ") and ln != "from __future__ import annotations"], [])
 
 
 class LauncherTest(unittest.TestCase):

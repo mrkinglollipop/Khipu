@@ -1,0 +1,88 @@
+/* Mock-only CSS for setup, What's new and polish (2026-10-15). Tokens and components come from App.css. */
+html,body{overflow:auto;height:auto}
+body.mockpage{padding:var(--s4) var(--s4) 48px;background:var(--bg)}
+.mockwrap{max-width:1280px;margin:0 auto}
+.mock-state{margin:var(--s5) 0 var(--s2);font-size:var(--t-xs);font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.mockwrap > .mock-state:first-child{margin-top:0}
+.mock-frame{position:relative;height:760px;border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;background:var(--bg)}
+.mock-frame.tall{height:900px}
+.mock-frame.short{height:600px}
+.mock-frame.setup{height:auto;min-height:800px;overflow:visible}
+.mock-frame.setup .shell{height:auto;min-height:800px}
+.mock-frame.setup .main{overflow:visible}
+.mock-frame.setup .onboard-wrap{min-height:calc(800px - 56px)}
+.mock-frame .shell{height:100%}
+.mock-frame .main{overflow:hidden}
+.mock-frame .rail-nav{overflow:hidden}
+.mock-frame .onboard-wrap{min-height:0}
+.plain-stage{display:flex;justify-content:center;padding:var(--s5) var(--s4);border:1px solid var(--border);border-radius:var(--r-lg);background:var(--bg)}
+.plain-stage .onboard{margin:0}
+.scrim{position:absolute;inset:0;background:var(--backdrop);display:flex;align-items:center;justify-content:center;padding:var(--s4)}
+.scrim dialog{position:static;display:block;margin:0}
+.scrim.solo{background:color-mix(in srgb,var(--text) 16%,var(--bg))}
+.post-update-dialog.wn-dialog{max-width:min(520px,calc(100vw - 32px))}
+.wn-sub{margin:2px 0 0;font-size:var(--t-sm)}
+.wn-list{list-style:none;margin:0;padding:0;border:1px solid var(--border);border-radius:var(--r-sm)}
+.wn-item{display:flex;align-items:center;gap:var(--s3);padding:var(--s2) var(--s3);border-bottom:1px solid var(--border)}
+.wn-item:last-child{border-bottom:0}
+.wn-text{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1;font-size:var(--t-sm);color:var(--text-2);line-height:1.4}
+.wn-text b{color:var(--text);font-size:var(--t-md)}
+.wn-item button{flex:none;white-space:nowrap}
+.wn-more{margin:0}
+.wn-ver{margin:var(--s3) 0 var(--s1);font-size:var(--t-md);font-weight:650;color:var(--text)}
+.wn-ver:first-child{margin-top:0}
+.wn-rows{list-style:none;margin:0;padding:0;border:1px solid var(--border);border-radius:var(--r-sm)}
+.wn-row{display:flex;align-items:center;gap:var(--s3);padding:var(--s2) var(--s3);border-bottom:1px solid var(--border);font-size:var(--t-sm)}
+.wn-row:last-child{border-bottom:0}
+.wn-t{flex:1;min-width:0}
+.wn-t b{color:var(--text)}
+.wn-row button{flex:none;white-space:nowrap}
+.section-body .disclose{margin-top:var(--s3)}
+/* setup: accounts step */
+.welcome{max-width:640px}
+.welcome-nav .nav-right{display:inline-flex;align-items:center;gap:var(--s2)}
+.welcome-nav .push{margin-left:0}
+.welcome-list li.new-line{color:var(--text)}
+.acct-list{list-style:none;margin:0;padding:0;width:100%;border:1px solid var(--border);border-radius:var(--r-sm)}
+.acct-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;column-gap:var(--s3);align-items:start;padding:var(--s3);border-bottom:1px solid var(--border)}
+.acct-row:last-child{border-bottom:0}
+.acct-row .hdot{margin-top:6px}
+.acct-main{display:flex;flex-direction:column;gap:2px;min-width:0}
+.acct-line{font-size:var(--t-sm);color:var(--text-2);line-height:1.4}
+.acct-act{margin-top:var(--s1)}
+.acct-read{display:flex;align-items:center;gap:var(--s2);font-size:var(--t-sm);color:var(--text-2);white-space:nowrap}
+.acct-read label{cursor:pointer}
+.acct-none{display:flex;align-items:center;gap:var(--s2);margin:0;font-size:var(--t-sm);color:var(--muted)}
+.acct-block{width:100%;display:flex;flex-direction:column;gap:var(--s1)}
+.acct-h{margin:0;font-size:var(--t-md);font-weight:600;color:var(--text)}
+.acct-h .meta{font-weight:400}
+.order-list{list-style:none;margin:var(--s1) 0 0;padding:0;border:1px solid var(--border);border-radius:var(--r-sm)}
+.order-row{display:flex;align-items:center;gap:var(--s2);padding:var(--s2) var(--s3);border-bottom:1px solid var(--border)}
+.order-row:last-child{border-bottom:0}
+.order-n{color:var(--muted);width:1.4em;font-variant-numeric:tabular-nums}
+.order-name{flex:1;color:var(--text)}
+.order-btns{display:inline-flex;gap:var(--s2)}
+.accounts .set-help{margin:0}
+.accounts .acct-switch{width:100%;border:1px solid var(--border);border-radius:var(--r-sm)}
+.accounts .callout{width:100%}
+/* polish */
+.pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--s4);align-items:start}
+.pair.single{grid-template-columns:minmax(0,1fr)}
+.pair-col{display:flex;flex-direction:column;gap:var(--s3);min-width:0}
+.pair-col .mock-state{margin:0}
+.pair-col .section-card,.pair-col .card{margin:0}
+.sw-slot{flex:none;min-width:5.5rem;display:inline-flex;align-items:center;padding-top:1px}
+.opt-row .toolbar{align-items:center}
+.wrapmeta{white-space:normal}
+@media (max-width:1100px){.pair{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:760px){.acct-row{grid-template-columns:auto minmax(0,1fr)}.acct-read{grid-column:2}}
+*,*::before,*::after{animation:none!important;transition:none!important}
+/* What's new card on Home (2026-10-15, Matt: dialog and card both, so closing one by accident leaves the other). */
+.wn-card .card-head{display:flex;align-items:center}
+.wn-card-h{margin:0;font:inherit;font-weight:650;color:var(--text);letter-spacing:inherit;text-transform:inherit}
+.wn-card .wn-rows{list-style:none;margin:0;padding:0}
+.wn-card .wn-row{display:flex;align-items:center;gap:var(--s3);padding:var(--s2) var(--s4);border-bottom:1px solid var(--border);font-size:var(--t-sm)}
+.wn-card .wn-row .wn-t{flex:1;min-width:0}
+.wn-card .wn-row button{flex:none}
+.wn-card-foot{font-size:var(--t-sm)}
+.wn-card .wn-rows{border:0;border-radius:0}

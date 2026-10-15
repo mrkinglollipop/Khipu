@@ -2,10 +2,11 @@
 # on-sub Sonnet build agent for this phase (brief: "do not delegate to other
 # agents"); there is no further agent to route this to.
 """khipu-recall-client — ask the warm recall service (khipu.recall_daemon) for
-one prompt's answer. Standard library only and no khipu import, so it starts
-under ``python3 -S -E -B`` in a few milliseconds; the whole point of the
-service is that a prompt no longer pays for a fresh interpreter importing the
-package.
+one prompt's answer. Standard library only and no khipu package import, so it
+starts under ``python3 -S -E -B`` in a few milliseconds; the whole point of
+the service is that a prompt no longer pays for a fresh interpreter importing
+the package. The one exception is ``khipu/wire.py``, loaded by file path
+(stdlib only, no package ``__init__``), so what it prints is strict JSON.
 
 Reads the hook payload on stdin. Argument: ``claude`` (default) or ``cursor``.
 
@@ -20,6 +21,7 @@ gate run), else ``KHIPU_CAPTURE_HOME``, then ``KHIPU_AEGIS_HOME``, then
 ``~/.grok/khipu``, plus ``recall.sock`` — the same resolution as
 ``khipu.session_capture.khipu_home``; failures log beside it.
 """
+import importlib.util
 import json
 import os
 import socket
@@ -34,6 +36,38 @@ MAX_ANSWER_BYTES = 8 * 1024 * 1024
 # The hook's routing switches (khipu.recall_prompt.ROUTING_SWITCHES): the
 # service reads them as this hook's, not as its own environment's.
 ROUTING_SWITCHES = ("ROUTING_NOW_OFF", "KHIPU_FEATURE_ROUTING_PUSH")
+
+
+def load_wire():
+    """khipu/wire.py beside this script: ``../khipu`` in the repo,
+    ``../packages/cli/khipu`` in the app bundle's ``bin``; None if missing."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    for rel in (("..", "khipu"), ("..", "packages", "cli", "khipu")):
+        path = os.path.join(here, *rel, "wire.py")
+        if os.path.isfile(path):
+            spec = importlib.util.spec_from_file_location("khipu_wire", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+    return None
+
+
+def hook_stdout(out):
+    """The answer as strict JSON (no lone surrogate escape, which Foundation
+    and serde_json reject), or None when wire.py cannot be found and the
+    answer would not encode strictly."""
+    try:
+        wire = load_wire()
+    except (OSError, ImportError, SyntaxError):
+        wire = None
+    if wire is not None:
+        return wire.dumps(out, ensure_ascii=True)
+    text = json.dumps(out, ensure_ascii=False)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return json.dumps(out)
 
 
 def socket_path():
@@ -123,8 +157,9 @@ def main(argv):
         sock.sendall(request.encode("utf-8"))
         line = read_answer(sock, deadline)
         out = as_hook_output(line)
-        if out is not None and time.monotonic() < deadline:
-            sys.stdout.write(json.dumps(out) + "\n")
+        text = hook_stdout(out) if out is not None else None
+        if text is not None and time.monotonic() < deadline:
+            sys.stdout.write(text + "\n")
             sys.stdout.flush()
             if json.loads(line).get("ok") is True:
                 sock.sendall(b'{"op":"ack"}\n')

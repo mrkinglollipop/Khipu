@@ -1,0 +1,115 @@
+/* Mock-only CSS for plans-before.html and plans.html (scope section 2).
+   Tokens and components come from App.css; this file only adds what the
+   new Plans layout needs. */
+.rail-nav { overflow: hidden; }
+/* A mock page stacks several screens: the document scrolls, each shell is as
+   tall as its content, and the panel's entry fade is off for screenshots. */
+html, body, #root { height: auto; overflow: visible; }
+#root > .shell { height: auto; min-height: 800px; }
+#root > .shell > .main { height: auto; overflow-y: visible; overflow-x: clip; min-width: 0; }
+#root > .shell > .rail { position: sticky; top: 0; height: 800px; align-self: start; }
+.panel:not(.is-hidden) { animation: none; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
+/* State panels stacked under the first full screen. */
+.mock-states { display: flex; flex-direction: column; gap: var(--s3); max-width: 1040px; margin: 0 auto; padding: var(--s6) var(--s6) var(--s8); }
+h2.mock-state { margin: var(--s4) 0 0; font-size: var(--t-xs); font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.mock-states .card { margin: 0; }
+.mock-divider { border: 0; border-top: 1px dashed var(--border-strong); margin: 0; }
+
+/* ---------------------------------------------------------------------------
+   Home card, after: one status phrase per row.
+--------------------------------------------------------------------------- */
+.plans-card .card-head .plans-head-note { font-size: var(--t-sm); font-weight: 400; color: var(--text-2); margin-right: var(--s2); display: inline-flex; align-items: baseline; gap: var(--s2); text-transform: none; letter-spacing: 0; }
+.plans-card .card-head .plans-head-note .hdot { transform: translateY(-1px); }
+/* The fifth column holds the one status phrase; nothing else follows it. */
+.card .row.plan-row.v2 { grid-template-columns: minmax(7rem, 11rem) minmax(4rem, 1fr) 3.5rem minmax(0, 14rem) minmax(0, auto); align-items: center; }
+.plan-row.v2 .plan-none { grid-column: 2 / -1; display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; min-width: 0; }
+.plan-row.v2 .plan-none .plan-say { grid-column: auto; }
+.plan-say { display: inline-flex; align-items: baseline; gap: var(--s2); font-size: var(--t-sm); color: var(--text-2); min-width: 0; }
+.plan-say .hdot { flex: none; transform: translateY(-1px); }
+.plan-say.grey { color: var(--muted); }
+.plan-row.v2 .plan-say-col { justify-self: end; text-align: right; }
+.plan-meter.dim { opacity: 0.4; }
+.plan-pct.dim { color: var(--text-2); }
+@media (max-width: 1040px) {
+  .card .row.plan-row.v2 { grid-template-columns: minmax(7rem, 9rem) minmax(4rem, 1fr) 3.5rem minmax(0, 13rem); row-gap: var(--s1); }
+  .plan-row.v2 .plan-say-col { grid-column: 2 / -1; justify-self: start; text-align: left; }
+}
+
+/* ---------------------------------------------------------------------------
+   Settings -> Routing -> Accounts, open, with each account's Plans block.
+--------------------------------------------------------------------------- */
+.group-card > .fold > .fold-btn { list-style: none; cursor: pointer; }
+.group-card > .fold > .fold-btn::-webkit-details-marker { display: none; }
+.group-card .group-sum { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.group-card .group-sum .group-title { font-weight: 600; color: var(--text); }
+.group-card .group-sum .meta { font-weight: 400; }
+.group-card .group-sum .spacer { flex: 1; }
+.group-card .fold[data-open=true] > .fold-btn .disclosure-chevron { transform: rotate(90deg); }
+.group-card.closed .section-head { border-bottom: 0; }
+
+.acct-tools { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; margin-bottom: var(--s2); }
+.acct-tools label { font-size: var(--t-sm); color: var(--text-2); }
+.acct-tools select { height: 26px; }
+.acct-tools .chip .n { color: var(--muted); font-variant-numeric: tabular-nums; }
+.acct-tools .chip.on .n { color: inherit; }
+
+/* The name doubles as the line's open/close button. */
+.acct-toggle { display: inline-flex; align-items: center; gap: var(--s1); padding: 0; margin: 0; border: 0; background: none; font: inherit; font-weight: 600; color: var(--text); cursor: pointer; text-align: left; height: auto; box-shadow: none; }
+.acct-toggle .disclosure-chevron { color: var(--muted); }
+.acct-toggle[aria-expanded="true"] .disclosure-chevron { transform: rotate(90deg); }
+.route-what .route-pace { font-size: var(--t-sm); color: var(--text-2); }
+
+.acct-body { grid-column: 2 / -1; margin-top: var(--s2); display: flex; flex-direction: column; gap: var(--s2); min-width: 0; }
+
+/* One account's plan: a bordered block, its name and plan as the heading. */
+.plan-block { --bar-track: color-mix(in srgb, var(--text-2) 68%, var(--surface-2)); }
+@media (prefers-color-scheme: dark) { .plan-block { --bar-track: color-mix(in srgb, var(--text-2) 55%, var(--surface-2)); } }
+.plan-block { border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface); padding: var(--s3); display: flex; flex-direction: column; gap: var(--s2); min-width: 0; }
+.plan-block.warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.plan-block-head { display: flex; align-items: baseline; gap: var(--s2); flex-wrap: wrap; margin: 0; font-size: var(--t-sm); font-weight: 600; color: var(--text); letter-spacing: 0; text-transform: none; }
+.plan-block-head .meta { font-weight: 400; }
+.plan-block-head .spacer { flex: 1; }
+.plan-block .plan-paused { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; font-size: var(--t-sm); color: var(--text-2); }
+.plan-wins { display: flex; flex-direction: column; gap: var(--s1); margin: 0; padding: 0; list-style: none; }
+.plan-win { display: grid; grid-template-columns: 7.5rem minmax(4rem, 1fr) 3.5rem minmax(0, 13rem); column-gap: var(--s3); align-items: center; font-size: var(--t-sm); }
+.plan-win .plan-wname { color: var(--text-2); }
+.plan-win .plan-reset { color: var(--muted); font-size: var(--t-xs); }
+.plan-reads { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; font-size: var(--t-xs); color: var(--muted); }
+.plan-fail { display: flex; align-items: baseline; gap: var(--s2); font-size: var(--t-sm); color: var(--text); line-height: 1.45; }
+.plan-fail .hdot { flex: none; transform: translateY(-1px); }
+.plan-block .fold.disclose { border-top: 0; padding-top: 0; }
+.plan-block .fold.disclose > .fold-btn { padding: 0; }
+.plan-block .disclose-body { padding: var(--s1) 0 0 var(--s5); gap: var(--s1); }
+.plan-details { display: grid; grid-template-columns: 8rem minmax(0, 1fr); gap: 2px var(--s3); margin: 0; font-size: var(--t-xs); color: var(--text-2); }
+.plan-details dt { color: var(--muted); }
+.plan-details dd { margin: 0; }
+.plan-details code { font-family: var(--mono); font-size: var(--t-xs); }
+.plan-block .toolbar { margin: 0; }
+.plan-empty { font-size: var(--t-sm); color: var(--muted); margin: 0; }
+
+.acct-reads-line { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+
+@media (max-width: 1040px) {
+  .plan-win { grid-template-columns: 6.5rem minmax(4rem, 1fr) 3.5rem; }
+  .plan-win .plan-reset { grid-column: 2 / -1; }
+  .acct-body { grid-column: 1 / -1; }
+}
+
+/* Needs you list, copied from routing.css so this mock reads the same as routing.html */
+.needs{border-radius:var(--r-md);padding:var(--s2) var(--s4)}
+.needs .txt{gap:var(--s2)}
+.needs ul{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px var(--s5)}
+.needs li{display:flex;align-items:center;gap:var(--s3);font-size:var(--t-sm);color:var(--text);min-height:30px}
+.needs li > span{flex:1;min-width:0}
+.needs li button{flex:none}
+@media (max-width:1100px){.needs ul{grid-template-columns:1fr}.needs li{flex-wrap:wrap}}
+
+/* names and reset times must not clip */
+.card .row.plan-row.v2 { grid-template-columns: minmax(9rem, 13rem) minmax(4rem, 1fr) 3.5rem minmax(0, 17rem) minmax(0, auto); }
+.plan-row.v2 .plan-name { white-space: normal; overflow: visible; text-overflow: clip; }
+.plan-row.v2 .plan-when { overflow: visible; text-overflow: clip; white-space: normal; }
+@media (max-width: 1100px) { .card .row.plan-row.v2 { grid-template-columns: minmax(13rem, 14rem) minmax(3rem, 1fr) 3.5rem minmax(0, 12rem); } }
+.route-what > .tag{align-self:flex-start}
+.route-what .route-pace-rate { font-size: var(--t-xs); color: var(--muted); }

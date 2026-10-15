@@ -34,6 +34,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from khipu.lines import split_lines
+
 LOCAL_HARNESSES = ("claude_code", "cursor", "codex", "aegis")
 
 
@@ -216,7 +218,7 @@ def _scrub_retained_backups(memory_root: Path, ts_iso: str, summary_md5: str) ->
         if not backup.is_file():
             continue
         try:
-            lines = backup.read_text(encoding="utf-8").splitlines(keepends=True)
+            lines = split_lines(backup.read_text(encoding="utf-8"), keepends=True)
             keep = [line for line in lines if not _line_matches(line, ts_iso, summary_md5)]
             if _has_unidentified_records(keep):
                 remaining.append(f"{backup}: unidentified legacy records")
@@ -246,7 +248,7 @@ def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: st
         return {"file": str(path), "removed": 0, "reason": "no legacy file", "identity": identity,
                 "backups": backups}
     try:
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        lines = split_lines(path.read_text(encoding="utf-8"), keepends=True)
     except (OSError, UnicodeError) as exc:
         return {"file": str(path), "removed": 0, "reason": f"unreadable: {exc}", "identity": identity,
                 "backups": backups}
