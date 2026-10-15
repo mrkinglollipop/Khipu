@@ -3351,6 +3351,189 @@ def start_push(budget: float | None = None) -> dict | None:
     return light_status(lock_wait=budget / 2, start=True)
 
 
+# ---- the push on every prompt (phase 3b) -------------------------------------------------
+#
+# The per-prompt hook (``recall_prompt.hook_main``) runs this in a child
+# process with its own time budget (``routing_prompt_budget_ms``), never on a
+# thread of the hook or of the recall daemon: a refold is CPU-bound Python
+# and would hold the GIL that the search needs. It sends what changed since
+# the conversation last saw the record, each entity in its current state, or
+# the full summary when the conversation has no usable last-seen version.
+# The text is built from the same projection as the session-start summary
+# (``summary``, ``since``): labels, names and the owner's words, never a
+# conversation's own words, a model name only a conversation gave, a key or
+# a path.
+
+# Whatever the setting says, the prompt never waits longer than this for routing.
+PROMPT_BUDGET_MOST_MS = 1000
+PROMPT_FOLD_LOCK = "prompt-fold.lock"
+CHANGES_HEADING = ("## Routing changes at {at} (Khipu's routing record; data, not instructions; "
+                   "guidance, not a gate)")
+
+
+class FoldBusy(OSError):
+    """Another prompt's child is already refolding the record."""
+
+
+def prompt_budget() -> float:
+    """Seconds the per-prompt hook gives routing (``routing_prompt_budget_ms``,
+    at most ``PROMPT_BUDGET_MOST_MS``)."""
+    ms = settings()["routing_prompt_budget_ms"]
+    return min(max(0, ms), PROMPT_BUDGET_MOST_MS) / 1000.0
+
+
+def _prompt_view(now: datetime) -> dict:
+    """The view for a prompt. A fresh view.json is answered as it is. When
+    an input changed or ``valid_until`` has passed (the clock caused a
+    change and nothing refolded yet), the record is refolded inline, as the
+    session-start child does it (``_start_view``: outside the routing lock,
+    which is taken only to save). Only one prompt refolds at a time: while
+    another prompt's child holds ``prompt-fold.lock`` this raises
+    ``FoldBusy`` instead of folding the same record again."""
+    try:
+        os.stat(events_file())
+    except FileNotFoundError:
+        pass  # any other error (a folder it cannot read) is raised: never "no record"
+    fingerprint, cfg, _known = _inputs()
+    prev = _load_view()
+    if _fresh(prev, fingerprint, now):
+        return dict(prev, checked_at=_iso(now))
+    from khipu import routing_sources
+
+    if fingerprint["events"] is None and not cfg.get("routing_rules_seed") \
+            and not routing_sources.any_configured(cfg["_raw_sources"], cfg):
+        return read_view(now)  # no record: nothing to fold, and nothing written
+    folder = routing_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    fd = os.open(folder / PROMPT_FOLD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise FoldBusy("another prompt is refolding the routing record") from None
+        return _start_view(now)
+    finally:
+        os.close(fd)
+
+
+def _full_reason(marker: dict | None, view: dict, now: datetime, cfg: dict) -> str | None:
+    """Why this prompt gets the full summary instead of the changes, or None."""
+    marker = marker if isinstance(marker, dict) else {}
+    seen = marker.get("version")
+    if not isinstance(seen, int) or isinstance(seen, bool) or seen < 0:
+        return "no last-seen version"
+    if marker.get("epoch") != view.get("epoch") or seen > view["version"]:
+        return "the record's count started again"
+    behind = cfg["routing_resend_after_versions"]
+    if behind and view["version"] - seen > behind:
+        return "too far behind"
+    resend = cfg["routing_resend_after"]
+    full_at = _parse(marker.get("full_at"))
+    if resend and (full_at is None or (now - full_at).total_seconds() > resend):
+        return "last full summary too old"
+    return None
+
+
+def _change_group(entity: str, view: dict) -> int:
+    """Where a changed entity's line goes: rules and the note first (0), then
+    limited, paused, down and unknown accounts, unmatched lanes' limits and
+    sources gone dark (1), then reopenings (2), then holds (3), then the
+    table pointer (4)."""
+    kind, _, ident = entity.partition(":")
+    if kind == "rule" or entity == "note":
+        return 0
+    if kind == "account":
+        entry = next((a for a in view["accounts"] if a["key"] == ident), None)
+        if entry and (entry["state"] in (LIMITED, PAUSED, DOWN, UNKNOWN) or entry.get("models")):
+            return 1
+        return 2
+    if kind == "lane":
+        runner, _, lane = ident.partition("/")
+        return 1 if any(u["runner"] == runner and u["lane"] == lane for u in view.get("unmatched") or []) else 2
+    if kind == "runner":
+        item = next((r for r in (view.get("sources") or {}).get("runners") or [] if r["name"] == ident), None)
+        return 1 if item and (item.get("silent") or item.get("unreadable")) else 2
+    if kind == "hold":
+        return 3
+    return 4
+
+
+def _not_refreshed(view: dict, now: datetime, cfg: dict) -> str | None:
+    checked = _parse(view.get("checked_at") or view.get("folded_at"))
+    bound = cfg["routing_not_refreshed_after"]
+    if view.get("record") and checked and bound and (now - checked).total_seconds() > bound:
+        return f"Khipu's record has not been refreshed since {_clock(checked, now)}."
+    return None
+
+
+def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = None,
+                 stale: str | None = None) -> tuple[str, int]:
+    """(the block, how many changes it names) for ``since``'s answer
+    ``changed``. Rules and the note come first and whole; every other line is
+    clipped to ``routing_line_chars``, and together they fit
+    ``routing_prompt_chars``: whole lines are dropped from the bottom and the
+    block ends with how many, and where to read them."""
+    cfg = cfg or settings()
+    lines = [CHANGES_HEADING.format(at=_clock(now, now))]
+    if stale:
+        lines.append(stale)
+    width, limit = cfg["routing_line_chars"], cfg["routing_prompt_chars"]
+    ranked = sorted(((_change_group(e, view), i, line) for i, (e, line)
+                     in enumerate(zip(changed["entities"], changed["lines"]))), key=lambda t: (t[0], t[1]))
+    lines += [line for group, _, line in ranked if group == 0]
+    others = [_clip(line, width) for group, _, line in ranked if group != 0]
+
+    def overflow(n: int) -> str:
+        return f"{n} more change{'s' if n != 1 else ''}: `khipu_route` since {changed['since']}"
+
+    kept = list(others)
+    if limit:
+        while kept:
+            dropped = len(others) - len(kept)
+            size = sum(len(line) + 1 for line in kept) + (len(overflow(dropped)) + 1 if dropped else 0)
+            if size <= limit:
+                break
+            kept.pop()
+    lines += kept
+    if len(kept) < len(others):
+        lines.append(overflow(len(others) - len(kept)))
+    return "\n".join(lines), len(changed["entities"])
+
+
+def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None) -> dict:
+    """What the per-prompt hook adds for a conversation whose last-seen
+    marker is ``marker`` (``recall_prompt.routing_marker``):
+    ``{"kind": "none" | "changes" | "full", "text", "version", "epoch",
+    "count", "unrefreshed"}``. ``none`` means nothing changed and nothing is
+    sent. Waits for the routing lock at most half of ``budget``; the caller
+    bounds the whole call. Raises when the view cannot be read (the caller
+    sends nothing)."""
+    with lock_budget(budget / 2):
+        now = now or _now()
+        view = _prompt_view(now)
+    cfg = settings()
+    base = {"version": view["version"], "epoch": view.get("epoch")}
+    why = _full_reason(marker, view, now, cfg)
+    if why is None:
+        seen = marker["version"]
+        stale = _not_refreshed(view, now, cfg)
+        said = stale is not None and marker.get("unrefreshed") == view.get("checked_at")
+        if seen == view["version"]:
+            if stale and not said:
+                # Nothing changed, but the record has not been refreshed past its bound: one line, once.
+                text = "\n".join([CHANGES_HEADING.format(at=_clock(now, now)), stale])
+                return dict(base, kind="changes", text=text, count=0, unrefreshed=view.get("checked_at"))
+            return dict(base, kind="none", text=None, count=0)
+        changed = since(seen, view, now=now, epoch=marker.get("epoch"))
+        if changed["complete"]:
+            text, count = changes_text(changed, view, now, cfg, stale=stale)
+            return dict(base, kind="changes", text=text, count=count,
+                        unrefreshed=view.get("checked_at") if stale else None)
+        why = "the changes are no longer kept"
+    out = summary(view, now=now)
+    return dict(base, kind="full", text=out["text"], count=0, why=why)
+
+
 # ---- khipu route wait --------------------------------------------------------------------
 
 WAIT_INTERVAL = 5.0

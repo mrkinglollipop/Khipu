@@ -55,6 +55,9 @@ STALE_RECHECK_S = 5.0
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 # A client that connects and says nothing must not hold a thread forever.
 CONN_READ_TIMEOUT_S = 10.0
+# The client tries the one-shot path after a failed answer only while this
+# much of its deadline is left (bin/khipu-recall-client.py).
+CLIENT_COLD_RETRY_S = 1.4
 # In-flight requests get this long to finish once the service is stopping.
 DRAIN_S = 3.0
 _ACCEPT_TICK_S = 0.5
@@ -356,7 +359,14 @@ class RecallService:
         if delivery is not None:
             result = delivery.get("result") or {}
             if recall_prompt._outcome_for(result.get("reason", "ok"), result.get("hits", [])) in ("error", "timeout"):
-                return {"ok": False, "error": result["reason"]}
+                # A failed search answers an error, so the client can still try
+                # the one-shot path. When it no longer can (too little time
+                # left), routing lines this prompt carries are delivered on
+                # their own (phase 3b): the search's outcome is logged as it was.
+                routed = (delivery.get("routing") or {}).get("pending")
+                left = options.get("deadline", 0) - time.monotonic()
+                if not routed or left >= CLIENT_COLD_RETRY_S:
+                    return {"ok": False, "error": result["reason"]}
         with self._lock:
             self.served += 1
         return {"ok": True, "output": out} if req.get("protocol") == 1 else out
@@ -505,6 +515,8 @@ def _warm_imports() -> None:
     """Pay the package's import cost at start, not on the first prompt."""
     try:
         from khipu import embed, hub_snapshot, recall_prompt, vector_scan  # noqa: F401
+        # What the per-prompt routing child runs, so a fork never imports it.
+        from khipu import config, features, routing, routing_sources, usage  # noqa: F401
     except Exception as exc:  # noqa: BLE001 — the first prompt will import them anyway
         _log(f"warm imports skipped: {type(exc).__name__}: {exc}")
 

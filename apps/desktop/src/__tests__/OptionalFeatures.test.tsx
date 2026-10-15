@@ -129,6 +129,9 @@ describe("OptionalFeatures", () => {
     // R3-2: the start budget is a setting (up to 8 s), not a fixed second.
     expect(within(routing).getByText(/up to the routing start budget/)).toBeInTheDocument();
     expect(within(routing).queryByText(/at most one second/)).toBeNull();
+    // Routing truth, phase 3b: the changes before each prompt, and their own budget.
+    expect(within(routing).getByText(/only what changed since that conversation last heard/)).toBeInTheDocument();
+    expect(within(routing).getByText(/up to the routing prompt budget before a prompt/)).toBeInTheDocument();
   });
 
   it("reflects what the CLI reports as on and off", async () => {

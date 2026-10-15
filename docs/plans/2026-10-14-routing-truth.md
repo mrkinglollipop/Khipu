@@ -28,7 +28,7 @@ can see and change all of it in the app. Khipu never decides where work goes.
 | 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | built, in review (branch feat/routing-truth-1b) |
 | 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | built, in review (branch feat/routing-truth-2) |
 | 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | built, in review (branch feat/routing-truth-3a) |
-| 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | open |
+| 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | built, in review (branch feat/routing-truth-3b) |
 | 3c | The daemon refolds on change and on the clock; the promotion gate's replay covers routing | S | open |
 | 4 | App: Home Routing card, Settings → Routing for what phases 1a to 3c built, health row, attention items | M–L | open (mock approved 2026-10-14; needs plan usage phase 2 merged) |
 | 5 | The background check at each known reset time, with its part of the app | S | open |
