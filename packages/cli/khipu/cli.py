@@ -2123,6 +2123,11 @@ def cmd_owed(args: argparse.Namespace) -> int:
                 status=getattr(args, "status", None) or "open",
                 limit=int(getattr(args, "limit", None) or 50),
             )
+            # Ages counted on the hub's own clock, so a Mac clock that runs
+            # ahead of or behind the hub can't make an age negative.
+            cur.execute("SELECT now()")
+            hub_now = (cur.fetchone() or [None])[0]
+    commitments.add_hub_ages(rows, hub_now)
     print(json.dumps(rows, indent=2, default=str))
     return 0
 

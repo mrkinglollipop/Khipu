@@ -19,7 +19,7 @@ import {
   spanWords,
 } from "./routing";
 import type { RouteView } from "./routing";
-import { fmtAge } from "./time";
+import { fmtAgo } from "./time";
 
 /** A named red check, in plain words, with at most one fix. Callers render
  *  one callout per entry; `fix` is omitted where the app has no honest fix to
@@ -341,7 +341,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       snap.reason === "snapshot_refresh_failed"
         ? `The last full rebuild failed${snap.refresh_error?.error ? `: ${snap.refresh_error.error}` : ""}.`
         : snap.reason === "snapshot_refresh_overdue"
-          ? `The nightly job rebuilds it in full and last did so ${fmtAge(snap.age_seconds)} ago.`
+          ? `The nightly job rebuilds it in full and last did so ${fmtAgo(snap.age_seconds)}.`
           : snap.reason === "snapshot_missing"
             ? "There is none on this Mac yet; the nightly job builds it."
             : "It has no rebuild time on record.";

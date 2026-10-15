@@ -94,9 +94,33 @@ class OwedCommandTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["text"], "follow up")
-        sql, params = cur.calls[-1]
+        sql, params = next(c for c in cur.calls if c[0].startswith("SELECT id, text"))
         self.assertIn("status = %s", sql)
         self.assertEqual(params[0], "open")
+
+    def test_list_ages_come_from_the_hub_clock(self):
+        # The hub's clock reads 12:00:00; a row opened at 11:59:20 is 40 s old
+        # whatever the Mac's clock says, and one stamped after the hub's now
+        # (clock drift between writers) floors at zero, never negative.
+        from datetime import datetime, timezone
+        hub = datetime(2026, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
+        opened = datetime(2026, 10, 15, 11, 59, 20, tzinfo=timezone.utc)
+        ahead = datetime(2026, 10, 15, 12, 0, 30, tzinfo=timezone.utc)
+        cur = _FakeCur([
+            ("SELECT id, text, project", {"rows": [
+                (1, "follow up", "acme/widget", None, "followup", 10, opened, None,
+                 "open", None, None, None),
+                (2, "ahead", "acme/widget", None, "followup", 11, ahead, None,
+                 "open", None, None, None),
+            ]}),
+            ("SELECT now()", {"row": (hub,)}),
+        ])
+        rc, out = _run(["owed"], cur)
+        self.assertEqual(rc, 0)
+        by_id = {r["id"]: r for r in out}
+        self.assertEqual(by_id[1]["opened_age_s"], 40.0)
+        self.assertEqual(by_id[2]["opened_age_s"], 0.0)
+        self.assertIsNone(by_id[1]["last_seen_age_s"])
 
     def test_close_by_id(self):
         cur = _FakeCur([("UPDATE commitments SET status = %s", {"rowcount": 1})])
