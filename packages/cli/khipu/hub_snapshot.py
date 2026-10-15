@@ -82,7 +82,9 @@ _TABLES = (
 # Version 4 adds the external-content FTS5 tables `episodes_fts`/`topics_fts`
 # (trigram) and their triggers; `search_snapshot` uses them when present and
 # falls back to LIKE on a file without them.
-SNAPSHOT_SCHEMA_VERSION = 4
+# Version 5 adds the ledger (projects, words, live rows, their history), so
+# `khipu ledger` reads while the hub is away. Removed rows are never in it.
+SNAPSHOT_SCHEMA_VERSION = 5
 
 _DELIVERABLE_COLS = (
     "id",
@@ -834,6 +836,8 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
             CREATE INDEX idx_snapshot_deliverables_project ON deliverables (project);
             """
         )
+    if version >= 5:
+        con.executescript(_LEDGER_SCHEMA_SQL)
     if version >= 4:
         try:
             con.executescript(_FTS_SCHEMA_SQL)
@@ -841,6 +845,173 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
             # A Python whose SQLite lacks FTS5 still writes a usable replica;
             # search_snapshot finds no FTS tables and stays on LIKE.
             _log(f"replica FTS tables not created: {exc}")
+
+
+_LEDGER_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS ledger_projects (
+    project TEXT PRIMARY KEY, name TEXT, hidden INTEGER, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS ledger_vocab (
+    project TEXT, field TEXT, word TEXT, meaning TEXT, position INTEGER,
+    PRIMARY KEY (project, field, word)
+);
+CREATE TABLE IF NOT EXISTS ledger_rows (
+    project TEXT, row_id TEXT, title TEXT, kind TEXT, parent TEXT, state TEXT, owner TEXT,
+    evidence TEXT, link TEXT, refs TEXT, seq INTEGER, created_at TEXT, updated_at TEXT,
+    version INTEGER, PRIMARY KEY (project, row_id)
+);
+CREATE TABLE IF NOT EXISTS ledger_history (
+    id INTEGER PRIMARY KEY, project TEXT, row_id TEXT, at TEXT, at_text TEXT, author TEXT,
+    shape TEXT, from_state TEXT, to_state TEXT, changes TEXT, note TEXT, event TEXT, raw TEXT,
+    source TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_snapshot_ledger_history_row ON ledger_history (project, row_id, id);
+"""
+_LEDGER_ROW_COLS = ("project", "row_id", "title", "kind", "parent", "state", "owner", "evidence", "link",
+                    "refs", "seq", "created_at", "updated_at", "version")
+_LEDGER_HIST_COLS = ("id", "project", "row_id", "at", "at_text", "author", "shape", "from_state", "to_state",
+                     "changes", "note", "event", "raw", "source")
+_LEDGER_JSON_COLS = frozenset({"refs", "author", "changes", "raw"})
+_LEDGER_TS_COLS = frozenset({"created_at", "updated_at", "at"})
+
+
+def _ledger_value(col: str, val: Any) -> Any:
+    if col in _LEDGER_JSON_COLS:
+        return _json_text(val)
+    if col in _LEDGER_TS_COLS:
+        return _ts_text(val)
+    return val
+
+
+def _insert_ledger(cur, con: sqlite3.Connection) -> int:
+    """The ledger's live rows (never a removed one), their history, and each
+    project's words. Empty (0, no error) on a hub without migration 0028."""
+    if "row_id" not in _pg_columns(cur, "ledger_rows"):
+        return 0
+    con.executescript(_LEDGER_SCHEMA_SQL)
+    cur.execute("SELECT project, name, hidden, created_at FROM ledger_projects")
+    for project, name, hidden, created in cur.fetchall():
+        con.execute("INSERT INTO ledger_projects VALUES (?, ?, ?, ?)", (project, name, int(bool(hidden)),
+                                                                         _ts_text(created)))
+    cur.execute("SELECT project, field, word, meaning, position FROM ledger_vocab")
+    con.executemany("INSERT INTO ledger_vocab VALUES (?, ?, ?, ?, ?)", cur.fetchall())
+    cur.execute(f"SELECT {', '.join(_LEDGER_ROW_COLS)} FROM ledger_rows WHERE removed_at IS NULL")
+    rows = cur.fetchall()
+    con.executemany(
+        f"INSERT INTO ledger_rows ({', '.join(_LEDGER_ROW_COLS)}) VALUES ({', '.join('?' * len(_LEDGER_ROW_COLS))})",
+        [[_ledger_value(c, v) for c, v in zip(_LEDGER_ROW_COLS, r, strict=True)] for r in rows],
+    )
+    sel = ", ".join(f"h.{c}" for c in _LEDGER_HIST_COLS)
+    cur.execute(f"SELECT {sel} FROM ledger_history h JOIN ledger_rows r ON r.project = h.project "
+                "AND r.row_id = h.row_id WHERE r.removed_at IS NULL ORDER BY h.id")
+    con.executemany(
+        f"INSERT INTO ledger_history ({', '.join(_LEDGER_HIST_COLS)}) "
+        f"VALUES ({', '.join('?' * len(_LEDGER_HIST_COLS))})",
+        [[_ledger_value(c, v) for c, v in zip(_LEDGER_HIST_COLS, h, strict=True)] for h in cur.fetchall()],
+    )
+    return len(rows)
+
+
+def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mapping[str, list],
+                          rows: Sequence[Mapping[str, Any]], history: Sequence[Mapping[str, Any]],
+                          row_ids: Sequence[str]) -> dict[str, Any]:
+    """Replace ``row_ids`` of ``project`` in the replica with ``rows`` (the
+    live ones among them) and their whole ``history``. A row missing from
+    ``rows`` was removed or purged and leaves the replica at once. Under the
+    refresh lock, like every incremental write here. Fail-open."""
+    path = snapshot_path()
+    if not path.is_file():
+        return {"ok": False, "error": "hub snapshot missing"}
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
+    try:
+        con = sqlite3.connect(str(path))
+        try:
+            con.executescript(_LEDGER_SCHEMA_SQL)
+            if proj is not None:
+                con.execute("INSERT OR REPLACE INTO ledger_projects VALUES (?, ?, ?, ?)",
+                            (project, proj[0], int(bool(proj[1])), _ts_text(proj[2])))
+            con.execute("DELETE FROM ledger_vocab WHERE project = ?", (project,))
+            con.executemany("INSERT INTO ledger_vocab VALUES (?, 'state', ?, ?, ?)",
+                            [(project, w, m, i) for i, (w, m) in enumerate(vocab.get("state") or [])])
+            con.executemany("INSERT INTO ledger_vocab VALUES (?, 'kind', ?, '', ?)",
+                            [(project, w, i) for i, w in enumerate(vocab.get("kind") or [])])
+            for row_id in row_ids:
+                con.execute("DELETE FROM ledger_rows WHERE project = ? AND row_id = ?", (project, row_id))
+                con.execute("DELETE FROM ledger_history WHERE project = ? AND row_id = ?", (project, row_id))
+            for row in rows:
+                values = {**row, "project": project}
+                con.execute(
+                    f"INSERT INTO ledger_rows ({', '.join(_LEDGER_ROW_COLS)}) "
+                    f"VALUES ({', '.join('?' * len(_LEDGER_ROW_COLS))})",
+                    [_ledger_value(c, values.get(c)) for c in _LEDGER_ROW_COLS],
+                )
+            for h in history:
+                values = {**h, "project": project}
+                con.execute(
+                    f"INSERT OR REPLACE INTO ledger_history ({', '.join(_LEDGER_HIST_COLS)}) "
+                    f"VALUES ({', '.join('?' * len(_LEDGER_HIST_COLS))})",
+                    [_ledger_value(c, values.get(c)) for c in _LEDGER_HIST_COLS],
+                )
+            con.commit()
+        finally:
+            con.close()
+        return {"ok": True, "rows": len(rows)}
+    except Exception as exc:  # noqa: BLE001  (the hub write already landed)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        _release_refresh_lock(lock)
+
+
+def ledger_in_snapshot() -> bool:
+    try:
+        con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        return bool(_snapshot_table_columns(con, "ledger_rows"))
+    finally:
+        con.close()
+
+
+def ledger_read_snapshot(project: str) -> dict[str, Any] | None:
+    """``project``'s words, live rows and history from the replica, with the
+    replica's time; None when the replica or its ledger tables are missing."""
+    if not snapshot_path().is_file():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        if not _snapshot_table_columns(con, "ledger_rows"):
+            return None
+        vocab: dict[str, list] = {"state": [], "kind": []}
+        for field, word, meaning in con.execute(
+                "SELECT field, word, meaning FROM ledger_vocab WHERE project = ? ORDER BY field, position",
+                (project,)):
+            if field == "state":
+                vocab["state"].append([word, meaning])
+            else:
+                vocab["kind"].append(word)
+        cols = [c for c in _LEDGER_ROW_COLS if c != "project"]
+        rows = [dict(zip(cols, r, strict=True)) for r in con.execute(
+            f"SELECT {', '.join(cols)} FROM ledger_rows WHERE project = ? ORDER BY seq", (project,))]
+        hcols = [c for c in _LEDGER_HIST_COLS if c != "project"]
+        history = []
+        for h in con.execute(f"SELECT {', '.join(hcols)} FROM ledger_history WHERE project = ? ORDER BY id",
+                             (project,)):
+            entry = dict(zip(hcols, h, strict=True))
+            for key in _LEDGER_JSON_COLS & set(entry):
+                if isinstance(entry[key], str):
+                    entry[key] = json.loads(entry[key])
+            history.append(entry)
+    except (sqlite3.Error, ValueError):
+        return None
+    finally:
+        con.close()
+    return {"vocab": vocab, "rows": rows, "history": history, "as_of": meta().get("refreshed_at")}
 
 
 _EPISODE_FTS_COLS = ("summary", "topics", "decisions", "preferences", "people")
@@ -1206,6 +1377,7 @@ def refresh() -> dict[str, Any]:
                     )
                     counts["decisions"] = _insert_decisions(cur, con)
                     counts["deliverables"] = _insert_deliverables(cur, con)
+                    counts["ledger_rows"] = _insert_ledger(cur, con)
             refreshed_at = _utcnow_iso()
             if _snapshot_table_columns(con, "snapshot_meta"):
                 con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('refreshed_at', ?)", (refreshed_at,))

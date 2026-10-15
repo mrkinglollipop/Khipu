@@ -1,0 +1,553 @@
+"""The ledger store and `khipu ledger` (Work view phase 1), against a real
+PostgreSQL started for this module on loopback in a temporary folder and
+removed afterwards. Never the live hub: the DSN is the scratch cluster's.
+
+Every fixture row is synthetic.
+"""
+from __future__ import annotations
+
+import ast
+import io
+import json
+import os
+import shutil
+import socket
+import sqlite3
+import subprocess
+import tempfile
+import threading
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[3]
+MIGRATIONS = REPO / "ops" / "migrations"
+INITDB, PG_CTL = shutil.which("initdb"), shutil.which("pg_ctl")
+P = "acme/widget"
+KEY = "sk-ant-" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4"
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _real_connect(dsn):
+    import psycopg
+
+    return psycopg.Connection.connect(dsn)
+
+
+@pytest.fixture(scope="module")
+def pg_dsn():
+    if not INITDB or not PG_CTL:
+        pytest.skip("needs PostgreSQL's initdb and pg_ctl on PATH")
+    root = Path(tempfile.mkdtemp(prefix="khipu-ledger-pg-"))
+    data, log = root / "data", root / "log"
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    started = False
+    try:
+        subprocess.run([INITDB, "-D", str(data), "-U", "khipu", "--auth=trust", "-E", "UTF8", "--locale=C"],
+                       check=True, capture_output=True, env=env, timeout=120)
+        port = _free_port()
+        subprocess.run([PG_CTL, "-D", str(data), "-l", str(log), "-w", "-t", "60", "-o",
+                        f"-c unix_socket_directories='' -c listen_addresses=127.0.0.1 -p {port} -c fsync=off",
+                        "start"], check=True, capture_output=True, env=env, timeout=120)
+        started = True
+        dsn = f"postgresql://khipu@127.0.0.1:{port}/postgres"
+        with _real_connect(dsn) as conn:
+            for name in ("0000_bootstrap.sql", "0028_ledger.sql", "0028_ledger.sql"):  # re-run is safe
+                conn.execute((MIGRATIONS / name).read_text(encoding="utf-8"))
+                conn.commit()
+        yield dsn
+    finally:
+        if started:
+            subprocess.run([PG_CTL, "-D", str(data), "-m", "immediate", "stop"], capture_output=True, env=env,
+                           timeout=60)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.fixture
+def hub(pg_dsn, monkeypatch, tmp_path):
+    import psycopg
+
+    monkeypatch.setattr(psycopg, "connect", psycopg.Connection.connect)
+    for name in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT", "CODEX_THREAD_ID",
+                 "KHIPU_SESSION_ID", "KHIPU_HARNESS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("KHIPU_DATABASE_URL", pg_dsn)
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
+    (tmp_path / "data").mkdir()
+    with _real_connect(pg_dsn) as conn:
+        conn.execute("TRUNCATE ledger_rows, ledger_history, ledger_ops, ledger_removed, ledger_vocab, "
+                     "ledger_imports, ledger_projects")
+        conn.commit()
+    return pg_dsn
+
+
+def _away(monkeypatch):
+    monkeypatch.setenv("KHIPU_DATABASE_URL", f"postgresql://khipu@127.0.0.1:{_free_port()}/postgres")
+
+
+def run(*argv):
+    from khipu import cli
+
+    args = cli.build_parser().parse_args(["ledger", *argv])
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = args.func(args)
+    return rc, out.getvalue(), err.getvalue()
+
+
+def ok(*argv) -> str:
+    rc, out, err = run(*argv, "--project", P)
+    assert rc == 0, (argv, out, err)
+    return out
+
+
+def _sql(dsn, query, params=()):
+    with _real_connect(dsn) as conn:
+        rows = conn.execute(query, params).fetchall() if query.lstrip().upper().startswith("SELECT") else None
+        if rows is None:
+            conn.execute(query, params)
+        conn.commit()
+    return rows
+
+
+def _history(dsn, row_id):
+    return _sql(dsn, "SELECT from_state, to_state, changes, note FROM ledger_history WHERE project = %s "
+                     "AND row_id = %s ORDER BY id", (P, row_id))
+
+
+def _snapshot(tmp_path) -> Path:
+    from khipu import hub_snapshot as hs
+
+    path = hs.snapshot_path()
+    con = sqlite3.connect(str(path))
+    hs._create_schema(con)
+    con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('refreshed_at', '2026-10-15T12:00:00Z')")
+    con.commit()
+    con.close()
+    return path
+
+
+# ---- the migration ------------------------------------------------------------
+
+
+def test_the_migration_is_additive_and_safe_to_re_run(hub):
+    got = _sql(hub, "SELECT version FROM schema_migrations WHERE version = '0028_ledger'")
+    assert got == [("0028_ledger",)]
+    text = (MIGRATIONS / "0028_ledger.sql").read_text(encoding="utf-8")
+    for statement in ("DROP ", "ALTER ", "DELETE ", "TRUNCATE "):
+        assert statement not in text.upper()
+
+
+# ---- the printed shapes -------------------------------------------------------------
+
+
+def test_the_printed_lines_match_the_trackers_for_the_same_input(hub, monkeypatch):
+    from khipu import ledger
+
+    ledger.set_setting("ledger_owner_word", "NEEDS MATT")
+    assert ok("add", "g-1", "--title", "Ship the thing", "--kind", "goal").strip() == "added g-1: NOT STARTED"
+    assert ok("add", "s-1", "--title", "First slice", "--kind", "slice", "--parent", "g-1", "--owner",
+              "lane-a").strip() == "added s-1: NOT STARTED"
+    assert ok("add", "n-1", "--title", "Pick a name", "--kind", "needs-matt", "--state", "NEEDS MATT").strip() \
+        == "added n-1: NEEDS MATT"
+    assert ok("set", "s-1", "--state", "IN FLIGHT", "--evidence", "PR 41").strip() == "set s-1: state, evidence"
+    assert ok("set", "s-1", "--note", "still going").strip() == "set s-1: note appended"
+    lines = ok("list").splitlines()
+    assert lines[0].startswith("g-1 · NOT STARTED · Ship the thing · owner=none · updated=20")
+    assert lines[-2:] == ["", "3 row(s)"]
+    loose = ok("loose-ends").splitlines()
+    assert loose[0] == "== IN FLIGHT (1)"
+    assert loose[1] == "s-1 · First slice · owner=lane-a · PR 41"
+    assert loose[-1].startswith("2 loose end(s); 1 without an owner; terminal states = ['DONE', 'DROPPED', "
+                                "'NEEDS MATT', 'VERIFIED']")
+    needs = ok("needs-matt").splitlines()
+    assert needs == ["n-1 · Pick a name · evidence=", "", "1 row(s) need Matt"]
+    assert ok("needs-owner").splitlines() == needs
+    assert ok("check").startswith("CHECK OK: 3 rows")
+    board = ok("render")
+    heads = [ln for ln in board.splitlines() if ln.startswith("#")]
+    assert [h.split(" (")[0] for h in heads[:-1]] == [
+        "# Orchestrator Tracker", "## Counts by state", "## Counts by kind", "## Rows", "### goal", "### slice",
+        "### needs-matt"]
+    assert heads[-1].startswith("## Changed since 20")
+    assert "- NEEDS MATT: 1" in board and "- needs-matt: 1" in board
+    assert "**parent: g-1: Ship the thing**" in board
+    out = Path(os.environ["KHIPU_DATA_DIR"]) / "board.md"
+    assert ok("render", "--out", str(out)).strip() == f"rendered 3 rows -> {out}"
+    assert out.read_text(encoding="utf-8").startswith("# Orchestrator Tracker")
+    got = json.loads(ok("get", "s-1"))
+    assert {"id", "title", "kind", "parent", "state", "evidence", "owner", "updated", "history"} <= set(got)
+    assert [(h["from"], h["to"]) for h in got["history"]] == [(None, "NOT STARTED"), ("NOT STARTED", "IN FLIGHT"),
+                                                            ("IN FLIGHT", "IN FLIGHT")]
+    assert got["history"][0]["ts"].endswith("Z")
+
+
+def test_errors_use_the_trackers_exit_code_and_name_the_allowed_words(hub):
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    rc, _out, err = run("add", "s-1", "--title", "Again", "--kind", "slice", "--project", P)
+    assert rc == 1 and err.strip() == "error: row s-1 already exists; use set to update it"
+    rc, _out, err = run("set", "s-1", "--state", "SHIPPED", "--project", P)
+    assert rc == 1 and "state must be one of: VERIFIED, MERGED-UNVERIFIED, BUILT-UNMERGED, IN FLIGHT" in err
+    rc, _out, err = run("set", "nope", "--state", "DONE", "--project", P)
+    assert rc == 1 and err.strip() == "error: no such row: nope"
+    rc, out, _err = run("set", "nope", "--state", "DONE", "--project", P, "--json")
+    assert rc == 1 and json.loads(out)["reason"] == "not_found"
+
+
+# ---- many writers ------------------------------------------------------------------
+
+
+def test_two_writers_at_once_both_land_in_history(hub):
+    from khipu import ledger
+
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    barrier, errors = threading.Barrier(2), []
+
+    def writer(evidence):
+        try:
+            barrier.wait()
+            ledger.write(ledger.new_op("set", P, "s-1", fields={"evidence": evidence}))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(e,)) for e in ("from A", "from B")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    entries = [h for h in _history(hub, "s-1") if "evidence" in h[2]]
+    assert sorted(h[2]["evidence"]["new"] for h in entries) == ["from A", "from B"]
+    # History order is the order writes landed: the later one is the value.
+    final = _sql(hub, "SELECT evidence, version FROM ledger_rows WHERE row_id = 's-1'")[0]
+    assert final[0] == entries[-1][2]["evidence"]["new"] and final[1] == 3
+    assert entries[-1][2]["evidence"]["old"] == entries[0][2]["evidence"]["new"]
+
+
+def test_two_new_rows_at_once_keep_distinct_order(hub):
+    from khipu import ledger
+
+    barrier = threading.Barrier(4)
+
+    def adder(i):
+        barrier.wait()
+        ledger.write(ledger.new_op("add", P, f"s-{i}", fields={"title": f"Slice {i}", "kind": "slice"}))
+
+    threads = [threading.Thread(target=adder, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    seqs = [r[0] for r in _sql(hub, "SELECT seq FROM ledger_rows ORDER BY seq")]
+    assert seqs == [1, 2, 3, 4]
+
+
+def test_if_state_refuses_a_moved_row(hub):
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    ok("set", "s-1", "--state", "IN FLIGHT")
+    rc, _out, err = run("set", "s-1", "--state", "DONE", "--if-state", "NOT STARTED", "--project", P)
+    assert rc == 1
+    assert "row s-1 is IN FLIGHT now, set by a shell command" in err and "nothing was changed" in err
+    assert _sql(hub, "SELECT state FROM ledger_rows")[0][0] == "IN FLIGHT"
+    assert ok("set", "s-1", "--state", "DONE", "--if-state", "IN FLIGHT").strip() == "set s-1: state"
+
+
+def test_a_retried_op_id_writes_once(hub):
+    first = ok("add", "s-1", "--title", "A slice", "--kind", "slice", "--op-id", "op-add-1")
+    again = ok("add", "s-1", "--title", "A slice", "--kind", "slice", "--op-id", "op-add-1")
+    assert first == again == "added s-1: NOT STARTED\n"
+    ok("set", "s-1", "--state", "QUEUED", "--op-id", "op-set-1")
+    ok("set", "s-1", "--state", "QUEUED", "--op-id", "op-set-1")
+    assert len(_history(hub, "s-1")) == 2
+
+
+def test_history_keeps_old_and_new_values_and_a_note_alone(hub):
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice", "--evidence", "first")
+    ok("set", "s-1", "--evidence", "second", "--owner", "lane-b", "--title", "A better slice",
+       "--link", "https://example.com/pull/7?x=1#frag")
+    ok("set", "s-1", "--note", "only a note")
+    hist = _history(hub, "s-1")
+    assert hist[1][2] == {"evidence": {"old": "first", "new": "second"}, "owner": {"old": "none", "new": "lane-b"},
+                          "title": {"old": "A slice", "new": "A better slice"},
+                          "link": {"old": "", "new": "https://example.com/pull/7"}}
+    assert hist[2][2] == {} and hist[2][3] == "only a note"
+
+
+# ---- per-project words ------------------------------------------------------------
+
+
+def test_each_project_keeps_its_own_words(hub):
+    from khipu import ledger
+
+    vocab = {"state": [["review", "open"], ["complete", "done"], ["ON HOLD", "open"], ["NEEDS MATT", "needs"]],
+             "kind": ["implementation", "verification"]}
+    with _real_connect(hub) as conn:
+        with conn.cursor() as cur:
+            ledger.ensure_project(cur, "other/proj", vocab)
+        conn.commit()
+    rc, _o, err = run("add", "i-1", "--title", "Build it", "--kind", "slice", "--state", "review",
+                      "--project", "other/proj")
+    assert rc == 1 and "kind must be one of: implementation, verification" in err
+    rc, out, _e = run("add", "i-1", "--title", "Build it", "--kind", "implementation", "--state", "review",
+                      "--project", "other/proj")
+    assert rc == 0 and out.strip() == "added i-1: review"
+    rc, _o, err = run("set", "i-1", "--state", "VERIFIED", "--project", "other/proj")
+    assert rc == 1 and "state must be one of: review, complete, ON HOLD, NEEDS MATT" in err
+    assert run("set", "i-1", "--state", "complete", "--project", "other/proj")[0] == 0
+    # NEEDS OWNER names this project's own needs-you word; the stored word is the project's.
+    assert run("set", "i-1", "--state", "NEEDS OWNER", "--project", "other/proj")[0] == 0
+    assert _sql(hub, "SELECT state FROM ledger_rows WHERE project = 'other/proj'")[0][0] == "NEEDS MATT"
+    # The default project in the same database still uses the standard words.
+    assert ok("add", "s-1", "--title", "A slice", "--kind", "slice", "--state", "NEEDS MATT").strip() \
+        == "added s-1: NEEDS OWNER"
+
+
+def test_history_is_kept_verbatim_in_both_shapes(hub):
+    ok("add", "s-1", "--title", "Line one\nline two of a multi-line title", "--kind", "slice")
+    raw_event = {"at": "2026-09-01T10:00:00Z", "event": "Owner authorised the release in chat"}
+    raw_transition = {"ts": "2026-09-02T11:00:00Z", "from": None, "to": "QUEUED", "note": "a\nmulti-line\nnote"}
+    with _real_connect(hub) as conn:
+        for shape, raw in (("event", raw_event), ("transition", raw_transition)):
+            conn.execute("INSERT INTO ledger_history (project, row_id, at, at_text, author, shape, event, raw, "
+                         "source) VALUES (%s, 's-1', %s, %s, '{\"kind\": \"import\"}', %s, %s, %s, 'import')",
+                         (P, raw.get("at") or raw["ts"], raw.get("at") or raw["ts"], shape, raw.get("event"),
+                          json.dumps(raw)))
+        conn.commit()
+    got = json.loads(ok("get", "s-1"))
+    assert got["title"] == "Line one\nline two of a multi-line title"
+    assert got["history"][1:] == [raw_event, raw_transition]
+
+
+# ---- limits are settings ----------------------------------------------------------
+
+
+def test_every_limit_is_a_setting_and_0_lifts_it(hub):
+    from khipu import ledger
+
+    long_title = "t" * 2001
+    rc, _o, err = run("add", "s-1", "--title", long_title, "--kind", "slice", "--project", P)
+    assert rc == 1 and "title is 2001 characters; the limit is 2000 (ledger_title_chars)" in err
+    ledger.set_setting("ledger_title_chars", "0")
+    assert ok("add", "s-1", "--title", long_title, "--kind", "slice").strip() == "added s-1: NOT STARTED"
+    assert set(ledger.SETTINGS) == {"ledger_id_chars", "ledger_title_chars", "ledger_evidence_chars",
+                                    "ledger_stale_after", "ledger_purge_after", "ledger_owner_word"}
+
+
+def test_a_key_shaped_string_is_refused(hub):
+    for argv in (("add", "s-1", "--title", f"use {KEY}", "--kind", "slice"),
+                 ("add", "s-1", "--title", "fine", "--kind", "slice", "--evidence", KEY),
+                 ("add", "s-1", "--title", "fine", "--kind", "slice", "--note", f"token {KEY}")):
+        rc, _o, err = run(*argv, "--project", P)
+        assert rc == 1 and "This looks like a key or password; nothing was saved" in err
+    assert _sql(hub, "SELECT count(*) FROM ledger_rows")[0][0] == 0
+    assert _sql(hub, "SELECT count(*) FROM ledger_history")[0][0] == 0
+
+
+# ---- order -----------------------------------------------------------------------
+
+
+def test_listings_never_order_by_state(hub):
+    for i, state in enumerate(("VERIFIED", "NOT STARTED", "IN FLIGHT", "DONE")):
+        ok("add", f"z-{i}", "--title", f"Slice {i}", "--kind", "slice", "--state", state)
+    ok("set", "z-0", "--state", "QUEUED")
+    ok("set", "z-3", "--state", "BUILT-UNMERGED")
+    listed = [ln.split(" · ")[0] for ln in ok("list").splitlines() if " · " in ln]
+    assert listed == ["z-0", "z-1", "z-2", "z-3"]
+    rendered = [ln[2:].split(" · ")[0] for ln in ok("render").split("## Rows")[1].split("## Changed")[0].splitlines()
+                if ln.startswith("- ")]
+    assert rendered == listed
+
+
+# ---- remove, restore, purge -----------------------------------------------------------
+
+
+def test_a_removed_row_is_gone_everywhere_at_once(hub, tmp_path):
+    from khipu import hub_snapshot as hs
+
+    _snapshot(tmp_path)
+    ok("add", "n-1", "--title", "Needs a call", "--kind", "needs-owner", "--state", "NEEDS OWNER")
+    ok("add", "s-1", "--title", "Stays", "--kind", "slice")
+    assert {r["row_id"] for r in hs.ledger_read_snapshot(P)["rows"]} == {"n-1", "s-1"}
+    assert ok("remove", "n-1", "--note", "duplicate").strip() == "removed n-1"
+    assert "n-1" not in ok("list") and "n-1" not in ok("render") and "n-1" not in ok("loose-ends")
+    assert ok("needs-owner").splitlines()[-1] == "0 row(s) need the owner"
+    assert "Total rows: 1" in ok("render") and "- NEEDS OWNER: 0" in ok("render")
+    assert ok("check").startswith("CHECK OK: 1 rows")
+    assert {r["row_id"] for r in hs.ledger_read_snapshot(P)["rows"]} == {"s-1"}
+    rc, _o, err = run("get", "n-1", "--project", P)
+    assert rc == 1 and "row n-1 was removed on 20" in err and "by a shell command" in err
+    removed = json.loads(ok("removed", "--json"))["removed"]
+    assert [(r["id"], r["days_left"]) for r in removed] == [("n-1", 30)]
+
+
+def test_restore_brings_a_row_back_with_its_history(hub):
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    ok("set", "s-1", "--state", "IN FLIGHT")
+    ok("remove", "s-1")
+    rc, _o, err = run("restore", "s-1", "--project", P)
+    assert rc == 1 and "restored in the Khipu app" in err
+    assert ok("restore", "s-1", "--from-app").strip() == "restored s-1"
+    got = json.loads(ok("get", "s-1"))
+    assert got["state"] == "IN FLIGHT"
+    assert [h["note"] for h in got["history"]] == ["seeded", "", "Removed", "Restored by you, in the app"]
+    assert got["history"][-1]["by"] == "you, in the app"
+
+
+def test_a_row_removed_30_days_ago_is_purged_to_a_bare_marker(hub):
+    from khipu import ledger
+
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice", "--op-id", "op-first-add")
+    ok("add", "s-2", "--title", "Removed yesterday", "--kind", "slice")
+    ok("remove", "s-1")
+    ok("remove", "s-2")
+    _sql(hub, "UPDATE ledger_rows SET removed_at = now() - interval '31 days' WHERE row_id = 's-1'")
+    with _real_connect(hub) as conn:
+        assert ledger.purge_due(conn) == {"ok": True, "purged": 1}
+    assert _sql(hub, "SELECT row_id FROM ledger_rows") == [("s-2",)]
+    assert _sql(hub, "SELECT count(*) FROM ledger_history WHERE row_id = 's-1'") == [(0,)]
+    marker = _sql(hub, "SELECT project, row_id, removed_by->>'kind' FROM ledger_removed")
+    assert marker == [(P, "s-1", "conversation")]
+    rc, _o, err = run("add", "s-1", "--title", "Back again", "--kind", "slice", "--project", P)
+    assert rc == 1 and "row s-1 was removed for good on 20" in err
+    rc, _o, err = run("add", "s-1", "--title", "A slice", "--kind", "slice", "--op-id", "op-first-add",
+                      "--project", P)
+    assert rc == 1 and "removed for good" in err
+    rc, _o, err = run("get", "s-1", "--project", P)
+    assert rc == 1 and "removed for good" in err
+
+
+def test_remove_for_good_at_once_is_the_apps_and_needs_a_removed_row(hub):
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    assert run("purge", "s-1", "--project", P)[0] == 1
+    rc, _o, err = run("purge", "s-1", "--project", P, "--from-app")
+    assert rc == 1 and "remove it first" in err
+    ok("remove", "s-1")
+    assert ok("purge", "s-1", "--from-app").strip() == "removed s-1 for good"
+    assert _sql(hub, "SELECT count(*) FROM ledger_rows") == [(0,)]
+
+
+def test_remove_with_children_needs_a_choice_and_each_does_what_it_says(hub):
+    ok("add", "g-1", "--title", "Goal", "--kind", "goal")
+    ok("add", "s-1", "--title", "Slice", "--kind", "slice", "--parent", "g-1")
+    ok("add", "r-1", "--title", "Review", "--kind", "review", "--parent", "s-1")
+    ok("add", "g-2", "--title", "Goal two", "--kind", "goal")
+    ok("add", "s-2", "--title", "Slice two", "--kind", "slice", "--parent", "g-2")
+    rc, _o, err = run("remove", "g-1", "--project", P)
+    assert rc == 1 and "row g-1 has 1 child row(s); say --children remove" in err
+    assert ok("remove", "g-1", "--children", "remove").strip() == "removed g-1 and 2 child row(s)"
+    assert _sql(hub, "SELECT row_id FROM ledger_rows WHERE removed_at IS NULL ORDER BY seq") == [("g-2",), ("s-2",)]
+    assert ok("remove", "g-2", "--children", "move-up").strip() == "removed g-2; 1 child row(s) moved up to the top"
+    assert _sql(hub, "SELECT parent FROM ledger_rows WHERE row_id = 's-2'") == [("",)]
+    assert _history(hub, "s-2")[-1][2] == {"parent": {"old": "g-2", "new": ""}}
+
+
+def test_khipu_forget_on_a_ledger_id_removes_it(hub):
+    from khipu import mcp_server
+
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    out = mcp_server._tool_forget({"id": f"ledger:{P}#s-1", "note": "written by mistake"})
+    assert out["ok"] and out["line"] == "removed s-1"
+    assert _sql(hub, "SELECT removed_note, removed_at IS NOT NULL FROM ledger_rows") == [("written by mistake", True)]
+    with pytest.raises(ValueError, match="no such row"):
+        mcp_server._tool_forget({"id": f"ledger:{P}#nope"})
+
+
+def test_the_only_delete_in_the_module_is_the_purge():
+    from khipu import ledger
+
+    tree = ast.parse(Path(ledger.__file__).read_text(encoding="utf-8"))
+    purge = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_purge_row")
+    inside = {id(n) for n in ast.walk(purge)}
+    deletes = [n for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+               and "DELETE " in n.value.upper() and n.value.lstrip().upper().startswith("DELETE")]
+    assert deletes and all(id(n) in inside for n in deletes)
+
+
+# ---- the hub away ----------------------------------------------------------------
+
+
+def test_the_hub_away_queues_doctor_goes_red_and_a_drain_lands_it(hub, monkeypatch):
+    from khipu import cli, ledger
+
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    _away(monkeypatch)
+    out = ok("set", "s-1", "--state", "IN FLIGHT", "--if-state", "NOT STARTED")
+    assert out.splitlines() == ["set s-1: queued",
+                                "Saved on this Mac; it reaches the ledger when the database answers"]
+    assert ledger.outbox_status()["pending"] == 1
+    assert cli._doctor_local_checks(None)["ledger_outbox_ok"] is False
+    monkeypatch.setenv("KHIPU_DATABASE_URL", hub)
+    # The next ledger call that reaches the hub lands it first.
+    assert "s-1 · IN FLIGHT" in ok("list")
+    assert ledger.outbox_status() == {"pending": 0, "refused": 0, "oldest_age_s": None}
+    assert cli._doctor_local_checks(None)["ledger_outbox_ok"] is True
+
+
+def test_a_late_if_state_becomes_a_history_entry(hub, monkeypatch):
+    from khipu import ledger
+
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    _away(monkeypatch)
+    ok("set", "s-1", "--state", "DONE", "--if-state", "NOT STARTED", "--note", "finished offline")
+    monkeypatch.setenv("KHIPU_DATABASE_URL", hub)
+    with _real_connect(hub) as conn:
+        ledger.apply_op(conn, ledger.new_op("set", P, "s-1", fields={"state": "IN FLIGHT"}))
+        assert ledger.drain(conn)["landed"] == 1
+    assert _sql(hub, "SELECT state FROM ledger_rows") == [("IN FLIGHT",)]
+    last = _history(hub, "s-1")[-1]
+    assert last[0] == last[1] == "IN FLIGHT"
+    assert last[3] == "arrived late; the row had moved to IN FLIGHT. finished offline"
+    assert last[2] == {"requested": {"state": {"old": "IN FLIGHT", "new": "DONE"}}}
+
+
+def test_reads_while_away_come_from_the_offline_copy_plus_the_queue(hub, monkeypatch, tmp_path):
+    _snapshot(tmp_path)
+    ok("add", "s-1", "--title", "In the copy", "--kind", "slice")
+    ok("add", "s-2", "--title", "Removed while away", "--kind", "slice")
+    _away(monkeypatch)
+    assert ok("add", "s-3", "--title", "Queued", "--kind", "slice").splitlines()[0] == "added s-3: NOT STARTED"
+    ok("set", "s-1", "--state", "IN FLIGHT")
+    ok("remove", "s-2")
+    out = ok("list")
+    assert [ln.split(" · ")[:2] for ln in out.splitlines() if " · " in ln] == [["s-1", "IN FLIGHT"],
+                                                                             ["s-3", "NOT STARTED"]]
+    assert "read from the offline copy as of 2026-10-15T12:00:00Z, with 3 waiting change(s) applied" in out
+    rc, _o, err = run("add", "s-1", "--title", "Dup", "--kind", "slice", "--project", P)
+    assert rc == 1 and "already exists" in err
+
+
+def test_the_refresh_copies_live_rows_only(hub, tmp_path):
+    from khipu import hub_snapshot as hs
+
+    ok("add", "s-1", "--title", "Kept", "--kind", "slice")
+    ok("add", "s-2", "--title", "Removed", "--kind", "slice")
+    ok("remove", "s-2")
+    con = sqlite3.connect(":memory:")
+    hs._create_schema(con)
+    with _real_connect(hub) as conn:
+        with conn.cursor() as cur:
+            assert hs._insert_ledger(cur, con) == 1
+    assert con.execute("SELECT row_id FROM ledger_rows").fetchall() == [("s-1",)]
+    assert {r[0] for r in con.execute("SELECT row_id FROM ledger_history")} == {"s-1"}
+    assert con.execute("SELECT count(*) FROM ledger_vocab").fetchone()[0] == 18
+
+
+def test_doctor_block_reports_counts_and_the_nightly_purges(hub):
+    from khipu import ledger
+
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    ok("add", "s-2", "--title", "Removed", "--kind", "slice")
+    ok("remove", "s-2")
+    block = ledger.doctor_block()
+    assert block["projects"] == {P: {"rows": 1, "removed": 1, "history": 3}}
+    assert block["removed_waiting_to_purge"] == 1 and block["purged_markers"] == 0
+    assert block["in_dump"] == "whole database"
+    _sql(hub, "UPDATE ledger_rows SET removed_at = now() - interval '40 days' WHERE row_id = 's-2'")
+    assert ledger.nightly() == {"ok": True, "landed": 0, "refused": 0, "purged": 1}
+    assert ledger.doctor_block()["purged_markers"] == 1
