@@ -318,6 +318,26 @@ class RecallQualityMetricHelpersTest(unittest.TestCase):
         self.assertEqual(row["value"], 50)
         self.assertFalse(row["ok"])  # 50/1000 = 0.05 > 0.01 threshold
 
+    def test_cross_session_pairs_query_is_a_range_join_not_every_pair(self):
+        """The pair count ran a self-join over every pair in 30 days of
+        episodes (29 s on the live hub, inside every `khipu status`). It must
+        find each pair's later episode by a ts range instead, and treat a
+        missing project or parent the same on either side of the pair."""
+        from khipu.drift import _cross_session_pairs_5min
+
+        cur = _FakeCur([
+            ("SELECT column_name FROM information_schema.columns",
+             {"rows": [("project",), ("parent_session_id",)]}),
+            ("WITH recent AS", {"row": (3,)}),
+            ("SELECT COUNT(*) FROM episodes WHERE ts", {"row": (1000,)}),
+        ])
+        _cross_session_pairs_5min(cur)
+        sql = next(s for s, _p in cur.calls if s.startswith("WITH recent AS"))
+        self.assertIn("b.ts <= a.ts + interval '300 seconds'", sql)
+        self.assertNotIn("abs(extract", sql)
+        self.assertNotIn("a.id < b.id", sql)
+        self.assertNotIn("NOT (a.project IS NOT NULL", sql)
+
     def test_dangling_topic_ratio_computes(self):
         from khipu.drift import _dangling_topic_ratio
 
