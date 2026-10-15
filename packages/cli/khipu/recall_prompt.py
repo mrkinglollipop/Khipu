@@ -824,6 +824,13 @@ _POLL_LOOK_MOST = 12.0
 _KEEP = object()
 
 
+# A reset whose outcome could not be written (a full or read-only disk) is
+# not probed again for this long, then is checked again: at most one probe
+# per this many seconds while the disk stays broken, and the check resumes
+# once it recovers.
+_BLOCKED_RESET_RETRY_S = 300.0
+
+
 class RefoldSchedule:
     """When the routing helper next refolds the record. ``wall`` and
     ``mono`` are the clocks (tests pass fakes). Due when the poll interval
@@ -851,6 +858,18 @@ class RefoldSchedule:
         self.view_seen: Any = None
         self.reset_settings: Any = None
         self.blocked_resets: dict[str, str] = {}
+        # When each block was set (wall clock, so a Mac's sleep counts): a block lasts
+        # ``_BLOCKED_RESET_RETRY_S``, then the same reset is checked again, so
+        # a disk that recovers gets its check (re-check of fix round 3).
+        self.blocked_at: dict[str, float] = {}
+
+    def live_blocks(self, now: float | None = None) -> dict[str, str]:
+        """The blocks still in force; expired ones are dropped."""
+        now = self._wall() if now is None else now
+        for key in [k for k, at in self.blocked_at.items() if now - at >= _BLOCKED_RESET_RETRY_S]:
+            self.blocked_at.pop(key, None)
+            self.blocked_resets.pop(key, None)
+        return dict(self.blocked_resets)
 
     def configure(self, interval: Any, *, off: bool, checks_only: bool = False,
                   reset_settings: Any = None) -> None:
@@ -1174,12 +1193,21 @@ def _take_poll_answer(schedule: "RefoldSchedule", out: dict | None) -> None:
     if out is None:
         schedule.ran(ok=False)
         return
-    schedule.blocked_resets.update(_failed_reset_writes(out.get("reset_checks") or []))
+    failed = _failed_reset_writes(out.get("reset_checks") or [])
+    now = schedule._wall()
+    for key, until in failed.items():
+        if schedule.blocked_resets.get(key) != until:
+            schedule.blocked_at[key] = now  # a new block, or a block on a later reset
+        schedule.blocked_resets[key] = until
     seen = out.get("view_stat")
     if isinstance(seen, list) and not schedule.off:
         schedule.view_seen = seen
     due = out.get("due")
     due = float(due) if isinstance(due, (int, float)) and not isinstance(due, bool) else None
+    if schedule.blocked_at:
+        # Wake when the first block ends: the reset it held is checked again.
+        ends = min(schedule.blocked_at.values()) + _BLOCKED_RESET_RETRY_S
+        due = ends if due is None else min(due, ends)
     ok = not out.get("busy") and out.get("saved", True) is not False
     schedule.ran(due, ok=ok, interval=out.get("interval"))
 
@@ -1307,7 +1335,7 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
             return None
         if pid == 0:
             os.close(read_fd)
-            _poll_routing_child(write_fd, blocked_resets=schedule.blocked_resets)
+            _poll_routing_child(write_fd, blocked_resets=schedule.live_blocks())
         pollers.add(pid)
         os.close(write_fd)
         return read_fd

@@ -228,7 +228,7 @@ def _helper_poll(schedule) -> dict:
     """A poll as the helper runs it: the view's stat first, then the child's
     poll, then the helper takes its answer."""
     schedule.view_seen = recall_prompt._view_stat(routing)
-    out = recall_prompt._poll_once(routing, blocked_resets=dict(schedule.blocked_resets))
+    out = recall_prompt._poll_once(routing, blocked_resets=schedule.live_blocks())
     out = json.loads(json.dumps(out))  # a child's answer crosses the pipe as JSON
     recall_prompt._take_poll_answer(schedule, out)
     return out
@@ -257,7 +257,7 @@ def test_failed_reset_outcome_write_stops_repeated_probes(home, monkeypatch, pus
     monkeypatch.setattr(routing, "_append_locked", cannot_append)
     schedule = _schedule(home)
     outcomes = []
-    for _ in range(30):
+    for _ in range(int(recall_prompt._BLOCKED_RESET_RETRY_S // 10) - 2):  # within the block
         recall_prompt._look_at_settings(schedule, routing)
         if schedule.due():
             outcomes.extend(_helper_poll(schedule)["reset_checks"])
@@ -276,6 +276,48 @@ def test_failed_reset_outcome_write_stops_repeated_probes(home, monkeypatch, pus
     recall_prompt._look_at_settings(schedule, routing)
     _helper_poll(schedule)
     assert probed == ["Claude", "Codex", "Claude"]
+
+
+def test_a_reset_whose_outcome_could_not_be_written_is_checked_again_once_the_disk_recovers(home, monkeypatch):
+    # Re-check of fix round 3: the block on a reset whose outcome could not be
+    # written never ended, so after the disk recovered that reset was never
+    # checked again. A block lasts _BLOCKED_RESET_RETRY_S, then the same reset
+    # is probed again: at most one probe per that wait while the disk is broken.
+    clocks = home["clocks"]
+    _set(home, routing_push_prompt=False, routing_reset_check=True, routing_busy_load=0)
+    until = T0 + timedelta(minutes=20)
+    routing.report(account="Claude", state="limited", until=routing._iso(until), author=ME)
+    clocks.run(22 * 60)
+    probed = []
+
+    def probe(account):
+        probed.append(clocks.now)
+        return {"ok": True, "source": "live", "windows": [
+            {"name": "five_hour", "used_pct": 0, "resets_at": routing._iso(until)}]}
+
+    def cannot_append(*_events):
+        raise OSError(errno.ENOSPC, "fake write failure")
+
+    monkeypatch.setattr("khipu.usage.probe_account", probe)
+    append = routing._append_locked
+    monkeypatch.setattr(routing, "_append_locked", cannot_append)
+    schedule = _schedule(home)
+    wait = recall_prompt._BLOCKED_RESET_RETRY_S
+
+    def step(seconds: float) -> None:
+        for _ in range(int(seconds // 10)):
+            recall_prompt._look_at_settings(schedule, routing)
+            if schedule.due():
+                _helper_poll(schedule)
+            clocks.run(10)
+
+    step(wait - 20)
+    assert len(probed) == 1  # blocked: no probe every 10 s while the disk is broken
+    monkeypatch.setattr(routing, "_append_locked", append)  # the disk recovers
+    step(wait)
+    assert len(probed) == 2  # the same reset is checked again
+    entry = next(a for a in routing.read_view()["accounts"] if a["key"] == "claude|")
+    assert entry["state"] == "open", entry
 
 
 @pytest.mark.parametrize("setting,old,new", [
