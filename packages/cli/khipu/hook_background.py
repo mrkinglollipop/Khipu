@@ -141,6 +141,10 @@ def run(mem_root: str, harness: str, sid: str) -> None:
 
         if ledger_jobs():
             _say(sid, harness, f"ledger outbox drain {ledger_drain()}")
+        from khipu.ledger import catch_up_offline_copy, replica_pending
+
+        if replica_pending():
+            _say(sid, harness, f"ledger offline copy catch-up {catch_up_offline_copy()}")
     except Exception as e:  # noqa: BLE001
         _say(sid, harness, f"ledger outbox drain skipped: {type(e).__name__}: {e}")
     try:

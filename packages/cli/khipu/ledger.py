@@ -32,6 +32,7 @@ import re
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,9 @@ PROJECT_MAX = 200
 SECRET_REFUSAL = "This looks like a key or password; nothing was saved"
 QUEUED_WORDS = "Saved on this Mac; it reaches the ledger when the database answers"
 HUB_CONNECT_TIMEOUT_S = 5
+# How long a write waits for another process draining this Mac's waiting writes
+# before it queues behind them instead.
+DRAIN_WAIT_S = 30.0
 
 # ---- settings -----------------------------------------------------------------
 
@@ -241,8 +245,8 @@ def _check_project(project: str | None) -> str:
 
 def _check_id(row_id: str, limits: dict[str, Any]) -> str:
     if not isinstance(row_id, str) or not _ID_RE.fullmatch(row_id):
-        raise LedgerError(f"row id {row_id!r} must start with a letter or digit and use only letters, digits "
-                          "and . _ : / -", "bad_id")
+        raise LedgerError("a row id must start with a letter or digit and use only letters, digits and . _ : / -",
+                          "bad_id")
     cap = limits["ledger_id_chars"]
     if cap and len(row_id) > cap:
         raise LedgerError(f"row id is {len(row_id)} characters; the limit is {cap} (ledger_id_chars)", "too_long")
@@ -266,17 +270,33 @@ def _check_link(raw: str) -> str:
     return urlunsplit(("https", parts.netloc, parts.path, "", ""))
 
 
-def _check_secrets(op: dict[str, Any]) -> None:
+def _strings(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            yield from _strings(k)
+            yield from _strings(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            yield from _strings(v)
+
+
+def refuse_secrets(*values: Any) -> None:
+    """Refuse when any string a caller sent (ids and the project included)
+    looks like a key. Runs before any other check, so no error message, queued
+    file or row ever carries one."""
     from khipu.redact import redact_secrets
 
-    texts = [op.get("note") or ""] + [str(v) for v in (op.get("fields") or {}).values() if isinstance(v, str)]
-    for text in texts:
+    for text in _strings(list(values)):
         if text and redact_secrets(text, force=True)[1]:
             raise LedgerError(SECRET_REFUSAL, "secret")
 
 
 def _check_op(op: dict[str, Any], limits: dict[str, Any]) -> None:
-    """Everything that needs no database: ids, lengths, links, secrets."""
+    """Everything that needs no database: secrets, ids, lengths, links. The
+    author is Khipu's own, so it is not a caller's string."""
+    refuse_secrets({k: v for k, v in op.items() if k != "author"})
     _check_project(op.get("project"))
     _check_id(op.get("row_id") or "", limits)
     fields = op.get("fields") or {}
@@ -290,7 +310,6 @@ def _check_op(op: dict[str, Any], limits: dict[str, Any]) -> None:
         _check_id(fields["parent"], {"ledger_id_chars": 0})
     if "link" in fields:
         fields["link"] = _check_link(fields["link"])
-    _check_secrets(op)
 
 
 def _word(vocab: dict[str, list], field: str, given: str | None) -> str | None:
@@ -677,6 +696,7 @@ def apply_op(conn, op: dict[str, Any], *, late: bool = False) -> dict[str, Any]:
 
 def purge(conn, project: str, row_id: str) -> dict[str, Any]:
     """Remove for good at once (the owner's choice in the app)."""
+    refuse_secrets(project, row_id)
     try:
         with conn.cursor() as cur:
             if not _purge_row(cur, project, row_id):
@@ -722,10 +742,51 @@ def purge_due(conn, *, now: datetime | None = None) -> dict[str, Any]:
 # ---- the offline copy ------------------------------------------------------------
 
 
+def _replica_pending_path() -> Path:
+    from khipu.paths import data_dir
+
+    return data_dir() / "ledger-replica-pending.json"
+
+
+@contextmanager
+def _replica_pending():
+    """The ids whose change has not reached the offline copy yet, as
+    ``{"<project>#<row id>": n}``; n grows each time the id changes again, so a
+    catch-up clears only what it actually copied. Read and written under a lock."""
+    from khipu.outbox import _atomic_write
+
+    path = _replica_pending_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path.with_suffix(".lock")), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            pending = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pending = {}
+        if not isinstance(pending, dict):
+            pending = {}
+        before = dict(pending)
+        yield pending
+        if pending != before:
+            _atomic_write(path, pending)
+    finally:
+        os.close(fd)
+
+
+def replica_pending() -> int:
+    try:
+        with _replica_pending() as pending:
+            return len(pending)
+    except OSError:
+        return 0
+
+
 def _replica_sync(conn, project: str, row_ids: list[str]) -> None:
-    """Write the landed change through to the offline copy at once, so a
-    removed row is gone from it and a new one is in it. Fail-open: the next
-    full refresh repairs a miss."""
+    """Write a landed change through to the offline copy, so a removed row is
+    gone from it and a new one is in it. The ids are written down first and
+    cleared only once copied: a copy skipped because a refresh holds the file,
+    or failed, is retried by the next ledger call that reaches the hub."""
     if not row_ids:
         return
     try:
@@ -733,20 +794,78 @@ def _replica_sync(conn, project: str, row_ids: list[str]) -> None:
 
         if not hub_snapshot.snapshot_path().is_file():
             return
-        with conn.cursor() as cur:
-            vocab = _vocab(cur, project)
-            cur.execute("SELECT name, hidden, created_at FROM ledger_projects WHERE project = %s", (project,))
-            proj = cur.fetchone()
-            cur.execute(f"SELECT {', '.join(_ROW_COLS)} FROM ledger_rows WHERE project = %s AND row_id = ANY(%s) "
-                        "AND removed_at IS NULL", (project, row_ids))
-            rows = [_row_dict(r) for r in cur.fetchall()]
-            cur.execute(f"SELECT {', '.join(_HIST_COLS)} FROM ledger_history WHERE project = %s "
-                        "AND row_id = ANY(%s) ORDER BY id", (project, [r["row_id"] for r in rows]))
-            history = [dict(zip(_HIST_COLS, h, strict=True)) for h in cur.fetchall()]
-        conn.rollback()
-        hub_snapshot.ledger_write_snapshot(project, proj, vocab, rows, history, row_ids)
+        with _replica_pending() as pending:
+            for row_id in row_ids:
+                key = f"{project}#{row_id}"
+                pending[key] = int(pending.get(key) or 0) + 1
     except Exception as exc:  # noqa: BLE001  (the hub write already landed)
         print(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return
+    replica_catch_up(conn)
+
+
+def replica_catch_up(conn) -> dict[str, Any]:
+    """Copy every id still waiting for the offline copy from the hub as it is
+    now. Safe to repeat: the copy keeps the newest version of each row.
+    Fail-open."""
+    out: dict[str, Any] = {"copied": 0, "left": 0}
+    try:
+        from khipu import hub_snapshot
+
+        with _replica_pending() as pending:
+            seen = dict(pending)
+        if not seen:
+            return out
+        by_project: dict[str, list[str]] = {}
+        for key in seen:
+            project, _sep, row_id = key.partition("#")
+            by_project.setdefault(project, []).append(row_id)
+        done: list[str] = []
+        for project, ids in by_project.items():
+            with conn.cursor() as cur:
+                vocab = _vocab(cur, project)
+                cur.execute("SELECT name, hidden, created_at FROM ledger_projects WHERE project = %s", (project,))
+                proj = cur.fetchone()
+                cur.execute(f"SELECT {', '.join(_ROW_COLS)} FROM ledger_rows WHERE project = %s "
+                            "AND row_id = ANY(%s)", (project, ids))
+                found = [_row_dict(r) for r in cur.fetchall()]
+                rows = [r for r in found if r["removed_at"] is None]
+                gone = {r["row_id"]: r["version"] for r in found if r["removed_at"] is not None}
+                cur.execute(f"SELECT {', '.join(_HIST_COLS)} FROM ledger_history WHERE project = %s "
+                            "AND row_id = ANY(%s) ORDER BY id", (project, [r["row_id"] for r in rows]))
+                history = [dict(zip(_HIST_COLS, h, strict=True)) for h in cur.fetchall()]
+            conn.rollback()
+            got = hub_snapshot.ledger_write_snapshot(project, proj, vocab, rows, history, ids, gone=gone)
+            # No offline copy at all: the next refresh copies everything.
+            if got.get("ok") or got.get("missing"):
+                done += [f"{project}#{i}" for i in ids]
+            else:
+                print(f"[khipu-ledger] offline copy not updated yet ({got.get('error')}); "
+                      "the next ledger call retries it", file=sys.stderr)
+        with _replica_pending() as pending:
+            for key in done:
+                if pending.get(key) == seen[key]:
+                    del pending[key]
+            out["left"] = len(pending)
+        out["copied"] = len(done)
+    except Exception as exc:  # noqa: BLE001  (the hub write already landed)
+        print(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}", file=sys.stderr)
+        out["error"] = f"{type(exc).__name__}: {exc}"[:200]
+    return out
+
+
+def catch_up_offline_copy() -> dict[str, Any]:
+    """The Stop hook's step: copy ids still waiting for the offline copy."""
+    if not replica_pending():
+        return {"copied": 0, "left": 0}
+    try:
+        conn = _connect()
+    except HubAway:
+        return {"copied": 0, "left": replica_pending(), "away": True}
+    try:
+        return replica_catch_up(conn)
+    finally:
+        conn.close()
 
 
 # ---- the outbox ----------------------------------------------------------------
@@ -807,24 +926,55 @@ def outbox_status() -> dict[str, Any]:
     return {"pending": len(jobs), "refused": len(refused), "oldest_age_s": oldest}
 
 
+def _drain_result() -> dict[str, Any]:
+    return {"jobs": 0, "landed": 0, "refused": 0, "stopped_early": False}
+
+
+@contextmanager
+def _drain_lock(wait_s: float = 0.0):
+    """The one lock that orders writes on this Mac: a drain holds it, and so
+    does a write while waiting writes go ahead of it. Yields False when it
+    could not be had within ``wait_s``."""
+    d = outbox_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(d / ".drain.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + wait_s
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.05)
+        yield True
+    finally:
+        os.close(fd)
+
+
 def drain(conn=None) -> dict[str, Any]:
     """Send every waiting write to the hub, oldest first. A write the ledger
     refuses now (its row was removed meanwhile, say) moves to ``refused/`` and
     keeps doctor red; nothing is dropped. Stops at the first sign the hub is
     away and keeps the rest."""
-    out: dict[str, Any] = {"jobs": 0, "landed": 0, "refused": 0, "stopped_early": False}
+    out = _drain_result()
     if not _outbox_jobs():
         return out
-    d = outbox_dir()
-    fd = os.open(str(d / ".drain.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    with _drain_lock() as got:
+        if not got:
+            return {**out, "busy": True}
+        return _drain_locked(conn, out)
+
+
+def _drain_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
     owned = conn is None
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return {**out, "busy": True}
         jobs = _outbox_jobs()
         out["jobs"] = len(jobs)
+        if not jobs:
+            return out
         if owned:
             try:
                 conn = _connect()
@@ -855,7 +1005,6 @@ def drain(conn=None) -> dict[str, Any]:
     finally:
         if owned and conn is not None:
             conn.close()
-        os.close(fd)
 
 
 def _refuse_job(path: Path, job: dict[str, Any]) -> None:
@@ -878,8 +1027,15 @@ def write(op: dict[str, Any], *, conn=None) -> dict[str, Any]:
     try:
         if owned:
             conn = _connect()
-        drain(conn)
-        return apply_op(conn, op)
+        if not _outbox_jobs():
+            return apply_op(conn, op)
+        # Writes waiting on this Mac go first. If they cannot all land now
+        # (another drain holds them, or the hub went away mid-drain) this one
+        # waits behind them, so an older write never lands on top of it.
+        with _drain_lock(DRAIN_WAIT_S) as got:
+            if got and not _drain_locked(conn, _drain_result())["stopped_early"]:
+                return apply_op(conn, op)
+        reason = "behind waiting writes"
     except LedgerError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -887,34 +1043,44 @@ def write(op: dict[str, Any], *, conn=None) -> dict[str, Any]:
             raise LedgerError("the ledger tables are not in the database yet; run khipu migrate", "no_tables") from exc
         if not _away(exc):
             raise
-        _check_offline(op)
-        enqueue(op, reason=type(exc).__name__)
-        state = op["fields"].get("state") or (START_STATE if op["verb"] == "add" else "")
-        lines = {"add": f"added {op['row_id']}: {state}", "set": f"set {op['row_id']}: queued",
-                 "remove": f"removed {op['row_id']}: queued"}
-        return {"ok": True, "verb": op["verb"], "id": op["row_id"], "queued": True, "state": state or None,
-                "line": lines.get(op["verb"], f"{op['verb']} {op['row_id']}: queued"), "words": QUEUED_WORDS}
+        reason = type(exc).__name__
     finally:
         if owned and conn is not None:
             conn.close()
+    _check_offline(op)
+    enqueue(op, reason=reason)
+    state = op["fields"].get("state") or (START_STATE if op["verb"] == "add" else "")
+    lines = {"add": f"added {op['row_id']}: {state}", "set": f"set {op['row_id']}: queued",
+             "remove": f"removed {op['row_id']}: queued"}
+    return {"ok": True, "verb": op["verb"], "id": op["row_id"], "queued": True, "state": state or None,
+            "line": lines.get(op["verb"], f"{op['verb']} {op['row_id']}: queued"), "words": QUEUED_WORDS}
 
 
 def _check_offline(op: dict[str, Any]) -> None:
     """What can be checked against the offline copy before queueing: the
-    project's words, and whether the row exists."""
-    view = _offline_view(op["project"])
-    if view is None:
+    project's words, and whether the row exists once the writes already
+    waiting are applied (a row added while away can be changed while away)."""
+    project = op["project"]
+    view = _offline_view(project)
+    queued = [q for q in queued_ops() if q.get("project") == project]
+    if view is None and not queued:
         return
-    vocab, rows = view["vocab"], {r["row_id"]: r for r in view["rows"]}
+    vocab = view["vocab"] if view else {"state": [], "kind": []}
     fields = op["fields"]
     if vocab["state"]:
         if fields.get("state"):
             fields["state"] = _word(vocab, "state", fields["state"])
         if fields.get("kind"):
             fields["kind"] = _word(vocab, "kind", fields["kind"])
+    merged = _overlay(view or {"vocab": vocab, "rows": [], "as_of": None, "offline": True}, project)
+    rows = {r["row_id"] for r in merged["rows"]}
     if op["verb"] == "add" and op["row_id"] in rows:
         raise LedgerError(f"row {op['row_id']} already exists; use set to update it", "exists")
-    if op["verb"] in ("set", "remove") and rows and op["row_id"] not in rows:
+    # Without the project in the offline copy, a row missing here may still be
+    # on the hub; only a row removed by a waiting write is known to be gone.
+    known = bool(view and view["rows"]) or any(q.get("verb") == "remove" and q.get("row_id") == op["row_id"]
+                                               for q in queued)
+    if op["verb"] in ("set", "remove") and known and op["row_id"] not in rows:
         raise LedgerError(f"no such row: {op['row_id']}", "not_found")
 
 
@@ -999,6 +1165,7 @@ def load(project: str, *, conn=None) -> dict[str, Any]:
         if owned:
             conn = _connect()
         drain(conn)
+        replica_catch_up(conn)
         return _hub_view(conn, project)
     except Exception as exc:  # noqa: BLE001
         if _tables_missing(exc):
@@ -1014,11 +1181,13 @@ def load(project: str, *, conn=None) -> dict[str, Any]:
 
 
 def get(project: str, row_id: str, *, conn=None) -> dict[str, Any]:
+    refuse_secrets(project, row_id)
     owned = conn is None
     try:
         if owned:
             conn = _connect()
         drain(conn)
+        replica_catch_up(conn)
         with conn.cursor() as cur:
             cur.execute(f"SELECT {', '.join(_ROW_COLS)} FROM ledger_rows WHERE project = %s AND row_id = %s",
                         (project, row_id))
@@ -1092,8 +1261,20 @@ def _order(rows: list[dict[str, Any]], vocab: dict[str, list]) -> list[dict[str,
     """Kind, then parent group (a parent and its children together), then the
     order rows were added. Never by state or by last change (rule 6)."""
     kinds = {k: i for i, k in enumerate(vocab["kind"])}
-    return sorted(rows, key=lambda r: (kinds.get(r["kind"], len(kinds)), "" if r["kind"] in kinds else r["kind"],
-                                       r["parent"] or r["row_id"], r["seq"]))
+
+    def kind(r: dict[str, Any]) -> tuple:
+        return (kinds.get(r["kind"], len(kinds)), "" if r["kind"] in kinds else r["kind"])
+
+    def group(r: dict[str, Any]) -> tuple:
+        # A root row heads the group of its own children, as on the tracker's board.
+        return (*kind(r), r["parent"] or r["row_id"])
+
+    # Groups follow the order their first row was added, so a new row never
+    # moves an older one (the tracker's import gives seq in its board order).
+    first: dict[tuple, int] = {}
+    for r in rows:
+        first[group(r)] = min(first.get(group(r), r["seq"]), r["seq"])
+    return sorted(rows, key=lambda r: (*kind(r), first[group(r)], group(r), r["seq"]))
 
 
 def _updated(row: dict[str, Any]) -> str:
@@ -1169,7 +1350,9 @@ def render_board(view: dict[str, Any]) -> str:
         counts_state[r["state"]] = counts_state.get(r["state"], 0) + 1
         counts_kind[r["kind"]] = counts_kind.get(r["kind"], 0) + 1
     since = _now() - timedelta(hours=24)
-    changed = [r for r in rows if isinstance(r["updated_at"], datetime) and r["updated_at"] >= since]
+    # The tracker lists this section by id.
+    changed = sorted((r for r in rows if isinstance(r["updated_at"], datetime) and r["updated_at"] >= since),
+                     key=lambda r: r["row_id"])
     lines = [f"# Orchestrator Tracker (generated {_z(_now())})", "", f"Total rows: {len(rows)}", "",
              "## Counts by state"]
     states = [w for w, _m in vocab["state"]]
@@ -1285,6 +1468,10 @@ def doctor_block() -> dict[str, Any]:
     # The nightly dump is a pg_dump of the whole database, so every ledger
     # table is in it by construction; there is no table list to keep.
     out["in_dump"] = "whole database"
+    out["offline_copy_waiting"] = replica_pending()
+    if out["offline_copy_waiting"]:
+        out["warnings"].append(f"ledger: {out['offline_copy_waiting']} change(s) not in the offline copy yet "
+                               "(copied at the next ledger call that reaches the database)")
     try:
         conn = _connect()
     except Exception as exc:  # noqa: BLE001
@@ -1330,6 +1517,7 @@ def nightly() -> dict[str, Any]:
     try:
         drained = drain(conn)
         purged = purge_due(conn)
+        replica_catch_up(conn)
         return {"ok": not drained.get("refused"), "landed": drained["landed"], "refused": drained["refused"],
                 "purged": purged.get("purged", 0)}
     except Exception as exc:  # noqa: BLE001  (a ledger miss cannot fail the night)
@@ -1372,6 +1560,7 @@ def _offline_note(view: dict[str, Any]) -> str | None:
 def cmd(args: argparse.Namespace) -> int:
     verb = args.ledger_cmd
     try:
+        refuse_secrets([v for k, v in vars(args).items() if k != "func"])
         project = _project_for(args)
         if verb in ("add", "set", "remove", "restore"):
             return _cmd_write(args, verb, project)

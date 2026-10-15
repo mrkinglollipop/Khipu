@@ -551,3 +551,233 @@ def test_doctor_block_reports_counts_and_the_nightly_purges(hub):
     _sql(hub, "UPDATE ledger_rows SET removed_at = now() - interval '40 days' WHERE row_id = 's-2'")
     assert ledger.nightly() == {"ok": True, "landed": 0, "refused": 0, "purged": 1}
     assert ledger.doctor_block()["purged_markers"] == 1
+
+
+# ---- review round: identifiers, the drain lock, the offline copy, order, the board -----------
+
+
+SECRET_ID = "sk-" + "A" * 48
+
+
+def _offline(monkeypatch, tmp_path):
+    from khipu import ledger
+
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
+    (tmp_path / "data").mkdir(exist_ok=True)
+
+    def away():
+        raise ledger.HubAway("synthetic: no hub")
+
+    monkeypatch.setattr(ledger, "_connect", away)
+    return ledger
+
+
+@pytest.mark.parametrize("field", ["project", "row_id", "op_id", "parent", "if_state"])
+def test_a_key_shaped_identifier_is_refused_before_it_is_stored(field, monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    params = {"project": "acme/widget", "row_id": "r1", "op_id": "op-1"}
+    verb, fields, if_state = "add", {"title": "fine", "kind": "slice"}, None
+    if field in params:
+        params[field] = SECRET_ID
+    elif field == "parent":
+        fields["parent"] = SECRET_ID
+    else:
+        verb, fields, if_state = "set", {"state": "DONE"}, SECRET_ID
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op(verb, **params, fields=fields, if_state=if_state))
+    assert err.value.reason == "secret" and SECRET_ID not in str(err.value)
+    assert ledger._outbox_jobs() == []
+
+
+@pytest.mark.parametrize("argv", [
+    ("add", SECRET_ID + "?", "--title", "fine", "--kind", "slice"),
+    ("add", "r1", "--title", "fine", "--kind", "slice", "--parent", SECRET_ID + "?"),
+    ("get", SECRET_ID),
+    ("set", SECRET_ID, "--state", "DONE"),
+    ("remove", SECRET_ID, "--json"),
+])
+def test_a_key_shaped_argument_is_never_echoed(argv, monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    rc, out, err = run(*argv, "--project", P)
+    assert rc == 1 and SECRET_ID not in out + err
+    assert "This looks like a key or password; nothing was saved" in out + err
+    assert ledger._outbox_jobs() == []
+
+
+def test_a_write_waits_behind_a_busy_drain_and_never_jumps_the_queue(monkeypatch, tmp_path):
+    import fcntl
+
+    ledger = _offline(monkeypatch, tmp_path)
+    first = ledger.new_op("set", P, "s-1", fields={"evidence": "first"})
+    ledger.enqueue(first)
+    applied = []
+    monkeypatch.setattr(ledger, "apply_op", lambda _conn, op, **_kw: applied.append(op["op_id"]) or {"ok": True})
+    monkeypatch.setattr(ledger, "DRAIN_WAIT_S", 0.2)
+    fd = os.open(str(ledger.outbox_dir() / ".drain.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # another process is draining
+        second = ledger.new_op("set", P, "s-1", fields={"evidence": "second"})
+        got = ledger.write(second, conn=object())
+    finally:
+        os.close(fd)
+    assert applied == [] and got["queued"] is True
+    assert [op["op_id"] for op in ledger.queued_ops()] == [first["op_id"], second["op_id"]]
+
+
+def test_a_write_behind_a_busy_drain_lands_after_the_older_one(hub, monkeypatch):
+    import fcntl
+
+    from khipu import ledger
+
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    _away(monkeypatch)
+    ok("set", "s-1", "--evidence", "first")
+    monkeypatch.setenv("KHIPU_DATABASE_URL", hub)
+    monkeypatch.setattr(ledger, "DRAIN_WAIT_S", 0.2)
+    fd = os.open(str(ledger.outbox_dir() / ".drain.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert ok("set", "s-1", "--evidence", "second").splitlines()[0] == "set s-1: queued"
+    finally:
+        os.close(fd)
+    assert "s-1 · NOT STARTED" in ok("list")
+    assert _sql(hub, "SELECT evidence FROM ledger_rows WHERE row_id = 's-1'") == [("second",)]
+    assert [h[2]["evidence"]["new"] for h in _history(hub, "s-1") if "evidence" in h[2]] == ["first", "second"]
+
+
+def _replica_row(row_id, version, title="t"):
+    return {"row_id": row_id, "title": title, "kind": "slice", "parent": "", "state": "NOT STARTED",
+            "owner": "none", "evidence": "", "link": "", "refs": {}, "seq": 1, "created_at": "2026-10-15T00:00:00Z",
+            "updated_at": "2026-10-15T00:00:00Z", "version": version}
+
+
+def _replica_titles(project="p"):
+    from khipu import hub_snapshot as hs
+
+    return {r["row_id"]: r["title"] for r in hs.ledger_read_snapshot(project)["rows"]}
+
+
+def test_a_late_sync_never_brings_back_a_removed_row_or_an_older_value(monkeypatch, tmp_path):
+    from khipu import hub_snapshot as hs
+
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
+    _snapshot(tmp_path)
+    proj, vocab = ("p", False, "2026-10-15T00:00:00Z"), {"state": [], "kind": []}
+    assert hs.ledger_write_snapshot("p", proj, vocab, [_replica_row("r", 3, "newer")], [], ["r"])["ok"]
+    assert hs.ledger_write_snapshot("p", proj, vocab, [_replica_row("r", 2, "older")], [], ["r"])["ok"]
+    assert _replica_titles() == {"r": "newer"}
+    # Removed at version 4; a writer that read version 3 before the removal lands after it.
+    assert hs.ledger_write_snapshot("p", proj, vocab, [], [], ["r"], gone={"r": 4})["ok"]
+    assert hs.ledger_write_snapshot("p", proj, vocab, [_replica_row("r", 3, "stale")], [], ["r"])["ok"]
+    assert _replica_titles() == {}
+    # Restored (version 5) comes back; purged (gone with no version) never does.
+    assert hs.ledger_write_snapshot("p", proj, vocab, [_replica_row("r", 5, "restored")], [], ["r"])["ok"]
+    assert _replica_titles() == {"r": "restored"}
+    assert hs.ledger_write_snapshot("p", proj, vocab, [], [], ["r"])["ok"]
+    assert hs.ledger_write_snapshot("p", proj, vocab, [_replica_row("r", 9, "after purge")], [], ["r"])["ok"]
+    assert _replica_titles() == {}
+
+
+def test_a_sync_skipped_by_a_busy_refresh_is_retried_on_the_next_call(hub, tmp_path):
+    from khipu import hub_snapshot as hs
+
+    _snapshot(tmp_path)
+    ok("add", "s-1", "--title", "Kept", "--kind", "slice")
+    ok("add", "s-2", "--title", "Removed while the copy is busy", "--kind", "slice")
+    lock = hs._acquire_refresh_lock()
+    assert lock is not None
+    try:
+        ok("remove", "s-2")
+        ok("set", "s-1", "--title", "Renamed while busy")
+    finally:
+        hs._release_refresh_lock(lock)
+    assert _replica_titles(P) == {"s-1": "Kept", "s-2": "Removed while the copy is busy"}
+    ok("list")
+    assert _replica_titles(P) == {"s-1": "Renamed while busy"}
+
+
+def test_the_refresh_keeps_removed_and_purged_ids_out_of_a_late_sync(hub, tmp_path):
+    from khipu import hub_snapshot as hs
+
+    ok("add", "s-1", "--title", "Removed", "--kind", "slice")
+    ok("add", "s-2", "--title", "Purged", "--kind", "slice")
+    ok("remove", "s-1")
+    ok("remove", "s-2")
+    ok("purge", "s-2", "--from-app")
+    path = _snapshot(tmp_path)
+    con = sqlite3.connect(str(path))
+    with _real_connect(hub) as conn:
+        with conn.cursor() as cur:
+            hs._insert_ledger(cur, con)
+    con.commit()
+    con.close()
+    vocab = {"state": [], "kind": []}
+    for rid in ("s-1", "s-2"):
+        assert hs.ledger_write_snapshot(P, None, vocab, [_replica_row(rid, 1, "stale")], [], [rid])["ok"]
+    assert _replica_titles(P) == {}
+
+
+def test_a_row_queued_offline_can_be_changed_and_removed_offline(monkeypatch, tmp_path):
+    from khipu import hub_snapshot as hs
+
+    ledger = _offline(monkeypatch, tmp_path)
+    _snapshot(tmp_path)
+    assert hs.ledger_write_snapshot(P, (P, False, "2026-10-15T00:00:00Z"), ledger.default_vocab("NEEDS OWNER"),
+                                    [_replica_row("r1", 1, "copied")], [], ["r1"])["ok"]
+    assert ledger.write(ledger.new_op("add", P, "r2", fields={"title": "queued", "kind": "slice"}))["queued"]
+    assert ledger.write(ledger.new_op("set", P, "r2", fields={"state": "DONE"}))["queued"]
+    assert [(r["row_id"], r["state"]) for r in ledger.load(P)["rows"]] == [("r1", "NOT STARTED"), ("r2", "DONE")]
+    assert ledger.write(ledger.new_op("remove", P, "r2"))["queued"]
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("set", P, "r2", fields={"state": "DONE"}))
+    assert err.value.reason == "not_found"
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("add", P, "r1", fields={"title": "again", "kind": "slice"}))
+    assert err.value.reason == "exists"
+
+
+def test_rows_keep_the_order_they_were_added_in_and_children_stay_with_their_parent():
+    from khipu import ledger
+
+    vocab = ledger.default_vocab("NEEDS OWNER")
+    rows = [{"row_id": "z-first", "kind": "slice", "parent": "", "seq": 1},
+            {"row_id": "a-second", "kind": "slice", "parent": "", "seq": 2},
+            {"row_id": "m-child", "kind": "slice", "parent": "z-first", "seq": 3},
+            {"row_id": "b-child", "kind": "slice", "parent": "a-second", "seq": 4}]
+    assert [r["row_id"] for r in ledger._order(rows, vocab)] == ["z-first", "m-child", "a-second", "b-child"]
+
+
+TRACKER_FIXTURE = Path(__file__).parent / "fixtures" / "ledger_tracker"
+# The tracker script's states and kinds for the project the fixture stands for.
+TRACKER_STATES = [("VERIFIED", "done"), ("MERGED-UNVERIFIED", "open"), ("BUILT-UNMERGED", "open"),
+                  ("IN FLIGHT", "open"), ("QUEUED", "open"), ("NOT STARTED", "open"), ("NEEDS MATT", "needs"),
+                  ("DROPPED", "dropped"), ("ON HOLD", "done"), ("DONE", "done")]
+TRACKER_KINDS = ["audit-item", "drive", "wave", "train", "loose-end", "needs-matt"]
+
+
+def test_render_matches_the_trackers_board_for_the_same_rows(monkeypatch):
+    """board.md is what the tracker script itself printed for tracker.json
+    (synthetic rows). The ledger's board differs only in its own punctuation
+    (no dashes), the missing-parent words and the generated times."""
+    import re
+    from datetime import datetime, timezone
+
+    from khipu import ledger
+
+    monkeypatch.setattr(ledger, "_now", lambda: datetime(2026, 10, 15, 15, 55, 26, tzinfo=timezone.utc))
+    source = json.loads((TRACKER_FIXTURE / "tracker.json").read_text(encoding="utf-8"))["rows"]
+    kind_at = {k: i for i, k in enumerate(TRACKER_KINDS)}
+    # Phase 2's import gives rows seq in the tracker's own render order: kind, then parent, then id.
+    ordered = sorted(source.values(), key=lambda r: (kind_at[r["kind"]], r["parent"] or r["id"], r["id"]))
+    rows = [{"row_id": r["id"], "title": r["title"], "kind": r["kind"], "parent": r["parent"], "state": r["state"],
+             "evidence": r["evidence"], "owner": r["owner"], "updated_at": ledger._parse_time(r["updated"]),
+             "seq": seq} for seq, r in enumerate(ordered, 1)]
+    rows.reverse()  # the order rows arrive in does not matter
+    view = {"vocab": {"state": [list(s) for s in TRACKER_STATES], "kind": TRACKER_KINDS}, "rows": rows}
+    expected = (TRACKER_FIXTURE / "board.md").read_text(encoding="utf-8")
+    expected = expected.replace(" — (unknown parent)**", ": (parent not found)**").replace(" — ", ": ")
+    expected = expected.replace("## Rows (grouped by kind, then parent; id order within group: never reordered "
+                                "by state)", "## Rows (grouped by kind, then parent; in the order added within a "
+                                "group; never reordered by state)")
+    stamp = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\)?$", re.M)
+    assert stamp.sub("TIME", ledger.render_board(view)) == stamp.sub("TIME", expected)

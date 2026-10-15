@@ -866,7 +866,12 @@ CREATE TABLE IF NOT EXISTS ledger_history (
     source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_snapshot_ledger_history_row ON ledger_history (project, row_id, id);
+CREATE TABLE IF NOT EXISTS ledger_gone (
+    project TEXT, row_id TEXT, version INTEGER, PRIMARY KEY (project, row_id)
+);
 """
+# A purged id never comes back, so its marker outranks every version.
+LEDGER_PURGED_VERSION = 2**62
 _LEDGER_ROW_COLS = ("project", "row_id", "title", "kind", "parent", "state", "owner", "evidence", "link",
                     "refs", "seq", "created_at", "updated_at", "version")
 _LEDGER_HIST_COLS = ("id", "project", "row_id", "at", "at_text", "author", "shape", "from_state", "to_state",
@@ -909,26 +914,53 @@ def _insert_ledger(cur, con: sqlite3.Connection) -> int:
         f"VALUES ({', '.join('?' * len(_LEDGER_HIST_COLS))})",
         [[_ledger_value(c, v) for c, v in zip(_LEDGER_HIST_COLS, h, strict=True)] for h in cur.fetchall()],
     )
+    # Removed and purged ids, so a write-through that read the row before it
+    # went cannot put it back after this dump.
+    cur.execute("SELECT project, row_id, version FROM ledger_rows WHERE removed_at IS NOT NULL")
+    gone = cur.fetchall()
+    cur.execute("SELECT project, row_id FROM ledger_removed")
+    gone += [(p, r, LEDGER_PURGED_VERSION) for p, r in cur.fetchall()]
+    con.executemany("INSERT OR REPLACE INTO ledger_gone VALUES (?, ?, ?)", gone)
     return len(rows)
 
 
 def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mapping[str, list],
                           rows: Sequence[Mapping[str, Any]], history: Sequence[Mapping[str, Any]],
-                          row_ids: Sequence[str]) -> dict[str, Any]:
-    """Replace ``row_ids`` of ``project`` in the replica with ``rows`` (the
-    live ones among them) and their whole ``history``. A row missing from
-    ``rows`` was removed or purged and leaves the replica at once. Under the
-    refresh lock, like every incremental write here. Fail-open."""
+                          row_ids: Sequence[str], gone: Mapping[str, int] | None = None) -> dict[str, Any]:
+    """Write ``row_ids`` of ``project`` through to the replica: each live one
+    in ``rows`` (with its whole ``history``), each removed one in ``gone`` at
+    the version it was removed at, and any other id as purged. A row only
+    replaces what the replica holds at the same or a lower version, and a
+    removed or purged id leaves a marker, so a writer that read the hub before
+    a newer change and lands after it changes nothing. Under the refresh lock,
+    like every incremental write here. Fail-open."""
     path = snapshot_path()
     if not path.is_file():
-        return {"ok": False, "error": "hub snapshot missing"}
+        return {"ok": False, "error": "hub snapshot missing", "missing": True}
     lock = _acquire_refresh_lock()
     if lock is None:
         return {"ok": False, "error": "hub snapshot refresh in progress"}
+    gone = dict(gone or {})
+    live = {r["row_id"]: r for r in rows}
+    for row_id in row_ids:
+        if row_id not in live and row_id not in gone:
+            gone[row_id] = LEDGER_PURGED_VERSION
     try:
         con = sqlite3.connect(str(path))
         try:
             con.executescript(_LEDGER_SCHEMA_SQL)
+
+            def held(row_id: str) -> tuple[int | None, int | None]:
+                got = con.execute("SELECT version FROM ledger_rows WHERE project = ? AND row_id = ?",
+                                  (project, row_id)).fetchone()
+                mark = con.execute("SELECT version FROM ledger_gone WHERE project = ? AND row_id = ?",
+                                   (project, row_id)).fetchone()
+                return (got[0] if got else None), (mark[0] if mark else None)
+
+            def drop(row_id: str) -> None:
+                con.execute("DELETE FROM ledger_rows WHERE project = ? AND row_id = ?", (project, row_id))
+                con.execute("DELETE FROM ledger_history WHERE project = ? AND row_id = ?", (project, row_id))
+
             if proj is not None:
                 con.execute("INSERT OR REPLACE INTO ledger_projects VALUES (?, ?, ?, ?)",
                             (project, proj[0], int(bool(proj[1])), _ts_text(proj[2])))
@@ -937,17 +969,33 @@ def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mappi
                             [(project, w, m, i) for i, (w, m) in enumerate(vocab.get("state") or [])])
             con.executemany("INSERT INTO ledger_vocab VALUES (?, 'kind', ?, '', ?)",
                             [(project, w, i) for i, w in enumerate(vocab.get("kind") or [])])
-            for row_id in row_ids:
-                con.execute("DELETE FROM ledger_rows WHERE project = ? AND row_id = ?", (project, row_id))
-                con.execute("DELETE FROM ledger_history WHERE project = ? AND row_id = ?", (project, row_id))
-            for row in rows:
+            written, stale = [], 0
+            for row_id, row in live.items():
+                have, mark = held(row_id)
+                version = int(row.get("version") or 0)
+                if max(have or 0, mark or 0) > version:
+                    stale += 1
+                    continue
+                drop(row_id)
+                con.execute("DELETE FROM ledger_gone WHERE project = ? AND row_id = ?", (project, row_id))
                 values = {**row, "project": project}
                 con.execute(
                     f"INSERT INTO ledger_rows ({', '.join(_LEDGER_ROW_COLS)}) "
                     f"VALUES ({', '.join('?' * len(_LEDGER_ROW_COLS))})",
                     [_ledger_value(c, values.get(c)) for c in _LEDGER_ROW_COLS],
                 )
+                written.append(row_id)
+            for row_id, version in gone.items():
+                have, mark = held(row_id)
+                if have is not None and have > version:
+                    stale += 1
+                    continue
+                drop(row_id)
+                con.execute("INSERT OR REPLACE INTO ledger_gone VALUES (?, ?, ?)",
+                            (project, row_id, max(version, mark or 0)))
             for h in history:
+                if h.get("row_id") not in written:
+                    continue
                 values = {**h, "project": project}
                 con.execute(
                     f"INSERT OR REPLACE INTO ledger_history ({', '.join(_LEDGER_HIST_COLS)}) "
@@ -957,7 +1005,7 @@ def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mappi
             con.commit()
         finally:
             con.close()
-        return {"ok": True, "rows": len(rows)}
+        return {"ok": True, "rows": len(written), "stale": stale}
     except Exception as exc:  # noqa: BLE001  (the hub write already landed)
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     finally:
