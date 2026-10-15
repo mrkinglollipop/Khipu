@@ -54,8 +54,13 @@ Phase 9 (addendum, finding and adding accounts; mock-only layout in `add-account
 - `add-account-found.html`: Home's "Found a Claude account you use" notice, Accounts with two Found rows, Not
   offered again, the Home notice when Track new accounts automatically is on, and the setup step listing every
   login found with Add another account.
-- `add-account-manage.html`: rename in place, Stop tracking with what it does and does not do, and two
-  accounts that read the same login.
+- `add-account-manage.html`: rename in place, Stop tracking with its choices (priority, pause, lanes, holds) and
+  what it does not change, and two accounts that read the same login.
+- `add-account-states.html`: states added after the cradle-to-grave review: a moved folder, a folder that
+  couldn't be checked, a missing login folder, signed out with earlier figures, a plan that changed after
+  signing in again, newly tracked and not ranked, a CLI Khipu can't run, nothing installed, the Grok sign-in
+  code and no code, rename with what is and isn't updated, stopping the last account, no accounts tracked,
+  Looking…, and setup with a signed-out default login and with nothing installed.
 
 Decisions in the mock:
 

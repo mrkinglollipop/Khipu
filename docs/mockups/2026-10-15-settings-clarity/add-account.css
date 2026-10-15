@@ -67,3 +67,9 @@
 .mock-frame.aa-auto .shell{height:auto;min-height:760px}
 .mock-frame.aa-auto .main{overflow:visible}
 .group-card .disclose > button.fold-btn{justify-content:flex-start;padding:var(--s2) var(--s4)}
+.aa-checks{margin:0;padding:var(--s2) var(--s3);border:1px solid var(--border);border-radius:var(--r-sm);display:flex;flex-direction:column;gap:var(--s2);font-size:var(--t-sm);color:var(--text-2)}
+.aa-checks legend{padding:0 var(--s1);font-weight:600;color:var(--text)}
+.aa-checks div{display:flex;gap:var(--s2);align-items:flex-start;min-height:24px}
+.aa-checks input{margin:2px 0 0;accent-color:var(--accent)}
+.aa-code{display:flex;flex-direction:column;gap:var(--s2);align-items:flex-start;padding:var(--s3);border:1px solid var(--border);border-radius:var(--r-sm)}
+.aa-code-val{font-family:var(--mono);font-size:var(--t-xl);letter-spacing:.12em;color:var(--text)}
