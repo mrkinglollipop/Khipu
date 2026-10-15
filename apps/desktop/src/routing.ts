@@ -157,7 +157,7 @@ export type RuleCell = {
   more?: number;
   why?: string | null;
   /** What a cap or a name Khipu can't use left out of this runner's files. */
-  skipped?: { lanes?: number; fix_lanes?: number; kinds?: number; added?: number };
+  skipped?: { lanes?: number; fix_lanes?: number; kinds?: number; added?: number; unfinished_line?: number };
   /** The privacy check's read of the whole events log: bytes read of its size, lines read, finished. */
   scan?: { read?: number; size?: number; lines?: number; done?: boolean; reset?: string | null };
 };
@@ -643,6 +643,7 @@ function leftOutLine(cells: RuleCell[]): string {
         k.kinds ? count(k.kinds, "lane whose kind it can't name", "lanes whose kind it can't name") : "",
         k.fix_lanes ? count(k.fix_lanes, "default fix lane", "default fix lanes") : "",
         k.added ? count(k.added, "line of added work", "lines of added work") : "",
+        k.unfinished_line ? "an unfinished last line of added work" : "",
       ].filter(Boolean);
       const list = items.length > 1 ? `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}` : items[0] ?? "some input";
       return `${list} in ${c.runner}`;

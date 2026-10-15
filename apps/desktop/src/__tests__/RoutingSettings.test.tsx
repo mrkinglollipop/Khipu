@@ -529,6 +529,15 @@ describe("Settings -> Routing: standing rules", () => {
     );
     expect(row("Standing rules", "3.")).not.toHaveTextContent("nothing wrong found");
     cleanup();
+    // A last line left without its newline for over ten minutes is never read.
+    const v = rule("incomplete", { read: 70, size: 140, lines: 1, done: false });
+    Object.assign(v.rule_results![0].checks![0].cells![0], { skipped: { unfinished_line: 1 } });
+    answers.khipu_route_view = v;
+    await page();
+    expect(row("Standing rules", "3.")).toHaveTextContent(
+      "Checked by Khipu, but not fully: Khipu left out an unfinished last line of added work in project A.",
+    );
+    cleanup();
     answers.khipu_route_view = rule("ok", { read: 8_000_000, size: 8_000_000, lines: 36000, done: true });
     await page();
     expect(row("Standing rules", "3.")).toHaveTextContent("nothing wrong found, 4 min ago. It read all 36,000 lines of added work.");

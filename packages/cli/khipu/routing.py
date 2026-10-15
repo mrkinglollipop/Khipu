@@ -2836,7 +2836,7 @@ def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
     # next read, one bounded chunk at a time, though no file changed.
     runners = ((view.get("source_cache") or {}).get("runners") or {}).values()
     if any(isinstance((r.get("events") or {}).get("scan"), dict) and not r["events"]["scan"].get("done")
-           for r in runners if isinstance(r, dict)):
+           and not r["events"]["scan"].get("unfinished") for r in runners if isinstance(r, dict)):
         return False
     folded = _parse(view.get("folded_at"))
     if folded is not None and (folded - now).total_seconds() > CLOCK_TOLERANCE:

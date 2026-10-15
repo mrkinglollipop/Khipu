@@ -591,39 +591,62 @@ def _read_range(path: Path, start: int, length: int) -> bytes:
         os.close(fd)
 
 
+# A last line still being written is left for the next read; one that stays
+# unfinished and unchanged this long is counted as unreadable.
+UNFINISHED_AFTER = 600
+
+
 def _valid_cursor(cursor, st) -> bool:
+    ints = ("offset", "size", "mtime_ns", "lines", "dropped", "head_len", "tail_len")
     return (isinstance(cursor, dict) and cursor.get("dev") == st.st_dev and cursor.get("ino") == st.st_ino
-            and type(cursor.get("offset")) is int and 0 <= cursor["offset"] <= st.st_size
-            and isinstance(cursor.get("head"), str) and isinstance(cursor.get("private"), list)
-            and type(cursor.get("lines")) is int and type(cursor.get("dropped")) is int)
+            and all(type(cursor.get(k)) is int for k in ints)
+            and 0 <= cursor["offset"] <= cursor["size"] <= st.st_size
+            and isinstance(cursor.get("head"), str) and isinstance(cursor.get("tail"), str)
+            and isinstance(cursor.get("private"), list))
 
 
-def _head_hash(path: Path, upto: int) -> str:
-    return hashlib.sha256(_read_range(path, 0, min(upto, SCAN_HEAD))).hexdigest()
+def _hash_range(path: Path, start: int, length: int) -> str:
+    return hashlib.sha256(_read_range(path, start, length)).hexdigest() if length else ""
+
+
+def _fingerprints(path: Path, offset: int) -> dict:
+    """The file's first 4 KB and the 4 KB just before ``offset``, hashed."""
+    head_len, tail_len = min(offset, SCAN_HEAD), min(offset, SCAN_HEAD)
+    return {"head_len": head_len, "head": _hash_range(path, 0, head_len),
+            "tail_len": tail_len, "tail": _hash_range(path, offset - tail_len, tail_len)}
 
 
 def scan_events(path: Path, cursor, now: datetime) -> dict:
     """One step of the privacy check's read of the whole events log: from the
-    cursor to at most ``SCAN_CHUNK`` bytes on, whole lines only. A missing or
-    damaged cursor, another file at the path (``rotated``), a file shorter
-    than what was read (``truncated``) or one whose start changed
-    (``rewritten``) starts again from the first byte and forgets what it
-    held. ``done`` once it has read up to the end of the file."""
+    cursor to at most ``SCAN_CHUNK`` bytes on, whole lines only.
+
+    The log is taken as append-only only on evidence: the same file (device,
+    inode), its first 4 KB and the 4 KB before the offset unchanged, and
+    either the same size and mtime as at the last read or a larger size.
+    Anything else (``rotated``, ``truncated``, ``rewritten``, or a missing or
+    ``damaged`` cursor) starts again from the first byte and forgets what it
+    held. ``done`` only when every byte up to the end of the file was read; a
+    final line without its newline is left unread and ``unfinished_since``
+    dates it, so ``unfinished`` is set once it has stayed so for
+    ``UNFINISHED_AFTER`` seconds."""
     st = os.stat(path)
     reset = None
     if not isinstance(cursor, dict):
         reset = "new" if cursor is None else "damaged"
     elif (cursor.get("dev"), cursor.get("ino")) != (st.st_dev, st.st_ino):
         reset = "rotated"
-    elif type(cursor.get("offset")) is int and cursor["offset"] > st.st_size:
+    elif type(cursor.get("size")) is int and st.st_size < cursor["size"]:
         reset = "truncated"
     elif not _valid_cursor(cursor, st):
         reset = "damaged"
-    elif cursor["offset"] and _head_hash(path, cursor["offset"]) != cursor["head"]:
-        reset = "rewritten"
+    else:
+        same = st.st_size == cursor["size"] and st.st_mtime_ns == cursor["mtime_ns"]
+        prints = _fingerprints(path, cursor["offset"])
+        if not (same or st.st_size > cursor["size"]) or any(prints[k] != cursor[k] for k in prints):
+            reset = "rewritten"
     if reset:
-        cursor = {"dev": st.st_dev, "ino": st.st_ino, "offset": 0, "head": "", "private": [], "lines": 0,
-                  "dropped": 0}
+        cursor = {"dev": st.st_dev, "ino": st.st_ino, "offset": 0, "size": 0, "mtime_ns": 0, "private": [],
+                  "lines": 0, "dropped": 0, "head_len": 0, "head": "", "tail_len": 0, "tail": ""}
     start = cursor["offset"]
     want = min(SCAN_CHUNK, st.st_size - start)
     data = _read_range(path, start, want)
@@ -641,10 +664,18 @@ def scan_events(path: Path, cursor, now: datetime) -> dict:
         dropped += len(private) - PRIVATE_MAX
         private = private[-PRIVATE_MAX:]
     offset = start + cut + 1 if cut != -1 else start
-    head = cursor["head"] if start >= SCAN_HEAD and cursor["head"] else (_head_hash(path, offset) if offset else "")
-    return {"dev": st.st_dev, "ino": st.st_ino, "offset": offset, "size": st.st_size, "head": head,
-            "private": private, "lines": cursor["lines"] + whole.count(b"\n"), "dropped": dropped,
-            "done": start + want >= st.st_size, "reset": reset}
+    # Bytes after the offset at the end of the file: a final line with no
+    # newline yet. Dated from when it was first seen as it is now.
+    at_end = start + want >= st.st_size
+    pending = at_end and offset < st.st_size
+    unchanged = not reset and st.st_size == cursor["size"] and st.st_mtime_ns == cursor["mtime_ns"]
+    since = cursor.get("unfinished_since") if pending and unchanged and cursor.get("unfinished_since") else (
+        _iso(now) if pending else None)
+    began = _parse(since)
+    return {"dev": st.st_dev, "ino": st.st_ino, "offset": offset, "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+            **_fingerprints(path, offset), "private": private, "lines": cursor["lines"] + whole.count(b"\n"),
+            "dropped": dropped, "done": at_end and not pending, "reset": reset, "unfinished_since": since,
+            "unfinished": bool(began and (now - began).total_seconds() > UNFINISHED_AFTER)}
 
 
 _PARSERS = {"global": _parse_global, "heartbeat": _parse_heartbeat, "config": _parse_config}
@@ -1126,8 +1157,9 @@ _NOT_NOW = ("failed", "stale", "not_read", "checking", "incomplete")
 def _skipped(check: str, kept: dict) -> dict:
     """What a cap or a name Khipu can't use left out of the files this check
     judges on one runner: lanes and default fix lanes from the settings, and
-    for the privacy check ADDED lines the line cap dropped (``added``) or
-    that lay before the tail (``older_added``)."""
+    for the privacy check private ADDED lines past ``PRIVATE_MAX`` or longer
+    than a chunk (``added``) and a last line left unfinished too long
+    (``unfinished_line``)."""
     config = (kept.get("config") or {}).get("data")
     config = config if isinstance(config, dict) else {}
     wanted = {"lanes"} | ({"fix_lanes"} if check == "grok_private" else set()) | \
@@ -1137,6 +1169,8 @@ def _skipped(check: str, kept: dict) -> dict:
         scan = (kept.get("events") or {}).get("scan")
         if isinstance(scan, dict) and scan.get("dropped"):
             out["added"] = scan["dropped"]
+        if isinstance(scan, dict) and scan.get("unfinished"):
+            out["unfinished_line"] = 1  # a last line left unfinished too long: never read
     return out
 
 
@@ -1176,7 +1210,7 @@ def _cell(check: str, runner: str, kept: dict, findings: list[dict], now, stale_
         outcome = "failed"
     elif any(r["stale"] for r in reads.values()):
         outcome = "stale"
-    elif check == "grok_private" and not (scan or {}).get("done"):
+    elif check == "grok_private" and not (scan or {}).get("done") and not (scan or {}).get("unfinished"):
         outcome = "checking"  # the whole-log read has not reached the end yet
     elif skipped:
         outcome = "incomplete"  # never a pass on part of the input

@@ -837,6 +837,61 @@ def test_a_truncated_log_is_read_again_and_forgets_what_it_held(home, capsys):
     assert _privacy(home, capsys)["checks"][0]["cells"][0]["scan"]["reset"] == "truncated"
 
 
+def _touch(path: Path, seconds: int) -> None:
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + seconds * 10 ** 9))
+
+
+def test_a_rewrite_that_keeps_the_start_and_the_length_is_scanned_again(home, capsys):
+    """Codex round 4: same inode, same length, first 4 KB kept, private Grok
+    work written after it; a new mtime means a full rescan."""
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    clean = _filler(200)
+    log.write_text(clean)
+    assert _privacy(home, capsys)["result"] == "ok"
+    lines = clean.splitlines(keepends=True)
+    victim = next(i for i, line in enumerate(lines) if sum(map(len, lines[:i])) > 4096)
+    room = len(lines[victim]) + len(lines[victim + 1])  # two lines' room: the private line is longer than one
+    lines[victim:victim + 2] = [PRIVATE_GROK.ljust(room - 1) + "\n"]
+    with open(log, "r+", encoding="utf-8") as fh:
+        fh.write("".join(lines))
+    assert log.stat().st_size == len(clean)
+    _touch(log, 5)
+    result = _privacy(home, capsys)
+    assert result["result"] == "broken" and result["checks"][0]["cells"][0]["scan"]["reset"] == "rewritten"
+
+
+def test_a_change_just_before_the_offset_then_an_append_is_scanned_again(home, capsys):
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    clean = _filler(200)
+    log.write_text(clean)
+    assert _privacy(home, capsys)["result"] == "ok"
+    lines = clean.splitlines(keepends=True)
+    lines[-3:-1] = [PRIVATE_GROK.ljust(len(lines[-3]) + len(lines[-2]) - 1) + "\n"]
+    log.write_text("".join(lines) + _filler(1))
+    result = _privacy(home, capsys)
+    assert result["result"] == "broken" and result["checks"][0]["cells"][0]["scan"]["reset"] == "rewritten"
+
+
+def test_a_final_line_without_its_newline_is_never_a_clean_scan(home, capsys):
+    """Codex round 4: the unfinished last line is not read; the check says
+    checking, and after ten minutes unchanged, not fully checked."""
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    log.write_text(_filler(3) + PRIVATE_GROK)  # no newline at the end
+    first = _privacy(home, capsys)
+    assert first["result"] == "checking"
+    home["clock"].advance(minutes=11)
+    late = _privacy(home, capsys)
+    cell = late["checks"][0]["cells"][0]
+    assert late["result"] == "incomplete" and cell["skipped"] == {"unfinished_line": 1}
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write("\n")
+    assert _privacy(home, capsys)["result"] == "broken"
+
+
 def test_a_corrupt_cursor_means_one_full_scan():
     for cursor in (None, "junk", {"ino": "x", "offset": -5}, {"dev": 1, "ino": 2, "offset": 10 ** 12}):
         assert routing_sources._valid_cursor(cursor, os.stat(__file__)) is False
