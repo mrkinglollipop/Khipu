@@ -214,7 +214,7 @@ class DoctorReadOnlyAndProbeTest(unittest.TestCase):
             payload = json.loads(out.getvalue())
             self.assertEqual(payload["embed_coverage"], coverage)
             self.assertFalse(payload["embed_coverage_ok"])
-            covered.assert_called_once_with(detail=True)
+            covered.assert_called_once_with(detail=True, cached_plan=True, keep_gaps=mock.ANY)
 
     def test_known_scheduled_job_failure_fails_doctor(self):
         args = cli.build_parser().parse_args(["doctor"])

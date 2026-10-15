@@ -108,20 +108,23 @@ def episodes_missing_in_pg(cur, keys: list[tuple[str, str]]) -> list[tuple[str, 
     reconcile uses the pairs to insert exactly the missing lines.
     """
     missing: list[tuple[str, str]] = []
-    batch = 500
+    # Two arrays per statement, not a VALUES list of 500 pairs: the server
+    # answers 500 pairs in ~7 ms, so 35 round trips of placeholders cost 2.8 s
+    # for 17k file episodes and the query itself almost nothing. The anti-join,
+    # the ::timestamptz cast and the input order (WITH ORDINALITY) are the same.
+    batch = 20000
     for i in range(0, len(keys), batch):
         chunk = keys[i : i + batch]
-        placeholders = ", ".join(["(%s, %s)"] * len(chunk))
-        params = [x for pair in chunk for x in pair]
         cur.execute(
-            f"""
-            SELECT v.ts, v.md FROM (VALUES {placeholders}) AS v(ts, md)
+            """
+            SELECT v.ts, v.md FROM unnest(%s::text[], %s::text[]) WITH ORDINALITY AS v(ts, md, ord)
             WHERE NOT EXISTS (
                 SELECT 1 FROM episodes e
                 WHERE e.ts = v.ts::timestamptz AND md5(e.summary) = v.md
             )
+            ORDER BY v.ord
             """,
-            params,
+            ([k[0] for k in chunk], [k[1] for k in chunk]),
         )
         missing.extend((r[0], r[1]) for r in cur.fetchall())
     return missing
