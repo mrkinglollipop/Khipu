@@ -43,13 +43,14 @@ import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
 import { buildAttention, harnessLabel, routingAttention, type Attention } from "./doctorAttention";
 import { HealthReportRows } from "./healthRows";
-import { SummariserBudgetCard, SynthProviderFields, synthModelError } from "./SynthProvider";
+import { SummariserCalls, SynthFallbackField, SynthProviderChoices, synthModelError } from "./SynthProvider";
+import { KeysCard } from "./KeysCard";
 import { PlansCard, PlansSettingsCard, usePlanAttention, usePlanUsage } from "./PlansCard";
 import { RoutingCard } from "./RoutingCard";
 import { RoutingSettings } from "./RoutingSettings";
 import { useRouting } from "./routing";
 import type { DoctorSynthProvider } from "./SynthProvider";
-import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVerify";
+import { useModelVerify } from "./modelVerify";
 import { WorkingBanner } from "./WorkingBanner";
 import { FeedbackForm } from "./FeedbackForm";
 import { PostUpdateNoticeDialog } from "./PostUpdateNoticeDialog";
@@ -1179,17 +1180,10 @@ export default function App() {
   const [secretsPresenceMsg, setSecretsPresenceMsg] = useState<string | null>(
     null,
   );
-  const [geminiKey, setGeminiKey] = useState("");
-  const [geminiMsg, setGeminiMsg] = useState<string | null>(null);
-  const [geminiSaving, setGeminiSaving] = useState(false);
   const [models, setModels] = useState<ModelsState>(DEFAULT_MODELS);
   const [modelsMsg, setModelsMsg] = useState<string | null>(null);
   const [modelsSaving, setModelsSaving] = useState(false);
-  const [openaiCompatKey, setOpenaiCompatKey] = useState("");
-  const [openaiCompatMsg, setOpenaiCompatMsg] = useState<string | null>(null);
-  const [openaiCompatSaving, setOpenaiCompatSaving] = useState(false);
-  const [modelVerify, setModelVerify] = useState<ModelVerifyResult | null>(null);
-  const [modelVerifying, setModelVerifying] = useState(false);
+  const modelCheck = useModelVerify();
   const [revSlug, setRevSlug] = useState("");
   const [revRecent, setRevRecent] = useState<RecentRevision[]>([]);
   const [revShowId, setRevShowId] = useState("");
@@ -1381,90 +1375,12 @@ export default function App() {
     }
   }, []);
 
-  /** "A model key is proven on save with one real call" — one cheap, real API
-   *  call per configured provider (`khipu.modelcheck.check_model_keys` via
-   *  the `khipu_secrets_verify` fixed-argv command), never the key itself.
-   *  Runs right after a key save, and again on "Check again". */
-  const verifyModelKeys = useCallback(async () => {
-    setModelVerifying(true);
-    try {
-      const raw = await invoke<string>("khipu_secrets_verify");
-      const out = parseJson(raw) as unknown as ModelVerifyResult | null;
-      setModelVerify(out);
-    } catch (e) {
-      setModelVerify({
-        ok: false,
-        checks: [{ id: "error", ok: false, title: "Key check failed", detail: String(e), model: null, seconds: 0 }],
-      });
-    } finally {
-      setModelVerifying(false);
-    }
-  }, []);
-
-  const saveGeminiKey = useCallback(async () => {
-    const value = geminiKey.trim();
-    if (!value) {
-      setGeminiMsg("Enter a key first.");
-      return;
-    }
-    setGeminiSaving(true);
-    setGeminiMsg(null);
-    try {
-      // Dedicated command, not runKhipu: the value goes to the CLI's stdin so it
-      // never appears in argv. Clear it from component state on success so the
-      // key does not sit in the renderer any longer than the request needs.
-      const raw = await invoke<string>("set_khipu_secret", {
-        account: "gemini_api_key",
-        value,
-      });
-      const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
-      if (parsed?.ok) {
-        setGeminiKey("");
-        setGeminiMsg("Saved to Keychain.");
-        fetchedAt.current.activity = undefined;
-        await loadSecretsPresence();
-        await loadStatus(true);
-        await verifyModelKeys();
-      } else {
-        setGeminiMsg(parsed?.error ?? "Could not save the key.");
-      }
-    } catch (e) {
-      setGeminiMsg(String(e));
-    } finally {
-      setGeminiSaving(false);
-    }
-  }, [geminiKey, loadSecretsPresence, loadStatus, verifyModelKeys]);
-
-  const saveOpenaiCompatKey = useCallback(async () => {
-    const value = openaiCompatKey.trim();
-    if (!value) {
-      setOpenaiCompatMsg("Enter a key first (or leave blank for Ollama).");
-      return;
-    }
-    setOpenaiCompatSaving(true);
-    setOpenaiCompatMsg(null);
-    try {
-      const raw = await invoke<string>("set_khipu_secret", {
-        account: "openai_compat_api_key",
-        value,
-      });
-      const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
-      if (parsed?.ok) {
-        setOpenaiCompatKey("");
-        setOpenaiCompatMsg("Saved to Keychain.");
-        fetchedAt.current.activity = undefined;
-        await loadSecretsPresence();
-        await loadStatus(true);
-        await verifyModelKeys();
-      } else {
-        setOpenaiCompatMsg(parsed?.error ?? "Could not save the key.");
-      }
-    } catch (e) {
-      setOpenaiCompatMsg(String(e));
-    } finally {
-      setOpenaiCompatSaving(false);
-    }
-  }, [openaiCompatKey, loadSecretsPresence, loadStatus, verifyModelKeys]);
+  /** A key was saved: re-read what is stored and the health report. */
+  const onKeySaved = useCallback(async () => {
+    fetchedAt.current.activity = undefined;
+    await loadSecretsPresence();
+    await loadStatus(true);
+  }, [loadSecretsPresence, loadStatus]);
 
   /** Resolves to the error it put in the toast, or null, so a caller that
    *  posts its own toast afterwards can keep the doctor failure visible. */
@@ -5313,47 +5229,24 @@ export default function App() {
 
                 {settingsSection === "capture" ? (
                   <>
-                    <div className="section-card">
-                      <div className="section-head">Capture</div>
-                      <div className="section-body">
-                        <div className="rows">
-                          <div className="row-item">
-                            <span className="row-main">Capture a session after</span>
-                            <span className="row-meta">
-                              {CAPTURE_MIN_TURNS} turns, or {CAPTURE_MIN_MINUTES} minutes
-                            </span>
-                          </div>
-                          <div className="row-item">
-                            <span className="row-main">Secrets</span>
-                            <span className="row-meta wrap">
-                              API keys, tokens, private keys and passwords in
-                              connection strings are masked before a transcript
-                              reaches the summariser and before any capture is
-                              stored
-                            </span>
-                          </div>
-                        </div>
-                        <p className="muted">
-                          Always captures before a compaction and when a session
-                          ends. This cadence is the engine's own, the same on every
-                          harness; it is not editable from here.
-                        </p>
-                      </div>
-                    </div>
+                    <p className="set-intro cm-intro">
+                      Khipu saves a short summary of each conversation (a capture) and keeps a list of what
+                      conversations say is still owed (commitments). Here you choose when it saves, which model
+                      writes the summaries, and how commitments close.
+                    </p>
 
-                    <CaptureTuningCard active={tab === "settings" && settingsSection === "capture"} />
+                    <CaptureTuningCard
+                      active={tab === "settings" && settingsSection === "capture"}
+                      turns={CAPTURE_MIN_TURNS}
+                      minutes={CAPTURE_MIN_MINUTES}
+                    />
 
-                    <div className="section-card">
-                      <div className="section-head">Models</div>
+                    <div className="section-card" id="summaries">
+                      <div className="section-head">Session summaries</div>
                       <div className="section-body">
-                        <p className="muted">
-                          Session summaries follow this card: an API key (Gemini,
-                          Claude Haiku, OpenAI, OpenRouter), the Claude or ChatGPT
-                          login you already use, or a local OpenAI-compatible
-                          endpoint. The monthly topic
-                          pass runs its own model and is not switched here. The
-                          model that searches by meaning is chosen under
-                          Embeddings.
+                        <p className="set-help" id="synth-help">
+                          Which model writes the summary of each conversation. Search by meaning uses its own model,
+                          set in Embeddings.
                         </p>
                         {models.models_error ? (
                           <Callout tone="err" title="The stored models setting could not be read">
@@ -5362,18 +5255,16 @@ export default function App() {
                           </Callout>
                         ) : null}
 
-                        <SynthProviderFields
+                        <SynthProviderChoices
                           row={models.synth}
                           onChange={(patch) => updateModelRole("synth", patch)}
                           presence={secretsPresence}
+                          verifyResult={modelCheck.result}
                           doctorSynth={
                             (doctorParsed?.synth_provider as DoctorSynthProvider | undefined) ?? null
                           }
-                          onKeySaved={async () => {
-                            await loadSecretsPresence();
-                            await loadStatus(true);
-                          }}
                         />
+                        <p className="measured">Measured on 15 real conversations, Oct 13.</p>
 
                         <div className="toolbar">
                           <button
@@ -5386,107 +5277,38 @@ export default function App() {
                           </button>
                         </div>
                         {modelsMsg ? <pre className="code">{modelsMsg}</pre> : null}
+
+                        <SynthFallbackField
+                          provider={models.synth.provider}
+                          doctorSynth={
+                            (doctorParsed?.synth_provider as DoctorSynthProvider | undefined) ?? null
+                          }
+                          presence={secretsPresence}
+                          verifyResult={modelCheck.result}
+                          onSaved={onKeySaved}
+                        />
+
+                        <SummariserCalls active={tab === "settings" && settingsSection === "capture"} />
                       </div>
                     </div>
 
-                    <SummariserBudgetCard active={tab === "settings" && settingsSection === "capture"} />
+                    <KeysCard
+                      active={tab === "settings" && settingsSection === "capture"}
+                      presence={secretsPresence}
+                      presenceError={secretsPresenceMsg}
+                      verify={modelCheck}
+                      onKeySaved={onKeySaved}
+                    />
 
                     <PlansSettingsCard state={plans} active={tab === "settings" && settingsSection === "capture"} />
 
-                    <div className="section-card">
-                      <div className="section-head">Keys</div>
-                      <div className="section-body">
-                        <label className="muted" htmlFor="gemini-key">
-                          Gemini API key — session summaries and the search index.
-                          Stored in the login Keychain; never written to the repo
-                          or a config file.
-                        </label>
-                        <div className="toolbar">
-                          <input
-                            id="gemini-key"
-                            className="mono"
-                            type="password"
-                            autoComplete="off"
-                            spellCheck={false}
-                            value={geminiKey}
-                            onChange={(e) => setGeminiKey(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") void saveGeminiKey();
-                            }}
-                            placeholder={
-                              secretsPresence?.gemini_in_keychain
-                                ? "A key is stored — type a new one to replace it"
-                                : "AIza…"
-                            }
-                          />
-                          <button
-                            type="button"
-                            disabled={geminiSaving || !geminiKey.trim()}
-                            onClick={() => void saveGeminiKey()}
-                          >
-                            {geminiSaving ? "Saving…" : "Save key"}
-                          </button>
-                        </div>
-                        {geminiMsg ? <pre className="code">{geminiMsg}</pre> : null}
-                        <ModelCheckRow
-                          check={modelCheckFor(modelVerify, "gemini_generate")}
-                          verifying={modelVerifying}
-                          onRetry={() => void verifyModelKeys()}
-                        />
-                        <ModelCheckRow
-                          check={modelCheckFor(modelVerify, "gemini_embed")}
-                          verifying={modelVerifying}
-                          onRetry={() => void verifyModelKeys()}
-                        />
-
-                        <label className="muted" htmlFor="openai-compat-key">
-                          Optional key for a local OpenAI-compatible endpoint
-                          (Ollama can leave this blank).
-                        </label>
-                        <div className="toolbar">
-                          <input
-                            id="openai-compat-key"
-                            className="mono"
-                            type="password"
-                            autoComplete="off"
-                            spellCheck={false}
-                            value={openaiCompatKey}
-                            onChange={(e) => setOpenaiCompatKey(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") void saveOpenaiCompatKey();
-                            }}
-                            placeholder="sk-… (optional)"
-                          />
-                          <button
-                            type="button"
-                            disabled={openaiCompatSaving || !openaiCompatKey.trim()}
-                            onClick={() => void saveOpenaiCompatKey()}
-                          >
-                            {openaiCompatSaving ? "Saving…" : "Save local key"}
-                          </button>
-                        </div>
-                        {openaiCompatMsg ? (
-                          <pre className="code">{openaiCompatMsg}</pre>
-                        ) : null}
-                        <ModelCheckRow
-                          check={modelCheckFor(modelVerify, "openai_compat_generate")}
-                          verifying={modelVerifying}
-                          onRetry={() => void verifyModelKeys()}
-                        />
-                        <p className="muted">
-                          Currently stored: Gemini{" "}
-                          <strong>
-                            {presenceLabel(secretsPresence, "gemini_in_keychain")}
-                          </strong>
-                          ; local endpoint{" "}
-                          <strong>
-                            {presenceLabel(secretsPresence, "openai_compat_in_keychain")}
-                          </strong>
-                          . An environment variable <code>GEMINI_API_KEY</code>{" "}
-                          takes precedence over the stored Gemini key.
-                        </p>
-                      </div>
-                    </div>
+                    <p className="cm-pointer">
+                      The model for search by meaning has its own section,{" "}
+                      <button type="button" className="link sm" onClick={() => setSettingsSection("index")}>
+                        Embeddings
+                      </button>
+                      .
+                    </p>
                   </>
                 ) : null}
 

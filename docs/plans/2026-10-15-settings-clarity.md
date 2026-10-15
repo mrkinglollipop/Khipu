@@ -31,7 +31,7 @@ a card on Home that stays until he closes it, each item with a Show me button.
 | 3 | Routing overview: groups that fold, the Needs you list, Plans moves into Accounts | M | open |
 | 4 | Routing lists: sort and filter accounts, filter and search rules, filter recent changes | S–M | open |
 | 5 | Standing rules: "Checked by Khipu" with the check's result | S | open |
-| 6 | Capture & models: three cards and one Keys list | M | open |
+| 6 | Capture & models: three cards and one Keys list | M | built, in review (branch feat/clarity-capture) |
 | 7 | Setup: an Accounts step | S–M | open |
 | 8 | What's new after an update (dialog and Home card), and its history in Settings → Updates | S | open |
 
