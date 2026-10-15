@@ -409,6 +409,18 @@ def test_check_now_after_the_reset_and_its_wait_counts_as_the_check(home):
     assert entry["next_check"] == routing._iso(until + timedelta(minutes=10))
 
 
+def test_check_now_on_unknown_account_reports_a_new_limit(home):
+    until = T0 + timedelta(hours=3)
+    assert _account(routing.read_view(), "claude|")["state"] == "unknown"
+    out = routing.check_account("Claude", probe=lambda _a: _same_limit(until), load=lambda: 0)
+    assert (out["outcome"], out["reason"]) == ("later_limit", "Khipu read a limit")
+    entry = _account(routing.read_view(), "claude|")
+    assert (entry["state"], entry["until"]) == ("limited", routing._iso(until))
+    events, unreadable = routing.read_events()
+    assert unreadable == 0 and events[-1]["reason"] == "Khipu read a limit"
+    assert entry["next_check"] == routing._iso(until + timedelta(minutes=2))
+
+
 def test_an_account_removed_from_settings_while_limited_is_never_checked(home, capsys):
     # F3: the record still held Claude, so it stayed due and showed Check now;
     # its check raised and every poll child failed before reaching Codex.

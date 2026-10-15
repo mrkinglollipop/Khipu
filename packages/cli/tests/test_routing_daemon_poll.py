@@ -14,6 +14,7 @@ tests use fake clocks; the helper's tests run the real helper process.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import signal
@@ -227,9 +228,97 @@ def _helper_poll(schedule) -> dict:
     """A poll as the helper runs it: the view's stat first, then the child's
     poll, then the helper takes its answer."""
     schedule.view_seen = recall_prompt._view_stat(routing)
-    out = recall_prompt._poll_once(routing)
+    out = recall_prompt._poll_once(routing, blocked_resets=dict(schedule.blocked_resets))
+    out = json.loads(json.dumps(out))  # a child's answer crosses the pipe as JSON
     recall_prompt._take_poll_answer(schedule, out)
     return out
+
+
+@pytest.mark.parametrize("push", [False, True])
+@pytest.mark.parametrize("failure", [errno.ENOSPC, errno.EACCES])
+def test_failed_reset_outcome_write_stops_repeated_probes(home, monkeypatch, push, failure):
+    clocks = home["clocks"]
+    _set(home, routing_push_prompt=push, routing_reset_check=True, routing_busy_load=0)
+    until = T0 + timedelta(minutes=20)
+    routing.report(account="Claude", state="limited", until=routing._iso(until), author=ME)
+    clocks.run(22 * 60)
+    probed = []
+
+    def probe(account):
+        probed.append(account["label"])
+        return {"ok": True, "source": "live", "windows": [
+            {"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]}
+
+    def cannot_append(*_events):
+        raise OSError(failure, "fake write failure")
+
+    monkeypatch.setattr("khipu.usage.probe_account", probe)
+    append = routing._append_locked
+    monkeypatch.setattr(routing, "_append_locked", cannot_append)
+    schedule = _schedule(home)
+    outcomes = []
+    for _ in range(30):
+        recall_prompt._look_at_settings(schedule, routing)
+        if schedule.due():
+            outcomes.extend(_helper_poll(schedule)["reset_checks"])
+        clocks.run(10)
+    assert probed == ["Claude"]
+    assert [o["outcome"] for o in outcomes] == ["write_failed"]
+    # A later account and a genuinely new reset are still eligible.
+    monkeypatch.setattr(routing, "_append_locked", append)
+    routing.report(account="Codex", state="limited", until=routing._iso(until), author=ME)
+    recall_prompt._look_at_settings(schedule, routing)
+    _helper_poll(schedule)
+    assert probed == ["Claude", "Codex"]
+    new_until = clocks.now + timedelta(minutes=1)
+    routing.report(account="Claude", state="limited", until=routing._iso(new_until), author=ME)
+    clocks.run(3 * 60)
+    recall_prompt._look_at_settings(schedule, routing)
+    _helper_poll(schedule)
+    assert probed == ["Claude", "Codex", "Claude"]
+
+
+@pytest.mark.parametrize("setting,old,new", [
+    ("routing_reset_check_wait", 3600, 120),
+    ("routing_reset_check_retries", [3600, 7200], [600, 1800]),
+    ("routing_busy_wait", 3600, 300),
+])
+def test_checks_only_helper_honours_changed_reset_settings(home, monkeypatch, setting, old, new):
+    clocks = home["clocks"]
+    _set(home, routing_push_prompt=False, routing_reset_check=True, routing_busy_load=1, **{setting: old})
+    until = T0 + timedelta(minutes=20)
+    routing.report(account="Claude", state="limited", until=routing._iso(until), author=ME)
+    probed = []
+
+    def probe(_account):
+        probed.append(clocks.now)
+        return {"ok": True, "source": "live", "windows": [
+            {"name": "five_hour", "used_pct": 100, "resets_at": routing._iso(until)}]}
+
+    monkeypatch.setattr("khipu.usage.probe_account", probe)
+    monkeypatch.setattr(routing.os, "getloadavg", lambda: (0, 0, 0))
+    if setting != "routing_reset_check_wait":
+        clocks.run(22 * 60)
+        routing.check_account("Claude", scheduled=True, probe=probe,
+                              load=lambda: 2 if setting == "routing_busy_wait" else 0)
+    schedule = _schedule(home)
+    recall_prompt._look_at_settings(schedule, routing)
+    _helper_poll(schedule)
+    old_due = schedule.valid_until
+    _set(home, **{setting: new})
+    clocks.run(5)
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due() == ["look"]
+    _helper_poll(schedule)
+    expected = until + timedelta(minutes={"routing_reset_check_wait": 2,
+                                          "routing_reset_check_retries": 10, "routing_busy_wait": 7}[setting])
+    assert schedule.valid_until == expected.timestamp() < old_due
+    clocks.run((expected - clocks.now).total_seconds())
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due()
+    before = len(probed)
+    _helper_poll(schedule)
+    assert probed[before:] == [expected]
 
 
 @pytest.mark.parametrize("interval", [0, "1h"])
