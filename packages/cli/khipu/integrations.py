@@ -2170,10 +2170,33 @@ def _probe_recall(command: str) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+# The routing block's headings (routing.py's full block and CHANGES_HEADING,
+# recall_prompt.ROUTING_TOO_LONG's pointer). recall_prompt appends the block
+# after whatever recall printed, never before it, so a context that starts
+# with one of these holds no recall output.
+_ROUTING_HEADINGS = ("## Routing at ", "## Routing changes at ", "## Routing\nKhipu's routing update")
+_RECALL_HEADING = "## Prior work on this topic"
+
+
+def _recall_part(ctx: str) -> str:
+    """The recall output in a prompt hook's context, without the routing
+    block appended after it. A recall heading after the routing block makes
+    the whole context count, so recall that leaked past it still shows."""
+    cut = len(ctx)
+    for heading in _ROUTING_HEADINGS:
+        at = 0 if ctx.startswith(heading) else ctx.find("\n\n" + heading)
+        if at >= 0:
+            cut = min(cut, at)
+    return ctx if _RECALL_HEADING in ctx[cut:] else ctx[:cut]
+
+
 def _probe_prompt_recall(command: str) -> dict:
-    """UserPromptSubmit hook: a trivial prompt must print exactly {} (R11's
-    gate) and a topical one must run cleanly and return valid JSON, shell-run
-    for the same reason as _probe_hook.
+    """UserPromptSubmit hook: a trivial prompt must carry no recall output
+    (R11's gate) and a topical one must run cleanly and return valid JSON,
+    shell-run for the same reason as _probe_hook. Since routing truth phase
+    3 a new conversation's first prompt also carries the routing block (and
+    a later one may carry its changes), so only the recall part is judged:
+    routing lines alone pass a trivial prompt and fail a topical one.
 
     2026-09-14 revision: khipu.recall_prompt now searches the LOCAL sqlite
     replica first (khipu.hub_snapshot) — no network round trip beyond one
@@ -2229,15 +2252,17 @@ def _probe_prompt_recall(command: str) -> dict:
         d_topical.get("hookSpecificOutput", {}).get("additionalContext")
         or d_topical.get("additional_context") or ""
     )
-    ok = trivial.returncode == 0 and topical.returncode == 0 and trivial_ctx == ""
+    trivial_recall = _recall_part(trivial_ctx)
+    topical_recall = _recall_part(topical_ctx)
+    ok = trivial.returncode == 0 and topical.returncode == 0 and trivial_recall == ""
     if snapshot_fresh:
-        ok = ok and bool(topical_ctx)
-    out = {"ok": ok, "trivial_empty": trivial_ctx == "", "topical_context_chars": len(topical_ctx),
+        ok = ok and bool(topical_recall)
+    out = {"ok": ok, "trivial_empty": trivial_recall == "", "topical_context_chars": len(topical_recall),
            "snapshot_fresh": snapshot_fresh, "ms": int((time.time() - t0) * 1000)}
     if not ok:
-        if trivial_ctx:
-            reason = "trivial prompt was not empty"
-        elif snapshot_fresh and not topical_ctx:
+        if trivial_recall:
+            reason = "trivial prompt carried recall output"
+        elif snapshot_fresh and not topical_recall:
             reason = "topical prompt returned nothing while the local snapshot is fresh"
         else:
             reason = trivial.stderr or topical.stderr or "probe failed"
