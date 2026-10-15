@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   ACCOUNTS_MAX,
+  MUSE_NO_TURN,
   PLAN_READ_FAILED,
   PlansCard,
   PlansSettingsCard,
@@ -21,6 +22,8 @@ import {
   loginKey,
   meterTone,
   planAttention,
+  planPauses,
+  planStatus,
   plansHealthDetail,
   resetPhrase,
   tightestOverall,
@@ -31,6 +34,7 @@ import {
 } from "../PlansCard";
 import type { PlanUsageState, UsageAccount, UsageReport } from "../PlansCard";
 import { HealthReportRows, plansHealthRow } from "../healthRows";
+import type { RouteView } from "../routing";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -211,12 +215,14 @@ describe("PlansCard on Home", () => {
     expect(screen.getAllByRole("meter")).toHaveLength(3);
   });
 
-  it("shows Muse's note when no turn has been observed, not 0%", async () => {
+  it("says Muse has no figures yet when no turn has been observed, not 0% and not Live", async () => {
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("no turn observed yet")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(MUSE_NO_TURN)).toBeTruthy());
     const muse = within(rowFor("Muse"));
     expect(muse.queryByRole("meter")).toBeNull();
     expect(muse.queryByText(/0%/)).toBeNull();
+    expect(muse.queryByText(/Live/)).toBeNull();
+    expect(screen.queryByText(/Live/)).toBeNull();
   });
 
   it("warns at 75% and alerts at 90%", async () => {
@@ -237,18 +243,18 @@ describe("PlansCard on Home", () => {
       timeout: "didn't answer in time",
       not_signed_in: "not signed in",
       not_installed: "not installed",
-      bad_reply: "unreadable reply",
+      bad_reply: "answered in a way Khipu can't read",
       no_plan_limits: "no plan limits reported",
       invalid_account: "not a valid account entry",
-      no_answer: "stopped without answering",
+      no_answer: "didn't answer",
       start_failed: "could not be started",
-      cli_error: "reported an error",
+      cli_error: "reported an error when asked",
       internal_error: "Khipu could not run the check",
       pending: "first read still running",
     };
     for (const [code, phrase] of Object.entries(phrases)) expect(usageErrorPhrase(code)).toBe(phrase);
-    expect(usageErrorPhrase("exit_3")).toBe("stopped without answering");
-    expect(usageErrorPhrase("signal_9")).toBe("stopped without answering");
+    expect(usageErrorPhrase("exit_3")).toBe("didn't answer");
+    expect(usageErrorPhrase("signal_9")).toBe("didn't answer");
     expect(usageErrorPhrase("something_new")).toBe("couldn't read");
     expect(usageErrorPhrase(undefined)).toBe("couldn't read");
     status = {
@@ -258,10 +264,17 @@ describe("PlansCard on Home", () => {
       })),
     };
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("didn't answer in time")).toBeTruthy());
-    for (const phrase of Object.values(phrases)) expect(screen.getAllByText(phrase).length).toBeGreaterThan(0);
+    // A row cached before every code had a note says the CLI's name and the
+    // code's phrase; each row says it once.
+    await waitFor(() => expect(screen.getByText("Can't read its plan: Claude Code didn't answer in time")).toBeTruthy());
+    expect(within(rowFor("Acct not_signed_in")).getByText("Not signed in")).toBeTruthy();
+    expect(within(rowFor("Acct no_plan_limits")).getByText("Its sign-in reports no plan limits")).toBeTruthy();
+    expect(within(rowFor("Acct pending")).getByText("Reading it for the first time")).toBeTruthy();
+    expect(within(rowFor("Acct internal_error")).getByText("Can't read its plan: Khipu could not run the check")).toBeTruthy();
+    expect(within(rowFor("Acct exit_3")).getByText("Can't read its plan: Claude Code didn't answer")).toBeTruthy();
+    for (const el of document.querySelectorAll(".plan-row")) expect(el.querySelectorAll(".plan-say")).toHaveLength(1);
     expect(screen.queryByText("exit_3")).toBeNull();
-    expect(screen.queryByText("couldn't read")).toBeNull();
+    expect(screen.queryByText(/couldn't read/)).toBeNull();
   });
 
   it("keeps the last figures of a failed probe with its phrase and their age", async () => {
@@ -276,9 +289,9 @@ describe("PlansCard on Home", () => {
     render(<Home />);
     await waitFor(() => expect(screen.getByText("40%")).toBeTruthy());
     const codex = within(rowFor("Codex"));
-    expect(codex.getByText("didn't answer in time")).toBeTruthy();
-    expect(codex.getByText("figures from 2 days ago")).toBeTruthy();
-    expect(within(rowFor("Muse")).getByText("as of the last turn, 2 h ago")).toBeTruthy();
+    expect(codex.getByText("Can't read it now; figures from 2 days ago")).toBeTruthy();
+    expect(codex.getByRole("meter").classList.contains("dim")).toBe(true);
+    expect(within(rowFor("Muse")).getByText("as of its last turn, 2 h ago")).toBeTruthy();
   });
 
   it("Refresh calls the refresh command, spins while it runs, then shows the new figures", async () => {
@@ -346,14 +359,14 @@ describe("PlansCard on Home", () => {
   it("shows an empty state when no account is configured", async () => {
     status = { generated_at: "2026-10-14T13:57:29Z", max_age_s: 120, refreshing: false, accounts: [], summary_text: [] };
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("No plans to show")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("No accounts to read yet")).toBeTruthy());
     expect(screen.queryByRole("meter")).toBeNull();
   });
 
   it("a window that has reset shows no old figure and no bar", async () => {
     status = withMuseResetAt95();
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("every limit has reset since it was read")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Every limit has reset since it was read")).toBeTruthy());
     const muse = within(rowFor("Muse"));
     expect(muse.queryByRole("meter")).toBeNull();
     expect(muse.queryByText("95%")).toBeNull();
@@ -486,9 +499,12 @@ describe("PlansSettingsCard", () => {
     const c = within(claude);
     for (const label of ["five-hour", "week", "Fable week"]) expect(c.getByText(label)).toBeTruthy();
     expect(c.getAllByText(/^resets /)).toHaveLength(3);
-    expect(c.getByText(/figures from .* ago/)).toBeTruthy();
-    expect(within(screen.getByRole("group", { name: "Muse" })).getByText("no turn observed yet")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Probe now" }));
+    expect(c.getByText(/^Live: read .* ago$/)).toBeTruthy();
+    const muse = within(screen.getByRole("group", { name: "Muse" }));
+    expect(muse.getByText(MUSE_NO_TURN)).toBeTruthy();
+    expect(muse.queryByText(/Live/)).toBeNull();
+    expect(muse.getByText(/^Checked .* ago$/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Check all now" }));
     await waitFor(() => expect(usageCalls()).toContain("khipu_usage_refresh"));
     await act(async () => release("khipu_usage_refresh"));
     await waitFor(() => expect(screen.getByText("94%")).toBeTruthy());
@@ -498,7 +514,7 @@ describe("PlansSettingsCard", () => {
     holdStatus = true;
     render(<Settings />);
     await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Reading plan usage…"));
-    expect(screen.getByRole("button", { name: "Probe now" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Check all now" })).toBeDisabled();
     await act(async () => release("khipu_usage_status"));
     await screen.findByRole("group", { name: "Claude" });
     expect(screen.queryByText("Reading plan usage…")).toBeNull();
@@ -520,15 +536,22 @@ describe("PlansSettingsCard", () => {
     status = r;
     render(<Settings />);
     const typo = within(await screen.findByRole("group", { name: "Typo" }));
-    expect(typo.getByText("not a valid account entry")).toBeTruthy();
-    expect(typo.getByText(/Khipu does not read the CLI "cluade"/)).toBeTruthy();
+    expect(typo.getByText(/^Can't read its plan: this account entry is not valid: Khipu does not read the CLI "cluade"/)).toBeTruthy();
     expect(
       within(screen.getByRole("group", { name: "Claude second" })).getByText(
         /Open Claude Code with this login folder and sign in again \(\/login\)/,
       ),
     ).toBeTruthy();
     const codex = within(screen.getByRole("group", { name: "Codex" }));
-    expect(codex.getByText(/figures from 2 days ago · last tried 30s ago/)).toBeTruthy();
+    expect(codex.getByText("Codex is not signed in.")).toBeTruthy();
+    expect(codex.getByText("Figures from 2 days ago")).toBeTruthy();
+    expect(codex.getByRole("button", { name: "Sign Codex in again" })).toBeTruthy();
+    const details = codex.getByRole("button", { name: "Details" });
+    expect(details.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(details);
+    expect(details.getAttribute("aria-expanded")).toBe("true");
+    expect(codex.getByText("not_signed_in")).toBeTruthy();
+    expect(codex.getByText(/, 30s ago$/)).toBeTruthy();
   });
 
   it("shows a reset that has passed as such, with no warning colour", async () => {
@@ -876,13 +899,15 @@ describe("a Codex whose live read failed (fix round 3)", () => {
     const { unmount } = render(<Home />);
     await waitFor(() => expect(screen.getByText("40%")).toBeTruthy());
     const codex = within(rowFor("Codex"));
-    expect(codex.getByText("not signed in")).toBeTruthy();
-    expect(codex.getByText("as of the last turn, 3 days ago")).toBeTruthy();
+    expect(codex.getByText("Not signed in")).toBeTruthy();
+    expect(rowFor("Codex").querySelectorAll(".plan-say")).toHaveLength(1);
     unmount();
     render(<Settings />);
     const group = within(await screen.findByRole("group", { name: "Codex" }));
-    expect(group.getByText("not signed in")).toBeTruthy();
-    expect(group.getByText(/Open Codex and sign in again/)).toBeTruthy();
+    expect(group.getByText(/^Codex is not signed in, so these figures are from its last turn. Open Codex and sign in again/)).toBeTruthy();
+    // The note already says the figures are from its last turn: said once.
+    expect(group.queryByText(/^As of its last turn/)).toBeNull();
+    expect(group.getAllByText(/last turn/)).toHaveLength(1);
   });
 
   it("names it in the health report's Plans row", () => {
@@ -930,5 +955,124 @@ describe("the 90% item while Home stays open", () => {
     late.accounts![0].windows![0] = { name: "five_hour", used_pct: 97, resets_at: "2026-10-14T15:00:00Z", window_mins: 300 };
     rerender(<AttentionProbe report={late} />);
     expect(screen.getByTestId("plan-attention").textContent).toBe("");
+  });
+});
+
+describe("one status phrase per account (settings clarity, phase 2)", () => {
+  const PAUSED_UNTIL = "2026-10-21T21:26:00Z";
+  const pausedGrok: RouteView = {
+    accounts: [{ key: "grok|", label: "Grok", harness: "grok", state: "paused", until: PAUSED_UNTIL }],
+  };
+
+  /** Every state in the scope's table, one account each. */
+  function tableReport(): UsageReport {
+    const r = realReport();
+    const [claude, codex, grok] = r.accounts!;
+    return {
+      ...r,
+      accounts: [
+        claude,
+        { ...codex, account: "Kept", ok: false, error: "timeout", stale: true, probed_at: "2026-10-12T14:00:00Z",
+          last_good_at: "2026-10-12T14:00:00Z", last_attempt_at: "2026-10-14T13:59:30Z",
+          note: "Codex didn't answer in time" },
+        { ...grok, windows: [], ok: false, error: "no_answer", note: "Grok Build didn't answer", last_good_at: null },
+        { ...codex, account: "Signed out", windows: [], ok: false, error: "not_signed_in",
+          note: "Codex is not signed in. Open Codex and sign in again" },
+        r.accounts![3],
+        { ...r.accounts![3], account: "Muse two", plan: "pro", note: null, observed_at: "2026-10-14T12:00:00Z",
+          windows: [{ name: "five_hour", used_pct: 12, resets_at: "2026-10-14T15:00:00Z", window_mins: 300 }] },
+      ],
+    };
+  }
+
+  function HomeWith({ routing }: { routing: RouteView | null }) {
+    const state = usePlanUsage(true);
+    return <PlansCard state={state} routing={routing} />;
+  }
+
+  it("renders each row of the table with exactly one status phrase", async () => {
+    status = tableReport();
+    render(<HomeWith routing={null} />);
+    await waitFor(() => expect(screen.getByText(MUSE_NO_TURN)).toBeTruthy());
+    const said = (name: string) => [...rowFor(name).querySelectorAll(".plan-say")].map((n) => n.textContent);
+    expect(said("Claude")).toEqual([]);
+    expect(within(rowFor("Claude")).getByRole("meter")).toBeTruthy();
+    expect(said("Kept")).toEqual(["Can't read it now; figures from 2 days ago"]);
+    expect(within(rowFor("Kept")).getByRole("meter").className).toBe("plan-meter dim");
+    expect(said("Grok")).toEqual(["Can't read its plan: Grok Build didn't answer"]);
+    expect(within(rowFor("Grok")).queryByText(/Sign in/)).toBeNull();
+    expect(said("Signed out")).toEqual(["Not signed in"]);
+    expect(within(rowFor("Signed out")).getByRole("button", { name: "Sign Signed out in again" })).toBeTruthy();
+    expect(said("Muse")).toEqual([MUSE_NO_TURN]);
+    expect(said("Muse two")).toEqual(["as of its last turn, 2 h ago"]);
+    expect(screen.queryByText(/Live/)).toBeNull();
+    expect(screen.queryByText(/The last read failed/)).toBeNull();
+  });
+
+  it("shows the owner's pause first, from the routing record", async () => {
+    status = tableReport();
+    render(<HomeWith routing={pausedGrok} />);
+    const pause = planPauses(pausedGrok, new Date()).get("Grok")!;
+    expect(pause).toMatch(/^Paused by you until /);
+    await waitFor(() => expect(within(rowFor("Grok")).getByText(pause)).toBeTruthy());
+    const tail = rowFor("Grok").querySelector(".plan-none")!;
+    expect(tail.firstElementChild!.textContent).toBe(pause);
+    expect(tail.querySelectorAll(".plan-say")).toHaveLength(1);
+    expect(within(rowFor("Claude")).queryByText(/Paused/)).toBeNull();
+  });
+
+  it("shows no pause when the routing record could not be read", async () => {
+    status = tableReport();
+    render(<HomeWith routing={null} />);
+    await waitFor(() => expect(rowFor("Grok")).toBeTruthy());
+    expect(screen.queryByText(/Paused by you/)).toBeNull();
+    expect(planPauses(null).size).toBe(0);
+  });
+
+  it("says in the card's head when the whole last read failed, with no loose footer", async () => {
+    render(<Home />);
+    await waitFor(() => expect(screen.getByText("40%")).toBeTruthy());
+    invokeMock.mockImplementation(async () => {
+      throw "khipu exited 1";
+    });
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    await act(async () => {
+      await exposed!.reread();
+    });
+    expect(screen.getByText(/^Last read failed .*; showing earlier figures$/)).toBeTruthy();
+    expect(screen.getByText("40%")).toBeTruthy();
+    expect(screen.queryByText(/these figures are from the read before it/)).toBeNull();
+    spy.mockRestore();
+  });
+
+  it("keeps every line about an account inside its block in Settings, the pause first", async () => {
+    status = tableReport();
+    function SettingsWith() {
+      const state = usePlanUsage("settings");
+      return <PlansSettingsCard state={state} active routing={pausedGrok} />;
+    }
+    const { container } = render(<SettingsWith />);
+    const grok = await screen.findByRole("group", { name: "Grok" });
+    const head = grok.querySelector("h2")!;
+    expect(head.textContent).toBe("GrokSuperGrok Heavy plan");
+    expect(head.nextElementSibling!.className).toBe("plan-paused");
+    expect(within(grok).getByText("Can't read its plan: Grok Build didn't answer. No figures to show.")).toBeTruthy();
+    expect(grok.className).toBe("plan-block warn");
+    const outside = (sel: string) => [...container.querySelectorAll(sel)].filter((n) => !n.closest(".plan-block"));
+    for (const sel of ['[role="meter"]', ".plan-fail", ".plan-reads", ".plan-paused", ".plan-empty", ".plan-details"]) {
+      expect(outside(sel)).toEqual([]);
+    }
+    expect(outside("button").map((b) => b.textContent)).toEqual(
+      expect.not.arrayContaining(["Details", "Sign in again"]),
+    );
+    expect(container.querySelectorAll(".plan-block")).toHaveLength(6);
+    expect(container.querySelector(".plan-account")).toBeNull();
+  });
+
+  it("judges the status from the report alone", () => {
+    const r = tableReport();
+    expect(planStatus(r.accounts![0], NOW)).toEqual({ figures: "live", say: null, tone: null, code: null });
+    expect(planStatus(r.accounts![1], NOW).figures).toBe("kept");
+    expect(planStatus(r.accounts![2], NOW).figures).toBe("none");
   });
 });

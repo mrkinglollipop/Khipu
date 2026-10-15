@@ -2441,7 +2441,10 @@ export default function App() {
   // Routing truth phase 4: the routing record (`khipu route --json`), read on
   // Home and every minute while Home stays open. Its attention items warn and
   // block nothing (the record is guidance, not a gate).
-  const routing = useRouting(tab === "home");
+  // Also read on Settings -> Capture & models, where Plans shows the pauses.
+  const routing = useRouting(tab === "home" || (tab === "settings" && settingsSection === "capture"));
+  // Plans shows a pause only from a record read without error, never a guess.
+  const routingForPlans = routing.error ? null : routing.data;
   const routingItems = useMemo(() => routingAttention(routing.data), [routing.data]);
   const homeAttention = useMemo(
     () => [...attention, ...planItems, ...routingItems],
@@ -3667,7 +3670,14 @@ export default function App() {
               onCaptureNow={() => void runCaptureNow()}
             />
 
-            <PlansCard state={plans} />
+            <PlansCard
+              state={plans}
+              routing={routingForPlans}
+              onOpenAccounts={() => {
+                setSettingsSection("capture");
+                setTab("settings");
+              }}
+            />
 
             <RoutingCard state={routing} plans={plans.data} />
 
@@ -5391,7 +5401,11 @@ export default function App() {
 
                     <SummariserBudgetCard active={tab === "settings" && settingsSection === "capture"} />
 
-                    <PlansSettingsCard state={plans} active={tab === "settings" && settingsSection === "capture"} />
+                    <PlansSettingsCard
+                      state={plans}
+                      active={tab === "settings" && settingsSection === "capture"}
+                      routing={routingForPlans}
+                    />
 
                     <div className="section-card">
                       <div className="section-head">Keys</div>

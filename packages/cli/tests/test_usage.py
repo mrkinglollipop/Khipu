@@ -1124,6 +1124,24 @@ def test_no_note_khipu_writes_carries_a_code():
         "This sign-in reports no plan limits. Open Claude Code with this login folder and sign in again (/login)")
 
 
+def test_every_code_a_probe_can_return_has_a_plain_note():
+    """Settings clarity, phase 2: the app shows the row's note as the cause, so
+    a code with no note would leave it inventing words. The sign-in command's
+    own codes never reach a plan row."""
+    sign_in = {usage.E_NOT_CONFIGURED, usage.E_AMBIGUOUS, usage.E_NO_SIGN_IN, usage.E_SIGN_IN_TIMEOUT}
+    codes = [value for name, value in vars(usage).items()
+             if name.startswith("E_") and isinstance(value, str) and value not in sign_in]
+    assert len(codes) >= 11
+    for code in [*codes, "exit_1", "exit_127", "signal_9"]:
+        for harness in usage.HARNESSES:
+            assert usage._note(code, harness), (code, harness)
+    assert usage._note("timeout", "grok") == "Grok Build didn't answer in time"
+    assert usage._note("no_answer", "grok") == "Grok Build didn't answer"
+    assert usage._note("exit_3", "grok") == "Grok Build didn't answer"
+    assert usage._note("cli_error", "codex") == "Codex reported an error when asked"
+    assert usage._note("bad_reply", "claude") == "Claude Code answered in a way Khipu can't read"
+
+
 def test_a_failed_probe_row_carries_the_plain_note_for_its_account(fake):
     row = usage.probe_account({"label": "Grok work", "harness": "grok", "home": "~/.grok-work"})
     assert row["ok"] is False and row["error"] == "not_installed"
