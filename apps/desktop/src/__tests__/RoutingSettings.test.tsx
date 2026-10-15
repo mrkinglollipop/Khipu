@@ -633,10 +633,182 @@ describe("Settings -> Routing: job runner folders, lanes, the table and changes"
     await page();
     expect(await screen.findByText("/notes/routing/ROUTING-NOW.md")).toBeInTheDocument();
     expect(screen.getByText("NOW block changed 9:20 AM")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /routing table/i })).toBeNull();
     const today = screen.getByRole("list", { name: "Today" });
     expect(within(today).getAllByRole("listitem")[0]).toHaveTextContent("Standing rule 6 removed");
     expect(screen.getByRole("list", { name: "Yesterday" })).toHaveTextContent("Grok Build paused by you");
+  });
+});
+
+// ---- Fix round 2 ----------------------------------------------------------------------------
+
+describe("Settings -> Routing: choosing the routing table file (R2-1)", () => {
+  it("chooses a file when none is set, refusing a relative path", async () => {
+    answers.khipu_config_show = config({ routing_table: setting(null, null) });
+    await page();
+    expect(await screen.findByText("No file set")).toBeInTheDocument();
+    const choose = screen.getByRole("button", { name: "Choose the routing table file" });
+    expect(choose).toHaveTextContent("Choose…");
+    fireEvent.click(choose);
+    const form = screen.getByRole("form", { name: "Change the routing table file" });
+    const field = within(form).getByLabelText("File");
+    expect(document.activeElement).toBe(field);
+    fireEvent.change(field, { target: { value: "notes/ROUTING-NOW.md" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    expect(await within(form).findByRole("alert")).toHaveTextContent("starting with / or ~/");
+    expect(calls("khipu_config_set")).toEqual([]);
+    answers.khipu_config_show = () =>
+      calls("khipu_config_set").length ? config() : config({ routing_table: setting(null, null) });
+    fireEvent.change(field, { target: { value: " ~/notes/ROUTING-NOW.md " } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls("khipu_config_set")).toEqual([{ key: "routing_table", value: "~/notes/ROUTING-NOW.md" }]));
+    expect(await screen.findByText("/notes/routing/ROUTING-NOW.md")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole("form", { name: "Change the routing table file" })).toBeNull());
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Change the routing table file" })),
+    );
+  });
+
+  it("changes the file, stops reading it, and shows the CLI's refusal", async () => {
+    answers.khipu_config_set = { ok: false, error: "routing_table can't name a file inside a private folder" };
+    await page();
+    const change = await screen.findByRole("button", { name: "Change the routing table file" });
+    expect(change).toHaveTextContent("Change…");
+    fireEvent.click(change);
+    const form = screen.getByRole("form", { name: "Change the routing table file" });
+    expect(within(form).getByLabelText("File")).toHaveValue("/notes/routing/ROUTING-NOW.md");
+    fireEvent.change(within(form).getByLabelText("File"), { target: { value: "/private/auth.json" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    expect(await within(form).findByRole("alert")).toHaveTextContent(
+      "Khipu didn't make that change: routing_table can't name a file inside a private folder",
+    );
+    fireEvent.click(within(form).getByRole("button", { name: "Stop reading it" }));
+    await waitFor(() => expect(calls("khipu_config_unset")).toEqual([{ key: "routing_table" }]));
+  });
+});
+
+describe("Settings -> Routing: focus after a button removes itself (R2-2)", () => {
+  /** The record as it reads after the write the test makes. */
+  function afterWrite(cmd: string, change: (v: RouteView) => RouteView) {
+    answers.khipu_route_view = () => (calls(cmd).length ? change(view()) : view());
+  }
+
+  it("Clear gives focus to the account's Mark paused until…", async () => {
+    afterWrite("khipu_route_clear", (v) => ({
+      ...v,
+      accounts: v.accounts!.map((a) => (a.label === "Claude main" ? { ...a, state: "open", until: null } : a)),
+    }));
+    await page();
+    const clear = screen.getByRole("button", { name: "Clear the limit for Claude main" });
+    clear.focus();
+    fireEvent.click(clear);
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Clear the limit for Claude main" })).toBeNull());
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Mark Claude main paused until…" })),
+    );
+  });
+
+  it("Lift gives focus to the account's Mark paused until…", async () => {
+    afterWrite("khipu_route_lift", (v) => ({
+      ...v,
+      accounts: v.accounts!.map((a) => (a.label === "Grok Build" ? { ...a, state: "open", until: null } : a)),
+    }));
+    await page();
+    const lift = screen.getByRole("button", { name: "Lift the pause for Grok Build" });
+    lift.focus();
+    fireEvent.click(lift);
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Mark Grok Build paused until…" })),
+    );
+  });
+
+  it("Dismiss gives focus to the account's Mark paused until…", async () => {
+    afterWrite("khipu_route_clear", (v) => ({
+      ...v,
+      accounts: v.accounts!.map((a) => (a.label === "Claude second" ? { ...a, disagreement: null } : a)),
+    }));
+    await page();
+    const dismiss = within(screen.getByRole("group", { name: "Claude second: two reports disagree" })).getByRole(
+      "button",
+      { name: "Dismiss the runner's report" },
+    );
+    dismiss.focus();
+    fireEvent.click(dismiss);
+    await waitFor(() => expect(screen.queryByRole("group", { name: "Claude second: two reports disagree" })).toBeNull());
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Mark Claude second paused until…" })),
+    );
+  });
+
+  it("Undo gives focus to the restored rule's Remove", async () => {
+    answers.khipu_route_view = () => {
+      const v = view();
+      const done = calls("khipu_route_rule").map((c) => c!.action);
+      return done.includes("retire") && !done.includes("restore") ? { ...v, rules: v.rules!.filter((r) => r.n !== 3) } : v;
+    };
+    await page();
+    fireEvent.click(screen.getByRole("button", { name: "Remove rule 3" }));
+    fireEvent.click(within(await screen.findByRole("group", { name: "Remove rule 3?" })).getByRole("button", { name: "Remove rule 3" }));
+    const undo = await screen.findByRole("button", { name: "Undo" });
+    undo.focus();
+    fireEvent.click(undo);
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Undo" })).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Remove rule 3" })));
+  });
+
+  it("End now gives focus to the next hold's End now, then to Add hold", async () => {
+    const second = { ...view().holds![0], id: "h2", scope_label: "all work", text: "Keep Codex for reviews." };
+    answers.khipu_route_view = () => {
+      const ended = calls("khipu_route_hold_end").map((c) => c!.id);
+      const v = view();
+      return { ...v, holds: [v.holds![0], second].filter((h) => !ended.includes(h.id)) };
+    };
+    await page();
+    const first = await screen.findByRole("button", { name: "End the hold on this Mac" });
+    first.focus();
+    fireEvent.click(first);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "End the hold on all work" })));
+    fireEvent.click(screen.getByRole("button", { name: "End the hold on all work" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "End the hold on all work" })).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Add hold" })));
+  });
+
+  it("leaves focus on a button the write keeps", async () => {
+    answers.khipu_route_lift = { ok: false, error: "that account isn't paused" };
+    await page();
+    const lift = screen.getByRole("button", { name: "Lift the pause for Grok Build" });
+    lift.focus();
+    fireEvent.click(lift);
+    expect(await screen.findByRole("alert")).toHaveTextContent("that account isn't paused");
+    expect(document.activeElement).toBe(lift);
+  });
+});
+
+describe("Settings -> Routing: a runner that went quiet on an earlier day (R2-3)", () => {
+  it("says when it stopped reporting as a sentence", async () => {
+    answers.khipu_route_view = () => {
+      const v = view();
+      const runners = v.sources!.runners!.map((r) => (r.name === "Project B" ? { ...r, heartbeat_at: "2026-10-13T14:02:00Z" } : r));
+      return { ...v, sources: { ...v.sources!, runners } };
+    };
+    await page();
+    await screen.findByRole("list", { name: "Job runner folders" });
+    expect(row("Job runner folders", "Project B")).toHaveTextContent("Stopped reporting yesterday at 10:02 AM");
+  });
+});
+
+describe("Settings -> Routing: no fixed cap on the owner's words (R2-4)", () => {
+  it("sends a hold longer than 4,000 characters when Longest words is No limit, and says what the app can hand over", async () => {
+    answers.khipu_config_show = config({ routing_hold_chars: setting(0, 300) });
+    await page();
+    expect(await screen.findByText("No limit on length; the app hands over up to 128 KB at once")).toBeInTheDocument();
+    const words = "Keep this account for the nightly review only. ".repeat(100).trim();
+    expect(words.length).toBeGreaterThan(4000);
+    const form = screen.getByRole("form", { name: "Add a hold" });
+    fireEvent.change(within(form).getByLabelText("Words"), { target: { value: words } });
+    fireEvent.click(within(form).getByRole("button", { name: "Add hold" }));
+    await waitFor(() => expect(calls("khipu_route_hold_add")).toHaveLength(1));
+    expect(calls("khipu_route_hold_add")[0]!.text).toBe(words);
+    expect(screen.getByText(/Khipu sets no limit on its\s+length/)).toBeInTheDocument();
   });
 });
 

@@ -614,6 +614,8 @@ const ROUTING_COUNT_KEYS: &[&str] = &[
 const ROUTING_SWITCH_KEYS: &[&str] = &["routing_push_start", "routing_push_prompt"];
 const ROUTING_SOURCES_KEY: &str = "routing_sources";
 const ROUTING_LANE_MAP_KEY: &str = "routing_lane_map";
+/// The routing table file: a full path, read only (fix round 2, R2-1).
+const ROUTING_TABLE_KEY: &str = "routing_table";
 const ROUTING_SOURCES_MAX: usize = 32;
 
 fn fixed_argv(argv: &[&str]) -> Vec<String> {
@@ -757,6 +759,21 @@ fn routing_key(key: &str) -> bool {
         || ROUTING_SWITCH_KEYS.contains(&key)
         || key == ROUTING_SOURCES_KEY
         || key == ROUTING_LANE_MAP_KEY
+        || key == ROUTING_TABLE_KEY
+}
+
+/// A file's full path, one line, starting with `/` or `~/` (so never with
+/// `-`), as the job runner folders are checked. The CLI refuses a file inside
+/// a private folder.
+fn checked_routing_path(what: &str, raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if v.is_empty() || has_control(v) || v.chars().count() > 1024 {
+        return Err(format!("{what} must be one line of at most 1024 characters"));
+    }
+    if !(v.starts_with('/') || v.starts_with("~/")) {
+        return Err(format!("{what} needs its full path, starting with / or ~/"));
+    }
+    Ok(v.to_string())
 }
 
 /// One line of text inside a routing JSON setting.
@@ -836,6 +853,9 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     }
     if key == ROUTING_LANE_MAP_KEY {
         return checked_routing_lane_map(v);
+    }
+    if key == ROUTING_TABLE_KEY {
+        return checked_routing_path("the routing table file", v);
     }
     let n: u64 = v
         .parse()
@@ -1015,8 +1035,13 @@ async fn khipu_route_view() -> Result<String, String> {
 const ROUTE_HOLD_REASONS: &[&str] = &["machine-busy", "disk-low", "keep", "outage", "other"];
 /// The rule verbs the app offers (`khipu route rule ACTION`).
 const ROUTE_RULE_ACTIONS: &[&str] = &["add", "edit", "retire", "restore", "confirm"];
-/// The longest owner's words the app sends (a rule, the note, a hold).
-const ROUTE_WORDS_MAX: usize = 4000;
+/// The most owner's words the app hands the CLI in one change (a rule, the
+/// note, a hold), in bytes of UTF-8. Not a limit on what the owner may say:
+/// the CLI keeps a note and a rule at any length, and a hold up to the
+/// owner's own `routing_hold_chars` (0: no limit). This only keeps one
+/// argument well inside what the system lets a program be started with
+/// (fix round 2, R2-4); Settings -> Routing says so.
+const ROUTE_WORDS_MAX_BYTES: usize = 128 * 1024;
 
 fn route_base(verb: &str) -> Vec<String> {
     vec!["route".to_string(), verb.to_string(), "--from-app".to_string()]
@@ -1065,16 +1090,21 @@ fn checked_route_until(raw: &str) -> Result<String, String> {
     }
 }
 
-/// The owner's words: trimmed, not empty, at most `ROUTE_WORDS_MAX`
-/// characters, no control characters except line breaks where `lines` allows
-/// them (the note). They travel after `--`, so even `-x` stays words.
+/// The owner's words: trimmed, not empty, at most `ROUTE_WORDS_MAX_BYTES`
+/// (the size of one argument, not a length the owner chose), no control
+/// characters except line breaks where `lines` allows them (the note). They
+/// travel after `--`, so even `-x` stays words.
 fn checked_route_words(raw: &str, lines: bool) -> Result<String, String> {
     let v = raw.trim();
     if v.is_empty() {
         return Err("write the words first".to_string());
     }
-    if v.chars().count() > ROUTE_WORDS_MAX {
-        return Err(format!("keep it under {ROUTE_WORDS_MAX} characters"));
+    if v.len() > ROUTE_WORDS_MAX_BYTES {
+        return Err(format!(
+            "these words are longer than the app can hand over in one change ({} KB of text); \
+             shorten them",
+            ROUTE_WORDS_MAX_BYTES / 1024
+        ));
     }
     if v.chars().any(|c| c.is_control() && !(lines && (c == '\n' || c == '\t'))) {
         return Err(if lines {
@@ -3445,7 +3475,7 @@ mod settings_command_tests {
         assert!(route_rule_argv("retire", Some(0), None).is_err());
         assert!(route_rule_argv("retire", None, None).is_err());
         assert!(route_rule_argv("add", None, Some("   ")).is_err());
-        assert!(route_note_set_argv(&"x".repeat(ROUTE_WORDS_MAX + 1)).is_err());
+        assert!(route_note_set_argv(&"x".repeat(ROUTE_WORDS_MAX_BYTES + 1)).is_err());
         assert!(route_note_set_argv("a\u{0}b").is_err());
         // Nothing but these fixed verbs: no report, no wait, no sources.
         for verb in ["report", "wait", "sources"] {
@@ -3469,8 +3499,7 @@ mod settings_command_tests {
             assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }
         // Phase 5 to 7 settings are not offered yet.
-        for k in ["routing_reset_check", "routing_push_delegation", "routing_cloud_copy", "routing_table",
-                  "routing_rules_seed"] {
+        for k in ["routing_reset_check", "routing_push_delegation", "routing_cloud_copy", "routing_rules_seed"] {
             assert!(config_set_argv(k, "on").is_err(), "{k}");
             assert!(config_unset_argv(k).is_err(), "{k}");
         }
@@ -3490,6 +3519,45 @@ mod settings_command_tests {
         for bad in [r#"{"B": {"lane": 3}}"#, r#"{"B": ["lane"]}"#, r#"{"B": {"la\nne": "x"}}"#, "[]"] {
             assert!(config_set_argv("routing_lane_map", bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_routing_table_file_is_offered_as_a_full_path() {
+        // Fix round 2, R2-1: Settings -> Routing chooses and clears the table file.
+        assert_eq!(
+            config_set_argv("routing_table", " ~/notes/ROUTING-NOW.md ").unwrap(),
+            v(&["config", "--set", "routing_table", "~/notes/ROUTING-NOW.md"])
+        );
+        assert_eq!(
+            config_set_argv("routing_table", "/notes/routing/ROUTING-NOW.md").unwrap(),
+            v(&["config", "--set", "routing_table", "/notes/routing/ROUTING-NOW.md"])
+        );
+        assert_eq!(config_unset_argv("routing_table").unwrap(), v(&["config", "--unset=routing_table"]));
+        let long = format!("/{}", "a".repeat(1024));
+        for bad in ["", "   ", "notes/ROUTING-NOW.md", "~notes", "-x", "--from-app", "/a\n--x", "/a\rb", long.as_str()] {
+            assert!(config_set_argv("routing_table", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_owners_words_are_not_cut_at_a_fixed_length() {
+        // Fix round 2, R2-4: a note, a rule or a hold longer than the old
+        // 4,000 characters reaches the CLI, which applies the owner's own
+        // routing_hold_chars (0: no limit). Only an argument too big to hand
+        // over is refused.
+        let long = "word ".repeat(2000);
+        assert!(long.trim().chars().count() > 4000);
+        assert_eq!(route_note_set_argv(&long).unwrap().last().unwrap(), long.trim());
+        assert_eq!(route_rule_argv("add", None, Some(&long)).unwrap().last().unwrap(), long.trim());
+        assert_eq!(route_rule_argv("edit", Some(2), Some(&long)).unwrap().last().unwrap(), long.trim());
+        assert_eq!(
+            route_hold_add_argv(&long, "other", "all", None, None).unwrap().last().unwrap(),
+            long.trim()
+        );
+        let at_most = "x".repeat(ROUTE_WORDS_MAX_BYTES);
+        assert!(route_note_set_argv(&at_most).is_ok());
+        let err = route_hold_add_argv(&format!("{at_most}x"), "other", "all", None, None).unwrap_err();
+        assert!(err.contains("128 KB"), "{err}");
     }
 
     #[test]

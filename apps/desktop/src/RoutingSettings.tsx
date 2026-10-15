@@ -29,6 +29,7 @@ import {
   disagreementWords,
   holdWords,
   modelDisagreementWords,
+  pastWords,
   saidWhen,
   useRouting,
   whenLocal,
@@ -49,17 +50,51 @@ import type { LimitUnit } from "./routingWords";
 type RouteSetting = { value: unknown; default: unknown; kind: string; source: string };
 type RouteConfig = { routing?: Record<string, RouteSetting> };
 
+/** Where focus goes when the control that made a change is gone. */
+type Back = () => HTMLElement | null | undefined;
+
+/** The most words the app hands the CLI in one change, in KB of text: the
+ *  size of one argument, not a limit the owner chose (src-tauri lib.rs,
+ *  ROUTE_WORDS_MAX_BYTES; fix round 2, R2-4). */
+const WORDS_MOST_KB = 128;
+
 type Writer = {
   busy: string | null;
   errors: Record<string, string>;
-  /** Run one write, re-read, and keep the CLI's error under `id`. */
-  run: (id: string, command: string, args?: Record<string, unknown>, after?: () => Promise<unknown>) => Promise<boolean>;
+  /**
+   * Run one write, re-read, and keep the CLI's error under `id`. Focus stays
+   * on the control that made the change; when the change removes that
+   * control (Clear, Lift, Dismiss, End now, Undo), focus goes to `back()`.
+   */
+  run: (
+    id: string,
+    command: string,
+    args?: Record<string, unknown>,
+    after?: (() => Promise<unknown>) | null,
+    back?: Back,
+  ) => Promise<boolean>;
   fail: (id: string, message: string | null) => void;
 };
 
 function useWriter(reread: () => Promise<unknown>): Writer {
   const [busy, setBusy] = useState<string | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  // The control focused when a write began, and where focus goes if the
+  // write takes that control away (fix round 2, R2-2). Settled after the
+  // render that ends the write, the re-read's changes included.
+  const keep = useRef<{ from: HTMLElement | null; back?: Back; done: boolean } | null>(null);
+  useEffect(() => {
+    const k = keep.current;
+    if (!k || !k.done) return;
+    keep.current = null;
+    const at = document.activeElement;
+    // Focus that moved on to another control stays where it is.
+    if (at && at !== document.body && (at as HTMLElement).isConnected && at !== k.from) return;
+    const usable = (el: HTMLElement | null | undefined): el is HTMLElement =>
+      !!el && el.isConnected && !(el as HTMLButtonElement).disabled;
+    const to = usable(k.from) ? k.from : k.back?.();
+    if (usable(to) && to !== at) to.focus();
+  });
   const fail = (id: string, message: string | null) =>
     setErrors((prev) => {
       const out = { ...prev };
@@ -67,11 +102,15 @@ function useWriter(reread: () => Promise<unknown>): Writer {
       else delete out[id];
       return out;
     });
-  const run: Writer["run"] = async (id, command, args, after) => {
+  const run: Writer["run"] = async (id, command, args, after, back) => {
+    const at = document.activeElement;
+    const k = { from: at instanceof HTMLElement && at !== document.body ? at : null, back, done: false };
+    keep.current = k;
     setBusy(id);
     const res = await callCli(command, args);
     await (after ?? reread)();
     fail(id, res.ok ? null : res.error);
+    if (keep.current === k) k.done = true;
     setBusy(null);
     return res.ok;
   };
@@ -284,7 +323,7 @@ const DISMISS_WHO: Record<string, string> = {
   check: "reset check's",
 };
 
-function DisagreePanel({ a, w, now }: { a: RouteAccount; w: Writer; now: Date }) {
+function DisagreePanel({ a, w, now, back }: { a: RouteAccount; w: Writer; now: Date; back: Back }) {
   const sides: { d: RouteReport; model?: string; sentence: string }[] = [];
   const own = disagreementWords(a, now);
   if (a.disagreement && own) sides.push({ d: a.disagreement, sentence: own });
@@ -342,7 +381,7 @@ function DisagreePanel({ a, w, now }: { a: RouteAccount; w: Writer; now: Date })
                       type="button"
                       className="sm"
                       disabled={w.busy === id}
-                      onClick={() => void w.run(id, "khipu_route_clear", { account: a.key, report: s.id })}
+                      onClick={() => void w.run(id, "khipu_route_clear", { account: a.key, report: s.id }, null, back)}
                     >
                       <Busy on={w.busy === id} />
                       {s.label}
@@ -407,7 +446,7 @@ function AccountRow({ a, w, now, reportDefault }: { a: RouteAccount; w: Writer; 
             className="sm"
             aria-label={`Lift the pause for ${a.label}`}
             disabled={w.busy === liftId}
-            onClick={() => void w.run(liftId, "khipu_route_lift", { account: a.key })}
+            onClick={() => void w.run(liftId, "khipu_route_lift", { account: a.key }, null, () => pauseBtn.current)}
           >
             <Busy on={w.busy === liftId} />
             Lift the pause
@@ -419,7 +458,7 @@ function AccountRow({ a, w, now, reportDefault }: { a: RouteAccount; w: Writer; 
             className="sm"
             aria-label={`Clear ${a.state === "down" ? "the down report" : "the limit"} for ${a.label}`}
             disabled={w.busy === clearId}
-            onClick={() => void w.run(clearId, "khipu_route_clear", { account: a.key })}
+            onClick={() => void w.run(clearId, "khipu_route_clear", { account: a.key }, null, () => pauseBtn.current)}
           >
             <Busy on={w.busy === clearId} />
             Clear
@@ -427,7 +466,7 @@ function AccountRow({ a, w, now, reportDefault }: { a: RouteAccount; w: Writer; 
         ) : null}
       </span>
       {pausing ? <PauseForm a={a} formId={formId} w={w} onClose={close} /> : null}
-      <DisagreePanel a={a} w={w} now={now} />
+      <DisagreePanel a={a} w={w} now={now} back={() => pauseBtn.current} />
       {w.errors[liftId] || w.errors[clearId] ? (
         <div className="route-pause" role="group" aria-label={`${a.label}: the change failed`}>
           <WriteError w={w} id={liftId} />
@@ -580,7 +619,8 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
         ) : null}
         <p className="set-help">
           Conversations see this word for word, right after your standing rules, and it is never shortened. Khipu
-          never turns it into a choice of account. Earlier notes stay in Recent changes.
+          never turns it into a choice of account. Earlier notes stay in Recent changes. Khipu sets no limit on its
+          length; the app hands over up to {WORDS_MOST_KB} KB of text in one change.
         </p>
       </div>
     </div>
@@ -592,6 +632,11 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
 // ---------------------------------------------------------------------------
 
 type RuleAsk = { n: number; kind: "confirm" | "edit" | "remove" } | null;
+
+/** A standing rule's Remove button: where focus goes once the rule is back. */
+function ruleRemoveButton(n: number): HTMLElement | null {
+  return document.querySelector<HTMLElement>(`.route-rule-list button[aria-label="Remove rule ${n}"]`);
+}
 
 function RuleRow({
   r,
@@ -798,7 +843,8 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
       </div>
       <div className="section-body">
         <p className="set-help">
-          Every conversation sees these first, in full, before anything else. They are never shortened or cut. Rules
+          Every conversation sees these first, in full, before anything else. They are never shortened or cut, and
+          Khipu sets no limit on their length (the app hands over up to {WORDS_MOST_KB} KB of text at once). Rules
           marked Seeded were copied from your routing table and your instructions; confirm each one, or edit or remove
           it.
         </p>
@@ -821,7 +867,9 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
               autoFocus
               disabled={w.busy === restoreId}
               onClick={async () => {
-                if (await w.run(restoreId, "khipu_route_rule", { action: "restore", n: removed.n })) setRemoved(null);
+                const n = removed.n;
+                if (await w.run(restoreId, "khipu_route_rule", { action: "restore", n }, null, () => ruleRemoveButton(n)))
+                  setRemoved(null);
               }}
             >
               <Busy on={w.busy === restoreId} />
@@ -1043,6 +1091,8 @@ function HoldsSection({
   const [choice, setChoice] = useState("tomorrow");
   const [custom, setCustom] = useState("");
   const base = useId().replace(/:/g, "");
+  const endBtns = useRef<Record<string, HTMLButtonElement | null>>({});
+  const addBtn = useRef<HTMLButtonElement>(null);
   // The longest words a hold may have (0: no limit), as the CLI enforces it.
   const most = settingNumber(cfg, "routing_hold_chars");
   async function add(e: FormEvent) {
@@ -1083,8 +1133,11 @@ function HoldsSection({
         <p className="set-help">Short notes about one account, this Mac or all work. Every hold from a conversation ends on its own.</p>
         {holds.length ? (
           <div className="rows" role="list" aria-label="Holds">
-            {holds.map((h) => {
+            {holds.map((h, i) => {
               const id = `hold-end:${h.id}`;
+              // Once this hold ends, focus goes to the next hold's End now,
+              // else the one before, else Add hold.
+              const after = [...holds.slice(i + 1), ...holds.slice(0, i).reverse()].map((x) => x.id);
               return (
                 <div key={h.id} className="row-item route-acct" role="listitem">
                   <span className="route-name">{capitalise(h.scope_label)}</span>
@@ -1094,11 +1147,18 @@ function HoldsSection({
                   </span>
                   <span className="route-acts">
                     <button
+                      ref={(el) => {
+                        endBtns.current[h.id] = el;
+                      }}
                       type="button"
                       className="sm"
                       aria-label={`End the hold on ${h.scope_label}`}
                       disabled={w.busy === id}
-                      onClick={() => void w.run(id, "khipu_route_hold_end", { id: h.id })}
+                      onClick={() =>
+                        void w.run(id, "khipu_route_hold_end", { id: h.id }, null, () =>
+                          after.map((x) => endBtns.current[x]).find((b) => b?.isConnected) ?? addBtn.current,
+                        )
+                      }
                     >
                       <Busy on={w.busy === id} />
                       End now
@@ -1132,7 +1192,11 @@ function HoldsSection({
               onChange={(e) => setText(e.target.value)}
             />
             <span className="set-help" id={`${base}-most`}>
-              {most == null ? "" : most ? `At most ${limitWords(most, "chars")}` : "No limit on length"}
+              {most == null
+                ? ""
+                : most
+                  ? `At most ${limitWords(most, "chars")}`
+                  : `No limit on length; the app hands over up to ${WORDS_MOST_KB} KB at once`}
             </span>
           </div>
           <div className="toolbar">
@@ -1170,7 +1234,7 @@ function HoldsSection({
           </div>
           <WriteError w={w} id="hold-add" />
           <div className="toolbar">
-            <button type="submit" className="sm" disabled={w.busy === "hold-add"}>
+            <button ref={addBtn} type="submit" className="sm" disabled={w.busy === "hold-add"}>
               <Busy on={w.busy === "hold-add"} />
               Add hold
             </button>
@@ -1500,7 +1564,8 @@ function runnerState(r: RouteRunner | undefined, now: Date): { text: string; ton
   }
   if (r.silent) {
     return {
-      text: r.heartbeat_at ? `Stopped reporting at ${whenLocal(r.heartbeat_at, now)}` : "Has not reported yet",
+      // "at 10:02 AM" today, "yesterday at 10:02 AM" before (fix round 2, R2-3).
+      text: r.heartbeat_at ? `Stopped reporting ${pastWords(r.heartbeat_at, now)}` : "Has not reported yet",
       tone: "err",
     };
   }
@@ -1883,13 +1948,52 @@ function LanesSection({
 // The routing table file and recent changes
 // ---------------------------------------------------------------------------
 
-function TableSection({ data, cfg, now }: { data: RouteView | null; cfg: RouteConfig | null; now: Date }) {
-  const path = cfg?.routing?.routing_table?.value;
+function TableSection({
+  data,
+  cfg,
+  w,
+  now,
+  reread,
+}: {
+  data: RouteView | null;
+  cfg: RouteConfig | null;
+  w: Writer;
+  now: Date;
+  reread: () => Promise<unknown>;
+}) {
+  const raw = cfg?.routing?.routing_table?.value;
+  const path = typeof raw === "string" && raw ? raw : null;
   const table = data?.sources?.table ?? null;
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState("");
+  const btn = useRef<HTMLButtonElement>(null);
+  const formId = `table-${useId().replace(/:/g, "")}`;
+  const id = "table-file";
   let val = "Not read yet";
   if (table?.error) val = "Can't read it";
   else if (table?.changed_at) val = `NOW block changed ${whenLocal(table.changed_at, now)}`;
   else if (table) val = "Read; no change seen yet";
+  const close = () => {
+    setOpen(false);
+    w.fail(id, null);
+    requestAnimationFrame(() => btn.current?.focus());
+  };
+  async function save(e: FormEvent) {
+    e.preventDefault();
+    const p = draft.trim();
+    if (!(p.startsWith("/") || p.startsWith("~/"))) {
+      w.fail(id, "Give the file's full path, starting with / or ~/.");
+      return;
+    }
+    if (p === path) {
+      close();
+      return;
+    }
+    if (await w.run(id, "khipu_config_set", { key: "routing_table", value: p }, reread)) close();
+  }
+  async function stop() {
+    if (await w.run(id, "khipu_config_unset", { key: "routing_table" }, reread)) close();
+  }
   return (
     <div className="section-card">
       <div className="section-head">Routing table file</div>
@@ -1897,14 +2001,74 @@ function TableSection({ data, cfg, now }: { data: RouteView | null; cfg: RouteCo
         <div className="rows">
           <div className="row-item route-limit">
             <span className="route-limit-text">
-              <span className="route-limit-name mono">{typeof path === "string" && path ? path : "No file set"}</span>
+              <span className="route-limit-name mono">{path ?? "No file set"}</span>
               <span className="set-help">
                 Read only. Khipu notes when its NOW block changes; it never takes an account's state from it, and never
                 writes to it.
               </span>
             </span>
-            <span className="route-val">{typeof path === "string" && path ? val : ""}</span>
-            <span />
+            <span className="route-val">{path ? val : ""}</span>
+            <button
+              ref={btn}
+              type="button"
+              className="sm"
+              aria-label={path ? "Change the routing table file" : "Choose the routing table file"}
+              aria-expanded={open}
+              aria-controls={open ? formId : undefined}
+              disabled={!cfg}
+              onClick={() => {
+                if (open) {
+                  close();
+                  return;
+                }
+                setDraft(path ?? "");
+                w.fail(id, null);
+                setOpen(true);
+              }}
+            >
+              {path ? "Change…" : "Choose…"}
+            </button>
+            {open ? (
+              <form
+                className="route-pause"
+                id={formId}
+                aria-label="Change the routing table file"
+                onSubmit={save}
+                onKeyDown={escapeCloses(close)}
+              >
+                <div className="toolbar">
+                  <label htmlFor={`${formId}-path`}>File</label>
+                  <input
+                    id={`${formId}-path`}
+                    className="mono"
+                    value={draft}
+                    autoFocus
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder="/path/to/ROUTING-NOW.md…"
+                    onChange={(e) => setDraft(e.target.value)}
+                  />
+                </div>
+                <p className="set-help">
+                  The file's full path, starting with / or ~/. Khipu won't read a file inside a private folder.
+                </p>
+                <WriteError w={w} id={id} />
+                <div className="toolbar">
+                  <button type="submit" className="primary sm" disabled={w.busy === id}>
+                    <Busy on={w.busy === id} />
+                    Save
+                  </button>
+                  {path ? (
+                    <button type="button" className="sm" disabled={w.busy === id} onClick={() => void stop()}>
+                      Stop reading it
+                    </button>
+                  ) : null}
+                  <button type="button" className="sm link" onClick={close}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            ) : null}
           </div>
         </div>
       </div>
@@ -1946,7 +2110,10 @@ function ChangesSection({ data, w, now }: { data: RouteView; w: Writer; now: Dat
                                 className="sm"
                                 disabled={w.busy === id}
                                 aria-label={`Bring back standing rule ${row.restore}`}
-                                onClick={() => void w.run(id, "khipu_route_rule", { action: "restore", n: row.restore })}
+                                onClick={() => {
+                                  const n = row.restore!;
+                                  void w.run(id, "khipu_route_rule", { action: "restore", n }, null, () => ruleRemoveButton(n));
+                                }}
                               >
                                 <Busy on={w.busy === id} />
                                 Bring it back
@@ -2031,7 +2198,7 @@ export function RoutingSettings({ active, plans }: { active: boolean; plans?: Us
       />
       <FoldersSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
       <LanesSection data={data} cfg={config.data} w={w} reread={rereadConfig} />
-      <TableSection data={data} cfg={config.data} now={now} />
+      <TableSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
       {data ? <ChangesSection data={data} w={w} now={now} /> : null}
       {config.error && !config.data ? (
         <p className="set-error" role="alert">

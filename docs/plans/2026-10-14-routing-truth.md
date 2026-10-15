@@ -831,6 +831,11 @@ Built differently from the mock (Settings fix round 1):
   `ROUTING_NOW_OFF=1`, that it can't see the shell's setting. It never says the setting is unset.
 - Dismiss buttons are named by whose report they remove ("Dismiss the runner's report", "Dismiss the
   conversation's report"), as the mock words them, and work on a job runner's limit too.
+- Settings fix round 2: the routing table file row has the mock's Change... button (Choose... when no file is
+  set): a full path starting with / or ~/, checked in the app and by the CLI, plus Stop reading it. The app no
+  longer caps the owner's words at 4,000 characters; a hold follows `routing_hold_chars` (0: no limit) and a
+  note or a rule has no length limit. The only cap left is the size of one argument the app hands the CLI,
+  128 KB of text, and the page says so by the note, the rules and a hold's words.
 
 ### Phase 5: the check at reset times (S, one session)
 
