@@ -533,7 +533,7 @@ def dedup_before_insert(cur, payload: dict[str, Any], *,
     receipt = _receipt_match(cur, payload, source)
     if receipt is not None:
         receipt_id, match = receipt
-        _log(f"dedup: merge receipt on episode {receipt_id} ({match}) — skipping insert")
+        _log(f"dedup: merge receipt on episode {receipt_id} ({match}); skipping insert")
         return {"action": "skip", "matched_episode": receipt_id,
                 "matched_via": "receipt", "match": match}
     exact_id = _dedup_exact_window(cur, payload, source=source)
@@ -757,7 +757,7 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     try:
                         _claim_unowned_episode(cur, dedup.get("matched_episode"),
                                                _stamp_origin(cur))
-                    except Exception as exc:  # noqa: BLE001 — classified below
+                    except Exception as exc:  # noqa: BLE001: classified below
                         cur.execute("ROLLBACK TO SAVEPOINT capture_claim")
                         _log(f"origin claim failed ({type(exc).__name__}: {exc})")
                         if _claim_required():
@@ -844,7 +844,7 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                 existing = cur.fetchone()
                 try:
                     _claim_unowned_episode(cur, existing[0] if existing else None, origin)
-                except Exception as exc:  # noqa: BLE001 — only a required claim runs SQL
+                except Exception as exc:  # noqa: BLE001: only a required claim runs SQL
                     raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
                 cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
                             (existing[0] if existing else None,))
