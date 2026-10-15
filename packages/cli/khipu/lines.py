@@ -9,7 +9,6 @@ parse. A record ends at LF and nowhere else.
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 
@@ -35,11 +34,15 @@ def read_lines(path: str | Path) -> list[str]:
     return split_lines(Path(path).read_bytes())
 
 
-def run_text(argv, *, input: str, **kw) -> subprocess.CompletedProcess:
+def run_text(argv, *, input: str, **kw):
     """``subprocess.run`` with ``input`` sent as strict UTF-8 and the captured
     output decoded as UTF-8 with replacement. One ``errors=`` in text mode
     covers both directions, so replacement there would also send a lone
     surrogate to the child as "?" and let a corrupted request succeed."""
+    # Imported here: embed imports this module, and on Windows its lock
+    # backend must load without fcntl, which subprocess imports.
+    import subprocess
+
     r = subprocess.run(argv, input=input.encode("utf-8"), capture_output=True, **kw)
     return subprocess.CompletedProcess(r.args, r.returncode, r.stdout.decode("utf-8", "replace"),
                                        r.stderr.decode("utf-8", "replace"))
