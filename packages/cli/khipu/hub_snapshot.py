@@ -1951,7 +1951,27 @@ def _lag_topics(cur, con, hub_now, hub_dump) -> dict[str, Any]:
     return {"lag_seconds": lag, "missing": len(differing), "checked": len(hub_rows), "truncated": False}
 
 
-def _lag_decisions(cur, con, since, hub_now, limit) -> dict[str, Any]:
+def _decision_digest_line(row: Sequence[Any]) -> str:
+    """One decision as the whole-table digest spells it: id, then each
+    tracked column, times as whole microseconds since the epoch."""
+    parts = [str(int(row[0]))]
+    for val in row[1:]:
+        if val is None:
+            parts.append("")
+        elif isinstance(val, int) and not isinstance(val, bool):
+            parts.append(str(val))
+        else:
+            parts.append(_vec_built_key(val) if _utc(val) is not None else str(val))
+    return "\t".join(parts)
+
+
+def _lag_decisions(cur, con, since, hub_now, limit, hub_dump) -> dict[str, Any]:
+    """Decisions changed since the cutoff, compared with the replica one by
+    one and dated by their own time. Then a digest of every decision's
+    tracked columns on both sides, with those changes laid over the
+    replica's: a difference left over lies outside the cutoff (a restore or
+    un-retract clears the times the cutoff is keyed on), and is dated from
+    the dump on the hub's clock."""
     cols = _pg_columns(cur, "decisions")
     if not {"id", "created_at"} <= cols:
         return {"lag_seconds": None, "not_applicable": "hub decisions table not migrated"}
@@ -1989,8 +2009,28 @@ def _lag_decisions(cur, con, since, hub_now, limit) -> dict[str, Any]:
         hub_vals = dict(zip(tracked, r[1:-1]))
         if mine is None or not all(same(hub_vals[c], v, c) for c, v in zip(rep_tracked, mine)):
             unapplied.append(r[-1])
+    truncated = len(rows) >= limit
+    if not truncated:
+        import hashlib
+
+        def micros(col: str) -> str:
+            if col.endswith("_at"):
+                return f"COALESCE(floor(extract(epoch FROM {col}) * 1000000)::bigint::text, '')"
+            return f"COALESCE({col}::text, '')"
+
+        line = " || E'\\t' || ".join(["id::text", *(micros(c) for c in rep_tracked)])
+        cur.execute(f"SELECT md5(string_agg({line}, E'\\n' ORDER BY id)) FROM decisions")
+        got = cur.fetchone()
+        mine_all = {int(r[0]): tuple(r[1:]) for r in con.execute(
+            f"SELECT {', '.join(['id', *rep_tracked])} FROM decisions")}
+        for r in rows:
+            hub_vals = dict(zip(tracked, r[1:-1]))
+            mine_all[int(r[0])] = tuple(hub_vals[c] for c in rep_tracked)
+        text = "\n".join(_decision_digest_line((i, *v)) for i, v in sorted(mine_all.items()))
+        if (got[0] if got else None) != (hashlib.md5(text.encode("utf-8")).hexdigest() if mine_all else None):
+            unapplied.append(hub_dump)
     return {"lag_seconds": _lag_from(hub_now, unapplied), "missing": len(unapplied),
-            "checked": len(rows), "truncated": len(rows) >= limit}
+            "checked": len(rows), "truncated": truncated}
 
 
 def _lag_deliverables(cur, con, since, hub_now, limit) -> dict[str, Any]:
@@ -2090,7 +2130,8 @@ def _lag_vectors(cur, con, hub_dump, hub_now, limit, pending: set[int]) -> dict[
                 "WHERE e.id::text = memory_embeddings.ref AND e.deleted_at IS NOT NULL))")
 
     def skip(kind: Any, ref: Any) -> bool:
-        return kind == "episode" and str(ref).isdigit() and int(ref) in pending
+        text = str(ref)
+        return kind == "episode" and text.isascii() and text.isdigit() and int(text) in pending
 
     rep_gone = ""
     if "deleted_at" in _snapshot_table_columns(con, "episodes"):
@@ -2223,7 +2264,7 @@ def measure_lag(cur, *, limit: int = FRESHNESS_PROBE_LIMIT) -> dict[str, Any]:
             "episodes": lambda: _lag_episodes(cur, con, since, hub_now, limit),
             "tombstones": lambda: _lag_tombstones(cur, con, since, hub_now, limit, pending),
             "topics": lambda: _lag_topics(cur, con, hub_now, hub_dump),
-            "decisions": lambda: _lag_decisions(cur, con, since, hub_now, limit),
+            "decisions": lambda: _lag_decisions(cur, con, since, hub_now, limit, hub_dump),
             "deliverables": lambda: _lag_deliverables(cur, con, since, hub_now, limit),
             "vectors": lambda: _lag_vectors(cur, con, hub_dump, hub_now, limit, pending),
         }
@@ -2289,11 +2330,11 @@ def _local_state(health: Mapping[str, Any], sidecar: Mapping[str, Any]) -> tuple
     return None, None
 
 
-def _legacy_behind_ingest(latest_ingested_at: str | None, refreshed_at: Any) -> float | None:
+def _legacy_behind_ingest(latest_ingested_at: str | None, hub_dumped_at: Any) -> float | None:
     """PR #144's figure, for when the hub answered but the per-table
     measurement did not: the hub's newest ingest against the newest the
-    replica holds (or the dump, whichever is later)."""
-    ing, ref = _utc(latest_ingested_at), _utc(refreshed_at)
+    replica holds (or the dump on the hub's clock, whichever is later)."""
+    ing, ref = _utc(latest_ingested_at), _utc(hub_dumped_at)
     if ing is None or ref is None:
         return None
     held = _replica_latest_ingested_at()
@@ -2395,7 +2436,7 @@ def snapshot_freshness(
                        for n, t in tables.items()},
         })
     else:
-        out["behind_ingest_seconds"] = _legacy_behind_ingest(latest_ingested_at, health.get("refreshed_at"))
+        out["behind_ingest_seconds"] = _legacy_behind_ingest(latest_ingested_at, meta().get("hub_dumped_at"))
         last = _read_last_known()
         if last is not None:
             out["last_known"] = last

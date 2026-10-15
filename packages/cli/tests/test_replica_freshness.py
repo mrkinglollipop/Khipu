@@ -115,6 +115,11 @@ class FakeCursor:
         elif "FROM memory_embeddings" in sql and "ORDER BY built_at, kind" in sql:
             rows = sorted((_vec_row(v) for v in h.live_vectors() if v["built_at"] and v["built_at"] > p[1]),
                           key=lambda r: (r[4], r[0], r[1], r[2]))[: p[2]]
+        elif "md5(string_agg" in sql and "FROM decisions" in sql:
+            text = "\n".join("\t".join([str(d["id"]), _micro(d.get("superseded_at")),
+                                         _micro(d.get("retracted_at")), str(d.get("superseded_by") or "")])
+                             for d in sorted(h.decisions, key=lambda d: d["id"]))
+            rows = [(hashlib.md5(text.encode()).hexdigest() if h.decisions else None,)]
         elif "md5(string_agg" in sql and "memory_embeddings" not in sql:
             live = sorted((t["slug"], t.get("content_hash")) for t in h.topics if t.get("deleted_at") is None)
             text = "\n".join(f"{s}\t{c or ''}" for s, c in live)
@@ -941,3 +946,42 @@ class ClockSkewTest(VectorCase):
 
         src = inspect.getsource(hs.sync_decision_changes)
         self.assertNotIn("_utcnow_iso()", src)
+
+
+class OutsideTheCutoffTest(VectorCase):
+    """A cutoff only narrows where a change is looked for: whatever lies
+    outside it is still caught by a digest of the whole table."""
+
+    _hub_dumped_at = ClockSkewTest._hub_dumped_at
+
+    def test_a_decision_restored_after_the_dump_is_not_fresh(self) -> None:
+        # The dump held decision 10 superseded; the hub restored it since,
+        # which clears the times the window is keyed on.
+        superseded = DUMP - timedelta(hours=2)
+        con = sqlite3.connect(self.snap)
+        con.execute("UPDATE decisions SET superseded_by = 99, superseded_at = ? WHERE id = 10", (_ts(superseded),))
+        con.commit()
+        con.close()
+        lag = hs.measure_lag(self.hub.cursor())
+        self.assertEqual(lag["tables"]["decisions"]["missing"], 1)
+        self.assertEqual(lag["tables"]["decisions"]["lag_seconds"], (NOW - DUMP).total_seconds())
+
+    def test_a_change_inside_the_window_is_dated_by_its_own_time_alone(self) -> None:
+        when = NOW - timedelta(minutes=5)
+        self.hub.decisions[0].update(superseded_by=12, superseded_at=when)
+        lag = hs.measure_lag(self.hub.cursor())
+        self.assertEqual(lag["tables"]["decisions"]["missing"], 1)
+        self.assertEqual(lag["tables"]["decisions"]["lag_seconds"], 300.0)
+
+    def test_the_older_ingest_figure_is_taken_from_the_hubs_dump_time(self) -> None:
+        self._hub_dumped_at(DUMP, mac=NOW - timedelta(minutes=5))
+        health = {**self.health(), "refreshed_at": _ts(NOW - timedelta(minutes=5))}
+        out = hs.snapshot_freshness(_ts(DUMP + timedelta(hours=1)), health, lag={"measured": False})
+        self.assertEqual(out["behind_ingest_seconds"], 3600.0)
+
+    def test_an_episode_ref_that_is_not_an_ascii_number_is_measured(self) -> None:
+        self._hub(("episode", "\u00b2", 0, "a", DUMP - timedelta(hours=1)))
+        self._replica(("episode", "\u00b2", 0, "a", _ts(DUMP - timedelta(hours=1))))
+        lag = hs.measure_lag(self.hub.cursor())
+        self.assertNotIn("error", lag["tables"]["vectors"])
+        self.assertEqual(lag["tables"]["vectors"]["missing"], 0)
