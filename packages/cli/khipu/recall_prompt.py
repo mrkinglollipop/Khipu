@@ -1509,13 +1509,15 @@ class _RoutingAtPrompt:
         """The child's answer, or None (off, failed or late). Waits until the
         budget has run from the moment the child was ready to read, never
         past ``self.cap`` nor ``limit`` (the request's deadline). An answer
-        the child finished within the budget (the time on its line) is read
-        even when the search ran past it; one finished later is not, however
-        early it is read (fix round 5). Once the wait is over, what is
+        the child finished (the time on its line) within the budget, or
+        before this call (while the prompt was still searching, so it costs
+        the prompt nothing), is taken; one finished after both is not,
+        however early it is read (fix round 5). Once the wait is over, what is
         already buffered is read for at most ``_ROUTING_DRAIN_MOST`` seconds,
         and never more than ``_ROUTING_ANSWER_MOST`` bytes in all."""
         if self.fd is None:
             return None
+        asked = time.monotonic()
         try:
             import select
 
@@ -1564,7 +1566,7 @@ class _RoutingAtPrompt:
                 self.status = "skipped:no-answer"
                 return None
             done = out.get("done")
-            cutoff = min(self.cap, began + self.budget)
+            cutoff = min(self.cap, max(began + self.budget, asked))
             if limit is not None:
                 cutoff = min(cutoff, limit)  # nor after the request's own deadline
             if not isinstance(done, (int, float)) or isinstance(done, bool) or done > cutoff:

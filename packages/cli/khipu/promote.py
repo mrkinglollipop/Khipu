@@ -239,6 +239,35 @@ def _code_env(root: Path, base: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+# The harnesses that start the hooks export PYTHONDONTWRITEBYTECODE=1, so a
+# hook only ever reads bytecode, never writes it. A module nothing else has
+# cached for the path a hook imports it by is compiled from source on every
+# one-shot prompt: routing alone took 1.0 to 2.6 s on a loaded Mac, past the
+# routing child's 1 s wait. A bytecode file names its source by path, and a
+# path under the ``live`` link holds one slot's code at a time, so that path
+# is compiled right after the flip (the old slot's hooks read it until then).
+_PRECOMPILE = "import compileall, sys\nsys.exit(0 if compileall.compile_dir(sys.argv[1], quiet=1) else 1)\n"
+
+
+def precompile(root: Path, *, python: str | None = None, timeout: float = 300) -> dict[str, Any]:
+    """Write the bytecode for ``root``'s khipu package, keyed by ``root`` as
+    given (the ``live`` link, or a slot), under the PYTHONPYCACHEPREFIX the
+    launchers set: never inside the code's own folders, so never inside a
+    signed app bundle. ``python`` defaults to the launchers' interpreter (the
+    cache is per Python version). Never fails a promotion."""
+    pkg = Path(root) / "packages" / "cli" / "khipu"
+    if not pkg.is_dir():
+        return {"ok": False, "error": f"no khipu package in {root}"}
+    t0 = time.monotonic()
+    env = _code_env(root)
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
+    r = _run([python or _hook_python(), "-c", _PRECOMPILE, str(pkg)], env=env, timeout=timeout)
+    out: dict[str, Any] = {"ok": r.returncode == 0, "ms": round((time.monotonic() - t0) * 1000)}
+    if r.returncode != 0:
+        out["error"] = _tail(r.stderr or r.stdout) or f"exit {r.returncode}"
+    return out
+
+
 def _base_env(extra: tuple[str, ...] = ()) -> dict[str, str]:
     """The caller's values for ``BASE_ENV_KEYS`` and ``extra``, read one name
     at a time; nothing else from the environment."""
@@ -1111,6 +1140,8 @@ def _after_flip() -> dict[str, Any]:
     live = live_root()
     out: dict[str, Any] = {"kicked": [], "kick_failed": []}
     if live is not None:
+        # Before the restarts, so the recall daemon starts warm too.
+        out["precompile"] = precompile(live)
         from khipu.launchd_gen import PASSTHROUGH_ENV
 
         env = _code_env(live, _base_env((*DATA_DIR_ENV_KEYS, *PASSTHROUGH_ENV)))
@@ -1159,6 +1190,8 @@ def promote(ref: str = "origin/main") -> dict[str, Any]:
         if not prepared["ok"]:
             return record({**entry, "ok": False, "error": f"slot: {prepared['error']}",
                            "ms": round((time.monotonic() - t0) * 1000)})
+        # The gate's replay runs the slot's hooks by the slot's own path.
+        entry["precompile"] = precompile(slot)
         gate = run_gate(slot)
         entry["gate"] = gate
         entry["gate_ms"] = sum(step["ms"] for step in gate)

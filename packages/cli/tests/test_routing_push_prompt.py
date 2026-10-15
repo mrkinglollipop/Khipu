@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from khipu import promote, recall_daemon, recall_prompt, routing
+from khipu import paths, promote, recall_daemon, recall_prompt, routing
 
 T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
 ACCOUNTS = [{"label": "Claude", "harness": "claude"},
@@ -942,12 +942,72 @@ def test_the_hooks_own_feature_switch_turns_the_push_on_on_the_daemon_path(home,
     assert _wait_log(1).endswith(" routing=full")
 
 
+def _as_a_live_hook(monkeypatch, home, *, precompiled: bool = True) -> dict:
+    """The environment a live one-shot hook's Python runs in: the harness's
+    PYTHONDONTWRITEBYTECODE=1 (a hook reads bytecode, never writes it) and
+    the launchers' cache prefix, which promote fills for the code it puts
+    live (``promote.precompile``), here for this checkout."""
+    monkeypatch.setenv("HOME", str(home["tmp"] / "home"))
+    if precompiled:
+        root = Path(recall_prompt.__file__).resolve().parents[3]
+        assert promote.precompile(root, python=sys.executable)["ok"]
+    return dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), PYTHONDONTWRITEBYTECODE="1",
+                PYTHONPYCACHEPREFIX=str(paths.pycache_dir()))
+
+
+_STALE_BYTECODE = (
+    "import importlib.util, json, os, sys\n"
+    "from khipu import recall_prompt, routing\n"
+    "routing.prompt_imports()\n"
+    "stale = []\n"
+    "for name, mod in sorted(sys.modules.items()):\n"
+    "    src = getattr(mod, '__file__', None)\n"
+    "    if name.split('.')[0] != 'khipu' or not src or not src.endswith('.py'):\n"
+    "        continue\n"
+    "    st = os.stat(src)\n"
+    "    want = importlib.util.MAGIC_NUMBER + bytes(4) + (int(st.st_mtime) & 0xFFFFFFFF).to_bytes(4, 'little')"
+    " + (st.st_size & 0xFFFFFFFF).to_bytes(4, 'little')\n"
+    "    try:\n"
+    "        with open(importlib.util.cache_from_source(src), 'rb') as f:\n"
+    "            ok = f.read(16) == want\n"
+    "    except OSError:\n"
+    "        ok = False\n"
+    "    if not ok:\n"
+    "        stale.append(name)\n"
+    "print(json.dumps(stale))\n"
+)
+
+
+@pytest.mark.parametrize("precompiled", [False, True])
+def test_the_routing_childs_modules_are_precompiled_for_a_live_hook(home, monkeypatch, precompiled):
+    """A live hook never writes bytecode, so a module of the code promote put
+    live that nothing precompiled is compiled from source by every prompt's
+    routing child (1 s and more on a loaded Mac, the child's whole wait).
+    Every khipu module the child loads has current bytecode once
+    ``promote.precompile`` ran, and the check sees the gap when it did not."""
+    env = _as_a_live_hook(monkeypatch, home, precompiled=precompiled)
+    proc = subprocess.run([sys.executable, "-c", _STALE_BYTECODE], env=env, capture_output=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr.decode()
+    stale = json.loads(proc.stdout.decode().splitlines()[-1])
+    if precompiled:
+        assert stale == []
+    else:
+        assert "khipu.routing" in stale
+
+
 def test_the_hook_never_imports_routing_itself(home, monkeypatch):
     """Finding R2-3: the hook imported routing and read its settings before
     the search started, about 25 ms on every cold-path prompt's critical path.
-    Only the child imports it; the hook's own process never does."""
-    _record()
+    Only the child imports it; the hook's own process never does.
+
+    The child gets what a live one's has: bytecode promote compiled, and a
+    view saved at its own clock (the recall daemon's poll keeps it folded).
+    A record written at the fake clock, a day before the child's, made it
+    refold inside the 1 s wait, as a cold import did."""
     _push_on(monkeypatch)
+    env = _as_a_live_hook(monkeypatch, home)
+    home["clock"].now = datetime.now(timezone.utc)
+    _record()
     script = (
         "import io, json, sys\n"
         "from khipu import recall_prompt\n"
@@ -966,14 +1026,15 @@ def test_the_hook_never_imports_routing_itself(home, monkeypatch):
         "seen['after'] = 'khipu.routing' in sys.modules\n"
         "print(json.dumps({'seen': seen, 'out': out.getvalue()}))\n"
     )
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    saved = routing.view_file().stat().st_mtime_ns
     proc = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, timeout=30)
     assert proc.returncode == 0, proc.stderr.decode()
     result = json.loads(proc.stdout.decode().splitlines()[-1])
     assert result["seen"] == {"at_search": False, "after": False}
-    assert _routing_part(result["out"]).startswith(FULL)
+    assert _routing_part(result["out"]).startswith(FULL), _last_log()
     assert _last_log().endswith(" routing=full")
     assert _marker()["full_at"]  # the child's clock (this subprocess has no fake one)
+    assert routing.view_file().stat().st_mtime_ns == saved  # it read the saved view, never refolded
 
 
 def test_a_switched_off_setting_is_decided_in_the_child_and_logs_nothing(home, monkeypatch):
@@ -1624,20 +1685,47 @@ def _fake_reader(lines: list[tuple[float, bytes]], *, budget: float = 0.01):
 
 def test_an_answer_finished_after_the_budget_is_not_taken(home):
     """Finding R5-3: once the budget ran out the wait became zero-time but
-    still read whatever was buffered, so an answer written about 90 ms after
-    the child was ready was taken against a 10 ms budget."""
+    still read whatever was buffered. An answer finished after both its
+    budget and the moment the prompt asked for it is not taken, even when
+    it is already buffered."""
     answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0}
 
-    def late(_at) -> bytes:
+    def after_the_ask(_at) -> bytes:
+        return json.dumps(dict(answer, done=time.monotonic() + 0.5)).encode() + b"\n"
+
+    at, writer = _fake_reader([(0.0, after_the_ask)])
+    writer.join(5)
+    assert at.collect() is None and at.status == "skipped:budget"
+
+    def now(_at) -> bytes:
         return json.dumps(dict(answer, done=time.monotonic())).encode() + b"\n"
 
-    at, writer = _fake_reader([(0.09, late)])
-    writer.join(5)  # the answer is buffered before the prompt reads it, as after a slow search
-    assert at.collect() is None and at.status == "skipped:budget"
-    at, writer = _fake_reader([(0.0, late)], budget=0.5)
+    at, writer = _fake_reader([(0.0, now)], budget=0.5)
     writer.join(5)
     out = at.collect()
     assert out is not None and out["kind"] == "full"
+
+
+def test_an_answer_finished_while_the_search_ran_is_taken(home):
+    """Live, a 50 ms budget dropped more than half the routing pushes on a
+    loaded Mac while searches of 300 ms and more ran beside them. An answer
+    finished before the prompt asked for it cost the prompt nothing, so it
+    is taken however far past the budget it finished; the wait after the
+    search is still the budget's."""
+    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0}
+
+    def during_the_search(_at) -> bytes:
+        return json.dumps(dict(answer, done=time.monotonic())).encode() + b"\n"
+
+    at, writer = _fake_reader([(0.09, during_the_search)])  # 90 ms after ready, on a 10 ms budget
+    writer.join(5)  # buffered before the prompt asks, as after a slow search
+    out = at.collect()
+    assert out is not None and out["kind"] == "full"
+    at, writer = _fake_reader([(0.8, during_the_search)])  # still running when the prompt asks
+    began = time.monotonic()
+    assert at.collect() is None and at.status == "skipped:budget"
+    assert time.monotonic() - began < 0.6  # waited the budget and the drain, not for the child
+    writer.join(5)
 
 
 def test_a_pipe_that_never_stops_is_drained_only_briefly(home):

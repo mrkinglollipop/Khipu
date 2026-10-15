@@ -234,13 +234,15 @@ def test_a_passing_gate_flips_and_restarts(home, monkeypatch, tmp_path):
                         lambda slot, commit, repo: (_fake_checkout(slot), {"ok": True})[1])
     monkeypatch.setattr(pm, "_head", lambda root: "headsha" if root else None)
     monkeypatch.setattr(pm, "GATE_STEPS", {name: _ok() for name in pm.GATE_ORDER})
-    calls = []
+    calls, envs = [], []
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
+        envs.append(kwargs.get("env") or {})
         return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "refreshed": []}), "")
 
     monkeypatch.setattr(pm, "_run", fake_run)
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")  # as every harness that starts a hook has it
     from khipu.jobs import PLIST_QUEUE_DRAIN, _plist_path
 
     _plist_path(PLIST_QUEUE_DRAIN).parent.mkdir(parents=True, exist_ok=True)
@@ -248,6 +250,17 @@ def test_a_passing_gate_flips_and_restarts(home, monkeypatch, tmp_path):
     out = pm.promote()
     assert out["ok"], out
     assert os.readlink(pm.live_link()) == str(b)
+    # Live hooks never write bytecode: the slot is compiled by its own path
+    # before its gate, and by the live link's after the flip, before the restarts.
+    compiled = [argv[-1] for argv in calls if argv[1:3] == ["-c", pm._PRECOMPILE]]
+    assert compiled == [str(b / "packages" / "cli" / "khipu"), str(pm.live_link() / "packages" / "cli" / "khipu")]
+    assert out["precompile"]["ok"] and out["after"]["precompile"]["ok"]
+    restarts = [i for i, argv in enumerate(calls) if argv[:1] == ["launchctl"] or argv[-2:] == ["jobs", "refresh"]]
+    assert calls.index(next(a for a in calls if a[-1] == compiled[1])) < min(restarts)
+    for argv, env in zip(calls, envs):
+        if argv[1:3] == ["-c", pm._PRECOMPILE]:
+            assert "PYTHONDONTWRITEBYTECODE" not in env
+            assert env["PYTHONPYCACHEPREFIX"] == str(Path.home() / "Library" / "Caches" / "Khipu" / "pycache")
     assert any(argv[-2:] == ["jobs", "refresh"] for argv in calls)
     assert any(argv[:3] == ["launchctl", "kickstart", "-k"] and argv[3].endswith(PLIST_QUEUE_DRAIN)
                for argv in calls)
