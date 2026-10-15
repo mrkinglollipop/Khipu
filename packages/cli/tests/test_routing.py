@@ -1566,3 +1566,58 @@ def test_a_limit_reported_without_a_time_is_marked_so(home, capsys):
     assert _state([_ev(0, "limited", T0)], T0 + timedelta(minutes=1))["witness"]["until_default"] is True
     timed = _state([_ev(0, "limited", T0, until=T0 + timedelta(hours=1))], T0 + timedelta(minutes=1))
     assert timed["witness"]["until_default"] is False
+
+
+# ---- Settings -> Routing (phase 4, second half) -------------------------------------------
+
+
+def test_a_removed_rule_comes_back_whole_with_restore(home, capsys):
+    rc, out = _cli(["route", "rule", "add", "--from-app", "--", "Never a -fast tier."], capsys)
+    assert rc == 0 and json.loads(out)["n"] == 1
+    _cli(["route", "rule", "confirm", "--from-app", "--", "1"], capsys)
+    rc, _out = _cli(["route", "rule", "retire", "--from-app", "--", "1"], capsys)
+    assert rc == 0 and routing.read_view()["rules"] == []
+    rc, out = _cli(["route", "rule", "restore", "--from-app", "--", "1"], capsys)
+    assert rc == 0 and json.loads(out)["n"] == 1
+    (rule,) = routing.read_view()["rules"]
+    assert (rule["n"], rule["text"], rule["confirmed"], rule["via"]) == (1, "Never a -fast tier.", True, "app")
+    # A rule in effect, or one that never was, can't be restored.
+    rc, out = _cli(["route", "rule", "restore", "--from-app", "--", "1"], capsys)
+    assert rc == 2 and "in effect" in json.loads(out)["error"]
+    rc, out = _cli(["route", "rule", "restore", "--from-app", "--", "9"], capsys)
+    assert rc == 2 and "no standing rule 9" in json.loads(out)["error"]
+    assert routing.doctor_block()["outside_app"] == []
+
+
+def test_the_apps_argv_keeps_a_dash_value_as_words_never_a_flag(home, capsys):
+    # The app puts every value after "--": a value that looks like a flag
+    # stays the owner's words.
+    _cli(["route", "rule", "add", "--from-app", "--", "-fast is never used"], capsys)
+    _cli(["route", "rule", "edit", "--from-app", "--", "1", "--from-app"], capsys)
+    _cli(["route", "note", "set", "--from-app", "--", "--owner"], capsys)
+    _cli(["route", "hold", "--reason", "other", "--all", "--from-app", "--", "-x keep it"], capsys)
+    view = routing.read_view()
+    assert view["rules"][0]["text"] == "--from-app"
+    assert view["note"]["text"] == "--owner"
+    assert view["holds"][0]["text"] == "-x keep it" and view["holds"][0]["owner"] is True
+
+
+def test_the_apps_view_marks_watched_rules_old_switches_and_who_changed_what(home, capsys, monkeypatch):
+    _cli(["route", "rule", "add", "--from-app", "--", "Never a -fast tier."], capsys)
+    _cli(["route", "rule", "add", "--from-app", "--", "Be kind to the Mac."], capsys)
+    _report(account="Codex", state="limited", until="1h")
+    _cli(["route", "rule", "retire", "--from-app", "--", "2"], capsys)
+    monkeypatch.setenv("ROUTING_NOW_OFF", "1")
+    rc, out = _cli(["route", "--json"], capsys)
+    data = json.loads(out)
+    assert [r["n"] for r in data["rules"]] == [1] and data["watched_rules"] == [1]
+    assert data["old_switches"]["env"] is True and isinstance(data["old_switches"]["file"], bool)
+    items = [i for c in data["changes"] for i in c["items"]]
+    codex = [i for i in items if i["entity"] == "account:codex|"][-1]
+    assert codex["now"]["state"] == "limited" and codex["source"] == "report"
+    assert codex["by"].startswith("a Claude Code conversation in project-a")
+    gone = next(i for i in items if i["entity"] == "rule:2" and i["now"] is None)
+    assert gone["was"]["text"] == "Be kind to the Mac." and gone["n"] == 2 and gone["by"] == "you"
+    monkeypatch.delenv("ROUTING_NOW_OFF")
+    rc, out = _cli(["route", "--json"], capsys)
+    assert json.loads(out)["old_switches"]["env"] is False

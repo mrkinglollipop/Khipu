@@ -46,6 +46,7 @@ import { HealthReportRows } from "./healthRows";
 import { SummariserBudgetCard, SynthProviderFields, synthModelError } from "./SynthProvider";
 import { PlansCard, PlansSettingsCard, usePlanAttention, usePlanUsage } from "./PlansCard";
 import { RoutingCard } from "./RoutingCard";
+import { RoutingSettings } from "./RoutingSettings";
 import { useRouting } from "./routing";
 import type { DoctorSynthProvider } from "./SynthProvider";
 import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVerify";
@@ -452,10 +453,11 @@ const ACTIVITY_PAGE = 40;
 const SEARCH_KINDS = ["episode", "topic"] as const;
 
 /** Settings sub-navigation (overhaul phase 5, `mocks/main.settings.html`).
- *  Nine sections, one per thing a person comes here to change. */
+ *  Ten sections, one per thing a person comes here to change. */
 type SettingsSection =
   | "database"
   | "capture"
+  | "routing"
   | "features"
   | "index"
   | "data"
@@ -467,6 +469,7 @@ type SettingsSection =
 const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
   ["database", "Database"],
   ["capture", "Capture & models"],
+  ["routing", "Routing"],
   ["features", "Optional features"],
   ["index", "Embeddings"],
   ["data", "Data & backups"],
@@ -5485,6 +5488,13 @@ export default function App() {
                       </div>
                     </div>
                   </>
+                ) : null}
+
+                {settingsSection === "routing" ? (
+                  <RoutingSettings
+                    active={tab === "settings" && settingsSection === "routing"}
+                    plans={plans.data}
+                  />
                 ) : null}
 
                 {settingsSection === "features" ? (

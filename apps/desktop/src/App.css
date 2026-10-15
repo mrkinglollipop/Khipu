@@ -3145,3 +3145,164 @@ input.switch:disabled {
   .route-hold .route-src,
   .route-hold .route-note { grid-column: 1 / -1; text-align: left; }
 }
+
+/* ---------------------------------------------------------------------------
+   Settings -> Routing (docs/plans/2026-10-14-routing-truth.md, phase 4; mock
+   docs/mockups/2026-10-14-routing/settings-routing.html and mock.css). Rows
+   keep a name column, what the row says, and its buttons on the trailing
+   edge; a form or a question opens under the row it changes.
+--------------------------------------------------------------------------- */
+.route-settings { overflow-wrap: break-word; }
+.route-settings .row-main,
+.route-settings .route-quote,
+.route-settings .route-state { overflow-wrap: anywhere; }
+.row-item.route-acct {
+  display: grid;
+  grid-template-columns: 8.75rem minmax(0, 1fr) auto;
+  column-gap: var(--s3);
+  align-items: start;
+}
+.row-item.route-acct .route-name { font-weight: 600; color: var(--text); padding-top: 1px; }
+.route-what { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.route-what .route-src { text-align: left; }
+/* A tag beside a state drops to its own line before the state's words break. */
+.route-what .route-state { flex-wrap: wrap; row-gap: 2px; }
+.route-what .route-state > span:not(.tag):not(.hdot) { flex: 0 0 auto; max-width: calc(100% - 1rem); }
+.route-acts { display: inline-flex; gap: var(--s2); justify-content: flex-end; flex-wrap: wrap; }
+.route-pause,
+.route-confirm {
+  grid-column: 2 / -1;
+  margin-top: var(--s2);
+  padding: var(--s3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+.route-confirm { background: var(--warn-soft); }
+.route-pause .toolbar label,
+.route-form label { font-size: var(--t-sm); color: var(--text-2); }
+.route-pause select,
+.route-form select { height: 30px; background-color: var(--surface); color: var(--text); }
+.route-pause textarea { width: 100%; min-height: 4.5em; font: inherit; resize: vertical; }
+.route-disagree {
+  grid-column: 2 / -1;
+  margin-top: var(--s2);
+  padding: var(--s3);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+  border-radius: var(--r-sm);
+  background: var(--warn-soft);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  line-height: 1.45;
+}
+.route-disagree ul { margin: 0; padding-left: 1.2em; }
+.route-disagree b { color: var(--text); }
+.route-rule-list { margin: 0; padding: 0; list-style: none; }
+.row-item.route-rule {
+  display: grid;
+  grid-template-columns: 1.5em minmax(0, 1fr) auto;
+  column-gap: var(--s2);
+  align-items: start;
+}
+.route-rule .route-rule-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.route-rule .row-main { white-space: normal; line-height: 1.45; }
+.route-rule-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s1) var(--s2);
+  align-items: center;
+  font-size: var(--t-xs);
+  color: var(--muted);
+}
+.route-rule-n { color: var(--muted); font-size: var(--t-sm); font-variant-numeric: tabular-nums; padding-top: 1px; }
+.route-rule .route-confirm,
+.route-rule .route-pause { grid-column: 2 / -1; }
+.route-undo { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; font-size: var(--t-sm); color: var(--text-2); }
+.route-form { display: flex; flex-direction: column; gap: var(--s2); padding: var(--s3) 0 0; }
+.route-form .toolbar input,
+.route-form .toolbar select { flex: 1; min-width: 10rem; }
+/* A label stays beside its field when the row wraps. */
+.route-field { display: inline-flex; align-items: center; gap: var(--s2); flex: 1 1 14rem; min-width: 0; }
+.route-pause .route-field { flex: 0 1 auto; }
+.section-body > .rows + .set-help,
+.section-body > .set-help + .rows,
+.section-body > .rows + .rows,
+.section-body > .rows + .route-form + .rows { margin-top: var(--s2); }
+.section-body h3.sub-title {
+  margin: var(--s3) 0 var(--s1);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--text-2);
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1.4;
+}
+.row-item.route-limit {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  column-gap: var(--s3);
+  align-items: center;
+}
+.route-limit-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.route-limit-name { color: var(--text); font-weight: 500; }
+.route-val { font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; }
+.route-limit .route-pause { grid-column: 1 / -1; }
+.row-item.route-hear { display: grid; grid-template-columns: 9rem minmax(0, 1fr); column-gap: var(--s3); align-items: baseline; }
+.route-hear .route-name { font-weight: 600; color: var(--text); }
+.row-item.route-lane {
+  display: grid;
+  grid-template-columns: minmax(0, 10rem) 1.2em minmax(0, 1fr) auto;
+  column-gap: var(--s2);
+  align-items: center;
+}
+.route-lane .mono { font-family: var(--mono); font-size: var(--t-sm); }
+.route-lane .route-pause { grid-column: 1 / -1; }
+.row-item.route-event {
+  display: grid;
+  grid-template-columns: 4.75rem minmax(0, 1fr) minmax(0, 13rem);
+  column-gap: var(--s3);
+  align-items: baseline;
+}
+.route-event .row-meta { margin-left: 0; }
+.route-event .row-main { white-space: normal; line-height: 1.45; }
+.route-who { font-size: var(--t-xs); color: var(--muted); text-align: right; }
+.rows h3.rows-head.route-day { margin: 0; }
+.route-days { display: flex; flex-direction: column; gap: var(--s3); }
+.section-head .route-head-tag { margin-left: var(--s2); }
+@media (max-width: 1040px) {
+  .row-item.route-acct { grid-template-columns: 8.75rem minmax(0, 1fr); }
+  .route-acct > .route-acts { grid-column: 2 / -1; justify-content: flex-start; margin-top: var(--s1); }
+}
+@media (max-width: 640px) {
+  .row-item.route-acct { grid-template-columns: 1fr; }
+  .route-acct > .route-acts,
+  .route-pause,
+  .route-confirm,
+  .route-disagree { grid-column: 1 / -1; }
+  .row-item.route-event { grid-template-columns: 4.25rem minmax(0, 1fr); }
+  .route-who { grid-column: 2 / -1; text-align: left; }
+  .row-item.route-limit { grid-template-columns: minmax(0, 1fr) auto; }
+  .route-limit > button { grid-column: 1 / -1; justify-self: start; }
+  .row-item.route-hear { grid-template-columns: 1fr; }
+  .row-item.route-lane { grid-template-columns: minmax(0, 1fr) 1.2em minmax(0, 1fr); }
+  .route-lane .route-acts { grid-column: 1 / -1; justify-content: flex-start; }
+}
+.route-settings .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

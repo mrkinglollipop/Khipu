@@ -69,19 +69,51 @@ export type RouteHold = {
   remind?: boolean;
 };
 
-export type RouteRule = { n: number; text: string; seeded?: boolean; confirmed?: boolean; date?: string | null };
+export type RouteRule = {
+  n: number;
+  text: string;
+  seeded?: boolean;
+  confirmed?: boolean;
+  date?: string | null;
+  /** Where the rule came from, in the owner's or the seed's words. */
+  source?: string | null;
+  via?: string | null;
+  at?: string | null;
+};
+
+export type RouteRunnerFile = { error?: string | null; good_at?: string | null; since?: string | null };
 
 export type RouteRunner = {
   name: string;
+  path?: string;
   heartbeat_at?: string | null;
+  /** Seconds between its heartbeats. */
+  interval?: number | null;
   silent?: boolean;
   unreadable?: boolean;
   unreadable_since?: string | null;
+  files?: Record<string, RouteRunnerFile>;
+  lanes?: string[];
+  unmatched_lanes?: string[];
 };
 
 export type RouteLane = { runner: string; lane: string; until?: string | null };
 
-export type RouteChange = { version: number; at: string; entities: string[] };
+/** One changed entity in a version: what it says now and said before (its
+ *  effective view; null when it ended or began) and who caused it. */
+export type RouteChangeItem = {
+  entity: string;
+  now?: Record<string, unknown> | null;
+  was?: Record<string, unknown> | null;
+  source?: string | null;
+  via?: string | null;
+  /** The author in words, set by the CLI. */
+  by?: string | null;
+  /** A removed rule's number. */
+  n?: number | null;
+};
+
+export type RouteChange = { version: number; at: string; entities: string[]; items?: RouteChangeItem[] };
 
 export type RuleCheck = {
   rule: number;
@@ -102,7 +134,15 @@ export type RouteView = {
   rules?: RouteRule[];
   note?: { text: string; at?: string | null } | null;
   unmatched?: RouteLane[];
-  sources?: { runners?: RouteRunner[] } | null;
+  sources?: {
+    runners?: RouteRunner[];
+    refused?: string[];
+    table?: { path?: string; stamped_at?: string | null; changed_at?: string | null; error?: string | null } | null;
+  } | null;
+  /** The numbers of the rules Khipu has a check for (`routing_sources.watched`). */
+  watched_rules?: number[];
+  /** The old hook's off switches as the app's CLI sees them. */
+  old_switches?: { env?: boolean; file?: boolean };
   changes?: RouteChange[];
   rule_checks?: RuleCheck[];
   /** Seconds; 0 means never. */
@@ -507,8 +547,10 @@ export function useRouting(active: boolean) {
   const [lastOkAt, setLastOkAt] = useState<string | null>(null);
   const inflight = useRef<Promise<void> | null>(null);
 
-  const load = useCallback((): Promise<void> => {
-    if (inflight.current) return inflight.current;
+  const load = useCallback((fresh = false): Promise<void> => {
+    // After a write, a read already under way may predate it: wait for it,
+    // then read again.
+    if (inflight.current) return fresh ? inflight.current.then(() => load(false)) : inflight.current;
     setLoading(true);
     const p = (async () => {
       try {

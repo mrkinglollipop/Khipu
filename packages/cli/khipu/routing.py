@@ -1773,12 +1773,14 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                  "date": event.get("date") or "", "seeded": bool(event.get("seeded")),
                                  "confirmed": not event.get("seeded"), "retired": False,
                                  "written_by": info["written_by"], "via": info["via"], "at": info["at"]}
-        elif kind in ("rule_edit", "rule_retire", "rule_confirm") and event.get("n") in rules:
+        elif kind in ("rule_edit", "rule_retire", "rule_restore", "rule_confirm") and event.get("n") in rules:
             rule = rules[event["n"]]
             if kind == "rule_edit" and isinstance(event.get("text"), str):
                 rule["text"] = event["text"]
             elif kind == "rule_retire":
                 rule["retired"] = True
+            elif kind == "rule_restore":
+                rule["retired"] = False
             elif kind == "rule_confirm":
                 rule["confirmed"] = True
             rule.update(written_by=info["written_by"], via=info["via"], at=info["at"])
@@ -2055,7 +2057,8 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
         changed = [k for k in changed if body["effective"].get(k) != prev_effective.get(k)]
         view_for_lines = dict(body, version=version)
         changes.append({"version": version, "at": _iso(now), "entities": changed,
-                        "lines": [change_line(k, view_for_lines, now, prev_effective) for k in changed]})
+                        "lines": [change_line(k, view_for_lines, now, prev_effective) for k in changed],
+                        "items": [_change_item(k, body, prev_effective) for k in changed]})
         changes = changes[-CHANGES_KEPT:]
     out = dict(body, schema=SCHEMA, epoch=epoch, version=version, folded_at=_iso(now), checked_at=_iso(now),
                record=record, bad_lines=bad, fingerprint=fingerprint, changes=changes)
@@ -2065,6 +2068,41 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
         # per-prompt push must not take it for "nothing changed" (fix round 5).
         out["unsaved_change"] = bool(prev) and record and body["effective"] != prev_effective
     return out
+
+
+def _change_item(entity: str, body: dict, prev_effective: dict) -> dict:
+    """One changed entity in a version, kept so the app can word Recent
+    changes in its own (local) times: what it says now and said before (its
+    effective view, None when it ended or began), and who caused it: the
+    shown report's source and author for an account, the hold's author, or
+    the owner for a rule and the note."""
+    kind, _, ident = entity.partition(":")
+    item: dict[str, Any] = {"entity": entity, "now": body["effective"].get(entity),
+                            "was": prev_effective.get(entity)}
+    author = source = via = None
+    if kind == "account":
+        entry = next((a for a in body["accounts"] if a["key"] == ident), None) or {}
+        w = entry.get("witness") or entry.get("last_seen") or {}
+        source, author = w.get("source"), w.get("written_by")
+        if entry.get("state") == PAUSED:
+            source, author = "owner", OWNER
+    elif kind == "hold":
+        hold = next((h for h in body["holds"] if h["id"] == ident), None)
+        if hold is not None:
+            author, via = hold.get("written_by"), hold.get("via")
+    elif kind == "rule":
+        rule = next((r for r in body["rules"] if str(r["n"]) == ident), None)
+        author, via = (rule.get("written_by"), rule.get("via")) if rule else (OWNER, None)
+        if rule is None:
+            # A removed rule's words, so the app can offer to bring it back.
+            item["n"] = int(ident) if ident.isdigit() else None
+    elif entity == "note":
+        note = body.get("note")
+        author, via = (note.get("written_by"), note.get("via")) if note else (OWNER, None)
+    else:
+        source = kind
+    item.update(source=source, written_by=author, via=via)
+    return item
 
 
 def _content_epoch(body: dict) -> str:
@@ -2547,6 +2585,21 @@ def edit_rule(n, text: str, *, via: str, now: datetime | None = None) -> dict:
 def retire_rule(n, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
     return dict(_owner_write({"type": "rule_retire", "n": rule["n"]}, via), n=rule["n"])
+
+
+def restore_rule(n, *, via: str, now: datetime | None = None) -> dict:
+    """Bring a removed rule back as it was when it was removed: its number,
+    words, source, date and confirmation (the app's Undo after a removal)."""
+    try:
+        number = int(n)
+    except (TypeError, ValueError):
+        raise RouteError(f"{n!r} is not a rule number") from None
+    if any(r["n"] == number for r in read_view(now)["rules"]):
+        raise RouteError(f"standing rule {number} is in effect")
+    events, _bad = read_events()
+    if not any(e.get("type") == "rule_add" and e.get("n") == number for e in events):
+        raise RouteError(f"there is no standing rule {number}")
+    return dict(_owner_write({"type": "rule_restore", "n": number}, via), n=number)
 
 
 def confirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
@@ -3057,6 +3110,15 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
                          "not_refreshed": cfg["routing_not_refreshed_after"]}
     # How long a limit reported without a time lasts (the card says so).
     out["report_default_limit"] = cfg["routing_report_default_limit"] or 1800
+    # Settings -> Routing (phase 4): which rules Khipu has a check for, the
+    # old hook's off switches as this process sees them, and each change's
+    # author in words.
+    out["watched_rules"] = sorted(set(routing_sources.watched(view.get("rules") or []).values()))
+    out["old_switches"] = {"env": (os.environ.get("ROUTING_NOW_OFF") or "").strip().lower() in _TRUE,
+                           "file": os.path.exists(ROUTING_NOW_DISABLE_FILE)}
+    out["changes"] = [dict(c, items=[dict(i, by=author_words(i.get("written_by"), push=False)
+                                          if i.get("written_by") else None) for i in c.get("items") or []])
+                      for c in view.get("changes") or []]
     for key in _INTERNAL:
         out.pop(key, None)
     return out
@@ -4058,6 +4120,8 @@ def run_cli(args) -> int:
                 raise RouteError(f"rule {args.action} takes one rule number")
             elif args.action == "retire":
                 out = retire_rule(params[0], via=via, now=now)
+            elif args.action == "restore":
+                out = restore_rule(params[0], via=via, now=now)
             else:
                 out = confirm_rule(params[0], via=via, now=now)
         else:
