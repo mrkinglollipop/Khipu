@@ -226,7 +226,8 @@ class ReaderTest(unittest.TestCase):
         frames = [{"jsonrpc": "2.0", "id": 1, "result": {"serverInfo": {"name": f"k{LS}h"}}},
                   {"jsonrpc": "2.0", "id": 2, "result": {"content": [
                       {"type": "text", "text": json.dumps({"counts": {"episodes": 3}})}]}}]
-        done = subprocess.CompletedProcess([], 0, "".join(_raw(f) + "\n" for f in frames), "")
+        done = subprocess.CompletedProcess(
+            [], 0, "".join(_raw(f) + "\n" for f in frames).encode("utf-8"), b"")
         with mock.patch.object(integrations.subprocess, "run", return_value=done):
             out = integrations._probe_mcp("khipu-mcp")
         self.assertEqual((out["ok"], out["episodes"]), (True, 3))

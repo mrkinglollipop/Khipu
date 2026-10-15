@@ -112,11 +112,15 @@ class TopicsCatchupContractTest(unittest.TestCase):
                                      {"slug": "note:fresh", "title": "Fresh", "body": "body text"})]
                 elif s.startswith("INSERT INTO memory_embeddings"):
                     self.inserts.append(params)
+                    self._result = [(datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc),)]  # RETURNING built_at
                 else:
                     self._result = []
 
             def fetchall(self):
                 return list(self._result)
+
+            def fetchone(self):
+                return self._result[0] if self._result else None
 
             def __enter__(self):
                 return self

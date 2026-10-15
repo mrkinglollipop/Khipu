@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from khipu import wire
 from khipu.config import capture_mode
 
 # ---- W1.4 ingest dedup ------------------------------------------------------
@@ -867,8 +868,9 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
     try:
         proc = subprocess.run(
             [sys.executable, str(capture_v2)],
-            input=json.dumps(payload, ensure_ascii=False),
-            text=True,
+            input=wire.dumps(payload),
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             env=env,
             timeout=300,

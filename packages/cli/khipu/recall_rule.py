@@ -455,7 +455,9 @@ def _pushed_memory_slice(cwd: str | None) -> str:
 def _session_start_payload() -> dict:
     """The hook's stdin payload, or {} (no input, not JSON, unreadable)."""
     try:
-        raw = sys.stdin.read()
+        from khipu import wire
+
+        raw = wire.read_stdin()
         if raw.strip():
             payload = json.loads(raw)
             if isinstance(payload, dict):
@@ -739,7 +741,9 @@ def session_start_main(*, shape: str | None = None) -> None:
                 "additionalContext": ctx,
             }
         }
-    print(json.dumps(out))
+    from khipu import wire
+
+    print(wire.dumps(out, ensure_ascii=True))
     if pushed:
         try:
             sys.stdout.flush()

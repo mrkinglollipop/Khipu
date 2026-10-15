@@ -76,6 +76,15 @@ def _add_paths() -> None:
             sys.path.insert(0, s)
 
 
+
+def _strict_json(value, **kw) -> str:
+    """JSON the desktop's serde_json parses whatever the text holds: ASCII,
+    no lone surrogate escape (khipu.wire)."""
+    from khipu import wire
+
+    return wire.dumps(value, ensure_ascii=True, **kw)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from khipu.drift import status_payload
     from khipu.hub_snapshot import (
@@ -95,7 +104,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         # embedding replica over Tailscale froze the desktop. Doctor (throttled)
         # and `khipu snapshot refresh` own the dump. snapshot_freshness (W2.4)
         # is still cheap — it only compares two timestamps already in hand.
-        data["hub_snapshot"] = snapshot_freshness(data.get("latest_ingested_at"))
+        data["hub_snapshot"] = snapshot_freshness(
+            data.get("latest_ingested_at"), lag=data.pop("replica_lag", None))
     except Exception as exc:
         if not hub_connection_failed(exc):
             raise
@@ -120,7 +130,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         data["bundle_seal"] = bundle_seal.check()
     except Exception as exc:  # noqa: BLE001
         data["bundle_seal"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    print(json.dumps(data, indent=2, default=str))
+    print(_strict_json(data, indent=2, default=str))
     return 0
 
 
@@ -458,7 +468,7 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
     }
     out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
                  and all(bool(local[k]) for k in LOCAL_GATES))
-    print(json.dumps(out, indent=2, default=str))
+    print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
 
 
@@ -567,7 +577,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     from khipu.hub_snapshot import (
         hub_connection_failed,
         snapshot_freshness,
-        snapshot_health,
         status_payload_snapshot,
     )
 
@@ -584,13 +593,12 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
             status["hub_error"] = f"{type(exc).__name__}: {exc}"
         else:
             raise
-    # W2.4: behind_ingest_seconds / ok=false reason=snapshot_behind_ingest only
-    # means something while PG is reachable — with the hub down, hub_ok is
-    # already red from a different, more specific check.
-    hub_snapshot = (
-        snapshot_freshness(status.get("latest_ingested_at"))
-        if hub_ok
-        else snapshot_health()
+    # Replica freshness phase 1: per-table lag while the hub answers; with it
+    # down the state is "unknown" (hub_ok is already red, more specifically)
+    # and the last measurement rides along.
+    hub_snapshot = snapshot_freshness(
+        status.get("latest_ingested_at") if hub_ok else None,
+        lag=status.pop("replica_lag", None),
     )
     # A check whose input is not configured on this machine is SKIPPED and
     # named in `not_configured` — distinct from red (configured but broken)
@@ -823,6 +831,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "status": status,
         "hub_ok": hub_ok,
         "hub_snapshot": hub_snapshot,
+        # Its own row in the app's health report; red only when stale.
+        "hub_snapshot_ok": bool(hub_snapshot.get("ok", True)),
         "drift": drift,
         "graph_drift": graph,
         "outbox": outbox,
@@ -938,7 +948,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "launchers_ok": bool(launchers.get("ok")),
         "nightly_steps_ok": local["nightly_steps_ok"],
     }
-    print(json.dumps(out, indent=2, default=str))
+    print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
 
 
@@ -3390,10 +3400,12 @@ def cmd_jobs(args: argparse.Namespace) -> int:
 
 
 def cmd_snapshot(args: argparse.Namespace) -> int:
-    from khipu.hub_snapshot import refresh, snapshot_health
+    from khipu.hub_snapshot import refresh, snapshot_freshness
 
     if args.snapshot_cmd == "status":
-        print(json.dumps(snapshot_health(), indent=2))
+        # Local evidence only (no hub connection): the state, per-table
+        # cursors and the last measurement status or doctor made.
+        print(json.dumps(snapshot_freshness(None), indent=2))
         return 0
     try:
         out = refresh()

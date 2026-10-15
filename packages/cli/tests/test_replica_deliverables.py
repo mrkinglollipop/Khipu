@@ -67,6 +67,9 @@ class _FakeHubCursor:
                 cols = []
             self._result = [(c,) for c in cols]
             return
+        if s == "SELECT now()":
+            self._result = [(datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc),)]
+            return
         if " FROM deliverables" in s:
             select = s.split(" FROM deliverables")[0][len("SELECT "):]
             cols = [c.strip() for c in select.split(",")]

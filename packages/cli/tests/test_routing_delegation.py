@@ -88,7 +88,7 @@ def _run(payload: dict, monkeypatch, environ: dict | None = None) -> dict:
     import io
     from contextlib import redirect_stdout
 
-    monkeypatch.setattr(routing_delegation.sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
     buf = io.StringIO()
     with redirect_stdout(buf):
         if environ is None:

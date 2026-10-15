@@ -9,7 +9,7 @@ migration.
 | Phase | What | State |
 |---|---|---|
 | 1 | `khipu_get` and `khipu get` page topic bodies by UTF-8 byte offset; identity and metadata on every page | built, in review (branch feat/record-paging-p1) |
-| 2 | Output is UTF-8 on the wire (`ensure_ascii=False`), with a byte budget that measures real content | open |
+| 2 | Output is UTF-8 on the wire (`ensure_ascii=False`), with a byte budget that measures real content | built, in review (branch feat/record-paging-p2) |
 
 Two PRs, phase 1 first.
 

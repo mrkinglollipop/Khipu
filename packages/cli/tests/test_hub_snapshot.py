@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import tempfile
@@ -647,26 +648,51 @@ class ForgetEpisodeInSnapshotTest(unittest.TestCase):
 
 
 class SnapshotFreshnessTest(unittest.TestCase):
+    """Without a per-table measurement (``lag``) the state is ``unknown``;
+    ``behind_ingest_seconds`` keeps PR #144's figure for older readers, and a
+    hub ingest since the dump never turns the replica red (decision 3)."""
+
+    HEALTH = {"ok": True, "exists": True, "age_seconds": 600}
+
+    def setUp(self) -> None:
+        # Earlier tests in the run may leave a sidecar (a refresh_error, say)
+        # in the shared data dir; these read only their own.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for name, target in (("meta_path", "meta.json"), ("freshness_path", "freshness.json")):
+            patcher = mock.patch.object(hs, name, return_value=Path(tmp.name) / target)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.meta_file = Path(tmp.name) / "meta.json"
+
+    def dumped(self, at: str) -> dict:
+        """A dump at ``at`` on both clocks; the figure reads the hub's."""
+        self.meta_file.write_text(json.dumps({"refreshed_at": at, "hub_dumped_at": at}))
+        return {**self.HEALTH, "refreshed_at": at}
+
     def test_behind_ingest_seconds_computed(self) -> None:
-        health = {"ok": True, "refreshed_at": "2026-09-03T12:00:00+00:00"}
+        health = self.dumped("2026-09-03T12:00:00+00:00")
         out = hs.snapshot_freshness("2026-09-03T12:10:00+00:00", health)
         self.assertEqual(out["behind_ingest_seconds"], 600.0)
         self.assertTrue(out["ok"])
+        self.assertEqual(out["state"], "unknown")
 
-    def test_ok_false_past_the_max(self) -> None:
-        health = {"ok": True, "refreshed_at": "2026-09-03T00:00:00+00:00"}
+    def test_an_ingest_since_the_dump_is_never_red_on_its_own(self) -> None:
+        health = self.dumped("2026-09-03T00:00:00+00:00")
         out = hs.snapshot_freshness("2026-09-03T01:00:00+00:00", health)
-        self.assertFalse(out["ok"])
-        self.assertEqual(out["reason"], "snapshot_behind_ingest")
+        self.assertEqual(out["behind_ingest_seconds"], 3600.0)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["reason"], "hub_not_measured")
 
     def test_missing_timestamps_are_none_not_crash(self) -> None:
-        out = hs.snapshot_freshness(None, {"ok": True, "refreshed_at": None})
+        out = hs.snapshot_freshness(None, {"ok": True, "exists": True, "refreshed_at": None, "age_seconds": None})
         self.assertIsNone(out["behind_ingest_seconds"])
+        self.assertEqual(out["state"], "stale")
+        self.assertFalse(out["ok"])
 
     def test_behind_is_measured_against_what_the_replica_holds(self) -> None:
-        """An old full dump with current incremental writes is not behind; a
-        replica whose newest episode is itself old still is."""
-        health = {"ok": True, "refreshed_at": "2026-09-03T00:00:00+00:00"}
+        """An old full dump with current incremental writes is not behind."""
+        health = self.dumped("2026-09-03T00:00:00+00:00")
         with tempfile.TemporaryDirectory() as tmp:
             snap = Path(tmp) / "hub_snapshot.sqlite"
             con = sqlite3.connect(snap)
@@ -681,8 +707,7 @@ class SnapshotFreshnessTest(unittest.TestCase):
         self.assertTrue(current["ok"])
         self.assertEqual(current["behind_ingest_seconds"], 60.0)
         self.assertEqual(current["refreshed_at"], "2026-09-03T00:00:00+00:00")
-        self.assertFalse(stalled["ok"])
-        self.assertEqual(stalled["reason"], "snapshot_behind_ingest")
+        self.assertEqual(stalled["behind_ingest_seconds"], 4 * 3600 + 60.0)
 
 
 if __name__ == "__main__":

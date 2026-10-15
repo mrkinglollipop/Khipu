@@ -329,11 +329,13 @@ class MemorySpaceAnyDimTest(_Base):
 
     def test_upsert_accepts_the_right_width_for_a_non_768_profile(self) -> None:
         cur = mock.Mock()
+        cur.fetchone.return_value = (None,)
         embed._upsert_chunks(cur, VOYAGE.id, [("topic", "t", 0, "x", "h", [0.1] * 1024)])
         self.assertEqual(cur.execute.call_count, 1)
 
     def test_an_unknown_profile_is_not_length_checked_here(self) -> None:
         cur = mock.Mock()
+        cur.fetchone.return_value = (None,)
         embed._upsert_chunks(cur, "prof-unseen", [("topic", "t", 0, "x", "h", [0.1, 0.2])])
         self.assertEqual(cur.execute.call_count, 1)
 

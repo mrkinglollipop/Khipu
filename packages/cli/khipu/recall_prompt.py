@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from khipu import t3 as _t3
+from khipu import wire
 if not hasattr(_t3, 'handoff_thread'):
     # A long-lived MCP server can still hold the t3 from before the
     # deploy that added this name; t3 is stdlib-only, so reloading is safe.
@@ -457,7 +458,7 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
             # nowhere to keep what it has seen. One write, with the ready line:
             # the hook gives this answer no time to arrive after it.
             answer = {"skip": "off" if off else "no-session"}
-            _write_all(write_fd, ready + json.dumps(answer).encode("utf-8") + b"\n")
+            _write_all(write_fd, ready + wire.encode(answer, ensure_ascii=True) + b"\n")
         else:
             _write_all(write_fd, ready)
             def fold_started() -> None:
@@ -487,7 +488,7 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
             # When the answer was finished: the hook takes it only if that was
             # within the read's budget, however long it took to read the pipe.
             answer["done"] = time.monotonic()
-            _write_all(write_fd, json.dumps(answer).encode("utf-8") + b"\n")
+            _write_all(write_fd, wire.encode(answer, ensure_ascii=True) + b"\n")
         code = 0
     except BaseException:  # noqa: BLE001 - nothing for routing, never a failed hook
         code = 1
@@ -1269,7 +1270,7 @@ def _poll_routing_child(write_fd: int, *, blocked_resets=None) -> None:
                 signal.signal(sig, stop)
 
         out = _poll_once(routing, on_fold=fold_started, on_probe=probe_started, blocked_resets=blocked_resets)
-        _write_all(write_fd, json.dumps(out).encode("utf-8") + b"\n")
+        _write_all(write_fd, wire.encode(out, ensure_ascii=True) + b"\n")
         code = 0
     except BaseException:  # noqa: BLE001 - the helper reads end of file and tries again later
         code = 1
@@ -3106,7 +3107,7 @@ def prompt_recall_main(*, shape: str | None = None) -> None:
     """Entry point for ``bin/khipu-prompt-recall``. Never raises: any failure
     prints ``{}`` so a broken recall lane can never block a prompt."""
     try:
-        raw = sys.stdin.read()
+        raw = wire.read_stdin()
     except Exception:  # noqa: BLE001
         raw = ""
     want = (shape or ("cursor" if "--cursor" in sys.argv[1:] else "claude")).strip().lower()
@@ -3123,7 +3124,7 @@ def prompt_recall_main(*, shape: str | None = None) -> None:
         log_terminal_outcome(raw, f"error: hook_main crashed: {type(exc).__name__}: {exc}")
         out = {}
     try:
-        print(json.dumps(out), flush=True)
+        print(wire.dumps(out, ensure_ascii=True), flush=True)
     except OSError:
         finish_delivery(delivery, delivered=False, reason="error: stdout delivery failed")
     else:

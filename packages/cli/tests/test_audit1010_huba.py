@@ -655,6 +655,7 @@ class HubAuditRegressionTest(unittest.TestCase):
                 def cursor(self): return self
                 def execute(self, *args, **kwargs): pass
                 def fetchall(self): return []
+                def fetchone(self): return None
 
             def episodes(_cur, con):
                 con.execute("INSERT INTO episodes (id, summary, raw) VALUES (41, 'race secret', '{}')")
@@ -711,6 +712,8 @@ class HubAuditRegressionTest(unittest.TestCase):
                 def __enter__(self): return self
                 def __exit__(self, *args): return False
                 def cursor(self): return self
+                def execute(self, *args, **kwargs): pass
+                def fetchone(self): return None
 
             inserts = ["_insert_episodes", "_insert_topics", "_insert_topic_revisions", "_insert_nodes",
                        "_insert_edges", "_insert_profiles", "_insert_memory_embeddings",
