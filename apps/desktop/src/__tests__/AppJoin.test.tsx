@@ -5,13 +5,15 @@ import { WELCOME_DONE_KEY } from "../Welcome";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null), save: vi.fn(async () => null) }));
+const dialog = vi.hoisted(() => ({ savePath: null as string | null }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null), save: vi.fn(async () => dialog.savePath) }));
 vi.mock("@tauri-apps/api/path", () => ({ resourceDir: vi.fn(async () => "/Resources") }));
 vi.mock("@tauri-apps/api/app", () => ({ getVersion: vi.fn(async () => "0.4.0") }));
 vi.mock("@tauri-apps/plugin-updater", () => ({ check: vi.fn(async () => null) }));
 vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: vi.fn(async () => {}) }));
 
 beforeEach(() => {
+  dialog.savePath = null;
   invokeMock.mockReset();
   vi.stubGlobal("localStorage", { getItem: (key: string) => key === WELCOME_DONE_KEY ? "1" : null, setItem: () => {}, removeItem: () => {}, clear: () => {} });
 });
@@ -44,6 +46,7 @@ function mockRemoteHub() {
     if (cmd === "khipu_db_status") return JSON.stringify({ ok: true, host_kind: "remote" });
     if (cmd === "liveness_now") return JSON.stringify({ ok: true, harnesses: {} });
     if (cmd === "join_advertise") return JSON.stringify({ ok: true, pin: "123456", timeout_sec: 600 });
+    if (cmd === "join_export") return JSON.stringify({ ok: true, out: "/tmp/k.khipujoin", expected: {} });
     if (cmd === "run_khipu") return JSON.stringify({ ok: true, capture_liveness: { ok: true, harnesses: {} }, claude_homes: { homes: [] }, counts: {}, recent: [] });
     return JSON.stringify({ ok: true });
   });
@@ -92,5 +95,33 @@ describe("App — Join kit passphrase", () => {
       timeout: 600,
       allowUnencrypted: true,
     });
+  });
+});
+
+describe("App — Join kit passphrase is not kept", () => {
+  it("clears the passphrase after a successful export", async () => {
+    mockRemoteHub();
+    dialog.savePath = "/tmp/k.khipujoin";
+    const section = await openAnotherMac();
+    const field = section.getByLabelText("Join kit passphrase") as HTMLInputElement;
+    fireEvent.change(field, { target: { value: "correct horse" } });
+    fireEvent.click(section.getByRole("button", { name: /Save join kit/ }));
+    expect(await screen.findByText(/Saved an encrypted join kit/)).toBeInTheDocument();
+    expect(invokeMock).toHaveBeenCalledWith("join_export", {
+      passphrase: "correct horse",
+      outPath: "/tmp/k.khipujoin",
+      allowUnencrypted: false,
+    });
+    expect(field.value).toBe("");
+  });
+
+  it("clears the passphrase after advertising starts", async () => {
+    mockRemoteHub();
+    const section = await openAnotherMac();
+    const field = section.getByLabelText("Join kit passphrase") as HTMLInputElement;
+    fireEvent.change(field, { target: { value: "correct horse" } });
+    fireEvent.click(section.getByRole("button", { name: /Advertise nearby/ }));
+    expect(await screen.findByText(/Nearby setup started/)).toBeInTheDocument();
+    expect(field.value).toBe("");
   });
 });

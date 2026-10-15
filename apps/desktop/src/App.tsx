@@ -2980,6 +2980,7 @@ export default function App() {
         return;
       }
       setSetupJoinExpected(parsed.expected ?? null);
+      setSetupJoinPassphrase("");
       setSetupJoinMsg(
         `Saved ${passphrase ? "an encrypted" : "an unencrypted"} join kit to ${parsed.out ?? dest}`,
       );
@@ -3011,6 +3012,7 @@ export default function App() {
         setSetupJoinMsg(String(parsed?.error ?? "Advertise failed."));
         return;
       }
+      setSetupJoinPassphrase("");
       setAdvertiseInfo({
         pin: parsed.pin,
         timeout_sec: parsed.timeout_sec,

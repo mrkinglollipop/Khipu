@@ -181,7 +181,7 @@ Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `-
 
 - `db move`: `--to DSN` or `--new-local`, `--dry-run`, `--into-nonempty`. It copies and verifies before switching and never writes to the source.
 - `db connect`: `--dsn`, `--use-stored`, `--root-crt`, `--no-jobs`, `--no-prove`.
-- `join export --out FILE --passphrase P [--allow-unencrypted]`; `join import --file FILE [--passphrase] [--skip-migrate-check]`; `join advertise --passphrase P [--allow-unencrypted] [--timeout] [--pin]`; `join receive --pin [--passphrase]`. Export and advertise refuse without a passphrase (flag or `KHIPU_JOIN_PASSPHRASE`) unless `--allow-unencrypted` is passed.
+- `join export --out FILE [--allow-unencrypted]`; `join import --file FILE [--skip-migrate-check]`; `join advertise [--allow-unencrypted] [--timeout] [--pin]`; `join receive --pin`. Each reads the passphrase from `KHIPU_JOIN_PASSPHRASE`, `--passphrase-stdin` (first line of stdin) or `--passphrase-fd N`; export and advertise ask for it in a terminal. A literal `--passphrase VALUE` is refused, because other processes can read command-line arguments. Export and advertise refuse without a passphrase unless `--allow-unencrypted` is passed.
 - `config`: `--set KEY VALUE`, `--unset KEY`, `--set-gateway-url URL`, `--set-capture-mode legacy|dual|hub`. See `khipu config --help` for the full key list.
 - `budget lift {synth,memory,library}` takes exactly one of `--today`, `--cap N`, `--unlimited`.
 

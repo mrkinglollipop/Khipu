@@ -14,6 +14,13 @@ from pathlib import Path
 from khipu.drift import BACKUP_MAX_AGE_HOURS
 
 
+def _dest_remote_or_none() -> str | None:
+    try:
+        return resolve_dest_remote()
+    except ValueError:
+        return None
+
+
 def resolve_dest_remote() -> str:
     """Offsite destination from config (``graph_backup_remote``)."""
     from khipu.config import graph_backup_remote
@@ -463,7 +470,14 @@ def run_offsite(
     keep: int = 3,
     rclone_bin: str = "rclone",
 ) -> dict:
-    dest_remote = dest_remote or resolve_dest_remote()
+    from khipu.config import check_graph_backup_remote
+
+    try:
+        dest_remote = (
+            check_graph_backup_remote(dest_remote) if dest_remote else resolve_dest_remote()
+        )
+    except ValueError as exc:
+        return {"ok": False, "reason": str(exc)}
     resolved = resolve_rclone(rclone_bin)
     if resolved is None:
         return {
@@ -511,7 +525,7 @@ def run_offsite(
         return {"ok": False, "reason": "refusing to upload live graph.sqlite"}
 
     dest = f"{dest_remote.rstrip('/')}/{snap.name}"
-    argv = [rclone_bin, "copyto", str(snap), dest]
+    argv = [rclone_bin, "copyto", "--", str(snap), dest]
     if str(live) in argv:
         return {"ok": False, "reason": "live graph path must not appear in rclone argv"}
 
@@ -575,7 +589,7 @@ def _prune_remote_snapshots(
 ) -> list[str]:
     prefix = f"{dest_remote.rstrip('/')}/"
     r = subprocess.run(
-        [rclone_bin, "lsf", prefix],
+        [rclone_bin, "lsf", "--", prefix],
         capture_output=True,
         text=True,
         timeout=120,
@@ -600,7 +614,7 @@ def _prune_remote_snapshots(
         if live is not None and str(live.resolve()) in target:
             continue
         dr = subprocess.run(
-            [rclone_bin, "deletefile", target],
+            [rclone_bin, "deletefile", "--", target],
             capture_output=True,
             text=True,
             timeout=120,
@@ -615,14 +629,17 @@ def offsite_health(
     now: datetime | None = None,
     producer: bool | None = None,
 ) -> dict:
-    dest = resolve_dest_remote()
     if not _resolve_producer(producer):
         return {
             "ok": True,
             "skipped": True,
             "reason": "not the graph producer",
-            "dest_remote": dest,
+            "dest_remote": _dest_remote_or_none(),
         }
+    try:
+        dest = resolve_dest_remote()
+    except ValueError as exc:
+        return {"ok": False, "skipped": False, "reason": str(exc), "dest_remote": None}
 
     if not has_r2_remote():
         return {
@@ -759,7 +776,7 @@ def status_payload() -> dict:
         "local": local,
         "offsite": offsite,
         "latest_snapshot": str(latest_snapshot()) if latest_snapshot() else None,
-        "dest_remote": resolve_dest_remote(),
+        "dest_remote": _dest_remote_or_none(),
         "live_graph": str(live) if live is not None else None,
         "has_r2_remote": has_r2_remote(),
         "last_graph_snapshot": _latest_ops_event("graph_snapshot"),

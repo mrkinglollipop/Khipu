@@ -188,6 +188,102 @@ class DestRemoteTest(unittest.TestCase):
             set_graph_backup_remote("just-a-bucket")
 
 
+class DestRemoteSafetyTest(unittest.TestCase):
+    """A destination must be a named rclone remote: never a local path, never
+    flag-shaped, from whichever source it resolved."""
+
+    BAD = ("/tmp/backup:graph", "--log-file=/tmp/x:y", "./local:dir", "r2 x:y", "-r2:x", "bucket")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(
+            os.environ,
+            {"KHIPU_DATA_DIR": self.tmp.name, "KHIPU_GRAPH_BACKUP_REMOTE": ""},
+        )
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_setter_refuses_local_and_flag_shaped_values(self):
+        from khipu.config import set_graph_backup_remote
+
+        for bad in self.BAD:
+            with self.subTest(bad=bad), self.assertRaises(ValueError) as ctx:
+                set_graph_backup_remote(bad)
+            self.assertIn("named rclone remote", str(ctx.exception))
+
+    def test_environment_value_is_validated_after_resolving(self):
+        for bad in self.BAD:
+            with self.subTest(bad=bad), mock.patch.dict(
+                os.environ, {"KHIPU_GRAPH_BACKUP_REMOTE": bad}
+            ):
+                with self.assertRaises(ValueError):
+                    graph_backup.resolve_dest_remote()
+                health = graph_backup.offsite_health(producer=True)
+                self.assertFalse(health["ok"])
+                self.assertIn("named rclone remote", health["reason"])
+
+    def test_hand_edited_config_value_is_validated(self):
+        import json as _json
+
+        Path(self.tmp.name, "config.json").write_text(
+            _json.dumps({"graph_backup_remote": "/tmp/backup:graph"}), encoding="utf-8"
+        )
+        with self.assertRaises(ValueError):
+            graph_backup.resolve_dest_remote()
+
+    def test_invalid_destination_never_reaches_rclone(self):
+        with (
+            mock.patch.dict(os.environ, {"KHIPU_GRAPH_BACKUP_REMOTE": "--log-file=/tmp/x:y"}),
+            mock.patch("khipu.graph_backup.subprocess.run") as run,
+        ):
+            out = graph_backup.run_offsite()
+        self.assertFalse(out["ok"])
+        self.assertIn("named rclone remote", out["reason"])
+        run.assert_not_called()
+
+    def test_rclone_operands_follow_a_double_dash(self):
+        d = Path(self.tmp.name)
+        snap = d / "graph-20260819T000000Z.sqlite"
+        snap.write_bytes(b"sqlite")
+        live = d / "live-graph.sqlite"
+        live.write_bytes(b"live")
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[1] == "lsf":
+                names = "\n".join(f"graph-2026081{i}T000000Z.sqlite" for i in range(5))
+                return mock.Mock(returncode=0, stdout=names, stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(graph_backup, "latest_snapshot", return_value=snap),
+            mock.patch.object(graph_backup, "_integrity_check", return_value="ok"),
+            mock.patch.object(graph_backup, "_required_graph_tables", return_value=None),
+            mock.patch.object(graph_backup, "_live_graph", return_value=live),
+            mock.patch.object(graph_backup, "resolve_rclone", return_value="rclone"),
+            mock.patch.object(graph_backup, "has_r2_remote", return_value=True),
+            mock.patch("khipu.graph_backup.subprocess.run", side_effect=fake_run),
+            mock.patch("khipu.ops_events.record", return_value={"ok": True, "id": 1}),
+        ):
+            out = graph_backup.run_offsite()
+        self.assertTrue(out["ok"], out)
+        by_verb = {}
+        for argv in calls:
+            by_verb.setdefault(argv[1], []).append(argv)
+        self.assertEqual(
+            by_verb["copyto"][0],
+            ["rclone", "copyto", "--", str(snap), f"r2:khipu-backups/khipu-graph/{snap.name}"],
+        )
+        self.assertEqual(by_verb["lsf"][0], ["rclone", "lsf", "--", "r2:khipu-backups/khipu-graph/"])
+        self.assertTrue(by_verb["deletefile"])
+        for argv in by_verb["deletefile"]:
+            self.assertEqual(argv[:3], ["rclone", "deletefile", "--"])
+
+
 class RunOffsiteTest(unittest.TestCase):
     def test_missing_r2_remote_fails_honest(self):
         with mock.patch.object(graph_backup, "resolve_rclone", return_value="rclone"), \
@@ -230,8 +326,9 @@ class RunOffsiteTest(unittest.TestCase):
             copy_calls = [c for c in calls if len(c) > 1 and c[1] == "copyto"]
             self.assertEqual(len(copy_calls), 1)
             argv = copy_calls[0]
-            self.assertEqual(argv[2], str(snap))
-            self.assertTrue(argv[3].startswith("r2:khipu-backups/khipu-graph/"))
+            self.assertEqual(argv[2], "--")
+            self.assertEqual(argv[3], str(snap))
+            self.assertTrue(argv[4].startswith("r2:khipu-backups/khipu-graph/"))
             joined = " ".join(argv)
             self.assertNotIn(str(live.resolve()), joined)
 

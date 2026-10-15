@@ -191,8 +191,9 @@ def _models_export_blob() -> dict[str, Any]:
 UNENCRYPTED_REFUSAL = (
     "A join kit needs a passphrase. The kit holds this hub's database password "
     "and any API keys, so without a passphrase anyone who gets the file can read "
-    "them. Pass --passphrase (or set KHIPU_JOIN_PASSPHRASE), or, if you "
-    "understand the risk, pass --allow-unencrypted to make an unencrypted kit."
+    "them. Set KHIPU_JOIN_PASSPHRASE, pass --passphrase-stdin or --passphrase-fd, "
+    "or run it in a terminal to be asked; or, if you understand the risk, pass "
+    "--allow-unencrypted to make an unencrypted kit."
 )
 
 
@@ -345,7 +346,15 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
         raise ValueError(f"capture_mode must be one of {CAPTURE_MODES}, got {mode!r}")
 
     # Validate the entire owned payload before changing a file or credential.
-    conninfo_to_dict(dsn)
+    # libpq's parse errors quote the text around the fault, which can be the
+    # password: say what is wrong without any of it.
+    try:
+        conninfo_to_dict(dsn)
+    except Exception:
+        raise ValueError(
+            "join kit database_url is not a valid database address; export the kit again "
+            "on the working Mac"
+        ) from None
     gateway = payload.get("gateway_url")
     if gateway is not None and not isinstance(gateway, str):
         raise ValueError("gateway_url must be a string")
@@ -491,6 +500,25 @@ def verify_live_counts(expected: dict[str, int]) -> dict[str, Any]:
             m for m in mismatches if m not in empty_when_expected
         ]
     return {"ok": ok, "expected": exp, "live": live, "mismatches": mismatches}
+
+
+LITERAL_PASSPHRASE_REFUSAL = (
+    "--passphrase on the command line is visible to other processes on this Mac. "
+    "Set KHIPU_JOIN_PASSPHRASE, pass --passphrase-stdin or --passphrase-fd N, "
+    "or run the command in a terminal to be asked."
+)
+
+
+def read_passphrase(*, stdin: bool = False, fd: int | None = None) -> str:
+    """First line from a file descriptor or stdin, else KHIPU_JOIN_PASSPHRASE."""
+    import sys
+
+    if fd is not None:
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as fh:
+            return fh.readline().strip()
+    if stdin:
+        return sys.stdin.readline().strip()
+    return resolve_passphrase(None)
 
 
 def resolve_passphrase(arg: str | None) -> str:

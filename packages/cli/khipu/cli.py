@@ -3247,22 +3247,61 @@ def cmd_db(args: argparse.Namespace) -> int:
     return 2
 
 
+def _add_passphrase_args(parser: argparse.ArgumentParser) -> None:
+    """A join kit passphrase never travels as a literal argument (other
+    processes can read argv): env, stdin, a file descriptor or the prompt."""
+    parser.add_argument("--passphrase", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--passphrase-stdin",
+        action="store_true",
+        help="Read the join kit passphrase from the first line of stdin "
+        "(or set KHIPU_JOIN_PASSPHRASE; a terminal asks)",
+    )
+    parser.add_argument(
+        "--passphrase-fd",
+        type=int,
+        default=None,
+        metavar="FD",
+        help="Read the join kit passphrase from the first line of this open file descriptor",
+    )
+
+
 def cmd_join(args: argparse.Namespace) -> int:
     from khipu.join import (
         export_kit,
         import_kit,
-        resolve_passphrase,
         verify_live_counts,
         write_kit_file,
     )
 
-    try:
-        passphrase = resolve_passphrase(getattr(args, "passphrase", None))
-    except ValueError as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}))
-        return 2
+    from khipu.join import LITERAL_PASSPHRASE_REFUSAL, read_passphrase
 
+    if getattr(args, "passphrase", None) is not None:
+        print(json.dumps({"ok": False, "error": LITERAL_PASSPHRASE_REFUSAL}))
+        return 2
     allow_unencrypted = bool(getattr(args, "allow_unencrypted", False))
+    try:
+        passphrase = read_passphrase(
+            stdin=bool(getattr(args, "passphrase_stdin", False)),
+            fd=getattr(args, "passphrase_fd", None),
+        )
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"ok": False, "error": f"could not read the passphrase: {type(exc).__name__}"}))
+        return 2
+    if (
+        args.join_cmd in ("export", "advertise")
+        and not passphrase
+        and not allow_unencrypted
+        and sys.stdin.isatty()
+    ):
+        import getpass
+
+        first = getpass.getpass("Join kit passphrase: ").strip()
+        if first and getpass.getpass("Type it again: ").strip() != first:
+            print(json.dumps({"ok": False, "error": "the two passphrases did not match"}))
+            return 2
+        passphrase = first
+
     if args.join_cmd in ("export", "advertise") and not passphrase and not allow_unencrypted:
         from khipu.join import UNENCRYPTED_REFUSAL
 
@@ -5120,11 +5159,7 @@ def build_parser() -> argparse.ArgumentParser:
     join_export = join_sub.add_parser(
         "export", help="Write a join kit from this Mac's Keychain/config"
     )
-    join_export.add_argument(
-        "--passphrase",
-        default=None,
-        help="Encryption passphrase, required unless --allow-unencrypted (or KHIPU_JOIN_PASSPHRASE)",
-    )
+    _add_passphrase_args(join_export)
     join_export.add_argument(
         "--allow-unencrypted",
         action="store_true",
@@ -5139,11 +5174,7 @@ def build_parser() -> argparse.ArgumentParser:
     join_import = join_sub.add_parser(
         "import", help="Apply a join kit's hub credentials on this Mac"
     )
-    join_import.add_argument(
-        "--passphrase",
-        default=None,
-        help="Passphrase if the kit was saved encrypted (or KHIPU_JOIN_PASSPHRASE)",
-    )
+    _add_passphrase_args(join_import)
     join_import.add_argument(
         "--file",
         required=True,
@@ -5159,11 +5190,7 @@ def build_parser() -> argparse.ArgumentParser:
         "advertise",
         help="Advertise join kit on LAN via Bonjour + TLS (macOS dns-sd)",
     )
-    join_advertise.add_argument(
-        "--passphrase",
-        default=None,
-        help="Encryption passphrase, required unless --allow-unencrypted (or KHIPU_JOIN_PASSPHRASE)",
-    )
+    _add_passphrase_args(join_advertise)
     join_advertise.add_argument(
         "--allow-unencrypted",
         action="store_true",
@@ -5185,11 +5212,7 @@ def build_parser() -> argparse.ArgumentParser:
         "receive",
         help="Find nearby Mac, send PIN, import join kit",
     )
-    join_receive.add_argument(
-        "--passphrase",
-        default=None,
-        help="Passphrase if the kit was saved encrypted (or KHIPU_JOIN_PASSPHRASE)",
-    )
+    _add_passphrase_args(join_receive)
     join_receive.add_argument(
         "--pin",
         required=True,

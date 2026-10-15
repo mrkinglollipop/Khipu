@@ -466,7 +466,11 @@ export function GraphBackupRemoteCard({ active }: { active: boolean }) {
           canReset={source === "config"}
           resetLabel="Use the default"
           onReset={() => unsetConfig("graph_backup_remote", cfg.reload)}
-          help={row ? `Comes from ${BACKUP_SOURCE_WORDS[source] ?? source}.` : "Reading the setting…"}
+          help={
+            row
+              ? `Comes from ${BACKUP_SOURCE_WORDS[source] ?? source}.${row.error ? ` Not usable: ${row.error}` : ""}`
+              : "Reading the setting…"
+          }
           onSave={async (v) => backupRemoteError(v) ?? writeConfig("graph_backup_remote", v.trim(), cfg.reload)}
         />
       </div>

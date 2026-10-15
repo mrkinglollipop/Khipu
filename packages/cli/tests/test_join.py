@@ -175,6 +175,98 @@ class JoinCliPassphraseTest(unittest.TestCase):
 
 
 
+class MalformedDsnTest(unittest.TestCase):
+    def test_malformed_database_url_error_never_echoes_kit_content(self) -> None:
+        kit = json.dumps({
+            "format": j.FORMAT_VERSION,
+            "database_url": "host=hub password=hunter2secret hunter2tail",
+        }).encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"KHIPU_DATA_DIR": tmp}
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                j.import_kit(kit, "")
+        msg = str(ctx.exception)
+        self.assertNotIn("hunter2", msg)
+        self.assertNotIn("host=hub", msg)
+        self.assertIn("database address", msg)
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertTrue(ctx.exception.__suppress_context__)
+
+
+class PassphraseInputTest(unittest.TestCase):
+    """A passphrase never travels as a literal argument: env, stdin, a file
+    descriptor or the terminal prompt."""
+
+    def _run(self, argv, *, stdin_text=None, tty=False, getpass_value=None):
+        import contextlib
+        import io
+
+        from khipu import cli
+
+        buf = io.StringIO()
+        stdin = io.StringIO(stdin_text or "")
+        stdin.isatty = lambda: tty  # type: ignore[method-assign]
+        with (
+            mock.patch.dict(os.environ, {"KHIPU_JOIN_PASSPHRASE": ""}),
+            mock.patch("sys.stdin", stdin),
+            mock.patch("getpass.getpass", return_value=getpass_value or "") as gp,
+            mock.patch("khipu.join.export_kit", return_value=b"kit") as export,
+            mock.patch("khipu.join.write_kit_file", side_effect=lambda p, b: p),
+            mock.patch("khipu.join.decrypt_payload", return_value={"expected": {}}),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = cli.main(argv)
+        return rc, buf.getvalue(), export, gp
+
+    def test_literal_passphrase_argument_is_refused_and_steers_to_safe_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "kit.khipujoin")
+            rc, stdout, export, _ = self._run(["join", "export", "--out", out, "--passphrase", "s3cret"])
+        self.assertEqual(rc, 2)
+        body = json.loads(stdout)
+        self.assertIn("visible to other processes", body["error"])
+        self.assertIn("KHIPU_JOIN_PASSPHRASE", body["error"])
+        self.assertNotIn("s3cret", stdout)
+        export.assert_not_called()
+
+    def test_passphrase_stdin_reads_one_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "kit.khipujoin")
+            rc, stdout, export, _ = self._run(
+                ["join", "export", "--out", out, "--passphrase-stdin"], stdin_text="from stdin\nextra\n"
+            )
+        self.assertEqual(rc, 0)
+        export.assert_called_once_with("from stdin", allow_unencrypted=False)
+        self.assertNotIn("from stdin", stdout)
+
+    def test_passphrase_fd_reads_from_the_descriptor(self) -> None:
+        r, w = os.pipe()
+        os.write(w, b"from fd\n")
+        os.close(w)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = str(Path(tmp) / "kit.khipujoin")
+                rc, _, export, _ = self._run(["join", "export", "--out", out, "--passphrase-fd", str(r)])
+        finally:
+            try:
+                os.close(r)
+            except OSError:
+                pass
+        self.assertEqual(rc, 0)
+        export.assert_called_once_with("from fd", allow_unencrypted=False)
+
+    def test_interactive_export_prompts_for_the_passphrase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "kit.khipujoin")
+            rc, _, export, gp = self._run(
+                ["join", "export", "--out", out], tty=True, getpass_value="typed"
+            )
+        self.assertEqual(rc, 0)
+        gp.assert_called()
+        export.assert_called_once_with("typed", allow_unencrypted=False)
+
+
 class LocalhostRefuseTest(unittest.TestCase):
     def test_is_localhost_dsn(self) -> None:
         for dsn in (

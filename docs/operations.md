@@ -168,7 +168,7 @@ khipu graph-backup drill          # restore into scratch; never touches the live
 - `graph_backup_ok` is red when the latest local snapshot is missing, empty or older than 36 hours.
 - `graph_offsite_ok` is red when no `r2:` rclone remote is configured, no successful offsite copy is recorded, or the last copy is more than 8 days old. The graph job runs the offsite copy when it is due (every 7 days), and recording a local snapshot on the producer starts a drill when the last good one is more than 8 days old.
 
-You need `rclone` installed and a remote named `r2` for the offsite part. The copy goes to the `graph_backup_remote` setting, an rclone `remote:path` (default `r2:khipu-backups/khipu-graph`). Set it in Settings, Data & backups, or with `khipu config --set graph_backup_remote r2:bucket/folder`; the environment variable `KHIPU_GRAPH_BACKUP_REMOTE` overrides both.
+You need `rclone` installed and a remote named `r2` for the offsite part. The copy goes to the `graph_backup_remote` setting, an rclone `remote:path` (default `r2:khipu-backups/khipu-graph`). It must name a remote: a local path or a value starting with a dash is refused wherever it is set, and the offsite check reports it. Set it in Settings, Data & backups, or with `khipu config --set graph_backup_remote r2:bucket/folder`; the environment variable `KHIPU_GRAPH_BACKUP_REMOTE` overrides both.
 
 ## Snapshots, the offline copy
 
@@ -217,14 +217,14 @@ A second Mac uses the same database. You give it a join kit.
 On the working Mac:
 
 - App: Settings, Another Mac, "Set up another Mac", type a passphrase, then "Save join kit…". Save and "Advertise nearby (PIN)" stay disabled until a passphrase is typed or "I understand: make it unencrypted" is ticked. Both are disabled if the database lives only on this Mac (this-mac or local Docker), because another Mac could not reach it.
-- CLI: `khipu join export --out FILE.khipujoin --passphrase ...` (or `KHIPU_JOIN_PASSPHRASE`). Without a passphrase it refuses unless `--allow-unencrypted` is passed.
+- CLI: `khipu join export --out FILE.khipujoin`, with the passphrase from `KHIPU_JOIN_PASSPHRASE`, `--passphrase-stdin`, `--passphrase-fd N` or the terminal prompt. A literal `--passphrase VALUE` is refused because other processes can read it. Without a passphrase it refuses unless `--allow-unencrypted` is passed.
 
 On the new Mac:
 
 - App: Welcome, Database, "Join a Khipu I already have", then "Import join kit file…". "Find nearby Mac" uses the PIN path.
-- CLI: `khipu join import --file FILE.khipujoin [--passphrase ...]`.
+- CLI: `khipu join import --file FILE.khipujoin`, with the passphrase supplied the same way when the kit is encrypted.
 
-Nearby pairing without a file: on the working Mac `khipu join advertise --passphrase ... [--pin ...]` (same passphrase rule as export) (Bonjour on the local network, TLS, 10 minutes by default); on the new Mac `khipu join receive --pin PIN`.
+Nearby pairing without a file: on the working Mac `khipu join advertise [--pin ...]` (same passphrase rule and input as export) (Bonjour on the local network, TLS, 10 minutes by default); on the new Mac `khipu join receive --pin PIN`.
 
 Notes:
 
