@@ -435,55 +435,72 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
             out["error"] = f"source registry unreadable or malformed: {exc}"
             return out
 
-    sqlite_nodes, sqlite_edges = _read_sqlite(path)
-    s_node_rows = {
-        row[0]: {
-            "id": row[0], "type": row[1], "bucket": row[2], "name": row[3],
-            "payload": row[4], "source_path": row[5], "built_at": row[6],
-            "frozen": row[7],
+    def _pg_nodes() -> tuple[list[dict[str, Any]], int]:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT n.id, n.type, n.bucket, n.name, n.payload, n.source_path, "
+                    f"n.built_at, n.frozen, n.source_id FROM nodes n "
+                    f"WHERE NOT {KHIPU_OWNED_NODE_SQL}"
+                )
+                rows = [
+                    {
+                        "id": r[0],
+                        "type": r[1],
+                        "bucket": r[2],
+                        "name": r[3],
+                        "payload": r[4],
+                        "source_path": r[5],
+                        "built_at": r[6],
+                        "frozen": r[7],
+                        "source_id": r[8],
+                    }
+                    for r in cur.fetchall()
+                ]
+                cur.execute(f"SELECT COUNT(*) FROM nodes n WHERE {KHIPU_OWNED_NODE_SQL}")
+                return rows, cur.fetchone()[0]
+
+    def _pg_edges() -> dict[tuple, tuple]:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT e.src, e.dst, e.type, e.weight, e.payload, e.built_at FROM edges e
+                    WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = e.src AND {KHIPU_OWNED_NODE_SQL})
+                      AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = e.dst AND {KHIPU_OWNED_NODE_SQL})
+                    """
+                )
+                return {(r[0], r[1], r[2]): r for r in cur.fetchall()}
+
+    # The hub's graphify nodes and edges (~42 MB) come down on two connections
+    # at once while graph.sqlite is read here: one connection's throughput was
+    # the limit (nodes then edges took 7-10 s, together about 4). Each query
+    # was its own statement, with its own snapshot, before too.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="khipu-graph-drift") as ex:
+        nodes_future = ex.submit(_pg_nodes)
+        edges_future = ex.submit(_pg_edges)
+        sqlite_nodes, sqlite_edges = _read_sqlite(path)
+        s_node_rows = {
+            row[0]: {
+                "id": row[0], "type": row[1], "bucket": row[2], "name": row[3],
+                "payload": row[4], "source_path": row[5], "built_at": row[6],
+                "frozen": row[7],
+            }
+            for row in sqlite_nodes
         }
-        for row in sqlite_nodes
-    }
-    s_edge_rows = {(r[0], r[1], r[2]): r for r in sqlite_edges}
-    s_nodes = set(s_node_rows)
-    s_edges = set(s_edge_rows)
-    membership_off = disabled_or_unreachable_ids()
-    sources_doc = load_sources()
-    owned = owned_source_ids(sources_doc)
-    producer = is_graph_producer()
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT n.id, n.type, n.bucket, n.name, n.payload, n.source_path, "
-                f"n.built_at, n.frozen, n.source_id FROM nodes n "
-                f"WHERE NOT {KHIPU_OWNED_NODE_SQL}"
-            )
-            pg_node_rows = [
-                {
-                    "id": r[0],
-                    "type": r[1],
-                    "bucket": r[2],
-                    "name": r[3],
-                    "payload": r[4],
-                    "source_path": r[5],
-                    "built_at": r[6],
-                    "frozen": r[7],
-                    "source_id": r[8],
-                }
-                for r in cur.fetchall()
-            ]
-            p_nodes = {r["id"] for r in pg_node_rows}
-            cur.execute(f"SELECT COUNT(*) FROM nodes n WHERE {KHIPU_OWNED_NODE_SQL}")
-            khipu_nodes = cur.fetchone()[0]
-            cur.execute(
-                f"""
-                SELECT e.src, e.dst, e.type, e.weight, e.payload, e.built_at FROM edges e
-                WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = e.src AND {KHIPU_OWNED_NODE_SQL})
-                  AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = e.dst AND {KHIPU_OWNED_NODE_SQL})
-                """
-            )
-            pg_edge_rows = {(r[0], r[1], r[2]): r for r in cur.fetchall()}
-            p_edges = set(pg_edge_rows)
+        s_edge_rows = {(r[0], r[1], r[2]): r for r in sqlite_edges}
+        s_nodes = set(s_node_rows)
+        s_edges = set(s_edge_rows)
+        membership_off = disabled_or_unreachable_ids()
+        sources_doc = load_sources()
+        owned = owned_source_ids(sources_doc)
+        producer = is_graph_producer()
+        pg_node_rows, khipu_nodes = nodes_future.result()
+        pg_edge_rows = edges_future.result()
+    p_nodes = {r["id"] for r in pg_node_rows}
+    p_edges = set(pg_edge_rows)
     missing_nodes = sorted(s_nodes - p_nodes)
     extra_node_ids = sorted(p_nodes - s_nodes)
     extra_node_rows = [r for r in pg_node_rows if r["id"] in set(extra_node_ids)]

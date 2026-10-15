@@ -406,12 +406,12 @@ class GraphDriftContentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             p = self._sqlite(Path(td))
             common = [mock.patch.object(graph_sync, "is_graph_producer", return_value=True), mock.patch.object(graph_sync, "disabled_or_unreachable_ids", return_value=set()), mock.patch.object(graph_sync, "load_sources", return_value={"sources": [{"id":"code:test", "enabled":True}]}), mock.patch.object(graph_sync, "owned_source_ids", return_value={"code:test"}), mock.patch.object(graph_sync, "_changed_since_last_mirror", return_value=False)]
-            with common[0], common[1], common[2], common[3], common[4], mock.patch("khipu.db.connect", return_value=self._Conn(self._Cur())):
+            with common[0], common[1], common[2], common[3], common[4], mock.patch("khipu.db.connect", side_effect=lambda **_kw: self._Conn(self._Cur())):
                 drifted = graph_sync.graph_drift(p)
             self.assertFalse(drifted["ok"], drifted)
             self.assertEqual(drifted["nodes_content_drift"], 1)
             self.assertEqual(drifted["edges_content_drift"], 1)
-            with mock.patch.object(graph_sync, "is_graph_producer", return_value=True), mock.patch.object(graph_sync, "disabled_or_unreachable_ids", return_value=set()), mock.patch.object(graph_sync, "load_sources", return_value={"sources": []}), mock.patch.object(graph_sync, "owned_source_ids", return_value=set()), mock.patch.object(graph_sync, "_changed_since_last_mirror", return_value=False), mock.patch("khipu.db.connect", return_value=self._Conn(self._Cur(payload='{"a": 1}', weight=1.0, source_id=None))):
+            with mock.patch.object(graph_sync, "is_graph_producer", return_value=True), mock.patch.object(graph_sync, "disabled_or_unreachable_ids", return_value=set()), mock.patch.object(graph_sync, "load_sources", return_value={"sources": []}), mock.patch.object(graph_sync, "owned_source_ids", return_value=set()), mock.patch.object(graph_sync, "_changed_since_last_mirror", return_value=False), mock.patch("khipu.db.connect", side_effect=lambda **_kw: self._Conn(self._Cur(payload='{"a": 1}', weight=1.0, source_id=None))):
                 clean = graph_sync.graph_drift(p)
             self.assertTrue(clean["ok"], clean)
 

@@ -466,6 +466,104 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if getattr(args, "quick", False):
         return _cmd_doctor_quick(args)
     from khipu.drift import backup_health, sample_drift, status_payload
+
+    mem = Path(args.memory_root) if args.memory_root else None
+    # The three checks that wait longest on the hub (file-vs-hub drift, the
+    # graph mirror's drift, embedding coverage with its topic lag) and the
+    # checks that read only this Mac run in worker threads, the hub ones on
+    # their own connections, while the rest of doctor goes on; each answer is
+    # what it was when they ran one after another (58 s end to end on
+    # 2026-10-15, most of it waiting on the network).
+    from concurrent.futures import ThreadPoolExecutor
+
+    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="khipu-doctor")
+    try:
+        workers = _doctor_start_workers(pool, args, mem, sample_drift)
+        return _cmd_doctor_body(args, workers, mem, status_payload, backup_health)
+    finally:
+        pool.shutdown(wait=True)
+
+
+def _doctor_sample_drift(sample_drift, mem: Path, sample) -> dict:
+    # Every other check is wrapped; this one was not, so a single unreadable
+    # topic file aborted the entire health report with a traceback instead of
+    # reporting red (audit 2026-08-17).
+    try:
+        return sample_drift(mem, sample=sample)
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        return {
+            "error": f"{type(e).__name__}: {e}",
+            "episodes_missing_in_pg": -1,
+            "topic_mismatches": [],
+            "topic_files_unreadable": [],
+        }
+
+
+def _doctor_graph_drift() -> dict:
+    try:
+        from khipu.graph_sync import graph_drift
+
+        return graph_drift()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _doctor_embed_checks() -> tuple[dict, bool, dict]:
+    """``(embed_coverage, embed_coverage_ok, topics_lag)``, in that order on
+    one thread: the lag reuses the gaps coverage kept."""
+    memory_gaps_kept: dict = {}
+    try:
+        from khipu.embed import coverage
+
+        # The chunk plan is built from this Mac's fingerprint cache (the same
+        # answer as re-reading every row's text: only rows whose version moved
+        # are re-read) and kept for topics_embed_lag below, so one doctor run
+        # plans the memory space once instead of reading ~28 MB of text twice.
+        embed_coverage = coverage(detail=True, cached_plan=True, keep_gaps=memory_gaps_kept)
+        embed_coverage_ok = (
+            embed_coverage.get("episodes", {}).get("missing", 0) == 0
+            and embed_coverage.get("topics", {}).get("missing", 0) == 0
+            and embed_coverage.get("missing", 0) == 0
+            and embed_coverage.get("stale", 0) == 0
+        )
+    except Exception as e:  # noqa: BLE001
+        embed_coverage = {"error": f"{type(e).__name__}: {e}"}
+        embed_coverage_ok = False
+    # D6/F2/F4: topic-embedding lag and the search-degrade rate — both were
+    # buried keys nothing aggregated before this (audit 2026-08-17 class).
+    try:
+        from khipu.embed import topics_embed_lag_minutes
+
+        topics_lag = topics_embed_lag_minutes(gaps=memory_gaps_kept)
+    except Exception as e:  # noqa: BLE001
+        topics_lag = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return embed_coverage, embed_coverage_ok, topics_lag
+
+
+def _doctor_start_workers(pool, args, mem, sample_drift) -> dict:
+    workers: dict = {
+        "drift": pool.submit(_doctor_sample_drift, sample_drift, mem, args.sample)
+        if mem is not None else None,
+        "graph": None,
+        "graph_configured": None,
+        "graph_error": None,
+    }
+    try:
+        from khipu.config import path_setting
+
+        workers["graph_configured"] = path_setting("graph_sqlite") is not None
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        workers["graph_error"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    if workers["graph_configured"]:
+        workers["graph"] = pool.submit(_doctor_graph_drift)
+    workers["embed"] = pool.submit(_doctor_embed_checks)
+    # Every check that reads only this Mac; `doctor --quick` gates on the same
+    # set (khipu.promote's first gate step).
+    workers["local"] = pool.submit(_doctor_local_checks, mem)
+    return workers
+
+
+def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     from khipu.hub_snapshot import (
         hub_connection_failed,
         snapshot_freshness,
@@ -473,7 +571,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         status_payload_snapshot,
     )
 
-    mem = Path(args.memory_root) if args.memory_root else None
+    drift_future, graph_future, embed_future, local_future = (
+        workers["drift"], workers["graph"], workers["embed"], workers["local"])
+    graph_configured, graph_error = workers["graph_configured"], workers["graph_error"]
     hub_ok = True
     try:
         status = status_payload(None)
@@ -497,9 +597,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # and from green (checked and clean). A fresh install has no legacy file
     # wiki, so drift against it is inapplicable, not passing.
     not_configured: list[str] = []
-    # Every other check below is wrapped; this one was not, so a single
-    # unreadable topic file aborted the entire health report with a traceback
-    # instead of reporting red (audit 2026-08-17).
     if mem is None:
         not_configured.append("memory_root")
         drift = {
@@ -508,80 +605,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "topic_mismatches": [],
             "topic_files_unreadable": [],
         }
-    else:
-        try:
-            drift = sample_drift(mem, sample=args.sample)
-        except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
-            drift = {
-                "error": f"{type(e).__name__}: {e}",
-                "episodes_missing_in_pg": -1,
-                "topic_mismatches": [],
-                "topic_files_unreadable": [],
-            }
     backup = backup_health()
-    # Every check that reads only this Mac; `doctor --quick` gates on the same
-    # set (khipu.promote's first gate step).
-    local = _doctor_local_checks(mem)
-    not_configured.extend(local.pop("not_configured"))
     try:
         from khipu import graph_backup
 
         _graph_offsite = graph_backup.offsite_health()
     except Exception as e:  # noqa: BLE001
         _graph_offsite = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    _graph_backup = local["graph_backup"]
-    liveness = local["capture_liveness"]
-    (outbox, outbox_ok, git_sync, secrets, dsn_file_ok, synth_provider, synth_provider_ok, jobs,
-     known_job_failures, jobs_ok, index_fresh, index_freshness_ok, synth_budget, synth_budget_ok,
-     prompt_recall_snapshot, prompt_recall_outcomes_block, recall_daemon_block, bundle_seal_block,
-     nightly_steps, degraded_rate, launchers) = (local[k] for k in (
-        "outbox", "outbox_ok", "git_sync", "secrets", "dsn_file_ok", "synth_provider",
-        "synth_provider_ok", "jobs", "job_failures", "jobs_ok", "index_freshness",
-        "index_freshness_ok", "synth_budget", "synth_budget_ok", "prompt_recall_snapshot",
-        "prompt_recall_outcomes", "recall_daemon", "bundle_seal", "nightly_steps", "degraded_rate",
-        "launchers"))
-    # P2b gate: directional. Every file episode must exist in PG by identity
-    # (ts, md5(summary)); PG holding MORE than the file is healthy (hub writes,
-    # archived episodes survive the upsert-only reconcile), so the old
-    # count-delta tolerance is gone — it could not fail once PG ⊃ file.
-    drift_ok = (
-        drift.get("episodes_missing_in_pg") == 0
-        and len(drift.get("topic_mismatches") or []) == 0
-        # A topic we could not read is a topic we did not check; unchecked is
-        # not the same as clean.
-        and not drift.get("topic_files_unreadable")
-        and not drift.get("error")
-    )
-    # Graph: graphify's graph.sqlite vs PG's graphify-owned rows, both
-    # directions (audit 2026-08-17 — PG had silently diverged for two weeks
-    # while doctor stayed green because it only looked at episodes/topics).
-    # A CONFIGURED-but-missing graph.sqlite is a red result, not a skip: that
-    # machine is supposed to be able to see the graph's source. An UNCONFIGURED
-    # one is skipped and named.
-    try:
-        from khipu.config import path_setting
-        from khipu.graph_sync import graph_drift
-
-        if path_setting("graph_sqlite") is None:
-            not_configured.append("graph_sqlite")
-            graph = {"ok": True, "skipped": "graph_sqlite not configured"}
-        else:
-            graph = graph_drift()
-    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
-        graph = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    try:
-        from khipu.embed import coverage
-
-        embed_coverage = coverage(detail=True)
-        embed_coverage_ok = (
-            embed_coverage.get("episodes", {}).get("missing", 0) == 0
-            and embed_coverage.get("topics", {}).get("missing", 0) == 0
-            and embed_coverage.get("missing", 0) == 0
-            and embed_coverage.get("stale", 0) == 0
-        )
-    except Exception as e:  # noqa: BLE001
-        embed_coverage = {"error": f"{type(e).__name__}: {e}"}
-        embed_coverage_ok = False
+    # --probe captures to the hub and then searches for it, so the hub checks
+    # finish first, as they did when everything ran in order: a probe row
+    # must never show up in their answers.
+    if getattr(args, "probe", False):
+        for fut in (drift_future, graph_future, embed_future):
+            if fut is not None:
+                fut.exception()
     # Informational: per-library coverage and profile, beside embed coverage.
     # Never gates status (a library mid-backfill is not a broken hub).
     try:
@@ -644,14 +681,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         notes_organise = organise.last_run()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         notes_organise = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    # D6/F2/F4: topic-embedding lag and the search-degrade rate — both were
-    # buried keys nothing aggregated before this (audit 2026-08-17 class).
-    try:
-        from khipu.embed import topics_embed_lag_minutes
-
-        topics_lag = topics_embed_lag_minutes()
-    except Exception as e:  # noqa: BLE001
-        topics_lag = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # K9: gateway per-token liveness, read over the network from the
     # deployed gateway's own /healthz (never deployed by doctor itself).
     # Applicable only when a gateway_url is configured.
@@ -661,10 +690,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         gw_liveness = gateway_liveness_check()
     except Exception as e:  # noqa: BLE001
         gw_liveness = {"ok": False, "applicable": True, "error": f"{type(e).__name__}: {e}"}
-    liveness.setdefault("harnesses", {})["gateway"] = gw_liveness
-    if not gw_liveness.get("ok", True):
-        liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "gateway"]))
-        liveness["ok"] = False
     # Aegis-specific gateway round trip, same K9 evidence-must-arrive discipline
     # but keyed on the bearer AEGIS ITSELF resolves (env or the on-disk token
     # file, never Keychain — its sandbox cannot reach it). Folded into the
@@ -679,13 +704,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         aegis_gw = aegis_gateway_check()
     except Exception as e:  # noqa: BLE001
         aegis_gw = {"ok": False, "applicable": True, "error": f"{type(e).__name__}: {e}"}
-    if aegis_gw.get("applicable"):
-        aegis_row = liveness.setdefault("harnesses", {}).setdefault("aegis", {"harness": "aegis", "ok": True})
-        aegis_row["gateway"] = aegis_gw
-        if not aegis_gw.get("ok", True):
-            aegis_row["ok"] = False
-            liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "aegis"]))
-            liveness["ok"] = False
     # K8: a heartbeat file under the dispatch dir from a harness Khipu does
     # not recognise — a warning (never a hard red: the hook that wrote it may
     # still be working fine, it is just unidentified).
@@ -728,6 +746,60 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         decision_links_block = _decisions.candidate_link_count()
     except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
         decision_links_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # The worker threads' answers, joined in the order their not_configured
+    # names and liveness rows used to be added.
+    local = local_future.result()
+    not_configured.extend(local.pop("not_configured"))
+    _graph_backup = local["graph_backup"]
+    liveness = local["capture_liveness"]
+    (outbox, outbox_ok, git_sync, secrets, dsn_file_ok, synth_provider, synth_provider_ok, jobs,
+     known_job_failures, jobs_ok, index_fresh, index_freshness_ok, synth_budget, synth_budget_ok,
+     prompt_recall_snapshot, prompt_recall_outcomes_block, recall_daemon_block, bundle_seal_block,
+     nightly_steps, degraded_rate, launchers) = (local[k] for k in (
+        "outbox", "outbox_ok", "git_sync", "secrets", "dsn_file_ok", "synth_provider",
+        "synth_provider_ok", "jobs", "job_failures", "jobs_ok", "index_freshness",
+        "index_freshness_ok", "synth_budget", "synth_budget_ok", "prompt_recall_snapshot",
+        "prompt_recall_outcomes", "recall_daemon", "bundle_seal", "nightly_steps", "degraded_rate",
+        "launchers"))
+    if drift_future is not None:
+        drift = drift_future.result()
+    # P2b gate: directional. Every file episode must exist in PG by identity
+    # (ts, md5(summary)); PG holding MORE than the file is healthy (hub writes,
+    # archived episodes survive the upsert-only reconcile), so the old
+    # count-delta tolerance is gone — it could not fail once PG ⊃ file.
+    drift_ok = (
+        drift.get("episodes_missing_in_pg") == 0
+        and len(drift.get("topic_mismatches") or []) == 0
+        # A topic we could not read is a topic we did not check; unchecked is
+        # not the same as clean.
+        and not drift.get("topic_files_unreadable")
+        and not drift.get("error")
+    )
+    # Graph: graphify's graph.sqlite vs PG's graphify-owned rows, both
+    # directions (audit 2026-08-17 — PG had silently diverged for two weeks
+    # while doctor stayed green because it only looked at episodes/topics).
+    # A CONFIGURED-but-missing graph.sqlite is a red result, not a skip: that
+    # machine is supposed to be able to see the graph's source. An UNCONFIGURED
+    # one is skipped and named.
+    if graph_configured is False:
+        not_configured.append("graph_sqlite")
+        graph = {"ok": True, "skipped": "graph_sqlite not configured"}
+    elif graph_future is not None:
+        graph = graph_future.result()
+    else:
+        graph = graph_error
+    embed_coverage, embed_coverage_ok, topics_lag = embed_future.result()
+    liveness.setdefault("harnesses", {})["gateway"] = gw_liveness
+    if not gw_liveness.get("ok", True):
+        liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "gateway"]))
+        liveness["ok"] = False
+    if aegis_gw.get("applicable"):
+        aegis_row = liveness.setdefault("harnesses", {}).setdefault("aegis", {"harness": "aegis", "ok": True})
+        aegis_row["gateway"] = aegis_gw
+        if not aegis_gw.get("ok", True):
+            aegis_row["ok"] = False
+            liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "aegis"]))
+            liveness["ok"] = False
     # Plan usage (docs/plans/2026-10-14-plan-usage.md, phase 2): each account's
     # tightest window still in force, read from the usage cache only (no CLI
     # is probed, nothing waits), and one warning per window at 90% or more.
