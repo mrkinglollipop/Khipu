@@ -340,7 +340,10 @@ The push has two shapes.
   `khipu route`", and doctor warns. The rules and the note are never cut whatever their length; doctor warns
   when together they pass 1,500 characters so Matt can shorten them. On a Mac with no routing sources the
   account lines are replaced by "No routing record on this Mac." When `folded_at` is older than 5 minutes (a
-  setting), a line says "Khipu's record has not been refreshed since HH:MMZ."
+  setting), a line says "Khipu's record has not been refreshed since HH:MMZ." Claude Code keeps a hook's
+  text whole only up to 10,000 characters, so at session start whole lines of the memory slice are dropped
+  from its bottom to make room; a summary that still does not fit is left out whole, is not recorded as
+  delivered, and arrives with a later push.
 - **What changed since this conversation last saw the record**, on every prompt. Khipu takes every entity
   that changed between the session's last-seen version and the current one (an account, a hold, a rule, the
   note) and sends its **current** state, one line each; a line another version has since replaced is never
@@ -372,8 +375,8 @@ The per-prompt part follows these rules.
   characters, and the cap applies to those lines only: rules and the note are never clipped or capped, in
   either shape. Only Khipu-written lines appear. From conversations only structured values are pushed:
   account, state, until, scope, basis, a hold's scope and reason, and the author Khipu set. A conversation's
-  own words (a hold's text, its evidence line, the name it gives itself) are shown only in `khipu_route`
-  results and in the app. A hold's words are pushed only when Matt wrote them. File prose is never pushed.
+  own words (a hold's text, its evidence line, the name it gives itself, and its project, which is its
+  folder's name) are shown only in `khipu_route` results and in the app; a push names only its harness. A hold's words are pushed only when Matt wrote them. File prose is never pushed.
 - **Switches.** The `routing_push` feature (added to the closed `features.FEATURES` set; off by default in
   the public product; one setting, shown in Optional features and at the top of Settings → Routing) turns
   all of it on or off. Under it, one setting per moment: at session start and after compaction

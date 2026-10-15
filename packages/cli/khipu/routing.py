@@ -924,8 +924,11 @@ OWNER = {"kind": "owner"}
 
 def author_words(by: dict | None, *, push: bool = True) -> str:
     """'a Claude Code conversation in khipu', 'you', 'Khipu usage probe'...
-    With ``push`` only what Khipu set is used: never the name a conversation
-    gives itself, and no session id."""
+    With ``push`` only what Khipu set from a fixed list is used: the
+    harness's words. The project, the session id and the name a conversation
+    gives itself are left out, because each is text the writer chose (its
+    folder's name, its environment, its own words), and a push reaches every
+    other conversation (decision 17). ``khipu_route`` and the app show them."""
     by = by or {}
     kind = by.get("kind")
     if kind == "owner":
@@ -947,15 +950,16 @@ def author_words(by: dict | None, *, push: bool = True) -> str:
         words = f"a {HARNESS_WORDS[harness]} conversation"
     else:  # never the stored text: it came from the writer's environment
         words = "a conversation from an unknown harness"
+    if push:
+        return words
     # The project and the session come from the writer's folder and
     # environment, so they are shown as a conversation's words are.
     if by.get("project"):
         words += f" in {their_words(by['project'])}"
-    if not push:
-        if by.get("session"):
-            words += f" (session {their_words(str(by['session'])[:8])})"
-        if by.get("name"):
-            words += f", which calls itself “{their_words(by['name'])}”"
+    if by.get("session"):
+        words += f" (session {their_words(str(by['session'])[:8])})"
+    if by.get("name"):
+        words += f", which calls itself “{their_words(by['name'])}”"
     return words
 
 
@@ -978,6 +982,24 @@ def view_file() -> Path:
 
 _held = threading.local()
 _LOCK_POLL = 0.05
+
+
+def finishing_view() -> bool:
+    """Whether this thread is folding a view it means to save, outside the
+    routing lock, or saving it (``_start_view``). The session-start child
+    runs on past its deadline only while this is true; it never holds the
+    lock while it folds."""
+    return bool(getattr(_held, "finishing", False))
+
+
+@contextlib.contextmanager
+def _finishing():
+    before = getattr(_held, "finishing", False)
+    _held.finishing = True
+    try:
+        yield
+    finally:
+        _held.finishing = before
 
 
 class LockBusy(OSError):
@@ -2022,15 +2044,59 @@ def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
         fingerprint = dict(fingerprint, events=_stat(events_file()))
         events, bad = read_events()
     prev = _load_view()
-    now = _not_before_last_fold(now, prev)
-    extra, status, cache = _sources(cfg, now, prev)
-    body = fold(events, now=now, cfg=cfg, known=known, extra=extra, sources=status)
+    now, body, status = _fold_body(now, cfg, known, events, prev)
     body["seed_error"] = seed_error
-    body["source_cache"] = cache
     view = _assemble(prev, body, now, bad, fingerprint,
                      record=fingerprint["events"] is not None or status is not None)
     _save_view(view)
     return view
+
+
+def _fold_body(now: datetime, cfg: dict, known: list[dict], events: list[dict],
+               prev: dict | None) -> tuple[datetime, dict, dict | None]:
+    """(the fold's clock, the folded body, the sources' status): the fold
+    itself, which reads and never writes."""
+    now = _not_before_last_fold(now, prev)
+    extra, status, cache = _sources(cfg, now, prev)
+    body = fold(events, now=now, cfg=cfg, known=known, extra=extra, sources=status)
+    body["source_cache"] = cache
+    return now, body, status
+
+
+def _start_view(now: datetime) -> dict:
+    """``read_view`` for the session-start child, whose fold may run on
+    after the hook has returned. The fold runs outside the routing lock; the
+    lock is taken, within this thread's ``lock_budget``, only to save the
+    view, and only when no input and no saved view changed meanwhile.
+    Otherwise the fold is answered unsaved. So a long fold never keeps a
+    conversation's write waiting. A rules seed that is due goes through
+    ``read_view``: importing it writes the log, under the lock."""
+    inputs = _inputs()
+    fingerprint, cfg, known = inputs
+    prev = _load_view()
+    if _fresh(prev, fingerprint, now):
+        return dict(prev, checked_at=_iso(now))
+    from khipu import routing_sources
+
+    if fingerprint["events"] is None and not cfg.get("routing_rules_seed") \
+            and not routing_sources.any_configured(cfg["_raw_sources"], cfg):
+        return read_view(now)  # no record: nothing to fold or save, and no lock
+    events, bad = read_events()
+    if cfg.get("routing_rules_seed") and not any(e.get("type") == "seed_import" for e in events):
+        return read_view(now)
+    with _finishing():
+        fold_now, body, status = _fold_body(now, cfg, known, events, prev)
+        body["seed_error"] = None
+        record = fingerprint["events"] is not None or status is not None
+        try:
+            with _lock():
+                if _inputs()[0] == fingerprint and (_load_view() or {}).get("digest") == (prev or {}).get("digest"):
+                    view = _assemble(prev, body, fold_now, bad, fingerprint, record=record)
+                    _save_view(view)
+                    return view
+        except OSError:
+            pass  # busy, or a read-only data dir: the answer, unsaved
+    return _assemble(prev, body, fold_now, bad, fingerprint, record=record, saved=False)
 
 
 def _unsaved_view(now: datetime) -> dict:
@@ -3208,16 +3274,18 @@ def _conversation_write(args: dict, *, author: dict, now: datetime | None = None
     return end_hold(hold_id, owner=False, author=by, via="mcp", now=now)
 
 
-def light_status(now: datetime | None = None, *, lock_wait: float = LIGHT_LOCK_BUDGET) -> dict:
+def light_status(now: datetime | None = None, *, lock_wait: float = LIGHT_LOCK_BUDGET,
+                 start: bool = False) -> dict:
     """The ``routing`` field of ``khipu_status``'s light payload: the summary
     a conversation gets at its start (``khipu route --summary``), for a
     harness with no hooks, and the text the session-start hook pushes
     (``start_push``). It waits for the routing lock only ``lock_wait``
     (``LIGHT_LOCK_BUDGET``, well inside the time khipu_status gives it), so
-    a held lock still answers, from an unsaved fold."""
+    a held lock still answers, from an unsaved fold. With ``start`` the
+    view is read as the session-start child reads it (``_start_view``)."""
     with lock_budget(lock_wait):
         now = now or _now()
-        view = read_view(now)
+        view = _start_view(now) if start else read_view(now)
         out = summary(view, now=now)
     # The summary is the push: built from labels and names, with the
     # owner's own words whole; it holds no key and no configured path.
@@ -3267,13 +3335,14 @@ def start_budget() -> float:
 
 def start_push(budget: float | None = None) -> dict | None:
     """The full summary for the session-start hook, or None when the push is
-    off. Waits for the routing lock at most half of ``budget`` (then answers
-    from an unsaved fold, as ``light_status`` does). The hook bounds the
+    off. Folds outside the routing lock and waits for it, to save the view,
+    at most half of ``budget`` (then answers from an unsaved fold, as
+    ``light_status`` does). The hook bounds the
     whole call and treats any exception as nothing to push."""
     if push_off("start"):
         return None
     budget = start_budget() if budget is None else budget
-    return light_status(lock_wait=budget / 2)
+    return light_status(lock_wait=budget / 2, start=True)
 
 
 # ---- khipu route wait --------------------------------------------------------------------

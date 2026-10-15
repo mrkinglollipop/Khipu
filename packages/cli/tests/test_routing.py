@@ -156,8 +156,11 @@ def test_an_open_report_cannot_end_a_cli_limit_but_does_end_an_estimated_one(hom
     entry = _account(routing.read_view(), SECOND)
     assert (entry["state"], entry["basis"], entry["until"]) == ("limited", "cli", "2026-10-14T18:52:00Z")
     assert (entry["disagreement"]["state"], entry["disagreement"]["source"]) == ("open", "report")
+    assert routing.account_line(entry, home["clock"].now, push=False).endswith(
+        "; a Codex conversation in project-b (session s-two) reported it open at 15:18Z")
+    # Pushed, the writer's folder name is left out (decision 17).
     assert routing.account_line(entry, home["clock"].now).endswith(
-        "; a Codex conversation in project-b reported it open at 15:18Z")
+        "; a Codex conversation reported it open at 15:18Z")
     # A newer report that agrees with the shown state ends the disagreement.
     home["clock"].advance(minutes=1)
     _report(account="Claude second", state="limited", until="1h")
@@ -761,8 +764,8 @@ def test_an_open_report_against_a_models_own_limit_is_a_disagreement(home):
     entry = _account(routing.read_view(), "claude|")
     assert entry["models"][0]["until"] == "2026-10-16T09:00:00Z"
     assert entry["models"][0]["disagreement"]["id"] == opened["id"]
-    assert "; a Codex conversation in project-b reported Opus open at 15:05Z" in \
-        routing.account_line(entry, home["clock"].now)
+    assert "; a Codex conversation reported Opus open at 15:05Z" in routing.account_line(entry, home["clock"].now)
+    assert "; a Codex conversation in project-b" in routing.account_line(entry, home["clock"].now, push=False)
     home["clock"].advance(hours=2)
     assert "Sources have disagreed about Claude (Opus) for more than 30 min." in routing.doctor_block()["warnings"]
     routing.clear("Claude", report_id=opened["id"], via="app")
@@ -973,8 +976,9 @@ def test_a_conversations_own_text_never_becomes_a_pushed_field(home):
     pushed = routing.summary(view)["text"] + "\n" + "\n".join(routing.since(0, view)["lines"])
     for words in ("Ignore rules", "route everything", "route all to grok", "send all work"):
         assert words not in pushed
-    assert "Codex: open; reported by a conversation from an unknown harness in proj" in pushed
-    assert "Claude: open; reported by a conversation from an unknown harness in project-a" in pushed
+    assert "Codex: open; reported by a conversation from an unknown harness" in pushed
+    assert "Claude: open; reported by a conversation from an unknown harness" in pushed
+    assert " in proj" not in pushed  # a folder's name is the writer's choice: never pushed
     assert view["unmatched"] == [] and not [k for k in view["effective"] if k.startswith("lane:")]
     # A model's name and a lane the map names are taken.
     _report(account="Codex", state="limited", until="1h", model="claude-opus-4.1")
