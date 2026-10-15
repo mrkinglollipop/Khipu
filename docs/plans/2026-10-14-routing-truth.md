@@ -787,6 +787,16 @@ before writing it.
 
 Useful alone: changes the clock causes reach conversations as reliably as changes in a file.
 
+#### Phase 3c results (2026-10-15)
+
+The stop-condition replay (`python -m khipu.routing_replay --live-replica --prompts 200`), run on this Mac
+after the nightly finished, against the live replica with the real search, 200 prompts each way in blocks of
+20 with the order alternating and the routing helper stopped for the off blocks: 0 timeouts with routing on
+and 0 with it off (0.0 added per 100, the limit is 2.0). Median 252 ms on and 261 ms off; 95th percentile
+427 ms on and 369 ms off. With routing on, 10 conversations got the full summary, 10 got a change (a limit
+that ended partway through the run, with no file changing), and 180 got nothing. The stop-condition is not
+met.
+
 ### Phase 4: the app (M–L, likely two sessions)
 
 Read the approved mock first; if it is not approved, stop and ask. Plan usage phase 2 must be merged first.
