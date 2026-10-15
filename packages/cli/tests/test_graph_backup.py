@@ -132,6 +132,49 @@ class ResolveRcloneTest(unittest.TestCase):
         self.assertIn("rclone binary not found", out["reason"])
 
 
+class DestRemoteTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(
+            os.environ,
+            {"KHIPU_DATA_DIR": self.tmp.name, "KHIPU_GRAPH_BACKUP_REMOTE": ""},
+        )
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_default_is_neutral(self):
+        self.assertEqual(graph_backup.resolve_dest_remote(), "r2:khipu-backups/khipu-graph")
+        out = graph_backup.offsite_health(producer=False)
+        self.assertEqual(out["dest_remote"], "r2:khipu-backups/khipu-graph")
+
+    def test_config_override_and_unset(self):
+        from khipu.config import set_graph_backup_remote
+
+        set_graph_backup_remote("r2:my-bucket/graph/")
+        self.assertEqual(graph_backup.resolve_dest_remote(), "r2:my-bucket/graph")
+        self.assertEqual(
+            graph_backup.offsite_health(producer=False)["dest_remote"], "r2:my-bucket/graph"
+        )
+        set_graph_backup_remote(None)
+        self.assertEqual(graph_backup.resolve_dest_remote(), "r2:khipu-backups/khipu-graph")
+
+    def test_env_override_wins(self):
+        from khipu.config import set_graph_backup_remote
+
+        set_graph_backup_remote("r2:from-config/graph")
+        with mock.patch.dict(os.environ, {"KHIPU_GRAPH_BACKUP_REMOTE": "r2:from-env/g"}):
+            self.assertEqual(graph_backup.resolve_dest_remote(), "r2:from-env/g")
+
+    def test_override_without_remote_name_is_refused(self):
+        from khipu.config import set_graph_backup_remote
+
+        with self.assertRaises(ValueError):
+            set_graph_backup_remote("just-a-bucket")
+
+
 class RunOffsiteTest(unittest.TestCase):
     def test_missing_r2_remote_fails_honest(self):
         with mock.patch.object(graph_backup, "resolve_rclone", return_value="rclone"), \
@@ -175,7 +218,7 @@ class RunOffsiteTest(unittest.TestCase):
             self.assertEqual(len(copy_calls), 1)
             argv = copy_calls[0]
             self.assertEqual(argv[2], str(snap))
-            self.assertTrue(argv[3].startswith("r2:matt-db-backups/khipu-graph/"))
+            self.assertTrue(argv[3].startswith("r2:khipu-backups/khipu-graph/"))
             joined = " ".join(argv)
             self.assertNotIn(str(live.resolve()), joined)
 

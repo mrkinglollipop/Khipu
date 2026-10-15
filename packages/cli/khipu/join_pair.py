@@ -183,6 +183,7 @@ def advertise(
     port: int = DEFAULT_PORT,
     pin: str | None = None,
     on_ready: Any | None = None,
+    allow_unencrypted: bool = False,
 ) -> dict[str, Any]:
     """Export kit, advertise Bonjour, serve once over TLS. Blocks until transfer or timeout."""
     from khipu.join import export_kit
@@ -190,7 +191,7 @@ def advertise(
     pin = pin or generate_pin()
     if len(pin) != 6 or not pin.isdigit():
         raise ValueError("PIN must be exactly 6 digits")
-    kit = export_kit(passphrase)
+    kit = export_kit(passphrase, allow_unencrypted=allow_unencrypted)
     cert_dir = _self_signed_cert_dir()
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(
@@ -611,6 +612,7 @@ def advertise_join_kit(
     *,
     timeout: int = DEFAULT_TIMEOUT_S,
     pin: str | None = None,
+    allow_unencrypted: bool = False,
 ) -> dict[str, Any]:
     """CLI/Tauri entry: emit PIN on stdout, then block until transfer or timeout."""
     pin = (pin or "").strip() or generate_pin()
@@ -624,8 +626,8 @@ def advertise_join_kit(
         "ipv4": lan_ipv4(),
         "hint": (
             "On the new Mac: Join existing Khipu → enter this PIN → Find nearby Mac. "
-            "Same Wi‑Fi required. File/AirDrop works if nearby fails. Passphrase only "
-            "if you locked the kit when saving."
+            "Same Wi‑Fi required. File/AirDrop works if nearby fails. Enter the "
+            "passphrase set on this Mac, unless the kit was made unencrypted."
         ),
     }
     out = advertise(
@@ -633,6 +635,7 @@ def advertise_join_kit(
         timeout_s=timeout,
         pin=pin,
         on_ready=lambda: print(json.dumps(banner), flush=True),
+        allow_unencrypted=allow_unencrypted,
     )
     out["phase"] = "finished"
     return out

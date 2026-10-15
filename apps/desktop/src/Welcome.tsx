@@ -1067,7 +1067,7 @@ export function Welcome({
               <ol className="welcome-list muted">
                 <li>
                   Click <strong>Import join kit file…</strong> and pick that file.
-                  A passphrase is optional — only if you typed one when saving.
+                  Type the passphrase set when the kit was saved first.
                 </li>
                 <li>
                   Nearby PIN is optional (same Wi‑Fi). File import is enough to continue.
@@ -1084,7 +1084,7 @@ export function Welcome({
                 </button>
               </div>
               <p className="muted" style={{ marginTop: "0.75rem" }}>
-                Optional passphrase (only if you set one when saving the file):
+                Join kit passphrase (leave blank only for a kit saved unencrypted):
               </p>
               <div className="toolbar" style={{ width: "100%" }}>
                 <input
@@ -1094,8 +1094,8 @@ export function Welcome({
                   spellCheck={false}
                   value={joinPassphrase}
                   onChange={(e) => setJoinPassphrase(e.target.value)}
-                  placeholder="Leave blank unless the file is locked"
-                  aria-label="Optional join passphrase"
+                  placeholder="Passphrase from the working Mac"
+                  aria-label="Join kit passphrase"
                 />
               </div>
               <p className="muted" style={{ marginTop: "0.75rem" }}>

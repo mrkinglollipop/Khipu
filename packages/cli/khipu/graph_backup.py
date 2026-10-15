@@ -13,7 +13,13 @@ from pathlib import Path
 
 from khipu.drift import BACKUP_MAX_AGE_HOURS
 
-DEST_REMOTE = "r2:matt-db-backups/khipu-graph"
+
+def resolve_dest_remote() -> str:
+    """Offsite destination from config (``graph_backup_remote``)."""
+    from khipu.config import graph_backup_remote
+
+    return graph_backup_remote()
+
 
 OFFSITE_MAX_AGE_DAYS = 8
 INTEGRITY_TIMEOUT_SECONDS = 60
@@ -453,10 +459,11 @@ def record_local(*, snapshot: Path | None = None) -> dict:
 
 def run_offsite(
     *,
-    dest_remote: str = DEST_REMOTE,
+    dest_remote: str | None = None,
     keep: int = 3,
     rclone_bin: str = "rclone",
 ) -> dict:
+    dest_remote = dest_remote or resolve_dest_remote()
     resolved = resolve_rclone(rclone_bin)
     if resolved is None:
         return {
@@ -608,12 +615,13 @@ def offsite_health(
     now: datetime | None = None,
     producer: bool | None = None,
 ) -> dict:
+    dest = resolve_dest_remote()
     if not _resolve_producer(producer):
         return {
             "ok": True,
             "skipped": True,
             "reason": "not the graph producer",
-            "dest_remote": DEST_REMOTE,
+            "dest_remote": dest,
         }
 
     if not has_r2_remote():
@@ -622,9 +630,9 @@ def offsite_health(
             "skipped": False,
             "reason": (
                 "rclone remote r2: not configured on this Mac — "
-                f"offsite dest remains {DEST_REMOTE}; supply an r2 remote to enable copy"
+                f"offsite dest remains {dest}; supply an r2 remote to enable copy"
             ),
-            "dest_remote": DEST_REMOTE,
+            "dest_remote": dest,
         }
 
     now = now or _utcnow()
@@ -637,7 +645,7 @@ def offsite_health(
             "ok": False,
             "skipped": False,
             "reason": reason,
-            "dest_remote": DEST_REMOTE,
+            "dest_remote": dest,
             "latest": ev,
             "max_age_days": OFFSITE_MAX_AGE_DAYS,
         }
@@ -648,7 +656,7 @@ def offsite_health(
             "ok": False,
             "skipped": False,
             "reason": "graph_snapshot_offsite event has no age",
-            "dest_remote": DEST_REMOTE,
+            "dest_remote": dest,
             "latest": ev,
             "max_age_days": OFFSITE_MAX_AGE_DAYS,
         }
@@ -657,7 +665,7 @@ def offsite_health(
     out = {
         "ok": fresh,
         "skipped": False,
-        "dest_remote": DEST_REMOTE,
+        "dest_remote": dest,
         "latest": {
             "status": ev.get("status"),
             "created_at": ev["created_at"].isoformat()
@@ -751,7 +759,7 @@ def status_payload() -> dict:
         "local": local,
         "offsite": offsite,
         "latest_snapshot": str(latest_snapshot()) if latest_snapshot() else None,
-        "dest_remote": DEST_REMOTE,
+        "dest_remote": resolve_dest_remote(),
         "live_graph": str(live) if live is not None else None,
         "has_r2_remote": has_r2_remote(),
         "last_graph_snapshot": _latest_ops_event("graph_snapshot"),

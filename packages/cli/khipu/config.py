@@ -338,6 +338,40 @@ def set_choice_setting(key: str, value: "str | None") -> Path:
     return save_config(data)
 
 
+# ---------------------------------------------------------------------------
+# Graph backup destination: the rclone `remote:path` the offsite copy of the
+# graph snapshot goes to. Env KHIPU_GRAPH_BACKUP_REMOTE → config.json →
+# default. The remote must be named `r2` (graph_backup.has_r2_remote).
+# ---------------------------------------------------------------------------
+
+DEFAULT_GRAPH_BACKUP_REMOTE = "r2:khipu-backups/khipu-graph"
+
+
+def graph_backup_remote() -> str:
+    env = (os.environ.get("KHIPU_GRAPH_BACKUP_REMOTE") or "").strip()
+    if env:
+        return env.rstrip("/")
+    stored = str(load_config().get("graph_backup_remote", "") or "").strip()
+    return stored.rstrip("/") if stored else DEFAULT_GRAPH_BACKUP_REMOTE
+
+
+def set_graph_backup_remote(value: "str | None") -> Path:
+    data = _load_config_for_mutation()
+    text = (value or "").strip().rstrip("/")
+    if not text:
+        data.pop("graph_backup_remote", None)
+    else:
+        if "\n" in text or "\r" in text:
+            raise ValueError("graph_backup_remote must not contain a newline")
+        remote, sep, path = text.partition(":")
+        if not sep or not remote or not path:
+            raise ValueError(
+                f"graph_backup_remote must look like r2:bucket/folder, got {text!r}"
+            )
+        data["graph_backup_remote"] = text
+    return save_config(data)
+
+
 def set_usage_accounts(raw: "str | list | None") -> Path:
     """Store ``usage_accounts``, the accounts ``khipu usage`` reads (JSON text
     or a list of ``{label, harness, home?}``, checked by

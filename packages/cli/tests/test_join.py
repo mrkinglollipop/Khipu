@@ -68,46 +68,111 @@ class EncryptRoundtripTest(unittest.TestCase):
             self.assertEqual(j.resolve_passphrase(None), "")
             self.assertEqual(j.resolve_passphrase("  "), "")
 
-    def test_export_kit_plaintext_when_passphrase_empty(self) -> None:
-        with (
+    def _export_patches(self):
+        return (
             mock.patch("khipu.keychain.get_dsn", return_value="postgres://u:p@hub/db"),
             mock.patch("khipu.config.capture_mode", return_value="hub"),
             mock.patch("khipu.config.gateway_url", return_value=None),
-            mock.patch("khipu.keychain.get_gemini_key", return_value=None),
+            mock.patch("khipu.keychain.get_gemini_key", return_value="gem-key"),
             mock.patch("khipu.keychain.get_openai_compat_key", return_value=None),
             mock.patch.object(j, "_models_export_blob", return_value={}),
             mock.patch.object(
                 j, "_fetch_live_counts", return_value={"episodes": 1, "topics": 1, "nodes": 1}
             ),
             mock.patch("khipu.paths.root_cert_file", return_value=Path("/no/such/root.crt")),
-        ):
-            blob = j.export_kit("")
+        )
+
+    def _export(self, passphrase: str, **kw) -> bytes:
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            for p in self._export_patches():
+                stack.enter_context(p)
+            return j.export_kit(passphrase, **kw)
+
+    def test_export_kit_refuses_without_passphrase(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            self._export("")
+        self.assertIn("needs a passphrase", str(ctx.exception))
+        self.assertIn("--allow-unencrypted", str(ctx.exception))
+
+    def test_export_kit_plaintext_only_with_explicit_opt_out(self) -> None:
+        blob = self._export("", allow_unencrypted=True)
         data = json.loads(blob.decode("utf-8"))
         self.assertEqual(data["database_url"], "postgres://u:p@hub/db")
         self.assertNotIn("ciphertext_b64", data)
+        # Reading an existing unencrypted kit keeps working without a passphrase.
         self.assertEqual(j.decrypt_payload(blob, ""), data)
 
     def test_export_kit_encrypts_when_passphrase_set(self) -> None:
-        with (
-            mock.patch("khipu.keychain.get_dsn", return_value="postgres://u:p@hub/db"),
-            mock.patch("khipu.config.capture_mode", return_value="hub"),
-            mock.patch("khipu.config.gateway_url", return_value=None),
-            mock.patch("khipu.keychain.get_gemini_key", return_value=None),
-            mock.patch("khipu.keychain.get_openai_compat_key", return_value=None),
-            mock.patch.object(j, "_models_export_blob", return_value={}),
-            mock.patch.object(
-                j, "_fetch_live_counts", return_value={"episodes": 1, "topics": 1, "nodes": 1}
-            ),
-            mock.patch("khipu.paths.root_cert_file", return_value=Path("/no/such/root.crt")),
-        ):
-            blob = j.export_kit("secret")
+        blob = self._export("secret")
+        self.assertNotIn(b"postgres://", blob)
+        self.assertNotIn(b"gem-key", blob)
         envelope = json.loads(blob.decode("utf-8"))
         self.assertIn("ciphertext_b64", envelope)
         out = j.decrypt_payload(blob, "secret")
         self.assertEqual(out["database_url"], "postgres://u:p@hub/db")
+        self.assertEqual(out["gemini_api_key"], "gem-key")
         with self.assertRaises(ValueError) as ctx:
             j.decrypt_payload(blob, "")
         self.assertIn("passphrase-protected", str(ctx.exception))
+
+
+class JoinCliPassphraseTest(unittest.TestCase):
+    def _run(self, argv: list[str], env: dict[str, str] | None = None):
+        import contextlib
+        import io
+
+        from khipu import cli
+
+        buf = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"KHIPU_JOIN_PASSPHRASE": "", **(env or {})}),
+            mock.patch("khipu.join.export_kit", return_value=b"kit") as export,
+            mock.patch("khipu.join.write_kit_file", side_effect=lambda p, b: p) as write,
+            mock.patch("khipu.join.decrypt_payload", return_value={"expected": {}}),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = cli.main(argv)
+        return rc, buf.getvalue(), export, write
+
+    def test_export_without_passphrase_is_refused_in_plain_words(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "kit.khipujoin")
+            rc, stdout, export, write = self._run(["join", "export", "--out", out])
+        self.assertEqual(rc, 2)
+        body = json.loads(stdout)
+        self.assertFalse(body["ok"])
+        self.assertIn("needs a passphrase", body["error"])
+        self.assertIn("database password", body["error"])
+        export.assert_not_called()
+        write.assert_not_called()
+
+    def test_advertise_without_passphrase_is_refused(self) -> None:
+        rc, stdout, export, _ = self._run(["join", "advertise"])
+        self.assertEqual(rc, 2)
+        self.assertIn("needs a passphrase", json.loads(stdout)["error"])
+        export.assert_not_called()
+
+    def test_export_opt_out_flag_makes_unencrypted_kit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "kit.khipujoin")
+            rc, stdout, export, _ = self._run(
+                ["join", "export", "--out", out, "--allow-unencrypted"]
+            )
+        self.assertEqual(rc, 0)
+        export.assert_called_once_with("", allow_unencrypted=True)
+
+    def test_export_with_passphrase_never_prints_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "kit.khipujoin")
+            rc, stdout, export, _ = self._run(
+                ["join", "export", "--out", out], env={"KHIPU_JOIN_PASSPHRASE": "s3cret-phrase"}
+            )
+        self.assertEqual(rc, 0)
+        export.assert_called_once_with("s3cret-phrase", allow_unencrypted=False)
+        self.assertNotIn("s3cret-phrase", stdout)
+
 
 
 class LocalhostRefuseTest(unittest.TestCase):

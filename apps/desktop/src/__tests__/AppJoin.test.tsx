@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
 
@@ -30,9 +30,67 @@ describe("App — Join advertise", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
     fireEvent.click(screen.getByRole("tab", { name: "Another Mac" }));
+    fireEvent.change(await screen.findByLabelText("Join kit passphrase"), { target: { value: "phrase" } });
     fireEvent.click(await screen.findByRole("button", { name: /Advertise nearby/ }));
     expect(await screen.findByText(/Nearby setup started/)).toBeInTheDocument();
     expect(screen.getByText(/Connection has not been checked/)).toBeInTheDocument();
     expect(screen.queryByText(/Advertising nearby/)).not.toBeInTheDocument();
+  });
+});
+
+function mockRemoteHub() {
+  invokeMock.mockImplementation(async (cmd: string) => {
+    if (cmd === "dsn_configured") return true;
+    if (cmd === "khipu_db_status") return JSON.stringify({ ok: true, host_kind: "remote" });
+    if (cmd === "liveness_now") return JSON.stringify({ ok: true, harnesses: {} });
+    if (cmd === "join_advertise") return JSON.stringify({ ok: true, pin: "123456", timeout_sec: 600 });
+    if (cmd === "run_khipu") return JSON.stringify({ ok: true, capture_liveness: { ok: true, harnesses: {} }, claude_homes: { homes: [] }, counts: {}, recent: [] });
+    return JSON.stringify({ ok: true });
+  });
+}
+
+async function openAnotherMac() {
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Another Mac" }));
+  await screen.findByText("Set up another Mac");
+  // IntegrationsPanel has its own "Save join kit…" shortcut; scope to this card.
+  return within(screen.getByText("Set up another Mac").closest(".section-card") as HTMLElement);
+}
+
+describe("App — Join kit passphrase", () => {
+  it("keeps Save join kit and Advertise disabled until a passphrase is typed", async () => {
+    mockRemoteHub();
+    const section = await openAnotherMac();
+    const save = section.getByRole("button", { name: /Save join kit/ });
+    const advertise = section.getByRole("button", { name: /Advertise nearby/ });
+    expect(save).toBeDisabled();
+    expect(advertise).toBeDisabled();
+    expect(screen.getByText("Type a passphrase to save or advertise a join kit.")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Join kit passphrase"), { target: { value: "  " } });
+    expect(save).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Join kit passphrase"), { target: { value: "correct horse" } });
+    expect(save).toBeEnabled();
+    expect(advertise).toBeEnabled();
+    expect(screen.queryByText(/Anyone who gets this file/)).not.toBeInTheDocument();
+  });
+
+  it("enables Save join kit with the unencrypted opt-out and shows the warning", async () => {
+    mockRemoteHub();
+    const section = await openAnotherMac();
+    const save = section.getByRole("button", { name: /Save join kit/ });
+    expect(screen.queryByText(/Anyone who gets this file/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("checkbox", { name: "I understand: make it unencrypted" }));
+    expect(save).toBeEnabled();
+    expect(
+      screen.getByText("Anyone who gets this file can read the database password and API keys."),
+    ).toBeInTheDocument();
+    fireEvent.click(section.getByRole("button", { name: /Advertise nearby/ }));
+    expect(await screen.findByText(/Nearby setup started/)).toBeInTheDocument();
+    expect(invokeMock).toHaveBeenCalledWith("join_advertise", {
+      passphrase: "",
+      timeout: 600,
+      allowUnencrypted: true,
+    });
   });
 });

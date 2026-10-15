@@ -396,9 +396,13 @@ jobs. A real memory round trip — written, found by search, shown as a timed li
 
 - **Join another Mac.** Pick this if a Mac in your life already runs Khipu —
   you want the *same* memory, not a second one. On the working Mac: Settings
-  → Another Mac → **Save join kit…**, then AirDrop the file (or use the
-  six-digit PIN over the same Wi‑Fi). On the new Mac: Welcome → **Join
-  existing Khipu**. Proves: live episode, topic and node counts are non-zero
+  → Another Mac → type a passphrase → **Save join kit…**, then AirDrop the
+  file (or use the six-digit PIN over the same Wi‑Fi). On the new Mac:
+  Welcome → **Join existing Khipu**, with the same passphrase. The kit holds
+  the database password and any API keys, so a passphrase is required; an
+  unencrypted kit is made only if you tick "I understand: make it
+  unencrypted" (`khipu join export --allow-unencrypted` on the command line).
+  Kits saved unencrypted before this still import. Proves: live episode, topic and node counts are non-zero
   when the join kit expects them to be.
 - **Set up a new database on this Mac.** Pick this if nobody has Khipu yet.
   Needs [Docker Desktop](https://docs.docker.com/desktop/setup/install/mac-install/)

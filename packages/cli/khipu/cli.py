@@ -2936,6 +2936,18 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 2
         print(json.dumps({"ok": True, "usage_accounts": usage.accounts_status(), "config_file": str(path)}))
         return 0
+    if (args.set and args.set[0] == "graph_backup_remote") or args.unset == "graph_backup_remote":
+        # Where `graph-backup offsite` copies the graph snapshot (rclone
+        # remote:path); `--unset` goes back to the default.
+        from khipu.config import graph_backup_remote, set_graph_backup_remote
+
+        try:
+            path = set_graph_backup_remote(args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, "graph_backup_remote": graph_backup_remote(), "config_file": str(path)}))
+        return 0
     from khipu import routing as _routing
 
     if (args.set and args.set[0] in _routing.SETTINGS) or args.unset in _routing.SETTINGS:
@@ -3243,9 +3255,16 @@ def cmd_join(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "error": str(exc)}))
         return 2
 
+    allow_unencrypted = bool(getattr(args, "allow_unencrypted", False))
+    if args.join_cmd in ("export", "advertise") and not passphrase and not allow_unencrypted:
+        from khipu.join import UNENCRYPTED_REFUSAL
+
+        print(json.dumps({"ok": False, "error": UNENCRYPTED_REFUSAL}))
+        return 2
+
     if args.join_cmd == "export":
         try:
-            blob = export_kit(passphrase)
+            blob = export_kit(passphrase, allow_unencrypted=allow_unencrypted)
             out_path = write_kit_file(Path(args.out), blob)
             from khipu.join import decrypt_payload
 
@@ -3306,6 +3325,7 @@ def cmd_join(args: argparse.Namespace) -> int:
                 passphrase,
                 timeout=int(getattr(args, "timeout", 600) or 600),
                 pin=getattr(args, "pin", None),
+                allow_unencrypted=allow_unencrypted,
             )
         except Exception as exc:
             print(json.dumps({"ok": False, "error": str(exc)}))
@@ -4600,7 +4620,7 @@ def build_parser() -> argparse.ArgumentParser:
     ).set_defaults(func=cmd_graph_backup)
     gbu_sub.add_parser(
         "offsite",
-        help="rclone copyto latest snapshot to r2:matt-db-backups/khipu-graph",
+        help="rclone copyto latest snapshot to graph_backup_remote (default r2:khipu-backups/khipu-graph)",
     ).set_defaults(func=cmd_graph_backup)
     gbu_sub.add_parser(
         "status", help="Local + offsite health and last ops_events"
@@ -5087,7 +5107,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     join = sub.add_parser(
         "join",
-        help="Export/import hub join kits (optional passphrase; never prints secrets)",
+        help="Export/import hub join kits (passphrase required to export; never prints secrets)",
     )
     join_sub = join.add_subparsers(dest="join_cmd", required=True)
     join_export = join_sub.add_parser(
@@ -5096,7 +5116,12 @@ def build_parser() -> argparse.ArgumentParser:
     join_export.add_argument(
         "--passphrase",
         default=None,
-        help="Optional encryption passphrase (omit for plaintext; or KHIPU_JOIN_PASSPHRASE)",
+        help="Encryption passphrase, required unless --allow-unencrypted (or KHIPU_JOIN_PASSPHRASE)",
+    )
+    join_export.add_argument(
+        "--allow-unencrypted",
+        action="store_true",
+        help="I understand: make an unencrypted kit anyone with the file can read",
     )
     join_export.add_argument(
         "--out",
@@ -5130,7 +5155,12 @@ def build_parser() -> argparse.ArgumentParser:
     join_advertise.add_argument(
         "--passphrase",
         default=None,
-        help="Optional encryption passphrase (omit for plaintext; or KHIPU_JOIN_PASSPHRASE)",
+        help="Encryption passphrase, required unless --allow-unencrypted (or KHIPU_JOIN_PASSPHRASE)",
+    )
+    join_advertise.add_argument(
+        "--allow-unencrypted",
+        action="store_true",
+        help="I understand: make an unencrypted kit anyone with the file can read",
     )
     join_advertise.add_argument(
         "--timeout",
@@ -5180,11 +5210,13 @@ def build_parser() -> argparse.ArgumentParser:
         "summariser fallback (synth_fallback gemini|none: what a failed "
         "window does on a provider other than Gemini), the comma-"
         'separated user_aliases list (e.g. --set user_aliases "matt,matthew") '
+        "the graph backup destination (graph_backup_remote, an rclone "
+        "remote:path, default r2:khipu-backups/khipu-graph) "
         "or the plan usage accounts as JSON (usage_accounts "
         '\'[{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}]\')',
     )
     cfg.add_argument("--unset", metavar="KEY",
-                     help="Remove a path setting, a daily call ceiling, synth_fallback or usage_accounts, or "
+                     help="Remove a path setting, a daily call ceiling, synth_fallback, graph_backup_remote or usage_accounts, or "
                      "relevance.cosine_floor / "
                      "relevance.cosine_floor_by_profile.<profile> to restore its default")
     cfg.add_argument(

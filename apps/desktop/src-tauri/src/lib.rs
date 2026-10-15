@@ -2305,15 +2305,26 @@ fn set_khipu_secret_sync(account: String, value: String) -> Result<String, Strin
     Ok(stdout)
 }
 
-/// Export a join kit to disk. Optional passphrase travels via env, never argv —
-/// same exposure model as `set_khipu_secret`'s stdin pipe. Empty passphrase
-/// writes a plaintext kit (the file is the secret).
+/// Export a join kit to disk. The passphrase travels via env, never argv —
+/// same exposure model as `set_khipu_secret`'s stdin pipe. The CLI refuses an
+/// empty passphrase unless `allow_unencrypted` (the owner's explicit opt-out).
 #[tauri::command]
-async fn join_export(passphrase: String, out_path: String) -> Result<String, String> {
-    spawn_blocking_cli(move || join_export_sync(passphrase, out_path)).await
+async fn join_export(
+    passphrase: String,
+    out_path: String,
+    allow_unencrypted: Option<bool>,
+) -> Result<String, String> {
+    spawn_blocking_cli(move || {
+        join_export_sync(passphrase, out_path, allow_unencrypted.unwrap_or(false))
+    })
+    .await
 }
 
-fn join_export_sync(passphrase: String, out_path: String) -> Result<String, String> {
+fn join_export_sync(
+    passphrase: String,
+    out_path: String,
+    allow_unencrypted: bool,
+) -> Result<String, String> {
     if out_path.trim().is_empty() {
         return Err("out_path is empty".to_string());
     }
@@ -2321,13 +2332,17 @@ fn join_export_sync(passphrase: String, out_path: String) -> Result<String, Stri
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
     let (bc_key, bc_val) = khipu_bytecode_env();
-    let output = Command::new(&py)
-        .arg("-m")
+    let mut cmd = Command::new(&py);
+    cmd.arg("-m")
         .arg("khipu")
         .arg("join")
         .arg("export")
         .arg("--out")
-        .arg(out_path.trim())
+        .arg(out_path.trim());
+    if allow_unencrypted {
+        cmd.arg("--allow-unencrypted");
+    }
+    let output = cmd
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
         .env("KHIPU_APP_VERSION", khipu_app_version())
@@ -2392,23 +2407,38 @@ fn join_import_sync(passphrase: String, file_path: String) -> Result<String, Str
 /// Advertise join kit on LAN (Bonjour + TLS). Spawns a background job and returns
 /// the first JSON line (PIN, port, timeout) while the server keeps running.
 #[tauri::command]
-async fn join_advertise(passphrase: String, timeout: u32) -> Result<String, String> {
-    spawn_blocking_cli(move || join_advertise_sync(passphrase, timeout)).await
+async fn join_advertise(
+    passphrase: String,
+    timeout: u32,
+    allow_unencrypted: Option<bool>,
+) -> Result<String, String> {
+    spawn_blocking_cli(move || {
+        join_advertise_sync(passphrase, timeout, allow_unencrypted.unwrap_or(false))
+    })
+    .await
 }
 
-fn join_advertise_sync(passphrase: String, timeout: u32) -> Result<String, String> {
+fn join_advertise_sync(
+    passphrase: String,
+    timeout: u32,
+    allow_unencrypted: bool,
+) -> Result<String, String> {
     let root = khipu_root()?;
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
     let (bc_key, bc_val) = khipu_bytecode_env();
     let tout = timeout.max(60);
-    let mut child = Command::new(&py)
-        .arg("-m")
+    let mut cmd = Command::new(&py);
+    cmd.arg("-m")
         .arg("khipu")
         .arg("join")
         .arg("advertise")
         .arg("--timeout")
-        .arg(tout.to_string())
+        .arg(tout.to_string());
+    if allow_unencrypted {
+        cmd.arg("--allow-unencrypted");
+    }
+    let mut child = cmd
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
         .env("KHIPU_APP_VERSION", khipu_app_version())

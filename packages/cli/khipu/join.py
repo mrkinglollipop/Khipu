@@ -132,7 +132,7 @@ def decrypt_payload(blob: bytes, passphrase: str = "") -> dict[str, Any]:
     if not passphrase.strip():
         raise ValueError(
             "this join kit is passphrase-protected — enter the phrase you typed "
-            "when saving it, or save a new kit without a passphrase"
+            "when saving it"
         )
     try:
         salt = base64.b64decode(envelope["salt_b64"])
@@ -188,7 +188,19 @@ def _models_export_blob() -> dict[str, Any]:
     }
 
 
-def export_kit(passphrase: str) -> bytes:
+UNENCRYPTED_REFUSAL = (
+    "A join kit needs a passphrase. The kit holds this hub's database password "
+    "and any API keys, so without a passphrase anyone who gets the file can read "
+    "them. Pass --passphrase (or set KHIPU_JOIN_PASSPHRASE), or, if you "
+    "understand the risk, pass --allow-unencrypted to make an unencrypted kit."
+)
+
+
+def export_kit(passphrase: str, *, allow_unencrypted: bool = False) -> bytes:
+    """Build a join kit. Encrypted unless the owner explicitly opts out."""
+    phrase = (passphrase or "").strip()
+    if not phrase and not allow_unencrypted:
+        raise ValueError(UNENCRYPTED_REFUSAL)
     from khipu.config import capture_mode, gateway_url
     from khipu.keychain import get_dsn, get_gemini_key, get_openai_compat_key
     from khipu.paths import root_cert_file
@@ -221,7 +233,6 @@ def export_kit(passphrase: str) -> bytes:
         payload["openai_compat_api_key"] = openai_compat
     if root_crt_pem:
         payload["root_crt_pem"] = root_crt_pem
-    phrase = (passphrase or "").strip()
     if phrase:
         return encrypt_payload(payload, phrase)
     return json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -483,5 +494,6 @@ def verify_live_counts(expected: dict[str, int]) -> dict[str, Any]:
 
 
 def resolve_passphrase(arg: str | None) -> str:
-    """Optional. Empty means a plaintext join kit (file/AirDrop is the secret)."""
+    """The passphrase from the flag or KHIPU_JOIN_PASSPHRASE; empty when neither.
+    Export refuses empty unless --allow-unencrypted; import of a plain kit needs none."""
     return (arg or os.environ.get("KHIPU_JOIN_PASSPHRASE") or "").strip()
