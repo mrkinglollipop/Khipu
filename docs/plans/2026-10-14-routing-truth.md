@@ -548,6 +548,11 @@ into the app's attention items. They never gate `ok`. The texts Matt reads:
   `kind` is not set, it "can't be checked", never reported as passing.
 - Whether a Grok lane uses the paid xAI API "can't be checked: the launch environment is set inside
   <script>", never reported as passing.
+
+The app's attention item for a broken rule quotes the rule first, by its number and word for word: "Your rule
+3 says: Never a -fast tier. Your Project A job runner's settings name ... (seen at 11:22 AM in its settings
+file). Khipu stopped nothing; it only reports." The number matches the rule the card marks, and the rule's own
+first letter stays as written (lower-casing it would turn "Grok" or "Khipu" into "grok" or "khipu").
 - "A job was started on <account> while you had it paused", or "…after it had reached its limit." (LAUNCH
   lines, through the lane map)
 - "Your <runner> job runner stopped reporting at HH:MM", or "Khipu can't read <runner>'s files since HH:MM."

@@ -3043,20 +3043,28 @@ input.switch:disabled {
    docs/mockups/2026-10-14-routing/mock.css). The name column matches the
    Plans card so the two read as a pair.
 --------------------------------------------------------------------------- */
-/* The note, the rules and hold words are shown word for word, paths and
-   links included: a word with no space in it breaks rather than running
-   past the card and scrolling the whole column sideways. Set on the card so
-   every text in it inherits it (nowrap pieces such as the state and the
-   tags are unaffected). */
-.routing-card { overflow-wrap: anywhere; }
+/* Text in the card breaks inside a word only when that word cannot fit on
+   a line of its own (a path or a link). The words people write, shown word
+   for word (the note, the rules, a hold's words and a reminder), may break
+   anywhere so a long path never runs past the card. Only those get
+   `anywhere`: it lets a column shrink to one letter, so on the whole card it
+   let a long state squeeze who said so into a letter per line. */
+.routing-card { overflow-wrap: break-word; }
+.route-quote,
+.route-rules li,
+.route-hold-words,
+.route-note > span:not(.tag) { overflow-wrap: anywhere; }
 .card .row.route-row {
   display: grid;
-  grid-template-columns: minmax(7rem, 11rem) auto minmax(0, 1fr);
+  /* The state takes the room it needs and wraps when it needs more; who
+     said so always keeps a column wide enough to read. */
+  grid-template-columns: minmax(7rem, 11rem) minmax(0, auto) minmax(12rem, 1fr);
   column-gap: var(--s3);
   row-gap: var(--s1);
   align-items: center;
 }
-.route-state { display: inline-flex; align-items: center; gap: var(--s2); font-size: var(--t-md); color: var(--text); white-space: nowrap; }
+.route-state { display: inline-flex; align-items: baseline; gap: var(--s2); font-size: var(--t-md); color: var(--text); }
+.route-state .hdot { flex: none; transform: translateY(-1px); }
 .route-src { font-size: var(--t-xs); color: var(--muted); text-align: right; min-width: 0; }
 .route-note {
   grid-column: 2 / -1;
@@ -3071,7 +3079,6 @@ input.switch:disabled {
 .route-note .tag { transform: translateY(-1px); flex: none; }
 .route-note > span:not(.tag) { flex: 1 1 auto; min-width: 0; }
 .card .row.route-stale { display: flex; flex-wrap: wrap; gap: var(--s1) var(--s3); }
-.card .row.route-stale .route-state { white-space: normal; }
 .route-sub { padding: var(--s2) var(--s4) var(--s3); border-bottom: 1px solid var(--border); }
 .routing-card [role="list"] + .route-sub { border-top: 1px solid var(--border); }
 .card h2.route-sub-head {
@@ -3087,7 +3094,8 @@ input.switch:disabled {
 .route-sub .route-holds { display: flex; flex-direction: column; gap: var(--s1); margin: 0; padding: 0; list-style: none; }
 .route-hold {
   display: grid;
-  grid-template-columns: minmax(7rem, 11rem) minmax(0, 1fr) auto;
+  /* A hold's words keep a readable column; its end and who set it wrap. */
+  grid-template-columns: minmax(7rem, 11rem) minmax(12rem, 1fr) minmax(0, auto);
   column-gap: var(--s3);
   align-items: baseline;
   font-size: var(--t-sm);
@@ -3123,8 +3131,6 @@ input.switch:disabled {
    either into a column a word wide. */
 @media (max-width: 1040px) {
   .card .row.route-row { grid-template-columns: minmax(7rem, 11rem) minmax(0, 1fr); }
-  .route-state { white-space: normal; align-items: baseline; }
-  .route-state .hdot { flex: none; transform: translateY(-1px); }
   .route-row .route-src { grid-column: 2 / -1; text-align: left; }
   .route-hold { grid-template-columns: minmax(7rem, 11rem) minmax(0, 1fr); }
   .route-hold .route-src { grid-column: 2 / -1; text-align: left; }
@@ -3134,5 +3140,8 @@ input.switch:disabled {
   .route-src { grid-column: 1 / -1; text-align: left; }
   .route-note { grid-column: 1 / -1; flex-wrap: wrap; }
   .route-hold { grid-template-columns: 1fr; }
-  .route-hold .route-src { text-align: left; }
+  /* Undo the 1040px placement: on one column a second-column end made an
+     extra column and squeezed the hold's scope to a letter per line. */
+  .route-hold .route-src,
+  .route-hold .route-note { grid-column: 1 / -1; text-align: left; }
 }

@@ -160,7 +160,7 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
               return (
                 <li key={h.id} className="route-hold">
                   <span>{h.scope_label.charAt(0).toUpperCase() + h.scope_label.slice(1)}</span>
-                  <span>{holdWords(h)}</span>
+                  <span className="route-hold-words">{holdWords(h)}</span>
                   <span className="route-src">{holdSource(h, now)}</span>
                   {remind ? (
                     <span className="route-note route-remind">

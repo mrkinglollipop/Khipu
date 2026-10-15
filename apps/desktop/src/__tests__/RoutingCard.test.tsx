@@ -12,7 +12,11 @@ import { RoutingCard, inPlansOrder } from "../RoutingCard";
 // The stylesheet as written (vitest hands CSS imports over empty, `?raw`
 // included). The app has no @types/node; vitest runs this file in node.
 // @ts-expect-error node:fs has no types here
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+// @ts-expect-error node:child_process has no types here
+import { execFileSync } from "node:child_process";
+// @ts-expect-error node:os has no types here
+import { tmpdir } from "node:os";
 
 const appCss: string = readFileSync(
   `${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/App.css`,
@@ -464,22 +468,130 @@ describe("Home Routing card, fix round 1", () => {
     expect(items[1]).not.toHaveTextContent("Is it still needed?");
     expect(within(items[1]).queryByText("Reminder")).toBeNull();
   });
+});
 
-  it("breaks a long word in the note, the rules and the holds instead of running past the card (F3)", () => {
-    const style = document.createElement("style");
-    style.textContent = appCss;
-    document.head.appendChild(style);
-    try {
-      const long = "/a/very/long/path/with/no/spaces/".repeat(10);
-      const v = mainView();
-      v.note = { text: `See ${long}`, at: "2026-10-13T14:00:00Z" };
-      v.holds = [{ ...v.holds![0], text: long }];
-      v.rules = [{ n: 1, text: long }];
-      const { container } = render(<RoutingCard state={stateOf(v)} />);
-      const card = container.querySelector(".routing-card") as HTMLElement;
-      expect(getComputedStyle(card).overflowWrap).toBe("anywhere");
-    } finally {
-      style.remove();
+// Fix round 2: the card laid out by a real browser engine. jsdom has no
+// layout, so a computed style says nothing about whether text fits; this
+// renders the real card with the real App.css in headless Chrome at the
+// app's default window width (1100) and at the mock's narrow width (700),
+// and finds every plain word that was broken across two lines. Paths and
+// hyphenated names may break; a word like "yesterday" or "Mac" never.
+const CHROME = [
+  (globalThis as unknown as { process: { env: Record<string, string | undefined> } }).process.env.KHIPU_TEST_CHROME,
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/usr/bin/google-chrome",
+  "/usr/bin/chromium",
+].find((p): p is string => !!p && existsSync(p));
+
+const MEASURE = `(function(){
+  var card = document.querySelector(".routing-card"), broken = [];
+  var walk = document.createTreeWalker(card, NodeFilter.SHOW_TEXT), n;
+  while ((n = walk.nextNode())) {
+    var re = /\\S+/g, m;
+    while ((m = re.exec(n.textContent))) {
+      if (!/^[A-Za-z,.'\\u2019]+$/.test(m[0])) continue;
+      var r = document.createRange(); r.setStart(n, m.index); r.setEnd(n, m.index + m[0].length);
+      var tops = {};
+      Array.prototype.forEach.call(r.getClientRects(), function (x) { if (x.width > 0) tops[Math.round(x.top)] = 1; });
+      if (Object.keys(tops).length > 1) broken.push(m[0]);
     }
+  }
+  var srcs = Array.prototype.map.call(card.querySelectorAll(".route-row .route-src"), function (e) { return Math.round(e.getBoundingClientRect().width); });
+  var de = document.documentElement;
+  document.body.setAttribute("data-out", JSON.stringify({ broken: broken, srcWidths: srcs, sideScroll: de.scrollWidth > de.clientWidth }));
+})();`;
+
+function layOut(cardHtml: string, width: number): { broken: string[]; srcWidths: number[]; sideScroll: boolean } {
+  const dir = mkdtempSync(`${tmpdir()}/khipu-routing-layout-`);
+  try {
+    const page = `${dir}/card.html`;
+    writeFileSync(page, `<!doctype html><html lang="en"><head><meta charset="utf-8"><style>${appCss}</style></head>` +
+      `<body><div id="root"><div class="shell"><nav class="rail"></nav><main class="main"><section class="panel">` +
+      `<div class="panel-body wide">${cardHtml}</div></section></main></div></div><script>${MEASURE}</script></body></html>`);
+    const dom: string = execFileSync(CHROME, [
+      "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", `--user-data-dir=${dir}/profile`,
+      `--window-size=${width},1600`, "--virtual-time-budget=2000", "--dump-dom", `file://${page}`,
+    ], { encoding: "utf8", timeout: 60000, stdio: ["ignore", "pipe", "ignore"] });
+    const m = dom.match(/data-out="([^"]*)"/);
+    if (!m) throw new Error("the page did not report its layout");
+    return JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&amp;/g, "&"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(!CHROME)("Home Routing card, fix round 2 (laid out in headless Chrome)", () => {
+  function longView(): RouteView {
+    const v = mainView();
+    v.accounts = [
+      // A model-scoped limit for two models next to a short source (R2-1).
+      acct("Claude main", "claude", {
+        state: "open",
+        witness: { source: "probe", written_by: { kind: "probe" }, at: "2026-10-14T18:59:00Z" },
+        models: [
+          { model: "Opus", until: "2026-10-15T13:00:00Z", basis: "cli", source: "probe" },
+          { model: "Sonnet", until: "2026-10-15T13:00:00Z", basis: "cli", source: "probe" },
+        ],
+      }),
+      // A long state next to a long source (R2-1).
+      acct("Muse", "muse", {
+        state: "probably_open", until: "2026-10-14T00:00:00Z", basis: "cli", checkable: false,
+        witness: { source: "runner", written_by: { kind: "runner", name: "Project A" }, at: "2026-10-13T15:13:00Z", message_time: true },
+      }),
+    ];
+    return v;
+  }
+
+  function cardHtml(): string {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(AFTERNOON);
+    const { container } = render(<RoutingCard state={stateOf(longView())} />);
+    expect(container.textContent).toContain("Its reset time passed yesterday at 8:00 PM; this account can't be checked without using a turn");
+    expect(container.textContent).toContain("This Mac");
+    return container.innerHTML;
+  }
+
+  it("keeps who said so readable beside a long state at the default window width (R2-1)", () => {
+    const out = layOut(cardHtml(), 1100);
+    expect(out.broken).toEqual([]);
+    expect(out.sideScroll).toBe(false);
+    for (const w of out.srcWidths) expect(w).toBeGreaterThanOrEqual(150);
+  }, 90000);
+
+  it("keeps a hold's scope on one line at the narrow width (R2-2)", () => {
+    const out = layOut(cardHtml(), 700);
+    expect(out.broken).toEqual([]);
+    expect(out.sideScroll).toBe(false);
+  }, 90000);
+
+  it("still breaks a long path in the note, the rules and the holds instead of running past the card", () => {
+    const long = "/a/very/long/path/with/no/spaces/".repeat(10);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(AFTERNOON);
+    const v = longView();
+    v.note = { text: `See ${long}`, at: "2026-10-13T14:00:00Z" };
+    v.holds = [{ ...v.holds![0], text: long }];
+    v.rules = [{ n: 1, text: long }];
+    const { container } = render(<RoutingCard state={stateOf(v)} />);
+    for (const width of [1100, 700]) expect(layOut(container.innerHTML, width).sideScroll).toBe(false);
+  }, 90000);
+});
+
+describe("Home Routing card, fix round 2", () => {
+  it("raises the broken rule in the words the approved conflict mock shows (R2-3)", () => {
+    const mock: string = readFileSync(
+      `${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/../../docs/mockups/2026-10-14-routing/home-routing-conflict.html`,
+      "utf8",
+    );
+    const m = mock.match(/<b>A standing rule may be broken<\/b><span>([^<]*)<\/span>/);
+    expect(m).not.toBeNull();
+    const v = mainView();
+    v.accounts = [];
+    v.rule_checks = [{
+      rule: 3, status: "broken", at: "2026-10-14T15:22:00Z", runner: "Project A", file: "settings",
+      text: "A standing rule may be broken: Project A's settings name a model ending in -fast for its grokcheck lane.",
+    }];
+    const [item] = routingAttention(v, MORNING);
+    expect(item.cause).toBe(m![1].replace(/&#x27;|&#39;/g, "'"));
   });
 });
