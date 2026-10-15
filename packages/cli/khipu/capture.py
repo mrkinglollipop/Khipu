@@ -31,6 +31,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from khipu import wire
+from khipu.lines import run_text
 from khipu.config import capture_mode
 
 # ---- W1.4 ingest dedup ------------------------------------------------------
@@ -69,22 +71,60 @@ def _jaccard(a: str, b: str) -> float:
 
 
 def _source_receipt(payload: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
-                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+    from khipu.capture_identity import payload_sha256
+
+    return payload_sha256(payload)
 
 
-def _dedup_exact_window(cur, payload: dict[str, Any]) -> int | None:
+def _receipts(payload: dict[str, Any], source: dict[str, Any] | None) -> list[str]:
+    """Merge receipts this capture may already be recorded under: the source
+    snapshot's (taken before enrichment, written since the capture identity
+    fix) and the enriched payload's (what older merges stored)."""
+    out = [source["payload_sha256"]] if source else []
+    legacy = _source_receipt(payload)
+    return out + [legacy] if legacy not in out else out
+
+
+# How a merge matched its target, recorded on its receipt. Only an identity
+# match may later transfer ownership; a receipt without the field was written
+# before receipts recorded it and counts as similarity.
+MATCH_IDENTITY = "identity"
+MATCH_SIMILARITY = "similarity"
+
+
+class ClaimDeferred(RuntimeError):
+    """A required origin claim failed after its savepoint rolled back. The
+    write must be retried (the outbox keeps the job and never buries it), or
+    the queued owner, the only ownership evidence, would be discarded."""
+
+
+def _receipt_match(cur, payload: dict[str, Any],
+                   source: dict[str, Any] | None) -> tuple[int, str] | None:
+    """The episode this capture was already merged into, and how that merge
+    matched: identity only when its receipt says so."""
+    receipts = _receipts(payload, source)
+    for match in (MATCH_IDENTITY, None):
+        for receipt_id in receipts:
+            entry = {"source_id": receipt_id}
+            if match:
+                entry["match"] = match
+            cur.execute("SELECT id FROM episodes WHERE raw @> %s::jsonb LIMIT 1",
+                        (json.dumps({"merged_from": [entry]}),))
+            row = cur.fetchone()
+            if row:
+                return int(row[0]), match or MATCH_SIMILARITY
+    return None
+
+
+def _dedup_exact_window(cur, payload: dict[str, Any], *,
+                        source: dict[str, Any] | None = None) -> int | None:
     """K3: every sibling PART of one split window shares the same (harness,
     session_id, transcript_range) — that alone would match the FIRST part
     inserted and silently skip every part after it as an "exact window"
     duplicate. window_id (+ part, carried in raw) makes each sibling its own
     identity. Pre-migration hub (no window_id column): falls back to the
-    pre-K3 match, same as a payload with no window_id."""
-    cur.execute("SELECT id FROM episodes WHERE raw @> %s::jsonb LIMIT 1",
-                (json.dumps({"merged_from": [{"source_id": _source_receipt(payload)}]}),))
-    receipt = cur.fetchone()
-    if receipt:
-        return int(receipt[0])
+    pre-K3 match, same as a payload with no window_id. Merge receipts are
+    matched first, by ``dedup_before_insert``."""
     harness = payload.get("harness")
     session_id = payload.get("session_id")
     tr = payload.get("transcript_range")
@@ -299,7 +339,8 @@ def _append_summary(existing: str, incoming: str) -> str:
 
 
 def _merge_into_episode(
-    cur, target_id: int, payload: dict[str, Any], *, matched_via: str, score: float
+    cur, target_id: int, payload: dict[str, Any], *, matched_via: str, score: float,
+    source: dict[str, Any] | None = None, match: str = MATCH_SIMILARITY,
 ) -> bool:
     """Fold a near-duplicate capture into the episode it matched.
 
@@ -333,9 +374,16 @@ def _merge_into_episode(
         return False
     topics, decisions, preferences, people, raw, target_ts, target_summary = row[:7]
     tags = row[7] if has_tags else None
-    source_id = _source_receipt(payload)
-    for source in (raw or {}).get("merged_from") or []:
-        if source.get("source_id") == source_id or source.get("payload") == payload:
+    from khipu.capture_identity import record_source, source_identity
+
+    # The receipt and the merged source row both come from the snapshot
+    # write_pg took before enrichment, so they depend on the incoming capture
+    # alone; a caller without one (tests, older paths) snapshots here.
+    source = source or source_identity(payload)
+    source_id = source["payload_sha256"]
+    receipts = set(_receipts(payload, source))
+    for prior in (raw or {}).get("merged_from") or []:
+        if prior.get("source_id") in receipts or prior.get("payload") == payload:
             return True
     new_topics = _union_json_list(topics, payload.get("topics"))
     new_decisions = _union_json_list(decisions, payload.get("decisions"))
@@ -361,6 +409,7 @@ def _merge_into_episode(
         "session_id": payload.get("session_id"),
         "ts": payload.get("ts"),
         "matched_via": matched_via,
+        "match": match,
         "score": round(score, 4),
         "payload": payload,
     })
@@ -383,6 +432,9 @@ def _merge_into_episode(
         params.append(json.dumps(verbatim, ensure_ascii=False))
     params.append(target_id)
     cur.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id = %s", params)
+
+    record_source(cur, target_id, "merged", source,
+                  ts=payload.get("ts"), summary=payload.get("summary"))
 
     # The merged capture's own open/closed loops belong to the target episode
     # — same call the insert path makes in write_pg, same SAVEPOINT fail-open.
@@ -473,15 +525,24 @@ def _reembed_merged_episode(ts: Any, summary: Any, merged: dict[str, Any]) -> No
         _log(f"merge re-embed failed ({type(exc).__name__}: {exc})")
 
 
-def dedup_before_insert(cur, payload: dict[str, Any]) -> dict[str, Any]:
+def dedup_before_insert(cur, payload: dict[str, Any], *,
+                        source: dict[str, Any] | None = None) -> dict[str, Any]:
     """W1.4: {'action': 'skip'|'merge'|'none', ...}. Never raises — any
-    failure in the similarity path degrades to 'none' (a normal insert)."""
+    failure in the similarity path degrades to 'none' (a normal insert).
+    ``source`` is write_pg's pre-enrichment source identity snapshot."""
     from khipu.config import float_setting
 
-    exact_id = _dedup_exact_window(cur, payload)
+    receipt = _receipt_match(cur, payload, source)
+    if receipt is not None:
+        receipt_id, match = receipt
+        _log(f"dedup: merge receipt on episode {receipt_id} ({match}); skipping insert")
+        return {"action": "skip", "matched_episode": receipt_id,
+                "matched_via": "receipt", "match": match}
+    exact_id = _dedup_exact_window(cur, payload, source=source)
     if exact_id is not None:
         _log(f"dedup: exact window match episode {exact_id} — skipping insert")
-        return {"action": "skip", "matched_episode": exact_id, "matched_via": "exact_window"}
+        return {"action": "skip", "matched_episode": exact_id, "matched_via": "exact_window",
+                "match": MATCH_IDENTITY}
 
     candidates = _dedup_candidates(cur, payload)
     if not candidates:
@@ -493,13 +554,15 @@ def dedup_before_insert(cur, payload: dict[str, Any]) -> dict[str, Any]:
     if best is None:
         return {"action": "none"}
     target_id, score, via = best
-    if not _merge_into_episode(cur, target_id, payload, matched_via=via, score=score):
+    if not _merge_into_episode(cur, target_id, payload, matched_via=via, score=score,
+                               source=source):
         return {"action": "none"}
     _log(
         f"dedup: merged into episode {target_id} via {via} ({score:.2f}), "
         f"project={payload.get('project')!r}"
     )
-    return {"action": "merge", "matched_episode": target_id, "matched_via": via, "score": score}
+    return {"action": "merge", "matched_episode": target_id, "matched_via": via, "score": score,
+            "match": MATCH_SIMILARITY}
 
 
 
@@ -596,6 +659,55 @@ def load_payload(raw: str) -> dict[str, Any]:
     return payload
 
 
+def _stamp_origin(cur) -> str | None:
+    """The origin for a new episode row, or None to leave it unset: on a hub
+    without the column (pre-0029), and when this machine has no readable
+    identity, which is logged and never replaced by an invented id. A capture
+    is never refused for its origin."""
+    from khipu import db
+
+    if not db.has_columns(cur, "episodes", "origin"):
+        # The column list is cached per process; a long-lived server that
+        # started before `khipu migrate` must see the column without a restart.
+        db._TABLE_COLUMNS_CACHE.pop("episodes", None)
+        if not db.has_columns(cur, "episodes", "origin"):
+            return None
+    from khipu.machine_identity import MachineIdentityError
+    from khipu.request_context import request_origin
+
+    try:
+        return request_origin()
+    except MachineIdentityError as exc:
+        _log(f"origin left unset: {exc}")
+        return None
+
+
+def _claim_required() -> bool:
+    """True when this write carries a trusted owner that must claim the row it
+    lands on: an outbox replay whose envelope named an origin, or a capture on
+    this machine. A live gateway caller, or the gateway process outside a
+    request, never claims, so its claim can never block a write."""
+    from khipu.request_context import gateway_label, gateway_process, in_replay, request_origin
+
+    if in_replay():
+        return request_origin() is not None
+    return not gateway_label() and not gateway_process()
+
+
+def _claim_unowned_episode(cur, episode_id: int | None, origin: str | None) -> None:
+    """Give an existing unowned row the owner of the capture that landed on it
+    instead of inserting (a replay or an exact-window skip; never a similarity
+    merge, which is not an identity match): the row a
+    file-mirror sync wrote without an origin. Only this machine, or the origin
+    an outbox envelope recorded when the capture was queued, may claim: a live
+    gateway caller must never claim an unowned row by replaying its
+    timestamp and summary, or its session window, or by matching its text."""
+    if episode_id is None or not origin or not _claim_required():
+        return
+    cur.execute("UPDATE episodes SET origin = %s WHERE id = %s AND origin IS NULL",
+                (origin, episode_id))
+
+
 def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
 
@@ -612,7 +724,17 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     # place a secret in a summary, decision, loop or topic page is masked
     # before it becomes a row, a page or a vector.
     _validate_timestamp(payload)
+    # Origin is stamped by the server from the request context, never taken
+    # from the caller (gateway provenance, decision 1).
+    payload.pop("origin", None)
     _redact_capture_values(payload)
+    # The source identity is snapshotted here, from the redacted payload as it
+    # arrived: before project inheritance and alias resolution read hub state
+    # into it, and before ingestion rewrites topics, tags and scope. Replaying
+    # the same capture must always produce the same key.
+    from khipu.capture_identity import source_identity
+
+    source = source_identity(payload)
     topics_written = 0
     episode_id: int | None = None
     with connect() as conn:
@@ -622,8 +744,28 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                 from khipu.identity import _resolve_project_alias
 
                 payload["project"] = _resolve_project_alias(cur, payload["project"]) or payload["project"]
-            dedup = dedup_before_insert(cur, payload)
+            dedup = dedup_before_insert(cur, payload, source=source)
             if dedup["action"] in ("skip", "merge"):
+                # The job is done once this returns (the outbox deletes it),
+                # so this is the last chance to record its trusted owner. Only
+                # an identity match (an exact window, a window_id, or a receipt
+                # of an identity merge) claims; origin is used for
+                # authorization, so a cosine or Jaccard resemblance, or a
+                # receipt of one, must never transfer ownership. A required
+                # claim that fails defers the write so the job is retried; one
+                # that is not required never blocks it.
+                if dedup.get("match") == MATCH_IDENTITY:
+                    cur.execute("SAVEPOINT capture_claim")
+                    try:
+                        _claim_unowned_episode(cur, dedup.get("matched_episode"),
+                                               _stamp_origin(cur))
+                    except Exception as exc:  # noqa: BLE001 - classified below
+                        cur.execute("ROLLBACK TO SAVEPOINT capture_claim")
+                        _log(f"origin claim failed ({type(exc).__name__}: {exc})")
+                        if _claim_required():
+                            raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
+                    else:
+                        cur.execute("RELEASE SAVEPOINT capture_claim")
                 conn.commit()
                 if dedup["action"] == "merge":
                     _refresh_merged_episode(cur, dedup["matched_episode"])
@@ -694,13 +836,18 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
 
             payload["scope"] = normalize_scope(payload.get("scope"))
 
-            inserted = _upsert_episode(cur, payload)
+            origin = _stamp_origin(cur)
+            inserted = _upsert_episode(cur, payload, source=source, origin=origin)
             if not inserted:
                 cur.execute(
                     "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
                     (payload["ts"], _md5_hex(payload["summary"])),
                 )
                 existing = cur.fetchone()
+                try:
+                    _claim_unowned_episode(cur, existing[0] if existing else None, origin)
+                except Exception as exc:  # noqa: BLE001 - only a required claim runs SQL
+                    raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
                 cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
                             (existing[0] if existing else None,))
                 row = cur.fetchone()
@@ -832,11 +979,9 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
     if suppress_mirror:
         env["KHIPU_MIRROR"] = "0"
     try:
-        proc = subprocess.run(
+        proc = run_text(
             [sys.executable, str(capture_v2)],
-            input=json.dumps(payload, ensure_ascii=False),
-            text=True,
-            capture_output=True,
+            input=wire.dumps(payload),
             env=env,
             timeout=300,
         )

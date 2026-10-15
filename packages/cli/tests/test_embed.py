@@ -523,6 +523,9 @@ class ApplySearchFiltersHarnessTest(unittest.TestCase):
         self.assertNotIn(", harness", cur.sql)
 
 
+_HUB_BUILT = "2026-10-15T12:00:00+00:00"
+
+
 class _CatchupCursor:
     """Enough of a cursor for embed_recent_missing's commitment (fix 5c) and
     topics (F2) passes: no episodes missing (isolates the leg under test),
@@ -546,11 +549,15 @@ class _CatchupCursor:
                             for slug, title, body in self.topic_rows]
         elif s.startswith("INSERT INTO memory_embeddings"):
             self.inserts.append(params)
+            self._result = [(_HUB_BUILT,)]  # RETURNING built_at
         else:
             self._result = []
 
     def fetchall(self):
         return list(self._result)
+
+    def fetchone(self):
+        return self._result[0] if self._result else None
 
     def __enter__(self):
         return self

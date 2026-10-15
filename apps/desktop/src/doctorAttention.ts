@@ -19,6 +19,7 @@ import {
   spanWords,
 } from "./routing";
 import type { RouteView } from "./routing";
+import { fmtAgo } from "./time";
 
 /** A named red check, in plain words, with at most one fix. Callers render
  *  one callout per entry; `fix` is omitted where the app has no honest fix to
@@ -329,14 +330,26 @@ export function buildAttention(parsed: Record<string, unknown>): {
     });
   }
 
-  const snap = (parsed as { hub_snapshot?: { ok?: boolean; reason?: string } }).hub_snapshot;
+  const snap = (parsed as {
+    hub_snapshot?: { ok?: boolean; reason?: string; age_seconds?: number | null; refresh_error?: { error?: string } | null };
+  }).hub_snapshot;
   if (snap && snap.ok === false) {
-    issues.push(`Offline copy is stale${snap.reason ? `: ${snap.reason}` : ""}`);
+    issues.push(`Offline copy is out of date${snap.reason ? `: ${snap.reason}` : ""}`);
+    // Only a missing, overdue or failed full rebuild turns this red; being
+    // behind the database between rebuilds shows on the health row instead.
+    const why =
+      snap.reason === "snapshot_refresh_failed"
+        ? `The last full rebuild failed${snap.refresh_error?.error ? `: ${snap.refresh_error.error}` : ""}.`
+        : snap.reason === "snapshot_refresh_overdue"
+          ? `The nightly job rebuilds it in full and last did so ${fmtAgo(snap.age_seconds)}.`
+          : snap.reason === "snapshot_missing"
+            ? "There is none on this Mac yet; the nightly job builds it."
+            : "It has no rebuild time on record.";
     items.push({
       key: "hub_snapshot",
       tone: "warn",
-      title: "The offline copy of your memory is behind",
-      cause: "It is what recall falls back to when the database is unreachable. Refreshing it is a Settings action.",
+      title: "The offline copy of your memory is out of date",
+      cause: `${why} Recall reads it first, and turns to the slower database once a full rebuild is more than a day old.`,
     });
   }
 

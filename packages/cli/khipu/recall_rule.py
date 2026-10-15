@@ -92,10 +92,11 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
   episode ids; cite the episodes, not the brief. `available: false` means off.
 - `khipu_reflect` answers one question from memory with each claim cited, or
   abstains. It calls a model: ask it for a synthesis, not a lookup.
-- `khipu_route` reads which accounts are open, limited, paused or down, with
-  the owner's rules and note: read it before handing work to another account.
-  `khipu_route_report` records a limit you hit; `khipu_route_rule` writes a
-  rule the owner asked for (unconfirmed until the owner confirms). Khipu reports; you route.
+- `khipu_route` reads which accounts are open, limited, paused or down,
+  the owner's rules, note, priority; read before delegating.
+  `khipu_route_report` logs a limit you hit; `khipu_route_rule` and
+  `khipu_route_priority` write an owner-requested rule or account
+  order (pending until confirmed). Khipu reports; you route.
 - Capture writes: on a local Mac with a Khipu capture hook (`khipu-stop-hook`
   or `khipu-aegis-capture`) the hook is the writer, not you — but `khipu_capture`
   works there too: call it (or `khipu capture now` in a shell) when you
@@ -454,7 +455,9 @@ def _pushed_memory_slice(cwd: str | None) -> str:
 def _session_start_payload() -> dict:
     """The hook's stdin payload, or {} (no input, not JSON, unreadable)."""
     try:
-        raw = sys.stdin.read()
+        from khipu import wire
+
+        raw = wire.read_stdin()
         if raw.strip():
             payload = json.loads(raw)
             if isinstance(payload, dict):
@@ -565,7 +568,7 @@ _ROUTING_CHILD_MOST = 60.0
 _ROUTING_CHILD_GRACE = 0.05
 
 
-def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float) -> None:
+def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, moment: str = "start") -> None:
     """The forked child: write the summary's JSON to ``write_fd`` and exit.
     Never returns, and never touches the hook's stdin, stdout or stderr."""
     code = 1
@@ -589,9 +592,9 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float) 
 
         signal.signal(signal.SIGALRM, on_alarm)
         signal.setitimer(signal.ITIMER_REAL, max(0.0, deadline - time.monotonic()) + _ROUTING_CHILD_GRACE)
-        out = routing.start_push(budget)
+        out = routing.start_push(budget, moment)
         if isinstance(out, dict):
-            data = memoryview(json.dumps({k: out.get(k) for k in ("text", "version", "epoch")}).encode("utf-8"))
+            data = memoryview(json.dumps({k: out.get(k) for k in ("text", "version", "epoch", "generation")}).encode("utf-8"))
             while data:
                 data = data[os.write(write_fd, data):]
         code = 0
@@ -602,7 +605,9 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float) 
 
 
 class _RoutingAtStart:
-    def __init__(self) -> None:
+    def __init__(self, moment: str = "start") -> None:
+        # "start", or "delegation" for a subagent's start (routing_delegation).
+        self.moment = moment
         self.out: dict | None = None
         self.deadline = time.monotonic()
         self.pid: int | None = None
@@ -613,7 +618,7 @@ class _RoutingAtStart:
             from khipu import routing
 
             started = time.monotonic()
-            if not hasattr(os, "fork") or routing.push_off("start"):
+            if not hasattr(os, "fork") or routing.push_off(self.moment):
                 return self  # off: no child at all
             # One small config read; any failure means the default second.
             try:
@@ -633,7 +638,7 @@ class _RoutingAtStart:
                 os.close(write_fd)
                 raise
             if pid == 0:
-                _routing_child(write_fd, read_fd, budget, self.deadline)
+                _routing_child(write_fd, read_fd, budget, self.deadline, self.moment)
             os.close(write_fd)
             self.pid, self.fd = pid, read_fd
         except Exception:
@@ -641,9 +646,10 @@ class _RoutingAtStart:
         return self
 
     def text(self) -> str | None:
-        """The summary's text, or None (off, failed, late or empty). Output
-        the child finished before the deadline is read even when the memory
-        part ran past it."""
+        """The summary's text, or None (off, failed, late, empty, or read
+        from a record generation that is no longer current). Output the
+        child finished before the deadline is read even when the memory part
+        ran past it."""
         if self.fd is None:
             return None
         try:
@@ -663,6 +669,10 @@ class _RoutingAtStart:
             text = out.get("text") if isinstance(out, dict) else None
             if not (isinstance(text, str) and text.strip()):
                 return None
+            from khipu import recall_prompt
+
+            if not recall_prompt._routing_generation_current(out.get("generation")):
+                return None  # the record changed since the child read it
             self.out = out
             return text
         except Exception:
@@ -731,7 +741,9 @@ def session_start_main(*, shape: str | None = None) -> None:
                 "additionalContext": ctx,
             }
         }
-    print(json.dumps(out))
+    from khipu import wire
+
+    print(wire.dumps(out, ensure_ascii=True))
     if pushed:
         try:
             sys.stdout.flush()

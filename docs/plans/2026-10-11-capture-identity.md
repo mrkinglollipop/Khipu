@@ -9,7 +9,7 @@ CAP-14, ARCH-10, CAP-22, ARCH-8 (P1); review RV1-01 (P0).
 
 | Phase | What | State |
 |---|---|---|
-| 1 | `episode_sources` table, backfill, dual write; nothing reads it yet | open |
+| 1 | `episode_sources` table, backfill, dual write; nothing reads it yet | built, in review (branch feat/capture-identity-p1) |
 | 2 | Every identity lookup reads sources; `write_pg` returns the episode id | open |
 | 3 | Uniqueness moves to the source key; the three backed-out fixes return | open |
 
@@ -107,6 +107,25 @@ Stop-conditions: if the backfill cannot derive a `source_key` for a class of his
 rows with no `session_id` and no stored payload), fall back to `sha256(id)` for those rows and say so in the
 PR; do not skip them. If the migration needs more than one transaction, stop and redesign the backfill as a
 separate `khipu migrate` step rather than splitting the file.
+
+Build notes (phase 1, 2026-10-15):
+
+- Measured on a scratch database seeded with 13,300 episodes (4 KB raw each, 2,660 merged entries): backfill
+  0.43 s, rerun 0.30 s. Read-only counts on this Mac's hub the same day: 19,303 live episodes; 11,468 with a
+  natural key, 7,835 without; 85 with `raw.merged_from` holding 104 entries.
+- Fallback classes, none skipped: origin rows with no natural key get the episode key
+  `sha256("khipu-episode-v1" US id)`, because their `raw` was rewritten after the write and no longer hashes
+  to the payload (7,835 here); `payload_sha256` is NULL on every backfilled origin row (not known).
+  782 live episodes share a natural key with an older episode (764 have `window_id` but no `part`, 18 have
+  neither, 2026-09-05 to 2026-10-11, all with distinct summaries); the older keeps the key and the newer
+  gets its episode key. Phase 3's collision gate must decide what these are before uniqueness moves; the
+  cause was not investigated. 26 merged entries carry neither a payload nor a `source_id` and are keyed
+  `sha256("khipu-merged-v1" US episode id US position)`.
+- Origin `ts` comes from `episodes.ts`, which no writer updates after insert, not from `raw.ts`.
+- The dual write lives in `mirror._upsert_episode` (so `write_pg`, the file mirror and reconcile all record
+  origin rows) and `capture._merge_into_episode`; `write_pg` snapshots the source identity before ingestion
+  rewrites topics, tags and scope. An origin key already held by another episode falls back to the episode
+  key, as in the backfill. The source row is fail-open under its own savepoint.
 
 Deploy order for this Mac: `khipu migrate` on the hub, then deploy the gateway, then merge (the hooks go
 live at merge). The gateway must tolerate the table being absent regardless.

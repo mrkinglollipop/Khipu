@@ -34,7 +34,7 @@ import re
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -86,22 +86,48 @@ def _locked_outbox():
         os.close(fd)
 
 
+def _queued_origin() -> dict[str, Any]:
+    """The origin to keep beside the payload, stamped now from the request
+    context (gateway provenance, phase 1), so a replay from another process or
+    machine writes the row as the caller that queued it. When this machine has
+    no readable identity the owner is recorded as unknown (None), never left
+    out: a job without the key is a legacy job, which the drainer stamps with
+    its own identity, and that machine may not be the one that queued it."""
+    from khipu.machine_identity import MachineIdentityError
+    from khipu.request_context import request_origin
+
+    try:
+        return {"origin": request_origin()}
+    except MachineIdentityError:
+        return {"origin": None}
+
+
+def _same_evidence(job: dict[str, Any], payload: dict[str, Any], stamp: dict[str, Any]) -> bool:
+    return job["payload"] == payload and {k: job[k] for k in ("origin",) if k in job} == stamp
+
+
 def enqueue(payload: dict[str, Any], *, reason: str = "") -> Path:
-    """Durably queue a capture; acknowledge an existing file only for equal content."""
+    """Durably queue a capture; acknowledge an existing file only for equal
+    content and equal origin."""
+    stamp = _queued_origin()
+    # Only the envelope says who owns a queued capture; the caller's own claim
+    # is dropped here as write_pg drops it.
+    payload = {k: v for k, v in payload.items() if k != "origin"}
     with _locked_outbox() as d:
-        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
+        evidence = {"payload": payload, **stamp} if stamp else payload
+        digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False,
                                           separators=(",", ":")).encode("utf-8")).hexdigest()
         collision = d / f"{digest}.json"
         if collision.exists():
-            if _read_job(collision)["payload"] != payload:
+            if not _same_evidence(_read_job(collision), payload, stamp):
                 raise ValueError("outbox identity conflicts with existing evidence")
             return collision
         dst = d / f"{_identity(payload)}.json"
-        job = {"payload": payload, "reason": reason, "queued_at": datetime.now(timezone.utc).isoformat(),
-               "attempts": 0}
+        job = {"payload": payload, **stamp, "reason": reason,
+               "queued_at": datetime.now(timezone.utc).isoformat(), "attempts": 0}
         if dst.exists():
             try:
-                if _read_job(dst)["payload"] == payload:
+                if _same_evidence(_read_job(dst), payload, stamp):
                     return dst
             except (OSError, ValueError, TypeError):
                 pass
@@ -176,6 +202,10 @@ def _read_job(jp: Path) -> dict[str, Any]:
     if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
         raise ValueError("job attempts is not a non-negative integer")
     job["attempts"] = attempts
+    from khipu.request_context import valid_origin
+
+    if "origin" in job and not valid_origin(job["origin"]):
+        raise ValueError("job origin is not a queued origin")
     return job
 
 
@@ -263,6 +293,18 @@ def status() -> dict[str, Any]:
             "max_attempts": MAX_ATTEMPTS}
 
 
+def _retry_order(jp: Path) -> tuple[bool, str, str]:
+    """Jobs never tried run first, in queue order; then failed jobs, oldest
+    attempt first; deferred origin claims last, also oldest attempt first. A
+    bounded drain therefore rotates through every retry instead of spending
+    its budget on the same failures in filename order."""
+    try:
+        job = json.loads(jp.read_text())
+        return (bool(job.get("claim_deferred")), str(job.get("last_attempt_at") or ""), jp.name)
+    except (OSError, ValueError, AttributeError):
+        return (False, "", jp.name)
+
+
 def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> dict[str, Any]:
     """Elect one replayer without blocking enqueue during external I/O.
 
@@ -279,12 +321,13 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return {**out, "busy": True}
-        js = jobs()
+        js = sorted(jobs(), key=_retry_order)
         if limit is not None:
             js = js[:limit]
         out["jobs"] = len(js)
-        from khipu.capture import write_pg
+        from khipu.capture import ClaimDeferred, write_pg
         from khipu.embed import embed_on_capture
+        from khipu.request_context import replaying
 
         for jp in js:
             if deadline is not None and time.monotonic() >= deadline:
@@ -301,20 +344,32 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                     _quarantine(jp, e)
                     out["quarantined"] = out.get("quarantined", 0) + 1
                     continue
+            # The queued origin, not this drainer's context, owns the row. A job
+            # queued before origins were recorded is stamped as before.
+            owner = replaying(job["origin"]) if "origin" in job else nullcontext()
             try:
-                stats = write_pg(payload)
+                with owner:
+                    stats = write_pg(payload)
             except Exception as e:  # noqa: BLE001 — keep the job; note the attempt
                 out["failed"] += 1
                 job["attempts"] += 1
                 job["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
+                job["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
                 name = type(e).__name__
                 unreachable = "Operational" in name or "Connection" in name or "connect" in str(e).lower()
+                # A deferred origin claim is transient and its job holds the
+                # only record of the owner: retried, never buried.
+                deferred = isinstance(e, ClaimDeferred)
+                job["claim_deferred"] = deferred
+                if deferred:
+                    unreachable = False
+                    out["deferred"] = out.get("deferred", 0) + 1
                 with _locked_outbox():
                     try:
                         # A concurrent forget/retry owns its change. Never
                         # resurrect a removed job or overwrite a replacement.
                         if jp.read_bytes() == snapshot:
-                            if not unreachable and job["attempts"] >= MAX_ATTEMPTS:
+                            if not (unreachable or deferred) and job["attempts"] >= MAX_ATTEMPTS:
                                 _bury(jp, job)
                                 out["buried"] = out.get("buried", 0) + 1
                             else:

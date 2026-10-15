@@ -49,11 +49,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from khipu import t3 as _t3
+from khipu import wire
 if not hasattr(_t3, 'handoff_thread'):
     # A long-lived MCP server can still hold the t3 from before the
     # deploy that added this name; t3 is stdlib-only, so reloading is safe.
     import importlib
     importlib.reload(_t3)
+from khipu.lines import split_lines
 from khipu.t3 import handoff_thread, is_helper_session, strip_handoff
 
 # Hard wall-clock budget for the whole gated search (R1): a hook that can add
@@ -244,17 +246,25 @@ def mark_routing_full(session_id: str, *, version: int, epoch: str | None, at: s
 
 
 def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_at: str | None = None,
-                      unrefreshed: str | None = None, wait: float = 0.05) -> bool:
+                      unrefreshed: str | None = None, based_on=None, wait: float = 0.05) -> bool:
     """Move the session's last-seen routing version to ``version`` once a
     block was delivered (routing truth, phases 3a and 3b). With ``full_at``
     the marker starts again from a full summary; otherwise only the version
-    moves, and never back within one epoch (two prompts of one session
-    delivered out of order). ``unrefreshed`` records that the not-refreshed
+    moves. Within one epoch nothing moves back (two prompts of one session
+    delivered out of order): a full summary older than what was heard
+    leaves the marker as it is. One exception: a full summary read against
+    this very marker (``based_on``, the version its child read, and nothing
+    delivered since) sets a version ahead of the record back to it (the
+    record's count started again, as after a restored view.json). ``unrefreshed`` records that the not-refreshed
     line for that read was said. Waits for the session's lock at most
     ``wait``; a busy lock or a failed write records nothing (the block is
     sent again) and is never raised."""
     def change(old: dict) -> dict:
         if full_at is not None:
+            if old.get("epoch") == epoch and isinstance(old.get("version"), int) and (
+                    (old["version"] > version and not (based_on is not None and old["version"] == based_on))
+                    or (old["version"] == version and _later(old.get("full_at"), full_at))):
+                return old  # a later block was heard first: an older full summary moves nothing back
             new = {"version": version, "epoch": epoch, "full_at": full_at}
         else:
             new = dict(old, epoch=epoch)
@@ -267,6 +277,14 @@ def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_
         return new
 
     return _update_routing_marker(session_id, change, wait)
+
+
+def _later(a, b) -> bool:
+    """Whether time ``a`` is after time ``b`` (both ISO; False when either is not)."""
+    try:
+        return datetime.fromisoformat(a.replace("Z", "+00:00")) > datetime.fromisoformat(b.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def mark_routing_pointer(session_id: str, *, version: int, epoch: str | None, wait: float = 0.05) -> bool:
@@ -390,10 +408,12 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
-def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, decided: bool = False) -> None:
+def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, decided: bool = False,
+                          moment: str = "prompt") -> None:
     """The forked child: decide whether routing is on for this prompt (the
-    switches, read from ``environ``, and the settings) unless the process
-    that started it already did (``decided``), write the time it is ready to
+    switches, read from ``environ``, and the settings; ``moment`` names
+    the push: "prompt", or "delegation" for the delegation hook) unless the
+    process that started it already did (``decided``), write the time it is ready to
     read and the read's budget (one line), then the routing answer's JSON
     (one line), to ``write_fd``, and exit. Never returns, and never touches
     the hook's stdin, stdout or stderr. ``deadline`` is the latest the hook
@@ -425,7 +445,7 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
         from khipu import routing
 
         routing.prompt_imports()
-        off = None if decided else routing.push_off("prompt", environ=environ)
+        off = None if decided else routing.push_off(moment, environ=environ)
         budget = 0.0
         if not off and isinstance(session_id, str) and session_id:
             try:
@@ -438,7 +458,7 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
             # nowhere to keep what it has seen. One write, with the ready line:
             # the hook gives this answer no time to arrive after it.
             answer = {"skip": "off" if off else "no-session"}
-            _write_all(write_fd, ready + json.dumps(answer).encode("utf-8") + b"\n")
+            _write_all(write_fd, ready + wire.encode(answer, ensure_ascii=True) + b"\n")
         else:
             _write_all(write_fd, ready)
             def fold_started() -> None:
@@ -451,9 +471,11 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
             try:
                 marker = routing_marker(session_id)
                 out = routing.prompt_push(marker, budget=budget, on_fold=fold_started)
-                answer = {k: out.get(k) for k in ("kind", "text", "version", "epoch", "count", "unrefreshed")}
+                answer = {k: out.get(k) for k in ("kind", "text", "version", "epoch", "count", "unrefreshed",
+                                                "generation")}
                 if isinstance(answer["text"], str) and len(answer["text"]) > _ROUTING_TEXT_MOST:
                     answer["text"] = answer["text"][:_ROUTING_TEXT_MOST]
+                answer["seen"] = marker.get("version")  # what the marker was when this answer was read
                 answer["pointer_said"] = marker.get("pointer") == {"version": out.get("version"),
                                                                    "epoch": out.get("epoch")}
                 answer["at"] = routing._iso(routing._now())
@@ -466,7 +488,7 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
             # When the answer was finished: the hook takes it only if that was
             # within the read's budget, however long it took to read the pipe.
             answer["done"] = time.monotonic()
-            _write_all(write_fd, json.dumps(answer).encode("utf-8") + b"\n")
+            _write_all(write_fd, wire.encode(answer, ensure_ascii=True) + b"\n")
         code = 0
     except BaseException:  # noqa: BLE001 - nothing for routing, never a failed hook
         code = 1
@@ -1248,7 +1270,7 @@ def _poll_routing_child(write_fd: int, *, blocked_resets=None) -> None:
                 signal.signal(sig, stop)
 
         out = _poll_once(routing, on_fold=fold_started, on_probe=probe_started, blocked_resets=blocked_resets)
-        _write_all(write_fd, json.dumps(out).encode("utf-8") + b"\n")
+        _write_all(write_fd, wire.encode(out, ensure_ascii=True) + b"\n")
         code = 0
     except BaseException:  # noqa: BLE001 - the helper reads end of file and tries again later
         code = 1
@@ -1414,6 +1436,27 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
         _reap_until(lambda: len(children) + len(pollers), reap, time.monotonic() + _FORKSERVER_REAP_MOST)
 
 
+def _routing_generation_current(files) -> bool:
+    """Whether every file a routing answer was read from
+    (``routing._generation``: ``[[path, stat], ...]``) still has the stat it
+    had then. An answer can sit in the pipe while the search runs, and the
+    record can change meanwhile; one read from an older generation is never
+    delivered. A stat each, never a wait."""
+    if not isinstance(files, list):
+        return False
+    for item in files:
+        if not (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)):
+            return False
+        try:
+            st = os.stat(item[0])
+            now = [st.st_mtime_ns, st.st_size, st.st_ino]
+        except OSError:
+            now = None
+        if now != item[1]:
+            return False
+    return True
+
+
 class _RoutingAtPrompt:
     """One prompt's routing read: ``begin`` forks the child, ``collect``
     reads its answer within the budget, ``info`` says what to add."""
@@ -1427,7 +1470,8 @@ class _RoutingAtPrompt:
         self.session: str | None = None
         self.helper: RoutingForkServer | None = None
 
-    def begin(self, session_id, environ=None, forkserver: "RoutingForkServer | None" = None) -> "_RoutingAtPrompt":
+    def begin(self, session_id, environ=None, forkserver: "RoutingForkServer | None" = None,
+              moment: str = "prompt") -> "_RoutingAtPrompt":
         """Start the child. ``environ`` is the hook's environment when it is
         not this process's (``caller_environ``). ``forkserver`` (the recall
         daemon's) starts it, so this process never forks; the daemon then
@@ -1435,7 +1479,9 @@ class _RoutingAtPrompt:
         one-shot hook forks itself and only reads the feature switch: the
         rest (the other switches, the settings, the budget, the session's
         marker) is the child's, so its search never waits for routing to be
-        imported."""
+        imported. ``moment`` is the push's switch: "prompt", or "delegation"
+        for the delegation hook (``routing_delegation``), which shares this
+        read, its budget and the session's marker."""
         try:
             from khipu import features
 
@@ -1451,7 +1497,7 @@ class _RoutingAtPrompt:
             if decided:
                 from khipu import routing as _routing
 
-                if _routing.push_off("prompt", environ=env):
+                if _routing.push_off(moment, environ=env):
                     return self  # off: nothing logged, as when the push is off
             if forkserver is None and not hasattr(os, "fork"):
                 self.status = "skipped:no-fork"
@@ -1491,7 +1537,7 @@ class _RoutingAtPrompt:
                 os.close(write_fd)
                 raise
             if pid == 0:
-                _prompt_routing_child(write_fd, session_id, environ, self.cap, decided)
+                _prompt_routing_child(write_fd, session_id, environ, self.cap, decided, moment)
             os.close(write_fd)
             self.pid, self.fd = pid, read_fd
             self.status = "skipped:budget"  # until an answer arrives in time
@@ -1504,13 +1550,17 @@ class _RoutingAtPrompt:
         """The child's answer, or None (off, failed or late). Waits until the
         budget has run from the moment the child was ready to read, never
         past ``self.cap`` nor ``limit`` (the request's deadline). An answer
-        the child finished within the budget (the time on its line) is read
-        even when the search ran past it; one finished later is not, however
-        early it is read (fix round 5). Once the wait is over, what is
+        the child finished (the time on its line) within the budget, or
+        before this call (while the prompt was still searching, so it costs
+        the prompt nothing), is taken; one finished after both is not,
+        however early it is read (fix round 5). Nor is one whose record
+        generation is no longer current (``_routing_generation_current``).
+        Once the wait is over, what is
         already buffered is read for at most ``_ROUTING_DRAIN_MOST`` seconds,
         and never more than ``_ROUTING_ANSWER_MOST`` bytes in all."""
         if self.fd is None:
             return None
+        asked = time.monotonic()
         try:
             import select
 
@@ -1559,11 +1609,14 @@ class _RoutingAtPrompt:
                 self.status = "skipped:no-answer"
                 return None
             done = out.get("done")
-            cutoff = min(self.cap, began + self.budget)
+            cutoff = min(self.cap, max(began + self.budget, asked))
             if limit is not None:
                 cutoff = min(cutoff, limit)  # nor after the request's own deadline
             if not isinstance(done, (int, float)) or isinstance(done, bool) or done > cutoff:
                 return None  # finished after its budget: routing=skipped:budget, the marker unmoved
+            if not _routing_generation_current(out.get("generation")):
+                self.status = "skipped:stale"  # the record changed since its read: the marker unmoved
+                return None
             return out
         except Exception:
             self.status = "skipped:error"
@@ -1609,7 +1662,7 @@ class _RoutingAtPrompt:
         if recall_rule._utf16_len(combined) <= recall_rule._HOOK_CONTEXT_BUDGET:
             pending = {"session": self.session, "version": out["version"], "epoch": out.get("epoch"),
                        "full": out["kind"] == "full", "unrefreshed": out.get("unrefreshed"),
-                       "at": out.get("at")}
+                       "at": out.get("at"), "based_on": out.get("seen")}
             return combined, {"status": label, "pending": pending}
         # Too long to go with this prompt. The block is not delivered, so the
         # session's last-seen version does not move and a later prompt with
@@ -1640,7 +1693,8 @@ def _routing_delivered(info: dict | None, delivered: bool) -> str:
             # The child's clock when it read (this process never imports routing).
             full_at = pending.get("at") if pending["full"] else None
             if not mark_routing_seen(pending["session"], version=pending["version"], epoch=pending["epoch"],
-                                     full_at=full_at, unrefreshed=pending.get("unrefreshed")):
+                                     full_at=full_at, unrefreshed=pending.get("unrefreshed"),
+                                     based_on=pending.get("based_on") if pending["full"] else None):
                 status = f"{status}:unmarked"
     return f" routing={status}"
 
@@ -3053,7 +3107,7 @@ def prompt_recall_main(*, shape: str | None = None) -> None:
     """Entry point for ``bin/khipu-prompt-recall``. Never raises: any failure
     prints ``{}`` so a broken recall lane can never block a prompt."""
     try:
-        raw = sys.stdin.read()
+        raw = wire.read_stdin()
     except Exception:  # noqa: BLE001
         raw = ""
     want = (shape or ("cursor" if "--cursor" in sys.argv[1:] else "claude")).strip().lower()
@@ -3070,7 +3124,7 @@ def prompt_recall_main(*, shape: str | None = None) -> None:
         log_terminal_outcome(raw, f"error: hook_main crashed: {type(exc).__name__}: {exc}")
         out = {}
     try:
-        print(json.dumps(out), flush=True)
+        print(wire.dumps(out, ensure_ascii=True), flush=True)
     except OSError:
         finish_delivery(delivery, delivered=False, reason="error: stdout delivery failed")
     else:
@@ -3162,7 +3216,7 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
         return {"ok": False, "available": False, "insufficient": True, "count": 0}
 
     calls: list[tuple[str, float]] = []
-    for line in raw.splitlines():
+    for line in split_lines(raw):
         m = _LOG_LINE_RE.match(line)
         if not m:
             continue
@@ -3261,7 +3315,7 @@ def prompt_routing_budget_rate(*, now: datetime | None = None, warn_pct: float =
     except OSError:
         return out
     statuses: list[str] = []
-    for line in raw.splitlines():
+    for line in split_lines(raw):
         m = _LOG_LINE_RE.match(line)
         if not m:
             continue

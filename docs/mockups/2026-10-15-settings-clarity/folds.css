@@ -1,0 +1,19 @@
+/* Mock-only (2026-10-15 review): every fold is a button with aria-expanded that controls the region under it,
+   in place of <details>/<summary>. Base look copied from App.css's details.disclose rules. */
+.fold.disclose{border-top:1px solid var(--border);padding-top:var(--s1)}
+button.fold-btn{display:flex;align-items:center;gap:var(--s2);width:100%;height:auto;min-height:32px;margin:0;padding:var(--s2) 0;border:0;border-radius:0;background:transparent;box-shadow:none;font:inherit;font-size:var(--t-sm);font-weight:inherit;color:var(--muted);text-align:left;cursor:pointer;transition:none}
+button.fold-btn:hover{border:0;background:transparent;color:var(--text-2)}
+button.fold-btn:focus-visible{outline:none;box-shadow:inset 0 0 0 3px var(--ring);border-radius:var(--r-sm)}
+button.fold-btn[aria-expanded=true] > .disclosure-chevron,button.fold-btn[aria-expanded=true] .gname > .disclosure-chevron{transform:rotate(90deg)}
+.fold-body[hidden]{display:none}
+/* Group and account headers are the main targets on this page: at least 44 px tall. */
+.fold.route-group > button.fold-btn{min-height:44px}
+.fold.acct-line > button.fold-btn{min-height:44px}
+/* Filter chips and the sort menu: 32 px, the app's largest small control. */
+.route-filter button.chip{height:32px;padding:0 12px}
+.route-filter select.sort{height:32px}
+/* Headings moved up a level so none is skipped (rule/no-skipped-heading-levels); the look stays the same. */
+.section-body h2.sub-title{margin:var(--s3) 0 var(--s1);font-size:var(--t-sm);font-weight:600;color:var(--text-2);letter-spacing:0;text-transform:none;line-height:1.4}
+h2.rows-head.route-day{margin:0}
+/* "Accounts and routing" wraps in the Settings list at 960 wide; wrapped names stay left-aligned. */
+.subnav button{justify-content:flex-start;text-align:left}

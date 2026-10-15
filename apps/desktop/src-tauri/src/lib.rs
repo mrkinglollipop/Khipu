@@ -604,6 +604,7 @@ const ROUTING_DURATION_KEYS: &[&str] = &[
     "routing_poll_interval",
     "routing_reset_check_wait",
     "routing_busy_wait",
+    "routing_priority_unconfirmed_warn_after",
 ];
 /// Whole numbers of 0 or more.
 const ROUTING_COUNT_KEYS: &[&str] = &[
@@ -622,7 +623,16 @@ const ROUTING_COUNT_KEYS: &[&str] = &[
 /// Numbers of 0 or more, a fraction allowed (a percentage).
 const ROUTING_NUMBER_KEYS: &[&str] = &["routing_slow_read_pct", "routing_busy_load"];
 /// On or off.
-const ROUTING_SWITCH_KEYS: &[&str] = &["routing_push_start", "routing_push_prompt", "routing_reset_check"];
+const ROUTING_SWITCH_KEYS: &[&str] = &[
+    "routing_push_start",
+    "routing_push_prompt",
+    "routing_push_delegation",
+    "routing_reset_check",
+    "routing_pace_order",
+];
+/// The owner's own dispatch scripts, by file name (phase 6).
+const ROUTING_DISPATCH_SCRIPTS_KEY: &str = "routing_dispatch_scripts";
+const ROUTING_DISPATCH_SCRIPTS_MAX: usize = 16;
 const ROUTING_RETRIES_KEY: &str = "routing_reset_check_retries";
 const ROUTING_SOURCES_KEY: &str = "routing_sources";
 const ROUTING_LANE_MAP_KEY: &str = "routing_lane_map";
@@ -774,6 +784,35 @@ fn routing_key(key: &str) -> bool {
         || key == ROUTING_SOURCES_KEY
         || key == ROUTING_LANE_MAP_KEY
         || key == ROUTING_TABLE_KEY
+        || key == ROUTING_DISPATCH_SCRIPTS_KEY
+}
+
+/// The dispatch scripts: a JSON list of file names only (letters, digits,
+/// dots, dashes and underscores; no folder), re-serialised.
+fn checked_dispatch_scripts(raw: &str) -> Result<String, String> {
+    let bad = || "dispatch scripts must be a JSON list of file names".to_string();
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|_| bad())?;
+    let items = value.as_array().ok_or_else(bad)?;
+    if items.len() > ROUTING_DISPATCH_SCRIPTS_MAX {
+        return Err(format!("at most {ROUTING_DISPATCH_SCRIPTS_MAX} dispatch scripts"));
+    }
+    let mut out: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        let name = item.as_str().ok_or_else(bad)?.trim();
+        let plain = !name.is_empty()
+            && name.chars().count() <= 64
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            && name != "."
+            && name != ".."
+            && !name.starts_with('-');
+        if !plain {
+            return Err(format!("{name:?} must be a file name only: letters, digits, dots, dashes and underscores"));
+        }
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
 /// A file's full path, one line, starting with `/` or `~/` (so never with
@@ -870,6 +909,9 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     }
     if key == ROUTING_TABLE_KEY {
         return checked_routing_path("the routing table file", v);
+    }
+    if key == ROUTING_DISPATCH_SCRIPTS_KEY {
+        return checked_dispatch_scripts(v);
     }
     if key == ROUTING_RETRIES_KEY {
         if has_control(v) { return Err("retry times must be one line".to_string()); }
@@ -1250,6 +1292,117 @@ fn route_hold_end_argv(id: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+/// The owner's priority verbs (`khipu route priority ACTION`, routing truth
+/// phase 4b).
+const ROUTE_PRIORITY_ACTIONS: &[&str] = &["set", "confirm", "undo", "clear"];
+/// The most entries one priority holds when read back (`routing.PRIORITY_MOST`).
+const ROUTE_PRIORITY_MOST: usize = 64;
+
+/// One account in the owner's priority as the webview sends it, in his order.
+#[derive(serde::Deserialize, Debug, Clone)]
+struct PriorityEntry {
+    account: String,
+    role: Option<String>,
+    until: Option<String>,
+}
+
+/// `route priority --from-app [--entries=JSON] [--until=T] -- ACTION`. The
+/// entries are rebuilt here from their checked fields alone (account, role,
+/// end) into JSON that travels joined to `--entries=`, so no value the
+/// webview sends can become a flag or an argument of its own; their order is
+/// the owner's, kept as sent.
+fn route_priority_argv(action: &str, entries: &[PriorityEntry], until: Option<&str>) -> Result<Vec<String>, String> {
+    if !ROUTE_PRIORITY_ACTIONS.contains(&action) {
+        return Err(format!("not a change to the priority: {action:?}"));
+    }
+    let mut argv = route_base("priority");
+    if action == "set" {
+        if entries.is_empty() {
+            return Err("put at least one account in the priority, or clear it".to_string());
+        }
+        if entries.len() > ROUTE_PRIORITY_MOST {
+            return Err(format!("a priority holds at most {ROUTE_PRIORITY_MOST} accounts"));
+        }
+        let mut clean = Vec::with_capacity(entries.len());
+        for e in entries {
+            let mut item = serde_json::Map::new();
+            item.insert("account".to_string(), Value::String(checked_route_account(&e.account)?));
+            if let Some(role) = e.role.as_deref().filter(|r| !r.trim().is_empty()) {
+                item.insert("role".to_string(), Value::String(checked_route_words(role, false)?));
+            }
+            if let Some(t) = e.until.as_deref().filter(|t| !t.trim().is_empty()) {
+                item.insert("until".to_string(), Value::String(checked_route_until(t)?));
+            }
+            clean.push(Value::Object(item));
+        }
+        let json = Value::Array(clean).to_string();
+        if json.len() > ROUTE_WORDS_MAX_BYTES {
+            return Err("this priority is longer than the app can hand over in one change; shorten the roles".to_string());
+        }
+        argv.push(format!("--entries={json}"));
+        if let Some(t) = until.filter(|t| !t.trim().is_empty()) {
+            argv.push(format!("--until={}", checked_route_until(t)?));
+        }
+    }
+    argv.extend(["--".to_string(), action.to_string()]);
+    Ok(argv)
+}
+
+/// The CLIs whose own login the app can start (`khipu.usage.SIGN_IN_ARGS`):
+/// each opens the owner's browser and asks nothing on a terminal.
+const SIGN_IN_HARNESSES: &[&str] = &["claude", "codex"];
+
+/// `~/x` as `<user home>/x`, for comparing one login folder written two ways.
+fn expand_home(path: &str, user_home: Option<&str>) -> String {
+    match (path.strip_prefix("~/"), user_home) {
+        (Some(rest), Some(h)) => format!("{}/{}", h.trim_end_matches('/'), rest),
+        _ => path.to_string(),
+    }
+}
+
+/// `usage --sign-in --account=LABEL --account-key=HARNESS|FOLDER` for the
+/// configured account that reads `harness` at `home` (None: the CLI's default
+/// login). `config` is `khipu config`'s answer: the account must be one of its
+/// `usage_accounts.accounts`, valid, and of a CLI the app can sign in; its
+/// label and folder come from that list, never from the webview. The key is
+/// the account's identity (`khipu.usage._key`), so two hand-edited accounts
+/// sharing a label stay apart; the CLI resolves it again, refuses a label
+/// that names more than one account, and builds the login's own argv itself.
+fn sign_in_argv(config: &Value, harness: &str, home: Option<&str>) -> Result<Vec<String>, String> {
+    if !SIGN_IN_HARNESSES.contains(&harness) {
+        return Err("Khipu can't start this CLI's sign-in; sign in from the CLI itself".to_string());
+    }
+    let status = config.get("usage_accounts").ok_or("Khipu couldn't read the account list")?;
+    let user_home = status.get("user_home").and_then(Value::as_str);
+    let wanted = home.map(str::trim).filter(|h| !h.is_empty()).map(|h| expand_home(h, user_home));
+    let accounts = status.get("accounts").and_then(Value::as_array).ok_or("Khipu couldn't read the account list")?;
+    let found = accounts.iter().find(|a| {
+        let same_cli = a.get("harness").and_then(Value::as_str) == Some(harness);
+        let theirs = a
+            .get("home")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(|h| expand_home(h, user_home));
+        same_cli && a.get("invalid").map_or(true, Value::is_null) && theirs == wanted
+    });
+    let account = found.ok_or("that login folder is not one of the accounts in Settings → Capture & models → Plans")?;
+    let label = account.get("label").and_then(Value::as_str).unwrap_or("").trim();
+    if label.is_empty() || has_control(label) {
+        return Err("that account has no label Khipu can name".to_string());
+    }
+    let folder = account.get("home").and_then(Value::as_str).map(str::trim).unwrap_or("");
+    if has_control(folder) {
+        return Err("that account has a login folder Khipu can't name".to_string());
+    }
+    Ok(vec![
+        "usage".to_string(),
+        "--sign-in".to_string(),
+        format!("--account={label}"),
+        format!("--account-key={harness}|{folder}"),
+    ])
+}
+
 #[tauri::command]
 async fn khipu_route_pause(account: String, until: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(route_pause_argv(&account, until.as_deref())?).await
@@ -1299,6 +1452,26 @@ async fn khipu_route_hold_add(
 #[tauri::command]
 async fn khipu_route_hold_end(id: String) -> Result<String, String> {
     run_khipu_cli_async(route_hold_end_argv(&id)?).await
+}
+
+#[tauri::command]
+async fn khipu_route_priority(
+    action: String,
+    entries: Option<Vec<PriorityEntry>>,
+    until: Option<String>,
+) -> Result<String, String> {
+    run_khipu_cli_async(route_priority_argv(&action, entries.as_deref().unwrap_or(&[]), until.as_deref())?).await
+}
+
+/// Sign in again: the CLI starts the account's own login (it opens the
+/// browser) in its own session, waits for it to end and reads that account
+/// again, so the answer is the account's new state. The account is checked
+/// against the configured list read just now.
+#[tauri::command]
+async fn khipu_account_sign_in(harness: String, home: Option<String>) -> Result<String, String> {
+    let raw = run_khipu_cli_async(fixed_argv(CONFIG_SHOW_ARGV)).await?;
+    let config: Value = serde_json::from_str(raw.trim()).map_err(|_| "Khipu couldn't read the account list".to_string())?;
+    run_khipu_cli_async(sign_in_argv(&config, &harness, home.as_deref())?).await
 }
 
 #[tauri::command]
@@ -2913,6 +3086,8 @@ pub fn run() {
             khipu_route_rule,
             khipu_route_hold_add,
             khipu_route_hold_end,
+            khipu_route_priority,
+            khipu_account_sign_in,
             khipu_jobs_status,
             khipu_job_install,
             khipu_job_uninstall,
@@ -3569,8 +3744,25 @@ mod settings_command_tests {
             assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }
         assert_eq!(config_unset_argv("routing_reset_check").unwrap(), v(&["config", "--unset=routing_reset_check"]));
-        // Phase 6 and 7 settings are not offered yet.
-        for k in ["routing_push_delegation", "routing_cloud_copy", "routing_rules_seed"] {
+        // Phase 6: the push before handing work to another agent, and the
+        // owner's dispatch scripts, by file name only.
+        assert_eq!(config_set_argv("routing_push_delegation", "off").unwrap(), v(&["config", "--set", "routing_push_delegation", "off"]));
+        assert_eq!(config_unset_argv("routing_push_delegation").unwrap(), v(&["config", "--unset=routing_push_delegation"]));
+        assert!(config_set_argv("routing_push_delegation", "yes").is_err());
+        assert_eq!(
+            config_set_argv("routing_dispatch_scripts", r#"[" dispatch.py ", "run-job.sh", "dispatch.py"]"#).unwrap(),
+            v(&["config", "--set", "routing_dispatch_scripts", r#"["dispatch.py","run-job.sh"]"#])
+        );
+        assert_eq!(config_set_argv("routing_dispatch_scripts", "[]").unwrap(), v(&["config", "--set", "routing_dispatch_scripts", "[]"]));
+        assert_eq!(config_unset_argv("routing_dispatch_scripts").unwrap(), v(&["config", "--unset=routing_dispatch_scripts"]));
+        for bad in [r#"["/bin/dispatch.py"]"#, r#"["a b"]"#, r#"[".."]"#, r#"["-x"]"#, r#"["-c"]"#, r#"["a\nb"]"#, r#"[3]"#,
+                    "dispatch.py", r#"{"a": 1}"#] {
+            assert!(config_set_argv("routing_dispatch_scripts", bad).is_err(), "{bad}");
+        }
+        let many: Vec<String> = (0..17).map(|i| format!("\"s{i}.py\"")).collect();
+        assert!(config_set_argv("routing_dispatch_scripts", &format!("[{}]", many.join(","))).is_err());
+        // Phase 7 settings are not offered yet.
+        for k in ["routing_cloud_copy", "routing_rules_seed"] {
             assert!(config_set_argv(k, "on").is_err(), "{k}");
             assert!(config_unset_argv(k).is_err(), "{k}");
         }
@@ -4380,5 +4572,106 @@ mod audit_1010_regression_tests {
         let out = Command::new("/bin/bash").arg("-c").arg(body).output().unwrap();
         let _ = std::fs::remove_dir_all(temp);
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+#[cfg(test)]
+mod priority_and_sign_in_tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn entry(account: &str, role: Option<&str>, until: Option<&str>) -> PriorityEntry {
+        PriorityEntry { account: account.into(), role: role.map(Into::into), until: until.map(Into::into) }
+    }
+
+    #[test]
+    fn the_priority_travels_as_one_joined_json_argument_in_the_owners_order() {
+        let entries = [
+            entry("claude|/logins/claude-second", Some("all Claude work first"), Some("2026-10-17T15:00:00-04:00")),
+            entry("codex|", Some("--from-app -- clear"), None),
+            entry("claude|", None, None),
+        ];
+        let argv = route_priority_argv("set", &entries, Some("2026-10-20T09:00:00Z")).unwrap();
+        assert_eq!(argv[..3], v(&["route", "priority", "--from-app"])[..]);
+        assert_eq!(argv[argv.len() - 2..], v(&["--", "set"])[..]);
+        assert_eq!(argv.len(), 7);
+        let json = argv[3].strip_prefix("--entries=").unwrap();
+        let parsed: Value = serde_json::from_str(json).unwrap();
+        let order: Vec<&str> = parsed.as_array().unwrap().iter().map(|e| e["account"].as_str().unwrap()).collect();
+        assert_eq!(order, ["claude|/logins/claude-second", "codex|", "claude|"]);
+        // A role that looks like a flag stays words inside the JSON.
+        assert_eq!(parsed[1]["role"], "--from-app -- clear");
+        assert_eq!(argv[4], "--until=2026-10-20T09:00:00Z");
+    }
+
+    #[test]
+    fn a_value_can_never_become_an_option() {
+        assert!(route_priority_argv("set", &[entry("--from-app", None, None)], None).is_err());
+        assert!(route_priority_argv("set", &[entry("Codex\n--x", None, None)], None).is_err());
+        assert!(route_priority_argv("set", &[entry("Codex", Some("a\nb"), None)], None).is_err());
+        assert!(route_priority_argv("set", &[entry("Codex", None, Some("--until"))], None).is_err());
+        assert!(route_priority_argv("set", &[entry("Codex", None, None)], Some("1h")).is_err());
+        assert!(route_priority_argv("--clear", &[], None).is_err());
+        assert!(route_priority_argv("set", &[], None).is_err());
+        let many: Vec<PriorityEntry> = (0..65).map(|_| entry("Codex", None, None)).collect();
+        assert!(route_priority_argv("set", &many, None).is_err());
+        // Confirm, undo and clear carry nothing but their verb, whatever is sent.
+        for action in ["confirm", "undo", "clear"] {
+            let argv = route_priority_argv(action, &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z")).unwrap();
+            assert_eq!(argv, v(&["route", "priority", "--from-app", "--", action]));
+        }
+    }
+
+    fn config() -> Value {
+        serde_json::json!({"usage_accounts": {"user_home": "/home/owner", "accounts": [
+            {"label": "Claude", "harness": "claude", "home": null},
+            {"label": "Claude second", "harness": "claude", "home": "~/.claude-second"},
+            {"label": "Codex", "harness": "codex", "home": null},
+            {"label": "Grok", "harness": "grok", "home": null},
+            {"label": "Broken", "harness": "claude", "home": "~/.broken", "invalid": "no such folder"},
+        ]}})
+    }
+
+    #[test]
+    fn sign_in_names_only_a_configured_account_and_passes_no_extra_arguments() {
+        let c = config();
+        assert_eq!(sign_in_argv(&c, "claude", None).unwrap(), v(&["usage", "--sign-in", "--account=Claude", "--account-key=claude|"]));
+        assert_eq!(
+            sign_in_argv(&c, "claude", Some("~/.claude-second")).unwrap(),
+            v(&["usage", "--sign-in", "--account=Claude second", "--account-key=claude|~/.claude-second"])
+        );
+        // The same folder written in full is the same login.
+        assert_eq!(
+            sign_in_argv(&c, "claude", Some("/home/owner/.claude-second")).unwrap(),
+            v(&["usage", "--sign-in", "--account=Claude second", "--account-key=claude|~/.claude-second"])
+        );
+        assert_eq!(sign_in_argv(&c, "codex", Some("")).unwrap(), v(&["usage", "--sign-in", "--account=Codex", "--account-key=codex|"]));
+    }
+
+    #[test]
+    fn sign_in_carries_the_accounts_identity_when_two_share_a_label() {
+        let c = serde_json::json!({"usage_accounts": {"user_home": "/home/owner", "accounts": [
+            {"label": "Same", "harness": "claude", "home": null},
+            {"label": "Same", "harness": "codex", "home": null},
+        ]}});
+        assert_eq!(sign_in_argv(&c, "codex", None).unwrap(), v(&["usage", "--sign-in", "--account=Same", "--account-key=codex|"]));
+        assert_eq!(sign_in_argv(&c, "claude", None).unwrap(), v(&["usage", "--sign-in", "--account=Same", "--account-key=claude|"]));
+    }
+
+    #[test]
+    fn sign_in_refuses_a_folder_that_is_not_a_configured_account() {
+        let c = config();
+        for home in ["~/.claude-other", "/tmp/evil", "--from-app", "~/.claude-second --x"] {
+            assert!(sign_in_argv(&c, "claude", Some(home)).is_err(), "{home}");
+        }
+        assert!(sign_in_argv(&c, "claude", Some("~/.broken")).is_err());
+        assert!(sign_in_argv(&c, "codex", Some("~/.claude-second")).is_err());
+        assert!(sign_in_argv(&c, "grok", None).is_err());
+        assert!(sign_in_argv(&c, "muse", None).is_err());
+        assert!(sign_in_argv(&c, "--sign-in", None).is_err());
+        assert!(sign_in_argv(&serde_json::json!({}), "claude", None).is_err());
     }
 }

@@ -31,6 +31,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from khipu.lines import read_lines, split_lines
+
 LIVE_NAME = "live"
 SLOT_NAMES = ("live-a", "live-b")
 GATE_ORDER = ("doctor", "recall", "capture", "version")
@@ -239,6 +241,45 @@ def _code_env(root: Path, base: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+# The harnesses that start the hooks export PYTHONDONTWRITEBYTECODE=1, so a
+# hook only ever reads bytecode, never writes it. A module nothing else has
+# cached for the path a hook imports it by is compiled from source on every
+# one-shot prompt: routing alone took 1.0 to 2.6 s on a loaded Mac, past the
+# routing child's 1 s wait. A bytecode file names its source by path, and a
+# path under the ``live`` link holds one slot's code at a time, so that path
+# is compiled right after the flip (the old slot's hooks read it until then).
+#
+# Every file is compiled again (``force``), with checked-hash invalidation: a
+# pyc records its source's hash, which every import checks. A timestamp pyc is
+# trusted on the source's mtime second and size alone, and two slots' versions
+# of a file can share both, so the previous slot's bytecode would be served
+# under ``live`` (and compileall would skip it as current).
+_PRECOMPILE = (
+    "import compileall, py_compile, sys\n"
+    "sys.exit(0 if compileall.compile_dir(sys.argv[1], quiet=1, force=True,"
+    " invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH) else 1)\n"
+)
+
+
+def precompile(root: Path, *, python: str | None = None, timeout: float = 300) -> dict[str, Any]:
+    """Write the bytecode for ``root``'s khipu package, keyed by ``root`` as
+    given (the ``live`` link, or a slot), under the PYTHONPYCACHEPREFIX the
+    launchers set: never inside the code's own folders, so never inside a
+    signed app bundle. ``python`` defaults to the launchers' interpreter (the
+    cache is per Python version). Never fails a promotion."""
+    pkg = Path(root) / "packages" / "cli" / "khipu"
+    if not pkg.is_dir():
+        return {"ok": False, "error": f"no khipu package in {root}"}
+    t0 = time.monotonic()
+    env = _code_env(root)
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
+    r = _run([python or _hook_python(), "-c", _PRECOMPILE, str(pkg)], env=env, timeout=timeout)
+    out: dict[str, Any] = {"ok": r.returncode == 0, "ms": round((time.monotonic() - t0) * 1000)}
+    if r.returncode != 0:
+        out["error"] = _tail(r.stderr or r.stdout) or f"exit {r.returncode}"
+    return out
+
+
 def _base_env(extra: tuple[str, ...] = ()) -> dict[str, str]:
     """The caller's values for ``BASE_ENV_KEYS`` and ``extra``, read one name
     at a time; nothing else from the environment."""
@@ -332,9 +373,9 @@ def _run(argv: list[str], *, env: dict[str, str] | None = None, input: str | Non
     try:
         with tempfile.TemporaryDirectory(prefix="khipu-gate-cwd-") as neutral:
             return subprocess.run(argv, env=env, input=input, cwd=cwd or neutral, capture_output=True,
-                                  text=True, timeout=timeout, check=False)
+                                  encoding="utf-8", timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
-        out = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        out = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         return subprocess.CompletedProcess(argv, 124, out, f"timed out after {timeout:g}s")
     except OSError as exc:
         return subprocess.CompletedProcess(argv, 127, "", f"{type(exc).__name__}: {exc}")
@@ -561,11 +602,28 @@ def _parse_summary(line: str) -> dict[str, Any] | None:
             "legs": legs.group("legs") if legs else None}
 
 
-def _read_tail(path: Path, max_bytes: int = REPLAY_TAIL_BYTES) -> str:
+def _read_tail(path: Path, max_bytes: int = REPLAY_TAIL_BYTES) -> list[str]:
+    """The whole lines in the last ``max_bytes`` of ``path``, each decoded as
+    strict UTF-8: the queries are compared and replayed, and replacing a bad
+    byte can merge two of them, so an undecodable line is skipped."""
     with open(path, "rb") as fh:
         size = fh.seek(0, os.SEEK_END)
-        fh.seek(max(0, size - max_bytes))
-        return fh.read().decode("utf-8", errors="replace")
+        offset = max(0, size - max_bytes)
+        before = b"\n"
+        if offset:
+            fh.seek(offset - 1)
+            before = fh.read(1)
+        fh.seek(offset)
+        data = fh.read()
+    if before != b"\n":
+        data = data.partition(b"\n")[2]  # the seek landed inside a line
+    out = []
+    for raw in data.split(b"\n"):
+        try:
+            out.append(raw.decode("utf-8").removesuffix("\r"))
+        except UnicodeDecodeError:
+            continue
+    return out
 
 
 def sample_queries(log: Path, n: int = 5, *, now: float | None = None) -> list[dict[str, Any]]:
@@ -577,11 +635,11 @@ def sample_queries(log: Path, n: int = 5, *, now: float | None = None) -> list[d
 
     now = time.time() if now is None else now
     try:
-        text = _read_tail(Path(log))
+        lines = _read_tail(Path(log))
     except OSError:
         return []
     seen: dict[str, dict[str, Any]] = {}
-    for line in text.splitlines():
+    for line in lines:
         try:
             row = json.loads(line)
         except ValueError:
@@ -661,7 +719,7 @@ def _recall_once(hook: Path, sample: dict[str, Any], session: str, *, legacy: bo
         row = None
         log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
         try:
-            for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            for line in read_lines(log):
                 row = _parse_summary(line) or row
         except OSError:
             row = None
@@ -682,7 +740,7 @@ def _probe_answer(r: subprocess.CompletedProcess) -> bool | None:
     if r.returncode != 0:
         return None
     try:
-        out = json.loads((r.stdout or "").strip().splitlines()[-1])
+        out = json.loads(split_lines((r.stdout or "").strip())[-1])
     except (ValueError, IndexError):
         return None
     push = out.get("push") if isinstance(out, dict) else None
@@ -1073,7 +1131,7 @@ def record(entry: dict[str, Any]) -> dict[str, Any]:
 
 def records() -> list[dict[str, Any]]:
     try:
-        lines = state_file().read_text(encoding="utf-8").splitlines()
+        lines = split_lines(state_file().read_text(encoding="utf-8"))
     except OSError:
         return []
     out = []
@@ -1103,6 +1161,16 @@ def _lock():
 # ---- after a flip ------------------------------------------------------------
 
 
+def _before_flip() -> dict[str, Any] | None:
+    """Compile the code still live through the ``live`` link, just before
+    the flip. A cache written before checked-hash bytecode (timestamp pycs)
+    would otherwise serve the old slot's code to hooks between the flip and
+    ``_after_flip``'s compile, wherever a file kept its size and mtime second.
+    Rewritten checked-hash, each one is checked against the new source."""
+    live = live_root()
+    return precompile(live) if live is not None else None
+
+
 def _after_flip() -> dict[str, Any]:
     """Re-render any plist the new live code renders differently, then
     restart the two long-running jobs that hold the old modules."""
@@ -1111,6 +1179,8 @@ def _after_flip() -> dict[str, Any]:
     live = live_root()
     out: dict[str, Any] = {"kicked": [], "kick_failed": []}
     if live is not None:
+        # Before the restarts, so the recall daemon starts warm too.
+        out["precompile"] = precompile(live)
         from khipu.launchd_gen import PASSTHROUGH_ENV
 
         env = _code_env(live, _base_env((*DATA_DIR_ENV_KEYS, *PASSTHROUGH_ENV)))
@@ -1159,6 +1229,8 @@ def promote(ref: str = "origin/main") -> dict[str, Any]:
         if not prepared["ok"]:
             return record({**entry, "ok": False, "error": f"slot: {prepared['error']}",
                            "ms": round((time.monotonic() - t0) * 1000)})
+        # The gate's replay runs the slot's hooks by the slot's own path.
+        entry["precompile"] = precompile(slot)
         gate = run_gate(slot)
         entry["gate"] = gate
         entry["gate_ms"] = sum(step["ms"] for step in gate)
@@ -1167,6 +1239,7 @@ def promote(ref: str = "origin/main") -> dict[str, Any]:
             return record({**entry, "ok": False, "failed_step": failed["step"],
                            "error": f"{failed['step']}: {failed['detail']}",
                            "ms": round((time.monotonic() - t0) * 1000)})
+        entry["precompile_live"] = _before_flip()
         flipped = flip(slot)
         if not flipped["ok"]:
             return record({**entry, "ok": False, "error": f"flip: {flipped['error']}",
@@ -1204,6 +1277,7 @@ def rollback() -> dict[str, Any]:
                                "error": f"could not put {target.name} back on {known[:12]}: {_tail(r.stderr)}"})
             entry["restored"] = known
         entry["commit"] = known
+        entry["precompile_live"] = _before_flip()
         flipped = flip(target)
         if not flipped["ok"]:
             return record({**entry, "ok": False, "error": f"flip: {flipped['error']}"})

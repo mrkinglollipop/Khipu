@@ -29,6 +29,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from khipu.lines import run_text, split_lines
+
 # Same contract as the legacy extractor so episodes look the same downstream.
 PROMPT = """You are extracting durable memory from an assistant/coding session.
 Output ONLY a single JSON object (no prose, no markdown fences) with these keys:
@@ -201,7 +203,7 @@ def _usage_lines_since(path: Path, day: str, block: int = 65_536) -> list[str]:
             # The first complete line of the buffer is older than ``day``.
             if pos > 0 and len(first) > 2 and first[1][8:18].decode("ascii", "replace") < day:
                 break
-    return [ln for ln in buf.decode("utf-8", "replace").splitlines() if ln.strip()]
+    return [ln for ln in split_lines(buf) if ln.strip()]
 
 
 def synth_usage_today() -> dict[str, Any]:
@@ -513,11 +515,13 @@ def _generate_codex_cli(prompt: str, *, model_id: str, timeout: int = 60, retrie
                         # 2026-10-13); the login is not part of that config.
                         "--ignore-user-config",
                         "-c", f"model_reasoning_effort={_codex_cli_effort()}", "-"]
-                result = subprocess.run(argv, input=prompt, text=True, capture_output=True,
-                                        cwd=cwd, env=env, timeout=timeout, check=False)
+                result = run_text(argv, input=prompt, cwd=cwd, env=env, timeout=timeout,
+                                  check=False)
                 usage = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
                 error = ""
-                for line in result.stdout.splitlines():
+                for line in split_lines(result.stdout):
+                    if not line.strip():
+                        continue
                     event = json.loads(line)
                     if event.get("type") == "thread.started" and event.get("thread_id"):
                         synth_cli.register(str(event["thread_id"]))

@@ -25,6 +25,9 @@ Tools:
   - ``khipu_route_rule``: a conversation may record the owner's requested
     standing-rule addition or edit; it is live but stays pending until the
     owner confirms it in Settings or at a terminal.
+  - ``khipu_route_priority``: a conversation may record the owner's priority
+    (his order of accounts) at his request; live, unconfirmed until he
+    confirms it; confirming, undoing and clearing stay his.
 
 Zero-dependency by design: the official MCP SDK requires pydantic/anyio which
 are not vendored in ``.python_libs``. The stdio transport is newline-delimited
@@ -71,6 +74,13 @@ SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX = 12, 50
 GRAPH_LIMIT_DEFAULT, GRAPH_LIMIT_MAX = 25, 200
 GRAPH_HOPS_MAX = 4
 MAX_FRAME_BYTES = 1024 * 1024
+
+from khipu.text_pages import (  # noqa: E402  khipu is importable: _server_version ran above
+    PAGE_BYTES_DEFAULT,
+    PAGE_BYTES_MAX,
+    PAGE_BYTES_MIN,
+    page_args,
+)
 
 
 def _ensure_path() -> None:
@@ -156,8 +166,12 @@ def mark_gateway_active() -> None:
 
 
 def _via_https_gateway() -> bool:
-    """True when this tools/call arrived through ``khipu.gateway`` (HTTPS)."""
-    if _GATEWAY_ACTIVE:
+    """True when this tools/call arrived through ``khipu.gateway`` (HTTPS):
+    the request carries a token label. The process-wide flag stays as the
+    fallback for threads a request starts, which do not inherit its label."""
+    from khipu.request_context import gateway_label
+
+    if gateway_label() or _GATEWAY_ACTIVE:
         return True
     return (os.environ.get(GATEWAY_ACTIVE_ENV) or "").strip().lower() in {
         "1", "true", "yes", "on",
@@ -308,8 +322,13 @@ TOOLS: list[dict] = [
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
         "description": (
             "Load a search hit by id. Episodes: full summary, decisions, "
-            "preferences, topics (not the capture raw blob). Topics: full "
-            "page body. Media: path/sha256/mime. Library ids "
+            "preferences, topics (not the capture raw blob). Topics: the page "
+            "body in pages of at most max_bytes UTF-8 bytes (default 65536, "
+            "most topics fit in one page). Every topic page carries id, kind, "
+            "slug, title, updated_at, content_hash, body_total_bytes, "
+            "body_offset, body_next_offset and complete; while complete is "
+            "false, call again with offset set to body_next_offset to read the "
+            "rest. Media: path/sha256/mime. Library ids "
             "(library:<name>:<doc>#<chunk>): the chunk text, its document "
             "(title, author, tags, rel_path, root) and the previous/next chunk "
             "text so you can read around a hit; library:<name>:<doc> returns the "
@@ -331,6 +350,25 @@ TOOLS: list[dict] = [
                     "description": (
                         "Optional: 'episode', 'topic', 'media', or 'library'. "
                         "Inferred from id when omitted."
+                    ),
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Topics only: UTF-8 byte offset into the body to start "
+                        "the page at (default 0). Pass the previous page's "
+                        "body_next_offset."
+                    ),
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": PAGE_BYTES_MIN,
+                    "maximum": PAGE_BYTES_MAX,
+                    "description": (
+                        "Topics only: largest page body in UTF-8 bytes "
+                        f"(default {PAGE_BYTES_DEFAULT}, at most {PAGE_BYTES_MAX}). "
+                        "A page never splits a character."
                     ),
                 },
             },
@@ -798,6 +836,42 @@ TOOLS: list[dict] = [
             "required": ["text", "owner_request"],
         },
     },
+    {
+        "name": "khipu_route_priority",
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        "description": (
+            "Record the owner's priority at his request: the full ordered list "
+            "of accounts he wants used first (each by its label or its id, as "
+            "khipu_route lists them), with his words for each one's role and an "
+            "optional end. It is live for every conversation at once, marked "
+            "with this conversation and unconfirmed, with the priority it "
+            "replaced shown beside it, until the owner confirms or undoes it "
+            "in Settings -> Routing. Khipu keeps his order as given and never "
+            "reorders it. This tool cannot confirm, undo or clear a priority."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entries": {
+                    "type": "array", "minItems": 1,
+                    "description": "The accounts in the owner's order",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "account": {"type": "string", "description": "Its label or its id, as khipu_route lists them"},
+                            "role": {"type": "string", "description": "The owner's words for its role"},
+                            "until": {"type": "string", "description": "When this entry ends (a time, or 2d, 30h)"},
+                        },
+                        "required": ["account"],
+                    },
+                },
+                "until": {"type": "string", "description": "When the whole priority ends (a time, or 3d)"},
+                "owner_request": {"type": "string",
+                                  "description": "This conversation's one-line words describing the owner's request"},
+            },
+            "required": ["entries", "owner_request"],
+        },
+    },
 ]
 
 
@@ -894,6 +968,7 @@ def _tool_get(args: dict) -> dict:
     kind = (args.get("kind") or "").strip().lower() or None
     if kind not in (None, "episode", "topic", "media", "library"):
         raise ValueError("kind must be 'episode', 'topic', 'media', or 'library'")
+    offset, max_bytes = page_args(args.get("offset"), args.get("max_bytes"))
     _ensure_path()
     from khipu import library_search
 
@@ -945,7 +1020,7 @@ def _tool_get(args: dict) -> dict:
                 row.update(decision_states_for_episode(int(ident)))
                 return _detail_response("episode", row)
         if inferred == "topic":
-            row = topic_detail(ident)
+            row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
             if row is None and kind is None:
                 media = media_detail(ident)
                 if media is not None:
@@ -973,7 +1048,7 @@ def _tool_get(args: dict) -> dict:
         else:
             return _detail_response("episode", row, **stale_fields())
     if inferred == "topic":
-        row = topic_detail_snapshot(ident)
+        row = topic_detail_snapshot(ident, offset=offset, max_bytes=max_bytes)
         if row is None:
             raise ValueError(f"topic not found: {ident}")
         return _detail_response("topic", row, **stale_fields())
@@ -1126,13 +1201,15 @@ def _tool_status(args: dict) -> dict:
         else:
             payload = status_payload(None)
         # W2.4: behind_ingest_seconds only means something while PG answers.
-        payload["hub_snapshot"] = snapshot_freshness(payload.get("latest_ingested_at"))
+        payload["hub_snapshot"] = snapshot_freshness(
+            payload.get("latest_ingested_at"), lag=payload.pop("replica_lag", None))
         # D4/R10: top-level convenience fields so a caller (or the model
         # reading its own tool result) does not have to know to dig into
         # hub_snapshot / session_capture for the two numbers that answer
         # "how stale is the local replica" and "is anything waiting to be
         # captured right now".
         payload["snapshot_age_seconds"] = payload["hub_snapshot"].get("age_seconds")
+        payload["snapshot_state"] = payload["hub_snapshot"].get("state")
         try:
             from khipu import session_capture as _sc
 
@@ -1702,6 +1779,30 @@ def _tool_route_rule(args: dict) -> dict:
                                 author=routing.conversation_author(), via="mcp")
 
 
+def _tool_route_priority(args: dict) -> dict:
+    """Record the owner's priority at his request through the conversation
+    author path; it never speaks as the owner, and its answer names each
+    account by its label and id, never a key or a login folder."""
+    if _via_https_gateway():
+        return {"available": False, "reason": ROUTING_GATEWAY_REASON}
+    _ensure_path()
+    from khipu import routing
+
+    if not isinstance(args, dict) or set(args) - {"entries", "until", "owner_request"}:
+        raise ValueError("khipu_route_priority takes entries, owner_request and optional until")
+    entries = args.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("entries must be the owner's accounts, in his order")
+    owner_request = args.get("owner_request")
+    if not isinstance(owner_request, str) or not owner_request.strip() or "\n" in owner_request or "\r" in owner_request:
+        raise ValueError("owner_request must be one line of text")
+    until = args.get("until")
+    if until is not None and not isinstance(until, str):
+        raise ValueError("until must be text")
+    return routing.conversation_priority(entries, until=until, owner_request=owner_request,
+                                         author=routing.conversation_author())
+
+
 TOOL_FUNCS = {
     "khipu_search": _tool_search,
     "khipu_get": _tool_get,
@@ -1719,6 +1820,7 @@ TOOL_FUNCS = {
     "khipu_route": _tool_route,
     "khipu_route_report": _tool_route_report,
     "khipu_route_rule": _tool_route_rule,
+    "khipu_route_priority": _tool_route_priority,
 }
 
 
@@ -1731,12 +1833,41 @@ def _error(req_id, code: int, message: str) -> dict:
 
 
 def _tool_text(payload: dict, *, is_error: bool = False) -> dict:
+    # Non-ASCII stays literal: escaping made a CJK body six bytes per
+    # character in this text and seven once the frame was dumped again.
+    # Strict at this level too: a client parses this text as JSON in turn.
+    from khipu import wire
+
     return {
         "content": [
-            {"type": "text", "text": json.dumps(payload, indent=2, default=str)}
+            {"type": "text", "text": wire.dumps(payload, indent=2, default=str)}
         ],
         "isError": is_error,
     }
+
+
+def encode_frame(message) -> bytes:
+    """One JSON-RPC message as UTF-8 bytes, for the stdio writer and the gateway.
+
+    Strict JSON (khipu.wire): no lone surrogate escape, U+2028 and U+2029
+    escaped, so Foundation, serde_json and line-based readers all parse it."""
+    from khipu import wire
+
+    return wire.encode(message, default=str)
+
+
+def _write_frame(message) -> None:
+    # Bytes to the buffer, so the frame is UTF-8 whatever the locale says
+    # stdout's encoding is (a C locale made it ASCII).
+    out = sys.stdout
+    buffer = getattr(out, "buffer", None)
+    if buffer is None:
+        out.write(encode_frame(message).decode("utf-8") + "\n")
+        out.flush()
+        return
+    out.flush()
+    buffer.write(encode_frame(message) + b"\n")
+    buffer.flush()
 
 
 # A stdio server lives as long as its client session, and a deploy (a
@@ -1919,7 +2050,7 @@ def main() -> int:
         if size > MAX_FRAME_BYTES:
             while line and not line.endswith(newline):
                 line = stream.readline(MAX_FRAME_BYTES + 1)
-            print(json.dumps(_error(None, -32700, "frame too large")), flush=True)
+            _write_frame(_error(None, -32700, "frame too large"))
             continue
         line = line.strip()
         if not line:
@@ -1927,11 +2058,11 @@ def main() -> int:
         try:
             msg = json.loads(line)
         except (ValueError, UnicodeDecodeError):
-            print(json.dumps(_error(None, -32700, "parse error")), flush=True)
+            _write_frame(_error(None, -32700, "parse error"))
             continue
         response = handle_message(msg)
         if response is not None:
-            print(json.dumps(response, default=str), flush=True)
+            _write_frame(response)
     return 0
 
 

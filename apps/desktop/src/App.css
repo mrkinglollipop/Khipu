@@ -2722,6 +2722,14 @@ input.switch:disabled {
   border-bottom: 0;
 }
 
+/* Stands where a switch goes until its value is read (or can't be). */
+.sw-slot {
+  flex: none;
+  display: inline-flex;
+  min-width: 36px;
+  margin-top: 1px;
+}
+
 .opt-text {
   display: flex;
   flex-direction: column;
@@ -3001,9 +3009,9 @@ input.switch:disabled {
    Embeddings track; the fill turns warn at 75% and err at 90%, and the
    percent beside it carries the same figure in words.
 --------------------------------------------------------------------------- */
-.plans-card, .plan-account { --bar-track: color-mix(in srgb, var(--text-2) 68%, var(--surface-2)); }
+.plans-card { --bar-track: color-mix(in srgb, var(--text-2) 68%, var(--surface-2)); }
 @media (prefers-color-scheme: dark) {
-  .plans-card, .plan-account { --bar-track: color-mix(in srgb, var(--text-2) 55%, var(--surface-2)); }
+  .plans-card { --bar-track: color-mix(in srgb, var(--text-2) 55%, var(--surface-2)); }
 }
 .plan-meter {
   position: relative;
@@ -3020,22 +3028,57 @@ input.switch:disabled {
 .plan-pct { font-variant-numeric: tabular-nums; text-align: right; font-size: var(--t-sm); color: var(--text); }
 .plan-pct.warn { color: var(--warn); font-weight: 600; }
 .plan-pct.err { color: var(--err); font-weight: 600; }
+/* Settings clarity phase 2: a Home row ends in exactly one status phrase
+   (.plan-say), after the owner's pause; a Settings account is one bordered
+   .plan-block with every line about it inside. */
 .card .row.plan-row {
   display: grid;
-  grid-template-columns: minmax(7rem, 11rem) minmax(4rem, 1fr) 3.5rem minmax(0, 15rem) auto;
+  grid-template-columns: minmax(9rem, 13rem) minmax(4rem, 1fr) 3.5rem minmax(0, 17rem) minmax(0, auto);
   column-gap: var(--s3);
+  align-items: center;
 }
-.plan-row .plan-none { grid-column: 2 / 5; font-size: var(--t-sm); }
-.plan-row .plan-when { overflow: hidden; text-overflow: ellipsis; }
-.plan-tags { display: inline-flex; gap: var(--s1); justify-content: flex-end; flex-wrap: wrap; }
-.plan-account + .plan-account { margin-top: var(--s2); }
-.plan-window .plan-wname { flex: 0 0 8rem; font-size: var(--t-sm); color: var(--text-2); }
-.plan-window .plan-meter { flex: 1; }
-.plan-window .plan-pct { flex: 0 0 3.5rem; }
+.plan-row .plan-name { white-space: normal; overflow: visible; text-overflow: clip; }
+.plan-row .plan-when { overflow: visible; text-overflow: clip; white-space: normal; }
+.plan-row .plan-none { grid-column: 2 / -1; display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; min-width: 0; }
+.plan-row .plan-say-col { justify-self: end; text-align: right; display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; justify-content: flex-end; }
+.plan-say { display: inline-flex; align-items: baseline; gap: var(--s2); font-size: var(--t-sm); color: var(--text-2); min-width: 0; }
+.plan-say .hdot, .plan-fail .hdot, .plans-head-note .hdot { flex: none; transform: translateY(-1px); }
+.plan-say.grey { color: var(--muted); }
+.plan-meter.dim { opacity: 0.4; }
+.plan-pct.dim { color: var(--text-2); }
+.plans-card .card-head .plans-head-note { font-size: var(--t-sm); font-weight: 400; color: var(--text-2); margin-right: var(--s2); display: inline-flex; align-items: baseline; gap: var(--s2); text-transform: none; letter-spacing: 0; }
+.plans-card .empty .plans-empty-btn { margin-top: var(--s2); }
+.plan-blocks { display: flex; flex-direction: column; gap: var(--s2); }
+.plan-block { --bar-track: color-mix(in srgb, var(--text-2) 68%, var(--surface-2)); }
+@media (prefers-color-scheme: dark) { .plan-block { --bar-track: color-mix(in srgb, var(--text-2) 55%, var(--surface-2)); } }
+.plan-block { border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface); padding: var(--s3); display: flex; flex-direction: column; gap: var(--s2); min-width: 0; }
+.plan-block.warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.plan-block-head { display: flex; align-items: baseline; gap: var(--s2); flex-wrap: wrap; margin: 0; font-size: var(--t-sm); font-weight: 600; color: var(--text); letter-spacing: 0; text-transform: none; }
+.plan-block-head .meta { font-weight: 400; }
+.plan-block .plan-paused { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; font-size: var(--t-sm); color: var(--text-2); }
+.plan-wins { display: flex; flex-direction: column; gap: var(--s1); margin: 0; padding: 0; list-style: none; }
+.plan-win { display: grid; grid-template-columns: 7.5rem minmax(4rem, 1fr) 3.5rem minmax(0, 13rem); column-gap: var(--s3); align-items: center; font-size: var(--t-sm); }
+.plan-win .plan-wname { color: var(--text-2); }
+.plan-win .plan-reset { color: var(--muted); font-size: var(--t-xs); }
+.plan-reads { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; font-size: var(--t-xs); color: var(--muted); }
+.plan-fail { display: flex; align-items: baseline; gap: var(--s2); flex-wrap: wrap; font-size: var(--t-sm); color: var(--text); line-height: 1.45; }
+.plan-empty { font-size: var(--t-sm); color: var(--muted); margin: 0; }
+.plan-details-btn { display: inline-flex; align-items: center; gap: var(--s1); padding: 0; height: auto; border: 0; background: none; box-shadow: none; font-size: var(--t-sm); color: var(--muted); cursor: pointer; }
+.plan-details-btn[aria-expanded="true"] .disclosure-chevron { transform: rotate(90deg); }
+.plan-details { display: grid; grid-template-columns: 8rem minmax(0, 1fr); gap: 2px var(--s3); margin: var(--s1) 0 0; padding-left: var(--s5); font-size: var(--t-xs); color: var(--text-2); }
+.plan-details[hidden] { display: none; }
+.plan-details dt { color: var(--muted); }
+.plan-details dd { margin: 0; }
+.plan-details code { font-family: var(--mono); font-size: var(--t-xs); }
+@media (max-width: 1100px) {
+  .card .row.plan-row { grid-template-columns: minmax(9rem, 12rem) minmax(3rem, 1fr) 3.5rem minmax(0, 12rem); row-gap: var(--s1); }
+  .plan-row .plan-say-col { grid-column: 2 / -1; justify-self: start; text-align: left; justify-content: flex-start; }
+  .plan-win { grid-template-columns: 6.5rem minmax(4rem, 1fr) 3.5rem; }
+  .plan-win .plan-reset { grid-column: 2 / -1; }
+}
 @media (max-width: 760px) {
   .card .row.plan-row { grid-template-columns: minmax(6rem, 1fr) minmax(4rem, 2fr) 3.5rem; }
-  .plan-row .plan-when, .plan-row .plan-tags { grid-column: 1 / -1; justify-content: flex-start; }
-  .plan-row .plan-none { grid-column: 2 / -1; }
+  .plan-row .plan-when { grid-column: 1 / -1; }
 }
 
 /* ---------------------------------------------------------------------------
@@ -3324,3 +3367,30 @@ input.switch:disabled {
 /* An inline question takes focus when it opens (fix round 1, F5); the
    question itself shows where focus is, so only a keyboard user gets a ring. */
 .route-confirm[tabindex="-1"]:focus:not(:focus-visible) { outline: none; }
+
+/* Setup: Accounts step (settings clarity phase 7) */
+.welcome-nav .nav-right{display:inline-flex;align-items:center;gap:var(--s2)}
+.welcome-list li.new-line{color:var(--text)}
+.acct-list{list-style:none;margin:0;padding:0;width:100%;border:1px solid var(--border);border-radius:var(--r-sm)}
+.acct-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;column-gap:var(--s3);align-items:start;padding:var(--s3);min-height:44px;border-bottom:1px solid var(--border)}
+.acct-row:last-child{border-bottom:0}
+.acct-row .hdot{margin-top:6px}
+.acct-main{display:flex;flex-direction:column;gap:2px;min-width:0}
+.acct-line{font-size:var(--t-sm);color:var(--text-2);line-height:1.4}
+.acct-act{margin-top:var(--s1)}
+.acct-read{display:flex;align-items:center;gap:var(--s2);font-size:var(--t-sm);color:var(--text-2);white-space:nowrap}
+.acct-read label{cursor:pointer}
+.acct-none{display:flex;align-items:center;gap:var(--s2);margin:0;font-size:var(--t-sm);color:var(--muted)}
+.acct-block{width:100%;display:flex;flex-direction:column;gap:var(--s1)}
+.acct-h{margin:0;font-size:var(--t-md);font-weight:600;color:var(--text)}
+.acct-h .meta{font-weight:400}
+.order-list{list-style:none;margin:var(--s1) 0 0;padding:0;border:1px solid var(--border);border-radius:var(--r-sm)}
+.order-row{display:flex;align-items:center;gap:var(--s2);padding:var(--s2) var(--s3);border-bottom:1px solid var(--border)}
+.order-row:last-child{border-bottom:0}
+.order-n{color:var(--muted);width:1.4em;font-variant-numeric:tabular-nums}
+.order-name{flex:1;color:var(--text)}
+.order-btns{display:inline-flex;gap:var(--s2)}
+.welcome .set-help{margin:0}
+.welcome .acct-switch{width:100%;border:1px solid var(--border);border-radius:var(--r-sm)}
+.welcome .callout{width:100%}
+@media (max-width:760px){.acct-row{grid-template-columns:auto minmax(0,1fr)}.acct-read{grid-column:2}}

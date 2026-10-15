@@ -157,7 +157,8 @@ def test_capture_stamp_reaches_persisted_raw(t3_db, tmp_path, monkeypatch, sid, 
     with mock.patch('khipu.db.has_columns', return_value=False):
         from khipu.mirror import _upsert_episode
         _upsert_episode(cur, payload)
-    raw = json.loads(cur.execute.call_args.args[1][9])
+    insert = next(c for c in cur.execute.call_args_list if 'INSERT INTO episodes' in c.args[0])
+    raw = json.loads(insert.args[1][9])
     assert raw.get('t3_thread_id') == expected
     if expected:
         assert raw['via'] == 't3'

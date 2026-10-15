@@ -129,6 +129,8 @@ function config(extra: Record<string, unknown> = {}) {
       routing_not_refreshed_after: setting(300),
       routing_push_start: setting(true),
       routing_push_prompt: setting(true),
+      routing_push_delegation: setting(true),
+      routing_dispatch_scripts: setting([], []),
       routing_reset_check: setting(true),
       routing_reset_check_wait: setting(120),
       routing_reset_check_retries: setting([600, 1800]),
@@ -160,7 +162,7 @@ beforeEach(() => {
   };
   invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
     const a = answers[cmd] ?? { ok: true };
-    const out = typeof a === "function" ? a(args) : a;
+    const out = typeof a === "function" ? await a(args) : a;
     return typeof out === "string" ? out : JSON.stringify(out);
   });
 });
@@ -268,6 +270,13 @@ describe("Settings -> Routing: who made each change", () => {
     const owner = rows.filter((r) => r.subject !== "Claude main");
     expect(owner).toHaveLength(5);
     for (const r of owner) expect(r.who).toBe("You, in Settings");
+  });
+
+  it("says when a change marked as yours did not pass Khipu's owner check", () => {
+    const unchecked = OWNER_ENDINGS.map((c) => ({ ...c, items: c.items.map((i) => ({ ...i, via: "app-unchecked" })) }));
+    const rows = changeDays({ ...view(), changes: unchecked } as RouteView, MORNING).flatMap((d) => d.rows);
+    expect(rows).toHaveLength(3);
+    for (const r of rows) expect(r.who).toBe("Marked as you, but not checked by Khipu");
   });
 });
 
@@ -595,10 +604,10 @@ describe("Settings -> Routing: holds", () => {
 });
 
 describe("Settings -> Routing: telling conversations", () => {
-  it("has the master switch and the two moments, and no delegation switch", async () => {
+  it("has the master switch and the three moments", async () => {
     await page();
     expect(screen.getByRole("switch", { name: "Tell conversations about routing" })).toBeChecked();
-    expect(screen.queryByText(/handing work to another agent/)).toBeNull();
+    expect(screen.getByRole("switch", { name: "Before handing work to another agent" })).toBeChecked();
     expect(screen.queryByText(/Copy for cloud agents/)).toBeNull();
     expect(screen.getByText("Checking for resets")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("switch", { name: "Tell conversations about routing" }));
@@ -607,6 +616,47 @@ describe("Settings -> Routing: telling conversations", () => {
     await waitFor(() =>
       expect(calls("khipu_config_set")).toEqual([{ key: "routing_push_prompt", value: "off" }]),
     );
+  });
+
+  it("turns the push before handing work to another agent off and on", async () => {
+    answers.khipu_config_show = () =>
+      calls("khipu_config_set").length ? config({ routing_push_delegation: setting(false, true) }) : config();
+    await page();
+    const sw = screen.getByRole("switch", { name: "Before handing work to another agent" });
+    fireEvent.click(sw);
+    await waitFor(() =>
+      expect(calls("khipu_config_set")).toEqual([{ key: "routing_push_delegation", value: "off" }]),
+    );
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Before handing work to another agent" })).not.toBeChecked());
+    fireEvent.click(screen.getByRole("switch", { name: "Before handing work to another agent" }));
+    await waitFor(() => expect(calls("khipu_config_set")).toHaveLength(2));
+    expect(calls("khipu_config_set")[1]).toEqual({ key: "routing_push_delegation", value: "on" });
+  });
+
+  it("saves your dispatch scripts as file names, and refuses a folder", async () => {
+    answers.khipu_config_show = () =>
+      calls("khipu_config_set").length ? config({ routing_dispatch_scripts: setting(["dispatch.py", "run-job.sh"], []) }) : config();
+    await page();
+    const row = screen.getByText("Your dispatch scripts").closest(".row-item") as HTMLElement;
+    expect(within(row).getByText("None")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Change your dispatch scripts" }));
+    const form = screen.getByRole("form", { name: "Change your dispatch scripts" });
+    const input = within(form).getByLabelText("File names");
+    fireEvent.change(input, { target: { value: "scripts/dispatch.py" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    expect(await within(form).findByRole("alert")).toHaveTextContent(/no folder/);
+    expect(calls("khipu_config_set")).toEqual([]);
+    // A name that starts with a dash would read as an option: refused, as the CLI and Rust do.
+    fireEvent.change(input, { target: { value: "-c" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    expect(await within(form).findByRole("alert")).toHaveTextContent(/no folder/);
+    expect(calls("khipu_config_set")).toEqual([]);
+    fireEvent.change(input, { target: { value: " dispatch.py, run-job.sh,dispatch.py " } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(calls("khipu_config_set")).toEqual([{ key: "routing_dispatch_scripts", value: '["dispatch.py","run-job.sh"]' }]),
+    );
+    await waitFor(() => expect(within(row).getByText("dispatch.py, run-job.sh")).toBeInTheDocument());
   });
 
   it("locks the master switch when the environment decides it", async () => {
@@ -1081,7 +1131,7 @@ function heldConfig() {
       return JSON.stringify({ ok: true });
     }
     const a = answers[cmd] ?? { ok: true };
-    const out = typeof a === "function" ? a(args) : a;
+    const out = typeof a === "function" ? await a(args) : a;
     return typeof out === "string" ? out : JSON.stringify(out);
   });
   return { release: () => open(), value: (key: string) => routing[key].value };
@@ -1243,7 +1293,7 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
     await waitFor(() => expect(calls("khipu_config_set")[1]).toEqual({ key: "routing_slow_read_pct", value: "0.5" }));
   });
 
-  it("says the master switch couldn't be read, and reads it again on Retry (finding 7)", async () => {
+  it("says the master switch couldn't be read, and reads it again on Try again (finding 7)", async () => {
     let fail = true;
     answers.khipu_features_show = () => {
       if (fail) throw new Error("khipu features: timed out");
@@ -1252,9 +1302,9 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
     await page();
     const alert = await screen.findByText(/Couldn't read this setting/);
     expect(alert).toHaveTextContent("Couldn't read this setting: khipu features: timed out");
-    expect(screen.getByRole("switch", { name: "Tell conversations about routing" })).toBeDisabled();
+    expect(screen.queryByRole("switch", { name: "Tell conversations about routing" })).toBeNull();
     fail = false;
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     await waitFor(() => expect(screen.getByRole("switch", { name: "Tell conversations about routing" })).toBeChecked());
     expect(screen.getByRole("switch", { name: "Tell conversations about routing" })).toBeEnabled();
     expect(screen.queryByText(/Couldn't read this setting/)).toBeNull();
@@ -1274,6 +1324,80 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
     fireEvent.click(sw);
     const alert = await screen.findByText(/Couldn't read this setting/);
     expect(alert).toHaveTextContent("khipu features: timed out");
-    expect(screen.getByRole("switch", { name: "Tell conversations about routing" })).toBeDisabled();
+    expect(screen.queryByRole("switch", { name: "Tell conversations about routing" })).toBeNull();
+  });
+});
+
+// Settings clarity phase 1 (docs/plans/2026-10-15-settings-clarity.md, 6a):
+// a switch whose value is not read yet is never drawn as off.
+describe("Settings -> Routing: nothing shows a false off while it is read", () => {
+  const SWITCHES = [
+    ["route-push-all", "Tell conversations about routing"],
+    ["route-push-start", "At the start of a conversation, and after it is compacted"],
+    ["route-push-prompt", "Before each prompt"],
+    ["route-push-delegation", "Before handing work to another agent"],
+    ["route-reset-check", "Check an account at its reset time"],
+  ] as const;
+
+  function hold<T>() {
+    let release!: (v: T) => void;
+    const p = new Promise<T>((r) => (release = r));
+    return { p, release };
+  }
+
+  it("shows Reading… (aria-busy) in place of each switch until its settings are read, then the real switch", async () => {
+    const cfg = hold<unknown>();
+    const feats = hold<unknown>();
+    answers.khipu_config_show = () => cfg.p;
+    answers.khipu_features_show = () => feats.p;
+    render(<RoutingSettings active />);
+    await screen.findByRole("list", { name: "Accounts" });
+    for (const [id, name] of SWITCHES) {
+      expect(screen.queryByRole("switch", { name })).toBeNull();
+      const slot = screen.getByTestId(`${id}-reading`);
+      expect(slot).toHaveAttribute("aria-busy", "true");
+      expect(slot).toHaveTextContent("Reading…");
+    }
+    // Folders and lanes say Reading…, never "none yet", before the settings arrive.
+    expect(screen.queryByText(/No job runner folders yet/)).toBeNull();
+    expect(screen.queryByText(/Lanes show here once/)).toBeNull();
+    expect(screen.getByText(/Looking for job runner folders/).closest("[aria-busy]")).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText(/Looking for job runner lanes/)).toBeInTheDocument();
+    cfg.release(config({ routing_push_prompt: setting(false) }));
+    feats.release({ features: { routing_push: { enabled: true, source: "file" } } });
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Before each prompt" })).not.toBeChecked());
+    for (const [, name] of SWITCHES.filter(([id]) => id !== "route-push-prompt")) {
+      expect(screen.getByRole("switch", { name })).toBeChecked();
+    }
+    expect(screen.queryByText("Reading…")).toBeNull();
+  });
+
+  it("says Can't read this setting in place of each switch when the settings read fails, with Try again", async () => {
+    let fail = true;
+    answers.khipu_config_show = () => {
+      if (fail) throw new Error("khipu config: timed out");
+      return config();
+    };
+    await page();
+    for (const [id, name] of SWITCHES.filter(([id]) => id !== "route-push-all")) {
+      await waitFor(() => expect(screen.getByTestId(`${id}-unread`)).toHaveTextContent("Can't read this setting"));
+      expect(screen.queryByRole("switch", { name })).toBeNull();
+    }
+    expect(screen.getByRole("switch", { name: "Tell conversations about routing" })).toBeChecked();
+    expect(screen.getByText(/Couldn't read job runner folders just now/)).toBeInTheDocument();
+    fail = false;
+    fireEvent.click(within(screen.getByTestId("route-push-start-unread")).getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Before each prompt" })).toBeChecked());
+  });
+
+  it("says Reading… for folders and lanes before the routing record is read", async () => {
+    const rec = hold<unknown>();
+    answers.khipu_route_view = () => rec.p;
+    render(<RoutingSettings active />);
+    await screen.findByText(/Looking for job runner lanes/);
+    expect(screen.queryByText(/Lanes show here once/)).toBeNull();
+    rec.release(view());
+    await screen.findByRole("list", { name: "Accounts" });
+    await waitFor(() => expect(screen.queryByText(/Looking for job runner lanes/)).toBeNull());
   });
 });

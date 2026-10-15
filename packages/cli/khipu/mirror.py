@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from khipu.lines import split_lines
 from khipu.topic_graph import parse_frontmatter_links, persist_capture_graph, persist_topic_graph
 
 # ---- W5.3: status vocabulary + frontmatter date parsing --------------------
@@ -341,12 +342,25 @@ def _upsert_topic(
     return changed
 
 
-def _upsert_episode(cur, payload: dict[str, Any]) -> bool:
+def _upsert_episode(cur, payload: dict[str, Any], *,
+                    source: dict[str, Any] | None = None,
+                    origin: str | None = None) -> bool:
     """Insert one episode; no-op when the (ts, md5(summary)) identity exists.
 
     Bare ON CONFLICT DO NOTHING is unambiguous here: id is never supplied, so
     the only unique constraint reachable is uq_episodes_ts_summary_md5
     (0003_reconcile_upsert.sql). Returns True when a row was inserted.
+
+    A new row also gets its origin row in episode_sources (capture identity
+    phase 1), from ``source`` when the caller snapshotted it (write_pg does,
+    before enrichment and ingestion rewrite the payload) or else from the
+    redacted copy written to the row, never the unredacted input.
+
+    ``origin`` is the server-stamped owner (0029); the caller has already
+    checked the column exists. A payload's own ``origin`` never reaches the
+    column, and is dropped from the stored raw too. So is its own
+    ``merged_from``: merge receipts are written only by the server's merge,
+    and a planted one could pose as an identity receipt and claim this row.
     """
     # Identity columns (0008) and tags (0010) are named only when they exist.
     # Naming them unconditionally made EVERY capture raise UndefinedColumn on a
@@ -360,6 +374,8 @@ def _upsert_episode(cur, payload: dict[str, Any]) -> bool:
         "parent_session_id", "transcript_range", "window_id",
     }
     safe = deepcopy(payload)
+    safe.pop("origin", None)
+    safe.pop("merged_from", None)
     for key, value in list(safe.items()):
         if key not in identity_keys:
             safe[key], _ = _redact_free_text(value)
@@ -408,6 +424,10 @@ def _upsert_episode(cur, payload: dict[str, Any]) -> bool:
         cols.append("verbatim")
         vals.append("%s::jsonb")
         params.append(json.dumps(safe.get("verbatim") or {}, ensure_ascii=False))
+    if origin is not None:
+        cols.append("origin")
+        vals.append("%s")
+        params.append(origin)
     cur.execute(
         f"""
         INSERT INTO episodes
@@ -415,10 +435,21 @@ def _upsert_episode(cur, payload: dict[str, Any]) -> bool:
         VALUES
           ({', '.join(vals)})
         ON CONFLICT DO NOTHING
+        RETURNING id
         """,
         tuple(params),
     )
-    return cur.rowcount > 0
+    inserted = cur.rowcount > 0
+    if inserted:
+        try:
+            row = cur.fetchone()
+            if row:
+                from khipu.capture_identity import record_source, source_identity
+
+                record_source(cur, int(row[0]), "origin", source or source_identity(safe))
+        except Exception as exc:  # noqa: BLE001 — the episode row stays; fail-open
+            _log(f"source row skipped ({type(exc).__name__}: {exc})")
+    return inserted
 
 
 def mirror_episode(payload: dict[str, Any]) -> bool:
@@ -440,7 +471,13 @@ def mirror_episode(payload: dict[str, Any]) -> bool:
         return False
     with connect() as conn:
         with conn.cursor() as cur:
-            _upsert_episode(cur, payload)
+            # A live capture by this process, so it is stamped like write_pg's.
+            # The file replays below (sync_recent_episodes, reconcile) are not:
+            # synced memory files can hold another machine's captures, and an
+            # unknown origin stays NULL rather than be claimed.
+            from khipu.capture import _stamp_origin
+
+            _upsert_episode(cur, payload, origin=_stamp_origin(cur))
             cur.execute("SAVEPOINT mirror_capture_graph")
             try:
                 persist_capture_graph(cur, payload)
@@ -537,7 +574,7 @@ def sync_recent_episodes(memory_root: Path, *, tail_lines: int = 40) -> dict[str
         block = min(size, 256 * 1024)
         f.seek(size - block)
         raw = f.read().decode("utf-8", errors="replace")
-    lines = [ln for ln in raw.splitlines() if ln.strip()][-tail_lines:]
+    lines = [ln for ln in split_lines(raw) if ln.strip()][-tail_lines:]
     objs: list[dict[str, Any]] = []
     keys: list[tuple[str, str]] = []
     for ln in lines:

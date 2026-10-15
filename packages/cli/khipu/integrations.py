@@ -48,6 +48,11 @@ Packs:
                {type,command,timeout} entries; UserPromptSubmit exposed the same way;
                SubagentStop, K4, carries agent_transcript_path for the child transcript)
 
+  Every claude_code/codex pack above also gets hooks.PreToolUse (matched to
+  delegation tools) and hooks.SubagentStart += khipu-delegation-hook: the
+  routing push at the moment of delegation (routing truth, phase 6; Codex
+  runs it once the owner has reviewed it).
+
   Every claude_code/codex pack above also gets hooks.UserPromptSubmit +=
   khipu-prompt-recall (R1): a bounded per-prompt search, pushed the same way
   as the SessionStart recall push, so the model does not have to decide to
@@ -77,6 +82,7 @@ from pathlib import Path
 from typing import Any
 
 from khipu import claude_homes as _homes
+from khipu import wire
 
 HARNESSES = ("claude_code", "cursor", "aegis", "codex", "grok_bot")
 HOME = Path.home()
@@ -209,7 +215,7 @@ def _shim(name: str) -> str:
 
 LAUNCHER_NAMES = (
     "khipu-mcp", "khipu-stop-hook", "khipu-recall-hook",
-    "khipu-prompt-recall", "khipu-aegis-capture",
+    "khipu-prompt-recall", "khipu-aegis-capture", "khipu-delegation-hook",
 )
 
 
@@ -248,10 +254,12 @@ def launcher_states() -> list[dict]:
 
 
 _PACK_LAUNCHERS: dict[str, tuple[str, ...]] = {
-    "claude_code": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall"),
+    "claude_code": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
+                    "khipu-delegation-hook"),
     "cursor": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook"),
     "aegis": ("khipu-mcp", "khipu-aegis-capture"),
-    "codex": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall"),
+    "codex": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
+              "khipu-delegation-hook"),
 }
 
 
@@ -325,6 +333,59 @@ CODEX_SESSIONEND_TIMEOUT = 3
 def codex_sessionend_hook() -> str:
     """Queue-only shim invocation for Codex SessionEnd (3 s hard cap)."""
     return queue_only_stop_hook()
+
+
+# The routing push at the moment of delegation (routing truth, phase 6): one
+# launcher for PreToolUse, matched to the tools a delegation can go through
+# (the hook itself then looks at the call and stays silent for the rest), and
+# SubagentStart. PreToolUse holds the call, so its timeout is the per-prompt
+# hook's; the hook never denies, whatever happens.
+DELEGATION_MATCHER = "Agent|Task|spawn_agent|Bash|shell|shell_command|exec_command|local_shell|delegate_task"
+DELEGATION_TIMEOUT = PROMPT_RECALL_TIMEOUT
+SUBAGENT_START_TIMEOUT = 10
+DELEGATION_EVENTS = ("PreToolUse", "SubagentStart")
+CODEX_REVIEW_STEP = ("Codex runs a new or changed hook only after you review it: start Codex, and approve "
+                     "Khipu's hooks when it says hooks need review.")
+
+
+def delegation_hook() -> str:
+    return _shim("khipu-delegation-hook")
+
+
+def _is_our_delegation(cmd: Any) -> bool:
+    return _is_launcher_command(cmd, "khipu-delegation-hook")
+
+
+def _install_delegation_hooks(hooks: dict, path: Path, changes: list[str]) -> bool:
+    """Add or re-point Khipu's PreToolUse and SubagentStart entries in a
+    Claude-shaped ``hooks`` block (Claude Code's settings.json, Codex's
+    hooks.json). True when anything changed."""
+    changed = False
+    want = delegation_hook()
+    for event in DELEGATION_EVENTS:
+        entries = hooks.setdefault(event, [])
+        matcher = DELEGATION_MATCHER if event == "PreToolUse" else None
+        timeout = DELEGATION_TIMEOUT if event == "PreToolUse" else SUBAGENT_START_TIMEOUT
+        ours = [e for e in entries if any(_is_our_delegation(h.get("command")) for h in e.get("hooks", []))]
+        if not ours:
+            entry: dict[str, Any] = {"hooks": [{"type": "command", "command": want, "timeout": timeout}]}
+            if matcher:
+                entry = {"matcher": matcher, **entry}
+            entries.append(entry)
+            changes.append(f"{path}: hooks.{event} += khipu-delegation-hook")
+            changed = True
+            continue
+        for e in ours:
+            for h in e.get("hooks", []):
+                if _is_our_delegation(h.get("command")) and (h.get("command") != want or h.get("timeout") != timeout):
+                    h["command"], h["timeout"] = want, timeout
+                    changes.append(f"{path}: hooks.{event} khipu-delegation-hook -> {want} (timeout={timeout})")
+                    changed = True
+            if matcher and e.get("matcher") != matcher and len(e.get("hooks", [])) == 1:
+                e["matcher"] = matcher
+                changes.append(f"{path}: hooks.{event} khipu-delegation-hook matcher -> {matcher}")
+                changed = True
+    return changed
 
 
 # Cursor sessionStart must outlive a hub PG slice; harness session_start.sh stays at 5s.
@@ -671,6 +732,8 @@ def _claude_hooks_install(settings: Path, dry: bool, res: dict) -> None:
         res["changes"].append(
             f"{settings}: hooks.UserPromptSubmit khipu-prompt-recall -> {prompt_recall_hook()}")
         changed = True
+    if _install_delegation_hooks(hooks, settings, res["changes"]):
+        changed = True
     if changed and not dry:
         res.setdefault("backups", []).append(_backup(settings))
         _write_json(settings, s)
@@ -724,13 +787,15 @@ def _claude_mcp_uninstall(path: Path, dry: bool, res: dict) -> None:
 def _claude_hooks_uninstall(settings: Path, dry: bool, res: dict) -> None:
     s = _load_json(settings)
     changed = False
-    for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop", "SessionStart", "UserPromptSubmit"):
+    for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop", "SessionStart", "UserPromptSubmit",
+                  *DELEGATION_EVENTS):
         entries = s.get("hooks", {}).get(event, [])
         kept = []
         for e in entries:
             e_hooks = [h for h in e.get("hooks", [])
                        if not (_is_ours(h.get("command")) or _is_our_recall(h.get("command"))
-                               or _is_our_prompt_recall(h.get("command")))]
+                               or _is_our_prompt_recall(h.get("command"))
+                               or _is_our_delegation(h.get("command")))]
             if len(e_hooks) != len(e.get("hooks", [])):
                 changed = True
                 res["changes"].append(f"{settings}: hooks.{event} -= khipu hook")
@@ -783,7 +848,7 @@ def _claude_uninstall(dry: bool, home: str | None = None) -> dict:
 
 _CLAUDE_HOME_FLAGS_OFF = {
     "hook_stop": False, "hook_precompact": False, "hook_sessionend": False, "hook_subagentstop": False,
-    "recall_rule": "missing", "prompt_recall": "missing",
+    "recall_rule": "missing", "prompt_recall": "missing", "delegation_push": "missing",
     "memory_tools_ok": False, "hooks_ok": False, "installed": False, "launcher_ok": True,
     "has_khipu": False,
 }
@@ -819,24 +884,28 @@ def _claude_home_status(h: _homes.ClaudeHome) -> tuple[dict, dict]:
     stop, precompact = _cmd("Stop", _is_ours), _cmd("PreCompact", _is_ours)
     sessionend, subagentstop = _cmd("SessionEnd", _is_ours), _cmd("SubagentStop", _is_ours)
     rule, prompt_recall = _cmd("SessionStart", _is_our_recall), _cmd("UserPromptSubmit", _is_our_prompt_recall)
+    delegation = _cmd("PreToolUse", _is_our_delegation)
+    subagent_start = _cmd("SubagentStart", _is_our_delegation)
     launch = _pack_launchers("claude_code", {
         "khipu-mcp": mcp_cmds[0],
         "khipu-stop-hook": stop,
         "khipu-recall-hook": rule,
         "khipu-prompt-recall": prompt_recall,
+        "khipu-delegation-hook": delegation or subagent_start,
     })
     row.update(
         hook_stop=stop is not None, hook_precompact=precompact is not None,
         hook_sessionend=sessionend is not None, hook_subagentstop=subagentstop is not None,
         recall_rule="installed" if rule else "missing",
         prompt_recall="installed" if prompt_recall else "missing",
+        delegation_push="installed" if delegation and subagent_start else "missing",
         memory_tools_ok=mcp_ok, launcher_ok=launch["launcher_ok"],
     )
     row["hooks_ok"] = all((stop, precompact, sessionend, subagentstop, rule, prompt_recall))
     row["installed"] = bool(mcp_ok and stop and precompact) and launch["launcher_ok"]
     # Any Khipu entry of this home's own, however stale. A linked home's hooks
     # are the owner's, so for it only the memory tools entry counts.
-    own_hooks = any((stop, precompact, sessionend, subagentstop, rule, prompt_recall))
+    own_hooks = any((stop, precompact, sessionend, subagentstop, rule, prompt_recall, delegation, subagent_start))
     row["has_khipu"] = _claude_has_mcp(h) or (own_hooks and h.linked_to is None)
     return row, launch
 
@@ -864,6 +933,8 @@ def _claude_pack_fields(scope: list[dict]) -> dict:
         "hook_sessionend": every("hook_sessionend"), "hook_subagentstop": every("hook_subagentstop"),
         "recall_rule": "installed" if every_installed("recall_rule") else "missing",
         "prompt_recall": "installed" if every_installed("prompt_recall") else "missing",
+        # The routing push at delegation (phase 6): PreToolUse and SubagentStart.
+        "delegation_push": "installed" if every_installed("delegation_push") else "missing",
         # Khipu-native extraction rides on this same hook (session_capture);
         # "legacy" was the model-driven capture_v2 nudge, which is now only
         # a parallel writer until the soak-gated legacy removal.
@@ -1574,6 +1645,13 @@ def _codex_install(dry: bool) -> dict:
         out["changes"].append(
             f"{CODEX_HOOKS}: hooks.UserPromptSubmit khipu-prompt-recall -> {prompt_recall_hook()}")
         changed = True
+    # Routing at delegation (phase 6). Codex keeps a hook it has not seen
+    # before switched off until the owner reviews it (hooks.state.<key>
+    # .trusted_hash); Khipu never writes that trust itself, it says so.
+    if _install_delegation_hooks(hooks, CODEX_HOOKS, out["changes"]):
+        changed = True
+    if changed:
+        out["next_step"] = CODEX_REVIEW_STEP
     if changed and not dry:
         out.setdefault("backups", []).append(_backup(CODEX_HOOKS))
         _write_json(CODEX_HOOKS, h)
@@ -1595,13 +1673,15 @@ def _codex_uninstall(dry: bool) -> dict:
                 _write_toml(CODEX_TOML, new)
     h = _load_json(CODEX_HOOKS)
     changed = False
-    for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop", "SessionStart", "UserPromptSubmit"):
+    for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop", "SessionStart", "UserPromptSubmit",
+                  *DELEGATION_EVENTS):
         entries = h.get("hooks", {}).get(event, [])
         kept = []
         for e in entries:
             e_hooks = [x for x in e.get("hooks", [])
                        if not (_is_ours(x.get("command")) or _is_our_recall(x.get("command"))
-                               or _is_our_prompt_recall(x.get("command")))]
+                               or _is_our_prompt_recall(x.get("command"))
+                               or _is_our_delegation(x.get("command")))]
             if len(e_hooks) != len(e.get("hooks", [])):
                 changed = True
                 out["changes"].append(f"{CODEX_HOOKS}: hooks.{event} -= khipu hook")
@@ -1630,6 +1710,8 @@ def _codex_status() -> dict:
             "hook_subagentstop": has("SubagentStop", _is_ours),
             "recall_rule": "installed" if has("SessionStart", _is_our_recall) else "missing",
             "prompt_recall": "installed" if has("UserPromptSubmit", _is_our_prompt_recall) else "missing",
+            "delegation_push": ("installed" if has("PreToolUse", _is_our_delegation)
+                                and has("SubagentStart", _is_our_delegation) else "missing"),
             "extract": "installed" if has("Stop", _is_ours) and has("PreCompact", _is_ours) else "missing"}
     def _cmd(ev: str, pred) -> str | None:
         for e in h.get("hooks", {}).get(ev, []):
@@ -1642,6 +1724,7 @@ def _codex_status() -> dict:
         "khipu-stop-hook": _cmd("Stop", _is_ours),
         "khipu-recall-hook": _cmd("SessionStart", _is_our_recall),
         "khipu-prompt-recall": _cmd("UserPromptSubmit", _is_our_prompt_recall),
+        "khipu-delegation-hook": _cmd("PreToolUse", _is_our_delegation) or _cmd("SubagentStart", _is_our_delegation),
     }))
     return out
 
@@ -1910,7 +1993,7 @@ def _probe_gateway(url: str, token: str) -> dict:
         req = urllib.request.Request(url + "/mcp", data=body, method="POST",
                                      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as resp:
-            frames = json.loads(resp.read().decode())
+            frames = json.loads(resp.read().decode("utf-8"))
         tools = [t["name"] for t in frames[1]["result"]["tools"]]
         st = json.loads(frames[2]["result"]["content"][0]["text"])
         # negative: a wrong token must be refused
@@ -1973,7 +2056,7 @@ def _gateway_healthz(url: str, token: str, *, timeout: float) -> Any:
 
     req = urllib.request.Request(url + "/healthz", headers={"Authorization": f"Bearer {token}"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+        return json.loads(resp.read().decode("utf-8"))
 
 
 def gateway_liveness_check() -> dict[str, Any]:
@@ -2035,12 +2118,14 @@ def _probe_mcp(command: str) -> dict:
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "khipu_status", "arguments": {}}},
     )) + "\n"
     try:
-        p = subprocess.run([command], input=lines, capture_output=True, text=True, timeout=60)
+        p = subprocess.run([command], input=lines.encode("utf-8"), capture_output=True, timeout=60)
+        # Bytes as UTF-8 whatever the locale, split on LF only: a literal
+        # U+2028 inside a string is not a frame boundary.
+        frames = [json.loads(ln) for ln in wire.split_frames(p.stdout)]
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    frames = [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
     if len(frames) < 2 or "result" not in frames[1]:
-        return {"ok": False, "error": (p.stderr or p.stdout)[-300:]}
+        return {"ok": False, "error": (p.stderr or p.stdout).decode("utf-8", "replace")[-300:]}
     body = json.loads(frames[1]["result"]["content"][0]["text"])
     return {"ok": not frames[1]["result"].get("isError") and "counts" in body,
             "episodes": body.get("counts", {}).get("episodes"), "ms": int((time.time() - t0) * 1000)}
@@ -2061,7 +2146,7 @@ def _probe_hook(command: str) -> dict:
             # inside the harnesses themselves).
             env = dict(os.environ, KHIPU_CAPTURE_HOME=str(Path(td) / "kh"), KHIPU_CAPTURE_NO_DRAIN="1")
             p = subprocess.run(command, shell=True, input='{"hook_event_name":"Stop","session_id":"khipu-verify"}',
-                               capture_output=True, text=True, timeout=60, env=env)
+                               capture_output=True, encoding="utf-8", timeout=60, env=env)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
     out = {"ok": p.returncode == 0, "exit": p.returncode, "ms": int((time.time() - t0) * 1000)}
@@ -2075,7 +2160,7 @@ def _probe_recall(command: str) -> dict:
     Shell-run for the same reason as _probe_hook."""
     t0 = time.time()
     try:
-        p = subprocess.run(command, shell=True, input="{}", capture_output=True, text=True, timeout=30)
+        p = subprocess.run(command, shell=True, input="{}", capture_output=True, encoding="utf-8", timeout=30)
         d = json.loads(p.stdout.strip() or "{}")
         ctx = (
             d.get("hookSpecificOutput", {}).get("additionalContext")
@@ -2088,10 +2173,33 @@ def _probe_recall(command: str) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+# The routing block's headings (routing.py's full block and CHANGES_HEADING,
+# recall_prompt.ROUTING_TOO_LONG's pointer). recall_prompt appends the block
+# after whatever recall printed, never before it, so a context that starts
+# with one of these holds no recall output.
+_ROUTING_HEADINGS = ("## Routing at ", "## Routing changes at ", "## Routing\nKhipu's routing update")
+_RECALL_HEADING = "## Prior work on this topic"
+
+
+def _recall_part(ctx: str) -> str:
+    """The recall output in a prompt hook's context, without the routing
+    block appended after it. A recall heading after the routing block makes
+    the whole context count, so recall that leaked past it still shows."""
+    cut = len(ctx)
+    for heading in _ROUTING_HEADINGS:
+        at = 0 if ctx.startswith(heading) else ctx.find("\n\n" + heading)
+        if at >= 0:
+            cut = min(cut, at)
+    return ctx if _RECALL_HEADING in ctx[cut:] else ctx[:cut]
+
+
 def _probe_prompt_recall(command: str) -> dict:
-    """UserPromptSubmit hook: a trivial prompt must print exactly {} (R11's
-    gate) and a topical one must run cleanly and return valid JSON, shell-run
-    for the same reason as _probe_hook.
+    """UserPromptSubmit hook: a trivial prompt must carry no recall output
+    (R11's gate) and a topical one must run cleanly and return valid JSON,
+    shell-run for the same reason as _probe_hook. Since routing truth phase
+    3 a new conversation's first prompt also carries the routing block (and
+    a later one may carry its changes), so only the recall part is judged:
+    routing lines alone pass a trivial prompt and fail a topical one.
 
     2026-09-14 revision: khipu.recall_prompt now searches the LOCAL sqlite
     replica first (khipu.hub_snapshot) — no network round trip beyond one
@@ -2126,11 +2234,11 @@ def _probe_prompt_recall(command: str) -> dict:
     try:
         trivial = subprocess.run(command, shell=True,
                                   input=json.dumps({"prompt": "ok", "session_id": trivial_session_id}),
-                                  capture_output=True, text=True, timeout=10)
+                                  capture_output=True, encoding="utf-8", timeout=10)
         topical = subprocess.run(
             command, shell=True,
             input=json.dumps({"prompt": "khipu prompt recall verify probe", "session_id": topical_session_id}),
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, encoding="utf-8", timeout=10,
         )
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -2147,15 +2255,17 @@ def _probe_prompt_recall(command: str) -> dict:
         d_topical.get("hookSpecificOutput", {}).get("additionalContext")
         or d_topical.get("additional_context") or ""
     )
-    ok = trivial.returncode == 0 and topical.returncode == 0 and trivial_ctx == ""
+    trivial_recall = _recall_part(trivial_ctx)
+    topical_recall = _recall_part(topical_ctx)
+    ok = trivial.returncode == 0 and topical.returncode == 0 and trivial_recall == ""
     if snapshot_fresh:
-        ok = ok and bool(topical_ctx)
-    out = {"ok": ok, "trivial_empty": trivial_ctx == "", "topical_context_chars": len(topical_ctx),
+        ok = ok and bool(topical_recall)
+    out = {"ok": ok, "trivial_empty": trivial_recall == "", "topical_context_chars": len(topical_recall),
            "snapshot_fresh": snapshot_fresh, "ms": int((time.time() - t0) * 1000)}
     if not ok:
-        if trivial_ctx:
-            reason = "trivial prompt was not empty"
-        elif snapshot_fresh and not topical_ctx:
+        if trivial_recall:
+            reason = "trivial prompt carried recall output"
+        elif snapshot_fresh and not topical_recall:
             reason = "topical prompt returned nothing while the local snapshot is fresh"
         else:
             reason = trivial.stderr or topical.stderr or "probe failed"
@@ -2184,7 +2294,7 @@ def _probe_extract(command: str) -> dict:
             khome = Path(td) / "khipu-home"
             env = dict(os.environ, KHIPU_AEGIS_PROBE="1", KHIPU_AEGIS_HOME=str(khome),
                        KHIPU_HARNESS="aegis")
-            p = subprocess.run(command, shell=True, input=envl, capture_output=True, text=True,
+            p = subprocess.run(command, shell=True, input=envl, capture_output=True, encoding="utf-8",
                                timeout=30, env=env)
             d = json.loads((p.stdout or "").strip() or "{}")
             # The job on disk is the real assertion: a "due" that queued nothing
@@ -2243,7 +2353,7 @@ def _probe_native_extract(command: str, harness: str) -> dict:
             env.update(KHIPU_CAPTURE_HOME=str(khome), KHIPU_CAPTURE_NO_DRAIN="1",
                        KHIPU_MEMORY_ROOT=str(Path(td) / "mem"))
             p = subprocess.run(command, shell=True, input=json.dumps(envl), capture_output=True,
-                               text=True, timeout=60, env=env)
+                               encoding="utf-8", timeout=60, env=env)
             queued = list((khome / "queue").glob("*.json"))
             beat = {}
             try:
@@ -2309,7 +2419,7 @@ def _probe_aegis_isolation(command: str) -> dict:
                 env = {k: v for k, v in os.environ.items() if k != "KHIPU_HARNESS"}
                 env.update(aegis_env, HOME=home, KHIPU_AEGIS_HOME=str(Path(home) / "kh"), **extra)
                 p = subprocess.run(command, shell=True, input=payload, capture_output=True,
-                                   text=True, timeout=60, env=env)
+                                   encoding="utf-8", timeout=60, env=env)
                 ran = (Path(home) / "kh" / "dispatch" / "aegis.json").is_file()
                 results[label] = (ran if label == "native_ran" else not ran) and p.returncode == 0
         out = {"ok": all(results.values()), **results, "ms": int((time.time() - t0) * 1000)}
@@ -2347,7 +2457,7 @@ def _probe_aegis_refusal(command: str) -> dict:
                 env = {k: v for k, v in os.environ.items() if k != "KHIPU_HARNESS"}
                 env.update(aegis_env, HOME=home, KHIPU_AEGIS_HOME=str(Path(home) / "kh"), **extra)
                 p = subprocess.run(command, shell=True, input=payload, capture_output=True,
-                                   text=True, timeout=60, env=env)
+                                   encoding="utf-8", timeout=60, env=env)
                 wrote = any(Path(home).rglob("*"))
                 # The recall hook refuses by printing a bare {}, so silence on
                 # disk is not enough — an emitted rule is also a breach.

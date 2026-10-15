@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import signal
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -42,14 +43,14 @@ class Clock:
 
 
 @pytest.fixture
-def home(tmp_path, monkeypatch):
+def home(tmp_path, monkeypatch, khipu_app):
     data = tmp_path / "data"
     data.mkdir()
     (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS}))
     monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
     clock = Clock(T0)
     monkeypatch.setattr(routing, "_now", clock)
-    return {"data": data, "clock": clock, "tmp": tmp_path}
+    return {"data": data, "clock": clock, "tmp": tmp_path, "callers": khipu_app}
 
 
 def _set(home, **values) -> None:
@@ -581,11 +582,18 @@ def test_probe_child_keeps_the_refresh_lock_until_cleanup_if_its_parent_dies(hom
     probe_pid_file = tmp_path / "orphan-probe.pid"
 
     def stuck(_account):
-        probe_pid_file.write_text(str(os.getpid()))
-        time.sleep(60)
+        # What is left of the child's own timer, so the test can see it is armed.
+        armed = signal.getitimer(signal.ITIMER_REAL)[0]
+        probe_pid_file.write_text(f"{os.getpid()} {armed!r}")
+        time.sleep(600)
 
     monkeypatch.setattr(usage, "probe_account", stuck)
-    monkeypatch.setattr(usage, "TIMEOUT_S", 0.3)
+    # Long enough that neither the caller's deadline nor the child's timer can
+    # pass before the test has killed the caller and looked at the lock, however
+    # busy the machine is. The test then fires the child's timer itself
+    # (SIGALRM, the signal its timer sends), so its cleanup runs from the same
+    # handler a real expiry runs.
+    monkeypatch.setattr(usage, "TIMEOUT_S", 60.0)
     monkeypatch.setattr(usage, "OVERALL_GRACE_S", 0.1)
     caller = os.fork()
     if caller == 0:
@@ -593,28 +601,44 @@ def test_probe_child_keeps_the_refresh_lock_until_cleanup_if_its_parent_dies(hom
             routing.check_account("Claude", now=home["clock"](), load=lambda: 0)
         finally:
             os._exit(0)
+    probe_pid = None
     try:
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 30
         while not probe_pid_file.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert probe_pid_file.exists()
-        probe_pid = int(probe_pid_file.read_text())
+        pid_text, armed = probe_pid_file.read_text().split()
+        probe_pid = int(pid_text)
+        assert 0 < float(armed) <= 60.1  # the child's own bound is armed
         os.kill(caller, 9)
         os.waitpid(caller, 0)
         assert usage._try_refresh_lock() is None  # live probe still excludes another refresh
+        os.kill(probe_pid, signal.SIGALRM)
         fd = None
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 30
         while fd is None and time.monotonic() < deadline:
             time.sleep(0.01)
             fd = usage._try_refresh_lock()
         assert fd is not None
         usage._release(fd)
+        # The lock is released as the child exits; the orphan is then reaped by init.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                os.kill(probe_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.01)
         with pytest.raises(ProcessLookupError):
             os.kill(probe_pid, 0)
+        probe_pid = None  # gone: never signal a pid that may be reused
     finally:
         with contextlib.suppress(OSError, ChildProcessError):
             os.kill(caller, 9)
             os.waitpid(caller, 0)
+        if probe_pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(probe_pid, 9)
 
 
 # ---- through the record ----------------------------------------------------------------
@@ -962,7 +986,8 @@ def test_owner_commands_refuse_without_a_typed_confirmation(home, capsys, monkey
     assert rc == 0 and json.loads(out)["ok"] is True
     block = routing.doctor_block()
     assert block["outside_app"] == ["pause of Codex"]
-    assert "A rule, a pause, a clear or your note was written by something other than the app." in block["warnings"]
+    assert "A rule, a pause, a clear, your note or your priority was written by something other than the app." \
+        in block["warnings"]
 
 
 def test_rule_at_owner_request_is_live_without_terminal_confirmation_but_owner_actions_are_not(home, capsys, monkeypatch):
@@ -2283,8 +2308,6 @@ def test_recent_changes_name_the_owner_in_settings_for_every_change_made_in_the_
 # setting that is not an option at all. Each leaves this list in the PR that
 # builds it, so the test below then asks for its control.
 NOT_IN_THE_APP_YET = {
-    # Phase 6: the push before handing work to another agent.
-    "routing_push_delegation",
     # Phase 7: the copy for cloud agents.
     "routing_cloud_copy", "routing_cloud_copy_hold_words", "routing_cloud_copy_rules",
     "routing_cloud_copy_stale_after", "routing_cloud_copy_debounce",
