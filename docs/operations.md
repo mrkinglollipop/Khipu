@@ -228,7 +228,7 @@ Nearby pairing without a file: on the working Mac `khipu join advertise [--pin .
 
 Notes:
 
-- The kit format is `khipu-join-v1`, encrypted with AES-GCM (PBKDF2 key, 390,000 iterations). The passphrase is optional but a good idea. Treat the kit as a credential.
+- The kit format is `khipu-join-v1`. With a passphrase it is encrypted with AES-GCM (PBKDF2 key, 390,000 iterations). Without one it is plain JSON holding the database address with its password and any configured API keys, readable by anyone who gets the file; Khipu writes it readable by your user only. Use a passphrase and treat the kit as a credential. Encrypting every kit is planned.
 - A kit whose database address is `localhost` is refused.
 - Import checks the live row counts. It fails hard only when the kit expects data and the live database shows none.
 - After you move the database (below), every other Mac needs a fresh kit.

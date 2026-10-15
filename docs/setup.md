@@ -140,7 +140,7 @@ docker run -d --name khipu-gateway --network host \
   khipu/gateway
 ```
 
-The gateway listens on `127.0.0.1:8787` by default (`KHIPU_GATEWAY_BIND` changes it). Put a TLS-terminating reverse proxy (Caddy or nginx, with a real certificate) in front. It refuses to start if the token is missing or shorter than 24 characters. The token is the only credential a cloud agent holds. Postgres stays private. If you use library search through the gateway, the gateway host also needs the embedding key for each enabled library profile.
+The gateway listens on `127.0.0.1:8787` by default (`KHIPU_GATEWAY_BIND` changes it). Put a TLS-terminating reverse proxy (Caddy or nginx, with a real certificate) in front. It refuses to start if the token is missing or shorter than 24 characters. The token is the only credential a cloud agent holds. Khipu does not check where your database lives; keep PostgreSQL on a private network and do not open its port to the internet. If you use library search through the gateway, the gateway host also needs the embedding key for each enabled library profile.
 
 Then, on your Mac:
 

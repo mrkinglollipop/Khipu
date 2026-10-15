@@ -77,7 +77,7 @@ Hub status: table counts, latest episode time, mirror lag and recent captures. R
 | `budget_ms` | Time budget for the prior-work lookup. Default 600. |
 | `full` | With `prompt`, return the complete payload instead of the light one. |
 
-With `prompt` and no `full`, the answer always has `hub_ok`, `prior_work`, `prior_work_text` and `prior_work_meta`. `notes_freshness`, `routing`, `contract` and `hub_error` are optional: each is left out when it is unavailable or its lookup fails. `prior_work` holds up to three items and `prior_work_text` is a short Markdown block. Without `prompt` (or with `full`), the answer is the complete payload: counts, recent captures, replica freshness (`hub_snapshot`, `snapshot_age_seconds`, `snapshot_state`), `pending_turns`, the capability `contract`, and `warnings` for plans nearly used up (read from the usage cache only). If the hub cannot be reached, the answer falls back to the local replica and carries `hub_error`.
+With `prompt` and no `full`, the answer always has `hub_ok`. `prior_work`, `prior_work_text`, `prior_work_meta`, `notes_freshness`, `routing`, `contract` and `hub_error` are optional: each is left out when it is unavailable or its lookup fails. `prior_work` holds up to three items and `prior_work_text` is a short Markdown block. Without `prompt` (or with `full`), the answer is the complete payload: counts, recent captures, replica freshness (`hub_snapshot`, `snapshot_age_seconds`, `snapshot_state`), `pending_turns`, the capability `contract`, and `warnings` for plans nearly used up (read from the usage cache only). If the hub cannot be reached, the answer falls back to the local replica and carries `hub_error`.
 
 The prompt path is the pull path for harnesses that get no pushed recall, such as Aegis and the gateway.
 
@@ -108,7 +108,7 @@ Behaviour depends on where it runs:
 
 ### khipu_forget
 
-Hide one episode from every reader. Parameter: `id` (required). The episode row is tombstoned, not erased: its summary and provenance stay in the database. Its vectors and legacy file lines are removed, the commitments it opened are closed (the closed rows stay) and its decisions are retracted. Graph topic nodes and earlier database backups are not touched. File, replica and outbox cleanup is best effort; a failure returns `complete: false` with the remaining stores in `partial`. Use it for a wrong capture or a test. Over the gateway it only works on episodes from cloud harnesses.
+Tombstone one episode. Parameter: `id` (required). The row is not erased: its summary and provenance stay in the database. Search and `khipu_get` skip it, but today the recent-capture lists (Activity, doctor, status, the full `khipu_status` and the session-start fallback) can still show it; a fix is planned. Its vectors and legacy file lines are removed, the commitments it opened are closed (the closed rows stay) and its decisions are retracted. Graph topic nodes and earlier database backups are not touched. The legacy file and replica steps can fail, and outbox jobs for the session are reported, not removed; either returns `complete: false` with the remaining stores in `partial`. Use it for a wrong capture or a test. Over the gateway it only works on episodes from cloud harnesses.
 
 ## Commitments and decisions
 
