@@ -14,6 +14,7 @@ tests use fake clocks; the helper's tests run the real helper process.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 import threading
@@ -216,6 +217,59 @@ def test_with_the_push_off_nothing_is_due_and_on_again_a_poll_is_due_at_once(hom
     monkeypatch.setenv("ROUTING_NOW_OFF", "1")  # the old hook's bypass
     recall_prompt._look_at_settings(schedule, routing)
     assert schedule.due() == []
+
+
+def _helper_poll(schedule) -> dict:
+    """A poll as the helper starts it: the view's stat first, then the child's poll."""
+    schedule.view_seen = recall_prompt._view_stat(routing)
+    return _poll(schedule)
+
+
+@pytest.mark.parametrize("interval", [0, "1h"])
+def test_a_limit_written_after_the_last_poll_is_waited_for_with_no_poll_following(home, monkeypatch, interval):
+    # The schedule learned valid_until only from a poll's answer: with the
+    # poll interval 0 (or a long one) a limit written after the start-up poll
+    # never refolded on the clock, and only a prompt's own fold saw its end.
+    clocks = home["clocks"]
+    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
+    _set(home, routing_poll_interval=interval)
+    routing.report(account="Claude", state="open", author=ME)
+    schedule = _schedule(home, interval=routing.poll_interval())
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due() == ["poll"]
+    _helper_poll(schedule)  # the start-up poll: the clock changes nothing for hours
+    assert schedule.valid_until > clocks.wall() + 3600 and not schedule.due()
+    clocks.run(5)
+    recall_prompt._look_at_settings(schedule, routing)
+    assert not schedule.due()  # nothing changed: no poll
+    routing.report(account="Codex", state="limited", until="12s", author=ME)
+    recall_prompt._look_at_settings(schedule, routing)  # the helper's look sees view.json changed
+    assert schedule.due() == ["poll"]
+    out = _helper_poll(schedule)
+    assert not out["folded"]  # the write saved the view: the poll only reads its valid_until
+    end = routing._parse(routing._load_view()["valid_until"])
+    assert schedule.valid_until == end.timestamp() == clocks.wall() + 12
+    recall_prompt._look_at_settings(schedule, routing)
+    assert not schedule.due() and 11.0 <= schedule.sleep_for(60.0) <= 12.0
+    clocks.run(12)
+    assert schedule.due() == ["clock"]
+    assert _helper_poll(schedule)["folded"]
+    codex = next(a for a in routing._load_view()["accounts"] if a["label"] == "Codex")
+    assert codex["state"] == routing.PROBABLY_OPEN
+    # Its own save is one more look at a fresh view, then nothing.
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due() == ["poll"] and not _helper_poll(schedule)["folded"]
+    recall_prompt._look_at_settings(schedule, routing)
+    assert not schedule.due()
+
+
+def test_a_changed_view_makes_no_poll_due_with_the_push_off(home):
+    _set(home, routing_poll_interval=0)
+    schedule = _schedule(home, interval=None)
+    recall_prompt._look_at_settings(schedule, routing)  # the feature is off by default
+    routing.report(account="Codex", state="limited", until="12s", author=ME)
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.off and schedule.view_seen is None and not schedule.due()
 
 
 def test_a_stopping_helper_sleeps_while_only_a_folding_poll_child_is_left():
@@ -474,6 +528,22 @@ def test_the_helper_picks_up_a_poll_interval_turned_on_again(home, monkeypatch, 
     assert next(a for a in view["accounts"] if a["label"] == "Claude")["state"] == routing.LIMITED
 
 
+def test_the_helper_refolds_at_a_limits_end_written_after_its_start_with_the_poll_off(home, monkeypatch, helper):
+    _set(home, routing_poll_interval=0)
+    monkeypatch.setattr(routing, "_now", lambda: datetime.now(timezone.utc))
+    routing.report(account="Claude", state="open", author=ME)
+    assert helper.start_routing()
+    assert helper.routing_forkserver.wait_ready(10)
+    time.sleep(1.5)  # its start-up poll has read the view; no poll follows
+    routing.report(account="Codex", state="limited", until="3s", author=ME)
+    view = routing._load_view()
+    version, end = view["version"], routing._parse(view["valid_until"])
+    # No prompt and no poll: only the helper's look at view.json and its clock.
+    view = _wait(lambda: (v := routing._load_view()) and v["version"] > version and v, seconds=15)
+    assert routing._parse(view["folded_at"]) >= end
+    assert next(a for a in view["accounts"] if a["label"] == "Codex")["state"] == routing.PROBABLY_OPEN
+
+
 # ---- doctor: the per-prompt budget rate -----------------------------------------------------------
 
 
@@ -538,6 +608,29 @@ def test_the_stop_condition_is_more_than_two_timeouts_in_a_hundred():
     assert not routing_replay.verdict(0.0, 3.0)
 
 
+def test_the_replay_stops_when_the_helper_never_refolds(tmp_path, monkeypatch):
+    # A helper that never polls (its push off) would leave the poll's cost
+    # out of the measure: the replay refuses to measure without it.
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "live"))
+    monkeypatch.delenv("KHIPU_ISOLATED_DIR", raising=False)
+    monkeypatch.setattr(routing, "ROUTING_NOW_DISABLE_FILE", str(tmp_path / "routing_now_disable"))
+    monkeypatch.setattr(routing_replay, "_CHECK_WAIT_S", 2.0)
+    real_seed = routing_replay._seed
+
+    def seed(directory, limit_ends_in):
+        real_seed(directory, limit_ends_in)
+        config = json.loads((directory / "config.json").read_text())
+        (directory / "config.json").write_text(json.dumps(dict(config, routing_push_prompt=False)))
+
+    monkeypatch.setattr(routing_replay, "_seed", seed)
+    work = Path(tempfile.mkdtemp(prefix="krr-", dir="/tmp"))
+    try:
+        with pytest.raises(RuntimeError, match="did not refold.*its push is off: routing_push_prompt off"):
+            routing_replay.replay(2, search="synthetic", workdir=work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_the_replay_reports_timeouts_per_100_each_way_and_writes_only_its_own_dir(tmp_path, monkeypatch):
     live = tmp_path / "live"
     live.mkdir()
@@ -546,16 +639,36 @@ def test_the_replay_reports_timeouts_per_100_each_way_and_writes_only_its_own_di
     monkeypatch.delenv("KHIPU_CAPTURE_HOME", raising=False)
     monkeypatch.setattr(routing, "ROUTING_NOW_DISABLE_FILE", str(tmp_path / "routing_now_disable"))
     monkeypatch.setattr(routing_replay, "_SYNTH_MEDIAN_S", 0.02)
+    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "0")  # an owner's shell with the push off
+    monkeypatch.setenv("ROUTING_NOW_OFF", "1")
+    folds: list[str] = []
+    real_fold = routing.fold
+    monkeypatch.setattr(routing, "fold", lambda *a, **k: folds.append("replay") or real_fold(*a, **k))
+    seen: dict = {}
+    real_helper_refolds = routing_replay._helper_refolds
+
+    def helper_refolds(*a, **k):
+        seen["push_off"] = routing.push_off("prompt")
+        seen["folds_before"] = len(folds)
+        seen["took"] = real_helper_refolds(*a, **k)
+        seen["folds_after"] = len(folds)
+        return seen["took"]
+
+    monkeypatch.setattr(routing_replay, "_helper_refolds", helper_refolds)
     work = Path(tempfile.mkdtemp(prefix="krr-", dir="/tmp"))
     try:
         out = routing_replay.replay(8, search="synthetic", workdir=work)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+    # The helper ran with the push on and refolded at the first limit's end
+    # with no prompt, and no fold in this process did it for it.
+    assert seen["push_off"] is None
+    assert seen["folds_after"] == seen["folds_before"]
+    assert out["helper_refold_s"] == seen["took"] and 0 <= seen["took"] < routing_replay._CHECK_WAIT_S
+    assert os.environ["KHIPU_FEATURE_ROUTING_PUSH"] == "0" and os.environ["ROUTING_NOW_OFF"] == "1"
     assert out["on"]["prompts"] == out["off"]["prompts"] == 8
     assert out["on"]["reasons"] == {"ok": 8} and out["off"]["reasons"] == {"ok": 8}
     assert out["on"]["per_100"] == out["off"]["per_100"] == 0.0 and not out["stop"] and not out["enough"]
     assert sum(out["on"]["routing"].values()) == 8 and out["off"]["routing"] == {}
     assert list(live.iterdir()) == []  # nothing in the configured data dir
-    import os
-
     assert "KHIPU_ISOLATED_DIR" not in os.environ and "KHIPU_CAPTURE_HOME" not in os.environ

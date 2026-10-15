@@ -438,11 +438,12 @@ def test_replay_refuses_an_empty_answer_where_live_had_one(home, monkeypatch):
 
 
 def _routing_hook(runs: list, *, on_status="full", on_hits=("episode:3",), off_hits=("episode:3",),
-                  first_on_hits=None, first_on_status=None, push=None):
+                  first_on_hits=None, first_on_status=None, push=None, on_reason="ok", on_ms=300.0):
     """A fake hook that answers with routing on (the run's environment says
-    so) as ``on_status`` and ``on_hits``; ``first_on_hits`` and
-    ``first_on_status`` only the first time (None: no routing field).
-    ``push`` is what the candidate's probe says (None: it says nothing)."""
+    so) as ``on_status``, ``on_hits``, ``on_reason`` and ``on_ms``;
+    ``first_on_hits`` and ``first_on_status`` only the first time (None: no
+    routing field). ``push`` is what the candidate's probe says (None: it
+    says nothing)."""
     def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
         if argv[1:2] == ["-c"]:
             runs.append(("prefold", env["PYTHONPATH"], env["KHIPU_ISOLATED_DIR"]))
@@ -454,11 +455,14 @@ def _routing_hook(runs: list, *, on_status="full", on_hits=("episode:3",), off_h
         runs.append(("on" if on else "off", "/candidate/packages/" in argv[0], record))
         hits = list(off_hits)
         status = on_status
+        reason, ms = "ok", 300.0
         if on:
             first = sum(1 for r in runs if r[0] == "on") == 1
             hits = list(first_on_hits if first_on_hits is not None and first else on_hits)
             status = first_on_status if first_on_status is not None and first else on_status
-        line = _summary(datetime.now(timezone.utc), "ok", hits) + (f" routing={status}" if on and status else "")
+            reason, ms = on_reason, on_ms
+        line = _summary(datetime.now(timezone.utc), reason, hits).replace("ms=300.0", f"ms={ms}")
+        line += f" routing={status}" if on and status else ""
         log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text(line + "\n")
@@ -546,6 +550,41 @@ def test_replay_fails_a_candidate_whose_search_answers_differ_with_routing_on(ho
     # The differing pair was replayed once more before the step failed.
     assert [r[:2] for r in runs if r[0] != "prefold"] == [("off", False), ("off", True), ("on", True),
                                                           ("off", True), ("on", True)]
+
+
+@pytest.mark.parametrize(("reason", "ms", "hits", "expect"), [
+    ("timeout>1.2s", 1200.0, (), "with routing on, timeout>1.2s"),
+    ("error:RuntimeError", 40.0, (), "with routing on, error:RuntimeError"),
+    ("ok", 1900.0, ("episode:3",), "with routing on, 1900 ms > 1200 ms"),
+])
+def test_replay_fails_a_candidate_whose_search_with_routing_on_times_out_fails_or_runs_long(
+        home, monkeypatch, reason, ms, hits, expect):
+    # The run with routing on is held to the same search test as the run
+    # with it off: an empty answer both ways, or the same hits found late,
+    # once let a routing that broke the search pass.
+    candidate = _one_query(home)
+    runs: list = []
+    off_hits = hits or ()
+    monkeypatch.setattr(pm, "_run", _routing_hook(runs, off_hits=off_hits, on_hits=hits, on_reason=reason, on_ms=ms))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"], out
+    assert expect in out["detail"]
+    # The failing pair was replayed once more before the step failed.
+    assert [r[0] for r in runs if r[0] != "prefold"] == ["off", "off", "on", "off", "on"]
+
+
+def test_the_search_test_is_the_same_for_both_runs():
+    off = {"exit": 0, "valid_json": True, "reason": "ok", "ms": 300.0, "hits": [], "routing": None}
+    on = {"exit": 0, "valid_json": True, "reason": "timeout>1.2s", "ms": 1200.0, "hits": [],
+          "routing": "none", "push": True}
+    assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, timeout>1.2s"
+    off["hits"] = ["episode:1"]
+    on.update(reason="ok", ms=1900.0, hits=["episode:1"], routing="full")
+    assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, 1900 ms > 1200 ms"
+    on.update(reason=None)
+    assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, the hook wrote no summary line"
+    on.update(reason="ok", ms=900.0)
+    assert pm._routing_problem("prompt 1", off, on) is None
 
 
 def test_replay_passes_a_search_that_differed_once_and_agrees_again(home, monkeypatch):

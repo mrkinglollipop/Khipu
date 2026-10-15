@@ -698,20 +698,40 @@ def _routing_skip_problem(status: str) -> str | None:
     return "its routing read was skipped"
 
 
+def _search_problem(run: dict[str, Any]) -> str | None:
+    """Why one replayed run's own search fails the step, or None: the hook
+    exited non-zero or wrote no JSON, wrote no summary line, timed out or
+    failed, or took longer than ``RECALL_BUDGET_MS``. The same test for the
+    run with routing off and the run with routing on."""
+    if run["exit"] != 0 or not run["valid_json"]:
+        return f"hook exit {run['exit']}, valid_json={run['valid_json']}"
+    reason = run.get("reason")
+    if reason is None:
+        return "the hook wrote no summary line"
+    if reason.startswith(("timeout", "error", "gate error")):
+        return reason
+    ms = run.get("ms")
+    if ms is not None and ms > RECALL_BUDGET_MS:
+        return f"{ms:.0f} ms > {RECALL_BUDGET_MS:.0f} ms"
+    return None
+
+
 def _routing_problem(label: str, off: dict[str, Any], on: dict[str, Any]) -> str | None:
     """Why the candidate's run with routing on fails the step, or None: its
     routing read was skipped for any reason but a benign one
     (``ROUTING_SKIPS_OK``), its code said the push was on and the hook
-    logged no routing status, or its search answer is not the one it gave
-    with routing off."""
+    logged no routing status, its own search fails as a run with routing
+    off would (``_search_problem``), or its search answer is not the one it
+    gave with routing off."""
     status = on.get("routing") or ""
     what = _routing_skip_problem(status)
     if what:
         return f"{label}: with routing on, {what} (routing={status})"
     if on.get("push") is True and not status and on.get("reason") is not None:
         return f"{label}: with routing on, the candidate's push is on but its hook logged no routing status"
-    if on["exit"] != 0 or not on["valid_json"]:
-        return f"{label}: with routing on, hook exit {on['exit']}, valid_json={on['valid_json']}"
+    what = _search_problem(on)
+    if what:
+        return f"{label}: with routing on, {what}"
     if on["hits"] != off["hits"]:
         return (f"{label}: the search answer changed with routing on ({len(on['hits'])} hit(s) against "
                 f"{len(off['hits'])} with it off)")
@@ -728,8 +748,10 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
     twice, with the routing push off and on (phase 3c): the candidate fails
     when its routing read is skipped for any reason but a benign one (it
     ran out of its budget, failed, or its reader died before it answered),
-    when its push is on and its hook logs no routing status, or when its
-    search answer differs with routing on (a failing pair is replayed once
+    when its push is on and its hook logs no routing status, when its
+    search with routing on times out, fails or runs past the 1.2 s budget
+    (the same test as with routing off), or when its search answer differs
+    with routing on (a failing pair is replayed once
     more first, so a search or a read that was late once is not taken for
     the candidate's routing)."""
     samples = sample_queries(query_log_path(), n)
@@ -753,18 +775,9 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
                 if live_hook.exists() else None)
         cand = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-cand-{i}", legacy=cand_legacy, routing=False)
         label = f"prompt {i + 1}"
-        reason = cand["reason"] or ""
-        if cand["exit"] != 0 or not cand["valid_json"]:
-            problems.append(f"{label}: hook exit {cand['exit']}, valid_json={cand['valid_json']}")
-            continue
-        if cand["reason"] is None:
-            problems.append(f"{label}: the hook wrote no summary line")
-            continue
-        if reason.startswith(("timeout", "error", "gate error")):
-            problems.append(f"{label}: {reason}")
-            continue
-        if cand["ms"] is not None and cand["ms"] > RECALL_BUDGET_MS:
-            problems.append(f"{label}: {cand['ms']:.0f} ms > {RECALL_BUDGET_MS:.0f} ms")
+        what = _search_problem(cand)
+        if what:
+            problems.append(f"{label}: {what}")
             continue
         live_hits = (live or {}).get("hits") or []
         if live_hits and not cand["hits"]:

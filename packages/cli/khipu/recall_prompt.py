@@ -796,7 +796,11 @@ _POLL_ANSWER_MOST = 64 * 1024
 # The helper reads the switches and ``routing_poll_interval`` at least this
 # often (and before every poll), so a push switched off stops the polls and
 # an interval turned on again or shortened is used without waiting for a
-# poll's answer or the view's ``valid_until``.
+# poll's answer or the view's ``valid_until``. It looks at view.json's stat
+# as often (``_look_at_view``): a write saves the view with its own
+# ``valid_until``, so a view changed since the last poll began makes a poll
+# due even when the interval is 0 or the next poll is far off, and that
+# poll's answer gives the schedule the new ``valid_until``.
 _SETTINGS_LOOK_S = 5.0
 # A poll child that is not refolding (it is looking at the files and the
 # view) ends after this long, and on the helper's stop signal; once it holds
@@ -825,6 +829,7 @@ class RefoldSchedule:
         self.woke = False
         self.runs = 0
         self.off = False
+        self.view_seen: Any = None
 
     def configure(self, interval: Any, *, off: bool) -> None:
         """The switches and the poll interval as the helper last read them
@@ -850,6 +855,17 @@ class RefoldSchedule:
             self.next_poll = mono
         else:
             self.next_poll = min(self.next_poll, mono + interval)
+
+    def saw_view(self, seen: Any) -> None:
+        """view.json's stat as the helper just looked (``_look_at_view``).
+        Changed since the last poll began (a write, a prompt's fold, or
+        that poll's own save), a poll is due now: its answer carries the
+        saved view's ``valid_until``, which a poll's answer alone told the
+        schedule before. With the push off nothing is due."""
+        if self.off or seen is None or seen == self.view_seen:
+            return
+        self.view_seen = seen
+        self.next_poll = self._mono()
 
     def _look(self) -> tuple[float, float]:
         wall, mono = self._wall(), self._mono()
@@ -916,6 +932,26 @@ def _look_at_settings(schedule: RefoldSchedule, routing) -> None:
     except Exception:  # noqa: BLE001 - unreadable settings: as they were
         return
     schedule.configure(interval, off=off)
+    _look_at_view(schedule, routing)
+
+
+def _view_stat(routing) -> Any:
+    """view.json's size, time and inode, or None. A stat only: the helper
+    never reads the view itself (a FIFO or a stalled disk would block it);
+    its poll child does, under its own alarm."""
+    try:
+        return routing._stat(routing.view_file())
+    except Exception:  # noqa: BLE001 - no data dir: nothing seen
+        return None
+
+
+def _look_at_view(schedule: RefoldSchedule, routing) -> None:
+    """A poll is due when view.json changed since the last poll began
+    (``RefoldSchedule.saw_view``). Only a poll's answer gave the schedule
+    ``valid_until`` before, so with ``routing_poll_interval`` 0 (or a long
+    one) a limit written after the last poll never refolded at its end."""
+    if not schedule.off:
+        schedule.saw_view(_view_stat(routing))
 
 
 def _reap_until(live: Callable[[], int], reap: Callable[[], None], until: float, *,
@@ -1000,9 +1036,9 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
     ``schedule`` says a refold is due it forks one poll child
     (``_poll_routing_child``), never a second while one runs, and never
     waits past the schedule's next poll or the view's ``valid_until``. It
-    reads the switches and the poll interval before every poll and every
-    ``_SETTINGS_LOOK_S``: with the per-prompt push off it forks no poll
-    child at all."""
+    reads the switches, the poll interval and the saved view's
+    ``valid_until`` before every poll and every ``_SETTINGS_LOOK_S``: with
+    the per-prompt push off it forks no poll child at all."""
     import select
     import signal
     import socket
@@ -1041,6 +1077,9 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
             pollers.discard(pid)
 
     def start_poll() -> int | None:
+        # What the child will read: a save after this (its own, a write's)
+        # makes the next look's poll due.
+        schedule.view_seen = _view_stat(routing)
         read_fd, write_fd = os.pipe()
         try:
             with warnings.catch_warnings():

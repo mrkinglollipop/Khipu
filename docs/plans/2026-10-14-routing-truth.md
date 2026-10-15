@@ -970,7 +970,9 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
   `routing_push_prompt`) and `routing_poll_interval` before every poll and every 5 seconds and forks no poll
   child while the push is off, and the daemon stops an idle helper within 2 seconds of the push going off.
   `khipu route`, the tools and doctor refold when they read, as before. A poll interval set to 0 and back is
-  used within 5 seconds, not at the view's `valid_until`. One fold at a time: a prompt's fold, the poll's, the
+  used within 5 seconds, not at the view's `valid_until`. The helper also looks at view.json every 5 seconds
+  and polls once when it changed, so the `valid_until` a write saved there is waited for: a limit written after its last poll
+  still refolds at its end with the poll interval at 0 or long. One fold at a time: a prompt's fold, the poll's, the
   session start's and a reader's (`khipu route`, the tools, doctor) each take their turn under
   `prompt-fold.lock`, wait for a running fold within their own budget and answer the view it saved; a reader
   whose budget runs out answers from its own fold, unsaved, and a prompt skips routing for that prompt
@@ -982,13 +984,16 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
   search through the candidate's hook with routing off and on and fails it when the routing read is skipped
   for any reason but a benign one (`fold-busy`, `unsaved`): it ran out of its budget, failed, or its reader
   died before it answered (`skipped:no-answer`); when the candidate's own code says its push is on and its
-  hook logs no routing status; or when routing changes the search's answer. A failing pair is replayed once
+  hook logs no routing status; when its search with routing on times out, fails or runs past the 1.2 s
+  budget (the same test as the run with routing off); or when routing changes the search's answer. A failing pair is replayed once
   more before the step fails (a read that refolded once because a runner's heartbeat changed mid-replay is
   timing, not the candidate). Every process the gate starts runs in an empty folder of its own, so a gate run
   from a checkout never imports that checkout's code in place of the candidate's. It measures the search's milliseconds both ways on the
   one-shot path only: the warm service runs the live code, not the candidate's. The warm-daemon measure is
   `python -m khipu.routing_replay` (the stop-condition: at least 200 prompts each way through a warm recall
-  service with its routing helper, timeouts per 100 for each).
+  service with its routing helper, timeouts per 100 for each). Its helper runs with the push on, and the
+  replay stops before the first prompt unless the helper refolds a seeded limit's end with no prompt asking,
+  so the poll's cost is in the measure.
 
 ## Fixed limits
 

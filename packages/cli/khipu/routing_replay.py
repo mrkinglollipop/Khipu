@@ -9,10 +9,14 @@ push off and once with it on, interleaved, and reports the timeouts per 100
 prompts for each.
 
 It never touches the live data dir: it makes its own isolated dir (its own
-log, dedup state and routing record, seeded with a small record whose limit
-ends during the run, so the helper's clock-driven refold happens while
-prompts arrive), and ``--live-replica`` only links the live replica read
-only, as the promotion gate's replay does. Run it as
+log, dedup state and routing record), and ``--live-replica`` only links the
+live replica read only, as the promotion gate's replay does. The routing
+push is on for the helper as on a Mac that uses it (each prompt's own
+request still says on or off), so the helper polls and refolds as it would
+there. Before the first prompt the helper must refold the seeded record at
+a first limit's end with no prompt asking (else the replay stops: a helper
+that never polls would leave its cost out), and a second limit ends during
+the run, so the helper's clock-driven refold happens while prompts arrive. Run it as
 ``python -m khipu.routing_replay --prompts 200``; it prints JSON and exits 1
 when the stop-condition is met.
 """
@@ -62,16 +66,23 @@ PROMPTS = (
 )
 _AUTHOR = {"kind": "conversation", "harness": "claude_code", "project": "routing-replay", "session": "replay"}
 _ACCOUNTS = [{"label": "Claude", "harness": "claude"}, {"label": "Codex", "harness": "codex"}]
-_ISOLATION_VARS = ("KHIPU_ISOLATED_DIR", "KHIPU_CAPTURE_HOME")
+_ISOLATION_VARS = ("KHIPU_ISOLATED_DIR", "KHIPU_CAPTURE_HOME", "KHIPU_FEATURE_ROUTING_PUSH", "ROUTING_NOW_OFF")
+# The first limit's end, which the helper must refold at before any prompt
+# is asked, and how long the replay waits for that refold.
+_CHECK_LIMIT = "2s"
+_CHECK_WAIT_S = 20.0
 
 
 @contextlib.contextmanager
 def _isolated(directory: Path) -> Iterator[None]:
     """Point this process's data dir and capture home at ``directory`` for
-    the run, and back afterwards."""
+    the run, with the routing push on (the helper takes this environment),
+    and back afterwards."""
     before = {k: os.environ.get(k) for k in _ISOLATION_VARS}
     os.environ["KHIPU_ISOLATED_DIR"] = str(directory)
     os.environ["KHIPU_CAPTURE_HOME"] = str(directory / "capture")
+    os.environ["KHIPU_FEATURE_ROUTING_PUSH"] = "1"
+    os.environ.pop("ROUTING_NOW_OFF", None)
     try:
         yield
     finally:
@@ -83,16 +94,43 @@ def _isolated(directory: Path) -> Iterator[None]:
 
 
 def _seed(directory: Path, limit_ends_in: str) -> None:
-    """The isolated dir's settings and a small routing record: one account
-    limited until ``limit_ends_in`` from now (its end is a clock-driven
-    change), one open, and one hold."""
+    """The isolated dir's settings (the routing push on, as on a Mac that
+    uses it) and a small routing record: one account limited until
+    ``limit_ends_in`` from now (its end is a clock-driven change), one open,
+    and one hold."""
     from khipu import routing
 
     (directory / "capture" / "logs").mkdir(parents=True, exist_ok=True)
-    (directory / "config.json").write_text(json.dumps({"usage_accounts": _ACCOUNTS}), encoding="utf-8")
+    (directory / "config.json").write_text(json.dumps({"usage_accounts": _ACCOUNTS,
+                                                       "features": {"routing_push": True}}), encoding="utf-8")
     routing.report(account="Codex", state="limited", until=limit_ends_in, author=_AUTHOR)
     routing.report(account="Claude", state="open", author=_AUTHOR)
     routing.add_hold("hold new launches while the replay runs", reason="keep", scope="machine", author=_AUTHOR)
+
+
+def _helper_refolds(wait: float | None = None) -> float:
+    """Wait, with no prompt asking, for the routing helper to refold the
+    record at its ``valid_until`` (the seeded first limit's end), and return
+    how many seconds after that end it saved the view. Only reads view.json
+    (``routing._load_view``): nothing in this process folds. Raises when it
+    does not, naming why the push is off when it is."""
+    from khipu import routing
+
+    seeded = routing._load_view() or {}
+    end = routing._parse(seeded.get("valid_until"))
+    if end is None:
+        raise RuntimeError("the seeded routing record has no limit end for the helper to refold at")
+    wait = _CHECK_WAIT_S if wait is None else wait
+    until = time.monotonic() + max(0.0, (end - routing._now()).total_seconds()) + wait
+    while time.monotonic() < until:
+        view = routing._load_view() or {}
+        folded = routing._parse(view.get("folded_at"))
+        if view.get("version") != seeded.get("version") and folded is not None and folded >= end:
+            return round((folded - end).total_seconds(), 2)
+        time.sleep(0.05)
+    off = routing.push_off("prompt")
+    raise RuntimeError("the routing helper did not refold the record at its limit's end with no prompt"
+                       + (f" (its push is off: {off})" if off else ""))
 
 
 def _ask(path: Path, prompt: str, session: str, routing_on: bool) -> dict[str, Any]:
@@ -246,7 +284,7 @@ def replay(n: int = MIN_PROMPTS, *, prompts: tuple[str, ...] | list[str] = PROMP
             promote._link_replica(directory)  # before isolation: the live replica's path
         stand_in = _synthetic_search(synthetic) if synthetic is not None else contextlib.nullcontext()
         with _isolated(directory), stand_in:
-            _seed(directory, limit_ends_in)
+            _seed(directory, _CHECK_LIMIT)
             recall_daemon._warm_imports()
             recall_daemon._warm_caches()
             transport = recall_daemon.KeepAliveTransport()
@@ -261,6 +299,11 @@ def replay(n: int = MIN_PROMPTS, *, prompts: tuple[str, ...] | list[str] = PROMP
                 svc.routing_forkserver.prepare()
                 if not svc.routing_forkserver.wait_ready(30):
                     raise RuntimeError("the routing helper did not start")
+                helper_refold_s = _helper_refolds()
+                # The limit that ends while the prompts arrive.
+                from khipu import routing
+
+                routing.report(account="Codex", state="limited", until=limit_ends_in, author=_AUTHOR)
                 asked: dict[bool, list[dict[str, Any]]] = {True: [], False: []}
                 for i in range(n):
                     prompt = texts[i]
@@ -280,7 +323,8 @@ def replay(n: int = MIN_PROMPTS, *, prompts: tuple[str, ...] | list[str] = PROMP
         off = _summary(asked[False], by_mode["off"], n)
         return {"prompts": n, "on": on, "off": off, "added_per_100": round(on["per_100"] - off["per_100"], 2),
                 "stop": verdict(on["per_100"], off["per_100"]), "stop_per_100": STOP_PER_100,
-                "enough": n >= MIN_PROMPTS, "live_replica": live_replica, "search": search}
+                "enough": n >= MIN_PROMPTS, "live_replica": live_replica, "search": search,
+                "helper_refold_s": helper_refold_s}
     finally:
         if own:
             shutil.rmtree(directory, ignore_errors=True)
