@@ -2037,6 +2037,42 @@ def cmd_usage(args: argparse.Namespace) -> int:
     the orchestrator."""
     from khipu import usage
 
+    if getattr(args, "forget_login_paths", False):
+        from khipu import session_capture
+
+        print(json.dumps({"ok": True, "cleared": session_capture.forget_login_homes()}))
+        return 0
+    if getattr(args, "discover", False) or getattr(args, "check", None) is not None:
+        # Settings clarity phase 9 (9A): the login folders Khipu could track.
+        # A read for the app; no MCP tool starts it (it carries paths).
+        from khipu import discover
+
+        out = discover.discover(now=bool(getattr(args, "now", False)), check=getattr(args, "check", None))
+        if getattr(args, "check", None) is None:
+            out["clis"] = discover.cli_states()
+        if args.json:
+            print(json.dumps(out, indent=2))
+        else:
+            for c in out["candidates"]:
+                print(f"{c['cli_name']:<11} {c['path'] or '(one login)':<40} {c['state']}"
+                      + (f" ({c['reason']})" if c.get("reason") else ""))
+            if not out["candidates"]:
+                print("Looking..." if out.get("looking") else "No other logins found.")
+            check = out.get("check")
+            if check is not None and not check.get("ok"):
+                print(f"Check not done: {check.get('error') or 'unknown'}")
+        check = out.get("check")
+        return 2 if check is not None and not check.get("ok") and check.get("error") != "timeout" else 0
+    if getattr(args, "try_account", False):
+        from khipu import discover
+
+        if not getattr(args, "harness", None):
+            print(json.dumps({"ok": False, "error": "name the CLI with --harness"}))
+            return 2
+        out = discover.try_account(args.harness, getattr(args, "folder", None))
+        print(json.dumps(out, indent=2))
+        return 0 if out.get("row") is not None else 2
+
     max_age = usage.DEFAULT_MAX_AGE_S if args.max_age is None else max(0.0, float(args.max_age))
     label = getattr(args, "account", None)
     key = getattr(args, "account_key", None)
@@ -2936,6 +2972,22 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 2
         print(json.dumps({"ok": True, "usage_accounts": usage.accounts_status(), "config_file": str(path)}))
         return 0
+    from khipu.config import CLI_SETTINGS
+
+    if (args.set and args.set[0] in CLI_SETTINGS) or args.unset in CLI_SETTINGS:
+        # Where a CLI and its Node live, set in the app (settings clarity
+        # phase 9, decision 10): `--set cli_path.codex /path/to/codex`,
+        # `--set node_folder /path/to/node/bin`; `--unset` clears it.
+        from khipu.config import cli_settings_status, set_cli_setting
+
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = set_cli_setting(key, args.set[1] if args.set else None)
+        except (KeyError, ValueError) as err:
+            print(json.dumps({"ok": False, "error": str(err).strip("'\""), "key": key}))
+            return 2
+        print(json.dumps({"ok": True, "cli_settings": cli_settings_status(), "config_file": str(path)}))
+        return 0
     from khipu import routing as _routing
 
     if (args.set and args.set[0] in _routing.SETTINGS) or args.unset in _routing.SETTINGS:
@@ -3030,7 +3082,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         )
         return 0
     from khipu import relevance, usage
-    from khipu.config import float_settings_status, list_setting, path_settings_status
+    from khipu.config import cli_settings_status, float_settings_status, list_setting, path_settings_status
 
     out = {
         "capture_mode": capture_mode(),
@@ -3048,6 +3100,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "relevance_cosine_floor": relevance.cosine_floor_status(),
         "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
         "usage_accounts": usage.accounts_status(),
+        "cli_settings": cli_settings_status(),
         "routing": _routing.settings_status(),
         "config_file": str(config_file()),
         "config": load_config(),
@@ -4648,6 +4701,20 @@ def build_parser() -> argparse.ArgumentParser:
     us.add_argument("--sign-in", action="store_true",
                     help="With --account: start that CLI's own login in its login folder (opens the browser), "
                          "wait for it, then read the account again")
+    us.add_argument("--discover", action="store_true",
+                    help="Look for login folders Khipu could track (for the app; prints paths)")
+    us.add_argument("--now", action="store_true",
+                    help="With --discover: check every due folder now, ignoring the once-a-day wait")
+    us.add_argument("--check", default=None, metavar="FOLDER",
+                    help="Check one found login folder now (the owner's Check; the CLI may write into it)")
+    us.add_argument("--try", dest="try_account", action="store_true",
+                    help="One read of an account that is not saved: --harness H and optionally --folder F")
+    us.add_argument("--harness", default=None, choices=("claude", "codex", "grok", "muse"),
+                    help="With --try: the CLI")
+    us.add_argument("--folder", default=None, metavar="F",
+                    help="With --try: the login folder (~/... or a full path); none = the default login")
+    us.add_argument("--forget-login-paths", action="store_true",
+                    help="Clear the login folder recorded for every saved conversation")
     us.set_defaults(func=cmd_usage)
 
     rt = sub.add_parser(

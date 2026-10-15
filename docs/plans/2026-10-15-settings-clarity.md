@@ -35,6 +35,7 @@ a card on Home that stays until he closes it, each item with a Show me button.
 | 7 | Setup: an Accounts step | S–M | open |
 | 8 | What's new after an update (dialog and Home card), and its history in Settings → Updates | S | open |
 | 9 | Finding and adding accounts in the app (addendum, see "Phase 9" at the end) | M–L | approved by Matt 2026-10-15 |
+| 9A | Discovery engine and CLI (`packages/cli`) | M | built, in review (branch feat/accounts-9a) |
 
 One PR per phase. Phase 1 goes first because it fixes things that are wrong today. Phases 2 to 6 can go in any
 order after 3, except that 4 and 5 need 3. Phases 7 and 8 go last, because they introduce what the earlier
@@ -559,6 +560,26 @@ Matt, 2026-10-15 (about 16:55 ET), answering open questions 1 to 8 with the reco
 18. **Accounts are per Mac.** Syncing later only with an identity that doesn't depend on a path.
 19. **Live proof is read-only;** one live Track on this Mac only on Matt's go, undone at once.
 
+Matt, 2026-10-15, after the 9A guardrail run (Rules for phase 9 and Guardrails):
+
+20. **A status check that writes waits for the owner on folders found only by name.** The guardrail run found
+    that both status commands write into an empty login folder:
+
+    | CLI (version) | Check | Answer in an empty folder | What it wrote there |
+    |---|---|---|---|
+    | Claude Code 2.1.296 | `claude auth status --json` | exit 1, `"loggedIn": false` | `.claude.json` and `backups/.claude.json.backup.<time>` |
+    | Codex 0.162.1 | `codex login status` | exit 1, "Not logged in" | `tmp/arg0/codex-arg0<random>/` with `.lock`, `apply_patch`, `applypatch`, `codex-execve-wrapper` |
+
+    Both ran with HOME and the login folder set to scratch folders; the default logins' own folders were not
+    changed. Grok's plan read was not run; Grok is treated as writing too until a run shows otherwise. So
+    discovery checks a Claude, Codex or Grok folder only when a conversation ran on it, T3 names it, it is the
+    CLI's default login, or the owner presses **Check**. A folder found only by its name shows as **Found, not
+    checked** with Check and Not this one; pressing Check is the owner's consent to that write, and the button's
+    help line says so: "Check asks Codex whether this login is signed in. Codex may create a settings file in
+    that folder when it is asked." Check runs the same one-shot check (`khipu usage --discover --check
+    <folder>`), which ignores the daily wait. A not-checked folder is never offered on Home, is not counted in
+    the 12-folder cap, and is never tracked automatically.
+
 Review history: a twelve-stage review (`dd33e77`) and an independent Codex review of it (11 findings, all
 confirmed against the code on 2026-10-15) are folded into the text below.
 
@@ -602,6 +623,9 @@ No Grok or Muse docs beyond `--help` were checked. A device-code sign-in prints 
   (`usage.py:691`, `codex_rollout`, which scans `<CODEX_HOME>/sessions` and reads the tail of up to five
   files). That fallback is switched off for discovery and `--try` (fix now, 9A); whether tracked accounts keep
   it is open question 9.
+  Khipu's own capture folder (`~/.grok/khipu` by default, `session_capture.khipu_home`) is Khipu's data, not the
+  Grok login's: discovery reads its session state files (source 2) and nothing else under `~/.grok` (tested
+  with the default capture home, 9A).
 - **Never prompt.** No discovery or check can start a login or any command that waits for a person (see
   Discovery, "How a prompt is made impossible").
 - **Login-folder paths stay with the owner.** They show in the app; they are never returned by `khipu_get`,
@@ -704,7 +728,8 @@ its CLI's default folder.
 `login status`), separate from `SIGN_IN_ARGS` and the device-code argv. Grok's check is `probe_grok`'s plan read
 (it passes `--no-leader`). Muse is checked only as its one default login, by its plan read. The runner keeps
 the exit code and a fixed signed-in, not-signed-in or couldn't-check result; everything the CLI prints is
-dropped, as `_classify` does. A signed-in Claude or Codex folder then gets one plan read for its plan name. No
+dropped, as `_classify` does. A signed-in Claude or Codex folder then gets one plan read for its plan name. A folder found only by
+its name is not checked until the owner presses Check (decision 20). No
 check uses a turn or a paid call; checks reach the network the same way today's plan reads do.
 
 **How a prompt is made impossible** (the class behind a past `muse login` started by accident while listing
@@ -743,7 +768,8 @@ and a failed check is already on its Found row.
   new, Found or automatic-tracking card, attention, health line). One card, listing every find a conversation
   used, each with Track… and Not this one, and a **Close** control. Close hides the card on this Mac until a
   different folder is found; it turns nothing down, and the Found rows in Settings stay.
-- **Accounts and routing → Accounts:** a Found row per undecided signed-in folder, "N found" as a neutral tag on
+- **Accounts and routing → Accounts:** a Found row per undecided signed-in folder, a "Found, not checked"
+  row with Check and Not this one per folder found only by its name (decision 20), "N found" as a neutral tag on
   the closed line, and while a run is going "Looking…", never "0 found". A folder that couldn't be checked
   shows "Couldn't check ~/.claude-x: <plain reason>" with Check again; it is never offered.
 - **Not this one** and Stop tracking record the folder in a per-Mac list (CLI, path, path identity, why: "you
@@ -997,7 +1023,8 @@ footer says "on this Mac".
 - **No status check may write into a folder.** Before discovery checks folders found only by name, run each
   status command and Grok's plan read against a scratch empty folder and diff its listing, and assert nothing
   under the real default login changes; record the result per CLI version in the PR. A CLI that writes is
-  checked only for folders tied to conversations or picked by the owner.
+  checked only for folders tied to conversations or picked by the owner. Result (2026-10-15): Claude Code
+  2.1.296 and Codex 0.162.1 both write; decision 20 applies this.
 - **Grok device code:** prove `grok login --device-auth` with a scratch `GROK_HOME` (no real sign-in: stop at
   the code line) does not touch the default login or `~/.grok/leader.sock`; otherwise Grok gets only Use a
   login I already have.
@@ -1057,8 +1084,9 @@ Claude and Codex with and without their variables, a corrupt state file never fa
 recorded, a second run refused while one runs, paths absent from MCP output, exact argv tuples (`codex login
 status` allowed, `codex login` refused), the rotation test (30 folders all checked within three runs), the
 30-day path retention and Forget, and `cli_path.<cli>` and `node_folder` honoured by `synth_cli.binary` and the
-probe PATH (a scratch nvm-style shim under launchd's bare PATH starts once the Node folder is set). Stop if a
-status check writes into a scratch folder (guardrail).
+probe PATH (a scratch nvm-style shim under launchd's bare PATH starts once the Node folder is set). A status check
+that writes into a scratch folder is handled by decision 20 (Claude Code and Codex do): folders found only
+by name are not checked until the owner's Check.
 
 **9B, tracking and managing (packages/cli, routing, Rust; one session).** Read Sections 5, 7 and 9 and
 `routing.py` (`routing_lane_map`, priority, holds) first. Build: naming rules and path-identity duplicates in
@@ -1074,11 +1102,12 @@ entry folds a late report under the old key into the new account; an ambiguous l
 never converted to the first match.
 
 **9C, app surfaces (apps/desktop; one session).** Read `add-account*.html` and `PlansCard.tsx` first. Build: the
-dialog (steps 1 and 3, every state but sign-in), Found rows, Looking…, couldn't check, last run line, Home's
+dialog (steps 1 and 3, every state but sign-in), Found rows, "Found, not checked" rows with Check and its
+help line (decision 20), Looking…, couldn't check, last run line, Home's
 Found and automatic-tracking cards with Close and their order, Not offered again, the switch, Rename and Stop
 tracking dialogs, the folder-not-found and moved rows, the signed-out row, the "Read no accounts" state, setup's
 step (found list, nothing found with Add, Sign in now, Run setup again rules), the What's new sentence. Tests:
-props-driven vitest per mock state; Close never turns down; automatic tracking off saves nothing; setup's
+props-driven vitest per mock state; a not-checked row runs no check until Check is pressed; Close never turns down; automatic tracking off saves nothing; setup's
 unticked login reaches no Home card; focus trapped in the dialog and returned after the folder picker; Set
 the Node folder… and Choose the CLI… save their settings and Check again re-runs (through the Tauri command,
 not props alone); Sign in now on an untracked folder saves first and then calls `khipu_account_sign_in`

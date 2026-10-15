@@ -76,8 +76,9 @@ def observe_sessions():
 
 
 _CANDIDATES = {
+    # ~/.claude/local/claude: Claude Code's own local install (`claude migrate-installer`).
     "claude": ("~/.npm-global/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude",
-               "~/.local/bin/claude"),
+               "~/.local/bin/claude", "~/.claude/local/claude"),
     "codex": ("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
               "/opt/homebrew/bin/codex", "/usr/local/bin/codex", "~/.npm-global/bin/codex"),
     # The plan usage probes (khipu.usage) look these two up the same way.
@@ -88,7 +89,9 @@ _CANDIDATES = {
 # own global add), none of them on launchd's PATH: tried last, in this order.
 # A ``*`` is a Node version folder, newest version first.
 _NODE_MANAGER_DIRS = ("~/.nvm/versions/node/*/bin", "~/.volta/bin", "~/Library/pnpm", "~/.bun/bin",
-                      "~/.local/share/fnm/node-versions/*/installation/bin", "~/.asdf/shims")
+                      "~/.local/share/fnm/node-versions/*/installation/bin",
+                      "~/Library/Application Support/fnm/node-versions/*/installation/bin",
+                      "~/.fnm/node-versions/*/installation/bin", "~/.asdf/shims")
 
 
 def _node_version(folder: str) -> tuple[int, ...]:
@@ -122,12 +125,25 @@ def _executable(path: Path) -> bool:
     return False
 
 
+def _chosen(name: str) -> str | None:
+    """The CLI the owner chose in the app (``cli_path.<name>``), when it is
+    still an executable file. A broken config never hides the CLI."""
+    try:
+        from khipu.config import CLI_SETTINGS, cli_setting
+
+        key = f"cli_path.{name}"
+        return cli_setting(key) if key in CLI_SETTINGS else None
+    except Exception:  # noqa: BLE001 — fall through to the usual lookup
+        return None
+
+
 def binary(name: str) -> str | None:
     """Absolute path of the user's CLI, or None. The launchd drain job runs with
     a bare PATH (2026-10-13: every capture failed with FileNotFoundError the
     minute the provider was switched), so PATH is only the first place looked;
     ``KHIPU_<NAME>_CLI`` names an explicit binary and is looked at before
-    anything else. After PATH come the usual install folders, then the folders
+    anything else, then the CLI the owner chose in the app
+    (``cli_path.<name>``). After PATH come the usual install folders, then the folders
     a Node version manager installs into (``_NODE_MANAGER_DIRS``), where only
     an executable file counts. A Node CLI found there still needs node on its
     PATH: the plan usage probes add the CLI's own folder
@@ -137,6 +153,9 @@ def binary(name: str) -> str | None:
     override = (os.environ.get(f"KHIPU_{name.upper()}_CLI") or "").strip()
     if override:
         return override if Path(override).is_file() else None
+    chosen = _chosen(name)
+    if chosen:
+        return chosen
     found = shutil.which(name)
     if found:
         return found

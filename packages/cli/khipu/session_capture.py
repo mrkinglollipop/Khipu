@@ -58,6 +58,7 @@ import base64
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -944,10 +945,143 @@ def save_state(harness: str, sid: str, st: dict, *, preserve_mtime: bool = False
         os.utime(p, ns=(previous.st_atime_ns, previous.st_mtime_ns))
 
 
+# The login folder a conversation ran under (settings clarity phase 9,
+# discovery source 2): the value of its CLI's folder variable in the hook's own
+# environment, and nothing else. Grok Build is captured as ``aegis``.
+LOGIN_HOME_VARS = {"claude_code": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "aegis": "GROK_HOME"}
+LOGIN_HOME_FIELD = "login_home"
+# Cleared from a session's state this long after its ``seen_ts``; discovery
+# counts conversations over 7 days, so nothing that counts is lost.
+LOGIN_HOME_KEEP_S = 30 * 86400
+LOGIN_HOME_SWEEP_S = 86400
+_LOGIN_SWEEP_STAMP = "login-homes.swept"
+# When the owner last pressed Forget: discovery ignores every session seen at
+# or before it (its recorded folder and the one its transcript implies).
+LOGIN_FORGOTTEN_STAMP = "login-homes.forgotten"
+
+
+def login_home(harness: str) -> str | None:
+    """The hook's own login-folder variable for ``harness``, or None."""
+    name = LOGIN_HOME_VARS.get(harness)
+    value = (os.environ.get(name) or "").strip() if name else ""
+    return value[:1024] if value and value.isprintable() else None
+
+
+def _state_files():
+    try:
+        with os.scandir(state_dir()) as entries:
+            return [Path(e.path) for e in entries
+                    if e.name.endswith(".json") and e.is_file(follow_symlinks=False)]
+    except OSError:
+        return []
+
+
+def _clear_login_home(path: Path, *, older_than: float | None) -> bool:
+    """Drop the login folder from one state file, keeping everything else
+    and its mtime; a file without the field (or a corrupt one) is never
+    rewritten. ``older_than``: only when ``seen_ts`` is before it. Takes the
+    hook's own lock for the file (``_path_lock``) and skips the file while
+    it is held, so a concurrent hook save is never overwritten."""
+    try:
+        with _path_lock(path.with_suffix(".lock")) as acquired:
+            if not acquired:
+                return False
+            return _clear_login_home_locked(path, older_than=older_than)
+    except OSError:
+        return False
+
+
+def _clear_login_home_locked(path: Path, *, older_than: float | None) -> bool:
+    try:
+        st = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(st, dict) or LOGIN_HOME_FIELD not in st:
+        return False
+    if older_than is not None:
+        try:
+            seen = float(st.get("seen_ts") or 0)
+        except (TypeError, ValueError):
+            seen = 0.0
+        if seen >= older_than:
+            return False
+    st.pop(LOGIN_HOME_FIELD, None)
+    try:
+        previous = path.stat()
+        tmp = path.with_name(path.name + ".login.tmp")
+        tmp.write_text(json.dumps(st), encoding="utf-8")
+        os.replace(tmp, path)
+        os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+    except OSError:
+        return False
+    return True
+
+
+def sweep_login_homes(*, now: float | None = None, force: bool = False) -> int:
+    """Clear login folders recorded more than ``LOGIN_HOME_KEEP_S`` ago. Runs
+    from the hook at most once a day (``force`` ignores that); never raises."""
+    try:
+        now = time.time() if now is None else now
+        stamp = state_dir() / _LOGIN_SWEEP_STAMP
+        if not force:
+            try:
+                if now - stamp.stat().st_mtime < LOGIN_HOME_SWEEP_S:
+                    return 0
+            except OSError:
+                pass
+        cleared = sum(_clear_login_home(p, older_than=now - LOGIN_HOME_KEEP_S) for p in _state_files())
+        try:
+            stamp.parent.mkdir(parents=True, exist_ok=True)
+            stamp.touch()
+            os.utime(stamp, (now, now))
+        except OSError:
+            pass
+        return cleared
+    except Exception:  # noqa: BLE001 — retention never fails a capture
+        return 0
+
+
+def forget_login_homes(*, now: float | None = None) -> int:
+    """``khipu usage --forget-login-paths``: clear the recorded login folder
+    from every session state file (the rest of each state is untouched) and
+    stamp the time, so discovery also stops deriving a folder for any
+    session seen at or before it."""
+    now = time.time() if now is None else now
+    stamp = state_dir() / LOGIN_FORGOTTEN_STAMP
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = stamp.with_name(stamp.name + ".tmp")
+        tmp.write_text(repr(float(now)), encoding="utf-8")
+        os.replace(tmp, stamp)
+    except OSError:
+        pass
+    return sum(_clear_login_home(p, older_than=None) for p in _state_files())
+
+
+def login_homes_forgotten_at() -> float | None:
+    """When the owner last pressed Forget, or None."""
+    stamp = state_dir() / LOGIN_FORGOTTEN_STAMP
+    try:
+        value = float(stamp.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        try:
+            return stamp.stat().st_mtime
+        except OSError:
+            return None
+    return value if math.isfinite(value) else None
+
+
 @contextmanager
 def _state_lock(harness: str, sid: str):
     """Serialize offset writers without delaying a harness Stop."""
-    lock = _state_file(harness, sid).with_suffix(".lock")
+    with _path_lock(_state_file(harness, sid).with_suffix(".lock")) as acquired:
+        yield acquired
+
+
+@contextmanager
+def _path_lock(lock: Path):
+    """The state lock at ``lock`` (a directory made with mkdir): never
+    waits; a lock older than 60 s is stale and taken over."""
     lock.parent.mkdir(parents=True, exist_ok=True)
     acquired = None
     try:
@@ -1867,6 +2001,10 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                 # with no turn in it (2026-08-24 false red).
                 st.update(seen_end=new_off, seen_ts=time.time(), transcript_path=str(path),
                           host_pids=ancestor_pids())
+                recorded = login_home(harness)
+                if recorded:
+                    st[LOGIN_HOME_FIELD] = recorded
+                sweep_login_homes()
                 if session_cwd(env):
                     st["cwd"] = session_cwd(env)
                 st["session_id"] = track_sid if is_subagent_stop else sid
