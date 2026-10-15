@@ -1,0 +1,214 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Khipu Settings mock: Capture &amp; models</title><link rel="stylesheet" href="App.css"><link rel="stylesheet" href="capture-models.css"></head>
+<!-- After: Settings → Capture & models per docs/plans/2026-10-15-settings-clarity.md section 1. First a full screen, then state panels (cards only). -->
+<body><div id="root"><div class="shell">
+<nav class="rail" aria-label="Primary"><div class="rail-drag"></div>
+<div class="brand"><img class="brand-icon" src="../../../apps/desktop/src/assets/khipu-icon.png" width="26" height="26" alt=""><span class="brand-name">Khipu</span></div>
+<div class="rail-nav"><div class="nav-group">
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 8 4l5 4.5V13H3z"/></svg><span class="nav-label">Home</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4"/><path d="m10 10 3.5 3.5"/></svg><span class="nav-label">Recall</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h10M3 8h7M3 12h5"/><path d="m11 11 1.5 1.5L15 10"/></svg><span class="nav-label">Owed</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></svg><span class="nav-label">Activity</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v3M11 3v3M3 6h10v3a5 5 0 0 1-10 0z"/><path d="M8 11v3"/></svg><span class="nav-label">Harnesses</span></button>
+<button type="button" class="nav active" aria-current="page"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h10M3 11h10"/><circle cx="6" cy="5" r="1.5"/><circle cx="10" cy="11" r="1.5"/></svg><span class="nav-label">Settings</span></button>
+</div></div>
+<div class="rail-foot"><div class="rail-health"><span class="hdot ok" aria-hidden="true"></span><span>All harnesses recording</span></div>
+<div class="rail-meta"><button type="button" class="rail-feedback">Feedback</button><span class="version-chip">v0.5.0</span></div></div></nav>
+<main class="main"><section class="panel"><header class="panel-head"><div class="panel-head-text"><h1>Settings</h1><p class="lede">Capture, models, data and this Mac.</p></div></header>
+<div class="panel-body wide settings-body">
+<div class="settings-split">
+<div class="subnav" role="tablist" aria-label="Settings sections">
+<button type="button" role="tab" aria-selected="false">Database</button>
+<button type="button" role="tab" aria-selected="true" class="on">Capture &amp; models</button>
+<button type="button" role="tab" aria-selected="false">Routing</button>
+<button type="button" role="tab" aria-selected="false">Optional features</button>
+<button type="button" role="tab" aria-selected="false">Embeddings</button>
+<button type="button" role="tab" aria-selected="false">Data &amp; backups</button>
+<button type="button" role="tab" aria-selected="false">Another Mac</button>
+<button type="button" role="tab" aria-selected="false">Components</button>
+<button type="button" role="tab" aria-selected="false">Updates</button>
+<button type="button" role="tab" aria-selected="false">Advanced</button>
+</div>
+<div class="settings-pane">
+
+<p class="set-intro cm-intro">Khipu saves a short summary of each conversation (a capture) and keeps a list of what conversations say is still owed (commitments). Here you choose when it saves, which model writes the summaries, and how commitments close.</p>
+
+<!-- Card 1: When Khipu saves a conversation -->
+<div class="section-card">
+<div class="section-head">When Khipu saves a conversation</div>
+<div class="section-body">
+<p class="cm-readonly">After 5 turns or 20 minutes, before a conversation is compacted, and when it ends. The same on every harness.</p>
+<p class="set-help">Keys, tokens and passwords are masked before anything is summarised or stored.</p>
+<div class="set-field">
+<div class="set-labelrow"><label class="set-label" for="a-mode">Where captures are written</label></div>
+<div class="toolbar"><select id="a-mode" aria-describedby="a-mode-help"><option>Files only</option><option selected>Files and Khipu</option><option>Khipu only</option></select></div>
+<p id="a-mode-help" class="set-help">The capture script writes files and Khipu stores each capture too.</p>
+</div>
+<form class="set-field narrow"><div class="set-labelrow"><label class="set-label" for="a-dedup">Merge near-duplicate captures at</label></div>
+<div class="toolbar"><input id="a-dedup" class="mono" value="0.92" inputmode="decimal" aria-describedby="a-dedup-help"><button type="submit" disabled>Save</button></div>
+<p id="a-dedup-help" class="set-help">From 0 to 1; higher merges only closer matches. A word matching rule can also merge close captures. Default 0.92.</p></form>
+</div></div>
+
+<!-- Card 2: Commitments -->
+<div class="section-card">
+<div class="section-head">Commitments</div>
+<div class="section-body">
+<p class="set-help">A commitment is something a conversation said is still owed: a follow-up, a blocker, a question or a promise. They are listed on Owed.</p>
+<form class="set-field"><div class="set-labelrow"><label class="set-label" for="a-names">Your names</label></div>
+<div class="toolbar"><input id="a-names" value="alex, al" aria-describedby="a-names-help"><button type="submit" disabled>Save</button></div>
+<p id="a-names-help" class="set-help">Names that mean you when Khipu decides who owns a commitment. Separate them with commas. Default: none.</p></form>
+<form class="set-field narrow"><div class="set-labelrow"><label class="set-label" for="a-close">Close a commitment when a later capture matches it at</label></div>
+<div class="toolbar"><input id="a-close" class="mono" value="0.85" inputmode="decimal" aria-describedby="a-close-help"><button type="submit" disabled>Save</button></div>
+<p id="a-close-help" class="set-help">From 0 to 1. A word and completion rule can also close a commitment. Default 0.85.</p></form>
+</div></div>
+
+<!-- Card 3: Session summaries -->
+<div class="section-card" id="summaries">
+<div class="section-head">Session summaries</div>
+<div class="section-body">
+<p class="set-help" id="synth-help">Which model writes the summary of each conversation. Search by meaning uses its own model, set in Embeddings.</p>
+<div class="choices" role="radiogroup" aria-labelledby="synth-legend" aria-describedby="synth-help"><span class="sr-only" id="synth-legend">Which model writes the summaries</span>
+<div class="choice"><label class="choice-head"><input type="radio" name="synth"><span class="choice-text"><span class="choice-name">Gemini Flash <span class="meta">API key</span></span><span class="choice-line">Fastest, about 3 s, least accurate</span></span><span class="tag ok"><span class="dot" aria-hidden="true"></span>Key works</span></label></div>
+<div class="choice on"><label class="choice-head"><input type="radio" name="synth" checked><span class="choice-text"><span class="choice-name">Claude Haiku <span class="meta">API key</span></span><span class="choice-line">Best memory, about 11 s a capture</span></span><span class="tag">Not checked</span></label>
+<div class="choice-body">
+<form class="set-field"><div class="set-labelrow"><label class="set-label" for="a-model">Model id</label></div>
+<div class="toolbar"><input id="a-model" class="mono" value="claude-haiku-5-5" aria-describedby="a-model-help"></div>
+<p id="a-model-help" class="set-help">Default claude-haiku-5-5.</p></form>
+<p class="choice-key">Uses the Claude API key: stored, not checked yet. <button type="button" class="link sm">Check it in Keys below</button></p>
+</div></div>
+<div class="choice"><label class="choice-head"><input type="radio" name="synth"><span class="choice-text"><span class="choice-name">OpenAI <span class="meta">API key</span></span><span class="choice-line">Accurate, thinner on open loops, about 8 s</span></span><span class="tag">No key</span></label></div>
+<div class="choice"><label class="choice-head"><input type="radio" name="synth"><span class="choice-text"><span class="choice-name">OpenRouter <span class="meta">API key</span></span><span class="choice-line">One key, any model</span></span><span class="tag">No key</span></label></div>
+<div class="choice"><label class="choice-head"><input type="radio" name="synth"><span class="choice-text"><span class="choice-name">Claude <span class="meta">your login</span></span><span class="choice-line">Uses the login you already have; counts against that plan</span></span><span class="tag ok"><span class="dot" aria-hidden="true"></span>Signed in</span></label></div>
+<div class="choice"><label class="choice-head"><input type="radio" name="synth"><span class="choice-text"><span class="choice-name">ChatGPT <span class="meta">your login</span></span><span class="choice-line">Uses the login you already have; counts against that plan</span></span><span class="tag">Not checked</span></label></div>
+<div class="choice"><label class="choice-head"><input type="radio" name="synth"><span class="choice-text"><span class="choice-name">A local model</span><span class="choice-line">A model on this Mac or your network</span></span><span class="tag">Not checked</span></label></div>
+</div>
+<p class="measured">Measured on 15 real conversations, Oct 13.</p>
+<div class="toolbar"><button type="button" class="primary">Save models</button></div>
+<fieldset class="set-field"><legend class="set-label">If the provider fails</legend>
+<div class="radio-stack">
+<label class="radio-choice"><input type="radio" name="fallback" checked> Retry on Gemini Flash</label>
+<label class="radio-choice"><input type="radio" name="fallback"> Wait and retry later on the same provider</label>
+</div>
+<p class="set-help">Fallback uses the Gemini key, about $0.002 a conversation. Nothing is dropped either way. Saved when you choose.</p>
+</fieldset>
+<div class="calls" role="group" aria-label="Calls today">
+<span class="calls-text"><span class="calls-main">Calls today: 12 of 5,000, about $0.03</span><span class="calls-sub">By provider: claude 10, gemini 2 (fallback). Daily limit 5,000 (default); 0 means no limit. It starts again at midnight UTC, 8:00 PM here.</span></span>
+<span class="calls-acts"><button type="button" class="sm" aria-label="Change the daily limit">Change…</button><button type="button" class="sm">Lift for today</button></span>
+</div>
+</div></div>
+
+<!-- Keys on this Mac -->
+<div class="section-card" id="keys">
+<div class="section-head">Keys on this Mac</div>
+<div class="section-body">
+<div class="rows" role="list" aria-label="Keys on this Mac">
+<div class="row-item key-row" role="listitem"><span class="key-text"><span class="key-name">Gemini</span><span class="key-uses">Summaries, the fallback and search by meaning</span><span class="key-status"><span class="hdot ok" aria-hidden="true"></span>Works, checked 2 min ago</span></span><span class="key-acts"><button type="button" class="sm" aria-label="Replace the Gemini key">Replace…</button><button type="button" class="sm" aria-label="Check the Gemini key now">Check now</button></span></div>
+<div class="row-item key-row" role="listitem"><span class="key-text"><span class="key-name">Claude API</span><span class="key-uses">Summaries with Claude Haiku</span><span class="key-status"><span class="hdot" aria-hidden="true"></span>Stored, not checked</span></span><span class="key-acts"><button type="button" class="sm" aria-label="Replace the Claude API key">Replace…</button><button type="button" class="sm" aria-label="Check the Claude API key now">Check now</button></span></div>
+<div class="row-item key-row" role="listitem"><span class="key-text"><span class="key-name">OpenAI</span><span class="key-uses">Summaries with OpenAI</span><span class="key-status muted">Not stored</span></span><span class="key-acts"><button type="button" class="sm" aria-label="Add an OpenAI key">Add…</button></span></div>
+<div class="row-item key-row" role="listitem"><span class="key-text"><span class="key-name">OpenRouter</span><span class="key-uses">Summaries through OpenRouter</span><span class="key-status muted">Not stored</span></span><span class="key-acts"><button type="button" class="sm" aria-label="Add an OpenRouter key">Add…</button></span></div>
+<div class="row-item key-row" role="listitem"><span class="key-text"><span class="key-name">Local endpoint</span><span class="key-uses">A local model, only if its endpoint asks for a key (Ollama doesn't)</span><span class="key-status muted">Optional, not stored</span></span><span class="key-acts"><button type="button" class="sm" aria-label="Add a local endpoint key">Add…</button></span></div>
+</div>
+<p class="set-help">Keys are kept in this Mac's login Keychain, never in a file.</p>
+</div></div>
+
+<p class="cm-pointer">Looking for Plans? It moved to <button type="button" class="link sm">Settings → Routing → Accounts</button>. The model for search by meaning has its own section, <button type="button" class="link sm">Embeddings</button>.</p>
+
+<hr class="mock-sep">
+
+<!-- STATE: a key that fails its check -->
+<h2 class="mock-state">State: a key fails its check</h2>
+<div class="section-card">
+<div class="section-head">Session summaries</div>
+<div class="section-body">
+<div class="choices" role="radiogroup" aria-label="Which model writes the summaries (key refused)">
+<div class="choice"><label class="choice-head"><input type="radio" name="synth-s1"><span class="choice-text"><span class="choice-name">Gemini Flash <span class="meta">API key</span></span><span class="choice-line">Fastest, about 3 s, least accurate</span></span><span class="tag err"><span class="dot" aria-hidden="true"></span>Key refused</span></label></div>
+<div class="choice on"><label class="choice-head"><input type="radio" name="synth-s1" checked><span class="choice-text"><span class="choice-name">Claude Haiku <span class="meta">API key</span></span><span class="choice-line">Best memory, about 11 s a capture</span></span><span class="tag ok"><span class="dot" aria-hidden="true"></span>Key works</span></label>
+<div class="choice-body"><p class="choice-key">Model id <code>claude-haiku-5-5</code>, using the Claude API key, in Keys below.</p></div></div>
+<div class="choice"><label class="choice-head"><input type="radio" name="synth-s1"><span class="choice-text"><span class="choice-name">OpenAI <span class="meta">API key</span></span><span class="choice-line">Accurate, thinner on open loops, about 8 s</span></span><span class="tag">No key</span></label></div>
+</div>
+<p class="measured">Rows 4 to 7 as above.</p>
+<fieldset class="set-field"><legend class="set-label">If the provider fails</legend>
+<div class="radio-stack">
+<label class="radio-choice"><input type="radio" name="fallback-s1" checked> Retry on Gemini Flash</label>
+<label class="radio-choice"><input type="radio" name="fallback-s1"> Wait and retry later on the same provider</label>
+</div>
+<p class="set-help">Fallback uses the Gemini key, about $0.002 a conversation. While that key is refused, a failed capture waits and is retried; nothing is dropped.</p>
+</fieldset>
+</div></div>
+<div class="section-card">
+<div class="section-head">Keys on this Mac</div>
+<div class="section-body">
+<div class="rows" role="list" aria-label="Keys on this Mac (key refused)">
+<div class="row-item key-row err" role="listitem"><span class="key-text"><span class="key-name">Gemini</span><span class="key-uses">Summaries, the fallback and search by meaning</span><span class="key-status err"><span class="hdot err" aria-hidden="true"></span>Gemini: this key was refused. Check it, or replace it.</span></span><span class="key-acts"><button type="button" class="sm" aria-label="Replace the Gemini key">Replace…</button><button type="button" class="sm" aria-label="Check the Gemini key now">Check now</button></span></div>
+<div class="row-item key-row" role="listitem"><span class="key-text"><span class="key-name">Claude API</span><span class="key-uses">Summaries with Claude Haiku</span><span class="key-status"><span class="hdot ok" aria-hidden="true"></span>Works, checked 1 min ago</span></span><span class="key-acts"><button type="button" class="sm" aria-label="Replace the Claude API key">Replace…</button><button type="button" class="sm" aria-label="Check the Claude API key now">Check now</button></span></div>
+</div>
+<p class="measured">Other keys as above.</p>
+</div></div>
+
+<!-- STATE: local provider chosen -->
+<h2 class="mock-state">State: a local model chosen</h2>
+<div class="section-card">
+<div class="section-head">Session summaries</div>
+<div class="section-body">
+<div class="choices" role="radiogroup" aria-label="Which model writes the summaries (local)">
+<div class="choice"><label class="choice-head"><input type="radio" name="synth-s2"><span class="choice-text"><span class="choice-name">ChatGPT <span class="meta">your login</span></span><span class="choice-line">Uses the login you already have; counts against that plan</span></span><span class="tag">Not checked</span></label></div>
+<div class="choice on"><label class="choice-head"><input type="radio" name="synth-s2" checked><span class="choice-text"><span class="choice-name">A local model</span><span class="choice-line">A model on this Mac or your network</span></span><span class="tag">Not checked</span></label>
+<div class="choice-body">
+<form class="set-field"><div class="set-labelrow"><label class="set-label" for="s2-endpoint">Endpoint</label></div>
+<div class="toolbar"><input id="s2-endpoint" class="mono" value="http://127.0.0.1:11434" aria-describedby="s2-endpoint-help"></div>
+<p id="s2-endpoint-help" class="set-help">Any OpenAI-compatible address, such as Ollama on this Mac.</p></form>
+<form class="set-field"><div class="set-labelrow"><label class="set-label" for="s2-model">Model id</label></div>
+<div class="toolbar"><input id="s2-model" class="mono" value="qwen3:8b"></div></form>
+<p class="choice-key">If the endpoint asks for a key, add it as Local endpoint in Keys below. Save models, then the check runs.</p>
+</div></div>
+</div>
+<p class="measured">Rows 1 to 5 as above.</p>
+<div class="toolbar"><button type="button" class="primary">Save models</button></div>
+</div></div>
+
+<!-- STATE: an environment variable key -->
+<h2 class="mock-state">State: a key set in the environment</h2>
+<div class="section-card">
+<div class="section-head">Keys on this Mac</div>
+<div class="section-body">
+<div class="rows" role="list" aria-label="Keys on this Mac (environment key)">
+<div class="row-item key-row" role="listitem"><span class="key-text"><span class="key-name">Gemini</span><span class="key-uses">Summaries, the fallback and search by meaning</span><span class="key-status"><span class="hdot ok" aria-hidden="true"></span><span>Set by <code>GEMINI_API_KEY</code> in the environment; that one is used. Works, checked 2 min ago.</span></span><span class="key-uses">A key stored in the Keychain is kept but not used while the variable is set.</span></span><span class="key-acts"><button type="button" class="sm" aria-label="Check the Gemini key now">Check now</button></span></div>
+</div>
+<p class="measured">Other keys as above.</p>
+</div></div>
+
+<!-- STATE: where captures are written, locked -->
+<h2 class="mock-state">State: where captures are written, locked by the environment</h2>
+<div class="section-card">
+<div class="section-head">When Khipu saves a conversation</div>
+<div class="section-body">
+<p class="cm-readonly">After 5 turns or 20 minutes, before a conversation is compacted, and when it ends. The same on every harness.</p>
+<p class="set-help">Keys, tokens and passwords are masked before anything is summarised or stored.</p>
+<div class="set-field">
+<div class="set-labelrow"><label class="set-label" for="s4-mode">Where captures are written</label><span class="tag">Locked</span></div>
+<p class="set-help" id="s4-lock">Set by the environment variable <code>KHIPU_CAPTURE_MODE</code>. Unset it to change this here.</p>
+<div class="toolbar"><select id="s4-mode" disabled aria-describedby="s4-lock s4-help"><option>Files only</option><option>Files and Khipu</option><option selected>Khipu only</option></select></div>
+<p id="s4-help" class="set-help">Khipu stores each capture. The session files are rebuilt from Khipu.</p>
+</div>
+<form class="set-field narrow"><div class="set-labelrow"><label class="set-label" for="s4-dedup">Merge near-duplicate captures at</label></div>
+<div class="toolbar"><input id="s4-dedup" class="mono" value="0.92" inputmode="decimal"><button type="submit" disabled>Save</button></div>
+<p class="set-help">Default 0.92.</p></form>
+</div></div>
+
+<!-- STATE: daily limit reached -->
+<h2 class="mock-state">State: daily limit reached</h2>
+<div class="section-card">
+<div class="section-head">Session summaries</div>
+<div class="section-body">
+<p class="measured">Provider rows and fallback as above.</p>
+<div class="calls warn" role="group" aria-label="Calls today">
+<span class="calls-text"><span class="calls-main">Calls today: 5,000 of 5,000. Captures wait until midnight UTC; nothing is dropped.</span><span class="calls-sub">Midnight UTC is 8:00 PM here. About $12.50 today.</span></span>
+<span class="calls-acts"><button type="button" class="sm" aria-label="Change the daily limit">Change…</button><button type="button" class="sm primary">Lift for today</button></span>
+</div>
+<p class="set-help">Lift for today starts today's count again, so the full limit is there until midnight UTC.</p>
+</div></div>
+
+</div>
+</div>
+</div>
+</section></main></div></div></body></html>

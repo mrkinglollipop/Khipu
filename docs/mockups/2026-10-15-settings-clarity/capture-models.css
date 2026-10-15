@@ -1,0 +1,84 @@
+/* Mock-only styles for Settings → Capture & models (2026-10-15 settings clarity).
+   Tokens and components come from App.css; this file only adds what the mocks need. */
+.rail-nav{overflow:hidden}
+
+/* State panels stacked under the first full screen. */
+.mock-state{margin:var(--s5) 0 calc(var(--s2) * -1);font-size:var(--t-xs);font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);line-height:1.4}
+.mock-sep{margin:var(--s4) 0 0;border:0;border-top:1px dashed var(--border-strong, var(--border))}
+
+/* Before: Plans card rows, as the real PlansSettingsCard draws them. */
+.plan-account .row-item{flex-wrap:wrap}
+.plan-reach{display:inline-flex;align-items:center;gap:var(--s2);flex-wrap:wrap}
+.before-provider .toolbar{padding:var(--s2) var(--s3) 0}
+.before-provider > .set-help,.before-provider > div > .set-help{padding:0 var(--s3)}
+.before-provider .set-field{padding:var(--s2) var(--s3)}
+.before-provider .rows-head{margin-bottom:var(--s1)}
+
+/* After: section intro and pointer. */
+.cm-intro{font-size:var(--t-md);color:var(--text-2);line-height:1.5}
+.cm-readonly{margin:0;font-size:var(--t-md);color:var(--text);line-height:1.5}
+.cm-pointer{margin:0;font-size:var(--t-sm);color:var(--text-2);line-height:1.5;display:flex;flex-wrap:wrap;gap:var(--s1) var(--s2);align-items:baseline}
+.cm-pointer button.link{height:auto;padding:0}
+
+/* Session summaries: one choice per row, the chosen one open. */
+.choices{display:flex;flex-direction:column;border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden;background:var(--surface)}
+.choice{border-bottom:1px solid var(--border)}
+.choice:last-child{border-bottom:0}
+.choice-head{display:grid;grid-template-columns:auto minmax(0,1fr) auto;column-gap:var(--s3);align-items:start;padding:var(--s2) var(--s3);cursor:pointer}
+.choice-head:hover{background:var(--surface-2)}
+.choice-head input[type="radio"]{margin:3px 0 0;accent-color:var(--accent);cursor:pointer}
+.choice-text{display:flex;flex-direction:column;gap:1px;min-width:0}
+.choice-name{font-weight:600;color:var(--text)}
+.choice-name .meta{font-weight:400;color:var(--text-2);font-size:var(--t-sm)}
+.choice-line{font-size:var(--t-sm);color:var(--text-2);line-height:1.4}
+.choice-head .tag{white-space:nowrap;margin-top:1px}
+.choice.on{background:color-mix(in srgb,var(--accent) 5%,var(--surface));box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}
+.choice.on .choice-head:hover{background:transparent}
+.choice-body{display:flex;flex-direction:column;gap:var(--s2);padding:0 var(--s3) var(--s3) calc(var(--s3) + 13px + var(--s3))}
+.choice-body .set-field .toolbar input{max-width:22rem}
+.choice-body .set-field + .set-field{margin-top:0;padding-top:0;border-top:0}
+.choice-key{margin:0;font-size:var(--t-sm);color:var(--text-2);line-height:1.45;display:flex;flex-wrap:wrap;gap:var(--s1) var(--s2);align-items:center}
+.choice-key button.link{height:auto;padding:0}
+.measured{margin:0;font-size:var(--t-xs);color:var(--muted);line-height:1.45}
+
+/* Fallback: two radio choices on one field. */
+.radio-stack{display:flex;flex-direction:column;gap:var(--s1)}
+.radio-stack .radio-choice{align-items:flex-start;font-size:var(--t-md);color:var(--text)}
+.radio-stack .radio-choice input{margin:3px 0 0;accent-color:var(--accent)}
+fieldset.set-field{margin:0;padding:0;border:0;min-width:0}
+fieldset.set-field legend{padding:0;margin-bottom:var(--s1)}
+
+/* Calls today: one line, with its two buttons. */
+.calls{display:grid;grid-template-columns:minmax(0,1fr) auto;column-gap:var(--s3);row-gap:var(--s1);align-items:center;padding:var(--s2) var(--s3);border:1px solid var(--border);border-radius:var(--r-md)}
+.calls-text{display:flex;flex-direction:column;gap:1px;min-width:0}
+.calls-main{color:var(--text);font-variant-numeric:tabular-nums}
+.calls-sub{font-size:var(--t-sm);color:var(--text-2)}
+.calls-acts{display:inline-flex;gap:var(--s2);flex-wrap:wrap;justify-content:flex-end}
+.calls.warn{border-color:color-mix(in srgb,var(--warn) 45%,var(--border));background:var(--warn-soft)}
+.calls.warn .calls-main{font-weight:600}
+
+/* Keys on this Mac. */
+.row-item.key-row{display:grid;grid-template-columns:minmax(0,1fr) auto;column-gap:var(--s3);align-items:center;padding:var(--s2) var(--s3)}
+.key-text{display:flex;flex-direction:column;gap:2px;min-width:0}
+.key-name{font-weight:600;color:var(--text)}
+.key-uses{font-size:var(--t-sm);color:var(--text-2);line-height:1.4}
+.key-status{display:flex;align-items:baseline;gap:var(--s2);font-size:var(--t-sm);color:var(--text);line-height:1.4}
+.key-status .hdot{flex:none;transform:translateY(-1px)}
+.key-status.err{color:var(--err)}
+.key-status.muted{color:var(--text-2)}
+.key-acts{display:inline-flex;gap:var(--s2);justify-content:flex-end;flex-wrap:wrap}
+.row-item.key-row.err{background:var(--err-soft)}
+.key-row .mono{font-family:var(--mono);font-size:var(--t-xs)}
+
+@media (max-width:1100px){
+  .row-item.key-row{grid-template-columns:minmax(0,1fr)}
+  .key-acts{justify-content:flex-start;margin-top:var(--s1)}
+  .calls{grid-template-columns:minmax(0,1fr)}
+  .calls-acts{justify-content:flex-start}
+}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.choice-head input[type="radio"],.radio-stack input[type="radio"]{height:auto;width:auto;padding:0;border:0;flex:none}
+.radio-stack .radio-choice{align-items:center}
+.radio-stack .radio-choice input{margin:0}
+.cm-pointer{display:block}
+.cm-pointer button.link{display:inline;vertical-align:baseline;font-size:inherit}
