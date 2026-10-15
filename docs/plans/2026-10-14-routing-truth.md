@@ -29,8 +29,8 @@ can see and change all of it in the app. Khipu never decides where work goes.
 | 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | done 2026-10-14 (PR #188) |
 | 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | done 2026-10-14 (PR #189) |
 | 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | done 2026-10-15 (PR #190) |
-| 3c | The daemon refolds on change and on the clock; the promotion gate's replay covers routing | S | built, in review (branch feat/routing-truth-3c) |
-| 4 | App: Home Routing card, Settings → Routing for what phases 1a to 3c built, health row, attention items | M–L | open (mock approved 2026-10-14; needs plan usage phase 2 merged) |
+| 3c | The daemon refolds on change and on the clock; the promotion gate's replay covers routing | S | done 2026-10-15 (PR #191) |
+| 4 | App: Home Routing card, Settings → Routing for what phases 1a to 3c built, health row, attention items | M–L | built, in review (branch feat/routing-truth-4) |
 | 5 | The background check at each known reset time, with its part of the app | S | open |
 | 6 | Push at the moment of delegation, with its part of the app | S–M | open (shaped by the phase 0 hook check; the Grok Build part needs Matt's go) |
 | 7 | Copy for cloud agents through the hub, read by cloud harnesses and a second Mac, with its part of the app | M | open |

@@ -87,8 +87,8 @@ export const REJECTED_FEATURES: ReadonlyArray<FeatureRow> = [
 ];
 
 /* Routing truth, phase 3a (docs/plans/2026-10-14-routing-truth.md). Off by
-   default; it also appears at the top of Settings -> Routing once that page
-   exists (phase 4). */
+   default; the same switch is in Settings -> Routing -> Telling
+   conversations (phase 4). */
 export const ROUTING_FEATURES: ReadonlyArray<FeatureRow> = [
   {
     name: "routing_push",

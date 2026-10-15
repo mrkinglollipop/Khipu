@@ -568,6 +568,13 @@ const BUDGET_LIFT_SYNTH_TODAY_ARGV: &[&str] = &["budget", "lift", "synth", "--to
 /// every account now. Fixed argv: the webview cannot reach `--max-age`.
 const USAGE_STATUS_ARGV: &[&str] = &["usage", "--json"];
 const USAGE_REFRESH_ARGV: &[&str] = &["usage", "--fresh", "--json"];
+/// Home -> Routing, the health report's Routing row and the routing
+/// attention items (docs/plans/2026-10-14-routing-truth.md, phase 4): the
+/// routing record as `khipu route --json` prints it. Read only and fixed
+/// argv: the webview cannot reach `--since`, an account, or any of `route`'s
+/// write verbs (report, hold, pause, lift, clear, note, rule), and `route`
+/// stays out of `ALLOWED_SUBCOMMANDS`.
+const ROUTE_VIEW_ARGV: &[&str] = &["route", "--json"];
 /// `config --set KEY N`, a whole number >= 0 (0 = unlimited) (`INT_SETTINGS`).
 /// Only the summariser's ceiling is offered in the app.
 const DAILY_CALL_KEYS: &[&str] = &["synth_daily_calls"];
@@ -579,6 +586,45 @@ const SYNTH_FALLBACKS: &[&str] = &["gemini", "none"];
 const USAGE_ACCOUNTS_KEY: &str = "usage_accounts";
 const USAGE_HARNESSES: &[&str] = &["claude", "codex", "grok", "muse"];
 const USAGE_ACCOUNTS_MAX: usize = 32;
+/// Settings -> Routing (routing truth phase 4): the sizes, times and switches
+/// the page offers, each `config --set KEY VALUE` or `config --unset=KEY`
+/// (the default again). The reset check (phase 5), the delegation switch
+/// (phase 6) and the copy for cloud agents (phase 7) join with their phases.
+/// Lengths of time, in whole seconds (0 turns the limit off where the CLI
+/// says so).
+const ROUTING_DURATION_KEYS: &[&str] = &[
+    "routing_stale_after",
+    "routing_conversation_hold",
+    "routing_conversation_hold_max",
+    "routing_owner_hold_reminder",
+    "routing_disagreement_warn_after",
+    "routing_resend_after",
+    "routing_not_refreshed_after",
+    "routing_report_default_limit",
+    "routing_poll_interval",
+];
+/// Whole numbers of 0 or more.
+const ROUTING_COUNT_KEYS: &[&str] = &[
+    "routing_summary_chars",
+    "routing_prompt_chars",
+    "routing_prompt_budget_ms",
+    "routing_resend_after_versions",
+    "routing_hold_chars",
+    "routing_line_chars",
+    "routing_start_budget_ms",
+    "routing_runner_silent_intervals",
+    "routing_runner_tail_bytes",
+    "routing_runner_limited_lines",
+];
+/// Numbers of 0 or more, a fraction allowed (a percentage).
+const ROUTING_NUMBER_KEYS: &[&str] = &["routing_slow_read_pct"];
+/// On or off.
+const ROUTING_SWITCH_KEYS: &[&str] = &["routing_push_start", "routing_push_prompt"];
+const ROUTING_SOURCES_KEY: &str = "routing_sources";
+const ROUTING_LANE_MAP_KEY: &str = "routing_lane_map";
+/// The routing table file: a full path, read only (fix round 2, R2-1).
+const ROUTING_TABLE_KEY: &str = "routing_table";
+const ROUTING_SOURCES_MAX: usize = 32;
 
 fn fixed_argv(argv: &[&str]) -> Vec<String> {
     argv.iter().map(|s| s.to_string()).collect()
@@ -715,6 +761,135 @@ fn checked_usage_accounts(raw: &str) -> Result<String, String> {
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
+fn routing_key(key: &str) -> bool {
+    ROUTING_DURATION_KEYS.contains(&key)
+        || ROUTING_COUNT_KEYS.contains(&key)
+        || ROUTING_NUMBER_KEYS.contains(&key)
+        || ROUTING_SWITCH_KEYS.contains(&key)
+        || key == ROUTING_SOURCES_KEY
+        || key == ROUTING_LANE_MAP_KEY
+        || key == ROUTING_TABLE_KEY
+}
+
+/// A file's full path, one line, starting with `/` or `~/` (so never with
+/// `-`), as the job runner folders are checked. The CLI refuses a file inside
+/// a private folder.
+fn checked_routing_path(what: &str, raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if v.is_empty() || has_control(v) || v.chars().count() > 1024 {
+        return Err(format!("{what} must be one line of at most 1024 characters"));
+    }
+    if !(v.starts_with('/') || v.starts_with("~/")) {
+        return Err(format!("{what} needs its full path, starting with / or ~/"));
+    }
+    Ok(v.to_string())
+}
+
+/// One line of text inside a routing JSON setting.
+fn routing_json_text(what: &str, v: &serde_json::Value, limit: usize) -> Result<String, String> {
+    let s = v.as_str().ok_or_else(|| format!("{what} must be text"))?.trim();
+    if s.is_empty() || has_control(s) || s.chars().count() > limit {
+        return Err(format!("{what} must be one line of at most {limit} characters"));
+    }
+    Ok(s.to_string())
+}
+
+/// The job runner folders, parsed and re-serialised: only `{name, kind:
+/// "lanes", path}` with an absolute path ever reaches argv. The CLI refuses a
+/// folder inside a private one.
+fn checked_routing_sources(raw: &str) -> Result<String, String> {
+    let bad = || "job runner folders must be a JSON list of {name, kind, path}".to_string();
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|_| bad())?;
+    let entries = value.as_array().ok_or_else(bad)?;
+    if entries.len() > ROUTING_SOURCES_MAX {
+        return Err(format!("at most {ROUTING_SOURCES_MAX} job runner folders"));
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let n = i + 1;
+        let obj = entry.as_object().ok_or_else(bad)?;
+        if obj.keys().any(|k| !matches!(k.as_str(), "name" | "kind" | "path")) {
+            return Err(format!("folder {n} has a field Khipu doesn't keep"));
+        }
+        let name = routing_json_text(&format!("folder {n}'s name"), obj.get("name").unwrap_or(&serde_json::Value::Null), 64)?;
+        let path = routing_json_text(&format!("folder {n}'s path"), obj.get("path").unwrap_or(&serde_json::Value::Null), 1024)?;
+        if !(path.starts_with('/') || path.starts_with("~/")) {
+            return Err(format!("folder {n} needs its full path, starting with / or ~/"));
+        }
+        out.push(serde_json::json!({"name": name, "kind": "lanes", "path": path}));
+    }
+    serde_json::to_string(&out).map_err(|e| e.to_string())
+}
+
+/// Which account each job lane uses: `{runner: {lane: account}}`, parsed
+/// and re-serialised from text fields only.
+fn checked_routing_lane_map(raw: &str) -> Result<String, String> {
+    let bad = || "the lane map must be JSON like {\"runner\": {\"lane\": \"account\"}}".to_string();
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|_| bad())?;
+    let runners = value.as_object().ok_or_else(bad)?;
+    if runners.len() > 64 {
+        return Err("at most 64 job runners in the lane map".to_string());
+    }
+    let mut out = serde_json::Map::new();
+    for (runner, lanes) in runners {
+        let runner = routing_json_text("a runner's name", &serde_json::Value::String(runner.clone()), 64)?;
+        let lanes = lanes.as_object().ok_or_else(bad)?;
+        if lanes.len() > 256 {
+            return Err(format!("at most 256 lanes for {runner}"));
+        }
+        let mut clean = serde_json::Map::new();
+        for (lane, account) in lanes {
+            let lane = routing_json_text("a lane's name", &serde_json::Value::String(lane.clone()), 64)?;
+            clean.insert(lane, serde_json::Value::String(routing_json_text("an account", account, 1100)?));
+        }
+        out.insert(runner, serde_json::Value::Object(clean));
+    }
+    serde_json::to_string(&out).map_err(|e| e.to_string())
+}
+
+/// A routing setting's value as argv takes it, re-printed from the parsed
+/// value: whole seconds, a whole number, on or off, or checked JSON.
+fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
+    let v = value.trim();
+    if ROUTING_SWITCH_KEYS.contains(&key) {
+        return match v {
+            "on" | "off" => Ok(v.to_string()),
+            _ => Err(format!("{key} must be on or off")),
+        };
+    }
+    if key == ROUTING_SOURCES_KEY {
+        return checked_routing_sources(v);
+    }
+    if key == ROUTING_LANE_MAP_KEY {
+        return checked_routing_lane_map(v);
+    }
+    if key == ROUTING_TABLE_KEY {
+        return checked_routing_path("the routing table file", v);
+    }
+    if ROUTING_NUMBER_KEYS.contains(&key) {
+        // Digits with at most one decimal point: never a sign, an exponent,
+        // "inf" or "NaN", so it can't be read as a flag or a special value.
+        let plain = !v.is_empty()
+            && v.len() <= 12
+            && v.chars().all(|c| c.is_ascii_digit() || c == '.')
+            && v.matches('.').count() <= 1
+            && v.chars().any(|c| c.is_ascii_digit());
+        let n: f64 = if plain { v.parse().unwrap_or(-1.0) } else { -1.0 };
+        if !(n.is_finite() && (0.0..=100.0).contains(&n)) {
+            return Err(format!("{key} must be a number from 0 to 100, got {value:?}"));
+        }
+        return Ok(n.to_string());
+    }
+    let n: u64 = v
+        .parse()
+        .map_err(|_| format!("{key} must be a whole number of 0 or more, got {value:?}"))?;
+    let most: u64 = if ROUTING_DURATION_KEYS.contains(&key) { 10 * 366 * 86_400 } else { 100_000_000 };
+    if n > most {
+        return Err(format!("{key} is too large"));
+    }
+    Ok(n.to_string())
+}
+
 fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
     let set = |k: &str, v: String| {
         vec!["config".to_string(), "--set".to_string(), k.to_string(), v]
@@ -756,6 +931,7 @@ fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
         }
         USAGE_ACCOUNTS_KEY => Ok(set(USAGE_ACCOUNTS_KEY, checked_usage_accounts(value)?)),
         k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
+        k if routing_key(k) => Ok(set(k, routing_setting_value(k, value)?)),
         _ => Err(format!("not a settable key: {key:?}")),
     }
 }
@@ -764,7 +940,12 @@ fn config_unset_argv(key: &str) -> Result<Vec<String>, String> {
     let by_profile = key
         .strip_prefix(COSINE_FLOOR_BY_PROFILE_PREFIX)
         .is_some_and(|id| checked_profile(id).is_ok());
-    if !PATH_KEYS.contains(&key) && key != COSINE_FLOOR_KEY && key != USAGE_ACCOUNTS_KEY && !by_profile {
+    if !PATH_KEYS.contains(&key)
+        && key != COSINE_FLOOR_KEY
+        && key != USAGE_ACCOUNTS_KEY
+        && !routing_key(key)
+        && !by_profile
+    {
         return Err(format!("not a resettable key: {key:?}"));
     }
     Ok(vec!["config".to_string(), format!("--unset={key}")])
@@ -857,6 +1038,240 @@ async fn khipu_usage_status() -> Result<String, String> {
 #[tauri::command]
 async fn khipu_usage_refresh() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(USAGE_REFRESH_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_route_view() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(ROUTE_VIEW_ARGV)).await
+}
+
+// --- Settings -> Routing writes (routing truth phase 4, second half). The
+// owner's changes to the routing record: pause, lift, clear or dismiss, the
+// note, the standing rules and holds. Each is one fixed verb with
+// `--from-app`, so the record stamps it `via: app` and doctor does not warn.
+// Every field is checked here, a value that takes a flag travels joined to it
+// (`--until=...`), and every free value travels after `--`, so nothing the
+// webview sends can become a flag: not a value starting with `-`, and not a
+// line break (refused in every one-line field). No shell is involved.
+
+/// `--reason` values `khipu route hold` accepts.
+const ROUTE_HOLD_REASONS: &[&str] = &["machine-busy", "disk-low", "keep", "outage", "other"];
+/// The rule verbs the app offers (`khipu route rule ACTION`).
+const ROUTE_RULE_ACTIONS: &[&str] = &["add", "edit", "retire", "restore", "confirm"];
+/// The most owner's words the app hands the CLI in one change (a rule, the
+/// note, a hold), in bytes of UTF-8. Not a limit on what the owner may say:
+/// the CLI keeps a note and a rule at any length, and a hold up to the
+/// owner's own `routing_hold_chars` (0: no limit). This only keeps one
+/// argument well inside what the system lets a program be started with
+/// (fix round 2, R2-4); Settings -> Routing says so.
+const ROUTE_WORDS_MAX_BYTES: usize = 128 * 1024;
+
+fn route_base(verb: &str) -> Vec<String> {
+    vec!["route".to_string(), verb.to_string(), "--from-app".to_string()]
+}
+
+/// An account as the record names it: its key (`harness|login folder`) or
+/// its label. One line, never starting with `-`.
+fn checked_route_account(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if v.is_empty() {
+        return Err("name the account".to_string());
+    }
+    if v.starts_with('-') || has_control(v) || v.chars().count() > 1100 {
+        return Err("that is not an account Khipu knows".to_string());
+    }
+    Ok(v.to_string())
+}
+
+/// A report's or a hold's id (`o1a2b3c4d`, `h…`, a runner's `runner:…`).
+fn checked_route_id(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    let ok = !v.is_empty()
+        && v.len() <= 128
+        && v.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.' | '/' | '|'));
+    if ok {
+        Ok(v.to_string())
+    } else {
+        Err("that is not a report or hold Khipu knows".to_string())
+    }
+}
+
+/// An end time the app computed: an ISO 8601 time with its offset, such as
+/// `2026-10-16T09:00:00-04:00`. Digits first, so it can never read as a flag.
+fn checked_route_until(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    let ok = v.len() >= 16
+        && v.len() <= 40
+        && v.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && v.contains('T')
+        && v.chars().all(|c| c.is_ascii_digit() || matches!(c, 'T' | 'Z' | ':' | '-' | '+' | '.'));
+    if ok {
+        Ok(v.to_string())
+    } else {
+        Err("the end must be a date and time".to_string())
+    }
+}
+
+/// The owner's words: trimmed, not empty, at most `ROUTE_WORDS_MAX_BYTES`
+/// (the size of one argument, not a length the owner chose), no control
+/// characters except line breaks where `lines` allows them (the note). They
+/// travel after `--`, so even `-x` stays words.
+fn checked_route_words(raw: &str, lines: bool) -> Result<String, String> {
+    let v = raw.trim();
+    if v.is_empty() {
+        return Err("write the words first".to_string());
+    }
+    if v.len() > ROUTE_WORDS_MAX_BYTES {
+        return Err(format!(
+            "these words are longer than the app can hand over in one change ({} KB of text); \
+             shorten them",
+            ROUTE_WORDS_MAX_BYTES / 1024
+        ));
+    }
+    if v.chars().any(|c| c.is_control() && !(lines && (c == '\n' || c == '\t'))) {
+        return Err(if lines {
+            "the words hold a character Khipu can't keep".to_string()
+        } else {
+            "keep it to one line".to_string()
+        });
+    }
+    Ok(v.to_string())
+}
+
+fn route_pause_argv(account: &str, until: Option<&str>) -> Result<Vec<String>, String> {
+    let mut argv = route_base("pause");
+    if let Some(t) = until.filter(|t| !t.trim().is_empty()) {
+        argv.push(format!("--until={}", checked_route_until(t)?));
+    }
+    argv.push("--".to_string());
+    argv.push(checked_route_account(account)?);
+    Ok(argv)
+}
+
+fn route_lift_argv(account: &str) -> Result<Vec<String>, String> {
+    let mut argv = route_base("lift");
+    argv.push("--".to_string());
+    argv.push(checked_route_account(account)?);
+    Ok(argv)
+}
+
+/// Clear the account, or with `report` dismiss that one report.
+fn route_clear_argv(account: &str, report: Option<&str>) -> Result<Vec<String>, String> {
+    let mut argv = route_base("clear");
+    if let Some(r) = report.filter(|r| !r.trim().is_empty()) {
+        argv.push(format!("--report={}", checked_route_id(r)?));
+    }
+    argv.push("--".to_string());
+    argv.push(checked_route_account(account)?);
+    Ok(argv)
+}
+
+fn route_note_set_argv(text: &str) -> Result<Vec<String>, String> {
+    let words = checked_route_words(text, true)?;
+    let mut argv = route_base("note");
+    argv.extend(["--".to_string(), "set".to_string(), words]);
+    Ok(argv)
+}
+
+fn route_note_end_argv() -> Vec<String> {
+    let mut argv = route_base("note");
+    argv.extend(["--".to_string(), "end".to_string()]);
+    argv
+}
+
+fn route_rule_argv(action: &str, n: Option<u32>, text: Option<&str>) -> Result<Vec<String>, String> {
+    if !ROUTE_RULE_ACTIONS.contains(&action) {
+        return Err(format!("not a rule change: {action:?}"));
+    }
+    let mut argv = route_base("rule");
+    argv.extend(["--".to_string(), action.to_string()]);
+    if action != "add" {
+        let n = n.filter(|n| *n >= 1).ok_or_else(|| "name the rule's number".to_string())?;
+        argv.push(n.to_string());
+    }
+    if action == "add" || action == "edit" {
+        argv.push(checked_route_words(text.unwrap_or(""), false)?);
+    }
+    Ok(argv)
+}
+
+fn route_hold_add_argv(
+    text: &str,
+    reason: &str,
+    scope: &str,
+    account: Option<&str>,
+    until: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let words = checked_route_words(text, false)?;
+    if !ROUTE_HOLD_REASONS.contains(&reason) {
+        return Err(format!("not a kind of hold: {reason:?}"));
+    }
+    let mut argv = route_base("hold");
+    argv.push(format!("--reason={reason}"));
+    match scope {
+        "all" => argv.push("--all".to_string()),
+        "machine" => argv.push("--machine".to_string()),
+        "account" => argv.push(format!("--account={}", checked_route_account(account.unwrap_or(""))?)),
+        _ => return Err(format!("a hold is about all work, this Mac or one account, not {scope:?}")),
+    }
+    if let Some(t) = until.filter(|t| !t.trim().is_empty()) {
+        argv.push(format!("--until={}", checked_route_until(t)?));
+    }
+    argv.extend(["--".to_string(), words]);
+    Ok(argv)
+}
+
+fn route_hold_end_argv(id: &str) -> Result<Vec<String>, String> {
+    let mut argv = route_base("hold");
+    argv.extend(["--".to_string(), "end".to_string(), checked_route_id(id)?]);
+    Ok(argv)
+}
+
+#[tauri::command]
+async fn khipu_route_pause(account: String, until: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_pause_argv(&account, until.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_route_lift(account: String) -> Result<String, String> {
+    run_khipu_cli_async(route_lift_argv(&account)?).await
+}
+
+#[tauri::command]
+async fn khipu_route_clear(account: String, report: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_clear_argv(&account, report.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_route_note_set(text: String) -> Result<String, String> {
+    run_khipu_cli_async(route_note_set_argv(&text)?).await
+}
+
+#[tauri::command]
+async fn khipu_route_note_end() -> Result<String, String> {
+    run_khipu_cli_async(route_note_end_argv()).await
+}
+
+#[tauri::command]
+async fn khipu_route_rule(action: String, n: Option<u32>, text: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_rule_argv(&action, n, text.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_route_hold_add(
+    text: String,
+    reason: String,
+    scope: String,
+    account: Option<String>,
+    until: Option<String>,
+) -> Result<String, String> {
+    run_khipu_cli_async(route_hold_add_argv(&text, &reason, &scope, account.as_deref(), until.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_route_hold_end(id: String) -> Result<String, String> {
+    run_khipu_cli_async(route_hold_end_argv(&id)?).await
 }
 
 #[tauri::command]
@@ -2461,6 +2876,15 @@ pub fn run() {
             khipu_budget_lift_synth_today,
             khipu_usage_status,
             khipu_usage_refresh,
+            khipu_route_view,
+            khipu_route_pause,
+            khipu_route_lift,
+            khipu_route_clear,
+            khipu_route_note_set,
+            khipu_route_note_end,
+            khipu_route_rule,
+            khipu_route_hold_add,
+            khipu_route_hold_end,
             khipu_jobs_status,
             khipu_job_install,
             khipu_job_uninstall,
@@ -2965,7 +3389,7 @@ mod settings_command_tests {
 
     #[test]
     fn none_of_these_verbs_join_the_generic_allowlist() {
-        for s in ["features", "config", "jobs", "recall", "gateway", "embed", "budget", "usage"] {
+        for s in ["features", "config", "jobs", "recall", "gateway", "embed", "budget", "usage", "route"] {
             assert!(!ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of the allowlist");
         }
         assert_eq!(ALLOWED_SUBCOMMANDS.len(), 14);
@@ -2992,6 +3416,208 @@ mod settings_command_tests {
             assert!(!argv.iter().any(|a| a.starts_with("--max-age")));
         }
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"usage"));
+    }
+
+    #[test]
+    fn routing_owner_writes_are_fixed_verbs_marked_from_the_app() {
+        let acct = "claude|/logins/claude-second";
+        assert_eq!(
+            route_pause_argv(acct, Some("2026-10-16T09:00:00-04:00")).unwrap(),
+            v(&["route", "pause", "--from-app", "--until=2026-10-16T09:00:00-04:00", "--", acct])
+        );
+        assert_eq!(route_pause_argv("Codex", None).unwrap(), v(&["route", "pause", "--from-app", "--", "Codex"]));
+        assert_eq!(route_lift_argv("Codex").unwrap(), v(&["route", "lift", "--from-app", "--", "Codex"]));
+        assert_eq!(route_clear_argv("Codex", None).unwrap(), v(&["route", "clear", "--from-app", "--", "Codex"]));
+        assert_eq!(
+            route_clear_argv("Codex", Some("e1a2b3c4")).unwrap(),
+            v(&["route", "clear", "--from-app", "--report=e1a2b3c4", "--", "Codex"])
+        );
+        assert_eq!(
+            route_note_set_argv("Codex first.\nThen Grok.").unwrap(),
+            v(&["route", "note", "--from-app", "--", "set", "Codex first.\nThen Grok."])
+        );
+        assert_eq!(route_note_end_argv(), v(&["route", "note", "--from-app", "--", "end"]));
+        assert_eq!(
+            route_rule_argv("add", None, Some("Never a -fast tier.")).unwrap(),
+            v(&["route", "rule", "--from-app", "--", "add", "Never a -fast tier."])
+        );
+        assert_eq!(
+            route_rule_argv("edit", Some(3), Some("Never a fast tier.")).unwrap(),
+            v(&["route", "rule", "--from-app", "--", "edit", "3", "Never a fast tier."])
+        );
+        for action in ["retire", "restore", "confirm"] {
+            assert_eq!(
+                route_rule_argv(action, Some(6), None).unwrap(),
+                v(&["route", "rule", "--from-app", "--", action, "6"])
+            );
+        }
+        assert_eq!(
+            route_hold_add_argv("No new launches", "machine-busy", "machine", None, None).unwrap(),
+            v(&["route", "hold", "--from-app", "--reason=machine-busy", "--machine", "--", "No new launches"])
+        );
+        assert_eq!(
+            route_hold_add_argv("Keep it", "keep", "account", Some("muse|"), Some("2026-10-17T20:00:00Z")).unwrap(),
+            v(&["route", "hold", "--from-app", "--reason=keep", "--account=muse|", "--until=2026-10-17T20:00:00Z",
+                "--", "Keep it"])
+        );
+        assert_eq!(
+            route_hold_end_argv("h1a2b3c4").unwrap(),
+            v(&["route", "hold", "--from-app", "--", "end", "h1a2b3c4"])
+        );
+    }
+
+    #[test]
+    fn a_routing_value_that_looks_like_a_flag_never_becomes_one() {
+        // Free words always travel after "--": the CLI reads them as words.
+        let argv = route_rule_argv("add", None, Some("--owner")).unwrap();
+        let sep = argv.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&argv[sep + 1..], &v(&["add", "--owner"])[..]);
+        let argv = route_note_set_argv("-x\n--from-app").unwrap();
+        assert_eq!(argv.last().unwrap(), "-x\n--from-app");
+        assert_eq!(argv.iter().position(|a| a == "--").unwrap(), argv.len() - 3);
+        let argv = route_hold_add_argv("-x words", "other", "all", None, None).unwrap();
+        assert_eq!(argv[argv.len() - 2..], v(&["--", "-x words"])[..]);
+        // One-line fields refuse a line break; ids, accounts and times refuse
+        // a leading "-" or anything that is not their shape.
+        assert!(route_rule_argv("add", None, Some("one\n--from-app")).is_err());
+        assert!(route_rule_argv("edit", Some(1), Some("a\rb")).is_err());
+        assert!(route_hold_add_argv("one\ntwo", "other", "all", None, None).is_err());
+        assert!(route_pause_argv("--owner", None).is_err());
+        assert!(route_pause_argv("Codex\n--until=1h", None).is_err());
+        assert!(route_pause_argv("Codex", Some("--from-app")).is_err());
+        assert!(route_pause_argv("Codex", Some("1h")).is_err());
+        assert!(route_pause_argv("Codex", Some("2026-10-16T09:00:00Z\n--x")).is_err());
+        assert!(route_clear_argv("Codex", Some("-e1")).is_err());
+        assert!(route_clear_argv("Codex", Some("e1 --from-app")).is_err());
+        assert!(route_hold_end_argv("--all").is_err());
+        assert!(route_hold_end_argv("h1\nend").is_err());
+        assert!(route_hold_add_argv("x", "--all", "all", None, None).is_err());
+        assert!(route_hold_add_argv("x", "other", "--machine", None, None).is_err());
+        assert!(route_hold_add_argv("x", "other", "account", Some("-c"), None).is_err());
+        assert!(route_rule_argv("--from-app", Some(1), None).is_err());
+        assert!(route_rule_argv("retire", Some(0), None).is_err());
+        assert!(route_rule_argv("retire", None, None).is_err());
+        assert!(route_rule_argv("add", None, Some("   ")).is_err());
+        assert!(route_note_set_argv(&"x".repeat(ROUTE_WORDS_MAX_BYTES + 1)).is_err());
+        assert!(route_note_set_argv("a\u{0}b").is_err());
+        // Nothing but these fixed verbs: no report, no wait, no sources.
+        for verb in ["report", "wait", "sources"] {
+            assert!(!ROUTE_RULE_ACTIONS.contains(&verb));
+        }
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"route"));
+    }
+
+    #[test]
+    fn routing_settings_are_reprinted_or_refused() {
+        assert_eq!(config_set_argv("routing_stale_after", "43200").unwrap(), v(&["config", "--set", "routing_stale_after", "43200"]));
+        assert_eq!(config_set_argv("routing_summary_chars", " 0 ").unwrap(), v(&["config", "--set", "routing_summary_chars", "0"]));
+        assert_eq!(config_set_argv("routing_push_prompt", "off").unwrap(), v(&["config", "--set", "routing_push_prompt", "off"]));
+        // Every limit Khipu enforces on the owner's words or a line can be
+        // raised from Settings -> Routing (fix round 1, F3).
+        assert_eq!(config_set_argv("routing_hold_chars", "0").unwrap(), v(&["config", "--set", "routing_hold_chars", "0"]));
+        assert_eq!(config_set_argv("routing_line_chars", "400").unwrap(), v(&["config", "--set", "routing_line_chars", "400"]));
+        for (k, bad) in [("routing_stale_after", "-1"), ("routing_stale_after", "12h"), ("routing_prompt_chars", "--x"),
+                         ("routing_push_start", "yes"), ("routing_summary_chars", "1e3"),
+                         ("routing_stale_after", "999999999999")] {
+            assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
+        }
+        // Phase 5 to 7 settings are not offered yet.
+        for k in ["routing_reset_check", "routing_push_delegation", "routing_cloud_copy", "routing_rules_seed"] {
+            assert!(config_set_argv(k, "on").is_err(), "{k}");
+            assert!(config_unset_argv(k).is_err(), "{k}");
+        }
+        assert_eq!(config_unset_argv("routing_stale_after").unwrap(), v(&["config", "--unset=routing_stale_after"]));
+        let sources = config_set_argv(
+            "routing_sources",
+            r#"[{"name": " Project A ", "kind": "anything", "path": "/runners/a"}]"#,
+        )
+        .unwrap();
+        assert_eq!(sources[3], r#"[{"kind":"lanes","name":"Project A","path":"/runners/a"}]"#);
+        for bad in [r#"[{"name": "a", "path": "relative/a"}]"#, r#"[{"name": "a", "path": "/a", "extra": 1}]"#,
+                    r#"[{"name": "a\n--x", "path": "/a"}]"#, r#"{"name": "a"}"#, "-x"] {
+            assert!(config_set_argv("routing_sources", bad).is_err(), "{bad}");
+        }
+        let map = config_set_argv("routing_lane_map", r#"{"Project B": {"opus-batch": "Claude main"}}"#).unwrap();
+        assert_eq!(map[3], r#"{"Project B":{"opus-batch":"Claude main"}}"#);
+        for bad in [r#"{"B": {"lane": 3}}"#, r#"{"B": ["lane"]}"#, r#"{"B": {"la\nne": "x"}}"#, "[]"] {
+            assert!(config_set_argv("routing_lane_map", bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn every_routing_setting_built_so_far_can_be_changed_from_the_app() {
+        // Codex review, finding 6: the record's, the job runners' and the
+        // start's sizes and times, each re-printed or refused.
+        for (k, raw, out) in [
+            ("routing_report_default_limit", "3600", "3600"),
+            ("routing_poll_interval", "0", "0"),
+            ("routing_start_budget_ms", " 2000 ", "2000"),
+            ("routing_runner_silent_intervals", "0", "0"),
+            ("routing_runner_tail_bytes", "1048576", "1048576"),
+            ("routing_runner_limited_lines", "0", "0"),
+            ("routing_slow_read_pct", "0.5", "0.5"),
+            ("routing_slow_read_pct", "2", "2"),
+            ("routing_slow_read_pct", "0", "0"),
+        ] {
+            assert_eq!(config_set_argv(k, raw).unwrap(), v(&["config", "--set", k, out]), "{k}={raw}");
+            assert_eq!(config_unset_argv(k).unwrap(), v(&["config", &format!("--unset={k}")]));
+        }
+        for (k, bad) in [("routing_slow_read_pct", "-1"), ("routing_slow_read_pct", "1e2"), ("routing_slow_read_pct", "NaN"),
+                         ("routing_slow_read_pct", "inf"), ("routing_slow_read_pct", "1.2.3"), ("routing_slow_read_pct", "."),
+                         ("routing_slow_read_pct", "101"), ("routing_slow_read_pct", "--x"),
+                         ("routing_runner_tail_bytes", "-5"), ("routing_poll_interval", "10s")] {
+            assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
+        }
+    }
+
+    #[test]
+    fn the_routing_table_file_is_offered_as_a_full_path() {
+        // Fix round 2, R2-1: Settings -> Routing chooses and clears the table file.
+        assert_eq!(
+            config_set_argv("routing_table", " ~/notes/ROUTING-NOW.md ").unwrap(),
+            v(&["config", "--set", "routing_table", "~/notes/ROUTING-NOW.md"])
+        );
+        assert_eq!(
+            config_set_argv("routing_table", "/notes/routing/ROUTING-NOW.md").unwrap(),
+            v(&["config", "--set", "routing_table", "/notes/routing/ROUTING-NOW.md"])
+        );
+        assert_eq!(config_unset_argv("routing_table").unwrap(), v(&["config", "--unset=routing_table"]));
+        let long = format!("/{}", "a".repeat(1024));
+        for bad in ["", "   ", "notes/ROUTING-NOW.md", "~notes", "-x", "--from-app", "/a\n--x", "/a\rb", long.as_str()] {
+            assert!(config_set_argv("routing_table", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_owners_words_are_not_cut_at_a_fixed_length() {
+        // Fix round 2, R2-4: a note, a rule or a hold longer than the old
+        // 4,000 characters reaches the CLI, which applies the owner's own
+        // routing_hold_chars (0: no limit). Only an argument too big to hand
+        // over is refused.
+        let long = "word ".repeat(2000);
+        assert!(long.trim().chars().count() > 4000);
+        assert_eq!(route_note_set_argv(&long).unwrap().last().unwrap(), long.trim());
+        assert_eq!(route_rule_argv("add", None, Some(&long)).unwrap().last().unwrap(), long.trim());
+        assert_eq!(route_rule_argv("edit", Some(2), Some(&long)).unwrap().last().unwrap(), long.trim());
+        assert_eq!(
+            route_hold_add_argv(&long, "other", "all", None, None).unwrap().last().unwrap(),
+            long.trim()
+        );
+        let at_most = "x".repeat(ROUTE_WORDS_MAX_BYTES);
+        assert!(route_note_set_argv(&at_most).is_ok());
+        let err = route_hold_add_argv(&format!("{at_most}x"), "other", "all", None, None).unwrap_err();
+        assert!(err.contains("128 KB"), "{err}");
+    }
+
+    #[test]
+    fn the_routing_view_is_one_fixed_read_only_argv() {
+        assert_eq!(fixed_argv(ROUTE_VIEW_ARGV), v(&["route", "--json"]));
+        // No write verb, no owner flag, no --since or account the webview could steer.
+        for word in ["report", "hold", "pause", "lift", "clear", "note", "rule", "wait", "sources",
+                     "--from-app", "--owner", "--since", "--summary", "--brief"] {
+            assert!(!ROUTE_VIEW_ARGV.contains(&word), "`{word}` must not be in the routing read");
+        }
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"route"));
     }
 
     #[test]

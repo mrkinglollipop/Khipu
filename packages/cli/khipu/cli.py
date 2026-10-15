@@ -4562,8 +4562,8 @@ def build_parser() -> argparse.ArgumentParser:
                             "not when its limit's time has merely passed")
     rwait.add_argument("--timeout", default=None, metavar="S",
                        help="Give up after S seconds (or 30m, 2h; 0 checks once); default: no end")
-    rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire or confirm a standing rule", parents=[rt_json])
-    rrule.add_argument("action", choices=("add", "edit", "retire", "confirm"))
+    rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire, restore or confirm a standing rule", parents=[rt_json])
+    rrule.add_argument("action", choices=("add", "edit", "retire", "restore", "confirm"))
     rrule.add_argument("params", nargs="*")
     rrule.add_argument("--source", default=None, help="Where the rule comes from (rule add)")
     rrule.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)

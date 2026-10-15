@@ -537,6 +537,32 @@ def test_doctor_checks_watched_rules_against_runner_settings_and_never_passes_wh
     assert not any(c["status"] not in ("broken", "cannot_check") for c in block["rule_checks"])
 
 
+def test_route_json_carries_what_the_app_card_needs(home, capsys):
+    """Phase 4: `khipu route --json` (the app's fixed-argv read) carries each
+    watched rule's check with the time Khipu read the file it was judged on,
+    the times the app words its warnings by, and each author in words; and
+    still no fold internals."""
+    _register(home)
+    routing.add_rule("Never a -fast tier.", via="app")
+    config = json.loads((home["a"] / "config.json").read_text())
+    config["lanes"]["codex"]["model"] = "gpt-6.1-sol-fast"
+    (home["a"] / "config.json").write_text(json.dumps(config))
+    conversation = {"kind": "conversation", "harness": "claude_code", "project": "project-b"}
+    routing.report(account="Muse", state="limited", until="1h", author=conversation)
+    routing.add_hold("keep it free", reason="keep", scope="account", account="Muse", author=conversation)
+    assert routing.run_cli(_args(json=True)) == 0
+    out = json.loads(capsys.readouterr().out)
+    broken = [c for c in out["rule_checks"] if c["status"] == "broken"]
+    assert [c["text"] for c in broken] == [
+        "A standing rule may be broken: project A's settings name a model ending in -fast for its codex lane."]
+    assert broken[0]["rule"] == 1 and broken[0]["at"] == routing._iso(T0)
+    assert out["warn_after"] == {"disagreement": 30 * 60, "not_refreshed": 5 * 60}
+    muse = next(a for a in out["accounts"] if a["label"] == "Muse")
+    assert muse["witness"]["by"] == "a Claude Code conversation in project-b"
+    assert out["holds"][0]["by"] == "a Claude Code conversation in project-b"
+    assert not {"fingerprint", "digest", "source_cache"} & set(out)
+
+
 def test_a_launch_while_paused_is_named(home):
     _register(home)
     routing.pause("Claude", via="app")
@@ -1158,3 +1184,71 @@ def test_a_window_with_no_number_neither_crashes_nor_miscounts_the_accounts(home
     routing.read_view()
     _, status = routing_sources.usage_evidence()
     assert status["accounts"] == 2
+
+
+def test_a_broken_rule_keeps_the_time_khipu_first_saw_it(home, capsys):
+    """Fix round 1 (F4): a check judged on a runner's settings is dated by
+    when Khipu first read the file as it reads now, not by the latest
+    refresh; a changed file is a new sighting. Each check names its runner
+    and file so the app can say "in its settings file"."""
+    _register(home)
+    routing.add_rule("Never a -fast tier.", via="app")
+    config = json.loads((home["a"] / "config.json").read_text())
+    config["lanes"]["codex"]["model"] = "gpt-6.1-sol-fast"
+    (home["a"] / "config.json").write_text(json.dumps(config))
+
+    def broken() -> dict:
+        assert routing.run_cli(_args(json=True)) == 0
+        out = json.loads(capsys.readouterr().out)
+        found = [c for c in out["rule_checks"] if c["status"] == "broken"]
+        assert len(found) == 1
+        return found[0]
+
+    first = broken()
+    assert first["at"] == routing._iso(T0)
+    assert first["runner"] == "project A" and first["file"] == "settings"
+    # The runner keeps running: its heartbeat moves, the settings don't.
+    for minutes in (20, 40):
+        home["clock"].now = T0 + timedelta(minutes=minutes)
+        _beat(home["a"], home["clock"].now)
+        assert broken()["at"] == routing._iso(T0)
+    # The settings change (still broken): Khipu saw this version later.
+    config["lanes"]["codex"]["model"] = "gpt-6.1-astra-fast"
+    (home["a"] / "config.json").write_text(json.dumps(config))
+    home["clock"].now = T0 + timedelta(minutes=50)
+    _beat(home["a"], home["clock"].now)
+    assert broken()["at"] == routing._iso(T0 + timedelta(minutes=50))
+
+
+def test_the_owner_can_dismiss_a_runners_side_of_a_disagreement(home):
+    # F6 (fix round 1): Dismiss works on either side of a disagreement, the
+    # job runner's limit included (its line is read from the runner's files,
+    # never written to the record).
+    _register(home)
+    home["clock"].advance(minutes=1)
+    routing.report(state="open", account="Claude second",
+                   author={"kind": "conversation", "harness": "claude_code", "project": "project-b", "session": "s"})
+    second = _account(routing.read_view(), SECOND)
+    assert second["state"] == "limited" and second["witness"]["source"] == "runner"
+    assert second["disagreement"]["source"] == "report"
+    runner_id = second["witness"]["id"]
+    home["clock"].advance(minutes=1)
+    out = routing.clear("Claude second", report_id=runner_id, via="app")
+    assert out["account"] == SECOND
+    second = _account(routing.read_view(), SECOND)
+    assert second["state"] == "open" and second["witness"]["source"] == "report"
+    assert routing.doctor_block()["outside_app"] == []
+    # An id that is no report about the account is still refused.
+    with pytest.raises(routing.RouteError):
+        routing.clear("Claude second", report_id="r-nothing", via="app")
+
+
+def test_the_table_says_why_it_cannot_be_read_in_a_fixed_phrase(tmp_path):
+    """A folder named as the routing table reads "a folder, not a file", so
+    the app can say so; a missing file and a file with no NOW block keep
+    their own phrases (final fix round, S2)."""
+    (tmp_path / "dir").mkdir()
+    (tmp_path / "plain.md").write_text("no block here\n")
+    assert routing_sources.read_table(str(tmp_path / "dir"))["error"] == "a folder, not a file"
+    assert routing_sources.read_table(str(tmp_path / "nope.md"))["error"] == "missing"
+    assert routing_sources.read_table(str(tmp_path / "plain.md"))["error"] == "no NOW block"

@@ -772,6 +772,54 @@ def test_an_open_report_against_a_models_own_limit_is_a_disagreement(home):
     assert _account(routing.read_view(), "claude|")["models"][0]["disagreement"] is None
 
 
+def test_recent_changes_name_the_report_that_made_each_change(home, capsys):
+    # Codex review, finding 4: a newer conversation's report that changes
+    # only the disagreement, or only a model's limit, is the change's
+    # author, never the older report the account shows or nobody.
+    _report(account="Claude second", state="limited", message="resets at 2026-10-14T18:52:00Z")
+    home["clock"].advance(minutes=10)
+    _report(account="Claude second", state="open", author=OTHER)
+    _report(account="Claude", state="open")
+    home["clock"].advance(minutes=5)
+    _report(account="Claude", state="limited", model="Opus", window="weekly", author=OTHER,
+            message="Opus weekly limit reached, resets at 2026-10-16T09:00:00Z")
+    home["clock"].advance(minutes=5)
+    _report(account="Claude", model="Opus", state="open")
+    rc, out = _cli(["route", "--json"], capsys)
+    items = [i for c in json.loads(out)["changes"] for i in c["items"]]
+
+    def changes(key: str) -> list[dict]:
+        return [i for i in items if i["entity"] == f"account:{key}"]
+
+    disagreed = changes(SECOND)[-1]
+    assert disagreed["now"]["disagreement"] == ["open", "report"]
+    assert disagreed["by"].startswith("a Codex conversation in project-b"), disagreed
+    opus, opus_disputed = changes("claude|")[-2:]
+    assert opus["now"]["state"] == "open" and opus["now"]["models"][0][0] == "Opus"
+    assert opus["by"].startswith("a Codex conversation in project-b"), opus
+    assert opus_disputed["now"]["models"][0][3] == ["open", "report"]
+    assert opus_disputed["by"].startswith("a Claude Code conversation in project-a"), opus_disputed
+
+
+def test_a_report_that_settles_a_model_disagreement_is_named_for_it(home, capsys):
+    # Codex re-check of finding 4: a newer report that ended a model's
+    # disagreement without changing its limit was credited to the
+    # unrelated report that opened the account.
+    _report(account="Claude", state="open")
+    home["clock"].advance(minutes=5)
+    msg = "Opus weekly limit reached, resets at 2026-10-16T09:00:00Z"
+    _report(account="Claude", state="limited", model="Opus", window="weekly", author=OTHER, message=msg)
+    home["clock"].advance(minutes=5)
+    _report(account="Claude", model="Opus", state="open")
+    home["clock"].advance(minutes=5)
+    _report(account="Claude", state="limited", model="Opus", window="weekly", author=OTHER, message=msg)
+    rc, out = _cli(["route", "--json"], capsys)
+    items = [i for c in json.loads(out)["changes"] for i in c["items"] if i["entity"] == "account:claude|"]
+    settled = items[-1]
+    assert len(settled["now"]["models"][0]) < 4 or settled["now"]["models"][0][3] is None, settled
+    assert settled["by"].startswith("a Codex conversation in project-b"), settled
+
+
 def test_a_quiet_read_is_not_called_unrefreshed(home):
     _report(account="Codex", state="open")
     home["clock"].advance(minutes=10)
@@ -1525,3 +1573,203 @@ def test_a_run_written_ahead_gives_way_once_more_lines_say_otherwise():
     fixed, behind, ahead = routing._write_order_times([T0, T0 + timedelta(minutes=1), low, None])
     assert fixed == [T0, T0 + timedelta(minutes=1), T0 + timedelta(minutes=1), None]
     assert (behind, ahead) == ([low], [])
+
+
+def test_a_stale_clear_is_named_as_the_owners_clear_not_a_sighting(home, capsys):
+    """Fix round 1 (F5): when an owner Clear goes out of date, the last word
+    on the account was his Clear; nobody saw it open. The fold, the line and
+    `khipu route --json` say so."""
+    _report(account="Codex", state="limited")
+    home["clock"].advance(minutes=1)
+    routing.clear("Codex", via="app")
+    home["clock"].advance(hours=13)
+    entry = _account(routing.read_view(), "codex|")
+    assert entry["state"] == "unknown"
+    assert entry["last_seen"]["source"] == "owner" and entry["last_seen"]["cleared"] is True
+    line = routing.account_line(entry, home["clock"].now)
+    assert "unknown: last cleared by you" in line and "last seen open" not in line
+    _rc, text = _cli(["route", "--json"], capsys)
+    codex = next(a for a in json.loads(text)["accounts"] if a["label"] == "Codex")
+    assert codex["last_seen"]["cleared"] is True and codex["last_seen"]["by"] == "you"
+    # A sighting that was not a Clear stays a sighting.
+    _report(account="Muse", state="open")
+    home["clock"].advance(hours=13)
+    muse = _account(routing.read_view(), "muse|")
+    assert muse["state"] == "unknown" and muse["last_seen"]["cleared"] is False
+
+
+def test_a_limit_reported_without_a_time_is_marked_so(home, capsys):
+    """Fix round 1 (F7): a conversation's limit report that names no time
+    lasts the default; the witness says so and `khipu route --json` carries
+    the default, so the card can say "without a time" and for how long."""
+    _report(account="Codex", state="limited")
+    _report(account="Muse", state="limited", until="1h")
+    _rc, text = _cli(["route", "--json"], capsys)
+    out = json.loads(text)
+    by_label = {a["label"]: a for a in out["accounts"]}
+    assert by_label["Codex"]["witness"]["until_default"] is True
+    assert by_label["Muse"]["witness"]["until_default"] is False
+    assert out["report_default_limit"] == 30 * 60
+    # A line with no time (an older or hand-written one) is read the same way.
+    assert _state([_ev(0, "limited", T0)], T0 + timedelta(minutes=1))["witness"]["until_default"] is True
+    timed = _state([_ev(0, "limited", T0, until=T0 + timedelta(hours=1))], T0 + timedelta(minutes=1))
+    assert timed["witness"]["until_default"] is False
+
+
+# ---- Settings -> Routing (phase 4, second half) -------------------------------------------
+
+
+def test_a_removed_rule_comes_back_whole_with_restore(home, capsys):
+    rc, out = _cli(["route", "rule", "add", "--from-app", "--", "Never a -fast tier."], capsys)
+    assert rc == 0 and json.loads(out)["n"] == 1
+    _cli(["route", "rule", "confirm", "--from-app", "--", "1"], capsys)
+    rc, _out = _cli(["route", "rule", "retire", "--from-app", "--", "1"], capsys)
+    assert rc == 0 and routing.read_view()["rules"] == []
+    rc, out = _cli(["route", "rule", "restore", "--from-app", "--", "1"], capsys)
+    assert rc == 0 and json.loads(out)["n"] == 1
+    (rule,) = routing.read_view()["rules"]
+    assert (rule["n"], rule["text"], rule["confirmed"], rule["via"]) == (1, "Never a -fast tier.", True, "app")
+    # A rule in effect, or one that never was, can't be restored.
+    rc, out = _cli(["route", "rule", "restore", "--from-app", "--", "1"], capsys)
+    assert rc == 2 and "in effect" in json.loads(out)["error"]
+    rc, out = _cli(["route", "rule", "restore", "--from-app", "--", "9"], capsys)
+    assert rc == 2 and "no standing rule 9" in json.loads(out)["error"]
+    assert routing.doctor_block()["outside_app"] == []
+
+
+def test_the_apps_argv_keeps_a_dash_value_as_words_never_a_flag(home, capsys):
+    # The app puts every value after "--": a value that looks like a flag
+    # stays the owner's words.
+    _cli(["route", "rule", "add", "--from-app", "--", "-fast is never used"], capsys)
+    _cli(["route", "rule", "edit", "--from-app", "--", "1", "--from-app"], capsys)
+    _cli(["route", "note", "set", "--from-app", "--", "--owner"], capsys)
+    _cli(["route", "hold", "--reason", "other", "--all", "--from-app", "--", "-x keep it"], capsys)
+    view = routing.read_view()
+    assert view["rules"][0]["text"] == "--from-app"
+    assert view["note"]["text"] == "--owner"
+    assert view["holds"][0]["text"] == "-x keep it" and view["holds"][0]["owner"] is True
+
+
+def test_the_apps_view_marks_watched_rules_old_switches_and_who_changed_what(home, capsys, monkeypatch):
+    _cli(["route", "rule", "add", "--from-app", "--", "Never a -fast tier."], capsys)
+    _cli(["route", "rule", "add", "--from-app", "--", "Be kind to the Mac."], capsys)
+    _report(account="Codex", state="limited", until="1h")
+    _cli(["route", "rule", "retire", "--from-app", "--", "2"], capsys)
+    monkeypatch.setenv("ROUTING_NOW_OFF", "1")
+    rc, out = _cli(["route", "--json"], capsys)
+    data = json.loads(out)
+    assert [r["n"] for r in data["rules"]] == [1] and data["watched_rules"] == [1]
+    assert data["old_switches"]["env"] is True and isinstance(data["old_switches"]["file"], bool)
+    items = [i for c in data["changes"] for i in c["items"]]
+    codex = [i for i in items if i["entity"] == "account:codex|"][-1]
+    assert codex["now"]["state"] == "limited" and codex["source"] == "report"
+    assert codex["by"].startswith("a Claude Code conversation in project-a")
+    gone = next(i for i in items if i["entity"] == "rule:2" and i["now"] is None)
+    assert gone["was"]["text"] == "Be kind to the Mac." and gone["n"] == 2 and gone["by"] == "you"
+    monkeypatch.delenv("ROUTING_NOW_OFF")
+    rc, out = _cli(["route", "--json"], capsys)
+    assert json.loads(out)["old_switches"]["env"] is False
+
+
+def test_recent_changes_name_the_owner_in_settings_for_every_change_made_in_the_app(home, capsys):
+    # F1 (fix round 1): each change item takes its author and its "via" from
+    # the event that caused it, never from the state after the change. A
+    # pause, a lift, a removed rule, an ended note and an ended hold made in
+    # the app all read "you, in Settings".
+    clock = home["clock"]
+    _cli(["route", "rule", "add", "--from-app", "--", "Never a -fast tier."], capsys)
+    _cli(["route", "rule", "add", "--from-app", "--", "Be kind to the Mac."], capsys)
+    _cli(["route", "note", "set", "--from-app", "--", "Codex first"], capsys)
+    _cli(["route", "hold", "--from-app", "--reason=other", "--machine", "--", "keep it"], capsys)
+    hold_id = routing.read_view()["holds"][0]["id"]
+    clock.advance(minutes=1)
+    _cli(["route", "pause", "--from-app", "--until=2h", "--", "Codex"], capsys)
+    _cli(["route", "pause", "--from-app", "--", "Muse"], capsys)
+    clock.advance(minutes=1)
+    _cli(["route", "lift", "--from-app", "--", "Muse"], capsys)
+    _cli(["route", "rule", "retire", "--from-app", "--", "2"], capsys)
+    _cli(["route", "hold", "--from-app", "--", "end", hold_id], capsys)
+    _cli(["route", "note", "end", "--from-app"], capsys)
+    rc, out = _cli(["route", "--json"], capsys)
+    data = json.loads(out)
+    assert data["outside_app"] == []
+    items = [i for c in data["changes"] for i in c["items"]]
+
+    def last(entity: str, ended: bool = False) -> dict:
+        return [i for i in items if i["entity"] == entity and (i["now"] is None) == ended][-1]
+
+    paused = last("account:codex|")
+    assert paused["now"]["state"] == "paused"
+    lifted = last("account:muse|")
+    assert lifted["was"]["state"] == "paused" and lifted["now"]["state"] != "paused"
+    for item in (paused, lifted, last("rule:2", ended=True), last("note", ended=True),
+                 last(f"hold:{hold_id}", ended=True)):
+        assert (item["via"], item["by"]) == ("app", "you"), item
+    # A change the clock made (the pause running out) is Khipu's, not the owner's.
+    clock.advance(hours=3)
+    rc, out = _cli(["route", "--json"], capsys)
+    items = [i for c in json.loads(out)["changes"] for i in c["items"]]
+    ran_out = [i for i in items if i["entity"] == "account:codex|"][-1]
+    assert ran_out["was"]["state"] == "paused" and ran_out["by"] is None and ran_out["via"] is None
+
+
+# Settings whose phase has not shipped its part of the app yet, and the one
+# setting that is not an option at all. Each leaves this list in the PR that
+# builds it, so the test below then asks for its control.
+NOT_IN_THE_APP_YET = {
+    # Phase 5: the check at reset times.
+    "routing_reset_check", "routing_reset_check_wait", "routing_reset_check_retries",
+    "routing_busy_load", "routing_busy_wait", "routing_busy_tries",
+    # Phase 6: the push before handing work to another agent.
+    "routing_push_delegation",
+    # Phase 7: the copy for cloud agents.
+    "routing_cloud_copy", "routing_cloud_copy_hold_words", "routing_cloud_copy_rules",
+    "routing_cloud_copy_stale_after", "routing_cloud_copy_debounce",
+    # Read once, by phase 1a's import of the standing rules, and never again
+    # after it ran: a control for it would do nothing.
+    "routing_rules_seed",
+}
+
+
+def test_every_routing_setting_is_in_the_app():
+    # Codex review, finding 6: every option is visible and usable on
+    # Settings -> Routing and every limit can be lifted there. The app's
+    # allowlist (lib.rs) and the page are compared with the CLI's whole
+    # list, so a setting added later can't be missed.
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    lib = (root / "apps/desktop/src-tauri/src/lib.rs").read_text(encoding="utf-8")
+    page = (root / "apps/desktop/src/RoutingSettings.tsx").read_text(encoding="utf-8")
+    allowed = set(re.findall(r'"(routing_[a-z_]+)"', lib[lib.index("const ROUTING_DURATION_KEYS"):
+                                                         lib.index("const ROUTING_SOURCES_MAX")]))
+    shown = set(re.findall(r'"(routing_[a-z_]+)"', page))
+    everything = set(routing.SETTINGS)
+    assert NOT_IN_THE_APP_YET <= everything
+    wanted = everything - NOT_IN_THE_APP_YET
+    assert sorted(wanted - allowed) == [], "settings the app can't change"
+    assert sorted(wanted - shown) == [], "settings Settings -> Routing doesn't show"
+    assert sorted((allowed | shown) & NOT_IN_THE_APP_YET) == [], "in the app: take it off NOT_IN_THE_APP_YET"
+    assert sorted(allowed - everything) == [], "the app allows a setting the CLI doesn't have"
+
+
+def test_every_limit_a_refusal_names_can_be_raised_in_the_app():
+    # F3 (fix round 1): a refusal that tells the owner which setting raises a
+    # limit names one the app offers: in the app's allowlist (lib.rs) and on
+    # Settings -> Routing. Every limit on the owner's own words is one.
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    source = Path(routing.__file__).read_text(encoding="utf-8")
+    named = set(re.findall(r"(routing_[a-z_]+) raises", source))
+    named |= {"routing_hold_chars", "routing_line_chars"}
+    lib = (root / "apps/desktop/src-tauri/src/lib.rs").read_text(encoding="utf-8")
+    page = (root / "apps/desktop/src/RoutingSettings.tsx").read_text(encoding="utf-8")
+    allowed = set(re.findall(r'"(routing_[a-z_]+)"', lib[lib.index("const ROUTING_DURATION_KEYS"):
+                                                         lib.index("const ROUTING_SWITCH_KEYS")]))
+    for key in sorted(named):
+        assert key in routing.SETTINGS, key
+        assert key in allowed, f"{key} is not in the app's allowlist"
+        assert f'key: "{key}"' in page, f"{key} has no row on Settings -> Routing"

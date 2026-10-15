@@ -27,6 +27,8 @@ import {
   unreadAccounts,
 } from "./PlansCard";
 import type { UsageReport } from "./PlansCard";
+import { brokenChecks, lastChangeWords, quietRunners, runnerWords } from "./routing";
+import type { RouteView } from "./routing";
 
 export type HealthRowStatus = "ok" | "err" | "skipped";
 
@@ -74,6 +76,8 @@ const LABELS: Record<string, string> = {
   degraded_rate_ok: "Search rarely falls back to keyword-only",
   // Not a doctor field: read from `khipu usage --json` (plansHealthRow).
   plans: "Plans",
+  // Not a doctor field: read from `khipu route --json` (routingHealthRow).
+  routing: "Routing",
 };
 
 const ORDER = Object.keys(LABELS);
@@ -187,6 +191,29 @@ export function plansHealthRow(plans: UsageReport | null | undefined, now: Date 
   };
 }
 
+/** The "Routing" row, from `khipu_route_view` (routing truth phase 4): the
+ *  last change, any standing rule that may be broken and any job runner that
+ *  stopped reporting or can't be read. Red only for those two; it never
+ *  blocks anything. Grey with no routing record on this Mac; no row until
+ *  the record has been read. */
+export function routingHealthRow(view: RouteView | null | undefined, now: Date = new Date()): HealthRow | null {
+  if (!view || !Array.isArray(view.accounts)) return null;
+  if (!view.record) return { key: "routing", status: "skipped", label: LABELS.routing };
+  const runners = quietRunners(view).map((r) => runnerWords(r, now));
+  const broken = brokenChecks(view).map((c) => (/[.!?]$/.test(c.text) ? c.text : `${c.text}.`));
+  const parts = [...runners];
+  const last = lastChangeWords(view, now);
+  if (last) parts.push(last);
+  parts.push(...broken);
+  if (!broken.length && (view.rules ?? []).length) parts.push("No standing rule looks broken.");
+  return {
+    key: "routing",
+    status: runners.length || broken.length ? "err" : "ok",
+    label: LABELS.routing,
+    detail: parts.join(" ") || "Nothing has changed yet.",
+  };
+}
+
 function sentenceCase(s: string): string {
   const t = s.trim();
   return t ? `${t.charAt(0).toUpperCase()}${t.slice(1)}${/[.!?]$/.test(t) ? "" : "."}` : t;
@@ -196,7 +223,11 @@ function sentenceCase(s: string): string {
  *  green, red, or (if `not_configured` names its check) grey "not set up".
  *  Sorted red first, then not-set-up, then green; stable within each group
  *  in the order above, unknown keys last in their group. */
-export function healthRows(parsed: Record<string, unknown>, plans?: UsageReport | null): HealthRow[] {
+export function healthRows(
+  parsed: Record<string, unknown>,
+  plans?: UsageReport | null,
+  routing?: RouteView | null,
+): HealthRow[] {
   const notConfiguredRaw = (parsed as { not_configured?: unknown })
     .not_configured;
   const notConfigured = Array.isArray(notConfiguredRaw)
@@ -218,6 +249,8 @@ export function healthRows(parsed: Record<string, unknown>, plans?: UsageReport 
   });
   const plansRow = plansHealthRow(plans);
   if (plansRow) rows.push(plansRow);
+  const routingRow = routingHealthRow(routing);
+  if (routingRow) rows.push(routingRow);
 
   const statusRank: Record<HealthRowStatus, number> = {
     err: 0,
@@ -275,6 +308,7 @@ export function HealthReportRows({
   parsed,
   attention,
   plans,
+  routing,
   onFixAction,
   busy,
 }: {
@@ -282,6 +316,8 @@ export function HealthReportRows({
   attention: Attention[];
   /** `khipu usage --json`, for the Plans row; no row until it is read. */
   plans?: UsageReport | null;
+  /** `khipu route --json`, for the Routing row; no row until it is read. */
+  routing?: RouteView | null;
   /** Fired when a row's fix button is pressed; the caller owns what each
    *  `fix.kind` actually does (reinstall hook / run probe / open revisions —
    *  see the Home attention callouts in App.tsx). Optional so this component
@@ -289,7 +325,7 @@ export function HealthReportRows({
   onFixAction?: (fix: NonNullable<Attention["fix"]>, harness?: string) => void;
   busy?: boolean;
 }) {
-  const rows = healthRows(parsed, plans);
+  const rows = healthRows(parsed, plans, routing);
   return (
     <div className="rows">
       {rows.map((row) => {
@@ -324,7 +360,9 @@ export function HealthReportRows({
         const single = matches.length === 1 ? matches[0] : undefined;
         // The Plans attention cause already names every window at 90%; with
         // none (nothing could be read) the row's own detail says why.
-        const text =
+        // The Routing row says what it saw itself: its attention items are
+        // the longer form of the same facts.
+        const text = row.key === "routing" ? (row.detail ?? sentence) :
           row.key === "plans"
             ? [matches.length ? sentence : sentenceCase(row.detail ?? sentence), row.note ? sentenceCase(row.note) : ""]
                 .filter(Boolean)
@@ -341,7 +379,7 @@ export function HealthReportRows({
               className="err"
             />
             <span className="row-main">{row.label}</span>
-            <span className="row-meta">{text}</span>
+            <span className={row.key === "routing" ? "row-meta wrap" : "row-meta"}>{text}</span>
             {single?.fix ? (
               <button
                 type="button"
