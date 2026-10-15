@@ -471,12 +471,17 @@ class _Cursor(_Cursor):
 
 class TopicDetailCapaTest(unittest.TestCase):
     def test_topic_body_query_and_response_are_utf8_bounded(self):
-        cur = _Cursor(("t", "T", "ééé", "active", None, None, [], "/t.md"))
-        with mock.patch.object(activity, "TOPIC_DETAIL_BODY_BYTES", 5), \
-                mock.patch.object(activity, "connect", return_value=_Conn(cur)):
-            out = activity.topic_detail("t")
+        # The database hands back at most max_bytes + 4 bytes from the offset;
+        # the page ends on a character boundary and says where the next starts.
+        raw = "ééé".encode("utf-8")
+        cur = _Cursor(("t", "T", raw[:9], len(raw), "active", None, None, [], "/t.md", None))
+        with mock.patch.object(activity, "connect", return_value=_Conn(cur)):
+            out = activity.topic_detail("t", max_bytes=5)
         self.assertEqual(out["body"], "éé")
-        self.assertTrue(out["body_truncated"])
-        self.assertIn("LEFT(body", cur.statements[0])
-        self.assertEqual(cur.params[0], (6, "t"))
+        self.assertEqual((out["body_offset"], out["body_next_offset"]), (0, 4))
+        self.assertEqual((out["body_total_bytes"], out["complete"]), (6, False))
+        self.assertNotIn("body_truncated", out)
+        self.assertIn("convert_to(t.body, 'UTF8')", cur.statements[0])
+        self.assertNotIn("LEFT(body", cur.statements[0])
+        self.assertEqual(cur.params[0], (1, 9, "t"))
 

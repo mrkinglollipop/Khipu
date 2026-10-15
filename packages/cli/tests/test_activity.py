@@ -92,12 +92,14 @@ class TopicDetailTest(unittest.TestCase):
 
     def test_detail_shape(self):
         created = dt.datetime(2026, 8, 17, 12, 0)
-        row = ("khipu", "Khipu", "body text", "active", created, created, [], "/x.md")
+        row = ("khipu", "Khipu", b"body text", 9, "active", created, created, [], "/x.md", "h1")
         cur = FakeCursor([[row]])
         with mock.patch.object(activity, "connect", return_value=FakeConn(cur)):
             out = activity.topic_detail("khipu")
-        self.assertEqual(out["slug"], "khipu")
+        self.assertEqual((out["id"], out["slug"]), ("khipu", "khipu"))
         self.assertEqual(out["body"], "body text")
+        self.assertEqual(out["content_hash"], "h1")
+        self.assertTrue(out["complete"])
         self.assertEqual(out["created_at"], "2026-08-17T12:00:00")
 
 
