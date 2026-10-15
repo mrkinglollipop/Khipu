@@ -29,7 +29,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from khipu.lines import split_lines
+from khipu.lines import run_text, split_lines
 
 # Same contract as the legacy extractor so episodes look the same downstream.
 PROMPT = """You are extracting durable memory from an assistant/coding session.
@@ -515,9 +515,8 @@ def _generate_codex_cli(prompt: str, *, model_id: str, timeout: int = 60, retrie
                         # 2026-10-13); the login is not part of that config.
                         "--ignore-user-config",
                         "-c", f"model_reasoning_effort={_codex_cli_effort()}", "-"]
-                result = subprocess.run(argv, input=prompt, text=True, encoding="utf-8",
-                                        errors="replace", capture_output=True, cwd=cwd, env=env,
-                                        timeout=timeout, check=False)
+                result = run_text(argv, input=prompt, cwd=cwd, env=env, timeout=timeout,
+                                  check=False)
                 usage = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
                 error = ""
                 for line in split_lines(result.stdout):

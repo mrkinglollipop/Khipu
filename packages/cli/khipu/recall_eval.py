@@ -58,7 +58,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from khipu.lines import read_lines, split_lines
+from khipu.lines import split_lines
 
 DEFAULT_K = 3
 
@@ -576,7 +576,9 @@ def load_replay_entries(
     """
     seen: set[str] = set()
     entries: list[dict[str, Any]] = []
-    for raw in read_lines(log_path):
+    # Strict: the queries are replayed and compared, and replacing bad bytes
+    # can merge two of them.
+    for raw in split_lines(log_path.read_text(encoding="utf-8")):
         raw = raw.strip()
         if not raw:
             continue

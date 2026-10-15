@@ -14,6 +14,7 @@ import json
 import os
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 import zlib
@@ -338,6 +339,59 @@ class ReaderTest(unittest.TestCase):
         with mock.patch.object(promote, "_run", side_effect=run):
             out = promote._recall_once(self.dir / "hook", {"prompt": "p"}, "s")
         self.assertEqual(out["reason"], f"ok{LS}x")
+
+
+
+class DecodingPolicyTest(unittest.TestCase):
+    """Replacement decoding only where losing a byte is harmless. Text Khipu
+    acts on or compares is decoded strictly, and stdin to a child is always
+    encoded strictly, whatever its output decoding is."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_replay_log_with_corrupt_query_bytes_is_refused(self):
+        # Replacing both bytes made the two queries one, silently changing
+        # the evaluation workload.
+        from khipu import recall_eval
+
+        log = self.dir / "query_log.jsonl"
+        log.write_bytes(b'{"query": "find caf\xff"}\n{"query": "find caf\xfe"}\n')
+        with self.assertRaises(UnicodeDecodeError):
+            recall_eval.load_replay_entries(log)
+
+    def test_run_text_encodes_stdin_strictly_and_decodes_output_with_replacement(self):
+        from khipu import lines
+
+        with self.assertRaises(UnicodeEncodeError):
+            lines.run_text([sys.executable, "-c", "pass"], input="caf\ud800")
+        echo = "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read() + b'\\xff')"
+        r = lines.run_text([sys.executable, "-c", echo], input="café", timeout=30)
+        self.assertEqual(r.stdout, "café�")
+
+    def test_codex_cli_prompt_with_a_lone_surrogate_never_reaches_the_child(self):
+        from khipu import extract, synth_cli
+
+        seen = self.dir / "stdin.bin"
+        cli = self.dir / "codex"
+        cli.write_text(
+            f"#!{sys.executable}\n"
+            "import json, pathlib, sys\n"
+            f"pathlib.Path({str(seen)!r}).write_bytes(sys.stdin.buffer.read())\n"
+            "pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_text('answer')\n"
+            "print(json.dumps({'type': 'turn.completed', 'usage': {}}))\n", encoding="utf-8")
+        cli.chmod(0o755)
+        with mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(self.dir / "kh")}), \
+                mock.patch.object(synth_cli, "binary", lambda name: str(cli)), \
+                mock.patch.object(extract.time, "sleep", lambda s: None), \
+                self.assertRaisesRegex(RuntimeError, "UnicodeEncodeError"):
+            extract._generate_codex_cli(json.loads('"caf\\ud800"'), model_id="m", timeout=30,
+                                        retries=0, caller="fixture")
+        self.assertFalse(seen.exists(), seen.read_bytes() if seen.exists() else b"")
 
 
 if __name__ == "__main__":
