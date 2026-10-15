@@ -86,12 +86,15 @@ CREATE INDEX IF NOT EXISTS idx_ledger_history_op
 
 -- One row per write that landed, keyed by the caller's op id: a retried write
 -- (a timeout, an outbox drain after a crash) finds its op here and returns
--- the first result instead of writing twice.
+-- the first result instead of writing twice. ``digest`` is the write itself
+-- (verb, row, fields, note, condition): the same op id with another digest is
+-- a different write and is refused.
 CREATE TABLE IF NOT EXISTS ledger_ops (
     op_id       TEXT PRIMARY KEY,
     project     TEXT NOT NULL,
     row_id      TEXT NOT NULL,
     verb        TEXT NOT NULL,
+    digest      TEXT NOT NULL DEFAULT '',
     result      JSONB NOT NULL DEFAULT '{}'::jsonb,
     at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );

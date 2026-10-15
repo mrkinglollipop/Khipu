@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -361,6 +362,25 @@ def new_op(verb: str, project: str, row_id: str, *, fields: dict | None = None, 
     }
 
 
+_DIGEST_KEYS = ("verb", "project", "row_id", "fields", "note", "if_state", "children")
+
+
+def op_digest(op: dict[str, Any]) -> str:
+    """The write itself, without when or by whom it was made: an op id stands
+    for exactly one digest, forever. Taken once, before the offline check
+    rewrites any word, and carried with the op from then on."""
+    if not op.get("digest"):
+        canonical = json.dumps({k: op.get(k) for k in _DIGEST_KEYS}, sort_keys=True, separators=(",", ":"),
+                               default=str)
+        op["digest"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return op["digest"]
+
+
+def _reused_error(op: dict[str, Any]) -> LedgerError:
+    return LedgerError(f"op id {op['op_id']} was already used for a different write; nothing was changed",
+                       "op_id_reused")
+
+
 # ---- the hub ------------------------------------------------------------------
 
 
@@ -670,20 +690,21 @@ def apply_op(conn, op: dict[str, Any], *, late: bool = False) -> dict[str, Any]:
     first had; a refused op leaves nothing behind."""
     from psycopg.types.json import Jsonb
 
+    digest = op_digest(op)
     try:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO ledger_ops (op_id, project, row_id, verb) VALUES (%s, %s, %s, %s) "
+            cur.execute("INSERT INTO ledger_ops (op_id, project, row_id, verb, digest) VALUES (%s, %s, %s, %s, %s) "
                         "ON CONFLICT (op_id) DO NOTHING RETURNING op_id",
-                        (op["op_id"], op["project"], op["row_id"], op["verb"]))
+                        (op["op_id"], op["project"], op["row_id"], op["verb"], digest))
             if cur.fetchone() is None:
                 marker = _marker(cur, op["project"], op["row_id"])
                 if marker:
                     raise _purged_error(op["row_id"], marker)
-                cur.execute("SELECT project, row_id, verb, result FROM ledger_ops WHERE op_id = %s", (op["op_id"],))
-                *first, stored = cur.fetchone()
-                if tuple(first) != (op["project"], op["row_id"], op["verb"]):
-                    raise LedgerError(f"op id {op['op_id']} was already used for a different write; "
-                                      "nothing was changed", "op_id_reused")
+                cur.execute("SELECT project, row_id, verb, digest, result FROM ledger_ops WHERE op_id = %s",
+                            (op["op_id"],))
+                *first, first_digest, stored = cur.fetchone()
+                if tuple(first) != (op["project"], op["row_id"], op["verb"]) or first_digest != digest:
+                    raise _reused_error(op)
                 result = dict(stored or {})
                 conn.rollback()
                 return {**result, "retried": True}
@@ -884,6 +905,43 @@ def _refused_dir() -> Path:
     return outbox_dir() / "refused"
 
 
+def _outcomes_dir() -> Path:
+    return outbox_dir() / "outcomes"
+
+
+OUTCOME_KEEP_S = 7 * 86400
+
+
+def _record_outcome(op: dict[str, Any], status: str, **detail: Any) -> None:
+    """What became of a job, written before the job leaves the line: every
+    writer waiting on its op id reads this, and nothing else, to answer. A job
+    gone with no outcome is never called landed."""
+    from khipu.outbox import _atomic_write
+
+    d = _outcomes_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    _atomic_write(d / f"{op['op_id']}.json", {"op_id": op["op_id"], "digest": op_digest(op), "status": status,
+                                              "at": _z(_now()), **detail})
+
+
+def _outcome(op_id: str) -> dict[str, Any] | None:
+    try:
+        got = json.loads((_outcomes_dir() / f"{op_id}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return got if isinstance(got, dict) else None
+
+
+def _prune_outcomes() -> None:
+    cutoff = time.time() - OUTCOME_KEEP_S
+    try:
+        for path in _outcomes_dir().glob("*.json"):
+            if path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _outbox_jobs() -> list[Path]:
     try:
         return sorted(p for p in outbox_dir().glob("*.json") if p.is_file())
@@ -923,9 +981,19 @@ def enqueue(op: dict[str, Any], reason: str = "") -> Path:
     fd = os.open(str(d / ".enqueue.lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
+        digest = op_digest(op)
         existing = _job_path(op["op_id"])
         if existing is not None:
+            try:
+                held = json.loads(existing.read_text(encoding="utf-8"))["op"]
+            except (OSError, ValueError, KeyError, TypeError):
+                held = None
+            if not isinstance(held, dict) or op_digest(held) != digest:
+                raise _reused_error(op)
             return existing
+        known = _outcome(op["op_id"])
+        if known is not None and known.get("digest") != digest:
+            raise _reused_error(op)
         last = 0
         for path in _outbox_jobs():
             head = path.name.split("-", 1)[0]
@@ -999,6 +1067,7 @@ def _drain_locked(conn, out: dict[str, Any], waiting: frozenset[str] = frozenset
     the writer is told). Every other job is a queued write, whoever drains it."""
     owned = conn is None
     try:
+        _prune_outcomes()
         jobs = _outbox_jobs()
         out["jobs"] = len(jobs)
         if not jobs:
@@ -1019,6 +1088,7 @@ def _drain_locked(conn, out: dict[str, Any], waiting: frozenset[str] = frozenset
             try:
                 result = apply_op(conn, op, late=op.get("op_id") not in waiting)
             except LedgerError as exc:
+                _record_outcome(op, "refused", refused=str(exc), reason_word=exc.reason)
                 _refuse_job(path, {**job, "refused": str(exc), "reason_word": exc.reason})
                 out["refused"] += 1
                 continue
@@ -1030,13 +1100,14 @@ def _drain_locked(conn, out: dict[str, Any], waiting: frozenset[str] = frozenset
                     break
                 # Anything else would fail every time and hold the line for
                 # good: it is set aside as refused, kept, and doctor goes red.
-                _refuse_job(path, {**job, "refused": f"this write failed: {type(exc).__name__}"[:200],
-                                   "reason_word": "failed"})
+                failed = f"this write failed: {type(exc).__name__}"[:200]
+                _record_outcome(op, "refused", refused=failed, reason_word="failed")
+                _refuse_job(path, {**job, "refused": failed, "reason_word": "failed"})
                 out["refused"] += 1
                 continue
+            _record_outcome(op, "landed", result=result)
             path.unlink(missing_ok=True)
             out["landed"] += 1
-            out.setdefault("results", {})[op.get("op_id")] = result
         return out
     finally:
         if owned and conn is not None:
@@ -1068,6 +1139,7 @@ def write(op: dict[str, Any], *, conn=None) -> dict[str, Any]:
     """Check, then apply ``op`` on the hub; queue it when the hub is away.
     Waiting writes go first, so writes land in the order they were made."""
     _check_op(op, settings())
+    op_digest(op)
     owned = conn is None
     try:
         if owned:
@@ -1099,7 +1171,6 @@ def _write_in_line(conn, op: dict[str, Any]) -> dict[str, Any]:
     itself when it can, and answers as a direct write would."""
     path = enqueue(op, reason="behind waiting writes")
     deadline = time.monotonic() + DRAIN_WAIT_S
-    results: dict[str, Any] = {}
     # From here the job is in the line: the answer can only be what became of
     # it (landed, refused, or still queued), never a fresh offline check.
     try:
@@ -1107,7 +1178,6 @@ def _write_in_line(conn, op: dict[str, Any]) -> dict[str, Any]:
             with _drain_lock() as got:
                 if got:
                     out = _drain_locked(conn, _drain_result(), frozenset({op["op_id"]}))
-                    results.update(out.get("results") or {})
                     if out["stopped_early"]:
                         break
                     continue
@@ -1118,27 +1188,43 @@ def _write_in_line(conn, op: dict[str, Any]) -> dict[str, Any]:
         print(f"[khipu-ledger] a waiting write stays queued: {type(exc).__name__}", file=sys.stderr)
     if path.exists():
         return _queued_reply(op)
-    refused = _refused_dir() / path.name
-    if refused.exists():
-        try:
-            job = json.loads(refused.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            job = {}
-        # Its writer is told here, so it is not also kept as a refused job.
-        refused.unlink(missing_ok=True)
-        raise LedgerError(str(job.get("refused") or "the ledger refused this write"),
-                          str(job.get("reason_word") or "refused"))
-    if op["op_id"] in results:
-        return results[op["op_id"]]
-    # Another process's drain landed it (gone from the line, not refused): a
-    # retried op id returns its first result. If that cannot be read now (the
-    # hub dropped, or the row was purged since), it still landed.
+    # Gone from the line: the outcome its drain wrote first is the answer,
+    # shared by every writer of this op id and never consumed by one of them.
+    known = _outcome(op["op_id"])
+    if known is not None and known.get("digest") == op_digest(op):
+        if known.get("status") == "landed" and isinstance(known.get("result"), dict):
+            result = dict(known["result"])
+            result.pop("retried", None)
+            return result
+        if known.get("status") == "refused":
+            # Its writer is told here, so it is not also kept as a refused job.
+            (_refused_dir() / path.name).unlink(missing_ok=True)
+            raise LedgerError(str(known.get("refused") or "the ledger refused this write"),
+                              str(known.get("reason_word") or "refused"))
+    # No outcome on this Mac: only the hub's own record of the op is evidence
+    # that it landed. It is read, never applied again.
     try:
-        result = apply_op(conn, op)
+        landed = _landed_result(conn, op)
     except Exception:  # noqa: BLE001
-        return {**_queued_reply(op), "queued": False, "line": f"{op['verb']} {op['row_id']}: landed"}
-    result.pop("retried", None)
-    return result
+        landed = None
+    if landed is not None:
+        return landed
+    raise LedgerError(f"{op['verb']} {op['row_id']}: left the line on this Mac but whether it landed cannot be "
+                      "confirmed now; check the row before writing it again", "unconfirmed")
+
+
+def _landed_result(conn, op: dict[str, Any]) -> dict[str, Any] | None:
+    """The first result of exactly this op, when the hub recorded one."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT project, row_id, verb, digest, result FROM ledger_ops WHERE op_id = %s",
+                        (op["op_id"],))
+            got = cur.fetchone()
+    finally:
+        conn.rollback()
+    if got is None or tuple(got[:3]) != (op["project"], op["row_id"], op["verb"]) or got[3] != op_digest(op):
+        return None
+    return dict(got[4] or {})
 
 
 def _queued_reply(op: dict[str, Any]) -> dict[str, Any]:
@@ -1167,18 +1253,19 @@ def _check_offline(op: dict[str, Any]) -> None:
             fields["kind"] = _word(vocab, "kind", fields["kind"])
     row_id = op["row_id"]
     last = [q.get("verb") for q in queued if q.get("row_id") == row_id and q.get("verb") in ("remove", "restore")]
-    removed_in_queue = bool(last) and last[-1] == "remove"
     restored_in_queue = bool(last) and last[-1] == "restore"
-    # A change that landed while the copy was busy is not in it yet: the copy
-    # says nothing about such a row, so it is left out and only what the
-    # waiting writes establish is checked for it; the hub decides the rest.
-    unsure = {k.partition("#")[2] for k in _pending_keys() if k.partition("#")[0] == project}
-    if view and unsure:
-        view = {**view, "rows": [r for r in view["rows"] if r["row_id"] not in unsure],
-                "gone": {k: v for k, v in (view.get("gone") or {}).items() if k not in unsure}}
+    # The waiting writes are applied to the whole copy, so what they establish
+    # (a cascade removing children, a move up) is known for every row.
     merged = _overlay(view or {"vocab": vocab, "rows": [], "as_of": None, "offline": True}, project)
-    rows = {r["row_id"]: r for r in merged["rows"]}
-    gone = (view or {}).get("gone") or {}
+    # Removed by a waiting write, itself or with its parent: definite.
+    removed_in_queue = row_id in merged["queue_removed"] or (bool(last) and last[-1] == "remove")
+    # A change that landed while the copy was busy is not in it yet: what the
+    # copy alone says about such a row (there, gone, its children) is left to
+    # the hub; only what the waiting writes establish is checked for it.
+    unsure = {k.partition("#")[2] for k in _pending_keys() if k.partition("#")[0] == project}
+    rows = {r["row_id"]: r for r in merged["rows"]
+            if r["row_id"] not in unsure or r["row_id"] in merged["queue_added"] | merged["queue_restored"]}
+    gone = {k: v for k, v in ((view or {}).get("gone") or {}).items() if k not in unsure}
     # Such a row may exist on the hub though the copy lacks it: whether it
     # exists is left to the hub, but the children the copy knows still count.
     hub_decides = row_id not in rows and (restored_in_queue or row_id in unsure) and not removed_in_queue
@@ -1250,6 +1337,8 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
     """Apply the waiting writes to an offline view, in the order they were made."""
     rows = {r["row_id"]: r for r in view["rows"]}
     removed: dict[str, dict[str, Any]] = {}
+    restored: set[str] = set()
+    added: set[str] = set()
     vocab = view["vocab"] if view["vocab"]["state"] else default_vocab()
     pending = 0
     for op in queued_ops():
@@ -1258,6 +1347,8 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
         pending += 1
         fields, row_id, at = op.get("fields") or {}, op.get("row_id"), _parse_time(op.get("at")) or _now()
         try:
+            if op["verb"] == "add":
+                added.add(row_id)
             if op["verb"] == "add" and row_id not in rows:
                 rows[row_id] = {"row_id": row_id, "title": fields.get("title", ""), "kind": fields.get("kind", ""),
                                 "parent": fields.get("parent", ""),
@@ -1276,6 +1367,7 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
                 row["updated_at"], row["queued"] = at, True
             elif op["verb"] == "restore" and row_id in removed and row_id not in rows:
                 rows[row_id] = removed.pop(row_id)
+                restored.add(row_id)
             elif op["verb"] == "remove" and row_id in rows:
                 removed[row_id] = rows.pop(row_id)
                 parent = removed[row_id]["parent"]
@@ -1294,7 +1386,9 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
                         removed[k] = rows.pop(k)
         except LedgerError:
             continue
-    return {**view, "vocab": vocab, "rows": sorted(rows.values(), key=lambda r: r["seq"]), "pending": pending}
+    return {**view, "vocab": vocab, "rows": sorted(rows.values(), key=lambda r: r["seq"]), "pending": pending,
+            "queue_removed": set(removed), "queue_restored": restored - set(removed),
+            "queue_added": added - set(removed)}
 
 
 def load(project: str, *, conn=None) -> dict[str, Any]:

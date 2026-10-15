@@ -929,11 +929,13 @@ def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mappi
                           row_ids: Sequence[str], gone: Mapping[str, int] | None = None) -> dict[str, Any]:
     """Write ``row_ids`` of ``project`` through to the replica: each live one
     in ``rows`` (with its whole ``history``), each removed one in ``gone`` at
-    the version it was removed at, and any other id as purged. A row only
-    replaces what the replica holds at the same or a lower version, and a
-    removed or purged id leaves a marker, so a writer that read the hub before
-    a newer change and lands after it changes nothing. Under the refresh lock,
-    like every incremental write here. Fail-open."""
+    the version it was removed at, and any other id as purged. A row and its
+    history are replaced whole, and only by a newer or equal revision: its
+    version, then its last history id (a late conditional write adds history
+    without a new version). A removed or purged id leaves a marker, so a writer
+    that read the hub before a newer change and lands after it changes
+    nothing. Under the refresh lock, like every incremental write here.
+    Fail-open."""
     path = snapshot_path()
     # Missing is judged under the lock: a first refresh still dumping has no
     # file yet, but may have read the hub before this change.
@@ -960,6 +962,15 @@ def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mappi
                                    (project, row_id)).fetchone()
                 return (got[0] if got else None), (mark[0] if mark else None)
 
+            def held_last_entry(row_id: str) -> int:
+                got = con.execute("SELECT MAX(id) FROM ledger_history WHERE project = ? AND row_id = ?",
+                                  (project, row_id)).fetchone()
+                return int(got[0] or 0) if got else 0
+
+            last_entry: dict[str, int] = {}
+            for h in history:
+                last_entry[h.get("row_id")] = max(last_entry.get(h.get("row_id"), 0), int(h.get("id") or 0))
+
             def drop(row_id: str) -> None:
                 con.execute("DELETE FROM ledger_rows WHERE project = ? AND row_id = ?", (project, row_id))
                 con.execute("DELETE FROM ledger_history WHERE project = ? AND row_id = ?", (project, row_id))
@@ -976,7 +987,8 @@ def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mappi
             for row_id, row in live.items():
                 have, mark = held(row_id)
                 version = int(row.get("version") or 0)
-                if max(have or 0, mark or 0) > version:
+                if max(have or 0, mark or 0) > version or (
+                        have == version and held_last_entry(row_id) > last_entry.get(row_id, 0)):
                     stale += 1
                     continue
                 drop(row_id)
