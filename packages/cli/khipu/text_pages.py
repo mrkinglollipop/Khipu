@@ -20,16 +20,30 @@ def _is_continuation(byte: int) -> bool:
     return 0x80 <= byte <= 0xBF
 
 
+def _whole_number(value: Any, default: int) -> int:
+    """``value`` as an int, refusing anything ``int()`` would silently
+    truncate (1.9 -> 1, -0.5 -> 0). JSON has one number type, so an integral
+    float such as 2.0 still counts as an integer."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ValueError("offset and max_bytes must be integers")
+    try:
+        number = int(value)
+        # int("1.9") already raises; a number must survive the round trip.
+        whole = isinstance(value, str) or number == value
+    except (TypeError, ValueError, OverflowError):
+        whole = False
+    if not whole:
+        raise ValueError("offset and max_bytes must be integers")
+    return number
+
+
 def page_args(offset: Any = None, max_bytes: Any = None) -> tuple[int, int]:
     """Validate caller arguments: offset >= 0 (default 0); max_bytes clamped
     to [PAGE_BYTES_MIN, PAGE_BYTES_MAX] (default PAGE_BYTES_DEFAULT)."""
-    try:
-        off = 0 if offset is None or offset == "" else int(offset)
-        size = PAGE_BYTES_DEFAULT if max_bytes is None or max_bytes == "" else int(max_bytes)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError("offset and max_bytes must be integers") from None
-    if isinstance(offset, bool) or isinstance(max_bytes, bool):
-        raise ValueError("offset and max_bytes must be integers")
+    off = _whole_number(offset, 0)
+    size = _whole_number(max_bytes, PAGE_BYTES_DEFAULT)
     if off < 0:
         raise ValueError("offset must be 0 or more")
     return off, min(max(size, PAGE_BYTES_MIN), PAGE_BYTES_MAX)

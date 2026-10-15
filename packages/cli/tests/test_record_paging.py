@@ -110,6 +110,19 @@ class PageUtf8Test(unittest.TestCase):
             with self.subTest(args=bad), self.assertRaises(ValueError):
                 page_args(*bad)
 
+    def test_page_args_refuses_fractional_numbers_instead_of_truncating(self):
+        # int() truncates toward zero: 1.9 would read from byte 1 and -0.5
+        # would slip past the "0 or more" check as offset 0.
+        from decimal import Decimal
+        from fractions import Fraction
+        for bad in ((1.9, None), (-0.5, None), (0.5, None), (None, 4.5),
+                    (Decimal("1.5"), None), (Fraction(3, 2), None), ("1.9", None)):
+            with self.subTest(args=bad), self.assertRaises(ValueError):
+                page_args(*bad)
+        # JSON has one number type, so an integral float is still an integer.
+        self.assertEqual(page_args(2.0, 8.0), (2, 8))
+        self.assertEqual(page_args(Decimal("3"), None), (3, PAGE_BYTES_DEFAULT))
+
 
 class _PgCursor:
     """Answers the topic query the way Postgres does: substring(bytea FROM
@@ -303,6 +316,16 @@ class KhipuGetToolTest(unittest.TestCase):
             bad = self._raw_call({"id": "t", "offset": -1})
         self.assertTrue(bad["result"]["isError"])
         self.assertIn("offset", bad["result"]["content"][0]["text"])
+
+    def test_khipu_get_refuses_fractional_paging_arguments(self):
+        cur = _PgCursor({"t": "abcdef"})
+        with mock.patch.object(activity, "connect", return_value=_PgConn(cur)):
+            for args in ({"offset": 1.9}, {"offset": -0.5}, {"max_bytes": 4.5}):
+                with self.subTest(args=args):
+                    bad = self._raw_call({"id": "t", **args})
+                    self.assertTrue(bad["result"].get("isError"), bad)
+                    self.assertIn("integer", bad["result"]["content"][0]["text"])
+            self.assertEqual(cur.params, [])
 
     def test_schema_documents_the_paging_arguments(self):
         tool = next(t for t in srv.TOOLS if t["name"] == "khipu_get")
