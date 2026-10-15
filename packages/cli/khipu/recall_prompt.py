@@ -46,7 +46,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from khipu import t3 as _t3
 if not hasattr(_t3, 'handoff_thread'):
@@ -535,6 +535,8 @@ class RoutingForkServer:
         self._next_spawn = 0.0
         self._closed = False
         self._in_flight = 0
+        # The last prompt that wanted the push (``start``), ready helper or not.
+        self._last_request: float | None = None
         self.spawned = 0  # how many helpers this daemon started (doctor and tests)
 
     def _spawn(self):
@@ -640,6 +642,8 @@ class RoutingForkServer:
         with self._lock:
             if self._closed:
                 raise RuntimeError("routing helper closed")  # the daemon is stopping
+            # Wanted now, ready or not: ``stop``'s idle wait counts from here.
+            self._last_request = time.monotonic()
             if self._ready and self._proc.poll() is not None:  # poll never waits
                 dead = self._detach_locked()
             if not self._ready:
@@ -667,6 +671,45 @@ class RoutingForkServer:
             if dead is not None:
                 _reap_later(*dead)
             raise RoutingHelperStarting() from exc
+
+    def keep_alive(self) -> bool:
+        """Start the helper, on a thread, when none is running: never
+        started (the daemon started with the push off and it was switched on
+        later), stopped, or dead. So the record's poll and its refold at
+        ``valid_until`` (phase 3c) go on between prompts without waiting for
+        one (fix round 5). At most every ``_FORKSERVER_RESPAWN_S``. Never
+        waits; True when it was asked to start. The daemon calls it only
+        while its push is on, and ``stop`` otherwise."""
+        dead = None
+        with self._lock:
+            if self._closed or self._starting:
+                return False
+            if self._proc is not None and self._proc.poll() is None:
+                return False
+            if self._proc is not None:
+                dead = self._detach_locked()
+            self._prepare_locked()
+            asked = self._starting
+        if dead is not None:
+            _reap_later(*dead)
+        return asked
+
+    def stop(self, *, idle_for: float = 0.0) -> bool:
+        """Stop the running helper (the push went off) without closing the
+        server: its poll ends with it, and a prompt with the push on, or
+        ``keep_alive``, starts one again. One still starting is never
+        stopped, and nor is one a prompt wanted (``start``, ready or not) in
+        the last ``idle_for`` seconds: that prompt's own environment had the
+        push on, and the helper's poll follows the helper's own switches.
+        Never waits. True when one was stopped."""
+        with self._lock:
+            if self._closed or self._proc is None or self._starting:
+                return False
+            if self._last_request is not None and time.monotonic() - self._last_request < idle_for:
+                return False
+            dead = self._detach_locked()
+        _reap_later(*dead)
+        return True
 
     def release(self) -> None:
         """A prompt that ``start`` sent is done with the helper."""
@@ -726,7 +769,319 @@ def daemon_routing_on(environ=None) -> bool:
         return False
 
 
-def routing_forkserver_main(fd: int) -> int:
+# ---- the helper's poll and refold (phase 3c) ----------------------------------
+#
+# The helper also keeps the record folded between prompts. A child it forks
+# (``_poll_routing_child``) runs ``routing.poll_refold``: it looks at the
+# sources and the log every ``routing_poll_interval`` and refolds at the
+# view's ``valid_until``, the next change the clock alone causes, so a
+# limit's end with no file changing is in view.json before the next prompt
+# reads it. The helper never sleeps past ``valid_until``. After the Mac
+# sleeps, everything that fell due while it slept runs once: the monotonic
+# clock stops while the Mac sleeps and the wall clock does not, so a jump
+# between the two is a wake. One poll child at a time, and its fold takes its
+# turn under the fold lock (``routing._fold_turn``), as a prompt's, the
+# session start's and a reader's do, so none of them folds the record beside
+# it: each waits for the running fold within its own budget and answers the
+# view it saved. Only a reader whose budget runs out answers from its own
+# fold, unsaved, and a write folds under the routing lock (its new line makes
+# any fold beside it unsavable). With the per-prompt push off the helper forks
+# no poll child, and the daemon stops the helper.
+
+# A wall-clock jump past the monotonic clock longer than this is a wake from
+# sleep (or the clock being set); everything due then runs once.
+_WAKE_JUMP_S = 30.0
+# The helper looks at its schedule, and reaps its children, at least this often.
+_HELPER_TICK_S = 1.0
+# A poll that failed, found a prompt folding, or could not save is tried
+# again after this long, or after the poll interval when that is shorter.
+_POLL_RETRY_S = 10.0
+_POLL_ANSWER_MOST = 64 * 1024
+# The helper reads the switches and ``routing_poll_interval`` at least this
+# often (and before every poll), so a push switched off stops the polls and
+# an interval turned on again or shortened is used without waiting for a
+# poll's answer or the view's ``valid_until``. It looks at view.json's stat
+# as often (``_look_at_view``): a write saves the view with its own
+# ``valid_until``, so a view someone else saved since the last poll makes a
+# poll due even when the interval is 0 or the next poll is far off, and that
+# poll's answer gives the schedule the new ``valid_until``. A poll's own
+# save never does: its answer carries the stat it saved (``_poll_once``).
+_SETTINGS_LOOK_S = 5.0
+# A poll child that is not refolding (it is looking at the files and the
+# view) ends after this long, and on the helper's stop signal; once it holds
+# the fold lock it runs on until it has saved the view (``_ROUTING_FOLD_MOST``).
+_POLL_LOOK_MOST = 5.0
+_KEEP = object()
+
+
+class RefoldSchedule:
+    """When the routing helper next refolds the record. ``wall`` and
+    ``mono`` are the clocks (tests pass fakes). Due when the poll interval
+    has run on the monotonic clock (``poll``), when the wall clock reaches
+    the view's ``valid_until`` (``clock``), or after a wake (``wake``);
+    whatever is due runs once, and ``ran`` starts the next wait. Due at once
+    when it is made: a daemon that starts reads the view's ``valid_until``
+    before it waits for it. ``configure`` gives it the settings as the
+    helper reads them: with the push off nothing is due at all."""
+
+    def __init__(self, interval: float | None, *, wall: Callable[[], float] = time.time,
+                 mono: Callable[[], float] = time.monotonic, jump: float = _WAKE_JUMP_S) -> None:
+        self.interval = interval if interval and interval > 0 else None
+        self._wall, self._mono, self._jump = wall, mono, jump
+        self.valid_until: float | None = None
+        self.next_poll: float | None = mono()
+        self._seen = (wall(), mono())
+        self.woke = False
+        self.runs = 0
+        self.off = False
+        self.view_seen: Any = None
+
+    def configure(self, interval: Any, *, off: bool) -> None:
+        """The switches and the poll interval as the helper last read them
+        (``_look_at_settings``). With the push off nothing is due, neither
+        the poll nor the clock; switched on again, a poll is due at once. A
+        poll interval turned on again is due at once too, and a shorter one
+        is used from now, not after the longer wait."""
+        mono = self._mono()
+        interval = interval if isinstance(interval, (int, float)) and not isinstance(interval, bool) \
+            and interval > 0 else None
+        if off:
+            self.off = True
+            return
+        if self.off:
+            self.off, self.interval, self.next_poll = False, interval, mono
+            return
+        if interval == self.interval:
+            return
+        self.interval = interval
+        if interval is None:
+            return  # at most the poll already due runs; its answer stops the next
+        if self.next_poll is None:
+            self.next_poll = mono
+        else:
+            self.next_poll = min(self.next_poll, mono + interval)
+
+    def saw_view(self, seen: Any) -> None:
+        """view.json's stat as the helper just looked (``_look_at_view``).
+        Changed since the last poll (a write's save or a prompt's fold; the
+        poll's own save is the stat its answer gave, ``_take_poll_answer``),
+        a poll is due now: its answer carries the saved view's
+        ``valid_until``, which a poll's answer alone told the schedule
+        before. With the push off nothing is due."""
+        if self.off or seen is None or seen == self.view_seen:
+            return
+        self.view_seen = seen
+        self.next_poll = self._mono()
+
+    def _look(self) -> tuple[float, float]:
+        wall, mono = self._wall(), self._mono()
+        last_wall, last_mono = self._seen
+        if abs((wall - last_wall) - (mono - last_mono)) > self._jump:
+            self.woke = True
+        self._seen = (wall, mono)
+        return wall, mono
+
+    def due(self) -> list[str]:
+        """Why a refold is due now (empty: not due, and always with the push off)."""
+        wall, mono = self._look()
+        if self.off:
+            return []
+        why = []
+        if self.woke:
+            why.append("wake")
+        if self.valid_until is not None and wall >= self.valid_until:
+            why.append("clock")
+        if self.next_poll is not None and mono >= self.next_poll:
+            why.append("poll")
+        return why
+
+    def ran(self, valid_until: float | None = None, *, ok: bool = True, interval: Any = _KEEP) -> None:
+        """A refold (or a look that found the view fresh) finished: the next
+        wait is the poll interval, and never past ``valid_until`` (wall-clock
+        seconds). A failed run, or one whose ``valid_until`` has already
+        passed, is tried again after ``_POLL_RETRY_S`` at most."""
+        wall, mono = self._look()
+        self.runs += 1
+        self.woke = False
+        if interval is not _KEEP:
+            self.interval = interval if isinstance(interval, (int, float)) and interval > 0 else None
+        if valid_until is not None and valid_until <= wall:
+            ok, valid_until = False, None
+        self.valid_until = valid_until if ok else None
+        wait = self.interval
+        if not ok:
+            wait = min(wait, _POLL_RETRY_S) if wait else _POLL_RETRY_S
+        self.next_poll = mono + wait if wait else None
+
+    def sleep_for(self, most: float) -> float:
+        """How long to wait before looking again: at most ``most``, never
+        past the next poll, and never past ``valid_until``."""
+        wall, mono = self._wall(), self._mono()
+        left = most
+        if self.off:
+            return max(0.0, left)
+        if self.next_poll is not None:
+            left = min(left, self.next_poll - mono)
+        if self.valid_until is not None:
+            left = min(left, self.valid_until - wall)
+        return max(0.0, left)
+
+
+def _look_at_settings(schedule: RefoldSchedule, routing) -> None:
+    """Give ``schedule`` the per-prompt push's switches (``routing.push_off``:
+    the feature, the old hook's bypass and ``routing_push_prompt``) and
+    ``routing_poll_interval`` as they are now. Settings it cannot read leave
+    the schedule as it was."""
+    try:
+        off = bool(routing.push_off("prompt"))
+        interval = routing.poll_interval()
+    except Exception:  # noqa: BLE001 - unreadable settings: as they were
+        return
+    schedule.configure(interval, off=off)
+    _look_at_view(schedule, routing)
+
+
+def _view_stat(routing) -> Any:
+    """view.json's size, time and inode, or None. A stat only: the helper
+    never reads the view itself (a FIFO or a stalled disk would block it);
+    its poll child does, under its own alarm."""
+    try:
+        return routing._stat(routing.view_file())
+    except Exception:  # noqa: BLE001 - no data dir: nothing seen
+        return None
+
+
+def _look_at_view(schedule: RefoldSchedule, routing) -> None:
+    """A poll is due when view.json changed since the last poll began
+    (``RefoldSchedule.saw_view``). Only a poll's answer gave the schedule
+    ``valid_until`` before, so with ``routing_poll_interval`` 0 (or a long
+    one) a limit written after the last poll never refolded at its end."""
+    if not schedule.off:
+        schedule.saw_view(_view_stat(routing))
+
+
+def _reap_until(live: Callable[[], int], reap: Callable[[], None], until: float, *,
+                sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic) -> None:
+    """A stopping helper's wait for its children: reap while any is live,
+    sleeping between looks (a poll child that is folding ignores the stop
+    signal and may run on), until ``until``."""
+    while live() and clock() < until:
+        reap()
+        if live():
+            sleep(0.01)
+
+
+def _detach_child(keep: tuple[int, ...]) -> None:
+    """In a forked child: its own session, stdin, stdout and stderr on
+    /dev/null, and every inherited descriptor but ``keep`` closed."""
+    os.setsid()
+    null = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(null, fd)
+    for fd in _inherited_fds():
+        if fd > 2 and fd not in (*keep, null):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+# How often a poll child reads view.json again when it changed under the read.
+_VIEW_SNAPSHOT_TRIES = 3
+
+
+def _view_snapshot(routing) -> tuple[Any, dict | None]:
+    """view.json's stat and the view it holds, from one read between two
+    equal stats; (None, None) when the file kept changing under the read or
+    could not be read. The stat is the file's identity: the deadline that
+    goes with it comes only from this read (fix round 5)."""
+    for _ in range(_VIEW_SNAPSHOT_TRIES):
+        before = _view_stat(routing)
+        if before is None:
+            break
+        view = routing._load_view()
+        if view is not None and _view_stat(routing) == before:
+            return before, view
+    return None, None
+
+
+def _poll_once(routing, on_fold=None) -> dict:
+    """One poll as the helper's child runs it: ``routing.poll_refold``'s
+    answer with ``due`` (``valid_until`` in wall-clock seconds) and, when it
+    folded and saved the view, ``view_stat``: view.json's stat after that
+    save, so it never makes another poll due. The stat and ``due`` come from
+    the same read of view.json (``_view_snapshot``): a save by a prompt
+    between the poll's own save and its stat is acknowledged only with that
+    save's own deadline, and one that changed under the read is left unseen
+    (the helper's next look polls again)."""
+    out = routing.poll_refold(on_fold=on_fold)
+    due = routing._parse(out.get("valid_until"))
+    out["view_stat"] = None
+    if out.get("folded") and out.get("saved"):
+        seen, view = _view_snapshot(routing)
+        if seen is not None:
+            out["view_stat"] = seen
+            due = routing._parse(view.get("valid_until"))
+    out["due"] = due.timestamp() if due is not None else None
+    return out
+
+
+def _take_poll_answer(schedule: "RefoldSchedule", out: dict | None) -> None:
+    """The helper's side of a poll's answer: the next wait (``ran``) and,
+    when the poll saved the view, the stat it saved as the one seen (a
+    save by anyone else after it still makes a poll due)."""
+    if out is None:
+        schedule.ran(ok=False)
+        return
+    seen = out.get("view_stat")
+    if isinstance(seen, list) and not schedule.off:
+        schedule.view_seen = seen
+    due = out.get("due")
+    due = float(due) if isinstance(due, (int, float)) and not isinstance(due, bool) else None
+    ok = not out.get("busy") and out.get("saved", True) is not False
+    schedule.ran(due, ok=ok, interval=out.get("interval"))
+
+
+def _poll_routing_child(write_fd: int) -> None:
+    """The helper's poll child: ``routing.poll_refold`` and its answer (one
+    JSON line, with ``due``: ``valid_until`` in wall-clock seconds) on
+    ``write_fd``. Never returns. Bounded by its own kernel alarm: a look at
+    the files and the view ends within ``_POLL_LOOK_MOST`` seconds and on the
+    helper's stop signal (SIGUSR1), as a prompt's reader does; a fold runs on
+    until it has saved the view (``_ROUTING_FOLD_MOST``), and the stop
+    signal never ends it mid-save."""
+    code = 1
+    try:
+        import signal
+
+        for sig in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1):
+            signal.signal(sig, signal.SIG_DFL)
+        signal.setitimer(signal.ITIMER_REAL, _POLL_LOOK_MOST)
+        _detach_child((write_fd,))
+        from khipu import routing
+
+        def fold_started() -> None:
+            signal.setitimer(signal.ITIMER_REAL, _ROUTING_FOLD_MOST)
+            signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+
+        out = _poll_once(routing, on_fold=fold_started)
+        _write_all(write_fd, json.dumps(out).encode("utf-8") + b"\n")
+        code = 0
+    except BaseException:  # noqa: BLE001 - the helper reads end of file and tries again later
+        code = 1
+    finally:
+        os._exit(code)
+
+
+def _poll_answer(buf: bytes) -> dict | None:
+    try:
+        out = json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return out if isinstance(out, dict) else None
+
+
+def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None) -> int:
     """The helper's loop: import what the read needs once, say it is ready
     (one line on stdout), then fork one child per request until the daemon
     closes stdin. The children are this process's, so it reaps them and
@@ -734,7 +1089,16 @@ def routing_forkserver_main(fd: int) -> int:
     answered busy and starts no child. A request whose prompt has stopped
     waiting starts no child. When it stops, it ends its children (SIGUSR1)
     and reaps them; a child refolding the record ignores that and is left to
-    finish saving the view (its own alarm bounds it)."""
+    finish saving the view (its own alarm bounds it). The poll child below
+    counts toward that limit and is ended the same way.
+
+    Between requests it keeps the record folded (phase 3c): when
+    ``schedule`` says a refold is due it forks one poll child
+    (``_poll_routing_child``), never a second while one runs, and never
+    waits past the schedule's next poll or the view's ``valid_until``. It
+    reads the switches, the poll interval and the saved view's
+    ``valid_until`` before every poll and every ``_SETTINGS_LOOK_S``: with
+    the per-prompt push off it forks no poll child at all."""
     import select
     import signal
     import socket
@@ -747,18 +1111,51 @@ def routing_forkserver_main(fd: int) -> int:
     routing.prompt_imports()
     import warnings
 
+    if schedule is None:
+        try:
+            interval = routing.poll_interval()
+        except Exception:  # noqa: BLE001 - unreadable settings: the default
+            interval = float(routing.SETTINGS["routing_poll_interval"][1])
+        schedule = RefoldSchedule(interval)
     children: set[int] = set()
+    pollers: set[int] = set()
+    poll_fd: int | None = None
+    poll_buf = b""
+    next_look = 0.0
 
     def reap() -> None:
-        while children:
+        while children or pollers:
             try:
                 pid, _status = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
                 children.clear()
+                pollers.clear()
                 return
             if not pid:
                 return
             children.discard(pid)
+            pollers.discard(pid)
+
+    def start_poll() -> int | None:
+        # What the child will read: a save by anyone else after this makes
+        # the next look's poll due; the child's own save is in its answer.
+        schedule.view_seen = _view_stat(routing)
+        read_fd, write_fd = os.pipe()
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                pid = os.fork()
+        except Exception:  # noqa: BLE001 - a failed fork: tried again later
+            os.close(read_fd)
+            os.close(write_fd)
+            schedule.ran(ok=False)
+            return None
+        if pid == 0:
+            os.close(read_fd)
+            _poll_routing_child(write_fd)
+        pollers.add(pid)
+        os.close(write_fd)
+        return read_fd
 
     try:
         _write_all(1, b"ready\n")
@@ -767,9 +1164,27 @@ def routing_forkserver_main(fd: int) -> int:
     try:
         while True:
             reap()
-            ready, _, _ = select.select([sock, 0], [], [], 1.0)
+            if poll_fd is None and (time.monotonic() >= next_look or schedule.due()):
+                # The switches as they are now: never a poll with the push off.
+                _look_at_settings(schedule, routing)
+                next_look = time.monotonic() + _SETTINGS_LOOK_S
+                if schedule.due():
+                    poll_fd, poll_buf = start_poll(), b""
+            wait = _HELPER_TICK_S if poll_fd is not None else schedule.sleep_for(_HELPER_TICK_S)
+            watched = [sock, 0] if poll_fd is None else [sock, 0, poll_fd]
+            ready, _, _ = select.select(watched, [], [], wait)
             if 0 in ready and not os.read(0, 4096):
                 return 0  # the daemon closed us, or died
+            if poll_fd is not None and poll_fd in ready:
+                try:
+                    chunk = os.read(poll_fd, 65536)
+                except OSError:
+                    chunk = b""
+                poll_buf += chunk
+                if not chunk or b"\n" in poll_buf or len(poll_buf) > _POLL_ANSWER_MOST:
+                    os.close(poll_fd)
+                    poll_fd = None
+                    _take_poll_answer(schedule, _poll_answer(poll_buf))
             if sock not in ready:
                 continue
             try:
@@ -787,7 +1202,7 @@ def routing_forkserver_main(fd: int) -> int:
                 if time.monotonic() >= cap:
                     raise TimeoutError("the prompt stopped waiting")
                 reap()
-                if len(children) >= _FORKSERVER_CHILDREN_MOST:
+                if len(children) + len(pollers) >= _FORKSERVER_CHILDREN_MOST:
                     # Ready with no budget, and the answer: the prompt logs routing=skipped:busy.
                     os.set_blocking(write_fd, False)
                     _write_all(write_fd, f"{time.monotonic()!r} 0.0\n".encode("ascii") + b'{"skip": "busy"}\n')
@@ -804,16 +1219,16 @@ def routing_forkserver_main(fd: int) -> int:
             children.add(pid)
             os.close(write_fd)
     finally:
-        for pid in list(children):
-            try:
-                os.kill(pid, signal.SIGUSR1)
-            except OSError:
-                children.discard(pid)
-        until = time.monotonic() + _FORKSERVER_REAP_MOST
-        while children and time.monotonic() < until:
-            reap()
-            if children:
-                time.sleep(0.01)
+        if poll_fd is not None:
+            os.close(poll_fd)
+        # A poll child that is folding ignores this, finishes and saves; its alarm bounds it.
+        for group in (children, pollers):
+            for pid in list(group):
+                try:
+                    os.kill(pid, signal.SIGUSR1)
+                except OSError:
+                    group.discard(pid)
+        _reap_until(lambda: len(children) + len(pollers), reap, time.monotonic() + _FORKSERVER_REAP_MOST)
 
 
 class _RoutingAtPrompt:
@@ -2617,4 +3032,72 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
             "run `khipu snapshot refresh`; if this stays red the machine cannot "
             "answer inside the deadline and per-prompt recall is effectively off"
         )
+    return out
+
+
+# ---- doctor: how often routing ran out of time before a prompt (phase 3c) --
+# Read from the same summary lines: their last field, ``routing=<status>``,
+# is written only when the push is on. Each status in ``ROUTING_OUT_OF_TIME``
+# is a prompt that went without its routing lines for lack of time (they
+# arrive with a later prompt): ``skipped:budget``, the read did not finish
+# inside ``routing_prompt_budget_ms``; ``skipped:fold-busy``, it waited for
+# another fold (the daemon's poll, folding a large record) past its budget;
+# ``skipped:busy``, the routing helper had no room for it;
+# ``skipped:starting``, the helper was not ready yet (one that never becomes
+# ready shows here, not as 0%).
+ROUTING_OUT_OF_TIME = ("skipped:budget", "skipped:fold-busy", "skipped:busy", "skipped:starting")
+
+_ROUTING_FIELD_RE = re.compile(r" routing=(?P<status>\S+)\s*$")
+_ROUTING_RATE_MIN_CALLS = 20
+_ROUTING_RATE_MAX_CALLS = 500
+
+
+def routing_status_of(line: str) -> str | None:
+    """The ``routing=`` status at the end of a summary line, or None."""
+    m = _ROUTING_FIELD_RE.search(line)
+    return m.group("status") if m else None
+
+
+def prompt_routing_budget_rate(*, now: datetime | None = None, warn_pct: float = 1.0) -> dict[str, Any]:
+    """The share of recent prompts whose routing read was skipped for lack
+    of time (``ROUTING_OUT_OF_TIME``: ``skipped`` in all, and each of them
+    apart), over the last ``_ROUTING_RATE_MAX_CALLS`` prompts with the push
+    on in the last 7 days. ``warn`` when more than ``warn_pct`` percent of
+    20 or more did (0: never warn). Missing telemetry reports
+    ``available: False``."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now.timestamp() - _OUTCOMES_WINDOW_S
+    out: dict[str, Any] = {"available": False, "count": 0, "skipped": 0, "skipped_budget": 0,
+                           "skipped_fold_busy": 0, "skipped_busy": 0, "skipped_starting": 0, "rate_pct": None,
+                           "warn_pct": warn_pct, "warn": False}
+    path = _log_path()
+    try:
+        if not path.is_file():
+            return out
+        raw = _tail_text(path, max_bytes=_OUTCOMES_TAIL_BYTES)
+    except OSError:
+        return out
+    statuses: list[str] = []
+    for line in raw.splitlines():
+        m = _LOG_LINE_RE.match(line)
+        if not m:
+            continue
+        status = routing_status_of(line)
+        if status is None:
+            continue
+        try:
+            stamp = datetime.strptime(m.group("stamp"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if stamp.timestamp() >= cutoff:
+            statuses.append(status)
+    statuses = statuses[-_ROUTING_RATE_MAX_CALLS:]
+    each = {status: sum(1 for s in statuses if s == status) for status in ROUTING_OUT_OF_TIME}
+    skipped = sum(each.values())
+    out.update(available=True, count=len(statuses), skipped=skipped, skipped_budget=each["skipped:budget"],
+               skipped_fold_busy=each["skipped:fold-busy"], skipped_busy=each["skipped:busy"],
+               skipped_starting=each["skipped:starting"])
+    if statuses:
+        out["rate_pct"] = round(100.0 * skipped / len(statuses), 2)
+    out["warn"] = bool(warn_pct and len(statuses) >= _ROUTING_RATE_MIN_CALLS and out["rate_pct"] > warn_pct)
     return out
