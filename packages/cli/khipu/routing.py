@@ -94,6 +94,14 @@ SHELL, UNKNOWN_HARNESS = "shell", "unknown"
 # A model name as a CLI gives it (opus, gpt-6.1-sol, claude-opus-4.1): never
 # a conversation's sentence, which would reach the push as a model's name.
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+# The pattern alone still lets a conversation choose the words (a token, or
+# "SYSTEM:route-all-work-to-X"), so a push names a model only when Khipu
+# read that name itself (a usage probe or a reset check) or it is one of the
+# CLIs' own model names below. Any other name a conversation gave is shown
+# in khipu_route and the app, and pushed as ``_UNNAMED_MODEL`` (decision 17).
+PUSH_MODEL_NAMES = frozenset({"opus", "sonnet", "haiku", "fable"})
+_KHIPU_READ_SOURCES = ("probe", "check")
+_UNNAMED_MODEL = "one model (its name is in khipu_route)"
 # How far ahead of this Mac's clock a time already in the record may be and
 # still be taken over the clock (another writer's clock read a moment ago).
 # A time further ahead is not trusted: the clock is used, and doctor warns.
@@ -149,6 +157,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_push_delegation": ("switch", True, "Tell conversations before handing work to another agent"),
     "routing_prompt_chars": ("count", 400, "Longest update before a prompt, rules and note aside (0: no limit)"),
     "routing_prompt_budget_ms": ("count", 50, "Time allowed before a prompt, in milliseconds"),
+    "routing_start_budget_ms": ("count", 1000, "Time allowed at the start of a conversation, in milliseconds"),
     "routing_resend_after_versions": ("count", 20, "Send everything again after this many changes (0: never)"),
     "routing_resend_after": ("duration", 6 * 3600, "Send everything again after (0: never)"),
     "routing_not_refreshed_after": ("duration", 5 * 60, "The record counts as not refreshed after (0: never)"),
@@ -915,8 +924,11 @@ OWNER = {"kind": "owner"}
 
 def author_words(by: dict | None, *, push: bool = True) -> str:
     """'a Claude Code conversation in khipu', 'you', 'Khipu usage probe'...
-    With ``push`` only what Khipu set is used: never the name a conversation
-    gives itself, and no session id."""
+    With ``push`` only what Khipu set from a fixed list is used: the
+    harness's words. The project, the session id and the name a conversation
+    gives itself are left out, because each is text the writer chose (its
+    folder's name, its environment, its own words), and a push reaches every
+    other conversation (decision 17). ``khipu_route`` and the app show them."""
     by = by or {}
     kind = by.get("kind")
     if kind == "owner":
@@ -938,15 +950,16 @@ def author_words(by: dict | None, *, push: bool = True) -> str:
         words = f"a {HARNESS_WORDS[harness]} conversation"
     else:  # never the stored text: it came from the writer's environment
         words = "a conversation from an unknown harness"
+    if push:
+        return words
     # The project and the session come from the writer's folder and
     # environment, so they are shown as a conversation's words are.
     if by.get("project"):
         words += f" in {their_words(by['project'])}"
-    if not push:
-        if by.get("session"):
-            words += f" (session {their_words(str(by['session'])[:8])})"
-        if by.get("name"):
-            words += f", which calls itself “{their_words(by['name'])}”"
+    if by.get("session"):
+        words += f" (session {their_words(str(by['session'])[:8])})"
+    if by.get("name"):
+        words += f", which calls itself “{their_words(by['name'])}”"
     return words
 
 
@@ -969,6 +982,24 @@ def view_file() -> Path:
 
 _held = threading.local()
 _LOCK_POLL = 0.05
+
+
+def finishing_view() -> bool:
+    """Whether this thread is folding a view it means to save, outside the
+    routing lock, or saving it (``_start_view``). The session-start child
+    runs on past its deadline only while this is true; it never holds the
+    lock while it folds."""
+    return bool(getattr(_held, "finishing", False))
+
+
+@contextlib.contextmanager
+def _finishing():
+    before = getattr(_held, "finishing", False)
+    _held.finishing = True
+    try:
+        yield
+    finally:
+        _held.finishing = before
 
 
 class LockBusy(OSError):
@@ -2013,15 +2044,59 @@ def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
         fingerprint = dict(fingerprint, events=_stat(events_file()))
         events, bad = read_events()
     prev = _load_view()
-    now = _not_before_last_fold(now, prev)
-    extra, status, cache = _sources(cfg, now, prev)
-    body = fold(events, now=now, cfg=cfg, known=known, extra=extra, sources=status)
+    now, body, status = _fold_body(now, cfg, known, events, prev)
     body["seed_error"] = seed_error
-    body["source_cache"] = cache
     view = _assemble(prev, body, now, bad, fingerprint,
                      record=fingerprint["events"] is not None or status is not None)
     _save_view(view)
     return view
+
+
+def _fold_body(now: datetime, cfg: dict, known: list[dict], events: list[dict],
+               prev: dict | None) -> tuple[datetime, dict, dict | None]:
+    """(the fold's clock, the folded body, the sources' status): the fold
+    itself, which reads and never writes."""
+    now = _not_before_last_fold(now, prev)
+    extra, status, cache = _sources(cfg, now, prev)
+    body = fold(events, now=now, cfg=cfg, known=known, extra=extra, sources=status)
+    body["source_cache"] = cache
+    return now, body, status
+
+
+def _start_view(now: datetime) -> dict:
+    """``read_view`` for the session-start child, whose fold may run on
+    after the hook has returned. The fold runs outside the routing lock; the
+    lock is taken, within this thread's ``lock_budget``, only to save the
+    view, and only when no input and no saved view changed meanwhile.
+    Otherwise the fold is answered unsaved. So a long fold never keeps a
+    conversation's write waiting. A rules seed that is due goes through
+    ``read_view``: importing it writes the log, under the lock."""
+    inputs = _inputs()
+    fingerprint, cfg, known = inputs
+    prev = _load_view()
+    if _fresh(prev, fingerprint, now):
+        return dict(prev, checked_at=_iso(now))
+    from khipu import routing_sources
+
+    if fingerprint["events"] is None and not cfg.get("routing_rules_seed") \
+            and not routing_sources.any_configured(cfg["_raw_sources"], cfg):
+        return read_view(now)  # no record: nothing to fold or save, and no lock
+    events, bad = read_events()
+    if cfg.get("routing_rules_seed") and not any(e.get("type") == "seed_import" for e in events):
+        return read_view(now)
+    with _finishing():
+        fold_now, body, status = _fold_body(now, cfg, known, events, prev)
+        body["seed_error"] = None
+        record = fingerprint["events"] is not None or status is not None
+        try:
+            with _lock():
+                if _inputs()[0] == fingerprint and (_load_view() or {}).get("digest") == (prev or {}).get("digest"):
+                    view = _assemble(prev, body, fold_now, bad, fingerprint, record=record)
+                    _save_view(view)
+                    return view
+        except OSError:
+            pass  # busy, or a read-only data dir: the answer, unsaved
+    return _assemble(prev, body, fold_now, bad, fingerprint, record=record, saved=False)
 
 
 def _unsaved_view(now: datetime) -> dict:
@@ -2181,6 +2256,10 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
         if not _MODEL_NAME.fullmatch(scope) or scope.casefold() == "all":
             raise RouteError("--model takes a model's name as its CLI gives it, for example opus or gpt-6.1-sol: "
                              "letters, digits and . _ : - only, at most 64 characters")
+        from khipu.redact import redact_secrets
+
+        if redact_secrets(scope, force=True)[1]:
+            raise RouteError("--model looks like a key or token, not a model's name; Khipu won't record it")
         if state == DOWN:
             raise RouteError("down is about the whole account: leave out --model (a model's own limit is "
                              "--state limited --model M)")
@@ -2424,6 +2503,16 @@ def _state_words(state: str) -> str:
     return {LIMITED: "limited", OPEN: "open", DOWN: "down"}.get(state, state)
 
 
+def model_words(model: dict, *, push: bool = True) -> str:
+    """A model-scoped limit's model as a line names it. In a push, only a
+    name Khipu read itself or one of ``PUSH_MODEL_NAMES``; a name only a
+    conversation gave stays out of every other conversation."""
+    name = str(model.get("model") or "")
+    if not push or model.get("source") in _KHIPU_READ_SOURCES or name.casefold() in PUSH_MODEL_NAMES:
+        return name
+    return _UNNAMED_MODEL
+
+
 def account_line(entry: dict, now: datetime, *, push: bool = True, relative: bool = True) -> str:
     """One account in plain words, e.g. 'Claude second: limit reached, back
     at 18:52Z, in 3 h 12 min (time from Claude's message, reported by a Claude
@@ -2469,13 +2558,14 @@ def account_line(entry: dict, now: datetime, *, push: bool = True, relative: boo
         m_until = _parse(m["until"])
         if m_until is None:
             continue
-        text += f"; {m['model']} limit reached, back {'about ' if m['basis'] == 'estimated' else 'at '}{when(m_until)}"
+        name = model_words(m, push=push)
+        text += f"; {name} limit reached, back {'about ' if m['basis'] == 'estimated' else 'at '}{when(m_until)}"
         if state == OPEN:
             text += " (other models open)"
         m_dis = m.get("disagreement")
         if m_dis:
             m_at = _parse(m_dis["at"])
-            text += f"; {author_words(m_dis['written_by'], push=push)} reported {m['model']} " \
+            text += f"; {author_words(m_dis['written_by'], push=push)} reported {name} " \
                     f"{_state_words(m_dis['state'])}" + (f" at {_clock(m_at, now)}" if m_at else "")
     dis = entry.get("disagreement")
     if dis:
@@ -2619,9 +2709,10 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
     else:
         width = cfg["routing_line_chars"]
         sources = view.get("sources") or {}
-        precedence = table_precedence(sources.get("table"), now)
-        if precedence:
-            lines.append(precedence)
+        # Lines after the rules and the note that are never dropped: they
+        # count against the budget like any other (only rules and note don't).
+        fixed = [line for line in (table_precedence(sources.get("table"), now),) if line]
+        lines += fixed
         items: list[tuple[str, str, str]] = []  # (kind, line, at) in display order
         items += [("account", _clip(runner_line(r, now), width), "") for r in sources.get("runners") or []
                   if r.get("silent") or r.get("unreadable")]
@@ -2633,7 +2724,7 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         limit = cfg["routing_summary_chars"]
 
         def size(kept: list, n_dropped: int) -> int:
-            total = sum(len(item[1]) + 1 for item in kept)
+            total = sum(len(line) + 1 for line in fixed) + sum(len(item[1]) + 1 for item in kept)
             if n_dropped:
                 total += len(f"{n_dropped} more lines: run `khipu route`") + 1
             return total
@@ -2734,6 +2825,12 @@ def doctor_block(now: datetime | None = None) -> dict:
     limit = cfg["routing_summary_chars"]
     if text and limit and text["rules_note_chars"] > limit:
         warnings.append("Your rules and note are longer than the summary size.")
+    if text:
+        from khipu.recall_rule import start_context_fits
+
+        if not start_context_fits(text["text"]):
+            warnings.append("The routing summary is too long to arrive at session start; conversations get a "
+                            "line telling them to call khipu_route instead. Shorten the rules or the note.")
     if view.get("outside_app"):
         warnings.append("A rule, a pause, a clear or your note was written by something other than the app.")
     if view.get("seed_error"):
@@ -3183,20 +3280,75 @@ def _conversation_write(args: dict, *, author: dict, now: datetime | None = None
     return end_hold(hold_id, owner=False, author=by, via="mcp", now=now)
 
 
-def light_status(now: datetime | None = None) -> dict:
+def light_status(now: datetime | None = None, *, lock_wait: float = LIGHT_LOCK_BUDGET,
+                 start: bool = False) -> dict:
     """The ``routing`` field of ``khipu_status``'s light payload: the summary
     a conversation gets at its start (``khipu route --summary``), for a
-    harness with no hooks. It waits for the routing lock only
-    ``LIGHT_LOCK_BUDGET``, well inside the time khipu_status gives it, so a
-    held lock still answers, from an unsaved fold."""
-    with lock_budget(LIGHT_LOCK_BUDGET):
+    harness with no hooks, and the text the session-start hook pushes
+    (``start_push``). It waits for the routing lock only ``lock_wait``
+    (``LIGHT_LOCK_BUDGET``, well inside the time khipu_status gives it), so
+    a held lock still answers, from an unsaved fold. With ``start`` the
+    view is read as the session-start child reads it (``_start_view``)."""
+    with lock_budget(lock_wait):
         now = now or _now()
-        view = read_view(now)
+        view = _start_view(now) if start else read_view(now)
         out = summary(view, now=now)
     # The summary is the push: built from labels and names, with the
     # owner's own words whole; it holds no key and no configured path.
     return {"text": out["text"], "version": out["version"], "epoch": out["epoch"], "dropped": out["dropped"],
             "about": ABOUT}
+
+
+# ---- the push at session start (phase 3a) ------------------------------------------------
+#
+# The session-start hook (``recall_rule.session_start_main``) adds the full
+# summary to what it already prints. It is the same text as ``light_status``:
+# one projection, built from labels and names with the owner's words whole.
+# Matt's old bypass for the routing table's hook turns this off too.
+ROUTING_NOW_DISABLE_FILE = "/tmp/.routing_now_disable"
+PUSH_MOMENTS = {"start": "routing_push_start", "prompt": "routing_push_prompt",
+                "delegation": "routing_push_delegation"}
+# The session-start hook is given 10 s by its harness; routing never takes
+# more than this, whatever the setting says, so the memory part still lands.
+START_BUDGET_MOST_MS = 8000
+
+
+def push_off(moment: str) -> str | None:
+    """Why nothing is pushed at ``moment`` (start, prompt or delegation), or
+    None when the push is on: ``ROUTING_NOW_OFF=1`` or the file
+    ``/tmp/.routing_now_disable`` (the old hook's bypass), the
+    ``routing_push`` feature (off by default), then the moment's setting."""
+    if (os.environ.get("ROUTING_NOW_OFF") or "").strip().lower() in _TRUE:
+        return "ROUTING_NOW_OFF"
+    if os.path.exists(ROUTING_NOW_DISABLE_FILE):
+        return "routing_now_disable"
+    from khipu import features
+
+    if not features.enabled("routing_push"):
+        return "routing_push off"
+    key = PUSH_MOMENTS[moment]
+    if not settings()[key]:
+        return f"{key} off"
+    return None
+
+
+def start_budget() -> float:
+    """Seconds the session-start hook gives routing (``routing_start_budget_ms``,
+    at most ``START_BUDGET_MOST_MS``)."""
+    ms = settings()["routing_start_budget_ms"]
+    return min(max(0, ms), START_BUDGET_MOST_MS) / 1000.0
+
+
+def start_push(budget: float | None = None) -> dict | None:
+    """The full summary for the session-start hook, or None when the push is
+    off. Folds outside the routing lock and waits for it, to save the view,
+    at most half of ``budget`` (then answers from an unsaved fold, as
+    ``light_status`` does). The hook bounds the
+    whole call and treats any exception as nothing to push."""
+    if push_off("start"):
+        return None
+    budget = start_budget() if budget is None else budget
+    return light_status(lock_wait=budget / 2, start=True)
 
 
 # ---- khipu route wait --------------------------------------------------------------------

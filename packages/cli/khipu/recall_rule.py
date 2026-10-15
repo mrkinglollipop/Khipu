@@ -30,6 +30,8 @@ import json
 import os
 import sqlite3
 import sys
+import threading
+import time
 from pathlib import Path
 
 from khipu.t3 import is_helper_session
@@ -448,24 +450,256 @@ def _pushed_memory_slice(cwd: str | None) -> str:
     return "\n".join(lines)
 
 
-def _session_start_cwd() -> str | None:
+def _session_start_payload() -> dict:
+    """The hook's stdin payload, or {} (no input, not JSON, unreadable)."""
     try:
         raw = sys.stdin.read()
         if raw.strip():
             payload = json.loads(raw)
             if isinstance(payload, dict):
-                cwd = payload.get("cwd") or payload.get("cwd_path")
-                if isinstance(cwd, str) and cwd.strip():
-                    return cwd
-                # Cursor sessionStart: common input uses workspace_roots, not cwd.
-                roots = payload.get("workspace_roots")
-                if isinstance(roots, list) and roots:
-                    first = roots[0]
-                    if isinstance(first, str) and first.strip():
-                        return first
+                return payload
+    except Exception:
+        return {}
+    return {}
+
+
+def _session_start_cwd(payload: dict | None = None) -> str | None:
+    """The session's folder from the payload (read from stdin when not given)."""
+    try:
+        if payload is None:
+            payload = _session_start_payload()
+        cwd = payload.get("cwd") or payload.get("cwd_path")
+        if isinstance(cwd, str) and cwd.strip():
+            return cwd
+        # Cursor sessionStart: common input uses workspace_roots, not cwd.
+        roots = payload.get("workspace_roots")
+        if isinstance(roots, list) and roots:
+            first = roots[0]
+            if isinstance(first, str) and first.strip():
+                return first
     except Exception:
         return None
     return None
+
+
+# ---- the hook's size at session start ------------------------------------------
+#
+# Claude Code keeps a hook's additionalContext whole only up to 10,000
+# characters, counted as JavaScript counts them (UTF-16 units). Past that it
+# saves the text to a file and the model gets a 2,000-character preview, so
+# nothing after the first 2,000 characters reaches it: not the memory slice,
+# not the routing summary. With routing in it, the output is kept under
+# ``_HOOK_CONTEXT_BUDGET`` (a margin below the limit).
+_HOOK_CONTEXT_MOST = 10_000
+_HOOK_CONTEXT_BUDGET = _HOOK_CONTEXT_MOST - 200
+_START_SEP = "\n\n"
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def fit_start_context(memory: str, routing_text: str | None,
+                      budget: int = _HOOK_CONTEXT_BUDGET) -> tuple[str, bool]:
+    """(the session-start context, whether the routing summary is in it).
+    The summary goes whole or not at all, since its rules and note are never
+    cut. To make room, whole lines are dropped from the bottom of the memory
+    slice, never from the recall rule, and a line says how many. When it
+    still does not fit, the memory part is returned exactly as it was and
+    the summary is left out (and not recorded as delivered), so a later push
+    carries it."""
+    if not routing_text:
+        return memory, False
+    fixed = _utf16_len(_START_SEP) + _utf16_len(routing_text)
+    if _utf16_len(memory) + fixed <= budget:
+        return f"{memory}{_START_SEP}{routing_text}", True
+    body = RULE_MD.strip()
+    keep = len(body) if memory.startswith(body) else 0
+    head, rest = memory[:keep], memory[keep:].split("\n")
+    for cut in range(1, len(rest) + 1):
+        dropped = sum(1 for line in rest[len(rest) - cut:] if line.strip())
+        trimmed = (head + "\n".join(rest[:len(rest) - cut])).rstrip("\n")
+        if dropped:
+            note = (f"({dropped} more memory slice line{'s' if dropped != 1 else ''} left out to fit "
+                    "the session-start limit; `khipu_search` for more.)")
+            trimmed = f"{trimmed}\n{note}" if trimmed else note
+        if _utf16_len(trimmed) + fixed <= budget:
+            return f"{trimmed}{_START_SEP}{routing_text}", True
+    # Too long to arrive whole, and it is never cut: say so and where to read
+    # it, so the rules and note are never dropped in silence (doctor warns too).
+    if _utf16_len(memory) + _utf16_len(_START_SEP + ROUTING_TOO_LONG) <= budget:
+        return f"{memory}{_START_SEP}{ROUTING_TOO_LONG}", False
+    return memory, False
+
+
+ROUTING_TOO_LONG = ("## Routing\nKhipu's routing summary (the owner's standing rules, the note and every "
+                    "account's state) is too long to arrive at session start. Call `khipu_route` to read it.")
+
+
+def start_context_fits(routing_text: str, budget: int = _HOOK_CONTEXT_BUDGET) -> bool:
+    """Whether a routing summary can arrive at session start beside the
+    recall rule alone (the memory slice gives way first, the rule never)."""
+    return _utf16_len(RULE_MD.strip()) + _utf16_len(_START_SEP) + _utf16_len(routing_text) <= budget
+
+
+# ---- routing at session start (routing truth, phase 3a) -----------------------
+#
+# Session start runs for every conversation on the Mac, so the routing part
+# can never block or break it. It runs in a child process, forked before the
+# memory slice so the two overlap, and is given ``routing_start_budget_ms``
+# from that moment. A process, never a thread: a refold is CPU-bound Python,
+# and on a thread it would hold the GIL and starve the memory slice, so a
+# join's deadline never bounded the hook (a 79 MB log took 15 s). Late,
+# failed or switched off, it adds nothing and the hook prints exactly what
+# it printed before routing existed. The child folds outside the routing
+# lock and takes the lock only to save view.json (``routing._start_view``),
+# so it never keeps a conversation's write waiting while it folds. A late
+# child is left to finish only while it is folding a view it means to save
+# or saving it (``routing.finishing_view``), so the next start reads that
+# view instead of folding again; it is detached from the hook's output and
+# gone ``_ROUTING_CHILD_MOST`` seconds after its deadline. A late child doing
+# anything else (waiting for the lock, building the text) exits at once.
+
+_ROUTING_CHILD_MOST = 60.0
+_ROUTING_CHILD_GRACE = 0.05
+
+
+def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float) -> None:
+    """The forked child: write the summary's JSON to ``write_fd`` and exit.
+    Never returns, and never touches the hook's stdin, stdout or stderr."""
+    code = 1
+    try:
+        import signal
+
+        os.close(read_fd)
+        os.setsid()  # its own session: the harness's hold on the hook ends with the hook
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        from khipu import routing
+
+        def on_alarm(_sig, _frame) -> None:
+            if routing.finishing_view():
+                # Folding a view to save, outside the lock, or saving it: finish, within a bound.
+                signal.signal(signal.SIGALRM, lambda *_: os._exit(1))
+                signal.setitimer(signal.ITIMER_REAL, _ROUTING_CHILD_MOST)
+                return
+            os._exit(1)
+
+        signal.signal(signal.SIGALRM, on_alarm)
+        signal.setitimer(signal.ITIMER_REAL, max(0.0, deadline - time.monotonic()) + _ROUTING_CHILD_GRACE)
+        out = routing.start_push(budget)
+        if isinstance(out, dict):
+            data = memoryview(json.dumps({k: out.get(k) for k in ("text", "version", "epoch")}).encode("utf-8"))
+            while data:
+                data = data[os.write(write_fd, data):]
+        code = 0
+    except BaseException:  # noqa: BLE001 - nothing for routing, never a failed hook
+        code = 1
+    finally:
+        os._exit(code)
+
+
+class _RoutingAtStart:
+    def __init__(self) -> None:
+        self.out: dict | None = None
+        self.deadline = time.monotonic()
+        self.pid: int | None = None
+        self.fd: int | None = None
+
+    def begin(self) -> "_RoutingAtStart":
+        try:
+            from khipu import routing
+
+            started = time.monotonic()
+            if not hasattr(os, "fork") or routing.push_off("start"):
+                return self  # off: no child at all
+            # One small config read; any failure means the default second.
+            try:
+                budget = routing.start_budget()
+            except Exception:
+                budget = 1.0
+            self.deadline = started + budget
+            import warnings
+
+            read_fd, write_fd = os.pipe()
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)  # fork with threads (3.12+)
+                    pid = os.fork()
+            except BaseException:
+                os.close(read_fd)
+                os.close(write_fd)
+                raise
+            if pid == 0:
+                _routing_child(write_fd, read_fd, budget, self.deadline)
+            os.close(write_fd)
+            self.pid, self.fd = pid, read_fd
+        except Exception:
+            self._close()
+        return self
+
+    def text(self) -> str | None:
+        """The summary's text, or None (off, failed, late or empty). Output
+        the child finished before the deadline is read even when the memory
+        part ran past it."""
+        if self.fd is None:
+            return None
+        try:
+            import select
+
+            chunks: list[bytes] = []
+            while True:
+                left = max(0.0, self.deadline - time.monotonic())
+                ready, _, _ = select.select([self.fd], [], [], left)
+                if not ready:
+                    return None
+                chunk = os.read(self.fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            out = json.loads(b"".join(chunks).decode("utf-8")) if chunks else None
+            text = out.get("text") if isinstance(out, dict) else None
+            if not (isinstance(text, str) and text.strip()):
+                return None
+            self.out = out
+            return text
+        except Exception:
+            return None
+        finally:
+            self._close()
+
+    def _close(self) -> None:
+        fd, pid = self.fd, self.pid
+        self.fd = self.pid = None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if pid is not None:
+            def reap() -> None:
+                try:
+                    os.waitpid(pid, 0)
+                except OSError:
+                    pass
+
+            # A late child may run on; reaping it never holds the hook.
+            threading.Thread(target=reap, name="khipu-routing-reap", daemon=True).start()
+
+    def delivered(self, session_id) -> None:
+        """Reset the session's last-seen version to the one just printed and
+        record the time of this full summary."""
+        out = self.out
+        if not isinstance(session_id, str) or not session_id or not isinstance(out, dict):
+            return
+        try:
+            from khipu import recall_prompt, routing
+
+            recall_prompt.mark_routing_full(session_id, version=out["version"], epoch=out.get("epoch"),
+                                            at=routing._iso(routing._now()))
+        except Exception:
+            pass
 
 
 def session_start_main(*, shape: str | None = None) -> None:
@@ -474,25 +708,32 @@ def session_start_main(*, shape: str | None = None) -> None:
     ``shape`` is ``cursor`` (flat ``additional_context``) or ``claude`` (nested
     ``hookSpecificOutput``). Default is Claude. Cursor installs pass ``--cursor``
     on the shim argv; a process-wide env var must not reshape Claude SessionStart.
+    With routing's push on, the full routing summary follows the memory part,
+    and the whole stays within the harness's limit (``fit_start_context``).
     """
-    cwd = _session_start_cwd()
+    payload = _session_start_payload()
+    cwd = _session_start_cwd(payload)
     if is_helper_session(cwd):
         print("{}")  # T3's thread-title helper: no recall
         return
-    ctx = session_start_context(cwd)
+    routing = _RoutingAtStart().begin()
+    ctx, pushed = fit_start_context(session_start_context(cwd), routing.text())
     if shape is None:
         shape = "cursor" if "--cursor" in sys.argv[1:] else "claude"
     want = shape.strip().lower()
     if want == "cursor":
-        print(json.dumps({"additional_context": ctx}))
-        return
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
-                    "additionalContext": ctx,
-                }
+        out = {"additional_context": ctx}
+    else:
+        out = {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": ctx,
             }
-        )
-    )
+        }
+    print(json.dumps(out))
+    if pushed:
+        try:
+            sys.stdout.flush()
+        except Exception:
+            return
+        routing.delivered(payload.get("session_id") or payload.get("sessionId"))

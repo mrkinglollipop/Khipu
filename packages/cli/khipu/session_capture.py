@@ -294,16 +294,25 @@ def transcript_path(env: dict, harness: str = "", *, synth_sessions: set[str] | 
 
 # ---- transcript readers ---------------------------------------------------------
 
-_SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+# Blocks a harness writes into a user turn to carry hook output and other
+# context the person never typed. One entry per harness tag, so a new harness's
+# wrapper is one more name here, not a second stripping path:
+#   system-reminder  Claude Code (hook context, reminders)
+#   hooks_context    Cursor (sessionStart additional_context, recorded in the
+#                    agent transcript with a description="..." attribute)
+INJECTED_CONTEXT_TAGS = ("system-reminder", "hooks_context")
+_INJECTED_CONTEXT = re.compile(
+    r"<(" + "|".join(re.escape(t) for t in INJECTED_CONTEXT_TAGS) + r")(?:\s[^>]*)?>.*?</\1>", re.S)
 _CURSOR_WRAP = re.compile(r"</?(?:user_query|timestamp)>")
 
 
 def _clean_user_text(text: str) -> str:
-    """Strip harness-injected scaffolding from a user turn: Claude Code's
-    <system-reminder> blocks (thousands of chars of hook context, none of it the
+    """Strip harness-injected scaffolding from a user turn: the injected
+    context blocks in ``INJECTED_CONTEXT_TAGS`` (Claude Code's <system-reminder>,
+    Cursor's <hooks_context>; thousands of chars of hook context, none of it the
     user), Cursor's <user_query>/<timestamp> wrappers, and the hand-over T3 Code
     glues in front of the first message after a provider switch."""
-    cleaned = _SYSTEM_REMINDER.sub("", text)
+    cleaned = _INJECTED_CONTEXT.sub("", text)
     # A Claude system-reminder can leave its separator newline before a real
     # T3 header. The public stripper stays strict; this harness cleanup owns
     # that injected prefix.

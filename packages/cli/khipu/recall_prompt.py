@@ -164,22 +164,77 @@ def _load_recent_batches(session_id: str) -> list[tuple[str, ...]]:
     return [tuple(b) for b in batches if isinstance(b, list)]
 
 
+def _load_session_state(session_id: str) -> dict:
+    try:
+        raw = json.loads(_dedup_path(session_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _write_session_state(session_id: str, data: dict) -> None:
+    p = _dedup_path(session_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=p.parent,
+                                     prefix=p.name, suffix=".tmp", delete=False) as f:
+        tmp = Path(f.name)
+        json.dump(data, f)
+    try:
+        os.replace(tmp, p)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _save_recent_batches(session_id: str, batches: list[tuple[str, ...]]) -> None:
+    """Replace the dedup batches, keeping the file's other keys (the routing
+    marker the session-start hook writes)."""
     if not session_id:
         return
     try:
-        p = _dedup_path(session_id)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=p.parent,
-                                         prefix=p.name, suffix=".tmp", delete=False) as f:
-            tmp = Path(f.name)
-            json.dump({"batches": [list(b) for b in batches[-DEDUP_WINDOW:]]}, f)
-        try:
-            os.replace(tmp, p)
-        finally:
-            tmp.unlink(missing_ok=True)
+        data = _load_session_state(session_id)
+        data["batches"] = [list(b) for b in batches[-DEDUP_WINDOW:]]
+        _write_session_state(session_id, data)
     except OSError:
         pass
+
+
+# ---- the routing marker (routing truth, phase 3a) ---------------------------
+#
+# Each conversation's last-seen routing version and the time of its last full
+# summary live in this same per-session file, under "routing" (scope: "kept in
+# that session's existing per-prompt state, not in a new file per session").
+
+
+def routing_marker(session_id: str) -> dict:
+    """{"version", "epoch", "full_at"} as last recorded, or {}."""
+    if not session_id:
+        return {}
+    marker = _load_session_state(session_id).get("routing")
+    return marker if isinstance(marker, dict) else {}
+
+
+def mark_routing_full(session_id: str, *, version: int, epoch: str | None, at: str) -> bool:
+    """Record that the full summary at ``version`` was delivered at ``at``:
+    the session's last-seen version starts again from it. Takes the
+    session's lock without waiting; a busy lock or a failed write records
+    nothing (the next prompt then sends the full summary again) and is never
+    raised."""
+    if not session_id or fcntl is None:
+        return False
+    try:
+        p = _dedup_path(session_id).with_suffix(".lock")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return False
+            data = _load_session_state(session_id)
+            data["routing"] = {"version": version, "epoch": epoch, "full_at": at}
+            _write_session_state(session_id, data)
+        return True
+    except Exception:  # noqa: BLE001 - the session-start hook must not fail on its marker
+        return False
 
 
 def _batch_seen(ids: tuple[str, ...], recent: list[tuple[str, ...]]) -> bool:

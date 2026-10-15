@@ -27,7 +27,7 @@ can see and change all of it in the app. Khipu never decides where work goes.
 | 1a | The record and its fold: event log, versioned view with clock-driven refolds, rules, Matt's note, holds, owner clear; `khipu route`; the doctor block | M | done 2026-10-14 (one known limit, see Known limits; its fix is in phase 1b) |
 | 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | built, in review (branch feat/routing-truth-1b) |
 | 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | built, in review (branch feat/routing-truth-2) |
-| 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | open |
+| 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | built, in review (branch feat/routing-truth-3a) |
 | 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | open |
 | 3c | The daemon refolds on change and on the clock; the promotion gate's replay covers routing | S | open |
 | 4 | App: Home Routing card, Settings → Routing for what phases 1a to 3c built, health row, attention items | M–L | open (mock approved 2026-10-14; needs plan usage phase 2 merged) |
@@ -340,7 +340,10 @@ The push has two shapes.
   `khipu route`", and doctor warns. The rules and the note are never cut whatever their length; doctor warns
   when together they pass 1,500 characters so Matt can shorten them. On a Mac with no routing sources the
   account lines are replaced by "No routing record on this Mac." When `folded_at` is older than 5 minutes (a
-  setting), a line says "Khipu's record has not been refreshed since HH:MMZ."
+  setting), a line says "Khipu's record has not been refreshed since HH:MMZ." Claude Code keeps a hook's
+  text whole only up to 10,000 characters, so at session start whole lines of the memory slice are dropped
+  from its bottom to make room; a summary that still does not fit is left out whole, is not recorded as
+  delivered, and arrives with a later push.
 - **What changed since this conversation last saw the record**, on every prompt. Khipu takes every entity
   that changed between the session's last-seen version and the current one (an account, a hold, a rule, the
   note) and sends its **current** state, one line each; a line another version has since replaced is never
@@ -372,8 +375,8 @@ The per-prompt part follows these rules.
   characters, and the cap applies to those lines only: rules and the note are never clipped or capped, in
   either shape. Only Khipu-written lines appear. From conversations only structured values are pushed:
   account, state, until, scope, basis, a hold's scope and reason, and the author Khipu set. A conversation's
-  own words (a hold's text, its evidence line, the name it gives itself) are shown only in `khipu_route`
-  results and in the app. A hold's words are pushed only when Matt wrote them. File prose is never pushed.
+  own words (a hold's text, its evidence line, the name it gives itself, and its project, which is its
+  folder's name) are shown only in `khipu_route` results and in the app; a push names only its harness. A hold's words are pushed only when Matt wrote them. File prose is never pushed.
 - **Switches.** The `routing_push` feature (added to the closed `features.FEATURES` set; off by default in
   the public product; one setting, shown in Optional features and at the top of Settings → Routing) turns
   all of it on or off. Under it, one setting per moment: at session start and after compaction
