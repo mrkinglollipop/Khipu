@@ -136,13 +136,42 @@ class _Id:
         return self._value
 
 
+def _symlink_forms(path: str) -> set[str]:
+    """Full login-path spellings after each symlink hop, including parent links."""
+    path = Path(path)
+    current = Path(path.anchor) if path.is_absolute() else Path.cwd()
+    pending = list(path.parts[1:] if path.is_absolute() else path.parts)
+    forms: set[str] = set()
+    hops = 0
+    while pending and hops < 40:  # Bound cycles and pathological link chains.
+        part = pending.pop(0)
+        if part == "..":
+            current = current.parent
+            continue
+        candidate = current / part
+        try:
+            target = Path(os.readlink(candidate))
+        except OSError:
+            current = candidate
+            continue
+        hops += 1
+        forms.add(str(current / target / Path(*pending)))
+        if target.is_absolute():
+            current = Path(target.anchor)
+            pending = list(target.parts[1:]) + pending
+        else:
+            pending = list(target.parts) + pending
+    return forms
+
+
 def _forms(raw: str, home: str | None) -> set[str]:
-    """``raw`` as typed, expanded and resolved, in its ~/ form, each in NFC."""
+    """``raw`` as typed, expanded, each symlink hop and resolved, also ~/ and NFC."""
     raw = raw.strip()
     forms = {raw.rstrip("/") or raw}
     with contextlib.suppress(Exception):
         expanded = os.path.expanduser(raw).rstrip("/")
         forms |= {expanded, os.path.realpath(expanded).rstrip("/")}
+        forms |= _symlink_forms(expanded)
     if home:
         for base in {home, os.path.realpath(home)}:
             forms |= {"~" + f[len(base):] for f in list(forms) if f.startswith(base + "/")}
@@ -233,14 +262,21 @@ def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
 
     for harness, raw in _homes(extra_keys, view):
         ident = _Id(harness, raw)
+        default = raw is None
         if raw is None:
             folder = _DEFAULT_FOLDERS.get(harness)
             if not folder or not home:
                 continue
             raw = os.path.join(home, folder)
-            add_name(folder, ident, plain=False)
-        else:
-            folder = unicodedata.normalize("NFC", Path(raw.rstrip("/")).name).strip()
+        for path in sorted(_forms(raw, home)):
+            root_to.setdefault(_fold(path), ident)
+            paths.append(path)
+            folder = unicodedata.normalize("NFC", Path(path.rstrip("/")).name).strip()
+            # Default harness names are public vocabulary; only their dotted
+            # folder spelling is private. Symlink targets still need aliases.
+            if default and folder == _DEFAULT_FOLDERS.get(harness):
+                add_name(folder, ident, plain=False)
+                continue
             name = folder.lstrip(".")
             # The name as written, and as Khipu itself writes it into a
             # window's name ("weekly_<slug>", usage.parse_claude).
@@ -249,9 +285,6 @@ def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
                     # Aliases retain the original name's classification:
                     # stripping a dot or casefolding must not make it prose.
                     add_name(form, ident, plain=re.fullmatch(r"[a-z]+", folder) is not None)
-        for form in _forms(raw, home):
-            root_to.setdefault(_fold(form), ident)
-            paths.append(form)
     for path in _other_paths():
         if len(path.rstrip("/")) > 1:
             root_to.setdefault(_fold(path.rstrip("/")), FOLDER_WORD)

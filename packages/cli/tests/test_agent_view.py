@@ -145,6 +145,72 @@ def test_adapter_metadata_never_reaches_agents(owner, monkeypatch):
     assert _leaks(routing.prompt_push(None, budget=5), owner) == []
 
 
+@pytest.mark.parametrize("chain", [False, True])
+@pytest.mark.parametrize("payload", [
+    ".ResolvedLogin9", "ResolvedLogin9", ".RESOLVEDLOGIN9", "RESOLVEDLOGIN9",
+    "resolvedlogin9", ".LoginPointer9", "LoginPointer9", ".LOGINPOINTER9",
+])
+def test_symlink_login_metadata_never_reaches_agents(owner, monkeypatch, chain, payload):
+    from khipu.config import config_file
+
+    home = Path(owner["home"])
+    resolved = home / ".ResolvedLogin9"
+    resolved.mkdir()
+    pointer = home / ".LoginPointer9"
+    if chain:
+        middle = home / ".MiddleLogin9"
+        middle.symlink_to(resolved.name, target_is_directory=True)
+        pointer.symlink_to(middle.name, target_is_directory=True)
+    else:
+        pointer.symlink_to(resolved, target_is_directory=True)
+    config_file().write_text(json.dumps({"usage_accounts": [
+        {"label": "Work", "harness": "claude", "home": "~/.LoginPointer9"}]}))
+    monkeypatch.setattr(usage, "_command", lambda h: "/tmp/fake-cli")
+    metadata = frames()
+    metadata[0]["response"]["response"]["claude_code_version"] = payload
+    metadata[1]["response"]["response"]["subscription_type"] = payload
+    monkeypatch.setattr(usage, "_converse", lambda *a, **kw: metadata)
+    raw = usage.report(fresh=True)["accounts"][0]
+    assert raw["plan"] == raw["version"] == payload
+    err, out = call("khipu_usage")
+    assert not err
+    assert _survivors(out, [payload]) == []
+    if chain:
+        for alias in _forms_of(".MiddleLogin9"):
+            assert _survivors(agent_view.scrub(f"Provider reports {alias} today"), [alias]) == []
+
+
+def test_symlink_aliases_follow_parent_links_and_changed_hops(owner):
+    from khipu.config import config_file
+
+    home = Path(owner["home"])
+    storage = home / "storage"
+    storage.mkdir()
+    resolved = storage / ".ResolvedLogin9"
+    resolved.mkdir()
+    middle = storage / ".MiddleLogin9"
+    middle.symlink_to(resolved.name, target_is_directory=True)
+    pointer = storage / ".LoginPointer9"
+    pointer.symlink_to(middle.name, target_is_directory=True)
+    parent = home / "ParentPointer9"
+    parent.symlink_to(storage, target_is_directory=True)
+    configured = "~/ParentPointer9/.LoginPointer9"
+    config_file().write_text(json.dumps({"usage_accounts": [
+        {"label": "Work", "harness": "claude", "home": configured}]}))
+    for spelling in (configured, str(parent / pointer.name), str(pointer), str(middle), str(resolved)):
+        assert spelling not in agent_view.scrub(spelling)
+        for alias in _forms_of(Path(spelling).name):
+            assert _survivors(agent_view.scrub(f"Provider reports {alias} today"), [alias]) == []
+    before = agent_view._TABLE["table"]
+    changed = storage / ".ChangedHop9"
+    changed.symlink_to(resolved.name, target_is_directory=True)
+    pointer.unlink()
+    pointer.symlink_to(changed.name, target_is_directory=True)
+    for alias in _forms_of(changed.name):
+        assert _survivors(agent_view.scrub(f"Provider reports {alias} today"), [alias]) == []
+    assert agent_view._TABLE["table"] is not before
+
+
 def test_a_cached_note_naming_the_user_is_not_passed_on(owner):
     cache(owner["account"], note=f"Previous attempt failed for {USER}")
     err, out = call("khipu_usage")
