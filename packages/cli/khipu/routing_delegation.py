@@ -28,9 +28,10 @@ import itertools
 import json
 import os
 import re
-import sys
 import time
 from typing import Any
+
+from khipu import wire
 
 # Claude Code's subagent tool (``Task`` in older versions) and Codex's native
 # one (``spawn_agent``).
@@ -505,7 +506,7 @@ def main() -> None:
     """Entry point for ``bin/khipu-delegation-hook``. Never raises and never
     fails the call: any error prints ``{}``."""
     try:
-        raw = sys.stdin.read()
+        raw = wire.read_stdin()
     except Exception:  # noqa: BLE001
         raw = ""
     info, kind, out = None, None, {}
@@ -515,7 +516,7 @@ def main() -> None:
         out = {}
     delivered = True
     try:
-        print(json.dumps(out), flush=True)
+        print(wire.dumps(out, ensure_ascii=True), flush=True)
     except OSError:
         delivered = False
     if kind is None:

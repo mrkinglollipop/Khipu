@@ -82,6 +82,7 @@ from pathlib import Path
 from typing import Any
 
 from khipu import claude_homes as _homes
+from khipu import wire
 
 HARNESSES = ("claude_code", "cursor", "aegis", "codex", "grok_bot")
 HOME = Path.home()
@@ -1992,7 +1993,7 @@ def _probe_gateway(url: str, token: str) -> dict:
         req = urllib.request.Request(url + "/mcp", data=body, method="POST",
                                      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as resp:
-            frames = json.loads(resp.read().decode())
+            frames = json.loads(resp.read().decode("utf-8"))
         tools = [t["name"] for t in frames[1]["result"]["tools"]]
         st = json.loads(frames[2]["result"]["content"][0]["text"])
         # negative: a wrong token must be refused
@@ -2055,7 +2056,7 @@ def _gateway_healthz(url: str, token: str, *, timeout: float) -> Any:
 
     req = urllib.request.Request(url + "/healthz", headers={"Authorization": f"Bearer {token}"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+        return json.loads(resp.read().decode("utf-8"))
 
 
 def gateway_liveness_check() -> dict[str, Any]:
@@ -2117,12 +2118,14 @@ def _probe_mcp(command: str) -> dict:
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "khipu_status", "arguments": {}}},
     )) + "\n"
     try:
-        p = subprocess.run([command], input=lines, capture_output=True, text=True, timeout=60)
+        p = subprocess.run([command], input=lines.encode("utf-8"), capture_output=True, timeout=60)
+        # Bytes as UTF-8 whatever the locale, split on LF only: a literal
+        # U+2028 inside a string is not a frame boundary.
+        frames = [json.loads(ln) for ln in wire.split_frames(p.stdout)]
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    frames = [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
     if len(frames) < 2 or "result" not in frames[1]:
-        return {"ok": False, "error": (p.stderr or p.stdout)[-300:]}
+        return {"ok": False, "error": (p.stderr or p.stdout).decode("utf-8", "replace")[-300:]}
     body = json.loads(frames[1]["result"]["content"][0]["text"])
     return {"ok": not frames[1]["result"].get("isError") and "counts" in body,
             "episodes": body.get("counts", {}).get("episodes"), "ms": int((time.time() - t0) * 1000)}
@@ -2143,7 +2146,7 @@ def _probe_hook(command: str) -> dict:
             # inside the harnesses themselves).
             env = dict(os.environ, KHIPU_CAPTURE_HOME=str(Path(td) / "kh"), KHIPU_CAPTURE_NO_DRAIN="1")
             p = subprocess.run(command, shell=True, input='{"hook_event_name":"Stop","session_id":"khipu-verify"}',
-                               capture_output=True, text=True, timeout=60, env=env)
+                               capture_output=True, encoding="utf-8", timeout=60, env=env)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
     out = {"ok": p.returncode == 0, "exit": p.returncode, "ms": int((time.time() - t0) * 1000)}
@@ -2157,7 +2160,7 @@ def _probe_recall(command: str) -> dict:
     Shell-run for the same reason as _probe_hook."""
     t0 = time.time()
     try:
-        p = subprocess.run(command, shell=True, input="{}", capture_output=True, text=True, timeout=30)
+        p = subprocess.run(command, shell=True, input="{}", capture_output=True, encoding="utf-8", timeout=30)
         d = json.loads(p.stdout.strip() or "{}")
         ctx = (
             d.get("hookSpecificOutput", {}).get("additionalContext")
@@ -2231,11 +2234,11 @@ def _probe_prompt_recall(command: str) -> dict:
     try:
         trivial = subprocess.run(command, shell=True,
                                   input=json.dumps({"prompt": "ok", "session_id": trivial_session_id}),
-                                  capture_output=True, text=True, timeout=10)
+                                  capture_output=True, encoding="utf-8", timeout=10)
         topical = subprocess.run(
             command, shell=True,
             input=json.dumps({"prompt": "khipu prompt recall verify probe", "session_id": topical_session_id}),
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, encoding="utf-8", timeout=10,
         )
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -2291,7 +2294,7 @@ def _probe_extract(command: str) -> dict:
             khome = Path(td) / "khipu-home"
             env = dict(os.environ, KHIPU_AEGIS_PROBE="1", KHIPU_AEGIS_HOME=str(khome),
                        KHIPU_HARNESS="aegis")
-            p = subprocess.run(command, shell=True, input=envl, capture_output=True, text=True,
+            p = subprocess.run(command, shell=True, input=envl, capture_output=True, encoding="utf-8",
                                timeout=30, env=env)
             d = json.loads((p.stdout or "").strip() or "{}")
             # The job on disk is the real assertion: a "due" that queued nothing
@@ -2350,7 +2353,7 @@ def _probe_native_extract(command: str, harness: str) -> dict:
             env.update(KHIPU_CAPTURE_HOME=str(khome), KHIPU_CAPTURE_NO_DRAIN="1",
                        KHIPU_MEMORY_ROOT=str(Path(td) / "mem"))
             p = subprocess.run(command, shell=True, input=json.dumps(envl), capture_output=True,
-                               text=True, timeout=60, env=env)
+                               encoding="utf-8", timeout=60, env=env)
             queued = list((khome / "queue").glob("*.json"))
             beat = {}
             try:
@@ -2416,7 +2419,7 @@ def _probe_aegis_isolation(command: str) -> dict:
                 env = {k: v for k, v in os.environ.items() if k != "KHIPU_HARNESS"}
                 env.update(aegis_env, HOME=home, KHIPU_AEGIS_HOME=str(Path(home) / "kh"), **extra)
                 p = subprocess.run(command, shell=True, input=payload, capture_output=True,
-                                   text=True, timeout=60, env=env)
+                                   encoding="utf-8", timeout=60, env=env)
                 ran = (Path(home) / "kh" / "dispatch" / "aegis.json").is_file()
                 results[label] = (ran if label == "native_ran" else not ran) and p.returncode == 0
         out = {"ok": all(results.values()), **results, "ms": int((time.time() - t0) * 1000)}
@@ -2454,7 +2457,7 @@ def _probe_aegis_refusal(command: str) -> dict:
                 env = {k: v for k, v in os.environ.items() if k != "KHIPU_HARNESS"}
                 env.update(aegis_env, HOME=home, KHIPU_AEGIS_HOME=str(Path(home) / "kh"), **extra)
                 p = subprocess.run(command, shell=True, input=payload, capture_output=True,
-                                   text=True, timeout=60, env=env)
+                                   encoding="utf-8", timeout=60, env=env)
                 wrote = any(Path(home).rglob("*"))
                 # The recall hook refuses by printing a bare {}, so silence on
                 # disk is not enough — an emitted rule is also a breach.
