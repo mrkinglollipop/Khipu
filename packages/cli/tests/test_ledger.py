@@ -1541,3 +1541,67 @@ def test_a_retry_whose_job_lands_while_it_looks_is_answered_as_landed(monkeypatc
 
     monkeypatch.setattr(ledger, "_job_path", gone_after_lookup)
     assert ledger._known_op(dict(op)) == {"ok": True, "line": "already landed"}
+
+
+def test_a_direct_write_that_finds_the_hub_away_keeps_its_place_ahead_of_a_later_one(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    in_flight, landed = threading.Event(), []
+    real_enqueue, later_queued = ledger.enqueue, threading.Event()
+
+    def apply(_c, op, **_kw):
+        if op["op_id"] == "older" and not landed and not in_flight.is_set():
+            in_flight.set()
+            later_queued.wait(1)  # a later write that could queue and drain now would go first
+            raise ledger.HubAway("synthetic: the hub went away mid-write")
+        landed.append(op["op_id"])
+        return {"ok": True}
+
+    def enqueue(op, reason=""):
+        path = real_enqueue(op, reason)
+        if op["op_id"] == "later":
+            later_queued.set()
+        return path
+
+    monkeypatch.setattr(ledger, "apply_op", apply)
+    monkeypatch.setattr(ledger, "enqueue", enqueue)
+    monkeypatch.setattr(ledger, "DRAIN_WAIT_S", 2)
+    answers = {}
+
+    def writer(name):
+        answers[name] = ledger.write(ledger.new_op("set", P, "r", fields={"evidence": name}, op_id=name),
+                                     conn=_Conn())
+
+    older = threading.Thread(target=writer, args=("older",))
+    older.start()
+    assert in_flight.wait(5)
+    later = threading.Thread(target=writer, args=("later",))
+    later.start()
+    older.join(10)
+    later.join(10)
+    # The older write joined the line before letting go: the later one drains it first.
+    assert landed == ["older", "later"] and ledger.queued_ops() == []
+
+
+def test_a_retry_of_a_long_landed_write_while_away_is_answered_as_landed(monkeypatch, tmp_path):
+    import time
+
+    ledger = _offline(monkeypatch, tmp_path)
+    op = ledger.new_op("set", P, "r", fields={"evidence": "one"}, op_id="old")
+    ledger._record_outcome(op, "landed", result={"ok": True, "line": "set r: evidence"})
+    old = time.time() - ledger.OUTCOME_KEEP_S - 60
+    os.utime(ledger._outcomes_dir() / "old.json", (old, old))
+    ledger._prune_outcomes()
+    got = ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "one"}, op_id="old"))
+    assert got["ok"] and not got.get("queued") and ledger.queued_ops() == []
+
+
+def test_the_hubs_record_of_a_purged_rows_op_answers_purged(hub):
+    from khipu import ledger
+
+    op = ledger.new_op("add", P, "a", fields={"title": "A", "kind": "slice"}, op_id="first")
+    assert ledger.write(dict(op))["ok"]
+    ok("remove", "a")
+    ok("purge", "a", "--from-app")
+    with _real_connect(hub) as conn, pytest.raises(ledger.LedgerError) as err:
+        ledger._landed_result(conn, dict(op))
+    assert err.value.reason == "purged"
