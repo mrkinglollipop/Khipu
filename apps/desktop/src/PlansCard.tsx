@@ -17,7 +17,7 @@ import type { FormEvent } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 import { EmptyState, ListRow, Tag } from "./ui";
 import { callCli, useCliState } from "./settingsCli";
-import { fmtAgeSince } from "./time";
+import { fmtAgoSince } from "./time";
 import type { Attention } from "./doctorAttention";
 
 export type UsageWindow = {
@@ -407,16 +407,21 @@ export type PlanUsageState = ReturnType<typeof usePlanUsage>;
 
 /** Whether Khipu can read the account now, in plain words: "Live: read 2 min
  *  ago", "Signed in, but its plan figures can't be read", "Not signed in",
- *  "CLI not installed". */
-export function liveWords(row: UsageAccount): { text: string; live: boolean } {
+ *  "CLI not installed". A read that worked but brought no figures (Muse
+ *  before its first turn) is never "Live": it says when it was checked, and
+ *  `checked` marks it so nobody is asked to sign in. */
+export function liveWords(row: UsageAccount): { text: string; live: boolean; checked?: boolean } {
   const code = row.ok === false ? row.error : row.live_error ?? null;
   if (code === "not_installed") return { text: "CLI not installed", live: false };
   if (code === "not_signed_in") return { text: "Not signed in", live: false };
   if (code === "no_plan_limits") return { text: "Signed in, but its plan figures can't be read", live: false };
   if (code === "pending") return { text: "Reading it for the first time", live: false };
   if (row.ok === false) return { text: `Can't be read just now (${usageErrorPhrase(code)})`, live: false };
-  const age = fmtAgeSince(row.last_attempt_at || row.probed_at);
-  return { text: age ? `Live: read ${age} ago` : "Live", live: true };
+  const age = fmtAgoSince(row.last_attempt_at || row.probed_at);
+  if (!(row.windows ?? []).some((w) => pctOf(w) != null)) {
+    return { text: age ? `Checked ${age}, no figures yet` : "Checked, no figures yet", live: false, checked: true };
+  }
+  return { text: age ? `Live: read ${age}` : "Live", live: true };
 }
 
 /** The CLIs whose own login the app can start (`khipu.usage.SIGN_IN_ARGS`):
@@ -428,9 +433,9 @@ const CLI_TITLE: Record<string, string> = { claude: "Claude Code", codex: "Codex
  *  when the owner signs in from the CLI itself, null when it is live or its
  *  CLI is not installed. */
 export function signInOffer(row: UsageAccount): "button" | "elsewhere" | null {
-  const { live } = liveWords(row);
+  const { live, checked } = liveWords(row);
   const code = row.ok === false ? row.error : row.live_error ?? null;
-  if (live || code === "not_installed" || code === "pending" || code === "invalid_account") return null;
+  if (live || checked || code === "not_installed" || code === "pending" || code === "invalid_account") return null;
   return SIGN_IN_CLIS.has(row.harness ?? "") ? "button" : "elsewhere";
 }
 
@@ -476,7 +481,7 @@ export function AccountReach({ row, onSignedIn }: { row: UsageAccount; onSignedI
   };
   return (
     <span className="plan-reach">
-      <Tag tone={live.live ? "ok" : "warn"} dot>
+      <Tag tone={live.live ? "ok" : live.checked ? "neutral" : "warn"} dot={!live.checked}>
         {live.text}
       </Tag>
       {offer === "button" ? (
@@ -525,11 +530,11 @@ function figuresAt(row: UsageAccount): string | null {
 }
 
 function StatusTags({ row }: { row: UsageAccount }) {
-  const age = fmtAgeSince(figuresAt(row));
+  const age = fmtAgoSince(figuresAt(row));
   if (row.observed_at) {
-    return <Tag tone={row.stale ? "warn" : "neutral"}>{age ? `as of the last turn, ${age} ago` : "as of the last turn"}</Tag>;
+    return <Tag tone={row.stale ? "warn" : "neutral"}>{age ? `as of the last turn, ${age}` : "as of the last turn"}</Tag>;
   }
-  if (row.stale) return <Tag tone="warn">{age ? `figures from ${age} ago` : "stale"}</Tag>;
+  if (row.stale) return <Tag tone="warn">{age ? `figures from ${age}` : "stale"}</Tag>;
   return null;
 }
 
@@ -635,13 +640,13 @@ export function PlansCard({ state }: { state: PlanUsageState }) {
  *  from 30s ago" for a fresh read, "last tried 30s ago" with no figures. */
 function readWhen(row: UsageAccount, hasFigures: boolean): string {
   const tried = row.last_attempt_at || row.probed_at || null;
-  const triedAge = fmtAgeSince(tried);
-  if (!hasFigures) return triedAge ? `last tried ${triedAge} ago` : "";
+  const triedAge = fmtAgoSince(tried);
+  if (!hasFigures) return triedAge ? `last tried ${triedAge}` : "";
   const figures = figuresAt(row);
-  const figuresAge = fmtAgeSince(figures);
-  const parts = figuresAge ? [`figures from ${figuresAge} ago`] : [];
+  const figuresAge = fmtAgoSince(figures);
+  const parts = figuresAge ? [`figures from ${figuresAge}`] : [];
   const gap = figures && tried ? Math.abs(new Date(tried).getTime() - new Date(figures).getTime()) : 0;
-  if (triedAge && (row.ok === false || gap > 60_000)) parts.push(`last tried ${triedAge} ago`);
+  if (triedAge && (row.ok === false || gap > 60_000)) parts.push(`last tried ${triedAge}`);
   return parts.join(" · ");
 }
 

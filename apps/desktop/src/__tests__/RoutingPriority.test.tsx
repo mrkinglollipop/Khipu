@@ -22,7 +22,8 @@ const TWO_MIN_AGO = "2026-10-15T13:58:00Z";
 const SECOND = "claude|/logins/claude-second";
 
 function row(extra: Partial<UsageAccount>): UsageAccount {
-  return { harness: "claude", account: "Claude", home: null, ok: true, error: null, windows: [],
+  return { harness: "claude", account: "Claude", home: null, ok: true, error: null,
+    windows: [{ name: "weekly", used_pct: 10, resets_at: null }],
     probed_at: TWO_MIN_AGO, last_attempt_at: TWO_MIN_AGO, ...extra };
 }
 
@@ -98,7 +99,7 @@ describe("each account says whether Khipu can read it", () => {
     render(<PlansSettingsCard state={state} active />);
     fireEvent.click(within(screen.getByRole("group", { name: "Claude second" })).getByRole("button", { name: "Sign Claude second in again" }));
     await waitFor(() => expect(calls("khipu_account_sign_in")).toEqual([{ harness: "claude", home: "~/.claude-second" }]));
-    await screen.findByText("Signed in. Live: read 0s ago.");
+    await screen.findByText("Signed in. Live: read just now.");
     expect(state.reread).toHaveBeenCalledTimes(1);
     fireEvent.click(within(screen.getByRole("group", { name: "Claude" })).getByRole("button", { name: "Sign Claude in again" }));
     await waitFor(() => expect(calls("khipu_account_sign_in")[1]).toEqual({ harness: "claude", home: null }));
