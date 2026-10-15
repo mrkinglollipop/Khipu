@@ -132,7 +132,8 @@ class EnqueueRecordsOriginTest(_OutboxOriginBase):
         with mock.patch("khipu.request_context.request_origin",
                         side_effect=MachineIdentityError("no id")):
             job = self._queue(label=None)
-        self.assertNotIn("origin", job)
+        self.assertIn("origin", job)
+        self.assertIsNone(job["origin"], "unknown is recorded, never left for the drainer to fill")
 
     def test_the_same_payload_from_two_callers_queues_twice(self):
         with rc.gateway_request("caller-a"):
@@ -191,6 +192,15 @@ class ReplayRestoresOriginTest(_OutboxOriginBase):
         jp.write_text(json.dumps(job))
         inserts = self._replay(_cli_drain)
         self.assertEqual([i.get("origin") for i in inserts], ["gateway:caller-a"])
+
+    def test_an_unreadable_identity_at_queue_time_stays_unknown_on_another_drainer(self):
+        from khipu.machine_identity import MachineIdentityError
+
+        with mock.patch("khipu.request_context.request_origin",
+                        side_effect=MachineIdentityError("no id")):
+            self._queue(label=None)
+        inserts = self._replay(_cli_drain)
+        self.assertEqual([i.get("origin") for i in inserts], [None])
 
     def test_a_job_queued_before_this_change_takes_the_drainers_origin(self):
         outbox._atomic_write(outbox.outbox_dir() / "legacy.json",

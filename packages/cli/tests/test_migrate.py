@@ -140,6 +140,44 @@ class RunTest(unittest.TestCase):
         self.assertIn("0000_a", cur.applied)
 
 
+    def test_a_file_split_into_steps_commits_each_step_and_records_last(self):
+        d = _dir([])
+        (d / "0000_a.sql").write_text(
+            "-- header\n-- khipu:step 1\nSELECT 'one', current_setting('khipu.local_origin');\n"
+            "-- khipu:step 2\nSELECT 'two';\n")
+        cur = FakeCursor(applied=set())
+        conn = FakeConn(cur)
+        commits_at = []
+        conn.commit = lambda: commits_at.append(len(cur.executed))
+        with mock.patch("khipu.db.connect", return_value=conn):
+            migrate.run(directory=d)
+        sqls = [s for s, _ in cur.executed]
+        one = next(i for i, s in enumerate(sqls) if "'one'" in s)
+        two = next(i for i, s in enumerate(sqls) if "'two'" in s)
+        record = next(i for i, s in enumerate(sqls) if s.startswith("INSERT INTO schema_migrations"))
+        self.assertNotIn("'two'", sqls[one], "each step is its own statement batch")
+        self.assertTrue(one < commits_at[0] <= two < record < commits_at[1])
+        self.assertEqual(len(commits_at), 2)
+        # The transaction-local identity is set again before every step.
+        self.assertEqual(sum(1 for s in sqls if "set_config" in s), 2)
+        self.assertEqual(sqls[one - 1].startswith("SELECT set_config"), True)
+        self.assertEqual(sqls[two - 1].startswith("SELECT set_config"), True)
+
+    def test_0029_runs_its_exclusive_lock_alone_with_a_lock_timeout(self):
+        path = dict(migrate.available())["0029_episode_origin"]
+        parts = migrate.steps(path.read_text(encoding="utf-8"))
+        self.assertEqual(len(parts), 3)
+        for part in parts:
+            self.assertIn("SET LOCAL lock_timeout", part)
+        self.assertIn("ALTER TABLE episodes ADD COLUMN", parts[0])
+        self.assertNotIn("CREATE INDEX", parts[0])
+        self.assertNotIn("UPDATE episodes", parts[0])
+        self.assertIn("CREATE INDEX", parts[1])
+        self.assertIn("UPDATE episodes", parts[2])
+        self.assertIn("schema_migrations", parts[2])
+        self.assertNotIn("schema_migrations", parts[0] + parts[1])
+
+
 class RepoMigrationsTest(unittest.TestCase):
     def test_the_repo_migrations_are_discoverable_and_self_recording(self):
         files = migrate.available()

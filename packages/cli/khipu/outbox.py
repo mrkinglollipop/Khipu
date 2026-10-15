@@ -89,15 +89,17 @@ def _locked_outbox():
 def _queued_origin() -> dict[str, Any]:
     """The origin to keep beside the payload, stamped now from the request
     context (gateway provenance, phase 1), so a replay from another process or
-    machine writes the row as the caller that queued it. Empty when this
-    machine has no readable identity: the replay then stamps what it can."""
+    machine writes the row as the caller that queued it. When this machine has
+    no readable identity the owner is recorded as unknown (None), never left
+    out: a job without the key is a legacy job, which the drainer stamps with
+    its own identity, and that machine may not be the one that queued it."""
     from khipu.machine_identity import MachineIdentityError
     from khipu.request_context import request_origin
 
     try:
         return {"origin": request_origin()}
     except MachineIdentityError:
-        return {}
+        return {"origin": None}
 
 
 def _same_evidence(job: dict[str, Any], payload: dict[str, Any], stamp: dict[str, Any]) -> bool:

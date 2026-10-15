@@ -217,14 +217,24 @@ class MigrationScratchTest(unittest.TestCase):
         for eid in local + other:
             self.assertIsNone(self._origin_of(eid), eid)
 
-    def test_migration_file_is_one_statement_so_a_refusal_applies_nothing(self):
+    def test_every_step_is_one_statement_that_refuses_first(self):
         # Under a psql that continues past errors, every top-level statement
-        # after a failure would still run. One DO block is one statement.
-        body = "\n".join(line for line in _migration_sql().splitlines()
-                         if not line.lstrip().startswith("--")).strip()
-        self.assertTrue(body.startswith("DO $$"))
-        self.assertTrue(body.endswith("$$;"))
-        self.assertEqual(body.count("$$"), 2)
+        # after a failure would still run. Each step (one transaction under
+        # `khipu migrate`) is its lock_timeout and one DO block that checks
+        # the identity before it changes anything.
+        from khipu import migrate
+
+        parts = migrate.steps(_migration_sql())
+        self.assertEqual(len(parts), 3)
+        for part in parts:
+            body = "\n".join(line for line in part.splitlines()
+                             if not line.lstrip().startswith("--")
+                             and not line.startswith("SET LOCAL lock_timeout")).strip()
+            self.assertTrue(body.startswith("DO $$"))
+            self.assertTrue(body.endswith("$$;"))
+            self.assertEqual(body.count("$$"), 2)
+            self.assertLess(body.index("RAISE EXCEPTION"),
+                            min(body.find(k) for k in ("ALTER", "CREATE", "UPDATE") if k in body))
 
     def test_default_runner_applies_none_and_never_reads_the_identity(self):
         from khipu import migrate
@@ -428,3 +438,100 @@ class WriteOriginScratchTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"KHIPU_GATEWAY_ACTIVE": "1"}):
             self._write(self._replay_payload(f"unowned process replay {n}", f"claude_code:{n}"))
         self.assertIsNone(self._origin(unowned)[0])
+
+
+class MigrationLockTimeoutScratchTest(unittest.TestCase):
+    """The runner against a real hub while another transaction holds episodes.
+    These commit (the runner commits per step), so each test returns the
+    scratch database to its found state: 0029 applied."""
+
+    def setUp(self):
+        self.conn = _direct_connect()
+        self.cur = self.conn.cursor()
+        self.addCleanup(self._restore)
+        self._unapply()
+
+    def _unapply(self):
+        self.cur.execute("DROP INDEX IF EXISTS idx_episodes_origin")
+        self.cur.execute("ALTER TABLE episodes DROP COLUMN IF EXISTS origin")
+        self.cur.execute("DELETE FROM schema_migrations WHERE version = %s", (VERSION,))
+        self.conn.commit()
+
+    def _restore(self):
+        self.conn.rollback()
+        from khipu import migrate
+
+        with mock.patch("khipu.machine_identity.local_origin", return_value=LOCAL):
+            migrate.run(conn=self.conn, directory=_migration_path().parent)
+        self.conn.close()
+
+    def _state(self):
+        self.cur.execute("SELECT count(*) FROM information_schema.columns "
+                         "WHERE table_name = 'episodes' AND column_name = 'origin'")
+        col = self.cur.fetchone()[0]
+        self.cur.execute("SELECT to_regclass('idx_episodes_origin') IS NOT NULL")
+        idx = self.cur.fetchone()[0]
+        self.cur.execute("SELECT count(*) FROM schema_migrations WHERE version = %s", (VERSION,))
+        ver = self.cur.fetchone()[0]
+        self.conn.rollback()
+        return col, idx, ver
+
+    def _run(self):
+        import time
+
+        from khipu import migrate
+
+        with mock.patch.object(migrate, "plan", return_value={
+                "applied": [], "pending": [VERSION], "unknown_applied": [],
+                "_pending_paths": [(VERSION, _migration_path())]}):
+            t0 = time.monotonic()
+            try:
+                return migrate.run(conn=self.conn, directory=_migration_path().parent), \
+                    time.monotonic() - t0
+            except Exception as exc:
+                self.conn.rollback()
+                return exc, time.monotonic() - t0
+
+    def test_a_held_lock_fails_fast_changes_nothing_and_a_rerun_applies(self):
+        holder = _direct_connect()
+        try:
+            hcur = holder.cursor()
+            hcur.execute("LOCK TABLE episodes IN ACCESS SHARE MODE")  # a long reader
+            out, took = self._run()
+            self.assertIsInstance(out, psycopg.errors.LockNotAvailable)
+            self.assertLess(took, 15, "the lock wait is bounded by lock_timeout")
+            self.assertEqual(self._state(), (0, False, 0), "a timed-out run changes nothing")
+        finally:
+            holder.rollback()
+            holder.close()
+        out, _ = self._run()
+        self.assertEqual(out["ran"], [VERSION])
+        self.assertEqual(self._state(), (1, True, 1))
+
+    def test_a_run_interrupted_after_the_column_step_completes_on_rerun(self):
+        # The state a failed step 2 or 3 leaves: the column, no index, no version.
+        self.cur.execute("ALTER TABLE episodes ADD COLUMN origin TEXT")
+        self.conn.commit()
+        self.assertEqual(self._state(), (1, False, 0))
+        out, _ = self._run()
+        self.assertEqual(out["ran"], [VERSION])
+        self.assertEqual(self._state(), (1, True, 1))
+
+    def test_a_refusal_under_psql_continuing_past_errors_applies_nothing(self):
+        # Each top-level statement in its own transaction, as psql without
+        # ON_ERROR_STOP runs the file and with no identity set, starting from
+        # the column-only state a failed run can leave.
+        from khipu import migrate
+
+        self.cur.execute("ALTER TABLE episodes ADD COLUMN origin TEXT")
+        self.conn.commit()
+        for part in migrate.steps(_migration_sql()):
+            for stmt in part.split("SET LOCAL lock_timeout = '5s';"):
+                if any(ln.strip() and not ln.lstrip().startswith("--") for ln in stmt.splitlines()):
+                    try:
+                        self.cur.execute(stmt)
+                        self.conn.commit()
+                    except psycopg.Error:
+                        self.conn.rollback()
+        self.assertEqual(self._state(), (1, False, 0))
+

@@ -4,7 +4,12 @@ Every migration file records itself in ``schema_migrations`` (``INSERT … ON
 CONFLICT DO NOTHING``), so applying is idempotent at the SQL level; this runner
 additionally skips files whose version is already recorded, so a re-run on a
 live database executes nothing. Files run in name order inside one transaction
-each: a failing migration leaves the database at the previous version.
+each: a failing migration leaves the database at the previous version. A file
+may split itself with "-- khipu:step" lines; each section is then its own
+transaction, so a lock taken by one step is released before the next, and the
+file records its version only in its last step: a failed step leaves the
+version unrecorded and a re-run applies the whole file again (each step must
+therefore be idempotent).
 
 Until this existed the schema was applied by hand from a private runbook, which
 is fine for one operator and useless for anyone else setting Khipu up.
@@ -22,6 +27,16 @@ _VERSION_RE = re.compile(r"^(\d{4}_[a-z0-9_]+)\.sql$")
 LOCAL_ORIGIN_SETTING = "khipu.local_origin"
 # The value that applies such a migration without claiming any existing row.
 LOCAL_ORIGIN_NONE = "none"
+_STEP_RE = re.compile(r"^-- khipu:step\b.*$", re.MULTILINE)
+
+
+def steps(sql: str) -> list[str]:
+    """The transactions a migration file runs as, in order."""
+    parts = _STEP_RE.split(sql)
+    # A section of comments alone (the file's header) is not a transaction.
+    return [p for p in parts
+            if any(ln.strip() and not ln.strip().startswith("--") for ln in p.splitlines())
+            ] or [sql]
 
 
 def migrations_dir() -> Path:
@@ -104,27 +119,33 @@ def _run_migrations(conn, *, dry_run: bool, directory: Path | None,
         return result
     for version, path in pending:
         sql = path.read_text(encoding="utf-8")
-        # One transaction per file. psycopg's connection is a transaction
-        # already; commit after each so a later failure cannot roll back an
-        # earlier, successful migration.
-        with conn.cursor() as cur:
-            if LOCAL_ORIGIN_SETTING in sql:
-                # Raises MachineIdentityError before the file runs when this
-                # machine has no readable identity.
-                from khipu.machine_identity import local_origin
+        value = None
+        if LOCAL_ORIGIN_SETTING in sql:
+            # Raises MachineIdentityError before the file runs when this
+            # machine has no readable identity.
+            from khipu.machine_identity import local_origin
 
-                value = local_origin() if claim_local_rows else LOCAL_ORIGIN_NONE
-                cur.execute("SELECT set_config(%s, %s, true)",
-                            (LOCAL_ORIGIN_SETTING, value))
-            cur.execute(sql)
-            # Belt and braces: the file records itself, but if a migration
-            # forgets to, the runner would re-apply it forever.
-            cur.execute(
-                "INSERT INTO schema_migrations (version, note) VALUES (%s, %s) "
-                "ON CONFLICT (version) DO NOTHING",
-                (version, f"applied by khipu migrate from {path.name}"),
-            )
-        conn.commit()
+            value = local_origin() if claim_local_rows else LOCAL_ORIGIN_NONE
+        # One transaction per file, or per step of a file that splits itself.
+        # psycopg's connection is a transaction already; commit after each so
+        # a later failure cannot roll back an earlier, successful one.
+        parts = steps(sql)
+        for i, part in enumerate(parts):
+            with conn.cursor() as cur:
+                if value is not None:
+                    # Transaction-local, so every step sets it again.
+                    cur.execute("SELECT set_config(%s, %s, true)",
+                                (LOCAL_ORIGIN_SETTING, value))
+                cur.execute(part)
+                if i == len(parts) - 1:
+                    # Belt and braces: the file records itself, but if a
+                    # migration forgets to, the runner would re-apply it forever.
+                    cur.execute(
+                        "INSERT INTO schema_migrations (version, note) VALUES (%s, %s) "
+                        "ON CONFLICT (version) DO NOTHING",
+                        (version, f"applied by khipu migrate from {path.name}"),
+                    )
+            conn.commit()
         result["ran"].append(version)
     result["pending"] = []
     return result
