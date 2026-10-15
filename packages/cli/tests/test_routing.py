@@ -1472,7 +1472,9 @@ def test_a_conversation_cannot_name_a_login_folder_khipu_does_not_know(home):
     with pytest.raises(routing.RouteError):
         routing.pause(secretish, via="app")
     routing.pause("codex|/logins/codex-work", via="app")
-    assert "Codex (codex-work): paused by you until you lift it" in routing.summary()["text"]
+    # The summary is agent-facing: the folder's name stands as the account's id (slice 9A).
+    ident = routing.account_id("codex|/logins/codex-work")
+    assert f"Codex ({ident}): paused by you until you lift it" in routing.summary()["text"]
 
 
 def test_a_seed_file_with_unusable_entries_says_so_and_imports_once_fixed(home):

@@ -1109,7 +1109,9 @@ def _tool_status_light(args: dict) -> dict:
         except Exception as exc:  # noqa: BLE001 — best-effort; prior_work
             # (on its own threads below) must land regardless.
             probe["hub_ok"] = False
-            probe["hub_error"] = f"{type(exc).__name__}: {exc}"
+            from khipu import agent_view
+
+            probe["hub_error"] = agent_view.error_text(exc)
 
     routing: dict = {}
 
@@ -1212,7 +1214,9 @@ def _tool_status(args: dict) -> dict:
         payload = status_payload_snapshot()
         if args.get("include_drift"):
             payload["drift_error"] = "hub unreachable; drift omitted"
-        payload["hub_error"] = f"{type(exc).__name__}: {exc}"
+        from khipu import agent_view
+
+        payload["hub_error"] = agent_view.error_text(exc)
     _attach_prior_work(payload, args)
     _attach_contract(payload)
     _attach_plan_warnings(payload)
@@ -1230,6 +1234,10 @@ def _attach_plan_warnings(payload: dict) -> None:
         warnings = usage.doctor_block()["warnings"]
     except Exception:  # noqa: BLE001
         return
+    with contextlib.suppress(Exception):
+        from khipu import agent_view
+
+        warnings = agent_view.scrub(warnings)
     payload["warnings"] = [*(payload.get("warnings") or []), *warnings]
 
 
@@ -1808,6 +1816,26 @@ def _result(req_id, payload: dict) -> dict:
     return {"jsonrpc": "2.0", "id": req_id, "result": payload}
 
 
+# Tools whose whole answer an agent reads about this Mac's accounts and
+# setup: scrubbed at the boundary (agent_view), over stdio and the gateway.
+# Memory content (khipu_search, khipu_get, khipu_status's prior work) is
+# never scrubbed: that would alter what was remembered.
+_AGENT_SCRUBBED = frozenset({"khipu_usage", "khipu_route", "khipu_route_report", "khipu_route_rule",
+                             "khipu_route_priority", "khipu_status"})
+_MEMORY_FIELDS = ("prior_work", "prior_work_text", "prior_work_meta")
+
+
+def _scrub_for_agents(name: str, payload):
+    from khipu import agent_view
+
+    if not isinstance(payload, dict):
+        return agent_view.scrub(payload)
+    memory = {k: payload[k] for k in _MEMORY_FIELDS if k in payload}
+    out = agent_view.scrub({k: v for k, v in payload.items() if k not in memory})
+    out.update(memory)
+    return out
+
+
 def _error(req_id, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
@@ -1988,12 +2016,16 @@ def _dispatch_message(msg: dict) -> dict | None:
             return _error(req_id, -32602, f"unknown tool: {name}")
         if _RELOAD_ON_CHANGE:
             _drop_modules_if_code_changed()
+        from khipu import agent_view
+
         try:
             payload = func(params.get("arguments") or {})
+            if name in _AGENT_SCRUBBED:
+                payload = _scrub_for_agents(name, payload)
         except _ToolFailure as exc:
-            return _result(req_id, _tool_text(exc.payload, is_error=True))
+            return _result(req_id, _tool_text(agent_view.scrub(exc.payload), is_error=True))
         except ValueError as exc:  # argument/mode rejections → tool error, not crash
-            return _result(req_id, _tool_text({"error": str(exc)}, is_error=True))
+            return _result(req_id, _tool_text({"error": agent_view.scrub(str(exc))}, is_error=True))
         except KeyboardInterrupt:
             raise
         except BaseException as exc:  # noqa: BLE001 — DB down, or SystemExit from
@@ -2001,11 +2033,9 @@ def _dispatch_message(msg: dict) -> dict | None:
             # which inside a long-lived MCP server killed the whole process and
             # took every other client's session with it — audit 2026-09-04).
             # A tool failing is a tool error; only the transport may end us.
-            if isinstance(exc, SystemExit):
-                detail = f"SystemExit: capture rejected the payload (exit {exc.code})"
-            else:
-                detail = f"{type(exc).__name__}: {exc}"
-            return _result(req_id, _tool_text({"error": detail}, is_error=True))
+            # Its own text may name a file: fixed words for a filesystem
+            # error, anything else scrubbed (agent_view.error_text).
+            return _result(req_id, _tool_text({"error": agent_view.error_text(exc)}, is_error=True))
         finally:
             if _RELOAD_ON_CHANGE:
                 _note_loaded_modules()

@@ -1259,28 +1259,44 @@ def public_row(row: dict) -> dict:
     Khipu's own words with no login folder in it."""
     from khipu import routing
 
+    harness, home = row.get("harness"), row.get("home")
     out = {k: row[k] for k in _PUBLIC_ROW_FIELDS if k in row}
-    out["id"] = routing.account_id(_key({"harness": row.get("harness"), "home": row.get("home")}))
+    out["id"] = routing.account_id(_key({"harness": harness, "home": home}))
+    out["harness"] = harness if harness in HARNESSES else "?"
+    for field in ("error", "live_error", "last_error"):
+        if field in out and out[field] is not None and not _is_code(out[field]):
+            out[field] = E_INTERNAL
     out["windows"] = [{k: w[k] for k in _PUBLIC_WINDOW_FIELDS if k in w}
                       for w in row.get("windows") or [] if isinstance(w, dict)]
     credits = row.get("credits")
     out["credits"] = ({k: v for k, v in credits.items() if isinstance(v, (bool, int, float))} or None
                       if isinstance(credits, dict) else None)
-    note = row.get("note")
+    error = out.get("error")
     if row.get("error") == E_INVALID:
         # The owner's reason names the entry as typed (a folder included).
         note = INVALID_PUBLIC_NOTE
-    elif isinstance(note, str) and _names_a_folder(note, row.get("home")):
-        note = _note(row.get("error"), row.get("harness"), row.get("home")) or "See Khipu's app for this account"
+    else:
+        # Only a note Khipu itself writes for this row passes; any other text
+        # (a cache edited by hand, a field from elsewhere) is written again.
+        note = row.get("note")
+        own = {_note(error, harness, home), _note(error, harness, None),
+               _rollout_note(out.get("live_error") or error or "", home), ROLLOUT_NOTE, "no turn observed yet"}
+        if note is not None and note not in own:
+            note = _note(error, harness, home)
     out["note"] = note
     return out
 
 
-def _names_a_folder(text: str, home: str | None) -> bool:
-    if "~/" in text or (home and home in text):
-        return True
-    path = _home_path(home) if home else None
-    return bool(path is not None and (str(path) in text or (path.name.lstrip(".") and path.name.lstrip(".") in text)))
+_EXIT_CODE = re.compile(r"(?:exit|signal)_\d{1,4}")
+
+
+def _is_code(value) -> bool:
+    """Whether ``value`` is one of Khipu's own fixed error codes (``E_*``,
+    or ``exit_N`` / ``signal_N`` from ``_exit_code``)."""
+    if not isinstance(value, str):
+        return False
+    codes = {v for k, v in globals().items() if k.startswith("E_") and isinstance(v, str)}
+    return value in codes or bool(_EXIT_CODE.fullmatch(value))
 
 
 def public_report(rep: dict) -> dict:
