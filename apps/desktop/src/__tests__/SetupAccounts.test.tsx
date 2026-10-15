@@ -52,11 +52,14 @@ type Opts = {
   refreshFail?: boolean;
   source?: "file" | "default";
   configFailAfterFirst?: boolean;
+  failOnce?: string[];
 };
 
 function fake(o: Opts = {}) {
+  const failing = new Set(o.failOnce ?? []);
   invokeMock.mockImplementation(async (cmd: string) => {
     if (o.hang) return new Promise(() => {});
+    if (failing.delete(cmd)) throw new Error(`${cmd} failed`);
     switch (cmd) {
       case "khipu_usage_refresh":
         if (o.refreshFail) throw new Error("probe failed");
@@ -309,6 +312,78 @@ describe("Setup › Accounts step, review round 2", () => {
     await ready();
     fireEvent.click(screen.getByRole("button", { name: "Check Grok Build again" }));
     expect(await screen.findByText(/couldn't read the account list again/)).toBeInTheDocument();
+  });
+});
+
+describe("Setup › Accounts step, review round 3", () => {
+  const TWO_CODEX = [
+    { label: "Codex A", harness: "codex", home: "/tmp/a-b" },
+    { label: "Codex B", harness: "codex", home: "/tmp/a/b" },
+  ];
+  const twoCodexRows = () => [
+    report().accounts[0],
+    { harness: "codex", account: "Codex A", home: "/tmp/a-b", ok: true, plan: "pro", windows: [] },
+    { harness: "codex", account: "Codex B", home: "/tmp/a/b", ok: true, plan: "pro", windows: [] },
+  ];
+
+  it("two accounts whose login folders differ only in punctuation get their own checkbox", async () => {
+    fake({ source: "file", accounts: [ENTRIES[0], ...TWO_CODEX], rows: twoCodexRows() });
+    const { onNext } = mount();
+    await ready();
+    const labels = screen.getAllByText("Read this account's plan");
+    fireEvent.click(labels[2]);
+    const boxes = screen.getAllByLabelText("Read this account's plan") as HTMLInputElement[];
+    expect(boxes.map((b) => b.checked)).toEqual([true, true, false]);
+    expect(new Set(boxes.map((b) => b.id)).size).toBe(3);
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    const sent = JSON.parse(calls("khipu_config_set")[0][1].value);
+    expect(sent.map((e: { label: string }) => e.label)).toEqual(["Claude Code", "Codex A"]);
+  });
+
+  it("a retry after a partial save re-sends a rechecked account", async () => {
+    fake({ failOnce: ["khipu_route_priority"] });
+    const { onNext } = mount();
+    await ready();
+    const boxes = () => screen.getAllByLabelText("Read this account's plan");
+    fireEvent.click(boxes()[1]);
+    fireEvent.click(screen.getByRole("button", { name: "Move Muse up" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await screen.findByText(/couldn't save the order/);
+    expect(calls("khipu_config_set")).toHaveLength(1);
+    fireEvent.click(boxes()[1]);
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    // Back to every account, as at the start: the default list again.
+    expect(calls("khipu_config_unset")).toHaveLength(1);
+  });
+
+  it("a retry after a partial save sends only what is still unsaved", async () => {
+    fake({ failOnce: ["khipu_route_priority"] });
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(screen.getAllByLabelText("Read this account's plan")[1]);
+    fireEvent.click(screen.getByRole("button", { name: "Move Muse up" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await screen.findByText(/saved which accounts to read, but couldn't save the order/);
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(calls("khipu_config_set")).toHaveLength(1);
+    expect(calls("khipu_route_priority")).toHaveLength(2);
+  });
+
+  it("a saved order is not sent again when only the telling switch failed", async () => {
+    fake({ failOnce: ["khipu_feature_set"] });
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(screen.getByRole("button", { name: "Move Muse up" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Tell my conversations about this" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await screen.findByText(/saved the order, but couldn't change whether conversations are told/);
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(calls("khipu_route_priority")).toHaveLength(1);
+    expect(calls("khipu_feature_set")).toHaveLength(2);
   });
 });
 
