@@ -2649,9 +2649,12 @@ def cmd_secrets_verify(args: argparse.Namespace) -> int:
         which = "all"
     try:
         result = check_model_keys(which=which)
-    except ValueError as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}))
+    except ValueError:
+        print(json.dumps({"ok": False, "error": "Unknown check selection."}))
         return 2
+    except Exception:  # noqa: BLE001 - fixed text: an error here could echo a key
+        print(json.dumps({"ok": False, "error": "The key check could not be completed."}))
+        return 1
     print(json.dumps(result, indent=2))
     return 0 if result["ok"] else 1
 
