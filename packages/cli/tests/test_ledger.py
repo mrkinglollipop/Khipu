@@ -1350,3 +1350,72 @@ def test_a_queued_cascade_removal_is_known_for_a_child_while_its_parent_is_pendi
         with pytest.raises(ledger.LedgerError) as err:
             ledger.write(ledger.new_op("set", P, row_id, fields={"evidence": "must be refused"}))
         assert err.value.reason == "not_found"
+
+
+def test_a_retry_of_a_write_already_in_line_is_answered_as_queued_while_away(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    for _ in range(2):
+        assert ledger.write(ledger.new_op("add", P, "r1", fields={"title": "one"}, op_id="add1"))["queued"]
+    for _ in range(2):
+        assert ledger.write(ledger.new_op("remove", P, "r1", op_id="rm1"))["queued"]
+    assert [q["op_id"] for q in ledger.queued_ops()] == ["add1", "rm1"]
+
+
+def test_a_write_landed_directly_still_owns_its_op_id_while_away(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    monkeypatch.setattr(ledger, "apply_op", lambda _conn, _op, **_kw: {"ok": True, "line": "set r: evidence"})
+
+    class Conn:
+        def close(self):
+            pass
+
+    assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "one"}, op_id="same"), conn=Conn())["ok"]
+    assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "one"}, op_id="same")) == {
+        "ok": True, "line": "set r: evidence"}
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "other"}, op_id="same"))
+    assert err.value.reason == "op_id_reused" and ledger.queued_ops() == []
+
+
+def test_an_old_outcome_keeps_its_op_ids_digest(monkeypatch, tmp_path):
+    import time
+
+    ledger = _offline(monkeypatch, tmp_path)
+    ledger._record_outcome(ledger.new_op("set", P, "r", fields={"evidence": "one"}, op_id="same"), "landed",
+                           result={"ok": True})
+    old = time.time() - ledger.OUTCOME_KEEP_S - 60
+    os.utime(ledger._outcomes_dir() / "same.json", (old, old))
+    ledger._prune_outcomes()
+    assert "result" not in ledger._outcome("same")
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "other"}, op_id="same"))
+    assert err.value.reason == "op_id_reused"
+
+
+def test_a_queued_add_of_a_pending_row_does_not_make_its_copy_trusted(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    view = {"vocab": ledger.default_vocab(), "rows": [_copy_row("p"), _copy_row("c", parent="p")], "history": [],
+            "gone": {}, "as_of": None, "offline": True}
+    monkeypatch.setattr(ledger, "_offline_view", lambda _p: view)
+    with ledger._replica_pending() as pending:
+        pending[f"{P}#c"] = "a change not copied yet"  # on the hub c may be removed already
+    assert ledger.write(ledger.new_op("add", P, "c", fields={"title": "again", "kind": "slice"}))["queued"]
+    with pytest.raises(ledger.LedgerError) as err:  # the waiting add is known
+        ledger.write(ledger.new_op("add", P, "c", fields={"title": "twice", "kind": "slice"}))
+    assert err.value.reason == "exists"
+    assert ledger.write(ledger.new_op("remove", P, "p"))["queued"]  # only the stale copy says p has a child
+
+
+def test_a_queued_cascade_from_a_parent_missing_from_the_copy_reaches_its_children(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    view = {"vocab": ledger.default_vocab(), "rows": [_copy_row("c", parent="x"), _copy_row("g", parent="c")],
+            "history": [], "gone": {}, "as_of": None, "offline": True}
+    monkeypatch.setattr(ledger, "_offline_view", lambda _p: view)
+    with ledger._replica_pending() as pending:
+        pending[f"{P}#x"] = "added on the hub, not copied yet"
+    assert ledger.write(ledger.new_op("remove", P, "x", children="remove"))["queued"]
+    assert ledger.load(P)["rows"] == []
+    for row_id in ("c", "g"):
+        with pytest.raises(ledger.LedgerError) as err:
+            ledger.write(ledger.new_op("set", P, row_id, fields={"evidence": "must be refused"}))
+        assert err.value.reason == "not_found"

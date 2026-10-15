@@ -933,11 +933,19 @@ def _outcome(op_id: str) -> dict[str, Any] | None:
 
 
 def _prune_outcomes() -> None:
+    """After ``OUTCOME_KEEP_S`` an outcome keeps only its op id and digest, so
+    the id still stands for that one write here; its result is dropped."""
+    from khipu.outbox import _atomic_write
+
     cutoff = time.time() - OUTCOME_KEEP_S
     try:
         for path in _outcomes_dir().glob("*.json"):
-            if path.stat().st_mtime < cutoff:
-                path.unlink(missing_ok=True)
+            if path.stat().st_mtime >= cutoff:
+                continue
+            got = _outcome(path.stem)
+            if got is None or got.get("status") == "kept":
+                continue
+            _atomic_write(path, {"op_id": got.get("op_id"), "digest": got.get("digest"), "status": "kept"})
     except OSError:
         pass
 
@@ -1146,7 +1154,9 @@ def write(op: dict[str, Any], *, conn=None) -> dict[str, Any]:
             conn = _connect()
         with _drain_lock() as got:
             if got and not _outbox_jobs():
-                return apply_op(conn, op)
+                result = apply_op(conn, op)
+                _note_landed(op, result)
+                return result
         return _write_in_line(conn, op)
     except LedgerError:
         raise
@@ -1159,9 +1169,45 @@ def write(op: dict[str, Any], *, conn=None) -> dict[str, Any]:
     finally:
         if owned and conn is not None:
             conn.close()
+    # A retry of a write already in line, or already landed, is answered as
+    # that write; it is not checked again against the line it is part of.
+    held = _known_op(op)
+    if held is not None:
+        return held
     _check_offline(op)
     enqueue(op, reason=reason)
     return _queued_reply(op)
+
+
+def _known_op(op: dict[str, Any]) -> dict[str, Any] | None:
+    """The answer for an op id this Mac already holds: queued, or landed with
+    its first result. Another write under the id is refused."""
+    path = _job_path(op["op_id"])
+    if path is not None:
+        try:
+            held = json.loads(path.read_text(encoding="utf-8"))["op"]
+        except (OSError, ValueError, KeyError, TypeError):
+            held = None
+        if not isinstance(held, dict) or op_digest(held) != op_digest(op):
+            raise _reused_error(op)
+        return _queued_reply(op)
+    known = _outcome(op["op_id"])
+    if known is None:
+        return None
+    if known.get("digest") != op_digest(op):
+        raise _reused_error(op)
+    if known.get("status") == "landed" and isinstance(known.get("result"), dict):
+        result = dict(known["result"])
+        result.pop("retried", None)
+        return result
+    return None
+
+
+def _note_landed(op: dict[str, Any], result: dict[str, Any]) -> None:
+    try:
+        _record_outcome(op, "landed", result=result)
+    except Exception as exc:  # noqa: BLE001  (the hub write already landed; the hub still knows the op)
+        print(f"[khipu-ledger] outcome not written down: {type(exc).__name__}", file=sys.stderr)
 
 
 def _write_in_line(conn, op: dict[str, Any]) -> dict[str, Any]:
@@ -1254,6 +1300,8 @@ def _check_offline(op: dict[str, Any]) -> None:
     row_id = op["row_id"]
     last = [q.get("verb") for q in queued if q.get("row_id") == row_id and q.get("verb") in ("remove", "restore")]
     restored_in_queue = bool(last) and last[-1] == "restore"
+    adds = [q.get("verb") for q in queued if q.get("row_id") == row_id and q.get("verb") in ("add", "remove")]
+    added_in_queue = bool(adds) and adds[-1] == "add"
     # The waiting writes are applied to the whole copy, so what they establish
     # (a cascade removing children, a move up) is known for every row.
     merged = _overlay(view or {"vocab": vocab, "rows": [], "as_of": None, "offline": True}, project)
@@ -1269,7 +1317,7 @@ def _check_offline(op: dict[str, Any]) -> None:
     # Such a row may exist on the hub though the copy lacks it: whether it
     # exists is left to the hub, but the children the copy knows still count.
     hub_decides = row_id not in rows and (restored_in_queue or row_id in unsure) and not removed_in_queue
-    if hub_decides and op["verb"] == "add" and restored_in_queue:
+    if hub_decides and op["verb"] == "add" and (restored_in_queue or added_in_queue):
         raise LedgerError(f"row {row_id} already exists; use set to update it", "exists")
     if hub_decides and op["verb"] == "add":
         return
@@ -1347,9 +1395,8 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
         pending += 1
         fields, row_id, at = op.get("fields") or {}, op.get("row_id"), _parse_time(op.get("at")) or _now()
         try:
-            if op["verb"] == "add":
-                added.add(row_id)
             if op["verb"] == "add" and row_id not in rows:
+                added.add(row_id)
                 rows[row_id] = {"row_id": row_id, "title": fields.get("title", ""), "kind": fields.get("kind", ""),
                                 "parent": fields.get("parent", ""),
                                 "state": _word(vocab, "state", fields.get("state")) or START_STATE,
@@ -1368,10 +1415,14 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
             elif op["verb"] == "restore" and row_id in removed and row_id not in rows:
                 rows[row_id] = removed.pop(row_id)
                 restored.add(row_id)
-            elif op["verb"] == "remove" and row_id in rows:
-                removed[row_id] = rows.pop(row_id)
-                parent = removed[row_id]["parent"]
-                if op.get("children") == "move-up":
+            elif op["verb"] == "remove":
+                # A row missing from the copy (its change not copied yet) is
+                # still removed on the hub, and so are its children the copy
+                # knows when the cascade says so.
+                if row_id in rows:
+                    removed[row_id] = rows.pop(row_id)
+                parent = removed[row_id]["parent"] if row_id in removed else None
+                if op.get("children") == "move-up" and parent is not None:
                     for row in rows.values():
                         if row["parent"] == row_id:
                             row["parent"] = parent
