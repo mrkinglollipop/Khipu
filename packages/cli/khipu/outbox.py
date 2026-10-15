@@ -34,7 +34,7 @@ import re
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -86,22 +86,46 @@ def _locked_outbox():
         os.close(fd)
 
 
+def _queued_origin() -> dict[str, Any]:
+    """The origin to keep beside the payload, stamped now from the request
+    context (gateway provenance, phase 1), so a replay from another process or
+    machine writes the row as the caller that queued it. Empty when this
+    machine has no readable identity: the replay then stamps what it can."""
+    from khipu.machine_identity import MachineIdentityError
+    from khipu.request_context import request_origin
+
+    try:
+        return {"origin": request_origin()}
+    except MachineIdentityError:
+        return {}
+
+
+def _same_evidence(job: dict[str, Any], payload: dict[str, Any], stamp: dict[str, Any]) -> bool:
+    return job["payload"] == payload and {k: job[k] for k in ("origin",) if k in job} == stamp
+
+
 def enqueue(payload: dict[str, Any], *, reason: str = "") -> Path:
-    """Durably queue a capture; acknowledge an existing file only for equal content."""
+    """Durably queue a capture; acknowledge an existing file only for equal
+    content and equal origin."""
+    stamp = _queued_origin()
+    # Only the envelope says who owns a queued capture; the caller's own claim
+    # is dropped here as write_pg drops it.
+    payload = {k: v for k, v in payload.items() if k != "origin"}
     with _locked_outbox() as d:
-        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
+        evidence = {"payload": payload, **stamp} if stamp else payload
+        digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False,
                                           separators=(",", ":")).encode("utf-8")).hexdigest()
         collision = d / f"{digest}.json"
         if collision.exists():
-            if _read_job(collision)["payload"] != payload:
+            if not _same_evidence(_read_job(collision), payload, stamp):
                 raise ValueError("outbox identity conflicts with existing evidence")
             return collision
         dst = d / f"{_identity(payload)}.json"
-        job = {"payload": payload, "reason": reason, "queued_at": datetime.now(timezone.utc).isoformat(),
-               "attempts": 0}
+        job = {"payload": payload, **stamp, "reason": reason,
+               "queued_at": datetime.now(timezone.utc).isoformat(), "attempts": 0}
         if dst.exists():
             try:
-                if _read_job(dst)["payload"] == payload:
+                if _same_evidence(_read_job(dst), payload, stamp):
                     return dst
             except (OSError, ValueError, TypeError):
                 pass
@@ -176,6 +200,10 @@ def _read_job(jp: Path) -> dict[str, Any]:
     if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
         raise ValueError("job attempts is not a non-negative integer")
     job["attempts"] = attempts
+    from khipu.request_context import valid_origin
+
+    if "origin" in job and not valid_origin(job["origin"]):
+        raise ValueError("job origin is not a queued origin")
     return job
 
 
@@ -285,6 +313,7 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
         out["jobs"] = len(js)
         from khipu.capture import write_pg
         from khipu.embed import embed_on_capture
+        from khipu.request_context import replaying
 
         for jp in js:
             if deadline is not None and time.monotonic() >= deadline:
@@ -301,8 +330,12 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                     _quarantine(jp, e)
                     out["quarantined"] = out.get("quarantined", 0) + 1
                     continue
+            # The queued origin, not this drainer's context, owns the row. A job
+            # queued before origins were recorded is stamped as before.
+            owner = replaying(job["origin"]) if "origin" in job else nullcontext()
             try:
-                stats = write_pg(payload)
+                with owner:
+                    stats = write_pg(payload)
             except Exception as e:  # noqa: BLE001 — keep the job; note the attempt
                 out["failed"] += 1
                 job["attempts"] += 1

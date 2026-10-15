@@ -36,6 +36,44 @@ def gateway_request(label: str) -> Iterator[None]:
         _GATEWAY_LABEL.reset(token)
 
 
+_UNSET = object()
+_REPLAY_ORIGIN: contextvars.ContextVar[object] = contextvars.ContextVar(
+    "khipu_replay_origin", default=_UNSET
+)
+
+
+def valid_origin(origin: object) -> bool:
+    """An origin a queued job may carry: unknown (None), or a stamped owner."""
+    if origin is None:
+        return True
+    if not isinstance(origin, str):
+        return False
+    kind, sep, rest = origin.partition(":")
+    return bool(sep and rest) and kind in {"gateway", "local"}
+
+
+@contextlib.contextmanager
+def replaying(origin: str | None) -> Iterator[None]:
+    """Replay a queued capture as the owner stamped when it was queued.
+
+    ``origin`` comes from the outbox job envelope, which only server code
+    writes, never from the payload; None means the owner was unknown then and
+    stays unknown, whoever drains it.
+    """
+    if not valid_origin(origin):
+        raise ValueError(f"not a queued origin: {origin!r}")
+    token = _REPLAY_ORIGIN.set(origin)
+    try:
+        yield
+    finally:
+        _REPLAY_ORIGIN.reset(token)
+
+
+def in_replay() -> bool:
+    """True while replaying a queued capture whose envelope named its origin."""
+    return _REPLAY_ORIGIN.get() is not _UNSET
+
+
 def gateway_label() -> str | None:
     """The calling token's label inside a gateway request, else None."""
     return _GATEWAY_LABEL.get()
@@ -55,7 +93,11 @@ def request_origin() -> str | None:
     caller is unknown there and the container's own machine id would claim the
     row for the wrong owner; otherwise this machine's ``local:<hash>``, which
     raises ``MachineIdentityError`` when the machine has no readable identity.
+    Inside ``replaying`` it is the origin the queued job was stamped with.
     """
+    replay = _REPLAY_ORIGIN.get()
+    if replay is not _UNSET:
+        return replay  # type: ignore[return-value]
     label = gateway_label()
     if label:
         return f"gateway:{label}"

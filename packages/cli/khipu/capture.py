@@ -761,11 +761,14 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     (payload["ts"], _md5_hex(payload["summary"])),
                 )
                 existing = cur.fetchone()
-                if existing and origin and origin.startswith("local:"):
-                    # An outbox replay of this machine's own capture whose row
-                    # a file-mirror sync already wrote without an origin. Only
-                    # locally: a gateway caller must never claim an unowned row
-                    # by replaying its timestamp and summary.
+                from khipu.request_context import in_replay
+
+                if existing and origin and (origin.startswith("local:") or in_replay()):
+                    # An outbox replay of a capture whose row a file-mirror
+                    # sync already wrote without an origin. Locally, or with
+                    # the origin the outbox envelope recorded when the capture
+                    # was queued: a live gateway caller must never claim an
+                    # unowned row by replaying its timestamp and summary.
                     cur.execute("UPDATE episodes SET origin = %s WHERE id = %s AND origin IS NULL",
                                 (origin, existing[0]))
                 cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
