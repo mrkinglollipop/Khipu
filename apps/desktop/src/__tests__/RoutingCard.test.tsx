@@ -22,7 +22,7 @@ const appCss: string = readFileSync(
   `${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/App.css`,
   "utf8",
 );
-import { accountSource, accountState, lastChangeWords, notRefreshedWords, ruleWords, useRouting } from "../routing";
+import { accountSource, accountState, lastChangeWords, midSentence, notRefreshedWords, ruleWords, useRouting } from "../routing";
 import type { RouteAccount, RouteView, RoutingState } from "../routing";
 import { routingAttention } from "../doctorAttention";
 import { HealthReportRows, routingHealthRow } from "../healthRows";
@@ -142,6 +142,13 @@ function rowFor(label: string): HTMLElement {
 }
 
 describe("Home Routing card, the main mock", () => {
+  it("counts pending conversation rules as needing confirmation", () => {
+    const data = mainView();
+    data.rules = [{ n: 1, text: "Keep deployment work local.", pending: true, pending_kind: "added", confirmed: false }];
+    render(<RoutingCard state={stateOf(data)} plans={PLANS} />);
+    expect(screen.getByText(/1 standing rule, shown first to every conversation/)).toHaveTextContent("1 not confirmed yet");
+  });
+
   it("shows each account in the Plans order with its state, who said so and when", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(MORNING);
@@ -734,7 +741,7 @@ describe("Home Routing card, phase 5 fix round 2", () => {
         reset_check: { status: "same_limit", checks: 1, reason },
       });
       const state = accountState(a, now).text;
-      expect(state).toBe(`Its reset time passed at 11:20 AM; ${reason}`);
+      expect(state).toBe(`Its reset time passed at 11:20 AM; ${midSentence(reason)}`);
       expect(state).not.toContain("not checked yet");
       const source = accountSource(a, now);
       expect(source).toBe("Checked by Khipu just now");
@@ -747,5 +754,24 @@ describe("Home Routing card, phase 5 fix round 2", () => {
       reset_check: { status: "later_limit", checks: 1, reason: "Khipu read a later reset time" },
     });
     expect(accountSource(later, now)).toBe("Checked by Khipu just now · Khipu read a later reset time");
+  });
+
+  it("lower-cases a reset reason's first word after the semicolon unless it is a name", () => {
+    expect(midSentence("This account can't be checked without using a turn"))
+      .toBe("this account can't be checked without using a turn");
+    expect(midSentence("The Mac is busy; Khipu will try again")).toBe("the Mac is busy; Khipu will try again");
+    expect(midSentence("Another Khipu usage check is running")).toBe("another Khipu usage check is running");
+    expect(midSentence("Khipu read the same limit again")).toBe("Khipu read the same limit again");
+    expect(midSentence("Claude said nothing")).toBe("Claude said nothing");
+    expect(midSentence("Thesis words stay")).toBe("Thesis words stay");
+    expect(midSentence("This")).toBe("this");
+    const a = acct("Claude second", "claude", {
+      state: "probably_open", until: "2026-10-14T15:20:00Z", basis: "cli",
+      witness: { source: "check", written_by: { kind: "check" }, at: "2026-10-14T15:22:00Z" },
+      reset_check: { status: "cannot_check", checks: 0, reason: "This account can't be checked without using a turn" },
+    });
+    const state = accountState(a, new Date("2026-10-14T15:22:00Z")).text;
+    expect(state).toBe("Its reset time passed at 11:20 AM; this account can't be checked without using a turn");
+    expect(state).not.toContain("; This");
   });
 });

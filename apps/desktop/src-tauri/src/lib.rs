@@ -1073,7 +1073,7 @@ async fn khipu_route_view() -> Result<String, String> {
 /// `--reason` values `khipu route hold` accepts.
 const ROUTE_HOLD_REASONS: &[&str] = &["machine-busy", "disk-low", "keep", "outage", "other"];
 /// The rule verbs the app offers (`khipu route rule ACTION`).
-const ROUTE_RULE_ACTIONS: &[&str] = &["add", "edit", "retire", "restore", "confirm"];
+const ROUTE_RULE_ACTIONS: &[&str] = &["add", "edit", "retire", "restore", "confirm", "undo", "dismiss"];
 /// The most owner's words the app hands the CLI in one change (a rule, the
 /// note, a hold), in bytes of UTF-8. Not a limit on what the owner may say:
 /// the CLI keeps a note and a rule at any length, and a hold up to the
@@ -3474,7 +3474,7 @@ mod settings_command_tests {
             route_rule_argv("edit", Some(3), Some("Never a fast tier.")).unwrap(),
             v(&["route", "rule", "--from-app", "--", "edit", "3", "Never a fast tier."])
         );
-        for action in ["retire", "restore", "confirm"] {
+        for action in ["retire", "restore", "confirm", "undo", "dismiss"] {
             assert_eq!(
                 route_rule_argv(action, Some(6), None).unwrap(),
                 v(&["route", "rule", "--from-app", "--", action, "6"])

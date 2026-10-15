@@ -104,6 +104,21 @@ def _record() -> None:
     routing.report(account="Claude", state="open", author=ME)
 
 
+def test_pending_rule_mark_and_prior_words_repeat_with_an_unrelated_next_push(home):
+    routing.add_rule("Original rule wording.", via="app")
+    before = routing.read_view()
+    routing.request_rule("Requested replacement.", n=1, author=ME)
+    heard_pending = routing.read_view()
+    routing.report(account="Codex", state="limited", until="2h", author=ME)
+    marker = {"version": heard_pending["version"], "epoch": heard_pending["epoch"],
+              "full_at": routing._iso(home["clock"].now)}
+    pushed = routing.prompt_push(marker, budget=1.0)
+    assert pushed["kind"] == "changes"
+    assert "changed by a Claude Code conversation at the owner's request" in pushed["text"]
+    assert "it replaced: “Original rule wording.”" in pushed["text"]
+    assert pushed["version"] > before["version"]
+
+
 def _payload(prompt: str = PROMPT, session: str | None = SESSION) -> dict:
     out = {"prompt": prompt, "cwd": "/work/project-a", "hook_event_name": "UserPromptSubmit"}
     if session is not None:

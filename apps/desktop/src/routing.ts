@@ -82,6 +82,12 @@ export type RouteRule = {
   text: string;
   seeded?: boolean;
   confirmed?: boolean;
+  /** A live conversation request awaiting the owner's reconfirmation. */
+  pending?: boolean;
+  pending_kind?: "added" | "changed" | null;
+  pending_by?: string | null;
+  /** The wording Undo restores for a pending change. */
+  prior_text?: string | null;
   date?: string | null;
   /** Where the rule came from, in the owner's or the seed's words. */
   source?: string | null;
@@ -248,6 +254,15 @@ export function capitalise(text: string): string {
   return text ? text.charAt(0).toUpperCase() + text.slice(1) : text;
 }
 
+/** A reset-check reason after a semicolon: its first word in lower case
+    unless it is a name ("Khipu", "Claude"), as the CLI's `_mid_sentence`. */
+export function midSentence(reason: string): string {
+  const space = reason.indexOf(" ");
+  const first = space < 0 ? reason : reason.slice(0, space);
+  if (first === "This" || first === "The" || first === "Another") return first.toLowerCase() + reason.slice(first.length);
+  return reason;
+}
+
 const CLI_NAMES: Record<string, string> = { claude: "Claude", codex: "Codex", grok: "Grok", muse: "Muse" };
 
 function cliName(harness: string): string {
@@ -300,7 +315,7 @@ export function accountState(a: RouteAccount, now: Date): { text: string; tone: 
       // A reset check's outcome is the state's own words, as the CLI's line
       // says it (fix round 2, R2-2): never "not checked yet" beside "Checked by Khipu".
       text = a.reset_check?.reason
-        ? `Its reset time passed ${pastWords(a.until, now)}; ${a.reset_check.reason}`
+        ? `Its reset time passed ${pastWords(a.until, now)}; ${midSentence(a.reset_check.reason)}`
         : a.configured === false
           ? `Probably open: its limit was due to end ${pastWords(a.until, now)}; Khipu can't check this account: it isn't in Settings \u2192 Models`
           : a.checkable === false

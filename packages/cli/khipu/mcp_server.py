@@ -22,6 +22,9 @@ Tools:
     ``available: false``). Khipu reports; it never picks or ranks.
   - ``khipu_route_report``: a conversation's report or hold; the author is
     set by Khipu, and the owner's changes are refused.
+  - ``khipu_route_rule``: a conversation may record the owner's requested
+    standing-rule addition or edit; it is live but stays pending until the
+    owner confirms it in Settings or at a terminal.
 
 Zero-dependency by design: the official MCP SDK requires pydantic/anyio which
 are not vendored in ``.python_libs``. The stdio transport is newline-delimited
@@ -762,6 +765,28 @@ TOOLS: list[dict] = [
                 "name": {"type": "string",
                          "description": "What this conversation calls itself (shown beside its author)"},
             },
+        },
+    },
+    {
+        "name": "khipu_route_rule",
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        "description": (
+            "Record the owner's request to add a standing rule, or to change "
+            "one when `rule` names its number. The wording is live for every "
+            "conversation immediately, marked with this conversation as the "
+            "requester, and remains pending until the owner confirms it in "
+            "Settings -> Routing or with a terminal confirmation. This tool "
+            "cannot confirm, retire, dismiss or undo a rule."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The owner's requested rule wording"},
+                "rule": {"type": "integer", "minimum": 1,
+                         "description": "Existing standing rule number to change; omit to add"},
+                "owner_request": {"type": "string", "description": "This conversation's one-line words describing the owner's request"},
+            },
+            "required": ["text", "owner_request"],
         },
     },
 ]
@@ -1636,6 +1661,29 @@ def _tool_route_report(args: dict) -> dict:
     return routing.conversation_write(args, author=routing.conversation_author())
 
 
+def _tool_route_rule(args: dict) -> dict:
+    """Record a conversation's owner-requested rule through the trusted
+    report author path; this tool never lets it speak as the owner."""
+    if _via_https_gateway():
+        return {"available": False, "reason": ROUTING_GATEWAY_REASON}
+    _ensure_path()
+    from khipu import routing
+
+    if not isinstance(args, dict) or set(args) - {"text", "rule", "owner_request"}:
+        raise ValueError("khipu_route_rule takes text, owner_request and optional rule")
+    text = args.get("text")
+    if not isinstance(text, str):
+        raise ValueError("text must be text")
+    owner_request = args.get("owner_request")
+    if not isinstance(owner_request, str) or not owner_request.strip() or "\n" in owner_request or "\r" in owner_request:
+        raise ValueError("owner_request must be one line of text")
+    number = args.get("rule")
+    if number is not None and (type(number) is not int or number < 1):
+        raise ValueError("rule must be a positive integer")
+    return routing.request_rule(text, n=number, owner_request=owner_request,
+                                author=routing.conversation_author(), via="mcp")
+
+
 TOOL_FUNCS = {
     "khipu_search": _tool_search,
     "khipu_get": _tool_get,
@@ -1652,6 +1700,7 @@ TOOL_FUNCS = {
     "khipu_usage": _tool_usage,
     "khipu_route": _tool_route,
     "khipu_route_report": _tool_route_report,
+    "khipu_route_rule": _tool_route_rule,
 }
 
 

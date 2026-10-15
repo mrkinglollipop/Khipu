@@ -288,10 +288,26 @@ function itemRow(change: RouteChange, item: RouteChangeItem, i: number, now: Dat
       return {
         ...base,
         subject,
-        text: "removed",
+        text: was?.pending === true && was.pending_kind === "added" ? "dismissed" : "removed",
         aside: was?.text ? `“${String(was.text)}”` : undefined,
         restore: item.n ?? Number(ident),
       };
+    }
+    if (cur.pending === true) {
+      const action = cur.pending_kind === "changed" ? "changed" : "added";
+      const by = str(cur.pending_by) ?? "a conversation";
+      const prior = str(cur.prior_text);
+      return {
+        ...base,
+        subject,
+        text: `${action} by ${by} at the owner's request; the owner has not confirmed it yet`,
+        aside: prior ? `“${String(cur.text)}”; it replaced “${prior}”` : `“${String(cur.text)}”`,
+      };
+    }
+    if (was?.pending === true && cur.pending !== true) {
+      if (was.text === cur.text) return { ...base, subject, text: "confirmed" };
+      if (cur.text === was.prior_text) return { ...base, subject, text: "undone", aside: `“${String(cur.text)}”` };
+      return { ...base, subject, text: "changed", aside: `“${String(cur.text)}”` };
     }
     if (!was) return { ...base, subject, text: "added", aside: `“${String(cur.text)}”` };
     if (was.text !== cur.text) return { ...base, subject, text: "changed", aside: `“${String(cur.text)}”` };

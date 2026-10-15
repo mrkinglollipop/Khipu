@@ -222,6 +222,28 @@ describe("Settings -> Routing: the words and choices", () => {
     expect(days[0].rows[0].restore).toBe(6);
     expect(days[1].rows[0]).toMatchObject({ subject: "Grok Build", text: "paused by you until Fri 9:00 AM", who: "You, in Settings" });
   });
+
+  it("words pending-rule history as added, confirmed, undone, or dismissed", () => {
+    const at = "2026-10-14T15:40:00Z";
+    const rows = changeDays({ changes: [
+      { version: 1, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: { text: "Added", pending: true, pending_kind: "added", pending_by: "a Codex conversation" }, was: null }] },
+      { version: 2, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: { text: "Added", pending: false }, was: { text: "Added", pending: true } }] },
+      { version: 3, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: { text: "Original", pending: false }, was: { text: "Changed", pending: true, prior_text: "Original" } }] },
+      { version: 4, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: null, was: { text: "Temporary", pending: true, pending_kind: "added" } }] },
+    ] } as RouteView, MORNING).flatMap((day) => day.rows);
+    expect(rows.map((r) => r.text)).toEqual(["dismissed", "undone", "confirmed", "added by a Codex conversation at the owner's request; the owner has not confirmed it yet"]);
+  });
+
+  it("words the owner's own edit or removal of a pending change as that, and shows a pending change's new words", () => {
+    const at = "2026-10-14T15:40:00Z";
+    const rows = changeDays({ changes: [
+      { version: 1, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: { text: "New", pending: true, pending_kind: "changed", pending_by: "a Codex conversation", prior_text: "Old" }, was: { text: "Old" } }] },
+      { version: 2, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: { text: "Owner's own", pending: false }, was: { text: "New", pending: true, pending_kind: "changed", prior_text: "Old" } }] },
+      { version: 3, at, entities: ["rule:1"], items: [{ entity: "rule:1", now: null, was: { text: "Again", pending: true, pending_kind: "changed", prior_text: "Owner's own" } }] },
+    ] } as RouteView, MORNING).flatMap((day) => day.rows);
+    expect(rows.map((r) => r.text)).toEqual(["removed", "changed", "changed by a Codex conversation at the owner's request; the owner has not confirmed it yet"]);
+    expect(rows[2].aside).toBe("“New”; it replaced “Old”");
+  });
 });
 
 // A lift, an ended note and an ended hold, each made in the app: real
@@ -361,6 +383,57 @@ describe("Settings -> Routing: standing rules", () => {
     const ask = screen.getByRole("group", { name: "Confirm rule 3?" });
     fireEvent.click(within(ask).getByRole("button", { name: "Confirm rule 3" }));
     await waitFor(() => expect(calls("khipu_route_rule")).toEqual([{ action: "confirm", n: 3 }]));
+  });
+
+  it("shows a pending conversation rule with its prior wording, then clears it after confirmation", async () => {
+    let confirmed = false;
+    answers.khipu_route_rule = (args) => {
+      if (args?.action === "confirm") confirmed = true;
+      return { ok: true };
+    };
+    answers.khipu_route_view = () => {
+      const v = view();
+      v.rules = [{ n: 3, text: "Never a fast tier, ever.", seeded: true, confirmed,
+        pending: !confirmed, pending_kind: "changed", pending_by: "a Codex conversation", prior_text: confirmed ? null : "Never a -fast tier.",
+        source: "from your routing table", date: "2026-10-13" }];
+      return v;
+    };
+    await page();
+    const three = row("Standing rules", "3.");
+    expect(three).toHaveTextContent("Changed by a Codex conversation at the owner's request; the owner has not confirmed it yet.");
+    expect(three).toHaveTextContent("It replaced: “Never a -fast tier.”");
+    fireEvent.click(screen.getByRole("button", { name: "Confirm rule 3" }));
+    fireEvent.click(within(screen.getByRole("group", { name: "Confirm rule 3?" })).getByRole("button", { name: "Confirm rule 3" }));
+    await waitFor(() => expect(calls("khipu_route_rule")).toContainEqual({ action: "confirm", n: 3 }));
+    await waitFor(() => expect(screen.queryByText(/owner has not confirmed/)).toBeNull());
+    expect(screen.queryByRole("button", { name: "Undo pending rule 3" })).toBeNull();
+  });
+
+  it("undo restores the prior wording, and a refused undo stays visible", async () => {
+    let undone = false;
+    answers.khipu_route_rule = (args) => {
+      if (args?.action === "undo") undone = true;
+      return { ok: true };
+    };
+    answers.khipu_route_view = () => {
+      const v = view();
+      v.rules = [{ n: 3, text: undone ? "Never a -fast tier." : "Never a fast tier, ever.", seeded: true, confirmed: false,
+        pending: !undone, pending_kind: "changed", pending_by: "a Codex conversation", prior_text: undone ? null : "Never a -fast tier.",
+        source: "from your routing table", date: "2026-10-13" }];
+      return v;
+    };
+    await page();
+    fireEvent.click(screen.getByRole("button", { name: "Undo pending rule 3" }));
+    await waitFor(() => expect(calls("khipu_route_rule")).toContainEqual({ action: "undo", n: 3 }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Undo pending rule 3" })).toBeNull());
+    expect(row("Standing rules", "3.")).toHaveTextContent("Never a -fast tier.");
+
+    undone = false;
+    answers.khipu_route_rule = { ok: false, error: "the pending rule changed again" };
+    await page();
+    const undoButtons = screen.getAllByRole("button", { name: "Undo pending rule 3" });
+    fireEvent.click(undoButtons[undoButtons.length - 1]);
+    expect(await screen.findByRole("alert")).toHaveTextContent("the pending rule changed again");
   });
 
   it("edits a rule after asking, and shows the CLI's error", async () => {

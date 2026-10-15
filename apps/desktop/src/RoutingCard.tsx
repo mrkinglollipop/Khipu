@@ -145,7 +145,7 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
   const accounts = inPlansOrder(data.accounts ?? [], plans);
   const holds = data.holds ?? [];
   const rules = data.rules ?? [];
-  const toConfirm = rules.filter((r) => r.seeded && !r.confirmed).length;
+  const toConfirm = rules.filter((r) => r.pending || (r.seeded && !r.confirmed)).length;
   // Counted per rule: one rule broken on two lanes is one rule that may be
   // broken. Its mark shows the latest sighting.
   const broken = brokenRules(data);

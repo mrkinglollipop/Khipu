@@ -53,7 +53,7 @@ class ToolAnnotationsTest(unittest.TestCase):
     }
     _EXPECTED_WRITE = {
         "khipu_capture", "khipu_owed_update", "khipu_decisions_update", "khipu_forget",
-        "khipu_route_report",
+        "khipu_route_report", "khipu_route_rule",
     }
 
     def test_every_tool_has_annotations(self):

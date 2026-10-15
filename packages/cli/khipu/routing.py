@@ -1113,11 +1113,12 @@ def _append_locked(*events: dict) -> None:
 # key) would stop every fold, so it is counted as unreadable and left out.
 _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", "basis", "source", "window",
                 "evidence", "until", "written_at", "via", "text", "file", "date", "sha256", "clock_at",
-                "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to", "schedule_id")
+                "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to", "schedule_id",
+                "owner_request", "prior_text")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries")
 _WHOLE_MOST = 2 ** 53
-_SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted")
+_SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed")
 _AUTHOR_FIELDS = ("kind", "harness", "project", "session", "name", "file")
 _HOLD_KINDS = ("account", "machine", "all")
 
@@ -1883,20 +1884,47 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         elif kind == "hold_end" and info["target"] in holds:
             holds[info["target"]].setdefault("ended_at", info["at"])
         elif kind == "rule_add" and isinstance(event.get("n"), int) and isinstance(event.get("text"), str):
+            pending = bool(event.get("pending"))
             rules[event["n"]] = {"n": event["n"], "text": event["text"], "source": event.get("source") or "",
                                  "date": event.get("date") or "", "seeded": bool(event.get("seeded")),
-                                 "confirmed": not event.get("seeded"), "retired": False,
+                                 "confirmed": not event.get("seeded") and not pending, "retired": False,
+                                 "pending": pending, "pending_kind": "added" if pending else None,
+                                 "prior_text": None, "prior_confirmed": None,
+                                 "pending_by": author_words(info["written_by"], push=True) if pending else None,
+                                 "pending_author": info["written_by"] if pending else None,
                                  "written_by": info["written_by"], "via": info["via"], "at": info["at"]}
-        elif kind in ("rule_edit", "rule_retire", "rule_restore", "rule_confirm") and event.get("n") in rules:
+        elif kind in ("rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_dismiss") and event.get("n") in rules:
             rule = rules[event["n"]]
             if kind == "rule_edit" and isinstance(event.get("text"), str):
+                was_pending = bool(rule.get("pending"))
+                prior = rule.get("prior_text") if was_pending else rule["text"]
+                prior_confirmed = rule.get("prior_confirmed") if was_pending else rule["confirmed"]
                 rule["text"] = event["text"]
+                if event.get("pending"):
+                    pending_kind = rule.get("pending_kind") if was_pending else "changed"
+                    rule.update(pending=True, pending_kind=pending_kind,
+                                prior_text=event.get("prior_text") if isinstance(event.get("prior_text"), str)
+                                else prior, prior_confirmed=event.get("prior_confirmed") if isinstance(event.get("prior_confirmed"), bool)
+                                else prior_confirmed, pending_by=author_words(info["written_by"], push=True),
+                                pending_author=info["written_by"], confirmed=False)
+                elif was_pending:
+                    # The owner's own wording over a pending request: confirmed
+                    # unless it replaced a seeded rule the owner never confirmed.
+                    rule.update(pending=False, pending_kind=None, prior_text=None, prior_confirmed=None, pending_by=None,
+                                pending_author=None, confirmed=not rule["seeded"] or bool(prior_confirmed))
             elif kind == "rule_retire":
                 rule["retired"] = True
             elif kind == "rule_restore":
                 rule["retired"] = False
             elif kind == "rule_confirm":
-                rule["confirmed"] = True
+                rule.update(confirmed=True, pending=False, pending_kind=None, prior_text=None, prior_confirmed=None,
+                            pending_by=None, pending_author=None)
+            elif kind == "rule_undo" and isinstance(rule.get("prior_text"), str):
+                rule.update(text=rule["prior_text"], pending=False, pending_kind=None, prior_text=None,
+                            prior_confirmed=None, pending_by=None, pending_author=None,
+                            confirmed=bool(rule.get("prior_confirmed")))
+            elif kind == "rule_dismiss":
+                rule["retired"] = True
             rule.update(written_by=info["written_by"], via=info["via"], at=info["at"])
         elif kind == "note_set" and isinstance(event.get("text"), str):
             note = {"text": event["text"], "at": info["at"], "written_by": info["written_by"], "via": info["via"]}
@@ -1977,7 +2005,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                              "owner": hold["owner"], "written_by": hold["written_by"], "via": hold["via"],
                              "at": _iso(hold["at"]), "remind": remind})
     active_rules = [{"n": r["n"], "text": r["text"], "source": r["source"], "date": r["date"], "seeded": r["seeded"],
-                     "confirmed": r["confirmed"], "written_by": r["written_by"], "via": r["via"], "at": _iso(r["at"])}
+                     "confirmed": r["confirmed"], "pending": r.get("pending"), "pending_kind": r.get("pending_kind"),
+                     "pending_by": r.get("pending_by"), "prior_text": r.get("prior_text"),
+                     "pending_author": r.get("pending_author"),
+                     "written_by": r["written_by"], "via": r["via"], "at": _iso(r["at"])}
                     for _n, r in sorted(rules.items()) if not r["retired"]]
     note_out = None if note is None else {"text": note["text"], "at": _iso(note["at"]),
                                           "written_by": note["written_by"], "via": note["via"]}
@@ -2029,7 +2060,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     effective.update({f"hold:{h['id']}": {"scope": h["scope_label"], "reason": h["reason"], "until": h["until"],
                                           "owner": h["owner"], "text": h["text"] if h["owner"] else None}
                       for h in active_holds})
-    effective.update({f"rule:{r['n']}": {"text": r["text"], "seeded": r["seeded"] and not r["confirmed"]}
+    effective.update({f"rule:{r['n']}": {"text": r["text"], "seeded": r["seeded"] and not r["confirmed"],
+                                           "pending": bool(r.get("pending")), "pending_kind": r.get("pending_kind"),
+                                           "prior_text": r.get("prior_text"),
+                                           "pending_by": r.get("pending_by") if r.get("pending") else None}
                       for r in active_rules})
     if note_out is not None:
         effective["note"] = {"text": note_out["text"]}
@@ -2544,7 +2578,7 @@ def _touched(kind: str | None, event: dict, info: dict) -> str | None:
         return f"hold:{event['id']}"
     if kind == "hold_end" and info["target"]:
         return f"hold:{info['target']}"
-    if kind in ("rule_add", "rule_edit", "rule_retire", "rule_restore", "rule_confirm") \
+    if kind in ("rule_add", "rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_dismiss") \
             and isinstance(event.get("n"), int):
         return f"rule:{event['n']}"
     if kind in ("note_set", "note_end"):
@@ -3296,6 +3330,55 @@ def edit_rule(n, text: str, *, via: str, now: datetime | None = None) -> dict:
     return dict(_owner_write({"type": "rule_edit", "n": rule["n"], "text": text.strip()}, via), n=rule["n"])
 
 
+def request_rule(text: str, *, n: int | None = None, owner_request: str | None = None,
+                 author: dict | None = None, via: str = "mcp", now: datetime | None = None) -> dict:
+    """Write a live rule that still needs the owner's confirmation.
+
+    The requester is recorded through the report-author path. Repeated
+    pending edits retain the original wording, so Undo restores it.
+    """
+    now = now or _now()
+    if not isinstance(text, str) or not text.strip():
+        raise RouteError("a rule needs its words")
+    if owner_request is None:
+        request_words = "the owner requested this change"
+    else:
+        request_words = _one_line(owner_request)
+        if not request_words:
+            raise RouteError("describe the owner's request in one line")
+    by = dict(author or conversation_author())
+    if by.get("kind") != "conversation":
+        by = conversation_author()
+    if n is None:
+        with _lock():
+            events, _bad = read_events()
+            number = _next_rules(events, 1)
+            written, view = _write({"type": "rule_add", "n": number, "text": text.strip(),
+                                    "source": "added at the owner's request", "date": now.date().isoformat(),
+                                    "seeded": False, "pending": True, "owner_request": request_words,
+                                    "written_by": by, "via": via})
+        return dict(_done(written, view), n=number)
+    # The predecessor and the append are one locked operation: an owner edit
+    # between them must become the wording Undo restores.
+    with _lock():
+        rule = _rule(n, now)
+        if rule.get("pending") and not _same_author(rule.get("pending_author"), by):
+            raise RouteError(f"standing rule {rule['n']} already has an unconfirmed change from another "
+                             "conversation; the owner confirms or undoes it in Settings \u2192 Routing first")
+        prior = rule.get("prior_text") if rule.get("pending") else rule["text"]
+        prior_confirmed = rule.get("prior_confirmed") if rule.get("pending") else rule["confirmed"]
+        written, view = _write({"type": "rule_edit", "n": rule["n"], "text": text.strip(), "pending": True,
+                                "prior_text": prior, "prior_confirmed": prior_confirmed,
+                                "owner_request": request_words, "written_by": by, "via": via})
+    return dict(_done(written, view), n=rule["n"])
+
+
+def _same_author(a: dict | None, b: dict | None) -> bool:
+    """One conversation, by what Khipu set (never the name it gives itself)."""
+    keys = ("kind", "harness", "project", "session")
+    return isinstance(a, dict) and isinstance(b, dict) and all(a.get(k) == b.get(k) for k in keys)
+
+
 def retire_rule(n, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
     return dict(_owner_write({"type": "rule_retire", "n": rule["n"]}, via), n=rule["n"])
@@ -3319,6 +3402,20 @@ def restore_rule(n, *, via: str, now: datetime | None = None) -> dict:
 def confirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
     return dict(_owner_write({"type": "rule_confirm", "n": rule["n"]}, via), n=rule["n"])
+
+
+def undo_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
+    rule = _rule(n, now)
+    if not rule.get("pending") or rule.get("pending_kind") != "changed" or not isinstance(rule.get("prior_text"), str):
+        raise RouteError(f"standing rule {rule['n']} has no pending edit to undo")
+    return dict(_owner_write({"type": "rule_undo", "n": rule["n"]}, via), n=rule["n"])
+
+
+def dismiss_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
+    rule = _rule(n, now)
+    if not rule.get("pending") or rule.get("pending_kind") != "added":
+        raise RouteError(f"standing rule {rule['n']} is not a pending addition")
+    return dict(_owner_write({"type": "rule_dismiss", "n": rule["n"]}, via), n=rule["n"])
 
 
 # ---- words ----------------------------------------------------------------------------
@@ -3489,6 +3586,17 @@ def table_precedence(table: dict | None, now: datetime) -> str | None:
 def rule_line(rule: dict) -> str:
     """A standing rule, whole. A seeded rule the owner has not confirmed
     says so: that mark is its only claim of ownership."""
+    if rule.get("pending"):
+        # A conversation's words until the owner confirms them: one line, as
+        # a conversation's words are shown, so they can't open a line of
+        # their own or read as the owner's. The wording it replaced was the
+        # owner's (or the seed's) and is quoted whole on one line.
+        action = rule.get("pending_kind") or "added"
+        replaced = f"; it replaced: “{_one_line(rule['prior_text'])}”" \
+            if action == "changed" and rule.get("prior_text") else ""
+        by = rule.get("pending_by") or "a conversation"
+        mark = f" ({action} by {by} at the owner's request; the owner has not confirmed it yet{replaced})"
+        return f"{rule['n']}. {their_words(rule['text'])}{mark}"
     mark = "" if rule.get("confirmed", True) else " (seeded; the owner has not confirmed it yet)"
     return f"{rule['n']}. {rule['text']}{mark}"
 
@@ -3687,6 +3795,8 @@ def doctor_block(now: datetime | None = None) -> dict:
                             "line telling them to call khipu_route instead. Shorten the rules or the note.")
     if view.get("outside_app"):
         warnings.append("A rule, a pause, a clear or your note was written by something other than the app.")
+    if any(r.get("pending") for r in view.get("rules") or []):
+        warnings.append("One or more standing rules were added or changed at the owner's request and still need confirmation.")
     if view.get("seed_error"):
         warnings.append(f"The standing rules were not imported: {view['seed_error']}.")
     bad = view.get("bad_lines") or 0
@@ -3736,6 +3846,7 @@ def doctor_block(now: datetime | None = None) -> dict:
                         f"the last {budget['count']} prompts (more than {budget['warn_pct']:g}%); those prompts "
                         "went without their routing lines until a later prompt. Raise the time allowed before "
                         "a prompt in Settings \u2192 Routing, or see whether the Mac is busy.")
+    pending_rules = sum(1 for r in view.get("rules") or [] if r.get("pending"))
     return {"record": bool(view.get("record")), "version": view["version"], "folded_at": view.get("folded_at"),
             "prompt_budget": budget,
             "valid_until": view.get("valid_until"),
@@ -3743,7 +3854,9 @@ def doctor_block(now: datetime | None = None) -> dict:
                           "next_check": e.get("next_check"), "cannot_check": (e.get("reset_check") or {}).get("reason"),
                           "line": account_line(e, now)} for e in view["accounts"]],
             "holds": len(view.get("holds") or []), "rules": len(view.get("rules") or []),
-            "rules_to_confirm": sum(1 for r in view.get("rules") or [] if r["seeded"] and not r["confirmed"]),
+            "rules_to_confirm": sum(1 for r in view.get("rules") or []
+                                    if r["seeded"] and not r["confirmed"] and not r.get("pending")),
+            "pending_conversation_rules": pending_rules,
             "note": view.get("note") is not None, "outside_app": view.get("outside_app") or [],
             "seed_error": view.get("seed_error"), "bad_lines": view.get("bad_lines", 0),
             "sources": _sources_brief(sources), "rule_checks": checks, "warnings": warnings}
@@ -3822,6 +3935,9 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["accounts"] = [_with_authors(dict(e, line=account_line(e, now, push=False))) for e in view["accounts"]
                        if account is None or e["key"] == account]
     out["holds"] = [dict(h, by=author_words(h.get("written_by"), push=False)) for h in view.get("holds") or []]
+    # A pending rule's requester as the fold keeps it, for Khipu's own
+    # same-conversation check; ``pending_by`` is its words.
+    out["rules"] = [{k: v for k, v in r.items() if k != "pending_author"} for r in view.get("rules") or []]
     # What the app's Routing card and attention items need beside the view
     # (phase 4): each watched rule's check, as doctor carries it, and the
     # two times the app words its warnings by.
@@ -3883,7 +3999,8 @@ _REPORT_FIELDS = ("id", "state", "source", "at", "since", "until")
 _LAST_SEEN_FIELDS = (*_REPORT_FIELDS, "cleared")
 _MODEL_FIELDS = ("model", "until", "basis", "source", "at", "id")
 _HOLD_FIELDS = ("id", "scope_label", "reason", "text", "until", "owner", "via", "at", "remind")
-_RULE_FIELDS = ("n", "text", "source", "date", "seeded", "confirmed", "via", "at")
+_RULE_FIELDS = ("n", "text", "source", "date", "seeded", "confirmed", "pending", "pending_kind",
+                "pending_by", "prior_text", "via", "at")
 _LANE_FIELDS = ("runner", "lane", "state", "until", "basis", "at", "id")
 _RUNNER_FIELDS = ("name", "heartbeat_at", "interval", "silent", "silent_deadline", "unreadable",
                   "unreadable_since", "lanes", "unmatched_lanes")
@@ -4070,7 +4187,7 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
         pairs = list(zip(out["entities"], out["lines"]))
         if key is not None:
             mine = {f"account:{key}"} | {f"hold:{i}" for i in _holds_on(key, view)}
-            pairs = [(e, line) for e, line in pairs if e in mine]
+            pairs = [(e, line) for e, line in pairs if e in mine or e.startswith("rule:") or e == "note"]
         return {"since": out["since"], "epoch": out["epoch"], "version": out["version"],
                 "complete": out["complete"], "entities": [_public_entity(e) for e, _line in pairs],
                 "lines": [line for _e, line in pairs], "about": ABOUT}
@@ -4099,7 +4216,8 @@ OWNER_ACTIONS = {"pause": "Pausing an account", "lift": "Lifting a pause", "clea
                  "dismiss": "Dismissing a report", "note": "The owner's note", "set_note": "The owner's note",
                  "end_note": "The owner's note", "rule": "A standing rule", "add_rule": "A standing rule",
                  "edit_rule": "A standing rule", "retire_rule": "A standing rule",
-                 "confirm_rule": "A standing rule"}
+                 "confirm_rule": "A standing rule", "undo_rule": "A standing rule",
+                 "dismiss_rule": "A standing rule"}
 OWNER_REFUSAL = ("{what} is the owner's to change: in the app (Settings \u2192 Routing) or on a terminal with "
                  "`khipu route`, which asks for a typed confirmation. A conversation can report what it "
                  "learned about an account and add or end its holds.")
@@ -4460,6 +4578,12 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
     width, limit = cfg["routing_line_chars"], cfg["routing_prompt_chars"]
     ranked = sorted(((_change_group(e, view), i, line) for i, (e, line)
                      in enumerate(zip(changed["entities"], changed["lines"]))), key=lambda t: (t[0], t[1]))
+    changed_rules = {e for e in changed["entities"] if e.startswith("rule:")}
+    # Pending conversation requests remain explicit in every change push
+    # until their owner resolves them, even when this version changes an
+    # unrelated account.
+    lines += [rule_line(r) for r in view.get("rules") or []
+              if r.get("pending") and f"rule:{r['n']}" not in changed_rules]
     lines += [line for group, _, line in ranked if group == 0]
     others = [_clip(line, width) for group, _, line in ranked if group != 0]
 
@@ -4508,7 +4632,8 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
         if seen == view["version"]:
             if stale and not said:
                 # Nothing changed, but the record has not been refreshed past its bound: one line, once.
-                text = "\n".join([CHANGES_HEADING.format(at=_clock(now, now)), stale])
+                text = "\n".join([CHANGES_HEADING.format(at=_clock(now, now)),
+                                  *[rule_line(r) for r in view.get("rules") or [] if r.get("pending")], stale])
                 return dict(base, kind="changes", text=text, count=0, unrefreshed=view.get("checked_at"))
             return dict(base, kind="none", text=None, count=0)
         changed = since(seen, view, now=now, epoch=marker.get("epoch"))
@@ -4652,6 +4777,9 @@ def _print_view(view: dict, now: datetime, account: str | None) -> None:
         print("Standing rules:")
         for rule in view["rules"]:
             mark = "" if rule["confirmed"] else "  [seeded; confirm in Settings \u2192 Routing]"
+            if rule.get("pending"):
+                print(f"  {rule_line(rule)}")
+                continue
             print(f"  {rule['n']}. {rule['text']}{mark}")
     if view.get("note"):
         print(note_line(view["note"], now))
@@ -4817,6 +4945,22 @@ def run_cli(args) -> int:
             _print_json(add_hold(" ".join(words), reason=args.reason, scope=scope, account=args.account,
                                  until=args.until, owner=owner_flag, via=via, now=now))
             return 0
+        if cmd == "rule" and getattr(args, "at_owner_request", None) is not None:
+            # The rule's words are the positional words, as for the owner's
+            # add and edit; the flag carries the owner's request.
+            params = list(args.params)
+            if args.action == "add":
+                out = request_rule(" ".join(params), owner_request=args.at_owner_request,
+                                   author=conversation_author(), via="cli", now=now)
+            elif args.action == "edit":
+                if len(params) < 2:
+                    raise RouteError('rule edit takes the rule number and its new words: rule edit 3 "<words>"')
+                out = request_rule(" ".join(params[1:]), n=params[0], owner_request=args.at_owner_request,
+                                   author=conversation_author(), via="cli", now=now)
+            else:
+                raise RouteError("--at-owner-request is only for rule add or edit")
+            _print_json(out)
+            return 0
         via = _owner_via(args)
         if via is None:
             _print_json({"ok": False, "error": _REFUSED})
@@ -4847,6 +4991,10 @@ def run_cli(args) -> int:
                 out = retire_rule(params[0], via=via, now=now)
             elif args.action == "restore":
                 out = restore_rule(params[0], via=via, now=now)
+            elif args.action == "undo":
+                out = undo_rule_request(params[0], via=via, now=now)
+            elif args.action == "dismiss":
+                out = dismiss_rule_request(params[0], via=via, now=now)
             else:
                 out = confirm_rule(params[0], via=via, now=now)
         else:

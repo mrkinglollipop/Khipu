@@ -198,7 +198,11 @@ never truncated. Khipu never ranks accounts from it, turns it into a pick, or ch
 Earlier notes stay in the history, and he can end the current one at any time.
 
 **Standing rules** are a first-class part of the record. They are never truncated anywhere and are always
-delivered first. The public product ships with no rules. On this Mac, phase 1a imports them once from a
+delivered first. The public product ships with no rules. A conversation may add or change a rule when it records
+the owner's request in its own words; the change is live immediately, marked with Khipu's author for that
+conversation and its prior wording when changed, and remains pending until the owner confirms it. Only the owner,
+from the app or after a typed terminal confirmation, can confirm it, undo a pending change or dismiss a pending
+addition. On this Mac, phase 1a imports them once from a
 local, untracked file named by the setting `routing_rules_seed`, and each imported rule is marked "seeded;
 confirm in Settings → Routing" until Matt confirms it; that mark is the only claim of ownership until he
 does. The seed is taken from the table and from Matt's earlier recorded words, not from a statement of his
@@ -945,6 +949,7 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
     at their limit (decision 7); the seven seeded rules and their wording, which still arrive marked
     "seeded" until he confirms each in Settings → Routing (decision 19); and his note as the place for his
     direction on where work should go (decision 18).
+21. The owner approved conversation-requested live standing-rule changes with later owner reconfirmation: "you should be able to update that rule when I ask you to, and then I go to reconfirm it. I understand that I need to manually confirm. I'm good with that."
 
 ## Known limits
 
