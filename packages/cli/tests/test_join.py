@@ -361,6 +361,121 @@ class JoinErrorTextTest(unittest.TestCase):
         self.assertNotIn(SECRET, join_pair.friendly_connect_error(OSError(RAW), [("h", 1)]))
 
 
+KIT_SECRET = "sk-SYNTHETICKITSECRET0123456789abcdef"
+
+
+def _wrong_type_variants():
+    """(label, payload) with each kit field in turn holding the secret in a
+    value of the wrong type (and a few right-type, wrong-value cases)."""
+    base = {
+        "format": j.FORMAT_VERSION,
+        "database_url": "postgresql://u@hub.example/db",
+        "capture_mode": "dual",
+        "models": {
+            "synth": {"provider": "cloud", "endpoint": "", "model_id": "gemini-2.5-flash"},
+            "embed": {"provider": "cloud", "endpoint": "", "model_id": ""},
+            "vision": {"provider": "off", "endpoint": "", "model_id": ""},
+        },
+        "expected": {"episodes": 1, "topics": 1, "nodes": 1},
+        "created_at": "2026-10-15T00:00:00+00:00",
+        "gateway_url": "https://gateway.example",
+        "gemini_api_key": "gem",
+        "openai_compat_api_key": "oai",
+        "root_crt_pem": "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----",
+    }
+    string_fields = ("format", "database_url", "capture_mode", "created_at", "gateway_url",
+                     "gemini_api_key", "openai_compat_api_key", "root_crt_pem")
+    out = []
+    for field in string_fields:
+        for bad in ({"k": KIT_SECRET}, [KIT_SECRET], 12345):
+            out.append((f"{field}={type(bad).__name__}", {**base, field: bad}))
+    out.append(("capture_mode=value", {**base, "capture_mode": KIT_SECRET}))
+    out.append(("format=value", {**base, "format": KIT_SECRET}))
+    for field in ("models", "expected"):
+        for bad in (KIT_SECRET, [KIT_SECRET], 7):
+            out.append((f"{field}={type(bad).__name__}", {**base, field: bad}))
+    for count in ("episodes", "topics", "nodes"):
+        for bad in (KIT_SECRET, {"k": KIT_SECRET}, [KIT_SECRET], True, -1):
+            out.append((f"expected.{count}={bad!r}"[:40],
+                        {**base, "expected": {**base["expected"], count: bad}}))
+    for role in ("synth", "embed", "vision"):
+        out.append((f"models.{role}=str", {**base, "models": {**base["models"], role: KIT_SECRET}}))
+        out.append((f"models.{role}.provider", {**base, "models": {
+            **base["models"], role: {**base["models"][role], "provider": KIT_SECRET}}}))
+        out.append((f"models.{role}.model_id", {**base, "models": {
+            **base["models"], role: {**base["models"][role], "model_id": [KIT_SECRET]}}}))
+    return out
+
+
+class KitFieldLeakTest(unittest.TestCase):
+    """Every field of a decrypted kit is checked with fixed text naming the
+    field, never its value, on both import and receive."""
+
+    def _capture(self, fn):
+        import contextlib
+        import io
+        import traceback
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = fn()
+            except BaseException:  # noqa: BLE001 — an escaped traceback is output too
+                err.write(traceback.format_exc())
+                rc = None
+        return rc, out.getvalue() + err.getvalue()
+
+    def _env(self, tmp):
+        return mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": tmp, "KHIPU_JOIN_PASSPHRASE": "phrase"})
+
+    def _guards(self):
+        import contextlib
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(j, "_fetch_live_counts", side_effect=RuntimeError("no hub in tests")))
+        stack.enter_context(mock.patch("khipu.migrate.run", return_value={"ok": True}))
+        return stack
+
+    def test_import_never_shows_a_wrong_typed_field_value(self) -> None:
+        from khipu import cli
+
+        for label, payload in _wrong_type_variants():
+            with self.subTest(field=label), tempfile.TemporaryDirectory() as tmp, self._env(tmp), self._guards():
+                kit = Path(tmp) / "k.khipujoin"
+                kit.write_bytes(j.encrypt_payload(payload, "phrase"))
+                rc, text = self._capture(lambda: cli.main(["join", "import", "--file", str(kit)]))
+                self.assertNotIn(KIT_SECRET, text)
+                self.assertNotIn("SYNTHETICKITSECRET", text)
+                self.assertEqual(rc, 1, text)
+                self.assertIn("join kit", json.loads(text)["error"])
+
+    def test_receive_never_shows_a_wrong_typed_field_value(self) -> None:
+        from khipu import cli, join_pair
+
+        for label, payload in _wrong_type_variants():
+            blob = j.encrypt_payload(payload, "phrase")
+            tls = mock.Mock()
+            tls.recv.side_effect = [blob, b""]
+            ctx = mock.Mock()
+            ctx.wrap_socket.return_value = tls
+            header = (json.dumps({"ok": True, "bytes": len(blob)}) + "\n").encode("utf-8")
+            with (
+                self.subTest(field=label),
+                tempfile.TemporaryDirectory() as tmp,
+                self._env(tmp),
+                self._guards(),
+                mock.patch.object(join_pair, "_browse_service", return_value=[{"name": "mac"}]),
+                mock.patch.object(join_pair, "_resolve_service", return_value=("h", 1, None)),
+                mock.patch.object(join_pair, "_tcp_connect", return_value=(mock.Mock(), "h", 1)),
+                mock.patch.object(join_pair, "_readline", return_value=header),
+                mock.patch("khipu.join_pair.ssl.SSLContext", return_value=ctx),
+            ):
+                rc, text = self._capture(lambda: cli.main(["join", "receive", "--pin", "123456"]))
+                self.assertNotIn(KIT_SECRET, text)
+                self.assertNotIn("SYNTHETICKITSECRET", text)
+                self.assertEqual(rc, 1, text)
+
+
 class LocalhostRefuseTest(unittest.TestCase):
     def test_is_localhost_dsn(self) -> None:
         for dsn in (

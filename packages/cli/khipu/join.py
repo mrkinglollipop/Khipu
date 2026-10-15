@@ -139,7 +139,7 @@ def decrypt_payload(blob: bytes, passphrase: str = "") -> dict[str, Any]:
     if envelope.get("format") == FORMAT_VERSION and "database_url" in envelope:
         return envelope
     if envelope.get("v") != FORMAT_VERSION:
-        raise JoinError(f"unsupported join kit version: {envelope.get('v')!r}")
+        raise JoinError("join kit field v is not a supported kit version")
     if "ciphertext_b64" not in envelope:
         raise JoinError("join kit envelope is malformed")
     if not passphrase.strip():
@@ -151,14 +151,17 @@ def decrypt_payload(blob: bytes, passphrase: str = "") -> dict[str, Any]:
         salt = base64.b64decode(envelope["salt_b64"])
         nonce = base64.b64decode(envelope["nonce_b64"])
         ciphertext = base64.b64decode(envelope["ciphertext_b64"])
-    except (KeyError, ValueError) as exc:
-        raise JoinError("join kit envelope is malformed") from exc
+    except (KeyError, ValueError, TypeError):
+        raise JoinError("join kit envelope is malformed") from None
     key = _derive_key(passphrase.strip(), salt)
     try:
         plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
     except Exception as exc:
         raise JoinError("passphrase incorrect or join kit is corrupt") from exc
-    payload = json.loads(plaintext.decode("utf-8"))
+    try:
+        payload = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise JoinError("join kit payload is not valid JSON") from None
     if not isinstance(payload, dict):
         raise JoinError("join kit payload must be a JSON object")
     return payload
@@ -339,6 +342,49 @@ def _sanitize_summary(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+_KIT_TEXT_FIELDS = (
+    "format", "database_url", "capture_mode", "created_at", "gateway_url",
+    "gemini_api_key", "openai_compat_api_key", "root_crt_pem",
+)
+_KIT_COUNT_FIELDS = ("episodes", "topics", "nodes")
+_KIT_MODEL_ROLES = ("synth", "embed", "vision")
+
+
+def _check_payload_fields(payload: dict[str, Any]) -> None:
+    """Every field a kit carries, by type, before anything reads it. Errors
+    name the field and never its value: a kit field may hold an API key."""
+    from khipu.config import CAPTURE_MODES
+
+    for field in _KIT_TEXT_FIELDS:
+        value = payload.get(field)
+        if value is not None and not isinstance(value, str):
+            raise JoinError(f"join kit field {field} must be text")
+    if payload.get("format") not in (None, FORMAT_VERSION):
+        raise JoinError("join kit field format is not a supported kit version")
+    mode = payload.get("capture_mode")
+    if mode and mode.strip().lower() not in CAPTURE_MODES:
+        raise JoinError(f"join kit field capture_mode must be one of {', '.join(CAPTURE_MODES)}")
+    expected = payload.get("expected")
+    if expected is not None:
+        if not isinstance(expected, dict):
+            raise JoinError("join kit field expected must be an object of counts")
+        for key in _KIT_COUNT_FIELDS:
+            n = expected.get(key)
+            if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < 0):
+                raise JoinError(f"join kit field expected.{key} must be a whole number of 0 or more")
+    models = payload.get("models")
+    if models is not None:
+        if not isinstance(models, dict):
+            raise JoinError("join kit field models must be an object")
+        for role, entry in models.items():
+            if not isinstance(entry, dict):
+                raise JoinError(f"join kit field models.{role if role in _KIT_MODEL_ROLES else '?'} must be an object")
+            for name, value in entry.items():
+                if value is not None and not isinstance(value, str):
+                    where = role if role in _KIT_MODEL_ROLES else "?"
+                    raise JoinError(f"join kit field models.{where} has a value that must be text")
+
+
 def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
     from khipu import config as config_mod
     from khipu import keychain
@@ -348,6 +394,7 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
     from khipu.paths import dsn_file, ensure_data_dir, root_cert_file
 
     payload = decrypt_payload(blob, passphrase)
+    _check_payload_fields(payload)
     dsn = str(payload.get("database_url") or "").strip()
     if not dsn:
         raise JoinError("join kit is missing database_url")
@@ -360,7 +407,7 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
         )
     mode = str(payload.get("capture_mode") or "").strip().lower()
     if mode and mode not in CAPTURE_MODES:
-        raise JoinError(f"capture_mode must be one of {CAPTURE_MODES}, got {mode!r}")
+        raise JoinError(f"join kit field capture_mode must be one of {', '.join(CAPTURE_MODES)}")
 
     # Validate the entire owned payload before changing a file or credential.
     # libpq's parse errors quote the text around the fault, which can be the
@@ -384,8 +431,8 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
             raise JoinError("models must be a non-empty JSON object")
         try:
             validate_models_object(models, for_set=True)
-        except ValueError as exc:
-            raise JoinError(f"join kit models are not valid: {exc}") from None
+        except (ValueError, TypeError, KeyError):
+            raise JoinError("join kit field models is not valid") from None
     for field in ("gemini_api_key", "openai_compat_api_key"):
         secret = payload.get(field)
         if secret is not None and not isinstance(secret, str):
@@ -484,11 +531,10 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
 
 
 def verify_live_counts(expected: dict[str, int]) -> dict[str, Any]:
-    exp = {
-        "episodes": int(expected.get("episodes") or 0),
-        "topics": int(expected.get("topics") or 0),
-        "nodes": int(expected.get("nodes") or 0),
-    }
+    try:
+        exp = {key: int(expected.get(key) or 0) for key in _KIT_COUNT_FIELDS}
+    except (ValueError, TypeError, AttributeError):
+        raise JoinError("join kit field expected must hold whole-number counts") from None
     try:
         live = _fetch_live_counts()
     except Exception as exc:
