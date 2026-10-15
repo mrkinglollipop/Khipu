@@ -98,16 +98,29 @@ export function agoSpan(iso: string, now: Date): string {
   return `${Math.round(hours / 24)} days ago`;
 }
 
-export type LimitUnit = "time" | "chars" | "ms" | "changes";
+export type LimitUnit = "time" | "chars" | "ms" | "changes" | "bytes" | "lines" | "intervals" | "pct";
+
+/** "512 KB", "1 MB", "300 bytes": a size in bytes. */
+function bytesWords(value: number): string {
+  const MB = 1024 * 1024;
+  if (value >= MB && value % (MB / 4) === 0) return `${(value / MB).toLocaleString()} MB`;
+  if (value >= 1024 && value % 1024 === 0) return `${(value / 1024).toLocaleString()} KB`;
+  return `${value.toLocaleString()} byte${value === 1 ? "" : "s"}`;
+}
 
 /** One setting's value in words: "1,500 characters", "50 ms", "12 hours",
- *  or the setting's own word for 0 ("No limit", "Never"). */
+ *  "512 KB", "1%", or the setting's own word for 0 ("No limit", "Never"). */
 export function limitWords(value: number, unit: LimitUnit, zero?: string): string {
   if (value === 0 && zero) return zero;
+  const plural = (one: string) => `${value.toLocaleString()} ${one}${value === 1 ? "" : "s"}`;
   if (unit === "time") return durationWords(value);
-  if (unit === "chars") return `${value.toLocaleString()} character${value === 1 ? "" : "s"}`;
+  if (unit === "chars") return plural("character");
   if (unit === "ms") return `${value.toLocaleString()} ms`;
-  return `${value.toLocaleString()} change${value === 1 ? "" : "s"}`;
+  if (unit === "bytes") return bytesWords(value);
+  if (unit === "lines") return plural("line");
+  if (unit === "intervals") return plural("interval");
+  if (unit === "pct") return `${value.toLocaleString()}%`;
+  return plural("change");
 }
 
 /** A rule's source and date as the page shows it: "From your routing table,
@@ -184,6 +197,31 @@ function whoWords(item: RouteChangeItem): string {
   return "Khipu";
 }
 
+type EffectiveModel = { model: string; until: string | null; basis: string | null; side: unknown };
+
+/** The models of an account's effective view, `[model, until, basis,
+ *  [state, source] | null]` each (`routing._effective_account`). */
+function effectiveModels(raw: unknown): EffectiveModel[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((m): m is unknown[] => Array.isArray(m) && typeof m[0] === "string")
+    .map((m) => ({ model: m[0] as string, until: str(m[1]), basis: str(m[2]), side: m[3] ?? null }));
+}
+
+const SIDE_WHO: Record<string, string> = {
+  report: "a conversation",
+  runner: "a job runner",
+  probe: "the plan check",
+  check: "Khipu's check",
+  owner: "you",
+};
+
+/** The side that disagrees, `[state, source]`, in words. */
+function sideSaid(raw: unknown): { who: string; state: string } | null {
+  if (!Array.isArray(raw) || typeof raw[0] !== "string") return null;
+  return { who: SIDE_WHO[String(raw[1])] ?? "another report", state: stateSaid(raw[0]) };
+}
+
 function itemRow(change: RouteChange, item: RouteChangeItem, i: number, now: Date): ChangeRow {
   const base = { key: `${change.version}-${i}`, at: change.at, who: whoWords(item) };
   const [kind, ...rest] = item.entity.split(":");
@@ -193,10 +231,41 @@ function itemRow(change: RouteChange, item: RouteChangeItem, i: number, now: Dat
   if (kind === "account") {
     const label = str(cur?.label) ?? str(was?.label) ?? "An account";
     if (!cur) return { ...base, subject: label, text: "no longer tracked" };
-    const entry = { key: ident, label, harness: "", ...cur, models: [] } as unknown as RouteAccount;
-    const text = lowerFirst(accountState(entry, now).text);
-    const aside = was && was.state !== cur.state ? `(was ${stateSaid(was.state)})` : undefined;
-    return { ...base, subject: label, text, aside };
+    // Worded as it stood when it changed, with each model's limit, and the
+    // disagreements and model limits that came or went beside the state
+    // (Codex review, finding 5).
+    const then = new Date(change.at);
+    const at = Number.isNaN(then.getTime()) ? now : then;
+    const nowModels = effectiveModels(cur.models);
+    const wasModels = effectiveModels(was?.models);
+    const lastSeen = str(cur.last_seen);
+    const entry = {
+      key: ident,
+      label,
+      harness: "",
+      ...cur,
+      models: nowModels,
+      disagreement: null,
+      last_seen: lastSeen ? { state: lastSeen } : null,
+    } as unknown as RouteAccount;
+    const said = accountState(entry, at).text.trim();
+    // A model's name keeps its capital ("Opus limit reached, ...").
+    const text = nowModels.some((m) => said.startsWith(m.model)) ? said : lowerFirst(said);
+    const parts: string[] = [];
+    if (was && was.state !== cur.state) parts.push(`was ${stateSaid(was.state)}`);
+    const dis = sideSaid(cur.disagreement);
+    if (dis && JSON.stringify(cur.disagreement) !== JSON.stringify(was?.disagreement)) parts.push(`${dis.who} said it is ${dis.state}`);
+    else if (!dis && sideSaid(was?.disagreement)) parts.push("the reports agree again");
+    for (const m of nowModels) {
+      const before = wasModels.find((x) => x.model === m.model);
+      const side = sideSaid(m.side);
+      if (side && JSON.stringify(m.side) !== JSON.stringify(before?.side)) parts.push(`${side.who} said ${m.model} is ${side.state}`);
+      else if (!side && sideSaid(before?.side)) parts.push(`the reports about ${m.model} agree again`);
+    }
+    for (const m of wasModels) {
+      if (!nowModels.some((x) => x.model === m.model)) parts.push(`${m.model} limit over`);
+    }
+    return { ...base, subject: label, text, aside: parts.length ? `(${parts.join("; ")})` : undefined };
   }
   if (kind === "hold") {
     const scope = str(cur?.scope) ?? str(was?.scope) ?? "all work";

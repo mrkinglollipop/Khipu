@@ -37,6 +37,9 @@ export type RouteModel = {
   basis?: string | null;
   source?: string;
   at?: string | null;
+  /** The report behind this model's limit, and who wrote it in words. */
+  id?: string;
+  by?: string;
   disagreement?: RouteReport | null;
 };
 

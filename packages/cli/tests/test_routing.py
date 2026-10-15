@@ -772,6 +772,35 @@ def test_an_open_report_against_a_models_own_limit_is_a_disagreement(home):
     assert _account(routing.read_view(), "claude|")["models"][0]["disagreement"] is None
 
 
+def test_recent_changes_name_the_report_that_made_each_change(home, capsys):
+    # Codex review, finding 4: a newer conversation's report that changes
+    # only the disagreement, or only a model's limit, is the change's
+    # author, never the older report the account shows or nobody.
+    _report(account="Claude second", state="limited", message="resets at 2026-10-14T18:52:00Z")
+    home["clock"].advance(minutes=10)
+    _report(account="Claude second", state="open", author=OTHER)
+    _report(account="Claude", state="open")
+    home["clock"].advance(minutes=5)
+    _report(account="Claude", state="limited", model="Opus", window="weekly", author=OTHER,
+            message="Opus weekly limit reached, resets at 2026-10-16T09:00:00Z")
+    home["clock"].advance(minutes=5)
+    _report(account="Claude", model="Opus", state="open")
+    rc, out = _cli(["route", "--json"], capsys)
+    items = [i for c in json.loads(out)["changes"] for i in c["items"]]
+
+    def changes(key: str) -> list[dict]:
+        return [i for i in items if i["entity"] == f"account:{key}"]
+
+    disagreed = changes(SECOND)[-1]
+    assert disagreed["now"]["disagreement"] == ["open", "report"]
+    assert disagreed["by"].startswith("a Codex conversation in project-b"), disagreed
+    opus, opus_disputed = changes("claude|")[-2:]
+    assert opus["now"]["state"] == "open" and opus["now"]["models"][0][0] == "Opus"
+    assert opus["by"].startswith("a Codex conversation in project-b"), opus
+    assert opus_disputed["now"]["models"][0][3] == ["open", "report"]
+    assert opus_disputed["by"].startswith("a Claude Code conversation in project-a"), opus_disputed
+
+
 def test_a_quiet_read_is_not_called_unrefreshed(home):
     _report(account="Codex", state="open")
     home["clock"].advance(minutes=10)
@@ -1663,6 +1692,47 @@ def test_recent_changes_name_the_owner_in_settings_for_every_change_made_in_the_
     items = [i for c in json.loads(out)["changes"] for i in c["items"]]
     ran_out = [i for i in items if i["entity"] == "account:codex|"][-1]
     assert ran_out["was"]["state"] == "paused" and ran_out["by"] is None and ran_out["via"] is None
+
+
+# Settings whose phase has not shipped its part of the app yet, and the one
+# setting that is not an option at all. Each leaves this list in the PR that
+# builds it, so the test below then asks for its control.
+NOT_IN_THE_APP_YET = {
+    # Phase 5: the check at reset times.
+    "routing_reset_check", "routing_reset_check_wait", "routing_reset_check_retries",
+    "routing_busy_load", "routing_busy_wait", "routing_busy_tries",
+    # Phase 6: the push before handing work to another agent.
+    "routing_push_delegation",
+    # Phase 7: the copy for cloud agents.
+    "routing_cloud_copy", "routing_cloud_copy_hold_words", "routing_cloud_copy_rules",
+    "routing_cloud_copy_stale_after", "routing_cloud_copy_debounce",
+    # Read once, by phase 1a's import of the standing rules, and never again
+    # after it ran: a control for it would do nothing.
+    "routing_rules_seed",
+}
+
+
+def test_every_routing_setting_is_in_the_app():
+    # Codex review, finding 6: every option is visible and usable on
+    # Settings -> Routing and every limit can be lifted there. The app's
+    # allowlist (lib.rs) and the page are compared with the CLI's whole
+    # list, so a setting added later can't be missed.
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    lib = (root / "apps/desktop/src-tauri/src/lib.rs").read_text(encoding="utf-8")
+    page = (root / "apps/desktop/src/RoutingSettings.tsx").read_text(encoding="utf-8")
+    allowed = set(re.findall(r'"(routing_[a-z_]+)"', lib[lib.index("const ROUTING_DURATION_KEYS"):
+                                                         lib.index("const ROUTING_SOURCES_MAX")]))
+    shown = set(re.findall(r'"(routing_[a-z_]+)"', page))
+    everything = set(routing.SETTINGS)
+    assert NOT_IN_THE_APP_YET <= everything
+    wanted = everything - NOT_IN_THE_APP_YET
+    assert sorted(wanted - allowed) == [], "settings the app can't change"
+    assert sorted(wanted - shown) == [], "settings Settings -> Routing doesn't show"
+    assert sorted((allowed | shown) & NOT_IN_THE_APP_YET) == [], "in the app: take it off NOT_IN_THE_APP_YET"
+    assert sorted(allowed - everything) == [], "the app allows a setting the CLI doesn't have"
 
 
 def test_every_limit_a_refusal_names_can_be_raised_in_the_app():

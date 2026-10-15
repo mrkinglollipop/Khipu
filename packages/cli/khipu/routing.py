@@ -2123,7 +2123,7 @@ def _change_item(entity: str, body: dict, prev_effective: dict, causes: dict | N
     author = source = via = None
     if kind == "account":
         entry = next((a for a in body["accounts"] if a["key"] == ident), None) or {}
-        w = entry.get("witness") or entry.get("last_seen") or {}
+        w = _account_change_cause(entry, item["now"], item["was"])
         w_at = _parse(w.get("at"))
         if cause is not None and (w.get("cleared") or w_at is None or w_at <= _parse(cause.get("at"))):
             source, author, via = "owner", cause.get("written_by"), cause.get("via")
@@ -2142,6 +2142,36 @@ def _change_item(entity: str, body: dict, prev_effective: dict, causes: dict | N
         source = kind
     item.update(source=source, written_by=author, via=via)
     return item
+
+
+def _account_change_cause(entry: dict, now_eff: dict | None, was_eff: dict | None) -> dict:
+    """The report behind what changed in an account (Codex review, finding
+    4): of the parts of its effective view that changed (its own state, the
+    side that disagrees with it, each model's limit and the side that
+    disagrees with that), the newest report now behind one of them. A
+    newer conversation's report that changed only the disagreement, or only
+    a model's limit, is named, never the older report the account shows.
+    When no report is behind what changed (a limit ran out, a side ended),
+    the report the account now shows, as before."""
+    shown = entry.get("witness") or entry.get("last_seen") or {}
+    cur, was = now_eff or {}, was_eff or {}
+    behind: list[dict | None] = []
+    if any(cur.get(k) != was.get(k) for k in ("state", "until", "basis", "reason", "last_seen")):
+        behind.append(shown)
+    if cur.get("disagreement") != was.get("disagreement"):
+        behind.append(entry.get("disagreement"))
+    was_models = {m[0]: m for m in was.get("models") or [] if isinstance(m, list) and m}
+    cur_models = {m[0]: m for m in cur.get("models") or [] if isinstance(m, list) and m}
+    for model in entry.get("models") or []:
+        now_m, was_m = cur_models.get(model["model"]), was_models.get(model["model"])
+        if now_m is None:
+            continue
+        if was_m is None or now_m[:3] != was_m[:3]:
+            behind.append(model)
+        if (was_m[3] if was_m is not None and len(was_m) > 3 else None) != (now_m[3] if len(now_m) > 3 else None):
+            behind.append(model.get("disagreement"))
+    found = [b for b in behind if isinstance(b, dict) and _parse(b.get("at")) is not None]
+    return max(found, key=lambda b: _parse(b["at"]), default=shown)
 
 
 def _content_epoch(body: dict) -> str:
@@ -3188,7 +3218,9 @@ def _with_authors(entry: dict) -> dict:
     entry["witness"] = by(entry.get("witness"))
     entry["disagreement"] = by(entry.get("disagreement"))
     entry["last_seen"] = by(entry.get("last_seen"))
-    entry["models"] = [dict(m, disagreement=by(m.get("disagreement"))) for m in entry.get("models") or []]
+    # A model's own limit names its author too: either side of a model's
+    # disagreement can be dismissed in the app (Codex review, finding 3).
+    entry["models"] = [dict(by(m), disagreement=by(m.get("disagreement"))) for m in entry.get("models") or []]
     return entry
 
 

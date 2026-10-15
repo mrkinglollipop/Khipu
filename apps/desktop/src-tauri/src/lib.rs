@@ -600,6 +600,8 @@ const ROUTING_DURATION_KEYS: &[&str] = &[
     "routing_disagreement_warn_after",
     "routing_resend_after",
     "routing_not_refreshed_after",
+    "routing_report_default_limit",
+    "routing_poll_interval",
 ];
 /// Whole numbers of 0 or more.
 const ROUTING_COUNT_KEYS: &[&str] = &[
@@ -609,7 +611,13 @@ const ROUTING_COUNT_KEYS: &[&str] = &[
     "routing_resend_after_versions",
     "routing_hold_chars",
     "routing_line_chars",
+    "routing_start_budget_ms",
+    "routing_runner_silent_intervals",
+    "routing_runner_tail_bytes",
+    "routing_runner_limited_lines",
 ];
+/// Numbers of 0 or more, a fraction allowed (a percentage).
+const ROUTING_NUMBER_KEYS: &[&str] = &["routing_slow_read_pct"];
 /// On or off.
 const ROUTING_SWITCH_KEYS: &[&str] = &["routing_push_start", "routing_push_prompt"];
 const ROUTING_SOURCES_KEY: &str = "routing_sources";
@@ -756,6 +764,7 @@ fn checked_usage_accounts(raw: &str) -> Result<String, String> {
 fn routing_key(key: &str) -> bool {
     ROUTING_DURATION_KEYS.contains(&key)
         || ROUTING_COUNT_KEYS.contains(&key)
+        || ROUTING_NUMBER_KEYS.contains(&key)
         || ROUTING_SWITCH_KEYS.contains(&key)
         || key == ROUTING_SOURCES_KEY
         || key == ROUTING_LANE_MAP_KEY
@@ -856,6 +865,20 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     }
     if key == ROUTING_TABLE_KEY {
         return checked_routing_path("the routing table file", v);
+    }
+    if ROUTING_NUMBER_KEYS.contains(&key) {
+        // Digits with at most one decimal point: never a sign, an exponent,
+        // "inf" or "NaN", so it can't be read as a flag or a special value.
+        let plain = !v.is_empty()
+            && v.len() <= 12
+            && v.chars().all(|c| c.is_ascii_digit() || c == '.')
+            && v.matches('.').count() <= 1
+            && v.chars().any(|c| c.is_ascii_digit());
+        let n: f64 = if plain { v.parse().unwrap_or(-1.0) } else { -1.0 };
+        if !(n.is_finite() && (0.0..=100.0).contains(&n)) {
+            return Err(format!("{key} must be a number from 0 to 100, got {value:?}"));
+        }
+        return Ok(n.to_string());
     }
     let n: u64 = v
         .parse()
@@ -3518,6 +3541,32 @@ mod settings_command_tests {
         assert_eq!(map[3], r#"{"Project B":{"opus-batch":"Claude main"}}"#);
         for bad in [r#"{"B": {"lane": 3}}"#, r#"{"B": ["lane"]}"#, r#"{"B": {"la\nne": "x"}}"#, "[]"] {
             assert!(config_set_argv("routing_lane_map", bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn every_routing_setting_built_so_far_can_be_changed_from_the_app() {
+        // Codex review, finding 6: the record's, the job runners' and the
+        // start's sizes and times, each re-printed or refused.
+        for (k, raw, out) in [
+            ("routing_report_default_limit", "3600", "3600"),
+            ("routing_poll_interval", "0", "0"),
+            ("routing_start_budget_ms", " 2000 ", "2000"),
+            ("routing_runner_silent_intervals", "0", "0"),
+            ("routing_runner_tail_bytes", "1048576", "1048576"),
+            ("routing_runner_limited_lines", "0", "0"),
+            ("routing_slow_read_pct", "0.5", "0.5"),
+            ("routing_slow_read_pct", "2", "2"),
+            ("routing_slow_read_pct", "0", "0"),
+        ] {
+            assert_eq!(config_set_argv(k, raw).unwrap(), v(&["config", "--set", k, out]), "{k}={raw}");
+            assert_eq!(config_unset_argv(k).unwrap(), v(&["config", &format!("--unset={k}")]));
+        }
+        for (k, bad) in [("routing_slow_read_pct", "-1"), ("routing_slow_read_pct", "1e2"), ("routing_slow_read_pct", "NaN"),
+                         ("routing_slow_read_pct", "inf"), ("routing_slow_read_pct", "1.2.3"), ("routing_slow_read_pct", "."),
+                         ("routing_slow_read_pct", "101"), ("routing_slow_read_pct", "--x"),
+                         ("routing_runner_tail_bytes", "-5"), ("routing_poll_interval", "10s")] {
+            assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }
     }
 

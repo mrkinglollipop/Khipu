@@ -896,3 +896,203 @@ describe("Settings -> Routing: the routing table file in plain words", () => {
     expect(tableErrorWords("something new")).toBe("it can't be read");
   });
 });
+
+// ---- Cross-family (Codex) review of phase 4 -----------------------------------------------------
+
+/** A khipu CLI stand-in for the routing settings: `config --set` changes
+ *  what `khipu_config_show` answers, and every write waits for `release()`,
+ *  so a second change can be made before the first one's re-read. */
+function heldConfig() {
+  let routing = config().routing as Record<string, ReturnType<typeof setting>>;
+  let open: () => void = () => {};
+  const gate = new Promise<void>((r) => {
+    open = r;
+  });
+  invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+    if (cmd === "khipu_config_show") return JSON.stringify({ routing });
+    if (cmd === "khipu_config_set") {
+      await gate;
+      const key = String(args!.key);
+      routing = { ...routing, [key]: setting(JSON.parse(String(args!.value)), routing[key]?.default) };
+      return JSON.stringify({ ok: true });
+    }
+    const a = answers[cmd] ?? { ok: true };
+    const out = typeof a === "function" ? a(args) : a;
+    return typeof out === "string" ? out : JSON.stringify(out);
+  });
+  return { release: () => open(), value: (key: string) => routing[key].value };
+}
+
+describe("Settings -> Routing: Codex review of phase 4", () => {
+  it("keeps both lane changes made before the first one's re-read (finding 1)", async () => {
+    const cli = heldConfig();
+    await page();
+    const b = await screen.findByRole("list", { name: "Project B" });
+    const opus = within(b).getAllByRole("listitem").find((r) => r.textContent?.startsWith("opus-batch"))!;
+    fireEvent.change(within(opus).getByLabelText("Account for opus-batch"), { target: { value: "Claude main" } });
+    fireEvent.click(within(opus).getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change the account for Project A's codex lane" }));
+    const a = screen.getByRole("list", { name: "Project A" });
+    const codex = within(a).getAllByRole("listitem").find((r) => r.textContent?.startsWith("codex"))!;
+    fireEvent.change(within(codex).getByLabelText("Account for codex"), { target: { value: "Claude second" } });
+    fireEvent.click(within(codex).getByRole("button", { name: "Save" }));
+    cli.release();
+    await waitFor(() => expect(calls("khipu_config_set")).toHaveLength(2));
+    await waitFor(() =>
+      expect(cli.value("routing_lane_map")).toEqual({
+        "Project A": { codex: "Claude second", main: "Claude main", secondary: "Claude second" },
+        "Project B": { secondary: "Claude second", "opus-batch": "Claude main" },
+      }),
+    );
+  });
+
+  it("keeps a folder added and one removed before the first re-read (finding 1)", async () => {
+    const cli = heldConfig();
+    await page();
+    await screen.findByRole("list", { name: "Job runner folders" });
+    fireEvent.click(screen.getByRole("button", { name: "Add a folder…" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Project C" } });
+    fireEvent.change(screen.getByLabelText("Folder"), { target: { value: "/runners/c" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add folder" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove the Project B folder" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove Project B" }));
+    cli.release();
+    await waitFor(() => expect(calls("khipu_config_set")).toHaveLength(2));
+    await waitFor(() =>
+      expect(cli.value("routing_sources")).toEqual([
+        { name: "Project A", kind: "lanes", path: "/runners/a" },
+        { name: "Project C", kind: "lanes", path: "/runners/c" },
+      ]),
+    );
+  });
+
+  it("shows many holds without copying the list for each one (finding 2)", async () => {
+    const many = Array.from({ length: 60 }, (_, i) => ({ ...view().holds![0], id: `h${i}`, scope_label: `scope ${i}` }));
+    answers.khipu_route_view = { ...view(), holds: many };
+    const slice = Array.prototype.slice;
+    let copies = 0;
+    const spy = vi.spyOn(Array.prototype, "slice").mockImplementation(function (this: unknown[], ...args: [number?, number?]) {
+      if (this.length && (this[0] as { scope_label?: unknown })?.scope_label !== undefined) copies++;
+      return slice.apply(this, args);
+    });
+    try {
+      await page();
+      await screen.findByRole("button", { name: "End the hold on scope 59" });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(copies).toBeLessThan(many.length);
+  });
+
+  it("offers Dismiss on both sides of a model's disagreement, each with its own report (finding 3)", async () => {
+    answers.khipu_route_view = () => {
+      const v = view();
+      v.accounts = [
+        acct("Claude main", "claude", {
+          state: "open",
+          witness: { source: "probe", written_by: { kind: "probe" }, at: "2026-10-14T15:36:00Z" },
+          models: [{
+            model: "Opus", until: "2026-10-16T13:00:00Z", basis: "cli", source: "report", id: "r-opus",
+            by: "a Codex conversation in project-b", at: "2026-10-14T15:20:00Z",
+            disagreement: { id: "e-opus-open", state: "open", source: "report", by: "a Claude Code conversation in project-a", at: "2026-10-14T15:30:00Z" },
+          }],
+        }),
+      ];
+      return v;
+    };
+    await page();
+    const panel = screen.getByRole("group", { name: "Claude main (Opus): two reports disagree" });
+    expect(panel).toHaveTextContent("Limit reached: the Opus limit, reported by a Codex conversation in project-b 20 min ago.");
+    expect(panel).toHaveTextContent("Open: reported by a Claude Code conversation in project-a 10 min ago.");
+    const buttons = within(panel).getAllByRole("button");
+    expect(buttons.map((x) => x.textContent)).toEqual([
+      "Dismiss the conversation's “limit reached” report",
+      "Dismiss the conversation's “open” report",
+    ]);
+    fireEvent.click(buttons[0]);
+    await waitFor(() => expect(calls("khipu_route_clear")).toEqual([{ account: "claude|", report: "r-opus" }]));
+  });
+
+  it("words a model's limit and a disagreement in Recent changes, at the change's own time (finding 5)", () => {
+    const v = view();
+    v.changes = [
+      { version: 20, at: "2026-10-13T15:00:00Z", entities: ["account:claude|"], items: [
+        { entity: "account:claude|", source: "report", by: "a Codex conversation in project-b",
+          now: { label: "Claude main", state: "open", disagreement: null, last_seen: null,
+            models: [["Opus", "2026-10-13T19:00:00Z", "cli", null]] },
+          was: { label: "Claude main", state: "open", disagreement: null, last_seen: null, models: [] } },
+      ] },
+      { version: 21, at: "2026-10-13T15:10:00Z", entities: ["account:claude|"], items: [
+        { entity: "account:claude|", source: "report", by: "a Claude Code conversation in project-a",
+          now: { label: "Claude main", state: "open", disagreement: null, last_seen: null,
+            models: [["Opus", "2026-10-13T19:00:00Z", "cli", ["open", "report"]]] },
+          was: { label: "Claude main", state: "open", disagreement: null, last_seen: null,
+            models: [["Opus", "2026-10-13T19:00:00Z", "cli", null]] } },
+      ] },
+      { version: 22, at: "2026-10-13T15:20:00Z", entities: ["account:claude|/logins/claude-second"], items: [
+        { entity: "account:claude|/logins/claude-second", source: "report", by: "a Codex conversation in project-b",
+          now: { label: "Claude second", state: "limited", until: "2026-10-13T22:52:00Z", basis: "cli", disagreement: ["open", "report"], models: [] },
+          was: { label: "Claude second", state: "limited", until: "2026-10-13T22:52:00Z", basis: "cli", disagreement: null, models: [] } },
+      ] },
+    ];
+    const rows = changeDays(v, MORNING).flatMap((d) => d.rows).filter((r) => r.key.startsWith("2"));
+    expect(rows.map((r) => [r.subject, r.text, r.aside])).toEqual([
+      ["Claude second", "limit reached, back at 6:52 PM", "(a conversation said it is open)"],
+      ["Claude main", "Opus limit reached, back at 3:00 PM; other models open", "(a conversation said Opus is open)"],
+      ["Claude main", "Opus limit reached, back at 3:00 PM; other models open", undefined],
+    ]);
+  });
+
+  it("shows every routing setting built so far, each changeable (finding 6)", async () => {
+    answers.khipu_config_show = config({
+      routing_report_default_limit: setting(1800),
+      routing_start_budget_ms: setting(1000),
+      routing_slow_read_pct: setting(1),
+      routing_runner_silent_intervals: setting(5),
+      routing_runner_tail_bytes: setting(524288),
+      routing_runner_limited_lines: setting(200),
+      routing_poll_interval: setting(10),
+    });
+    await page();
+    await screen.findByText("512 KB");
+    for (const [name, words] of [
+      ["How long a limit reported without a time lasts", "30 minutes"],
+      ["Time allowed at the start of a conversation", "1,000 ms"],
+      ["Warn when reading before a prompt is too slow on more than", "1%"],
+      ["Say a job runner stopped reporting after", "5 intervals"],
+      ["How much of the end of a runner's events.log is read", "512 KB"],
+      ["Newest limit lines kept from each runner", "200 lines"],
+      ["Look at the folders and the routing table every", "10 seconds"],
+    ]) {
+      const btn = screen.getByRole("button", { name: `Change: ${name}` });
+      expect(btn.closest(".route-limit")).toHaveTextContent(words);
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Change: How much of the end of a runner's events.log is read" }));
+    const select = screen.getByLabelText("Read the last");
+    expect(within(select).getByRole("option", { name: "All of it" })).toBeInTheDocument();
+    fireEvent.change(select, { target: { value: "0" } });
+    fireEvent.click(within(screen.getByRole("form", { name: "Change: How much of the end of a runner's events.log is read" })).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls("khipu_config_set")).toEqual([{ key: "routing_runner_tail_bytes", value: "0" }]));
+    fireEvent.click(screen.getByRole("button", { name: "Change: Warn when reading before a prompt is too slow on more than" }));
+    fireEvent.change(screen.getByLabelText("Warn above"), { target: { value: "0.5" } });
+    fireEvent.click(within(screen.getByRole("form", { name: "Change: Warn when reading before a prompt is too slow on more than" })).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls("khipu_config_set")[1]).toEqual({ key: "routing_slow_read_pct", value: "0.5" }));
+  });
+
+  it("says the master switch couldn't be read, and reads it again on Retry (finding 7)", async () => {
+    let fail = true;
+    answers.khipu_features_show = () => {
+      if (fail) throw new Error("khipu features: timed out");
+      return { features: { routing_push: { enabled: true, source: "file" } } };
+    };
+    await page();
+    const alert = await screen.findByText(/Couldn't read this setting/);
+    expect(alert).toHaveTextContent("Couldn't read this setting: khipu features: timed out");
+    expect(screen.getByRole("switch", { name: "Tell conversations about routing" })).toBeDisabled();
+    fail = false;
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Tell conversations about routing" })).toBeChecked());
+    expect(screen.getByRole("switch", { name: "Tell conversations about routing" })).toBeEnabled();
+    expect(screen.queryByText(/Couldn't read this setting/)).toBeNull();
+  });
+});

@@ -34,7 +34,7 @@ import {
   useRouting,
   whenLocal,
 } from "./routing";
-import type { RouteAccount, RouteHold, RouteReport, RouteRule, RouteRunner, RouteView } from "./routing";
+import type { RouteAccount, RouteHold, RouteModel, RouteReport, RouteRule, RouteRunner, RouteView } from "./routing";
 import {
   agoSpan,
   changeDays,
@@ -60,18 +60,28 @@ type Back = () => HTMLElement | null | undefined;
  *  ROUTE_WORDS_MAX_BYTES; fix round 2, R2-4). */
 const WORDS_MOST_KB = 128;
 
+/** A write's arguments, or a function that builds them from state read just
+ *  before the write runs (a string is a refusal in words: nothing is sent). */
+type WriteArgs = Record<string, unknown> | undefined | (() => Promise<Record<string, unknown> | string>);
+
 type Writer = {
-  busy: string | null;
+  /** Whether a write under `id` is running or waiting its turn. */
+  isBusy: (id: string) => boolean;
+  /** Whether any write is running or waiting. */
+  anyBusy: boolean;
   errors: Record<string, string>;
   /**
-   * Run one write, re-read, and keep the CLI's error under `id`. Focus stays
-   * on the control that made the change; when the change removes that
-   * control (Clear, Lift, Dismiss, End now, Undo), focus goes to `back()`.
+   * Run one write, re-read, and keep the CLI's error under `id`. Writes run
+   * one at a time, in the order they were asked for, so a second change
+   * made before the first one's re-read builds on the first (Codex review,
+   * finding 1). Focus stays on the control that made the change; when the
+   * change removes that control (Clear, Lift, Dismiss, End now, Undo),
+   * focus goes to `back()`.
    */
   run: (
     id: string,
     command: string,
-    args?: Record<string, unknown>,
+    args?: WriteArgs,
     after?: (() => Promise<unknown>) | null,
     back?: Back,
   ) => Promise<boolean>;
@@ -79,8 +89,10 @@ type Writer = {
 };
 
 function useWriter(reread: () => Promise<unknown>): Writer {
-  const [busy, setBusy] = useState<string | null>(null);
+  // The writes running or waiting, oldest first.
+  const [pending, setPending] = useState<string[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const queue = useRef<Promise<unknown>>(Promise.resolve());
   // The control focused when a write began, and where focus goes if the
   // write takes that control away (fix round 2, R2-2). Settled after the
   // render that ends the write, the re-read's changes included.
@@ -104,19 +116,45 @@ function useWriter(reread: () => Promise<unknown>): Writer {
       else delete out[id];
       return out;
     });
-  const run: Writer["run"] = async (id, command, args, after, back) => {
+  const run: Writer["run"] = (id, command, args, after, back) => {
     const at = document.activeElement;
-    const k = { from: at instanceof HTMLElement && at !== document.body ? at : null, back, done: false };
-    keep.current = k;
-    setBusy(id);
-    const res = await callCli(command, args);
-    await (after ?? reread)();
-    fail(id, res.ok ? null : res.error);
-    if (keep.current === k) k.done = true;
-    setBusy(null);
-    return res.ok;
+    const from = at instanceof HTMLElement && at !== document.body ? at : null;
+    setPending((p) => [...p, id]);
+    const job = queue.current.then(async () => {
+      const k = { from, back, done: false };
+      keep.current = k;
+      let ok = false;
+      try {
+        const built = typeof args === "function" ? await args() : args;
+        if (typeof built === "string") {
+          fail(id, built);
+        } else {
+          const res = await callCli(command, built);
+          await (after ?? reread)();
+          fail(id, res.ok ? null : res.error);
+          ok = res.ok;
+        }
+      } finally {
+        if (keep.current === k) k.done = true;
+        setPending((p) => {
+          const i = p.indexOf(id);
+          return i < 0 ? p : [...p.slice(0, i), ...p.slice(i + 1)];
+        });
+      }
+      return ok;
+    });
+    queue.current = job.catch(() => undefined);
+    return job;
   };
-  return { busy, errors, run, fail };
+  return { isBusy: (id) => pending.includes(id), anyBusy: pending.length > 0, errors, run, fail };
+}
+
+/** One routing setting's value as `khipu config` reports it now, read just
+ *  before a write that edits it, or why it couldn't be read. */
+async function currentSetting(key: string): Promise<{ value: unknown } | string> {
+  const res = await callCli<RouteConfig>("khipu_config_show");
+  if (!res.ok) return `Khipu couldn't read the setting before changing it: ${res.error}`;
+  return { value: res.data.routing?.[key]?.value };
 }
 
 /** `say` puts a refusal in the control's own words, as a setting's name
@@ -293,8 +331,8 @@ function PauseForm({
       </p>
       <WriteError w={w} id={id} />
       <div className="toolbar">
-        <button type="submit" className="primary sm" disabled={w.busy === id}>
-          <Busy on={w.busy === id} />
+        <button type="submit" className="primary sm" disabled={w.isBusy(id)}>
+          <Busy on={w.isBusy(id)} />
           Mark {a.label} paused
         </button>
         <button type="button" className="sm link" onClick={onClose}>
@@ -329,25 +367,30 @@ const DISMISS_WHO: Record<string, string> = {
 };
 
 function DisagreePanel({ a, w, now, back }: { a: RouteAccount; w: Writer; now: Date; back: Back }) {
-  const sides: { d: RouteReport; model?: string; sentence: string }[] = [];
+  const sides: { d: RouteReport; model?: RouteModel; sentence: string }[] = [];
   const own = disagreementWords(a, now);
   if (a.disagreement && own) sides.push({ d: a.disagreement, sentence: own });
   const modelWords = modelDisagreementWords(a, now);
   (a.models ?? [])
     .filter((m) => m.disagreement && m.until && new Date(m.until).getTime() > now.getTime())
-    .forEach((m, i) => sides.push({ d: m.disagreement!, model: m.model, sentence: modelWords[i] ?? "" }));
+    .forEach((m, i) => sides.push({ d: m.disagreement!, model: m, sentence: modelWords[i] ?? "" }));
   if (!sides.length) return null;
   const said = accountSource(a, now).split(" · ")[0];
   const shownBy = said ? said.charAt(0).toLowerCase() + said.slice(1) : "the stronger report";
   return (
     <>
-      {sides.map(({ d, model, sentence }) => {
-        const shown = a.witness;
+      {sides.map(({ d, model: m, sentence }) => {
+        const model = m?.model;
+        // The side that shows: the account's own report, or for a model the
+        // report behind that model's limit (Codex review, finding 3).
+        const shown = m
+          ? { id: m.id, source: m.source, cleared: false, state: "limited" }
+          : { ...(a.witness ?? {}), state: a.state };
         // Either side can be dismissed, a job runner's limit too (F6); an
         // owner's own clear is not a report.
         const sidesOf = [
-          ...(shown?.id && shown.source && shown.source !== "owner" && !shown.cleared && !model
-            ? [{ id: shown.id, state: a.state, source: shown.source }]
+          ...(shown.id && shown.source && shown.source !== "owner" && !shown.cleared
+            ? [{ id: shown.id, state: shown.state, source: shown.source }]
             : []),
           ...(d.id && d.source && d.source !== "owner" ? [{ id: d.id, state: d.state ?? "", source: d.source }] : []),
         ];
@@ -370,7 +413,11 @@ function DisagreePanel({ a, w, now, back }: { a: RouteAccount; w: Writer; now: D
               <b>Two reports disagree{model ? ` about ${model}` : ""}.</b>
             </span>
             <ul>
-              {!model ? <li>{sideWords(a.state, shownBy, null, now)}</li> : null}
+              {m ? (
+                <li>{sideWords("limited", `the ${m.model} limit, reported by ${m.by || "another source"}`, m.at, now)}</li>
+              ) : (
+                <li>{sideWords(a.state, shownBy, null, now)}</li>
+              )}
               <li>{sideWords(d.state, `reported by ${d.by || "another source"}`, d.at, now)}</li>
             </ul>
             <span>
@@ -385,10 +432,10 @@ function DisagreePanel({ a, w, now, back }: { a: RouteAccount; w: Writer; now: D
                       key={s.id}
                       type="button"
                       className="sm"
-                      disabled={w.busy === id}
+                      disabled={w.isBusy(id)}
                       onClick={() => void w.run(id, "khipu_route_clear", { account: a.key, report: s.id }, null, back)}
                     >
-                      <Busy on={w.busy === id} />
+                      <Busy on={w.isBusy(id)} />
                       {s.label}
                     </button>
                   );
@@ -450,10 +497,10 @@ function AccountRow({ a, w, now, reportDefault }: { a: RouteAccount; w: Writer; 
             type="button"
             className="sm"
             aria-label={`Lift the pause for ${a.label}`}
-            disabled={w.busy === liftId}
+            disabled={w.isBusy(liftId)}
             onClick={() => void w.run(liftId, "khipu_route_lift", { account: a.key }, null, () => pauseBtn.current)}
           >
-            <Busy on={w.busy === liftId} />
+            <Busy on={w.isBusy(liftId)} />
             Lift the pause
           </button>
         ) : null}
@@ -462,10 +509,10 @@ function AccountRow({ a, w, now, reportDefault }: { a: RouteAccount; w: Writer; 
             type="button"
             className="sm"
             aria-label={`Clear ${a.state === "down" ? "the down report" : "the limit"} for ${a.label}`}
-            disabled={w.busy === clearId}
+            disabled={w.isBusy(clearId)}
             onClick={() => void w.run(clearId, "khipu_route_clear", { account: a.key }, null, () => pauseBtn.current)}
           >
-            <Busy on={w.busy === clearId} />
+            <Busy on={w.isBusy(clearId)} />
             Clear
           </button>
         ) : null}
@@ -570,8 +617,8 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
             />
             <WriteError w={w} id="note" />
             <div className="toolbar">
-              <button type="submit" className="primary sm" disabled={w.busy === "note"}>
-                <Busy on={w.busy === "note"} />
+              <button type="submit" className="primary sm" disabled={w.isBusy("note")}>
+                <Busy on={w.isBusy("note")} />
                 Save note
               </button>
               <button type="button" className="sm link" onClick={close}>
@@ -608,12 +655,12 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
               <button
                 type="button"
                 className="sm danger"
-                disabled={w.busy === "note-end"}
+                disabled={w.isBusy("note-end")}
                 onClick={async () => {
                   if (await w.run("note-end", "khipu_route_note_end")) close();
                 }}
               >
-                <Busy on={w.busy === "note-end"} />
+                <Busy on={w.isBusy("note-end")} />
                 End the note
               </button>
               <button type="button" className="sm link" onClick={close}>
@@ -727,12 +774,12 @@ function RuleRow({
             <button
               type="button"
               className="primary sm"
-              disabled={w.busy === id}
+              disabled={w.isBusy(id)}
               onClick={async () => {
                 if (await w.run(id, "khipu_route_rule", { action: "confirm", n: r.n })) close();
               }}
             >
-              <Busy on={w.busy === id} />
+              <Busy on={w.isBusy(id)} />
               Confirm rule {r.n}
             </button>
             <button type="button" className="sm link" onClick={close}>
@@ -769,8 +816,8 @@ function RuleRow({
           ) : null}
           <WriteError w={w} id={id} />
           <div className="toolbar">
-            <button type="submit" className="primary sm" disabled={w.busy === id}>
-              <Busy on={w.busy === id} />
+            <button type="submit" className="primary sm" disabled={w.isBusy(id)}>
+              <Busy on={w.isBusy(id)} />
               {editConfirm ? `Change rule ${r.n}` : "Save…"}
             </button>
             <button type="button" className="sm link" onClick={close}>
@@ -790,7 +837,7 @@ function RuleRow({
             <button
               type="button"
               className="sm danger"
-              disabled={w.busy === id}
+              disabled={w.isBusy(id)}
               onClick={async () => {
                 if (await w.run(id, "khipu_route_rule", { action: "retire", n: r.n })) {
                   close();
@@ -798,7 +845,7 @@ function RuleRow({
                 }
               }}
             >
-              <Busy on={w.busy === id} />
+              <Busy on={w.isBusy(id)} />
               Remove rule {r.n}
             </button>
             <button type="button" className="sm link" onClick={close}>
@@ -870,14 +917,14 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
               type="button"
               className="sm"
               autoFocus
-              disabled={w.busy === restoreId}
+              disabled={w.isBusy(restoreId)}
               onClick={async () => {
                 const n = removed.n;
                 if (await w.run(restoreId, "khipu_route_rule", { action: "restore", n }, null, () => ruleRemoveButton(n)))
                   setRemoved(null);
               }}
             >
-              <Busy on={w.busy === restoreId} />
+              <Busy on={w.isBusy(restoreId)} />
               Undo
             </button>
           </div>
@@ -904,8 +951,8 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
             <ConfirmGroup label="Add this rule?" onClose={() => setAdding(false)} back={() => addBtn.current}>
               <span>Add this rule? Every conversation sees it first, in full, from its next prompt.</span>
               <div className="toolbar">
-                <button type="submit" className="primary sm" disabled={w.busy === "rule-add"}>
-                  <Busy on={w.busy === "rule-add"} />
+                <button type="submit" className="primary sm" disabled={w.isBusy("rule-add")}>
+                  <Busy on={w.isBusy("rule-add")} />
                   Add the rule
                 </button>
                 <button type="button" className="sm link" onClick={() => setAdding(false)}>
@@ -1032,8 +1079,8 @@ function LimitRow({
                 </span>
               );
             })}
-            <button type="submit" className="primary sm" disabled={w.busy === id}>
-              <Busy on={w.busy === id} />
+            <button type="submit" className="primary sm" disabled={w.isBusy(id)}>
+              <Busy on={w.isBusy(id)} />
               Save
             </button>
             <button type="button" className="sm link" onClick={close}>
@@ -1140,9 +1187,6 @@ function HoldsSection({
           <div className="rows" role="list" aria-label="Holds">
             {holds.map((h, i) => {
               const id = `hold-end:${h.id}`;
-              // Once this hold ends, focus goes to the next hold's End now,
-              // else the one before, else Add hold.
-              const after = [...holds.slice(i + 1), ...holds.slice(0, i).reverse()].map((x) => x.id);
               return (
                 <div key={h.id} className="row-item route-acct" role="listitem">
                   <span className="route-name">{capitalise(h.scope_label)}</span>
@@ -1158,14 +1202,26 @@ function HoldsSection({
                       type="button"
                       className="sm"
                       aria-label={`End the hold on ${h.scope_label}`}
-                      disabled={w.busy === id}
-                      onClick={() =>
-                        void w.run(id, "khipu_route_hold_end", { id: h.id }, null, () =>
-                          after.map((x) => endBtns.current[x]).find((b) => b?.isConnected) ?? addBtn.current,
-                        )
-                      }
+                      disabled={w.isBusy(id)}
+                      onClick={() => {
+                        // Once this hold ends, focus goes to the next hold's
+                        // End now, else the one before, else Add hold. Worked
+                        // out on the click, from this hold's place, so a long
+                        // list of holds costs nothing to show (Codex review,
+                        // finding 2).
+                        const from = holds;
+                        void w.run(id, "khipu_route_hold_end", { id: h.id }, null, () => {
+                          const usable = (j: number) => {
+                            const b = endBtns.current[from[j].id];
+                            return b?.isConnected ? b : null;
+                          };
+                          for (let j = i + 1; j < from.length; j++) if (usable(j)) return usable(j);
+                          for (let j = i - 1; j >= 0; j--) if (usable(j)) return usable(j);
+                          return addBtn.current;
+                        });
+                      }}
                     >
-                      <Busy on={w.busy === id} />
+                      <Busy on={w.isBusy(id)} />
                       End now
                     </button>
                   </span>
@@ -1239,8 +1295,8 @@ function HoldsSection({
           </div>
           <WriteError w={w} id="hold-add" />
           <div className="toolbar">
-            <button ref={addBtn} type="submit" className="sm" disabled={w.busy === "hold-add"}>
-              <Busy on={w.busy === "hold-add"} />
+            <button ref={addBtn} type="submit" className="sm" disabled={w.isBusy("hold-add")}>
+              <Busy on={w.isBusy("hold-add")} />
               Add hold
             </button>
           </div>
@@ -1361,6 +1417,7 @@ function TellingSection({
   data,
   cfg,
   features,
+  featuresError,
   w,
   reread,
   rereadFeatures,
@@ -1368,11 +1425,17 @@ function TellingSection({
   data: RouteView | null;
   cfg: RouteConfig | null;
   features: FeaturesShape | null;
+  featuresError?: string | null;
   w: Writer;
   reread: () => Promise<unknown>;
   rereadFeatures: () => Promise<unknown>;
 }) {
   const master = features?.features?.routing_push;
+  // The switch's state could not be read (the read failed, or it has no
+  // answer for this switch): say so and offer to read it again, never a
+  // silent off (Codex review, finding 7).
+  const unread = !master && (featuresError != null || features != null);
+  const [retrying, setRetrying] = useState(false);
   const locked = master?.source === "env";
   const moment = (key: string) => cfg?.routing?.[key]?.value === true;
   const old = data?.old_switches ?? {};
@@ -1391,11 +1454,34 @@ function TellingSection({
           what="Turns all of the telling on or off. The same switch is in Optional features."
           tag={locked ? <Tag>Locked</Tag> : <Tag>Also in Optional features</Tag>}
           checked={master?.enabled === true}
-          disabled={!master || locked || w.busy !== null}
-          busy={w.busy === "push"}
+          disabled={!master || locked || w.anyBusy}
+          busy={w.isBusy("push")}
           onChange={(next) => void w.run("push", "khipu_feature_set", { name: "routing_push", enabled: next }, rereadFeatures)}
           error={
             <>
+              {unread ? (
+                <div className="toolbar">
+                  <p className="set-error" role="alert">
+                    Couldn't read this setting{featuresError ? `: ${featuresError}` : "."}
+                  </p>
+                  <button
+                    type="button"
+                    className="sm"
+                    disabled={retrying}
+                    onClick={async () => {
+                      setRetrying(true);
+                      try {
+                        await rereadFeatures();
+                      } finally {
+                        setRetrying(false);
+                      }
+                    }}
+                  >
+                    <Busy on={retrying} />
+                    Retry
+                  </button>
+                </div>
+              ) : null}
               {locked ? (
                 <p className="opt-cost">
                   The environment variable <code>KHIPU_FEATURE_ROUTING_PUSH</code> decides this switch. Unset it to
@@ -1412,8 +1498,8 @@ function TellingSection({
           what="The full summary: your rules, your note, every account and the holds."
           tag={<Tag tone="ok">Start</Tag>}
           checked={moment("routing_push_start")}
-          disabled={!cfg || w.busy !== null}
-          busy={w.busy === "push-start"}
+          disabled={!cfg || w.anyBusy}
+          busy={w.isBusy("push-start")}
           onChange={(next) =>
             void w.run("push-start", "khipu_config_set", { key: "routing_push_start", value: next ? "on" : "off" }, reread)
           }
@@ -1425,8 +1511,8 @@ function TellingSection({
           what="Only what changed since the conversation last heard, as it stands now. A conversation that fell far behind gets the full summary again."
           tag={<Tag tone="ok">Next prompt</Tag>}
           checked={moment("routing_push_prompt")}
-          disabled={!cfg || w.busy !== null}
-          busy={w.busy === "push-prompt"}
+          disabled={!cfg || w.anyBusy}
+          busy={w.isBusy("push-prompt")}
           onChange={(next) =>
             void w.run("push-prompt", "khipu_config_set", { key: "routing_push_prompt", value: next ? "on" : "off" }, reread)
           }
@@ -1480,6 +1566,22 @@ function TellingSection({
             reread={reread}
           />
           <LimitRow
+            name="Warn when reading before a prompt is too slow on more than"
+            help="Of prompts in the last 7 days; the warning shows in the health report."
+            fields={[{ key: "routing_slow_read_pct", label: "Warn above", unit: "pct", options: [0.5, 1, 2, 5, 10, 0], zero: "Never" }]}
+            cfg={cfg}
+            w={w}
+            reread={reread}
+          />
+          <LimitRow
+            name="Time allowed at the start of a conversation"
+            help="How long Khipu works on the summary when a conversation starts, so its memory still arrives on time. Never more than 8 seconds."
+            fields={[{ key: "routing_start_budget_ms", label: "Time allowed at the start", unit: "ms", options: [250, 500, 1000, 2000, 4000, 8000] }]}
+            cfg={cfg}
+            w={w}
+            reread={reread}
+          />
+          <LimitRow
             name="Send everything again when a conversation is this far behind"
             help="Also when it comes back after being idle."
             fields={[
@@ -1495,6 +1597,14 @@ function TellingSection({
             name="Treat a report as out of date after"
             help="An account with only out-of-date reports shows as Unknown, never as open."
             fields={[{ key: "routing_stale_after", label: "Out of date after", unit: "time", options: [H, 6 * H, 12 * H, 24 * H, 48 * H, 0], zero: "Never" }]}
+            cfg={cfg}
+            w={w}
+            reread={reread}
+          />
+          <LimitRow
+            name="How long a limit reported without a time lasts"
+            help="When a conversation reports a limit but not when it ends. A newer report replaces it sooner."
+            fields={[{ key: "routing_report_default_limit", label: "Lasts", unit: "time", options: [10 * M, 30 * M, H, 2 * H, 5 * H, 24 * H] }]}
             cfg={cfg}
             w={w}
             reread={reread}
@@ -1623,8 +1733,21 @@ function FoldersSection({
   const addBtn = useRef<HTMLButtonElement>(null);
   const removeBtns = useRef<Record<string, HTMLButtonElement | null>>({});
   const base = useId().replace(/:/g, "");
-  const write = (next: SourceEntry[], id: string) =>
-    w.run(id, "khipu_config_set", { key: "routing_sources", value: JSON.stringify(next) }, reread);
+  // Each change is made to the folders as Khipu has them just before it is
+  // written, never to the list this page last read: an add and a remove
+  // made before the first one's re-read both stay (Codex review, finding 1).
+  const write = (edit: (now: SourceEntry[]) => SourceEntry[] | string, id: string) =>
+    w.run(
+      id,
+      "khipu_config_set",
+      async () => {
+        const cur = await currentSetting("routing_sources");
+        if (typeof cur === "string") return cur;
+        const next = edit(Array.isArray(cur.value) ? (cur.value as SourceEntry[]) : []);
+        return typeof next === "string" ? next : { key: "routing_sources", value: JSON.stringify(next) };
+      },
+      reread,
+    );
   const closeAdd = () => {
     setAdding(false);
     requestAnimationFrame(() => addBtn.current?.focus());
@@ -1641,11 +1764,16 @@ function FoldersSection({
       w.fail("folder-add", "Give the folder's full path, starting with / or ~/.");
       return;
     }
-    if (entries.some((x) => x.name.toLowerCase() === n.toLowerCase())) {
+    const taken = (list: SourceEntry[]) => list.some((x) => x.name.toLowerCase() === n.toLowerCase());
+    if (taken(entries)) {
       w.fail("folder-add", `A folder is already named ${n}.`);
       return;
     }
-    if (await write([...entries, { name: n, kind: "lanes", path: p }], "folder-add")) {
+    const added = await write(
+      (now) => (taken(now) ? `A folder is already named ${n}.` : [...now, { name: n, kind: "lanes", path: p }]),
+      "folder-add",
+    );
+    if (added) {
       setName("");
       setPath("");
       closeAdd();
@@ -1687,8 +1815,8 @@ function FoldersSection({
             </div>
             <WriteError w={w} id="folder-add" />
             <div className="toolbar">
-              <button type="submit" className="primary sm" disabled={w.busy === "folder-add"}>
-                <Busy on={w.busy === "folder-add"} />
+              <button type="submit" className="primary sm" disabled={w.isBusy("folder-add")}>
+                <Busy on={w.isBusy("folder-add")} />
                 Add folder
               </button>
               <button type="button" className="sm link" onClick={closeAdd}>
@@ -1744,12 +1872,12 @@ function FoldersSection({
                         <button
                           type="button"
                           className="sm danger"
-                          disabled={w.busy === id}
+                          disabled={w.isBusy(id)}
                           onClick={async () => {
-                            if (await write(entries.filter((x) => x.name !== entry.name), id)) setRemoving(null);
+                            if (await write((now) => now.filter((x) => x.name !== entry.name), id)) setRemoving(null);
                           }}
                         >
-                          <Busy on={w.busy === id} />
+                          <Busy on={w.isBusy(id)} />
                           Remove {entry.name}
                         </button>
                         <button type="button" className="sm link" onClick={() => setRemoving(null)}>
@@ -1765,6 +1893,48 @@ function FoldersSection({
         ) : (
           <p className="set-help">No job runner folders yet. Add one to let Khipu read a runner's limits and heartbeat.</p>
         )}
+        <div className="rows">
+          <LimitRow
+            name="Say a job runner stopped reporting after"
+            help="Counted in the runner's own heartbeat intervals."
+            fields={[{ key: "routing_runner_silent_intervals", label: "Stopped after", unit: "intervals", options: [2, 3, 5, 10, 20, 0], zero: "Never" }]}
+            cfg={cfg}
+            w={w}
+            reread={reread}
+          />
+          <LimitRow
+            name="How much of the end of a runner's events.log is read"
+            help="Older lines are left unread."
+            fields={[
+              {
+                key: "routing_runner_tail_bytes",
+                label: "Read the last",
+                unit: "bytes",
+                options: [128 * 1024, 512 * 1024, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024, 0],
+                zero: "All of it",
+              },
+            ]}
+            cfg={cfg}
+            w={w}
+            reread={reread}
+          />
+          <LimitRow
+            name="Newest limit lines kept from each runner"
+            help="The runner's lines that say a lane reached a limit."
+            fields={[{ key: "routing_runner_limited_lines", label: "Keep", unit: "lines", options: [50, 100, 200, 500, 1000, 0], zero: "No limit" }]}
+            cfg={cfg}
+            w={w}
+            reread={reread}
+          />
+          <LimitRow
+            name="Look at the folders and the routing table every"
+            help="Off: Khipu still updates when a limit or a hold runs out, and whenever it is asked."
+            fields={[{ key: "routing_poll_interval", label: "Look every", unit: "time", options: [5, 10, 30, 60, 5 * M, 0], zero: "Off" }]}
+            cfg={cfg}
+            w={w}
+            reread={reread}
+          />
+        </div>
         <p className="set-help">
           Khipu only reads these folders. It never writes to them, never changes a runner's settings, and reads only
           its limits, its job starts, its heartbeat and the few lane settings it needs to watch your rules. Every line
@@ -1786,7 +1956,6 @@ function LaneRow({
   lane,
   target,
   accounts,
-  map,
   w,
   reread,
 }: {
@@ -1794,7 +1963,6 @@ function LaneRow({
   lane: string;
   target: string | undefined;
   accounts: RouteAccount[];
-  map: LaneMap;
   w: Writer;
   reread: () => Promise<unknown>;
 }) {
@@ -1805,13 +1973,26 @@ function LaneRow({
   const id = `lane:${runner}/${lane}`;
   async function save(e: FormEvent) {
     e.preventDefault();
-    const next: LaneMap = JSON.parse(JSON.stringify(map));
-    const lanes = { ...(next[runner] ?? {}) };
-    if (choice) lanes[lane] = choice;
-    else delete lanes[lane];
-    if (Object.keys(lanes).length) next[runner] = lanes;
-    else delete next[runner];
-    const ok = await w.run(id, "khipu_config_set", { key: "routing_lane_map", value: JSON.stringify(next) }, reread);
+    // The change is made to the lane map as Khipu has it just before the
+    // write, so two lanes saved before the first re-read both keep their
+    // accounts (Codex review, finding 1).
+    const ok = await w.run(
+      id,
+      "khipu_config_set",
+      async () => {
+        const cur = await currentSetting("routing_lane_map");
+        if (typeof cur === "string") return cur;
+        const raw = cur.value;
+        const next: LaneMap = raw && typeof raw === "object" && !Array.isArray(raw) ? JSON.parse(JSON.stringify(raw)) : {};
+        const lanes = { ...(next[runner] ?? {}) };
+        if (choice) lanes[lane] = choice;
+        else delete lanes[lane];
+        if (Object.keys(lanes).length) next[runner] = lanes;
+        else delete next[runner];
+        return { key: "routing_lane_map", value: JSON.stringify(next) };
+      },
+      reread,
+    );
     if (ok && choice) setOpen(false);
   }
   return (
@@ -1832,8 +2013,8 @@ function LaneRow({
               </option>
             ))}
           </select>
-          <button type="submit" className="sm primary" disabled={w.busy === id || (!target && !choice)}>
-            <Busy on={w.busy === id} />
+          <button type="submit" className="sm primary" disabled={w.isBusy(id) || (!target && !choice)}>
+            <Busy on={w.isBusy(id)} />
             Save
           </button>
           {target ? (
@@ -1919,7 +2100,6 @@ function LanesSection({
                         lane={lane}
                         target={map[name]?.[lane]}
                         accounts={accounts}
-                        map={map}
                         w={w}
                         reread={reread}
                       />
@@ -2059,12 +2239,12 @@ function TableSection({
                 </p>
                 <WriteError w={w} id={id} say={(m) => settingWords(m, "routing_table", "Routing table file")} />
                 <div className="toolbar">
-                  <button type="submit" className="primary sm" disabled={w.busy === id}>
-                    <Busy on={w.busy === id} />
+                  <button type="submit" className="primary sm" disabled={w.isBusy(id)}>
+                    <Busy on={w.isBusy(id)} />
                     Save
                   </button>
                   {path ? (
-                    <button type="button" className="sm" disabled={w.busy === id} onClick={() => void stop()}>
+                    <button type="button" className="sm" disabled={w.isBusy(id)} onClick={() => void stop()}>
                       Stop reading it
                     </button>
                   ) : null}
@@ -2113,14 +2293,14 @@ function ChangesSection({ data, w, now }: { data: RouteView; w: Writer; now: Dat
                               <button
                                 type="button"
                                 className="sm"
-                                disabled={w.busy === id}
+                                disabled={w.isBusy(id)}
                                 aria-label={`Bring back standing rule ${row.restore}`}
                                 onClick={() => {
                                   const n = row.restore!;
                                   void w.run(id, "khipu_route_rule", { action: "restore", n }, null, () => ruleRemoveButton(n));
                                 }}
                               >
-                                <Busy on={w.busy === id} />
+                                <Busy on={w.isBusy(id)} />
                                 Bring it back
                               </button>
                               <WriteError w={w} id={id} />
@@ -2197,6 +2377,7 @@ export function RoutingSettings({ active, plans }: { active: boolean; plans?: Us
         data={data}
         cfg={config.data}
         features={features.data}
+        featuresError={features.error}
         w={w}
         reread={rereadConfig}
         rereadFeatures={features.reload}
