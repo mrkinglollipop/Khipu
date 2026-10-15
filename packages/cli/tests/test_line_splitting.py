@@ -377,6 +377,20 @@ class DecodingPolicyTest(unittest.TestCase):
             for q in (b"find caf\xe9 notes", b"find caf\xe8 notes", b"plain")))
         self.assertEqual([r["prompt"] for r in promote.sample_queries(log)], ["plain"])
 
+    def test_promote_tail_keeps_a_record_that_starts_exactly_at_the_boundary(self):
+        # A tail whose first byte follows an LF holds a whole first record;
+        # only a tail that starts inside a line drops its first fragment.
+        from khipu import promote
+
+        log = self.dir / "query_log.jsonl"
+        first = b"dropped older record\n"
+        log.write_bytes(first + b"keep this complete query\n")
+        tail = len(b"keep this complete query\n")
+        self.assertEqual(promote._read_tail(log, max_bytes=tail),
+                         ["keep this complete query", ""])
+        self.assertEqual(promote._read_tail(log, max_bytes=tail + 3),
+                         ["keep this complete query", ""])
+
     def test_run_text_encodes_stdin_strictly_and_decodes_output_with_replacement(self):
         from khipu import lines
 

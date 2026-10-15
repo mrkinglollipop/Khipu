@@ -609,10 +609,14 @@ def _read_tail(path: Path, max_bytes: int = REPLAY_TAIL_BYTES) -> list[str]:
     with open(path, "rb") as fh:
         size = fh.seek(0, os.SEEK_END)
         offset = max(0, size - max_bytes)
+        before = b"\n"
+        if offset:
+            fh.seek(offset - 1)
+            before = fh.read(1)
         fh.seek(offset)
         data = fh.read()
-    if offset:
-        data = data.partition(b"\n")[2]  # the seek may land inside a line
+    if before != b"\n":
+        data = data.partition(b"\n")[2]  # the seek landed inside a line
     out = []
     for raw in data.split(b"\n"):
         try:
