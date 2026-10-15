@@ -211,6 +211,98 @@ def test_symlink_aliases_follow_parent_links_and_changed_hops(owner):
     assert agent_view._TABLE["table"] is not before
 
 
+def _encode_identity(value, encoding):
+    if encoding == "unicode-one":
+        return value.replace("o", r"\u006f", 1)
+    if encoding == "percent-one":
+        return value.replace("o", "%6F", 1)
+    if encoding == "unicode-all":
+        return "".join(r"\u%04x" % ord(c) for c in value)
+    if encoding == "hex-all":
+        return "".join(r"\x%02x" % ord(c) for c in value)
+    if encoding == "decimal-entities":
+        return "".join(f"&#{ord(c)};" for c in value)
+    if encoding == "hex-entities":
+        return "".join(f"&#x{ord(c):x};" for c in value)
+    encoded = "".join(f"%{ord(c):02X}" for c in value)
+    if encoding == "percent-five":
+        for _ in range(4):
+            encoded = encoded.replace("%", "%25")
+    return encoded
+
+
+@pytest.mark.parametrize("kind", ["folder", "user", "full", "tilde"])
+@pytest.mark.parametrize("encoding", [
+    "unicode-one", "percent-one", "unicode-all", "hex-all", "percent-all",
+    "percent-five", "decimal-entities", "hex-entities",
+])
+def test_encoded_identities_never_reach_mcp(owner, monkeypatch, kind, encoding):
+    from khipu.config import config_file
+
+    home = Path(owner["home"])
+    resolved = home / ".ResolvedLogin9"
+    resolved.mkdir()
+    pointer = home / ".LoginPointer9"
+    pointer.symlink_to(resolved.name, target_is_directory=True)
+    config_file().write_text(json.dumps({"usage_accounts": [
+        {"label": "Work", "harness": "claude", "home": "~/.LoginPointer9"}]}))
+    original = {"folder": resolved.name, "user": USER, "full": str(resolved),
+                "tilde": "~/" + resolved.name}[kind]
+    payload = _encode_identity(original, encoding)
+    if kind in ("folder", "user") and len(payload) <= 64:
+        monkeypatch.setattr(usage, "_command", lambda h: "/tmp/fake-cli")
+        metadata = frames()
+        metadata[0]["response"]["response"]["claude_code_version"] = payload
+        metadata[1]["response"]["response"]["subscription_type"] = payload
+        monkeypatch.setattr(usage, "_converse", lambda *a, **kw: metadata)
+        raw = usage.report(fresh=True)["accounts"][0]
+        assert raw["plan"] == raw["version"] == payload
+        err, out = call("khipu_usage")
+        assert not err
+        assert out["accounts"][0]["plan"] == agent_view.WITHHELD
+        assert out["accounts"][0]["version"] == agent_view.WITHHELD
+    else:
+        def fail(**kw):
+            raise ValueError("Provider failed at " + payload)
+
+        monkeypatch.setattr(usage, "report", fail)
+        err, out = call("khipu_usage")
+        expected = agent_view.WITHHELD
+        if encoding in ("unicode-one", "percent-one") and kind in ("full", "tilde"):
+            # Literal path syntax is removed before the final containment check.
+            replacement = agent_view.FOLDER_WORD if kind == "full" else agent_view.HOME_WORD
+            expected = "Provider failed at " + replacement
+        assert err and out["error"] == expected
+
+
+@pytest.mark.parametrize("login,payload", [
+    (".Resolved+Login9", ".Res%6Flved+Login9"),
+    (".Resolved Login9", ".Res%6Flved+Login9"),
+    (".ResolvedLogin9", _encode_identity(r".Res\u006flvedLogin9", "percent-five")),
+    (".ResolvedLogin9", r".Res\x26#111;lvedLogin9"),
+    (".Maße-Café", r".MASSE-CAFE\u0301"),
+])
+def test_decoded_variants_cover_plus_mixed_and_normalized_names(tmp_path, monkeypatch, login, payload):
+    _setup(tmp_path, monkeypatch, USER, [login])
+    assert agent_view.scrub(payload) == agent_view.WITHHELD
+
+
+def test_decoding_preserves_public_text_owner_words_and_fast_path(owner, monkeypatch):
+    note = r"Owner permits .probe\u002dlogin"
+    routing.set_note(note, via="app")
+    assert agent_view.scrub(note) == note
+    assert agent_view.scrub(note + r" and .probe\u002dlogin") == agent_view.WITHHELD + " " + note
+    for text in ("100% public", r"literal \uZZZZ and \xQQ", "public &#35; text", "a+b%20c"):
+        assert agent_view.scrub(text) == text
+
+    def unexpected_decode(value):
+        pytest.fail("ordinary output must skip decoding")
+
+    monkeypatch.setattr(agent_view, "unquote", unexpected_decode)
+    monkeypatch.setattr(agent_view, "unquote_plus", unexpected_decode)
+    assert agent_view.scrub("ordinary public text + words") == "ordinary public text + words"
+
+
 def test_a_cached_note_naming_the_user_is_not_passed_on(owner):
     cache(owner["account"], note=f"Previous attempt failed for {USER}")
     err, out = call("khipu_usage")

@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import getpass
 import hashlib
+import html
 import os
 import re
 import threading
@@ -34,6 +35,7 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import unquote, unquote_plus
 
 HOME_WORD = "the home folder"
 USER_WORD = "the user"
@@ -51,10 +53,40 @@ _TAIL = rf"(?:/{_SEG}(?:\s{_SEG})*(?=/))*(?:/[^\s\"'`,;)\]}}]*)?"
 # Each harness's login folder when none is configured: its key is "harness|".
 _DEFAULT_FOLDERS = {"claude": ".claude", "codex": ".codex", "grok": ".grok"}
 _LOCK = threading.Lock()
+_CHAR_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})")
+_NUMERIC_ENTITY = re.compile(r"&#(?:[xX][0-9a-fA-F]+|[0-9]+);?")
 
 
 def _fold(text: str) -> str:
     return unicodedata.normalize("NFC", text).casefold()
+
+
+def _decoded_variants(text: str):
+    """Bound nested decoding while retaining literal plus signs as well as spaces."""
+    yield text
+    if not any(marker in text for marker in ("%", "\\", "&#")):
+        return
+    seen = {text}
+    pending = {text}
+    for _ in range(5):
+        following = set()
+        for value in pending:
+            decoded = {value}
+            if "%" in value or "+" in value:
+                decoded.update((unquote(value), unquote_plus(value)))
+            for candidate in tuple(decoded):
+                if "\\" in candidate:
+                    candidate = _CHAR_ESCAPE.sub(
+                        lambda m: chr(int(m.group(1) or m.group(2), 16)), candidate)
+                    decoded.add(candidate)
+                if "&#" in candidate:
+                    decoded.add(_NUMERIC_ENTITY.sub(lambda m: html.unescape(m.group()), candidate))
+            following.update(decoded - seen)
+        if not following:
+            return
+        yield from following
+        seen.update(following)
+        pending = following
 
 
 def keep_owner_words(view) -> list[str]:
@@ -390,10 +422,13 @@ def _scrub_text(text: str, table: _Table, keep: list[str]) -> str:
     # Regex case-insensitivity cannot expand Unicode casefolds (ß -> ss).
     # Check the finished value even when it contained no apparent path or
     # token. Owner words remain masked until this fail-closed check is done.
-    folded = _fold(text)
-    if unmatched_root or any(secret in folded for secret in table.secrets) \
-            or (table.name_secrets is not None and table.name_secrets.search(folded)):
-        text = WITHHELD + "".join(f" \x00{i}\x00" for i in range(len(held)))
+    for variant in _decoded_variants(text):
+        folded = _fold(variant)
+        if unmatched_root or any(secret in folded for secret in table.secrets) \
+                or (table.name_secrets is not None and table.name_secrets.search(folded)) \
+                or (variant != text and _PATHLIKE.search(folded)):
+            text = WITHHELD + "".join(f" \x00{i}\x00" for i in range(len(held)))
+            break
     for i, word in enumerate(held):
         text = text.replace(f"\x00{i}\x00", word)
     return text
