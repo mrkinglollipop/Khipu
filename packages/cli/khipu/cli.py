@@ -76,6 +76,15 @@ def _add_paths() -> None:
             sys.path.insert(0, s)
 
 
+
+def _strict_json(value, **kw) -> str:
+    """JSON the desktop's serde_json parses whatever the text holds: ASCII,
+    no lone surrogate escape (khipu.wire)."""
+    from khipu import wire
+
+    return wire.dumps(value, ensure_ascii=True, **kw)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from khipu.drift import status_payload
     from khipu.hub_snapshot import (
@@ -95,7 +104,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         # embedding replica over Tailscale froze the desktop. Doctor (throttled)
         # and `khipu snapshot refresh` own the dump. snapshot_freshness (W2.4)
         # is still cheap — it only compares two timestamps already in hand.
-        data["hub_snapshot"] = snapshot_freshness(data.get("latest_ingested_at"))
+        data["hub_snapshot"] = snapshot_freshness(
+            data.get("latest_ingested_at"), lag=data.pop("replica_lag", None))
     except Exception as exc:
         if not hub_connection_failed(exc):
             raise
@@ -120,7 +130,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         data["bundle_seal"] = bundle_seal.check()
     except Exception as exc:  # noqa: BLE001
         data["bundle_seal"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    print(json.dumps(data, indent=2, default=str))
+    print(_strict_json(data, indent=2, default=str))
     return 0
 
 
@@ -458,7 +468,7 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
     }
     out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
                  and all(bool(local[k]) for k in LOCAL_GATES))
-    print(json.dumps(out, indent=2, default=str))
+    print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
 
 
@@ -567,7 +577,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     from khipu.hub_snapshot import (
         hub_connection_failed,
         snapshot_freshness,
-        snapshot_health,
         status_payload_snapshot,
     )
 
@@ -584,13 +593,12 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
             status["hub_error"] = f"{type(exc).__name__}: {exc}"
         else:
             raise
-    # W2.4: behind_ingest_seconds / ok=false reason=snapshot_behind_ingest only
-    # means something while PG is reachable — with the hub down, hub_ok is
-    # already red from a different, more specific check.
-    hub_snapshot = (
-        snapshot_freshness(status.get("latest_ingested_at"))
-        if hub_ok
-        else snapshot_health()
+    # Replica freshness phase 1: per-table lag while the hub answers; with it
+    # down the state is "unknown" (hub_ok is already red, more specifically)
+    # and the last measurement rides along.
+    hub_snapshot = snapshot_freshness(
+        status.get("latest_ingested_at") if hub_ok else None,
+        lag=status.pop("replica_lag", None),
     )
     # A check whose input is not configured on this machine is SKIPPED and
     # named in `not_configured` — distinct from red (configured but broken)
@@ -823,6 +831,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "status": status,
         "hub_ok": hub_ok,
         "hub_snapshot": hub_snapshot,
+        # Its own row in the app's health report; red only when stale.
+        "hub_snapshot_ok": bool(hub_snapshot.get("ok", True)),
         "drift": drift,
         "graph_drift": graph,
         "outbox": outbox,
@@ -938,7 +948,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "launchers_ok": bool(launchers.get("ok")),
         "nightly_steps_ok": local["nightly_steps_ok"],
     }
-    print(json.dumps(out, indent=2, default=str))
+    print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
 
 
@@ -2028,7 +2038,22 @@ def cmd_usage(args: argparse.Namespace) -> int:
     from khipu import usage
 
     max_age = usage.DEFAULT_MAX_AGE_S if args.max_age is None else max(0.0, float(args.max_age))
-    rep = usage.report(fresh=bool(args.fresh), max_age=max_age)
+    label = getattr(args, "account", None)
+    key = getattr(args, "account_key", None)
+    account, error = (usage.resolve_account(label, key) if label is not None or key is not None
+                      else (None, None))
+    if error:
+        print(json.dumps({"ok": False, "error": error}))
+        return 2
+    if getattr(args, "sign_in", False):
+        if account is None:
+            print(json.dumps({"ok": False, "error": "name the account with --account"}))
+            return 2
+        out = usage.sign_in(account["label"], key=usage.account_key(account))
+        print(json.dumps(out, indent=2))
+        return 0 if out["ok"] else 1
+    one = {"accounts": [account]} if account else {}
+    rep = usage.report(fresh=bool(args.fresh), max_age=max_age, **one)
     if args.json:
         print(json.dumps(rep, indent=2))
     elif not rep["accounts"]:
@@ -2098,6 +2123,11 @@ def cmd_owed(args: argparse.Namespace) -> int:
                 status=getattr(args, "status", None) or "open",
                 limit=int(getattr(args, "limit", None) or 50),
             )
+            # Ages counted on the hub's own clock, so a Mac clock that runs
+            # ahead of or behind the hub can't make an age negative.
+            cur.execute("SELECT now()")
+            hub_now = (cur.fetchone() or [None])[0]
+    commitments.add_hub_ages(rows, hub_now)
     print(json.dumps(rows, indent=2, default=str))
     return 0
 
@@ -2644,9 +2674,12 @@ def cmd_secrets_verify(args: argparse.Namespace) -> int:
         which = "all"
     try:
         result = check_model_keys(which=which)
-    except ValueError as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}))
+    except ValueError:
+        print(json.dumps({"ok": False, "error": "Unknown check selection."}))
         return 2
+    except Exception:  # noqa: BLE001 - fixed text: an error here could echo a key
+        print(json.dumps({"ok": False, "error": "The key check could not be completed."}))
+        return 1
     print(json.dumps(result, indent=2))
     return 0 if result["ok"] else 1
 
@@ -3116,7 +3149,7 @@ def cmd_budget(args: argparse.Namespace) -> int:
 def cmd_migrate(args: argparse.Namespace) -> int:
     from khipu.migrate import run
 
-    out = run(dry_run=bool(args.dry_run))
+    out = run(dry_run=bool(args.dry_run), claim_local_rows=True)
     print(json.dumps(out, indent=2))
     # A pending list after a real run means a migration failed to apply.
     return 0 if args.dry_run or not out["pending"] else 1
@@ -3400,10 +3433,12 @@ def cmd_jobs(args: argparse.Namespace) -> int:
 
 
 def cmd_snapshot(args: argparse.Namespace) -> int:
-    from khipu.hub_snapshot import refresh, snapshot_health
+    from khipu.hub_snapshot import refresh, snapshot_freshness
 
     if args.snapshot_cmd == "status":
-        print(json.dumps(snapshot_health(), indent=2))
+        # Local evidence only (no hub connection): the state, per-table
+        # cursors and the last measurement status or doctor made.
+        print(json.dumps(snapshot_freshness(None), indent=2))
         return 0
     try:
         out = refresh()
@@ -4634,6 +4669,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-age", type=float, default=None, metavar="S",
         help="Reuse a cached probe younger than S seconds (default 120); older figures are marked stale",
     )
+    us.add_argument("--account", default=None, metavar="LABEL",
+                    help="Only this configured account (its label, as Settings shows it)")
+    us.add_argument("--account-key", default=None, metavar="KEY",
+                    help="Only the account with this key (harness|login folder); wins over a label two accounts share")
+    us.add_argument("--sign-in", action="store_true",
+                    help="With --account: start that CLI's own login in its login folder (opens the browser), "
+                         "wait for it, then read the account again")
     us.set_defaults(func=cmd_usage)
 
     rt = sub.add_parser(
@@ -4711,6 +4753,17 @@ def build_parser() -> argparse.ArgumentParser:
                             "not when its limit's time has merely passed")
     rwait.add_argument("--timeout", default=None, metavar="S",
                        help="Give up after S seconds (or 30m, 2h; 0 checks once); default: no end")
+    rprio = rt_sub.add_parser(
+        "priority", parents=[rt_json],
+        help="The owner's priority: show it; set, confirm, undo or clear it (asks for a typed confirmation)")
+    rprio.add_argument("action", nargs="?", default="show", choices=("show", "set", "confirm", "undo", "clear"))
+    rprio.add_argument("accounts", nargs="*", help="set: the accounts in your order (or --entries)")
+    rprio.add_argument("--entries", default=None, metavar="JSON",
+                       help='set: [{"account": "...", "role": "your words", "until": "T"}, ...] in your order')
+    rprio.add_argument("--until", default=None, metavar="T", help="set: when the whole priority ends")
+    rprio.add_argument("--at-owner-request", default=None, metavar="REQUEST",
+                       help="A conversation: the owner's request, in one line (set only; stays unconfirmed)")
+    rprio.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire, restore or confirm a standing rule", parents=[rt_json])
     rrule.add_argument("action", choices=("add", "edit", "retire", "restore", "confirm", "undo", "dismiss"))
     rrule.add_argument("params", nargs="*")

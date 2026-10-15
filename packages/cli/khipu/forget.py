@@ -44,6 +44,8 @@ from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from typing import Any
 
+from khipu.lines import split_lines
+
 LOCAL_HARNESSES = ("claude_code", "cursor", "codex", "aegis")
 
 # What a forget keeps, said plainly in every result. Nothing deletes a
@@ -414,7 +416,7 @@ def _candidate_hashes(candidates: list[dict[str, Any]], source_rows: list[dict[s
     for _place, path in places:
         # An unreadable file is reported by the scrub step, not here.
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            lines = split_lines(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError):
             continue
         for line in lines:
@@ -562,7 +564,7 @@ def _replace_target(path: Path) -> Path:
 
 
 def _read_lines(path: Path) -> list[str]:
-    return path.read_text(encoding="utf-8").splitlines(keepends=True)
+    return split_lines(path.read_text(encoding="utf-8"), keepends=True)
 
 
 def _rewrite_log(root: Path, path: Path, ts_iso: str | None, summary_md5: str | None) -> dict[str, Any]:

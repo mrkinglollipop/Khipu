@@ -376,11 +376,12 @@ def test_extraction_fixture_prompt_is_byte_identical_across_adapters():
                 return Reply({'content': [{'type': 'text', 'text': answer}]})
             return Reply({'choices': [{'message': {'content': answer}}]})
         def respond_cli(argv, **kwargs):
-            prompts.append(kwargs['input'].encode())
             if provider == 'claude-cli':
+                prompts.append(kwargs['input'].encode())
                 return subprocess.CompletedProcess(argv, 0, json.dumps({'result': answer}), '')
+            prompts.append(kwargs['input'])  # codex-cli: strict UTF-8 bytes
             Path(argv[argv.index('-o') + 1]).write_text(answer)
-            return subprocess.CompletedProcess(argv, 0, '', '')
+            return subprocess.CompletedProcess(argv, 0, b'', b'')
         with mock.patch.object(extract, '_provider_key', return_value='fake'), \
              mock.patch.object(extract, '_key', return_value='fake'), \
              mock.patch.object(extract.urllib.request, 'urlopen', side_effect=respond), \
@@ -420,7 +421,23 @@ def cli_reply(provider, argv, *, text='ab', error=False, code=0, usage=True):
             'input_tokens': 1000, 'output_tokens': 200, 'cached_input_tokens': 400}})
     if error:
         events.append({'type': 'turn.failed', 'error': {'message': text}})
-    return subprocess.CompletedProcess(argv, code, '\n'.join(json.dumps(e) for e in events), 'ignored stderr')
+    # codex-cli runs through lines.run_text: bytes in, bytes out.
+    return subprocess.CompletedProcess(argv, code, '\n'.join(json.dumps(e) for e in events).encode(),
+                                       b'ignored stderr')
+
+
+def test_codex_cli_event_with_a_raw_line_separator_is_one_event(monkeypatch):
+    # codex exec --json may leave U+2028 raw inside a string; splitlines()
+    # cut that event in two and the half failed to parse, failing the call.
+    monkeypatch.setattr(synth_cli, 'binary', lambda name: name)
+    def run(argv, **kw):
+        reply = cli_reply('codex-cli', argv)
+        item = json.dumps({'type': 'item.completed', 'item': {'text': 'a\u2028b'}}, ensure_ascii=False)
+        return subprocess.CompletedProcess(argv, 0, item.encode() + b'\n' + reply.stdout + b'\n', b'')
+    with mock.patch.object(extract.subprocess, 'run', side_effect=run):
+        assert extract._generate_codex_cli('p', model_id='m', timeout=7, retries=0, caller='fixture') == 'ab'
+    row = json.loads(extract.synth_usage_path().read_text())
+    assert (row['prompt_tokens'], row['output_tokens']) == (1000, 200)
 
 
 @pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
@@ -438,8 +455,11 @@ def test_cli_exact_argv_stdin_env_usage_budget_and_no_capture(provider, tmp_path
         cwd = Path(kw['cwd'])
         assert cwd.is_relative_to(tmp_path / 'state' / 'synth-cli')
         assert list(cwd.iterdir()) == []
-        assert kw['input'].encode() == prompt.encode()
-        assert kw['text'] and kw['capture_output'] and not kw['check']
+        if provider == 'claude-cli':
+            assert kw['input'].encode() == prompt.encode() and kw['text']
+        else:
+            assert kw['input'] == prompt.encode() and not kw.get('text')
+        assert kw['capture_output'] and not kw['check']
         assert kw['timeout'] == 7
         assert not any(k.startswith('KHIPU_') for k in kw['env'])
         assert 'CLAUDECODE' not in kw['env'] and 'CLAUDE_CODE_ENTRYPOINT' not in kw['env']

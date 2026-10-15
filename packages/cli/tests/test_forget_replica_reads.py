@@ -20,6 +20,7 @@ import tempfile
 import time
 import unittest
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -108,6 +109,13 @@ class ForgottenEpisodeStaysForgottenInTheReplicaTest(unittest.TestCase):
 
             def cursor(self):
                 return self
+
+            def execute(self, *_args, **_kwargs):
+                pass
+
+            def fetchone(self):
+                # The dump reads the hub's own clock before any table.
+                return (datetime(2026, 10, 3, tzinfo=timezone.utc),)
 
         def episodes(_cur, con):
             _fill(con, gone_deleted_at="2026-10-02T00:00:00+00:00")

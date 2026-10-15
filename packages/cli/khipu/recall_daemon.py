@@ -52,7 +52,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from khipu import __version__
+from khipu import __version__, wire
 
 SOCKET_NAME = "recall.sock"
 # How often, at most, the service looks at the package's files again.
@@ -511,7 +511,7 @@ class RecallService:
                     chunk = conn.recv(65536)
                     if not chunk:
                         if buf.strip():
-                            conn.sendall(json.dumps(self._answer(buf)).encode("utf-8") + b"\n")
+                            conn.sendall(wire.encode(self._answer(buf), ensure_ascii=True) + b"\n")
                         return
                     buf += chunk
                 line, buf = buf.split(b"\n", 1)
@@ -519,7 +519,8 @@ class RecallService:
                     continue
                 delivery = {}
                 answer = self._answer(line, delivery)
-                conn.sendall(json.dumps(answer).encode("utf-8") + b"\n")
+                # Strict: the client prints this answer as hook stdout.
+                conn.sendall(wire.encode(answer, ensure_ascii=True) + b"\n")
                 if delivery:
                     from khipu import recall_prompt
                     deadline = json.loads(line).get("deadline", time.monotonic() + 0.2)

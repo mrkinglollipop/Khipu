@@ -31,6 +31,7 @@ can see and change all of it in the app. Khipu never decides where work goes.
 | 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | done 2026-10-15 (PR #190) |
 | 3c | The daemon refolds on change and on the clock; the promotion gate's replay covers routing | S | done 2026-10-15 (PR #191) |
 | 4 | App: Home Routing card, Settings → Routing for what phases 1a to 3c built, health row, attention items | M–L | done 2026-10-15 (PR #192) |
+| 4b | The owner's priority and the spend pace, with their part of the app | S–M | built, in review (branch feat/routing-priority) |
 | 5 | The background check at each known reset time, with its part of the app | S | built, in review (branch feat/routing-truth-5) |
 | 6 | Push at the moment of delegation, with its part of the app | S–M | built, in review (branch feat/routing-truth-6) |
 | 7 | Copy for cloud agents through the hub, read by cloud harnesses and a second Mac, with its part of the app | M | open |
@@ -819,6 +820,77 @@ Inspect `PlansCard.tsx`, the fixed-argv commands in `lib.rs` (`khipu_usage_statu
   ships a control that does nothing.
 
 Useful alone: Matt sees and changes all of it without a terminal.
+
+### Phase 4b: the owner's priority (S–M, one session)
+
+The owner asked on 2026-10-15, after upgrading the second Claude account: "Does Khipu have the ability to
+prioritize an account? Say, like, this account's the priority at the moment?" and then "Think about it.
+Make sure you've thought it through with what we need and what I'm trying to accomplish, and do it." What
+he is trying to accomplish: spend each plan's allowance where it is worth most before it resets (this week:
+use the second Claude account hard before its Saturday 3 pm Eastern reset, keep this account for
+orchestration), and have every conversation in every project follow that without him editing rules or
+typing in a terminal.
+
+This stays inside "Khipu reports, it does not route". The priority is the owner's stated choice, reported
+word for word like his note and rules; Khipu never computes, reorders or enforces it, and a conversation
+with better live information may still route differently and say why.
+
+The record gains one owner-held item, **the priority**: an ordered list of accounts (from the accounts plan
+usage lists), each with an optional role in his words ("all Claude work first", "orchestration only",
+"cross-family reviews") and an optional end time, plus an optional end time for the whole list. Writes:
+- From the app (Settings → Routing → Accounts → "Priority"): add an account to the order, move it up or
+  down, remove it, set its role and its end, clear the whole priority. Owner writes, marked via=app.
+- From a conversation at the owner's request (the same mechanism as standing rules phase "rule edits"):
+  written at once and live, marked "set by <conversation> at the owner's request; the owner has not
+  confirmed it yet", with the priority it replaced shown beside it until he confirms in the app with one
+  tap, or undoes it. Confirming, undoing and clearing stay owner-only.
+- The CLI with a typed yes, as today for owner commands.
+
+What conversations see, first in every summary and in every change push, before the account lines:
+"Your priority (your words; guidance, not a gate): 1. Claude second, until Sat 3:00 PM: all Claude work
+first; 2. Codex: cross-family reviews; 3. Claude: orchestration only." Each entry also carries the facts
+Khipu already has about that account, never a judgement: its state (open, limited until …), and, when plan
+usage can read it, how much of its window is used and how long until it resets ("12% of its week used,
+resets in 2 d 4 h"). If the first account is limited, down or paused the line says so beside it; Khipu does
+not promote the next one. When an entry's end time passes it drops out on its own (a clock-driven refold,
+as limits do) and conversations hear "Priority on Claude second ended"; when the last entry ends, "No
+priority set". A priority naming an account that is not in the accounts list is kept and shown as
+"not in Settings → Models".
+
+Tools: `khipu_route` returns the priority as data (labels, roles, ends, confirmed or not);
+`khipu_route_priority` sets it at the owner's request (a conversation passes the full ordered list and the
+owner's words for what he asked); `khipu route priority` shows it, and with a typed yes sets or clears it.
+
+App: the Home Routing card shows the priority at the top ("Priority: Claude second until Sat 3:00 PM, then
+Codex"), with the unconfirmed mark and Confirm/Undo when a conversation set it. Settings → Routing →
+Accounts gets the Priority controls above the account list. Every control is a fixed-argv command with
+--from-app, argv from validated fields only.
+
+Doctor: warns when the priority is unconfirmed for more than a day, when its first account is limited or
+paused, and when an entry names an unknown account.
+
+Tests: order, roles and ends survive a refold and a restart; an end drops the entry and tells
+conversations; set at the owner's request is live, marked and shows the replaced priority; a conversation
+cannot confirm, undo or clear; the summary puts the priority first and never truncates it; the app's
+controls send the right argv and a value can never become an option; Khipu never reorders the list.
+
+Stop-condition: if a piece of this would make Khipu pick, reorder or enforce, it stays out and the build
+reports it.
+
+**Spend pace (the owner, the same day):** "it would be nice if the model in conversations is like, okay,
+there's a lot of usage there left, but very little time. Whereas like ChatGPT, I've got over ninety percent
+but a week to use it, so there's not as much of a rush." So for every account plan usage can read, Khipu
+reports a fact beside it: what is left of its longest window and the time until that window resets, and the
+pace that would use it up by then ("Claude second: 88% of its week left, resets Sat 3:00 PM (2 d 4 h): about
+1.7% an hour to use it all"; "Codex: 92% of its week left, resets Thu (6 d 20 h): about 0.6% an hour"), in
+plain words a model can act on ("a lot left, little time" / "plenty of time"). These are arithmetic on
+figures Khipu already reads, never a choice. When the owner has set no priority, the summary lists accounts
+in order of that pace, fastest first, under the heading "Accounts by how soon their allowance runs out
+unused (Khipu's arithmetic, not your priority)"; the owner can switch that ordering off in the app (a
+setting), and a priority he sets always comes first and is never reordered. An account whose usage cannot
+be read says so ("plan figures can't be read: sign in again") and gets no pace, never a guess. Tests: the
+pace arithmetic on fixed figures and a fixed clock; a window that resets before the next one; 0% and 100%
+left; an unreadable account; the ordering switch; the owner's priority never reordered.
 
 ### Phase 5: the check at reset times (S, one session)
 

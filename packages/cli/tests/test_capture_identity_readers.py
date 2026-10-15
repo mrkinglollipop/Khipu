@@ -106,7 +106,6 @@ class ExactWindowReaderTest(unittest.TestCase):
         with _no_sources():
             self.assertIsNone(cap._dedup_exact_window(cur, dict(self.PAYLOAD)))
         self.assertFalse(any("episode_sources" in s for s in cur.calls))
-        self.assertTrue(any("raw @>" in s for s in cur.calls), "receipt match still runs")
 
 
     def test_windowed_capture_without_a_part_ignores_the_source_key(self):

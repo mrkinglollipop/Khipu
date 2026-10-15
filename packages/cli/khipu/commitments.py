@@ -1333,6 +1333,21 @@ def list_owed(cur, *, project: str | None = None, parent_session_id: str | None 
     return rows[:limit]
 
 
+def add_hub_ages(rows: list[dict[str, Any]], hub_now: Any) -> list[dict[str, Any]]:
+    """Adds ``opened_age_s`` and ``last_seen_age_s``: seconds from each time to
+    ``hub_now``, the hub's clock at the read. A reader adds the seconds since
+    it read the list on its own clock, so the two clocks never meet in one
+    subtraction. None when either time is missing; never negative."""
+    for row in rows:
+        for key, out in (("opened_at", "opened_age_s"), ("last_seen_at", "last_seen_age_s")):
+            at = row.get(key)
+            try:
+                row[out] = max(0.0, (hub_now - at).total_seconds())
+            except (TypeError, AttributeError):
+                row[out] = None
+    return rows
+
+
 def set_status(cur, commitment_id: int, status: str) -> bool:
     if status not in ("open", "closed", "stale", "dropped"):
         raise ValueError(f"status must be open/closed/stale/dropped, got {status!r}")

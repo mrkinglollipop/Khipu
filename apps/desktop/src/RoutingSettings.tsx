@@ -28,12 +28,25 @@ import {
   disagreementWords,
   holdWords,
   modelDisagreementWords,
+  paceWords,
   pastWords,
+  priorityPendingWords,
   saidWhen,
   useRouting,
   whenLocal,
 } from "./routing";
-import type { RouteAccount, RouteHold, RouteModel, RouteReport, RouteRule, RouteRunner, RouteView } from "./routing";
+import type {
+  PlanFact,
+  RouteAccount,
+  RouteHold,
+  RouteModel,
+  RoutePriority,
+  RoutePriorityEntry,
+  RouteReport,
+  RouteRule,
+  RouteRunner,
+  RouteView,
+} from "./routing";
 import {
   agoSpan,
   changeDays,
@@ -462,7 +475,19 @@ function DisagreePanel({ a, w, now, back }: { a: RouteAccount; w: Writer; now: D
   );
 }
 
-function AccountRow({ a, w, now, reportDefault }: { a: RouteAccount; w: Writer; now: Date; reportDefault?: number }) {
+function AccountRow({
+  a,
+  w,
+  now,
+  reportDefault,
+  fact,
+}: {
+  a: RouteAccount;
+  w: Writer;
+  now: Date;
+  reportDefault?: number;
+  fact?: PlanFact;
+}) {
   const [pausing, setPausing] = useState(false);
   const pauseBtn = useRef<HTMLButtonElement>(null);
   const formId = `pause-${useId().replace(/:/g, "")}`;
@@ -490,6 +515,7 @@ function AccountRow({ a, w, now, reportDefault }: { a: RouteAccount; w: Writer; 
         </span>
         {src ? <span className="route-src">{src}</span> : null}
         {a.next_check ? <span className="route-src">Khipu checks again at {whenLocal(a.next_check, now)}.</span> : null}
+        {fact && a.configured !== false ? <span className="route-src">{paceWords(fact, now)}</span> : null}
       </span>
       <span className="route-acts">
         {a.checkable !== false && a.configured !== false && ["limited", "probably_open", "unknown"].includes(a.state) ? (
@@ -551,7 +577,7 @@ function AccountRow({ a, w, now, reportDefault }: { a: RouteAccount; w: Writer; 
   );
 }
 
-function ResetChecksSection({ data, cfg, w, reread }: { data: RouteView | null; cfg: RouteConfig | null; w: Writer; reread: () => Promise<unknown> }) {
+function ResetChecksSection({ data, cfg, cfgError, w, reread }: { data: RouteView | null; cfg: RouteConfig | null; cfgError?: string | null; w: Writer; reread: () => Promise<unknown> }) {
   const enabled = cfg?.routing?.routing_reset_check?.value === true;
   const next = (data?.accounts ?? []).filter((a) => a.next_check).map((a) => `${a.label}: ${whenLocal(a.next_check!, new Date())}`);
   return (
@@ -562,6 +588,7 @@ function ResetChecksSection({ data, cfg, w, reread }: { data: RouteView | null; 
           what="Khipu reads only an account's usage. It never sends a model turn."
           tag={<Tag>{enabled ? "On" : "Off"}</Tag>} checked={enabled} disabled={!cfg || w.anyBusy}
           busy={w.isBusy("reset-check")}
+          read={switchRead(cfg, cfgError, reread)}
           onChange={(on) => void w.run("reset-check", "khipu_config_set", { key: "routing_reset_check", value: on ? "on" : "off" }, reread)}
           error={<WriteError w={w} id="reset-check" />} />
         <div className="rows">
@@ -576,12 +603,363 @@ function ResetChecksSection({ data, cfg, w, reread }: { data: RouteView | null; 
   );
 }
 
-function AccountsSection({ data, plans, w, now }: { data: RouteView; plans?: UsageReport | null; w: Writer; now: Date }) {
+// ---------------------------------------------------------------------------
+// Your priority (phase 4b): your order of accounts, each with your words for
+// its role and an optional end. Every change sends the whole list in the
+// order shown; Khipu keeps it as sent and never reorders it.
+// ---------------------------------------------------------------------------
+
+type PriorityItem = { account: string; role: string | null; until: string | null };
+
+/** The list as the CLI takes it back: account key, role and end only. */
+function priorityItems(entries: RoutePriorityEntry[]): PriorityItem[] {
+  return entries.map((e) => ({ account: e.account, role: e.role ?? null, until: e.until ?? null }));
+}
+
+/** "until Sat 3:00 PM", or "no end". */
+function endText(until: string | null | undefined, now: Date): string {
+  return until ? `until ${whenLocal(until, now)}` : "no end";
+}
+
+/** The end choices of a priority form: keep the end it has, the usual ends,
+ *  a date and time, or none. */
+function PriorityEndField({
+  idBase,
+  label,
+  current,
+  choice,
+  setChoice,
+  custom,
+  setCustom,
+  now,
+}: {
+  idBase: string;
+  label: string;
+  current: string | null;
+  choice: string;
+  setChoice: (v: string) => void;
+  custom: string;
+  setCustom: (v: string) => void;
+  now: Date;
+}) {
+  const choices = endChoices(now, 24).map((c) => (c.id === "never" ? { ...c, label: "No end" } : c));
+  return (
+    <span className="route-field">
+      <label htmlFor={`${idBase}-until`}>{label}</label>
+      <select id={`${idBase}-until`} value={choice} onChange={(e) => setChoice(e.target.value)}>
+        {current ? <option value="keep">Keep: until {whenLocal(current, now)}</option> : null}
+        {choices.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.label}
+          </option>
+        ))}
+      </select>
+      {choice === "custom" ? (
+        <>
+          <label className="sr-only" htmlFor={`${idBase}-at`}>
+            Date and time it ends
+          </label>
+          <input id={`${idBase}-at`} type="datetime-local" value={custom} onChange={(e) => setCustom(e.target.value)} />
+        </>
+      ) : null}
+    </span>
+  );
+}
+
+function pickedEnd(choice: string, custom: string, current: string | null, now: Date): { iso: string | null } | { error: string } {
+  if (choice === "keep") return { iso: current };
+  return chosenEnd(choice, custom, endChoices(now, 24), now);
+}
+
+function PriorityEntryForm({
+  p,
+  i,
+  w,
+  onClose,
+}: {
+  p: RoutePriority;
+  i: number;
+  w: Writer;
+  onClose: () => void;
+}) {
+  const e = p.entries[i];
+  const [role, setRole] = useState(e.role ?? "");
+  const [choice, setChoice] = useState(e.until ? "keep" : "never");
+  const [custom, setCustom] = useState("");
+  const roleRef = useFocusFirst<HTMLInputElement>();
+  const formId = `prio-${useId().replace(/:/g, "")}`;
+  const id = `priority:edit:${e.account}`;
+  async function submit(ev: FormEvent) {
+    ev.preventDefault();
+    const now = new Date();
+    const end = pickedEnd(choice, custom, e.until ?? null, now);
+    if ("error" in end) {
+      w.fail(id, end.error);
+      return;
+    }
+    const next = priorityItems(p.entries);
+    next[i] = { account: e.account, role: role.trim() || null, until: end.iso };
+    if (await w.run(id, "khipu_route_priority", { action: "set", entries: next, until: p.until ?? null })) onClose();
+  }
+  return (
+    <form className="route-pause" id={formId} aria-label={`Change ${e.label} in your priority`} onSubmit={submit} onKeyDown={escapeCloses(onClose)}>
+      <div className="toolbar">
+        <span className="route-field">
+          <label htmlFor={`${formId}-role`}>Its role, in your words</label>
+          <input id={`${formId}-role`} ref={roleRef} type="text" value={role} placeholder="all Claude work first"
+            onChange={(ev) => setRole(ev.target.value)} />
+        </span>
+        <PriorityEndField idBase={formId} label={`${e.label} keeps its place`} current={e.until ?? null} choice={choice}
+          setChoice={setChoice} custom={custom} setCustom={setCustom} now={new Date()} />
+      </div>
+      <WriteError w={w} id={id} />
+      <div className="toolbar">
+        <button type="submit" className="primary sm" disabled={w.isBusy(id)}>
+          <Busy on={w.isBusy(id)} />
+          Save
+        </button>
+        <button type="button" className="sm link" onClick={onClose}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function PriorityEndForm({ p, w, onClose }: { p: RoutePriority; w: Writer; onClose: () => void }) {
+  const [choice, setChoice] = useState(p.until ? "keep" : "never");
+  const [custom, setCustom] = useState("");
+  const formId = `prio-end-${useId().replace(/:/g, "")}`;
+  const id = "priority:end";
+  async function submit(ev: FormEvent) {
+    ev.preventDefault();
+    const end = pickedEnd(choice, custom, p.until ?? null, new Date());
+    if ("error" in end) {
+      w.fail(id, end.error);
+      return;
+    }
+    if (await w.run(id, "khipu_route_priority", { action: "set", entries: priorityItems(p.entries), until: end.iso })) onClose();
+  }
+  return (
+    <form className="route-pause" aria-label="When your whole priority ends" onSubmit={submit} onKeyDown={escapeCloses(onClose)}>
+      <div className="toolbar">
+        <PriorityEndField idBase={formId} label="Your whole priority ends" current={p.until ?? null} choice={choice}
+          setChoice={setChoice} custom={custom} setCustom={setCustom} now={new Date()} />
+      </div>
+      <WriteError w={w} id={id} />
+      <div className="toolbar">
+        <button type="submit" className="primary sm" disabled={w.isBusy(id)}>
+          <Busy on={w.isBusy(id)} />
+          Save
+        </button>
+        <button type="button" className="sm link" onClick={onClose}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function PrioritySection({
+  data,
+  cfg,
+  w,
+  now,
+  reread,
+}: {
+  data: RouteView;
+  cfg: RouteConfig | null;
+  w: Writer;
+  now: Date;
+  reread: () => Promise<unknown>;
+}) {
+  const p = data.priority ?? null;
+  const entries = p?.entries ?? [];
+  const [editing, setEditing] = useState<number | null>(null);
+  const [endOpen, setEndOpen] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [adding, setAdding] = useState("");
+  const addId = useId();
+  const addSelect = useRef<HTMLSelectElement>(null);
+  const candidates = (data.accounts ?? []).filter((a) => a.configured !== false && !entries.some((e) => e.account === a.key));
+  const choice = candidates.some((a) => a.key === adding) ? adding : candidates[0]?.key ?? "";
+  const send = (id: string, next: PriorityItem[], back?: Back) =>
+    next.length
+      ? w.run(id, "khipu_route_priority", { action: "set", entries: next, until: p?.until ?? null }, null, back)
+      : w.run(id, "khipu_route_priority", { action: "clear" }, null, back);
+  const move = (i: number, by: number) => {
+    const next = priorityItems(entries);
+    const [item] = next.splice(i, 1);
+    next.splice(i + by, 0, item);
+    void send(`priority:move:${entries[i].account}`, next);
+  };
+  const paceOn = cfg?.routing?.routing_pace_order?.value !== false;
+  const ids = entries.map((e) => `priority:move:${e.account}`).concat(entries.map((e) => `priority:remove:${e.account}`));
+  return (
+    <div className="route-priority-set" role="group" aria-label="Your priority">
+      <h3 className="sub-title">Priority</h3>
+      <p className="set-help">
+        Your order of accounts, each with your words for its role and an end if you want one. Conversations hear it
+        first, before the account lines, word for word. Khipu keeps your order as you set it and never picks or reorders
+        for you; if the first account is limited, paused or down, conversations hear that beside it.
+      </p>
+      {p?.pending ? (
+        <div className="route-disagree" role="group" aria-label="A conversation set your priority">
+          <span>
+            <b>{priorityPendingWords(p)}</b>
+          </span>
+          {p.owner_request ? <span>What it said you asked: “{p.owner_request}”</span> : null}
+          <span>
+            It replaced:{" "}
+            {p.replaced?.entries.length
+              ? p.replaced.entries.map((e, i) => `${i + 1}. ${e.label}${e.role ? `: ${e.role}` : ""}`).join("; ")
+              : "no priority"}
+            .
+          </span>
+          <div className="toolbar">
+            <button type="button" className="sm primary" disabled={w.isBusy("priority:confirm")}
+              onClick={() => void w.run("priority:confirm", "khipu_route_priority", { action: "confirm" })}>
+              <Busy on={w.isBusy("priority:confirm")} />
+              Confirm
+            </button>
+            <button type="button" className="sm" disabled={w.isBusy("priority:undo")}
+              onClick={() => void w.run("priority:undo", "khipu_route_priority", { action: "undo" }, null, () => addSelect.current)}>
+              <Busy on={w.isBusy("priority:undo")} />
+              Undo
+            </button>
+          </div>
+          <WriteError w={w} id="priority:confirm" />
+          <WriteError w={w} id="priority:undo" />
+        </div>
+      ) : null}
+      {entries.length ? (
+        <ol className="rows route-priority-list" aria-label="Your priority, first to last">
+          {entries.map((e, i) => (
+            <li key={e.account} className="row-item route-acct">
+              <span className="route-name">
+                {i + 1}. {e.label}
+              </span>
+              <span className="route-what">
+                <span>{e.role ? e.role : "No role written"}</span>
+                <span className="route-src">
+                  {endText(e.until, now)}
+                  {e.in_settings === false ? " · not in Settings → Models" : ""}
+                </span>
+              </span>
+              <span className="route-acts">
+                <button type="button" className="sm" aria-label={`Move ${e.label} up`} disabled={i === 0 || w.anyBusy}
+                  onClick={() => move(i, -1)}>
+                  Up
+                </button>
+                <button type="button" className="sm" aria-label={`Move ${e.label} down`}
+                  disabled={i === entries.length - 1 || w.anyBusy} onClick={() => move(i, 1)}>
+                  Down
+                </button>
+                <button type="button" className="sm" aria-label={`Change ${e.label}'s role or end`} aria-expanded={editing === i}
+                  onClick={() => setEditing((v) => (v === i ? null : i))}>
+                  Change…
+                </button>
+                <button type="button" className="sm" aria-label={`Remove ${e.label} from your priority`} disabled={w.anyBusy}
+                  onClick={() => void send(`priority:remove:${e.account}`, priorityItems(entries).filter((_, j) => j !== i), () => addSelect.current)}>
+                  Remove
+                </button>
+              </span>
+              {editing === i && p ? <PriorityEntryForm p={p} i={i} w={w} onClose={() => setEditing(null)} /> : null}
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="set-help">No priority set. Conversations hear the accounts in their usual order.</p>
+      )}
+      {ids.map((id) => (
+        <WriteError key={id} w={w} id={id} />
+      ))}
+      <div className="toolbar">
+        {candidates.length ? (
+          <>
+            <label htmlFor={addId}>Add to the end</label>
+            <select id={addId} ref={addSelect} value={choice} onChange={(e) => setAdding(e.target.value)}>
+              {candidates.map((a) => (
+                <option key={a.key} value={a.key}>
+                  {a.label}
+                </option>
+              ))}
+            </select>
+            <button type="button" className="sm" disabled={!choice || w.isBusy("priority:add")}
+              onClick={() => void send("priority:add", [...priorityItems(entries), { account: choice, role: null, until: null }])}>
+              <Busy on={w.isBusy("priority:add")} />
+              Add
+            </button>
+          </>
+        ) : null}
+        {p ? (
+          <>
+            <span className="route-src">Whole priority: {endText(p.until, now)}</span>
+            <button type="button" className="sm" aria-expanded={endOpen} onClick={() => setEndOpen((v) => !v)}>
+              Change the end…
+            </button>
+            <button type="button" className="sm" aria-expanded={clearing} onClick={() => setClearing((v) => !v)}>
+              Clear the priority
+            </button>
+          </>
+        ) : null}
+      </div>
+      <WriteError w={w} id="priority:add" />
+      {endOpen && p ? <PriorityEndForm p={p} w={w} onClose={() => setEndOpen(false)} /> : null}
+      {clearing && p ? (
+        <ConfirmGroup label="Clear your priority?" onClose={() => setClearing(false)} back={() => addSelect.current}>
+          <span>Clear your priority? Conversations hear "No priority set" on their next prompt. It stays in Recent changes.</span>
+          <WriteError w={w} id="priority:clear" />
+          <div className="toolbar">
+            <button type="button" className="sm danger" disabled={w.isBusy("priority:clear")}
+              onClick={async () => {
+                if (await w.run("priority:clear", "khipu_route_priority", { action: "clear" }, null, () => addSelect.current)) setClearing(false);
+              }}>
+              <Busy on={w.isBusy("priority:clear")} />
+              Clear it
+            </button>
+            <button type="button" className="sm link" onClick={() => setClearing(false)}>
+              Keep it
+            </button>
+          </div>
+        </ConfirmGroup>
+      ) : null}
+      <SwitchRow id="route-pace-order" label="With no priority set, list accounts by how soon their allowance runs out unused"
+        what="Khipu works out, for each account it can read, the pace that would use what is left of its longest window by the time it resets, and lists the fastest first under a heading that says it is arithmetic, not your priority. Each account's pace is told either way. A priority you set always comes first and is never reordered."
+        tag={<Tag>{paceOn ? "On" : "Off"}</Tag>} checked={paceOn} disabled={!cfg || w.anyBusy} busy={w.isBusy("pace-order")}
+        onChange={(on) => void w.run("pace-order", "khipu_config_set", { key: "routing_pace_order", value: on ? "on" : "off" }, reread)}
+        error={<WriteError w={w} id="pace-order" />} />
+      <div className="rows">
+        <LimitRow name="Warn when a priority a conversation set is still unconfirmed after"
+          help="Khipu's health report reminds you to confirm or undo it."
+          fields={[{ key: "routing_priority_unconfirmed_warn_after", label: "Warn after", unit: "time", options: [12 * H, D, 3 * D, 0], zero: "Never" }]}
+          cfg={cfg} w={w} reread={reread} />
+      </div>
+    </div>
+  );
+}
+
+function AccountsSection({
+  data,
+  plans,
+  cfg,
+  w,
+  now,
+  reread,
+}: {
+  data: RouteView;
+  plans?: UsageReport | null;
+  cfg: RouteConfig | null;
+  w: Writer;
+  now: Date;
+  reread: () => Promise<unknown>;
+}) {
   const accounts = inPlansOrder(data.accounts ?? [], plans);
   return (
     <div className="section-card">
       <div className="section-head">Accounts</div>
       <div className="section-body">
+        <PrioritySection data={data} cfg={cfg} w={w} now={now} reread={reread} />
         <p className="set-help">
           The same accounts as Plans, from the list in Settings → Capture &amp; models. Reports come from four
           places: each account's plan check, your job runners, conversations, and you. Your routing table is not one
@@ -590,7 +968,8 @@ function AccountsSection({ data, plans, w, now }: { data: RouteView; plans?: Usa
         {accounts.length ? (
           <div className="rows" role="list" aria-label="Accounts">
             {accounts.map((a) => (
-              <AccountRow key={a.key} a={a} w={w} now={now} reportDefault={data.report_default_limit} />
+              <AccountRow key={a.key} a={a} w={w} now={now} reportDefault={data.report_default_limit}
+                fact={data.plan_facts?.[a.key]} />
             ))}
           </div>
         ) : (
@@ -1461,6 +1840,47 @@ const HEARS: [string, string][] = [
   ["Cloud agents", "Not yet: they will hear it from a copy for cloud agents, in a later release."],
 ];
 
+/** Where a switch's value stands: read, still being read, or not readable.
+ *  Until it is read the switch is not drawn at all, so it never shows a
+ *  false off. */
+type SwitchRead = { state: "ready" } | { state: "reading" } | { state: "unread"; error?: string | null; retry: () => Promise<unknown> };
+
+/** A switch's read state from the read that feeds it. */
+function switchRead(value: unknown, error: string | null | undefined, retry: () => Promise<unknown>): SwitchRead {
+  if (value != null) return { state: "ready" };
+  if (error != null) return { state: "unread", error, retry };
+  return { state: "reading" };
+}
+
+/** Try again after a failed settings read, busy while it reads. */
+function UnreadNote({ id, read }: { id: string; read: Extract<SwitchRead, { state: "unread" }> }) {
+  const [retrying, setRetrying] = useState(false);
+  return (
+    <div className="toolbar">
+      <p className="set-error" role="alert" id={`${id}-unread`}>
+        Couldn't read this setting{read.error ? `: ${read.error}` : "."}
+      </p>
+      <button
+        type="button"
+        className="sm"
+        disabled={retrying}
+        aria-busy={retrying || undefined}
+        onClick={async () => {
+          setRetrying(true);
+          try {
+            await read.retry();
+          } finally {
+            setRetrying(false);
+          }
+        }}
+      >
+        <Busy on={retrying} />
+        Try again
+      </button>
+    </div>
+  );
+}
+
 function SwitchRow({
   id,
   label,
@@ -1471,6 +1891,7 @@ function SwitchRow({
   busy,
   onChange,
   error,
+  read = { state: "ready" },
 }: {
   id: string;
   label: string;
@@ -1481,7 +1902,29 @@ function SwitchRow({
   busy: boolean;
   onChange: (next: boolean) => void;
   error?: ReactNode;
+  read?: SwitchRead;
 }) {
+  if (read.state !== "ready") {
+    const reading = read.state === "reading";
+    return (
+      <div className="opt-row" aria-busy={reading || undefined} data-testid={`${id}-${read.state}`}>
+        <span className="sw-slot">
+          <Tag tone={reading ? "neutral" : "err"}>{reading ? "Reading…" : "Can't read this setting"}</Tag>
+        </span>
+        <div className="opt-text">
+          <div className="opt-title">
+            <span className="opt-name" id={`${id}-name`}>
+              {label}
+            </span>
+          </div>
+          <p id={`${id}-what`} className="opt-what">
+            {what}
+          </p>
+          {read.state === "unread" ? <UnreadNote id={id} read={read} /> : null}
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="opt-row">
       <input
@@ -1608,6 +2051,7 @@ function TellingSection({
   cfg,
   features,
   featuresError,
+  cfgError,
   w,
   reread,
   rereadFeatures,
@@ -1616,6 +2060,7 @@ function TellingSection({
   cfg: RouteConfig | null;
   features: FeaturesShape | null;
   featuresError?: string | null;
+  cfgError?: string | null;
   w: Writer;
   reread: () => Promise<unknown>;
   rereadFeatures: () => Promise<unknown>;
@@ -1626,8 +2071,13 @@ function TellingSection({
   // silent off (Codex review, finding 7). A failed read after a write also
   // counts: the switch may show a value that is no longer true, so it is
   // marked unread and held until a read succeeds.
-  const unread = featuresError != null || (!master && features != null);
-  const [retrying, setRetrying] = useState(false);
+  const masterRead: SwitchRead =
+    featuresError != null || (!master && features != null)
+      ? { state: "unread", error: featuresError, retry: rereadFeatures }
+      : !master
+        ? { state: "reading" }
+        : { state: "ready" };
+  const cfgRead = switchRead(cfg, cfgError, reread);
   const locked = master?.source === "env";
   const moment = (key: string) => cfg?.routing?.[key]?.value === true;
   const old = data?.old_switches ?? {};
@@ -1646,34 +2096,12 @@ function TellingSection({
           what="Turns all of the telling on or off. The same switch is in Optional features."
           tag={locked ? <Tag>Locked</Tag> : <Tag>Also in Optional features</Tag>}
           checked={master?.enabled === true}
-          disabled={!master || unread || locked || w.anyBusy}
+          disabled={!master || locked || w.anyBusy}
+          read={masterRead}
           busy={w.isBusy("push")}
           onChange={(next) => void w.run("push", "khipu_feature_set", { name: "routing_push", enabled: next }, rereadFeatures)}
           error={
             <>
-              {unread ? (
-                <div className="toolbar">
-                  <p className="set-error" role="alert">
-                    Couldn't read this setting{featuresError ? `: ${featuresError}` : "."}
-                  </p>
-                  <button
-                    type="button"
-                    className="sm"
-                    disabled={retrying}
-                    onClick={async () => {
-                      setRetrying(true);
-                      try {
-                        await rereadFeatures();
-                      } finally {
-                        setRetrying(false);
-                      }
-                    }}
-                  >
-                    <Busy on={retrying} />
-                    Retry
-                  </button>
-                </div>
-              ) : null}
               {locked ? (
                 <p className="opt-cost">
                   The environment variable <code>KHIPU_FEATURE_ROUTING_PUSH</code> decides this switch. Unset it to
@@ -1691,6 +2119,7 @@ function TellingSection({
           tag={<Tag tone="ok">Start</Tag>}
           checked={moment("routing_push_start")}
           disabled={!cfg || w.anyBusy}
+          read={cfgRead}
           busy={w.isBusy("push-start")}
           onChange={(next) =>
             void w.run("push-start", "khipu_config_set", { key: "routing_push_start", value: next ? "on" : "off" }, reread)
@@ -1704,6 +2133,7 @@ function TellingSection({
           tag={<Tag tone="ok">Next prompt</Tag>}
           checked={moment("routing_push_prompt")}
           disabled={!cfg || w.anyBusy}
+          read={cfgRead}
           busy={w.isBusy("push-prompt")}
           onChange={(next) =>
             void w.run("push-prompt", "khipu_config_set", { key: "routing_push_prompt", value: next ? "on" : "off" }, reread)
@@ -1717,6 +2147,7 @@ function TellingSection({
           tag={<Tag tone="ok">Delegation</Tag>}
           checked={moment("routing_push_delegation")}
           disabled={!cfg || w.anyBusy}
+          read={cfgRead}
           busy={w.isBusy("push-delegation")}
           onChange={(next) =>
             void w.run("push-delegation", "khipu_config_set", { key: "routing_push_delegation", value: next ? "on" : "off" }, reread)
@@ -1919,15 +2350,33 @@ function runnerDetail(entry: SourceEntry, r: RouteRunner | undefined, now: Date)
   return parts.join(" · ");
 }
 
+/** Whether the routing record and the settings a section needs are read. */
+type RecordRead = "ready" | "reading" | "failed";
+
+/** "Reading…" before the record is read, or that the read failed: in place of
+ *  a list's empty state, which would otherwise say "none" before anything
+ *  was read. */
+function RecordReadLine({ read, what }: { read: Exclude<RecordRead, "ready">; what: string }) {
+  return read === "reading" ? (
+    <p className="set-help" aria-busy="true" role="status">
+      <Tag>Reading…</Tag> Looking for {what}.
+    </p>
+  ) : (
+    <p className="set-error">Couldn't read {what} just now.</p>
+  );
+}
+
 function FoldersSection({
   data,
   cfg,
+  recordRead = "ready",
   w,
   now,
   reread,
 }: {
   data: RouteView | null;
   cfg: RouteConfig | null;
+  recordRead?: RecordRead;
   w: Writer;
   now: Date;
   reread: () => Promise<unknown>;
@@ -2100,6 +2549,8 @@ function FoldersSection({
               );
             })}
           </div>
+        ) : recordRead !== "ready" ? (
+          <RecordReadLine read={recordRead} what="job runner folders" />
         ) : (
           <p className="set-help">No job runner folders yet. Add one to let Khipu read a runner's limits and heartbeat.</p>
         )}
@@ -2273,11 +2724,13 @@ function LaneRow({
 function LanesSection({
   data,
   cfg,
+  recordRead = "ready",
   w,
   reread,
 }: {
   data: RouteView | null;
   cfg: RouteConfig | null;
+  recordRead?: RecordRead;
   w: Writer;
   reread: () => Promise<unknown>;
 }) {
@@ -2291,7 +2744,10 @@ function LanesSection({
     <div className="section-card">
       <div className="section-head">Which account each job lane uses</div>
       <div className="section-body">
-        {names.length ? (
+        {recordRead !== "ready" ? (
+          // Before the lane map is read every lane would look unmatched.
+          <RecordReadLine read={recordRead} what="job runner lanes" />
+        ) : names.length ? (
           names.map((name) => {
             const r = runners.find((x) => x.name === name);
             const lanes = [...new Set([...(r?.lanes ?? []), ...Object.keys(map[name] ?? {})])].sort();
@@ -2549,6 +3005,10 @@ export function RoutingSettings({ active, plans }: { active: boolean; plans?: Us
   const w = useWriter(rereadRoute);
   const now = new Date();
   const data = route.data;
+  // Folders and lanes come from both the routing record and the settings;
+  // until both are read they say so, never "none yet".
+  const recordRead: RecordRead =
+    data && config.data ? "ready" : (!data && route.error) || (!config.data && config.error) ? "failed" : "reading";
   return (
     <div className="route-settings">
       <p className="set-help set-intro">
@@ -2573,11 +3033,11 @@ export function RoutingSettings({ active, plans }: { active: boolean; plans?: Us
       ) : null}
       {data ? (
         <>
-          <AccountsSection data={data} plans={plans} w={w} now={now} />
+          <AccountsSection data={data} plans={plans} cfg={config.data} w={w} now={now} reread={rereadConfig} />
           <NoteSection data={data} w={w} now={now} />
           <RulesSection data={data} w={w} now={now} />
           <HoldsSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
-          <ResetChecksSection data={data} cfg={config.data} w={w} reread={rereadConfig} />
+          <ResetChecksSection data={data} cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} />
         </>
       ) : !route.error ? (
         <p className="set-help" role="status">
@@ -2589,12 +3049,13 @@ export function RoutingSettings({ active, plans }: { active: boolean; plans?: Us
         cfg={config.data}
         features={features.data}
         featuresError={features.error}
+        cfgError={config.error}
         w={w}
         reread={rereadConfig}
         rereadFeatures={features.reload}
       />
-      <FoldersSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
-      <LanesSection data={data} cfg={config.data} w={w} reread={rereadConfig} />
+      <FoldersSection data={data} cfg={config.data} recordRead={recordRead} w={w} now={now} reread={rereadConfig} />
+      <LanesSection data={data} cfg={config.data} recordRead={recordRead} w={w} reread={rereadConfig} />
       <TableSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
       {data ? <ChangesSection data={data} w={w} now={now} /> : null}
       {config.error && !config.data ? (

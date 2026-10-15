@@ -88,7 +88,7 @@ def _run(payload: dict, monkeypatch, environ: dict | None = None) -> dict:
     import io
     from contextlib import redirect_stdout
 
-    monkeypatch.setattr(routing_delegation.sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
     buf = io.StringIO()
     with redirect_stdout(buf):
         if environ is None:
@@ -160,6 +160,16 @@ def _log_lines() -> list[str]:
     (_call("Bash", {"command": "cat > brief.md <<'EOF'\nplain text\nEOF\ncodex exec - < brief.md"}), "codex exec"),
     (_call("Bash", {"command": "# hand it on\nclaude -p hi 2>&1 | tee out.log"}), "claude -p"),
     (_call("Bash", {"command": "out=$(codex exec hi)"}), "codex exec"),
+    # The shell removes quotes and escapes before it runs a name.
+    (_call("Bash", {"command": "co'dex' exec hi"}), "codex exec"),
+    (_call("Bash", {"command": "c\\odex exec hi"}), "codex exec"),
+    (_call("Bash", {"command": "\"claude\" -p hi"}), "claude -p"),
+    (_call("Bash", {"command": "gr\\\nok -p hi"}), "grok"),
+    (_call("shell", {"command": ["bash", "-lc", "co'dex' exec hi"]}), "codex exec"),
+    # An unquoted heredoc runs its command substitutions.
+    (_call("Bash", {"command": "cat <<EOF\n$(codex exec hi)\nEOF"}), "codex exec"),
+    (_call("Bash", {"command": "cat <<-EOF > out.md\n\tresult: $(echo a; claude -p hi)\n\tEOF"}), "claude -p"),
+    (_call("Bash", {"command": "cat <<EOF\nx $(echo \"(\" $(grok -p hi))\nEOF"}), "grok"),
 ])
 def test_delegation_calls_are_matched(payload, kind):
     assert routing_delegation.delegation_kind(payload, frozenset()) == kind
@@ -186,6 +196,17 @@ def test_delegation_calls_are_matched(payload, kind):
     _call("Bash", {"command": "cat <<EOF\nunclosed\ncodex exec hi"}),
     _call("Bash", {"command": "git commit -m x # then codex exec it"}),
     _call("Bash", {"command": "grep -c claude <<< 'codex exec hi'"}),
+    # A heredoc on a numbered descriptor is still a heredoc.
+    _call("Bash", {"command": "cat 3<<'END'\ncodex exec hi\nEND"}),
+    _call("Bash", {"command": "cat 0<<-END\n\tcodex exec hi\n\tEND"}),
+    _call("Bash", {"command": "grep x 3<<< 'codex exec hi'"}),
+    # A quoted or escaped heredoc, and text around a substitution, run nothing.
+    _call("Bash", {"command": "cat <<'EOF'\n$(codex exec hi)\nEOF"}),
+    _call("Bash", {"command": "cat <<\\EOF\n$(codex exec hi)\nEOF"}),
+    _call("Bash", {"command": "cat <<EOF\n\\$(codex exec hi)\nEOF"}),
+    _call("Bash", {"command": "cat <<EOF\n$(date) codex exec hi\nEOF"}),
+    _call("Bash", {"command": "cat <<EOF\n$((1 + 2)) codex exec\nEOF"}),
+    _call("Bash", {"command": "echo co''dex exec hi"}),
     _call("exec_command", {"cmd": "ls -la"}),
     _call("spawn_agents_on_csv", {"csv": "x"}),
     _call("send_input", {"message": "codex exec hi"}),
@@ -216,6 +237,22 @@ def test_an_ordinary_command_costs_near_nothing(monkeypatch):
     # A real delegation with a long inline brief is still seen.
     brief = "x " * 40_000
     assert routing_delegation.delegation_kind(_call("Bash", {"command": f"claude -p '{brief}'"})) == "claude -p"
+
+
+def test_an_argv_command_is_read_within_the_budget():
+    # Codex's shell tool sends argv: a huge one is cut off, never joined whole.
+    call = _call("shell", {"command": ["echo"] + ["x"] * 5_000_000 + ["grok"]})
+    started = time.monotonic()
+    assert routing_delegation.delegation_kind(call, frozenset()) is None
+    assert time.monotonic() - started < routing_delegation._SCAN_BUDGET_S
+    # A deadline already passed ends the read before any of it.
+    for command in (["echo"] + ["x"] * 5_000_000 + ["grok"], ["codex", "exec", "hi"], "codex exec hi"):
+        started = time.monotonic()
+        late = _call("shell", {"command": command})
+        assert routing_delegation.delegation_kind(late, frozenset(), deadline=started - 1) is None
+        assert time.monotonic() - started < 0.05
+    assert routing_delegation.delegation_kind(_call("shell", {"command": ["codex", "exec", "x" * 10_000_000]}),
+                                              frozenset()) == "codex exec"
 
 
 def test_a_configured_dispatch_script_is_matched_by_file_name(home):

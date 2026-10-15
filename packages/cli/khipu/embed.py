@@ -38,10 +38,12 @@ import urllib.error
 import urllib.request
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
 from khipu import profiles as _profiles
+from khipu.lines import split_lines
 from khipu.profiles import ProfileSpec, resolve_spec
 from khipu.search_text import hybrid_rerank
 from khipu.snippets import FETCH_LIMIT, LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
@@ -982,7 +984,7 @@ def _log_query_timing(profile: str, ms: float, ok: bool) -> None:
             fh.write(line + "\n")
         if path.stat().st_size < _TIMING_COUNT_BYTES:
             return
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = split_lines(path.read_text(encoding="utf-8"))
         if len(lines) > TIMING_TRIM_AT:
             tmp = path.with_suffix(".jsonl.tmp")
             tmp.write_text("\n".join(lines[-TIMING_KEEP:]) + "\n", encoding="utf-8")
@@ -999,7 +1001,7 @@ def median_query_ms(profile: str | None = None, *, hours: float = 24.0) -> dict[
     cutoff = time.time() - hours * 3600.0
     by: dict[str, list[int]] = {}
     try:
-        for raw in _timings_path().read_text(encoding="utf-8").splitlines():
+        for raw in split_lines(_timings_path().read_text(encoding="utf-8")):
             try:
                 row = json.loads(raw)
                 if not row.get("ok") or float(row["ts"]) < cutoff:
@@ -1447,11 +1449,15 @@ def _existing_hashes_many(cur, profiles: list[str] | None) -> dict[str, dict[tup
 
 def _upsert_chunks(
     cur, profile: str, rows: list[tuple[str, str, int, str, str, list[float]]]
-) -> None:
+) -> list[Any]:
+    """Write the chunks and return the hub's ``built_at`` for each, in order.
+    A replica copy must carry these, never this Mac's clock: freshness
+    compares the two for equality, and two clocks never agree exactly."""
     spec = _profiles.cached_spec(profile)
     keys = [(kind, str(ref), idx) for kind, ref, idx, _text, _hash, _vec in rows]
     if len(keys) != len(set(keys)):
         raise ValueError("duplicate embedding chunk indexes in one persistence batch")
+    built: list[Any] = []
     for kind, ref, idx, text, h, vec in rows:
         # The column is untyped, so the database no longer rejects a vector of
         # the wrong width; this is the check that does.
@@ -1469,9 +1475,21 @@ def _upsert_chunks(
               content_hash = EXCLUDED.content_hash,
               embedding = EXCLUDED.embedding,
               built_at = now()
+            RETURNING built_at
             """,
             (profile, kind, ref, idx, text, h, _vec_literal(vec)),
         )
+        got = cur.fetchone()
+        stamp = got[0] if got else None
+        built.append(stamp if isinstance(stamp, (datetime, str)) else None)
+    return built
+
+
+def _stamps(built: Any, n: int) -> list[Any]:
+    """``n`` hub build times from ``_upsert_chunks``; a missing one is None,
+    which the replica keeps as unknown rather than guessing a time."""
+    vals = list(built) if isinstance(built, list) else []
+    return (vals + [None] * n)[:n]
 
 
 def _api_texts(
@@ -1961,7 +1979,7 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                 if not isinstance(live_row, dict) or live_row != source_row:
                     _log("embed-on-capture: episode changed during provider call; backfill will catch it")
                     return False
-                _upsert_chunks(
+                built = _upsert_chunks(
                     cur, profile,
                     [("episode", eid, i, c, _md5(c), v)
                      for i, (c, v) in enumerate(zip(chunks, vecs))],
@@ -1976,22 +1994,19 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
         # episode too. Its own try/except so a snapshot hiccup never turns an
         # already-successful embed-on-capture into a reported failure.
         try:
-            from datetime import datetime, timezone
-
             from khipu.hub_snapshot import upsert_episode
 
             # Preserve the full committed source row, including deleted_at.
             # The snapshot adapter ignores columns it does not store.
             episode_row = dict(source_row)
             episode_row["id"] = int(eid)
-            built_at = datetime.now(timezone.utc).isoformat()
             embedding_rows = [
                 {
                     "profile": profile, "kind": "episode", "ref": eid, "chunk_idx": i,
                     "chunk_text": c, "content_hash": _md5(c), "embedding": v,
-                    "built_at": built_at,
+                    "built_at": b,
                 }
-                for i, (c, v) in enumerate(zip(chunks, vecs))
+                for i, (c, v, b) in enumerate(zip(chunks, vecs, _stamps(built, len(chunks))))
             ]
             snap = upsert_episode(
                 episode_row, embedding_rows, deliverable_rows=deliverable_rows
@@ -3365,14 +3380,14 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 batch = todo[start : start + BATCH]
                 api = _api_texts(profile, [("", t) for _, _, _, t, _ in batch])
                 vecs = embed_batch(api, profile=profile)
-                _upsert_chunks(cur, profile,
-                               [(k, r, i, t, h, v) for (k, r, i, t, h), v in zip(batch, vecs)])
+                built = _upsert_chunks(cur, profile,
+                                       [(k, r, i, t, h, v) for (k, r, i, t, h), v in zip(batch, vecs)])
                 conn.commit()
                 out["chunks"] += len(batch)
                 episode_snapshot_rows.extend(
                     {"profile": profile, "kind": k, "ref": r, "chunk_idx": i,
-                     "chunk_text": t, "content_hash": h, "embedding": v}
-                    for (k, r, i, t, h), v in zip(batch, vecs)
+                     "chunk_text": t, "content_hash": h, "embedding": v, "built_at": b}
+                    for (k, r, i, t, h), v, b in zip(batch, vecs, _stamps(built, len(batch)))
                 )
             for ref, indices in episode_replacements.items():
                 cur.execute(
@@ -3418,18 +3433,15 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 chunks = chunk_text(text)
                 api = _api_texts(profile, [("", c) for c in chunks])
                 vecs = embed_batch(api, profile=profile)
-                from datetime import datetime, timezone
-
-                built_at = datetime.now(timezone.utc).isoformat()
                 rows = [("commitment", str(cid), i, c, _md5(c), v)
                         for i, (c, v) in enumerate(zip(chunks, vecs))]
-                _upsert_chunks(cur, profile, rows)
+                built = _upsert_chunks(cur, profile, rows)
                 conn.commit()
                 out["commitments_chunks"] += len(rows)
                 snapshot_rows.extend(
                     {"profile": profile, "kind": "commitment", "ref": str(cid), "chunk_idx": i,
-                     "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": built_at}
-                    for i, (c, v) in enumerate(zip(chunks, vecs))
+                     "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": b}
+                    for i, (c, v, b) in enumerate(zip(chunks, vecs, _stamps(built, len(rows))))
                 )
             if snapshot_rows:
                 # Keep the sqlite hub replica current, same as embed_on_capture
@@ -3493,12 +3505,9 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 chunks = [c for _i, c in indexed_chunks]
                 api = _api_texts(profile, [(title or slug or "", c) for c in chunks])
                 vecs = embed_batch(api, profile=profile) if api else []
-                from datetime import datetime, timezone
-
-                built_at = datetime.now(timezone.utc).isoformat()
                 rows = [("topic", slug, i, c, _md5(c), v)
                         for (i, c), v in zip(indexed_chunks, vecs)]
-                _upsert_chunks(cur, profile, rows)
+                built = _upsert_chunks(cur, profile, rows)
                 cur.execute(
                     "DELETE FROM memory_embeddings WHERE profile = %s AND kind = 'topic' "
                     "AND ref = %s AND NOT (chunk_idx = ANY(%s))",
@@ -3510,8 +3519,8 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 topic_replacements.append((profile, "topic", str(slug)))
                 topic_snapshot_rows.extend(
                     {"profile": profile, "kind": "topic", "ref": slug, "chunk_idx": i,
-                     "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": built_at}
-                    for (i, c), v in zip(indexed_chunks, vecs)
+                     "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": b}
+                    for (i, c), v, b in zip(indexed_chunks, vecs, _stamps(built, len(rows)))
                 )
                 if out["topics_embedded"] >= COMMITMENT_CATCHUP_LIMIT:
                     break

@@ -129,8 +129,9 @@ describe("App — Activity", () => {
 
     verdict = JSON.stringify({ ok: false, complete: false, soft_deleted: true, partial: ["snapshot", "outbox"], snapshot: { ok: false, error: "disk full" } });
     fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Forget" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("removed from database; local copy could not be removed: remaining stores: snapshot, outbox");
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    // The alert and the dialog's close can land in separate renders; wait for each.
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("removed from database; local copy could not be removed: remaining stores: snapshot, outbox"));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   });
 
   it("UI-21 accepts only the latest requested activity page", async () => {

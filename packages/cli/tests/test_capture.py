@@ -305,9 +305,10 @@ class _EpisodesFakeCursor:
                 self._result = []
             return
         if s.startswith("SELECT id FROM episodes WHERE raw @>"):
-            receipt = json.loads(params[0])["merged_from"][0]["source_id"]
+            # jsonb containment: some merged_from entry holds every key asked for.
+            want = json.loads(params[0])["merged_from"][0]
             hits = [eid for eid, e in self.episodes.items()
-                    if any(source.get("source_id") == receipt
+                    if any(all(source.get(k) == v for k, v in want.items())
                            for source in (e.get("raw") or {}).get("merged_from", []))]
             self._result = [(hits[0],)] if hits else []
             return

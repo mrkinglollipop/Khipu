@@ -15,6 +15,7 @@ import fcntl
 import io
 import json
 import os
+import select
 import shutil
 import signal
 import socket
@@ -29,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from khipu import promote, recall_daemon, recall_prompt, routing
+from khipu import paths, promote, recall_daemon, recall_prompt, routing
 
 T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
 ACCOUNTS = [{"label": "Claude", "harness": "claude"},
@@ -366,8 +367,8 @@ def test_the_order_and_the_budget_of_a_change_block(home, monkeypatch):
     assert lines[3].startswith("Hold on")
     assert len(lines) == 4
     # Over the budget: whole lines from the bottom, then where to read the rest.
-    recall_prompt.mark_routing_seen(SESSION, version=seen["version"], epoch=seen["epoch"],
-                                    full_at=seen["full_at"])
+    # The marker is set back by hand: a delivery never moves it back.
+    assert recall_prompt._update_routing_marker(SESSION, lambda _old: dict(seen), 0.05)
     _set(home, routing_prompt_chars=150)
     lines = _routing_part(_cold(monkeypatch)).splitlines()[1:]
     assert lines[0] == "Standing rule 1. Never the paid xAI API."
@@ -612,10 +613,80 @@ def _damage(home, monkeypatch, damage: str) -> None:
     routing.view_file().write_text('{"schema": 1, "accounts": [' + ",".join([row] * count) + "]}")
 
 
-def _wait_saved() -> None:
-    """The child that was folding finishes and saves the view."""
-    for _ in range(200):
-        if routing._load_view() is not None:
+def _watch_the_read(home, monkeypatch):
+    """Watches one-shot prompts' routing reads without timing them: the
+    routing child's read is held until the test lets it go
+    (``out["go"]()``), so a hook that waited for the read could not
+    answer; every wait the hook makes on the child is recorded as
+    ``(timeout, answered)``, with the budget the child sent; and any read of
+    the record in this process (the hook's) is recorded too. All of it is
+    installed on ``monkeypatch`` (use a ``monkeypatch.context()``)."""
+    go, released = home["tmp"] / "routing-go", home["tmp"] / "routing-released"
+    hook = os.getpid()
+    out: dict = {"waits": [], "budget": None, "hook_reads": [], "go": go.touch, "held": lambda: not released.exists()}
+    real_collect = recall_prompt._RoutingAtPrompt.collect
+    real_select = select.select
+
+    def held(name, real):
+        def run(*a, **k):
+            if os.getpid() == hook:
+                out["hook_reads"].append(name)
+            elif name == "prompt_push":
+                deadline = time.monotonic() + 60
+                while not go.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                released.touch()
+            return real(*a, **k)
+
+        return run
+
+    for name in ("prompt_push", "read_view", "_load_view", "fold"):
+        monkeypatch.setattr(routing, name, held(name, getattr(routing, name)))
+
+    def collect(self, limit=None):
+        out["fd"] = self.fd
+        try:
+            return real_collect(self, limit)
+        finally:
+            out["budget"] = self.budget
+
+    def watched(rlist, wlist, xlist, timeout=None):
+        got = real_select(rlist, wlist, xlist, timeout)
+        if list(rlist) == [out.get("fd")]:
+            out["waits"].append((timeout, bool(got[0])))
+        return got
+
+    monkeypatch.setattr(recall_prompt._RoutingAtPrompt, "collect", collect)
+    monkeypatch.setattr(select, "select", watched)
+    # The child's alarm ends it 2 s after the hook's 1 s cap unless it has
+    # started to fold. Held, and then parsing 40 MB on a busy machine, it may
+    # not have by then; the alarm has its own tests.
+    monkeypatch.setattr(recall_prompt, "_ROUTING_CHILD_MOST", 120.0)
+    return out
+
+
+def _assert_waited_only_the_budget(read: dict, budget: float) -> None:
+    """The hook stopped because its wait ran out, not because the read
+    answered (it was held); it never planned to wait past its cap; and once
+    the child said it was ready, it waited at most the budget."""
+    waits = read["waits"]
+    assert waits and waits[-1][1] is False, waits
+    assert all(t is not None and t <= recall_prompt._ROUTING_WAIT_MOST + 1e-6 for t, _ in waits), waits
+    if read["budget"]:  # the ready line arrived before the cap (a busy machine can miss it)
+        assert read["budget"] == budget and waits[-1][0] <= budget + 1e-6, (read["budget"], waits)
+
+
+def _wait_saved(seconds: float = 120.0) -> None:
+    """The child that was folding finishes and saves the view. A damaged
+    40 MB view.json takes seconds to parse, so it is only read once it is
+    small again (the child's save replaced it)."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            small = routing.view_file().stat().st_size < 1024 * 1024
+        except FileNotFoundError:
+            small = False
+        if small and routing._load_view() is not None:
             return
         time.sleep(0.1)
     raise AssertionError("the late child never saved the view")
@@ -625,21 +696,30 @@ def _wait_saved() -> None:
 def test_a_huge_record_never_slows_the_one_shot_path(home, monkeypatch, damage):
     _record()
     _damage(home, monkeypatch, damage)
-    started = time.monotonic()
-    before = _cold(monkeypatch, session="other")
-    baseline = time.monotonic() - started
+    with monkeypatch.context() as m:
+        read = _watch_the_read(home, m)
+        before = _cold(m, session="other")
+        _push_on(m)
+        try:
+            out = _cold(m)
+            assert read["held"]()  # the hook answered while the child's read was still held
+            assert read["hook_reads"] == []  # the hook never reads the record itself
+            assert out == before  # late: nothing added, and recall's part byte for byte
+            assert _last_log().endswith(" routing=skipped:budget")
+            assert _marker() == {}
+            _assert_waited_only_the_budget(read, 0.1)
+        finally:
+            read["go"]()
+        _wait_saved()
     _push_on(monkeypatch)
-    started = time.monotonic()
-    out = _cold(monkeypatch)
-    took = time.monotonic() - started
-    assert out == before  # late: nothing added, and recall's part byte for byte
-    assert took < baseline + 0.1 + 0.4, (took, baseline)
-    assert _last_log().endswith(" routing=skipped:budget")
-    assert _marker() == {}
-    _wait_saved()
-    monkeypatch.setattr(routing, "fold", _cpu_bound_fold(30.0))  # would be late if it folded again
+    # The next prompt is answered from the saved view. A refold would take 30 s,
+    # past any wait, so a generous budget only keeps a busy machine from making
+    # the child's small read late. Set in the child, not in config.json: the
+    # config's stat is part of the view's fingerprint, and a write would refold.
+    monkeypatch.setattr(routing, "prompt_budget", lambda: recall_prompt._ROUTING_WAIT_MOST)
+    monkeypatch.setattr(routing, "fold", _cpu_bound_fold(30.0))
     home["search"]["hits"] = [dict(HITS[0], id="42")]
-    assert _routing_part(_cold(monkeypatch)).startswith(FULL)
+    assert _routing_part(_cold(monkeypatch)).startswith(FULL), _log_lines()[-2:]
 
 
 @pytest.mark.parametrize("damage", ["huge-log", "huge-view"])
@@ -942,12 +1022,73 @@ def test_the_hooks_own_feature_switch_turns_the_push_on_on_the_daemon_path(home,
     assert _wait_log(1).endswith(" routing=full")
 
 
+def _as_a_live_hook(monkeypatch, home, *, precompiled: bool = True) -> dict:
+    """The environment a live one-shot hook's Python runs in: the harness's
+    PYTHONDONTWRITEBYTECODE=1 (a hook reads bytecode, never writes it) and
+    the launchers' cache prefix, which promote fills for the code it puts
+    live (``promote.precompile``), here for this checkout."""
+    monkeypatch.setenv("HOME", str(home["tmp"] / "home"))
+    if precompiled:
+        root = Path(recall_prompt.__file__).resolve().parents[3]
+        assert promote.precompile(root, python=sys.executable)["ok"]
+    return dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), PYTHONDONTWRITEBYTECODE="1",
+                PYTHONPYCACHEPREFIX=str(paths.pycache_dir()))
+
+
+_STALE_BYTECODE = (
+    "import importlib.util, json, os, sys\n"
+    "from khipu import recall_prompt, routing\n"
+    "routing.prompt_imports()\n"
+    "stale = []\n"
+    "for name, mod in sorted(sys.modules.items()):\n"
+    "    src = getattr(mod, '__file__', None)\n"
+    "    if name.split('.')[0] != 'khipu' or not src or not src.endswith('.py'):\n"
+    "        continue\n"
+    "    with open(src, 'rb') as f:\n"
+    "        source = f.read()\n"
+    "    want = importlib.util.MAGIC_NUMBER + (3).to_bytes(4, 'little') + importlib.util.source_hash(source)\n"
+    "    try:\n"
+    "        with open(importlib.util.cache_from_source(src), 'rb') as f:\n"
+    "            ok = f.read(16) == want\n"
+    "    except OSError:\n"
+    "        ok = False\n"
+    "    if not ok:\n"
+    "        stale.append(name)\n"
+    "print(json.dumps(stale))\n"
+)
+
+
+@pytest.mark.parametrize("precompiled", [False, True])
+def test_the_routing_childs_modules_are_precompiled_for_a_live_hook(home, monkeypatch, precompiled):
+    """A live hook never writes bytecode, so a module of the code promote put
+    live that nothing precompiled is compiled from source by every prompt's
+    routing child (1 s and more on a loaded Mac, the child's whole wait).
+    Every khipu module the child loads has current, checked-hash bytecode
+    (its source's hash, checked on every import) once ``promote.precompile``
+    ran, and the check sees the gap when it did not."""
+    env = _as_a_live_hook(monkeypatch, home, precompiled=precompiled)
+    proc = subprocess.run([sys.executable, "-c", _STALE_BYTECODE], env=env, capture_output=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr.decode()
+    stale = json.loads(proc.stdout.decode().splitlines()[-1])
+    if precompiled:
+        assert stale == []
+    else:
+        assert "khipu.routing" in stale
+
+
 def test_the_hook_never_imports_routing_itself(home, monkeypatch):
     """Finding R2-3: the hook imported routing and read its settings before
     the search started, about 25 ms on every cold-path prompt's critical path.
-    Only the child imports it; the hook's own process never does."""
-    _record()
+    Only the child imports it; the hook's own process never does.
+
+    The child gets what a live one's has: bytecode promote compiled, and a
+    view saved at its own clock (the recall daemon's poll keeps it folded).
+    A record written at the fake clock, a day before the child's, made it
+    refold inside the 1 s wait, as a cold import did."""
     _push_on(monkeypatch)
+    env = _as_a_live_hook(monkeypatch, home)
+    home["clock"].now = datetime.now(timezone.utc)
+    _record()
     script = (
         "import io, json, sys\n"
         "from khipu import recall_prompt\n"
@@ -966,14 +1107,15 @@ def test_the_hook_never_imports_routing_itself(home, monkeypatch):
         "seen['after'] = 'khipu.routing' in sys.modules\n"
         "print(json.dumps({'seen': seen, 'out': out.getvalue()}))\n"
     )
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    saved = routing.view_file().stat().st_mtime_ns
     proc = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, timeout=30)
     assert proc.returncode == 0, proc.stderr.decode()
     result = json.loads(proc.stdout.decode().splitlines()[-1])
     assert result["seen"] == {"at_search": False, "after": False}
-    assert _routing_part(result["out"]).startswith(FULL)
+    assert _routing_part(result["out"]).startswith(FULL), _last_log()
     assert _last_log().endswith(" routing=full")
     assert _marker()["full_at"]  # the child's clock (this subprocess has no fake one)
+    assert routing.view_file().stat().st_mtime_ns == saved  # it read the saved view, never refolded
 
 
 def test_a_switched_off_setting_is_decided_in_the_child_and_logs_nothing(home, monkeypatch):
@@ -1226,15 +1368,19 @@ def _end(svc, thread) -> None:
     svc.close()
 
 
-def _timed(svc, prompt: str = PROMPT) -> float:
+def _timed(svc, prompt: str = PROMPT, push: bool | None = None, deadline_s: float = 1.6) -> float:
     """One prompt as the client sends it (request, answer, ack): the seconds
-    from the request to the answer."""
+    from the request to the answer. ``push``: the hook's own push switch,
+    sent with the request as the client sends it. ``deadline_s``: the
+    request's deadline, the client's 1.6 s unless a test says otherwise."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(5)
+    sock.settimeout(deadline_s + 5)
     sock.connect(str(svc.path))
     try:
         req = {"op": "recall", "raw": json.dumps(_payload(prompt)), "shape": "claude", "protocol": 1,
-               "deadline": time.monotonic() + 1.6}
+               "deadline": time.monotonic() + deadline_s}
+        if push is not None:
+            req["env"] = {"KHIPU_FEATURE_ROUTING_PUSH": "1" if push else "0"}
         began = time.monotonic()
         sock.sendall(json.dumps(req).encode() + b"\n")
         buf = b""
@@ -1270,6 +1416,130 @@ def _burst(svc, count: int) -> list[float]:
         t.join(15)
     assert len(times) == count
     return times
+
+
+def _paired_burst(svc, count: int) -> tuple[list[float], list[float]]:
+    """``count`` prompts with the hook's push on and ``count`` with it off,
+    sent at once to the same daemon, interleaved: the prompts with the push
+    off are the baseline, timed at the same moment under the same load."""
+    times: dict[bool, list[float]] = {True: [], False: []}
+    lock = threading.Lock()
+    go = threading.Event()
+
+    def one(i: int, push: bool) -> None:
+        go.wait(5)
+        # 60 requests at once from this process, which also runs the daemon:
+        # on a busy machine one can wait out the client's 1.6 s before the
+        # daemon's thread starts it. Routing's wait has its own 1 s cap.
+        took = _timed(svc, f"{PROMPT} {i}", push=push, deadline_s=30.0)
+        with lock:
+            times[push].append(took)
+
+    threads = [threading.Thread(target=one, args=(i, i % 2 == 0)) for i in range(2 * count)]
+    for t in threads:
+        t.start()
+    go.set()
+    for t in threads:
+        t.join(60)
+    assert len(times[True]) == len(times[False]) == count
+    return times[True], times[False]
+
+
+def _wait_children_ended(helper, seconds: float = 60.0) -> None:
+    """Until the helper has no live routing child (one that ended and is not
+    reaped yet is a zombie: it is reaped at the helper's next request). The
+    helper keeps at most ``_FORKSERVER_CHILDREN_MOST`` and answers busy past
+    that, so on a busy machine, where children end late, a burst sent at
+    once after another would only be told busy."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        rows = subprocess.run(["ps", "-A", "-o", "ppid=,stat="], capture_output=True, text=True,
+                              check=True).stdout.split("\n")
+        live = [r for r in rows if r.split() and r.split()[0] == str(helper.pid) and not r.split()[1].startswith("Z")]
+        if not live:
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"the helper's routing children never ended: {live}")
+
+
+def _split_in_the_daemon(monkeypatch) -> list[dict]:
+    """Each prompt as the daemon handles it (``hook_main``, in this process):
+    whether the push was on, its seconds in the handler, the seconds of those
+    it spent waiting for its routing child (``collect``), and that wait's
+    budget and ``(timeout, answered)`` steps. A busy machine starts and runs
+    the routing children late, and a prompt then waits for one by design (at
+    most its budget once the child is ready, never past its cap); what the
+    push adds besides that wait is the push's own cost."""
+    spans: list[dict] = []
+    lock = threading.Lock()
+    local = threading.local()
+    real_hook, real_collect = recall_prompt.hook_main, recall_prompt._RoutingAtPrompt.collect
+    real_select = select.select
+
+    def hook_main(*a, **k):
+        local.span = span = {"on": (k.get("environ") or {}).get("KHIPU_FEATURE_ROUTING_PUSH") == "1",
+                             "wait": 0.0, "collects": []}
+        began = time.monotonic()
+        try:
+            return real_hook(*a, **k)
+        finally:
+            span["took"] = time.monotonic() - began
+            with lock:
+                spans.append(span)
+
+    def collect(self, limit=None):
+        step = {"fd": self.fd, "waits": [], "budget": None}
+        local.step = step
+        began = time.monotonic()
+        try:
+            return real_collect(self, limit)
+        finally:
+            local.span["wait"] += time.monotonic() - began
+            step["budget"] = self.budget
+            local.span["collects"].append(step)
+            local.step = None
+
+    def watched(rlist, wlist, xlist, timeout=None):
+        got = real_select(rlist, wlist, xlist, timeout)
+        step = getattr(local, "step", None)
+        if step is not None and list(rlist) == [step["fd"]]:
+            step["waits"].append((timeout, bool(got[0])))
+        return got
+
+    monkeypatch.setattr(recall_prompt, "hook_main", hook_main)
+    monkeypatch.setattr(recall_prompt._RoutingAtPrompt, "collect", collect)
+    monkeypatch.setattr(select, "select", watched)
+    return spans
+
+
+def _assert_the_push_adds_little(spans: list[dict]) -> tuple[float, float]:
+    """Every wait for a routing child kept to its cap, and to its budget once
+    the child was ready; and besides that wait, the median prompt with the
+    push on took at most 40 ms more in the daemon than the median one with it
+    off, sent with it. Returns those two medians."""
+    on = [s for s in spans if s["on"]]
+    off = [s for s in spans if not s["on"]]
+    assert on and off and len(on) == len(off), (len(on), len(off))
+    for span in on:
+        for step in span["collects"]:
+            waits = step["waits"]
+            assert all(t is not None and t <= recall_prompt._ROUTING_WAIT_MOST + 1e-6 for t, _ in waits), waits
+            if step["budget"] and waits and not waits[-1][1]:  # ready, then the budget ran out
+                assert waits[-1][0] <= step["budget"] + 1e-6, step
+    rest = _median([s["took"] - s["wait"] for s in on])
+    base = _median([s["took"] for s in off])
+    assert rest <= base + 0.04, (sorted(s["took"] - s["wait"] for s in on), sorted(s["took"] for s in off))
+    return rest, base
+
+
+def _routing_statuses(first: int, count: int) -> list[str]:
+    """The routing statuses of the next ``count`` prompts with the push on,
+    among as many with it off (which log none)."""
+    _wait_log(first + 2 * count - 1)
+    lines = _log_lines()[first - 1:first - 1 + 2 * count]
+    statuses = [line.rsplit(" routing=", 1)[1] for line in lines if " routing=" in line]
+    assert len(statuses) == count, lines
+    return statuses
 
 
 def _statuses(first: int, count: int) -> list[str]:
@@ -1338,40 +1608,55 @@ def test_a_burst_of_prompts_keeps_the_helper_and_adds_little(home, monkeypatch):
     helper's datagram queue while it imported; the send blocked, the helper
     was killed under the lock (stalling the prompts behind it) and the
     respawn throttle skipped routing for the next bursts: a median of 217 ms
-    with the push on against 31 ms off, and none of the 30 routed."""
+    with the push on against 31 ms off, and none of the 30 routed. Each burst
+    of 30 with the push on is sent with 30 with it off, to the same daemon:
+    those are its baseline, under the same load at the same moment. A busy
+    machine starts the routing children late and a prompt then waits for its
+    child by design, so that wait is checked against its own bounds and the
+    rest of the prompt against the baseline (``_assert_the_push_adds_little``)."""
+    def _delivered(status: str) -> bool:
+        # Delivered; ":unmarked" when 30 prompts of one session kept its
+        # marker's lock past its wait, which records nothing by design.
+        return _routed(status.removesuffix(":unmarked"))
+
     _record()
     home["clock"].now = datetime.now(timezone.utc).replace(microsecond=0)
     _set(home, routing_prompt_budget_ms=50)
-    svc, thread = _fresh_daemon(home, "off")
-    try:
-        off = _burst(svc, 30)
-    finally:
-        _end(svc, thread)
     _push_on(monkeypatch)
     svc, thread = _fresh_daemon(home, "on")
+    medians = []
     try:
         first = len(_log_lines()) + 1
-        on = _burst(svc, 30)
-        statuses = _statuses(first, 30)
-        assert all(_routed(s) or s in ("skipped:starting", "skipped:busy") for s in statuses), statuses
-        assert svc.routing_forkserver.wait_ready(10)
+        with monkeypatch.context() as m:
+            spans = _split_in_the_daemon(m)
+            on, off = _paired_burst(svc, 30)
+        statuses = _routing_statuses(first, 30)
+        # Until the helper is ready a prompt skips:starting; once it is, a
+        # child late under the load, or waiting on another's fold, skips as
+        # it always did. Never an error, and never a helper started again.
+        assert all(_delivered(s) or s in ("skipped:starting", "skipped:busy", "skipped:budget", "skipped:fold-busy")
+                   for s in statuses), sorted(set(statuses))
+        medians.append(_assert_the_push_adds_little(spans))
+        assert svc.routing_forkserver.wait_ready(60)  # a fresh interpreter's imports, slow under load
         helper = svc.routing_forkserver._proc
         for _ in range(2):  # later bursts route, on the same helper
+            _wait_children_ended(helper)
             first = len(_log_lines()) + 1
-            again = _burst(svc, 30)
-            later = _statuses(first, 30)
-            assert any(_routed(s) for s in later), later
-            # Never a helper starting again; a child late under the load, or
-            # waiting on another's fold, skips as it always did.
-            assert all(_routed(s) or s in ("skipped:busy", "skipped:budget", "skipped:fold-busy")
-                       for s in later), later
+            with monkeypatch.context() as m:
+                spans = _split_in_the_daemon(m)
+                again, warm_off = _paired_burst(svc, 30)
+            later = _routing_statuses(first, 30)
+            assert any(_delivered(s) for s in later), sorted(set(later))
+            assert all(_delivered(s) or s in ("skipped:busy", "skipped:budget", "skipped:fold-busy")
+                       for s in later), sorted(set(later))
             assert svc.routing_forkserver._proc is helper and helper.poll() is None
+            medians.append(_assert_the_push_adds_little(spans))
         assert svc.routing_forkserver.spawned == 1
     finally:
         _end(svc, thread)
-    print(f"burst medians: off {_median(off):.4f} fresh {_median(on):.4f} warm {_median(again):.4f}")
-    assert _median(on) <= _median(off) + 0.04, (sorted(on), sorted(off))
-    assert _median(again) <= _median(off) + 0.04, (sorted(again), sorted(off))
+    print(f"burst medians, end to end: fresh {_median(on):.4f} against {_median(off):.4f} off, "
+          f"warm {_median(again):.4f} against {_median(warm_off):.4f} off; in the daemon, besides "
+          "the routing wait: " + ", ".join(f"{r:.4f} against {b:.4f}" for r, b in medians))
 
 
 def test_a_full_helper_queue_skips_only_that_prompt_and_keeps_the_helper(home, monkeypatch):
@@ -1624,20 +1909,140 @@ def _fake_reader(lines: list[tuple[float, bytes]], *, budget: float = 0.01):
 
 def test_an_answer_finished_after_the_budget_is_not_taken(home):
     """Finding R5-3: once the budget ran out the wait became zero-time but
-    still read whatever was buffered, so an answer written about 90 ms after
-    the child was ready was taken against a 10 ms budget."""
-    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0}
+    still read whatever was buffered. An answer finished after both its
+    budget and the moment the prompt asked for it is not taken, even when
+    it is already buffered."""
+    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0,
+              "generation": []}
 
-    def late(_at) -> bytes:
+    def after_the_ask(_at) -> bytes:
+        return json.dumps(dict(answer, done=time.monotonic() + 0.5)).encode() + b"\n"
+
+    at, writer = _fake_reader([(0.0, after_the_ask)])
+    writer.join(5)
+    assert at.collect() is None and at.status == "skipped:budget"
+
+    def now(_at) -> bytes:
         return json.dumps(dict(answer, done=time.monotonic())).encode() + b"\n"
 
-    at, writer = _fake_reader([(0.09, late)])
-    writer.join(5)  # the answer is buffered before the prompt reads it, as after a slow search
-    assert at.collect() is None and at.status == "skipped:budget"
-    at, writer = _fake_reader([(0.0, late)], budget=0.5)
+    at, writer = _fake_reader([(0.0, now)], budget=0.5)
     writer.join(5)
     out = at.collect()
     assert out is not None and out["kind"] == "full"
+
+
+def test_an_answer_finished_while_the_search_ran_is_taken(home):
+    """Live, a 50 ms budget dropped more than half the routing pushes on a
+    loaded Mac while searches of 300 ms and more ran beside them. An answer
+    finished before the prompt asked for it cost the prompt nothing, so it
+    is taken however far past the budget it finished; the wait after the
+    search is still the budget's."""
+    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0,
+              "generation": []}
+
+    def during_the_search(_at) -> bytes:
+        return json.dumps(dict(answer, done=time.monotonic())).encode() + b"\n"
+
+    at, writer = _fake_reader([(0.09, during_the_search)])  # 90 ms after ready, on a 10 ms budget
+    writer.join(5)  # buffered before the prompt asks, as after a slow search
+    out = at.collect()
+    assert out is not None and out["kind"] == "full"
+    at, writer = _fake_reader([(0.8, during_the_search)])  # still running when the prompt asks
+    began = time.monotonic()
+    assert at.collect() is None and at.status == "skipped:budget"
+    assert time.monotonic() - began < 0.6  # waited the budget and the drain, not for the child
+    writer.join(5)
+
+
+def _answered_while_the_search_ran(home, monkeypatch) -> recall_prompt._RoutingAtPrompt:
+    """A real child whose answer (80 ms of rendering on a 10 ms budget) is
+    buffered before the prompt asks for it, as after a slow search."""
+    _record()
+    _set(home, routing_prompt_budget_ms=10)
+    _push_on(monkeypatch)
+    render = routing.prompt_push
+
+    def slow(*a, **k):
+        out = render(*a, **k)
+        time.sleep(0.08)
+        return out
+
+    monkeypatch.setattr(routing, "prompt_push", slow)
+    at = recall_prompt._RoutingAtPrompt().begin(SESSION)
+    assert at.pid is not None
+    _pid, status = os.waitpid(at.pid, 0)
+    at.pid = None
+    assert status == 0
+    return at
+
+
+@pytest.mark.parametrize("change", ["none", "report", "refold"])
+def test_a_buffered_answer_from_an_older_record_generation_is_dropped(home, monkeypatch, change):
+    """Codex review of the cold-start fix: an answer buffered while the
+    search ran was taken after the record changed under it, so the prompt
+    said "Claude: open" at version 2 while the record said limited at 3. An
+    answer is taken only while the record it was read from is still the
+    current one: a conversation's report, or a fold another process saved
+    (a source change reaches prompts that way), drops it at once."""
+    at = _answered_while_the_search_ran(home, monkeypatch)
+    before = _marker()
+    if change == "report":
+        routing.report(account="Claude", state="limited", until="2h", author=ME)
+    elif change == "refold":
+        routing._save_view(routing._load_view())
+    began = time.monotonic()
+    out = at.collect()
+    assert time.monotonic() - began < 0.05  # stats, never a wait
+    if change == "none":
+        assert out is not None and out["kind"] == "full"
+        return
+    assert out is None and at.status == "skipped:stale"
+    assert _marker() == before
+
+
+def test_an_older_full_summary_never_moves_the_marker_back(home):
+    """Codex review of the cold-start fix: a late full summary at version 2,
+    delivered after version 3 was heard, rewound the marker to 2. Within one
+    epoch a full summary moves nothing back, as changes never did; a newer
+    one, or one of a new epoch, starts the marker again."""
+    at = routing._iso(T0)
+    earlier = routing._iso(T0 - timedelta(minutes=5))
+    assert recall_prompt.mark_routing_full(SESSION, version=3, epoch="e1", at=at)
+    assert recall_prompt.mark_routing_seen(SESSION, version=2, epoch="e1", full_at=earlier)
+    assert _marker() == {"version": 3, "epoch": "e1", "full_at": at}
+    assert recall_prompt.mark_routing_seen(SESSION, version=3, epoch="e1", full_at=earlier)
+    assert _marker() == {"version": 3, "epoch": "e1", "full_at": at}
+    assert recall_prompt.mark_routing_seen(SESSION, version=2, epoch="e1")
+    assert _marker()["version"] == 3
+    later = routing._iso(T0 + timedelta(minutes=5))
+    assert recall_prompt.mark_routing_seen(SESSION, version=4, epoch="e1", full_at=later)
+    assert _marker() == {"version": 4, "epoch": "e1", "full_at": later}
+    assert recall_prompt.mark_routing_seen(SESSION, version=1, epoch="e2", full_at=earlier)
+    assert _marker() == {"version": 1, "epoch": "e2", "full_at": earlier}
+
+
+def test_a_full_summary_resets_a_marker_ahead_of_the_record(home, monkeypatch):
+    """Adversarial review of the no-rewind rule: a marker ahead of the record
+    in its own epoch (a view.json restored from a backup) gets the full
+    summary, "the record's count started again"; refusing to move the
+    marker back made every later prompt send it again. A full summary read
+    against this very marker sets it back; one read against an older marker
+    (a newer block delivered since) does not."""
+    _record()
+    _push_on(monkeypatch)
+    view = routing.read_view()
+    ahead = {"version": view["version"] + 5, "epoch": view["epoch"], "full_at": routing._iso(T0)}
+    assert recall_prompt._update_routing_marker(SESSION, lambda _old: dict(ahead), 0.05)
+    assert "## Routing" in _cold(monkeypatch)
+    assert _last_log().endswith(" routing=full")
+    assert _marker()["version"] == view["version"]
+    assert "## Routing" not in _cold(monkeypatch)  # heard: not sent again
+    assert _last_log().endswith(" routing=none")
+    # Read against version 2, delivered after version 3 was heard: kept at 3.
+    assert recall_prompt._update_routing_marker(SESSION, lambda _old: dict(ahead, version=3), 0.05)
+    assert recall_prompt.mark_routing_seen(SESSION, version=2, epoch=view["epoch"],
+                                           full_at=routing._iso(T0), based_on=2)
+    assert _marker()["version"] == 3
 
 
 def test_a_pipe_that_never_stops_is_drained_only_briefly(home):
@@ -1673,7 +2078,8 @@ def test_a_pipe_that_never_stops_is_drained_only_briefly(home):
 def test_an_answer_finished_after_the_request_deadline_is_not_taken(home):
     """Review of fix round 5: the cutoff left out the request's deadline, so
     an answer finished after it, though within the budget, was taken."""
-    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0}
+    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0,
+              "generation": []}
 
     def late(_at) -> bytes:
         return json.dumps(dict(answer, done=time.monotonic())).encode() + b"\n"

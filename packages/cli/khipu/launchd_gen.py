@@ -25,6 +25,7 @@ from khipu.jobs import (
     _log_paths,
     _plist_path,
 )
+from khipu.lines import split_lines
 
 TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "launchd"
 
@@ -131,7 +132,7 @@ def queue_drain_startup_failures() -> dict[str, Any]:
         out["error"] = str(exc)
         return out
     entered = startup = importing = False
-    for line in tail.decode("utf-8", errors="replace").splitlines():
+    for line in split_lines(tail):
         if line.startswith(_DRAIN_ATTEMPT):
             entered = startup = importing = False
         elif line == _DRAIN_STARTED:

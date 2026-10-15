@@ -14,5 +14,11 @@ export default defineConfig({
     globals: true,
     include: ["src/**/*.test.{ts,tsx}"],
     setupFiles: ["./vitest.setup.ts"],
+    // A test that mounts the whole App spends seconds importing and first
+    // rendering it on a busy machine. No test here measures speed, so these
+    // are the limits a stuck test is failed at, not budgets: the default 5 s
+    // failed sound tests whenever other work had the CPU.
+    testTimeout: 60_000,
+    hookTimeout: 60_000,
   },
 });

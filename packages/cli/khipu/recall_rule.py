@@ -92,10 +92,11 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
   episode ids; cite the episodes, not the brief. `available: false` means off.
 - `khipu_reflect` answers one question from memory with each claim cited, or
   abstains. It calls a model: ask it for a synthesis, not a lookup.
-- `khipu_route` reads which accounts are open, limited, paused or down, with
-  the owner's rules and note: read it before handing work to another account.
-  `khipu_route_report` records a limit you hit; `khipu_route_rule` writes a
-  rule the owner asked for (unconfirmed until the owner confirms). Khipu reports; you route.
+- `khipu_route` reads which accounts are open, limited, paused or down,
+  the owner's rules, note, priority; read before delegating.
+  `khipu_route_report` logs a limit you hit; `khipu_route_rule` and
+  `khipu_route_priority` write an owner-requested rule or account
+  order (pending until confirmed). Khipu reports; you route.
 - Capture writes: on a local Mac with a Khipu capture hook (`khipu-stop-hook`
   or `khipu-aegis-capture`) the hook is the writer, not you — but `khipu_capture`
   works there too: call it (or `khipu capture now` in a shell) when you
@@ -454,7 +455,9 @@ def _pushed_memory_slice(cwd: str | None) -> str:
 def _session_start_payload() -> dict:
     """The hook's stdin payload, or {} (no input, not JSON, unreadable)."""
     try:
-        raw = sys.stdin.read()
+        from khipu import wire
+
+        raw = wire.read_stdin()
         if raw.strip():
             payload = json.loads(raw)
             if isinstance(payload, dict):
@@ -591,7 +594,7 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
         signal.setitimer(signal.ITIMER_REAL, max(0.0, deadline - time.monotonic()) + _ROUTING_CHILD_GRACE)
         out = routing.start_push(budget, moment)
         if isinstance(out, dict):
-            data = memoryview(json.dumps({k: out.get(k) for k in ("text", "version", "epoch")}).encode("utf-8"))
+            data = memoryview(json.dumps({k: out.get(k) for k in ("text", "version", "epoch", "generation")}).encode("utf-8"))
             while data:
                 data = data[os.write(write_fd, data):]
         code = 0
@@ -643,9 +646,10 @@ class _RoutingAtStart:
         return self
 
     def text(self) -> str | None:
-        """The summary's text, or None (off, failed, late or empty). Output
-        the child finished before the deadline is read even when the memory
-        part ran past it."""
+        """The summary's text, or None (off, failed, late, empty, or read
+        from a record generation that is no longer current). Output the
+        child finished before the deadline is read even when the memory part
+        ran past it."""
         if self.fd is None:
             return None
         try:
@@ -665,6 +669,10 @@ class _RoutingAtStart:
             text = out.get("text") if isinstance(out, dict) else None
             if not (isinstance(text, str) and text.strip()):
                 return None
+            from khipu import recall_prompt
+
+            if not recall_prompt._routing_generation_current(out.get("generation")):
+                return None  # the record changed since the child read it
             self.out = out
             return text
         except Exception:
@@ -733,7 +741,9 @@ def session_start_main(*, shape: str | None = None) -> None:
                 "additionalContext": ctx,
             }
         }
-    print(json.dumps(out))
+    from khipu import wire
+
+    print(wire.dumps(out, ensure_ascii=True))
     if pushed:
         try:
             sys.stdout.flush()

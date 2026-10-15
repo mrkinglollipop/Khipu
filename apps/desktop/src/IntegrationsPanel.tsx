@@ -3,7 +3,7 @@ import { Check, Loader2, Minus, RefreshCw, TriangleAlert, X } from "lucide-react
 import { WorkingBanner } from "./WorkingBanner";
 import { Callout, Dialog, Tag } from "./ui";
 import { GatewayTokenCard } from "./SettingsControls";
-import { fmtAge } from "./time";
+import { fmtAgo } from "./time";
 import type { Tone } from "./ui";
 
 /**
@@ -446,14 +446,14 @@ export function verifiedLine(
       return {
         mark: own.stale ? "warn" : "ok",
         text:
-          `Verified ${ownAge != null ? `${fmtAge(ownAge)} ago` : "at an unknown time"}` +
+          `Verified ${ownAge != null ? `${fmtAgo(ownAge)}` : "at an unknown time"}` +
           (own.seconds != null ? ` · ${fmtSeconds(own.seconds)} round trip` : "") +
           (own.stale ? " — older than a week, run Verify" : ""),
       };
     }
     return {
       mark: "err",
-      text: `Last verify failed${ownAge != null ? ` ${fmtAge(ownAge)} ago` : ""} — ${(own.error ?? own.reason ?? "the capture never became findable").slice(0, 120)}`,
+      text: `Last verify failed${ownAge != null ? ` ${fmtAgo(ownAge)}` : ""} — ${(own.error ?? own.reason ?? "the capture never became findable").slice(0, 120)}`,
     };
   }
   const last = stored?.last_probe;
@@ -461,7 +461,7 @@ export function verifiedLine(
     if (liveBeat) {
       return {
         mark: "ok",
-        text: `Working · hook ran ${fmtAge(lv?.last_captured_age_s)} ago · Verify to time a round trip`,
+        text: `Working · hook ran ${fmtAgo(lv?.last_captured_age_s)} · Verify to time a round trip`,
       };
     }
     return { mark: "off", text: "Not verified on this pack yet — Verify runs it" };
@@ -475,7 +475,7 @@ export function verifiedLine(
       return {
         mark: "ok",
         text:
-          `Working · hook ran ${fmtAge(lv?.last_captured_age_s)} ago · Verify to time a round trip` +
+          `Working · hook ran ${fmtAgo(lv?.last_captured_age_s)} · Verify to time a round trip` +
           ` · last timed probe on this Mac was for ${other}`,
       };
     }
@@ -483,7 +483,7 @@ export function verifiedLine(
       mark: "off",
       text:
         `Not verified on this pack yet — the last probe on this Mac ran for ${other}` +
-        (stored?.age_seconds != null ? `, ${fmtAge(stored.age_seconds)} ago` : ""),
+        (stored?.age_seconds != null ? `, ${fmtAgo(stored.age_seconds)}` : ""),
     };
   }
   if (last.status === "skipped") {
@@ -497,7 +497,7 @@ export function verifiedLine(
     return {
       mark: stored?.ok === false ? "warn" : "ok",
       text:
-        `Verified ${age != null ? `${fmtAge(age)} ago` : "at an unknown time"}` +
+        `Verified ${age != null ? `${fmtAgo(age)}` : "at an unknown time"}` +
         (last.seconds != null ? ` · ${fmtSeconds(last.seconds)} round trip` : "") +
         (stored?.ok === false ? " — older than a week, run Verify" : ""),
     };
@@ -976,8 +976,8 @@ export function IntegrationsPanel({
                   <CheckMark mark={latest != null ? (lookup ? "ok" : "off") : (recentWithoutCapture ? "warn" : "off")} />
                   <span>{latest != null
                     ? lookup
-                      ? `Last capture linked to a thread ${fmtAge(latest)} ago${t3.last_thread_linked_capture_harness ? ` · ${LABEL[t3.last_thread_linked_capture_harness as HarnessId] ?? t3.last_thread_linked_capture_harness}` : ""}`
-                      : `Last capture linked to a thread ${fmtAge(latest)} ago · captures since then are recorded but not linked`
+                      ? `Last capture linked to a thread ${fmtAgo(latest)}${t3.last_thread_linked_capture_harness ? ` · ${LABEL[t3.last_thread_linked_capture_harness as HarnessId] ?? t3.last_thread_linked_capture_harness}` : ""}`
+                      : `Last capture linked to a thread ${fmtAgo(latest)} · captures since then are recorded but not linked`
                     : recentWithoutCapture
                       ? "T3 was used in the last day without a thread-linked capture"
                       : "No thread-linked capture yet"}</span>
@@ -1049,7 +1049,7 @@ export function IntegrationsPanel({
                   : lv?.seen && (lv.captures ?? 0) > 0
                     ? {
                         mark: "ok",
-                        text: `Capture hook · last capture ${fmtAge(lv.last_captured_age_s)} ago`,
+                        text: `Capture hook · last capture ${fmtAgo(lv.last_captured_age_s)}`,
                       }
                     : lv?.seen
                       ? { mark: "warn", text: "Capture hook · ran, nothing captured yet" }

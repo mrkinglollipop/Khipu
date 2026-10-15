@@ -39,6 +39,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterator
 
+from khipu.lines import read_lines
+
 MIN_PROMPTS = 200
 # The most timeouts per 100 prompts routing on may add before the push stops.
 STOP_PER_100 = 2.0
@@ -235,7 +237,7 @@ def _rows_now() -> int:
     from khipu import recall_prompt
 
     path = recall_prompt._log_path()
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    lines = read_lines(path) if path.exists() else []
     return sum(1 for line in lines if recall_prompt._LOG_LINE_RE.match(line))
 
 
@@ -260,7 +262,7 @@ def _log_rows(count: int, wait: float = 10.0) -> dict[str, list[dict[str, Any]]]
     path = recall_prompt._log_path()
     until = time.monotonic() + wait
     while True:
-        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+        lines = read_lines(path) if path.exists() else []
         rows = [line for line in lines if recall_prompt._LOG_LINE_RE.match(line)]
         if len(rows) >= count or time.monotonic() >= until:
             break

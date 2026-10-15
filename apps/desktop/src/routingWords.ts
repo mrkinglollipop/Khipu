@@ -190,7 +190,11 @@ export type ChangeRow = {
 };
 
 function whoWords(item: RouteChangeItem): string {
-  if (item.by === "you") return item.via === "app" ? "You, in Settings" : "You, outside the app";
+  if (item.by === "you") {
+    // Khipu's owner check did not run for this line (khipu/routing.py `_mark_unchecked`).
+    if (item.via?.endsWith("-unchecked")) return "Marked as you, but not checked by Khipu";
+    return item.via === "app" ? "You, in Settings" : "You, outside the app";
+  }
   if (item.source === "probe") return "The plan check";
   if (item.source === "check") return "Khipu's check";
   if (item.by) return capitalise(item.by.replace(/ lanes \(read by Khipu\)$/, " job runner"));

@@ -20,10 +20,12 @@ import {
   modelDisagreementWords,
   holdWords,
   notRefreshedWords,
+  priorityHeadline,
+  priorityPendingWords,
   whenLocal,
   windowWords,
 } from "./routing";
-import type { PlanFigure, RouteAccount, RoutingState } from "./routing";
+import type { PlanFigure, RouteAccount, RoutePriority, RoutingState } from "./routing";
 import { callCli } from "./settingsCli";
 
 const NO_RECORD_HINT =
@@ -32,9 +34,10 @@ const NO_RECORD_HINT =
 /** The account rows in the Plans card's order, so the two read as a pair;
  *  accounts Plans does not list keep the record's order after them. */
 export function inPlansOrder(accounts: RouteAccount[], plans?: UsageReport | null): RouteAccount[] {
-  const order = (plans?.accounts ?? []).map((row) => row.account || row.harness || "");
+  // Matched by the stable key, never the label: a name can be reused.
+  const order = (plans?.accounts ?? []).map((row) => row.key ?? null);
   const rank = (a: RouteAccount) => {
-    const i = order.indexOf(a.label);
+    const i = order.indexOf(a.key);
     return i === -1 ? order.length : i;
   };
   return accounts
@@ -45,7 +48,7 @@ export function inPlansOrder(accounts: RouteAccount[], plans?: UsageReport | nul
 
 /** "58% of its week used" for an open account, from the Plans read. */
 function planFigure(a: RouteAccount, plans: UsageReport | null | undefined, now: Date): PlanFigure | null {
-  const row = (plans?.accounts ?? []).find((r) => (r.account || r.harness) === a.label);
+  const row = (plans?.accounts ?? []).find((r) => r.key != null && r.key === a.key);
   const w = row ? tightestWindow(row, now) : null;
   if (!w || typeof w.used_pct !== "number") return null;
   return { pct: w.used_pct, window: windowWords(w.name) };
@@ -96,6 +99,53 @@ function AccountRow({
         </span>
       ) : null}
     </div>
+  );
+}
+
+/** The owner's priority at the top of the card, in his order. One a
+ *  conversation set at his request carries its mark and Confirm or Undo. */
+function PriorityRow({ p, now, reload }: { p: RoutePriority; now: Date; reload: () => Promise<void> }) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const act = async (action: "confirm" | "undo") => {
+    if (busy) return;
+    setBusy(action);
+    setError(null);
+    try {
+      const out = await callCli("khipu_route_priority", { action });
+      if (!out.ok) setError(out.error);
+      await reload();
+    } finally {
+      setBusy(null);
+    }
+  };
+  return (
+    <ListRow className="route-priority">
+      <span className="route-state">{priorityHeadline(p, now)}</span>
+      {p.pending ? (
+        <>
+          <span className="route-note">
+            <Tag tone="warn" dot>
+              Not confirmed
+            </Tag>
+            <span>{priorityPendingWords(p)}</span>
+          </span>
+          <span className="route-acts">
+            <button type="button" className="sm" disabled={busy !== null} onClick={() => void act("confirm")}>
+              {busy === "confirm" ? "Confirming…" : "Confirm"}
+            </button>
+            <button type="button" className="sm" disabled={busy !== null} onClick={() => void act("undo")}>
+              {busy === "undo" ? "Undoing…" : "Undo"}
+            </button>
+          </span>
+          {error ? (
+            <span className="set-error" role="alert">
+              Khipu didn't make that change: {error}
+            </span>
+          ) : null}
+        </>
+      ) : null}
+    </ListRow>
   );
 }
 
@@ -169,6 +219,7 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
           {error ? <span className="route-src">{error}</span> : null}
         </ListRow>
       ) : null}
+      {data.priority ? <PriorityRow p={data.priority} now={now} reload={() => state.load(true)} /> : null}
       {accounts.length === 0 ? (
         <EmptyState
           title="No accounts to show"

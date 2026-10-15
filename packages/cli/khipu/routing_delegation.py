@@ -24,12 +24,14 @@ does not route. Inside Aegis both refuse, as Khipu's other hook scripts do.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
-import sys
 import time
 from typing import Any
+
+from khipu import wire
 
 # Claude Code's subagent tool (``Task`` in older versions) and Codex's native
 # one (``spawn_agent``).
@@ -62,19 +64,23 @@ _DEPTH_MOST = 2
 _SCAN_MOST = 200_000
 _SCAN_BUDGET_S = 0.15
 _CHECK_EVERY = 256
+# An argv command (Codex's shell tool) is read for its first _ARGV_MOST words.
+_ARGV_MOST = 4096
 
 # One shell token. Operators and redirections come only from unquoted text,
 # so a quoted ";" stays a word. A word keeps its quotes here; _unquote strips them.
 _LEX = re.compile(r"""
     (?P<space>(?:[ \t\r]|\\\n)+)
   | (?P<op>&&|\|\||;;|\|&|[;&|()\n])
-  | (?P<heredoc><<-?(?!<))
+  | (?P<heredoc>[0-9]*<<-?(?!<))
   | (?P<redir>[0-9]*(?:<<<|<>|>>|>&|<&|>\||[<>]))
   | (?P<word>(?:'[^']*'?|\$'(?:\\.|[^'\\])*'?|"(?:\\.|[^"\\])*"?|\\.|[^\s;&|()<>'"\\])+)
   | (?P<other>.)
 """, re.X | re.S)
 _PIECE = re.compile(r"""'([^']*)'?|\$'((?:\\.|[^'\\])*)'?|"((?:\\.|[^"\\])*)"?|\\(.)|([^'"\\$]+|\$)""", re.S)
 _DQ_ESCAPE = re.compile(r'\\([\\"$`\n])')
+# Quote and escape characters, which the shell removes from a word.
+_QUOTING = re.compile(r"""['"\\]""")
 
 
 class _OutOfTime(Exception):
@@ -108,14 +114,22 @@ def _unquote(word: str) -> str:
 def _segments(command: str, deadline: float) -> list[list[str]]:
     """The simple commands of a shell script, each as its words, unquoted.
     Comments, heredoc bodies and redirections (with their targets) are
-    left out; operators split commands only where the shell would see them."""
-    text = command[:_SCAN_MOST]
+    left out; operators split commands only where the shell would see them.
+    A heredoc whose delimiter is unquoted still runs its ``$(...)``, so those
+    are read."""
+    return _scan(command[:_SCAN_MOST], 0, deadline, False, 0)[0]
+
+
+def _scan(text: str, pos: int, deadline: float, nested: bool, depth: int) -> tuple[list[list[str]], int]:
+    """``_segments`` from ``pos``. ``nested``: the inside of a ``$(``, which
+    ends at its unmatched ``)``; returns the position past it."""
     out: list[list[str]] = []
     cur: list[str] = []
-    heredocs: list[tuple[str, bool]] = []
+    heredocs: list[tuple[str, bool, bool]] = []  # (delimiter, strips tabs, expands)
     pending: str | None = None  # "redir" or "heredoc": the next word is its target
     dash = False
-    pos, n, count = 0, len(text), 0
+    parens = 0
+    n, count = len(text), 0
     while pos < n:
         count += 1
         if count % _CHECK_EVERY == 0 and time.monotonic() > deadline:
@@ -127,7 +141,7 @@ def _segments(command: str, deadline: float) -> list[list[str]]:
             continue
         if kind == "word":
             if pending == "heredoc":
-                heredocs.append((_unquote(tok), dash))
+                heredocs.append((_unquote(tok), dash, _QUOTING.search(tok) is None))
             elif pending is None:
                 if tok.startswith("#"):
                     nl = text.find("\n", pos)
@@ -138,17 +152,25 @@ def _segments(command: str, deadline: float) -> list[list[str]]:
             continue
         pending = None
         if kind == "heredoc":
-            pending, dash = "heredoc", tok == "<<-"
+            pending, dash = "heredoc", tok.endswith("<<-")
             continue
         if kind == "redir":
             pending = "redir"
             continue
+        if nested and tok == ")" and parens == 0:
+            if cur:
+                out.append(cur)
+            return out, pos
+        if nested and tok in ("(", ")"):
+            parens += 1 if tok == "(" else -1
         if cur:  # an operator
             out.append(cur)
             cur = []
         if tok == "\n":
-            for delim, strip_tabs in heredocs:
+            for delim, strip_tabs, expands in heredocs:
                 end = re.compile("^" + ("\t*" if strip_tabs else "") + re.escape(delim) + "$", re.M).search(text, pos)
+                if expands and depth < _DEPTH_MOST:
+                    out.extend(_substitutions(text[pos:n if end is None else end.start()], deadline, depth + 1))
                 if end is None:
                     pos = n
                     break
@@ -156,6 +178,27 @@ def _segments(command: str, deadline: float) -> list[list[str]]:
             heredocs = []
     if cur:
         out.append(cur)
+    return out, pos
+
+
+def _substitutions(body: str, deadline: float, depth: int) -> list[list[str]]:
+    """The commands of each ``$(...)`` in an expandable heredoc body; the
+    rest of the body is data. An escaped ``\\$(`` and arithmetic ``$((``
+    run nothing."""
+    out: list[list[str]] = []
+    i = body.find("$(")
+    while i >= 0:
+        if time.monotonic() > deadline:
+            raise _OutOfTime
+        j = i
+        while j > 0 and body[j - 1] == "\\":
+            j -= 1
+        if (i - j) % 2 or body.startswith("$((", i):
+            i = body.find("$(", i + 2)
+            continue
+        found, end = _scan(body, i + 2, deadline, True, depth)
+        out.extend(found)
+        i = body.find("$(", end)
     return out
 
 
@@ -181,12 +224,14 @@ def _skip_options(argv: list[str], i: int, short: str, long: frozenset[str]) -> 
     return i
 
 
-def _strip_prefix(argv: list[str]) -> list[str]:
+def _strip_prefix(argv: list[str], deadline: float) -> list[str]:
     """``argv`` without leading ``VAR=value`` words and wrappers such as
     ``env -u FOO``, ``nohup`` or ``timeout -s KILL 600``, so
     ``CLAUDE_CONFIG_DIR=x claude -p`` is seen as ``claude -p``."""
     i = 0
     while i < len(argv):
+        if i % _CHECK_EVERY == 0 and time.monotonic() > deadline:
+            raise _OutOfTime
         word = argv[i]
         base = os.path.basename(word)
         if _ASSIGNMENT.fullmatch(word):
@@ -209,7 +254,7 @@ def _prints(args: list[str]) -> bool:
 
 
 def _argv_kind(argv: list[str], scripts: frozenset[str], depth: int, deadline: float) -> str | None:
-    argv = _strip_prefix(argv)
+    argv = _strip_prefix(argv, deadline)
     if not argv:
         return None
     base, args = os.path.basename(argv[0]), argv[1:]
@@ -234,9 +279,30 @@ def _argv_kind(argv: list[str], scripts: frozenset[str], depth: int, deadline: f
     return None
 
 
+def _bounded_argv(command: list, deadline: float) -> list[str] | None:
+    """An argv command's first _ARGV_MOST words, cut at _SCAN_MOST
+    characters in all, or None if one of them is not a string."""
+    if time.monotonic() > deadline:
+        raise _OutOfTime
+    words = list(itertools.islice(command, _ARGV_MOST))
+    if not all(isinstance(word, str) for word in words):
+        return None
+    out: list[str] = []
+    size = 0
+    for word in words:
+        out.append(word[:_SCAN_MOST - size])
+        size += len(word) + 1
+        if size >= _SCAN_MOST:
+            break
+    return out
+
+
 def _shell_kind(command: Any, scripts: frozenset[str], depth: int, deadline: float) -> str | None:
-    if isinstance(command, list) and all(isinstance(w, str) for w in command):
-        return _argv_kind(list(command), scripts, depth, deadline)
+    if time.monotonic() > deadline:
+        raise _OutOfTime
+    if isinstance(command, list):
+        argv = _bounded_argv(command, deadline)
+        return None if argv is None else _argv_kind(argv, scripts, depth, deadline)
     if not isinstance(command, str) or not command.strip():
         return None
     for argv in _segments(command, deadline):
@@ -261,15 +327,24 @@ def shell_kind(command: Any, scripts: frozenset[str] = frozenset(), depth: int =
         return None
 
 
-def _mentions(command: Any, names) -> bool:
+def _mentions(command: Any, names, deadline: float) -> bool:
     """A cheap test that can only say no: whether any of ``names`` appears
-    anywhere in the command's text."""
+    in the command's first _SCAN_MOST characters, as written or with its
+    quotes and escapes removed."""
     if isinstance(command, list):
-        command = " ".join(w for w in command if isinstance(w, str))
+        words = _bounded_argv(command, deadline)
+        if words is None:
+            return False
+        command = " ".join(words)
     if not isinstance(command, str):
         return False
     head = command[:_SCAN_MOST]
-    return any(name in head for name in names)
+    if any(name in head for name in names):
+        return True
+    # The shell runs co'dex' or c\odex as codex, so look again without the
+    # quotes and escapes (str.replace: a long command costs next to nothing).
+    bare = head.replace("\\\n", "").replace("\\", "").replace("'", "").replace('"', "")
+    return len(bare) < len(head) and any(name in bare for name in names)
 
 
 def _configured_script_names() -> list[str]:
@@ -332,15 +407,20 @@ def delegation_kind(payload: dict, scripts: frozenset[str] | None = None,
     if command is None:
         return None
     deadline = time.monotonic() + _SCAN_BUDGET_S if deadline is None else deadline
-    kind = shell_kind(command, deadline=deadline) if _mentions(command, _BUILT_IN) else None
-    if kind is None:
-        if scripts is None:
-            names = _configured_script_names()
-            found = _dispatch_scripts() if names and _mentions(command, names) else frozenset()
-        else:
-            found = scripts if _mentions(command, scripts) else frozenset()
-        if found:
-            kind = shell_kind(command, found, deadline=deadline)
+    try:
+        if isinstance(command, list):
+            command = _bounded_argv(command, deadline)
+        kind = _shell_kind(command, frozenset(), 0, deadline) if _mentions(command, _BUILT_IN, deadline) else None
+        if kind is None:
+            if scripts is None:
+                names = _configured_script_names()
+                found = _dispatch_scripts() if names and _mentions(command, names, deadline) else frozenset()
+            else:
+                found = scripts if _mentions(command, scripts, deadline) else frozenset()
+            if found:
+                kind = _shell_kind(command, found, 0, deadline)
+    except _OutOfTime:
+        return None
     return kind
 
 
@@ -426,7 +506,7 @@ def main() -> None:
     """Entry point for ``bin/khipu-delegation-hook``. Never raises and never
     fails the call: any error prints ``{}``."""
     try:
-        raw = sys.stdin.read()
+        raw = wire.read_stdin()
     except Exception:  # noqa: BLE001
         raw = ""
     info, kind, out = None, None, {}
@@ -436,7 +516,7 @@ def main() -> None:
         out = {}
     delivered = True
     try:
-        print(json.dumps(out), flush=True)
+        print(wire.dumps(out, ensure_ascii=True), flush=True)
     except OSError:
         delivered = False
     if kind is None:

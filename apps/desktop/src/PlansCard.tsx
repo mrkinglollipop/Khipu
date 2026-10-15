@@ -14,11 +14,13 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { Loader2, RefreshCw } from "lucide-react";
+import { ChevronRight, Loader2, RefreshCw } from "lucide-react";
 import { EmptyState, ListRow, Tag } from "./ui";
 import { callCli, useCliState } from "./settingsCli";
-import { fmtAgeSince } from "./time";
+import { fmtAgoSince } from "./time";
 import type { Attention } from "./doctorAttention";
+import { accountState } from "./routing";
+import type { RouteView } from "./routing";
 
 export type UsageWindow = {
   name?: string;
@@ -30,6 +32,8 @@ export type UsageWindow = {
 };
 
 export type UsageAccount = {
+  /** `harness|login folder`, the routing record's key for the account. */
+  key?: string | null;
   harness?: string;
   account?: string;
   home?: string | null;
@@ -72,14 +76,18 @@ const ERROR_PHRASE: Record<string, string> = {
   timeout: "didn't answer in time",
   not_signed_in: "not signed in",
   not_installed: "not installed",
-  bad_reply: "unreadable reply",
+  bad_reply: "answered in a way Khipu can't read",
   no_plan_limits: "no plan limits reported",
   invalid_account: "not a valid account entry",
-  no_answer: "stopped without answering",
+  no_answer: "didn't answer",
   start_failed: "could not be started",
-  cli_error: "reported an error",
+  cli_error: "reported an error when asked",
   internal_error: "Khipu could not run the check",
   pending: "first read still running",
+  not_configured: "not in the account list",
+  ambiguous_account: "shares its name with another account",
+  no_sign_in: "signs in from its own CLI",
+  sign_in_timeout: "sign-in not finished in time",
 };
 
 export function usageErrorPhrase(code: string | null | undefined): string {
@@ -236,14 +244,6 @@ export function liveReadFailures(report: UsageReport | null | undefined): string
     .map((row) => `${row.account || row.harness || "Account"} is showing its last turn (${usageErrorPhrase(row.live_error)})`);
 }
 
-/** The tag for a row: why its read failed (figures kept from before), or why
- *  its live read failed (figures from a fallback); null when neither. */
-function failureTag(row: UsageAccount): string | null {
-  if (row.ok === false) return usageErrorPhrase(row.error);
-  if (row.live_error) return usageErrorPhrase(row.live_error);
-  return null;
-}
-
 /** One attention item when any window still in force is at or above 90%. */
 export function planAttention(report: UsageReport | null | undefined, now: Date = new Date()): Attention[] {
   const hot: string[] = [];
@@ -330,6 +330,8 @@ type ReadKind = "status" | "refresh";
 export function usePlanUsage(active: unknown) {
   const [data, setData] = useState<UsageReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** When the last read failed, for "Last read failed 2 min ago". */
+  const [errorAt, setErrorAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const inflight = useRef<{ kind: ReadKind; promise: Promise<void> } | null>(null);
@@ -345,14 +347,17 @@ export function usePlanUsage(active: unknown) {
         if (!res.ok) {
           console.error("khipu usage failed:", res.error);
           setError(PLAN_READ_FAILED);
+          setErrorAt(new Date().toISOString());
           return;
         }
         const report = parseReport(res.data);
         if (report) {
           setData(report);
           setError(null);
+          setErrorAt(null);
         } else {
           setError(PLAN_READ_UNREADABLE);
+          setErrorAt(new Date().toISOString());
         }
       } finally {
         if (inflight.current === entry) inflight.current = null;
@@ -392,16 +397,119 @@ export function usePlanUsage(active: unknown) {
     if (active) void load();
   }, [active, load]);
 
-  return { data, error, loading, refreshing, load, refresh, reread };
+  return { data, error, errorAt, loading, refreshing, load, refresh, reread };
 }
 
 export type PlanUsageState = ReturnType<typeof usePlanUsage>;
 
-function Meter({ pct, label, tone }: { pct: number; label: string; tone: "err" | "warn" | null }) {
+// ---------------------------------------------------------------------------
+// Whether Khipu can read each account, and signing in again from the app.
+// ---------------------------------------------------------------------------
+
+/** Whether Khipu can read the account now, in plain words: "Live: read 2 min
+ *  ago", "Signed in, but its plan figures can't be read", "Not signed in",
+ *  "CLI not installed". A read that worked but brought no figures (Muse
+ *  before its first turn) is never "Live": it says when it was checked, and
+ *  `checked` marks it so nobody is asked to sign in. */
+export function liveWords(row: UsageAccount): { text: string; live: boolean; checked?: boolean } {
+  const code = row.ok === false ? row.error : row.live_error ?? null;
+  if (code === "not_installed") return { text: "CLI not installed", live: false };
+  if (code === "not_signed_in") return { text: "Not signed in", live: false };
+  if (code === "no_plan_limits") return { text: "Signed in, but its plan figures can't be read", live: false };
+  if (code === "pending") return { text: "Reading it for the first time", live: false };
+  if (row.ok === false) return { text: `Can't be read just now (${usageErrorPhrase(code)})`, live: false };
+  const age = fmtAgoSince(row.last_attempt_at || row.probed_at);
+  if (!(row.windows ?? []).some((w) => pctOf(w) != null)) {
+    return { text: age ? `Checked ${age}, no figures yet` : "Checked, no figures yet", live: false, checked: true };
+  }
+  return { text: age ? `Live: read ${age}` : "Live", live: true };
+}
+
+/** The CLIs whose own login the app can start (`khipu.usage.SIGN_IN_ARGS`):
+ *  each opens the browser and asks nothing on a terminal. */
+const SIGN_IN_CLIS = new Set(["claude", "codex"]);
+const CLI_TITLE: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", muse: "Muse" };
+
+/** "button" when the app can start this account's own login, "elsewhere"
+ *  when the owner signs in from the CLI itself, null when it is live or its
+ *  CLI is not installed. */
+export function signInOffer(row: UsageAccount): "button" | "elsewhere" | null {
+  // Only a sign-in problem is mended by signing in: a timeout or an error
+  // offers nothing (settings clarity, phase 2).
+  const code = row.ok === false ? row.error : row.live_error ?? null;
+  if (code !== "not_signed_in" && code !== "no_plan_limits") return null;
+  return SIGN_IN_CLIS.has(row.harness ?? "") ? "button" : "elsewhere";
+}
+
+type SignInAnswer = { ok?: boolean; error?: string; row?: UsageAccount };
+
+/** What the owner reads once a sign-in ends, from the account read just after. */
+export function signInOutcome(res: { ok: boolean; data?: SignInAnswer; refusal?: Record<string, unknown>; error?: string }): string {
+  const answer = (res.ok ? res.data : (res.refusal as SignInAnswer | undefined)) ?? {};
+  const after = answer.row ? liveWords(answer.row).text : null;
+  if (res.ok && answer.ok) return after ? `Signed in. ${after}.` : "Signed in.";
+  if (answer.error === "sign_in_timeout") {
+    return "Khipu stopped waiting after 15 minutes. Press Sign in again to start over.";
+  }
+  if (answer.error === "not_configured") return "That account is no longer in the list below, so Khipu didn't start a sign-in.";
+  if (answer.error === "ambiguous_account") {
+    return "Two accounts share that name, so Khipu didn't start a sign-in. Give each its own name in the list below.";
+  }
+  if (after) return `The sign-in didn't finish. ${after}.`;
+  return `The sign-in didn't start: ${res.error ?? "Khipu couldn't run it"}.`;
+}
+
+/** For an account whose sign-in is the problem: Sign in again (Claude Code,
+ *  Codex), or where to sign in (Grok Build). The button starts the account's
+ *  own login in its own login folder; the browser opens; Khipu reads the
+ *  account again when the login ends, and the card shows its new state. */
+export function SignInControl({ row, onSignedIn }: { row: UsageAccount; onSignedIn?: () => Promise<unknown> | void }) {
+  const [busy, setBusy] = useState(false);
+  const [said, setSaid] = useState<string | null>(null);
+  const offer = signInOffer(row);
+  const name = row.account || row.harness || "this account";
+  const signIn = async () => {
+    if (busy) return;
+    setBusy(true);
+    setSaid(null);
+    try {
+      const res = await callCli<SignInAnswer>("khipu_account_sign_in", { harness: row.harness, home: row.home ?? null });
+      setSaid(signInOutcome(res));
+      await onSignedIn?.();
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (!offer && !busy && !said) return null;
+  return (
+    <>
+      {offer === "button" ? (
+        <button type="button" className="sm" disabled={busy} aria-busy={busy || undefined}
+          aria-label={`Sign ${name} in again`} onClick={() => void signIn()}>
+          {busy ? <Loader2 size={14} className="spin" aria-hidden /> : null}
+          Sign in again
+        </button>
+      ) : offer === "elsewhere" ? (
+        <span className="meta">Sign in from {CLI_TITLE[row.harness ?? ""] ?? "its CLI"}</span>
+      ) : null}
+      {busy ? (
+        <span className="meta" role="status">
+          Finish signing in in your browser; Khipu reads the account again when you're done.
+        </span>
+      ) : said ? (
+        <span className="meta" role="status">
+          {said}
+        </span>
+      ) : null}
+    </>
+  );
+}
+
+function Meter({ pct, label, tone, dim }: { pct: number; label: string; tone: "err" | "warn" | null; dim?: boolean }) {
   const width = Math.min(100, Math.max(0, pct));
   return (
     <span
-      className={tone ? `plan-meter ${tone}` : "plan-meter"}
+      className={["plan-meter", tone, dim ? "dim" : null].filter(Boolean).join(" ")}
       role="meter"
       aria-label={label}
       aria-valuemin={0}
@@ -420,15 +528,6 @@ function figuresAt(row: UsageAccount): string | null {
   return row.observed_at || row.last_good_at || row.probed_at || null;
 }
 
-function StatusTags({ row }: { row: UsageAccount }) {
-  const age = fmtAgeSince(figuresAt(row));
-  if (row.observed_at) {
-    return <Tag tone={row.stale ? "warn" : "neutral"}>{age ? `as of the last turn, ${age} ago` : "as of the last turn"}</Tag>;
-  }
-  if (row.stale) return <Tag tone="warn">{age ? `figures from ${age} ago` : "stale"}</Tag>;
-  return null;
-}
-
 function RefreshButton({ busy, label, onClick }: { busy: boolean; label: string; onClick: () => void }) {
   return (
     <button type="button" className="sm" disabled={busy} aria-busy={busy || undefined} onClick={onClick}>
@@ -442,111 +541,336 @@ function RefreshButton({ busy, label, onClick }: { busy: boolean; label: string;
   );
 }
 
+const NO_ACCOUNTS_TITLE = "No accounts to read yet";
 const NO_ACCOUNTS_HINT =
-  "No claude, codex, grok or muse command was found on this Mac, and no account is listed under Settings → Capture & models → Plans.";
-const ALL_RESET = "every limit has reset since it was read";
+  "List your accounts in Settings → Capture & models and Khipu shows how much of each plan is left. It can read Claude Code, Codex, Grok Build and Muse.";
+const NO_ACCOUNTS_HINT_HERE =
+  "List your accounts below and Khipu shows how much of each plan is left. It can read Claude Code, Codex, Grok Build and Muse.";
+export const MUSE_NO_TURN = "No figures yet. Muse reports its plan after its first turn.";
+const NO_RESETTING_LIMIT = "Its plan shows no limit that resets.";
 
 /** Figures exist, but every window has reset since they were read. */
 export function onlyResetWindows(row: UsageAccount, now: Date): boolean {
   return liveWindows(row, now).length === 0 && (row.windows ?? []).some((w) => pctOf(w) != null);
 }
 
-/** One account on Home: its tightest window still in force as a bar, or why
- *  there is none. */
-function PlanRow({ row, now }: { row: UsageAccount; now: Date }) {
+/** The code behind an account's trouble: its failed read, or its failed live
+ *  read when the figures came from a fallback (Codex's last turn). */
+function troubleCode(row: UsageAccount): string | null {
+  return row.ok === false ? row.error ?? null : row.live_error ?? null;
+}
+
+const SIGN_IN_CODES = new Set(["not_signed_in", "no_plan_limits"]);
+
+/** The failure's cause in Khipu's own words: the row's note (`usage.py`
+ *  `_note()` gives one for every code), else the code's phrase after the CLI's
+ *  name for a row cached before notes covered every code. */
+function failureCause(row: UsageAccount, code: string): string {
+  const note = row.ok === false ? (row.note ?? "").trim().replace(/\.$/, "") : "";
+  if (note) return /^(This|The) /.test(note) ? note.charAt(0).toLowerCase() + note.slice(1) : note;
+  if (code === "internal_error") return ERROR_PHRASE.internal_error;
+  return `${CLI_TITLE[row.harness ?? ""] ?? "its CLI"} ${usageErrorPhrase(code)}`;
+}
+
+/** What one account's row says, once: whether its figures are from this read,
+ *  kept from an earlier one, or absent, and the single status phrase (null
+ *  when the figures speak for themselves). Settings clarity, phase 2. */
+export type PlanStatus = {
+  figures: "live" | "kept" | "none";
+  say: string | null;
+  tone: "warn" | "grey" | null;
+  code: string | null;
+};
+
+export function planStatus(row: UsageAccount, now: Date = new Date()): PlanStatus {
+  const code = troubleCode(row);
+  const hasFigures = liveWindows(row, now).length > 0;
+  const figures: PlanStatus["figures"] = !hasFigures ? "none" : code ? "kept" : "live";
+  const age = fmtAgoSince(figuresAt(row));
+  if (code && SIGN_IN_CODES.has(code)) {
+    return { figures, say: code === "no_plan_limits" ? "Its sign-in reports no plan limits" : "Not signed in", tone: "warn", code };
+  }
+  if (code === "pending") return { figures, say: "Reading it for the first time", tone: "grey", code };
+  if (code) {
+    if (hasFigures) {
+      const from = row.observed_at ? `figures from its last turn, ${age}` : `figures from ${age}`;
+      return { figures, say: `Can't read it now; ${age ? from : "showing earlier figures"}`, tone: "warn", code };
+    }
+    if (onlyResetWindows(row, now)) {
+      return { figures, say: "Can't read it now; every limit has reset since it was read", tone: "warn", code };
+    }
+    return { figures, say: `Can't read its plan: ${failureCause(row, code)}`, tone: "warn", code };
+  }
+  if (onlyResetWindows(row, now)) return { figures, say: "Every limit has reset since it was read", tone: "grey", code };
+  if (!hasFigures) {
+    if (row.harness === "muse") return { figures, say: MUSE_NO_TURN, tone: "grey", code };
+    // A read that worked but found no figures says when it was checked.
+    const checked = fmtAgoSince(row.last_attempt_at || row.probed_at);
+    const say = checked ? `${NO_RESETTING_LIMIT.slice(0, -1)}; checked ${checked}` : NO_RESETTING_LIMIT;
+    return { figures, say, tone: "grey", code };
+  }
+  if (row.observed_at) {
+    return { figures, say: age ? `as of its last turn, ${age}` : "as of its last turn", tone: "grey", code };
+  }
+  if (row.stale && age) return { figures, say: `figures from ${age}`, tone: "grey", code };
+  return { figures, say: null, tone: null, code };
+}
+
+/** "Paused by you until Wed, Oct 21, 9:26 PM" for each account the routing
+ *  record says the owner paused, by its stable key (a name can be reused by
+ *  another login). Empty when the record could not be read: Plans then shows
+ *  no pause rather than guessing. */
+export function planPauses(view: RouteView | null | undefined, now: Date = new Date()): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const a of view?.accounts ?? []) {
+    if (a.state === "paused") out.set(a.key, accountState(a, now).text);
+  }
+  return out;
+}
+
+function accountName(row: UsageAccount): string {
+  return row.account || row.harness || "Account";
+}
+
+function StatusPhrase({ status }: { status: PlanStatus }) {
+  if (!status.say) return null;
+  return (
+    <span className={status.tone === "grey" ? "plan-say grey" : "plan-say"}>
+      {status.tone === "warn" ? <span className="hdot warn" aria-hidden="true" /> : null}
+      {status.say}
+    </span>
+  );
+}
+
+/** One account on Home: its tightest window still in force as a bar, and at
+ *  most one status phrase, after the pause when the owner paused it. */
+function PlanRow({ row, now, pause, onSignedIn }: {
+  row: UsageAccount; now: Date; pause?: string; onSignedIn?: () => Promise<unknown> | void;
+}) {
+  const status = planStatus(row, now);
   const w = tightestWindow(row, now);
   const p = w ? pctOf(w) : null;
   const reset = w ? resetPhrase(w.resets_at, now) : null;
-  const allReset = onlyResetWindows(row, now);
+  const dim = status.figures === "kept";
+  const tail = (
+    <>
+      {pause ? <Tag>{pause}</Tag> : null}
+      <StatusPhrase status={status} />
+      <SignInControl row={row} onSignedIn={onSignedIn} />
+    </>
+  );
   return (
     <ListRow className="plan-row">
       <span className="plan-name ellip">
-        {row.account || row.harness}
+        {accountName(row)}
         {row.plan ? <span className="meta"> {row.plan}</span> : null}
       </span>
       {w && p != null ? (
         <>
-          <Meter pct={p} label={`${planName(row)} ${windowLabel(w)}`} tone={meterTone(p)} />
-          <span className={`plan-pct ${meterTone(p) ?? ""}`}>{fmtPct(p)}</span>
+          <Meter pct={p} label={`${planName(row)} ${windowLabel(w)}`} tone={meterTone(p)} dim={dim} />
+          <span className={`plan-pct ${meterTone(p) ?? (dim ? "dim" : "")}`}>{fmtPct(p)}</span>
           <span className="plan-when meta">
             {windowLabel(w)}
             {reset ? ` · ${reset}` : ""}
           </span>
+          <span className="plan-say-col">{tail}</span>
         </>
       ) : (
-        <span className="plan-none t2">
-          {allReset ? ALL_RESET : row.ok === false ? usageErrorPhrase(row.error) : row.note || "no limits reported"}
-        </span>
+        <span className="plan-none">{tail}</span>
       )}
-      <span className="plan-tags">
-        {row.ok === false && (w || allReset) ? <Tag tone="warn">{usageErrorPhrase(row.error)}</Tag> : null}
-        {row.ok !== false && row.live_error ? <Tag tone="warn">{usageErrorPhrase(row.live_error)}</Tag> : null}
-        <StatusTags row={row} />
-      </span>
     </ListRow>
   );
 }
 
-/** Home → Plans: one row per account, the tightest window of each. */
-export function PlansCard({ state }: { state: PlanUsageState }) {
-  const { data, error, loading, refreshing, refresh } = state;
+/** Home → Plans: one row per account, the tightest window of each. `routing`
+ *  is the routing record when it was read, for the pauses. */
+export function PlansCard({ state, routing, onOpenAccounts }: {
+  state: PlanUsageState;
+  routing?: RouteView | null;
+  onOpenAccounts?: () => void;
+}) {
+  const { data, error, errorAt, loading, refreshing, refresh, reread } = state;
   const accounts = data?.accounts ?? [];
   const now = new Date();
+  const pauses = planPauses(routing, now);
+  const failedAge = fmtAgoSince(errorAt);
   return (
     <div className="card plans-card">
       <div className="card-head">
         Plans
         <span className="spacer" />
+        {data != null && error ? (
+          <span className="plans-head-note">
+            <span className="hdot warn" aria-hidden="true" />
+            Last read failed {failedAge ?? "just now"}; showing earlier figures
+          </span>
+        ) : null}
         <RefreshButton busy={refreshing || loading} label="Refresh" onClick={() => void refresh()} />
       </div>
       {data == null ? (
         error ? (
           <EmptyState title="Could not read plan usage" hint={error} />
         ) : (
-          <EmptyState
-            title={loading ? "Reading plan usage" : "Plan usage not read yet"}
-            hint="Asks each subscription CLI how much of its plan is left; no model call is made."
-          />
+          <div className="empty" role="status">
+            <b>{loading ? "Reading plan usage…" : "Plan usage not read yet"}</b>
+            <span>Asks each subscription CLI how much of its plan is left; no model call is made.</span>
+          </div>
         )
       ) : accounts.length === 0 ? (
-        <EmptyState title="No plans to show" hint={NO_ACCOUNTS_HINT} />
-      ) : (
-        <>
-          {accounts.map((row, i) => (
-            <PlanRow key={`${row.harness}|${row.home ?? ""}|${i}`} row={row} now={now} />
-          ))}
-          {error ? (
-            <ListRow>
-              <span className="meta">The last read failed; these figures are from the read before it.</span>
-            </ListRow>
+        <div className="empty">
+          <b>{NO_ACCOUNTS_TITLE}</b>
+          <span>{NO_ACCOUNTS_HINT}</span>
+          {onOpenAccounts ? (
+            <button type="button" className="sm plans-empty-btn" onClick={onOpenAccounts}
+              aria-label="Which accounts Khipu reads: opens Settings, Capture & models">
+              Which accounts Khipu reads
+            </button>
           ) : null}
-        </>
+        </div>
+      ) : (
+        accounts.map((row, i) => (
+          <PlanRow key={`${row.harness}|${row.home ?? ""}|${i}`} row={row} now={now}
+            pause={row.key ? pauses.get(row.key) : undefined} onSignedIn={reread} />
+        ))
       )}
     </div>
   );
 }
 
-/** "figures from 2 days ago · last tried 30s ago" for kept figures, "figures
- *  from 30s ago" for a fresh read, "last tried 30s ago" with no figures. */
-function readWhen(row: UsageAccount, hasFigures: boolean): string {
-  const tried = row.last_attempt_at || row.probed_at || null;
-  const triedAge = fmtAgeSince(tried);
-  if (!hasFigures) return triedAge ? `last tried ${triedAge} ago` : "";
-  const figures = figuresAt(row);
-  const figuresAge = fmtAgeSince(figures);
-  const parts = figuresAge ? [`figures from ${figuresAge} ago`] : [];
-  const gap = figures && tried ? Math.abs(new Date(tried).getTime() - new Date(figures).getTime()) : 0;
-  if (triedAge && (row.ok === false || gap > 60_000)) parts.push(`last tried ${triedAge} ago`);
-  return parts.join(" · ");
+/** "Wed, Oct 14, 3:38 PM, 2 min ago"; null without a time. */
+function whenAndAge(iso: string | null | undefined): string | null {
+  const d = parseIso(iso);
+  if (!d) return null;
+  const local = d.toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  const age = fmtAgoSince(iso);
+  return age ? `${local}, ${age}` : local;
 }
 
-/** Settings → Capture & models → Plans: every account, every window, its
- *  reset and when its figures were read, Probe now, and which accounts are
- *  read (`usage_accounts`). Shares Home's reads (`state`). */
-export function PlansSettingsCard({ state, active }: { state: PlanUsageState; active: boolean }) {
+/** The one failure line of a Settings block: the cause, what Khipu still
+ *  shows, and the one thing to do if there is one. */
+function failureLine(row: UsageAccount, status: PlanStatus, now: Date): string | null {
+  const code = status.code;
+  if (!code || code === "pending") return null;
+  if (SIGN_IN_CODES.has(code)) {
+    const note = (row.note ?? "").trim();
+    if (note) return /[.)]$/.test(note) ? note : `${note}.`;
+    const cli = CLI_TITLE[row.harness ?? ""] ?? "This CLI";
+    return code === "no_plan_limits" ? "This sign-in reports no plan limits." : `${cli} is not signed in.`;
+  }
+  const cause = failureCause(row, code);
+  // The figures' age is on the block's read line, so it is said once.
+  if (status.figures !== "none") return `Can't read it now: ${cause}. Showing earlier figures.`;
+  if (onlyResetWindows(row, now)) return `Can't read it now: ${cause}. Every limit has reset since it was read.`;
+  return `Can't read its plan: ${cause}. No figures to show.`;
+}
+
+/** One account in Settings: a bordered block under its name, holding every
+ *  line about it (the pause first, each window, the one failure line with
+ *  sign-in, when it was read, and Details), so no line floats loose. */
+function PlanBlock({ row, now, pause, onSignedIn }: {
+  row: UsageAccount; now: Date; pause?: string; onSignedIn?: () => Promise<unknown> | void;
+}) {
+  const [open, setOpen] = useState(false);
+  const id = useId();
+  const name = accountName(row);
+  const status = planStatus(row, now);
+  const windows = (row.windows ?? []).filter((w) => pctOf(w) != null);
+  const fail = failureLine(row, status, now);
+  const dim = status.figures === "kept" || (status.code != null && status.figures === "none");
+  const triedAge = fmtAgoSince(row.last_attempt_at || row.probed_at);
+  const figuresAge = fmtAgoSince(figuresAt(row));
+  const login = row.home || "default login";
+  return (
+    <section className={status.tone === "warn" ? "plan-block warn" : "plan-block"} role="group" aria-label={name}>
+      <h2 className="plan-block-head">
+        {name}
+        {row.plan ? <span className="meta">{`${row.plan.charAt(0).toUpperCase()}${row.plan.slice(1)} plan`}</span> : null}
+      </h2>
+      {pause ? (
+        <div className="plan-paused">
+          <Tag>{pause}</Tag>
+          <span>Khipu still reads its plan; a read uses no turn.</span>
+        </div>
+      ) : null}
+      {windows.length ? (
+        <ul className="plan-wins" aria-label={`${name} windows`}>
+          {windows.map((w) => {
+            const p = pctOf(w) as number;
+            const reset = resetPhrase(w.resets_at, now);
+            const tone = hasReset(w, now) ? null : meterTone(p);
+            return (
+              <li key={w.name} className="plan-win">
+                <span className="plan-wname">{windowLabel(w)}</span>
+                <Meter pct={p} label={`${planName(row)} ${windowLabel(w)}`} tone={tone} dim={dim} />
+                <span className={`plan-pct ${tone ?? (dim ? "dim" : "")}`}>{fmtPct(p)}</span>
+                <span className="plan-reset">{reset ?? "no reset reported"}</span>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+      {fail ? (
+        <div className="plan-fail">
+          <span className="hdot warn" aria-hidden="true" />
+          <span>{fail}</span>
+          <SignInControl row={row} onSignedIn={onSignedIn} />
+        </div>
+      ) : !windows.length ? (
+        <p className="plan-empty">
+          {status.code === "pending" ? "Reading it for the first time." : row.harness === "muse" ? MUSE_NO_TURN : NO_RESETTING_LIMIT}
+        </p>
+      ) : null}
+      <div className="plan-reads">
+        {status.figures === "live" && !row.observed_at && !row.stale ? (
+          <Tag tone="ok" dot>
+            {triedAge ? `Live: read ${triedAge}` : "Live"}
+          </Tag>
+        ) : row.observed_at && windows.length && !fail?.includes("last turn") ? (
+          <span>{figuresAge ? `As of its last turn, ${figuresAge}` : "As of its last turn"}</span>
+        ) : windows.length ? (
+          <span>{figuresAge ? `Figures from ${figuresAge}` : "Earlier figures"}</span>
+        ) : !status.code && triedAge ? (
+          <span>Checked {triedAge}</span>
+        ) : null}
+        <span>{login}</span>
+      </div>
+      {status.code && status.code !== "pending" ? (
+        <div className="plan-details-fold">
+          <button type="button" className="disclosure plan-details-btn" aria-expanded={open} aria-controls={`${id}-details`}
+            onClick={() => setOpen((o) => !o)}>
+            <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
+            Details
+          </button>
+          <dl className="plan-details" id={`${id}-details`} hidden={!open}>
+            <dt>Short code</dt>
+            <dd>
+              <code>{status.code}</code>
+            </dd>
+            <dt>Last attempt</dt>
+            <dd>{whenAndAge(row.last_attempt_at || row.probed_at) ?? "Not recorded"}</dd>
+            <dt>Last good read</dt>
+            <dd>{whenAndAge(row.last_good_at || row.observed_at) ?? "None yet"}</dd>
+            <dt>Login</dt>
+            <dd>{login}</dd>
+          </dl>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+/** Settings → Capture & models → Plans: one block per account, Check all
+ *  now, and which accounts are read (`usage_accounts`). Shares Home's reads
+ *  (`state`). Phase 3 moves it into Settings → Accounts and routing. */
+export function PlansSettingsCard({ state, active, routing }: {
+  state: PlanUsageState;
+  active: boolean;
+  routing?: RouteView | null;
+}) {
   const st = state;
   const accounts = st.data?.accounts ?? [];
   const now = new Date();
+  const pauses = planPauses(routing, now);
   return (
     <div className="section-card">
       <div className="section-head">Plans</div>
@@ -561,64 +885,25 @@ export function PlansSettingsCard({ state, active }: { state: PlanUsageState; ac
             Reading plan usage…
           </p>
         ) : null}
-        {st.data && accounts.length === 0 ? <p className="set-help">{NO_ACCOUNTS_HINT}</p> : null}
-        {accounts.map((row, i) => {
-          const windows = (row.windows ?? []).filter((w) => pctOf(w) != null);
-          const when = readWhen(row, windows.length > 0);
-          return (
-            <div key={`${row.harness}|${row.home ?? ""}|${i}`} className="rows plan-account" role="group" aria-label={row.account || row.harness}>
-              <div className="row-item">
-                <span className="row-main">
-                  {row.account || row.harness}
-                  {row.plan ? <span className="meta"> {row.plan}</span> : null}
-                </span>
-                {failureTag(row) ? <Tag tone="warn">{failureTag(row)}</Tag> : null}
-                <StatusTags row={row} />
-                <span className="row-meta">
-                  {row.home || "default login"}
-                  {when ? ` · ${when}` : ""}
-                </span>
-              </div>
-              {windows.length === 0 ? (
-                <div className="row-item">
-                  <span className="row-main t2">
-                    {row.note || (row.ok === false ? usageErrorPhrase(row.error) : "no limits reported")}
-                  </span>
-                </div>
-              ) : (
-                <>
-                  {windows.map((w) => {
-                    const p = pctOf(w) as number;
-                    const reset = resetPhrase(w.resets_at, now);
-                    const tone = hasReset(w, now) ? null : meterTone(p);
-                    return (
-                      <div key={w.name} className="row-item plan-window">
-                        <span className="plan-wname">{windowLabel(w)}</span>
-                        <Meter pct={p} label={`${planName(row)} ${windowLabel(w)}`} tone={tone} />
-                        <span className={`plan-pct ${tone ?? ""}`}>{fmtPct(p)}</span>
-                        <span className="row-meta">{reset ?? "no reset reported"}</span>
-                      </div>
-                    );
-                  })}
-                  {row.note ? (
-                    <div className="row-item">
-                      <span className="row-main t2">{row.note}</span>
-                    </div>
-                  ) : null}
-                </>
-              )}
-            </div>
-          );
-        })}
+        {st.data && accounts.length === 0 ? <p className="set-help">{NO_ACCOUNTS_HINT_HERE}</p> : null}
+        {accounts.length ? (
+          <div className="plan-blocks">
+            {accounts.map((row, i) => (
+              <PlanBlock key={`${row.harness}|${row.home ?? ""}|${i}`} row={row} now={now}
+                pause={row.key ? pauses.get(row.key) : undefined} onSignedIn={st.reread} />
+            ))}
+          </div>
+        ) : null}
         <div className="toolbar">
-          <RefreshButton busy={st.refreshing || st.loading} label="Probe now" onClick={() => void st.refresh()} />
-          <span className="muted">Asks every CLI again now; takes up to about seven seconds.</span>
+          <RefreshButton busy={st.refreshing || st.loading} label="Check all now" onClick={() => void st.refresh()} />
+          <span className="muted">Asks every CLI again now; takes up to about seven seconds. No model call is made.</span>
         </div>
         <UsageAccountsField active={active} onChanged={st.reread} />
       </div>
     </div>
   );
 }
+
 
 // ---------------------------------------------------------------------------
 // Which accounts are read: `config --set usage_accounts JSON` / `--unset`.
