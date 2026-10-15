@@ -701,8 +701,16 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
             dedup = dedup_before_insert(cur, payload, source=source)
             if dedup["action"] in ("skip", "merge"):
                 # The job is done once this returns (the outbox deletes it),
-                # so this is the last chance to record its trusted owner.
-                _claim_unowned_episode(cur, dedup.get("matched_episode"), _stamp_origin(cur))
+                # so this is the last chance to record its trusted owner. A
+                # failed claim must not fail a skip or roll back a merge.
+                cur.execute("SAVEPOINT capture_claim")
+                try:
+                    _claim_unowned_episode(cur, dedup.get("matched_episode"), _stamp_origin(cur))
+                except Exception as exc:  # noqa: BLE001 — the row stays, unowned
+                    cur.execute("ROLLBACK TO SAVEPOINT capture_claim")
+                    _log(f"origin claim failed ({type(exc).__name__}: {exc})")
+                else:
+                    cur.execute("RELEASE SAVEPOINT capture_claim")
                 conn.commit()
                 if dedup["action"] == "merge":
                     _refresh_merged_episode(cur, dedup["matched_episode"])

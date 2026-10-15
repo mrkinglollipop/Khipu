@@ -337,6 +337,22 @@ class DedupEarlyReturnClaimsTest(_OutboxOriginBase):
         self.assertEqual(cur.claims, [])
         self.assertIsNone(cur.episodes[1]["origin"])
 
+    def test_a_failed_claim_never_fails_the_skip_or_the_merge(self):
+        for name, cur, payload, patches in (
+                ("exact window", _DedupClaimCursor(dict(_WINDOW)), _window_payload(), None),
+                ("merge", _merge_target(), _merge_payload(), _MERGE_TEXT)):
+            with self.subTest(name):
+                for job in outbox.jobs():
+                    job.unlink()
+                khipu_db._TABLE_COLUMNS_CACHE.clear()
+                self._queue(payload)
+                with mock.patch.object(cap, "_stamp_origin", side_effect=RuntimeError("probe")), \
+                        mock.patch.multiple(cap, **patches) if patches else contextlib.nullcontext():
+                    self._replay(_cli_drain, cur=cur)
+                self.assertEqual(cur.inserts, [])
+                self.assertIsNone(cur.episodes[1]["origin"])
+                self.assertIn("ROLLBACK TO SAVEPOINT capture_claim", [c for c, _ in cur.calls])
+
     def test_a_live_gateway_caller_never_claims_on_any_early_return(self):
         cases = (("exact window", _DedupClaimCursor(dict(_WINDOW)), _window_payload(), None),
                  ("merge", _merge_target(), _merge_payload(), _MERGE_TEXT))
