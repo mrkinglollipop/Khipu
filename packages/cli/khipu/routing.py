@@ -2825,6 +2825,12 @@ def doctor_block(now: datetime | None = None) -> dict:
     limit = cfg["routing_summary_chars"]
     if text and limit and text["rules_note_chars"] > limit:
         warnings.append("Your rules and note are longer than the summary size.")
+    if text:
+        from khipu.recall_rule import start_context_fits
+
+        if not start_context_fits(text["text"]):
+            warnings.append("The routing summary is too long to arrive at session start; conversations get a "
+                            "line telling them to call khipu_route instead. Shorten the rules or the note.")
     if view.get("outside_app"):
         warnings.append("A rule, a pause, a clear or your note was written by something other than the app.")
     if view.get("seed_error"):

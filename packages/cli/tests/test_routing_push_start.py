@@ -664,3 +664,17 @@ def test_the_apps_cost_line_matches_the_start_budget_setting():
     assert "start budget" in cost
     assert f"{_WORDS[default_s]} second{'s' if default_s != 1 else ''} by default" in cost
     assert f"never more than {_WORDS[most_s]} seconds" in cost
+
+
+def test_a_summary_too_long_for_session_start_leaves_a_pointer_not_silence():
+    # R4-1: a summary past the hook limit was left out with nothing said.
+    from khipu import recall_rule
+
+    memory = recall_rule.RULE_MD.strip()
+    huge = "## Routing\n" + "\n".join("Rule %d: " % i + "x" * 150 for i in range(80))
+    ctx, pushed = recall_rule.fit_start_context(memory, huge)
+    assert pushed is False
+    assert ctx.startswith(memory) and ctx.endswith(recall_rule.ROUTING_TOO_LONG)
+    assert "khipu_route" in ctx and "Rule 1:" not in ctx
+    assert not recall_rule.start_context_fits(huge)
+    assert recall_rule.start_context_fits("## Routing\nCodex: open")

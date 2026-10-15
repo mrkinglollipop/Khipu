@@ -525,7 +525,21 @@ def fit_start_context(memory: str, routing_text: str | None,
             trimmed = f"{trimmed}\n{note}" if trimmed else note
         if _utf16_len(trimmed) + fixed <= budget:
             return f"{trimmed}{_START_SEP}{routing_text}", True
+    # Too long to arrive whole, and it is never cut: say so and where to read
+    # it, so the rules and note are never dropped in silence (doctor warns too).
+    if _utf16_len(memory) + _utf16_len(_START_SEP + ROUTING_TOO_LONG) <= budget:
+        return f"{memory}{_START_SEP}{ROUTING_TOO_LONG}", False
     return memory, False
+
+
+ROUTING_TOO_LONG = ("## Routing\nKhipu's routing summary (the owner's standing rules, the note and every "
+                    "account's state) is too long to arrive at session start. Call `khipu_route` to read it.")
+
+
+def start_context_fits(routing_text: str, budget: int = _HOOK_CONTEXT_BUDGET) -> bool:
+    """Whether a routing summary can arrive at session start beside the
+    recall rule alone (the memory slice gives way first, the rule never)."""
+    return _utf16_len(RULE_MD.strip()) + _utf16_len(_START_SEP) + _utf16_len(routing_text) <= budget
 
 
 # ---- routing at session start (routing truth, phase 3a) -----------------------
