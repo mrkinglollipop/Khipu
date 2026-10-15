@@ -104,7 +104,7 @@ def _status_frames(summary: str, *, literal: bool) -> bytes:
     UTF-8 writer may."""
     status = {"counts": {"episodes": 3}, "recent_captures": [{"summary": summary}]}
     frames = [
-        {"jsonrpc": "2.0", "id": 1, "result": {"instructions": "Khipu memory — 記憶"}},
+        {"jsonrpc": "2.0", "id": 1, "result": {"instructions": "Khipu memory \u2014 \u8a18\u61b6"}},
         {"jsonrpc": "2.0", "id": 2,
          "result": {"content": [{"type": "text", "text": json.dumps(status, ensure_ascii=not literal)}],
                     "isError": False}},
