@@ -3037,3 +3037,96 @@ input.switch:disabled {
   .plan-row .plan-when, .plan-row .plan-tags { grid-column: 1 / -1; justify-content: flex-start; }
   .plan-row .plan-none { grid-column: 2 / -1; }
 }
+
+/* ---------------------------------------------------------------------------
+   Home -> Routing (docs/plans/2026-10-14-routing-truth.md, phase 4; mock
+   docs/mockups/2026-10-14-routing/mock.css). The name column matches the
+   Plans card so the two read as a pair.
+--------------------------------------------------------------------------- */
+.card .row.route-row {
+  display: grid;
+  grid-template-columns: minmax(7rem, 11rem) auto minmax(0, 1fr);
+  column-gap: var(--s3);
+  row-gap: var(--s1);
+  align-items: center;
+}
+.route-state { display: inline-flex; align-items: center; gap: var(--s2); font-size: var(--t-md); color: var(--text); white-space: nowrap; }
+.route-src { font-size: var(--t-xs); color: var(--muted); text-align: right; min-width: 0; }
+.route-note {
+  grid-column: 2 / -1;
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+  flex-wrap: nowrap;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  line-height: 1.45;
+}
+.route-note .tag { transform: translateY(-1px); flex: none; }
+.route-note > span:not(.tag) { flex: 1 1 auto; min-width: 0; }
+.card .row.route-stale { display: flex; flex-wrap: wrap; gap: var(--s1) var(--s3); }
+.card .row.route-stale .route-state { white-space: normal; }
+.route-sub { padding: var(--s2) var(--s4) var(--s3); border-bottom: 1px solid var(--border); }
+.routing-card [role="list"] + .route-sub { border-top: 1px solid var(--border); }
+.card h2.route-sub-head {
+  margin: 0 0 var(--s1);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--text-2);
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1.4;
+}
+.route-sub-head .meta { font-weight: 400; }
+.route-sub .route-holds { display: flex; flex-direction: column; gap: var(--s1); margin: 0; padding: 0; list-style: none; }
+.route-hold {
+  display: grid;
+  grid-template-columns: minmax(7rem, 11rem) minmax(0, 1fr) auto;
+  column-gap: var(--s3);
+  align-items: baseline;
+  font-size: var(--t-sm);
+  color: var(--text);
+}
+.route-hold .route-src { text-align: right; }
+.route-quote {
+  margin: 0;
+  padding: var(--s1) 0 0 var(--s3);
+  border-left: 2px solid var(--border-strong);
+  font-size: var(--t-sm);
+  color: var(--text);
+  line-height: 1.5;
+}
+.card .row.route-rules { display: block; padding: 0 var(--s4); }
+.route-rules details.disclose { border-top: 0; padding-top: 0; }
+.route-rules summary.disclosure { color: var(--text-2); }
+.route-rules summary.disclosure .tag { margin-left: var(--s1); }
+.route-rules ol {
+  margin: 0;
+  padding-left: 1.4em;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  line-height: 1.45;
+}
+.route-rules .route-rule-broken { color: var(--text); }
+.card .row.route-foot .meta { white-space: normal; }
+/* A narrow window (the content column under about 800px): who said so moves
+   under the state, and a hold's end under its words, instead of squeezing
+   either into a column a word wide. */
+@media (max-width: 1040px) {
+  .card .row.route-row { grid-template-columns: minmax(7rem, 11rem) minmax(0, 1fr); }
+  .route-state { white-space: normal; align-items: baseline; }
+  .route-state .hdot { flex: none; transform: translateY(-1px); }
+  .route-row .route-src { grid-column: 2 / -1; text-align: left; }
+  .route-hold { grid-template-columns: minmax(7rem, 11rem) minmax(0, 1fr); }
+  .route-hold .route-src { grid-column: 2 / -1; text-align: left; }
+}
+@media (max-width: 760px) {
+  .card .row.route-row { grid-template-columns: minmax(6rem, 1fr) auto; }
+  .route-src { grid-column: 1 / -1; text-align: left; }
+  .route-note { grid-column: 1 / -1; flex-wrap: wrap; }
+  .route-hold { grid-template-columns: 1fr; }
+  .route-hold .route-src { text-align: left; }
+}

@@ -3032,12 +3032,36 @@ _INTERNAL = ("fingerprint", "digest", "source_cache")
 def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     """The view as ``khipu route --json`` prints it: the fold's internals
     left out, each account with its line in full words."""
+    from khipu import routing_sources
+
+    cfg = settings()
     out = dict(view, generated_at=_iso(now))
-    out["accounts"] = [dict(e, line=account_line(e, now, push=False)) for e in view["accounts"]
+    out["accounts"] = [_with_authors(dict(e, line=account_line(e, now, push=False))) for e in view["accounts"]
                        if account is None or e["key"] == account]
+    out["holds"] = [dict(h, by=author_words(h.get("written_by"), push=False)) for h in view.get("holds") or []]
+    # What the app's Routing card and attention items need beside the view
+    # (phase 4): each watched rule's check, as doctor carries it, and the
+    # two times the app words its warnings by.
+    out["rule_checks"] = routing_sources.rule_checks(view.get("source_cache") or {}, view.get("rules") or [])
+    out["warn_after"] = {"disagreement": cfg["routing_disagreement_warn_after"],
+                         "not_refreshed": cfg["routing_not_refreshed_after"]}
     for key in _INTERNAL:
         out.pop(key, None)
     return out
+
+
+def _with_authors(entry: dict) -> dict:
+    """An account with ``by`` beside each ``written_by`` it holds: the
+    author in the words the app and ``khipu route`` show (a conversation's
+    project and session included, as conversations' words are shown)."""
+    def by(item):
+        return dict(item, by=author_words(item.get("written_by"), push=False)) if item else item
+
+    entry["witness"] = by(entry.get("witness"))
+    entry["disagreement"] = by(entry.get("disagreement"))
+    entry["last_seen"] = by(entry.get("last_seen"))
+    entry["models"] = [dict(m, disagreement=by(m.get("disagreement"))) for m in entry.get("models") or []]
+    return entry
 
 
 # A conversation's answer goes to other model providers: it carries no path

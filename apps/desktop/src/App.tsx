@@ -41,10 +41,12 @@ import type { ClaudeHomesReport } from "./railHealth";
 import { RightNowCard } from "./RightNow";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
-import { buildAttention, harnessLabel, type Attention } from "./doctorAttention";
+import { buildAttention, harnessLabel, routingAttention, type Attention } from "./doctorAttention";
 import { HealthReportRows } from "./healthRows";
 import { SummariserBudgetCard, SynthProviderFields, synthModelError } from "./SynthProvider";
 import { PlansCard, PlansSettingsCard, usePlanAttention, usePlanUsage } from "./PlansCard";
+import { RoutingCard } from "./RoutingCard";
+import { useRouting } from "./routing";
 import type { DoctorSynthProvider } from "./SynthProvider";
 import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVerify";
 import { WorkingBanner } from "./WorkingBanner";
@@ -2433,7 +2435,15 @@ export default function App() {
     tab === "home" ? "home" : tab === "settings" && settingsSection === "capture" ? "settings" : null,
   );
   const planItems = usePlanAttention(plans.data);
-  const homeAttention = useMemo(() => [...attention, ...planItems], [attention, planItems]);
+  // Routing truth phase 4: the routing record (`khipu route --json`), read on
+  // Home and every minute while Home stays open. Its attention items warn and
+  // block nothing (the record is guidance, not a gate).
+  const routing = useRouting(tab === "home");
+  const routingItems = useMemo(() => routingAttention(routing.data), [routing.data]);
+  const homeAttention = useMemo(
+    () => [...attention, ...planItems, ...routingItems],
+    [attention, planItems, routingItems],
+  );
   // "Connect to a server you run or another Mac…" reopens the first-run flow
   // at the Database step rather than restarting it — `welcomeInitialStepKey`
   // is bumped on every click so a second visit still jumps even when
@@ -3563,6 +3573,7 @@ export default function App() {
                 void refreshDsn(true);
                 void loadRightNow(true);
                 void plans.load();
+                void routing.load();
               }}
             >
               <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
@@ -3654,6 +3665,8 @@ export default function App() {
             />
 
             <PlansCard state={plans} />
+
+            <RoutingCard state={routing} plans={plans.data} />
 
             <div className="tiles">
               <Tile
@@ -3890,6 +3903,7 @@ export default function App() {
                 parsed={doctorParsed ?? {}}
                 attention={homeAttention}
                 plans={plans.data}
+                routing={routing.data}
                 busy={actionBusy || probeBusy}
                 onFixAction={(fix, harness) => {
                   if (fix.kind === "reinstall-hook" && harness) {

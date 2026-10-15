@@ -7,6 +7,17 @@
 // place a red `*_ok` field becomes a plain-words title, cause and (when the
 // app has an honest fix) a button.
 
+import {
+  brokenChecks,
+  capitalise,
+  longDisagreements,
+  quietRunners,
+  runnerWords,
+  spanWords,
+  whenLocal,
+} from "./routing";
+import type { RouteView } from "./routing";
+
 /** A named red check, in plain words, with at most one fix. Callers render
  *  one callout per entry; `fix` is omitted where the app has no honest fix to
  *  offer. */
@@ -328,4 +339,63 @@ export function buildAttention(parsed: Record<string, unknown>): {
   }
 
   return { issues, items };
+}
+
+// ---- Routing (docs/plans/2026-10-14-routing-truth.md, phase 4) -------------
+// Read from `khipu route --json` (the app's `khipu_route_view`), not doctor,
+// the same way the Plans item is read from `khipu usage`. Each item warns and
+// blocks nothing: the record is guidance, not a gate, so every cause says
+// Khipu stopped nothing.
+
+/** The scope's four attention items: a standing rule may be broken, a job
+ *  runner stopped reporting (or its files can't be read), sources disagreed
+ *  for longer than the warn time, and a limit from a lane not matched to an
+ *  account. Pure; `now` decides what counts as long. */
+export function routingAttention(view: RouteView | null | undefined, now: Date = new Date()): Attention[] {
+  if (!view || !view.record) return [];
+  const items: Attention[] = [];
+  const broken = brokenChecks(view);
+  if (broken.length) {
+    const lines = broken.map((c) => {
+      const rule = (view.rules ?? []).find((r) => r.n === c.rule);
+      const said = rule ? `Your rule ${rule.n} says: ${rule.text.replace(/\.$/, "")}. ` : "";
+      const what = capitalise(c.text.replace(/^A standing rule may be broken: /, "").replace(/\.$/, ""));
+      const seen = c.at ? ` (seen at ${whenLocal(c.at, now)})` : "";
+      return `${said}${what}${seen}.`;
+    });
+    items.push({
+      key: "routing:rules",
+      tone: "warn",
+      title: broken.length === 1 ? "A standing rule may be broken" : `${broken.length} standing rules may be broken`,
+      cause: `${lines.join(" ")} Khipu stopped nothing; it only reports.`,
+    });
+  }
+  for (const r of quietRunners(view)) {
+    items.push({
+      key: `routing:runner:${r.name}`,
+      tone: "warn",
+      title: r.silent ? "A job runner stopped reporting" : "Khipu can't read a job runner's files",
+      cause: r.silent
+        ? `${r.heartbeat_at ? `Your ${r.name} job runner's last report was at ${whenLocal(r.heartbeat_at, now)}.` : `Your ${r.name} job runner has not reported yet.`} Limits it finds won't reach your conversations until it runs again. Khipu stopped nothing.`
+        : `${runnerWords(r, now)} Limits it finds won't reach your conversations until Khipu can read them again. Khipu stopped nothing.`,
+    });
+  }
+  const span = spanWords(view.warn_after?.disagreement ?? 30 * 60);
+  for (const d of longDisagreements(view, now)) {
+    items.push({
+      key: `routing:disagree:${d.label}`,
+      tone: "warn",
+      title: `Sources disagree about ${d.label}`,
+      cause: `Sources have disagreed about ${d.label} for more than ${span}. The Routing card shows the stronger report and names both; conversations are told both.`,
+    });
+  }
+  for (const u of view.unmatched ?? []) {
+    items.push({
+      key: `routing:lane:${u.runner}/${u.lane}`,
+      tone: "warn",
+      title: "A limit came from a lane not matched to an account",
+      cause: `A limit came from ${u.runner}'s ${u.lane} lane, which isn't matched to an account${u.until ? `; it ends ${whenLocal(u.until, now)}` : ""}. Conversations are told the lane's name only, never a guessed account.`,
+    });
+  }
+  return items;
 }

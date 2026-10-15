@@ -568,6 +568,13 @@ const BUDGET_LIFT_SYNTH_TODAY_ARGV: &[&str] = &["budget", "lift", "synth", "--to
 /// every account now. Fixed argv: the webview cannot reach `--max-age`.
 const USAGE_STATUS_ARGV: &[&str] = &["usage", "--json"];
 const USAGE_REFRESH_ARGV: &[&str] = &["usage", "--fresh", "--json"];
+/// Home -> Routing, the health report's Routing row and the routing
+/// attention items (docs/plans/2026-10-14-routing-truth.md, phase 4): the
+/// routing record as `khipu route --json` prints it. Read only and fixed
+/// argv: the webview cannot reach `--since`, an account, or any of `route`'s
+/// write verbs (report, hold, pause, lift, clear, note, rule), and `route`
+/// stays out of `ALLOWED_SUBCOMMANDS`.
+const ROUTE_VIEW_ARGV: &[&str] = &["route", "--json"];
 /// `config --set KEY N`, a whole number >= 0 (0 = unlimited) (`INT_SETTINGS`).
 /// Only the summariser's ceiling is offered in the app.
 const DAILY_CALL_KEYS: &[&str] = &["synth_daily_calls"];
@@ -857,6 +864,11 @@ async fn khipu_usage_status() -> Result<String, String> {
 #[tauri::command]
 async fn khipu_usage_refresh() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(USAGE_REFRESH_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_route_view() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(ROUTE_VIEW_ARGV)).await
 }
 
 #[tauri::command]
@@ -2461,6 +2473,7 @@ pub fn run() {
             khipu_budget_lift_synth_today,
             khipu_usage_status,
             khipu_usage_refresh,
+            khipu_route_view,
             khipu_jobs_status,
             khipu_job_install,
             khipu_job_uninstall,
@@ -2965,7 +2978,7 @@ mod settings_command_tests {
 
     #[test]
     fn none_of_these_verbs_join_the_generic_allowlist() {
-        for s in ["features", "config", "jobs", "recall", "gateway", "embed", "budget", "usage"] {
+        for s in ["features", "config", "jobs", "recall", "gateway", "embed", "budget", "usage", "route"] {
             assert!(!ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of the allowlist");
         }
         assert_eq!(ALLOWED_SUBCOMMANDS.len(), 14);
@@ -2992,6 +3005,17 @@ mod settings_command_tests {
             assert!(!argv.iter().any(|a| a.starts_with("--max-age")));
         }
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"usage"));
+    }
+
+    #[test]
+    fn the_routing_view_is_one_fixed_read_only_argv() {
+        assert_eq!(fixed_argv(ROUTE_VIEW_ARGV), v(&["route", "--json"]));
+        // No write verb, no owner flag, no --since or account the webview could steer.
+        for word in ["report", "hold", "pause", "lift", "clear", "note", "rule", "wait", "sources",
+                     "--from-app", "--owner", "--since", "--summary", "--brief"] {
+            assert!(!ROUTE_VIEW_ARGV.contains(&word), "`{word}` must not be in the routing read");
+        }
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"route"));
     }
 
     #[test]

@@ -537,6 +537,32 @@ def test_doctor_checks_watched_rules_against_runner_settings_and_never_passes_wh
     assert not any(c["status"] not in ("broken", "cannot_check") for c in block["rule_checks"])
 
 
+def test_route_json_carries_what_the_app_card_needs(home, capsys):
+    """Phase 4: `khipu route --json` (the app's fixed-argv read) carries each
+    watched rule's check with the time Khipu read the file it was judged on,
+    the times the app words its warnings by, and each author in words; and
+    still no fold internals."""
+    _register(home)
+    routing.add_rule("Never a -fast tier.", via="app")
+    config = json.loads((home["a"] / "config.json").read_text())
+    config["lanes"]["codex"]["model"] = "gpt-6.1-sol-fast"
+    (home["a"] / "config.json").write_text(json.dumps(config))
+    conversation = {"kind": "conversation", "harness": "claude_code", "project": "project-b"}
+    routing.report(account="Muse", state="limited", until="1h", author=conversation)
+    routing.add_hold("keep it free", reason="keep", scope="account", account="Muse", author=conversation)
+    assert routing.run_cli(_args(json=True)) == 0
+    out = json.loads(capsys.readouterr().out)
+    broken = [c for c in out["rule_checks"] if c["status"] == "broken"]
+    assert [c["text"] for c in broken] == [
+        "A standing rule may be broken: project A's settings name a model ending in -fast for its codex lane."]
+    assert broken[0]["rule"] == 1 and broken[0]["at"] == routing._iso(T0)
+    assert out["warn_after"] == {"disagreement": 30 * 60, "not_refreshed": 5 * 60}
+    muse = next(a for a in out["accounts"] if a["label"] == "Muse")
+    assert muse["witness"]["by"] == "a Claude Code conversation in project-b"
+    assert out["holds"][0]["by"] == "a Claude Code conversation in project-b"
+    assert not {"fingerprint", "digest", "source_cache"} & set(out)
+
+
 def test_a_launch_while_paused_is_named(home):
     _register(home)
     routing.pause("Claude", via="app")

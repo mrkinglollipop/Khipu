@@ -911,21 +911,26 @@ def rule_checks(cache: dict, rules: list[dict]) -> list[dict]:
     out: list[dict] = []
     for name, kept in sorted(((cache or {}).get("runners") or {}).items()):
         config = (kept.get("config") or {}).get("data") or {}
+        # When Khipu last read the file a check is judged on (the app says
+        # "seen at 11:22 AM"): the settings file, or the events log for an
+        # ADDED line.
+        config_at = (kept.get("config") or {}).get("good_at")
+        events_at = (kept.get("events") or {}).get("good_at")
         lanes = _config_facts(config.get("lanes"))
         for lane, spec in sorted(lanes.items()):
             kind = (spec.get("kind") or "").lower()
             script = spec.get("script") or "the launch command"
             if "fast_tier" in watch:
                 if spec.get("fast"):
-                    out.append({"rule": watch["fast_tier"], "status": "broken",
+                    out.append({"rule": watch["fast_tier"], "status": "broken", "at": config_at,
                                 "text": f"A standing rule may be broken: {name}'s settings name a model ending in "
                                         f"-fast for its {lane} lane."})
                 elif not spec.get("model_in_launch"):
-                    out.append({"rule": watch["fast_tier"], "status": "cannot_check",
+                    out.append({"rule": watch["fast_tier"], "status": "cannot_check", "at": config_at,
                                 "text": f"{name}'s {lane} lane: can't be checked: the model is set inside "
                                         f"{script}"})
             if "paid_xai" in watch and kind.startswith("grok"):
-                out.append({"rule": watch["paid_xai"], "status": "cannot_check",
+                out.append({"rule": watch["paid_xai"], "status": "cannot_check", "at": config_at,
                             "text": f"{name}'s {lane} lane: whether it uses the paid xAI API can't be checked: "
                                     f"the launch environment is set inside {script}"})
             if "grok_confirm" in watch and kind == "grokcheck":
@@ -933,11 +938,11 @@ def rule_checks(cache: dict, rules: list[dict]) -> list[dict]:
                 other = lanes.get(confirm) if confirm else None
                 other_kind = ((other or {}).get("kind") or "").lower()
                 if other is None or other_kind.startswith("grok"):  # none named, or a lane the settings lack
-                    out.append({"rule": watch["grok_confirm"], "status": "broken",
+                    out.append({"rule": watch["grok_confirm"], "status": "broken", "at": config_at,
                                 "text": f"A standing rule may be broken: {name}'s Grok check lane has no "
                                         "confirming lane from another model family."})
                 elif not other_kind:
-                    out.append({"rule": watch["grok_confirm"], "status": "cannot_check",
+                    out.append({"rule": watch["grok_confirm"], "status": "cannot_check", "at": config_at,
                                 "text": f"{name}'s Grok check lane: whether its confirming lane {confirm} is from "
                                         "another model family can't be checked: its kind isn't set"})
         if "grok_private" in watch:
@@ -951,7 +956,7 @@ def rule_checks(cache: dict, rules: list[dict]) -> list[dict]:
                 if "fix_lanes" in added and added["fix_lanes"] is None:
                     named |= set(config.get("fix_lanes") or [])
                 if added.get("private") and grok & named:
-                    out.append({"rule": watch["grok_private"], "status": "broken",
+                    out.append({"rule": watch["grok_private"], "status": "broken", "at": events_at,
                                 "text": f"A standing rule may be broken: a Grok lane is set to work on "
                                         f"{added.get('pipeline')}, which is marked private."})
     return out
