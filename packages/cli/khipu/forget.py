@@ -89,14 +89,27 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
     shared_identities: list[dict[str, Any]] = []
     from khipu.capture_identity import sources_for_episode, sources_ready
 
+    raw = None
+    try:
+        cur.execute("SELECT raw FROM episodes WHERE id = %s", (episode_id,))
+        raw_row = cur.fetchone()
+        raw = raw_row[0] if isinstance(raw_row, tuple) and len(raw_row) == 1 else None
+    except Exception:  # noqa: BLE001 — old schema/driver must still forget the hub row
+        raw = None
     if sources_ready(cur):
         # Every source row, origin and merged, keeps the (ts, summary_md5) it
         # was first written under, so each legacy line this episode ever had
         # is named exactly, whatever edits and merges did to the live summary
         # since (RSN-6). The live identity above stays first.
         source_rows = sources_for_episode(cur, episode_id)
+        # Recording a source row fails open, so the rows can be a subset of
+        # the sources raw names. Each missing one is rebuilt from raw, or
+        # counted as unidentified when raw no longer carries its payload.
+        recovered, missing = _sources_missing_from_rows(raw, source_rows)
+        source_rows = [*source_rows, *recovered]
+        unidentified_sources += missing
         has_merged_sources = any(src["role"] == "merged" for src in source_rows)
-        unidentified_sources = sum(1 for src in source_rows
+        unidentified_sources += sum(1 for src in source_rows
                                    if src["ts"] is None or src["summary_md5"] is None)
         from_sources: list[dict[str, Any]] = []
         for src in source_rows:
@@ -123,28 +136,16 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
             held = {int(r[0]) - 1 for r in cur.fetchall()}
             shared_identities = [from_sources[i] for i in sorted(held)]
             legacy_identities = [i for i in legacy_identities if i not in shared_identities]
-    # Pre-0027 hub (or no source row recorded): an edited summary can still have an original legacy
-    # identity in raw. For merged episodes, raw describes a retained source,
+    # Pre-0027 hub (or a 0027 hub where raw named nothing to recover): an
+    # edited summary can still have an original legacy identity in raw. For merged episodes, raw describes a retained source,
     # not an identity that forget can safely erase without a capture-identity
     # contract.
-    try:
-        cur.execute("SELECT raw FROM episodes WHERE id = %s", (episode_id,))
-        raw_row = cur.fetchone()
-        raw = raw_row[0] if isinstance(raw_row, tuple) and len(raw_row) == 1 else None
-        if isinstance(raw, dict) and not source_rows:
-            has_merged_sources = bool(raw.get("merged_from"))
-            original_ts = raw.get("ts")
-            original_summary = raw.get("summary")
-            if (not has_merged_sources and isinstance(original_ts, str)
-                    and isinstance(original_summary, str) and original_summary):
-                original = {
-                    "ts": original_ts,
-                    "summary_md5": hashlib.md5(original_summary.encode("utf-8")).hexdigest(),
-                }
-                if any(original[key] != legacy_identities[0][key] for key in ("ts", "summary_md5")):
-                    legacy_identities.append(original)
-    except Exception:  # noqa: BLE001 — old schema/driver must still forget the hub row
-        pass
+    if isinstance(raw, dict) and not source_rows:
+        has_merged_sources = bool(raw.get("merged_from"))
+        original = _raw_identity(raw)
+        if (not has_merged_sources and original is not None
+                and any(original[key] != legacy_identities[0][key] for key in ("ts", "summary_md5"))):
+            legacy_identities.append(original)
     cur.execute(
         "UPDATE episodes SET deleted_at = now() WHERE id = %s AND deleted_at IS NULL",
         (episode_id,),
@@ -210,6 +211,65 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         "unidentified_sources": unidentified_sources,
         "shared_identities": shared_identities,
     }
+
+
+def _raw_identity(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The (ts, summary_md5) legacy identity a captured payload was mirrored
+    under, or None when the payload lacks either."""
+    ts, summary = payload.get("ts"), payload.get("summary")
+    if not isinstance(ts, str) or not isinstance(summary, str) or not summary:
+        return None
+    return {"ts": ts, "summary_md5": hashlib.md5(summary.encode("utf-8")).hexdigest()}
+
+
+def _sources_missing_from_rows(raw: Any, rows: list[dict[str, Any]]
+                               ) -> tuple[list[dict[str, Any]], int]:
+    """Sources raw names (its own origin and each merge receipt) that no
+    source row covers. Returns rows rebuilt from raw for the ones it can
+    identify, and how many it cannot."""
+    if not isinstance(raw, dict):
+        return [], 0
+    from khipu.capture_identity import has_natural_key, payload_sha256, source_key
+
+    recovered: list[dict[str, Any]] = []
+    missing = 0
+    if not any(row["role"] == "origin" for row in rows):
+        # raw is the origin payload, but a merge rewrites raw.verbatim, so its
+        # payload key is gone; the natural key and the legacy identity survive.
+        ident = _raw_identity(raw)
+        if ident is None:
+            missing += 1
+        else:
+            key = source_key(raw) if has_natural_key(raw) else None
+            recovered.append({"source_key": key, "role": "origin", **ident,
+                              "payload_sha256": None, "recovered": True})
+    hashes = {row.get("payload_sha256") for row in rows} - {None}
+    receipts = raw.get("merged_from") or []
+    if not isinstance(receipts, list):
+        return recovered, missing + 1
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            missing += 1
+            continue
+        payload = receipt.get("payload")
+        source_id = receipt.get("source_id")
+        source_id = source_id if isinstance(source_id, str) else None
+        if source_id in hashes:
+            continue
+        ident = _raw_identity(payload) if isinstance(payload, dict) else None
+        if ident is None:
+            missing += 1
+            continue
+        # A row with the same key covers the receipt only when it names the
+        # same legacy line: a natural key is shared by every re-synthesis of
+        # one transcript span, and the merged row loses that key conflict.
+        key = source_key(payload)
+        if any(row["source_key"] == key and _same_identity(ident, row) for row in rows):
+            continue
+        recovered.append({"source_key": key, "role": "merged", **ident,
+                          "payload_sha256": source_id or payload_sha256(payload),
+                          "recovered": True})
+    return recovered, missing
 
 
 def _same_identity(a: dict[str, Any], b: dict[str, Any]) -> bool:

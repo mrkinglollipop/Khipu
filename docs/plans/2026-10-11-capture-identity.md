@@ -9,7 +9,7 @@ CAP-14, ARCH-10, CAP-22, ARCH-8 (P1); review RV1-01 (P0).
 
 | Phase | What | State |
 |---|---|---|
-| 1 | `episode_sources` table, backfill, dual write; nothing reads it yet | built, in review (branch feat/capture-identity-p1) |
+| 1 | `episode_sources` table, backfill, dual write; nothing reads it yet | merged (PR #199) |
 | 2 | Every identity lookup reads sources; `write_pg` returns the episode id | built, in review (branch feat/capture-identity-p2) |
 | 3 | Uniqueness moves to the source key; the three backed-out fixes return | open |
 
@@ -161,6 +161,9 @@ Build notes (phase 2, 2026-10-15):
 - The file-line anti-join counts a line present when either the live identity or any source row matches.
 - Forget leaves a source-derived line that another episode also holds (reported as `legacy_shared`) and
   reports `legacy_file` partial when a source row has no `ts` or `summary_md5`.
+- A source row is recorded fail-open, so forget checks the rows against raw: an origin or a
+  `merged_from` receipt with no row is rebuilt from raw (its payload's `ts` and summary), and one raw
+  can no longer identify is counted as unidentified, which makes the forget partial.
 - Timed on a scratch database with 20,000 episodes and source rows: anti-join over 20,100 keys 182 ms
   (146 ms without the table); source-key lookup 0.09 ms. The live replica and live capture timing gate
   below has not been run.

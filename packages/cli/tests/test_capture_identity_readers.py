@@ -50,6 +50,21 @@ class WritePgReturnsTheIdTest(_WritePgCase):
         self.assertEqual(again["episode_id"], first["episode_id"])
         self.assertEqual(len(cur.episodes), 1)
 
+    def test_replay_of_a_merged_source_is_skipped_by_its_key_alone(self):
+        # A merged source's own columns (session, range, window) differ from
+        # the episode it landed in, so only its recorded key can find it.
+        cur = _SourcesFakeCursor()
+        first = self._write(cur, self._payload())
+        merged = self._payload(session_id="codex:elsewhere", harness="codex",
+                               transcript_range="40:90", window_id="w9",
+                               summary="a capture merged into the first")
+        ident = ci.source_identity(dict(merged))
+        cur.sources[ident["source_key"]] = {"episode_id": first["episode_id"], "role": "merged"}
+        again = self._write(cur, merged)
+        self.assertFalse(again["episode_inserted"])
+        self.assertEqual(again["episode_id"], first["episode_id"])
+        self.assertEqual(len(cur.episodes), 1)
+
     def test_probe_false_reports_the_id_and_dedups_by_columns(self):
         cur = _SourcesFakeCursor(sources=False)
         with _no_sources():
@@ -240,6 +255,12 @@ class _ForgetCur:
             self.shared_queries += 1
             self._all = [(n,) for n, md in enumerate(params[1], 1) if md in self.shared_md5]
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
     def fetchone(self):
         return self._one
 
@@ -250,7 +271,7 @@ class _ForgetCur:
 class ForgetReaderTest(unittest.TestCase):
     TS = datetime(2026, 10, 1, 9, 0, 0, tzinfo=timezone.utc)
     RAW = {"ts": "2026-10-01T09:00:00Z", "summary": "first text",
-           "merged_from": [{"source_id": "x", "ts": "2026-10-01T09:02:00Z"}]}
+           "merged_from": [{"source_id": "p2", "ts": "2026-10-01T09:02:00Z"}]}
 
     def test_identities_come_from_every_source_row(self):
         sources = [("k1", "origin", self.TS, _md5("first text"), None),
@@ -289,9 +310,76 @@ class ForgetReaderTest(unittest.TestCase):
 
     def test_source_rows_without_a_timestamp_or_md5_are_counted(self):
         sources = [("k1", "origin", None, _md5("first text"), None),
-                   ("k2", "merged", self.TS, None, None)]
+                   ("k2", "merged", self.TS, None, "p2")]
         cur = _ForgetCur((self.TS, "edited text", "claude_code:a"), self.RAW, sources)
         self.assertEqual(forget.forget_episode(cur, 3)["unidentified_sources"], 2)
+
+    def test_a_merged_source_without_its_row_is_recovered_from_raw(self):
+        # The origin row was recorded but the merged one failed open: forget
+        # must still erase the merged legacy line and report its queued copy.
+        a = {"ts": "2026-10-01T09:00:00Z", "summary": "original fixture A", "harness": "codex",
+             "session_id": "codex:fixtureA", "transcript_range": "0:10"}
+        b = {"ts": "2026-10-01T09:02:00Z", "summary": "merged fixture B", "harness": "codex",
+             "session_id": "codex:fixtureB", "transcript_range": "0:10"}
+        raw = {**a, "merged_from": [{"source_id": ci.payload_sha256(b), "payload": b,
+                                     "ts": b["ts"]}]}
+        sources = [(ci.source_key(a), "origin", self.TS, _md5(a["summary"]),
+                    ci.payload_sha256(a))]
+        cur = _ForgetCur((self.TS, "combined fixture A and B", a["session_id"]), raw, sources)
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
+                mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot",
+                           return_value={"ok": True}), \
+                mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(Path(td) / "outbox")}):
+            import json
+
+            path = Path(td) / "episodes.jsonl"
+            path.write_text(json.dumps(a) + "\n" + json.dumps(b) + "\n")
+            job = outbox.enqueue(b)
+            out = forget.forget_everywhere(3, memory_root=Path(td))
+            left = path.read_text()
+        self.assertEqual(left, "")
+        self.assertFalse(out["complete"])
+        self.assertIn("outbox", out["partial"])
+        self.assertTrue(out["remaining"][0].endswith(str(job)))
+
+    def test_a_receipt_without_a_row_or_payload_is_unidentified(self):
+        sources = [("k1", "origin", self.TS, _md5("first text"), None)]
+        raw = {**self.RAW, "merged_from": [{"source_id": "gone", "ts": "2026-10-01T09:02:00Z"}]}
+        cur = _ForgetCur((self.TS, "edited text", "claude_code:a"), raw, sources)
+        self.assertEqual(forget.forget_episode(cur, 3)["unidentified_sources"], 1)
+
+    def test_a_receipt_sharing_the_origin_key_with_other_content_is_recovered(self):
+        a = {"ts": "2026-10-01T09:00:00Z", "summary": "first text", "harness": "codex",
+             "session_id": "codex:a", "transcript_range": "0:10"}
+        b = {**a, "ts": "2026-10-01T09:02:00Z", "summary": "a re-synthesis"}
+        self.assertEqual(ci.source_key(a), ci.source_key(b))
+        raw = {**a, "merged_from": [{"source_id": ci.payload_sha256(b), "payload": b}]}
+        sources = [(ci.source_key(a), "origin", self.TS, _md5("first text"),
+                    ci.payload_sha256(a))]
+        cur = _ForgetCur((self.TS, "edited text", "codex:a"), raw, sources)
+        out = forget.forget_episode(cur, 3)
+        self.assertIn(_md5("a re-synthesis"), {i["summary_md5"] for i in out["legacy_identities"]})
+
+    def test_malformed_receipts_are_unidentified_not_a_crash(self):
+        sources = [("k1", "origin", self.TS, _md5("first text"), None)]
+        for merged_from, missing in ((5, 1), ("x", 1), ([{"source_id": ["p"]}], 1),
+                                     ([{"source_id": {"a": 1}, "payload": 7}], 1)):
+            raw = {**self.RAW, "merged_from": merged_from}
+            cur = _ForgetCur((self.TS, "edited text", "claude_code:a"), raw, sources)
+            self.assertEqual(forget.forget_episode(cur, 3)["unidentified_sources"], missing,
+                             merged_from)
+
+    def test_an_origin_without_its_row_is_recovered_from_raw(self):
+        sources = [("k2", "merged", datetime(2026, 10, 1, 9, 2, tzinfo=timezone.utc),
+                    _md5("second capture"), "p2")]
+        raw = {**self.RAW, "session_id": "claude_code:a", "transcript_range": "0:9"}
+        cur = _ForgetCur((self.TS, "edited text", "claude_code:a"), raw, sources)
+        out = forget.forget_episode(cur, 3)
+        self.assertIn(_md5("first text"), {i["summary_md5"] for i in out["legacy_identities"]})
+        origin = [r for r in out["source_rows"] if r["role"] == "origin"]
+        self.assertEqual([r["source_key"] for r in origin], [ci.source_key(raw)])
+        self.assertEqual(out["unidentified_sources"], 0)
 
     def _everywhere(self, result):
         cur = mock.MagicMock()

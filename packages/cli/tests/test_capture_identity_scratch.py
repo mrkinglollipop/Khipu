@@ -184,5 +184,18 @@ class MergedEpisodeScratchTest(unittest.TestCase):
         self.assertIn(other["summary"], left)
 
 
+    def test_forget_recovers_a_merged_source_whose_row_was_never_recorded(self):
+        # Recording a source row fails open; raw's merge receipt still names B.
+        other = self._edit_a_and_write_file()
+        with _direct_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM episode_sources WHERE episode_id = %s AND role = 'merged'",
+                            (self.a_id,))
+                self.assertEqual(cur.rowcount, 1)
+            conn.commit()
+        out = self._forget()
+        self.assertTrue(out["complete"], out.get("partial_errors"))
+        self.assertEqual(self._file_summaries(), [other["summary"]])
+
 if __name__ == "__main__":
     unittest.main()
