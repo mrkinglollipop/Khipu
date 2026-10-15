@@ -69,8 +69,9 @@ def _jaccard(a: str, b: str) -> float:
 
 
 def _source_receipt(payload: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
-                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+    from khipu.capture_identity import payload_sha256
+
+    return payload_sha256(payload)
 
 
 def _dedup_exact_window(cur, payload: dict[str, Any]) -> int | None:
@@ -384,6 +385,11 @@ def _merge_into_episode(
     params.append(target_id)
     cur.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id = %s", params)
 
+    from khipu.capture_identity import record_source, source_identity
+
+    record_source(cur, target_id, "merged", source_identity(payload),
+                  ts=payload.get("ts"), summary=payload.get("summary"))
+
     # The merged capture's own open/closed loops belong to the target episode
     # — same call the insert path makes in write_pg, same SAVEPOINT fail-open.
     try:
@@ -622,6 +628,12 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                 from khipu.identity import _resolve_project_alias
 
                 payload["project"] = _resolve_project_alias(cur, payload["project"]) or payload["project"]
+            # The source identity is taken here, as the payload stands when a
+            # merge would record it, before ingestion rewrites topics, tags
+            # and scope below.
+            from khipu.capture_identity import source_identity
+
+            source = source_identity(payload)
             dedup = dedup_before_insert(cur, payload)
             if dedup["action"] in ("skip", "merge"):
                 conn.commit()
@@ -694,7 +706,7 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
 
             payload["scope"] = normalize_scope(payload.get("scope"))
 
-            inserted = _upsert_episode(cur, payload)
+            inserted = _upsert_episode(cur, payload, source=source)
             if not inserted:
                 cur.execute(
                     "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",

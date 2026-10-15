@@ -141,3 +141,16 @@ def table_columns(cur, table: str) -> set[str]:
 def has_columns(cur, table: str, *names: str) -> bool:
     cols = table_columns(cur, table)
     return all(name in cols for name in names)
+
+
+def has_table(cur, table: str) -> bool:
+    """Whether ``table`` exists, sharing ``table_columns``' cache. Only a yes
+    is cached: a long-lived process (MCP server, gateway) that started before
+    a migration must see the new table on its next write, not after a restart."""
+    if _TABLE_COLUMNS_CACHE.get(table):
+        return True
+    _TABLE_COLUMNS_CACHE.pop(table, None)
+    cols = table_columns(cur, table)
+    if not cols:
+        _TABLE_COLUMNS_CACHE.pop(table, None)
+    return bool(cols)
