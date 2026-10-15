@@ -1,0 +1,159 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Khipu Settings mock: Capture &amp; models, before</title><link rel="stylesheet" href="App.css"><link rel="stylesheet" href="capture-models.css"></head>
+<!-- Before: Settings → Capture & models as v0.4.15 draws it (App.tsx settingsSection "capture", CaptureTuningCard, SynthProviderFields, SummariserBudgetCard, PlansSettingsCard, Keys). Two em-dashes in today's strings are drawn as colons here. -->
+<body><div id="root"><div class="shell">
+<nav class="rail" aria-label="Primary"><div class="rail-drag"></div>
+<div class="brand"><img class="brand-icon" src="../../../apps/desktop/src/assets/khipu-icon.png" width="26" height="26" alt=""><span class="brand-name">Khipu</span></div>
+<div class="rail-nav"><div class="nav-group">
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 8 4l5 4.5V13H3z"/></svg><span class="nav-label">Home</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4"/><path d="m10 10 3.5 3.5"/></svg><span class="nav-label">Recall</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h10M3 8h7M3 12h5"/><path d="m11 11 1.5 1.5L15 10"/></svg><span class="nav-label">Owed</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></svg><span class="nav-label">Activity</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v3M11 3v3M3 6h10v3a5 5 0 0 1-10 0z"/><path d="M8 11v3"/></svg><span class="nav-label">Harnesses</span></button>
+<button type="button" class="nav active" aria-current="page"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h10M3 11h10"/><circle cx="6" cy="5" r="1.5"/><circle cx="10" cy="11" r="1.5"/></svg><span class="nav-label">Settings</span></button>
+</div></div>
+<div class="rail-foot"><div class="rail-health"><span class="hdot ok" aria-hidden="true"></span><span>All harnesses recording</span></div>
+<div class="rail-meta"><button type="button" class="rail-feedback">Feedback</button><span class="version-chip">v0.4.15</span></div></div></nav>
+<main class="main"><section class="panel"><header class="panel-head"><div class="panel-head-text"><h1>Settings</h1><p class="lede">Capture, models, data and this Mac.</p></div></header>
+<div class="panel-body wide settings-body">
+<div class="settings-split">
+<div class="subnav" role="tablist" aria-label="Settings sections">
+<button type="button" role="tab" aria-selected="false">Database</button>
+<button type="button" role="tab" aria-selected="true" class="on">Capture &amp; models</button>
+<button type="button" role="tab" aria-selected="false">Routing</button>
+<button type="button" role="tab" aria-selected="false">Optional features</button>
+<button type="button" role="tab" aria-selected="false">Embeddings</button>
+<button type="button" role="tab" aria-selected="false">Data &amp; backups</button>
+<button type="button" role="tab" aria-selected="false">Another Mac</button>
+<button type="button" role="tab" aria-selected="false">Components</button>
+<button type="button" role="tab" aria-selected="false">Updates</button>
+<button type="button" role="tab" aria-selected="false">Advanced</button>
+</div>
+<div class="settings-pane">
+
+<!-- 1. Capture -->
+<div class="section-card">
+<div class="section-head">Capture</div>
+<div class="section-body">
+<div class="rows">
+<div class="row-item"><span class="row-main">Capture a session after</span><span class="row-meta">5 turns, or 20 minutes</span></div>
+<div class="row-item"><span class="row-main">Secrets</span><span class="row-meta wrap">API keys, tokens, private keys and passwords in connection strings are masked before a transcript reaches the summariser and before any capture is stored</span></div>
+</div>
+<p class="muted">Always captures before a compaction and when a session ends. This cadence is the engine's own, the same on every harness; it is not editable from here.</p>
+</div></div>
+
+<!-- 2. How captures are stored (CaptureTuningCard) -->
+<div class="section-card">
+<div class="section-head">How captures are stored</div>
+<div class="section-body">
+<div class="set-field">
+<div class="set-labelrow"><label class="set-label" for="b-mode">Where a capture is written</label></div>
+<div class="toolbar"><select id="b-mode" aria-describedby="b-mode-help"><option>Files only</option><option selected>Files and Khipu</option><option>Khipu only</option></select></div>
+<p id="b-mode-help" class="set-help">The capture script writes files and Khipu stores each capture too.</p>
+</div>
+<form class="set-field narrow"><div class="set-labelrow"><label class="set-label" for="b-dedup">Merge near-duplicate captures at</label></div>
+<div class="toolbar"><input id="b-dedup" class="mono" value="0.92" inputmode="decimal" aria-describedby="b-dedup-help"><button type="submit" disabled>Save</button></div>
+<p id="b-dedup-help" class="set-help">Sets the meaning-based threshold from 0 to 1. An independent word matching rule can also merge close captures. Default 0.92.</p></form>
+<form class="set-field narrow"><div class="set-labelrow"><label class="set-label" for="b-close">Close an open commitment at</label></div>
+<div class="toolbar"><input id="b-close" class="mono" value="0.85" inputmode="decimal" aria-describedby="b-close-help"><button type="submit" disabled>Save</button></div>
+<p id="b-close-help" class="set-help">Sets the meaning-based closure threshold from 0 to 1. A separate word and completion rule can also close a commitment. Default 0.85.</p></form>
+<form class="set-field"><div class="set-labelrow"><label class="set-label" for="b-names">Your names</label></div>
+<div class="toolbar"><input id="b-names" value="alex, al" aria-describedby="b-names-help"><button type="submit" disabled>Save</button></div>
+<p id="b-names-help" class="set-help">Names that mean you when Khipu decides who owns a commitment. Separate them with commas.</p></form>
+</div></div>
+
+<!-- 3. Models (SynthProviderFields with Claude Haiku chosen) -->
+<div class="section-card">
+<div class="section-head">Models</div>
+<div class="section-body">
+<p class="muted">Session summaries follow this card: an API key (Gemini, Claude Haiku, OpenAI, OpenRouter), the Claude or ChatGPT login you already use, or a local OpenAI-compatible endpoint. The monthly topic pass runs its own model and is not switched here. The model that searches by meaning is chosen under Embeddings.</p>
+<div class="rows before-provider" style="margin-bottom:12px">
+<div class="rows-head">Session summaries</div>
+<div class="toolbar"><label class="muted" for="models-synth-provider">Provider</label>
+<select id="models-synth-provider"><option>Gemini Flash (API key)</option><option selected>Claude Haiku (API key)</option><option>OpenAI (API key)</option><option>OpenRouter (one key, any model)</option><option>Claude on my own login (claude -p)</option><option>ChatGPT on my own login (codex)</option><option>local</option></select></div>
+<div>
+<p class="set-help">Claude Haiku 5.5: the best memory, first in 10 of 15 judged windows, 3 wrong or invented items, about 11 s a capture.</p>
+<p class="set-help">GPT-6 Luna: accurate where it answers (2 wrong items) but thin on open loops; about 8 s a capture at low effort, 50 s at high.</p>
+<p class="set-help">Gemini 2.5 Flash: the fastest, about 3 s, and last on quality: no first places, about 10 wrong or invented items.</p>
+<p class="set-help">Measured 2026-10-13 on 15 real windows. Gemini stays the embedder for search by meaning whichever summariser you pick.</p>
+</div>
+<div class="toolbar"><input class="mono" disabled aria-label="Summariser endpoint" placeholder="http://127.0.0.1:11434"><input class="mono" value="claude-haiku-5-5" aria-label="Summariser model id"></div>
+<div class="set-field">
+<div class="inline"><span class="tag ok"><span class="dot" aria-hidden="true"></span>Key present</span><span class="meta">Keychain</span></div>
+<div class="toolbar"><input class="mono" type="password" aria-label="Claude Haiku (API key) key" placeholder="A key is stored: type a new one to replace it"><button type="button" disabled>Set key</button></div>
+<p class="set-help">Stored in the login Keychain; never written to the repo or a config file.</p>
+</div>
+<div class="set-field">
+<div class="toolbar"><label class="muted" for="models-synth-fallback">If the provider fails</label>
+<select id="models-synth-fallback"><option selected>Retry that window on Gemini Flash</option><option>Do not fall back; the capture waits and is retried later</option></select></div>
+<p class="set-help">Fallback calls are billed to the Gemini key, about $0.002 per window, and count under By provider as gemini. Nothing is ever dropped either way: with no fallback the capture waits in the queue and is retried.</p>
+</div>
+</div>
+<div class="toolbar"><button type="button" class="primary">Save models</button></div>
+</div></div>
+
+<!-- 4. Summariser calls per day (SummariserBudgetCard) -->
+<div class="section-card">
+<div class="section-head">Summariser calls per day</div>
+<div class="section-body">
+<div class="rows">
+<div class="row-item"><span class="row-main">Today</span><span class="row-meta">12 of 5,000 calls today (default)</span></div>
+<div class="row-item"><span class="row-main">Estimated cost today</span><span class="row-meta">$0.03</span></div>
+<div class="row-item"><span class="row-main">By provider</span><span class="row-meta wrap">Claude Haiku (API key): 12 calls, $0.03</span></div>
+</div>
+<form class="set-field narrow"><div class="set-labelrow"><label class="set-label" for="b-cap">Daily ceiling</label></div>
+<div class="toolbar"><input id="b-cap" class="mono" value="5000" inputmode="decimal" aria-describedby="b-cap-help"><button type="submit" disabled>Save</button></div>
+<p id="b-cap-help" class="set-help">0 means no ceiling. When the ceiling is reached, captures wait in the queue until UTC midnight; nothing is dropped.</p></form>
+<div class="toolbar"><button type="button">Lift for today</button><span class="muted">Resets today's count, so the full ceiling is available again until UTC midnight.</span></div>
+</div></div>
+
+<!-- 5. Plans (PlansSettingsCard) -->
+<div class="section-card">
+<div class="section-head">Plans</div>
+<div class="section-body">
+<div class="rows plan-account" role="group" aria-label="Claude main">
+<div class="row-item"><span class="row-main">Claude main<span class="meta"> max</span></span><span class="row-meta">default login · figures from 17s ago</span></div>
+<div class="row-item"><span class="plan-reach"><span class="tag ok"><span class="dot" aria-hidden="true"></span>Live: read 17s ago</span></span></div>
+<div class="row-item plan-window"><span class="plan-wname">five-hour</span><span class="plan-meter" role="meter" aria-label="Claude main Max five-hour" aria-valuemin="0" aria-valuemax="100" aria-valuenow="34"><i style="width:34%"></i></span><span class="plan-pct">34%</span><span class="row-meta">resets 6:10 PM</span></div>
+<div class="row-item plan-window"><span class="plan-wname">week</span><span class="plan-meter" role="meter" aria-label="Claude main Max week" aria-valuemin="0" aria-valuemax="100" aria-valuenow="61"><i style="width:61%"></i></span><span class="plan-pct">61%</span><span class="row-meta">resets Sat 3:00 PM</span></div>
+</div>
+<div class="rows plan-account" role="group" aria-label="Codex">
+<div class="row-item"><span class="row-main">Codex<span class="meta"> pro</span></span><span class="row-meta">default login · figures from 17s ago</span></div>
+<div class="row-item"><span class="plan-reach"><span class="tag ok"><span class="dot" aria-hidden="true"></span>Live: read 17s ago</span></span></div>
+<div class="row-item plan-window"><span class="plan-wname">five-hour</span><span class="plan-meter" role="meter" aria-label="Codex Pro five-hour" aria-valuemin="0" aria-valuemax="100" aria-valuenow="8"><i style="width:8%"></i></span><span class="plan-pct">8%</span><span class="row-meta">resets 7:25 PM</span></div>
+<div class="row-item plan-window"><span class="plan-wname">week</span><span class="plan-meter warn" role="meter" aria-label="Codex Pro week" aria-valuemin="0" aria-valuemax="100" aria-valuenow="78"><i style="width:78%"></i></span><span class="plan-pct warn">78%</span><span class="row-meta">resets Thu Oct 22 6:13 AM</span></div>
+</div>
+<div class="rows plan-account" role="group" aria-label="Grok Build">
+<div class="row-item"><span class="row-main">Grok Build<span class="meta"> SuperGrok</span></span><span class="tag warn">reported an error</span><span class="row-meta">default login · last tried 17s ago</span></div>
+<div class="row-item"><span class="plan-reach"><span class="tag warn"><span class="dot" aria-hidden="true"></span>Can't be read just now (reported an error)</span><span class="meta">Sign in from Grok Build</span></span></div>
+<div class="row-item"><span class="row-main t2">reported an error</span></div>
+</div>
+<div class="rows plan-account" role="group" aria-label="Muse">
+<div class="row-item"><span class="row-main">Muse</span><span class="row-meta">default login · last tried 17s ago</span></div>
+<div class="row-item"><span class="plan-reach"><span class="tag ok"><span class="dot" aria-hidden="true"></span>Live: read 17s ago</span></span></div>
+<div class="row-item"><span class="row-main t2">no turn observed yet</span></div>
+</div>
+<div class="toolbar"><button type="button" class="sm"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/></svg>Probe now</button><span class="muted">Asks every CLI again now; takes up to about seven seconds.</span></div>
+<div class="set-field">
+<div class="set-labelrow"><span class="set-label" id="b-acc-head">Accounts read</span><span class="tag">Default</span></div>
+<p class="set-help">Every installed CLI is read with its default login. Add an account to read a second login, such as another Claude or Grok sign-in.</p>
+<form class="toolbar" aria-label="Add an account"><label class="muted" for="b-acc-name">Name</label><input id="b-acc-name" placeholder="Claude second…"><label class="muted" for="b-acc-cli">CLI</label><select id="b-acc-cli"><option>Claude Code</option><option>Codex</option><option>Grok Build</option><option>Muse</option></select><label class="muted" for="b-acc-home">Login folder</label><input id="b-acc-home" placeholder="~/.claude-second…"><button type="submit" class="sm">Add</button></form>
+<p class="set-help">The login folder is where that CLI keeps a second sign-in; leave it empty for the default login. With no Name, the account is named after its CLI and login folder.</p>
+</div>
+</div></div>
+
+<!-- 6. Keys -->
+<div class="section-card">
+<div class="section-head">Keys</div>
+<div class="section-body">
+<label class="muted" for="gemini-key">Gemini API key: session summaries and the search index. Stored in the login Keychain; never written to the repo or a config file.</label>
+<div class="toolbar"><input id="gemini-key" class="mono" type="password" placeholder="A key is stored: type a new one to replace it"><button type="button" disabled>Save key</button></div>
+<label class="muted" for="openai-compat-key">Optional key for a local OpenAI-compatible endpoint (Ollama can leave this blank).</label>
+<div class="toolbar"><input id="openai-compat-key" class="mono" type="password" placeholder="sk-… (optional)"><button type="button" disabled>Save local key</button></div>
+<p class="muted">Currently stored: Gemini <strong>yes</strong>; local endpoint <strong>no</strong>. An environment variable <code>GEMINI_API_KEY</code> takes precedence over the stored Gemini key.</p>
+</div></div>
+
+</div>
+</div>
+</div>
+</section></main></div></div></body></html>
