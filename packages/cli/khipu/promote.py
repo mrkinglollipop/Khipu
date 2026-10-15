@@ -602,11 +602,24 @@ def _parse_summary(line: str) -> dict[str, Any] | None:
             "legs": legs.group("legs") if legs else None}
 
 
-def _read_tail(path: Path, max_bytes: int = REPLAY_TAIL_BYTES) -> str:
+def _read_tail(path: Path, max_bytes: int = REPLAY_TAIL_BYTES) -> list[str]:
+    """The whole lines in the last ``max_bytes`` of ``path``, each decoded as
+    strict UTF-8: the queries are compared and replayed, and replacing a bad
+    byte can merge two of them, so an undecodable line is skipped."""
     with open(path, "rb") as fh:
         size = fh.seek(0, os.SEEK_END)
-        fh.seek(max(0, size - max_bytes))
-        return fh.read().decode("utf-8", errors="replace")
+        offset = max(0, size - max_bytes)
+        fh.seek(offset)
+        data = fh.read()
+    if offset:
+        data = data.partition(b"\n")[2]  # the seek may land inside a line
+    out = []
+    for raw in data.split(b"\n"):
+        try:
+            out.append(raw.decode("utf-8").removesuffix("\r"))
+        except UnicodeDecodeError:
+            continue
+    return out
 
 
 def sample_queries(log: Path, n: int = 5, *, now: float | None = None) -> list[dict[str, Any]]:
@@ -618,11 +631,11 @@ def sample_queries(log: Path, n: int = 5, *, now: float | None = None) -> list[d
 
     now = time.time() if now is None else now
     try:
-        text = _read_tail(Path(log))
+        lines = _read_tail(Path(log))
     except OSError:
         return []
     seen: dict[str, dict[str, Any]] = {}
-    for line in split_lines(text):
+    for line in lines:
         try:
             row = json.loads(line)
         except ValueError:

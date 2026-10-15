@@ -364,6 +364,19 @@ class DecodingPolicyTest(unittest.TestCase):
         with self.assertRaises(UnicodeDecodeError):
             recall_eval.load_replay_entries(log)
 
+    def test_promote_sample_skips_corrupt_queries_instead_of_merging_them(self):
+        # The promote gate replays these queries as hook stdin; replacing the
+        # bad byte merged two distinct queries into one corrupted one.
+        import time as _time
+        from khipu import promote
+
+        stamp = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+        log = self.dir / "query_log.jsonl"
+        log.write_bytes(b"".join(
+            b'{"ts": "%s", "query": "%s"}\n' % (stamp.encode(), q)
+            for q in (b"find caf\xe9 notes", b"find caf\xe8 notes", b"plain")))
+        self.assertEqual([r["prompt"] for r in promote.sample_queries(log)], ["plain"])
+
     def test_run_text_encodes_stdin_strictly_and_decodes_output_with_replacement(self):
         from khipu import lines
 
