@@ -1744,6 +1744,11 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     rules: dict[int, dict] = {}
     note: dict | None = None
     seed: dict | None = None
+    # The newest written change to each entity (an owner's pause, lift,
+    # clear or dismissal, a hold or its end, a rule's or the note's change):
+    # who wrote it and through what. A version's Recent changes names its
+    # author from this, never from the state left after it (fix round 1).
+    causes: dict[str, dict] = {}
     for event in events:
         kind = event.get("type")
         if kind == "evidence":
@@ -1754,6 +1759,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         info = _owner_event(event)
         if info["at"] is None:
             continue
+        touched = _touched(kind, event, info)
+        if touched:
+            causes[touched] = {"at": info["at"], "seq": info["seq"], "written_by": info["written_by"],
+                               "via": info["via"]}
         if kind in ("pause", "lift", "clear") and info["account"]:
             owner[{"pause": "pauses", "lift": "lifts", "clear": "clears"}[kind]][info["account"]] = info
         elif kind == "dismiss" and info["target"]:
@@ -1905,7 +1914,25 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         effective["table"] = {"hash": table.get("hash"), "error": bool(table.get("error"))}
     return {"accounts": entries, "holds": active_holds, "rules": active_rules, "note": note_out,
             "unmatched": lanes, "outside_app": outside_app, "seed": seed, "sources": sources,
-            "valid_until": _iso(min(future)) if future else None, "effective": effective}
+            "valid_until": _iso(min(future)) if future else None, "effective": effective,
+            "causes": {k: dict(c, at=_iso(c["at"])) for k, c in causes.items()}}
+
+
+def _touched(kind: str | None, event: dict, info: dict) -> str | None:
+    """The entity a written (non-evidence) line changes, as the view's
+    ``effective`` names it, or None."""
+    if kind in ("pause", "lift", "clear", "dismiss") and info["account"]:
+        return f"account:{info['account']}"
+    if kind == "hold" and event.get("id"):
+        return f"hold:{event['id']}"
+    if kind == "hold_end" and info["target"]:
+        return f"hold:{info['target']}"
+    if kind in ("rule_add", "rule_edit", "rule_retire", "rule_restore", "rule_confirm") \
+            and isinstance(event.get("n"), int):
+        return f"rule:{event['n']}"
+    if kind in ("note_set", "note_end"):
+        return "note"
+    return None
 
 
 # ---- the view: refold on read, versions -----------------------------------------------
@@ -2039,6 +2066,9 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
     (an account's label in config.json can hold one), so the view can
     always be saved and compares equal to itself once saved."""
     body = _scrub(body)
+    # Kept only to name each change's author below; never saved or shown.
+    causes = body.pop("causes", None) or {}
+    since_at = _parse((prev or {}).get("folded_at"))
     prev_effective = (prev or {}).get("effective") or {}
     version = int((prev or {}).get("version") or 0)
     changes = [_without_table_text(c) for c in (prev or {}).get("changes") or []]
@@ -2058,7 +2088,8 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
         view_for_lines = dict(body, version=version)
         changes.append({"version": version, "at": _iso(now), "entities": changed,
                         "lines": [change_line(k, view_for_lines, now, prev_effective) for k in changed],
-                        "items": [_change_item(k, body, prev_effective) for k in changed]})
+                        "items": [_change_item(k, body, prev_effective, causes, since_at)
+                                  for k in changed]})
         changes = changes[-CHANGES_KEPT:]
     out = dict(body, schema=SCHEMA, epoch=epoch, version=version, folded_at=_iso(now), checked_at=_iso(now),
                record=record, bad_lines=bad, fingerprint=fingerprint, changes=changes)
@@ -2070,35 +2101,43 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
     return out
 
 
-def _change_item(entity: str, body: dict, prev_effective: dict) -> dict:
+def _change_item(entity: str, body: dict, prev_effective: dict, causes: dict | None = None,
+                 since_at: datetime | None = None) -> dict:
     """One changed entity in a version, kept so the app can word Recent
     changes in its own (local) times: what it says now and said before (its
-    effective view, None when it ended or began), and who caused it: the
-    shown report's source and author for an account, the hold's author, or
-    the owner for a rule and the note."""
+    effective view, None when it ended or began), and who caused it.
+
+    The author and ``via`` come from the event that made the change: the
+    newest written line on that entity in this version (``causes``, written
+    at or after the last saved fold, ``since_at``). For an account, a report
+    newer than that line is the cause instead. A change no line in this
+    version made (a limit or a hold running out, a report going stale) is
+    the clock's: an account names the report it now shows, anything else
+    names no author."""
     kind, _, ident = entity.partition(":")
     item: dict[str, Any] = {"entity": entity, "now": body["effective"].get(entity),
                             "was": prev_effective.get(entity)}
+    latest = cause = (causes or {}).get(entity)
+    if cause is not None and since_at is not None and (_parse(cause.get("at")) or since_at) < since_at:
+        cause = None  # written before this version: not what changed it
     author = source = via = None
     if kind == "account":
         entry = next((a for a in body["accounts"] if a["key"] == ident), None) or {}
         w = entry.get("witness") or entry.get("last_seen") or {}
-        source, author = w.get("source"), w.get("written_by")
-        if entry.get("state") == PAUSED:
-            source, author = "owner", OWNER
-    elif kind == "hold":
-        hold = next((h for h in body["holds"] if h["id"] == ident), None)
-        if hold is not None:
-            author, via = hold.get("written_by"), hold.get("via")
-    elif kind == "rule":
-        rule = next((r for r in body["rules"] if str(r["n"]) == ident), None)
-        author, via = (rule.get("written_by"), rule.get("via")) if rule else (OWNER, None)
-        if rule is None:
+        w_at = _parse(w.get("at"))
+        if cause is not None and (w.get("cleared") or w_at is None or w_at <= _parse(cause.get("at"))):
+            source, author, via = "owner", cause.get("written_by"), cause.get("via")
+        elif entry.get("state") == PAUSED:
+            # Paused before this version; the pause still shows.
+            source, author, via = "owner", (latest or {}).get("written_by") or OWNER, (latest or {}).get("via")
+        else:
+            source, author, via = w.get("source"), w.get("written_by"), w.get("via")
+    elif kind in ("hold", "rule") or entity == "note":
+        if cause is not None:
+            author, via = cause.get("written_by"), cause.get("via")
+        if kind == "rule" and item["now"] is None:
             # A removed rule's words, so the app can offer to bring it back.
             item["n"] = int(ident) if ident.isdigit() else None
-    elif entity == "note":
-        note = body.get("note")
-        author, via = (note.get("written_by"), note.get("via")) if note else (OWNER, None)
     else:
         source = kind
     item.update(source=source, written_by=author, via=via)
@@ -2524,7 +2563,8 @@ def clear(account: str, *, report_id: str | None = None, via: str, now: datetime
     """Clear the account (treat it as open until something newer reports on
     it), or with ``report_id`` dismiss that one report: any report the fold
     counts for that account, one a job runner's lane reaches through the
-    lane map included."""
+    lane map included, and one the view shows for it from a source (a job
+    runner's limit read from its files; fix round 1, F6)."""
     key = resolve_account(account)
     if report_id:
         events, _bad = read_events()
@@ -2533,9 +2573,23 @@ def clear(account: str, *, report_id: str | None = None, via: str, now: datetime
         ids = {str(e.get("id")) for e in events
                if e.get("type") == "evidence" and _evidence_account(e, lane_map, known) == key}
         if report_id not in ids:
+            entry = next((a for a in read_view(now)["accounts"] if a["key"] == key), None) or {}
+            ids |= _shown_report_ids(entry)
+        if report_id not in ids:
             raise RouteError(f"{report_id!r} is not a report about that account")
         return dict(_owner_write({"type": "dismiss", "account": key, "target": report_id}, via), account=key)
     return dict(_owner_write({"type": "clear", "account": key}, via), account=key)
+
+
+def _shown_report_ids(entry: dict) -> set[str]:
+    """The ids of the reports an account's entry shows (what it says, the
+    side that disagrees, the last one seen, each model's), the owner's own
+    clear left out."""
+    items = [entry.get("witness"), entry.get("disagreement"), entry.get("last_seen")]
+    for model in entry.get("models") or []:
+        items += [model, model.get("disagreement")]
+    return {str(i["id"]) for i in items
+            if isinstance(i, dict) and i.get("id") and i.get("source") != "owner" and not i.get("cleared")}
 
 
 def set_note(text: str, *, via: str, now: datetime | None = None) -> dict:

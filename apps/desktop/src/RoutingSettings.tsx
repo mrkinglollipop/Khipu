@@ -102,6 +102,44 @@ function escapeCloses(close: () => void) {
   };
 }
 
+/**
+ * An inline question under the row it changes. Focus moves into it when it
+ * opens, so Escape and Tab work from there; when it closes (answered,
+ * cancelled or Escape) and focus would be lost with it, focus goes to
+ * `back()`, the button that opened it or what took its place (fix round 1, F5).
+ */
+function ConfirmGroup({
+  label,
+  onClose,
+  back,
+  children,
+}: {
+  label: string;
+  onClose: () => void;
+  back: () => HTMLElement | null | undefined;
+  children: ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const backRef = useRef(back);
+  backRef.current = back;
+  useEffect(() => {
+    ref.current?.focus();
+    return () => {
+      requestAnimationFrame(() => {
+        const at = document.activeElement;
+        if (at && at !== document.body) return;
+        const to = backRef.current();
+        if (to?.isConnected) to.focus();
+      });
+    };
+  }, []);
+  return (
+    <div ref={ref} tabIndex={-1} className="route-confirm" role="group" aria-label={label} onKeyDown={escapeCloses(onClose)}>
+      {children}
+    </div>
+  );
+}
+
 function useFocusFirst<T extends HTMLElement>(): RefObject<T | null> {
   const ref = useRef<T>(null);
   useEffect(() => {
@@ -238,6 +276,14 @@ function sideWords(state: string | undefined, by: string, at: string | null | un
   );
 }
 
+/** Whose report a Dismiss button removes, by its source, as the mock words it. */
+const DISMISS_WHO: Record<string, string> = {
+  report: "conversation's",
+  runner: "runner's",
+  probe: "plan check's",
+  check: "reset check's",
+};
+
 function DisagreePanel({ a, w, now }: { a: RouteAccount; w: Writer; now: Date }) {
   const sides: { d: RouteReport; model?: string; sentence: string }[] = [];
   const own = disagreementWords(a, now);
@@ -253,10 +299,22 @@ function DisagreePanel({ a, w, now }: { a: RouteAccount; w: Writer; now: Date })
     <>
       {sides.map(({ d, model, sentence }) => {
         const shown = a.witness;
-        const dismissible = [
-          ...(shown?.source === "report" && shown.id && !model ? [{ id: shown.id, state: a.state }] : []),
-          ...(d.source === "report" && d.id ? [{ id: d.id, state: d.state ?? "" }] : []),
+        // Either side can be dismissed, a job runner's limit too (F6); an
+        // owner's own clear is not a report.
+        const sidesOf = [
+          ...(shown?.id && shown.source && shown.source !== "owner" && !shown.cleared && !model
+            ? [{ id: shown.id, state: a.state, source: shown.source }]
+            : []),
+          ...(d.id && d.source && d.source !== "owner" ? [{ id: d.id, state: d.state ?? "", source: d.source }] : []),
         ];
+        const named = sidesOf.map((x) => `Dismiss the ${DISMISS_WHO[x.source] ?? "other"} report`);
+        const dismissible = sidesOf.map((x, i) => ({
+          ...x,
+          // Two sides from the same kind of source are told apart by what they say.
+          label: named.indexOf(named[i]) !== named.lastIndexOf(named[i])
+            ? `Dismiss the ${DISMISS_WHO[x.source] ?? "other"} “${stateSaid(x.state)}” report`
+            : named[i],
+        }));
         return (
           <div
             key={d.id ?? model ?? "account"}
@@ -287,7 +345,7 @@ function DisagreePanel({ a, w, now }: { a: RouteAccount; w: Writer; now: Date })
                       onClick={() => void w.run(id, "khipu_route_clear", { account: a.key, report: s.id })}
                     >
                       <Busy on={w.busy === id} />
-                      Dismiss the “{stateSaid(s.state)}” report
+                      {s.label}
                     </button>
                   );
                 })}
@@ -423,11 +481,14 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
   const [ending, setEnding] = useState(false);
   const [draft, setDraft] = useState("");
   const editBtn = useRef<HTMLButtonElement>(null);
+  const endBtn = useRef<HTMLButtonElement>(null);
   const fieldId = useId();
   const close = () => {
+    const from = ending ? "end" : "edit";
     setEditing(false);
     setEnding(false);
-    requestAnimationFrame(() => editBtn.current?.focus());
+    // Back to the button that opened it; once the note ended, to Write a note.
+    requestAnimationFrame(() => ((from === "end" ? endBtn.current : null) ?? editBtn.current)?.focus());
   };
   async function save(e: FormEvent) {
     e.preventDefault();
@@ -489,14 +550,14 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
               {note ? "Edit note" : "Write a note"}
             </button>
             {note ? (
-              <button type="button" className="sm" aria-expanded={ending} onClick={() => setEnding((v) => !v)}>
+              <button ref={endBtn} type="button" className="sm" aria-expanded={ending} onClick={() => setEnding((v) => !v)}>
                 End this note
               </button>
             ) : null}
           </div>
         )}
         {ending && note ? (
-          <div className="route-confirm" role="group" aria-label="End your note?" onKeyDown={escapeCloses(close)}>
+          <ConfirmGroup label="End your note?" onClose={close} back={() => endBtn.current ?? editBtn.current}>
             <span>End your note? Conversations stop seeing it on their next prompt. It stays in Recent changes.</span>
             <WriteError w={w} id="note-end" />
             <div className="toolbar">
@@ -515,7 +576,7 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
                 Keep it
               </button>
             </div>
-          </div>
+          </ConfirmGroup>
         ) : null}
         <p className="set-help">
           Conversations see this word for word, right after your standing rules, and it is never shortened. Khipu
@@ -555,9 +616,19 @@ function RuleRow({
   const toConfirm = r.seeded && !r.confirmed;
   const id = `rule:${r.n}`;
   const fieldId = useId();
+  const confirmBtn = useRef<HTMLButtonElement>(null);
+  const editBtn = useRef<HTMLButtonElement>(null);
+  const removeBtn = useRef<HTMLButtonElement>(null);
   const close = () => {
+    const from = mine;
     setAsk(null);
     setEditConfirm(false);
+    if (from === "edit") {
+      // The edit form is not a ConfirmGroup: its field takes focus itself.
+      requestAnimationFrame(() => {
+        if (!document.activeElement || document.activeElement === document.body) editBtn.current?.focus();
+      });
+    }
   };
   const origin = ruleOrigin(r.source, r.date, now);
   return (
@@ -576,11 +647,12 @@ function RuleRow({
       </span>
       <span className="route-acts">
         {toConfirm ? (
-          <button type="button" className="sm" aria-label={`Confirm rule ${r.n}`} aria-expanded={mine === "confirm"} onClick={() => setAsk({ n: r.n, kind: "confirm" })}>
+          <button ref={confirmBtn} type="button" className="sm" aria-label={`Confirm rule ${r.n}`} aria-expanded={mine === "confirm"} onClick={() => setAsk({ n: r.n, kind: "confirm" })}>
             Confirm
           </button>
         ) : null}
         <button
+          ref={editBtn}
           type="button"
           className="sm"
           aria-label={`Edit rule ${r.n}`}
@@ -593,12 +665,12 @@ function RuleRow({
         >
           Edit
         </button>
-        <button type="button" className="sm" aria-label={`Remove rule ${r.n}`} aria-expanded={mine === "remove"} onClick={() => setAsk({ n: r.n, kind: "remove" })}>
+        <button ref={removeBtn} type="button" className="sm" aria-label={`Remove rule ${r.n}`} aria-expanded={mine === "remove"} onClick={() => setAsk({ n: r.n, kind: "remove" })}>
           Remove
         </button>
       </span>
       {mine === "confirm" ? (
-        <div className="route-confirm" role="group" aria-label={`Confirm rule ${r.n}?`} onKeyDown={escapeCloses(close)}>
+        <ConfirmGroup label={`Confirm rule ${r.n}?`} onClose={close} back={() => confirmBtn.current ?? editBtn.current}>
           <span>Confirm rule {r.n} as written? It loses its Seeded mark and stays first in every conversation.</span>
           <WriteError w={w} id={id} />
           <div className="toolbar">
@@ -617,7 +689,7 @@ function RuleRow({
               Cancel
             </button>
           </div>
-        </div>
+        </ConfirmGroup>
       ) : null}
       {mine === "edit" ? (
         <form
@@ -658,7 +730,7 @@ function RuleRow({
         </form>
       ) : null}
       {mine === "remove" ? (
-        <div className="route-confirm" role="group" aria-label={`Remove rule ${r.n}?`} onKeyDown={escapeCloses(close)}>
+        <ConfirmGroup label={`Remove rule ${r.n}?`} onClose={close} back={() => removeBtn.current}>
           <span>
             Remove this rule? Conversations stop seeing it on their next prompt. You can undo this here or from Recent
             changes.
@@ -683,7 +755,7 @@ function RuleRow({
               Keep it
             </button>
           </div>
-        </div>
+        </ConfirmGroup>
       ) : null}
     </li>
   );
@@ -696,6 +768,7 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
   const [draft, setDraft] = useState("");
   const [adding, setAdding] = useState(false);
   const fieldId = useId();
+  const addBtn = useRef<HTMLButtonElement>(null);
   const toConfirm = rules.filter((r) => r.seeded && !r.confirmed).length;
   async function add(e: FormEvent) {
     e.preventDefault();
@@ -741,9 +814,11 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
         {removed && !rules.some((r) => r.n === removed.n) ? (
           <div className="route-undo" role="status">
             <span>Rule {removed.n} removed.</span>
+            {/* It appears only after a removal here: focus lands on it (F5). */}
             <button
               type="button"
               className="sm"
+              autoFocus
               disabled={w.busy === restoreId}
               onClick={async () => {
                 if (await w.run(restoreId, "khipu_route_rule", { action: "restore", n: removed.n })) setRemoved(null);
@@ -767,13 +842,13 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
               onChange={(e) => setDraft(e.target.value)}
             />
             {!adding ? (
-              <button type="submit" className="sm">
+              <button ref={addBtn} type="submit" className="sm">
                 Add rule…
               </button>
             ) : null}
           </div>
           {adding ? (
-            <div className="route-confirm" role="group" aria-label="Add this rule?" onKeyDown={escapeCloses(() => setAdding(false))}>
+            <ConfirmGroup label="Add this rule?" onClose={() => setAdding(false)} back={() => addBtn.current}>
               <span>Add this rule? Every conversation sees it first, in full, from its next prompt.</span>
               <div className="toolbar">
                 <button type="submit" className="primary sm" disabled={w.busy === "rule-add"}>
@@ -784,7 +859,7 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
                   Cancel
                 </button>
               </div>
-            </div>
+            </ConfirmGroup>
           ) : null}
           <WriteError w={w} id="rule-add" />
         </form>
@@ -941,6 +1016,12 @@ function holdSourceWords(h: RouteHold, now: Date): string {
   return `${holdKind(h.reason)} · ${by} · ${end}`;
 }
 
+/** A hold's length as the CLI counts it: its words on one line (runs of
+ * white space as one space, trimmed), in characters. */
+function holdWordsLength(text: string): number {
+  return [...text.replace(/\s+/g, " ").trim()].length;
+}
+
 function HoldsSection({
   data,
   cfg,
@@ -962,10 +1043,21 @@ function HoldsSection({
   const [choice, setChoice] = useState("tomorrow");
   const [custom, setCustom] = useState("");
   const base = useId().replace(/:/g, "");
+  // The longest words a hold may have (0: no limit), as the CLI enforces it.
+  const most = settingNumber(cfg, "routing_hold_chars");
   async function add(e: FormEvent) {
     e.preventDefault();
     if (!text.trim()) {
       w.fail("hold-add", "Write what conversations should know.");
+      return;
+    }
+    const words = holdWordsLength(text);
+    if (most && words > most) {
+      w.fail(
+        "hold-add",
+        `A hold's words are at most ${limitWords(most, "chars")} (these are ${limitWords(words, "chars")}). ` +
+          "Shorten them, or raise the limit under Longest words in a hold below.",
+      );
       return;
     }
     const at = new Date();
@@ -1036,8 +1128,12 @@ function HoldsSection({
               value={text}
               placeholder="What conversations should know…"
               autoComplete="off"
+              aria-describedby={`${base}-most`}
               onChange={(e) => setText(e.target.value)}
             />
+            <span className="set-help" id={`${base}-most`}>
+              {most == null ? "" : most ? `At most ${limitWords(most, "chars")}` : "No limit on length"}
+            </span>
           </div>
           <div className="toolbar">
             <span className="route-field">
@@ -1095,6 +1191,14 @@ function HoldsSection({
               },
             ]}
             join=" · at most "
+            cfg={cfg}
+            w={w}
+            reread={reread}
+          />
+          <LimitRow
+            name="Longest words in a hold"
+            help="Yours and conversations' alike."
+            fields={[{ key: "routing_hold_chars", label: "Longest words", unit: "chars", options: [150, 300, 600, 1200, 0], zero: "No limit" }]}
             cfg={cfg}
             w={w}
             reread={reread}
@@ -1291,6 +1395,14 @@ function TellingSection({
             reread={reread}
           />
           <LimitRow
+            name="Longest line"
+            help="Each line about an account, a hold or a lane. Rules and your note are never cut."
+            fields={[{ key: "routing_line_chars", label: "Longest line", unit: "chars", options: [100, 200, 400, 800, 0], zero: "No limit" }]}
+            cfg={cfg}
+            w={w}
+            reread={reread}
+          />
+          <LimitRow
             name="Time allowed before a prompt"
             help="If reading takes longer, the update waits for the next prompt; memory search is not slowed. Never more than one second."
             fields={[{ key: "routing_prompt_budget_ms", label: "Time allowed", unit: "ms", options: [25, 50, 100, 200, 500, 1000] }]}
@@ -1352,9 +1464,12 @@ function TellingSection({
             ) : null}
           </p>
         ) : (
+          // Khipu sees only its own environment, not the shell a conversation
+          // starts from, so it never says ROUTING_NOW_OFF is unset (fix round 1, F4).
           <p className="set-help">
-            Your old "routing off" switches are not set. Setting either one (<span className="mono">ROUTING_NOW_OFF=1</span>
-            , or the file <span className="mono">/tmp/.routing_now_disable</span>) also turns this off.
+            Your old "routing off" file, <span className="mono">/tmp/.routing_now_disable</span>, isn't there. Khipu
+            can't see your shell's settings: if <span className="mono">ROUTING_NOW_OFF=1</span> is set there,
+            conversations started from that shell are told nothing. Setting either one turns the telling off.
           </p>
         )}
       </div>
@@ -1436,6 +1551,7 @@ function FoldersSection({
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
   const addBtn = useRef<HTMLButtonElement>(null);
+  const removeBtns = useRef<Record<string, HTMLButtonElement | null>>({});
   const base = useId().replace(/:/g, "");
   const write = (next: SourceEntry[], id: string) =>
     w.run(id, "khipu_config_set", { key: "routing_sources", value: JSON.stringify(next) }, reread);
@@ -1531,6 +1647,9 @@ function FoldersSection({
                   </span>
                   <span className="route-acts">
                     <button
+                      ref={(el) => {
+                        removeBtns.current[entry.name] = el;
+                      }}
                       type="button"
                       className="sm"
                       aria-label={`Remove the ${entry.name} folder`}
@@ -1541,7 +1660,11 @@ function FoldersSection({
                     </button>
                   </span>
                   {removing === entry.name ? (
-                    <div className="route-confirm" role="group" aria-label={`Remove the ${entry.name} folder?`} onKeyDown={escapeCloses(() => setRemoving(null))}>
+                    <ConfirmGroup
+                      label={`Remove the ${entry.name} folder?`}
+                      onClose={() => setRemoving(null)}
+                      back={() => removeBtns.current[entry.name] ?? addBtn.current}
+                    >
                       <span>
                         Stop reading {entry.name}? Its limits and heartbeat stop counting; the folder itself is not
                         touched.
@@ -1563,7 +1686,7 @@ function FoldersSection({
                           Keep it
                         </button>
                       </div>
-                    </div>
+                    </ConfirmGroup>
                   ) : null}
                 </div>
               );

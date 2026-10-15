@@ -820,6 +820,18 @@ Inspect `PlansCard.tsx`, the fixed-argv commands in `lib.rs` (`khipu_usage_statu
 
 Useful alone: Matt sees and changes all of it without a terminal.
 
+Built differently from the mock (Settings fix round 1):
+
+- The pause form's "Note for your agents" field and a paused row's "Your note: ..." are not built: the record
+  has no note on a pause yet (`route pause` takes none), so under the stop-condition above they stay out.
+  Adding them needs a `--note` on `route pause`, the note in the fold, the summary and the tools; Matt's call
+  whether it joins a later phase.
+- The old off switches: Khipu sees only its own environment, never the shell a conversation starts from, so
+  the page says whether `/tmp/.routing_now_disable` exists and, unless Khipu's own environment has
+  `ROUTING_NOW_OFF=1`, that it can't see the shell's setting. It never says the setting is unset.
+- Dismiss buttons are named by whose report they remove ("Dismiss the runner's report", "Dismiss the
+  conversation's report"), as the mock words them, and work on a job runner's limit too.
+
 ### Phase 5: the check at reset times (S, one session)
 
 Inspect `recall_daemon.run`, `usage.probe_account`, `_try_refresh_lock`, and the phase 1a fold before writing

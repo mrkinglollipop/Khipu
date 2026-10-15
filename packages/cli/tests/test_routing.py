@@ -1621,3 +1621,66 @@ def test_the_apps_view_marks_watched_rules_old_switches_and_who_changed_what(hom
     monkeypatch.delenv("ROUTING_NOW_OFF")
     rc, out = _cli(["route", "--json"], capsys)
     assert json.loads(out)["old_switches"]["env"] is False
+
+
+def test_recent_changes_name_the_owner_in_settings_for_every_change_made_in_the_app(home, capsys):
+    # F1 (fix round 1): each change item takes its author and its "via" from
+    # the event that caused it, never from the state after the change. A
+    # pause, a lift, a removed rule, an ended note and an ended hold made in
+    # the app all read "you, in Settings".
+    clock = home["clock"]
+    _cli(["route", "rule", "add", "--from-app", "--", "Never a -fast tier."], capsys)
+    _cli(["route", "rule", "add", "--from-app", "--", "Be kind to the Mac."], capsys)
+    _cli(["route", "note", "set", "--from-app", "--", "Codex first"], capsys)
+    _cli(["route", "hold", "--from-app", "--reason=other", "--machine", "--", "keep it"], capsys)
+    hold_id = routing.read_view()["holds"][0]["id"]
+    clock.advance(minutes=1)
+    _cli(["route", "pause", "--from-app", "--until=2h", "--", "Codex"], capsys)
+    _cli(["route", "pause", "--from-app", "--", "Muse"], capsys)
+    clock.advance(minutes=1)
+    _cli(["route", "lift", "--from-app", "--", "Muse"], capsys)
+    _cli(["route", "rule", "retire", "--from-app", "--", "2"], capsys)
+    _cli(["route", "hold", "--from-app", "--", "end", hold_id], capsys)
+    _cli(["route", "note", "end", "--from-app"], capsys)
+    rc, out = _cli(["route", "--json"], capsys)
+    data = json.loads(out)
+    assert data["outside_app"] == []
+    items = [i for c in data["changes"] for i in c["items"]]
+
+    def last(entity: str, ended: bool = False) -> dict:
+        return [i for i in items if i["entity"] == entity and (i["now"] is None) == ended][-1]
+
+    paused = last("account:codex|")
+    assert paused["now"]["state"] == "paused"
+    lifted = last("account:muse|")
+    assert lifted["was"]["state"] == "paused" and lifted["now"]["state"] != "paused"
+    for item in (paused, lifted, last("rule:2", ended=True), last("note", ended=True),
+                 last(f"hold:{hold_id}", ended=True)):
+        assert (item["via"], item["by"]) == ("app", "you"), item
+    # A change the clock made (the pause running out) is Khipu's, not the owner's.
+    clock.advance(hours=3)
+    rc, out = _cli(["route", "--json"], capsys)
+    items = [i for c in json.loads(out)["changes"] for i in c["items"]]
+    ran_out = [i for i in items if i["entity"] == "account:codex|"][-1]
+    assert ran_out["was"]["state"] == "paused" and ran_out["by"] is None and ran_out["via"] is None
+
+
+def test_every_limit_a_refusal_names_can_be_raised_in_the_app():
+    # F3 (fix round 1): a refusal that tells the owner which setting raises a
+    # limit names one the app offers: in the app's allowlist (lib.rs) and on
+    # Settings -> Routing. Every limit on the owner's own words is one.
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    source = Path(routing.__file__).read_text(encoding="utf-8")
+    named = set(re.findall(r"(routing_[a-z_]+) raises", source))
+    named |= {"routing_hold_chars", "routing_line_chars"}
+    lib = (root / "apps/desktop/src-tauri/src/lib.rs").read_text(encoding="utf-8")
+    page = (root / "apps/desktop/src/RoutingSettings.tsx").read_text(encoding="utf-8")
+    allowed = set(re.findall(r'"(routing_[a-z_]+)"', lib[lib.index("const ROUTING_DURATION_KEYS"):
+                                                         lib.index("const ROUTING_SWITCH_KEYS")]))
+    for key in sorted(named):
+        assert key in routing.SETTINGS, key
+        assert key in allowed, f"{key} is not in the app's allowlist"
+        assert f'key: "{key}"' in page, f"{key} has no row on Settings -> Routing"

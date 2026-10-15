@@ -607,6 +607,8 @@ const ROUTING_COUNT_KEYS: &[&str] = &[
     "routing_prompt_chars",
     "routing_prompt_budget_ms",
     "routing_resend_after_versions",
+    "routing_hold_chars",
+    "routing_line_chars",
 ];
 /// On or off.
 const ROUTING_SWITCH_KEYS: &[&str] = &["routing_push_start", "routing_push_prompt"];
@@ -3457,6 +3459,10 @@ mod settings_command_tests {
         assert_eq!(config_set_argv("routing_stale_after", "43200").unwrap(), v(&["config", "--set", "routing_stale_after", "43200"]));
         assert_eq!(config_set_argv("routing_summary_chars", " 0 ").unwrap(), v(&["config", "--set", "routing_summary_chars", "0"]));
         assert_eq!(config_set_argv("routing_push_prompt", "off").unwrap(), v(&["config", "--set", "routing_push_prompt", "off"]));
+        // Every limit Khipu enforces on the owner's words or a line can be
+        // raised from Settings -> Routing (fix round 1, F3).
+        assert_eq!(config_set_argv("routing_hold_chars", "0").unwrap(), v(&["config", "--set", "routing_hold_chars", "0"]));
+        assert_eq!(config_set_argv("routing_line_chars", "400").unwrap(), v(&["config", "--set", "routing_line_chars", "400"]));
         for (k, bad) in [("routing_stale_after", "-1"), ("routing_stale_after", "12h"), ("routing_prompt_chars", "--x"),
                          ("routing_push_start", "yes"), ("routing_summary_chars", "1e3"),
                          ("routing_stale_after", "999999999999")] {

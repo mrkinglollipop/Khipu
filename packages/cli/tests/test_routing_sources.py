@@ -1218,3 +1218,26 @@ def test_a_broken_rule_keeps_the_time_khipu_first_saw_it(home, capsys):
     home["clock"].now = T0 + timedelta(minutes=50)
     _beat(home["a"], home["clock"].now)
     assert broken()["at"] == routing._iso(T0 + timedelta(minutes=50))
+
+
+def test_the_owner_can_dismiss_a_runners_side_of_a_disagreement(home):
+    # F6 (fix round 1): Dismiss works on either side of a disagreement, the
+    # job runner's limit included (its line is read from the runner's files,
+    # never written to the record).
+    _register(home)
+    home["clock"].advance(minutes=1)
+    routing.report(state="open", account="Claude second",
+                   author={"kind": "conversation", "harness": "claude_code", "project": "project-b", "session": "s"})
+    second = _account(routing.read_view(), SECOND)
+    assert second["state"] == "limited" and second["witness"]["source"] == "runner"
+    assert second["disagreement"]["source"] == "report"
+    runner_id = second["witness"]["id"]
+    home["clock"].advance(minutes=1)
+    out = routing.clear("Claude second", report_id=runner_id, via="app")
+    assert out["account"] == SECOND
+    second = _account(routing.read_view(), SECOND)
+    assert second["state"] == "open" and second["witness"]["source"] == "report"
+    assert routing.doctor_block()["outside_app"] == []
+    # An id that is no report about the account is still refused.
+    with pytest.raises(routing.RouteError):
+        routing.clear("Claude second", report_id="r-nothing", via="app")
