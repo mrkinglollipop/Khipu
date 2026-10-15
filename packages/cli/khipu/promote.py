@@ -720,6 +720,18 @@ def _search_problem(run: dict[str, Any]) -> str | None:
     return None
 
 
+def _off_problem(label: str, live_hits: list, cand: dict[str, Any]) -> str | None:
+    """Why the candidate's run with routing off fails the step, or None: its
+    own search fails (``_search_problem``), or it answered nothing where the
+    live code had hits. The same test for the first run and the replayed one."""
+    what = _search_problem(cand)
+    if what:
+        return f"{label}: {what}"
+    if live_hits and not cand["hits"]:
+        return f"{label}: empty answer where live had {len(live_hits)} hit(s)"
+    return None
+
+
 def _comparable(off: dict[str, Any], on: dict[str, Any]) -> bool:
     """Whether two runs' search answers can be compared: the same legs ran
     and the same degraded note. Each run is a cold one-shot hook, so an
@@ -767,8 +779,10 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
     with routing on while both runs ran the same legs with the same degraded
     note. A failing pair, or one whose legs or degraded note differ, is
     replayed once more first, so a search or a read that was late once is
-    not taken for the candidate's routing; a pair whose legs or degraded
-    note still differ is noted, not failed (timing, not routing)."""
+    not taken for the candidate's routing, and both replayed runs are held
+    to their tests (the run with routing off to the search and empty-answer
+    tests); a pair whose legs or degraded note still differ is noted, not
+    failed (timing, not routing)."""
     samples = sample_queries(query_log_path(), n)
     if not samples:
         return False, "no queries in the last day; use Khipu once and re-run"
@@ -790,13 +804,10 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
                 if live_hook.exists() else None)
         cand = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-cand-{i}", legacy=cand_legacy, routing=False)
         label = f"prompt {i + 1}"
-        what = _search_problem(cand)
-        if what:
-            problems.append(f"{label}: {what}")
-            continue
         live_hits = (live or {}).get("hits") or []
-        if live_hits and not cand["hits"]:
-            problems.append(f"{label}: empty answer where live had {len(live_hits)} hit(s)")
+        problem = _off_problem(label, live_hits, cand)
+        if problem:
+            problems.append(problem)
             continue
         on = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-route-{i}", legacy=cand_legacy, routing=True,
                           root=Path(candidate))
@@ -811,7 +822,9 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
                                 routing=False)
             on = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-route-{i}-again", legacy=cand_legacy,
                               routing=True, root=Path(candidate))
-            problem = _routing_problem(label, cand, on)
+            # Both replayed runs are tested: the one with routing off
+            # replaces the first, so it is held to the first one's tests.
+            problem = _off_problem(label, live_hits, cand) or _routing_problem(label, cand, on)
         if problem:
             problems.append(problem)
             continue

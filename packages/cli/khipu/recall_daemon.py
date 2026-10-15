@@ -323,7 +323,7 @@ class RecallService:
 
     def keep_routing(self) -> bool:
         """While this service's switches have the per-prompt push on, start
-        the routing helper again if it died after it started, so the record
+        the routing helper if none is running (never started, or died), so the record
         keeps being refolded between prompts (phase 3c: the helper polls the
         sources and the log and refolds at the view's ``valid_until``; the
         refold runs in a child of the helper, never on this process's GIL).

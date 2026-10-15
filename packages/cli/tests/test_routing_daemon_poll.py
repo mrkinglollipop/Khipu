@@ -265,6 +265,64 @@ def test_a_limit_written_after_the_last_poll_is_waited_for_with_no_poll_followin
     assert not schedule.due()
 
 
+def test_a_save_after_the_polls_own_is_taken_with_its_own_deadline(home, monkeypatch):
+    # Fix round 5, finding 1: the poll child's answer carried its fold's
+    # valid_until, and view.json's stat was taken afterwards. A prompt's save
+    # in between was acknowledged with the older deadline: a limit ending in
+    # 12 s was scheduled 3 h away and the account stayed limited.
+    clocks = home["clocks"]
+    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
+    _set(home, routing_poll_interval="3h")
+    routing.report(account="Claude", state="open", author=ME)
+    later = routing._iso(clocks.now + timedelta(hours=3))
+
+    def poll_refold(**_k):
+        # The child's fold saved a view good for 3 h; a prompt saves its own before the child's stat.
+        routing.report(account="Codex", state="limited", until="12s", author=ME)
+        return {"folded": True, "saved": True, "busy": False, "version": 1, "valid_until": later,
+                "interval": 10800.0}
+
+    monkeypatch.setattr(routing, "poll_refold", poll_refold)
+    schedule = _schedule(home, interval=routing.poll_interval())
+    recall_prompt._look_at_settings(schedule, routing)
+    out = _helper_poll(schedule)
+    assert out["view_stat"] == recall_prompt._view_stat(routing)  # the save it read is the one it acknowledges
+    assert schedule.valid_until == clocks.wall() + 12
+    clocks.run(13)
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due() == ["clock"]
+
+
+def test_a_view_saved_while_the_poll_reads_it_is_not_acknowledged(home, monkeypatch):
+    # The deadline and the stat come from one read between two equal stats;
+    # a view that keeps changing under the read is left unseen, so the next
+    # look polls again.
+    clocks = home["clocks"]
+    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
+    _set(home, routing_poll_interval="3h")
+    routing.report(account="Claude", state="open", author=ME)
+    real_load = routing._load_view
+
+    def poll_refold(**_k):
+        return {"folded": True, "saved": True, "busy": False, "version": 1,
+                "valid_until": routing._iso(clocks.now + timedelta(hours=3)), "interval": 10800.0}
+
+    def load_view():
+        view = real_load()
+        routing.report(account="Codex", state="limited", until="12s", author=ME)  # saved under the read
+        return view
+
+    monkeypatch.setattr(routing, "poll_refold", poll_refold)
+    schedule = _schedule(home, interval=routing.poll_interval())
+    recall_prompt._look_at_settings(schedule, routing)
+    with monkeypatch.context() as m:
+        m.setattr(routing, "_load_view", load_view)
+        out = _helper_poll(schedule)
+    assert out["view_stat"] is None
+    recall_prompt._look_at_settings(schedule, routing)
+    assert schedule.due() == ["poll"]
+
+
 def _beat(folder: Path, at: datetime) -> None:
     (folder / "state" / "heartbeat.json").write_text(json.dumps(
         {"pid": 1, "time": at.timestamp(), "at": routing._iso(at), "interval": 20.0, "error": None}))
@@ -526,7 +584,6 @@ def test_the_helper_refolds_after_a_source_change(home, monkeypatch, helper):
 
 def test_the_daemon_starts_a_dead_helper_again_between_prompts(home, monkeypatch, helper):
     monkeypatch.setattr(recall_prompt, "_FORKSERVER_RESPAWN_S", 0.0)
-    assert not helper.keep_routing()  # never started (the push was off): stays unstarted
     assert helper.start_routing()
     assert helper.routing_forkserver.wait_ready(10)
     proc = helper.routing_forkserver._proc
@@ -550,6 +607,24 @@ def test_the_daemon_stops_the_helper_when_the_push_goes_off_and_never_starts_it_
     _set(home, routing_push_prompt=True)
     assert helper.keep_routing()  # on again: started again
     assert _wait(lambda: helper.routing_forkserver.wait_ready(0.1) and helper.routing_forkserver.spawned == 2)
+
+
+def test_a_daemon_started_with_the_push_off_starts_its_helper_once_the_push_is_on(home, monkeypatch):
+    # Fix round 5, finding 5: keep_alive left a helper never started alone,
+    # so a daemon that started with the push off and had it switched on
+    # later never polled until a prompt came.
+    monkeypatch.setattr(recall_daemon, "_ROUTING_LOOK_S", 0.0)
+    svc = recall_daemon.RecallService(home["capture"] / "recall.sock", stamp_fn=lambda: "fixed",
+                                      idle_check=False)
+    try:
+        assert not svc.start_routing()  # the push is off when it starts
+        assert not svc.keep_routing() and svc.routing_forkserver.spawned == 0
+        monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
+        assert svc.keep_routing()
+        assert svc.routing_forkserver.wait_ready(10) and svc.routing_forkserver.spawned == 1
+        assert not svc.keep_routing()  # up: nothing more to start
+    finally:
+        svc.close()
 
 
 def test_a_starting_helper_a_prompt_wanted_is_never_stopped_with_the_daemons_push_off(home, monkeypatch):
@@ -753,3 +828,74 @@ def test_the_replay_reports_timeouts_per_100_each_way_and_writes_only_its_own_di
     assert sum(out["on"]["routing"].values()) == 8 and out["off"]["routing"] == {}
     assert list(live.iterdir()) == []  # nothing in the configured data dir
     assert "KHIPU_ISOLATED_DIR" not in os.environ and "KHIPU_CAPTURE_HOME" not in os.environ
+
+
+def test_a_stalled_daemon_counts_as_a_timeout_and_each_request_counts_once(monkeypatch):
+    # Fix round 5, finding 3: the client's receive timeout came back as
+    # error="client: TimeoutError" and only errors starting "timeout" were
+    # counted, so a daemon that never answered showed no timeouts.
+    import socket
+
+    monkeypatch.setattr(routing_replay, "ANSWER_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(recall_daemon, "CONN_READ_TIMEOUT_S", 0.1)
+    folder = Path(tempfile.mkdtemp(prefix="krs-", dir="/tmp"))
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(folder / "s.sock"))
+        server.listen(4)  # accepts into its backlog, never answers
+        asked = routing_replay._ask(folder / "s.sock", "a prompt", "replay-on-0", True)
+    finally:
+        server.close()
+        shutil.rmtree(folder, ignore_errors=True)
+    assert not asked["ok"] and asked["timeout"] and asked["session"] == "replay-on-0"
+    assert routing_replay._summary([asked], [], 1)["timeouts"] == 1
+    # Per request, once: a timeout the client saw and the service logged, a
+    # client timeout whose row says ok, and a prompt that was fine.
+    fine = {"ok": True, "error": None, "timeout": False, "ms": 300.0}
+    asked = [dict(asked, session="replay-on-0"), dict(asked, session="replay-on-1"), dict(fine, session="replay-on-2")]
+    rows = [{"session": "replay-on-0", "reason": "timeout>delivery deadline", "ms": 1600.0, "routing": None},
+            {"session": "replay-on-1", "reason": "ok", "ms": 1700.0, "routing": None},
+            {"session": "replay-on-2", "reason": "ok", "ms": 300.0, "routing": None}]
+    assert routing_replay._summary(asked, rows, 3)["timeouts"] == 2
+
+
+def test_the_replays_off_prompts_run_with_no_helper_and_its_on_prompts_with_one(tmp_path, monkeypatch):
+    # Fix round 5, finding 4: the helper ran (and polled) for both groups,
+    # only each request said on or off, so its background cost landed on
+    # both sides and cancelled out. Off now means no helper at all, in
+    # blocks whose order alternates.
+    live = tmp_path / "live"
+    live.mkdir()
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(live))
+    monkeypatch.delenv("KHIPU_ISOLATED_DIR", raising=False)
+    monkeypatch.delenv("KHIPU_CAPTURE_HOME", raising=False)
+    monkeypatch.setattr(routing, "ROUTING_NOW_DISABLE_FILE", str(tmp_path / "routing_now_disable"))
+    monkeypatch.setattr(routing_replay, "_SYNTH_MEDIAN_S", 0.02)
+    monkeypatch.setattr(routing_replay, "_BLOCK", 4, raising=False)
+    monkeypatch.setattr(recall_prompt, "_FORKSERVER_RESPAWN_S", 0.0)
+    helpers: list = []
+
+    class Recorded(recall_prompt.RoutingForkServer):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            helpers.append(self)
+
+    monkeypatch.setattr(recall_prompt, "RoutingForkServer", Recorded)
+    seen: list = []
+    real_ask = routing_replay._ask
+
+    def ask(path, prompt, session, routing_on):
+        proc = helpers[-1]._proc
+        seen.append((routing_on, proc is not None and proc.poll() is None and helpers[-1].wait_ready(0)))
+        return real_ask(path, prompt, session, routing_on)
+
+    monkeypatch.setattr(routing_replay, "_ask", ask)
+    work = Path(tempfile.mkdtemp(prefix="krr-", dir="/tmp"))
+    try:
+        out = routing_replay.replay(8, search="synthetic", workdir=work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    assert [on for on, _ in seen] == [True] * 4 + [False] * 4 + [False] * 4 + [True] * 4
+    assert all(up == on for on, up in seen), seen
+    assert out["on"]["prompts"] == out["off"]["prompts"] == 8
+    assert out["on"]["timeouts"] == out["off"]["timeouts"] == 0

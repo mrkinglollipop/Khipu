@@ -5,15 +5,18 @@ at least 200 replayed prompts, timeouts with routing on exceed those with
 routing off by more than 2 in 100 prompts, switch push off and stop." This
 replays prompts through a warm recall service (``recall_daemon.RecallService``
 with its routing helper, as ``serve`` runs it), each prompt once with the
-push off and once with it on, interleaved, and reports the timeouts per 100
-prompts for each.
+push off and once with it on, and reports the timeouts per 100 prompts for
+each. The prompts go in blocks of ``_BLOCK``: each block once with routing
+on (the helper running, polling and refolding in the background, and each
+request saying on) and once with routing off (no helper at all, and each
+request saying off), the order alternating from block to block, so the
+helper's background cost lands only on the routing-on side.
 
 It never touches the live data dir: it makes its own isolated dir (its own
 log, dedup state and routing record), and ``--live-replica`` only links the
-live replica read only, as the promotion gate's replay does. The routing
-push is on for the helper as on a Mac that uses it (each prompt's own
-request still says on or off), so the helper polls and refolds as it would
-there. Before the first prompt the helper must refold the seeded record at
+live replica read only, as the promotion gate's replay does. While it runs,
+the helper has the routing push on as on a Mac that uses it, so it polls
+and refolds as it would there. Before the first prompt the helper must refold the seeded record at
 a first limit's end with no prompt asking (else the replay stops: a helper
 that never polls would leave its cost out), and a second limit ends during
 the run, so the helper's clock-driven refold happens while prompts arrive. Run it as
@@ -71,6 +74,10 @@ _ISOLATION_VARS = ("KHIPU_ISOLATED_DIR", "KHIPU_CAPTURE_HOME", "KHIPU_FEATURE_RO
 # is asked, and how long the replay waits for that refold.
 _CHECK_LIMIT = "2s"
 _CHECK_WAIT_S = 20.0
+# Prompts per block: each block runs once with the helper and once without.
+_BLOCK = 20
+# The longest the replay waits for the helper to start or to end.
+_HELPER_WAIT_S = 30.0
 
 
 @contextlib.contextmanager
@@ -133,8 +140,32 @@ def _helper_refolds(wait: float | None = None) -> float:
                        + (f" (its push is off: {off})" if off else ""))
 
 
+def _helper_on(fs, wait: float = _HELPER_WAIT_S) -> None:
+    """Start the routing helper and wait until it is ready (its own start
+    may be held back by ``_FORKSERVER_RESPAWN_S`` after the last one)."""
+    until = time.monotonic() + wait
+    while not fs.wait_ready(0.05):
+        if time.monotonic() >= until:
+            raise RuntimeError("the routing helper did not start")
+        fs.prepare()
+
+
+def _helper_off(fs, wait: float = _HELPER_WAIT_S) -> None:
+    """Stop the routing helper and wait until its process has ended: the
+    prompts with routing off run with no background poll at all."""
+    proc = fs._proc
+    if proc is not None and not fs.stop():
+        raise RuntimeError("the routing helper could not be stopped")
+    if proc is not None:
+        with contextlib.suppress(Exception):
+            proc.wait(wait)
+
+
 def _ask(path: Path, prompt: str, session: str, routing_on: bool) -> dict[str, Any]:
-    """One prompt as the client sends it: request, answer, ack."""
+    """One prompt as the client sends it: request, answer, ack. ``timeout``
+    is true when the answer never reached the client in time: its receive
+    timed out, the answer came after the deadline (it is not acked), or the
+    service answered with a timeout."""
     from khipu import recall_daemon
 
     raw = json.dumps({"session_id": session, "prompt": prompt, "cwd": "/replay/project",
@@ -156,11 +187,15 @@ def _ask(path: Path, prompt: str, session: str, routing_on: bool) -> dict[str, A
             buf += chunk
         answer = json.loads(buf.split(b"\n", 1)[0] or b"{}")
         took = time.monotonic() - began
-        if answer.get("ok") is True and time.monotonic() < deadline:
+        late = time.monotonic() >= deadline
+        if answer.get("ok") is True and not late:
             sock.sendall(b'{"op":"ack"}\n')
-        return {"ok": answer.get("ok") is True, "error": answer.get("error"), "ms": round(took * 1000, 1)}
+        timed_out = late or str(answer.get("error") or "").startswith("timeout")
+        return {"ok": answer.get("ok") is True, "error": answer.get("error"), "ms": round(took * 1000, 1),
+                "session": session, "timeout": timed_out}
     except (OSError, ValueError) as exc:
-        return {"ok": False, "error": f"client: {type(exc).__name__}", "ms": round((time.monotonic() - began) * 1000, 1)}
+        return {"ok": False, "error": f"client: {type(exc).__name__}", "session": session,
+                "timeout": isinstance(exc, TimeoutError), "ms": round((time.monotonic() - began) * 1000, 1)}
     finally:
         sock.close()
 
@@ -182,7 +217,7 @@ def _log_rows(count: int, wait: float = 10.0) -> dict[str, list[dict[str, Any]]]
     for line in rows:
         m = recall_prompt._LOG_LINE_RE.match(line)
         session = line.split(" session=", 1)[1].split(" ", 1)[0]
-        out.setdefault(session, []).append({"reason": m.group("reason"), "ms": float(m.group("ms")),
+        out.setdefault(session, []).append({"session": session, "reason": m.group("reason"), "ms": float(m.group("ms")),
                                             "routing": recall_prompt.routing_status_of(line)})
     return out
 
@@ -239,11 +274,22 @@ def verdict(on_per_100: float, off_per_100: float, *, most: float = STOP_PER_100
 
 
 def _summary(asked: list[dict[str, Any]], rows: list[dict[str, Any]], n: int) -> dict[str, Any]:
-    timeouts = sum(1 for r in rows if r["reason"].startswith("timeout"))
-    # A prompt whose answer never reached the client is a timeout too, logged or not.
-    unlogged = max(0, sum(1 for a in asked if not a["ok"] and str(a.get("error") or "").startswith("timeout"))
-                   - timeouts)
-    timeouts += unlogged
+    """Each request is matched with its own summary line (a session's
+    requests and lines in order; the replay asks one at a time) and counts
+    one timeout when either side says so: the service logged a timeout, or
+    the answer never reached the client in time (``_ask``'s ``timeout``),
+    logged or not."""
+    pending: dict[Any, list[dict[str, Any]]] = {}
+    for r in rows:
+        pending.setdefault(r.get("session"), []).append(r)
+    timeouts = 0
+    for a in asked:
+        lines = pending.get(a.get("session"))
+        row = lines.pop(0) if lines else None
+        if a.get("timeout") or (row is not None and row["reason"].startswith("timeout")):
+            timeouts += 1
+    # A logged timeout no request matched still counts.
+    timeouts += sum(1 for lines in pending.values() for r in lines if r["reason"].startswith("timeout"))
     statuses: dict[str, int] = {}
     for r in rows:
         if r["routing"]:
@@ -263,8 +309,9 @@ def _summary(asked: list[dict[str, Any]], rows: list[dict[str, Any]], n: int) ->
 def replay(n: int = MIN_PROMPTS, *, prompts: tuple[str, ...] | list[str] = PROMPTS, live_replica: bool = False,
            limit_ends_in: str = "20s", workdir: Path | None = None, search: str = "real") -> dict[str, Any]:
     """Replay ``n`` prompts with routing on and ``n`` with it off through
-    one warm recall service, interleaved (on first, then off first, in
-    turn), and report timeouts per 100 for each and whether the
+    one warm recall service, in blocks of ``_BLOCK`` (each block with the
+    helper running and routing on, and with no helper and routing off, on
+    first, then off first, in turn), and report timeouts per 100 for each and whether the
     stop-condition is met (``stop``). Everything it writes is under
     ``workdir`` (a new temp dir by default, removed afterwards). ``search``
     is ``real`` (the hook's own search) or ``synthetic`` (a stand-in with a
@@ -296,20 +343,23 @@ def replay(n: int = MIN_PROMPTS, *, prompts: tuple[str, ...] | list[str] = PROMP
             thread = threading.Thread(target=svc.run, daemon=True)
             thread.start()
             try:
-                svc.routing_forkserver.prepare()
-                if not svc.routing_forkserver.wait_ready(30):
-                    raise RuntimeError("the routing helper did not start")
+                fs = svc.routing_forkserver
+                _helper_on(fs)
                 helper_refold_s = _helper_refolds()
                 # The limit that ends while the prompts arrive.
                 from khipu import routing
 
                 routing.report(account="Codex", state="limited", until=limit_ends_in, author=_AUTHOR)
                 asked: dict[bool, list[dict[str, Any]]] = {True: [], False: []}
-                for i in range(n):
-                    prompt = texts[i]
-                    for routing_on in ((True, False) if i % 2 == 0 else (False, True)):
+                for start in range(0, n, _BLOCK):
+                    block = range(start, min(n, start + _BLOCK))
+                    for routing_on in ((True, False) if (start // _BLOCK) % 2 == 0 else (False, True)):
+                        # Off is off: no helper polling in the background either.
+                        (_helper_on if routing_on else _helper_off)(fs)
                         mode = "on" if routing_on else "off"
-                        asked[routing_on].append(_ask(svc.path, prompt, f"replay-{mode}-{i % SESSIONS}", routing_on))
+                        for i in block:
+                            asked[routing_on].append(_ask(svc.path, texts[i], f"replay-{mode}-{i % SESSIONS}",
+                                                          routing_on))
                 rows = _log_rows(2 * n)
             finally:
                 svc.stop()

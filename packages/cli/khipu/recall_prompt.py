@@ -673,15 +673,16 @@ class RoutingForkServer:
             raise RoutingHelperStarting() from exc
 
     def keep_alive(self) -> bool:
-        """Start the helper again, on a thread, when one this daemon
-        started has died, so the record's poll and its refold at
-        ``valid_until`` (phase 3c) go on between prompts. Never waits; a
-        helper never started (the push off) stays unstarted. True when it
-        was asked to start again. The daemon calls it only while its push
-        is on, and ``stop`` otherwise."""
+        """Start the helper, on a thread, when none is running: never
+        started (the daemon started with the push off and it was switched on
+        later), stopped, or dead. So the record's poll and its refold at
+        ``valid_until`` (phase 3c) go on between prompts without waiting for
+        one (fix round 5). At most every ``_FORKSERVER_RESPAWN_S``. Never
+        waits; True when it was asked to start. The daemon calls it only
+        while its push is on, and ``stop`` otherwise."""
         dead = None
         with self._lock:
-            if self._closed or not self.spawned or self._starting:
+            if self._closed or self._starting:
                 return False
             if self._proc is not None and self._proc.poll() is None:
                 return False
@@ -985,15 +986,43 @@ def _detach_child(keep: tuple[int, ...]) -> None:
                 pass
 
 
+# How often a poll child reads view.json again when it changed under the read.
+_VIEW_SNAPSHOT_TRIES = 3
+
+
+def _view_snapshot(routing) -> tuple[Any, dict | None]:
+    """view.json's stat and the view it holds, from one read between two
+    equal stats; (None, None) when the file kept changing under the read or
+    could not be read. The stat is the file's identity: the deadline that
+    goes with it comes only from this read (fix round 5)."""
+    for _ in range(_VIEW_SNAPSHOT_TRIES):
+        before = _view_stat(routing)
+        if before is None:
+            break
+        view = routing._load_view()
+        if view is not None and _view_stat(routing) == before:
+            return before, view
+    return None, None
+
+
 def _poll_once(routing, on_fold=None) -> dict:
     """One poll as the helper's child runs it: ``routing.poll_refold``'s
     answer with ``due`` (``valid_until`` in wall-clock seconds) and, when it
-    folded and saved the view, ``view_stat``: view.json's stat just after
-    its own save, so that save never makes another poll due."""
+    folded and saved the view, ``view_stat``: view.json's stat after that
+    save, so it never makes another poll due. The stat and ``due`` come from
+    the same read of view.json (``_view_snapshot``): a save by a prompt
+    between the poll's own save and its stat is acknowledged only with that
+    save's own deadline, and one that changed under the read is left unseen
+    (the helper's next look polls again)."""
     out = routing.poll_refold(on_fold=on_fold)
     due = routing._parse(out.get("valid_until"))
+    out["view_stat"] = None
+    if out.get("folded") and out.get("saved"):
+        seen, view = _view_snapshot(routing)
+        if seen is not None:
+            out["view_stat"] = seen
+            due = routing._parse(view.get("valid_until"))
     out["due"] = due.timestamp() if due is not None else None
-    out["view_stat"] = _view_stat(routing) if out.get("folded") and out.get("saved") else None
     return out
 
 

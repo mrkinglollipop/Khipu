@@ -438,12 +438,15 @@ def test_replay_refuses_an_empty_answer_where_live_had_one(home, monkeypatch):
 
 
 def _routing_hook(runs: list, *, on_status="full", on_hits=("episode:3",), off_hits=("episode:3",),
-                  first_on_hits=None, first_on_status=None, push=None, on_reason="ok", on_ms=300.0):
+                  first_on_hits=None, first_on_status=None, push=None, on_reason="ok", on_ms=300.0,
+                  again_off=None):
     """A fake hook that answers with routing on (the run's environment says
     so) as ``on_status``, ``on_hits``, ``on_reason`` and ``on_ms``;
     ``first_on_hits`` and ``first_on_status`` only the first time (None: no
     routing field). ``push`` is what the candidate's probe says (None: it
-    says nothing)."""
+    says nothing). ``again_off`` is ``(reason, ms, hits)`` for the
+    candidate's second run with routing off (the replayed one), which then
+    ran no legs."""
     def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
         if argv[1:2] == ["-c"]:
             runs.append(("prefold", env["PYTHONPATH"], env["KHIPU_ISOLATED_DIR"]))
@@ -461,7 +464,12 @@ def _routing_hook(runs: list, *, on_status="full", on_hits=("episode:3",), off_h
             hits = list(first_on_hits if first_on_hits is not None and first else on_hits)
             status = first_on_status if first_on_status is not None and first else on_status
             reason, ms = on_reason, on_ms
+        again = not on and again_off is not None and sum(1 for r in runs if r[:2] == ("off", True)) == 2
+        if again:
+            reason, ms, hits = again_off[0], again_off[1], list(again_off[2])
         line = _summary(datetime.now(timezone.utc), reason, hits).replace("ms=300.0", f"ms={ms}")
+        if again:
+            line = line.replace("legs=['lexical']", "legs=[]")
         line += f" routing={status}" if on and status else ""
         log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -570,6 +578,25 @@ def test_replay_fails_a_candidate_whose_search_with_routing_on_times_out_fails_o
     assert not out["ok"], out
     assert expect in out["detail"]
     # The failing pair was replayed once more before the step failed.
+    assert [r[0] for r in runs if r[0] != "prefold"] == ["off", "off", "on", "off", "on"]
+
+
+@pytest.mark.parametrize(("again_off", "expect"), [
+    (("timeout>1.2s", 1200.0, ()), "prompt 1: timeout>1.2s"),
+    (("ok", 300.0, ()), "prompt 1: empty answer where live had 1 hit(s)"),
+])
+def test_replay_holds_the_replayed_run_with_routing_off_to_the_same_tests(home, monkeypatch, again_off, expect):
+    # Fix round 5, finding 2: the replayed pair's run with routing off
+    # replaced the first one but was never tested, so a candidate whose
+    # replayed search timed out (or came back empty where live had hits)
+    # passed whenever its replayed run with routing on was fine and ran
+    # other legs.
+    candidate = _one_query(home)
+    runs: list = []
+    monkeypatch.setattr(pm, "_run", _routing_hook(runs, first_on_status="skipped:budget", again_off=again_off))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"], out
+    assert expect in out["detail"]
     assert [r[0] for r in runs if r[0] != "prefold"] == ["off", "off", "on", "off", "on"]
 
 
