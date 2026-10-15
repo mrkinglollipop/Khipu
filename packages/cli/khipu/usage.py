@@ -1243,6 +1243,55 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
             "accounts": rows, "summary_text": [summary_line(r) for r in rows]}
 
 
+# What a conversation sees of a row (``khipu_usage``): an allowlist, so a field
+# added to the owner's rows later stays out until named here. Never ``home``
+# or any path: conversations reach other model providers (slice 9A).
+_PUBLIC_ROW_FIELDS = ("harness", "account", "plan", "ok", "error", "live_error", "last_error", "version",
+                      "source", "observed_at", "probed_at", "last_attempt_at", "last_good_at", "ms", "cached",
+                      "stale", "refreshing")
+_PUBLIC_WINDOW_FIELDS = ("name", "used_pct", "resets_at", "window_mins", "model")
+INVALID_PUBLIC_NOTE = "This account entry is not valid; the owner can fix it in Khipu's Settings"
+
+
+def public_row(row: dict) -> dict:
+    """One report row as a conversation may see it: the account by its
+    label and its ``khipu_route`` id, its state and figures, and a note in
+    Khipu's own words with no login folder in it."""
+    from khipu import routing
+
+    out = {k: row[k] for k in _PUBLIC_ROW_FIELDS if k in row}
+    out["id"] = routing.account_id(_key({"harness": row.get("harness"), "home": row.get("home")}))
+    out["windows"] = [{k: w[k] for k in _PUBLIC_WINDOW_FIELDS if k in w}
+                      for w in row.get("windows") or [] if isinstance(w, dict)]
+    credits = row.get("credits")
+    out["credits"] = ({k: v for k, v in credits.items() if isinstance(v, (bool, int, float))} or None
+                      if isinstance(credits, dict) else None)
+    note = row.get("note")
+    if row.get("error") == E_INVALID:
+        # The owner's reason names the entry as typed (a folder included).
+        note = INVALID_PUBLIC_NOTE
+    elif isinstance(note, str) and _names_a_folder(note, row.get("home")):
+        note = _note(row.get("error"), row.get("harness"), row.get("home")) or "See Khipu's app for this account"
+    out["note"] = note
+    return out
+
+
+def _names_a_folder(text: str, home: str | None) -> bool:
+    if "~/" in text or (home and home in text):
+        return True
+    path = _home_path(home) if home else None
+    return bool(path is not None and (str(path) in text or (path.name.lstrip(".") and path.name.lstrip(".") in text)))
+
+
+def public_report(rep: dict) -> dict:
+    """``report`` as ``khipu_usage`` answers it: every row through
+    ``public_row`` and each summary line rebuilt from the public row."""
+    rows = [public_row(r) for r in rep.get("accounts") or []]
+    return {"generated_at": rep.get("generated_at"), "max_age_s": rep.get("max_age_s"),
+            "refreshing": bool(rep.get("refreshing")), "accounts": rows,
+            "summary_text": [summary_line(r) for r in rows]}
+
+
 def account_key(account: dict) -> str:
     """The identity an owner action carries: ``harness|login folder`` as
     ``_key`` writes it. Labels are display names and may repeat."""

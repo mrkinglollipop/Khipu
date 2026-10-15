@@ -1699,7 +1699,9 @@ def _tool_usage(args: dict) -> dict:
     if max_age is None or isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
         max_age = usage.DEFAULT_MAX_AGE_S
     # Cache-first: never waits on a probe; at most one refresh runs in the background.
-    return usage.report(fresh=bool(args.get("fresh")), max_age=max(0.0, float(max_age)), background=True)
+    # Projected: a conversation never sees a login folder (the app's own command keeps them).
+    return usage.public_report(usage.report(fresh=bool(args.get("fresh")), max_age=max(0.0, float(max_age)),
+                                            background=True))
 
 
 def _tool_route(args: dict) -> dict:
