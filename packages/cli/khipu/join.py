@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
+from khipu.output_guard import remember, secret_result
 from khipu.join_errors import JoinError, public_error, redact_connection_text  # noqa: F401
 
 FORMAT_VERSION = "khipu-join-v1"
@@ -128,6 +129,7 @@ def encrypt_payload(payload: dict[str, Any], passphrase: str) -> bytes:
     return json.dumps(envelope).encode("utf-8")
 
 
+@secret_result("kit")
 def decrypt_payload(blob: bytes, passphrase: str = "") -> dict[str, Any]:
     try:
         envelope = json.loads(blob.decode("utf-8"))
@@ -222,7 +224,7 @@ def export_kit(passphrase: str, *, allow_unencrypted: bool = False) -> bytes:
     from khipu.keychain import get_dsn, get_gemini_key, get_openai_compat_key
     from khipu.paths import root_cert_file
 
-    dsn = get_dsn()
+    dsn = remember(get_dsn(), "database_url")
     if not dsn:
         raise JoinError(
             "No database URL in Keychain. Configure the hub DSN before exporting a join kit."
@@ -243,13 +245,13 @@ def export_kit(passphrase: str, *, allow_unencrypted: bool = False) -> bytes:
         "expected": counts,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    gateway = gateway_url()
+    gateway = remember(gateway_url(), "gateway_url")
     if gateway:
         payload["gateway_url"] = gateway
-    gemini = get_gemini_key()
+    gemini = remember(get_gemini_key(), "gemini_api_key")
     if gemini:
         payload["gemini_api_key"] = gemini
-    openai_compat = get_openai_compat_key()
+    openai_compat = remember(get_openai_compat_key(), "openai_compat_api_key")
     if openai_compat:
         payload["openai_compat_api_key"] = openai_compat
     if root_crt_pem:
@@ -489,7 +491,7 @@ def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
                                          "-a", account, "-w")
             if receipt.returncode not in (0, 44):
                 raise JoinError(f"cannot snapshot join credential {account}")
-            credentials[account] = receipt.stdout.strip() if receipt.returncode == 0 else None
+            credentials[account] = remember(receipt.stdout.strip(), account) if receipt.returncode == 0 else None
     modified_credentials = []
     try:
         if isinstance(root_pem, str) and root_pem.strip():
@@ -582,6 +584,7 @@ LITERAL_PASSPHRASE_REFUSAL = (
 )
 
 
+@secret_result("passphrase")
 def read_passphrase(*, stdin: bool = False, fd: int | None = None) -> str:
     """First line from a file descriptor or stdin, else KHIPU_JOIN_PASSPHRASE."""
     import sys
@@ -594,6 +597,7 @@ def read_passphrase(*, stdin: bool = False, fd: int | None = None) -> str:
     return resolve_passphrase(None)
 
 
+@secret_result("passphrase")
 def resolve_passphrase(arg: str | None) -> str:
     """The passphrase from the flag or KHIPU_JOIN_PASSPHRASE; empty when neither.
     Export refuses empty unless --allow-unencrypted; import of a plain kit needs none."""

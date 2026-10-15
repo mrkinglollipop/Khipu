@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from khipu.output_guard import guard_output
 from khipu.join_errors import JoinError
 
 SERVICE_TYPE = "_khipu-join._tcp"
@@ -609,6 +610,7 @@ def receive(
     return result
 
 
+@guard_output
 def advertise_join_kit(
     passphrase: str,
     *,

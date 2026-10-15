@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from khipu.search_text import search_tokens
+from khipu.output_guard import guard_output, remember
 
 
 def _env(*names: str, default: str = "") -> str:
@@ -3266,6 +3267,7 @@ def _add_passphrase_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+@guard_output
 def cmd_join(args: argparse.Namespace) -> int:
     from khipu.join import (
         export_kit,
@@ -3288,6 +3290,7 @@ def cmd_join(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as exc:
         print(json.dumps({"ok": False, "error": f"could not read the passphrase: {type(exc).__name__}"}))
         return 2
+    remember(passphrase, "passphrase")
     if (
         args.join_cmd in ("export", "advertise")
         and not passphrase
@@ -3296,8 +3299,8 @@ def cmd_join(args: argparse.Namespace) -> int:
     ):
         import getpass
 
-        first = getpass.getpass("Join kit passphrase: ").strip()
-        if first and getpass.getpass("Type it again: ").strip() != first:
+        first = remember(getpass.getpass("Join kit passphrase: ").strip(), "passphrase")
+        if first and remember(getpass.getpass("Type it again: ").strip(), "passphrase") != first:
             print(json.dumps({"ok": False, "error": "the two passphrases did not match"}))
             return 2
         passphrase = first
@@ -4049,6 +4052,7 @@ def cmd_sources(args: argparse.Namespace) -> int:
         return 2
 
 
+@guard_output
 def cmd_graph_backup(args: argparse.Namespace) -> int:
     from khipu import graph_backup
     from khipu.join_errors import redact_connection_text
@@ -5662,10 +5666,21 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+@guard_output
+def _dispatch_guarded_command(args: argparse.Namespace) -> int:
+    try:
+        return int(args.func(args))
+    except Exception as exc:  # noqa: BLE001 — the final stderr printer is guarded too
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     _add_paths()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.func in (cmd_join, cmd_graph_backup):
+        return _dispatch_guarded_command(args)
     try:
         return int(args.func(args))
     except Exception as e:  # noqa: BLE001 — CLI surface

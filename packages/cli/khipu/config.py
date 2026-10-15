@@ -21,6 +21,8 @@ import os
 import re
 from pathlib import Path
 
+from khipu.output_guard import secret_result
+
 CAPTURE_MODES = ("legacy", "dual", "hub")
 DEFAULT_CAPTURE_MODE = "dual"
 CONFIG_NAME = "config.json"
@@ -36,6 +38,7 @@ def config_file() -> Path:
     return data_dir() / CONFIG_NAME
 
 
+@secret_result("config")
 def load_config() -> dict:
     path = config_file()
     if not path.is_file():
@@ -47,6 +50,7 @@ def load_config() -> dict:
         return {}
 
 
+@secret_result("config")
 def _load_config_for_mutation() -> dict:
     """Load an existing document without overwriting malformed bytes."""
     path = config_file()

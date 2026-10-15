@@ -641,7 +641,7 @@ def offsite_health(
         }
 
     now = now or _utcnow()
-    ev = _latest_ops_event("graph_snapshot_offsite")
+    ev = _public_history(_latest_ops_event("graph_snapshot_offsite"), "graph_snapshot_offsite")
     if not ev or ev.get("status") != "ok":
         reason = "no successful graph_snapshot_offsite event recorded yet"
         if ev and ev.get("status") != "ok":
@@ -756,6 +756,25 @@ def scratch_drill(
     return out
 
 
+def _public_history(event: dict | None, kind: str) -> dict | None:
+    """Historical detail is an untrusted log, not command output."""
+    if event is None:
+        return None
+    status = event.get("status")
+    status = status if status in ("ok", "fail", "skipped") else "unknown"
+    created = event.get("created_at")
+    age = event.get("age_seconds")
+    return {
+        "status": status,
+        "created_at": created.isoformat() if isinstance(created, datetime) else None,
+        "age_seconds": age if isinstance(age, (int, float)) else None,
+        "summary": ("Backup operation failed; full details are stored in the log."
+                    if status == "fail" else
+                    "Backup operation recorded; full details are stored in the log."),
+        "log_location": f"ops_events.detail (kind={kind}, latest event)",
+    }
+
+
 def status_payload() -> dict:
     local = local_health()
     offsite = offsite_health()
@@ -767,7 +786,7 @@ def status_payload() -> dict:
         "dest_remote": _dest_remote_or_none(),
         "live_graph": str(live) if live is not None else None,
         "has_r2_remote": has_r2_remote(),
-        "last_graph_snapshot": _latest_ops_event("graph_snapshot"),
-        "last_graph_snapshot_offsite": _latest_ops_event("graph_snapshot_offsite"),
-        "last_graph_restore_drill": _latest_ops_event("graph_restore_drill"),
+        "last_graph_snapshot": _public_history(_latest_ops_event("graph_snapshot"), "graph_snapshot"),
+        "last_graph_snapshot_offsite": _public_history(_latest_ops_event("graph_snapshot_offsite"), "graph_snapshot_offsite"),
+        "last_graph_restore_drill": _public_history(_latest_ops_event("graph_restore_drill"), "graph_restore_drill"),
     }
