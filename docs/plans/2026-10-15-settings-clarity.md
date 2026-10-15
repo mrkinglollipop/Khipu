@@ -34,6 +34,7 @@ a card on Home that stays until he closes it, each item with a Show me button.
 | 6 | Capture & models: three cards and one Keys list | M | open |
 | 7 | Setup: an Accounts step | S–M | open |
 | 8 | What's new after an update (dialog and Home card), and its history in Settings → Updates | S | open |
+| 9 | Finding and adding accounts in the app (addendum, see "Phase 9" at the end) | M–L | scope for Matt's review |
 
 One PR per phase. Phase 1 goes first because it fixes things that are wrong today. Phases 2 to 6 can go in any
 order after 3, except that 4 and 5 need 3. Phases 7 and 8 go last, because they introduce what the earlier
@@ -491,3 +492,163 @@ Better Design rules, every critical and serious finding fixed in the mocks:
 Terms replaced for someone outside the team: "NOW block" became "current-state section"; "Routing table file"
 became "Old routing table file"; "No window with a reset time ahead" became "Its plan shows no limit that
 resets"; "Khipu checks this" became "Checked by Khipu"; "Routing" became "Accounts and routing".
+
+## Phase 9: finding and adding accounts (addendum, 2026-10-15, for Matt's review)
+
+Asked by Matt 2026-10-15: "we need to verify that users can add accounts for Khipu to track, because right now
+I don't know how that would be", then "There should be a feature that automatically finds them." Phases 1 to 8
+above are unchanged; this phase builds on 3 (Plans in Accounts and routing → Accounts) and 7 (the setup
+Accounts step). Mocks: `add-account.html` (the Add an account dialog and every state), `add-account-found.html`
+(Home's notice, Found rows, Not offered again, the automatic switch, the setup step), `add-account-manage.html`
+(rename, Stop tracking, two accounts on one login).
+
+### Today
+
+The only way to add an account is the "Accounts read" form (`PlansCard.tsx`, `UsageAccountsField`, about line
+1010): Name, CLI and a free-text "Login folder". It works only for someone who already made a second login in
+a terminal (for example `CLAUDE_CONFIG_DIR=~/.claude-second claude login`) and knows its path. With no list
+saved, Khipu reads every installed CLI's default login (`usage.configured_accounts`). The CLI already refuses a
+second entry for the same login (`login_taken`) or name (`name_taken`), and an app button can start a sign-in
+again for a configured Claude or Codex account (`khipu_account_sign_in`, `lib.rs:1471`; `usage.sign_in`,
+`usage.py:1307`), which opens the browser with no terminal.
+
+### What each CLI supports (checked on this Mac 2026-10-15)
+
+| CLI (version here) | More than one login | How the login folder is chosen | Signed-in check with no turn | Sign-in with no terminal |
+|---|---|---|---|---|
+| Claude Code 2.1.296 | Yes, one per folder | `CLAUDE_CONFIG_DIR`, default `~/.claude` (docs: code.claude.com/docs/en/settings, "To keep the home-directory files somewhere else, set CLAUDE_CONFIG_DIR"; not in `--help`) | `claude auth status --json` (`claude auth status --help`) | Yes: `claude auth login --claudeai` opens the browser (`claude auth login --help`; Khipu already runs it) |
+| Codex 0.162.1 | Yes, one per folder | `CODEX_HOME`, default `~/.codex` (docs: learn.chatgpt.com config-advanced, "Codex stores its local state under CODEX_HOME"; `codex --help` names `$CODEX_HOME`) | `codex login status` (`codex login --help`) | Yes: `codex login` opens the browser and returns to a local callback (docs: learn.chatgpt.com auth); `--device-auth` also exists |
+| Grok Build 1.0.52 | Yes, by folder | `GROK_HOME`, default `~/.grok` (not in `--help`; `grok du` calls `~/.grok` "the grok home"; Khipu's plan reads already use it, `usage.py:63`) | No status command in `--help`; the plan read (`_x.ai/billing`) answers "not signed in" | Not proven: `grok login` has `--oauth` and `--device-auth`, but nothing in its help says the default asks nothing on a terminal, and its leader socket defaults to `~/.grok/leader.sock` whatever the folder |
+| Muse 1.4.6 | No: one login per Mac | None in `muse --help`; Khipu already treats Muse as one sign-in (`usage.py:818`) | The plan read (`usage/read`) | Not without showing a code: `muse login` says "approve a code in your browser"; `META_API_KEY` overrides it |
+
+No Grok or Muse docs beyond `--help` were checked. Only Claude Code and Codex can be signed in from the app
+today. For Grok Build and Muse the app says so plainly and offers only "Use a login I already have" (Grok) or
+nothing new (Muse, one login); see open question 1 for the way to close that gap.
+
+### Finding accounts automatically (the main path)
+
+Khipu finds accounts without the owner opening anything, from three sources, none of which reads a login's
+contents:
+
+1. **Folder names in the home folder:** `~/.claude`, `~/.claude-*`, `~/.codex`, `~/.codex-*`, `~/.grok`,
+   `~/.grok-*`. Directories only; names ending in `-backup`, `-backups`, `-logs` or `.bak…` are skipped.
+2. **The logins conversations actually ran under.** The capture hook already runs inside each harness's
+   environment and records each session's `transcript_path` (`session_capture.py:1868`); for Claude,
+   `claude_homes.transcript_home` already maps a transcript to its home, and T3's Claude instances
+   (`t3.claude_instances`, `homePath`) are already listed. The build adds the login folder's path (only the
+   path: the value of `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `GROK_HOME`, or the folder the transcript sits
+   under) to the session's state, so Khipu can count "used by 4 conversations this week" per folder. T3's Codex
+   instances join the Claude ones.
+3. **The CLI's own answer** for each new candidate folder: the signed-in check in the table, run with that
+   folder as the login folder, then one plan read for a signed-in folder. Neither uses a turn or a paid call:
+   the checks are the CLIs' own status commands and the same plan reads Khipu already makes.
+
+When it runs: when the app starts, every 6 hours while it is open, when Accounts and routing or setup's
+Accounts step opens, and from "Look for accounts now". Sources 1 and 2 cost a folder listing and a read of
+Khipu's own state. Source 3 runs only for a folder Khipu has not decided about yet (not tracked, not turned
+down), at most 12 a run, each a child process with the plan read's 5-second limit. A folder already tracked or
+turned down is never checked again by discovery.
+
+What the owner sees, only for a folder that is signed in and not tracked:
+
+- **Home:** one quiet notice above the health line: "Found a Claude account you use: ~/.claude-client" with
+  why ("4 of your conversations this week ran on it, and it is signed in (Pro)") and **Track…** and **Not this
+  one**. Several finds share one notice that lists them. This is one more exception to rule 6 (Matt asked for
+  it); it is a notice, never a dialog or a badge, and it goes away when each find is answered.
+- **Accounts and routing → Accounts:** a "Found" row at the top of the list for each find, with the same two
+  buttons, and "2 found" on the group's closed line. A signed-in folder that no conversation has used yet is
+  shown here only, not on Home.
+- **Track…** opens the Add an account dialog at step 3 (name and read) with that login chosen. **Not this
+  one** is remembered on this Mac and listed under "Not offered again", where Offer again undoes it.
+- **"Track new accounts automatically"**, off by default, under the list (and in the setup step). When on, a
+  signed-in find that conversations used is tracked with its default name, and Home says once "Khipu started
+  tracking Claude client" with Undo, Rename… and Close. A folder no conversation used still waits for the
+  owner.
+
+### Adding an account by hand (the fallback)
+
+Settings → Accounts and routing → Accounts gets **Add an account…** at the top of the group (next to Look for
+accounts now); setup's Accounts step gets **Add another account…**. Both open one dialog in three steps:
+
+1. **Service:** Claude, Codex, Grok Build, Muse (the CLIs `usage.HARNESSES` reads), each saying whether its
+   CLI is installed and its version. Not installed: what to do (open its download page, open it once, Check
+   again), and Next stays off. Muse, already tracked, is shown and off ("one login per Mac").
+2. **Which login**, two ways:
+   - **Use a login I already have:** every login folder discovery found for that CLI, each with signed in or
+     not, its plan when readable, how many conversations used it this week, and "Tracked as Claude work" (off)
+     when it is tracked. "Choose another folder…" opens a folder picker (today's free-text field, kept for a
+     login somewhere else). Nothing found besides what is tracked: says so and offers Sign in to another
+     account.
+   - **Sign in to another account** (Claude and Codex): the owner gives a name; Khipu makes the login folder
+     `~/.claude-<name>` or `~/.codex-<name>` (lowercase, spaces as dashes, a number added if taken), next to
+     the default so the CLI, T3 and discovery all find it, then starts that CLI's own sign-in with that folder
+     (as `usage.sign_in` does) and waits up to 15 minutes, showing "Waiting for you to finish signing in in
+     your browser", Open the sign-in page again, and Stop and cancel. Failure (timed out, or the CLI reports no
+     sign-in): says so, nothing is saved, the empty folder stays for Try again. For Grok Build this choice is
+     off with the reason; for Muse it does not appear.
+3. **Name and read once:** the name (default from the folder: `~/.claude-client` → "Claude client") and one
+   plan read of the unsaved account, shown before anything is saved: **Live** with its figures; **signed in
+   but unreadable** with the plain reason from `_note()` and Read again now (it can still be saved); **not
+   signed in** with Sign in now or Save without signing in. Saving adds it to `usage_accounts`; if the list
+   was the default, Khipu first writes the default accounts out explicitly so nothing that was read stops being
+   read. The account then appears in Plans (Home and Settings) and in Accounts and routing.
+
+Refusals come before the save, in words: the same login already tracked ("Khipu already tracks this login as
+Claude work", matched by the folder's real identity, as `claude_homes.path_identity` does, so a shortcut or a
+full path counts as the same folder), with Show Claude work; a name already used, with a suggestion.
+
+### Rename, stop tracking, and two accounts on one login
+
+- **Rename…** edits the name in place. The routing record's holds and priority are keyed by the account's
+  CLI and login folder (`routing.py`, hold `scope` keys); the build confirms that and stops if anything is
+  keyed by name alone. Recent changes keeps the old name.
+- **Stop tracking…** (the word "remove" is avoided because people read it as deleting) explains in the dialog
+  what it does: Khipu stops reading the plan and stops telling conversations about it; the account leaves
+  Plans, Accounts and routing, and the priority list. What it does not do: it never deletes, empties or signs
+  out the login folder; conversations on it keep working and are still saved; past history stays; a hold on
+  it runs to its end. The folder goes under "Not offered again" so discovery does not offer it straight back.
+- **Two accounts on one login** (only possible in a list edited by hand, since the CLI refuses it): both lines
+  get "Same login as …", the group's closed line says "2 read the same login", and one warning offers Keep
+  Claude work or Keep Claude team. Keeping one stops tracking the other; the folder is untouched.
+
+### Guardrails for the build (stop-conditions)
+
+- Never read inside a login folder: discovery lists names, and asks the CLI. If any check needs a file's
+  contents, stop and ask.
+- **A status check must not write into a folder that is not a login.** Before discovery checks folders found
+  only by name, the build runs each status command against a scratch empty folder and compares the folder's
+  listing before and after. If the CLI creates files there, discovery checks only folders that sources 2 and 3
+  already tie to conversations or that the owner picks, and says so in the scope.
+- **Codex logins in the Keychain:** Codex can keep its sign-in in the macOS Keychain (`auto` storage). Before
+  "Sign in to another account" ships for Codex, the build proves with two scratch folders that a second
+  `CODEX_HOME` keeps its own sign-in and does not replace the first. If it does not, Codex gets only "Use a
+  login I already have", and that is reported.
+- Never run a real sign-in in tests; the sign-in is faked as it is today (`popen=` in `usage.sign_in`).
+- Discovery never adds silently while the switch is off; a test fails if a find is saved without Track.
+
+### Sessions
+
+Oracles as for every phase above, plus `cargo test` for the new commands.
+
+- **9A, backend (`packages/cli`):** read `usage.py` (accounts, `sign_in`), `claude_homes.py`, `t3.py` and
+  `session_capture.py` before writing. `khipu usage --discover --json` (finds with source, signed in, plan,
+  conversations this week, tracked or turned down); `khipu usage --try` (one read of an unsaved account, no
+  cache write); sign-in for a new account into a folder Khipu creates under the rule above; the login folder
+  path recorded with each session; turned-down folders stored; the two stop-condition checks above, run first.
+- **9B, the dialog (`apps/desktop`):** read `add-account.html` and `PlansCard.tsx` first. The three steps and
+  every state in the mock, the Rust commands with fixed argv (like `khipu_account_sign_in`), the folder picker
+  in place of the free-text field.
+- **9C, found and manage:** read `add-account-found.html` and `add-account-manage.html` first. Home's notice,
+  the Found rows, Not offered again, the switch, Rename…, Stop tracking…, the same-login warning, and the setup
+  step's found list with Add another account.
+
+### Open questions for Matt
+
+1. **Grok Build and Muse sign-in in the app.** Both have a device-code sign-in (`grok login --device-auth`,
+   `muse login`) that prints a link and a code. Khipu could show that link and code in the app, reading only
+   those two from the CLI's output with a strict pattern; today Khipu never reads anything a login prints. Allow
+   that, or keep "sign in from Grok Build, then choose it here"?
+2. **Where new login folders go:** `~/.claude-<name>` next to the default (proposed: the CLIs, T3 and
+   discovery find it, and it can be used by hand), or inside Khipu's own folder (out of sight)?
+3. **The Home notice** is a new exception to "never pops up or badges" (rule 6). Confirm it, and that it shows
+   only finds a conversation actually used.

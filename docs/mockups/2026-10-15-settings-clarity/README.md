@@ -45,6 +45,18 @@ Files:
   new history.
 - `polish.html`: the three fixes, before and after.
 
+Phase 9 (addendum, finding and adding accounts; mock-only layout in `add-account.css`):
+
+- `add-account.html`: where Add an account starts, then the dialog's three steps and every state: choose the
+  service, service not installed, the logins Khipu found, nothing found besides what is tracked, sign in to
+  another account, sign-in in progress, sign-in failed, Grok Build (sign-in can't start from Khipu), and the
+  read before saving (Live, signed in but unreadable, not signed in, duplicate login, name already used).
+- `add-account-found.html`: Home's "Found a Claude account you use" notice, Accounts with two Found rows, Not
+  offered again, the Home notice when Track new accounts automatically is on, and the setup step listing every
+  login found with Add another account.
+- `add-account-manage.html`: rename in place, Stop tracking with what it does and does not do, and two
+  accounts that read the same login.
+
 Decisions in the mock:
 
 - Folding never hides a problem: a closed group shows the count and colour of each problem in it, and Needs

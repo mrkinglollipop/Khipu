@@ -1,0 +1,69 @@
+/* Mock-only CSS for adding an account and finding accounts (phase 9, 2026-10-15). Tokens and components come from
+   App.css; the frame, setup and Plans pieces come from onboarding.css and plans.css. */
+.aa-stage{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--s4);align-items:start}
+.aa-cell{display:flex;flex-direction:column;gap:var(--s2);min-width:0}
+.aa-cell .mock-state{margin:0}
+.aa-scrim{display:flex;justify-content:center;padding:var(--s5) var(--s4);border:1px solid var(--border);border-radius:var(--r-lg);background:color-mix(in srgb,var(--text) 14%,var(--bg))}
+.aa-scrim dialog{position:static;display:block;margin:0}
+.kit-dialog.aa-dialog{max-width:560px}
+.aa-dialog .kit-dialog-body{gap:var(--s3)}
+.aa-dialog .kit-dialog-body h2{display:flex;flex-direction:column;gap:2px}
+.aa-step{font-size:var(--t-xs);font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+.aa-list{list-style:none;margin:0;padding:0;border:1px solid var(--border);border-radius:var(--r-sm)}
+.aa-opt{display:grid;grid-template-columns:auto minmax(0,1fr) auto;column-gap:var(--s3);align-items:center;min-height:44px;padding:var(--s2) var(--s3);border-bottom:1px solid var(--border);font-size:var(--t-sm)}
+.aa-opt:last-child{border-bottom:0}
+.aa-opt input[type=radio]{margin:0;width:16px;height:16px;accent-color:var(--accent)}
+.aa-opt label{display:flex;flex-direction:column;gap:2px;min-width:0;cursor:pointer}
+.aa-opt label b{color:var(--text);font-size:var(--t-md);font-weight:600}
+.aa-opt .t2,.aa-opt .meta{line-height:1.4}
+.aa-opt.chosen{background:var(--accent-soft, color-mix(in srgb,var(--accent) 10%,transparent))}
+.aa-opt.off label{cursor:default}
+.aa-opt.off b{color:var(--text-2)}
+.aa-opt .tag{white-space:nowrap}
+.aa-mono{font-family:var(--mono);font-size:var(--t-sm);color:var(--text)}
+.aa-ways{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--s2)}
+.aa-way{display:flex;gap:var(--s2);align-items:flex-start;padding:var(--s3);border:1px solid var(--border);border-radius:var(--r-sm);min-height:44px;font-size:var(--t-sm);color:var(--text-2)}
+.aa-way.chosen{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}
+.aa-way input{margin:3px 0 0;accent-color:var(--accent)}
+.aa-way label{display:flex;flex-direction:column;gap:2px;cursor:pointer}
+.aa-way b{color:var(--text);font-size:var(--t-md)}
+.aa-field{display:flex;flex-direction:column;gap:var(--s1)}
+.aa-field label{font-size:var(--t-sm);font-weight:600;color:var(--text)}
+.aa-field input{height:32px;padding:0 var(--s2);border:1px solid var(--border);border-radius:var(--r-sm);background:var(--bg);color:var(--text);font:inherit;font-size:var(--t-sm)}
+.aa-field input[aria-invalid=true]{border-color:var(--err)}
+.aa-field .set-help{margin:0}
+.aa-result{display:flex;flex-direction:column;gap:var(--s2);padding:var(--s3);border:1px solid var(--border);border-radius:var(--r-sm)}
+.aa-result-head{display:flex;align-items:center;gap:var(--s2);font-size:var(--t-sm);color:var(--text)}
+.aa-result-head b{font-size:var(--t-md)}
+.aa-result .plan-row{padding:0;border:0}
+.aa-result p{margin:0;font-size:var(--t-sm);color:var(--text-2)}
+.aa-wait{display:flex;align-items:center;gap:var(--s2);font-size:var(--t-sm);color:var(--text-2)}
+.aa-spin{width:14px;height:14px;border-radius:50%;border:2px solid var(--border);border-top-color:var(--accent);flex:none}
+.aa-actions{display:flex;gap:6px;justify-content:flex-end;align-items:center;flex-wrap:wrap;padding-top:var(--s1)}
+.aa-actions .aa-left{margin-right:auto}
+.aa-note{margin:0;font-size:var(--t-sm);color:var(--text-2)}
+.aa-dos{margin:0;padding-left:1.2em;font-size:var(--t-sm);color:var(--text-2);display:flex;flex-direction:column;gap:2px}
+.aa-dos li b{color:var(--text)}
+/* Found rows and the Accounts group head */
+.aa-groupbar{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap;padding:var(--s2) var(--s4);border-bottom:1px solid var(--border)}
+.aa-groupbar .spacer{flex:1}
+.aa-found{display:grid;grid-template-columns:auto minmax(0,1fr) auto;column-gap:var(--s3);align-items:center;padding:var(--s3) var(--s4);border-bottom:1px solid var(--border);background:color-mix(in srgb,var(--accent) 6%,transparent);font-size:var(--t-sm)}
+.aa-found .aa-ft{display:flex;flex-direction:column;gap:2px;min-width:0}
+.aa-found .aa-ft b{color:var(--text);font-size:var(--t-md)}
+.aa-found .aa-btns{display:inline-flex;gap:var(--s2);flex-wrap:wrap;justify-content:flex-end}
+.aa-same{margin:var(--s2) var(--s4)}
+.aa-switch{border-top:1px solid var(--border)}
+.aa-switch .opt-row{padding:var(--s3) var(--s4)}
+.aa-home-found .txt span{line-height:1.45}
+.aa-rename{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap}
+.aa-rename input{height:28px;padding:0 var(--s2);border:1px solid var(--border);border-radius:var(--r-sm);background:var(--bg);color:var(--text);font:inherit;font-size:var(--t-sm)}
+.aa-panel{border:1px solid var(--border);border-radius:var(--r-lg);background:var(--bg);padding:var(--s4)}
+@media (max-width:1100px){.aa-stage{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:760px){.aa-ways{grid-template-columns:minmax(0,1fr)}.aa-found{grid-template-columns:auto minmax(0,1fr)}.aa-found .aa-btns{grid-column:2;justify-content:flex-start;margin-top:var(--s2)}}
+.group-card > .fold > button.section-head{justify-content:flex-start;padding:var(--s3) var(--s4);color:var(--text)}
+.aa-dialog .callout{flex-direction:column}
+.aa-dialog .callout .cta{flex-wrap:wrap}
+.mock-frame.aa-auto{height:auto}
+.mock-frame.aa-auto .shell{height:auto;min-height:760px}
+.mock-frame.aa-auto .main{overflow:visible}
+.group-card .disclose > button.fold-btn{justify-content:flex-start;padding:var(--s2) var(--s4)}
