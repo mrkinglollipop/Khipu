@@ -141,11 +141,17 @@ export type RuleCheck = {
 };
 
 /** What a checked rule's last check found (`routing_sources.rule_results`). */
+export type RuleSource = { runner: string; good_at?: string | null; failed?: boolean; since?: string | null; stale?: boolean };
+
+export type RuleCheckResult = Omit<RuleResult, "rule" | "checks"> & { check: string; sources?: RuleSource[] };
+
 export type RuleResult = {
   rule: number;
+  /** One entry per check the rule asks for; `result` is the worst of them. */
+  checks?: RuleCheckResult[];
   /** Which of Khipu's four checks gave this result. */
   check?: "fast_tier" | "paid_xai" | "grok_private" | "grok_confirm" | string;
-  result: "ok" | "broken" | "cannot_check" | "no_lane" | "no_runner" | "unreadable" | string;
+  result: "ok" | "broken" | "cannot_check" | "no_lane" | "no_runner" | "unreadable" | "stale" | string;
   /** When the check last ran on the files it judged; only for "ok". */
   at?: string | null;
   /** Lanes it judged, and lanes it is about but couldn't judge. */
@@ -594,42 +600,78 @@ const CANNOT_SEE: Record<string, string> = {
   grok_private: "Khipu hasn't read your job runner's list of added work yet.",
 };
 
-/** The line under a standing rule: what Khipu's check found, or that Khipu
- *  has no check for it. `tone` is "ok", "warn" or "" (grey). A rule Khipu
- *  checks says "nothing wrong found" only from a result of "ok", which the
- *  CLI gives only after a check that ran. */
-export function ruleResultLine(
-  watched: boolean,
-  result: RuleResult | undefined,
-  nowMs: number = Date.now(),
-): { text: string; tone: "ok" | "warn" | "" } {
-  if (!watched) return { text: "Passed to every conversation as written. Khipu has no way to check this one.", tone: "" };
-  switch (result?.result) {
+// What each check is about, for a rule with several checks.
+const CHECK_FOR: Record<string, string> = {
+  fast_tier: "for models ending in -fast",
+  paid_xai: "for the paid xAI API",
+  grok_private: "for Grok on private work",
+  grok_confirm: "for re-checks of Grok work",
+};
+
+// The sources a stale result is about: the failed or stale ones.
+function staleLine(check: string | undefined, sources: RuleSource[], nowMs: number): string {
+  const file = check === "grok_private" ? "list of added work" : "settings";
+  const parts = sources.filter((x) => x.failed || x.stale).map((x) => {
+    const ago = fmtAgoSince(x.good_at, nowMs);
+    return x.failed
+      ? `Khipu couldn't read ${x.runner}'s ${file}${ago ? `; it last read them ${ago}` : ""}`
+      : `Khipu last read ${x.runner}'s ${file} ${ago ?? "a long time ago"}`;
+  });
+  return `${parts.join(" and ") || "Khipu can't tell how recent its read was"}.`;
+}
+
+type Line = { text: string; tone: "ok" | "warn" | "" };
+
+// One result's line. `f` names the check ("" for a rule with one check);
+// `top` is the whole rule's one line, which says "nothing wrong found".
+function resultLine(result: RuleResult | RuleCheckResult, f: string, nowMs: number, top: boolean): Line {
+  const by = `Checked by Khipu${f}`;
+  const sources = "checks" in result && result.checks ? result.checks.flatMap((c) => c.sources ?? []) : (result as RuleCheckResult).sources ?? [];
+  switch (result.result) {
     case "broken": {
       const words = (result.text ?? "").replace(BROKEN_LEAD, "");
       const more = result.more ? ` ${result.more === 1 ? "1 more lane" : `${result.more} more lanes`} too.` : "";
-      return {
-        text: `Checked by Khipu: may be broken.${words ? ` ${words.charAt(0).toUpperCase()}${words.slice(1)}` : ""}${more}`,
-        tone: "warn",
-      };
+      return { text: `${by}: may be broken.${words ? ` ${words.charAt(0).toUpperCase()}${words.slice(1)}` : ""}${more}`, tone: "warn" };
     }
     case "ok": {
       const ago = fmtAgoSince(result.at, nowMs);
       const n = result.unchecked ?? 0;
       const rest = n ? ` ${n === 1 ? "1 lane" : `${n} lanes`} couldn't be checked: ${CANNOT_SEE[result.check ?? ""] ?? CANNOT_SEE.fast_tier}` : "";
-      return { text: `Checked by Khipu in your job runners' settings: nothing wrong found${ago ? `, ${ago}` : ""}.${rest}`, tone: "ok" };
+      const head = top ? `${by} in your job runners' settings: nothing wrong found` : `${by}: passed`;
+      return { text: `${head}${ago ? `, ${ago}` : ""}.${rest}`, tone: "ok" };
     }
+    case "stale":
+      return { text: `${by}, but not now: ${staleLine(result.check, sources, nowMs)}`, tone: "" };
     case "cannot_check":
-      return { text: `Checked by Khipu, but not here: ${CANNOT_SEE[result.check ?? ""] ?? CANNOT_SEE.fast_tier}`, tone: "" };
+      return { text: `${by}, but not here: ${CANNOT_SEE[result.check ?? ""] ?? CANNOT_SEE.fast_tier}`, tone: "" };
     case "no_lane":
-      return { text: "Checked by Khipu, but not yet: none of your job runners has a lane this rule is about.", tone: "" };
+      return { text: `${by}, but not yet: none of your job runners has a lane this rule is about.`, tone: "" };
     case "no_runner":
-      return { text: "Checked by Khipu, but not yet: add a job runner folder so it has something to read.", tone: "" };
+      return { text: `${by}, but not yet: add a job runner folder so it has something to read.`, tone: "" };
     case "unreadable":
-      return { text: "Checked by Khipu, but not now: Khipu can't read your job runners' settings.", tone: "" };
+      return { text: `${by}, but not now: Khipu can't read your job runners' settings.`, tone: "" };
     default:
-      return { text: "Checked by Khipu. Reading what the last check found…", tone: "" };
+      return { text: `${by}. Reading what the last check found…`, tone: "" };
   }
+}
+
+const NOT_CHECKED: Line = { text: "Passed to every conversation as written. Khipu has no way to check this one.", tone: "" };
+
+/** The line under a standing rule: what Khipu's check found, or that Khipu
+ *  has no check for it. `tone` is "ok", "warn" or "" (grey). A rule Khipu
+ *  checks says "nothing wrong found" only from a result of "ok", which the
+ *  CLI gives only after every check ran and read fresh files. */
+export function ruleResultLine(watched: boolean, result: RuleResult | undefined, nowMs: number = Date.now()): Line {
+  if (!watched) return NOT_CHECKED;
+  return result ? resultLine(result, "", nowMs, true) : resultLine({ rule: 0, result: "" }, "", nowMs, true);
+}
+
+/** Every line under a standing rule: one per check when it has several and
+ *  they did not all pass, each naming its check; else `ruleResultLine`. */
+export function ruleResultLines(watched: boolean, result: RuleResult | undefined, nowMs: number = Date.now()): Line[] {
+  const checks = result?.checks ?? [];
+  if (!watched || !result || checks.length < 2 || result.result === "ok") return [ruleResultLine(watched, result, nowMs)];
+  return checks.map((c) => resultLine(c, ` ${CHECK_FOR[c.check] ?? ""}`.trimEnd(), nowMs, false));
 }
 
 // Words a rule commonly opens with that are not names, so "Never a -fast

@@ -424,6 +424,48 @@ describe("Settings -> Routing: standing rules", () => {
       expect(ruleResultLine(true, { rule: 3, result: r, at: "2026-10-14T15:36:00Z" }).text).not.toContain("nothing wrong found");
   });
 
+  it("never shows a stale check as fresh", async () => {
+    const src = (runner: string, o: object = {}) => ({ runner, good_at: "2026-10-13T15:36:00Z", failed: false, since: null, stale: false, ...o });
+    answers.khipu_route_view = {
+      ...view(),
+      rule_results: [{
+        rule: 3, check: "fast_tier", result: "stale", lanes: 2, unchecked: 0,
+        checks: [{ check: "fast_tier", result: "stale", lanes: 2, unchecked: 0,
+          sources: [src("Project A", { failed: true, since: "2026-10-14T15:00:00Z", stale: true }), src("Project B", { good_at: "2026-10-14T15:36:00Z" })] }],
+      }],
+    };
+    await page();
+    const three = row("Standing rules", "3.");
+    expect(three).toHaveTextContent("Checked by Khipu, but not now: Khipu couldn't read Project A's settings; it last read them 24 h ago.");
+    expect(three).not.toHaveTextContent("nothing wrong found");
+    expect(three).not.toHaveTextContent("just now");
+    expect(three).not.toHaveTextContent("Project B");
+    expect(ruleResultLine(true, { rule: 3, result: "stale", checks: [{ check: "fast_tier", result: "stale",
+      sources: [src("Project A", { good_at: "2026-10-14T03:00:00Z", stale: true })] }] }, Date.parse("2026-10-14T16:00:00Z"))).toEqual({
+      text: "Checked by Khipu, but not now: Khipu last read Project A's settings 13 h ago.", tone: "" });
+  });
+
+  it("shows every check's outcome for a rule with several checks", async () => {
+    const at = "2026-10-14T15:36:00Z";
+    answers.khipu_route_view = {
+      ...view(),
+      rule_results: [{
+        rule: 3, check: "paid_xai", result: "cannot_check",
+        checks: [
+          { check: "grok_private", result: "ok", at, lanes: 1, unchecked: 0, sources: [] },
+          { check: "paid_xai", result: "cannot_check", lanes: 0, unchecked: 1, sources: [] },
+        ],
+      }],
+    };
+    await page();
+    const three = row("Standing rules", "3.");
+    expect(three).toHaveTextContent("Checked by Khipu for Grok on private work: passed, 4 min ago.");
+    expect(three).toHaveTextContent("Checked by Khipu for the paid xAI API, but not here: the launch environment is set inside the launch script, which Khipu doesn't read.");
+    expect(three).not.toHaveTextContent("nothing wrong found");
+    expect(three.querySelectorAll(".rule-result")).toHaveLength(2);
+    expect(three).not.toHaveClass("broken");
+  });
+
   it("shows a broken check on the rule's own row and in Home's list", async () => {
     const text = "A standing rule may be broken: Project A's settings name a model ending in -fast for its codex lane.";
     const v: RouteView = {

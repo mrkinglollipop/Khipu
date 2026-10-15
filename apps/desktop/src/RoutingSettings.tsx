@@ -31,7 +31,7 @@ import {
   paceWords,
   pastWords,
   priorityPendingWords,
-  ruleResultLine,
+  ruleResultLines,
   saidWhen,
   useRouting,
   whenLocal,
@@ -1161,9 +1161,9 @@ function RuleRow({
     }
   };
   const origin = ruleOrigin(r.source, r.date, now);
-  const check = ruleResultLine(watched, result, now.getTime());
+  const checks = ruleResultLines(watched, result, now.getTime());
   return (
-    <li className={`row-item route-rule${check.tone === "warn" ? " broken" : ""}`}>
+    <li className={`row-item route-rule${result?.result === "broken" && checks.some((c) => c.tone === "warn") ? " broken" : ""}`}>
       <span className="route-rule-n" aria-hidden>
         {r.n}.
       </span>
@@ -1181,7 +1181,9 @@ function RuleRow({
             </span>
           ) : null}
         </span>
-        <span className={`rule-result${check.tone ? ` ${check.tone}` : ""}`}>{check.text}</span>
+        {checks.map((c) => (
+          <span key={c.text} className={`rule-result${c.tone ? ` ${c.tone}` : ""}`}>{c.text}</span>
+        ))}
       </span>
       <span className="route-acts">
         {toConfirm ? (

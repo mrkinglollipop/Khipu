@@ -607,12 +607,63 @@ def test_a_broken_check_is_the_rules_result_and_a_lane_less_rule_says_so(home, c
     assert results[2]["result"] == "no_lane"  # no Grok lane: nothing for the xAI check to read
 
 
+def test_a_failed_runner_read_is_never_dated_by_a_fresh_one(home, capsys):
+    """Codex review P2: A's settings fail and a day passes while B still reads
+    well; A's kept lanes must not count as checked, and B's fresh time must
+    not date the rule as "just now"."""
+    _register(home, b=True)
+    routing.add_rule("Never a -fast tier.", via="app")
+    assert routing.run_cli(_args(json=True)) == 0
+    assert _results(json.loads(capsys.readouterr().out))[1]["result"] == "ok"
+    (home["a"] / "config.json").write_text("{not json")
+    home["clock"].advance(hours=24)
+    assert routing.run_cli(_args(json=True)) == 0
+    result = _results(json.loads(capsys.readouterr().out))[1]
+    assert result["result"] == "stale" and result["at"] is None
+    (check,) = result["checks"]
+    sources = {s["runner"]: s for s in check["sources"]}
+    assert sources["project A"]["failed"] is True and sources["project A"]["good_at"] == routing._iso(T0)
+    assert sources["project B"]["failed"] is False
+    assert sources["project B"]["good_at"] == routing._iso(T0 + timedelta(hours=24))
+
+
+def test_a_source_read_too_long_ago_is_stale_and_coverage_takes_the_oldest_time():
+    rules = [{"n": 1, "text": "Never a -fast tier."}]
+    lanes = {"codex": {"kind": "codex", "model": "x", "confirm_lane": None, "fast": False, "model_in_launch": True,
+                       "script": None}}
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+
+    def runner(at: datetime) -> dict:
+        return {"config": {"data": {"lanes": lanes}, "good_at": routing._iso(at), "since": None}}
+
+    fresh = {"runners": {"A": runner(now - timedelta(hours=2)), "B": runner(now - timedelta(minutes=1))}}
+    (ok,) = routing_sources.rule_results(fresh, rules, now=now, stale_after=12 * 3600)
+    assert ok["result"] == "ok" and ok["at"] == routing._iso(now - timedelta(hours=2))  # the oldest, not the newest
+    old = {"runners": {"A": runner(now - timedelta(hours=13)), "B": runner(now - timedelta(minutes=1))}}
+    (stale,) = routing_sources.rule_results(old, rules, now=now, stale_after=12 * 3600)
+    assert stale["result"] == "stale" and stale["at"] is None
+    assert [s["runner"] for s in stale["checks"][0]["sources"] if s["stale"]] == ["A"]
+
+
+def test_a_rule_with_several_checks_passes_only_when_every_check_passed(home, capsys):
+    """Codex review P2: the privacy check passes while the paid xAI check
+    can't see the launch environment; the rule is not a pass, and both
+    outcomes are kept."""
+    _register(home)
+    routing.add_rule("Grok never uses the paid xAI API for privacy work.", via="app")
+    assert routing.run_cli(_args(json=True)) == 0
+    result = _results(json.loads(capsys.readouterr().out))[1]
+    assert result["result"] == "cannot_check" and result["at"] is None
+    assert {c["check"]: c["result"] for c in result["checks"]} == {"paid_xai": "cannot_check",
+                                                                  "grok_private": "ok"}
+
+
 def test_a_runner_whose_settings_were_never_read_is_not_a_pass(home):
     rules = [{"n": 1, "text": "Never a -fast tier."}]
     cache = {"runners": {"project A": {"config": {"data": None, "good_at": None}}}}
-    assert routing_sources.rule_results(cache, rules) == [
-        {"check": "fast_tier", "result": "unreadable", "at": None, "lanes": 0, "unchecked": 0, "text": None,
-         "more": 0, "why": None, "rule": 1, "checks": ["fast_tier"]}]
+    (result,) = routing_sources.rule_results(cache, rules)
+    assert (result["rule"], result["result"], result["at"]) == (1, "unreadable", None)
+    assert [(c["check"], c["result"], c["sources"]) for c in result["checks"]] == [("fast_tier", "unreadable", [])]
 
 
 def test_a_launch_while_paused_is_named(home):

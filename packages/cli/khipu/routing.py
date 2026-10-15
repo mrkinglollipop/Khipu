@@ -4609,7 +4609,8 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     # rule's last check found and when it ran, so a rule row says "nothing
     # wrong found" only after a check that ran.
     out["rule_results"] = routing_sources.rule_results(view.get("source_cache") or {}, view.get("rules") or [],
-                                                       out["rule_checks"])
+                                                       out["rule_checks"], now=now,
+                                                       stale_after=cfg["routing_stale_after"] or 0)
     out["warn_after"] = {"disagreement": cfg["routing_disagreement_warn_after"],
                          "not_refreshed": cfg["routing_not_refreshed_after"]}
     # How long a limit reported without a time lasts (the card says so).
